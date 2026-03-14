@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "Pure-Rust HDF5 writer library (WASM-compatible, no C dependencies)"
+repository = "https://github.com/stephenberry/hdf5-pure"
 
 [features]
 default = ["std", "checksum", "deflate"]
