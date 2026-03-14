@@ -1,0 +1,31 @@
+[package]
+name = "hdf5-pure"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Pure-Rust HDF5 writer library (WASM-compatible, no C dependencies)"
+
+[features]
+default = ["std", "checksum", "deflate"]
+std = []
+checksum = []
+fast-checksum = ["crc32fast"]
+deflate = ["flate2"]
+fast-deflate = ["flate2/zlib-ng"]
+provenance = ["sha2"]
+mmap = ["memmap2"]
+parallel = ["rayon"]
+
+[dependencies]
+byteorder = { version = "1", default-features = false }
+flate2 = { version = "1", optional = true, default-features = false, features = ["rust_backend"] }
+sha2 = { version = "0.10", optional = true, default-features = false }
+rayon = { version = "1", optional = true }
+crc32fast = { version = "1", optional = true }
+memmap2 = { version = "0.9", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"
+hdf5 = { package = "hdf5-metno", version = "0.12", features = ["static", "zlib"] }
+ndarray = "0.16"
