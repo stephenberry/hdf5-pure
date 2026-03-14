@@ -170,13 +170,13 @@ pub fn resolve_path_any(
     let base = superblock.base_address;
 
     let root_header =
-        ObjectHeader::parse(file_data, superblock.root_group_address as usize, os, ls)?;
+        ObjectHeader::parse_with_base(file_data, superblock.root_group_address as usize, os, ls, base)?;
 
     let mut current_addr = superblock.root_group_address;
     let mut current_header = root_header;
 
     for (i, component) in components.iter().enumerate() {
-        let entries = resolve_group_entries(file_data, &current_header, os, ls)?;
+        let entries = resolve_group_entries(file_data, &current_header, os, ls, base)?;
 
         let found = entries.iter().find(|e| e.name == *component);
         match found {
@@ -188,7 +188,7 @@ pub fn resolve_path_any(
                 }
                 current_addr = abs_addr;
                 current_header =
-                    ObjectHeader::parse(file_data, current_addr as usize, os, ls)?;
+                    ObjectHeader::parse_with_base(file_data, current_addr as usize, os, ls, base)?;
             }
             None => {
                 return Err(FormatError::PathNotFound(String::from(*component)));
@@ -200,11 +200,15 @@ pub fn resolve_path_any(
 }
 
 /// Resolve group entries from an object header, auto-detecting v1 vs v2.
+///
+/// `base_address` is the superblock base address, used to convert relative
+/// addresses to absolute file offsets in v1 groups.
 pub fn resolve_group_entries(
     file_data: &[u8],
     object_header: &ObjectHeader,
     offset_size: u8,
     length_size: u8,
+    base_address: u64,
 ) -> Result<Vec<GroupEntry>, FormatError> {
     if is_v1_group(object_header) {
         // v1: find SymbolTableMessage and use existing v1 code
@@ -216,7 +220,7 @@ pub fn resolve_group_entries(
                 FormatError::PathNotFound(String::from("no symbol table message"))
             })?;
         let stm = SymbolTableMessage::parse(&sym_msg.data, offset_size)?;
-        group_v1::resolve_v1_group_entries(file_data, &stm, offset_size, length_size)
+        group_v1::resolve_v1_group_entries(file_data, &stm, offset_size, length_size, base_address)
     } else if is_v2_group(object_header) {
         resolve_v2_group_entries(file_data, object_header, offset_size, length_size)
     } else {

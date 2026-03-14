@@ -85,11 +85,26 @@ impl ObjectHeader {
         offset_size: u8,
         length_size: u8,
     ) -> Result<ObjectHeader, FormatError> {
+        Self::parse_with_base(data, offset, offset_size, length_size, 0)
+    }
+
+    /// Parse an object header, applying `base_address` to v1 continuation offsets.
+    ///
+    /// For files with a non-zero superblock base_address (e.g., files with a userblock),
+    /// v1 object header continuation block addresses are stored relative to base_address.
+    /// This method adds `base_address` to those addresses before reading them.
+    pub fn parse_with_base(
+        data: &[u8],
+        offset: usize,
+        offset_size: u8,
+        length_size: u8,
+        base_address: u64,
+    ) -> Result<ObjectHeader, FormatError> {
         ensure_len(data, offset, 4)?;
         if data[offset..offset + 4] == OHDR_SIGNATURE {
             Self::parse_v2(data, offset, offset_size, length_size)
         } else {
-            Self::parse_v1(data, offset, offset_size, length_size)
+            Self::parse_v1(data, offset, offset_size, length_size, base_address)
         }
     }
 
@@ -98,6 +113,7 @@ impl ObjectHeader {
         offset: usize,
         offset_size: u8,
         length_size: u8,
+        base_address: u64,
     ) -> Result<ObjectHeader, FormatError> {
         // version(1) + reserved(1) + num_messages(2) + ref_count(4) + header_size(4) = 12
         // then pad to 8-byte alignment from start of header
@@ -165,8 +181,9 @@ impl ObjectHeader {
                 let cont_msg_data = &messages.last()
                     .ok_or(FormatError::InvalidObjectHeaderSignature)?.data;
                 if cont_msg_data.len() >= (offset_size as usize + length_size as usize) {
-                    let cont_offset =
-                        read_offset(cont_msg_data, 0, offset_size)? as usize;
+                    let cont_offset_raw =
+                        read_offset(cont_msg_data, 0, offset_size)?;
+                    let cont_offset = (cont_offset_raw + base_address) as usize;
                     let cont_length =
                         read_offset(cont_msg_data, offset_size as usize, length_size)?
                             as usize;
@@ -177,6 +194,7 @@ impl ObjectHeader {
                         cont_length,
                         offset_size,
                         length_size,
+                        base_address,
                         32, // max continuation depth
                     )?;
                     messages.extend(cont_msgs);
@@ -202,6 +220,7 @@ impl ObjectHeader {
         length: usize,
         offset_size: u8,
         length_size: u8,
+        base_address: u64,
         depth_remaining: u16,
     ) -> Result<Vec<HeaderMessage>, FormatError> {
         if depth_remaining == 0 {
@@ -247,13 +266,15 @@ impl ObjectHeader {
                 let cont_msg_data = &messages.last()
                     .ok_or(FormatError::InvalidObjectHeaderSignature)?.data;
                 if cont_msg_data.len() >= (offset_size as usize + length_size as usize) {
-                    let cont_offset =
-                        read_offset(cont_msg_data, 0, offset_size)? as usize;
+                    let cont_offset_raw =
+                        read_offset(cont_msg_data, 0, offset_size)?;
+                    let cont_offset = (cont_offset_raw + base_address) as usize;
                     let cont_length =
                         read_offset(cont_msg_data, offset_size as usize, length_size)?
                             as usize;
                     let cont_msgs = Self::parse_v1_continuation(
                         data, cont_offset, cont_length, offset_size, length_size,
+                        base_address,
                         depth_remaining - 1,
                     )?;
                     messages.extend(cont_msgs);

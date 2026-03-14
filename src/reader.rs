@@ -96,11 +96,12 @@ impl File {
     }
 
     fn parse_header(&self, address: u64) -> Result<ObjectHeader, FormatError> {
-        ObjectHeader::parse(
+        ObjectHeader::parse_with_base(
             &self.data,
             address as usize,
             self.superblock.offset_size,
             self.superblock.length_size,
+            self.addr_offset,
         )
     }
 
@@ -211,7 +212,7 @@ impl<'f> Group<'f> {
         let os = self.file.offset_size();
         let ls = self.file.length_size();
         let base = self.file.addr_offset;
-        let mut entries = group_v2::resolve_group_entries(&self.file.data, &hdr, os, ls)
+        let mut entries = group_v2::resolve_group_entries(&self.file.data, &hdr, os, ls, base)
             .map_err(Error::Format)?;
         // Convert link addresses from relative to absolute
         for entry in &mut entries {

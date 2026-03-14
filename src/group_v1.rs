@@ -22,31 +22,39 @@ pub struct GroupEntry {
 }
 
 /// Given a SymbolTableMessage, resolve all group children.
+///
+/// `base_address` is the superblock base address (typically the userblock size).
+/// All addresses stored in v1 structures are relative to this value.
 pub fn resolve_v1_group_entries(
     file_data: &[u8],
     sym_table_msg: &SymbolTableMessage,
     offset_size: u8,
     length_size: u8,
+    base_address: u64,
 ) -> Result<Vec<GroupEntry>, FormatError> {
-    // Parse local heap
-    let heap = LocalHeap::parse(
+    // Parse local heap (address is relative to base_address)
+    let mut heap = LocalHeap::parse(
         file_data,
-        sym_table_msg.local_heap_address as usize,
+        (sym_table_msg.local_heap_address + base_address) as usize,
         offset_size,
         length_size,
     )?;
+    // The data segment address stored in the heap is also relative to base_address
+    heap.data_segment_address += base_address;
 
-    // Collect all SNOD addresses from B-tree
+    // Collect all SNOD addresses from B-tree (btree_address is relative to base_address)
     let snod_addrs = collect_symbol_table_nodes(
         file_data,
         sym_table_msg.btree_address,
         offset_size,
         length_size,
+        base_address,
     )?;
 
     let mut entries = Vec::new();
     for snod_addr in snod_addrs {
-        let snod = SymbolTableNode::parse(file_data, snod_addr as usize, offset_size)?;
+        // SNOD addresses from B-tree children are also relative to base_address
+        let snod = SymbolTableNode::parse(file_data, (snod_addr + base_address) as usize, offset_size)?;
         for entry in &snod.entries {
             let name = heap.read_string(file_data, entry.link_name_offset)?;
             entries.push(GroupEntry {
@@ -77,6 +85,10 @@ fn find_symbol_table_message(
 
 /// Navigate a path like "group1/subgroup/dataset" from a root group.
 /// Returns the object header address of the target.
+///
+/// Note: this function does not apply base_address offsets. It is intended for
+/// use with files that have base_address=0. Use `resolve_path_any` from group_v2
+/// for general-purpose path resolution.
 pub fn resolve_path(
     file_data: &[u8],
     root_sym_table: &SymbolTableMessage,
@@ -93,7 +105,7 @@ pub fn resolve_path(
 
     for (i, component) in components.iter().enumerate() {
         let entries =
-            resolve_v1_group_entries(file_data, &current_sym_table, offset_size, length_size)?;
+            resolve_v1_group_entries(file_data, &current_sym_table, offset_size, length_size, 0)?;
 
         let found = entries.iter().find(|e| e.name == *component);
         match found {
@@ -294,7 +306,7 @@ mod tests {
             8,
             8,
         );
-        let entries = resolve_v1_group_entries(&file, &msg, 8, 8).unwrap();
+        let entries = resolve_v1_group_entries(&file, &msg, 8, 8, 0).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].name, "alpha");
         assert_eq!(entries[0].object_header_address, 0x1000);
@@ -361,7 +373,7 @@ mod tests {
         let sb = crate::superblock::Superblock::parse(file_data, sig_offset).unwrap();
         let root_sym = get_root_sym_table(file_data, &sb);
 
-        let entries = resolve_v1_group_entries(file_data, &root_sym, sb.offset_size, sb.length_size).unwrap();
+        let entries = resolve_v1_group_entries(file_data, &root_sym, sb.offset_size, sb.length_size, 0).unwrap();
         let data_entry = entries.iter().find(|e| e.name == "data").expect("should have 'data'");
 
         let hdr = ObjectHeader::parse(file_data, data_entry.object_header_address as usize, sb.offset_size, sb.length_size).unwrap();

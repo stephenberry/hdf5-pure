@@ -369,6 +369,25 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
                 raw_data: bytes.to_vec(),
             }
         }
+        AttrValue::AsciiStringArray(arr) => {
+            let max_len = arr.iter().map(|s| s.len()).max().unwrap_or(0);
+            let mut raw = Vec::new();
+            for s in arr {
+                let mut b = s.as_bytes().to_vec();
+                b.resize(max_len, 0);
+                raw.extend_from_slice(&b);
+            }
+            AttributeMessage {
+                name: name.to_string(),
+                datatype: Datatype::String {
+                    size: max_len as u32,
+                    padding: StringPadding::NullPad,
+                    charset: CharacterSet::Ascii,
+                },
+                dataspace: simple_1d(arr.len() as u64),
+                raw_data: raw,
+            }
+        }
         AttrValue::VarLenAsciiArray(strings) => {
             // Build a VL string attribute. Each element is a VL reference:
             //   sequence_length (4 bytes) + collection_address (8 bytes) + object_index (4 bytes) = 16 bytes
@@ -502,6 +521,9 @@ pub enum AttrValue {
     StringArray(Vec<String>),
     /// Fixed-width ASCII string attribute (charset = ASCII).
     AsciiString(String),
+    /// Array of fixed-width ASCII strings (null-padded to the longest element).
+    /// Compatible with MATLAB `MATLAB_fields` and matio.
+    AsciiStringArray(Vec<String>),
     /// Array of variable-length ASCII strings (MATLAB_fields pattern).
     /// Each element is a variable-length sequence of ASCII bytes.
     /// Requires a global heap collection in the file.

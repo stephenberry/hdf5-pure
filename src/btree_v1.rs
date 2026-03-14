@@ -137,27 +137,32 @@ impl BTreeV1Node {
 }
 
 /// Collect all leaf-level child addresses (SNOD addresses) by traversing the B-tree.
+///
+/// `base_address` is the superblock base address. All addresses stored in the
+/// B-tree are relative to this value. The returned SNOD addresses are also
+/// relative (the caller must add `base_address` to obtain absolute file offsets).
 pub fn collect_symbol_table_nodes(
     file_data: &[u8],
     btree_address: u64,
     offset_size: u8,
     length_size: u8,
+    base_address: u64,
 ) -> Result<Vec<u64>, FormatError> {
-    let node = BTreeV1Node::parse(file_data, btree_address as usize, offset_size, length_size)?;
+    let node = BTreeV1Node::parse(file_data, (btree_address + base_address) as usize, offset_size, length_size)?;
 
     if node.node_type != 0 {
         return Err(FormatError::InvalidBTreeNodeType(node.node_type));
     }
 
     if node.node_level == 0 {
-        // Leaf: children are SNOD addresses
+        // Leaf: children are SNOD addresses (relative to base_address)
         Ok(node.children)
     } else {
-        // Internal: recurse into children
+        // Internal: recurse into children (child addresses are relative to base_address)
         let mut result = Vec::new();
         for &child_addr in &node.children {
             let child_snods =
-                collect_symbol_table_nodes(file_data, child_addr, offset_size, length_size)?;
+                collect_symbol_table_nodes(file_data, child_addr, offset_size, length_size, base_address)?;
             result.extend(child_snods);
         }
         Ok(result)
@@ -246,7 +251,7 @@ mod tests {
         file[leaf2_offset..leaf2_offset + leaf2.len()].copy_from_slice(&leaf2);
         file[internal_offset..internal_offset + internal.len()].copy_from_slice(&internal);
 
-        let snods = collect_symbol_table_nodes(&file, internal_offset as u64, os, os).unwrap();
+        let snods = collect_symbol_table_nodes(&file, internal_offset as u64, os, os, 0).unwrap();
         assert_eq!(snods, vec![0xA00, 0xB00]);
     }
 
@@ -263,7 +268,7 @@ mod tests {
         let data = build_btree_node(1, 0, &[0, 1], &[0x100], None, None, 8);
         let mut file = vec![0u8; 512];
         file[..data.len()].copy_from_slice(&data);
-        let err = collect_symbol_table_nodes(&file, 0, 8, 8).unwrap_err();
+        let err = collect_symbol_table_nodes(&file, 0, 8, 8, 0).unwrap_err();
         assert_eq!(err, FormatError::InvalidBTreeNodeType(1));
     }
 
