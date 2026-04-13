@@ -130,19 +130,24 @@ impl ObjectHeader {
 
         // Pad to 8-byte alignment: header prefix is 12 bytes, pad to 16
         let padding = 4; // pad 12-byte prefix to 16-byte alignment
-        let msg_start = offset.checked_add(12 + padding).ok_or(FormatError::UnexpectedEof {
-            expected: usize::MAX,
-            available: data.len(),
-        })?;
+        let msg_start = offset
+            .checked_add(12 + padding)
+            .ok_or(FormatError::UnexpectedEof {
+                expected: usize::MAX,
+                available: data.len(),
+            })?;
 
         ensure_len(data, msg_start, header_data_size)?;
 
         let mut messages = Vec::new();
         let mut pos = msg_start;
-        let msg_end = msg_start.checked_add(header_data_size).ok_or(FormatError::UnexpectedEof {
-            expected: usize::MAX,
-            available: data.len(),
-        })?;
+        let msg_end =
+            msg_start
+                .checked_add(header_data_size)
+                .ok_or(FormatError::UnexpectedEof {
+                    expected: usize::MAX,
+                    available: data.len(),
+                })?;
 
         for _ in 0..num_messages {
             if pos + 8 > msg_end {
@@ -178,15 +183,15 @@ impl ObjectHeader {
 
             // Follow continuations
             if msg_type == MessageType::ObjectHeaderContinuation {
-                let cont_msg_data = &messages.last()
-                    .ok_or(FormatError::InvalidObjectHeaderSignature)?.data;
+                let cont_msg_data = &messages
+                    .last()
+                    .ok_or(FormatError::InvalidObjectHeaderSignature)?
+                    .data;
                 if cont_msg_data.len() >= (offset_size as usize + length_size as usize) {
-                    let cont_offset_raw =
-                        read_offset(cont_msg_data, 0, offset_size)?;
+                    let cont_offset_raw = read_offset(cont_msg_data, 0, offset_size)?;
                     let cont_offset = (cont_offset_raw + base_address) as usize;
                     let cont_length =
-                        read_offset(cont_msg_data, offset_size as usize, length_size)?
-                            as usize;
+                        read_offset(cont_msg_data, offset_size as usize, length_size)? as usize;
                     // Parse continuation block (v1: just raw messages, no signature)
                     let cont_msgs = Self::parse_v1_continuation(
                         data,
@@ -263,17 +268,21 @@ impl ObjectHeader {
 
             // Recursive continuations
             if msg_type == MessageType::ObjectHeaderContinuation {
-                let cont_msg_data = &messages.last()
-                    .ok_or(FormatError::InvalidObjectHeaderSignature)?.data;
+                let cont_msg_data = &messages
+                    .last()
+                    .ok_or(FormatError::InvalidObjectHeaderSignature)?
+                    .data;
                 if cont_msg_data.len() >= (offset_size as usize + length_size as usize) {
-                    let cont_offset_raw =
-                        read_offset(cont_msg_data, 0, offset_size)?;
+                    let cont_offset_raw = read_offset(cont_msg_data, 0, offset_size)?;
                     let cont_offset = (cont_offset_raw + base_address) as usize;
                     let cont_length =
-                        read_offset(cont_msg_data, offset_size as usize, length_size)?
-                            as usize;
+                        read_offset(cont_msg_data, offset_size as usize, length_size)? as usize;
                     let cont_msgs = Self::parse_v1_continuation(
-                        data, cont_offset, cont_length, offset_size, length_size,
+                        data,
+                        cont_offset,
+                        cont_length,
+                        offset_size,
+                        length_size,
                         base_address,
                         depth_remaining - 1,
                     )?;
@@ -335,10 +344,12 @@ impl ObjectHeader {
         pos += chunk_size_width as usize;
 
         let chunk0_msg_start = pos;
-        let chunk0_msg_end = pos.checked_add(chunk0_size).ok_or(FormatError::UnexpectedEof {
-            expected: usize::MAX,
-            available: data.len(),
-        })?;
+        let chunk0_msg_end = pos
+            .checked_add(chunk0_size)
+            .ok_or(FormatError::UnexpectedEof {
+                expected: usize::MAX,
+                available: data.len(),
+            })?;
 
         // Validate checksum: from OHDR signature through all messages (before checksum)
         ensure_len(data, chunk0_msg_end, 4)?;
@@ -546,7 +557,7 @@ mod tests {
         buf.extend_from_slice(&(messages.len() as u16).to_le_bytes()); // num_messages
         buf.extend_from_slice(&1u32.to_le_bytes()); // reference_count
         buf.extend_from_slice(&(msg_bytes.len() as u32).to_le_bytes()); // header_data_size
-        // Pad to 8-byte alignment (12 bytes so far, pad 4)
+                                                                        // Pad to 8-byte alignment (12 bytes so far, pad 4)
         buf.extend_from_slice(&[0u8; 4]);
         buf.extend_from_slice(&msg_bytes);
         buf
@@ -623,7 +634,7 @@ mod tests {
     fn parse_v1_two_messages() {
         let messages = [
             (0x0001u16, &[1u8, 2, 3, 4][..], 0u8), // Dataspace
-            (0x0008, &[5u8, 6][..], 0),              // DataLayout
+            (0x0008, &[5u8, 6][..], 0),            // DataLayout
         ];
         let data = build_v1_header(&messages, 8, 8);
         let hdr = ObjectHeader::parse(&data, 0, 8, 8).unwrap();
@@ -666,11 +677,7 @@ mod tests {
 
     #[test]
     fn parse_v2_with_timestamps() {
-        let data = build_v2_header(
-            0x20,
-            &[(0x01, &[1], 0)],
-            Some((100, 200, 300, 400)),
-        );
+        let data = build_v2_header(0x20, &[(0x01, &[1], 0)], Some((100, 200, 300, 400)));
         let hdr = ObjectHeader::parse(&data, 0, 8, 8).unwrap();
         assert_eq!(hdr.access_time, Some(100));
         assert_eq!(hdr.modification_time, Some(200));
@@ -722,7 +729,7 @@ mod tests {
             0x00,
             &[
                 (0x00, &[0, 0, 0, 0], 0), // NIL
-                (0x01, &[42], 0),           // Dataspace
+                (0x01, &[42], 0),         // Dataspace
             ],
             None,
         );
@@ -781,8 +788,8 @@ mod tests {
         let header = build_v2_header(
             0x00,
             &[
-                (0x01, &[42], 0),       // Dataspace
-                (0x10, &cont_data, 0),   // Continuation
+                (0x01, &[42], 0),      // Dataspace
+                (0x10, &cont_data, 0), // Continuation
             ],
             None,
         );

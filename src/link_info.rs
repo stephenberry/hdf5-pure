@@ -139,7 +139,7 @@ mod tests {
         let mut data = vec![0u8; 2 + 8 + 8];
         data[0] = 0; // version
         data[1] = 0; // flags
-        // fractal heap address = undefined
+                     // fractal heap address = undefined
         data[2..10].copy_from_slice(&0xFFFF_FFFF_FFFF_FFFFu64.to_le_bytes());
         // btree name index = undefined
         data[10..18].copy_from_slice(&0xFFFF_FFFF_FFFF_FFFFu64.to_le_bytes());

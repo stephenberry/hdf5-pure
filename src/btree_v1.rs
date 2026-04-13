@@ -148,7 +148,12 @@ pub fn collect_symbol_table_nodes(
     length_size: u8,
     base_address: u64,
 ) -> Result<Vec<u64>, FormatError> {
-    let node = BTreeV1Node::parse(file_data, (btree_address + base_address) as usize, offset_size, length_size)?;
+    let node = BTreeV1Node::parse(
+        file_data,
+        (btree_address + base_address) as usize,
+        offset_size,
+        length_size,
+    )?;
 
     if node.node_type != 0 {
         return Err(FormatError::InvalidBTreeNodeType(node.node_type));
@@ -161,8 +166,13 @@ pub fn collect_symbol_table_nodes(
         // Internal: recurse into children (child addresses are relative to base_address)
         let mut result = Vec::new();
         for &child_addr in &node.children {
-            let child_snods =
-                collect_symbol_table_nodes(file_data, child_addr, offset_size, length_size, base_address)?;
+            let child_snods = collect_symbol_table_nodes(
+                file_data,
+                child_addr,
+                offset_size,
+                length_size,
+                base_address,
+            )?;
             result.extend(child_snods);
         }
         Ok(result)
@@ -197,7 +207,11 @@ mod tests {
         buf.push(node_type);
         buf.push(level);
         buf.extend_from_slice(&entries_used.to_le_bytes());
-        let undef: u64 = if offset_size == 4 { 0xFFFFFFFF } else { 0xFFFFFFFFFFFFFFFF };
+        let undef: u64 = if offset_size == 4 {
+            0xFFFFFFFF
+        } else {
+            0xFFFFFFFFFFFFFFFF
+        };
         write_offset(&mut buf, left.unwrap_or(undef), offset_size);
         write_offset(&mut buf, right.unwrap_or(undef), offset_size);
         for i in 0..children.len() {
@@ -240,10 +254,13 @@ mod tests {
         let leaf1 = build_btree_node(0, 0, &[0, 5], &[0xA00], None, None, os);
         let leaf2 = build_btree_node(0, 0, &[5, 10], &[0xB00], None, None, os);
         let internal = build_btree_node(
-            0, 1,
+            0,
+            1,
             &[0, 5, 10],
             &[leaf1_offset as u64, leaf2_offset as u64],
-            None, None, os,
+            None,
+            None,
+            os,
         );
 
         let mut file = vec![0u8; 1024];

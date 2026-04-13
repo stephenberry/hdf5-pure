@@ -91,7 +91,10 @@ pub fn decompress_chunks_lane_partitioned(
                 stats.compressed_bytes += size as u64;
                 stats.decompressed_bytes += decompressed.len() as u64;
 
-                results.push(DecompressedChunk { index, data: decompressed });
+                results.push(DecompressedChunk {
+                    index,
+                    data: decompressed,
+                });
             }
 
             Ok((results, stats))
@@ -155,7 +158,10 @@ pub fn decompress_chunks_parallel(
                 raw_chunk.to_vec()
             };
 
-            Ok(DecompressedChunk { index, data: decompressed })
+            Ok(DecompressedChunk {
+                index,
+                data: decompressed,
+            })
         })
         .collect();
 

@@ -481,8 +481,7 @@ pub(crate) fn patch_vl_refs(raw_data: &mut [u8], collection_address: u64) {
     let count = raw_data.len() / vl_ref_size;
     for i in 0..count {
         let addr_offset = i * vl_ref_size + 4; // skip sequence_length
-        raw_data[addr_offset..addr_offset + 8]
-            .copy_from_slice(&collection_address.to_le_bytes());
+        raw_data[addr_offset..addr_offset + 8].copy_from_slice(&collection_address.to_le_bytes());
     }
 }
 
@@ -859,6 +858,15 @@ impl DatasetBuilder {
     /// Enable fletcher32 checksum.
     pub fn with_fletcher32(&mut self) -> &mut Self {
         self.chunk_options.fletcher32 = true;
+        self
+    }
+
+    /// Enable ZFP fixed-rate compression (implies chunked if not already set).
+    ///
+    /// `rate` is the number of compressed bits per value (e.g. 16.0 gives
+    /// 2:1 compression for f32 data). Only valid for f32 datasets.
+    pub fn with_zfp(&mut self, rate: f64) -> &mut Self {
+        self.chunk_options.zfp_rate = Some(rate);
         self
     }
 

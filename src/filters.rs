@@ -7,14 +7,16 @@ extern crate alloc;
 use alloc::{vec, vec::Vec};
 
 use crate::error::FormatError;
-use crate::filter_pipeline::{FilterPipeline, FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SHUFFLE};
+use crate::filter_pipeline::{
+    FilterPipeline, FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SHUFFLE, FILTER_ZFP,
+};
 
 /// Apply a filter pipeline to decompress a chunk.
 /// Filters are applied in REVERSE order for decompression.
 pub fn decompress_chunk(
     compressed: &[u8],
     pipeline: &FilterPipeline,
-    _chunk_size: usize,
+    chunk_size: usize,
     element_size: u32,
 ) -> Result<Vec<u8>, FormatError> {
     let mut data = compressed.to_vec();
@@ -24,6 +26,14 @@ pub fn decompress_chunk(
             FILTER_SHUFFLE => shuffle_decompress(&data, element_size as usize)?,
             FILTER_DEFLATE => deflate_decompress(&data)?,
             FILTER_FLETCHER32 => fletcher32_verify(&data)?,
+            FILTER_ZFP => {
+                let rate =
+                    crate::zfp::zfp_rate_from_cd_values(&filter.client_data).ok_or_else(|| {
+                        FormatError::FilterError("ZFP: invalid or non-rate cd_values".into())
+                    })?;
+                let num_floats = chunk_size / element_size as usize;
+                crate::zfp::decompress_f32(&data, num_floats, rate)?
+            }
             other => return Err(FormatError::UnsupportedFilter(other)),
         };
     }
@@ -48,6 +58,13 @@ pub fn compress_chunk(
                 deflate_compress(&result, level)?
             }
             FILTER_FLETCHER32 => fletcher32_append(&result)?,
+            FILTER_ZFP => {
+                let rate =
+                    crate::zfp::zfp_rate_from_cd_values(&filter.client_data).ok_or_else(|| {
+                        FormatError::FilterError("ZFP: invalid or non-rate cd_values".into())
+                    })?;
+                crate::zfp::compress_f32(&result, rate)?
+            }
             other => return Err(FormatError::UnsupportedFilter(other)),
         };
     }
@@ -76,10 +93,7 @@ fn deflate_decompress(_data: &[u8]) -> Result<Vec<u8>, FormatError> {
 #[cfg(feature = "deflate")]
 fn deflate_compress(data: &[u8], level: u32) -> Result<Vec<u8>, FormatError> {
     use std::io::Write;
-    let mut encoder = flate2::write::ZlibEncoder::new(
-        Vec::new(),
-        flate2::Compression::new(level),
-    );
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(level));
     encoder
         .write_all(data)
         .map_err(|e| FormatError::CompressionError(e.to_string()))?;
@@ -288,7 +302,10 @@ mod tests {
         // After shuffle: [A0 B0 A1 B1 A2 B2 A3 B3]
         let data = vec![0xA0, 0xA1, 0xA2, 0xA3, 0xB0, 0xB1, 0xB2, 0xB3];
         let shuffled = shuffle_compress(&data, 4).unwrap();
-        assert_eq!(shuffled, vec![0xA0, 0xB0, 0xA1, 0xB1, 0xA2, 0xB2, 0xA3, 0xB3]);
+        assert_eq!(
+            shuffled,
+            vec![0xA0, 0xB0, 0xA1, 0xB1, 0xA2, 0xB2, 0xA3, 0xB3]
+        );
     }
 
     // --- Fletcher32 tests ---
@@ -331,7 +348,10 @@ mod tests {
         let last = with_checksum.len() - 1;
         with_checksum[last] ^= 0xFF;
         let result = fletcher32_verify(&with_checksum);
-        assert!(matches!(result, Err(FormatError::Fletcher32Mismatch { .. })));
+        assert!(matches!(
+            result,
+            Err(FormatError::Fletcher32Mismatch { .. })
+        ));
     }
 
     // --- Pipeline tests ---

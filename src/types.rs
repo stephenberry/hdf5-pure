@@ -135,7 +135,10 @@ pub(crate) fn classify_datatype(dt: &crate::datatype::Datatype) -> DType {
             base_type,
             dimensions,
         } => DType::Array(Box::new(classify_datatype(base_type)), dimensions.clone()),
-        Datatype::Reference { ref_type: crate::datatype::ReferenceType::Object, .. } => DType::ObjectReference,
+        Datatype::Reference {
+            ref_type: crate::datatype::ReferenceType::Object,
+            ..
+        } => DType::ObjectReference,
         _ => DType::Other(format!("{dt:?}")),
     }
 }
@@ -204,7 +207,9 @@ fn decode_attr_value(
         Datatype::VariableLength {
             is_string: true, ..
         } => {
-            let strings = attr.read_vl_strings(file_data, offset_size, length_size).ok()?;
+            let strings = attr
+                .read_vl_strings(file_data, offset_size, length_size)
+                .ok()?;
             if strings.len() == 1 {
                 Some(AttrValue::String(strings[0].clone()))
             } else {

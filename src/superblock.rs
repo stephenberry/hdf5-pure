@@ -324,7 +324,7 @@ mod tests {
         buf.extend_from_slice(&4u16.to_le_bytes()); // group_leaf_node_k
         buf.extend_from_slice(&16u16.to_le_bytes()); // group_internal_node_k
         buf.extend_from_slice(&0u32.to_le_bytes()); // consistency_flags
-        // base_address
+                                                    // base_address
         write_offset(&mut buf, 0, offset_size);
         // free_space_address
         write_offset(&mut buf, 0xFFFFFFFFFFFFFFFF, offset_size);
@@ -370,7 +370,7 @@ mod tests {
         write_offset(&mut buf, 0xFFFFFFFFFFFFFFFF, offset_size); // free space
         write_offset(&mut buf, 8192, offset_size); // eof
         write_offset(&mut buf, 0xFFFFFFFFFFFFFFFF, offset_size); // driver info
-        // Root symbol table entry
+                                                                 // Root symbol table entry
         write_offset(&mut buf, 0, offset_size);
         write_offset(&mut buf, 200, offset_size); // root group addr
         buf.extend_from_slice(&0u32.to_le_bytes());
@@ -495,7 +495,7 @@ mod tests {
     #[test]
     fn truncated_data() {
         let data = HDF5_SIGNATURE.to_vec(); // Just the signature, no version
-        // Only 8 bytes, need at least 9
+                                            // Only 8 bytes, need at least 9
         assert!(matches!(
             Superblock::parse(&data, 0),
             Err(FormatError::UnexpectedEof { .. })

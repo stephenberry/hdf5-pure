@@ -16,6 +16,7 @@ fast-deflate = ["flate2/zlib-ng"]
 provenance = ["sha2"]
 mmap = ["memmap2"]
 parallel = ["rayon"]
+zfp = []
 
 [dependencies]
 byteorder = { version = "1", default-features = false }

@@ -79,9 +79,13 @@ impl LinkMessage {
 
         let name_bytes = self.name.as_bytes();
         let name_len = name_bytes.len();
-        let name_size_width: u8 = if name_len <= 0xFF { 1 }
-            else if name_len <= 0xFFFF { 2 }
-            else { 4 };
+        let name_size_width: u8 = if name_len <= 0xFF {
+            1
+        } else if name_len <= 0xFFFF {
+            2
+        } else {
+            4
+        };
 
         let is_hard = matches!(self.link_target, LinkTarget::Hard { .. });
         let has_link_type = !is_hard;
@@ -90,14 +94,25 @@ impl LinkMessage {
 
         let mut flags: u8 = 0;
         // Bits 0-1: size of name length field
-        let size_bits = match name_size_width { 1 => 0u8, 2 => 1, 4 => 2, _ => 3 };
+        let size_bits = match name_size_width {
+            1 => 0u8,
+            2 => 1,
+            4 => 2,
+            _ => 3,
+        };
         flags |= size_bits;
         // Bit 2: creation order present
-        if has_creation_order { flags |= 0x04; }
+        if has_creation_order {
+            flags |= 0x04;
+        }
         // Bit 3: link type present
-        if has_link_type { flags |= 0x08; }
+        if has_link_type {
+            flags |= 0x08;
+        }
         // Bit 4: charset present
-        if has_charset { flags |= 0x10; }
+        if has_charset {
+            flags |= 0x10;
+        }
         buf.push(flags);
 
         if has_link_type {
@@ -128,20 +143,23 @@ impl LinkMessage {
         buf.extend_from_slice(name_bytes);
 
         match &self.link_target {
-            LinkTarget::Hard { object_header_address } => {
-                match offset_size {
-                    2 => buf.extend_from_slice(&(*object_header_address as u16).to_le_bytes()),
-                    4 => buf.extend_from_slice(&(*object_header_address as u32).to_le_bytes()),
-                    8 => buf.extend_from_slice(&object_header_address.to_le_bytes()),
-                    _ => {}
-                }
-            }
+            LinkTarget::Hard {
+                object_header_address,
+            } => match offset_size {
+                2 => buf.extend_from_slice(&(*object_header_address as u16).to_le_bytes()),
+                4 => buf.extend_from_slice(&(*object_header_address as u32).to_le_bytes()),
+                8 => buf.extend_from_slice(&object_header_address.to_le_bytes()),
+                _ => {}
+            },
             LinkTarget::Soft { target_path } => {
                 let path_bytes = target_path.as_bytes();
                 buf.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
                 buf.extend_from_slice(path_bytes);
             }
-            LinkTarget::External { filename, object_path } => {
+            LinkTarget::External {
+                filename,
+                object_path,
+            } => {
                 let mut ext_data = Vec::new();
                 ext_data.push(0); // flags
                 ext_data.extend_from_slice(filename.as_bytes());
@@ -249,19 +267,16 @@ impl LinkMessage {
             1 => {
                 // Soft link
                 ensure_len(data, pos, 2)?;
-                let soft_len =
-                    u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+                let soft_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
                 pos += 2;
                 ensure_len(data, pos, soft_len)?;
-                let target_path =
-                    String::from_utf8_lossy(&data[pos..pos + soft_len]).into_owned();
+                let target_path = String::from_utf8_lossy(&data[pos..pos + soft_len]).into_owned();
                 LinkTarget::Soft { target_path }
             }
             64 => {
                 // External link
                 ensure_len(data, pos, 2)?;
-                let ext_len =
-                    u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+                let ext_len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
                 pos += 2;
                 ensure_len(data, pos, ext_len)?;
                 let ext_data = &data[pos..pos + ext_len];
@@ -270,8 +285,7 @@ impl LinkMessage {
                 let start = if !ext_data.is_empty() { 1 } else { 0 };
                 let rest = &ext_data[start..];
                 let null1 = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
-                let filename =
-                    String::from_utf8_lossy(&rest[..null1]).into_owned();
+                let filename = String::from_utf8_lossy(&rest[..null1]).into_owned();
                 let after_null1 = if null1 + 1 < rest.len() {
                     null1 + 1
                 } else {
@@ -279,8 +293,7 @@ impl LinkMessage {
                 };
                 let rest2 = &rest[after_null1..];
                 let null2 = rest2.iter().position(|&b| b == 0).unwrap_or(rest2.len());
-                let object_path =
-                    String::from_utf8_lossy(&rest2[..null2]).into_owned();
+                let object_path = String::from_utf8_lossy(&rest2[..null2]).into_owned();
                 LinkTarget::External {
                     filename,
                     object_path,

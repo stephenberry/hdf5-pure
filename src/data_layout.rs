@@ -205,20 +205,10 @@ impl DataLayout {
                     let val = match dim_size_encoded_length {
                         1 => data[p] as u32,
                         2 => u16::from_le_bytes([data[p], data[p + 1]]) as u32,
-                        4 => u32::from_le_bytes([
-                            data[p],
-                            data[p + 1],
-                            data[p + 2],
-                            data[p + 3],
-                        ]),
+                        4 => u32::from_le_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]),
                         8 => {
                             // Truncate to u32
-                            u32::from_le_bytes([
-                                data[p],
-                                data[p + 1],
-                                data[p + 2],
-                                data[p + 3],
-                            ])
+                            u32::from_le_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]])
                         }
                         _ => {
                             return Err(FormatError::UnexpectedEof {
@@ -252,7 +242,10 @@ impl DataLayout {
                             single_chunk_filtered_size = Some(read_length(data, p, length_size)?);
                             p += ls;
                             single_chunk_filter_mask = Some(u32::from_le_bytes([
-                                data[p], data[p + 1], data[p + 2], data[p + 3],
+                                data[p],
+                                data[p + 1],
+                                data[p + 2],
+                                data[p + 3],
                             ]));
                             p += 4;
                             if is_undefined(data, p, offset_size) {
@@ -391,7 +384,7 @@ mod tests {
         let mut buf = vec![3u8, 2]; // version=3, class=2 (chunked)
         buf.push(3); // dimensionality=3 (rank+1)
         buf.extend_from_slice(&0x2000u64.to_le_bytes()); // btree address
-        // 3 chunk dim sizes × 4 bytes
+                                                         // 3 chunk dim sizes × 4 bytes
         buf.extend_from_slice(&100u32.to_le_bytes());
         buf.extend_from_slice(&200u32.to_le_bytes());
         buf.extend_from_slice(&8u32.to_le_bytes()); // last = element size
@@ -415,7 +408,12 @@ mod tests {
         buf.extend_from_slice(&3u16.to_le_bytes());
         buf.extend_from_slice(&[1, 2, 3]);
         let layout = DataLayout::parse(&buf, 8, 8).unwrap();
-        assert_eq!(layout, DataLayout::Compact { data: vec![1, 2, 3] });
+        assert_eq!(
+            layout,
+            DataLayout::Compact {
+                data: vec![1, 2, 3]
+            }
+        );
     }
 
     #[test]
@@ -465,7 +463,7 @@ mod tests {
         buf.push(4); // dim_size_encoded_length=4
         buf.extend_from_slice(&128u32.to_le_bytes()); // dim 0
         buf.push(1); // chunk_index_type=1 (single chunk)
-        // filters present: filtered_size(8) + filter_mask(4) + address(8)
+                     // filters present: filtered_size(8) + filter_mask(4) + address(8)
         buf.extend_from_slice(&1024u64.to_le_bytes()); // filtered size
         buf.extend_from_slice(&0u32.to_le_bytes()); // filter mask
         buf.extend_from_slice(&0x4000u64.to_le_bytes()); // address

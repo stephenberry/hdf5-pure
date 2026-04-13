@@ -54,7 +54,8 @@ pub fn resolve_v1_group_entries(
     let mut entries = Vec::new();
     for snod_addr in snod_addrs {
         // SNOD addresses from B-tree children are also relative to base_address
-        let snod = SymbolTableNode::parse(file_data, (snod_addr + base_address) as usize, offset_size)?;
+        let snod =
+            SymbolTableNode::parse(file_data, (snod_addr + base_address) as usize, offset_size)?;
         for entry in &snod.entries {
             let name = heap.read_string(file_data, entry.link_name_offset)?;
             entries.push(GroupEntry {
@@ -174,7 +175,11 @@ mod tests {
         let btree_offset = (btree_offset + 7) & !7;
 
         // B-tree: entries_used = 1 child (the SNOD), keys = [0, last_name_end]
-        let last_key = if children.is_empty() { 0u64 } else { heap_data_size as u64 };
+        let last_key = if children.is_empty() {
+            0u64
+        } else {
+            heap_data_size as u64
+        };
         let btree_header_size = 8 + os * 2; // sig + type + level + entries + siblings
         let btree_keys_children = os + os + os; // key[0] + child[0] + key[1]
         let total_size = btree_offset + btree_header_size + btree_keys_children + 64;
@@ -188,7 +193,7 @@ mod tests {
             pos += 4;
             file[pos] = 0; // version
             pos += 4; // version(1) + reserved(3)
-            // data_segment_size
+                      // data_segment_size
             match length_size {
                 4 => file[pos..pos + 4].copy_from_slice(&(heap_data_size as u32).to_le_bytes()),
                 8 => file[pos..pos + 8].copy_from_slice(&(heap_data_size as u64).to_le_bytes()),
@@ -204,10 +209,8 @@ mod tests {
             pos += ls;
             // data_segment_address
             match offset_size {
-                4 => file[pos..pos + 4]
-                    .copy_from_slice(&(heap_data_offset as u32).to_le_bytes()),
-                8 => file[pos..pos + 8]
-                    .copy_from_slice(&(heap_data_offset as u64).to_le_bytes()),
+                4 => file[pos..pos + 4].copy_from_slice(&(heap_data_offset as u32).to_le_bytes()),
+                8 => file[pos..pos + 8].copy_from_slice(&(heap_data_offset as u64).to_le_bytes()),
                 _ => {}
             }
         }
@@ -263,8 +266,7 @@ mod tests {
             for _ in 0..2 {
                 match offset_size {
                     4 => file[pos..pos + 4].copy_from_slice(&0xFFFFFFFFu32.to_le_bytes()),
-                    8 => file[pos..pos + 8]
-                        .copy_from_slice(&0xFFFFFFFFFFFFFFFFu64.to_le_bytes()),
+                    8 => file[pos..pos + 8].copy_from_slice(&0xFFFFFFFFFFFFFFFFu64.to_le_bytes()),
                     _ => {}
                 }
                 pos += os;
@@ -301,11 +303,7 @@ mod tests {
 
     #[test]
     fn resolve_entries_two_children() {
-        let (file, msg) = build_synthetic_group(
-            &[("alpha", 0x1000, 0), ("beta", 0x2000, 0)],
-            8,
-            8,
-        );
+        let (file, msg) = build_synthetic_group(&[("alpha", 0x1000, 0), ("beta", 0x2000, 0)], 8, 8);
         let entries = resolve_v1_group_entries(&file, &msg, 8, 8, 0).unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].name, "alpha");
@@ -316,11 +314,8 @@ mod tests {
 
     #[test]
     fn resolve_path_single_level() {
-        let (file, msg) = build_synthetic_group(
-            &[("child1", 0x3000, 0), ("child2", 0x4000, 0)],
-            8,
-            8,
-        );
+        let (file, msg) =
+            build_synthetic_group(&[("child1", 0x3000, 0), ("child2", 0x4000, 0)], 8, 8);
         let addr = resolve_path(&file, &msg, "child1", 8, 8).unwrap();
         assert_eq!(addr, 0x3000);
     }
@@ -343,9 +338,24 @@ mod tests {
         crate::dataspace::Dataspace,
         crate::data_layout::DataLayout,
     ) {
-        let dt_data = &hdr.messages.iter().find(|m| m.msg_type == MessageType::Datatype).unwrap().data;
-        let ds_data = &hdr.messages.iter().find(|m| m.msg_type == MessageType::Dataspace).unwrap().data;
-        let dl_data = &hdr.messages.iter().find(|m| m.msg_type == MessageType::DataLayout).unwrap().data;
+        let dt_data = &hdr
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::Datatype)
+            .unwrap()
+            .data;
+        let ds_data = &hdr
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::Dataspace)
+            .unwrap()
+            .data;
+        let dl_data = &hdr
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::DataLayout)
+            .unwrap()
+            .data;
         let (dt, _) = crate::datatype::Datatype::parse(dt_data).unwrap();
         let ds = crate::dataspace::Dataspace::parse(ds_data, length_size).unwrap();
         let dl = crate::data_layout::DataLayout::parse(dl_data, offset_size, length_size).unwrap();
@@ -357,10 +367,17 @@ mod tests {
         sb: &crate::superblock::Superblock,
     ) -> SymbolTableMessage {
         let root_header = ObjectHeader::parse(
-            file_data, sb.root_group_address as usize, sb.offset_size, sb.length_size,
-        ).unwrap();
-        let sym_msg = root_header.messages.iter()
-            .find(|m| m.msg_type == MessageType::SymbolTable).unwrap();
+            file_data,
+            sb.root_group_address as usize,
+            sb.offset_size,
+            sb.length_size,
+        )
+        .unwrap();
+        let sym_msg = root_header
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::SymbolTable)
+            .unwrap();
         SymbolTableMessage::parse(&sym_msg.data, sb.offset_size).unwrap()
     }
 
@@ -373,10 +390,21 @@ mod tests {
         let sb = crate::superblock::Superblock::parse(file_data, sig_offset).unwrap();
         let root_sym = get_root_sym_table(file_data, &sb);
 
-        let entries = resolve_v1_group_entries(file_data, &root_sym, sb.offset_size, sb.length_size, 0).unwrap();
-        let data_entry = entries.iter().find(|e| e.name == "data").expect("should have 'data'");
+        let entries =
+            resolve_v1_group_entries(file_data, &root_sym, sb.offset_size, sb.length_size, 0)
+                .unwrap();
+        let data_entry = entries
+            .iter()
+            .find(|e| e.name == "data")
+            .expect("should have 'data'");
 
-        let hdr = ObjectHeader::parse(file_data, data_entry.object_header_address as usize, sb.offset_size, sb.length_size).unwrap();
+        let hdr = ObjectHeader::parse(
+            file_data,
+            data_entry.object_header_address as usize,
+            sb.offset_size,
+            sb.length_size,
+        )
+        .unwrap();
         let (dt, ds, dl) = extract_dataset(file_data, &hdr, sb.offset_size, sb.length_size);
         let raw = crate::data_read::read_raw_data(file_data, &dl, &ds, &dt).unwrap();
         let values = crate::data_read::read_as_f64(&raw, &dt).unwrap();
@@ -390,8 +418,16 @@ mod tests {
         let sb = crate::superblock::Superblock::parse(file_data, sig_offset).unwrap();
         let root_sym = get_root_sym_table(file_data, &sb);
 
-        let addr = resolve_path(file_data, &root_sym, "group1/values", sb.offset_size, sb.length_size).unwrap();
-        let hdr = ObjectHeader::parse(file_data, addr as usize, sb.offset_size, sb.length_size).unwrap();
+        let addr = resolve_path(
+            file_data,
+            &root_sym,
+            "group1/values",
+            sb.offset_size,
+            sb.length_size,
+        )
+        .unwrap();
+        let hdr =
+            ObjectHeader::parse(file_data, addr as usize, sb.offset_size, sb.length_size).unwrap();
         let (dt, ds, dl) = extract_dataset(file_data, &hdr, sb.offset_size, sb.length_size);
         let raw = crate::data_read::read_raw_data(file_data, &dl, &ds, &dt).unwrap();
         let values = crate::data_read::read_as_i32(&raw, &dt).unwrap();
@@ -405,8 +441,16 @@ mod tests {
         let sb = crate::superblock::Superblock::parse(file_data, sig_offset).unwrap();
         let root_sym = get_root_sym_table(file_data, &sb);
 
-        let addr = resolve_path(file_data, &root_sym, "group2/temps", sb.offset_size, sb.length_size).unwrap();
-        let hdr = ObjectHeader::parse(file_data, addr as usize, sb.offset_size, sb.length_size).unwrap();
+        let addr = resolve_path(
+            file_data,
+            &root_sym,
+            "group2/temps",
+            sb.offset_size,
+            sb.length_size,
+        )
+        .unwrap();
+        let hdr =
+            ObjectHeader::parse(file_data, addr as usize, sb.offset_size, sb.length_size).unwrap();
         let (dt, ds, dl) = extract_dataset(file_data, &hdr, sb.offset_size, sb.length_size);
         let raw = crate::data_read::read_raw_data(file_data, &dl, &ds, &dt).unwrap();
         let values = crate::data_read::read_as_f32(&raw, &dt).unwrap();
@@ -421,8 +465,16 @@ mod tests {
         let sb = crate::superblock::Superblock::parse(file_data, sig_offset).unwrap();
         let root_sym = get_root_sym_table(file_data, &sb);
 
-        let addr = resolve_path(file_data, &root_sym, "a/b/c/deep", sb.offset_size, sb.length_size).unwrap();
-        let hdr = ObjectHeader::parse(file_data, addr as usize, sb.offset_size, sb.length_size).unwrap();
+        let addr = resolve_path(
+            file_data,
+            &root_sym,
+            "a/b/c/deep",
+            sb.offset_size,
+            sb.length_size,
+        )
+        .unwrap();
+        let hdr =
+            ObjectHeader::parse(file_data, addr as usize, sb.offset_size, sb.length_size).unwrap();
         let (dt, ds, dl) = extract_dataset(file_data, &hdr, sb.offset_size, sb.length_size);
         let raw = crate::data_read::read_raw_data(file_data, &dl, &ds, &dt).unwrap();
         let values = crate::data_read::read_as_f64(&raw, &dt).unwrap();

@@ -19,7 +19,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-use crate::btree_v2::{BTreeV2Header, collect_btree_v2_records};
+use crate::btree_v2::{collect_btree_v2_records, BTreeV2Header};
 use crate::error::FormatError;
 use crate::fractal_heap::FractalHeapHeader;
 use crate::message_type::MessageType;
@@ -109,8 +109,14 @@ fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
         2 => u16::from_le_bytes([data[pos], data[pos + 1]]) as u64,
         4 => u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as u64,
         8 => u64::from_le_bytes([
-            data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-            data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7],
+            data[pos],
+            data[pos + 1],
+            data[pos + 2],
+            data[pos + 3],
+            data[pos + 4],
+            data[pos + 5],
+            data[pos + 6],
+            data[pos + 7],
         ]),
         _ => return Err(FormatError::InvalidOffsetSize(size)),
     })
@@ -135,10 +141,7 @@ pub fn is_shared(msg_flags: u8) -> bool {
 ///
 /// When the shared flag is set on a message, the data contains a reference
 /// instead of the actual message content.
-pub fn parse_shared_ref(
-    data: &[u8],
-    offset_size: u8,
-) -> Result<SharedMessageRef, FormatError> {
+pub fn parse_shared_ref(data: &[u8], offset_size: u8) -> Result<SharedMessageRef, FormatError> {
     ensure_len(data, 0, 2)?;
     let version = data[0];
     let ref_type = data[1];
@@ -243,7 +246,10 @@ pub fn parse_sohm_table(
         let mesg_types = u16::from_le_bytes([file_data[pos], file_data[pos + 1]]);
         pos += 2;
         let min_mesg_size = u32::from_le_bytes([
-            file_data[pos], file_data[pos + 1], file_data[pos + 2], file_data[pos + 3],
+            file_data[pos],
+            file_data[pos + 1],
+            file_data[pos + 2],
+            file_data[pos + 3],
         ]);
         pos += 4;
         let list_max = u16::from_le_bytes([file_data[pos], file_data[pos + 1]]);
@@ -373,7 +379,10 @@ pub fn parse_sohm_btree_entries(
 /// Find the SOHM index that handles the given message type.
 fn find_index_for_msg_type(table: &SohmTable, msg_type: MessageType) -> Option<&SohmIndex> {
     let type_bit = 1u16 << msg_type.to_u16();
-    table.indexes.iter().find(|idx| idx.mesg_types & type_bit != 0)
+    table
+        .indexes
+        .iter()
+        .find(|idx| idx.mesg_types & type_bit != 0)
 }
 
 fn is_undefined(val: u64, offset_size: u8) -> bool {
@@ -397,16 +406,18 @@ pub fn resolve_sohm_message(
     offset_size: u8,
     length_size: u8,
 ) -> Result<Vec<u8>, FormatError> {
-    let index = find_index_for_msg_type(sohm_table, target_msg_type).ok_or(
-        FormatError::InvalidSharedMessageVersion(2),
-    )?;
+    let index = find_index_for_msg_type(sohm_table, target_msg_type)
+        .ok_or(FormatError::InvalidSharedMessageVersion(2))?;
 
     if is_undefined(index.heap_addr, offset_size) {
         return Err(FormatError::InvalidSharedMessageVersion(2));
     }
 
     let fh_header = FractalHeapHeader::parse(
-        file_data, index.heap_addr as usize, offset_size, length_size,
+        file_data,
+        index.heap_addr as usize,
+        offset_size,
+        length_size,
     )?;
     fh_header.read_managed_object(file_data, heap_id, offset_size)
 }
@@ -424,7 +435,12 @@ pub fn resolve_shared_message(
     length_size: u8,
 ) -> Result<Vec<u8>, FormatError> {
     resolve_shared_message_with_sohm(
-        file_data, shared_ref, target_msg_type, offset_size, length_size, None,
+        file_data,
+        shared_ref,
+        target_msg_type,
+        offset_size,
+        length_size,
+        None,
     )
 }
 
@@ -439,12 +455,12 @@ pub fn resolve_shared_message_with_sohm(
 ) -> Result<Vec<u8>, FormatError> {
     match shared_ref.ref_type {
         1 | 3 => {
-            let addr = shared_ref.object_header_address.ok_or(
-                FormatError::UnexpectedEof {
+            let addr = shared_ref
+                .object_header_address
+                .ok_or(FormatError::UnexpectedEof {
                     expected: 1,
                     available: 0,
-                }
-            )?;
+                })?;
             let target_header =
                 ObjectHeader::parse(file_data, addr as usize, offset_size, length_size)?;
             for msg in &target_header.messages {
@@ -472,19 +488,23 @@ pub fn resolve_shared_message_with_sohm(
             })
         }
         2 => {
-            let heap_id = shared_ref.heap_id.as_ref().ok_or(
-                FormatError::InvalidSharedMessageVersion(2),
-            )?;
-            let table = sohm_table.ok_or(
-                FormatError::InvalidSharedMessageVersion(2),
-            )?;
+            let heap_id = shared_ref
+                .heap_id
+                .as_ref()
+                .ok_or(FormatError::InvalidSharedMessageVersion(2))?;
+            let table = sohm_table.ok_or(FormatError::InvalidSharedMessageVersion(2))?;
             resolve_sohm_message(
-                file_data, heap_id, table, target_msg_type, offset_size, length_size,
+                file_data,
+                heap_id,
+                table,
+                target_msg_type,
+                offset_size,
+                length_size,
             )
         }
-        _ => {
-            Err(FormatError::InvalidSharedMessageVersion(shared_ref.ref_type))
-        }
+        _ => Err(FormatError::InvalidSharedMessageVersion(
+            shared_ref.ref_type,
+        )),
     }
 }
 
@@ -697,14 +717,24 @@ mod tests {
     fn parse_smtb_two_indexes_4byte() {
         let indexes = vec![
             SohmIndex {
-                index_type: 0, mesg_types: 0x0008, min_mesg_size: 50,
-                list_max: 50, btree_min: 40, num_messages: 1,
-                index_addr: 0x1000, heap_addr: 0x2000,
+                index_type: 0,
+                mesg_types: 0x0008,
+                min_mesg_size: 50,
+                list_max: 50,
+                btree_min: 40,
+                num_messages: 1,
+                index_addr: 0x1000,
+                heap_addr: 0x2000,
             },
             SohmIndex {
-                index_type: 1, mesg_types: 0x0002, min_mesg_size: 100,
-                list_max: 25, btree_min: 15, num_messages: 5,
-                index_addr: 0x5000, heap_addr: 0x6000,
+                index_type: 1,
+                mesg_types: 0x0002,
+                min_mesg_size: 100,
+                list_max: 25,
+                btree_min: 15,
+                num_messages: 5,
+                index_addr: 0x5000,
+                heap_addr: 0x6000,
             },
         ];
         let data = build_smtb(&indexes, 4);
@@ -733,10 +763,10 @@ mod tests {
         data.extend_from_slice(&0x12345678u32.to_le_bytes()); // hash
         data.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]); // heap_id
         data.extend_from_slice(&3u32.to_le_bytes()); // ref_count
-        // Pad to entry size (entry_size for 8-byte offsets = 1+4+max(10,12)=17)
-        // OH size with 8-byte offsets = 2+8=10, heap size = 12, max=12
-        // Total entry: 1+4+12=17
-        // We wrote 1+4+8+4=17 bytes — no padding needed
+                                                     // Pad to entry size (entry_size for 8-byte offsets = 1+4+max(10,12)=17)
+                                                     // OH size with 8-byte offsets = 2+8=10, heap size = 12, max=12
+                                                     // Total entry: 1+4+12=17
+                                                     // We wrote 1+4+8+4=17 bytes — no padding needed
         let entry = parse_sohm_entry(&data, 8).unwrap();
         assert_eq!(entry.location, 0);
         assert_eq!(entry.hash, 0x12345678);
@@ -752,7 +782,7 @@ mod tests {
         data.extend_from_slice(&0xAABBCCDDu32.to_le_bytes()); // hash
         data.extend_from_slice(&5u16.to_le_bytes()); // mesg_index
         data.extend_from_slice(&0x7000u64.to_le_bytes()); // oh_addr
-        // OH entry: 2+8=10 bytes, heap entry: 12 bytes, so max=12, need 2 bytes padding
+                                                          // OH entry: 2+8=10 bytes, heap entry: 12 bytes, so max=12, need 2 bytes padding
         data.extend_from_slice(&[0u8; 2]);
 
         let entry = parse_sohm_entry(&data, 8).unwrap();
@@ -798,14 +828,20 @@ mod tests {
     fn parse_smli_two_entries() {
         let entries = vec![
             SohmEntry {
-                location: 0, hash: 0x1111,
+                location: 0,
+                hash: 0x1111,
                 heap_id: Some([10, 20, 30, 40, 50, 60, 70, 80]),
-                ref_count: Some(1), mesg_index: None, oh_addr: None,
+                ref_count: Some(1),
+                mesg_index: None,
+                oh_addr: None,
             },
             SohmEntry {
-                location: 0, hash: 0x2222,
+                location: 0,
+                hash: 0x2222,
                 heap_id: Some([11, 21, 31, 41, 51, 61, 71, 81]),
-                ref_count: Some(2), mesg_index: None, oh_addr: None,
+                ref_count: Some(2),
+                mesg_index: None,
+                oh_addr: None,
             },
         ];
         let data = build_smli(&entries, 8);
@@ -829,14 +865,16 @@ mod tests {
     #[test]
     fn find_index_for_datatype() {
         let table = SohmTable {
-            indexes: vec![
-                SohmIndex {
-                    index_type: 0,
-                    mesg_types: 0x0008, // bit 3 = Datatype (0x0003)
-                    min_mesg_size: 50, list_max: 50, btree_min: 40,
-                    num_messages: 1, index_addr: 0x1000, heap_addr: 0x2000,
-                },
-            ],
+            indexes: vec![SohmIndex {
+                index_type: 0,
+                mesg_types: 0x0008, // bit 3 = Datatype (0x0003)
+                min_mesg_size: 50,
+                list_max: 50,
+                btree_min: 40,
+                num_messages: 1,
+                index_addr: 0x1000,
+                heap_addr: 0x2000,
+            }],
         };
         let idx = find_index_for_msg_type(&table, MessageType::Datatype);
         assert!(idx.is_some());
@@ -846,14 +884,16 @@ mod tests {
     #[test]
     fn find_index_no_match() {
         let table = SohmTable {
-            indexes: vec![
-                SohmIndex {
-                    index_type: 0,
-                    mesg_types: 0x0002, // bit 1 = Dataspace
-                    min_mesg_size: 50, list_max: 50, btree_min: 40,
-                    num_messages: 1, index_addr: 0x1000, heap_addr: 0x2000,
-                },
-            ],
+            indexes: vec![SohmIndex {
+                index_type: 0,
+                mesg_types: 0x0002, // bit 1 = Dataspace
+                min_mesg_size: 50,
+                list_max: 50,
+                btree_min: 40,
+                num_messages: 1,
+                index_addr: 0x1000,
+                heap_addr: 0x2000,
+            }],
         };
         let idx = find_index_for_msg_type(&table, MessageType::Datatype);
         assert!(idx.is_none());

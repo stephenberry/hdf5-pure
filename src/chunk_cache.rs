@@ -11,22 +11,22 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-#[cfg(feature = "std")]
-use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error};
 #[cfg(not(feature = "std"))]
 use alloc::alloc::{alloc_zeroed, dealloc, handle_alloc_error};
-
 #[cfg(feature = "std")]
-use std::sync::Mutex;
+use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error};
+
 #[cfg(not(feature = "std"))]
 use crate::nosync::Mutex;
+#[cfg(feature = "std")]
+use std::sync::Mutex;
 
 use core::ops::{Deref, DerefMut};
 
-#[cfg(feature = "std")]
-use std::collections::HashMap;
 #[cfg(not(feature = "std"))]
 use alloc::collections::BTreeMap;
+#[cfg(feature = "std")]
+use std::collections::HashMap;
 
 use crate::chunked_read::ChunkInfo;
 
@@ -364,7 +364,9 @@ impl ChunkCache {
         // Track sequential vs random access
         let is_sequential = inner.last_coord.as_ref().map_or(false, |prev| {
             // Sequential if exactly one dimension changed
-            let changes: usize = prev.iter().zip(coord.iter())
+            let changes: usize = prev
+                .iter()
+                .zip(coord.iter())
                 .filter(|(a, b)| a != b)
                 .count();
             changes <= 1
@@ -480,7 +482,9 @@ impl ChunkCache {
         // We touch the stats to record that prefetch hints were issued.
         let mut inner = self.inner.lock().unwrap();
         for coord in next_coords {
-            let exists = inner.index.as_ref()
+            let exists = inner
+                .index
+                .as_ref()
                 .map(|idx| idx.contains_key(coord))
                 .unwrap_or(false);
             if exists {
@@ -698,6 +702,9 @@ mod tests {
         assert_eq!(align_to_cache_line(0), 0);
         assert_eq!(align_to_cache_line(1), CACHE_LINE_SIZE);
         assert_eq!(align_to_cache_line(CACHE_LINE_SIZE), CACHE_LINE_SIZE);
-        assert_eq!(align_to_cache_line(CACHE_LINE_SIZE + 1), CACHE_LINE_SIZE * 2);
+        assert_eq!(
+            align_to_cache_line(CACHE_LINE_SIZE + 1),
+            CACHE_LINE_SIZE * 2
+        );
     }
 }

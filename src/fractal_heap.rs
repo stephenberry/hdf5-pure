@@ -47,8 +47,14 @@ fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
         2 => u16::from_le_bytes([data[pos], data[pos + 1]]) as u64,
         4 => u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as u64,
         8 => u64::from_le_bytes([
-            data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-            data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7],
+            data[pos],
+            data[pos + 1],
+            data[pos + 2],
+            data[pos + 3],
+            data[pos + 4],
+            data[pos + 5],
+            data[pos + 6],
+            data[pos + 7],
         ]),
         _ => return Err(FormatError::InvalidOffsetSize(size)),
     })
@@ -109,7 +115,10 @@ impl FractalHeapHeader {
 
         ensure_len(file_data, pos, 4)?;
         let max_managed_object_size = u32::from_le_bytes([
-            file_data[pos], file_data[pos + 1], file_data[pos + 2], file_data[pos + 3],
+            file_data[pos],
+            file_data[pos + 1],
+            file_data[pos + 2],
+            file_data[pos + 3],
         ]);
         pos += 4;
 
@@ -353,7 +362,7 @@ impl FractalHeapHeader {
 
         // Compute block sizes for each row using the doubling table
         let tw = self.table_width as u64;
-        
+
         let nrows_usize = nrows as usize;
 
         // Build table of (block_size, heap_offset) for each child entry
@@ -496,12 +505,16 @@ mod tests {
         // next_huge_object_id (length_size)
         pos += ls;
         // btree_huge_objects_address (offset_size) - undefined
-        for i in 0..os { buf[pos + i] = 0xFF; }
+        for i in 0..os {
+            buf[pos + i] = 0xFF;
+        }
         pos += os;
         // free_space_managed_blocks (length_size)
         pos += ls;
         // managed_block_free_space_manager_address (offset_size) - undefined
-        for i in 0..os { buf[pos + i] = 0xFF; }
+        for i in 0..os {
+            buf[pos + i] = 0xFF;
+        }
         pos += os;
         // managed_space_in_heap (length_size)
         pos += ls;

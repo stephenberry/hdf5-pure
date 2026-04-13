@@ -84,10 +84,7 @@ pub enum Datatype {
         exponent_bias: u32,
     },
     /// Class 2: Time type (rarely used).
-    Time {
-        size: u32,
-        bit_precision: u16,
-    },
+    Time { size: u32, bit_precision: u16 },
     /// Class 3: Fixed-length string.
     String {
         size: u32,
@@ -102,20 +99,14 @@ pub enum Datatype {
         bit_precision: u16,
     },
     /// Class 5: Opaque data.
-    Opaque {
-        size: u32,
-        tag: Vec<u8>,
-    },
+    Opaque { size: u32, tag: Vec<u8> },
     /// Class 6: Compound type.
     Compound {
         size: u32,
         members: Vec<CompoundMember>,
     },
     /// Class 7: Reference type.
-    Reference {
-        size: u32,
-        ref_type: ReferenceType,
-    },
+    Reference { size: u32, ref_type: ReferenceType },
     /// Class 8: Enumeration type.
     Enumeration {
         size: u32,
@@ -298,7 +289,13 @@ impl Datatype {
                 ensure_len(data, pos, 2)?;
                 let bit_precision = LittleEndian::read_u16(&data[pos..pos + 2]);
                 pos += 2;
-                Ok((Datatype::Time { size, bit_precision }, pos))
+                Ok((
+                    Datatype::Time {
+                        size,
+                        bit_precision,
+                    },
+                    pos,
+                ))
             }
             3 => {
                 // String
@@ -306,7 +303,14 @@ impl Datatype {
                 let charset_val = (bf0 >> 4) & 0x0F;
                 let padding = parse_string_padding(padding_val)?;
                 let charset = parse_charset(charset_val)?;
-                Ok((Datatype::String { size, padding, charset }, pos))
+                Ok((
+                    Datatype::String {
+                        size,
+                        padding,
+                        charset,
+                    },
+                    pos,
+                ))
             }
             4 => {
                 // Bit Field
@@ -553,21 +557,44 @@ impl Datatype {
     /// Serialize datatype to HDF5 message bytes.
     pub fn serialize(&self) -> Vec<u8> {
         match self {
-            Datatype::FixedPoint { size, byte_order, signed, bit_offset, bit_precision } => {
+            Datatype::FixedPoint {
+                size,
+                byte_order,
+                signed,
+                bit_offset,
+                bit_precision,
+            } => {
                 let mut bf0 = 0u8;
-                if matches!(byte_order, DatatypeByteOrder::BigEndian) { bf0 |= 0x01; }
-                if *signed { bf0 |= 0x08; }
+                if matches!(byte_order, DatatypeByteOrder::BigEndian) {
+                    bf0 |= 0x01;
+                }
+                if *signed {
+                    bf0 |= 0x08;
+                }
                 let mut buf = Self::build_header(0, 1, [bf0, 0, 0], *size);
                 buf.extend_from_slice(&bit_offset.to_le_bytes());
                 buf.extend_from_slice(&bit_precision.to_le_bytes());
                 buf
             }
-            Datatype::FloatingPoint { size, byte_order, bit_offset, bit_precision,
-                exponent_location, exponent_size, mantissa_location, mantissa_size, exponent_bias } => {
+            Datatype::FloatingPoint {
+                size,
+                byte_order,
+                bit_offset,
+                bit_precision,
+                exponent_location,
+                exponent_size,
+                mantissa_location,
+                mantissa_size,
+                exponent_bias,
+            } => {
                 let mut bf0 = 0x20u8; // bit 5: sign location bit (standard IEEE 754)
                 match byte_order {
-                    DatatypeByteOrder::BigEndian => { bf0 |= 0x01; }
-                    DatatypeByteOrder::Vax => { bf0 |= 0x40; }
+                    DatatypeByteOrder::BigEndian => {
+                        bf0 |= 0x01;
+                    }
+                    DatatypeByteOrder::Vax => {
+                        bf0 |= 0x40;
+                    }
                     _ => {}
                 }
                 // bf[1] = sign bit location (bit position of sign in the value)
@@ -582,7 +609,11 @@ impl Datatype {
                 buf.extend_from_slice(&exponent_bias.to_le_bytes());
                 buf
             }
-            Datatype::String { size, padding, charset } => {
+            Datatype::String {
+                size,
+                padding,
+                charset,
+            } => {
                 let pad_val = match padding {
                     StringPadding::NullTerminate => 0,
                     StringPadding::NullPad => 1,
@@ -595,7 +626,12 @@ impl Datatype {
                 let bf0 = pad_val | (cs_val << 4);
                 Self::build_header(3, 1, [bf0, 0, 0], *size)
             }
-            Datatype::VariableLength { is_string, padding, charset, base_type } => {
+            Datatype::VariableLength {
+                is_string,
+                padding,
+                charset,
+                base_type,
+            } => {
                 let mut bf0 = if *is_string { 0x01u8 } else { 0x00 };
                 if *is_string {
                     if let Some(p) = padding {
@@ -612,7 +648,9 @@ impl Datatype {
                         CharacterSet::Ascii => 0,
                         CharacterSet::Utf8 => 1,
                     })
-                } else { 0 };
+                } else {
+                    0
+                };
                 let mut buf = Self::build_header(9, 1, [bf0, bf1, 0], 16);
                 buf.extend_from_slice(&base_type.serialize());
                 buf
@@ -638,7 +676,11 @@ impl Datatype {
                 }
                 buf
             }
-            Datatype::Enumeration { size, base_type, members } => {
+            Datatype::Enumeration {
+                size,
+                base_type,
+                members,
+            } => {
                 let num = members.len() as u16;
                 let bf0 = (num & 0xFF) as u8;
                 let bf1 = ((num >> 8) & 0xFF) as u8;
@@ -656,7 +698,10 @@ impl Datatype {
                 }
                 buf
             }
-            Datatype::Array { base_type, dimensions } => {
+            Datatype::Array {
+                base_type,
+                dimensions,
+            } => {
                 let mut buf = Self::build_header(10, 3, [0, 0, 0], self.type_size());
                 buf.push(dimensions.len() as u8);
                 for &d in dimensions {
@@ -672,9 +717,7 @@ impl Datatype {
                 };
                 Self::build_header(7, 1, [bf0, 0, 0], *size)
             }
-            _ => {
-                Vec::new()
-            }
+            _ => Vec::new(),
         }
     }
 
@@ -701,8 +744,13 @@ impl Datatype {
             Datatype::Reference { size, .. } => *size,
             Datatype::Enumeration { size, .. } => *size,
             Datatype::VariableLength { .. } => 16, // typically pointer + length
-            Datatype::Array { base_type, dimensions } => {
-                let elem_count: u32 = dimensions.iter().copied()
+            Datatype::Array {
+                base_type,
+                dimensions,
+            } => {
+                let elem_count: u32 = dimensions
+                    .iter()
+                    .copied()
                     .fold(1u32, |a, b| a.saturating_mul(b));
                 base_type.type_size().saturating_mul(elem_count)
             }
@@ -727,7 +775,13 @@ mod tests {
     use super::*;
 
     // Helper to build a fixed-point datatype message
-    fn build_fixed_point(size: u32, be: bool, signed: bool, bit_offset: u16, bit_precision: u16) -> Vec<u8> {
+    fn build_fixed_point(
+        size: u32,
+        be: bool,
+        signed: bool,
+        bit_offset: u16,
+        bit_precision: u16,
+    ) -> Vec<u8> {
         let bf0 = if be { 0x01 } else { 0x00 } | if signed { 0x08 } else { 0x00 };
         let mut buf = build_dt_header(0, 1, [bf0, 0, 0], size);
         let mut props = [0u8; 4];
@@ -738,7 +792,14 @@ mod tests {
     }
 
     // Helper to build a floating-point datatype message
-    fn build_float(size: u32, exp_loc: u8, exp_size: u8, mant_loc: u8, mant_size: u8, exp_bias: u32) -> Vec<u8> {
+    fn build_float(
+        size: u32,
+        exp_loc: u8,
+        exp_size: u8,
+        mant_loc: u8,
+        mant_size: u8,
+        exp_bias: u32,
+    ) -> Vec<u8> {
         // LE byte order: bo_low=0, bo_high=0
         let bf0 = 0x00u8;
         let bf1 = 0x00u8;
@@ -762,26 +823,32 @@ mod tests {
         let data = build_fixed_point(1, false, false, 0, 8);
         let (dt, consumed) = Datatype::parse(&data).unwrap();
         assert_eq!(consumed, 12);
-        assert_eq!(dt, Datatype::FixedPoint {
-            size: 1,
-            byte_order: DatatypeByteOrder::LittleEndian,
-            signed: false,
-            bit_offset: 0,
-            bit_precision: 8,
-        });
+        assert_eq!(
+            dt,
+            Datatype::FixedPoint {
+                size: 1,
+                byte_order: DatatypeByteOrder::LittleEndian,
+                signed: false,
+                bit_offset: 0,
+                bit_precision: 8,
+            }
+        );
     }
 
     #[test]
     fn test_fixed_point_i16_le() {
         let data = build_fixed_point(2, false, true, 0, 16);
         let (dt, _) = Datatype::parse(&data).unwrap();
-        assert_eq!(dt, Datatype::FixedPoint {
-            size: 2,
-            byte_order: DatatypeByteOrder::LittleEndian,
-            signed: true,
-            bit_offset: 0,
-            bit_precision: 16,
-        });
+        assert_eq!(
+            dt,
+            Datatype::FixedPoint {
+                size: 2,
+                byte_order: DatatypeByteOrder::LittleEndian,
+                signed: true,
+                bit_offset: 0,
+                bit_precision: 16,
+            }
+        );
     }
 
     #[test]
@@ -789,7 +856,12 @@ mod tests {
         let data = build_fixed_point(4, true, false, 0, 32);
         let (dt, _) = Datatype::parse(&data).unwrap();
         match &dt {
-            Datatype::FixedPoint { byte_order, signed, size, .. } => {
+            Datatype::FixedPoint {
+                byte_order,
+                signed,
+                size,
+                ..
+            } => {
                 assert_eq!(*byte_order, DatatypeByteOrder::BigEndian);
                 assert!(!signed);
                 assert_eq!(*size, 4);
@@ -802,13 +874,16 @@ mod tests {
     fn test_fixed_point_i64_le() {
         let data = build_fixed_point(8, false, true, 0, 64);
         let (dt, _) = Datatype::parse(&data).unwrap();
-        assert_eq!(dt, Datatype::FixedPoint {
-            size: 8,
-            byte_order: DatatypeByteOrder::LittleEndian,
-            signed: true,
-            bit_offset: 0,
-            bit_precision: 64,
-        });
+        assert_eq!(
+            dt,
+            Datatype::FixedPoint {
+                size: 8,
+                byte_order: DatatypeByteOrder::LittleEndian,
+                signed: true,
+                bit_offset: 0,
+                bit_precision: 64,
+            }
+        );
     }
 
     #[test]
@@ -817,34 +892,40 @@ mod tests {
         let data = build_float(4, 23, 8, 0, 23, 127);
         let (dt, consumed) = Datatype::parse(&data).unwrap();
         assert_eq!(consumed, 20);
-        assert_eq!(dt, Datatype::FloatingPoint {
-            size: 4,
-            byte_order: DatatypeByteOrder::LittleEndian,
-            bit_offset: 0,
-            bit_precision: 32,
-            exponent_location: 23,
-            exponent_size: 8,
-            mantissa_location: 0,
-            mantissa_size: 23,
-            exponent_bias: 127,
-        });
+        assert_eq!(
+            dt,
+            Datatype::FloatingPoint {
+                size: 4,
+                byte_order: DatatypeByteOrder::LittleEndian,
+                bit_offset: 0,
+                bit_precision: 32,
+                exponent_location: 23,
+                exponent_size: 8,
+                mantissa_location: 0,
+                mantissa_size: 23,
+                exponent_bias: 127,
+            }
+        );
     }
 
     #[test]
     fn test_float_f64_le() {
         let data = build_float(8, 52, 11, 0, 52, 1023);
         let (dt, _) = Datatype::parse(&data).unwrap();
-        assert_eq!(dt, Datatype::FloatingPoint {
-            size: 8,
-            byte_order: DatatypeByteOrder::LittleEndian,
-            bit_offset: 0,
-            bit_precision: 64,
-            exponent_location: 52,
-            exponent_size: 11,
-            mantissa_location: 0,
-            mantissa_size: 52,
-            exponent_bias: 1023,
-        });
+        assert_eq!(
+            dt,
+            Datatype::FloatingPoint {
+                size: 8,
+                byte_order: DatatypeByteOrder::LittleEndian,
+                bit_offset: 0,
+                bit_precision: 64,
+                exponent_location: 52,
+                exponent_size: 11,
+                mantissa_location: 0,
+                mantissa_size: 52,
+                exponent_bias: 1023,
+            }
+        );
     }
 
     #[test]
@@ -852,11 +933,14 @@ mod tests {
         let buf = build_dt_header(3, 1, [0x00, 0, 0], 10); // padding=0(nullterm), charset=0(ascii)
         let (dt, consumed) = Datatype::parse(&buf).unwrap();
         assert_eq!(consumed, 8);
-        assert_eq!(dt, Datatype::String {
-            size: 10,
-            padding: StringPadding::NullTerminate,
-            charset: CharacterSet::Ascii,
-        });
+        assert_eq!(
+            dt,
+            Datatype::String {
+                size: 10,
+                padding: StringPadding::NullTerminate,
+                charset: CharacterSet::Ascii,
+            }
+        );
     }
 
     #[test]
@@ -864,11 +948,14 @@ mod tests {
         // padding=2(space pad), charset=1(utf8) → bf0 = 0x12
         let buf = build_dt_header(3, 1, [0x12, 0, 0], 32);
         let (dt, _) = Datatype::parse(&buf).unwrap();
-        assert_eq!(dt, Datatype::String {
-            size: 32,
-            padding: StringPadding::SpacePad,
-            charset: CharacterSet::Utf8,
-        });
+        assert_eq!(
+            dt,
+            Datatype::String {
+                size: 32,
+                padding: StringPadding::SpacePad,
+                charset: CharacterSet::Utf8,
+            }
+        );
     }
 
     #[test]
@@ -880,10 +967,13 @@ mod tests {
         buf.extend_from_slice(&[0, 0, 0, 0]);
         let (dt, consumed) = Datatype::parse(&buf).unwrap();
         assert_eq!(consumed, 16); // 8 header + 8 padded tag
-        assert_eq!(dt, Datatype::Opaque {
-            size: 64,
-            tag: b"BLOB".to_vec(),
-        });
+        assert_eq!(
+            dt,
+            Datatype::Opaque {
+                size: 64,
+                tag: b"BLOB".to_vec(),
+            }
+        );
     }
 
     #[test]
@@ -891,7 +981,7 @@ mod tests {
         // Compound with size=12, 2 members: "x" u32 at offset 0, "y" f64 at offset 4
         // Size=12, so offset_bytes=1
         let mut buf = build_dt_header(6, 3, [2, 0, 0], 12); // 2 members
-        // Member "x": name "x\0", offset=0, then u32 LE datatype
+                                                            // Member "x": name "x\0", offset=0, then u32 LE datatype
         buf.extend_from_slice(b"x\0");
         buf.push(0); // byte_offset = 0
         buf.extend_from_slice(&build_fixed_point(4, false, false, 0, 32));
@@ -910,7 +1000,11 @@ mod tests {
                 assert_eq!(members[1].name, "y");
                 assert_eq!(members[1].byte_offset, 4);
                 match &members[0].datatype {
-                    Datatype::FixedPoint { size: 4, signed: false, .. } => {}
+                    Datatype::FixedPoint {
+                        size: 4,
+                        signed: false,
+                        ..
+                    } => {}
                     other => panic!("expected u32, got {other:?}"),
                 }
                 match &members[1].datatype {
@@ -926,27 +1020,33 @@ mod tests {
     fn test_reference_object() {
         let buf = build_dt_header(7, 1, [0, 0, 0], 8);
         let (dt, _) = Datatype::parse(&buf).unwrap();
-        assert_eq!(dt, Datatype::Reference {
-            size: 8,
-            ref_type: ReferenceType::Object,
-        });
+        assert_eq!(
+            dt,
+            Datatype::Reference {
+                size: 8,
+                ref_type: ReferenceType::Object,
+            }
+        );
     }
 
     #[test]
     fn test_reference_region() {
         let buf = build_dt_header(7, 1, [1, 0, 0], 12);
         let (dt, _) = Datatype::parse(&buf).unwrap();
-        assert_eq!(dt, Datatype::Reference {
-            size: 12,
-            ref_type: ReferenceType::DatasetRegion,
-        });
+        assert_eq!(
+            dt,
+            Datatype::Reference {
+                size: 12,
+                ref_type: ReferenceType::DatasetRegion,
+            }
+        );
     }
 
     #[test]
     fn test_enumeration() {
         // Enum with base type i32 LE, 3 members
         let mut buf = build_dt_header(8, 3, [3, 0, 0], 4); // 3 members
-        // Base type: i32 LE
+                                                           // Base type: i32 LE
         buf.extend_from_slice(&build_fixed_point(4, false, true, 0, 32));
         // Names: "RED\0", "GREEN\0", "BLUE\0"
         buf.extend_from_slice(b"RED\0");
@@ -959,7 +1059,11 @@ mod tests {
 
         let (dt, _) = Datatype::parse(&buf).unwrap();
         match dt {
-            Datatype::Enumeration { size, base_type, members } => {
+            Datatype::Enumeration {
+                size,
+                base_type,
+                members,
+            } => {
                 assert_eq!(size, 4);
                 assert_eq!(members.len(), 3);
                 assert_eq!(members[0].name, "RED");
@@ -969,7 +1073,11 @@ mod tests {
                 assert_eq!(members[2].name, "BLUE");
                 assert_eq!(members[2].value, 2i32.to_le_bytes().to_vec());
                 match *base_type {
-                    Datatype::FixedPoint { signed: true, size: 4, .. } => {}
+                    Datatype::FixedPoint {
+                        signed: true,
+                        size: 4,
+                        ..
+                    } => {}
                     other => panic!("expected i32, got {other:?}"),
                 }
             }
@@ -988,7 +1096,12 @@ mod tests {
 
         let (dt, _) = Datatype::parse(&buf).unwrap();
         match dt {
-            Datatype::VariableLength { is_string, padding, charset, base_type } => {
+            Datatype::VariableLength {
+                is_string,
+                padding,
+                charset,
+                base_type,
+            } => {
                 assert!(is_string);
                 assert_eq!(padding, Some(StringPadding::NullTerminate));
                 assert_eq!(charset, Some(CharacterSet::Utf8));
@@ -1008,7 +1121,12 @@ mod tests {
 
         let (dt, _) = Datatype::parse(&buf).unwrap();
         match dt {
-            Datatype::VariableLength { is_string, padding, charset, base_type } => {
+            Datatype::VariableLength {
+                is_string,
+                padding,
+                charset,
+                base_type,
+            } => {
                 assert!(!is_string);
                 assert_eq!(padding, None);
                 assert_eq!(charset, None);
@@ -1025,15 +1143,22 @@ mod tests {
         buf.push(2); // ndims=2
         buf.extend_from_slice(&3u32.to_le_bytes()); // dim 0
         buf.extend_from_slice(&4u32.to_le_bytes()); // dim 1
-        // Base type: i32 LE
+                                                    // Base type: i32 LE
         buf.extend_from_slice(&build_fixed_point(4, false, true, 0, 32));
 
         let (dt, _) = Datatype::parse(&buf).unwrap();
         match dt {
-            Datatype::Array { base_type, dimensions } => {
+            Datatype::Array {
+                base_type,
+                dimensions,
+            } => {
                 assert_eq!(dimensions, vec![3, 4]);
                 match *base_type {
-                    Datatype::FixedPoint { size: 4, signed: true, .. } => {}
+                    Datatype::FixedPoint {
+                        size: 4,
+                        signed: true,
+                        ..
+                    } => {}
                     other => panic!("expected i32, got {other:?}"),
                 }
             }
@@ -1050,12 +1175,15 @@ mod tests {
         buf.extend_from_slice(&props);
 
         let (dt, _) = Datatype::parse(&buf).unwrap();
-        assert_eq!(dt, Datatype::BitField {
-            size: 2,
-            byte_order: DatatypeByteOrder::LittleEndian,
-            bit_offset: 0,
-            bit_precision: 16,
-        });
+        assert_eq!(
+            dt,
+            Datatype::BitField {
+                size: 2,
+                byte_order: DatatypeByteOrder::LittleEndian,
+                bit_offset: 0,
+                bit_precision: 16,
+            }
+        );
     }
 
     #[test]
@@ -1067,10 +1195,13 @@ mod tests {
 
         let (dt, consumed) = Datatype::parse(&buf).unwrap();
         assert_eq!(consumed, 10);
-        assert_eq!(dt, Datatype::Time {
-            size: 8,
-            bit_precision: 64,
-        });
+        assert_eq!(
+            dt,
+            Datatype::Time {
+                size: 8,
+                bit_precision: 64,
+            }
+        );
     }
 
     #[test]
@@ -1102,7 +1233,10 @@ mod tests {
                 assert_eq!(members.len(), 1);
                 assert_eq!(members[0].name, "data");
                 match &members[0].datatype {
-                    Datatype::Array { dimensions, base_type } => {
+                    Datatype::Array {
+                        dimensions,
+                        base_type,
+                    } => {
                         assert_eq!(dimensions, &[2]);
                         match base_type.as_ref() {
                             Datatype::Enumeration { members, .. } => {
@@ -1167,28 +1301,41 @@ mod tests {
                     name: "x".to_string(),
                     byte_offset: 0,
                     datatype: Datatype::FloatingPoint {
-                        size: 8, byte_order: DatatypeByteOrder::LittleEndian,
-                        bit_offset: 0, bit_precision: 64,
-                        exponent_location: 52, exponent_size: 11,
-                        mantissa_location: 0, mantissa_size: 52, exponent_bias: 1023,
+                        size: 8,
+                        byte_order: DatatypeByteOrder::LittleEndian,
+                        bit_offset: 0,
+                        bit_precision: 64,
+                        exponent_location: 52,
+                        exponent_size: 11,
+                        mantissa_location: 0,
+                        mantissa_size: 52,
+                        exponent_bias: 1023,
                     },
                 },
                 CompoundMember {
                     name: "y".to_string(),
                     byte_offset: 8,
                     datatype: Datatype::FloatingPoint {
-                        size: 8, byte_order: DatatypeByteOrder::LittleEndian,
-                        bit_offset: 0, bit_precision: 64,
-                        exponent_location: 52, exponent_size: 11,
-                        mantissa_location: 0, mantissa_size: 52, exponent_bias: 1023,
+                        size: 8,
+                        byte_order: DatatypeByteOrder::LittleEndian,
+                        bit_offset: 0,
+                        bit_precision: 64,
+                        exponent_location: 52,
+                        exponent_size: 11,
+                        mantissa_location: 0,
+                        mantissa_size: 52,
+                        exponent_bias: 1023,
                     },
                 },
                 CompoundMember {
                     name: "id".to_string(),
                     byte_offset: 16,
                     datatype: Datatype::FixedPoint {
-                        size: 4, byte_order: DatatypeByteOrder::LittleEndian,
-                        signed: true, bit_offset: 0, bit_precision: 32,
+                        size: 4,
+                        byte_order: DatatypeByteOrder::LittleEndian,
+                        signed: true,
+                        bit_offset: 0,
+                        bit_precision: 32,
                     },
                 },
             ],
@@ -1203,13 +1350,25 @@ mod tests {
         let dt = Datatype::Enumeration {
             size: 4,
             base_type: Box::new(Datatype::FixedPoint {
-                size: 4, byte_order: DatatypeByteOrder::LittleEndian,
-                signed: true, bit_offset: 0, bit_precision: 32,
+                size: 4,
+                byte_order: DatatypeByteOrder::LittleEndian,
+                signed: true,
+                bit_offset: 0,
+                bit_precision: 32,
             }),
             members: vec![
-                EnumMember { name: "RED".to_string(), value: 0i32.to_le_bytes().to_vec() },
-                EnumMember { name: "GREEN".to_string(), value: 1i32.to_le_bytes().to_vec() },
-                EnumMember { name: "BLUE".to_string(), value: 2i32.to_le_bytes().to_vec() },
+                EnumMember {
+                    name: "RED".to_string(),
+                    value: 0i32.to_le_bytes().to_vec(),
+                },
+                EnumMember {
+                    name: "GREEN".to_string(),
+                    value: 1i32.to_le_bytes().to_vec(),
+                },
+                EnumMember {
+                    name: "BLUE".to_string(),
+                    value: 2i32.to_le_bytes().to_vec(),
+                },
             ],
         };
         let bytes = dt.serialize();
@@ -1221,10 +1380,15 @@ mod tests {
     fn serialize_parse_array_roundtrip() {
         let dt = Datatype::Array {
             base_type: Box::new(Datatype::FloatingPoint {
-                size: 8, byte_order: DatatypeByteOrder::LittleEndian,
-                bit_offset: 0, bit_precision: 64,
-                exponent_location: 52, exponent_size: 11,
-                mantissa_location: 0, mantissa_size: 52, exponent_bias: 1023,
+                size: 8,
+                byte_order: DatatypeByteOrder::LittleEndian,
+                bit_offset: 0,
+                bit_precision: 64,
+                exponent_location: 52,
+                exponent_size: 11,
+                mantissa_location: 0,
+                mantissa_size: 52,
+                exponent_bias: 1023,
             }),
             dimensions: vec![3],
         };
@@ -1236,15 +1400,21 @@ mod tests {
     #[test]
     fn test_type_size() {
         let dt = Datatype::FixedPoint {
-            size: 4, byte_order: DatatypeByteOrder::LittleEndian,
-            signed: true, bit_offset: 0, bit_precision: 32,
+            size: 4,
+            byte_order: DatatypeByteOrder::LittleEndian,
+            signed: true,
+            bit_offset: 0,
+            bit_precision: 32,
         };
         assert_eq!(dt.type_size(), 4);
 
         let dt = Datatype::Array {
             base_type: Box::new(Datatype::FixedPoint {
-                size: 4, byte_order: DatatypeByteOrder::LittleEndian,
-                signed: true, bit_offset: 0, bit_precision: 32,
+                size: 4,
+                byte_order: DatatypeByteOrder::LittleEndian,
+                signed: true,
+                bit_offset: 0,
+                bit_precision: 32,
             }),
             dimensions: vec![3, 4],
         };

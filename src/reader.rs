@@ -373,7 +373,10 @@ impl<'f> Dataset<'f> {
         let mut dl = self.data_layout()?;
         // Adjust contiguous data address by base_address offset
         if self.file.addr_offset != 0 {
-            if let DataLayout::Contiguous { ref mut address, .. } = dl {
+            if let DataLayout::Contiguous {
+                ref mut address, ..
+            } = dl
+            {
                 if let Some(addr) = address {
                     *addr += self.file.addr_offset;
                 }
@@ -413,11 +416,9 @@ fn has_message(header: &ObjectHeader, msg_type: MessageType) -> bool {
 }
 
 fn is_group(header: &ObjectHeader) -> bool {
-    header
-        .messages
-        .iter()
-        .any(|m| m.msg_type == MessageType::LinkInfo
+    header.messages.iter().any(|m| {
+        m.msg_type == MessageType::LinkInfo
             || m.msg_type == MessageType::Link
-            || m.msg_type == MessageType::SymbolTable)
+            || m.msg_type == MessageType::SymbolTable
+    })
 }
-

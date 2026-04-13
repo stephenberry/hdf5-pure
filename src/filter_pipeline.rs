@@ -15,6 +15,8 @@ pub const FILTER_FLETCHER32: u16 = 3;
 pub const FILTER_SZIP: u16 = 4;
 pub const FILTER_NBIT: u16 = 5;
 pub const FILTER_SCALEOFFSET: u16 = 6;
+/// ZFP compression filter (registered HDF5 filter ID 32013).
+pub const FILTER_ZFP: u16 = 32013;
 
 /// Description of a single filter in a pipeline.
 #[derive(Debug, Clone, PartialEq)]
@@ -98,7 +100,8 @@ impl FilterPipeline {
             ensure_len(data, pos, num_client_data * 4)?;
             let mut client_data = Vec::with_capacity(num_client_data);
             for _ in 0..num_client_data {
-                let val = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+                let val =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
                 client_data.push(val);
                 pos += 4;
             }
@@ -116,7 +119,10 @@ impl FilterPipeline {
             });
         }
 
-        Ok(FilterPipeline { version: 1, filters })
+        Ok(FilterPipeline {
+            version: 1,
+            filters,
+        })
     }
 
     fn parse_v2(data: &[u8], number_of_filters: usize) -> Result<FilterPipeline, FormatError> {
@@ -160,7 +166,8 @@ impl FilterPipeline {
             ensure_len(data, pos, num_client_data * 4)?;
             let mut client_data = Vec::with_capacity(num_client_data);
             for _ in 0..num_client_data {
-                let val = u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+                let val =
+                    u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
                 client_data.push(val);
                 pos += 4;
             }
@@ -175,7 +182,10 @@ impl FilterPipeline {
             });
         }
 
-        Ok(FilterPipeline { version: 2, filters })
+        Ok(FilterPipeline {
+            version: 2,
+            filters,
+        })
     }
 
     /// Serialize the filter pipeline to bytes.
@@ -279,7 +289,7 @@ mod tests {
         buf.extend_from_slice(&0u16.to_le_bytes()); // flags
         buf.extend_from_slice(&1u16.to_le_bytes()); // nclient
         buf.extend_from_slice(&6u32.to_le_bytes()); // level=6
-        // odd client data count => 4 bytes padding
+                                                    // odd client data count => 4 bytes padding
         buf.extend_from_slice(&[0u8; 4]);
 
         let fp = FilterPipeline::parse(&buf).unwrap();
@@ -332,7 +342,7 @@ mod tests {
     #[test]
     fn parse_v2_three_filters() {
         let mut buf = vec![2u8, 3]; // version=2, nfilters=3
-        // shuffle (id=2)
+                                    // shuffle (id=2)
         buf.extend_from_slice(&FILTER_SHUFFLE.to_le_bytes());
         buf.extend_from_slice(&0u16.to_le_bytes());
         buf.extend_from_slice(&0u16.to_le_bytes());
@@ -411,10 +421,10 @@ mod tests {
         buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
         buf.extend_from_slice(&0u16.to_le_bytes()); // flags
         buf.extend_from_slice(&2u16.to_le_bytes()); // nclient=2
-        // name padded to 8-byte boundary: 9 bytes -> 16 bytes
+                                                    // name padded to 8-byte boundary: 9 bytes -> 16 bytes
         buf.extend_from_slice(name);
         buf.extend_from_slice(&[0u8; 7]); // pad 9->16
-        // client data: 2 values (even, no padding needed)
+                                          // client data: 2 values (even, no padding needed)
         buf.extend_from_slice(&42u32.to_le_bytes());
         buf.extend_from_slice(&99u32.to_le_bytes());
 
