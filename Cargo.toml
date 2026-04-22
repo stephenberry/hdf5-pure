@@ -16,6 +16,9 @@ fast-deflate = ["flate2/zlib-ng"]
 provenance = ["sha2"]
 mmap = ["memmap2"]
 parallel = ["rayon"]
+# Serde-based (de)serialization of MATLAB v7.3 .mat files.
+# Requires `std` (uses File/Group/Dataset reader APIs).
+serde = ["dep:serde", "std"]
 
 [dependencies]
 byteorder = { version = "1", default-features = false }
@@ -24,9 +27,11 @@ sha2 = { version = "0.10", optional = true, default-features = false }
 rayon = { version = "1", optional = true }
 crc32fast = { version = "1", optional = true }
 memmap2 = { version = "0.9", optional = true }
+serde = { version = "1", optional = true, default-features = false, features = ["derive", "alloc"] }
 
 [dev-dependencies]
 tempfile = "3"
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
 hdf5 = { package = "hdf5-metno", version = "0.12", features = ["static", "zlib"] }
 ndarray = "0.16"
