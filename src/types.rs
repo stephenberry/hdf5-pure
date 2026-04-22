@@ -143,15 +143,19 @@ pub(crate) fn classify_datatype(dt: &crate::datatype::Datatype) -> DType {
 /// Read attribute messages into a `HashMap<String, AttrValue>`.
 ///
 /// Best-effort: attributes that can't be decoded are silently skipped.
+/// `base_address` is the file-level userblock offset — needed so that
+/// variable-length attribute data (stored in global heap collections with
+/// addresses relative to the base) can be located correctly.
 pub(crate) fn attrs_to_map(
     attrs: &[crate::attribute::AttributeMessage],
     file_data: &[u8],
     offset_size: u8,
     length_size: u8,
+    base_address: u64,
 ) -> HashMap<std::string::String, AttrValue> {
     let mut map = HashMap::new();
     for attr in attrs {
-        if let Some(val) = decode_attr_value(attr, file_data, offset_size, length_size) {
+        if let Some(val) = decode_attr_value(attr, file_data, offset_size, length_size, base_address) {
             map.insert(attr.name.clone(), val);
         }
     }
@@ -163,6 +167,7 @@ fn decode_attr_value(
     file_data: &[u8],
     offset_size: u8,
     length_size: u8,
+    base_address: u64,
 ) -> Option<AttrValue> {
     use crate::datatype::Datatype;
 
@@ -201,10 +206,26 @@ fn decode_attr_value(
                 Some(AttrValue::StringArray(strings))
             }
         }
-        Datatype::VariableLength {
-            is_string: true, ..
-        } => {
-            let strings = attr.read_vl_strings(file_data, offset_size, length_size).ok()?;
+        Datatype::VariableLength { is_string, base_type, .. }
+            if *is_string || is_ascii_char_vlen_base(base_type) =>
+        {
+            // Two MATLAB-relevant encodings share the same on-disk byte
+            // layout (length + heap ref + object index per element; heap
+            // object holds raw bytes without terminator):
+            //   - is_string: true             — H5T_STRING{STRSIZE=VAR}
+            //   - VLEN of H5T_STRING{SIZE=1}  — what matio / MATLAB emit
+            //
+            // Patch collection addresses to absolute by adding
+            // base_address, then delegate to the VL string reader.
+            let patched = rebase_vl_refs(&attr.raw_data, offset_size, base_address);
+            let strings = crate::vl_data::read_vl_strings(
+                file_data,
+                &patched,
+                attr.dataspace.num_elements(),
+                offset_size,
+                length_size,
+            )
+            .ok()?;
             if strings.len() == 1 {
                 Some(AttrValue::String(strings[0].clone()))
             } else {
@@ -213,4 +234,68 @@ fn decode_attr_value(
         }
         _ => None,
     }
+}
+
+/// Recognize the MATLAB-style VLEN encoding where the base type is a 1-byte
+/// ASCII string (`H5T_VLEN { H5T_STRING { STRSIZE 1, ..., CSET ASCII } }`).
+/// Other VLEN sequences of strings may exist but we only auto-decode this
+/// specific shape as a string array.
+fn is_ascii_char_vlen_base(base: &crate::datatype::Datatype) -> bool {
+    use crate::datatype::{CharacterSet, Datatype};
+    matches!(
+        base,
+        Datatype::String {
+            size: 1,
+            charset: CharacterSet::Ascii,
+            ..
+        }
+    )
+}
+
+/// Copy `raw_data` and add `base_address` to each VL reference's
+/// `collection_address` field. The VL reference layout is
+/// `length(4) + address(offset_size) + index(4)` repeated per element.
+fn rebase_vl_refs(raw_data: &[u8], offset_size: u8, base_address: u64) -> Vec<u8> {
+    if base_address == 0 {
+        return raw_data.to_vec();
+    }
+    let elem_size = 4 + offset_size as usize + 4;
+    let mut out = raw_data.to_vec();
+    let mut pos = 0;
+    while pos + elem_size <= out.len() {
+        let addr_start = pos + 4;
+        let addr_end = addr_start + offset_size as usize;
+        let addr = match offset_size {
+            2 => u16::from_le_bytes([out[addr_start], out[addr_start + 1]]) as u64,
+            4 => u32::from_le_bytes([
+                out[addr_start],
+                out[addr_start + 1],
+                out[addr_start + 2],
+                out[addr_start + 3],
+            ]) as u64,
+            8 => u64::from_le_bytes([
+                out[addr_start], out[addr_start + 1], out[addr_start + 2], out[addr_start + 3],
+                out[addr_start + 4], out[addr_start + 5], out[addr_start + 6], out[addr_start + 7],
+            ]),
+            _ => return raw_data.to_vec(),
+        };
+        // Leave undefined/null addresses alone.
+        let is_undef = match offset_size {
+            2 => addr == 0xFFFF,
+            4 => addr == 0xFFFF_FFFF,
+            8 => addr == 0xFFFF_FFFF_FFFF_FFFF,
+            _ => false,
+        };
+        if !is_undef && addr != 0 {
+            let new_addr = addr + base_address;
+            match offset_size {
+                2 => out[addr_start..addr_end].copy_from_slice(&(new_addr as u16).to_le_bytes()),
+                4 => out[addr_start..addr_end].copy_from_slice(&(new_addr as u32).to_le_bytes()),
+                8 => out[addr_start..addr_end].copy_from_slice(&new_addr.to_le_bytes()),
+                _ => {}
+            }
+        }
+        pos += elem_size;
+    }
+    out
 }

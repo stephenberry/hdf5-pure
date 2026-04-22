@@ -143,6 +143,59 @@ grp.set_attr("MATLAB_fields", AttrValue::VarLenAsciiArray(fields));
 builder.add_group(grp.finish());
 ```
 
+## MATLAB v7.3 `.mat` via serde
+
+With the `serde` feature, Rust structs can be serialized directly to `.mat`
+v7.3 files and back:
+
+```rust
+use hdf5_pure::mat::{self, Complex64, Matrix};
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct Experiment {
+    name: String,
+    trial: u32,
+    samples: Vec<f64>,
+    data: Matrix<f64>,
+    waveform: Vec<Complex64>,
+    config: Config,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
+struct Config { threshold: f64, tag: String }
+
+let e = Experiment {
+    name: "run1".into(), trial: 3,
+    samples: vec![1.0, 2.0, 3.0],
+    data: Matrix::from_row_major(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+    waveform: vec![Complex64::new(1.0, 0.0), Complex64::new(0.0, 1.0)],
+    config: Config { threshold: 0.5, tag: "prod".into() },
+};
+
+mat::to_file(&e, "experiment.mat").unwrap();
+let back: Experiment = mat::from_file("experiment.mat").unwrap();
+assert_eq!(back, e);
+```
+
+The top-level value must be a struct (or `HashMap<String, _>`); each field
+becomes a MATLAB variable. Mapping:
+
+| Rust | HDF5 / MATLAB encoding |
+|---|---|
+| `f64`, `f32`, `i*`, `u*` | scalar dataset `[1,1]`, `MATLAB_class = "double"` / `"single"` / `"int*"` / `"uint*"` |
+| `bool` | `uint8` scalar, `MATLAB_class = "logical"` |
+| `String` / `&str` | `uint16` `[1, N]` UTF-16LE, `MATLAB_class = "char"` |
+| `Vec<T>` of numeric `T` | `[1, N]` row vector |
+| `Matrix<T>` or `Vec<Vec<T>>` | column-major 2-D dataset, HDF5 shape `[cols, rows]` |
+| `Complex32` / `Complex64` | compound `{real, imag}` dataset |
+| nested struct | HDF5 group with `MATLAB_class = "struct"`, `MATLAB_fields` |
+| `Option<T>` | omitted if `None` |
+| unit enum variant | UTF-16 char dataset holding the variant name |
+
+Not supported in this release: cell arrays, non-unit enum variants, MATLAB
+objects (`classdef`), datetime / categorical types.
+
 ## Cargo features
 
 | Feature | Default | Description |
@@ -150,6 +203,7 @@ builder.add_group(grp.finish());
 | `std` | yes | File I/O, high-level reader API |
 | `checksum` | yes | Jenkins hash for v2+ object headers |
 | `deflate` | yes | Deflate compression (pure Rust backend) |
+| `serde` | no | Serialize/deserialize MATLAB v7.3 `.mat` files via serde |
 | `fast-checksum` | no | Hardware-accelerated CRC32 via `crc32fast` |
 | `fast-deflate` | no | zlib-ng backend for deflate via `flate2/zlib-ng` |
 | `mmap` | no | Memory-mapped file reading via `memmap2` |
