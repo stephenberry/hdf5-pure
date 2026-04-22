@@ -12,6 +12,8 @@ use crate::error::FormatError;
 use crate::filter_pipeline::{
     FilterDescription, FilterPipeline, FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SHUFFLE,
 };
+#[cfg(feature = "zfp")]
+use crate::filter_pipeline::FILTER_ZFP;
 use crate::filters::compress_chunk;
 
 /// Round a file offset up to the next cache-line boundary.
@@ -35,6 +37,10 @@ pub struct ChunkOptions {
     pub shuffle: bool,
     /// Whether to apply fletcher32 checksum.
     pub fletcher32: bool,
+    /// ZFP fixed-rate compression (bits per value), None = no ZFP.
+    /// When set, takes priority over shuffle + deflate.
+    #[cfg(feature = "zfp")]
+    pub zfp_rate: Option<f64>,
 }
 
 impl ChunkOptions {
@@ -44,13 +50,42 @@ impl ChunkOptions {
             || self.deflate_level.is_some()
             || self.shuffle
             || self.fletcher32
+            || self.zfp_enabled()
+    }
+
+    #[cfg(feature = "zfp")]
+    #[inline]
+    fn zfp_enabled(&self) -> bool {
+        self.zfp_rate.is_some()
+    }
+
+    #[cfg(not(feature = "zfp"))]
+    #[inline]
+    fn zfp_enabled(&self) -> bool {
+        false
     }
 
     /// Build a FilterPipeline from the options.
     pub fn build_pipeline(&self, element_size: u32) -> Option<FilterPipeline> {
         let mut filters = Vec::new();
 
-        if self.shuffle {
+        // ZFP is a standalone compressor — it replaces shuffle + deflate.
+        #[cfg(feature = "zfp")]
+        let zfp_active = if let Some(rate) = self.zfp_rate {
+            filters.push(FilterDescription {
+                filter_id: FILTER_ZFP,
+                name: Some("zfp".into()),
+                flags: 0,
+                client_data: crate::zfp::zfp_cd_values_rate(rate),
+            });
+            true
+        } else {
+            false
+        };
+        #[cfg(not(feature = "zfp"))]
+        let zfp_active = false;
+
+        if !zfp_active && self.shuffle {
             filters.push(FilterDescription {
                 filter_id: FILTER_SHUFFLE,
                 name: None,
@@ -59,7 +94,9 @@ impl ChunkOptions {
             });
         }
 
-        if let Some(level) = self.deflate_level {
+        if !zfp_active
+            && let Some(level) = self.deflate_level
+        {
             filters.push(FilterDescription {
                 filter_id: FILTER_DEFLATE,
                 name: None,

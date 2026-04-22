@@ -8,6 +8,8 @@ use alloc::{vec, vec::Vec};
 
 use crate::error::FormatError;
 use crate::filter_pipeline::{FilterPipeline, FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SHUFFLE};
+#[cfg(feature = "zfp")]
+use crate::filter_pipeline::FILTER_ZFP;
 
 /// Apply a filter pipeline to decompress a chunk.
 /// Filters are applied in REVERSE order for decompression.
@@ -24,6 +26,15 @@ pub fn decompress_chunk(
             FILTER_SHUFFLE => shuffle_decompress(&data, element_size as usize)?,
             FILTER_DEFLATE => deflate_decompress(&data)?,
             FILTER_FLETCHER32 => fletcher32_verify(&data)?,
+            #[cfg(feature = "zfp")]
+            FILTER_ZFP => {
+                let rate =
+                    crate::zfp::zfp_rate_from_cd_values(&filter.client_data).ok_or_else(|| {
+                        FormatError::FilterError("ZFP: invalid or non-rate cd_values".into())
+                    })?;
+                let num_floats = _chunk_size / element_size as usize;
+                crate::zfp::decompress_f32(&data, num_floats, rate)?
+            }
             other => return Err(FormatError::UnsupportedFilter(other)),
         };
     }
@@ -48,6 +59,14 @@ pub fn compress_chunk(
                 deflate_compress(&result, level)?
             }
             FILTER_FLETCHER32 => fletcher32_append(&result)?,
+            #[cfg(feature = "zfp")]
+            FILTER_ZFP => {
+                let rate =
+                    crate::zfp::zfp_rate_from_cd_values(&filter.client_data).ok_or_else(|| {
+                        FormatError::FilterError("ZFP: invalid or non-rate cd_values".into())
+                    })?;
+                crate::zfp::compress_f32(&result, rate)?
+            }
             other => return Err(FormatError::UnsupportedFilter(other)),
         };
     }

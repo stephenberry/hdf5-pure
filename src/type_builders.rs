@@ -867,6 +867,17 @@ impl DatasetBuilder {
         self
     }
 
+    /// Enable ZFP fixed-rate compression (implies chunked if not already set).
+    ///
+    /// `rate` is the number of compressed bits per value. Supports f32, f64,
+    /// i32, and i64 datasets in 1D–4D. When ZFP is active it replaces shuffle
+    /// and deflate on the same dataset.
+    #[cfg(feature = "zfp")]
+    pub fn with_zfp(&mut self, rate: f64) -> &mut Self {
+        self.chunk_options.zfp_rate = Some(rate);
+        self
+    }
+
     /// Attach SHINES provenance metadata (SHA-256, creator, timestamp).
     ///
     /// The SHA-256 hash of the raw dataset bytes is computed automatically
