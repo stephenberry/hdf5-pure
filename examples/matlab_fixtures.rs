@@ -14,7 +14,7 @@
 //! % Then run the commands printed by the example.
 //! ```
 
-use hdf5_pure::mat::{self, Complex64, Matrix};
+use hdf5_pure::mat::{self, Complex32, Complex64, Matrix};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -31,6 +31,18 @@ fn main() {
     write_complex(&out);
     write_unit_enum(&out);
     write_everything(&out);
+
+    // Edge-case stress fixtures.
+    write_extremes(&out);
+    write_shapes(&out);
+    write_int_matrices(&out);
+    write_unicode(&out);
+    write_complex_edges(&out);
+    write_deep_nested(&out);
+    write_bool_ext(&out);
+    write_empty_variants(&out);
+    write_large_matrix(&out);
+
     copy_octave_helpers(&out);
 
     println!();
@@ -38,7 +50,7 @@ fn main() {
     println!();
     println!("Quick check in MATLAB:");
     println!("  >> cd('matlab_fixtures')");
-    println!("  >> verify                     % runs 50 assertions");
+    println!("  >> verify                     % runs all assertions");
     println!();
     println!("Or from a shell (GNU Octave):");
     println!("  $ cd matlab_fixtures && octave --no-gui --eval verify");
@@ -412,4 +424,275 @@ fn announce(filename: &str, commands: &[&str]) {
     for line in commands {
         println!("  >> {line}");
     }
+}
+
+// ===========================================================================
+// Edge-case stress fixtures. `verify.m` has detailed assertions for these;
+// no per-file `announce()` listing is needed (the verify script runs them
+// all at once).
+// ===========================================================================
+
+/// Extreme numeric values: IEEE specials, integer limits, subnormals.
+#[derive(Serialize, Deserialize)]
+struct Extremes {
+    nan64: f64,
+    pos_inf: f64,
+    neg_inf: f64,
+    neg_zero: f64,
+    subnormal: f64,
+    nan32: f32,
+    pos_inf32: f32,
+    i64_min: i64,
+    i64_max: i64,
+    i32_min: i32,
+    i32_max: i32,
+    u64_max: u64,
+    i8_min: i8,
+    i8_max: i8,
+    u8_max: u8,
+    nan_vec: Vec<f64>,
+    i64_extremes: Vec<i64>,
+}
+
+fn write_extremes(dir: &Path) {
+    let v = Extremes {
+        nan64: f64::NAN,
+        pos_inf: f64::INFINITY,
+        neg_inf: f64::NEG_INFINITY,
+        neg_zero: -0.0_f64,
+        subnormal: f64::from_bits(1), // smallest positive subnormal
+        nan32: f32::NAN,
+        pos_inf32: f32::INFINITY,
+        i64_min: i64::MIN,
+        i64_max: i64::MAX,
+        i32_min: i32::MIN,
+        i32_max: i32::MAX,
+        u64_max: u64::MAX,
+        i8_min: i8::MIN,
+        i8_max: i8::MAX,
+        u8_max: u8::MAX,
+        nan_vec: vec![1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.0],
+        i64_extremes: vec![i64::MIN, -1, 0, 1, i64::MAX],
+    };
+    mat::to_file(&v, dir.join("extremes.mat")).unwrap();
+    println!("wrote: extremes.mat");
+}
+
+/// Matrix orientation edges — 1x1, row vector, column vector, non-square,
+/// plus a 3x3 with per-cell distinct values to catch any row/col swap.
+#[derive(Serialize, Deserialize)]
+struct Shapes {
+    m_1x1: Matrix<f64>,
+    m_1x5: Matrix<f64>,
+    m_5x1: Matrix<f64>,
+    m_2x3: Matrix<f64>,
+    m_3x2: Matrix<f64>,
+    m_3x3: Matrix<f64>,
+}
+
+fn write_shapes(dir: &Path) {
+    let v = Shapes {
+        m_1x1: Matrix::from_row_major(1, 1, vec![42.0]),
+        m_1x5: Matrix::from_row_major(1, 5, vec![10.0, 20.0, 30.0, 40.0, 50.0]),
+        m_5x1: Matrix::from_row_major(5, 1, vec![10.0, 20.0, 30.0, 40.0, 50.0]),
+        m_2x3: Matrix::from_row_major(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        m_3x2: Matrix::from_row_major(3, 2, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+        m_3x3: Matrix::from_row_major(
+            3,
+            3,
+            vec![11.0, 12.0, 13.0, 21.0, 22.0, 23.0, 31.0, 32.0, 33.0],
+        ),
+    };
+    mat::to_file(&v, dir.join("shapes.mat")).unwrap();
+    println!("wrote: shapes.mat");
+}
+
+/// Every integer matrix class plus logical and single.
+#[derive(Serialize, Deserialize)]
+struct IntMatrices {
+    m_i8: Matrix<i8>,
+    m_i16: Matrix<i16>,
+    m_i32: Matrix<i32>,
+    m_i64: Matrix<i64>,
+    m_u8: Matrix<u8>,
+    m_u16: Matrix<u16>,
+    m_u32: Matrix<u32>,
+    m_u64: Matrix<u64>,
+    m_bool: Matrix<bool>,
+    m_f32: Matrix<f32>,
+}
+
+fn write_int_matrices(dir: &Path) {
+    let v = IntMatrices {
+        m_i8: Matrix::from_row_major(2, 2, vec![-128_i8, 127, 0, -1]),
+        m_i16: Matrix::from_row_major(2, 2, vec![-32768_i16, 32767, 0, -1]),
+        m_i32: Matrix::from_row_major(2, 2, vec![-1_i32, 2, 3, 4]),
+        m_i64: Matrix::from_row_major(2, 2, vec![-1_i64, 2, 3, i64::MAX]),
+        m_u8: Matrix::from_row_major(2, 3, vec![0_u8, 1, 2, 253, 254, 255]),
+        m_u16: Matrix::from_row_major(2, 2, vec![0_u16, 1, 65534, 65535]),
+        m_u32: Matrix::from_row_major(2, 2, vec![0_u32, 1, 4294967294, 4294967295]),
+        m_u64: Matrix::from_row_major(2, 2, vec![0_u64, 1, 2, u64::MAX]),
+        m_bool: Matrix::from_row_major(2, 2, vec![true, false, false, true]),
+        m_f32: Matrix::from_row_major(2, 2, vec![1.5_f32, 2.5, 3.5, 4.5]),
+    };
+    mat::to_file(&v, dir.join("int_matrices.mat")).unwrap();
+    println!("wrote: int_matrices.mat");
+}
+
+/// Unicode strings: Latin-1 accents, CJK, emoji surrogate pair, multi-line,
+/// single char, long ASCII.
+#[derive(Serialize, Deserialize)]
+struct Unicode {
+    latin1: String,
+    cjk: String,
+    emoji: String,
+    mixed: String,
+    multiline: String,
+    one_char: String,
+    long_ascii: String,
+}
+
+fn write_unicode(dir: &Path) {
+    let v = Unicode {
+        latin1: "café — naïve — résumé".into(),
+        cjk: "日本語テスト".into(),
+        emoji: "🎉".into(), // U+1F389: requires a UTF-16 surrogate pair
+        mixed: "é日🎉A".into(),
+        multiline: "line1\nline2\tindented\nend".into(),
+        one_char: "X".into(),
+        long_ascii: "abcdefghij".repeat(500),
+    };
+    mat::to_file(&v, dir.join("unicode.mat")).unwrap();
+    println!("wrote: unicode.mat");
+}
+
+/// Complex edge cases: NaN, Inf, pure real/imaginary, f32 complex.
+#[derive(Serialize, Deserialize)]
+struct ComplexEdges {
+    z_nan: Complex64,
+    z_inf: Complex64,
+    z_zero: Complex64,
+    z_pure_imag: Complex64,
+    z_pure_real: Complex64,
+    z32: Complex32,
+    z32_vec: Vec<Complex32>,
+    cmat: Matrix<f64>,
+}
+
+fn write_complex_edges(dir: &Path) {
+    let v = ComplexEdges {
+        z_nan: Complex64::new(f64::NAN, 0.0),
+        z_inf: Complex64::new(f64::INFINITY, f64::NEG_INFINITY),
+        z_zero: Complex64::new(0.0, 0.0),
+        z_pure_imag: Complex64::new(0.0, 2.5),
+        z_pure_real: Complex64::new(3.5, 0.0),
+        z32: Complex32::new(1.25, -0.5),
+        z32_vec: vec![
+            Complex32::new(0.0, 0.0),
+            Complex32::new(1.0, 1.0),
+            Complex32::new(-1.0, -1.0),
+        ],
+        cmat: Matrix::from_row_major(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
+    };
+    mat::to_file(&v, dir.join("complex_edges.mat")).unwrap();
+    println!("wrote: complex_edges.mat");
+}
+
+/// 4-level deep struct nesting.
+#[derive(Serialize, Deserialize)]
+struct Root { label: String, inner: Inner }
+#[derive(Serialize, Deserialize)]
+struct Inner { depth: u32, sub: SubInner }
+#[derive(Serialize, Deserialize)]
+struct SubInner { tag: String, leaf: Leaf }
+#[derive(Serialize, Deserialize)]
+struct Leaf { id: u64, values: Vec<f64> }
+
+fn write_deep_nested(dir: &Path) {
+    #[derive(Serialize)]
+    struct Wrap { root: Root }
+    let v = Wrap {
+        root: Root {
+            label: "top".into(),
+            inner: Inner {
+                depth: 2,
+                sub: SubInner {
+                    tag: "middle".into(),
+                    leaf: Leaf { id: 12345, values: vec![1.5, 2.5, 3.5] },
+                },
+            },
+        },
+    };
+    mat::to_file(&v, dir.join("deep_nested.mat")).unwrap();
+    println!("wrote: deep_nested.mat");
+}
+
+/// Extended boolean cases — length-1 vec, 3x3 logical matrix, longer vec.
+#[derive(Serialize, Deserialize)]
+struct BoolExt {
+    single: Vec<bool>,
+    mat: Matrix<bool>,
+    flags: Vec<bool>,
+}
+
+fn write_bool_ext(dir: &Path) {
+    let v = BoolExt {
+        single: vec![true],
+        mat: Matrix::from_row_major(
+            3,
+            3,
+            vec![true, false, true, false, true, false, true, false, true],
+        ),
+        flags: vec![true, true, false, true, false, false, true],
+    };
+    mat::to_file(&v, dir.join("bool_ext.mat")).unwrap();
+    println!("wrote: bool_ext.mat");
+}
+
+/// Empty containers of every primitive type.
+#[derive(Serialize, Deserialize)]
+struct EmptyVariants {
+    e_f64: Vec<f64>,
+    e_f32: Vec<f32>,
+    e_i32: Vec<i32>,
+    e_u8: Vec<u8>,
+    e_bool: Vec<bool>,
+    e_str: String,
+}
+
+fn write_empty_variants(dir: &Path) {
+    let v = EmptyVariants {
+        e_f64: vec![], e_f32: vec![], e_i32: vec![], e_u8: vec![],
+        e_bool: vec![], e_str: String::new(),
+    };
+    mat::to_file(&v, dir.join("empty_variants.mat")).unwrap();
+    println!("wrote: empty_variants.mat");
+}
+
+/// Large matrix (100x50) with position-coded values (`value = row*1000 + col`)
+/// so specific cells can be verified to rule out any transpose off-by-one at
+/// size.
+#[derive(Serialize, Deserialize)]
+struct LargeMatrix {
+    m: Matrix<f64>,
+    rows: u32,
+    cols: u32,
+}
+
+fn write_large_matrix(dir: &Path) {
+    let rows = 100usize;
+    let cols = 50usize;
+    let mut data = Vec::with_capacity(rows * cols);
+    for r in 0..rows {
+        for c in 0..cols {
+            data.push((r * 1000 + c) as f64);
+        }
+    }
+    let v = LargeMatrix {
+        m: Matrix::from_row_major(rows, cols, data),
+        rows: rows as u32,
+        cols: cols as u32,
+    };
+    mat::to_file(&v, dir.join("large_matrix.mat")).unwrap();
+    println!("wrote: large_matrix.mat");
 }

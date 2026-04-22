@@ -187,12 +187,16 @@ fn read_numeric(
     // Read all elements as the MATLAB class's native type.
     let flat = read_all_elements(ds, class)?;
 
-    if rows == 1 || cols == 1 {
+    // A 1-D HDF5 dataset (no recorded cols/rows split) is treated as a flat
+    // Vec1D. Files produced by MATLAB/this library are always 2-D, but some
+    // external tools write true 1-D shapes.
+    if shape.len() <= 1 {
         return Ok(MatValue::Vec1D(flat));
     }
 
-    // 2-D matrix: the stored bytes are column-major for a MATLAB [rows, cols]
-    // matrix. Transpose into row-major for Rust.
+    // 2-D dataset. Preserve the MATLAB [rows, cols] shape even when one dim
+    // is 1 — Matrix<T> needs this to distinguish row vs column vectors. The
+    // deserializer flattens to a plain sequence for Vec<T> callers.
     let matrix = transpose_col_major_to_row_major(flat, rows, cols)?;
     Ok(MatValue::Matrix {
         rows,

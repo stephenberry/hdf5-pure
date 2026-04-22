@@ -614,3 +614,48 @@ fn full_roundtrip_via_matio() {
     assert_eq!(parsed.xs, vec![0.5, 1.5, 2.5]);
     assert_eq!(parsed.ns, vec![10, 20, 30]);
 }
+
+/// Regression: a column-vector matrix written by matio (MATLAB [N,1]) must
+/// round-trip through our Matrix<T> reader as a Matrix of shape (N, 1), not
+/// (1, N). This exercises the reader path that used to silently flatten 2-D
+/// datasets with a unit dimension into Vec1D and lose the orientation.
+#[test]
+fn hdf5_pure_reads_column_vector_matrix_from_matio() {
+    use hdf5_pure::mat::Matrix;
+    let _g = matio_lock();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("colvec.mat");
+    {
+        let f = MatFile::create_v73(&path);
+        // MATLAB 3×1 column. Column-major bytes of a 3×1 are just [a, b, c].
+        f.write(MatVar::f64_matrix("m", 3, 1, &[10.0, 20.0, 30.0]));
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ColOnly { m: Matrix<f64> }
+    let parsed: ColOnly = mat::from_file(&path).unwrap();
+    assert_eq!(parsed.m.rows(), 3);
+    assert_eq!(parsed.m.cols(), 1);
+    assert_eq!(parsed.m.data(), &[10.0, 20.0, 30.0]);
+}
+
+/// Companion: row-vector matrix from matio round-trips as (1, N).
+#[test]
+fn hdf5_pure_reads_row_vector_matrix_from_matio() {
+    use hdf5_pure::mat::Matrix;
+    let _g = matio_lock();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("rowvec.mat");
+    {
+        let f = MatFile::create_v73(&path);
+        // MATLAB 1×4 row. Column-major bytes of a 1×4 are [a, b, c, d].
+        f.write(MatVar::f64_matrix("m", 1, 4, &[10.0, 20.0, 30.0, 40.0]));
+    }
+
+    #[derive(serde::Deserialize)]
+    struct RowOnly { m: Matrix<f64> }
+    let parsed: RowOnly = mat::from_file(&path).unwrap();
+    assert_eq!(parsed.m.rows(), 1);
+    assert_eq!(parsed.m.cols(), 4);
+    assert_eq!(parsed.m.data(), &[10.0, 20.0, 30.0, 40.0]);
+}

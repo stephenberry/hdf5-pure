@@ -165,6 +165,11 @@ impl<'de> Deserializer<'de> for MatValueDeserializer {
     fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, MatError> {
         match self.value {
             MatValue::Vec1D(v) => visitor.visit_seq(Vec1DSeq::new(v)),
+            // A degenerate 2-D matrix (1×N or N×1) flattens to a sequence so
+            // that `Vec<T>` deserializes from either orientation.
+            MatValue::Matrix { rows, cols, vec } if rows == 1 || cols == 1 => {
+                visitor.visit_seq(Vec1DSeq::new(vec))
+            }
             MatValue::Matrix { rows, cols, vec } => {
                 visitor.visit_seq(MatrixRowsSeq::new(rows, cols, vec))
             }
