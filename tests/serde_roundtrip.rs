@@ -56,9 +56,9 @@ fn serialize_top_level_struct_produces_three_variables() {
         Some(&AttrValue::String("double".into()))
     );
 
-    // name: char [1, 4] (UTF-16 code units of "beta")
+    // name: char [4, 1] HDF5 → MATLAB row [1, 4] (UTF-16 code units of "beta")
     let name = file.dataset("name").unwrap();
-    assert_eq!(name.shape().unwrap(), vec![1, 4]);
+    assert_eq!(name.shape().unwrap(), vec![4, 1]);
     assert_eq!(
         name.attrs().unwrap().get("MATLAB_class"),
         Some(&AttrValue::String("char".into()))
@@ -190,7 +190,7 @@ fn option_some_serializes_underlying() {
     let v = WithOption { required: 1.0, maybe: Some("hello".into()) };
     let file = File::from_bytes(mat::to_bytes(&v).unwrap()).unwrap();
     let ds = file.dataset("maybe").unwrap();
-    assert_eq!(ds.shape().unwrap(), vec![1, 5]);
+    assert_eq!(ds.shape().unwrap(), vec![5, 1]);
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -232,7 +232,8 @@ fn unit_enum_variant_becomes_char_string() {
     let v = WithEnum { state: Flag::On };
     let file = File::from_bytes(mat::to_bytes(&v).unwrap()).unwrap();
     let ds = file.dataset("state").unwrap();
-    assert_eq!(ds.shape().unwrap(), vec![1, 2]);
+    // MATLAB row-vector string: HDF5 shape [N, 1].
+    assert_eq!(ds.shape().unwrap(), vec![2, 1]);
     let units = ds.read_u16().unwrap();
     assert_eq!(String::from_utf16(&units).unwrap(), "On");
 }

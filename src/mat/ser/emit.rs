@@ -334,7 +334,10 @@ fn apply_char_string(ds: &mut DatasetBuilder, s: &str) {
         ds.set_attr("MATLAB_empty", AttrValue::U32(1));
         return;
     }
-    ds.with_u16_data(&units).with_shape(&[1, n]);
+    // MATLAB strings are row vectors: MATLAB shape [1, N] → HDF5 [N, 1]
+    // (column-major on-disk). This matches libmatio's output and lets
+    // MATLAB `strcmp` work without transposing.
+    ds.with_u16_data(&units).with_shape(&[n, 1]);
     set_class(ds, MatClass::Char);
     set_char_decode(ds);
 }

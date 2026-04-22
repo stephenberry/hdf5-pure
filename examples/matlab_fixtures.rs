@@ -31,17 +31,32 @@ fn main() {
     write_complex(&out);
     write_unit_enum(&out);
     write_everything(&out);
+    copy_octave_helpers(&out);
 
     println!();
     println!("All fixtures written to: {}", out.display());
     println!();
     println!("Quick check in MATLAB:");
     println!("  >> cd('matlab_fixtures')");
-    println!("  >> !ls *.mat                  % list files");
-    println!("  >> load scalars.mat           % try each in turn");
-    println!("  >> whos                       % inspect variables");
+    println!("  >> verify                     % runs 50 assertions");
     println!();
-    println!("Per-file checks are printed above each `wrote:` line.");
+    println!("Or from a shell (GNU Octave):");
+    println!("  $ cd matlab_fixtures && octave --no-gui --eval verify");
+}
+
+/// Copy `verify.m` and `ok.m` from `examples/octave/` next to the fixture
+/// files. Users run `verify` in MATLAB/Octave after `cd`ing into the output
+/// directory — the helper scripts need to be on the path alongside.
+fn copy_octave_helpers(out: &Path) {
+    let src = Path::new("examples/octave");
+    for name in ["verify.m", "ok.m"] {
+        let from = src.join(name);
+        if from.exists() {
+            let _ = std::fs::copy(&from, out.join(name));
+        } else {
+            eprintln!("warning: {} not found; skipping", from.display());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

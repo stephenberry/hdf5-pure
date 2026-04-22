@@ -73,9 +73,10 @@ fn c_library_reads_nested_struct_file() {
         .collect();
     assert_eq!(field_names, vec!["threshold", "tag"]);
 
-    // char dataset: MATLAB char = UTF-16 in uint16 storage.
+    // char dataset: MATLAB char = UTF-16 in uint16 storage. Strings are
+    // MATLAB row vectors, which means HDF5 shape [N, 1] (column-major).
     let name = file.dataset("name").unwrap();
-    assert_eq!(name.shape(), vec![1, 5]); // "alpha" = 5 UTF-16 code units
+    assert_eq!(name.shape(), vec![5, 1]); // "alpha" = 5 UTF-16 code units
     let units: Vec<u16> = name.read_raw().unwrap();
     assert_eq!(String::from_utf16(&units).unwrap(), "alpha");
     let name_class = name
