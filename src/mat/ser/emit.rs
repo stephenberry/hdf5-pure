@@ -148,6 +148,7 @@ fn apply_scalar(ds: &mut DatasetBuilder, n: ScalarNum) -> Result<(), MatError> {
         ScalarNum::Bool(b) => {
             ds.with_u8_data(&[u8::from(b)]).with_shape(&[1, 1]);
             set_class(ds, MatClass::Logical);
+            set_logical_decode(ds);
         }
         ScalarNum::F64(x) => {
             ds.with_f64_data(&[x]).with_shape(&[1, 1]);
@@ -205,6 +206,7 @@ fn apply_vec_1d(ds: &mut DatasetBuilder, v: NumVec) -> Result<(), MatError> {
             let bytes: Vec<u8> = vec.into_iter().map(u8::from).collect();
             ds.with_u8_data(&bytes).with_shape(&shape);
             set_class(ds, MatClass::Logical);
+            set_logical_decode(ds);
         }
         NumVec::F64(vec) => {
             ds.with_f64_data(&vec).with_shape(&shape);
@@ -265,6 +267,7 @@ fn apply_matrix(
             let bytes: Vec<u8> = col_major.into_iter().map(u8::from).collect();
             ds.with_u8_data(&bytes).with_shape(&shape);
             set_class(ds, MatClass::Logical);
+            set_logical_decode(ds);
         }
         NumVec::F64(row_major) => {
             let col = transpose_scalars(rows, cols, &row_major);
@@ -327,11 +330,13 @@ fn apply_char_string(ds: &mut DatasetBuilder, s: &str) {
         // Empty char: use MATLAB_empty marker with [0, 0] shape.
         ds.with_u16_data(&[]).with_shape(&[0u64, 0]);
         set_class(ds, MatClass::Char);
+        set_char_decode(ds);
         ds.set_attr("MATLAB_empty", AttrValue::U32(1));
         return;
     }
     ds.with_u16_data(&units).with_shape(&[1, n]);
     set_class(ds, MatClass::Char);
+    set_char_decode(ds);
 }
 
 fn emit_empty(ds: &mut DatasetBuilder, tag: ScalarTag) {
@@ -340,6 +345,7 @@ fn emit_empty(ds: &mut DatasetBuilder, tag: ScalarTag) {
         ScalarTag::Bool => {
             ds.with_u8_data(&[]).with_shape(&[0u64, 0]);
             set_class(ds, MatClass::Logical);
+            set_logical_decode(ds);
         }
         ScalarTag::F64 => {
             ds.with_f64_data(&[]).with_shape(&[0u64, 0]);
@@ -390,6 +396,20 @@ fn set_class(ds: &mut DatasetBuilder, class: MatClass) {
         "MATLAB_class",
         AttrValue::AsciiString(class.as_str().into()),
     );
+}
+
+/// MATLAB writes logical datasets as uint8 storage with `MATLAB_int_decode = 1`
+/// in addition to `MATLAB_class = "logical"`. Without this attribute matio
+/// (and MATLAB itself) report the variable as an empty/unknown class.
+fn set_logical_decode(ds: &mut DatasetBuilder) {
+    ds.set_attr("MATLAB_int_decode", AttrValue::I32(1));
+}
+
+/// `char` datasets are uint16 storage; MATLAB also expects
+/// `MATLAB_int_decode = 2` so the library decodes the uint16 code units as
+/// UTF-16 characters rather than a numeric array.
+fn set_char_decode(ds: &mut DatasetBuilder) {
+    ds.set_attr("MATLAB_int_decode", AttrValue::I32(2));
 }
 
 fn transpose_scalars<T: Copy>(rows: usize, cols: usize, row_major: &[T]) -> Vec<T> {
