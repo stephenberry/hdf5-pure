@@ -6,6 +6,18 @@
 use hdf5_pure::{AttrValue, CompoundTypeBuilder, FileBuilder, make_f64_type};
 use tempfile::tempdir;
 
+/// Read a MATLAB-style variable-length ASCII attribute from an `hdf5::Attribute`.
+/// Our serializer emits the same `H5T_VLEN { H5T_STRING { STRSIZE 1 } }` shape
+/// that real MATLAB and matio emit, so reading via `VarLenArray<FixedAscii<1>>`
+/// matches. Returns the decoded strings in order.
+fn read_vl_ascii_attr(attr: &hdf5::Attribute) -> Vec<String> {
+    let raw: Vec<hdf5::types::VarLenArray<hdf5::types::FixedAscii<1>>> =
+        attr.read_raw().expect("VLEN{string,1} attr");
+    raw.iter()
+        .map(|vl| vl.iter().flat_map(|c| c.as_str().chars()).collect())
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Numeric dataset round-trips
 // ---------------------------------------------------------------------------
@@ -645,11 +657,8 @@ fn crosscheck_varlen_ascii_array_attr() {
     // C library should be able to open and read the VL attribute
     let file = hdf5::File::open(&path).unwrap();
     let attr = file.attr("MATLAB_fields").unwrap();
-    let vals: Vec<hdf5::types::VarLenAscii> = attr.read_raw().unwrap();
-    assert_eq!(vals.len(), 3);
-    assert_eq!(vals[0].as_str(), "x");
-    assert_eq!(vals[1].as_str(), "y");
-    assert_eq!(vals[2].as_str(), "velocity");
+    let vals = read_vl_ascii_attr(&attr);
+    assert_eq!(vals, vec!["x", "y", "velocity"]);
 
     // Read dataset to verify file integrity
     let ds = file.dataset("x").unwrap();
@@ -907,32 +916,16 @@ fn crosscheck_varlen_ascii_array_encoding_vs_metno() {
     let attr = file.attr("MATLAB_fields").unwrap();
     assert_eq!(attr.shape(), vec![3]);
 
-    let vals: Vec<hdf5::types::VarLenAscii> = attr.read_raw().unwrap();
-    assert_eq!(vals.len(), 3);
-    assert_eq!(vals[0].as_str(), "x");
-    assert_eq!(vals[1].as_str(), "y");
-    assert_eq!(vals[2].as_str(), "z");
+    let vals = read_vl_ascii_attr(&attr);
+    assert_eq!(vals, vec!["x", "y", "z"]);
 
-    // --- Also write with hdf5-metno and compare ---
-    let metno_path = dir.path().join("metno_vl.h5");
-    {
-        let mf = hdf5::File::create(&metno_path).unwrap();
-        let vl_strings: Vec<hdf5::types::VarLenAscii> = fields.iter()
-            .map(|s| hdf5::types::VarLenAscii::from_ascii(s.as_bytes()).unwrap())
-            .collect();
-        let a = mf.new_attr::<hdf5::types::VarLenAscii>()
-            .shape([vl_strings.len()])
-            .create("MATLAB_fields").unwrap();
-        a.write(&vl_strings).unwrap();
-    }
-    let mf = hdf5::File::open(&metno_path).unwrap();
-    let ma = mf.attr("MATLAB_fields").unwrap();
-    let metno_vals: Vec<hdf5::types::VarLenAscii> = ma.read_raw().unwrap();
-
-    // Values must be identical
-    for (i, (fv, mv)) in vals.iter().zip(metno_vals.iter()).enumerate() {
-        assert_eq!(fv.as_str(), mv.as_str(), "mismatch at index {i}");
-    }
+    // Verify the encoded datatype matches the MATLAB-expected shape
+    // (`H5T_VLEN { H5T_STRING { STRSIZE 1 } }`).
+    let descr = format!("{:?}", attr.dtype().unwrap().to_descriptor().unwrap());
+    assert!(
+        descr.contains("VarLenArray") && descr.contains("FixedAscii(1)"),
+        "unexpected dtype: {descr}"
+    );
 }
 
 #[test]
@@ -957,10 +950,9 @@ fn crosscheck_varlen_ascii_on_nested_group() {
 
     // Read VL attribute on the nested group
     let attr = grp.attr("MATLAB_fields").unwrap();
-    let vals: Vec<hdf5::types::VarLenAscii> = attr.read_raw().unwrap();
+    let vals = read_vl_ascii_attr(&attr);
     assert_eq!(vals.len(), 2);
-    assert_eq!(vals[0].as_str(), "x");
-    assert_eq!(vals[1].as_str(), "y");
+    assert_eq!(vals, vec!["x", "y"]);
 
     // Verify ASCII attr
     let class_attr = grp.attr("MATLAB_class").unwrap();
@@ -1020,10 +1012,8 @@ fn crosscheck_userblock_all_address_types() {
 
     // Root VL attr
     let root_fields = file.attr("MATLAB_fields").unwrap();
-    let vals: Vec<hdf5::types::VarLenAscii> = root_fields.read_raw().unwrap();
-    assert_eq!(vals.len(), 2);
-    assert_eq!(vals[0].as_str(), "alpha");
-    assert_eq!(vals[1].as_str(), "beta");
+    let vals = read_vl_ascii_attr(&root_fields);
+    assert_eq!(vals, vec!["alpha", "beta"]);
 
     // Root ASCII attr
     let class = file.attr("MATLAB_class").unwrap();
@@ -1039,10 +1029,8 @@ fn crosscheck_userblock_all_address_types() {
     // Nested group with VL attr
     let inner = file.group("inner").unwrap();
     let inner_fields = inner.attr("MATLAB_fields").unwrap();
-    let iv: Vec<hdf5::types::VarLenAscii> = inner_fields.read_raw().unwrap();
-    assert_eq!(iv.len(), 2);
-    assert_eq!(iv[0].as_str(), "vals");
-    assert_eq!(iv[1].as_str(), "ids");
+    let iv = read_vl_ascii_attr(&inner_fields);
+    assert_eq!(iv, vec!["vals", "ids"]);
 
     let inner_vals: Vec<f64> = file.dataset("inner/vals").unwrap().read_1d().unwrap().to_vec();
     assert_eq!(inner_vals, vec![10.0, 20.0, 30.0]);
@@ -1161,10 +1149,8 @@ fn crosscheck_matlab_struct_pattern() {
 
     // Field list
     let fields = grp.attr("MATLAB_fields").unwrap();
-    let fv: Vec<hdf5::types::VarLenAscii> = fields.read_raw().unwrap();
-    assert_eq!(fv.len(), 2);
-    assert_eq!(fv[0].as_str(), "field1");
-    assert_eq!(fv[1].as_str(), "field2");
+    let fv = read_vl_ascii_attr(&fields);
+    assert_eq!(fv, vec!["field1", "field2"]);
 
     // Child datasets and their attrs
     let f1: Vec<f64> = file.dataset("mystruct/field1").unwrap().read_1d().unwrap().to_vec();

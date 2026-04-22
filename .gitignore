@@ -1,1 +1,4 @@
 /target
+.DS_Store
+matlab_fixtures/
+.claude/

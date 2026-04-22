@@ -389,27 +389,32 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
             }
         }
         AttrValue::VarLenAsciiArray(strings) => {
-            // Build a VL string attribute. Each element is a VL reference:
-            //   sequence_length (4 bytes) + collection_address (8 bytes) + object_index (4 bytes) = 16 bytes
-            // The global heap collection address is a placeholder (0) here.
-            // It gets patched by FileWriter::finish() when the collection address is known.
+            // MATLAB v7.3 (and matio) expect MATLAB_fields and similar
+            // variable-length ASCII arrays encoded as:
+            //   H5T_VLEN { H5T_STRING { STRSIZE=1, NULLTERM, ASCII } }
+            // — a VLEN sequence of 1-byte fixed strings. The on-disk byte
+            // layout is identical to H5T_STRING{STRSIZE=VAR} (length + heap
+            // address + object index per element; heap object holds raw
+            // bytes without null terminator), so only the datatype
+            // descriptor changes.
             let vl_ref_size = 16usize; // 4 + 8 + 4 for offset_size=8
             let mut raw = Vec::with_capacity(strings.len() * vl_ref_size);
             for (i, s) in strings.iter().enumerate() {
-                // sequence_length = number of bytes in string
                 raw.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                // collection_address = placeholder 0 (patched later)
-                raw.extend_from_slice(&0u64.to_le_bytes());
-                // object_index = 1-based index into the global heap collection
+                raw.extend_from_slice(&0u64.to_le_bytes()); // patched later
                 raw.extend_from_slice(&((i + 1) as u32).to_le_bytes());
             }
             AttributeMessage {
                 name: name.to_string(),
                 datatype: Datatype::VariableLength {
-                    is_string: true,
-                    padding: Some(StringPadding::NullTerminate),
-                    charset: Some(CharacterSet::Ascii),
-                    base_type: Box::new(make_u8_type()),
+                    is_string: false,
+                    padding: None,
+                    charset: None,
+                    base_type: Box::new(Datatype::String {
+                        size: 1,
+                        padding: StringPadding::NullTerminate,
+                        charset: CharacterSet::Ascii,
+                    }),
                 },
                 dataspace: simple_1d(strings.len() as u64),
                 raw_data: raw,

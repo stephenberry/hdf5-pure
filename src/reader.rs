@@ -174,6 +174,7 @@ impl<'f> Group<'f> {
             &self.file.data,
             self.file.offset_size(),
             self.file.length_size(),
+            self.file.addr_offset,
         ))
     }
 
@@ -336,6 +337,7 @@ impl<'f> Dataset<'f> {
             &self.file.data,
             self.file.offset_size(),
             self.file.length_size(),
+            self.file.addr_offset,
         ))
     }
 
