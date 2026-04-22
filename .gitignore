@@ -2,3 +2,5 @@
 .DS_Store
 matlab_fixtures/
 .claude/
+# Fixture-regen venv (developer tool; committed fixtures are self-contained)
+tests/fixtures/zfp/.venv/

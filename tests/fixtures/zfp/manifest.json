@@ -1,0 +1,771 @@
+{
+  "fixtures": [
+    {
+      "name": "f32_1d_16_ramp_rate16",
+      "dtype": "f32",
+      "shape": [
+        16
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        242,
+        66060288
+      ],
+      "raw_bytes_len": 64,
+      "compressed_bytes_len": 32,
+      "notes": "monotonic ramp"
+    },
+    {
+      "name": "f32_1d_16_ramp_rate8",
+      "dtype": "f32",
+      "shape": [
+        16
+      ],
+      "rate": 8.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        242,
+        32505856
+      ],
+      "raw_bytes_len": 64,
+      "compressed_bytes_len": 16,
+      "notes": ""
+    },
+    {
+      "name": "f32_1d_32_ramp_rate16",
+      "dtype": "f32",
+      "shape": [
+        32
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        498,
+        66060288
+      ],
+      "raw_bytes_len": 128,
+      "compressed_bytes_len": 64,
+      "notes": "monotonic ramp"
+    },
+    {
+      "name": "f32_1d_32_ramp_rate8",
+      "dtype": "f32",
+      "shape": [
+        32
+      ],
+      "rate": 8.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        498,
+        32505856
+      ],
+      "raw_bytes_len": 128,
+      "compressed_bytes_len": 32,
+      "notes": ""
+    },
+    {
+      "name": "f64_1d_16_ramp_rate16",
+      "dtype": "f64",
+      "shape": [
+        16
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        243,
+        66060288
+      ],
+      "raw_bytes_len": 128,
+      "compressed_bytes_len": 32,
+      "notes": "monotonic ramp"
+    },
+    {
+      "name": "f64_1d_16_ramp_rate8",
+      "dtype": "f64",
+      "shape": [
+        16
+      ],
+      "rate": 8.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        243,
+        32505856
+      ],
+      "raw_bytes_len": 128,
+      "compressed_bytes_len": 16,
+      "notes": ""
+    },
+    {
+      "name": "f64_1d_32_ramp_rate16",
+      "dtype": "f64",
+      "shape": [
+        32
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        499,
+        66060288
+      ],
+      "raw_bytes_len": 256,
+      "compressed_bytes_len": 64,
+      "notes": "monotonic ramp"
+    },
+    {
+      "name": "f64_1d_32_ramp_rate8",
+      "dtype": "f64",
+      "shape": [
+        32
+      ],
+      "rate": 8.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        499,
+        32505856
+      ],
+      "raw_bytes_len": 256,
+      "compressed_bytes_len": 32,
+      "notes": ""
+    },
+    {
+      "name": "f32_1d_16_ramp_rate32",
+      "dtype": "f32",
+      "shape": [
+        16
+      ],
+      "rate": 32.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        242,
+        133169152
+      ],
+      "raw_bytes_len": 64,
+      "compressed_bytes_len": 64,
+      "notes": "max rate for f32 (near lossless)"
+    },
+    {
+      "name": "f64_1d_16_ramp_rate64",
+      "dtype": "f64",
+      "shape": [
+        16
+      ],
+      "rate": 64.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        243,
+        267386880
+      ],
+      "raw_bytes_len": 128,
+      "compressed_bytes_len": 128,
+      "notes": "max rate for f64 (near lossless)"
+    },
+    {
+      "name": "f32_1d_16_zeros_rate16",
+      "dtype": "f32",
+      "shape": [
+        16
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        242,
+        66060288
+      ],
+      "raw_bytes_len": 64,
+      "compressed_bytes_len": 32,
+      "notes": ""
+    },
+    {
+      "name": "f32_1d_16_mixed_rate16",
+      "dtype": "f32",
+      "shape": [
+        16
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        242,
+        66060288
+      ],
+      "raw_bytes_len": 64,
+      "compressed_bytes_len": 32,
+      "notes": ""
+    },
+    {
+      "name": "f32_1d_13_partial_rate16",
+      "dtype": "f32",
+      "shape": [
+        13
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        194,
+        66060288
+      ],
+      "raw_bytes_len": 52,
+      "compressed_bytes_len": 32,
+      "notes": "length not a multiple of 4 -> partial block"
+    },
+    {
+      "name": "i32_1d_16_ramp_rate16",
+      "dtype": "i32",
+      "shape": [
+        16
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        240,
+        66060288
+      ],
+      "raw_bytes_len": 64,
+      "compressed_bytes_len": 32,
+      "notes": ""
+    },
+    {
+      "name": "i32_1d_16_ramp_rate32",
+      "dtype": "i32",
+      "shape": [
+        16
+      ],
+      "rate": 32.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        240,
+        133169152
+      ],
+      "raw_bytes_len": 64,
+      "compressed_bytes_len": 64,
+      "notes": ""
+    },
+    {
+      "name": "i64_1d_16_ramp_rate16",
+      "dtype": "i64",
+      "shape": [
+        16
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        241,
+        66060288
+      ],
+      "raw_bytes_len": 128,
+      "compressed_bytes_len": 32,
+      "notes": ""
+    },
+    {
+      "name": "i64_1d_16_ramp_rate32",
+      "dtype": "i64",
+      "shape": [
+        16
+      ],
+      "rate": 32.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        241,
+        133169152
+      ],
+      "raw_bytes_len": 128,
+      "compressed_bytes_len": 64,
+      "notes": ""
+    },
+    {
+      "name": "f32_2d_4x4_ramp_rate16",
+      "dtype": "f32",
+      "shape": [
+        4,
+        4
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        805306422,
+        267386880
+      ],
+      "raw_bytes_len": 64,
+      "compressed_bytes_len": 32,
+      "notes": ""
+    },
+    {
+      "name": "f32_2d_8x12_ramp_rate16",
+      "dtype": "f32",
+      "shape": [
+        8,
+        12
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        1879048374,
+        267386880
+      ],
+      "raw_bytes_len": 384,
+      "compressed_bytes_len": 192,
+      "notes": ""
+    },
+    {
+      "name": "f64_2d_4x4_ramp_rate16",
+      "dtype": "f64",
+      "shape": [
+        4,
+        4
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        805306423,
+        267386880
+      ],
+      "raw_bytes_len": 128,
+      "compressed_bytes_len": 32,
+      "notes": ""
+    },
+    {
+      "name": "f64_2d_8x12_ramp_rate16",
+      "dtype": "f64",
+      "shape": [
+        8,
+        12
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        1879048375,
+        267386880
+      ],
+      "raw_bytes_len": 768,
+      "compressed_bytes_len": 192,
+      "notes": ""
+    },
+    {
+      "name": "i32_2d_4x4_ramp_rate16",
+      "dtype": "i32",
+      "shape": [
+        4,
+        4
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        805306420,
+        267386880
+      ],
+      "raw_bytes_len": 64,
+      "compressed_bytes_len": 32,
+      "notes": ""
+    },
+    {
+      "name": "i32_2d_8x12_ramp_rate16",
+      "dtype": "i32",
+      "shape": [
+        8,
+        12
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        1879048372,
+        267386880
+      ],
+      "raw_bytes_len": 384,
+      "compressed_bytes_len": 192,
+      "notes": ""
+    },
+    {
+      "name": "i64_2d_4x4_ramp_rate16",
+      "dtype": "i64",
+      "shape": [
+        4,
+        4
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        805306421,
+        267386880
+      ],
+      "raw_bytes_len": 128,
+      "compressed_bytes_len": 32,
+      "notes": ""
+    },
+    {
+      "name": "i64_2d_8x12_ramp_rate16",
+      "dtype": "i64",
+      "shape": [
+        8,
+        12
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        1879048373,
+        267386880
+      ],
+      "raw_bytes_len": 768,
+      "compressed_bytes_len": 192,
+      "notes": ""
+    },
+    {
+      "name": "f32_2d_5x7_partial_rate16",
+      "dtype": "f32",
+      "shape": [
+        5,
+        7
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        1073741926,
+        267386880
+      ],
+      "raw_bytes_len": 140,
+      "compressed_bytes_len": 128,
+      "notes": "neither axis divisible by 4"
+    },
+    {
+      "name": "f32_3d_4x4x4_ramp_rate16",
+      "dtype": "f32",
+      "shape": [
+        4,
+        4,
+        4
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        3145786,
+        1072693296
+      ],
+      "raw_bytes_len": 256,
+      "compressed_bytes_len": 128,
+      "notes": ""
+    },
+    {
+      "name": "f32_3d_8x8x8_ramp_rate16",
+      "dtype": "f32",
+      "shape": [
+        8,
+        8,
+        8
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        7340154,
+        1072693360
+      ],
+      "raw_bytes_len": 2048,
+      "compressed_bytes_len": 1024,
+      "notes": ""
+    },
+    {
+      "name": "f64_3d_4x4x4_ramp_rate16",
+      "dtype": "f64",
+      "shape": [
+        4,
+        4,
+        4
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        3145787,
+        1072693296
+      ],
+      "raw_bytes_len": 512,
+      "compressed_bytes_len": 128,
+      "notes": ""
+    },
+    {
+      "name": "f64_3d_8x8x8_ramp_rate16",
+      "dtype": "f64",
+      "shape": [
+        8,
+        8,
+        8
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        7340155,
+        1072693360
+      ],
+      "raw_bytes_len": 4096,
+      "compressed_bytes_len": 1024,
+      "notes": ""
+    },
+    {
+      "name": "i32_3d_4x4x4_ramp_rate16",
+      "dtype": "i32",
+      "shape": [
+        4,
+        4,
+        4
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        3145784,
+        1072693296
+      ],
+      "raw_bytes_len": 256,
+      "compressed_bytes_len": 128,
+      "notes": ""
+    },
+    {
+      "name": "i32_3d_8x8x8_ramp_rate16",
+      "dtype": "i32",
+      "shape": [
+        8,
+        8,
+        8
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        7340152,
+        1072693360
+      ],
+      "raw_bytes_len": 2048,
+      "compressed_bytes_len": 1024,
+      "notes": ""
+    },
+    {
+      "name": "i64_3d_4x4x4_ramp_rate16",
+      "dtype": "i64",
+      "shape": [
+        4,
+        4,
+        4
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        3145785,
+        1072693296
+      ],
+      "raw_bytes_len": 512,
+      "compressed_bytes_len": 128,
+      "notes": ""
+    },
+    {
+      "name": "i64_3d_8x8x8_ramp_rate16",
+      "dtype": "i64",
+      "shape": [
+        8,
+        8,
+        8
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        7340153,
+        1072693360
+      ],
+      "raw_bytes_len": 4096,
+      "compressed_bytes_len": 1024,
+      "notes": ""
+    },
+    {
+      "name": "f32_4d_4x4x4x4_ramp_rate16",
+      "dtype": "f32",
+      "shape": [
+        4,
+        4,
+        4,
+        4
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        805503038,
+        4293919488,
+        3355414527,
+        493487
+      ],
+      "raw_bytes_len": 1024,
+      "compressed_bytes_len": 512,
+      "notes": ""
+    },
+    {
+      "name": "f64_4d_4x4x4x4_ramp_rate16",
+      "dtype": "f64",
+      "shape": [
+        4,
+        4,
+        4,
+        4
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        805503039,
+        4293919488,
+        3355414527,
+        493487
+      ],
+      "raw_bytes_len": 2048,
+      "compressed_bytes_len": 512,
+      "notes": ""
+    },
+    {
+      "name": "i32_4d_4x4x4x4_ramp_rate16",
+      "dtype": "i32",
+      "shape": [
+        4,
+        4,
+        4,
+        4
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        805503036,
+        4293919488,
+        3355414527,
+        493487
+      ],
+      "raw_bytes_len": 1024,
+      "compressed_bytes_len": 512,
+      "notes": ""
+    },
+    {
+      "name": "i64_4d_4x4x4x4_ramp_rate16",
+      "dtype": "i64",
+      "shape": [
+        4,
+        4,
+        4,
+        4
+      ],
+      "rate": 16.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        805503037,
+        4293919488,
+        3355414527,
+        493487
+      ],
+      "raw_bytes_len": 2048,
+      "compressed_bytes_len": 512,
+      "notes": ""
+    }
+  ]
+}
