@@ -63,8 +63,14 @@ fn c_library_reads_nested_struct_file() {
     let class_val = class_attr.read_scalar::<hdf5::types::FixedAscii<32>>().unwrap();
     assert_eq!(class_val.as_str(), "struct");
     let fields_attr = cfg.attr("MATLAB_fields").unwrap();
-    let fields: Vec<hdf5::types::VarLenAscii> = fields_attr.read_raw().unwrap();
-    let field_names: Vec<&str> = fields.iter().map(|s| s.as_str()).collect();
+    // MATLAB-compatible encoding is `H5T_VLEN { H5T_STRING { STRSIZE 1 } }`,
+    // so we read as a VLEN of single-byte FixedAscii.
+    let raw: Vec<hdf5::types::VarLenArray<hdf5::types::FixedAscii<1>>> =
+        fields_attr.read_raw().unwrap();
+    let field_names: Vec<String> = raw
+        .iter()
+        .map(|vl| vl.iter().flat_map(|c| c.as_str().chars()).collect())
+        .collect();
     assert_eq!(field_names, vec!["threshold", "tag"]);
 
     // char dataset: MATLAB char = UTF-16 in uint16 storage.

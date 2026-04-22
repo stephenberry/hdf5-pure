@@ -206,11 +206,17 @@ fn decode_attr_value(
                 Some(AttrValue::StringArray(strings))
             }
         }
-        Datatype::VariableLength {
-            is_string: true, ..
-        } => {
-            // Patch collection addresses to absolute by adding base_address,
-            // then delegate to the VL string reader.
+        Datatype::VariableLength { is_string, base_type, .. }
+            if *is_string || is_ascii_char_vlen_base(base_type) =>
+        {
+            // Two MATLAB-relevant encodings share the same on-disk byte
+            // layout (length + heap ref + object index per element; heap
+            // object holds raw bytes without terminator):
+            //   - is_string: true             — H5T_STRING{STRSIZE=VAR}
+            //   - VLEN of H5T_STRING{SIZE=1}  — what matio / MATLAB emit
+            //
+            // Patch collection addresses to absolute by adding
+            // base_address, then delegate to the VL string reader.
             let patched = rebase_vl_refs(&attr.raw_data, offset_size, base_address);
             let strings = crate::vl_data::read_vl_strings(
                 file_data,
@@ -228,6 +234,22 @@ fn decode_attr_value(
         }
         _ => None,
     }
+}
+
+/// Recognize the MATLAB-style VLEN encoding where the base type is a 1-byte
+/// ASCII string (`H5T_VLEN { H5T_STRING { STRSIZE 1, ..., CSET ASCII } }`).
+/// Other VLEN sequences of strings may exist but we only auto-decode this
+/// specific shape as a string array.
+fn is_ascii_char_vlen_base(base: &crate::datatype::Datatype) -> bool {
+    use crate::datatype::{CharacterSet, Datatype};
+    matches!(
+        base,
+        Datatype::String {
+            size: 1,
+            charset: CharacterSet::Ascii,
+            ..
+        }
+    )
 }
 
 /// Copy `raw_data` and add `base_address` to each VL reference's

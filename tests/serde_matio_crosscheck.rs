@@ -112,6 +112,12 @@ mod ffi {
             matvar: *mut matvar_t,
             fieldname: *const c_char,
         ) -> c_int;
+        pub unsafe fn Mat_VarCreateStruct2(
+            name: *const c_char,
+            rank: c_int,
+            dims: *const usize,
+            fields: *const *const c_char,
+        ) -> *mut matvar_t;
         pub unsafe fn Mat_VarSetStructFieldByName(
             matvar: *mut matvar_t,
             field_name: *const c_char,
@@ -321,25 +327,18 @@ impl MatVar {
     pub fn empty_struct(name: &str, field_names: &[&str]) -> Self {
         let c = CString::new(name).unwrap();
         let dims = [1usize, 1];
+        // Mat_VarCreateStruct2 expects a NULL-terminated array of C strings
+        // (unlike the deprecated Mat_VarCreateStruct which takes a count).
+        let cfields: Vec<CString> =
+            field_names.iter().map(|f| CString::new(*f).unwrap()).collect();
+        let mut cfield_ptrs: Vec<*const std::ffi::c_char> =
+            cfields.iter().map(|c| c.as_ptr()).collect();
+        cfield_ptrs.push(std::ptr::null());
         let ptr = unsafe {
-            ffi::Mat_VarCreate(
-                c.as_ptr(),
-                ffi::MAT_C_STRUCT,
-                0,
-                2,
-                dims.as_ptr(),
-                std::ptr::null(),
-                0,
-            )
+            ffi::Mat_VarCreateStruct2(c.as_ptr(), 2, dims.as_ptr(), cfield_ptrs.as_ptr())
         };
-        assert!(!ptr.is_null(), "Mat_VarCreate struct {name} failed");
-        let me = MatVar { ptr, owned: true };
-        for &f in field_names {
-            let cf = CString::new(f).unwrap();
-            let rc = unsafe { ffi::Mat_VarAddStructField(me.ptr, cf.as_ptr()) };
-            assert_eq!(rc, 0, "Mat_VarAddStructField({f}) failed");
-        }
-        me
+        assert!(!ptr.is_null(), "Mat_VarCreateStruct2({name}) failed");
+        MatVar { ptr, owned: true }
     }
 
     /// Attach `value` as the named field. Transfers ownership of `value`.
@@ -474,9 +473,6 @@ struct Nested {
 }
 
 #[test]
-#[ignore = "hdf5-pure encodes MATLAB_fields as H5T_STRING{STRSIZE=VAR}, but \
-            libmatio (and likely MATLAB) expects H5T_VLEN{H5T_STRING}; causes \
-            libmatio to crash when reading. Tracked as a follow-up fix."]
 fn matio_reads_nested_struct_from_hdf5_pure() {
     let _g = matio_lock();
     let dir = tempdir().unwrap();
@@ -565,9 +561,6 @@ fn hdf5_pure_reads_matrix_written_by_matio() {
 }
 
 #[test]
-#[ignore = "hdf5-pure deserializer doesn't yet parse the H5T_VLEN MATLAB_fields \
-            attribute that libmatio writes — only the H5T_STRING{STRSIZE=VAR} \
-            form our serializer produces. Tracked as a follow-up fix."]
 fn hdf5_pure_reads_nested_struct_written_by_matio() {
     let _g = matio_lock();
     let dir = tempdir().unwrap();
