@@ -5,6 +5,7 @@ edition = "2024"
 license = "MIT"
 description = "Pure-Rust HDF5 writer library (WASM-compatible, no C dependencies)"
 repository = "https://github.com/stephenberry/hdf5-pure"
+build = "build.rs"
 
 [features]
 default = ["std", "checksum", "deflate"]
@@ -19,6 +20,12 @@ parallel = ["rayon"]
 # Serde-based (de)serialization of MATLAB v7.3 .mat files.
 # Requires `std` (uses File/Group/Dataset reader APIs).
 serde = ["dep:serde", "std"]
+# Test-only: enable a crosscheck test that links against the system libmatio
+# (reference MATLAB MAT file library). Requires libmatio to be installed:
+# `brew install libmatio` (macOS) or `apt install libmatio-dev` (Debian).
+# Not a run-time dependency — build.rs only emits link directives for this
+# feature, and the crosscheck lives in a gated integration test.
+matio-crosscheck = ["serde"]
 
 [dependencies]
 byteorder = { version = "1", default-features = false }
