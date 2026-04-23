@@ -1,16 +1,37 @@
-//! Pure-Rust ZFP compression for f32 data (1D blocks of 4).
+//! Pure-Rust ZFP fixed-rate codec for f32, f64, i32, i64.
 //!
-//! Implements the ZFP fixed-rate compression algorithm matching the reference
-//! C implementation (<https://github.com/LLNL/zfp>). Only the f32 codec is
-//! provided because the weather simulation uses f32 throughout.
+//! Direct port of the reference LLNL/zfp C algorithm
+//! (<https://github.com/LLNL/zfp>), currently specialized to 1D blocks of 4
+//! values. Interoperable byte-for-byte with the reference bitstream: this is
+//! enforced by `tests/zfp_crosscheck.rs`, which compares output against
+//! fixtures produced by the real H5Z-ZFP plugin and zfpy.
 //!
-//! # Algorithm per block of 4 f32 values
+//! # Algorithm per block (4 values for 1D)
 //!
-//! 1. **Block-floating-point cast** -- find max exponent, convert to i32.
-//! 2. **Forward lifting transform** -- 5-stage decorrelating transform.
-//! 3. **Negabinary conversion** -- `(x + NBMASK) ^ NBMASK`.
-//! 4. **Embedded bit-plane encoding** -- MSB-to-LSB with group tests.
-//! 5. **Fixed-rate truncation** -- each block gets exactly `rate * 4` bits.
+//! **Float (f32/f64)**:
+//!   1. Block-floating-point cast: compute `emax = max frexp-exponent` across
+//!      the block; scale each value by `2^(PBITS - 2 - emax)` and truncate to
+//!      a signed integer of width `PBITS` (32 or 64 bits).
+//!   2. Emit a block header: `1` bit for non-empty, then `EBITS` bits for
+//!      `emax + EBIAS` (8 bits / EBIAS=127 for f32; 11 / 1023 for f64). An
+//!      empty all-zero block emits a single `0` bit and pads to `maxbits`.
+//!
+//! **Integer (i32/i64)**: skip the float header and cast; use the values
+//! directly as signed integers.
+//!
+//! **Then, common to both**:
+//!   3. Forward lifting transform: 5-stage non-orthogonal decorrelating
+//!      transform on the 4 signed integers.
+//!   4. Negabinary conversion: `(x + NBMASK) ^ NBMASK` per coefficient, where
+//!      `NBMASK = 0xAA..AA` of the coefficient width. Maps two's-complement
+//!      signed to unsigned such that the bit-plane encoder treats sign
+//!      uniformly.
+//!   5. Embedded bit-plane encoding: MSB-to-LSB, for each plane emit
+//!      refinement bits for coefficients already marked significant, then run
+//!      a unary run-length scan over the remaining coefficients (group-test
+//!      bit; if positive, scan one-by-one until a 1-bit is found; if only one
+//!      remains after a positive group test, its significance is implicit).
+//!   6. Pad to exactly `rate * block_size` bits.
 //!
 //! The bit stream uses 64-bit words in **little-endian** byte order with bits
 //! packed LSB-first within each word.
@@ -26,14 +47,13 @@ use crate::error::FormatError;
 /// Number of values per ZFP block (1D).
 const BLOCK_SIZE: usize = 4;
 
-/// Number of exponent bits for f32.
-const EBITS: u32 = 8;
+/// Exponent bits in the block-float header, per scalar type.
+const EBITS_F32: u32 = 8;
+const EBITS_F64: u32 = 11;
 
-/// Negabinary mask for 32-bit integers.
-const NBMASK: u32 = 0xAAAA_AAAA;
-
-/// Total number of bit planes for u32 coefficients.
-const PBITS: u32 = 32;
+/// Negabinary masks (per integer width).
+const NBMASK_U32: u32 = 0xAAAA_AAAA;
+const NBMASK_U64: u64 = 0xAAAA_AAAA_AAAA_AAAA;
 
 // ---------------------------------------------------------------------------
 // Bit-stream I/O
@@ -58,24 +78,30 @@ impl BitWriter {
         }
     }
 
-    /// Write `n` bits from the least-significant end of `value`.
+    /// Write the `n` least-significant bits of `value`. Bits above `n` in
+    /// `value` are ignored (masked off) so the caller may pass a packed
+    /// bit-plane register without pre-masking.
     #[inline]
     fn write(&mut self, n: u32, value: u64) {
         debug_assert!(n <= 64);
         if n == 0 {
             return;
         }
-        // Pack into current word
-        self.word |= value << self.bits;
+        let masked = if n == 64 {
+            value
+        } else {
+            value & ((1u64 << n) - 1)
+        };
+        self.word |= masked << self.bits;
         self.bits += n;
         if self.bits >= 64 {
             self.buf.extend_from_slice(&self.word.to_le_bytes());
             self.bits -= 64;
-            // Carry: the high bits that didn't fit.
-            // When n == 64 and bits was 0, shift amount is 64 which would be
-            // UB for a fixed-width shift, so guard with a conditional.
+            // Carry: the high bits of `masked` that didn't fit in the
+            // flushed word. When bits was 0 and n == 64 we've already
+            // flushed everything, so a fresh word starts at 0.
             self.word = if self.bits > 0 {
-                value >> (n - self.bits)
+                masked >> (n - self.bits)
             } else {
                 0
             };
@@ -193,99 +219,180 @@ impl<'a> BitReader<'a> {
 // Block-floating-point cast (f32 <-> i32)
 // ---------------------------------------------------------------------------
 
-/// Convert a block of 4 f32 values to block-floating-point i32 representation.
+/// IEEE 754 f32 exponent bias.
+const EBIAS_F32: i32 = 127;
+
+/// Reference `pad_block` for a partial 1D block of width `n` (0 ≤ n ≤ 4).
 ///
-/// Returns `(exponent, coefficients)` where `exponent` is the biased exponent
-/// (raw IEEE exponent + 1, so that values can be reconstructed as
-/// `i32 * 2^(exponent - 30 - 127)`).
-///
-/// If all values are zero (or subnormal), returns `(0, [0; 4])` -- the block
-/// is "empty" and only a single 0-bit is emitted by the encoder.
-fn fwd_cast_f32(vals: &[f32; BLOCK_SIZE]) -> (u32, [i32; BLOCK_SIZE]) {
-    // Find maximum biased exponent across the 4 values.
-    let mut emax: i32 = 0;
-    for &v in vals {
-        let bits = v.to_bits();
-        let e = ((bits >> 23) & 0xFF) as i32; // biased exponent
-        if e > emax {
-            emax = e;
+/// For `n = 0` the block becomes all-zero. Otherwise the tail is filled by
+/// the fall-through cascade: `p[1] = p[0]; p[2] = p[1]; p[3] = p[0]`
+/// starting from `case n`. This matches the symmetric reflection used by
+/// LLNL/zfp so that partial blocks encode identically under crosscheck.
+macro_rules! impl_pad_partial {
+    ($name:ident, $scalar:ty, $zero:expr) => {
+        fn $name(block: &mut [$scalar; BLOCK_SIZE], n: usize) {
+            match n {
+                0 => {
+                    block[0] = $zero;
+                    block[1] = $zero;
+                    block[2] = $zero;
+                    block[3] = $zero;
+                }
+                1 => {
+                    block[1] = block[0];
+                    block[2] = block[1];
+                    block[3] = block[0];
+                }
+                2 => {
+                    block[2] = block[1];
+                    block[3] = block[0];
+                }
+                3 => {
+                    block[3] = block[0];
+                }
+                _ => {}
+            }
         }
-    }
-
-    if emax == 0 {
-        // All zeros / subnormals -- empty block
-        return (0, [0; BLOCK_SIZE]);
-    }
-
-    // bias = emax + 1 (the value stored in the header)
-    let bias = (emax + 1) as u32;
-
-    // shift: number of bits to shift the mantissa.
-    // ZFP: each value is converted via ldexp(value, -emax + (PBITS - 2))
-    // which is equivalent to reinterpreting the mantissa as a (PBITS-1)-bit
-    // fixed-point number with the implicit leading 1 at bit (PBITS-2)=30.
-    let mut result = [0i32; BLOCK_SIZE];
-    for (i, &v) in vals.iter().enumerate() {
-        let bits = v.to_bits();
-        let sign = (bits >> 31) & 1;
-        let e = ((bits >> 23) & 0xFF) as i32;
-        let m = (bits & 0x007F_FFFF) as i32;
-
-        if e == 0 {
-            // Zero or subnormal -- treat as 0
-            result[i] = 0;
-        } else {
-            // Reconstruct with implicit 1 and shift to common exponent
-            let frac = m | 0x0080_0000; // 24-bit significand with implicit 1
-            let shift = emax - e;
-            // Place the implicit 1 at bit 30 (PBITS-2), then shift down by
-            // (emax - e) to align to the common exponent.
-            // 30 - 23 = 7 extra bits of precision beyond the mantissa.
-            let shifted = if shift < 7 {
-                frac << (7 - shift)
-            } else if shift < 31 + 7 {
-                frac >> (shift - 7)
-            } else {
-                0
-            };
-            result[i] = if sign != 0 { -shifted } else { shifted };
-        }
-    }
-
-    (bias, result)
+    };
 }
 
-/// Inverse block-floating-point cast: reconstruct f32 values from i32
-/// coefficients and biased exponent.
+impl_pad_partial!(pad_partial_block_f32, f32, 0.0f32);
+impl_pad_partial!(pad_partial_block_f64, f64, 0.0f64);
+impl_pad_partial!(pad_partial_block_i32, i32, 0i32);
+impl_pad_partial!(pad_partial_block_i64, i64, 0i64);
+
+/// Convert a block of 4 f32 values to block-floating-point i32 representation,
+/// matching LLNL/zfp's `fwd_cast`.
 ///
-/// The forward cast placed the implicit-1 at bit 30 (PBITS-2) relative to
-/// the IEEE biased exponent `emax`. To invert:
-///   value = coefficient * 2^(emax - 127 - 30)
-/// where `emax` is the raw IEEE biased exponent and 127 is the f32 bias.
+/// The reference defines:
+///
+///   emax = max frexp-exponent across the block (0.5 ≤ |m| < 1 convention)
+///   iblock[i] = (Int)(fblock[i] * 2^(30 - emax))
+///
+/// Using the IEEE biased exponent `b` of the largest-magnitude value,
+/// frexp's exponent is `b - (EBIAS - 1) = b - 126`, so the scale becomes
+/// `2^(156 - b)`. The returned header value is `emax_biased = frexp_emax +
+/// EBIAS = b + 1`, which is what the reference stream writes (as the high
+/// bits of `2*e + 1`).
+///
+/// If all values are zero or subnormal the reference's `exponent()` returns
+/// `-EBIAS`, which we signal here as `emax_biased = 0` — the encoder then
+/// emits a single zero-bit empty-block marker.
+fn fwd_cast_f32(vals: &[f32; BLOCK_SIZE]) -> (u32, [i32; BLOCK_SIZE]) {
+    let mut ieee_max: i32 = 0;
+    for &v in vals {
+        let e = ((v.to_bits() >> 23) & 0xFF) as i32;
+        if e > ieee_max {
+            ieee_max = e;
+        }
+    }
+    if ieee_max == 0 {
+        return (0, [0; BLOCK_SIZE]);
+    }
+    let emax_biased = (ieee_max + 1) as u32;
+    // scale = 2^(30 - frexp_emax) = 2^(30 - (ieee_max - (EBIAS - 1)))
+    //       = 2^(30 + EBIAS - 1 - ieee_max) = 2^(156 - ieee_max)
+    let scale_exp = 30 + EBIAS_F32 - 1 - ieee_max;
+    let scale = pow2_f64(scale_exp);
+    let mut result = [0i32; BLOCK_SIZE];
+    for i in 0..BLOCK_SIZE {
+        // Do the multiply in f64 so subnormal / extreme scaling doesn't clip;
+        // then truncate toward zero to match C's `(Int)` cast.
+        let y = vals[i] as f64 * scale;
+        result[i] = y as i32;
+    }
+    (emax_biased, result)
+}
+
+/// Inverse block-floating-point cast matching LLNL/zfp's `inv_cast`:
+///
+///   value = coefficient * 2^(emax - 30)   (frexp-exponent convention)
+///
+/// Given the stored header value `emax_biased = frexp_emax + EBIAS`, the
+/// dequantization scale is `2^(emax_biased - EBIAS - 30)`.
 fn inv_cast_f32(emax_biased: u32, coeffs: &[i32; BLOCK_SIZE]) -> [f32; BLOCK_SIZE] {
     let mut result = [0.0f32; BLOCK_SIZE];
     if emax_biased == 0 {
         return result;
     }
-    // emax_biased = raw_biased_exponent + 1
-    let emax = emax_biased as i32 - 1;
-
-    // The forward cast maps: value -> i32 via ldexp(value, (PBITS-2) - emax + bias)
-    // i.e. coefficient = value * 2^(30 - emax + 127)
-    // So: value = coefficient * 2^(emax - 127 - 30)
-    let exp = emax - 127 - (PBITS as i32 - 2); // emax - 127 - 30
-
+    let exp = emax_biased as i32 - EBIAS_F32 - 30;
     let scale = pow2_f64(exp);
     for (i, &c) in coeffs.iter().enumerate() {
         if c == 0 {
-            result[i] = 0.0;
             continue;
         }
-        let val = (c as f64) * scale;
-        result[i] = val as f32;
+        result[i] = ((c as f64) * scale) as f32;
     }
-
     result
+}
+
+/// IEEE 754 f64 exponent bias.
+const EBIAS_F64: i32 = 1023;
+
+/// f64 analog of `fwd_cast_f32` — produces i64 coefficients scaled such that
+/// `|coef| ≤ 2^62`, and the header value `emax_biased = frexp_emax + EBIAS`
+/// (i.e., the raw IEEE biased exponent of the largest-magnitude input +1).
+fn fwd_cast_f64(vals: &[f64; BLOCK_SIZE]) -> (u64, [i64; BLOCK_SIZE]) {
+    let mut ieee_max: i32 = 0;
+    for &v in vals {
+        let e = ((v.to_bits() >> 52) & 0x7FF) as i32;
+        if e > ieee_max {
+            ieee_max = e;
+        }
+    }
+    if ieee_max == 0 {
+        return (0, [0; BLOCK_SIZE]);
+    }
+    let emax_biased = (ieee_max + 1) as u64;
+    // scale = 2^(62 - frexp_emax). For f64: frexp_emax = ieee_max - 1022.
+    // => scale_exp = 62 - (ieee_max - 1022) = 1084 - ieee_max.
+    // ieee_max ∈ [1, 2046] ⇒ scale_exp ∈ [-962, 1083]; the upper end exceeds
+    // the normal f64 range so use a two-step build.
+    let scale = pow2_f64_wide(1084 - ieee_max);
+    let mut result = [0i64; BLOCK_SIZE];
+    for i in 0..BLOCK_SIZE {
+        let y = vals[i] * scale;
+        result[i] = y as i64; // saturating toward zero, same as C `(Int64)`
+    }
+    (emax_biased, result)
+}
+
+/// f64 inverse cast — `value = coef * 2^(emax_biased - EBIAS - 62)`.
+fn inv_cast_f64(emax_biased: u64, coeffs: &[i64; BLOCK_SIZE]) -> [f64; BLOCK_SIZE] {
+    let mut result = [0.0f64; BLOCK_SIZE];
+    if emax_biased == 0 {
+        return result;
+    }
+    let exp = emax_biased as i32 - EBIAS_F64 - 62;
+    let scale = pow2_f64_wide(exp);
+    for (i, &c) in coeffs.iter().enumerate() {
+        if c == 0 {
+            continue;
+        }
+        result[i] = (c as f64) * scale;
+    }
+    result
+}
+
+/// Like `pow2_f64` but handles `exp` outside `[-1022, 1023]` by splitting
+/// into multiple steps. Needed for f64 quantization where the scale can
+/// exceed the normal-range upper bound (up to ~2^1083).
+#[inline]
+fn pow2_f64_wide(exp: i32) -> f64 {
+    if exp >= -1022 && exp <= 1023 {
+        return pow2_f64(exp);
+    }
+    let mut remaining = exp;
+    let mut acc = 1.0f64;
+    while remaining > 1023 {
+        acc *= pow2_f64(1023);
+        remaining -= 1023;
+    }
+    while remaining < -1022 {
+        acc *= pow2_f64(-1022);
+        remaining += 1022;
+    }
+    acc * pow2_f64(remaining)
 }
 
 /// `2.0_f64.powi(exp)` without `std` / `libm`.
@@ -302,323 +409,196 @@ fn pow2_f64(exp: i32) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
-// Lifting transform (1D, 4 values)
+// Lifting transform (1D, 4 values). Matches reference `fwd_lift` / `inv_lift`
+// (`src/template/encode.c`, `decode.c`) — identical instruction sequence
+// except for the integer width. Shifts are arithmetic (sign-preserving), so
+// i32/i64 share the source.
 // ---------------------------------------------------------------------------
 
-/// Forward decorrelating lifting transform on 4 i32 values.
-///
-/// Matches the ZFP C reference `_t2(fwd_lift, Int, 1)` for 1D blocks.
-#[allow(clippy::many_single_char_names)]
-fn fwd_lift(p: &mut [i32; BLOCK_SIZE]) {
-    let mut x = p[0];
-    let mut y = p[1];
-    let mut z = p[2];
-    let mut w = p[3];
-
-    // Stage 1: non-orthogonal transform
-    x = x.wrapping_add(w);
-    x >>= 1;
-    w = w.wrapping_sub(x);
-
-    z = z.wrapping_add(y);
-    z >>= 1;
-    y = y.wrapping_sub(z);
-
-    x = x.wrapping_add(z);
-    x >>= 1;
-    z = z.wrapping_sub(x);
-
-    w = w.wrapping_add(y);
-    w >>= 1;
-    y = y.wrapping_sub(w);
-
-    // Stage 2: additional decorrelation
-    w = w.wrapping_add(y >> 1);
-    y = y.wrapping_sub(w >> 1);
-
-    p[0] = x;
-    p[1] = y;
-    p[2] = z;
-    p[3] = w;
+macro_rules! impl_lift {
+    ($fwd:ident, $inv:ident, $int:ty) => {
+        #[allow(clippy::many_single_char_names)]
+        fn $fwd(p: &mut [$int; BLOCK_SIZE]) {
+            let mut x = p[0];
+            let mut y = p[1];
+            let mut z = p[2];
+            let mut w = p[3];
+            x = x.wrapping_add(w); x >>= 1; w = w.wrapping_sub(x);
+            z = z.wrapping_add(y); z >>= 1; y = y.wrapping_sub(z);
+            x = x.wrapping_add(z); x >>= 1; z = z.wrapping_sub(x);
+            w = w.wrapping_add(y); w >>= 1; y = y.wrapping_sub(w);
+            w = w.wrapping_add(y >> 1);
+            y = y.wrapping_sub(w >> 1);
+            p[0] = x; p[1] = y; p[2] = z; p[3] = w;
+        }
+        #[allow(clippy::many_single_char_names)]
+        fn $inv(p: &mut [$int; BLOCK_SIZE]) {
+            let mut x = p[0];
+            let mut y = p[1];
+            let mut z = p[2];
+            let mut w = p[3];
+            y = y.wrapping_add(w >> 1);
+            w = w.wrapping_sub(y >> 1);
+            y = y.wrapping_add(w); w <<= 1; w = w.wrapping_sub(y);
+            z = z.wrapping_add(x); x <<= 1; x = x.wrapping_sub(z);
+            y = y.wrapping_add(z); z <<= 1; z = z.wrapping_sub(y);
+            w = w.wrapping_add(x); x <<= 1; x = x.wrapping_sub(w);
+            p[0] = x; p[1] = y; p[2] = z; p[3] = w;
+        }
+    };
 }
 
-/// Inverse decorrelating lifting transform on 4 i32 values.
-#[allow(clippy::many_single_char_names)]
-fn inv_lift(p: &mut [i32; BLOCK_SIZE]) {
-    let mut x = p[0];
-    let mut y = p[1];
-    let mut z = p[2];
-    let mut w = p[3];
-
-    // Undo stage 2
-    y = y.wrapping_add(w >> 1);
-    w = w.wrapping_sub(y >> 1);
-
-    // Undo stage 1 (reverse order)
-    y = y.wrapping_add(w);
-    w <<= 1;
-    w = w.wrapping_sub(y);
-
-    z = z.wrapping_add(x);
-    x <<= 1;
-    x = x.wrapping_sub(z);
-
-    y = y.wrapping_add(z);
-    z <<= 1;
-    z = z.wrapping_sub(y);
-
-    w = w.wrapping_add(x);
-    x <<= 1;
-    x = x.wrapping_sub(w);
-
-    p[0] = x;
-    p[1] = y;
-    p[2] = z;
-    p[3] = w;
-}
+impl_lift!(fwd_lift_i32, inv_lift_i32, i32);
+impl_lift!(fwd_lift_i64, inv_lift_i64, i64);
 
 // ---------------------------------------------------------------------------
-// Negabinary conversion
+// Negabinary conversion (signed ↔ unsigned).
 // ---------------------------------------------------------------------------
 
-/// Convert signed i32 to unsigned negabinary representation.
 #[inline]
-fn int2uint(x: i32) -> u32 {
-    ((x as u32).wrapping_add(NBMASK)) ^ NBMASK
+fn int2uint_i32(x: i32) -> u32 {
+    ((x as u32).wrapping_add(NBMASK_U32)) ^ NBMASK_U32
 }
-
-/// Convert unsigned negabinary back to signed i32.
 #[inline]
-fn uint2int(x: u32) -> i32 {
-    ((x ^ NBMASK).wrapping_sub(NBMASK)) as i32
+fn uint2int_i32(x: u32) -> i32 {
+    ((x ^ NBMASK_U32).wrapping_sub(NBMASK_U32)) as i32
+}
+#[inline]
+fn int2uint_i64(x: i64) -> u64 {
+    ((x as u64).wrapping_add(NBMASK_U64)) ^ NBMASK_U64
+}
+#[inline]
+fn uint2int_i64(x: u64) -> i64 {
+    ((x ^ NBMASK_U64).wrapping_sub(NBMASK_U64)) as i64
 }
 
 // ---------------------------------------------------------------------------
 // Embedded bit-plane encoder / decoder
+//
+// Direct port of LLNL/zfp's `encode_few_ints` / `decode_few_ints` from
+// `src/template/encode.c` and `src/template/decode.c`, specialized for
+// `size <= 64`. For the 4-coefficient 1D case the generic u32 form covers
+// f32 and i32 blocks; the u64 form (added for 2D/3D) covers f64 and i64.
+//
+// Algorithm: from most-significant bit plane down to `kmin`, each iteration:
+//   * Write the first `n` bits of the plane verbatim — one refinement bit
+//     per already-significant coefficient (they've had their group-test
+//     "1" emitted in a previous plane and are now in fixed-precision mode).
+//   * Run a unary run-length scan over the remaining `size - n`
+//     coefficients. Repeatedly: emit a group-test bit. If 0, done with
+//     this plane. If 1, scan one-by-one; emit each coefficient's bit at
+//     this plane until a 1-bit is found (that coefficient becomes newly
+//     significant). If only one coefficient remains after a positive
+//     group test, its significance is implicit.
 // ---------------------------------------------------------------------------
 
-/// Encode 4 unsigned coefficients using ZFP's embedded bit-plane codec.
+/// `encode_few_ints` / `decode_few_ints` ports. Generated per integer width.
 ///
-/// Implements the ZFP C reference encoder's nested-loop structure. At each
-/// bit plane (MSB to LSB):
-///
-///  1. Emit refinement bits for already-significant coefficients.
-///  2. Run a recursive group-test on the remaining (not-yet-significant)
-///     coefficients: emit 0 if none have a 1-bit at this plane, or emit 1
-///     then scan one-by-one. When a newly-significant coefficient is found,
-///     recurse on the remaining unsignificant ones. If only one unsignificant
-///     coefficient remains and the group test was 1, its significance is
-///     implicit (no bit emitted).
-///
-/// Writing stops when `maxbits` bits have been emitted.
-fn encode_ints(w: &mut BitWriter, ucoeffs: &[u32; BLOCK_SIZE], maxbits: usize) {
-    let start = w.position();
-    let mut sig = [false; BLOCK_SIZE];
-
-    for k in (0..PBITS).rev() {
-        // Phase 1: refinement bits for already-significant coefficients
-        for i in 0..BLOCK_SIZE {
-            if sig[i] {
-                if w.position() - start >= maxbits {
-                    return;
+/// `size` must be ≤ 64 — the bit plane is packed into a single u64 register.
+/// For N-D blocks where size > 64 (4D has 256), a separate `many_ints`
+/// variant will be needed; Step 5 will add it.
+macro_rules! impl_few_ints {
+    ($enc:ident, $dec:ident, $uint:ty, $intprec:expr) => {
+        fn $enc(
+            w: &mut BitWriter,
+            maxbits: usize,
+            maxprec: u32,
+            data: &[$uint],
+            size: usize,
+        ) -> usize {
+            let kmin: u32 = $intprec.saturating_sub(maxprec);
+            let mut bits = maxbits;
+            let mut n: usize = 0;
+            let mut k: u32 = $intprec;
+            while bits > 0 && k > kmin {
+                k -= 1;
+                // step 1: extract bit plane k into x (bit i = data[i] >> k & 1)
+                let mut x: u64 = 0;
+                for i in 0..size {
+                    x |= ((data[i] >> k) as u64 & 1) << i;
                 }
-                w.write_bit((ucoeffs[i] >> k) & 1 != 0);
-            }
-        }
-
-        // Phase 2: significance pass (recursive group test)
-        if w.position() - start >= maxbits {
-            return;
-        }
-        encode_sig_group(w, ucoeffs, k, &mut sig, maxbits, start);
-    }
-}
-
-/// Recursive group-test encoder for one bit plane.
-///
-/// `from` is the first coefficient index to consider; only indices `>= from`
-/// that are not yet significant are tested.
-fn encode_sig_group(
-    w: &mut BitWriter,
-    ucoeffs: &[u32; BLOCK_SIZE],
-    plane: u32,
-    sig: &mut [bool; BLOCK_SIZE],
-    maxbits: usize,
-    start: usize,
-) {
-    // Gather not-yet-significant indices.
-    let mut unsig = [0usize; BLOCK_SIZE];
-    let mut n = 0usize;
-    for (i, &s) in sig.iter().enumerate() {
-        if !s {
-            unsig[n] = i;
-            n += 1;
-        }
-    }
-    if n == 0 {
-        return;
-    }
-
-    encode_sig_slice(w, ucoeffs, plane, sig, &unsig[..n], maxbits, start);
-}
-
-/// Encode significance for a slice of unsignificant coefficient indices.
-fn encode_sig_slice(
-    w: &mut BitWriter,
-    ucoeffs: &[u32; BLOCK_SIZE],
-    plane: u32,
-    sig: &mut [bool; BLOCK_SIZE],
-    unsig: &[usize],
-    maxbits: usize,
-    start: usize,
-) {
-    if unsig.is_empty() {
-        return;
-    }
-    if w.position() - start >= maxbits {
-        return;
-    }
-
-    // Group test: does any coefficient in `unsig` have bit `plane` set?
-    let any = unsig.iter().any(|&i| (ucoeffs[i] >> plane) & 1 != 0);
-
-    w.write_bit(any);
-
-    if !any {
-        return;
-    }
-
-    // Scan to find the newly-significant coefficient(s).
-    for (idx, &i) in unsig.iter().enumerate() {
-        let remaining = unsig.len() - idx;
-
-        if remaining == 1 {
-            // Last one — implicit significance (the group test already said 1).
-            sig[i] = true;
-            return;
-        }
-
-        if w.position() - start >= maxbits {
-            return;
-        }
-
-        let is_sig = (ucoeffs[i] >> plane) & 1 != 0;
-        w.write_bit(is_sig);
-
-        if is_sig {
-            sig[i] = true;
-            // Recurse on remaining unsignificant coefficients.
-            encode_sig_slice(w, ucoeffs, plane, sig, &unsig[idx + 1..], maxbits, start);
-            return;
-        }
-    }
-}
-
-/// Decode 4 unsigned coefficients from the embedded bit-plane codec.
-fn decode_ints(r: &mut BitReader<'_>, maxbits: usize) -> ([u32; BLOCK_SIZE], usize) {
-    let mut ucoeffs = [0u32; BLOCK_SIZE];
-    let mut sig = [false; BLOCK_SIZE];
-    let mut bits_read: usize = 0;
-
-    for k in (0..PBITS).rev() {
-        // Phase 1: refinement bits for significant coefficients
-        for i in 0..BLOCK_SIZE {
-            if sig[i] {
-                if bits_read >= maxbits {
-                    return (ucoeffs, bits_read);
+                // step 2: emit first n bits (refinement for already-sig coefs)
+                let m = n.min(bits);
+                bits -= m;
+                if m > 0 {
+                    w.write(m as u32, x);
+                    x >>= m;
                 }
-                if r.read_bit() {
-                    ucoeffs[i] |= 1 << k;
+                // step 3: unary run-length encode remainder
+                while bits > 0 && n < size {
+                    bits -= 1;
+                    let group = x != 0;
+                    w.write_bit(group);
+                    if !group {
+                        break;
+                    }
+                    while bits > 0 && n < size - 1 {
+                        bits -= 1;
+                        let bit = (x & 1) != 0;
+                        w.write_bit(bit);
+                        if bit {
+                            break;
+                        }
+                        x >>= 1;
+                        n += 1;
+                    }
+                    x >>= 1;
+                    n += 1;
                 }
-                bits_read += 1;
             }
+            maxbits - bits
         }
 
-        // Phase 2: significance pass (recursive group test)
-        if bits_read >= maxbits {
-            return (ucoeffs, bits_read);
-        }
-        // Gather unsignificant indices.
-        let mut unsig = [0usize; BLOCK_SIZE];
-        let mut n = 0usize;
-        for (i, &s) in sig.iter().enumerate() {
-            if !s {
-                unsig[n] = i;
-                n += 1;
+        fn $dec(
+            r: &mut BitReader<'_>,
+            maxbits: usize,
+            maxprec: u32,
+            data: &mut [$uint],
+            size: usize,
+        ) -> usize {
+            let kmin: u32 = $intprec.saturating_sub(maxprec);
+            let mut bits = maxbits;
+            let mut n: usize = 0;
+            for v in data.iter_mut().take(size) {
+                *v = 0;
             }
+            let mut k: u32 = $intprec;
+            while bits > 0 && k > kmin {
+                k -= 1;
+                let m = n.min(bits);
+                bits -= m;
+                let mut x: u64 = if m > 0 { r.read(m as u32) } else { 0 };
+                while bits > 0 && n < size {
+                    bits -= 1;
+                    if r.read_bit() {
+                        while bits > 0 && n < size - 1 {
+                            bits -= 1;
+                            if r.read_bit() {
+                                break;
+                            }
+                            n += 1;
+                        }
+                        x |= 1u64 << n;
+                    } else {
+                        break;
+                    }
+                    n += 1;
+                }
+                let mut xx = x;
+                let mut i = 0;
+                while xx != 0 {
+                    data[i] |= ((xx & 1) as $uint) << k;
+                    xx >>= 1;
+                    i += 1;
+                }
+            }
+            maxbits - bits
         }
-        bits_read = decode_sig_slice(
-            r,
-            &mut ucoeffs,
-            &mut sig,
-            k,
-            &unsig[..n],
-            bits_read,
-            maxbits,
-        );
-    }
-
-    (ucoeffs, bits_read)
+    };
 }
 
-/// Decode significance for a slice of unsignificant coefficient indices.
-fn decode_sig_slice(
-    r: &mut BitReader<'_>,
-    ucoeffs: &mut [u32; BLOCK_SIZE],
-    sig: &mut [bool; BLOCK_SIZE],
-    plane: u32,
-    unsig: &[usize],
-    mut bits_read: usize,
-    maxbits: usize,
-) -> usize {
-    if unsig.is_empty() || bits_read >= maxbits {
-        return bits_read;
-    }
-
-    // Group test bit
-    let any = r.read_bit();
-    bits_read += 1;
-
-    if !any {
-        return bits_read;
-    }
-
-    // Scan for newly-significant coefficients
-    for (idx, &i) in unsig.iter().enumerate() {
-        let remaining = unsig.len() - idx;
-
-        if remaining == 1 {
-            // Implicit significance.
-            sig[i] = true;
-            ucoeffs[i] |= 1 << plane;
-            return bits_read;
-        }
-
-        if bits_read >= maxbits {
-            return bits_read;
-        }
-
-        let is_sig = r.read_bit();
-        bits_read += 1;
-
-        if is_sig {
-            sig[i] = true;
-            ucoeffs[i] |= 1 << plane;
-            // Recurse on remaining unsignificant coefficients.
-            return decode_sig_slice(
-                r,
-                ucoeffs,
-                sig,
-                plane,
-                &unsig[idx + 1..],
-                bits_read,
-                maxbits,
-            );
-        }
-    }
-
-    bits_read
-}
+impl_few_ints!(encode_few_ints_u32, decode_few_ints_u32, u32, 32u32);
+impl_few_ints!(encode_few_ints_u64, decode_few_ints_u64, u64, 64u32);
 
 // ---------------------------------------------------------------------------
 // Block-level encode / decode
@@ -644,23 +624,26 @@ fn encode_block_f32(w: &mut BitWriter, vals: &[f32; BLOCK_SIZE], maxbits: usize)
     // Non-empty block
     w.write_bit(true);
 
-    // Write exponent (EBITS = 8 bits)
-    // The stored value is emax_biased - 1 = emax (raw IEEE biased exponent)
-    w.write(EBITS, u64::from(emax_biased - 1));
+    // Write exponent (EBITS = 8 bits).
+    // `emax_biased` holds `emax + 1` where `emax` is the raw IEEE biased
+    // exponent of the block's largest-magnitude value. ZFP stores this
+    // `emax + 1` value directly (matches reference LLNL/zfp output).
+    w.write(EBITS_F32, u64::from(emax_biased));
 
     // Step 2: forward lifting transform
-    fwd_lift(&mut icoeffs);
+    fwd_lift_i32(&mut icoeffs);
 
     // Step 3: negabinary conversion
     let mut ucoeffs = [0u32; BLOCK_SIZE];
     for i in 0..BLOCK_SIZE {
-        ucoeffs[i] = int2uint(icoeffs[i]);
+        ucoeffs[i] = int2uint_i32(icoeffs[i]);
     }
 
     // Step 4: embedded bit-plane encoding with budget
-    let header_bits = 1 + EBITS as usize;
+    let header_bits = 1 + EBITS_F32 as usize;
     let coeff_bits = maxbits.saturating_sub(header_bits);
-    encode_ints(w, &ucoeffs, coeff_bits);
+    // maxprec for 1D fixed-rate: full precision of the coefficient type.
+    encode_few_ints_u32(w, coeff_bits, 32, &ucoeffs, BLOCK_SIZE);
 
     // Pad to exactly maxbits
     let used = w.position() - start;
@@ -685,14 +668,14 @@ fn decode_block_f32(
         return Ok([0.0f32; BLOCK_SIZE]);
     }
 
-    // Read exponent
-    let emax = r.read(EBITS) as u32;
-    let emax_biased = emax + 1;
+    // Read exponent — the stored value is `emax + 1` (see encode_block_f32).
+    let emax_biased = r.read(EBITS_F32) as u32;
 
     // Decode coefficients
-    let header_bits = 1 + EBITS as usize;
+    let header_bits = 1 + EBITS_F32 as usize;
     let coeff_bits = maxbits.saturating_sub(header_bits);
-    let (ucoeffs, bits_consumed) = decode_ints(r, coeff_bits);
+    let mut ucoeffs = [0u32; BLOCK_SIZE];
+    let bits_consumed = decode_few_ints_u32(r, coeff_bits, 32, &mut ucoeffs, BLOCK_SIZE);
 
     // Skip remaining padding bits to maintain block alignment.
     let remaining = coeff_bits.saturating_sub(bits_consumed);
@@ -701,15 +684,109 @@ fn decode_block_f32(
     // Negabinary -> signed
     let mut icoeffs = [0i32; BLOCK_SIZE];
     for i in 0..BLOCK_SIZE {
-        icoeffs[i] = uint2int(ucoeffs[i]);
+        icoeffs[i] = uint2int_i32(ucoeffs[i]);
     }
 
     // Inverse lifting transform
-    inv_lift(&mut icoeffs);
+    inv_lift_i32(&mut icoeffs);
 
     // Inverse block-floating-point cast
     Ok(inv_cast_f32(emax_biased, &icoeffs))
 }
+
+fn encode_block_f64(w: &mut BitWriter, vals: &[f64; BLOCK_SIZE], maxbits: usize) {
+    let start = w.position();
+    let (emax_biased, mut icoeffs) = fwd_cast_f64(vals);
+    if emax_biased == 0 {
+        w.write_bit(false);
+        pad_bits(w, maxbits.saturating_sub(1));
+        return;
+    }
+    w.write_bit(true);
+    w.write(EBITS_F64, emax_biased);
+    fwd_lift_i64(&mut icoeffs);
+    let mut ucoeffs = [0u64; BLOCK_SIZE];
+    for i in 0..BLOCK_SIZE {
+        ucoeffs[i] = int2uint_i64(icoeffs[i]);
+    }
+    let header_bits = 1 + EBITS_F64 as usize;
+    let coeff_bits = maxbits.saturating_sub(header_bits);
+    encode_few_ints_u64(w, coeff_bits, 64, &ucoeffs, BLOCK_SIZE);
+    let used = w.position() - start;
+    pad_bits(w, maxbits.saturating_sub(used));
+}
+
+fn decode_block_f64(
+    r: &mut BitReader<'_>,
+    maxbits: usize,
+) -> Result<[f64; BLOCK_SIZE], FormatError> {
+    let nonempty = r.read_bit();
+    if !nonempty {
+        let remaining = maxbits.saturating_sub(1);
+        r.read(remaining.min(64) as u32);
+        if remaining > 64 {
+            skip_bits(r, remaining - 64);
+        }
+        return Ok([0.0f64; BLOCK_SIZE]);
+    }
+    let emax_biased = r.read(EBITS_F64);
+    let header_bits = 1 + EBITS_F64 as usize;
+    let coeff_bits = maxbits.saturating_sub(header_bits);
+    let mut ucoeffs = [0u64; BLOCK_SIZE];
+    let bits_consumed = decode_few_ints_u64(r, coeff_bits, 64, &mut ucoeffs, BLOCK_SIZE);
+    skip_bits(r, coeff_bits.saturating_sub(bits_consumed));
+    let mut icoeffs = [0i64; BLOCK_SIZE];
+    for i in 0..BLOCK_SIZE {
+        icoeffs[i] = uint2int_i64(ucoeffs[i]);
+    }
+    inv_lift_i64(&mut icoeffs);
+    Ok(inv_cast_f64(emax_biased, &icoeffs))
+}
+
+/// Integer-path block encoder — no block-float header, coefficients are the
+/// input values cast directly. Covers i32 (u32 coeff) and i64 (u64 coeff).
+macro_rules! impl_int_block_codec {
+    ($enc:ident, $dec:ident, $int:ty, $uint:ty, $fwd_lift:ident, $inv_lift:ident,
+     $to_uint:ident, $to_int:ident, $enc_ints:ident, $dec_ints:ident, $intprec:expr) => {
+        fn $enc(w: &mut BitWriter, vals: &[$int; BLOCK_SIZE], maxbits: usize) {
+            let start = w.position();
+            let mut icoeffs = *vals;
+            $fwd_lift(&mut icoeffs);
+            let mut ucoeffs = [0 as $uint; BLOCK_SIZE];
+            for i in 0..BLOCK_SIZE {
+                ucoeffs[i] = $to_uint(icoeffs[i]);
+            }
+            $enc_ints(w, maxbits, $intprec, &ucoeffs, BLOCK_SIZE);
+            let used = w.position() - start;
+            pad_bits(w, maxbits.saturating_sub(used));
+        }
+        fn $dec(
+            r: &mut BitReader<'_>,
+            maxbits: usize,
+        ) -> Result<[$int; BLOCK_SIZE], FormatError> {
+            let mut ucoeffs = [0 as $uint; BLOCK_SIZE];
+            let bits_consumed = $dec_ints(r, maxbits, $intprec, &mut ucoeffs, BLOCK_SIZE);
+            skip_bits(r, maxbits.saturating_sub(bits_consumed));
+            let mut icoeffs = [0 as $int; BLOCK_SIZE];
+            for i in 0..BLOCK_SIZE {
+                icoeffs[i] = $to_int(ucoeffs[i]);
+            }
+            $inv_lift(&mut icoeffs);
+            Ok(icoeffs)
+        }
+    };
+}
+
+impl_int_block_codec!(
+    encode_block_i32, decode_block_i32,
+    i32, u32, fwd_lift_i32, inv_lift_i32, int2uint_i32, uint2int_i32,
+    encode_few_ints_u32, decode_few_ints_u32, 32u32
+);
+impl_int_block_codec!(
+    encode_block_i64, decode_block_i64,
+    i64, u64, fwd_lift_i64, inv_lift_i64, int2uint_i64, uint2int_i64,
+    encode_few_ints_u64, decode_few_ints_u64, 64u32
+);
 
 /// Write `n` zero bits.
 fn pad_bits(w: &mut BitWriter, n: usize) {
@@ -753,25 +830,30 @@ const ZFP_MODE_RATE: u32 = 1;
 pub fn compress_f32(data: &[u8], rate: f64) -> Result<Vec<u8>, FormatError> {
     let num_floats = data.len() / 4;
     let maxbits = (rate * BLOCK_SIZE as f64) as usize;
+    let num_blocks = num_floats.div_ceil(BLOCK_SIZE);
+    let total_bits = num_blocks * maxbits;
 
     let mut w = BitWriter::new();
 
     let mut i = 0;
     while i < num_floats {
         let mut block = [0.0f32; BLOCK_SIZE];
-        for j in 0..BLOCK_SIZE {
-            if i + j < num_floats {
-                let off = (i + j) * 4;
-                block[j] =
-                    f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
-            }
-            // else: zero-padded (already 0.0)
+        let n_real = (num_floats - i).min(BLOCK_SIZE);
+        for j in 0..n_real {
+            let off = (i + j) * 4;
+            block[j] =
+                f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
         }
+        pad_partial_block_f32(&mut block, n_real);
         encode_block_f32(&mut w, &block, maxbits);
         i += BLOCK_SIZE;
     }
 
-    Ok(w.finish())
+    let mut out = w.finish();
+    // Truncate trailing word-alignment padding so that the output length
+    // matches the exact bit budget (what H5Z-ZFP stores on disk).
+    out.truncate(total_bits.div_ceil(8));
+    Ok(out)
 }
 
 /// Decompress a ZFP-compressed f32 stream.
@@ -803,6 +885,90 @@ pub fn decompress_f32(
 
     Ok(output)
 }
+
+/// Per-type 1D compress/decompress. Same structure as `compress_f32` /
+/// `decompress_f32` but parameterized over scalar width and the block
+/// encoder/decoder/padder used.
+macro_rules! impl_compress_1d {
+    ($compress:ident, $decompress:ident, $scalar:ty, $zero:expr,
+     $elem_bytes:expr, $from_le:path, $encode_block:ident, $decode_block:ident,
+     $pad_partial:ident) => {
+        #[doc = concat!("Compress a 1D ", stringify!($scalar), " array via ZFP fixed-rate.")]
+        pub fn $compress(data: &[u8], rate: f64) -> Result<Vec<u8>, FormatError> {
+            const ESZ: usize = $elem_bytes;
+            let num_values = data.len() / ESZ;
+            let maxbits = (rate * BLOCK_SIZE as f64) as usize;
+            let num_blocks = num_values.div_ceil(BLOCK_SIZE);
+            let total_bits = num_blocks * maxbits;
+            let mut w = BitWriter::new();
+            let mut i = 0;
+            while i < num_values {
+                let mut block = [$zero; BLOCK_SIZE];
+                let n_real = (num_values - i).min(BLOCK_SIZE);
+                for j in 0..n_real {
+                    let off = (i + j) * ESZ;
+                    let mut buf = [0u8; ESZ];
+                    buf.copy_from_slice(&data[off..off + ESZ]);
+                    block[j] = $from_le(buf);
+                }
+                $pad_partial(&mut block, n_real);
+                $encode_block(&mut w, &block, maxbits);
+                i += BLOCK_SIZE;
+            }
+            let mut out = w.finish();
+            out.truncate(total_bits.div_ceil(8));
+            Ok(out)
+        }
+
+        #[doc = concat!("Decompress to 1D ", stringify!($scalar), " bytes (little-endian).")]
+        pub fn $decompress(
+            compressed: &[u8],
+            num_values: usize,
+            rate: f64,
+        ) -> Result<Vec<u8>, FormatError> {
+            const ESZ: usize = $elem_bytes;
+            let maxbits = (rate * BLOCK_SIZE as f64) as usize;
+            let mut r = BitReader::new(compressed);
+            let mut output = Vec::with_capacity(num_values * ESZ);
+            let mut i = 0;
+            while i < num_values {
+                let block = $decode_block(&mut r, maxbits)?;
+                let count = BLOCK_SIZE.min(num_values - i);
+                for j in 0..count {
+                    output.extend_from_slice(&block[j].to_le_bytes());
+                }
+                i += BLOCK_SIZE;
+            }
+            Ok(output)
+        }
+    };
+}
+
+#[inline]
+fn f64_from_le(b: [u8; 8]) -> f64 {
+    f64::from_le_bytes(b)
+}
+#[inline]
+fn i32_from_le(b: [u8; 4]) -> i32 {
+    i32::from_le_bytes(b)
+}
+#[inline]
+fn i64_from_le(b: [u8; 8]) -> i64 {
+    i64::from_le_bytes(b)
+}
+
+impl_compress_1d!(
+    compress_f64, decompress_f64, f64, 0.0f64,
+    8, f64_from_le, encode_block_f64, decode_block_f64, pad_partial_block_f64
+);
+impl_compress_1d!(
+    compress_i32, decompress_i32, i32, 0i32,
+    4, i32_from_le, encode_block_i32, decode_block_i32, pad_partial_block_i32
+);
+impl_compress_1d!(
+    compress_i64, decompress_i64, i64, 0i64,
+    8, i64_from_le, encode_block_i64, decode_block_i64, pad_partial_block_i64
+);
 
 /// Build ZFP cd\_values for HDF5 filter metadata (fixed-rate mode).
 ///
@@ -871,7 +1037,7 @@ mod tests {
     #[test]
     fn negabinary_roundtrip() {
         for x in [-1000, -1, 0, 1, 42, i32::MIN, i32::MAX] {
-            assert_eq!(uint2int(int2uint(x)), x);
+            assert_eq!(uint2int_i32(int2uint_i32(x)), x);
         }
     }
 
@@ -881,17 +1047,17 @@ mod tests {
     fn lift_roundtrip() {
         let original = [100, -200, 300, -400];
         let mut p = original;
-        fwd_lift(&mut p);
-        inv_lift(&mut p);
+        fwd_lift_i32(&mut p);
+        inv_lift_i32(&mut p);
         assert_eq!(p, original);
     }
 
     #[test]
     fn lift_zeros() {
         let mut p = [0, 0, 0, 0];
-        fwd_lift(&mut p);
+        fwd_lift_i32(&mut p);
         assert_eq!(p, [0, 0, 0, 0]);
-        inv_lift(&mut p);
+        inv_lift_i32(&mut p);
         assert_eq!(p, [0, 0, 0, 0]);
     }
 

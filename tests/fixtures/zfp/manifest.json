@@ -766,6 +766,25 @@
       "raw_bytes_len": 2048,
       "compressed_bytes_len": 512,
       "notes": ""
+    },
+    {
+      "name": "f32_1d_4_varied_rate24",
+      "dtype": "f32",
+      "shape": [
+        4
+      ],
+      "rate": 24.0,
+      "mode": "rate",
+      "filter_name": "H5Z-ZFP-1.1.1 (ZFP-1.0.1)",
+      "cd_values_u32": [
+        269504785,
+        91252346,
+        50,
+        99614720
+      ],
+      "raw_bytes_len": 16,
+      "compressed_bytes_len": 12,
+      "notes": "mixed-magnitude block that exposes a reference-diff at rate 24"
     }
   ]
 }

@@ -66,10 +66,10 @@ fn read_bin(name: &str) -> Vec<u8> {
 }
 
 /// True if the fixture falls inside the slice of the codec implemented so
-/// far. As Steps 3 and 5 land, this gate widens.
+/// far. Widens as Steps 3 and 5 land.
 fn is_supported(fix: &Fixture) -> bool {
-    // Step 2 initial state: f32 1D fixed-rate only.
-    fix.dtype == "f32" && fix.shape.len() == 1 && fix.mode == "rate"
+    let dtype_ok = matches!(fix.dtype.as_str(), "f32" | "f64" | "i32" | "i64");
+    dtype_ok && fix.shape.len() == 1 && fix.mode == "rate"
 }
 
 /// Expected element size in bytes for a fixture's dtype.
@@ -81,21 +81,101 @@ fn element_size(dtype: &str) -> usize {
     }
 }
 
-/// Max absolute reconstruction error we accept at a given rate. The fixed-
-/// rate mode gives each block exactly `rate * block_size` bits; for f32 at
-/// rate 16 the reconstruction is good to roughly 2^-8 * max(|block|).
-fn decode_tolerance(fix: &Fixture) -> f64 {
-    // Conservative: give 2^-(rate/2) relative tolerance scaled by max value.
-    // `rate` here is bits-per-value.
-    2f64.powi(-(fix.rate as i32 / 2))
+/// Max absolute reconstruction error we accept at a given rate.
+///
+/// Floats: the block-floating-point cast gives roughly `2^-(rate/2)` relative
+/// error, so a rate-16 f32 reconstruction is good to ~2^-8.
+///
+/// Integers: at rates below `INTPREC`, ZFP's lifting+truncation introduces a
+/// sizeable but well-defined quantization error. The encode-byte-match check
+/// is the real crosscheck gate (any deviation fails there); the decode bound
+/// is just a sanity floor, so we use a loose `max(|raw|) / 2` here.
+fn decode_tolerance(fix: &Fixture, raw: &[u8]) -> f64 {
+    match fix.dtype.as_str() {
+        "f32" | "f64" => 2f64.powi(-(fix.rate as i32 / 2)),
+        "i32" => {
+            let max_abs = raw
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]).unsigned_abs() as f64)
+                .fold(0f64, f64::max);
+            (max_abs / 2.0).max(1.0)
+        }
+        "i64" => {
+            let max_abs = raw
+                .chunks_exact(8)
+                .map(|c| i64::from_le_bytes(c.try_into().unwrap()).unsigned_abs() as f64)
+                .fold(0f64, f64::max);
+            (max_abs / 2.0).max(1.0)
+        }
+        _ => 1e30,
+    }
 }
 
-/// Interpret a byte slice as a sequence of f32 LE values.
-fn f32_slice(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
+/// Per-dtype decode + max-error computation.
+fn decode_and_max_err(
+    dtype: &str,
+    reference: &[u8],
+    num_values: usize,
+    rate: f64,
+    raw: &[u8],
+) -> Result<f64, String> {
+    fn max_abs<T: Copy + Into<f64>>(a: &[T], b: &[T]) -> f64 {
+        a.iter()
+            .zip(b.iter())
+            .map(|(&x, &y)| (x.into() - y.into()).abs())
+            .fold(0f64, f64::max)
+    }
+    match dtype {
+        "f32" => {
+            let decoded = zfp::decompress_f32(reference, num_values, rate).map_err(|e| format!("{e:?}"))?;
+            let expected: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let got: Vec<f32> = decoded.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            if got.len() != expected.len() {
+                return Err(format!("decoded {} != expected {}", got.len(), expected.len()));
+            }
+            Ok(max_abs(&expected, &got))
+        }
+        "f64" => {
+            let decoded = zfp::decompress_f64(reference, num_values, rate).map_err(|e| format!("{e:?}"))?;
+            let expected: Vec<f64> = raw.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
+            let got: Vec<f64> = decoded.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
+            if got.len() != expected.len() {
+                return Err(format!("decoded {} != expected {}", got.len(), expected.len()));
+            }
+            Ok(max_abs(&expected, &got))
+        }
+        "i32" => {
+            let decoded = zfp::decompress_i32(reference, num_values, rate).map_err(|e| format!("{e:?}"))?;
+            let expected: Vec<i32> = raw.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let got: Vec<i32> = decoded.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            if got.len() != expected.len() {
+                return Err(format!("decoded {} != expected {}", got.len(), expected.len()));
+            }
+            let max = expected.iter().zip(got.iter()).map(|(&a, &b)| (a as f64 - b as f64).abs()).fold(0f64, f64::max);
+            Ok(max)
+        }
+        "i64" => {
+            let decoded = zfp::decompress_i64(reference, num_values, rate).map_err(|e| format!("{e:?}"))?;
+            let expected: Vec<i64> = raw.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect();
+            let got: Vec<i64> = decoded.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect();
+            if got.len() != expected.len() {
+                return Err(format!("decoded {} != expected {}", got.len(), expected.len()));
+            }
+            let max = expected.iter().zip(got.iter()).map(|(&a, &b)| (a as f64 - b as f64).abs()).fold(0f64, f64::max);
+            Ok(max)
+        }
+        other => Err(format!("unknown dtype {other}")),
+    }
+}
+
+fn encode_per_dtype(dtype: &str, raw: &[u8], rate: f64) -> Result<Vec<u8>, String> {
+    match dtype {
+        "f32" => zfp::compress_f32(raw, rate).map_err(|e| format!("{e:?}")),
+        "f64" => zfp::compress_f64(raw, rate).map_err(|e| format!("{e:?}")),
+        "i32" => zfp::compress_i32(raw, rate).map_err(|e| format!("{e:?}")),
+        "i64" => zfp::compress_i64(raw, rate).map_err(|e| format!("{e:?}")),
+        other => Err(format!("unknown dtype {other}")),
+    }
 }
 
 #[derive(Debug)]
@@ -117,37 +197,15 @@ fn run_case(fix: &Fixture) -> CaseOutcome {
     let num_values: usize = fix.shape.iter().product();
     assert_eq!(raw.len(), num_values * elem_size);
 
-    // Decode path — 1D f32 for now
     let (decode_max_err, decode_err_msg) =
-        match zfp::decompress_f32(&reference, num_values, fix.rate) {
-            Ok(decoded_bytes) => {
-                let expected = f32_slice(&raw);
-                let got = f32_slice(&decoded_bytes);
-                if got.len() != expected.len() {
-                    (
-                        None,
-                        Some(format!(
-                            "decoded len {} != expected {}",
-                            got.len(),
-                            expected.len()
-                        )),
-                    )
-                } else {
-                    let max_err = expected
-                        .iter()
-                        .zip(got.iter())
-                        .map(|(&a, &b)| (a as f64 - b as f64).abs())
-                        .fold(0f64, f64::max);
-                    (Some(max_err), None)
-                }
-            }
-            Err(e) => (None, Some(format!("{e:?}"))),
+        match decode_and_max_err(&fix.dtype, &reference, num_values, fix.rate, &raw) {
+            Ok(e) => (Some(e), None),
+            Err(m) => (None, Some(m)),
         };
 
-    // Encode path
-    let (encode_byte_match, encode_err_msg) = match zfp::compress_f32(&raw, fix.rate) {
+    let (encode_byte_match, encode_err_msg) = match encode_per_dtype(&fix.dtype, &raw, fix.rate) {
         Ok(encoded) => (Some(encoded == reference), None),
-        Err(e) => (None, Some(format!("{e:?}"))),
+        Err(m) => (None, Some(m)),
     };
 
     CaseOutcome {
@@ -160,7 +218,6 @@ fn run_case(fix: &Fixture) -> CaseOutcome {
 }
 
 #[test]
-#[ignore = "bit-format not yet verified against reference; Step 3 removes this"]
 fn zfp_crosscheck() {
     let manifest = load_manifest();
     let mut skipped: Vec<&str> = Vec::new();
@@ -173,7 +230,8 @@ fn zfp_crosscheck() {
             continue;
         }
         let outcome = run_case(fix);
-        let tol = decode_tolerance(fix);
+        let raw = read_bin(&format!("{}.raw.bin", fix.name));
+        let tol = decode_tolerance(fix, &raw);
         let decode_ok = match (&outcome.decode_err_msg, outcome.decode_max_err) {
             (None, Some(e)) => e <= tol,
             _ => false,
