@@ -30,7 +30,6 @@ fn decompress_all_chunks(
     chunks: &[ChunkInfo],
     pipeline: Option<&FilterPipeline>,
     chunk_dims: &[u64],
-    chunk_total_bytes: usize,
     element_size: u32,
     element_type: Option<crate::filters::ZfpElementTypeWhenEnabled>,
 ) -> Result<Vec<CacheAlignedBuffer>, FormatError> {
@@ -48,7 +47,6 @@ fn decompress_all_chunks(
                     chunks,
                     pl,
                     chunk_dims,
-                    chunk_total_bytes,
                     element_size,
                     element_type,
                     seed,
@@ -78,7 +76,6 @@ fn decompress_all_chunks(
                     chunk_dims,
                     element_size,
                     element_type,
-                    chunk_total_bytes,
                 };
                 decompress_chunk(raw_chunk, pl, ctx)?
             } else {
@@ -103,7 +100,6 @@ pub fn decompress_all_chunks_with_stats(
     chunks: &[ChunkInfo],
     pipeline: &FilterPipeline,
     chunk_dims: &[u64],
-    chunk_total_bytes: usize,
     element_size: u32,
     element_type: Option<crate::filters::ZfpElementTypeWhenEnabled>,
     seed: u64,
@@ -114,7 +110,6 @@ pub fn decompress_all_chunks_with_stats(
         chunks,
         pipeline,
         chunk_dims,
-        chunk_total_bytes,
         element_size,
         element_type,
         seed,
@@ -439,9 +434,6 @@ pub fn read_chunked_data(
         chunk_strides[i] = chunk_strides[i + 1] * chunk_dims[i + 1];
     }
 
-    let chunk_total_elements: usize = chunk_dims.iter().product();
-    let chunk_total_bytes = chunk_total_elements * elem_size;
-
     // Decompress all chunks (parallel when beneficial, sequential otherwise)
     let chunk_dims_u64: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
     let element_type = zfp_element_type_from_datatype(datatype);
@@ -450,7 +442,6 @@ pub fn read_chunked_data(
         &chunks,
         pipeline,
         &chunk_dims_u64,
-        chunk_total_bytes,
         elem_size as u32,
         element_type,
     )?;
@@ -602,8 +593,6 @@ pub fn read_chunked_data_cached(
         chunk_strides[i] = chunk_strides[i + 1] * chunk_dims[i + 1];
     }
 
-    let chunk_total_elements: usize = chunk_dims.iter().product();
-    let chunk_total_bytes = chunk_total_elements * elem_size;
     let chunk_dims_u64: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
     let element_type = zfp_element_type_from_datatype(datatype);
 
@@ -630,7 +619,6 @@ pub fn read_chunked_data_cached(
                         chunk_dims: &chunk_dims_u64,
                         element_size: elem_size as u32,
                         element_type,
-                        chunk_total_bytes,
                     };
                     decompress_chunk(raw_chunk, pl, ctx)?
                 } else {
@@ -927,8 +915,6 @@ pub fn read_chunked_data_sweep(
         chunk_strides[i] = chunk_strides[i + 1] * chunk_dims[i + 1];
     }
 
-    let chunk_total_elements: usize = chunk_dims.iter().product();
-    let chunk_total_bytes = chunk_total_elements * elem_size;
     let chunk_dims_u64: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
     let element_type = zfp_element_type_from_datatype(datatype);
 
@@ -964,7 +950,6 @@ pub fn read_chunked_data_sweep(
                         chunk_dims: &chunk_dims_u64,
                         element_size: elem_size as u32,
                         element_type,
-                        chunk_total_bytes,
                     };
                     decompress_chunk(raw_chunk, pl, ctx)?
                 } else {
@@ -1364,7 +1349,6 @@ mod tests {
             let ctx = crate::filters::ChunkContext::basic(
                 &dims_u64,
                 elem_size as u32,
-                chunk_bytes.len(),
             );
             let compressed = compress_chunk(&chunk_bytes, &pipeline, ctx).unwrap();
 

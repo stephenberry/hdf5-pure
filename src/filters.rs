@@ -28,8 +28,6 @@ pub struct ChunkContext<'a> {
     /// the caller does not know or does not need it; type-aware filters
     /// will return an error.
     pub element_type: Option<ZfpElementTypeWhenEnabled>,
-    /// Total uncompressed bytes in one chunk (shape product × element size).
-    pub chunk_total_bytes: usize,
 }
 
 /// Dummy wrapper so ChunkContext's type stays stable whether or not the
@@ -42,13 +40,12 @@ pub type ZfpElementTypeWhenEnabled = core::convert::Infallible;
 impl<'a> ChunkContext<'a> {
     /// Lightweight constructor for callers that don't need ZFP support — the
     /// element_type is left `None`, so any ZFP filter in the pipeline will
-    /// error out. `chunk_total_bytes` and `element_size` must still be valid.
-    pub fn basic(chunk_dims: &'a [u64], element_size: u32, chunk_total_bytes: usize) -> Self {
+    /// error out. `element_size` must still be valid.
+    pub fn basic(chunk_dims: &'a [u64], element_size: u32) -> Self {
         Self {
             chunk_dims,
             element_size,
             element_type: None,
-            chunk_total_bytes,
         }
     }
 }
@@ -469,7 +466,7 @@ mod tests {
         };
         let data: Vec<u8> = (0..200).map(|i| (i % 256) as u8).collect();
         let dims = [data.len() as u64];
-        let ctx = ChunkContext::basic(&dims, 1, data.len());
+        let ctx = ChunkContext::basic(&dims, 1);
         let compressed = compress_chunk(&data, &pipeline, ctx).unwrap();
         let decompressed = decompress_chunk(&compressed, &pipeline, ctx).unwrap();
         assert_eq!(decompressed, data);
@@ -498,7 +495,7 @@ mod tests {
         // 25 f64 values (200 bytes)
         let data: Vec<u8> = (0..200).map(|i| (i % 256) as u8).collect();
         let dims = [(data.len() / 8) as u64];
-        let ctx = ChunkContext::basic(&dims, 8, data.len());
+        let ctx = ChunkContext::basic(&dims, 8);
         let compressed = compress_chunk(&data, &pipeline, ctx).unwrap();
         let decompressed = decompress_chunk(&compressed, &pipeline, ctx).unwrap();
         assert_eq!(decompressed, data);
@@ -532,7 +529,7 @@ mod tests {
         };
         let data: Vec<u8> = (0..160).map(|i| (i % 256) as u8).collect();
         let dims = [(data.len() / 8) as u64];
-        let ctx = ChunkContext::basic(&dims, 8, data.len());
+        let ctx = ChunkContext::basic(&dims, 8);
         let compressed = compress_chunk(&data, &pipeline, ctx).unwrap();
         let decompressed = decompress_chunk(&compressed, &pipeline, ctx).unwrap();
         assert_eq!(decompressed, data);
@@ -567,7 +564,7 @@ mod tests {
         // Use realistic f64-sized data
         let data: Vec<u8> = (0..80).map(|i| (i * 3 % 256) as u8).collect();
         let dims = [(data.len() / 8) as u64];
-        let ctx = ChunkContext::basic(&dims, 8, data.len());
+        let ctx = ChunkContext::basic(&dims, 8);
         let compressed = compress_chunk(&data, &pipeline, ctx).unwrap();
         let decompressed = decompress_chunk(&compressed, &pipeline, ctx).unwrap();
         assert_eq!(decompressed, data);

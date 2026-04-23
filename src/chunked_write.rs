@@ -961,15 +961,12 @@ pub fn build_chunked_data_at_ext(
     let mut data_buf = Vec::new();
     let mut written_chunks = Vec::with_capacity(num_chunks);
 
-    let chunk_total_bytes: usize = chunk_dims.iter().product::<u64>() as usize * element_size;
-
     for (_offsets, chunk_bytes) in &chunks {
         let compressed = if let Some(ref pl) = pipeline {
             let ctx = ChunkContext {
                 chunk_dims,
                 element_size: element_size as u32,
                 element_type: zfp_element_type,
-                chunk_total_bytes,
             };
             compress_chunk(chunk_bytes, pl, ctx)?
         } else {

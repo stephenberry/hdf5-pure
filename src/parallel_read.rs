@@ -46,7 +46,6 @@ pub fn decompress_chunks_lane_partitioned(
     chunks: &[ChunkInfo],
     pipeline: &FilterPipeline,
     chunk_dims: &[u64],
-    chunk_total_bytes: usize,
     element_size: u32,
     element_type: Option<ZfpElementTypeWhenEnabled>,
     seed: u64,
@@ -88,7 +87,6 @@ pub fn decompress_chunks_lane_partitioned(
                         chunk_dims,
                         element_size,
                         element_type,
-                        chunk_total_bytes,
                     };
                     decompress_chunk(raw_chunk, pipeline, ctx)?
                 } else {
@@ -139,7 +137,6 @@ pub fn decompress_chunks_parallel(
     chunks: &[ChunkInfo],
     pipeline: &FilterPipeline,
     chunk_dims: &[u64],
-    chunk_total_bytes: usize,
     element_size: u32,
     element_type: Option<ZfpElementTypeWhenEnabled>,
 ) -> Result<Vec<Vec<u8>>, FormatError> {
@@ -164,7 +161,6 @@ pub fn decompress_chunks_parallel(
                     chunk_dims,
                     element_size,
                     element_type,
-                    chunk_total_bytes,
                 };
                 decompress_chunk(raw_chunk, pipeline, ctx)?
             } else {
@@ -186,7 +182,6 @@ pub fn decompress_chunks_sequential(
     chunks: &[ChunkInfo],
     pipeline: Option<&FilterPipeline>,
     chunk_dims: &[u64],
-    chunk_total_bytes: usize,
     element_size: u32,
     element_type: Option<ZfpElementTypeWhenEnabled>,
 ) -> Result<Vec<Vec<u8>>, FormatError> {
@@ -208,7 +203,6 @@ pub fn decompress_chunks_sequential(
                     chunk_dims,
                     element_size,
                     element_type,
-                    chunk_total_bytes,
                 };
                 decompress_chunk(raw_chunk, pl, ctx)?
             } else {
