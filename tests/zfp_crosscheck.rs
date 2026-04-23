@@ -24,8 +24,18 @@
 use std::fs;
 use std::path::PathBuf;
 
-use hdf5_pure::zfp;
+use hdf5_pure::zfp::{self, ZfpElementType};
 use serde::Deserialize;
+
+fn dtype_to_elem_type(dtype: &str) -> Result<ZfpElementType, String> {
+    match dtype {
+        "f32" => Ok(ZfpElementType::F32),
+        "f64" => Ok(ZfpElementType::F64),
+        "i32" => Ok(ZfpElementType::I32),
+        "i64" => Ok(ZfpElementType::I64),
+        other => Err(format!("unknown dtype {other}")),
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct Manifest {
@@ -126,9 +136,10 @@ fn decode_and_max_err(
             .map(|(&x, &y)| (x.into() - y.into()).abs())
             .fold(0f64, f64::max)
     }
+    let elem_ty = dtype_to_elem_type(dtype)?;
+    let decoded = zfp::decompress(reference, dims, rate, elem_ty).map_err(|e| format!("{e:?}"))?;
     match dtype {
         "f32" => {
-            let decoded = zfp::decompress_f32(reference, dims, rate).map_err(|e| format!("{e:?}"))?;
             let expected: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
             let got: Vec<f32> = decoded.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
             if got.len() != expected.len() {
@@ -137,7 +148,6 @@ fn decode_and_max_err(
             Ok(max_abs(&expected, &got))
         }
         "f64" => {
-            let decoded = zfp::decompress_f64(reference, dims, rate).map_err(|e| format!("{e:?}"))?;
             let expected: Vec<f64> = raw.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
             let got: Vec<f64> = decoded.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
             if got.len() != expected.len() {
@@ -146,7 +156,6 @@ fn decode_and_max_err(
             Ok(max_abs(&expected, &got))
         }
         "i32" => {
-            let decoded = zfp::decompress_i32(reference, dims, rate).map_err(|e| format!("{e:?}"))?;
             let expected: Vec<i32> = raw.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
             let got: Vec<i32> = decoded.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
             if got.len() != expected.len() {
@@ -156,7 +165,6 @@ fn decode_and_max_err(
             Ok(max)
         }
         "i64" => {
-            let decoded = zfp::decompress_i64(reference, dims, rate).map_err(|e| format!("{e:?}"))?;
             let expected: Vec<i64> = raw.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect();
             let got: Vec<i64> = decoded.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect();
             if got.len() != expected.len() {
@@ -170,13 +178,8 @@ fn decode_and_max_err(
 }
 
 fn encode_per_dtype(dtype: &str, raw: &[u8], dims: &[usize], rate: f64) -> Result<Vec<u8>, String> {
-    match dtype {
-        "f32" => zfp::compress_f32(raw, dims, rate).map_err(|e| format!("{e:?}")),
-        "f64" => zfp::compress_f64(raw, dims, rate).map_err(|e| format!("{e:?}")),
-        "i32" => zfp::compress_i32(raw, dims, rate).map_err(|e| format!("{e:?}")),
-        "i64" => zfp::compress_i64(raw, dims, rate).map_err(|e| format!("{e:?}")),
-        other => Err(format!("unknown dtype {other}")),
-    }
+    let elem_ty = dtype_to_elem_type(dtype)?;
+    zfp::compress(raw, dims, rate, elem_ty).map_err(|e| format!("{e:?}"))
 }
 
 #[derive(Debug)]

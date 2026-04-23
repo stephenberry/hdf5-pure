@@ -1820,10 +1820,40 @@ impl_codec!(
     encode_block_i64_4d, decode_block_i64_4d
 );
 
-pub use codec_f32::{compress as compress_f32, decompress as decompress_f32};
-pub use codec_f64::{compress as compress_f64, decompress as decompress_f64};
-pub use codec_i32::{compress as compress_i32, decompress as decompress_i32};
-pub use codec_i64::{compress as compress_i64, decompress as decompress_i64};
+/// Compress a raw chunk buffer with ZFP fixed-rate.
+///
+/// `data` holds `dims.iter().product()` little-endian scalars of `element_type`
+/// in row-major order (outer-most dimension first). `rate` is bits-per-scalar
+/// and must be finite and in `(0, 8 * sizeof(element_type)]`.
+pub fn compress(
+    data: &[u8],
+    dims: &[usize],
+    rate: f64,
+    element_type: ZfpElementType,
+) -> Result<Vec<u8>, FormatError> {
+    match element_type {
+        ZfpElementType::F32 => codec_f32::compress(data, dims, rate),
+        ZfpElementType::F64 => codec_f64::compress(data, dims, rate),
+        ZfpElementType::I32 => codec_i32::compress(data, dims, rate),
+        ZfpElementType::I64 => codec_i64::compress(data, dims, rate),
+    }
+}
+
+/// Decompress a ZFP fixed-rate chunk into little-endian scalars of
+/// `element_type`, row-major, sized to `dims`.
+pub fn decompress(
+    compressed: &[u8],
+    dims: &[usize],
+    rate: f64,
+    element_type: ZfpElementType,
+) -> Result<Vec<u8>, FormatError> {
+    match element_type {
+        ZfpElementType::F32 => codec_f32::decompress(compressed, dims, rate),
+        ZfpElementType::F64 => codec_f64::decompress(compressed, dims, rate),
+        ZfpElementType::I32 => codec_i32::decompress(compressed, dims, rate),
+        ZfpElementType::I64 => codec_i64::decompress(compressed, dims, rate),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // HDF5 filter cd_values encoding, matching the H5Z-ZFP plugin layout so that
@@ -2168,8 +2198,8 @@ mod tests {
     #[test]
     fn compress_decompress_zeros() {
         let data = vec![0u8; 16]; // 4 zero f32 values
-        let compressed = compress_f32(&data, &[4], 16.0).unwrap();
-        let decompressed = decompress_f32(&compressed, &[4], 16.0).unwrap();
+        let compressed = compress(&data, &[4], 16.0, ZfpElementType::F32).unwrap();
+        let decompressed = decompress(&compressed, &[4], 16.0, ZfpElementType::F32).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -2177,8 +2207,8 @@ mod tests {
     fn compress_decompress_ones() {
         let vals: Vec<f32> = vec![1.0; 8];
         let data: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let compressed = compress_f32(&data, &[8], 16.0).unwrap();
-        let decompressed = decompress_f32(&compressed, &[8], 16.0).unwrap();
+        let compressed = compress(&data, &[8], 16.0, ZfpElementType::F32).unwrap();
+        let decompressed = decompress(&compressed, &[8], 16.0, ZfpElementType::F32).unwrap();
         // Lossy -- check within tolerance
         let recon: Vec<f32> = decompressed
             .chunks(4)
@@ -2207,8 +2237,8 @@ mod tests {
 
         // High rate should give good accuracy for same-magnitude blocks
         let dims = [vals.len()];
-        let compressed = compress_f32(&data, &dims, 24.0).unwrap();
-        let decompressed = decompress_f32(&compressed, &dims, 24.0).unwrap();
+        let compressed = compress(&data, &dims, 24.0, ZfpElementType::F32).unwrap();
+        let decompressed = decompress(&compressed, &dims, 24.0, ZfpElementType::F32).unwrap();
         let recon: Vec<f32> = decompressed
             .chunks(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -2231,8 +2261,8 @@ mod tests {
         // At rate=32 (maximum), should be nearly lossless for normal f32 values
         let vals: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
         let data: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let compressed = compress_f32(&data, &[4], 32.0).unwrap();
-        let decompressed = decompress_f32(&compressed, &[4], 32.0).unwrap();
+        let compressed = compress(&data, &[4], 32.0, ZfpElementType::F32).unwrap();
+        let decompressed = decompress(&compressed, &[4], 32.0, ZfpElementType::F32).unwrap();
         let recon: Vec<f32> = decompressed
             .chunks(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -2286,7 +2316,7 @@ mod tests {
     fn compress_rejects_short_buffer() {
         // 3 f32s worth of bytes, but we claim dims = [4].
         let short = vec![0u8; 3 * 4];
-        let err = compress_f32(&short, &[4], 16.0).expect_err("short buffer must error");
+        let err = compress(&short, &[4], 16.0, ZfpElementType::F32).expect_err("short buffer must error");
         assert!(matches!(err, FormatError::FilterError(_)), "{err:?}");
     }
 
@@ -2294,7 +2324,7 @@ mod tests {
     fn compress_rejects_long_buffer() {
         // Too many bytes — also a size mismatch.
         let long = vec![0u8; 5 * 4];
-        let err = compress_f32(&long, &[4], 16.0).expect_err("long buffer must error");
+        let err = compress(&long, &[4], 16.0, ZfpElementType::F32).expect_err("long buffer must error");
         assert!(matches!(err, FormatError::FilterError(_)), "{err:?}");
     }
 
@@ -2302,19 +2332,19 @@ mod tests {
     fn compress_rejects_bad_rate() {
         let data = vec![0u8; 16 * 4];
         // Non-finite.
-        let err = compress_f32(&data, &[16], f64::NAN).expect_err("NaN must error");
+        let err = compress(&data, &[16], f64::NAN, ZfpElementType::F32).expect_err("NaN must error");
         assert!(matches!(err, FormatError::FilterError(_)));
-        let err = compress_f32(&data, &[16], f64::INFINITY).expect_err("inf must error");
+        let err = compress(&data, &[16], f64::INFINITY, ZfpElementType::F32).expect_err("inf must error");
         assert!(matches!(err, FormatError::FilterError(_)));
         // Non-positive.
-        let err = compress_f32(&data, &[16], 0.0).expect_err("rate=0 must error");
+        let err = compress(&data, &[16], 0.0, ZfpElementType::F32).expect_err("rate=0 must error");
         assert!(matches!(err, FormatError::FilterError(_)));
-        let err = compress_f32(&data, &[16], -1.0).expect_err("negative rate must error");
+        let err = compress(&data, &[16], -1.0, ZfpElementType::F32).expect_err("negative rate must error");
         assert!(matches!(err, FormatError::FilterError(_)));
         // Above scalar width.
-        let err = compress_f32(&data, &[16], 33.0).expect_err("rate > 32 must error for f32");
+        let err = compress(&data, &[16], 33.0, ZfpElementType::F32).expect_err("rate > 32 must error for f32");
         assert!(matches!(err, FormatError::FilterError(_)));
-        let err = compress_f32(&data, &[16], 1e20).expect_err("huge rate must error");
+        let err = compress(&data, &[16], 1e20, ZfpElementType::F32).expect_err("huge rate must error");
         assert!(matches!(err, FormatError::FilterError(_)));
     }
 
@@ -2322,9 +2352,9 @@ mod tests {
     fn compress_rate_at_scalar_width_is_accepted() {
         // The inclusive upper bound should still work (lossless-ish).
         let data = vec![0u8; 4 * 4];
-        assert!(compress_f32(&data, &[4], 32.0).is_ok());
+        assert!(compress(&data, &[4], 32.0, ZfpElementType::F32).is_ok());
         let data = vec![0u8; 4 * 8];
-        assert!(compress_f64(&data, &[4], 64.0).is_ok());
+        assert!(compress(&data, &[4], 64.0, ZfpElementType::F64).is_ok());
     }
 
     #[test]
@@ -2333,15 +2363,15 @@ mod tests {
         // corrupt cd_values value can't drive an OOM on read.
         let c = vec![0u8; 64];
         assert!(matches!(
-            decompress_f32(&c, &[4], 0.0),
+            decompress(&c, &[4], 0.0, ZfpElementType::F32),
             Err(FormatError::FilterError(_))
         ));
         assert!(matches!(
-            decompress_f32(&c, &[4], 1e20),
+            decompress(&c, &[4], 1e20, ZfpElementType::F32),
             Err(FormatError::FilterError(_))
         ));
         assert!(matches!(
-            decompress_f32(&c, &[4], f64::NAN),
+            decompress(&c, &[4], f64::NAN, ZfpElementType::F32),
             Err(FormatError::FilterError(_))
         ));
     }
@@ -2351,8 +2381,8 @@ mod tests {
         // 6 values = 1 full block + 1 partial block (2 values + 2 zeros)
         let vals: Vec<f32> = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
         let data: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let compressed = compress_f32(&data, &[6], 16.0).unwrap();
-        let decompressed = decompress_f32(&compressed, &[6], 16.0).unwrap();
+        let compressed = compress(&data, &[6], 16.0, ZfpElementType::F32).unwrap();
+        let decompressed = decompress(&compressed, &[6], 16.0, ZfpElementType::F32).unwrap();
         let recon: Vec<f32> = decompressed
             .chunks(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))

@@ -130,24 +130,24 @@ fn zfp_rate(filter: &crate::filter_pipeline::FilterDescription) -> Result<f64, F
 }
 
 #[cfg(feature = "zfp")]
+fn zfp_element_type(ctx: &ChunkContext<'_>) -> Result<ZfpElementType, FormatError> {
+    ctx.element_type.ok_or_else(|| {
+        FormatError::FilterError(
+            "ZFP: element_type missing from ChunkContext (caller must set it)".into(),
+        )
+    })
+}
+
+#[cfg(feature = "zfp")]
 fn zfp_compress(
     data: &[u8],
     filter: &crate::filter_pipeline::FilterDescription,
     ctx: &ChunkContext<'_>,
 ) -> Result<Vec<u8>, FormatError> {
     let rate = zfp_rate(filter)?;
-    let elem_ty = ctx.element_type.ok_or_else(|| {
-        FormatError::FilterError(
-            "ZFP: element_type missing from ChunkContext (caller must set it)".into(),
-        )
-    })?;
+    let elem_ty = zfp_element_type(ctx)?;
     let dims_usize: Vec<usize> = ctx.chunk_dims.iter().map(|&d| d as usize).collect();
-    match elem_ty {
-        ZfpElementType::F32 => crate::zfp::compress_f32(data, &dims_usize, rate),
-        ZfpElementType::F64 => crate::zfp::compress_f64(data, &dims_usize, rate),
-        ZfpElementType::I32 => crate::zfp::compress_i32(data, &dims_usize, rate),
-        ZfpElementType::I64 => crate::zfp::compress_i64(data, &dims_usize, rate),
-    }
+    crate::zfp::compress(data, &dims_usize, rate, elem_ty)
 }
 
 #[cfg(feature = "zfp")]
@@ -157,18 +157,9 @@ fn zfp_decompress(
     ctx: &ChunkContext<'_>,
 ) -> Result<Vec<u8>, FormatError> {
     let rate = zfp_rate(filter)?;
-    let elem_ty = ctx.element_type.ok_or_else(|| {
-        FormatError::FilterError(
-            "ZFP: element_type missing from ChunkContext (caller must set it)".into(),
-        )
-    })?;
+    let elem_ty = zfp_element_type(ctx)?;
     let dims_usize: Vec<usize> = ctx.chunk_dims.iter().map(|&d| d as usize).collect();
-    match elem_ty {
-        ZfpElementType::F32 => crate::zfp::decompress_f32(data, &dims_usize, rate),
-        ZfpElementType::F64 => crate::zfp::decompress_f64(data, &dims_usize, rate),
-        ZfpElementType::I32 => crate::zfp::decompress_i32(data, &dims_usize, rate),
-        ZfpElementType::I64 => crate::zfp::decompress_i64(data, &dims_usize, rate),
-    }
+    crate::zfp::decompress(data, &dims_usize, rate, elem_ty)
 }
 
 /// Decompress zlib-compressed data.
