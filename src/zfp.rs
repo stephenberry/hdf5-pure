@@ -44,12 +44,8 @@ use alloc::{format, vec, vec::Vec};
 
 use crate::error::FormatError;
 
-/// Scalar type the codec operates on.
-///
-/// The H5Z-ZFP plugin encodes this as a small integer inside cd_values;
-/// Step 6 wires the cd_values decoder up to populate this from a stored
-/// filter on read. For write, the dataset's datatype determines which
-/// variant is passed in.
+/// Scalar type the codec operates on. Encoded as a small integer inside the
+/// H5Z-ZFP plugin's `cd_values`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZfpElementType {
     F32,
@@ -735,8 +731,8 @@ fn uint2int_i64(x: u64) -> i64 {
 /// `encode_few_ints` / `decode_few_ints` ports. Generated per integer width.
 ///
 /// `size` must be ≤ 64 — the bit plane is packed into a single u64 register.
-/// For N-D blocks where size > 64 (4D has 256), a separate `many_ints`
-/// variant will be needed; Step 5 will add it.
+/// For N-D blocks where size > 64 (4D has 256) the codec dispatches to
+/// `encode_many_ints` / `decode_many_ints` instead.
 macro_rules! impl_few_ints {
     ($enc:ident, $dec:ident, $uint:ty, $intprec:expr) => {
         fn $enc(
@@ -1893,7 +1889,7 @@ fn zfp_meta_for(elem: ZfpElementType, dims: &[usize]) -> u64 {
             meta = (meta << 12) + ny;
             meta = (meta << 12) + nx;
         }
-        _ => {}
+        _ => unreachable!("rank must be 1..=4 — validated by zfp_cd_values_rate"),
     }
     meta = (meta << 2) + rank as u64 - 1;
     meta = (meta << 2) + zt - 1;

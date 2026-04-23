@@ -873,9 +873,9 @@ impl DatasetBuilder {
     /// i32, and i64 datasets in 1D–4D. When ZFP is active it replaces shuffle
     /// and deflate on the same dataset.
     ///
-    /// The scalar type is derived from the dataset's datatype at finalize
-    /// time, so any of `with_{f32,f64,i32,i64}_data` or an explicit
-    /// `with_dtype` establishes it. Finalize returns
+    /// The scalar type is derived from the dataset's datatype when the file
+    /// is written, so any of `with_{f32,f64,i32,i64}_data` or an explicit
+    /// `with_dtype` establishes it. `finish()` / `write()` returns
     /// [`FormatError::UnsupportedZfp`](crate::FormatError::UnsupportedZfp) if
     /// the dataset's datatype isn't one of the four supported scalar types,
     /// or if the chunk rank is outside 1..=4.
