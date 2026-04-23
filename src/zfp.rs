@@ -1369,19 +1369,46 @@ macro_rules! impl_codec {
         pub(crate) mod $mod_name {
             use super::*;
 
+            /// Width in bits of the scalar type — the maximum meaningful
+            /// `rate` (anything above this wastes bits without improving
+            /// fidelity and risks `usize` overflow inside the codec).
+            const SCALAR_BITS: usize = $esz * 8;
+
+            fn validate_rate(rate: f64) -> Result<(), FormatError> {
+                if !rate.is_finite() || rate <= 0.0 || rate > SCALAR_BITS as f64 {
+                    return Err(FormatError::FilterError(format!(
+                        "ZFP: rate must be in (0, {}]; got {}",
+                        SCALAR_BITS, rate
+                    )));
+                }
+                Ok(())
+            }
+
             pub fn compress(
                 data: &[u8],
                 dims: &[usize],
                 rate: f64,
             ) -> Result<Vec<u8>, FormatError> {
+                if !matches!(dims.len(), 1..=4) {
+                    return Err(FormatError::FilterError(
+                        "ZFP: only 1D-4D supported".into(),
+                    ));
+                }
+                validate_rate(rate)?;
+                let expected = dims.iter().product::<usize>() * $esz;
+                if data.len() != expected {
+                    return Err(FormatError::FilterError(format!(
+                        "ZFP: data length {} does not match dims product × element size ({})",
+                        data.len(),
+                        expected,
+                    )));
+                }
                 match dims.len() {
                     1 => compress_1d(data, dims[0], rate),
                     2 => compress_2d(data, dims[0], dims[1], rate),
                     3 => compress_3d(data, dims[0], dims[1], dims[2], rate),
                     4 => compress_4d(data, dims[0], dims[1], dims[2], dims[3], rate),
-                    _ => Err(FormatError::FilterError(
-                        "ZFP: only 1D-4D supported".into(),
-                    )),
+                    _ => unreachable!(),
                 }
             }
 
@@ -1390,14 +1417,18 @@ macro_rules! impl_codec {
                 dims: &[usize],
                 rate: f64,
             ) -> Result<Vec<u8>, FormatError> {
+                if !matches!(dims.len(), 1..=4) {
+                    return Err(FormatError::FilterError(
+                        "ZFP: only 1D-4D supported".into(),
+                    ));
+                }
+                validate_rate(rate)?;
                 match dims.len() {
                     1 => decompress_1d(compressed, dims[0], rate),
                     2 => decompress_2d(compressed, dims[0], dims[1], rate),
                     3 => decompress_3d(compressed, dims[0], dims[1], dims[2], rate),
                     4 => decompress_4d(compressed, dims[0], dims[1], dims[2], dims[3], rate),
-                    _ => Err(FormatError::FilterError(
-                        "ZFP: only 1D-4D supported".into(),
-                    )),
+                    _ => unreachable!(),
                 }
             }
 
@@ -2244,6 +2275,70 @@ mod tests {
         let err = zfp_cd_values_rate(16.0, ZfpElementType::F32, &[])
             .expect_err("rank 0 should be rejected");
         assert!(matches!(err, FormatError::UnsupportedZfp(_)));
+    }
+
+    #[test]
+    fn compress_rejects_short_buffer() {
+        // 3 f32s worth of bytes, but we claim dims = [4].
+        let short = vec![0u8; 3 * 4];
+        let err = compress_f32(&short, &[4], 16.0).expect_err("short buffer must error");
+        assert!(matches!(err, FormatError::FilterError(_)), "{err:?}");
+    }
+
+    #[test]
+    fn compress_rejects_long_buffer() {
+        // Too many bytes — also a size mismatch.
+        let long = vec![0u8; 5 * 4];
+        let err = compress_f32(&long, &[4], 16.0).expect_err("long buffer must error");
+        assert!(matches!(err, FormatError::FilterError(_)), "{err:?}");
+    }
+
+    #[test]
+    fn compress_rejects_bad_rate() {
+        let data = vec![0u8; 16 * 4];
+        // Non-finite.
+        let err = compress_f32(&data, &[16], f64::NAN).expect_err("NaN must error");
+        assert!(matches!(err, FormatError::FilterError(_)));
+        let err = compress_f32(&data, &[16], f64::INFINITY).expect_err("inf must error");
+        assert!(matches!(err, FormatError::FilterError(_)));
+        // Non-positive.
+        let err = compress_f32(&data, &[16], 0.0).expect_err("rate=0 must error");
+        assert!(matches!(err, FormatError::FilterError(_)));
+        let err = compress_f32(&data, &[16], -1.0).expect_err("negative rate must error");
+        assert!(matches!(err, FormatError::FilterError(_)));
+        // Above scalar width.
+        let err = compress_f32(&data, &[16], 33.0).expect_err("rate > 32 must error for f32");
+        assert!(matches!(err, FormatError::FilterError(_)));
+        let err = compress_f32(&data, &[16], 1e20).expect_err("huge rate must error");
+        assert!(matches!(err, FormatError::FilterError(_)));
+    }
+
+    #[test]
+    fn compress_rate_at_scalar_width_is_accepted() {
+        // The inclusive upper bound should still work (lossless-ish).
+        let data = vec![0u8; 4 * 4];
+        assert!(compress_f32(&data, &[4], 32.0).is_ok());
+        let data = vec![0u8; 4 * 8];
+        assert!(compress_f64(&data, &[4], 64.0).is_ok());
+    }
+
+    #[test]
+    fn decompress_rejects_bad_rate() {
+        // Non-positive and too-large rates must fail on decompress too so a
+        // corrupt cd_values value can't drive an OOM on read.
+        let c = vec![0u8; 64];
+        assert!(matches!(
+            decompress_f32(&c, &[4], 0.0),
+            Err(FormatError::FilterError(_))
+        ));
+        assert!(matches!(
+            decompress_f32(&c, &[4], 1e20),
+            Err(FormatError::FilterError(_))
+        ));
+        assert!(matches!(
+            decompress_f32(&c, &[4], f64::NAN),
+            Err(FormatError::FilterError(_))
+        ));
     }
 
     #[test]
