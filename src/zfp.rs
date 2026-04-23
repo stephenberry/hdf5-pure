@@ -1595,30 +1595,50 @@ macro_rules! impl_codec {
                             let ry = (n1 - y0).min(4);
                             let rx = (n0 - x0).min(4);
                             let mut block = [$zero_s; 64];
-                            for z in 0..rz {
-                                for y in 0..ry {
-                                    // Bounds-check the row once per (z, y); the inner x loop
-                                    // indexes a bounded row slice. Measured ~23% faster on
-                                    // 3D f32 extraction than per-scalar indexing into `data`
-                                    // because LLVM can't hoist the per-iteration bounds
-                                    // check across three levels of nesting.
-                                    let row_off = (((z0 + z) * n1 + (y0 + y)) * n0 + x0) * $esz;
-                                    let row = &data[row_off..row_off + rx * $esz];
-                                    for x in 0..rx {
-                                        let buf: [u8; $esz] = row[x * $esz..(x + 1) * $esz]
-                                            .try_into()
-                                            .unwrap();
-                                        block[16 * z + 4 * y + x] = $from_le(buf);
+                            if rz == 4 && ry == 4 && rx == 4 {
+                                // Fast path: interior block, no padding.
+                                // The fixed 4×4×4 loop lets LLVM fully unroll
+                                // and skip the ~48 no-op `$pad_s` dispatches
+                                // that the partial path emits per block.
+                                for z in 0..4 {
+                                    for y in 0..4 {
+                                        let row_off =
+                                            (((z0 + z) * n1 + (y0 + y)) * n0 + x0) * $esz;
+                                        let row = &data[row_off..row_off + 4 * $esz];
+                                        for x in 0..4 {
+                                            let buf: [u8; $esz] = row
+                                                [x * $esz..(x + 1) * $esz]
+                                                .try_into()
+                                                .unwrap();
+                                            block[16 * z + 4 * y + x] = $from_le(buf);
+                                        }
                                     }
-                                    $pad_s(block.as_mut_slice(), 16 * z + 4 * y, rx, 1);
                                 }
-                                for x in 0..4 {
-                                    $pad_s(block.as_mut_slice(), 16 * z + x, ry, 4);
+                            } else {
+                                // Partial block (edge): extract what's there and
+                                // pad the rest along each axis.
+                                for z in 0..rz {
+                                    for y in 0..ry {
+                                        let row_off =
+                                            (((z0 + z) * n1 + (y0 + y)) * n0 + x0) * $esz;
+                                        let row = &data[row_off..row_off + rx * $esz];
+                                        for x in 0..rx {
+                                            let buf: [u8; $esz] = row
+                                                [x * $esz..(x + 1) * $esz]
+                                                .try_into()
+                                                .unwrap();
+                                            block[16 * z + 4 * y + x] = $from_le(buf);
+                                        }
+                                        $pad_s(block.as_mut_slice(), 16 * z + 4 * y, rx, 1);
+                                    }
+                                    for x in 0..4 {
+                                        $pad_s(block.as_mut_slice(), 16 * z + x, ry, 4);
+                                    }
                                 }
-                            }
-                            for y in 0..4 {
-                                for x in 0..4 {
-                                    $pad_s(block.as_mut_slice(), 4 * y + x, rz, 16);
+                                for y in 0..4 {
+                                    for x in 0..4 {
+                                        $pad_s(block.as_mut_slice(), 4 * y + x, rz, 16);
+                                    }
                                 }
                             }
                             $enc3(&mut w, &block, maxbits);
@@ -1653,17 +1673,33 @@ macro_rules! impl_codec {
                             let rz = (n2 - z0).min(4);
                             let ry = (n1 - y0).min(4);
                             let rx = (n0 - x0).min(4);
-                            for z in 0..rz {
-                                for y in 0..ry {
-                                    // Mirror of the compress side: bounds-check the row
-                                    // once per (z, y) so the inner x loop writes to a
-                                    // bounded mutable row slice.
-                                    let row_off = (((z0 + z) * n1 + (y0 + y)) * n0 + x0) * $esz;
-                                    let row = &mut output[row_off..row_off + rx * $esz];
-                                    for x in 0..rx {
-                                        row[x * $esz..(x + 1) * $esz].copy_from_slice(
-                                            &block[16 * z + 4 * y + x].to_le_bytes(),
-                                        );
+                            if rz == 4 && ry == 4 && rx == 4 {
+                                // Fast path: interior block. Compile-time 4×4×4
+                                // lets LLVM unroll and vectorize the stores.
+                                for z in 0..4 {
+                                    for y in 0..4 {
+                                        let row_off =
+                                            (((z0 + z) * n1 + (y0 + y)) * n0 + x0) * $esz;
+                                        let row = &mut output[row_off..row_off + 4 * $esz];
+                                        for x in 0..4 {
+                                            row[x * $esz..(x + 1) * $esz].copy_from_slice(
+                                                &block[16 * z + 4 * y + x].to_le_bytes(),
+                                            );
+                                        }
+                                    }
+                                }
+                            } else {
+                                // Partial block (edge): write only what fits.
+                                for z in 0..rz {
+                                    for y in 0..ry {
+                                        let row_off =
+                                            (((z0 + z) * n1 + (y0 + y)) * n0 + x0) * $esz;
+                                        let row = &mut output[row_off..row_off + rx * $esz];
+                                        for x in 0..rx {
+                                            row[x * $esz..(x + 1) * $esz].copy_from_slice(
+                                                &block[16 * z + 4 * y + x].to_le_bytes(),
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -1701,55 +1737,88 @@ macro_rules! impl_codec {
                                 let ry = (n1 - y0).min(4);
                                 let rx = (n0 - x0).min(4);
                                 let mut block = [$zero_s; 256];
-                                for wi in 0..rw {
-                                    for z in 0..rz {
-                                        for y in 0..ry {
-                                            for x in 0..rx {
-                                                let src = (((w0 + wi) * n2 + (z0 + z)) * n1
+                                if rw == 4 && rz == 4 && ry == 4 && rx == 4 {
+                                    // Fast path: interior block, no padding.
+                                    // Fixed 4×4×4×4 lets LLVM unroll, and the
+                                    // row-slice hoist gives the inner x loop
+                                    // a bounded mutable slice.
+                                    for wi in 0..4 {
+                                        for z in 0..4 {
+                                            for y in 0..4 {
+                                                let row_off = ((((w0 + wi) * n2 + (z0 + z))
+                                                    * n1
                                                     + (y0 + y))
                                                     * n0
-                                                    + (x0 + x);
-                                                let off = src * $esz;
-                                                let mut buf = [0u8; $esz];
-                                                buf.copy_from_slice(&data[off..off + $esz]);
-                                                block[64 * wi + 16 * z + 4 * y + x] = $from_le(buf);
+                                                    + x0)
+                                                    * $esz;
+                                                let row =
+                                                    &data[row_off..row_off + 4 * $esz];
+                                                for x in 0..4 {
+                                                    let buf: [u8; $esz] = row
+                                                        [x * $esz..(x + 1) * $esz]
+                                                        .try_into()
+                                                        .unwrap();
+                                                    block[64 * wi + 16 * z + 4 * y + x] =
+                                                        $from_le(buf);
+                                                }
                                             }
-                                            $pad_s(
-                                                block.as_mut_slice(),
-                                                64 * wi + 16 * z + 4 * y,
-                                                rx,
-                                                1,
-                                            );
-                                        }
-                                        for x in 0..4 {
-                                            $pad_s(
-                                                block.as_mut_slice(),
-                                                64 * wi + 16 * z + x,
-                                                ry,
-                                                4,
-                                            );
                                         }
                                     }
-                                    for y in 0..4 {
-                                        for x in 0..4 {
-                                            $pad_s(
-                                                block.as_mut_slice(),
-                                                64 * wi + 4 * y + x,
-                                                rz,
-                                                16,
-                                            );
+                                } else {
+                                    for wi in 0..rw {
+                                        for z in 0..rz {
+                                            for y in 0..ry {
+                                                for x in 0..rx {
+                                                    let src = (((w0 + wi) * n2 + (z0 + z))
+                                                        * n1
+                                                        + (y0 + y))
+                                                        * n0
+                                                        + (x0 + x);
+                                                    let off = src * $esz;
+                                                    let mut buf = [0u8; $esz];
+                                                    buf.copy_from_slice(
+                                                        &data[off..off + $esz],
+                                                    );
+                                                    block[64 * wi + 16 * z + 4 * y + x] =
+                                                        $from_le(buf);
+                                                }
+                                                $pad_s(
+                                                    block.as_mut_slice(),
+                                                    64 * wi + 16 * z + 4 * y,
+                                                    rx,
+                                                    1,
+                                                );
+                                            }
+                                            for x in 0..4 {
+                                                $pad_s(
+                                                    block.as_mut_slice(),
+                                                    64 * wi + 16 * z + x,
+                                                    ry,
+                                                    4,
+                                                );
+                                            }
+                                        }
+                                        for y in 0..4 {
+                                            for x in 0..4 {
+                                                $pad_s(
+                                                    block.as_mut_slice(),
+                                                    64 * wi + 4 * y + x,
+                                                    rz,
+                                                    16,
+                                                );
+                                            }
                                         }
                                     }
-                                }
-                                for z in 0..4 {
-                                    for y in 0..4 {
-                                        for x in 0..4 {
-                                            $pad_s(
-                                                block.as_mut_slice(),
-                                                16 * z + 4 * y + x,
-                                                rw,
-                                                64,
-                                            );
+                                    for z in 0..4 {
+                                        for y in 0..4 {
+                                            for x in 0..4 {
+                                                $pad_s(
+                                                    block.as_mut_slice(),
+                                                    16 * z + 4 * y + x,
+                                                    rw,
+                                                    64,
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -1791,19 +1860,51 @@ macro_rules! impl_codec {
                                 let rz = (n2 - z0).min(4);
                                 let ry = (n1 - y0).min(4);
                                 let rx = (n0 - x0).min(4);
-                                for wi in 0..rw {
-                                    for z in 0..rz {
-                                        for y in 0..ry {
-                                            for x in 0..rx {
-                                                let dst = (((w0 + wi) * n2 + (z0 + z)) * n1
+                                if rw == 4 && rz == 4 && ry == 4 && rx == 4 {
+                                    // Fast path: interior block. 4×4×4×4 literal
+                                    // bounds plus a hoisted row slice lets LLVM
+                                    // unroll and vectorize.
+                                    for wi in 0..4 {
+                                        for z in 0..4 {
+                                            for y in 0..4 {
+                                                let row_off = ((((w0 + wi) * n2 + (z0 + z))
+                                                    * n1
                                                     + (y0 + y))
                                                     * n0
-                                                    + (x0 + x);
-                                                let off = dst * $esz;
-                                                output[off..off + $esz].copy_from_slice(
-                                                    &block[64 * wi + 16 * z + 4 * y + x]
-                                                        .to_le_bytes(),
-                                                );
+                                                    + x0)
+                                                    * $esz;
+                                                let row = &mut output
+                                                    [row_off..row_off + 4 * $esz];
+                                                for x in 0..4 {
+                                                    row[x * $esz..(x + 1) * $esz]
+                                                        .copy_from_slice(
+                                                            &block[64 * wi
+                                                                + 16 * z
+                                                                + 4 * y
+                                                                + x]
+                                                                .to_le_bytes(),
+                                                        );
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    for wi in 0..rw {
+                                        for z in 0..rz {
+                                            for y in 0..ry {
+                                                for x in 0..rx {
+                                                    let dst = (((w0 + wi) * n2 + (z0 + z))
+                                                        * n1
+                                                        + (y0 + y))
+                                                        * n0
+                                                        + (x0 + x);
+                                                    let off = dst * $esz;
+                                                    output[off..off + $esz].copy_from_slice(
+                                                        &block
+                                                            [64 * wi + 16 * z + 4 * y + x]
+                                                            .to_le_bytes(),
+                                                    );
+                                                }
                                             }
                                         }
                                     }
