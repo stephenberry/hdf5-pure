@@ -6,6 +6,10 @@ license = "MIT"
 description = "Pure-Rust HDF5 writer library (WASM-compatible, no C dependencies)"
 repository = "https://github.com/stephenberry/hdf5-pure"
 build = "build.rs"
+# Keep binary test fixtures out of the published crate. They are needed only
+# for maintainer CI (byte-level crosscheck against reference HDF5 / H5Z-ZFP
+# fixtures) and stay in the git repo for that purpose.
+exclude = ["tests/fixtures/**"]
 
 [features]
 default = ["std", "checksum", "deflate"]
