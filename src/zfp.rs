@@ -35,6 +35,15 @@
 //!
 //! The bit stream uses 64-bit words in **little-endian** byte order with bits
 //! packed LSB-first within each word.
+//!
+//! # NaN / Infinity
+//!
+//! The block-floating-point cast reads each value's `frexp` exponent, which
+//! has no meaningful value for NaN or ±Inf inputs. The reference ZFP codec
+//! also leaves this unspecified in fixed-rate mode. Our output for such
+//! inputs is bit-identical to the reference (same cast / same headers), but
+//! the decoded values are **undefined**: feed only finite floats if you
+//! care about round-trip fidelity.
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
