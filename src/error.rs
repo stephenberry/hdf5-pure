@@ -171,6 +171,8 @@ pub enum FormatError {
     NestingDepthExceeded,
     /// Duplicate dataset name detected during parallel metadata merge.
     DuplicateDatasetName(String),
+    /// ZFP filter configuration is invalid (e.g. missing element type, rank out of range).
+    UnsupportedZfp(String),
 }
 
 impl fmt::Display for FormatError {
@@ -376,6 +378,9 @@ impl fmt::Display for FormatError {
             }
             FormatError::DuplicateDatasetName(name) => {
                 write!(f, "duplicate dataset name during parallel merge: {name}")
+            }
+            FormatError::UnsupportedZfp(msg) => {
+                write!(f, "unsupported ZFP configuration: {msg}")
             }
         }
     }

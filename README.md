@@ -110,6 +110,30 @@ builder.create_dataset("shuffled")
     .with_deflate(6);
 ```
 
+### ZFP (optional, `zfp` feature)
+
+Pure-Rust fixed-rate port of the LLNL/zfp codec, registered HDF5 filter
+ID 32013. Byte-for-byte interoperable with the reference H5Z-ZFP plugin:
+files we write are readable by `h5py` + `hdf5plugin`, and files those tools
+produce are readable by us. Supported slice:
+
+- Scalar types: `f32`, `f64`, `i32`, `i64`
+- Ranks: 1D, 2D, 3D, 4D (per-block sizes 4, 16, 64, 256)
+- Mode: fixed-rate (`rate` bits per value)
+
+```rust
+// Compile with `--features zfp`
+builder.create_dataset("temperature")
+    .with_f32_data(&data)
+    .with_shape(&[ny, nx])
+    .with_chunks(&[ny, nx])
+    .with_zfp(16.0);  // 16 bits per value
+```
+
+Interop is enforced by `tests/zfp_crosscheck.rs`, which compares against
+fixtures produced by `h5py` + `hdf5plugin`. See `tests/fixtures/zfp/regen.py`
+for the generator — run it after any codec change.
+
 ## Userblock (MATLAB v7.3)
 
 ```rust
@@ -209,6 +233,7 @@ objects (`classdef`), datetime / categorical types.
 | `mmap` | no | Memory-mapped file reading via `memmap2` |
 | `parallel` | no | Parallel chunk processing via `rayon` |
 | `provenance` | no | SHA-256 data provenance tracking |
+| `zfp` | no | ZFP fixed-rate compression (HDF5 filter 32013), f32/f64/i32/i64 × 1D–4D |
 
 For WASM, disable default features:
 

@@ -12,7 +12,7 @@ use crate::dataspace::Dataspace;
 use crate::datatype::Datatype;
 use crate::error::FormatError;
 use crate::filter_pipeline::FilterPipeline;
-use crate::filters::decompress_chunk;
+use crate::filters::{decompress_chunk, ChunkContext};
 use crate::extensible_array::{ExtensibleArrayHeader, read_extensible_array_chunks};
 use crate::fixed_array::{FixedArrayHeader, read_fixed_array_chunks};
 
@@ -29,8 +29,7 @@ fn decompress_all_chunks(
     file_data: &[u8],
     chunks: &[ChunkInfo],
     pipeline: Option<&FilterPipeline>,
-    chunk_total_bytes: usize,
-    element_size: u32,
+    ctx: ChunkContext<'_>,
 ) -> Result<Vec<CacheAlignedBuffer>, FormatError> {
     #[cfg(feature = "parallel")]
     {
@@ -45,8 +44,7 @@ fn decompress_all_chunks(
                     file_data,
                     chunks,
                     pl,
-                    chunk_total_bytes,
-                    element_size,
+                    ctx,
                     seed,
                     None, // auto-detect lane count
                 )?;
@@ -70,7 +68,7 @@ fn decompress_all_chunks(
 
         let decompressed = if let Some(pl) = pipeline {
             if chunk_info.filter_mask == 0 {
-                decompress_chunk(raw_chunk, pl, chunk_total_bytes, element_size)?
+                decompress_chunk(raw_chunk, pl, ctx)?
             } else {
                 raw_chunk.to_vec()
             }
@@ -92,19 +90,12 @@ pub fn decompress_all_chunks_with_stats(
     file_data: &[u8],
     chunks: &[ChunkInfo],
     pipeline: &FilterPipeline,
-    chunk_total_bytes: usize,
-    element_size: u32,
+    ctx: ChunkContext<'_>,
     seed: u64,
     num_lanes: Option<usize>,
 ) -> Result<(Vec<Vec<u8>>, PartitionStats), FormatError> {
     parallel_read::decompress_chunks_lane_partitioned(
-        file_data,
-        chunks,
-        pipeline,
-        chunk_total_bytes,
-        element_size,
-        seed,
-        num_lanes,
+        file_data, chunks, pipeline, ctx, seed, num_lanes,
     )
 }
 
@@ -425,16 +416,14 @@ pub fn read_chunked_data(
         chunk_strides[i] = chunk_strides[i + 1] * chunk_dims[i + 1];
     }
 
-    let chunk_total_elements: usize = chunk_dims.iter().product();
-    let chunk_total_bytes = chunk_total_elements * elem_size;
-
     // Decompress all chunks (parallel when beneficial, sequential otherwise)
+    let chunk_dims_u64: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
+    let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype);
     let decompressed_chunks = decompress_all_chunks(
         file_data,
         &chunks,
         pipeline,
-        chunk_total_bytes,
-        elem_size as u32,
+        ctx,
     )?;
 
     for (chunk_info, decompressed) in chunks.iter().zip(decompressed_chunks.iter()) {
@@ -584,8 +573,8 @@ pub fn read_chunked_data_cached(
         chunk_strides[i] = chunk_strides[i + 1] * chunk_dims[i + 1];
     }
 
-    let chunk_total_elements: usize = chunk_dims.iter().product();
-    let chunk_total_bytes = chunk_total_elements * elem_size;
+    let chunk_dims_u64: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
+    let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype);
 
     for chunk_info in &chunks {
         let coord: Vec<u64> = chunk_info.offsets.iter().take(rank).copied().collect();
@@ -606,7 +595,7 @@ pub fn read_chunked_data_cached(
             let raw_chunk = &file_data[c_addr..c_addr + size];
             let dec = if let Some(pl) = pipeline {
                 if chunk_info.filter_mask == 0 {
-                    decompress_chunk(raw_chunk, pl, chunk_total_bytes, elem_size as u32)?
+                    decompress_chunk(raw_chunk, pl, ctx)?
                 } else {
                     raw_chunk.to_vec()
                 }
@@ -901,8 +890,8 @@ pub fn read_chunked_data_sweep(
         chunk_strides[i] = chunk_strides[i + 1] * chunk_dims[i + 1];
     }
 
-    let chunk_total_elements: usize = chunk_dims.iter().product();
-    let chunk_total_bytes = chunk_total_elements * elem_size;
+    let chunk_dims_u64: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
+    let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype);
 
     for chunk_info in &chunks {
         let coord: Vec<u64> = chunk_info.offsets.iter().take(rank).copied().collect();
@@ -932,7 +921,7 @@ pub fn read_chunked_data_sweep(
             let raw_chunk = &file_data[c_addr..c_addr + size];
             let dec = if let Some(pl) = pipeline {
                 if chunk_info.filter_mask == 0 {
-                    decompress_chunk(raw_chunk, pl, chunk_total_bytes, elem_size as u32)?
+                    decompress_chunk(raw_chunk, pl, ctx)?
                 } else {
                     raw_chunk.to_vec()
                 }
@@ -1326,7 +1315,12 @@ mod tests {
             for i in start..start + chunk_elems {
                 chunk_bytes.extend_from_slice(&values[i].to_le_bytes());
             }
-            let compressed = compress_chunk(&chunk_bytes, &pipeline, elem_size as u32).unwrap();
+            let dims_u64 = [chunk_elems as u64];
+            let ctx = crate::filters::ChunkContext::basic(
+                &dims_u64,
+                elem_size as u32,
+            );
+            let compressed = compress_chunk(&chunk_bytes, &pipeline, ctx).unwrap();
 
             file_data[data_offset..data_offset + compressed.len()]
                 .copy_from_slice(&compressed);

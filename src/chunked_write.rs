@@ -12,7 +12,9 @@ use crate::error::FormatError;
 use crate::filter_pipeline::{
     FilterDescription, FilterPipeline, FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SHUFFLE,
 };
-use crate::filters::compress_chunk;
+#[cfg(feature = "zfp")]
+use crate::filter_pipeline::FILTER_ZFP;
+use crate::filters::{compress_chunk, ChunkContext, ZfpElementTypeWhenEnabled};
 
 /// Round a file offset up to the next cache-line boundary.
 ///
@@ -35,6 +37,10 @@ pub struct ChunkOptions {
     pub shuffle: bool,
     /// Whether to apply fletcher32 checksum.
     pub fletcher32: bool,
+    /// ZFP fixed-rate compression (bits per value), None = no ZFP.
+    /// When set, takes priority over shuffle + deflate.
+    #[cfg(feature = "zfp")]
+    pub zfp_rate: Option<f64>,
 }
 
 impl ChunkOptions {
@@ -44,13 +50,64 @@ impl ChunkOptions {
             || self.deflate_level.is_some()
             || self.shuffle
             || self.fletcher32
+            || self.zfp_enabled()
+    }
+
+    #[cfg(feature = "zfp")]
+    #[inline]
+    fn zfp_enabled(&self) -> bool {
+        self.zfp_rate.is_some()
+    }
+
+    #[cfg(not(feature = "zfp"))]
+    #[inline]
+    fn zfp_enabled(&self) -> bool {
+        false
     }
 
     /// Build a FilterPipeline from the options.
-    pub fn build_pipeline(&self, element_size: u32) -> Option<FilterPipeline> {
+    ///
+    /// `chunk_dims` and `zfp_element_type` are only consulted when the ZFP
+    /// filter is active — they're embedded into the ZFP cd_values so the
+    /// resulting file is readable by the reference H5Z-ZFP plugin.
+    ///
+    /// Returns [`FormatError::UnsupportedZfp`] when ZFP was requested but
+    /// `zfp_element_type` is `None` (e.g. the dataset's datatype isn't one of
+    /// f32/f64/i32/i64), or the chunk rank is outside 1..=4.
+    pub fn build_pipeline(
+        &self,
+        element_size: u32,
+        chunk_dims: &[u64],
+        zfp_element_type: Option<ZfpElementTypeWhenEnabled>,
+    ) -> Result<Option<FilterPipeline>, FormatError> {
         let mut filters = Vec::new();
+        let _ = chunk_dims; // used only under the `zfp` feature below
+        let _ = zfp_element_type; // used only under the `zfp` feature below
 
-        if self.shuffle {
+        // ZFP is a standalone compressor — it replaces shuffle + deflate.
+        #[cfg(feature = "zfp")]
+        let zfp_active = if let Some(rate) = self.zfp_rate {
+            let elem_ty = zfp_element_type.ok_or_else(|| {
+                FormatError::UnsupportedZfp(
+                    "ZFP compression requires the dataset's datatype to be one \
+                     of f32, f64, i32, or i64"
+                        .into(),
+                )
+            })?;
+            filters.push(FilterDescription {
+                filter_id: FILTER_ZFP,
+                name: Some("zfp".into()),
+                flags: 0,
+                client_data: crate::zfp::zfp_cd_values_rate(rate, elem_ty, chunk_dims)?,
+            });
+            true
+        } else {
+            false
+        };
+        #[cfg(not(feature = "zfp"))]
+        let zfp_active = false;
+
+        if !zfp_active && self.shuffle {
             filters.push(FilterDescription {
                 filter_id: FILTER_SHUFFLE,
                 name: None,
@@ -59,7 +116,9 @@ impl ChunkOptions {
             });
         }
 
-        if let Some(level) = self.deflate_level {
+        if !zfp_active
+            && let Some(level) = self.deflate_level
+        {
             filters.push(FilterDescription {
                 filter_id: FILTER_DEFLATE,
                 name: None,
@@ -81,12 +140,12 @@ impl ChunkOptions {
         // for read compatibility.
 
         if filters.is_empty() {
-            None
+            Ok(None)
         } else {
-            Some(FilterPipeline {
+            Ok(Some(FilterPipeline {
                 version: 2,
                 filters,
-            })
+            }))
         }
     }
 
@@ -856,28 +915,36 @@ fn write_undefined_element(
 
 /// Build chunked data with absolute addresses.
 /// If `maxshape` has unlimited dims, uses Extensible Array index.
+///
+/// `ctx` carries chunk_dims, element_size, and (for type-aware filters like
+/// ZFP) the scalar element type. Build it via [`ChunkContext::from_datatype`]
+/// when a `Datatype` is in scope.
 pub fn build_chunked_data_at(
     raw_data: &[u8],
     shape: &[u64],
-    chunk_dims: &[u64],
-    element_size: usize,
+    ctx: ChunkContext<'_>,
     options: &ChunkOptions,
     base_address: u64,
 ) -> Result<ChunkedDataResult, FormatError> {
-    build_chunked_data_at_ext(raw_data, shape, chunk_dims, element_size, options, base_address, None)
+    build_chunked_data_at_ext(raw_data, shape, ctx, options, base_address, None)
 }
 
 /// Build chunked data with absolute addresses and optional maxshape.
+///
+/// `ctx` carries chunk_dims, element_size, and (for type-aware filters like
+/// ZFP) the scalar element type. Build it via [`ChunkContext::from_datatype`]
+/// when a `Datatype` is in scope.
 pub fn build_chunked_data_at_ext(
     raw_data: &[u8],
     shape: &[u64],
-    chunk_dims: &[u64],
-    element_size: usize,
+    ctx: ChunkContext<'_>,
     options: &ChunkOptions,
     base_address: u64,
     maxshape: Option<&[u64]>,
 ) -> Result<ChunkedDataResult, FormatError> {
-    let pipeline = options.build_pipeline(element_size as u32);
+    let chunk_dims = ctx.chunk_dims;
+    let element_size = ctx.element_size as usize;
+    let pipeline = options.build_pipeline(ctx.element_size, chunk_dims, ctx.element_type)?;
 
     let chunks = split_into_chunks(raw_data, shape, chunk_dims, element_size);
     let num_chunks = chunks.len();
@@ -889,7 +956,7 @@ pub fn build_chunked_data_at_ext(
 
     for (_offsets, chunk_bytes) in &chunks {
         let compressed = if let Some(ref pl) = pipeline {
-            compress_chunk(chunk_bytes, pl, element_size as u32)?
+            compress_chunk(chunk_bytes, pl, ctx)?
         } else {
             chunk_bytes.clone()
         };
@@ -1037,8 +1104,9 @@ mod tests {
     ) -> Vec<f64> {
         let raw = f64_to_bytes(values);
         let base_address = 0x1000u64;
+        let ctx = ChunkContext::basic(chunk_dims, 8);
         let result =
-            build_chunked_data_at(&raw, shape, chunk_dims, 8, options, base_address).unwrap();
+            build_chunked_data_at(&raw, shape, ctx, options, base_address).unwrap();
 
         // Build a fake file buffer
         let file_size = base_address as usize + result.data_bytes.len();
@@ -1214,8 +1282,10 @@ mod tests {
             chunk_dims: Some(vec![20]),
             ..Default::default()
         };
+        let dims = [20u64];
+        let ctx = ChunkContext::basic(&dims, 8);
         let result =
-            build_chunked_data_at(&raw, &[100], &[20], 8, &options, base_address).unwrap();
+            build_chunked_data_at(&raw, &[100], ctx, &options, base_address).unwrap();
 
         // Parse layout to get chunk addresses (via roundtrip read)
         let file_size = base_address as usize + result.data_bytes.len();
@@ -1255,7 +1325,7 @@ mod tests {
             deflate_level: Some(6),
             ..Default::default()
         };
-        let pl = options.build_pipeline(8).unwrap();
+        let pl = options.build_pipeline(8, &[], None).unwrap().unwrap();
         assert_eq!(pl.filters.len(), 1);
         assert_eq!(pl.filters[0].filter_id, FILTER_DEFLATE);
     }
@@ -1268,7 +1338,7 @@ mod tests {
             fletcher32: true,
             ..Default::default()
         };
-        let pl = options.build_pipeline(8).unwrap();
+        let pl = options.build_pipeline(8, &[], None).unwrap().unwrap();
         assert_eq!(pl.filters.len(), 3);
         assert_eq!(pl.filters[0].filter_id, FILTER_SHUFFLE);
         assert_eq!(pl.filters[1].filter_id, FILTER_DEFLATE);
@@ -1422,8 +1492,9 @@ mod tests {
             chunk_dims: Some(chunk_dims.to_vec()),
             ..Default::default()
         };
+        let ctx = ChunkContext::basic(chunk_dims, 8);
         let result = build_chunked_data_at_ext(
-            &raw, shape, chunk_dims, 8, &options, base_address, Some(maxshape),
+            &raw, shape, ctx, &options, base_address, Some(maxshape),
         )
         .unwrap();
 

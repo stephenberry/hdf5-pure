@@ -75,6 +75,8 @@ pub mod signature;
 pub mod superblock;
 pub mod symbol_table;
 pub mod vl_data;
+#[cfg(feature = "zfp")]
+pub mod zfp;
 
 #[cfg(feature = "provenance")]
 pub mod provenance;

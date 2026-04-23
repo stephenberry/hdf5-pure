@@ -867,6 +867,28 @@ impl DatasetBuilder {
         self
     }
 
+    /// Enable ZFP fixed-rate compression (implies chunked if not already set).
+    ///
+    /// `rate` is the number of compressed bits per value. Supports f32, f64,
+    /// i32, and i64 datasets in 1D–4D. When ZFP is active it replaces shuffle
+    /// and deflate on the same dataset.
+    ///
+    /// The scalar type is derived from the dataset's datatype when the file
+    /// is written, so any of `with_{f32,f64,i32,i64}_data` or an explicit
+    /// `with_dtype` establishes it. `finish()` / `write()` returns
+    /// [`FormatError::UnsupportedZfp`](crate::FormatError::UnsupportedZfp) if
+    /// the dataset's datatype isn't one of the four supported scalar types,
+    /// or if the chunk rank is outside 1..=4.
+    ///
+    /// The resulting file is byte-compatible with the reference H5Z-ZFP
+    /// plugin (HDF5 filter ID 32013): other tools like h5py + hdf5plugin
+    /// will read and decompress it, and vice versa.
+    #[cfg(feature = "zfp")]
+    pub fn with_zfp(&mut self, rate: f64) -> &mut Self {
+        self.chunk_options.zfp_rate = Some(rate);
+        self
+    }
+
     /// Attach SHINES provenance metadata (SHA-256, creator, timestamp).
     ///
     /// The SHA-256 hash of the raw dataset bytes is computed automatically

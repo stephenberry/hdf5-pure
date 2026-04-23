@@ -565,8 +565,8 @@ impl FileWriter {
         for (i, d) in all_ds.iter().enumerate() {
             if is_chunked[i] {
                 let chunk_dims = d.chunk_options.resolve_chunk_dims(&d.ds.dimensions);
-                let elem_size = d.dt.type_size() as usize;
-                let result = build_chunked_data_at_ext(&d.raw, &d.ds.dimensions, &chunk_dims, elem_size, &d.chunk_options, dummy_cursor, d.maxshape.as_deref())?;
+                let ctx = crate::filters::ChunkContext::from_datatype(&chunk_dims, &d.dt);
+                let result = build_chunked_data_at_ext(&d.raw, &d.ds.dimensions, ctx, &d.chunk_options, dummy_cursor, d.maxshape.as_deref())?;
                 dummy_cursor += result.data_bytes.len() as u64;
                 let dense_blob = if ds_dense[i] { Some(build_dense_attrs(&d.attrs, 0)) } else { None };
                 let oh = build_chunked_dataset_oh(&d.dt, &d.ds, &result.layout_message, result.pipeline_message.as_deref(), &d.attrs, dense_blob.as_ref());
@@ -682,9 +682,9 @@ impl FileWriter {
         for (i, d) in all_ds.iter().enumerate() {
             if is_chunked[i] {
                 let chunk_dims = d.chunk_options.resolve_chunk_dims(&d.ds.dimensions);
-                let elem_size = d.dt.type_size() as usize;
                 let base_address = cursor2 as u64;
-                let result = build_chunked_data_at_ext(&d.raw, &d.ds.dimensions, &chunk_dims, elem_size, &d.chunk_options, base_address, d.maxshape.as_deref())?;
+                let ctx = crate::filters::ChunkContext::from_datatype(&chunk_dims, &d.dt);
+                let result = build_chunked_data_at_ext(&d.raw, &d.ds.dimensions, ctx, &d.chunk_options, base_address, d.maxshape.as_deref())?;
                 cursor2 += result.data_bytes.len();
                 ds_layouts.push(DsLayout {
                     data: result.data_bytes, data_addr: base_address,
