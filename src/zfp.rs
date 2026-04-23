@@ -1336,9 +1336,6 @@ fn skip_bits(r: &mut BitReader<'_>, n: usize) {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// ZFP compression mode stored in cd\_values\[0\].
-const ZFP_MODE_RATE: u32 = 1;
-
 #[inline]
 fn f32_from_le(b: [u8; 4]) -> f32 {
     f32::from_le_bytes(b)
@@ -1792,38 +1789,254 @@ pub use codec_f64::{compress as compress_f64, decompress as decompress_f64};
 pub use codec_i32::{compress as compress_i32, decompress as decompress_i32};
 pub use codec_i64::{compress as compress_i64, decompress as decompress_i64};
 
-/// Build ZFP cd\_values for HDF5 filter metadata (fixed-rate mode).
-///
-/// Returns a `Vec<u32>` suitable for use as `FilterDescription::client_data`.
-/// Format: `[mode, rate_hi, rate_lo, type, 0, 0]` where rate is stored as
-/// the two u32 halves of an f64.
-pub fn zfp_cd_values_rate(rate: f64) -> Vec<u32> {
-    let rate_bits = rate.to_bits();
-    let rate_lo = rate_bits as u32;
-    let rate_hi = (rate_bits >> 32) as u32;
-    // cd_values format per H5Z-ZFP:
-    // [0] = mode (1=rate)
-    // [1] = high 32 bits of rate (as f64)
-    // [2] = low 32 bits of rate (as f64)
-    // [3] = type (0=f32 unused in our case, but kept for compat)
-    // [4] = 0 (unused)
-    // [5] = 0 (unused)
-    vec![ZFP_MODE_RATE, rate_hi, rate_lo, 0, 0, 0]
+// ---------------------------------------------------------------------------
+// HDF5 filter cd_values encoding, matching the H5Z-ZFP plugin layout so that
+// files we write are readable by the reference plugin (and vice versa).
+//
+// Layout as produced by `H5Z_zfp_set_local` in `H5Zzfp.c`:
+//   cd_values[0] : version word
+//                  (ZFP_VERSION_NO<<16) | (ZFP_CODEC<<12) | H5Z_FILTER_ZFP_VERSION_NO
+//   cd_values[1..] : a ZFP native header, written bit-by-bit into the u32
+//                    slots as a little-endian bit stream. The header is:
+//                      * 32-bit magic: 'z', 'f', 'p', ZFP_CODEC  (LSB first)
+//                      * 52-bit meta : type + rank + per-axis sizes (see
+//                        `zfp_field_metadata` in src/zfp.c). The low 2 bits
+//                        are `type - 1`, next 2 are `rank - 1`, the rest
+//                        hold size-1 per axis (48/24/16/12 bits each for
+//                        rank 1/2/3/4).
+//                      * 12-bit mode : for rate-mode with maxbits ≤ 2048,
+//                        `mode = maxbits - 1` (short form).
+// ---------------------------------------------------------------------------
+
+const ZFP_VERSION_NO: u32 = 0x1010; // ZFP 1.0.1.0
+const ZFP_CODEC: u32 = 5;
+const H5Z_FILTER_ZFP_VERSION_NO: u32 = 0x111; // H5Z-ZFP 1.1.1
+
+/// Encode meta (52 bits) per `zfp_field_metadata`. `dims` is row-major
+/// (outer→inner). Returns a u64 whose low 52 bits are the meta value.
+fn zfp_meta_for(elem: ZfpElementType, dims: &[usize]) -> u64 {
+    // zfp_type: int32=1, int64=2, float=3, double=4
+    let zt: u64 = match elem {
+        ZfpElementType::I32 => 1,
+        ZfpElementType::I64 => 2,
+        ZfpElementType::F32 => 3,
+        ZfpElementType::F64 => 4,
+    };
+    let rank = dims.len();
+    let mut meta: u64 = 0;
+    // Build via shift-and-add in the same order the reference does:
+    // first the sizes in reverse row-major (nx last -> nw/nz/ny/nx), then
+    // rank-1, then type-1. Because we shift left before adding, the final
+    // low bits are type-1, then rank-1, then nx-1, etc. — matching what
+    // the reference stream reads LSB-first.
+    match rank {
+        1 => {
+            let nx = dims[0] as u64 - 1;
+            meta = (meta << 48) + nx;
+        }
+        2 => {
+            // C does: <<24 ny-1, <<24 nx-1. That yields nx-1 at lower bits,
+            // ny-1 at upper. Row-major `dims = [ny, nx]` so dims[0]=ny.
+            let ny = dims[0] as u64 - 1;
+            let nx = dims[1] as u64 - 1;
+            meta = (meta << 24) + ny;
+            meta = (meta << 24) + nx;
+        }
+        3 => {
+            // C: <<16 nz, <<16 ny, <<16 nx
+            let nz = dims[0] as u64 - 1;
+            let ny = dims[1] as u64 - 1;
+            let nx = dims[2] as u64 - 1;
+            meta = (meta << 16) + nz;
+            meta = (meta << 16) + ny;
+            meta = (meta << 16) + nx;
+        }
+        4 => {
+            // C: <<12 nw, <<12 nz, <<12 ny, <<12 nx
+            let nw = dims[0] as u64 - 1;
+            let nz = dims[1] as u64 - 1;
+            let ny = dims[2] as u64 - 1;
+            let nx = dims[3] as u64 - 1;
+            meta = (meta << 12) + nw;
+            meta = (meta << 12) + nz;
+            meta = (meta << 12) + ny;
+            meta = (meta << 12) + nx;
+        }
+        _ => {}
+    }
+    meta = (meta << 2) + rank as u64 - 1;
+    meta = (meta << 2) + zt - 1;
+    meta
 }
 
-/// Extract the rate from ZFP cd\_values (fixed-rate mode).
-///
-/// Returns `Some(rate)` if the cd\_values represent fixed-rate mode, `None`
-/// otherwise.
+/// Build ZFP `cd_values` for an HDF5 ZFP filter in fixed-rate mode. Matches
+/// the layout written by H5Z-ZFP's `set_local`, so the resulting file is
+/// readable by the reference plugin.
+pub fn zfp_cd_values_rate(
+    rate: f64,
+    element_type: ZfpElementType,
+    chunk_dims: &[u64],
+) -> Vec<u32> {
+    assert!(
+        matches!(chunk_dims.len(), 1..=4),
+        "ZFP cd_values only supports 1D-4D chunks",
+    );
+    let dims_usize: Vec<usize> = chunk_dims.iter().map(|&d| d as usize).collect();
+    let rank = dims_usize.len();
+    let block_values: usize = 4usize.pow(rank as u32);
+    let maxbits = (rate * block_values as f64) as u64;
+    // Encode header bits into a buffer.
+    let mut w = BitWriter::new();
+    w.write(8, u64::from(b'z'));
+    w.write(8, u64::from(b'f'));
+    w.write(8, u64::from(b'p'));
+    w.write(8, u64::from(ZFP_CODEC as u8));
+    w.write(52, zfp_meta_for(element_type, &dims_usize));
+    // Rate-mode short form: mode = maxbits - 1 for maxbits ≤ 2048.
+    // Our rate × 4^rank is well inside that range for supported inputs.
+    // Mode (12 bits short / 64 bits long). `zfp_stream_mode` short form for
+    // fixed-rate is `maxbits - 1` when maxbits ≤ 2048; otherwise encode each
+    // stream parameter separately in 64 bits (low 12 = 0xFFF sentinel).
+    let header_bits: usize = if maxbits <= 2048 {
+        let mode = maxbits.saturating_sub(1);
+        w.write(12, mode);
+        32 + 52 + 12
+    } else {
+        // Long form matches zfp::zfp_stream_mode for the fixed-rate
+        // configuration produced by `zfp_stream_set_rate`:
+        //   minbits = maxbits (+ `bits` floor for floats)
+        //   maxprec = ZFP_MAX_PREC = 64
+        //   minexp  = ZFP_MIN_EXP  = -1074
+        let minbits = maxbits;
+        let maxprec: u64 = 63; // ZFP_MAX_PREC - 1
+        let minexp_enc: u64 = (-1074i64 + 16495) as u64; // 15421, fits in 15 bits
+        let mut mode: u64 = 0;
+        mode = (mode << 15) + minexp_enc;
+        mode = (mode << 7) + maxprec;
+        mode = (mode << 15) + (maxbits - 1);
+        mode = (mode << 15) + (minbits - 1);
+        mode = (mode << 12) + 0xFFF;
+        // Write 64 bits of mode, LSB-first (write() masks to n bits).
+        w.write(64, mode);
+        32 + 52 + 64
+    };
+    let mut bytes = w.finish();
+    // The BitWriter flushes 64-bit words; trim to the exact bit budget so
+    // the resulting cd_values match what H5Z-ZFP writes.
+    bytes.truncate(header_bits.div_ceil(8));
+    // Pack the byte stream into u32 little-endian slots.
+    let mut cd: Vec<u32> = Vec::with_capacity(1 + bytes.len().div_ceil(4));
+    let v0 = (ZFP_VERSION_NO << 16) | (ZFP_CODEC << 12) | H5Z_FILTER_ZFP_VERSION_NO;
+    cd.push(v0);
+    for chunk in bytes.chunks(4) {
+        let mut buf = [0u8; 4];
+        buf[..chunk.len()].copy_from_slice(chunk);
+        cd.push(u32::from_le_bytes(buf));
+    }
+    cd
+}
+
+/// Parsed ZFP filter metadata extracted from `cd_values`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ZfpFilterMeta {
+    pub element_type: ZfpElementType,
+    pub dims: Vec<u64>,
+    pub rate: f64,
+}
+
+/// Parse `cd_values` written by H5Z-ZFP's `set_local` callback and extract
+/// the scalar type, chunk dims, and rate. Returns `None` if the layout or
+/// mode is something we don't support (e.g. precision / accuracy / expert
+/// modes, or the long mode form).
+pub fn zfp_filter_meta_from_cd_values(cd_values: &[u32]) -> Option<ZfpFilterMeta> {
+    if cd_values.len() < 4 {
+        return None;
+    }
+    // cd_values[0] is the version word; we trust it shape-wise.
+    // Treat cd_values[1..] as a little-endian byte stream.
+    let mut bytes: Vec<u8> = Vec::with_capacity((cd_values.len() - 1) * 4);
+    for &w in &cd_values[1..] {
+        bytes.extend_from_slice(&w.to_le_bytes());
+    }
+    let mut r = BitReader::new(&bytes);
+    // Magic (32 bits): 'z', 'f', 'p', codec.
+    if r.read(8) != u64::from(b'z')
+        || r.read(8) != u64::from(b'f')
+        || r.read(8) != u64::from(b'p')
+    {
+        return None;
+    }
+    let _codec = r.read(8); // accept any codec version
+    // Meta (52 bits).
+    let meta = r.read(52);
+    let zt = (meta & 0x3) + 1; // 1..=4
+    let rank = ((meta >> 2) & 0x3) + 1; // 1..=4
+    let element_type = match zt {
+        1 => ZfpElementType::I32,
+        2 => ZfpElementType::I64,
+        3 => ZfpElementType::F32,
+        4 => ZfpElementType::F64,
+        _ => return None,
+    };
+    // Extract dim sizes per rank (reverse of the encoder).
+    let mut dims: Vec<u64> = match rank {
+        1 => {
+            let n = (meta >> 4) & ((1u64 << 48) - 1);
+            vec![n + 1]
+        }
+        2 => {
+            let nx = (meta >> 4) & ((1u64 << 24) - 1);
+            let ny = (meta >> 28) & ((1u64 << 24) - 1);
+            vec![ny + 1, nx + 1]
+        }
+        3 => {
+            let nx = (meta >> 4) & ((1u64 << 16) - 1);
+            let ny = (meta >> 20) & ((1u64 << 16) - 1);
+            let nz = (meta >> 36) & ((1u64 << 16) - 1);
+            vec![nz + 1, ny + 1, nx + 1]
+        }
+        4 => {
+            let nx = (meta >> 4) & ((1u64 << 12) - 1);
+            let ny = (meta >> 16) & ((1u64 << 12) - 1);
+            let nz = (meta >> 28) & ((1u64 << 12) - 1);
+            let nw = (meta >> 40) & ((1u64 << 12) - 1);
+            vec![nw + 1, nz + 1, ny + 1, nx + 1]
+        }
+        _ => return None,
+    };
+    // Mode: 12 bits short, extended to 64 if the 12-bit short is 0xFFF.
+    let mode_short = r.read(12);
+    let maxbits = if mode_short < 0xFFF {
+        mode_short + 1
+    } else {
+        // Long mode: read 52 more bits → full 64-bit mode code that packs
+        // (minbits, maxbits, maxprec, minexp). We only care about maxbits.
+        let rest = r.read(52);
+        let mode = mode_short | (rest << 12);
+        // From zfp.c: minbits field occupies bits 12..=26 (15 bits, +1).
+        //             maxbits field occupies bits 27..=41 (15 bits, +1).
+        let maxbits_enc = (mode >> 27) & 0x7FFF;
+        maxbits_enc + 1
+    };
+    let block_values = 4u64.pow(rank as u32);
+    let rate = maxbits as f64 / block_values as f64;
+    // Drop any dims that are zero (guard against malformed inputs).
+    dims.retain(|&d| d != 0);
+    if dims.len() as u64 != rank {
+        return None;
+    }
+    Some(ZfpFilterMeta {
+        element_type,
+        dims,
+        rate,
+    })
+}
+
+/// Convenience accessor for just the rate field. Used by the filter
+/// pipeline when it already knows the element type from the dataset's
+/// datatype and the chunk dims from the chunked-read metadata.
 pub fn zfp_rate_from_cd_values(cd_values: &[u32]) -> Option<f64> {
-    if cd_values.len() < 3 {
-        return None;
-    }
-    if cd_values[0] != ZFP_MODE_RATE {
-        return None;
-    }
-    let bits = (u64::from(cd_values[1]) << 32) | u64::from(cd_values[2]);
-    Some(f64::from_bits(bits))
+    zfp_filter_meta_from_cd_values(cd_values).map(|m| m.rate)
 }
 
 // ---------------------------------------------------------------------------
@@ -1995,10 +2208,23 @@ mod tests {
 
     #[test]
     fn cd_values_roundtrip() {
-        let rate = 16.5;
-        let cd = zfp_cd_values_rate(rate);
-        let recovered = zfp_rate_from_cd_values(&cd).unwrap();
-        assert!((rate - recovered).abs() < f64::EPSILON);
+        // Integer rate at 1D f32 — short-form mode, no loss in the round-trip.
+        let cd = zfp_cd_values_rate(16.0, ZfpElementType::F32, &[16]);
+        let meta = zfp_filter_meta_from_cd_values(&cd).unwrap();
+        assert_eq!(meta.rate, 16.0);
+        assert_eq!(meta.element_type, ZfpElementType::F32);
+        assert_eq!(meta.dims, vec![16]);
+    }
+
+    #[test]
+    fn cd_values_matches_reference_fixture() {
+        // Probed from h5py + hdf5plugin for an f32 1D 16-value ramp at rate 16:
+        // `[0x10105111, 0x0570667a, 0x000000f2, 0x03f00000]`.
+        let cd = zfp_cd_values_rate(16.0, ZfpElementType::F32, &[16]);
+        assert_eq!(
+            cd,
+            vec![0x10105111, 0x0570667a, 0x000000f2, 0x03f00000],
+        );
     }
 
     #[test]

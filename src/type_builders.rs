@@ -888,6 +888,15 @@ impl DatasetBuilder {
     /// `rate` is the number of compressed bits per value. Supports f32, f64,
     /// i32, and i64 datasets in 1D–4D. When ZFP is active it replaces shuffle
     /// and deflate on the same dataset.
+    ///
+    /// The scalar type is read from whichever `with_{f32,f64,i32,i64}_data`
+    /// call set the data, so call that before `with_zfp` — or after, as long
+    /// as both happen before finalize. Finalize returns an error if the
+    /// dataset isn't one of the four supported types.
+    ///
+    /// The resulting file is byte-compatible with the reference H5Z-ZFP
+    /// plugin (HDF5 filter ID 32013): other tools like h5py + hdf5plugin
+    /// will read and decompress it, and vice versa.
     #[cfg(feature = "zfp")]
     pub fn with_zfp(&mut self, rate: f64) -> &mut Self {
         self.chunk_options.zfp_rate = Some(rate);
