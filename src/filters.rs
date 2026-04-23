@@ -10,31 +10,88 @@ use crate::error::FormatError;
 use crate::filter_pipeline::{FilterPipeline, FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SHUFFLE};
 #[cfg(feature = "zfp")]
 use crate::filter_pipeline::FILTER_ZFP;
+#[cfg(feature = "zfp")]
+use crate::zfp::ZfpElementType;
+
+/// Context shared with filter pipeline operations.
+///
+/// Most filters (deflate, shuffle, fletcher32) need only element_size; ZFP
+/// also needs chunk dimensions and scalar type, carried here so future
+/// type-aware filters can look them up without changing the pipeline API.
+#[derive(Debug, Clone, Copy)]
+pub struct ChunkContext<'a> {
+    /// Chunk dimensions in elements (one per dataset rank).
+    pub chunk_dims: &'a [u64],
+    /// Size of one element in bytes (for shuffle's interleave width).
+    pub element_size: u32,
+    /// Scalar type, required for type-aware filters like ZFP. `None` means
+    /// the caller does not know or does not need it; type-aware filters
+    /// will return an error.
+    pub element_type: Option<ZfpElementTypeWhenEnabled>,
+    /// Total uncompressed bytes in one chunk (shape product × element size).
+    pub chunk_total_bytes: usize,
+}
+
+/// Dummy wrapper so ChunkContext's type stays stable whether or not the
+/// `zfp` feature is on. With `zfp` on this aliases `zfp::ZfpElementType`.
+#[cfg(feature = "zfp")]
+pub type ZfpElementTypeWhenEnabled = ZfpElementType;
+#[cfg(not(feature = "zfp"))]
+pub type ZfpElementTypeWhenEnabled = core::convert::Infallible;
+
+impl<'a> ChunkContext<'a> {
+    /// Lightweight constructor for callers that don't need ZFP support — the
+    /// element_type is left `None`, so any ZFP filter in the pipeline will
+    /// error out. `chunk_total_bytes` and `element_size` must still be valid.
+    pub fn basic(chunk_dims: &'a [u64], element_size: u32, chunk_total_bytes: usize) -> Self {
+        Self {
+            chunk_dims,
+            element_size,
+            element_type: None,
+            chunk_total_bytes,
+        }
+    }
+}
+
+/// Map an HDF5 `Datatype` to the matching ZFP scalar type, if it's one of the
+/// supported codec widths. Returns `None` for types outside f32/f64/i32/i64.
+#[cfg(feature = "zfp")]
+pub fn zfp_element_type_from_datatype(
+    dt: &crate::datatype::Datatype,
+) -> Option<ZfpElementTypeWhenEnabled> {
+    use crate::datatype::Datatype;
+    match dt {
+        Datatype::FloatingPoint { size: 4, .. } => Some(ZfpElementType::F32),
+        Datatype::FloatingPoint { size: 8, .. } => Some(ZfpElementType::F64),
+        Datatype::FixedPoint { size: 4, signed: true, .. } => Some(ZfpElementType::I32),
+        Datatype::FixedPoint { size: 8, signed: true, .. } => Some(ZfpElementType::I64),
+        _ => None,
+    }
+}
+
+#[cfg(not(feature = "zfp"))]
+pub fn zfp_element_type_from_datatype(
+    _: &crate::datatype::Datatype,
+) -> Option<ZfpElementTypeWhenEnabled> {
+    None
+}
 
 /// Apply a filter pipeline to decompress a chunk.
 /// Filters are applied in REVERSE order for decompression.
 pub fn decompress_chunk(
     compressed: &[u8],
     pipeline: &FilterPipeline,
-    _chunk_size: usize,
-    element_size: u32,
+    ctx: ChunkContext<'_>,
 ) -> Result<Vec<u8>, FormatError> {
     let mut data = compressed.to_vec();
 
     for filter in pipeline.filters.iter().rev() {
         data = match filter.filter_id {
-            FILTER_SHUFFLE => shuffle_decompress(&data, element_size as usize)?,
+            FILTER_SHUFFLE => shuffle_decompress(&data, ctx.element_size as usize)?,
             FILTER_DEFLATE => deflate_decompress(&data)?,
             FILTER_FLETCHER32 => fletcher32_verify(&data)?,
             #[cfg(feature = "zfp")]
-            FILTER_ZFP => {
-                let rate =
-                    crate::zfp::zfp_rate_from_cd_values(&filter.client_data).ok_or_else(|| {
-                        FormatError::FilterError("ZFP: invalid or non-rate cd_values".into())
-                    })?;
-                let num_floats = _chunk_size / element_size as usize;
-                crate::zfp::decompress_f32(&data, num_floats, rate)?
-            }
+            FILTER_ZFP => zfp_decompress(&data, filter, &ctx)?,
             other => return Err(FormatError::UnsupportedFilter(other)),
         };
     }
@@ -47,31 +104,84 @@ pub fn decompress_chunk(
 pub fn compress_chunk(
     data: &[u8],
     pipeline: &FilterPipeline,
-    element_size: u32,
+    ctx: ChunkContext<'_>,
 ) -> Result<Vec<u8>, FormatError> {
     let mut result = data.to_vec();
 
     for filter in &pipeline.filters {
         result = match filter.filter_id {
-            FILTER_SHUFFLE => shuffle_compress(&result, element_size as usize)?,
+            FILTER_SHUFFLE => shuffle_compress(&result, ctx.element_size as usize)?,
             FILTER_DEFLATE => {
                 let level = filter.client_data.first().copied().unwrap_or(6);
                 deflate_compress(&result, level)?
             }
             FILTER_FLETCHER32 => fletcher32_append(&result)?,
             #[cfg(feature = "zfp")]
-            FILTER_ZFP => {
-                let rate =
-                    crate::zfp::zfp_rate_from_cd_values(&filter.client_data).ok_or_else(|| {
-                        FormatError::FilterError("ZFP: invalid or non-rate cd_values".into())
-                    })?;
-                crate::zfp::compress_f32(&result, rate)?
-            }
+            FILTER_ZFP => zfp_compress(&result, filter, &ctx)?,
             other => return Err(FormatError::UnsupportedFilter(other)),
         };
     }
 
     Ok(result)
+}
+
+#[cfg(feature = "zfp")]
+fn zfp_rate(filter: &crate::filter_pipeline::FilterDescription) -> Result<f64, FormatError> {
+    crate::zfp::zfp_rate_from_cd_values(&filter.client_data).ok_or_else(|| {
+        FormatError::FilterError("ZFP: invalid or non-rate cd_values".into())
+    })
+}
+
+#[cfg(feature = "zfp")]
+fn zfp_compress(
+    data: &[u8],
+    filter: &crate::filter_pipeline::FilterDescription,
+    ctx: &ChunkContext<'_>,
+) -> Result<Vec<u8>, FormatError> {
+    let rate = zfp_rate(filter)?;
+    let elem_ty = ctx.element_type.ok_or_else(|| {
+        FormatError::FilterError(
+            "ZFP: element_type missing from ChunkContext (caller must set it)".into(),
+        )
+    })?;
+    // Step 5 will add N-D dispatch; for now 1D only.
+    if ctx.chunk_dims.len() != 1 {
+        return Err(FormatError::FilterError(
+            "ZFP: only 1D chunks supported in this build (N-D support is pending)".into(),
+        ));
+    }
+    match elem_ty {
+        ZfpElementType::F32 => crate::zfp::compress_f32(data, rate),
+        ZfpElementType::F64 => crate::zfp::compress_f64(data, rate),
+        ZfpElementType::I32 => crate::zfp::compress_i32(data, rate),
+        ZfpElementType::I64 => crate::zfp::compress_i64(data, rate),
+    }
+}
+
+#[cfg(feature = "zfp")]
+fn zfp_decompress(
+    data: &[u8],
+    filter: &crate::filter_pipeline::FilterDescription,
+    ctx: &ChunkContext<'_>,
+) -> Result<Vec<u8>, FormatError> {
+    let rate = zfp_rate(filter)?;
+    let elem_ty = ctx.element_type.ok_or_else(|| {
+        FormatError::FilterError(
+            "ZFP: element_type missing from ChunkContext (caller must set it)".into(),
+        )
+    })?;
+    if ctx.chunk_dims.len() != 1 {
+        return Err(FormatError::FilterError(
+            "ZFP: only 1D chunks supported in this build (N-D support is pending)".into(),
+        ));
+    }
+    let num_values = ctx.chunk_total_bytes / ctx.element_size as usize;
+    match elem_ty {
+        ZfpElementType::F32 => crate::zfp::decompress_f32(data, num_values, rate),
+        ZfpElementType::F64 => crate::zfp::decompress_f64(data, num_values, rate),
+        ZfpElementType::I32 => crate::zfp::decompress_i32(data, num_values, rate),
+        ZfpElementType::I64 => crate::zfp::decompress_i64(data, num_values, rate),
+    }
 }
 
 /// Decompress zlib-compressed data.
@@ -368,8 +478,10 @@ mod tests {
             }],
         };
         let data: Vec<u8> = (0..200).map(|i| (i % 256) as u8).collect();
-        let compressed = compress_chunk(&data, &pipeline, 1).unwrap();
-        let decompressed = decompress_chunk(&compressed, &pipeline, data.len(), 1).unwrap();
+        let dims = [data.len() as u64];
+        let ctx = ChunkContext::basic(&dims, 1, data.len());
+        let compressed = compress_chunk(&data, &pipeline, ctx).unwrap();
+        let decompressed = decompress_chunk(&compressed, &pipeline, ctx).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -395,8 +507,10 @@ mod tests {
         };
         // 25 f64 values (200 bytes)
         let data: Vec<u8> = (0..200).map(|i| (i % 256) as u8).collect();
-        let compressed = compress_chunk(&data, &pipeline, 8).unwrap();
-        let decompressed = decompress_chunk(&compressed, &pipeline, data.len(), 8).unwrap();
+        let dims = [(data.len() / 8) as u64];
+        let ctx = ChunkContext::basic(&dims, 8, data.len());
+        let compressed = compress_chunk(&data, &pipeline, ctx).unwrap();
+        let decompressed = decompress_chunk(&compressed, &pipeline, ctx).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -427,8 +541,10 @@ mod tests {
             ],
         };
         let data: Vec<u8> = (0..160).map(|i| (i % 256) as u8).collect();
-        let compressed = compress_chunk(&data, &pipeline, 8).unwrap();
-        let decompressed = decompress_chunk(&compressed, &pipeline, data.len(), 8).unwrap();
+        let dims = [(data.len() / 8) as u64];
+        let ctx = ChunkContext::basic(&dims, 8, data.len());
+        let compressed = compress_chunk(&data, &pipeline, ctx).unwrap();
+        let decompressed = decompress_chunk(&compressed, &pipeline, ctx).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -460,8 +576,10 @@ mod tests {
         };
         // Use realistic f64-sized data
         let data: Vec<u8> = (0..80).map(|i| (i * 3 % 256) as u8).collect();
-        let compressed = compress_chunk(&data, &pipeline, 8).unwrap();
-        let decompressed = decompress_chunk(&compressed, &pipeline, data.len(), 8).unwrap();
+        let dims = [(data.len() / 8) as u64];
+        let ctx = ChunkContext::basic(&dims, 8, data.len());
+        let compressed = compress_chunk(&data, &pipeline, ctx).unwrap();
+        let decompressed = decompress_chunk(&compressed, &pipeline, ctx).unwrap();
         assert_eq!(decompressed, data);
     }
 }

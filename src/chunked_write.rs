@@ -14,7 +14,7 @@ use crate::filter_pipeline::{
 };
 #[cfg(feature = "zfp")]
 use crate::filter_pipeline::FILTER_ZFP;
-use crate::filters::compress_chunk;
+use crate::filters::{compress_chunk, ChunkContext};
 
 /// Round a file offset up to the next cache-line boundary.
 ///
@@ -41,6 +41,11 @@ pub struct ChunkOptions {
     /// When set, takes priority over shuffle + deflate.
     #[cfg(feature = "zfp")]
     pub zfp_rate: Option<f64>,
+    /// Scalar type ZFP should treat the data as. Populated by the
+    /// DatasetBuilder when the data setter is called (e.g. `with_f32_data`
+    /// => F32). Ignored unless `zfp_rate` is also set.
+    #[cfg(feature = "zfp")]
+    pub zfp_element_type: Option<crate::zfp::ZfpElementType>,
 }
 
 impl ChunkOptions {
@@ -924,9 +929,20 @@ pub fn build_chunked_data_at_ext(
     let mut data_buf = Vec::new();
     let mut written_chunks = Vec::with_capacity(num_chunks);
 
+    let chunk_total_bytes: usize = chunk_dims.iter().product::<u64>() as usize * element_size;
+
     for (_offsets, chunk_bytes) in &chunks {
         let compressed = if let Some(ref pl) = pipeline {
-            compress_chunk(chunk_bytes, pl, element_size as u32)?
+            let ctx = ChunkContext {
+                chunk_dims,
+                element_size: element_size as u32,
+                #[cfg(feature = "zfp")]
+                element_type: options.zfp_element_type,
+                #[cfg(not(feature = "zfp"))]
+                element_type: None,
+                chunk_total_bytes,
+            };
+            compress_chunk(chunk_bytes, pl, ctx)?
         } else {
             chunk_bytes.clone()
         };

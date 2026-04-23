@@ -588,6 +588,10 @@ impl DatasetBuilder {
         if self.shape.is_none() {
             self.shape = Some(vec![data.len() as u64]);
         }
+        #[cfg(feature = "zfp")]
+        {
+            self.chunk_options.zfp_element_type = Some(crate::zfp::ZfpElementType::F64);
+        }
         self
     }
 
@@ -600,6 +604,10 @@ impl DatasetBuilder {
         self.data = Some(b);
         if self.shape.is_none() {
             self.shape = Some(vec![data.len() as u64]);
+        }
+        #[cfg(feature = "zfp")]
+        {
+            self.chunk_options.zfp_element_type = Some(crate::zfp::ZfpElementType::F32);
         }
         self
     }
@@ -614,6 +622,10 @@ impl DatasetBuilder {
         if self.shape.is_none() {
             self.shape = Some(vec![data.len() as u64]);
         }
+        #[cfg(feature = "zfp")]
+        {
+            self.chunk_options.zfp_element_type = Some(crate::zfp::ZfpElementType::I32);
+        }
         self
     }
 
@@ -626,6 +638,10 @@ impl DatasetBuilder {
         self.data = Some(b);
         if self.shape.is_none() {
             self.shape = Some(vec![data.len() as u64]);
+        }
+        #[cfg(feature = "zfp")]
+        {
+            self.chunk_options.zfp_element_type = Some(crate::zfp::ZfpElementType::I64);
         }
         self
     }

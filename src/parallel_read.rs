@@ -10,7 +10,7 @@
 use crate::chunked_read::ChunkInfo;
 use crate::error::FormatError;
 use crate::filter_pipeline::FilterPipeline;
-use crate::filters::decompress_chunk;
+use crate::filters::{decompress_chunk, ChunkContext, ZfpElementTypeWhenEnabled};
 use crate::lane_partition::{self, LaneStats, PartitionStats};
 
 /// Threshold: only use parallel decompression when chunk count exceeds this.
@@ -45,8 +45,10 @@ pub fn decompress_chunks_lane_partitioned(
     file_data: &[u8],
     chunks: &[ChunkInfo],
     pipeline: &FilterPipeline,
+    chunk_dims: &[u64],
     chunk_total_bytes: usize,
     element_size: u32,
+    element_type: Option<ZfpElementTypeWhenEnabled>,
     seed: u64,
     num_lanes: Option<usize>,
 ) -> Result<(Vec<Vec<u8>>, PartitionStats), FormatError> {
@@ -82,7 +84,13 @@ pub fn decompress_chunks_lane_partitioned(
                 let raw_chunk = &file_data[c_addr..c_addr + size];
 
                 let decompressed = if chunk_info.filter_mask == 0 {
-                    decompress_chunk(raw_chunk, pipeline, chunk_total_bytes, element_size)?
+                    let ctx = ChunkContext {
+                        chunk_dims,
+                        element_size,
+                        element_type,
+                        chunk_total_bytes,
+                    };
+                    decompress_chunk(raw_chunk, pipeline, ctx)?
                 } else {
                     raw_chunk.to_vec()
                 };
@@ -130,8 +138,10 @@ pub fn decompress_chunks_parallel(
     file_data: &[u8],
     chunks: &[ChunkInfo],
     pipeline: &FilterPipeline,
+    chunk_dims: &[u64],
     chunk_total_bytes: usize,
     element_size: u32,
+    element_type: Option<ZfpElementTypeWhenEnabled>,
 ) -> Result<Vec<Vec<u8>>, FormatError> {
     use rayon::prelude::*;
 
@@ -150,7 +160,13 @@ pub fn decompress_chunks_parallel(
             let raw_chunk = &file_data[c_addr..c_addr + size];
 
             let decompressed = if chunk_info.filter_mask == 0 {
-                decompress_chunk(raw_chunk, pipeline, chunk_total_bytes, element_size)?
+                let ctx = ChunkContext {
+                    chunk_dims,
+                    element_size,
+                    element_type,
+                    chunk_total_bytes,
+                };
+                decompress_chunk(raw_chunk, pipeline, ctx)?
             } else {
                 raw_chunk.to_vec()
             };
@@ -169,8 +185,10 @@ pub fn decompress_chunks_sequential(
     file_data: &[u8],
     chunks: &[ChunkInfo],
     pipeline: Option<&FilterPipeline>,
+    chunk_dims: &[u64],
     chunk_total_bytes: usize,
     element_size: u32,
+    element_type: Option<ZfpElementTypeWhenEnabled>,
 ) -> Result<Vec<Vec<u8>>, FormatError> {
     let mut result = Vec::with_capacity(chunks.len());
     for chunk_info in chunks {
@@ -186,7 +204,13 @@ pub fn decompress_chunks_sequential(
 
         let decompressed = if let Some(pl) = pipeline {
             if chunk_info.filter_mask == 0 {
-                decompress_chunk(raw_chunk, pl, chunk_total_bytes, element_size)?
+                let ctx = ChunkContext {
+                    chunk_dims,
+                    element_size,
+                    element_type,
+                    chunk_total_bytes,
+                };
+                decompress_chunk(raw_chunk, pl, ctx)?
             } else {
                 raw_chunk.to_vec()
             }

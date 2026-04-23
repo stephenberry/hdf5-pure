@@ -44,6 +44,20 @@ use alloc::{vec, vec::Vec};
 
 use crate::error::FormatError;
 
+/// Scalar type the codec operates on.
+///
+/// The H5Z-ZFP plugin encodes this as a small integer inside cd_values;
+/// Step 6 wires the cd_values decoder up to populate this from a stored
+/// filter on read. For write, the dataset's datatype determines which
+/// variant is passed in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZfpElementType {
+    F32,
+    F64,
+    I32,
+    I64,
+}
+
 /// Number of values per ZFP block (1D).
 const BLOCK_SIZE: usize = 4;
 
