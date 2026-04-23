@@ -14,7 +14,7 @@ use crate::filter_pipeline::{
 };
 #[cfg(feature = "zfp")]
 use crate::filter_pipeline::FILTER_ZFP;
-use crate::filters::{compress_chunk, ChunkContext};
+use crate::filters::{compress_chunk, ChunkContext, ZfpElementTypeWhenEnabled};
 
 /// Round a file offset up to the next cache-line boundary.
 ///
@@ -41,11 +41,6 @@ pub struct ChunkOptions {
     /// When set, takes priority over shuffle + deflate.
     #[cfg(feature = "zfp")]
     pub zfp_rate: Option<f64>,
-    /// Scalar type ZFP should treat the data as. Populated by the
-    /// DatasetBuilder when the data setter is called (e.g. `with_f32_data`
-    /// => F32). Ignored unless `zfp_rate` is also set.
-    #[cfg(feature = "zfp")]
-    pub zfp_element_type: Option<crate::zfp::ZfpElementType>,
 }
 
 impl ChunkOptions {
@@ -72,29 +67,30 @@ impl ChunkOptions {
 
     /// Build a FilterPipeline from the options.
     ///
-    /// `chunk_dims` is only consulted when the ZFP filter is active — it's
-    /// embedded into the ZFP cd_values so the resulting file is readable by
-    /// the reference H5Z-ZFP plugin.
+    /// `chunk_dims` and `zfp_element_type` are only consulted when the ZFP
+    /// filter is active — they're embedded into the ZFP cd_values so the
+    /// resulting file is readable by the reference H5Z-ZFP plugin.
     ///
-    /// Returns [`FormatError::UnsupportedZfp`] when ZFP was requested but the
-    /// dataset wasn't set up with a scalar data setter, or the chunk rank is
-    /// outside 1..=4.
+    /// Returns [`FormatError::UnsupportedZfp`] when ZFP was requested but
+    /// `zfp_element_type` is `None` (e.g. the dataset's datatype isn't one of
+    /// f32/f64/i32/i64), or the chunk rank is outside 1..=4.
     pub fn build_pipeline(
         &self,
         element_size: u32,
         chunk_dims: &[u64],
+        zfp_element_type: Option<ZfpElementTypeWhenEnabled>,
     ) -> Result<Option<FilterPipeline>, FormatError> {
         let mut filters = Vec::new();
         let _ = chunk_dims; // used only under the `zfp` feature below
+        let _ = zfp_element_type; // used only under the `zfp` feature below
 
         // ZFP is a standalone compressor — it replaces shuffle + deflate.
         #[cfg(feature = "zfp")]
         let zfp_active = if let Some(rate) = self.zfp_rate {
-            let elem_ty = self.zfp_element_type.ok_or_else(|| {
+            let elem_ty = zfp_element_type.ok_or_else(|| {
                 FormatError::UnsupportedZfp(
-                    "ZFP compression requires a scalar dataset; set its data via \
-                     with_f32_data / with_f64_data / with_i32_data / with_i64_data \
-                     before finalize"
+                    "ZFP compression requires the dataset's datatype to be one \
+                     of f32, f64, i32, or i64"
                         .into(),
                 )
             })?;
@@ -919,6 +915,11 @@ fn write_undefined_element(
 
 /// Build chunked data with absolute addresses.
 /// If `maxshape` has unlimited dims, uses Extensible Array index.
+///
+/// `zfp_element_type` is only consulted when ZFP is enabled in `options`; it
+/// is the scalar type the codec should encode the raw bytes as, typically
+/// derived from the dataset's datatype via
+/// [`crate::filters::zfp_element_type_from_datatype`].
 pub fn build_chunked_data_at(
     raw_data: &[u8],
     shape: &[u64],
@@ -926,11 +927,20 @@ pub fn build_chunked_data_at(
     element_size: usize,
     options: &ChunkOptions,
     base_address: u64,
+    zfp_element_type: Option<ZfpElementTypeWhenEnabled>,
 ) -> Result<ChunkedDataResult, FormatError> {
-    build_chunked_data_at_ext(raw_data, shape, chunk_dims, element_size, options, base_address, None)
+    build_chunked_data_at_ext(
+        raw_data, shape, chunk_dims, element_size, options, base_address, None,
+        zfp_element_type,
+    )
 }
 
 /// Build chunked data with absolute addresses and optional maxshape.
+///
+/// `zfp_element_type` is only consulted when ZFP is enabled in `options`; it
+/// is the scalar type the codec should encode the raw bytes as, typically
+/// derived from the dataset's datatype via
+/// [`crate::filters::zfp_element_type_from_datatype`].
 pub fn build_chunked_data_at_ext(
     raw_data: &[u8],
     shape: &[u64],
@@ -939,8 +949,9 @@ pub fn build_chunked_data_at_ext(
     options: &ChunkOptions,
     base_address: u64,
     maxshape: Option<&[u64]>,
+    zfp_element_type: Option<ZfpElementTypeWhenEnabled>,
 ) -> Result<ChunkedDataResult, FormatError> {
-    let pipeline = options.build_pipeline(element_size as u32, chunk_dims)?;
+    let pipeline = options.build_pipeline(element_size as u32, chunk_dims, zfp_element_type)?;
 
     let chunks = split_into_chunks(raw_data, shape, chunk_dims, element_size);
     let num_chunks = chunks.len();
@@ -957,10 +968,7 @@ pub fn build_chunked_data_at_ext(
             let ctx = ChunkContext {
                 chunk_dims,
                 element_size: element_size as u32,
-                #[cfg(feature = "zfp")]
-                element_type: options.zfp_element_type,
-                #[cfg(not(feature = "zfp"))]
-                element_type: None,
+                element_type: zfp_element_type,
                 chunk_total_bytes,
             };
             compress_chunk(chunk_bytes, pl, ctx)?
@@ -1112,7 +1120,7 @@ mod tests {
         let raw = f64_to_bytes(values);
         let base_address = 0x1000u64;
         let result =
-            build_chunked_data_at(&raw, shape, chunk_dims, 8, options, base_address).unwrap();
+            build_chunked_data_at(&raw, shape, chunk_dims, 8, options, base_address, None).unwrap();
 
         // Build a fake file buffer
         let file_size = base_address as usize + result.data_bytes.len();
@@ -1289,7 +1297,7 @@ mod tests {
             ..Default::default()
         };
         let result =
-            build_chunked_data_at(&raw, &[100], &[20], 8, &options, base_address).unwrap();
+            build_chunked_data_at(&raw, &[100], &[20], 8, &options, base_address, None).unwrap();
 
         // Parse layout to get chunk addresses (via roundtrip read)
         let file_size = base_address as usize + result.data_bytes.len();
@@ -1329,7 +1337,7 @@ mod tests {
             deflate_level: Some(6),
             ..Default::default()
         };
-        let pl = options.build_pipeline(8, &[]).unwrap().unwrap();
+        let pl = options.build_pipeline(8, &[], None).unwrap().unwrap();
         assert_eq!(pl.filters.len(), 1);
         assert_eq!(pl.filters[0].filter_id, FILTER_DEFLATE);
     }
@@ -1342,7 +1350,7 @@ mod tests {
             fletcher32: true,
             ..Default::default()
         };
-        let pl = options.build_pipeline(8, &[]).unwrap().unwrap();
+        let pl = options.build_pipeline(8, &[], None).unwrap().unwrap();
         assert_eq!(pl.filters.len(), 3);
         assert_eq!(pl.filters[0].filter_id, FILTER_SHUFFLE);
         assert_eq!(pl.filters[1].filter_id, FILTER_DEFLATE);
@@ -1497,7 +1505,7 @@ mod tests {
             ..Default::default()
         };
         let result = build_chunked_data_at_ext(
-            &raw, shape, chunk_dims, 8, &options, base_address, Some(maxshape),
+            &raw, shape, chunk_dims, 8, &options, base_address, Some(maxshape), None,
         )
         .unwrap();
 

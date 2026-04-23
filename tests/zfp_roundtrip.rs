@@ -181,6 +181,39 @@ fn zfp_on_unsupported_scalar_errors_not_panics() {
 }
 
 #[test]
+fn zfp_dtype_is_sole_source_of_truth() {
+    // Regression: the data setter must no longer carry a parallel
+    // `zfp_element_type`. The codec reads the scalar type from the dataset's
+    // datatype, so writing raw bytes through `with_u8_data` and then
+    // overriding the dtype with `with_dtype(make_f32_type())` must produce a
+    // valid ZFP-compressed f32 dataset. Before the refactor this errored
+    // because `with_u8_data` never populated `chunk_options.zfp_element_type`.
+    use hdf5_pure::make_f32_type;
+    let vals: Vec<f32> = (0..16).map(|i| i as f32 * 0.25).collect();
+    let raw: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("v")
+        .with_u8_data(&raw)
+        .with_dtype(make_f32_type())
+        .with_shape(&[vals.len() as u64])
+        .with_chunks(&[vals.len() as u64])
+        .with_zfp(16.0);
+    let bytes = builder.finish().expect("dtype-driven ZFP should succeed");
+
+    let file = File::from_bytes(bytes).unwrap();
+    let ds = file.dataset("v").unwrap();
+    let back = ds.read_f32().unwrap();
+    assert_eq!(back.len(), vals.len());
+    assert!(
+        max_abs_err(&vals, &back) < 0.1,
+        "max_err {}",
+        max_abs_err(&vals, &back)
+    );
+}
+
+#[test]
 fn zfp_with_5d_chunks_errors_not_panics() {
     // 5D chunks are beyond the ZFP rank limit. Finalize must surface a
     // FormatError::UnsupportedZfp, not panic inside the cd_values builder.

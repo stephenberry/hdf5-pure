@@ -588,10 +588,6 @@ impl DatasetBuilder {
         if self.shape.is_none() {
             self.shape = Some(vec![data.len() as u64]);
         }
-        #[cfg(feature = "zfp")]
-        {
-            self.chunk_options.zfp_element_type = Some(crate::zfp::ZfpElementType::F64);
-        }
         self
     }
 
@@ -604,10 +600,6 @@ impl DatasetBuilder {
         self.data = Some(b);
         if self.shape.is_none() {
             self.shape = Some(vec![data.len() as u64]);
-        }
-        #[cfg(feature = "zfp")]
-        {
-            self.chunk_options.zfp_element_type = Some(crate::zfp::ZfpElementType::F32);
         }
         self
     }
@@ -622,10 +614,6 @@ impl DatasetBuilder {
         if self.shape.is_none() {
             self.shape = Some(vec![data.len() as u64]);
         }
-        #[cfg(feature = "zfp")]
-        {
-            self.chunk_options.zfp_element_type = Some(crate::zfp::ZfpElementType::I32);
-        }
         self
     }
 
@@ -638,10 +626,6 @@ impl DatasetBuilder {
         self.data = Some(b);
         if self.shape.is_none() {
             self.shape = Some(vec![data.len() as u64]);
-        }
-        #[cfg(feature = "zfp")]
-        {
-            self.chunk_options.zfp_element_type = Some(crate::zfp::ZfpElementType::I64);
         }
         self
     }
@@ -889,12 +873,12 @@ impl DatasetBuilder {
     /// i32, and i64 datasets in 1D–4D. When ZFP is active it replaces shuffle
     /// and deflate on the same dataset.
     ///
-    /// The scalar type is read from whichever `with_{f32,f64,i32,i64}_data`
-    /// call set the data, so call that before `with_zfp` — or after, as long
-    /// as both happen before finalize. Finalize returns
+    /// The scalar type is derived from the dataset's datatype at finalize
+    /// time, so any of `with_{f32,f64,i32,i64}_data` or an explicit
+    /// `with_dtype` establishes it. Finalize returns
     /// [`FormatError::UnsupportedZfp`](crate::FormatError::UnsupportedZfp) if
-    /// the dataset isn't one of the four supported scalar types, or if the
-    /// chunk rank is outside 1..=4.
+    /// the dataset's datatype isn't one of the four supported scalar types,
+    /// or if the chunk rank is outside 1..=4.
     ///
     /// The resulting file is byte-compatible with the reference H5Z-ZFP
     /// plugin (HDF5 filter ID 32013): other tools like h5py + hdf5plugin
