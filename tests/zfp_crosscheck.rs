@@ -66,10 +66,11 @@ fn read_bin(name: &str) -> Vec<u8> {
 }
 
 /// True if the fixture falls inside the slice of the codec implemented so
-/// far. Widens as Steps 3 and 5 land.
+/// far. All four types and 1D–4D are in scope after Step 5.
 fn is_supported(fix: &Fixture) -> bool {
     let dtype_ok = matches!(fix.dtype.as_str(), "f32" | "f64" | "i32" | "i64");
-    dtype_ok && fix.shape.len() == 1 && fix.mode == "rate"
+    let rank_ok = matches!(fix.shape.len(), 1 | 2 | 3 | 4);
+    dtype_ok && rank_ok && fix.mode == "rate"
 }
 
 /// Expected element size in bytes for a fixture's dtype.
@@ -115,7 +116,7 @@ fn decode_tolerance(fix: &Fixture, raw: &[u8]) -> f64 {
 fn decode_and_max_err(
     dtype: &str,
     reference: &[u8],
-    num_values: usize,
+    dims: &[usize],
     rate: f64,
     raw: &[u8],
 ) -> Result<f64, String> {
@@ -127,7 +128,7 @@ fn decode_and_max_err(
     }
     match dtype {
         "f32" => {
-            let decoded = zfp::decompress_f32(reference, num_values, rate).map_err(|e| format!("{e:?}"))?;
+            let decoded = zfp::decompress_f32(reference, dims, rate).map_err(|e| format!("{e:?}"))?;
             let expected: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
             let got: Vec<f32> = decoded.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
             if got.len() != expected.len() {
@@ -136,7 +137,7 @@ fn decode_and_max_err(
             Ok(max_abs(&expected, &got))
         }
         "f64" => {
-            let decoded = zfp::decompress_f64(reference, num_values, rate).map_err(|e| format!("{e:?}"))?;
+            let decoded = zfp::decompress_f64(reference, dims, rate).map_err(|e| format!("{e:?}"))?;
             let expected: Vec<f64> = raw.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
             let got: Vec<f64> = decoded.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
             if got.len() != expected.len() {
@@ -145,7 +146,7 @@ fn decode_and_max_err(
             Ok(max_abs(&expected, &got))
         }
         "i32" => {
-            let decoded = zfp::decompress_i32(reference, num_values, rate).map_err(|e| format!("{e:?}"))?;
+            let decoded = zfp::decompress_i32(reference, dims, rate).map_err(|e| format!("{e:?}"))?;
             let expected: Vec<i32> = raw.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
             let got: Vec<i32> = decoded.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
             if got.len() != expected.len() {
@@ -155,7 +156,7 @@ fn decode_and_max_err(
             Ok(max)
         }
         "i64" => {
-            let decoded = zfp::decompress_i64(reference, num_values, rate).map_err(|e| format!("{e:?}"))?;
+            let decoded = zfp::decompress_i64(reference, dims, rate).map_err(|e| format!("{e:?}"))?;
             let expected: Vec<i64> = raw.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect();
             let got: Vec<i64> = decoded.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect();
             if got.len() != expected.len() {
@@ -168,12 +169,12 @@ fn decode_and_max_err(
     }
 }
 
-fn encode_per_dtype(dtype: &str, raw: &[u8], rate: f64) -> Result<Vec<u8>, String> {
+fn encode_per_dtype(dtype: &str, raw: &[u8], dims: &[usize], rate: f64) -> Result<Vec<u8>, String> {
     match dtype {
-        "f32" => zfp::compress_f32(raw, rate).map_err(|e| format!("{e:?}")),
-        "f64" => zfp::compress_f64(raw, rate).map_err(|e| format!("{e:?}")),
-        "i32" => zfp::compress_i32(raw, rate).map_err(|e| format!("{e:?}")),
-        "i64" => zfp::compress_i64(raw, rate).map_err(|e| format!("{e:?}")),
+        "f32" => zfp::compress_f32(raw, dims, rate).map_err(|e| format!("{e:?}")),
+        "f64" => zfp::compress_f64(raw, dims, rate).map_err(|e| format!("{e:?}")),
+        "i32" => zfp::compress_i32(raw, dims, rate).map_err(|e| format!("{e:?}")),
+        "i64" => zfp::compress_i64(raw, dims, rate).map_err(|e| format!("{e:?}")),
         other => Err(format!("unknown dtype {other}")),
     }
 }
@@ -198,15 +199,16 @@ fn run_case(fix: &Fixture) -> CaseOutcome {
     assert_eq!(raw.len(), num_values * elem_size);
 
     let (decode_max_err, decode_err_msg) =
-        match decode_and_max_err(&fix.dtype, &reference, num_values, fix.rate, &raw) {
+        match decode_and_max_err(&fix.dtype, &reference, &fix.shape, fix.rate, &raw) {
             Ok(e) => (Some(e), None),
             Err(m) => (None, Some(m)),
         };
 
-    let (encode_byte_match, encode_err_msg) = match encode_per_dtype(&fix.dtype, &raw, fix.rate) {
-        Ok(encoded) => (Some(encoded == reference), None),
-        Err(m) => (None, Some(m)),
-    };
+    let (encode_byte_match, encode_err_msg) =
+        match encode_per_dtype(&fix.dtype, &raw, &fix.shape, fix.rate) {
+            Ok(encoded) => (Some(encoded == reference), None),
+            Err(m) => (None, Some(m)),
+        };
 
     CaseOutcome {
         name: fix.name.clone(),

@@ -144,17 +144,12 @@ fn zfp_compress(
             "ZFP: element_type missing from ChunkContext (caller must set it)".into(),
         )
     })?;
-    // Step 5 will add N-D dispatch; for now 1D only.
-    if ctx.chunk_dims.len() != 1 {
-        return Err(FormatError::FilterError(
-            "ZFP: only 1D chunks supported in this build (N-D support is pending)".into(),
-        ));
-    }
+    let dims_usize: Vec<usize> = ctx.chunk_dims.iter().map(|&d| d as usize).collect();
     match elem_ty {
-        ZfpElementType::F32 => crate::zfp::compress_f32(data, rate),
-        ZfpElementType::F64 => crate::zfp::compress_f64(data, rate),
-        ZfpElementType::I32 => crate::zfp::compress_i32(data, rate),
-        ZfpElementType::I64 => crate::zfp::compress_i64(data, rate),
+        ZfpElementType::F32 => crate::zfp::compress_f32(data, &dims_usize, rate),
+        ZfpElementType::F64 => crate::zfp::compress_f64(data, &dims_usize, rate),
+        ZfpElementType::I32 => crate::zfp::compress_i32(data, &dims_usize, rate),
+        ZfpElementType::I64 => crate::zfp::compress_i64(data, &dims_usize, rate),
     }
 }
 
@@ -170,17 +165,12 @@ fn zfp_decompress(
             "ZFP: element_type missing from ChunkContext (caller must set it)".into(),
         )
     })?;
-    if ctx.chunk_dims.len() != 1 {
-        return Err(FormatError::FilterError(
-            "ZFP: only 1D chunks supported in this build (N-D support is pending)".into(),
-        ));
-    }
-    let num_values = ctx.chunk_total_bytes / ctx.element_size as usize;
+    let dims_usize: Vec<usize> = ctx.chunk_dims.iter().map(|&d| d as usize).collect();
     match elem_ty {
-        ZfpElementType::F32 => crate::zfp::decompress_f32(data, num_values, rate),
-        ZfpElementType::F64 => crate::zfp::decompress_f64(data, num_values, rate),
-        ZfpElementType::I32 => crate::zfp::decompress_i32(data, num_values, rate),
-        ZfpElementType::I64 => crate::zfp::decompress_i64(data, num_values, rate),
+        ZfpElementType::F32 => crate::zfp::decompress_f32(data, &dims_usize, rate),
+        ZfpElementType::F64 => crate::zfp::decompress_f64(data, &dims_usize, rate),
+        ZfpElementType::I32 => crate::zfp::decompress_i32(data, &dims_usize, rate),
+        ZfpElementType::I64 => crate::zfp::decompress_i64(data, &dims_usize, rate),
     }
 }
 

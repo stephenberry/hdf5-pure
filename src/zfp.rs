@@ -275,6 +275,41 @@ impl_pad_partial!(pad_partial_block_f64, f64, 0.0f64);
 impl_pad_partial!(pad_partial_block_i32, i32, 0i32);
 impl_pad_partial!(pad_partial_block_i64, i64, 0i64);
 
+/// Strided variant of `pad_block` used to fill partial N-D blocks. For a
+/// 2D block we pad along x within each row (stride 1) and then along y
+/// across columns (stride 4); 3D / 4D are analogous.
+macro_rules! impl_pad_strided {
+    ($name:ident, $scalar:ty, $zero:expr) => {
+        fn $name(block: &mut [$scalar], base: usize, n: usize, stride: usize) {
+            match n {
+                0 => {
+                    block[base] = $zero;
+                    block[base + stride] = $zero;
+                    block[base + 2 * stride] = $zero;
+                    block[base + 3 * stride] = $zero;
+                }
+                1 => {
+                    block[base + stride] = block[base];
+                    block[base + 2 * stride] = block[base + stride];
+                    block[base + 3 * stride] = block[base];
+                }
+                2 => {
+                    block[base + 2 * stride] = block[base + stride];
+                    block[base + 3 * stride] = block[base];
+                }
+                3 => {
+                    block[base + 3 * stride] = block[base];
+                }
+                _ => {}
+            }
+        }
+    };
+}
+impl_pad_strided!(pad_strided_f32, f32, 0.0f32);
+impl_pad_strided!(pad_strided_f64, f64, 0.0f64);
+impl_pad_strided!(pad_strided_i32, i32, 0i32);
+impl_pad_strided!(pad_strided_i64, i64, 0i64);
+
 /// Convert a block of 4 f32 values to block-floating-point i32 representation,
 /// matching LLNL/zfp's `fwd_cast`.
 ///
@@ -293,6 +328,14 @@ impl_pad_partial!(pad_partial_block_i64, i64, 0i64);
 /// `-EBIAS`, which we signal here as `emax_biased = 0` — the encoder then
 /// emits a single zero-bit empty-block marker.
 fn fwd_cast_f32(vals: &[f32; BLOCK_SIZE]) -> (u32, [i32; BLOCK_SIZE]) {
+    let mut out = [0i32; BLOCK_SIZE];
+    let e = fwd_cast_f32_slice(vals, &mut out);
+    (e, out)
+}
+
+/// N-D variant: fills `coeffs` in-place and returns `emax_biased`.
+fn fwd_cast_f32_slice(vals: &[f32], coeffs: &mut [i32]) -> u32 {
+    debug_assert_eq!(vals.len(), coeffs.len());
     let mut ieee_max: i32 = 0;
     for &v in vals {
         let e = ((v.to_bits() >> 23) & 0xFF) as i32;
@@ -301,21 +344,18 @@ fn fwd_cast_f32(vals: &[f32; BLOCK_SIZE]) -> (u32, [i32; BLOCK_SIZE]) {
         }
     }
     if ieee_max == 0 {
-        return (0, [0; BLOCK_SIZE]);
+        for c in coeffs.iter_mut() {
+            *c = 0;
+        }
+        return 0;
     }
     let emax_biased = (ieee_max + 1) as u32;
-    // scale = 2^(30 - frexp_emax) = 2^(30 - (ieee_max - (EBIAS - 1)))
-    //       = 2^(30 + EBIAS - 1 - ieee_max) = 2^(156 - ieee_max)
     let scale_exp = 30 + EBIAS_F32 - 1 - ieee_max;
     let scale = pow2_f64(scale_exp);
-    let mut result = [0i32; BLOCK_SIZE];
-    for i in 0..BLOCK_SIZE {
-        // Do the multiply in f64 so subnormal / extreme scaling doesn't clip;
-        // then truncate toward zero to match C's `(Int)` cast.
-        let y = vals[i] as f64 * scale;
-        result[i] = y as i32;
+    for i in 0..vals.len() {
+        coeffs[i] = (vals[i] as f64 * scale) as i32;
     }
-    (emax_biased, result)
+    emax_biased
 }
 
 /// Inverse block-floating-point cast matching LLNL/zfp's `inv_cast`:
@@ -326,8 +366,17 @@ fn fwd_cast_f32(vals: &[f32; BLOCK_SIZE]) -> (u32, [i32; BLOCK_SIZE]) {
 /// dequantization scale is `2^(emax_biased - EBIAS - 30)`.
 fn inv_cast_f32(emax_biased: u32, coeffs: &[i32; BLOCK_SIZE]) -> [f32; BLOCK_SIZE] {
     let mut result = [0.0f32; BLOCK_SIZE];
+    inv_cast_f32_slice(emax_biased, coeffs, &mut result);
+    result
+}
+
+fn inv_cast_f32_slice(emax_biased: u32, coeffs: &[i32], out: &mut [f32]) {
+    debug_assert_eq!(coeffs.len(), out.len());
+    for v in out.iter_mut() {
+        *v = 0.0;
+    }
     if emax_biased == 0 {
-        return result;
+        return;
     }
     let exp = emax_biased as i32 - EBIAS_F32 - 30;
     let scale = pow2_f64(exp);
@@ -335,9 +384,8 @@ fn inv_cast_f32(emax_biased: u32, coeffs: &[i32; BLOCK_SIZE]) -> [f32; BLOCK_SIZ
         if c == 0 {
             continue;
         }
-        result[i] = ((c as f64) * scale) as f32;
+        out[i] = ((c as f64) * scale) as f32;
     }
-    result
 }
 
 /// IEEE 754 f64 exponent bias.
@@ -347,6 +395,13 @@ const EBIAS_F64: i32 = 1023;
 /// `|coef| ≤ 2^62`, and the header value `emax_biased = frexp_emax + EBIAS`
 /// (i.e., the raw IEEE biased exponent of the largest-magnitude input +1).
 fn fwd_cast_f64(vals: &[f64; BLOCK_SIZE]) -> (u64, [i64; BLOCK_SIZE]) {
+    let mut out = [0i64; BLOCK_SIZE];
+    let e = fwd_cast_f64_slice(vals, &mut out);
+    (e, out)
+}
+
+fn fwd_cast_f64_slice(vals: &[f64], coeffs: &mut [i64]) -> u64 {
+    debug_assert_eq!(vals.len(), coeffs.len());
     let mut ieee_max: i32 = 0;
     for &v in vals {
         let e = ((v.to_bits() >> 52) & 0x7FF) as i32;
@@ -355,27 +410,33 @@ fn fwd_cast_f64(vals: &[f64; BLOCK_SIZE]) -> (u64, [i64; BLOCK_SIZE]) {
         }
     }
     if ieee_max == 0 {
-        return (0, [0; BLOCK_SIZE]);
+        for c in coeffs.iter_mut() {
+            *c = 0;
+        }
+        return 0;
     }
     let emax_biased = (ieee_max + 1) as u64;
-    // scale = 2^(62 - frexp_emax). For f64: frexp_emax = ieee_max - 1022.
-    // => scale_exp = 62 - (ieee_max - 1022) = 1084 - ieee_max.
-    // ieee_max ∈ [1, 2046] ⇒ scale_exp ∈ [-962, 1083]; the upper end exceeds
-    // the normal f64 range so use a two-step build.
     let scale = pow2_f64_wide(1084 - ieee_max);
-    let mut result = [0i64; BLOCK_SIZE];
-    for i in 0..BLOCK_SIZE {
-        let y = vals[i] * scale;
-        result[i] = y as i64; // saturating toward zero, same as C `(Int64)`
+    for i in 0..vals.len() {
+        coeffs[i] = (vals[i] * scale) as i64;
     }
-    (emax_biased, result)
+    emax_biased
 }
 
 /// f64 inverse cast — `value = coef * 2^(emax_biased - EBIAS - 62)`.
 fn inv_cast_f64(emax_biased: u64, coeffs: &[i64; BLOCK_SIZE]) -> [f64; BLOCK_SIZE] {
     let mut result = [0.0f64; BLOCK_SIZE];
+    inv_cast_f64_slice(emax_biased, coeffs, &mut result);
+    result
+}
+
+fn inv_cast_f64_slice(emax_biased: u64, coeffs: &[i64], out: &mut [f64]) {
+    debug_assert_eq!(coeffs.len(), out.len());
+    for v in out.iter_mut() {
+        *v = 0.0;
+    }
     if emax_biased == 0 {
-        return result;
+        return;
     }
     let exp = emax_biased as i32 - EBIAS_F64 - 62;
     let scale = pow2_f64_wide(exp);
@@ -383,9 +444,8 @@ fn inv_cast_f64(emax_biased: u64, coeffs: &[i64; BLOCK_SIZE]) -> [f64; BLOCK_SIZ
         if c == 0 {
             continue;
         }
-        result[i] = (c as f64) * scale;
+        out[i] = (c as f64) * scale;
     }
-    result
 }
 
 /// Like `pow2_f64` but handles `exp` outside `[-1022, 1023]` by splitting
@@ -464,6 +524,172 @@ macro_rules! impl_lift {
 
 impl_lift!(fwd_lift_i32, inv_lift_i32, i32);
 impl_lift!(fwd_lift_i64, inv_lift_i64, i64);
+
+// ---------------------------------------------------------------------------
+// N-D multi-axis lift. For 2D/3D/4D the block is 4^N elements arranged
+// row-major with strides (1, 4, 16, 64, ...). `fwd_xform` applies `fwd_lift`
+// along each axis in turn; `inv_xform` reverses them.
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn fwd_lift_axis_i32(block: &mut [i32], base: usize, stride: usize) {
+    let mut v = [
+        block[base],
+        block[base + stride],
+        block[base + 2 * stride],
+        block[base + 3 * stride],
+    ];
+    fwd_lift_i32(&mut v);
+    block[base] = v[0];
+    block[base + stride] = v[1];
+    block[base + 2 * stride] = v[2];
+    block[base + 3 * stride] = v[3];
+}
+#[inline]
+fn inv_lift_axis_i32(block: &mut [i32], base: usize, stride: usize) {
+    let mut v = [
+        block[base],
+        block[base + stride],
+        block[base + 2 * stride],
+        block[base + 3 * stride],
+    ];
+    inv_lift_i32(&mut v);
+    block[base] = v[0];
+    block[base + stride] = v[1];
+    block[base + 2 * stride] = v[2];
+    block[base + 3 * stride] = v[3];
+}
+#[inline]
+fn fwd_lift_axis_i64(block: &mut [i64], base: usize, stride: usize) {
+    let mut v = [
+        block[base],
+        block[base + stride],
+        block[base + 2 * stride],
+        block[base + 3 * stride],
+    ];
+    fwd_lift_i64(&mut v);
+    block[base] = v[0];
+    block[base + stride] = v[1];
+    block[base + 2 * stride] = v[2];
+    block[base + 3 * stride] = v[3];
+}
+#[inline]
+fn inv_lift_axis_i64(block: &mut [i64], base: usize, stride: usize) {
+    let mut v = [
+        block[base],
+        block[base + stride],
+        block[base + 2 * stride],
+        block[base + 3 * stride],
+    ];
+    inv_lift_i64(&mut v);
+    block[base] = v[0];
+    block[base + stride] = v[1];
+    block[base + 2 * stride] = v[2];
+    block[base + 3 * stride] = v[3];
+}
+
+macro_rules! impl_nd_xform {
+    ($fwd2:ident, $inv2:ident, $fwd3:ident, $inv3:ident, $fwd4:ident, $inv4:ident,
+     $fwd_axis:ident, $inv_axis:ident, $int:ty) => {
+        fn $fwd2(block: &mut [$int; 16]) {
+            for y in 0..4 { $fwd_axis(block.as_mut_slice(), 4 * y, 1); }
+            for x in 0..4 { $fwd_axis(block.as_mut_slice(), x, 4); }
+        }
+        fn $inv2(block: &mut [$int; 16]) {
+            for x in 0..4 { $inv_axis(block.as_mut_slice(), x, 4); }
+            for y in 0..4 { $inv_axis(block.as_mut_slice(), 4 * y, 1); }
+        }
+
+        fn $fwd3(block: &mut [$int; 64]) {
+            for z in 0..4 { for y in 0..4 { $fwd_axis(block.as_mut_slice(), 16 * z + 4 * y, 1); } }
+            for z in 0..4 { for x in 0..4 { $fwd_axis(block.as_mut_slice(), 16 * z + x, 4); } }
+            for y in 0..4 { for x in 0..4 { $fwd_axis(block.as_mut_slice(), 4 * y + x, 16); } }
+        }
+        fn $inv3(block: &mut [$int; 64]) {
+            for y in 0..4 { for x in 0..4 { $inv_axis(block.as_mut_slice(), 4 * y + x, 16); } }
+            for z in 0..4 { for x in 0..4 { $inv_axis(block.as_mut_slice(), 16 * z + x, 4); } }
+            for z in 0..4 { for y in 0..4 { $inv_axis(block.as_mut_slice(), 16 * z + 4 * y, 1); } }
+        }
+
+        fn $fwd4(block: &mut [$int; 256]) {
+            for w in 0..4 { for z in 0..4 { for y in 0..4 {
+                $fwd_axis(block.as_mut_slice(), 64 * w + 16 * z + 4 * y, 1);
+            } } }
+            for w in 0..4 { for z in 0..4 { for x in 0..4 {
+                $fwd_axis(block.as_mut_slice(), 64 * w + 16 * z + x, 4);
+            } } }
+            for w in 0..4 { for y in 0..4 { for x in 0..4 {
+                $fwd_axis(block.as_mut_slice(), 64 * w + 4 * y + x, 16);
+            } } }
+            for z in 0..4 { for y in 0..4 { for x in 0..4 {
+                $fwd_axis(block.as_mut_slice(), 16 * z + 4 * y + x, 64);
+            } } }
+        }
+        fn $inv4(block: &mut [$int; 256]) {
+            for z in 0..4 { for y in 0..4 { for x in 0..4 {
+                $inv_axis(block.as_mut_slice(), 16 * z + 4 * y + x, 64);
+            } } }
+            for w in 0..4 { for y in 0..4 { for x in 0..4 {
+                $inv_axis(block.as_mut_slice(), 64 * w + 4 * y + x, 16);
+            } } }
+            for w in 0..4 { for z in 0..4 { for x in 0..4 {
+                $inv_axis(block.as_mut_slice(), 64 * w + 16 * z + x, 4);
+            } } }
+            for w in 0..4 { for z in 0..4 { for y in 0..4 {
+                $inv_axis(block.as_mut_slice(), 64 * w + 16 * z + 4 * y, 1);
+            } } }
+        }
+    };
+}
+
+impl_nd_xform!(
+    fwd_xform_i32_2d, inv_xform_i32_2d,
+    fwd_xform_i32_3d, inv_xform_i32_3d,
+    fwd_xform_i32_4d, inv_xform_i32_4d,
+    fwd_lift_axis_i32, inv_lift_axis_i32, i32
+);
+impl_nd_xform!(
+    fwd_xform_i64_2d, inv_xform_i64_2d,
+    fwd_xform_i64_3d, inv_xform_i64_3d,
+    fwd_xform_i64_4d, inv_xform_i64_4d,
+    fwd_lift_axis_i64, inv_lift_axis_i64, i64
+);
+
+// ---------------------------------------------------------------------------
+// Coefficient permutation tables (from LLNL/zfp's `codec{2,3,4}.c`).
+// `PERM_D[i]` is the flat index of the i-th coefficient in encoding order.
+// Ordered by polynomial degree / frequency (low-frequency first).
+// ---------------------------------------------------------------------------
+
+const PERM_2: [u8; 16] = [
+    0, 1, 4, 5, 2, 8, 6, 9, 3, 12, 10, 7, 13, 11, 14, 15,
+];
+
+const PERM_3: [u8; 64] = [
+    0, 1, 4, 16, 20, 17, 5, 2, 8, 32, 21, 6, 18, 24, 9, 33,
+    36, 3, 12, 48, 22, 25, 37, 40, 34, 10, 7, 19, 28, 13, 49, 52,
+    41, 38, 26, 23, 29, 53, 11, 35, 44, 14, 50, 56, 42, 27, 39, 45,
+    30, 54, 57, 60, 51, 15, 43, 46, 58, 61, 55, 31, 62, 59, 47, 63,
+];
+
+const PERM_4: [u8; 256] = [
+    0, 1, 4, 16, 64, 5, 80, 17, 68, 65, 20, 2, 8, 32, 128, 84,
+    81, 69, 21, 6, 18, 66, 24, 72, 9, 96, 33, 36, 129, 132, 144, 3,
+    12, 48, 192, 85, 82, 70, 22, 73, 25, 88, 37, 100, 97, 148, 145, 133,
+    10, 160, 34, 136, 130, 40, 7, 19, 67, 28, 76, 13, 112, 49, 52, 193,
+    196, 208, 86, 89, 101, 149, 161, 137, 41, 134, 38, 164, 26, 152, 146, 104,
+    98, 74, 83, 71, 23, 77, 29, 92, 53, 116, 113, 212, 209, 197, 11, 35,
+    131, 44, 140, 14, 176, 50, 56, 194, 200, 224, 90, 165, 102, 153, 150, 105,
+    168, 162, 138, 42, 87, 93, 117, 213, 27, 75, 99, 39, 135, 147, 108, 45,
+    141, 156, 30, 78, 177, 180, 54, 114, 120, 57, 198, 210, 216, 201, 225, 228,
+    15, 240, 51, 204, 195, 60, 169, 166, 154, 106, 91, 103, 151, 109, 157, 94,
+    181, 118, 121, 214, 217, 229, 163, 139, 43, 142, 46, 172, 58, 184, 178, 232,
+    226, 202, 241, 205, 61, 199, 55, 244, 31, 220, 211, 124, 115, 79, 170, 167,
+    155, 107, 158, 110, 173, 122, 185, 182, 233, 230, 218, 95, 245, 119, 221, 215,
+    125, 242, 206, 62, 203, 59, 248, 47, 236, 227, 188, 179, 143, 171, 174, 186,
+    234, 246, 222, 126, 219, 123, 249, 111, 237, 231, 189, 183, 159, 252, 243, 207,
+    63, 175, 250, 187, 238, 235, 190, 253, 247, 223, 127, 254, 251, 239, 191, 255,
+];
 
 // ---------------------------------------------------------------------------
 // Negabinary conversion (signed ↔ unsigned).
@@ -613,6 +839,113 @@ macro_rules! impl_few_ints {
 
 impl_few_ints!(encode_few_ints_u32, decode_few_ints_u32, u32, 32u32);
 impl_few_ints!(encode_few_ints_u64, decode_few_ints_u64, u64, 64u32);
+
+/// `encode_many_ints` / `decode_many_ints` ports for `size > 64` (used by 4D
+/// blocks, which have 256 coefficients). Same algorithm as the `few` variant
+/// but the bit plane is not packed into a single u64 — the encoder iterates
+/// `data[i] >> k` directly and tracks the remaining-1-bit count in `c`.
+macro_rules! impl_many_ints {
+    ($enc:ident, $dec:ident, $uint:ty, $intprec:expr) => {
+        fn $enc(
+            w: &mut BitWriter,
+            maxbits: usize,
+            maxprec: u32,
+            data: &[$uint],
+            size: usize,
+        ) -> usize {
+            let kmin: u32 = $intprec.saturating_sub(maxprec);
+            let mut bits = maxbits;
+            let mut n: usize = 0;
+            let mut k: u32 = $intprec;
+            while bits > 0 && k > kmin {
+                k -= 1;
+                // step 1: emit first n bits (refinement for already-sig coefs)
+                let m = n.min(bits);
+                bits -= m;
+                for i in 0..m {
+                    w.write_bit((data[i] >> k) & 1 == 1);
+                }
+                // step 2: count remaining 1-bits in this plane
+                let mut c: usize = 0;
+                for i in m..size {
+                    if (data[i] >> k) & 1 == 1 {
+                        c += 1;
+                    }
+                }
+                // step 3: unary run-length encode remainder
+                while bits > 0 && n < size {
+                    bits -= 1;
+                    let group = c > 0;
+                    w.write_bit(group);
+                    if !group {
+                        break;
+                    }
+                    // found at least one; scan for the next 1-bit
+                    c -= 1;
+                    while bits > 0 && n < size - 1 {
+                        bits -= 1;
+                        let bit = (data[n] >> k) & 1 == 1;
+                        w.write_bit(bit);
+                        if bit {
+                            break;
+                        }
+                        n += 1;
+                    }
+                    n += 1;
+                }
+            }
+            maxbits - bits
+        }
+
+        fn $dec(
+            r: &mut BitReader<'_>,
+            maxbits: usize,
+            maxprec: u32,
+            data: &mut [$uint],
+            size: usize,
+        ) -> usize {
+            let kmin: u32 = $intprec.saturating_sub(maxprec);
+            let mut bits = maxbits;
+            let mut n: usize = 0;
+            for v in data.iter_mut().take(size) {
+                *v = 0;
+            }
+            let mut k: u32 = $intprec;
+            while bits > 0 && k > kmin {
+                k -= 1;
+                // step 1: decode first n bits
+                let m = n.min(bits);
+                bits -= m;
+                for i in 0..m {
+                    if r.read_bit() {
+                        data[i] |= (1 as $uint) << k;
+                    }
+                }
+                // step 2: unary run-length decode remainder
+                while bits > 0 && n < size {
+                    bits -= 1;
+                    if r.read_bit() {
+                        while bits > 0 && n < size - 1 {
+                            bits -= 1;
+                            if r.read_bit() {
+                                break;
+                            }
+                            n += 1;
+                        }
+                        data[n] |= (1 as $uint) << k;
+                    } else {
+                        break;
+                    }
+                    n += 1;
+                }
+            }
+            maxbits - bits
+        }
+    };
+}
+
+impl_many_ints!(encode_many_ints_u32, decode_many_ints_u32, u32, 32u32);
+impl_many_ints!(encode_many_ints_u64, decode_many_ints_u64, u64, 64u32);
 
 // ---------------------------------------------------------------------------
 // Block-level encode / decode
@@ -802,6 +1135,178 @@ impl_int_block_codec!(
     encode_few_ints_u64, decode_few_ints_u64, 64u32
 );
 
+// ---------------------------------------------------------------------------
+// N-D block codec (2D / 3D / 4D). Structure identical to the 1D code above
+// but with larger blocks and a coefficient permutation (`PERM_D`). 4D blocks
+// have 256 coefficients, beyond the 64-coefficient `encode_few_ints` limit,
+// so they use `encode_many_ints` instead.
+// ---------------------------------------------------------------------------
+
+macro_rules! impl_float_block_nd {
+    ($enc:ident, $dec:ident, $bs:expr, $scalar:ty, $int:ty, $uint:ty, $zero:expr,
+     $fwd_cast_slice:ident, $inv_cast_slice:ident,
+     $fwd_xform:ident, $inv_xform:ident,
+     $int2uint:ident, $uint2int:ident, $perm:ident,
+     $enc_ints:ident, $dec_ints:ident, $intprec:expr,
+     $ebits:expr, $emax_ty:ty) => {
+        fn $enc(w: &mut BitWriter, block: &[$scalar; $bs], maxbits: usize) {
+            let start = w.position();
+            let mut icoeffs = [0 as $int; $bs];
+            let emax_biased = $fwd_cast_slice(block, &mut icoeffs);
+            if emax_biased == 0 {
+                w.write_bit(false);
+                pad_bits(w, maxbits.saturating_sub(1));
+                return;
+            }
+            w.write_bit(true);
+            w.write($ebits, emax_biased as u64);
+            $fwd_xform(&mut icoeffs);
+            let mut ucoeffs = [0 as $uint; $bs];
+            for i in 0..$bs {
+                ucoeffs[i] = $int2uint(icoeffs[$perm[i] as usize]);
+            }
+            let header_bits = 1 + ($ebits as usize);
+            let coeff_bits = maxbits.saturating_sub(header_bits);
+            $enc_ints(w, coeff_bits, $intprec, &ucoeffs, $bs);
+            let used = w.position() - start;
+            pad_bits(w, maxbits.saturating_sub(used));
+        }
+
+        fn $dec(
+            r: &mut BitReader<'_>,
+            maxbits: usize,
+        ) -> Result<[$scalar; $bs], FormatError> {
+            let nonempty = r.read_bit();
+            if !nonempty {
+                let remaining = maxbits.saturating_sub(1);
+                // skip_bits handles > 64 bits
+                skip_bits(r, remaining);
+                return Ok([$zero; $bs]);
+            }
+            let emax_biased: $emax_ty = r.read($ebits) as $emax_ty;
+            let header_bits = 1 + ($ebits as usize);
+            let coeff_bits = maxbits.saturating_sub(header_bits);
+            let mut ucoeffs = [0 as $uint; $bs];
+            let bits_consumed = $dec_ints(r, coeff_bits, $intprec, &mut ucoeffs, $bs);
+            skip_bits(r, coeff_bits.saturating_sub(bits_consumed));
+            let mut icoeffs = [0 as $int; $bs];
+            for i in 0..$bs {
+                icoeffs[$perm[i] as usize] = $uint2int(ucoeffs[i]);
+            }
+            $inv_xform(&mut icoeffs);
+            let mut out = [$zero; $bs];
+            $inv_cast_slice(emax_biased, &icoeffs, &mut out);
+            Ok(out)
+        }
+    };
+}
+
+macro_rules! impl_int_block_nd {
+    ($enc:ident, $dec:ident, $bs:expr, $int:ty, $uint:ty, $zero:expr,
+     $fwd_xform:ident, $inv_xform:ident,
+     $int2uint:ident, $uint2int:ident, $perm:ident,
+     $enc_ints:ident, $dec_ints:ident, $intprec:expr) => {
+        fn $enc(w: &mut BitWriter, block: &[$int; $bs], maxbits: usize) {
+            let start = w.position();
+            let mut icoeffs = *block;
+            $fwd_xform(&mut icoeffs);
+            let mut ucoeffs = [0 as $uint; $bs];
+            for i in 0..$bs {
+                ucoeffs[i] = $int2uint(icoeffs[$perm[i] as usize]);
+            }
+            $enc_ints(w, maxbits, $intprec, &ucoeffs, $bs);
+            let used = w.position() - start;
+            pad_bits(w, maxbits.saturating_sub(used));
+        }
+        fn $dec(
+            r: &mut BitReader<'_>,
+            maxbits: usize,
+        ) -> Result<[$int; $bs], FormatError> {
+            let mut ucoeffs = [0 as $uint; $bs];
+            let bits_consumed = $dec_ints(r, maxbits, $intprec, &mut ucoeffs, $bs);
+            skip_bits(r, maxbits.saturating_sub(bits_consumed));
+            let mut icoeffs = [$zero; $bs];
+            for i in 0..$bs {
+                icoeffs[$perm[i] as usize] = $uint2int(ucoeffs[i]);
+            }
+            $inv_xform(&mut icoeffs);
+            Ok(icoeffs)
+        }
+    };
+}
+
+// 2D block codec (16 coefs).
+impl_float_block_nd!(
+    encode_block_f32_2d, decode_block_f32_2d, 16, f32, i32, u32, 0.0f32,
+    fwd_cast_f32_slice, inv_cast_f32_slice, fwd_xform_i32_2d, inv_xform_i32_2d,
+    int2uint_i32, uint2int_i32, PERM_2,
+    encode_few_ints_u32, decode_few_ints_u32, 32u32, EBITS_F32, u32
+);
+impl_float_block_nd!(
+    encode_block_f64_2d, decode_block_f64_2d, 16, f64, i64, u64, 0.0f64,
+    fwd_cast_f64_slice, inv_cast_f64_slice, fwd_xform_i64_2d, inv_xform_i64_2d,
+    int2uint_i64, uint2int_i64, PERM_2,
+    encode_few_ints_u64, decode_few_ints_u64, 64u32, EBITS_F64, u64
+);
+impl_int_block_nd!(
+    encode_block_i32_2d, decode_block_i32_2d, 16, i32, u32, 0i32,
+    fwd_xform_i32_2d, inv_xform_i32_2d, int2uint_i32, uint2int_i32, PERM_2,
+    encode_few_ints_u32, decode_few_ints_u32, 32u32
+);
+impl_int_block_nd!(
+    encode_block_i64_2d, decode_block_i64_2d, 16, i64, u64, 0i64,
+    fwd_xform_i64_2d, inv_xform_i64_2d, int2uint_i64, uint2int_i64, PERM_2,
+    encode_few_ints_u64, decode_few_ints_u64, 64u32
+);
+
+// 3D block codec (64 coefs).
+impl_float_block_nd!(
+    encode_block_f32_3d, decode_block_f32_3d, 64, f32, i32, u32, 0.0f32,
+    fwd_cast_f32_slice, inv_cast_f32_slice, fwd_xform_i32_3d, inv_xform_i32_3d,
+    int2uint_i32, uint2int_i32, PERM_3,
+    encode_few_ints_u32, decode_few_ints_u32, 32u32, EBITS_F32, u32
+);
+impl_float_block_nd!(
+    encode_block_f64_3d, decode_block_f64_3d, 64, f64, i64, u64, 0.0f64,
+    fwd_cast_f64_slice, inv_cast_f64_slice, fwd_xform_i64_3d, inv_xform_i64_3d,
+    int2uint_i64, uint2int_i64, PERM_3,
+    encode_few_ints_u64, decode_few_ints_u64, 64u32, EBITS_F64, u64
+);
+impl_int_block_nd!(
+    encode_block_i32_3d, decode_block_i32_3d, 64, i32, u32, 0i32,
+    fwd_xform_i32_3d, inv_xform_i32_3d, int2uint_i32, uint2int_i32, PERM_3,
+    encode_few_ints_u32, decode_few_ints_u32, 32u32
+);
+impl_int_block_nd!(
+    encode_block_i64_3d, decode_block_i64_3d, 64, i64, u64, 0i64,
+    fwd_xform_i64_3d, inv_xform_i64_3d, int2uint_i64, uint2int_i64, PERM_3,
+    encode_few_ints_u64, decode_few_ints_u64, 64u32
+);
+
+// 4D block codec (256 coefs) — uses `encode_many_ints` / `decode_many_ints`.
+impl_float_block_nd!(
+    encode_block_f32_4d, decode_block_f32_4d, 256, f32, i32, u32, 0.0f32,
+    fwd_cast_f32_slice, inv_cast_f32_slice, fwd_xform_i32_4d, inv_xform_i32_4d,
+    int2uint_i32, uint2int_i32, PERM_4,
+    encode_many_ints_u32, decode_many_ints_u32, 32u32, EBITS_F32, u32
+);
+impl_float_block_nd!(
+    encode_block_f64_4d, decode_block_f64_4d, 256, f64, i64, u64, 0.0f64,
+    fwd_cast_f64_slice, inv_cast_f64_slice, fwd_xform_i64_4d, inv_xform_i64_4d,
+    int2uint_i64, uint2int_i64, PERM_4,
+    encode_many_ints_u64, decode_many_ints_u64, 64u32, EBITS_F64, u64
+);
+impl_int_block_nd!(
+    encode_block_i32_4d, decode_block_i32_4d, 256, i32, u32, 0i32,
+    fwd_xform_i32_4d, inv_xform_i32_4d, int2uint_i32, uint2int_i32, PERM_4,
+    encode_many_ints_u32, decode_many_ints_u32, 32u32
+);
+impl_int_block_nd!(
+    encode_block_i64_4d, decode_block_i64_4d, 256, i64, u64, 0i64,
+    fwd_xform_i64_4d, inv_xform_i64_4d, int2uint_i64, uint2int_i64, PERM_4,
+    encode_many_ints_u64, decode_many_ints_u64, 64u32
+);
+
 /// Write `n` zero bits.
 fn pad_bits(w: &mut BitWriter, n: usize) {
     // Write in chunks of 64
@@ -834,130 +1339,10 @@ fn skip_bits(r: &mut BitReader<'_>, n: usize) {
 /// ZFP compression mode stored in cd\_values\[0\].
 const ZFP_MODE_RATE: u32 = 1;
 
-/// Compress an f32 array using ZFP fixed-rate mode.
-///
-/// The input is a byte slice containing little-endian f32 values. The `rate`
-/// parameter specifies bits per value (e.g. 16.0 means each block of 4 values
-/// gets 64 bits of compressed output).
-///
-/// Returns the compressed byte stream.
-pub fn compress_f32(data: &[u8], rate: f64) -> Result<Vec<u8>, FormatError> {
-    let num_floats = data.len() / 4;
-    let maxbits = (rate * BLOCK_SIZE as f64) as usize;
-    let num_blocks = num_floats.div_ceil(BLOCK_SIZE);
-    let total_bits = num_blocks * maxbits;
-
-    let mut w = BitWriter::new();
-
-    let mut i = 0;
-    while i < num_floats {
-        let mut block = [0.0f32; BLOCK_SIZE];
-        let n_real = (num_floats - i).min(BLOCK_SIZE);
-        for j in 0..n_real {
-            let off = (i + j) * 4;
-            block[j] =
-                f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
-        }
-        pad_partial_block_f32(&mut block, n_real);
-        encode_block_f32(&mut w, &block, maxbits);
-        i += BLOCK_SIZE;
-    }
-
-    let mut out = w.finish();
-    // Truncate trailing word-alignment padding so that the output length
-    // matches the exact bit budget (what H5Z-ZFP stores on disk).
-    out.truncate(total_bits.div_ceil(8));
-    Ok(out)
+#[inline]
+fn f32_from_le(b: [u8; 4]) -> f32 {
+    f32::from_le_bytes(b)
 }
-
-/// Decompress a ZFP-compressed f32 stream.
-///
-/// `compressed` is the raw compressed bytes. `num_floats` is the number of
-/// f32 values in the original uncompressed data. `rate` is the bits-per-value
-/// rate used during compression.
-///
-/// Returns the decompressed data as little-endian f32 bytes.
-pub fn decompress_f32(
-    compressed: &[u8],
-    num_floats: usize,
-    rate: f64,
-) -> Result<Vec<u8>, FormatError> {
-    let maxbits = (rate * BLOCK_SIZE as f64) as usize;
-
-    let mut r = BitReader::new(compressed);
-    let mut output = Vec::with_capacity(num_floats * 4);
-
-    let mut i = 0;
-    while i < num_floats {
-        let block = decode_block_f32(&mut r, maxbits)?;
-        let count = BLOCK_SIZE.min(num_floats - i);
-        for j in 0..count {
-            output.extend_from_slice(&block[j].to_le_bytes());
-        }
-        i += BLOCK_SIZE;
-    }
-
-    Ok(output)
-}
-
-/// Per-type 1D compress/decompress. Same structure as `compress_f32` /
-/// `decompress_f32` but parameterized over scalar width and the block
-/// encoder/decoder/padder used.
-macro_rules! impl_compress_1d {
-    ($compress:ident, $decompress:ident, $scalar:ty, $zero:expr,
-     $elem_bytes:expr, $from_le:path, $encode_block:ident, $decode_block:ident,
-     $pad_partial:ident) => {
-        #[doc = concat!("Compress a 1D ", stringify!($scalar), " array via ZFP fixed-rate.")]
-        pub fn $compress(data: &[u8], rate: f64) -> Result<Vec<u8>, FormatError> {
-            const ESZ: usize = $elem_bytes;
-            let num_values = data.len() / ESZ;
-            let maxbits = (rate * BLOCK_SIZE as f64) as usize;
-            let num_blocks = num_values.div_ceil(BLOCK_SIZE);
-            let total_bits = num_blocks * maxbits;
-            let mut w = BitWriter::new();
-            let mut i = 0;
-            while i < num_values {
-                let mut block = [$zero; BLOCK_SIZE];
-                let n_real = (num_values - i).min(BLOCK_SIZE);
-                for j in 0..n_real {
-                    let off = (i + j) * ESZ;
-                    let mut buf = [0u8; ESZ];
-                    buf.copy_from_slice(&data[off..off + ESZ]);
-                    block[j] = $from_le(buf);
-                }
-                $pad_partial(&mut block, n_real);
-                $encode_block(&mut w, &block, maxbits);
-                i += BLOCK_SIZE;
-            }
-            let mut out = w.finish();
-            out.truncate(total_bits.div_ceil(8));
-            Ok(out)
-        }
-
-        #[doc = concat!("Decompress to 1D ", stringify!($scalar), " bytes (little-endian).")]
-        pub fn $decompress(
-            compressed: &[u8],
-            num_values: usize,
-            rate: f64,
-        ) -> Result<Vec<u8>, FormatError> {
-            const ESZ: usize = $elem_bytes;
-            let maxbits = (rate * BLOCK_SIZE as f64) as usize;
-            let mut r = BitReader::new(compressed);
-            let mut output = Vec::with_capacity(num_values * ESZ);
-            let mut i = 0;
-            while i < num_values {
-                let block = $decode_block(&mut r, maxbits)?;
-                let count = BLOCK_SIZE.min(num_values - i);
-                for j in 0..count {
-                    output.extend_from_slice(&block[j].to_le_bytes());
-                }
-                i += BLOCK_SIZE;
-            }
-            Ok(output)
-        }
-    };
-}
-
 #[inline]
 fn f64_from_le(b: [u8; 8]) -> f64 {
     f64::from_le_bytes(b)
@@ -971,18 +1356,441 @@ fn i64_from_le(b: [u8; 8]) -> i64 {
     i64::from_le_bytes(b)
 }
 
-impl_compress_1d!(
-    compress_f64, decompress_f64, f64, 0.0f64,
-    8, f64_from_le, encode_block_f64, decode_block_f64, pad_partial_block_f64
+/// Generates a per-scalar codec module with 1D/2D/3D/4D compress and
+/// decompress functions, plus public dispatchers `compress` / `decompress`
+/// that route by `dims.len()`. Dims use HDF5 row-major convention (outermost
+/// first; the last entry is the fastest-varying axis).
+macro_rules! impl_codec {
+    (
+        $mod_name:ident, $scalar:ty, $zero_s:expr, $esz:expr, $from_le:path,
+        $pad1:ident, $pad_s:ident,
+        $enc1:ident, $dec1:ident,
+        $enc2:ident, $dec2:ident,
+        $enc3:ident, $dec3:ident,
+        $enc4:ident, $dec4:ident
+    ) => {
+        pub(crate) mod $mod_name {
+            use super::*;
+
+            pub fn compress(
+                data: &[u8],
+                dims: &[usize],
+                rate: f64,
+            ) -> Result<Vec<u8>, FormatError> {
+                match dims.len() {
+                    1 => compress_1d(data, dims[0], rate),
+                    2 => compress_2d(data, dims[0], dims[1], rate),
+                    3 => compress_3d(data, dims[0], dims[1], dims[2], rate),
+                    4 => compress_4d(data, dims[0], dims[1], dims[2], dims[3], rate),
+                    _ => Err(FormatError::FilterError(
+                        "ZFP: only 1D-4D supported".into(),
+                    )),
+                }
+            }
+
+            pub fn decompress(
+                compressed: &[u8],
+                dims: &[usize],
+                rate: f64,
+            ) -> Result<Vec<u8>, FormatError> {
+                match dims.len() {
+                    1 => decompress_1d(compressed, dims[0], rate),
+                    2 => decompress_2d(compressed, dims[0], dims[1], rate),
+                    3 => decompress_3d(compressed, dims[0], dims[1], dims[2], rate),
+                    4 => decompress_4d(compressed, dims[0], dims[1], dims[2], dims[3], rate),
+                    _ => Err(FormatError::FilterError(
+                        "ZFP: only 1D-4D supported".into(),
+                    )),
+                }
+            }
+
+            fn compress_1d(data: &[u8], n: usize, rate: f64) -> Result<Vec<u8>, FormatError> {
+                let maxbits = (rate * 4.0) as usize;
+                let total_bits = n.div_ceil(4) * maxbits;
+                let mut w = BitWriter::new();
+                let mut i = 0;
+                while i < n {
+                    let mut block = [$zero_s; 4];
+                    let nr = (n - i).min(4);
+                    for j in 0..nr {
+                        let off = (i + j) * $esz;
+                        let mut buf = [0u8; $esz];
+                        buf.copy_from_slice(&data[off..off + $esz]);
+                        block[j] = $from_le(buf);
+                    }
+                    $pad1(&mut block, nr);
+                    $enc1(&mut w, &block, maxbits);
+                    i += 4;
+                }
+                let mut out = w.finish();
+                out.truncate(total_bits.div_ceil(8));
+                Ok(out)
+            }
+
+            fn decompress_1d(
+                compressed: &[u8],
+                n: usize,
+                rate: f64,
+            ) -> Result<Vec<u8>, FormatError> {
+                let maxbits = (rate * 4.0) as usize;
+                let mut r = BitReader::new(compressed);
+                let mut output = Vec::with_capacity(n * $esz);
+                let mut i = 0;
+                while i < n {
+                    let block = $dec1(&mut r, maxbits)?;
+                    let c = (n - i).min(4);
+                    for j in 0..c {
+                        output.extend_from_slice(&block[j].to_le_bytes());
+                    }
+                    i += 4;
+                }
+                Ok(output)
+            }
+
+            fn compress_2d(
+                data: &[u8],
+                n1: usize,
+                n0: usize,
+                rate: f64,
+            ) -> Result<Vec<u8>, FormatError> {
+                let maxbits = (rate * 16.0) as usize;
+                let nb1 = n1.div_ceil(4);
+                let nb0 = n0.div_ceil(4);
+                let total_bits = nb1 * nb0 * maxbits;
+                let mut w = BitWriter::new();
+                for b1 in 0..nb1 {
+                    for b0 in 0..nb0 {
+                        let y0 = b1 * 4;
+                        let x0 = b0 * 4;
+                        let ry = (n1 - y0).min(4);
+                        let rx = (n0 - x0).min(4);
+                        let mut block = [$zero_s; 16];
+                        for y in 0..ry {
+                            for x in 0..rx {
+                                let src = (y0 + y) * n0 + (x0 + x);
+                                let off = src * $esz;
+                                let mut buf = [0u8; $esz];
+                                buf.copy_from_slice(&data[off..off + $esz]);
+                                block[4 * y + x] = $from_le(buf);
+                            }
+                            $pad_s(block.as_mut_slice(), 4 * y, rx, 1);
+                        }
+                        for x in 0..4 {
+                            $pad_s(block.as_mut_slice(), x, ry, 4);
+                        }
+                        $enc2(&mut w, &block, maxbits);
+                    }
+                }
+                let mut out = w.finish();
+                out.truncate(total_bits.div_ceil(8));
+                Ok(out)
+            }
+
+            fn decompress_2d(
+                compressed: &[u8],
+                n1: usize,
+                n0: usize,
+                rate: f64,
+            ) -> Result<Vec<u8>, FormatError> {
+                let maxbits = (rate * 16.0) as usize;
+                let nb1 = n1.div_ceil(4);
+                let nb0 = n0.div_ceil(4);
+                let mut r = BitReader::new(compressed);
+                let mut output = vec![0u8; n1 * n0 * $esz];
+                for b1 in 0..nb1 {
+                    for b0 in 0..nb0 {
+                        let y0 = b1 * 4;
+                        let x0 = b0 * 4;
+                        let block = $dec2(&mut r, maxbits)?;
+                        let ry = (n1 - y0).min(4);
+                        let rx = (n0 - x0).min(4);
+                        for y in 0..ry {
+                            for x in 0..rx {
+                                let dst = (y0 + y) * n0 + (x0 + x);
+                                let off = dst * $esz;
+                                output[off..off + $esz]
+                                    .copy_from_slice(&block[4 * y + x].to_le_bytes());
+                            }
+                        }
+                    }
+                }
+                Ok(output)
+            }
+
+            fn compress_3d(
+                data: &[u8],
+                n2: usize,
+                n1: usize,
+                n0: usize,
+                rate: f64,
+            ) -> Result<Vec<u8>, FormatError> {
+                let maxbits = (rate * 64.0) as usize;
+                let nb2 = n2.div_ceil(4);
+                let nb1 = n1.div_ceil(4);
+                let nb0 = n0.div_ceil(4);
+                let total_bits = nb2 * nb1 * nb0 * maxbits;
+                let mut w = BitWriter::new();
+                for b2 in 0..nb2 {
+                    for b1 in 0..nb1 {
+                        for b0 in 0..nb0 {
+                            let z0 = b2 * 4;
+                            let y0 = b1 * 4;
+                            let x0 = b0 * 4;
+                            let rz = (n2 - z0).min(4);
+                            let ry = (n1 - y0).min(4);
+                            let rx = (n0 - x0).min(4);
+                            let mut block = [$zero_s; 64];
+                            for z in 0..rz {
+                                for y in 0..ry {
+                                    for x in 0..rx {
+                                        let src = ((z0 + z) * n1 + (y0 + y)) * n0 + (x0 + x);
+                                        let off = src * $esz;
+                                        let mut buf = [0u8; $esz];
+                                        buf.copy_from_slice(&data[off..off + $esz]);
+                                        block[16 * z + 4 * y + x] = $from_le(buf);
+                                    }
+                                    $pad_s(block.as_mut_slice(), 16 * z + 4 * y, rx, 1);
+                                }
+                                for x in 0..4 {
+                                    $pad_s(block.as_mut_slice(), 16 * z + x, ry, 4);
+                                }
+                            }
+                            for y in 0..4 {
+                                for x in 0..4 {
+                                    $pad_s(block.as_mut_slice(), 4 * y + x, rz, 16);
+                                }
+                            }
+                            $enc3(&mut w, &block, maxbits);
+                        }
+                    }
+                }
+                let mut out = w.finish();
+                out.truncate(total_bits.div_ceil(8));
+                Ok(out)
+            }
+
+            fn decompress_3d(
+                compressed: &[u8],
+                n2: usize,
+                n1: usize,
+                n0: usize,
+                rate: f64,
+            ) -> Result<Vec<u8>, FormatError> {
+                let maxbits = (rate * 64.0) as usize;
+                let nb2 = n2.div_ceil(4);
+                let nb1 = n1.div_ceil(4);
+                let nb0 = n0.div_ceil(4);
+                let mut r = BitReader::new(compressed);
+                let mut output = vec![0u8; n2 * n1 * n0 * $esz];
+                for b2 in 0..nb2 {
+                    for b1 in 0..nb1 {
+                        for b0 in 0..nb0 {
+                            let z0 = b2 * 4;
+                            let y0 = b1 * 4;
+                            let x0 = b0 * 4;
+                            let block = $dec3(&mut r, maxbits)?;
+                            let rz = (n2 - z0).min(4);
+                            let ry = (n1 - y0).min(4);
+                            let rx = (n0 - x0).min(4);
+                            for z in 0..rz {
+                                for y in 0..ry {
+                                    for x in 0..rx {
+                                        let dst = ((z0 + z) * n1 + (y0 + y)) * n0 + (x0 + x);
+                                        let off = dst * $esz;
+                                        output[off..off + $esz].copy_from_slice(
+                                            &block[16 * z + 4 * y + x].to_le_bytes(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(output)
+            }
+
+            fn compress_4d(
+                data: &[u8],
+                n3: usize,
+                n2: usize,
+                n1: usize,
+                n0: usize,
+                rate: f64,
+            ) -> Result<Vec<u8>, FormatError> {
+                let maxbits = (rate * 256.0) as usize;
+                let nb3 = n3.div_ceil(4);
+                let nb2 = n2.div_ceil(4);
+                let nb1 = n1.div_ceil(4);
+                let nb0 = n0.div_ceil(4);
+                let total_bits = nb3 * nb2 * nb1 * nb0 * maxbits;
+                let mut w = BitWriter::new();
+                for b3 in 0..nb3 {
+                    for b2 in 0..nb2 {
+                        for b1 in 0..nb1 {
+                            for b0 in 0..nb0 {
+                                let w0 = b3 * 4;
+                                let z0 = b2 * 4;
+                                let y0 = b1 * 4;
+                                let x0 = b0 * 4;
+                                let rw = (n3 - w0).min(4);
+                                let rz = (n2 - z0).min(4);
+                                let ry = (n1 - y0).min(4);
+                                let rx = (n0 - x0).min(4);
+                                let mut block = [$zero_s; 256];
+                                for wi in 0..rw {
+                                    for z in 0..rz {
+                                        for y in 0..ry {
+                                            for x in 0..rx {
+                                                let src = (((w0 + wi) * n2 + (z0 + z)) * n1
+                                                    + (y0 + y))
+                                                    * n0
+                                                    + (x0 + x);
+                                                let off = src * $esz;
+                                                let mut buf = [0u8; $esz];
+                                                buf.copy_from_slice(&data[off..off + $esz]);
+                                                block[64 * wi + 16 * z + 4 * y + x] = $from_le(buf);
+                                            }
+                                            $pad_s(
+                                                block.as_mut_slice(),
+                                                64 * wi + 16 * z + 4 * y,
+                                                rx,
+                                                1,
+                                            );
+                                        }
+                                        for x in 0..4 {
+                                            $pad_s(
+                                                block.as_mut_slice(),
+                                                64 * wi + 16 * z + x,
+                                                ry,
+                                                4,
+                                            );
+                                        }
+                                    }
+                                    for y in 0..4 {
+                                        for x in 0..4 {
+                                            $pad_s(
+                                                block.as_mut_slice(),
+                                                64 * wi + 4 * y + x,
+                                                rz,
+                                                16,
+                                            );
+                                        }
+                                    }
+                                }
+                                for z in 0..4 {
+                                    for y in 0..4 {
+                                        for x in 0..4 {
+                                            $pad_s(
+                                                block.as_mut_slice(),
+                                                16 * z + 4 * y + x,
+                                                rw,
+                                                64,
+                                            );
+                                        }
+                                    }
+                                }
+                                $enc4(&mut w, &block, maxbits);
+                            }
+                        }
+                    }
+                }
+                let mut out = w.finish();
+                out.truncate(total_bits.div_ceil(8));
+                Ok(out)
+            }
+
+            fn decompress_4d(
+                compressed: &[u8],
+                n3: usize,
+                n2: usize,
+                n1: usize,
+                n0: usize,
+                rate: f64,
+            ) -> Result<Vec<u8>, FormatError> {
+                let maxbits = (rate * 256.0) as usize;
+                let nb3 = n3.div_ceil(4);
+                let nb2 = n2.div_ceil(4);
+                let nb1 = n1.div_ceil(4);
+                let nb0 = n0.div_ceil(4);
+                let mut r = BitReader::new(compressed);
+                let mut output = vec![0u8; n3 * n2 * n1 * n0 * $esz];
+                for b3 in 0..nb3 {
+                    for b2 in 0..nb2 {
+                        for b1 in 0..nb1 {
+                            for b0 in 0..nb0 {
+                                let w0 = b3 * 4;
+                                let z0 = b2 * 4;
+                                let y0 = b1 * 4;
+                                let x0 = b0 * 4;
+                                let block = $dec4(&mut r, maxbits)?;
+                                let rw = (n3 - w0).min(4);
+                                let rz = (n2 - z0).min(4);
+                                let ry = (n1 - y0).min(4);
+                                let rx = (n0 - x0).min(4);
+                                for wi in 0..rw {
+                                    for z in 0..rz {
+                                        for y in 0..ry {
+                                            for x in 0..rx {
+                                                let dst = (((w0 + wi) * n2 + (z0 + z)) * n1
+                                                    + (y0 + y))
+                                                    * n0
+                                                    + (x0 + x);
+                                                let off = dst * $esz;
+                                                output[off..off + $esz].copy_from_slice(
+                                                    &block[64 * wi + 16 * z + 4 * y + x]
+                                                        .to_le_bytes(),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(output)
+            }
+        }
+    };
+}
+
+impl_codec!(
+    codec_f32, f32, 0.0f32, 4, f32_from_le,
+    pad_partial_block_f32, pad_strided_f32,
+    encode_block_f32, decode_block_f32,
+    encode_block_f32_2d, decode_block_f32_2d,
+    encode_block_f32_3d, decode_block_f32_3d,
+    encode_block_f32_4d, decode_block_f32_4d
 );
-impl_compress_1d!(
-    compress_i32, decompress_i32, i32, 0i32,
-    4, i32_from_le, encode_block_i32, decode_block_i32, pad_partial_block_i32
+impl_codec!(
+    codec_f64, f64, 0.0f64, 8, f64_from_le,
+    pad_partial_block_f64, pad_strided_f64,
+    encode_block_f64, decode_block_f64,
+    encode_block_f64_2d, decode_block_f64_2d,
+    encode_block_f64_3d, decode_block_f64_3d,
+    encode_block_f64_4d, decode_block_f64_4d
 );
-impl_compress_1d!(
-    compress_i64, decompress_i64, i64, 0i64,
-    8, i64_from_le, encode_block_i64, decode_block_i64, pad_partial_block_i64
+impl_codec!(
+    codec_i32, i32, 0i32, 4, i32_from_le,
+    pad_partial_block_i32, pad_strided_i32,
+    encode_block_i32, decode_block_i32,
+    encode_block_i32_2d, decode_block_i32_2d,
+    encode_block_i32_3d, decode_block_i32_3d,
+    encode_block_i32_4d, decode_block_i32_4d
 );
+impl_codec!(
+    codec_i64, i64, 0i64, 8, i64_from_le,
+    pad_partial_block_i64, pad_strided_i64,
+    encode_block_i64, decode_block_i64,
+    encode_block_i64_2d, decode_block_i64_2d,
+    encode_block_i64_3d, decode_block_i64_3d,
+    encode_block_i64_4d, decode_block_i64_4d
+);
+
+pub use codec_f32::{compress as compress_f32, decompress as decompress_f32};
+pub use codec_f64::{compress as compress_f64, decompress as decompress_f64};
+pub use codec_i32::{compress as compress_i32, decompress as decompress_i32};
+pub use codec_i64::{compress as compress_i64, decompress as decompress_i64};
 
 /// Build ZFP cd\_values for HDF5 filter metadata (fixed-rate mode).
 ///
@@ -1107,8 +1915,8 @@ mod tests {
     #[test]
     fn compress_decompress_zeros() {
         let data = vec![0u8; 16]; // 4 zero f32 values
-        let compressed = compress_f32(&data, 16.0).unwrap();
-        let decompressed = decompress_f32(&compressed, 4, 16.0).unwrap();
+        let compressed = compress_f32(&data, &[4], 16.0).unwrap();
+        let decompressed = decompress_f32(&compressed, &[4], 16.0).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -1116,8 +1924,8 @@ mod tests {
     fn compress_decompress_ones() {
         let vals: Vec<f32> = vec![1.0; 8];
         let data: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let compressed = compress_f32(&data, 16.0).unwrap();
-        let decompressed = decompress_f32(&compressed, 8, 16.0).unwrap();
+        let compressed = compress_f32(&data, &[8], 16.0).unwrap();
+        let decompressed = decompress_f32(&compressed, &[8], 16.0).unwrap();
         // Lossy -- check within tolerance
         let recon: Vec<f32> = decompressed
             .chunks(4)
@@ -1145,8 +1953,9 @@ mod tests {
         let data: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
 
         // High rate should give good accuracy for same-magnitude blocks
-        let compressed = compress_f32(&data, 24.0).unwrap();
-        let decompressed = decompress_f32(&compressed, vals.len(), 24.0).unwrap();
+        let dims = [vals.len()];
+        let compressed = compress_f32(&data, &dims, 24.0).unwrap();
+        let decompressed = decompress_f32(&compressed, &dims, 24.0).unwrap();
         let recon: Vec<f32> = decompressed
             .chunks(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -1169,8 +1978,8 @@ mod tests {
         // At rate=32 (maximum), should be nearly lossless for normal f32 values
         let vals: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
         let data: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let compressed = compress_f32(&data, 32.0).unwrap();
-        let decompressed = decompress_f32(&compressed, 4, 32.0).unwrap();
+        let compressed = compress_f32(&data, &[4], 32.0).unwrap();
+        let decompressed = decompress_f32(&compressed, &[4], 32.0).unwrap();
         let recon: Vec<f32> = decompressed
             .chunks(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -1197,8 +2006,8 @@ mod tests {
         // 6 values = 1 full block + 1 partial block (2 values + 2 zeros)
         let vals: Vec<f32> = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
         let data: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let compressed = compress_f32(&data, 16.0).unwrap();
-        let decompressed = decompress_f32(&compressed, 6, 16.0).unwrap();
+        let compressed = compress_f32(&data, &[6], 16.0).unwrap();
+        let decompressed = decompress_f32(&compressed, &[6], 16.0).unwrap();
         let recon: Vec<f32> = decompressed
             .chunks(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
