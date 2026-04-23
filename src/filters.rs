@@ -48,6 +48,19 @@ impl<'a> ChunkContext<'a> {
             element_type: None,
         }
     }
+
+    /// Build a full context from a dataset's `Datatype`: derives
+    /// `element_size` from `dt.type_size()` and `element_type` from
+    /// [`zfp_element_type_from_datatype`]. This is the preferred
+    /// constructor for read/write paths where a `Datatype` is in scope,
+    /// so the two fields can't drift out of sync.
+    pub fn from_datatype(chunk_dims: &'a [u64], dt: &crate::datatype::Datatype) -> Self {
+        Self {
+            chunk_dims,
+            element_size: dt.type_size(),
+            element_type: zfp_element_type_from_datatype(dt),
+        }
+    }
 }
 
 /// Map an HDF5 `Datatype` to the matching ZFP scalar type, if it's one of the

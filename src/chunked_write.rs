@@ -916,42 +916,35 @@ fn write_undefined_element(
 /// Build chunked data with absolute addresses.
 /// If `maxshape` has unlimited dims, uses Extensible Array index.
 ///
-/// `zfp_element_type` is only consulted when ZFP is enabled in `options`; it
-/// is the scalar type the codec should encode the raw bytes as, typically
-/// derived from the dataset's datatype via
-/// [`crate::filters::zfp_element_type_from_datatype`].
+/// `ctx` carries chunk_dims, element_size, and (for type-aware filters like
+/// ZFP) the scalar element type. Build it via [`ChunkContext::from_datatype`]
+/// when a `Datatype` is in scope.
 pub fn build_chunked_data_at(
     raw_data: &[u8],
     shape: &[u64],
-    chunk_dims: &[u64],
-    element_size: usize,
+    ctx: ChunkContext<'_>,
     options: &ChunkOptions,
     base_address: u64,
-    zfp_element_type: Option<ZfpElementTypeWhenEnabled>,
 ) -> Result<ChunkedDataResult, FormatError> {
-    build_chunked_data_at_ext(
-        raw_data, shape, chunk_dims, element_size, options, base_address, None,
-        zfp_element_type,
-    )
+    build_chunked_data_at_ext(raw_data, shape, ctx, options, base_address, None)
 }
 
 /// Build chunked data with absolute addresses and optional maxshape.
 ///
-/// `zfp_element_type` is only consulted when ZFP is enabled in `options`; it
-/// is the scalar type the codec should encode the raw bytes as, typically
-/// derived from the dataset's datatype via
-/// [`crate::filters::zfp_element_type_from_datatype`].
+/// `ctx` carries chunk_dims, element_size, and (for type-aware filters like
+/// ZFP) the scalar element type. Build it via [`ChunkContext::from_datatype`]
+/// when a `Datatype` is in scope.
 pub fn build_chunked_data_at_ext(
     raw_data: &[u8],
     shape: &[u64],
-    chunk_dims: &[u64],
-    element_size: usize,
+    ctx: ChunkContext<'_>,
     options: &ChunkOptions,
     base_address: u64,
     maxshape: Option<&[u64]>,
-    zfp_element_type: Option<ZfpElementTypeWhenEnabled>,
 ) -> Result<ChunkedDataResult, FormatError> {
-    let pipeline = options.build_pipeline(element_size as u32, chunk_dims, zfp_element_type)?;
+    let chunk_dims = ctx.chunk_dims;
+    let element_size = ctx.element_size as usize;
+    let pipeline = options.build_pipeline(ctx.element_size, chunk_dims, ctx.element_type)?;
 
     let chunks = split_into_chunks(raw_data, shape, chunk_dims, element_size);
     let num_chunks = chunks.len();
@@ -963,11 +956,6 @@ pub fn build_chunked_data_at_ext(
 
     for (_offsets, chunk_bytes) in &chunks {
         let compressed = if let Some(ref pl) = pipeline {
-            let ctx = ChunkContext {
-                chunk_dims,
-                element_size: element_size as u32,
-                element_type: zfp_element_type,
-            };
             compress_chunk(chunk_bytes, pl, ctx)?
         } else {
             chunk_bytes.clone()
@@ -1116,8 +1104,9 @@ mod tests {
     ) -> Vec<f64> {
         let raw = f64_to_bytes(values);
         let base_address = 0x1000u64;
+        let ctx = ChunkContext::basic(chunk_dims, 8);
         let result =
-            build_chunked_data_at(&raw, shape, chunk_dims, 8, options, base_address, None).unwrap();
+            build_chunked_data_at(&raw, shape, ctx, options, base_address).unwrap();
 
         // Build a fake file buffer
         let file_size = base_address as usize + result.data_bytes.len();
@@ -1293,8 +1282,10 @@ mod tests {
             chunk_dims: Some(vec![20]),
             ..Default::default()
         };
+        let dims = [20u64];
+        let ctx = ChunkContext::basic(&dims, 8);
         let result =
-            build_chunked_data_at(&raw, &[100], &[20], 8, &options, base_address, None).unwrap();
+            build_chunked_data_at(&raw, &[100], ctx, &options, base_address).unwrap();
 
         // Parse layout to get chunk addresses (via roundtrip read)
         let file_size = base_address as usize + result.data_bytes.len();
@@ -1501,8 +1492,9 @@ mod tests {
             chunk_dims: Some(chunk_dims.to_vec()),
             ..Default::default()
         };
+        let ctx = ChunkContext::basic(chunk_dims, 8);
         let result = build_chunked_data_at_ext(
-            &raw, shape, chunk_dims, 8, &options, base_address, Some(maxshape), None,
+            &raw, shape, ctx, &options, base_address, Some(maxshape),
         )
         .unwrap();
 
