@@ -2105,8 +2105,76 @@ pub fn zfp_filter_meta_from_cd_values(cd_values: &[u32]) -> Option<ZfpFilterMeta
 /// Convenience accessor for just the rate field. Used by the filter
 /// pipeline when it already knows the element type from the dataset's
 /// datatype and the chunk dims from the chunked-read metadata.
+///
+/// Unlike `zfp_filter_meta_from_cd_values` this parses directly from the
+/// `&[u32]` bit stream with no heap allocation — called once per chunk on
+/// the read/write path, so avoiding the intermediate `Vec<u8>` and dim
+/// `Vec<u64>` matters.
 pub fn zfp_rate_from_cd_values(cd_values: &[u32]) -> Option<f64> {
-    zfp_filter_meta_from_cd_values(cd_values).map(|m| m.rate)
+    if cd_values.len() < 4 {
+        return None;
+    }
+    // cd_values[0] is the version word; the bit stream starts at cd_values[1],
+    // packed LSB-first within each u32 word.
+    let words = &cd_values[1..];
+    // Magic: 'z','f','p', codec_version — 32 bits starting at bit 0.
+    if read_bits_u32(words, 0, 8)? != u64::from(b'z')
+        || read_bits_u32(words, 8, 8)? != u64::from(b'f')
+        || read_bits_u32(words, 16, 8)? != u64::from(b'p')
+    {
+        return None;
+    }
+    // Meta (52 bits at bit 32). Layout per `zfp_field_metadata`:
+    //   bits 0..=1 : type-1    (we ignore — caller knows the scalar type)
+    //   bits 2..=3 : rank-1    (1..=4)
+    //   the rest   : per-axis sizes (not needed for rate)
+    let meta = read_bits_u32(words, 32, 52)?;
+    let rank = ((meta >> 2) & 0x3) + 1;
+    // Mode: 12 bits short at bit 84. Short form: `maxbits = mode + 1`.
+    // Long form (`mode_short == 0xFFF`): extended by 52 more bits,
+    // maxbits lives in bits 27..=41 of the full 64-bit mode word (+1).
+    let mode_short = read_bits_u32(words, 84, 12)?;
+    let maxbits = if mode_short < 0xFFF {
+        mode_short + 1
+    } else {
+        let rest = read_bits_u32(words, 96, 52)?;
+        let mode = mode_short | (rest << 12);
+        let maxbits_enc = (mode >> 27) & 0x7FFF;
+        maxbits_enc + 1
+    };
+    let block_values = 4u64.pow(rank as u32);
+    Some(maxbits as f64 / block_values as f64)
+}
+
+/// Read `n_bits` (≤ 64) starting at `bit_pos` from the LSB-first u32
+/// bit stream. Returns `None` if the request runs past the end of
+/// `words`. Used by the alloc-free rate parser above.
+fn read_bits_u32(words: &[u32], bit_pos: u64, n_bits: u32) -> Option<u64> {
+    debug_assert!(n_bits <= 64);
+    let mut out: u64 = 0;
+    let mut remaining = n_bits;
+    let mut pos = bit_pos;
+    let mut written: u32 = 0;
+    while remaining > 0 {
+        let word_idx = (pos / 32) as usize;
+        if word_idx >= words.len() {
+            return None;
+        }
+        let bit_off = (pos % 32) as u32;
+        let avail = 32 - bit_off;
+        let take = remaining.min(avail);
+        let mask = if take == 32 {
+            u32::MAX as u64
+        } else {
+            (1u64 << take) - 1
+        };
+        let slice = ((words[word_idx] as u64) >> bit_off) & mask;
+        out |= slice << written;
+        written += take;
+        remaining -= take;
+        pos += take as u64;
+    }
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -2310,6 +2378,62 @@ mod tests {
         let err = zfp_cd_values_rate(16.0, ZfpElementType::F32, &[])
             .expect_err("rank 0 should be rejected");
         assert!(matches!(err, FormatError::UnsupportedZfp(_)));
+    }
+
+    #[test]
+    fn rate_from_cd_values_matches_full_parse() {
+        // The alloc-free rate parser must agree with the full-meta parser
+        // across every rank the codec supports. Regression for the direct
+        // `&[u32]` bit reader — a sign flip or mask error would surface here.
+        for rank in 1..=4 {
+            for &elem in &[
+                ZfpElementType::F32,
+                ZfpElementType::F64,
+                ZfpElementType::I32,
+                ZfpElementType::I64,
+            ] {
+                let dims: Vec<u64> = (0..rank).map(|i| 4 + i as u64).collect();
+                let rate = 12.0 + rank as f64;
+                let cd = zfp_cd_values_rate(rate, elem, &dims).unwrap();
+                let fast = zfp_rate_from_cd_values(&cd)
+                    .unwrap_or_else(|| panic!("fast parse failed for {elem:?} rank {rank}"));
+                let slow = zfp_filter_meta_from_cd_values(&cd).unwrap().rate;
+                assert!(
+                    (fast - slow).abs() < 1e-9,
+                    "fast={fast} slow={slow} for {elem:?} rank {rank}",
+                );
+                assert!(
+                    (fast - rate).abs() < 1e-9,
+                    "fast={fast} expected={rate} for {elem:?} rank {rank}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rate_from_cd_values_matches_reference_fixture() {
+        // Same fixture as `cd_values_matches_reference_fixture`, but exercises
+        // the allocation-free parser directly.
+        let cd = vec![0x10105111, 0x0570667a, 0x000000f2, 0x03f00000];
+        assert_eq!(zfp_rate_from_cd_values(&cd), Some(16.0));
+    }
+
+    #[test]
+    fn rate_from_cd_values_rejects_truncated_input() {
+        // The parser must refuse to run off the end of a short buffer.
+        let cd = vec![0x10105111, 0x0570667a]; // missing meta/mode words
+        assert_eq!(zfp_rate_from_cd_values(&cd), None);
+        // Fewer than 4 u32s: the version-word guard trips first.
+        assert_eq!(zfp_rate_from_cd_values(&[]), None);
+        assert_eq!(zfp_rate_from_cd_values(&[0; 3]), None);
+    }
+
+    #[test]
+    fn rate_from_cd_values_rejects_wrong_magic() {
+        // Flip one byte of the 'zfp' magic and we should reject the stream.
+        let mut cd = vec![0x10105111, 0x0570667a, 0x000000f2, 0x03f00000];
+        cd[1] ^= 0x1; // corrupt the LSB of 'z'
+        assert_eq!(zfp_rate_from_cd_values(&cd), None);
     }
 
     #[test]

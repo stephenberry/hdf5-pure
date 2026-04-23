@@ -4,7 +4,7 @@
 extern crate alloc;
 
 #[cfg(not(feature = "std"))]
-use alloc::{vec, vec::Vec};
+use alloc::{format, vec, vec::Vec};
 
 use crate::error::FormatError;
 use crate::filter_pipeline::{FilterPipeline, FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SHUFFLE};
@@ -80,20 +80,20 @@ pub fn decompress_chunk(
     pipeline: &FilterPipeline,
     ctx: ChunkContext<'_>,
 ) -> Result<Vec<u8>, FormatError> {
-    let mut data = compressed.to_vec();
-
+    let mut owned: Option<Vec<u8>> = None;
     for filter in pipeline.filters.iter().rev() {
-        data = match filter.filter_id {
-            FILTER_SHUFFLE => shuffle_decompress(&data, ctx.element_size as usize)?,
-            FILTER_DEFLATE => deflate_decompress(&data)?,
-            FILTER_FLETCHER32 => fletcher32_verify(&data)?,
+        let input: &[u8] = owned.as_deref().unwrap_or(compressed);
+        let next = match filter.filter_id {
+            FILTER_SHUFFLE => shuffle_decompress(input, ctx.element_size as usize)?,
+            FILTER_DEFLATE => deflate_decompress(input)?,
+            FILTER_FLETCHER32 => fletcher32_verify(input)?,
             #[cfg(feature = "zfp")]
-            FILTER_ZFP => zfp_decompress(&data, filter, &ctx)?,
+            FILTER_ZFP => zfp_decompress(input, filter, &ctx)?,
             other => return Err(FormatError::UnsupportedFilter(other)),
         };
+        owned = Some(next);
     }
-
-    Ok(data)
+    Ok(owned.unwrap_or_else(|| compressed.to_vec()))
 }
 
 /// Apply a filter pipeline to compress a chunk.
@@ -103,23 +103,23 @@ pub fn compress_chunk(
     pipeline: &FilterPipeline,
     ctx: ChunkContext<'_>,
 ) -> Result<Vec<u8>, FormatError> {
-    let mut result = data.to_vec();
-
+    let mut owned: Option<Vec<u8>> = None;
     for filter in &pipeline.filters {
-        result = match filter.filter_id {
-            FILTER_SHUFFLE => shuffle_compress(&result, ctx.element_size as usize)?,
+        let input: &[u8] = owned.as_deref().unwrap_or(data);
+        let next = match filter.filter_id {
+            FILTER_SHUFFLE => shuffle_compress(input, ctx.element_size as usize)?,
             FILTER_DEFLATE => {
                 let level = filter.client_data.first().copied().unwrap_or(6);
-                deflate_compress(&result, level)?
+                deflate_compress(input, level)?
             }
-            FILTER_FLETCHER32 => fletcher32_append(&result)?,
+            FILTER_FLETCHER32 => fletcher32_append(input)?,
             #[cfg(feature = "zfp")]
-            FILTER_ZFP => zfp_compress(&result, filter, &ctx)?,
+            FILTER_ZFP => zfp_compress(input, filter, &ctx)?,
             other => return Err(FormatError::UnsupportedFilter(other)),
         };
+        owned = Some(next);
     }
-
-    Ok(result)
+    Ok(owned.unwrap_or_else(|| data.to_vec()))
 }
 
 #[cfg(feature = "zfp")]
@@ -138,6 +138,23 @@ fn zfp_element_type(ctx: &ChunkContext<'_>) -> Result<ZfpElementType, FormatErro
     })
 }
 
+/// Copy chunk dims into a stack buffer and return a slice of the valid
+/// prefix. ZFP's rank bound is 4, so a heap Vec is unnecessary per chunk.
+#[cfg(feature = "zfp")]
+fn zfp_dims_on_stack(ctx: &ChunkContext<'_>) -> Result<([usize; 4], usize), FormatError> {
+    let rank = ctx.chunk_dims.len();
+    if rank == 0 || rank > 4 {
+        return Err(FormatError::FilterError(format!(
+            "ZFP: chunk rank must be 1..=4, got {rank}",
+        )));
+    }
+    let mut buf = [0usize; 4];
+    for (slot, &d) in buf.iter_mut().zip(ctx.chunk_dims.iter()) {
+        *slot = d as usize;
+    }
+    Ok((buf, rank))
+}
+
 #[cfg(feature = "zfp")]
 fn zfp_compress(
     data: &[u8],
@@ -146,8 +163,8 @@ fn zfp_compress(
 ) -> Result<Vec<u8>, FormatError> {
     let rate = zfp_rate(filter)?;
     let elem_ty = zfp_element_type(ctx)?;
-    let dims_usize: Vec<usize> = ctx.chunk_dims.iter().map(|&d| d as usize).collect();
-    crate::zfp::compress(data, &dims_usize, rate, elem_ty)
+    let (dims_buf, rank) = zfp_dims_on_stack(ctx)?;
+    crate::zfp::compress(data, &dims_buf[..rank], rate, elem_ty)
 }
 
 #[cfg(feature = "zfp")]
@@ -158,8 +175,8 @@ fn zfp_decompress(
 ) -> Result<Vec<u8>, FormatError> {
     let rate = zfp_rate(filter)?;
     let elem_ty = zfp_element_type(ctx)?;
-    let dims_usize: Vec<usize> = ctx.chunk_dims.iter().map(|&d| d as usize).collect();
-    crate::zfp::decompress(data, &dims_usize, rate, elem_ty)
+    let (dims_buf, rank) = zfp_dims_on_stack(ctx)?;
+    crate::zfp::decompress(data, &dims_buf[..rank], rate, elem_ty)
 }
 
 /// Decompress zlib-compressed data.
