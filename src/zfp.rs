@@ -97,6 +97,18 @@ impl BitWriter {
         }
     }
 
+    /// Like `new`, but sizes the output buffer for a known-upper-bound
+    /// output length. Each `compress_Nd` knows `total_bits` up front, so
+    /// passing it here avoids log₂(N) amortized-growth reallocations
+    /// inside the encoder's hot loop.
+    fn with_capacity(bytes: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(bytes),
+            word: 0,
+            bits: 0,
+        }
+    }
+
     /// Write the `n` least-significant bits of `value`. Bits above `n` in
     /// `value` are ignored (masked off) so the caller may pass a packed
     /// bit-plane register without pre-masking.
@@ -127,10 +139,20 @@ impl BitWriter {
         }
     }
 
-    /// Write a single bit.
+    /// Write a single bit. Specialized body (not routed through `write(1, …)`)
+    /// because the unary run-length encoder in `encode_few_ints` /
+    /// `encode_many_ints` calls this per bit on dense planes; dispatching
+    /// through the `write(n, _)` path adds a mask/shift setup per call that
+    /// the unary path doesn't need.
     #[inline]
     fn write_bit(&mut self, bit: bool) {
-        self.write(1, u64::from(bit));
+        self.word |= (bit as u64) << self.bits;
+        self.bits += 1;
+        if self.bits == 64 {
+            self.buf.extend_from_slice(&self.word.to_le_bytes());
+            self.word = 0;
+            self.bits = 0;
+        }
     }
 
     /// Flush any partial word (zero-padded to 64 bits) and return the buffer.
@@ -1440,7 +1462,7 @@ macro_rules! impl_codec {
             fn compress_1d(data: &[u8], n: usize, rate: f64) -> Result<Vec<u8>, FormatError> {
                 let maxbits = (rate * 4.0) as usize;
                 let total_bits = n.div_ceil(4) * maxbits;
-                let mut w = BitWriter::new();
+                let mut w = BitWriter::with_capacity(total_bits.div_ceil(8) + 8);
                 let mut i = 0;
                 while i < n {
                     let mut block = [$zero_s; 4];
@@ -1490,7 +1512,7 @@ macro_rules! impl_codec {
                 let nb1 = n1.div_ceil(4);
                 let nb0 = n0.div_ceil(4);
                 let total_bits = nb1 * nb0 * maxbits;
-                let mut w = BitWriter::new();
+                let mut w = BitWriter::with_capacity(total_bits.div_ceil(8) + 8);
                 for b1 in 0..nb1 {
                     for b0 in 0..nb0 {
                         let y0 = b1 * 4;
@@ -1562,7 +1584,7 @@ macro_rules! impl_codec {
                 let nb1 = n1.div_ceil(4);
                 let nb0 = n0.div_ceil(4);
                 let total_bits = nb2 * nb1 * nb0 * maxbits;
-                let mut w = BitWriter::new();
+                let mut w = BitWriter::with_capacity(total_bits.div_ceil(8) + 8);
                 for b2 in 0..nb2 {
                     for b1 in 0..nb1 {
                         for b0 in 0..nb0 {
@@ -1665,7 +1687,7 @@ macro_rules! impl_codec {
                 let nb1 = n1.div_ceil(4);
                 let nb0 = n0.div_ceil(4);
                 let total_bits = nb3 * nb2 * nb1 * nb0 * maxbits;
-                let mut w = BitWriter::new();
+                let mut w = BitWriter::with_capacity(total_bits.div_ceil(8) + 8);
                 for b3 in 0..nb3 {
                     for b2 in 0..nb2 {
                         for b1 in 0..nb1 {
