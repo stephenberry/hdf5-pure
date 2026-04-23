@@ -75,27 +75,34 @@ impl ChunkOptions {
     /// `chunk_dims` is only consulted when the ZFP filter is active — it's
     /// embedded into the ZFP cd_values so the resulting file is readable by
     /// the reference H5Z-ZFP plugin.
+    ///
+    /// Returns [`FormatError::UnsupportedZfp`] when ZFP was requested but the
+    /// dataset wasn't set up with a scalar data setter, or the chunk rank is
+    /// outside 1..=4.
     pub fn build_pipeline(
         &self,
         element_size: u32,
         chunk_dims: &[u64],
-    ) -> Option<FilterPipeline> {
+    ) -> Result<Option<FilterPipeline>, FormatError> {
         let mut filters = Vec::new();
         let _ = chunk_dims; // used only under the `zfp` feature below
 
         // ZFP is a standalone compressor — it replaces shuffle + deflate.
         #[cfg(feature = "zfp")]
         let zfp_active = if let Some(rate) = self.zfp_rate {
-            let elem_ty = self.zfp_element_type.expect(
-                "ZFP compression requires a scalar dataset; set its data via \
-                 with_f32_data / with_f64_data / with_i32_data / with_i64_data \
-                 before finalize",
-            );
+            let elem_ty = self.zfp_element_type.ok_or_else(|| {
+                FormatError::UnsupportedZfp(
+                    "ZFP compression requires a scalar dataset; set its data via \
+                     with_f32_data / with_f64_data / with_i32_data / with_i64_data \
+                     before finalize"
+                        .into(),
+                )
+            })?;
             filters.push(FilterDescription {
                 filter_id: FILTER_ZFP,
                 name: Some("zfp".into()),
                 flags: 0,
-                client_data: crate::zfp::zfp_cd_values_rate(rate, elem_ty, chunk_dims),
+                client_data: crate::zfp::zfp_cd_values_rate(rate, elem_ty, chunk_dims)?,
             });
             true
         } else {
@@ -137,12 +144,12 @@ impl ChunkOptions {
         // for read compatibility.
 
         if filters.is_empty() {
-            None
+            Ok(None)
         } else {
-            Some(FilterPipeline {
+            Ok(Some(FilterPipeline {
                 version: 2,
                 filters,
-            })
+            }))
         }
     }
 
@@ -933,7 +940,7 @@ pub fn build_chunked_data_at_ext(
     base_address: u64,
     maxshape: Option<&[u64]>,
 ) -> Result<ChunkedDataResult, FormatError> {
-    let pipeline = options.build_pipeline(element_size as u32, chunk_dims);
+    let pipeline = options.build_pipeline(element_size as u32, chunk_dims)?;
 
     let chunks = split_into_chunks(raw_data, shape, chunk_dims, element_size);
     let num_chunks = chunks.len();
@@ -1322,7 +1329,7 @@ mod tests {
             deflate_level: Some(6),
             ..Default::default()
         };
-        let pl = options.build_pipeline(8, &[]).unwrap();
+        let pl = options.build_pipeline(8, &[]).unwrap().unwrap();
         assert_eq!(pl.filters.len(), 1);
         assert_eq!(pl.filters[0].filter_id, FILTER_DEFLATE);
     }
@@ -1335,7 +1342,7 @@ mod tests {
             fletcher32: true,
             ..Default::default()
         };
-        let pl = options.build_pipeline(8, &[]).unwrap();
+        let pl = options.build_pipeline(8, &[]).unwrap().unwrap();
         assert_eq!(pl.filters.len(), 3);
         assert_eq!(pl.filters[0].filter_id, FILTER_SHUFFLE);
         assert_eq!(pl.filters[1].filter_id, FILTER_DEFLATE);

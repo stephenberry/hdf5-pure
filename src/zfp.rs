@@ -40,7 +40,7 @@
 extern crate alloc;
 
 #[cfg(not(feature = "std"))]
-use alloc::{vec, vec::Vec};
+use alloc::{format, vec, vec::Vec};
 
 use crate::error::FormatError;
 
@@ -1872,15 +1872,19 @@ fn zfp_meta_for(elem: ZfpElementType, dims: &[usize]) -> u64 {
 /// Build ZFP `cd_values` for an HDF5 ZFP filter in fixed-rate mode. Matches
 /// the layout written by H5Z-ZFP's `set_local`, so the resulting file is
 /// readable by the reference plugin.
+///
+/// Returns [`FormatError::UnsupportedZfp`] if the rank is outside 1..=4.
 pub fn zfp_cd_values_rate(
     rate: f64,
     element_type: ZfpElementType,
     chunk_dims: &[u64],
-) -> Vec<u32> {
-    assert!(
-        matches!(chunk_dims.len(), 1..=4),
-        "ZFP cd_values only supports 1D-4D chunks",
-    );
+) -> Result<Vec<u32>, FormatError> {
+    if !matches!(chunk_dims.len(), 1..=4) {
+        return Err(FormatError::UnsupportedZfp(format!(
+            "only 1D-4D chunks are supported, got rank {}",
+            chunk_dims.len()
+        )));
+    }
     let dims_usize: Vec<usize> = chunk_dims.iter().map(|&d| d as usize).collect();
     let rank = dims_usize.len();
     let block_values: usize = 4usize.pow(rank as u32);
@@ -1933,7 +1937,7 @@ pub fn zfp_cd_values_rate(
         buf[..chunk.len()].copy_from_slice(chunk);
         cd.push(u32::from_le_bytes(buf));
     }
-    cd
+    Ok(cd)
 }
 
 /// Parsed ZFP filter metadata extracted from `cd_values`.
@@ -2209,7 +2213,7 @@ mod tests {
     #[test]
     fn cd_values_roundtrip() {
         // Integer rate at 1D f32 — short-form mode, no loss in the round-trip.
-        let cd = zfp_cd_values_rate(16.0, ZfpElementType::F32, &[16]);
+        let cd = zfp_cd_values_rate(16.0, ZfpElementType::F32, &[16]).unwrap();
         let meta = zfp_filter_meta_from_cd_values(&cd).unwrap();
         assert_eq!(meta.rate, 16.0);
         assert_eq!(meta.element_type, ZfpElementType::F32);
@@ -2220,11 +2224,26 @@ mod tests {
     fn cd_values_matches_reference_fixture() {
         // Probed from h5py + hdf5plugin for an f32 1D 16-value ramp at rate 16:
         // `[0x10105111, 0x0570667a, 0x000000f2, 0x03f00000]`.
-        let cd = zfp_cd_values_rate(16.0, ZfpElementType::F32, &[16]);
+        let cd = zfp_cd_values_rate(16.0, ZfpElementType::F32, &[16]).unwrap();
         assert_eq!(
             cd,
             vec![0x10105111, 0x0570667a, 0x000000f2, 0x03f00000],
         );
+    }
+
+    #[test]
+    fn cd_values_rejects_5d_chunks() {
+        // 5D chunks should be an error, not a panic.
+        let err = zfp_cd_values_rate(16.0, ZfpElementType::F32, &[2, 2, 2, 2, 2])
+            .expect_err("5D chunks should be rejected");
+        assert!(matches!(err, FormatError::UnsupportedZfp(_)));
+    }
+
+    #[test]
+    fn cd_values_rejects_zero_rank() {
+        let err = zfp_cd_values_rate(16.0, ZfpElementType::F32, &[])
+            .expect_err("rank 0 should be rejected");
+        assert!(matches!(err, FormatError::UnsupportedZfp(_)));
     }
 
     #[test]

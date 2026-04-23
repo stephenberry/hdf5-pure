@@ -6,7 +6,7 @@
 
 #![cfg(feature = "zfp")]
 
-use hdf5_pure::{File, FileBuilder};
+use hdf5_pure::{Error, File, FileBuilder, FormatError};
 
 fn max_abs_err(a: &[f32], b: &[f32]) -> f64 {
     a.iter()
@@ -158,5 +158,45 @@ fn zfp_f32_roundtrip_4d() {
         max_abs_err(&vals, &back) < 0.1,
         "max_err {} > 0.1",
         max_abs_err(&vals, &back)
+    );
+}
+
+#[test]
+fn zfp_on_unsupported_scalar_errors_not_panics() {
+    // u8 is not one of ZFP's supported scalar types. Finalize must surface
+    // a FormatError::UnsupportedZfp, not panic.
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("v")
+        .with_u8_data(&[1u8, 2, 3, 4])
+        .with_chunks(&[4])
+        .with_zfp(16.0);
+    let err = builder
+        .finish()
+        .expect_err("ZFP on u8 should error, not succeed");
+    assert!(
+        matches!(err, Error::Format(FormatError::UnsupportedZfp(_))),
+        "unexpected error variant: {err:?}",
+    );
+}
+
+#[test]
+fn zfp_with_5d_chunks_errors_not_panics() {
+    // 5D chunks are beyond the ZFP rank limit. Finalize must surface a
+    // FormatError::UnsupportedZfp, not panic inside the cd_values builder.
+    let vals: Vec<f32> = (0..32).map(|i| i as f32).collect();
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("v")
+        .with_f32_data(&vals)
+        .with_shape(&[2, 2, 2, 2, 2])
+        .with_chunks(&[2, 2, 2, 2, 2])
+        .with_zfp(16.0);
+    let err = builder
+        .finish()
+        .expect_err("ZFP with 5D chunks should error, not succeed");
+    assert!(
+        matches!(err, Error::Format(FormatError::UnsupportedZfp(_))),
+        "unexpected error variant: {err:?}",
     );
 }

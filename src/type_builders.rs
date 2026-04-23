@@ -891,8 +891,10 @@ impl DatasetBuilder {
     ///
     /// The scalar type is read from whichever `with_{f32,f64,i32,i64}_data`
     /// call set the data, so call that before `with_zfp` — or after, as long
-    /// as both happen before finalize. Finalize returns an error if the
-    /// dataset isn't one of the four supported types.
+    /// as both happen before finalize. Finalize returns
+    /// [`FormatError::UnsupportedZfp`](crate::FormatError::UnsupportedZfp) if
+    /// the dataset isn't one of the four supported scalar types, or if the
+    /// chunk rank is outside 1..=4.
     ///
     /// The resulting file is byte-compatible with the reference H5Z-ZFP
     /// plugin (HDF5 filter ID 32013): other tools like h5py + hdf5plugin
