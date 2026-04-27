@@ -43,6 +43,9 @@ fn main() {
     write_empty_variants(&out);
     write_large_matrix(&out);
 
+    // Cell-array fixtures (Vec<Struct>, Vec<Option<T>> with None, nested).
+    write_cells(&out);
+
     copy_octave_helpers(&out);
 
     println!();
@@ -695,4 +698,76 @@ fn write_large_matrix(dir: &Path) {
     };
     mat::to_file(&v, dir.join("large_matrix.mat")).unwrap();
     println!("wrote: large_matrix.mat");
+}
+
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Point {
+    x: f64,
+    y: f64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CellsRoot {
+    /// `Vec<Struct>` lowers to a 3x1 cell array of struct.
+    points: Vec<Point>,
+    /// `Vec<Option<Struct>>` with `None` interspersed: the `None` slot becomes
+    /// `struct([])` (an empty struct array).
+    optionals: Vec<Option<Point>>,
+    /// `Vec<Vec<Option<Struct>>>` matches the soul-rs `rx_data` shape: an
+    /// outer cell whose elements are themselves cells.
+    grid: Vec<Vec<Option<Point>>>,
+    /// Ragged `Vec<Vec<f64>>` falls back to a cell of doubles instead of
+    /// erroring on the non-uniform inner lengths.
+    ragged: Vec<Vec<f64>>,
+}
+
+fn write_cells(dir: &Path) {
+    announce(
+        "cells.mat",
+        &[
+            "assert(iscell(points), 'points iscell')",
+            "assert(numel(points) == 3, 'points length')",
+            "assert(points{1}.x == 1.0 && points{1}.y == 2.0, 'points{1}')",
+            "assert(points{3}.x == 5.0 && points{3}.y == 6.0, 'points{3}')",
+            "assert(iscell(optionals), 'optionals iscell')",
+            "assert(numel(optionals) == 3, 'optionals length')",
+            "assert(isstruct(optionals{2}) && isempty(fieldnames(optionals{2})), 'optionals{2} is struct([])')",
+            "assert(optionals{1}.x == 10.0, 'optionals{1}')",
+            "assert(optionals{3}.x == 30.0, 'optionals{3}')",
+            "assert(iscell(grid), 'grid iscell')",
+            "assert(numel(grid) == 2, 'grid outer length')",
+            "assert(iscell(grid{1}), 'grid{1} iscell')",
+            "assert(numel(grid{1}) == 2, 'grid{1} length')",
+            "assert(grid{1}{1}.x == 100.0, 'grid{1}{1}.x')",
+            "assert(isstruct(grid{1}{2}) && isempty(fieldnames(grid{1}{2})), 'grid{1}{2} is struct([])')",
+            "assert(isstruct(grid{2}{1}) && isempty(fieldnames(grid{2}{1})), 'grid{2}{1} is struct([])')",
+            "assert(grid{2}{2}.x == 200.0, 'grid{2}{2}.x')",
+            "assert(iscell(ragged), 'ragged iscell')",
+            "assert(numel(ragged) == 2, 'ragged length')",
+            "assert(isequal(ragged{1}(:), [1; 2; 3]), 'ragged{1}')",
+            "assert(isequal(ragged{2}(:), [4; 5]), 'ragged{2}')",
+            "disp('cells.mat OK')",
+        ],
+    );
+    let v = CellsRoot {
+        points: vec![
+            Point { x: 1.0, y: 2.0 },
+            Point { x: 3.0, y: 4.0 },
+            Point { x: 5.0, y: 6.0 },
+        ],
+        optionals: vec![
+            Some(Point { x: 10.0, y: 11.0 }),
+            None,
+            Some(Point { x: 30.0, y: 31.0 }),
+        ],
+        grid: vec![
+            vec![Some(Point { x: 100.0, y: 100.0 }), None],
+            vec![None, Some(Point { x: 200.0, y: 200.0 })],
+        ],
+        ragged: vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0]],
+    };
+    mat::to_file(&v, dir.join("cells.mat")).unwrap();
+    println!("wrote: cells.mat");
 }

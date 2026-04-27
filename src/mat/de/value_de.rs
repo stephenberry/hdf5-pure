@@ -132,7 +132,12 @@ impl<'de> Deserializer<'de> for MatValueDeserializer {
 
     fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, MatError> {
         match self.value {
-            MatValue::Omit => visitor.visit_none(),
+            // `Omit` is the in-memory placeholder used by the serializer for a
+            // missing value. `EmptyStructArray` is the on-disk encoding of the
+            // same idea (`struct([])`) that the writer emits inside a cell
+            // array; treating both as `None` keeps `Vec<Option<T>>` round-trips
+            // sound once cell-array reading is implemented.
+            MatValue::Omit | MatValue::EmptyStructArray => visitor.visit_none(),
             other => visitor.visit_some(MatValueDeserializer::new(other)),
         }
     }
@@ -185,6 +190,14 @@ impl<'de> Deserializer<'de> for MatValueDeserializer {
             MatValue::ComplexMatrix32 { rows, cols, pairs } => {
                 visitor.visit_seq(ComplexMatrixRowsSeq::new32(rows, cols, pairs))
             }
+            MatValue::Cell(elements) => visitor.visit_seq(CellSeq::new(elements)),
+            // `deserialize_seq` is called when the target IS a sequence (e.g.
+            // `Vec<T>`): yield zero elements rather than failing, so a sender
+            // that emitted `struct([])` for an empty optional sequence still
+            // deserializes cleanly. `dispatch_any` uses `visit_none` for the
+            // same value because the target there is unknown and a missing
+            // optional is the more common interpretation.
+            MatValue::EmptyStructArray => visitor.visit_seq(CellSeq::new(Vec::new())),
             // A scalar can deserialize as a length-1 Vec.
             MatValue::Scalar(s) => {
                 let v = NumVec::from_single(s);
@@ -339,6 +352,8 @@ fn dispatch_any<'de, V: Visitor<'de>>(value: MatValue, visitor: V) -> Result<V::
             visitor.visit_seq(ComplexMatrixRowsSeq::new32(rows, cols, pairs))
         }
         MatValue::Struct(fields) => visitor.visit_map(StructMap::new(fields)),
+        MatValue::Cell(elements) => visitor.visit_seq(CellSeq::new(elements)),
+        MatValue::EmptyStructArray => visitor.visit_none(),
     }
 }
 
@@ -465,6 +480,38 @@ impl Vec1DSeq {
 }
 
 impl<'de> SeqAccess<'de> for Vec1DSeq {
+    type Error = MatError;
+    fn next_element_seed<T: DeserializeSeed<'de>>(
+        &mut self,
+        seed: T,
+    ) -> Result<Option<T::Value>, MatError> {
+        match self.items.pop_front() {
+            Some(v) => seed.deserialize(MatValueDeserializer::new(v)).map(Some),
+            None => Ok(None),
+        }
+    }
+    fn size_hint(&self) -> Option<usize> {
+        Some(self.items.len())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cell SeqAccess: yields each element verbatim
+// ---------------------------------------------------------------------------
+
+struct CellSeq {
+    items: VecDeque<MatValue>,
+}
+
+impl CellSeq {
+    fn new(elements: Vec<MatValue>) -> Self {
+        Self {
+            items: elements.into(),
+        }
+    }
+}
+
+impl<'de> SeqAccess<'de> for CellSeq {
     type Error = MatError;
     fn next_element_seed<T: DeserializeSeed<'de>>(
         &mut self,

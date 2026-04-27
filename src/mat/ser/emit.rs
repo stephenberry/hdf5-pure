@@ -1,5 +1,7 @@
 //! Emit a `MatValue` tree into an HDF5 file with MATLAB v7.3 conventions.
 
+use std::collections::VecDeque;
+
 use crate::file_writer::AttrValue;
 use crate::mat::class::MatClass;
 use crate::mat::error::MatError;
@@ -12,16 +14,68 @@ use crate::writer::FileBuilder;
 
 use crate::mat::value::{MatValue, NumVec, ScalarNum, ScalarTag};
 
+/// Hidden MATLAB conventional group that holds the targets of object
+/// references. Cell-array elements live here, addressed by absolute path.
+const REFS_GROUP: &str = "#refs#";
+
+/// Allocator + queue for cell-array element interning. Cells stash each
+/// element under a fresh `ref_{id:016x}` name and the emitter drains the
+/// queue at file-build time to materialize the `#refs#` group. Draining is
+/// itself emit-aware: a Cell whose elements include nested cells will push
+/// new entries onto the queue while it is being drained.
+struct RefsAccumulator {
+    next_id: u64,
+    pending: VecDeque<(String, MatValue)>,
+}
+
+impl RefsAccumulator {
+    fn new() -> Self {
+        Self {
+            next_id: 0,
+            pending: VecDeque::new(),
+        }
+    }
+
+    /// Reserve a fresh name and queue `value` for later emission. Returns the
+    /// absolute path the parent dataset's reference should resolve to.
+    fn intern(&mut self, value: MatValue) -> String {
+        let name = format!("ref_{:016x}", self.next_id);
+        self.next_id += 1;
+        let path = format!("{REFS_GROUP}/{name}");
+        self.pending.push_back((name, value));
+        path
+    }
+
+    fn pop_front(&mut self) -> Option<(String, MatValue)> {
+        self.pending.pop_front()
+    }
+
+    fn has_any(&self) -> bool {
+        !self.pending.is_empty()
+    }
+}
+
 /// Turn a list of top-level `(name, value)` pairs into a MAT 7.3 file.
 pub(crate) fn emit_file(fields: Vec<(String, MatValue)>) -> Result<Vec<u8>, MatError> {
     let mut builder = FileBuilder::new();
     builder.with_userblock(USERBLOCK_SIZE);
+    let mut refs = RefsAccumulator::new();
 
     for (name, value) in fields {
         if matches!(value, MatValue::Omit) {
             continue;
         }
-        emit_at_root(&mut builder, &name, value)?;
+        emit_at_root(&mut builder, &name, value, &mut refs)?;
+    }
+
+    if refs.has_any() {
+        let mut refs_group = builder.create_group(REFS_GROUP);
+        // Drain in FIFO order; emitting one entry may itself queue more
+        // (nested cells), which the loop will pick up on later iterations.
+        while let Some((name, value)) = refs.pop_front() {
+            emit_into_group(&mut refs_group, &name, value, &mut refs)?;
+        }
+        builder.add_group(refs_group.finish());
     }
 
     let mut bytes = builder.finish().map_err(MatError::Hdf5)?;
@@ -30,33 +84,43 @@ pub(crate) fn emit_file(fields: Vec<(String, MatValue)>) -> Result<Vec<u8>, MatE
 }
 
 /// Emit a single named value at the file root.
-fn emit_at_root(builder: &mut FileBuilder, name: &str, value: MatValue) -> Result<(), MatError> {
+fn emit_at_root(
+    builder: &mut FileBuilder,
+    name: &str,
+    value: MatValue,
+    refs: &mut RefsAccumulator,
+) -> Result<(), MatError> {
     match value {
         MatValue::Omit => Ok(()),
         MatValue::Struct(fields) => {
-            let group = build_struct_group(name, fields)?;
+            let group = build_struct_group(name, fields, refs)?;
             builder.add_group(group);
             Ok(())
         }
         other => {
             let ds = builder.create_dataset(name);
-            apply_value_to_dataset(ds, other)
+            apply_value_to_dataset(ds, other, refs)
         }
     }
 }
 
 /// Emit a value as a child of a group.
-fn emit_into_group(group: &mut GroupBuilder, name: &str, value: MatValue) -> Result<(), MatError> {
+fn emit_into_group(
+    group: &mut GroupBuilder,
+    name: &str,
+    value: MatValue,
+    refs: &mut RefsAccumulator,
+) -> Result<(), MatError> {
     match value {
         MatValue::Omit => Ok(()),
         MatValue::Struct(fields) => {
-            let sub = build_struct_group(name, fields)?;
+            let sub = build_struct_group(name, fields, refs)?;
             group.add_group(sub);
             Ok(())
         }
         other => {
             let ds = group.create_dataset(name);
-            apply_value_to_dataset(ds, other)
+            apply_value_to_dataset(ds, other, refs)
         }
     }
 }
@@ -65,6 +129,7 @@ fn emit_into_group(group: &mut GroupBuilder, name: &str, value: MatValue) -> Res
 fn build_struct_group(
     name: &str,
     fields: Vec<(String, MatValue)>,
+    refs: &mut RefsAccumulator,
 ) -> Result<FinishedGroup, MatError> {
     let mut group = new_group_builder(name);
     // Filter out Omit fields and record the surviving order.
@@ -74,7 +139,7 @@ fn build_struct_group(
             continue;
         }
         live_names.push(fname.clone());
-        emit_into_group(&mut group, &fname, value)?;
+        emit_into_group(&mut group, &fname, value, refs)?;
     }
     group.set_attr(
         "MATLAB_class",
@@ -92,7 +157,11 @@ fn new_group_builder(name: &str) -> GroupBuilder {
 
 /// Apply a non-struct `MatValue` to the given `DatasetBuilder`, writing data,
 /// shape, and the `MATLAB_class` attribute.
-fn apply_value_to_dataset(ds: &mut DatasetBuilder, value: MatValue) -> Result<(), MatError> {
+fn apply_value_to_dataset(
+    ds: &mut DatasetBuilder,
+    value: MatValue,
+    refs: &mut RefsAccumulator,
+) -> Result<(), MatError> {
     match value {
         MatValue::Omit | MatValue::Struct(_) => {
             unreachable!("emitted as group, not dataset")
@@ -140,7 +209,46 @@ fn apply_value_to_dataset(ds: &mut DatasetBuilder, value: MatValue) -> Result<()
             set_class(ds, MatClass::Single);
             Ok(())
         }
+        MatValue::Cell(elements) => apply_cell(ds, elements, refs),
+        MatValue::EmptyStructArray => {
+            apply_empty_struct_array(ds);
+            Ok(())
+        }
     }
+}
+
+/// Stash each element under `#refs#` and write the parent dataset as a vector
+/// of object references. Shape is `[1, n]` HDF5 storage of a MATLAB `[n, 1]`
+/// column vector, matching `apply_vec_1d`.
+fn apply_cell(
+    ds: &mut DatasetBuilder,
+    elements: Vec<MatValue>,
+    refs: &mut RefsAccumulator,
+) -> Result<(), MatError> {
+    let paths: Vec<String> = elements.into_iter().map(|el| refs.intern(el)).collect();
+    if paths.is_empty() {
+        // Defensive: `unify_sequence` lowers an empty input to `Vec1D` (not a
+        // Cell), so this branch isn't reachable today. Kept so a future code
+        // path that hands an empty Cell to the emitter doesn't write a
+        // shape-mismatched dataset.
+        ds.with_u64_data(&[]).with_shape(&[0u64, 0]);
+        set_class(ds, MatClass::Cell);
+        ds.set_attr("MATLAB_empty", AttrValue::U32(1));
+        return Ok(());
+    }
+    let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+    let n = path_refs.len() as u64;
+    ds.with_path_references(&path_refs).with_shape(&[1u64, n]);
+    set_class(ds, MatClass::Cell);
+    Ok(())
+}
+
+/// Empty-struct-array marker (MATLAB `struct([])`). Placeholder for
+/// `Option::None` inside a sequence.
+fn apply_empty_struct_array(ds: &mut DatasetBuilder) {
+    ds.with_u64_data(&[]).with_shape(&[0u64, 0]);
+    set_class(ds, MatClass::Struct);
+    ds.set_attr("MATLAB_empty", AttrValue::U32(1));
 }
 
 fn apply_scalar(ds: &mut DatasetBuilder, n: ScalarNum) -> Result<(), MatError> {

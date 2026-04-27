@@ -255,64 +255,82 @@ impl SerializeTupleStruct for SeqSer {
     }
 }
 
-/// Decide what a finished sequence of elements means: 1-D numeric vec,
-/// 2-D numeric matrix, complex vec/matrix, or reject (heterogeneous/unsupported).
+/// Decide what a finished sequence of elements means. A sequence whose
+/// elements all share the same numeric shape (scalars of one tag, vectors of
+/// one tag and length, complex of one width) collapses to a numeric vec/matrix
+/// or complex vec/matrix. Anything else (mixed tags, ragged inner vectors,
+/// sequences of structs, sequences containing `None`) lowers to a MATLAB cell
+/// array; the emitter interns each element under `#refs#`.
 fn unify_sequence(elements: Vec<MatValue>) -> Result<MatValue, MatError> {
     if elements.is_empty() {
         // Unknown element type; default to an empty f64 array.
         return Ok(MatValue::Vec1D(NumVec::F64(Vec::new())));
     }
 
-    // ----- all elements are numeric scalars -----
-    if elements.iter().all(|e| matches!(e, MatValue::Scalar(_))) {
-        let first_tag = match &elements[0] {
-            MatValue::Scalar(s) => s.tag(),
-            _ => unreachable!(),
-        };
-        let mut vec = NumVec::empty_with_tag(first_tag);
-        for e in elements {
-            let MatValue::Scalar(s) = e else { unreachable!() };
-            vec.push(s)?;
-        }
-        return Ok(MatValue::Vec1D(vec));
-    }
+    let elements = match try_unify_homogeneous(elements) {
+        Ok(unified) => return Ok(unified),
+        Err(elements) => elements,
+    };
 
-    // ----- all elements are 1-D vectors of the same numeric tag & length → Matrix -----
-    if elements
-        .iter()
-        .all(|e| matches!(e, MatValue::Vec1D(_)))
-    {
-        let (first_tag, first_len) = match &elements[0] {
-            MatValue::Vec1D(v) => (v.tag(), v.len()),
-            _ => unreachable!(),
-        };
-        for e in &elements {
-            match e {
-                MatValue::Vec1D(v) if v.tag() == first_tag && v.len() == first_len => {}
-                MatValue::Vec1D(v) if v.len() != first_len => {
-                    return Err(MatError::RaggedMatrix {
-                        expected: first_len,
-                        got: v.len(),
-                    });
-                }
-                _ => return Err(MatError::MixedSequenceElementTypes),
+    // Heterogeneous: lower to a cell array, mapping `Omit` to `struct([])`.
+    let cell_elements: Vec<MatValue> = elements
+        .into_iter()
+        .map(|e| match e {
+            MatValue::Omit => MatValue::EmptyStructArray,
+            other => other,
+        })
+        .collect();
+    Ok(MatValue::Cell(cell_elements))
+}
+
+/// Try the homogeneous fast paths. Returns the original `Vec` back via
+/// `Err(_)` when no path matches, so the cell-array fallback can take
+/// ownership without re-cloning each element. (Cloning a `Vec1D` or
+/// `ComplexVec*` of the inner shape would double peak allocation on the
+/// matrix path for large `Vec<Vec<T>>` inputs.)
+fn try_unify_homogeneous(
+    elements: Vec<MatValue>,
+) -> Result<MatValue, Vec<MatValue>> {
+    debug_assert!(!elements.is_empty());
+
+    // ----- all elements are numeric scalars of the same tag → Vec1D -----
+    if let Some(MatValue::Scalar(first)) = elements.first() {
+        let first_tag = first.tag();
+        if elements
+            .iter()
+            .all(|e| matches!(e, MatValue::Scalar(s) if s.tag() == first_tag))
+        {
+            let mut vec = NumVec::empty_with_tag(first_tag);
+            for e in elements {
+                let MatValue::Scalar(s) = e else { unreachable!() };
+                vec.push(s).expect("tag check held");
             }
+            return Ok(MatValue::Vec1D(vec));
         }
-        let rows = elements.len();
-        let cols = first_len;
-        let mut flat = NumVec::empty_with_tag(first_tag);
-        for e in elements {
-            let MatValue::Vec1D(v) = e else { unreachable!() };
-            flat.extend(v)?;
-        }
-        return Ok(MatValue::Matrix {
-            rows,
-            cols,
-            vec: flat,
-        });
     }
 
-    // ----- all elements are complex scalars → Complex vec -----
+    // ----- all elements are Vec1D of same tag & length → Matrix -----
+    if let Some(MatValue::Vec1D(first)) = elements.first() {
+        let first_tag = first.tag();
+        let first_len = first.len();
+        if elements.iter().all(|e| {
+            matches!(e, MatValue::Vec1D(v) if v.tag() == first_tag && v.len() == first_len)
+        }) {
+            let rows = elements.len();
+            let mut flat = NumVec::empty_with_tag(first_tag);
+            for e in elements {
+                let MatValue::Vec1D(v) = e else { unreachable!() };
+                flat.extend(v).expect("tag check held");
+            }
+            return Ok(MatValue::Matrix {
+                rows,
+                cols: first_len,
+                vec: flat,
+            });
+        }
+    }
+
+    // ----- all complex scalars of one width → ComplexVec (f64 case) -----
     if elements
         .iter()
         .all(|e| matches!(e, MatValue::ComplexScalar64 { .. }))
@@ -326,6 +344,7 @@ fn unify_sequence(elements: Vec<MatValue>) -> Result<MatValue, MatError> {
             .collect();
         return Ok(MatValue::ComplexVec64(pairs));
     }
+    // ----- f32 complex-scalar variant of the above -----
     if elements
         .iter()
         .all(|e| matches!(e, MatValue::ComplexScalar32 { .. }))
@@ -340,55 +359,47 @@ fn unify_sequence(elements: Vec<MatValue>) -> Result<MatValue, MatError> {
         return Ok(MatValue::ComplexVec32(pairs));
     }
 
-    // ----- all elements are complex vecs of same length → Complex matrix -----
-    if elements.iter().all(|e| matches!(e, MatValue::ComplexVec64(_))) {
-        let first_len = match &elements[0] {
-            MatValue::ComplexVec64(v) => v.len(),
-            _ => unreachable!(),
-        };
-        let mut pairs: Vec<(f64, f64)> = Vec::new();
-        for e in &elements {
-            let MatValue::ComplexVec64(v) = e else { unreachable!() };
-            if v.len() != first_len {
-                return Err(MatError::RaggedMatrix {
-                    expected: first_len,
-                    got: v.len(),
-                });
+    // ----- all elements are ComplexVec of same length → ComplexMatrix -----
+    if let Some(MatValue::ComplexVec64(first)) = elements.first() {
+        let first_len = first.len();
+        if elements
+            .iter()
+            .all(|e| matches!(e, MatValue::ComplexVec64(v) if v.len() == first_len))
+        {
+            let rows = elements.len();
+            let mut pairs: Vec<(f64, f64)> = Vec::with_capacity(rows * first_len);
+            for e in elements {
+                let MatValue::ComplexVec64(v) = e else { unreachable!() };
+                pairs.extend(v);
             }
-            pairs.extend_from_slice(v);
+            return Ok(MatValue::ComplexMatrix64 {
+                rows,
+                cols: first_len,
+                pairs,
+            });
         }
-        return Ok(MatValue::ComplexMatrix64 {
-            rows: elements.len(),
-            cols: first_len,
-            pairs,
-        });
     }
-    if elements.iter().all(|e| matches!(e, MatValue::ComplexVec32(_))) {
-        let first_len = match &elements[0] {
-            MatValue::ComplexVec32(v) => v.len(),
-            _ => unreachable!(),
-        };
-        let mut pairs: Vec<(f32, f32)> = Vec::new();
-        for e in &elements {
-            let MatValue::ComplexVec32(v) = e else { unreachable!() };
-            if v.len() != first_len {
-                return Err(MatError::RaggedMatrix {
-                    expected: first_len,
-                    got: v.len(),
-                });
+    if let Some(MatValue::ComplexVec32(first)) = elements.first() {
+        let first_len = first.len();
+        if elements
+            .iter()
+            .all(|e| matches!(e, MatValue::ComplexVec32(v) if v.len() == first_len))
+        {
+            let rows = elements.len();
+            let mut pairs: Vec<(f32, f32)> = Vec::with_capacity(rows * first_len);
+            for e in elements {
+                let MatValue::ComplexVec32(v) = e else { unreachable!() };
+                pairs.extend(v);
             }
-            pairs.extend_from_slice(v);
+            return Ok(MatValue::ComplexMatrix32 {
+                rows,
+                cols: first_len,
+                pairs,
+            });
         }
-        return Ok(MatValue::ComplexMatrix32 {
-            rows: elements.len(),
-            cols: first_len,
-            pairs,
-        });
     }
 
-    Err(MatError::UnsupportedType(
-        "heterogeneous sequence — MAT v7.3 cell arrays not supported in this release",
-    ))
+    Err(elements)
 }
 
 // ---------------------------------------------------------------------------
