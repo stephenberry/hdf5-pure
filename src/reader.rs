@@ -27,7 +27,6 @@ use crate::types::{attrs_to_map, classify_datatype, AttrValue, DType};
 pub struct File {
     data: Vec<u8>,
     superblock: Superblock,
-    chunk_cache: ChunkCache,
     /// Byte offset to add to all relative addresses (= original base_address).
     addr_offset: u64,
 }
@@ -49,7 +48,6 @@ impl File {
         Ok(Self {
             data,
             superblock,
-            chunk_cache: ChunkCache::new(),
             addr_offset,
         })
     }
@@ -73,6 +71,7 @@ impl File {
         Ok(Dataset {
             file: self,
             header: hdr,
+            chunk_cache: ChunkCache::new(),
         })
     }
 
@@ -192,6 +191,7 @@ impl<'f> Group<'f> {
         Ok(Dataset {
             file: self.file,
             header: hdr,
+            chunk_cache: ChunkCache::new(),
         })
     }
 
@@ -228,10 +228,20 @@ impl<'f> Group<'f> {
 // ---------------------------------------------------------------------------
 
 /// A lightweight handle to an HDF5 dataset.
-#[derive(Debug)]
 pub struct Dataset<'f> {
     file: &'f File,
     header: ObjectHeader,
+    // Held per-dataset: the chunk index is keyed only by chunk coordinate, so
+    // a file-level cache would alias chunk addresses across datasets.
+    chunk_cache: ChunkCache,
+}
+
+impl<'f> std::fmt::Debug for Dataset<'f> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Dataset")
+            .field("messages", &self.header.messages.len())
+            .finish()
+    }
 }
 
 impl<'f> Dataset<'f> {
@@ -390,7 +400,7 @@ impl<'f> Dataset<'f> {
             pipeline.as_ref(),
             self.file.offset_size(),
             self.file.length_size(),
-            &self.file.chunk_cache,
+            &self.chunk_cache,
         )?)
     }
 }
