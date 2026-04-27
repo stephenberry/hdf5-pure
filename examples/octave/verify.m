@@ -281,4 +281,44 @@ ok(m(7,13) == 6 * 1000 + 12, 'm(7,13) interior');
 ok(rows == uint32(100) && cols == uint32(50), 'rows/cols scalar fields');
 clearvars -except is_truey is_falsy as_codes eq_text
 
+fprintf('=== cells.mat ===\n');
+% Octave 11's `load` for v7.3 does not follow object references and reports
+% "unknown datatype" for cell datasets and the `struct([])` markers in
+% `#refs#`. The file IS a valid MAT v7.3 cell array (libmatio's `matdump`
+% reads it correctly, and MATLAB itself loads it); the cell assertions only
+% run when the loader produces the expected variables.
+warning('off', 'load:unsupported');
+s = load('cells.mat');
+if ~isfield(s, 'points')
+  fprintf('  skipped: this loader does not support v7.3 cell arrays\n');
+  fprintf('           (Octave 11 limitation; verify with libmatio or MATLAB)\n');
+else
+  points = s.points; optionals = s.optionals; grid = s.grid; ragged = s.ragged;
+  ok(iscell(points), 'points iscell');
+  ok(numel(points) == 3, 'points has 3 cells');
+  ok(points{1}.x == 1.0 && points{1}.y == 2.0, 'points{1}');
+  ok(points{2}.x == 3.0 && points{2}.y == 4.0, 'points{2}');
+  ok(points{3}.x == 5.0 && points{3}.y == 6.0, 'points{3}');
+
+  ok(iscell(optionals), 'optionals iscell');
+  ok(numel(optionals) == 3, 'optionals has 3 cells');
+  ok(optionals{1}.x == 10.0, 'optionals{1}.x');
+  ok(isstruct(optionals{2}) && isempty(fieldnames(optionals{2})), 'optionals{2} is struct([])');
+  ok(optionals{3}.x == 30.0, 'optionals{3}.x');
+
+  ok(iscell(grid), 'grid iscell');
+  ok(numel(grid) == 2, 'grid outer length');
+  ok(iscell(grid{1}) && numel(grid{1}) == 2, 'grid{1} is 2-cell');
+  ok(grid{1}{1}.x == 100.0, 'grid{1}{1}.x');
+  ok(isstruct(grid{1}{2}) && isempty(fieldnames(grid{1}{2})), 'grid{1}{2} is struct([])');
+  ok(isstruct(grid{2}{1}) && isempty(fieldnames(grid{2}{1})), 'grid{2}{1} is struct([])');
+  ok(grid{2}{2}.x == 200.0, 'grid{2}{2}.x');
+
+  ok(iscell(ragged), 'ragged iscell');
+  ok(numel(ragged) == 2, 'ragged outer length');
+  ok(isequal(double(ragged{1}(:))', [1 2 3]), 'ragged{1}');
+  ok(isequal(double(ragged{2}(:))', [4 5]), 'ragged{2}');
+end
+clearvars -except is_truey is_falsy as_codes eq_text
+
 fprintf('\nAll fixtures verified.\n');

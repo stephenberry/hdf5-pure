@@ -44,13 +44,18 @@
 //! | `bool` | `uint8` scalar, `MATLAB_class = "logical"` |
 //! | `String` | `uint16` `[1, N]` UTF-16LE, `MATLAB_class = "char"` |
 //! | `Vec<T>` of numeric `T` | `[1, N]` row vector |
-//! | [`Matrix`]`<T>` or `Vec<Vec<T>>` | column-major 2-D dataset |
+//! | [`Matrix`]`<T>` or `Vec<Vec<T>>` of same length | column-major 2-D dataset |
 //! | [`Complex32`] / [`Complex64`] | compound `{real, imag}` dataset |
 //! | nested struct | group with child datasets, `MATLAB_class = "struct"` |
-//! | `Option<T>` | field is omitted when `None` |
+//! | `Option<T>` (struct field) | field is omitted when `None` |
 //! | unit enum variants | UTF-16 char dataset containing the variant name |
+//! | `Vec<Struct>` / `Vec<Option<T>>` / ragged `Vec<Vec<T>>` | cell array (object references into `#refs#`); `None` becomes `struct([])` |
 //!
 //! See the crate-level README for a fuller description.
+//!
+//! ## Cell arrays
+//!
+//! Heterogeneous sequences (sequences of structs, sequences with `None` interspersed, ragged inner vectors, mixed numeric tags) lower to a MATLAB cell array: each element is interned under the conventional `#refs#` group and the parent dataset stores object references with `MATLAB_class = "cell"`. Read in **MATLAB**, **libmatio**, **Julia `MAT.jl`**, or Python via **`pymatreader`**. Note: GNU Octave 11's `load` does not yet follow object references for v7.3 cells; load with one of the above instead.
 
 pub mod class;
 pub mod complex;
@@ -75,11 +80,16 @@ use serde::Serialize;
 ///
 /// The root value must be a struct with named fields. Each field becomes a
 /// top-level MATLAB variable.
+///
+/// # Sequence handling
+///
+/// Numeric sequences whose elements share a class collapse to row/column vectors or 2-D matrices as before. Any sequence that doesn't (e.g. `Vec<MyStruct>`, `Vec<Option<T>>` with `None` interspersed, ragged `Vec<Vec<f64>>`, or mixed numeric tags) lowers to a MATLAB cell array; each element is interned under the conventional `#refs#` group and the parent dataset stores object references with `MATLAB_class="cell"`. `Option::None` inside a sequence becomes `struct([])` so each cell slot has a defined MATLAB type. Cases that previously errored with `MatError::RaggedMatrix` or `MatError::MixedSequenceElementTypes` now succeed via this fallback.
 pub fn to_bytes<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, MatError> {
     ser::to_bytes(value)
 }
 
-/// Serialize `value` to the given filesystem path as a MAT v7.3 file.
+/// Serialize `value` to the given filesystem path as a MAT v7.3 file. See
+/// [`to_bytes`] for details on how heterogeneous sequences are encoded.
 pub fn to_file<T: Serialize + ?Sized, P: AsRef<std::path::Path>>(
     value: &T,
     path: P,

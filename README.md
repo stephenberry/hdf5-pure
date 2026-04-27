@@ -211,14 +211,42 @@ becomes a MATLAB variable. Mapping:
 | `bool` | `uint8` scalar, `MATLAB_class = "logical"` |
 | `String` / `&str` | `uint16` `[1, N]` UTF-16LE, `MATLAB_class = "char"` |
 | `Vec<T>` of numeric `T` | `[1, N]` row vector |
-| `Matrix<T>` or `Vec<Vec<T>>` | column-major 2-D dataset, HDF5 shape `[cols, rows]` |
+| `Matrix<T>` or `Vec<Vec<T>>` of same length | column-major 2-D dataset, HDF5 shape `[cols, rows]` |
 | `Complex32` / `Complex64` | compound `{real, imag}` dataset |
 | nested struct | HDF5 group with `MATLAB_class = "struct"`, `MATLAB_fields` |
-| `Option<T>` | omitted if `None` |
+| `Option<T>` (struct field) | omitted if `None` |
 | unit enum variant | UTF-16 char dataset holding the variant name |
+| `Vec<Struct>` / `Vec<Option<T>>` / ragged `Vec<Vec<T>>` | cell array (`MATLAB_class = "cell"`, object references into `#refs#`); `None` slots become `struct([])` |
 
-Not supported in this release: cell arrays, non-unit enum variants, MATLAB
-objects (`classdef`), datetime / categorical types.
+### Cell array pattern
+
+Sequences that don't unify into a numeric matrix lower to a MATLAB cell array. Each element is interned under the conventional `#refs#` group and the parent dataset stores object references.
+
+```rust
+use hdf5_pure::mat;
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize)]
+struct Point { x: f64, y: f64 }
+
+#[derive(Serialize, Deserialize)]
+struct Capture {
+    /// 3x1 cell array of struct.
+    path: Vec<Point>,
+    /// 3x1 cell array; the `None` slot becomes `struct([])`.
+    optionals: Vec<Option<Point>>,
+    /// Outer 2x1 cell of cells; rows-of-variable-length-records shape.
+    grid: Vec<Vec<Option<Point>>>,
+    /// Ragged numerics also fall back to cell rather than erroring.
+    ragged: Vec<Vec<f64>>,
+}
+```
+
+In MATLAB this loads as `iscell(path) == true`, `path{1}.x`, etc. Empty `None` slots load as `struct([])` (`isempty(fieldnames(...))`).
+
+**Reader compatibility.** Cell arrays load correctly in MATLAB, libmatio (reference C library), Julia's `MAT.jl`, and Python via `pymatreader` / `hdf5storage`. GNU Octave 11's `load` does not yet follow object references for v7.3 cells (warns "unknown datatype"); load such files with one of the above instead.
+
+Not supported in this release: non-unit enum variants, MATLAB objects (`classdef`), datetime / categorical types.
 
 ## Cargo features
 

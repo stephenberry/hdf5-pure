@@ -1,7 +1,7 @@
 //! MATLAB class strings used in the `MATLAB_class` attribute.
 //!
-//! These correspond to MATLAB's built-in numeric, character, logical, and
-//! struct classes. Other MATLAB classes (`cell`, `string`, `function_handle`,
+//! These correspond to MATLAB's built-in numeric, character, logical, struct,
+//! and cell classes. Other MATLAB classes (`string`, `function_handle`,
 //! user-defined `classdef` objects, …) exist but are not emitted by the
 //! serializer in this release.
 
@@ -36,7 +36,8 @@ pub enum MatClass {
     Logical,
     /// Struct (HDF5 group with `MATLAB_fields`).
     Struct,
-    /// Heterogeneous cell array (object references; unsupported for write in v1).
+    /// Heterogeneous cell array. Stored as object references resolved against
+    /// a hidden `#refs#` group (one entry per cell slot).
     Cell,
 }
 
