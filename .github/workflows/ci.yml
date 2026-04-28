@@ -60,3 +60,19 @@ jobs:
         run: cargo check --locked --target wasm32-unknown-unknown --no-default-features
       - name: Check (default features)
         run: cargo check --locked --target wasm32-unknown-unknown
+
+  lint:
+    name: Lint (fmt, clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: lint
+      - name: Rustfmt
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --locked --features serde --all-targets -- -D warnings
