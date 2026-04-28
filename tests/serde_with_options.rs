@@ -1,3 +1,4 @@
+#![cfg(feature = "serde")]
 //! Tests for the new `to_bytes_with_options` / `to_file_with_options` API.
 
 use hdf5_pure::mat::{
