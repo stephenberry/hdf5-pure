@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            flags: ""
+          - name: serde
+            flags: --features serde
+          - name: zfp
+            flags: --features zfp
+          # `matio-crosscheck` is intentionally excluded: it links against the
+          # system libmatio and is meant for maintainer-local crosscheck runs.
+          - name: full
+            flags: --features "serde zfp fast-deflate fast-checksum provenance mmap parallel"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+      - run: cargo test --locked ${{ matrix.flags }}
+
+  no-std-check:
+    name: Check (no_std)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: no-std
+      - run: cargo check --locked --no-default-features
+
+  wasm:
+    name: Build (wasm32-unknown-unknown)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm32
+      - name: Check (no default features)
+        run: cargo check --locked --target wasm32-unknown-unknown --no-default-features
+      - name: Check (default features)
+        run: cargo check --locked --target wasm32-unknown-unknown
