@@ -9,8 +9,10 @@ use serde::ser::{
 };
 
 use crate::mat::error::MatError;
+use crate::mat::options::Options;
 
 use super::emit::emit_file;
+use super::emit_with_builder::emit_file_with_options;
 use super::value_ser::{to_value, ValueSerializer};
 use crate::mat::value::MatValue;
 
@@ -18,6 +20,16 @@ use crate::mat::value::MatValue;
 pub fn to_bytes<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, MatError> {
     let fields = value.serialize(RootSerializer)?;
     emit_file(fields)
+}
+
+/// Like [`to_bytes`] but with explicit options. Use this to opt into the
+/// modern `string` class, name sanitization, deflate compression, etc.
+pub fn to_bytes_with_options<T: Serialize + ?Sized>(
+    value: &T,
+    options: &Options,
+) -> Result<Vec<u8>, MatError> {
+    let fields = value.serialize(RootSerializer)?;
+    emit_file_with_options(fields, options)
 }
 
 /// The root serializer. Produces `Vec<(field_name, MatValue)>`.

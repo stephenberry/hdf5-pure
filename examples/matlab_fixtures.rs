@@ -715,8 +715,8 @@ struct CellsRoot {
     /// `Vec<Option<Struct>>` with `None` interspersed: the `None` slot becomes
     /// `struct([])` (an empty struct array).
     optionals: Vec<Option<Point>>,
-    /// `Vec<Vec<Option<Struct>>>` matches the soul-rs `rx_data` shape: an
-    /// outer cell whose elements are themselves cells.
+    /// `Vec<Vec<Option<Struct>>>`: an outer cell whose elements are themselves
+    /// cells, with `None` slots becoming `struct([])` markers.
     grid: Vec<Vec<Option<Point>>>,
     /// Ragged `Vec<Vec<f64>>` falls back to a cell of doubles instead of
     /// erroring on the non-uniform inner lengths.

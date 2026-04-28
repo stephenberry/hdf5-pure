@@ -144,7 +144,9 @@ fn nested_vec_of_vec_produces_cell_of_cells() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("nested.mat");
 
-    // Mimic the soul-rs `rx_data: Vec<Vec<Option<RxData>>>` shape.
+    // `Vec<Vec<Option<Struct>>>`: rows of optional points. Each outer
+    // entry is a cell of inner refs; missing inner elements become
+    // `struct([])` markers.
     let root = NestedSeq {
         rows: vec![
             vec![Some(Point { x: 1.0, y: 1.0 }), None],

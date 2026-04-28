@@ -102,12 +102,14 @@ impl From<std::io::Error> for MatError {
     }
 }
 
+#[cfg(feature = "serde")]
 impl serde::ser::Error for MatError {
     fn custom<T: fmt::Display>(msg: T) -> Self {
         MatError::Custom(msg.to_string())
     }
 }
 
+#[cfg(feature = "serde")]
 impl serde::de::Error for MatError {
     fn custom<T: fmt::Display>(msg: T) -> Self {
         MatError::Custom(msg.to_string())
