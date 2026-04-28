@@ -87,9 +87,9 @@ pub use complex::{Complex32, Complex64};
 pub use matrix::Matrix;
 
 #[cfg(feature = "serde")]
-use serde::de::DeserializeOwned;
-#[cfg(feature = "serde")]
 use serde::Serialize;
+#[cfg(feature = "serde")]
+use serde::de::DeserializeOwned;
 
 /// Serialize `value` to a MAT v7.3 byte vector.
 ///

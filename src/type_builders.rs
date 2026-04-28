@@ -486,8 +486,7 @@ pub(crate) fn patch_vl_refs(raw_data: &mut [u8], collection_address: u64) {
     let count = raw_data.len() / vl_ref_size;
     for i in 0..count {
         let addr_offset = i * vl_ref_size + 4; // skip sequence_length
-        raw_data[addr_offset..addr_offset + 8]
-            .copy_from_slice(&collection_address.to_le_bytes());
+        raw_data[addr_offset..addr_offset + 8].copy_from_slice(&collection_address.to_le_bytes());
     }
 }
 

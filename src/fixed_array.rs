@@ -82,9 +82,9 @@ impl FixedArrayHeader {
 
         let version = d[4];
         if version != 0 {
-            return Err(FormatError::ChunkedReadError(
-                format!("unsupported Fixed Array header version: {version}"),
-            ));
+            return Err(FormatError::ChunkedReadError(format!(
+                "unsupported Fixed Array header version: {version}"
+            )));
         }
 
         let client_id = d[5];
@@ -168,8 +168,8 @@ pub fn read_fixed_array_chunks(
         num_chunks_per_dim.push(ds_dim.div_ceil(ch_dim));
     }
 
-    let chunk_byte_size: u64 = chunk_dimensions.iter().map(|&d| d as u64).product::<u64>()
-        * element_size as u64;
+    let chunk_byte_size: u64 =
+        chunk_dimensions.iter().map(|&d| d as u64).product::<u64>() * element_size as u64;
 
     let mut chunks = Vec::new();
 
@@ -280,8 +280,14 @@ mod tests {
         let num_chunks = vec![5u64];
         let chunk_dims = vec![20u32];
         assert_eq!(index_to_chunk_offsets(0, &num_chunks, &chunk_dims), vec![0]);
-        assert_eq!(index_to_chunk_offsets(1, &num_chunks, &chunk_dims), vec![20]);
-        assert_eq!(index_to_chunk_offsets(4, &num_chunks, &chunk_dims), vec![80]);
+        assert_eq!(
+            index_to_chunk_offsets(1, &num_chunks, &chunk_dims),
+            vec![20]
+        );
+        assert_eq!(
+            index_to_chunk_offsets(4, &num_chunks, &chunk_dims),
+            vec![80]
+        );
     }
 
     #[test]
@@ -289,17 +295,35 @@ mod tests {
         // 10x6 dataset with 4x3 chunks => ceil(10/4)=3, ceil(6/3)=2 => 6 chunks
         let num_chunks = vec![3u64, 2];
         let chunk_dims = vec![4u32, 3];
-        assert_eq!(index_to_chunk_offsets(0, &num_chunks, &chunk_dims), vec![0, 0]);
-        assert_eq!(index_to_chunk_offsets(1, &num_chunks, &chunk_dims), vec![0, 3]);
-        assert_eq!(index_to_chunk_offsets(2, &num_chunks, &chunk_dims), vec![4, 0]);
-        assert_eq!(index_to_chunk_offsets(3, &num_chunks, &chunk_dims), vec![4, 3]);
-        assert_eq!(index_to_chunk_offsets(5, &num_chunks, &chunk_dims), vec![8, 3]);
+        assert_eq!(
+            index_to_chunk_offsets(0, &num_chunks, &chunk_dims),
+            vec![0, 0]
+        );
+        assert_eq!(
+            index_to_chunk_offsets(1, &num_chunks, &chunk_dims),
+            vec![0, 3]
+        );
+        assert_eq!(
+            index_to_chunk_offsets(2, &num_chunks, &chunk_dims),
+            vec![4, 0]
+        );
+        assert_eq!(
+            index_to_chunk_offsets(3, &num_chunks, &chunk_dims),
+            vec![4, 3]
+        );
+        assert_eq!(
+            index_to_chunk_offsets(5, &num_chunks, &chunk_dims),
+            vec![8, 3]
+        );
     }
 
     #[test]
     fn read_variable_length_values() {
         assert_eq!(read_variable_length(&[0x78, 0x56], 2).unwrap(), 0x5678);
-        assert_eq!(read_variable_length(&[0x01, 0x02, 0x03, 0x04], 4).unwrap(), 0x04030201);
+        assert_eq!(
+            read_variable_length(&[0x01, 0x02, 0x03, 0x04], 4).unwrap(),
+            0x04030201
+        );
         assert_eq!(read_variable_length(&[0xFF], 1).unwrap(), 0xFF);
     }
 
@@ -382,13 +406,20 @@ mod tests {
             file_data[pos..pos + os].copy_from_slice(&addr.to_le_bytes());
         }
 
-        let header = FixedArrayHeader::parse(&file_data, fahd_offset, offset_size, length_size)
-            .unwrap();
+        let header =
+            FixedArrayHeader::parse(&file_data, fahd_offset, offset_size, length_size).unwrap();
         let ds_dims = vec![100u64];
         let chunk_dims = vec![20u32];
         let chunks = read_fixed_array_chunks(
-            &file_data, &header, &ds_dims, &chunk_dims, 8, offset_size, length_size,
-        ).unwrap();
+            &file_data,
+            &header,
+            &ds_dims,
+            &chunk_dims,
+            8,
+            offset_size,
+            length_size,
+        )
+        .unwrap();
 
         assert_eq!(chunks.len(), 5);
         for (i, c) in chunks.iter().enumerate() {
@@ -445,13 +476,20 @@ mod tests {
             file_data[pos + os + 4..pos + os + 8].copy_from_slice(&fmask.to_le_bytes());
         }
 
-        let header = FixedArrayHeader::parse(&file_data, fahd_offset, offset_size, length_size)
-            .unwrap();
+        let header =
+            FixedArrayHeader::parse(&file_data, fahd_offset, offset_size, length_size).unwrap();
         let ds_dims = vec![60u64];
         let chunk_dims = vec![20u32];
         let chunks = read_fixed_array_chunks(
-            &file_data, &header, &ds_dims, &chunk_dims, 8, offset_size, length_size,
-        ).unwrap();
+            &file_data,
+            &header,
+            &ds_dims,
+            &chunk_dims,
+            8,
+            offset_size,
+            length_size,
+        )
+        .unwrap();
 
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0].address, 0x1000);

@@ -9,10 +9,10 @@ use alloc::{string::String, string::ToString, vec, vec::Vec};
 #[cfg(not(feature = "std"))]
 use alloc::format;
 
-#[cfg(feature = "std")]
-use std::collections::HashMap;
 #[cfg(not(feature = "std"))]
 use alloc::collections::BTreeMap as HashMap;
+#[cfg(feature = "std")]
+use std::collections::HashMap;
 
 use crate::attribute::AttributeMessage;
 use crate::chunked_write::{ChunkOptions, build_chunked_data_at_ext};
@@ -24,14 +24,14 @@ use crate::metadata_index::{DatasetMetadata, MetadataBlock, MetadataIndex};
 use crate::object_header_writer::ObjectHeaderWriter;
 use crate::superblock::Superblock;
 use crate::type_builders::{
-    build_attr_message, build_global_heap_collection, patch_vl_refs,
-    DatasetBuilder, FinishedGroup, GroupBuilder,
+    DatasetBuilder, FinishedGroup, GroupBuilder, build_attr_message, build_global_heap_collection,
+    patch_vl_refs,
 };
 
 // Re-export public types that moved to type_builders for API compatibility.
-pub use crate::type_builders::{AttrValue, CompoundTypeBuilder, EnumTypeBuilder};
 #[cfg(feature = "provenance")]
 pub use crate::type_builders::ProvenanceConfig;
+pub use crate::type_builders::{AttrValue, CompoundTypeBuilder, EnumTypeBuilder};
 
 use crate::datatype::{CharacterSet, Datatype};
 
@@ -169,9 +169,32 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     let starting_block_size = dblock_content_size.next_power_of_two().max(512) as u64;
 
     // Fractal heap header size
-    let frhp_size = 4 + 1 + 2 + 2 + 1 + 4
-        + ls + os + ls + os + ls + ls + ls + ls + ls + ls + ls + ls
-        + 2 + ls + ls + 2 + 2 + os + 2 + 4;
+    let frhp_size = 4
+        + 1
+        + 2
+        + 2
+        + 1
+        + 4
+        + ls
+        + os
+        + ls
+        + os
+        + ls
+        + ls
+        + ls
+        + ls
+        + ls
+        + ls
+        + ls
+        + ls
+        + 2
+        + ls
+        + ls
+        + 2
+        + 2
+        + os
+        + 2
+        + 4;
 
     let frhp_addr = base_address;
     let dblock_addr = frhp_addr + frhp_size as u64;
@@ -436,7 +459,7 @@ impl FileWriter {
             let dt = db.datatype.ok_or(FormatError::DatasetMissingData)?;
             let shape = db.shape.ok_or(FormatError::DatasetMissingShape)?;
             // Allow empty data for zero-element datasets (e.g. shape [0, 0]).
-            let is_empty = shape.iter().any(|&d| d == 0);
+            let is_empty = shape.contains(&0);
             let raw = if is_empty {
                 db.data.unwrap_or_default()
             } else {
@@ -444,12 +467,20 @@ impl FileWriter {
             };
             let max_dimensions = db.maxshape.clone();
             let dspace = Dataspace {
-                space_type: if shape.is_empty() { DataspaceType::Scalar } else { DataspaceType::Simple },
-                rank: shape.len() as u8, dimensions: shape, max_dimensions,
+                space_type: if shape.is_empty() {
+                    DataspaceType::Scalar
+                } else {
+                    DataspaceType::Simple
+                },
+                rank: shape.len() as u8,
+                dimensions: shape,
+                max_dimensions,
             };
             let patches = collect_vl_patches(&db.attrs);
             let mut attrs = Vec::new();
-            for (n, v) in &db.attrs { attrs.push(build_attr_message(n, v)); }
+            for (n, v) in &db.attrs {
+                attrs.push(build_attr_message(n, v));
+            }
             #[cfg(feature = "provenance")]
             if let Some(ref prov) = db.provenance {
                 let p = crate::provenance::Provenance {
@@ -460,7 +491,16 @@ impl FileWriter {
                 attrs.extend(p.build_attrs(&raw));
             }
             let idx = all_ds.len();
-            all_ds.push(DsFlat { name: db.name, dt, ds: dspace, raw, attrs, chunk_options: db.chunk_options, maxshape: db.maxshape, reference_targets: db.reference_targets });
+            all_ds.push(DsFlat {
+                name: db.name,
+                dt,
+                ds: dspace,
+                raw,
+                attrs,
+                chunk_options: db.chunk_options,
+                maxshape: db.maxshape,
+                reference_targets: db.reference_targets,
+            });
             ds_vl.push(patches);
             Ok(idx)
         }
@@ -474,7 +514,9 @@ impl FileWriter {
         ) -> Result<usize, FormatError> {
             let patches = collect_vl_patches(&g.attrs);
             let mut gattrs = Vec::new();
-            for (n, v) in &g.attrs { gattrs.push(build_attr_message(n, v)); }
+            for (n, v) in &g.attrs {
+                gattrs.push(build_attr_message(n, v));
+            }
             let mut ds_idx = Vec::new();
             for db in g.datasets {
                 ds_idx.push(flatten_dataset(db, all_ds, ds_vl)?);
@@ -484,7 +526,12 @@ impl FileWriter {
                 sub_grp_idx.push(flatten_group(sg, all_ds, groups, grp_vl, ds_vl)?);
             }
             let gi = groups.len();
-            groups.push(GrpFlat { name: g.name, attrs: gattrs, ds_indices: ds_idx, sub_group_indices: sub_grp_idx });
+            groups.push(GrpFlat {
+                name: g.name,
+                attrs: gattrs,
+                ds_indices: ds_idx,
+                sub_group_indices: sub_grp_idx,
+            });
             grp_vl.push(patches);
             Ok(gi)
         }
@@ -497,7 +544,13 @@ impl FileWriter {
         }
 
         for g in self.groups.into_iter() {
-            root_group_indices.push(flatten_group(g, &mut all_ds, &mut groups, &mut grp_vl, &mut ds_vl)?);
+            root_group_indices.push(flatten_group(
+                g,
+                &mut all_ds,
+                &mut groups,
+                &mut grp_vl,
+                &mut ds_vl,
+            )?);
         }
 
         // Build global heap collections for VarLenAsciiArray attributes.
@@ -528,27 +581,50 @@ impl FileWriter {
             root_attrs.push(build_attr_message(n, v));
         }
 
-        let is_chunked: Vec<bool> = all_ds.iter().map(|d| d.chunk_options.is_chunked() || d.maxshape.is_some()).collect();
+        let is_chunked: Vec<bool> = all_ds
+            .iter()
+            .map(|d| d.chunk_options.is_chunked() || d.maxshape.is_some())
+            .collect();
         let root_dense = root_attrs.len() > DENSE_ATTR_THRESHOLD;
-        let group_dense: Vec<bool> = groups.iter().map(|g| g.attrs.len() > DENSE_ATTR_THRESHOLD).collect();
-        let ds_dense: Vec<bool> = all_ds.iter().map(|d| d.attrs.len() > DENSE_ATTR_THRESHOLD).collect();
+        let group_dense: Vec<bool> = groups
+            .iter()
+            .map(|g| g.attrs.len() > DENSE_ATTR_THRESHOLD)
+            .collect();
+        let ds_dense: Vec<bool> = all_ds
+            .iter()
+            .map(|d| d.attrs.len() > DENSE_ATTR_THRESHOLD)
+            .collect();
 
         // Pass 1: compute OH sizes with dummy addresses
-        let group_oh_sizes: Vec<usize> = groups.iter().enumerate().map(|(gi, g)| {
-            let mut dummy_links: Vec<LinkMessage> = g.ds_indices.iter().map(|&i| make_link(&all_ds[i].name, 0)).collect();
-            for &sgi in &g.sub_group_indices { dummy_links.push(make_link(&groups[sgi].name, 0)); }
-            if group_dense[gi] {
-                let dummy_blob = build_dense_attrs(&g.attrs, 0);
-                build_group_oh(&dummy_links, &g.attrs, Some(&dummy_blob)).len()
-            } else {
-                build_group_oh(&dummy_links, &g.attrs, None).len()
-            }
-        }).collect();
+        let group_oh_sizes: Vec<usize> = groups
+            .iter()
+            .enumerate()
+            .map(|(gi, g)| {
+                let mut dummy_links: Vec<LinkMessage> = g
+                    .ds_indices
+                    .iter()
+                    .map(|&i| make_link(&all_ds[i].name, 0))
+                    .collect();
+                for &sgi in &g.sub_group_indices {
+                    dummy_links.push(make_link(&groups[sgi].name, 0));
+                }
+                if group_dense[gi] {
+                    let dummy_blob = build_dense_attrs(&g.attrs, 0);
+                    build_group_oh(&dummy_links, &g.attrs, Some(&dummy_blob)).len()
+                } else {
+                    build_group_oh(&dummy_links, &g.attrs, None).len()
+                }
+            })
+            .collect();
 
         let root_dummy_links: Vec<LinkMessage> = {
             let mut links = Vec::new();
-            for &i in &root_ds_indices { links.push(make_link(&all_ds[i].name, 0)); }
-            for &gi in &root_group_indices { links.push(make_link(&groups[gi].name, 0)); }
+            for &i in &root_ds_indices {
+                links.push(make_link(&all_ds[i].name, 0));
+            }
+            for &gi in &root_group_indices {
+                links.push(make_link(&groups[gi].name, 0));
+            }
             links
         };
         let root_oh_size = if root_dense {
@@ -558,7 +634,10 @@ impl FileWriter {
             build_group_oh(&root_dummy_links, &root_attrs, None).len()
         };
 
-        struct DataBlob { data: Vec<u8>, oh_bytes: Vec<u8> }
+        struct DataBlob {
+            data: Vec<u8>,
+            oh_bytes: Vec<u8>,
+        }
 
         let mut dummy_blobs: Vec<DataBlob> = Vec::new();
         let mut dummy_cursor = 0u64;
@@ -566,15 +645,50 @@ impl FileWriter {
             if is_chunked[i] {
                 let chunk_dims = d.chunk_options.resolve_chunk_dims(&d.ds.dimensions);
                 let ctx = crate::filters::ChunkContext::from_datatype(&chunk_dims, &d.dt);
-                let result = build_chunked_data_at_ext(&d.raw, &d.ds.dimensions, ctx, &d.chunk_options, dummy_cursor, d.maxshape.as_deref())?;
+                let result = build_chunked_data_at_ext(
+                    &d.raw,
+                    &d.ds.dimensions,
+                    ctx,
+                    &d.chunk_options,
+                    dummy_cursor,
+                    d.maxshape.as_deref(),
+                )?;
                 dummy_cursor += result.data_bytes.len() as u64;
-                let dense_blob = if ds_dense[i] { Some(build_dense_attrs(&d.attrs, 0)) } else { None };
-                let oh = build_chunked_dataset_oh(&d.dt, &d.ds, &result.layout_message, result.pipeline_message.as_deref(), &d.attrs, dense_blob.as_ref());
-                dummy_blobs.push(DataBlob { data: result.data_bytes, oh_bytes: oh });
+                let dense_blob = if ds_dense[i] {
+                    Some(build_dense_attrs(&d.attrs, 0))
+                } else {
+                    None
+                };
+                let oh = build_chunked_dataset_oh(
+                    &d.dt,
+                    &d.ds,
+                    &result.layout_message,
+                    result.pipeline_message.as_deref(),
+                    &d.attrs,
+                    dense_blob.as_ref(),
+                );
+                dummy_blobs.push(DataBlob {
+                    data: result.data_bytes,
+                    oh_bytes: oh,
+                });
             } else {
-                let dense_blob = if ds_dense[i] { Some(build_dense_attrs(&d.attrs, 0)) } else { None };
-                let oh = build_dataset_oh(&d.dt, &d.ds, 0, d.raw.len() as u64, &d.attrs, dense_blob.as_ref());
-                dummy_blobs.push(DataBlob { data: d.raw.clone(), oh_bytes: oh });
+                let dense_blob = if ds_dense[i] {
+                    Some(build_dense_attrs(&d.attrs, 0))
+                } else {
+                    None
+                };
+                let oh = build_dataset_oh(
+                    &d.dt,
+                    &d.ds,
+                    0,
+                    d.raw.len() as u64,
+                    &d.attrs,
+                    dense_blob.as_ref(),
+                );
+                dummy_blobs.push(DataBlob {
+                    data: d.raw.clone(),
+                    oh_bytes: oh,
+                });
             }
         }
 
@@ -596,32 +710,40 @@ impl FileWriter {
         };
 
         let mut group_dense_blobs: Vec<Option<DenseAttrBlob>> = Vec::new();
-        let group_addrs2: Vec<u64> = group_oh_sizes.iter().enumerate().map(|(gi, &sz)| {
-            let addr = cursor2 as u64;
-            cursor2 += sz;
-            if group_dense[gi] {
-                let blob = build_dense_attrs(&groups[gi].attrs, cursor2 as u64);
-                cursor2 += blob.blob.len();
-                group_dense_blobs.push(Some(blob));
-            } else {
-                group_dense_blobs.push(None);
-            }
-            addr
-        }).collect();
+        let group_addrs2: Vec<u64> = group_oh_sizes
+            .iter()
+            .enumerate()
+            .map(|(gi, &sz)| {
+                let addr = cursor2 as u64;
+                cursor2 += sz;
+                if group_dense[gi] {
+                    let blob = build_dense_attrs(&groups[gi].attrs, cursor2 as u64);
+                    cursor2 += blob.blob.len();
+                    group_dense_blobs.push(Some(blob));
+                } else {
+                    group_dense_blobs.push(None);
+                }
+                addr
+            })
+            .collect();
 
         let mut ds_dense_blobs: Vec<Option<DenseAttrBlob>> = Vec::new();
-        let ds_oh_addrs2: Vec<u64> = actual_ds_oh_sizes.iter().enumerate().map(|(i, &sz)| {
-            let addr = cursor2 as u64;
-            cursor2 += sz;
-            if ds_dense[i] {
-                let blob = build_dense_attrs(&all_ds[i].attrs, cursor2 as u64);
-                cursor2 += blob.blob.len();
-                ds_dense_blobs.push(Some(blob));
-            } else {
-                ds_dense_blobs.push(None);
-            }
-            addr
-        }).collect();
+        let ds_oh_addrs2: Vec<u64> = actual_ds_oh_sizes
+            .iter()
+            .enumerate()
+            .map(|(i, &sz)| {
+                let addr = cursor2 as u64;
+                cursor2 += sz;
+                if ds_dense[i] {
+                    let blob = build_dense_attrs(&all_ds[i].attrs, cursor2 as u64);
+                    cursor2 += blob.blob.len();
+                    ds_dense_blobs.push(Some(blob));
+                } else {
+                    ds_dense_blobs.push(None);
+                }
+                addr
+            })
+            .collect();
 
         // Resolve path-based references now that all addresses are known.
         // Build a map of (group_name, child_name) -> address for resolution.
@@ -651,11 +773,24 @@ impl FileWriter {
                     for &sgi in &groups[gi].sub_group_indices {
                         register_group(
                             &format!("{}/{}", prefix, groups[sgi].name),
-                            sgi, groups, ds_addrs, grp_addrs, all_ds, map,
+                            sgi,
+                            groups,
+                            ds_addrs,
+                            grp_addrs,
+                            all_ds,
+                            map,
                         );
                     }
                 }
-                register_group(&groups[gi].name, gi, &groups, &ds_oh_addrs2, &group_addrs2, &all_ds, &mut path_map);
+                register_group(
+                    &groups[gi].name,
+                    gi,
+                    &groups,
+                    &ds_oh_addrs2,
+                    &group_addrs2,
+                    &all_ds,
+                    &mut path_map,
+                );
             }
 
             // Patch reference datasets
@@ -684,20 +819,34 @@ impl FileWriter {
                 let chunk_dims = d.chunk_options.resolve_chunk_dims(&d.ds.dimensions);
                 let base_address = cursor2 as u64;
                 let ctx = crate::filters::ChunkContext::from_datatype(&chunk_dims, &d.dt);
-                let result = build_chunked_data_at_ext(&d.raw, &d.ds.dimensions, ctx, &d.chunk_options, base_address, d.maxshape.as_deref())?;
+                let result = build_chunked_data_at_ext(
+                    &d.raw,
+                    &d.ds.dimensions,
+                    ctx,
+                    &d.chunk_options,
+                    base_address,
+                    d.maxshape.as_deref(),
+                )?;
                 cursor2 += result.data_bytes.len();
                 ds_layouts.push(DsLayout {
-                    data: result.data_bytes, data_addr: base_address,
+                    data: result.data_bytes,
+                    data_addr: base_address,
                     chunked_msgs: Some((result.layout_message, result.pipeline_message)),
                 });
             } else {
                 let data = d.raw.clone();
-                let addr = if data.is_empty() { u64::MAX } else {
+                let addr = if data.is_empty() {
+                    u64::MAX
+                } else {
                     let a = cursor2 as u64;
                     cursor2 += data.len();
                     a
                 };
-                ds_layouts.push(DsLayout { data, data_addr: addr, chunked_msgs: None });
+                ds_layouts.push(DsLayout {
+                    data,
+                    data_addr: addr,
+                    chunked_msgs: None,
+                });
             }
         }
 
@@ -715,13 +864,19 @@ impl FileWriter {
             }
             for (gi, patches) in grp_vl.iter().enumerate() {
                 for patch in patches {
-                    patch_vl_refs(&mut groups[gi].attrs[patch.attr_index].raw_data, gcol_cursor);
+                    patch_vl_refs(
+                        &mut groups[gi].attrs[patch.attr_index].raw_data,
+                        gcol_cursor,
+                    );
                     gcol_cursor += patch.collection_bytes.len() as u64;
                 }
             }
             for (di, patches) in ds_vl.iter().enumerate() {
                 for patch in patches {
-                    patch_vl_refs(&mut all_ds[di].attrs[patch.attr_index].raw_data, gcol_cursor);
+                    patch_vl_refs(
+                        &mut all_ds[di].attrs[patch.attr_index].raw_data,
+                        gcol_cursor,
+                    );
                     gcol_cursor += patch.collection_bytes.len() as u64;
                 }
             }
@@ -733,11 +888,28 @@ impl FileWriter {
         for (i, d) in all_ds.iter().enumerate() {
             let layout = &ds_layouts[i];
             let oh = if let Some((ref lm, ref pm)) = layout.chunked_msgs {
-                build_chunked_dataset_oh(&d.dt, &d.ds, lm, pm.as_deref(), &d.attrs, ds_dense_blobs[i].as_ref())
+                build_chunked_dataset_oh(
+                    &d.dt,
+                    &d.ds,
+                    lm,
+                    pm.as_deref(),
+                    &d.attrs,
+                    ds_dense_blobs[i].as_ref(),
+                )
             } else {
-                build_dataset_oh(&d.dt, &d.ds, layout.data_addr, layout.data.len() as u64, &d.attrs, ds_dense_blobs[i].as_ref())
+                build_dataset_oh(
+                    &d.dt,
+                    &d.ds,
+                    layout.data_addr,
+                    layout.data.len() as u64,
+                    &d.attrs,
+                    ds_dense_blobs[i].as_ref(),
+                )
             };
-            ds_blobs2.push(DataBlob { data: layout.data.clone(), oh_bytes: oh });
+            ds_blobs2.push(DataBlob {
+                data: layout.data.clone(),
+                oh_bytes: oh,
+            });
         }
 
         let actual_ds_oh_sizes2: Vec<usize> = ds_blobs2.iter().map(|b| b.oh_bytes.len()).collect();
@@ -753,45 +925,90 @@ impl FileWriter {
         }
 
         let sb = Superblock {
-            version: 3, offset_size: OFFSET_SIZE, length_size: LENGTH_SIZE,
-            base_address: ub as u64, eof_address: eof_addr2, root_group_address: root_group_addr,
-            group_leaf_node_k: None, group_internal_node_k: None, indexed_storage_internal_node_k: None,
-            free_space_address: None, driver_info_address: None,
-            consistency_flags: 0, superblock_extension_address: Some(u64::MAX), checksum: None,
+            version: 3,
+            offset_size: OFFSET_SIZE,
+            length_size: LENGTH_SIZE,
+            base_address: ub as u64,
+            eof_address: eof_addr2,
+            root_group_address: root_group_addr,
+            group_leaf_node_k: None,
+            group_internal_node_k: None,
+            indexed_storage_internal_node_k: None,
+            free_space_address: None,
+            driver_info_address: None,
+            consistency_flags: 0,
+            superblock_extension_address: Some(u64::MAX),
+            checksum: None,
         };
         buf.extend_from_slice(&sb.serialize());
 
         // Root group OH
         let root_links: Vec<LinkMessage> = {
             let mut v = Vec::new();
-            for &i in &root_ds_indices { v.push(make_link(&all_ds[i].name, ds_oh_addrs2[i])); }
-            for &gi in &root_group_indices { v.push(make_link(&groups[gi].name, group_addrs2[gi])); }
+            for &i in &root_ds_indices {
+                v.push(make_link(&all_ds[i].name, ds_oh_addrs2[i]));
+            }
+            for &gi in &root_group_indices {
+                v.push(make_link(&groups[gi].name, group_addrs2[gi]));
+            }
             v
         };
-        buf.extend_from_slice(&build_group_oh(&root_links, &root_attrs, root_dense_blob.as_ref()));
-        if let Some(ref blob) = root_dense_blob { buf.extend_from_slice(&blob.blob); }
+        buf.extend_from_slice(&build_group_oh(
+            &root_links,
+            &root_attrs,
+            root_dense_blob.as_ref(),
+        ));
+        if let Some(ref blob) = root_dense_blob {
+            buf.extend_from_slice(&blob.blob);
+        }
 
         // Group OHs + dense blobs
         for (gi, g) in groups.iter().enumerate() {
-            let mut links: Vec<LinkMessage> = g.ds_indices.iter().map(|&i| make_link(&all_ds[i].name, ds_oh_addrs2[i])).collect();
-            for &sgi in &g.sub_group_indices { links.push(make_link(&groups[sgi].name, group_addrs2[sgi])); }
-            buf.extend_from_slice(&build_group_oh(&links, &g.attrs, group_dense_blobs[gi].as_ref()));
-            if let Some(ref blob) = group_dense_blobs[gi] { buf.extend_from_slice(&blob.blob); }
+            let mut links: Vec<LinkMessage> = g
+                .ds_indices
+                .iter()
+                .map(|&i| make_link(&all_ds[i].name, ds_oh_addrs2[i]))
+                .collect();
+            for &sgi in &g.sub_group_indices {
+                links.push(make_link(&groups[sgi].name, group_addrs2[sgi]));
+            }
+            buf.extend_from_slice(&build_group_oh(
+                &links,
+                &g.attrs,
+                group_dense_blobs[gi].as_ref(),
+            ));
+            if let Some(ref blob) = group_dense_blobs[gi] {
+                buf.extend_from_slice(&blob.blob);
+            }
         }
 
         // Dataset OHs + dense blobs
         for (i, blob) in ds_blobs2.iter().enumerate() {
             buf.extend_from_slice(&blob.oh_bytes);
-            if let Some(ref dense) = ds_dense_blobs[i] { buf.extend_from_slice(&dense.blob); }
+            if let Some(ref dense) = ds_dense_blobs[i] {
+                buf.extend_from_slice(&dense.blob);
+            }
         }
 
         // Data
-        for blob in &ds_blobs2 { buf.extend_from_slice(&blob.data); }
+        for blob in &ds_blobs2 {
+            buf.extend_from_slice(&blob.data);
+        }
 
         // Global heap collections
-        for patch in &vl_root { buf.extend_from_slice(&patch.collection_bytes); }
-        for patches in &grp_vl { for patch in patches { buf.extend_from_slice(&patch.collection_bytes); } }
-        for patches in &ds_vl { for patch in patches { buf.extend_from_slice(&patch.collection_bytes); } }
+        for patch in &vl_root {
+            buf.extend_from_slice(&patch.collection_bytes);
+        }
+        for patches in &grp_vl {
+            for patch in patches {
+                buf.extend_from_slice(&patch.collection_bytes);
+            }
+        }
+        for patches in &ds_vl {
+            for patch in patches {
+                buf.extend_from_slice(&patch.collection_bytes);
+            }
+        }
 
         Ok(buf)
     }
@@ -869,7 +1086,13 @@ mod tests {
     fn parse_file(bytes: &[u8]) -> (Superblock, ObjectHeader) {
         let sig = signature::find_signature(bytes).unwrap();
         let sb = Superblock::parse(bytes, sig).unwrap();
-        let oh = ObjectHeader::parse(bytes, sb.root_group_address as usize, sb.offset_size, sb.length_size).unwrap();
+        let oh = ObjectHeader::parse(
+            bytes,
+            sb.root_group_address as usize,
+            sb.offset_size,
+            sb.length_size,
+        )
+        .unwrap();
         (sb, oh)
     }
 
@@ -877,13 +1100,30 @@ mod tests {
         let sig = signature::find_signature(bytes).unwrap();
         let sb = Superblock::parse(bytes, sig).unwrap();
         let addr = resolve_path_any(bytes, &sb, path).unwrap();
-        let hdr = ObjectHeader::parse(bytes, addr as usize, sb.offset_size, sb.length_size).unwrap();
-        let dt_data = &hdr.messages.iter().find(|m| m.msg_type == MessageType::Datatype).unwrap().data;
-        let ds_data = &hdr.messages.iter().find(|m| m.msg_type == MessageType::Dataspace).unwrap().data;
-        let dl_data = &hdr.messages.iter().find(|m| m.msg_type == MessageType::DataLayout).unwrap().data;
+        let hdr =
+            ObjectHeader::parse(bytes, addr as usize, sb.offset_size, sb.length_size).unwrap();
+        let dt_data = &hdr
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::Datatype)
+            .unwrap()
+            .data;
+        let ds_data = &hdr
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::Dataspace)
+            .unwrap()
+            .data;
+        let dl_data = &hdr
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::DataLayout)
+            .unwrap()
+            .data;
         let (dt, _) = Datatype::parse(dt_data).unwrap();
         let ds = Dataspace::parse(ds_data, sb.length_size).unwrap();
-        let dl = crate::data_layout::DataLayout::parse(dl_data, sb.offset_size, sb.length_size).unwrap();
+        let dl =
+            crate::data_layout::DataLayout::parse(dl_data, sb.offset_size, sb.length_size).unwrap();
         let raw = crate::data_read::read_raw_data(bytes, &dl, &ds, &dt).unwrap();
         crate::data_read::read_as_f64(&raw, &dt).unwrap()
     }
@@ -908,13 +1148,16 @@ mod tests {
     #[test]
     fn file_with_dataset_attrs() {
         let mut fw = FileWriter::new();
-        fw.create_dataset("data").with_f64_data(&[1.0, 2.0]).set_attr("scale", AttrValue::F64(0.5));
+        fw.create_dataset("data")
+            .with_f64_data(&[1.0, 2.0])
+            .set_attr("scale", AttrValue::F64(0.5));
         let bytes = fw.finish().unwrap();
         assert_eq!(read_dataset_f64(&bytes, "data"), vec![1.0, 2.0]);
         let sig = signature::find_signature(&bytes).unwrap();
         let sb = Superblock::parse(&bytes, sig).unwrap();
         let addr = resolve_path_any(&bytes, &sb, "data").unwrap();
-        let hdr = ObjectHeader::parse(&bytes, addr as usize, sb.offset_size, sb.length_size).unwrap();
+        let hdr =
+            ObjectHeader::parse(&bytes, addr as usize, sb.offset_size, sb.length_size).unwrap();
         let attrs = crate::attribute::extract_attributes(&hdr, sb.length_size).unwrap();
         assert_eq!(attrs.len(), 1);
         assert_eq!(attrs[0].name, "scale");
@@ -952,11 +1195,17 @@ mod tests {
         let sig = signature::find_signature(&bytes).unwrap();
         let sb = Superblock::parse(&bytes, sig).unwrap();
         let addr = resolve_path_any(&bytes, &sb, "data").unwrap();
-        let hdr = ObjectHeader::parse(&bytes, addr as usize, sb.offset_size, sb.length_size).unwrap();
-        let attrs = crate::attribute::extract_attributes_full(&bytes, &hdr, sb.offset_size, sb.length_size).unwrap();
+        let hdr =
+            ObjectHeader::parse(&bytes, addr as usize, sb.offset_size, sb.length_size).unwrap();
+        let attrs =
+            crate::attribute::extract_attributes_full(&bytes, &hdr, sb.offset_size, sb.length_size)
+                .unwrap();
         assert_eq!(attrs.len(), 20);
         for i in 0..20 {
-            let attr = attrs.iter().find(|a| a.name == format!("attr_{i:03}")).unwrap();
+            let attr = attrs
+                .iter()
+                .find(|a| a.name == format!("attr_{i:03}"))
+                .unwrap();
             let v = attr.read_as_f64().unwrap();
             assert!((v[0] - i as f64 * 1.5).abs() < 1e-10);
         }
@@ -973,8 +1222,16 @@ mod tests {
         let bytes = fw.finish().unwrap();
         let sig = signature::find_signature(&bytes).unwrap();
         let sb = Superblock::parse(&bytes, sig).unwrap();
-        let oh = ObjectHeader::parse(&bytes, sb.root_group_address as usize, sb.offset_size, sb.length_size).unwrap();
-        let attrs = crate::attribute::extract_attributes_full(&bytes, &oh, sb.offset_size, sb.length_size).unwrap();
+        let oh = ObjectHeader::parse(
+            &bytes,
+            sb.root_group_address as usize,
+            sb.offset_size,
+            sb.length_size,
+        )
+        .unwrap();
+        let attrs =
+            crate::attribute::extract_attributes_full(&bytes, &oh, sb.offset_size, sb.length_size)
+                .unwrap();
         assert_eq!(attrs.len(), 15);
     }
 
@@ -983,13 +1240,20 @@ mod tests {
         let mut fw = FileWriter::new();
         let ds = fw.create_dataset("data");
         ds.with_f64_data(&[1.0]);
-        for i in 0..5 { ds.set_attr(&format!("a{i}"), AttrValue::F64(i as f64)); }
+        for i in 0..5 {
+            ds.set_attr(&format!("a{i}"), AttrValue::F64(i as f64));
+        }
         let bytes = fw.finish().unwrap();
         let sig = signature::find_signature(&bytes).unwrap();
         let sb = Superblock::parse(&bytes, sig).unwrap();
         let addr = resolve_path_any(&bytes, &sb, "data").unwrap();
-        let hdr = ObjectHeader::parse(&bytes, addr as usize, sb.offset_size, sb.length_size).unwrap();
-        assert!(!hdr.messages.iter().any(|m| m.msg_type == MessageType::AttributeInfo));
+        let hdr =
+            ObjectHeader::parse(&bytes, addr as usize, sb.offset_size, sb.length_size).unwrap();
+        assert!(
+            !hdr.messages
+                .iter()
+                .any(|m| m.msg_type == MessageType::AttributeInfo)
+        );
         let attrs = crate::attribute::extract_attributes(&hdr, sb.length_size).unwrap();
         assert_eq!(attrs.len(), 5);
     }
@@ -998,11 +1262,16 @@ mod tests {
     fn encode_decode_managed_id_roundtrip() {
         let id = encode_managed_id(100, 42, 40, 8);
         let fh = crate::fractal_heap::FractalHeapHeader {
-            heap_id_length: 8, io_filter_encoded_length: 0,
-            max_managed_object_size: 1024, table_width: 4,
-            starting_block_size: 4096, max_direct_block_size: 65536,
-            max_heap_size: 40, starting_row_of_indirect_blocks: 1,
-            root_block_address: 0, current_rows_in_root_indirect_block: 0,
+            heap_id_length: 8,
+            io_filter_encoded_length: 0,
+            max_managed_object_size: 1024,
+            table_width: 4,
+            starting_block_size: 4096,
+            max_direct_block_size: 65536,
+            max_heap_size: 40,
+            starting_row_of_indirect_blocks: 1,
+            root_block_address: 0,
+            current_rows_in_root_indirect_block: 0,
             managed_objects_count: 0,
         };
         let (off, len) = fh.decode_managed_id(&id).unwrap();
@@ -1012,22 +1281,38 @@ mod tests {
 
     #[test]
     fn finalize_parallel_basic() {
-        use crate::metadata_index::{MetadataBlock, build_dataset_metadata};
         use crate::chunked_write::ChunkOptions;
+        use crate::metadata_index::{MetadataBlock, build_dataset_metadata};
         use crate::type_builders::make_f64_type;
 
         let mut b0 = MetadataBlock::new(0);
-        let data_a: Vec<u8> = [1.0f64, 2.0, 3.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let data_a: Vec<u8> = [1.0f64, 2.0, 3.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
         b0.add_dataset(build_dataset_metadata(
-            "alpha", make_f64_type(), vec![3], data_a,
-            ChunkOptions::default(), None, vec![],
+            "alpha",
+            make_f64_type(),
+            vec![3],
+            data_a,
+            ChunkOptions::default(),
+            None,
+            vec![],
         ));
 
         let mut b1 = MetadataBlock::new(1);
-        let data_b: Vec<u8> = [10.0f64, 20.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let data_b: Vec<u8> = [10.0f64, 20.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
         b1.add_dataset(build_dataset_metadata(
-            "beta", make_f64_type(), vec![2], data_b,
-            ChunkOptions::default(), None, vec![],
+            "beta",
+            make_f64_type(),
+            vec![2],
+            data_b,
+            ChunkOptions::default(),
+            None,
+            vec![],
         ));
 
         let bytes = finalize_parallel(vec![b0, b1]).unwrap();
@@ -1037,19 +1322,29 @@ mod tests {
 
     #[test]
     fn finalize_parallel_duplicate_error() {
-        use crate::metadata_index::{MetadataBlock, build_dataset_metadata};
         use crate::chunked_write::ChunkOptions;
+        use crate::metadata_index::{MetadataBlock, build_dataset_metadata};
         use crate::type_builders::make_f64_type;
 
         let mut b0 = MetadataBlock::new(0);
         b0.add_dataset(build_dataset_metadata(
-            "dup", make_f64_type(), vec![1], vec![0u8; 8],
-            ChunkOptions::default(), None, vec![],
+            "dup",
+            make_f64_type(),
+            vec![1],
+            vec![0u8; 8],
+            ChunkOptions::default(),
+            None,
+            vec![],
         ));
         let mut b1 = MetadataBlock::new(1);
         b1.add_dataset(build_dataset_metadata(
-            "dup", make_f64_type(), vec![1], vec![0u8; 8],
-            ChunkOptions::default(), None, vec![],
+            "dup",
+            make_f64_type(),
+            vec![1],
+            vec![0u8; 8],
+            ChunkOptions::default(),
+            None,
+            vec![],
         ));
         let err = finalize_parallel(vec![b0, b1]).unwrap_err();
         assert!(matches!(err, FormatError::DuplicateDatasetName(_)));

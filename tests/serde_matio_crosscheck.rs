@@ -13,7 +13,12 @@
 // FFI bindings to system libmatio.
 // =======================================================================
 
-#[allow(non_camel_case_types, non_snake_case, non_upper_case_globals, dead_code)]
+#[allow(
+    non_camel_case_types,
+    non_snake_case,
+    non_upper_case_globals,
+    dead_code
+)]
 mod ffi {
     use std::ffi::{c_char, c_int, c_uint, c_void};
 
@@ -132,7 +137,7 @@ mod ffi {
 // lifetime discipline on borrowed struct-field pointers.
 // =======================================================================
 
-use std::ffi::{c_void, CStr, CString};
+use std::ffi::{CStr, CString, c_void};
 use std::path::Path;
 use std::ptr;
 
@@ -164,14 +169,16 @@ impl MatFile {
         if p.is_null() {
             None
         } else {
-            Some(MatVar { ptr: p, owned: true })
+            Some(MatVar {
+                ptr: p,
+                owned: true,
+            })
         }
     }
 
     /// Write a prepared MatVar to this file.
     pub fn write(&self, var: MatVar) {
-        let rc =
-            unsafe { ffi::Mat_VarWrite(self.ptr, var.ptr, ffi::MAT_COMPRESSION_NONE) };
+        let rc = unsafe { ffi::Mat_VarWrite(self.ptr, var.ptr, ffi::MAT_COMPRESSION_NONE) };
         assert_eq!(rc, 0, "Mat_VarWrite failed ({rc})");
         // matio keeps a reference after Mat_VarWrite; still must free on our side.
         drop(var);
@@ -222,13 +229,7 @@ impl MatVar {
         Self::create_numeric(name, ffi::MAT_C_DOUBLE, ffi::MAT_T_DOUBLE, &[1, 1], &[v])
     }
     pub fn f64_row_vec(name: &str, v: &[f64]) -> Self {
-        Self::create_numeric(
-            name,
-            ffi::MAT_C_DOUBLE,
-            ffi::MAT_T_DOUBLE,
-            &[1, v.len()],
-            v,
-        )
+        Self::create_numeric(name, ffi::MAT_C_DOUBLE, ffi::MAT_T_DOUBLE, &[1, v.len()], v)
     }
     /// Build a 2-D f64 matrix. `data` must be in column-major order (MATLAB).
     pub fn f64_matrix(name: &str, rows: usize, cols: usize, col_major: &[f64]) -> Self {
@@ -245,13 +246,7 @@ impl MatVar {
         Self::create_numeric(name, ffi::MAT_C_INT32, ffi::MAT_T_INT32, &[1, 1], &[v])
     }
     pub fn i32_row_vec(name: &str, v: &[i32]) -> Self {
-        Self::create_numeric(
-            name,
-            ffi::MAT_C_INT32,
-            ffi::MAT_T_INT32,
-            &[1, v.len()],
-            v,
-        )
+        Self::create_numeric(name, ffi::MAT_C_INT32, ffi::MAT_T_INT32, &[1, v.len()], v)
     }
     pub fn u32_scalar(name: &str, v: u32) -> Self {
         Self::create_numeric(name, ffi::MAT_C_UINT32, ffi::MAT_T_UINT32, &[1, 1], &[v])
@@ -316,7 +311,10 @@ impl MatVar {
         if p.is_null() {
             None
         } else {
-            Some(MatVar { ptr: p, owned: false })
+            Some(MatVar {
+                ptr: p,
+                owned: false,
+            })
         }
     }
 
@@ -329,8 +327,10 @@ impl MatVar {
         let dims = [1usize, 1];
         // Mat_VarCreateStruct2 expects a NULL-terminated array of C strings
         // (unlike the deprecated Mat_VarCreateStruct which takes a count).
-        let cfields: Vec<CString> =
-            field_names.iter().map(|f| CString::new(*f).unwrap()).collect();
+        let cfields: Vec<CString> = field_names
+            .iter()
+            .map(|f| CString::new(*f).unwrap())
+            .collect();
         let mut cfield_ptrs: Vec<*const std::ffi::c_char> =
             cfields.iter().map(|c| c.as_ptr()).collect();
         cfield_ptrs.push(std::ptr::null());
@@ -392,7 +392,15 @@ fn matio_reads_scalars_from_hdf5_pure() {
     let _g = matio_lock();
     let dir = tempdir().unwrap();
     let path = dir.path().join("scalars.mat");
-    mat::to_file(&Scalars { x: 1.5, n: -7, u: 42 }, &path).unwrap();
+    mat::to_file(
+        &Scalars {
+            x: 1.5,
+            n: -7,
+            u: 42,
+        },
+        &path,
+    )
+    .unwrap();
 
     let f = MatFile::open(&path);
     assert_eq!(f.read("x").unwrap().scalar_f64(), 1.5);
@@ -412,7 +420,10 @@ fn matio_reads_vectors_from_hdf5_pure() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("vectors.mat");
     mat::to_file(
-        &Vectors { xs: vec![1.0, 2.0, 3.0, 4.0], ns: vec![-1, 0, 1] },
+        &Vectors {
+            xs: vec![1.0, 2.0, 3.0, 4.0],
+            ns: vec![-1, 0, 1],
+        },
         &path,
     )
     .unwrap();
@@ -481,7 +492,10 @@ fn matio_reads_nested_struct_from_hdf5_pure() {
     mat::to_file(
         &Nested {
             name: 99,
-            config: Config { threshold: 0.25, trial: 3 },
+            config: Config {
+                threshold: 0.25,
+                trial: 3,
+            },
         },
         &path,
     )
@@ -515,7 +529,14 @@ fn hdf5_pure_reads_scalars_written_by_matio() {
     }
 
     let parsed: Scalars = mat::from_file(&path).unwrap();
-    assert_eq!(parsed, Scalars { x: 1.5, n: -7, u: 42 });
+    assert_eq!(
+        parsed,
+        Scalars {
+            x: 1.5,
+            n: -7,
+            u: 42
+        }
+    );
 }
 
 #[test]
@@ -532,7 +553,10 @@ fn hdf5_pure_reads_vectors_written_by_matio() {
     let parsed: Vectors = mat::from_file(&path).unwrap();
     assert_eq!(
         parsed,
-        Vectors { xs: vec![1.0, 2.0, 3.0, 4.0], ns: vec![-1, 0, 1] }
+        Vectors {
+            xs: vec![1.0, 2.0, 3.0, 4.0],
+            ns: vec![-1, 0, 1]
+        }
     );
 }
 
@@ -578,7 +602,13 @@ fn hdf5_pure_reads_nested_struct_written_by_matio() {
     let parsed: Nested = mat::from_file(&path).unwrap();
     assert_eq!(
         parsed,
-        Nested { name: 99, config: Config { threshold: 0.25, trial: 3 } }
+        Nested {
+            name: 99,
+            config: Config {
+                threshold: 0.25,
+                trial: 3
+            }
+        }
     );
 }
 
@@ -594,7 +624,10 @@ fn full_roundtrip_via_matio() {
     let path2 = dir.path().join("b.mat");
 
     mat::to_file(
-        &Vectors { xs: vec![0.5, 1.5, 2.5], ns: vec![10, 20, 30] },
+        &Vectors {
+            xs: vec![0.5, 1.5, 2.5],
+            ns: vec![10, 20, 30],
+        },
         &path1,
     )
     .unwrap();
@@ -632,7 +665,9 @@ fn hdf5_pure_reads_column_vector_matrix_from_matio() {
     }
 
     #[derive(serde::Deserialize)]
-    struct ColOnly { m: Matrix<f64> }
+    struct ColOnly {
+        m: Matrix<f64>,
+    }
     let parsed: ColOnly = mat::from_file(&path).unwrap();
     assert_eq!(parsed.m.rows(), 3);
     assert_eq!(parsed.m.cols(), 1);
@@ -653,7 +688,9 @@ fn hdf5_pure_reads_row_vector_matrix_from_matio() {
     }
 
     #[derive(serde::Deserialize)]
-    struct RowOnly { m: Matrix<f64> }
+    struct RowOnly {
+        m: Matrix<f64>,
+    }
     let parsed: RowOnly = mat::from_file(&path).unwrap();
     assert_eq!(parsed.m.rows(), 1);
     assert_eq!(parsed.m.cols(), 4);

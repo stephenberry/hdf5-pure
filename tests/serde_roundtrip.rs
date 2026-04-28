@@ -23,7 +23,11 @@ struct SimpleRoot {
 
 #[test]
 fn userblock_signature_present() {
-    let v = SimpleRoot { trial: 1, temperature: 23.5, name: "alpha".into() };
+    let v = SimpleRoot {
+        trial: 1,
+        temperature: 23.5,
+        name: "alpha".into(),
+    };
     let bytes = mat::to_bytes(&v).unwrap();
     assert!(bytes.len() > 512, "file must be at least userblock + HDF5");
     assert_eq!(&bytes[..6], b"MATLAB");
@@ -32,7 +36,11 @@ fn userblock_signature_present() {
 
 #[test]
 fn serialize_top_level_struct_produces_three_variables() {
-    let v = SimpleRoot { trial: 7, temperature: 300.0, name: "beta".into() };
+    let v = SimpleRoot {
+        trial: 7,
+        temperature: 300.0,
+        name: "beta".into(),
+    };
     let bytes = mat::to_bytes(&v).unwrap();
 
     let file = File::from_bytes(bytes).unwrap();
@@ -140,7 +148,10 @@ struct Inner {
 fn nested_struct_becomes_group() {
     let v = WithNested {
         x: 1.5,
-        inner: Inner { y: 42, z: vec![10.0, 20.0] },
+        inner: Inner {
+            y: 42,
+            z: vec![10.0, 20.0],
+        },
     };
     let file = File::from_bytes(mat::to_bytes(&v).unwrap()).unwrap();
 
@@ -179,7 +190,10 @@ struct WithOption {
 
 #[test]
 fn option_none_is_omitted() {
-    let v = WithOption { required: 1.0, maybe: None };
+    let v = WithOption {
+        required: 1.0,
+        maybe: None,
+    };
     let file = File::from_bytes(mat::to_bytes(&v).unwrap()).unwrap();
     assert!(file.dataset("required").is_ok());
     assert!(file.dataset("maybe").is_err());
@@ -187,7 +201,10 @@ fn option_none_is_omitted() {
 
 #[test]
 fn option_some_serializes_underlying() {
-    let v = WithOption { required: 1.0, maybe: Some("hello".into()) };
+    let v = WithOption {
+        required: 1.0,
+        maybe: Some("hello".into()),
+    };
     let file = File::from_bytes(mat::to_bytes(&v).unwrap()).unwrap();
     let ds = file.dataset("maybe").unwrap();
     assert_eq!(ds.shape().unwrap(), vec![5, 1]);
@@ -220,7 +237,10 @@ fn complex_scalar_and_vector() {
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
-enum Flag { On, Off }
+enum Flag {
+    On,
+    Off,
+}
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 struct WithEnum {
@@ -246,7 +266,10 @@ struct WithBool {
 
 #[test]
 fn bool_fields_are_logical_uint8() {
-    let v = WithBool { flag: true, flags: vec![true, false, true] };
+    let v = WithBool {
+        flag: true,
+        flags: vec![true, false, true],
+    };
     let file = File::from_bytes(mat::to_bytes(&v).unwrap()).unwrap();
 
     let f = file.dataset("flag").unwrap();
@@ -274,7 +297,11 @@ fn rt<T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug>(
 
 #[test]
 fn roundtrip_simple_primitives() {
-    rt(SimpleRoot { trial: 9, temperature: 273.15, name: "hello".into() });
+    rt(SimpleRoot {
+        trial: 9,
+        temperature: 273.15,
+        name: "hello".into(),
+    });
 }
 
 #[test]
@@ -290,8 +317,11 @@ fn roundtrip_vectors() {
 fn roundtrip_matrix_f64() {
     rt(WithMatrix {
         m: Matrix::from_row_major(
-            3, 4,
-            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+            3,
+            4,
+            vec![
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+            ],
         ),
     });
 }
@@ -300,21 +330,34 @@ fn roundtrip_matrix_f64() {
 fn roundtrip_nested() {
     rt(WithNested {
         x: 1.5,
-        inner: Inner { y: 42, z: vec![10.0, 20.0, 30.0] },
+        inner: Inner {
+            y: 42,
+            z: vec![10.0, 20.0, 30.0],
+        },
     });
 }
 
 #[test]
 fn roundtrip_option_some_and_none() {
-    rt(WithOption { required: 1.0, maybe: Some("world".into()) });
-    rt(WithOption { required: 2.5, maybe: None });
+    rt(WithOption {
+        required: 1.0,
+        maybe: Some("world".into()),
+    });
+    rt(WithOption {
+        required: 2.5,
+        maybe: None,
+    });
 }
 
 #[test]
 fn roundtrip_complex_scalar_and_vec() {
     rt(WithComplex {
         z: Complex64::new(2.0, -1.0),
-        zs: vec![Complex64::new(1.0, 0.0), Complex64::new(0.0, 1.0), Complex64::new(-1.0, -1.0)],
+        zs: vec![
+            Complex64::new(1.0, 0.0),
+            Complex64::new(0.0, 1.0),
+            Complex64::new(-1.0, -1.0),
+        ],
     });
 }
 
@@ -326,7 +369,10 @@ fn roundtrip_unit_enum() {
 
 #[test]
 fn roundtrip_bool() {
-    rt(WithBool { flag: true, flags: vec![false, true, false, true] });
+    rt(WithBool {
+        flag: true,
+        flags: vec![false, true, false, true],
+    });
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -336,7 +382,9 @@ struct WithStringUnicode {
 
 #[test]
 fn roundtrip_non_ascii_string() {
-    rt(WithStringUnicode { tag: "résumé 💡 αβγ".into() });
+    rt(WithStringUnicode {
+        tag: "résumé 💡 αβγ".into(),
+    });
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -347,10 +395,7 @@ struct VecOfVec {
 #[test]
 fn roundtrip_vec_of_vec_as_matrix() {
     rt(VecOfVec {
-        grid: vec![
-            vec![1.0, 2.0, 3.0],
-            vec![4.0, 5.0, 6.0],
-        ],
+        grid: vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]],
     });
 }
 
@@ -402,13 +447,15 @@ fn roundtrip_int_matrices() {
 #[test]
 fn roundtrip_bool_matrix() {
     #[derive(Serialize, Deserialize, Debug, PartialEq)]
-    struct BoolMat { m: Matrix<bool> }
+    struct BoolMat {
+        m: Matrix<bool>,
+    }
     rt(BoolMat {
-        m: Matrix::from_row_major(3, 3, vec![
-            true, false, true,
-            false, true, false,
-            true, false, true,
-        ]),
+        m: Matrix::from_row_major(
+            3,
+            3,
+            vec![true, false, true, false, true, false, true, false, true],
+        ),
     });
 }
 
@@ -502,15 +549,29 @@ fn roundtrip_integer_extremes() {
 #[test]
 fn roundtrip_deep_nested() {
     #[derive(Serialize, Deserialize, Debug, PartialEq)]
-    struct L1 { label: String, l2: L2 }
+    struct L1 {
+        label: String,
+        l2: L2,
+    }
     #[derive(Serialize, Deserialize, Debug, PartialEq)]
-    struct L2 { depth: u32, l3: L3 }
+    struct L2 {
+        depth: u32,
+        l3: L3,
+    }
     #[derive(Serialize, Deserialize, Debug, PartialEq)]
-    struct L3 { tag: String, l4: L4 }
+    struct L3 {
+        tag: String,
+        l4: L4,
+    }
     #[derive(Serialize, Deserialize, Debug, PartialEq)]
-    struct L4 { id: u64, values: Vec<f64> }
+    struct L4 {
+        id: u64,
+        values: Vec<f64>,
+    }
     #[derive(Serialize, Deserialize, Debug, PartialEq)]
-    struct Root { root: L1 }
+    struct Root {
+        root: L1,
+    }
     rt(Root {
         root: L1 {
             label: "top".into(),
@@ -518,7 +579,10 @@ fn roundtrip_deep_nested() {
                 depth: 2,
                 l3: L3 {
                     tag: "middle".into(),
-                    l4: L4 { id: 999, values: vec![1.5, 2.5, 3.5] },
+                    l4: L4 {
+                        id: 999,
+                        values: vec![1.5, 2.5, 3.5],
+                    },
                 },
             },
         },
@@ -529,7 +593,10 @@ fn roundtrip_deep_nested() {
 #[test]
 fn roundtrip_surrogate_pair() {
     #[derive(Serialize, Deserialize, Debug, PartialEq)]
-    struct Emoji { party: String, mixed: String }
+    struct Emoji {
+        party: String,
+        mixed: String,
+    }
     rt(Emoji {
         party: "🎉".into(),
         mixed: "é日🎉A".into(),
@@ -562,7 +629,9 @@ fn roundtrip_empty_variants() {
 #[test]
 fn roundtrip_large_matrix() {
     #[derive(Serialize, Deserialize, Debug, PartialEq)]
-    struct Big { m: Matrix<f64> }
+    struct Big {
+        m: Matrix<f64>,
+    }
     let rows = 100;
     let cols = 50;
     let mut data = Vec::with_capacity(rows * cols);
@@ -571,7 +640,9 @@ fn roundtrip_large_matrix() {
             data.push((r * 1000 + c) as f64);
         }
     }
-    rt(Big { m: Matrix::from_row_major(rows, cols, data) });
+    rt(Big {
+        m: Matrix::from_row_major(rows, cols, data),
+    });
 }
 
 /// Complex32 scalar and vec survive roundtrip preserving precision.
@@ -596,7 +667,9 @@ fn roundtrip_complex32() {
 #[test]
 fn roundtrip_matrix_with_specials() {
     #[derive(Serialize, Deserialize)]
-    struct MatS { m: Matrix<f64> }
+    struct MatS {
+        m: Matrix<f64>,
+    }
     let m = Matrix::from_row_major(
         2,
         3,
@@ -619,7 +692,10 @@ fn roundtrip_matrix_with_specials() {
 #[test]
 fn roundtrip_option_complex_inner() {
     #[derive(Serialize, Deserialize, Debug, PartialEq)]
-    struct Inner { k: u32, v: f64 }
+    struct Inner {
+        k: u32,
+        v: f64,
+    }
     #[derive(Serialize, Deserialize, Debug, PartialEq)]
     struct Outer {
         some_struct: Option<Inner>,

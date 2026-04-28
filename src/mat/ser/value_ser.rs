@@ -60,7 +60,9 @@ impl Serializer for ValueSerializer {
         Ok(MatValue::Scalar(ScalarNum::I64(v)))
     }
     fn serialize_i128(self, _v: i128) -> Result<MatValue, MatError> {
-        Err(MatError::UnsupportedType("i128 (MATLAB has no 128-bit integer)"))
+        Err(MatError::UnsupportedType(
+            "i128 (MATLAB has no 128-bit integer)",
+        ))
     }
     fn serialize_u8(self, v: u8) -> Result<MatValue, MatError> {
         Ok(MatValue::Scalar(ScalarNum::U8(v)))
@@ -151,11 +153,7 @@ impl Serializer for ValueSerializer {
     fn serialize_tuple(self, len: usize) -> Result<SeqSer, MatError> {
         Ok(SeqSer::new(Some(len)))
     }
-    fn serialize_tuple_struct(
-        self,
-        _name: &'static str,
-        len: usize,
-    ) -> Result<SeqSer, MatError> {
+    fn serialize_tuple_struct(self, _name: &'static str, len: usize) -> Result<SeqSer, MatError> {
         Ok(SeqSer::new(Some(len)))
     }
     fn serialize_tuple_variant(
@@ -172,11 +170,7 @@ impl Serializer for ValueSerializer {
         Ok(MapSer::new())
     }
 
-    fn serialize_struct(
-        self,
-        name: &'static str,
-        _len: usize,
-    ) -> Result<StructSer, MatError> {
+    fn serialize_struct(self, name: &'static str, _len: usize) -> Result<StructSer, MatError> {
         Ok(match name {
             MATRIX_SENTINEL => StructSer::Matrix(MatrixFields::default()),
             COMPLEX64_SENTINEL => StructSer::Complex64(ComplexFields::default()),
@@ -288,9 +282,7 @@ fn unify_sequence(elements: Vec<MatValue>) -> Result<MatValue, MatError> {
 /// ownership without re-cloning each element. (Cloning a `Vec1D` or
 /// `ComplexVec*` of the inner shape would double peak allocation on the
 /// matrix path for large `Vec<Vec<T>>` inputs.)
-fn try_unify_homogeneous(
-    elements: Vec<MatValue>,
-) -> Result<MatValue, Vec<MatValue>> {
+fn try_unify_homogeneous(elements: Vec<MatValue>) -> Result<MatValue, Vec<MatValue>> {
     debug_assert!(!elements.is_empty());
 
     // ----- all elements are numeric scalars of the same tag → Vec1D -----
@@ -302,7 +294,9 @@ fn try_unify_homogeneous(
         {
             let mut vec = NumVec::empty_with_tag(first_tag);
             for e in elements {
-                let MatValue::Scalar(s) = e else { unreachable!() };
+                let MatValue::Scalar(s) = e else {
+                    unreachable!()
+                };
                 vec.push(s).expect("tag check held");
             }
             return Ok(MatValue::Vec1D(vec));
@@ -313,13 +307,15 @@ fn try_unify_homogeneous(
     if let Some(MatValue::Vec1D(first)) = elements.first() {
         let first_tag = first.tag();
         let first_len = first.len();
-        if elements.iter().all(|e| {
-            matches!(e, MatValue::Vec1D(v) if v.tag() == first_tag && v.len() == first_len)
-        }) {
+        if elements.iter().all(
+            |e| matches!(e, MatValue::Vec1D(v) if v.tag() == first_tag && v.len() == first_len),
+        ) {
             let rows = elements.len();
             let mut flat = NumVec::empty_with_tag(first_tag);
             for e in elements {
-                let MatValue::Vec1D(v) = e else { unreachable!() };
+                let MatValue::Vec1D(v) = e else {
+                    unreachable!()
+                };
                 flat.extend(v).expect("tag check held");
             }
             return Ok(MatValue::Matrix {
@@ -369,7 +365,9 @@ fn try_unify_homogeneous(
             let rows = elements.len();
             let mut pairs: Vec<(f64, f64)> = Vec::with_capacity(rows * first_len);
             for e in elements {
-                let MatValue::ComplexVec64(v) = e else { unreachable!() };
+                let MatValue::ComplexVec64(v) = e else {
+                    unreachable!()
+                };
                 pairs.extend(v);
             }
             return Ok(MatValue::ComplexMatrix64 {
@@ -388,7 +386,9 @@ fn try_unify_homogeneous(
             let rows = elements.len();
             let mut pairs: Vec<(f32, f32)> = Vec::with_capacity(rows * first_len);
             for e in elements {
-                let MatValue::ComplexVec32(v) = e else { unreachable!() };
+                let MatValue::ComplexVec32(v) = e else {
+                    unreachable!()
+                };
                 pairs.extend(v);
             }
             return Ok(MatValue::ComplexMatrix32 {
@@ -432,7 +432,7 @@ impl SerializeMap for MapSer {
                 return Err(MatError::UnsupportedType(match other.kind() {
                     "struct" => "map with non-string keys (struct as key)",
                     _ => "map with non-string keys",
-                }))
+                }));
             }
         };
         self.pending_key = Some(key_str);
@@ -440,10 +440,9 @@ impl SerializeMap for MapSer {
     }
 
     fn serialize_value<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), MatError> {
-        let key = self
-            .pending_key
-            .take()
-            .ok_or_else(|| MatError::Custom("serialize_value called before serialize_key".into()))?;
+        let key = self.pending_key.take().ok_or_else(|| {
+            MatError::Custom("serialize_value called before serialize_key".into())
+        })?;
         let val = value.serialize(ValueSerializer)?;
         if !matches!(val, MatValue::Omit) {
             self.fields.push((key, val));
@@ -512,7 +511,7 @@ impl SerializeStruct for StructSer {
                 other => {
                     return Err(MatError::Custom(format!(
                         "unexpected field {other:?} on Matrix sentinel"
-                    )))
+                    )));
                 }
             },
             StructSer::Complex64(fields) => match key {
@@ -521,7 +520,7 @@ impl SerializeStruct for StructSer {
                 other => {
                     return Err(MatError::Custom(format!(
                         "unexpected field {other:?} on Complex64 sentinel"
-                    )))
+                    )));
                 }
             },
             StructSer::Complex32(fields) => match key {
@@ -530,7 +529,7 @@ impl SerializeStruct for StructSer {
                 other => {
                     return Err(MatError::Custom(format!(
                         "unexpected field {other:?} on Complex32 sentinel"
-                    )))
+                    )));
                 }
             },
             StructSer::Plain(ps) => {
@@ -566,9 +565,15 @@ impl SerializeStruct for StructSer {
 }
 
 fn matrix_from_fields(fields: MatrixFields) -> Result<MatValue, MatError> {
-    let rows = fields.rows.ok_or_else(|| MatError::MissingField("rows".into()))?;
-    let cols = fields.cols.ok_or_else(|| MatError::MissingField("cols".into()))?;
-    let data = fields.data.ok_or_else(|| MatError::MissingField("data".into()))?;
+    let rows = fields
+        .rows
+        .ok_or_else(|| MatError::MissingField("rows".into()))?;
+    let cols = fields
+        .cols
+        .ok_or_else(|| MatError::MissingField("cols".into()))?;
+    let data = fields
+        .data
+        .ok_or_else(|| MatError::MissingField("data".into()))?;
     let vec = match data {
         MatValue::Vec1D(v) => v,
         // Serializing `Vec<T>` of length 0 with T unknown yields F64.
@@ -582,7 +587,7 @@ fn matrix_from_fields(fields: MatrixFields) -> Result<MatValue, MatError> {
             return Err(MatError::Custom(format!(
                 "Matrix::data must be a Vec<T>, got {}",
                 other.kind()
-            )))
+            )));
         }
     };
     if vec.len() != rows * cols {

@@ -48,7 +48,7 @@ fn read_dataset(ds: &Dataset<'_>) -> Result<MatValue, MatError> {
     let class = matlab_class_from_attrs(&attrs)?;
     let shape = ds.shape().map_err(MatError::Hdf5)?;
     let dtype = ds.dtype().map_err(MatError::Hdf5)?;
-    let is_empty = is_empty_attr(&attrs) || shape.iter().any(|&d| d == 0);
+    let is_empty = is_empty_attr(&attrs) || shape.contains(&0);
 
     let class = class.unwrap_or_else(|| class_from_dtype(&dtype));
 
@@ -98,7 +98,7 @@ fn matlab_class_from_attrs(
         other => {
             return Err(MatError::Custom(format!(
                 "MATLAB_class attribute has unexpected type: {other:?}"
-            )))
+            )));
         }
     };
     match raw {
@@ -172,11 +172,7 @@ fn is_complex_dtype(dtype: &DType) -> bool {
 // Numeric reading
 // ---------------------------------------------------------------------------
 
-fn read_numeric(
-    ds: &Dataset<'_>,
-    shape: &[u64],
-    class: MatClass,
-) -> Result<MatValue, MatError> {
+fn read_numeric(ds: &Dataset<'_>, shape: &[u64], class: MatClass) -> Result<MatValue, MatError> {
     let (rows, cols, total) = shape_decomposition(shape);
 
     // For a single-element dataset we emit a Scalar of the appropriate class.
@@ -299,11 +295,7 @@ fn transpose_col_major_to_row_major(
 // Complex reading
 // ---------------------------------------------------------------------------
 
-fn read_complex(
-    ds: &Dataset<'_>,
-    shape: &[u64],
-    class: MatClass,
-) -> Result<MatValue, MatError> {
+fn read_complex(ds: &Dataset<'_>, shape: &[u64], class: MatClass) -> Result<MatValue, MatError> {
     let (rows, cols, total) = shape_decomposition(shape);
     let bytes = ds.read_u8().map_err(MatError::Hdf5)?;
 

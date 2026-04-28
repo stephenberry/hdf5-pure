@@ -205,20 +205,10 @@ impl DataLayout {
                     let val = match dim_size_encoded_length {
                         1 => data[p] as u32,
                         2 => u16::from_le_bytes([data[p], data[p + 1]]) as u32,
-                        4 => u32::from_le_bytes([
-                            data[p],
-                            data[p + 1],
-                            data[p + 2],
-                            data[p + 3],
-                        ]),
+                        4 => u32::from_le_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]]),
                         8 => {
                             // Truncate to u32
-                            u32::from_le_bytes([
-                                data[p],
-                                data[p + 1],
-                                data[p + 2],
-                                data[p + 3],
-                            ])
+                            u32::from_le_bytes([data[p], data[p + 1], data[p + 2], data[p + 3]])
                         }
                         _ => {
                             return Err(FormatError::UnexpectedEof {
@@ -252,7 +242,10 @@ impl DataLayout {
                             single_chunk_filtered_size = Some(read_length(data, p, length_size)?);
                             p += ls;
                             single_chunk_filter_mask = Some(u32::from_le_bytes([
-                                data[p], data[p + 1], data[p + 2], data[p + 3],
+                                data[p],
+                                data[p + 1],
+                                data[p + 2],
+                                data[p + 3],
                             ]));
                             p += 4;
                             if is_undefined(data, p, offset_size) {
@@ -415,7 +408,12 @@ mod tests {
         buf.extend_from_slice(&3u16.to_le_bytes());
         buf.extend_from_slice(&[1, 2, 3]);
         let layout = DataLayout::parse(&buf, 8, 8).unwrap();
-        assert_eq!(layout, DataLayout::Compact { data: vec![1, 2, 3] });
+        assert_eq!(
+            layout,
+            DataLayout::Compact {
+                data: vec![1, 2, 3]
+            }
+        );
     }
 
     #[test]

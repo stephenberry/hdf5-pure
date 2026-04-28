@@ -174,7 +174,9 @@ fn write_matrix(dir: &Path) {
     let a = Matrix::from_row_major(
         3,
         4,
-        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+        vec![
+            1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ],
     );
     let id = Matrix::from_row_major(2, 2, vec![1.0, 0.0, 0.0, 1.0]);
     let v = Matrices { a, id };
@@ -259,7 +261,9 @@ fn write_nested_struct(dir: &Path) {
     };
     // Wrap in a struct so the file has one top-level variable named `e`.
     #[derive(Serialize)]
-    struct Wrap<'a> { e: &'a Experiment }
+    struct Wrap<'a> {
+        e: &'a Experiment,
+    }
     mat::to_file(&Wrap { e: &v }, dir.join("nested.mat")).unwrap();
     println!("wrote: nested.mat");
 }
@@ -350,7 +354,9 @@ fn write_unit_enum(dir: &Path) {
             "disp('enum.mat OK')",
         ],
     );
-    let v = UnitEnum { phase: Phase::Running };
+    let v = UnitEnum {
+        phase: Phase::Running,
+    };
     mat::to_file(&v, dir.join("enum.mat")).unwrap();
     println!("wrote: enum.mat");
 }
@@ -603,17 +609,31 @@ fn write_complex_edges(dir: &Path) {
 
 /// 4-level deep struct nesting.
 #[derive(Serialize, Deserialize)]
-struct Root { label: String, inner: Inner }
+struct Root {
+    label: String,
+    inner: Inner,
+}
 #[derive(Serialize, Deserialize)]
-struct Inner { depth: u32, sub: SubInner }
+struct Inner {
+    depth: u32,
+    sub: SubInner,
+}
 #[derive(Serialize, Deserialize)]
-struct SubInner { tag: String, leaf: Leaf }
+struct SubInner {
+    tag: String,
+    leaf: Leaf,
+}
 #[derive(Serialize, Deserialize)]
-struct Leaf { id: u64, values: Vec<f64> }
+struct Leaf {
+    id: u64,
+    values: Vec<f64>,
+}
 
 fn write_deep_nested(dir: &Path) {
     #[derive(Serialize)]
-    struct Wrap { root: Root }
+    struct Wrap {
+        root: Root,
+    }
     let v = Wrap {
         root: Root {
             label: "top".into(),
@@ -621,7 +641,10 @@ fn write_deep_nested(dir: &Path) {
                 depth: 2,
                 sub: SubInner {
                     tag: "middle".into(),
-                    leaf: Leaf { id: 12345, values: vec![1.5, 2.5, 3.5] },
+                    leaf: Leaf {
+                        id: 12345,
+                        values: vec![1.5, 2.5, 3.5],
+                    },
                 },
             },
         },
@@ -665,8 +688,12 @@ struct EmptyVariants {
 
 fn write_empty_variants(dir: &Path) {
     let v = EmptyVariants {
-        e_f64: vec![], e_f32: vec![], e_i32: vec![], e_u8: vec![],
-        e_bool: vec![], e_str: String::new(),
+        e_f64: vec![],
+        e_f32: vec![],
+        e_i32: vec![],
+        e_u8: vec![],
+        e_bool: vec![],
+        e_str: String::new(),
     };
     mat::to_file(&v, dir.join("empty_variants.mat")).unwrap();
     println!("wrote: empty_variants.mat");

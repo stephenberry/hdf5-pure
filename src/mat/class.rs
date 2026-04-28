@@ -136,6 +136,9 @@ mod tests {
 
     #[test]
     fn unknown_class_is_error() {
-        assert!(matches!(MatClass::parse("datetime"), Err(MatError::UnknownClass(_))));
+        assert!(matches!(
+            MatClass::parse("datetime"),
+            Err(MatError::UnknownClass(_))
+        ));
     }
 }

@@ -17,7 +17,7 @@ use crate::object_header::ObjectHeader;
 use crate::signature;
 use crate::superblock::Superblock;
 
-use crate::types::{attrs_to_map, classify_datatype, AttrValue, DType};
+use crate::types::{AttrValue, DType, attrs_to_map, classify_datatype};
 
 // ---------------------------------------------------------------------------
 // File
@@ -384,12 +384,13 @@ impl<'f> Dataset<'f> {
         let ds = self.dataspace()?;
         let mut dl = self.data_layout()?;
         // Adjust contiguous data address by base_address offset
-        if self.file.addr_offset != 0 {
-            if let DataLayout::Contiguous { ref mut address, .. } = dl {
-                if let Some(addr) = address {
-                    *addr += self.file.addr_offset;
-                }
-            }
+        if self.file.addr_offset != 0
+            && let DataLayout::Contiguous {
+                ref mut address, ..
+            } = dl
+            && let Some(addr) = address
+        {
+            *addr += self.file.addr_offset;
         }
         let pipeline = self.filter_pipeline();
         Ok(data_read::read_raw_data_cached(
@@ -425,11 +426,9 @@ fn has_message(header: &ObjectHeader, msg_type: MessageType) -> bool {
 }
 
 fn is_group(header: &ObjectHeader) -> bool {
-    header
-        .messages
-        .iter()
-        .any(|m| m.msg_type == MessageType::LinkInfo
+    header.messages.iter().any(|m| {
+        m.msg_type == MessageType::LinkInfo
             || m.msg_type == MessageType::Link
-            || m.msg_type == MessageType::SymbolTable)
+            || m.msg_type == MessageType::SymbolTable
+    })
 }
-

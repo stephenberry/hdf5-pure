@@ -33,7 +33,10 @@ fn c_library_reads_nested_struct_file() {
         trial: 3,
         temperature: 300.0,
         samples: vec![1.0, 2.0, 3.0, 4.0, 5.0],
-        config: Config { threshold: 0.5, tag: "run".into() },
+        config: Config {
+            threshold: 0.5,
+            tag: "run".into(),
+        },
     };
 
     mat::to_file(&e, &path).unwrap();
@@ -60,7 +63,9 @@ fn c_library_reads_nested_struct_file() {
     // Nested group with MATLAB struct class + MATLAB_fields VL attribute.
     let cfg = file.group("config").unwrap();
     let class_attr = cfg.attr("MATLAB_class").unwrap();
-    let class_val = class_attr.read_scalar::<hdf5::types::FixedAscii<32>>().unwrap();
+    let class_val = class_attr
+        .read_scalar::<hdf5::types::FixedAscii<32>>()
+        .unwrap();
     assert_eq!(class_val.as_str(), "struct");
     let fields_attr = cfg.attr("MATLAB_fields").unwrap();
     // MATLAB-compatible encoding is `H5T_VLEN { H5T_STRING { STRSIZE 1 } }`,
@@ -155,7 +160,9 @@ fn c_library_reads_complex_as_compound() {
 
     // MATLAB_class is the real-number class for complex.
     let class_attr = ds.attr("MATLAB_class").unwrap();
-    let cls = class_attr.read_scalar::<hdf5::types::FixedAscii<32>>().unwrap();
+    let cls = class_attr
+        .read_scalar::<hdf5::types::FixedAscii<32>>()
+        .unwrap();
     assert_eq!(cls.as_str(), "double");
 }
 
@@ -170,7 +177,10 @@ fn c_library_reads_logical_as_uint8() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("flags.mat");
 
-    let f = Flags { on: true, bits: vec![true, false, true, true, false] };
+    let f = Flags {
+        on: true,
+        bits: vec![true, false, true, true, false],
+    };
     mat::to_file(&f, &path).unwrap();
 
     let file = hdf5::File::open(&path).unwrap();
@@ -179,8 +189,11 @@ fn c_library_reads_logical_as_uint8() {
     assert_eq!(on.shape(), vec![1, 1]);
     let on_raw: Vec<u8> = on.read_raw().unwrap();
     assert_eq!(on_raw, vec![1]);
-    let cls = on.attr("MATLAB_class").unwrap()
-        .read_scalar::<hdf5::types::FixedAscii<32>>().unwrap();
+    let cls = on
+        .attr("MATLAB_class")
+        .unwrap()
+        .read_scalar::<hdf5::types::FixedAscii<32>>()
+        .unwrap();
     assert_eq!(cls.as_str(), "logical");
 
     let bits = file.dataset("bits").unwrap();
@@ -201,7 +214,10 @@ fn to_file_and_from_file_roundtrip() {
         trial: 9,
         temperature: 77.3,
         samples: vec![0.1, 0.2, 0.3],
-        config: Config { threshold: 0.8, tag: "production".into() },
+        config: Config {
+            threshold: 0.8,
+            tag: "production".into(),
+        },
     };
 
     mat::to_file(&e, &path).unwrap();

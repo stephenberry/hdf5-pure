@@ -10,7 +10,7 @@
 use crate::chunked_read::ChunkInfo;
 use crate::error::FormatError;
 use crate::filter_pipeline::FilterPipeline;
-use crate::filters::{decompress_chunk, ChunkContext};
+use crate::filters::{ChunkContext, decompress_chunk};
 use crate::lane_partition::{self, LaneStats, PartitionStats};
 
 /// Threshold: only use parallel decompression when chunk count exceeds this.
@@ -90,7 +90,10 @@ pub fn decompress_chunks_lane_partitioned(
                 stats.compressed_bytes += size as u64;
                 stats.decompressed_bytes += decompressed.len() as u64;
 
-                results.push(DecompressedChunk { index, data: decompressed });
+                results.push(DecompressedChunk {
+                    index,
+                    data: decompressed,
+                });
             }
 
             Ok((results, stats))
@@ -153,7 +156,10 @@ pub fn decompress_chunks_parallel(
                 raw_chunk.to_vec()
             };
 
-            Ok(DecompressedChunk { index, data: decompressed })
+            Ok(DecompressedChunk {
+                index,
+                data: decompressed,
+            })
         })
         .collect();
 

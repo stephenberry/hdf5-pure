@@ -65,8 +65,12 @@ fn fixture_dir() -> PathBuf {
 
 fn load_manifest() -> Manifest {
     let path = fixture_dir().join("manifest.json");
-    let text = fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("read {}: {e}\n(run regen.py to produce fixtures)", path.display()));
+    let text = fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "read {}: {e}\n(run regen.py to produce fixtures)",
+            path.display()
+        )
+    });
     serde_json::from_str(&text).expect("parse manifest.json")
 }
 
@@ -140,37 +144,85 @@ fn decode_and_max_err(
     let decoded = zfp::decompress(reference, dims, rate, elem_ty).map_err(|e| format!("{e:?}"))?;
     match dtype {
         "f32" => {
-            let expected: Vec<f32> = raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-            let got: Vec<f32> = decoded.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let expected: Vec<f32> = raw
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let got: Vec<f32> = decoded
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
             if got.len() != expected.len() {
-                return Err(format!("decoded {} != expected {}", got.len(), expected.len()));
+                return Err(format!(
+                    "decoded {} != expected {}",
+                    got.len(),
+                    expected.len()
+                ));
             }
             Ok(max_abs(&expected, &got))
         }
         "f64" => {
-            let expected: Vec<f64> = raw.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
-            let got: Vec<f64> = decoded.chunks_exact(8).map(|c| f64::from_le_bytes(c.try_into().unwrap())).collect();
+            let expected: Vec<f64> = raw
+                .chunks_exact(8)
+                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            let got: Vec<f64> = decoded
+                .chunks_exact(8)
+                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
             if got.len() != expected.len() {
-                return Err(format!("decoded {} != expected {}", got.len(), expected.len()));
+                return Err(format!(
+                    "decoded {} != expected {}",
+                    got.len(),
+                    expected.len()
+                ));
             }
             Ok(max_abs(&expected, &got))
         }
         "i32" => {
-            let expected: Vec<i32> = raw.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-            let got: Vec<i32> = decoded.chunks_exact(4).map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let expected: Vec<i32> = raw
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let got: Vec<i32> = decoded
+                .chunks_exact(4)
+                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
             if got.len() != expected.len() {
-                return Err(format!("decoded {} != expected {}", got.len(), expected.len()));
+                return Err(format!(
+                    "decoded {} != expected {}",
+                    got.len(),
+                    expected.len()
+                ));
             }
-            let max = expected.iter().zip(got.iter()).map(|(&a, &b)| (a as f64 - b as f64).abs()).fold(0f64, f64::max);
+            let max = expected
+                .iter()
+                .zip(got.iter())
+                .map(|(&a, &b)| (a as f64 - b as f64).abs())
+                .fold(0f64, f64::max);
             Ok(max)
         }
         "i64" => {
-            let expected: Vec<i64> = raw.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect();
-            let got: Vec<i64> = decoded.chunks_exact(8).map(|c| i64::from_le_bytes(c.try_into().unwrap())).collect();
+            let expected: Vec<i64> = raw
+                .chunks_exact(8)
+                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            let got: Vec<i64> = decoded
+                .chunks_exact(8)
+                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
             if got.len() != expected.len() {
-                return Err(format!("decoded {} != expected {}", got.len(), expected.len()));
+                return Err(format!(
+                    "decoded {} != expected {}",
+                    got.len(),
+                    expected.len()
+                ));
             }
-            let max = expected.iter().zip(got.iter()).map(|(&a, &b)| (a as f64 - b as f64).abs()).fold(0f64, f64::max);
+            let max = expected
+                .iter()
+                .zip(got.iter())
+                .map(|(&a, &b)| (a as f64 - b as f64).abs())
+                .fold(0f64, f64::max);
             Ok(max)
         }
         other => Err(format!("unknown dtype {other}")),

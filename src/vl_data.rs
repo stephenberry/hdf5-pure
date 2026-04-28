@@ -124,17 +124,14 @@ pub fn read_vl_strings(
             continue;
         }
 
-        let coll = GlobalHeapCollection::parse(
-            file_data,
-            vl.collection_address as usize,
-            length_size,
-        )?;
-        let obj = coll
-            .get_object(vl.object_index as u16)
-            .ok_or(FormatError::GlobalHeapObjectNotFound {
+        let coll =
+            GlobalHeapCollection::parse(file_data, vl.collection_address as usize, length_size)?;
+        let obj = coll.get_object(vl.object_index as u16).ok_or(
+            FormatError::GlobalHeapObjectNotFound {
                 collection_address: vl.collection_address,
                 index: vl.object_index as u16,
-            })?;
+            },
+        )?;
 
         // The object data is the raw string bytes
         let len = (vl.length as usize).min(obj.data.len());
@@ -157,22 +154,22 @@ pub fn read_vl_bytes(
     let mut result = Vec::with_capacity(refs.len());
 
     for vl in &refs {
-        if vl.length == 0 && (is_undefined_address(vl.collection_address, offset_size) || vl.collection_address == 0) {
+        if vl.length == 0
+            && (is_undefined_address(vl.collection_address, offset_size)
+                || vl.collection_address == 0)
+        {
             result.push(Vec::new());
             continue;
         }
 
-        let coll = GlobalHeapCollection::parse(
-            file_data,
-            vl.collection_address as usize,
-            length_size,
-        )?;
-        let obj = coll
-            .get_object(vl.object_index as u16)
-            .ok_or(FormatError::GlobalHeapObjectNotFound {
+        let coll =
+            GlobalHeapCollection::parse(file_data, vl.collection_address as usize, length_size)?;
+        let obj = coll.get_object(vl.object_index as u16).ok_or(
+            FormatError::GlobalHeapObjectNotFound {
                 collection_address: vl.collection_address,
                 index: vl.object_index as u16,
-            })?;
+            },
+        )?;
 
         let len = (vl.length as usize).min(obj.data.len());
         result.push(obj.data[..len].to_vec());
@@ -267,10 +264,7 @@ mod tests {
     fn read_vl_strings_from_heap() {
         let gcol_offset = 256usize;
         let mut file_data = vec![0u8; 512];
-        build_gcol_at(&mut file_data, gcol_offset, &[
-            (1, b"Alice"),
-            (2, b"Bob"),
-        ]);
+        build_gcol_at(&mut file_data, gcol_offset, &[(1, b"Alice"), (2, b"Bob")]);
 
         let raw = build_vl_refs(&["Alice", "Bob"], gcol_offset as u64, 1, 8);
         let strings = read_vl_strings(&file_data, &raw, 2, 8, 8).unwrap();
@@ -306,10 +300,11 @@ mod tests {
     fn read_vl_bytes_from_heap() {
         let gcol_offset = 128usize;
         let mut file_data = vec![0u8; 512];
-        build_gcol_at(&mut file_data, gcol_offset, &[
-            (1, &[0xDE, 0xAD]),
-            (2, &[0xBE, 0xEF, 0xCA]),
-        ]);
+        build_gcol_at(
+            &mut file_data,
+            gcol_offset,
+            &[(1, &[0xDE, 0xAD]), (2, &[0xBE, 0xEF, 0xCA])],
+        );
 
         let _raw = build_vl_refs(&["ab", "abc"], gcol_offset as u64, 1, 8);
         // Fix lengths to match actual byte lengths

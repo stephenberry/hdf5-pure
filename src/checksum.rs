@@ -67,22 +67,41 @@ fn rot(x: u32, k: u32) -> u32 {
 }
 
 fn mix(a: &mut u32, b: &mut u32, c: &mut u32) {
-    *a = a.wrapping_sub(*c); *a ^= rot(*c, 4);  *c = c.wrapping_add(*b);
-    *b = b.wrapping_sub(*a); *b ^= rot(*a, 6);  *a = a.wrapping_add(*c);
-    *c = c.wrapping_sub(*b); *c ^= rot(*b, 8);  *b = b.wrapping_add(*a);
-    *a = a.wrapping_sub(*c); *a ^= rot(*c, 16); *c = c.wrapping_add(*b);
-    *b = b.wrapping_sub(*a); *b ^= rot(*a, 19); *a = a.wrapping_add(*c);
-    *c = c.wrapping_sub(*b); *c ^= rot(*b, 4);  *b = b.wrapping_add(*a);
+    *a = a.wrapping_sub(*c);
+    *a ^= rot(*c, 4);
+    *c = c.wrapping_add(*b);
+    *b = b.wrapping_sub(*a);
+    *b ^= rot(*a, 6);
+    *a = a.wrapping_add(*c);
+    *c = c.wrapping_sub(*b);
+    *c ^= rot(*b, 8);
+    *b = b.wrapping_add(*a);
+    *a = a.wrapping_sub(*c);
+    *a ^= rot(*c, 16);
+    *c = c.wrapping_add(*b);
+    *b = b.wrapping_sub(*a);
+    *b ^= rot(*a, 19);
+    *a = a.wrapping_add(*c);
+    *c = c.wrapping_sub(*b);
+    *c ^= rot(*b, 4);
+    *b = b.wrapping_add(*a);
 }
 
 fn final_mix(a: &mut u32, b: &mut u32, c: &mut u32) {
-    *c ^= *b; *c = c.wrapping_sub(rot(*b, 14));
-    *a ^= *c; *a = a.wrapping_sub(rot(*c, 11));
-    *b ^= *a; *b = b.wrapping_sub(rot(*a, 25));
-    *c ^= *b; *c = c.wrapping_sub(rot(*b, 16));
-    *a ^= *c; *a = a.wrapping_sub(rot(*c, 4));
-    *b ^= *a; *b = b.wrapping_sub(rot(*a, 14));
-    *c ^= *b; *c = c.wrapping_sub(rot(*b, 24));
+    *c ^= *b;
+    *c = c.wrapping_sub(rot(*b, 14));
+    *a ^= *c;
+    *a = a.wrapping_sub(rot(*c, 11));
+    *b ^= *a;
+    *b = b.wrapping_sub(rot(*a, 25));
+    *c ^= *b;
+    *c = c.wrapping_sub(rot(*b, 16));
+    *a ^= *c;
+    *a = a.wrapping_sub(rot(*c, 4));
+    *b ^= *a;
+    *b = b.wrapping_sub(rot(*a, 14));
+    *c ^= *b;
+    *c = c.wrapping_sub(rot(*b, 24));
 }
 
 fn read_u32_le(data: &[u8], offset: usize) -> u32 {
@@ -96,7 +115,9 @@ fn read_u32_le(data: &[u8], offset: usize) -> u32 {
 
 fn hashlittle(data: &[u8], initval: u32) -> u32 {
     let length = data.len();
-    let mut a: u32 = 0xdeadbeefu32.wrapping_add(length as u32).wrapping_add(initval);
+    let mut a: u32 = 0xdeadbeefu32
+        .wrapping_add(length as u32)
+        .wrapping_add(initval);
     let mut b: u32 = a;
     let mut c: u32 = a;
 
@@ -235,11 +256,13 @@ mod tests {
         // Verify against a real HDF5 file checksum
         let file_data: &[u8] = include_bytes!("../tests/fixtures/v2_groups.h5");
         // Superblock v3: checksum at offset 44, covers bytes 0..44
-        let stored = u32::from_le_bytes([
-            file_data[44], file_data[45], file_data[46], file_data[47],
-        ]);
+        let stored =
+            u32::from_le_bytes([file_data[44], file_data[45], file_data[46], file_data[47]]);
         let computed = jenkins_lookup3(&file_data[0..44]);
-        assert_eq!(computed, stored, "Jenkins lookup3 should match HDF5 superblock checksum");
+        assert_eq!(
+            computed, stored,
+            "Jenkins lookup3 should match HDF5 superblock checksum"
+        );
     }
 
     // --- CRC32 tests ---

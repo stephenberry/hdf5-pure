@@ -6,7 +6,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::{string::String, vec::Vec};
 
-use crate::btree_v2::{collect_btree_v2_records, BTreeV2Header};
+use crate::btree_v2::{BTreeV2Header, collect_btree_v2_records};
 use crate::error::FormatError;
 use crate::fractal_heap::FractalHeapHeader;
 use crate::group_v1::{self, GroupEntry};
@@ -78,8 +78,7 @@ fn resolve_dense_entries(
     let btree_addr = link_info
         .btree_name_index_address
         .ok_or_else(|| FormatError::PathNotFound(String::from("no B-tree v2 name index")))?;
-    let btree_hdr =
-        BTreeV2Header::parse(file_data, btree_addr as usize, offset_size, length_size)?;
+    let btree_hdr = BTreeV2Header::parse(file_data, btree_addr as usize, offset_size, length_size)?;
     let records = collect_btree_v2_records(file_data, &btree_hdr, offset_size, length_size)?;
 
     let mut entries = Vec::new();
@@ -169,8 +168,13 @@ pub fn resolve_path_any(
     let ls = superblock.length_size;
     let base = superblock.base_address;
 
-    let root_header =
-        ObjectHeader::parse_with_base(file_data, superblock.root_group_address as usize, os, ls, base)?;
+    let root_header = ObjectHeader::parse_with_base(
+        file_data,
+        superblock.root_group_address as usize,
+        os,
+        ls,
+        base,
+    )?;
 
     let mut current_addr = superblock.root_group_address;
     let mut current_header = root_header;
@@ -216,9 +220,7 @@ pub fn resolve_group_entries(
             .messages
             .iter()
             .find(|m| m.msg_type == MessageType::SymbolTable)
-            .ok_or_else(|| {
-                FormatError::PathNotFound(String::from("no symbol table message"))
-            })?;
+            .ok_or_else(|| FormatError::PathNotFound(String::from("no symbol table message")))?;
         let stm = SymbolTableMessage::parse(&sym_msg.data, offset_size)?;
         group_v1::resolve_v1_group_entries(file_data, &stm, offset_size, length_size, base_address)
     } else if is_v2_group(object_header) {
@@ -334,8 +336,8 @@ mod tests {
         assert!(sb.version >= 2); // v2/v3 superblock
 
         let addr = resolve_path_any(file_data, &sb, "sensors/temperature").unwrap();
-        let hdr = ObjectHeader::parse(file_data, addr as usize, sb.offset_size, sb.length_size)
-            .unwrap();
+        let hdr =
+            ObjectHeader::parse(file_data, addr as usize, sb.offset_size, sb.length_size).unwrap();
         let (dt, ds, dl) = extract_dataset(file_data, &hdr, sb.offset_size, sb.length_size);
         let raw = data_read::read_raw_data(file_data, &dl, &ds, &dt).unwrap();
         let values = data_read::read_as_f64(&raw, &dt).unwrap();
@@ -349,8 +351,8 @@ mod tests {
         let sb = Superblock::parse(file_data, sig_offset).unwrap();
 
         let addr = resolve_path_any(file_data, &sb, "sensors/humidity").unwrap();
-        let hdr = ObjectHeader::parse(file_data, addr as usize, sb.offset_size, sb.length_size)
-            .unwrap();
+        let hdr =
+            ObjectHeader::parse(file_data, addr as usize, sb.offset_size, sb.length_size).unwrap();
         let (dt, ds, dl) = extract_dataset(file_data, &hdr, sb.offset_size, sb.length_size);
         let raw = data_read::read_raw_data(file_data, &dl, &ds, &dt).unwrap();
         let values = data_read::read_as_i32(&raw, &dt).unwrap();
@@ -364,8 +366,8 @@ mod tests {
         let sb = Superblock::parse(file_data, sig_offset).unwrap();
 
         let addr = resolve_path_any(file_data, &sb, "dataset_015").unwrap();
-        let hdr = ObjectHeader::parse(file_data, addr as usize, sb.offset_size, sb.length_size)
-            .unwrap();
+        let hdr =
+            ObjectHeader::parse(file_data, addr as usize, sb.offset_size, sb.length_size).unwrap();
         let (dt, ds, dl) = extract_dataset(file_data, &hdr, sb.offset_size, sb.length_size);
         let raw = data_read::read_raw_data(file_data, &dl, &ds, &dt).unwrap();
         let values = data_read::read_as_f64(&raw, &dt).unwrap();
@@ -380,8 +382,8 @@ mod tests {
         let sb = Superblock::parse(file_data, sig_offset).unwrap();
 
         let addr = resolve_path_any(file_data, &sb, "group1/values").unwrap();
-        let hdr = ObjectHeader::parse(file_data, addr as usize, sb.offset_size, sb.length_size)
-            .unwrap();
+        let hdr =
+            ObjectHeader::parse(file_data, addr as usize, sb.offset_size, sb.length_size).unwrap();
         let (dt, ds, dl) = extract_dataset(file_data, &hdr, sb.offset_size, sb.length_size);
         let raw = data_read::read_raw_data(file_data, &dl, &ds, &dt).unwrap();
         let values = data_read::read_as_i32(&raw, &dt).unwrap();
@@ -395,8 +397,8 @@ mod tests {
         let sb = Superblock::parse(file_data, sig_offset).unwrap();
 
         let addr = resolve_path_any(file_data, &sb, "sensors/temperature").unwrap();
-        let hdr = ObjectHeader::parse(file_data, addr as usize, sb.offset_size, sb.length_size)
-            .unwrap();
+        let hdr =
+            ObjectHeader::parse(file_data, addr as usize, sb.offset_size, sb.length_size).unwrap();
         let (dt, ds, dl) = extract_dataset(file_data, &hdr, sb.offset_size, sb.length_size);
         let raw = data_read::read_raw_data(file_data, &dl, &ds, &dt).unwrap();
         let values = data_read::read_as_f64(&raw, &dt).unwrap();

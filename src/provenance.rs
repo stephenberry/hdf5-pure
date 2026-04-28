@@ -15,7 +15,7 @@ use crate::dataspace::Dataspace;
 use crate::datatype::Datatype;
 use crate::error::FormatError;
 use crate::object_header::ObjectHeader;
-use crate::type_builders::{build_attr_message, AttrValue};
+use crate::type_builders::{AttrValue, build_attr_message};
 
 // ---- Attribute name constants ----
 
@@ -99,12 +99,8 @@ pub fn verify_dataset(
     length_size: u8,
 ) -> Result<VerifyResult, FormatError> {
     // 1. Extract all attributes (compact + dense).
-    let attrs = crate::attribute::extract_attributes_full(
-        file_data,
-        header,
-        offset_size,
-        length_size,
-    )?;
+    let attrs =
+        crate::attribute::extract_attributes_full(file_data, header, offset_size, length_size)?;
 
     // 2. Find the stored hash.
     let stored_hash = attrs
@@ -229,21 +225,14 @@ mod tests {
         use crate::signature;
         use crate::superblock::Superblock;
 
-        let raw_data: Vec<u8> = (0..24u64)
-            .flat_map(|v| (v as f64).to_le_bytes())
-            .collect();
+        let raw_data: Vec<u8> = (0..24u64).flat_map(|v| (v as f64).to_le_bytes()).collect();
         let expected_hash = sha256_hex(&raw_data);
 
         let mut fw = FileWriter::new();
         let ds = fw.create_dataset("sensor");
-        ds.with_f64_data(
-            &(0..24).map(|v| v as f64).collect::<Vec<_>>(),
-        );
+        ds.with_f64_data(&(0..24).map(|v| v as f64).collect::<Vec<_>>());
         ds.set_attr(ATTR_SHA256, AttrValue::String(expected_hash.clone()));
-        ds.set_attr(
-            ATTR_CREATOR,
-            AttrValue::String("test-suite".into()),
-        );
+        ds.set_attr(ATTR_CREATOR, AttrValue::String("test-suite".into()));
         ds.set_attr(
             ATTR_TIMESTAMP,
             AttrValue::String("2026-02-19T12:00:00Z".into()),

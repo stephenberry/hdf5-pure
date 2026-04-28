@@ -48,10 +48,7 @@ pub fn matrix_dims(extents: &[usize], mode: OneDimensionalMode) -> Vec<usize> {
 ///
 /// Panics if `buf.len()` is smaller than `matlab_dims.len().max(2)`.
 #[inline]
-pub fn storage_dims_u64_into<'a>(
-    matlab_dims: &[usize],
-    buf: &'a mut [u64],
-) -> &'a [u64] {
+pub fn storage_dims_u64_into<'a>(matlab_dims: &[usize], buf: &'a mut [u64]) -> &'a [u64] {
     let n = matlab_dims.len().max(2);
     assert!(
         n <= buf.len(),
@@ -104,7 +101,10 @@ mod tests {
 
     #[test]
     fn matrix_dims_handles_special_cases() {
-        assert_eq!(matrix_dims(&[], OneDimensionalMode::ColumnVector), vec![1, 1]);
+        assert_eq!(
+            matrix_dims(&[], OneDimensionalMode::ColumnVector),
+            vec![1, 1]
+        );
         assert_eq!(
             matrix_dims(&[7], OneDimensionalMode::ColumnVector),
             vec![7, 1]
@@ -121,10 +121,7 @@ mod tests {
         assert_eq!(storage_dims_u64_into(&[], &mut buf), &[1u64, 1]);
         assert_eq!(storage_dims_u64_into(&[5], &mut buf), &[1u64, 5]);
         assert_eq!(storage_dims_u64_into(&[3, 4], &mut buf), &[4u64, 3]);
-        assert_eq!(
-            storage_dims_u64_into(&[2, 3, 4], &mut buf),
-            &[4u64, 3, 2]
-        );
+        assert_eq!(storage_dims_u64_into(&[2, 3, 4], &mut buf), &[4u64, 3, 2]);
     }
 
     #[test]

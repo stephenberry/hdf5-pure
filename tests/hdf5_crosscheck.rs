@@ -131,9 +131,7 @@ fn crosscheck_u8_dataset() {
     let path = dir.path().join("u8.h5");
 
     let mut builder = FileBuilder::new();
-    builder
-        .create_dataset("data")
-        .with_u8_data(&[0, 128, 255]);
+    builder.create_dataset("data").with_u8_data(&[0, 128, 255]);
     builder.write(&path).unwrap();
 
     let file = hdf5::File::open(&path).unwrap();
@@ -228,15 +226,9 @@ fn crosscheck_multiple_datasets() {
     let path = dir.path().join("multi.h5");
 
     let mut builder = FileBuilder::new();
-    builder
-        .create_dataset("x")
-        .with_f64_data(&[1.0, 2.0, 3.0]);
-    builder
-        .create_dataset("y")
-        .with_i32_data(&[10, 20, 30]);
-    builder
-        .create_dataset("z")
-        .with_u8_data(&[0xFF, 0x00]);
+    builder.create_dataset("x").with_f64_data(&[1.0, 2.0, 3.0]);
+    builder.create_dataset("y").with_i32_data(&[10, 20, 30]);
+    builder.create_dataset("z").with_u8_data(&[0xFF, 0x00]);
     builder.write(&path).unwrap();
 
     let file = hdf5::File::open(&path).unwrap();
@@ -284,9 +276,7 @@ fn crosscheck_nested_groups() {
 
     let mut builder = FileBuilder::new();
     let mut outer = builder.create_group("outer");
-    outer
-        .create_dataset("outer_data")
-        .with_f64_data(&[1.0]);
+    outer.create_dataset("outer_data").with_f64_data(&[1.0]);
 
     let mut inner = outer.create_group("inner");
     inner
@@ -607,9 +597,7 @@ fn crosscheck_large_dataset() {
     let data: Vec<f64> = (0..n).map(|i| i as f64).collect();
 
     let mut builder = FileBuilder::new();
-    builder
-        .create_dataset("big")
-        .with_f64_data(&data);
+    builder.create_dataset("big").with_f64_data(&data);
     builder.write(&path).unwrap();
 
     let file = hdf5::File::open(&path).unwrap();
@@ -675,10 +663,7 @@ fn crosscheck_dense_attributes() {
     let ds = builder.create_dataset("data");
     ds.with_f64_data(&[1.0, 2.0, 3.0]);
     for i in 0..20 {
-        ds.set_attr(
-            &format!("attr_{i:03}"),
-            AttrValue::F64(i as f64 * 1.5),
-        );
+        ds.set_attr(&format!("attr_{i:03}"), AttrValue::F64(i as f64 * 1.5));
     }
     builder.write(&path).unwrap();
 
@@ -749,7 +734,9 @@ fn crosscheck_matlab_empty_shape_marker() {
 
     // Verify dataset-level attributes
     let class_attr = ds.attr("MATLAB_class").unwrap();
-    let class_val = class_attr.read_scalar::<hdf5::types::FixedAscii<32>>().unwrap();
+    let class_val = class_attr
+        .read_scalar::<hdf5::types::FixedAscii<32>>()
+        .unwrap();
     assert_eq!(class_val.as_str(), "double");
 
     let empty_attr = ds.attr("MATLAB_empty").unwrap();
@@ -803,8 +790,12 @@ fn crosscheck_matlab_refs_subsystem_pattern() {
 
     // --- #refs# group ---
     let mut refs_grp = builder.create_group("#refs#");
-    refs_grp.create_dataset("a").with_u16_data(&[72, 101, 108, 108, 111]);
-    refs_grp.create_dataset("b").with_u16_data(&[87, 111, 114, 108, 100]);
+    refs_grp
+        .create_dataset("a")
+        .with_u16_data(&[72, 101, 108, 108, 111]);
+    refs_grp
+        .create_dataset("b")
+        .with_u16_data(&[87, 111, 114, 108, 100]);
     refs_grp.create_dataset("c").with_u16_data(&[70, 111, 111]);
 
     // Cross-references within #refs#
@@ -872,7 +863,9 @@ fn crosscheck_matlab_refs_subsystem_pattern() {
 
     // Dataset-level attribute
     let class_attr = data.attr("MATLAB_class").unwrap();
-    let class_val = class_attr.read_scalar::<hdf5::types::FixedAscii<32>>().unwrap();
+    let class_val = class_attr
+        .read_scalar::<hdf5::types::FixedAscii<32>>()
+        .unwrap();
     assert_eq!(class_val.as_str(), "string");
 }
 
@@ -893,15 +886,18 @@ fn crosscheck_varlen_ascii_array_encoding_vs_metno() {
 
     // --- Verify raw bytes: GCOL present and well-formed ---
     let forge_bytes = std::fs::read(&forge_path).unwrap();
-    let fg = forge_bytes.windows(4).position(|w| w == b"GCOL")
+    let fg = forge_bytes
+        .windows(4)
+        .position(|w| w == b"GCOL")
         .expect("forge file missing GCOL signature");
     assert_eq!(forge_bytes[fg + 4], 1, "GCOL version should be 1");
 
     // Collection size must be >= 4096 (H5HG_MINSIZE)
-    let collection_size = u64::from_le_bytes(
-        forge_bytes[fg + 8..fg + 16].try_into().unwrap()
+    let collection_size = u64::from_le_bytes(forge_bytes[fg + 8..fg + 16].try_into().unwrap());
+    assert!(
+        collection_size >= 4096,
+        "GCOL size {collection_size} < H5HG_MINSIZE"
     );
-    assert!(collection_size >= 4096, "GCOL size {collection_size} < H5HG_MINSIZE");
 
     // First object at GCOL+16: index=1, data="x"
     let obj0 = fg + 16;
@@ -956,13 +952,25 @@ fn crosscheck_varlen_ascii_on_nested_group() {
 
     // Verify ASCII attr
     let class_attr = grp.attr("MATLAB_class").unwrap();
-    let class_val = class_attr.read_scalar::<hdf5::types::FixedAscii<32>>().unwrap();
+    let class_val = class_attr
+        .read_scalar::<hdf5::types::FixedAscii<32>>()
+        .unwrap();
     assert_eq!(class_val.as_str(), "struct");
 
     // Verify datasets
-    let x: Vec<f64> = file.dataset("my_struct/x").unwrap().read_1d().unwrap().to_vec();
+    let x: Vec<f64> = file
+        .dataset("my_struct/x")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
     assert_eq!(x, vec![1.0, 2.0]);
-    let y: Vec<f64> = file.dataset("my_struct/y").unwrap().read_1d().unwrap().to_vec();
+    let y: Vec<f64> = file
+        .dataset("my_struct/y")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
     assert_eq!(y, vec![3.0, 4.0]);
 }
 
@@ -987,7 +995,8 @@ fn crosscheck_userblock_all_address_types() {
 
     // Nested group with its own VL attr (second GCOL)
     let mut grp = builder.create_group("inner");
-    grp.create_dataset("vals").with_f64_data(&[10.0, 20.0, 30.0]);
+    grp.create_dataset("vals")
+        .with_f64_data(&[10.0, 20.0, 30.0]);
     grp.create_dataset("ids").with_i32_data(&[1, 2, 3]);
     grp.set_attr(
         "MATLAB_fields",
@@ -1032,9 +1041,19 @@ fn crosscheck_userblock_all_address_types() {
     let iv = read_vl_ascii_attr(&inner_fields);
     assert_eq!(iv, vec!["vals", "ids"]);
 
-    let inner_vals: Vec<f64> = file.dataset("inner/vals").unwrap().read_1d().unwrap().to_vec();
+    let inner_vals: Vec<f64> = file
+        .dataset("inner/vals")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
     assert_eq!(inner_vals, vec![10.0, 20.0, 30.0]);
-    let inner_ids: Vec<i32> = file.dataset("inner/ids").unwrap().read_1d().unwrap().to_vec();
+    let inner_ids: Vec<i32> = file
+        .dataset("inner/ids")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
     assert_eq!(inner_ids, vec![1, 2, 3]);
 
     // Reference dataset shape
@@ -1078,14 +1097,26 @@ fn crosscheck_group_only_no_datasets() {
     assert_eq!(cv.as_str(), "struct");
 
     // Leaf data
-    let a_val: Vec<f64> = file.dataset("outer/a/val").unwrap().read_1d().unwrap().to_vec();
+    let a_val: Vec<f64> = file
+        .dataset("outer/a/val")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
     assert_eq!(a_val, vec![1.0]);
-    let b_val: Vec<i32> = file.dataset("outer/b/val").unwrap().read_1d().unwrap().to_vec();
+    let b_val: Vec<i32> = file
+        .dataset("outer/b/val")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
     assert_eq!(b_val, vec![42]);
 
     // Sub-group attrs
     let a_class = file.group("outer/a").unwrap().attr("MATLAB_class").unwrap();
-    let acv = a_class.read_scalar::<hdf5::types::FixedAscii<32>>().unwrap();
+    let acv = a_class
+        .read_scalar::<hdf5::types::FixedAscii<32>>()
+        .unwrap();
     assert_eq!(acv.as_str(), "double");
 }
 
@@ -1097,8 +1128,10 @@ fn crosscheck_long_ascii_class_attr() {
     let path = dir.path().join("long_class.h5");
 
     let mut builder = FileBuilder::new();
-    builder.create_dataset("x").with_f64_data(&[1.0])
-        .set_attr("MATLAB_class", AttrValue::AsciiString("canonical empty".into()));
+    builder.create_dataset("x").with_f64_data(&[1.0]).set_attr(
+        "MATLAB_class",
+        AttrValue::AsciiString("canonical empty".into()),
+    );
     builder.write(&path).unwrap();
 
     let file = hdf5::File::open(&path).unwrap();
@@ -1153,14 +1186,28 @@ fn crosscheck_matlab_struct_pattern() {
     assert_eq!(fv, vec!["field1", "field2"]);
 
     // Child datasets and their attrs
-    let f1: Vec<f64> = file.dataset("mystruct/field1").unwrap().read_1d().unwrap().to_vec();
+    let f1: Vec<f64> = file
+        .dataset("mystruct/field1")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
     assert_eq!(f1, vec![1.0]);
-    let f1_class = file.dataset("mystruct/field1").unwrap()
-        .attr("MATLAB_class").unwrap()
-        .read_scalar::<hdf5::types::FixedAscii<32>>().unwrap();
+    let f1_class = file
+        .dataset("mystruct/field1")
+        .unwrap()
+        .attr("MATLAB_class")
+        .unwrap()
+        .read_scalar::<hdf5::types::FixedAscii<32>>()
+        .unwrap();
     assert_eq!(f1_class.as_str(), "double");
 
-    let f2: Vec<i32> = file.dataset("mystruct/field2").unwrap().read_1d().unwrap().to_vec();
+    let f2: Vec<i32> = file
+        .dataset("mystruct/field2")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
     assert_eq!(f2, vec![10, 20]);
 }
 
@@ -1176,7 +1223,8 @@ fn crosscheck_matlab_cell_array() {
     refs_group.create_dataset("ref_1").with_i32_data(&[42]);
     builder.add_group(refs_group.finish());
 
-    builder.create_dataset("mycell")
+    builder
+        .create_dataset("mycell")
         .with_path_references(&["#refs#/ref_0", "#refs#/ref_1"])
         .with_shape(&[1, 2])
         .set_attr("MATLAB_class", AttrValue::AsciiString("cell".into()));
@@ -1188,14 +1236,27 @@ fn crosscheck_matlab_cell_array() {
     // Cell reference dataset
     let mycell = file.dataset("mycell").unwrap();
     assert_eq!(mycell.shape(), vec![1, 2]);
-    let cell_class = mycell.attr("MATLAB_class").unwrap()
-        .read_scalar::<hdf5::types::FixedAscii<32>>().unwrap();
+    let cell_class = mycell
+        .attr("MATLAB_class")
+        .unwrap()
+        .read_scalar::<hdf5::types::FixedAscii<32>>()
+        .unwrap();
     assert_eq!(cell_class.as_str(), "cell");
 
     // Referenced data
-    let r0: Vec<f64> = file.dataset("#refs#/ref_0").unwrap().read_1d().unwrap().to_vec();
+    let r0: Vec<f64> = file
+        .dataset("#refs#/ref_0")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
     assert_eq!(r0, vec![1.0]);
-    let r1: Vec<i32> = file.dataset("#refs#/ref_1").unwrap().read_1d().unwrap().to_vec();
+    let r1: Vec<i32> = file
+        .dataset("#refs#/ref_1")
+        .unwrap()
+        .read_1d()
+        .unwrap()
+        .to_vec();
     assert_eq!(r1, vec![42]);
 }
 

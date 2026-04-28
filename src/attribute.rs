@@ -4,7 +4,7 @@
 use alloc::{string::String, vec::Vec};
 
 use crate::attribute_info::AttributeInfoMessage;
-use crate::btree_v2::{collect_btree_v2_records, BTreeV2Header};
+use crate::btree_v2::{BTreeV2Header, collect_btree_v2_records};
 use crate::data_read;
 use crate::dataspace::Dataspace;
 use crate::datatype::Datatype;
@@ -246,7 +246,12 @@ impl AttributeMessage {
 }
 
 /// Compute raw data size based on dataspace and datatype, then extract from message bytes.
-fn compute_raw_data(data: &[u8], pos: usize, dataspace: &Dataspace, datatype: &Datatype) -> Vec<u8> {
+fn compute_raw_data(
+    data: &[u8],
+    pos: usize,
+    dataspace: &Dataspace,
+    datatype: &Datatype,
+) -> Vec<u8> {
     let num_elements = dataspace.num_elements() as usize;
     let elem_size = datatype.type_size() as usize;
     let expected_size = num_elements * elem_size;
@@ -332,12 +337,12 @@ pub fn extract_attributes_full(
 
     // Check for dense attributes via AttributeInfo message
     let attr_info = find_attribute_info(header, offset_size)?;
-    if let Some(info) = attr_info {
-        if let Some(fh_addr) = info.fractal_heap_address {
-            let dense_attrs =
-                extract_dense_attributes(file_data, &info, fh_addr, offset_size, length_size)?;
-            attrs.extend(dense_attrs);
-        }
+    if let Some(info) = attr_info
+        && let Some(fh_addr) = info.fractal_heap_address
+    {
+        let dense_attrs =
+            extract_dense_attributes(file_data, &info, fh_addr, offset_size, length_size)?;
+        attrs.extend(dense_attrs);
     }
 
     Ok(attrs)
@@ -369,14 +374,13 @@ fn extract_dense_attributes(
     let fh = FractalHeapHeader::parse(file_data, fh_addr as usize, offset_size, length_size)?;
 
     // Parse B-tree v2 for name index (type 8)
-    let btree_addr = attr_info.btree_name_index_address.ok_or(
-        FormatError::UnexpectedEof {
+    let btree_addr = attr_info
+        .btree_name_index_address
+        .ok_or(FormatError::UnexpectedEof {
             expected: 1,
             available: 0,
-        }
-    )?;
-    let btree_hdr =
-        BTreeV2Header::parse(file_data, btree_addr as usize, offset_size, length_size)?;
+        })?;
+    let btree_hdr = BTreeV2Header::parse(file_data, btree_addr as usize, offset_size, length_size)?;
     let records = collect_btree_v2_records(file_data, &btree_hdr, offset_size, length_size)?;
 
     let mut attrs = Vec::new();
@@ -467,14 +471,13 @@ mod tests {
 
         // Name padded to 8 bytes
         data.extend_from_slice(name);
-        while data.len() % 8 != 0 || data.len() == 8 {
+        if data.len() % 8 != 0 || data.len() == 8 {
             // Pad name to 8-byte boundary from start of name
             let name_start = 8;
             let name_padded = pad8(name_size);
             while data.len() < name_start + name_padded {
                 data.push(0);
             }
-            break;
         }
 
         // Datatype padded to 8 bytes
