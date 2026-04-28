@@ -10,8 +10,7 @@
 pub const USERBLOCK_SIZE: u64 = 512;
 
 /// Default description text written in the first 124 bytes.
-pub const DEFAULT_DESCRIPTION: &str =
-    "MATLAB 7.3 MAT-file, Platform: hdf5-pure (Rust)";
+pub const DEFAULT_DESCRIPTION: &str = "MATLAB 7.3 MAT-file, Platform: hdf5-pure (Rust)";
 
 /// Write the MATLAB v7.3 userblock into the first 512 bytes of `file_bytes`.
 ///
@@ -32,7 +31,11 @@ pub fn write_header(file_bytes: &mut [u8], description: &str) {
     let n = bytes.len().min(124);
     for (dst, src) in file_bytes[..n].iter_mut().zip(bytes[..n].iter()) {
         // Replace non-ASCII with '?' to keep the header valid ASCII.
-        *dst = if src.is_ascii() && *src != 0 { *src } else { b'?' };
+        *dst = if src.is_ascii() && *src != 0 {
+            *src
+        } else {
+            b'?'
+        };
     }
 
     // 124..126: version = 0x0200 (little-endian → bytes 0x00, 0x02).

@@ -8,7 +8,7 @@ use crate::message_type::MessageType;
 
 /// Writer for v2 object headers with proper checksums.
 pub struct ObjectHeaderWriter {
-    messages: Vec<(MessageType, Vec<u8>, u8)>,  // (type, data, msg_flags)
+    messages: Vec<(MessageType, Vec<u8>, u8)>, // (type, data, msg_flags)
 }
 
 impl ObjectHeaderWriter {
@@ -32,7 +32,9 @@ impl ObjectHeaderWriter {
     /// Serialize the complete v2 object header (OHDR + messages + checksum).
     pub fn serialize(&self) -> Vec<u8> {
         // Calculate total message bytes: each message has type(1) + size(2) + flags(1) + data
-        let msg_bytes_total: usize = self.messages.iter()
+        let msg_bytes_total: usize = self
+            .messages
+            .iter()
             .map(|(_, data, _)| 4 + data.len())
             .sum();
 

@@ -8,7 +8,7 @@ use crate::mat::error::MatError;
 use crate::mat::userblock::{self, USERBLOCK_SIZE};
 use crate::mat::utf16;
 use crate::type_builders::{
-    make_f32_type, make_f64_type, DatasetBuilder, FinishedGroup, GroupBuilder,
+    DatasetBuilder, FinishedGroup, GroupBuilder, make_f32_type, make_f64_type,
 };
 use crate::writer::FileBuilder;
 

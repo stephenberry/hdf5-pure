@@ -34,12 +34,10 @@ use std::collections::HashSet;
 
 use crate::file_writer::AttrValue;
 use crate::mat::class::MatClass;
-use crate::mat::dims::{matrix_dims, storage_dims_u64_into, vector_dims, STORAGE_DIMS_BUF_LEN};
+use crate::mat::dims::{STORAGE_DIMS_BUF_LEN, matrix_dims, storage_dims_u64_into, vector_dims};
 use crate::mat::error::MatError;
 use crate::mat::identifier::{dedupe_name, is_valid_name, sanitize_name};
-use crate::mat::options::{
-    Compression, EmptyMarkerEncoding, InvalidNamePolicy, Options,
-};
+use crate::mat::options::{Compression, EmptyMarkerEncoding, InvalidNamePolicy, Options};
 use crate::mat::string_object;
 use crate::mat::userblock::{self, USERBLOCK_SIZE};
 use crate::mat::utf16;
@@ -268,7 +266,10 @@ impl MatBuilder {
         let target = self.resolve_target(name)?;
         let ds = self.dataset_at_target(&target);
         apply(ds);
-        ds.set_attr("MATLAB_class", AttrValue::AsciiString(class.as_str().into()));
+        ds.set_attr(
+            "MATLAB_class",
+            AttrValue::AsciiString(class.as_str().into()),
+        );
         Ok(self)
     }
 
@@ -280,9 +281,15 @@ impl MatBuilder {
         matlab_dims: &[usize],
         data: &[f64],
     ) -> Result<&mut Self, MatError> {
-        self.write_array_inner(name, MatClass::Double, matlab_dims, data.len(), |ds, shape| {
-            ds.with_f64_data(data).with_shape(shape);
-        })
+        self.write_array_inner(
+            name,
+            MatClass::Double,
+            matlab_dims,
+            data.len(),
+            |ds, shape| {
+                ds.with_f64_data(data).with_shape(shape);
+            },
+        )
     }
     pub fn write_f32(
         &mut self,
@@ -290,9 +297,15 @@ impl MatBuilder {
         matlab_dims: &[usize],
         data: &[f32],
     ) -> Result<&mut Self, MatError> {
-        self.write_array_inner(name, MatClass::Single, matlab_dims, data.len(), |ds, shape| {
-            ds.with_f32_data(data).with_shape(shape);
-        })
+        self.write_array_inner(
+            name,
+            MatClass::Single,
+            matlab_dims,
+            data.len(),
+            |ds, shape| {
+                ds.with_f32_data(data).with_shape(shape);
+            },
+        )
     }
     pub fn write_i8(
         &mut self,
@@ -300,9 +313,15 @@ impl MatBuilder {
         matlab_dims: &[usize],
         data: &[i8],
     ) -> Result<&mut Self, MatError> {
-        self.write_array_inner(name, MatClass::Int8, matlab_dims, data.len(), |ds, shape| {
-            ds.with_i8_data(data).with_shape(shape);
-        })
+        self.write_array_inner(
+            name,
+            MatClass::Int8,
+            matlab_dims,
+            data.len(),
+            |ds, shape| {
+                ds.with_i8_data(data).with_shape(shape);
+            },
+        )
     }
     pub fn write_i16(
         &mut self,
@@ -310,9 +329,15 @@ impl MatBuilder {
         matlab_dims: &[usize],
         data: &[i16],
     ) -> Result<&mut Self, MatError> {
-        self.write_array_inner(name, MatClass::Int16, matlab_dims, data.len(), |ds, shape| {
-            ds.with_i16_data(data).with_shape(shape);
-        })
+        self.write_array_inner(
+            name,
+            MatClass::Int16,
+            matlab_dims,
+            data.len(),
+            |ds, shape| {
+                ds.with_i16_data(data).with_shape(shape);
+            },
+        )
     }
     pub fn write_i32(
         &mut self,
@@ -320,9 +345,15 @@ impl MatBuilder {
         matlab_dims: &[usize],
         data: &[i32],
     ) -> Result<&mut Self, MatError> {
-        self.write_array_inner(name, MatClass::Int32, matlab_dims, data.len(), |ds, shape| {
-            ds.with_i32_data(data).with_shape(shape);
-        })
+        self.write_array_inner(
+            name,
+            MatClass::Int32,
+            matlab_dims,
+            data.len(),
+            |ds, shape| {
+                ds.with_i32_data(data).with_shape(shape);
+            },
+        )
     }
     pub fn write_i64(
         &mut self,
@@ -330,9 +361,15 @@ impl MatBuilder {
         matlab_dims: &[usize],
         data: &[i64],
     ) -> Result<&mut Self, MatError> {
-        self.write_array_inner(name, MatClass::Int64, matlab_dims, data.len(), |ds, shape| {
-            ds.with_i64_data(data).with_shape(shape);
-        })
+        self.write_array_inner(
+            name,
+            MatClass::Int64,
+            matlab_dims,
+            data.len(),
+            |ds, shape| {
+                ds.with_i64_data(data).with_shape(shape);
+            },
+        )
     }
     pub fn write_u8(
         &mut self,
@@ -340,9 +377,15 @@ impl MatBuilder {
         matlab_dims: &[usize],
         data: &[u8],
     ) -> Result<&mut Self, MatError> {
-        self.write_array_inner(name, MatClass::UInt8, matlab_dims, data.len(), |ds, shape| {
-            ds.with_u8_data(data).with_shape(shape);
-        })
+        self.write_array_inner(
+            name,
+            MatClass::UInt8,
+            matlab_dims,
+            data.len(),
+            |ds, shape| {
+                ds.with_u8_data(data).with_shape(shape);
+            },
+        )
     }
     pub fn write_u16(
         &mut self,
@@ -350,9 +393,15 @@ impl MatBuilder {
         matlab_dims: &[usize],
         data: &[u16],
     ) -> Result<&mut Self, MatError> {
-        self.write_array_inner(name, MatClass::UInt16, matlab_dims, data.len(), |ds, shape| {
-            ds.with_u16_data(data).with_shape(shape);
-        })
+        self.write_array_inner(
+            name,
+            MatClass::UInt16,
+            matlab_dims,
+            data.len(),
+            |ds, shape| {
+                ds.with_u16_data(data).with_shape(shape);
+            },
+        )
     }
     pub fn write_u32(
         &mut self,
@@ -360,9 +409,15 @@ impl MatBuilder {
         matlab_dims: &[usize],
         data: &[u32],
     ) -> Result<&mut Self, MatError> {
-        self.write_array_inner(name, MatClass::UInt32, matlab_dims, data.len(), |ds, shape| {
-            ds.with_u32_data(data).with_shape(shape);
-        })
+        self.write_array_inner(
+            name,
+            MatClass::UInt32,
+            matlab_dims,
+            data.len(),
+            |ds, shape| {
+                ds.with_u32_data(data).with_shape(shape);
+            },
+        )
     }
     pub fn write_u64(
         &mut self,
@@ -370,9 +425,15 @@ impl MatBuilder {
         matlab_dims: &[usize],
         data: &[u64],
     ) -> Result<&mut Self, MatError> {
-        self.write_array_inner(name, MatClass::UInt64, matlab_dims, data.len(), |ds, shape| {
-            ds.with_u64_data(data).with_shape(shape);
-        })
+        self.write_array_inner(
+            name,
+            MatClass::UInt64,
+            matlab_dims,
+            data.len(),
+            |ds, shape| {
+                ds.with_u64_data(data).with_shape(shape);
+            },
+        )
     }
 
     /// Write a logical array (MATLAB `logical`, stored as `uint8`).
@@ -385,10 +446,16 @@ impl MatBuilder {
         if data.is_empty() {
             return self.write_empty_with_decode(name, MatClass::Logical, matlab_dims, Some(1));
         }
-        self.write_array_inner(name, MatClass::Logical, matlab_dims, data.len(), |ds, shape| {
-            ds.with_u8_data(data).with_shape(shape);
-            ds.set_attr("MATLAB_int_decode", AttrValue::I32(1));
-        })
+        self.write_array_inner(
+            name,
+            MatClass::Logical,
+            matlab_dims,
+            data.len(),
+            |ds, shape| {
+                ds.with_u8_data(data).with_shape(shape);
+                ds.set_attr("MATLAB_int_decode", AttrValue::I32(1));
+            },
+        )
     }
 
     /// Write a `char` UTF-16 string (MATLAB `char`). Uses `[N, 1]` MATLAB
@@ -493,7 +560,8 @@ impl MatBuilder {
         let metadata = string_object::create_string_object_metadata(object_id);
         let target = self.resolve_target(name)?;
         let ds = self.dataset_at_target(&target);
-        ds.with_u32_data(&metadata).with_shape(&[1, metadata.len() as u64]);
+        ds.with_u32_data(&metadata)
+            .with_shape(&[1, metadata.len() as u64]);
         ds.set_attr(
             "MATLAB_class",
             AttrValue::AsciiString(string_object::MATLAB_CLASS_STRING.into()),
@@ -648,17 +716,16 @@ impl MatBuilder {
     }
 
     fn close_struct(&mut self) -> Result<(), MatError> {
-        let mut s = self.open_structs.pop().ok_or_else(|| {
-            MatError::Custom("close_struct called with no open struct".into())
-        })?;
+        let mut s = self
+            .open_structs
+            .pop()
+            .ok_or_else(|| MatError::Custom("close_struct called with no open struct".into()))?;
         s.group.set_attr(
             "MATLAB_class",
             AttrValue::AsciiString(MatClass::Struct.as_str().into()),
         );
-        s.group.set_attr(
-            "MATLAB_fields",
-            AttrValue::VarLenAsciiArray(s.fields),
-        );
+        s.group
+            .set_attr("MATLAB_fields", AttrValue::VarLenAsciiArray(s.fields));
         let finished = s.group.finish();
         match s.parent {
             ParentKind::Root => self.file.add_group(finished),
@@ -709,8 +776,7 @@ impl MatBuilder {
                 }
                 EmptyMarkerEncoding::DataAsDims => {
                     if matlab_dims.len() > STORAGE_DIMS_BUF_LEN {
-                        let dim_data: Vec<u64> =
-                            matlab_dims.iter().map(|&d| d as u64).collect();
+                        let dim_data: Vec<u64> = matlab_dims.iter().map(|&d| d as u64).collect();
                         ds.with_u64_data(&dim_data)
                             .with_shape(&[dim_data.len() as u64]);
                     } else {
@@ -865,8 +931,7 @@ impl MatBuilder {
         );
 
         // 6. Build the MCOS reference array.
-        let mut paths: Vec<String> =
-            Vec::with_capacity(5 + self.string_object_payload_paths.len());
+        let mut paths: Vec<String> = Vec::with_capacity(5 + self.string_object_payload_paths.len());
         paths.push(metadata_path);
         paths.push(canonical_path);
         paths.extend(self.string_object_payload_paths.iter().cloned());
@@ -1062,57 +1127,112 @@ impl<'a> StructWriter<'a> {
         Ok(self)
     }
     #[inline]
-    pub fn write_f64(&mut self, name: &str, dims: &[usize], data: &[f64]) -> Result<&mut Self, MatError> {
+    pub fn write_f64(
+        &mut self,
+        name: &str,
+        dims: &[usize],
+        data: &[f64],
+    ) -> Result<&mut Self, MatError> {
         self.mb.write_f64(name, dims, data)?;
         Ok(self)
     }
     #[inline]
-    pub fn write_f32(&mut self, name: &str, dims: &[usize], data: &[f32]) -> Result<&mut Self, MatError> {
+    pub fn write_f32(
+        &mut self,
+        name: &str,
+        dims: &[usize],
+        data: &[f32],
+    ) -> Result<&mut Self, MatError> {
         self.mb.write_f32(name, dims, data)?;
         Ok(self)
     }
     #[inline]
-    pub fn write_i8(&mut self, name: &str, dims: &[usize], data: &[i8]) -> Result<&mut Self, MatError> {
+    pub fn write_i8(
+        &mut self,
+        name: &str,
+        dims: &[usize],
+        data: &[i8],
+    ) -> Result<&mut Self, MatError> {
         self.mb.write_i8(name, dims, data)?;
         Ok(self)
     }
     #[inline]
-    pub fn write_i16(&mut self, name: &str, dims: &[usize], data: &[i16]) -> Result<&mut Self, MatError> {
+    pub fn write_i16(
+        &mut self,
+        name: &str,
+        dims: &[usize],
+        data: &[i16],
+    ) -> Result<&mut Self, MatError> {
         self.mb.write_i16(name, dims, data)?;
         Ok(self)
     }
     #[inline]
-    pub fn write_i32(&mut self, name: &str, dims: &[usize], data: &[i32]) -> Result<&mut Self, MatError> {
+    pub fn write_i32(
+        &mut self,
+        name: &str,
+        dims: &[usize],
+        data: &[i32],
+    ) -> Result<&mut Self, MatError> {
         self.mb.write_i32(name, dims, data)?;
         Ok(self)
     }
     #[inline]
-    pub fn write_i64(&mut self, name: &str, dims: &[usize], data: &[i64]) -> Result<&mut Self, MatError> {
+    pub fn write_i64(
+        &mut self,
+        name: &str,
+        dims: &[usize],
+        data: &[i64],
+    ) -> Result<&mut Self, MatError> {
         self.mb.write_i64(name, dims, data)?;
         Ok(self)
     }
     #[inline]
-    pub fn write_u8(&mut self, name: &str, dims: &[usize], data: &[u8]) -> Result<&mut Self, MatError> {
+    pub fn write_u8(
+        &mut self,
+        name: &str,
+        dims: &[usize],
+        data: &[u8],
+    ) -> Result<&mut Self, MatError> {
         self.mb.write_u8(name, dims, data)?;
         Ok(self)
     }
     #[inline]
-    pub fn write_u16(&mut self, name: &str, dims: &[usize], data: &[u16]) -> Result<&mut Self, MatError> {
+    pub fn write_u16(
+        &mut self,
+        name: &str,
+        dims: &[usize],
+        data: &[u16],
+    ) -> Result<&mut Self, MatError> {
         self.mb.write_u16(name, dims, data)?;
         Ok(self)
     }
     #[inline]
-    pub fn write_u32(&mut self, name: &str, dims: &[usize], data: &[u32]) -> Result<&mut Self, MatError> {
+    pub fn write_u32(
+        &mut self,
+        name: &str,
+        dims: &[usize],
+        data: &[u32],
+    ) -> Result<&mut Self, MatError> {
         self.mb.write_u32(name, dims, data)?;
         Ok(self)
     }
     #[inline]
-    pub fn write_u64(&mut self, name: &str, dims: &[usize], data: &[u64]) -> Result<&mut Self, MatError> {
+    pub fn write_u64(
+        &mut self,
+        name: &str,
+        dims: &[usize],
+        data: &[u64],
+    ) -> Result<&mut Self, MatError> {
         self.mb.write_u64(name, dims, data)?;
         Ok(self)
     }
     #[inline]
-    pub fn write_logical(&mut self, name: &str, dims: &[usize], data: &[u8]) -> Result<&mut Self, MatError> {
+    pub fn write_logical(
+        &mut self,
+        name: &str,
+        dims: &[usize],
+        data: &[u8],
+    ) -> Result<&mut Self, MatError> {
         self.mb.write_logical(name, dims, data)?;
         Ok(self)
     }
@@ -1296,7 +1416,8 @@ impl<'a> CellWriter<'a> {
     pub fn push_string(&mut self, value: &str) -> Result<&mut Self, MatError> {
         // MATLAB string scalar: dims [1, 1].
         let r = self.arm();
-        self.mb.write_string_object(&r, &[value.to_owned()], &[1, 1])?;
+        self.mb
+            .write_string_object(&r, &[value.to_owned()], &[1, 1])?;
         self.record(r);
         Ok(self)
     }

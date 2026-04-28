@@ -53,3 +53,26 @@ ndarray = "0.16"
 [[example]]
 name = "matlab_fixtures"
 required-features = ["serde"]
+
+# Style-preference clippy lints muted crate-wide. The remaining clippy
+# surface is still on (`-D warnings` in CI), so genuinely problematic
+# patterns continue to fail the build.
+[lints.clippy]
+# Low-level binary format code naturally has many fields per call site
+# (file_data, dataspace, datatype, layout, cache, ...). Default 7 is too tight.
+too_many_arguments = "allow"
+# Incremental bytestream construction reads more naturally as
+# `let mut buf = Vec::new(); buf.push(...);` than the equivalent `vec![...]`.
+vec_init_then_push = "allow"
+same_item_push = "allow"
+# Index-based loops are sometimes the clearest way to express the access pattern.
+needless_range_loop = "allow"
+# We prefer the explicit forms.
+collapsible_if = "allow"
+collapsible_match = "allow"
+collapsible_else_if = "allow"
+manual_div_ceil = "allow"
+manual_is_multiple_of = "allow"
+unnecessary_map_or = "allow"
+# Approximate float constants in tests/fixtures are intentional.
+approx_constant = "allow"

@@ -97,8 +97,7 @@ impl GlobalHeapCollection {
             let obj_header_size = 8 + length_size as usize;
             ensure_len(file_data, pos, obj_header_size)?;
 
-            let reference_count =
-                u16::from_le_bytes([file_data[pos + 2], file_data[pos + 3]]);
+            let reference_count = u16::from_le_bytes([file_data[pos + 2], file_data[pos + 3]]);
             let object_size = read_length(file_data, pos + 8, length_size)? as usize;
 
             pos += obj_header_size;
@@ -187,13 +186,7 @@ mod tests {
 
     #[test]
     fn parse_collection_two_objects() {
-        let data = build_collection(
-            &[
-                (1, 1, b"hello"),
-                (2, 1, b"world!!!"),
-            ],
-            8,
-        );
+        let data = build_collection(&[(1, 1, b"hello"), (2, 1, b"world!!!")], 8);
         let coll = GlobalHeapCollection::parse(&data, 0, 8).unwrap();
         assert_eq!(coll.objects.len(), 2);
         assert_eq!(coll.objects[0].index, 1);
@@ -204,13 +197,7 @@ mod tests {
 
     #[test]
     fn get_object_by_index() {
-        let data = build_collection(
-            &[
-                (1, 1, b"aaa"),
-                (3, 2, b"bbb"),
-            ],
-            8,
-        );
+        let data = build_collection(&[(1, 1, b"aaa"), (3, 2, b"bbb")], 8);
         let coll = GlobalHeapCollection::parse(&data, 0, 8).unwrap();
         let obj = coll.get_object(3).unwrap();
         assert_eq!(obj.data, b"bbb");

@@ -126,7 +126,11 @@ fn vec_of_option_with_none_uses_empty_struct_marker() {
                 .read_scalar::<hdf5::types::FixedAscii<32>>()
                 .unwrap();
             assert_eq!(cls.as_str(), "struct");
-            let empty = ds.attr("MATLAB_empty").unwrap().read_scalar::<u32>().unwrap();
+            let empty = ds
+                .attr("MATLAB_empty")
+                .unwrap()
+                .read_scalar::<u32>()
+                .unwrap();
             assert_eq!(empty, 1);
             empty_struct_count += 1;
         }
@@ -278,7 +282,10 @@ fn from_file_on_cell_array_currently_errors() {
     mat::to_file(&original, &path).unwrap();
 
     let result: Result<PathRoot, _> = mat::from_file(&path);
-    assert!(result.is_err(), "cell-array deserialization not yet implemented");
+    assert!(
+        result.is_err(),
+        "cell-array deserialization not yet implemented"
+    );
 }
 
 #[test]

@@ -175,7 +175,9 @@ fn u32_bytes(values: &[u32]) -> Vec<u8> {
 }
 
 fn product(extents: &[usize]) -> Option<usize> {
-    extents.iter().try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+    extents
+        .iter()
+        .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
 }
 
 #[cfg(test)]
@@ -199,11 +201,8 @@ mod tests {
 
     #[test]
     fn saveobj_validates_dim_product() {
-        let err = encode_string_saveobj_payload(
-            &["a".to_owned(), "b".to_owned()],
-            &[3, 1],
-        )
-        .unwrap_err();
+        let err =
+            encode_string_saveobj_payload(&["a".to_owned(), "b".to_owned()], &[3, 1]).unwrap_err();
         assert!(matches!(err, MatError::Custom(_)));
     }
 }

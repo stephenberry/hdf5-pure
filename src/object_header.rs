@@ -130,19 +130,24 @@ impl ObjectHeader {
 
         // Pad to 8-byte alignment: header prefix is 12 bytes, pad to 16
         let padding = 4; // pad 12-byte prefix to 16-byte alignment
-        let msg_start = offset.checked_add(12 + padding).ok_or(FormatError::UnexpectedEof {
-            expected: usize::MAX,
-            available: data.len(),
-        })?;
+        let msg_start = offset
+            .checked_add(12 + padding)
+            .ok_or(FormatError::UnexpectedEof {
+                expected: usize::MAX,
+                available: data.len(),
+            })?;
 
         ensure_len(data, msg_start, header_data_size)?;
 
         let mut messages = Vec::new();
         let mut pos = msg_start;
-        let msg_end = msg_start.checked_add(header_data_size).ok_or(FormatError::UnexpectedEof {
-            expected: usize::MAX,
-            available: data.len(),
-        })?;
+        let msg_end =
+            msg_start
+                .checked_add(header_data_size)
+                .ok_or(FormatError::UnexpectedEof {
+                    expected: usize::MAX,
+                    available: data.len(),
+                })?;
 
         for _ in 0..num_messages {
             if pos + 8 > msg_end {
@@ -158,10 +163,10 @@ impl ObjectHeader {
             let msg_type = MessageType::from_u16(msg_type_raw);
 
             // Check if unknown + must-understand (bit 3 of msg_flags)
-            if let MessageType::Unknown(id) = msg_type {
-                if msg_flags & 0x08 != 0 {
-                    return Err(FormatError::UnsupportedMessage(id));
-                }
+            if let MessageType::Unknown(id) = msg_type
+                && msg_flags & 0x08 != 0
+            {
+                return Err(FormatError::UnsupportedMessage(id));
             }
 
             if msg_type != MessageType::Nil {
@@ -178,15 +183,15 @@ impl ObjectHeader {
 
             // Follow continuations
             if msg_type == MessageType::ObjectHeaderContinuation {
-                let cont_msg_data = &messages.last()
-                    .ok_or(FormatError::InvalidObjectHeaderSignature)?.data;
+                let cont_msg_data = &messages
+                    .last()
+                    .ok_or(FormatError::InvalidObjectHeaderSignature)?
+                    .data;
                 if cont_msg_data.len() >= (offset_size as usize + length_size as usize) {
-                    let cont_offset_raw =
-                        read_offset(cont_msg_data, 0, offset_size)?;
+                    let cont_offset_raw = read_offset(cont_msg_data, 0, offset_size)?;
                     let cont_offset = (cont_offset_raw + base_address) as usize;
                     let cont_length =
-                        read_offset(cont_msg_data, offset_size as usize, length_size)?
-                            as usize;
+                        read_offset(cont_msg_data, offset_size as usize, length_size)? as usize;
                     // Parse continuation block (v1: just raw messages, no signature)
                     let cont_msgs = Self::parse_v1_continuation(
                         data,
@@ -243,10 +248,10 @@ impl ObjectHeader {
 
             let msg_type = MessageType::from_u16(msg_type_raw);
 
-            if let MessageType::Unknown(id) = msg_type {
-                if msg_flags & 0x08 != 0 {
-                    return Err(FormatError::UnsupportedMessage(id));
-                }
+            if let MessageType::Unknown(id) = msg_type
+                && msg_flags & 0x08 != 0
+            {
+                return Err(FormatError::UnsupportedMessage(id));
             }
 
             if msg_type != MessageType::Nil {
@@ -263,17 +268,21 @@ impl ObjectHeader {
 
             // Recursive continuations
             if msg_type == MessageType::ObjectHeaderContinuation {
-                let cont_msg_data = &messages.last()
-                    .ok_or(FormatError::InvalidObjectHeaderSignature)?.data;
+                let cont_msg_data = &messages
+                    .last()
+                    .ok_or(FormatError::InvalidObjectHeaderSignature)?
+                    .data;
                 if cont_msg_data.len() >= (offset_size as usize + length_size as usize) {
-                    let cont_offset_raw =
-                        read_offset(cont_msg_data, 0, offset_size)?;
+                    let cont_offset_raw = read_offset(cont_msg_data, 0, offset_size)?;
                     let cont_offset = (cont_offset_raw + base_address) as usize;
                     let cont_length =
-                        read_offset(cont_msg_data, offset_size as usize, length_size)?
-                            as usize;
+                        read_offset(cont_msg_data, offset_size as usize, length_size)? as usize;
                     let cont_msgs = Self::parse_v1_continuation(
-                        data, cont_offset, cont_length, offset_size, length_size,
+                        data,
+                        cont_offset,
+                        cont_length,
+                        offset_size,
+                        length_size,
                         base_address,
                         depth_remaining - 1,
                     )?;
@@ -335,10 +344,12 @@ impl ObjectHeader {
         pos += chunk_size_width as usize;
 
         let chunk0_msg_start = pos;
-        let chunk0_msg_end = pos.checked_add(chunk0_size).ok_or(FormatError::UnexpectedEof {
-            expected: usize::MAX,
-            available: data.len(),
-        })?;
+        let chunk0_msg_end = pos
+            .checked_add(chunk0_size)
+            .ok_or(FormatError::UnexpectedEof {
+                expected: usize::MAX,
+                available: data.len(),
+            })?;
 
         // Validate checksum: from OHDR signature through all messages (before checksum)
         ensure_len(data, chunk0_msg_end, 4)?;
@@ -434,10 +445,10 @@ impl ObjectHeader {
 
             let msg_type = MessageType::from_u16(msg_type_raw);
 
-            if let MessageType::Unknown(id) = msg_type {
-                if msg_flags & 0x08 != 0 {
-                    return Err(FormatError::UnsupportedMessage(id));
-                }
+            if let MessageType::Unknown(id) = msg_type
+                && msg_flags & 0x08 != 0
+            {
+                return Err(FormatError::UnsupportedMessage(id));
             }
 
             let msg_data = data[pos..pos + msg_data_size].to_vec();
@@ -565,13 +576,11 @@ mod tests {
         buf.push(2); // version
         buf.push(flags);
 
-        if has_timestamps {
-            if let Some((at, mt, ct, bt)) = timestamps {
-                buf.extend_from_slice(&at.to_le_bytes());
-                buf.extend_from_slice(&mt.to_le_bytes());
-                buf.extend_from_slice(&ct.to_le_bytes());
-                buf.extend_from_slice(&bt.to_le_bytes());
-            }
+        if has_timestamps && let Some((at, mt, ct, bt)) = timestamps {
+            buf.extend_from_slice(&at.to_le_bytes());
+            buf.extend_from_slice(&mt.to_le_bytes());
+            buf.extend_from_slice(&ct.to_le_bytes());
+            buf.extend_from_slice(&bt.to_le_bytes());
         }
 
         if flags & 0x10 != 0 {
@@ -623,7 +632,7 @@ mod tests {
     fn parse_v1_two_messages() {
         let messages = [
             (0x0001u16, &[1u8, 2, 3, 4][..], 0u8), // Dataspace
-            (0x0008, &[5u8, 6][..], 0),              // DataLayout
+            (0x0008, &[5u8, 6][..], 0),            // DataLayout
         ];
         let data = build_v1_header(&messages, 8, 8);
         let hdr = ObjectHeader::parse(&data, 0, 8, 8).unwrap();
@@ -666,11 +675,7 @@ mod tests {
 
     #[test]
     fn parse_v2_with_timestamps() {
-        let data = build_v2_header(
-            0x20,
-            &[(0x01, &[1], 0)],
-            Some((100, 200, 300, 400)),
-        );
+        let data = build_v2_header(0x20, &[(0x01, &[1], 0)], Some((100, 200, 300, 400)));
         let hdr = ObjectHeader::parse(&data, 0, 8, 8).unwrap();
         assert_eq!(hdr.access_time, Some(100));
         assert_eq!(hdr.modification_time, Some(200));
@@ -722,7 +727,7 @@ mod tests {
             0x00,
             &[
                 (0x00, &[0, 0, 0, 0], 0), // NIL
-                (0x01, &[42], 0),           // Dataspace
+                (0x01, &[42], 0),         // Dataspace
             ],
             None,
         );
@@ -781,8 +786,8 @@ mod tests {
         let header = build_v2_header(
             0x00,
             &[
-                (0x01, &[42], 0),       // Dataspace
-                (0x10, &cont_data, 0),   // Continuation
+                (0x01, &[42], 0),      // Dataspace
+                (0x10, &cont_data, 0), // Continuation
             ],
             None,
         );

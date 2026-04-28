@@ -9,12 +9,12 @@ use alloc::{vec, vec::Vec};
 use crate::checksum::jenkins_lookup3;
 use crate::chunk_cache::{CACHE_LINE_SIZE, align_to_cache_line};
 use crate::error::FormatError;
-use crate::filter_pipeline::{
-    FilterDescription, FilterPipeline, FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SHUFFLE,
-};
 #[cfg(feature = "zfp")]
 use crate::filter_pipeline::FILTER_ZFP;
-use crate::filters::{compress_chunk, ChunkContext, ZfpElementTypeWhenEnabled};
+use crate::filter_pipeline::{
+    FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SHUFFLE, FilterDescription, FilterPipeline,
+};
+use crate::filters::{ChunkContext, ZfpElementTypeWhenEnabled, compress_chunk};
 
 /// Round a file offset up to the next cache-line boundary.
 ///
@@ -116,9 +116,7 @@ impl ChunkOptions {
             });
         }
 
-        if !zfp_active
-            && let Some(level) = self.deflate_level
-        {
+        if !zfp_active && let Some(level) = self.deflate_level {
             filters.push(FilterDescription {
                 filter_id: FILTER_DEFLATE,
                 name: None,
@@ -132,7 +130,7 @@ impl ChunkOptions {
                 filter_id: FILTER_FLETCHER32,
                 name: None,
                 flags: 0,
-                client_data: vec![],  
+                client_data: vec![],
             });
         }
 
@@ -285,7 +283,12 @@ pub fn serialize_v4_single_chunk_pub(
     element_size: u32,
 ) -> Vec<u8> {
     serialize_v4_single_chunk(
-        chunk_dims, chunk_address, filtered_size, filter_mask, offset_size, element_size,
+        chunk_dims,
+        chunk_address,
+        filtered_size,
+        filter_mask,
+        offset_size,
+        element_size,
     )
 }
 
@@ -445,7 +448,11 @@ pub fn build_fixed_array_at(
     // where chunk.size is the unfiltered chunk size in bytes (product of all chunk dims).
     let chunk_size_bytes: usize = if has_filters {
         let max_raw = chunks.iter().map(|c| c.raw_size).max().unwrap_or(1);
-        let log2_val = if max_raw <= 1 { 0 } else { 63 - max_raw.leading_zeros() };
+        let log2_val = if max_raw <= 1 {
+            0
+        } else {
+            63 - max_raw.leading_zeros()
+        };
         let len = 1 + ((log2_val + 8) / 8) as usize;
         len.min(8)
     } else {
@@ -641,8 +648,7 @@ pub fn build_extensible_array_at(
     let max_dblk_nelmts_bits: u8 = 10;
 
     // EAHD size: fixed(12) + 6 stats(6*length_size) + addr(offset_size) + checksum(4)
-    let aehd_size = 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1
-        + 6 * length_size as usize + os + 4;
+    let aehd_size = 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 6 * length_size as usize + os + 4;
     let aeib_address = ea_base_address + aehd_size as u64;
 
     // Determine how many elements go inline vs data blocks
@@ -659,7 +665,11 @@ pub fn build_extensible_array_at(
     let sblk_min = super_blk_min_nelmts as usize; // sup_blk_min_data_ptrs
     // nsblks = log2(2^max_nelmts_bits / data_blk_min_elmts) + 1
     //        = max_nelmts_bits - log2(data_blk_min_elmts) + 1
-    let log2_dblk_min = if min_dblk_nelmts <= 1 { 0 } else { (min_dblk_nelmts as u32).trailing_zeros() as usize };
+    let log2_dblk_min = if min_dblk_nelmts <= 1 {
+        0
+    } else {
+        (min_dblk_nelmts as u32).trailing_zeros() as usize
+    };
     let nsblks = (max_nelmts_bits as usize).saturating_sub(log2_dblk_min) + 1;
 
     // Direct data block addresses (from super blocks 0..sblk_min-1)
@@ -746,17 +756,13 @@ pub fn build_extensible_array_at(
         idx_blk_elmts as u64
     };
 
-    let write_length = |buf: &mut Vec<u8>, val: u64| {
-        match length_size {
-            4 => buf.extend_from_slice(&(val as u32).to_le_bytes()),
-            _ => buf.extend_from_slice(&val.to_le_bytes()),
-        }
+    let write_length = |buf: &mut Vec<u8>, val: u64| match length_size {
+        4 => buf.extend_from_slice(&(val as u32).to_le_bytes()),
+        _ => buf.extend_from_slice(&val.to_le_bytes()),
     };
-    let write_addr = |buf: &mut Vec<u8>, val: u64| {
-        match offset_size {
-            4 => buf.extend_from_slice(&(val as u32).to_le_bytes()),
-            _ => buf.extend_from_slice(&val.to_le_bytes()),
-        }
+    let write_addr = |buf: &mut Vec<u8>, val: u64| match offset_size {
+        4 => buf.extend_from_slice(&(val as u32).to_le_bytes()),
+        _ => buf.extend_from_slice(&val.to_le_bytes()),
     };
 
     write_length(&mut aehd, 0); // stat[0]: reserved/unknown
@@ -789,7 +795,13 @@ pub fn build_extensible_array_at(
     #[allow(clippy::needless_range_loop)]
     for i in 0..idx_blk_elmts as usize {
         if i < n_inline {
-            write_chunk_element(&mut aeib, &chunks[i], offset_size, has_filters, chunk_size_bytes);
+            write_chunk_element(
+                &mut aeib,
+                &chunks[i],
+                offset_size,
+                has_filters,
+                chunk_size_bytes,
+            );
         } else {
             write_undefined_element(&mut aeib, offset_size, has_filters, chunk_size_bytes);
         }
@@ -1105,8 +1117,7 @@ mod tests {
         let raw = f64_to_bytes(values);
         let base_address = 0x1000u64;
         let ctx = ChunkContext::basic(chunk_dims, 8);
-        let result =
-            build_chunked_data_at(&raw, shape, ctx, options, base_address).unwrap();
+        let result = build_chunked_data_at(&raw, shape, ctx, options, base_address).unwrap();
 
         // Build a fake file buffer
         let file_size = base_address as usize + result.data_bytes.len();
@@ -1260,8 +1271,8 @@ mod tests {
 
     #[test]
     fn align_chunk_offset_values() {
-        use super::align_chunk_offset;
         use super::CACHE_LINE_SIZE;
+        use super::align_chunk_offset;
         let cl = CACHE_LINE_SIZE as u64;
         assert_eq!(align_chunk_offset(0), 0);
         assert_eq!(align_chunk_offset(1), cl);
@@ -1284,8 +1295,7 @@ mod tests {
         };
         let dims = [20u64];
         let ctx = ChunkContext::basic(&dims, 8);
-        let result =
-            build_chunked_data_at(&raw, &[100], ctx, &options, base_address).unwrap();
+        let result = build_chunked_data_at(&raw, &[100], ctx, &options, base_address).unwrap();
 
         // Parse layout to get chunk addresses (via roundtrip read)
         let file_size = base_address as usize + result.data_bytes.len();
@@ -1302,9 +1312,8 @@ mod tests {
         let datatype = make_f64_type();
 
         // Verify data roundtrips correctly
-        let output = read_chunked_data(
-            &file_data, &layout, &dataspace, &datatype, None, 8, 8,
-        ).unwrap();
+        let output =
+            read_chunked_data(&file_data, &layout, &dataspace, &datatype, None, 8, 8).unwrap();
         assert_eq!(bytes_to_f64(&output), values);
     }
 
@@ -1493,10 +1502,9 @@ mod tests {
             ..Default::default()
         };
         let ctx = ChunkContext::basic(chunk_dims, 8);
-        let result = build_chunked_data_at_ext(
-            &raw, shape, ctx, &options, base_address, Some(maxshape),
-        )
-        .unwrap();
+        let result =
+            build_chunked_data_at_ext(&raw, shape, ctx, &options, base_address, Some(maxshape))
+                .unwrap();
 
         let file_size = base_address as usize + result.data_bytes.len();
         let mut file_data = vec![0u8; file_size];
@@ -1505,7 +1513,9 @@ mod tests {
         let layout = DataLayout::parse(&result.layout_message, 8, 8).unwrap();
         // Verify it uses EA index
         match &layout {
-            DataLayout::Chunked { chunk_index_type, .. } => {
+            DataLayout::Chunked {
+                chunk_index_type, ..
+            } => {
                 assert_eq!(*chunk_index_type, Some(4), "expected EA index type");
             }
             _ => panic!("expected chunked layout"),
@@ -1519,8 +1529,8 @@ mod tests {
         };
         let datatype = make_f64_type();
 
-        let output = read_chunked_data(&file_data, &layout, &dataspace, &datatype, None, 8, 8)
-            .unwrap();
+        let output =
+            read_chunked_data(&file_data, &layout, &dataspace, &datatype, None, 8, 8).unwrap();
 
         bytes_to_f64(&output)
     }
@@ -1571,8 +1581,14 @@ mod tests {
         let mut fw = FileWriter::new();
         let data1: Vec<f64> = (0..50).map(|i| i as f64).collect();
         let data2: Vec<f64> = (0..30).map(|i| (i * 10) as f64).collect();
-        fw.create_dataset("a").with_f64_data(&data1).with_shape(&[50]).with_chunks(&[25]);
-        fw.create_dataset("b").with_f64_data(&data2).with_shape(&[30]).with_chunks(&[10]);
+        fw.create_dataset("a")
+            .with_f64_data(&data1)
+            .with_shape(&[50])
+            .with_chunks(&[25]);
+        fw.create_dataset("b")
+            .with_f64_data(&data2)
+            .with_shape(&[30])
+            .with_chunks(&[10]);
         let bytes = fw.finish().unwrap();
         let path = std::env::temp_dir().join("rustyhdf5_chunked_multi.h5");
         std::fs::write(&path, &bytes).unwrap();
@@ -1591,10 +1607,13 @@ mod tests {
     #[cfg(feature = "std")]
     #[test]
     fn h5py_reads_chunked_with_attrs() {
-        use crate::file_writer::{FileWriter, AttrValue};
+        use crate::file_writer::{AttrValue, FileWriter};
         let mut fw = FileWriter::new();
         let data: Vec<f64> = (0..50).map(|i| i as f64).collect();
-        fw.create_dataset("data").with_f64_data(&data).with_shape(&[50]).with_chunks(&[25])
+        fw.create_dataset("data")
+            .with_f64_data(&data)
+            .with_shape(&[50])
+            .with_chunks(&[25])
             .set_attr("units", AttrValue::String("meters".to_string()));
         let bytes = fw.finish().unwrap();
         let path = std::env::temp_dir().join("rustyhdf5_chunked_attrs.h5");

@@ -218,13 +218,9 @@ impl MatValue {
             MatValue::Vec1D(_) => "1-D vector",
             MatValue::Matrix { .. } => "2-D matrix",
             MatValue::String(_) => "string",
-            MatValue::ComplexScalar64 { .. } | MatValue::ComplexScalar32 { .. } => {
-                "complex scalar"
-            }
+            MatValue::ComplexScalar64 { .. } | MatValue::ComplexScalar32 { .. } => "complex scalar",
             MatValue::ComplexVec64(_) | MatValue::ComplexVec32(_) => "complex vector",
-            MatValue::ComplexMatrix64 { .. } | MatValue::ComplexMatrix32 { .. } => {
-                "complex matrix"
-            }
+            MatValue::ComplexMatrix64 { .. } | MatValue::ComplexMatrix32 { .. } => "complex matrix",
             MatValue::Struct(_) => "struct",
             MatValue::Cell(_) => "cell array",
             MatValue::EmptyStructArray => "empty struct array",

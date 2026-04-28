@@ -124,7 +124,11 @@ pub fn partition(
         lanes.clear();
         let mut start = 0;
         for i in 0..num_lanes {
-            let target = if i < extra { base_per_lane + 1 } else { base_per_lane };
+            let target = if i < extra {
+                base_per_lane + 1
+            } else {
+                base_per_lane
+            };
             lanes.push(all_items[start..start + target].to_vec());
             start += target;
         }
@@ -137,11 +141,7 @@ pub fn partition(
 ///
 /// `seed` should incorporate the dataset offset and chunk range so the
 /// assignment is deterministic per query.
-pub fn partition_chunks(
-    num_chunks: usize,
-    num_lanes: usize,
-    seed: u64,
-) -> Vec<Vec<usize>> {
+pub fn partition_chunks(num_chunks: usize, num_lanes: usize, seed: u64) -> Vec<Vec<usize>> {
     partition(num_chunks, num_lanes, seed, PartitionMode::WorkStealing)
 }
 
@@ -175,8 +175,18 @@ impl PartitionStats {
 
     /// Returns the max/min chunk count across lanes (imbalance metric).
     pub fn imbalance(&self) -> (usize, usize) {
-        let max = self.per_lane.iter().map(|s| s.chunks_processed).max().unwrap_or(0);
-        let min = self.per_lane.iter().map(|s| s.chunks_processed).min().unwrap_or(0);
+        let max = self
+            .per_lane
+            .iter()
+            .map(|s| s.chunks_processed)
+            .max()
+            .unwrap_or(0);
+        let min = self
+            .per_lane
+            .iter()
+            .map(|s| s.chunks_processed)
+            .min()
+            .unwrap_or(0);
         (max, min)
     }
 }

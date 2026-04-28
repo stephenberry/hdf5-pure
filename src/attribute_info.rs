@@ -30,8 +30,14 @@ fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
         2 => u16::from_le_bytes([data[pos], data[pos + 1]]) as u64,
         4 => u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as u64,
         8 => u64::from_le_bytes([
-            data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-            data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7],
+            data[pos],
+            data[pos + 1],
+            data[pos + 2],
+            data[pos + 3],
+            data[pos + 4],
+            data[pos + 5],
+            data[pos + 6],
+            data[pos + 7],
         ]),
         _ => return Err(FormatError::InvalidOffsetSize(size)),
     })

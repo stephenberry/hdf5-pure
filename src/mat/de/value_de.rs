@@ -333,12 +333,8 @@ fn dispatch_any<'de, V: Visitor<'de>>(value: MatValue, visitor: V) -> Result<V::
         MatValue::Matrix { rows, cols, vec } => {
             visitor.visit_seq(MatrixRowsSeq::new(rows, cols, vec))
         }
-        MatValue::ComplexScalar64 { re, im } => {
-            visitor.visit_map(ComplexStructMap64::new(re, im))
-        }
-        MatValue::ComplexScalar32 { re, im } => {
-            visitor.visit_map(ComplexStructMap32::new(re, im))
-        }
+        MatValue::ComplexScalar64 { re, im } => visitor.visit_map(ComplexStructMap64::new(re, im)),
+        MatValue::ComplexScalar32 { re, im } => visitor.visit_map(ComplexStructMap32::new(re, im)),
         MatValue::ComplexVec64(pairs) => {
             visitor.visit_seq(ComplexPairsSeq::Vec64(pairs.into_iter().collect()))
         }
@@ -361,7 +357,7 @@ fn dispatch_any<'de, V: Visitor<'de>>(value: MatValue, visitor: V) -> Result<V::
 // Helper coercions
 // ---------------------------------------------------------------------------
 
-fn mismatch<'de, T>(expected: &'static str, got: MatValue) -> Result<T, MatError> {
+fn mismatch<T>(expected: &'static str, got: MatValue) -> Result<T, MatError> {
     Err(MatError::Custom(format!(
         "expected {expected}, got {}",
         got.kind()
@@ -748,10 +744,7 @@ impl<'de> MapAccess<'de> for StructMap {
             None => Ok(None),
         }
     }
-    fn next_value_seed<V: DeserializeSeed<'de>>(
-        &mut self,
-        seed: V,
-    ) -> Result<V::Value, MatError> {
+    fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, MatError> {
         let v = self
             .pending_value
             .take()
@@ -828,10 +821,7 @@ impl<'de> MapAccess<'de> for MatrixStructMap {
         seed.deserialize(StringRefDe(key.to_string())).map(Some)
     }
 
-    fn next_value_seed<V: DeserializeSeed<'de>>(
-        &mut self,
-        seed: V,
-    ) -> Result<V::Value, MatError> {
+    fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, MatError> {
         match self.state {
             MatrixState::NeedRowsValue => {
                 self.state = MatrixState::NeedColsKey;
@@ -952,16 +942,8 @@ macro_rules! impl_complex_map {
     };
 }
 
-impl_complex_map!(
-    ComplexStructMap64,
-    f64,
-    |x: f64| x.into_deserializer()
-);
-impl_complex_map!(
-    ComplexStructMap32,
-    f32,
-    |x: f32| x.into_deserializer()
-);
+impl_complex_map!(ComplexStructMap64, f64, |x: f64| x.into_deserializer());
+impl_complex_map!(ComplexStructMap32, f32, |x: f32| x.into_deserializer());
 
 // ---------------------------------------------------------------------------
 // Enum unit variant

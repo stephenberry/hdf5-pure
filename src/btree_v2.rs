@@ -46,8 +46,14 @@ fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
         2 => u16::from_le_bytes([data[pos], data[pos + 1]]) as u64,
         4 => u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as u64,
         8 => u64::from_le_bytes([
-            data[pos], data[pos + 1], data[pos + 2], data[pos + 3],
-            data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7],
+            data[pos],
+            data[pos + 1],
+            data[pos + 2],
+            data[pos + 3],
+            data[pos + 4],
+            data[pos + 5],
+            data[pos + 6],
+            data[pos + 7],
         ]),
         _ => return Err(FormatError::InvalidOffsetSize(size)),
     })
@@ -119,8 +125,7 @@ impl BTreeV2Header {
         pos += offset_size as usize;
 
         ensure_len(file_data, pos, 2)?;
-        let num_records_in_root =
-            u16::from_le_bytes([file_data[pos], file_data[pos + 1]]);
+        let num_records_in_root = u16::from_le_bytes([file_data[pos], file_data[pos + 1]]);
         pos += 2;
 
         let total_records = read_offset(file_data, pos, length_size)?;
@@ -321,12 +326,8 @@ fn collect_internal_records(
     // We collect child[0] records, then record[0], then child[1], etc.
     for (i, &(child_addr, child_nrec)) in children.iter().enumerate() {
         if child_depth == 0 {
-            let leaf_recs = parse_leaf_records(
-                file_data,
-                child_addr as usize,
-                child_nrec,
-                record_size,
-            )?;
+            let leaf_recs =
+                parse_leaf_records(file_data, child_addr as usize, child_nrec, record_size)?;
             out.extend(leaf_recs);
         } else {
             collect_internal_records(

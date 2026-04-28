@@ -33,7 +33,10 @@ fn csr_triple_chunked_read() {
     let read_indptr = file.dataset("X/indptr").unwrap().read_i32().unwrap();
 
     assert_eq!(read_data, data, "X/data mismatch");
-    assert_eq!(read_indices, indices, "X/indices mismatch (first regression)");
+    assert_eq!(
+        read_indices, indices,
+        "X/indices mismatch (first regression)"
+    );
     assert_eq!(read_indptr, indptr, "X/indptr mismatch (second regression)");
 }
 

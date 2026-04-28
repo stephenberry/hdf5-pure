@@ -135,7 +135,10 @@ pub(crate) fn classify_datatype(dt: &crate::datatype::Datatype) -> DType {
             base_type,
             dimensions,
         } => DType::Array(Box::new(classify_datatype(base_type)), dimensions.clone()),
-        Datatype::Reference { ref_type: crate::datatype::ReferenceType::Object, .. } => DType::ObjectReference,
+        Datatype::Reference {
+            ref_type: crate::datatype::ReferenceType::Object,
+            ..
+        } => DType::ObjectReference,
         _ => DType::Other(format!("{dt:?}")),
     }
 }
@@ -155,7 +158,9 @@ pub(crate) fn attrs_to_map(
 ) -> HashMap<std::string::String, AttrValue> {
     let mut map = HashMap::new();
     for attr in attrs {
-        if let Some(val) = decode_attr_value(attr, file_data, offset_size, length_size, base_address) {
+        if let Some(val) =
+            decode_attr_value(attr, file_data, offset_size, length_size, base_address)
+        {
             map.insert(attr.name.clone(), val);
         }
     }
@@ -206,9 +211,11 @@ fn decode_attr_value(
                 Some(AttrValue::StringArray(strings))
             }
         }
-        Datatype::VariableLength { is_string, base_type, .. }
-            if *is_string || is_ascii_char_vlen_base(base_type) =>
-        {
+        Datatype::VariableLength {
+            is_string,
+            base_type,
+            ..
+        } if *is_string || is_ascii_char_vlen_base(base_type) => {
             // Two MATLAB-relevant encodings share the same on-disk byte
             // layout (length + heap ref + object index per element; heap
             // object holds raw bytes without terminator):
@@ -274,8 +281,14 @@ fn rebase_vl_refs(raw_data: &[u8], offset_size: u8, base_address: u64) -> Vec<u8
                 out[addr_start + 3],
             ]) as u64,
             8 => u64::from_le_bytes([
-                out[addr_start], out[addr_start + 1], out[addr_start + 2], out[addr_start + 3],
-                out[addr_start + 4], out[addr_start + 5], out[addr_start + 6], out[addr_start + 7],
+                out[addr_start],
+                out[addr_start + 1],
+                out[addr_start + 2],
+                out[addr_start + 3],
+                out[addr_start + 4],
+                out[addr_start + 5],
+                out[addr_start + 6],
+                out[addr_start + 7],
             ]),
             _ => return raw_data.to_vec(),
         };

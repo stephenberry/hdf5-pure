@@ -68,10 +68,7 @@ fn emit_at_struct(sw: &mut StructWriter, name: &str, value: MatValue) -> Result<
     }
 }
 
-fn emit_cell_elements(
-    cw: &mut CellWriter,
-    elements: Vec<MatValue>,
-) -> Result<(), MatError> {
+fn emit_cell_elements(cw: &mut CellWriter, elements: Vec<MatValue>) -> Result<(), MatError> {
     for value in elements {
         emit_cell_element(cw, value)?;
     }
@@ -252,11 +249,7 @@ fn emit_cell_matrix(
     Ok(())
 }
 
-fn emit_leaf_at_builder(
-    mb: &mut MatBuilder,
-    name: &str,
-    value: MatValue,
-) -> Result<(), MatError> {
+fn emit_leaf_at_builder(mb: &mut MatBuilder, name: &str, value: MatValue) -> Result<(), MatError> {
     match value {
         MatValue::Omit | MatValue::Struct(_) | MatValue::Cell(_) => {
             // Handled by the caller.
@@ -280,21 +273,19 @@ fn emit_leaf_at_builder(
             .map(|_| ()),
         MatValue::ComplexMatrix64 { rows, cols, pairs } => {
             let col_major = transpose_pairs(rows, cols, &pairs);
-            mb.write_complex_f64(name, &[rows, cols], &col_major).map(|_| ())
+            mb.write_complex_f64(name, &[rows, cols], &col_major)
+                .map(|_| ())
         }
         MatValue::ComplexMatrix32 { rows, cols, pairs } => {
             let col_major = transpose_pairs(rows, cols, &pairs);
-            mb.write_complex_f32(name, &[rows, cols], &col_major).map(|_| ())
+            mb.write_complex_f32(name, &[rows, cols], &col_major)
+                .map(|_| ())
         }
         MatValue::EmptyStructArray => mb.write_empty_struct_array(name).map(|_| ()),
     }
 }
 
-fn emit_leaf_at_struct(
-    sw: &mut StructWriter,
-    name: &str,
-    value: MatValue,
-) -> Result<(), MatError> {
+fn emit_leaf_at_struct(sw: &mut StructWriter, name: &str, value: MatValue) -> Result<(), MatError> {
     match value {
         MatValue::Omit | MatValue::Struct(_) | MatValue::Cell(_) => Ok(()),
         MatValue::Scalar(n) => emit_scalar_at_struct(sw, name, n),
@@ -315,11 +306,13 @@ fn emit_leaf_at_struct(
             .map(|_| ()),
         MatValue::ComplexMatrix64 { rows, cols, pairs } => {
             let col_major = transpose_pairs(rows, cols, &pairs);
-            sw.write_complex_f64(name, &[rows, cols], &col_major).map(|_| ())
+            sw.write_complex_f64(name, &[rows, cols], &col_major)
+                .map(|_| ())
         }
         MatValue::ComplexMatrix32 { rows, cols, pairs } => {
             let col_major = transpose_pairs(rows, cols, &pairs);
-            sw.write_complex_f32(name, &[rows, cols], &col_major).map(|_| ())
+            sw.write_complex_f32(name, &[rows, cols], &col_major)
+                .map(|_| ())
         }
         MatValue::EmptyStructArray => sw.write_empty_struct_array(name).map(|_| ()),
     }
@@ -370,7 +363,9 @@ fn emit_scalar_at_struct(
 fn emit_vec_at_builder(mb: &mut MatBuilder, name: &str, v: NumVec) -> Result<(), MatError> {
     let dims = mb.vector_dims(v.len());
     if v.len() == 0 {
-        return mb.write_empty(name, scalar_class(v.tag()), &dims).map(|_| ());
+        return mb
+            .write_empty(name, scalar_class(v.tag()), &dims)
+            .map(|_| ());
     }
     match v {
         NumVec::Bool(vec) => {
@@ -394,7 +389,9 @@ fn emit_vec_at_builder(mb: &mut MatBuilder, name: &str, v: NumVec) -> Result<(),
 fn emit_vec_at_struct(sw: &mut StructWriter, name: &str, v: NumVec) -> Result<(), MatError> {
     let dims = sw.vector_dims(v.len());
     if v.len() == 0 {
-        return sw.write_empty(name, scalar_class(v.tag()), &dims).map(|_| ());
+        return sw
+            .write_empty(name, scalar_class(v.tag()), &dims)
+            .map(|_| ());
     }
     match v {
         NumVec::Bool(vec) => {
@@ -471,22 +468,16 @@ fn emit_matrix_at_struct(
     .map(|_| ())
 }
 
-fn emit_string_at_builder(
-    mb: &mut MatBuilder,
-    name: &str,
-    s: &str,
-) -> Result<(), MatError> {
+fn emit_string_at_builder(mb: &mut MatBuilder, name: &str, s: &str) -> Result<(), MatError> {
     match mb.options().string_class {
         StringClass::Char => mb.write_char(name, s).map(|_| ()),
-        StringClass::String => mb.write_string_object(name, &[s.to_owned()], &[1, 1]).map(|_| ()),
+        StringClass::String => mb
+            .write_string_object(name, &[s.to_owned()], &[1, 1])
+            .map(|_| ()),
     }
 }
 
-fn emit_string_at_struct(
-    sw: &mut StructWriter,
-    name: &str,
-    s: &str,
-) -> Result<(), MatError> {
+fn emit_string_at_struct(sw: &mut StructWriter, name: &str, s: &str) -> Result<(), MatError> {
     match sw.string_class() {
         StringClass::Char => sw.write_char(name, s).map(|_| ()),
         StringClass::String => sw

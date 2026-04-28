@@ -60,10 +60,7 @@ fn roundtrip_with_attributes() {
 
     let ds = file.dataset("data").unwrap();
     let ds_attrs = ds.attrs().unwrap();
-    assert_eq!(
-        ds_attrs.get("unit"),
-        Some(&AttrValue::String("m/s".into()))
-    );
+    assert_eq!(ds_attrs.get("unit"), Some(&AttrValue::String("m/s".into())));
 }
 
 #[test]
@@ -96,21 +93,24 @@ fn roundtrip_group_with_dataset() {
 #[test]
 fn roundtrip_multiple_datasets() {
     let mut builder = FileBuilder::new();
-    builder
-        .create_dataset("x")
-        .with_f64_data(&[1.0, 2.0, 3.0]);
-    builder
-        .create_dataset("y")
-        .with_f64_data(&[4.0, 5.0, 6.0]);
-    builder
-        .create_dataset("z")
-        .with_i32_data(&[7, 8, 9]);
+    builder.create_dataset("x").with_f64_data(&[1.0, 2.0, 3.0]);
+    builder.create_dataset("y").with_f64_data(&[4.0, 5.0, 6.0]);
+    builder.create_dataset("z").with_i32_data(&[7, 8, 9]);
     let bytes = builder.finish().unwrap();
 
     let file = File::from_bytes(bytes).unwrap();
-    assert_eq!(file.dataset("x").unwrap().read_f64().unwrap(), vec![1.0, 2.0, 3.0]);
-    assert_eq!(file.dataset("y").unwrap().read_f64().unwrap(), vec![4.0, 5.0, 6.0]);
-    assert_eq!(file.dataset("z").unwrap().read_i32().unwrap(), vec![7, 8, 9]);
+    assert_eq!(
+        file.dataset("x").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0]
+    );
+    assert_eq!(
+        file.dataset("y").unwrap().read_f64().unwrap(),
+        vec![4.0, 5.0, 6.0]
+    );
+    assert_eq!(
+        file.dataset("z").unwrap().read_i32().unwrap(),
+        vec![7, 8, 9]
+    );
 }
 
 #[test]
@@ -119,13 +119,14 @@ fn roundtrip_write_to_file() {
     let path = dir.path().join("test.h5");
 
     let mut builder = FileBuilder::new();
-    builder
-        .create_dataset("data")
-        .with_f64_data(&[1.0, 2.0]);
+    builder.create_dataset("data").with_f64_data(&[1.0, 2.0]);
     builder.write(&path).unwrap();
 
     let file = File::open(&path).unwrap();
-    assert_eq!(file.dataset("data").unwrap().read_f64().unwrap(), vec![1.0, 2.0]);
+    assert_eq!(
+        file.dataset("data").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0]
+    );
 }
 
 #[test]
@@ -234,7 +235,9 @@ fn roundtrip_compound_complex64() {
 fn roundtrip_userblock_512() {
     let mut builder = FileBuilder::new();
     builder.with_userblock(512);
-    builder.create_dataset("data").with_f64_data(&[1.0, 2.0, 3.0]);
+    builder
+        .create_dataset("data")
+        .with_f64_data(&[1.0, 2.0, 3.0]);
     let mut bytes = builder.finish().unwrap();
 
     // Verify userblock is at the start (512 zero bytes)
@@ -261,7 +264,9 @@ fn roundtrip_nested_groups() {
     outer.create_dataset("outer_data").with_f64_data(&[1.0]);
 
     let mut inner = outer.create_group("inner");
-    inner.create_dataset("inner_data").with_f64_data(&[2.0, 3.0]);
+    inner
+        .create_dataset("inner_data")
+        .with_f64_data(&[2.0, 3.0]);
     inner.set_attr("depth", AttrValue::I64(2));
     outer.add_group(inner.finish());
 
@@ -375,8 +380,12 @@ fn roundtrip_path_references() {
 
     // Create #refs# group with two child datasets
     let mut refs_grp = builder.create_group("#refs#");
-    refs_grp.create_dataset("child_a").with_f64_data(&[1.0, 2.0]);
-    refs_grp.create_dataset("child_b").with_i32_data(&[10, 20, 30]);
+    refs_grp
+        .create_dataset("child_a")
+        .with_f64_data(&[1.0, 2.0]);
+    refs_grp
+        .create_dataset("child_b")
+        .with_i32_data(&[10, 20, 30]);
     builder.add_group(refs_grp.finish());
 
     // Create a reference dataset pointing to those children by path
@@ -523,8 +532,12 @@ fn roundtrip_matlab_refs_subsystem_pattern() {
     let mut refs_grp = builder.create_group("#refs#");
 
     // String-value datasets (simulating MATLAB string objects)
-    refs_grp.create_dataset("a").with_u16_data(&[72, 101, 108, 108, 111]); // "Hello" UTF-16
-    refs_grp.create_dataset("b").with_u16_data(&[87, 111, 114, 108, 100]); // "World"
+    refs_grp
+        .create_dataset("a")
+        .with_u16_data(&[72, 101, 108, 108, 111]); // "Hello" UTF-16
+    refs_grp
+        .create_dataset("b")
+        .with_u16_data(&[87, 111, 114, 108, 100]); // "World"
     refs_grp.create_dataset("c").with_u16_data(&[70, 111, 111]); // "Foo"
 
     // A child dataset that itself references siblings (cross-references within #refs#)
@@ -619,8 +632,14 @@ fn roundtrip_varlen_ascii_on_nested_group() {
     assert!(datasets.contains(&"y".to_string()));
 
     // Verify data
-    assert_eq!(file.dataset("my_struct/x").unwrap().read_f64().unwrap(), vec![1.0, 2.0]);
-    assert_eq!(file.dataset("my_struct/y").unwrap().read_f64().unwrap(), vec![3.0, 4.0]);
+    assert_eq!(
+        file.dataset("my_struct/x").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0]
+    );
+    assert_eq!(
+        file.dataset("my_struct/y").unwrap().read_f64().unwrap(),
+        vec![3.0, 4.0]
+    );
 }
 
 #[test]
@@ -653,6 +672,12 @@ fn roundtrip_group_only_no_datasets() {
     assert!(groups.contains(&"b".to_string()));
     assert_eq!(outer_grp.datasets().unwrap().len(), 0);
 
-    assert_eq!(file.dataset("outer/a/val").unwrap().read_f64().unwrap(), vec![1.0]);
-    assert_eq!(file.dataset("outer/b/val").unwrap().read_i32().unwrap(), vec![42]);
+    assert_eq!(
+        file.dataset("outer/a/val").unwrap().read_f64().unwrap(),
+        vec![1.0]
+    );
+    assert_eq!(
+        file.dataset("outer/b/val").unwrap().read_i32().unwrap(),
+        vec![42]
+    );
 }

@@ -524,13 +524,24 @@ macro_rules! impl_lift {
             let mut y = p[1];
             let mut z = p[2];
             let mut w = p[3];
-            x = x.wrapping_add(w); x >>= 1; w = w.wrapping_sub(x);
-            z = z.wrapping_add(y); z >>= 1; y = y.wrapping_sub(z);
-            x = x.wrapping_add(z); x >>= 1; z = z.wrapping_sub(x);
-            w = w.wrapping_add(y); w >>= 1; y = y.wrapping_sub(w);
+            x = x.wrapping_add(w);
+            x >>= 1;
+            w = w.wrapping_sub(x);
+            z = z.wrapping_add(y);
+            z >>= 1;
+            y = y.wrapping_sub(z);
+            x = x.wrapping_add(z);
+            x >>= 1;
+            z = z.wrapping_sub(x);
+            w = w.wrapping_add(y);
+            w >>= 1;
+            y = y.wrapping_sub(w);
             w = w.wrapping_add(y >> 1);
             y = y.wrapping_sub(w >> 1);
-            p[0] = x; p[1] = y; p[2] = z; p[3] = w;
+            p[0] = x;
+            p[1] = y;
+            p[2] = z;
+            p[3] = w;
         }
         #[allow(clippy::many_single_char_names)]
         fn $inv(p: &mut [$int; BLOCK_SIZE]) {
@@ -540,11 +551,22 @@ macro_rules! impl_lift {
             let mut w = p[3];
             y = y.wrapping_add(w >> 1);
             w = w.wrapping_sub(y >> 1);
-            y = y.wrapping_add(w); w <<= 1; w = w.wrapping_sub(y);
-            z = z.wrapping_add(x); x <<= 1; x = x.wrapping_sub(z);
-            y = y.wrapping_add(z); z <<= 1; z = z.wrapping_sub(y);
-            w = w.wrapping_add(x); x <<= 1; x = x.wrapping_sub(w);
-            p[0] = x; p[1] = y; p[2] = z; p[3] = w;
+            y = y.wrapping_add(w);
+            w <<= 1;
+            w = w.wrapping_sub(y);
+            z = z.wrapping_add(x);
+            x <<= 1;
+            x = x.wrapping_sub(z);
+            y = y.wrapping_add(z);
+            z <<= 1;
+            z = z.wrapping_sub(y);
+            w = w.wrapping_add(x);
+            x <<= 1;
+            x = x.wrapping_sub(w);
+            p[0] = x;
+            p[1] = y;
+            p[2] = z;
+            p[3] = w;
         }
     };
 }
@@ -619,67 +641,141 @@ macro_rules! impl_nd_xform {
     ($fwd2:ident, $inv2:ident, $fwd3:ident, $inv3:ident, $fwd4:ident, $inv4:ident,
      $fwd_axis:ident, $inv_axis:ident, $int:ty) => {
         fn $fwd2(block: &mut [$int; 16]) {
-            for y in 0..4 { $fwd_axis(block.as_mut_slice(), 4 * y, 1); }
-            for x in 0..4 { $fwd_axis(block.as_mut_slice(), x, 4); }
+            for y in 0..4 {
+                $fwd_axis(block.as_mut_slice(), 4 * y, 1);
+            }
+            for x in 0..4 {
+                $fwd_axis(block.as_mut_slice(), x, 4);
+            }
         }
         fn $inv2(block: &mut [$int; 16]) {
-            for x in 0..4 { $inv_axis(block.as_mut_slice(), x, 4); }
-            for y in 0..4 { $inv_axis(block.as_mut_slice(), 4 * y, 1); }
+            for x in 0..4 {
+                $inv_axis(block.as_mut_slice(), x, 4);
+            }
+            for y in 0..4 {
+                $inv_axis(block.as_mut_slice(), 4 * y, 1);
+            }
         }
 
         fn $fwd3(block: &mut [$int; 64]) {
-            for z in 0..4 { for y in 0..4 { $fwd_axis(block.as_mut_slice(), 16 * z + 4 * y, 1); } }
-            for z in 0..4 { for x in 0..4 { $fwd_axis(block.as_mut_slice(), 16 * z + x, 4); } }
-            for y in 0..4 { for x in 0..4 { $fwd_axis(block.as_mut_slice(), 4 * y + x, 16); } }
+            for z in 0..4 {
+                for y in 0..4 {
+                    $fwd_axis(block.as_mut_slice(), 16 * z + 4 * y, 1);
+                }
+            }
+            for z in 0..4 {
+                for x in 0..4 {
+                    $fwd_axis(block.as_mut_slice(), 16 * z + x, 4);
+                }
+            }
+            for y in 0..4 {
+                for x in 0..4 {
+                    $fwd_axis(block.as_mut_slice(), 4 * y + x, 16);
+                }
+            }
         }
         fn $inv3(block: &mut [$int; 64]) {
-            for y in 0..4 { for x in 0..4 { $inv_axis(block.as_mut_slice(), 4 * y + x, 16); } }
-            for z in 0..4 { for x in 0..4 { $inv_axis(block.as_mut_slice(), 16 * z + x, 4); } }
-            for z in 0..4 { for y in 0..4 { $inv_axis(block.as_mut_slice(), 16 * z + 4 * y, 1); } }
+            for y in 0..4 {
+                for x in 0..4 {
+                    $inv_axis(block.as_mut_slice(), 4 * y + x, 16);
+                }
+            }
+            for z in 0..4 {
+                for x in 0..4 {
+                    $inv_axis(block.as_mut_slice(), 16 * z + x, 4);
+                }
+            }
+            for z in 0..4 {
+                for y in 0..4 {
+                    $inv_axis(block.as_mut_slice(), 16 * z + 4 * y, 1);
+                }
+            }
         }
 
         fn $fwd4(block: &mut [$int; 256]) {
-            for w in 0..4 { for z in 0..4 { for y in 0..4 {
-                $fwd_axis(block.as_mut_slice(), 64 * w + 16 * z + 4 * y, 1);
-            } } }
-            for w in 0..4 { for z in 0..4 { for x in 0..4 {
-                $fwd_axis(block.as_mut_slice(), 64 * w + 16 * z + x, 4);
-            } } }
-            for w in 0..4 { for y in 0..4 { for x in 0..4 {
-                $fwd_axis(block.as_mut_slice(), 64 * w + 4 * y + x, 16);
-            } } }
-            for z in 0..4 { for y in 0..4 { for x in 0..4 {
-                $fwd_axis(block.as_mut_slice(), 16 * z + 4 * y + x, 64);
-            } } }
+            for w in 0..4 {
+                for z in 0..4 {
+                    for y in 0..4 {
+                        $fwd_axis(block.as_mut_slice(), 64 * w + 16 * z + 4 * y, 1);
+                    }
+                }
+            }
+            for w in 0..4 {
+                for z in 0..4 {
+                    for x in 0..4 {
+                        $fwd_axis(block.as_mut_slice(), 64 * w + 16 * z + x, 4);
+                    }
+                }
+            }
+            for w in 0..4 {
+                for y in 0..4 {
+                    for x in 0..4 {
+                        $fwd_axis(block.as_mut_slice(), 64 * w + 4 * y + x, 16);
+                    }
+                }
+            }
+            for z in 0..4 {
+                for y in 0..4 {
+                    for x in 0..4 {
+                        $fwd_axis(block.as_mut_slice(), 16 * z + 4 * y + x, 64);
+                    }
+                }
+            }
         }
         fn $inv4(block: &mut [$int; 256]) {
-            for z in 0..4 { for y in 0..4 { for x in 0..4 {
-                $inv_axis(block.as_mut_slice(), 16 * z + 4 * y + x, 64);
-            } } }
-            for w in 0..4 { for y in 0..4 { for x in 0..4 {
-                $inv_axis(block.as_mut_slice(), 64 * w + 4 * y + x, 16);
-            } } }
-            for w in 0..4 { for z in 0..4 { for x in 0..4 {
-                $inv_axis(block.as_mut_slice(), 64 * w + 16 * z + x, 4);
-            } } }
-            for w in 0..4 { for z in 0..4 { for y in 0..4 {
-                $inv_axis(block.as_mut_slice(), 64 * w + 16 * z + 4 * y, 1);
-            } } }
+            for z in 0..4 {
+                for y in 0..4 {
+                    for x in 0..4 {
+                        $inv_axis(block.as_mut_slice(), 16 * z + 4 * y + x, 64);
+                    }
+                }
+            }
+            for w in 0..4 {
+                for y in 0..4 {
+                    for x in 0..4 {
+                        $inv_axis(block.as_mut_slice(), 64 * w + 4 * y + x, 16);
+                    }
+                }
+            }
+            for w in 0..4 {
+                for z in 0..4 {
+                    for x in 0..4 {
+                        $inv_axis(block.as_mut_slice(), 64 * w + 16 * z + x, 4);
+                    }
+                }
+            }
+            for w in 0..4 {
+                for z in 0..4 {
+                    for y in 0..4 {
+                        $inv_axis(block.as_mut_slice(), 64 * w + 16 * z + 4 * y, 1);
+                    }
+                }
+            }
         }
     };
 }
 
 impl_nd_xform!(
-    fwd_xform_i32_2d, inv_xform_i32_2d,
-    fwd_xform_i32_3d, inv_xform_i32_3d,
-    fwd_xform_i32_4d, inv_xform_i32_4d,
-    fwd_lift_axis_i32, inv_lift_axis_i32, i32
+    fwd_xform_i32_2d,
+    inv_xform_i32_2d,
+    fwd_xform_i32_3d,
+    inv_xform_i32_3d,
+    fwd_xform_i32_4d,
+    inv_xform_i32_4d,
+    fwd_lift_axis_i32,
+    inv_lift_axis_i32,
+    i32
 );
 impl_nd_xform!(
-    fwd_xform_i64_2d, inv_xform_i64_2d,
-    fwd_xform_i64_3d, inv_xform_i64_3d,
-    fwd_xform_i64_4d, inv_xform_i64_4d,
-    fwd_lift_axis_i64, inv_lift_axis_i64, i64
+    fwd_xform_i64_2d,
+    inv_xform_i64_2d,
+    fwd_xform_i64_3d,
+    inv_xform_i64_3d,
+    fwd_xform_i64_4d,
+    inv_xform_i64_4d,
+    fwd_lift_axis_i64,
+    inv_lift_axis_i64,
+    i64
 );
 
 // ---------------------------------------------------------------------------
@@ -688,34 +784,28 @@ impl_nd_xform!(
 // Ordered by polynomial degree / frequency (low-frequency first).
 // ---------------------------------------------------------------------------
 
-const PERM_2: [u8; 16] = [
-    0, 1, 4, 5, 2, 8, 6, 9, 3, 12, 10, 7, 13, 11, 14, 15,
-];
+const PERM_2: [u8; 16] = [0, 1, 4, 5, 2, 8, 6, 9, 3, 12, 10, 7, 13, 11, 14, 15];
 
 const PERM_3: [u8; 64] = [
-    0, 1, 4, 16, 20, 17, 5, 2, 8, 32, 21, 6, 18, 24, 9, 33,
-    36, 3, 12, 48, 22, 25, 37, 40, 34, 10, 7, 19, 28, 13, 49, 52,
-    41, 38, 26, 23, 29, 53, 11, 35, 44, 14, 50, 56, 42, 27, 39, 45,
-    30, 54, 57, 60, 51, 15, 43, 46, 58, 61, 55, 31, 62, 59, 47, 63,
+    0, 1, 4, 16, 20, 17, 5, 2, 8, 32, 21, 6, 18, 24, 9, 33, 36, 3, 12, 48, 22, 25, 37, 40, 34, 10,
+    7, 19, 28, 13, 49, 52, 41, 38, 26, 23, 29, 53, 11, 35, 44, 14, 50, 56, 42, 27, 39, 45, 30, 54,
+    57, 60, 51, 15, 43, 46, 58, 61, 55, 31, 62, 59, 47, 63,
 ];
 
 const PERM_4: [u8; 256] = [
-    0, 1, 4, 16, 64, 5, 80, 17, 68, 65, 20, 2, 8, 32, 128, 84,
-    81, 69, 21, 6, 18, 66, 24, 72, 9, 96, 33, 36, 129, 132, 144, 3,
-    12, 48, 192, 85, 82, 70, 22, 73, 25, 88, 37, 100, 97, 148, 145, 133,
-    10, 160, 34, 136, 130, 40, 7, 19, 67, 28, 76, 13, 112, 49, 52, 193,
-    196, 208, 86, 89, 101, 149, 161, 137, 41, 134, 38, 164, 26, 152, 146, 104,
-    98, 74, 83, 71, 23, 77, 29, 92, 53, 116, 113, 212, 209, 197, 11, 35,
-    131, 44, 140, 14, 176, 50, 56, 194, 200, 224, 90, 165, 102, 153, 150, 105,
-    168, 162, 138, 42, 87, 93, 117, 213, 27, 75, 99, 39, 135, 147, 108, 45,
-    141, 156, 30, 78, 177, 180, 54, 114, 120, 57, 198, 210, 216, 201, 225, 228,
-    15, 240, 51, 204, 195, 60, 169, 166, 154, 106, 91, 103, 151, 109, 157, 94,
-    181, 118, 121, 214, 217, 229, 163, 139, 43, 142, 46, 172, 58, 184, 178, 232,
-    226, 202, 241, 205, 61, 199, 55, 244, 31, 220, 211, 124, 115, 79, 170, 167,
-    155, 107, 158, 110, 173, 122, 185, 182, 233, 230, 218, 95, 245, 119, 221, 215,
-    125, 242, 206, 62, 203, 59, 248, 47, 236, 227, 188, 179, 143, 171, 174, 186,
-    234, 246, 222, 126, 219, 123, 249, 111, 237, 231, 189, 183, 159, 252, 243, 207,
-    63, 175, 250, 187, 238, 235, 190, 253, 247, 223, 127, 254, 251, 239, 191, 255,
+    0, 1, 4, 16, 64, 5, 80, 17, 68, 65, 20, 2, 8, 32, 128, 84, 81, 69, 21, 6, 18, 66, 24, 72, 9,
+    96, 33, 36, 129, 132, 144, 3, 12, 48, 192, 85, 82, 70, 22, 73, 25, 88, 37, 100, 97, 148, 145,
+    133, 10, 160, 34, 136, 130, 40, 7, 19, 67, 28, 76, 13, 112, 49, 52, 193, 196, 208, 86, 89, 101,
+    149, 161, 137, 41, 134, 38, 164, 26, 152, 146, 104, 98, 74, 83, 71, 23, 77, 29, 92, 53, 116,
+    113, 212, 209, 197, 11, 35, 131, 44, 140, 14, 176, 50, 56, 194, 200, 224, 90, 165, 102, 153,
+    150, 105, 168, 162, 138, 42, 87, 93, 117, 213, 27, 75, 99, 39, 135, 147, 108, 45, 141, 156, 30,
+    78, 177, 180, 54, 114, 120, 57, 198, 210, 216, 201, 225, 228, 15, 240, 51, 204, 195, 60, 169,
+    166, 154, 106, 91, 103, 151, 109, 157, 94, 181, 118, 121, 214, 217, 229, 163, 139, 43, 142, 46,
+    172, 58, 184, 178, 232, 226, 202, 241, 205, 61, 199, 55, 244, 31, 220, 211, 124, 115, 79, 170,
+    167, 155, 107, 158, 110, 173, 122, 185, 182, 233, 230, 218, 95, 245, 119, 221, 215, 125, 242,
+    206, 62, 203, 59, 248, 47, 236, 227, 188, 179, 143, 171, 174, 186, 234, 246, 222, 126, 219,
+    123, 249, 111, 237, 231, 189, 183, 159, 252, 243, 207, 63, 175, 250, 187, 238, 235, 190, 253,
+    247, 223, 127, 254, 251, 239, 191, 255,
 ];
 
 // ---------------------------------------------------------------------------
@@ -1134,10 +1224,7 @@ macro_rules! impl_int_block_codec {
             let used = w.position() - start;
             pad_bits(w, maxbits.saturating_sub(used));
         }
-        fn $dec(
-            r: &mut BitReader<'_>,
-            maxbits: usize,
-        ) -> Result<[$int; BLOCK_SIZE], FormatError> {
+        fn $dec(r: &mut BitReader<'_>, maxbits: usize) -> Result<[$int; BLOCK_SIZE], FormatError> {
             let mut ucoeffs = [0 as $uint; BLOCK_SIZE];
             let bits_consumed = $dec_ints(r, maxbits, $intprec, &mut ucoeffs, BLOCK_SIZE);
             skip_bits(r, maxbits.saturating_sub(bits_consumed));
@@ -1152,14 +1239,30 @@ macro_rules! impl_int_block_codec {
 }
 
 impl_int_block_codec!(
-    encode_block_i32, decode_block_i32,
-    i32, u32, fwd_lift_i32, inv_lift_i32, int2uint_i32, uint2int_i32,
-    encode_few_ints_u32, decode_few_ints_u32, 32u32
+    encode_block_i32,
+    decode_block_i32,
+    i32,
+    u32,
+    fwd_lift_i32,
+    inv_lift_i32,
+    int2uint_i32,
+    uint2int_i32,
+    encode_few_ints_u32,
+    decode_few_ints_u32,
+    32u32
 );
 impl_int_block_codec!(
-    encode_block_i64, decode_block_i64,
-    i64, u64, fwd_lift_i64, inv_lift_i64, int2uint_i64, uint2int_i64,
-    encode_few_ints_u64, decode_few_ints_u64, 64u32
+    encode_block_i64,
+    decode_block_i64,
+    i64,
+    u64,
+    fwd_lift_i64,
+    inv_lift_i64,
+    int2uint_i64,
+    uint2int_i64,
+    encode_few_ints_u64,
+    decode_few_ints_u64,
+    64u32
 );
 
 // ---------------------------------------------------------------------------
@@ -1199,10 +1302,7 @@ macro_rules! impl_float_block_nd {
             pad_bits(w, maxbits.saturating_sub(used));
         }
 
-        fn $dec(
-            r: &mut BitReader<'_>,
-            maxbits: usize,
-        ) -> Result<[$scalar; $bs], FormatError> {
+        fn $dec(r: &mut BitReader<'_>, maxbits: usize) -> Result<[$scalar; $bs], FormatError> {
             let nonempty = r.read_bit();
             if !nonempty {
                 let remaining = maxbits.saturating_sub(1);
@@ -1245,10 +1345,7 @@ macro_rules! impl_int_block_nd {
             let used = w.position() - start;
             pad_bits(w, maxbits.saturating_sub(used));
         }
-        fn $dec(
-            r: &mut BitReader<'_>,
-            maxbits: usize,
-        ) -> Result<[$int; $bs], FormatError> {
+        fn $dec(r: &mut BitReader<'_>, maxbits: usize) -> Result<[$int; $bs], FormatError> {
             let mut ucoeffs = [0 as $uint; $bs];
             let bits_consumed = $dec_ints(r, maxbits, $intprec, &mut ucoeffs, $bs);
             skip_bits(r, maxbits.saturating_sub(bits_consumed));
@@ -1264,74 +1361,230 @@ macro_rules! impl_int_block_nd {
 
 // 2D block codec (16 coefs).
 impl_float_block_nd!(
-    encode_block_f32_2d, decode_block_f32_2d, 16, f32, i32, u32, 0.0f32,
-    fwd_cast_f32_slice, inv_cast_f32_slice, fwd_xform_i32_2d, inv_xform_i32_2d,
-    int2uint_i32, uint2int_i32, PERM_2,
-    encode_few_ints_u32, decode_few_ints_u32, 32u32, EBITS_F32, u32
+    encode_block_f32_2d,
+    decode_block_f32_2d,
+    16,
+    f32,
+    i32,
+    u32,
+    0.0f32,
+    fwd_cast_f32_slice,
+    inv_cast_f32_slice,
+    fwd_xform_i32_2d,
+    inv_xform_i32_2d,
+    int2uint_i32,
+    uint2int_i32,
+    PERM_2,
+    encode_few_ints_u32,
+    decode_few_ints_u32,
+    32u32,
+    EBITS_F32,
+    u32
 );
 impl_float_block_nd!(
-    encode_block_f64_2d, decode_block_f64_2d, 16, f64, i64, u64, 0.0f64,
-    fwd_cast_f64_slice, inv_cast_f64_slice, fwd_xform_i64_2d, inv_xform_i64_2d,
-    int2uint_i64, uint2int_i64, PERM_2,
-    encode_few_ints_u64, decode_few_ints_u64, 64u32, EBITS_F64, u64
+    encode_block_f64_2d,
+    decode_block_f64_2d,
+    16,
+    f64,
+    i64,
+    u64,
+    0.0f64,
+    fwd_cast_f64_slice,
+    inv_cast_f64_slice,
+    fwd_xform_i64_2d,
+    inv_xform_i64_2d,
+    int2uint_i64,
+    uint2int_i64,
+    PERM_2,
+    encode_few_ints_u64,
+    decode_few_ints_u64,
+    64u32,
+    EBITS_F64,
+    u64
 );
 impl_int_block_nd!(
-    encode_block_i32_2d, decode_block_i32_2d, 16, i32, u32, 0i32,
-    fwd_xform_i32_2d, inv_xform_i32_2d, int2uint_i32, uint2int_i32, PERM_2,
-    encode_few_ints_u32, decode_few_ints_u32, 32u32
+    encode_block_i32_2d,
+    decode_block_i32_2d,
+    16,
+    i32,
+    u32,
+    0i32,
+    fwd_xform_i32_2d,
+    inv_xform_i32_2d,
+    int2uint_i32,
+    uint2int_i32,
+    PERM_2,
+    encode_few_ints_u32,
+    decode_few_ints_u32,
+    32u32
 );
 impl_int_block_nd!(
-    encode_block_i64_2d, decode_block_i64_2d, 16, i64, u64, 0i64,
-    fwd_xform_i64_2d, inv_xform_i64_2d, int2uint_i64, uint2int_i64, PERM_2,
-    encode_few_ints_u64, decode_few_ints_u64, 64u32
+    encode_block_i64_2d,
+    decode_block_i64_2d,
+    16,
+    i64,
+    u64,
+    0i64,
+    fwd_xform_i64_2d,
+    inv_xform_i64_2d,
+    int2uint_i64,
+    uint2int_i64,
+    PERM_2,
+    encode_few_ints_u64,
+    decode_few_ints_u64,
+    64u32
 );
 
 // 3D block codec (64 coefs).
 impl_float_block_nd!(
-    encode_block_f32_3d, decode_block_f32_3d, 64, f32, i32, u32, 0.0f32,
-    fwd_cast_f32_slice, inv_cast_f32_slice, fwd_xform_i32_3d, inv_xform_i32_3d,
-    int2uint_i32, uint2int_i32, PERM_3,
-    encode_few_ints_u32, decode_few_ints_u32, 32u32, EBITS_F32, u32
+    encode_block_f32_3d,
+    decode_block_f32_3d,
+    64,
+    f32,
+    i32,
+    u32,
+    0.0f32,
+    fwd_cast_f32_slice,
+    inv_cast_f32_slice,
+    fwd_xform_i32_3d,
+    inv_xform_i32_3d,
+    int2uint_i32,
+    uint2int_i32,
+    PERM_3,
+    encode_few_ints_u32,
+    decode_few_ints_u32,
+    32u32,
+    EBITS_F32,
+    u32
 );
 impl_float_block_nd!(
-    encode_block_f64_3d, decode_block_f64_3d, 64, f64, i64, u64, 0.0f64,
-    fwd_cast_f64_slice, inv_cast_f64_slice, fwd_xform_i64_3d, inv_xform_i64_3d,
-    int2uint_i64, uint2int_i64, PERM_3,
-    encode_few_ints_u64, decode_few_ints_u64, 64u32, EBITS_F64, u64
+    encode_block_f64_3d,
+    decode_block_f64_3d,
+    64,
+    f64,
+    i64,
+    u64,
+    0.0f64,
+    fwd_cast_f64_slice,
+    inv_cast_f64_slice,
+    fwd_xform_i64_3d,
+    inv_xform_i64_3d,
+    int2uint_i64,
+    uint2int_i64,
+    PERM_3,
+    encode_few_ints_u64,
+    decode_few_ints_u64,
+    64u32,
+    EBITS_F64,
+    u64
 );
 impl_int_block_nd!(
-    encode_block_i32_3d, decode_block_i32_3d, 64, i32, u32, 0i32,
-    fwd_xform_i32_3d, inv_xform_i32_3d, int2uint_i32, uint2int_i32, PERM_3,
-    encode_few_ints_u32, decode_few_ints_u32, 32u32
+    encode_block_i32_3d,
+    decode_block_i32_3d,
+    64,
+    i32,
+    u32,
+    0i32,
+    fwd_xform_i32_3d,
+    inv_xform_i32_3d,
+    int2uint_i32,
+    uint2int_i32,
+    PERM_3,
+    encode_few_ints_u32,
+    decode_few_ints_u32,
+    32u32
 );
 impl_int_block_nd!(
-    encode_block_i64_3d, decode_block_i64_3d, 64, i64, u64, 0i64,
-    fwd_xform_i64_3d, inv_xform_i64_3d, int2uint_i64, uint2int_i64, PERM_3,
-    encode_few_ints_u64, decode_few_ints_u64, 64u32
+    encode_block_i64_3d,
+    decode_block_i64_3d,
+    64,
+    i64,
+    u64,
+    0i64,
+    fwd_xform_i64_3d,
+    inv_xform_i64_3d,
+    int2uint_i64,
+    uint2int_i64,
+    PERM_3,
+    encode_few_ints_u64,
+    decode_few_ints_u64,
+    64u32
 );
 
 // 4D block codec (256 coefs) — uses `encode_many_ints` / `decode_many_ints`.
 impl_float_block_nd!(
-    encode_block_f32_4d, decode_block_f32_4d, 256, f32, i32, u32, 0.0f32,
-    fwd_cast_f32_slice, inv_cast_f32_slice, fwd_xform_i32_4d, inv_xform_i32_4d,
-    int2uint_i32, uint2int_i32, PERM_4,
-    encode_many_ints_u32, decode_many_ints_u32, 32u32, EBITS_F32, u32
+    encode_block_f32_4d,
+    decode_block_f32_4d,
+    256,
+    f32,
+    i32,
+    u32,
+    0.0f32,
+    fwd_cast_f32_slice,
+    inv_cast_f32_slice,
+    fwd_xform_i32_4d,
+    inv_xform_i32_4d,
+    int2uint_i32,
+    uint2int_i32,
+    PERM_4,
+    encode_many_ints_u32,
+    decode_many_ints_u32,
+    32u32,
+    EBITS_F32,
+    u32
 );
 impl_float_block_nd!(
-    encode_block_f64_4d, decode_block_f64_4d, 256, f64, i64, u64, 0.0f64,
-    fwd_cast_f64_slice, inv_cast_f64_slice, fwd_xform_i64_4d, inv_xform_i64_4d,
-    int2uint_i64, uint2int_i64, PERM_4,
-    encode_many_ints_u64, decode_many_ints_u64, 64u32, EBITS_F64, u64
+    encode_block_f64_4d,
+    decode_block_f64_4d,
+    256,
+    f64,
+    i64,
+    u64,
+    0.0f64,
+    fwd_cast_f64_slice,
+    inv_cast_f64_slice,
+    fwd_xform_i64_4d,
+    inv_xform_i64_4d,
+    int2uint_i64,
+    uint2int_i64,
+    PERM_4,
+    encode_many_ints_u64,
+    decode_many_ints_u64,
+    64u32,
+    EBITS_F64,
+    u64
 );
 impl_int_block_nd!(
-    encode_block_i32_4d, decode_block_i32_4d, 256, i32, u32, 0i32,
-    fwd_xform_i32_4d, inv_xform_i32_4d, int2uint_i32, uint2int_i32, PERM_4,
-    encode_many_ints_u32, decode_many_ints_u32, 32u32
+    encode_block_i32_4d,
+    decode_block_i32_4d,
+    256,
+    i32,
+    u32,
+    0i32,
+    fwd_xform_i32_4d,
+    inv_xform_i32_4d,
+    int2uint_i32,
+    uint2int_i32,
+    PERM_4,
+    encode_many_ints_u32,
+    decode_many_ints_u32,
+    32u32
 );
 impl_int_block_nd!(
-    encode_block_i64_4d, decode_block_i64_4d, 256, i64, u64, 0i64,
-    fwd_xform_i64_4d, inv_xform_i64_4d, int2uint_i64, uint2int_i64, PERM_4,
-    encode_many_ints_u64, decode_many_ints_u64, 64u32
+    encode_block_i64_4d,
+    decode_block_i64_4d,
+    256,
+    i64,
+    u64,
+    0i64,
+    fwd_xform_i64_4d,
+    inv_xform_i64_4d,
+    int2uint_i64,
+    uint2int_i64,
+    PERM_4,
+    encode_many_ints_u64,
+    decode_many_ints_u64,
+    64u32
 );
 
 /// Write `n` zero bits.
@@ -1417,9 +1670,7 @@ macro_rules! impl_codec {
                 rate: f64,
             ) -> Result<Vec<u8>, FormatError> {
                 if !matches!(dims.len(), 1..=4) {
-                    return Err(FormatError::FilterError(
-                        "ZFP: only 1D-4D supported".into(),
-                    ));
+                    return Err(FormatError::FilterError("ZFP: only 1D-4D supported".into()));
                 }
                 validate_rate(rate)?;
                 let expected = dims.iter().product::<usize>() * $esz;
@@ -1445,9 +1696,7 @@ macro_rules! impl_codec {
                 rate: f64,
             ) -> Result<Vec<u8>, FormatError> {
                 if !matches!(dims.len(), 1..=4) {
-                    return Err(FormatError::FilterError(
-                        "ZFP: only 1D-4D supported".into(),
-                    ));
+                    return Err(FormatError::FilterError("ZFP: only 1D-4D supported".into()));
                 }
                 validate_rate(rate)?;
                 match dims.len() {
@@ -1602,14 +1851,11 @@ macro_rules! impl_codec {
                                 // that the partial path emits per block.
                                 for z in 0..4 {
                                     for y in 0..4 {
-                                        let row_off =
-                                            (((z0 + z) * n1 + (y0 + y)) * n0 + x0) * $esz;
+                                        let row_off = (((z0 + z) * n1 + (y0 + y)) * n0 + x0) * $esz;
                                         let row = &data[row_off..row_off + 4 * $esz];
                                         for x in 0..4 {
-                                            let buf: [u8; $esz] = row
-                                                [x * $esz..(x + 1) * $esz]
-                                                .try_into()
-                                                .unwrap();
+                                            let buf: [u8; $esz] =
+                                                row[x * $esz..(x + 1) * $esz].try_into().unwrap();
                                             block[16 * z + 4 * y + x] = $from_le(buf);
                                         }
                                     }
@@ -1619,14 +1865,11 @@ macro_rules! impl_codec {
                                 // pad the rest along each axis.
                                 for z in 0..rz {
                                     for y in 0..ry {
-                                        let row_off =
-                                            (((z0 + z) * n1 + (y0 + y)) * n0 + x0) * $esz;
+                                        let row_off = (((z0 + z) * n1 + (y0 + y)) * n0 + x0) * $esz;
                                         let row = &data[row_off..row_off + rx * $esz];
                                         for x in 0..rx {
-                                            let buf: [u8; $esz] = row
-                                                [x * $esz..(x + 1) * $esz]
-                                                .try_into()
-                                                .unwrap();
+                                            let buf: [u8; $esz] =
+                                                row[x * $esz..(x + 1) * $esz].try_into().unwrap();
                                             block[16 * z + 4 * y + x] = $from_le(buf);
                                         }
                                         $pad_s(block.as_mut_slice(), 16 * z + 4 * y, rx, 1);
@@ -1678,8 +1921,7 @@ macro_rules! impl_codec {
                                 // lets LLVM unroll and vectorize the stores.
                                 for z in 0..4 {
                                     for y in 0..4 {
-                                        let row_off =
-                                            (((z0 + z) * n1 + (y0 + y)) * n0 + x0) * $esz;
+                                        let row_off = (((z0 + z) * n1 + (y0 + y)) * n0 + x0) * $esz;
                                         let row = &mut output[row_off..row_off + 4 * $esz];
                                         for x in 0..4 {
                                             row[x * $esz..(x + 1) * $esz].copy_from_slice(
@@ -1692,8 +1934,7 @@ macro_rules! impl_codec {
                                 // Partial block (edge): write only what fits.
                                 for z in 0..rz {
                                     for y in 0..ry {
-                                        let row_off =
-                                            (((z0 + z) * n1 + (y0 + y)) * n0 + x0) * $esz;
+                                        let row_off = (((z0 + z) * n1 + (y0 + y)) * n0 + x0) * $esz;
                                         let row = &mut output[row_off..row_off + rx * $esz];
                                         for x in 0..rx {
                                             row[x * $esz..(x + 1) * $esz].copy_from_slice(
@@ -1745,14 +1986,12 @@ macro_rules! impl_codec {
                                     for wi in 0..4 {
                                         for z in 0..4 {
                                             for y in 0..4 {
-                                                let row_off = ((((w0 + wi) * n2 + (z0 + z))
-                                                    * n1
+                                                let row_off = ((((w0 + wi) * n2 + (z0 + z)) * n1
                                                     + (y0 + y))
                                                     * n0
                                                     + x0)
                                                     * $esz;
-                                                let row =
-                                                    &data[row_off..row_off + 4 * $esz];
+                                                let row = &data[row_off..row_off + 4 * $esz];
                                                 for x in 0..4 {
                                                     let buf: [u8; $esz] = row
                                                         [x * $esz..(x + 1) * $esz]
@@ -1769,16 +2008,13 @@ macro_rules! impl_codec {
                                         for z in 0..rz {
                                             for y in 0..ry {
                                                 for x in 0..rx {
-                                                    let src = (((w0 + wi) * n2 + (z0 + z))
-                                                        * n1
+                                                    let src = (((w0 + wi) * n2 + (z0 + z)) * n1
                                                         + (y0 + y))
                                                         * n0
                                                         + (x0 + x);
                                                     let off = src * $esz;
                                                     let mut buf = [0u8; $esz];
-                                                    buf.copy_from_slice(
-                                                        &data[off..off + $esz],
-                                                    );
+                                                    buf.copy_from_slice(&data[off..off + $esz]);
                                                     block[64 * wi + 16 * z + 4 * y + x] =
                                                         $from_le(buf);
                                                 }
@@ -1867,23 +2103,17 @@ macro_rules! impl_codec {
                                     for wi in 0..4 {
                                         for z in 0..4 {
                                             for y in 0..4 {
-                                                let row_off = ((((w0 + wi) * n2 + (z0 + z))
-                                                    * n1
+                                                let row_off = ((((w0 + wi) * n2 + (z0 + z)) * n1
                                                     + (y0 + y))
                                                     * n0
                                                     + x0)
                                                     * $esz;
-                                                let row = &mut output
-                                                    [row_off..row_off + 4 * $esz];
+                                                let row = &mut output[row_off..row_off + 4 * $esz];
                                                 for x in 0..4 {
-                                                    row[x * $esz..(x + 1) * $esz]
-                                                        .copy_from_slice(
-                                                            &block[64 * wi
-                                                                + 16 * z
-                                                                + 4 * y
-                                                                + x]
-                                                                .to_le_bytes(),
-                                                        );
+                                                    row[x * $esz..(x + 1) * $esz].copy_from_slice(
+                                                        &block[64 * wi + 16 * z + 4 * y + x]
+                                                            .to_le_bytes(),
+                                                    );
                                                 }
                                             }
                                         }
@@ -1893,15 +2123,13 @@ macro_rules! impl_codec {
                                         for z in 0..rz {
                                             for y in 0..ry {
                                                 for x in 0..rx {
-                                                    let dst = (((w0 + wi) * n2 + (z0 + z))
-                                                        * n1
+                                                    let dst = (((w0 + wi) * n2 + (z0 + z)) * n1
                                                         + (y0 + y))
                                                         * n0
                                                         + (x0 + x);
                                                     let off = dst * $esz;
                                                     output[off..off + $esz].copy_from_slice(
-                                                        &block
-                                                            [64 * wi + 16 * z + 4 * y + x]
+                                                        &block[64 * wi + 16 * z + 4 * y + x]
                                                             .to_le_bytes(),
                                                     );
                                                 }
@@ -1920,36 +2148,72 @@ macro_rules! impl_codec {
 }
 
 impl_codec!(
-    codec_f32, f32, 0.0f32, 4, f32_from_le,
-    pad_partial_block_f32, pad_strided_f32,
-    encode_block_f32, decode_block_f32,
-    encode_block_f32_2d, decode_block_f32_2d,
-    encode_block_f32_3d, decode_block_f32_3d,
-    encode_block_f32_4d, decode_block_f32_4d
+    codec_f32,
+    f32,
+    0.0f32,
+    4,
+    f32_from_le,
+    pad_partial_block_f32,
+    pad_strided_f32,
+    encode_block_f32,
+    decode_block_f32,
+    encode_block_f32_2d,
+    decode_block_f32_2d,
+    encode_block_f32_3d,
+    decode_block_f32_3d,
+    encode_block_f32_4d,
+    decode_block_f32_4d
 );
 impl_codec!(
-    codec_f64, f64, 0.0f64, 8, f64_from_le,
-    pad_partial_block_f64, pad_strided_f64,
-    encode_block_f64, decode_block_f64,
-    encode_block_f64_2d, decode_block_f64_2d,
-    encode_block_f64_3d, decode_block_f64_3d,
-    encode_block_f64_4d, decode_block_f64_4d
+    codec_f64,
+    f64,
+    0.0f64,
+    8,
+    f64_from_le,
+    pad_partial_block_f64,
+    pad_strided_f64,
+    encode_block_f64,
+    decode_block_f64,
+    encode_block_f64_2d,
+    decode_block_f64_2d,
+    encode_block_f64_3d,
+    decode_block_f64_3d,
+    encode_block_f64_4d,
+    decode_block_f64_4d
 );
 impl_codec!(
-    codec_i32, i32, 0i32, 4, i32_from_le,
-    pad_partial_block_i32, pad_strided_i32,
-    encode_block_i32, decode_block_i32,
-    encode_block_i32_2d, decode_block_i32_2d,
-    encode_block_i32_3d, decode_block_i32_3d,
-    encode_block_i32_4d, decode_block_i32_4d
+    codec_i32,
+    i32,
+    0i32,
+    4,
+    i32_from_le,
+    pad_partial_block_i32,
+    pad_strided_i32,
+    encode_block_i32,
+    decode_block_i32,
+    encode_block_i32_2d,
+    decode_block_i32_2d,
+    encode_block_i32_3d,
+    decode_block_i32_3d,
+    encode_block_i32_4d,
+    decode_block_i32_4d
 );
 impl_codec!(
-    codec_i64, i64, 0i64, 8, i64_from_le,
-    pad_partial_block_i64, pad_strided_i64,
-    encode_block_i64, decode_block_i64,
-    encode_block_i64_2d, decode_block_i64_2d,
-    encode_block_i64_3d, decode_block_i64_3d,
-    encode_block_i64_4d, decode_block_i64_4d
+    codec_i64,
+    i64,
+    0i64,
+    8,
+    i64_from_le,
+    pad_partial_block_i64,
+    pad_strided_i64,
+    encode_block_i64,
+    decode_block_i64,
+    encode_block_i64_2d,
+    decode_block_i64_2d,
+    encode_block_i64_3d,
+    decode_block_i64_3d,
+    encode_block_i64_4d,
+    decode_block_i64_4d
 );
 
 /// Compress a raw chunk buffer with ZFP fixed-rate.
@@ -2162,9 +2426,7 @@ pub fn zfp_filter_meta_from_cd_values(cd_values: &[u32]) -> Option<ZfpFilterMeta
     }
     let mut r = BitReader::new(&bytes);
     // Magic (32 bits): 'z', 'f', 'p', codec.
-    if r.read(8) != u64::from(b'z')
-        || r.read(8) != u64::from(b'f')
-        || r.read(8) != u64::from(b'p')
+    if r.read(8) != u64::from(b'z') || r.read(8) != u64::from(b'f') || r.read(8) != u64::from(b'p')
     {
         return None;
     }
@@ -2491,10 +2753,7 @@ mod tests {
         // Probed from h5py + hdf5plugin for an f32 1D 16-value ramp at rate 16:
         // `[0x10105111, 0x0570667a, 0x000000f2, 0x03f00000]`.
         let cd = zfp_cd_values_rate(16.0, ZfpElementType::F32, &[16]).unwrap();
-        assert_eq!(
-            cd,
-            vec![0x10105111, 0x0570667a, 0x000000f2, 0x03f00000],
-        );
+        assert_eq!(cd, vec![0x10105111, 0x0570667a, 0x000000f2, 0x03f00000],);
     }
 
     #[test]
@@ -2572,7 +2831,8 @@ mod tests {
     fn compress_rejects_short_buffer() {
         // 3 f32s worth of bytes, but we claim dims = [4].
         let short = vec![0u8; 3 * 4];
-        let err = compress(&short, &[4], 16.0, ZfpElementType::F32).expect_err("short buffer must error");
+        let err =
+            compress(&short, &[4], 16.0, ZfpElementType::F32).expect_err("short buffer must error");
         assert!(matches!(err, FormatError::FilterError(_)), "{err:?}");
     }
 
@@ -2580,7 +2840,8 @@ mod tests {
     fn compress_rejects_long_buffer() {
         // Too many bytes — also a size mismatch.
         let long = vec![0u8; 5 * 4];
-        let err = compress(&long, &[4], 16.0, ZfpElementType::F32).expect_err("long buffer must error");
+        let err =
+            compress(&long, &[4], 16.0, ZfpElementType::F32).expect_err("long buffer must error");
         assert!(matches!(err, FormatError::FilterError(_)), "{err:?}");
     }
 
@@ -2588,19 +2849,24 @@ mod tests {
     fn compress_rejects_bad_rate() {
         let data = vec![0u8; 16 * 4];
         // Non-finite.
-        let err = compress(&data, &[16], f64::NAN, ZfpElementType::F32).expect_err("NaN must error");
+        let err =
+            compress(&data, &[16], f64::NAN, ZfpElementType::F32).expect_err("NaN must error");
         assert!(matches!(err, FormatError::FilterError(_)));
-        let err = compress(&data, &[16], f64::INFINITY, ZfpElementType::F32).expect_err("inf must error");
+        let err =
+            compress(&data, &[16], f64::INFINITY, ZfpElementType::F32).expect_err("inf must error");
         assert!(matches!(err, FormatError::FilterError(_)));
         // Non-positive.
         let err = compress(&data, &[16], 0.0, ZfpElementType::F32).expect_err("rate=0 must error");
         assert!(matches!(err, FormatError::FilterError(_)));
-        let err = compress(&data, &[16], -1.0, ZfpElementType::F32).expect_err("negative rate must error");
+        let err = compress(&data, &[16], -1.0, ZfpElementType::F32)
+            .expect_err("negative rate must error");
         assert!(matches!(err, FormatError::FilterError(_)));
         // Above scalar width.
-        let err = compress(&data, &[16], 33.0, ZfpElementType::F32).expect_err("rate > 32 must error for f32");
+        let err = compress(&data, &[16], 33.0, ZfpElementType::F32)
+            .expect_err("rate > 32 must error for f32");
         assert!(matches!(err, FormatError::FilterError(_)));
-        let err = compress(&data, &[16], 1e20, ZfpElementType::F32).expect_err("huge rate must error");
+        let err =
+            compress(&data, &[16], 1e20, ZfpElementType::F32).expect_err("huge rate must error");
         assert!(matches!(err, FormatError::FilterError(_)));
     }
 

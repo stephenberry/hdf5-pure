@@ -135,7 +135,11 @@ impl Dataspace {
         let mut buf = Vec::new();
         buf.push(2); // version 2
         buf.push(self.rank);
-        let flags = if self.max_dimensions.is_some() { 0x01 } else { 0x00 };
+        let flags = if self.max_dimensions.is_some() {
+            0x01
+        } else {
+            0x00
+        };
         buf.push(flags);
         let type_byte = match self.space_type {
             DataspaceType::Scalar => 0,
@@ -267,12 +271,7 @@ mod tests {
 
     #[test]
     fn simple_3d_with_max_dims_unlimited() {
-        let data = build_v1_dataspace(
-            3,
-            0x01,
-            &[2, 3, 4],
-            Some(&[10, u64::MAX, 100]),
-        );
+        let data = build_v1_dataspace(3, 0x01, &[2, 3, 4], Some(&[10, u64::MAX, 100]));
         let ds = Dataspace::parse(&data, 8).unwrap();
         assert_eq!(ds.rank, 3);
         assert_eq!(ds.dimensions, vec![2, 3, 4]);

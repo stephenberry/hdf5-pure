@@ -7,9 +7,9 @@ extern crate alloc;
 use alloc::{format, vec, vec::Vec};
 
 use crate::error::FormatError;
-use crate::filter_pipeline::{FilterPipeline, FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SHUFFLE};
 #[cfg(feature = "zfp")]
 use crate::filter_pipeline::FILTER_ZFP;
+use crate::filter_pipeline::{FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SHUFFLE, FilterPipeline};
 #[cfg(feature = "zfp")]
 use crate::zfp::ZfpElementType;
 
@@ -73,8 +73,16 @@ pub fn zfp_element_type_from_datatype(
     match dt {
         Datatype::FloatingPoint { size: 4, .. } => Some(ZfpElementType::F32),
         Datatype::FloatingPoint { size: 8, .. } => Some(ZfpElementType::F64),
-        Datatype::FixedPoint { size: 4, signed: true, .. } => Some(ZfpElementType::I32),
-        Datatype::FixedPoint { size: 8, signed: true, .. } => Some(ZfpElementType::I64),
+        Datatype::FixedPoint {
+            size: 4,
+            signed: true,
+            ..
+        } => Some(ZfpElementType::I32),
+        Datatype::FixedPoint {
+            size: 8,
+            signed: true,
+            ..
+        } => Some(ZfpElementType::I64),
         _ => None,
     }
 }
@@ -137,9 +145,8 @@ pub fn compress_chunk(
 
 #[cfg(feature = "zfp")]
 fn zfp_rate(filter: &crate::filter_pipeline::FilterDescription) -> Result<f64, FormatError> {
-    crate::zfp::zfp_rate_from_cd_values(&filter.client_data).ok_or_else(|| {
-        FormatError::FilterError("ZFP: invalid or non-rate cd_values".into())
-    })
+    crate::zfp::zfp_rate_from_cd_values(&filter.client_data)
+        .ok_or_else(|| FormatError::FilterError("ZFP: invalid or non-rate cd_values".into()))
 }
 
 #[cfg(feature = "zfp")]
@@ -213,10 +220,7 @@ fn deflate_decompress(_data: &[u8]) -> Result<Vec<u8>, FormatError> {
 #[cfg(feature = "deflate")]
 fn deflate_compress(data: &[u8], level: u32) -> Result<Vec<u8>, FormatError> {
     use std::io::Write;
-    let mut encoder = flate2::write::ZlibEncoder::new(
-        Vec::new(),
-        flate2::Compression::new(level),
-    );
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(level));
     encoder
         .write_all(data)
         .map_err(|e| FormatError::CompressionError(e.to_string()))?;
@@ -394,7 +398,7 @@ mod tests {
         // Compress data and verify it decompresses correctly
         let data = vec![0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9];
         let compressed = deflate_compress(&data, 6).unwrap();
-        assert!(compressed.len() > 0);
+        assert!(!compressed.is_empty());
         let decompressed = deflate_decompress(&compressed).unwrap();
         assert_eq!(decompressed, data);
     }
@@ -425,7 +429,10 @@ mod tests {
         // After shuffle: [A0 B0 A1 B1 A2 B2 A3 B3]
         let data = vec![0xA0, 0xA1, 0xA2, 0xA3, 0xB0, 0xB1, 0xB2, 0xB3];
         let shuffled = shuffle_compress(&data, 4).unwrap();
-        assert_eq!(shuffled, vec![0xA0, 0xB0, 0xA1, 0xB1, 0xA2, 0xB2, 0xA3, 0xB3]);
+        assert_eq!(
+            shuffled,
+            vec![0xA0, 0xB0, 0xA1, 0xB1, 0xA2, 0xB2, 0xA3, 0xB3]
+        );
     }
 
     // --- Fletcher32 tests ---
@@ -468,7 +475,10 @@ mod tests {
         let last = with_checksum.len() - 1;
         with_checksum[last] ^= 0xFF;
         let result = fletcher32_verify(&with_checksum);
-        assert!(matches!(result, Err(FormatError::Fletcher32Mismatch { .. })));
+        assert!(matches!(
+            result,
+            Err(FormatError::Fletcher32Mismatch { .. })
+        ));
     }
 
     // --- Pipeline tests ---
