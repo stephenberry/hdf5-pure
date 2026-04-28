@@ -95,7 +95,7 @@ pub mod types;
 #[cfg(feature = "std")]
 pub mod writer;
 
-#[cfg(feature = "serde")]
+#[cfg(feature = "std")]
 pub mod mat;
 
 // ---------------------------------------------------------------------------
