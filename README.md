@@ -272,7 +272,7 @@ hdf5-pure = { version = "0.1", default-features = false, features = ["checksum"]
 
 ## Acknowledgements
 
-The HDF5 format parsing and low-level I/O modules are derived from [rustyhdf5](https://github.com/rustystack/rustyhdf5) by the RustyStack project (MIT licensed).
+The HDF5 format parsing and low-level I/O modules are derived from rustyhdf5 by the RustyStack project (MIT licensed).
 
 ## License
 
