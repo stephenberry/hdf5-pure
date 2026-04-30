@@ -85,6 +85,10 @@ impl NumVec {
         }
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub(crate) fn tag(&self) -> ScalarTag {
         match self {
             NumVec::Bool(_) => ScalarTag::Bool,

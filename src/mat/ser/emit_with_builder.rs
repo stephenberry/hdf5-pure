@@ -362,7 +362,7 @@ fn emit_scalar_at_struct(
 
 fn emit_vec_at_builder(mb: &mut MatBuilder, name: &str, v: NumVec) -> Result<(), MatError> {
     let dims = mb.vector_dims(v.len());
-    if v.len() == 0 {
+    if v.is_empty() {
         return mb
             .write_empty(name, scalar_class(v.tag()), &dims)
             .map(|_| ());
@@ -388,7 +388,7 @@ fn emit_vec_at_builder(mb: &mut MatBuilder, name: &str, v: NumVec) -> Result<(),
 
 fn emit_vec_at_struct(sw: &mut StructWriter, name: &str, v: NumVec) -> Result<(), MatError> {
     let dims = sw.vector_dims(v.len());
-    if v.len() == 0 {
+    if v.is_empty() {
         return sw
             .write_empty(name, scalar_class(v.tag()), &dims)
             .map(|_| ());
