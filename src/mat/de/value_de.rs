@@ -13,7 +13,7 @@ use serde::forward_to_deserialize_any;
 
 use crate::mat::complex::{COMPLEX32_SENTINEL, COMPLEX64_SENTINEL};
 use crate::mat::error::MatError;
-use crate::mat::matrix::MATRIX_SENTINEL;
+use crate::mat::matrix::{MATRIX_COMPLEX32_SENTINEL, MATRIX_COMPLEX64_SENTINEL, MATRIX_SENTINEL};
 use crate::mat::value::{MatValue, NumVec, ScalarNum};
 
 // ---------------------------------------------------------------------------
@@ -184,6 +184,15 @@ impl<'de> Deserializer<'de> for MatValueDeserializer {
             MatValue::ComplexVec32(pairs) => {
                 visitor.visit_seq(ComplexPairsSeq::Vec32(pairs.into_iter().collect()))
             }
+            // A degenerate 2-D complex matrix (1×N or N×1) flattens to a
+            // sequence so `Vec<Complex*>` deserializes from either
+            // orientation, matching the numeric `Matrix` flatten above.
+            MatValue::ComplexMatrix64 { rows, cols, pairs } if rows == 1 || cols == 1 => {
+                visitor.visit_seq(ComplexPairsSeq::Vec64(pairs.into_iter().collect()))
+            }
+            MatValue::ComplexMatrix32 { rows, cols, pairs } if rows == 1 || cols == 1 => {
+                visitor.visit_seq(ComplexPairsSeq::Vec32(pairs.into_iter().collect()))
+            }
             MatValue::ComplexMatrix64 { rows, cols, pairs } => {
                 visitor.visit_seq(ComplexMatrixRowsSeq::new64(rows, cols, pairs))
             }
@@ -238,22 +247,48 @@ impl<'de> Deserializer<'de> for MatValueDeserializer {
         visitor: V,
     ) -> Result<V::Value, MatError> {
         match name {
-            MATRIX_SENTINEL => match self.value {
-                MatValue::Matrix { rows, cols, vec } => {
-                    visitor.visit_map(MatrixStructMap::new(rows, cols, vec))
+            // The three Matrix sentinels (numeric and the two complex
+            // variants) all consume the same set of `MatValue` shapes; the
+            // sentinel name only matters at serialize time, where it
+            // preserves the element class for an empty Vec.
+            MATRIX_SENTINEL | MATRIX_COMPLEX64_SENTINEL | MATRIX_COMPLEX32_SENTINEL => {
+                match self.value {
+                    MatValue::Matrix { rows, cols, vec } => {
+                        visitor.visit_map(MatrixStructMap::numeric(rows, cols, vec))
+                    }
+                    // Allow deserializing a scalar or 1-D vec as a Matrix
+                    // (treating it as rows=1 or single-element).
+                    MatValue::Vec1D(v) => {
+                        let len = v.len();
+                        visitor.visit_map(MatrixStructMap::numeric(1, len, v))
+                    }
+                    MatValue::Scalar(s) => {
+                        let v = NumVec::from_single(s);
+                        visitor.visit_map(MatrixStructMap::numeric(1, 1, v))
+                    }
+                    MatValue::ComplexMatrix64 { rows, cols, pairs } => {
+                        visitor.visit_map(MatrixStructMap::complex64(rows, cols, pairs))
+                    }
+                    MatValue::ComplexMatrix32 { rows, cols, pairs } => {
+                        visitor.visit_map(MatrixStructMap::complex32(rows, cols, pairs))
+                    }
+                    MatValue::ComplexVec64(pairs) => {
+                        let len = pairs.len();
+                        visitor.visit_map(MatrixStructMap::complex64(1, len, pairs))
+                    }
+                    MatValue::ComplexVec32(pairs) => {
+                        let len = pairs.len();
+                        visitor.visit_map(MatrixStructMap::complex32(1, len, pairs))
+                    }
+                    MatValue::ComplexScalar64 { re, im } => {
+                        visitor.visit_map(MatrixStructMap::complex64(1, 1, vec![(re, im)]))
+                    }
+                    MatValue::ComplexScalar32 { re, im } => {
+                        visitor.visit_map(MatrixStructMap::complex32(1, 1, vec![(re, im)]))
+                    }
+                    other => mismatch("Matrix", other),
                 }
-                // Allow deserializing a scalar or 1-D vec as a Matrix
-                // (treating it as rows=1 or single-element).
-                MatValue::Vec1D(v) => {
-                    let len = v.len();
-                    visitor.visit_map(MatrixStructMap::new(1, len, v))
-                }
-                MatValue::Scalar(s) => {
-                    let v = NumVec::from_single(s);
-                    visitor.visit_map(MatrixStructMap::new(1, 1, v))
-                }
-                other => mismatch("Matrix", other),
-            },
+            }
             COMPLEX64_SENTINEL => match self.value {
                 MatValue::ComplexScalar64 { re, im } => {
                     visitor.visit_map(ComplexStructMap64::new(re, im))
@@ -330,6 +365,13 @@ fn dispatch_any<'de, V: Visitor<'de>>(value: MatValue, visitor: V) -> Result<V::
         },
         MatValue::String(s) => visitor.visit_string(s),
         MatValue::Vec1D(v) => visitor.visit_seq(Vec1DSeq::new(v)),
+        // Match `deserialize_seq`: a degenerate 2-D matrix (1×N or N×1)
+        // flattens so callers going through `deserialize_any` (untagged
+        // enums, custom Visitor impls, serde-derive's `Content` round-trip)
+        // see the same orientation-agnostic sequence as `Vec<T>` callers.
+        MatValue::Matrix { rows, cols, vec } if rows == 1 || cols == 1 => {
+            visitor.visit_seq(Vec1DSeq::new(vec))
+        }
         MatValue::Matrix { rows, cols, vec } => {
             visitor.visit_seq(MatrixRowsSeq::new(rows, cols, vec))
         }
@@ -339,6 +381,12 @@ fn dispatch_any<'de, V: Visitor<'de>>(value: MatValue, visitor: V) -> Result<V::
             visitor.visit_seq(ComplexPairsSeq::Vec64(pairs.into_iter().collect()))
         }
         MatValue::ComplexVec32(pairs) => {
+            visitor.visit_seq(ComplexPairsSeq::Vec32(pairs.into_iter().collect()))
+        }
+        MatValue::ComplexMatrix64 { rows, cols, pairs } if rows == 1 || cols == 1 => {
+            visitor.visit_seq(ComplexPairsSeq::Vec64(pairs.into_iter().collect()))
+        }
+        MatValue::ComplexMatrix32 { rows, cols, pairs } if rows == 1 || cols == 1 => {
             visitor.visit_seq(ComplexPairsSeq::Vec32(pairs.into_iter().collect()))
         }
         MatValue::ComplexMatrix64 { rows, cols, pairs } => {
@@ -779,7 +827,13 @@ struct MatrixStructMap {
     state: MatrixState,
     rows: usize,
     cols: usize,
-    data: Option<NumVec>,
+    data: Option<MatrixData>,
+}
+
+enum MatrixData {
+    Numeric(NumVec),
+    Complex64(Vec<(f64, f64)>),
+    Complex32(Vec<(f32, f32)>),
 }
 
 enum MatrixState {
@@ -793,12 +847,30 @@ enum MatrixState {
 }
 
 impl MatrixStructMap {
-    fn new(rows: usize, cols: usize, vec: NumVec) -> Self {
+    fn numeric(rows: usize, cols: usize, vec: NumVec) -> Self {
         Self {
             state: MatrixState::NeedRowsKey,
             rows,
             cols,
-            data: Some(vec),
+            data: Some(MatrixData::Numeric(vec)),
+        }
+    }
+
+    fn complex64(rows: usize, cols: usize, pairs: Vec<(f64, f64)>) -> Self {
+        Self {
+            state: MatrixState::NeedRowsKey,
+            rows,
+            cols,
+            data: Some(MatrixData::Complex64(pairs)),
+        }
+    }
+
+    fn complex32(rows: usize, cols: usize, pairs: Vec<(f32, f32)>) -> Self {
+        Self {
+            state: MatrixState::NeedRowsKey,
+            rows,
+            cols,
+            data: Some(MatrixData::Complex32(pairs)),
         }
     }
 }
@@ -833,8 +905,12 @@ impl<'de> MapAccess<'de> for MatrixStructMap {
             }
             MatrixState::NeedDataValue => {
                 self.state = MatrixState::Done;
-                let data = self.data.take().unwrap();
-                seed.deserialize(MatValueDeserializer::new(MatValue::Vec1D(data)))
+                let value = match self.data.take().unwrap() {
+                    MatrixData::Numeric(v) => MatValue::Vec1D(v),
+                    MatrixData::Complex64(pairs) => MatValue::ComplexVec64(pairs),
+                    MatrixData::Complex32(pairs) => MatValue::ComplexVec32(pairs),
+                };
+                seed.deserialize(MatValueDeserializer::new(value))
             }
             _ => Err(MatError::Custom("matrix map value before key".into())),
         }

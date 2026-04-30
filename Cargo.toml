@@ -1,6 +1,6 @@
 [package]
 name = "hdf5-pure"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 license = "MIT"
 description = "Pure-Rust HDF5 writer library (WASM-compatible, no C dependencies)"

@@ -11,7 +11,7 @@ use serde::ser::{
 
 use crate::mat::complex::{COMPLEX32_SENTINEL, COMPLEX64_SENTINEL};
 use crate::mat::error::MatError;
-use crate::mat::matrix::MATRIX_SENTINEL;
+use crate::mat::matrix::{MATRIX_COMPLEX32_SENTINEL, MATRIX_COMPLEX64_SENTINEL, MATRIX_SENTINEL};
 use crate::mat::utf16;
 
 use crate::mat::value::{MatValue, NumVec, ScalarNum, ScalarTag};
@@ -172,7 +172,13 @@ impl Serializer for ValueSerializer {
 
     fn serialize_struct(self, name: &'static str, _len: usize) -> Result<StructSer, MatError> {
         Ok(match name {
-            MATRIX_SENTINEL => StructSer::Matrix(MatrixFields::default()),
+            MATRIX_SENTINEL => StructSer::Matrix(MatrixFields::default(), MatrixKind::Numeric),
+            MATRIX_COMPLEX64_SENTINEL => {
+                StructSer::Matrix(MatrixFields::default(), MatrixKind::Complex64)
+            }
+            MATRIX_COMPLEX32_SENTINEL => {
+                StructSer::Matrix(MatrixFields::default(), MatrixKind::Complex32)
+            }
             COMPLEX64_SENTINEL => StructSer::Complex64(ComplexFields::default()),
             COMPLEX32_SENTINEL => StructSer::Complex32(ComplexFields::default()),
             _ => StructSer::Plain(PlainStructFields::default()),
@@ -461,10 +467,21 @@ impl SerializeMap for MapSer {
 // ---------------------------------------------------------------------------
 
 pub(crate) enum StructSer {
-    Matrix(MatrixFields),
+    Matrix(MatrixFields, MatrixKind),
     Complex64(ComplexFields<f64>),
     Complex32(ComplexFields<f32>),
     Plain(PlainStructFields),
+}
+
+/// Element class hint for a `Matrix<T>` sentinel. Carried through from the
+/// chosen sentinel name (see `matrix::matrix_sentinel_for`) so that empty
+/// matrices, where the inner `Vec<T>` cannot reveal `T`, still emit with the
+/// right MATLAB class.
+#[derive(Clone, Copy)]
+pub(crate) enum MatrixKind {
+    Numeric,
+    Complex64,
+    Complex32,
 }
 
 #[derive(Default)]
@@ -495,7 +512,7 @@ impl SerializeStruct for StructSer {
         value: &T,
     ) -> Result<(), MatError> {
         match self {
-            StructSer::Matrix(fields) => match key {
+            StructSer::Matrix(fields, _) => match key {
                 "rows" => {
                     let v = value.serialize(ValueSerializer)?;
                     fields.rows = Some(expect_usize(v, "Matrix::rows")?);
@@ -543,7 +560,7 @@ impl SerializeStruct for StructSer {
     fn end(self) -> Result<MatValue, MatError> {
         match self {
             StructSer::Plain(ps) => Ok(MatValue::Struct(ps.fields)),
-            StructSer::Matrix(fields) => matrix_from_fields(fields),
+            StructSer::Matrix(fields, kind) => matrix_from_fields(fields, kind),
             StructSer::Complex64(fields) => Ok(MatValue::ComplexScalar64 {
                 re: fields
                     .real
@@ -564,7 +581,7 @@ impl SerializeStruct for StructSer {
     }
 }
 
-fn matrix_from_fields(fields: MatrixFields) -> Result<MatValue, MatError> {
+fn matrix_from_fields(fields: MatrixFields, kind: MatrixKind) -> Result<MatValue, MatError> {
     let rows = fields
         .rows
         .ok_or_else(|| MatError::MissingField("rows".into()))?;
@@ -574,30 +591,58 @@ fn matrix_from_fields(fields: MatrixFields) -> Result<MatValue, MatError> {
     let data = fields
         .data
         .ok_or_else(|| MatError::MissingField("data".into()))?;
-    let vec = match data {
-        MatValue::Vec1D(v) => v,
-        // Serializing `Vec<T>` of length 0 with T unknown yields F64.
-        // If rows*cols == 0 we let it pass as an empty NumVec of that tag.
-        MatValue::Scalar(s) if rows * cols == 1 => {
-            let mut nv = NumVec::empty_with_tag(s.tag());
-            nv.push(s)?;
-            nv
-        }
-        other => {
+    let total = rows * cols;
+    let length_check = |actual: usize| -> Result<(), MatError> {
+        if actual != total {
             return Err(MatError::Custom(format!(
-                "Matrix::data must be a Vec<T>, got {}",
-                other.kind()
+                "Matrix::data length {} does not match rows*cols = {}",
+                actual, total
             )));
         }
+        Ok(())
     };
-    if vec.len() != rows * cols {
-        return Err(MatError::Custom(format!(
-            "Matrix::data length {} does not match rows*cols = {}",
-            vec.len(),
-            rows * cols
-        )));
+    match (kind, data) {
+        // Numeric Matrix<T>: data unifies to Vec1D of T's tag. Matrix<Complex*>
+        // does not land here; it carries `T::SENTINEL = MATRIX_COMPLEX{32,64}_SENTINEL`
+        // and routes to the dedicated Complex64 / Complex32 arms below.
+        (MatrixKind::Numeric, MatValue::Vec1D(vec)) => {
+            length_check(vec.len())?;
+            Ok(MatValue::Matrix { rows, cols, vec })
+        }
+        // Matrix<Complex64>: ComplexVec64 in the data slot, OR an empty
+        // Vec1D (the f64-default that an empty `Vec<Complex64>` collapses
+        // to in the seq path: with no elements observed, the seq
+        // unification can't recover T). The dedicated sentinel here lets
+        // us recover the class.
+        (MatrixKind::Complex64, MatValue::ComplexVec64(pairs)) => {
+            length_check(pairs.len())?;
+            Ok(MatValue::ComplexMatrix64 { rows, cols, pairs })
+        }
+        (MatrixKind::Complex64, MatValue::Vec1D(vec)) if vec.is_empty() => {
+            length_check(0)?;
+            Ok(MatValue::ComplexMatrix64 {
+                rows,
+                cols,
+                pairs: Vec::new(),
+            })
+        }
+        (MatrixKind::Complex32, MatValue::ComplexVec32(pairs)) => {
+            length_check(pairs.len())?;
+            Ok(MatValue::ComplexMatrix32 { rows, cols, pairs })
+        }
+        (MatrixKind::Complex32, MatValue::Vec1D(vec)) if vec.is_empty() => {
+            length_check(0)?;
+            Ok(MatValue::ComplexMatrix32 {
+                rows,
+                cols,
+                pairs: Vec::new(),
+            })
+        }
+        (_, other) => Err(MatError::Custom(format!(
+            "Matrix::data must be a Vec<T>, got {}",
+            other.kind()
+        ))),
     }
-    Ok(MatValue::Matrix { rows, cols, vec })
 }
 
 fn expect_usize(v: MatValue, field: &str) -> Result<usize, MatError> {

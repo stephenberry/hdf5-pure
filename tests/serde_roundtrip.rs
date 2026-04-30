@@ -327,6 +327,21 @@ fn roundtrip_matrix_f64() {
 }
 
 #[test]
+fn roundtrip_matrix_f64_column_vector() {
+    // N×1 column vector: shape must round-trip distinctly from 1×N.
+    rt(WithMatrix {
+        m: Matrix::from_row_major(4, 1, vec![1.0, 2.0, 3.0, 4.0]),
+    });
+}
+
+#[test]
+fn roundtrip_matrix_f64_row_vector() {
+    rt(WithMatrix {
+        m: Matrix::from_row_major(1, 4, vec![1.0, 2.0, 3.0, 4.0]),
+    });
+}
+
+#[test]
 fn roundtrip_nested() {
     rt(WithNested {
         x: 1.5,
@@ -411,6 +426,168 @@ fn roundtrip_complex_matrix() {
             vec![Complex64::new(1.0, 0.0), Complex64::new(0.0, 1.0)],
             vec![Complex64::new(-1.0, 0.0), Complex64::new(0.0, -1.0)],
         ],
+    });
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+struct WithMatrixComplex64 {
+    m: Matrix<Complex64>,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+struct WithMatrixComplex32 {
+    m: Matrix<Complex32>,
+}
+
+#[test]
+fn roundtrip_matrix_complex64_2d() {
+    rt(WithMatrixComplex64 {
+        m: Matrix::from_row_major(
+            2,
+            3,
+            vec![
+                Complex64::new(1.0, 0.5),
+                Complex64::new(2.0, 1.5),
+                Complex64::new(3.0, -0.5),
+                Complex64::new(-1.0, 0.0),
+                Complex64::new(0.0, 2.5),
+                Complex64::new(7.0, -7.0),
+            ],
+        ),
+    });
+}
+
+#[test]
+fn roundtrip_matrix_complex64_column_vector() {
+    // N×1 column vector: the orientation a downstream caller might choose
+    // when they need the legacy `[N, 1]` MATLAB shape for 1-D complex data.
+    rt(WithMatrixComplex64 {
+        m: Matrix::from_row_major(
+            4,
+            1,
+            vec![
+                Complex64::new(1.0, 0.0),
+                Complex64::new(0.0, 1.0),
+                Complex64::new(-1.0, 0.0),
+                Complex64::new(0.0, -1.0),
+            ],
+        ),
+    });
+}
+
+#[test]
+fn roundtrip_matrix_complex64_row_vector() {
+    rt(WithMatrixComplex64 {
+        m: Matrix::from_row_major(
+            1,
+            3,
+            vec![
+                Complex64::new(1.0, 0.0),
+                Complex64::new(2.0, 0.0),
+                Complex64::new(3.0, 0.0),
+            ],
+        ),
+    });
+}
+
+#[test]
+fn roundtrip_matrix_complex64_single_element() {
+    rt(WithMatrixComplex64 {
+        m: Matrix::from_row_major(1, 1, vec![Complex64::new(1.5, -2.5)]),
+    });
+}
+
+#[test]
+fn roundtrip_matrix_complex32_2d() {
+    // Asymmetric shape (3×2) so a row/col swap or transpose regression fails
+    // distinctly from the Complex64 2×3 pin above.
+    rt(WithMatrixComplex32 {
+        m: Matrix::from_row_major(
+            3,
+            2,
+            vec![
+                Complex32::new(1.0, 0.5),
+                Complex32::new(2.0, 1.5),
+                Complex32::new(3.0, -0.5),
+                Complex32::new(-1.0, 0.0),
+                Complex32::new(0.0, 2.5),
+                Complex32::new(7.0, -7.0),
+            ],
+        ),
+    });
+}
+
+#[test]
+fn roundtrip_matrix_complex32_column_vector() {
+    rt(WithMatrixComplex32 {
+        m: Matrix::from_row_major(
+            4,
+            1,
+            vec![
+                Complex32::new(1.0, 0.0),
+                Complex32::new(0.0, 1.0),
+                Complex32::new(-1.0, 0.0),
+                Complex32::new(0.0, -1.0),
+            ],
+        ),
+    });
+}
+
+#[test]
+fn roundtrip_matrix_complex32_row_vector() {
+    rt(WithMatrixComplex32 {
+        m: Matrix::from_row_major(
+            1,
+            3,
+            vec![
+                Complex32::new(1.0, 0.0),
+                Complex32::new(2.0, 0.0),
+                Complex32::new(3.0, 0.0),
+            ],
+        ),
+    });
+}
+
+#[test]
+fn roundtrip_matrix_complex32_single_element() {
+    rt(WithMatrixComplex32 {
+        m: Matrix::from_row_major(1, 1, vec![Complex32::new(1.5, -2.5)]),
+    });
+}
+
+/// Serialize once, assert the on-disk dtype is compound (real/imag), then
+/// deserialize from those same bytes and assert value equality. Folds the
+/// dtype check and the roundtrip into a single serialization.
+fn assert_empty_complex_compound_roundtrip<T>(value: T)
+where
+    T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+{
+    let bytes = mat::to_bytes(&value).expect("serialize");
+    let file = File::from_bytes(bytes.clone()).unwrap();
+    let dt = file.dataset("m").unwrap().dtype().unwrap();
+    assert!(
+        matches!(dt, hdf5_pure::DType::Compound(_)),
+        "expected compound (real/imag) datatype for empty complex Matrix, got {dt:?}"
+    );
+    let back: T = mat::from_bytes(&bytes).expect("deserialize");
+    assert_eq!(back, value);
+}
+
+#[test]
+fn empty_matrix_complex64_writes_compound_dataset() {
+    // A 0×0 Matrix<Complex64> has nothing in `data` for the seq path to
+    // observe, so without the dedicated sentinel the Vec<Complex64> would
+    // collapse to an f64-empty default and write as a numeric (non-complex)
+    // dataset. The sentinel name preserves the element class.
+    assert_empty_complex_compound_roundtrip(WithMatrixComplex64 {
+        m: Matrix::from_row_major(0, 0, Vec::<Complex64>::new()),
+    });
+}
+
+#[test]
+fn empty_matrix_complex32_writes_compound_dataset() {
+    assert_empty_complex_compound_roundtrip(WithMatrixComplex32 {
+        m: Matrix::from_row_major(0, 0, Vec::<Complex32>::new()),
     });
 }
 

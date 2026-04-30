@@ -84,7 +84,7 @@ pub use options::{
 #[cfg(feature = "serde")]
 pub use complex::{Complex32, Complex64};
 #[cfg(feature = "serde")]
-pub use matrix::Matrix;
+pub use matrix::{MatElement, Matrix};
 
 #[cfg(feature = "serde")]
 use serde::Serialize;

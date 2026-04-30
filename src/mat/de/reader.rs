@@ -53,6 +53,12 @@ fn read_dataset(ds: &Dataset<'_>) -> Result<MatValue, MatError> {
     let class = class.unwrap_or_else(|| class_from_dtype(&dtype));
 
     if is_empty {
+        // Complex compound types preserve their shape and class so a 0×0
+        // `Matrix<Complex*>` round-trips back to a 0×0 complex matrix
+        // rather than collapsing to a numeric empty vec.
+        if matches!(class, MatClass::Double | MatClass::Single) && is_complex_dtype(&dtype) {
+            return Ok(empty_complex_value(class, &shape));
+        }
         // Empty numeric/char: produce an empty 1-D vec of the correct tag.
         return Ok(empty_value_for_class(class));
     }
@@ -114,6 +120,26 @@ fn is_empty_attr(attrs: &HashMap<String, AttrValue>) -> bool {
         Some(AttrValue::I64(v)) => *v != 0,
         Some(AttrValue::I32(v)) => *v != 0,
         _ => false,
+    }
+}
+
+/// Build an empty `ComplexMatrix*` whose `(rows, cols)` matches the dataspace
+/// shape, so deserializing into `Matrix<Complex*>` recovers the original
+/// shape (0×0, 0×N, N×0) instead of collapsing to 1×0.
+fn empty_complex_value(class: MatClass, shape: &[u64]) -> MatValue {
+    let (rows, cols, _total) = shape_decomposition(shape);
+    match class {
+        MatClass::Double => MatValue::ComplexMatrix64 {
+            rows,
+            cols,
+            pairs: Vec::new(),
+        },
+        MatClass::Single => MatValue::ComplexMatrix32 {
+            rows,
+            cols,
+            pairs: Vec::new(),
+        },
+        _ => unreachable!("empty_complex_value called with non-float class"),
     }
 }
 
@@ -193,7 +219,14 @@ fn read_numeric(ds: &Dataset<'_>, shape: &[u64], class: MatClass) -> Result<MatV
     // 2-D dataset. Preserve the MATLAB [rows, cols] shape even when one dim
     // is 1 — Matrix<T> needs this to distinguish row vs column vectors. The
     // deserializer flattens to a plain sequence for Vec<T> callers.
-    let matrix = transpose_col_major_to_row_major(flat, rows, cols)?;
+    // Skip the transpose when one dim is 1: column-major and row-major
+    // orderings are identical for 1×N / N×1, so the call would be a no-op
+    // copy.
+    let matrix = if rows == 1 || cols == 1 {
+        flat
+    } else {
+        transpose_col_major_to_row_major(flat, rows, cols)?
+    };
     Ok(MatValue::Matrix {
         rows,
         cols,
@@ -304,33 +337,39 @@ fn read_complex(ds: &Dataset<'_>, shape: &[u64], class: MatClass) -> Result<MatV
             let pairs = parse_complex64_pairs(&bytes, total)?;
             if total == 1 {
                 let (re, im) = pairs[0];
-                Ok(MatValue::ComplexScalar64 { re, im })
-            } else if rows == 1 || cols == 1 {
-                Ok(MatValue::ComplexVec64(pairs))
-            } else {
-                let row_major = transpose_pairs_col_to_row(pairs, rows, cols);
-                Ok(MatValue::ComplexMatrix64 {
-                    rows,
-                    cols,
-                    pairs: row_major,
-                })
+                return Ok(MatValue::ComplexScalar64 { re, im });
             }
+            // Preserve the MATLAB [rows, cols] shape even when one dim is 1,
+            // so `Matrix<Complex64>` round-trips as a row vs column vector.
+            // The deserializer flattens to a plain sequence for
+            // `Vec<Complex64>` callers.
+            let row_major = if rows == 1 || cols == 1 {
+                pairs
+            } else {
+                transpose_pairs_col_to_row(pairs, rows, cols)
+            };
+            Ok(MatValue::ComplexMatrix64 {
+                rows,
+                cols,
+                pairs: row_major,
+            })
         }
         MatClass::Single => {
             let pairs = parse_complex32_pairs(&bytes, total)?;
             if total == 1 {
                 let (re, im) = pairs[0];
-                Ok(MatValue::ComplexScalar32 { re, im })
-            } else if rows == 1 || cols == 1 {
-                Ok(MatValue::ComplexVec32(pairs))
-            } else {
-                let row_major = transpose_pairs_col_to_row(pairs, rows, cols);
-                Ok(MatValue::ComplexMatrix32 {
-                    rows,
-                    cols,
-                    pairs: row_major,
-                })
+                return Ok(MatValue::ComplexScalar32 { re, im });
             }
+            let row_major = if rows == 1 || cols == 1 {
+                pairs
+            } else {
+                transpose_pairs_col_to_row(pairs, rows, cols)
+            };
+            Ok(MatValue::ComplexMatrix32 {
+                rows,
+                cols,
+                pairs: row_major,
+            })
         }
         _ => Err(MatError::Custom(
             "complex compound on non-float class".into(),
