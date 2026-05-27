@@ -25,7 +25,7 @@ use crate::filters::{ChunkContext, ZfpElementTypeWhenEnabled, compress_chunk};
 /// the paged data-block layout. The value mirrors the HDF5 C library's
 /// `H5D_FARRAY_MAX_DBLK_PAGE_NELMTS_BITS`. The reader does not use this constant:
 /// it honors whatever page size a file declares in its FAHD.
-pub const FIXED_ARRAY_PAGE_BITS: u8 = 10;
+pub(crate) const FIXED_ARRAY_PAGE_BITS: u8 = 10;
 
 /// Round a file offset up to the next cache-line boundary.
 ///
