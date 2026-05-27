@@ -506,6 +506,96 @@ fn crosscheck_chunked_dataset() {
 }
 
 #[test]
+fn crosscheck_paged_fixed_array() {
+    // > 1024 chunks pushes the Fixed Array index into its paged data block
+    // layout. A non-compliant (flat) data block makes the C library reject the
+    // file or misread it; this asserts the reference reader accepts ours.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("paged_fa.h5");
+
+    let n = 2500usize;
+    let data: Vec<f64> = (0..n).map(|i| i as f64 * 0.25).collect();
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("data")
+        .with_f64_data(&data)
+        .with_shape(&[n as u64])
+        .with_chunks(&[1]);
+    builder.write(&path).unwrap();
+
+    let file = hdf5::File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    let values = ds.read_raw::<f64>().unwrap();
+    assert_eq!(values.len(), n);
+    for (i, &v) in values.iter().enumerate() {
+        assert!((v - i as f64 * 0.25).abs() < 1e-10);
+    }
+}
+
+#[test]
+fn crosscheck_paged_fixed_array_deflate() {
+    // Paged data block on the filtered element path, read back by the reference
+    // C library (which validates each page checksum).
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("paged_fa_deflate.h5");
+
+    let n = 1500usize;
+    let data: Vec<f64> = (0..n).map(|i| (i % 11) as f64).collect();
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("data")
+        .with_f64_data(&data)
+        .with_shape(&[n as u64])
+        .with_chunks(&[1])
+        .with_deflate(4);
+    builder.write(&path).unwrap();
+
+    let file = hdf5::File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    let values = ds.read_raw::<f64>().unwrap();
+    assert_eq!(values.len(), n);
+    for (i, &v) in values.iter().enumerate() {
+        assert!((v - (i % 11) as f64).abs() < 1e-10);
+    }
+}
+
+#[test]
+fn crosscheck_read_paged_fixed_array_from_c_lib() {
+    // Reverse direction: the reference C library writes a paged Fixed Array
+    // (the layout that previously triggered "paged Fixed Array data blocks not
+    // yet supported"), and hdf5-pure must read it back. `libver_v110` forces the
+    // v110+ Fixed Array index; > 1024 fixed-shape chunks make it paged.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_paged_fa.h5");
+
+    let n = 2500usize;
+    let data: Vec<f64> = (0..n).map(|i| i as f64 * 0.25).collect();
+    {
+        let file = hdf5::FileBuilder::new()
+            .with_fapl(|fapl| fapl.libver_v110())
+            .create(&path)
+            .unwrap();
+        let ds = file
+            .new_dataset::<f64>()
+            .chunk([1])
+            .shape([n])
+            .create("data")
+            .unwrap();
+        ds.write_raw(data.as_slice()).unwrap();
+        file.close().unwrap();
+    }
+
+    let bytes = std::fs::read(&path).unwrap();
+    let file = hdf5_pure::File::from_bytes(bytes).unwrap();
+    let ds = file.dataset("data").unwrap();
+    let values = ds.read_f64().unwrap();
+    assert_eq!(values.len(), n);
+    for (i, &v) in values.iter().enumerate() {
+        assert!((v - i as f64 * 0.25).abs() < 1e-10);
+    }
+}
+
+#[test]
 fn crosscheck_deflate_compressed() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("deflate.h5");

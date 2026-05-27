@@ -681,3 +681,46 @@ fn roundtrip_group_only_no_datasets() {
         vec![42]
     );
 }
+
+#[test]
+fn roundtrip_paged_fixed_array_many_chunks() {
+    // More than 1024 chunks forces the Fixed Array index into its paged data
+    // block layout (page size = 2^10 = 1024). 2500 chunks of size 1 spans three
+    // pages, with a partial final page.
+    let n = 2500usize;
+    let data: Vec<f64> = (0..n).map(|i| i as f64 * 0.5).collect();
+
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("data")
+        .with_f64_data(&data)
+        .with_shape(&[n as u64])
+        .with_chunks(&[1]);
+    let bytes = builder.finish().unwrap();
+
+    let file = File::from_bytes(bytes).unwrap();
+    let ds = file.dataset("data").unwrap();
+    assert_eq!(ds.shape().unwrap(), vec![n as u64]);
+    assert_eq!(ds.read_f64().unwrap(), data);
+}
+
+#[test]
+fn roundtrip_paged_fixed_array_deflate() {
+    // Paged data block on the filtered (client_id = 1) path: each element record
+    // carries an address plus a variable-width compressed size and filter mask.
+    let n = 1500usize;
+    let data: Vec<f64> = (0..n).map(|i| (i % 7) as f64).collect();
+
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("data")
+        .with_f64_data(&data)
+        .with_shape(&[n as u64])
+        .with_chunks(&[1])
+        .with_deflate(4);
+    let bytes = builder.finish().unwrap();
+
+    let file = File::from_bytes(bytes).unwrap();
+    let ds = file.dataset("data").unwrap();
+    assert_eq!(ds.read_f64().unwrap(), data);
+}

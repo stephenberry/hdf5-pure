@@ -501,37 +501,65 @@ pub fn build_fixed_array_at(
 
     assert_eq!(fahd.len(), fahd_total_size);
 
-    // Build FADB
+    // Append one element record (chunk address, plus filtered size + mask).
+    let write_element = |buf: &mut Vec<u8>, chunk: &WrittenChunk| {
+        match offset_size {
+            4 => buf.extend_from_slice(&(chunk.address as u32).to_le_bytes()),
+            _ => buf.extend_from_slice(&chunk.address.to_le_bytes()),
+        }
+        if has_filters {
+            // Compressed size, written using the variable chunk_size_bytes width.
+            let cs_bytes = chunk.compressed_size.to_le_bytes();
+            buf.extend_from_slice(&cs_bytes[..chunk_size_bytes]);
+            buf.extend_from_slice(&chunk.filter_mask.to_le_bytes());
+        }
+    };
+
+    // Build FADB prefix: signature + version + client_id + header address.
     let mut fadb = Vec::new();
     fadb.extend_from_slice(b"FADB");
     fadb.push(0); // version
     fadb.push(client_id);
-
-    // header address
     match offset_size {
         4 => fadb.extend_from_slice(&(fa_base_address as u32).to_le_bytes()),
-        8 => fadb.extend_from_slice(&fa_base_address.to_le_bytes()),
         _ => fadb.extend_from_slice(&fa_base_address.to_le_bytes()),
     }
 
-    // Element data
-    for chunk in chunks {
-        match offset_size {
-            4 => fadb.extend_from_slice(&(chunk.address as u32).to_le_bytes()),
-            8 => fadb.extend_from_slice(&chunk.address.to_le_bytes()),
-            _ => fadb.extend_from_slice(&chunk.address.to_le_bytes()),
+    let page_size = 1usize << max_bits;
+    if num_elements <= page_size {
+        // Non-paged: elements stored directly, then a single checksum.
+        for chunk in chunks {
+            write_element(&mut fadb, chunk);
         }
-        if has_filters {
-            // Write compressed size using chunk_size_bytes (variable width)
-            let cs_bytes = chunk.compressed_size.to_le_bytes();
-            fadb.extend_from_slice(&cs_bytes[..chunk_size_bytes]);
-            fadb.extend_from_slice(&chunk.filter_mask.to_le_bytes());
+        let fadb_checksum = jenkins_lookup3(&fadb);
+        fadb.extend_from_slice(&fadb_checksum.to_le_bytes());
+    } else {
+        // Paged: a page-init bitmap and checksum follow the prefix, then each
+        // page stores its elements followed by its own checksum. We write every
+        // chunk densely, so all pages are initialized.
+        let npages = num_elements.div_ceil(page_size);
+        let bitmap_size = npages.div_ceil(8);
+        let mut bitmap = vec![0u8; bitmap_size];
+        for page in 0..npages {
+            // Most-significant-bit-first ordering, matching H5VM_bit_set.
+            bitmap[page / 8] |= 1 << (7 - (page % 8));
+        }
+        fadb.extend_from_slice(&bitmap);
+        let prefix_checksum = jenkins_lookup3(&fadb);
+        fadb.extend_from_slice(&prefix_checksum.to_le_bytes());
+
+        for page in 0..npages {
+            let start = page * page_size;
+            let end = core::cmp::min(start + page_size, num_elements);
+            let mut page_buf = Vec::with_capacity((end - start) * elem_size);
+            for chunk in &chunks[start..end] {
+                write_element(&mut page_buf, chunk);
+            }
+            let page_checksum = jenkins_lookup3(&page_buf);
+            page_buf.extend_from_slice(&page_checksum.to_le_bytes());
+            fadb.extend_from_slice(&page_buf);
         }
     }
-
-    // FADB checksum
-    let fadb_checksum = jenkins_lookup3(&fadb);
-    fadb.extend_from_slice(&fadb_checksum.to_le_bytes());
 
     let mut combined = fahd;
     combined.extend_from_slice(&fadb);
