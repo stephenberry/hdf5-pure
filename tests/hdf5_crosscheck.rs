@@ -596,6 +596,49 @@ fn crosscheck_read_paged_fixed_array_from_c_lib() {
 }
 
 #[test]
+fn crosscheck_read_paged_fixed_array_with_uninitialized_page() {
+    // The reference C library writes a paged Fixed Array but, with incremental
+    // allocation, only the first page's chunks are written. The second page is
+    // never allocated, so its page-init bitmap bit stays cleared. hdf5-pure must
+    // skip that page (no chunk records) and fill the unwritten tail with the
+    // dataset's fill value, exercising the bitmap-skip path against real bytes.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_paged_fa_sparse.h5");
+
+    let n = 2000usize; // 2 pages of 1024; page 1 (chunks 1024..) left untouched
+    let written = 1000usize; // entirely within page 0
+    let head: Vec<f64> = (0..written).map(|i| (i + 1) as f64).collect();
+    {
+        let file = hdf5::FileBuilder::new()
+            .with_fapl(|fapl| fapl.libver_v110())
+            .create(&path)
+            .unwrap();
+        let ds = file
+            .new_dataset::<f64>()
+            .chunk([1])
+            .shape([n])
+            .create("data")
+            .unwrap();
+        // Write only the first `written` chunks; the rest stay unallocated.
+        ds.write_slice(head.as_slice(), 0..written).unwrap();
+        file.close().unwrap();
+    }
+
+    let bytes = std::fs::read(&path).unwrap();
+    let file = hdf5_pure::File::from_bytes(bytes).unwrap();
+    let ds = file.dataset("data").unwrap();
+    let values = ds.read_f64().unwrap();
+    assert_eq!(values.len(), n);
+    for (i, &v) in values.iter().enumerate() {
+        let expected = if i < written { (i + 1) as f64 } else { 0.0 };
+        assert!(
+            (v - expected).abs() < 1e-10,
+            "index {i}: got {v}, expected {expected}"
+        );
+    }
+}
+
+#[test]
 fn crosscheck_deflate_compressed() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("deflate.h5");

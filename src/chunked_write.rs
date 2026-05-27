@@ -16,6 +16,17 @@ use crate::filter_pipeline::{
 };
 use crate::filters::{ChunkContext, ZfpElementTypeWhenEnabled, compress_chunk};
 
+/// Log2 of the Fixed Array data-block page size (`2^10 = 1024` elements).
+///
+/// Single source of truth for the page exponent the writer emits: it is both
+/// the `max_nelmts_bits` field stored in the Fixed Array header (FAHD) and the
+/// `max_dblk_page_nelmts_bits` field in the v4 chunked layout message, which the
+/// HDF5 spec requires to be equal. Above this many chunks the writer switches to
+/// the paged data-block layout. The value mirrors the HDF5 C library's
+/// `H5D_FARRAY_MAX_DBLK_PAGE_NELMTS_BITS`. The reader does not use this constant:
+/// it honors whatever page size a file declares in its FAHD.
+pub const FIXED_ARRAY_PAGE_BITS: u8 = 10;
+
 /// Round a file offset up to the next cache-line boundary.
 ///
 /// This ensures chunk data starts at an address that is a multiple of the
@@ -479,8 +490,7 @@ pub fn build_fixed_array_at(
     fahd.push(client_id);
     fahd.push(elem_size as u8);
 
-    // max_nelmts_bits: use 10 as default (page_size = 1024), matching h5py convention
-    let max_bits: u8 = 10;
+    let max_bits = FIXED_ARRAY_PAGE_BITS;
     fahd.push(max_bits);
 
     match length_size {
@@ -1070,7 +1080,6 @@ pub fn build_chunked_data_at_ext(
         )
     } else {
         let fa_address = base_address + data_buf.len() as u64;
-        let max_bits: u8 = 10;
 
         let fa_bytes = build_fixed_array_at(
             &written_chunks,
@@ -1086,7 +1095,7 @@ pub fn build_chunked_data_at_ext(
             fa_address,
             offset_size,
             element_size as u32,
-            max_bits,
+            FIXED_ARRAY_PAGE_BITS,
         )
     };
 
