@@ -4,7 +4,10 @@
 extern crate alloc;
 
 #[cfg(not(feature = "std"))]
-use alloc::{format, vec, vec::Vec};
+use alloc::{vec, vec::Vec};
+// `format!` is only reached by the zfp-gated code paths below.
+#[cfg(all(not(feature = "std"), feature = "zfp"))]
+use alloc::format;
 
 use crate::error::FormatError;
 #[cfg(feature = "zfp")]
