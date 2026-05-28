@@ -12,9 +12,11 @@ use crate::error::FormatError;
 #[cfg(feature = "zfp")]
 use crate::filter_pipeline::FILTER_ZFP;
 use crate::filter_pipeline::{
-    FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SHUFFLE, FilterDescription, FilterPipeline,
+    FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SCALEOFFSET, FILTER_SHUFFLE, FilterDescription,
+    FilterPipeline,
 };
 use crate::filters::{ChunkContext, ZfpElementTypeWhenEnabled, compress_chunk};
+use crate::scaleoffset::{ScaleOffset, ScaleOffsetType, build_cd_values};
 
 /// Log2 of the Fixed Array data-block page size (`2^10 = 1024` elements).
 ///
@@ -52,6 +54,10 @@ pub struct ChunkOptions {
     /// When set, takes priority over shuffle + deflate.
     #[cfg(feature = "zfp")]
     pub zfp_rate: Option<f64>,
+    /// Scale-offset compression mode, None = no scale-offset. When set it is
+    /// the primary transform (mutually exclusive with ZFP, replaces shuffle)
+    /// and may be followed by deflate.
+    pub scale_offset: Option<ScaleOffset>,
 }
 
 impl ChunkOptions {
@@ -62,6 +68,7 @@ impl ChunkOptions {
             || self.shuffle
             || self.fletcher32
             || self.zfp_enabled()
+            || self.scale_offset.is_some()
     }
 
     #[cfg(feature = "zfp")]
@@ -90,9 +97,9 @@ impl ChunkOptions {
         element_size: u32,
         chunk_dims: &[u64],
         zfp_element_type: Option<ZfpElementTypeWhenEnabled>,
+        scale_offset_type: Option<ScaleOffsetType>,
     ) -> Result<Option<FilterPipeline>, FormatError> {
         let mut filters = Vec::new();
-        let _ = chunk_dims; // used only under the `zfp` feature below
         let _ = zfp_element_type; // used only under the `zfp` feature below
 
         // ZFP is a standalone compressor — it replaces shuffle + deflate.
@@ -118,7 +125,37 @@ impl ChunkOptions {
         #[cfg(not(feature = "zfp"))]
         let zfp_active = false;
 
-        if !zfp_active && self.shuffle {
+        // Scale-offset is also a primary transform: mutually exclusive with
+        // ZFP, replaces shuffle, but may be followed by deflate (pushed first
+        // so the pipeline order is [scaleoffset, deflate]).
+        let scaleoffset_active = if let Some(mode) = self.scale_offset {
+            if zfp_active {
+                return Err(FormatError::FilterError(
+                    "scale-offset and ZFP cannot be combined on one dataset".into(),
+                ));
+            }
+            let ty = scale_offset_type.ok_or_else(|| {
+                FormatError::FilterError(
+                    "scale-offset requires an integer or floating-point scalar \
+                     datatype with a definite (little/big endian) byte order"
+                        .into(),
+                )
+            })?;
+            let nelmts = u32::try_from(chunk_dims.iter().product::<u64>()).map_err(|_| {
+                FormatError::FilterError("scale-offset: chunk has too many elements".into())
+            })?;
+            filters.push(FilterDescription {
+                filter_id: FILTER_SCALEOFFSET,
+                name: None,
+                flags: 0,
+                client_data: build_cd_values(mode, ty, element_size, nelmts)?,
+            });
+            true
+        } else {
+            false
+        };
+
+        if !zfp_active && !scaleoffset_active && self.shuffle {
             filters.push(FilterDescription {
                 filter_id: FILTER_SHUFFLE,
                 name: None,
@@ -994,7 +1031,12 @@ pub fn build_chunked_data_at_ext(
 ) -> Result<ChunkedDataResult, FormatError> {
     let chunk_dims = ctx.chunk_dims;
     let element_size = ctx.element_size as usize;
-    let pipeline = options.build_pipeline(ctx.element_size, chunk_dims, ctx.element_type)?;
+    let pipeline = options.build_pipeline(
+        ctx.element_size,
+        chunk_dims,
+        ctx.element_type,
+        ctx.scale_offset_type,
+    )?;
 
     let chunks = split_into_chunks(raw_data, shape, chunk_dims, element_size);
     let num_chunks = chunks.len();
@@ -1371,7 +1413,7 @@ mod tests {
             deflate_level: Some(6),
             ..Default::default()
         };
-        let pl = options.build_pipeline(8, &[], None).unwrap().unwrap();
+        let pl = options.build_pipeline(8, &[], None, None).unwrap().unwrap();
         assert_eq!(pl.filters.len(), 1);
         assert_eq!(pl.filters[0].filter_id, FILTER_DEFLATE);
     }
@@ -1384,7 +1426,7 @@ mod tests {
             fletcher32: true,
             ..Default::default()
         };
-        let pl = options.build_pipeline(8, &[], None).unwrap().unwrap();
+        let pl = options.build_pipeline(8, &[], None, None).unwrap().unwrap();
         assert_eq!(pl.filters.len(), 3);
         assert_eq!(pl.filters[0].filter_id, FILTER_SHUFFLE);
         assert_eq!(pl.filters[1].filter_id, FILTER_DEFLATE);

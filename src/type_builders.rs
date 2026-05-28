@@ -11,6 +11,7 @@ use crate::dataspace::{Dataspace, DataspaceType};
 use crate::datatype::{
     CharacterSet, CompoundMember, Datatype, DatatypeByteOrder, EnumMember, StringPadding,
 };
+use crate::scaleoffset::ScaleOffset;
 
 // ---- Datatype constructors ----
 
@@ -863,6 +864,30 @@ impl DatasetBuilder {
     /// Enable fletcher32 checksum.
     pub fn with_fletcher32(&mut self) -> &mut Self {
         self.chunk_options.fletcher32 = true;
+        self
+    }
+
+    /// Enable scale-offset compression (implies chunked if not already set).
+    ///
+    /// Scale-offset stores each chunk's values as offsets from the chunk
+    /// minimum, packed into the fewest bits the chunk's range needs:
+    ///
+    /// * [`ScaleOffset::Integer`] is **lossless** for integer datasets. Pass
+    ///   `0` to let the encoder choose the bit width per chunk (the usual
+    ///   choice).
+    /// * [`ScaleOffset::FloatDScale`] is **lossy** for float datasets: values
+    ///   are rounded to the given number of decimal digits before packing.
+    ///
+    /// The datatype class/sign/byte-order are derived from the dataset's
+    /// datatype when the file is written, so the mode must match the data
+    /// (integer mode on `with_i*`/`with_u*` data, float mode on
+    /// `with_f32`/`with_f64` data) or `finish()` / `write()` returns a
+    /// [`FormatError`](crate::FormatError). Scale-offset is mutually exclusive
+    /// with ZFP and replaces shuffle, but may be combined with
+    /// [`with_deflate`](Self::with_deflate). Files are readable by the
+    /// reference HDF5 library (filter id 6) and vice versa.
+    pub fn with_scale_offset(&mut self, mode: ScaleOffset) -> &mut Self {
+        self.chunk_options.scale_offset = Some(mode);
         self
     }
 

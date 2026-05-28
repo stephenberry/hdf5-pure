@@ -69,6 +69,7 @@ pub mod object_header;
 pub mod object_header_writer;
 #[cfg(feature = "parallel")]
 pub mod parallel_read;
+pub mod scaleoffset;
 pub mod shared_message;
 pub mod signature;
 pub mod superblock;
@@ -114,6 +115,8 @@ pub use types::{AttrValue, DType};
 
 #[cfg(feature = "std")]
 pub use writer::FileBuilder;
+
+pub use scaleoffset::ScaleOffset;
 
 pub use type_builders::{
     CompoundTypeBuilder, EnumTypeBuilder, make_f32_type, make_f64_type, make_i8_type,

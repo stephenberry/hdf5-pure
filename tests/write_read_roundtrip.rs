@@ -724,3 +724,110 @@ fn roundtrip_paged_fixed_array_deflate() {
     let ds = file.dataset("data").unwrap();
     assert_eq!(ds.read_f64().unwrap(), data);
 }
+
+// ---------------------------------------------------------------------------
+// Scale-offset filter (id 6) round-trips: write with hdf5-pure, read back.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn roundtrip_scale_offset_integer_lossless() {
+    // Multi-chunk i32 dataset, including a partial last chunk, lossless.
+    let n = 250usize;
+    let data: Vec<i32> = (0..n).map(|i| 1000 + (i as i32 % 37)).collect();
+
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("data")
+        .with_i32_data(&data)
+        .with_shape(&[n as u64])
+        .with_chunks(&[40]) // 250 / 40 -> 7 chunks, last partial
+        .with_scale_offset(hdf5_pure::ScaleOffset::Integer(0));
+    let bytes = builder.finish().unwrap();
+
+    let file = File::from_bytes(bytes).unwrap();
+    let ds = file.dataset("data").unwrap();
+    assert_eq!(ds.read_i32().unwrap(), data);
+}
+
+#[test]
+fn roundtrip_scale_offset_integer_negative_and_constant() {
+    // Negative values plus an all-equal chunk (exercises minbits == 0).
+    let mut data: Vec<i32> = (0..50).map(|i| -100 + i).collect();
+    data.extend(std::iter::repeat_n(7, 50)); // constant chunk
+
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("data")
+        .with_i32_data(&data)
+        .with_shape(&[data.len() as u64])
+        .with_chunks(&[50])
+        .with_scale_offset(hdf5_pure::ScaleOffset::Integer(0));
+    let bytes = builder.finish().unwrap();
+
+    let file = File::from_bytes(bytes).unwrap();
+    let ds = file.dataset("data").unwrap();
+    assert_eq!(ds.read_i32().unwrap(), data);
+}
+
+#[test]
+fn roundtrip_scale_offset_u16_lossless() {
+    let data: Vec<u16> = (0..100).map(|i| 40000 + (i as u16 % 13)).collect();
+
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("data")
+        .with_u16_data(&data)
+        .with_shape(&[data.len() as u64])
+        .with_chunks(&[25])
+        .with_scale_offset(hdf5_pure::ScaleOffset::Integer(0));
+    let bytes = builder.finish().unwrap();
+
+    let file = File::from_bytes(bytes).unwrap();
+    let ds = file.dataset("data").unwrap();
+    assert_eq!(ds.read_u16().unwrap(), data);
+}
+
+#[test]
+fn roundtrip_scale_offset_float_dscale_lossy() {
+    let decimals = 3i32;
+    let data: Vec<f64> = (0..200).map(|i| 1.0 + (i as f64) * 0.001).collect();
+
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("data")
+        .with_f64_data(&data)
+        .with_shape(&[data.len() as u64])
+        .with_chunks(&[64])
+        .with_scale_offset(hdf5_pure::ScaleOffset::FloatDScale(decimals));
+    let bytes = builder.finish().unwrap();
+
+    let file = File::from_bytes(bytes).unwrap();
+    let ds = file.dataset("data").unwrap();
+    let got = ds.read_f64().unwrap();
+    let tol = 0.5 * 10f64.powi(-decimals);
+    assert_eq!(got.len(), data.len());
+    for (g, w) in got.iter().zip(data.iter()) {
+        assert!((g - w).abs() <= tol, "got {g}, want {w}");
+    }
+}
+
+#[test]
+fn roundtrip_scale_offset_integer_then_deflate() {
+    // Scale-offset followed by deflate: the pipeline applies [scaleoffset, deflate]
+    // on write and reverses on read.
+    let data: Vec<i32> = (0..300).map(|i| 5000 + (i % 19)).collect();
+
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("data")
+        .with_i32_data(&data)
+        .with_shape(&[data.len() as u64])
+        .with_chunks(&[64])
+        .with_scale_offset(hdf5_pure::ScaleOffset::Integer(0))
+        .with_deflate(5);
+    let bytes = builder.finish().unwrap();
+
+    let file = File::from_bytes(bytes).unwrap();
+    let ds = file.dataset("data").unwrap();
+    assert_eq!(ds.read_i32().unwrap(), data);
+}
