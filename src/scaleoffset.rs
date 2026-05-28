@@ -1131,7 +1131,7 @@ mod tests {
     fn pack_unpack_equivalence_random() {
         // For every minbits in 1..=64 and across many random widths/lengths,
         // pack(offsets) followed by unpack must return the original offsets.
-        let mut rng = Rng::new(0xC0FFEE_F00D_1234);
+        let mut rng = Rng::new(0x00C0_FFEE_F00D_1234);
         for _ in 0..400 {
             let minbits = (rng.range(64) + 1) as u32; // 1..=64
             let nelmts = (rng.range(257) + 1) as usize; // 1..=257
@@ -1179,14 +1179,7 @@ mod tests {
 
     #[test]
     fn integer_roundtrip_random_u8() {
-        roundtrip_random::<u8>(
-            0x11,
-            1,
-            false,
-            ORDER_LE,
-            |r| (r.next() as u8),
-            |v, _| vec![v],
-        );
+        roundtrip_random::<u8>(0x11, 1, false, ORDER_LE, |r| r.next() as u8, |v, _| vec![v]);
     }
 
     #[test]
@@ -1197,7 +1190,7 @@ mod tests {
                 2,
                 false,
                 order,
-                |r| (r.next() as u16),
+                |r| r.next() as u16,
                 |v, o| {
                     if o == ORDER_LE {
                         v.to_le_bytes().to_vec()
