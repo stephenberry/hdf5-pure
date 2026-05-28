@@ -12,7 +12,10 @@ use alloc::format;
 use crate::error::FormatError;
 #[cfg(feature = "zfp")]
 use crate::filter_pipeline::FILTER_ZFP;
-use crate::filter_pipeline::{FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SHUFFLE, FilterPipeline};
+use crate::filter_pipeline::{
+    FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SCALEOFFSET, FILTER_SHUFFLE, FilterPipeline,
+};
+use crate::scaleoffset::ScaleOffsetType;
 #[cfg(feature = "zfp")]
 use crate::zfp::ZfpElementType;
 
@@ -31,6 +34,10 @@ pub struct ChunkContext<'a> {
     /// the caller does not know or does not need it; type-aware filters
     /// will return an error.
     pub element_type: Option<ZfpElementTypeWhenEnabled>,
+    /// Datatype facts the scale-offset encoder needs (class/sign/order).
+    /// `None` for callers that don't have a `Datatype` or whose type isn't a
+    /// scale-offset-compatible scalar; scale-offset writes then error.
+    pub scale_offset_type: Option<ScaleOffsetType>,
 }
 
 /// Dummy wrapper so ChunkContext's type stays stable whether or not the
@@ -49,6 +56,7 @@ impl<'a> ChunkContext<'a> {
             chunk_dims,
             element_size,
             element_type: None,
+            scale_offset_type: None,
         }
     }
 
@@ -62,6 +70,7 @@ impl<'a> ChunkContext<'a> {
             chunk_dims,
             element_size: dt.type_size(),
             element_type: zfp_element_type_from_datatype(dt),
+            scale_offset_type: crate::scaleoffset::scale_offset_type_from_datatype(dt),
         }
     }
 }
@@ -111,6 +120,7 @@ pub fn decompress_chunk(
             FILTER_SHUFFLE => shuffle_decompress(input, ctx.element_size as usize)?,
             FILTER_DEFLATE => deflate_decompress(input)?,
             FILTER_FLETCHER32 => fletcher32_verify(input)?,
+            FILTER_SCALEOFFSET => crate::scaleoffset::decompress(input, filter)?,
             #[cfg(feature = "zfp")]
             FILTER_ZFP => zfp_decompress(input, filter, &ctx)?,
             other => return Err(FormatError::UnsupportedFilter(other)),
@@ -137,6 +147,7 @@ pub fn compress_chunk(
                 deflate_compress(input, level)?
             }
             FILTER_FLETCHER32 => fletcher32_append(input)?,
+            FILTER_SCALEOFFSET => crate::scaleoffset::compress(input, filter)?,
             #[cfg(feature = "zfp")]
             FILTER_ZFP => zfp_compress(input, filter, &ctx)?,
             other => return Err(FormatError::UnsupportedFilter(other)),

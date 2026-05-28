@@ -1421,3 +1421,145 @@ fn crosscheck_matlab_userblock_header() {
     // HDF5 signature should be at offset 512
     assert_eq!(&raw[512..520], b"\x89HDF\r\n\x1a\n");
 }
+
+// ---------------------------------------------------------------------------
+// Scale-offset filter (id 6) interop, both directions.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn crosscheck_read_scale_offset_int_from_c_lib() {
+    // Reference C library writes an integer scale-offset dataset (multi-chunk,
+    // partial last chunk); hdf5-pure must decode it losslessly.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_scaleoffset_int.h5");
+
+    let n = 250usize;
+    let data: Vec<i32> = (0..n).map(|i| 1000 + (i as i32 % 37)).collect();
+    {
+        let file = hdf5::File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .scale_offset(hdf5::filters::ScaleOffset::Integer(0))
+            .chunk([40])
+            .shape([n])
+            .create("data")
+            .unwrap();
+        ds.write_raw(data.as_slice()).unwrap();
+        file.close().unwrap();
+    }
+
+    let bytes = std::fs::read(&path).unwrap();
+    let file = hdf5_pure::File::from_bytes(bytes).unwrap();
+    let ds = file.dataset("data").unwrap();
+    assert_eq!(ds.read_i32().unwrap(), data);
+}
+
+#[test]
+fn crosscheck_read_scale_offset_float_from_c_lib() {
+    // Reference C library writes a float D-scale dataset; hdf5-pure decodes it
+    // within the decimal tolerance.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_scaleoffset_float.h5");
+
+    let decimals = 3u8;
+    let n = 200usize;
+    let data: Vec<f64> = (0..n).map(|i| 5.0 + (i as f64) * 0.01).collect();
+    {
+        let file = hdf5::File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<f64>()
+            .scale_offset(hdf5::filters::ScaleOffset::FloatDScale(decimals))
+            .chunk([64])
+            .shape([n])
+            .create("data")
+            .unwrap();
+        ds.write_raw(data.as_slice()).unwrap();
+        file.close().unwrap();
+    }
+
+    let bytes = std::fs::read(&path).unwrap();
+    let file = hdf5_pure::File::from_bytes(bytes).unwrap();
+    let ds = file.dataset("data").unwrap();
+    let got = ds.read_f64().unwrap();
+    let tol = 0.5 * 10f64.powi(-(decimals as i32));
+    assert_eq!(got.len(), n);
+    for (g, w) in got.iter().zip(data.iter()) {
+        assert!((g - w).abs() <= tol, "got {g}, want {w}");
+    }
+}
+
+#[test]
+fn crosscheck_scale_offset_int_compressed() {
+    // hdf5-pure writes integer scale-offset; the reference C library reads it.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("scaleoffset_int.h5");
+
+    let n = 250usize;
+    let data: Vec<i32> = (0..n).map(|i| -50 + (i as i32 % 91)).collect();
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("data")
+        .with_i32_data(&data)
+        .with_shape(&[n as u64])
+        .with_chunks(&[40])
+        .with_scale_offset(hdf5_pure::ScaleOffset::Integer(0));
+    builder.write(&path).unwrap();
+
+    let file = hdf5::File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    let values = ds.read_raw::<i32>().unwrap();
+    assert_eq!(values, data);
+}
+
+#[test]
+fn crosscheck_scale_offset_float_dscale() {
+    // hdf5-pure writes float D-scale; the reference C library reads it within
+    // the decimal tolerance.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("scaleoffset_float.h5");
+
+    let decimals = 2i32;
+    let n = 180usize;
+    let data: Vec<f64> = (0..n).map(|i| 100.0 + (i as f64) * 0.05).collect();
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("data")
+        .with_f64_data(&data)
+        .with_shape(&[n as u64])
+        .with_chunks(&[50])
+        .with_scale_offset(hdf5_pure::ScaleOffset::FloatDScale(decimals));
+    builder.write(&path).unwrap();
+
+    let file = hdf5::File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    let values = ds.read_raw::<f64>().unwrap();
+    let tol = 0.5 * 10f64.powi(-decimals);
+    assert_eq!(values.len(), n);
+    for (g, w) in values.iter().zip(data.iter()) {
+        assert!((g - w).abs() <= tol, "got {g}, want {w}");
+    }
+}
+
+#[test]
+fn crosscheck_scale_offset_then_deflate() {
+    // hdf5-pure writes [scaleoffset, deflate]; the reference C library reads it.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("scaleoffset_deflate.h5");
+
+    let n = 300usize;
+    let data: Vec<i32> = (0..n).map(|i| 7000 + (i as i32 % 23)).collect();
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("data")
+        .with_i32_data(&data)
+        .with_shape(&[n as u64])
+        .with_chunks(&[64])
+        .with_scale_offset(hdf5_pure::ScaleOffset::Integer(0))
+        .with_deflate(5);
+    builder.write(&path).unwrap();
+
+    let file = hdf5::File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    let values = ds.read_raw::<i32>().unwrap();
+    assert_eq!(values, data);
+}

@@ -8,7 +8,7 @@ Pure-Rust HDF5 reader/writer. No C dependencies, no build scripts, WASM-compatib
 - **Read** HDF5 files (v0/v1/v2/v3 superblocks, v1/v2 object headers, contiguous/chunked/compact storage)
 - **No C dependencies** — compiles to `wasm32-unknown-unknown` with `--no-default-features`
 - **MATLAB v7.3 compatible** — userblock support, fixed-length ASCII attributes, variable-length string arrays, object references
-- Deflate and shuffle compression
+- Deflate, shuffle, and scale-offset (lossless integer / lossy float) compression
 - Compound types, enumerations, array types
 - Complex number datasets (as compound `{real, imag}`)
 
@@ -109,6 +109,35 @@ builder.create_dataset("shuffled")
     .with_shuffle()
     .with_deflate(6);
 ```
+
+### Scale-offset (HDF5 filter id 6)
+
+Scale-offset stores each chunk's values as offsets from the chunk minimum,
+packed into the fewest bits the chunk's range needs. It is a built-in HDF5
+filter, so files we write are readable by the reference C library, h5py, and
+MATLAB, and files those tools produce are readable by us.
+
+```rust
+use hdf5_pure::ScaleOffset;
+
+// Integer mode is lossless. `0` lets the encoder pick the bit width per chunk.
+builder.create_dataset("counts")
+    .with_i32_data(&counts)
+    .with_chunks(&[1000])
+    .with_scale_offset(ScaleOffset::Integer(0));
+
+// Float D-scale is lossy: values are rounded to N decimal digits before packing.
+builder.create_dataset("readings")
+    .with_f64_data(&readings)
+    .with_chunks(&[1000])
+    .with_scale_offset(ScaleOffset::FloatDScale(3))  // keep 3 decimal digits
+    .with_deflate(6);                                // may be followed by deflate
+```
+
+| Mode | Datatype | Loss |
+|---|---|---|
+| `ScaleOffset::Integer(minbits)` | signed/unsigned integers | lossless |
+| `ScaleOffset::FloatDScale(decimals)` | `f32` / `f64` | lossy to `decimals` digits |
 
 ### ZFP (optional, `zfp` feature)
 
