@@ -1332,6 +1332,149 @@ mod tests {
         );
     }
 
+    /// A chunk with `minbits > 0` and `FILL_DEFINED`: the offsets at the
+    /// all-ones sentinel must reconstruct to `filval`, while every other
+    /// offset reconstructs to `minval + offset`. Companion to the
+    /// `minbits == 0` regression above — together they cover both sides of
+    /// the sentinel branch.
+    #[test]
+    fn fill_defined_sentinel_emits_filval_not_minval() {
+        let nelmts = 4u32;
+        let size = 4u32;
+        let mut cd = vec![0u32; TOTAL_NPARMS];
+        cd[PARM_SCALETYPE] = SO_INT;
+        cd[PARM_SCALEFACTOR] = 0;
+        cd[PARM_NELMTS] = nelmts;
+        cd[PARM_CLASS] = CLS_INTEGER;
+        cd[PARM_SIZE] = size;
+        cd[PARM_SIGN] = SGN_NONE;
+        cd[PARM_ORDER] = ORDER_LE;
+        cd[PARM_FILAVAIL] = FILL_DEFINED;
+        cd[PARM_FILVAL] = 999;
+        let f = FilterDescription {
+            filter_id: crate::filter_pipeline::FILTER_SCALEOFFSET,
+            name: None,
+            flags: 0,
+            client_data: cd,
+        };
+        // minbits = 3 → sentinel = 7. Offsets [0, 1, 7, 2] expect
+        // [minval+0, minval+1, filval, minval+2] = [10, 11, 999, 12].
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(&3u32.to_le_bytes());
+        chunk.push(8);
+        chunk.extend_from_slice(&10u64.to_le_bytes());
+        chunk.extend_from_slice(&[0u8; HEADER_LEN - 13]);
+        chunk.extend_from_slice(&pack_offsets(&[0, 1, 7, 2], 3, 4));
+        let out = decompress(&chunk, &f).unwrap();
+        let got: Vec<u32> = out
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(got, vec![10u32, 11, 999, 12]);
+    }
+
+    /// The writer doesn't support encoding with a defined fill value (the
+    /// builder doesn't expose one). If someone hands it a `FILL_DEFINED`
+    /// `cd_values` directly, it must error rather than silently miscompress.
+    #[test]
+    fn compress_rejects_fill_defined() {
+        let nelmts = 4u32;
+        let size = 4u32;
+        let mut cd = vec![0u32; TOTAL_NPARMS];
+        cd[PARM_SCALETYPE] = SO_INT;
+        cd[PARM_NELMTS] = nelmts;
+        cd[PARM_CLASS] = CLS_INTEGER;
+        cd[PARM_SIZE] = size;
+        cd[PARM_SIGN] = SGN_NONE;
+        cd[PARM_ORDER] = ORDER_LE;
+        cd[PARM_FILAVAIL] = FILL_DEFINED;
+        cd[PARM_FILVAL] = 0;
+        let f = FilterDescription {
+            filter_id: crate::filter_pipeline::FILTER_SCALEOFFSET,
+            name: None,
+            flags: 0,
+            client_data: cd,
+        };
+        let raw = vec![0u8; nelmts as usize * size as usize];
+        assert!(matches!(
+            compress(&raw, &f),
+            Err(FormatError::FilterError(_))
+        ));
+    }
+
+    /// Float E-scale is forbidden by the reference library too; we error
+    /// before touching the payload.
+    #[test]
+    fn decompress_rejects_escale() {
+        let mut cd = vec![0u32; TOTAL_NPARMS];
+        cd[PARM_SCALETYPE] = SO_FLOAT_ESCALE;
+        cd[PARM_NELMTS] = 4;
+        cd[PARM_CLASS] = CLS_FLOAT;
+        cd[PARM_SIZE] = 4;
+        cd[PARM_ORDER] = ORDER_LE;
+        let f = FilterDescription {
+            filter_id: crate::filter_pipeline::FILTER_SCALEOFFSET,
+            name: None,
+            flags: 0,
+            client_data: cd,
+        };
+        let chunk = vec![0u8; HEADER_LEN + 4];
+        assert!(matches!(
+            decompress(&chunk, &f),
+            Err(FormatError::FilterError(_))
+        ));
+    }
+
+    /// A corrupt header that claims `minbits > size * 8` must error rather
+    /// than reach the bit reader and panic.
+    #[test]
+    fn decompress_rejects_oversized_minbits_header() {
+        let f = int_filter(4, false, ORDER_LE, 4);
+        // size=4 → full_bits=32. Set minbits=33.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&33u32.to_le_bytes());
+        bad.push(8);
+        bad.extend_from_slice(&0u64.to_le_bytes());
+        bad.extend_from_slice(&[0u8; HEADER_LEN - 13]);
+        bad.extend_from_slice(&[0u8; 16]); // dummy payload
+        assert!(matches!(
+            decompress(&bad, &f),
+            Err(FormatError::FilterError(_))
+        ));
+    }
+
+    /// Signed 1-byte ints: covers the `size == 1` arm of `sign_extend`,
+    /// which the unsigned `u8` round-trip skips.
+    #[test]
+    fn integer_i8_roundtrip_with_negatives() {
+        let vals: [i8; 6] = [-100, -50, 0, 27, -99, 100];
+        let raw: Vec<u8> = vals.iter().map(|&v| v as u8).collect();
+        let f = int_filter(1, true, ORDER_LE, vals.len() as u32);
+        let comp = compress(&raw, &f).unwrap();
+        let dec = decompress(&comp, &f).unwrap();
+        assert_eq!(dec, raw);
+    }
+
+    /// `nelmts == 1` exercises the streaming min/max loops in
+    /// `precompress_{integer,float}` with an empty body (the `1..nelmts`
+    /// range yields nothing). Span is 0, minbits is 0 — round-trips both
+    /// integer and float through the all-equal short-circuit.
+    #[test]
+    fn single_element_chunk_roundtrip() {
+        let raw = 42u32.to_le_bytes().to_vec();
+        let f = int_filter(4, false, ORDER_LE, 1);
+        let comp = compress(&raw, &f).unwrap();
+        let dec = decompress(&comp, &f).unwrap();
+        assert_eq!(dec, raw);
+
+        let raw = 3.14f64.to_le_bytes().to_vec();
+        let f = float_filter(8, 3, ORDER_LE, 1);
+        let comp = compress(&raw, &f).unwrap();
+        let dec = decompress(&comp, &f).unwrap();
+        let got = f64::from_le_bytes(dec.as_slice().try_into().unwrap());
+        assert!((got - 3.14).abs() <= 0.5e-3);
+    }
+
     #[test]
     fn scale_offset_type_from_datatype_classes() {
         let i32_ty = Datatype::FixedPoint {
