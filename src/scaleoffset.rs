@@ -295,24 +295,39 @@ pub fn decompress(input: &[u8], filter: &FilterDescription) -> Result<Vec<u8>, F
         return Ok(input[start..start + size_out].to_vec());
     }
 
-    // Unpack per-element offsets (all zero when minbits == 0).
-    let offsets = if minbits == 0 {
-        vec![0u64; p.nelmts]
-    } else {
-        if input.len() < HEADER_LEN {
-            return Err(FormatError::FilterError(
-                "scaleoffset: chunk too short for packed payload".to_string(),
-            ));
-        }
-        let payload = &input[HEADER_LEN..];
-        unpack_bits(payload, p.nelmts, minbits)?
-    };
-
+    // minbits == 0 means every element equals `minval`. Short-circuit so we
+    // never enter the sentinel-matching path, which would otherwise misread
+    // a `FILL_DEFINED` chunk's stored values as fill values (the all-ones
+    // sentinel collapses to 0 when minbits == 0, the same value every zero
+    // offset carries). The reference C decoder handles this identically.
     let mut out = Vec::with_capacity(size_out);
+    if minbits == 0 {
+        let mask = p.width_mask();
+        for _ in 0..p.nelmts {
+            write_value(&mut out, minval & mask, p.size, p.order);
+        }
+        return Ok(out);
+    }
+
+    if input.len() < HEADER_LEN {
+        return Err(FormatError::FilterError(
+            "scaleoffset: chunk too short for packed payload".to_string(),
+        ));
+    }
+    let payload = &input[HEADER_LEN..];
+    // Validate payload length once, up front; the BitReader trusts the
+    // caller to not read past the end.
+    if payload.len() * 8 < p.nelmts * minbits as usize {
+        return Err(FormatError::FilterError(
+            "scaleoffset: payload too short for packed data".to_string(),
+        ));
+    }
+    let mut reader = BitReader::new(payload);
+
     if p.class == CLS_INTEGER {
-        reconstruct_integer(&mut out, &offsets, &p, minbits, minval, cd)?;
+        reconstruct_integer(&mut out, &mut reader, &p, minbits, minval, cd)?;
     } else {
-        reconstruct_float(&mut out, &offsets, &p, minbits, minval, cd)?;
+        reconstruct_float(&mut out, &mut reader, &p, minbits, minval, cd)?;
     }
     Ok(out)
 }
@@ -376,7 +391,7 @@ pub fn compress(input: &[u8], filter: &FilterDescription) -> Result<Vec<u8>, For
 
 fn reconstruct_integer(
     out: &mut Vec<u8>,
-    offsets: &[u64],
+    reader: &mut BitReader<'_>,
     p: &Parms,
     minbits: u32,
     minval: u64,
@@ -384,14 +399,16 @@ fn reconstruct_integer(
 ) -> Result<(), FormatError> {
     let mask = p.width_mask();
     let sentinel = sentinel(minbits);
+    // Hoist `fv & mask` out of the per-element branch.
     let filval = if p.filavail == FILL_DEFINED {
-        Some(read_fill_bits(cd, p.size)?)
+        Some(read_fill_bits(cd, p.size)? & mask)
     } else {
         None
     };
-    for &d in offsets {
+    for _ in 0..p.nelmts {
+        let d = reader.read(minbits);
         let bits = match filval {
-            Some(fv) if d == sentinel => fv & mask,
+            Some(fv) if d == sentinel => fv,
             _ => d.wrapping_add(minval) & mask,
         };
         write_value(out, bits, p.size, p.order);
@@ -400,20 +417,31 @@ fn reconstruct_integer(
 }
 
 fn precompress_integer(input: &[u8], p: &Parms, signed: bool) -> (u32, u64, Vec<u64>) {
-    // Gather elements as i128 so signed and unsigned ranges share one path.
-    let vals: Vec<i128> = (0..p.nelmts)
-        .map(|i| {
-            let bits = read_value(&input[i * p.size..(i + 1) * p.size], p.size, p.order);
-            if signed {
-                sign_extend(bits, p.size) as i128
-            } else {
-                bits as i128
-            }
-        })
-        .collect();
+    // Stream the input twice (min/max, then offsets) instead of materializing
+    // a Vec<i128>. The intermediate dominated cache pressure on large chunks
+    // (16 B/element vs the source's 1-8 B/element); two cache-warm passes
+    // come out ahead.
+    let full_bits = (p.size * 8) as u32;
+    let read_as_i128 = |i: usize| -> i128 {
+        let bits = read_value(&input[i * p.size..(i + 1) * p.size], p.size, p.order);
+        if signed {
+            sign_extend(bits, p.size) as i128
+        } else {
+            bits as i128
+        }
+    };
 
-    let min = *vals.iter().min().unwrap();
-    let max = *vals.iter().max().unwrap();
+    let first = read_as_i128(0);
+    let (mut min, mut max) = (first, first);
+    for i in 1..p.nelmts {
+        let v = read_as_i128(i);
+        if v < min {
+            min = v;
+        }
+        if v > max {
+            max = v;
+        }
+    }
 
     let minval = if signed {
         (min as i64) as u64
@@ -421,21 +449,22 @@ fn precompress_integer(input: &[u8], p: &Parms, signed: bool) -> (u32, u64, Vec<
         min as u64
     };
 
-    // Overflow guard mirrors `H5Z_scaleoffset_check_{1,2}`: a span within two of
-    // the full range can't gain from packing, so store at full precision.
+    // Overflow guard mirrors `H5Z_scaleoffset_check_{1,2}`: a span within two
+    // of the full range can't gain from packing, so store at full precision.
     let width_max: u128 = p.width_mask() as u128;
     let spread = (max - min) as u128;
     if spread > width_max.saturating_sub(2) {
-        return ((p.size * 8) as u32, minval, Vec::new());
+        return (full_bits, minval, Vec::new());
     }
 
-    let span = (spread as u64) + 1;
-    let minbits = ceil_log2(span);
-    if minbits >= (p.size * 8) as u32 {
-        return ((p.size * 8) as u32, minval, Vec::new());
+    let minbits = ceil_log2((spread as u64) + 1);
+    if minbits >= full_bits {
+        return (full_bits, minval, Vec::new());
     }
 
-    let offsets = vals.iter().map(|&v| (v - min) as u64).collect();
+    let offsets = (0..p.nelmts)
+        .map(|i| (read_as_i128(i) - min) as u64)
+        .collect();
     (minbits, minval, offsets)
 }
 
@@ -443,7 +472,7 @@ fn precompress_integer(input: &[u8], p: &Parms, signed: bool) -> (u32, u64, Vec<
 
 fn reconstruct_float(
     out: &mut Vec<u8>,
-    offsets: &[u64],
+    reader: &mut BitReader<'_>,
     p: &Parms,
     minbits: u32,
     minval: u64,
@@ -456,98 +485,105 @@ fn reconstruct_float(
     } else {
         None
     };
-    for &d in offsets {
-        let bits = if let Some(fv) = filval.filter(|_| d == sentinel) {
-            fv
-        } else if p.size == 4 {
-            let min = f32::from_bits(minval as u32);
-            let pow = pow10_f32(decimals);
-            ((d as i64 as f32) / pow + min).to_bits() as u64
-        } else {
-            let min = f64::from_bits(minval);
-            let pow = pow10_f64(decimals);
-            ((d as i64 as f64) / pow + min).to_bits()
-        };
-        write_value(out, bits, p.size, p.order);
+    // Dispatch on width once: pow, min, and the size/order args are all
+    // loop-invariant. The compiler won't hoist the inner `match p.size`
+    // across both branches by itself.
+    if p.size == 4 {
+        let min = f32::from_bits(minval as u32);
+        let pow = pow10_f32(decimals);
+        for _ in 0..p.nelmts {
+            let d = reader.read(minbits);
+            let bits = if let Some(fv) = filval.filter(|_| d == sentinel) {
+                fv
+            } else {
+                ((d as i64 as f32) / pow + min).to_bits() as u64
+            };
+            write_value(out, bits, 4, p.order);
+        }
+    } else {
+        let min = f64::from_bits(minval);
+        let pow = pow10_f64(decimals);
+        for _ in 0..p.nelmts {
+            let d = reader.read(minbits);
+            let bits = if let Some(fv) = filval.filter(|_| d == sentinel) {
+                fv
+            } else {
+                ((d as i64 as f64) / pow + min).to_bits()
+            };
+            write_value(out, bits, 8, p.order);
+        }
     }
     Ok(())
 }
 
 fn precompress_float(input: &[u8], p: &Parms) -> (u32, u64, Vec<u64>) {
+    // Two streaming passes over the input bytes (min/max, then offsets),
+    // no intermediate Vec<f32>/Vec<f64>. `min_scaled = min * pow` is hoisted
+    // out of the per-element loop so we don't recompute the same product N
+    // times — bit-identical to the previous `v * pow - min * pow`.
     let decimals = p.scale_factor;
     let full_bits = (p.size * 8) as u32;
     if p.size == 4 {
-        let vals: Vec<f32> = (0..p.nelmts)
-            .map(|i| f32::from_bits(read_value(&input[i * 4..i * 4 + 4], 4, p.order) as u32))
-            .collect();
-        let (min, max) = min_max_f32(&vals);
-        let pow = pow10_f32(decimals);
-        // check_3: residual span beyond signed range → store raw.
-        let residual = max * pow - min * pow;
-        if residual > (1u64 << 31) as f32 {
-            return (full_bits, (min.to_bits() as u64), Vec::new());
+        let read_f32 = |i: usize| -> f32 {
+            f32::from_bits(read_value(&input[i * 4..i * 4 + 4], 4, p.order) as u32)
+        };
+        let first = read_f32(0);
+        let (mut min, mut max) = (first, first);
+        for i in 1..p.nelmts {
+            let v = read_f32(i);
+            if v < min {
+                min = v;
+            }
+            if v > max {
+                max = v;
+            }
         }
-        let span = (round_half_away_f32(residual) as u64) + 1;
-        let minbits = ceil_log2(span);
+        let pow = pow10_f32(decimals);
+        let min_scaled = min * pow;
+        // check_3: residual span beyond signed 32-bit range → store raw.
+        let residual = max * pow - min_scaled;
         let minval = min.to_bits() as u64;
+        if residual > (1u64 << 31) as f32 {
+            return (full_bits, minval, Vec::new());
+        }
+        let minbits = ceil_log2((round_half_away_f32(residual) as u64) + 1);
         if minbits >= full_bits {
             return (full_bits, minval, Vec::new());
         }
-        let offsets = vals
-            .iter()
-            .map(|&v| round_half_away_f32(v * pow - min * pow) as u64)
+        let offsets = (0..p.nelmts)
+            .map(|i| round_half_away_f32(read_f32(i) * pow - min_scaled) as u64)
             .collect();
         (minbits, minval, offsets)
     } else {
-        let vals: Vec<f64> = (0..p.nelmts)
-            .map(|i| f64::from_bits(read_value(&input[i * 8..i * 8 + 8], 8, p.order)))
-            .collect();
-        let (min, max) = min_max_f64(&vals);
-        let pow = pow10_f64(decimals);
-        let residual = max * pow - min * pow;
-        if residual > (1u64 << 63) as f64 {
-            return (full_bits, min.to_bits(), Vec::new());
+        let read_f64 =
+            |i: usize| -> f64 { f64::from_bits(read_value(&input[i * 8..i * 8 + 8], 8, p.order)) };
+        let first = read_f64(0);
+        let (mut min, mut max) = (first, first);
+        for i in 1..p.nelmts {
+            let v = read_f64(i);
+            if v < min {
+                min = v;
+            }
+            if v > max {
+                max = v;
+            }
         }
-        let span = (round_half_away_f64(residual) as u64) + 1;
-        let minbits = ceil_log2(span);
+        let pow = pow10_f64(decimals);
+        let min_scaled = min * pow;
+        let residual = max * pow - min_scaled;
         let minval = min.to_bits();
+        if residual > (1u64 << 63) as f64 {
+            return (full_bits, minval, Vec::new());
+        }
+        let minbits = ceil_log2((round_half_away_f64(residual) as u64) + 1);
         if minbits >= full_bits {
             return (full_bits, minval, Vec::new());
         }
-        let offsets = vals
-            .iter()
-            .map(|&v| round_half_away_f64(v * pow - min * pow) as u64)
+        let offsets = (0..p.nelmts)
+            .map(|i| round_half_away_f64(read_f64(i) * pow - min_scaled) as u64)
             .collect();
         (minbits, minval, offsets)
     }
-}
-
-fn min_max_f32(vals: &[f32]) -> (f32, f32) {
-    let mut min = vals[0];
-    let mut max = vals[0];
-    for &v in vals {
-        if v < min {
-            min = v;
-        }
-        if v > max {
-            max = v;
-        }
-    }
-    (min, max)
-}
-
-fn min_max_f64(vals: &[f64]) -> (f64, f64) {
-    let mut min = vals[0];
-    let mut max = vals[0];
-    for &v in vals {
-        if v < min {
-            min = v;
-        }
-        if v > max {
-            max = v;
-        }
-    }
-    (min, max)
 }
 
 // --- header emit helpers --------------------------------------------------
@@ -584,23 +620,127 @@ fn write_header(out: &mut Vec<u8>, minbits: u32, minval: u64) {
 // --- bit packing ----------------------------------------------------------
 
 /// Pack `nelmts` offsets, `minbits` bits each, MSB-first. The buffer length
-/// matches the reference `nelmts * minbits / 8 + 1` (the `+1` is a zero
-/// trailing byte the reference always reserves).
+/// matches the reference `nelmts * minbits / 8 + 1`: enough for the bit
+/// stream plus, when the stream is a multiple of 8 bits, one trailing zero
+/// the reference always reserves.
+///
+/// Implementation maintains a `u64` accumulator with the most recently
+/// written bits at its bottom, flushing whole bytes from the top as the
+/// accumulator fills. This processes a chunk of `nelmts * minbits` bits
+/// with O(nelmts) iterations rather than O(nelmts * minbits) — roughly an
+/// order of magnitude fewer instructions in the hot path for typical
+/// minbits.
 fn pack_offsets(offsets: &[u64], minbits: u32, nelmts: usize) -> Vec<u8> {
     let payload_len = nelmts * minbits as usize / 8 + 1;
-    let mut buf = vec![0u8; payload_len];
-    let mut bitpos = 0usize;
+    if minbits == 0 {
+        // All offsets are zero; the reference layout is just `payload_len`
+        // zero bytes.
+        return vec![0u8; payload_len];
+    }
+    let mut buf = Vec::with_capacity(payload_len);
+    let mask: u64 = if minbits == 64 {
+        u64::MAX
+    } else {
+        (1u64 << minbits) - 1
+    };
+    let mut acc: u64 = 0;
+    let mut nbits: u32 = 0;
     for &v in offsets {
-        for b in (0..minbits).rev() {
-            if (v >> b) & 1 != 0 {
-                buf[bitpos >> 3] |= 1 << (7 - (bitpos & 7));
-            }
-            bitpos += 1;
+        // Drain whole bytes already buffered so nbits ∈ 0..=7 going in.
+        while nbits >= 8 {
+            nbits -= 8;
+            buf.push(((acc >> nbits) & 0xFF) as u8);
         }
+        // Merge in `minbits` bits. Work in u128 because `acc << 64` would be
+        // UB in u64 (we'd hit it when minbits == 64 and nbits == 0).
+        let combined = ((acc as u128) << minbits) | (v & mask) as u128;
+        let total = nbits + minbits;
+        if total <= 64 {
+            acc = combined as u64;
+            nbits = total;
+        } else {
+            // The merged value spans more than a u64; emit 8 bytes from the
+            // top and keep the spillover (always 1..=7 bits) for next round.
+            let drop = total - 64;
+            let top = (combined >> drop) as u64;
+            buf.extend_from_slice(&top.to_be_bytes());
+            acc = (combined & ((1u128 << drop) - 1)) as u64;
+            nbits = drop;
+        }
+    }
+    while nbits >= 8 {
+        nbits -= 8;
+        buf.push(((acc >> nbits) & 0xFF) as u8);
+    }
+    if nbits > 0 {
+        // Left-align the remaining bits into a final byte; the low bits are
+        // zero padding within the partial byte.
+        buf.push(((acc << (8 - nbits)) & 0xFF) as u8);
+    }
+    // For bit streams that end on a byte boundary, the reference still
+    // reserves one trailing zero. The formula above sized the buffer for
+    // either case; pad here.
+    while buf.len() < payload_len {
+        buf.push(0);
     }
     buf
 }
 
+/// Streaming MSB-first bit reader over a packed payload. Fused with the
+/// reconstruction loop so we don't have to materialize a `Vec<u64>` of
+/// intermediate offsets.
+struct BitReader<'a> {
+    payload: &'a [u8],
+    bit_pos: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(payload: &'a [u8]) -> Self {
+        Self {
+            payload,
+            bit_pos: 0,
+        }
+    }
+
+    /// Read the next `minbits` bits (1..=64) MSB-first. Caller validates
+    /// that the payload holds enough bits up front.
+    #[inline]
+    fn read(&mut self, minbits: u32) -> u64 {
+        debug_assert!((1..=64).contains(&minbits));
+        let byte = self.bit_pos >> 3;
+        let off = (self.bit_pos & 7) as u32;
+
+        // Load a 72-bit window at `byte`. Hot path: payload has ≥ 9 bytes
+        // remaining and we can read directly. Tail: zero-pad a stack buffer.
+        let (hi, lo) = if byte + 9 <= self.payload.len() {
+            let hi = u64::from_be_bytes(self.payload[byte..byte + 8].try_into().unwrap());
+            let lo = self.payload[byte + 8] as u64;
+            (hi, lo)
+        } else {
+            let mut window = [0u8; 9];
+            let take = self.payload.len().saturating_sub(byte).min(9);
+            window[..take].copy_from_slice(&self.payload[byte..byte + take]);
+            let hi = u64::from_be_bytes(window[..8].try_into().unwrap());
+            let lo = window[8] as u64;
+            (hi, lo)
+        };
+
+        // Align the window so the desired `minbits` bits sit at the top of
+        // a 64-bit value, then shift them down. The off == 0 branch avoids
+        // the otherwise-suspicious `lo >> 8` on a value with only 8 set bits.
+        let combined = if off == 0 {
+            hi
+        } else {
+            (hi << off) | (lo >> (8 - off))
+        };
+        self.bit_pos += minbits as usize;
+        combined >> (64 - minbits)
+    }
+}
+
+/// Test-only helper: collect a full bitstream into a `Vec<u64>`. The main
+/// decompress path drives the reconstructor directly off [`BitReader`].
+#[cfg(test)]
 fn unpack_bits(payload: &[u8], nelmts: usize, minbits: u32) -> Result<Vec<u64>, FormatError> {
     let total_bits = nelmts * minbits as usize;
     if payload.len() * 8 < total_bits {
@@ -608,18 +748,8 @@ fn unpack_bits(payload: &[u8], nelmts: usize, minbits: u32) -> Result<Vec<u64>, 
             "scaleoffset: payload too short for packed data".to_string(),
         ));
     }
-    let mut out = Vec::with_capacity(nelmts);
-    let mut bitpos = 0usize;
-    for _ in 0..nelmts {
-        let mut v = 0u64;
-        for _ in 0..minbits {
-            let bit = (payload[bitpos >> 3] >> (7 - (bitpos & 7))) & 1;
-            v = (v << 1) | bit as u64;
-            bitpos += 1;
-        }
-        out.push(v);
-    }
-    Ok(out)
+    let mut reader = BitReader::new(payload);
+    Ok((0..nelmts).map(|_| reader.read(minbits)).collect())
 }
 
 // --- value (de)serialization ----------------------------------------------
@@ -973,6 +1103,233 @@ mod tests {
             order: ORDER_LE,
         };
         assert!(build_cd_values(ScaleOffset::Integer(0), float_ty, 8, 10).is_err());
+    }
+
+    /// Deterministic xorshift64 used to drive the property-style tests below.
+    /// Keeps the dev-dependency footprint minimal while still covering a wide
+    /// input space; seeds are fixed so failures are reproducible.
+    struct Rng(u64);
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed | 1)
+        }
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn range(&mut self, hi: u64) -> u64 {
+            // Modulo bias is fine for our coverage purposes.
+            self.next() % hi
+        }
+    }
+
+    #[test]
+    fn pack_unpack_equivalence_random() {
+        // For every minbits in 1..=64 and across many random widths/lengths,
+        // pack(offsets) followed by unpack must return the original offsets.
+        let mut rng = Rng::new(0xC0FFEE_F00D_1234);
+        for _ in 0..400 {
+            let minbits = (rng.range(64) + 1) as u32; // 1..=64
+            let nelmts = (rng.range(257) + 1) as usize; // 1..=257
+            let mask = if minbits == 64 {
+                u64::MAX
+            } else {
+                (1u64 << minbits) - 1
+            };
+            let offsets: Vec<u64> = (0..nelmts).map(|_| rng.next() & mask).collect();
+            let packed = pack_offsets(&offsets, minbits, nelmts);
+            // Reference layout reserves at least one trailing byte.
+            assert_eq!(packed.len(), nelmts * minbits as usize / 8 + 1);
+            let unpacked = unpack_bits(&packed, nelmts, minbits).unwrap();
+            assert_eq!(
+                unpacked, offsets,
+                "minbits={minbits}, nelmts={nelmts}, seed=0xC0FFEEF00D1234"
+            );
+        }
+    }
+
+    fn roundtrip_random<T: Copy>(
+        seed: u64,
+        size: u32,
+        signed: bool,
+        order: u32,
+        encode: impl Fn(&mut Rng) -> T,
+        to_bytes: impl Fn(T, u32) -> Vec<u8>,
+    ) {
+        let mut rng = Rng::new(seed);
+        for trial in 0..40 {
+            let nelmts = (rng.range(199) + 1) as usize;
+            let mut raw = Vec::with_capacity(nelmts * size as usize);
+            for _ in 0..nelmts {
+                raw.extend_from_slice(&to_bytes(encode(&mut rng), order));
+            }
+            let f = int_filter(size, signed, order, nelmts as u32);
+            let comp = compress(&raw, &f).unwrap();
+            let dec = decompress(&comp, &f).unwrap();
+            assert_eq!(
+                dec, raw,
+                "trial {trial}: size={size}, signed={signed}, order={order}"
+            );
+        }
+    }
+
+    #[test]
+    fn integer_roundtrip_random_u8() {
+        roundtrip_random::<u8>(
+            0x11,
+            1,
+            false,
+            ORDER_LE,
+            |r| (r.next() as u8),
+            |v, _| vec![v],
+        );
+    }
+
+    #[test]
+    fn integer_roundtrip_random_u16_le_and_be() {
+        for &order in &[ORDER_LE, ORDER_BE] {
+            roundtrip_random::<u16>(
+                0x22 ^ order as u64,
+                2,
+                false,
+                order,
+                |r| (r.next() as u16),
+                |v, o| {
+                    if o == ORDER_LE {
+                        v.to_le_bytes().to_vec()
+                    } else {
+                        v.to_be_bytes().to_vec()
+                    }
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn integer_roundtrip_random_i32_narrow_and_wide() {
+        // Mix narrow (small span -> small minbits) and wide (forces raw path).
+        let mut rng = Rng::new(0x33);
+        for trial in 0..40 {
+            let nelmts = (rng.range(199) + 1) as usize;
+            let narrow = rng.next() & 1 == 0;
+            let mut raw = Vec::with_capacity(nelmts * 4);
+            for _ in 0..nelmts {
+                let v: i32 = if narrow {
+                    (rng.range(1024) as i32) - 512 // span ~= 1024
+                } else {
+                    rng.next() as i32 // full range
+                };
+                raw.extend_from_slice(&v.to_le_bytes());
+            }
+            let f = int_filter(4, true, ORDER_LE, nelmts as u32);
+            let comp = compress(&raw, &f).unwrap();
+            let dec = decompress(&comp, &f).unwrap();
+            assert_eq!(dec, raw, "trial {trial}: narrow={narrow}");
+        }
+    }
+
+    #[test]
+    fn integer_roundtrip_random_i64() {
+        roundtrip_random::<i64>(
+            0x44,
+            8,
+            true,
+            ORDER_LE,
+            |r| {
+                // Bias toward narrow spans so we exercise the packing path,
+                // but include the full-range tail too.
+                let span = 1u64 << (r.range(48) as u32 + 1);
+                let v = (r.next() % span) as i64;
+                let off = (r.next() as i64) >> 1;
+                v.wrapping_add(off)
+            },
+            |v, _| v.to_le_bytes().to_vec(),
+        );
+    }
+
+    #[test]
+    fn float_dscale_roundtrip_random_within_tolerance() {
+        let mut rng = Rng::new(0x55);
+        for trial in 0..30 {
+            let nelmts = (rng.range(99) + 1) as usize;
+            let decimals = (rng.range(5) as i32) + 1; // 1..=5
+            // Keep magnitudes modest so f64 ULP stays well below the D-scale
+            // tolerance. Avoid generating values pre-quantized to the same
+            // precision (decimals) we then round to, otherwise the input
+            // sits exactly on a rounding boundary.
+            let mut raw = Vec::with_capacity(nelmts * 8);
+            let mut vals = Vec::with_capacity(nelmts);
+            for _ in 0..nelmts {
+                let v = (rng.next() as i32 as f64) * 1e-9; // |v| <= ~2.1
+                vals.push(v);
+                raw.extend_from_slice(&v.to_le_bytes());
+            }
+            let f = float_filter(8, decimals, ORDER_LE, nelmts as u32);
+            let comp = compress(&raw, &f).unwrap();
+            let dec = decompress(&comp, &f).unwrap();
+            let got: Vec<f64> = dec
+                .chunks_exact(8)
+                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            // 0.5 ULP rounding + a few ULP of float arithmetic noise.
+            let tol = 0.501 * 10f64.powi(-decimals);
+            for (g, v) in got.iter().zip(vals.iter()) {
+                assert!(
+                    (g - v).abs() <= tol,
+                    "trial {trial}: got {g}, want {v} (tol {tol})"
+                );
+            }
+        }
+    }
+
+    /// Build a synthetic chunk where `minbits == 0`, the compressed header
+    /// declares `minval = 7`, but the filter's `cd_values` say
+    /// `filavail = FILL_DEFINED` with `filval = 99`. The reference C decoder
+    /// short-circuits the `minbits == 0` path to emit `minval` for every
+    /// element. The Rust port must match: every element should reconstruct
+    /// to 7, not 99. Catches the sentinel-collision divergence flagged in
+    /// the scale-offset review.
+    #[test]
+    fn minbits_zero_with_fill_defined_emits_minval_not_filval() {
+        let nelmts = 5u32;
+        let size = 4u32;
+        let mut cd = vec![0u32; TOTAL_NPARMS];
+        cd[PARM_SCALETYPE] = SO_INT;
+        cd[PARM_SCALEFACTOR] = 0;
+        cd[PARM_NELMTS] = nelmts;
+        cd[PARM_CLASS] = CLS_INTEGER;
+        cd[PARM_SIZE] = size;
+        cd[PARM_SIGN] = SGN_NONE;
+        cd[PARM_ORDER] = ORDER_LE;
+        cd[PARM_FILAVAIL] = FILL_DEFINED;
+        cd[PARM_FILVAL] = 99;
+        let f = FilterDescription {
+            filter_id: crate::filter_pipeline::FILTER_SCALEOFFSET,
+            name: None,
+            flags: 0,
+            client_data: cd,
+        };
+        // 21-byte header (minbits=0, minval=7) + 1-byte trailing pad.
+        let mut chunk = Vec::with_capacity(HEADER_LEN + 1);
+        chunk.extend_from_slice(&0u32.to_le_bytes());
+        chunk.push(8);
+        chunk.extend_from_slice(&7u64.to_le_bytes());
+        chunk.extend_from_slice(&[0u8; HEADER_LEN - 13]);
+        chunk.push(0);
+        let out = decompress(&chunk, &f).unwrap();
+        let got: Vec<u32> = out
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![7u32; nelmts as usize],
+            "minbits==0 with FILL_DEFINED must emit minval, not filval"
+        );
     }
 
     #[test]
