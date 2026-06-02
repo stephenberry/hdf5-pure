@@ -5,7 +5,7 @@
 
 use hdf5::Extent;
 use hdf5::file::LibraryVersion;
-use hdf5_pure::{File, FileBuilder, SwmrWriter};
+use hdf5_pure::{Error, File, FileBuilder, FormatError, SwmrWriter};
 use tempfile::tempdir;
 
 fn pure_create(path: &std::path::Path, n: usize) {
@@ -217,4 +217,202 @@ fn append_f64_pure_file() {
     let v = f.dataset("d").unwrap().read_raw::<f64>().unwrap();
     let expected: Vec<f64> = (0..400).map(|i| i as f64).collect();
     assert_eq!(v, expected);
+}
+
+/// Every other fixture uses a chunk length of 1, where "element count" and
+/// "chunk count" collapse and a chunk-vs-element confusion is invisible. This
+/// exercises a multi-element chunk (`chunks = [4]`): aligned appends that cross
+/// the inline -> direct -> super-block boundary must read back correctly via
+/// pure and C, and an append whose length is not a whole number of chunks must
+/// be rejected before any write.
+#[test]
+fn append_chunk_size_greater_than_one() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("chunk4.h5");
+
+    let mut b = FileBuilder::new();
+    b.create_dataset("d")
+        .with_i32_data(&(0..16).collect::<Vec<_>>())
+        .with_shape(&[16])
+        .with_maxshape(&[u64::MAX])
+        .with_chunks(&[4]);
+    b.write(&path).unwrap();
+
+    {
+        let mut w = SwmrWriter::open(&path).unwrap();
+        // Aligned (multiples of the chunk length), crossing inline -> direct -> super.
+        w.append_i32("d", &(16..240).collect::<Vec<_>>()).unwrap();
+        w.append_i32("d", &(240..400).collect::<Vec<_>>()).unwrap();
+
+        // Unaligned append (2 elements, 2 % 4 != 0) is rejected before any write.
+        let err = match w.append_i32("d", &[400, 401]) {
+            Ok(()) => panic!("expected an unaligned append to be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, Error::Format(FormatError::ChunkedReadError(_))),
+            "expected ChunkedReadError for an unaligned append, got {err:?}"
+        );
+    }
+
+    let expected: Vec<i32> = (0..400).collect();
+    assert_eq!(
+        read_pure(&path),
+        expected,
+        "hdf5-pure read mismatch (chunk=4)"
+    );
+    assert_eq!(read_c(&path), expected, "C-library read mismatch (chunk=4)");
+}
+
+/// Appending to one dataset must not disturb a sibling. No other test has more
+/// than one dataset, so cross-dataset isolation (correct object-header
+/// resolution, and EOF appends not clobbering another dataset's blocks) is
+/// otherwise unverified. The shared superblock legitimately changes, so the
+/// sibling is checked by reading it back, not byte-for-byte.
+#[test]
+fn append_to_one_of_multiple_datasets_leaves_others_intact() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("multi.h5");
+
+    let mut b = FileBuilder::new();
+    b.create_dataset("a")
+        .with_i32_data(&(0..10).collect::<Vec<_>>())
+        .with_shape(&[10])
+        .with_maxshape(&[u64::MAX])
+        .with_chunks(&[1]);
+    b.create_dataset("b")
+        .with_i32_data(&(100..110).collect::<Vec<_>>())
+        .with_shape(&[10])
+        .with_maxshape(&[u64::MAX])
+        .with_chunks(&[1]);
+    b.write(&path).unwrap();
+
+    let read_pure_named = |name: &str| -> Vec<i32> {
+        let f = File::from_bytes(std::fs::read(&path).unwrap()).unwrap();
+        f.dataset(name).unwrap().read_i32().unwrap()
+    };
+    let read_c_named = |name: &str| -> Vec<i32> {
+        let f = hdf5::File::open(&path).unwrap();
+        f.dataset(name).unwrap().read_raw::<i32>().unwrap()
+    };
+
+    // Append into "a", crossing into the super blocks; "b" must be untouched.
+    {
+        let mut w = SwmrWriter::open(&path).unwrap();
+        w.append_i32("a", &(10..300).collect::<Vec<_>>()).unwrap();
+    }
+    assert_eq!(read_pure_named("a"), (0..300).collect::<Vec<_>>());
+    assert_eq!(
+        read_pure_named("b"),
+        (100..110).collect::<Vec<_>>(),
+        "sibling b changed (pure)"
+    );
+    assert_eq!(
+        read_c_named("b"),
+        (100..110).collect::<Vec<_>>(),
+        "sibling b changed (C)"
+    );
+
+    // Now append into "b"; "a" must be untouched.
+    {
+        let mut w = SwmrWriter::open(&path).unwrap();
+        w.append_i32("b", &(110..400).collect::<Vec<_>>()).unwrap();
+    }
+    assert_eq!(
+        read_pure_named("a"),
+        (0..300).collect::<Vec<_>>(),
+        "sibling a changed (pure)"
+    );
+    assert_eq!(read_pure_named("b"), (100..400).collect::<Vec<_>>());
+    assert_eq!(
+        read_c_named("a"),
+        (0..300).collect::<Vec<_>>(),
+        "sibling a changed (C)"
+    );
+    assert_eq!(read_c_named("b"), (100..400).collect::<Vec<_>>());
+}
+
+/// Reopen a cleanly-closed file with a fresh writer and keep appending. Every
+/// other append test holds a single writer open for all appends; this exercises
+/// the persisted-state round-trip through a second `open()` (re-deriving the
+/// committed dimension and EA count from disk) and confirms the second writer
+/// continues at the correct ordinal rather than re-appending or gapping.
+#[test]
+fn recover_and_reappend_after_clean_phase4() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("reopen.h5");
+    pure_create(&path, 10);
+
+    // Writer 1: append across inline -> direct -> super, clean close.
+    {
+        let mut w = SwmrWriter::open(&path).unwrap();
+        w.append_i32("d", &(10..300).collect::<Vec<_>>()).unwrap();
+        w.close().unwrap();
+    }
+    // Writer 2: re-derive committed state from disk, continue appending.
+    {
+        let mut w = SwmrWriter::open(&path).unwrap();
+        w.append_i32("d", &(300..900).collect::<Vec<_>>()).unwrap();
+        w.close().unwrap();
+    }
+
+    let expected: Vec<i32> = (0..900).collect();
+    assert_eq!(
+        read_pure(&path),
+        expected,
+        "hdf5-pure read mismatch after reopen"
+    );
+    assert_eq!(
+        read_c(&path),
+        expected,
+        "C-library read mismatch after reopen"
+    );
+}
+
+/// A filtered (compressed) dataset is not an appendable target: the Extensible
+/// Array stores a different element encoding and the appended chunk would have
+/// to be compressed. The filter check runs at the first append (not at
+/// `open()`), so `open()` succeeds, the append is rejected with a "filtered"
+/// reason, and the dataset's existing (compressed) data is left readable.
+#[test]
+fn rejects_filtered_pure_dataset() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("filtered.h5");
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("d")
+            .with_i32_data(&(0..100).collect::<Vec<_>>())
+            .with_shape(&[100])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[10])
+            .with_deflate(4);
+        b.write(&path).unwrap();
+    }
+
+    {
+        // open() only validates the superblock; the filter is caught at append.
+        let mut w = SwmrWriter::open(&path).unwrap();
+        let err = match w.append_i32("d", &(100..110).collect::<Vec<_>>()) {
+            Ok(()) => panic!("expected a filtered dataset to be rejected"),
+            Err(e) => e,
+        };
+        match err {
+            Error::SwmrAppendUnsupported(reason) => {
+                assert!(reason.contains("filtered"), "unexpected reason: {reason}");
+            }
+            other => panic!("expected SwmrAppendUnsupported, got {other:?}"),
+        }
+    }
+
+    // The rejected append did not corrupt the compressed dataset.
+    assert_eq!(
+        read_pure(&path),
+        (0..100).collect::<Vec<_>>(),
+        "pure read after rejected append"
+    );
+    assert_eq!(
+        read_c(&path),
+        (0..100).collect::<Vec<_>>(),
+        "C read after rejected append"
+    );
 }

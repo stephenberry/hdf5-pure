@@ -193,6 +193,14 @@ impl SwmrWriter {
         w.read_to_end(&mut data).map_err(Error::Io)?;
         let sig = signature::find_signature(&data)?;
         let mut sb = Superblock::parse(&data, sig)?;
+        if sb.version < 2 {
+            // `Superblock::serialize` emits the v2/v3 layout, so rewriting a
+            // v0/v1 superblock here would corrupt it (the same hazard `open`
+            // guards against). This crate never SWMR-flags a v0/v1 file, so
+            // there is nothing to clear; treat it as already clean rather than
+            // risk a destructive rewrite.
+            return Ok(());
+        }
         if sb.consistency_flags == 0 {
             return Ok(());
         }
@@ -428,7 +436,21 @@ impl SwmrWriter {
         let page_nelmts = 1u64 << ea_header.max_dblk_nelmts_bits;
         let blk_off_size = (ea_header.max_nelmts_bits as usize).div_ceil(8);
         let index_block_addr = ea_header.index_block_address as usize;
-        let num_chunks = ea_header.num_elements;
+        // The dataspace dimension is the single commit point (append phase 4);
+        // the EA element count is published one phase earlier (phase 3). If a
+        // prior writer crashed between the two, the on-disk EA count is ahead of
+        // the committed dimension. Seed the writer's chunk count from the
+        // *committed* dimension so the next append rolls forward from the last
+        // commit -- overwriting any slots a crashed writer wrote but never
+        // committed -- instead of appending past them and leaving a gap. In a
+        // cleanly-closed file the two already agree, so this is a no-op there.
+        // (`chunk_elems == 0` is a malformed layout the append path rejects up
+        // front; fall back to the stored count to avoid dividing by zero.)
+        let num_chunks = if chunk_elems == 0 {
+            ea_header.num_elements
+        } else {
+            current_dim.div_ceil(chunk_elems)
+        };
 
         Ok(Located {
             dim0_off,
@@ -1261,5 +1283,127 @@ mod tests {
                 "inconsistent paged view after crash at phase {max_phase}"
             );
         }
+    }
+
+    /// The consistent-prefix guarantee must hold for the *reference C library*,
+    /// not only this crate's reader. The pure reader bounds chunk reads by
+    /// `min(EA count, dimension)`, so it tolerates a phase-3 state where the EA
+    /// count has advanced past the dimension; the C library instead walks
+    /// strictly by the dataspace dimension and re-validates block checksums. A
+    /// stale end-of-file, a half-grown index, or a mis-checksummed block at an
+    /// intermediate phase could therefore satisfy the pure reader yet break C
+    /// or h5py. Open the file fresh with the C library at each stopped phase and
+    /// confirm it reads the old length until the phase-4 dimension commit.
+    #[test]
+    fn crash_consistency_c_library_reads_prefix() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("base.h5");
+        let n = 50i32;
+        let target = 250i32; // crosses the inline -> direct -> super-block boundary
+        {
+            let data: Vec<i32> = (0..n).collect();
+            let mut b = FileBuilder::new();
+            b.create_dataset("d")
+                .with_i32_data(&data)
+                .with_shape(&[n as u64])
+                .with_maxshape(&[u64::MAX])
+                .with_chunks(&[1]);
+            b.write(&base).unwrap();
+        }
+
+        for max_phase in 1u8..=4 {
+            let p = dir.path().join(format!("crash_c_{max_phase}.h5"));
+            std::fs::copy(&base, &p).unwrap();
+            {
+                let mut w = SwmrWriter::open(&p).unwrap();
+                w.append_phased("d", &i32_bytes(n..target), max_phase)
+                    .unwrap();
+                // writer dropped here, simulating a crash after `max_phase`
+            }
+            let expected_len = if max_phase == 4 { target } else { n };
+            let f = hdf5::File::open(&p).unwrap();
+            let v = f.dataset("d").unwrap().read_raw::<i32>().unwrap();
+            assert_eq!(
+                v,
+                (0..expected_len).collect::<Vec<_>>(),
+                "C library saw an inconsistent view after crash at phase {max_phase}"
+            );
+            f.close().unwrap();
+        }
+    }
+
+    /// Crash recovery across the phase-3/phase-4 gap. A writer that crashes
+    /// after publishing the EA element count (phase 3) but before publishing the
+    /// dataspace dimension (phase 4) leaves the on-disk count ahead of the
+    /// committed dimension. A fresh writer must roll forward from the committed
+    /// dimension, overwriting the uncommitted slots, rather than appending past
+    /// them and leaving a gap. The crashed and recovery appends deliberately
+    /// write *different* values at the overlapping positions so a regression
+    /// (seeding the chunk count from the stale EA header) surfaces the crashed
+    /// writer's values instead of the recovery writer's.
+    #[test]
+    fn recover_and_reappend_after_phase3_crash() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("phase3_recover.h5");
+        let n = 50i32;
+        {
+            let data: Vec<i32> = (0..n).collect();
+            let mut b = FileBuilder::new();
+            b.create_dataset("d")
+                .with_i32_data(&data)
+                .with_shape(&[n as u64])
+                .with_maxshape(&[u64::MAX])
+                .with_chunks(&[1]);
+            b.write(&path).unwrap();
+        }
+
+        // Writer 1 crashes after phase 3: the EA count advances to 250 but the
+        // dimension stays 50. Its appended values (1000..1200) are distinct from
+        // the eventual correct continuation so a leak is detectable.
+        {
+            let mut w = SwmrWriter::open(&path).unwrap();
+            w.append_phased("d", &i32_bytes(1000..1200), 3).unwrap();
+            // dropped without phase 4 -> dimension not published
+        }
+        // The committed prefix is still the original 50 elements (pure + C).
+        let pf = PureFile::from_bytes(std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            pf.dataset("d").unwrap().read_i32().unwrap(),
+            (0..n).collect::<Vec<_>>(),
+            "phase-3 crash exposed uncommitted data to the pure reader"
+        );
+        {
+            let f = hdf5::File::open(&path).unwrap();
+            assert_eq!(
+                f.dataset("d").unwrap().read_raw::<i32>().unwrap(),
+                (0..n).collect::<Vec<_>>(),
+                "phase-3 crash exposed uncommitted data to the C library"
+            );
+            f.close().unwrap();
+        }
+
+        // Writer 2 recovers: it must roll forward from the committed dimension
+        // (50), overwriting the uncommitted slots, and append the real
+        // continuation 50..150.
+        {
+            let mut w = SwmrWriter::open(&path).unwrap();
+            w.append_i32("d", &(n..150).collect::<Vec<_>>()).unwrap();
+            w.close().unwrap();
+        }
+
+        let expected: Vec<i32> = (0..150).collect();
+        let pf = PureFile::from_bytes(std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            pf.dataset("d").unwrap().read_i32().unwrap(),
+            expected,
+            "recovery did not roll forward correctly (pure reader)"
+        );
+        let f = hdf5::File::open(&path).unwrap();
+        assert_eq!(
+            f.dataset("d").unwrap().read_raw::<i32>().unwrap(),
+            expected,
+            "recovery did not roll forward correctly (C library)"
+        );
+        f.close().unwrap();
     }
 }
