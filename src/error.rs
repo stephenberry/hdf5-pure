@@ -13,6 +13,7 @@ use core::fmt;
 
 /// Errors that can occur when parsing HDF5 binary format structures.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FormatError {
     /// The HDF5 magic signature was not found at any valid offset.
     SignatureNotFound,
@@ -399,6 +400,7 @@ impl std::error::Error for FormatError {}
 /// Errors that can occur when using the high-level API.
 #[cfg(feature = "std")]
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Error {
     /// I/O error from the filesystem.
     Io(std::io::Error),
@@ -413,6 +415,11 @@ pub enum Error {
     /// A SWMR operation (e.g. [`crate::File::refresh`]) was requested on a file
     /// that was not opened for SWMR reading via `File::open_swmr`.
     SwmrUnsupported,
+    /// The file or dataset is not a supported target for the SWMR append writer
+    /// (e.g. a userblock or non-latest-format file, or a dataset that is
+    /// filtered, not rank-1 with an unlimited dimension, or not
+    /// Extensible-Array indexed). The payload is a human-readable reason.
+    SwmrAppendUnsupported(&'static str),
 }
 
 #[cfg(feature = "std")]
@@ -428,6 +435,9 @@ impl fmt::Display for Error {
                 f,
                 "refresh requires a file opened with File::open_swmr (live handle)"
             ),
+            Error::SwmrAppendUnsupported(reason) => {
+                write!(f, "unsupported SWMR append target: {reason}")
+            }
         }
     }
 }

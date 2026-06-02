@@ -87,6 +87,11 @@ struct Located {
 }
 
 /// An append writer over an existing HDF5 file.
+///
+/// The writer keeps a full in-memory mirror of the file (`O(file size)` memory)
+/// so it can read existing structures and recompute checksums without hitting
+/// the disk. For the unbounded "streaming log" use case this grows with the
+/// file; a future revision could bound it, but v1 favors simplicity.
 pub struct SwmrWriter {
     handle: std::fs::File,
     /// Full in-memory mirror of the file; mutated in lock-step with on-disk
@@ -121,10 +126,22 @@ impl SwmrWriter {
 
         let sb_sig_off = signature::find_signature(&data)?;
         let superblock = Superblock::parse(&data, sb_sig_off)?;
+        if superblock.version < 2 {
+            // `Superblock::serialize` always emits the v2/v3 layout, so writing
+            // the SWMR flag (or the EOF) onto a v0/v1 superblock would clobber
+            // it. EA-indexed datasets always imply the latest format, so a
+            // legitimate append target is always v2/v3; reject the rest before
+            // any mutating write rather than corrupt the file.
+            return Err(Error::SwmrAppendUnsupported(
+                "SWMR append requires a latest-format file (v2/v3 superblock)",
+            ));
+        }
         if superblock.base_address != 0 {
             // Userblock files store addresses relative to the base; unsupported
             // by the append writer for now.
-            return Err(Error::SwmrUnsupported);
+            return Err(Error::SwmrAppendUnsupported(
+                "files with a userblock (non-zero base address) are not supported",
+            ));
         }
         let offset_size = superblock.offset_size;
         let length_size = superblock.length_size;
@@ -150,7 +167,7 @@ impl SwmrWriter {
     fn set_swmr_flag(&mut self, active: bool) -> Result<(), Error> {
         self.superblock.consistency_flags = if active { SWMR_WRITE_FLAGS } else { 0 };
         let bytes = self.superblock.serialize();
-        self.write_at(self.sb_sig_off, &bytes);
+        self.write_at(self.sb_sig_off, &bytes)?;
         self.sync()?;
         self.flag_set = active;
         Ok(())
@@ -208,6 +225,12 @@ impl SwmrWriter {
     /// Append raw little-endian element bytes to an unlimited dataset. `bytes`
     /// must be a whole number of chunks' worth of elements, and the dataset's
     /// current length must be chunk-aligned.
+    ///
+    /// On success the appended chunks are durably committed and visible to a
+    /// refreshing reader. On error (including an underlying I/O failure) the new
+    /// length is never published, so a reader still sees the prior consistent
+    /// prefix; the writer should then be dropped rather than reused, as its
+    /// in-memory mirror may have advanced past what reached disk.
     pub fn append_raw(&mut self, dataset: &str, bytes: &[u8]) -> Result<(), Error> {
         self.append_phased(dataset, bytes, 4)
     }
@@ -233,7 +256,9 @@ impl SwmrWriter {
         };
 
         if elem_bytes == 0 || chunk_bytes == 0 {
-            return Err(Error::SwmrUnsupported);
+            return Err(Error::SwmrAppendUnsupported(
+                "dataset has zero-sized elements or chunks",
+            ));
         }
         if bytes.len() % elem_bytes != 0 {
             return Err(Error::Format(FormatError::ChunkedReadError(
@@ -274,7 +299,7 @@ impl SwmrWriter {
         // Phase 1.
         for c in 0..n_new_chunks {
             let chunk_data = &bytes[c * chunk_bytes..(c + 1) * chunk_bytes];
-            let chunk_addr = self.append_bytes(chunk_data);
+            let chunk_addr = self.append_bytes(chunk_data)?;
             let e = num_chunks + c as u64;
             self.ea_insert(dataset, e, chunk_addr)?;
         }
@@ -339,7 +364,9 @@ impl SwmrWriter {
             .iter()
             .any(|m| m.msg_type == MessageType::FilterPipeline)
         {
-            return Err(Error::SwmrUnsupported);
+            return Err(Error::SwmrAppendUnsupported(
+                "filtered datasets are not supported",
+            ));
         }
 
         // Parse the dataspace: must be rank 1 with one unlimited dimension.
@@ -347,11 +374,17 @@ impl SwmrWriter {
             &self.data[dataspace_msg.data_off..dataspace_msg.data_off + dataspace_msg.size];
         let dataspace = Dataspace::parse(ds_bytes, ls)?;
         if dataspace.rank != 1 {
-            return Err(Error::SwmrUnsupported);
+            return Err(Error::SwmrAppendUnsupported(
+                "only rank-1 datasets are supported",
+            ));
         }
         match &dataspace.max_dimensions {
             Some(maxs) if maxs.first() == Some(&u64::MAX) => {}
-            _ => return Err(Error::SwmrUnsupported),
+            _ => {
+                return Err(Error::SwmrAppendUnsupported(
+                    "dataset has no unlimited (maxshape) dimension",
+                ));
+            }
         }
         let current_dim = dataspace.dimensions[0];
         // v2 dataspace header is 4 bytes (version, rank, flags, type); dim 0 follows.
@@ -367,12 +400,18 @@ impl SwmrWriter {
                 chunk_dimensions,
                 ..
             } => (addr as usize, chunk_dimensions),
-            _ => return Err(Error::SwmrUnsupported),
+            _ => {
+                return Err(Error::SwmrAppendUnsupported(
+                    "only Extensible-Array-indexed chunked datasets are supported",
+                ));
+            }
         };
         // chunk_dimensions for a v4 layout includes the element-size pseudo
         // dimension as its last entry; the leading entry is the axis-0 chunk size.
         if chunk_dims.len() != 2 {
-            return Err(Error::SwmrUnsupported);
+            return Err(Error::SwmrAppendUnsupported(
+                "unexpected chunk dimensionality (expected a rank-1 chunked layout)",
+            ));
         }
         let chunk_elems = chunk_dims[0] as u64;
         let elem_bytes = chunk_dims[1] as usize;
@@ -381,7 +420,9 @@ impl SwmrWriter {
         // Parse the EA header for its creation parameters and current count.
         let ea_header = ExtensibleArrayHeader::parse(&self.data, ea_addr, os, ls)?;
         if ea_header.client_id != 0 {
-            return Err(Error::SwmrUnsupported); // filtered
+            return Err(Error::SwmrAppendUnsupported(
+                "filtered datasets are not supported",
+            ));
         }
         let geom = EaGeometry::from_header(&ea_header);
         let page_nelmts = 1u64 << ea_header.max_dblk_nelmts_bits;
@@ -431,14 +472,21 @@ impl SwmrWriter {
         if e < idx {
             let ib_prefix = 4 + 1 + 1 + os as usize; // sig + ver + client + hdr_addr
             let slot_off = index_block_addr + ib_prefix + e as usize * elem_size;
-            self.write_addr_at(slot_off, chunk_addr);
-            self.rechecksum_index_block(dataset);
+            self.write_addr_at(slot_off, chunk_addr)?;
+            self.rechecksum_index_block(dataset)?;
             return Ok(());
         }
 
         // Otherwise the element lives in a data block. Find which one and how it
         // is reached (a direct pointer in the index block, or via a super block).
         let region = locate_data_block(&self.located[dataset].geom, idx, e);
+        if region.ndblks == 0 {
+            // The geometry failed to cover `e` (see `locate_data_block`). Refuse
+            // rather than write garbage with the `u64::MAX` block-size sentinel.
+            return Err(Error::SwmrAppendUnsupported(
+                "chunk index geometry does not cover the appended element",
+            ));
+        }
         let dblk_nelmts = region.dblk_nelmts;
         let is_paged = dblk_nelmts > page_nelmts;
         let slot = (e - region.db_start) as usize;
@@ -468,9 +516,9 @@ impl SwmrWriter {
                     block_offset_rel,
                     blk_off,
                     elem_size,
-                )
+                )?
             } else {
-                self.alloc_undef_data_block(ea_addr, dblk_nelmts, block_offset_rel, blk_off)
+                self.alloc_undef_data_block(ea_addr, dblk_nelmts, block_offset_rel, blk_off)?
             };
             match region.parent {
                 Parent::IndexDirect { ordinal } => {
@@ -479,8 +527,8 @@ impl SwmrWriter {
                         + ib_prefix
                         + idx as usize * elem_size
                         + ordinal * os as usize;
-                    self.write_addr_at(slot_off, new_addr);
-                    self.rechecksum_index_block(dataset);
+                    self.write_addr_at(slot_off, new_addr)?;
+                    self.rechecksum_index_block(dataset)?;
                 }
                 Parent::Super { dblk_local, .. } => {
                     let sblk_addr = sblk_addr.unwrap();
@@ -492,14 +540,14 @@ impl SwmrWriter {
                         page_nelmts,
                         blk_off,
                     );
-                    self.write_addr_at(slot_off, new_addr);
+                    self.write_addr_at(slot_off, new_addr)?;
                     self.rechecksum_super_block(
                         sblk_addr,
                         ndblks,
                         dblk_nelmts,
                         page_nelmts,
                         blk_off,
-                    );
+                    )?;
                 }
             }
             new_addr
@@ -532,9 +580,9 @@ impl SwmrWriter {
             // Write the element into the data block and re-checksum the block.
             let db_prefix = 4 + 1 + 1 + os as usize + blk_off;
             let elem_off = dblk_addr as usize + db_prefix + slot * elem_size;
-            self.write_addr_at(elem_off, chunk_addr);
+            self.write_addr_at(elem_off, chunk_addr)?;
             let cks_off = dblk_addr as usize + db_prefix + dblk_nelmts as usize * elem_size;
-            self.rechecksum_range(dblk_addr as usize, cks_off);
+            self.rechecksum_range(dblk_addr as usize, cks_off)?;
         } else {
             // Write the element into the right page, re-checksum that page, and
             // (when the page is first touched) mark it initialized in the super
@@ -545,23 +593,23 @@ impl SwmrWriter {
             let slot_in_page = slot % page_nelmts;
             let page_bytes = page_nelmts * elem_size + 4;
             let page_off = dblk_addr as usize + header_size + page * page_bytes;
-            self.write_addr_at(page_off + slot_in_page * elem_size, chunk_addr);
+            self.write_addr_at(page_off + slot_in_page * elem_size, chunk_addr)?;
             let page_cks_off = page_off + page_nelmts * elem_size;
-            self.rechecksum_range(page_off, page_cks_off);
+            self.rechecksum_range(page_off, page_cks_off)?;
 
             if slot_in_page == 0 {
                 let sblk_addr = sblk_addr.unwrap();
                 let npages = (dblk_nelmts / page_nelmts as u64) as usize;
                 if let Parent::Super { dblk_local, .. } = region.parent {
                     let global_page = dblk_local * npages + page;
-                    self.set_sb_page_bit(sblk_addr, blk_off, global_page);
+                    self.set_sb_page_bit(sblk_addr, blk_off, global_page)?;
                     self.rechecksum_super_block(
                         sblk_addr,
                         ndblks,
                         dblk_nelmts,
                         page_nelmts as u64,
                         blk_off,
-                    );
+                    )?;
                 }
             }
         }
@@ -598,13 +646,18 @@ impl SwmrWriter {
 
     /// Set page `global_page`'s bit in a super block's page-init bitmap
     /// (MSB-first), in memory and on disk.
-    fn set_sb_page_bit(&mut self, sblk_addr: u64, blk_off: usize, global_page: usize) {
+    fn set_sb_page_bit(
+        &mut self,
+        sblk_addr: u64,
+        blk_off: usize,
+        global_page: usize,
+    ) -> Result<(), Error> {
         let os = self.offset_size as usize;
         let bitmap_start = sblk_addr as usize + 4 + 1 + 1 + os + blk_off;
         let byte = bitmap_start + global_page / 8;
         let mask = 0x80u8 >> (global_page % 8);
         let v = self.data[byte] | mask;
-        self.write_at(byte, &[v]);
+        self.write_at(byte, &[v])
     }
 
     /// Address of an already-allocated super block (`sblk_j`-th super-block
@@ -673,12 +726,12 @@ impl SwmrWriter {
             blk_off,
             0,
         );
-        let new_addr = self.append_bytes(&aesb);
+        let new_addr = self.append_bytes(&aesb)?;
 
         // Link the super block from the index block and re-checksum it.
         let slot_off = ib_addr + ib_prefix + idx_elems * elem_size + ndblk_addrs * os + sblk_j * os;
-        self.write_addr_at(slot_off, new_addr);
-        self.rechecksum_index_block(dataset);
+        self.write_addr_at(slot_off, new_addr)?;
+        self.rechecksum_index_block(dataset)?;
         Ok(new_addr)
     }
 
@@ -692,7 +745,7 @@ impl SwmrWriter {
         dblk_nelmts: u64,
         block_offset_rel: u64,
         blk_off: usize,
-    ) -> u64 {
+    ) -> Result<u64, Error> {
         let os = self.offset_size;
         let mut buf = Vec::new();
         buf.extend_from_slice(b"EADB");
@@ -721,7 +774,7 @@ impl SwmrWriter {
         block_offset_rel: u64,
         blk_off: usize,
         elem_size: usize,
-    ) -> u64 {
+    ) -> Result<u64, Error> {
         let os = self.offset_size;
         let mut buf = Vec::new();
         buf.extend_from_slice(b"EADB");
@@ -747,7 +800,7 @@ impl SwmrWriter {
     }
 
     /// Recompute the index block checksum from the located dataset metadata.
-    fn rechecksum_index_block(&mut self, dataset: &str) {
+    fn rechecksum_index_block(&mut self, dataset: &str) -> Result<(), Error> {
         let loc = &self.located[dataset];
         let os = self.offset_size as usize;
         let ib_prefix = 4 + 1 + 1 + os;
@@ -758,7 +811,7 @@ impl SwmrWriter {
             + loc.idx_blk_elmts as usize * loc.ea_elem_size
             + ndblk_addrs * os
             + nsblk_addrs * os;
-        self.rechecksum_range(loc.index_block_addr, cks_off);
+        self.rechecksum_range(loc.index_block_addr, cks_off)
     }
 
     fn rechecksum_super_block(
@@ -768,19 +821,19 @@ impl SwmrWriter {
         dblk_nelmts: u64,
         page_nelmts: u64,
         blk_off: usize,
-    ) {
+    ) -> Result<(), Error> {
         let os = self.offset_size as usize;
         let prefix = 4 + 1 + 1 + os + blk_off;
         let bitmap = self.sb_bitmap_size(ndblks, dblk_nelmts, page_nelmts);
         let cks_off = sblk_addr as usize + prefix + bitmap + ndblks as usize * os;
-        self.rechecksum_range(sblk_addr as usize, cks_off);
+        self.rechecksum_range(sblk_addr as usize, cks_off)
     }
 
     /// Recompute the Jenkins checksum over `[start, cks_off)` and write it at
     /// `cks_off`.
-    fn rechecksum_range(&mut self, start: usize, cks_off: usize) {
+    fn rechecksum_range(&mut self, start: usize, cks_off: usize) -> Result<(), Error> {
         let cks = jenkins_lookup3(&self.data[start..cks_off]);
-        self.write_at(cks_off, &cks.to_le_bytes());
+        self.write_at(cks_off, &cks.to_le_bytes())
     }
 
     /// Patch the six EA header statistics and recompute the header checksum.
@@ -798,21 +851,20 @@ impl SwmrWriter {
             );
             (loc.ea_addr, stats, self.length_size)
         };
-        let write_stat = |this: &mut Self, k: usize, v: u64| {
+        let write_stat = |this: &mut Self, k: usize, v: u64| -> Result<(), Error> {
             let off = ea_addr + 12 + k * ls as usize;
-            this.write_length_at(off, v);
+            this.write_length_at(off, v)
         };
-        write_stat(self, 0, stats.nsuper_blks);
-        write_stat(self, 1, stats.super_blk_size);
-        write_stat(self, 2, stats.ndata_blks);
-        write_stat(self, 3, stats.data_blk_size);
-        write_stat(self, 4, stats.max_idx_set);
-        write_stat(self, 5, stats.nelmts);
+        write_stat(self, 0, stats.nsuper_blks)?;
+        write_stat(self, 1, stats.super_blk_size)?;
+        write_stat(self, 2, stats.ndata_blks)?;
+        write_stat(self, 3, stats.data_blk_size)?;
+        write_stat(self, 4, stats.max_idx_set)?;
+        write_stat(self, 5, stats.nelmts)?;
         // EAHD checksum covers signature .. just before the trailing checksum.
         let aehd_size = ExtensibleArrayHeader::serialized_size(self.offset_size, self.length_size);
         let cks_off = ea_addr + aehd_size - 4;
-        self.rechecksum_range(ea_addr, cks_off);
-        Ok(())
+        self.rechecksum_range(ea_addr, cks_off)
     }
 
     fn patch_dimension(&mut self, dataset: &str, new_dim: u64) -> Result<(), Error> {
@@ -820,48 +872,53 @@ impl SwmrWriter {
             let loc = &self.located[dataset];
             (loc.dim0_off, loc.ohdr_chunk_start, loc.ohdr_chunk_msg_end)
         };
-        self.write_length_at(dim0_off, new_dim);
+        self.write_length_at(dim0_off, new_dim)?;
         // Recompute the containing object-header chunk's checksum.
-        self.rechecksum_range(chunk_start, chunk_msg_end);
-        Ok(())
+        self.rechecksum_range(chunk_start, chunk_msg_end)
     }
 
     fn patch_superblock_eof(&mut self) -> Result<(), Error> {
         let eof = self.data.len() as u64;
         self.superblock.eof_address = eof;
         let bytes = self.superblock.serialize();
-        self.write_at(self.sb_sig_off, &bytes);
-        Ok(())
+        self.write_at(self.sb_sig_off, &bytes)
     }
 
     // ----- raw byte / address IO ----------------------------------------
 
     /// Append `bytes` at end-of-file (in memory and on disk), returning the
     /// address (offset) at which they were written.
-    fn append_bytes(&mut self, bytes: &[u8]) -> u64 {
+    ///
+    /// The disk write happens now, not at the next `sync`, so a later in-place
+    /// patch of this region lands on top of bytes that already exist on disk. A
+    /// failed write is propagated rather than swallowed: the append aborts
+    /// before any later phase publishes the new length, so a partial write is
+    /// never reported as success.
+    fn append_bytes(&mut self, bytes: &[u8]) -> Result<u64, Error> {
         let addr = self.data.len() as u64;
         self.data.extend_from_slice(bytes);
-        // Defer the disk write to the next `sync`/`write_at`? No — write now so a
-        // later in-place patch of this region also reaches disk.
-        let _ = self.handle.seek(SeekFrom::Start(addr));
-        let _ = self.handle.write_all(bytes);
-        addr
+        self.handle.seek(SeekFrom::Start(addr)).map_err(Error::Io)?;
+        self.handle.write_all(bytes).map_err(Error::Io)?;
+        Ok(addr)
     }
 
-    fn write_at(&mut self, offset: usize, bytes: &[u8]) {
+    fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), Error> {
         self.data[offset..offset + bytes.len()].copy_from_slice(bytes);
-        let _ = self.handle.seek(SeekFrom::Start(offset as u64));
-        let _ = self.handle.write_all(bytes);
+        self.handle
+            .seek(SeekFrom::Start(offset as u64))
+            .map_err(Error::Io)?;
+        self.handle.write_all(bytes).map_err(Error::Io)?;
+        Ok(())
     }
 
-    fn write_addr_at(&mut self, offset: usize, addr: u64) {
+    fn write_addr_at(&mut self, offset: usize, addr: u64) -> Result<(), Error> {
         match self.offset_size {
             4 => self.write_at(offset, &(addr as u32).to_le_bytes()),
             _ => self.write_at(offset, &addr.to_le_bytes()),
         }
     }
 
-    fn write_length_at(&mut self, offset: usize, val: u64) {
+    fn write_length_at(&mut self, offset: usize, val: u64) -> Result<(), Error> {
         match self.length_size {
             4 => self.write_at(offset, &(val as u32).to_le_bytes()),
             _ => self.write_at(offset, &val.to_le_bytes()),
@@ -1159,6 +1216,49 @@ mod tests {
                 v,
                 (0..expected_len).collect::<Vec<_>>(),
                 "inconsistent view after crash at phase {max_phase}"
+            );
+        }
+    }
+
+    /// Same consistent-prefix guarantee, but for an append that crosses the
+    /// paged-data-block boundary (~131060 chunks) so the most intricate in-place
+    /// growth runs: allocating a paged super block, paged data blocks, and the
+    /// per-page checksums + page-init bitmap, all in phase 1. Stopping at any
+    /// phase boundary must still read back as the old prefix until the final
+    /// dimension commit. Slow (~131k chunks), like `append_crosses_paging_boundary`.
+    #[test]
+    fn crash_consistency_paged_prefix() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("base.h5");
+        let start = 131_000i32; // just below the paging boundary
+        let target = 132_000i32; // crosses it -> paged super block + data blocks
+        {
+            let data: Vec<i32> = (0..start).collect();
+            let mut b = FileBuilder::new();
+            b.create_dataset("d")
+                .with_i32_data(&data)
+                .with_shape(&[start as u64])
+                .with_maxshape(&[u64::MAX])
+                .with_chunks(&[1]);
+            b.write(&base).unwrap();
+        }
+
+        for max_phase in 1u8..=4 {
+            let p = dir.path().join(format!("crash_paged_{max_phase}.h5"));
+            std::fs::copy(&base, &p).unwrap();
+            {
+                let mut w = SwmrWriter::open(&p).unwrap();
+                w.append_phased("d", &i32_bytes(start..target), max_phase)
+                    .unwrap();
+                // writer dropped here, simulating a crash after `max_phase`
+            }
+            let expected_len = if max_phase == 4 { target } else { start };
+            let f = PureFile::from_bytes(std::fs::read(&p).unwrap()).unwrap();
+            let v = f.dataset("d").unwrap().read_i32().unwrap();
+            assert_eq!(
+                v,
+                (0..expected_len).collect::<Vec<_>>(),
+                "inconsistent paged view after crash at phase {max_phase}"
             );
         }
     }

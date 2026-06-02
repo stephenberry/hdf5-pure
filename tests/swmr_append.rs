@@ -151,6 +151,48 @@ fn append_crosses_paging_boundary() {
     assert_eq!(read_c(&path), expected, "C-library read mismatch (paged)");
 }
 
+/// A non-latest-format (v0/v1 superblock) file must be rejected with a clear
+/// error and left byte-for-byte unchanged. Regression for the bug where
+/// `open()` wrote the SWMR flag through `Superblock::serialize` (which always
+/// emits the v2/v3 layout), clobbering a v0/v1 superblock before any append.
+#[test]
+fn rejects_and_preserves_non_latest_format_file() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("legacy.h5");
+    // Force the earliest format so the file gets a v0/v1 superblock.
+    {
+        let file = hdf5::File::with_options()
+            .with_fapl(|p| p.libver_bounds(LibraryVersion::Earliest, LibraryVersion::V18))
+            .create(&path)
+            .unwrap();
+        let ds = file.new_dataset::<i32>().shape((5,)).create("d").unwrap();
+        ds.write(&(0..5).collect::<Vec<i32>>()).unwrap();
+        file.close().unwrap();
+    }
+
+    let before = std::fs::read(&path).unwrap();
+    let sig = b"\x89HDF\r\n\x1a\n";
+    let off = before.windows(8).position(|w| w == sig).unwrap();
+    assert!(
+        before[off + 8] < 2,
+        "test precondition: expected a v0/v1 superblock, got version {}",
+        before[off + 8]
+    );
+
+    let err = match SwmrWriter::open(&path) {
+        Ok(_) => panic!("expected open() to reject a v0/v1 superblock file"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, hdf5_pure::Error::SwmrAppendUnsupported(_)),
+        "expected SwmrAppendUnsupported, got {err:?}"
+    );
+
+    let after = std::fs::read(&path).unwrap();
+    assert_eq!(before, after, "open() must not mutate a rejected file");
+    assert_eq!(read_c(&path), (0..5).collect::<Vec<i32>>());
+}
+
 /// f64 dataset append, just to exercise a non-4-byte element size.
 #[test]
 fn append_f64_pure_file() {

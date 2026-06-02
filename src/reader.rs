@@ -105,6 +105,11 @@ impl File {
     /// [`File::open_swmr`]. The superblock is checksum-validated on every
     /// re-read; a transient parse failure (a writer caught mid-flush) is
     /// retried a bounded number of times before being surfaced.
+    ///
+    /// Cost: each call re-reads the entire file from disk (`O(file size)`).
+    /// That keeps the implementation simple and correct, but when following a
+    /// large, steadily growing log it is the cost paid per refresh; budget
+    /// refresh frequency accordingly.
     pub fn refresh(&mut self) -> Result<(), Error> {
         let handle = self.handle.as_mut().ok_or(Error::SwmrUnsupported)?;
 
@@ -129,12 +134,19 @@ impl File {
                 Err(e) => {
                     last_err = Some(e);
                     // Brief backoff before re-reading; the writer's in-place
-                    // updates are tiny, so a short pause clears the window.
-                    std::thread::sleep(std::time::Duration::from_micros(50 * (attempt + 1) as u64));
+                    // updates are tiny, so a short pause clears the window. Skip
+                    // it on the final attempt, where there is no re-read to come.
+                    if attempt + 1 < MAX_ATTEMPTS {
+                        std::thread::sleep(std::time::Duration::from_micros(
+                            50 * (attempt + 1) as u64,
+                        ));
+                    }
                 }
             }
         }
-        Err(last_err.unwrap_or(Error::SwmrUnsupported))
+        // The loop always runs at least once and only reaches here via the
+        // `Err` arm, so `last_err` is always `Some`; surface the real error.
+        Err(last_err.expect("refresh retried at least once before failing"))
     }
 
     /// Returns a handle to the root group.
