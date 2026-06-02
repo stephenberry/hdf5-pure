@@ -130,9 +130,7 @@ impl File {
                     last_err = Some(e);
                     // Brief backoff before re-reading; the writer's in-place
                     // updates are tiny, so a short pause clears the window.
-                    std::thread::sleep(std::time::Duration::from_micros(
-                        50 * (attempt + 1) as u64,
-                    ));
+                    std::thread::sleep(std::time::Duration::from_micros(50 * (attempt + 1) as u64));
                 }
             }
         }

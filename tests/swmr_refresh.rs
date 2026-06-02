@@ -62,7 +62,11 @@ fn refresh_follows_external_appends() {
     // Without refresh, the reader still sees the old snapshot.
     {
         let ds = file.dataset("d").unwrap();
-        assert_eq!(ds.shape().unwrap(), vec![100], "stale view changed before refresh");
+        assert_eq!(
+            ds.shape().unwrap(),
+            vec![100],
+            "stale view changed before refresh"
+        );
     }
 
     // After refresh, the reader observes the appended rows and grown index.

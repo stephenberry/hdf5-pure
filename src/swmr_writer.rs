@@ -21,17 +21,16 @@
 //! - Appends land on chunk boundaries: the dataset's current length and the
 //!   appended length are both whole multiples of the chunk length. (A chunk
 //!   length of 1 — the common streaming layout — always satisfies this.)
-//! - Up to the paged-data-block boundary (131056 chunks on the unlimited axis).
-//!   Larger appends return [`Error::SwmrUnsupported`] rather than risk an
-//!   incorrect paged write.
+//! - Unbounded growth: super blocks and (past ~131060 chunks) paged data blocks
+//!   are allocated incrementally as block boundaries are crossed.
 //! - Files with a zero base address (no userblock).
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 
-use crate::chunked_write::ea_compute_stats;
 use crate::checksum::jenkins_lookup3;
+use crate::chunked_write::ea_compute_stats;
 use crate::data_layout::DataLayout;
 use crate::dataspace::Dataspace;
 use crate::error::{Error, FormatError};
@@ -99,7 +98,15 @@ pub struct SwmrWriter {
     sb_sig_off: usize,
     superblock: Superblock,
     located: HashMap<String, Located>,
+    /// Whether the superblock's SWMR-write consistency flag is currently set
+    /// (so [`Drop`] knows to clear it).
+    flag_set: bool,
 }
+
+/// Superblock consistency-flag bits: bit 0 = write access, bit 2 = SWMR write
+/// access. A SWMR writer sets both (`0x05`) while writing and clears them on a
+/// clean close — matching the reference C library and h5py.
+const SWMR_WRITE_FLAGS: u32 = 0x05;
 
 impl SwmrWriter {
     /// Open an existing HDF5 file for appending.
@@ -121,7 +128,7 @@ impl SwmrWriter {
         }
         let offset_size = superblock.offset_size;
         let length_size = superblock.length_size;
-        Ok(Self {
+        let mut w = Self {
             handle,
             data,
             offset_size,
@@ -129,7 +136,55 @@ impl SwmrWriter {
             sb_sig_off,
             superblock,
             located: HashMap::new(),
-        })
+            flag_set: false,
+        };
+        // Mark the file as having an active SWMR writer so a concurrent reader
+        // may open it with `H5F_ACC_SWMR_READ` / h5py `swmr=True`. Cleared on
+        // `close`/drop.
+        w.set_swmr_flag(true)?;
+        Ok(w)
+    }
+
+    /// Set or clear the superblock's SWMR-write consistency flags, recompute the
+    /// superblock checksum, and flush.
+    fn set_swmr_flag(&mut self, active: bool) -> Result<(), Error> {
+        self.superblock.consistency_flags = if active { SWMR_WRITE_FLAGS } else { 0 };
+        let bytes = self.superblock.serialize();
+        self.write_at(self.sb_sig_off, &bytes);
+        self.sync()?;
+        self.flag_set = active;
+        Ok(())
+    }
+
+    /// Finish writing: clear the SWMR-write flag and flush, marking the file
+    /// cleanly closed. Prefer this over relying on `Drop` so the (rare) flush
+    /// error surfaces.
+    pub fn close(mut self) -> Result<(), Error> {
+        self.set_swmr_flag(false)
+    }
+
+    /// Clear a stale SWMR-write flag left in `path` by a writer that exited
+    /// without a clean close (the h5clear equivalent). Safe to call on a file
+    /// with the flag already clear.
+    pub fn clear_swmr_flag<P: AsRef<std::path::Path>>(path: P) -> Result<(), Error> {
+        let mut w = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.as_ref())
+            .map_err(Error::Io)?;
+        let mut data = Vec::new();
+        w.read_to_end(&mut data).map_err(Error::Io)?;
+        let sig = signature::find_signature(&data)?;
+        let mut sb = Superblock::parse(&data, sig)?;
+        if sb.consistency_flags == 0 {
+            return Ok(());
+        }
+        sb.consistency_flags = 0;
+        let bytes = sb.serialize();
+        w.seek(SeekFrom::Start(sig as u64)).map_err(Error::Io)?;
+        w.write_all(&bytes).map_err(Error::Io)?;
+        w.sync_data().map_err(Error::Io)?;
+        Ok(())
     }
 
     /// Append `i32` values to an unlimited dataset.
@@ -288,7 +343,8 @@ impl SwmrWriter {
         }
 
         // Parse the dataspace: must be rank 1 with one unlimited dimension.
-        let ds_bytes = &self.data[dataspace_msg.data_off..dataspace_msg.data_off + dataspace_msg.size];
+        let ds_bytes =
+            &self.data[dataspace_msg.data_off..dataspace_msg.data_off + dataspace_msg.size];
         let dataspace = Dataspace::parse(ds_bytes, ls)?;
         if dataspace.rank != 1 {
             return Err(Error::SwmrUnsupported);
@@ -429,11 +485,20 @@ impl SwmrWriter {
                 Parent::Super { dblk_local, .. } => {
                     let sblk_addr = sblk_addr.unwrap();
                     let slot_off = self.sb_dblk_slot_off(
-                        sblk_addr, dblk_local, ndblks, dblk_nelmts, page_nelmts, blk_off,
+                        sblk_addr,
+                        dblk_local,
+                        ndblks,
+                        dblk_nelmts,
+                        page_nelmts,
+                        blk_off,
                     );
                     self.write_addr_at(slot_off, new_addr);
                     self.rechecksum_super_block(
-                        sblk_addr, ndblks, dblk_nelmts, page_nelmts, blk_off,
+                        sblk_addr,
+                        ndblks,
+                        dblk_nelmts,
+                        page_nelmts,
+                        blk_off,
                     );
                 }
             }
@@ -451,7 +516,12 @@ impl SwmrWriter {
                 Parent::Super { dblk_local, .. } => {
                     let sblk_addr = sblk_addr.unwrap();
                     let slot_off = self.sb_dblk_slot_off(
-                        sblk_addr, dblk_local, ndblks, dblk_nelmts, page_nelmts, blk_off,
+                        sblk_addr,
+                        dblk_local,
+                        ndblks,
+                        dblk_nelmts,
+                        page_nelmts,
+                        blk_off,
                     );
                     self.read_addr_at(slot_off)
                 }
@@ -567,7 +637,17 @@ impl SwmrWriter {
         if !is_undef(existing, self.offset_size) {
             return Ok(existing);
         }
-        let (blk_off, os, ib_prefix, ndblk_addrs, idx_elems, elem_size, ib_addr, ea_addr, page_nelmts) = {
+        let (
+            blk_off,
+            os,
+            ib_prefix,
+            ndblk_addrs,
+            idx_elems,
+            elem_size,
+            ib_addr,
+            ea_addr,
+            page_nelmts,
+        ) = {
             let loc = &self.located[dataset];
             (
                 loc.blk_off_size,
@@ -596,8 +676,7 @@ impl SwmrWriter {
         let new_addr = self.append_bytes(&aesb);
 
         // Link the super block from the index block and re-checksum it.
-        let slot_off =
-            ib_addr + ib_prefix + idx_elems * elem_size + ndblk_addrs * os + sblk_j * os;
+        let slot_off = ib_addr + ib_prefix + idx_elems * elem_size + ndblk_addrs * os + sblk_j * os;
         self.write_addr_at(slot_off, new_addr);
         self.rechecksum_index_block(dataset);
         Ok(new_addr)
@@ -804,6 +883,17 @@ impl SwmrWriter {
     }
 }
 
+impl Drop for SwmrWriter {
+    /// Best-effort clear of the SWMR-write flag so a writer that is merely
+    /// dropped (rather than `close`d) still leaves the file cleanly marked. Use
+    /// [`SwmrWriter::close`] to observe flush errors.
+    fn drop(&mut self) {
+        if self.flag_set {
+            let _ = self.set_swmr_flag(false);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Extensible-array element location (where element `e` lives in the structure)
 // ---------------------------------------------------------------------------
@@ -854,7 +944,10 @@ fn locate_data_block(geom: &EaGeometry, idx_blk_elmts: u64, e: u64) -> DataBlock
                 dblk_nelmts: dn,
                 ndblks,
                 sb_block_offset,
-                parent: Parent::Super { sblk_j: j, dblk_local },
+                parent: Parent::Super {
+                    sblk_j: j,
+                    dblk_local,
+                },
             };
         }
         elem += span;
@@ -976,8 +1069,7 @@ fn walk_messages(
     let mut pos = start;
     while pos + msg_header_size <= end {
         let msg_type_raw = data[pos] as u16;
-        let msg_data_size =
-            u16::from_le_bytes([data[pos + 1], data[pos + 2]]) as usize;
+        let msg_data_size = u16::from_le_bytes([data[pos + 1], data[pos + 2]]) as usize;
         pos += msg_header_size;
         if pos + msg_data_size > end {
             break; // padding
@@ -1056,7 +1148,8 @@ mod tests {
             std::fs::copy(&base, &p).unwrap();
             {
                 let mut w = SwmrWriter::open(&p).unwrap();
-                w.append_phased("d", &i32_bytes(n..target), max_phase).unwrap();
+                w.append_phased("d", &i32_bytes(n..target), max_phase)
+                    .unwrap();
                 // writer dropped here, simulating a crash after `max_phase`
             }
             let expected_len = if max_phase == 4 { target } else { n };

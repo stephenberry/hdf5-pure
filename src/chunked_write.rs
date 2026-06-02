@@ -812,6 +812,8 @@ pub(crate) fn build_aesb(
 }
 
 /// The six Extensible Array header statistics, in the C library's stored order.
+/// Used by the SWMR append writer (`std` only).
+#[cfg(feature = "std")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EaStats {
     pub nsuper_blks: u64,
@@ -824,6 +826,7 @@ pub(crate) struct EaStats {
 
 /// On-disk byte size of one non-paged Extensible Array data block (`EADB`)
 /// holding `dblk_nelmts` element slots.
+#[cfg(feature = "std")]
 pub(crate) fn eadb_size(
     dblk_nelmts: u64,
     elem_size: usize,
@@ -843,6 +846,7 @@ pub(crate) fn eadb_size(
 
 /// On-disk byte size of one Extensible Array super block (`EASB`) with `ndblks`
 /// data-block pointers and (when its data blocks are paged) a page-init bitmap.
+#[cfg(feature = "std")]
 pub(crate) fn aesb_size(
     ndblks: u64,
     dblk_nelmts: u64,
@@ -864,6 +868,7 @@ pub(crate) fn aesb_size(
 /// `num_elements` densely-filled elements. Mirrors the allocation performed by
 /// [`build_extensible_array_at`] so the bulk writer and the incremental append
 /// writer always agree (asserted by a unit test).
+#[cfg(feature = "std")]
 pub(crate) fn ea_compute_stats(
     geom: &EaGeometry,
     idx_blk_elmts: u64,
@@ -1894,6 +1899,7 @@ mod tests {
     /// `ea_compute_stats` must reproduce the EAHD statistics that
     /// `build_extensible_array_at` actually writes (these feed the in-place
     /// append writer, so any drift would corrupt appended files).
+    #[cfg(feature = "std")]
     #[test]
     fn ea_compute_stats_matches_builder() {
         use crate::extensible_array::{EaGeometry, ExtensibleArrayHeader};
@@ -1920,7 +1926,8 @@ mod tests {
                 .collect();
             let ea = build_extensible_array_at(&chunks, 8, 8, false, 0x100000);
             // Parse the 6 stats from the EAHD (12-byte fixed prefix, then 6 * ls).
-            let stat = |k: usize| u64::from_le_bytes(ea[12 + k * 8..12 + k * 8 + 8].try_into().unwrap());
+            let stat =
+                |k: usize| u64::from_le_bytes(ea[12 + k * 8..12 + k * 8 + 8].try_into().unwrap());
             let built = super::EaStats {
                 nsuper_blks: stat(0),
                 super_blk_size: stat(1),

@@ -94,7 +94,10 @@ fn refreshing_reader_follows_pure_appends() {
     pure_create(&path, 10);
 
     let mut reader = File::open_swmr(&path).unwrap();
-    assert_eq!(reader.dataset("d").unwrap().read_i32().unwrap(), (0..10).collect::<Vec<_>>());
+    assert_eq!(
+        reader.dataset("d").unwrap().read_i32().unwrap(),
+        (0..10).collect::<Vec<_>>()
+    );
 
     let mut w = SwmrWriter::open(&path).unwrap();
     w.append_i32("d", &(10..300).collect::<Vec<_>>()).unwrap();
@@ -115,7 +118,7 @@ fn refreshing_reader_follows_pure_appends() {
     );
 }
 
-/// Append across the paged-data-block boundary (131056 chunks): start just
+/// Append across the paged-data-block boundary (131060 chunks): start just
 /// below it (built by the bulk writer for speed), then append past it so the
 /// writer must allocate a paged super block and paged data blocks in place.
 #[test]
@@ -140,7 +143,11 @@ fn append_crosses_paging_boundary() {
             .unwrap();
     }
     let expected: Vec<i32> = (0..end as i32).collect();
-    assert_eq!(read_pure(&path), expected, "hdf5-pure read mismatch (paged)");
+    assert_eq!(
+        read_pure(&path),
+        expected,
+        "hdf5-pure read mismatch (paged)"
+    );
     assert_eq!(read_c(&path), expected, "C-library read mismatch (paged)");
 }
 
