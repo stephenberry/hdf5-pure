@@ -9,6 +9,7 @@ use alloc::{vec, vec::Vec};
 use crate::checksum::jenkins_lookup3;
 use crate::chunk_cache::{CACHE_LINE_SIZE, align_to_cache_line};
 use crate::error::FormatError;
+use crate::extensible_array::{EaGeometry, ExtensibleArrayHeader};
 #[cfg(feature = "zfp")]
 use crate::filter_pipeline::FILTER_ZFP;
 use crate::filter_pipeline::{
@@ -678,11 +679,147 @@ fn serialize_v4_extensible_array(
     buf
 }
 
+/// Write an offset-sized address (little-endian) to `buf`.
+fn write_ea_addr(buf: &mut Vec<u8>, val: u64, offset_size: u8) {
+    match offset_size {
+        4 => buf.extend_from_slice(&(val as u32).to_le_bytes()),
+        _ => buf.extend_from_slice(&val.to_le_bytes()),
+    }
+}
+
+/// Build a single Extensible Array Data Block (`EADB`) holding the chunk
+/// elements for `[elem_start, elem_start + dblk_nelmts)`. Slots whose absolute
+/// element index reaches `num_elements` are written as undefined.
+///
+/// When `dblk_nelmts` exceeds the page size the block is *paged*: the header
+/// carries its own checksum and the elements are split into contiguous pages of
+/// `page_nelmts` slots, each followed by a checksum. Returns the block bytes and
+/// the number of leading pages that contain at least one real element (used by
+/// the owning super block to build its page-init bitmap). For non-paged blocks
+/// the returned page count is 0.
+#[allow(clippy::too_many_arguments)]
+fn build_eadb(
+    chunks: &[WrittenChunk],
+    num_elements: usize,
+    elem_start: usize,
+    dblk_nelmts: usize,
+    block_offset_rel: u64,
+    ea_base_address: u64,
+    offset_size: u8,
+    has_filters: bool,
+    chunk_size_bytes: usize,
+    client_id: u8,
+    page_nelmts: usize,
+    blk_off_size: usize,
+) -> (Vec<u8>, usize) {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"EADB");
+    buf.push(0); // version
+    buf.push(client_id);
+    write_ea_addr(&mut buf, ea_base_address, offset_size);
+    buf.extend_from_slice(&block_offset_rel.to_le_bytes()[..blk_off_size]);
+
+    if dblk_nelmts <= page_nelmts {
+        // Non-paged: elements inline, single checksum.
+        for slot in 0..dblk_nelmts {
+            let idx = elem_start + slot;
+            if idx < num_elements {
+                write_chunk_element(
+                    &mut buf,
+                    &chunks[idx],
+                    offset_size,
+                    has_filters,
+                    chunk_size_bytes,
+                );
+            } else {
+                write_undefined_element(&mut buf, offset_size, has_filters, chunk_size_bytes);
+            }
+        }
+        let cks = jenkins_lookup3(&buf);
+        buf.extend_from_slice(&cks.to_le_bytes());
+        (buf, 0)
+    } else {
+        // Paged: the header has its own checksum, then full pages follow. We
+        // reserve every page (matching the C library's allocation) and report
+        // how many leading pages hold real data so the super block can mark
+        // them initialized in its bitmap.
+        let header_cks = jenkins_lookup3(&buf);
+        buf.extend_from_slice(&header_cks.to_le_bytes());
+
+        let npages = dblk_nelmts / page_nelmts;
+        let mut pages_init = 0usize;
+        for page in 0..npages {
+            let page_start = elem_start + page * page_nelmts;
+            let mut page_buf = Vec::new();
+            let mut has_real = false;
+            for slot in 0..page_nelmts {
+                let idx = page_start + slot;
+                if idx < num_elements {
+                    write_chunk_element(
+                        &mut page_buf,
+                        &chunks[idx],
+                        offset_size,
+                        has_filters,
+                        chunk_size_bytes,
+                    );
+                    has_real = true;
+                } else {
+                    write_undefined_element(
+                        &mut page_buf,
+                        offset_size,
+                        has_filters,
+                        chunk_size_bytes,
+                    );
+                }
+            }
+            let page_cks = jenkins_lookup3(&page_buf);
+            page_buf.extend_from_slice(&page_cks.to_le_bytes());
+            buf.extend_from_slice(&page_buf);
+            if has_real {
+                pages_init += 1;
+            }
+        }
+        (buf, pages_init)
+    }
+}
+
+/// Build an Extensible Array Super (secondary) Block (`EASB`) referencing
+/// `dblk_addrs`. When `page_bitmap` is non-empty the block's data blocks are
+/// paged and the bitmap (already populated by the caller) is written between
+/// the block offset and the data block addresses.
+fn build_aesb(
+    ea_base_address: u64,
+    block_offset_rel: u64,
+    page_bitmap: &[u8],
+    dblk_addrs: &[u64],
+    offset_size: u8,
+    blk_off_size: usize,
+    client_id: u8,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"EASB");
+    buf.push(0); // version
+    buf.push(client_id);
+    write_ea_addr(&mut buf, ea_base_address, offset_size);
+    buf.extend_from_slice(&block_offset_rel.to_le_bytes()[..blk_off_size]);
+    buf.extend_from_slice(page_bitmap);
+    for &addr in dblk_addrs {
+        write_ea_addr(&mut buf, addr, offset_size);
+    }
+    let cks = jenkins_lookup3(&buf);
+    buf.extend_from_slice(&cks.to_le_bytes());
+    buf
+}
+
 /// Build a complete Extensible Array at a known absolute address.
 ///
-/// For simplicity, we put all elements inline in the index block when the
-/// number of chunks is small (up to idx_blk_elmts), otherwise use inline +
-/// direct data blocks.
+/// Lays out the header (`EAHD`), index block (`EAIB`), and — for datasets with
+/// more than `idx_blk_elmts + sum(direct data blocks)` chunks — the on-disk
+/// super blocks (`EASB`) and their data blocks (`EADB`, paged when large). The
+/// super-block / data-block size progression comes from the shared
+/// [`EaGeometry`], so the writer and reader cannot drift. Byte-for-byte
+/// compatible with the reference HDF5 C library across inline, direct, super
+/// block, and paged ranges (verified by crosscheck tests).
 pub fn build_extensible_array_at(
     chunks: &[WrittenChunk],
     offset_size: u8,
@@ -715,60 +852,184 @@ pub fn build_extensible_array_at(
 
     let client_id: u8 = if has_filters { 1 } else { 0 };
 
-    // EA creation parameters — must match HDF5 C library defaults exactly
+    // EA creation parameters — must match the HDF5 C library defaults exactly.
     let max_nelmts_bits: u8 = 32;
     let idx_blk_elmts: u8 = 4;
     let min_dblk_nelmts: u8 = 16;
     let super_blk_min_nelmts: u8 = 4;
     let max_dblk_nelmts_bits: u8 = 10;
 
-    // EAHD size: fixed(12) + 6 stats(6*length_size) + addr(offset_size) + checksum(4)
-    let aehd_size = 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 6 * length_size as usize + os + 4;
+    // Derive the block-size geometry from the shared helper (single source of
+    // truth shared with the reader).
+    let geom_header = ExtensibleArrayHeader {
+        client_id,
+        element_size: elem_size as u8,
+        max_nelmts_bits,
+        idx_blk_elmts,
+        min_dblk_nelmts,
+        super_blk_min_nelmts,
+        max_dblk_nelmts_bits,
+        num_elements: 0,
+        index_block_address: 0,
+    };
+    let geom = EaGeometry::from_header(&geom_header);
+    let page_nelmts = 1usize << max_dblk_nelmts_bits;
+    let blk_off_size = (max_nelmts_bits as usize).div_ceil(8);
+    let inline = idx_blk_elmts as usize;
+
+    let aehd_size = ExtensibleArrayHeader::serialized_size(offset_size, length_size);
     let aeib_address = ea_base_address + aehd_size as u64;
 
-    // Determine how many elements go inline vs data blocks
-    let n_inline = (idx_blk_elmts as usize).min(num_elements);
-    let remaining_after_inline = num_elements.saturating_sub(n_inline);
-
-    // Compute super block layout per HDF5 spec:
-    // nsblks = floor(log2((2^max_nelmts_bits - idx_blk_elmts) / data_blk_min_elmts)) + 1
-    // For each super block i:
-    //   ndblks_in_sblk = 2^floor(i/2)
-    //   dblk_nelmts = data_blk_min_elmts * 2^ceil(i/2)
-    // Super blocks 0..sup_blk_min_data_ptrs-1 have their data block addrs in EAIB directly.
-    // Super blocks sup_blk_min_data_ptrs..nsblks-1 get super block addresses.
-    let sblk_min = super_blk_min_nelmts as usize; // sup_blk_min_data_ptrs
-    // nsblks = log2(2^max_nelmts_bits / data_blk_min_elmts) + 1
-    //        = max_nelmts_bits - log2(data_blk_min_elmts) + 1
-    let log2_dblk_min = if min_dblk_nelmts <= 1 {
-        0
-    } else {
-        (min_dblk_nelmts as u32).trailing_zeros() as usize
-    };
-    let nsblks = (max_nelmts_bits as usize).saturating_sub(log2_dblk_min) + 1;
-
-    // Direct data block addresses (from super blocks 0..sblk_min-1)
-    let mut dblk_sizes: Vec<usize> = Vec::new();
-    for sblk_idx in 0..sblk_min.min(nsblks) {
-        let ndblks = 1usize << (sblk_idx / 2);
-        let dblk_nelmts = (min_dblk_nelmts as usize) * (1 << sblk_idx.div_ceil(2));
-        for _ in 0..ndblks {
-            dblk_sizes.push(dblk_nelmts);
-        }
-    }
-    let n_direct_dblks = dblk_sizes.len();
-
-    // Super block addresses (for super blocks sblk_min..nsblks-1)
-    let n_sblk_addrs = nsblks.saturating_sub(sblk_min);
-
-    // EAIB size: header + inline elements + direct dblk addresses + sblk addresses + checksum
-    let aeib_size = 4 + 1 + 1 + os // sig+ver+client+hdr_addr
-        + idx_blk_elmts as usize * elem_size // inline elements (always all slots)
-        + n_direct_dblks * os // direct data block addresses
-        + n_sblk_addrs * os // super block addresses
+    let ndblk_addrs = geom.direct_dblk_nelmts.len();
+    let nsblk_addrs = geom.nsblk_addrs;
+    let aeib_size = 4 + 1 + 1 + os // sig + ver + client + hdr_addr
+        + inline * elem_size       // inline elements (always all slots)
+        + ndblk_addrs * os         // direct data block addresses
+        + nsblk_addrs * os         // super block addresses
         + 4; // checksum
+    let body_base = aeib_address + aeib_size as u64;
 
-    // Build AEHD
+    let undef_addr: u64 = match offset_size {
+        4 => 0xFFFF_FFFF,
+        _ => u64::MAX,
+    };
+
+    // ---- Build the body (direct data blocks, then super blocks) -----------
+    // Addresses are absolute, computed from `body_base`, so the body can be
+    // built before the index block that references it.
+    let mut body: Vec<u8> = Vec::new();
+    let mut direct_addrs: Vec<u64> = Vec::with_capacity(ndblk_addrs);
+    let mut sblk_addrs: Vec<u64> = Vec::with_capacity(nsblk_addrs);
+
+    // Stats (match the C library's EAHD fields exactly).
+    let mut ndata_blks: u64 = 0;
+    let mut data_blk_size: u64 = 0;
+    let mut nsuper_blks: u64 = 0;
+    let mut super_blk_size: u64 = 0;
+    let mut alloc_slots: u64 = inline as u64; // nelmts: idx slots + every allocated data block
+
+    let mut elem_cursor = inline; // absolute element index past the inline slots
+
+    // Direct data blocks: addresses stored directly in the index block.
+    for &dblk_nelmts in &geom.direct_dblk_nelmts {
+        let dblk_nelmts = dblk_nelmts as usize;
+        if elem_cursor >= num_elements {
+            direct_addrs.push(undef_addr);
+            elem_cursor += dblk_nelmts;
+            continue;
+        }
+        let addr = body_base + body.len() as u64;
+        let (db_bytes, _) = build_eadb(
+            chunks,
+            num_elements,
+            elem_cursor,
+            dblk_nelmts,
+            (elem_cursor - inline) as u64,
+            ea_base_address,
+            offset_size,
+            has_filters,
+            chunk_size_bytes,
+            client_id,
+            page_nelmts,
+            blk_off_size,
+        );
+        ndata_blks += 1;
+        data_blk_size += db_bytes.len() as u64;
+        alloc_slots += dblk_nelmts as u64;
+        body.extend_from_slice(&db_bytes);
+        direct_addrs.push(addr);
+        elem_cursor += dblk_nelmts;
+    }
+
+    // Super blocks: addresses stored in the index block; super-block pointer `j`
+    // refers to super block `first_indirect_sblk + j`.
+    for j in 0..nsblk_addrs {
+        let sblk_idx = geom.first_indirect_sblk + j;
+        let (ndblks, dblk_nelmts) = geom.sblks[sblk_idx];
+        let ndblks = ndblks as usize;
+        let dblk_nelmts = dblk_nelmts as usize;
+        let sb_span = ndblks * dblk_nelmts;
+        if elem_cursor >= num_elements {
+            sblk_addrs.push(undef_addr);
+            elem_cursor += sb_span;
+            continue;
+        }
+
+        let is_paged = dblk_nelmts > page_nelmts;
+        let npages = if is_paged {
+            dblk_nelmts / page_nelmts
+        } else {
+            0
+        };
+        let sb_block_offset = (elem_cursor - inline) as u64;
+        let bitmap_size = if is_paged {
+            ndblks * npages.div_ceil(8)
+        } else {
+            0
+        };
+        let mut page_bitmap = vec![0u8; bitmap_size];
+
+        let mut sb_dblk_addrs: Vec<u64> = Vec::with_capacity(ndblks);
+        let mut local_elem = elem_cursor;
+        for db_local in 0..ndblks {
+            if local_elem >= num_elements {
+                sb_dblk_addrs.push(undef_addr);
+                local_elem += dblk_nelmts;
+                continue;
+            }
+            let addr = body_base + body.len() as u64;
+            let (db_bytes, pages_init) = build_eadb(
+                chunks,
+                num_elements,
+                local_elem,
+                dblk_nelmts,
+                (local_elem - inline) as u64,
+                ea_base_address,
+                offset_size,
+                has_filters,
+                chunk_size_bytes,
+                client_id,
+                page_nelmts,
+                blk_off_size,
+            );
+            ndata_blks += 1;
+            data_blk_size += db_bytes.len() as u64;
+            alloc_slots += dblk_nelmts as u64;
+            body.extend_from_slice(&db_bytes);
+            sb_dblk_addrs.push(addr);
+            if is_paged {
+                for p in 0..pages_init {
+                    let global_page = db_local * npages + p;
+                    page_bitmap[global_page / 8] |= 0x80 >> (global_page % 8);
+                }
+            }
+            local_elem += dblk_nelmts;
+        }
+
+        let aesb_addr = body_base + body.len() as u64;
+        let aesb = build_aesb(
+            ea_base_address,
+            sb_block_offset,
+            &page_bitmap,
+            &sb_dblk_addrs,
+            offset_size,
+            blk_off_size,
+            client_id,
+        );
+        nsuper_blks += 1;
+        super_blk_size += aesb.len() as u64;
+        body.extend_from_slice(&aesb);
+        sblk_addrs.push(aesb_addr);
+
+        elem_cursor += sb_span;
+    }
+
+    // ---- Build the header (EAHD) ------------------------------------------
+    let write_length = |buf: &mut Vec<u8>, val: u64| match length_size {
+        4 => buf.extend_from_slice(&(val as u32).to_le_bytes()),
+        _ => buf.extend_from_slice(&val.to_le_bytes()),
+    };
+
     let mut aehd = Vec::with_capacity(aehd_size);
     aehd.extend_from_slice(b"EAHD");
     aehd.push(0); // version
@@ -780,96 +1041,33 @@ pub fn build_extensible_array_at(
     aehd.push(super_blk_min_nelmts);
     aehd.push(max_dblk_nelmts_bits);
 
-    // 6 stats fields matching HDF5 C library:
-    // [0] = 0 (unknown/reserved), [1] = 0 (unknown/reserved),
-    // [2] = ndata_blks, [3] = data_blk_total_size (computed after building data blocks),
-    // [4] = nelmts, [5] = max_idx_set
-    // We'll compute ndata_blks and data_blk_size below, and fill with placeholder for now.
-    // Actually, we need to compute these before writing EAHD.
-    // Count data blocks that will have chunks:
-    let n_active_dblks: u64 = if remaining_after_inline > 0 {
-        let mut count = 0u64;
-        let mut ci = n_inline;
-        for &sz in &dblk_sizes {
-            if ci < num_elements {
-                count += 1;
-                ci += sz;
-            }
-        }
-        count
-    } else {
-        0
-    };
-    // Compute total data block size (we'll update after building, but estimate here)
-    // For now, compute the AEDB size per block: sig(4) + ver(1) + cid(1) + hdr_addr(os) + nelmts*elem_size + checksum(4)
-    let aedb_header_overhead = 4 + 1 + 1 + os + 4;
-    let data_blk_total_size: u64 = if remaining_after_inline > 0 {
-        let mut total = 0u64;
-        let mut ci = n_inline;
-        for &sz in &dblk_sizes {
-            if ci < num_elements {
-                total += (aedb_header_overhead + sz * elem_size) as u64;
-                ci += sz;
-            }
-        }
-        total
-    } else {
-        0
-    };
-    // max_idx_set: idx_blk_elmts + sum of data block sizes for active blocks
-    let max_idx_set: u64 = if remaining_after_inline > 0 {
-        let mut max_set = idx_blk_elmts as u64;
-        let mut ci = n_inline;
-        for &sz in &dblk_sizes {
-            if ci < num_elements {
-                max_set += sz as u64;
-                ci += sz;
-            }
-        }
-        max_set
-    } else {
-        idx_blk_elmts as u64
-    };
+    // 6 statistics, in the C library's order:
+    //   [0] nsuper_blks   [1] super_blk_size   [2] ndata_blks
+    //   [3] data_blk_size [4] max_idx_set      [5] nelmts
+    write_length(&mut aehd, nsuper_blks);
+    write_length(&mut aehd, super_blk_size);
+    write_length(&mut aehd, ndata_blks);
+    write_length(&mut aehd, data_blk_size);
+    write_length(&mut aehd, num_elements as u64); // max_idx_set (dense fill)
+    write_length(&mut aehd, alloc_slots); // nelmts (allocated slots)
 
-    let write_length = |buf: &mut Vec<u8>, val: u64| match length_size {
-        4 => buf.extend_from_slice(&(val as u32).to_le_bytes()),
-        _ => buf.extend_from_slice(&val.to_le_bytes()),
-    };
-    let write_addr = |buf: &mut Vec<u8>, val: u64| match offset_size {
-        4 => buf.extend_from_slice(&(val as u32).to_le_bytes()),
-        _ => buf.extend_from_slice(&val.to_le_bytes()),
-    };
-
-    write_length(&mut aehd, 0); // stat[0]: reserved/unknown
-    write_length(&mut aehd, 0); // stat[1]: reserved/unknown
-    write_length(&mut aehd, n_active_dblks); // stat[2]: ndata_blks
-    write_length(&mut aehd, data_blk_total_size); // stat[3]: data_blk_total_size
-    write_length(&mut aehd, num_elements as u64); // stat[4]: nelmts
-    write_length(&mut aehd, max_idx_set); // stat[5]: max_idx_set
-
-    write_addr(&mut aehd, aeib_address);
+    write_ea_addr(&mut aehd, aeib_address, offset_size);
 
     let aehd_checksum = jenkins_lookup3(&aehd);
     aehd.extend_from_slice(&aehd_checksum.to_le_bytes());
     debug_assert_eq!(aehd.len(), aehd_size);
 
-    // Build AEIB
+    // ---- Build the index block (EAIB) -------------------------------------
     let mut aeib = Vec::with_capacity(aeib_size);
     aeib.extend_from_slice(b"EAIB");
     aeib.push(0); // version
     aeib.push(client_id);
+    write_ea_addr(&mut aeib, ea_base_address, offset_size);
 
-    // header address
-    match offset_size {
-        4 => aeib.extend_from_slice(&(ea_base_address as u32).to_le_bytes()),
-        8 => aeib.extend_from_slice(&ea_base_address.to_le_bytes()),
-        _ => aeib.extend_from_slice(&ea_base_address.to_le_bytes()),
-    }
-
-    // Inline elements (always write idx_blk_elmts slots, fill unused with undefined)
+    // Inline elements (always write idx_blk_elmts slots; fill unused as undefined).
     #[allow(clippy::needless_range_loop)]
-    for i in 0..idx_blk_elmts as usize {
-        if i < n_inline {
+    for i in 0..inline {
+        if i < num_elements {
             write_chunk_element(
                 &mut aeib,
                 &chunks[i],
@@ -881,89 +1079,21 @@ pub fn build_extensible_array_at(
             write_undefined_element(&mut aeib, offset_size, has_filters, chunk_size_bytes);
         }
     }
-
-    // Data block addresses + build data blocks
-    let mut data_blocks_buf = Vec::new();
-    let dblks_base = aeib_address + aeib_size as u64;
-    let mut dblk_cursor = dblks_base;
-    let mut chunk_idx = n_inline;
-
-    for &nelmts in &dblk_sizes {
-        if chunk_idx >= num_elements {
-            // No more chunks — write undefined address
-            match offset_size {
-                4 => aeib.extend_from_slice(&u32::MAX.to_le_bytes()),
-                8 => aeib.extend_from_slice(&u64::MAX.to_le_bytes()),
-                _ => aeib.extend_from_slice(&u64::MAX.to_le_bytes()),
-            }
-            continue;
-        }
-
-        // Write this data block's address
-        match offset_size {
-            4 => aeib.extend_from_slice(&(dblk_cursor as u32).to_le_bytes()),
-            8 => aeib.extend_from_slice(&dblk_cursor.to_le_bytes()),
-            _ => aeib.extend_from_slice(&dblk_cursor.to_le_bytes()),
-        }
-
-        // Build EADB
-        let mut aedb = Vec::new();
-        aedb.extend_from_slice(b"EADB");
-        aedb.push(0); // version
-        aedb.push(client_id);
-        match offset_size {
-            4 => aedb.extend_from_slice(&(ea_base_address as u32).to_le_bytes()),
-            8 => aedb.extend_from_slice(&ea_base_address.to_le_bytes()),
-            _ => aedb.extend_from_slice(&ea_base_address.to_le_bytes()),
-        }
-
-        // Block offset: encoded in ceil(max_nelmts_bits/8) bytes
-        // This is the EA-relative index of the first element in this data block
-        let blk_off_size = (max_nelmts_bits as usize).div_ceil(8);
-        let blk_off_val = (chunk_idx - n_inline) as u64;
-        aedb.extend_from_slice(&blk_off_val.to_le_bytes()[..blk_off_size]);
-
-        // Write elements (fill all nelmts slots, use undefined for empty)
-        for slot in 0..nelmts {
-            if chunk_idx + slot < num_elements {
-                write_chunk_element(
-                    &mut aedb,
-                    &chunks[chunk_idx + slot],
-                    offset_size,
-                    has_filters,
-                    chunk_size_bytes,
-                );
-            } else {
-                // Undefined slot
-                write_undefined_element(&mut aedb, offset_size, has_filters, chunk_size_bytes);
-            }
-        }
-
-        let aedb_checksum = jenkins_lookup3(&aedb);
-        aedb.extend_from_slice(&aedb_checksum.to_le_bytes());
-
-        dblk_cursor += aedb.len() as u64;
-        data_blocks_buf.extend_from_slice(&aedb);
-        chunk_idx += nelmts;
+    // Direct data block addresses, then super block addresses.
+    for &addr in &direct_addrs {
+        write_ea_addr(&mut aeib, addr, offset_size);
+    }
+    for &addr in &sblk_addrs {
+        write_ea_addr(&mut aeib, addr, offset_size);
     }
 
-    // Super block addresses (all undefined for now — we don't create super blocks)
-    for _ in 0..n_sblk_addrs {
-        match offset_size {
-            4 => aeib.extend_from_slice(&u32::MAX.to_le_bytes()),
-            8 => aeib.extend_from_slice(&u64::MAX.to_le_bytes()),
-            _ => aeib.extend_from_slice(&u64::MAX.to_le_bytes()),
-        }
-    }
-
-    // AEIB checksum
     let aeib_checksum = jenkins_lookup3(&aeib);
     aeib.extend_from_slice(&aeib_checksum.to_le_bytes());
     debug_assert_eq!(aeib.len(), aeib_size);
 
     let mut combined = aehd;
     combined.extend_from_slice(&aeib);
-    combined.extend_from_slice(&data_blocks_buf);
+    combined.extend_from_slice(&body);
     combined
 }
 
@@ -1632,6 +1762,31 @@ mod tests {
     fn ea_roundtrip_1d_many_chunks() {
         let values: Vec<f64> = (0..100).map(|i| i as f64).collect();
         let result = roundtrip_ea(&values, &[100], &[10], &[u64::MAX]);
+        assert_eq!(result, values);
+    }
+
+    /// One chunk per element across the inline, direct-data-block, and
+    /// super-block ranges. Before the geometry fix these silently corrupted
+    /// past 20 chunks (4 inline + the first 16-element direct block).
+    #[test]
+    fn ea_roundtrip_super_block_sizes() {
+        for &n in &[245u64, 300, 2000, 50000] {
+            let values: Vec<f64> = (0..n).map(|i| i as f64).collect();
+            let result = roundtrip_ea(&values, &[n], &[1], &[u64::MAX]);
+            assert_eq!(result.len(), n as usize, "length mismatch at n={n}");
+            assert_eq!(result, values, "data mismatch at n={n}");
+        }
+    }
+
+    /// Cross the paging boundary (131060 = 4 inline + 240 direct + super blocks
+    /// SB4..SB12), exercising paged data blocks in super block 13 (the first
+    /// whose data blocks exceed 1024 elements) on both write and read.
+    #[test]
+    fn ea_roundtrip_paged_data_blocks() {
+        let n: u64 = 132_000;
+        let values: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let result = roundtrip_ea(&values, &[n], &[1], &[u64::MAX]);
+        assert_eq!(result.len(), n as usize);
         assert_eq!(result, values);
     }
 

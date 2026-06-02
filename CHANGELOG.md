@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Extensible Array chunk index (used for chunked datasets with one unlimited dimension): reading a dataset with more than 20 chunks along the unlimited axis silently returned wrong data, and writing more than 244 chunks silently dropped the excess. The reader's data-block size progression did not match the HDF5 format (it diverged past the inline elements plus the first data block), and the writer never emitted super blocks or paged data blocks. Reader and writer now share a single block-size geometry derived from the array's creation parameters; the writer emits super blocks and, above 131060 chunks, paged data blocks; and the array header statistics match the reference C library byte-for-byte. Verified against the reference C HDF5 library in both directions across the inline, direct-block, super-block, and paged ranges. Found while implementing SWMR support ([#17](https://github.com/stephenberry/hdf5-pure/issues/17)).
+
 ## [0.6.0]
 
 ### Added

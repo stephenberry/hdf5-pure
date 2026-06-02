@@ -128,14 +128,18 @@ impl ExtensibleArrayHeader {
         let max_dblk_nelmts_bits = d[11];
 
         let mut pos = 12;
-        // 6 stats fields: [0] unknown, [1] unknown, [2] nsuper_blks_created,
-        // [3] super_blk_size, [4] nelmts, [5] max_idx_set
-        // We only need nelmts (field[4]) and skip the rest.
+        // 6 statistics fields, in the HDF5 C library's stored order:
+        //   [0] nsuper_blks   [1] super_blk_size   [2] ndata_blks
+        //   [3] data_blk_size [4] max_idx_set      [5] nelmts
+        // We read max_idx_set (field [4]) — the count of elements that have been
+        // set, which bounds the live region. For a densely written array it
+        // equals the chunk count; `nelmts` (field [5]) is the larger
+        // rounded-up-to-block-boundary slot count, which we do not need.
         let ls = length_size as usize;
-        pos += 4 * ls; // skip first 4 stats fields
-        let num_elements = read_offset(d, pos, length_size)?;
-        pos += ls; // skip nelmts
-        pos += ls; // skip max_idx_set (6th stats field)
+        pos += 4 * ls; // skip [0]..[3]
+        let num_elements = read_offset(d, pos, length_size)?; // [4] max_idx_set
+        pos += ls;
+        pos += ls; // skip [5] nelmts
         let index_block_address = read_offset(d, pos, offset_size)?;
 
         Ok(ExtensibleArrayHeader {
@@ -154,6 +158,80 @@ impl ExtensibleArrayHeader {
     /// Compute the size of this header in bytes (for write support).
     pub fn serialized_size(offset_size: u8, length_size: u8) -> usize {
         4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 6 * length_size as usize + offset_size as usize + 4
+    }
+}
+
+/// Geometry of an Extensible Array, derived from its header creation parameters.
+///
+/// This is the single source of truth for the super-block / data-block size
+/// progression, shared by both the reader (this module) and the writer
+/// (`chunked_write`). It mirrors libhdf5's `H5EA__hdr_init`: starting from
+/// `(ndblks = 1, dblk_nelmts = min_dblk_nelmts)`, each successive super block
+/// alternately doubles the elements-per-data-block (even index) and the
+/// number-of-data-blocks (odd index):
+///
+/// ```text
+///   super block i:  ndblks = 2^floor(i/2)   dblk_nelmts = min_dblk * 2^ceil(i/2)
+///   SB0: 1 x 16   SB1: 1 x 32   SB2: 2 x 32   SB3: 2 x 64   SB4: 4 x 64 ...
+/// ```
+///
+/// The first `super_blk_min_nelmts` super blocks have their data-block
+/// addresses stored directly in the index block; the rest are reached through
+/// on-disk super blocks (`EASB`) whose addresses are stored in the index block.
+#[derive(Debug, Clone)]
+pub(crate) struct EaGeometry {
+    /// `(ndblks, dblk_nelmts)` for each super block index `0..nsblks`.
+    pub sblks: Vec<(u64, u64)>,
+    /// Element count of each direct data block whose address is stored in the
+    /// index block. `len()` equals the number of direct data-block pointers.
+    pub direct_dblk_nelmts: Vec<u64>,
+    /// Number of super-block pointers stored in the index block.
+    pub nsblk_addrs: usize,
+    /// Super-block index of the first super block reached via a super-block
+    /// pointer in the index block (i.e. `super_blk_min_nelmts`).
+    pub first_indirect_sblk: usize,
+}
+
+impl EaGeometry {
+    /// Derive the geometry from a parsed header.
+    pub fn from_header(h: &ExtensibleArrayHeader) -> Self {
+        let min_dblk = h.min_dblk_nelmts as u64;
+        let sup_blk_min = h.super_blk_min_nelmts as usize;
+        // nsblks = max_nelmts_bits - log2(min_dblk_nelmts) + 1
+        let log2_min = if min_dblk <= 1 {
+            0
+        } else {
+            min_dblk.trailing_zeros() as u64
+        };
+        let nsblks = (h.max_nelmts_bits as u64).saturating_sub(log2_min) as usize + 1;
+
+        let mut sblks = Vec::with_capacity(nsblks);
+        let mut ndblks = 1u64;
+        let mut dblk_nelmts = min_dblk;
+        for u in 0..nsblks {
+            sblks.push((ndblks, dblk_nelmts));
+            if u % 2 == 0 {
+                dblk_nelmts = dblk_nelmts.saturating_mul(2);
+            } else {
+                ndblks = ndblks.saturating_mul(2);
+            }
+        }
+
+        let mut direct_dblk_nelmts = Vec::new();
+        for sb in sblks.iter().take(sup_blk_min.min(nsblks)) {
+            let (nd, dn) = *sb;
+            for _ in 0..nd {
+                direct_dblk_nelmts.push(dn);
+            }
+        }
+
+        let nsblk_addrs = nsblks.saturating_sub(sup_blk_min);
+        EaGeometry {
+            sblks,
+            direct_dblk_nelmts,
+            nsblk_addrs,
+            first_indirect_sblk: sup_blk_min,
+        }
     }
 }
 
@@ -281,14 +359,92 @@ fn read_data_block_elements(
     let blk_off_size = (header.max_nelmts_bits as usize).div_ceil(8);
     let mut pos = db_offset + db_header_size + blk_off_size;
 
-    // Check if paged
-    let page_nelmts = 1usize << header.max_nelmts_bits;
-    let is_paged = nelmts > page_nelmts;
+    // Direct data blocks and non-paged super-block data blocks store their
+    // elements inline. Paged data blocks (only ever found inside a super block
+    // whose `dblk_nelmts` exceeds the page size) are handled separately by
+    // `read_paged_data_block`, which is driven by the page-init bitmap stored
+    // in the owning super block.
+    let mut chunks = Vec::new();
+    for i in 0..nelmts {
+        let (info, consumed) = read_element(
+            file_data,
+            pos,
+            header.client_id,
+            header.element_size,
+            offset_size,
+            chunk_byte_size,
+            start_index + i,
+            num_chunks_per_dim,
+            chunk_dimensions,
+        )?;
+        if let Some(ci) = info {
+            chunks.push(ci);
+        }
+        pos += consumed;
+    }
+
+    Ok(chunks)
+}
+
+/// Test whether page `page_idx` is initialized in a super-block page-init
+/// bitmap. The bitmap is a contiguous, MSB-first bit stream: page 0 is bit 7 of
+/// byte 0, page 1 is bit 6, page 8 is bit 7 of byte 1, and so on.
+fn page_is_initialized(bitmap: &[u8], page_idx: usize) -> bool {
+    let byte = page_idx / 8;
+    let mask = 0x80u8 >> (page_idx % 8);
+    byte < bitmap.len() && (bitmap[byte] & mask) != 0
+}
+
+/// Read a paged Extensible Array data block.
+///
+/// A paged data block has a 22-byte header (signature, version, client id,
+/// header address, block offset) *followed by its own checksum*, after which
+/// the data block's pages are laid out contiguously. Each page holds
+/// `page_nelmts` element slots followed by a 4-byte checksum, and is written
+/// only when initialized. Whether page `p` of this data block is initialized is
+/// recorded in the owning super block's bitmap at global page index
+/// `db_local_idx * npages + p`. Pages are filled sequentially, so the first
+/// uninitialized page marks the end of populated data for this block.
+#[allow(clippy::too_many_arguments)]
+fn read_paged_data_block(
+    file_data: &[u8],
+    db_offset: usize,
+    page_nelmts: usize,
+    npages: usize,
+    db_local_idx: usize,
+    page_bitmap: &[u8],
+    header: &ExtensibleArrayHeader,
+    offset_size: u8,
+    chunk_byte_size: u64,
+    start_index: usize,
+    num_chunks_per_dim: &[u64],
+    chunk_dimensions: &[u32],
+) -> Result<Vec<ChunkInfo>, FormatError> {
+    let blk_off_size = (header.max_nelmts_bits as usize).div_ceil(8);
+    // Header includes its own checksum: sig(4)+ver(1)+cid(1)+hdr_addr+block_offset+checksum(4)
+    let db_header_size = 4 + 1 + 1 + offset_size as usize + blk_off_size + 4;
+    if db_offset + db_header_size > file_data.len() {
+        return Err(FormatError::UnexpectedEof {
+            expected: db_offset + db_header_size,
+            available: file_data.len(),
+        });
+    }
+    if &file_data[db_offset..db_offset + 4] != b"EADB" {
+        return Err(FormatError::ChunkedReadError(
+            "invalid Extensible Array data block signature".into(),
+        ));
+    }
 
     let mut chunks = Vec::new();
-
-    if !is_paged {
-        for i in 0..nelmts {
+    let mut pos = db_offset + db_header_size;
+    for page in 0..npages {
+        let global_page = db_local_idx * npages + page;
+        if !page_is_initialized(page_bitmap, global_page) {
+            // Pages are populated sequentially; nothing initialized after this.
+            break;
+        }
+        let page_start = start_index + page * page_nelmts;
+        for i in 0..page_nelmts {
             let (info, consumed) = read_element(
                 file_data,
                 pos,
@@ -296,7 +452,7 @@ fn read_data_block_elements(
                 header.element_size,
                 offset_size,
                 chunk_byte_size,
-                start_index + i,
+                page_start + i,
                 num_chunks_per_dim,
                 chunk_dimensions,
             )?;
@@ -305,72 +461,8 @@ fn read_data_block_elements(
             }
             pos += consumed;
         }
-    } else {
-        // Paged: elements are split into pages of page_nelmts.
-        // After the data block header comes a page bitmap, then each page
-        // has page_nelmts elements followed by a 4-byte checksum.
-        let npages = nelmts.div_ceil(page_nelmts);
-        // Page bitmap: ceil(npages / 8) bytes
-        let bitmap_size = npages.div_ceil(8);
-        // Read bitmap
-        if pos + bitmap_size > file_data.len() {
-            return Err(FormatError::UnexpectedEof {
-                expected: pos + bitmap_size,
-                available: file_data.len(),
-            });
-        }
-        let bitmap = &file_data[pos..pos + bitmap_size];
-        pos += bitmap_size;
-
-        let elem_bytes = if header.client_id == 0 {
-            offset_size as usize
-        } else {
-            header.element_size as usize
-        };
-
-        let mut global_idx = start_index;
-        for page_idx in 0..npages {
-            let byte_idx = page_idx / 8;
-            let bit_idx = page_idx % 8;
-            let page_has_data = (bitmap[byte_idx] >> bit_idx) & 1 != 0;
-
-            let elems_this_page = if page_idx == npages - 1 {
-                let remainder = nelmts % page_nelmts;
-                if remainder == 0 {
-                    page_nelmts
-                } else {
-                    remainder
-                }
-            } else {
-                page_nelmts
-            };
-
-            if page_has_data {
-                for i in 0..elems_this_page {
-                    let (info, consumed) = read_element(
-                        file_data,
-                        pos,
-                        header.client_id,
-                        header.element_size,
-                        offset_size,
-                        chunk_byte_size,
-                        global_idx + i,
-                        num_chunks_per_dim,
-                        chunk_dimensions,
-                    )?;
-                    if let Some(ci) = info {
-                        chunks.push(ci);
-                    }
-                    pos += consumed;
-                }
-                // Skip page checksum (4 bytes)
-                pos += 4;
-            } else {
-                // Empty page: skip all elements + checksum
-                pos += elems_this_page * elem_bytes + 4;
-            }
-            global_idx += elems_this_page;
-        }
+        // Skip the page checksum.
+        pos += 4;
     }
 
     Ok(chunks)
@@ -454,125 +546,74 @@ pub fn read_extensible_array_chunks(
         return Ok(chunks);
     }
 
-    // Compute data block and super block counts
-    let min_dblk = header.min_dblk_nelmts as usize;
-    let sblk_min = header.super_blk_min_nelmts as usize;
+    // Derive the (shared) extensible-array geometry from the header. This is
+    // the same progression the writer uses, so reader and writer cannot drift.
+    let geom = EaGeometry::from_header(header);
 
-    // The first sblk_min super block levels have their data blocks listed directly
-    // in the index block. Compute their sizes.
-    let mut n_direct_dblks = 0usize;
-    let mut dblk_sizes: Vec<usize> = Vec::new();
-    {
-        let mut nelmts = min_dblk;
-        for sb_level in 0..sblk_min {
-            let ndblks = 1usize << sb_level;
-            for _ in 0..ndblks {
-                dblk_sizes.push(nelmts);
-                n_direct_dblks += 1;
-            }
-            if sb_level > 0 {
-                nelmts *= 2;
-            }
-        }
-    }
-
-    // Read direct data block addresses from index block
-    let mut dblk_addrs: Vec<u64> = Vec::with_capacity(n_direct_dblks);
-    for _ in 0..n_direct_dblks {
-        if pos + os > file_data.len() {
-            break;
-        }
-        let addr = read_offset(file_data, pos, offset_size)?;
-        dblk_addrs.push(addr);
+    // 2. Direct data blocks: their addresses are listed in the index block,
+    //    one per entry in `geom.direct_dblk_nelmts`.
+    let mut direct_addrs: Vec<u64> = Vec::with_capacity(geom.direct_dblk_nelmts.len());
+    for _ in 0..geom.direct_dblk_nelmts.len() {
+        direct_addrs.push(read_offset(file_data, pos, offset_size)?);
         pos += os;
     }
-
-    // Read elements from direct data blocks
-    for (i, &addr) in dblk_addrs.iter().enumerate() {
-        if i >= dblk_sizes.len() {
+    for (i, &addr) in direct_addrs.iter().enumerate() {
+        if global_index >= total_elements {
             break;
         }
-        let nelmts = dblk_sizes[i];
-        if is_undefined_addr(addr, offset_size) {
-            global_index += nelmts;
-            continue;
+        let nelmts = geom.direct_dblk_nelmts[i] as usize;
+        if !is_undefined_addr(addr, offset_size) {
+            let block_chunks = read_data_block_elements(
+                file_data,
+                addr as usize,
+                nelmts,
+                header,
+                offset_size,
+                chunk_byte_size,
+                global_index,
+                &num_chunks_per_dim,
+                chunk_dimensions,
+            )?;
+            chunks.extend(block_chunks);
         }
-        let block_chunks = read_data_block_elements(
-            file_data,
-            addr as usize,
-            nelmts,
-            header,
-            offset_size,
-            chunk_byte_size,
-            global_index,
-            &num_chunks_per_dim,
-            chunk_dimensions,
-        )?;
-        chunks.extend(block_chunks);
+        // Advance even for undefined blocks so linear indices stay aligned.
         global_index += nelmts;
     }
 
-    // Remaining elements are in super blocks
-    let total_in_ib_and_direct: usize = n_inline + dblk_sizes.iter().sum::<usize>();
-    if total_elements <= total_in_ib_and_direct {
-        return Ok(chunks);
-    }
-    let remaining_elements = total_elements - total_in_ib_and_direct;
-
-    // Compute super block layout
-    let mut sb_addrs: Vec<u64> = Vec::new();
-    let mut sb_infos: Vec<(usize, usize)> = Vec::new();
-    {
-        let mut covered = 0usize;
-        let mut sb_level = sblk_min;
-        let mut nelmts_per_dblk = min_dblk;
-        for lev in 0..sblk_min {
-            if lev > 0 {
-                nelmts_per_dblk *= 2;
-            }
-        }
-
-        while covered < remaining_elements {
-            let ndblks = 1usize << sb_level;
-            nelmts_per_dblk *= 2;
-            let total_in_sb = ndblks * nelmts_per_dblk;
-            sb_infos.push((ndblks, nelmts_per_dblk));
-            covered += total_in_sb;
-            sb_level += 1;
-        }
-    }
-
-    // Read super block addresses from index block
-    for _ in 0..sb_infos.len() {
+    // 3. Super blocks: the remaining `geom.nsblk_addrs` index-block entries are
+    //    addresses of on-disk super blocks (`EASB`). Super-block pointer `j`
+    //    refers to super block `first_indirect_sblk + j`.
+    let mut sblk_addrs: Vec<u64> = Vec::with_capacity(geom.nsblk_addrs);
+    for _ in 0..geom.nsblk_addrs {
         if pos + os > file_data.len() {
             break;
         }
-        let addr = read_offset(file_data, pos, offset_size)?;
-        sb_addrs.push(addr);
+        sblk_addrs.push(read_offset(file_data, pos, offset_size)?);
         pos += os;
     }
-
-    // Process each super block
-    for (sb_idx, &sb_addr) in sb_addrs.iter().enumerate() {
-        let (ndblks, nelmts_per_dblk) = sb_infos[sb_idx];
-        if is_undefined_addr(sb_addr, offset_size) {
-            global_index += ndblks * nelmts_per_dblk;
-            continue;
+    for (j, &sb_addr) in sblk_addrs.iter().enumerate() {
+        if global_index >= total_elements {
+            break;
         }
-        let sb_chunks = read_super_block(
-            file_data,
-            sb_addr as usize,
-            ndblks,
-            nelmts_per_dblk,
-            header,
-            offset_size,
-            chunk_byte_size,
-            global_index,
-            &num_chunks_per_dim,
-            chunk_dimensions,
-        )?;
-        chunks.extend(sb_chunks);
-        global_index += ndblks * nelmts_per_dblk;
+        let sblk_idx = geom.first_indirect_sblk + j;
+        let (ndblks, dblk_nelmts) = geom.sblks[sblk_idx];
+        let total_in_sb = (ndblks * dblk_nelmts) as usize;
+        if !is_undefined_addr(sb_addr, offset_size) {
+            let sb_chunks = read_super_block(
+                file_data,
+                sb_addr as usize,
+                ndblks as usize,
+                dblk_nelmts as usize,
+                header,
+                offset_size,
+                chunk_byte_size,
+                global_index,
+                &num_chunks_per_dim,
+                chunk_dimensions,
+            )?;
+            chunks.extend(sb_chunks);
+        }
+        global_index += total_in_sb;
     }
 
     Ok(chunks)
@@ -595,7 +636,12 @@ fn read_super_block(
     let os = offset_size as usize;
 
     // AESB: signature(4) + version(1) + client_id(1) + header_address(offset_size)
-    let sb_header_size = 4 + 1 + 1 + os;
+    //       + block_offset(ceil(max_nelmts_bits/8))
+    //       + [page-init bitmap, if data blocks are paged]
+    //       + data block addresses
+    //       + checksum
+    let blk_off_size = (header.max_nelmts_bits as usize).div_ceil(8);
+    let sb_header_size = 4 + 1 + 1 + os + blk_off_size;
     if sb_offset + sb_header_size > file_data.len() {
         return Err(FormatError::UnexpectedEof {
             expected: sb_offset + sb_header_size,
@@ -611,7 +657,33 @@ fn read_super_block(
 
     let mut pos = sb_offset + sb_header_size;
 
-    // Read data block addresses
+    // A super block's data blocks are paged when their element count exceeds
+    // the page size. When paged, a page-init bitmap precedes the data block
+    // addresses. Its size is `ndblks * ceil(npages / 8)` bytes, and it is a
+    // contiguous bit stream indexed by `db_local_idx * npages + page`.
+    let page_nelmts = 1usize << header.max_dblk_nelmts_bits;
+    let is_paged = nelmts_per_dblk > page_nelmts;
+    let npages = if is_paged {
+        nelmts_per_dblk / page_nelmts
+    } else {
+        0
+    };
+    let page_bitmap: Vec<u8> = if is_paged {
+        let bitmap_size = ndblks * npages.div_ceil(8);
+        if pos + bitmap_size > file_data.len() {
+            return Err(FormatError::UnexpectedEof {
+                expected: pos + bitmap_size,
+                available: file_data.len(),
+            });
+        }
+        let bm = file_data[pos..pos + bitmap_size].to_vec();
+        pos += bitmap_size;
+        bm
+    } else {
+        Vec::new()
+    };
+
+    // Read data block addresses.
     let mut dblk_addrs: Vec<u64> = Vec::with_capacity(ndblks);
     for _ in 0..ndblks {
         if pos + os > file_data.len() {
@@ -628,23 +700,38 @@ fn read_super_block(
     let mut chunks = Vec::new();
     let mut global_idx = start_index;
 
-    for &addr in &dblk_addrs {
-        if is_undefined_addr(addr, offset_size) {
-            global_idx += nelmts_per_dblk;
-            continue;
+    for (db_local, &addr) in dblk_addrs.iter().enumerate() {
+        if !is_undefined_addr(addr, offset_size) {
+            let block_chunks = if is_paged {
+                read_paged_data_block(
+                    file_data,
+                    addr as usize,
+                    page_nelmts,
+                    npages,
+                    db_local,
+                    &page_bitmap,
+                    header,
+                    offset_size,
+                    chunk_byte_size,
+                    global_idx,
+                    num_chunks_per_dim,
+                    chunk_dimensions,
+                )?
+            } else {
+                read_data_block_elements(
+                    file_data,
+                    addr as usize,
+                    nelmts_per_dblk,
+                    header,
+                    offset_size,
+                    chunk_byte_size,
+                    global_idx,
+                    num_chunks_per_dim,
+                    chunk_dimensions,
+                )?
+            };
+            chunks.extend(block_chunks);
         }
-        let block_chunks = read_data_block_elements(
-            file_data,
-            addr as usize,
-            nelmts_per_dblk,
-            header,
-            offset_size,
-            chunk_byte_size,
-            global_idx,
-            num_chunks_per_dim,
-            chunk_dimensions,
-        )?;
-        chunks.extend(block_chunks);
         global_idx += nelmts_per_dblk;
     }
 
