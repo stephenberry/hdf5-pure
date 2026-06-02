@@ -115,6 +115,35 @@ fn refreshing_reader_follows_pure_appends() {
     );
 }
 
+/// Append across the paged-data-block boundary (131056 chunks): start just
+/// below it (built by the bulk writer for speed), then append past it so the
+/// writer must allocate a paged super block and paged data blocks in place.
+#[test]
+fn append_crosses_paging_boundary() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("d.h5");
+    let start = 131_000usize;
+    let end = 135_000usize;
+    {
+        let data: Vec<i32> = (0..start as i32).collect();
+        let mut b = FileBuilder::new();
+        b.create_dataset("d")
+            .with_i32_data(&data)
+            .with_shape(&[start as u64])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[1]);
+        b.write(&path).unwrap();
+    }
+    {
+        let mut w = SwmrWriter::open(&path).unwrap();
+        w.append_i32("d", &(start as i32..end as i32).collect::<Vec<_>>())
+            .unwrap();
+    }
+    let expected: Vec<i32> = (0..end as i32).collect();
+    assert_eq!(read_pure(&path), expected, "hdf5-pure read mismatch (paged)");
+    assert_eq!(read_c(&path), expected, "C-library read mismatch (paged)");
+}
+
 /// f64 dataset append, just to exercise a non-4-byte element size.
 #[test]
 fn append_f64_pure_file() {
