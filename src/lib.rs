@@ -92,6 +92,8 @@ pub(crate) mod nosync;
 #[cfg(feature = "std")]
 pub mod reader;
 #[cfg(feature = "std")]
+pub mod swmr_writer;
+#[cfg(feature = "std")]
 pub mod types;
 #[cfg(feature = "std")]
 pub mod writer;
@@ -115,6 +117,9 @@ pub use types::{AttrValue, DType};
 
 #[cfg(feature = "std")]
 pub use writer::FileBuilder;
+
+#[cfg(feature = "std")]
+pub use swmr_writer::SwmrWriter;
 
 pub use scaleoffset::ScaleOffset;
 

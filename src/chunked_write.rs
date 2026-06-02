@@ -680,7 +680,7 @@ fn serialize_v4_extensible_array(
 }
 
 /// Write an offset-sized address (little-endian) to `buf`.
-fn write_ea_addr(buf: &mut Vec<u8>, val: u64, offset_size: u8) {
+pub(crate) fn write_ea_addr(buf: &mut Vec<u8>, val: u64, offset_size: u8) {
     match offset_size {
         4 => buf.extend_from_slice(&(val as u32).to_le_bytes()),
         _ => buf.extend_from_slice(&val.to_le_bytes()),
@@ -698,7 +698,7 @@ fn write_ea_addr(buf: &mut Vec<u8>, val: u64, offset_size: u8) {
 /// the owning super block to build its page-init bitmap). For non-paged blocks
 /// the returned page count is 0.
 #[allow(clippy::too_many_arguments)]
-fn build_eadb(
+pub(crate) fn build_eadb(
     chunks: &[WrittenChunk],
     num_elements: usize,
     elem_start: usize,
@@ -787,7 +787,7 @@ fn build_eadb(
 /// `dblk_addrs`. When `page_bitmap` is non-empty the block's data blocks are
 /// paged and the bitmap (already populated by the caller) is written between
 /// the block offset and the data block addresses.
-fn build_aesb(
+pub(crate) fn build_aesb(
     ea_base_address: u64,
     block_offset_rel: u64,
     page_bitmap: &[u8],
@@ -809,6 +809,107 @@ fn build_aesb(
     let cks = jenkins_lookup3(&buf);
     buf.extend_from_slice(&cks.to_le_bytes());
     buf
+}
+
+/// The six Extensible Array header statistics, in the C library's stored order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EaStats {
+    pub nsuper_blks: u64,
+    pub super_blk_size: u64,
+    pub ndata_blks: u64,
+    pub data_blk_size: u64,
+    pub max_idx_set: u64,
+    pub nelmts: u64,
+}
+
+/// On-disk byte size of one non-paged Extensible Array data block (`EADB`)
+/// holding `dblk_nelmts` element slots.
+pub(crate) fn eadb_size(
+    dblk_nelmts: u64,
+    elem_size: usize,
+    page_nelmts: u64,
+    offset_size: u8,
+    blk_off_size: usize,
+) -> u64 {
+    let prefix = 4 + 1 + 1 + offset_size as usize + blk_off_size;
+    if dblk_nelmts <= page_nelmts {
+        (prefix + dblk_nelmts as usize * elem_size + 4) as u64
+    } else {
+        // Paged: header carries its own checksum, then full pages follow.
+        let npages = dblk_nelmts / page_nelmts;
+        (prefix + 4) as u64 + npages * (page_nelmts * elem_size as u64 + 4)
+    }
+}
+
+/// On-disk byte size of one Extensible Array super block (`EASB`) with `ndblks`
+/// data-block pointers and (when its data blocks are paged) a page-init bitmap.
+pub(crate) fn aesb_size(
+    ndblks: u64,
+    dblk_nelmts: u64,
+    page_nelmts: u64,
+    offset_size: u8,
+    blk_off_size: usize,
+) -> u64 {
+    let os = offset_size as usize;
+    let bitmap = if dblk_nelmts > page_nelmts {
+        let npages = dblk_nelmts / page_nelmts;
+        ndblks as usize * npages.div_ceil(8) as usize
+    } else {
+        0
+    };
+    (4 + 1 + 1 + os + blk_off_size + bitmap + ndblks as usize * os + 4) as u64
+}
+
+/// Compute the six Extensible Array header statistics for an array holding
+/// `num_elements` densely-filled elements. Mirrors the allocation performed by
+/// [`build_extensible_array_at`] so the bulk writer and the incremental append
+/// writer always agree (asserted by a unit test).
+pub(crate) fn ea_compute_stats(
+    geom: &EaGeometry,
+    idx_blk_elmts: u64,
+    elem_size: usize,
+    page_nelmts: u64,
+    offset_size: u8,
+    blk_off_size: usize,
+    num_elements: u64,
+) -> EaStats {
+    let mut s = EaStats {
+        nsuper_blks: 0,
+        super_blk_size: 0,
+        ndata_blks: 0,
+        data_blk_size: 0,
+        max_idx_set: num_elements,
+        nelmts: idx_blk_elmts,
+    };
+    let mut elem = idx_blk_elmts;
+    for &dn in &geom.direct_dblk_nelmts {
+        if elem < num_elements {
+            s.ndata_blks += 1;
+            s.data_blk_size += eadb_size(dn, elem_size, page_nelmts, offset_size, blk_off_size);
+            s.nelmts += dn;
+        }
+        elem += dn;
+    }
+    for j in 0..geom.nsblk_addrs {
+        let (ndblks, dn) = geom.sblks[geom.first_indirect_sblk + j];
+        let span = ndblks * dn;
+        if elem < num_elements {
+            s.nsuper_blks += 1;
+            s.super_blk_size += aesb_size(ndblks, dn, page_nelmts, offset_size, blk_off_size);
+            let mut le = elem;
+            for _ in 0..ndblks {
+                if le < num_elements {
+                    s.ndata_blks += 1;
+                    s.data_blk_size +=
+                        eadb_size(dn, elem_size, page_nelmts, offset_size, blk_off_size);
+                    s.nelmts += dn;
+                }
+                le += dn;
+            }
+        }
+        elem += span;
+    }
+    s
 }
 
 /// Build a complete Extensible Array at a known absolute address.
@@ -1788,6 +1889,49 @@ mod tests {
         let result = roundtrip_ea(&values, &[n], &[1], &[u64::MAX]);
         assert_eq!(result.len(), n as usize);
         assert_eq!(result, values);
+    }
+
+    /// `ea_compute_stats` must reproduce the EAHD statistics that
+    /// `build_extensible_array_at` actually writes (these feed the in-place
+    /// append writer, so any drift would corrupt appended files).
+    #[test]
+    fn ea_compute_stats_matches_builder() {
+        use crate::extensible_array::{EaGeometry, ExtensibleArrayHeader};
+        let geom_header = ExtensibleArrayHeader {
+            client_id: 0,
+            element_size: 8,
+            max_nelmts_bits: 32,
+            idx_blk_elmts: 4,
+            min_dblk_nelmts: 16,
+            super_blk_min_nelmts: 4,
+            max_dblk_nelmts_bits: 10,
+            num_elements: 0,
+            index_block_address: 0,
+        };
+        let geom = EaGeometry::from_header(&geom_header);
+        for &n in &[1u64, 4, 20, 100, 244, 300, 2000, 50000, 131056, 140000] {
+            let chunks: Vec<WrittenChunk> = (0..n)
+                .map(|i| WrittenChunk {
+                    address: 0x1000 + i * 8,
+                    compressed_size: 8,
+                    raw_size: 8,
+                    filter_mask: 0,
+                })
+                .collect();
+            let ea = build_extensible_array_at(&chunks, 8, 8, false, 0x100000);
+            // Parse the 6 stats from the EAHD (12-byte fixed prefix, then 6 * ls).
+            let stat = |k: usize| u64::from_le_bytes(ea[12 + k * 8..12 + k * 8 + 8].try_into().unwrap());
+            let built = super::EaStats {
+                nsuper_blks: stat(0),
+                super_blk_size: stat(1),
+                ndata_blks: stat(2),
+                data_blk_size: stat(3),
+                max_idx_set: stat(4),
+                nelmts: stat(5),
+            };
+            let computed = super::ea_compute_stats(&geom, 4, 8, 1024, 8, 4, n);
+            assert_eq!(computed, built, "stats mismatch at n={n}");
+        }
     }
 
     // ---- h5py round-trip tests for chunked writes ----

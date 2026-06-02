@@ -410,6 +410,9 @@ pub enum Error {
     MissingMessage(crate::message_type::MessageType),
     /// Alignment or size error for zero-copy typed access.
     AlignmentError(String),
+    /// A SWMR operation (e.g. [`crate::File::refresh`]) was requested on a file
+    /// that was not opened for SWMR reading via `File::open_swmr`.
+    SwmrUnsupported,
 }
 
 #[cfg(feature = "std")]
@@ -421,6 +424,10 @@ impl fmt::Display for Error {
             Error::NotADataset(path) => write!(f, "not a dataset: {path}"),
             Error::MissingMessage(mt) => write!(f, "missing required message: {mt:?}"),
             Error::AlignmentError(msg) => write!(f, "alignment error: {msg}"),
+            Error::SwmrUnsupported => write!(
+                f,
+                "refresh requires a file opened with File::open_swmr (live handle)"
+            ),
         }
     }
 }

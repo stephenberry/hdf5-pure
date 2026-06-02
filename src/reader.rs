@@ -1,6 +1,7 @@
 //! Reading API: File, Dataset, and Group handles for reading HDF5 files.
 
 use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom};
 
 use crate::attribute::extract_attributes_full;
 use crate::chunk_cache::ChunkCache;
@@ -29,27 +30,113 @@ pub struct File {
     superblock: Superblock,
     /// Byte offset to add to all relative addresses (= original base_address).
     addr_offset: u64,
+    /// Live file handle, retained only when the file was opened with
+    /// [`File::open_swmr`] so [`File::refresh`] can re-read appended data.
+    handle: Option<std::fs::File>,
 }
 
 impl File {
     /// Open an HDF5 file from a filesystem path.
+    ///
+    /// Reads the file into memory once. To follow a file that a concurrent
+    /// single writer is appending to (SWMR), use [`File::open_swmr`] instead.
     pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
         let bytes = std::fs::read(path.as_ref()).map_err(Error::Io)?;
         Self::from_bytes(bytes)
     }
 
-    /// Open an HDF5 file from an in-memory byte vector.
-    pub fn from_bytes(data: Vec<u8>) -> Result<Self, Error> {
-        let sig_offset = signature::find_signature(&data)?;
-        let mut superblock = Superblock::parse(&data, sig_offset)?;
-        let addr_offset = superblock.base_address;
-        // Normalize root_group_address to absolute so resolve_path_any works.
-        superblock.root_group_address += addr_offset;
+    /// Open an HDF5 file for SWMR (single-writer/multiple-reader) reading.
+    ///
+    /// Like [`File::open`], but retains a live handle to the file so that
+    /// [`File::refresh`] can re-read data appended by a concurrent writer
+    /// (whether produced by this crate's append writer, the reference HDF5 C
+    /// library, or h5py in SWMR mode). The initial view is a consistent
+    /// snapshot; call [`File::refresh`] to advance to a newer one.
+    ///
+    /// Only the `std` build supports this (it requires a live filesystem
+    /// handle); the in-memory [`File::from_bytes`] path cannot refresh.
+    pub fn open_swmr<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
+        let mut handle = std::fs::File::open(path.as_ref()).map_err(Error::Io)?;
+        let mut data = Vec::new();
+        handle.read_to_end(&mut data).map_err(Error::Io)?;
+        let (superblock, addr_offset) = Self::parse_superblock(&data)?;
         Ok(Self {
             data,
             superblock,
             addr_offset,
+            handle: Some(handle),
         })
+    }
+
+    /// Open an HDF5 file from an in-memory byte vector.
+    pub fn from_bytes(data: Vec<u8>) -> Result<Self, Error> {
+        let (superblock, addr_offset) = Self::parse_superblock(&data)?;
+        Ok(Self {
+            data,
+            superblock,
+            addr_offset,
+            handle: None,
+        })
+    }
+
+    /// Parse the superblock from `data`, returning it (with `root_group_address`
+    /// normalized to an absolute offset) and the base-address offset.
+    fn parse_superblock(data: &[u8]) -> Result<(Superblock, u64), Error> {
+        let sig_offset = signature::find_signature(data)?;
+        let mut superblock = Superblock::parse(data, sig_offset)?;
+        let addr_offset = superblock.base_address;
+        // Normalize root_group_address to absolute so resolve_path_any works.
+        superblock.root_group_address += addr_offset;
+        Ok((superblock, addr_offset))
+    }
+
+    /// Re-read the file from disk to pick up data appended by a concurrent
+    /// writer, then re-parse the superblock.
+    ///
+    /// This is the SWMR reader's refresh primitive (analogous to the C library's
+    /// `H5Drefresh` / h5py's `Dataset.refresh()`): after it returns, newly
+    /// fetched [`Dataset`]/[`Group`] handles observe the writer's appended
+    /// chunks and extended dimensions, because they re-parse object headers at
+    /// their (stable) addresses against the refreshed bytes. Existing handles
+    /// borrow `&self`, so they must be dropped before calling this; re-fetch
+    /// them afterward.
+    ///
+    /// Returns [`Error::SwmrUnsupported`] if the file was not opened with
+    /// [`File::open_swmr`]. The superblock is checksum-validated on every
+    /// re-read; a transient parse failure (a writer caught mid-flush) is
+    /// retried a bounded number of times before being surfaced.
+    pub fn refresh(&mut self) -> Result<(), Error> {
+        let handle = self.handle.as_mut().ok_or(Error::SwmrUnsupported)?;
+
+        // A writer only appends (the file grows) and updates a few fixed-size,
+        // individually checksummed structures in place (superblock EOF, object
+        // header dimensions, array header counts). Re-reading the whole file and
+        // re-validating the superblock checksum yields a consistent view; if the
+        // superblock is caught mid-update, retry.
+        const MAX_ATTEMPTS: u32 = 100;
+        let mut last_err = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            let mut data = Vec::new();
+            handle.seek(SeekFrom::Start(0)).map_err(Error::Io)?;
+            handle.read_to_end(&mut data).map_err(Error::Io)?;
+            match Self::parse_superblock(&data) {
+                Ok((superblock, addr_offset)) => {
+                    self.data = data;
+                    self.superblock = superblock;
+                    self.addr_offset = addr_offset;
+                    return Ok(());
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    // Brief backoff before re-reading; the writer's in-place
+                    // updates are tiny, so a short pause clears the window.
+                    std::thread::sleep(std::time::Duration::from_micros(
+                        50 * (attempt + 1) as u64,
+                    ));
+                }
+            }
+        }
+        Err(last_err.unwrap_or(Error::SwmrUnsupported))
     }
 
     /// Returns a handle to the root group.
