@@ -83,7 +83,7 @@ fn read_bin(name: &str) -> Vec<u8> {
 /// far. All four types and 1D–4D are in scope after Step 5.
 fn is_supported(fix: &Fixture) -> bool {
     let dtype_ok = matches!(fix.dtype.as_str(), "f32" | "f64" | "i32" | "i64");
-    let rank_ok = matches!(fix.shape.len(), 1 | 2 | 3 | 4);
+    let rank_ok = matches!(fix.shape.len(), 1..=4);
     dtype_ok && rank_ok && fix.mode == "rate"
 }
 

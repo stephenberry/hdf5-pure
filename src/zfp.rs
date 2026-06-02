@@ -480,7 +480,7 @@ fn inv_cast_f64_slice(emax_biased: u64, coeffs: &[i64], out: &mut [f64]) {
 /// exceed the normal-range upper bound (up to ~2^1083).
 #[inline]
 fn pow2_f64_wide(exp: i32) -> f64 {
-    if exp >= -1022 && exp <= 1023 {
+    if (-1022..=1023).contains(&exp) {
         return pow2_f64(exp);
     }
     let mut remaining = exp;
@@ -504,7 +504,10 @@ fn pow2_f64_wide(exp: i32) -> f64 {
 /// not need a subnormal/overflow fallback path.
 #[inline]
 fn pow2_f64(exp: i32) -> f64 {
-    debug_assert!(exp >= -1022 && exp <= 1023, "pow2_f64 out of normal range");
+    debug_assert!(
+        (-1022..=1023).contains(&exp),
+        "pow2_f64 out of normal range"
+    );
     let biased = (exp + 1023) as u64;
     f64::from_bits(biased << 52)
 }
