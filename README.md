@@ -341,7 +341,7 @@ For WASM, disable default features:
 
 ```toml
 [dependencies]
-hdf5-pure = { version = "0.1", default-features = false, features = ["checksum"] }
+hdf5-pure = { version = "0.7", default-features = false, features = ["checksum"] }
 ```
 
 ## Acknowledgements
