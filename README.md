@@ -6,6 +6,7 @@ Pure-Rust HDF5 reader/writer. No C dependencies, no build scripts, WASM-compatib
 
 - **Write** HDF5 files with datasets, groups, attributes, and nested hierarchies
 - **Read** HDF5 files (v0/v1/v2/v3 superblocks, v1/v2 object headers, contiguous/chunked/compact storage)
+- **SWMR** (single-writer / multiple-reader) append and refreshing read for 1-D unlimited datasets, interoperable with the reference C library and h5py
 - **No C dependencies** — compiles to `wasm32-unknown-unknown` with `--no-default-features`
 - **MATLAB v7.3 compatible** — userblock support, fixed-length ASCII attributes, variable-length string arrays, object references
 - Deflate, shuffle, and scale-offset (lossless integer / lossy float) compression
@@ -63,6 +64,50 @@ builder.create_dataset("x").with_f64_data(&[1.0, 2.0]);
 
 let bytes: Vec<u8> = builder.finish().unwrap(); // no filesystem needed
 ```
+
+## SWMR (single writer, multiple readers)
+
+A single process can append to an unlimited dataset in place while other processes read it concurrently. The writer appends chunks and flushes in dependency order so readers only ever observe a consistent prefix; readers re-read to pick up new data. This interoperates with the reference HDF5 C library and h5py in both directions.
+
+The dataset must have one unlimited dimension and be chunked (it is indexed by an Extensible Array, which the latest format selects automatically). Create it the usual way:
+
+```rust
+use hdf5_pure::FileBuilder;
+
+let mut builder = FileBuilder::new();
+builder.create_dataset("log")
+    .with_i32_data(&[0, 1, 2])   // initial rows
+    .with_shape(&[3])
+    .with_maxshape(&[u64::MAX])  // one unlimited dimension
+    .with_chunks(&[1]);
+builder.write("stream.h5").unwrap();
+```
+
+Append in place (each call flushes durably; the file stays valid for concurrent readers throughout):
+
+```rust
+use hdf5_pure::SwmrWriter;
+
+let mut writer = SwmrWriter::open("stream.h5").unwrap();
+writer.append_i32("log", &[3, 4, 5]).unwrap();
+writer.append_i32("log", &[6, 7]).unwrap();
+writer.close().unwrap(); // clears the SWMR flag; or just drop the writer
+```
+
+Follow a growing file from another process (or the reference C library / h5py writing in SWMR mode):
+
+```rust
+use hdf5_pure::File;
+
+let mut file = File::open_swmr("stream.h5").unwrap();
+let n = file.dataset("log").unwrap().shape().unwrap()[0];
+// ... later, after the writer appends ...
+file.refresh().unwrap();                 // re-read appended data
+let ds = file.dataset("log").unwrap();
+println!("now {} rows", ds.shape().unwrap()[0]);
+```
+
+Supported subset: one unlimited dimension, chunked, unfiltered (no compression on the appended dataset), chunk-aligned appends, no userblock. Growth is unbounded. SWMR requires the `std` filesystem (not the in-memory/WASM path). If a writer process exits without `close()`, the file is left marked as having an active SWMR writer; recover it with `SwmrWriter::clear_swmr_flag(path)` (the equivalent of `h5clear`).
 
 ## Supported data types
 

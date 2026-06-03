@@ -336,6 +336,7 @@ fn read_data_block_elements(
     offset_size: u8,
     chunk_byte_size: u64,
     start_index: usize,
+    total_elements: usize,
     num_chunks_per_dim: &[u64],
     chunk_dimensions: &[u32],
 ) -> Result<Vec<ChunkInfo>, FormatError> {
@@ -364,8 +365,13 @@ fn read_data_block_elements(
     // whose `dblk_nelmts` exceeds the page size) are handled separately by
     // `read_paged_data_block`, which is driven by the page-init bitmap stored
     // in the owning super block.
+    // Read only as many elements as the dataset count allows. A SWMR writer may
+    // have written element slots beyond the published count (it grows the block
+    // before bumping the count); those must be ignored, otherwise their linear
+    // indices wrap modulo the current chunk-grid and overwrite earlier chunks.
+    let limit = total_elements.saturating_sub(start_index).min(nelmts);
     let mut chunks = Vec::new();
-    for i in 0..nelmts {
+    for i in 0..limit {
         let (info, consumed) = read_element(
             file_data,
             pos,
@@ -417,6 +423,7 @@ fn read_paged_data_block(
     offset_size: u8,
     chunk_byte_size: u64,
     start_index: usize,
+    total_elements: usize,
     num_chunks_per_dim: &[u64],
     chunk_dimensions: &[u32],
 ) -> Result<Vec<ChunkInfo>, FormatError> {
@@ -444,7 +451,11 @@ fn read_paged_data_block(
             break;
         }
         let page_start = start_index + page * page_nelmts;
-        for i in 0..page_nelmts {
+        // Ignore element slots beyond the published count (a writer may have
+        // written ahead of bumping the count); their wrapped linear indices
+        // would otherwise overwrite earlier chunks.
+        let limit = total_elements.saturating_sub(page_start).min(page_nelmts);
+        for i in 0..limit {
             let (info, consumed) = read_element(
                 file_data,
                 pos,
@@ -460,6 +471,9 @@ fn read_paged_data_block(
                 chunks.push(ci);
             }
             pos += consumed;
+        }
+        if limit < page_nelmts {
+            break; // remaining slots/pages are beyond the dataset count
         }
         // Skip the page checksum.
         pos += 4;
@@ -515,7 +529,14 @@ pub fn read_extensible_array_chunks(
 
     let mut chunks = Vec::new();
     let mut global_index = 0usize;
-    let total_elements = header.num_elements as usize;
+    // Bound the traversal by the dataset's dimensions, not just the array's
+    // stored element count. A SWMR writer publishes the grown chunk index
+    // (header element count) before the grown dataspace dimension; reading only
+    // as many chunks as the current dimensions imply means an interrupted append
+    // (index ahead of dimensions) yields a consistent prefix rather than chunks
+    // beyond the dataset bounds.
+    let dims_chunks: usize = num_chunks_per_dim.iter().product::<u64>() as usize;
+    let total_elements = (header.num_elements as usize).min(dims_chunks);
 
     // 1. Read inline elements in index block
     let n_inline = header.idx_blk_elmts as usize;
@@ -571,6 +592,7 @@ pub fn read_extensible_array_chunks(
                 offset_size,
                 chunk_byte_size,
                 global_index,
+                total_elements,
                 &num_chunks_per_dim,
                 chunk_dimensions,
             )?;
@@ -608,6 +630,7 @@ pub fn read_extensible_array_chunks(
                 offset_size,
                 chunk_byte_size,
                 global_index,
+                total_elements,
                 &num_chunks_per_dim,
                 chunk_dimensions,
             )?;
@@ -630,6 +653,7 @@ fn read_super_block(
     offset_size: u8,
     chunk_byte_size: u64,
     start_index: usize,
+    total_elements: usize,
     num_chunks_per_dim: &[u64],
     chunk_dimensions: &[u32],
 ) -> Result<Vec<ChunkInfo>, FormatError> {
@@ -714,6 +738,7 @@ fn read_super_block(
                     offset_size,
                     chunk_byte_size,
                     global_idx,
+                    total_elements,
                     num_chunks_per_dim,
                     chunk_dimensions,
                 )?
@@ -726,6 +751,7 @@ fn read_super_block(
                     offset_size,
                     chunk_byte_size,
                     global_idx,
+                    total_elements,
                     num_chunks_per_dim,
                     chunk_dimensions,
                 )?
