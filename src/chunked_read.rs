@@ -12,7 +12,9 @@ use crate::data_layout::DataLayout;
 use crate::dataspace::Dataspace;
 use crate::datatype::Datatype;
 use crate::error::FormatError;
-use crate::extensible_array::{ExtensibleArrayHeader, read_extensible_array_chunks};
+use crate::extensible_array::{
+    ExtensibleArrayHeader, read_extensible_array_chunks, read_extensible_array_chunks_from_source,
+};
 use crate::filter_pipeline::FilterPipeline;
 use crate::filters::{ChunkContext, decompress_chunk};
 use crate::fixed_array::{
@@ -667,9 +669,19 @@ pub fn read_chunked_data_from_source<S: FileSource + ?Sized>(
             )?
         }
         (4, Some(4)) => {
-            return Err(FormatError::ChunkedReadError(
-                "streaming Extensible-Array chunk index is not yet supported".into(),
-            ));
+            // Extensible Array — spatial chunk dims only.
+            let spatial_chunk_dims: Vec<u32> = chunk_dimensions[..rank].to_vec();
+            let header =
+                ExtensibleArrayHeader::parse_from_source(source, addr, offset_size, length_size)?;
+            read_extensible_array_chunks_from_source(
+                source,
+                &header,
+                &dataspace.dimensions,
+                &spatial_chunk_dims,
+                u32_from(elem_size as u64)?,
+                offset_size,
+                length_size,
+            )?
         }
         (v, idx) => {
             return Err(FormatError::ChunkedReadError(format!(
