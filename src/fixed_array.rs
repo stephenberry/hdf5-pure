@@ -249,7 +249,13 @@ pub fn read_fixed_array_chunks(
     }
     let bitmap = &file_data[bitmap_pos..bitmap_pos + bitmap_size];
     let pages_start = bitmap_pos + bitmap_size + 4;
-    let page_stride = page_size * elem_size + 4;
+    let page_stride = page_size
+        .checked_mul(elem_size)
+        .and_then(|bytes| bytes.checked_add(4))
+        .ok_or(FormatError::OffsetOverflow {
+            offset: page_size as u64,
+            length: elem_size as u64,
+        })?;
 
     for page in 0..npages {
         let nelem_in_page = core::cmp::min(page_size, num_elements - page * page_size);
@@ -259,7 +265,13 @@ pub fn read_fixed_array_chunks(
         if !initialized {
             continue;
         }
-        let page_start = pages_start + page * page_stride;
+        let page_offset = page
+            .checked_mul(page_stride)
+            .ok_or(FormatError::OffsetOverflow {
+                offset: page as u64,
+                length: page_stride as u64,
+            })?;
+        let page_start = pages_start + page_offset;
         for j in 0..nelem_in_page {
             let index = page * page_size + j;
             let elem_pos = page_start + j * elem_size;
