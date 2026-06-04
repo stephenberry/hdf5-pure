@@ -28,7 +28,12 @@ pub fn read_raw_data_zerocopy<'a>(
 ) -> Result<Option<&'a [u8]>, FormatError> {
     let num_elements = dataspace.num_elements().to_usize()?;
     let elem_size = datatype.type_size() as usize;
-    let expected_size = num_elements * elem_size;
+    let expected_size = num_elements
+        .checked_mul(elem_size)
+        .ok_or(FormatError::OffsetOverflow {
+            offset: num_elements as u64,
+            length: elem_size as u64,
+        })?;
 
     // Zero-element datasets have no data to read.
     if num_elements == 0 {
@@ -84,7 +89,12 @@ pub fn read_raw_data_full(
 ) -> Result<Vec<u8>, FormatError> {
     let num_elements = dataspace.num_elements().to_usize()?;
     let elem_size = datatype.type_size() as usize;
-    let expected_size = num_elements * elem_size;
+    let expected_size = num_elements
+        .checked_mul(elem_size)
+        .ok_or(FormatError::OffsetOverflow {
+            offset: num_elements as u64,
+            length: elem_size as u64,
+        })?;
 
     // Zero-element datasets have no data to read.
     if num_elements == 0 {
