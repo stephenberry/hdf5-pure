@@ -8,6 +8,7 @@ use alloc::{vec, vec::Vec};
 
 use crate::checksum::jenkins_lookup3;
 use crate::chunk_cache::{CACHE_LINE_SIZE, align_to_cache_line};
+use crate::convert::TryToUsize;
 use crate::error::FormatError;
 use crate::extensible_array::{EaGeometry, ExtensibleArrayHeader};
 #[cfg(feature = "zfp")]
@@ -932,7 +933,7 @@ pub fn build_extensible_array_at(
     length_size: u8,
     has_filters: bool,
     ea_base_address: u64,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, FormatError> {
     let os = offset_size as usize;
     let num_elements = chunks.len();
 
@@ -1014,12 +1015,16 @@ pub fn build_extensible_array_at(
     let mut super_blk_size: u64 = 0;
     let mut alloc_slots: u64 = inline as u64; // nelmts: idx slots + every allocated data block
 
-    let mut elem_cursor = inline; // absolute element index past the inline slots
+    // Absolute element index past the inline slots. This walks the extensible
+    // array's theoretical element space (up to `2^max_nelmts_bits` slots), which
+    // exceeds a 32-bit `usize`, so it and the per-block spans are tracked in
+    // `u64`; only the bounded, real-data values handed to the block builders are
+    // narrowed (checked) to `usize`.
+    let mut elem_cursor: u64 = inline as u64;
 
     // Direct data blocks: addresses stored directly in the index block.
     for &dblk_nelmts in &geom.direct_dblk_nelmts {
-        let dblk_nelmts = dblk_nelmts as usize;
-        if elem_cursor >= num_elements {
+        if elem_cursor >= num_elements as u64 {
             direct_addrs.push(undef_addr);
             elem_cursor += dblk_nelmts;
             continue;
@@ -1028,9 +1033,9 @@ pub fn build_extensible_array_at(
         let (db_bytes, _) = build_eadb(
             chunks,
             num_elements,
-            elem_cursor,
-            dblk_nelmts,
-            (elem_cursor - inline) as u64,
+            elem_cursor.to_usize()?,
+            dblk_nelmts.to_usize()?,
+            elem_cursor - inline as u64,
             ea_base_address,
             offset_size,
             has_filters,
@@ -1041,7 +1046,7 @@ pub fn build_extensible_array_at(
         );
         ndata_blks += 1;
         data_blk_size += db_bytes.len() as u64;
-        alloc_slots += dblk_nelmts as u64;
+        alloc_slots += dblk_nelmts;
         body.extend_from_slice(&db_bytes);
         direct_addrs.push(addr);
         elem_cursor += dblk_nelmts;
@@ -1051,34 +1056,38 @@ pub fn build_extensible_array_at(
     // refers to super block `first_indirect_sblk + j`.
     for j in 0..nsblk_addrs {
         let sblk_idx = geom.first_indirect_sblk + j;
+        // `ndblks` and `dblk_nelmts` are u64 element counts from the EA geometry.
+        // Their product (this super block's element span) and the running cursor
+        // walk the array's theoretical address space and can exceed a 32-bit
+        // usize, so they stay in u64; only bounded, real-data counts are narrowed.
         let (ndblks, dblk_nelmts) = geom.sblks[sblk_idx];
-        let ndblks = ndblks as usize;
-        let dblk_nelmts = dblk_nelmts as usize;
         let sb_span = ndblks * dblk_nelmts;
-        if elem_cursor >= num_elements {
+        if elem_cursor >= num_elements as u64 {
             sblk_addrs.push(undef_addr);
             elem_cursor += sb_span;
             continue;
         }
 
-        let is_paged = dblk_nelmts > page_nelmts;
+        // Past the early-out this super block holds real data, so its block
+        // counts are bounded by the (usize) chunk count and narrow safely.
+        let is_paged = dblk_nelmts > page_nelmts as u64;
         let npages = if is_paged {
-            dblk_nelmts / page_nelmts
+            dblk_nelmts / page_nelmts as u64
         } else {
             0
         };
-        let sb_block_offset = (elem_cursor - inline) as u64;
+        let sb_block_offset = elem_cursor - inline as u64;
         let bitmap_size = if is_paged {
-            ndblks * npages.div_ceil(8)
+            (ndblks * npages.div_ceil(8)).to_usize()?
         } else {
             0
         };
         let mut page_bitmap = vec![0u8; bitmap_size];
 
-        let mut sb_dblk_addrs: Vec<u64> = Vec::with_capacity(ndblks);
+        let mut sb_dblk_addrs: Vec<u64> = Vec::with_capacity(ndblks.to_usize()?);
         let mut local_elem = elem_cursor;
         for db_local in 0..ndblks {
-            if local_elem >= num_elements {
+            if local_elem >= num_elements as u64 {
                 sb_dblk_addrs.push(undef_addr);
                 local_elem += dblk_nelmts;
                 continue;
@@ -1087,9 +1096,9 @@ pub fn build_extensible_array_at(
             let (db_bytes, pages_init) = build_eadb(
                 chunks,
                 num_elements,
-                local_elem,
-                dblk_nelmts,
-                (local_elem - inline) as u64,
+                local_elem.to_usize()?,
+                dblk_nelmts.to_usize()?,
+                local_elem - inline as u64,
                 ea_base_address,
                 offset_size,
                 has_filters,
@@ -1100,12 +1109,12 @@ pub fn build_extensible_array_at(
             );
             ndata_blks += 1;
             data_blk_size += db_bytes.len() as u64;
-            alloc_slots += dblk_nelmts as u64;
+            alloc_slots += dblk_nelmts;
             body.extend_from_slice(&db_bytes);
             sb_dblk_addrs.push(addr);
             if is_paged {
                 for p in 0..pages_init {
-                    let global_page = db_local * npages + p;
+                    let global_page = (db_local * npages).to_usize()? + p;
                     page_bitmap[global_page / 8] |= 0x80 >> (global_page % 8);
                 }
             }
@@ -1200,7 +1209,7 @@ pub fn build_extensible_array_at(
     let mut combined = aehd;
     combined.extend_from_slice(&aeib);
     combined.extend_from_slice(&body);
-    combined
+    Ok(combined)
 }
 
 fn write_chunk_element(
@@ -1331,7 +1340,7 @@ pub fn build_chunked_data_at_ext(
             length_size,
             has_filters,
             ea_address,
-        );
+        )?;
         data_buf.extend_from_slice(&ea_bytes);
 
         serialize_v4_extensible_array(
@@ -1796,7 +1805,7 @@ mod tests {
                 filter_mask: 0,
             },
         ];
-        let ea = build_extensible_array_at(&chunks, 8, 8, false, 0x2000);
+        let ea = build_extensible_array_at(&chunks, 8, 8, false, 0x2000).unwrap();
         assert_eq!(&ea[0..4], b"EAHD");
         // Find EAIB after EAHD: 12 fixed + 6*8 stats + 8 addr + 4 checksum = 72
         let aehd_size = 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 6 * 8 + 8 + 4;
@@ -1924,7 +1933,7 @@ mod tests {
                     filter_mask: 0,
                 })
                 .collect();
-            let ea = build_extensible_array_at(&chunks, 8, 8, false, 0x100000);
+            let ea = build_extensible_array_at(&chunks, 8, 8, false, 0x100000).unwrap();
             // Parse the 6 stats from the EAHD (12-byte fixed prefix, then 6 * ls).
             let stat =
                 |k: usize| u64::from_le_bytes(ea[12 + k * 8..12 + k * 8 + 8].try_into().unwrap());
