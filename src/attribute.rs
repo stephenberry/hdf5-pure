@@ -5,6 +5,7 @@ use alloc::{string::String, vec::Vec};
 
 use crate::attribute_info::AttributeInfoMessage;
 use crate::btree_v2::{BTreeV2Header, collect_btree_v2_records};
+use crate::convert::TryToUsize;
 use crate::data_read;
 use crate::dataspace::Dataspace;
 use crate::datatype::Datatype;
@@ -84,7 +85,7 @@ impl AttributeMessage {
         pos += pad8(dataspace_size);
 
         // Raw data: num_elements × type_size bytes
-        let raw_data = compute_raw_data(data, pos, &dataspace, &datatype);
+        let raw_data = compute_raw_data(data, pos, &dataspace, &datatype)?;
 
         Ok(AttributeMessage {
             name,
@@ -118,7 +119,7 @@ impl AttributeMessage {
         let dataspace = Dataspace::parse(&data[pos..pos + dataspace_size], length_size)?;
         pos += dataspace_size;
 
-        let raw_data = compute_raw_data(data, pos, &dataspace, &datatype);
+        let raw_data = compute_raw_data(data, pos, &dataspace, &datatype)?;
 
         Ok(AttributeMessage {
             name,
@@ -153,7 +154,7 @@ impl AttributeMessage {
         let dataspace = Dataspace::parse(&data[pos..pos + dataspace_size], length_size)?;
         pos += dataspace_size;
 
-        let raw_data = compute_raw_data(data, pos, &dataspace, &datatype);
+        let raw_data = compute_raw_data(data, pos, &dataspace, &datatype)?;
 
         Ok(AttributeMessage {
             name,
@@ -251,20 +252,26 @@ fn compute_raw_data(
     pos: usize,
     dataspace: &Dataspace,
     datatype: &Datatype,
-) -> Vec<u8> {
-    let num_elements = dataspace.num_elements() as usize;
-    let elem_size = datatype.type_size() as usize;
-    let expected_size = num_elements * elem_size;
+) -> Result<Vec<u8>, FormatError> {
+    let num_elements = dataspace.num_elements();
+    let elem_size = datatype.type_size() as u64;
+    let expected_size = num_elements
+        .checked_mul(elem_size)
+        .ok_or(FormatError::OffsetOverflow {
+            offset: num_elements,
+            length: elem_size,
+        })?
+        .to_usize()?;
     let available = data.len().saturating_sub(pos);
     let take = expected_size.min(available);
-    if take > 0 {
+    Ok(if take > 0 {
         data[pos..pos + take].to_vec()
     } else if available > 0 {
         // Fallback: take whatever is available (e.g., for VL types where type_size may not match)
         data[pos..].to_vec()
     } else {
         Vec::new()
-    }
+    })
 }
 
 /// Extract a name from raw bytes, stripping null terminator.
@@ -371,7 +378,7 @@ fn extract_dense_attributes(
     length_size: u8,
 ) -> Result<Vec<AttributeMessage>, FormatError> {
     // Parse fractal heap
-    let fh = FractalHeapHeader::parse(file_data, fh_addr as usize, offset_size, length_size)?;
+    let fh = FractalHeapHeader::parse(file_data, fh_addr.to_usize()?, offset_size, length_size)?;
 
     // Parse B-tree v2 for name index (type 8)
     let btree_addr = attr_info
@@ -380,7 +387,8 @@ fn extract_dense_attributes(
             expected: 1,
             available: 0,
         })?;
-    let btree_hdr = BTreeV2Header::parse(file_data, btree_addr as usize, offset_size, length_size)?;
+    let btree_hdr =
+        BTreeV2Header::parse(file_data, btree_addr.to_usize()?, offset_size, length_size)?;
     let records = collect_btree_v2_records(file_data, &btree_hdr, offset_size, length_size)?;
 
     let mut attrs = Vec::new();

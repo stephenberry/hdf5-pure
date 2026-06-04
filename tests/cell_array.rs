@@ -1,4 +1,7 @@
-#![cfg(feature = "serde")]
+// Crosschecks against the reference HDF5 C library (`hdf5-metno`), gated to
+// 64-bit-pointer targets; skip on 32-bit so `cross test --target i686-...`
+// stays pure-Rust.
+#![cfg(all(feature = "serde", not(target_pointer_width = "32")))]
 //! Cell-array serialization for sequences that don't fit a numeric matrix.
 //!
 //! `Vec<MyStruct>`, `Vec<Option<T>>` with `None` interspersed, and

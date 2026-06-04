@@ -185,6 +185,33 @@ pub enum FormatError {
     DuplicateDatasetName(String),
     /// ZFP filter configuration is invalid (e.g. missing element type, rank out of range).
     UnsupportedZfp(String),
+    /// A file-derived 64-bit value (an offset, length, size, or element count)
+    /// does not fit in the target integer type on this platform. This is the
+    /// guard that replaces silent `as usize` / `as u32` truncation: on a 32-bit
+    /// host, `usize` is 32 bits, so an HDF5 offset or length above `usize::MAX`
+    /// would otherwise wrap and read the wrong bytes. The original value is
+    /// preserved for diagnostics, and `target` names the type we tried to
+    /// narrow to (e.g. `"usize"`, `"u32"`).
+    ValueTooLargeForPlatform {
+        /// The original 64-bit value read from the file.
+        value: u64,
+        /// The platform integer type the value could not fit into.
+        target: &'static str,
+    },
+    /// Two file-derived values (typically an offset and a length) overflow `u64`
+    /// when added to form a slice bound. Reported instead of wrapping so a
+    /// malformed file cannot produce a wrapped or out-of-range index.
+    OffsetOverflow {
+        /// First operand (typically the base offset/address).
+        offset: u64,
+        /// Second operand (typically the length/size).
+        length: u64,
+    },
+    /// A random-access byte source (see [`crate::source::FileSource`]) failed to
+    /// supply the requested bytes. The string carries a backend-specific reason
+    /// (e.g. an underlying `std::io::Error` rendered to text), so this stays
+    /// `no_std`/`alloc`-friendly and free of an `std::io` dependency.
+    Source(String),
 }
 
 impl fmt::Display for FormatError {
@@ -411,6 +438,22 @@ impl fmt::Display for FormatError {
             }
             FormatError::UnsupportedZfp(msg) => {
                 write!(f, "unsupported ZFP configuration: {msg}")
+            }
+            FormatError::ValueTooLargeForPlatform { value, target } => {
+                write!(
+                    f,
+                    "file value {value} does not fit in {target} on this platform \
+                     (a 64-bit HDF5 offset/length exceeds this target's address width)"
+                )
+            }
+            FormatError::OffsetOverflow { offset, length } => {
+                write!(
+                    f,
+                    "offset arithmetic overflow: {offset} + {length} exceeds u64"
+                )
+            }
+            FormatError::Source(msg) => {
+                write!(f, "byte source error: {msg}")
             }
         }
     }

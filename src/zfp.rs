@@ -51,6 +51,7 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec, vec::Vec};
 
+use crate::convert::TryToUsize;
 use crate::error::FormatError;
 
 /// Scalar type the codec operates on. Encoded as a small integer inside the
@@ -2350,7 +2351,10 @@ pub fn zfp_cd_values_rate(
             chunk_dims.len()
         )));
     }
-    let dims_usize: Vec<usize> = chunk_dims.iter().map(|&d| d as usize).collect();
+    let dims_usize: Vec<usize> = chunk_dims
+        .iter()
+        .map(|&d| d.to_usize())
+        .collect::<Result<_, _>>()?;
     let rank = dims_usize.len();
     let block_values: usize = 4usize.pow(rank as u32);
     let maxbits = (rate * block_values as f64) as u64;

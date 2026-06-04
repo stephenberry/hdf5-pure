@@ -5,6 +5,7 @@ use std::io::{Read, Seek, SeekFrom};
 
 use crate::attribute::extract_attributes_full;
 use crate::chunk_cache::ChunkCache;
+use crate::convert::TryToUsize;
 use crate::data_layout::DataLayout;
 use crate::data_read;
 use crate::dataspace::Dataspace;
@@ -194,7 +195,7 @@ impl File {
     fn parse_header(&self, address: u64) -> Result<ObjectHeader, FormatError> {
         ObjectHeader::parse_with_base(
             &self.data,
-            address as usize,
+            address.to_usize()?,
             self.superblock.offset_size,
             self.superblock.length_size,
             self.addr_offset,

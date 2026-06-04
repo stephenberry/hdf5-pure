@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 #[cfg(feature = "checksum")]
 use byteorder::{ByteOrder, LittleEndian};
 
+use crate::convert::TryToUsize;
 use crate::error::FormatError;
 
 /// Parsed fractal heap header (signature "FRHP").
@@ -289,22 +290,22 @@ impl FractalHeapHeader {
             // Root is a direct block
             self.read_from_direct_block(
                 file_data,
-                self.root_block_address as usize,
+                self.root_block_address.to_usize()?,
                 self.starting_block_size,
                 0, // block offset in heap = 0 for root
                 heap_offset,
-                obj_len as usize,
+                obj_len.to_usize()?,
                 offset_size,
             )
         } else {
             // Root is an indirect block — limit recursion to 64 levels
             self.read_from_indirect_block(
                 file_data,
-                self.root_block_address as usize,
+                self.root_block_address.to_usize()?,
                 self.current_rows_in_root_indirect_block,
                 0, // block offset
                 heap_offset,
-                obj_len as usize,
+                obj_len.to_usize()?,
                 offset_size,
                 64, // max recursion depth
             )
@@ -326,8 +327,13 @@ impl FractalHeapHeader {
         length: usize,
         _offset_size: u8,
     ) -> Result<Vec<u8>, FormatError> {
-        let local_offset = (target_offset - block_heap_offset) as usize;
-        let pos = block_addr + local_offset;
+        let local_offset = (target_offset - block_heap_offset).to_usize()?;
+        let pos = block_addr
+            .checked_add(local_offset)
+            .ok_or(FormatError::OffsetOverflow {
+                offset: block_addr as u64,
+                length: target_offset - block_heap_offset,
+            })?;
         ensure_len(file_data, pos, length)?;
         Ok(file_data[pos..pos + length].to_vec())
     }
@@ -392,7 +398,7 @@ impl FractalHeapHeader {
                     if target_offset >= current_heap_offset && target_offset < block_end {
                         return self.read_from_direct_block(
                             file_data,
-                            child_addr as usize,
+                            child_addr.to_usize()?,
                             block_size,
                             current_heap_offset,
                             target_offset,
@@ -421,7 +427,7 @@ impl FractalHeapHeader {
                     if target_offset >= current_heap_offset && target_offset < block_end {
                         return self.read_from_indirect_block(
                             file_data,
-                            child_addr as usize,
+                            child_addr.to_usize()?,
                             child_nrows as u16,
                             current_heap_offset,
                             target_offset,
@@ -440,7 +446,7 @@ impl FractalHeapHeader {
         }
 
         Err(FormatError::UnexpectedEof {
-            expected: target_offset as usize + length,
+            expected: target_offset.to_usize()?.saturating_add(length),
             available: file_data.len(),
         })
     }

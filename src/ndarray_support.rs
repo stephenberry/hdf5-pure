@@ -38,6 +38,7 @@
 
 use ndarray::{Array, ArrayBase, ArrayD, Data, Dimension, IxDyn};
 
+use crate::convert::TryToUsize;
 use crate::error::Error;
 use crate::reader::Dataset;
 use crate::type_builders::DatasetBuilder;
@@ -127,7 +128,11 @@ impl Dataset<'_> {
     /// [`Dataset::read_f64`](crate::Dataset::read_f64) conversion rules, with
     /// no check that `T` matches the on-disk datatype.
     pub fn read_array_dyn<T: H5Element>(&self) -> Result<ArrayD<T>, Error> {
-        let shape: Vec<usize> = self.shape()?.iter().map(|&d| d as usize).collect();
+        let shape: Vec<usize> = self
+            .shape()?
+            .iter()
+            .map(|&d| d.to_usize())
+            .collect::<Result<Vec<_>, _>>()?;
         let data = T::read_from(self)?;
         ArrayD::from_shape_vec(IxDyn(&shape), data).map_err(|e| Error::Shape(e.to_string()))
     }

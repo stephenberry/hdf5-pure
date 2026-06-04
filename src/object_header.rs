@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 
 use byteorder::{ByteOrder, LittleEndian};
 
+use crate::convert::{TryToUsize, slice_range};
 use crate::error::FormatError;
 use crate::message_type::MessageType;
 
@@ -126,7 +127,7 @@ impl ObjectHeader {
 
         let num_messages = LittleEndian::read_u16(&data[offset + 2..offset + 4]);
         let reference_count = LittleEndian::read_u32(&data[offset + 4..offset + 8]);
-        let header_data_size = LittleEndian::read_u32(&data[offset + 8..offset + 12]) as usize;
+        let header_data_size = LittleEndian::read_u32(&data[offset + 8..offset + 12]).to_usize()?;
 
         // Pad to 8-byte alignment: header prefix is 12 bytes, pad to 16
         let padding = 4; // pad 12-byte prefix to 16-byte alignment
@@ -189,9 +190,10 @@ impl ObjectHeader {
                     .data;
                 if cont_msg_data.len() >= (offset_size as usize + length_size as usize) {
                     let cont_offset_raw = read_offset(cont_msg_data, 0, offset_size)?;
-                    let cont_offset = (cont_offset_raw + base_address) as usize;
+                    let cont_offset = slice_range(cont_offset_raw, base_address)?.end;
                     let cont_length =
-                        read_offset(cont_msg_data, offset_size as usize, length_size)? as usize;
+                        read_offset(cont_msg_data, offset_size as usize, length_size)?
+                            .to_usize()?;
                     // Parse continuation block (v1: just raw messages, no signature)
                     let cont_msgs = Self::parse_v1_continuation(
                         data,
@@ -274,9 +276,10 @@ impl ObjectHeader {
                     .data;
                 if cont_msg_data.len() >= (offset_size as usize + length_size as usize) {
                     let cont_offset_raw = read_offset(cont_msg_data, 0, offset_size)?;
-                    let cont_offset = (cont_offset_raw + base_address) as usize;
+                    let cont_offset = slice_range(cont_offset_raw, base_address)?.end;
                     let cont_length =
-                        read_offset(cont_msg_data, offset_size as usize, length_size)? as usize;
+                        read_offset(cont_msg_data, offset_size as usize, length_size)?
+                            .to_usize()?;
                     let cont_msgs = Self::parse_v1_continuation(
                         data,
                         cont_offset,
@@ -340,7 +343,7 @@ impl ObjectHeader {
             _ => unreachable!(),
         };
         ensure_len(data, pos, chunk_size_width as usize)?;
-        let chunk0_size = read_offset(data, pos, chunk_size_width)? as usize;
+        let chunk0_size = read_offset(data, pos, chunk_size_width)?.to_usize()?;
         pos += chunk_size_width as usize;
 
         let chunk0_msg_start = pos;
@@ -456,9 +459,9 @@ impl ObjectHeader {
             if msg_type == MessageType::ObjectHeaderContinuation {
                 // Parse continuation offset/length from message data
                 if msg_data.len() >= (offset_size as usize + length_size as usize) {
-                    let cont_off = read_offset(&msg_data, 0, offset_size)? as usize;
+                    let cont_off = read_offset(&msg_data, 0, offset_size)?.to_usize()?;
                     let cont_len =
-                        read_offset(&msg_data, offset_size as usize, length_size)? as usize;
+                        read_offset(&msg_data, offset_size as usize, length_size)?.to_usize()?;
                     continuations.push((cont_off, cont_len));
                 }
             } else if msg_type != MessageType::Nil {

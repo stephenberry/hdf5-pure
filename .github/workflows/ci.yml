@@ -101,3 +101,125 @@ jobs:
         with:
           tool: cargo-shear
       - run: cargo shear
+
+  # ===========================================================================
+  # 32-bit / no_std compatibility (issue #27).
+  #
+  # hdf5-pure indexes the in-memory file image with `usize`. On a 32-bit target
+  # `usize` is 32 bits, so a 64-bit HDF5 offset/length above 4 GiB cast with
+  # `as usize` would silently truncate and read the wrong bytes. The reader now
+  # routes every file-derived narrowing through `crate::convert`
+  # (`to_usize`/`slice_range`/`u32_from`), which errors instead of truncating.
+  # The jobs below keep the crate building and running on a 32-bit pointer width
+  # and on bare-metal no_std, and ratchet down stray narrowing casts.
+  # ===========================================================================
+
+  # The library must stay type-clean on a 32-bit pointer width. `clippy --target`
+  # is a check (no linker/QEMU), so this is fast and reliable.
+  check-32bit:
+    name: Check (i686-unknown-linux-gnu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: i686-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: i686
+      - name: Clippy (lib, default features)
+        run: cargo clippy --locked --target i686-unknown-linux-gnu --lib -- -D warnings
+      - name: Clippy (lib, full features minus C-backed ones)
+        run: >
+          cargo clippy --locked --target i686-unknown-linux-gnu --lib
+          --features "serde zfp fast-checksum provenance parallel ndarray" -- -D warnings
+
+  # Ratchet for pointer-width-aware cast lints. On i686 clippy flags every
+  # potential `u64 as usize`-style narrowing; hundreds are benign (bounded
+  # counts/sizes) so we cannot `-D` them yet. Instead we cap the COUNT so a PR
+  # cannot introduce *new* narrowing casts. Drive CAST_BASELINE down over time
+  # (fix real ones; annotate benign ones with
+  # `#[expect(clippy::cast_possible_truncation, reason = "...")]`). When it
+  # reaches 0, replace this with `-D clippy::cast_possible_truncation`.
+  cast-ratchet-32bit:
+    name: 32-bit cast ratchet (i686)
+    runs-on: ubuntu-latest
+    env:
+      # Adjust DOWNWARD only, never upward. Measured on the pinned toolchain
+      # below; a different clippy version may report a slightly different count,
+      # in which case re-measure once and reset this.
+      CAST_BASELINE: 273
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned so the baseline is stable against clippy-version drift.
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: clippy
+          targets: i686-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cast-ratchet-i686
+      - name: Count 32-bit narrowing-cast warnings
+        run: |
+          set -euo pipefail
+          # Force a fresh compile of OUR crate for the i686 target so clippy
+          # actually re-emits the lints (a cached build emits nothing);
+          # dependencies stay cached. The clean must be target-scoped.
+          cargo clean -p hdf5-pure --target i686-unknown-linux-gnu
+          # JSON is the only format that reliably carries the lint name per
+          # diagnostic (`--message-format=short` drops it).
+          cargo clippy --locked --target i686-unknown-linux-gnu --lib \
+            --features "serde zfp fast-checksum provenance parallel ndarray" \
+            --message-format=json \
+            -- -W clippy::cast_possible_truncation \
+               -W clippy::cast_possible_wrap > clippy.json
+          count=$(jq -r 'select(.reason == "compiler-message") | .message.code.code // empty' clippy.json \
+                  | grep -cE '^clippy::cast_possible_(truncation|wrap)$' || true)
+          echo "32-bit narrowing-cast warnings: $count (baseline ${CAST_BASELINE})"
+          if [ "$count" -gt "${CAST_BASELINE}" ]; then
+            echo "::error::32-bit narrowing-cast count rose to $count (> ${CAST_BASELINE}). A new u64-as-usize-style cast was added; route it through crate::convert (to_usize / slice_range / u32_from), or, if it is provably bounded, annotate it with #[expect(clippy::cast_possible_truncation, reason = \"...\")]."
+            exit 1
+          fi
+          if [ "$count" -lt "${CAST_BASELINE}" ]; then
+            echo "::notice::Cast count dropped to $count; lower CAST_BASELINE in ci.yml to lock it in."
+          fi
+
+  # Real 32-bit execution under QEMU. The reference HDF5 C library
+  # (`hdf5-metno`) is a 64-bit-only dev-dependency, so the C-crosscheck tests
+  # compile out here and the pure-Rust library tests run on a true 32-bit
+  # pointer width, exercising the checked `u64 -> usize` conversions. The
+  # `fast-deflate` (zlib-ng) feature is C code and is intentionally omitted.
+  test-32bit:
+    name: Test (i686, QEMU via cross)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cross-i686
+      - name: cross test (pure-Rust library + roundtrip suite on i686)
+        run: >
+          cross test --locked --target i686-unknown-linux-gnu
+          --no-default-features
+          --features "std checksum deflate zfp serde ndarray provenance fast-checksum"
+          --lib --test write_read_roundtrip --test serde_roundtrip --test zfp_roundtrip
+
+  # Bare-metal no_std build: proves the crate links without `std` on a genuine
+  # `none` target (the existing no-std-check only runs on the std-capable host).
+  no-std-bare-metal:
+    name: Build (thumbv7em-none-eabi, no_std)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabi
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: thumbv7em
+      - run: cargo build --locked --no-default-features --target thumbv7em-none-eabi

@@ -4,6 +4,7 @@
 use alloc::{string::String, vec::Vec};
 
 use crate::btree_v1::collect_symbol_table_nodes;
+use crate::convert::{TryToUsize, slice_range};
 use crate::error::FormatError;
 use crate::local_heap::LocalHeap;
 use crate::message_type::MessageType;
@@ -35,7 +36,7 @@ pub fn resolve_v1_group_entries(
     // Parse local heap (address is relative to base_address)
     let mut heap = LocalHeap::parse(
         file_data,
-        (sym_table_msg.local_heap_address + base_address) as usize,
+        slice_range(sym_table_msg.local_heap_address, base_address)?.end,
         offset_size,
         length_size,
     )?;
@@ -54,8 +55,11 @@ pub fn resolve_v1_group_entries(
     let mut entries = Vec::new();
     for snod_addr in snod_addrs {
         // SNOD addresses from B-tree children are also relative to base_address
-        let snod =
-            SymbolTableNode::parse(file_data, (snod_addr + base_address) as usize, offset_size)?;
+        let snod = SymbolTableNode::parse(
+            file_data,
+            slice_range(snod_addr, base_address)?.end,
+            offset_size,
+        )?;
         for entry in &snod.entries {
             let name = heap.read_string(file_data, entry.link_name_offset)?;
             entries.push(GroupEntry {
@@ -118,7 +122,7 @@ pub fn resolve_path(
                 // Not last — must be a group, parse its object header to get symbol table
                 let obj_header = ObjectHeader::parse(
                     file_data,
-                    entry.object_header_address as usize,
+                    entry.object_header_address.to_usize()?,
                     offset_size,
                     length_size,
                 )?;

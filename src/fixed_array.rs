@@ -7,6 +7,7 @@ extern crate alloc;
 use alloc::{format, vec, vec::Vec};
 
 use crate::chunked_read::ChunkInfo;
+use crate::convert::{TryToUsize, u32_from};
 use crate::error::FormatError;
 
 /// Parsed Fixed Array header (FAHD).
@@ -127,7 +128,7 @@ pub fn read_fixed_array_chunks(
     offset_size: u8,
     _length_size: u8,
 ) -> Result<Vec<ChunkInfo>, FormatError> {
-    let db_offset = header.data_block_address as usize;
+    let db_offset = header.data_block_address.to_usize()?;
     let rank = chunk_dimensions.len();
     let os = offset_size as usize;
 
@@ -191,7 +192,7 @@ pub fn read_fixed_array_chunks(
         let offsets = index_to_chunk_offsets(index, &num_chunks_per_dim, chunk_dimensions);
         if header.client_id == 0 {
             Ok(Some(ChunkInfo {
-                chunk_size: chunk_byte_size as u32,
+                chunk_size: u32_from(chunk_byte_size)?,
                 filter_mask: 0,
                 offsets,
                 address,
@@ -206,7 +207,7 @@ pub fn read_fixed_array_chunks(
                 file_data[fm_off + 3],
             ]);
             Ok(Some(ChunkInfo {
-                chunk_size: chunk_size as u32,
+                chunk_size: u32_from(chunk_size)?,
                 filter_mask,
                 offsets,
                 address,
@@ -214,7 +215,7 @@ pub fn read_fixed_array_chunks(
         }
     };
 
-    let num_elements = header.num_elements as usize;
+    let num_elements = header.num_elements.to_usize()?;
     let page_size = (1u64 << header.max_nelmts_bits) as usize;
     let is_paged = num_elements > page_size;
 

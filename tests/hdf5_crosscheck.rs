@@ -1,3 +1,7 @@
+// Crosschecks link the reference HDF5 C library (the `hdf5-metno` dev-dependency),
+// which is gated to 64-bit-pointer targets; skip them on 32-bit so the pure-Rust
+// suite can run under `cross test --target i686-...`.
+#![cfg(not(target_pointer_width = "32"))]
 //! Cross-validation tests: write with hdf5-pure, read with the official C HDF5 library.
 //!
 //! These tests verify that files produced by hdf5-pure are valid HDF5 files

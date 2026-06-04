@@ -10,6 +10,7 @@ extern crate alloc;
 use alloc::{format, vec, vec::Vec};
 
 use crate::chunked_read::ChunkInfo;
+use crate::convert::{TryToUsize, u32_from};
 use crate::error::FormatError;
 
 /// Parsed Extensible Array header (AEHD).
@@ -266,7 +267,7 @@ fn read_element(
         let offsets = index_to_chunk_offsets(linear_index, num_chunks_per_dim, chunk_dimensions);
         Ok((
             Some(ChunkInfo {
-                chunk_size: chunk_byte_size as u32,
+                chunk_size: u32_from(chunk_byte_size)?,
                 filter_mask: 0,
                 offsets,
                 address,
@@ -298,7 +299,7 @@ fn read_element(
         let offsets = index_to_chunk_offsets(linear_index, num_chunks_per_dim, chunk_dimensions);
         Ok((
             Some(ChunkInfo {
-                chunk_size: chunk_size as u32,
+                chunk_size: u32_from(chunk_size)?,
                 filter_mask,
                 offsets,
                 address,
@@ -509,7 +510,7 @@ pub fn read_extensible_array_chunks(
         chunk_dimensions.iter().map(|&d| d as u64).product::<u64>() * element_size as u64;
 
     // Parse index block (AEIB)
-    let ib_offset = header.index_block_address as usize;
+    let ib_offset = header.index_block_address.to_usize()?;
     let ib_header_size = 4 + 1 + 1 + offset_size as usize; // sig + ver + client + hdr_addr
     if ib_offset + ib_header_size > file_data.len() {
         return Err(FormatError::UnexpectedEof {
@@ -535,8 +536,8 @@ pub fn read_extensible_array_chunks(
     // as many chunks as the current dimensions imply means an interrupted append
     // (index ahead of dimensions) yields a consistent prefix rather than chunks
     // beyond the dataset bounds.
-    let dims_chunks: usize = num_chunks_per_dim.iter().product::<u64>() as usize;
-    let total_elements = (header.num_elements as usize).min(dims_chunks);
+    let dims_chunks: usize = num_chunks_per_dim.iter().product::<u64>().to_usize()?;
+    let total_elements = (header.num_elements.to_usize()?).min(dims_chunks);
 
     // 1. Read inline elements in index block
     let n_inline = header.idx_blk_elmts as usize;
@@ -582,11 +583,11 @@ pub fn read_extensible_array_chunks(
         if global_index >= total_elements {
             break;
         }
-        let nelmts = geom.direct_dblk_nelmts[i] as usize;
+        let nelmts = geom.direct_dblk_nelmts[i].to_usize()?;
         if !is_undefined_addr(addr, offset_size) {
             let block_chunks = read_data_block_elements(
                 file_data,
-                addr as usize,
+                addr.to_usize()?,
                 nelmts,
                 header,
                 offset_size,
@@ -619,13 +620,13 @@ pub fn read_extensible_array_chunks(
         }
         let sblk_idx = geom.first_indirect_sblk + j;
         let (ndblks, dblk_nelmts) = geom.sblks[sblk_idx];
-        let total_in_sb = (ndblks * dblk_nelmts) as usize;
+        let total_in_sb = (ndblks * dblk_nelmts).to_usize()?;
         if !is_undefined_addr(sb_addr, offset_size) {
             let sb_chunks = read_super_block(
                 file_data,
-                sb_addr as usize,
-                ndblks as usize,
-                dblk_nelmts as usize,
+                sb_addr.to_usize()?,
+                ndblks.to_usize()?,
+                dblk_nelmts.to_usize()?,
                 header,
                 offset_size,
                 chunk_byte_size,
@@ -729,7 +730,7 @@ fn read_super_block(
             let block_chunks = if is_paged {
                 read_paged_data_block(
                     file_data,
-                    addr as usize,
+                    addr.to_usize()?,
                     page_nelmts,
                     npages,
                     db_local,
@@ -745,7 +746,7 @@ fn read_super_block(
             } else {
                 read_data_block_elements(
                     file_data,
-                    addr as usize,
+                    addr.to_usize()?,
                     nelmts_per_dblk,
                     header,
                     offset_size,

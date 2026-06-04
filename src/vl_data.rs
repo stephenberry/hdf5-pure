@@ -5,8 +5,9 @@
 //! `sequence_length(4 LE) + collection_address(offset_size LE) + object_index(4 LE)`.
 
 #[cfg(not(feature = "std"))]
-use alloc::{string::String, vec::Vec};
+use alloc::{format, string::String, vec::Vec};
 
+use crate::convert::TryToUsize;
 use crate::error::FormatError;
 use crate::global_heap::GlobalHeapCollection;
 
@@ -51,8 +52,14 @@ pub fn parse_vl_references(
     num_elements: u64,
     offset_size: u8,
 ) -> Result<Vec<VlElement>, FormatError> {
-    let elem_size = 4 + offset_size as usize + 4; // length + address + index
-    let total = num_elements as usize * elem_size;
+    let elem_size = 4 + offset_size as u64 + 4; // length + address + index
+    let total = num_elements
+        .checked_mul(elem_size)
+        .ok_or(FormatError::OffsetOverflow {
+            offset: num_elements,
+            length: elem_size,
+        })?
+        .to_usize()?;
     if raw_data.len() < total {
         return Err(FormatError::UnexpectedEof {
             expected: total,
@@ -60,7 +67,7 @@ pub fn parse_vl_references(
         });
     }
 
-    let mut elements = Vec::with_capacity(num_elements as usize);
+    let mut elements = Vec::with_capacity(num_elements.to_usize()?);
     let mut pos = 0;
 
     for _ in 0..num_elements {
@@ -125,13 +132,19 @@ pub fn read_vl_strings(
         }
 
         let coll =
-            GlobalHeapCollection::parse(file_data, vl.collection_address as usize, length_size)?;
-        let obj = coll.get_object(vl.object_index as u16).ok_or(
-            FormatError::GlobalHeapObjectNotFound {
+            GlobalHeapCollection::parse(file_data, vl.collection_address.to_usize()?, length_size)?;
+        let index = u16::try_from(vl.object_index).map_err(|_| {
+            FormatError::VlDataError(format!(
+                "global heap object index {} does not fit u16",
+                vl.object_index
+            ))
+        })?;
+        let obj = coll
+            .get_object(index)
+            .ok_or(FormatError::GlobalHeapObjectNotFound {
                 collection_address: vl.collection_address,
-                index: vl.object_index as u16,
-            },
-        )?;
+                index,
+            })?;
 
         // The object data is the raw string bytes
         let len = (vl.length as usize).min(obj.data.len());
@@ -163,13 +176,19 @@ pub fn read_vl_bytes(
         }
 
         let coll =
-            GlobalHeapCollection::parse(file_data, vl.collection_address as usize, length_size)?;
-        let obj = coll.get_object(vl.object_index as u16).ok_or(
-            FormatError::GlobalHeapObjectNotFound {
+            GlobalHeapCollection::parse(file_data, vl.collection_address.to_usize()?, length_size)?;
+        let index = u16::try_from(vl.object_index).map_err(|_| {
+            FormatError::VlDataError(format!(
+                "global heap object index {} does not fit u16",
+                vl.object_index
+            ))
+        })?;
+        let obj = coll
+            .get_object(index)
+            .ok_or(FormatError::GlobalHeapObjectNotFound {
                 collection_address: vl.collection_address,
-                index: vl.object_index as u16,
-            },
-        )?;
+                index,
+            })?;
 
         let len = (vl.length as usize).min(obj.data.len());
         result.push(obj.data[..len].to_vec());
