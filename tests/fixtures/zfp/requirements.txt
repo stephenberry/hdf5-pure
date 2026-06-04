@@ -1,0 +1,12 @@
+# Pinned toolchain for regenerating the ZFP crosscheck fixtures via regen.py.
+#
+# These are the exact versions that produced the committed fixtures:
+# hdf5plugin 6.0.0 bundles H5Z-ZFP 1.1.1 / ZFP 1.0.1, matching the
+# `filter_name` recorded in manifest.json. Bump deliberately, then regenerate
+# and commit the resulting fixtures + manifest together.
+#
+# Tested with Python 3.13.5. Prefer `uv run regen.py`, which reads the
+# equivalent PEP 723 pins embedded in regen.py and needs no venv.
+h5py==3.16.0
+hdf5plugin==6.0.0
+numpy==2.4.4

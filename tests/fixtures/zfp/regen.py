@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = "==3.13.*"
+# dependencies = [
+#     "h5py==3.16.0",
+#     "hdf5plugin==6.0.0",
+#     "numpy==2.4.4",
+# ]
+# ///
 """Regenerate ZFP crosscheck fixtures from the reference H5Z-ZFP plugin.
 
 Produces a `manifest.json` plus three files per fixture:
@@ -6,7 +14,16 @@ Produces a `manifest.json` plus three files per fixture:
   <name>.compressed.bin   reference compressed chunk bytes (single chunk)
   <name>.cd.bin           cd_values as u32 little-endian tuple (informational)
 
-Run from repo root inside the project-local venv:
+The pinned versions above are the exact toolchain that produced the committed
+fixtures: hdf5plugin 6.0.0 bundles H5Z-ZFP 1.1.1 / ZFP 1.0.1, matching the
+`filter_name` recorded in `manifest.json`. Keep them in sync if you bump either.
+
+Run from the repo root with uv (resolves the pins above automatically):
+    uv run tests/fixtures/zfp/regen.py
+
+Or in a venv pinned from the sibling requirements file:
+    python -m venv tests/fixtures/zfp/.venv
+    tests/fixtures/zfp/.venv/bin/pip install -r tests/fixtures/zfp/requirements.txt
     tests/fixtures/zfp/.venv/bin/python tests/fixtures/zfp/regen.py
 """
 
@@ -124,6 +141,18 @@ def build_cases() -> list[Case]:
             data=np.arange(13, dtype=np.float64),
             rate=16.0,
             notes="length not a multiple of 4 -> partial block",
+        )
+    )
+    # edge: single partial block of mixed magnitudes at a high rate, which
+    # historically exposed a reference-diff in the decoder.
+    cases.append(
+        Case(
+            name="f32_1d_4_varied_rate24",
+            dtype="f32",
+            shape=(4,),
+            data=np.array([100.0, -50.5, 42.0, 80.0], dtype=np.float64),
+            rate=24.0,
+            notes="mixed-magnitude block that exposes a reference-diff at rate 24",
         )
     )
 
