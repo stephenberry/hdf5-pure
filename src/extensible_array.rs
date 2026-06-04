@@ -831,7 +831,19 @@ pub fn read_extensible_array_chunks_from_source<S: FileSource + ?Sized>(
     let n_inline = header.idx_blk_elmts as usize;
     let ndirect = geom.direct_dblk_nelmts.len();
     let nsblk = geom.nsblk_addrs;
-    let ib_len = ib_header_size + n_inline * elem_stride + (ndirect + nsblk) * os;
+    let inline_bytes = n_inline
+        .checked_mul(elem_stride)
+        .ok_or(FormatError::OffsetOverflow {
+            offset: n_inline as u64,
+            length: elem_stride as u64,
+        })?;
+    let addr_bytes = (ndirect + nsblk)
+        .checked_mul(os)
+        .ok_or(FormatError::OffsetOverflow {
+            offset: (ndirect + nsblk) as u64,
+            length: os as u64,
+        })?;
+    let ib_len = ib_header_size + inline_bytes + addr_bytes;
     let ib = source.read_exact_at(header.index_block_address, ib_len)?;
     if &ib[0..4] != b"EAIB" {
         return Err(FormatError::ChunkedReadError(
@@ -953,7 +965,13 @@ fn read_data_block_elements_from_source<S: FileSource + ?Sized>(
 
     // Prefix + block-offset field + `limit` element slots (we only decode up to
     // the published count).
-    let region_len = db_header_size + blk_off_size + limit * elem_stride;
+    let elem_bytes = limit
+        .checked_mul(elem_stride)
+        .ok_or(FormatError::OffsetOverflow {
+            offset: limit as u64,
+            length: elem_stride as u64,
+        })?;
+    let region_len = db_header_size + blk_off_size + elem_bytes;
     let block = source.read_exact_at(db_address, region_len)?;
     if &block[0..4] != b"EADB" {
         return Err(FormatError::ChunkedReadError(
@@ -1003,7 +1021,13 @@ fn read_paged_data_block_from_source<S: FileSource + ?Sized>(
     let blk_off_size = (header.max_nelmts_bits as usize).div_ceil(8);
     let db_header_size = 4 + 1 + 1 + offset_size as usize + blk_off_size + 4;
     let elem_stride = ea_elem_stride(header, offset_size);
-    let page_stride = page_nelmts * elem_stride + 4;
+    let page_stride = page_nelmts
+        .checked_mul(elem_stride)
+        .and_then(|bytes| bytes.checked_add(4))
+        .ok_or(FormatError::OffsetOverflow {
+            offset: page_nelmts as u64,
+            length: elem_stride as u64,
+        })?;
 
     // Pages are populated sequentially; read only the leading initialized pages.
     let mut init_pages = 0usize;
@@ -1020,7 +1044,13 @@ fn read_paged_data_block_from_source<S: FileSource + ?Sized>(
         .saturating_sub(db_address)
         .to_usize()
         .unwrap_or(usize::MAX);
-    let region_len = (db_header_size + init_pages * page_stride).min(avail);
+    let pages_bytes = init_pages
+        .checked_mul(page_stride)
+        .ok_or(FormatError::OffsetOverflow {
+            offset: init_pages as u64,
+            length: page_stride as u64,
+        })?;
+    let region_len = (db_header_size + pages_bytes).min(avail);
     let block = source.read_exact_at(db_address, region_len)?;
     if block.len() < 4 || &block[0..4] != b"EADB" {
         return Err(FormatError::ChunkedReadError(
@@ -1089,13 +1119,22 @@ fn read_super_block_from_source<S: FileSource + ?Sized>(
         0
     };
     let bitmap_size = if is_paged {
-        ndblks * npages.div_ceil(8)
+        ndblks
+            .checked_mul(npages.div_ceil(8))
+            .ok_or(FormatError::OffsetOverflow {
+                offset: ndblks as u64,
+                length: npages.div_ceil(8) as u64,
+            })?
     } else {
         0
     };
 
     // Header + (optional) page-init bitmap + data-block addresses.
-    let region_len = sb_header_size + bitmap_size + ndblks * os;
+    let addr_bytes = ndblks.checked_mul(os).ok_or(FormatError::OffsetOverflow {
+        offset: ndblks as u64,
+        length: os as u64,
+    })?;
+    let region_len = sb_header_size + bitmap_size + addr_bytes;
     let block = source.read_exact_at(sb_address, region_len)?;
     if &block[0..4] != b"EASB" {
         return Err(FormatError::ChunkedReadError(
