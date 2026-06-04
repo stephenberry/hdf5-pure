@@ -10,29 +10,39 @@ env:
 
 jobs:
   test:
-    name: Test (${{ matrix.name }})
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }} / ${{ matrix.config.name }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        include:
+        # `default` and `full` run on every platform so we exercise both the
+        # minimal and maximal feature sets on Linux, macOS, and Windows.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        config:
           - name: default
             flags: ""
-          - name: serde
-            flags: --features serde
-          - name: zfp
-            flags: --features zfp
           # `matio-crosscheck` is intentionally excluded: it links against the
           # system libmatio and is meant for maintainer-local crosscheck runs.
           - name: full
             flags: --features "serde zfp fast-deflate fast-checksum provenance mmap parallel"
+        # The single-feature isolation configs only need to run on one platform;
+        # they are subsets of `full`, which already runs everywhere.
+        include:
+          - os: ubuntu-latest
+            config:
+              name: serde
+              flags: --features serde
+          - os: ubuntu-latest
+            config:
+              name: zfp
+              flags: --features zfp
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.name }}
-      - run: cargo test --locked ${{ matrix.flags }}
+          key: ${{ matrix.os }}-${{ matrix.config.name }}
+      - run: cargo test --locked ${{ matrix.config.flags }}
 
   no-std-check:
     name: Check (no_std)
