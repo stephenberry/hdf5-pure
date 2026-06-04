@@ -19,11 +19,14 @@ fast-checksum = ["crc32fast"]
 deflate = ["flate2"]
 fast-deflate = ["flate2/zlib-ng"]
 provenance = ["sha2"]
-mmap = ["memmap2"]
 parallel = ["rayon"]
 # Pure-Rust ZFP fixed-rate compression filter (HDF5 filter ID 32013).
 # Supports f32/f64/i32/i64 datasets in 1D–4D.
 zfp = []
+# Ergonomic N-dimensional array I/O via the `ndarray` crate
+# (`DatasetBuilder::with_ndarray`, `Dataset::read_array`/`read_array_dyn`).
+# Requires `std` (it builds on the File/Dataset reader and writer APIs).
+ndarray = ["dep:ndarray", "std"]
 # Serde-based (de)serialization of MATLAB v7.3 .mat files.
 # Requires `std` (uses File/Group/Dataset reader APIs).
 serde = ["dep:serde", "std"]
@@ -40,15 +43,17 @@ flate2 = { version = "1", optional = true, default-features = false, features = 
 sha2 = { version = "0.10", optional = true, default-features = false }
 rayon = { version = "1", optional = true }
 crc32fast = { version = "1", optional = true }
-memmap2 = { version = "0.9", optional = true }
 serde = { version = "1", optional = true, default-features = false, features = ["derive", "alloc"] }
+# A permissive range (like `hdf5-metno`'s own `ndarray` requirement) so the
+# user's existing `ndarray` unifies with ours instead of compiling a second
+# copy. Only APIs stable across 0.16/0.17 are used.
+ndarray = { version = ">=0.16, <0.18", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 hdf5 = { package = "hdf5-metno", version = "0.12", features = ["static", "zlib"] }
-ndarray = "0.16"
 
 [[example]]
 name = "matlab_fixtures"

@@ -831,3 +831,37 @@ fn roundtrip_scale_offset_integer_then_deflate() {
     let ds = file.dataset("data").unwrap();
     assert_eq!(ds.read_i32().unwrap(), data);
 }
+
+#[test]
+fn shape_data_mismatch_is_rejected() {
+    use hdf5_pure::{Error, FormatError};
+
+    // 3 elements supplied but a 2x2 (=4 element) shape requested.
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("bad")
+        .with_f64_data(&[1.0, 2.0, 3.0])
+        .with_shape(&[2, 2]);
+    let err = builder.finish().unwrap_err();
+    match err {
+        Error::Format(FormatError::ShapeDataMismatch { expected, actual }) => {
+            assert_eq!(expected, 4 * 8); // shape needs 4 f64 = 32 bytes
+            assert_eq!(actual, 3 * 8); // only 3 f64 = 24 bytes supplied
+        }
+        other => panic!("expected ShapeDataMismatch, got {other:?}"),
+    }
+}
+
+#[test]
+fn matching_shape_and_data_is_accepted() {
+    // Regression guard: a correct 2x3 shape must still write/read cleanly.
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("ok")
+        .with_f64_data(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        .with_shape(&[2, 3]);
+    let file = File::from_bytes(builder.finish().unwrap()).unwrap();
+    let ds = file.dataset("ok").unwrap();
+    assert_eq!(ds.shape().unwrap(), vec![2, 3]);
+    assert_eq!(ds.read_f64().unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+}
