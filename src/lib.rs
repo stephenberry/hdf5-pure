@@ -26,6 +26,24 @@
 //! let values = ds.read_f64().unwrap();
 //! ```
 //!
+//! # Streaming large files
+//!
+//! [`File::open`] reads the whole file into memory. To read a file too large to
+//! buffer (for example a multi-gigabyte file on a 32-bit host, where it exceeds
+//! the address space), use [`File::open_streaming`], which fetches metadata and
+//! dataset chunks from the file on demand instead of buffering it whole. The
+//! reading API is identical; only the backing store differs. Reads of
+//! contiguous, compact, and chunked datasets are supported; the streaming
+//! backend currently resolves only latest-format (v2) groups and does not yet
+//! read attributes.
+//!
+//! ```rust,no_run
+//! use hdf5_pure::File;
+//!
+//! let file = File::open_streaming("huge.h5").unwrap();
+//! let values = file.dataset("signal").unwrap().read_f64().unwrap();
+//! ```
+//!
 //! # N-dimensional arrays (`ndarray` feature)
 //!
 //! With the `ndarray` feature, datasets can be written from and read back into

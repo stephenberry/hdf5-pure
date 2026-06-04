@@ -54,6 +54,20 @@ let attrs = file.root().attrs().unwrap();
 println!("version: {:?}", attrs.get("version"));  // Some(I64(2))
 ```
 
+### Streaming large files
+
+`File::open(path)` reads the whole file into memory. To read a file too large to buffer (for example a multi-gigabyte file produced on a 32-bit host, where it exceeds the address space), open it with `File::open_streaming(path)` instead. It fetches metadata and dataset chunks from the file on demand rather than buffering it whole, so peak memory stays close to one chunk plus the metadata being parsed.
+
+```rust
+use hdf5_pure::File;
+
+let file = File::open_streaming("huge.h5").unwrap();
+let ds = file.dataset("signal").unwrap();
+let values = ds.read_f64().unwrap();  // only this dataset's chunks are read
+```
+
+The reading API is identical to `File::open`; only the backing store differs. Dataset reads are fully supported: contiguous, compact, and every chunk-index layout (B-tree v1, fixed array, and extensible array). Two limits apply to the streaming backend that in-memory reading does not have: only latest-format (v2) groups resolve along a path (a v1 symbol-table group is rejected), and reading attributes is not yet supported. `open_streaming` requires the `std` filesystem.
+
 ### In-memory (WASM)
 
 ```rust
