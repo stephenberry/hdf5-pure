@@ -208,7 +208,12 @@ pub fn read_raw_data_full_from_source<S: FileSource + ?Sized>(
 ) -> Result<Vec<u8>, FormatError> {
     let num_elements = dataspace.num_elements().to_usize()?;
     let elem_size = datatype.type_size() as usize;
-    let expected_size = num_elements * elem_size;
+    let expected_size = num_elements
+        .checked_mul(elem_size)
+        .ok_or(FormatError::OffsetOverflow {
+            offset: num_elements as u64,
+            length: elem_size as u64,
+        })?;
 
     if num_elements == 0 {
         return Ok(Vec::new());

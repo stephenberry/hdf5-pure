@@ -427,7 +427,13 @@ pub fn read_fixed_array_chunks_from_source<S: FileSource + ?Sized>(
     let bitmap_addr = db_address + db_header_size as u64;
     let bitmap = source.read_exact_at(bitmap_addr, bitmap_size)?;
     let pages_start_addr = bitmap_addr + bitmap_size as u64 + 4;
-    let page_stride = page_size * elem_size + 4;
+    let page_stride = page_size
+        .checked_mul(elem_size)
+        .and_then(|bytes| bytes.checked_add(4))
+        .ok_or(FormatError::OffsetOverflow {
+            offset: page_size as u64,
+            length: elem_size as u64,
+        })?;
 
     for page in 0..npages {
         let nelem_in_page = core::cmp::min(page_size, num_elements - page * page_size);
@@ -435,8 +441,22 @@ pub fn read_fixed_array_chunks_from_source<S: FileSource + ?Sized>(
         if !initialized {
             continue;
         }
-        let page_addr = pages_start_addr + (page * page_stride) as u64;
-        let region = source.read_exact_at(page_addr, nelem_in_page * elem_size)?;
+        let page_offset = page
+            .checked_mul(page_stride)
+            .ok_or(FormatError::OffsetOverflow {
+                offset: page as u64,
+                length: page_stride as u64,
+            })?;
+        let page_addr = pages_start_addr + page_offset as u64;
+        let region = source.read_exact_at(
+            page_addr,
+            nelem_in_page
+                .checked_mul(elem_size)
+                .ok_or(FormatError::OffsetOverflow {
+                    offset: nelem_in_page as u64,
+                    length: elem_size as u64,
+                })?,
+        )?;
         for j in 0..nelem_in_page {
             if let Some(info) = parse_fa_element(
                 &region,
