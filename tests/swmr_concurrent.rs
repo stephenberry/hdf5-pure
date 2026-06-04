@@ -2,7 +2,14 @@
 //! the superblock SWMR flag set) while h5py opens the same file with
 //! `swmr=True` and reads the appended data concurrently.
 //!
-//! Skipped automatically when python3 / h5py are unavailable.
+//! Skipped automatically when python3 / h5py are unavailable, so this is an
+//! optional interop probe rather than a hard dependency (CI does not install
+//! h5py). To run it deterministically, use the version the probe was validated
+//! against (h5py 3.16.0 on CPython 3.13):
+//!
+//!     uv run --with h5py==3.16.0 -- cargo test --test swmr_concurrent
+//!
+//! `uv run` puts a pinned python3 + h5py on PATH for the duration of the test.
 
 use hdf5_pure::{FileBuilder, SwmrWriter};
 use tempfile::tempdir;
