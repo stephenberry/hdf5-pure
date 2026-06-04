@@ -15,7 +15,9 @@ use crate::error::FormatError;
 use crate::extensible_array::{ExtensibleArrayHeader, read_extensible_array_chunks};
 use crate::filter_pipeline::FilterPipeline;
 use crate::filters::{ChunkContext, decompress_chunk};
-use crate::fixed_array::{FixedArrayHeader, read_fixed_array_chunks};
+use crate::fixed_array::{
+    FixedArrayHeader, read_fixed_array_chunks, read_fixed_array_chunks_from_source,
+};
 use crate::source::FileSource;
 
 #[cfg(feature = "parallel")]
@@ -123,7 +125,7 @@ pub fn decompress_all_chunks_with_stats(
 }
 
 /// Information about a single chunk in a chunked dataset.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChunkInfo {
     /// Size of chunk data in the file (after compression).
     pub chunk_size: u32,
@@ -649,9 +651,24 @@ pub fn read_chunked_data_from_source<S: FileSource + ?Sized>(
                 u32_from(elem_size as u64)?,
             )
         }
-        (4, Some(3)) | (4, Some(4)) => {
+        (4, Some(3)) => {
+            // Fixed Array — spatial chunk dims only.
+            let spatial_chunk_dims: Vec<u32> = chunk_dimensions[..rank].to_vec();
+            let header =
+                FixedArrayHeader::parse_from_source(source, addr, offset_size, length_size)?;
+            read_fixed_array_chunks_from_source(
+                source,
+                &header,
+                &dataspace.dimensions,
+                &spatial_chunk_dims,
+                u32_from(elem_size as u64)?,
+                offset_size,
+                length_size,
+            )?
+        }
+        (4, Some(4)) => {
             return Err(FormatError::ChunkedReadError(
-                "streaming Fixed-Array / Extensible-Array chunk index is not yet supported".into(),
+                "streaming Extensible-Array chunk index is not yet supported".into(),
             ));
         }
         (v, idx) => {
