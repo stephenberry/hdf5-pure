@@ -7,7 +7,7 @@ extern crate alloc;
 use alloc::{format, vec, vec::Vec};
 
 use crate::chunk_cache::{CacheAlignedBuffer, ChunkCache};
-use crate::convert::{TryToUsize, slice_range};
+use crate::convert::{TryToUsize, slice_range, u32_from};
 use crate::data_layout::DataLayout;
 use crate::dataspace::Dataspace;
 use crate::datatype::Datatype;
@@ -16,6 +16,7 @@ use crate::extensible_array::{ExtensibleArrayHeader, read_extensible_array_chunk
 use crate::filter_pipeline::FilterPipeline;
 use crate::filters::{ChunkContext, decompress_chunk};
 use crate::fixed_array::{FixedArrayHeader, read_fixed_array_chunks};
+use crate::source::FileSource;
 
 #[cfg(feature = "parallel")]
 use crate::parallel_read;
@@ -66,6 +67,36 @@ fn decompress_all_chunks(
             }
         } else {
             raw_chunk.to_vec()
+        };
+        result.push(CacheAlignedBuffer::from_vec(decompressed));
+    }
+    Ok(result)
+}
+
+/// Decompress all chunks, reading each chunk's bytes from a [`FileSource`].
+///
+/// Streaming counterpart of [`decompress_all_chunks`]. Sequential only: the
+/// lane-partitioned parallel path borrows a whole-file `&[u8]` inside a `Send`
+/// rayon closure, and a `ReadSeekSource` serializes on its mutex anyway, so a
+/// parallel streaming variant is a separate follow-up.
+fn decompress_all_chunks_from_source<S: FileSource + ?Sized>(
+    source: &S,
+    chunks: &[ChunkInfo],
+    pipeline: Option<&FilterPipeline>,
+    ctx: ChunkContext<'_>,
+) -> Result<Vec<CacheAlignedBuffer>, FormatError> {
+    let mut result = Vec::with_capacity(chunks.len());
+    for chunk_info in chunks {
+        let raw_chunk =
+            source.read_exact_at(chunk_info.address, chunk_info.chunk_size.to_usize()?)?;
+        let decompressed = if let Some(pl) = pipeline {
+            if chunk_info.filter_mask == 0 {
+                decompress_chunk(&raw_chunk, pl, ctx)?
+            } else {
+                raw_chunk
+            }
+        } else {
+            raw_chunk
         };
         result.push(CacheAlignedBuffer::from_vec(decompressed));
     }
@@ -233,6 +264,92 @@ pub fn collect_chunk_info(
             let child_chunks =
                 collect_chunk_info(file_data, child_addr, ndims, offset_size, _length_size)?;
             all_chunks.extend(child_chunks);
+        }
+        Ok(all_chunks)
+    }
+}
+
+/// Traverse B-tree v1 type 1 from a [`FileSource`], reading each node on demand.
+///
+/// The streaming counterpart of [`collect_chunk_info`]: it reads the node header
+/// and the key/child region as two bounded windows via `read_at`, recursing into
+/// child nodes by reading their regions, so the index can be walked without a
+/// whole-file buffer.
+pub fn collect_chunk_info_from_source<S: FileSource + ?Sized>(
+    source: &S,
+    btree_address: u64,
+    ndims: usize,
+    offset_size: u8,
+    _length_size: u8,
+) -> Result<Vec<ChunkInfo>, FormatError> {
+    let os = offset_size as usize;
+    let header_size = 8 + os * 2;
+
+    // Node header: signature(4) + type(1) + level(1) + entries_used(2) + 2 siblings.
+    let header = source.read_exact_at(btree_address, header_size)?;
+    if &header[0..4] != b"TREE" {
+        return Err(FormatError::InvalidBTreeSignature);
+    }
+    let node_type = header[4];
+    if node_type != 1 {
+        return Err(FormatError::InvalidBTreeNodeType(node_type));
+    }
+    let node_level = header[5];
+    let entries_used = u16::from_le_bytes([header[6], header[7]]) as usize;
+
+    // Key/child region begins right after the header (siblings already included).
+    let key_size = 4 + 4 + ndims * os;
+    let needed = entries_used * (key_size + os) + key_size;
+    let body_addr =
+        btree_address
+            .checked_add(header_size as u64)
+            .ok_or(FormatError::OffsetOverflow {
+                offset: btree_address,
+                length: header_size as u64,
+            })?;
+    let body = source.read_exact_at(body_addr, needed)?;
+    let mut pos = 0usize;
+
+    if node_level == 0 {
+        let mut chunks = Vec::with_capacity(entries_used);
+        for _ in 0..entries_used {
+            let chunk_size =
+                u32::from_le_bytes([body[pos], body[pos + 1], body[pos + 2], body[pos + 3]]);
+            let filter_mask =
+                u32::from_le_bytes([body[pos + 4], body[pos + 5], body[pos + 6], body[pos + 7]]);
+            let mut offsets = Vec::with_capacity(ndims);
+            let mut kp = pos + 8;
+            for _ in 0..ndims {
+                offsets.push(read_offset(&body, kp, offset_size)?);
+                kp += os;
+            }
+            pos += key_size;
+            let address = read_offset(&body, pos, offset_size)?;
+            pos += os;
+            chunks.push(ChunkInfo {
+                chunk_size,
+                filter_mask,
+                offsets,
+                address,
+            });
+        }
+        Ok(chunks)
+    } else {
+        let mut child_addrs = Vec::with_capacity(entries_used);
+        for _ in 0..entries_used {
+            pos += key_size; // skip key
+            child_addrs.push(read_offset(&body, pos, offset_size)?);
+            pos += os;
+        }
+        let mut all_chunks = Vec::new();
+        for child_addr in child_addrs {
+            all_chunks.extend(collect_chunk_info_from_source(
+                source,
+                child_addr,
+                ndims,
+                offset_size,
+                _length_size,
+            )?);
         }
         Ok(all_chunks)
     }
@@ -417,27 +534,171 @@ pub fn read_chunked_data(
         }
     };
 
-    // Assemble output
-    let total_elements = dataspace.num_elements() as usize;
-    let total_bytes = total_elements * elem_size;
+    // Decompress all chunks (parallel when beneficial, sequential otherwise)
+    let chunk_dims_u64: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
+    let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype);
+    let decompressed_chunks = decompress_all_chunks(file_data, &chunks, pipeline, ctx)?;
+
+    let total_bytes = (dataspace.num_elements() as usize) * elem_size;
+    Ok(assemble_chunks(
+        &chunks,
+        &decompressed_chunks,
+        rank,
+        &chunk_dims,
+        &ds_dims,
+        elem_size,
+        total_bytes,
+    ))
+}
+
+/// Read a chunked dataset from a [`FileSource`], reading the chunk index and
+/// each chunk's bytes on demand via `read_at`.
+///
+/// Streaming counterpart of [`read_chunked_data`]. Supports the B-tree v1 (v3),
+/// single-chunk, and implicit (v4 index types 1 and 2) indexes; the Fixed-Array
+/// and Extensible-Array indexes (v4 index types 3 and 4) are a follow-up and
+/// currently return a clear error. The decompression is sequential.
+pub fn read_chunked_data_from_source<S: FileSource + ?Sized>(
+    source: &S,
+    layout: &DataLayout,
+    dataspace: &Dataspace,
+    datatype: &Datatype,
+    pipeline: Option<&FilterPipeline>,
+    offset_size: u8,
+    length_size: u8,
+) -> Result<Vec<u8>, FormatError> {
+    let (
+        chunk_dimensions,
+        version,
+        chunk_index_type,
+        addr_opt,
+        single_filtered_size,
+        single_filter_mask,
+    ) = match layout {
+        DataLayout::Chunked {
+            chunk_dimensions,
+            btree_address,
+            version,
+            chunk_index_type,
+            single_chunk_filtered_size,
+            single_chunk_filter_mask,
+        } => (
+            chunk_dimensions,
+            *version,
+            *chunk_index_type,
+            *btree_address,
+            *single_chunk_filtered_size,
+            *single_chunk_filter_mask,
+        ),
+        _ => {
+            return Err(FormatError::ChunkedReadError(
+                "expected chunked layout".into(),
+            ));
+        }
+    };
+
+    let addr = addr_opt
+        .ok_or_else(|| FormatError::ChunkedReadError("no address for chunked layout".into()))?;
+
+    let elem_size = datatype.type_size() as usize;
+    let ndims = chunk_dimensions.len();
+    let rank = ndims - 1;
+    // `chunk_dimensions` are u32, so this widens; the dataspace dims are u64 and
+    // are narrowed with a checked conversion.
+    let chunk_dims: Vec<usize> = chunk_dimensions[..rank]
+        .iter()
+        .map(|&d| d as usize)
+        .collect();
+    let ds_dims: Vec<usize> = dataspace
+        .dimensions
+        .iter()
+        .map(|&d| d.to_usize())
+        .collect::<Result<_, _>>()?;
+    if ds_dims.len() != rank {
+        return Err(FormatError::ChunkedReadError(format!(
+            "rank mismatch: dataspace has {} dims, layout has {} chunk dims (rank={})",
+            ds_dims.len(),
+            chunk_dimensions.len(),
+            rank
+        )));
+    }
+
+    let chunks = match (version, chunk_index_type) {
+        (3, _) => collect_chunk_info_from_source(source, addr, ndims, offset_size, length_size)?,
+        (4, Some(1)) => {
+            // Single chunk covering the whole dataset.
+            let chunk_byte_size: usize = chunk_dims.iter().product::<usize>() * elem_size;
+            let (csize, fmask) = if let Some(fs) = single_filtered_size {
+                (u32_from(fs)?, single_filter_mask.unwrap_or(0))
+            } else {
+                (u32_from(chunk_byte_size as u64)?, 0)
+            };
+            vec![ChunkInfo {
+                chunk_size: csize,
+                filter_mask: fmask,
+                offsets: vec![0u64; rank],
+                address: addr,
+            }]
+        }
+        (4, Some(2)) => {
+            let spatial_chunk_dims: Vec<u32> = chunk_dimensions[..rank].to_vec();
+            generate_implicit_chunks(
+                addr,
+                &dataspace.dimensions,
+                &spatial_chunk_dims,
+                u32_from(elem_size as u64)?,
+            )
+        }
+        (4, Some(3)) | (4, Some(4)) => {
+            return Err(FormatError::ChunkedReadError(
+                "streaming Fixed-Array / Extensible-Array chunk index is not yet supported".into(),
+            ));
+        }
+        (v, idx) => {
+            return Err(FormatError::ChunkedReadError(format!(
+                "unsupported chunked layout version={v}, index_type={idx:?}"
+            )));
+        }
+    };
+
+    let chunk_dims_u64: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
+    let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype);
+    let decompressed_chunks = decompress_all_chunks_from_source(source, &chunks, pipeline, ctx)?;
+    let total_bytes = dataspace.num_elements().to_usize()? * elem_size;
+    Ok(assemble_chunks(
+        &chunks,
+        &decompressed_chunks,
+        rank,
+        &chunk_dims,
+        &ds_dims,
+        elem_size,
+        total_bytes,
+    ))
+}
+
+/// Scatter decompressed chunks into the dense output buffer. Pure (no file
+/// access): shared by the buffered and streaming chunked readers.
+fn assemble_chunks(
+    chunks: &[ChunkInfo],
+    decompressed: &[CacheAlignedBuffer],
+    rank: usize,
+    chunk_dims: &[usize],
+    ds_dims: &[usize],
+    elem_size: usize,
+    total_bytes: usize,
+) -> Vec<u8> {
     let mut output = vec![0u8; total_bytes];
 
     let mut ds_strides = vec![1usize; rank];
     for i in (0..rank.saturating_sub(1)).rev() {
         ds_strides[i] = ds_strides[i + 1] * ds_dims[i + 1];
     }
-
     let mut chunk_strides = vec![1usize; rank];
     for i in (0..rank.saturating_sub(1)).rev() {
         chunk_strides[i] = chunk_strides[i + 1] * chunk_dims[i + 1];
     }
 
-    // Decompress all chunks (parallel when beneficial, sequential otherwise)
-    let chunk_dims_u64: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
-    let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype);
-    let decompressed_chunks = decompress_all_chunks(file_data, &chunks, pipeline, ctx)?;
-
-    for (chunk_info, decompressed) in chunks.iter().zip(decompressed_chunks.iter()) {
+    for (chunk_info, decompressed) in chunks.iter().zip(decompressed.iter()) {
         // B-tree v1 (v3) offsets have rank+1 dims; v4 index offsets have rank dims
         let chunk_offsets: Vec<usize> = chunk_info
             .offsets
@@ -454,8 +715,8 @@ pub fn read_chunked_data(
                 decompressed,
                 &mut output,
                 &chunk_offsets,
-                &chunk_dims,
-                &ds_dims,
+                chunk_dims,
+                ds_dims,
                 &ds_strides,
                 &chunk_strides,
                 elem_size,
@@ -464,7 +725,7 @@ pub fn read_chunked_data(
         }
     }
 
-    Ok(output)
+    output
 }
 
 /// Read a chunked dataset with caching support.
@@ -1357,6 +1618,51 @@ mod tests {
         }
     }
 
+    /// Assert the streaming chunked reader matches the buffered one over both an
+    /// in-memory source and a lazy `Read+Seek` source.
+    #[cfg(feature = "std")]
+    fn assert_chunked_streams_match(
+        file_data: &[u8],
+        layout: &DataLayout,
+        dataspace: &Dataspace,
+        datatype: &Datatype,
+        pipeline: Option<&FilterPipeline>,
+    ) {
+        use crate::source::{BytesSource, ReadSeekSource};
+        let buffered =
+            read_chunked_data(file_data, layout, dataspace, datatype, pipeline, 8, 8).unwrap();
+        let from_mem = read_chunked_data_from_source(
+            &BytesSource::new(file_data),
+            layout,
+            dataspace,
+            datatype,
+            pipeline,
+            8,
+            8,
+        )
+        .unwrap();
+        let from_seek = read_chunked_data_from_source(
+            &ReadSeekSource::new(std::io::Cursor::new(file_data.to_vec())).unwrap(),
+            layout,
+            dataspace,
+            datatype,
+            pipeline,
+            8,
+            8,
+        )
+        .unwrap();
+        assert_eq!(buffered, from_mem, "BytesSource mismatch");
+        assert_eq!(buffered, from_seek, "ReadSeekSource mismatch");
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn streaming_chunked_btree_v1_matches_buffered() {
+        let values: Vec<f64> = (0..25).map(|i| i as f64).collect();
+        let (file_data, layout, dataspace) = build_1d_chunked_file(&values, 10);
+        assert_chunked_streams_match(&file_data, &layout, &dataspace, &make_f64_type(), None);
+    }
+
     #[cfg(feature = "deflate")]
     #[test]
     fn read_1d_two_chunks_with_deflate() {
@@ -1441,6 +1747,9 @@ mod tests {
             let val = f64::from_le_bytes(raw[i * 8..(i + 1) * 8].try_into().unwrap());
             assert_eq!(val, i as f64, "mismatch at index {i}");
         }
+
+        // The streaming reader must reproduce the same decompressed bytes.
+        assert_chunked_streams_match(&file_data, &layout, &dataspace, &datatype, Some(&pipeline));
     }
 
     #[test]
@@ -1516,6 +1825,9 @@ mod tests {
             let val = f32::from_le_bytes(raw[i * 4..(i + 1) * 4].try_into().unwrap());
             assert_eq!(val, i as f32, "mismatch at element {i}");
         }
+
+        #[cfg(feature = "std")]
+        assert_chunked_streams_match(&file_data, &layout, &dataspace, &datatype, None);
     }
 
     #[test]

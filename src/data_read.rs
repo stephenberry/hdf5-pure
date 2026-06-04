@@ -7,13 +7,16 @@ use alloc::{collections::BTreeMap, string::String, vec, vec::Vec};
 use std::collections::BTreeMap;
 
 use crate::chunk_cache::ChunkCache;
-use crate::chunked_read::{read_chunked_data, read_chunked_data_cached};
+use crate::chunked_read::{
+    read_chunked_data, read_chunked_data_cached, read_chunked_data_from_source,
+};
 use crate::convert::{TryToUsize, slice_range};
 use crate::data_layout::DataLayout;
 use crate::dataspace::Dataspace;
 use crate::datatype::{Datatype, DatatypeByteOrder};
 use crate::error::FormatError;
 use crate::filter_pipeline::FilterPipeline;
+use crate::source::FileSource;
 
 /// Zero-copy read of contiguous raw data, returning a borrowed slice.
 ///
@@ -178,6 +181,111 @@ pub fn read_raw_data_cached(
             length_size,
         ),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming variants (read from a `FileSource` instead of a whole-file buffer)
+// ---------------------------------------------------------------------------
+//
+// These mirror `read_raw_data_full` / `read_raw_data` / `read_raw_data_cached`
+// but fetch bytes on demand via `FileSource::read_exact_at`, so a 32-bit host
+// can read a dataset out of a file larger than its address space. They always
+// return an owned `Vec<u8>`: a lazy source cannot hand out a borrow, and the
+// public API already returns owned data. The zero-copy `read_raw_data_zerocopy`
+// stays the in-memory-only fast path and is intentionally not given a streaming
+// variant.
+
+/// Read raw bytes for a dataset from a [`FileSource`] (streaming counterpart of
+/// [`read_raw_data_full`]).
+pub fn read_raw_data_full_from_source<S: FileSource + ?Sized>(
+    source: &S,
+    layout: &DataLayout,
+    dataspace: &Dataspace,
+    datatype: &Datatype,
+    pipeline: Option<&FilterPipeline>,
+    offset_size: u8,
+    length_size: u8,
+) -> Result<Vec<u8>, FormatError> {
+    let num_elements = dataspace.num_elements().to_usize()?;
+    let elem_size = datatype.type_size() as usize;
+    let expected_size = num_elements * elem_size;
+
+    if num_elements == 0 {
+        return Ok(Vec::new());
+    }
+
+    match layout {
+        DataLayout::Compact { data } => {
+            if data.len() != expected_size {
+                return Err(FormatError::DataSizeMismatch {
+                    expected: expected_size,
+                    actual: data.len(),
+                });
+            }
+            Ok(data.clone())
+        }
+        DataLayout::Contiguous { address, size } => {
+            let addr = address.ok_or(FormatError::NoDataAllocated)?;
+            let sz = (*size).to_usize()?;
+            if sz != expected_size {
+                return Err(FormatError::DataSizeMismatch {
+                    expected: expected_size,
+                    actual: sz,
+                });
+            }
+            // The single point of I/O; `read_exact_at` bounds-checks against the
+            // source length (in u64) and errors instead of truncating.
+            source.read_exact_at(addr, sz)
+        }
+        DataLayout::Chunked { .. } => read_chunked_data_from_source(
+            source,
+            layout,
+            dataspace,
+            datatype,
+            pipeline,
+            offset_size,
+            length_size,
+        ),
+        DataLayout::Virtual { .. } => Err(FormatError::UnsupportedVersion(0)),
+    }
+}
+
+/// Read raw bytes from a [`FileSource`] with default parameters (streaming
+/// counterpart of [`read_raw_data`]).
+pub fn read_raw_data_from_source<S: FileSource + ?Sized>(
+    source: &S,
+    layout: &DataLayout,
+    dataspace: &Dataspace,
+    datatype: &Datatype,
+) -> Result<Vec<u8>, FormatError> {
+    read_raw_data_full_from_source(source, layout, dataspace, datatype, None, 8, 8)
+}
+
+/// Streaming counterpart of [`read_raw_data_cached`].
+///
+/// The chunk cache is not yet consulted on the streaming path (a follow-up); the
+/// result is identical to the buffered cached read, only the chunk index is
+/// re-scanned on each call.
+#[allow(clippy::too_many_arguments)]
+pub fn read_raw_data_cached_from_source<S: FileSource + ?Sized>(
+    source: &S,
+    layout: &DataLayout,
+    dataspace: &Dataspace,
+    datatype: &Datatype,
+    pipeline: Option<&FilterPipeline>,
+    offset_size: u8,
+    length_size: u8,
+    _cache: &ChunkCache,
+) -> Result<Vec<u8>, FormatError> {
+    read_raw_data_full_from_source(
+        source,
+        layout,
+        dataspace,
+        datatype,
+        pipeline,
+        offset_size,
+        length_size,
+    )
 }
 
 fn datatype_name(dt: &Datatype) -> &'static str {
@@ -1283,6 +1391,98 @@ mod tests {
         // Verify the actual data
         let values = read_as_f64(slice, &dt).unwrap();
         assert_eq!(values, vec![1.0, 2.0, 3.0]);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn streaming_contiguous_matches_buffered() {
+        use crate::source::{BytesSource, ReadSeekSource};
+        let dt = make_f64_le_type();
+        let ds = make_simple_dataspace(&[3]);
+        let mut file_data = vec![0u8; 1024];
+        let offset = 256usize;
+        for (i, v) in [1.0f64, 2.0, 3.0].iter().enumerate() {
+            file_data[offset + i * 8..offset + i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        let layout = DataLayout::Contiguous {
+            address: Some(offset as u64),
+            size: 24,
+        };
+
+        let buffered = read_raw_data_full(&file_data, &layout, &ds, &dt, None, 8, 8).unwrap();
+        let from_mem = read_raw_data_full_from_source(
+            &BytesSource::new(&file_data),
+            &layout,
+            &ds,
+            &dt,
+            None,
+            8,
+            8,
+        )
+        .unwrap();
+        let from_seek = read_raw_data_full_from_source(
+            &ReadSeekSource::new(std::io::Cursor::new(file_data)).unwrap(),
+            &layout,
+            &ds,
+            &dt,
+            None,
+            8,
+            8,
+        )
+        .unwrap();
+
+        assert_eq!(buffered, from_mem);
+        assert_eq!(buffered, from_seek);
+        assert_eq!(read_as_f64(&from_seek, &dt).unwrap(), vec![1.0, 2.0, 3.0]);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn streaming_compact_matches_buffered() {
+        use crate::source::BytesSource;
+        let dt = make_f64_le_type();
+        let ds = make_simple_dataspace(&[2]);
+        let mut data = Vec::new();
+        for v in [7.0f64, 8.0] {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        let layout = DataLayout::Compact { data };
+        let buffered = read_raw_data_full(&[], &layout, &ds, &dt, None, 8, 8).unwrap();
+        let streamed = read_raw_data_full_from_source(
+            &BytesSource::new(Vec::new()),
+            &layout,
+            &ds,
+            &dt,
+            None,
+            8,
+            8,
+        )
+        .unwrap();
+        assert_eq!(buffered, streamed);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn streaming_contiguous_error_parity() {
+        use crate::source::BytesSource;
+        let dt = make_f64_le_type();
+        let ds = make_simple_dataspace(&[3]);
+        let layout = DataLayout::Contiguous {
+            address: None,
+            size: 24,
+        };
+        let buffered = read_raw_data_full(&[], &layout, &ds, &dt, None, 8, 8);
+        let streamed = read_raw_data_full_from_source(
+            &BytesSource::new(Vec::new()),
+            &layout,
+            &ds,
+            &dt,
+            None,
+            8,
+            8,
+        );
+        assert!(matches!(buffered, Err(FormatError::NoDataAllocated)));
+        assert!(matches!(streamed, Err(FormatError::NoDataAllocated)));
     }
 
     #[test]
