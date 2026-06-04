@@ -65,6 +65,34 @@ builder.create_dataset("x").with_f64_data(&[1.0, 2.0]);
 let bytes: Vec<u8> = builder.finish().unwrap(); // no filesystem needed
 ```
 
+### N-dimensional arrays (`ndarray` feature)
+
+Enable the `ndarray` feature to write and read datasets of any rank as
+[`ndarray`](https://docs.rs/ndarray) arrays. Shape and datatype are taken from
+the array, and data is stored row-major (C order), matching HDF5:
+
+```rust
+use hdf5_pure::{File, FileBuilder};
+use ndarray::{array, Array2};
+
+let a: Array2<f64> = array![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]];
+
+let mut fb = FileBuilder::new();
+fb.create_dataset("m").with_ndarray(&a);          // shape [2, 3], f64
+let bytes = fb.finish().unwrap();
+
+let file = File::from_bytes(bytes).unwrap();
+let back: Array2<f64> = file.dataset("m").unwrap().read_array().unwrap();
+assert_eq!(a, back);
+
+// When the rank is only known at runtime:
+let dynamic = file.dataset("m").unwrap().read_array_dyn::<f64>().unwrap(); // ArrayD<f64>
+```
+
+`with_ndarray` accepts owned arrays or views; non-standard layouts (transposed,
+Fortran-order, or strided) are repacked to row-major on write, and chunking and
+compression chain as usual (`.with_ndarray(&a).with_chunks(&[64, 64]).with_deflate(6)`).
+
 ## SWMR (single writer, multiple readers)
 
 A single process can append to an unlimited dataset in place while other processes read it concurrently. The writer appends chunks and flushes in dependency order so readers only ever observe a consistent prefix; readers re-read to pick up new data. This interoperates with the reference HDF5 C library and h5py in both directions.
@@ -332,7 +360,7 @@ Not supported in this release: non-unit enum variants, MATLAB objects (`classdef
 | `serde` | no | Serialize/deserialize MATLAB v7.3 `.mat` files via serde |
 | `fast-checksum` | no | Hardware-accelerated CRC32 via `crc32fast` |
 | `fast-deflate` | no | zlib-ng backend for deflate via `flate2/zlib-ng` |
-| `mmap` | no | Memory-mapped file reading via `memmap2` |
+| `ndarray` | no | N-dimensional array I/O via the [`ndarray`](https://docs.rs/ndarray) crate |
 | `parallel` | no | Parallel chunk processing via `rayon` |
 | `provenance` | no | SHA-256 data provenance tracking |
 | `zfp` | no | ZFP fixed-rate compression (HDF5 filter 32013), f32/f64/i32/i64 × 1D–4D |

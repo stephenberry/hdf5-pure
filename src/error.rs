@@ -140,6 +140,14 @@ pub enum FormatError {
     DatasetMissingData,
     /// Dataset is missing shape.
     DatasetMissingShape,
+    /// The dataset's element count implied by its shape does not match the
+    /// amount of data supplied (`shape.product() * element_size != data.len()`).
+    ShapeDataMismatch {
+        /// Number of data bytes the shape requires (`product(shape) * element_size`).
+        expected: usize,
+        /// Number of data bytes actually supplied.
+        actual: usize,
+    },
     /// Invalid filter pipeline version.
     InvalidFilterPipelineVersion(u8),
     /// Unsupported filter ID.
@@ -344,6 +352,12 @@ impl fmt::Display for FormatError {
             FormatError::DatasetMissingShape => {
                 write!(f, "dataset is missing shape")
             }
+            FormatError::ShapeDataMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "shape/data mismatch: shape requires {expected} bytes, got {actual} bytes"
+                )
+            }
             FormatError::InvalidFilterPipelineVersion(v) => {
                 write!(f, "invalid filter pipeline version: {v}")
             }
@@ -412,6 +426,11 @@ pub enum Error {
     MissingMessage(crate::message_type::MessageType),
     /// Alignment or size error for zero-copy typed access.
     AlignmentError(String),
+    /// An array shape error from the `ndarray` integration: either the flat
+    /// data could not be reshaped to the dataset's dimensions, or a requested
+    /// static rank (e.g. `read_array::<_, Ix2>`) did not match the dataset's
+    /// runtime rank. Only constructed when the `ndarray` feature is enabled.
+    Shape(String),
     /// A SWMR operation (e.g. [`crate::File::refresh`]) was requested on a file
     /// that was not opened for SWMR reading via `File::open_swmr`.
     SwmrUnsupported,
@@ -431,6 +450,7 @@ impl fmt::Display for Error {
             Error::NotADataset(path) => write!(f, "not a dataset: {path}"),
             Error::MissingMessage(mt) => write!(f, "missing required message: {mt:?}"),
             Error::AlignmentError(msg) => write!(f, "alignment error: {msg}"),
+            Error::Shape(msg) => write!(f, "array shape error: {msg}"),
             Error::SwmrUnsupported => write!(
                 f,
                 "refresh requires a file opened with File::open_swmr (live handle)"

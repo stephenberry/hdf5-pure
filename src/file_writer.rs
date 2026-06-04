@@ -465,6 +465,22 @@ impl FileWriter {
             } else {
                 db.data.ok_or(FormatError::DatasetMissingData)?
             };
+            // Guard against a shape that disagrees with the supplied data. The
+            // reader enforces the same `num_elements * element_size` invariant
+            // (see `data_read::read_raw_data_full`), so without this check a
+            // mismatch (e.g. data for 3 elements with shape `[2, 2]`) would
+            // produce a file that fails to read back. `saturating_mul` keeps an
+            // absurd shape from overflowing into a false match.
+            let elem_size = dt.type_size() as u64;
+            if !is_empty && elem_size > 0 {
+                let expected = shape.iter().product::<u64>().saturating_mul(elem_size);
+                if raw.len() as u64 != expected {
+                    return Err(FormatError::ShapeDataMismatch {
+                        expected: expected as usize,
+                        actual: raw.len(),
+                    });
+                }
+            }
             let max_dimensions = db.maxshape.clone();
             let dspace = Dataspace {
                 space_type: if shape.is_empty() {

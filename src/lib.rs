@@ -25,6 +25,27 @@
 //! let ds = file.dataset("data").unwrap();
 //! let values = ds.read_f64().unwrap();
 //! ```
+//!
+//! # N-dimensional arrays (`ndarray` feature)
+//!
+//! With the `ndarray` feature, datasets can be written from and read back into
+//! [`ndarray`] arrays of any rank, in row-major (C) order:
+//!
+//! ```
+//! # #[cfg(feature = "ndarray")] {
+//! use hdf5_pure::{File, FileBuilder};
+//! use ndarray::{array, Array2};
+//!
+//! let a: Array2<f64> = array![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]];
+//! let mut fb = FileBuilder::new();
+//! fb.create_dataset("m").with_ndarray(&a);
+//! let bytes = fb.finish().unwrap();
+//!
+//! let file = File::from_bytes(bytes).unwrap();
+//! let back: Array2<f64> = file.dataset("m").unwrap().read_array().unwrap();
+//! assert_eq!(a, back);
+//! # }
+//! ```
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -101,6 +122,9 @@ pub mod writer;
 #[cfg(feature = "std")]
 pub mod mat;
 
+#[cfg(feature = "ndarray")]
+pub mod ndarray_support;
+
 // ---------------------------------------------------------------------------
 // Public API re-exports
 // ---------------------------------------------------------------------------
@@ -120,6 +144,9 @@ pub use writer::FileBuilder;
 
 #[cfg(feature = "std")]
 pub use swmr_writer::SwmrWriter;
+
+#[cfg(feature = "ndarray")]
+pub use ndarray_support::H5Element;
 
 pub use scaleoffset::ScaleOffset;
 

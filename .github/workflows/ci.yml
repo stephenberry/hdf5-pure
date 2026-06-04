@@ -24,7 +24,7 @@ jobs:
           # `matio-crosscheck` is intentionally excluded: it links against the
           # system libmatio and is meant for maintainer-local crosscheck runs.
           - name: full
-            flags: --features "serde zfp fast-deflate fast-checksum provenance mmap parallel"
+            flags: --features "serde zfp fast-deflate fast-checksum provenance parallel ndarray"
         # The single-feature isolation configs only need to run on one platform;
         # they are subsets of `full`, which already runs everywhere.
         include:
@@ -36,6 +36,10 @@ jobs:
             config:
               name: zfp
               flags: --features zfp
+          - os: ubuntu-latest
+            config:
+              name: ndarray
+              flags: --features ndarray
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -85,4 +89,15 @@ jobs:
       - name: Rustfmt
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --locked --features serde --all-targets -- -D warnings
+        run: cargo clippy --locked --features "serde ndarray" --all-targets -- -D warnings
+
+  shear:
+    name: Unused dependencies (cargo-shear)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-shear
+      - run: cargo shear

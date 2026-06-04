@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- N-dimensional array I/O via the optional `ndarray` feature ([#24](https://github.com/stephenberry/hdf5-pure/issues/24)). `DatasetBuilder::with_ndarray` writes any `ndarray` array or view, inferring the dataset shape and datatype from it, and `Dataset::read_array` / `Dataset::read_array_dyn` read a dataset back into a typed `ndarray::Array` (fixed rank) or `ArrayD` (runtime rank). Data is stored row-major (C order), so files are byte-compatible with the reference HDF5 library (verified by cross-check); non-standard-layout inputs (transposed, Fortran-order, or strided views) are repacked to row-major on write, and chunking/compression chain as usual. The feature is off by default and implies `std`, keeping the core build dependency-free and WASM/`no_std`-clean. The supported element types (`f32`, `f64`, and the signed and unsigned 8/16/32/64-bit integers) are described by the new sealed `H5Element` trait.
+
+### Changed
+
+- Writing a dataset whose shape disagrees with the supplied data now fails fast with `FormatError::ShapeDataMismatch` (the element count implied by the shape must match the data length) instead of silently producing a file that cannot be read back.
+
+### Removed
+
+- The `mmap` feature and its `memmap2` dependency, which were declared but never implemented — enabling `mmap` did nothing ([#24](https://github.com/stephenberry/hdf5-pure/issues/24)). Downstream code that named the feature should drop it.
+
 ## [0.7.0] - 2026-06-03
 
 ### Added
