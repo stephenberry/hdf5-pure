@@ -97,9 +97,15 @@ impl Dataset<'_> {
     ///
     /// The dimensionality `D` (e.g. [`ndarray::Ix2`]) is usually inferred from
     /// the binding, so a call site reads as `let m: Array2<f64> =
-    /// ds.read_array()?;`. The element type `T` follows the same numeric
-    /// conversion rules as [`Dataset::read_f64`](crate::Dataset::read_f64) and
-    /// friends.
+    /// ds.read_array()?;`.
+    ///
+    /// `T` is the type you want the elements *delivered as*, not an assertion
+    /// about the dataset's stored type. The stored bytes are coerced into `T`
+    /// using the same rules as [`Dataset::read_f64`](crate::Dataset::read_f64)
+    /// and its siblings, so the conversion can be lossy: reading an `f64`
+    /// dataset as `i32` truncates, and reading an `i32` dataset as `f64`
+    /// widens. There is no check that `T` matches the on-disk datatype, so pick
+    /// `T` to match the stored type when you need an exact, lossless read.
     ///
     /// # Errors
     ///
@@ -115,7 +121,11 @@ impl Dataset<'_> {
     /// Read the dataset into a dynamically-ranked [`ndarray::ArrayD`].
     ///
     /// The array's shape is taken from the dataset's dataspace, so this works
-    /// for any rank without naming it at compile time.
+    /// for any rank without naming it at compile time. As with
+    /// [`read_array`](Self::read_array), `T` is the requested element type and
+    /// the stored bytes are coerced into it (possibly lossily) following the
+    /// [`Dataset::read_f64`](crate::Dataset::read_f64) conversion rules, with
+    /// no check that `T` matches the on-disk datatype.
     pub fn read_array_dyn<T: H5Element>(&self) -> Result<ArrayD<T>, Error> {
         let shape: Vec<usize> = self.shape()?.iter().map(|&d| d as usize).collect();
         let data = T::read_from(self)?;
