@@ -17,6 +17,7 @@ use crate::group_v2;
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
 use crate::signature;
+use crate::source::{BytesSource, FileSource, ReadSeekSource};
 use crate::superblock::Superblock;
 
 use crate::types::{AttrValue, DType, attrs_to_map, classify_datatype};
@@ -25,9 +26,38 @@ use crate::types::{AttrValue, DType, attrs_to_map, classify_datatype};
 // File
 // ---------------------------------------------------------------------------
 
+/// Backing store for a [`File`]: either the whole file buffered in memory, or a
+/// lazy [`FileSource`] that reads regions on demand (see [`File::open_streaming`]).
+enum Backend {
+    InMemory(Vec<u8>),
+    Streaming(Box<dyn FileSource + Send + Sync>),
+}
+
+/// A borrowed `FileSource` view over a [`File`]'s backend, used by the
+/// streaming-capable read paths so one call site serves both backends.
+enum SourceView<'a> {
+    Mem(&'a [u8]),
+    Stream(&'a (dyn FileSource + Send + Sync)),
+}
+
+impl FileSource for SourceView<'_> {
+    fn len(&self) -> u64 {
+        match self {
+            SourceView::Mem(b) => b.len() as u64,
+            SourceView::Stream(s) => s.len(),
+        }
+    }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
+        match self {
+            SourceView::Mem(b) => BytesSource::new(*b).read_at(offset, buf),
+            SourceView::Stream(s) => s.read_at(offset, buf),
+        }
+    }
+}
+
 /// An open HDF5 file for reading.
 pub struct File {
-    data: Vec<u8>,
+    backend: Backend,
     superblock: Superblock,
     /// Byte offset to add to all relative addresses (= original base_address).
     addr_offset: u64,
@@ -41,9 +71,36 @@ impl File {
     ///
     /// Reads the file into memory once. To follow a file that a concurrent
     /// single writer is appending to (SWMR), use [`File::open_swmr`] instead.
+    /// To read a file larger than memory (e.g. on a 32-bit host) without
+    /// buffering it, use [`File::open_streaming`].
     pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
         let bytes = std::fs::read(path.as_ref()).map_err(Error::Io)?;
         Self::from_bytes(bytes)
+    }
+
+    /// Open an HDF5 file for **streaming** reads, fetching regions on demand from
+    /// the file instead of buffering it whole.
+    ///
+    /// This lets a host read a file larger than its address space — the original
+    /// motivation being 32-bit targets reading multi-gigabyte files (issue #27).
+    /// Metadata and dataset chunks are read through a [`ReadSeekSource`], so peak
+    /// memory stays close to one chunk plus the metadata being parsed.
+    ///
+    /// Current limits (the buffered [`File::open`] has none of these): only
+    /// latest-format (v2) groups resolve — a v1 symbol-table group on the path
+    /// is rejected — and attribute reading on the streaming backend is not yet
+    /// supported. Dataset reads (contiguous, compact, and all chunked index
+    /// types) are fully supported.
+    pub fn open_streaming<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
+        let handle = std::fs::File::open(path.as_ref()).map_err(Error::Io)?;
+        let source = ReadSeekSource::new(handle).map_err(Error::Format)?;
+        let (superblock, addr_offset) = Self::parse_superblock_source(&source)?;
+        Ok(Self {
+            backend: Backend::Streaming(Box::new(source)),
+            superblock,
+            addr_offset,
+            handle: None,
+        })
     }
 
     /// Open an HDF5 file for SWMR (single-writer/multiple-reader) reading.
@@ -62,7 +119,7 @@ impl File {
         handle.read_to_end(&mut data).map_err(Error::Io)?;
         let (superblock, addr_offset) = Self::parse_superblock(&data)?;
         Ok(Self {
-            data,
+            backend: Backend::InMemory(data),
             superblock,
             addr_offset,
             handle: Some(handle),
@@ -73,11 +130,19 @@ impl File {
     pub fn from_bytes(data: Vec<u8>) -> Result<Self, Error> {
         let (superblock, addr_offset) = Self::parse_superblock(&data)?;
         Ok(Self {
-            data,
+            backend: Backend::InMemory(data),
             superblock,
             addr_offset,
             handle: None,
         })
+    }
+
+    /// A `FileSource` view over the backend, for the streaming-capable paths.
+    fn source(&self) -> SourceView<'_> {
+        match &self.backend {
+            Backend::InMemory(v) => SourceView::Mem(v),
+            Backend::Streaming(s) => SourceView::Stream(s.as_ref()),
+        }
     }
 
     /// Parse the superblock from `data`, returning it (with `root_group_address`
@@ -87,6 +152,18 @@ impl File {
         let mut superblock = Superblock::parse(data, sig_offset)?;
         let addr_offset = superblock.base_address;
         // Normalize root_group_address to absolute so resolve_path_any works.
+        superblock.root_group_address += addr_offset;
+        Ok((superblock, addr_offset))
+    }
+
+    /// Streaming counterpart of [`parse_superblock`]: locate and parse the
+    /// superblock by reading only small windows from the source.
+    fn parse_superblock_source<S: FileSource + ?Sized>(
+        source: &S,
+    ) -> Result<(Superblock, u64), Error> {
+        let sig_offset = signature::find_signature_in(source)?;
+        let mut superblock = Superblock::parse_from_source(source, sig_offset)?;
+        let addr_offset = superblock.base_address;
         superblock.root_group_address += addr_offset;
         Ok((superblock, addr_offset))
     }
@@ -127,7 +204,7 @@ impl File {
             handle.read_to_end(&mut data).map_err(Error::Io)?;
             match Self::parse_superblock(&data) {
                 Ok((superblock, addr_offset)) => {
-                    self.data = data;
+                    self.backend = Backend::InMemory(data);
                     self.superblock = superblock;
                     self.addr_offset = addr_offset;
                     return Ok(());
@@ -159,9 +236,19 @@ impl File {
         }
     }
 
+    /// Resolve a path to an object-header address, dispatching on the backend.
+    fn resolve_path(&self, path: &str) -> Result<u64, Error> {
+        Ok(match &self.backend {
+            Backend::InMemory(v) => group_v2::resolve_path_any(v, &self.superblock, path)?,
+            Backend::Streaming(s) => {
+                group_v2::resolve_path_any_from_source(s.as_ref(), &self.superblock, path)?
+            }
+        })
+    }
+
     /// Resolve a path and return a `Dataset` handle.
     pub fn dataset(&self, path: &str) -> Result<Dataset<'_>, Error> {
-        let addr = group_v2::resolve_path_any(&self.data, &self.superblock, path)?;
+        let addr = self.resolve_path(path)?;
         let hdr = self.parse_header(addr)?;
         if !has_message(&hdr, MessageType::DataLayout) {
             return Err(Error::NotADataset(path.to_string()));
@@ -175,16 +262,20 @@ impl File {
 
     /// Resolve a path and return a `Group` handle.
     pub fn group(&self, path: &str) -> Result<Group<'_>, Error> {
-        let addr = group_v2::resolve_path_any(&self.data, &self.superblock, path)?;
+        let addr = self.resolve_path(path)?;
         Ok(Group {
             file: self,
             address: addr,
         })
     }
 
-    /// Returns the raw file bytes.
+    /// Returns the raw file bytes for an in-memory file, or an empty slice for a
+    /// streaming file (which has no whole-file buffer).
     pub fn as_bytes(&self) -> &[u8] {
-        &self.data
+        match &self.backend {
+            Backend::InMemory(v) => v,
+            Backend::Streaming(_) => &[],
+        }
     }
 
     /// Returns a reference to the parsed superblock.
@@ -193,13 +284,16 @@ impl File {
     }
 
     fn parse_header(&self, address: u64) -> Result<ObjectHeader, FormatError> {
-        ObjectHeader::parse_with_base(
-            &self.data,
-            address.to_usize()?,
-            self.superblock.offset_size,
-            self.superblock.length_size,
-            self.addr_offset,
-        )
+        let os = self.superblock.offset_size;
+        let ls = self.superblock.length_size;
+        match &self.backend {
+            Backend::InMemory(v) => {
+                ObjectHeader::parse_with_base(v, address.to_usize()?, os, ls, self.addr_offset)
+            }
+            Backend::Streaming(s) => {
+                ObjectHeader::parse_from_source(s.as_ref(), address, os, ls, self.addr_offset)
+            }
+        }
     }
 
     fn offset_size(&self) -> u8 {
@@ -209,12 +303,77 @@ impl File {
     fn length_size(&self) -> u8 {
         self.superblock.length_size
     }
+
+    /// Resolve the children of a group object header, dispatching on the backend
+    /// and converting link addresses to absolute.
+    fn group_children(&self, hdr: &ObjectHeader) -> Result<Vec<GroupEntry>, Error> {
+        let (os, ls, base) = (self.offset_size(), self.length_size(), self.addr_offset);
+        let mut entries = match &self.backend {
+            Backend::InMemory(v) => group_v2::resolve_group_entries(v, hdr, os, ls, base),
+            Backend::Streaming(s) => {
+                group_v2::resolve_group_entries_from_source(s.as_ref(), hdr, os, ls)
+            }
+        }
+        .map_err(Error::Format)?;
+        for entry in &mut entries {
+            entry.object_header_address += base;
+        }
+        Ok(entries)
+    }
+
+    /// Read all attributes attached to an object header, dispatching on the
+    /// backend. Attribute reading is not yet supported on the streaming backend.
+    fn attrs_of(&self, hdr: &ObjectHeader) -> Result<HashMap<String, AttrValue>, Error> {
+        match &self.backend {
+            Backend::InMemory(v) => {
+                let attr_msgs =
+                    extract_attributes_full(v, hdr, self.offset_size(), self.length_size())?;
+                Ok(attrs_to_map(
+                    &attr_msgs,
+                    v,
+                    self.offset_size(),
+                    self.length_size(),
+                    self.addr_offset,
+                ))
+            }
+            Backend::Streaming(_) => Err(Error::Format(FormatError::ChunkedReadError(
+                "attribute reading is not yet supported on the streaming backend".into(),
+            ))),
+        }
+    }
+
+    /// Read a dataset's raw bytes for the given layout, dispatching on the backend.
+    fn read_dataset_raw(
+        &self,
+        dl: &DataLayout,
+        ds: &Dataspace,
+        dt: &Datatype,
+        pipeline: Option<&FilterPipeline>,
+        cache: &ChunkCache,
+    ) -> Result<Vec<u8>, FormatError> {
+        let (os, ls) = (self.offset_size(), self.length_size());
+        match &self.backend {
+            Backend::InMemory(v) => {
+                data_read::read_raw_data_cached(v, dl, ds, dt, pipeline, os, ls, cache)
+            }
+            Backend::Streaming(s) => data_read::read_raw_data_cached_from_source(
+                s.as_ref(),
+                dl,
+                ds,
+                dt,
+                pipeline,
+                os,
+                ls,
+                cache,
+            ),
+        }
+    }
 }
 
 impl std::fmt::Debug for File {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("File")
-            .field("size", &self.data.len())
+            .field("size", &self.source().len())
             .field("superblock_version", &self.superblock.version)
             .finish()
     }
@@ -260,19 +419,7 @@ impl<'f> Group<'f> {
     /// Read all attributes of this group.
     pub fn attrs(&self) -> Result<HashMap<String, AttrValue>, Error> {
         let hdr = self.file.parse_header(self.address)?;
-        let attr_msgs = extract_attributes_full(
-            &self.file.data,
-            &hdr,
-            self.file.offset_size(),
-            self.file.length_size(),
-        )?;
-        Ok(attrs_to_map(
-            &attr_msgs,
-            &self.file.data,
-            self.file.offset_size(),
-            self.file.length_size(),
-            self.file.addr_offset,
-        ))
+        self.file.attrs_of(&hdr)
     }
 
     /// Get a dataset within this group by name.
@@ -308,16 +455,7 @@ impl<'f> Group<'f> {
 
     fn children(&self) -> Result<Vec<GroupEntry>, Error> {
         let hdr = self.file.parse_header(self.address)?;
-        let os = self.file.offset_size();
-        let ls = self.file.length_size();
-        let base = self.file.addr_offset;
-        let mut entries = group_v2::resolve_group_entries(&self.file.data, &hdr, os, ls, base)
-            .map_err(Error::Format)?;
-        // Convert link addresses from relative to absolute
-        for entry in &mut entries {
-            entry.object_header_address += base;
-        }
-        Ok(entries)
+        self.file.group_children(&hdr)
     }
 }
 
@@ -434,19 +572,7 @@ impl<'f> Dataset<'f> {
 
     /// Read all attributes of this dataset.
     pub fn attrs(&self) -> Result<HashMap<String, AttrValue>, Error> {
-        let attr_msgs = extract_attributes_full(
-            &self.file.data,
-            &self.header,
-            self.file.offset_size(),
-            self.file.length_size(),
-        )?;
-        Ok(attrs_to_map(
-            &attr_msgs,
-            &self.file.data,
-            self.file.offset_size(),
-            self.file.length_size(),
-            self.file.addr_offset,
-        ))
+        self.file.attrs_of(&self.header)
     }
 
     fn datatype(&self) -> Result<Datatype, Error> {
@@ -491,16 +617,9 @@ impl<'f> Dataset<'f> {
             *addr += self.file.addr_offset;
         }
         let pipeline = self.filter_pipeline();
-        Ok(data_read::read_raw_data_cached(
-            &self.file.data,
-            &dl,
-            &ds,
-            &dt,
-            pipeline.as_ref(),
-            self.file.offset_size(),
-            self.file.length_size(),
-            &self.chunk_cache,
-        )?)
+        Ok(self
+            .file
+            .read_dataset_raw(&dl, &ds, &dt, pipeline.as_ref(), &self.chunk_cache)?)
     }
 }
 
