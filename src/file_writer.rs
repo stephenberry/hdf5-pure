@@ -478,6 +478,7 @@ impl FileWriter {
                     return Err(FormatError::ShapeDataMismatch {
                         expected: expected as usize,
                         actual: raw.len(),
+                        element_size: elem_size as usize,
                     });
                 }
             }
