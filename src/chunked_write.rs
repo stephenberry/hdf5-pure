@@ -1943,10 +1943,14 @@ mod tests {
 
     // ---- h5py round-trip tests for chunked writes ----
 
+    // Runs `script` under python3, passing the HDF5 file path as `sys.argv[1]`
+    // so the script can open it without interpolating the path into the source.
+    // Interpolating a Windows path (with backslashes) into a Python string
+    // literal breaks the parser (e.g. `\U` triggers a unicode-escape error).
     #[cfg(feature = "std")]
-    fn h5py_run(script: &str) -> Option<String> {
+    fn h5py_run(path: &std::path::Path, script: &str) -> Option<String> {
         let o = std::process::Command::new("python3")
-            .args(["-c", script])
+            .args(["-c", script, &path.to_string_lossy()])
             .output()
             .ok()?;
         if !o.status.success() {
@@ -1977,11 +1981,10 @@ mod tests {
         let bytes = fw.finish().unwrap();
         let path = std::env::temp_dir().join("rustyhdf5_chunked_multi.h5");
         std::fs::write(&path, &bytes).unwrap();
-        let script = format!(
-            "import h5py,json; f=h5py.File('{}','r'); print(json.dumps({{'a':f['a'][:].tolist(),'b':f['b'][:].tolist()}}))",
-            path.display()
-        );
-        let Some(out) = h5py_run(&script) else { return };
+        let script = "import sys,h5py,json; f=h5py.File(sys.argv[1],'r'); print(json.dumps({'a':f['a'][:].tolist(),'b':f['b'][:].tolist()}))";
+        let Some(out) = h5py_run(&path, script) else {
+            return;
+        };
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         let va: Vec<f64> = serde_json::from_value(v["a"].clone()).unwrap();
         let vb: Vec<f64> = serde_json::from_value(v["b"].clone()).unwrap();
@@ -2003,11 +2006,10 @@ mod tests {
         let bytes = fw.finish().unwrap();
         let path = std::env::temp_dir().join("rustyhdf5_chunked_attrs.h5");
         std::fs::write(&path, &bytes).unwrap();
-        let script = format!(
-            "import h5py,json; f=h5py.File('{}','r'); d=f['data']; print(json.dumps({{'values':d[:].tolist(),'units':d.attrs['units'].decode() if isinstance(d.attrs['units'],bytes) else str(d.attrs['units'])}}))",
-            path.display()
-        );
-        let Some(out) = h5py_run(&script) else { return };
+        let script = "import sys,h5py,json; f=h5py.File(sys.argv[1],'r'); d=f['data']; print(json.dumps({'values':d[:].tolist(),'units':d.attrs['units'].decode() if isinstance(d.attrs['units'],bytes) else str(d.attrs['units'])}))";
+        let Some(out) = h5py_run(&path, script) else {
+            return;
+        };
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         let values: Vec<f64> = serde_json::from_value(v["values"].clone()).unwrap();
         assert_eq!(values, data);
