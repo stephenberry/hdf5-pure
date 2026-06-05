@@ -1,3 +1,6 @@
+// Uses the reference HDF5 C library (`hdf5-metno`), gated to 64-bit-pointer
+// targets; skip on 32-bit so `cross test --target i686-...` stays pure-Rust.
+#![cfg(not(target_pointer_width = "32"))]
 //! SWMR-reader (refresh) tests: hdf5-pure follows an Extensible-Array dataset
 //! that an external HDF5 writer appends to.
 //!

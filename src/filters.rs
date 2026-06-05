@@ -9,6 +9,8 @@ use alloc::{vec, vec::Vec};
 #[cfg(all(not(feature = "std"), feature = "zfp"))]
 use alloc::format;
 
+#[cfg(feature = "zfp")]
+use crate::convert::TryToUsize;
 use crate::error::FormatError;
 #[cfg(feature = "zfp")]
 use crate::filter_pipeline::FILTER_ZFP;
@@ -184,7 +186,7 @@ fn zfp_dims_on_stack(ctx: &ChunkContext<'_>) -> Result<([usize; 4], usize), Form
     }
     let mut buf = [0usize; 4];
     for (slot, &d) in buf.iter_mut().zip(ctx.chunk_dims.iter()) {
-        *slot = d as usize;
+        *slot = d.to_usize()?;
     }
     Ok((buf, rank))
 }

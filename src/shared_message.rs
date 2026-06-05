@@ -20,6 +20,7 @@
 use alloc::vec::Vec;
 
 use crate::btree_v2::{BTreeV2Header, collect_btree_v2_records};
+use crate::convert::TryToUsize;
 use crate::error::FormatError;
 use crate::fractal_heap::FractalHeapHeader;
 use crate::message_type::MessageType;
@@ -415,7 +416,7 @@ pub fn resolve_sohm_message(
 
     let fh_header = FractalHeapHeader::parse(
         file_data,
-        index.heap_addr as usize,
+        index.heap_addr.to_usize()?,
         offset_size,
         length_size,
     )?;
@@ -462,7 +463,7 @@ pub fn resolve_shared_message_with_sohm(
                     available: 0,
                 })?;
             let target_header =
-                ObjectHeader::parse(file_data, addr as usize, offset_size, length_size)?;
+                ObjectHeader::parse(file_data, addr.to_usize()?, offset_size, length_size)?;
             for msg in &target_header.messages {
                 if msg.msg_type == target_msg_type && !is_shared(msg.flags) {
                     return Ok(msg.data.clone());

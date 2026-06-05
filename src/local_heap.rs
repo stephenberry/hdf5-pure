@@ -3,6 +3,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::string::String;
 
+use crate::convert::TryToUsize;
 use crate::error::FormatError;
 
 /// Parsed HDF5 Local Heap header.
@@ -79,9 +80,20 @@ impl LocalHeap {
 
     /// Read a null-terminated string from the heap's data segment at the given byte offset.
     pub fn read_string(&self, file_data: &[u8], string_offset: u64) -> Result<String, FormatError> {
-        let seg_addr = self.data_segment_address as usize;
-        let str_start = seg_addr + string_offset as usize;
-        let seg_end = seg_addr + self.data_segment_size as usize;
+        let seg_addr = self.data_segment_address.to_usize()?;
+        let str_start =
+            seg_addr
+                .checked_add(string_offset.to_usize()?)
+                .ok_or(FormatError::OffsetOverflow {
+                    offset: self.data_segment_address,
+                    length: string_offset,
+                })?;
+        let seg_end = seg_addr
+            .checked_add(self.data_segment_size.to_usize()?)
+            .ok_or(FormatError::OffsetOverflow {
+                offset: self.data_segment_address,
+                length: self.data_segment_size,
+            })?;
 
         if str_start >= file_data.len() || str_start >= seg_end {
             return Err(FormatError::UnexpectedEof {

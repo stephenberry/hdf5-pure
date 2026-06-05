@@ -3,6 +3,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+use crate::convert::TryToUsize;
 use crate::error::FormatError;
 
 /// A parsed B-tree v1 node.
@@ -148,12 +149,14 @@ pub fn collect_symbol_table_nodes(
     length_size: u8,
     base_address: u64,
 ) -> Result<Vec<u64>, FormatError> {
-    let node = BTreeV1Node::parse(
-        file_data,
-        (btree_address + base_address) as usize,
-        offset_size,
-        length_size,
-    )?;
+    let node_offset = btree_address
+        .checked_add(base_address)
+        .ok_or(FormatError::OffsetOverflow {
+            offset: btree_address,
+            length: base_address,
+        })?
+        .to_usize()?;
+    let node = BTreeV1Node::parse(file_data, node_offset, offset_size, length_size)?;
 
     if node.node_type != 0 {
         return Err(FormatError::InvalidBTreeNodeType(node.node_type));

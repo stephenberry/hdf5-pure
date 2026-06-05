@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 #[cfg(feature = "checksum")]
 use byteorder::{ByteOrder, LittleEndian};
 
+use crate::convert::TryToUsize;
 use crate::error::FormatError;
 
 /// Parsed B-tree v2 header (signature "BTHD").
@@ -189,7 +190,7 @@ pub fn collect_btree_v2_records(
         // Root is a leaf
         parse_leaf_records(
             file_data,
-            header.root_node_address as usize,
+            header.root_node_address.to_usize()?,
             header.num_records_in_root,
             header.record_size,
         )
@@ -198,7 +199,7 @@ pub fn collect_btree_v2_records(
         let mut records = Vec::new();
         collect_internal_records(
             file_data,
-            header.root_node_address as usize,
+            header.root_node_address.to_usize()?,
             header.num_records_in_root,
             header.depth,
             header.record_size,
@@ -327,12 +328,12 @@ fn collect_internal_records(
     for (i, &(child_addr, child_nrec)) in children.iter().enumerate() {
         if child_depth == 0 {
             let leaf_recs =
-                parse_leaf_records(file_data, child_addr as usize, child_nrec, record_size)?;
+                parse_leaf_records(file_data, child_addr.to_usize()?, child_nrec, record_size)?;
             out.extend(leaf_recs);
         } else {
             collect_internal_records(
                 file_data,
-                child_addr as usize,
+                child_addr.to_usize()?,
                 child_nrec,
                 child_depth,
                 record_size,

@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use crate::chunk_cache::ChunkCache;
 use crate::chunked_read::{read_chunked_data, read_chunked_data_cached};
+use crate::convert::{TryToUsize, slice_range};
 use crate::data_layout::DataLayout;
 use crate::dataspace::Dataspace;
 use crate::datatype::{Datatype, DatatypeByteOrder};
@@ -25,9 +26,14 @@ pub fn read_raw_data_zerocopy<'a>(
     dataspace: &Dataspace,
     datatype: &Datatype,
 ) -> Result<Option<&'a [u8]>, FormatError> {
-    let num_elements = dataspace.num_elements() as usize;
+    let num_elements = dataspace.num_elements().to_usize()?;
     let elem_size = datatype.type_size() as usize;
-    let expected_size = num_elements * elem_size;
+    let expected_size = num_elements
+        .checked_mul(elem_size)
+        .ok_or(FormatError::OffsetOverflow {
+            offset: num_elements as u64,
+            length: elem_size as u64,
+        })?;
 
     // Zero-element datasets have no data to read.
     if num_elements == 0 {
@@ -37,21 +43,21 @@ pub fn read_raw_data_zerocopy<'a>(
     match layout {
         DataLayout::Contiguous { address, size } => {
             let addr = address.ok_or(FormatError::NoDataAllocated)?;
-            let addr = addr as usize;
-            let sz = *size as usize;
+            let r = slice_range(addr, *size)?;
+            let sz = r.end - r.start;
             if sz != expected_size {
                 return Err(FormatError::DataSizeMismatch {
                     expected: expected_size,
                     actual: sz,
                 });
             }
-            if addr + sz > file_data.len() {
+            if r.end > file_data.len() {
                 return Err(FormatError::UnexpectedEof {
-                    expected: addr + sz,
+                    expected: r.end,
                     available: file_data.len(),
                 });
             }
-            Ok(Some(&file_data[addr..addr + sz]))
+            Ok(Some(&file_data[r]))
         }
         _ => Ok(None),
     }
@@ -81,9 +87,14 @@ pub fn read_raw_data_full(
     offset_size: u8,
     length_size: u8,
 ) -> Result<Vec<u8>, FormatError> {
-    let num_elements = dataspace.num_elements() as usize;
+    let num_elements = dataspace.num_elements().to_usize()?;
     let elem_size = datatype.type_size() as usize;
-    let expected_size = num_elements * elem_size;
+    let expected_size = num_elements
+        .checked_mul(elem_size)
+        .ok_or(FormatError::OffsetOverflow {
+            offset: num_elements as u64,
+            length: elem_size as u64,
+        })?;
 
     // Zero-element datasets have no data to read.
     if num_elements == 0 {
@@ -102,21 +113,21 @@ pub fn read_raw_data_full(
         }
         DataLayout::Contiguous { address, size } => {
             let addr = address.ok_or(FormatError::NoDataAllocated)?;
-            let addr = addr as usize;
-            let sz = *size as usize;
+            let r = slice_range(addr, *size)?;
+            let sz = r.end - r.start;
             if sz != expected_size {
                 return Err(FormatError::DataSizeMismatch {
                     expected: expected_size,
                     actual: sz,
                 });
             }
-            if addr + sz > file_data.len() {
+            if r.end > file_data.len() {
                 return Err(FormatError::UnexpectedEof {
-                    expected: addr + sz,
+                    expected: r.end,
                     available: file_data.len(),
                 });
             }
-            Ok(file_data[addr..addr + sz].to_vec())
+            Ok(file_data[r].to_vec())
         }
         DataLayout::Chunked { .. } => read_chunked_data(
             file_data,
@@ -480,7 +491,7 @@ pub fn read_compound_fields(
             let mut fields = Vec::with_capacity(members.len());
             for m in members {
                 let field_size = m.datatype.type_size() as usize;
-                let offset = m.byte_offset as usize;
+                let offset = m.byte_offset.to_usize()?;
                 let mut field_raw = Vec::with_capacity(count * field_size);
                 for i in 0..count {
                     let elem_start = i * elem_size + offset;

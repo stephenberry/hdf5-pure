@@ -3,6 +3,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::{string::String, vec::Vec};
 
+use crate::convert::TryToUsize;
 use crate::datatype::CharacterSet;
 use crate::error::FormatError;
 
@@ -247,7 +248,7 @@ impl LinkMessage {
         };
 
         // Link name length
-        let name_len = read_offset(data, pos, name_size_field_width)? as usize;
+        let name_len = read_offset(data, pos, name_size_field_width)?.to_usize()?;
         pos += name_size_field_width as usize;
 
         // Link name

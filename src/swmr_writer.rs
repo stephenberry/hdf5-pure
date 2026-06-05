@@ -31,6 +31,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::checksum::jenkins_lookup3;
 use crate::chunked_write::ea_compute_stats;
+use crate::convert::TryToUsize;
 use crate::data_layout::DataLayout;
 use crate::dataspace::Dataspace;
 use crate::error::{Error, FormatError};
@@ -352,7 +353,7 @@ impl SwmrWriter {
 
         // Walk the v2 object header, recording the dataspace and layout messages
         // (with file offsets) and the checksum region of their containing chunk.
-        let walk = walk_v2_object_header(&self.data, oh_addr as usize, os, ls)?;
+        let walk = walk_v2_object_header(&self.data, oh_addr.to_usize()?, os, ls)?;
 
         let dataspace_msg = walk
             .messages
@@ -407,7 +408,7 @@ impl SwmrWriter {
                 btree_address: Some(addr),
                 chunk_dimensions,
                 ..
-            } => (addr as usize, chunk_dimensions),
+            } => (addr.to_usize()?, chunk_dimensions),
             _ => {
                 return Err(Error::SwmrAppendUnsupported(
                     "only Extensible-Array-indexed chunked datasets are supported",
@@ -423,7 +424,7 @@ impl SwmrWriter {
         }
         let chunk_elems = chunk_dims[0] as u64;
         let elem_bytes = chunk_dims[1] as usize;
-        let chunk_bytes = chunk_elems as usize * elem_bytes;
+        let chunk_bytes = chunk_elems.to_usize()? * elem_bytes;
 
         // Parse the EA header for its creation parameters and current count.
         let ea_header = ExtensibleArrayHeader::parse(&self.data, ea_addr, os, ls)?;
@@ -435,7 +436,7 @@ impl SwmrWriter {
         let geom = EaGeometry::from_header(&ea_header);
         let page_nelmts = 1u64 << ea_header.max_dblk_nelmts_bits;
         let blk_off_size = (ea_header.max_nelmts_bits as usize).div_ceil(8);
-        let index_block_addr = ea_header.index_block_address as usize;
+        let index_block_addr = ea_header.index_block_address.to_usize()?;
         // The dataspace dimension is the single commit point (append phase 4);
         // the EA element count is published one phase earlier (phase 3). If a
         // prior writer crashed between the two, the on-disk EA count is ahead of
@@ -493,7 +494,7 @@ impl SwmrWriter {
         // Inline element slots live directly in the index block.
         if e < idx {
             let ib_prefix = 4 + 1 + 1 + os as usize; // sig + ver + client + hdr_addr
-            let slot_off = index_block_addr + ib_prefix + e as usize * elem_size;
+            let slot_off = index_block_addr + ib_prefix + e.to_usize()? * elem_size;
             self.write_addr_at(slot_off, chunk_addr)?;
             self.rechecksum_index_block(dataset)?;
             return Ok(());
@@ -511,7 +512,7 @@ impl SwmrWriter {
         }
         let dblk_nelmts = region.dblk_nelmts;
         let is_paged = dblk_nelmts > page_nelmts;
-        let slot = (e - region.db_start) as usize;
+        let slot = (e - region.db_start).to_usize()?;
         let block_offset_rel = region.db_start - idx;
         let ndblks = region.ndblks;
 
@@ -547,7 +548,7 @@ impl SwmrWriter {
                     let ib_prefix = 4 + 1 + 1 + os as usize;
                     let slot_off = index_block_addr
                         + ib_prefix
-                        + idx as usize * elem_size
+                        + idx.to_usize()? * elem_size
                         + ordinal * os as usize;
                     self.write_addr_at(slot_off, new_addr)?;
                     self.rechecksum_index_block(dataset)?;
@@ -561,7 +562,7 @@ impl SwmrWriter {
                         dblk_nelmts,
                         page_nelmts,
                         blk_off,
-                    );
+                    )?;
                     self.write_addr_at(slot_off, new_addr)?;
                     self.rechecksum_super_block(
                         sblk_addr,
@@ -579,7 +580,7 @@ impl SwmrWriter {
                     let ib_prefix = 4 + 1 + 1 + os as usize;
                     let slot_off = index_block_addr
                         + ib_prefix
-                        + idx as usize * elem_size
+                        + idx.to_usize()? * elem_size
                         + ordinal * os as usize;
                     self.read_addr_at(slot_off)
                 }
@@ -592,7 +593,7 @@ impl SwmrWriter {
                         dblk_nelmts,
                         page_nelmts,
                         blk_off,
-                    );
+                    )?;
                     self.read_addr_at(slot_off)
                 }
             }
@@ -601,27 +602,28 @@ impl SwmrWriter {
         if !is_paged {
             // Write the element into the data block and re-checksum the block.
             let db_prefix = 4 + 1 + 1 + os as usize + blk_off;
-            let elem_off = dblk_addr as usize + db_prefix + slot * elem_size;
+            let dblk_addr = dblk_addr.to_usize()?;
+            let elem_off = dblk_addr + db_prefix + slot * elem_size;
             self.write_addr_at(elem_off, chunk_addr)?;
-            let cks_off = dblk_addr as usize + db_prefix + dblk_nelmts as usize * elem_size;
-            self.rechecksum_range(dblk_addr as usize, cks_off)?;
+            let cks_off = dblk_addr + db_prefix + dblk_nelmts.to_usize()? * elem_size;
+            self.rechecksum_range(dblk_addr, cks_off)?;
         } else {
             // Write the element into the right page, re-checksum that page, and
             // (when the page is first touched) mark it initialized in the super
             // block's page-init bitmap.
-            let page_nelmts = page_nelmts as usize;
+            let page_nelmts = page_nelmts.to_usize()?;
             let header_size = 4 + 1 + 1 + os as usize + blk_off + 4; // includes header checksum
             let page = slot / page_nelmts;
             let slot_in_page = slot % page_nelmts;
             let page_bytes = page_nelmts * elem_size + 4;
-            let page_off = dblk_addr as usize + header_size + page * page_bytes;
+            let page_off = dblk_addr.to_usize()? + header_size + page * page_bytes;
             self.write_addr_at(page_off + slot_in_page * elem_size, chunk_addr)?;
             let page_cks_off = page_off + page_nelmts * elem_size;
             self.rechecksum_range(page_off, page_cks_off)?;
 
             if slot_in_page == 0 {
                 let sblk_addr = sblk_addr.unwrap();
-                let npages = (dblk_nelmts / page_nelmts as u64) as usize;
+                let npages = (dblk_nelmts / page_nelmts as u64).to_usize()?;
                 if let Parent::Super { dblk_local, .. } = region.parent {
                     let global_page = dblk_local * npages + page;
                     self.set_sb_page_bit(sblk_addr, blk_off, global_page)?;
@@ -640,12 +642,17 @@ impl SwmrWriter {
 
     /// Byte size of a super block's page-init bitmap (0 when its data blocks are
     /// not paged): `ndblks * ceil(npages / 8)`.
-    fn sb_bitmap_size(&self, ndblks: u64, dblk_nelmts: u64, page_nelmts: u64) -> usize {
+    fn sb_bitmap_size(
+        &self,
+        ndblks: u64,
+        dblk_nelmts: u64,
+        page_nelmts: u64,
+    ) -> Result<usize, Error> {
         if dblk_nelmts > page_nelmts {
-            let npages = (dblk_nelmts / page_nelmts) as usize;
-            ndblks as usize * npages.div_ceil(8)
+            let npages = (dblk_nelmts / page_nelmts).to_usize()?;
+            Ok(ndblks.to_usize()? * npages.div_ceil(8))
         } else {
-            0
+            Ok(0)
         }
     }
 
@@ -659,11 +666,11 @@ impl SwmrWriter {
         dblk_nelmts: u64,
         page_nelmts: u64,
         blk_off: usize,
-    ) -> usize {
+    ) -> Result<usize, Error> {
         let os = self.offset_size as usize;
         let prefix = 4 + 1 + 1 + os + blk_off;
-        let bitmap = self.sb_bitmap_size(ndblks, dblk_nelmts, page_nelmts);
-        sblk_addr as usize + prefix + bitmap + dblk_local * os
+        let bitmap = self.sb_bitmap_size(ndblks, dblk_nelmts, page_nelmts)?;
+        Ok(sblk_addr.to_usize()? + prefix + bitmap + dblk_local * os)
     }
 
     /// Set page `global_page`'s bit in a super block's page-init bitmap
@@ -675,7 +682,7 @@ impl SwmrWriter {
         global_page: usize,
     ) -> Result<(), Error> {
         let os = self.offset_size as usize;
-        let bitmap_start = sblk_addr as usize + 4 + 1 + 1 + os + blk_off;
+        let bitmap_start = sblk_addr.to_usize()? + 4 + 1 + 1 + os + blk_off;
         let byte = bitmap_start + global_page / 8;
         let mask = 0x80u8 >> (global_page % 8);
         let v = self.data[byte] | mask;
@@ -684,17 +691,17 @@ impl SwmrWriter {
 
     /// Address of an already-allocated super block (`sblk_j`-th super-block
     /// pointer in the index block).
-    fn super_block_addr(&self, dataset: &str, sblk_j: usize) -> u64 {
+    fn super_block_addr(&self, dataset: &str, sblk_j: usize) -> Result<u64, Error> {
         let loc = &self.located[dataset];
         let os = self.offset_size as usize;
         let ib_prefix = 4 + 1 + 1 + os;
         let ndblk_addrs = loc.geom.direct_dblk_nelmts.len();
         let slot_off = loc.index_block_addr
             + ib_prefix
-            + loc.idx_blk_elmts as usize * loc.ea_elem_size
+            + loc.idx_blk_elmts.to_usize()? * loc.ea_elem_size
             + ndblk_addrs * os
             + sblk_j * os;
-        self.read_addr_at(slot_off)
+        Ok(self.read_addr_at(slot_off))
     }
 
     /// Return the address of super block `sblk_j`, allocating an empty one (all
@@ -708,7 +715,7 @@ impl SwmrWriter {
         ndblks: u64,
         dblk_nelmts: u64,
     ) -> Result<u64, Error> {
-        let existing = self.super_block_addr(dataset, sblk_j);
+        let existing = self.super_block_addr(dataset, sblk_j)?;
         if !is_undef(existing, self.offset_size) {
             return Ok(existing);
         }
@@ -729,7 +736,7 @@ impl SwmrWriter {
                 self.offset_size as usize,
                 4 + 1 + 1 + self.offset_size as usize,
                 loc.geom.direct_dblk_nelmts.len(),
-                loc.idx_blk_elmts as usize,
+                loc.idx_blk_elmts.to_usize()?,
                 loc.ea_elem_size,
                 loc.index_block_addr,
                 loc.ea_addr as u64,
@@ -737,8 +744,8 @@ impl SwmrWriter {
             )
         };
 
-        let bitmap = vec![0u8; self.sb_bitmap_size(ndblks, dblk_nelmts, page_nelmts)];
-        let undef = vec![undef_addr(self.offset_size); ndblks as usize];
+        let bitmap = vec![0u8; self.sb_bitmap_size(ndblks, dblk_nelmts, page_nelmts)?];
+        let undef = vec![undef_addr(self.offset_size); ndblks.to_usize()?];
         let aesb = crate::chunked_write::build_aesb(
             ea_addr,
             sb_block_offset,
@@ -808,9 +815,9 @@ impl SwmrWriter {
         buf.extend_from_slice(&header_cks.to_le_bytes());
 
         let undef = undef_addr(os);
-        let npages = (dblk_nelmts / page_nelmts) as usize;
+        let npages = (dblk_nelmts / page_nelmts).to_usize()?;
         for _ in 0..npages {
-            let mut page = Vec::with_capacity(page_nelmts as usize * elem_size + 4);
+            let mut page = Vec::with_capacity(page_nelmts.to_usize()? * elem_size + 4);
             for _ in 0..page_nelmts {
                 crate::chunked_write::write_ea_addr(&mut page, undef, os);
             }
@@ -830,7 +837,7 @@ impl SwmrWriter {
         let nsblk_addrs = loc.geom.nsblk_addrs;
         let cks_off = loc.index_block_addr
             + ib_prefix
-            + loc.idx_blk_elmts as usize * loc.ea_elem_size
+            + loc.idx_blk_elmts.to_usize()? * loc.ea_elem_size
             + ndblk_addrs * os
             + nsblk_addrs * os;
         self.rechecksum_range(loc.index_block_addr, cks_off)
@@ -846,9 +853,10 @@ impl SwmrWriter {
     ) -> Result<(), Error> {
         let os = self.offset_size as usize;
         let prefix = 4 + 1 + 1 + os + blk_off;
-        let bitmap = self.sb_bitmap_size(ndblks, dblk_nelmts, page_nelmts);
-        let cks_off = sblk_addr as usize + prefix + bitmap + ndblks as usize * os;
-        self.rechecksum_range(sblk_addr as usize, cks_off)
+        let bitmap = self.sb_bitmap_size(ndblks, dblk_nelmts, page_nelmts)?;
+        let sblk_off = sblk_addr.to_usize()?;
+        let cks_off = sblk_off + prefix + bitmap + ndblks.to_usize()? * os;
+        self.rechecksum_range(sblk_off, cks_off)
     }
 
     /// Recompute the Jenkins checksum over `[start, cks_off)` and write it at
@@ -1080,7 +1088,7 @@ fn walk_v2_object_header(
         pos += 4; // attr storage phase-change
     }
     let chunk_size_width = 1usize << (flags & 0x03);
-    let chunk0_size = read_uint(data, pos, chunk_size_width)? as usize;
+    let chunk0_size = read_uint(data, pos, chunk_size_width)?.to_usize()?;
     pos += chunk_size_width;
     let chunk0_start = offset;
     let chunk0_msg_start = pos;
@@ -1155,9 +1163,9 @@ fn walk_messages(
         }
         let msg_type = MessageType::from_u16(msg_type_raw);
         if msg_type == MessageType::ObjectHeaderContinuation {
-            let cont_off = read_uint(data, pos, offset_size as usize)? as usize;
+            let cont_off = read_uint(data, pos, offset_size as usize)?.to_usize()?;
             let cont_len =
-                read_uint(data, pos + offset_size as usize, length_size as usize)? as usize;
+                read_uint(data, pos + offset_size as usize, length_size as usize)?.to_usize()?;
             continuations.push((cont_off, cont_len));
         } else {
             messages.push(WalkedMessage {
@@ -1295,6 +1303,9 @@ mod tests {
     /// or h5py. Open the file fresh with the C library at each stopped phase and
     /// confirm it reads the old length until the phase-4 dimension commit.
     #[test]
+    // Reads back with the reference HDF5 C library (`hdf5-metno`), which is a
+    // 64-bit-only dev-dependency; skip on 32-bit so the lib tests run there.
+    #[cfg(not(target_pointer_width = "32"))]
     fn crash_consistency_c_library_reads_prefix() {
         let dir = tempdir().unwrap();
         let base = dir.path().join("base.h5");
@@ -1342,6 +1353,9 @@ mod tests {
     /// (seeding the chunk count from the stale EA header) surfaces the crashed
     /// writer's values instead of the recovery writer's.
     #[test]
+    // Reads back with the reference HDF5 C library (`hdf5-metno`), which is a
+    // 64-bit-only dev-dependency; skip on 32-bit so the lib tests run there.
+    #[cfg(not(target_pointer_width = "32"))]
     fn recover_and_reappend_after_phase3_crash() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("phase3_recover.h5");

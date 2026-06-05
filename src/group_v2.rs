@@ -7,6 +7,7 @@
 use alloc::{string::String, vec::Vec};
 
 use crate::btree_v2::{BTreeV2Header, collect_btree_v2_records};
+use crate::convert::TryToUsize;
 use crate::error::FormatError;
 use crate::fractal_heap::FractalHeapHeader;
 use crate::group_v1::{self, GroupEntry};
@@ -72,13 +73,14 @@ fn resolve_dense_entries(
     length_size: u8,
 ) -> Result<Vec<GroupEntry>, FormatError> {
     // Parse fractal heap
-    let fh = FractalHeapHeader::parse(file_data, fh_addr as usize, offset_size, length_size)?;
+    let fh = FractalHeapHeader::parse(file_data, fh_addr.to_usize()?, offset_size, length_size)?;
 
     // Parse B-tree v2 for name index
     let btree_addr = link_info
         .btree_name_index_address
         .ok_or_else(|| FormatError::PathNotFound(String::from("no B-tree v2 name index")))?;
-    let btree_hdr = BTreeV2Header::parse(file_data, btree_addr as usize, offset_size, length_size)?;
+    let btree_hdr =
+        BTreeV2Header::parse(file_data, btree_addr.to_usize()?, offset_size, length_size)?;
     let records = collect_btree_v2_records(file_data, &btree_hdr, offset_size, length_size)?;
 
     let mut entries = Vec::new();
@@ -170,7 +172,7 @@ pub fn resolve_path_any(
 
     let root_header = ObjectHeader::parse_with_base(
         file_data,
-        superblock.root_group_address as usize,
+        superblock.root_group_address.to_usize()?,
         os,
         ls,
         base,
@@ -191,8 +193,13 @@ pub fn resolve_path_any(
                     return Ok(abs_addr);
                 }
                 current_addr = abs_addr;
-                current_header =
-                    ObjectHeader::parse_with_base(file_data, current_addr as usize, os, ls, base)?;
+                current_header = ObjectHeader::parse_with_base(
+                    file_data,
+                    current_addr.to_usize()?,
+                    os,
+                    ls,
+                    base,
+                )?;
             }
             None => {
                 return Err(FormatError::PathNotFound(String::from(*component)));

@@ -8,6 +8,7 @@
 //! the same region produce identical partitions (cache-friendly, reproducible).
 
 use crate::chunked_read::ChunkInfo;
+use crate::convert::slice_range;
 use crate::error::FormatError;
 use crate::filter_pipeline::FilterPipeline;
 use crate::filters::{ChunkContext, decompress_chunk};
@@ -69,16 +70,15 @@ pub fn decompress_chunks_lane_partitioned(
 
             for &index in &indices {
                 let chunk_info = &chunks[index];
-                let c_addr = chunk_info.address as usize;
-                let size = chunk_info.chunk_size as usize;
+                let r = slice_range(chunk_info.address, u64::from(chunk_info.chunk_size))?;
 
-                if c_addr + size > file_data.len() {
+                if r.end > file_data.len() {
                     return Err(FormatError::UnexpectedEof {
-                        expected: c_addr + size,
+                        expected: r.end,
                         available: file_data.len(),
                     });
                 }
-                let raw_chunk = &file_data[c_addr..c_addr + size];
+                let raw_chunk = &file_data[r];
 
                 let decompressed = if chunk_info.filter_mask == 0 {
                     decompress_chunk(raw_chunk, pipeline, ctx)?
@@ -87,7 +87,7 @@ pub fn decompress_chunks_lane_partitioned(
                 };
 
                 stats.chunks_processed += 1;
-                stats.compressed_bytes += size as u64;
+                stats.compressed_bytes += u64::from(chunk_info.chunk_size);
                 stats.decompressed_bytes += decompressed.len() as u64;
 
                 results.push(DecompressedChunk {
@@ -140,15 +140,14 @@ pub fn decompress_chunks_parallel(
         .par_iter()
         .enumerate()
         .map(|(index, chunk_info)| {
-            let c_addr = chunk_info.address as usize;
-            let size = chunk_info.chunk_size as usize;
-            if c_addr + size > file_data.len() {
+            let r = slice_range(chunk_info.address, u64::from(chunk_info.chunk_size))?;
+            if r.end > file_data.len() {
                 return Err(FormatError::UnexpectedEof {
-                    expected: c_addr + size,
+                    expected: r.end,
                     available: file_data.len(),
                 });
             }
-            let raw_chunk = &file_data[c_addr..c_addr + size];
+            let raw_chunk = &file_data[r];
 
             let decompressed = if chunk_info.filter_mask == 0 {
                 decompress_chunk(raw_chunk, pipeline, ctx)?
@@ -177,15 +176,14 @@ pub fn decompress_chunks_sequential(
 ) -> Result<Vec<Vec<u8>>, FormatError> {
     let mut result = Vec::with_capacity(chunks.len());
     for chunk_info in chunks {
-        let c_addr = chunk_info.address as usize;
-        let size = chunk_info.chunk_size as usize;
-        if c_addr + size > file_data.len() {
+        let r = slice_range(chunk_info.address, u64::from(chunk_info.chunk_size))?;
+        if r.end > file_data.len() {
             return Err(FormatError::UnexpectedEof {
-                expected: c_addr + size,
+                expected: r.end,
                 available: file_data.len(),
             });
         }
-        let raw_chunk = &file_data[c_addr..c_addr + size];
+        let raw_chunk = &file_data[r];
 
         let decompressed = if let Some(pl) = pipeline {
             if chunk_info.filter_mask == 0 {

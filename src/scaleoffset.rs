@@ -30,6 +30,7 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::{string::ToString, vec, vec::Vec};
 
+use crate::convert::TryToUsize;
 use crate::datatype::{Datatype, DatatypeByteOrder};
 use crate::error::FormatError;
 use crate::filter_pipeline::FilterDescription;
@@ -223,7 +224,7 @@ impl Parms {
         Ok(Parms {
             scale_type: cd[PARM_SCALETYPE],
             scale_factor: cd[PARM_SCALEFACTOR] as i32,
-            nelmts: cd[PARM_NELMTS] as usize,
+            nelmts: cd[PARM_NELMTS].to_usize()?,
             class,
             size,
             order,
@@ -254,7 +255,11 @@ pub fn decompress(input: &[u8], filter: &FilterDescription) -> Result<Vec<u8>, F
     }
 
     let full_bits = (p.size * 8) as u32;
-    let size_out = p.nelmts * p.size;
+    // `nelmts` is file-derived; `nelmts * size` is an allocation size and a
+    // slice bound. The product is computed in `u64` (it cannot overflow there:
+    // `nelmts` originates from a `u32` and `size` is 1..=8) and narrowed to
+    // `usize`, which errors instead of truncating on a 32-bit host.
+    let size_out = (p.nelmts as u64 * p.size as u64).to_usize()?;
 
     // No-op mode: integer (non-DSCALE) datasets created with scale_factor equal
     // to the full bit width store the chunk verbatim, with no header.
@@ -316,8 +321,10 @@ pub fn decompress(input: &[u8], filter: &FilterDescription) -> Result<Vec<u8>, F
     }
     let payload = &input[HEADER_LEN..];
     // Validate payload length once, up front; the BitReader trusts the
-    // caller to not read past the end.
-    if payload.len() * 8 < p.nelmts * minbits as usize {
+    // caller to not read past the end. Compare in `u64` so the bit counts
+    // (`nelmts` is file-derived, `minbits` up to 64) cannot overflow a 32-bit
+    // `usize` and falsely pass the check.
+    if (payload.len() as u64) * 8 < p.nelmts as u64 * minbits as u64 {
         return Err(FormatError::FilterError(
             "scaleoffset: payload too short for packed data".to_string(),
         ));
@@ -357,7 +364,10 @@ pub fn compress(input: &[u8], filter: &FilterDescription) -> Result<Vec<u8>, For
         ));
     }
 
-    let expected = p.nelmts * p.size;
+    // `nelmts * size` in `u64` (cannot overflow there) narrowed to `usize`,
+    // so a file-derived `nelmts` cannot wrap a 32-bit `usize` and spuriously
+    // equal `input.len()`.
+    let expected = (p.nelmts as u64 * p.size as u64).to_usize()?;
     if input.len() != expected {
         return Err(FormatError::CompressionError(
             "scaleoffset: chunk size does not match nelmts * datatype size".to_string(),
@@ -380,11 +390,8 @@ pub fn compress(input: &[u8], filter: &FilterDescription) -> Result<Vec<u8>, For
     if minbits >= full_bits {
         return Ok(emit_raw(full_bits, minval, input));
     }
-    Ok(emit(
-        minbits,
-        minval,
-        &pack_offsets(&offsets, minbits, p.nelmts),
-    ))
+    let payload = pack_offsets(&offsets, minbits, p.nelmts)?;
+    Ok(emit(minbits, minval, &payload))
 }
 
 // --- integer reconstruction / pre-compression ----------------------------
@@ -630,12 +637,16 @@ fn write_header(out: &mut Vec<u8>, minbits: u32, minval: u64) {
 /// with O(nelmts) iterations rather than O(nelmts * minbits) — roughly an
 /// order of magnitude fewer instructions in the hot path for typical
 /// minbits.
-fn pack_offsets(offsets: &[u64], minbits: u32, nelmts: usize) -> Vec<u8> {
-    let payload_len = nelmts * minbits as usize / 8 + 1;
+fn pack_offsets(offsets: &[u64], minbits: u32, nelmts: usize) -> Result<Vec<u8>, FormatError> {
+    // `nelmts * minbits` is a bit count that sizes the payload buffer. Compute
+    // it in `u64` (cannot overflow there: `nelmts` originates from a `u32` and
+    // `minbits` is <= 64) and narrow the resulting byte length to `usize`,
+    // erroring instead of truncating on a 32-bit host.
+    let payload_len = (nelmts as u64 * minbits as u64 / 8 + 1).to_usize()?;
     if minbits == 0 {
         // All offsets are zero; the reference layout is just `payload_len`
         // zero bytes.
-        return vec![0u8; payload_len];
+        return Ok(vec![0u8; payload_len]);
     }
     let mut buf = Vec::with_capacity(payload_len);
     let mask: u64 = if minbits == 64 {
@@ -683,7 +694,7 @@ fn pack_offsets(offsets: &[u64], minbits: u32, nelmts: usize) -> Vec<u8> {
     while buf.len() < payload_len {
         buf.push(0);
     }
-    buf
+    Ok(buf)
 }
 
 /// Streaming MSB-first bit reader over a packed payload. Fused with the
@@ -1141,7 +1152,7 @@ mod tests {
                 (1u64 << minbits) - 1
             };
             let offsets: Vec<u64> = (0..nelmts).map(|_| rng.next() & mask).collect();
-            let packed = pack_offsets(&offsets, minbits, nelmts);
+            let packed = pack_offsets(&offsets, minbits, nelmts).unwrap();
             // Reference layout reserves at least one trailing byte.
             assert_eq!(packed.len(), nelmts * minbits as usize / 8 + 1);
             let unpacked = unpack_bits(&packed, nelmts, minbits).unwrap();
@@ -1357,7 +1368,7 @@ mod tests {
         chunk.push(8);
         chunk.extend_from_slice(&10u64.to_le_bytes());
         chunk.extend_from_slice(&[0u8; HEADER_LEN - 13]);
-        chunk.extend_from_slice(&pack_offsets(&[0, 1, 7, 2], 3, 4));
+        chunk.extend_from_slice(&pack_offsets(&[0, 1, 7, 2], 3, 4).unwrap());
         let out = decompress(&chunk, &f).unwrap();
         let got: Vec<u32> = out
             .chunks_exact(4)

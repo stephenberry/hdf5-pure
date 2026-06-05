@@ -53,6 +53,16 @@ ndarray = { version = ">=0.16, <0.18", optional = true }
 tempfile = "3"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
+
+# The reference HDF5 C library, used only by the byte-level crosscheck tests.
+# Its `static` feature compiles libhdf5 from source via CMake, which does not
+# cross-compile to 32-bit targets cleanly and is unnecessary there anyway (a
+# 32-bit host cannot allocate the multi-GiB fixtures these tests build). Gate it
+# to 64-bit-pointer targets so `cross test --target i686-...` can run the
+# pure-Rust suite on a 32-bit pointer width without building any C code. The
+# crosscheck test files (and the metno-backed unit tests in `swmr_writer`) carry
+# the matching `#![cfg(not(target_pointer_width = "32"))]` gate.
+[target.'cfg(not(target_pointer_width = "32"))'.dev-dependencies]
 hdf5 = { package = "hdf5-metno", version = "0.12", features = ["static", "zlib"] }
 
 [[example]]

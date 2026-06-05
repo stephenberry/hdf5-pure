@@ -3,6 +3,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+use crate::convert::TryToUsize;
 use crate::error::FormatError;
 
 /// Magic signature for global heap collections.
@@ -78,7 +79,13 @@ impl GlobalHeapCollection {
         }
 
         let collection_size = read_length(file_data, offset + 8, length_size)?;
-        let collection_end = offset + collection_size as usize;
+        let collection_end =
+            offset
+                .checked_add(collection_size.to_usize()?)
+                .ok_or(FormatError::OffsetOverflow {
+                    offset: offset as u64,
+                    length: collection_size,
+                })?;
 
         let mut pos = offset + header_size;
         let mut objects = Vec::new();
@@ -98,7 +105,7 @@ impl GlobalHeapCollection {
             ensure_len(file_data, pos, obj_header_size)?;
 
             let reference_count = u16::from_le_bytes([file_data[pos + 2], file_data[pos + 3]]);
-            let object_size = read_length(file_data, pos + 8, length_size)? as usize;
+            let object_size = read_length(file_data, pos + 8, length_size)?.to_usize()?;
 
             pos += obj_header_size;
             ensure_len(file_data, pos, object_size)?;

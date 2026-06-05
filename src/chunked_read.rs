@@ -7,6 +7,7 @@ extern crate alloc;
 use alloc::{format, vec, vec::Vec};
 
 use crate::chunk_cache::{CacheAlignedBuffer, ChunkCache};
+use crate::convert::{TryToUsize, slice_range};
 use crate::data_layout::DataLayout;
 use crate::dataspace::Dataspace;
 use crate::datatype::Datatype;
@@ -48,15 +49,14 @@ fn decompress_all_chunks(
     // Sequential fallback — allocate into aligned buffers
     let mut result = Vec::with_capacity(chunks.len());
     for chunk_info in chunks {
-        let c_addr = chunk_info.address as usize;
-        let size = chunk_info.chunk_size as usize;
-        if c_addr + size > file_data.len() {
+        let r = slice_range(chunk_info.address, u64::from(chunk_info.chunk_size))?;
+        if r.end > file_data.len() {
             return Err(FormatError::UnexpectedEof {
-                expected: c_addr + size,
+                expected: r.end,
                 available: file_data.len(),
             });
         }
-        let raw_chunk = &file_data[c_addr..c_addr + size];
+        let raw_chunk = &file_data[r];
 
         let decompressed = if let Some(pl) = pipeline {
             if chunk_info.filter_mask == 0 {
@@ -134,7 +134,7 @@ pub fn collect_chunk_info(
     offset_size: u8,
     _length_size: u8,
 ) -> Result<Vec<ChunkInfo>, FormatError> {
-    let offset = btree_address as usize;
+    let offset = btree_address.to_usize()?;
     let os = offset_size as usize;
 
     // Parse B-tree v1 header
@@ -380,7 +380,7 @@ pub fn read_chunked_data(
             // Fixed Array — use spatial chunk dims only
             let spatial_chunk_dims: Vec<u32> = chunk_dimensions[..rank].to_vec();
             let header =
-                FixedArrayHeader::parse(file_data, addr as usize, offset_size, length_size)?;
+                FixedArrayHeader::parse(file_data, addr.to_usize()?, offset_size, length_size)?;
             read_fixed_array_chunks(
                 file_data,
                 &header,
@@ -394,8 +394,12 @@ pub fn read_chunked_data(
         (4, Some(4)) => {
             // Extensible Array — use spatial chunk dims only
             let spatial_chunk_dims: Vec<u32> = chunk_dimensions[..rank].to_vec();
-            let header =
-                ExtensibleArrayHeader::parse(file_data, addr as usize, offset_size, length_size)?;
+            let header = ExtensibleArrayHeader::parse(
+                file_data,
+                addr.to_usize()?,
+                offset_size,
+                length_size,
+            )?;
             read_extensible_array_chunks(
                 file_data,
                 &header,
@@ -559,7 +563,7 @@ pub fn read_chunked_data_cached(
             (4, Some(3)) => {
                 let spatial_chunk_dims: Vec<u32> = chunk_dimensions[..rank].to_vec();
                 let header =
-                    FixedArrayHeader::parse(file_data, addr as usize, offset_size, length_size)?;
+                    FixedArrayHeader::parse(file_data, addr.to_usize()?, offset_size, length_size)?;
                 read_fixed_array_chunks(
                     file_data,
                     &header,
@@ -574,7 +578,7 @@ pub fn read_chunked_data_cached(
                 let spatial_chunk_dims: Vec<u32> = chunk_dimensions[..rank].to_vec();
                 let header = ExtensibleArrayHeader::parse(
                     file_data,
-                    addr as usize,
+                    addr.to_usize()?,
                     offset_size,
                     length_size,
                 )?;
@@ -625,15 +629,14 @@ pub fn read_chunked_data_cached(
             cached
         } else {
             // Decompress from file
-            let c_addr = chunk_info.address as usize;
-            let size = chunk_info.chunk_size as usize;
-            if c_addr + size > file_data.len() {
+            let r = slice_range(chunk_info.address, u64::from(chunk_info.chunk_size))?;
+            if r.end > file_data.len() {
                 return Err(FormatError::UnexpectedEof {
-                    expected: c_addr + size,
+                    expected: r.end,
                     available: file_data.len(),
                 });
             }
-            let raw_chunk = &file_data[c_addr..c_addr + size];
+            let raw_chunk = &file_data[r];
             let dec = if let Some(pl) = pipeline {
                 if chunk_info.filter_mask == 0 {
                     decompress_chunk(raw_chunk, pl, ctx)?
@@ -911,7 +914,7 @@ pub fn read_chunked_data_sweep(
             (4, Some(3)) => {
                 let spatial_chunk_dims: Vec<u32> = chunk_dimensions[..rank].to_vec();
                 let header =
-                    FixedArrayHeader::parse(file_data, addr as usize, offset_size, length_size)?;
+                    FixedArrayHeader::parse(file_data, addr.to_usize()?, offset_size, length_size)?;
                 read_fixed_array_chunks(
                     file_data,
                     &header,
@@ -926,7 +929,7 @@ pub fn read_chunked_data_sweep(
                 let spatial_chunk_dims: Vec<u32> = chunk_dimensions[..rank].to_vec();
                 let header = ExtensibleArrayHeader::parse(
                     file_data,
-                    addr as usize,
+                    addr.to_usize()?,
                     offset_size,
                     length_size,
                 )?;
@@ -986,15 +989,14 @@ pub fn read_chunked_data_sweep(
             cached
         } else {
             // Decompress from file
-            let c_addr = chunk_info.address as usize;
-            let size = chunk_info.chunk_size as usize;
-            if c_addr + size > file_data.len() {
+            let r = slice_range(chunk_info.address, u64::from(chunk_info.chunk_size))?;
+            if r.end > file_data.len() {
                 return Err(FormatError::UnexpectedEof {
-                    expected: c_addr + size,
+                    expected: r.end,
                     available: file_data.len(),
                 });
             }
-            let raw_chunk = &file_data[c_addr..c_addr + size];
+            let raw_chunk = &file_data[r];
             let dec = if let Some(pl) = pipeline {
                 if chunk_info.filter_mask == 0 {
                     decompress_chunk(raw_chunk, pl, ctx)?
