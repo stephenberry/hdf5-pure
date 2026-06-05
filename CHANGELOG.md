@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-06-05
+
 ### Added
 
 - Streaming reads for files too large to buffer, via `File::open_streaming(path)` ([#27](https://github.com/stephenberry/hdf5-pure/issues/27)). The reader fetches metadata and dataset chunks from the file on demand through a `Read + Seek` source instead of loading the whole file into memory, so a host can read a multi-gigabyte file without an equivalent allocation; the motivating case is a 32-bit target (where the file exceeds the address space) reading data produced by the reference C library. The reading API is unchanged and only the backing store differs: the in-memory `File::open` / `File::from_bytes` / `File::open_swmr` paths are byte- and performance-identical to before (they keep the chunk cache and full v1/v2 group support), while the streaming backend reads each region on demand. Contiguous, compact, and all chunk-index layouts (B-tree v1, fixed array, and extensible array) stream. Two limits apply to the streaming backend that the in-memory path does not have: only latest-format (v2) groups resolve along a path (a v1 symbol-table group is rejected), and attribute reading is not yet supported. Verified end-to-end against the buffered reader on a 32-bit (i686) target under emulation.
@@ -63,7 +65,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The MAT serde deserializer now flattens 1×N and N×1 `Matrix` / `ComplexMatrix` values to a 1-D sequence inside `deserialize_any`, matching the existing behavior of `deserialize_seq`. This means untagged enums, `serde::de::Content` roundtrips, and custom `Visitor` impls that previously discriminated on the 2-D rows-of-rows shape when one axis was 1 will now see a flat sequence. Values with both axes greater than 1 still surface as a 2-D rows-of-rows.
 - Numeric / complex dataset readers no longer collapse a 1×N or N×1 dataset to a flat vector at the value layer. Shape is preserved through `MatValue::Matrix` / `ComplexMatrix`, and any flattening for `Vec<T>` callers happens at the serde-deserializer level (above). Direct consumers of `pub(crate)` value APIs are unaffected; this is an internal cleanup that fixes column-vector roundtrip ambiguity.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/stephenberry/hdf5-pure/releases/tag/v0.6.0
 [0.5.1]: https://github.com/stephenberry/hdf5-pure/releases/tag/v0.5.1
