@@ -9,6 +9,7 @@ use alloc::{format, vec, vec::Vec};
 use crate::chunked_read::ChunkInfo;
 use crate::convert::{TryToUsize, u32_from};
 use crate::error::FormatError;
+use crate::source::FileSource;
 
 /// Parsed Fixed Array header (FAHD).
 #[derive(Debug, Clone)]
@@ -105,6 +106,73 @@ impl FixedArrayHeader {
             data_block_address,
         })
     }
+
+    /// Parse a Fixed Array header from a [`FileSource`] (bounded window).
+    pub fn parse_from_source<S: FileSource + ?Sized>(
+        source: &S,
+        address: u64,
+        offset_size: u8,
+        length_size: u8,
+    ) -> Result<Self, FormatError> {
+        let min_size = 4 + 1 + 1 + 1 + 1 + length_size as usize + offset_size as usize + 4;
+        let buf = source.read_exact_at(address, min_size)?;
+        Self::parse(&buf, 0, offset_size, length_size)
+    }
+}
+
+/// Decode one Fixed/Extensible-Array element record from `block` at `elem_pos`.
+///
+/// Returns `None` for the all-`0xFF` sentinel (an unallocated chunk). `block`
+/// may be the whole-file buffer (buffered path, `elem_pos` absolute) or a
+/// data-block region read from a source (streaming path, `elem_pos` relative).
+#[allow(clippy::too_many_arguments)]
+fn parse_fa_element(
+    block: &[u8],
+    elem_pos: usize,
+    index: usize,
+    client_id: u8,
+    chunk_byte_size: u64,
+    elem_size: usize,
+    chunk_size_bytes: usize,
+    offset_size: u8,
+    num_chunks_per_dim: &[u64],
+    chunk_dimensions: &[u32],
+) -> Result<Option<ChunkInfo>, FormatError> {
+    if elem_pos + elem_size > block.len() {
+        return Err(FormatError::UnexpectedEof {
+            expected: elem_pos + elem_size,
+            available: block.len(),
+        });
+    }
+    if is_undefined(block, elem_pos, offset_size) {
+        return Ok(None);
+    }
+    let address = read_offset(block, elem_pos, offset_size)?;
+    let offsets = index_to_chunk_offsets(index, num_chunks_per_dim, chunk_dimensions);
+    if client_id == 0 {
+        Ok(Some(ChunkInfo {
+            chunk_size: u32_from(chunk_byte_size)?,
+            filter_mask: 0,
+            offsets,
+            address,
+        }))
+    } else {
+        let os = offset_size as usize;
+        let chunk_size = read_variable_length(&block[elem_pos + os..], chunk_size_bytes)?;
+        let fm_off = elem_pos + os + chunk_size_bytes;
+        let filter_mask = u32::from_le_bytes([
+            block[fm_off],
+            block[fm_off + 1],
+            block[fm_off + 2],
+            block[fm_off + 3],
+        ]);
+        Ok(Some(ChunkInfo {
+            chunk_size: u32_from(chunk_size)?,
+            filter_mask,
+            offsets,
+            address,
+        }))
+    }
 }
 
 /// Read chunk records from a Fixed Array data block.
@@ -175,46 +243,6 @@ pub fn read_fixed_array_chunks(
     let chunk_byte_size: u64 =
         chunk_dimensions.iter().map(|&d| d as u64).product::<u64>() * element_size as u64;
 
-    // Decode the element at absolute file position `elem_pos`, whose linear
-    // index across the whole array is `index`. Returns `None` for the "all
-    // 0xFF" sentinel that marks an unallocated chunk.
-    let parse_element = |elem_pos: usize, index: usize| -> Result<Option<ChunkInfo>, FormatError> {
-        if elem_pos + elem_size > file_data.len() {
-            return Err(FormatError::UnexpectedEof {
-                expected: elem_pos + elem_size,
-                available: file_data.len(),
-            });
-        }
-        if is_undefined(file_data, elem_pos, offset_size) {
-            return Ok(None);
-        }
-        let address = read_offset(file_data, elem_pos, offset_size)?;
-        let offsets = index_to_chunk_offsets(index, &num_chunks_per_dim, chunk_dimensions);
-        if header.client_id == 0 {
-            Ok(Some(ChunkInfo {
-                chunk_size: u32_from(chunk_byte_size)?,
-                filter_mask: 0,
-                offsets,
-                address,
-            }))
-        } else {
-            let chunk_size = read_variable_length(&file_data[elem_pos + os..], chunk_size_bytes)?;
-            let fm_off = elem_pos + os + chunk_size_bytes;
-            let filter_mask = u32::from_le_bytes([
-                file_data[fm_off],
-                file_data[fm_off + 1],
-                file_data[fm_off + 2],
-                file_data[fm_off + 3],
-            ]);
-            Ok(Some(ChunkInfo {
-                chunk_size: u32_from(chunk_size)?,
-                filter_mask,
-                offsets,
-                address,
-            }))
-        }
-    };
-
     let num_elements = header.num_elements.to_usize()?;
     let page_size = (1u64 << header.max_nelmts_bits).to_usize()?;
     let is_paged = num_elements > page_size;
@@ -225,7 +253,18 @@ pub fn read_fixed_array_chunks(
         // Elements stored directly after the data block prefix.
         let mut pos = db_offset + db_header_size;
         for index in 0..num_elements {
-            if let Some(info) = parse_element(pos, index)? {
+            if let Some(info) = parse_fa_element(
+                file_data,
+                pos,
+                index,
+                header.client_id,
+                chunk_byte_size,
+                elem_size,
+                chunk_size_bytes,
+                offset_size,
+                &num_chunks_per_dim,
+                chunk_dimensions,
+            )? {
                 chunks.push(info);
             }
             pos += elem_size;
@@ -275,7 +314,162 @@ pub fn read_fixed_array_chunks(
         for j in 0..nelem_in_page {
             let index = page * page_size + j;
             let elem_pos = page_start + j * elem_size;
-            if let Some(info) = parse_element(elem_pos, index)? {
+            if let Some(info) = parse_fa_element(
+                file_data,
+                elem_pos,
+                index,
+                header.client_id,
+                chunk_byte_size,
+                elem_size,
+                chunk_size_bytes,
+                offset_size,
+                &num_chunks_per_dim,
+                chunk_dimensions,
+            )? {
+                chunks.push(info);
+            }
+        }
+    }
+
+    Ok(chunks)
+}
+
+/// Read chunk records from a Fixed Array via a [`FileSource`].
+///
+/// Streaming counterpart of [`read_fixed_array_chunks`]: it reads the data-block
+/// prefix, then the element array (non-paged) or each initialized page
+/// (paged) as bounded windows via `read_at`, decoding the same records.
+#[allow(clippy::too_many_arguments)]
+pub fn read_fixed_array_chunks_from_source<S: FileSource + ?Sized>(
+    source: &S,
+    header: &FixedArrayHeader,
+    dataset_dims: &[u64],
+    chunk_dimensions: &[u32],
+    element_size: u32,
+    offset_size: u8,
+    _length_size: u8,
+) -> Result<Vec<ChunkInfo>, FormatError> {
+    let db_address = header.data_block_address;
+    let rank = chunk_dimensions.len();
+    let os = offset_size as usize;
+    let db_header_size = 4 + 1 + 1 + os;
+
+    // Data block prefix: FADB(4) + version(1) + client_id(1) + header_address.
+    let prefix = source.read_exact_at(db_address, db_header_size)?;
+    if &prefix[0..4] != b"FADB" {
+        return Err(FormatError::ChunkedReadError(
+            "invalid Fixed Array data block signature".into(),
+        ));
+    }
+
+    let chunk_size_bytes = if header.client_id == 0 {
+        0
+    } else {
+        (header.element_size as usize)
+            .checked_sub(os + 4)
+            .ok_or_else(|| {
+                FormatError::ChunkedReadError("Fixed Array element size too small".into())
+            })?
+    };
+    let elem_size = if header.client_id == 0 {
+        os
+    } else {
+        header.element_size as usize
+    };
+
+    let mut num_chunks_per_dim = Vec::with_capacity(rank);
+    for d_idx in 0..rank {
+        let ch_dim = chunk_dimensions[d_idx] as u64;
+        num_chunks_per_dim.push(dataset_dims[d_idx].div_ceil(ch_dim));
+    }
+    let chunk_byte_size: u64 =
+        chunk_dimensions.iter().map(|&d| d as u64).product::<u64>() * element_size as u64;
+
+    let num_elements = header.num_elements.to_usize()?;
+    let page_size = (1u64 << header.max_nelmts_bits).to_usize()?;
+    let is_paged = num_elements > page_size;
+
+    let mut chunks = Vec::new();
+
+    if !is_paged {
+        // All elements live directly after the prefix; read them in one window.
+        let region = source.read_exact_at(
+            db_address + db_header_size as u64,
+            num_elements
+                .checked_mul(elem_size)
+                .ok_or(FormatError::OffsetOverflow {
+                    offset: num_elements as u64,
+                    length: elem_size as u64,
+                })?,
+        )?;
+        for index in 0..num_elements {
+            if let Some(info) = parse_fa_element(
+                &region,
+                index * elem_size,
+                index,
+                header.client_id,
+                chunk_byte_size,
+                elem_size,
+                chunk_size_bytes,
+                offset_size,
+                &num_chunks_per_dim,
+                chunk_dimensions,
+            )? {
+                chunks.push(info);
+            }
+        }
+        return Ok(chunks);
+    }
+
+    // Paged: read the page-init bitmap, then each initialized page's elements.
+    let npages = num_elements.div_ceil(page_size);
+    let bitmap_size = npages.div_ceil(8);
+    let bitmap_addr = db_address + db_header_size as u64;
+    let bitmap = source.read_exact_at(bitmap_addr, bitmap_size)?;
+    let pages_start_addr = bitmap_addr + bitmap_size as u64 + 4;
+    let page_stride = page_size
+        .checked_mul(elem_size)
+        .and_then(|bytes| bytes.checked_add(4))
+        .ok_or(FormatError::OffsetOverflow {
+            offset: page_size as u64,
+            length: elem_size as u64,
+        })?;
+
+    for page in 0..npages {
+        let nelem_in_page = core::cmp::min(page_size, num_elements - page * page_size);
+        let initialized = (bitmap[page / 8] >> (7 - (page % 8))) & 1 == 1;
+        if !initialized {
+            continue;
+        }
+        let page_offset = page
+            .checked_mul(page_stride)
+            .ok_or(FormatError::OffsetOverflow {
+                offset: page as u64,
+                length: page_stride as u64,
+            })?;
+        let page_addr = pages_start_addr + page_offset as u64;
+        let region = source.read_exact_at(
+            page_addr,
+            nelem_in_page
+                .checked_mul(elem_size)
+                .ok_or(FormatError::OffsetOverflow {
+                    offset: nelem_in_page as u64,
+                    length: elem_size as u64,
+                })?,
+        )?;
+        for j in 0..nelem_in_page {
+            if let Some(info) = parse_fa_element(
+                &region,
+                j * elem_size,
+                page * page_size + j,
+                header.client_id,
+                chunk_byte_size,
+                elem_size,
+                chunk_size_bytes,
+                offset_size,
+                &num_chunks_per_dim,
+                chunk_dimensions,
+            )? {
                 chunks.push(info);
             }
         }
@@ -473,6 +667,77 @@ mod tests {
             assert_eq!(c.filter_mask, 0);
             assert_eq!(c.chunk_size, chunk_byte_size as u32);
         }
+
+        #[cfg(feature = "std")]
+        assert_fa_streams_match(&file_data, fahd_offset, &ds_dims, &chunk_dims, 8, 8, 8);
+    }
+
+    /// Assert the streaming Fixed-Array reader matches the buffered one over both
+    /// an in-memory and a `Read+Seek` source.
+    #[cfg(feature = "std")]
+    fn assert_fa_streams_match(
+        file_data: &[u8],
+        header_offset: usize,
+        ds_dims: &[u64],
+        chunk_dims: &[u32],
+        element_size: u32,
+        offset_size: u8,
+        length_size: u8,
+    ) {
+        use crate::source::{BytesSource, ReadSeekSource};
+        let h =
+            FixedArrayHeader::parse(file_data, header_offset, offset_size, length_size).unwrap();
+        let buffered = read_fixed_array_chunks(
+            file_data,
+            &h,
+            ds_dims,
+            chunk_dims,
+            element_size,
+            offset_size,
+            length_size,
+        )
+        .unwrap();
+
+        let mem = BytesSource::new(file_data);
+        let hm = FixedArrayHeader::parse_from_source(
+            &mem,
+            header_offset as u64,
+            offset_size,
+            length_size,
+        )
+        .unwrap();
+        let from_mem = read_fixed_array_chunks_from_source(
+            &mem,
+            &hm,
+            ds_dims,
+            chunk_dims,
+            element_size,
+            offset_size,
+            length_size,
+        )
+        .unwrap();
+
+        let seek = ReadSeekSource::new(std::io::Cursor::new(file_data.to_vec())).unwrap();
+        let hs = FixedArrayHeader::parse_from_source(
+            &seek,
+            header_offset as u64,
+            offset_size,
+            length_size,
+        )
+        .unwrap();
+        let from_seek = read_fixed_array_chunks_from_source(
+            &seek,
+            &hs,
+            ds_dims,
+            chunk_dims,
+            element_size,
+            offset_size,
+            length_size,
+        )
+        .unwrap();
+
+        assert_eq!(buffered, from_mem, "BytesSource mismatch");
+        assert_eq!(buffered, from_seek, "ReadSeekSource mismatch");
     }
 
     /// Build a synthetic Fixed Array (filtered) and verify reading.
@@ -545,6 +810,9 @@ mod tests {
         assert_eq!(chunks[1].chunk_size, 115);
         assert_eq!(chunks[2].address, 0x3000);
         assert_eq!(chunks[2].chunk_size, 100);
+
+        #[cfg(feature = "std")]
+        assert_fa_streams_match(&file_data, fahd_offset, &ds_dims, &chunk_dims, 8, 8, 8);
     }
 
     /// Build a synthetic paged (non-filtered) Fixed Array and verify both that
@@ -596,8 +864,21 @@ mod tests {
         let header =
             FixedArrayHeader::parse(&file_data, fahd_offset, offset_size, length_size).unwrap();
         assert_eq!(header.num_elements, 3);
-        read_fixed_array_chunks(&file_data, &header, &[3], &[1], 8, offset_size, length_size)
-            .unwrap()
+        let buffered =
+            read_fixed_array_chunks(&file_data, &header, &[3], &[1], 8, offset_size, length_size)
+                .unwrap();
+        // The streaming reader must produce the same chunks for the paged layout.
+        #[cfg(feature = "std")]
+        assert_fa_streams_match(
+            &file_data,
+            fahd_offset,
+            &[3],
+            &[1],
+            8,
+            offset_size,
+            length_size,
+        );
+        buffered
     }
 
     #[test]

@@ -5,8 +5,16 @@ use alloc::vec::Vec;
 
 use byteorder::{ByteOrder, LittleEndian};
 
+use crate::convert::TryToUsize;
 use crate::error::FormatError;
 use crate::signature::HDF5_SIGNATURE;
+use crate::source::FileSource;
+
+/// Upper bound on the on-disk size of a superblock across all versions: the
+/// largest is v1 with 8-byte offsets at 100 bytes (28 prefix + 4 addresses +
+/// a 40-byte root symbol-table entry). 128 leaves headroom while staying a
+/// tiny, fixed window to pull from a streaming source.
+const MAX_SUPERBLOCK_LEN: u64 = 128;
 
 /// Parsed HDF5 superblock (all versions).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +121,25 @@ impl Superblock {
             8 => buf.extend_from_slice(&val.to_le_bytes()),
             _ => {}
         }
+    }
+
+    /// Parse a superblock from a [`FileSource`], given the byte offset where its
+    /// signature was found (see [`crate::signature::find_signature_in`]).
+    ///
+    /// The superblock is fully self-contained: every field is stored inline and
+    /// none is a pointer followed during this parse, so only a small fixed
+    /// window ([`MAX_SUPERBLOCK_LEN`] bytes, clamped to the bytes available) is
+    /// read. This lets the entry point be parsed from a lazy streaming source
+    /// without materializing the whole file.
+    pub fn parse_from_source<S: FileSource + ?Sized>(
+        source: &S,
+        signature_offset: u64,
+    ) -> Result<Superblock, FormatError> {
+        let available = source.len().saturating_sub(signature_offset);
+        let window = available.min(MAX_SUPERBLOCK_LEN).to_usize()?;
+        let buf = source.read_exact_at(signature_offset, window)?;
+        // The window begins at the signature, so within `buf` it sits at 0.
+        Self::parse(&buf, 0)
     }
 
     /// Parse a superblock from `data` starting at `signature_offset`.
@@ -557,5 +584,43 @@ mod tests {
         let sb = Superblock::parse(&data, 0).unwrap();
         assert_eq!(sb.offset_size, 2);
         assert_eq!(sb.eof_address, 2048);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn parse_from_streaming_source_matches_buffered() {
+        use crate::source::{BytesSource, ReadSeekSource};
+        // A superblock at offset 512 in a larger file is parsed identically from
+        // a lazy Read+Seek source (reading only a small window) and from the
+        // in-memory buffer.
+        let mut data = vec![0u8; 4096];
+        let v2 = build_v2_bytes(8, 2);
+        data[512..512 + v2.len()].copy_from_slice(&v2);
+
+        let buffered = Superblock::parse(&data, 512).unwrap();
+        let from_mem = Superblock::parse_from_source(&BytesSource::new(&data), 512).unwrap();
+        let from_seek = Superblock::parse_from_source(
+            &ReadSeekSource::new(std::io::Cursor::new(data)).unwrap(),
+            512,
+        )
+        .unwrap();
+
+        assert_eq!(buffered, from_mem);
+        assert_eq!(buffered, from_seek);
+        assert_eq!(from_seek.root_group_address, 48);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn parse_from_streaming_source_validates_checksum() {
+        use crate::source::ReadSeekSource;
+        let mut data = build_v2_bytes(8, 2);
+        let len = data.len();
+        data[len - 1] ^= 0xFF; // corrupt the stored checksum
+        let src = ReadSeekSource::new(std::io::Cursor::new(data)).unwrap();
+        assert!(matches!(
+            Superblock::parse_from_source(&src, 0),
+            Err(FormatError::ChecksumMismatch { .. })
+        ));
     }
 }

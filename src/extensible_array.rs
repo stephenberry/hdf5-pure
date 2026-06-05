@@ -12,6 +12,7 @@ use alloc::{format, vec, vec::Vec};
 use crate::chunked_read::ChunkInfo;
 use crate::convert::{TryToUsize, u32_from};
 use crate::error::FormatError;
+use crate::source::FileSource;
 
 /// Parsed Extensible Array header (AEHD).
 #[derive(Debug, Clone)]
@@ -159,6 +160,28 @@ impl ExtensibleArrayHeader {
     /// Compute the size of this header in bytes (for write support).
     pub fn serialized_size(offset_size: u8, length_size: u8) -> usize {
         4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 6 * length_size as usize + offset_size as usize + 4
+    }
+
+    /// Parse an Extensible Array header from a [`FileSource`] (bounded window).
+    pub fn parse_from_source<S: FileSource + ?Sized>(
+        source: &S,
+        address: u64,
+        offset_size: u8,
+        length_size: u8,
+    ) -> Result<Self, FormatError> {
+        let size = Self::serialized_size(offset_size, length_size);
+        let buf = source.read_exact_at(address, size)?;
+        Self::parse(&buf, 0, offset_size, length_size)
+    }
+}
+
+/// Per-element stride in an Extensible Array data block: just the address for
+/// non-filtered chunks, or the full filtered element record otherwise.
+fn ea_elem_stride(header: &ExtensibleArrayHeader, offset_size: u8) -> usize {
+    if header.client_id == 0 {
+        offset_size as usize
+    } else {
+        header.element_size as usize
     }
 }
 
@@ -765,6 +788,417 @@ fn read_super_block(
     Ok(chunks)
 }
 
+// ---------------------------------------------------------------------------
+// Streaming traversal (read each block from a `FileSource` on demand)
+// ---------------------------------------------------------------------------
+
+/// Read chunk records from an Extensible Array via a [`FileSource`].
+///
+/// Streaming counterpart of [`read_extensible_array_chunks`]: reads the index
+/// block, then each direct data block and super block (and its paged data
+/// blocks) as bounded windows via `read_at`. The shared `read_element` /
+/// `EaGeometry` drive the decoding, so the layout logic stays in one place.
+#[allow(clippy::too_many_arguments)]
+pub fn read_extensible_array_chunks_from_source<S: FileSource + ?Sized>(
+    source: &S,
+    header: &ExtensibleArrayHeader,
+    dataset_dims: &[u64],
+    chunk_dimensions: &[u32],
+    element_size: u32,
+    offset_size: u8,
+    _length_size: u8,
+) -> Result<Vec<ChunkInfo>, FormatError> {
+    let rank = chunk_dimensions.len();
+    let os = offset_size as usize;
+
+    let mut num_chunks_per_dim = Vec::with_capacity(rank);
+    for d in 0..rank {
+        let ch_dim = chunk_dimensions[d] as u64;
+        num_chunks_per_dim.push(dataset_dims[d].div_ceil(ch_dim));
+    }
+    let chunk_byte_size: u64 =
+        chunk_dimensions.iter().map(|&d| d as u64).product::<u64>() * element_size as u64;
+
+    let dims_chunks: usize = num_chunks_per_dim.iter().product::<u64>().to_usize()?;
+    let total_elements = header.num_elements.to_usize()?.min(dims_chunks);
+
+    let geom = EaGeometry::from_header(header);
+    let elem_stride = ea_elem_stride(header, offset_size);
+
+    // Read the whole index block: header + inline element slots + direct
+    // data-block addresses + super-block addresses.
+    let ib_header_size = 4 + 1 + 1 + os;
+    let n_inline = header.idx_blk_elmts as usize;
+    let ndirect = geom.direct_dblk_nelmts.len();
+    let nsblk = geom.nsblk_addrs;
+    let inline_bytes = n_inline
+        .checked_mul(elem_stride)
+        .ok_or(FormatError::OffsetOverflow {
+            offset: n_inline as u64,
+            length: elem_stride as u64,
+        })?;
+    let addr_bytes = (ndirect + nsblk)
+        .checked_mul(os)
+        .ok_or(FormatError::OffsetOverflow {
+            offset: (ndirect + nsblk) as u64,
+            length: os as u64,
+        })?;
+    let ib_len = ib_header_size + inline_bytes + addr_bytes;
+    let ib = source.read_exact_at(header.index_block_address, ib_len)?;
+    if &ib[0..4] != b"EAIB" {
+        return Err(FormatError::ChunkedReadError(
+            "invalid Extensible Array index block signature".into(),
+        ));
+    }
+
+    let mut pos = ib_header_size;
+    let mut chunks = Vec::new();
+    let mut global_index = 0usize;
+
+    // 1. Inline elements stored directly in the index block.
+    for i in 0..n_inline {
+        if global_index + i >= total_elements {
+            break;
+        }
+        let (info, consumed) = read_element(
+            &ib,
+            pos,
+            header.client_id,
+            header.element_size,
+            offset_size,
+            chunk_byte_size,
+            global_index + i,
+            &num_chunks_per_dim,
+            chunk_dimensions,
+        )?;
+        if let Some(ci) = info {
+            chunks.push(ci);
+        }
+        pos += consumed;
+    }
+    global_index += n_inline.min(total_elements);
+    if global_index >= total_elements {
+        return Ok(chunks);
+    }
+
+    // After all inline slots, `pos` sits at the direct data-block addresses.
+    let mut direct_addrs: Vec<u64> = Vec::with_capacity(ndirect);
+    for _ in 0..ndirect {
+        direct_addrs.push(read_offset(&ib, pos, offset_size)?);
+        pos += os;
+    }
+    for (i, &addr) in direct_addrs.iter().enumerate() {
+        if global_index >= total_elements {
+            break;
+        }
+        let nelmts = geom.direct_dblk_nelmts[i].to_usize()?;
+        if !is_undefined_addr(addr, offset_size) {
+            chunks.extend(read_data_block_elements_from_source(
+                source,
+                addr,
+                nelmts,
+                header,
+                offset_size,
+                chunk_byte_size,
+                global_index,
+                total_elements,
+                &num_chunks_per_dim,
+                chunk_dimensions,
+            )?);
+        }
+        global_index += nelmts;
+    }
+
+    // 3. Super-block addresses.
+    let mut sblk_addrs: Vec<u64> = Vec::with_capacity(nsblk);
+    for _ in 0..nsblk {
+        sblk_addrs.push(read_offset(&ib, pos, offset_size)?);
+        pos += os;
+    }
+    for (j, &sb_addr) in sblk_addrs.iter().enumerate() {
+        if global_index >= total_elements {
+            break;
+        }
+        let sblk_idx = geom.first_indirect_sblk + j;
+        let (ndblks, dblk_nelmts) = geom.sblks[sblk_idx];
+        let total_in_sb = (ndblks * dblk_nelmts).to_usize()?;
+        if !is_undefined_addr(sb_addr, offset_size) {
+            chunks.extend(read_super_block_from_source(
+                source,
+                sb_addr,
+                ndblks.to_usize()?,
+                dblk_nelmts.to_usize()?,
+                header,
+                offset_size,
+                chunk_byte_size,
+                global_index,
+                total_elements,
+                &num_chunks_per_dim,
+                chunk_dimensions,
+            )?);
+        }
+        global_index += total_in_sb;
+    }
+
+    Ok(chunks)
+}
+
+/// Collect elements from a (non-paged) data block read from the source.
+#[allow(clippy::too_many_arguments)]
+fn read_data_block_elements_from_source<S: FileSource + ?Sized>(
+    source: &S,
+    db_address: u64,
+    nelmts: usize,
+    header: &ExtensibleArrayHeader,
+    offset_size: u8,
+    chunk_byte_size: u64,
+    start_index: usize,
+    total_elements: usize,
+    num_chunks_per_dim: &[u64],
+    chunk_dimensions: &[u32],
+) -> Result<Vec<ChunkInfo>, FormatError> {
+    let os = offset_size as usize;
+    let db_header_size = 4 + 1 + 1 + os;
+    let blk_off_size = (header.max_nelmts_bits as usize).div_ceil(8);
+    let elem_stride = ea_elem_stride(header, offset_size);
+    let limit = total_elements.saturating_sub(start_index).min(nelmts);
+
+    // Prefix + block-offset field + `limit` element slots (we only decode up to
+    // the published count).
+    let elem_bytes = limit
+        .checked_mul(elem_stride)
+        .ok_or(FormatError::OffsetOverflow {
+            offset: limit as u64,
+            length: elem_stride as u64,
+        })?;
+    let region_len = db_header_size + blk_off_size + elem_bytes;
+    let block = source.read_exact_at(db_address, region_len)?;
+    if &block[0..4] != b"EADB" {
+        return Err(FormatError::ChunkedReadError(
+            "invalid Extensible Array data block signature".into(),
+        ));
+    }
+
+    let mut pos = db_header_size + blk_off_size;
+    let mut chunks = Vec::new();
+    for i in 0..limit {
+        let (info, consumed) = read_element(
+            &block,
+            pos,
+            header.client_id,
+            header.element_size,
+            offset_size,
+            chunk_byte_size,
+            start_index + i,
+            num_chunks_per_dim,
+            chunk_dimensions,
+        )?;
+        if let Some(ci) = info {
+            chunks.push(ci);
+        }
+        pos += consumed;
+    }
+    Ok(chunks)
+}
+
+/// Read a paged Extensible Array data block from the source.
+#[allow(clippy::too_many_arguments)]
+fn read_paged_data_block_from_source<S: FileSource + ?Sized>(
+    source: &S,
+    db_address: u64,
+    page_nelmts: usize,
+    npages: usize,
+    db_local_idx: usize,
+    page_bitmap: &[u8],
+    header: &ExtensibleArrayHeader,
+    offset_size: u8,
+    chunk_byte_size: u64,
+    start_index: usize,
+    total_elements: usize,
+    num_chunks_per_dim: &[u64],
+    chunk_dimensions: &[u32],
+) -> Result<Vec<ChunkInfo>, FormatError> {
+    let blk_off_size = (header.max_nelmts_bits as usize).div_ceil(8);
+    let db_header_size = 4 + 1 + 1 + offset_size as usize + blk_off_size + 4;
+    let elem_stride = ea_elem_stride(header, offset_size);
+    let page_stride = page_nelmts
+        .checked_mul(elem_stride)
+        .and_then(|bytes| bytes.checked_add(4))
+        .ok_or(FormatError::OffsetOverflow {
+            offset: page_nelmts as u64,
+            length: elem_stride as u64,
+        })?;
+
+    // Pages are populated sequentially; read only the leading initialized pages.
+    let mut init_pages = 0usize;
+    for page in 0..npages {
+        if !page_is_initialized(page_bitmap, db_local_idx * npages + page) {
+            break;
+        }
+        init_pages += 1;
+    }
+    // Clamp to the bytes actually available (the final partial page may omit its
+    // trailing checksum).
+    let avail = source
+        .len()
+        .saturating_sub(db_address)
+        .to_usize()
+        .unwrap_or(usize::MAX);
+    let pages_bytes = init_pages
+        .checked_mul(page_stride)
+        .ok_or(FormatError::OffsetOverflow {
+            offset: init_pages as u64,
+            length: page_stride as u64,
+        })?;
+    let region_len = (db_header_size + pages_bytes).min(avail);
+    let block = source.read_exact_at(db_address, region_len)?;
+    if block.len() < 4 || &block[0..4] != b"EADB" {
+        return Err(FormatError::ChunkedReadError(
+            "invalid Extensible Array data block signature".into(),
+        ));
+    }
+
+    let mut chunks = Vec::new();
+    let mut pos = db_header_size;
+    for page in 0..npages {
+        let global_page = db_local_idx * npages + page;
+        if !page_is_initialized(page_bitmap, global_page) {
+            break;
+        }
+        let page_start = start_index + page * page_nelmts;
+        let limit = total_elements.saturating_sub(page_start).min(page_nelmts);
+        for i in 0..limit {
+            let (info, consumed) = read_element(
+                &block,
+                pos,
+                header.client_id,
+                header.element_size,
+                offset_size,
+                chunk_byte_size,
+                page_start + i,
+                num_chunks_per_dim,
+                chunk_dimensions,
+            )?;
+            if let Some(ci) = info {
+                chunks.push(ci);
+            }
+            pos += consumed;
+        }
+        if limit < page_nelmts {
+            break;
+        }
+        pos += 4; // page checksum
+    }
+    Ok(chunks)
+}
+
+/// Read a super block (AESB) and its data blocks from the source.
+#[allow(clippy::too_many_arguments)]
+fn read_super_block_from_source<S: FileSource + ?Sized>(
+    source: &S,
+    sb_address: u64,
+    ndblks: usize,
+    nelmts_per_dblk: usize,
+    header: &ExtensibleArrayHeader,
+    offset_size: u8,
+    chunk_byte_size: u64,
+    start_index: usize,
+    total_elements: usize,
+    num_chunks_per_dim: &[u64],
+    chunk_dimensions: &[u32],
+) -> Result<Vec<ChunkInfo>, FormatError> {
+    let os = offset_size as usize;
+    let blk_off_size = (header.max_nelmts_bits as usize).div_ceil(8);
+    let sb_header_size = 4 + 1 + 1 + os + blk_off_size;
+
+    let page_nelmts = 1usize << header.max_dblk_nelmts_bits;
+    let is_paged = nelmts_per_dblk > page_nelmts;
+    let npages = if is_paged {
+        nelmts_per_dblk / page_nelmts
+    } else {
+        0
+    };
+    let bitmap_size = if is_paged {
+        ndblks
+            .checked_mul(npages.div_ceil(8))
+            .ok_or(FormatError::OffsetOverflow {
+                offset: ndblks as u64,
+                length: npages.div_ceil(8) as u64,
+            })?
+    } else {
+        0
+    };
+
+    // Header + (optional) page-init bitmap + data-block addresses.
+    let addr_bytes = ndblks.checked_mul(os).ok_or(FormatError::OffsetOverflow {
+        offset: ndblks as u64,
+        length: os as u64,
+    })?;
+    let region_len = sb_header_size + bitmap_size + addr_bytes;
+    let block = source.read_exact_at(sb_address, region_len)?;
+    if &block[0..4] != b"EASB" {
+        return Err(FormatError::ChunkedReadError(
+            "invalid Extensible Array super block signature".into(),
+        ));
+    }
+
+    let mut pos = sb_header_size;
+    let page_bitmap: Vec<u8> = if is_paged {
+        let bm = block[pos..pos + bitmap_size].to_vec();
+        pos += bitmap_size;
+        bm
+    } else {
+        Vec::new()
+    };
+
+    let mut dblk_addrs: Vec<u64> = Vec::with_capacity(ndblks);
+    for _ in 0..ndblks {
+        dblk_addrs.push(read_offset(&block, pos, offset_size)?);
+        pos += os;
+    }
+
+    let mut chunks = Vec::new();
+    let mut global_idx = start_index;
+    for (db_local, &addr) in dblk_addrs.iter().enumerate() {
+        if !is_undefined_addr(addr, offset_size) {
+            let block_chunks = if is_paged {
+                read_paged_data_block_from_source(
+                    source,
+                    addr,
+                    page_nelmts,
+                    npages,
+                    db_local,
+                    &page_bitmap,
+                    header,
+                    offset_size,
+                    chunk_byte_size,
+                    global_idx,
+                    total_elements,
+                    num_chunks_per_dim,
+                    chunk_dimensions,
+                )?
+            } else {
+                read_data_block_elements_from_source(
+                    source,
+                    addr,
+                    nelmts_per_dblk,
+                    header,
+                    offset_size,
+                    chunk_byte_size,
+                    global_idx,
+                    total_elements,
+                    num_chunks_per_dim,
+                    chunk_dimensions,
+                )?
+            };
+            chunks.extend(block_chunks);
+        }
+        global_idx += nelmts_per_dblk;
+    }
+
+    Ok(chunks)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -912,6 +1346,59 @@ mod tests {
         assert_eq!(chunks[0].chunk_size, chunk_byte_size as u32);
         assert_eq!(chunks[1].address, base_addr + chunk_byte_size);
         assert_eq!(chunks[1].offsets, vec![20]);
+
+        #[cfg(feature = "std")]
+        assert_ea_streams_match(&file_data, aehd_offset, &ds_dims, &chunk_dims, 8, os, ls);
+    }
+
+    /// Assert the streaming Extensible-Array reader matches the buffered one over
+    /// both an in-memory and a `Read+Seek` source.
+    #[cfg(feature = "std")]
+    fn assert_ea_streams_match(
+        file_data: &[u8],
+        aehd_offset: usize,
+        ds_dims: &[u64],
+        chunk_dims: &[u32],
+        element_size: u32,
+        os: u8,
+        ls: u8,
+    ) {
+        use crate::source::{BytesSource, ReadSeekSource};
+        let h = ExtensibleArrayHeader::parse(file_data, aehd_offset, os, ls).unwrap();
+        let buffered =
+            read_extensible_array_chunks(file_data, &h, ds_dims, chunk_dims, element_size, os, ls)
+                .unwrap();
+
+        let mem = BytesSource::new(file_data);
+        let hm =
+            ExtensibleArrayHeader::parse_from_source(&mem, aehd_offset as u64, os, ls).unwrap();
+        let from_mem = read_extensible_array_chunks_from_source(
+            &mem,
+            &hm,
+            ds_dims,
+            chunk_dims,
+            element_size,
+            os,
+            ls,
+        )
+        .unwrap();
+
+        let seek = ReadSeekSource::new(std::io::Cursor::new(file_data.to_vec())).unwrap();
+        let hs =
+            ExtensibleArrayHeader::parse_from_source(&seek, aehd_offset as u64, os, ls).unwrap();
+        let from_seek = read_extensible_array_chunks_from_source(
+            &seek,
+            &hs,
+            ds_dims,
+            chunk_dims,
+            element_size,
+            os,
+            ls,
+        )
+        .unwrap();
+
+        assert_eq!(buffered, from_mem, "BytesSource mismatch");
+        assert_eq!(buffered, from_seek, "ReadSeekSource mismatch");
     }
 
     /// Build a synthetic EA with inline elements + one direct data block.
@@ -1013,6 +1500,68 @@ mod tests {
         for (i, c) in chunks.iter().enumerate() {
             assert_eq!(c.address, base_addr + i as u64 * chunk_byte_size);
             assert_eq!(c.offsets, vec![i as u64 * 10]);
+        }
+
+        #[cfg(feature = "std")]
+        assert_ea_streams_match(&file_data, aehd_offset, &ds_dims, &chunk_dims, 8, os, ls);
+    }
+
+    /// A large Extensible Array built by the writer reaches direct data blocks,
+    /// super blocks, and paged super-block data blocks; the streaming reader
+    /// must reproduce the buffered read across all those layers. Driving the
+    /// layout from the writer avoids hand-building the doubling-table geometry.
+    #[cfg(feature = "std")]
+    #[test]
+    fn streaming_ea_super_blocks_and_paged_match_buffered() {
+        use crate::chunked_write::{WrittenChunk, build_extensible_array_at};
+        use crate::source::{BytesSource, ReadSeekSource};
+
+        // n covers: inline+direct (2000), several super blocks (50000), and
+        // paged super-block data blocks (140000, since dblk_nelmts exceeds the
+        // 1024-element page size at the higher super blocks).
+        for &n in &[2000u64, 50000, 140000] {
+            let chunks: Vec<WrittenChunk> = (0..n)
+                .map(|i| WrittenChunk {
+                    address: 0x10 + i * 8,
+                    compressed_size: 8,
+                    raw_size: 8,
+                    filter_mask: 0,
+                })
+                .collect();
+            let base = 0x1000u64;
+            let ea = build_extensible_array_at(&chunks, 8, 8, false, base).unwrap();
+            let mut file = vec![0u8; base as usize + ea.len()];
+            file[base as usize..].copy_from_slice(&ea);
+
+            let ds_dims = vec![n];
+            let chunk_dims = vec![1u32];
+            let header = ExtensibleArrayHeader::parse(&file, base as usize, 8, 8).unwrap();
+            let buffered =
+                read_extensible_array_chunks(&file, &header, &ds_dims, &chunk_dims, 8, 8, 8)
+                    .unwrap();
+            assert_eq!(buffered.len() as u64, n, "buffered chunk count at n={n}");
+
+            let mem = BytesSource::new(&file);
+            let hm = ExtensibleArrayHeader::parse_from_source(&mem, base, 8, 8).unwrap();
+            let from_mem =
+                read_extensible_array_chunks_from_source(&mem, &hm, &ds_dims, &chunk_dims, 8, 8, 8)
+                    .unwrap();
+
+            let seek = ReadSeekSource::new(std::io::Cursor::new(file)).unwrap();
+            let hs = ExtensibleArrayHeader::parse_from_source(&seek, base, 8, 8).unwrap();
+            let from_seek = read_extensible_array_chunks_from_source(
+                &seek,
+                &hs,
+                &ds_dims,
+                &chunk_dims,
+                8,
+                8,
+                8,
+            )
+            .unwrap();
+
+            assert_eq!(buffered, from_mem, "BytesSource mismatch at n={n}");
+            assert_eq!(buffered, from_seek, "ReadSeekSource mismatch at n={n}");
         }
     }
 

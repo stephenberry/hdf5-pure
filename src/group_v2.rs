@@ -6,7 +6,9 @@
 #[cfg(not(feature = "std"))]
 use alloc::{string::String, vec::Vec};
 
-use crate::btree_v2::{BTreeV2Header, collect_btree_v2_records};
+use crate::btree_v2::{
+    BTreeV2Header, collect_btree_v2_records, collect_btree_v2_records_from_source,
+};
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
 use crate::fractal_heap::FractalHeapHeader;
@@ -15,6 +17,7 @@ use crate::link_info::LinkInfoMessage;
 use crate::link_message::{LinkMessage, LinkTarget};
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
+use crate::source::FileSource;
 use crate::superblock::Superblock;
 use crate::symbol_table::SymbolTableMessage;
 
@@ -237,6 +240,129 @@ pub fn resolve_group_entries(
             "object header is not a group",
         )))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming path resolution (latest-format / v2 groups), reading each metadata
+// structure from a `FileSource` on demand.
+// ---------------------------------------------------------------------------
+
+/// Streaming counterpart of [`resolve_path_any`] for latest-format files.
+///
+/// Resolves a path to an object-header address by reading the object headers
+/// and (for dense groups) the fractal heap + B-tree v2 from a [`FileSource`].
+/// Only v2 (latest-format) groups are supported; a v1 symbol-table group on the
+/// path returns an error (the v1 group traversal is not yet migrated).
+pub fn resolve_path_any_from_source<S: FileSource + ?Sized>(
+    source: &S,
+    superblock: &Superblock,
+    path: &str,
+) -> Result<u64, FormatError> {
+    let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if components.is_empty() {
+        return Ok(superblock.root_group_address);
+    }
+
+    let os = superblock.offset_size;
+    let ls = superblock.length_size;
+    let base = superblock.base_address;
+
+    let mut current_addr = superblock.root_group_address;
+    let mut current_header =
+        ObjectHeader::parse_from_source(source, superblock.root_group_address, os, ls, base)?;
+
+    for (i, component) in components.iter().enumerate() {
+        let entries = resolve_group_entries_from_source(source, &current_header, os, ls)?;
+        match entries.iter().find(|e| e.name == *component) {
+            Some(entry) => {
+                let abs_addr = entry.object_header_address + base;
+                if i == components.len() - 1 {
+                    return Ok(abs_addr);
+                }
+                current_addr = abs_addr;
+                current_header =
+                    ObjectHeader::parse_from_source(source, current_addr, os, ls, base)?;
+            }
+            None => return Err(FormatError::PathNotFound(String::from(*component))),
+        }
+    }
+
+    Ok(current_addr)
+}
+
+/// Streaming counterpart of [`resolve_group_entries`] (v2 groups only).
+pub fn resolve_group_entries_from_source<S: FileSource + ?Sized>(
+    source: &S,
+    object_header: &ObjectHeader,
+    offset_size: u8,
+    length_size: u8,
+) -> Result<Vec<GroupEntry>, FormatError> {
+    if is_v1_group(object_header) {
+        Err(FormatError::PathNotFound(String::from(
+            "v1 (symbol-table) groups are not yet supported by the streaming reader",
+        )))
+    } else if is_v2_group(object_header) {
+        resolve_v2_group_entries_from_source(source, object_header, offset_size, length_size)
+    } else {
+        Err(FormatError::PathNotFound(String::from(
+            "object header is not a group",
+        )))
+    }
+}
+
+fn resolve_v2_group_entries_from_source<S: FileSource + ?Sized>(
+    source: &S,
+    object_header: &ObjectHeader,
+    offset_size: u8,
+    length_size: u8,
+) -> Result<Vec<GroupEntry>, FormatError> {
+    let link_info = find_link_info(object_header, offset_size)?;
+    if let Some(fh_addr) = link_info.fractal_heap_address {
+        resolve_dense_entries_from_source(source, &link_info, fh_addr, offset_size, length_size)
+    } else {
+        // Compact storage: links live in the (already-parsed) object header.
+        resolve_compact_entries(object_header, offset_size)
+    }
+}
+
+fn resolve_dense_entries_from_source<S: FileSource + ?Sized>(
+    source: &S,
+    link_info: &LinkInfoMessage,
+    fh_addr: u64,
+    offset_size: u8,
+    length_size: u8,
+) -> Result<Vec<GroupEntry>, FormatError> {
+    let fh = FractalHeapHeader::parse_from_source(source, fh_addr, offset_size, length_size)?;
+
+    let btree_addr = link_info
+        .btree_name_index_address
+        .ok_or_else(|| FormatError::PathNotFound(String::from("no B-tree v2 name index")))?;
+    let btree_hdr = BTreeV2Header::parse_from_source(source, btree_addr, offset_size, length_size)?;
+    let records =
+        collect_btree_v2_records_from_source(source, &btree_hdr, offset_size, length_size)?;
+
+    let mut entries = Vec::new();
+    for record in &records {
+        let id_offset = if btree_hdr.tree_type == 5 { 4 } else { 8 };
+        if record.data.len() < id_offset + fh.heap_id_length as usize {
+            continue;
+        }
+        let id_bytes = &record.data[id_offset..id_offset + fh.heap_id_length as usize];
+        let link_data = fh.read_managed_object_from_source(source, id_bytes, offset_size)?;
+        let link = LinkMessage::parse(&link_data, offset_size)?;
+        if let LinkTarget::Hard {
+            object_header_address,
+        } = link.link_target
+        {
+            entries.push(GroupEntry {
+                name: link.name,
+                object_header_address,
+                cache_type: 0,
+            });
+        }
+    }
+
+    Ok(entries)
 }
 
 #[cfg(test)]

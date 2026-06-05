@@ -8,6 +8,7 @@ use byteorder::{ByteOrder, LittleEndian};
 
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
+use crate::source::FileSource;
 
 /// Parsed B-tree v2 header (signature "BTHD").
 #[derive(Debug, Clone)]
@@ -159,6 +160,26 @@ impl BTreeV2Header {
             total_records,
         })
     }
+
+    /// Parse a B-tree v2 header from a [`FileSource`].
+    ///
+    /// The header is fully self-contained (signature + fixed fields + a root
+    /// pointer + checksum), so only a small bounded window is read.
+    pub fn parse_from_source<S: FileSource + ?Sized>(
+        source: &S,
+        address: u64,
+        offset_size: u8,
+        length_size: u8,
+    ) -> Result<BTreeV2Header, FormatError> {
+        // 16 fixed prefix bytes + root address + 2 (num records) + total-records
+        // field + 4 checksum; <= 64 with 8-byte offsets/lengths.
+        const MAX_HEADER: u64 = 64;
+        let window = MAX_HEADER
+            .min(source.len().saturating_sub(address))
+            .to_usize()?;
+        let buf = source.read_exact_at(address, window)?;
+        Self::parse(&buf, 0, offset_size, length_size)
+    }
 }
 
 /// Compute maximum records per node for a given depth level.
@@ -257,7 +278,70 @@ fn parse_leaf_records(
     Ok(records)
 }
 
-/// Recursively collect records from an internal node.
+/// Parse an internal node's child pointers from its node bytes (offset 0 = the
+/// "BTIN" signature), returning the `(child_address, child_num_records)` list.
+///
+/// The node's own records sit at `node[6 + i * record_size ..]`; the caller
+/// reads them while interleaving child traversals. Shared by the buffered and
+/// streaming collectors so the child-pointer-width logic lives in one place.
+fn parse_internal_child_pointers(
+    node: &[u8],
+    num_records: u16,
+    depth: u16,
+    record_size: u16,
+    offset_size: u8,
+    max_leaf_nrec: u64,
+) -> Result<Vec<(u64, u16)>, FormatError> {
+    // signature(4) + version(1) + type(1) = 6
+    ensure_len(node, 0, 6)?;
+    if &node[0..4] != b"BTIN" {
+        return Err(FormatError::InvalidBTreeV2Signature);
+    }
+
+    let nr = num_records as usize;
+    let rs = record_size as usize;
+    // Records come first, then the child pointers.
+    let mut pos = 6;
+    ensure_len(node, pos, nr * rs)?;
+    pos += nr * rs;
+
+    // Child-pointer encoding widths (variable, per the HDF5 spec).
+    let child_depth = depth - 1;
+    let max_nrec_child = if child_depth == 0 {
+        max_leaf_nrec
+    } else {
+        // Computing the exact max records at an internal child depth is complex;
+        // a conservative upper bound from the leaf max is sufficient to size the
+        // variable-width nrec field.
+        max_leaf_nrec * 2
+    };
+    let nrec_width = bytes_for_max_records(max_nrec_child);
+
+    let total_nrec_width = if depth > 1 {
+        let max_total = header_max_total_records(max_leaf_nrec, depth - 1);
+        bytes_for_max_records(max_total)
+    } else {
+        0
+    };
+
+    let num_children = nr + 1;
+    let child_ptr_size = offset_size as usize + nrec_width + total_nrec_width;
+    ensure_len(node, pos, num_children * child_ptr_size)?;
+
+    let mut children = Vec::with_capacity(num_children);
+    for _ in 0..num_children {
+        let addr = read_offset(node, pos, offset_size)?;
+        pos += offset_size as usize;
+        let child_nrec = read_var_uint(node, pos, nrec_width)? as u16;
+        pos += nrec_width;
+        pos += total_nrec_width; // skip total-records-in-subtree
+        children.push((addr, child_nrec));
+    }
+
+    Ok(children)
+}
+
+/// Recursively collect records from an internal node (buffered path).
 #[allow(clippy::too_many_arguments, clippy::only_used_in_recursion)]
 fn collect_internal_records(
     file_data: &[u8],
@@ -271,65 +355,30 @@ fn collect_internal_records(
     max_leaf_nrec: u64,
     out: &mut Vec<BTreeV2Record>,
 ) -> Result<(), FormatError> {
-    // signature(4) + version(1) + type(1) = 6
     ensure_len(file_data, offset, 6)?;
-    if &file_data[offset..offset + 4] != b"BTIN" {
-        return Err(FormatError::InvalidBTreeV2Signature);
-    }
+    let node = &file_data[offset..];
+    let children = parse_internal_child_pointers(
+        node,
+        num_records,
+        depth,
+        record_size,
+        offset_size,
+        max_leaf_nrec,
+    )?;
 
     let nr = num_records as usize;
     let rs = record_size as usize;
-    let mut pos = offset + 6;
-
-    // Read all records first
-    ensure_len(file_data, pos, nr * rs)?;
-    let records_start = pos;
-    pos += nr * rs;
-
-    // Compute sizes for child pointers
-    // max_records at child depth - for variable-width nrec encoding
     let child_depth = depth - 1;
-    let max_nrec_child = if child_depth == 0 {
-        max_leaf_nrec
-    } else {
-        // For internal nodes at child_depth, computing max records is complex.
-        // Use a reasonable upper bound from node_size.
-        max_leaf_nrec * 2 // conservative estimate
-    };
-    let nrec_width = bytes_for_max_records(max_nrec_child);
 
-    // Total records in subtree width (only if depth > 1)
-    let total_nrec_width = if depth > 1 {
-        // Width to hold total records in a subtree
-        // We compute max possible total records at this subtree depth
-        let max_total = header_max_total_records(max_leaf_nrec, depth - 1);
-        bytes_for_max_records(max_total)
-    } else {
-        0
-    };
-
-    let num_children = nr + 1;
-    let child_ptr_size = offset_size as usize + nrec_width + total_nrec_width;
-    ensure_len(file_data, pos, num_children * child_ptr_size)?;
-
-    // Read child pointers
-    let mut children = Vec::with_capacity(num_children);
-    for _ in 0..num_children {
-        let addr = read_offset(file_data, pos, offset_size)?;
-        pos += offset_size as usize;
-        let child_nrec = read_var_uint(file_data, pos, nrec_width)? as u16;
-        pos += nrec_width;
-        pos += total_nrec_width; // skip total records in subtree
-        children.push((addr, child_nrec));
-    }
-
-    // Interleave: child[0], record[0], child[1], record[1], ..., child[nr]
-    // We collect child[0] records, then record[0], then child[1], etc.
+    // Interleave: child[0], record[0], child[1], record[1], ..., child[nr].
     for (i, &(child_addr, child_nrec)) in children.iter().enumerate() {
         if child_depth == 0 {
-            let leaf_recs =
-                parse_leaf_records(file_data, child_addr.to_usize()?, child_nrec, record_size)?;
-            out.extend(leaf_recs);
+            out.extend(parse_leaf_records(
+                file_data,
+                child_addr.to_usize()?,
+                child_nrec,
+                record_size,
+            )?);
         } else {
             collect_internal_records(
                 file_data,
@@ -345,11 +394,100 @@ fn collect_internal_records(
             )?;
         }
 
-        // Add record[i] (except after the last child)
         if i < nr {
-            let rec_start = records_start + i * rs;
+            let start = 6 + i * rs;
             out.push(BTreeV2Record {
-                data: file_data[rec_start..rec_start + rs].to_vec(),
+                data: node[start..start + rs].to_vec(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Collect all records from a B-tree v2 by traversing from the root, reading
+/// each fixed-size node from a [`FileSource`] on demand rather than indexing a
+/// whole-file buffer.
+pub fn collect_btree_v2_records_from_source<S: FileSource + ?Sized>(
+    source: &S,
+    header: &BTreeV2Header,
+    offset_size: u8,
+    _length_size: u8,
+) -> Result<Vec<BTreeV2Record>, FormatError> {
+    if header.total_records == 0 || header.num_records_in_root == 0 {
+        return Ok(Vec::new());
+    }
+    let max_leaf_nrec = max_records_leaf(header.node_size, header.record_size);
+    let mut records = Vec::new();
+    collect_node_from_source(
+        source,
+        header.root_node_address,
+        header.num_records_in_root,
+        header.depth,
+        header.record_size,
+        header.node_size,
+        offset_size,
+        max_leaf_nrec,
+        &mut records,
+    )?;
+    Ok(records)
+}
+
+/// Read and collect one node (leaf or internal) from the source, recursing into
+/// children. Mirrors the buffered [`collect_btree_v2_records`] traversal and
+/// produces records in the same order.
+#[allow(clippy::too_many_arguments)]
+fn collect_node_from_source<S: FileSource + ?Sized>(
+    source: &S,
+    address: u64,
+    num_records: u16,
+    depth: u16,
+    record_size: u16,
+    node_size: u32,
+    offset_size: u8,
+    max_leaf_nrec: u64,
+    out: &mut Vec<BTreeV2Record>,
+) -> Result<(), FormatError> {
+    // Every node occupies `node_size` bytes; read that window (clamped to the
+    // bytes available, in case the final node abuts EOF).
+    let node_len = u64::from(node_size)
+        .min(source.len().saturating_sub(address))
+        .to_usize()?;
+    let node = source.read_exact_at(address, node_len)?;
+
+    if depth == 0 {
+        out.extend(parse_leaf_records(&node, 0, num_records, record_size)?);
+        return Ok(());
+    }
+
+    let children = parse_internal_child_pointers(
+        &node,
+        num_records,
+        depth,
+        record_size,
+        offset_size,
+        max_leaf_nrec,
+    )?;
+
+    let nr = num_records as usize;
+    let rs = record_size as usize;
+    let child_depth = depth - 1;
+    for (i, &(child_addr, child_nrec)) in children.iter().enumerate() {
+        collect_node_from_source(
+            source,
+            child_addr,
+            child_nrec,
+            child_depth,
+            record_size,
+            node_size,
+            offset_size,
+            max_leaf_nrec,
+            out,
+        )?;
+        if i < nr {
+            let start = 6 + i * rs;
+            out.push(BTreeV2Record {
+                data: node[start..start + rs].to_vec(),
             });
         }
     }
@@ -475,5 +613,47 @@ mod tests {
         let hdr = BTreeV2Header::parse(&header, 0, 8, 8).unwrap();
         let records = collect_btree_v2_records(&header, &hdr, 8, 8).unwrap();
         assert!(records.is_empty());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn streaming_btree_matches_buffered() {
+        use crate::source::{BytesSource, ReadSeekSource};
+        let rec1 = [1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        let rec2 = [11u8, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21];
+        let leaf = build_leaf_node(5, &[&rec1, &rec2]);
+        let leaf_offset = 256usize;
+        let header = build_btree_v2_header(5, 512, 11, 0, leaf_offset as u64, 2, 2, 8, 8);
+        let mut file_data = vec![0u8; 512];
+        file_data[..header.len()].copy_from_slice(&header);
+        file_data[leaf_offset..leaf_offset + leaf.len()].copy_from_slice(&leaf);
+
+        let hdr = BTreeV2Header::parse(&file_data, 0, 8, 8).unwrap();
+        let buffered: Vec<_> = collect_btree_v2_records(&file_data, &hdr, 8, 8)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.data)
+            .collect();
+
+        let mem = BytesSource::new(&file_data);
+        let hdr_mem = BTreeV2Header::parse_from_source(&mem, 0, 8, 8).unwrap();
+        assert_eq!(hdr_mem.root_node_address, hdr.root_node_address);
+        let from_mem: Vec<_> = collect_btree_v2_records_from_source(&mem, &hdr_mem, 8, 8)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.data)
+            .collect();
+
+        let seek = ReadSeekSource::new(std::io::Cursor::new(file_data)).unwrap();
+        let hdr_seek = BTreeV2Header::parse_from_source(&seek, 0, 8, 8).unwrap();
+        let from_seek: Vec<_> = collect_btree_v2_records_from_source(&seek, &hdr_seek, 8, 8)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.data)
+            .collect();
+
+        assert_eq!(buffered, from_mem);
+        assert_eq!(buffered, from_seek);
+        assert_eq!(from_seek.len(), 2);
     }
 }

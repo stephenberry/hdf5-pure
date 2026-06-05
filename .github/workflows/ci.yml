@@ -208,6 +208,7 @@ jobs:
           --no-default-features
           --features "std checksum deflate zfp serde ndarray provenance fast-checksum"
           --lib --test write_read_roundtrip --test serde_roundtrip --test zfp_roundtrip
+          --test streaming_reader
 
   # Bare-metal no_std build: proves the crate links without `std` on a genuine
   # `none` target (the existing no-std-check only runs on the std-capable host).

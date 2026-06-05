@@ -8,6 +8,24 @@ use byteorder::{ByteOrder, LittleEndian};
 
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
+use crate::source::FileSource;
+
+/// A child entry of a fractal-heap indirect block: either a direct block (a leaf
+/// holding object bytes) or a nested indirect block. Returned by
+/// [`FractalHeapHeader::find_child_for_offset`] so the buffered and streaming
+/// readers share the indirect-block navigation logic.
+enum HeapChild {
+    Direct {
+        addr: u64,
+        block_size: u64,
+        heap_offset: u64,
+    },
+    Indirect {
+        addr: u64,
+        nrows: u16,
+        heap_offset: u64,
+    },
+}
 
 /// Parsed fractal heap header (signature "FRHP").
 #[derive(Debug, Clone)]
@@ -338,6 +356,106 @@ impl FractalHeapHeader {
         Ok(file_data[pos..pos + length].to_vec())
     }
 
+    /// Locate the indirect-block child whose heap range contains `target_offset`.
+    ///
+    /// `block` is the indirect block's bytes (offset 0 = the "FHIB" signature).
+    /// Walks the direct-block rows then the indirect-block rows, accumulating the
+    /// heap-offset cursor exactly as the on-disk doubling table prescribes, and
+    /// returns the matching child (or `None`). Shared by the buffered and
+    /// streaming readers so this navigation lives in one place.
+    fn find_child_for_offset(
+        &self,
+        block: &[u8],
+        nrows: u16,
+        iblock_heap_offset: u64,
+        target_offset: u64,
+        offset_size: u8,
+    ) -> Result<Option<HeapChild>, FormatError> {
+        ensure_len(block, 0, 4)?;
+        if &block[0..4] != b"FHIB" {
+            return Err(FormatError::InvalidFractalHeapSignature);
+        }
+
+        let block_offset_bytes = (self.max_heap_size as usize).div_ceil(8);
+        let iblock_header = 5 + offset_size as usize + block_offset_bytes;
+        let mut pos = iblock_header;
+        let tw = self.table_width as u64;
+        let nrows_usize = nrows as usize;
+        let start_indirect = self.starting_row_of_indirect_blocks as usize;
+        let max_direct_rows = nrows_usize.min(start_indirect);
+        let mut current_heap_offset = iblock_heap_offset;
+
+        // Direct-block rows.
+        for row in 0..max_direct_rows {
+            let block_size = self.block_size_for_row(row);
+            for _col in 0..tw {
+                let child_addr = read_offset(block, pos, offset_size)?;
+                pos += offset_size as usize;
+                if self.io_filter_encoded_length > 0 {
+                    // filtered_size + filter_mask — filtered direct blocks are not
+                    // yet supported; skip the (simplified) trailing field.
+                    pos += 4;
+                }
+                if !is_undefined(child_addr, offset_size) {
+                    let block_end = current_heap_offset + block_size;
+                    if target_offset >= current_heap_offset && target_offset < block_end {
+                        return Ok(Some(HeapChild::Direct {
+                            addr: child_addr,
+                            block_size,
+                            heap_offset: current_heap_offset,
+                        }));
+                    }
+                }
+                current_heap_offset += block_size;
+            }
+        }
+
+        // Indirect-block rows.
+        for row in start_indirect..nrows_usize {
+            let child_nrows = row - start_indirect + 1;
+            let total_child_space = self.indirect_block_heap_size(child_nrows);
+            for _col in 0..tw {
+                let child_addr = read_offset(block, pos, offset_size)?;
+                pos += offset_size as usize;
+                if !is_undefined(child_addr, offset_size) {
+                    let block_end = current_heap_offset + total_child_space;
+                    if target_offset >= current_heap_offset && target_offset < block_end {
+                        return Ok(Some(HeapChild::Indirect {
+                            addr: child_addr,
+                            nrows: child_nrows as u16,
+                            heap_offset: current_heap_offset,
+                        }));
+                    }
+                }
+                current_heap_offset += total_child_space;
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Byte length of the entry region of an indirect block with `nrows` rows
+    /// (header + per-row child pointers), used to size the read window for the
+    /// streaming reader.
+    fn indirect_block_entries_len(&self, nrows: u16, offset_size: u8) -> usize {
+        let block_offset_bytes = (self.max_heap_size as usize).div_ceil(8);
+        let iblock_header = 5 + offset_size as usize + block_offset_bytes;
+        let start_indirect = self.starting_row_of_indirect_blocks as usize;
+        let nrows_usize = nrows as usize;
+        let max_direct_rows = nrows_usize.min(start_indirect);
+        let num_indirect_rows = nrows_usize.saturating_sub(start_indirect);
+        let direct_entry = offset_size as usize
+            + if self.io_filter_encoded_length > 0 {
+                4
+            } else {
+                0
+            };
+        let tw = self.table_width as usize;
+        iblock_header
+            + max_direct_rows * tw * direct_entry
+            + num_indirect_rows * tw * (offset_size as usize)
+    }
+
     /// Read an object by traversing an indirect block to find the right direct block.
     #[allow(clippy::too_many_arguments)]
     fn read_from_indirect_block(
@@ -356,99 +474,180 @@ impl FractalHeapHeader {
                 "fractal heap: maximum recursion depth exceeded".into(),
             ));
         }
-        // Parse indirect block header
         ensure_len(file_data, iblock_addr, 4)?;
-        if &file_data[iblock_addr..iblock_addr + 4] != b"FHIB" {
-            return Err(FormatError::InvalidFractalHeapSignature);
+        let block = &file_data[iblock_addr..];
+        match self.find_child_for_offset(
+            block,
+            nrows,
+            iblock_heap_offset,
+            target_offset,
+            offset_size,
+        )? {
+            Some(HeapChild::Direct {
+                addr,
+                block_size,
+                heap_offset,
+            }) => self.read_from_direct_block(
+                file_data,
+                addr.to_usize()?,
+                block_size,
+                heap_offset,
+                target_offset,
+                length,
+                offset_size,
+            ),
+            Some(HeapChild::Indirect {
+                addr,
+                nrows: child_nrows,
+                heap_offset,
+            }) => self.read_from_indirect_block(
+                file_data,
+                addr.to_usize()?,
+                child_nrows,
+                heap_offset,
+                target_offset,
+                length,
+                offset_size,
+                depth_remaining - 1,
+            ),
+            None => Err(FormatError::UnexpectedEof {
+                expected: target_offset.to_usize()?.saturating_add(length),
+                available: file_data.len(),
+            }),
         }
+    }
 
-        let block_offset_bytes = (self.max_heap_size as usize).div_ceil(8);
-        let iblock_header = 5 + offset_size as usize + block_offset_bytes;
-        let mut pos = iblock_addr + iblock_header;
+    // -----------------------------------------------------------------------
+    // Streaming readers (fetch each block from a `FileSource` on demand)
+    // -----------------------------------------------------------------------
 
-        // Compute block sizes for each row using the doubling table
-        let tw = self.table_width as u64;
+    /// Parse a fractal heap header from a [`FileSource`] (small bounded window).
+    pub fn parse_from_source<S: FileSource + ?Sized>(
+        source: &S,
+        address: u64,
+        offset_size: u8,
+        length_size: u8,
+    ) -> Result<FractalHeapHeader, FormatError> {
+        // The FRHP header is bounded: with 8-byte offsets/lengths it is ~170
+        // bytes; 256 is a safe window.
+        const MAX_HEADER: u64 = 256;
+        let window = MAX_HEADER
+            .min(source.len().saturating_sub(address))
+            .to_usize()?;
+        let buf = source.read_exact_at(address, window)?;
+        Self::parse(&buf, 0, offset_size, length_size)
+    }
 
-        let nrows_usize = nrows as usize;
-
-        // Build table of (block_size, heap_offset) for each child entry
-        let mut current_heap_offset = iblock_heap_offset;
-
-        // Count direct block entries vs indirect block entries
-        let start_indirect = self.starting_row_of_indirect_blocks as usize;
-
-        // Read child addresses for direct block rows
-        let max_direct_rows = nrows_usize.min(start_indirect);
-
-        for row in 0..max_direct_rows {
-            let block_size = self.block_size_for_row(row);
-
-            for _col in 0..tw {
-                let child_addr = read_offset(file_data, pos, offset_size)?;
-                pos += offset_size as usize;
-
-                if self.io_filter_encoded_length > 0 {
-                    // filtered_size(length_size) + filter_mask(4)
-                    // Skip for now - we don't handle filtered direct blocks in fractal heaps
-                    pos += 4; // filter_mask - simplified
-                }
-
-                if !is_undefined(child_addr, offset_size) {
-                    let block_end = current_heap_offset + block_size;
-                    if target_offset >= current_heap_offset && target_offset < block_end {
-                        return self.read_from_direct_block(
-                            file_data,
-                            child_addr.to_usize()?,
-                            block_size,
-                            current_heap_offset,
-                            target_offset,
-                            length,
-                            offset_size,
-                        );
-                    }
-                }
-                current_heap_offset += block_size;
-            }
+    /// Read a managed object from the heap (by raw heap ID) via a [`FileSource`].
+    pub fn read_managed_object_from_source<S: FileSource + ?Sized>(
+        &self,
+        source: &S,
+        id_bytes: &[u8],
+        offset_size: u8,
+    ) -> Result<Vec<u8>, FormatError> {
+        let (heap_offset, obj_len) = self.decode_managed_id(id_bytes)?;
+        if is_undefined(self.root_block_address, offset_size) {
+            return Err(FormatError::UnexpectedEof {
+                expected: 1,
+                available: 0,
+            });
         }
-
-        // If we have indirect block rows
-        for row in start_indirect..nrows_usize {
-            let block_size = self.block_size_for_row(row);
-            let child_nrows = row - start_indirect + 1;
-
-            for _col in 0..tw {
-                let child_addr = read_offset(file_data, pos, offset_size)?;
-                pos += offset_size as usize;
-
-                if !is_undefined(child_addr, offset_size) {
-                    // Calculate total heap space covered by this indirect block child
-                    let total_child_space = self.indirect_block_heap_size(child_nrows);
-                    let block_end = current_heap_offset + total_child_space;
-                    if target_offset >= current_heap_offset && target_offset < block_end {
-                        return self.read_from_indirect_block(
-                            file_data,
-                            child_addr.to_usize()?,
-                            child_nrows as u16,
-                            current_heap_offset,
-                            target_offset,
-                            length,
-                            offset_size,
-                            depth_remaining - 1,
-                        );
-                    }
-                    current_heap_offset += total_child_space;
-                } else {
-                    let total_child_space = self.indirect_block_heap_size(child_nrows);
-                    current_heap_offset += total_child_space;
-                }
-            }
-            let _ = block_size;
+        if self.current_rows_in_root_indirect_block == 0 {
+            self.read_from_direct_block_from_source(
+                source,
+                self.root_block_address,
+                0, // root direct block starts at heap offset 0
+                heap_offset,
+                obj_len.to_usize()?,
+            )
+        } else {
+            self.read_from_indirect_block_from_source(
+                source,
+                self.root_block_address,
+                self.current_rows_in_root_indirect_block,
+                0,
+                heap_offset,
+                obj_len.to_usize()?,
+                offset_size,
+                64,
+            )
         }
+    }
 
-        Err(FormatError::UnexpectedEof {
-            expected: target_offset.to_usize()?.saturating_add(length),
-            available: file_data.len(),
-        })
+    fn read_from_direct_block_from_source<S: FileSource + ?Sized>(
+        &self,
+        source: &S,
+        block_addr: u64,
+        block_heap_offset: u64,
+        target_offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, FormatError> {
+        let local_offset = target_offset - block_heap_offset;
+        let pos = block_addr
+            .checked_add(local_offset)
+            .ok_or(FormatError::OffsetOverflow {
+                offset: block_addr,
+                length: local_offset,
+            })?;
+        source.read_exact_at(pos, length)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_from_indirect_block_from_source<S: FileSource + ?Sized>(
+        &self,
+        source: &S,
+        iblock_addr: u64,
+        nrows: u16,
+        iblock_heap_offset: u64,
+        target_offset: u64,
+        length: usize,
+        offset_size: u8,
+        depth_remaining: u16,
+    ) -> Result<Vec<u8>, FormatError> {
+        if depth_remaining == 0 {
+            return Err(FormatError::ChunkedReadError(
+                "fractal heap: maximum recursion depth exceeded".into(),
+            ));
+        }
+        let region_len = (self.indirect_block_entries_len(nrows, offset_size) as u64)
+            .min(source.len().saturating_sub(iblock_addr))
+            .to_usize()?;
+        let block = source.read_exact_at(iblock_addr, region_len)?;
+        match self.find_child_for_offset(
+            &block,
+            nrows,
+            iblock_heap_offset,
+            target_offset,
+            offset_size,
+        )? {
+            Some(HeapChild::Direct {
+                addr, heap_offset, ..
+            }) => self.read_from_direct_block_from_source(
+                source,
+                addr,
+                heap_offset,
+                target_offset,
+                length,
+            ),
+            Some(HeapChild::Indirect {
+                addr,
+                nrows: child_nrows,
+                heap_offset,
+            }) => self.read_from_indirect_block_from_source(
+                source,
+                addr,
+                child_nrows,
+                heap_offset,
+                target_offset,
+                length,
+                offset_size,
+                depth_remaining - 1,
+            ),
+            None => Err(FormatError::UnexpectedEof {
+                expected: target_offset.to_usize()?.saturating_add(length),
+                available: source.len().to_usize().unwrap_or(usize::MAX),
+            }),
+        }
     }
 
     /// Get block size for a given row in the doubling table.
@@ -658,6 +857,41 @@ mod tests {
 
         let obj = hdr.read_managed_object(&file_data, &id, 8).unwrap();
         assert_eq!(&obj, b"Hello, World!");
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn streaming_managed_object_matches_buffered() {
+        use crate::source::{BytesSource, ReadSeekSource};
+        let (file_data, _) = build_simple_heap(8, 8);
+
+        // Same heap ID as `read_managed_object_from_direct_block`.
+        let hdr = FractalHeapHeader::parse(&file_data, 0, 8, 8).unwrap();
+        let dblock_header_size = 5 + 8 + (hdr.max_heap_size as usize).div_ceil(8);
+        let payload = (dblock_header_size as u64) | (13u64 << hdr.max_heap_size);
+        let mut id = vec![0u8; 7];
+        for i in 0..6 {
+            id[1 + i] = ((payload >> (i * 8)) & 0xFF) as u8;
+        }
+
+        let buffered = hdr.read_managed_object(&file_data, &id, 8).unwrap();
+
+        // Header parsed from a source, then the object fetched from a source.
+        let mem = BytesSource::new(&file_data);
+        let hdr_mem = FractalHeapHeader::parse_from_source(&mem, 0, 8, 8).unwrap();
+        let from_mem = hdr_mem
+            .read_managed_object_from_source(&mem, &id, 8)
+            .unwrap();
+
+        let seek = ReadSeekSource::new(std::io::Cursor::new(file_data)).unwrap();
+        let hdr_seek = FractalHeapHeader::parse_from_source(&seek, 0, 8, 8).unwrap();
+        let from_seek = hdr_seek
+            .read_managed_object_from_source(&seek, &id, 8)
+            .unwrap();
+
+        assert_eq!(buffered, from_mem);
+        assert_eq!(buffered, from_seek);
+        assert_eq!(&from_seek, b"Hello, World!");
     }
 
     #[test]

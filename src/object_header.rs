@@ -8,6 +8,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use crate::convert::{TryToUsize, slice_range};
 use crate::error::FormatError;
 use crate::message_type::MessageType;
+use crate::source::FileSource;
 
 /// OHDR signature for v2 object headers.
 const OHDR_SIGNATURE: [u8; 4] = [b'O', b'H', b'D', b'R'];
@@ -385,7 +386,9 @@ impl ObjectHeader {
             &mut continuations,
         )?;
 
-        // Follow continuations (limit to prevent cycles in malformed data)
+        // Follow continuations (limit to prevent cycles in malformed data).
+        // Offsets are u64 file offsets; in this buffered path they index the
+        // in-memory image, so narrow (checked) to usize here.
         let mut cont_remaining = 256u16;
         while let Some((cont_offset, cont_length)) = continuations.pop() {
             if cont_remaining == 0 {
@@ -394,8 +397,8 @@ impl ObjectHeader {
             cont_remaining -= 1;
             Self::parse_v2_continuation(
                 data,
-                cont_offset,
-                cont_length,
+                cont_offset.to_usize()?,
+                cont_length.to_usize()?,
                 has_creation_order,
                 offset_size,
                 length_size,
@@ -425,7 +428,7 @@ impl ObjectHeader {
         offset_size: u8,
         length_size: u8,
         messages: &mut Vec<HeaderMessage>,
-        continuations: &mut Vec<(usize, usize)>,
+        continuations: &mut Vec<(u64, u64)>,
     ) -> Result<(), FormatError> {
         let msg_header_size = if has_creation_order { 6 } else { 4 };
         let mut pos = start;
@@ -457,11 +460,13 @@ impl ObjectHeader {
             let msg_data = data[pos..pos + msg_data_size].to_vec();
 
             if msg_type == MessageType::ObjectHeaderContinuation {
-                // Parse continuation offset/length from message data
+                // The continuation offset/length are file offsets; keep them as
+                // u64 so the driver (buffered or streaming) can fetch that
+                // region — a streaming reader can then follow a continuation
+                // past 4 GiB on a 32-bit host.
                 if msg_data.len() >= (offset_size as usize + length_size as usize) {
-                    let cont_off = read_offset(&msg_data, 0, offset_size)?.to_usize()?;
-                    let cont_len =
-                        read_offset(&msg_data, offset_size as usize, length_size)?.to_usize()?;
+                    let cont_off = read_offset(&msg_data, 0, offset_size)?;
+                    let cont_len = read_offset(&msg_data, offset_size as usize, length_size)?;
                     continuations.push((cont_off, cont_len));
                 }
             } else if msg_type != MessageType::Nil {
@@ -489,7 +494,7 @@ impl ObjectHeader {
         offset_size: u8,
         length_size: u8,
         messages: &mut Vec<HeaderMessage>,
-        continuations: &mut Vec<(usize, usize)>,
+        continuations: &mut Vec<(u64, u64)>,
     ) -> Result<(), FormatError> {
         // OCHK signature(4) + messages + checksum(4)
         ensure_len(data, offset, length)?;
@@ -530,6 +535,303 @@ impl ObjectHeader {
             messages,
             continuations,
         )
+    }
+
+    // -----------------------------------------------------------------------
+    // Streaming parsers (read each header chunk from a `FileSource` on demand)
+    // -----------------------------------------------------------------------
+
+    /// Parse an object header from a [`FileSource`], reading each header chunk
+    /// (and continuation chunk) as a small bounded window via
+    /// [`FileSource::read_at`] rather than indexing a whole-file buffer.
+    ///
+    /// `base_address` is added to v1 continuation offsets (as in
+    /// [`Self::parse_with_base`]). The result is identical to the buffered
+    /// parser; this path simply never holds more than one chunk at a time, so it
+    /// works against a file larger than the address space on a 32-bit host.
+    pub fn parse_from_source<S: FileSource + ?Sized>(
+        source: &S,
+        address: u64,
+        offset_size: u8,
+        length_size: u8,
+        base_address: u64,
+    ) -> Result<ObjectHeader, FormatError> {
+        let mut sig = [0u8; 4];
+        source.read_at(address, &mut sig)?;
+        if sig == OHDR_SIGNATURE {
+            Self::parse_v2_from_source(source, address, offset_size, length_size)
+        } else {
+            Self::parse_v1_from_source(source, address, offset_size, length_size, base_address)
+        }
+    }
+
+    fn parse_v2_from_source<S: FileSource + ?Sized>(
+        source: &S,
+        address: u64,
+        offset_size: u8,
+        length_size: u8,
+    ) -> Result<ObjectHeader, FormatError> {
+        // The v2 prefix is bounded: sig(4) + ver(1) + flags(1) + optional
+        // timestamps(16) + optional attribute thresholds(4) + chunk0-size
+        // field(<=8) = at most 34 bytes. Read that window, then the chunk0 body.
+        const MAX_PREFIX: u64 = 4 + 1 + 1 + 16 + 4 + 8;
+        let head_len = MAX_PREFIX
+            .min(source.len().saturating_sub(address))
+            .to_usize()?;
+        let head = source.read_exact_at(address, head_len)?;
+        if head.len() < 6 {
+            return Err(FormatError::UnexpectedEof {
+                expected: 6,
+                available: head.len(),
+            });
+        }
+        let version = head[4];
+        if version != 2 {
+            return Err(FormatError::InvalidObjectHeaderVersion(version));
+        }
+        let flags = head[5];
+        let mut pos = 6usize;
+
+        let (access_time, modification_time, change_time, birth_time) = if flags & 0x20 != 0 {
+            ensure_len(&head, pos, 16)?;
+            let at = LittleEndian::read_u32(&head[pos..pos + 4]);
+            let mt = LittleEndian::read_u32(&head[pos + 4..pos + 8]);
+            let ct = LittleEndian::read_u32(&head[pos + 8..pos + 12]);
+            let bt = LittleEndian::read_u32(&head[pos + 12..pos + 16]);
+            pos += 16;
+            (Some(at), Some(mt), Some(ct), Some(bt))
+        } else {
+            (None, None, None, None)
+        };
+
+        if flags & 0x10 != 0 {
+            ensure_len(&head, pos, 4)?;
+            pos += 4;
+        }
+
+        let chunk_size_width = match flags & 0x03 {
+            0 => 1u8,
+            1 => 2,
+            2 => 4,
+            3 => 8,
+            _ => unreachable!(),
+        };
+        ensure_len(&head, pos, chunk_size_width as usize)?;
+        let chunk0_size = read_offset(&head, pos, chunk_size_width)?.to_usize()?;
+        pos += chunk_size_width as usize;
+        let prefix_len = pos;
+
+        // The chunk0 body (prefix + messages + 4-byte checksum) is contiguous
+        // from `address`; read it all so the checksum covers the same bytes the
+        // buffered parser hashes.
+        let chunk0_end = prefix_len
+            .checked_add(chunk0_size)
+            .ok_or(FormatError::UnexpectedEof {
+                expected: usize::MAX,
+                available: head.len(),
+            })?;
+        let chunk0_total =
+            (chunk0_end as u64)
+                .checked_add(4)
+                .ok_or(FormatError::OffsetOverflow {
+                    offset: chunk0_end as u64,
+                    length: 4,
+                })?;
+        let chunk0 = source.read_exact_at(address, chunk0_total.to_usize()?)?;
+
+        #[cfg(feature = "checksum")]
+        {
+            let stored = LittleEndian::read_u32(&chunk0[chunk0_end..chunk0_end + 4]);
+            let computed = crate::checksum::jenkins_lookup3(&chunk0[..chunk0_end]);
+            if computed != stored {
+                return Err(FormatError::ChecksumMismatch {
+                    expected: stored,
+                    computed,
+                });
+            }
+        }
+
+        let has_creation_order = flags & 0x04 != 0;
+        let mut messages = Vec::new();
+        let mut continuations: Vec<(u64, u64)> = Vec::new();
+        Self::parse_v2_messages(
+            &chunk0,
+            prefix_len,
+            chunk0_end,
+            has_creation_order,
+            offset_size,
+            length_size,
+            &mut messages,
+            &mut continuations,
+        )?;
+
+        // Follow continuations by reading each (bounded) chunk from the source.
+        let mut cont_remaining = 256u16;
+        while let Some((cont_off, cont_len)) = continuations.pop() {
+            if cont_remaining == 0 {
+                return Err(FormatError::NestingDepthExceeded);
+            }
+            cont_remaining -= 1;
+            let cont_len = cont_len.to_usize()?;
+            let region = source.read_exact_at(cont_off, cont_len)?;
+            Self::parse_v2_continuation(
+                &region,
+                0,
+                cont_len,
+                has_creation_order,
+                offset_size,
+                length_size,
+                &mut messages,
+                &mut continuations,
+            )?;
+        }
+
+        Ok(ObjectHeader {
+            version: 2,
+            messages,
+            reference_count: None,
+            flags,
+            access_time,
+            modification_time,
+            change_time,
+            birth_time,
+        })
+    }
+
+    fn parse_v1_from_source<S: FileSource + ?Sized>(
+        source: &S,
+        address: u64,
+        offset_size: u8,
+        length_size: u8,
+        base_address: u64,
+    ) -> Result<ObjectHeader, FormatError> {
+        // version(1) + reserved(1) + num_messages(2) + ref_count(4) +
+        // header_size(4) = 12, padded to 16 before the first message.
+        let prefix = source.read_exact_at(address, 16)?;
+        let version = prefix[0];
+        if version != 1 {
+            return Err(FormatError::InvalidObjectHeaderVersion(version));
+        }
+        let num_messages = LittleEndian::read_u16(&prefix[2..4]);
+        let reference_count = LittleEndian::read_u32(&prefix[4..8]);
+        let header_data_size = u64::from(LittleEndian::read_u32(&prefix[8..12]));
+
+        let mut messages = Vec::new();
+        Self::parse_v1_chunk_from_source(
+            source,
+            address + 16,
+            header_data_size,
+            num_messages,
+            offset_size,
+            length_size,
+            base_address,
+            32,
+            &mut messages,
+        )?;
+
+        Ok(ObjectHeader {
+            version: 1,
+            messages,
+            reference_count: Some(reference_count),
+            flags: 0,
+            access_time: None,
+            modification_time: None,
+            change_time: None,
+            birth_time: None,
+        })
+    }
+
+    /// Parse the messages of one v1 header chunk read from the source, following
+    /// each continuation depth-first (as the buffered v1 parser does) so the
+    /// resulting message order is identical.
+    #[allow(clippy::too_many_arguments)]
+    fn parse_v1_chunk_from_source<S: FileSource + ?Sized>(
+        source: &S,
+        region_addr: u64,
+        region_len: u64,
+        max_messages: u16,
+        offset_size: u8,
+        length_size: u8,
+        base_address: u64,
+        depth_remaining: u16,
+        messages: &mut Vec<HeaderMessage>,
+    ) -> Result<(), FormatError> {
+        if depth_remaining == 0 {
+            return Err(FormatError::NestingDepthExceeded);
+        }
+        let region = source.read_exact_at(region_addr, region_len.to_usize()?)?;
+        let end = region.len();
+        let mut pos = 0usize;
+        let mut count = 0u16;
+
+        while count < max_messages && pos + 8 <= end {
+            let msg_type_raw = LittleEndian::read_u16(&region[pos..pos + 2]);
+            let msg_data_size = LittleEndian::read_u16(&region[pos + 2..pos + 4]) as usize;
+            let msg_flags = region[pos + 4];
+            // reserved(3) at pos+5..pos+8
+            pos += 8;
+
+            if pos + msg_data_size > end {
+                break;
+            }
+            count += 1;
+
+            let msg_type = MessageType::from_u16(msg_type_raw);
+            if let MessageType::Unknown(id) = msg_type
+                && msg_flags & 0x08 != 0
+            {
+                return Err(FormatError::UnsupportedMessage(id));
+            }
+
+            let msg_data = region[pos..pos + msg_data_size].to_vec();
+            pos += msg_data_size;
+
+            // Decode the continuation pointer (if any) before the message data is
+            // moved into the list; the message itself is kept, matching the
+            // buffered parser, and then followed depth-first.
+            let cont = if msg_type == MessageType::ObjectHeaderContinuation
+                && msg_data.len() >= (offset_size as usize + length_size as usize)
+            {
+                let off_raw = read_offset(&msg_data, 0, offset_size)?;
+                let len = read_offset(&msg_data, offset_size as usize, length_size)?;
+                Some((off_raw, len))
+            } else {
+                None
+            };
+
+            if msg_type != MessageType::Nil {
+                messages.push(HeaderMessage {
+                    msg_type,
+                    size: msg_data_size,
+                    flags: msg_flags,
+                    creation_order: None,
+                    data: msg_data,
+                });
+            }
+
+            if let Some((off_raw, len)) = cont {
+                let cont_off =
+                    off_raw
+                        .checked_add(base_address)
+                        .ok_or(FormatError::OffsetOverflow {
+                            offset: off_raw,
+                            length: base_address,
+                        })?;
+                Self::parse_v1_chunk_from_source(
+                    source,
+                    cont_off,
+                    len,
+                    u16::MAX,
+                    offset_size,
+                    length_size,
+                    base_address,
+                    depth_remaining - 1,
+                    messages,
+                )?;
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -820,5 +1122,107 @@ mod tests {
         let data = [b'O', b'H', b'D', b'R', 2]; // signature + version, but no flags
         let err = ObjectHeader::parse(&data, 0, 8, 8).unwrap_err();
         assert!(matches!(err, FormatError::UnexpectedEof { .. }));
+    }
+
+    // ---- Streaming parser equivalence -------------------------------------
+
+    #[cfg(feature = "std")]
+    fn assert_same_header(a: &ObjectHeader, b: &ObjectHeader) {
+        assert_eq!(a.version, b.version);
+        assert_eq!(a.reference_count, b.reference_count);
+        assert_eq!(a.flags, b.flags);
+        assert_eq!(a.access_time, b.access_time);
+        assert_eq!(a.modification_time, b.modification_time);
+        assert_eq!(a.messages.len(), b.messages.len(), "message count");
+        for (i, (x, y)) in a.messages.iter().zip(&b.messages).enumerate() {
+            assert_eq!(x.msg_type, y.msg_type, "msg {i} type");
+            assert_eq!(x.size, y.size, "msg {i} size");
+            assert_eq!(x.flags, y.flags, "msg {i} flags");
+            assert_eq!(x.creation_order, y.creation_order, "msg {i} creation_order");
+            assert_eq!(x.data, y.data, "msg {i} data");
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn parse_three_ways(file_data: Vec<u8>, os: u8, ls: u8, base: u64) {
+        use crate::source::{BytesSource, ReadSeekSource};
+        let buffered = ObjectHeader::parse_with_base(&file_data, 0, os, ls, base).unwrap();
+        let from_mem =
+            ObjectHeader::parse_from_source(&BytesSource::new(&file_data), 0, os, ls, base)
+                .unwrap();
+        let from_seek = ObjectHeader::parse_from_source(
+            &ReadSeekSource::new(std::io::Cursor::new(file_data)).unwrap(),
+            0,
+            os,
+            ls,
+            base,
+        )
+        .unwrap();
+        assert_same_header(&buffered, &from_mem);
+        assert_same_header(&buffered, &from_seek);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn streaming_v2_simple_matches_buffered() {
+        let header = build_v2_header(0x20, &[(0x01, &[1, 2, 3], 0)], Some((1, 2, 3, 4)));
+        parse_three_ways(header, 8, 8, 0);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn streaming_v2_with_continuation_matches_buffered() {
+        // A v2 header at offset 0 whose continuation points to an OCHK chunk at
+        // offset 256 — the streaming parser must read that second chunk from the
+        // source and produce the same messages in the same order.
+        let ochk_msg_data = [0xDE, 0xAD];
+        let mut ochk_buf = Vec::new();
+        ochk_buf.extend_from_slice(&OCHK_SIGNATURE);
+        ochk_buf.push(0x03); // Datatype
+        ochk_buf.extend_from_slice(&(ochk_msg_data.len() as u16).to_le_bytes());
+        ochk_buf.push(0);
+        ochk_buf.extend_from_slice(&ochk_msg_data);
+        let cks = crate::checksum::jenkins_lookup3(&ochk_buf);
+        ochk_buf.extend_from_slice(&cks.to_le_bytes());
+
+        let ochk_offset = 256usize;
+        let mut cont_data = Vec::new();
+        cont_data.extend_from_slice(&(ochk_offset as u64).to_le_bytes());
+        cont_data.extend_from_slice(&(ochk_buf.len() as u64).to_le_bytes());
+
+        let header = build_v2_header(0x00, &[(0x01, &[42], 0), (0x10, &cont_data, 0)], None);
+        let mut file_data = vec![0u8; ochk_offset + ochk_buf.len()];
+        file_data[..header.len()].copy_from_slice(&header);
+        file_data[ochk_offset..ochk_offset + ochk_buf.len()].copy_from_slice(&ochk_buf);
+
+        parse_three_ways(file_data, 8, 8, 0);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn streaming_v1_with_continuation_matches_buffered() {
+        // A v1 header whose continuation points to a raw-message chunk at offset
+        // 256 (v1 continuations have no signature). The buffered parser keeps the
+        // continuation message in the list and follows it depth-first; the
+        // streaming parser must do the same.
+        let cont_msg_data = [0xBE, 0xEF];
+        let mut cont_chunk = Vec::new();
+        cont_chunk.extend_from_slice(&0x03u16.to_le_bytes()); // Datatype
+        cont_chunk.extend_from_slice(&(cont_msg_data.len() as u16).to_le_bytes());
+        cont_chunk.push(0);
+        cont_chunk.extend_from_slice(&[0u8; 3]); // reserved
+        cont_chunk.extend_from_slice(&cont_msg_data);
+
+        let cont_offset = 256usize;
+        let mut cont_ptr = Vec::new();
+        cont_ptr.extend_from_slice(&(cont_offset as u64).to_le_bytes());
+        cont_ptr.extend_from_slice(&(cont_chunk.len() as u64).to_le_bytes());
+
+        let header = build_v1_header(&[(0x01, &[42][..], 0), (0x10, &cont_ptr[..], 0)], 8, 8);
+        let mut file_data = vec![0u8; cont_offset + cont_chunk.len()];
+        file_data[..header.len()].copy_from_slice(&header);
+        file_data[cont_offset..cont_offset + cont_chunk.len()].copy_from_slice(&cont_chunk);
+
+        parse_three_ways(file_data, 8, 8, 0);
     }
 }
