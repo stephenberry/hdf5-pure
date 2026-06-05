@@ -112,7 +112,28 @@ pub trait FileSource {
     ///
     /// Convenience wrapper over [`read_at`](FileSource::read_at) for callers that
     /// want an owned buffer; the lazy backends keep no more than this resident.
+    ///
+    /// The request is bounds-checked against [`len`](FileSource::len) *before* the
+    /// buffer is allocated. The metadata parsers feed `len` values straight from
+    /// the file (a chunk-0 body size, a continuation-block length, a heap object
+    /// size), so a malformed file could otherwise name a multi-gigabyte length
+    /// and make this reserve `vec![0u8; len]` up front only for the read to fail
+    /// EOF anyway — a cheap denial of service. Rejecting an out-of-range request
+    /// before allocating avoids that; the error returned is identical to the one
+    /// the underlying [`read_at`](FileSource::read_at) would have produced.
     fn read_exact_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
+        let end = offset
+            .checked_add(len as u64)
+            .ok_or(FormatError::OffsetOverflow {
+                offset,
+                length: len as u64,
+            })?;
+        if end > self.len() {
+            return Err(FormatError::UnexpectedEof {
+                expected: end.to_usize().unwrap_or(usize::MAX),
+                available: self.len().to_usize().unwrap_or(usize::MAX),
+            });
+        }
         let mut buf = vec![0u8; len];
         self.read_at(offset, &mut buf)?;
         Ok(buf)
@@ -459,6 +480,20 @@ mod tests {
         ));
         // Zero-length read at EOF succeeds.
         src.read_at(8, &mut []).unwrap();
+    }
+
+    #[test]
+    fn read_exact_at_rejects_oversized_len_without_allocating() {
+        // A length far larger than the source must error cleanly rather than
+        // attempt to reserve the buffer first. Before the pre-allocation bounds
+        // check, this called `vec![0u8; usize::MAX]` and aborted the process.
+        let src = BytesSource::new(vec![1u8, 2, 3, 4]);
+        assert!(matches!(
+            src.read_exact_at(0, usize::MAX).unwrap_err(),
+            FormatError::UnexpectedEof { .. }
+        ));
+        // A read that fits is unaffected.
+        assert_eq!(src.read_exact_at(1, 3).unwrap(), vec![2, 3, 4]);
     }
 
     #[test]
