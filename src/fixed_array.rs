@@ -216,7 +216,7 @@ pub fn read_fixed_array_chunks(
     };
 
     let num_elements = header.num_elements.to_usize()?;
-    let page_size = (1u64 << header.max_nelmts_bits) as usize;
+    let page_size = (1u64 << header.max_nelmts_bits).to_usize()?;
     let is_paged = num_elements > page_size;
 
     let mut chunks = Vec::new();
