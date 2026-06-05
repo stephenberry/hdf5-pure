@@ -558,10 +558,11 @@ pub fn read_chunked_data(
 /// Read a chunked dataset from a [`FileSource`], reading the chunk index and
 /// each chunk's bytes on demand via `read_at`.
 ///
-/// Streaming counterpart of [`read_chunked_data`]. Supports the B-tree v1 (v3),
-/// single-chunk, and implicit (v4 index types 1 and 2) indexes; the Fixed-Array
-/// and Extensible-Array indexes (v4 index types 3 and 4) are a follow-up and
-/// currently return a clear error. The decompression is sequential.
+/// Streaming counterpart of [`read_chunked_data`], with the same chunk-index
+/// coverage: the B-tree v1 (v3) index and the v4 single-chunk, implicit,
+/// Fixed-Array, and Extensible-Array indexes (index types 1-4). A v4 index
+/// type 5 (version-2 B-tree) is not supported, matching the buffered reader.
+/// The decompression is sequential.
 pub fn read_chunked_data_from_source<S: FileSource + ?Sized>(
     source: &S,
     layout: &DataLayout,

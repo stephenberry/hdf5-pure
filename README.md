@@ -56,7 +56,7 @@ println!("version: {:?}", attrs.get("version"));  // Some(I64(2))
 
 ### Streaming large files
 
-`File::open(path)` reads the whole file into memory. To read a file too large to buffer (for example a multi-gigabyte file produced on a 32-bit host, where it exceeds the address space), open it with `File::open_streaming(path)` instead. It fetches metadata and dataset chunks from the file on demand rather than buffering it whole, so peak memory stays close to one chunk plus the metadata being parsed.
+`File::open(path)` reads the whole file into memory. To read a file too large to buffer (for example a multi-gigabyte file produced on a 32-bit host, where it exceeds the address space), open it with `File::open_streaming(path)` instead. It fetches metadata and dataset chunks from the file on demand rather than buffering it whole, so it never holds the entire file in memory at once: peak memory tracks the data you actually read (one dataset, decompressed, with its chunks fetched on demand) plus the metadata being parsed, not the whole file.
 
 ```rust
 use hdf5_pure::File;
