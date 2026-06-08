@@ -102,6 +102,29 @@ jobs:
           tool: cargo-shear
       - run: cargo shear
 
+  # Detect accidental or unversioned public-API changes by diffing the crate
+  # against the latest version published to crates.io. A breaking change (e.g.
+  # removing a `pub fn`) fails the job unless the version in Cargo.toml is
+  # bumped accordingly (under 0.x, breaking changes require a minor bump).
+  #
+  # `parallel_read`/`lane_partition` are gated behind `parallel`, so the feature
+  # set below must enable the public-API-bearing features to see their surface.
+  # `fast-deflate` is omitted (a flate2 backend swap, no API delta) along with
+  # `matio-crosscheck` (test-only, links system libmatio).
+  semver-checks:
+    name: SemVer (cargo-semver-checks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: semver-checks
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          feature-group: default-features
+          features: serde,zfp,fast-checksum,provenance,parallel,ndarray
+
   # ===========================================================================
   # 32-bit / no_std compatibility (issue #27).
   #
