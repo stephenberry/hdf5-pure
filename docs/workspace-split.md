@@ -1,0 +1,118 @@
+# Workspace split design (issue #33 follow-up)
+
+Status: proposal. No code has moved yet. This document records the dependency analysis, the crate boundaries that are actually achievable, the publish model, and a phased migration plan, so the split can be executed (or rejected) as its own tracked effort.
+
+## Motivation
+
+`hdf5-pure` is a single ~40.8k-LoC crate with ~50 top-level modules. Consequences:
+
+- Every edit recompiles the whole crate; there is no incremental boundary.
+- Optional functionality is expressed with `#[cfg(feature = "...")]` scattered across modules instead of crate-level separation.
+- Nearly every module is `pub mod` at the crate root, so the public API surface is enormous and accidental (issue #33, a dead `pub fn` that shipped in 0.8.0, is a direct symptom).
+
+Splitting into a Cargo workspace addresses the first two structurally and gives us a natural place to tighten the third.
+
+## Hard constraint: read and write are one strongly-connected component
+
+Rust forbids circular dependencies *between crates*. The data engine has genuine mutual recursion that a naive "read crate vs write crate" split cannot honor. The verified edges:
+
+```
+chunk_cache      -> chunked_read
+chunked_read     -> chunk_cache, extensible_array, fixed_array, filters, ...
+extensible_array -> chunked_read, chunked_write          <-- depends on BOTH directions
+fixed_array      -> chunked_read
+chunked_write    -> chunked_read, chunk_cache, extensible_array, file_writer
+file_writer      -> chunked_write, data_read, attribute, type_builders, metadata_index, ...
+data_read        -> chunked_read
+metadata_index   -> chunked_write, type_builders
+type_builders    -> chunked_write, attribute
+attribute        -> data_read
+```
+
+`extensible_array` depends on both `chunked_read` and `chunked_write`; `file_writer` and `chunked_write` are mutually dependent; `data_read`/`attribute`/`type_builders`/`metadata_index` close further loops. Collapsed, these modules form a single strongly-connected component (SCC) that must live in **one** crate.
+
+This is the central finding: **you cannot get separate read and write crates without first inverting some of these dependencies through traits.** That refactor is possible (see "Breaking the SCC" below) but is a larger, behavior-touching change and is out of scope for the first split.
+
+Everything *below* the SCC (primitives, format structures, filters) and *above* it (the thin high-level API, the MAT subsystem) separates cleanly.
+
+## Proposed crates
+
+Six library crates plus a facade. Validated acyclic: every cross-crate `use crate::` edge points to the same or a lower layer (0 upward edges).
+
+| Crate          | LoC    | Depends on                  | Contents |
+|----------------|--------|-----------------------------|----------|
+| `hdf5-core`    | 1,919  | (none)                      | `error`, `convert`, `message_type`, `nosync`, `checksum`, `signature`, `source` |
+| `hdf5-format`  | 9,254  | core                        | `dataspace`, `datatype`, `data_layout`, `link_message`, `link_info`, `group_info`, `attribute_info`, `btree_v1`, `btree_v2`, `local_heap`, `global_heap`, `symbol_table`, `fractal_heap`, `shared_message`, `object_header`, `object_header_writer`, `vl_data`, `superblock` |
+| `hdf5-filters` | 5,518  | core, format                | `filter_pipeline`, `filters`, `scaleoffset`, `zfp` (`zfp` feature) |
+| `hdf5-engine`  | 14,177 | core, format, filters       | the SCC: `chunk_cache`, `chunked_read`, `chunked_write`, `extensible_array`, `fixed_array`, `lane_partition`, `parallel_read`, `data_read`, `file_writer`, `metadata_index`, `type_builders`, `attribute`, `group_v1`, `group_v2`, `provenance` |
+| `hdf5-api`     | 2,642  | engine                      | `reader`, `writer`, `types`, `swmr_writer`, `ndarray_support` (the std/ndarray-gated high-level surface) |
+| `hdf5-mat`     | 7,155  | api                         | `mat/**` (MATLAB v7.3 serde; `serde` feature) |
+| `hdf5-pure`    | facade | api, mat                    | re-exports only; owns the feature flags and the published API |
+
+LoC figures are measured from the current tree and will drift as code changes.
+
+### Why the engine stays large
+
+`hdf5-engine` (~14k LoC) is the irreducible SCC plus the format-orchestration around it. It is the one crate that does not subdivide under the no-cycle rule. The high-level API (`hdf5-api`) peels off above it only because nothing in the SCC depends back on `reader`/`writer`/`types`/`swmr_writer`/`ndarray_support` (verified).
+
+## Feature flags
+
+Features stay defined on the facade `hdf5-pure` and forward to the sub-crates:
+
+- `std` -> enables `hdf5-api` (and the std paths in core/source).
+- `parallel` -> enables `lane_partition`/`parallel_read` inside `hdf5-engine` (via an `hdf5-engine/parallel` feature).
+- `zfp` -> `hdf5-filters/zfp`.
+- `deflate` / `fast-deflate` / `checksum` / `fast-checksum` -> core/filters as appropriate.
+- `provenance` -> `hdf5-engine/provenance`.
+- `ndarray` -> `hdf5-api/ndarray`.
+- `serde` -> enables `hdf5-mat`.
+- `matio-crosscheck` -> stays a test-only feature on the facade (or on `hdf5-mat`).
+
+Each sub-crate keeps only the `#[cfg]`s relevant to its own contents, which removes most of the cross-cutting `cfg` scatter.
+
+## Publish model: single facade crate
+
+Decision: **only `hdf5-pure` is published to crates.io.** The six sub-crates are workspace members referenced by path and version; they are not separately published, versioned, or documented for external use.
+
+Rationale:
+
+- Users see no change: `hdf5_pure::...` paths and the crate name stay identical.
+- One version, one `cargo publish`, one changelog. No N-crate version lockstep.
+- The internal boundaries can be renamed or re-drawn later without a public break, because nothing external depends on them directly.
+
+Consequence for the facade: because the current crate exposes almost every module as `pub mod`, the facade must re-export all of those paths (`pub use hdf5_engine::chunked_read;` etc.) to keep the public API byte-for-byte compatible. `cargo-semver-checks` (now in CI) will enforce that during the migration.
+
+### Recommended follow-up (separate, breaking): shrink the public surface
+
+Exposing every internal module is the root cause of issue #33. Once the workspace exists, a *separate* 0.x-minor (breaking) release should demote internal modules from `pub` to `pub(crate)`/crate-private and keep only the curated surface (`File`, `Dataset`, `Group`, `FileBuilder`, `SwmrWriter`, the `type_builders` makers, `ScaleOffset`, `Error`/`FormatError`, `H5Element`). That is intentionally not part of the split itself, so the split can land as a non-breaking internal refactor.
+
+## Phased migration
+
+Each phase compiles and passes the full test suite on its own; land them as separate PRs.
+
+1. **Scaffold the workspace.** Add `[workspace]` to the root manifest, create `crates/hdf5-core` and move the 7 core modules. Repoint `crate::` -> `hdf5_core::` in movers; the main crate depends on it by path. Smallest, safest first move.
+2. **`hdf5-format`.** Move the 18 structure modules. Largest single mechanical move; no logic changes.
+3. **`hdf5-filters`.** Move the 4 filter modules; wire the `zfp`/`deflate` features through.
+4. **`hdf5-engine`.** Move the SCC as one unit (it cannot be subdivided). Wire `parallel`/`provenance`.
+5. **`hdf5-api`.** Move the 5 high-level modules; wire `std`/`ndarray`.
+6. **`hdf5-mat`.** Move `mat/**`; wire `serde`.
+7. **Reduce the facade to re-exports.** `src/lib.rs` becomes `pub use` lines only. Confirm `cargo-semver-checks` reports no public-API change versus the pre-split release.
+
+Throughout: `cargo fmt --check`, `cargo clippy -D warnings`, the full feature matrix, the no_std build, and the 32-bit jobs must stay green (CI already covers these). The cast-ratchet baseline in CI is measured on the whole crate and may need re-pointing per sub-crate.
+
+## Breaking the SCC (optional, later)
+
+If separate read/write crates are ever wanted, the SCC must be cut with dependency inversion. The two load-bearing back-edges are:
+
+- `extensible_array` / `fixed_array` -> `chunked_write` (the index structures call into the writer). Invert by having the writer pass in a trait the index implements, rather than the index reaching up to the writer.
+- `file_writer` <-> `chunked_write`. Define a `ChunkSink`/`DatasetWriter` trait in a lower crate that `file_writer` implements and `chunked_write` consumes.
+
+This is real refactoring with test surface, tracked separately from the mechanical split. The mechanical split above delivers most of the compile-time and separation benefit without it.
+
+## Expected benefits and their limits
+
+- **Separation of concerns / smaller public surface:** the biggest, most durable win. Internals stop being addressable from outside; `#[cfg]` scatter collapses to crate boundaries.
+- **Incremental compile:** editing `hdf5-filters` (which holds the 2.9k-LoC `zfp.rs`) or `hdf5-format` no longer forces a full-crate rebuild of unrelated code. The win is bounded by the linear `core -> format -> filters -> engine` chain and by the engine remaining one ~14k-LoC unit; `hdf5-mat` and `hdf5-api` are the most independently rebuildable.
+- **Testing:** each layer gets its own test target and can be exercised in isolation.
+
+The split is feasible and low-risk as a mechanical refactor under the single-facade model. It does not, by itself, shrink the engine or break the read/write coupling; those are separate, deliberately-scoped follow-ups.
