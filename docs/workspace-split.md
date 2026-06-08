@@ -29,11 +29,17 @@ type_builders    -> chunked_write, attribute
 attribute        -> data_read
 ```
 
-`extensible_array` depends on both `chunked_read` and `chunked_write`; `file_writer` and `chunked_write` are mutually dependent; `data_read`/`attribute`/`type_builders`/`metadata_index` close further loops. Collapsed, these modules form a single strongly-connected component (SCC) that must live in **one** crate.
+`extensible_array` depends on both `chunked_read` and `chunked_write`; `file_writer` and `chunked_write` are mutually dependent; `data_read`/`attribute`/`type_builders`/`metadata_index` close further loops (the edges above are an illustrative subset, not the full set). Collapsed, these modules form a single strongly-connected component (SCC) that must live in **one** crate.
 
-This is the central finding: **you cannot get separate read and write crates without first inverting some of these dependencies through traits.** That refactor is possible (see "Breaking the SCC" below) but is a larger, behavior-touching change and is out of scope for the first split.
+The SCC is larger than the short list above: a Tarjan run over the extracted edge set (see "Methodology") puts **14 of the 15 engine modules in one SCC** — `chunk_cache`, `chunked_read`, `chunked_write`, `extensible_array`, `fixed_array`, `data_read`, `file_writer`, `metadata_index`, `type_builders`, `attribute`, `group_v1`, `group_v2`, `provenance`, and `parallel_read`. They are all mutually reachable through the core loop (for example `file_writer -> group_v2 -> data_read -> chunked_read -> extensible_array -> chunked_write -> file_writer`, and `file_writer <-> provenance` is a direct two-cycle). The **only** engine module outside the SCC is `lane_partition`: it has zero outgoing `crate::` edges, so it is a pure leaf, not part of the cycle. (`lane_partition` could therefore be pushed down into a lower crate, but it is only used by the engine's parallel path and gains nothing from moving, so it stays.) This makes the central finding stronger, not weaker: the engine is essentially irreducible.
+
+That central finding: **you cannot get separate read and write crates without first inverting some of these dependencies through traits.** That refactor is possible (see "Breaking the SCC" below) but is a larger, behavior-touching change and is out of scope for the first split.
 
 Everything *below* the SCC (primitives, format structures, filters) and *above* it (the thin high-level API, the MAT subsystem) separates cleanly.
+
+### Methodology
+
+The dependency graph in this document was derived mechanically: extract every `use crate::<module>` / `crate::<module>::` reference from each source file (matching module names that include digits, e.g. `group_v1`), collapse the `mat/**` subtree to a single node, build the directed module graph, and run Tarjan's algorithm for the SCCs plus a layer-assignment check for upward edges. It is reproducible from the current tree, not hand-curated.
 
 ## Proposed crates
 
@@ -44,9 +50,9 @@ Six library crates plus a facade. Validated acyclic: every cross-crate `use crat
 | `hdf5-core`    | 1,919  | (none)                      | `error`, `convert`, `message_type`, `nosync`, `checksum`, `signature`, `source` |
 | `hdf5-format`  | 9,254  | core                        | `dataspace`, `datatype`, `data_layout`, `link_message`, `link_info`, `group_info`, `attribute_info`, `btree_v1`, `btree_v2`, `local_heap`, `global_heap`, `symbol_table`, `fractal_heap`, `shared_message`, `object_header`, `object_header_writer`, `vl_data`, `superblock` |
 | `hdf5-filters` | 5,518  | core, format                | `filter_pipeline`, `filters`, `scaleoffset`, `zfp` (`zfp` feature) |
-| `hdf5-engine`  | 14,177 | core, format, filters       | the SCC: `chunk_cache`, `chunked_read`, `chunked_write`, `extensible_array`, `fixed_array`, `lane_partition`, `parallel_read`, `data_read`, `file_writer`, `metadata_index`, `type_builders`, `attribute`, `group_v1`, `group_v2`, `provenance` |
+| `hdf5-engine`  | 14,177 | core, format, filters       | the 14-module SCC (`chunk_cache`, `chunked_read`, `chunked_write`, `extensible_array`, `fixed_array`, `parallel_read`, `data_read`, `file_writer`, `metadata_index`, `type_builders`, `attribute`, `group_v1`, `group_v2`, `provenance`) plus the `lane_partition` leaf |
 | `hdf5-api`     | 2,642  | engine                      | `reader`, `writer`, `types`, `swmr_writer`, `ndarray_support` (the std/ndarray-gated high-level surface) |
-| `hdf5-mat`     | 7,155  | api                         | `mat/**` (MATLAB v7.3 serde; `serde` feature) |
+| `hdf5-mat`     | 7,155  | api **and** engine          | `mat/**` (MATLAB v7.3 serde; `serde` feature) — reaches `file_writer`/`type_builders` (engine) directly, not only `reader`/`writer`/`types` (api) |
 | `hdf5-pure`    | facade | api, mat                    | re-exports only; owns the feature flags and the published API |
 
 LoC figures are measured from the current tree and will drift as code changes.
@@ -81,6 +87,8 @@ Rationale:
 - The internal boundaries can be renamed or re-drawn later without a public break, because nothing external depends on them directly.
 
 Consequence for the facade: because the current crate exposes almost every module as `pub mod`, the facade must re-export all of those paths (`pub use hdf5_engine::chunked_read;` etc.) to keep the public API byte-for-byte compatible. `cargo-semver-checks` (now in CI) will enforce that during the migration.
+
+A subtlety the per-crate manifests must account for: **internal crates have internal consumers, not just the facade.** A module's dependency edges do not all point at the layer directly below it. `hdf5-mat`, for instance, uses `file_writer` and `type_builders` (engine, layer 3) directly, not only the `reader`/`writer`/`types` wrappers in `hdf5-api` (layer 4) — so `hdf5-mat` must depend on both `hdf5-api` and `hdf5-engine` (or `hdf5-api` must re-export those engine items for it). Either way the graph stays acyclic (engine is below mat), but whoever wires `Cargo.toml` cannot assume each crate depends solely on the one beneath it.
 
 ### Recommended follow-up (separate, breaking): shrink the public surface
 
