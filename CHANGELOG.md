@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-06-08
+
+### Removed
+
+- `parallel_read::decompress_chunks_parallel` and `parallel_read::decompress_chunks_sequential` ([#33](https://github.com/stephenberry/hdf5-pure/issues/33)). Both were public but never called: `decompress_chunks_parallel` was a legacy `par_iter` decompression path superseded by the lane-partitioned implementation that the reader actually uses, and `decompress_chunks_sequential` duplicated a fallback that `chunked_read` already implements inline. They were reachable only with the `parallel` feature enabled and have no realistic use outside the crate. Removing them is a breaking change to that feature's public surface, hence the `0.x.0` bump; code using the reader and writer APIs is unaffected. CI now runs [`cargo-semver-checks`](https://github.com/obi1kenobi/cargo-semver-checks) against the last published release so an unintended public-API change like this is caught before it ships.
+
 ## [0.8.0] - 2026-06-05
 
 ### Added
@@ -65,7 +71,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The MAT serde deserializer now flattens 1×N and N×1 `Matrix` / `ComplexMatrix` values to a 1-D sequence inside `deserialize_any`, matching the existing behavior of `deserialize_seq`. This means untagged enums, `serde::de::Content` roundtrips, and custom `Visitor` impls that previously discriminated on the 2-D rows-of-rows shape when one axis was 1 will now see a flat sequence. Values with both axes greater than 1 still surface as a 2-D rows-of-rows.
 - Numeric / complex dataset readers no longer collapse a 1×N or N×1 dataset to a flat vector at the value layer. Shape is preserved through `MatValue::Matrix` / `ComplexMatrix`, and any flattening for `Vec<T>` callers happens at the serde-deserializer level (above). Direct consumers of `pub(crate)` value APIs are unaffected; this is an internal cleanup that fixes column-vector roundtrip ambiguity.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/stephenberry/hdf5-pure/releases/tag/v0.6.0
