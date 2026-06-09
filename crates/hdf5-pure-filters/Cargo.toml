@@ -16,8 +16,8 @@ fast-deflate = ["flate2/zlib-ng"]
 zfp = []
 
 [dependencies]
-hdf5-pure-core = { path = "../hdf5-pure-core", version = "=0.9.0", default-features = false }
-hdf5-pure-format = { path = "../hdf5-pure-format", version = "=0.9.0", default-features = false }
+hdf5-pure-core = { workspace = true }
+hdf5-pure-format = { workspace = true }
 flate2 = { version = "1", optional = true, default-features = false, features = ["rust_backend"] }
 
 [lints]

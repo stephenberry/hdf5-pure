@@ -14,7 +14,7 @@ std = ["hdf5-pure-core/std"]
 checksum = ["hdf5-pure-core/checksum"]
 
 [dependencies]
-hdf5-pure-core = { path = "../hdf5-pure-core", version = "=0.9.0", default-features = false }
+hdf5-pure-core = { workspace = true }
 byteorder = { version = "1", default-features = false }
 
 [lints]

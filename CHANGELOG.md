@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-06-09
+
 ### Changed
 
 - **Internal refactor: `hdf5-pure` is now a Cargo workspace** ([#34](https://github.com/stephenberry/hdf5-pure/issues/34)). The single crate was split into six internal sub-crates layered `hdf5-pure-core` → `hdf5-pure-format` → `hdf5-pure-filters` → `hdf5-pure-engine` → `hdf5-pure-api` → `hdf5-pure-mat`, with `hdf5-pure` re-exporting them as the facade. **There is no change to the public API or to how you depend on the crate:** `cargo add hdf5-pure` still pulls one dependency, all `hdf5_pure::...` paths are byte-for-byte identical, and the same features (`std`, `serde`, `zfp`, `ndarray`, `parallel`, `provenance`, `deflate`/`fast-deflate`, `checksum`/`fast-checksum`) behave the same. The split tightens internal boundaries, collapses the cross-cutting `#[cfg]` scatter to crate lines, and makes the layers independently compilable and testable. The read/write data engine is one strongly-connected component and therefore stays in a single crate (`hdf5-pure-engine`); see `docs/workspace-split.md` for the dependency analysis and the friction points encountered (notably that `cargo-semver-checks` cannot introspect a facade's cross-crate re-exports, so CI now semver-checks each sub-crate rather than the facade).

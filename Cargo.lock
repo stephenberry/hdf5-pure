@@ -304,7 +304,7 @@ dependencies = [
 
 [[package]]
 name = "hdf5-pure"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "hdf5-metno",
  "hdf5-pure-api",
@@ -321,7 +321,7 @@ dependencies = [
 
 [[package]]
 name = "hdf5-pure-api"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "hdf5-metno",
  "hdf5-pure",
@@ -332,14 +332,14 @@ dependencies = [
 
 [[package]]
 name = "hdf5-pure-core"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "crc32fast",
 ]
 
 [[package]]
 name = "hdf5-pure-engine"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "hdf5-pure",
  "hdf5-pure-core",
@@ -353,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "hdf5-pure-filters"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "flate2",
  "hdf5-pure-core",
@@ -362,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "hdf5-pure-format"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "byteorder",
  "hdf5-pure-core",
@@ -370,7 +370,7 @@ dependencies = [
 
 [[package]]
 name = "hdf5-pure-mat"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "hdf5-pure",
  "hdf5-pure-api",

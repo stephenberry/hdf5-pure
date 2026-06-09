@@ -2,10 +2,24 @@
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.9.0"
+version = "0.9.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/stephenberry/hdf5-pure"
+
+# Internal sub-crate dependencies, declared once so a release bumps the version
+# in a single place (here + `[workspace.package]` above). Every consumer uses
+# `default-features = false`, so that is centralized here too. Members reference
+# these with `{ workspace = true }` (adding `features`/`optional` as needed).
+# `path` + exact `version` means local builds use the workspace path while
+# published builds resolve the version-locked crate from crates.io.
+[workspace.dependencies]
+hdf5-pure-core = { path = "crates/hdf5-pure-core", version = "=0.9.1", default-features = false }
+hdf5-pure-format = { path = "crates/hdf5-pure-format", version = "=0.9.1", default-features = false }
+hdf5-pure-filters = { path = "crates/hdf5-pure-filters", version = "=0.9.1", default-features = false }
+hdf5-pure-engine = { path = "crates/hdf5-pure-engine", version = "=0.9.1", default-features = false }
+hdf5-pure-api = { path = "crates/hdf5-pure-api", version = "=0.9.1", default-features = false }
+hdf5-pure-mat = { path = "crates/hdf5-pure-mat", version = "=0.9.1", default-features = false }
 
 [workspace.lints.clippy]
 # Low-level binary format code naturally has many fields per call site
@@ -75,12 +89,12 @@ serde = ["std", "hdf5-pure-mat/serde"]
 matio-crosscheck = ["serde"]
 
 [dependencies]
-hdf5-pure-core = { path = "crates/hdf5-pure-core", version = "=0.9.0", default-features = false }
-hdf5-pure-format = { path = "crates/hdf5-pure-format", version = "=0.9.0", default-features = false }
-hdf5-pure-filters = { path = "crates/hdf5-pure-filters", version = "=0.9.0", default-features = false }
-hdf5-pure-engine = { path = "crates/hdf5-pure-engine", version = "=0.9.0", default-features = false }
-hdf5-pure-api = { path = "crates/hdf5-pure-api", version = "=0.9.0", optional = true, default-features = false }
-hdf5-pure-mat = { path = "crates/hdf5-pure-mat", version = "=0.9.0", optional = true, default-features = false }
+hdf5-pure-core = { workspace = true }
+hdf5-pure-format = { workspace = true }
+hdf5-pure-filters = { workspace = true }
+hdf5-pure-engine = { workspace = true }
+hdf5-pure-api = { workspace = true, optional = true }
+hdf5-pure-mat = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"

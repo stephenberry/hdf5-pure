@@ -20,9 +20,9 @@ provenance = ["dep:sha2"]
 ndarray = ["dep:ndarray", "std"]
 
 [dependencies]
-hdf5-pure-core = { path = "../hdf5-pure-core", version = "=0.9.0", default-features = false }
-hdf5-pure-format = { path = "../hdf5-pure-format", version = "=0.9.0", default-features = false }
-hdf5-pure-filters = { path = "../hdf5-pure-filters", version = "=0.9.0", default-features = false }
+hdf5-pure-core = { workspace = true }
+hdf5-pure-format = { workspace = true }
+hdf5-pure-filters = { workspace = true }
 rayon = { version = "1", optional = true }
 sha2 = { version = "0.10", optional = true, default-features = false }
 ndarray = { version = ">=0.16, <0.18", optional = true }
