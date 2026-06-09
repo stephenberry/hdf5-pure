@@ -1,0 +1,18 @@
+[package]
+name = "hdf5-core"
+description = "Core primitives (errors, conversions, checksums, byte sources) for hdf5-pure. Internal crate; use `hdf5-pure` instead."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+std = []
+checksum = []
+fast-checksum = ["dep:crc32fast"]
+
+[dependencies]
+crc32fast = { version = "1", optional = true }
+
+[lints]
+workspace = true

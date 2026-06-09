@@ -1,10 +1,39 @@
-[package]
-name = "hdf5-pure"
+[workspace]
+members = ["crates/*"]
+
+[workspace.package]
 version = "0.9.0"
 edition = "2024"
 license = "MIT"
-description = "Pure-Rust HDF5 writer library (WASM-compatible, no C dependencies)"
 repository = "https://github.com/stephenberry/hdf5-pure"
+
+[workspace.lints.clippy]
+# Low-level binary format code naturally has many fields per call site
+# (file_data, dataspace, datatype, layout, cache, ...). Default 7 is too tight.
+too_many_arguments = "allow"
+# Incremental bytestream construction reads more naturally as
+# `let mut buf = Vec::new(); buf.push(...);` than the equivalent `vec![...]`.
+vec_init_then_push = "allow"
+same_item_push = "allow"
+# Index-based loops are sometimes the clearest way to express the access pattern.
+needless_range_loop = "allow"
+# We prefer the explicit forms.
+collapsible_if = "allow"
+collapsible_match = "allow"
+collapsible_else_if = "allow"
+manual_div_ceil = "allow"
+manual_is_multiple_of = "allow"
+unnecessary_map_or = "allow"
+# Approximate float constants in tests/fixtures are intentional.
+approx_constant = "allow"
+
+[package]
+name = "hdf5-pure"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure-Rust HDF5 writer library (WASM-compatible, no C dependencies)"
+repository.workspace = true
 build = "build.rs"
 # Keep binary test fixtures out of the published crate. They are needed only
 # for maintainer CI (byte-level crosscheck against reference HDF5 / H5Z-ZFP
@@ -13,9 +42,9 @@ exclude = ["tests/fixtures/**"]
 
 [features]
 default = ["std", "checksum", "deflate"]
-std = []
-checksum = []
-fast-checksum = ["crc32fast"]
+std = ["hdf5-core/std"]
+checksum = ["hdf5-core/checksum"]
+fast-checksum = ["hdf5-core/fast-checksum"]
 deflate = ["flate2"]
 fast-deflate = ["flate2/zlib-ng"]
 provenance = ["sha2"]
@@ -38,11 +67,11 @@ serde = ["dep:serde", "std"]
 matio-crosscheck = ["serde"]
 
 [dependencies]
+hdf5-core = { path = "crates/hdf5-core", version = "=0.9.0" }
 byteorder = { version = "1", default-features = false }
 flate2 = { version = "1", optional = true, default-features = false, features = ["rust_backend"] }
 sha2 = { version = "0.10", optional = true, default-features = false }
 rayon = { version = "1", optional = true }
-crc32fast = { version = "1", optional = true }
 serde = { version = "1", optional = true, default-features = false, features = ["derive", "alloc"] }
 # A permissive range (like `hdf5-metno`'s own `ndarray` requirement) so the
 # user's existing `ndarray` unifies with ours instead of compiling a second
@@ -69,25 +98,7 @@ hdf5 = { package = "hdf5-metno", version = "0.12", features = ["static", "zlib"]
 name = "matlab_fixtures"
 required-features = ["serde"]
 
-# Style-preference clippy lints muted crate-wide. The remaining clippy
-# surface is still on (`-D warnings` in CI), so genuinely problematic
-# patterns continue to fail the build.
-[lints.clippy]
-# Low-level binary format code naturally has many fields per call site
-# (file_data, dataspace, datatype, layout, cache, ...). Default 7 is too tight.
-too_many_arguments = "allow"
-# Incremental bytestream construction reads more naturally as
-# `let mut buf = Vec::new(); buf.push(...);` than the equivalent `vec![...]`.
-vec_init_then_push = "allow"
-same_item_push = "allow"
-# Index-based loops are sometimes the clearest way to express the access pattern.
-needless_range_loop = "allow"
-# We prefer the explicit forms.
-collapsible_if = "allow"
-collapsible_match = "allow"
-collapsible_else_if = "allow"
-manual_div_ceil = "allow"
-manual_is_multiple_of = "allow"
-unnecessary_map_or = "allow"
-# Approximate float constants in tests/fixtures are intentional.
-approx_constant = "allow"
+# Style-preference clippy lints are defined once in `[workspace.lints]` and
+# inherited by every member crate (including this facade) below.
+[lints]
+workspace = true

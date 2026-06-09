@@ -234,6 +234,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 
 [[package]]
+name = "hdf5-core"
+version = "0.9.0"
+dependencies = [
+ "crc32fast",
+]
+
+[[package]]
 name = "hdf5-metno"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -307,8 +314,8 @@ name = "hdf5-pure"
 version = "0.9.0"
 dependencies = [
  "byteorder",
- "crc32fast",
  "flate2",
+ "hdf5-core",
  "hdf5-metno",
  "ndarray",
  "rayon",

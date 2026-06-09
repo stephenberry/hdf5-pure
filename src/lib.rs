@@ -74,20 +74,24 @@ extern crate alloc;
 // Format-level modules (from rustyhdf5-format)
 // ---------------------------------------------------------------------------
 
+// Re-exported from `hdf5-core` (keeps the `hdf5_pure::<module>` paths and the
+// in-crate `crate::<module>` references resolving unchanged).
+pub use hdf5_core::{checksum, convert, error, message_type, signature, source};
+
+#[cfg(not(feature = "std"))]
+pub(crate) use hdf5_core::nosync;
+
 pub mod attribute;
 pub mod attribute_info;
 pub mod btree_v1;
 pub mod btree_v2;
-pub mod checksum;
 pub mod chunk_cache;
 pub mod chunked_read;
 pub mod chunked_write;
-pub mod convert;
 pub mod data_layout;
 pub mod data_read;
 pub mod dataspace;
 pub mod datatype;
-pub mod error;
 pub mod extensible_array;
 pub mod file_writer;
 pub mod filter_pipeline;
@@ -103,7 +107,6 @@ pub mod lane_partition;
 pub mod link_info;
 pub mod link_message;
 pub mod local_heap;
-pub mod message_type;
 pub mod metadata_index;
 pub mod object_header;
 pub mod object_header_writer;
@@ -111,8 +114,6 @@ pub mod object_header_writer;
 pub mod parallel_read;
 pub mod scaleoffset;
 pub mod shared_message;
-pub mod signature;
-pub mod source;
 pub mod superblock;
 pub mod symbol_table;
 pub mod type_builders;
@@ -122,9 +123,6 @@ pub mod zfp;
 
 #[cfg(feature = "provenance")]
 pub mod provenance;
-
-#[cfg(not(feature = "std"))]
-pub(crate) mod nosync;
 
 // ---------------------------------------------------------------------------
 // High-level modules
