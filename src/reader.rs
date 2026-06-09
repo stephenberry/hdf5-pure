@@ -323,10 +323,7 @@ impl File {
     /// [`Superblock::eof_address`](crate::superblock::Superblock) (reachable via
     /// [`File::superblock`]) to detect appended or unaccounted tail bytes.
     pub fn file_size(&self) -> u64 {
-        match &self.backend {
-            Backend::InMemory(v) => v.len() as u64,
-            Backend::Streaming(s) => s.len(),
-        }
+        self.source().len()
     }
 
     /// The minimum library version required to read this file, derived from its

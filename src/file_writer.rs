@@ -410,9 +410,10 @@ impl FileWriter {
     /// introduced in HDF5 1.10 ([`LibVer::WRITER_OUTPUT`]) — so this is an
     /// assertion guard rather than a format selector: it lets a caller demand
     /// compatibility (and get a loud error if it cannot be met) instead of
-    /// discovering an incompatible file downstream. Bounds that straddle 1.10
-    /// (e.g. the default `Earliest..=Latest`) are accepted; an upper bound older
-    /// than 1.10, or a lower bound newer than it, is rejected.
+    /// discovering an incompatible file downstream. Leaving this unset places no
+    /// constraint. Bounds that straddle 1.10 (e.g. `Earliest..=Latest`) are
+    /// accepted; an upper bound older than 1.10, or a lower bound newer than it,
+    /// is rejected.
     pub fn with_libver_bounds(&mut self, low: LibVer, high: LibVer) -> &mut Self {
         self.libver_bounds = Some((low, high));
         self
