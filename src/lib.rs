@@ -108,6 +108,7 @@ pub(crate) mod group_v1;
 pub(crate) mod group_v2;
 #[cfg(feature = "parallel")]
 pub(crate) mod lane_partition;
+pub(crate) mod libver;
 pub(crate) mod link_info;
 pub(crate) mod link_message;
 pub(crate) mod local_heap;
@@ -161,7 +162,9 @@ pub use error::Error;
 pub use error::FormatError;
 
 #[cfg(feature = "std")]
-pub use reader::{Dataset, File, Group};
+pub use reader::{Dataset, File, Group, is_hdf5, is_hdf5_bytes};
+
+pub use libver::LibVer;
 
 #[cfg(all(feature = "std", feature = "provenance"))]
 pub use provenance::VerifyResult;

@@ -14,6 +14,7 @@ use crate::error::{Error, FormatError};
 use crate::filter_pipeline::FilterPipeline;
 use crate::group_v1::GroupEntry;
 use crate::group_v2;
+use crate::libver::LibVer;
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
 use crate::signature;
@@ -53,6 +54,36 @@ impl FileSource for SourceView<'_> {
             SourceView::Stream(s) => s.read_at(offset, buf),
         }
     }
+}
+
+/// Test whether a file looks like an HDF5 file, without reading it whole.
+///
+/// This is the spelling of the C library's `H5Fis_accessible` /
+/// `H5Fis_hdf5`: it opens the file and scans only the 8-byte candidate windows
+/// where the HDF5 signature is permitted (offsets 0, 512, 1024, 2048, …), so it
+/// never buffers the whole file. Returns:
+///
+/// - `Ok(true)` — the HDF5 signature was found,
+/// - `Ok(false)` — the file opened but has no HDF5 signature,
+/// - `Err(..)` — the file could not be opened (missing, permissions, …).
+///
+/// It validates only the signature, not the rest of the format; a truncated or
+/// corrupt file past the signature still reports `true`. Use [`File::open`] to
+/// fully parse and validate.
+pub fn is_hdf5<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<bool> {
+    let handle = std::fs::File::open(path)?;
+    let source = ReadSeekSource::new(handle).map_err(std::io::Error::other)?;
+    match signature::find_signature_in(&source) {
+        Ok(_) => Ok(true),
+        Err(FormatError::SignatureNotFound) => Ok(false),
+        Err(e) => Err(std::io::Error::other(e)),
+    }
+}
+
+/// Test whether an in-memory buffer begins (at a permitted offset) with the
+/// HDF5 signature. The buffer-backed counterpart of [`is_hdf5`].
+pub fn is_hdf5_bytes(data: &[u8]) -> bool {
+    signature::find_signature(data).is_ok()
 }
 
 /// An open HDF5 file for reading.
@@ -281,6 +312,30 @@ impl File {
     /// Returns a reference to the parsed superblock.
     pub fn superblock(&self) -> &Superblock {
         &self.superblock
+    }
+
+    /// The size of the underlying file in bytes (the HDF5 `H5Fget_filesize`).
+    ///
+    /// This is the total byte length of the backing store — for a streaming
+    /// file the length reported by its source, for an in-memory file the length
+    /// of its buffer. It includes any userblock prefix and trailing bytes, so it
+    /// may exceed the superblock's logical end-of-file address; compare against
+    /// [`Superblock::eof_address`](crate::superblock::Superblock) (reachable via
+    /// [`File::superblock`]) to detect appended or unaccounted tail bytes.
+    pub fn file_size(&self) -> u64 {
+        match &self.backend {
+            Backend::InMemory(v) => v.len() as u64,
+            Backend::Streaming(s) => s.len(),
+        }
+    }
+
+    /// The minimum library version required to read this file, derived from its
+    /// superblock version (the *low bound* of HDF5's `H5Fget_libver_bounds`).
+    ///
+    /// A version 3 superblock, for example, reports [`LibVer::V110`] because it
+    /// was introduced in HDF5 1.10.
+    pub fn libver_bound(&self) -> LibVer {
+        LibVer::from_superblock_version(self.superblock.version)
     }
 
     fn parse_header(&self, address: u64) -> Result<ObjectHeader, FormatError> {

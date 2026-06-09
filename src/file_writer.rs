@@ -18,6 +18,7 @@ use crate::attribute::AttributeMessage;
 use crate::chunked_write::{ChunkOptions, build_chunked_data_at_ext};
 use crate::dataspace::{Dataspace, DataspaceType};
 use crate::error::FormatError;
+use crate::libver::LibVer;
 use crate::link_message::{LinkMessage, LinkTarget};
 use crate::message_type::MessageType;
 use crate::object_header_writer::ObjectHeaderWriter;
@@ -378,6 +379,9 @@ pub struct FileWriter {
     root_attrs: Vec<(String, AttrValue)>,
     groups: Vec<FinishedGroup>,
     userblock_size: u64,
+    /// Requested library-version bounds (low, high), validated in `finish`.
+    /// `None` means no constraint (any output the writer produces is accepted).
+    libver_bounds: Option<(LibVer, LibVer)>,
 }
 
 impl Default for FileWriter {
@@ -393,7 +397,41 @@ impl FileWriter {
             root_attrs: Vec::new(),
             groups: Vec::new(),
             userblock_size: 0,
+            libver_bounds: None,
         }
+    }
+
+    /// Constrain the on-disk format version of the file, mirroring HDF5's
+    /// `H5Pset_libver_bounds`. The produced file must fall within `[low, high]`;
+    /// otherwise [`finish`](Self::finish) fails with
+    /// [`FormatError::LibverBoundsUnsatisfiable`].
+    ///
+    /// This crate's writer emits exactly one format — the version 3 superblock
+    /// introduced in HDF5 1.10 ([`LibVer::WRITER_OUTPUT`]) — so this is an
+    /// assertion guard rather than a format selector: it lets a caller demand
+    /// compatibility (and get a loud error if it cannot be met) instead of
+    /// discovering an incompatible file downstream. Bounds that straddle 1.10
+    /// (e.g. the default `Earliest..=Latest`) are accepted; an upper bound older
+    /// than 1.10, or a lower bound newer than it, is rejected.
+    pub fn with_libver_bounds(&mut self, low: LibVer, high: LibVer) -> &mut Self {
+        self.libver_bounds = Some((low, high));
+        self
+    }
+
+    /// Validate the requested [`libver_bounds`](Self::libver_bounds) against the
+    /// format this writer actually produces.
+    fn check_libver_bounds(&self) -> Result<(), FormatError> {
+        if let Some((low, high)) = self.libver_bounds {
+            let produced = LibVer::WRITER_OUTPUT;
+            if produced < low || produced > high {
+                return Err(FormatError::LibverBoundsUnsatisfiable {
+                    writes: produced.name(),
+                    requested_low: low.name(),
+                    requested_high: high.name(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Set the userblock size in bytes. Must be a power of two >= 512 or 0 (no userblock).
@@ -422,6 +460,7 @@ impl FileWriter {
     }
 
     pub fn finish(self) -> Result<Vec<u8>, FormatError> {
+        self.check_libver_bounds()?;
         struct DsFlat {
             name: String,
             dt: Datatype,

@@ -7,6 +7,7 @@ use crate::type_builders::{
 };
 
 use crate::error::Error;
+use crate::libver::LibVer;
 
 /// Builder for creating a new HDF5 file.
 ///
@@ -55,6 +56,21 @@ impl FileBuilder {
     /// userblock data into `bytes[0..size]`.
     pub fn with_userblock(&mut self, size: u64) -> &mut Self {
         self.writer.with_userblock(size);
+        self
+    }
+
+    /// Constrain the on-disk format version of the file, mirroring HDF5's
+    /// `H5Pset_libver_bounds`. The produced file must fall within `[low, high]`,
+    /// or [`finish`](Self::finish) / [`write`](Self::write) fails with
+    /// [`Error::Format`] wrapping
+    /// [`FormatError::LibverBoundsUnsatisfiable`](crate::FormatError::LibverBoundsUnsatisfiable).
+    ///
+    /// This crate writes exactly one format — the version 3 superblock from
+    /// HDF5 1.10 ([`LibVer::WRITER_OUTPUT`]) — so this is a compatibility
+    /// assertion, not a format selector: a bound that excludes 1.10 (an upper
+    /// bound older than it, or a lower bound newer than it) is rejected.
+    pub fn with_libver_bounds(&mut self, low: LibVer, high: LibVer) -> &mut Self {
+        self.writer.with_libver_bounds(low, high);
         self
     }
 
