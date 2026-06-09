@@ -2410,6 +2410,10 @@ pub fn zfp_cd_values_rate(
 }
 
 /// Parsed ZFP filter metadata extracted from `cd_values`.
+///
+/// Used as a reference oracle by the ZFP tests that cross-check the alloc-free
+/// `zfp_rate_from_cd_values`; gated so it is not shipped as dead code.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ZfpFilterMeta {
     pub element_type: ZfpElementType,
@@ -2421,6 +2425,9 @@ pub struct ZfpFilterMeta {
 /// the scalar type, chunk dims, and rate. Returns `None` if the layout or
 /// mode is something we don't support (e.g. precision / accuracy / expert
 /// modes, or the long mode form).
+///
+/// Test-only reference implementation (see [`ZfpFilterMeta`]).
+#[cfg(test)]
 pub fn zfp_filter_meta_from_cd_values(cd_values: &[u32]) -> Option<ZfpFilterMeta> {
     if cd_values.len() < 4 {
         return None;

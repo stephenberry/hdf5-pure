@@ -68,7 +68,7 @@ Features stay defined on the facade `hdf5-pure` and forward to the sub-crates:
 - `std` -> enables `hdf5-api` (and the std paths in core/source).
 - `parallel` -> enables `lane_partition`/`parallel_read` inside `hdf5-engine` (via an `hdf5-engine/parallel` feature).
 - `zfp` -> `hdf5-filters/zfp`.
-- `deflate` / `fast-deflate` / `checksum` / `fast-checksum` -> core/filters as appropriate.
+- `deflate` / `fast-deflate` / `checksum` -> core/filters as appropriate.
 - `provenance` -> `hdf5-engine/provenance`.
 - `ndarray` -> `hdf5-api/ndarray`.
 - `serde` -> enables `hdf5-mat`.

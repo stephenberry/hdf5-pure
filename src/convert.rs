@@ -69,13 +69,6 @@ impl TryToUsize for u32 {
     }
 }
 
-/// Free-function form of [`TryToUsize::to_usize`] for a `u64`, for the rare
-/// site where a method call on a temporary reads awkwardly.
-#[inline]
-pub fn usize_from(value: u64) -> Result<usize, FormatError> {
-    value.to_usize()
-}
-
 /// Fallibly narrow a file-derived `u64` to `u32`.
 ///
 /// Used where the in-memory representation of a (de)compressed chunk size or

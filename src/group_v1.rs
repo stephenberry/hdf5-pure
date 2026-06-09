@@ -4,11 +4,9 @@
 use alloc::{string::String, vec::Vec};
 
 use crate::btree_v1::collect_symbol_table_nodes;
-use crate::convert::{TryToUsize, slice_range};
+use crate::convert::slice_range;
 use crate::error::FormatError;
 use crate::local_heap::LocalHeap;
-use crate::message_type::MessageType;
-use crate::object_header::ObjectHeader;
 use crate::symbol_table::{SymbolTableMessage, SymbolTableNode};
 
 /// A resolved group entry (child name + object header address).
@@ -18,7 +16,9 @@ pub struct GroupEntry {
     pub name: String,
     /// Address of the child's object header.
     pub object_header_address: u64,
-    /// Cache type from the symbol table entry.
+    /// Cache type from the symbol table (SNOD) entry. Parsed for on-disk
+    /// completeness; the reader does not currently act on it.
+    #[allow(dead_code)]
     pub cache_type: u32,
 }
 
@@ -73,73 +73,11 @@ pub fn resolve_v1_group_entries(
     Ok(entries)
 }
 
-/// Extract the SymbolTableMessage from an object header's messages.
-fn find_symbol_table_message(
-    obj_header: &ObjectHeader,
-    offset_size: u8,
-) -> Result<SymbolTableMessage, FormatError> {
-    for msg in &obj_header.messages {
-        if msg.msg_type == MessageType::SymbolTable {
-            return SymbolTableMessage::parse(&msg.data, offset_size);
-        }
-    }
-    Err(FormatError::PathNotFound(String::from(
-        "no symbol table message found in object header",
-    )))
-}
-
-/// Navigate a path like "group1/subgroup/dataset" from a root group.
-/// Returns the object header address of the target.
-///
-/// Note: this function does not apply base_address offsets. It is intended for
-/// use with files that have base_address=0. Use `resolve_path_any` from group_v2
-/// for general-purpose path resolution.
-pub fn resolve_path(
-    file_data: &[u8],
-    root_sym_table: &SymbolTableMessage,
-    path: &str,
-    offset_size: u8,
-    length_size: u8,
-) -> Result<u64, FormatError> {
-    let components: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    if components.is_empty() {
-        return Err(FormatError::PathNotFound(String::from(path)));
-    }
-
-    let mut current_sym_table = root_sym_table.clone();
-
-    for (i, component) in components.iter().enumerate() {
-        let entries =
-            resolve_v1_group_entries(file_data, &current_sym_table, offset_size, length_size, 0)?;
-
-        let found = entries.iter().find(|e| e.name == *component);
-        match found {
-            Some(entry) => {
-                if i == components.len() - 1 {
-                    // Last component — return its address
-                    return Ok(entry.object_header_address);
-                }
-                // Not last — must be a group, parse its object header to get symbol table
-                let obj_header = ObjectHeader::parse(
-                    file_data,
-                    entry.object_header_address.to_usize()?,
-                    offset_size,
-                    length_size,
-                )?;
-                current_sym_table = find_symbol_table_message(&obj_header, offset_size)?;
-            }
-            None => {
-                return Err(FormatError::PathNotFound(String::from(*component)));
-            }
-        }
-    }
-
-    Err(FormatError::PathNotFound(String::from(path)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message_type::MessageType;
+    use crate::object_header::ObjectHeader;
     /// Build a minimal synthetic file with a group containing named children.
     /// Returns (file_data, SymbolTableMessage).
     fn build_synthetic_group(
@@ -316,21 +254,6 @@ mod tests {
         assert_eq!(entries[1].object_header_address, 0x2000);
     }
 
-    #[test]
-    fn resolve_path_single_level() {
-        let (file, msg) =
-            build_synthetic_group(&[("child1", 0x3000, 0), ("child2", 0x4000, 0)], 8, 8);
-        let addr = resolve_path(&file, &msg, "child1", 8, 8).unwrap();
-        assert_eq!(addr, 0x3000);
-    }
-
-    #[test]
-    fn resolve_path_not_found() {
-        let (file, msg) = build_synthetic_group(&[("x", 0x100, 0)], 8, 8);
-        let err = resolve_path(&file, &msg, "nonexistent", 8, 8).unwrap_err();
-        assert!(matches!(err, FormatError::PathNotFound(_)));
-    }
-
     // Helper to extract dataset components from an object header
     fn extract_dataset(
         _file_data: &[u8],
@@ -413,75 +336,5 @@ mod tests {
         let raw = crate::data_read::read_raw_data(file_data, &dl, &ds, &dt).unwrap();
         let values = crate::data_read::read_as_f64(&raw, &dt).unwrap();
         assert_eq!(values, vec![1.0, 2.0, 3.0]);
-    }
-
-    #[test]
-    fn integration_two_groups_group1_values() {
-        let file_data: &[u8] = include_bytes!("../tests/fixtures/two_groups.h5");
-        let sig_offset = crate::signature::find_signature(file_data).unwrap();
-        let sb = crate::superblock::Superblock::parse(file_data, sig_offset).unwrap();
-        let root_sym = get_root_sym_table(file_data, &sb);
-
-        let addr = resolve_path(
-            file_data,
-            &root_sym,
-            "group1/values",
-            sb.offset_size,
-            sb.length_size,
-        )
-        .unwrap();
-        let hdr =
-            ObjectHeader::parse(file_data, addr as usize, sb.offset_size, sb.length_size).unwrap();
-        let (dt, ds, dl) = extract_dataset(file_data, &hdr, sb.offset_size, sb.length_size);
-        let raw = crate::data_read::read_raw_data(file_data, &dl, &ds, &dt).unwrap();
-        let values = crate::data_read::read_as_i32(&raw, &dt).unwrap();
-        assert_eq!(values, vec![10, 20, 30]);
-    }
-
-    #[test]
-    fn integration_two_groups_group2_temps() {
-        let file_data: &[u8] = include_bytes!("../tests/fixtures/two_groups.h5");
-        let sig_offset = crate::signature::find_signature(file_data).unwrap();
-        let sb = crate::superblock::Superblock::parse(file_data, sig_offset).unwrap();
-        let root_sym = get_root_sym_table(file_data, &sb);
-
-        let addr = resolve_path(
-            file_data,
-            &root_sym,
-            "group2/temps",
-            sb.offset_size,
-            sb.length_size,
-        )
-        .unwrap();
-        let hdr =
-            ObjectHeader::parse(file_data, addr as usize, sb.offset_size, sb.length_size).unwrap();
-        let (dt, ds, dl) = extract_dataset(file_data, &hdr, sb.offset_size, sb.length_size);
-        let raw = crate::data_read::read_raw_data(file_data, &dl, &ds, &dt).unwrap();
-        let values = crate::data_read::read_as_f32(&raw, &dt).unwrap();
-        assert!((values[0] - 98.6).abs() < 0.01);
-        assert!((values[1] - 37.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn integration_nested_groups() {
-        let file_data: &[u8] = include_bytes!("../tests/fixtures/nested_groups.h5");
-        let sig_offset = crate::signature::find_signature(file_data).unwrap();
-        let sb = crate::superblock::Superblock::parse(file_data, sig_offset).unwrap();
-        let root_sym = get_root_sym_table(file_data, &sb);
-
-        let addr = resolve_path(
-            file_data,
-            &root_sym,
-            "a/b/c/deep",
-            sb.offset_size,
-            sb.length_size,
-        )
-        .unwrap();
-        let hdr =
-            ObjectHeader::parse(file_data, addr as usize, sb.offset_size, sb.length_size).unwrap();
-        let (dt, ds, dl) = extract_dataset(file_data, &hdr, sb.offset_size, sb.length_size);
-        let raw = crate::data_read::read_raw_data(file_data, &dl, &ds, &dt).unwrap();
-        let values = crate::data_read::read_as_f64(&raw, &dt).unwrap();
-        assert_eq!(values, vec![42.0]);
     }
 }

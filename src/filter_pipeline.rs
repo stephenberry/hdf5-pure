@@ -12,8 +12,6 @@ use crate::error::FormatError;
 pub const FILTER_DEFLATE: u16 = 1;
 pub const FILTER_SHUFFLE: u16 = 2;
 pub const FILTER_FLETCHER32: u16 = 3;
-pub const FILTER_SZIP: u16 = 4;
-pub const FILTER_NBIT: u16 = 5;
 pub const FILTER_SCALEOFFSET: u16 = 6;
 /// ZFP compression filter (registered HDF5 filter ID 32013).
 #[cfg(feature = "zfp")]

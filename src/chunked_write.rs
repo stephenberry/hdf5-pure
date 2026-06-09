@@ -7,7 +7,7 @@ extern crate alloc;
 use alloc::{vec, vec::Vec};
 
 use crate::checksum::jenkins_lookup3;
-use crate::chunk_cache::{CACHE_LINE_SIZE, align_to_cache_line};
+use crate::chunk_cache::align_to_cache_line;
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
 use crate::extensible_array::{EaGeometry, ExtensibleArrayHeader};
@@ -30,16 +30,6 @@ use crate::scaleoffset::{ScaleOffset, ScaleOffsetType, build_cd_values};
 /// `H5D_FARRAY_MAX_DBLK_PAGE_NELMTS_BITS`. The reader does not use this constant:
 /// it honors whatever page size a file declares in its FAHD.
 pub(crate) const FIXED_ARRAY_PAGE_BITS: u8 = 10;
-
-/// Round a file offset up to the next cache-line boundary.
-///
-/// This ensures chunk data starts at an address that is a multiple of the
-/// architecture's cache line size, enabling aligned loads in SIMD paths.
-#[inline]
-pub fn align_chunk_offset(offset: u64) -> u64 {
-    let align = CACHE_LINE_SIZE as u64;
-    (offset + align - 1) & !(align - 1)
-}
 
 /// Options for chunked dataset creation.
 #[derive(Debug, Clone, Default)]
@@ -319,27 +309,6 @@ pub fn split_into_chunks(
     }
 
     result
-}
-
-/// Build the complete chunked dataset blob (chunk data + index) and return
-/// layout/pipeline messages. `base_address` is where the blob will be placed in the file.
-/// Serialize a v4 single chunk layout message (public for OH size estimation).
-pub fn serialize_v4_single_chunk_pub(
-    chunk_dims: &[u32],
-    chunk_address: u64,
-    filtered_size: Option<u64>,
-    filter_mask: Option<u32>,
-    offset_size: u8,
-    element_size: u32,
-) -> Vec<u8> {
-    serialize_v4_single_chunk(
-        chunk_dims,
-        chunk_address,
-        filtered_size,
-        filter_mask,
-        offset_size,
-        element_size,
-    )
 }
 
 /// Serialize a v4 single chunk layout message.
@@ -1245,22 +1214,6 @@ fn write_undefined_element(
     }
 }
 
-/// Build chunked data with absolute addresses.
-/// If `maxshape` has unlimited dims, uses Extensible Array index.
-///
-/// `ctx` carries chunk_dims, element_size, and (for type-aware filters like
-/// ZFP) the scalar element type. Build it via [`ChunkContext::from_datatype`]
-/// when a `Datatype` is in scope.
-pub fn build_chunked_data_at(
-    raw_data: &[u8],
-    shape: &[u64],
-    ctx: ChunkContext<'_>,
-    options: &ChunkOptions,
-    base_address: u64,
-) -> Result<ChunkedDataResult, FormatError> {
-    build_chunked_data_at_ext(raw_data, shape, ctx, options, base_address, None)
-}
-
 /// Build chunked data with absolute addresses and optional maxshape.
 ///
 /// `ctx` carries chunk_dims, element_size, and (for type-aware filters like
@@ -1441,7 +1394,8 @@ mod tests {
         let raw = f64_to_bytes(values);
         let base_address = 0x1000u64;
         let ctx = ChunkContext::basic(chunk_dims, 8);
-        let result = build_chunked_data_at(&raw, shape, ctx, options, base_address).unwrap();
+        let result =
+            build_chunked_data_at_ext(&raw, shape, ctx, options, base_address, None).unwrap();
 
         // Build a fake file buffer
         let file_size = base_address as usize + result.data_bytes.len();
@@ -1594,32 +1548,21 @@ mod tests {
     }
 
     #[test]
-    fn align_chunk_offset_values() {
-        use super::CACHE_LINE_SIZE;
-        use super::align_chunk_offset;
-        let cl = CACHE_LINE_SIZE as u64;
-        assert_eq!(align_chunk_offset(0), 0);
-        assert_eq!(align_chunk_offset(1), cl);
-        assert_eq!(align_chunk_offset(cl), cl);
-        assert_eq!(align_chunk_offset(cl + 1), cl * 2);
-        assert_eq!(align_chunk_offset(cl * 10), cl * 10);
-    }
-
-    #[test]
     fn chunk_addresses_are_cache_aligned() {
-        use super::align_chunk_offset;
+        use super::align_to_cache_line;
         let values: Vec<f64> = (0..100).map(|i| i as f64).collect();
         let raw = f64_to_bytes(&values);
         let base_address = 0x1000u64;
         // Ensure base is aligned for this test
-        let base_address = align_chunk_offset(base_address);
+        let base_address = align_to_cache_line(base_address as usize) as u64;
         let options = ChunkOptions {
             chunk_dims: Some(vec![20]),
             ..Default::default()
         };
         let dims = [20u64];
         let ctx = ChunkContext::basic(&dims, 8);
-        let result = build_chunked_data_at(&raw, &[100], ctx, &options, base_address).unwrap();
+        let result =
+            build_chunked_data_at_ext(&raw, &[100], ctx, &options, base_address, None).unwrap();
 
         // Parse layout to get chunk addresses (via roundtrip read)
         let file_size = base_address as usize + result.data_bytes.len();

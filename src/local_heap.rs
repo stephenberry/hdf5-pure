@@ -11,7 +11,9 @@ use crate::error::FormatError;
 pub struct LocalHeap {
     /// Size of the data segment in bytes.
     pub data_segment_size: u64,
-    /// Offset of the free list head within the data segment.
+    /// Offset of the free list head within the data segment. Parsed for
+    /// on-disk-format completeness; the reader does not free-list-allocate.
+    #[allow(dead_code)]
     pub free_list_head_offset: u64,
     /// File address of the data segment.
     pub data_segment_address: u64,

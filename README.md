@@ -372,7 +372,6 @@ Not supported in this release: non-unit enum variants, MATLAB objects (`classdef
 | `checksum` | yes | Jenkins hash for v2+ object headers |
 | `deflate` | yes | Deflate compression (pure Rust backend) |
 | `serde` | no | Serialize/deserialize MATLAB v7.3 `.mat` files via serde |
-| `fast-checksum` | no | Hardware-accelerated CRC32 via `crc32fast` |
 | `fast-deflate` | no | zlib-ng backend for deflate via `flate2/zlib-ng` |
 | `ndarray` | no | N-dimensional array I/O via the [`ndarray`](https://docs.rs/ndarray) crate |
 | `parallel` | no | Parallel chunk processing via `rayon` |

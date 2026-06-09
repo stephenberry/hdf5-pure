@@ -14,7 +14,6 @@ use crate::fractal_heap::FractalHeapHeader;
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
 use crate::shared_message;
-use crate::vl_data;
 
 /// A parsed HDF5 attribute message.
 #[derive(Debug, Clone)]
@@ -215,6 +214,9 @@ impl AttributeMessage {
     }
 
     /// Read attribute value as a single string (first element).
+    ///
+    /// Only used by tests; gated so it is not shipped as dead code.
+    #[cfg(test)]
     pub fn read_as_string(&self) -> Result<String, FormatError> {
         let strings = data_read::read_as_strings(&self.raw_data, &self.datatype)?;
         Ok(strings.into_iter().next().unwrap_or_default())
@@ -223,26 +225,6 @@ impl AttributeMessage {
     /// Read attribute value as a vector of fixed-length strings.
     pub fn read_as_strings(&self) -> Result<Vec<String>, FormatError> {
         data_read::read_as_strings(&self.raw_data, &self.datatype)
-    }
-
-    /// Read variable-length string attribute values.
-    ///
-    /// Needs the full file data and offset/length sizes from the superblock
-    /// because VL strings store their data in the global heap.
-    pub fn read_vl_strings(
-        &self,
-        file_data: &[u8],
-        offset_size: u8,
-        length_size: u8,
-    ) -> Result<Vec<String>, FormatError> {
-        let num_elements = self.dataspace.num_elements();
-        vl_data::read_vl_strings(
-            file_data,
-            &self.raw_data,
-            num_elements,
-            offset_size,
-            length_size,
-        )
     }
 }
 
@@ -280,7 +262,11 @@ fn extract_name(bytes: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[..end]).into_owned()
 }
 
-/// Extract all attribute messages from an object header.
+/// Extract all (compact) attribute messages from an object header.
+///
+/// Only used by tests; the reader uses [`extract_attributes_full`] (which also
+/// handles dense storage). Gated so it is not shipped as dead code.
+#[cfg(test)]
 pub fn extract_attributes(
     header: &ObjectHeader,
     length_size: u8,
@@ -293,14 +279,6 @@ pub fn extract_attributes(
         }
     }
     Ok(attrs)
-}
-
-/// Find a specific attribute by name.
-pub fn find_attribute<'a>(
-    attrs: &'a [AttributeMessage],
-    name: &str,
-) -> Option<&'a AttributeMessage> {
-    attrs.iter().find(|a| a.name == name)
 }
 
 /// Extract all attributes from an object header, supporting both compact and dense storage.
@@ -714,30 +692,6 @@ mod tests {
         assert_eq!(attrs[0].name, "attr0");
         assert_eq!(attrs[1].name, "attr1");
         assert_eq!(attrs[2].name, "attr2");
-    }
-
-    #[test]
-    fn find_attribute_by_name() {
-        let name = b"target\0";
-        let dt_bytes = build_f64_dt();
-        let ds_bytes = build_scalar_ds();
-
-        let mut attr_data = Vec::new();
-        attr_data.push(2);
-        attr_data.push(0);
-        attr_data.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        attr_data.extend_from_slice(&(dt_bytes.len() as u16).to_le_bytes());
-        attr_data.extend_from_slice(&(ds_bytes.len() as u16).to_le_bytes());
-        attr_data.extend_from_slice(name);
-        attr_data.extend_from_slice(&dt_bytes);
-        attr_data.extend_from_slice(&ds_bytes);
-        attr_data.extend_from_slice(&99.0f64.to_le_bytes());
-
-        let attr = AttributeMessage::parse(&attr_data, 8).unwrap();
-        let attrs = vec![attr];
-
-        assert!(find_attribute(&attrs, "target").is_some());
-        assert!(find_attribute(&attrs, "missing").is_none());
     }
 
     #[test]

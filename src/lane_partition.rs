@@ -34,66 +34,12 @@ fn fxhash_combine(seed: u64, index: u64) -> u64 {
     fxhash(seed ^ fxhash(index))
 }
 
-/// Partitioning mode for distributing work across lanes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PartitionMode {
-    /// Equal-size round-robin: item `i` goes to lane `permutation[i] % num_lanes`.
-    /// Guarantees each lane gets at most `ceil(n / num_lanes)` items.
-    EqualSize,
-    /// Work-stealing: uses equal-size as the base assignment, but lanes with
-    /// fewer items can steal from neighbours.  In practice the deterministic
-    /// shuffle already balances well, so this mode adds a rebalancing pass
-    /// that caps the max-min difference at 1.
-    WorkStealing,
-}
-
-/// Deterministic lane partitioner.
-///
-/// Assigns items to lanes using a seeded pseudorandom permutation so that:
-/// - Every item is assigned to exactly one lane (no gaps, no duplicates).
-/// - The assignment is reproducible for the same `(seed, num_items)` pair.
-/// - No inter-thread coordination is needed at runtime.
-pub struct LanePartitioner {
-    pub num_lanes: usize,
-    pub mode: PartitionMode,
-}
-
-impl LanePartitioner {
-    /// Create a new partitioner with the given lane count and mode.
-    pub fn new(num_lanes: usize, mode: PartitionMode) -> Self {
-        let num_lanes = num_lanes.max(1);
-        Self { num_lanes, mode }
-    }
-
-    /// Create a partitioner that auto-detects the number of available cores.
-    #[cfg(feature = "std")]
-    pub fn auto(mode: PartitionMode) -> Self {
-        let num_lanes = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        Self::new(num_lanes, mode)
-    }
-
-    /// Partition `num_items` items into `self.num_lanes` lanes.
-    ///
-    /// Returns a `Vec<Vec<usize>>` where `result[lane]` contains the original
-    /// indices assigned to that lane, in the order determined by the
-    /// pseudorandom permutation.
-    pub fn partition(&self, num_items: usize, seed: u64) -> Vec<Vec<usize>> {
-        partition(num_items, self.num_lanes, seed, self.mode)
-    }
-}
-
 /// Core partition function.
 ///
 /// Returns `result[lane] = [indices...]` such that every index in `0..num_items`
-/// appears in exactly one lane.
-pub fn partition(
-    num_items: usize,
-    num_lanes: usize,
-    seed: u64,
-    mode: PartitionMode,
-) -> Vec<Vec<usize>> {
+/// appears in exactly one lane. Items are assigned by a seeded pseudorandom
+/// hash, then rebalanced so the max-min lane size differs by at most 1.
+pub fn partition(num_items: usize, num_lanes: usize, seed: u64) -> Vec<Vec<usize>> {
     let num_lanes = num_lanes.max(1);
     if num_items == 0 {
         return vec![Vec::new(); num_lanes];
@@ -116,22 +62,20 @@ pub fn partition(
         lanes[lane].push(idx);
     }
 
-    if mode == PartitionMode::WorkStealing {
-        // Rebalance so that the first `extra` lanes have base_per_lane+1 items
-        // and the remaining lanes have exactly base_per_lane items.
-        // Collect all items into a flat list (preserving hash-based ordering per lane).
-        let all_items: Vec<usize> = lanes.drain(..).flat_map(|l| l.into_iter()).collect();
-        lanes.clear();
-        let mut start = 0;
-        for i in 0..num_lanes {
-            let target = if i < extra {
-                base_per_lane + 1
-            } else {
-                base_per_lane
-            };
-            lanes.push(all_items[start..start + target].to_vec());
-            start += target;
-        }
+    // Rebalance so that the first `extra` lanes have base_per_lane+1 items
+    // and the remaining lanes have exactly base_per_lane items.
+    // Collect all items into a flat list (preserving hash-based ordering per lane).
+    let all_items: Vec<usize> = lanes.drain(..).flat_map(|l| l.into_iter()).collect();
+    lanes.clear();
+    let mut start = 0;
+    for i in 0..num_lanes {
+        let target = if i < extra {
+            base_per_lane + 1
+        } else {
+            base_per_lane
+        };
+        lanes.push(all_items[start..start + target].to_vec());
+        start += target;
     }
 
     lanes
@@ -142,7 +86,7 @@ pub fn partition(
 /// `seed` should incorporate the dataset offset and chunk range so the
 /// assignment is deterministic per query.
 pub fn partition_chunks(num_chunks: usize, num_lanes: usize, seed: u64) -> Vec<Vec<usize>> {
-    partition(num_chunks, num_lanes, seed, PartitionMode::WorkStealing)
+    partition(num_chunks, num_lanes, seed)
 }
 
 /// Per-lane decompression statistics for diagnostics.
@@ -161,7 +105,6 @@ pub struct LaneStats {
 pub struct PartitionStats {
     pub per_lane: Vec<LaneStats>,
     pub total_chunks: usize,
-    pub num_lanes: usize,
 }
 
 impl PartitionStats {
@@ -169,25 +112,7 @@ impl PartitionStats {
         Self {
             per_lane: (0..num_lanes).map(|_| LaneStats::default()).collect(),
             total_chunks: 0,
-            num_lanes,
         }
-    }
-
-    /// Returns the max/min chunk count across lanes (imbalance metric).
-    pub fn imbalance(&self) -> (usize, usize) {
-        let max = self
-            .per_lane
-            .iter()
-            .map(|s| s.chunks_processed)
-            .max()
-            .unwrap_or(0);
-        let min = self
-            .per_lane
-            .iter()
-            .map(|s| s.chunks_processed)
-            .min()
-            .unwrap_or(0);
-        (max, min)
     }
 }
 
@@ -203,7 +128,7 @@ mod tests {
     fn all_items_covered_no_duplicates() {
         for n in [0, 1, 2, 5, 10, 16, 31, 100] {
             for lanes in [1, 2, 4, 8, 16] {
-                let result = partition(n, lanes, 42, PartitionMode::EqualSize);
+                let result = partition(n, lanes, 42);
                 assert_eq!(result.len(), lanes);
 
                 let mut seen = HashSet::new();
@@ -222,15 +147,15 @@ mod tests {
 
     #[test]
     fn deterministic_same_seed() {
-        let a = partition(50, 4, 12345, PartitionMode::EqualSize);
-        let b = partition(50, 4, 12345, PartitionMode::EqualSize);
+        let a = partition(50, 4, 12345);
+        let b = partition(50, 4, 12345);
         assert_eq!(a, b);
     }
 
     #[test]
     fn different_seed_different_partition() {
-        let a = partition(50, 4, 100, PartitionMode::EqualSize);
-        let b = partition(50, 4, 200, PartitionMode::EqualSize);
+        let a = partition(50, 4, 100);
+        let b = partition(50, 4, 200);
         // Very unlikely to be identical with different seeds
         assert_ne!(a, b);
     }
@@ -240,7 +165,7 @@ mod tests {
         // With work-stealing, no lane should differ by more than 1 from ideal
         for n in [7, 13, 31, 100] {
             for lanes in [2, 4, 8, 16] {
-                let result = partition(n, lanes, 999, PartitionMode::WorkStealing);
+                let result = partition(n, lanes, 999);
                 let sizes: Vec<usize> = result.iter().map(|l| l.len()).collect();
                 let max = *sizes.iter().max().unwrap();
                 let min = *sizes.iter().min().unwrap();
@@ -273,14 +198,14 @@ mod tests {
 
     #[test]
     fn single_lane() {
-        let result = partition(10, 1, 0, PartitionMode::EqualSize);
+        let result = partition(10, 1, 0);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].len(), 10);
     }
 
     #[test]
     fn zero_items() {
-        let result = partition(0, 4, 0, PartitionMode::EqualSize);
+        let result = partition(0, 4, 0);
         assert_eq!(result.len(), 4);
         for lane in &result {
             assert!(lane.is_empty());
@@ -289,31 +214,10 @@ mod tests {
 
     #[test]
     fn more_lanes_than_items() {
-        let result = partition(3, 16, 42, PartitionMode::WorkStealing);
+        let result = partition(3, 16, 42);
         assert_eq!(result.len(), 16);
         let total: usize = result.iter().map(|l| l.len()).sum();
         assert_eq!(total, 3);
-    }
-
-    #[test]
-    fn lane_partitioner_struct() {
-        let lp = LanePartitioner::new(4, PartitionMode::EqualSize);
-        let result = lp.partition(20, 42);
-        assert_eq!(result.len(), 4);
-        let total: usize = result.iter().map(|l| l.len()).sum();
-        assert_eq!(total, 20);
-    }
-
-    #[test]
-    fn partition_stats_imbalance() {
-        let mut stats = PartitionStats::new(4);
-        stats.per_lane[0].chunks_processed = 5;
-        stats.per_lane[1].chunks_processed = 5;
-        stats.per_lane[2].chunks_processed = 6;
-        stats.per_lane[3].chunks_processed = 4;
-        let (max, min) = stats.imbalance();
-        assert_eq!(max, 6);
-        assert_eq!(min, 4);
     }
 
     #[test]
@@ -326,7 +230,7 @@ mod tests {
     fn lane_count_various() {
         // Test with 1, 2, 4, 8, 16 lanes as specified
         for &lanes in &[1, 2, 4, 8, 16] {
-            let result = partition(32, lanes, 0xDEAD, PartitionMode::WorkStealing);
+            let result = partition(32, lanes, 0xDEAD);
             assert_eq!(result.len(), lanes);
             let total: usize = result.iter().map(|l| l.len()).sum();
             assert_eq!(total, 32);

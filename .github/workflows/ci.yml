@@ -24,7 +24,7 @@ jobs:
           # `matio-crosscheck` is intentionally excluded: it links against the
           # system libmatio and is meant for maintainer-local crosscheck runs.
           - name: full
-            flags: --features "serde zfp fast-deflate fast-checksum provenance parallel ndarray"
+            flags: --features "serde zfp fast-deflate provenance parallel ndarray"
         # The single-feature isolation configs only need to run on one platform;
         # they are subsets of `full`, which already runs everywhere.
         include:
@@ -123,7 +123,7 @@ jobs:
       - uses: obi1kenobi/cargo-semver-checks-action@v2
         with:
           feature-group: default-features
-          features: serde,zfp,fast-checksum,provenance,parallel,ndarray
+          features: serde,zfp,provenance,parallel,ndarray
 
   # ===========================================================================
   # 32-bit / no_std compatibility (issue #27).
@@ -156,7 +156,7 @@ jobs:
       - name: Clippy (lib, full features minus C-backed ones)
         run: >
           cargo clippy --locked --target i686-unknown-linux-gnu --lib
-          --features "serde zfp fast-checksum provenance parallel ndarray" -- -D warnings
+          --features "serde zfp provenance parallel ndarray" -- -D warnings
 
   # Ratchet for pointer-width-aware cast lints. On i686 clippy flags every
   # potential `u64 as usize`-style narrowing; hundreds are benign (bounded
@@ -193,7 +193,7 @@ jobs:
           # JSON is the only format that reliably carries the lint name per
           # diagnostic (`--message-format=short` drops it).
           cargo clippy --locked --target i686-unknown-linux-gnu --lib \
-            --features "serde zfp fast-checksum provenance parallel ndarray" \
+            --features "serde zfp provenance parallel ndarray" \
             --message-format=json \
             -- -W clippy::cast_possible_truncation \
                -W clippy::cast_possible_wrap > clippy.json
@@ -229,7 +229,7 @@ jobs:
         run: >
           cross test --locked --target i686-unknown-linux-gnu
           --no-default-features
-          --features "std checksum deflate zfp serde ndarray provenance fast-checksum"
+          --features "std checksum deflate zfp serde ndarray provenance"
           --lib --test write_read_roundtrip --test serde_roundtrip --test zfp_roundtrip
           --test streaming_reader
 

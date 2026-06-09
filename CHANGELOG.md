@@ -12,9 +12,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **The public API is now a curated surface; the internal format modules are no longer exposed** ([#33](https://github.com/stephenberry/hdf5-pure/issues/33)). Previously almost every module was `pub` at the crate root (`btree_v1`, `fractal_heap`, `object_header`, `chunked_write`, `data_read`, …), so internal on-disk-format machinery — and any dead code in it — was part of the published API surface. That is the root cause of the 0.9.0 dead-`pub fn` slip. Those modules are now `pub(crate)`, and the supported public API is the curated set re-exported at the crate root: `File`, `Dataset`, `Group`, `FileBuilder`, `SwmrWriter`, `DatasetBuilder`, `GroupBuilder`, `FinishedGroup`, `CompoundTypeBuilder`, `EnumTypeBuilder`, the `make_*_type` constructors, `Datatype`, `ScaleOffset`, `AttrValue`, `DType`, `H5Element`, `Error`, `FormatError`, and the `mat` module. **Code using the documented reader/writer/builder API is unaffected**; code that reached into internal module paths (e.g. `hdf5_pure::object_header::…`) must stop doing so, hence the `0.x.0` bump. The byte-level ZFP crosscheck, which exercised the internal codec entry points, moved from `tests/` to an in-crate test.
 
+### Added
+
+- `Dataset::verify_provenance` (feature `provenance`). Recomputes a dataset's SHA-256 and compares it against the `_provenance_sha256` attribute written by `DatasetBuilder::with_provenance`, returning `VerifyResult::{Ok, Mismatch { stored, computed }, NoHash}`. This is the read counterpart to the existing provenance write path: previously the crate could write an integrity hash but offered no public way to check it. The implementation reuses the public `Dataset` read path (`VerifyResult` is re-exported at the crate root).
+
+### Removed
+
+- The `fast-checksum` feature and its `crc32fast` dependency. The feature gated a CRC32 implementation that nothing ever called — HDF5 uses Bob Jenkins' lookup3 hash for all metadata checksums, never CRC32 — so enabling it was a no-op. Drop it from any feature list that named it.
+- Several internal subsystems that were built but never wired into the reader or writer: the SOHM (shared object header message) table parser, the `metadata_index` / independent-parallel-write module, the `group_info` message parser, the adaptive "sweep" chunk-read path and its cache instrumentation, the batch object-header writer, the unadopted `source::Cursor` abstraction, and the compound/enum/object-reference/region-reference/flat-array data readers. None were reachable through the public API.
+
 ### Notes
 
-- Encapsulating the internals surfaced a large amount of code that compiled only because it was `pub` — parsed-but-unused struct fields plus several not-yet-wired or apparently-abandoned subsystems (the SOHM shared-message-table parser, the `metadata_index` module, the "sweep" chunk reader, the batch object-header writer, and the CRC32 / `fast-checksum` apparatus, which HDF5's Jenkins-lookup3 metadata checksums never use). To keep this release a focused encapsulation rather than a mass deletion, a crate-level `#![allow(dead_code)]` is in place as a transitional measure; a follow-up will audit each item (delete vs keep) and restore `dead_code` enforcement.
+- Encapsulating the internals surfaced a large amount of code that compiled only because it was `pub`. Each item was audited: genuinely abandoned subsystems were removed (see above), while struct fields that are parsed from the on-disk format for completeness but not yet read are kept with localized `#[allow(dead_code)]` and a note. `dead_code` enforcement is restored for `std` builds; `no_std` builds allow it because the high-level reader/writer entry points that consume the parsing machinery are `std`-gated and absent there.
 
 ## [0.9.0] - 2026-06-08
 

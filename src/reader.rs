@@ -621,6 +621,34 @@ impl<'f> Dataset<'f> {
             .file
             .read_dataset_raw(&dl, &ds, &dt, pipeline.as_ref(), &self.chunk_cache)?)
     }
+
+    /// Verify this dataset against its stored provenance hash.
+    ///
+    /// Recomputes the SHA-256 of the dataset's raw bytes and compares it with
+    /// the `_provenance_sha256` attribute written by
+    /// [`DatasetBuilder::with_provenance`](crate::DatasetBuilder::with_provenance).
+    /// Returns [`VerifyResult::NoHash`](crate::VerifyResult::NoHash) when the
+    /// dataset carries no provenance hash, so a missing hash is distinguishable
+    /// from an actual mismatch.
+    #[cfg(feature = "provenance")]
+    pub fn verify_provenance(&self) -> Result<crate::provenance::VerifyResult, Error> {
+        use crate::provenance::{ATTR_SHA256, VerifyResult, sha256_hex};
+
+        let attrs = self.attrs()?;
+        let stored = match attrs.get(ATTR_SHA256) {
+            Some(AttrValue::String(s) | AttrValue::AsciiString(s)) => {
+                s.trim_end_matches('\0').to_string()
+            }
+            _ => return Ok(VerifyResult::NoHash),
+        };
+
+        let computed = sha256_hex(&self.read_raw()?);
+        if computed == stored {
+            Ok(VerifyResult::Ok)
+        } else {
+            Ok(VerifyResult::Mismatch { stored, computed })
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

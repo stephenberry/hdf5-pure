@@ -12,7 +12,9 @@ const GCOL_SIGNATURE: [u8; 4] = [b'G', b'C', b'O', b'L'];
 /// A parsed global heap collection.
 #[derive(Debug, Clone)]
 pub struct GlobalHeapCollection {
-    /// Total size of this collection including header.
+    /// Total size of this collection including header. Parsed from the GCOL
+    /// header for completeness; the reader uses object offsets directly.
+    #[allow(dead_code)]
     pub collection_size: u64,
     /// Objects within this collection.
     pub objects: Vec<GlobalHeapObject>,
@@ -23,7 +25,9 @@ pub struct GlobalHeapCollection {
 pub struct GlobalHeapObject {
     /// Object index (1-based; 0 is the free space marker).
     pub index: u16,
-    /// Reference count.
+    /// Reference count. Parsed from the heap object for completeness; not used
+    /// by the reader.
+    #[allow(dead_code)]
     pub reference_count: u16,
     /// Object data.
     pub data: Vec<u8>,
