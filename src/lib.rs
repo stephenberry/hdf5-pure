@@ -66,62 +66,75 @@
 //! ```
 
 #![cfg_attr(not(feature = "std"), no_std)]
+// Transitional (0.10.0): encapsulating the internal modules as `pub(crate)`
+// surfaced a large amount of code that was only reachable because it had been
+// `pub` — parsed-but-unused struct fields plus several not-yet-wired or
+// apparently-abandoned subsystems (the SOHM message-table parser in
+// `shared_message`, the `metadata_index` module, the "sweep" reader in
+// `chunked_read`, the batch writer in `object_header_writer`, and the CRC32 /
+// `fast-checksum` apparatus in `checksum`, which HDF5's Jenkins-lookup3 metadata
+// checksums never use). Rather than delete coherent in-progress code under one
+// change, this allow is kept crate-wide so the encapsulation lands cleanly; a
+// dedicated follow-up audits each item (delete vs keep), removes this line, and
+// restores `dead_code` enforcement.
+#![allow(dead_code)]
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 
 // ---------------------------------------------------------------------------
-// Format-level modules (from rustyhdf5-format)
+// Internal modules (encapsulated as `pub(crate)`; the curated public surface is
+// re-exported at the bottom of this file).
 // ---------------------------------------------------------------------------
 
-pub mod attribute;
-pub mod attribute_info;
-pub mod btree_v1;
-pub mod btree_v2;
-pub mod checksum;
-pub mod chunk_cache;
-pub mod chunked_read;
-pub mod chunked_write;
-pub mod convert;
-pub mod data_layout;
-pub mod data_read;
-pub mod dataspace;
-pub mod datatype;
-pub mod error;
-pub mod extensible_array;
-pub mod file_writer;
-pub mod filter_pipeline;
-pub mod filters;
-pub mod fixed_array;
-pub mod fractal_heap;
-pub mod global_heap;
-pub mod group_info;
-pub mod group_v1;
-pub mod group_v2;
+pub(crate) mod attribute;
+pub(crate) mod attribute_info;
+pub(crate) mod btree_v1;
+pub(crate) mod btree_v2;
+pub(crate) mod checksum;
+pub(crate) mod chunk_cache;
+pub(crate) mod chunked_read;
+pub(crate) mod chunked_write;
+pub(crate) mod convert;
+pub(crate) mod data_layout;
+pub(crate) mod data_read;
+pub(crate) mod dataspace;
+pub(crate) mod datatype;
+pub(crate) mod error;
+pub(crate) mod extensible_array;
+pub(crate) mod file_writer;
+pub(crate) mod filter_pipeline;
+pub(crate) mod filters;
+pub(crate) mod fixed_array;
+pub(crate) mod fractal_heap;
+pub(crate) mod global_heap;
+pub(crate) mod group_info;
+pub(crate) mod group_v1;
+pub(crate) mod group_v2;
 #[cfg(feature = "parallel")]
-pub mod lane_partition;
-pub mod link_info;
-pub mod link_message;
-pub mod local_heap;
-pub mod message_type;
-pub mod metadata_index;
-pub mod object_header;
-pub mod object_header_writer;
+pub(crate) mod lane_partition;
+pub(crate) mod link_info;
+pub(crate) mod link_message;
+pub(crate) mod local_heap;
+pub(crate) mod message_type;
+pub(crate) mod metadata_index;
+pub(crate) mod object_header;
+pub(crate) mod object_header_writer;
 #[cfg(feature = "parallel")]
-pub mod parallel_read;
-pub mod scaleoffset;
-pub mod shared_message;
-pub mod signature;
-pub mod source;
-pub mod superblock;
-pub mod symbol_table;
-pub mod type_builders;
-pub mod vl_data;
+pub(crate) mod parallel_read;
+pub(crate) mod scaleoffset;
+pub(crate) mod shared_message;
+pub(crate) mod signature;
+pub(crate) mod source;
+pub(crate) mod superblock;
+pub(crate) mod symbol_table;
+pub(crate) mod type_builders;
+pub(crate) mod vl_data;
 #[cfg(feature = "zfp")]
-pub mod zfp;
+pub(crate) mod zfp;
 
 #[cfg(feature = "provenance")]
-pub mod provenance;
+pub(crate) mod provenance;
 
 #[cfg(not(feature = "std"))]
 pub(crate) mod nosync;
@@ -131,19 +144,19 @@ pub(crate) mod nosync;
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "std")]
-pub mod reader;
+pub(crate) mod reader;
 #[cfg(feature = "std")]
-pub mod swmr_writer;
+pub(crate) mod swmr_writer;
 #[cfg(feature = "std")]
-pub mod types;
+pub(crate) mod types;
 #[cfg(feature = "std")]
-pub mod writer;
+pub(crate) mod writer;
 
 #[cfg(feature = "std")]
 pub mod mat;
 
 #[cfg(feature = "ndarray")]
-pub mod ndarray_support;
+pub(crate) mod ndarray_support;
 
 // ---------------------------------------------------------------------------
 // Public API re-exports
@@ -170,8 +183,12 @@ pub use ndarray_support::H5Element;
 
 pub use scaleoffset::ScaleOffset;
 
+// The HDF5 datatype handle returned by the `make_*_type` constructors and
+// accepted by the compound/enum builders and `DatasetBuilder::with_dtype`.
+pub use datatype::Datatype;
+
 pub use type_builders::{
-    CompoundTypeBuilder, EnumTypeBuilder, make_f32_type, make_f64_type, make_i8_type,
-    make_i16_type, make_i32_type, make_i64_type, make_u8_type, make_u16_type, make_u32_type,
-    make_u64_type,
+    CompoundTypeBuilder, DatasetBuilder, EnumTypeBuilder, FinishedGroup, GroupBuilder,
+    make_f32_type, make_f64_type, make_i8_type, make_i16_type, make_i32_type, make_i64_type,
+    make_u8_type, make_u16_type, make_u32_type, make_u64_type,
 };

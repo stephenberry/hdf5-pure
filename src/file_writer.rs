@@ -28,10 +28,9 @@ use crate::type_builders::{
     patch_vl_refs,
 };
 
-// Re-export public types that moved to type_builders for API compatibility.
-#[cfg(feature = "provenance")]
-pub use crate::type_builders::ProvenanceConfig;
-pub use crate::type_builders::{AttrValue, CompoundTypeBuilder, EnumTypeBuilder};
+// `AttrValue` lives in `type_builders`; `types` and `mat` reference it through
+// this module's path, so keep it re-exported here.
+pub use crate::type_builders::AttrValue;
 
 use crate::datatype::{CharacterSet, Datatype};
 

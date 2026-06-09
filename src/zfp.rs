@@ -2926,3 +2926,10 @@ mod tests {
         }
     }
 }
+
+// Byte-level crosscheck of this codec against H5Z-ZFP reference fixtures. Lives
+// in-crate (rather than tests/) because it exercises the internal `compress`/
+// `decompress` entry points, which are no longer part of the public API.
+#[cfg(test)]
+#[path = "zfp_crosscheck.rs"]
+mod zfp_crosscheck;
