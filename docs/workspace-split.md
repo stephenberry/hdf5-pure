@@ -76,15 +76,20 @@ Features stay defined on the facade `hdf5-pure` and forward to the sub-crates:
 
 Each sub-crate keeps only the `#[cfg]`s relevant to its own contents, which removes most of the cross-cutting `cfg` scatter.
 
-## Publish model: single facade crate
+## Publish model: facade over published sub-crates
 
-Decision: **only `hdf5-pure` is published to crates.io.** The six sub-crates are workspace members referenced by path and version; they are not separately published, versioned, or documented for external use.
+Decision: **`hdf5-pure` is the only crate users are expected to depend on, but all seven crates must be published to crates.io.** This is a correction to an earlier draft of this section, which claimed only the facade would be published with the sub-crates referenced by path alone. That does not work: **crates.io rejects any published crate that has a path-only dependency.** When you run `cargo publish`, cargo discards the `path` and resolves each dependency by its `version` requirement against the registry, so every sub-crate the facade pulls in must already exist on crates.io. There is no "publish the facade only" option for a real multi-crate split — this is exactly the model gitoxide uses (the `gix-*` crates are all published, with `gix` as the facade).
 
-Rationale:
+What this means concretely:
 
-- Users see no change: `hdf5_pure::...` paths and the crate name stay identical.
-- One version, one `cargo publish`, one changelog. No N-crate version lockstep.
-- The internal boundaries can be renamed or re-drawn later without a public break, because nothing external depends on them directly.
+- **All seven crates are published, version-locked, in dependency order.** A release publishes bottom-up: `hdf5-core` → `hdf5-format` → `hdf5-filters` → `hdf5-engine` → `hdf5-api` → `hdf5-mat` → `hdf5-pure`. Each sub-crate dependency is declared as `{ path = "...", version = "=x.y.z" }` (or a compatible range) so local builds use the workspace path and published builds use the registry version. A `[workspace.package]` `version` field plus `version.workspace = true` in each member keeps them in lockstep from a single source of truth.
+- **One version number, but N publish steps.** The changelog can stay single (on the facade), but the release process is no longer one `cargo publish` — it is a scripted, ordered, all-or-nothing sequence. `cargo release` or `cargo-workspaces` handles this; doing it by hand is error-prone because a failure partway leaves a partial release on the registry (crates.io publishes are immutable; you can only yank).
+- **Each sub-crate now has its own public API on crates.io**, which `cargo-semver-checks` will track per-crate. This makes the "shrink the public surface" follow-up below more urgent, not less: every `pub` item in a sub-crate is a registry-visible commitment unless demoted to `pub(crate)` or the crate is explicitly documented as an internal implementation detail not covered by semver (a `README`/doc note, the convention gitoxide's `gix-*` crates use).
+
+What survives from the original rationale:
+
+- **Users see no change:** `hdf5_pure::...` paths and the crate name stay identical; `cargo add hdf5-pure` still pulls one dependency line (cargo resolves the rest transitively).
+- **The facade is still the stable public entry point**, and internal boundaries can still be re-drawn later — but only behind the facade's re-exports, since the sub-crates are now themselves on the registry and a careless change to a sub-crate's `pub` surface is a public break that `cargo-semver-checks` will flag.
 
 Consequence for the facade: because the current crate exposes almost every module as `pub mod`, the facade must re-export all of those paths (`pub use hdf5_engine::chunked_read;` etc.) to keep the public API byte-for-byte compatible. `cargo-semver-checks` (now in CI) will enforce that during the migration.
 
@@ -105,6 +110,7 @@ Each phase compiles and passes the full test suite on its own; land them as sepa
 5. **`hdf5-api`.** Move the 5 high-level modules; wire `std`/`ndarray`.
 6. **`hdf5-mat`.** Move `mat/**`; wire `serde`.
 7. **Reduce the facade to re-exports.** `src/lib.rs` becomes `pub use` lines only. Confirm `cargo-semver-checks` reports no public-API change versus the pre-split release.
+8. **Wire the multi-crate release.** Add `[workspace.package]` with a single `version`, set `version.workspace = true` on every member, and convert each sub-crate dependency to `{ path = "...", version = "=x.y.z" }`. Adopt a release tool (`cargo release` or `cargo-workspaces`) to publish bottom-up in one ordered, all-or-nothing step (see "Publish model"). This phase is a prerequisite for the *next* published release, not for the split landing on `main`; the path-only workspace compiles and tests fine without it.
 
 Throughout: `cargo fmt --check`, `cargo clippy -D warnings`, the full feature matrix, the no_std build, and the 32-bit jobs must stay green (CI already covers these). The cast-ratchet baseline in CI is measured on the whole crate and may need re-pointing per sub-crate.
 
@@ -123,4 +129,4 @@ This is real refactoring with test surface, tracked separately from the mechanic
 - **Incremental compile:** editing `hdf5-filters` (which holds the 2.9k-LoC `zfp.rs`) or `hdf5-format` no longer forces a full-crate rebuild of unrelated code. The win is bounded by the linear `core -> format -> filters -> engine` chain and by the engine remaining one ~14k-LoC unit; `hdf5-mat` and `hdf5-api` are the most independently rebuildable.
 - **Testing:** each layer gets its own test target and can be exercised in isolation.
 
-The split is feasible and low-risk as a mechanical refactor under the single-facade model. It does not, by itself, shrink the engine or break the read/write coupling; those are separate, deliberately-scoped follow-ups.
+The split is feasible and low-risk as a mechanical refactor under the published-facade model (all sub-crates published, `hdf5-pure` as the curated entry point). It does not, by itself, shrink the engine or break the read/write coupling; those are separate, deliberately-scoped follow-ups.
