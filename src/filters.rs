@@ -53,6 +53,10 @@ impl<'a> ChunkContext<'a> {
     /// Lightweight constructor for callers that don't need ZFP support — the
     /// element_type is left `None`, so any ZFP filter in the pipeline will
     /// error out. `element_size` must still be valid.
+    ///
+    /// Currently only used by tests (read/write paths build the context via
+    /// [`ChunkContext::from_datatype`]); gated so it is not shipped as dead code.
+    #[cfg(test)]
     pub fn basic(chunk_dims: &'a [u64], element_size: u32) -> Self {
         Self {
             chunk_dims,

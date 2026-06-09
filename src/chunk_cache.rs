@@ -116,20 +116,9 @@ impl CacheAlignedBuffer {
 
     /// Whether the buffer is empty.
     #[inline]
+    #[allow(dead_code)] // exercised by unit tests; companion to `len`
     pub fn is_empty(&self) -> bool {
         self.len == 0
-    }
-
-    /// The underlying aligned pointer.
-    #[inline]
-    pub fn as_ptr(&self) -> *const u8 {
-        self.ptr
-    }
-
-    /// Mutable pointer to the data.
-    #[inline]
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.ptr
     }
 
     /// Borrow as a byte slice.
@@ -267,26 +256,6 @@ struct CacheInner {
 
     /// Monotonic counter for LRU ordering.
     tick: u64,
-
-    /// Last accessed chunk coordinate (for sequential detection).
-    last_coord: Option<ChunkCoord>,
-
-    /// Access pattern statistics.
-    stats: AccessStats,
-}
-
-/// Access pattern statistics tracked by the chunk cache.
-///
-/// Updated on each `get_decompressed` / `put_decompressed` call to help
-/// the sweep detector understand the workload.
-#[derive(Debug, Clone, Default)]
-pub struct AccessStats {
-    /// Number of accesses that followed a sequential pattern.
-    pub sequential_count: u64,
-    /// Number of accesses that appeared random (non-sequential).
-    pub random_count: u64,
-    /// Last detected sweep direction description (informational).
-    pub sweep_direction: Option<&'static str>,
 }
 
 impl ChunkCache {
@@ -305,8 +274,6 @@ impl ChunkCache {
                 max_bytes,
                 max_slots,
                 tick: 0,
-                last_coord: None,
-                stats: AccessStats::default(),
             }),
         }
     }
@@ -339,12 +306,6 @@ impl ChunkCache {
         inner.index = Some(map);
     }
 
-    /// Look up a chunk by its spatial coordinate in the index.
-    pub fn lookup_index(&self, coord: &[u64]) -> Option<ChunkInfo> {
-        let inner = self.inner.lock().unwrap();
-        inner.index.as_ref()?.get(coord).cloned()
-    }
-
     /// Return all indexed chunks as a `Vec<ChunkInfo>` (order unspecified).
     pub fn all_indexed_chunks(&self) -> Option<Vec<ChunkInfo>> {
         let inner = self.inner.lock().unwrap();
@@ -361,23 +322,6 @@ impl ChunkCache {
         inner.tick += 1;
         let tick = inner.tick;
 
-        // Track sequential vs random access
-        let is_sequential = inner.last_coord.as_ref().is_some_and(|prev| {
-            // Sequential if exactly one dimension changed
-            let changes: usize = prev
-                .iter()
-                .zip(coord.iter())
-                .filter(|(a, b)| a != b)
-                .count();
-            changes <= 1
-        });
-        if is_sequential {
-            inner.stats.sequential_count += 1;
-        } else if inner.last_coord.is_some() {
-            inner.stats.random_count += 1;
-        }
-        inner.last_coord = Some(coord.to_vec());
-
         for slot in inner.slots.iter_mut() {
             if slot.coord.as_slice() == coord {
                 slot.last_access = tick;
@@ -388,6 +332,10 @@ impl ChunkCache {
     }
 
     /// Try to get a reference-counted clone of the aligned buffer for a chunk.
+    ///
+    /// Currently only exercised by unit tests; gated so it is not shipped as
+    /// dead code.
+    #[cfg(test)]
     pub fn get_decompressed_aligned(&self, coord: &[u64]) -> Option<CacheAlignedBuffer> {
         let mut inner = self.inner.lock().unwrap();
         inner.tick += 1;
@@ -455,60 +403,32 @@ impl ChunkCache {
     }
 
     /// Clear the entire cache (index + decompressed data).
+    ///
+    /// Currently only exercised by unit tests; gated so it is not shipped as
+    /// dead code.
+    #[cfg(test)]
     pub fn clear(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.index = None;
         inner.slots.clear();
         inner.current_bytes = 0;
         inner.tick = 0;
-        inner.last_coord = None;
-        inner.stats = AccessStats::default();
-    }
-
-    /// Hint that the given chunk coordinates will be accessed soon.
-    ///
-    /// Pre-populates the chunk index for these coordinates so that
-    /// subsequent lookups are O(1). This does NOT pre-decompress the
-    /// chunks — it only ensures the index entries exist.
-    pub fn prefetch_hint(&self, next_coords: &[ChunkCoord]) {
-        let inner = self.inner.lock().unwrap();
-        if inner.index.is_none() {
-            return;
-        }
-        drop(inner);
-        // For each predicted coordinate, verify it exists in the index.
-        // The index is already populated, so this is a no-op for known chunks.
-        // The purpose is to signal intent — callers can pre-decompress if needed.
-        // We touch the stats to record that prefetch hints were issued.
-        let mut inner = self.inner.lock().unwrap();
-        for coord in next_coords {
-            let exists = inner
-                .index
-                .as_ref()
-                .map(|idx| idx.contains_key(coord))
-                .unwrap_or(false);
-            if exists {
-                inner.stats.sequential_count += 1;
-            }
-        }
-    }
-
-    /// Return the current access pattern statistics.
-    pub fn access_stats(&self) -> AccessStats {
-        self.inner.lock().unwrap().stats.clone()
-    }
-
-    /// Update the sweep direction label in the access stats.
-    pub fn set_sweep_direction(&self, direction: &'static str) {
-        self.inner.lock().unwrap().stats.sweep_direction = Some(direction);
     }
 
     /// Number of decompressed chunks currently cached.
+    ///
+    /// Currently only exercised by unit tests; gated so it is not shipped as
+    /// dead code.
+    #[cfg(test)]
     pub fn cached_chunk_count(&self) -> usize {
         self.inner.lock().unwrap().slots.len()
     }
 
     /// Total bytes of decompressed data currently cached.
+    ///
+    /// Currently only exercised by unit tests; gated so it is not shipped as
+    /// dead code.
+    #[cfg(test)]
     pub fn cached_bytes(&self) -> usize {
         self.inner.lock().unwrap().current_bytes
     }
@@ -547,13 +467,14 @@ mod tests {
         cache.populate_index(&chunks, 2); // rank=2, truncate to [0,0] and [10,0]
         assert!(cache.has_index());
 
-        let c0 = cache.lookup_index(&[0, 0]).unwrap();
-        assert_eq!(c0.address, 0x1000);
-
-        let c1 = cache.lookup_index(&[10, 0]).unwrap();
-        assert_eq!(c1.address, 0x2000);
-
-        assert!(cache.lookup_index(&[5, 0]).is_none());
+        let mut addrs: Vec<u64> = cache
+            .all_indexed_chunks()
+            .unwrap()
+            .iter()
+            .map(|c| c.address)
+            .collect();
+        addrs.sort_unstable();
+        assert_eq!(addrs, vec![0x1000, 0x2000]);
     }
 
     #[test]

@@ -61,7 +61,9 @@ pub struct SymbolTableEntry {
     pub object_header_address: u64,
     /// Cache type: 0=none, 1=group, 2=symbolic link.
     pub cache_type: u32,
-    /// 16-byte scratch pad (cached data).
+    /// 16-byte scratch pad (cached data). Parsed for on-disk-format
+    /// completeness; not used by the reader.
+    #[allow(dead_code)]
     pub scratch_pad: [u8; 16],
 }
 

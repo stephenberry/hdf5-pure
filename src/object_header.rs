@@ -17,6 +17,10 @@ const OHDR_SIGNATURE: [u8; 4] = [b'O', b'H', b'D', b'R'];
 const OCHK_SIGNATURE: [u8; 4] = [b'O', b'C', b'H', b'K'];
 
 /// A single parsed header message.
+///
+/// `size` and `creation_order` are decoded from the on-disk message prefix for
+/// completeness but are not consulted by the current reader.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct HeaderMessage {
     /// The message type.
@@ -32,6 +36,11 @@ pub struct HeaderMessage {
 }
 
 /// Parsed HDF5 object header.
+///
+/// The version/refcount/flags and the four v2 timestamp fields are decoded from
+/// the header for on-disk-format completeness but are not consulted by the
+/// current reader; kept to document the format.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ObjectHeader {
     /// Header version (1 or 2).

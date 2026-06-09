@@ -97,8 +97,6 @@ pub enum FormatError {
     InvalidLinkType(u8),
     /// Invalid Link Info message version.
     InvalidLinkInfoVersion(u8),
-    /// Invalid Group Info message version.
-    InvalidGroupInfoVersion(u8),
     /// Invalid B-tree v2 signature.
     InvalidBTreeV2Signature,
     /// Invalid B-tree v2 version.
@@ -115,12 +113,6 @@ pub enum FormatError {
     InvalidAttributeInfoVersion(u8),
     /// Invalid shared message version.
     InvalidSharedMessageVersion(u8),
-    /// Invalid SOHM table version.
-    InvalidSohmTableVersion(u8),
-    /// Invalid SOHM table signature (expected "SMTB").
-    InvalidSohmTableSignature,
-    /// Invalid SOHM list signature (expected "SMLI").
-    InvalidSohmListSignature,
     /// Invalid global heap collection signature.
     InvalidGlobalHeapSignature,
     /// Invalid global heap version.
@@ -319,9 +311,6 @@ impl fmt::Display for FormatError {
             FormatError::InvalidLinkInfoVersion(v) => {
                 write!(f, "invalid link info message version: {v}")
             }
-            FormatError::InvalidGroupInfoVersion(v) => {
-                write!(f, "invalid group info message version: {v}")
-            }
             FormatError::InvalidBTreeV2Signature => {
                 write!(f, "invalid B-tree v2 signature")
             }
@@ -345,15 +334,6 @@ impl fmt::Display for FormatError {
             }
             FormatError::InvalidSharedMessageVersion(v) => {
                 write!(f, "invalid shared message version: {v}")
-            }
-            FormatError::InvalidSohmTableVersion(v) => {
-                write!(f, "invalid SOHM table version: {v}")
-            }
-            FormatError::InvalidSohmTableSignature => {
-                write!(f, "invalid SOHM table signature (expected SMTB)")
-            }
-            FormatError::InvalidSohmListSignature => {
-                write!(f, "invalid SOHM list signature (expected SMLI)")
             }
             FormatError::InvalidGlobalHeapSignature => {
                 write!(f, "invalid global heap collection signature")

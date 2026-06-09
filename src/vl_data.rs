@@ -155,48 +155,6 @@ pub fn read_vl_strings(
     Ok(result)
 }
 
-/// Resolve VL byte sequences from raw data.
-pub fn read_vl_bytes(
-    file_data: &[u8],
-    raw_data: &[u8],
-    num_elements: u64,
-    offset_size: u8,
-    length_size: u8,
-) -> Result<Vec<Vec<u8>>, FormatError> {
-    let refs = parse_vl_references(raw_data, num_elements, offset_size)?;
-    let mut result = Vec::with_capacity(refs.len());
-
-    for vl in &refs {
-        if vl.length == 0
-            && (is_undefined_address(vl.collection_address, offset_size)
-                || vl.collection_address == 0)
-        {
-            result.push(Vec::new());
-            continue;
-        }
-
-        let coll =
-            GlobalHeapCollection::parse(file_data, vl.collection_address.to_usize()?, length_size)?;
-        let index = u16::try_from(vl.object_index).map_err(|_| {
-            FormatError::VlDataError(format!(
-                "global heap object index {} does not fit u16",
-                vl.object_index
-            ))
-        })?;
-        let obj = coll
-            .get_object(index)
-            .ok_or(FormatError::GlobalHeapObjectNotFound {
-                collection_address: vl.collection_address,
-                index,
-            })?;
-
-        let len = (vl.length as usize).min(obj.data.len());
-        result.push(obj.data[..len].to_vec());
-    }
-
-    Ok(result)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -313,30 +271,6 @@ mod tests {
         let file_data = vec![0u8; 16];
         let strings = read_vl_strings(&file_data, &raw, 1, 8, 8).unwrap();
         assert_eq!(strings, vec![""]);
-    }
-
-    #[test]
-    fn read_vl_bytes_from_heap() {
-        let gcol_offset = 128usize;
-        let mut file_data = vec![0u8; 512];
-        build_gcol_at(
-            &mut file_data,
-            gcol_offset,
-            &[(1, &[0xDE, 0xAD]), (2, &[0xBE, 0xEF, 0xCA])],
-        );
-
-        let _raw = build_vl_refs(&["ab", "abc"], gcol_offset as u64, 1, 8);
-        // Fix lengths to match actual byte lengths
-        let mut raw_fixed = Vec::new();
-        raw_fixed.extend_from_slice(&2u32.to_le_bytes());
-        raw_fixed.extend_from_slice(&(gcol_offset as u64).to_le_bytes());
-        raw_fixed.extend_from_slice(&1u32.to_le_bytes());
-        raw_fixed.extend_from_slice(&3u32.to_le_bytes());
-        raw_fixed.extend_from_slice(&(gcol_offset as u64).to_le_bytes());
-        raw_fixed.extend_from_slice(&2u32.to_le_bytes());
-
-        let bytes = read_vl_bytes(&file_data, &raw_fixed, 2, 8, 8).unwrap();
-        assert_eq!(bytes, vec![vec![0xDE, 0xAD], vec![0xBE, 0xEF, 0xCA]]);
     }
 
     #[test]

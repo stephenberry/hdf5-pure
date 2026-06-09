@@ -7,6 +7,11 @@ use crate::convert::TryToUsize;
 use crate::error::FormatError;
 
 /// A parsed B-tree v1 node.
+///
+/// Some fields are decoded from the on-disk node for completeness but are not
+/// consulted by the current traversal (which walks `children`); they are kept
+/// to document the format and allow future use.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct BTreeV1Node {
     /// Node type: 0=group, 1=raw data chunks.

@@ -28,6 +28,10 @@ enum HeapChild {
 }
 
 /// Parsed fractal heap header (signature "FRHP").
+///
+/// Several header fields are decoded for on-disk-format completeness but are
+/// not consulted by the current heap reader; kept to document the format.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct FractalHeapHeader {
     /// Length of heap IDs in bytes (typically 7).

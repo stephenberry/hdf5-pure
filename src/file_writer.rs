@@ -20,7 +20,6 @@ use crate::dataspace::{Dataspace, DataspaceType};
 use crate::error::FormatError;
 use crate::link_message::{LinkMessage, LinkTarget};
 use crate::message_type::MessageType;
-use crate::metadata_index::{DatasetMetadata, MetadataBlock, MetadataIndex};
 use crate::object_header_writer::ObjectHeaderWriter;
 use crate::superblock::Superblock;
 use crate::type_builders::{
@@ -372,11 +371,6 @@ fn write_undef_offset(buf: &mut Vec<u8>, offset_size: u8) {
 }
 
 // ---- FileWriter ----
-
-/// An opaque handle representing a dataset or group whose address will be
-/// resolved during file serialization.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ObjectHandle(usize);
 
 /// The main file creation API.
 pub struct FileWriter {
@@ -1030,68 +1024,6 @@ impl FileWriter {
     }
 }
 
-// ---- Independent parallel dataset creation ----
-
-/// Builder that creates datasets without locking the file header.
-///
-/// Each `IndependentDatasetBuilder` accumulates its own [`MetadataBlock`]
-/// independently. On [`IndependentDatasetBuilder::finish`], the block is
-/// returned for later merging.
-///
-/// Thread-safety: each thread should own its own builder instance.
-pub struct IndependentDatasetBuilder {
-    block: MetadataBlock,
-}
-
-impl IndependentDatasetBuilder {
-    /// Create a new independent builder with the given creator id.
-    pub fn new(creator_id: u32) -> Self {
-        Self {
-            block: MetadataBlock::new(creator_id),
-        }
-    }
-
-    /// Add a dataset specification to this builder.
-    pub fn add_dataset(&mut self, meta: DatasetMetadata) {
-        self.block.add_dataset(meta);
-    }
-
-    /// Consume the builder and return the metadata block.
-    pub fn finish(self) -> MetadataBlock {
-        self.block
-    }
-}
-
-/// Finalize multiple independently-created metadata blocks into a complete HDF5 file.
-///
-/// This implements the write-ahead approach: each block's data is laid out
-/// sequentially, then the index table (root group with links) is written last
-/// to point at all the dataset object headers.
-pub fn finalize_parallel(blocks: Vec<MetadataBlock>) -> Result<Vec<u8>, FormatError> {
-    let index = MetadataIndex::merge_blocks(&blocks)?;
-    finalize_from_index(index)
-}
-
-/// Build a complete HDF5 file from a merged MetadataIndex.
-fn finalize_from_index(index: MetadataIndex) -> Result<Vec<u8>, FormatError> {
-    // Convert DatasetMetadata into the internal DsFlat representation and
-    // delegate to the same two-pass algorithm used by FileWriter.
-    let mut fw = FileWriter::new();
-    for ds_meta in &index.datasets {
-        let db = fw.create_dataset(&ds_meta.name);
-        // Set the datatype and raw data directly via internal fields
-        db.datatype = Some(ds_meta.datatype.clone());
-        db.shape = Some(ds_meta.dataspace.dimensions.clone());
-        db.maxshape = ds_meta.maxshape.clone();
-        db.data = Some(ds_meta.raw_data.clone());
-        db.chunk_options = ds_meta.chunk_options.clone();
-        for (name, val) in &ds_meta.attrs {
-            db.set_attr(name, val.clone());
-        }
-    }
-    fw.finish()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1293,76 +1225,5 @@ mod tests {
         let (off, len) = fh.decode_managed_id(&id).unwrap();
         assert_eq!(off, 100);
         assert_eq!(len, 42);
-    }
-
-    #[test]
-    fn finalize_parallel_basic() {
-        use crate::chunked_write::ChunkOptions;
-        use crate::metadata_index::{MetadataBlock, build_dataset_metadata};
-        use crate::type_builders::make_f64_type;
-
-        let mut b0 = MetadataBlock::new(0);
-        let data_a: Vec<u8> = [1.0f64, 2.0, 3.0]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        b0.add_dataset(build_dataset_metadata(
-            "alpha",
-            make_f64_type(),
-            vec![3],
-            data_a,
-            ChunkOptions::default(),
-            None,
-            vec![],
-        ));
-
-        let mut b1 = MetadataBlock::new(1);
-        let data_b: Vec<u8> = [10.0f64, 20.0]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        b1.add_dataset(build_dataset_metadata(
-            "beta",
-            make_f64_type(),
-            vec![2],
-            data_b,
-            ChunkOptions::default(),
-            None,
-            vec![],
-        ));
-
-        let bytes = finalize_parallel(vec![b0, b1]).unwrap();
-        assert_eq!(read_dataset_f64(&bytes, "alpha"), vec![1.0, 2.0, 3.0]);
-        assert_eq!(read_dataset_f64(&bytes, "beta"), vec![10.0, 20.0]);
-    }
-
-    #[test]
-    fn finalize_parallel_duplicate_error() {
-        use crate::chunked_write::ChunkOptions;
-        use crate::metadata_index::{MetadataBlock, build_dataset_metadata};
-        use crate::type_builders::make_f64_type;
-
-        let mut b0 = MetadataBlock::new(0);
-        b0.add_dataset(build_dataset_metadata(
-            "dup",
-            make_f64_type(),
-            vec![1],
-            vec![0u8; 8],
-            ChunkOptions::default(),
-            None,
-            vec![],
-        ));
-        let mut b1 = MetadataBlock::new(1);
-        b1.add_dataset(build_dataset_metadata(
-            "dup",
-            make_f64_type(),
-            vec![1],
-            vec![0u8; 8],
-            ChunkOptions::default(),
-            None,
-            vec![],
-        ));
-        let err = finalize_parallel(vec![b0, b1]).unwrap_err();
-        assert!(matches!(err, FormatError::DuplicateDatasetName(_)));
     }
 }

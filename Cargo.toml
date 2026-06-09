@@ -15,7 +15,6 @@ exclude = ["tests/fixtures/**"]
 default = ["std", "checksum", "deflate"]
 std = []
 checksum = []
-fast-checksum = ["crc32fast"]
 deflate = ["flate2"]
 fast-deflate = ["flate2/zlib-ng"]
 provenance = ["sha2"]
@@ -42,7 +41,6 @@ byteorder = { version = "1", default-features = false }
 flate2 = { version = "1", optional = true, default-features = false, features = ["rust_backend"] }
 sha2 = { version = "0.10", optional = true, default-features = false }
 rayon = { version = "1", optional = true }
-crc32fast = { version = "1", optional = true }
 serde = { version = "1", optional = true, default-features = false, features = ["derive", "alloc"] }
 # A permissive range (like `hdf5-metno`'s own `ndarray` requirement) so the
 # user's existing `ndarray` unifies with ours instead of compiling a second

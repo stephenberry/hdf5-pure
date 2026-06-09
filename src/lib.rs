@@ -66,18 +66,14 @@
 //! ```
 
 #![cfg_attr(not(feature = "std"), no_std)]
-// Transitional (0.10.0): encapsulating the internal modules as `pub(crate)`
-// surfaced a large amount of code that was only reachable because it had been
-// `pub` — parsed-but-unused struct fields plus several not-yet-wired or
-// apparently-abandoned subsystems (the SOHM message-table parser in
-// `shared_message`, the `metadata_index` module, the "sweep" reader in
-// `chunked_read`, the batch writer in `object_header_writer`, and the CRC32 /
-// `fast-checksum` apparatus in `checksum`, which HDF5's Jenkins-lookup3 metadata
-// checksums never use). Rather than delete coherent in-progress code under one
-// change, this allow is kept crate-wide so the encapsulation lands cleanly; a
-// dedicated follow-up audits each item (delete vs keep), removes this line, and
-// restores `dead_code` enforcement.
-#![allow(dead_code)]
+// In `no_std` builds the high-level entry points that consume the parsing and
+// serialization machinery — the `reader`, `writer`, and `swmr_writer` modules —
+// are `std`-gated and therefore absent, leaving much of that machinery without
+// an in-crate consumer. It is deliberately kept available for future `no_std`
+// readers/writers rather than cfg-gating every module to `std`, so `dead_code`
+// is allowed only in `no_std` builds. `std` builds (the primary target) keep
+// full `dead_code` enforcement.
+#![cfg_attr(not(feature = "std"), allow(dead_code))]
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -108,7 +104,6 @@ pub(crate) mod filters;
 pub(crate) mod fixed_array;
 pub(crate) mod fractal_heap;
 pub(crate) mod global_heap;
-pub(crate) mod group_info;
 pub(crate) mod group_v1;
 pub(crate) mod group_v2;
 #[cfg(feature = "parallel")]
@@ -117,7 +112,6 @@ pub(crate) mod link_info;
 pub(crate) mod link_message;
 pub(crate) mod local_heap;
 pub(crate) mod message_type;
-pub(crate) mod metadata_index;
 pub(crate) mod object_header;
 pub(crate) mod object_header_writer;
 #[cfg(feature = "parallel")]

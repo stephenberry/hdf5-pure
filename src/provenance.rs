@@ -9,12 +9,6 @@ use alloc::{format, string::String, vec::Vec};
 use sha2::{Digest, Sha256};
 
 use crate::attribute::AttributeMessage;
-use crate::data_layout::DataLayout;
-use crate::data_read::read_raw_data;
-use crate::dataspace::Dataspace;
-use crate::datatype::Datatype;
-use crate::error::FormatError;
-use crate::object_header::ObjectHeader;
 use crate::type_builders::{AttrValue, build_attr_message};
 
 // ---- Attribute name constants ----
@@ -74,99 +68,6 @@ impl Provenance {
     }
 }
 
-// ---- Verification ----
-
-/// Result of a provenance verification check.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum VerifyResult {
-    /// Hash matches — data integrity confirmed.
-    Ok,
-    /// Hash mismatch — stored vs computed.
-    Mismatch { stored: String, computed: String },
-    /// No provenance hash attribute found on this dataset.
-    NoHash,
-}
-
-/// Verify the integrity of a dataset by recomputing its SHA-256 hash and
-/// comparing it against the stored `_provenance_sha256` attribute.
-///
-/// `file_data` is the entire HDF5 file bytes; `header` is the parsed object
-/// header for the dataset of interest.
-pub fn verify_dataset(
-    file_data: &[u8],
-    header: &ObjectHeader,
-    offset_size: u8,
-    length_size: u8,
-) -> Result<VerifyResult, FormatError> {
-    // 1. Extract all attributes (compact + dense).
-    let attrs =
-        crate::attribute::extract_attributes_full(file_data, header, offset_size, length_size)?;
-
-    // 2. Find the stored hash.
-    let stored_hash = attrs
-        .iter()
-        .find(|a| a.name == ATTR_SHA256)
-        .and_then(|a| core::str::from_utf8(&a.raw_data).ok())
-        .map(|s| s.trim_end_matches('\0').to_string());
-
-    let stored_hash = match stored_hash {
-        Some(h) => h,
-        None => return Ok(VerifyResult::NoHash),
-    };
-
-    // 3. Read the raw dataset data.
-    let dt_msg = header
-        .messages
-        .iter()
-        .find(|m| m.msg_type == crate::message_type::MessageType::Datatype)
-        .ok_or_else(|| FormatError::SerializationError("missing Datatype message".into()))?;
-    let ds_msg = header
-        .messages
-        .iter()
-        .find(|m| m.msg_type == crate::message_type::MessageType::Dataspace)
-        .ok_or_else(|| FormatError::SerializationError("missing Dataspace message".into()))?;
-    let dl_msg = header
-        .messages
-        .iter()
-        .find(|m| m.msg_type == crate::message_type::MessageType::DataLayout)
-        .ok_or_else(|| FormatError::SerializationError("missing DataLayout message".into()))?;
-
-    let (dt, _) = Datatype::parse(&dt_msg.data)?;
-    let ds = Dataspace::parse(&ds_msg.data, length_size)?;
-    let dl = DataLayout::parse(&dl_msg.data, offset_size, length_size)?;
-
-    let pipeline = header
-        .messages
-        .iter()
-        .find(|m| m.msg_type == crate::message_type::MessageType::FilterPipeline)
-        .map(|m| crate::filter_pipeline::FilterPipeline::parse(&m.data))
-        .transpose()?;
-
-    let raw = match &dl {
-        DataLayout::Chunked { .. } => crate::chunked_read::read_chunked_data(
-            file_data,
-            &dl,
-            &ds,
-            &dt,
-            pipeline.as_ref(),
-            offset_size,
-            length_size,
-        )?,
-        _ => read_raw_data(file_data, &dl, &ds, &dt)?,
-    };
-
-    // 4. Compare.
-    let computed = sha256_hex(&raw);
-    if computed == stored_hash {
-        Ok(VerifyResult::Ok)
-    } else {
-        Ok(VerifyResult::Mismatch {
-            stored: stored_hash,
-            computed,
-        })
-    }
-}
-
 // ---- Tests ----
 
 #[cfg(test)]
@@ -216,68 +117,5 @@ mod tests {
         let attrs = prov.build_attrs(b"data");
         assert_eq!(attrs.len(), 4);
         assert_eq!(attrs[3].name, ATTR_SOURCE);
-    }
-
-    #[test]
-    fn roundtrip_provenance_on_file() {
-        use crate::file_writer::FileWriter;
-        use crate::group_v2::resolve_path_any;
-        use crate::signature;
-        use crate::superblock::Superblock;
-
-        let raw_data: Vec<u8> = (0..24u64).flat_map(|v| (v as f64).to_le_bytes()).collect();
-        let expected_hash = sha256_hex(&raw_data);
-
-        let mut fw = FileWriter::new();
-        let ds = fw.create_dataset("sensor");
-        ds.with_f64_data(&(0..24).map(|v| v as f64).collect::<Vec<_>>());
-        ds.set_attr(ATTR_SHA256, AttrValue::String(expected_hash.clone()));
-        ds.set_attr(ATTR_CREATOR, AttrValue::String("test-suite".into()));
-        ds.set_attr(
-            ATTR_TIMESTAMP,
-            AttrValue::String("2026-02-19T12:00:00Z".into()),
-        );
-        let bytes = fw.finish().unwrap();
-
-        // Verify round-trip
-        let sig = signature::find_signature(&bytes).unwrap();
-        let sb = Superblock::parse(&bytes, sig).unwrap();
-        let addr = resolve_path_any(&bytes, &sb, "sensor").unwrap();
-        let hdr = crate::object_header::ObjectHeader::parse(
-            &bytes,
-            addr as usize,
-            sb.offset_size,
-            sb.length_size,
-        )
-        .unwrap();
-
-        let result = verify_dataset(&bytes, &hdr, sb.offset_size, sb.length_size).unwrap();
-        assert_eq!(result, VerifyResult::Ok);
-    }
-
-    #[test]
-    fn verify_no_hash_attribute() {
-        use crate::file_writer::FileWriter;
-        use crate::group_v2::resolve_path_any;
-        use crate::signature;
-        use crate::superblock::Superblock;
-
-        let mut fw = FileWriter::new();
-        fw.create_dataset("plain").with_f64_data(&[1.0, 2.0]);
-        let bytes = fw.finish().unwrap();
-
-        let sig = signature::find_signature(&bytes).unwrap();
-        let sb = Superblock::parse(&bytes, sig).unwrap();
-        let addr = resolve_path_any(&bytes, &sb, "plain").unwrap();
-        let hdr = crate::object_header::ObjectHeader::parse(
-            &bytes,
-            addr as usize,
-            sb.offset_size,
-            sb.length_size,
-        )
-        .unwrap();
-
-        let result = verify_dataset(&bytes, &hdr, sb.offset_size, sb.length_size).unwrap();
-        assert_eq!(result, VerifyResult::NoHash);
     }
 }

@@ -1,10 +1,7 @@
-//! HDF5 metadata checksum: Jenkins lookup3 `hashlittle` and CRC32.
+//! HDF5 metadata checksum: Jenkins lookup3 `hashlittle`.
 //!
 //! HDF5 uses Bob Jenkins' lookup3 hash (not CRC32C) for all metadata
 //! checksums in superblocks, object headers, B-tree nodes, etc.
-//!
-//! When the `fast-checksum` feature is enabled, CRC32 computations use
-//! hardware-accelerated instructions via the `crc32fast` crate.
 
 /// Compute the Jenkins lookup3 checksum of a byte slice.
 ///
@@ -13,54 +10,6 @@
 pub fn jenkins_lookup3(data: &[u8]) -> u32 {
     hashlittle(data, 0)
 }
-
-/// Compute CRC32 (IEEE / ISO 3309) over data.
-///
-/// When the `fast-checksum` feature is enabled, this uses hardware CRC32
-/// instructions on x86 (SSE 4.2) and ARM (CRC extension) via `crc32fast`.
-/// Otherwise falls back to a software table-based implementation.
-pub fn crc32(data: &[u8]) -> u32 {
-    #[cfg(feature = "fast-checksum")]
-    {
-        crc32fast::hash(data)
-    }
-    #[cfg(not(feature = "fast-checksum"))]
-    {
-        crc32_software(data)
-    }
-}
-
-/// Software CRC32 (always available, for testing/comparison).
-pub fn crc32_software(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFFFFFF;
-    for &byte in data {
-        let index = ((crc ^ byte as u32) & 0xFF) as usize;
-        crc = CRC32_TABLE[index] ^ (crc >> 8);
-    }
-    crc ^ 0xFFFFFFFF
-}
-
-/// CRC32 lookup table (IEEE polynomial 0xEDB88320).
-#[rustfmt::skip]
-const CRC32_TABLE: [u32; 256] = {
-    let mut table = [0u32; 256];
-    let mut i = 0u32;
-    while i < 256 {
-        let mut crc = i;
-        let mut j = 0;
-        while j < 8 {
-            if crc & 1 != 0 {
-                crc = 0xEDB88320 ^ (crc >> 1);
-            } else {
-                crc >>= 1;
-            }
-            j += 1;
-        }
-        table[i as usize] = crc;
-        i += 1;
-    }
-    table
-};
 
 fn rot(x: u32, k: u32) -> u32 {
     x.rotate_left(k)
@@ -263,32 +212,5 @@ mod tests {
             computed, stored,
             "Jenkins lookup3 should match HDF5 superblock checksum"
         );
-    }
-
-    // --- CRC32 tests ---
-
-    #[test]
-    fn crc32_empty() {
-        assert_eq!(crc32(b""), 0);
-    }
-
-    #[test]
-    fn crc32_known_value() {
-        // CRC32 of "123456789" is 0xCBF43926
-        assert_eq!(crc32(b"123456789"), 0xCBF43926);
-    }
-
-    #[test]
-    fn crc32_software_matches() {
-        let data: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
-        let hw = crc32(&data);
-        let sw = crc32_software(&data);
-        assert_eq!(hw, sw);
-    }
-
-    #[test]
-    fn crc32_deterministic() {
-        let data = b"hello world";
-        assert_eq!(crc32(data), crc32(data));
     }
 }

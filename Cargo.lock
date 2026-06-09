@@ -307,7 +307,6 @@ name = "hdf5-pure"
 version = "0.10.0"
 dependencies = [
  "byteorder",
- "crc32fast",
  "flate2",
  "hdf5-metno",
  "ndarray",
