@@ -19,12 +19,10 @@
 //! active as the codec is parameterized (Step 3) and extended to N-D
 //! (Step 5). Any supported-fixture failure fails the test.
 
-#![cfg(feature = "zfp")]
-
 use std::fs;
 use std::path::PathBuf;
 
-use hdf5_pure::zfp::{self, ZfpElementType};
+use crate::zfp::{self, ZfpElementType};
 use serde::Deserialize;
 
 fn dtype_to_elem_type(dtype: &str) -> Result<ZfpElementType, String> {
