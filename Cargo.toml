@@ -42,7 +42,14 @@ exclude = ["tests/fixtures/**"]
 
 [features]
 default = ["std", "checksum", "deflate"]
-std = ["hdf5-core/std", "hdf5-format/std", "hdf5-filters/std", "hdf5-engine/std"]
+std = [
+    "hdf5-core/std",
+    "hdf5-format/std",
+    "hdf5-filters/std",
+    "hdf5-engine/std",
+    "dep:hdf5-api",
+    "hdf5-api/std",
+]
 checksum = ["hdf5-core/checksum", "hdf5-format/checksum", "hdf5-engine/checksum"]
 fast-checksum = ["hdf5-core/fast-checksum"]
 deflate = ["hdf5-filters/deflate", "hdf5-engine/deflate"]
@@ -55,7 +62,7 @@ zfp = ["hdf5-filters/zfp", "hdf5-engine/zfp"]
 # Ergonomic N-dimensional array I/O via the `ndarray` crate
 # (`DatasetBuilder::with_ndarray`, `Dataset::read_array`/`read_array_dyn`).
 # Requires `std` (it builds on the File/Dataset reader and writer APIs).
-ndarray = ["dep:ndarray", "std", "hdf5-engine/ndarray"]
+ndarray = ["std", "hdf5-engine/ndarray", "hdf5-api/ndarray"]
 # Serde-based (de)serialization of MATLAB v7.3 .mat files.
 # Requires `std` (uses File/Group/Dataset reader APIs).
 serde = ["dep:serde", "std"]
@@ -67,20 +74,21 @@ serde = ["dep:serde", "std"]
 matio-crosscheck = ["serde"]
 
 [dependencies]
-hdf5-core = { path = "crates/hdf5-core", version = "=0.9.0" }
-hdf5-format = { path = "crates/hdf5-format", version = "=0.9.0" }
-hdf5-filters = { path = "crates/hdf5-filters", version = "=0.9.0" }
-hdf5-engine = { path = "crates/hdf5-engine", version = "=0.9.0" }
+hdf5-core = { path = "crates/hdf5-core", version = "=0.9.0", default-features = false }
+hdf5-format = { path = "crates/hdf5-format", version = "=0.9.0", default-features = false }
+hdf5-filters = { path = "crates/hdf5-filters", version = "=0.9.0", default-features = false }
+hdf5-engine = { path = "crates/hdf5-engine", version = "=0.9.0", default-features = false }
+hdf5-api = { path = "crates/hdf5-api", version = "=0.9.0", optional = true, default-features = false }
 serde = { version = "1", optional = true, default-features = false, features = ["derive", "alloc"] }
-# A permissive range (like `hdf5-metno`'s own `ndarray` requirement) so the
-# user's existing `ndarray` unifies with ours instead of compiling a second
-# copy. Only APIs stable across 0.16/0.17 are used.
-ndarray = { version = ">=0.16, <0.18", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
+# Used by the ndarray integration tests/examples. `ndarray` is otherwise a
+# transitive dependency (pulled by `hdf5-api` under the `ndarray` feature), so
+# it is declared here as well to be nameable from the facade's test crates.
+ndarray = ">=0.16, <0.18"
 
 # The reference HDF5 C library, used only by the byte-level crosscheck tests.
 # Its `static` feature compiles libhdf5 from source via CMake, which does not

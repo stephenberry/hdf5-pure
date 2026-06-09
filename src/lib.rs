@@ -75,15 +75,21 @@ extern crate alloc;
 // ---------------------------------------------------------------------------
 
 // Re-exported from `hdf5-core` (keeps the `hdf5_pure::<module>` paths and the
-// in-crate `crate::<module>` references resolving unchanged).
+// in-crate `crate::<module>` references resolving unchanged). `#[doc(inline)]`
+// makes rustdoc render and emit the inlined contents under `hdf5_pure::*` so
+// the documented and semver-tracked surface matches the pre-split crate.
+#[doc(inline)]
 pub use hdf5_core::{checksum, convert, error, message_type, signature, source};
 
 // Re-exported from `hdf5-filters`.
 #[cfg(feature = "zfp")]
+#[doc(inline)]
 pub use hdf5_filters::zfp;
+#[doc(inline)]
 pub use hdf5_filters::{filter_pipeline, filters, scaleoffset};
 
 // Re-exported from `hdf5-format`.
+#[doc(inline)]
 pub use hdf5_format::{
     attribute_info, btree_v1, btree_v2, data_layout, dataspace, datatype, fractal_heap,
     global_heap, group_info, link_info, link_message, local_heap, object_header,
@@ -91,34 +97,34 @@ pub use hdf5_format::{
 };
 
 // Re-exported from `hdf5-engine`.
+#[doc(inline)]
 pub use hdf5_engine::{
     attribute, chunk_cache, chunked_read, chunked_write, data_read, extensible_array, file_writer,
     fixed_array, group_v1, group_v2, metadata_index, type_builders,
 };
 #[cfg(feature = "parallel")]
+#[doc(inline)]
 pub use hdf5_engine::{lane_partition, parallel_read};
 
 #[cfg(feature = "provenance")]
+#[doc(inline)]
 pub use hdf5_engine::provenance;
 
 // ---------------------------------------------------------------------------
 // High-level modules
 // ---------------------------------------------------------------------------
 
+// Re-exported from `hdf5-api` (the std-only high-level surface).
 #[cfg(feature = "std")]
-pub mod reader;
-#[cfg(feature = "std")]
-pub mod swmr_writer;
-#[cfg(feature = "std")]
-pub mod types;
-#[cfg(feature = "std")]
-pub mod writer;
+#[doc(inline)]
+pub use hdf5_api::{reader, swmr_writer, types, writer};
 
 #[cfg(feature = "std")]
 pub mod mat;
 
 #[cfg(feature = "ndarray")]
-pub mod ndarray_support;
+#[doc(inline)]
+pub use hdf5_api::ndarray_support;
 
 // ---------------------------------------------------------------------------
 // Public API re-exports

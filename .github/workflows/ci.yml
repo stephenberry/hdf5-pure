@@ -152,10 +152,10 @@ jobs:
         with:
           key: i686
       - name: Clippy (lib, default features)
-        run: cargo clippy --locked --target i686-unknown-linux-gnu --lib -- -D warnings
+        run: cargo clippy --locked --workspace --target i686-unknown-linux-gnu --lib -- -D warnings
       - name: Clippy (lib, full features minus C-backed ones)
         run: >
-          cargo clippy --locked --target i686-unknown-linux-gnu --lib
+          cargo clippy --locked --workspace --target i686-unknown-linux-gnu --lib
           --features "serde zfp fast-checksum provenance parallel ndarray" -- -D warnings
 
   # Ratchet for pointer-width-aware cast lints. On i686 clippy flags every
@@ -172,7 +172,7 @@ jobs:
       # Adjust DOWNWARD only, never upward. Measured on the pinned toolchain
       # below; a different clippy version may report a slightly different count,
       # in which case re-measure once and reset this.
-      CAST_BASELINE: 270
+      CAST_BASELINE: 269
     steps:
       - uses: actions/checkout@v4
       # Pinned so the baseline is stable against clippy-version drift.
@@ -186,13 +186,17 @@ jobs:
       - name: Count 32-bit narrowing-cast warnings
         run: |
           set -euo pipefail
-          # Force a fresh compile of OUR crate for the i686 target so clippy
+          # Force a fresh compile of OUR crates for the i686 target so clippy
           # actually re-emits the lints (a cached build emits nothing);
-          # dependencies stay cached. The clean must be target-scoped.
-          cargo clean -p hdf5-pure --target i686-unknown-linux-gnu
+          # third-party dependencies stay cached. The clean must be
+          # target-scoped and cover every workspace member, since the casts now
+          # live in the sub-crates rather than the thin facade lib.
+          cargo clean --target i686-unknown-linux-gnu \
+            -p hdf5-core -p hdf5-format -p hdf5-filters \
+            -p hdf5-engine -p hdf5-api -p hdf5-pure
           # JSON is the only format that reliably carries the lint name per
           # diagnostic (`--message-format=short` drops it).
-          cargo clippy --locked --target i686-unknown-linux-gnu --lib \
+          cargo clippy --locked --workspace --target i686-unknown-linux-gnu --lib \
             --features "serde zfp fast-checksum provenance parallel ndarray" \
             --message-format=json \
             -- -W clippy::cast_possible_truncation \

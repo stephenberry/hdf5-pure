@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 
 [features]
+# `default` exists so `cargo test -p hdf5-core` builds with std (the test
+# harness needs it). The facade sets `default-features = false` and drives
+# features explicitly, so this does not leak into `hdf5-pure`'s no_std builds.
+default = ["std", "checksum"]
 std = []
 checksum = []
 fast-checksum = ["dep:crc32fast"]
