@@ -119,8 +119,12 @@ pub use hdf5_engine::provenance;
 #[doc(inline)]
 pub use hdf5_api::{reader, swmr_writer, types, writer};
 
+// Re-exported from `hdf5-mat`. The MAT builder API is available under `std`;
+// the serde-based (de)serialization parts inside it are additionally gated by
+// the `serde` feature (forwarded to `hdf5-mat/serde`).
 #[cfg(feature = "std")]
-pub mod mat;
+#[doc(inline)]
+pub use hdf5_mat::mat;
 
 #[cfg(feature = "ndarray")]
 #[doc(inline)]

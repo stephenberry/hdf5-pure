@@ -1,0 +1,29 @@
+[package]
+name = "hdf5-mat"
+description = "MATLAB v7.3 (.mat) serde (de)serialization over hdf5-pure. Internal crate; use `hdf5-pure` with the `serde` feature instead."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# The MAT subsystem is meaningless without serde, so it is on by default; the
+# facade enables this crate (optional dep) via its own `serde` feature.
+default = ["serde"]
+serde = ["dep:serde"]
+
+[dependencies]
+hdf5-engine = { path = "../hdf5-engine", version = "=0.9.0", default-features = false, features = ["std"] }
+hdf5-api = { path = "../hdf5-api", version = "=0.9.0", default-features = false, features = ["std"] }
+serde = { version = "1", optional = true, default-features = false, features = ["derive", "alloc"] }
+
+[dev-dependencies]
+# Doc examples in this crate are written from the end user's perspective
+# (`use hdf5_pure::...`). Declared path-only (no version) so cargo strips it on
+# publish, keeping the bottom-up publish order intact; it only exists to make
+# `cargo test -p hdf5-mat`'s doctests resolve the facade locally. `serde` is
+# enabled because the MAT (de)serialization examples use it.
+hdf5-pure = { path = "../..", features = ["serde"] }
+
+[lints]
+workspace = true

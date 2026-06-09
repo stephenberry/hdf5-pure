@@ -49,6 +49,7 @@ std = [
     "hdf5-engine/std",
     "dep:hdf5-api",
     "hdf5-api/std",
+    "dep:hdf5-mat",
 ]
 checksum = ["hdf5-core/checksum", "hdf5-format/checksum", "hdf5-engine/checksum"]
 fast-checksum = ["hdf5-core/fast-checksum"]
@@ -65,7 +66,7 @@ zfp = ["hdf5-filters/zfp", "hdf5-engine/zfp"]
 ndarray = ["std", "hdf5-engine/ndarray", "hdf5-api/ndarray"]
 # Serde-based (de)serialization of MATLAB v7.3 .mat files.
 # Requires `std` (uses File/Group/Dataset reader APIs).
-serde = ["dep:serde", "std"]
+serde = ["std", "hdf5-mat/serde"]
 # Test-only: enable a crosscheck test that links against the system libmatio
 # (reference MATLAB MAT file library). Requires libmatio to be installed:
 # `brew install libmatio` (macOS) or `apt install libmatio-dev` (Debian).
@@ -79,7 +80,7 @@ hdf5-format = { path = "crates/hdf5-format", version = "=0.9.0", default-feature
 hdf5-filters = { path = "crates/hdf5-filters", version = "=0.9.0", default-features = false }
 hdf5-engine = { path = "crates/hdf5-engine", version = "=0.9.0", default-features = false }
 hdf5-api = { path = "crates/hdf5-api", version = "=0.9.0", optional = true, default-features = false }
-serde = { version = "1", optional = true, default-features = false, features = ["derive", "alloc"] }
+hdf5-mat = { path = "crates/hdf5-mat", version = "=0.9.0", optional = true, default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

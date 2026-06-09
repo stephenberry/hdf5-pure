@@ -283,6 +283,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hdf5-mat"
+version = "0.9.0"
+dependencies = [
+ "hdf5-api",
+ "hdf5-engine",
+ "hdf5-pure",
+ "serde",
+]
+
+[[package]]
 name = "hdf5-metno"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -360,6 +370,7 @@ dependencies = [
  "hdf5-engine",
  "hdf5-filters",
  "hdf5-format",
+ "hdf5-mat",
  "hdf5-metno",
  "ndarray",
  "serde",
