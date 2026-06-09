@@ -102,17 +102,22 @@ jobs:
           tool: cargo-shear
       - run: cargo shear
 
-  # Detect accidental or unversioned public-API changes by diffing the crate
+  # Detect accidental or unversioned public-API changes by diffing each crate
   # against the latest version published to crates.io. A breaking change (e.g.
-  # removing a `pub fn`) fails the job unless the version in Cargo.toml is
-  # bumped accordingly (under 0.x, breaking changes require a minor bump).
+  # removing a `pub fn`) fails the job unless the version is bumped accordingly
+  # (under 0.x, breaking changes require a minor bump).
   #
-  # `parallel_read`/`lane_partition` are gated behind `parallel`, so the feature
-  # set below must enable the public-API-bearing features to see their surface.
-  # `fast-deflate` is omitted (a flate2 backend swap, no API delta) along with
-  # `matio-crosscheck` (test-only, links system libmatio).
+  # The facade `hdf5-pure` is intentionally NOT checked: its public surface is
+  # entirely cross-crate re-exports (`pub use hdf5_pure_engine::...`), which rustdoc
+  # omits from its JSON output, so cargo-semver-checks cannot introspect them
+  # (it would report every re-exported item as "removed"). The real, checkable
+  # API lives in the sub-crates below; the facade is pure re-exports whose
+  # compatibility is guaranteed structurally and exercised by the test suite.
+  # Each sub-crate is checked with --all-features so its whole feature-gated
+  # surface is covered. Sub-crates not yet on crates.io are skipped (their first
+  # publish establishes the baseline).
   semver-checks:
-    name: SemVer (cargo-semver-checks)
+    name: SemVer (cargo-semver-checks, per sub-crate)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -120,10 +125,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: semver-checks
-      - uses: obi1kenobi/cargo-semver-checks-action@v2
+      - uses: taiki-e/install-action@v2
         with:
-          feature-group: default-features
-          features: serde,zfp,fast-checksum,provenance,parallel,ndarray
+          tool: cargo-semver-checks
+      - name: Check each sub-crate (facade excluded; unpublished crates skipped)
+        run: |
+          set -uo pipefail
+          rc=0
+          for crate in hdf5-pure-core hdf5-pure-format hdf5-pure-filters hdf5-pure-engine hdf5-pure-api hdf5-pure-mat; do
+            if cargo semver-checks check-release -p "$crate" --all-features 2>/tmp/sc.err; then
+              echo "::notice::$crate OK"
+            elif grep -q 'not found in registry' /tmp/sc.err; then
+              echo "::notice::$crate not yet published; skipping baseline check"
+            else
+              echo "::error::$crate failed cargo-semver-checks"
+              cat /tmp/sc.err
+              rc=1
+            fi
+          done
+          exit $rc
 
   # ===========================================================================
   # 32-bit / no_std compatibility (issue #27).
@@ -192,8 +212,8 @@ jobs:
           # target-scoped and cover every workspace member, since the casts now
           # live in the sub-crates rather than the thin facade lib.
           cargo clean --target i686-unknown-linux-gnu \
-            -p hdf5-core -p hdf5-format -p hdf5-filters \
-            -p hdf5-engine -p hdf5-api -p hdf5-pure
+            -p hdf5-pure-core -p hdf5-pure-format -p hdf5-pure-filters \
+            -p hdf5-pure-engine -p hdf5-pure-api -p hdf5-pure
           # JSON is the only format that reliably carries the lint name per
           # diagnostic (`--message-format=short` drops it).
           cargo clippy --locked --workspace --target i686-unknown-linux-gnu --lib \

@@ -38,7 +38,7 @@ use crate::convert::TryToUsize;
 use crate::error::Error;
 use crate::reader::Dataset;
 
-pub use hdf5_engine::ndarray_support::{H5Element, ScalarSource};
+pub use hdf5_pure_engine::ndarray_support::{H5Element, ScalarSource};
 
 // Invert the engine -> reader dependency: the engine's `H5Element::read_from`
 // dispatches through `ScalarSource`, which the reader's `Dataset` implements by

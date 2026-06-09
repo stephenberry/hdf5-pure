@@ -234,65 +234,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 
 [[package]]
-name = "hdf5-api"
-version = "0.9.0"
-dependencies = [
- "hdf5-engine",
- "hdf5-metno",
- "hdf5-pure",
- "ndarray",
- "tempfile",
-]
-
-[[package]]
-name = "hdf5-core"
-version = "0.9.0"
-dependencies = [
- "crc32fast",
-]
-
-[[package]]
-name = "hdf5-engine"
-version = "0.9.0"
-dependencies = [
- "hdf5-core",
- "hdf5-filters",
- "hdf5-format",
- "hdf5-pure",
- "ndarray",
- "rayon",
- "serde_json",
- "sha2",
-]
-
-[[package]]
-name = "hdf5-filters"
-version = "0.9.0"
-dependencies = [
- "flate2",
- "hdf5-core",
- "hdf5-format",
-]
-
-[[package]]
-name = "hdf5-format"
-version = "0.9.0"
-dependencies = [
- "byteorder",
- "hdf5-core",
-]
-
-[[package]]
-name = "hdf5-mat"
-version = "0.9.0"
-dependencies = [
- "hdf5-api",
- "hdf5-engine",
- "hdf5-pure",
- "serde",
-]
-
-[[package]]
 name = "hdf5-metno"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -365,17 +306,76 @@ dependencies = [
 name = "hdf5-pure"
 version = "0.9.0"
 dependencies = [
- "hdf5-api",
- "hdf5-core",
- "hdf5-engine",
- "hdf5-filters",
- "hdf5-format",
- "hdf5-mat",
  "hdf5-metno",
+ "hdf5-pure-api",
+ "hdf5-pure-core",
+ "hdf5-pure-engine",
+ "hdf5-pure-filters",
+ "hdf5-pure-format",
+ "hdf5-pure-mat",
  "ndarray",
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "hdf5-pure-api"
+version = "0.9.0"
+dependencies = [
+ "hdf5-metno",
+ "hdf5-pure",
+ "hdf5-pure-engine",
+ "ndarray",
+ "tempfile",
+]
+
+[[package]]
+name = "hdf5-pure-core"
+version = "0.9.0"
+dependencies = [
+ "crc32fast",
+]
+
+[[package]]
+name = "hdf5-pure-engine"
+version = "0.9.0"
+dependencies = [
+ "hdf5-pure",
+ "hdf5-pure-core",
+ "hdf5-pure-filters",
+ "hdf5-pure-format",
+ "ndarray",
+ "rayon",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "hdf5-pure-filters"
+version = "0.9.0"
+dependencies = [
+ "flate2",
+ "hdf5-pure-core",
+ "hdf5-pure-format",
+]
+
+[[package]]
+name = "hdf5-pure-format"
+version = "0.9.0"
+dependencies = [
+ "byteorder",
+ "hdf5-pure-core",
+]
+
+[[package]]
+name = "hdf5-pure-mat"
+version = "0.9.0"
+dependencies = [
+ "hdf5-pure",
+ "hdf5-pure-api",
+ "hdf5-pure-engine",
+ "serde",
 ]
 
 [[package]]

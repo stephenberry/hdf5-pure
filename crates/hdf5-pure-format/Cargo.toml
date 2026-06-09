@@ -1,5 +1,5 @@
 [package]
-name = "hdf5-format"
+name = "hdf5-pure-format"
 description = "HDF5 on-disk format structures (object headers, B-trees, heaps, datatypes) for hdf5-pure. Internal crate; use `hdf5-pure` instead."
 version.workspace = true
 edition.workspace = true
@@ -7,14 +7,14 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# See hdf5-core: `default` is for standalone `cargo test`; the facade overrides
+# See hdf5-pure-core: `default` is for standalone `cargo test`; the facade overrides
 # it with `default-features = false`.
 default = ["std", "checksum"]
-std = ["hdf5-core/std"]
-checksum = ["hdf5-core/checksum"]
+std = ["hdf5-pure-core/std"]
+checksum = ["hdf5-pure-core/checksum"]
 
 [dependencies]
-hdf5-core = { path = "../hdf5-core", version = "=0.9.0", default-features = false }
+hdf5-pure-core = { path = "../hdf5-pure-core", version = "=0.9.0", default-features = false }
 byteorder = { version = "1", default-features = false }
 
 [lints]

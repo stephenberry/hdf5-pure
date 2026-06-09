@@ -1,5 +1,5 @@
 [package]
-name = "hdf5-api"
+name = "hdf5-pure-api"
 description = "High-level HDF5 reader/writer API (File, Dataset, Group, FileBuilder, SwmrWriter) for hdf5-pure. Internal crate; use `hdf5-pure` instead."
 version.workspace = true
 edition.workspace = true
@@ -7,20 +7,20 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# `hdf5-api` is the std-only high-level surface; it always pulls the engine's
-# std paths in. A bare default keeps `cargo build -p hdf5-api` working.
+# `hdf5-pure-api` is the std-only high-level surface; it always pulls the engine's
+# std paths in. A bare default keeps `cargo build -p hdf5-pure-api` working.
 default = ["std"]
-std = ["hdf5-engine/std"]
-checksum = ["hdf5-engine/checksum"]
-deflate = ["hdf5-engine/deflate"]
-fast-deflate = ["hdf5-engine/fast-deflate"]
-zfp = ["hdf5-engine/zfp"]
-parallel = ["hdf5-engine/parallel"]
-provenance = ["hdf5-engine/provenance"]
-ndarray = ["dep:ndarray", "hdf5-engine/ndarray", "std"]
+std = ["hdf5-pure-engine/std"]
+checksum = ["hdf5-pure-engine/checksum"]
+deflate = ["hdf5-pure-engine/deflate"]
+fast-deflate = ["hdf5-pure-engine/fast-deflate"]
+zfp = ["hdf5-pure-engine/zfp"]
+parallel = ["hdf5-pure-engine/parallel"]
+provenance = ["hdf5-pure-engine/provenance"]
+ndarray = ["dep:ndarray", "hdf5-pure-engine/ndarray", "std"]
 
 [dependencies]
-hdf5-engine = { path = "../hdf5-engine", version = "=0.9.0", default-features = false }
+hdf5-pure-engine = { path = "../hdf5-pure-engine", version = "=0.9.0", default-features = false }
 ndarray = { version = ">=0.16, <0.18", optional = true }
 
 [dev-dependencies]
@@ -28,7 +28,7 @@ tempfile = "3"
 # Doc examples in this crate are written from the end user's perspective
 # (`use hdf5_pure::...`). Declared path-only (no version) so cargo strips it on
 # publish, keeping the bottom-up publish order intact; it only exists to make
-# `cargo test -p hdf5-api`'s doctests resolve the facade locally. `ndarray` is
+# `cargo test -p hdf5-pure-api`'s doctests resolve the facade locally. `ndarray` is
 # enabled because the read-helper examples use it.
 hdf5-pure = { path = "../..", features = ["ndarray"] }
 

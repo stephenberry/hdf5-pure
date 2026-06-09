@@ -43,30 +43,30 @@ exclude = ["tests/fixtures/**"]
 [features]
 default = ["std", "checksum", "deflate"]
 std = [
-    "hdf5-core/std",
-    "hdf5-format/std",
-    "hdf5-filters/std",
-    "hdf5-engine/std",
-    "dep:hdf5-api",
-    "hdf5-api/std",
-    "dep:hdf5-mat",
+    "hdf5-pure-core/std",
+    "hdf5-pure-format/std",
+    "hdf5-pure-filters/std",
+    "hdf5-pure-engine/std",
+    "dep:hdf5-pure-api",
+    "hdf5-pure-api/std",
+    "dep:hdf5-pure-mat",
 ]
-checksum = ["hdf5-core/checksum", "hdf5-format/checksum", "hdf5-engine/checksum"]
-fast-checksum = ["hdf5-core/fast-checksum"]
-deflate = ["hdf5-filters/deflate", "hdf5-engine/deflate"]
-fast-deflate = ["hdf5-filters/fast-deflate", "hdf5-engine/fast-deflate"]
-provenance = ["hdf5-engine/provenance"]
-parallel = ["hdf5-engine/parallel"]
+checksum = ["hdf5-pure-core/checksum", "hdf5-pure-format/checksum", "hdf5-pure-engine/checksum"]
+fast-checksum = ["hdf5-pure-core/fast-checksum"]
+deflate = ["hdf5-pure-filters/deflate", "hdf5-pure-engine/deflate"]
+fast-deflate = ["hdf5-pure-filters/fast-deflate", "hdf5-pure-engine/fast-deflate"]
+provenance = ["hdf5-pure-engine/provenance"]
+parallel = ["hdf5-pure-engine/parallel"]
 # Pure-Rust ZFP fixed-rate compression filter (HDF5 filter ID 32013).
 # Supports f32/f64/i32/i64 datasets in 1D–4D.
-zfp = ["hdf5-filters/zfp", "hdf5-engine/zfp"]
+zfp = ["hdf5-pure-filters/zfp", "hdf5-pure-engine/zfp"]
 # Ergonomic N-dimensional array I/O via the `ndarray` crate
 # (`DatasetBuilder::with_ndarray`, `Dataset::read_array`/`read_array_dyn`).
 # Requires `std` (it builds on the File/Dataset reader and writer APIs).
-ndarray = ["std", "hdf5-engine/ndarray", "hdf5-api/ndarray"]
+ndarray = ["std", "hdf5-pure-engine/ndarray", "hdf5-pure-api/ndarray"]
 # Serde-based (de)serialization of MATLAB v7.3 .mat files.
 # Requires `std` (uses File/Group/Dataset reader APIs).
-serde = ["std", "hdf5-mat/serde"]
+serde = ["std", "hdf5-pure-mat/serde"]
 # Test-only: enable a crosscheck test that links against the system libmatio
 # (reference MATLAB MAT file library). Requires libmatio to be installed:
 # `brew install libmatio` (macOS) or `apt install libmatio-dev` (Debian).
@@ -75,19 +75,19 @@ serde = ["std", "hdf5-mat/serde"]
 matio-crosscheck = ["serde"]
 
 [dependencies]
-hdf5-core = { path = "crates/hdf5-core", version = "=0.9.0", default-features = false }
-hdf5-format = { path = "crates/hdf5-format", version = "=0.9.0", default-features = false }
-hdf5-filters = { path = "crates/hdf5-filters", version = "=0.9.0", default-features = false }
-hdf5-engine = { path = "crates/hdf5-engine", version = "=0.9.0", default-features = false }
-hdf5-api = { path = "crates/hdf5-api", version = "=0.9.0", optional = true, default-features = false }
-hdf5-mat = { path = "crates/hdf5-mat", version = "=0.9.0", optional = true, default-features = false }
+hdf5-pure-core = { path = "crates/hdf5-pure-core", version = "=0.9.0", default-features = false }
+hdf5-pure-format = { path = "crates/hdf5-pure-format", version = "=0.9.0", default-features = false }
+hdf5-pure-filters = { path = "crates/hdf5-pure-filters", version = "=0.9.0", default-features = false }
+hdf5-pure-engine = { path = "crates/hdf5-pure-engine", version = "=0.9.0", default-features = false }
+hdf5-pure-api = { path = "crates/hdf5-pure-api", version = "=0.9.0", optional = true, default-features = false }
+hdf5-pure-mat = { path = "crates/hdf5-pure-mat", version = "=0.9.0", optional = true, default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 # Used by the ndarray integration tests/examples. `ndarray` is otherwise a
-# transitive dependency (pulled by `hdf5-api` under the `ndarray` feature), so
+# transitive dependency (pulled by `hdf5-pure-api` under the `ndarray` feature), so
 # it is declared here as well to be nameable from the facade's test crates.
 ndarray = ">=0.16, <0.18"
 

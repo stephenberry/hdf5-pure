@@ -7,7 +7,7 @@
 //! [`hdf5-pure`]: https://docs.rs/hdf5-pure
 
 // Re-exported from lower crates so in-crate `crate::<module>` paths resolve.
-pub use hdf5_api::{reader, types, writer};
-pub use hdf5_engine::{error, file_writer, type_builders};
+pub use hdf5_pure_api::{reader, types, writer};
+pub use hdf5_pure_engine::{error, file_writer, type_builders};
 
 pub mod mat;

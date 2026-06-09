@@ -14,16 +14,16 @@
 extern crate alloc;
 
 // Re-exported from lower crates so in-crate `crate::<module>` paths resolve.
-pub use hdf5_core::{checksum, convert, error, message_type, signature, source};
+pub use hdf5_pure_core::{checksum, convert, error, message_type, signature, source};
 
 #[cfg(not(feature = "std"))]
-pub use hdf5_core::nosync;
+pub use hdf5_pure_core::nosync;
 
 #[cfg(feature = "zfp")]
-pub use hdf5_filters::zfp;
-pub use hdf5_filters::{filter_pipeline, filters, scaleoffset};
+pub use hdf5_pure_filters::zfp;
+pub use hdf5_pure_filters::{filter_pipeline, filters, scaleoffset};
 
-pub use hdf5_format::{
+pub use hdf5_pure_format::{
     attribute_info, btree_v1, btree_v2, data_layout, dataspace, datatype, fractal_heap,
     global_heap, group_info, link_info, link_message, local_heap, object_header,
     object_header_writer, shared_message, superblock, symbol_table, vl_data,

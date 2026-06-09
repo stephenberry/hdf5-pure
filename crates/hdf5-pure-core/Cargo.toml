@@ -1,5 +1,5 @@
 [package]
-name = "hdf5-core"
+name = "hdf5-pure-core"
 description = "Core primitives (errors, conversions, checksums, byte sources) for hdf5-pure. Internal crate; use `hdf5-pure` instead."
 version.workspace = true
 edition.workspace = true
@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-# `default` exists so `cargo test -p hdf5-core` builds with std (the test
+# `default` exists so `cargo test -p hdf5-pure-core` builds with std (the test
 # harness needs it). The facade sets `default-features = false` and drives
 # features explicitly, so this does not leak into `hdf5-pure`'s no_std builds.
 default = ["std", "checksum"]

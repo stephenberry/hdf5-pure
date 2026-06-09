@@ -74,61 +74,61 @@ extern crate alloc;
 // Format-level modules (from rustyhdf5-format)
 // ---------------------------------------------------------------------------
 
-// Re-exported from `hdf5-core` (keeps the `hdf5_pure::<module>` paths and the
+// Re-exported from `hdf5-pure-core` (keeps the `hdf5_pure::<module>` paths and the
 // in-crate `crate::<module>` references resolving unchanged). `#[doc(inline)]`
 // makes rustdoc render and emit the inlined contents under `hdf5_pure::*` so
 // the documented and semver-tracked surface matches the pre-split crate.
 #[doc(inline)]
-pub use hdf5_core::{checksum, convert, error, message_type, signature, source};
+pub use hdf5_pure_core::{checksum, convert, error, message_type, signature, source};
 
-// Re-exported from `hdf5-filters`.
+// Re-exported from `hdf5-pure-filters`.
 #[cfg(feature = "zfp")]
 #[doc(inline)]
-pub use hdf5_filters::zfp;
+pub use hdf5_pure_filters::zfp;
 #[doc(inline)]
-pub use hdf5_filters::{filter_pipeline, filters, scaleoffset};
+pub use hdf5_pure_filters::{filter_pipeline, filters, scaleoffset};
 
-// Re-exported from `hdf5-format`.
+// Re-exported from `hdf5-pure-format`.
 #[doc(inline)]
-pub use hdf5_format::{
+pub use hdf5_pure_format::{
     attribute_info, btree_v1, btree_v2, data_layout, dataspace, datatype, fractal_heap,
     global_heap, group_info, link_info, link_message, local_heap, object_header,
     object_header_writer, shared_message, superblock, symbol_table, vl_data,
 };
 
-// Re-exported from `hdf5-engine`.
+// Re-exported from `hdf5-pure-engine`.
 #[doc(inline)]
-pub use hdf5_engine::{
+pub use hdf5_pure_engine::{
     attribute, chunk_cache, chunked_read, chunked_write, data_read, extensible_array, file_writer,
     fixed_array, group_v1, group_v2, metadata_index, type_builders,
 };
 #[cfg(feature = "parallel")]
 #[doc(inline)]
-pub use hdf5_engine::{lane_partition, parallel_read};
+pub use hdf5_pure_engine::{lane_partition, parallel_read};
 
 #[cfg(feature = "provenance")]
 #[doc(inline)]
-pub use hdf5_engine::provenance;
+pub use hdf5_pure_engine::provenance;
 
 // ---------------------------------------------------------------------------
 // High-level modules
 // ---------------------------------------------------------------------------
 
-// Re-exported from `hdf5-api` (the std-only high-level surface).
+// Re-exported from `hdf5-pure-api` (the std-only high-level surface).
 #[cfg(feature = "std")]
 #[doc(inline)]
-pub use hdf5_api::{reader, swmr_writer, types, writer};
+pub use hdf5_pure_api::{reader, swmr_writer, types, writer};
 
-// Re-exported from `hdf5-mat`. The MAT builder API is available under `std`;
+// Re-exported from `hdf5-pure-mat`. The MAT builder API is available under `std`;
 // the serde-based (de)serialization parts inside it are additionally gated by
 // the `serde` feature (forwarded to `hdf5-mat/serde`).
 #[cfg(feature = "std")]
 #[doc(inline)]
-pub use hdf5_mat::mat;
+pub use hdf5_pure_mat::mat;
 
 #[cfg(feature = "ndarray")]
 #[doc(inline)]
-pub use hdf5_api::ndarray_support;
+pub use hdf5_pure_api::ndarray_support;
 
 // ---------------------------------------------------------------------------
 // Public API re-exports

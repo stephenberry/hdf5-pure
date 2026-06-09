@@ -10,7 +10,7 @@
 extern crate alloc;
 
 // Re-exported from lower crates so in-crate `crate::<module>` paths resolve.
-pub use hdf5_core::{checksum, convert, error, message_type, signature, source};
+pub use hdf5_pure_core::{checksum, convert, error, message_type, signature, source};
 
 pub mod attribute_info;
 pub mod btree_v1;

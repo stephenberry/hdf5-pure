@@ -10,8 +10,8 @@
 extern crate alloc;
 
 // Re-exported from lower crates so in-crate `crate::<module>` paths resolve.
-pub use hdf5_core::{convert, error};
-pub use hdf5_format::datatype;
+pub use hdf5_pure_core::{convert, error};
+pub use hdf5_pure_format::datatype;
 
 pub mod filter_pipeline;
 pub mod filters;
