@@ -1,8 +1,6 @@
 # Workspace split design (issue #33 follow-up)
 
-Status: **implemented** (issue #34). The crate is now a Cargo workspace of six internal sub-crates under the `hdf5-pure` facade. This document records the dependency analysis, the crate boundaries, the publish model, the phased migration plan, and (at the end) the friction points discovered while executing it that deviate from the original proposal.
-
-> Naming note: the original proposal named the sub-crates `hdf5-core`, `hdf5-format`, etc. They ship as **`hdf5-pure-core`, `hdf5-pure-format`, `hdf5-pure-filters`, `hdf5-pure-engine`, `hdf5-pure-api`, `hdf5-pure-mat`** — `hdf5-format` was already taken on crates.io, and the `hdf5-pure-*` scheme namespaces all of them consistently as internal to the facade. The crate names in the tables below use the original short forms for readability; read them with the `hdf5-pure-` prefix.
+Status: proposal. No code has moved yet. This document records the dependency analysis, the crate boundaries that are actually achievable, the publish model, and a phased migration plan, so the split can be executed (or rejected) as its own tracked effort.
 
 ## Motivation
 
@@ -132,25 +130,3 @@ This is real refactoring with test surface, tracked separately from the mechanic
 - **Testing:** each layer gets its own test target and can be exercised in isolation.
 
 The split is feasible and low-risk as a mechanical refactor under the published-facade model (all sub-crates published, `hdf5-pure` as the curated entry point). It does not, by itself, shrink the engine or break the read/write coupling; those are separate, deliberately-scoped follow-ups.
-
-## Implementation notes (deviations discovered during execution)
-
-The mechanical plan held, but four practical issues surfaced that the proposal did not anticipate. They are recorded here because they shape the workspace as built.
-
-1. **The facade re-exports use `#[doc(inline)]`.** Each `pub use hdf5_pure_engine::...;` in `src/lib.rs` carries `#[doc(inline)]` so rustdoc renders the inlined items under `hdf5_pure::*` (matching the pre-split docs). The compile-level path compatibility (`hdf5_pure::chunked_write::...` etc.) holds either way; the attribute is for documentation fidelity.
-
-2. **`cargo-semver-checks` cannot verify the facade.** rustdoc omits cross-crate re-exported item *bodies* from its JSON output, so `cargo-semver-checks` (0.48, the latest) reports every re-exported item under `hdf5_pure::*` as "removed" — a false positive. `#[doc(inline)]` does not change this. The CI `semver-checks` job was therefore re-pointed to check **each sub-crate** (where the real definitions live, introspectable, with `--all-features`) and to **skip the facade**, whose compatibility is instead guaranteed structurally (it is pure re-exports) and exercised by the test suite. Sub-crates not yet on crates.io are skipped until their first publish establishes a baseline. This supersedes the proposal's claim that semver-checks would "enforce that during the migration."
-
-3. **The `ndarray` integration required dependency inversion.** `DatasetBuilder::with_ndarray` is an inherent method on a type that lives in `hdf5-pure-engine`, so the inherent impl had to move into the engine (Rust forbids inherent impls on a foreign type). But the public `H5Element` bound also drives `Dataset::read_array`, and `Dataset` lives one layer up in `hdf5-pure-api`. To keep `H5Element` a single sealed trait without forming a cycle, the engine defines a `ScalarSource` trait that `hdf5-pure-api`'s `Dataset` implements; `H5Element::read_from` dispatches through it. The public surface (`H5Element`, `with_ndarray`, `read_array`/`read_array_dyn`) is unchanged.
-
-4. **A few engine internals were promoted from `pub(crate)` to `pub`** (marked `#[doc(hidden)]`) because the SWMR append writer and the MAT builder, which now live in higher crates, reach into them: `chunked_write::{ea_compute_stats, build_aesb, write_ea_addr, EaStats}`, `extensible_array::EaGeometry`, and `type_builders::GroupBuilder::new`. These are additive (non-breaking) and hidden from docs; the "shrink the public surface" follow-up should re-evaluate them.
-
-### Per-crate testing wiring
-
-Two ergonomic adjustments let each layer be tested in isolation (`cargo test --workspace`):
-
-- The `no_std`-capable sub-crates (`core`/`format`/`filters`/`engine`) carry a `default = ["std", ...]` so a bare `cargo test -p <crate>` gets a std test harness; the facade sets `default-features = false` on its path deps and drives features explicitly, so this does not leak into `hdf5-pure`'s `no_std` builds.
-- Doc examples in the sub-crates are written from the end user's perspective (`use hdf5_pure::...`). Each such sub-crate declares `hdf5-pure` as a **path-only** (no version) dev-dependency; cargo strips path-only dev-deps on publish, so the bottom-up publish order is preserved while the doctests resolve the facade locally.
-- The 32-bit `check-32bit` and `cast-ratchet-32bit` CI jobs were re-pointed from `--lib` (the now-empty facade) to `--workspace` so they lint the cast-bearing sub-crate code; the cast baseline was re-measured (269).
-- All `cargo test`/`cargo clippy --all-targets` CI invocations use `--workspace`. The workspace root is itself a package, so its only *default* member is the facade; without `--workspace` the ~500 unit tests now living in the sub-crates' `src/**` would silently not run.
-- The few sub-crate unit tests that `include_bytes!` a binary fixture reach the workspace-root `tests/fixtures/` via `../../../tests/fixtures/...`. These are `#[cfg(test)]`-only, so they do not affect the published artifact (cargo's publish verification builds the lib only) and they resolve on any git checkout. The one scenario they do not cover is running `cargo test` against a *downloaded* sub-crate `.crate` (the fixtures live outside the package dir); that is acceptable for internal crates whose tests are exercised from the workspace.

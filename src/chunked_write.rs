@@ -681,8 +681,7 @@ fn serialize_v4_extensible_array(
 }
 
 /// Write an offset-sized address (little-endian) to `buf`.
-#[doc(hidden)] // internal plumbing; reached by hdf5-pure-api's SWMR append writer
-pub fn write_ea_addr(buf: &mut Vec<u8>, val: u64, offset_size: u8) {
+pub(crate) fn write_ea_addr(buf: &mut Vec<u8>, val: u64, offset_size: u8) {
     match offset_size {
         4 => buf.extend_from_slice(&(val as u32).to_le_bytes()),
         _ => buf.extend_from_slice(&val.to_le_bytes()),
@@ -789,8 +788,7 @@ pub(crate) fn build_eadb(
 /// `dblk_addrs`. When `page_bitmap` is non-empty the block's data blocks are
 /// paged and the bitmap (already populated by the caller) is written between
 /// the block offset and the data block addresses.
-#[doc(hidden)] // internal plumbing; reached by hdf5-pure-api's SWMR append writer
-pub fn build_aesb(
+pub(crate) fn build_aesb(
     ea_base_address: u64,
     block_offset_rel: u64,
     page_bitmap: &[u8],
@@ -818,8 +816,7 @@ pub fn build_aesb(
 /// Used by the SWMR append writer (`std` only).
 #[cfg(feature = "std")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[doc(hidden)] // internal plumbing; reached by hdf5-pure-api's SWMR append writer
-pub struct EaStats {
+pub(crate) struct EaStats {
     pub nsuper_blks: u64,
     pub super_blk_size: u64,
     pub ndata_blks: u64,
@@ -873,8 +870,7 @@ pub(crate) fn aesb_size(
 /// [`build_extensible_array_at`] so the bulk writer and the incremental append
 /// writer always agree (asserted by a unit test).
 #[cfg(feature = "std")]
-#[doc(hidden)] // internal plumbing; reached by hdf5-pure-api's SWMR append writer
-pub fn ea_compute_stats(
+pub(crate) fn ea_compute_stats(
     geom: &EaGeometry,
     idx_blk_elmts: u64,
     elem_size: usize,

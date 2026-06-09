@@ -389,7 +389,7 @@ mod tests {
 
     #[test]
     fn integration_simple_dataset_full_traversal() {
-        let file_data: &[u8] = include_bytes!("../../../tests/fixtures/simple_dataset.h5");
+        let file_data: &[u8] = include_bytes!("../tests/fixtures/simple_dataset.h5");
         let sig_offset = crate::signature::find_signature(file_data).unwrap();
         let sb = crate::superblock::Superblock::parse(file_data, sig_offset).unwrap();
         let root_sym = get_root_sym_table(file_data, &sb);
@@ -417,7 +417,7 @@ mod tests {
 
     #[test]
     fn integration_two_groups_group1_values() {
-        let file_data: &[u8] = include_bytes!("../../../tests/fixtures/two_groups.h5");
+        let file_data: &[u8] = include_bytes!("../tests/fixtures/two_groups.h5");
         let sig_offset = crate::signature::find_signature(file_data).unwrap();
         let sb = crate::superblock::Superblock::parse(file_data, sig_offset).unwrap();
         let root_sym = get_root_sym_table(file_data, &sb);
@@ -440,7 +440,7 @@ mod tests {
 
     #[test]
     fn integration_two_groups_group2_temps() {
-        let file_data: &[u8] = include_bytes!("../../../tests/fixtures/two_groups.h5");
+        let file_data: &[u8] = include_bytes!("../tests/fixtures/two_groups.h5");
         let sig_offset = crate::signature::find_signature(file_data).unwrap();
         let sb = crate::superblock::Superblock::parse(file_data, sig_offset).unwrap();
         let root_sym = get_root_sym_table(file_data, &sb);
@@ -464,7 +464,7 @@ mod tests {
 
     #[test]
     fn integration_nested_groups() {
-        let file_data: &[u8] = include_bytes!("../../../tests/fixtures/nested_groups.h5");
+        let file_data: &[u8] = include_bytes!("../tests/fixtures/nested_groups.h5");
         let sig_offset = crate::signature::find_signature(file_data).unwrap();
         let sb = crate::superblock::Superblock::parse(file_data, sig_offset).unwrap();
         let root_sym = get_root_sym_table(file_data, &sb);

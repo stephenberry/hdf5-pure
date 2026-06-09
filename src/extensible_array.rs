@@ -203,8 +203,7 @@ fn ea_elem_stride(header: &ExtensibleArrayHeader, offset_size: u8) -> usize {
 /// addresses stored directly in the index block; the rest are reached through
 /// on-disk super blocks (`EASB`) whose addresses are stored in the index block.
 #[derive(Debug, Clone)]
-#[doc(hidden)] // internal plumbing; reached by hdf5-pure-api's SWMR append writer
-pub struct EaGeometry {
+pub(crate) struct EaGeometry {
     /// `(ndblks, dblk_nelmts)` for each super block index `0..nsblks`.
     pub sblks: Vec<(u64, u64)>,
     /// Element count of each direct data block whose address is stored in the

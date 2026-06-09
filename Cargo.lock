@@ -304,78 +304,18 @@ dependencies = [
 
 [[package]]
 name = "hdf5-pure"
-version = "0.9.1"
-dependencies = [
- "hdf5-metno",
- "hdf5-pure-api",
- "hdf5-pure-core",
- "hdf5-pure-engine",
- "hdf5-pure-filters",
- "hdf5-pure-format",
- "hdf5-pure-mat",
- "ndarray",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "hdf5-pure-api"
-version = "0.9.1"
-dependencies = [
- "hdf5-metno",
- "hdf5-pure",
- "hdf5-pure-engine",
- "ndarray",
- "tempfile",
-]
-
-[[package]]
-name = "hdf5-pure-core"
-version = "0.9.1"
-dependencies = [
- "crc32fast",
-]
-
-[[package]]
-name = "hdf5-pure-engine"
-version = "0.9.1"
-dependencies = [
- "hdf5-pure",
- "hdf5-pure-core",
- "hdf5-pure-filters",
- "hdf5-pure-format",
- "ndarray",
- "rayon",
- "serde_json",
- "sha2",
-]
-
-[[package]]
-name = "hdf5-pure-filters"
-version = "0.9.1"
-dependencies = [
- "flate2",
- "hdf5-pure-core",
- "hdf5-pure-format",
-]
-
-[[package]]
-name = "hdf5-pure-format"
-version = "0.9.1"
+version = "0.9.0"
 dependencies = [
  "byteorder",
- "hdf5-pure-core",
-]
-
-[[package]]
-name = "hdf5-pure-mat"
-version = "0.9.1"
-dependencies = [
- "hdf5-pure",
- "hdf5-pure-api",
- "hdf5-pure-engine",
+ "crc32fast",
+ "flate2",
+ "hdf5-metno",
+ "ndarray",
+ "rayon",
  "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]

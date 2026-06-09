@@ -965,8 +965,7 @@ pub struct GroupBuilder {
 }
 
 impl GroupBuilder {
-    #[doc(hidden)] // reached by the MAT (hdf5-pure-mat) builder
-    pub fn new(name: &str) -> Self {
+    pub(crate) fn new(name: &str) -> Self {
         Self {
             name: name.to_string(),
             datasets: Vec::new(),

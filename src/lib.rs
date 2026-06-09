@@ -47,8 +47,7 @@
 //! # N-dimensional arrays (`ndarray` feature)
 //!
 //! With the `ndarray` feature, datasets can be written from and read back into
-//! [`ndarray`](https://docs.rs/ndarray) arrays of any rank, in row-major (C)
-//! order:
+//! [`ndarray`] arrays of any rank, in row-major (C) order:
 //!
 //! ```
 //! # #[cfg(feature = "ndarray")] {
@@ -72,68 +71,79 @@
 extern crate alloc;
 
 // ---------------------------------------------------------------------------
-// Internal sub-crate re-exports
-//
-// `hdf5-pure` is a facade over the workspace's internal sub-crates. The
-// `pub use`s below re-export their modules so every `hdf5_pure::<module>` path
-// stays identical to the pre-split crate.
+// Format-level modules (from rustyhdf5-format)
 // ---------------------------------------------------------------------------
 
-// Re-exported from `hdf5-pure-core` (keeps the `hdf5_pure::<module>` paths and the
-// in-crate `crate::<module>` references resolving unchanged). `#[doc(inline)]`
-// makes rustdoc render and emit the inlined contents under `hdf5_pure::*` so
-// the documented and semver-tracked surface matches the pre-split crate.
-#[doc(inline)]
-pub use hdf5_pure_core::{checksum, convert, error, message_type, signature, source};
-
-// Re-exported from `hdf5-pure-filters`.
-#[cfg(feature = "zfp")]
-#[doc(inline)]
-pub use hdf5_pure_filters::zfp;
-#[doc(inline)]
-pub use hdf5_pure_filters::{filter_pipeline, filters, scaleoffset};
-
-// Re-exported from `hdf5-pure-format`.
-#[doc(inline)]
-pub use hdf5_pure_format::{
-    attribute_info, btree_v1, btree_v2, data_layout, dataspace, datatype, fractal_heap,
-    global_heap, group_info, link_info, link_message, local_heap, object_header,
-    object_header_writer, shared_message, superblock, symbol_table, vl_data,
-};
-
-// Re-exported from `hdf5-pure-engine`.
-#[doc(inline)]
-pub use hdf5_pure_engine::{
-    attribute, chunk_cache, chunked_read, chunked_write, data_read, extensible_array, file_writer,
-    fixed_array, group_v1, group_v2, metadata_index, type_builders,
-};
+pub mod attribute;
+pub mod attribute_info;
+pub mod btree_v1;
+pub mod btree_v2;
+pub mod checksum;
+pub mod chunk_cache;
+pub mod chunked_read;
+pub mod chunked_write;
+pub mod convert;
+pub mod data_layout;
+pub mod data_read;
+pub mod dataspace;
+pub mod datatype;
+pub mod error;
+pub mod extensible_array;
+pub mod file_writer;
+pub mod filter_pipeline;
+pub mod filters;
+pub mod fixed_array;
+pub mod fractal_heap;
+pub mod global_heap;
+pub mod group_info;
+pub mod group_v1;
+pub mod group_v2;
 #[cfg(feature = "parallel")]
-#[doc(inline)]
-pub use hdf5_pure_engine::{lane_partition, parallel_read};
+pub mod lane_partition;
+pub mod link_info;
+pub mod link_message;
+pub mod local_heap;
+pub mod message_type;
+pub mod metadata_index;
+pub mod object_header;
+pub mod object_header_writer;
+#[cfg(feature = "parallel")]
+pub mod parallel_read;
+pub mod scaleoffset;
+pub mod shared_message;
+pub mod signature;
+pub mod source;
+pub mod superblock;
+pub mod symbol_table;
+pub mod type_builders;
+pub mod vl_data;
+#[cfg(feature = "zfp")]
+pub mod zfp;
 
 #[cfg(feature = "provenance")]
-#[doc(inline)]
-pub use hdf5_pure_engine::provenance;
+pub mod provenance;
+
+#[cfg(not(feature = "std"))]
+pub(crate) mod nosync;
 
 // ---------------------------------------------------------------------------
 // High-level modules
 // ---------------------------------------------------------------------------
 
-// Re-exported from `hdf5-pure-api` (the std-only high-level surface).
 #[cfg(feature = "std")]
-#[doc(inline)]
-pub use hdf5_pure_api::{reader, swmr_writer, types, writer};
+pub mod reader;
+#[cfg(feature = "std")]
+pub mod swmr_writer;
+#[cfg(feature = "std")]
+pub mod types;
+#[cfg(feature = "std")]
+pub mod writer;
 
-// Re-exported from `hdf5-pure-mat`. The MAT builder API is available under `std`;
-// the serde-based (de)serialization parts inside it are additionally gated by
-// the `serde` feature (forwarded to `hdf5-pure-mat/serde`).
 #[cfg(feature = "std")]
-#[doc(inline)]
-pub use hdf5_pure_mat::mat;
+pub mod mat;
 
 #[cfg(feature = "ndarray")]
-#[doc(inline)]
-pub use hdf5_pure_api::ndarray_support;
+pub mod ndarray_support;
 
 // ---------------------------------------------------------------------------
 // Public API re-exports

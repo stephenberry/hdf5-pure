@@ -463,7 +463,7 @@ mod tests {
 
     #[test]
     fn integration_v2_groups_temperature() {
-        let file_data: &[u8] = include_bytes!("../../../tests/fixtures/v2_groups.h5");
+        let file_data: &[u8] = include_bytes!("../tests/fixtures/v2_groups.h5");
         let sig_offset = signature::find_signature(file_data).unwrap();
         let sb = Superblock::parse(file_data, sig_offset).unwrap();
         assert!(sb.version >= 2); // v2/v3 superblock
@@ -479,7 +479,7 @@ mod tests {
 
     #[test]
     fn integration_v2_groups_humidity() {
-        let file_data: &[u8] = include_bytes!("../../../tests/fixtures/v2_groups.h5");
+        let file_data: &[u8] = include_bytes!("../tests/fixtures/v2_groups.h5");
         let sig_offset = signature::find_signature(file_data).unwrap();
         let sb = Superblock::parse(file_data, sig_offset).unwrap();
 
@@ -494,7 +494,7 @@ mod tests {
 
     #[test]
     fn integration_v2_many_links() {
-        let file_data: &[u8] = include_bytes!("../../../tests/fixtures/v2_many_links.h5");
+        let file_data: &[u8] = include_bytes!("../tests/fixtures/v2_many_links.h5");
         let sig_offset = signature::find_signature(file_data).unwrap();
         let sb = Superblock::parse(file_data, sig_offset).unwrap();
 
@@ -510,7 +510,7 @@ mod tests {
     #[test]
     fn integration_resolve_path_any_v1() {
         // Test that resolve_path_any also works for v1 files
-        let file_data: &[u8] = include_bytes!("../../../tests/fixtures/two_groups.h5");
+        let file_data: &[u8] = include_bytes!("../tests/fixtures/two_groups.h5");
         let sig_offset = signature::find_signature(file_data).unwrap();
         let sb = Superblock::parse(file_data, sig_offset).unwrap();
 
@@ -525,7 +525,7 @@ mod tests {
 
     #[test]
     fn integration_resolve_path_any_v2() {
-        let file_data: &[u8] = include_bytes!("../../../tests/fixtures/v2_groups.h5");
+        let file_data: &[u8] = include_bytes!("../tests/fixtures/v2_groups.h5");
         let sig_offset = signature::find_signature(file_data).unwrap();
         let sb = Superblock::parse(file_data, sig_offset).unwrap();
 
@@ -540,7 +540,7 @@ mod tests {
 
     #[test]
     fn path_not_found_v2() {
-        let file_data: &[u8] = include_bytes!("../../../tests/fixtures/v2_groups.h5");
+        let file_data: &[u8] = include_bytes!("../tests/fixtures/v2_groups.h5");
         let sig_offset = signature::find_signature(file_data).unwrap();
         let sb = Superblock::parse(file_data, sig_offset).unwrap();
 

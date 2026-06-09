@@ -46,10 +46,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.os }}-${{ matrix.config.name }}
-      # `--workspace` is required: the workspace root is itself a package, so
-      # its only default member is the `hdf5-pure` facade. Without `--workspace`
-      # the ~500 unit tests that live in the sub-crates' `src/**` would not run.
-      - run: cargo test --locked --workspace ${{ matrix.config.flags }}
+      - run: cargo test --locked ${{ matrix.config.flags }}
 
   no-std-check:
     name: Check (no_std)
@@ -92,7 +89,7 @@ jobs:
       - name: Rustfmt
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --locked --workspace --features "serde ndarray" --all-targets -- -D warnings
+        run: cargo clippy --locked --features "serde ndarray" --all-targets -- -D warnings
 
   shear:
     name: Unused dependencies (cargo-shear)
@@ -105,22 +102,17 @@ jobs:
           tool: cargo-shear
       - run: cargo shear
 
-  # Detect accidental or unversioned public-API changes by diffing each crate
+  # Detect accidental or unversioned public-API changes by diffing the crate
   # against the latest version published to crates.io. A breaking change (e.g.
-  # removing a `pub fn`) fails the job unless the version is bumped accordingly
-  # (under 0.x, breaking changes require a minor bump).
+  # removing a `pub fn`) fails the job unless the version in Cargo.toml is
+  # bumped accordingly (under 0.x, breaking changes require a minor bump).
   #
-  # The facade `hdf5-pure` is intentionally NOT checked: its public surface is
-  # entirely cross-crate re-exports (`pub use hdf5_pure_engine::...`), which rustdoc
-  # omits from its JSON output, so cargo-semver-checks cannot introspect them
-  # (it would report every re-exported item as "removed"). The real, checkable
-  # API lives in the sub-crates below; the facade is pure re-exports whose
-  # compatibility is guaranteed structurally and exercised by the test suite.
-  # Each sub-crate is checked with --all-features so its whole feature-gated
-  # surface is covered. Sub-crates not yet on crates.io are skipped (their first
-  # publish establishes the baseline).
+  # `parallel_read`/`lane_partition` are gated behind `parallel`, so the feature
+  # set below must enable the public-API-bearing features to see their surface.
+  # `fast-deflate` is omitted (a flate2 backend swap, no API delta) along with
+  # `matio-crosscheck` (test-only, links system libmatio).
   semver-checks:
-    name: SemVer (cargo-semver-checks, per sub-crate)
+    name: SemVer (cargo-semver-checks)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -128,33 +120,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: semver-checks
-      - uses: taiki-e/install-action@v2
+      - uses: obi1kenobi/cargo-semver-checks-action@v2
         with:
-          tool: cargo-semver-checks
-      - name: Check each sub-crate (facade excluded; unpublished crates skipped)
-        run: |
-          set -uo pipefail
-          rc=0
-          for crate in hdf5-pure-core hdf5-pure-format hdf5-pure-filters hdf5-pure-engine hdf5-pure-api hdf5-pure-mat; do
-            if cargo semver-checks check-release -p "$crate" --all-features 2>/tmp/sc.err; then
-              echo "::notice::$crate OK"
-            # The "unpublished, so skip" branch keys on cargo-semver-checks'
-            # exact phrasing for a crate absent from the registry (verified with
-            # 0.48: "<crate> not found in registry (crates.io)."). This coupling
-            # is intentional but brittle: if a future version rewords that
-            # message, an unpublished crate will fall through to the failure
-            # branch below and fail the job (fail-closed, so you'll notice) —
-            # update this grep pattern when that happens. Once every sub-crate
-            # has been published once, this branch stops mattering.
-            elif grep -q 'not found in registry' /tmp/sc.err; then
-              echo "::notice::$crate not yet published; skipping baseline check"
-            else
-              echo "::error::$crate failed cargo-semver-checks"
-              cat /tmp/sc.err
-              rc=1
-            fi
-          done
-          exit $rc
+          feature-group: default-features
+          features: serde,zfp,fast-checksum,provenance,parallel,ndarray
 
   # ===========================================================================
   # 32-bit / no_std compatibility (issue #27).
@@ -183,10 +152,10 @@ jobs:
         with:
           key: i686
       - name: Clippy (lib, default features)
-        run: cargo clippy --locked --workspace --target i686-unknown-linux-gnu --lib -- -D warnings
+        run: cargo clippy --locked --target i686-unknown-linux-gnu --lib -- -D warnings
       - name: Clippy (lib, full features minus C-backed ones)
         run: >
-          cargo clippy --locked --workspace --target i686-unknown-linux-gnu --lib
+          cargo clippy --locked --target i686-unknown-linux-gnu --lib
           --features "serde zfp fast-checksum provenance parallel ndarray" -- -D warnings
 
   # Ratchet for pointer-width-aware cast lints. On i686 clippy flags every
@@ -203,7 +172,7 @@ jobs:
       # Adjust DOWNWARD only, never upward. Measured on the pinned toolchain
       # below; a different clippy version may report a slightly different count,
       # in which case re-measure once and reset this.
-      CAST_BASELINE: 269
+      CAST_BASELINE: 270
     steps:
       - uses: actions/checkout@v4
       # Pinned so the baseline is stable against clippy-version drift.
@@ -217,17 +186,13 @@ jobs:
       - name: Count 32-bit narrowing-cast warnings
         run: |
           set -euo pipefail
-          # Force a fresh compile of OUR crates for the i686 target so clippy
+          # Force a fresh compile of OUR crate for the i686 target so clippy
           # actually re-emits the lints (a cached build emits nothing);
-          # third-party dependencies stay cached. The clean must be
-          # target-scoped and cover every workspace member, since the casts now
-          # live in the sub-crates rather than the thin facade lib.
-          cargo clean --target i686-unknown-linux-gnu \
-            -p hdf5-pure-core -p hdf5-pure-format -p hdf5-pure-filters \
-            -p hdf5-pure-engine -p hdf5-pure-api -p hdf5-pure
+          # dependencies stay cached. The clean must be target-scoped.
+          cargo clean -p hdf5-pure --target i686-unknown-linux-gnu
           # JSON is the only format that reliably carries the lint name per
           # diagnostic (`--message-format=short` drops it).
-          cargo clippy --locked --workspace --target i686-unknown-linux-gnu --lib \
+          cargo clippy --locked --target i686-unknown-linux-gnu --lib \
             --features "serde zfp fast-checksum provenance parallel ndarray" \
             --message-format=json \
             -- -W clippy::cast_possible_truncation \
@@ -261,12 +226,8 @@ jobs:
         with:
           key: cross-i686
       - name: cross test (pure-Rust library + roundtrip suite on i686)
-        # `--workspace` runs every sub-crate's lib unit tests (the cast-sensitive
-        # parsing/geometry code) on a true 32-bit pointer width, plus the named
-        # facade integration tests. `--lib` selects all member libs; the `--test`
-        # targets resolve in the facade where they live.
         run: >
-          cross test --locked --workspace --target i686-unknown-linux-gnu
+          cross test --locked --target i686-unknown-linux-gnu
           --no-default-features
           --features "std checksum deflate zfp serde ndarray provenance fast-checksum"
           --lib --test write_read_roundtrip --test serde_roundtrip --test zfp_roundtrip
