@@ -965,7 +965,7 @@ pub struct GroupBuilder {
 }
 
 impl GroupBuilder {
-    #[doc(hidden)] // reached by the MAT (hdf5-mat) builder
+    #[doc(hidden)] // reached by the MAT (hdf5-pure-mat) builder
     pub fn new(name: &str) -> Self {
         Self {
             name: name.to_string(),

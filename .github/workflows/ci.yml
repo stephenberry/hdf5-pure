@@ -138,6 +138,14 @@ jobs:
           for crate in hdf5-pure-core hdf5-pure-format hdf5-pure-filters hdf5-pure-engine hdf5-pure-api hdf5-pure-mat; do
             if cargo semver-checks check-release -p "$crate" --all-features 2>/tmp/sc.err; then
               echo "::notice::$crate OK"
+            # The "unpublished, so skip" branch keys on cargo-semver-checks'
+            # exact phrasing for a crate absent from the registry (verified with
+            # 0.48: "<crate> not found in registry (crates.io)."). This coupling
+            # is intentional but brittle: if a future version rewords that
+            # message, an unpublished crate will fall through to the failure
+            # branch below and fail the job (fail-closed, so you'll notice) —
+            # update this grep pattern when that happens. Once every sub-crate
+            # has been published once, this branch stops mattering.
             elif grep -q 'not found in registry' /tmp/sc.err; then
               echo "::notice::$crate not yet published; skipping baseline check"
             else

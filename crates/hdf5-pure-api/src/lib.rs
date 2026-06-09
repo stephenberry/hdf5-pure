@@ -6,7 +6,7 @@
 //! [`hdf5-pure`]: https://docs.rs/hdf5-pure
 
 // Re-exported from lower crates so in-crate `crate::<module>` paths resolve.
-// `hdf5-engine` re-exports the core/format/filters modules at its own root, so
+// `hdf5-pure-engine` re-exports the core/format/filters modules at its own root, so
 // every lower-layer module this crate names is reachable through it.
 pub use hdf5_pure_engine::{
     attribute, checksum, chunk_cache, chunked_write, convert, data_layout, data_read, dataspace,

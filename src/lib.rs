@@ -47,7 +47,8 @@
 //! # N-dimensional arrays (`ndarray` feature)
 //!
 //! With the `ndarray` feature, datasets can be written from and read back into
-//! [`ndarray`] arrays of any rank, in row-major (C) order:
+//! [`ndarray`](https://docs.rs/ndarray) arrays of any rank, in row-major (C)
+//! order:
 //!
 //! ```
 //! # #[cfg(feature = "ndarray")] {
@@ -71,7 +72,11 @@
 extern crate alloc;
 
 // ---------------------------------------------------------------------------
-// Format-level modules (from rustyhdf5-format)
+// Internal sub-crate re-exports
+//
+// `hdf5-pure` is a facade over the workspace's internal sub-crates. The
+// `pub use`s below re-export their modules so every `hdf5_pure::<module>` path
+// stays identical to the pre-split crate.
 // ---------------------------------------------------------------------------
 
 // Re-exported from `hdf5-pure-core` (keeps the `hdf5_pure::<module>` paths and the
@@ -121,7 +126,7 @@ pub use hdf5_pure_api::{reader, swmr_writer, types, writer};
 
 // Re-exported from `hdf5-pure-mat`. The MAT builder API is available under `std`;
 // the serde-based (de)serialization parts inside it are additionally gated by
-// the `serde` feature (forwarded to `hdf5-mat/serde`).
+// the `serde` feature (forwarded to `hdf5-pure-mat/serde`).
 #[cfg(feature = "std")]
 #[doc(inline)]
 pub use hdf5_pure_mat::mat;

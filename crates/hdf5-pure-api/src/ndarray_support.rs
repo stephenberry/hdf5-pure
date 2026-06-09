@@ -1,7 +1,7 @@
 //! Ergonomic N-dimensional array I/O via the [`ndarray`] crate (read side).
 //!
 //! Enabled by the `ndarray` feature. The element trait [`H5Element`] and the
-//! writer method `DatasetBuilder::with_ndarray` live in `hdf5-engine` (next to
+//! writer method `DatasetBuilder::with_ndarray` live in `hdf5-pure-engine` (next to
 //! the builder); this module adds the reader side:
 //!
 //! * [`Dataset::read_array`](crate::Dataset::read_array) /

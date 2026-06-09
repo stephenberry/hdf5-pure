@@ -2,12 +2,12 @@
 //!
 //! The public surface (`hdf5_pure::H5Element`, `DatasetBuilder::with_ndarray`,
 //! and `Dataset::read_array`) is split across two crates because the types it
-//! touches are: the writer's [`DatasetBuilder`] lives here in `hdf5-engine`,
-//! while the reader's `Dataset` lives in `hdf5-api` (above the engine).
+//! touches are: the writer's [`DatasetBuilder`] lives here in `hdf5-pure-engine`,
+//! while the reader's `Dataset` lives in `hdf5-pure-api` (above the engine).
 //!
 //! To keep the cycle from forming, the read direction is inverted through the
 //! [`ScalarSource`] trait: this crate defines it and dispatches `H5Element`
-//! reads against it, and `hdf5-api` implements it for its `Dataset` and adds
+//! reads against it, and `hdf5-pure-api` implements it for its `Dataset` and adds
 //! the `Dataset::read_array` / `read_array_dyn` methods. The write direction
 //! needs no inversion: `with_ndarray` lives here, next to `DatasetBuilder`.
 
@@ -21,8 +21,8 @@ mod sealed {
 }
 
 /// A reader that can produce a dataset's elements as each supported scalar
-/// type. Implemented by `hdf5-api`'s `Dataset` so [`H5Element::read_from`] can
-/// dispatch reads without `hdf5-engine` depending on the reader crate.
+/// type. Implemented by `hdf5-pure-api`'s `Dataset` so [`H5Element::read_from`] can
+/// dispatch reads without `hdf5-pure-engine` depending on the reader crate.
 #[doc(hidden)]
 pub trait ScalarSource {
     fn read_f32(&self) -> Result<Vec<f32>, Error>;
