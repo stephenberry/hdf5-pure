@@ -81,43 +81,32 @@ pub use hdf5_core::{checksum, convert, error, message_type, signature, source};
 #[cfg(not(feature = "std"))]
 pub(crate) use hdf5_core::nosync;
 
+// Re-exported from `hdf5-format`.
+pub use hdf5_format::{
+    attribute_info, btree_v1, btree_v2, data_layout, dataspace, datatype, fractal_heap,
+    global_heap, group_info, link_info, link_message, local_heap, object_header,
+    object_header_writer, shared_message, superblock, symbol_table, vl_data,
+};
+
 pub mod attribute;
-pub mod attribute_info;
-pub mod btree_v1;
-pub mod btree_v2;
 pub mod chunk_cache;
 pub mod chunked_read;
 pub mod chunked_write;
-pub mod data_layout;
 pub mod data_read;
-pub mod dataspace;
-pub mod datatype;
 pub mod extensible_array;
 pub mod file_writer;
 pub mod filter_pipeline;
 pub mod filters;
 pub mod fixed_array;
-pub mod fractal_heap;
-pub mod global_heap;
-pub mod group_info;
 pub mod group_v1;
 pub mod group_v2;
 #[cfg(feature = "parallel")]
 pub mod lane_partition;
-pub mod link_info;
-pub mod link_message;
-pub mod local_heap;
 pub mod metadata_index;
-pub mod object_header;
-pub mod object_header_writer;
 #[cfg(feature = "parallel")]
 pub mod parallel_read;
 pub mod scaleoffset;
-pub mod shared_message;
-pub mod superblock;
-pub mod symbol_table;
 pub mod type_builders;
-pub mod vl_data;
 #[cfg(feature = "zfp")]
 pub mod zfp;
 

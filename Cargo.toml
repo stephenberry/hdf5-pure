@@ -42,8 +42,8 @@ exclude = ["tests/fixtures/**"]
 
 [features]
 default = ["std", "checksum", "deflate"]
-std = ["hdf5-core/std"]
-checksum = ["hdf5-core/checksum"]
+std = ["hdf5-core/std", "hdf5-format/std"]
+checksum = ["hdf5-core/checksum", "hdf5-format/checksum"]
 fast-checksum = ["hdf5-core/fast-checksum"]
 deflate = ["flate2"]
 fast-deflate = ["flate2/zlib-ng"]
@@ -68,6 +68,7 @@ matio-crosscheck = ["serde"]
 
 [dependencies]
 hdf5-core = { path = "crates/hdf5-core", version = "=0.9.0" }
+hdf5-format = { path = "crates/hdf5-format", version = "=0.9.0" }
 byteorder = { version = "1", default-features = false }
 flate2 = { version = "1", optional = true, default-features = false, features = ["rust_backend"] }
 sha2 = { version = "0.10", optional = true, default-features = false }
