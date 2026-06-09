@@ -1,0 +1,21 @@
+[package]
+name = "hdf5-filters"
+description = "HDF5 filter pipeline (deflate, scale-offset, ZFP) for hdf5-pure. Internal crate; use `hdf5-pure` instead."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+std = ["hdf5-core/std", "hdf5-format/std"]
+deflate = ["dep:flate2"]
+fast-deflate = ["flate2/zlib-ng"]
+zfp = []
+
+[dependencies]
+hdf5-core = { path = "../hdf5-core", version = "=0.9.0" }
+hdf5-format = { path = "../hdf5-format", version = "=0.9.0" }
+flate2 = { version = "1", optional = true, default-features = false, features = ["rust_backend"] }
+
+[lints]
+workspace = true

@@ -241,6 +241,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hdf5-filters"
+version = "0.9.0"
+dependencies = [
+ "flate2",
+ "hdf5-core",
+ "hdf5-format",
+]
+
+[[package]]
 name = "hdf5-format"
 version = "0.9.0"
 dependencies = [
@@ -322,8 +331,8 @@ name = "hdf5-pure"
 version = "0.9.0"
 dependencies = [
  "byteorder",
- "flate2",
  "hdf5-core",
+ "hdf5-filters",
  "hdf5-format",
  "hdf5-metno",
  "ndarray",

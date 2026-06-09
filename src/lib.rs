@@ -81,6 +81,11 @@ pub use hdf5_core::{checksum, convert, error, message_type, signature, source};
 #[cfg(not(feature = "std"))]
 pub(crate) use hdf5_core::nosync;
 
+// Re-exported from `hdf5-filters`.
+#[cfg(feature = "zfp")]
+pub use hdf5_filters::zfp;
+pub use hdf5_filters::{filter_pipeline, filters, scaleoffset};
+
 // Re-exported from `hdf5-format`.
 pub use hdf5_format::{
     attribute_info, btree_v1, btree_v2, data_layout, dataspace, datatype, fractal_heap,
@@ -95,8 +100,6 @@ pub mod chunked_write;
 pub mod data_read;
 pub mod extensible_array;
 pub mod file_writer;
-pub mod filter_pipeline;
-pub mod filters;
 pub mod fixed_array;
 pub mod group_v1;
 pub mod group_v2;
@@ -105,10 +108,7 @@ pub mod lane_partition;
 pub mod metadata_index;
 #[cfg(feature = "parallel")]
 pub mod parallel_read;
-pub mod scaleoffset;
 pub mod type_builders;
-#[cfg(feature = "zfp")]
-pub mod zfp;
 
 #[cfg(feature = "provenance")]
 pub mod provenance;
