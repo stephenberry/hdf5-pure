@@ -1,7 +1,11 @@
 //! SHINES provenance: SHA-256 content hashing, provenance attributes, and
 //! data-integrity verification.
 //!
-//! Enable with the `provenance` Cargo feature (on by default).
+//! Enable with the `provenance` Cargo feature (opt-in; not in the default set).
+//! Writing is done via
+//! [`DatasetBuilder::with_provenance`](crate::DatasetBuilder::with_provenance);
+//! the stored hash is checked back with
+//! [`Dataset::verify_provenance`](crate::Dataset::verify_provenance).
 
 #[cfg(not(feature = "std"))]
 use alloc::{format, string::String, vec::Vec};
@@ -66,6 +70,30 @@ impl Provenance {
         }
         attrs
     }
+}
+
+// ---- Verification ----
+
+/// Outcome of checking a dataset against its stored provenance hash.
+///
+/// Returned by [`Dataset::verify_provenance`](crate::Dataset::verify_provenance).
+/// `NoHash` is kept distinct from `Mismatch` so a dataset that was simply never
+/// written with provenance is not reported as corrupt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifyResult {
+    /// The recomputed hash matches the stored `_provenance_sha256` attribute.
+    Ok,
+    /// The recomputed hash differs from the stored one. Carries both digests
+    /// (lowercase hex) for diagnostics.
+    Mismatch {
+        /// The hash recorded in the `_provenance_sha256` attribute.
+        stored: String,
+        /// The hash recomputed from the dataset's current raw bytes.
+        computed: String,
+    },
+    /// The dataset carries no `_provenance_sha256` attribute, so there is
+    /// nothing to verify against.
+    NoHash,
 }
 
 // ---- Tests ----

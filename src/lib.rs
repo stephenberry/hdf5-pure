@@ -163,6 +163,9 @@ pub use error::FormatError;
 #[cfg(feature = "std")]
 pub use reader::{Dataset, File, Group};
 
+#[cfg(all(feature = "std", feature = "provenance"))]
+pub use provenance::VerifyResult;
+
 #[cfg(feature = "std")]
 pub use types::{AttrValue, DType};
 
