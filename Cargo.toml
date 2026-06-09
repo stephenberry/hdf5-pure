@@ -42,20 +42,20 @@ exclude = ["tests/fixtures/**"]
 
 [features]
 default = ["std", "checksum", "deflate"]
-std = ["hdf5-core/std", "hdf5-format/std", "hdf5-filters/std"]
-checksum = ["hdf5-core/checksum", "hdf5-format/checksum"]
+std = ["hdf5-core/std", "hdf5-format/std", "hdf5-filters/std", "hdf5-engine/std"]
+checksum = ["hdf5-core/checksum", "hdf5-format/checksum", "hdf5-engine/checksum"]
 fast-checksum = ["hdf5-core/fast-checksum"]
-deflate = ["hdf5-filters/deflate"]
-fast-deflate = ["hdf5-filters/fast-deflate"]
-provenance = ["sha2"]
-parallel = ["rayon"]
+deflate = ["hdf5-filters/deflate", "hdf5-engine/deflate"]
+fast-deflate = ["hdf5-filters/fast-deflate", "hdf5-engine/fast-deflate"]
+provenance = ["hdf5-engine/provenance"]
+parallel = ["hdf5-engine/parallel"]
 # Pure-Rust ZFP fixed-rate compression filter (HDF5 filter ID 32013).
 # Supports f32/f64/i32/i64 datasets in 1D–4D.
-zfp = ["hdf5-filters/zfp"]
+zfp = ["hdf5-filters/zfp", "hdf5-engine/zfp"]
 # Ergonomic N-dimensional array I/O via the `ndarray` crate
 # (`DatasetBuilder::with_ndarray`, `Dataset::read_array`/`read_array_dyn`).
 # Requires `std` (it builds on the File/Dataset reader and writer APIs).
-ndarray = ["dep:ndarray", "std"]
+ndarray = ["dep:ndarray", "std", "hdf5-engine/ndarray"]
 # Serde-based (de)serialization of MATLAB v7.3 .mat files.
 # Requires `std` (uses File/Group/Dataset reader APIs).
 serde = ["dep:serde", "std"]
@@ -70,9 +70,7 @@ matio-crosscheck = ["serde"]
 hdf5-core = { path = "crates/hdf5-core", version = "=0.9.0" }
 hdf5-format = { path = "crates/hdf5-format", version = "=0.9.0" }
 hdf5-filters = { path = "crates/hdf5-filters", version = "=0.9.0" }
-byteorder = { version = "1", default-features = false }
-sha2 = { version = "0.10", optional = true, default-features = false }
-rayon = { version = "1", optional = true }
+hdf5-engine = { path = "crates/hdf5-engine", version = "=0.9.0" }
 serde = { version = "1", optional = true, default-features = false, features = ["derive", "alloc"] }
 # A permissive range (like `hdf5-metno`'s own `ndarray` requirement) so the
 # user's existing `ndarray` unifies with ours instead of compiling a second

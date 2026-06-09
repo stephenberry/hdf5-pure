@@ -241,6 +241,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hdf5-engine"
+version = "0.9.0"
+dependencies = [
+ "hdf5-core",
+ "hdf5-filters",
+ "hdf5-format",
+ "ndarray",
+ "rayon",
+ "sha2",
+]
+
+[[package]]
 name = "hdf5-filters"
 version = "0.9.0"
 dependencies = [
@@ -330,16 +342,14 @@ dependencies = [
 name = "hdf5-pure"
 version = "0.9.0"
 dependencies = [
- "byteorder",
  "hdf5-core",
+ "hdf5-engine",
  "hdf5-filters",
  "hdf5-format",
  "hdf5-metno",
  "ndarray",
- "rayon",
  "serde",
  "serde_json",
- "sha2",
  "tempfile",
 ]
 

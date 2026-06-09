@@ -78,9 +78,6 @@ extern crate alloc;
 // in-crate `crate::<module>` references resolving unchanged).
 pub use hdf5_core::{checksum, convert, error, message_type, signature, source};
 
-#[cfg(not(feature = "std"))]
-pub(crate) use hdf5_core::nosync;
-
 // Re-exported from `hdf5-filters`.
 #[cfg(feature = "zfp")]
 pub use hdf5_filters::zfp;
@@ -93,25 +90,16 @@ pub use hdf5_format::{
     object_header_writer, shared_message, superblock, symbol_table, vl_data,
 };
 
-pub mod attribute;
-pub mod chunk_cache;
-pub mod chunked_read;
-pub mod chunked_write;
-pub mod data_read;
-pub mod extensible_array;
-pub mod file_writer;
-pub mod fixed_array;
-pub mod group_v1;
-pub mod group_v2;
+// Re-exported from `hdf5-engine`.
+pub use hdf5_engine::{
+    attribute, chunk_cache, chunked_read, chunked_write, data_read, extensible_array, file_writer,
+    fixed_array, group_v1, group_v2, metadata_index, type_builders,
+};
 #[cfg(feature = "parallel")]
-pub mod lane_partition;
-pub mod metadata_index;
-#[cfg(feature = "parallel")]
-pub mod parallel_read;
-pub mod type_builders;
+pub use hdf5_engine::{lane_partition, parallel_read};
 
 #[cfg(feature = "provenance")]
-pub mod provenance;
+pub use hdf5_engine::provenance;
 
 // ---------------------------------------------------------------------------
 // High-level modules
