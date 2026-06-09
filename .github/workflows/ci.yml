@@ -46,7 +46,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.os }}-${{ matrix.config.name }}
-      - run: cargo test --locked ${{ matrix.config.flags }}
+      # `--workspace` is required: the workspace root is itself a package, so
+      # its only default member is the `hdf5-pure` facade. Without `--workspace`
+      # the ~500 unit tests that live in the sub-crates' `src/**` would not run.
+      - run: cargo test --locked --workspace ${{ matrix.config.flags }}
 
   no-std-check:
     name: Check (no_std)
@@ -89,7 +92,7 @@ jobs:
       - name: Rustfmt
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --locked --features "serde ndarray" --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --features "serde ndarray" --all-targets -- -D warnings
 
   shear:
     name: Unused dependencies (cargo-shear)
@@ -250,8 +253,12 @@ jobs:
         with:
           key: cross-i686
       - name: cross test (pure-Rust library + roundtrip suite on i686)
+        # `--workspace` runs every sub-crate's lib unit tests (the cast-sensitive
+        # parsing/geometry code) on a true 32-bit pointer width, plus the named
+        # facade integration tests. `--lib` selects all member libs; the `--test`
+        # targets resolve in the facade where they live.
         run: >
-          cross test --locked --target i686-unknown-linux-gnu
+          cross test --locked --workspace --target i686-unknown-linux-gnu
           --no-default-features
           --features "std checksum deflate zfp serde ndarray provenance fast-checksum"
           --lib --test write_read_roundtrip --test serde_roundtrip --test zfp_roundtrip
