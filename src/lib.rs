@@ -139,6 +139,8 @@ pub(crate) mod nosync;
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "std")]
+pub(crate) mod edit;
+#[cfg(feature = "std")]
 pub(crate) mod reader;
 #[cfg(feature = "std")]
 pub(crate) mod swmr_writer;
@@ -177,6 +179,9 @@ pub use writer::FileBuilder;
 
 #[cfg(feature = "std")]
 pub use swmr_writer::SwmrWriter;
+
+#[cfg(feature = "std")]
+pub use edit::EditSession;
 
 #[cfg(feature = "ndarray")]
 pub use ndarray_support::H5Element;

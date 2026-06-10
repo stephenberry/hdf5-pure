@@ -500,6 +500,12 @@ pub enum Error {
     /// filtered, not rank-1 with an unlimited dimension, or not
     /// Extensible-Array indexed). The payload is a human-readable reason.
     SwmrAppendUnsupported(&'static str),
+    /// The file or the requested object is not a supported target for the
+    /// in-place editor ([`crate::EditSession`]) — for example a userblock or
+    /// non-latest-format file, a group whose links are densely stored, or a
+    /// dataset shape/datatype/filter combination the in-place writer cannot
+    /// emit yet. The payload is a human-readable reason.
+    EditUnsupported(&'static str),
 }
 
 #[cfg(feature = "std")]
@@ -518,6 +524,9 @@ impl fmt::Display for Error {
             ),
             Error::SwmrAppendUnsupported(reason) => {
                 write!(f, "unsupported SWMR append target: {reason}")
+            }
+            Error::EditUnsupported(reason) => {
+                write!(f, "unsupported in-place edit target: {reason}")
             }
         }
     }
