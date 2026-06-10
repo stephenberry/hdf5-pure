@@ -3,16 +3,16 @@
 // suite can run under `cross test --target i686-...`.
 #![cfg(not(target_pointer_width = "32"))]
 //! Cross-validation for in-place editing against the reference C library
-//! (PR #38 / issue #32): files the C library *writes* are edited in place by
+//! (issue #32): files the C library *writes* are edited in place by
 //! `EditSession`, and the result is read back by both `hdf5-pure` and the C
 //! library. This proves the editor works on files it did not itself produce, in
-//! both the HDF5 1.8 (v2 superblock) and 1.10+ (v3 superblock) formats.
+//! both the HDF5 1.8 (v2 superblock) and 1.10+ (v3 superblock) formats, and
+//! including headers the C library splits across multiple chunks (which the
+//! editor collapses into a single chunk on rewrite).
 //!
 //! Boundary recorded here too: the default earliest format (version 0
 //! superblock with symbol-table groups) is refused cleanly, leaving the file
-//! untouched. (A separate, content-dependent limit not asserted here: the C
-//! library sometimes lays a group header out across multiple chunks, which the
-//! editor does not yet rebuild — see `src/edit.rs`.)
+//! untouched.
 
 use hdf5::file::LibraryVersion;
 use hdf5_pure::{EditSession, File, FileBuilder};
@@ -158,6 +158,71 @@ fn c_written_v3_file_edited_in_place() {
     session.commit().unwrap();
 
     assert_edits_applied(&path);
+}
+
+#[test]
+fn c_multichunk_group_header_is_collapsed_and_edited() {
+    // The C library lays a group header out across multiple chunks once it holds
+    // enough messages; several root attributes reliably force that. The editor
+    // must collapse the continuation chunks into one header on rewrite, preserve
+    // the existing messages (the attributes), and apply the edit.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_multichunk.h5");
+    {
+        let file = hdf5::File::with_options()
+            .with_fapl(|p| p.libver_bounds(LibraryVersion::V110, LibraryVersion::latest()))
+            .create(&path)
+            .unwrap();
+        file.new_dataset::<f64>()
+            .shape((3,))
+            .create("alpha")
+            .unwrap()
+            .write(&[1.0f64, 2.0, 3.0])
+            .unwrap();
+        file.new_dataset::<i32>()
+            .shape((2,))
+            .create("doomed")
+            .unwrap()
+            .write(&[7i32, 8])
+            .unwrap();
+        let grp = file.create_group("grp").unwrap();
+        grp.new_dataset::<i32>()
+            .shape((4,))
+            .create("beta")
+            .unwrap()
+            .write(&[10i32, 20, 30, 40])
+            .unwrap();
+        // Several root-group attributes push the root header past one chunk.
+        for i in 0..6 {
+            let a = file
+                .new_attr::<i64>()
+                .shape(())
+                .create(format!("meta{i}").as_str())
+                .unwrap();
+            a.write_scalar(&(i as i64 * 100)).unwrap();
+        }
+        file.close().unwrap();
+    }
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        stage_edits(&mut session);
+        session.commit().unwrap();
+    }
+
+    assert_edits_applied(&path);
+
+    // The C-written root attributes survived the multi-chunk -> single-chunk
+    // rewrite of the root header (verified by the C library).
+    let c = hdf5::File::open(&path).unwrap();
+    for i in 0..6 {
+        let v: i64 = c.attr(&format!("meta{i}")).unwrap().read_scalar().unwrap();
+        assert_eq!(
+            v,
+            i as i64 * 100,
+            "root attribute meta{i} lost or corrupted"
+        );
+    }
 }
 
 #[test]
