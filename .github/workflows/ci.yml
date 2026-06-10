@@ -247,3 +247,37 @@ jobs:
         with:
           key: thumbv7em
       - run: cargo build --locked --no-default-features --target thumbv7em-none-eabi
+
+  # ===========================================================================
+  # Undefined-behavior sanitizing with Miri (issue #26).
+  #
+  # The library is almost entirely safe Rust; the unsafe that exists is the
+  # cache-line-aligned chunk buffer in `chunk_cache` (manual global-allocator
+  # `alloc_zeroed`/`dealloc`, `slice::from_raw_parts[_mut]`, and `unsafe impl
+  # Send`/`Sync` for `CacheAlignedBuffer`). Miri interprets that allocation and
+  # the surrounding pointer arithmetic under Stacked Borrows + strict provenance,
+  # catching aliasing / out-of-bounds / leak UB that the normal test run cannot
+  # observe.
+  #
+  # Scoped to the `chunk_cache` unit tests on purpose: most other tests touch the
+  # filesystem and the crosscheck tests call into the libhdf5 C library, neither
+  # of which Miri can execute. Widen the `--lib` test filter as more
+  # pure-in-memory unsafe lands (the single-threaded `nosync::Mutex` is the next
+  # candidate, once the crate's no_std unit-test harness compiles).
+  miri:
+    name: Miri (undefined behavior)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@miri
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: miri
+      - name: Miri test (chunk_cache unsafe)
+        # `--no-default-features --features std` keeps the interpreted build
+        # minimal: the `chunk_cache` tests are pure in-memory, so there is no
+        # need to compile the `deflate` (flate2/miniz_oxide) or `checksum` code
+        # that Miri never executes. Smaller, more deterministic surface.
+        run: cargo miri test --locked --no-default-features --features std --lib chunk_cache
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
