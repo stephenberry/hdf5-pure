@@ -274,6 +274,10 @@ jobs:
         with:
           key: miri
       - name: Miri test (chunk_cache unsafe)
-        run: cargo miri test --locked --lib chunk_cache
+        # `--no-default-features --features std` keeps the interpreted build
+        # minimal: the `chunk_cache` tests are pure in-memory, so there is no
+        # need to compile the `deflate` (flate2/miniz_oxide) or `checksum` code
+        # that Miri never executes. Smaller, more deterministic surface.
+        run: cargo miri test --locked --no-default-features --features std --lib chunk_cache
         env:
           MIRIFLAGS: -Zmiri-strict-provenance
