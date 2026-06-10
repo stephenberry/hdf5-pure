@@ -35,9 +35,11 @@
 //! - The file uses a latest-format (version 2/3) superblock with 8-byte
 //!   offsets/lengths and **no** userblock (base address 0).
 //! - Every group on an edited path stores its links compactly (not in a dense
-//!   fractal heap), has a single-chunk object header, and does not track message
-//!   creation order. Files written by this crate's
-//!   [`FileBuilder`](crate::FileBuilder) satisfy this.
+//!   fractal heap) and does not track message creation order. Object headers
+//!   split across continuation chunks (as the reference C library often writes)
+//!   are collapsed into a single chunk when rewritten. Files written by this
+//!   crate's [`FileBuilder`](crate::FileBuilder) and by the C library satisfy
+//!   this.
 //! - Added datasets are contiguous and unfiltered (no chunking, compression,
 //!   shuffle, scale-offset, or extensible dimensions), have a fixed-size
 //!   datatype with a non-empty shape, and carry only fixed-size (non
@@ -73,6 +75,11 @@ const MAX_COMPACT_ATTRS: usize = 8;
 /// pathological or cyclic hard-link graph (HDF5 hard links can form cycles).
 /// Far deeper than any real group hierarchy.
 const MAX_COPY_DEPTH: u32 = 1000;
+
+/// Maximum number of object-header chunks to follow when gathering a header that
+/// spans continuation blocks, guarding against a cyclic continuation chain.
+/// Matches the reader's continuation-depth cap.
+const MAX_OH_CHUNKS: usize = 256;
 
 /// A path identified by its components (no leading/trailing empties); the root
 /// group is the empty vector.
@@ -343,7 +350,7 @@ impl EditSession {
                     .map_err(|_| Error::EditUnsupported("group address exceeds this platform"))?;
                 let info = self.inspect_group(addr)?;
                 let node = nodes.get_mut(key).unwrap();
-                node.base_region = self.data[info.region_start..info.region_end].to_vec();
+                node.base_region = info.region;
                 node.existing_links = info.link_names;
             }
         }
@@ -511,24 +518,75 @@ impl EditSession {
         Ok((region_start, region_end))
     }
 
-    /// Parse and validate a group's object header, returning the byte range
-    /// `[start, end)` of its chunk-0 message region (the bytes to copy when
-    /// rewriting the header) and the names of its existing links.
-    fn inspect_group(&self, addr: usize) -> Result<GroupInfo, Error> {
+    /// Collect every message of the object header at `addr` into one contiguous
+    /// region, following continuation blocks across chunks and dropping the
+    /// `Continuation` messages themselves. Re-emitting the result through
+    /// [`build_v2_object_header`] collapses a multi-chunk header (as the
+    /// reference C library often writes) into a single chunk, which is how this
+    /// editor rebuilds headers. The chunk-0 prefix is validated by
+    /// [`oh_region`]; each continuation block must be a well-formed `OCHK` block
+    /// within the file.
+    fn gather_oh_messages(&self, addr: usize) -> Result<Vec<u8>, Error> {
+        let (rs, re) = self.oh_region(addr)?;
         let d = &self.data;
-        let (region_start, region_end) = self.oh_region(addr)?;
+        let mut out = Vec::new();
+        // Worklist of (message-region start, end) per chunk, chunk 0 first.
+        let mut chunks: Vec<(usize, usize)> = vec![(rs, re)];
+        let mut i = 0;
+        while i < chunks.len() {
+            if chunks.len() > MAX_OH_CHUNKS {
+                return Err(Error::EditUnsupported(
+                    "object header has too many continuation chunks",
+                ));
+            }
+            let (cs, ce) = chunks[i];
+            i += 1;
+            let region = &d[..ce];
+            let mut p = cs;
+            while let Some((msg_type, body, body_end)) = next_message(region, p)? {
+                if msg_type == MessageType::ObjectHeaderContinuation {
+                    // Body: block offset (offset_size) + block length (length_size).
+                    if body_end - body < (OFFSET_SIZE + LENGTH_SIZE) as usize {
+                        return Err(Error::EditUnsupported("malformed continuation message"));
+                    }
+                    let off = u64::from_le_bytes(d[body..body + 8].try_into().unwrap());
+                    let len = u64::from_le_bytes(d[body + 8..body + 16].try_into().unwrap());
+                    let off = usize::try_from(off).map_err(|_| {
+                        Error::EditUnsupported("continuation address exceeds this platform")
+                    })?;
+                    let len = usize::try_from(len).map_err(|_| {
+                        Error::EditUnsupported("continuation length exceeds this platform")
+                    })?;
+                    // An OCHK block is signature(4) + messages + checksum(4).
+                    let blk_end = off
+                        .checked_add(len)
+                        .filter(|&e| e <= d.len() && len >= 8)
+                        .ok_or(Error::EditUnsupported("continuation block out of bounds"))?;
+                    if &d[off..off + 4] != b"OCHK" {
+                        return Err(Error::EditUnsupported(
+                            "invalid continuation block signature",
+                        ));
+                    }
+                    chunks.push((off + 4, blk_end - 4));
+                } else {
+                    out.extend_from_slice(&region[p..body_end]);
+                }
+                p = body_end;
+            }
+        }
+        Ok(out)
+    }
 
-        let region = &d[..region_end];
-        let mut p = region_start;
+    /// Parse and validate a group's object header (collapsing any continuation
+    /// chunks), returning its unified message region — the bytes to copy when
+    /// rewriting the header — and the names of its existing links.
+    fn inspect_group(&self, addr: usize) -> Result<GroupInfo, Error> {
+        let region = self.gather_oh_messages(addr)?;
+        let mut p = 0;
         let mut has_link_info = false;
         let mut link_names = Vec::new();
-        while let Some((msg_type, body, body_end)) = next_message(region, p)? {
+        while let Some((msg_type, body, body_end)) = next_message(&region, p)? {
             match msg_type {
-                MessageType::ObjectHeaderContinuation => {
-                    return Err(Error::EditUnsupported(
-                        "a target group's object header spans multiple chunks (not supported in place yet)",
-                    ));
-                }
                 MessageType::LinkInfo => {
                     has_link_info = true;
                     // LinkInfo: version(1) flags(1) [max_creation_index(8) if
@@ -537,11 +595,11 @@ impl EditSession {
                     // message's own body, not just the region, so a short or
                     // malformed LinkInfo can't make us read the next message.
                     let mut q = body + 2;
-                    if body_end - body >= 2 && d[body + 1] & 0x01 != 0 {
+                    if body_end - body >= 2 && region[body + 1] & 0x01 != 0 {
                         q += 8;
                     }
                     if q + 8 <= body_end {
-                        let heap_addr = u64::from_le_bytes(d[q..q + 8].try_into().unwrap());
+                        let heap_addr = u64::from_le_bytes(region[q..q + 8].try_into().unwrap());
                         if heap_addr != u64::MAX {
                             return Err(Error::EditUnsupported(
                                 "a target group uses dense (fractal-heap) link storage (not supported in place yet)",
@@ -550,7 +608,7 @@ impl EditSession {
                     }
                 }
                 MessageType::Link => {
-                    if let Ok(link) = LinkMessage::parse(&d[body..body_end], OFFSET_SIZE) {
+                    if let Ok(link) = LinkMessage::parse(&region[body..body_end], OFFSET_SIZE) {
                         link_names.push(link.name);
                     }
                 }
@@ -568,11 +626,7 @@ impl EditSession {
                 "a target group's object header has no link-info message",
             ));
         }
-        Ok(GroupInfo {
-            region_start,
-            region_end,
-            link_names,
-        })
+        Ok(GroupInfo { region, link_names })
     }
 
     /// Parse the object header at `addr` into a copyable model, validating that
@@ -582,23 +636,16 @@ impl EditSession {
     /// soft/external links, chunked/old-version data layouts, and headers that
     /// are neither a dataset nor a group.
     fn read_object(&self, addr: usize) -> Result<ObjModel, Error> {
-        let (rs, re) = self.oh_region(addr)?;
-        let d = &self.data;
+        let region = self.gather_oh_messages(addr)?;
 
         let mut layout: Option<(usize, usize)> = None; // (body offset, size)
         let mut has_link_info = false;
         let mut children: Vec<(String, u64)> = Vec::new();
         let mut non_link: Vec<u8> = Vec::new();
 
-        let region = &d[..re];
-        let mut p = rs;
-        while let Some((msg_type, body, body_end)) = next_message(region, p)? {
+        let mut p = 0;
+        while let Some((msg_type, body, body_end)) = next_message(&region, p)? {
             match msg_type {
-                MessageType::ObjectHeaderContinuation => {
-                    return Err(Error::EditUnsupported(
-                        "an object's header spans multiple chunks (not supported in place yet)",
-                    ));
-                }
                 MessageType::AttributeInfo => {
                     return Err(Error::EditUnsupported(
                         "an object uses dense (fractal-heap) attribute storage (not supported in place yet)",
@@ -607,11 +654,11 @@ impl EditSession {
                 MessageType::LinkInfo => {
                     has_link_info = true;
                     let mut q = body + 2;
-                    if body_end - body >= 2 && d[body + 1] & 0x01 != 0 {
+                    if body_end - body >= 2 && region[body + 1] & 0x01 != 0 {
                         q += 8;
                     }
                     if q + 8 <= body_end {
-                        let heap_addr = u64::from_le_bytes(d[q..q + 8].try_into().unwrap());
+                        let heap_addr = u64::from_le_bytes(region[q..q + 8].try_into().unwrap());
                         if heap_addr != u64::MAX {
                             return Err(Error::EditUnsupported(
                                 "a group uses dense (fractal-heap) link storage (not supported in place yet)",
@@ -619,7 +666,8 @@ impl EditSession {
                         }
                     }
                 }
-                MessageType::Link => match LinkMessage::parse(&d[body..body_end], OFFSET_SIZE) {
+                MessageType::Link => match LinkMessage::parse(&region[body..body_end], OFFSET_SIZE)
+                {
                     Ok(LinkMessage {
                         name,
                         link_target:
@@ -638,33 +686,32 @@ impl EditSession {
                 _ => {}
             }
             if msg_type != MessageType::Link {
-                non_link.extend_from_slice(&d[p..body_end]);
+                non_link.extend_from_slice(&region[p..body_end]);
             }
             p = body_end;
         }
 
         if let Some((lbody, lsize)) = layout {
-            let version = d[lbody];
+            let version = region[lbody];
             if !(version == 3 || version == 4) || lsize < 2 {
                 return Err(Error::EditUnsupported(
                     "an unsupported data-layout version cannot be copied in place yet",
                 ));
             }
-            match d[lbody + 1] {
-                0 => Ok(ObjModel::DatasetVerbatim {
-                    region: d[rs..re].to_vec(),
-                }),
+            let class = region[lbody + 1];
+            match class {
+                0 => Ok(ObjModel::DatasetVerbatim { region }),
                 1 => {
-                    if lbody + 18 > re {
+                    if lbody + 18 > region.len() {
                         return Err(Error::EditUnsupported("malformed contiguous data layout"));
                     }
                     let data_addr =
-                        u64::from_le_bytes(d[lbody + 2..lbody + 10].try_into().unwrap());
+                        u64::from_le_bytes(region[lbody + 2..lbody + 10].try_into().unwrap());
                     let data_size =
-                        u64::from_le_bytes(d[lbody + 10..lbody + 18].try_into().unwrap());
+                        u64::from_le_bytes(region[lbody + 10..lbody + 18].try_into().unwrap());
                     Ok(ObjModel::DatasetContiguous {
-                        region: d[rs..re].to_vec(),
-                        addr_off: (lbody + 2) - rs,
+                        region,
+                        addr_off: lbody + 2,
                         data_addr,
                         data_size,
                     })
@@ -816,10 +863,10 @@ enum ObjModel {
     },
 }
 
-/// The validated message region and existing link names of a group header.
+/// The validated, chunk-collapsed message region and existing link names of a
+/// group header.
 struct GroupInfo {
-    region_start: usize,
-    region_end: usize,
+    region: Vec<u8>,
     link_names: Vec<String>,
 }
 
