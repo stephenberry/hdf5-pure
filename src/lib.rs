@@ -1,7 +1,8 @@
-//! Pure-Rust HDF5 file reading and writing library.
+//! Pure-Rust HDF5 file reading, writing, and in-place editing library.
 //!
-//! `hdf5-pure` is a zero-C-dependency crate for creating and reading HDF5 files.
-//! It is WASM-compatible and supports `no_std` environments with `alloc`.
+//! `hdf5-pure` is a zero-C-dependency crate for creating, reading, and editing
+//! HDF5 files. It is WASM-compatible and supports `no_std` environments with
+//! `alloc`.
 //!
 //! # Writing files
 //!
@@ -24,6 +25,22 @@
 //! let file = File::from_bytes(std::fs::read("output.h5").unwrap()).unwrap();
 //! let ds = file.dataset("data").unwrap();
 //! let values = ds.read_f64().unwrap();
+//! ```
+//!
+//! # Editing files in place
+//!
+//! [`EditSession`] opens an existing file and adds, deletes, or copies objects
+//! without reading it all in and rewriting it. New data and rebuilt object
+//! headers are appended at end-of-file and the superblock is repointed last, so
+//! the cost is proportional to what changes rather than to the file size.
+//!
+//! ```rust,no_run
+//! use hdf5_pure::EditSession;
+//!
+//! let mut session = EditSession::open("output.h5").unwrap();
+//! session.create_dataset("extra").with_f64_data(&[4.0, 5.0]);
+//! session.delete("data");            // H5Ldelete
+//! session.commit().unwrap();
 //! ```
 //!
 //! # Streaming large files

@@ -1,11 +1,12 @@
 # hdf5-pure
 
-Pure-Rust HDF5 reader/writer. No C dependencies, no build scripts, WASM-compatible.
+Pure-Rust HDF5 reader, writer, and in-place editor. No C dependencies, no build scripts, WASM-compatible.
 
 ## Features
 
 - **Write** HDF5 files with datasets, groups, attributes, and nested hierarchies
 - **Read** HDF5 files (v0/v1/v2/v3 superblocks, v1/v2 object headers, contiguous/chunked/compact storage)
+- **Edit in place** — add, delete (`H5Ldelete`), and copy (`H5Ocopy`) datasets and groups in an existing file without reading it all in and rewriting it; the cost is proportional to what changes, not the file size
 - **SWMR** (single-writer / multiple-reader) append and refreshing read for 1-D unlimited datasets, interoperable with the reference C library and h5py
 - **No C dependencies** — compiles to `wasm32-unknown-unknown` with `--no-default-features`
 - **MATLAB v7.3 compatible** — userblock support, fixed-length ASCII attributes, variable-length string arrays, object references
@@ -53,6 +54,25 @@ println!("data:  {:?}", ds.read_f64().unwrap());  // [22.5, 23.1, 21.8]
 let attrs = file.root().attrs().unwrap();
 println!("version: {:?}", attrs.get("version"));  // Some(I64(2))
 ```
+
+### Editing in place
+
+`EditSession` opens an existing file and adds, deletes, or copies objects without reading it all in and rewriting it. New data and the rebuilt object headers are appended at the end of the file and the superblock is repointed last, so the cost is proportional to what changes and a failed commit leaves the file valid.
+
+```rust,no_run
+use hdf5_pure::EditSession;
+
+let mut session = EditSession::open("output.h5").unwrap();
+
+session.create_group("run2");
+session.create_dataset("run2/signal").with_f64_data(&[1.0, 2.0, 3.0]);
+session.copy("temperature", "temperature_backup");  // H5Ocopy
+session.delete("sensors/pressure");                 // H5Ldelete
+
+session.commit().unwrap();  // apply everything in place
+```
+
+Contiguous, unfiltered datasets and compact-link groups are supported; the editor refuses (rather than silently degrade the file) anything it cannot reproduce faithfully — a userblock or pre-1.10 file, chunked/compressed additions, or dense-storage headers on the edited path. The space left by deleted or superseded objects is not yet reclaimed.
 
 ### Streaming large files
 

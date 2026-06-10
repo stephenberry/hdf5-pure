@@ -6,3 +6,7 @@ matlab_fixtures/
 tests/fixtures/zfp/.venv/
 # Local scratch dir for drafts and throwaway work
 /tmp/
+
+# Stray build artifacts
+*.rlib
+*.rmeta
