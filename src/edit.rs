@@ -69,6 +69,11 @@ use crate::type_builders::{AttrValue, DatasetBuilder, build_attr_message};
 /// Mirrors `DENSE_ATTR_THRESHOLD` in `file_writer`.
 const MAX_COMPACT_ATTRS: usize = 8;
 
+/// Recursion-depth cap for object copy, guarding against a stack overflow on a
+/// pathological or cyclic hard-link graph (HDF5 hard links can form cycles).
+/// Far deeper than any real group hierarchy.
+const MAX_COPY_DEPTH: u32 = 1000;
+
 /// A path identified by its components (no leading/trailing empties); the root
 /// group is the empty vector.
 type PathKey = Vec<String>;
@@ -274,7 +279,7 @@ impl EditSession {
                     .map_err(|_| Error::EditUnsupported("copy source does not exist"))?;
             let src_addr = usize::try_from(src_addr)
                 .map_err(|_| Error::EditUnsupported("source address exceeds this platform"))?;
-            self.plan_copy(src_addr)?;
+            self.plan_copy(src_addr, 0)?;
             add_targets.push(dst.clone());
             let leaf = dst.last().unwrap().clone();
             let parent = dst[..dst.len() - 1].to_vec();
@@ -411,7 +416,7 @@ impl EditSession {
 
             // Deep-copy each source subtree and link its root into this group.
             for (leaf, src_addr) in copies {
-                let root = self.perform_copy(src_addr as usize)?;
+                let root = self.perform_copy(src_addr as usize, 0)?;
                 region.extend_from_slice(&encode_link_message(&leaf, root));
             }
 
@@ -687,12 +692,17 @@ impl EditSession {
 
     /// Recursively validate that the object at `addr` (and, for a group, its
     /// whole subtree) can be copied, without writing anything.
-    fn plan_copy(&self, addr: usize) -> Result<(), Error> {
+    fn plan_copy(&self, addr: usize, depth: u32) -> Result<(), Error> {
+        if depth >= MAX_COPY_DEPTH {
+            return Err(Error::EditUnsupported(
+                "copy source nests too deeply (possible hard-link cycle)",
+            ));
+        }
         if let ObjModel::Group { children, .. } = self.read_object(addr)? {
             for (_, child) in children {
                 let child = usize::try_from(child)
                     .map_err(|_| Error::EditUnsupported("child address exceeds this platform"))?;
-                self.plan_copy(child)?;
+                self.plan_copy(child, depth + 1)?;
             }
         }
         Ok(())
@@ -701,7 +711,12 @@ impl EditSession {
     /// Recursively deep-copy the object at `addr`, appending fresh copies of
     /// every object (data blobs and headers) at end-of-file and returning the new
     /// object-header address of the copied root.
-    fn perform_copy(&mut self, addr: usize) -> Result<u64, Error> {
+    fn perform_copy(&mut self, addr: usize, depth: u32) -> Result<u64, Error> {
+        if depth >= MAX_COPY_DEPTH {
+            return Err(Error::EditUnsupported(
+                "copy source nests too deeply (possible hard-link cycle)",
+            ));
+        }
         match self.read_object(addr)? {
             ObjModel::DatasetVerbatim { region } => {
                 let oh = build_v2_object_header(&region);
@@ -736,7 +751,7 @@ impl EditSession {
                     let child = usize::try_from(child).map_err(|_| {
                         Error::EditUnsupported("child address exceeds this platform")
                     })?;
-                    let new_child = self.perform_copy(child)?;
+                    let new_child = self.perform_copy(child, depth + 1)?;
                     region.extend_from_slice(&encode_link_message(&name, new_child));
                 }
                 let oh = build_v2_object_header(&region);
