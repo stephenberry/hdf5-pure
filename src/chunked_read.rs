@@ -6,6 +6,7 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec, vec::Vec};
 
+use crate::btree_v1::btree_v1_node_header_size;
 use crate::chunk_cache::{CacheAlignedBuffer, ChunkCache};
 use crate::convert::{TryToUsize, slice_range, u32_from};
 use crate::data_layout::DataLayout;
@@ -136,6 +137,15 @@ fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
     })
 }
 
+/// Size of a single key in a version 1 B-tree of type 1 (raw data chunks):
+/// `chunk_size(4) + filter_mask(4) + ndims * offset_size`. The `ndims` trailing
+/// offsets are the per-dimension scaled chunk coordinates (rank + 1 values, the
+/// extra one being the element-offset dimension). (HDF5 format spec, "Disk
+/// Format: Level 1A1 — Version 1 B-trees", type 1 key.)
+const fn chunk_record_key_size(ndims: usize, offset_size: usize) -> usize {
+    4 + 4 + ndims * offset_size
+}
+
 /// Traverse B-tree v1 type 1 to collect all chunk locations.
 ///
 /// `ndims` is the number of offset dimensions in each key, which equals
@@ -151,7 +161,7 @@ pub fn collect_chunk_info(
     let os = offset_size as usize;
 
     // Parse B-tree v1 header
-    let header_size = 8 + os * 2;
+    let header_size = btree_v1_node_header_size(offset_size);
     if offset + header_size > file_data.len() {
         return Err(FormatError::UnexpectedEof {
             expected: offset + header_size,
@@ -171,10 +181,9 @@ pub fn collect_chunk_info(
     let node_level = file_data[offset + 5];
     let entries_used = u16::from_le_bytes([file_data[offset + 6], file_data[offset + 7]]) as usize;
 
-    let mut pos = offset + 8 + os * 2; // skip left/right sibling
+    let mut pos = offset + header_size; // first key, past signature/siblings
 
-    // Key size: chunk_size(4) + filter_mask(4) + ndims * offset_size
-    let key_size = 4 + 4 + ndims * os;
+    let key_size = chunk_record_key_size(ndims, os);
 
     if node_level == 0 {
         // Leaf node: keys and children interleaved
@@ -265,7 +274,7 @@ pub fn collect_chunk_info_from_source<S: FileSource + ?Sized>(
     _length_size: u8,
 ) -> Result<Vec<ChunkInfo>, FormatError> {
     let os = offset_size as usize;
-    let header_size = 8 + os * 2;
+    let header_size = btree_v1_node_header_size(offset_size);
 
     // Node header: signature(4) + type(1) + level(1) + entries_used(2) + 2 siblings.
     let header = source.read_exact_at(btree_address, header_size)?;
@@ -280,7 +289,7 @@ pub fn collect_chunk_info_from_source<S: FileSource + ?Sized>(
     let entries_used = u16::from_le_bytes([header[6], header[7]]) as usize;
 
     // Key/child region begins right after the header (siblings already included).
-    let key_size = 4 + 4 + ndims * os;
+    let key_size = chunk_record_key_size(ndims, os);
     let needed = entries_used * (key_size + os) + key_size;
     let body_addr =
         btree_address
