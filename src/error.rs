@@ -506,6 +506,12 @@ pub enum Error {
     /// dataset shape/datatype/filter combination the in-place writer cannot
     /// emit yet. The payload is a human-readable reason.
     EditUnsupported(&'static str),
+    /// An object in the source file cannot be reproduced faithfully by
+    /// [`repack`](crate::repack), so the repack was refused rather than write a
+    /// silently degraded file — for example a variable-length, time, bitfield,
+    /// or opaque datatype, a virtual/external data layout, an unsupported
+    /// filter, or an object reference. The payload names the object and reason.
+    RepackUnsupported(String),
 }
 
 #[cfg(feature = "std")]
@@ -527,6 +533,9 @@ impl fmt::Display for Error {
             }
             Error::EditUnsupported(reason) => {
                 write!(f, "unsupported in-place edit target: {reason}")
+            }
+            Error::RepackUnsupported(reason) => {
+                write!(f, "cannot repack faithfully: {reason}")
             }
         }
     }

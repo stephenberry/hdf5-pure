@@ -165,6 +165,8 @@ pub(crate) mod free_space;
 #[cfg(feature = "std")]
 pub(crate) mod reader;
 #[cfg(feature = "std")]
+pub(crate) mod repack;
+#[cfg(feature = "std")]
 pub(crate) mod swmr_writer;
 #[cfg(feature = "std")]
 pub(crate) mod types;
@@ -204,6 +206,9 @@ pub use swmr_writer::SwmrWriter;
 
 #[cfg(feature = "std")]
 pub use edit::EditSession;
+
+#[cfg(feature = "std")]
+pub use repack::{RepackOptions, repack};
 
 #[cfg(feature = "ndarray")]
 pub use ndarray_support::H5Element;

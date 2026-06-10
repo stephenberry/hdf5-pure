@@ -627,18 +627,18 @@ impl<'f> Dataset<'f> {
         self.file.attrs_of(&self.header)
     }
 
-    fn datatype(&self) -> Result<Datatype, Error> {
+    pub(crate) fn datatype(&self) -> Result<Datatype, Error> {
         let msg = find_message(&self.header, MessageType::Datatype)?;
         let (dt, _) = Datatype::parse(&msg.data)?;
         Ok(dt)
     }
 
-    fn dataspace(&self) -> Result<Dataspace, Error> {
+    pub(crate) fn dataspace(&self) -> Result<Dataspace, Error> {
         let msg = find_message(&self.header, MessageType::Dataspace)?;
         Ok(Dataspace::parse(&msg.data, self.file.length_size())?)
     }
 
-    fn data_layout(&self) -> Result<DataLayout, Error> {
+    pub(crate) fn data_layout(&self) -> Result<DataLayout, Error> {
         let msg = find_message(&self.header, MessageType::DataLayout)?;
         Ok(DataLayout::parse(
             &msg.data,
@@ -647,7 +647,7 @@ impl<'f> Dataset<'f> {
         )?)
     }
 
-    fn filter_pipeline(&self) -> Option<FilterPipeline> {
+    pub(crate) fn filter_pipeline(&self) -> Option<FilterPipeline> {
         self.header
             .messages
             .iter()
@@ -655,7 +655,7 @@ impl<'f> Dataset<'f> {
             .and_then(|msg| FilterPipeline::parse(&msg.data).ok())
     }
 
-    fn read_raw(&self) -> Result<Vec<u8>, Error> {
+    pub(crate) fn read_raw(&self) -> Result<Vec<u8>, Error> {
         let dt = self.datatype()?;
         let ds = self.dataspace()?;
         let mut dl = self.data_layout()?;
