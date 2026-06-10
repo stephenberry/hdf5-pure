@@ -339,3 +339,53 @@ fn c_v0_root_attributes_survive_conversion() {
         vec![9]
     );
 }
+
+#[test]
+fn free_space_reuse_and_truncation_stay_c_readable() {
+    // Free-space management (issue #21): within one session, add a large dataset
+    // then delete it. The freed blocks and superseded headers are reclaimed and
+    // the file is truncated. The reference C library must still read the survivor
+    // correctly from the shrunken file, and its end-of-file must be consistent.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_freespace.h5");
+    write_c_starter(&path, LibraryVersion::V110, LibraryVersion::latest());
+    let size_start = std::fs::metadata(&path).unwrap().len();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("bulk")
+            .with_f64_data(&vec![9.0; 2048]);
+        session.commit().unwrap();
+        let size_with_bulk = std::fs::metadata(&path).unwrap().len();
+        assert!(size_with_bulk > size_start);
+
+        session.delete("bulk");
+        session.commit().unwrap();
+        let size_after = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            size_after < size_with_bulk,
+            "deleting the bulk dataset should shrink the file (was {size_with_bulk}, now {size_after})"
+        );
+    }
+
+    // hdf5-pure: end-of-file matches the truncated physical size.
+    let f = File::open(&path).unwrap();
+    assert_eq!(f.file_size(), std::fs::metadata(&path).unwrap().len());
+    assert!(f.dataset("bulk").is_err());
+
+    // The reference C library reads the shrunken file and the survivors intact.
+    let c = hdf5::File::open(&path).unwrap();
+    assert!(
+        c.dataset("bulk").is_err(),
+        "deleted dataset still present (C)"
+    );
+    assert_eq!(
+        c.dataset("alpha").unwrap().read_raw::<f64>().unwrap(),
+        vec![1.0, 2.0, 3.0]
+    );
+    assert_eq!(
+        c.dataset("grp/beta").unwrap().read_raw::<i32>().unwrap(),
+        vec![10, 20, 30, 40]
+    );
+}

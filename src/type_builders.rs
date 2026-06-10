@@ -768,6 +768,25 @@ impl DatasetBuilder {
         raw_data: Vec<u8>,
         num_elements: u64,
     ) -> &mut Self {
+        self.with_raw_data(datatype, raw_data, num_elements)
+    }
+
+    /// Write a dataset from an explicit datatype and its raw element bytes.
+    ///
+    /// The lowest-level data entry point: `raw_data` is written verbatim as the
+    /// dataset's storage, interpreted by `datatype`, so the caller is
+    /// responsible for the bytes matching the datatype's on-disk layout (little
+    /// endian, `num_elements` elements each of the datatype's size). It underpins
+    /// the typed helpers and lets a captured `(datatype, bytes)` pair — for
+    /// example from reading an existing dataset — be re-emitted without a typed
+    /// helper. The shape defaults to `[num_elements]` unless
+    /// [`with_shape`](Self::with_shape) sets it.
+    pub fn with_raw_data(
+        &mut self,
+        datatype: Datatype,
+        raw_data: Vec<u8>,
+        num_elements: u64,
+    ) -> &mut Self {
         self.datatype = Some(datatype);
         self.data = Some(raw_data);
         if self.shape.is_none() {
