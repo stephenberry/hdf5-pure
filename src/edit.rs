@@ -467,8 +467,16 @@ impl EditSession {
         // linearization point. Until it lands, the file on disk still points at
         // the old root (the appended objects are merely unreferenced trailing
         // bytes), so a failure here leaves a valid file.
+        //
+        // That ordering is only crash-safe if the appended objects are durable
+        // before the root pointer is flipped; otherwise a power loss could
+        // persist the flip ahead of the data it references, leaving the root
+        // pointing at bytes that never reached disk. `flush` on a plain `File`
+        // does not force a write-back, so sync the appended bytes to disk first
+        // (the barrier), then flip the pointer, then sync the flip.
         let new_root = new_addr[&PathKey::new()];
         let new_eof = self.data.len() as u64;
+        self.handle.sync_all().map_err(Error::Io)?;
         if self.superblock.version >= 2 {
             // Build the new superblock off a clone and adopt it only once the
             // write succeeds, so a failed write does not desync the in-memory
@@ -478,11 +486,11 @@ impl EditSession {
             new_sb.eof_address = new_eof;
             let sb_bytes = new_sb.serialize();
             self.write_at(self.sb_sig_off, &sb_bytes)?;
-            self.handle.flush().map_err(Error::Io)?;
+            self.handle.sync_all().map_err(Error::Io)?;
             self.superblock = new_sb;
         } else {
             self.repoint_v0v1_root(new_root, new_eof)?;
-            self.handle.flush().map_err(Error::Io)?;
+            self.handle.sync_all().map_err(Error::Io)?;
             self.superblock.root_group_address = new_root;
             self.superblock.eof_address = new_eof;
         }
