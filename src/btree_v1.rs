@@ -6,6 +6,21 @@ use alloc::vec::Vec;
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
 
+/// Size of the size-of-offsets-independent prefix of a version 1 B-tree node:
+/// `signature(4) + node_type(1) + node_level(1) + entries_used(2)`. The two
+/// sibling addresses that follow are each `offset_size` bytes wide; see
+/// [`btree_v1_node_header_size`]. (HDF5 format spec, "Disk Format: Level 1A1 —
+/// Version 1 B-trees".)
+pub(crate) const BTREE_V1_NODE_PREFIX_LEN: usize = 8;
+
+/// Total size of a version 1 B-tree node header for a file whose size-of-offsets
+/// is `offset_size`: the fixed [`BTREE_V1_NODE_PREFIX_LEN`] prefix plus the left
+/// and right sibling addresses (`offset_size` bytes each). This is the offset
+/// from the start of a node to its first key.
+pub(crate) const fn btree_v1_node_header_size(offset_size: u8) -> usize {
+    BTREE_V1_NODE_PREFIX_LEN + (offset_size as usize) * 2
+}
+
 /// A parsed B-tree v1 node.
 ///
 /// Some fields are decoded from the on-disk node for completeness but are not
@@ -67,10 +82,10 @@ impl BTreeV1Node {
         offset_size: u8,
         _length_size: u8,
     ) -> Result<BTreeV1Node, FormatError> {
-        // signature(4) + node_type(1) + node_level(1) + entries_used(2) = 8
-        // + left_sibling(offset_size) + right_sibling(offset_size)
+        // signature(4) + node_type(1) + node_level(1) + entries_used(2),
+        // then left_sibling(offset_size) + right_sibling(offset_size).
         let os = offset_size as usize;
-        let header_size = 8 + os * 2;
+        let header_size = btree_v1_node_header_size(offset_size);
         if offset + header_size > file_data.len() {
             return Err(FormatError::UnexpectedEof {
                 expected: offset + header_size,
@@ -86,7 +101,7 @@ impl BTreeV1Node {
         let node_level = file_data[offset + 5];
         let entries_used = u16::from_le_bytes([file_data[offset + 6], file_data[offset + 7]]);
 
-        let mut pos = offset + 8;
+        let mut pos = offset + BTREE_V1_NODE_PREFIX_LEN;
         let left_sibling = if is_undefined(file_data, pos, offset_size) {
             None
         } else {

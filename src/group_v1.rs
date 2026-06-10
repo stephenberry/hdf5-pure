@@ -122,7 +122,7 @@ mod tests {
         } else {
             heap_data_size as u64
         };
-        let btree_header_size = 8 + os * 2; // sig + type + level + entries + siblings
+        let btree_header_size = crate::btree_v1::btree_v1_node_header_size(offset_size);
         let btree_keys_children = os + os + os; // key[0] + child[0] + key[1]
         let total_size = btree_offset + btree_header_size + btree_keys_children + 64;
 
