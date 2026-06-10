@@ -394,6 +394,23 @@ impl File {
         }
     }
 
+    /// Names of every attribute message on `hdr`, including ones whose datatype
+    /// [`attrs_of`](Self::attrs_of) cannot decode into an [`AttrValue`] (and so
+    /// silently omits from its map). Repack diffs this against the decoded map to
+    /// refuse rather than drop an attribute it cannot reproduce.
+    pub(crate) fn attr_message_names_of(&self, hdr: &ObjectHeader) -> Result<Vec<String>, Error> {
+        match &self.backend {
+            Backend::InMemory(v) => {
+                let attr_msgs =
+                    extract_attributes_full(v, hdr, self.offset_size(), self.length_size())?;
+                Ok(attr_msgs.into_iter().map(|a| a.name).collect())
+            }
+            Backend::Streaming(_) => Err(Error::Format(FormatError::ChunkedReadError(
+                "attribute reading is not yet supported on the streaming backend".into(),
+            ))),
+        }
+    }
+
     /// Read a dataset's raw bytes for the given layout, dispatching on the backend.
     fn read_dataset_raw(
         &self,
@@ -472,6 +489,14 @@ impl<'f> Group<'f> {
     pub fn attrs(&self) -> Result<HashMap<String, AttrValue>, Error> {
         let hdr = self.file.parse_header(self.address)?;
         self.file.attrs_of(&hdr)
+    }
+
+    /// Names of every attribute on this group, including any whose datatype
+    /// [`attrs`](Self::attrs) cannot represent. Used by repack to detect an
+    /// attribute it would otherwise drop.
+    pub(crate) fn attr_names(&self) -> Result<Vec<String>, Error> {
+        let hdr = self.file.parse_header(self.address)?;
+        self.file.attr_message_names_of(&hdr)
     }
 
     /// Get a dataset within this group by name.
@@ -625,6 +650,13 @@ impl<'f> Dataset<'f> {
     /// Read all attributes of this dataset.
     pub fn attrs(&self) -> Result<HashMap<String, AttrValue>, Error> {
         self.file.attrs_of(&self.header)
+    }
+
+    /// Names of every attribute on this dataset, including any whose datatype
+    /// [`attrs`](Self::attrs) cannot represent. Used by repack to detect an
+    /// attribute it would otherwise drop.
+    pub(crate) fn attr_names(&self) -> Result<Vec<String>, Error> {
+        self.file.attr_message_names_of(&self.header)
     }
 
     pub(crate) fn datatype(&self) -> Result<Datatype, Error> {

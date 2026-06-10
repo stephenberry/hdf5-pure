@@ -110,3 +110,44 @@ fn repack_refuses_c_vlen_string_dataset() {
     }
     assert!(!dst.exists(), "dst must not be created when repack refuses");
 }
+
+#[test]
+fn repack_refuses_unrepresentable_attribute() {
+    // The C library writes a boolean attribute, which is an HDF5 enumeration —
+    // a datatype the reader cannot decode into an AttrValue and would silently
+    // drop. Repack must refuse by name rather than write a file missing the
+    // attribute, upholding the fail-loud fidelity contract.
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("c_boolattr.h5");
+    let dst = dir.path().join("boolattr_repacked.h5");
+
+    {
+        let file = hdf5::File::create(&src).unwrap();
+        let ds = file
+            .new_dataset::<f64>()
+            .shape((2,))
+            .create("data")
+            .unwrap();
+        ds.write(&[1.0f64, 2.0]).unwrap();
+        // A boolean (enum) attribute the pure reader cannot represent.
+        ds.new_attr::<bool>()
+            .shape(())
+            .create("active")
+            .unwrap()
+            .write_scalar(&true)
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    let err = repack(&src, &dst, &RepackOptions::new()).unwrap_err();
+    match err {
+        hdf5_pure::Error::RepackUnsupported(msg) => {
+            assert!(
+                msg.contains("active") && msg.contains("data"),
+                "error should name the attribute and its dataset: {msg}"
+            );
+        }
+        other => panic!("expected RepackUnsupported, got {other:?}"),
+    }
+    assert!(!dst.exists(), "dst must not be created when repack refuses");
+}

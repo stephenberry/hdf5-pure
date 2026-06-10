@@ -26,8 +26,11 @@
 //! Refused (named, never dropped silently): variable-length, time, bitfield,
 //! opaque, and reference datatypes (their on-disk representation cannot yet be
 //! re-emitted faithfully — references in particular would carry stale absolute
-//! addresses); virtual and external data layouts; and any filter other than
-//! deflate/shuffle/fletcher32 (e.g. scale-offset, szip, zfp).
+//! addresses); virtual and external data layouts; any filter other than
+//! deflate/shuffle/fletcher32 (e.g. scale-offset, szip, zfp); and any attribute
+//! whose datatype the reader cannot decode into an [`AttrValue`] (e.g. an
+//! enumeration, compound, or boolean attribute). An attribute that cannot be
+//! reproduced fails the repack by name rather than being silently dropped.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -144,8 +147,16 @@ fn populate<S: GroupSink>(
     drop: &BTreeSet<String>,
     matched: &mut BTreeSet<String>,
 ) -> Result<(), Error> {
-    // Attributes, in name order for a deterministic output.
-    for (name, value) in sorted(src.attrs()?) {
+    // Attributes, in name order for a deterministic output. Refuse if any
+    // attribute on this group cannot be represented (and would be dropped).
+    let attrs = src.attrs()?;
+    let owner = if path.is_empty() {
+        "root group".to_string()
+    } else {
+        format!("group {path}")
+    };
+    check_attr_completeness(&attrs, &src.attr_names()?, &owner)?;
+    for (name, value) in sorted(attrs) {
         sink.sink_set_attr(&name, value);
     }
 
@@ -246,6 +257,32 @@ fn emit_dataset(db: &mut DatasetBuilder, ds: &Dataset, path: &str) -> Result<(),
         }
     }
 
+    // Carry the dataset's attributes, refusing if any cannot be represented.
+    let attrs = ds.attrs()?;
+    check_attr_completeness(&attrs, &ds.attr_names()?, &format!("dataset {path}"))?;
+    for (name, value) in sorted(attrs) {
+        db.set_attr(&name, value);
+    }
+
+    Ok(())
+}
+
+/// Refuse the repack if `owner` has an attribute the reader cannot represent as
+/// an [`AttrValue`] and would therefore drop. `names` is every attribute on the
+/// object; `decoded` is the subset that read back, keyed by name. Any name not
+/// in `decoded` is an attribute that would be silently lost.
+fn check_attr_completeness(
+    decoded: &std::collections::HashMap<String, AttrValue>,
+    names: &[String],
+    owner: &str,
+) -> Result<(), Error> {
+    for name in names {
+        if !decoded.contains_key(name) {
+            return Err(Error::RepackUnsupported(format!(
+                "{owner}: attribute {name:?} has a datatype that cannot be repacked faithfully yet"
+            )));
+        }
+    }
     Ok(())
 }
 

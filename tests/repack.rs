@@ -85,6 +85,34 @@ fn pure_compaction_preserves_everything() {
 }
 
 #[test]
+fn carries_dataset_attributes() {
+    let src = tmp("hdf5_pure_repack_dsattr_src.h5");
+    let dst = tmp("hdf5_pure_repack_dsattr_dst.h5");
+    let mut b = FileBuilder::new();
+    let ds = b.create_dataset("signal");
+    ds.with_f64_data(&[1.0, 2.0, 3.0]);
+    ds.set_attr("sample_rate", AttrValue::F64(44100.0));
+    ds.set_attr("label", AttrValue::String("voltage".to_string()));
+    b.write(&src).unwrap();
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    let f = hdf5_pure::File::open(&dst).unwrap();
+    let attrs = f.dataset("signal").unwrap().attrs().unwrap();
+    assert_eq!(attrs.get("sample_rate"), Some(&AttrValue::F64(44100.0)));
+    assert_eq!(
+        attrs.get("label"),
+        Some(&AttrValue::String("voltage".to_string()))
+    );
+    assert_eq!(
+        f.dataset("signal").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0]
+    );
+    std::fs::remove_file(&src).ok();
+    std::fs::remove_file(&dst).ok();
+}
+
+#[test]
 fn drops_whole_group_subtree() {
     let src = tmp("hdf5_pure_repack_dropgrp_src.h5");
     let dst = tmp("hdf5_pure_repack_dropgrp_dst.h5");
