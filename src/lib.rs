@@ -161,6 +161,8 @@ pub(crate) mod nosync;
 #[cfg(feature = "std")]
 pub(crate) mod edit;
 #[cfg(feature = "std")]
+pub(crate) mod free_space;
+#[cfg(feature = "std")]
 pub(crate) mod reader;
 #[cfg(feature = "std")]
 pub(crate) mod swmr_writer;

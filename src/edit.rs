@@ -19,8 +19,9 @@
 //!
 //! Deletion ([`EditSession::delete`], the HDF5 `H5Ldelete`) is the mirror image:
 //! the parent group's header is rebuilt without the removed link, relocated up
-//! the tree the same way, and the unlinked object (and its subtree) is left as
-//! dead bytes. Object copy ([`EditSession::copy`], the HDF5 `H5Ocopy`) deep-copies
+//! the tree the same way, and the unlinked object (and its subtree) is freed —
+//! its blocks are returned to a session-local free list (see below).
+//! Object copy ([`EditSession::copy`], the HDF5 `H5Ocopy`) deep-copies
 //! a source subtree — appending fresh copies of every object, repointing internal
 //! links and the contiguous data address — and links the copy in like an
 //! addition; the headers are reproduced from their verbatim message bytes, so
@@ -51,9 +52,28 @@
 //! - A new group's parent must already exist or be created in the same session
 //!   (each level created explicitly); intermediate groups are not auto-created.
 //!
-//! The reclaimed-space question (a superseded object header becomes unreferenced
-//! dead bytes after each commit) is out of scope here; it belongs to the
-//! free-space work tracked separately (issue #21).
+//! # Free-space reuse (issue #21)
+//!
+//! Each commit vacates space: the object headers it rewrites are superseded, and
+//! a deletion abandons its target's blocks. Those regions are recorded in a
+//! session-local free list and reused by later commits in the same session —
+//! a new object is written into a fitting freed region instead of growing the
+//! file, and when freed space forms a run reaching end-of-file the file is
+//! physically truncated. The reuse is crash-safe: it only ever overwrites space
+//! freed by an *earlier*, already-durable commit (never space the current commit
+//! is mid-way through freeing), and truncation happens only after the superblock
+//! recording the smaller end-of-file is itself durable.
+//!
+//! Reclaim is best-effort and conservative. A deleted object whose blocks cannot
+//! be enumerated exhaustively — chunked or variable-length storage, dense
+//! attribute/link heaps, a non–version-2 header — is left as dead bytes rather
+//! than risk freeing a region that is still in use; under-reclaiming only wastes
+//! space, while over-reclaiming would corrupt. As with the reference library's
+//! default file-space strategy, the free list is **not** persisted: it is
+//! forgotten when the session closes, so reuse and shrinkage apply to churn
+//! within a session, not across reopen, and a single delete-then-close shrinks
+//! the file only when the freed bytes reach end-of-file. Whole-file compaction
+//! that reclaims every hole across a reopen is the separate repack path.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -64,6 +84,7 @@ use crate::checksum::jenkins_lookup3;
 use crate::dataspace::{Dataspace, DataspaceType};
 use crate::error::Error;
 use crate::file_writer::{LENGTH_SIZE, OFFSET_SIZE, build_dataset_oh, make_link};
+use crate::free_space::FreeList;
 use crate::group_v2::resolve_group_entries;
 use crate::link_message::{LinkMessage, LinkTarget};
 use crate::message_type::MessageType;
@@ -128,6 +149,14 @@ pub struct EditSession {
     pending_deletes: Vec<PathKey>,
     /// Object copies staged by `copy`, as (source path, destination full path).
     pending_copies: Vec<(PathKey, PathKey)>,
+    /// Session-local free-space tracker (issue #21). Holds regions vacated by
+    /// prior commits in this session — superseded object headers and the blocks
+    /// of deleted objects — so later commits reuse them instead of growing the
+    /// file, and so a freed run reaching end-of-file can be truncated away. It
+    /// starts empty on `open`: holes already present in the file from earlier
+    /// sessions or other tools are not tracked (there is no on-disk free-space
+    /// manager yet), only those this session creates.
+    free: FreeList,
 }
 
 impl EditSession {
@@ -171,6 +200,7 @@ impl EditSession {
             pending_groups: Vec::new(),
             pending_deletes: Vec::new(),
             pending_copies: Vec::new(),
+            free: FreeList::new(),
         })
     }
 
@@ -198,8 +228,17 @@ impl EditSession {
 
     /// Stage removal of the link at `path` (the HDF5 `H5Ldelete`), applied on the
     /// next [`commit`](Self::commit). The link's object — and, for a group, its
-    /// whole subtree — becomes unreachable; the bytes it occupied are not
-    /// reclaimed (that is the separate free-space concern, issue #21).
+    /// whole subtree — becomes unreachable. The bytes it occupied are returned to
+    /// this session's free list (issue #21): a later commit reuses them for new
+    /// objects instead of growing the file, and if a freed run reaches
+    /// end-of-file the file is truncated. Reclaim is best-effort — an object
+    /// whose blocks this engine cannot enumerate exhaustively (chunked or
+    /// variable-length storage, dense attribute/link heaps) is left as dead bytes
+    /// rather than risk freeing a region that is still in use. As in the
+    /// reference library's default file-space strategy, freed space is reused
+    /// only within the open session; it is not persisted across reopen, and an
+    /// object reference to a deleted object may, after reuse, resolve to an
+    /// unrelated object (deleting a referenced object is undefined in HDF5).
     ///
     /// The path must exist. A deletion may not overlap another staged change in
     /// the same commit (e.g. delete `/a` while adding `/a/b`); split such
@@ -304,14 +343,21 @@ impl EditSession {
 
         // Stage deletions: each must exist, must not overlap any other staged
         // change, and is recorded against its parent group (which becomes dirty).
+        // `deleted_addrs` keeps each removed object's header address so its owned
+        // blocks can be reclaimed after the commit lands (issue #21).
         let deletes = std::mem::take(&mut self.pending_deletes);
+        let mut deleted_addrs: Vec<usize> = Vec::new();
         for (i, d) in deletes.iter().enumerate() {
             if d.is_empty() {
                 return Err(Error::EditUnsupported("cannot delete the root group"));
             }
             let path_str = d.join("/");
-            crate::group_v2::resolve_path_any(&self.data, &self.superblock, &path_str)
-                .map_err(|_| Error::EditUnsupported("nothing to delete at the given path"))?;
+            let del_addr =
+                crate::group_v2::resolve_path_any(&self.data, &self.superblock, &path_str)
+                    .map_err(|_| Error::EditUnsupported("nothing to delete at the given path"))?;
+            if let Ok(a) = usize::try_from(del_addr) {
+                deleted_addrs.push(a);
+            }
             for t in &add_targets {
                 if is_prefix(d, t) || is_prefix(t, d) {
                     return Err(Error::EditUnsupported(
@@ -336,7 +382,11 @@ impl EditSession {
         }
 
         // Resolve / validate each node's base object-header region up front.
+        // Every existing dirty group is rewritten to a freshly-appended header,
+        // so its old header becomes dead bytes once the superblock is repointed;
+        // `superseded_addrs` records those old headers for reclamation (#21).
         let keys: Vec<PathKey> = nodes.keys().cloned().collect();
+        let mut superseded_addrs: Vec<usize> = Vec::new();
         for key in &keys {
             let is_new = nodes[key].is_new;
             if is_new {
@@ -353,6 +403,7 @@ impl EditSession {
                 let addr = usize::try_from(addr)
                     .map_err(|_| Error::EditUnsupported("group address exceeds this platform"))?;
                 let info = self.inspect_group(addr)?;
+                superseded_addrs.push(addr);
                 let node = nodes.get_mut(key).unwrap();
                 node.base_region = info.region;
                 node.existing_links = info.link_names;
@@ -405,6 +456,24 @@ impl EditSession {
             flat.insert(key.clone(), v);
         }
 
+        // Gather the regions this commit will vacate, read from the current
+        // on-disk layout before any byte moves: every deleted object's owned
+        // blocks plus every superseded group header. These are not added to the
+        // free list until after the superblock repoint (they remain live until
+        // then), so the appends below never reuse them. Enumeration is
+        // best-effort — `collect_free_spans` simply omits anything it cannot
+        // account for exhaustively, so the worst case is unreclaimed dead bytes,
+        // never a freed-but-live region.
+        let mut to_free: Vec<(u64, u64)> = Vec::new();
+        for &a in &deleted_addrs {
+            self.collect_free_spans(a, 0, &mut to_free);
+        }
+        for &a in &superseded_addrs {
+            if let Ok(spans) = self.oh_chunk_spans(a) {
+                to_free.extend(spans);
+            }
+        }
+
         // --- Apply: process deepest groups first so each parent sees its
         // children's new addresses, then repoint the superblock last. ---
         let mut new_addr: BTreeMap<PathKey, u64> = BTreeMap::new();
@@ -433,7 +502,7 @@ impl EditSession {
 
             // Datasets directly under this group.
             for fd in flat.remove(key).into_iter().flatten() {
-                let data_addr = self.append(&fd.raw)?;
+                let data_addr = self.alloc_or_append(&fd.raw)?;
                 let oh = build_dataset_oh(
                     &fd.dt,
                     &fd.ds,
@@ -442,7 +511,7 @@ impl EditSession {
                     &fd.attrs,
                     None,
                 );
-                let oh_addr = self.append(&oh)?;
+                let oh_addr = self.alloc_or_append(&oh)?;
                 region.extend_from_slice(&encode_link_message(&fd.name, oh_addr));
             }
 
@@ -459,7 +528,7 @@ impl EditSession {
             }
 
             let oh = build_v2_object_header(&region);
-            let addr = self.append(&oh)?;
+            let addr = self.alloc_or_append(&oh)?;
             new_addr.insert(key.clone(), addr);
         }
 
@@ -475,7 +544,20 @@ impl EditSession {
         // does not force a write-back, so sync the appended bytes to disk first
         // (the barrier), then flip the pointer, then sync the flip.
         let new_root = new_addr[&PathKey::new()];
-        let new_eof = self.data.len() as u64;
+
+        // The new tree is fully written, so the regions this commit vacated are
+        // now dead: hand them to the session free list. If the resulting free
+        // space forms a run reaching end-of-file, the file can be physically
+        // truncated to where that run starts; otherwise the end-of-file is
+        // unchanged. `take_trailing` removes the trimmed run so it is not also
+        // counted as reusable interior space.
+        for (a, l) in to_free.drain(..) {
+            self.free.free(a, l);
+        }
+        let cur_eof = self.data.len() as u64;
+        let trunc_to = self.free.take_trailing(cur_eof);
+        let new_eof = trunc_to.unwrap_or(cur_eof);
+
         self.handle.sync_all().map_err(Error::Io)?;
         if self.superblock.version >= 2 {
             // Build the new superblock off a clone and adopt it only once the
@@ -493,6 +575,17 @@ impl EditSession {
             self.handle.sync_all().map_err(Error::Io)?;
             self.superblock.root_group_address = new_root;
             self.superblock.eof_address = new_eof;
+        }
+
+        // Physically shrink the file only after the superblock — now carrying the
+        // smaller end-of-file — is durable. A crash between the two leaves a file
+        // whose superblock end-of-file is correct and whose trailing bytes are
+        // mere unreferenced slack, which the next open ignores; the reverse order
+        // could advertise an end-of-file past the actual file length.
+        if let Some(cut) = trunc_to {
+            self.handle.set_len(cut).map_err(Error::Io)?;
+            self.data.truncate(cut as usize);
+            self.handle.sync_all().map_err(Error::Io)?;
         }
         Ok(())
     }
@@ -868,7 +961,7 @@ impl EditSession {
         match self.read_object(addr)? {
             ObjModel::DatasetVerbatim { region } => {
                 let oh = build_v2_object_header(&region);
-                self.append(&oh)
+                self.alloc_or_append(&oh)
             }
             ObjModel::DatasetContiguous {
                 mut region,
@@ -885,10 +978,10 @@ impl EditSession {
                     .filter(|&e| e <= self.data.len())
                     .ok_or(Error::EditUnsupported("dataset data is out of bounds"))?;
                 let data = self.data[start..end].to_vec();
-                let new_data_addr = self.append(&data)?;
+                let new_data_addr = self.alloc_or_append(&data)?;
                 region[addr_off..addr_off + 8].copy_from_slice(&new_data_addr.to_le_bytes());
                 let oh = build_v2_object_header(&region);
-                self.append(&oh)
+                self.alloc_or_append(&oh)
             }
             ObjModel::Group {
                 non_link_region,
@@ -903,7 +996,7 @@ impl EditSession {
                     region.extend_from_slice(&encode_link_message(&name, new_child));
                 }
                 let oh = build_v2_object_header(&region);
-                self.append(&oh)
+                self.alloc_or_append(&oh)
             }
         }
     }
@@ -930,6 +1023,141 @@ impl EditSession {
         self.handle.write_all(bytes).map_err(Error::Io)?;
         self.data[offset..offset + bytes.len()].copy_from_slice(bytes);
         Ok(())
+    }
+
+    /// Place `bytes` either in a reusable free region left by a prior commit
+    /// (overwriting it in place) or, failing that, by appending at end-of-file.
+    /// Returns the address written to.
+    ///
+    /// Reuse only ever draws from [`self.free`](Self::free), which holds regions
+    /// vacated by *earlier* commits in this session — never space the current
+    /// commit is about to free — so the bytes it overwrites are already
+    /// unreachable from the on-disk root and a mid-commit crash cannot corrupt
+    /// the live tree (the superblock still points at the prior, intact root).
+    fn alloc_or_append(&mut self, bytes: &[u8]) -> Result<u64, Error> {
+        if let Some(addr) = self.free.alloc(bytes.len() as u64) {
+            self.write_at(
+                usize::try_from(addr).map_err(|_| {
+                    Error::EditUnsupported("free-region address exceeds this platform")
+                })?,
+                bytes,
+            )?;
+            Ok(addr)
+        } else {
+            self.append(bytes)
+        }
+    }
+
+    /// On-disk byte spans `(addr, len)` of every chunk of the version 2 object
+    /// header at `addr`: chunk 0 (signature, prefix, messages, checksum) plus
+    /// each continuation (`OCHK`) block. Used to reclaim a header's storage when
+    /// its object is deleted. An error (propagated from [`oh_region`] or a
+    /// malformed continuation) means the header is not a plain v2 header this
+    /// engine can fully account for, and the caller leaves it as dead bytes
+    /// rather than guess its extent.
+    fn oh_chunk_spans(&self, addr: usize) -> Result<Vec<(u64, u64)>, Error> {
+        let (rs, re) = self.oh_region(addr)?;
+        let d = &self.data;
+        // Chunk 0 spans from the header start through its trailing checksum;
+        // `oh_region` guarantees `re + 4 <= d.len()`.
+        let mut spans: Vec<(u64, u64)> = vec![(addr as u64, (re + 4 - addr) as u64)];
+        // Walk continuation messages exactly as `gather_oh_messages` does, but
+        // record each OCHK block's extent instead of collecting its messages.
+        let mut chunks: Vec<(usize, usize)> = vec![(rs, re)];
+        let mut i = 0;
+        while i < chunks.len() {
+            if chunks.len() > MAX_OH_CHUNKS {
+                return Err(Error::EditUnsupported(
+                    "object header has too many continuation chunks",
+                ));
+            }
+            let (cs, ce) = chunks[i];
+            i += 1;
+            let region = &d[..ce];
+            let mut p = cs;
+            while let Some((msg_type, body, body_end)) = next_message(region, p)? {
+                if msg_type == MessageType::ObjectHeaderContinuation {
+                    if body_end - body < (OFFSET_SIZE + LENGTH_SIZE) as usize {
+                        return Err(Error::EditUnsupported("malformed continuation message"));
+                    }
+                    let off = u64::from_le_bytes(d[body..body + 8].try_into().unwrap());
+                    let len = u64::from_le_bytes(d[body + 8..body + 16].try_into().unwrap());
+                    let off_us = usize::try_from(off).map_err(|_| {
+                        Error::EditUnsupported("continuation address exceeds this platform")
+                    })?;
+                    let len_us = usize::try_from(len).map_err(|_| {
+                        Error::EditUnsupported("continuation length exceeds this platform")
+                    })?;
+                    let blk_end = off_us
+                        .checked_add(len_us)
+                        .filter(|&e| e <= d.len() && len_us >= 8)
+                        .ok_or(Error::EditUnsupported("continuation block out of bounds"))?;
+                    if d[off_us..off_us + 4] != *b"OCHK" {
+                        return Err(Error::EditUnsupported(
+                            "invalid continuation block signature",
+                        ));
+                    }
+                    spans.push((off, len));
+                    chunks.push((off_us + 4, blk_end - 4));
+                }
+                p = body_end;
+            }
+        }
+        Ok(spans)
+    }
+
+    /// Best-effort enumeration of every on-disk block owned by the object at
+    /// `addr` (and, for a group, its whole subtree), accumulating `(addr, len)`
+    /// spans into `out` for reclamation after a delete.
+    ///
+    /// Deliberately conservative: any object whose layout it cannot fully
+    /// account for — a non-v2 header, a chunked or otherwise unsupported data
+    /// layout, a group holding a soft/external link, dense attribute storage —
+    /// contributes nothing and is not descended into, so `out` never names a
+    /// region that might still be in use. Bounded by [`MAX_COPY_DEPTH`] against a
+    /// hard-link cycle. Variable-length data in global-heap collections is never
+    /// reclaimed here (a collection can be shared), so it is simply left behind.
+    fn collect_free_spans(&self, addr: usize, depth: u32, out: &mut Vec<(u64, u64)>) {
+        if depth >= MAX_COPY_DEPTH {
+            return;
+        }
+        // The header's own chunks. If they cannot be mapped, account for nothing.
+        let spans = match self.oh_chunk_spans(addr) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        match self.read_object(addr) {
+            Ok(ObjModel::DatasetVerbatim { .. }) => out.extend(spans),
+            Ok(ObjModel::DatasetContiguous {
+                data_addr,
+                data_size,
+                ..
+            }) => {
+                out.extend(spans);
+                // A defined, in-bounds contiguous data block is owned outright;
+                // an empty dataset stores the undefined address and owns none.
+                if data_addr != u64::MAX && data_size > 0 {
+                    if let (Ok(start), Ok(len)) =
+                        (usize::try_from(data_addr), usize::try_from(data_size))
+                    {
+                        if start.checked_add(len).is_some_and(|e| e <= self.data.len()) {
+                            out.push((data_addr, data_size));
+                        }
+                    }
+                }
+            }
+            Ok(ObjModel::Group { children, .. }) => {
+                out.extend(spans);
+                for (_, child) in children {
+                    if let Ok(c) = usize::try_from(child) {
+                        self.collect_free_spans(c, depth + 1, out);
+                    }
+                }
+            }
+            // Header maps but the content is unsupported: leak the whole object
+            // rather than free a header whose owned blocks we cannot enumerate.
+            Err(_) => {}
+        }
     }
 }
 
