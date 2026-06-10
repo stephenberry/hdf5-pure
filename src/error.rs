@@ -204,6 +204,21 @@ pub enum FormatError {
     /// (e.g. an underlying `std::io::Error` rendered to text), so this stays
     /// `no_std`/`alloc`-friendly and free of an `std::io` dependency.
     Source(String),
+    /// The library-version bounds requested via
+    /// [`FileBuilder::with_libver_bounds`](crate::FileBuilder::with_libver_bounds)
+    /// cannot be satisfied. This crate's writer emits exactly one on-disk format
+    /// (the version 3 / HDF5 1.10 superblock), so a bound that excludes it — an
+    /// upper bound older than 1.10, or a lower bound newer than 1.10 — is
+    /// unsatisfiable. The fields carry the format produced and the bounds asked
+    /// for, as [`LibVer::name`](crate::LibVer::name) labels.
+    LibverBoundsUnsatisfiable {
+        /// The library-version label of the format this crate writes.
+        writes: &'static str,
+        /// The requested lower bound.
+        requested_low: &'static str,
+        /// The requested upper bound.
+        requested_high: &'static str,
+    },
 }
 
 impl fmt::Display for FormatError {
@@ -435,6 +450,17 @@ impl fmt::Display for FormatError {
             FormatError::Source(msg) => {
                 write!(f, "byte source error: {msg}")
             }
+            FormatError::LibverBoundsUnsatisfiable {
+                writes,
+                requested_low,
+                requested_high,
+            } => {
+                write!(
+                    f,
+                    "requested library-version bounds [{requested_low}, {requested_high}] \
+                     cannot be satisfied: this crate writes the {writes} format"
+                )
+            }
         }
     }
 }
@@ -474,6 +500,12 @@ pub enum Error {
     /// filtered, not rank-1 with an unlimited dimension, or not
     /// Extensible-Array indexed). The payload is a human-readable reason.
     SwmrAppendUnsupported(&'static str),
+    /// The file or the requested object is not a supported target for the
+    /// in-place editor ([`crate::EditSession`]) — for example a userblock or
+    /// non-latest-format file, a group whose links are densely stored, or a
+    /// dataset shape/datatype/filter combination the in-place writer cannot
+    /// emit yet. The payload is a human-readable reason.
+    EditUnsupported(&'static str),
 }
 
 #[cfg(feature = "std")]
@@ -492,6 +524,9 @@ impl fmt::Display for Error {
             ),
             Error::SwmrAppendUnsupported(reason) => {
                 write!(f, "unsupported SWMR append target: {reason}")
+            }
+            Error::EditUnsupported(reason) => {
+                write!(f, "unsupported in-place edit target: {reason}")
             }
         }
     }
