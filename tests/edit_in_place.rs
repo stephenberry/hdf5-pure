@@ -133,6 +133,33 @@ fn commit_without_staged_datasets_is_noop() {
 }
 
 #[test]
+fn duplicate_name_is_rejected_without_writing() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_dup.h5");
+    write_starter(&path);
+    let before = std::fs::read(&path).unwrap();
+
+    // Collide with the existing "original" dataset.
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.create_dataset("original").with_i32_data(&[1, 2]);
+        let err = session.commit().unwrap_err();
+        assert!(err.to_string().contains("already exists"), "got: {err}");
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+
+    // Collide between two datasets staged in the same commit.
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.create_dataset("dup").with_i32_data(&[1]);
+        session.create_dataset("dup").with_i32_data(&[2]);
+        assert!(session.commit().is_err());
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn chunked_dataset_is_rejected_without_writing() {
     let path = std::env::temp_dir().join("hdf5_pure_edit_reject_chunked.h5");
     write_starter(&path);

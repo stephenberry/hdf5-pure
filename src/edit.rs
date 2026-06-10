@@ -152,15 +152,25 @@ impl EditSession {
         // unsupported target fails cleanly with the file unmodified.
         let root_addr = usize::try_from(self.superblock.root_group_address)
             .map_err(|_| Error::EditUnsupported("root group address exceeds this platform"))?;
-        let (region_start, region_end) = self.inspect_root_group(root_addr)?;
-        let old_region = self.data[region_start..region_end].to_vec();
+        let root = self.inspect_root_group(root_addr)?;
+        let old_region = self.data[root.region_start..root.region_end].to_vec();
 
         // Flatten every staged dataset before writing, so a rejected one (e.g.
-        // chunked) does not leave a half-applied commit.
+        // chunked) does not leave a half-applied commit. Reject a name that
+        // already exists in the group or repeats within this commit, since two
+        // links with the same name would be invalid HDF5.
         let pending = std::mem::take(&mut self.pending);
         let mut flat = Vec::with_capacity(pending.len());
+        let mut seen = root.link_names;
         for db in pending {
-            flat.push(flatten_dataset(db)?);
+            let fd = flatten_dataset(db)?;
+            if seen.iter().any(|n| n == &fd.name) {
+                return Err(Error::EditUnsupported(
+                    "a link with this name already exists in the root group",
+                ));
+            }
+            seen.push(fd.name.clone());
+            flat.push(fd);
         }
 
         // Append each dataset and collect the link messages for the root group.
@@ -199,8 +209,10 @@ impl EditSession {
 
     /// Parse and validate the root group's object header, returning the byte
     /// range `[start, end)` of its chunk-0 message region (the bytes to copy
-    /// when rewriting the header).
-    fn inspect_root_group(&self, addr: usize) -> Result<(usize, usize), Error> {
+    /// when rewriting the header) and the names of its existing links (so a
+    /// commit can reject a name collision rather than write a group with
+    /// duplicate links, which is invalid HDF5).
+    fn inspect_root_group(&self, addr: usize) -> Result<RootGroup, Error> {
         let d = &self.data;
         if d.len() < addr + 6 || &d[addr..addr + 4] != b"OHDR" {
             return Err(Error::EditUnsupported(
@@ -243,14 +255,17 @@ impl EditSession {
             .ok_or(Error::EditUnsupported("truncated root group object header"))?;
 
         // Walk the chunk-0 messages: reject continuation (multi-chunk header)
-        // and dense link storage, and confirm this is actually a group.
+        // and dense link storage, confirm this is actually a group, and collect
+        // existing link names.
         let mut p = region_start;
         let mut has_link_info = false;
+        let mut link_names = Vec::new();
         while p + 4 <= region_end {
             let msg_type = MessageType::from_u16(d[p] as u16);
             let msg_size = u16::from_le_bytes([d[p + 1], d[p + 2]]) as usize;
             let body = p + 4;
-            if body + msg_size > region_end {
+            let body_end = body + msg_size;
+            if body_end > region_end {
                 return Err(Error::EditUnsupported("malformed root group object header"));
             }
             match msg_type {
@@ -263,18 +278,29 @@ impl EditSession {
                     has_link_info = true;
                     // LinkInfo: version(1) flags(1) [max_creation_index(8) if
                     // flags&0x01] fractal_heap_addr(8) ... — dense storage has a
-                    // defined fractal-heap address.
+                    // defined fractal-heap address. Read the heap address only if
+                    // it lies within this message's own body (not merely within
+                    // the file), so a short/malformed LinkInfo can't make us read
+                    // bytes belonging to the next message.
                     let mut q = body + 2;
                     if msg_size >= 2 && d[body + 1] & 0x01 != 0 {
                         q += 8;
                     }
-                    if q + 8 <= region_end {
+                    if q + 8 <= body_end {
                         let heap_addr = u64::from_le_bytes(d[q..q + 8].try_into().unwrap());
                         if heap_addr != u64::MAX {
                             return Err(Error::EditUnsupported(
                                 "root group uses dense (fractal-heap) link storage (not supported in place yet)",
                             ));
                         }
+                    }
+                }
+                MessageType::Link => {
+                    // Recover the link name to detect collisions with additions.
+                    if let Ok(link) =
+                        crate::link_message::LinkMessage::parse(&d[body..body_end], OFFSET_SIZE)
+                    {
+                        link_names.push(link.name);
                     }
                 }
                 MessageType::DataLayout => {
@@ -284,14 +310,18 @@ impl EditSession {
                 }
                 _ => {}
             }
-            p = body + msg_size;
+            p = body_end;
         }
         if !has_link_info {
             return Err(Error::EditUnsupported(
                 "root group object header has no link-info message",
             ));
         }
-        Ok((region_start, region_end))
+        Ok(RootGroup {
+            region_start,
+            region_end,
+            link_names,
+        })
     }
 
     /// Append `bytes` at end-of-file, updating both the mirror and the file.
@@ -314,6 +344,14 @@ impl EditSession {
         self.handle.write_all(bytes).map_err(Error::Io)?;
         Ok(())
     }
+}
+
+/// The validated root group: the byte range of its chunk-0 message region and
+/// the names of its existing links.
+struct RootGroup {
+    region_start: usize,
+    region_end: usize,
+    link_names: Vec<String>,
 }
 
 /// A staged dataset reduced to the pieces the writer needs.
@@ -382,6 +420,14 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
     if db.attrs.len() > MAX_COMPACT_ATTRS {
         return Err(Error::EditUnsupported(
             "datasets with dense (many) attributes cannot be added in place yet",
+        ));
+    }
+    // The link message body (whose length is independent of the address) must
+    // fit the object-header message's u16 size field; a pathologically long
+    // name would otherwise overflow it into silent corruption.
+    if make_link(&db.name, 0).serialize(OFFSET_SIZE).len() > u16::MAX as usize {
+        return Err(Error::EditUnsupported(
+            "dataset name is too long to encode as a link message",
         ));
     }
 
