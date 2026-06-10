@@ -13,6 +13,11 @@
 //!    reader must return `Ok`/`Err` but never panic, index out of bounds, or
 //!    overflow. proptest *shrinks* any offending input to its minimal form,
 //!    which is exactly what makes parser bugs tractable to debug.
+//!
+//! When a property fails, proptest records the minimal reproducer under
+//! `tests/proptest-regressions/` and replays it on every subsequent run. Those
+//! files are deterministic seeds, not build artifacts: commit them so the
+//! reproducer travels with the fix.
 
 use hdf5_pure::{DType, File, FileBuilder, Group};
 use proptest::prelude::*;
