@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-06-10
+
 ### Added
 
 - `EditSession` now edits objects whose headers span multiple chunks ([#32](https://github.com/stephenberry/hdf5-pure/issues/32)). The reference C library lays a group or dataset object header out across continuation blocks once it holds enough messages (several attributes are enough); previously the in-place editor refused such a header. It now gathers the messages from every chunk and re-emits them as a single chunk on rewrite, so files written by the C library — in both the 1.8 (version 2 superblock) and 1.10+ (version 3 superblock) formats — are editable in place, verified by a round-trip crosscheck against the C library.

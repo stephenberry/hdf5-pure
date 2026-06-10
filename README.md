@@ -72,7 +72,7 @@ session.delete("sensors/pressure");                 // H5Ldelete
 session.commit().unwrap();  // apply everything in place
 ```
 
-Contiguous, unfiltered datasets and compact-link groups are supported; the editor refuses (rather than silently degrade the file) anything it cannot reproduce faithfully — a userblock or pre-1.10 file, chunked/compressed additions, or dense-storage headers on the edited path. The space left by deleted or superseded objects is not yet reclaimed.
+Contiguous, unfiltered datasets and compact-link groups are supported, and the editor edits files across every on-disk format the reference C library and h5py produce — version 0/1/2/3 superblocks, single- and multi-chunk object headers (a multi-chunk header is collapsed into one chunk on rewrite, and a version 0/1 symbol-table group on the edited path is converted to the latest compact-link format). It refuses, rather than silently degrade the file, anything it cannot reproduce faithfully — a userblock (non-zero base address), chunked/compressed additions, dense-storage headers on the edited path, or copying an existing version-1 object. The space left by deleted or superseded objects is not yet reclaimed.
 
 ### Streaming large files
 

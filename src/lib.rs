@@ -32,7 +32,10 @@
 //! [`EditSession`] opens an existing file and adds, deletes, or copies objects
 //! without reading it all in and rewriting it. New data and rebuilt object
 //! headers are appended at end-of-file and the superblock is repointed last, so
-//! the cost is proportional to what changes rather than to the file size.
+//! the cost is proportional to what changes rather than to the file size. It
+//! edits files written by this crate, the reference HDF5 C library, and h5py
+//! across all of their on-disk formats, and refuses — rather than silently
+//! degrade the file — anything it cannot reproduce faithfully.
 //!
 //! ```rust,no_run
 //! use hdf5_pure::EditSession;
