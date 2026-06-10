@@ -1,7 +1,7 @@
 //! Tests for in-place editing via `EditSession` (issue #32, Group C):
 //! add, delete, and copy datasets and groups at any path.
 
-use hdf5_pure::{DType, EditSession, File, FileBuilder};
+use hdf5_pure::{AttrValue, DType, EditSession, File, FileBuilder};
 
 /// Write a starter file with one dataset, returning its path.
 fn write_starter(path: &std::path::Path) {
@@ -552,6 +552,139 @@ fn copy_rejects_missing_source_and_cycle() {
         assert!(err.to_string().contains("itself"), "got: {err}");
     }
     assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn add_dataset_with_attributes() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_attrs.h5");
+    write_starter(&path);
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        let ds = session.create_dataset("measured");
+        ds.with_f64_data(&[1.0, 2.0]);
+        ds.set_attr("count", AttrValue::I64(2));
+        ds.set_attr("unit", AttrValue::String("m/s".into()));
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let ds = file.dataset("measured").unwrap();
+    assert_eq!(ds.read_f64().unwrap(), vec![1.0, 2.0]);
+    let attrs = ds.attrs().unwrap();
+    assert_eq!(attrs.get("count"), Some(&AttrValue::I64(2)));
+    assert_eq!(attrs.get("unit"), Some(&AttrValue::String("m/s".into())));
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn copy_preserves_dataset_attributes() {
+    // Exercises the "verbatim message bytes" claim: a copied dataset's
+    // attributes (separate header messages) must survive byte-for-byte.
+    let path = std::env::temp_dir().join("hdf5_pure_edit_copy_attrs.h5");
+    let mut b = FileBuilder::new();
+    let ds = b.create_dataset("src");
+    ds.with_i32_data(&[5, 6, 7]);
+    ds.set_attr("label", AttrValue::String("alpha".into()));
+    ds.set_attr("scale", AttrValue::F64(2.5));
+    b.write(&path).unwrap();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.copy("src", "dup");
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let src_attrs = file.dataset("src").unwrap().attrs().unwrap();
+    let dup = file.dataset("dup").unwrap();
+    assert_eq!(dup.read_i32().unwrap(), vec![5, 6, 7]);
+    // The copy's attributes equal the source's.
+    assert_eq!(dup.attrs().unwrap(), src_attrs);
+    assert_eq!(
+        dup.attrs().unwrap().get("label"),
+        Some(&AttrValue::String("alpha".into()))
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn edit_preserves_multiple_root_datasets() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_multi_root.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("d0").with_i32_data(&[0]);
+    b.create_dataset("d1").with_i32_data(&[1]);
+    b.create_dataset("d2").with_i32_data(&[2]);
+    b.write(&path).unwrap();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.create_group("extra");
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let mut names = file.root().datasets().unwrap();
+    names.sort();
+    assert_eq!(names, vec!["d0", "d1", "d2"]);
+    for (i, n) in ["d0", "d1", "d2"].iter().enumerate() {
+        assert_eq!(file.dataset(n).unwrap().read_i32().unwrap(), vec![i as i32]);
+    }
+    assert_eq!(file.root().groups().unwrap(), vec!["extra".to_string()]);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn mixed_add_delete_copy_in_one_commit() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_mixed.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("keep").with_i32_data(&[1, 1]);
+    b.create_dataset("remove").with_i32_data(&[9]);
+    b.create_dataset("source").with_f64_data(&[3.0, 3.0, 3.0]);
+    b.write(&path).unwrap();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.create_dataset("fresh").with_i32_data(&[42]); // add
+        session.delete("remove"); // delete
+        session.copy("source", "source_copy"); // copy
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let mut names = file.root().datasets().unwrap();
+    names.sort();
+    assert_eq!(names, vec!["fresh", "keep", "source", "source_copy"]);
+    assert!(file.dataset("remove").is_err());
+    assert_eq!(file.dataset("fresh").unwrap().read_i32().unwrap(), vec![42]);
+    assert_eq!(
+        file.dataset("source_copy").unwrap().read_f64().unwrap(),
+        vec![3.0, 3.0, 3.0]
+    );
+    assert_eq!(
+        file.dataset("keep").unwrap().read_i32().unwrap(),
+        vec![1, 1]
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn superblock_eof_matches_file_size_after_edit() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_eof.h5");
+    write_starter(&path);
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("more")
+            .with_f64_data(&[1.0, 2.0, 3.0]);
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let on_disk = std::fs::metadata(&path).unwrap().len();
+    // The edit updates the superblock's logical end-of-file to the new size.
+    assert_eq!(file.file_size(), on_disk);
+    assert_eq!(file.superblock().eof_address, on_disk);
     std::fs::remove_file(&path).ok();
 }
 

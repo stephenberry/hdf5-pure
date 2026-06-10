@@ -452,12 +452,19 @@ impl EditSession {
             new_addr.insert(key.clone(), addr);
         }
 
-        self.superblock.root_group_address = new_addr[&PathKey::new()];
-        self.superblock.eof_address = self.data.len() as u64;
-        let sb_bytes = self.superblock.serialize();
+        // Repoint the superblock at the new root last: this single in-place
+        // write is the commit's linearization point. Until it lands, the file on
+        // disk still points at the old root (the appended objects are merely
+        // unreferenced trailing bytes), so a failure here leaves a valid file.
+        // Build the new superblock off a clone and only adopt it once the write
+        // succeeds, so a failed write does not desync the in-memory state.
+        let mut new_sb = self.superblock.clone();
+        new_sb.root_group_address = new_addr[&PathKey::new()];
+        new_sb.eof_address = self.data.len() as u64;
+        let sb_bytes = new_sb.serialize();
         self.write_at(self.sb_sig_off, &sb_bytes)?;
-
         self.handle.flush().map_err(Error::Io)?;
+        self.superblock = new_sb;
         Ok(())
     }
 
@@ -511,17 +518,11 @@ impl EditSession {
         let d = &self.data;
         let (region_start, region_end) = self.oh_region(addr)?;
 
+        let region = &d[..region_end];
         let mut p = region_start;
         let mut has_link_info = false;
         let mut link_names = Vec::new();
-        while p + 4 <= region_end {
-            let msg_type = MessageType::from_u16(d[p] as u16);
-            let msg_size = u16::from_le_bytes([d[p + 1], d[p + 2]]) as usize;
-            let body = p + 4;
-            let body_end = body + msg_size;
-            if body_end > region_end {
-                return Err(Error::EditUnsupported("malformed group object header"));
-            }
+        while let Some((msg_type, body, body_end)) = next_message(region, p)? {
             match msg_type {
                 MessageType::ObjectHeaderContinuation => {
                     return Err(Error::EditUnsupported(
@@ -536,7 +537,7 @@ impl EditSession {
                     // message's own body, not just the region, so a short or
                     // malformed LinkInfo can't make us read the next message.
                     let mut q = body + 2;
-                    if msg_size >= 2 && d[body + 1] & 0x01 != 0 {
+                    if body_end - body >= 2 && d[body + 1] & 0x01 != 0 {
                         q += 8;
                     }
                     if q + 8 <= body_end {
@@ -589,15 +590,9 @@ impl EditSession {
         let mut children: Vec<(String, u64)> = Vec::new();
         let mut non_link: Vec<u8> = Vec::new();
 
+        let region = &d[..re];
         let mut p = rs;
-        while p + 4 <= re {
-            let msg_type = MessageType::from_u16(d[p] as u16);
-            let msg_size = u16::from_le_bytes([d[p + 1], d[p + 2]]) as usize;
-            let body = p + 4;
-            let body_end = body + msg_size;
-            if body_end > re {
-                return Err(Error::EditUnsupported("malformed object header"));
-            }
+        while let Some((msg_type, body, body_end)) = next_message(region, p)? {
             match msg_type {
                 MessageType::ObjectHeaderContinuation => {
                     return Err(Error::EditUnsupported(
@@ -612,7 +607,7 @@ impl EditSession {
                 MessageType::LinkInfo => {
                     has_link_info = true;
                     let mut q = body + 2;
-                    if msg_size >= 2 && d[body + 1] & 0x01 != 0 {
+                    if body_end - body >= 2 && d[body + 1] & 0x01 != 0 {
                         q += 8;
                     }
                     if q + 8 <= body_end {
@@ -639,7 +634,7 @@ impl EditSession {
                         ));
                     }
                 },
-                MessageType::DataLayout => layout = Some((body, msg_size)),
+                MessageType::DataLayout => layout = Some((body, body_end - body)),
                 _ => {}
             }
             if msg_type != MessageType::Link {
@@ -763,21 +758,24 @@ impl EditSession {
     /// Append `bytes` at end-of-file, updating both the mirror and the file.
     /// Returns the absolute address the bytes were written at.
     fn append(&mut self, bytes: &[u8]) -> Result<u64, Error> {
+        // Write to disk before updating the in-memory mirror, so a failed write
+        // never leaves the mirror ahead of the file on disk.
         let addr = self.data.len() as u64;
-        self.data.extend_from_slice(bytes);
         self.handle.seek(SeekFrom::Start(addr)).map_err(Error::Io)?;
         self.handle.write_all(bytes).map_err(Error::Io)?;
+        self.data.extend_from_slice(bytes);
         Ok(addr)
     }
 
     /// Overwrite bytes in place at `offset`, updating both the mirror and the
     /// file. The caller guarantees the range already exists.
     fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), Error> {
-        self.data[offset..offset + bytes.len()].copy_from_slice(bytes);
+        // Write to disk before updating the in-memory mirror (see `append`).
         self.handle
             .seek(SeekFrom::Start(offset as u64))
             .map_err(Error::Io)?;
         self.handle.write_all(bytes).map_err(Error::Io)?;
+        self.data[offset..offset + bytes.len()].copy_from_slice(bytes);
         Ok(())
     }
 }
@@ -981,14 +979,7 @@ fn encode_link_message(name: &str, addr: u64) -> Vec<u8> {
 /// link body for a hard link.
 fn patch_link_target(region: &mut [u8], name: &str, new_addr: u64) -> Result<(), Error> {
     let mut p = 0;
-    while p + 4 <= region.len() {
-        let msg_type = MessageType::from_u16(region[p] as u16);
-        let msg_size = u16::from_le_bytes([region[p + 1], region[p + 2]]) as usize;
-        let body = p + 4;
-        let body_end = body + msg_size;
-        if body_end > region.len() {
-            break;
-        }
+    while let Some((msg_type, body, body_end)) = next_message(region, p)? {
         if msg_type == MessageType::Link {
             if let Ok(link) = LinkMessage::parse(&region[body..body_end], OFFSET_SIZE) {
                 if link.name == name {
@@ -1019,14 +1010,7 @@ fn remove_link_from_region(region: &[u8], name: &str) -> Result<Vec<u8>, Error> 
     let mut out = Vec::with_capacity(region.len());
     let mut p = 0;
     let mut removed = false;
-    while p + 4 <= region.len() {
-        let msg_type = MessageType::from_u16(region[p] as u16);
-        let msg_size = u16::from_le_bytes([region[p + 1], region[p + 2]]) as usize;
-        let body = p + 4;
-        let body_end = body + msg_size;
-        if body_end > region.len() {
-            break;
-        }
+    while let Some((msg_type, body, body_end)) = next_message(region, p)? {
         let mut skip = false;
         if msg_type == MessageType::Link {
             if let Ok(link) = LinkMessage::parse(&region[body..body_end], OFFSET_SIZE) {
@@ -1055,6 +1039,25 @@ fn remove_link_from_region(region: &[u8], name: &str) -> Result<Vec<u8>, Error> 
 /// Whether `a` is a path prefix of (or equal to) `b`.
 fn is_prefix(a: &[String], b: &[String]) -> bool {
     a.len() <= b.len() && b[..a.len()] == *a
+}
+
+/// Parse the version-2 object-header message record at `p` within a chunk-0
+/// message region, returning `(message type, body start, body end)`; the next
+/// record begins at `body end`. Returns `Ok(None)` once fewer than 4 bytes
+/// remain (a clean end of the region), and `Err` if a record's declared body
+/// runs past the region. Centralizes the bounds check shared by every walker.
+fn next_message(region: &[u8], p: usize) -> Result<Option<(MessageType, usize, usize)>, Error> {
+    if p + 4 > region.len() {
+        return Ok(None);
+    }
+    let msg_type = MessageType::from_u16(region[p] as u16);
+    let msg_size = u16::from_le_bytes([region[p + 1], region[p + 2]]) as usize;
+    let body = p + 4;
+    let body_end = body + msg_size;
+    if body_end > region.len() {
+        return Err(Error::EditUnsupported("malformed object header message"));
+    }
+    Ok(Some((msg_type, body, body_end)))
 }
 
 /// Wrap a chunk-0 message region in a fresh single-chunk version 2 object header
