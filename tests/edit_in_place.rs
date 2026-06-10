@@ -279,6 +279,149 @@ fn duplicate_name_is_rejected_without_writing() {
 }
 
 #[test]
+fn delete_dataset_from_root() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_del_root.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
+    b.create_dataset("remove").with_i32_data(&[9, 9]);
+    b.write(&path).unwrap();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.delete("remove");
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.root().datasets().unwrap(), vec!["keep".to_string()]);
+    assert_eq!(
+        file.dataset("keep").unwrap().read_i32().unwrap(),
+        vec![1, 2, 3]
+    );
+    assert!(file.dataset("remove").is_err());
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn delete_nested_group_subtree() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_del_nested.h5");
+    write_starter(&path);
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.create_group("grp");
+        session.create_dataset("grp/inner").with_i32_data(&[5, 6]);
+        session.create_dataset("sibling").with_i32_data(&[7]);
+        session.commit().unwrap();
+    }
+
+    // Delete the whole group "grp" (its subtree becomes unreachable).
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.delete("grp");
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    assert!(file.group("grp").is_err());
+    assert!(file.dataset("grp/inner").is_err());
+    // Siblings and original survive.
+    assert_eq!(
+        file.dataset("sibling").unwrap().read_i32().unwrap(),
+        vec![7]
+    );
+    assert_eq!(
+        file.dataset("original").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    let mut roots = file.root().datasets().unwrap();
+    roots.sort();
+    assert_eq!(roots, vec!["original".to_string(), "sibling".to_string()]);
+    assert!(file.root().groups().unwrap().is_empty());
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn delete_one_of_nested_then_keep_group() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_del_one.h5");
+    write_starter(&path);
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.create_group("g");
+        session.create_dataset("g/a").with_i32_data(&[1]);
+        session.create_dataset("g/b").with_i32_data(&[2]);
+        session.commit().unwrap();
+    }
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.delete("g/a"); // remove one member, keep the group and g/b
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    assert!(file.dataset("g/a").is_err());
+    assert_eq!(file.dataset("g/b").unwrap().read_i32().unwrap(), vec![2]);
+    assert_eq!(
+        file.group("g").unwrap().datasets().unwrap(),
+        vec!["b".to_string()]
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn add_and_delete_in_one_commit() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_del.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("old").with_i32_data(&[1]);
+    b.write(&path).unwrap();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.create_dataset("new").with_i32_data(&[2]);
+        session.delete("old");
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.root().datasets().unwrap(), vec!["new".to_string()]);
+    assert_eq!(file.dataset("new").unwrap().read_i32().unwrap(), vec![2]);
+    assert!(file.dataset("old").is_err());
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn delete_missing_or_overlapping_is_rejected() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_del_reject.h5");
+    write_starter(&path);
+    let before = std::fs::read(&path).unwrap();
+
+    // Nothing to delete.
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.delete("ghost");
+        let err = session.commit().unwrap_err();
+        assert!(err.to_string().contains("nothing to delete"), "got: {err}");
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+
+    // Delete /g while adding under it in the same commit → overlap rejected.
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.create_group("g");
+        session.commit().unwrap();
+    }
+    let mid = std::fs::read(&path).unwrap();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.delete("g");
+        session.create_dataset("g/x").with_i32_data(&[1]);
+        let err = session.commit().unwrap_err();
+        assert!(err.to_string().contains("overlaps"), "got: {err}");
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), mid);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn chunked_dataset_is_rejected_without_writing() {
     let path = std::env::temp_dir().join("hdf5_pure_edit_reject_chunked.h5");
     write_starter(&path);

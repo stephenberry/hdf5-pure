@@ -17,12 +17,16 @@
 //! (the root through the superblock); absolute object-reference addresses to
 //! other objects stay valid.
 //!
+//! Deletion ([`EditSession::delete`], the HDF5 `H5Ldelete`) is the mirror image:
+//! the parent group's header is rebuilt without the removed link, relocated up
+//! the tree the same way, and the unlinked object (and its subtree) is left as
+//! dead bytes. Object copy (`H5Ocopy`) is a planned follow-on.
+//!
 //! # Scope
 //!
-//! This is the additive half of the in-place edit engine (deletion and object
-//! copy are planned follow-ons). It is deliberately strict: rather than silently
-//! produce a degraded file, it refuses with [`Error::EditUnsupported`] any case
-//! it cannot reproduce faithfully. Requirements:
+//! It is deliberately strict: rather than silently produce a degraded file, it
+//! refuses with [`Error::EditUnsupported`] any case it cannot reproduce
+//! faithfully. Requirements:
 //!
 //! - The file uses a latest-format (version 2/3) superblock with 8-byte
 //!   offsets/lengths and **no** userblock (base address 0).
@@ -98,6 +102,8 @@ pub struct EditSession {
     pending_datasets: Vec<(PathKey, DatasetBuilder)>,
     /// New groups staged by `create_group`, as full paths.
     pending_groups: Vec<PathKey>,
+    /// Links staged for removal by `delete`, as full paths.
+    pending_deletes: Vec<PathKey>,
 }
 
 impl EditSession {
@@ -141,6 +147,7 @@ impl EditSession {
             superblock,
             pending_datasets: Vec::new(),
             pending_groups: Vec::new(),
+            pending_deletes: Vec::new(),
         })
     }
 
@@ -166,23 +173,43 @@ impl EditSession {
         self.pending_groups.push(split_path(path));
     }
 
-    /// Apply all staged additions to the file in place and flush to disk.
+    /// Stage removal of the link at `path` (the HDF5 `H5Ldelete`), applied on the
+    /// next [`commit`](Self::commit). The link's object — and, for a group, its
+    /// whole subtree — becomes unreachable; the bytes it occupied are not
+    /// reclaimed (that is the separate free-space concern, issue #21).
+    ///
+    /// The path must exist. A deletion may not overlap another staged change in
+    /// the same commit (e.g. delete `/a` while adding `/a/b`); split such
+    /// edits into separate commits. The link's parent group must itself be
+    /// editable in place (compact links, single-chunk header); the target being
+    /// removed has no such restriction.
+    pub fn delete(&mut self, path: &str) {
+        self.pending_deletes.push(split_path(path));
+    }
+
+    /// Apply all staged additions and deletions to the file in place and flush.
     ///
     /// Appends each new dataset (data blob + object header) and each new group,
     /// then appends rewritten object headers for every touched group and its
-    /// ancestors up to the root, then repoints the superblock at the new root.
-    /// On success the staged set is cleared and the session can be reused. On
-    /// any [`Error::EditUnsupported`] the file on disk is left untouched: every
-    /// check runs before the first byte is written.
+    /// ancestors up to the root (omitting any deleted links), then repoints the
+    /// superblock at the new root. On success the staged set is cleared and the
+    /// session can be reused. On any [`Error::EditUnsupported`] the file on disk
+    /// is left untouched: every check runs before the first byte is written.
     pub fn commit(&mut self) -> Result<(), Error> {
-        if self.pending_datasets.is_empty() && self.pending_groups.is_empty() {
+        if self.pending_datasets.is_empty()
+            && self.pending_groups.is_empty()
+            && self.pending_deletes.is_empty()
+        {
             return Ok(());
         }
 
         // --- Plan: build the tree of "dirty" groups (root plus every group on a
-        // path to an addition), validating every target before any write. ---
+        // path to an addition or deletion), validating every target before any
+        // write. `add_targets` records the full paths created this commit, used
+        // to reject a deletion that overlaps an addition. ---
         let mut nodes: BTreeMap<PathKey, Node> = BTreeMap::new();
         nodes.entry(PathKey::new()).or_default(); // root is always dirty
+        let mut add_targets: Vec<PathKey> = Vec::new();
 
         // Mark explicitly-created new groups, ensuring their ancestor chain.
         for path in std::mem::take(&mut self.pending_groups) {
@@ -190,13 +217,50 @@ impl EditSession {
                 return Err(Error::EditUnsupported("cannot create the root group"));
             }
             ensure_ancestors(&mut nodes, &path);
-            nodes.entry(path).or_default().is_new = true;
+            nodes.entry(path.clone()).or_default().is_new = true;
+            add_targets.push(path);
         }
 
         // Attach datasets to their parent group nodes, ensuring ancestor chains.
         for (parent, db) in std::mem::take(&mut self.pending_datasets) {
+            let mut full = parent.clone();
+            full.push(db.name.clone());
+            add_targets.push(full);
             ensure_ancestors(&mut nodes, &parent);
             nodes.entry(parent).or_default().datasets.push(db);
+        }
+
+        // Stage deletions: each must exist, must not overlap any other staged
+        // change, and is recorded against its parent group (which becomes dirty).
+        let deletes = std::mem::take(&mut self.pending_deletes);
+        for (i, d) in deletes.iter().enumerate() {
+            if d.is_empty() {
+                return Err(Error::EditUnsupported("cannot delete the root group"));
+            }
+            let path_str = d.join("/");
+            crate::group_v2::resolve_path_any(&self.data, &self.superblock, &path_str)
+                .map_err(|_| Error::EditUnsupported("nothing to delete at the given path"))?;
+            for t in &add_targets {
+                if is_prefix(d, t) || is_prefix(t, d) {
+                    return Err(Error::EditUnsupported(
+                        "a deletion overlaps an addition in the same commit; use separate commits",
+                    ));
+                }
+            }
+            for (j, d2) in deletes.iter().enumerate() {
+                if i != j && is_prefix(d, d2) {
+                    return Err(Error::EditUnsupported(
+                        "overlapping deletions in one commit; delete the common parent only",
+                    ));
+                }
+            }
+            let parent = d[..d.len() - 1].to_vec();
+            ensure_ancestors(&mut nodes, &parent);
+            nodes
+                .entry(parent)
+                .or_default()
+                .deletes
+                .push(d.last().unwrap().clone());
         }
 
         // Resolve / validate each node's base object-header region up front.
@@ -272,7 +336,18 @@ impl EditSession {
         let mut by_depth = keys.clone();
         by_depth.sort_by_key(|k| std::cmp::Reverse(k.len())); // deepest first
         for key in &by_depth {
-            let mut region = std::mem::take(&mut nodes.get_mut(key).unwrap().base_region);
+            let (mut region, deletes) = {
+                let node = nodes.get_mut(key).unwrap();
+                (
+                    std::mem::take(&mut node.base_region),
+                    std::mem::take(&mut node.deletes),
+                )
+            };
+
+            // Remove deleted links first (verbatim-preserving the rest).
+            for name in &deletes {
+                region = remove_link_from_region(&region, name)?;
+            }
 
             // Datasets directly under this group.
             for fd in flat.remove(key).into_iter().flatten() {
@@ -446,6 +521,8 @@ impl EditSession {
 struct Node {
     is_new: bool,
     datasets: Vec<DatasetBuilder>,
+    /// Names of links to remove from this group (from `delete`).
+    deletes: Vec<String>,
     base_region: Vec<u8>,
     existing_links: Vec<String>,
 }
@@ -642,6 +719,51 @@ fn patch_link_target(region: &mut [u8], name: &str, new_addr: u64) -> Result<(),
     Err(Error::EditUnsupported(
         "expected child link not found in parent group",
     ))
+}
+
+/// Copy a chunk-0 message `region`, dropping the single Link message named
+/// `name` and preserving every other message verbatim (used by `delete`). Errors
+/// if no such link is present.
+fn remove_link_from_region(region: &[u8], name: &str) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::with_capacity(region.len());
+    let mut p = 0;
+    let mut removed = false;
+    while p + 4 <= region.len() {
+        let msg_type = MessageType::from_u16(region[p] as u16);
+        let msg_size = u16::from_le_bytes([region[p + 1], region[p + 2]]) as usize;
+        let body = p + 4;
+        let body_end = body + msg_size;
+        if body_end > region.len() {
+            break;
+        }
+        let mut skip = false;
+        if msg_type == MessageType::Link {
+            if let Ok(link) = LinkMessage::parse(&region[body..body_end], OFFSET_SIZE) {
+                if link.name == name {
+                    skip = true;
+                    removed = true;
+                }
+            }
+        }
+        if !skip {
+            out.extend_from_slice(&region[p..body_end]);
+        }
+        p = body_end;
+    }
+    if p < region.len() {
+        out.extend_from_slice(&region[p..]);
+    }
+    if !removed {
+        return Err(Error::EditUnsupported(
+            "link to delete not found in its parent group",
+        ));
+    }
+    Ok(out)
+}
+
+/// Whether `a` is a path prefix of (or equal to) `b`.
+fn is_prefix(a: &[String], b: &[String]) -> bool {
+    a.len() <= b.len() && b[..a.len()] == *a
 }
 
 /// Wrap a chunk-0 message region in a fresh single-chunk version 2 object header
