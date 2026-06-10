@@ -485,6 +485,9 @@ fn ensure_ancestors(nodes: &mut BTreeMap<PathKey, Node>, path: &[String]) {
 /// Validate a staged dataset and reduce it to a [`FlatDataset`], rejecting any
 /// feature this engine cannot emit as contiguous, unfiltered storage.
 fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
+    if db.name.is_empty() {
+        return Err(Error::EditUnsupported("dataset path has an empty name"));
+    }
     if db.chunk_options.is_chunked() || db.maxshape.is_some() {
         return Err(Error::EditUnsupported(
             "chunked / compressed / extensible datasets cannot be added in place yet",
