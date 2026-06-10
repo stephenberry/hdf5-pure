@@ -53,6 +53,9 @@ ndarray = { version = ">=0.16, <0.18", optional = true }
 tempfile = "3"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
+# Property-based testing for the write/read roundtrip and parser-robustness
+# invariants (issue #26).
+proptest = "1"
 
 # The reference HDF5 C library, used only by the byte-level crosscheck tests.
 # Its `static` feature compiles libhdf5 from source via CMake, which does not
