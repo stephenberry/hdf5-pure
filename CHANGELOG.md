@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-06-10
+
+Internal robustness and test-coverage work from [#26](https://github.com/stephenberry/hdf5-pure/issues/26). No public API or on-disk-format change; existing code is unaffected.
+
+### Added
+
+- Property-based tests (`proptest`, a dev-dependency only) covering two invariants across a generated input space rather than hand-picked examples ([#44](https://github.com/stephenberry/hdf5-pure/pull/44)): bit-exact write/read roundtrip identity for every supported numeric datatype (so `NaN`/`Inf` floats are checked via `to_bits`) in both contiguous and chunked+deflate layouts, and parser robustness — feeding arbitrary, signature-prefixed, and corrupted-real-file bytes to the reader must return `Ok`/`Err` but never panic, index out of bounds, or overflow.
+- A Miri CI job that interprets the crate's only non-trivial `unsafe` — the cache-line-aligned chunk buffer in `chunk_cache` (manual allocator calls, `slice::from_raw_parts`, and the `Send`/`Sync` impls) — under Stacked Borrows and strict provenance, catching aliasing and out-of-bounds undefined behavior the normal test run cannot observe ([#43](https://github.com/stephenberry/hdf5-pure/pull/43)).
+
+### Changed
+
+- Internal cleanup only: the repeated B-tree v1 node-header and chunk-record-key size arithmetic (previously the literals `8 + offset_size * 2` and `4 + 4 + ndims * offset_size` scattered across several call sites) is now expressed through named, spec-documented helpers ([#42](https://github.com/stephenberry/hdf5-pure/pull/42)). Value-preserving, verified byte-identical to the code it replaces.
+
 ## [0.12.0] - 2026-06-10
 
 ### Added
@@ -109,7 +122,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The MAT serde deserializer now flattens 1×N and N×1 `Matrix` / `ComplexMatrix` values to a 1-D sequence inside `deserialize_any`, matching the existing behavior of `deserialize_seq`. This means untagged enums, `serde::de::Content` roundtrips, and custom `Visitor` impls that previously discriminated on the 2-D rows-of-rows shape when one axis was 1 will now see a flat sequence. Values with both axes greater than 1 still surface as a 2-D rows-of-rows.
 - Numeric / complex dataset readers no longer collapse a 1×N or N×1 dataset to a flat vector at the value layer. Shape is preserved through `MatValue::Matrix` / `ComplexMatrix`, and any flattening for `Vec<T>` callers happens at the serde-deserializer level (above). Direct consumers of `pub(crate)` value APIs are unaffected; this is an internal cleanup that fixes column-vector roundtrip ambiguity.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.12.1...HEAD
+[0.12.1]: https://github.com/stephenberry/hdf5-pure/compare/v0.12.0...v0.12.1
+[0.12.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.11.0...v0.12.0
+[0.11.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.10.0...v0.11.0
+[0.10.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.6.0...v0.7.0
