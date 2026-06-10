@@ -32,14 +32,18 @@
 //! refuses with [`Error::EditUnsupported`] any case it cannot reproduce
 //! faithfully. Requirements:
 //!
-//! - The file uses a latest-format (version 2/3) superblock with 8-byte
-//!   offsets/lengths and **no** userblock (base address 0).
-//! - Every group on an edited path stores its links compactly (not in a dense
-//!   fractal heap) and does not track message creation order. Object headers
+//! - The file uses 8-byte offsets/lengths and has **no** userblock (base
+//!   address 0). Any superblock version (0–3) is accepted: a version 0/1
+//!   (symbol-table) file is edited by converting each group on the edited path
+//!   to the latest format and repointing the superblock's root symbol-table
+//!   entry.
+//! - A version 2/3 group on an edited path stores its links compactly (not in a
+//!   dense fractal heap) and does not track message creation order; headers
 //!   split across continuation chunks (as the reference C library often writes)
-//!   are collapsed into a single chunk when rewritten. Files written by this
-//!   crate's [`FileBuilder`](crate::FileBuilder) and by the C library satisfy
-//!   this.
+//!   are collapsed into a single chunk when rewritten. A version 1 group is
+//!   converted to a compact-link v2 header, carrying its links and attributes
+//!   over (other group messages — symbol table, modification time — are
+//!   dropped); an attribute it cannot reproduce is refused.
 //! - Added datasets are contiguous and unfiltered (no chunking, compression,
 //!   shuffle, scale-offset, or extensible dimensions), have a fixed-size
 //!   datatype with a non-empty shape, and carry only fixed-size (non
@@ -60,8 +64,10 @@ use crate::checksum::jenkins_lookup3;
 use crate::dataspace::{Dataspace, DataspaceType};
 use crate::error::Error;
 use crate::file_writer::{LENGTH_SIZE, OFFSET_SIZE, build_dataset_oh, make_link};
+use crate::group_v2::resolve_group_entries;
 use crate::link_message::{LinkMessage, LinkTarget};
 use crate::message_type::MessageType;
+use crate::object_header::ObjectHeader;
 use crate::signature;
 use crate::superblock::Superblock;
 use crate::type_builders::{AttrValue, DatasetBuilder, build_attr_message};
@@ -142,10 +148,8 @@ impl EditSession {
         let sb_sig_off = signature::find_signature(&data)?;
         let superblock = Superblock::parse(&data, sb_sig_off)?;
 
-        if superblock.version < 2 {
-            return Err(Error::EditUnsupported(
-                "superblock version 0/1 (symbol-table root group) is not editable in place",
-            ));
+        if superblock.version > 3 {
+            return Err(Error::EditUnsupported("unsupported superblock version"));
         }
         if superblock.offset_size != OFFSET_SIZE || superblock.length_size != LENGTH_SIZE {
             return Err(Error::EditUnsupported(
@@ -459,19 +463,54 @@ impl EditSession {
             new_addr.insert(key.clone(), addr);
         }
 
-        // Repoint the superblock at the new root last: this single in-place
-        // write is the commit's linearization point. Until it lands, the file on
-        // disk still points at the old root (the appended objects are merely
-        // unreferenced trailing bytes), so a failure here leaves a valid file.
-        // Build the new superblock off a clone and only adopt it once the write
-        // succeeds, so a failed write does not desync the in-memory state.
-        let mut new_sb = self.superblock.clone();
-        new_sb.root_group_address = new_addr[&PathKey::new()];
-        new_sb.eof_address = self.data.len() as u64;
-        let sb_bytes = new_sb.serialize();
-        self.write_at(self.sb_sig_off, &sb_bytes)?;
-        self.handle.flush().map_err(Error::Io)?;
-        self.superblock = new_sb;
+        // Repoint the superblock at the new root last: this is the commit's
+        // linearization point. Until it lands, the file on disk still points at
+        // the old root (the appended objects are merely unreferenced trailing
+        // bytes), so a failure here leaves a valid file.
+        let new_root = new_addr[&PathKey::new()];
+        let new_eof = self.data.len() as u64;
+        if self.superblock.version >= 2 {
+            // Build the new superblock off a clone and adopt it only once the
+            // write succeeds, so a failed write does not desync the in-memory
+            // state. The v2/v3 superblock carries its own checksum.
+            let mut new_sb = self.superblock.clone();
+            new_sb.root_group_address = new_root;
+            new_sb.eof_address = new_eof;
+            let sb_bytes = new_sb.serialize();
+            self.write_at(self.sb_sig_off, &sb_bytes)?;
+            self.handle.flush().map_err(Error::Io)?;
+            self.superblock = new_sb;
+        } else {
+            self.repoint_v0v1_root(new_root, new_eof)?;
+            self.handle.flush().map_err(Error::Io)?;
+            self.superblock.root_group_address = new_root;
+            self.superblock.eof_address = new_eof;
+        }
+        Ok(())
+    }
+
+    /// Repoint a version 0/1 superblock at the rebuilt (now v2) root group and
+    /// update its end-of-file field, patching the raw bytes in place — these
+    /// superblocks carry no checksum. The root symbol-table entry is switched to
+    /// cache type 0 (its scratch-pad B-tree / local-heap addresses, which
+    /// describe the old symbol-table group, no longer apply). The
+    /// object-header-address write is done last so it is the linearization point.
+    fn repoint_v0v1_root(&mut self, new_root: u64, new_eof: u64) -> Result<(), Error> {
+        let os = self.superblock.offset_size as usize;
+        // Field layout after the fixed prefix: base / free-space / EOF / driver
+        // addresses, then the root symbol-table entry (link-name offset, object
+        // header address, cache type(4), reserved(4), scratch(16)). The prefix is
+        // 24 bytes for v0 and 28 for v1 (the latter adds indexed-storage-K).
+        let var_start = if self.superblock.version == 0 { 24 } else { 28 };
+        let base = self.sb_sig_off + var_start;
+        let eof_off = base + 2 * os;
+        let ste = base + 4 * os;
+        let oh_addr_off = ste + os;
+        let cache_off = ste + 2 * os;
+        self.write_at(eof_off, &new_eof.to_le_bytes()[..os])?;
+        self.write_at(cache_off, &[0u8; 4])?; // cache type = none
+        self.write_at(cache_off + 8, &[0u8; 16])?; // clear scratch-pad
+        self.write_at(oh_addr_off, &new_root.to_le_bytes()[..os])?;
         Ok(())
     }
 
@@ -577,10 +616,69 @@ impl EditSession {
         Ok(out)
     }
 
-    /// Parse and validate a group's object header (collapsing any continuation
-    /// chunks), returning its unified message region — the bytes to copy when
-    /// rewriting the header — and the names of its existing links.
+    /// Reconstruct a version-1 (symbol-table) group as a fresh v2 compact-link
+    /// message region: a LinkInfo message, one Link message per existing child,
+    /// and the group's existing attributes (re-wrapped as v2 messages). The
+    /// symbol-table message and other non-link/non-attribute messages
+    /// (modification time, comment, …) are dropped — editing a v0/v1 group
+    /// converts it to the latest format. Refuses an attribute it cannot
+    /// reproduce (shared, or larger than a v2 message can hold).
+    fn reconstruct_v1_group(&self, addr: usize) -> Result<GroupInfo, Error> {
+        let os = self.superblock.offset_size;
+        let ls = self.superblock.length_size;
+        let base = self.superblock.base_address;
+        let oh = ObjectHeader::parse_with_base(&self.data, addr, os, ls, base)?;
+        if oh
+            .messages
+            .iter()
+            .any(|m| m.msg_type == MessageType::DataLayout)
+        {
+            return Err(Error::EditUnsupported(
+                "a target path names a dataset, not a group",
+            ));
+        }
+        let entries = resolve_group_entries(&self.data, &oh, os, ls, base)?;
+
+        let mut region = fresh_group_region();
+        let mut link_names = Vec::with_capacity(entries.len());
+        for e in &entries {
+            // Group-entry addresses are stored relative to the base address (0
+            // here), matching how link targets are stored.
+            region.extend_from_slice(&encode_link_message(&e.name, e.object_header_address));
+            link_names.push(e.name.clone());
+        }
+        for m in &oh.messages {
+            if m.msg_type == MessageType::Attribute {
+                if m.flags != 0 {
+                    return Err(Error::EditUnsupported(
+                        "a v0/v1 group has a shared attribute message (not convertible in place yet)",
+                    ));
+                }
+                if m.data.len() > u16::MAX as usize {
+                    return Err(Error::EditUnsupported(
+                        "a v0/v1 group attribute is too large to convert in place",
+                    ));
+                }
+                // Re-wrap the attribute message body (it is self-describing) in a
+                // v2 message record.
+                region.push(MessageType::Attribute.to_u16() as u8);
+                region.extend_from_slice(&(m.data.len() as u16).to_le_bytes());
+                region.push(0); // message flags
+                region.extend_from_slice(&m.data);
+            }
+        }
+        Ok(GroupInfo { region, link_names })
+    }
+
+    /// Parse and validate a group's object header, returning its message region
+    /// — the bytes to copy when rewriting the header — and the names of its
+    /// existing links. A version 2 header is rebuilt from its own message bytes
+    /// (collapsing continuation chunks, preserving every message); a version 1
+    /// symbol-table group is converted to v2 via [`reconstruct_v1_group`].
     fn inspect_group(&self, addr: usize) -> Result<GroupInfo, Error> {
+        if self.data.len() < addr + 4 || self.data[addr..addr + 4] != *b"OHDR" {
+            return self.reconstruct_v1_group(addr);
+        }
         let region = self.gather_oh_messages(addr)?;
         let mut p = 0;
         let mut has_link_info = false;

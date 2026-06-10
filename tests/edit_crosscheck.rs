@@ -10,9 +10,10 @@
 //! including headers the C library splits across multiple chunks (which the
 //! editor collapses into a single chunk on rewrite).
 //!
-//! Boundary recorded here too: the default earliest format (version 0
-//! superblock with symbol-table groups) is refused cleanly, leaving the file
-//! untouched.
+//! The default earliest format (version 0 superblock with symbol-table groups)
+//! is also editable: each group on the edited path is converted to the latest
+//! compact-link format on rewrite, the superblock's root symbol-table entry is
+//! repointed, and the result is read back correctly by the C library.
 
 use hdf5::file::LibraryVersion;
 use hdf5_pure::{EditSession, File, FileBuilder};
@@ -226,7 +227,7 @@ fn c_multichunk_group_header_is_collapsed_and_edited() {
 }
 
 #[test]
-fn c_earliest_symboltable_file_is_refused_cleanly() {
+fn c_v0_symboltable_file_edited_then_read_by_c_library() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("c_v0.h5");
     // Earliest low bound yields a version 0 superblock with symbol-table groups.
@@ -235,30 +236,106 @@ fn c_earliest_symboltable_file_is_refused_cleanly() {
         File::open(&path).unwrap().superblock().version <= 1,
         "expected a v0/v1 superblock from the earliest libver bound"
     );
-    let before = std::fs::read(&path).unwrap();
 
-    let err = match EditSession::open(&path) {
-        Ok(_) => panic!("expected a version 0 / symbol-table file to be refused at open"),
-        Err(e) => e,
-    };
-    assert!(
-        err.to_string().contains("symbol-table") || err.to_string().contains("version 0"),
-        "unexpected reason: {err}"
-    );
-    assert_eq!(
-        std::fs::read(&path).unwrap(),
-        before,
-        "rejected open modified the file"
-    );
+    // Add at root, add into the (symbol-table) group, and delete a root dataset.
+    // (Copy of the existing v1 objects is not supported, so it is not staged.)
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("added")
+            .with_f64_data(&[100.0, 200.0]);
+        session
+            .create_dataset("grp/gamma")
+            .with_i32_data(&[1, 2, 3]);
+        session.delete("doomed");
+        session.commit().unwrap();
+    }
 
-    // hdf5-pure can still *read* the default-format file.
+    // The superblock stays version 0; the edited groups were converted to v2.
+    let f = File::open(&path).unwrap();
+    assert!(f.superblock().version <= 1);
     assert_eq!(
-        File::open(&path)
-            .unwrap()
-            .dataset("alpha")
-            .unwrap()
-            .read_f64()
-            .unwrap(),
+        f.dataset("alpha").unwrap().read_f64().unwrap(),
         vec![1.0, 2.0, 3.0]
+    );
+    assert_eq!(
+        f.dataset("added").unwrap().read_f64().unwrap(),
+        vec![100.0, 200.0]
+    );
+    assert_eq!(
+        f.dataset("grp/beta").unwrap().read_i32().unwrap(),
+        vec![10, 20, 30, 40]
+    );
+    assert_eq!(
+        f.dataset("grp/gamma").unwrap().read_i32().unwrap(),
+        vec![1, 2, 3]
+    );
+    assert!(f.dataset("doomed").is_err());
+
+    // The reference C library reads the edited version-0 file and agrees.
+    let c = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        c.dataset("alpha").unwrap().read_raw::<f64>().unwrap(),
+        vec![1.0, 2.0, 3.0]
+    );
+    assert_eq!(
+        c.dataset("added").unwrap().read_raw::<f64>().unwrap(),
+        vec![100.0, 200.0]
+    );
+    assert_eq!(
+        c.dataset("grp/beta").unwrap().read_raw::<i32>().unwrap(),
+        vec![10, 20, 30, 40]
+    );
+    assert_eq!(
+        c.dataset("grp/gamma").unwrap().read_raw::<i32>().unwrap(),
+        vec![1, 2, 3]
+    );
+    assert!(c.dataset("doomed").is_err());
+}
+
+#[test]
+fn c_v0_root_attributes_survive_conversion() {
+    // A version-0 root is a symbol-table (v1) group; editing converts it to v2.
+    // Its existing attributes must survive that conversion, verified by the C
+    // library reading them back.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_v0_attrs.h5");
+    {
+        let file = hdf5::File::with_options()
+            .with_fapl(|p| p.libver_bounds(LibraryVersion::Earliest, LibraryVersion::V18))
+            .create(&path)
+            .unwrap();
+        file.new_dataset::<f64>()
+            .shape((2,))
+            .create("d")
+            .unwrap()
+            .write(&[1.0f64, 2.0])
+            .unwrap();
+        file.new_attr::<i64>()
+            .shape(())
+            .create("tag")
+            .unwrap()
+            .write_scalar(&77i64)
+            .unwrap();
+        file.close().unwrap();
+    }
+    assert!(File::open(&path).unwrap().superblock().version <= 1);
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.create_dataset("extra").with_i32_data(&[9]);
+        session.commit().unwrap();
+    }
+
+    let c = hdf5::File::open(&path).unwrap();
+    let tag: i64 = c.attr("tag").unwrap().read_scalar().unwrap();
+    assert_eq!(tag, 77, "root attribute lost converting the v0 group to v2");
+    assert_eq!(
+        c.dataset("d").unwrap().read_raw::<f64>().unwrap(),
+        vec![1.0, 2.0]
+    );
+    assert_eq!(
+        c.dataset("extra").unwrap().read_raw::<i32>().unwrap(),
+        vec![9]
     );
 }
