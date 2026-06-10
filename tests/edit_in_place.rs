@@ -133,6 +133,125 @@ fn commit_without_staged_datasets_is_noop() {
 }
 
 #[test]
+fn create_group_at_root() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_group.h5");
+    write_starter(&path);
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.create_group("results");
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.root().groups().unwrap(), vec!["results".to_string()]);
+    // The new group is empty and openable.
+    assert!(
+        file.group("results")
+            .unwrap()
+            .datasets()
+            .unwrap()
+            .is_empty()
+    );
+    // Original dataset intact.
+    assert_eq!(
+        file.dataset("original").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn add_dataset_into_new_nested_group() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_nested.h5");
+    write_starter(&path);
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.create_group("measurements");
+        session.create_group("measurements/run1");
+        session
+            .create_dataset("measurements/run1/signal")
+            .with_f64_data(&[10.0, 11.0, 12.0]);
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let ds = file.dataset("measurements/run1/signal").unwrap();
+    assert_eq!(ds.read_f64().unwrap(), vec![10.0, 11.0, 12.0]);
+    // Ancestors and the original survive.
+    assert_eq!(
+        file.group("measurements").unwrap().groups().unwrap(),
+        vec!["run1".to_string()]
+    );
+    assert_eq!(
+        file.dataset("original").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn add_into_existing_group_across_commits() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_existing_group.h5");
+    write_starter(&path);
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.create_group("g");
+        session.create_dataset("g/a").with_i32_data(&[1, 2]);
+        session.commit().unwrap();
+        // Second commit adds into the now-existing group g.
+        session.create_dataset("g/b").with_i32_data(&[3, 4]);
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.dataset("g/a").unwrap().read_i32().unwrap(), vec![1, 2]);
+    assert_eq!(file.dataset("g/b").unwrap().read_i32().unwrap(), vec![3, 4]);
+    let mut names = file.group("g").unwrap().datasets().unwrap();
+    names.sort();
+    assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn add_into_two_sibling_groups_one_commit() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_siblings.h5");
+    write_starter(&path);
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.create_group("x");
+        session.create_group("y");
+        session.create_dataset("x/d").with_i32_data(&[1]);
+        session.create_dataset("y/d").with_i32_data(&[2]);
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.dataset("x/d").unwrap().read_i32().unwrap(), vec![1]);
+    assert_eq!(file.dataset("y/d").unwrap().read_i32().unwrap(), vec![2]);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn dataset_into_missing_group_is_rejected() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_missing_group.h5");
+    write_starter(&path);
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.create_dataset("nope/d").with_i32_data(&[1]);
+        let err = session.commit().unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "got: {err}");
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn duplicate_name_is_rejected_without_writing() {
     let path = std::env::temp_dir().join("hdf5_pure_edit_dup.h5");
     write_starter(&path);

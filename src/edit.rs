@@ -1,36 +1,47 @@
-//! In-place editing of an existing HDF5 file (issue #32, Group C — first
-//! milestone: add objects without rewriting the whole file).
+//! In-place editing of an existing HDF5 file (issue #32, Group C).
 //!
-//! [`EditSession`] opens an existing file and appends new datasets to its root
-//! group **in place**: the new dataset's data and object header are written at
-//! the end of the file, and the root group's object header is rewritten (also
-//! appended) with one extra link per added dataset, after which the superblock
-//! is repointed at the new root header. Nothing already in the file is moved,
-//! so the cost is proportional to what you add, not to the file size — unlike
-//! the read-everything-then-rebuild path through [`FileBuilder`](crate::FileBuilder).
+//! [`EditSession`] opens an existing file and adds objects to it **in place**:
+//! new data and object headers are written at the end of the file, and the
+//! object headers of the touched groups (and their ancestors up to the root)
+//! are rewritten — also appended — so the superblock ends up pointing at the
+//! new root header. Nothing already in the file is moved, so the cost is
+//! proportional to what you add, not to the file size — unlike the
+//! read-everything-then-rebuild path through [`FileBuilder`](crate::FileBuilder).
 //!
-//! # Scope of this milestone
+//! Both new datasets and new (sub)groups are supported, at any existing group
+//! path. Adding into a nested group `/a/b` rewrites `b`'s header (with the new
+//! link), then `a`'s header (repointing its link to `b`'s new location), then
+//! the root's — "relocation up the tree". This is always safe for *additions*
+//! because no surviving object is relocated except the groups on the path being
+//! edited, and those are reachable only through links this same commit rewrites
+//! (the root through the superblock); absolute object-reference addresses to
+//! other objects stay valid.
 //!
-//! This is the foundation of the broader in-place edit engine (deletion and
-//! object copy are planned follow-ons). It is deliberately strict: rather than
-//! silently produce a degraded file, it refuses with [`Error::EditUnsupported`]
-//! any case it cannot reproduce faithfully. Supported targets:
+//! # Scope
+//!
+//! This is the additive half of the in-place edit engine (deletion and object
+//! copy are planned follow-ons). It is deliberately strict: rather than silently
+//! produce a degraded file, it refuses with [`Error::EditUnsupported`] any case
+//! it cannot reproduce faithfully. Requirements:
 //!
 //! - The file uses a latest-format (version 2/3) superblock with 8-byte
 //!   offsets/lengths and **no** userblock (base address 0).
-//! - The root group stores its links compactly (not in a dense fractal heap),
-//!   its object header is a single chunk, and it does not track message
-//!   creation order. Files written by this crate's [`FileBuilder`](crate::FileBuilder)
-//!   satisfy this.
+//! - Every group on an edited path stores its links compactly (not in a dense
+//!   fractal heap), has a single-chunk object header, and does not track message
+//!   creation order. Files written by this crate's
+//!   [`FileBuilder`](crate::FileBuilder) satisfy this.
 //! - Added datasets are contiguous and unfiltered (no chunking, compression,
 //!   shuffle, scale-offset, or extensible dimensions), have a fixed-size
 //!   datatype with a non-empty shape, and carry only fixed-size (non
 //!   variable-length) attributes, few enough to stay in compact storage.
+//! - A new group's parent must already exist or be created in the same session
+//!   (each level created explicitly); intermediate groups are not auto-created.
 //!
-//! The reclaimed-space question (the old root header becomes unreferenced dead
-//! bytes after each commit) is out of scope here; it belongs to the free-space
-//! work tracked separately (issue #21).
+//! The reclaimed-space question (a superseded object header becomes unreferenced
+//! dead bytes after each commit) is out of scope here; it belongs to the
+//! free-space work tracked separately (issue #21).
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -39,22 +50,27 @@ use crate::checksum::jenkins_lookup3;
 use crate::dataspace::{Dataspace, DataspaceType};
 use crate::error::Error;
 use crate::file_writer::{LENGTH_SIZE, OFFSET_SIZE, build_dataset_oh, make_link};
+use crate::link_message::{LinkMessage, LinkTarget};
 use crate::message_type::MessageType;
 use crate::signature;
 use crate::superblock::Superblock;
 use crate::type_builders::{AttrValue, DatasetBuilder, build_attr_message};
 
 /// Maximum number of compact attributes; beyond this HDF5 switches a dataset to
-/// dense (fractal-heap) attribute storage, which this milestone does not emit.
+/// dense (fractal-heap) attribute storage, which this engine does not emit.
 /// Mirrors `DENSE_ATTR_THRESHOLD` in `file_writer`.
 const MAX_COMPACT_ATTRS: usize = 8;
+
+/// A path identified by its components (no leading/trailing empties); the root
+/// group is the empty vector.
+type PathKey = Vec<String>;
 
 /// An open HDF5 file being edited in place.
 ///
 /// Mirror the file in memory and keep a writable handle; every mutation is
 /// applied to both so the on-disk file stays consistent. Stage additions with
-/// [`create_dataset`](Self::create_dataset), then apply them with
-/// [`commit`](Self::commit).
+/// [`create_dataset`](Self::create_dataset) / [`create_group`](Self::create_group),
+/// then apply them with [`commit`](Self::commit).
 ///
 /// # Example
 ///
@@ -62,8 +78,9 @@ const MAX_COMPACT_ATTRS: usize = 8;
 /// use hdf5_pure::EditSession;
 ///
 /// let mut session = EditSession::open("existing.h5")?;
+/// session.create_group("run2");
 /// session
-///     .create_dataset("new_signal")
+///     .create_dataset("run2/signal")
 ///     .with_f64_data(&[1.0, 2.0, 3.0]);
 /// session.commit()?;
 /// # Ok::<(), hdf5_pure::Error>(())
@@ -77,8 +94,10 @@ pub struct EditSession {
     /// Parsed superblock. Addresses are as stored on disk (relative to the base
     /// address, which this editor requires to be 0).
     superblock: Superblock,
-    /// Datasets staged by `create_dataset`, applied on the next `commit`.
-    pending: Vec<DatasetBuilder>,
+    /// Datasets staged by `create_dataset`, as (parent group path, builder).
+    pending_datasets: Vec<(PathKey, DatasetBuilder)>,
+    /// New groups staged by `create_group`, as full paths.
+    pending_groups: Vec<PathKey>,
 }
 
 impl EditSession {
@@ -120,85 +139,174 @@ impl EditSession {
             data,
             sb_sig_off,
             superblock,
-            pending: Vec::new(),
+            pending_datasets: Vec::new(),
+            pending_groups: Vec::new(),
         })
     }
 
-    /// Stage a new dataset to be added to the root group on the next
-    /// [`commit`](Self::commit). Returns a [`DatasetBuilder`] to configure its
-    /// data, shape, and attributes — the same builder used by
-    /// [`FileBuilder`](crate::FileBuilder).
-    pub fn create_dataset(&mut self, name: &str) -> &mut DatasetBuilder {
-        self.pending.push(DatasetBuilder::new(name));
-        self.pending
-            .last_mut()
-            .expect("just pushed a dataset builder")
+    /// Stage a new dataset, added on the next [`commit`](Self::commit). The
+    /// argument is the full path of the dataset; everything before the last
+    /// component names the parent group, which must exist (or be created in this
+    /// session). Returns the [`DatasetBuilder`] — the same builder used by
+    /// [`FileBuilder`](crate::FileBuilder) — to configure data, shape, and
+    /// attributes.
+    pub fn create_dataset(&mut self, path: &str) -> &mut DatasetBuilder {
+        let mut comps = split_path(path);
+        let leaf = comps.pop().unwrap_or_default();
+        self.pending_datasets
+            .push((comps, DatasetBuilder::new(&leaf)));
+        &mut self.pending_datasets.last_mut().unwrap().1
     }
 
-    /// Apply all staged datasets to the file in place and flush to disk.
+    /// Stage a new (empty) group at `path`, created on the next
+    /// [`commit`](Self::commit). The parent must already exist or be created in
+    /// the same session; populate the group with datasets via
+    /// [`create_dataset`](Self::create_dataset) using a path under it.
+    pub fn create_group(&mut self, path: &str) {
+        self.pending_groups.push(split_path(path));
+    }
+
+    /// Apply all staged additions to the file in place and flush to disk.
     ///
-    /// Appends each new dataset (data blob + object header), then appends a
-    /// rewritten root-group object header carrying the new links, then repoints
-    /// the superblock at it. On success the staged set is cleared and the
-    /// session can be reused for further edits. On any
-    /// [`Error::EditUnsupported`] the file on disk is left untouched (the guard
-    /// runs before any bytes are written).
+    /// Appends each new dataset (data blob + object header) and each new group,
+    /// then appends rewritten object headers for every touched group and its
+    /// ancestors up to the root, then repoints the superblock at the new root.
+    /// On success the staged set is cleared and the session can be reused. On
+    /// any [`Error::EditUnsupported`] the file on disk is left untouched: every
+    /// check runs before the first byte is written.
     pub fn commit(&mut self) -> Result<(), Error> {
-        if self.pending.is_empty() {
+        if self.pending_datasets.is_empty() && self.pending_groups.is_empty() {
             return Ok(());
         }
 
-        // Validate the root group up front, before writing anything, so an
-        // unsupported target fails cleanly with the file unmodified.
-        let root_addr = usize::try_from(self.superblock.root_group_address)
-            .map_err(|_| Error::EditUnsupported("root group address exceeds this platform"))?;
-        let root = self.inspect_root_group(root_addr)?;
-        let old_region = self.data[root.region_start..root.region_end].to_vec();
+        // --- Plan: build the tree of "dirty" groups (root plus every group on a
+        // path to an addition), validating every target before any write. ---
+        let mut nodes: BTreeMap<PathKey, Node> = BTreeMap::new();
+        nodes.entry(PathKey::new()).or_default(); // root is always dirty
 
-        // Flatten every staged dataset before writing, so a rejected one (e.g.
-        // chunked) does not leave a half-applied commit. Reject a name that
-        // already exists in the group or repeats within this commit, since two
-        // links with the same name would be invalid HDF5.
-        let pending = std::mem::take(&mut self.pending);
-        let mut flat = Vec::with_capacity(pending.len());
-        let mut seen = root.link_names;
-        for db in pending {
-            let fd = flatten_dataset(db)?;
-            if seen.iter().any(|n| n == &fd.name) {
-                return Err(Error::EditUnsupported(
-                    "a link with this name already exists in the root group",
-                ));
+        // Mark explicitly-created new groups, ensuring their ancestor chain.
+        for path in std::mem::take(&mut self.pending_groups) {
+            if path.is_empty() {
+                return Err(Error::EditUnsupported("cannot create the root group"));
             }
-            seen.push(fd.name.clone());
-            flat.push(fd);
+            ensure_ancestors(&mut nodes, &path);
+            nodes.entry(path).or_default().is_new = true;
         }
 
-        // Append each dataset and collect the link messages for the root group.
-        let mut new_links = Vec::new();
-        for fd in flat {
-            let data_addr = self.append(&fd.raw)?;
-            let oh = build_dataset_oh(
-                &fd.dt,
-                &fd.ds,
-                data_addr,
-                fd.raw.len() as u64,
-                &fd.attrs,
-                None,
-            );
-            let oh_addr = self.append(&oh)?;
-            new_links.push(encode_link_message(&fd.name, oh_addr));
+        // Attach datasets to their parent group nodes, ensuring ancestor chains.
+        for (parent, db) in std::mem::take(&mut self.pending_datasets) {
+            ensure_ancestors(&mut nodes, &parent);
+            nodes.entry(parent).or_default().datasets.push(db);
         }
 
-        // Rewrite the root-group object header (old messages verbatim + the new
-        // links) at the end of the file, then repoint the superblock at it.
-        let mut region = old_region;
-        for link in &new_links {
-            region.extend_from_slice(link);
+        // Resolve / validate each node's base object-header region up front.
+        let keys: Vec<PathKey> = nodes.keys().cloned().collect();
+        for key in &keys {
+            let is_new = nodes[key].is_new;
+            if is_new {
+                nodes.get_mut(key).unwrap().base_region = fresh_group_region();
+            } else {
+                let path_str = key.join("/");
+                let addr =
+                    crate::group_v2::resolve_path_any(&self.data, &self.superblock, &path_str)
+                        .map_err(|_| {
+                            Error::EditUnsupported(
+                                "a target group does not exist; create it first in this session",
+                            )
+                        })?;
+                let addr = usize::try_from(addr)
+                    .map_err(|_| Error::EditUnsupported("group address exceeds this platform"))?;
+                let info = self.inspect_group(addr)?;
+                let node = nodes.get_mut(key).unwrap();
+                node.base_region = self.data[info.region_start..info.region_end].to_vec();
+                node.existing_links = info.link_names;
+            }
         }
-        let new_root_oh = build_v2_object_header(&region);
-        let new_root_addr = self.append(&new_root_oh)?;
 
-        self.superblock.root_group_address = new_root_addr;
+        // Map each node to its direct child group nodes (for link wiring).
+        let mut children: BTreeMap<PathKey, Vec<PathKey>> = BTreeMap::new();
+        for key in &keys {
+            if !key.is_empty() {
+                let parent = key[..key.len() - 1].to_vec();
+                children.entry(parent).or_default().push(key.clone());
+            }
+        }
+
+        // Validate names: no addition may collide with an existing link or with
+        // another addition under the same parent.
+        for key in &keys {
+            let node = &nodes[key];
+            let mut adding: Vec<&str> = Vec::new();
+            for db in &node.datasets {
+                adding.push(&db.name);
+            }
+            for child in children.get(key).into_iter().flatten() {
+                if nodes[child].is_new {
+                    adding.push(child.last().unwrap());
+                }
+            }
+            for (i, name) in adding.iter().enumerate() {
+                if node.existing_links.iter().any(|n| n == name) || adding[..i].contains(name) {
+                    return Err(Error::EditUnsupported(
+                        "a link with this name already exists in the target group",
+                    ));
+                }
+            }
+        }
+
+        // Flatten datasets (more guards) before any write, so a rejected one
+        // leaves the commit unapplied.
+        let mut flat: BTreeMap<PathKey, Vec<FlatDataset>> = BTreeMap::new();
+        for key in &keys {
+            let dbs = std::mem::take(&mut nodes.get_mut(key).unwrap().datasets);
+            let mut v = Vec::with_capacity(dbs.len());
+            for db in dbs {
+                v.push(flatten_dataset(db)?);
+            }
+            flat.insert(key.clone(), v);
+        }
+
+        // --- Apply: process deepest groups first so each parent sees its
+        // children's new addresses, then repoint the superblock last. ---
+        let mut new_addr: BTreeMap<PathKey, u64> = BTreeMap::new();
+        let mut by_depth = keys.clone();
+        by_depth.sort_by_key(|k| std::cmp::Reverse(k.len())); // deepest first
+        for key in &by_depth {
+            let mut region = std::mem::take(&mut nodes.get_mut(key).unwrap().base_region);
+
+            // Datasets directly under this group.
+            for fd in flat.remove(key).into_iter().flatten() {
+                let data_addr = self.append(&fd.raw)?;
+                let oh = build_dataset_oh(
+                    &fd.dt,
+                    &fd.ds,
+                    data_addr,
+                    fd.raw.len() as u64,
+                    &fd.attrs,
+                    None,
+                );
+                let oh_addr = self.append(&oh)?;
+                region.extend_from_slice(&encode_link_message(&fd.name, oh_addr));
+            }
+
+            // Wire links to dirty child groups (new → add a link; existing →
+            // patch the existing link to the child's new address).
+            for child in children.get(key).into_iter().flatten() {
+                let child_name = child.last().unwrap();
+                let child_addr = new_addr[child];
+                if nodes[child].is_new {
+                    region.extend_from_slice(&encode_link_message(child_name, child_addr));
+                } else {
+                    patch_link_target(&mut region, child_name, child_addr)?;
+                }
+            }
+
+            let oh = build_v2_object_header(&region);
+            let addr = self.append(&oh)?;
+            new_addr.insert(key.clone(), addr);
+        }
+
+        self.superblock.root_group_address = new_addr[&PathKey::new()];
         self.superblock.eof_address = self.data.len() as u64;
         let sb_bytes = self.superblock.serialize();
         self.write_at(self.sb_sig_off, &sb_bytes)?;
@@ -207,27 +315,20 @@ impl EditSession {
         Ok(())
     }
 
-    /// Parse and validate the root group's object header, returning the byte
-    /// range `[start, end)` of its chunk-0 message region (the bytes to copy
-    /// when rewriting the header) and the names of its existing links (so a
-    /// commit can reject a name collision rather than write a group with
-    /// duplicate links, which is invalid HDF5).
-    fn inspect_root_group(&self, addr: usize) -> Result<RootGroup, Error> {
+    /// Parse and validate a group's object header, returning the byte range
+    /// `[start, end)` of its chunk-0 message region (the bytes to copy when
+    /// rewriting the header) and the names of its existing links.
+    fn inspect_group(&self, addr: usize) -> Result<GroupInfo, Error> {
         let d = &self.data;
-        if d.len() < addr + 6 || &d[addr..addr + 4] != b"OHDR" {
+        if d.len() < addr + 6 || &d[addr..addr + 4] != b"OHDR" || d[addr + 4] != 2 {
             return Err(Error::EditUnsupported(
-                "root group does not use a version 2 object header",
-            ));
-        }
-        if d[addr + 4] != 2 {
-            return Err(Error::EditUnsupported(
-                "root group does not use a version 2 object header",
+                "a target group does not use a version 2 object header",
             ));
         }
         let flags = d[addr + 5];
         if flags & 0x04 != 0 {
             return Err(Error::EditUnsupported(
-                "root group tracks message creation order (not supported in place yet)",
+                "a target group tracks message creation order (not supported in place yet)",
             ));
         }
         let mut pos = addr + 6;
@@ -244,7 +345,7 @@ impl EditSession {
             _ => 8,
         };
         if d.len() < pos + size_width {
-            return Err(Error::EditUnsupported("truncated root group object header"));
+            return Err(Error::EditUnsupported("truncated group object header"));
         }
         let chunk0_size = read_le(&d[pos..pos + size_width]);
         pos += size_width;
@@ -252,11 +353,8 @@ impl EditSession {
         let region_end = region_start
             .checked_add(chunk0_size)
             .filter(|&e| e + 4 <= d.len())
-            .ok_or(Error::EditUnsupported("truncated root group object header"))?;
+            .ok_or(Error::EditUnsupported("truncated group object header"))?;
 
-        // Walk the chunk-0 messages: reject continuation (multi-chunk header)
-        // and dense link storage, confirm this is actually a group, and collect
-        // existing link names.
         let mut p = region_start;
         let mut has_link_info = false;
         let mut link_names = Vec::new();
@@ -266,22 +364,21 @@ impl EditSession {
             let body = p + 4;
             let body_end = body + msg_size;
             if body_end > region_end {
-                return Err(Error::EditUnsupported("malformed root group object header"));
+                return Err(Error::EditUnsupported("malformed group object header"));
             }
             match msg_type {
                 MessageType::ObjectHeaderContinuation => {
                     return Err(Error::EditUnsupported(
-                        "root group object header spans multiple chunks (not supported in place yet)",
+                        "a target group's object header spans multiple chunks (not supported in place yet)",
                     ));
                 }
                 MessageType::LinkInfo => {
                     has_link_info = true;
                     // LinkInfo: version(1) flags(1) [max_creation_index(8) if
-                    // flags&0x01] fractal_heap_addr(8) ... — dense storage has a
-                    // defined fractal-heap address. Read the heap address only if
-                    // it lies within this message's own body (not merely within
-                    // the file), so a short/malformed LinkInfo can't make us read
-                    // bytes belonging to the next message.
+                    // flags&0x01] fractal_heap_addr(8) … — dense storage has a
+                    // defined fractal-heap address. Bound the read by this
+                    // message's own body, not just the region, so a short or
+                    // malformed LinkInfo can't make us read the next message.
                     let mut q = body + 2;
                     if msg_size >= 2 && d[body + 1] & 0x01 != 0 {
                         q += 8;
@@ -290,22 +387,19 @@ impl EditSession {
                         let heap_addr = u64::from_le_bytes(d[q..q + 8].try_into().unwrap());
                         if heap_addr != u64::MAX {
                             return Err(Error::EditUnsupported(
-                                "root group uses dense (fractal-heap) link storage (not supported in place yet)",
+                                "a target group uses dense (fractal-heap) link storage (not supported in place yet)",
                             ));
                         }
                     }
                 }
                 MessageType::Link => {
-                    // Recover the link name to detect collisions with additions.
-                    if let Ok(link) =
-                        crate::link_message::LinkMessage::parse(&d[body..body_end], OFFSET_SIZE)
-                    {
+                    if let Ok(link) = LinkMessage::parse(&d[body..body_end], OFFSET_SIZE) {
                         link_names.push(link.name);
                     }
                 }
                 MessageType::DataLayout => {
                     return Err(Error::EditUnsupported(
-                        "root object is a dataset, not a group",
+                        "a target path names a dataset, not a group",
                     ));
                 }
                 _ => {}
@@ -314,10 +408,10 @@ impl EditSession {
         }
         if !has_link_info {
             return Err(Error::EditUnsupported(
-                "root group object header has no link-info message",
+                "a target group's object header has no link-info message",
             ));
         }
-        Ok(RootGroup {
+        Ok(GroupInfo {
             region_start,
             region_end,
             link_names,
@@ -346,9 +440,18 @@ impl EditSession {
     }
 }
 
-/// The validated root group: the byte range of its chunk-0 message region and
-/// the names of its existing links.
-struct RootGroup {
+/// A dirty group in the edit plan: its base object-header message region and the
+/// additions targeting it.
+#[derive(Default)]
+struct Node {
+    is_new: bool,
+    datasets: Vec<DatasetBuilder>,
+    base_region: Vec<u8>,
+    existing_links: Vec<String>,
+}
+
+/// The validated message region and existing link names of a group header.
+struct GroupInfo {
     region_start: usize,
     region_end: usize,
     link_names: Vec<String>,
@@ -363,8 +466,24 @@ struct FlatDataset {
     attrs: Vec<crate::attribute::AttributeMessage>,
 }
 
+/// Split a path into non-empty components.
+fn split_path(path: &str) -> PathKey {
+    path.split('/')
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// Ensure a node exists for every ancestor prefix of `path` (so each is rebuilt
+/// and can re-wire its child link). Does not set `is_new`.
+fn ensure_ancestors(nodes: &mut BTreeMap<PathKey, Node>, path: &[String]) {
+    for len in 0..=path.len() {
+        nodes.entry(path[..len].to_vec()).or_default();
+    }
+}
+
 /// Validate a staged dataset and reduce it to a [`FlatDataset`], rejecting any
-/// feature this milestone cannot emit as contiguous, unfiltered storage.
+/// feature this engine cannot emit as contiguous, unfiltered storage.
 fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
     if db.chunk_options.is_chunked() || db.maxshape.is_some() {
         return Err(Error::EditUnsupported(
@@ -456,8 +575,25 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
     })
 }
 
+/// The chunk-0 message region of a fresh, empty compact-link group: a single
+/// LinkInfo message advertising no dense storage. Mirrors `build_group_oh`.
+fn fresh_group_region() -> Vec<u8> {
+    let mut li = Vec::with_capacity(18);
+    li.push(0); // version
+    li.push(0); // flags
+    li.extend_from_slice(&u64::MAX.to_le_bytes()); // fractal heap addr = UNDEF
+    li.extend_from_slice(&u64::MAX.to_le_bytes()); // btree name index addr = UNDEF
+    let mut m = Vec::with_capacity(4 + li.len());
+    m.push(MessageType::LinkInfo.to_u16() as u8);
+    m.extend_from_slice(&(li.len() as u16).to_le_bytes());
+    m.push(0); // message flags
+    m.extend_from_slice(&li);
+    m
+}
+
 /// Encode a complete object-header Link message (4-byte record header + body)
-/// for a hard link `name -> addr`.
+/// for a hard link `name -> addr`. The caller must have validated that the body
+/// fits the u16 size field (see [`flatten_dataset`]); group names are short.
 fn encode_link_message(name: &str, addr: u64) -> Vec<u8> {
     let body = make_link(name, addr).serialize(OFFSET_SIZE);
     let mut m = Vec::with_capacity(4 + body.len());
@@ -468,8 +604,45 @@ fn encode_link_message(name: &str, addr: u64) -> Vec<u8> {
     m
 }
 
-/// Wrap a chunk-0 message region in a fresh single-chunk version 2 object
-/// header (`OHDR` prefix + region + Jenkins checksum). Mirrors the encoding in
+/// Patch an existing hard Link message in a chunk-0 message `region`, retargeting
+/// the link named `name` to `new_addr` (used to repoint a parent at a relocated
+/// child group). The target address is the trailing `OFFSET_SIZE` bytes of the
+/// link body for a hard link.
+fn patch_link_target(region: &mut [u8], name: &str, new_addr: u64) -> Result<(), Error> {
+    let mut p = 0;
+    while p + 4 <= region.len() {
+        let msg_type = MessageType::from_u16(region[p] as u16);
+        let msg_size = u16::from_le_bytes([region[p + 1], region[p + 2]]) as usize;
+        let body = p + 4;
+        let body_end = body + msg_size;
+        if body_end > region.len() {
+            break;
+        }
+        if msg_type == MessageType::Link {
+            if let Ok(link) = LinkMessage::parse(&region[body..body_end], OFFSET_SIZE) {
+                if link.name == name {
+                    return match link.link_target {
+                        LinkTarget::Hard { .. } => {
+                            let ofs = body_end - OFFSET_SIZE as usize;
+                            region[ofs..body_end].copy_from_slice(&new_addr.to_le_bytes());
+                            Ok(())
+                        }
+                        _ => Err(Error::EditUnsupported(
+                            "a group on the edited path is reached by a soft/external link",
+                        )),
+                    };
+                }
+            }
+        }
+        p = body_end;
+    }
+    Err(Error::EditUnsupported(
+        "expected child link not found in parent group",
+    ))
+}
+
+/// Wrap a chunk-0 message region in a fresh single-chunk version 2 object header
+/// (`OHDR` prefix + region + Jenkins checksum). Mirrors the encoding in
 /// [`crate::object_header_writer::ObjectHeaderWriter::serialize`].
 fn build_v2_object_header(region: &[u8]) -> Vec<u8> {
     let total = region.len();
