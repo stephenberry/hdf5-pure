@@ -20,7 +20,11 @@
 //! Deletion ([`EditSession::delete`], the HDF5 `H5Ldelete`) is the mirror image:
 //! the parent group's header is rebuilt without the removed link, relocated up
 //! the tree the same way, and the unlinked object (and its subtree) is left as
-//! dead bytes. Object copy (`H5Ocopy`) is a planned follow-on.
+//! dead bytes. Object copy ([`EditSession::copy`], the HDF5 `H5Ocopy`) deep-copies
+//! a source subtree — appending fresh copies of every object, repointing internal
+//! links and the contiguous data address — and links the copy in like an
+//! addition; the headers are reproduced from their verbatim message bytes, so
+//! datatypes, dataspaces, and attributes stay byte-exact.
 //!
 //! # Scope
 //!
@@ -104,6 +108,8 @@ pub struct EditSession {
     pending_groups: Vec<PathKey>,
     /// Links staged for removal by `delete`, as full paths.
     pending_deletes: Vec<PathKey>,
+    /// Object copies staged by `copy`, as (source path, destination full path).
+    pending_copies: Vec<(PathKey, PathKey)>,
 }
 
 impl EditSession {
@@ -148,6 +154,7 @@ impl EditSession {
             pending_datasets: Vec::new(),
             pending_groups: Vec::new(),
             pending_deletes: Vec::new(),
+            pending_copies: Vec::new(),
         })
     }
 
@@ -187,6 +194,22 @@ impl EditSession {
         self.pending_deletes.push(split_path(path));
     }
 
+    /// Stage a deep copy of the object at `src` to a new link at `dst` (the HDF5
+    /// `H5Ocopy`), applied on the next [`commit`](Self::commit). The source — a
+    /// dataset or a whole group subtree — is duplicated: fresh copies of every
+    /// object's data and header are written, internal links and the contiguous
+    /// data address are repointed to the copies, and a link named by `dst`'s last
+    /// component is added to `dst`'s parent group. The original is untouched.
+    ///
+    /// The copy reflects the file's on-disk state at commit time. `src` must
+    /// exist and `dst` must not (and may not lie inside `src`). The source
+    /// subtree must be copyable in place: contiguous/compact datasets only (no
+    /// chunked/compressed storage), compact links and attributes, single-chunk
+    /// headers — otherwise `commit` reports [`Error::EditUnsupported`].
+    pub fn copy(&mut self, src: &str, dst: &str) {
+        self.pending_copies.push((split_path(src), split_path(dst)));
+    }
+
     /// Apply all staged additions and deletions to the file in place and flush.
     ///
     /// Appends each new dataset (data blob + object header) and each new group,
@@ -199,6 +222,7 @@ impl EditSession {
         if self.pending_datasets.is_empty()
             && self.pending_groups.is_empty()
             && self.pending_deletes.is_empty()
+            && self.pending_copies.is_empty()
         {
             return Ok(());
         }
@@ -228,6 +252,38 @@ impl EditSession {
             add_targets.push(full);
             ensure_ancestors(&mut nodes, &parent);
             nodes.entry(parent).or_default().datasets.push(db);
+        }
+
+        // Stage copies: validate the source subtree is copyable (read-only),
+        // then treat the destination like an addition to its parent group.
+        for (src, dst) in std::mem::take(&mut self.pending_copies) {
+            if src.is_empty() {
+                return Err(Error::EditUnsupported("cannot copy the root group"));
+            }
+            if dst.is_empty() {
+                return Err(Error::EditUnsupported("copy destination path is empty"));
+            }
+            if is_prefix(&src, &dst) {
+                return Err(Error::EditUnsupported(
+                    "cannot copy an object into itself or its own subtree",
+                ));
+            }
+            let src_str = src.join("/");
+            let src_addr =
+                crate::group_v2::resolve_path_any(&self.data, &self.superblock, &src_str)
+                    .map_err(|_| Error::EditUnsupported("copy source does not exist"))?;
+            let src_addr = usize::try_from(src_addr)
+                .map_err(|_| Error::EditUnsupported("source address exceeds this platform"))?;
+            self.plan_copy(src_addr)?;
+            add_targets.push(dst.clone());
+            let leaf = dst.last().unwrap().clone();
+            let parent = dst[..dst.len() - 1].to_vec();
+            ensure_ancestors(&mut nodes, &parent);
+            nodes
+                .entry(parent)
+                .or_default()
+                .copies
+                .push((leaf, src_addr as u64));
         }
 
         // Stage deletions: each must exist, must not overlap any other staged
@@ -309,6 +365,9 @@ impl EditSession {
                     adding.push(child.last().unwrap());
                 }
             }
+            for (leaf, _) in &node.copies {
+                adding.push(leaf);
+            }
             for (i, name) in adding.iter().enumerate() {
                 if node.existing_links.iter().any(|n| n == name) || adding[..i].contains(name) {
                     return Err(Error::EditUnsupported(
@@ -336,17 +395,24 @@ impl EditSession {
         let mut by_depth = keys.clone();
         by_depth.sort_by_key(|k| std::cmp::Reverse(k.len())); // deepest first
         for key in &by_depth {
-            let (mut region, deletes) = {
+            let (mut region, deletes, copies) = {
                 let node = nodes.get_mut(key).unwrap();
                 (
                     std::mem::take(&mut node.base_region),
                     std::mem::take(&mut node.deletes),
+                    std::mem::take(&mut node.copies),
                 )
             };
 
             // Remove deleted links first (verbatim-preserving the rest).
             for name in &deletes {
                 region = remove_link_from_region(&region, name)?;
+            }
+
+            // Deep-copy each source subtree and link its root into this group.
+            for (leaf, src_addr) in copies {
+                let root = self.perform_copy(src_addr as usize)?;
+                region.extend_from_slice(&encode_link_message(&leaf, root));
             }
 
             // Datasets directly under this group.
@@ -390,20 +456,21 @@ impl EditSession {
         Ok(())
     }
 
-    /// Parse and validate a group's object header, returning the byte range
-    /// `[start, end)` of its chunk-0 message region (the bytes to copy when
-    /// rewriting the header) and the names of its existing links.
-    fn inspect_group(&self, addr: usize) -> Result<GroupInfo, Error> {
+    /// Parse and validate the prefix of a single-chunk version 2 object header at
+    /// `addr`, returning the `[start, end)` byte range of its message region.
+    /// Rejects headers that are not OHDR v2 or that track message creation order
+    /// (whose 6-byte message records this engine does not emit).
+    fn oh_region(&self, addr: usize) -> Result<(usize, usize), Error> {
         let d = &self.data;
         if d.len() < addr + 6 || &d[addr..addr + 4] != b"OHDR" || d[addr + 4] != 2 {
             return Err(Error::EditUnsupported(
-                "a target group does not use a version 2 object header",
+                "an object does not use a version 2 object header",
             ));
         }
         let flags = d[addr + 5];
         if flags & 0x04 != 0 {
             return Err(Error::EditUnsupported(
-                "a target group tracks message creation order (not supported in place yet)",
+                "an object tracks message creation order (not supported in place yet)",
             ));
         }
         let mut pos = addr + 6;
@@ -420,7 +487,7 @@ impl EditSession {
             _ => 8,
         };
         if d.len() < pos + size_width {
-            return Err(Error::EditUnsupported("truncated group object header"));
+            return Err(Error::EditUnsupported("truncated object header"));
         }
         let chunk0_size = read_le(&d[pos..pos + size_width]);
         pos += size_width;
@@ -428,7 +495,16 @@ impl EditSession {
         let region_end = region_start
             .checked_add(chunk0_size)
             .filter(|&e| e + 4 <= d.len())
-            .ok_or(Error::EditUnsupported("truncated group object header"))?;
+            .ok_or(Error::EditUnsupported("truncated object header"))?;
+        Ok((region_start, region_end))
+    }
+
+    /// Parse and validate a group's object header, returning the byte range
+    /// `[start, end)` of its chunk-0 message region (the bytes to copy when
+    /// rewriting the header) and the names of its existing links.
+    fn inspect_group(&self, addr: usize) -> Result<GroupInfo, Error> {
+        let d = &self.data;
+        let (region_start, region_end) = self.oh_region(addr)?;
 
         let mut p = region_start;
         let mut has_link_info = false;
@@ -493,6 +569,182 @@ impl EditSession {
         })
     }
 
+    /// Parse the object header at `addr` into a copyable model, validating that
+    /// every message can be reproduced faithfully (verbatim message bytes, with
+    /// only the contiguous data address and child link targets repointed).
+    /// Rejects multi-chunk headers, dense attribute storage, dense or
+    /// soft/external links, chunked/old-version data layouts, and headers that
+    /// are neither a dataset nor a group.
+    fn read_object(&self, addr: usize) -> Result<ObjModel, Error> {
+        let (rs, re) = self.oh_region(addr)?;
+        let d = &self.data;
+
+        let mut layout: Option<(usize, usize)> = None; // (body offset, size)
+        let mut has_link_info = false;
+        let mut children: Vec<(String, u64)> = Vec::new();
+        let mut non_link: Vec<u8> = Vec::new();
+
+        let mut p = rs;
+        while p + 4 <= re {
+            let msg_type = MessageType::from_u16(d[p] as u16);
+            let msg_size = u16::from_le_bytes([d[p + 1], d[p + 2]]) as usize;
+            let body = p + 4;
+            let body_end = body + msg_size;
+            if body_end > re {
+                return Err(Error::EditUnsupported("malformed object header"));
+            }
+            match msg_type {
+                MessageType::ObjectHeaderContinuation => {
+                    return Err(Error::EditUnsupported(
+                        "an object's header spans multiple chunks (not supported in place yet)",
+                    ));
+                }
+                MessageType::AttributeInfo => {
+                    return Err(Error::EditUnsupported(
+                        "an object uses dense (fractal-heap) attribute storage (not supported in place yet)",
+                    ));
+                }
+                MessageType::LinkInfo => {
+                    has_link_info = true;
+                    let mut q = body + 2;
+                    if msg_size >= 2 && d[body + 1] & 0x01 != 0 {
+                        q += 8;
+                    }
+                    if q + 8 <= body_end {
+                        let heap_addr = u64::from_le_bytes(d[q..q + 8].try_into().unwrap());
+                        if heap_addr != u64::MAX {
+                            return Err(Error::EditUnsupported(
+                                "a group uses dense (fractal-heap) link storage (not supported in place yet)",
+                            ));
+                        }
+                    }
+                }
+                MessageType::Link => match LinkMessage::parse(&d[body..body_end], OFFSET_SIZE) {
+                    Ok(LinkMessage {
+                        name,
+                        link_target:
+                            LinkTarget::Hard {
+                                object_header_address,
+                            },
+                        ..
+                    }) => children.push((name, object_header_address)),
+                    _ => {
+                        return Err(Error::EditUnsupported(
+                            "a group contains a soft/external link (not copyable in place yet)",
+                        ));
+                    }
+                },
+                MessageType::DataLayout => layout = Some((body, msg_size)),
+                _ => {}
+            }
+            if msg_type != MessageType::Link {
+                non_link.extend_from_slice(&d[p..body_end]);
+            }
+            p = body_end;
+        }
+
+        if let Some((lbody, lsize)) = layout {
+            let version = d[lbody];
+            if !(version == 3 || version == 4) || lsize < 2 {
+                return Err(Error::EditUnsupported(
+                    "an unsupported data-layout version cannot be copied in place yet",
+                ));
+            }
+            match d[lbody + 1] {
+                0 => Ok(ObjModel::DatasetVerbatim {
+                    region: d[rs..re].to_vec(),
+                }),
+                1 => {
+                    if lbody + 18 > re {
+                        return Err(Error::EditUnsupported("malformed contiguous data layout"));
+                    }
+                    let data_addr =
+                        u64::from_le_bytes(d[lbody + 2..lbody + 10].try_into().unwrap());
+                    let data_size =
+                        u64::from_le_bytes(d[lbody + 10..lbody + 18].try_into().unwrap());
+                    Ok(ObjModel::DatasetContiguous {
+                        region: d[rs..re].to_vec(),
+                        addr_off: (lbody + 2) - rs,
+                        data_addr,
+                        data_size,
+                    })
+                }
+                _ => Err(Error::EditUnsupported(
+                    "chunked datasets cannot be copied in place yet",
+                )),
+            }
+        } else if has_link_info {
+            Ok(ObjModel::Group {
+                non_link_region: non_link,
+                children,
+            })
+        } else {
+            Err(Error::EditUnsupported(
+                "an object is neither a contiguous/compact dataset nor a group",
+            ))
+        }
+    }
+
+    /// Recursively validate that the object at `addr` (and, for a group, its
+    /// whole subtree) can be copied, without writing anything.
+    fn plan_copy(&self, addr: usize) -> Result<(), Error> {
+        if let ObjModel::Group { children, .. } = self.read_object(addr)? {
+            for (_, child) in children {
+                let child = usize::try_from(child)
+                    .map_err(|_| Error::EditUnsupported("child address exceeds this platform"))?;
+                self.plan_copy(child)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Recursively deep-copy the object at `addr`, appending fresh copies of
+    /// every object (data blobs and headers) at end-of-file and returning the new
+    /// object-header address of the copied root.
+    fn perform_copy(&mut self, addr: usize) -> Result<u64, Error> {
+        match self.read_object(addr)? {
+            ObjModel::DatasetVerbatim { region } => {
+                let oh = build_v2_object_header(&region);
+                self.append(&oh)
+            }
+            ObjModel::DatasetContiguous {
+                mut region,
+                addr_off,
+                data_addr,
+                data_size,
+            } => {
+                let start = usize::try_from(data_addr)
+                    .map_err(|_| Error::EditUnsupported("data address exceeds this platform"))?;
+                let len = usize::try_from(data_size)
+                    .map_err(|_| Error::EditUnsupported("data size exceeds this platform"))?;
+                let end = start
+                    .checked_add(len)
+                    .filter(|&e| e <= self.data.len())
+                    .ok_or(Error::EditUnsupported("dataset data is out of bounds"))?;
+                let data = self.data[start..end].to_vec();
+                let new_data_addr = self.append(&data)?;
+                region[addr_off..addr_off + 8].copy_from_slice(&new_data_addr.to_le_bytes());
+                let oh = build_v2_object_header(&region);
+                self.append(&oh)
+            }
+            ObjModel::Group {
+                non_link_region,
+                children,
+            } => {
+                let mut region = non_link_region;
+                for (name, child) in children {
+                    let child = usize::try_from(child).map_err(|_| {
+                        Error::EditUnsupported("child address exceeds this platform")
+                    })?;
+                    let new_child = self.perform_copy(child)?;
+                    region.extend_from_slice(&encode_link_message(&name, new_child));
+                }
+                let oh = build_v2_object_header(&region);
+                self.append(&oh)
+            }
+        }
+    }
+
     /// Append `bytes` at end-of-file, updating both the mirror and the file.
     /// Returns the absolute address the bytes were written at.
     fn append(&mut self, bytes: &[u8]) -> Result<u64, Error> {
@@ -523,8 +775,32 @@ struct Node {
     datasets: Vec<DatasetBuilder>,
     /// Names of links to remove from this group (from `delete`).
     deletes: Vec<String>,
+    /// Copies to add to this group: (new link name, source object-header addr).
+    copies: Vec<(String, u64)>,
     base_region: Vec<u8>,
     existing_links: Vec<String>,
+}
+
+/// A source object parsed for copying. Headers are reproduced from their
+/// verbatim message bytes; only the contiguous data address and child link
+/// targets are repointed to the freshly-written copies.
+enum ObjModel {
+    /// A compact dataset (data inline in the header): copy the region verbatim.
+    DatasetVerbatim { region: Vec<u8> },
+    /// A contiguous dataset: copy the region, repointing the data address at
+    /// `addr_off` (region-relative) to a fresh copy of `[data_addr, +data_size)`.
+    DatasetContiguous {
+        region: Vec<u8>,
+        addr_off: usize,
+        data_addr: u64,
+        data_size: u64,
+    },
+    /// A group: every non-link message verbatim, plus its hard-link children to
+    /// copy and re-link by name.
+    Group {
+        non_link_region: Vec<u8>,
+        children: Vec<(String, u64)>,
+    },
 }
 
 /// The validated message region and existing link names of a group header.

@@ -1,4 +1,5 @@
-//! Tests for in-place editing via `EditSession` (issue #32, Group C milestone 1).
+//! Tests for in-place editing via `EditSession` (issue #32, Group C):
+//! add, delete, and copy datasets and groups at any path.
 
 use hdf5_pure::{DType, EditSession, File, FileBuilder};
 
@@ -418,6 +419,139 @@ fn delete_missing_or_overlapping_is_rejected() {
         assert!(err.to_string().contains("overlaps"), "got: {err}");
     }
     assert_eq!(std::fs::read(&path).unwrap(), mid);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn copy_dataset_to_new_name() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_copy_ds.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("src").with_f64_data(&[1.5, 2.5, 3.5]);
+    b.write(&path).unwrap();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.copy("src", "dup");
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    // Original and copy both present and identical.
+    assert_eq!(
+        file.dataset("src").unwrap().read_f64().unwrap(),
+        vec![1.5, 2.5, 3.5]
+    );
+    assert_eq!(
+        file.dataset("dup").unwrap().read_f64().unwrap(),
+        vec![1.5, 2.5, 3.5]
+    );
+    assert_eq!(file.dataset("dup").unwrap().dtype().unwrap(), DType::F64);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn copy_group_subtree() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_copy_grp.h5");
+    write_starter(&path);
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.create_group("template");
+        session.create_group("template/inner");
+        session.create_dataset("template/a").with_i32_data(&[1, 2]);
+        session
+            .create_dataset("template/inner/b")
+            .with_f64_data(&[9.0]);
+        session.commit().unwrap();
+    }
+
+    // Copy the whole subtree under a new name.
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.copy("template", "run1");
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    // Deep structure duplicated.
+    assert_eq!(
+        file.dataset("run1/a").unwrap().read_i32().unwrap(),
+        vec![1, 2]
+    );
+    assert_eq!(
+        file.dataset("run1/inner/b").unwrap().read_f64().unwrap(),
+        vec![9.0]
+    );
+    assert_eq!(
+        file.group("run1").unwrap().groups().unwrap(),
+        vec!["inner".to_string()]
+    );
+    // Original subtree untouched.
+    assert_eq!(
+        file.dataset("template/a").unwrap().read_i32().unwrap(),
+        vec![1, 2]
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn copy_into_subgroup() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_copy_into.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("payload").with_i32_data(&[7, 8, 9]);
+    b.write(&path).unwrap();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.create_group("dest");
+        session.copy("payload", "dest/payload_copy");
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("dest/payload_copy")
+            .unwrap()
+            .read_i32()
+            .unwrap(),
+        vec![7, 8, 9]
+    );
+    assert_eq!(
+        file.dataset("payload").unwrap().read_i32().unwrap(),
+        vec![7, 8, 9]
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn copy_rejects_missing_source_and_cycle() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_copy_reject.h5");
+    write_starter(&path);
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.create_group("g");
+        session.commit().unwrap();
+    }
+    let before = std::fs::read(&path).unwrap();
+
+    // Missing source.
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.copy("ghost", "x");
+        let err = session.commit().unwrap_err();
+        assert!(
+            err.to_string().contains("source does not exist"),
+            "got: {err}"
+        );
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+
+    // Copy a group into its own subtree.
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.copy("g", "g/inside");
+        let err = session.commit().unwrap_err();
+        assert!(err.to_string().contains("itself"), "got: {err}");
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before);
     std::fs::remove_file(&path).ok();
 }
 
