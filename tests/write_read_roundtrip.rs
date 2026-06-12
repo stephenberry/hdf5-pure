@@ -344,6 +344,39 @@ fn explicit_compound_builder_rejects_invalid_layouts() {
 }
 
 #[test]
+fn nested_compound_type_mismatch_shows_hierarchical_path() {
+    let inner_mismatched = CompoundTypeBuilder::with_size(16)
+        .i8_field("0", 0)
+        .f64_field("1", 8) // mismatch: expected u64, got f64
+        .build()
+        .unwrap();
+
+    let outer = CompoundTypeBuilder::with_size(24)
+        .field("0", 0, inner_mismatched)
+        .f32_field("1", 16)
+        .build()
+        .unwrap();
+
+    let raw = vec![0u8; 24];
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("nested_mismatched")
+        .with_compound_data(outer, raw, 1);
+    let bytes = builder.finish().unwrap();
+
+    let file = File::from_bytes(bytes).unwrap();
+    let ds = file.dataset("nested_mismatched").unwrap();
+
+    let err = ds.read_compound::<((i8, u64), f32)>().unwrap_err();
+    match err {
+        hdf5_pure::Error::Format(FormatError::CompoundFieldTypeMismatch(ref path)) => {
+            assert_eq!(path, "0.1");
+        }
+        other => panic!("expected CompoundFieldTypeMismatch(\"0.1\"), got {:?}", other),
+    }
+}
+
+#[test]
 fn roundtrip_userblock_512() {
     let mut builder = FileBuilder::new();
     builder.with_userblock(512);

@@ -1,7 +1,7 @@
 //! Safe field-wise encoding and decoding for HDF5 compound datatypes.
 
 #[cfg(not(feature = "std"))]
-use alloc::{string::ToString, vec::Vec};
+use alloc::{format, string::ToString, vec::Vec};
 
 use crate::convert::{TryToUsize, u32_from};
 use crate::datatype::{CompoundMember, Datatype, DatatypeByteOrder};
@@ -236,8 +236,13 @@ fn decode_named<T: CompoundField>(
                 compound_size: reported_compound_size(bytes),
             })?;
     T::decode_field(&member.datatype, field_bytes).map_err(|error| match error {
-        FormatError::CompoundFieldTypeMismatch(_) => {
-            FormatError::CompoundFieldTypeMismatch(name.to_string())
+        FormatError::CompoundFieldTypeMismatch(inner) => {
+            let path = if inner.is_empty() {
+                name.to_string()
+            } else {
+                format!("{}.{}", name, inner)
+            };
+            FormatError::CompoundFieldTypeMismatch(path)
         }
         other => other,
     })
