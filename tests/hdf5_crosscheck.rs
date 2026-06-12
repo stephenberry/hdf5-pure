@@ -7,7 +7,7 @@
 //! These tests verify that files produced by hdf5-pure are valid HDF5 files
 //! readable by the reference C implementation.
 
-use hdf5_pure::{AttrValue, CompoundTypeBuilder, FileBuilder, make_f64_type};
+use hdf5_pure::{AttrValue, CompoundTypeBuilder, Datatype, File, FileBuilder, make_f64_type};
 use tempfile::tempdir;
 
 /// Read a MATLAB-style variable-length ASCII attribute from an `hdf5::Attribute`.
@@ -719,6 +719,125 @@ fn crosscheck_compound_f64_pairs() {
     let file = hdf5::File::open(&path).unwrap();
     let ds = file.dataset("complex").unwrap();
     assert_eq!(ds.shape(), vec![3]);
+}
+
+#[repr(C)]
+#[derive(hdf5::H5Type, Clone, Copy, Debug, PartialEq)]
+struct PaddedTuple(
+    #[hdf5(rename = "0")] i8,
+    #[hdf5(rename = "1")] u64,
+    #[hdf5(rename = "2")] f32,
+);
+
+#[test]
+fn c_library_reads_explicit_offset_compound() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("padded_compound.h5");
+
+    let datatype = CompoundTypeBuilder::with_size(24)
+        .i8_field("0", 0)
+        .u64_field("1", 8)
+        .f32_field("2", 16)
+        .build()
+        .unwrap();
+    let expected = [PaddedTuple(-4, 17, 2.5), PaddedTuple(8, u64::MAX, -1.25)];
+    let mut raw = vec![0u8; expected.len() * 24];
+    for (index, value) in expected.iter().enumerate() {
+        let record = &mut raw[index * 24..(index + 1) * 24];
+        record[0] = value.0 as u8;
+        record[8..16].copy_from_slice(&value.1.to_le_bytes());
+        record[16..20].copy_from_slice(&value.2.to_le_bytes());
+    }
+
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("padded")
+        .with_compound_data(datatype, raw, expected.len() as u64);
+    builder.write(&path).unwrap();
+
+    let file = hdf5::File::open(&path).unwrap();
+    let actual: Vec<PaddedTuple> = file.dataset("padded").unwrap().read_raw().unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn pure_reader_decodes_c_written_padded_compound() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_padded_compound.h5");
+    let expected = [PaddedTuple(-9, 23, 4.5), PaddedTuple(3, 77, -6.25)];
+
+    let file = hdf5::File::create(&path).unwrap();
+    file.new_dataset_builder()
+        .with_data(&expected)
+        .create("padded")
+        .unwrap();
+    drop(file);
+
+    let file = File::open(&path).unwrap();
+    let ds = file.dataset("padded").unwrap();
+    assert_eq!(
+        ds.read_compound::<(i8, u64, f32)>().unwrap(),
+        expected.map(|value| (value.0, value.1, value.2))
+    );
+    match ds.datatype().unwrap() {
+        Datatype::Compound { size, members } => {
+            assert_eq!(size as usize, core::mem::size_of::<PaddedTuple>());
+            assert_eq!(
+                members
+                    .iter()
+                    .map(|member| (member.name.as_str(), member.byte_offset))
+                    .collect::<Vec<_>>(),
+                vec![("0", 0), ("1", 8), ("2", 16)]
+            );
+        }
+        other => panic!("expected compound, got {other:?}"),
+    }
+}
+
+#[repr(C)]
+#[derive(hdf5::H5Type, Clone, Copy, Debug, PartialEq)]
+struct NestedInner(#[hdf5(rename = "0")] i8, #[hdf5(rename = "1")] u64);
+
+#[repr(C)]
+#[derive(hdf5::H5Type, Clone, Copy, Debug, PartialEq)]
+struct NestedOuter(#[hdf5(rename = "0")] NestedInner, #[hdf5(rename = "1")] f32);
+
+#[test]
+fn c_library_reads_nested_explicit_compound() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("nested_compound.h5");
+
+    let inner = CompoundTypeBuilder::with_size(16)
+        .i8_field("0", 0)
+        .u64_field("1", 8)
+        .build()
+        .unwrap();
+    let outer = CompoundTypeBuilder::with_size(24)
+        .field("0", 0, inner)
+        .f32_field("1", 16)
+        .build()
+        .unwrap();
+    let expected = [
+        NestedOuter(NestedInner(-1, 100), 2.0),
+        NestedOuter(NestedInner(6, 200), -3.0),
+    ];
+    let mut raw = vec![0u8; expected.len() * 24];
+    for (index, value) in expected.iter().enumerate() {
+        let record = &mut raw[index * 24..(index + 1) * 24];
+        record[0] = value.0.0 as u8;
+        record[8..16].copy_from_slice(&value.0.1.to_le_bytes());
+        record[16..20].copy_from_slice(&value.1.to_le_bytes());
+    }
+
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("nested")
+        .with_compound_data(outer, raw, expected.len() as u64);
+    builder.write(&path).unwrap();
+
+    let file = hdf5::File::open(&path).unwrap();
+    let actual: Vec<NestedOuter> = file.dataset("nested").unwrap().read_raw().unwrap();
+    assert_eq!(actual, expected);
 }
 
 // ---------------------------------------------------------------------------

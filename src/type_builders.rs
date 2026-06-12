@@ -7,6 +7,7 @@ use alloc::{boxed::Box, string::String, string::ToString, vec, vec::Vec};
 
 use crate::attribute::AttributeMessage;
 use crate::chunked_write::ChunkOptions;
+use crate::compound::CompoundType;
 use crate::dataspace::{Dataspace, DataspaceType};
 use crate::datatype::{
     CharacterSet, CompoundMember, Datatype, DatatypeByteOrder, EnumMember, StringPadding,
@@ -212,6 +213,135 @@ impl CompoundTypeBuilder {
 impl Default for CompoundTypeBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Builder for an HDF5 compound datatype with explicit field offsets and size.
+///
+/// This is the pure-Rust equivalent of creating an `H5T_COMPOUND` type and
+/// inserting fields with `H5Tinsert`. [`build`](Self::build) validates field
+/// names, bounds, and overlap before returning a datatype.
+pub struct ExplicitCompoundTypeBuilder {
+    size: u32,
+    fields: Vec<CompoundMember>,
+}
+
+impl ExplicitCompoundTypeBuilder {
+    /// Add a field at an explicit byte offset.
+    pub fn field(mut self, name: &str, byte_offset: u64, datatype: Datatype) -> Self {
+        self.fields.push(CompoundMember {
+            name: name.to_string(),
+            byte_offset,
+            datatype,
+        });
+        self
+    }
+
+    /// Add an f64 field at an explicit byte offset.
+    pub fn f64_field(self, name: &str, byte_offset: u64) -> Self {
+        self.field(name, byte_offset, make_f64_type())
+    }
+
+    /// Add an f32 field at an explicit byte offset.
+    pub fn f32_field(self, name: &str, byte_offset: u64) -> Self {
+        self.field(name, byte_offset, make_f32_type())
+    }
+
+    /// Add an i32 field at an explicit byte offset.
+    pub fn i32_field(self, name: &str, byte_offset: u64) -> Self {
+        self.field(name, byte_offset, make_i32_type())
+    }
+
+    /// Add an i64 field at an explicit byte offset.
+    pub fn i64_field(self, name: &str, byte_offset: u64) -> Self {
+        self.field(name, byte_offset, make_i64_type())
+    }
+
+    /// Add a u8 field at an explicit byte offset.
+    pub fn u8_field(self, name: &str, byte_offset: u64) -> Self {
+        self.field(name, byte_offset, make_u8_type())
+    }
+
+    /// Add an i8 field at an explicit byte offset.
+    pub fn i8_field(self, name: &str, byte_offset: u64) -> Self {
+        self.field(name, byte_offset, make_i8_type())
+    }
+
+    /// Add an i16 field at an explicit byte offset.
+    pub fn i16_field(self, name: &str, byte_offset: u64) -> Self {
+        self.field(name, byte_offset, make_i16_type())
+    }
+
+    /// Add a u16 field at an explicit byte offset.
+    pub fn u16_field(self, name: &str, byte_offset: u64) -> Self {
+        self.field(name, byte_offset, make_u16_type())
+    }
+
+    /// Add a u32 field at an explicit byte offset.
+    pub fn u32_field(self, name: &str, byte_offset: u64) -> Self {
+        self.field(name, byte_offset, make_u32_type())
+    }
+
+    /// Add a u64 field at an explicit byte offset.
+    pub fn u64_field(self, name: &str, byte_offset: u64) -> Self {
+        self.field(name, byte_offset, make_u64_type())
+    }
+
+    /// Validate and build the compound datatype.
+    pub fn build(mut self) -> Result<Datatype, crate::error::FormatError> {
+        use crate::error::FormatError;
+
+        if self.size == 0 {
+            return Err(FormatError::InvalidCompoundSize);
+        }
+        if self.fields.is_empty() {
+            return Err(FormatError::EmptyCompoundType);
+        }
+
+        for (index, field) in self.fields.iter().enumerate() {
+            if self.fields[..index]
+                .iter()
+                .any(|earlier| earlier.name == field.name)
+            {
+                return Err(FormatError::DuplicateCompoundField(field.name.clone()));
+            }
+            let field_size = field.datatype.type_size();
+            let end = field.byte_offset.checked_add(u64::from(field_size));
+            if field_size == 0 || end.is_none_or(|end| end > u64::from(self.size)) {
+                return Err(FormatError::CompoundFieldOutOfBounds {
+                    name: field.name.clone(),
+                    offset: field.byte_offset,
+                    field_size,
+                    compound_size: self.size,
+                });
+            }
+        }
+
+        self.fields.sort_by_key(|field| field.byte_offset);
+        for fields in self.fields.windows(2) {
+            let first_end = fields[0].byte_offset + u64::from(fields[0].datatype.type_size());
+            if first_end > fields[1].byte_offset {
+                return Err(FormatError::CompoundFieldOverlap {
+                    first: fields[0].name.clone(),
+                    second: fields[1].name.clone(),
+                });
+            }
+        }
+
+        Ok(Datatype::Compound {
+            size: self.size,
+            members: self.fields,
+        })
+    }
+}
+
+impl CompoundTypeBuilder {
+    /// Create a compound builder with an explicit total size and field offsets.
+    pub fn with_size(size: u32) -> ExplicitCompoundTypeBuilder {
+        ExplicitCompoundTypeBuilder {
+            size,
+            fields: Vec::new(),
+        }
     }
 }
 
@@ -774,6 +904,40 @@ impl DatasetBuilder {
             self.shape = Some(vec![num_elements]);
         }
         self
+    }
+
+    /// Safely encode a slice of compound values field by field.
+    ///
+    /// Built-in implementations support numeric tuples with one through twelve
+    /// fields. No Rust struct or tuple padding is copied into the file.
+    pub fn with_compound_values<T: CompoundType>(
+        &mut self,
+        values: &[T],
+    ) -> Result<&mut Self, crate::error::FormatError> {
+        let datatype = T::datatype();
+        if !matches!(datatype, Datatype::Compound { .. }) {
+            return Err(crate::error::FormatError::TypeMismatch {
+                expected: "Compound",
+                actual: "non-Compound",
+            });
+        }
+        let element_size = datatype.type_size() as usize;
+        if element_size == 0 {
+            return Err(crate::error::FormatError::InvalidCompoundSize);
+        }
+        let mut raw = Vec::with_capacity(values.len().saturating_mul(element_size));
+        for value in values {
+            let start = raw.len();
+            value.encode(&mut raw);
+            let actual = raw.len() - start;
+            if actual != element_size {
+                return Err(crate::error::FormatError::DataSizeMismatch {
+                    expected: element_size,
+                    actual,
+                });
+            }
+        }
+        Ok(self.with_compound_data(datatype, raw, values.len() as u64))
     }
 
     /// Write an enum dataset with i32 values.
