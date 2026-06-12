@@ -688,7 +688,7 @@ impl<'f> Dataset<'f> {
     /// memory layout, so padded compound records are supported safely.
     pub fn read_compound<T: CompoundType>(&self) -> Result<Vec<T>, Error> {
         let datatype = self.datatype()?;
-        let element_size = datatype.type_size() as usize;
+        let element_size = datatype.type_size().to_usize()?;
         if !matches!(datatype, Datatype::Compound { .. }) {
             return Err(FormatError::TypeMismatch {
                 expected: "Compound",

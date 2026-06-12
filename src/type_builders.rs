@@ -8,6 +8,7 @@ use alloc::{boxed::Box, string::String, string::ToString, vec, vec::Vec};
 use crate::attribute::AttributeMessage;
 use crate::chunked_write::ChunkOptions;
 use crate::compound::CompoundType;
+use crate::convert::TryToUsize;
 use crate::dataspace::{Dataspace, DataspaceType};
 use crate::datatype::{
     CharacterSet, CompoundMember, Datatype, DatatypeByteOrder, EnumMember, StringPadding,
@@ -914,14 +915,14 @@ impl DatasetBuilder {
         &mut self,
         values: &[T],
     ) -> Result<&mut Self, crate::error::FormatError> {
-        let datatype = T::datatype();
+        let datatype = T::datatype()?;
         if !matches!(datatype, Datatype::Compound { .. }) {
             return Err(crate::error::FormatError::TypeMismatch {
                 expected: "Compound",
                 actual: "non-Compound",
             });
         }
-        let element_size = datatype.type_size() as usize;
+        let element_size = datatype.type_size().to_usize()?;
         if element_size == 0 {
             return Err(crate::error::FormatError::InvalidCompoundSize);
         }
