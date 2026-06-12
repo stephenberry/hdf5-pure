@@ -154,6 +154,20 @@ pub enum FormatError {
     },
     /// Variable-length data error.
     VlDataError(String),
+    /// A variable-length read exceeded its configured element limit.
+    VariableLengthElementLimitExceeded {
+        /// Maximum number of elements permitted by the caller.
+        limit: usize,
+        /// Number of elements present in the selected data.
+        actual: u64,
+    },
+    /// A variable-length read exceeded its configured payload-byte limit.
+    VariableLengthByteLimitExceeded {
+        /// Maximum number of payload bytes permitted by the caller.
+        limit: usize,
+        /// Number of payload bytes required by the selected data.
+        required: u64,
+    },
     /// Serialization error.
     SerializationError(String),
     /// Dataset is missing data.
@@ -425,6 +439,19 @@ impl fmt::Display for FormatError {
             }
             FormatError::VlDataError(msg) => {
                 write!(f, "variable-length data error: {msg}")
+            }
+            FormatError::VariableLengthElementLimitExceeded { limit, actual } => {
+                write!(
+                    f,
+                    "variable-length element limit exceeded: limit is {limit}, data contains {actual}"
+                )
+            }
+            FormatError::VariableLengthByteLimitExceeded { limit, required } => {
+                write!(
+                    f,
+                    "variable-length payload limit exceeded: limit is {limit} bytes, \
+                     data requires {required} bytes"
+                )
             }
             FormatError::SerializationError(msg) => {
                 write!(f, "serialization error: {msg}")

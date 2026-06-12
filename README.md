@@ -213,6 +213,30 @@ assert_eq!(records, values);
 
 Use `CompoundTypeBuilder::with_size` for an `H5Tinsert`-style layout with explicit offsets and padding. `Dataset::datatype` exposes the exact field offsets from existing files, while `Dataset::read_raw` returns their complete unfiltered record bytes.
 
+### Variable-length string reads
+
+`Dataset::read_string` reads both fixed-length and variable-length HDF5 string datasets. VL reads can be bounded before payload allocation, or consumed one string at a time:
+
+```rust
+use hdf5_pure::{File, VlenStringReadOptions};
+
+let file = File::open_streaming("strings.h5").unwrap();
+let dataset = file.dataset("names").unwrap();
+
+let payload_bytes = dataset.vlen_string_payload_size().unwrap();
+let options = VlenStringReadOptions::new()
+    .with_max_elements(100_000)
+    .with_max_payload_bytes(64 * 1024 * 1024);
+
+dataset.visit_vlen_strings(options, |value| {
+    println!("{value}");
+}).unwrap();
+
+println!("{payload_bytes} bytes of string payload");
+```
+
+The payload limit covers bytes referenced by VL elements and excludes Rust container metadata. Shared global heap collections are indexed once per read, and only the referenced object payloads are fetched. This works with both `File::open` and `File::open_streaming`.
+
 ### Attributes
 
 | Variant | HDF5 encoding |

@@ -187,6 +187,9 @@ pub use error::FormatError;
 #[cfg(feature = "std")]
 pub use reader::{Dataset, File, Group, is_hdf5, is_hdf5_bytes};
 
+#[cfg(feature = "std")]
+pub use vl_data::VlenStringReadOptions;
+
 pub use libver::LibVer;
 
 #[cfg(all(feature = "std", feature = "provenance"))]
