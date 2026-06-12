@@ -372,7 +372,10 @@ fn nested_compound_type_mismatch_shows_hierarchical_path() {
         hdf5_pure::Error::Format(FormatError::CompoundFieldTypeMismatch(ref path)) => {
             assert_eq!(path, "0.1");
         }
-        other => panic!("expected CompoundFieldTypeMismatch(\"0.1\"), got {:?}", other),
+        other => panic!(
+            "expected CompoundFieldTypeMismatch(\"0.1\"), got {:?}",
+            other
+        ),
     }
 }
 
