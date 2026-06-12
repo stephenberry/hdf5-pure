@@ -8,8 +8,53 @@
 use alloc::{format, string::String, vec::Vec};
 
 use crate::convert::TryToUsize;
+use crate::datatype::{CharacterSet, Datatype};
 use crate::error::FormatError;
-use crate::global_heap::GlobalHeapCollection;
+use crate::global_heap::GlobalHeapIndex;
+use crate::source::{BytesSource, FileSource};
+
+/// Allocation limits for reading variable-length strings.
+///
+/// Limits are checked before any string payload is materialized. The payload
+/// byte limit covers the bytes referenced by the VL elements; it excludes the
+/// `Vec<String>` and `String` allocation metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VlenStringReadOptions {
+    max_elements: Option<usize>,
+    max_payload_bytes: Option<usize>,
+}
+
+impl VlenStringReadOptions {
+    /// Create options with no limits.
+    pub const fn new() -> Self {
+        Self {
+            max_elements: None,
+            max_payload_bytes: None,
+        }
+    }
+
+    /// Set the maximum number of VL elements that may be read.
+    pub const fn with_max_elements(mut self, max_elements: usize) -> Self {
+        self.max_elements = Some(max_elements);
+        self
+    }
+
+    /// Set the maximum total string payload size in bytes.
+    pub const fn with_max_payload_bytes(mut self, max_payload_bytes: usize) -> Self {
+        self.max_payload_bytes = Some(max_payload_bytes);
+        self
+    }
+
+    /// Return the configured element limit.
+    pub const fn max_elements(&self) -> Option<usize> {
+        self.max_elements
+    }
+
+    /// Return the configured payload-byte limit.
+    pub const fn max_payload_bytes(&self) -> Option<usize> {
+        self.max_payload_bytes
+    }
+}
 
 /// A parsed variable-length element reference (global heap ID).
 #[derive(Debug, Clone)]
@@ -110,6 +155,178 @@ fn is_undefined_address(addr: u64, offset_size: u8) -> bool {
     }
 }
 
+/// Whether a datatype is one of the string-shaped VL encodings understood by
+/// this module.
+pub(crate) fn is_vlen_string_datatype(datatype: &Datatype) -> bool {
+    match datatype {
+        Datatype::VariableLength {
+            is_string: true, ..
+        } => true,
+        Datatype::VariableLength {
+            is_string: false,
+            base_type,
+            ..
+        } => matches!(
+            base_type.as_ref(),
+            Datatype::String {
+                size: 1,
+                charset: CharacterSet::Ascii,
+                ..
+            }
+        ),
+        _ => false,
+    }
+}
+
+fn check_element_limit(
+    num_elements: u64,
+    options: VlenStringReadOptions,
+) -> Result<(), FormatError> {
+    if let Some(limit) = options.max_elements
+        && num_elements > limit as u64
+    {
+        return Err(FormatError::VariableLengthElementLimitExceeded {
+            limit,
+            actual: num_elements,
+        });
+    }
+    Ok(())
+}
+
+fn payload_size(refs: &[VlElement], options: VlenStringReadOptions) -> Result<u64, FormatError> {
+    let mut required = 0u64;
+    for element in refs {
+        required =
+            required
+                .checked_add(u64::from(element.length))
+                .ok_or(FormatError::OffsetOverflow {
+                    offset: required,
+                    length: u64::from(element.length),
+                })?;
+    }
+    if let Some(limit) = options.max_payload_bytes
+        && required > limit as u64
+    {
+        return Err(FormatError::VariableLengthByteLimitExceeded { limit, required });
+    }
+    Ok(required)
+}
+
+/// Return the total payload bytes named by a set of VL references.
+pub fn vlen_string_payload_size(
+    raw_data: &[u8],
+    num_elements: u64,
+    offset_size: u8,
+) -> Result<u64, FormatError> {
+    check_element_limit(num_elements, VlenStringReadOptions::default())?;
+    let refs = parse_vl_references(raw_data, num_elements, offset_size)?;
+    payload_size(&refs, VlenStringReadOptions::default())
+}
+
+/// Resolve VL strings from a random-access file source and pass them to a
+/// visitor one at a time.
+pub fn visit_vl_strings_from_source<S, F>(
+    source: &S,
+    raw_data: &[u8],
+    num_elements: u64,
+    offset_size: u8,
+    length_size: u8,
+    base_address: u64,
+    options: VlenStringReadOptions,
+    mut visitor: F,
+) -> Result<(), FormatError>
+where
+    S: FileSource + ?Sized,
+    F: FnMut(&str),
+{
+    check_element_limit(num_elements, options)?;
+    let refs = parse_vl_references(raw_data, num_elements, offset_size)?;
+    payload_size(&refs, options)?;
+
+    let mut collections: Vec<(u64, GlobalHeapIndex)> = Vec::new();
+    for element in &refs {
+        if element.length == 0
+            && (is_undefined_address(element.collection_address, offset_size)
+                || element.collection_address == 0)
+        {
+            visitor("");
+            continue;
+        }
+        if is_undefined_address(element.collection_address, offset_size) {
+            return Err(FormatError::VlDataError(
+                "non-empty VL element has an undefined heap address".into(),
+            ));
+        }
+
+        let collection_address = element.collection_address.checked_add(base_address).ok_or(
+            FormatError::OffsetOverflow {
+                offset: element.collection_address,
+                length: base_address,
+            },
+        )?;
+        let collection_pos = match collections
+            .iter()
+            .position(|(address, _)| *address == collection_address)
+        {
+            Some(pos) => pos,
+            None => {
+                let collection = GlobalHeapIndex::parse(source, collection_address, length_size)?;
+                collections.push((collection_address, collection));
+                collections.len() - 1
+            }
+        };
+
+        let index = u16::try_from(element.object_index).map_err(|_| {
+            FormatError::VlDataError(format!(
+                "global heap object index {} does not fit u16",
+                element.object_index
+            ))
+        })?;
+        let object = collections[collection_pos].1.get_object(index).ok_or(
+            FormatError::GlobalHeapObjectNotFound {
+                collection_address,
+                index,
+            },
+        )?;
+        if u64::from(element.length) > object.size {
+            return Err(FormatError::VlDataError(format!(
+                "VL element length {} exceeds global heap object size {}",
+                element.length, object.size
+            )));
+        }
+
+        let bytes = source.read_exact_at(object.data_address, element.length as usize)?;
+        let string = String::from_utf8_lossy(&bytes);
+        visitor(&string);
+    }
+
+    Ok(())
+}
+
+/// Resolve VL strings from a random-access file source.
+pub fn read_vl_strings_from_source<S: FileSource + ?Sized>(
+    source: &S,
+    raw_data: &[u8],
+    num_elements: u64,
+    offset_size: u8,
+    length_size: u8,
+    base_address: u64,
+    options: VlenStringReadOptions,
+) -> Result<Vec<String>, FormatError> {
+    let mut strings = Vec::new();
+    visit_vl_strings_from_source(
+        source,
+        raw_data,
+        num_elements,
+        offset_size,
+        length_size,
+        base_address,
+        options,
+        |string| strings.push(String::from(string)),
+    )?;
+    Ok(strings)
+}
+
 /// Resolve VL strings from raw data by looking up each element in the global heap.
 pub fn read_vl_strings(
     file_data: &[u8],
@@ -118,41 +335,15 @@ pub fn read_vl_strings(
     offset_size: u8,
     length_size: u8,
 ) -> Result<Vec<String>, FormatError> {
-    let refs = parse_vl_references(raw_data, num_elements, offset_size)?;
-    let mut result = Vec::with_capacity(refs.len());
-
-    for vl in &refs {
-        if vl.length == 0 && is_undefined_address(vl.collection_address, offset_size) {
-            result.push(String::new());
-            continue;
-        }
-        if vl.length == 0 && vl.collection_address == 0 {
-            result.push(String::new());
-            continue;
-        }
-
-        let coll =
-            GlobalHeapCollection::parse(file_data, vl.collection_address.to_usize()?, length_size)?;
-        let index = u16::try_from(vl.object_index).map_err(|_| {
-            FormatError::VlDataError(format!(
-                "global heap object index {} does not fit u16",
-                vl.object_index
-            ))
-        })?;
-        let obj = coll
-            .get_object(index)
-            .ok_or(FormatError::GlobalHeapObjectNotFound {
-                collection_address: vl.collection_address,
-                index,
-            })?;
-
-        // The object data is the raw string bytes
-        let len = (vl.length as usize).min(obj.data.len());
-        let s = String::from_utf8_lossy(&obj.data[..len]).into_owned();
-        result.push(s);
-    }
-
-    Ok(result)
+    read_vl_strings_from_source(
+        &BytesSource::new(file_data),
+        raw_data,
+        num_elements,
+        offset_size,
+        length_size,
+        0,
+        VlenStringReadOptions::default(),
+    )
 }
 
 #[cfg(test)]
@@ -245,6 +436,32 @@ mod tests {
 
         let raw = build_vl_refs(&["Alice", "Bob"], gcol_offset as u64, 1, 8);
         let strings = read_vl_strings(&file_data, &raw, 2, 8, 8).unwrap();
+        assert_eq!(strings, vec!["Alice", "Bob"]);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn read_vl_strings_from_seekable_source() {
+        use std::io::Cursor;
+
+        use crate::source::ReadSeekSource;
+
+        let gcol_offset = 256usize;
+        let mut file_data = vec![0u8; 512];
+        build_gcol_at(&mut file_data, gcol_offset, &[(1, b"Alice"), (2, b"Bob")]);
+        let raw = build_vl_refs(&["Alice", "Bob"], gcol_offset as u64, 1, 8);
+        let source = ReadSeekSource::new(Cursor::new(file_data)).unwrap();
+
+        let strings = read_vl_strings_from_source(
+            &source,
+            &raw,
+            2,
+            8,
+            8,
+            0,
+            VlenStringReadOptions::default(),
+        )
+        .unwrap();
         assert_eq!(strings, vec!["Alice", "Bob"]);
     }
 

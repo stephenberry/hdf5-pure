@@ -21,6 +21,7 @@ use crate::object_header::ObjectHeader;
 use crate::signature;
 use crate::source::{BytesSource, FileSource, ReadSeekSource};
 use crate::superblock::Superblock;
+use crate::vl_data::{self, VlenStringReadOptions};
 
 use crate::types::{AttrValue, DType, attrs_to_map, classify_datatype};
 
@@ -617,10 +618,93 @@ impl<'f> Dataset<'f> {
     }
 
     /// Read all data as `String` values.
+    ///
+    /// Fixed-length and variable-length HDF5 string datasets are both
+    /// supported. Use [`read_vlen_strings`](Self::read_vlen_strings) when
+    /// variable-length allocation limits are required.
     pub fn read_string(&self) -> Result<Vec<String>, Error> {
-        let raw = self.read_raw()?;
         let dt = self.datatype()?;
-        Ok(data_read::read_as_strings(&raw, &dt)?)
+        if vl_data::is_vlen_string_datatype(&dt) {
+            self.read_vlen_strings(VlenStringReadOptions::default())
+        } else {
+            let raw = self.read_raw()?;
+            Ok(data_read::read_as_strings(&raw, &dt)?)
+        }
+    }
+
+    /// Return the total bytes referenced by this VL string dataset.
+    ///
+    /// This is the payload equivalent of HDF5's `H5Dvlen_get_buf_size`: it
+    /// excludes `Vec<String>` and `String` allocation metadata.
+    pub fn vlen_string_payload_size(&self) -> Result<u64, Error> {
+        let datatype = self.datatype()?;
+        if !vl_data::is_vlen_string_datatype(&datatype) {
+            return Err(FormatError::TypeMismatch {
+                expected: "VariableLength string",
+                actual: "non-VariableLength string",
+            }
+            .into());
+        }
+        let dataspace = self.dataspace()?;
+        let raw = self.read_raw()?;
+        Ok(vl_data::vlen_string_payload_size(
+            &raw,
+            dataspace.num_elements(),
+            self.file.offset_size(),
+        )?)
+    }
+
+    /// Read a VL string dataset with explicit allocation limits.
+    ///
+    /// Both limits are checked before any string payload is materialized.
+    pub fn read_vlen_strings(&self, options: VlenStringReadOptions) -> Result<Vec<String>, Error> {
+        let mut strings = Vec::new();
+        self.visit_vlen_strings(options, |string| strings.push(string.to_owned()))?;
+        Ok(strings)
+    }
+
+    /// Visit a VL string dataset one element at a time.
+    ///
+    /// The string slice passed to `visitor` is valid only for the duration of
+    /// that callback. This avoids retaining all decoded string payloads at once.
+    pub fn visit_vlen_strings<F>(
+        &self,
+        options: VlenStringReadOptions,
+        visitor: F,
+    ) -> Result<(), Error>
+    where
+        F: FnMut(&str),
+    {
+        let datatype = self.datatype()?;
+        if !vl_data::is_vlen_string_datatype(&datatype) {
+            return Err(FormatError::TypeMismatch {
+                expected: "VariableLength string",
+                actual: "non-VariableLength string",
+            }
+            .into());
+        }
+        let dataspace = self.dataspace()?;
+        if let Some(limit) = options.max_elements()
+            && dataspace.num_elements() > limit as u64
+        {
+            return Err(FormatError::VariableLengthElementLimitExceeded {
+                limit,
+                actual: dataspace.num_elements(),
+            }
+            .into());
+        }
+        let raw = self.read_raw()?;
+        let source = self.file.source();
+        Ok(vl_data::visit_vl_strings_from_source(
+            &source,
+            &raw,
+            dataspace.num_elements(),
+            self.file.offset_size(),
+            self.file.length_size(),
+            self.file.addr_offset,
+            options,
+            visitor,
+        )?)
     }
 
     /// Read all attributes of this dataset.
