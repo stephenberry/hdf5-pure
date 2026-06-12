@@ -53,6 +53,34 @@ pub enum FormatError {
     InvalidByteOrder(u8),
     /// Invalid reference type.
     InvalidReferenceType(u8),
+    /// A compound datatype has a zero total size.
+    InvalidCompoundSize,
+    /// A compound datatype contains no fields.
+    EmptyCompoundType,
+    /// A compound datatype contains the same field name more than once.
+    DuplicateCompoundField(String),
+    /// A compound field extends past the declared compound size.
+    CompoundFieldOutOfBounds {
+        /// Field name.
+        name: String,
+        /// Field byte offset.
+        offset: u64,
+        /// Field size in bytes.
+        field_size: u32,
+        /// Declared compound size in bytes.
+        compound_size: u32,
+    },
+    /// Two compound fields overlap.
+    CompoundFieldOverlap {
+        /// Earlier field in byte order.
+        first: String,
+        /// Later field in byte order.
+        second: String,
+    },
+    /// A named compound field was not present.
+    CompoundFieldMissing(String),
+    /// A compound field has an incompatible datatype.
+    CompoundFieldTypeMismatch(String),
     /// Invalid dataspace version.
     InvalidDataspaceVersion(u8),
     /// Invalid dataspace type.
@@ -271,6 +299,36 @@ impl fmt::Display for FormatError {
             }
             FormatError::InvalidReferenceType(r) => {
                 write!(f, "invalid reference type: {r}")
+            }
+            FormatError::InvalidCompoundSize => {
+                write!(f, "compound datatype size must be greater than zero")
+            }
+            FormatError::EmptyCompoundType => {
+                write!(f, "compound datatype must contain at least one field")
+            }
+            FormatError::DuplicateCompoundField(name) => {
+                write!(f, "duplicate compound field name: {name}")
+            }
+            FormatError::CompoundFieldOutOfBounds {
+                name,
+                offset,
+                field_size,
+                compound_size,
+            } => {
+                write!(
+                    f,
+                    "compound field {name:?} at offset {offset} with size {field_size} \
+                     exceeds compound size {compound_size}"
+                )
+            }
+            FormatError::CompoundFieldOverlap { first, second } => {
+                write!(f, "compound fields {first:?} and {second:?} overlap")
+            }
+            FormatError::CompoundFieldMissing(name) => {
+                write!(f, "compound field {name:?} is missing")
+            }
+            FormatError::CompoundFieldTypeMismatch(name) => {
+                write!(f, "compound field {name:?} has an incompatible datatype")
             }
             FormatError::InvalidDataspaceVersion(v) => {
                 write!(f, "invalid dataspace version: {v}")

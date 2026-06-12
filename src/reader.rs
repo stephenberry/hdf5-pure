@@ -5,6 +5,7 @@ use std::io::{Read, Seek, SeekFrom};
 
 use crate::attribute::extract_attributes_full;
 use crate::chunk_cache::ChunkCache;
+use crate::compound::CompoundType;
 use crate::convert::TryToUsize;
 use crate::data_layout::DataLayout;
 use crate::data_read;
@@ -627,7 +628,9 @@ impl<'f> Dataset<'f> {
         self.file.attrs_of(&self.header)
     }
 
-    fn datatype(&self) -> Result<Datatype, Error> {
+    /// Returns the exact HDF5 datatype, including compound field offsets and
+    /// total record size.
+    pub fn datatype(&self) -> Result<Datatype, Error> {
         let msg = find_message(&self.header, MessageType::Datatype)?;
         let (dt, _) = Datatype::parse(&msg.data)?;
         Ok(dt)
@@ -655,7 +658,11 @@ impl<'f> Dataset<'f> {
             .and_then(|msg| FilterPipeline::parse(&msg.data).ok())
     }
 
-    fn read_raw(&self) -> Result<Vec<u8>, Error> {
+    /// Read the dataset's exact unfiltered element bytes.
+    ///
+    /// For compound datasets this preserves all file padding and uses the
+    /// offsets reported by [`datatype`](Self::datatype).
+    pub fn read_raw(&self) -> Result<Vec<u8>, Error> {
         let dt = self.datatype()?;
         let ds = self.dataspace()?;
         let mut dl = self.data_layout()?;
@@ -672,6 +679,34 @@ impl<'f> Dataset<'f> {
         Ok(self
             .file
             .read_dataset_raw(&dl, &ds, &dt, pipeline.as_ref(), &self.chunk_cache)?)
+    }
+
+    /// Decode all elements of a compound dataset field by field.
+    ///
+    /// Built-in implementations support numeric tuples with one through twelve
+    /// fields. Decoding uses the file's field offsets rather than Rust's tuple
+    /// memory layout, so padded compound records are supported safely.
+    pub fn read_compound<T: CompoundType>(&self) -> Result<Vec<T>, Error> {
+        let datatype = self.datatype()?;
+        let element_size = datatype.type_size().to_usize()?;
+        if !matches!(datatype, Datatype::Compound { .. }) {
+            return Err(FormatError::TypeMismatch {
+                expected: "Compound",
+                actual: "non-Compound",
+            }
+            .into());
+        }
+        let raw = self.read_raw()?;
+        if element_size == 0 || !raw.len().is_multiple_of(element_size) {
+            return Err(FormatError::DataSizeMismatch {
+                expected: element_size,
+                actual: raw.len(),
+            }
+            .into());
+        }
+        raw.chunks_exact(element_size)
+            .map(|bytes| T::decode(&datatype, bytes).map_err(Error::from))
+            .collect()
     }
 
     /// Verify this dataset against its stored provenance hash.

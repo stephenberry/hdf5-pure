@@ -111,6 +111,7 @@ pub(crate) mod checksum;
 pub(crate) mod chunk_cache;
 pub(crate) mod chunked_read;
 pub(crate) mod chunked_write;
+pub(crate) mod compound;
 pub(crate) mod convert;
 pub(crate) mod data_layout;
 pub(crate) mod data_read;
@@ -210,10 +211,14 @@ pub use scaleoffset::ScaleOffset;
 
 // The HDF5 datatype handle returned by the `make_*_type` constructors and
 // accepted by the compound/enum builders and `DatasetBuilder::with_dtype`.
-pub use datatype::Datatype;
+pub use compound::{CompoundField, CompoundType};
+pub use datatype::{
+    CharacterSet, CompoundMember, Datatype, DatatypeByteOrder, EnumMember, ReferenceType,
+    StringPadding,
+};
 
 pub use type_builders::{
-    CompoundTypeBuilder, DatasetBuilder, EnumTypeBuilder, FinishedGroup, GroupBuilder,
-    make_f32_type, make_f64_type, make_i8_type, make_i16_type, make_i32_type, make_i64_type,
-    make_u8_type, make_u16_type, make_u32_type, make_u64_type,
+    CompoundTypeBuilder, DatasetBuilder, EnumTypeBuilder, ExplicitCompoundTypeBuilder,
+    FinishedGroup, GroupBuilder, make_f32_type, make_f64_type, make_i8_type, make_i16_type,
+    make_i32_type, make_i64_type, make_u8_type, make_u16_type, make_u32_type, make_u64_type,
 };
