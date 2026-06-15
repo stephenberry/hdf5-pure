@@ -80,11 +80,10 @@ impl FileBuilder {
     /// section `threshold` are recorded in the file's superblock extension, so
     /// the reference C library and a later reopen observe the choice.
     ///
-    /// Persisting free space on disk (`persist = true`) requires writing
-    /// free-space manager blocks and is not yet supported, so it makes
-    /// [`finish`](Self::finish) / [`write`](Self::write) fail with
-    /// [`Error::Format`] wrapping
-    /// [`FormatError::FileSpacePersistUnsupported`](crate::FormatError::FileSpacePersistUnsupported).
+    /// `persist = true` records that freed space should be tracked on disk across
+    /// closes. A brand-new file has nothing to track, so this only records the
+    /// intent; freeing space in a later [`EditSession`](crate::EditSession) then
+    /// writes the on-disk free-space-manager blocks that survive a reopen.
     pub fn with_file_space_strategy(
         &mut self,
         strategy: FileSpaceStrategy,

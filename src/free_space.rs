@@ -6,12 +6,15 @@
 //! later allocation can reuse them instead of growing the file, and so a run of
 //! free space that reaches end-of-file can be truncated away.
 //!
-//! It is the in-memory half of HDF5's "free-space management". It is **not** the
-//! on-disk free-space manager (the `FSHD`/`FSSE` blocks and the File Space Info
-//! superblock-extension message): freed-but-unreused space is invisible to other
-//! tools, exactly as the reference C library's default `FSM_AGGR` strategy with
-//! persistence off leaves it. Persisting the free list across file opens is a
-//! later, additive step.
+//! It is the in-memory half of HDF5's "free-space management". For a file opened
+//! without persistence (the default) it is purely session-local: freed-but-
+//! unreused space is invisible to other tools, exactly as the reference C
+//! library's default `FSM_AGGR` strategy with persistence off leaves it. When the
+//! file was created with `persist = true`, [`EditSession`](crate::EditSession)
+//! seeds this list from the on-disk free-space managers (the `FSHD`/`FSSE` blocks
+//! the File Space Info superblock-extension message points at) on open and writes
+//! it back on each commit, so reuse spans sessions (see
+//! [`free_space_manager`](crate::free_space_manager)).
 //!
 //! The structure is a sorted, fully coalesced list of disjoint `[addr, addr+len)`
 //! regions. Every public operation preserves both invariants (sorted by address,
@@ -121,6 +124,12 @@ impl FreeList {
             self.regions[i].len -= len;
         }
         Some(addr)
+    }
+
+    /// The free regions as `(addr, len)` pairs, sorted ascending by address and
+    /// fully coalesced. Used to persist the free list to disk (issue #21).
+    pub(crate) fn sections(&self) -> Vec<(u64, u64)> {
+        self.regions.iter().map(|r| (r.addr, r.len)).collect()
     }
 
     /// If a free region ends exactly at `eof` (the current end-of-file), remove

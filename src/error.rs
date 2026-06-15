@@ -57,9 +57,6 @@ pub enum FormatError {
     InvalidFileSpaceStrategy(u8),
     /// Unsupported File Space Info message version (only version 1 is handled).
     UnsupportedFileSpaceInfoVersion(u8),
-    /// Persisting free space on disk (`persist = true`) is not yet supported by
-    /// the writer.
-    FileSpacePersistUnsupported,
     /// A free-space manager block (`FSHD`/`FSSE`) is malformed.
     InvalidFreeSpaceManager,
     /// A compound datatype has a zero total size.
@@ -328,12 +325,6 @@ impl fmt::Display for FormatError {
             }
             FormatError::UnsupportedFileSpaceInfoVersion(v) => {
                 write!(f, "unsupported File Space Info message version: {v}")
-            }
-            FormatError::FileSpacePersistUnsupported => {
-                write!(
-                    f,
-                    "persisting free space on disk (persist = true) is not yet supported"
-                )
             }
             FormatError::InvalidFreeSpaceManager => {
                 write!(f, "malformed free-space manager block (FSHD/FSSE)")
