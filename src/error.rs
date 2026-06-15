@@ -60,6 +60,8 @@ pub enum FormatError {
     /// Persisting free space on disk (`persist = true`) is not yet supported by
     /// the writer.
     FileSpacePersistUnsupported,
+    /// A free-space manager block (`FSHD`/`FSSE`) is malformed.
+    InvalidFreeSpaceManager,
     /// A compound datatype has a zero total size.
     InvalidCompoundSize,
     /// A compound datatype contains no fields.
@@ -332,6 +334,9 @@ impl fmt::Display for FormatError {
                     f,
                     "persisting free space on disk (persist = true) is not yet supported"
                 )
+            }
+            FormatError::InvalidFreeSpaceManager => {
+                write!(f, "malformed free-space manager block (FSHD/FSSE)")
             }
             FormatError::InvalidCompoundSize => {
                 write!(f, "compound datatype size must be greater than zero")

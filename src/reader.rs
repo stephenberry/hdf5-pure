@@ -14,6 +14,7 @@ use crate::datatype::Datatype;
 use crate::error::{Error, FormatError};
 use crate::file_space_info::{FileSpaceInfo, FileSpaceStrategy};
 use crate::filter_pipeline::FilterPipeline;
+use crate::free_space_manager;
 use crate::group_v1::GroupEntry;
 use crate::group_v2;
 use crate::libver::LibVer;
@@ -377,6 +378,35 @@ impl File {
     /// if present and readable.
     pub fn file_space_info(&self) -> Option<&FileSpaceInfo> {
         self.file_space_info.as_ref()
+    }
+
+    /// The free regions a file persists on disk in its free-space managers (when
+    /// written with `H5Pset_file_space_strategy(..., persist = true)`), as
+    /// `(address, length)` pairs sorted by address.
+    ///
+    /// Empty when the file does not persist free space, or for the streaming
+    /// backend (which does not load the manager blocks). The addresses are file
+    /// offsets (relative to the base address); reading data is unaffected by the
+    /// presence or absence of these managers.
+    pub fn persisted_free_space(&self) -> Vec<(u64, u64)> {
+        let Some(info) = &self.file_space_info else {
+            return Vec::new();
+        };
+        if !info.persist {
+            return Vec::new();
+        }
+        let Backend::InMemory(data) = &self.backend else {
+            return Vec::new();
+        };
+        let mut sections = free_space_manager::read_persisted_sections(
+            data,
+            &info.manager_addrs,
+            self.addr_offset,
+            self.superblock.offset_size,
+        )
+        .unwrap_or_default();
+        sections.sort_by_key(|s| s.addr);
+        sections.into_iter().map(|s| (s.addr, s.size)).collect()
     }
 
     /// The size of the underlying file in bytes (the HDF5 `H5Fget_filesize`).
