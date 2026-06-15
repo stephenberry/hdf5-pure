@@ -48,8 +48,12 @@ pub struct FractalHeapHeader {
     pub max_direct_block_size: u64,
     /// Maximum heap size in bits (determines offset bit width in heap IDs).
     pub max_heap_size: u16,
-    /// Starting row of indirect blocks in the doubling table.
-    pub starting_row_of_indirect_blocks: u16,
+    /// Starting number of rows in the root indirect block (HDF5's
+    /// `start_root_rows`): an allocation hint for how many rows the root
+    /// indirect block begins with, **not** the direct/indirect row boundary.
+    /// The boundary is computed by [`FractalHeapHeader::max_direct_rows`]. This
+    /// field is decoded for format completeness but not consulted by the reader.
+    pub start_root_rows: u16,
     /// Address of the root block.
     pub root_block_address: u64,
     /// Number of rows in root indirect block (0 = root is direct block).
@@ -100,6 +104,13 @@ fn is_undefined(val: u64, offset_size: u8) -> bool {
         8 => val == 0xFFFF_FFFF_FFFF_FFFF,
         _ => false,
     }
+}
+
+/// Floor of the base-2 logarithm of `v` (0 for `v == 0`). The doubling-table
+/// block sizes are powers of two, so this is their exact log2; it mirrors
+/// HDF5's `H5VM_log2_gen`.
+fn log2_floor(v: u64) -> u32 {
+    if v == 0 { 0 } else { 63 - v.leading_zeros() }
 }
 
 impl FractalHeapHeader {
@@ -184,10 +195,9 @@ impl FractalHeapHeader {
         let max_heap_size = u16::from_le_bytes([file_data[pos], file_data[pos + 1]]);
         pos += 2;
 
-        // starting_row_of_indirect_blocks (2)
+        // start_root_rows: starting # of rows in the root indirect block (2)
         ensure_len(file_data, pos, 2)?;
-        let starting_row_of_indirect_blocks =
-            u16::from_le_bytes([file_data[pos], file_data[pos + 1]]);
+        let start_root_rows = u16::from_le_bytes([file_data[pos], file_data[pos + 1]]);
         pos += 2;
 
         // root_block_address (offset_size)
@@ -232,7 +242,7 @@ impl FractalHeapHeader {
             starting_block_size,
             max_direct_block_size,
             max_heap_size,
-            starting_row_of_indirect_blocks,
+            start_root_rows,
             root_block_address,
             current_rows_in_root_indirect_block,
             managed_objects_count,
@@ -385,12 +395,14 @@ impl FractalHeapHeader {
         let mut pos = iblock_header;
         let tw = self.table_width as u64;
         let nrows_usize = nrows as usize;
-        let start_indirect = self.starting_row_of_indirect_blocks as usize;
-        let max_direct_rows = nrows_usize.min(start_indirect);
+        // The direct/indirect boundary is computed from the doubling table, not
+        // taken from the `start_root_rows` header field (a common confusion that
+        // mis-reads any heap whose rows extend past that hint).
+        let direct_rows = nrows_usize.min(self.max_direct_rows());
         let mut current_heap_offset = iblock_heap_offset;
 
         // Direct-block rows.
-        for row in 0..max_direct_rows {
+        for row in 0..direct_rows {
             let block_size = self.block_size_for_row(row);
             for _col in 0..tw {
                 let child_addr = read_offset(block, pos, offset_size)?;
@@ -401,7 +413,7 @@ impl FractalHeapHeader {
                     pos += 4;
                 }
                 if !is_undefined(child_addr, offset_size) {
-                    let block_end = current_heap_offset + block_size;
+                    let block_end = current_heap_offset.saturating_add(block_size);
                     if target_offset >= current_heap_offset && target_offset < block_end {
                         return Ok(Some(HeapChild::Direct {
                             addr: child_addr,
@@ -410,19 +422,21 @@ impl FractalHeapHeader {
                         }));
                     }
                 }
-                current_heap_offset += block_size;
+                current_heap_offset = current_heap_offset.saturating_add(block_size);
             }
         }
 
-        // Indirect-block rows.
-        for row in start_indirect..nrows_usize {
-            let child_nrows = row - start_indirect + 1;
+        // Indirect-block rows. A child indirect block occupying parent row `row`
+        // has that row's doubling-table block size; its own row count and the
+        // heap space it spans follow from that size.
+        for row in direct_rows..nrows_usize {
+            let child_nrows = self.size_to_rows(self.block_size_for_row(row));
             let total_child_space = self.indirect_block_heap_size(child_nrows);
             for _col in 0..tw {
                 let child_addr = read_offset(block, pos, offset_size)?;
                 pos += offset_size as usize;
                 if !is_undefined(child_addr, offset_size) {
-                    let block_end = current_heap_offset + total_child_space;
+                    let block_end = current_heap_offset.saturating_add(total_child_space);
                     if target_offset >= current_heap_offset && target_offset < block_end {
                         return Ok(Some(HeapChild::Indirect {
                             addr: child_addr,
@@ -431,7 +445,7 @@ impl FractalHeapHeader {
                         }));
                     }
                 }
-                current_heap_offset += total_child_space;
+                current_heap_offset = current_heap_offset.saturating_add(total_child_space);
             }
         }
 
@@ -444,10 +458,10 @@ impl FractalHeapHeader {
     fn indirect_block_entries_len(&self, nrows: u16, offset_size: u8) -> usize {
         let block_offset_bytes = (self.max_heap_size as usize).div_ceil(8);
         let iblock_header = 5 + offset_size as usize + block_offset_bytes;
-        let start_indirect = self.starting_row_of_indirect_blocks as usize;
         let nrows_usize = nrows as usize;
-        let max_direct_rows = nrows_usize.min(start_indirect);
-        let num_indirect_rows = nrows_usize.saturating_sub(start_indirect);
+        let boundary = self.max_direct_rows();
+        let direct_rows = nrows_usize.min(boundary);
+        let num_indirect_rows = nrows_usize.saturating_sub(boundary);
         let direct_entry = offset_size as usize
             + if self.io_filter_encoded_length > 0 {
                 4
@@ -456,7 +470,7 @@ impl FractalHeapHeader {
             };
         let tw = self.table_width as usize;
         iblock_header
-            + max_direct_rows * tw * direct_entry
+            + direct_rows * tw * direct_entry
             + num_indirect_rows * tw * (offset_size as usize)
     }
 
@@ -654,22 +668,52 @@ impl FractalHeapHeader {
         }
     }
 
-    /// Get block size for a given row in the doubling table.
+    /// Get block size for a given row in the doubling table. Saturates rather
+    /// than overflowing for an out-of-range `row`, so a malformed header (an
+    /// implausibly large `current_rows`) cannot panic the shift or the multiply.
     fn block_size_for_row(&self, row: usize) -> u64 {
         let sbs = self.starting_block_size;
         if row <= 1 {
             sbs
         } else {
-            sbs * (1u64 << (row - 1))
+            match u32::try_from(row - 1)
+                .ok()
+                .and_then(|s| 1u64.checked_shl(s))
+            {
+                Some(mult) => sbs.saturating_mul(mult),
+                None => u64::MAX,
+            }
         }
     }
 
-    /// Total heap space covered by an indirect block with the given number of rows.
+    /// Number of rows in the doubling table that hold **direct** blocks. Rows
+    /// `[0, max_direct_rows)` are direct; rows at or beyond it are indirect.
+    /// Computed from the doubling-table parameters exactly as HDF5 does
+    /// (`H5HFdtable.c`: `(max_direct_bits - start_bits) + 2`) — not read from the
+    /// `start_root_rows` header field, which is a different quantity.
+    fn max_direct_rows(&self) -> usize {
+        let start_bits = log2_floor(self.starting_block_size);
+        let max_direct_bits = log2_floor(self.max_direct_block_size);
+        (max_direct_bits.saturating_sub(start_bits) + 2) as usize
+    }
+
+    /// Number of rows in an indirect block that manages `size` bytes of heap
+    /// space (HDF5's `H5HF__dtable_size_to_rows`:
+    /// `(log2(size) - first_row_bits) + 1`, where
+    /// `first_row_bits = log2(start_block_size) + log2(table_width)`).
+    fn size_to_rows(&self, size: u64) -> usize {
+        let first_row_bits =
+            log2_floor(self.starting_block_size) + log2_floor(self.table_width as u64);
+        (log2_floor(size).saturating_sub(first_row_bits) + 1) as usize
+    }
+
+    /// Total heap space covered by an indirect block with the given number of
+    /// rows. Saturates so a malformed `nrows` cannot overflow the running total.
     fn indirect_block_heap_size(&self, nrows: usize) -> u64 {
         let tw = self.table_width as u64;
         let mut total = 0u64;
         for row in 0..nrows {
-            total += self.block_size_for_row(row) * tw;
+            total = total.saturating_add(self.block_size_for_row(row).saturating_mul(tw));
         }
         total
     }
@@ -762,7 +806,7 @@ mod tests {
         // max_heap_size (2) = 16
         buf[pos..pos + 2].copy_from_slice(&max_heap_size.to_le_bytes());
         pos += 2;
-        // starting_row_of_indirect_blocks (2) = 2
+        // start_root_rows (2) = 2
         buf[pos..pos + 2].copy_from_slice(&2u16.to_le_bytes());
         pos += 2;
         // root_block_address (offset_size) = dblock_offset
@@ -923,5 +967,61 @@ mod tests {
         let id = vec![0x40u8, 0, 0, 0, 0, 0, 0]; // bit 6 set = type 1
         let err = hdr.decode_managed_id(&id).unwrap_err();
         assert_eq!(err, FormatError::InvalidHeapIdType(1));
+    }
+
+    #[test]
+    fn log2_floor_basics() {
+        assert_eq!(log2_floor(0), 0);
+        assert_eq!(log2_floor(1), 0);
+        assert_eq!(log2_floor(512), 9);
+        assert_eq!(log2_floor(65536), 16);
+        assert_eq!(log2_floor(131072), 17);
+        // Floor for non-powers-of-two (mirrors H5VM_log2_gen).
+        assert_eq!(log2_floor(1023), 9);
+        assert_eq!(log2_floor(1024), 10);
+    }
+
+    /// Build a header with the given doubling-table parameters (the only fields
+    /// `max_direct_rows`/`size_to_rows` consult); other fields are irrelevant.
+    fn dtable_header(
+        start_block_size: u64,
+        max_direct_block_size: u64,
+        table_width: u16,
+    ) -> FractalHeapHeader {
+        FractalHeapHeader {
+            heap_id_length: 7,
+            io_filter_encoded_length: 0,
+            max_managed_object_size: 0,
+            table_width,
+            starting_block_size: start_block_size,
+            max_direct_block_size,
+            max_heap_size: 64,
+            start_root_rows: 1,
+            root_block_address: 0,
+            current_rows_in_root_indirect_block: 0,
+            managed_objects_count: 0,
+        }
+    }
+
+    #[test]
+    fn max_direct_rows_matches_hdf5_formula() {
+        // (log2(max_direct) - log2(start)) + 2, the boundary between direct and
+        // indirect rows. Values cross-checked against HDF5's H5HFdtable.c.
+        assert_eq!(dtable_header(512, 65536, 4).max_direct_rows(), 9); // (16-9)+2
+        assert_eq!(dtable_header(4096, 65536, 4).max_direct_rows(), 6); // (16-12)+2
+        // Degenerate: max-direct == start gives the minimum of 2 direct rows.
+        assert_eq!(dtable_header(512, 512, 4).max_direct_rows(), 2);
+    }
+
+    #[test]
+    fn size_to_rows_matches_hdf5_formula() {
+        // first_row_bits = log2(start) + log2(width). For start=512, width=4:
+        // first_row_bits = 9 + 2 = 11, rows = (log2(size) - 11) + 1.
+        let h = dtable_header(512, 65536, 4);
+        assert_eq!(h.size_to_rows(131072), 7); // 2^17: (17-11)+1
+        assert_eq!(h.size_to_rows(4096), 2); // 2^12: (12-11)+1
+        // Below first_row_bits saturates to a single row, never underflows.
+        assert_eq!(h.size_to_rows(512), 1);
+        assert_eq!(h.size_to_rows(1), 1);
     }
 }

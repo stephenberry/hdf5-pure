@@ -238,7 +238,7 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     write_length(&mut frhp, max_direct_block_size, LENGTH_SIZE); // max_direct_block_size
     frhp.extend_from_slice(&max_heap_size.to_le_bytes());
     let sri: u16 = 1;
-    frhp.extend_from_slice(&sri.to_le_bytes()); // starting_row_of_indirect_blocks
+    frhp.extend_from_slice(&sri.to_le_bytes()); // start_root_rows
     write_offset(&mut frhp, dblock_addr, OFFSET_SIZE);
     frhp.extend_from_slice(&0u16.to_le_bytes()); // root is direct block
     let frhp_checksum = crate::checksum::jenkins_lookup3(&frhp);
@@ -1359,7 +1359,7 @@ mod tests {
             starting_block_size: 4096,
             max_direct_block_size: 65536,
             max_heap_size: 40,
-            starting_row_of_indirect_blocks: 1,
+            start_root_rows: 1,
             root_block_address: 0,
             current_rows_in_root_indirect_block: 0,
             managed_objects_count: 0,
