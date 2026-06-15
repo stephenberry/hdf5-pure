@@ -1355,6 +1355,7 @@ mod tests {
             heap_id_length: 8,
             io_filter_encoded_length: 0,
             max_managed_object_size: 1024,
+            btree_huge_objects_address: u64::MAX,
             table_width: 4,
             starting_block_size: 4096,
             max_direct_block_size: 65536,

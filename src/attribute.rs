@@ -381,8 +381,8 @@ fn extract_dense_attributes(
         }
         let id_bytes = &record.data[id_offset..id_offset + fh.heap_id_length as usize];
 
-        // Read attribute message from fractal heap
-        let attr_data = fh.read_managed_object(file_data, id_bytes, offset_size)?;
+        // Read the attribute message from the fractal heap (managed or huge object).
+        let attr_data = fh.read_object(file_data, id_bytes, offset_size, length_size)?;
 
         // The data in the heap is a complete attribute message
         let attr = AttributeMessage::parse(&attr_data, length_size)?;
