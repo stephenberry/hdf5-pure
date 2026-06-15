@@ -61,6 +61,70 @@ fn c_library_reads_our_strategy() {
 }
 
 #[test]
+fn we_read_c_library_persisted_free_space() {
+    // The C library writes a persisted FSM file with real free space (a deleted
+    // dataset). hdf5-pure must follow the File Space Info manager addresses to the
+    // on-disk FSHD/FSSE blocks and recover the freed sections.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_persisted_fsm.h5");
+    {
+        let file = hdf5::FileBuilder::new()
+            .with_fapl(|fapl| fapl.libver_v110())
+            .with_fcpl(|fcpl| {
+                fcpl.file_space_strategy(CStrategy::FreeSpaceManager {
+                    paged: false,
+                    persist: true,
+                    threshold: 1,
+                })
+            })
+            .create(&path)
+            .unwrap();
+        file.new_dataset::<i32>()
+            .shape((100,))
+            .create("a")
+            .unwrap()
+            .write(&vec![1i32; 100])
+            .unwrap();
+        file.new_dataset::<i32>()
+            .shape((400,))
+            .create("b")
+            .unwrap()
+            .write(&vec![2i32; 400])
+            .unwrap();
+        file.new_dataset::<i32>()
+            .shape((100,))
+            .create("c")
+            .unwrap()
+            .write(&vec![3i32; 100])
+            .unwrap();
+        file.unlink("b").unwrap(); // frees b's storage into the persisted FSM
+        file.close().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    assert_eq!(f.file_space_strategy(), Some(FileSpaceStrategy::FsmAggr));
+    assert!(f.file_space_info().unwrap().persist);
+
+    let free = f.persisted_free_space();
+    assert!(
+        !free.is_empty(),
+        "expected persisted free sections from the deleted dataset"
+    );
+    // The freed regions are non-overlapping and account for real space (b held
+    // 400 * 4 = 1600 bytes of raw data, freed as at least one large section).
+    let total: u64 = free.iter().map(|(_, len)| *len).sum();
+    assert!(
+        total >= 1600,
+        "freed space {total} should cover the dataset"
+    );
+    assert!(free.iter().any(|&(_, len)| len >= 1600));
+
+    // Surviving datasets still read correctly alongside the persisted managers.
+    assert_eq!(f.dataset("a").unwrap().read_i32().unwrap(), vec![1; 100]);
+    assert_eq!(f.dataset("c").unwrap().read_i32().unwrap(), vec![3; 100]);
+}
+
+#[test]
 fn we_read_c_library_strategy() {
     let dir = tempdir().unwrap();
 
