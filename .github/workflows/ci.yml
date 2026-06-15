@@ -172,7 +172,7 @@ jobs:
       # Adjust DOWNWARD only, never upward. Measured on the pinned toolchain
       # below; a different clippy version may report a slightly different count,
       # in which case re-measure once and reset this.
-      CAST_BASELINE: 270
+      CAST_BASELINE: 268
     steps:
       - uses: actions/checkout@v4
       # Pinned so the baseline is stable against clippy-version drift.
