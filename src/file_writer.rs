@@ -112,6 +112,13 @@ pub(crate) fn build_group_oh(
     li.extend_from_slice(&u64::MAX.to_le_bytes()); // fractal heap addr = UNDEF
     li.extend_from_slice(&u64::MAX.to_le_bytes()); // btree name index addr = UNDEF
     w.add_message(MessageType::LinkInfo, li);
+    // A new-style group (one with a Link Info message) must also carry a Group
+    // Info message, or the HDF5 C library refuses to insert links into it:
+    // `H5G_obj_insert` reads the Group Info message unconditionally and fails
+    // with "message type not found", so the file is readable but not writable by
+    // the C library. The minimal body (version 0, no optional fields) leaves the
+    // C library to use its defaults (max compact = 8, min dense = 6).
+    w.add_message(MessageType::GroupInfo, vec![0, 0]);
     for link in links {
         w.add_message(MessageType::Link, link.serialize(OFFSET_SIZE));
     }

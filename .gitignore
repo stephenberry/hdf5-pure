@@ -6,6 +6,8 @@ matlab_fixtures/
 tests/fixtures/zfp/.venv/
 # Local scratch dir for drafts and throwaway work
 /tmp/
+# Throwaway scratch probe tests (zz_ prefix), never committed
+tests/zz_*
 
 # Stray build artifacts
 *.rlib

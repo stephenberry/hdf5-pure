@@ -1126,7 +1126,7 @@ impl EditSession {
         if self.data.len() < addr + 4 || self.data[addr..addr + 4] != *b"OHDR" {
             return self.reconstruct_v1_group(addr);
         }
-        let region = self.gather_oh_messages(addr)?;
+        let mut region = self.gather_oh_messages(addr)?;
         let mut p = 0;
         let mut has_link_info = false;
         let mut link_names = Vec::new();
@@ -1171,6 +1171,10 @@ impl EditSession {
                 "a target group's object header has no link-info message",
             ));
         }
+        // Heal headers written by older hdf5-pure releases that omitted the
+        // Group Info message, so the rewritten group stays writable by the C
+        // library.
+        ensure_group_info(&mut region)?;
         Ok(GroupInfo { region, link_names })
     }
 
@@ -1266,6 +1270,9 @@ impl EditSession {
                 )),
             }
         } else if has_link_info {
+            // A copied group must carry a Group Info message so the copy stays
+            // writable by the C library, even when the source omitted it.
+            ensure_group_info(&mut non_link)?;
             Ok(ObjModel::Group {
                 non_link_region: non_link,
                 children,
@@ -1671,20 +1678,60 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
     })
 }
 
-/// The chunk-0 message region of a fresh, empty compact-link group: a single
-/// LinkInfo message advertising no dense storage. Mirrors `build_group_oh`.
+/// A minimal Group Info message body (type 0x000A): version 0 with neither the
+/// link-phase-change nor the estimated-entry fields stored. With both absent the
+/// HDF5 C library fills `max_compact`/`min_dense` from its own defaults (8 and
+/// 6). See [`ensure_group_info`] for why every group needs this message.
+const GROUP_INFO_BODY: [u8; 2] = [0, 0];
+
+/// Frame one chunk-0 object-header message record: a 1-byte type, a 2-byte
+/// little-endian body length, a 1-byte flags field (always 0 here), then the
+/// body. This is the v2 message-record layout used throughout a group's chunk-0
+/// message region. Callers pass bodies that fit the u16 length field: link
+/// bodies are validated in [`flatten_dataset`], and the Link Info / Group Info
+/// bodies are fixed and short.
+fn region_message(msg_type: MessageType, body: &[u8]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(4 + body.len());
+    m.push(msg_type.to_u16() as u8);
+    m.extend_from_slice(&(body.len() as u16).to_le_bytes());
+    m.push(0); // message flags
+    m.extend_from_slice(body);
+    m
+}
+
+/// The chunk-0 message region of a fresh, empty compact-link group: a LinkInfo
+/// message advertising no dense storage, followed by a GroupInfo message.
+/// Mirrors `build_group_oh`.
 fn fresh_group_region() -> Vec<u8> {
     let mut li = Vec::with_capacity(18);
     li.push(0); // version
     li.push(0); // flags
     li.extend_from_slice(&u64::MAX.to_le_bytes()); // fractal heap addr = UNDEF
     li.extend_from_slice(&u64::MAX.to_le_bytes()); // btree name index addr = UNDEF
-    let mut m = Vec::with_capacity(4 + li.len());
-    m.push(MessageType::LinkInfo.to_u16() as u8);
-    m.extend_from_slice(&(li.len() as u16).to_le_bytes());
-    m.push(0); // message flags
-    m.extend_from_slice(&li);
-    m
+    let mut region = region_message(MessageType::LinkInfo, &li);
+    region.extend_from_slice(&region_message(MessageType::GroupInfo, &GROUP_INFO_BODY));
+    region
+}
+
+/// Ensure a group's chunk-0 message `region` carries a Group Info message,
+/// appending a minimal one when absent.
+///
+/// The HDF5 C library refuses to insert a link into a group whose object header
+/// has a Link Info message but no Group Info message: on the new-format path
+/// `H5G_obj_insert` reads the Group Info message unconditionally and fails with
+/// "message type not found". Such a group round-trips for *reading* but cannot
+/// be *modified* by the C library. Earlier hdf5-pure releases wrote groups that
+/// way, so heal any such header whenever we rewrite one in place.
+fn ensure_group_info(region: &mut Vec<u8>) -> Result<(), Error> {
+    let mut p = 0;
+    while let Some((msg_type, _body, body_end)) = next_message(region, p)? {
+        if msg_type == MessageType::GroupInfo {
+            return Ok(());
+        }
+        p = body_end;
+    }
+    region.extend_from_slice(&region_message(MessageType::GroupInfo, &GROUP_INFO_BODY));
+    Ok(())
 }
 
 /// Encode a complete object-header Link message (4-byte record header + body)
@@ -1692,12 +1739,7 @@ fn fresh_group_region() -> Vec<u8> {
 /// fits the u16 size field (see [`flatten_dataset`]); group names are short.
 fn encode_link_message(name: &str, addr: u64) -> Vec<u8> {
     let body = make_link(name, addr).serialize(OFFSET_SIZE);
-    let mut m = Vec::with_capacity(4 + body.len());
-    m.push(MessageType::Link.to_u16() as u8);
-    m.extend_from_slice(&(body.len() as u16).to_le_bytes());
-    m.push(0); // message flags
-    m.extend_from_slice(&body);
-    m
+    region_message(MessageType::Link, &body)
 }
 
 /// Patch an existing hard Link message in a chunk-0 message `region`, retargeting
@@ -1821,4 +1863,65 @@ fn read_le(bytes: &[u8]) -> usize {
         v |= (b as u64) << (8 * i);
     }
     v as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Collect the message types present in a chunk-0 region, in order.
+    fn region_types(region: &[u8]) -> Vec<MessageType> {
+        let mut out = Vec::new();
+        let mut p = 0;
+        while let Some((mt, _, end)) = next_message(region, p).unwrap() {
+            out.push(mt);
+            p = end;
+        }
+        out
+    }
+
+    #[test]
+    fn fresh_group_region_pairs_link_info_with_group_info() {
+        // A new-style group must carry both a Link Info and a Group Info message
+        // (the C library requires the pair before it will insert a link).
+        let types = region_types(&fresh_group_region());
+        assert_eq!(types, vec![MessageType::LinkInfo, MessageType::GroupInfo]);
+    }
+
+    #[test]
+    fn ensure_group_info_appends_when_missing() {
+        // A region with a Link Info message but no Group Info message (how older
+        // hdf5-pure releases wrote groups) gains exactly one Group Info message.
+        let li_body = {
+            let mut b = vec![0u8, 0];
+            b.extend_from_slice(&u64::MAX.to_le_bytes());
+            b.extend_from_slice(&u64::MAX.to_le_bytes());
+            b
+        };
+        let mut region = region_message(MessageType::LinkInfo, &li_body);
+        ensure_group_info(&mut region).unwrap();
+        assert_eq!(
+            region_types(&region),
+            vec![MessageType::LinkInfo, MessageType::GroupInfo]
+        );
+
+        // The appended message decodes as a minimal Group Info body.
+        let mut p = 0;
+        while let Some((mt, body, end)) = next_message(&region, p).unwrap() {
+            if mt == MessageType::GroupInfo {
+                assert_eq!(&region[body..end], &GROUP_INFO_BODY);
+            }
+            p = end;
+        }
+    }
+
+    #[test]
+    fn ensure_group_info_is_idempotent() {
+        // A region that already has a Group Info message is left untouched, so
+        // re-editing a healed (or C-written) group does not duplicate it.
+        let mut region = fresh_group_region();
+        let before = region.clone();
+        ensure_group_info(&mut region).unwrap();
+        assert_eq!(region, before);
+    }
 }
