@@ -2,7 +2,8 @@
 //! survivors, and fail-loud refusal of features that cannot be reproduced.
 
 use hdf5_pure::{
-    AttrValue, Datatype, DatatypeByteOrder, FileBuilder, RepackOptions, ScaleOffset, repack,
+    AttrValue, Datatype, DatatypeByteOrder, FileBuilder, FileSpaceStrategy, RepackOptions,
+    ScaleOffset, repack,
 };
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -294,6 +295,36 @@ fn roundtrips_opaque_and_bitfield_datatypes() {
     assert_eq!(flags.datatype().unwrap(), bitfield_dt);
     assert_eq!(flags.read_raw().unwrap(), bitfield_raw);
 
+    std::fs::remove_file(&src).ok();
+    std::fs::remove_file(&dst).ok();
+}
+
+#[test]
+fn preserves_file_space_strategy() {
+    let src = tmp("hdf5_pure_repack_fss_src.h5");
+    let dst = tmp("hdf5_pure_repack_fss_dst.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
+    b.create_dataset("drop_me").with_f64_data(&vec![0.0; 1000]);
+    b.with_file_space_strategy(FileSpaceStrategy::Page, false, 4)
+        .with_file_space_page_size(8192);
+    b.write(&src).unwrap();
+
+    repack(&src, &dst, &RepackOptions::new().drop_path("drop_me")).unwrap();
+
+    let f = hdf5_pure::File::open(&dst).unwrap();
+    // The strategy (and its page size / threshold) carries forward; persist is
+    // reset to false since the compact output has no free space to persist.
+    assert_eq!(f.file_space_strategy(), Some(FileSpaceStrategy::Page));
+    let info = f.file_space_info().unwrap();
+    assert_eq!(info.page_size, 8192);
+    assert_eq!(info.threshold, 4);
+    assert!(!info.persist);
+    assert_eq!(
+        f.dataset("keep").unwrap().read_i32().unwrap(),
+        vec![1, 2, 3]
+    );
+    assert!(f.dataset("drop_me").is_err());
     std::fs::remove_file(&src).ok();
     std::fs::remove_file(&dst).ok();
 }

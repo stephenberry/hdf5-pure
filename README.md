@@ -90,6 +90,24 @@ repack("input.h5", "compact.h5", &options).unwrap();
 
 `repack` never silently degrades data: every surviving object is reproduced byte-for-byte — datatype, shape, chunking, supported filters, raw data, and attributes — or the whole operation fails with `Error::RepackUnsupported` naming the object, leaving no output file. It reproduces fixed-point, floating-point, string, bit-field, opaque, compound, enumeration, and array datatypes, contiguous or chunked, filtered with deflate, shuffle, fletcher32, and/or lossless integer scale-offset. Anything it cannot reproduce exactly — variable-length, time, and reference datatypes, virtual layouts, lossy filters (float D-scale scale-offset, ZFP, SZIP), or an attribute the reader cannot decode — it refuses by name rather than write a file that quietly differs.
 
+### File-space strategy
+
+Mirroring `H5Pset_file_space_strategy` and `H5Pset_file_space_page_size`, a written file can record how it manages free space. The strategy is stored in a superblock-extension message, so the reference HDF5 C library and a later reopen observe it; `File::file_space_strategy()` reads it back.
+
+```rust,no_run
+use hdf5_pure::{File, FileBuilder, FileSpaceStrategy};
+
+let mut b = FileBuilder::new();
+b.create_dataset("d").with_i32_data(&[1, 2, 3]);
+b.with_file_space_strategy(FileSpaceStrategy::Page, false, 1)  // strategy, persist, threshold
+    .with_file_space_page_size(8192);
+b.write("out.h5").unwrap();
+
+assert_eq!(File::open("out.h5").unwrap().file_space_strategy(), Some(FileSpaceStrategy::Page));
+```
+
+Persisting free space across reopen (`persist = true`) is not yet implemented — it requires writing the on-disk free-space manager blocks — so it fails loudly rather than write a file whose freed space would silently not persist.
+
 ### Streaming large files
 
 `File::open(path)` reads the whole file into memory. To read a file too large to buffer (for example a multi-gigabyte file produced on a 32-bit host, where it exceeds the address space), open it with `File::open_streaming(path)` instead. It fetches metadata and dataset chunks from the file on demand rather than buffering it whole, so it never holds the entire file in memory at once: peak memory tracks the data you actually read (one dataset, decompressed, with its chunks fetched on demand) plus the metadata being parsed, not the whole file.

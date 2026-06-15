@@ -1,0 +1,161 @@
+//! File-space management strategy via the file-creation property list (the
+//! `H5Pset_file_space_strategy` / `H5Pset_file_space_page_size` follow-on to
+//! issue #21): the writer records the chosen strategy in a superblock-extension
+//! File Space Info message, and the reader reads it back.
+
+use hdf5_pure::{File, FileBuilder, FileSpaceStrategy};
+
+fn tmp(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(name)
+}
+
+#[test]
+fn each_strategy_roundtrips() {
+    for (i, strategy) in [
+        FileSpaceStrategy::FsmAggr,
+        FileSpaceStrategy::Page,
+        FileSpaceStrategy::Aggr,
+        FileSpaceStrategy::None,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let path = tmp(&format!("hdf5_pure_fss_{i}.h5"));
+        let mut b = FileBuilder::new();
+        b.create_dataset("d").with_i32_data(&[1, 2, 3, 4]);
+        b.with_file_space_strategy(strategy, false, 7)
+            .with_file_space_page_size(8192);
+        b.write(&path).unwrap();
+
+        let f = File::open(&path).unwrap();
+        // The strategy and its parameters round-trip.
+        assert_eq!(f.file_space_strategy(), Some(strategy));
+        let info = f.file_space_info().expect("file records a strategy");
+        assert_eq!(info.strategy, strategy);
+        assert!(!info.persist);
+        assert_eq!(info.threshold, 7);
+        assert_eq!(info.page_size, 8192);
+        assert!(info.manager_addrs.is_empty());
+        // The superblock actually points at an extension.
+        let ext = f.superblock().superblock_extension_address;
+        assert!(matches!(ext, Some(a) if a != u64::MAX));
+        // The dataset still reads correctly alongside the extension.
+        assert_eq!(
+            f.dataset("d").unwrap().read_i32().unwrap(),
+            vec![1, 2, 3, 4]
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+}
+
+#[test]
+fn no_config_writes_no_extension() {
+    let path = tmp("hdf5_pure_fss_default.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("d").with_f64_data(&[1.5, 2.5]);
+    b.write(&path).unwrap();
+
+    let f = File::open(&path).unwrap();
+    // Default: no File Space Info message, matching the C library's behavior.
+    assert_eq!(f.file_space_strategy(), None);
+    assert!(f.file_space_info().is_none());
+    assert_eq!(
+        f.superblock().superblock_extension_address,
+        Some(u64::MAX),
+        "no extension is written when file space is unconfigured"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn page_size_only_defaults_strategy() {
+    let path = tmp("hdf5_pure_fss_pageonly.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("d").with_i32_data(&[9]);
+    b.with_file_space_page_size(2048);
+    b.write(&path).unwrap();
+
+    let f = File::open(&path).unwrap();
+    let info = f
+        .file_space_info()
+        .expect("page size implies a strategy record");
+    assert_eq!(info.strategy, FileSpaceStrategy::FsmAggr);
+    assert_eq!(info.page_size, 2048);
+    assert_eq!(info.threshold, 1); // default
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn strategy_survives_userblock_and_empty_file() {
+    // A userblock shifts base_address, so the extension's base-relative address
+    // must still resolve; and a file with no datasets must still carry it.
+    let path = tmp("hdf5_pure_fss_userblock.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("d").with_i32_data(&[5, 6]);
+    b.with_userblock(512)
+        .with_file_space_strategy(FileSpaceStrategy::None, false, 1);
+    b.write(&path).unwrap();
+    let f = File::open(&path).unwrap();
+    assert_eq!(f.file_space_strategy(), Some(FileSpaceStrategy::None));
+    assert_eq!(f.dataset("d").unwrap().read_i32().unwrap(), vec![5, 6]);
+    std::fs::remove_file(&path).ok();
+
+    let path = tmp("hdf5_pure_fss_empty.h5");
+    let mut b = FileBuilder::new();
+    b.with_file_space_strategy(FileSpaceStrategy::Aggr, false, 1);
+    b.write(&path).unwrap();
+    let f = File::open(&path).unwrap();
+    assert_eq!(f.file_space_strategy(), Some(FileSpaceStrategy::Aggr));
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn survives_in_place_edit() {
+    // Editing a strategy-bearing file in place must keep the strategy: the
+    // superblock extension is preserved across the append-only commit, including
+    // a delete that frees space (the extension pins end-of-file, so it is never
+    // cut by truncation).
+    use hdf5_pure::EditSession;
+    let path = tmp("hdf5_pure_fss_edit.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
+    b.with_file_space_strategy(FileSpaceStrategy::Page, false, 1)
+        .with_file_space_page_size(4096);
+    b.write(&path).unwrap();
+
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        s.create_dataset("added").with_f64_data(&vec![7.0; 512]);
+        s.commit().unwrap();
+        s.delete("added");
+        s.commit().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    assert_eq!(f.file_space_strategy(), Some(FileSpaceStrategy::Page));
+    assert_eq!(f.file_space_info().unwrap().page_size, 4096);
+    assert_eq!(
+        f.dataset("keep").unwrap().read_i32().unwrap(),
+        vec![1, 2, 3]
+    );
+    assert!(f.dataset("added").is_err());
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn persist_true_is_refused() {
+    let path = tmp("hdf5_pure_fss_persist.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("d").with_i32_data(&[1]);
+    b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1);
+    let err = b.write(&path).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            hdf5_pure::Error::Format(hdf5_pure::FormatError::FileSpacePersistUnsupported)
+        ),
+        "expected FileSpacePersistUnsupported, got {err:?}"
+    );
+    assert!(!path.exists(), "no file is written when finish() fails");
+}
