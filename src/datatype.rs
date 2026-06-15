@@ -84,11 +84,10 @@ pub enum Datatype {
         exponent_bias: u32,
     },
     /// Class 2: Time type (rarely used).
-    Time {
-        size: u32,
-        byte_order: DatatypeByteOrder,
-        bit_precision: u16,
-    },
+    ///
+    /// The byte-order bit is not modelled (this matches the parser, which has
+    /// always ignored it); a serialized time type is emitted little-endian.
+    Time { size: u32, bit_precision: u16 },
     /// Class 3: Fixed-length string.
     String {
         size: u32,
@@ -291,17 +290,11 @@ impl Datatype {
             2 => {
                 // Time
                 ensure_len(data, pos, 2)?;
-                let byte_order = if bf0 & 0x01 == 0 {
-                    DatatypeByteOrder::LittleEndian
-                } else {
-                    DatatypeByteOrder::BigEndian
-                };
                 let bit_precision = LittleEndian::read_u16(&data[pos..pos + 2]);
                 pos += 2;
                 Ok((
                     Datatype::Time {
                         size,
-                        byte_order,
                         bit_precision,
                     },
                     pos,
@@ -727,15 +720,11 @@ impl Datatype {
             }
             Datatype::Time {
                 size,
-                byte_order,
                 bit_precision,
             } => {
-                let bf0 = if matches!(byte_order, DatatypeByteOrder::BigEndian) {
-                    0x01u8
-                } else {
-                    0
-                };
-                let mut buf = Self::build_header(2, 1, [bf0, 0, 0], *size);
+                // bf0 bit 0 is the byte order; the struct does not model it, so
+                // emit little-endian (matching the parser, which ignores it).
+                let mut buf = Self::build_header(2, 1, [0, 0, 0], *size);
                 buf.extend_from_slice(&bit_precision.to_le_bytes());
                 buf
             }
@@ -1246,7 +1235,6 @@ mod tests {
             dt,
             Datatype::Time {
                 size: 8,
-                byte_order: DatatypeByteOrder::LittleEndian,
                 bit_precision: 64,
             }
         );
@@ -1447,20 +1435,14 @@ mod tests {
 
     #[test]
     fn serialize_parse_time_roundtrip() {
-        for byte_order in [
-            DatatypeByteOrder::LittleEndian,
-            DatatypeByteOrder::BigEndian,
-        ] {
-            let dt = Datatype::Time {
-                size: 8,
-                byte_order,
-                bit_precision: 64,
-            };
-            let bytes = dt.serialize();
-            let (parsed, consumed) = Datatype::parse(&bytes).unwrap();
-            assert_eq!(parsed, dt);
-            assert_eq!(consumed, bytes.len());
-        }
+        let dt = Datatype::Time {
+            size: 8,
+            bit_precision: 64,
+        };
+        let bytes = dt.serialize();
+        let (parsed, consumed) = Datatype::parse(&bytes).unwrap();
+        assert_eq!(parsed, dt);
+        assert_eq!(consumed, bytes.len());
     }
 
     #[test]

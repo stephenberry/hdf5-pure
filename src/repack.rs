@@ -16,10 +16,10 @@
 //! [`Error::RepackUnsupported`] naming the object and the reason. It refuses
 //! rather than approximate. Currently reproducible:
 //!
-//! - Datasets with fixed-point, floating-point, fixed-length string, time,
-//!   bit-field, opaque, compound, enumeration, and array datatypes,
-//!   contiguous/compact or chunked, filtered with deflate, shuffle, fletcher32,
-//!   and/or **lossless integer** scale-offset.
+//! - Datasets with fixed-point, floating-point, fixed-length string, bit-field,
+//!   opaque, compound, enumeration, and array datatypes, contiguous/compact or
+//!   chunked, filtered with deflate, shuffle, fletcher32, and/or **lossless
+//!   integer** scale-offset.
 //! - Group hierarchy of arbitrary depth.
 //! - Attributes representable as [`AttrValue`] (numbers, fixed and
 //!   variable-length strings and their arrays), on datasets, groups, and root.
@@ -27,8 +27,9 @@
 //! Repack reads each dataset's *decompressed* bytes and re-applies its filters,
 //! so it can only reproduce **lossless** filters (then the re-encoded chunks
 //! decompress to the exact same bytes). Refused (named, never dropped silently):
-//! variable-length and reference datatypes (a reference's stored absolute
-//! addresses would go stale on rewrite); virtual and external data layouts;
+//! variable-length, time (its byte order is not modelled), and reference
+//! datatypes (a reference's stored absolute addresses would go stale on
+//! rewrite); virtual and external data layouts;
 //! lossy filters — float D-scale scale-offset and ZFP, whose re-encoding is not
 //! guaranteed idempotent — and SZIP, which this crate cannot write; and any
 //! attribute whose datatype the reader cannot decode into an [`AttrValue`] (e.g.
@@ -305,9 +306,10 @@ fn check_attr_completeness(
 }
 
 /// Reject datatypes whose on-disk form this crate cannot re-emit faithfully
-/// (variable-length, and reference, whose stored absolute addresses would go
-/// stale on rewrite), recursing into compound members, enumeration bases, and
-/// array element types so a nested occurrence is caught too.
+/// (variable-length; time, whose byte order is not modelled; and reference,
+/// whose stored absolute addresses would go stale on rewrite), recursing into
+/// compound members, enumeration bases, and array element types so a nested
+/// occurrence is caught too.
 fn check_datatype(dt: &Datatype, path: &str) -> Result<(), Error> {
     let bad = |what: &str| {
         Err(Error::RepackUnsupported(format!(
@@ -321,9 +323,11 @@ fn check_datatype(dt: &Datatype, path: &str) -> Result<(), Error> {
         Datatype::FixedPoint { .. }
         | Datatype::FloatingPoint { .. }
         | Datatype::String { .. }
-        | Datatype::Time { .. }
         | Datatype::BitField { .. }
         | Datatype::Opaque { .. } => Ok(()),
+        // The time type's serialized byte order is not modelled (always emitted
+        // little-endian), so a big-endian source could not be reproduced exactly.
+        Datatype::Time { .. } => bad("time"),
         Datatype::VariableLength { .. } => bad("variable-length"),
         Datatype::Reference { .. } => bad("reference"),
         Datatype::Compound { members, .. } => {
