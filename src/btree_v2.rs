@@ -194,6 +194,81 @@ fn max_records_leaf(node_size: u32, record_size: u16) -> u64 {
     ((node_size - overhead) / record_size as u32) as u64
 }
 
+/// The per-level child-pointer field widths of a v2 B-tree's doubling table,
+/// computed exactly as the HDF5 C library does (`H5B2hdr.c`).
+///
+/// An internal node's child pointer is `address + records-in-child +
+/// total-records-in-subtree`. The last two are variable-width integers whose
+/// sizes the on-disk format does not store; a reader must recompute them from
+/// the node size, record size, and tree depth, or it mis-reads every pointer.
+/// The widths are *not* a simple function of the leaf capacity — the
+/// per-subtree-total width follows the recurrence
+/// `cum_max_nrec[u] = (max_nrec[u] + 1) * cum_max_nrec[u-1] + max_nrec[u]`,
+/// and an earlier conservative estimate of it disagreed with the C library at
+/// depth 3 and beyond, leaving large groups (tens of thousands of links)
+/// unreadable.
+struct NodeInfo {
+    /// Bytes encoding a child pointer's "number of records in the child node".
+    /// HDF5 uses one width at every level, taken from the leaf maximum (the
+    /// largest, since `max_nrec` shrinks with depth).
+    max_nrec_size: usize,
+    /// Bytes encoding a child pointer's "total records in the child's subtree",
+    /// indexed by the child node's depth. `[0]` is 0 (a leaf has no subtree
+    /// total); `[u]` sizes the field for a child at depth `u`.
+    cum_max_nrec_size: Vec<usize>,
+}
+
+impl NodeInfo {
+    /// Build the doubling-table widths for a tree of the given root `depth`.
+    fn compute(node_size: u32, record_size: u16, offset_size: u8, depth: u16) -> NodeInfo {
+        // Level 0: leaf.
+        let max_nrec0 = max_records_leaf(node_size, record_size);
+        let max_nrec_size = bytes_for_max_records(max_nrec0);
+
+        let mut cum_max_nrec_size = Vec::with_capacity(depth as usize + 1);
+        cum_max_nrec_size.push(0); // a leaf's pointer carries no subtree total
+        let rs = record_size as usize;
+        let mut prev_cum = max_nrec0;
+        for u in 1..=depth as usize {
+            // Internal-pointer size at this level uses the *previous* level's
+            // subtree-total width (H5B2_INT_POINTER_SIZE).
+            let int_ptr = offset_size as usize + max_nrec_size + cum_max_nrec_size[u - 1];
+            // Records that fit an internal node at this level (H5B2_NUM_INT_REC).
+            let avail = (node_size as usize).saturating_sub(10 + int_ptr);
+            let denom = rs + int_ptr;
+            let max_nrec_u = avail.checked_div(denom).unwrap_or(0) as u64;
+            // cum_max_nrec[u] = (max_nrec[u] + 1) * cum_max_nrec[u-1] + max_nrec[u]
+            let cum = max_nrec_u
+                .saturating_add(1)
+                .saturating_mul(prev_cum)
+                .saturating_add(max_nrec_u);
+            cum_max_nrec_size.push(bytes_for_max_records(cum));
+            prev_cum = cum;
+        }
+
+        NodeInfo {
+            max_nrec_size,
+            cum_max_nrec_size,
+        }
+    }
+
+    /// Width of a child pointer's "total records in subtree" field for a node at
+    /// `depth` (its children sit one level below, so the field has width
+    /// `cum_max_nrec_size[depth - 1]`; for `depth == 1` the children are leaves
+    /// and the field is absent).
+    fn total_nrec_size(&self, depth: u16) -> usize {
+        self.cum_max_nrec_size
+            .get((depth - 1) as usize)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Full on-disk width of one child pointer for a node at `depth`.
+    fn child_ptr_size(&self, depth: u16, offset_size: u8) -> usize {
+        offset_size as usize + self.max_nrec_size + self.total_nrec_size(depth)
+    }
+}
+
 /// Collect all records from a B-tree v2 by traversing from the root.
 pub fn collect_btree_v2_records(
     file_data: &[u8],
@@ -205,8 +280,6 @@ pub fn collect_btree_v2_records(
         return Ok(Vec::new());
     }
 
-    let max_leaf_nrec = max_records_leaf(header.node_size, header.record_size);
-
     if header.depth == 0 {
         // Root is a leaf
         parse_leaf_records(
@@ -217,6 +290,12 @@ pub fn collect_btree_v2_records(
         )
     } else {
         // Root is internal; traverse recursively
+        let node_info = NodeInfo::compute(
+            header.node_size,
+            header.record_size,
+            offset_size,
+            header.depth,
+        );
         let mut records = Vec::new();
         collect_internal_records(
             file_data,
@@ -227,7 +306,7 @@ pub fn collect_btree_v2_records(
             header.node_size,
             offset_size,
             length_size,
-            max_leaf_nrec,
+            &node_info,
             &mut records,
         )?;
         Ok(records)
@@ -290,7 +369,7 @@ fn parse_internal_child_pointers(
     depth: u16,
     record_size: u16,
     offset_size: u8,
-    max_leaf_nrec: u64,
+    node_info: &NodeInfo,
 ) -> Result<Vec<(u64, u16)>, FormatError> {
     // signature(4) + version(1) + type(1) = 6
     ensure_len(node, 0, 6)?;
@@ -305,27 +384,14 @@ fn parse_internal_child_pointers(
     ensure_len(node, pos, nr * rs)?;
     pos += nr * rs;
 
-    // Child-pointer encoding widths (variable, per the HDF5 spec).
-    let child_depth = depth - 1;
-    let max_nrec_child = if child_depth == 0 {
-        max_leaf_nrec
-    } else {
-        // Computing the exact max records at an internal child depth is complex;
-        // a conservative upper bound from the leaf max is sufficient to size the
-        // variable-width nrec field.
-        max_leaf_nrec * 2
-    };
-    let nrec_width = bytes_for_max_records(max_nrec_child);
-
-    let total_nrec_width = if depth > 1 {
-        let max_total = header_max_total_records(max_leaf_nrec, depth - 1);
-        bytes_for_max_records(max_total)
-    } else {
-        0
-    };
+    // Child-pointer field widths, computed exactly from the doubling table:
+    // the records-in-child field is one width at every level, and the
+    // subtree-total field's width is that of the child's depth (`depth - 1`).
+    let nrec_width = node_info.max_nrec_size;
+    let total_nrec_width = node_info.total_nrec_size(depth);
 
     let num_children = nr + 1;
-    let child_ptr_size = offset_size as usize + nrec_width + total_nrec_width;
+    let child_ptr_size = node_info.child_ptr_size(depth, offset_size);
     ensure_len(node, pos, num_children * child_ptr_size)?;
 
     let mut children = Vec::with_capacity(num_children);
@@ -352,7 +418,7 @@ fn collect_internal_records(
     node_size: u32,
     offset_size: u8,
     length_size: u8,
-    max_leaf_nrec: u64,
+    node_info: &NodeInfo,
     out: &mut Vec<BTreeV2Record>,
 ) -> Result<(), FormatError> {
     ensure_len(file_data, offset, 6)?;
@@ -363,7 +429,7 @@ fn collect_internal_records(
         depth,
         record_size,
         offset_size,
-        max_leaf_nrec,
+        node_info,
     )?;
 
     let nr = num_records as usize;
@@ -389,7 +455,7 @@ fn collect_internal_records(
                 node_size,
                 offset_size,
                 length_size,
-                max_leaf_nrec,
+                node_info,
                 out,
             )?;
         }
@@ -417,7 +483,12 @@ pub fn collect_btree_v2_records_from_source<S: FileSource + ?Sized>(
     if header.total_records == 0 || header.num_records_in_root == 0 {
         return Ok(Vec::new());
     }
-    let max_leaf_nrec = max_records_leaf(header.node_size, header.record_size);
+    let node_info = NodeInfo::compute(
+        header.node_size,
+        header.record_size,
+        offset_size,
+        header.depth,
+    );
     let mut records = Vec::new();
     collect_node_from_source(
         source,
@@ -427,7 +498,7 @@ pub fn collect_btree_v2_records_from_source<S: FileSource + ?Sized>(
         header.record_size,
         header.node_size,
         offset_size,
-        max_leaf_nrec,
+        &node_info,
         &mut records,
     )?;
     Ok(records)
@@ -445,7 +516,7 @@ fn collect_node_from_source<S: FileSource + ?Sized>(
     record_size: u16,
     node_size: u32,
     offset_size: u8,
-    max_leaf_nrec: u64,
+    node_info: &NodeInfo,
     out: &mut Vec<BTreeV2Record>,
 ) -> Result<(), FormatError> {
     // Every node occupies `node_size` bytes; read that window (clamped to the
@@ -466,7 +537,7 @@ fn collect_node_from_source<S: FileSource + ?Sized>(
         depth,
         record_size,
         offset_size,
-        max_leaf_nrec,
+        node_info,
     )?;
 
     let nr = num_records as usize;
@@ -481,7 +552,7 @@ fn collect_node_from_source<S: FileSource + ?Sized>(
             record_size,
             node_size,
             offset_size,
-            max_leaf_nrec,
+            node_info,
             out,
         )?;
         if i < nr {
@@ -493,16 +564,6 @@ fn collect_node_from_source<S: FileSource + ?Sized>(
     }
 
     Ok(())
-}
-
-/// Estimate maximum total records at a given depth (for variable-width encoding).
-fn header_max_total_records(max_leaf_nrec: u64, depth: u16) -> u64 {
-    // Conservative: branching factor * max_leaf at each level
-    let mut total = max_leaf_nrec;
-    for _ in 0..depth {
-        total = total.saturating_mul(max_leaf_nrec.max(2));
-    }
-    total
 }
 
 #[cfg(test)]
@@ -558,6 +619,119 @@ mod tests {
         buf
     }
 
+    // ---- Synthetic multi-level tree construction (8-byte offsets) ----
+
+    /// An 11-byte record carrying its in-order id in byte 0.
+    fn rec(id: u8) -> [u8; 11] {
+        let mut r = [0u8; 11];
+        r[0] = id;
+        r
+    }
+
+    /// Append a leaf node, returning its address.
+    fn put_leaf(file: &mut Vec<u8>, tree_type: u8, recs: &[[u8; 11]]) -> u64 {
+        let addr = file.len() as u64;
+        let mut node = vec![b'B', b'T', b'L', b'F', 0, tree_type];
+        for r in recs {
+            node.extend_from_slice(r);
+        }
+        let ck = crate::checksum::jenkins_lookup3(&node);
+        node.extend_from_slice(&ck.to_le_bytes());
+        file.extend_from_slice(&node);
+        addr
+    }
+
+    /// Append an internal node. `children` is `(addr, records-in-child,
+    /// total-records-in-subtree)`; `max_nrec_size` / `total_width` are the
+    /// doubling-table field widths for the node's level.
+    fn put_internal(
+        file: &mut Vec<u8>,
+        tree_type: u8,
+        recs: &[[u8; 11]],
+        children: &[(u64, u16, u64)],
+        max_nrec_size: usize,
+        total_width: usize,
+    ) -> u64 {
+        let addr = file.len() as u64;
+        let mut node = vec![b'B', b'T', b'I', b'N', 0, tree_type];
+        for r in recs {
+            node.extend_from_slice(r);
+        }
+        for &(caddr, nrec, total) in children {
+            node.extend_from_slice(&caddr.to_le_bytes()); // 8-byte offset
+            node.extend_from_slice(&u64::from(nrec).to_le_bytes()[..max_nrec_size]);
+            node.extend_from_slice(&total.to_le_bytes()[..total_width]);
+        }
+        let ck = crate::checksum::jenkins_lookup3(&node);
+        node.extend_from_slice(&ck.to_le_bytes());
+        file.extend_from_slice(&node);
+        addr
+    }
+
+    /// A hand-built depth-3 B-tree (the same node/record sizes the C library
+    /// uses for a dense group's name index) must be traversed in record order.
+    /// This is the regression the field-width fix targets: at depth 3 the
+    /// subtree-total field is 2 bytes (`cum_max_nrec_size[2]`), and the earlier
+    /// over-estimate read it as 3, misaligning every root child pointer.
+    #[test]
+    fn reads_depth_3_btree() {
+        // For node_size=512, record_size=11, 8-byte offsets: max_nrec_size = 1,
+        // cum_max_nrec_size = [0, 2, 2]; so depth-1 child pointers carry no
+        // subtree total, while depth-2 and depth-3 pointers carry a 2-byte one.
+        let mut file = vec![0u8; 64]; // header occupies the front; tree follows
+
+        // Eight leaves, each one record; four depth-1 nodes; two depth-2 nodes;
+        // one depth-3 root. In-order traversal yields ids 0..15.
+        let leaf = |f: &mut Vec<u8>, id: u8| put_leaf(f, 5, &[rec(id)]);
+        let l0 = leaf(&mut file, 0);
+        let l2 = leaf(&mut file, 2);
+        let l4 = leaf(&mut file, 4);
+        let l6 = leaf(&mut file, 6);
+        let l8 = leaf(&mut file, 8);
+        let l10 = leaf(&mut file, 10);
+        let l12 = leaf(&mut file, 12);
+        let l14 = leaf(&mut file, 14);
+
+        // Depth-1 internal nodes (children are leaves: total_width = 0).
+        let n1 = put_internal(&mut file, 5, &[rec(1)], &[(l0, 1, 1), (l2, 1, 1)], 1, 0);
+        let n2 = put_internal(&mut file, 5, &[rec(5)], &[(l4, 1, 1), (l6, 1, 1)], 1, 0);
+        let n3 = put_internal(&mut file, 5, &[rec(9)], &[(l8, 1, 1), (l10, 1, 1)], 1, 0);
+        let n4 = put_internal(&mut file, 5, &[rec(13)], &[(l12, 1, 1), (l14, 1, 1)], 1, 0);
+
+        // Depth-2 internal nodes (children are depth-1: total_width = 2).
+        let m1 = put_internal(&mut file, 5, &[rec(3)], &[(n1, 1, 3), (n2, 1, 3)], 1, 2);
+        let m2 = put_internal(&mut file, 5, &[rec(11)], &[(n3, 1, 3), (n4, 1, 3)], 1, 2);
+
+        // Depth-3 root (children are depth-2: total_width = 2).
+        let root = put_internal(&mut file, 5, &[rec(7)], &[(m1, 1, 7), (m2, 1, 7)], 1, 2);
+
+        // Lay the header (root address, depth 3, 15 total records) at the front.
+        let header = build_btree_v2_header(5, 512, 11, 3, root, 1, 15, 8, 8);
+        file[..header.len()].copy_from_slice(&header);
+
+        let hdr = BTreeV2Header::parse(&file, 0, 8, 8).unwrap();
+        let ids: Vec<u8> = collect_btree_v2_records(&file, &hdr, 8, 8)
+            .unwrap()
+            .iter()
+            .map(|r| r.data[0])
+            .collect();
+        assert_eq!(ids, (0u8..15).collect::<Vec<_>>());
+
+        // The streaming collector must agree.
+        #[cfg(feature = "std")]
+        {
+            use crate::source::BytesSource;
+            let src = BytesSource::new(&file);
+            let hdr_s = BTreeV2Header::parse_from_source(&src, 0, 8, 8).unwrap();
+            let ids_s: Vec<u8> = collect_btree_v2_records_from_source(&src, &hdr_s, 8, 8)
+                .unwrap()
+                .iter()
+                .map(|r| r.data[0])
+                .collect();
+            assert_eq!(ids_s, (0u8..15).collect::<Vec<_>>());
+        }
+    }
+
     #[test]
     fn parse_header() {
         let data = build_btree_v2_header(5, 512, 11, 0, 0x1000, 3, 3, 8, 8);
@@ -569,6 +743,29 @@ mod tests {
         assert_eq!(hdr.root_node_address, 0x1000);
         assert_eq!(hdr.num_records_in_root, 3);
         assert_eq!(hdr.total_records, 3);
+    }
+
+    #[test]
+    fn node_info_matches_hdf5_widths() {
+        // Real name-index B-tree parameters (node 512, record 11, 8-byte
+        // offsets), hand-verified against H5B2hdr.c. The depth-3 regression:
+        // a depth-3 root's child pointer is 11 bytes (8 + max_nrec_size 1 +
+        // cum_max_nrec_size[2] 2), not 12. The earlier estimate produced a
+        // 3-byte subtree-total field (from 45^3 = 91125) instead of the exact
+        // 2 (from cum_max_nrec[2] = 26449), misaligning every pointer and making
+        // groups of ~26k+ links unreadable.
+        let ni = NodeInfo::compute(512, 11, 8, 3);
+        assert_eq!(ni.max_nrec_size, 1);
+        assert_eq!(ni.cum_max_nrec_size, vec![0, 2, 2, 3]);
+        assert_eq!(ni.child_ptr_size(1, 8), 9); // depth-1 children are leaves
+        assert_eq!(ni.child_ptr_size(2, 8), 11);
+        assert_eq!(ni.child_ptr_size(3, 8), 11);
+
+        // A larger leaf capacity needs a 2-byte per-node record count:
+        // (4096 - 10) / 8 = 510 records, and enc(510) = 2. This also guards the
+        // old `enc(max_leaf * 2)` mistake for the records-in-child field.
+        let big = NodeInfo::compute(4096, 8, 8, 1);
+        assert_eq!(big.max_nrec_size, 2);
     }
 
     #[test]
