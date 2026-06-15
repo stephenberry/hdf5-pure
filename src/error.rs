@@ -53,6 +53,13 @@ pub enum FormatError {
     InvalidByteOrder(u8),
     /// Invalid reference type.
     InvalidReferenceType(u8),
+    /// Invalid file-space management strategy code in a File Space Info message.
+    InvalidFileSpaceStrategy(u8),
+    /// Unsupported File Space Info message version (only version 1 is handled).
+    UnsupportedFileSpaceInfoVersion(u8),
+    /// Persisting free space on disk (`persist = true`) is not yet supported by
+    /// the writer.
+    FileSpacePersistUnsupported,
     /// A compound datatype has a zero total size.
     InvalidCompoundSize,
     /// A compound datatype contains no fields.
@@ -313,6 +320,18 @@ impl fmt::Display for FormatError {
             }
             FormatError::InvalidReferenceType(r) => {
                 write!(f, "invalid reference type: {r}")
+            }
+            FormatError::InvalidFileSpaceStrategy(s) => {
+                write!(f, "invalid file-space strategy code: {s}")
+            }
+            FormatError::UnsupportedFileSpaceInfoVersion(v) => {
+                write!(f, "unsupported File Space Info message version: {v}")
+            }
+            FormatError::FileSpacePersistUnsupported => {
+                write!(
+                    f,
+                    "persisting free space on disk (persist = true) is not yet supported"
+                )
             }
             FormatError::InvalidCompoundSize => {
                 write!(f, "compound datatype size must be greater than zero")

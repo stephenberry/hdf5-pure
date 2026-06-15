@@ -12,6 +12,7 @@ use crate::data_read;
 use crate::dataspace::Dataspace;
 use crate::datatype::Datatype;
 use crate::error::{Error, FormatError};
+use crate::file_space_info::{FileSpaceInfo, FileSpaceStrategy};
 use crate::filter_pipeline::FilterPipeline;
 use crate::group_v1::GroupEntry;
 use crate::group_v2;
@@ -97,6 +98,10 @@ pub struct File {
     /// Live file handle, retained only when the file was opened with
     /// [`File::open_swmr`] so [`File::refresh`] can re-read appended data.
     handle: Option<std::fs::File>,
+    /// File Space Info parsed from the superblock extension, if the file records
+    /// one. Best-effort: a malformed or unreadable extension leaves this `None`
+    /// rather than failing the open.
+    file_space_info: Option<FileSpaceInfo>,
 }
 
 impl File {
@@ -128,12 +133,12 @@ impl File {
         let handle = std::fs::File::open(path.as_ref()).map_err(Error::Io)?;
         let source = ReadSeekSource::new(handle).map_err(Error::Format)?;
         let (superblock, addr_offset) = Self::parse_superblock_source(&source)?;
-        Ok(Self {
-            backend: Backend::Streaming(Box::new(source)),
+        Ok(Self::from_parts(
+            Backend::Streaming(Box::new(source)),
             superblock,
             addr_offset,
-            handle: None,
-        })
+            None,
+        ))
     }
 
     /// Open an HDF5 file for SWMR (single-writer/multiple-reader) reading.
@@ -151,23 +156,23 @@ impl File {
         let mut data = Vec::new();
         handle.read_to_end(&mut data).map_err(Error::Io)?;
         let (superblock, addr_offset) = Self::parse_superblock(&data)?;
-        Ok(Self {
-            backend: Backend::InMemory(data),
+        Ok(Self::from_parts(
+            Backend::InMemory(data),
             superblock,
             addr_offset,
-            handle: Some(handle),
-        })
+            Some(handle),
+        ))
     }
 
     /// Open an HDF5 file from an in-memory byte vector.
     pub fn from_bytes(data: Vec<u8>) -> Result<Self, Error> {
         let (superblock, addr_offset) = Self::parse_superblock(&data)?;
-        Ok(Self {
-            backend: Backend::InMemory(data),
+        Ok(Self::from_parts(
+            Backend::InMemory(data),
             superblock,
             addr_offset,
-            handle: None,
-        })
+            None,
+        ))
     }
 
     /// A `FileSource` view over the backend, for the streaming-capable paths.
@@ -199,6 +204,48 @@ impl File {
         let addr_offset = superblock.base_address;
         superblock.root_group_address += addr_offset;
         Ok((superblock, addr_offset))
+    }
+
+    /// Assemble a [`File`] from parsed parts, then load the File Space Info from
+    /// the superblock extension (best-effort, so a bad extension never fails the
+    /// open).
+    fn from_parts(
+        backend: Backend,
+        superblock: Superblock,
+        addr_offset: u64,
+        handle: Option<std::fs::File>,
+    ) -> Self {
+        let mut file = File {
+            backend,
+            superblock,
+            addr_offset,
+            handle,
+            file_space_info: None,
+        };
+        file.file_space_info = file.read_file_space_info();
+        file
+    }
+
+    /// Parse the File Space Info message from the superblock extension, if the
+    /// file records one and it can be read. Best-effort: any failure (no
+    /// extension, unreadable object header, malformed message) yields `None`.
+    fn read_file_space_info(&self) -> Option<FileSpaceInfo> {
+        let rel = self.superblock.superblock_extension_address?;
+        if rel == u64::MAX {
+            return None;
+        }
+        let abs = self.addr_offset.checked_add(rel)?;
+        let header = self.parse_header(abs).ok()?;
+        let msg = header
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::FileSpaceInfo)?;
+        FileSpaceInfo::parse(
+            &msg.data,
+            self.superblock.offset_size,
+            self.superblock.length_size,
+        )
+        .ok()
     }
 
     /// Re-read the file from disk to pick up data appended by a concurrent
@@ -240,6 +287,7 @@ impl File {
                     self.backend = Backend::InMemory(data);
                     self.superblock = superblock;
                     self.addr_offset = addr_offset;
+                    self.file_space_info = self.read_file_space_info();
                     return Ok(());
                 }
                 Err(e) => {
@@ -314,6 +362,21 @@ impl File {
     /// Returns a reference to the parsed superblock.
     pub fn superblock(&self) -> &Superblock {
         &self.superblock
+    }
+
+    /// The file-space management strategy this file records in its superblock
+    /// extension (set with `H5Pset_file_space_strategy`), or `None` if the file
+    /// records none — the default, which the C library also writes as "no
+    /// message". See [`file_space_info`](Self::file_space_info) for the full
+    /// record (persist flag, threshold, page size).
+    pub fn file_space_strategy(&self) -> Option<FileSpaceStrategy> {
+        self.file_space_info.as_ref().map(|info| info.strategy)
+    }
+
+    /// The full [`FileSpaceInfo`] recorded in this file's superblock extension,
+    /// if present and readable.
+    pub fn file_space_info(&self) -> Option<&FileSpaceInfo> {
+        self.file_space_info.as_ref()
     }
 
     /// The size of the underlying file in bytes (the HDF5 `H5Fget_filesize`).

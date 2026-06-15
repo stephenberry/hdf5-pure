@@ -119,6 +119,7 @@ pub(crate) mod dataspace;
 pub(crate) mod datatype;
 pub(crate) mod error;
 pub(crate) mod extensible_array;
+pub(crate) mod file_space_info;
 pub(crate) mod file_writer;
 pub(crate) mod filter_pipeline;
 pub(crate) mod filters;
@@ -218,6 +219,8 @@ pub use repack::{RepackOptions, repack};
 pub use ndarray_support::H5Element;
 
 pub use scaleoffset::ScaleOffset;
+
+pub use file_space_info::{FileSpaceInfo, FileSpaceStrategy};
 
 // The HDF5 datatype handle returned by the `make_*_type` constructors and
 // accepted by the compound/enum builders and `DatasetBuilder::with_dtype`.

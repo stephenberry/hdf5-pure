@@ -23,6 +23,9 @@
 //! - Group hierarchy of arbitrary depth.
 //! - Attributes representable as [`AttrValue`] (numbers, fixed and
 //!   variable-length strings and their arrays), on datasets, groups, and root.
+//! - The source file's file-space management strategy (with its page size and
+//!   threshold), carried into the compact output as non-persistent — a repacked
+//!   file has no free space to persist.
 //!
 //! Repack reads each dataset's *decompressed* bytes and re-applies its filters,
 //! so it can only reproduce **lossless** filters (then the re-encoded chunks
@@ -97,6 +100,15 @@ pub fn repack<P: AsRef<Path>, Q: AsRef<Path>>(
     let mut matched: BTreeSet<String> = BTreeSet::new();
 
     let mut builder = FileBuilder::new();
+    // Carry the source's file-space strategy forward. The repacked file is
+    // compact with no free space, so the strategy and its page size/threshold
+    // are preserved but `persist` is reset to false — there is nothing to
+    // persist, and writing persistent free-space blocks is a separate feature.
+    if let Some(info) = file.file_space_info() {
+        builder
+            .with_file_space_strategy(info.strategy, false, info.threshold)
+            .with_file_space_page_size(info.page_size);
+    }
     let root = file.root();
     populate(&mut builder, &root, "", &drop, &mut matched)?;
 

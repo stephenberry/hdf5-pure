@@ -21,6 +21,7 @@ pub enum MessageType {
     SharedMessageTable,
     AttributeInfo,
     ObjectReferenceCount,
+    FileSpaceInfo,
     /// Unknown message type with its raw type ID.
     Unknown(u16),
 }
@@ -47,6 +48,7 @@ impl MessageType {
             0x0013 => MessageType::BTreeKValues,
             0x0015 => MessageType::AttributeInfo,
             0x0016 => MessageType::ObjectReferenceCount,
+            0x0017 => MessageType::FileSpaceInfo,
             other => MessageType::Unknown(other),
         }
     }
@@ -72,6 +74,7 @@ impl MessageType {
             MessageType::BTreeKValues => 0x0013,
             MessageType::AttributeInfo => 0x0015,
             MessageType::ObjectReferenceCount => 0x0016,
+            MessageType::FileSpaceInfo => 0x0017,
             MessageType::Unknown(v) => v,
         }
     }
@@ -102,6 +105,7 @@ mod tests {
             (0x0013, MessageType::BTreeKValues),
             (0x0015, MessageType::AttributeInfo),
             (0x0016, MessageType::ObjectReferenceCount),
+            (0x0017, MessageType::FileSpaceInfo),
         ];
         for (val, expected) in &known {
             let mt = MessageType::from_u16(*val);
