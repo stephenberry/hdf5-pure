@@ -184,10 +184,58 @@ Supported subset: one unlimited dimension, chunked, unfiltered (no compression o
 | `with_complex32_data` | Compound `{real: f32, imag: f32}` |
 | `with_complex64_data` | Compound `{real: f64, imag: f64}` |
 | `with_compound_data` | Arbitrary compound types |
+| `with_compound_values` | Safely encoded numeric tuples |
 | `with_enum_i32_data` / `with_enum_u8_data` | Enumeration types |
 | `with_array_data` | Fixed-size array types |
 | `with_path_references` | Object references (resolved by path) |
 | `with_dtype` + `with_shape` | Empty/zero-dimension datasets |
+
+### Compound types
+
+Numeric tuples are encoded field by field, without relying on Rust tuple layout:
+
+```rust
+use hdf5_pure::{File, FileBuilder};
+
+let values = [(1i8, 20u64, 3.5f32), (2, 30, 4.5)];
+let mut builder = FileBuilder::new();
+builder.create_dataset("records")
+    .with_compound_values(&values)
+    .unwrap();
+let bytes = builder.finish().unwrap();
+
+let file = File::from_bytes(bytes).unwrap();
+let records = file.dataset("records").unwrap()
+    .read_compound::<(i8, u64, f32)>()
+    .unwrap();
+assert_eq!(records, values);
+```
+
+Use `CompoundTypeBuilder::with_size` for an `H5Tinsert`-style layout with explicit offsets and padding. `Dataset::datatype` exposes the exact field offsets from existing files, while `Dataset::read_raw` returns their complete unfiltered record bytes.
+
+### Variable-length string reads
+
+`Dataset::read_string` reads both fixed-length and variable-length HDF5 string datasets. VL reads can be bounded before payload allocation, or consumed one string at a time:
+
+```rust
+use hdf5_pure::{File, VlenStringReadOptions};
+
+let file = File::open_streaming("strings.h5").unwrap();
+let dataset = file.dataset("names").unwrap();
+
+let payload_bytes = dataset.vlen_string_payload_size().unwrap();
+let options = VlenStringReadOptions::new()
+    .with_max_elements(100_000)
+    .with_max_payload_bytes(64 * 1024 * 1024);
+
+dataset.visit_vlen_strings(options, |value| {
+    println!("{value}");
+}).unwrap();
+
+println!("{payload_bytes} bytes of string payload");
+```
+
+The payload limit covers bytes referenced by VL elements and excludes Rust container metadata. Shared global heap collections are indexed once per read, and only the referenced object payloads are fetched. This works with both `File::open` and `File::open_streaming`.
 
 ### Attributes
 

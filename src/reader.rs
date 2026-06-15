@@ -5,6 +5,7 @@ use std::io::{Read, Seek, SeekFrom};
 
 use crate::attribute::extract_attributes_full;
 use crate::chunk_cache::ChunkCache;
+use crate::compound::CompoundType;
 use crate::convert::TryToUsize;
 use crate::data_layout::DataLayout;
 use crate::data_read;
@@ -20,6 +21,7 @@ use crate::object_header::ObjectHeader;
 use crate::signature;
 use crate::source::{BytesSource, FileSource, ReadSeekSource};
 use crate::superblock::Superblock;
+use crate::vl_data::{self, VlenStringReadOptions};
 
 use crate::types::{AttrValue, DType, attrs_to_map, classify_datatype};
 
@@ -641,10 +643,93 @@ impl<'f> Dataset<'f> {
     }
 
     /// Read all data as `String` values.
+    ///
+    /// Fixed-length and variable-length HDF5 string datasets are both
+    /// supported. Use [`read_vlen_strings`](Self::read_vlen_strings) when
+    /// variable-length allocation limits are required.
     pub fn read_string(&self) -> Result<Vec<String>, Error> {
-        let raw = self.read_raw()?;
         let dt = self.datatype()?;
-        Ok(data_read::read_as_strings(&raw, &dt)?)
+        if vl_data::is_vlen_string_datatype(&dt) {
+            self.read_vlen_strings(VlenStringReadOptions::default())
+        } else {
+            let raw = self.read_raw()?;
+            Ok(data_read::read_as_strings(&raw, &dt)?)
+        }
+    }
+
+    /// Return the total bytes referenced by this VL string dataset.
+    ///
+    /// This is the payload equivalent of HDF5's `H5Dvlen_get_buf_size`: it
+    /// excludes `Vec<String>` and `String` allocation metadata.
+    pub fn vlen_string_payload_size(&self) -> Result<u64, Error> {
+        let datatype = self.datatype()?;
+        if !vl_data::is_vlen_string_datatype(&datatype) {
+            return Err(FormatError::TypeMismatch {
+                expected: "VariableLength string",
+                actual: "non-VariableLength string",
+            }
+            .into());
+        }
+        let dataspace = self.dataspace()?;
+        let raw = self.read_raw()?;
+        Ok(vl_data::vlen_string_payload_size(
+            &raw,
+            dataspace.num_elements(),
+            self.file.offset_size(),
+        )?)
+    }
+
+    /// Read a VL string dataset with explicit allocation limits.
+    ///
+    /// Both limits are checked before any string payload is materialized.
+    pub fn read_vlen_strings(&self, options: VlenStringReadOptions) -> Result<Vec<String>, Error> {
+        let mut strings = Vec::new();
+        self.visit_vlen_strings(options, |string| strings.push(string.to_owned()))?;
+        Ok(strings)
+    }
+
+    /// Visit a VL string dataset one element at a time.
+    ///
+    /// The string slice passed to `visitor` is valid only for the duration of
+    /// that callback. This avoids retaining all decoded string payloads at once.
+    pub fn visit_vlen_strings<F>(
+        &self,
+        options: VlenStringReadOptions,
+        visitor: F,
+    ) -> Result<(), Error>
+    where
+        F: FnMut(&str),
+    {
+        let datatype = self.datatype()?;
+        if !vl_data::is_vlen_string_datatype(&datatype) {
+            return Err(FormatError::TypeMismatch {
+                expected: "VariableLength string",
+                actual: "non-VariableLength string",
+            }
+            .into());
+        }
+        let dataspace = self.dataspace()?;
+        if let Some(limit) = options.max_elements()
+            && dataspace.num_elements() > limit as u64
+        {
+            return Err(FormatError::VariableLengthElementLimitExceeded {
+                limit,
+                actual: dataspace.num_elements(),
+            }
+            .into());
+        }
+        let raw = self.read_raw()?;
+        let source = self.file.source();
+        Ok(vl_data::visit_vl_strings_from_source(
+            &source,
+            &raw,
+            dataspace.num_elements(),
+            self.file.offset_size(),
+            self.file.length_size(),
+            self.file.addr_offset,
+            options,
+            visitor,
+        )?)
     }
 
     /// Read all attributes of this dataset.
@@ -659,7 +744,9 @@ impl<'f> Dataset<'f> {
         self.file.attr_message_names_of(&self.header)
     }
 
-    pub(crate) fn datatype(&self) -> Result<Datatype, Error> {
+    /// Returns the exact HDF5 datatype, including compound field offsets and
+    /// total record size.
+    pub fn datatype(&self) -> Result<Datatype, Error> {
         let msg = find_message(&self.header, MessageType::Datatype)?;
         let (dt, _) = Datatype::parse(&msg.data)?;
         Ok(dt)
@@ -687,7 +774,11 @@ impl<'f> Dataset<'f> {
             .and_then(|msg| FilterPipeline::parse(&msg.data).ok())
     }
 
-    pub(crate) fn read_raw(&self) -> Result<Vec<u8>, Error> {
+    /// Read the dataset's exact unfiltered element bytes.
+    ///
+    /// For compound datasets this preserves all file padding and uses the
+    /// offsets reported by [`datatype`](Self::datatype).
+    pub fn read_raw(&self) -> Result<Vec<u8>, Error> {
         let dt = self.datatype()?;
         let ds = self.dataspace()?;
         let mut dl = self.data_layout()?;
@@ -704,6 +795,34 @@ impl<'f> Dataset<'f> {
         Ok(self
             .file
             .read_dataset_raw(&dl, &ds, &dt, pipeline.as_ref(), &self.chunk_cache)?)
+    }
+
+    /// Decode all elements of a compound dataset field by field.
+    ///
+    /// Built-in implementations support numeric tuples with one through twelve
+    /// fields. Decoding uses the file's field offsets rather than Rust's tuple
+    /// memory layout, so padded compound records are supported safely.
+    pub fn read_compound<T: CompoundType>(&self) -> Result<Vec<T>, Error> {
+        let datatype = self.datatype()?;
+        let element_size = datatype.type_size().to_usize()?;
+        if !matches!(datatype, Datatype::Compound { .. }) {
+            return Err(FormatError::TypeMismatch {
+                expected: "Compound",
+                actual: "non-Compound",
+            }
+            .into());
+        }
+        let raw = self.read_raw()?;
+        if element_size == 0 || !raw.len().is_multiple_of(element_size) {
+            return Err(FormatError::DataSizeMismatch {
+                expected: element_size,
+                actual: raw.len(),
+            }
+            .into());
+        }
+        raw.chunks_exact(element_size)
+            .map(|bytes| T::decode(&datatype, bytes).map_err(Error::from))
+            .collect()
     }
 
     /// Verify this dataset against its stored provenance hash.

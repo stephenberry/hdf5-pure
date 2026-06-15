@@ -1,4 +1,6 @@
-use hdf5_pure::{AttrValue, CompoundTypeBuilder, DType, File, FileBuilder, make_f64_type};
+use hdf5_pure::{
+    AttrValue, CompoundTypeBuilder, DType, Datatype, File, FileBuilder, FormatError, make_f64_type,
+};
 
 #[test]
 fn roundtrip_f64_dataset() {
@@ -228,6 +230,152 @@ fn roundtrip_compound_complex64() {
             assert_eq!(fields[1].0, "imag");
         }
         other => panic!("expected compound, got {other}"),
+    }
+}
+
+#[test]
+fn roundtrip_compound_tuple_field_wise() {
+    let values = [(-5i8, 10u64, 1.25f32), (7i8, u64::MAX, -3.5f32)];
+
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("tuples")
+        .with_compound_values(&values)
+        .unwrap();
+    let bytes = builder.finish().unwrap();
+
+    let file = File::from_bytes(bytes).unwrap();
+    let ds = file.dataset("tuples").unwrap();
+    assert_eq!(ds.read_compound::<(i8, u64, f32)>().unwrap(), values);
+    assert_eq!(ds.read_raw().unwrap().len(), values.len() * 13);
+
+    match ds.datatype().unwrap() {
+        Datatype::Compound { size, members } => {
+            assert_eq!(size, 13);
+            assert_eq!(
+                members
+                    .iter()
+                    .map(|member| (member.name.as_str(), member.byte_offset))
+                    .collect::<Vec<_>>(),
+                vec![("0", 0), ("1", 1), ("2", 9)]
+            );
+        }
+        other => panic!("expected compound, got {other:?}"),
+    }
+}
+
+#[test]
+fn padded_compound_decodes_without_using_tuple_layout() {
+    let datatype = CompoundTypeBuilder::with_size(24)
+        .i8_field("0", 0)
+        .u64_field("1", 8)
+        .f32_field("2", 16)
+        .build()
+        .unwrap();
+
+    let values = [(-3i8, 42u64, 1.5f32), (9, u64::MAX, -2.25)];
+    let mut raw = vec![0u8; values.len() * 24];
+    for (index, (a, b, c)) in values.iter().copied().enumerate() {
+        let record = &mut raw[index * 24..(index + 1) * 24];
+        record[0] = a as u8;
+        record[8..16].copy_from_slice(&b.to_le_bytes());
+        record[16..20].copy_from_slice(&c.to_le_bytes());
+    }
+
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("padded")
+        .with_compound_data(datatype, raw.clone(), values.len() as u64);
+    let bytes = builder.finish().unwrap();
+
+    let file = File::from_bytes(bytes).unwrap();
+    let ds = file.dataset("padded").unwrap();
+    assert_eq!(ds.read_raw().unwrap(), raw);
+    assert_eq!(ds.read_compound::<(i8, u64, f32)>().unwrap(), values);
+}
+
+#[test]
+fn nested_compound_tuple_roundtrip() {
+    let values = [((-2i8, 99u64), 3.25f32), ((7, 11), -0.5)];
+
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("nested")
+        .with_compound_values(&values)
+        .unwrap();
+    let bytes = builder.finish().unwrap();
+
+    let file = File::from_bytes(bytes).unwrap();
+    let ds = file.dataset("nested").unwrap();
+    assert_eq!(ds.read_compound::<((i8, u64), f32)>().unwrap(), values);
+}
+
+#[test]
+fn explicit_compound_builder_rejects_invalid_layouts() {
+    let err = CompoundTypeBuilder::with_size(8)
+        .u64_field("a", 0)
+        .u32_field("b", 6)
+        .build()
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        FormatError::CompoundFieldOutOfBounds { ref name, .. } if name == "b"
+    ));
+
+    let err = CompoundTypeBuilder::with_size(16)
+        .u64_field("a", 0)
+        .u64_field("b", 4)
+        .build()
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        FormatError::CompoundFieldOverlap {
+            ref first,
+            ref second
+        } if first == "a" && second == "b"
+    ));
+
+    let err = CompoundTypeBuilder::with_size(16)
+        .u64_field("a", 0)
+        .u64_field("a", 8)
+        .build()
+        .unwrap_err();
+    assert_eq!(err, FormatError::DuplicateCompoundField("a".into()));
+}
+
+#[test]
+fn nested_compound_type_mismatch_shows_hierarchical_path() {
+    let inner_mismatched = CompoundTypeBuilder::with_size(16)
+        .i8_field("0", 0)
+        .f64_field("1", 8) // mismatch: expected u64, got f64
+        .build()
+        .unwrap();
+
+    let outer = CompoundTypeBuilder::with_size(24)
+        .field("0", 0, inner_mismatched)
+        .f32_field("1", 16)
+        .build()
+        .unwrap();
+
+    let raw = vec![0u8; 24];
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("nested_mismatched")
+        .with_compound_data(outer, raw, 1);
+    let bytes = builder.finish().unwrap();
+
+    let file = File::from_bytes(bytes).unwrap();
+    let ds = file.dataset("nested_mismatched").unwrap();
+
+    let err = ds.read_compound::<((i8, u64), f32)>().unwrap_err();
+    match err {
+        hdf5_pure::Error::Format(FormatError::CompoundFieldTypeMismatch(ref path)) => {
+            assert_eq!(path, "0.1");
+        }
+        other => panic!(
+            "expected CompoundFieldTypeMismatch(\"0.1\"), got {:?}",
+            other
+        ),
     }
 }
 

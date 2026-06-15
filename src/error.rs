@@ -53,6 +53,34 @@ pub enum FormatError {
     InvalidByteOrder(u8),
     /// Invalid reference type.
     InvalidReferenceType(u8),
+    /// A compound datatype has a zero total size.
+    InvalidCompoundSize,
+    /// A compound datatype contains no fields.
+    EmptyCompoundType,
+    /// A compound datatype contains the same field name more than once.
+    DuplicateCompoundField(String),
+    /// A compound field extends past the declared compound size.
+    CompoundFieldOutOfBounds {
+        /// Field name.
+        name: String,
+        /// Field byte offset.
+        offset: u64,
+        /// Field size in bytes.
+        field_size: u32,
+        /// Declared compound size in bytes.
+        compound_size: u32,
+    },
+    /// Two compound fields overlap.
+    CompoundFieldOverlap {
+        /// Earlier field in byte order.
+        first: String,
+        /// Later field in byte order.
+        second: String,
+    },
+    /// A named compound field was not present.
+    CompoundFieldMissing(String),
+    /// A compound field has an incompatible datatype.
+    CompoundFieldTypeMismatch(String),
     /// Invalid dataspace version.
     InvalidDataspaceVersion(u8),
     /// Invalid dataspace type.
@@ -126,6 +154,20 @@ pub enum FormatError {
     },
     /// Variable-length data error.
     VlDataError(String),
+    /// A variable-length read exceeded its configured element limit.
+    VariableLengthElementLimitExceeded {
+        /// Maximum number of elements permitted by the caller.
+        limit: usize,
+        /// Number of elements present in the selected data.
+        actual: u64,
+    },
+    /// A variable-length read exceeded its configured payload-byte limit.
+    VariableLengthByteLimitExceeded {
+        /// Maximum number of payload bytes permitted by the caller.
+        limit: usize,
+        /// Number of payload bytes required by the selected data.
+        required: u64,
+    },
     /// Serialization error.
     SerializationError(String),
     /// Dataset is missing data.
@@ -272,6 +314,36 @@ impl fmt::Display for FormatError {
             FormatError::InvalidReferenceType(r) => {
                 write!(f, "invalid reference type: {r}")
             }
+            FormatError::InvalidCompoundSize => {
+                write!(f, "compound datatype size must be greater than zero")
+            }
+            FormatError::EmptyCompoundType => {
+                write!(f, "compound datatype must contain at least one field")
+            }
+            FormatError::DuplicateCompoundField(name) => {
+                write!(f, "duplicate compound field name: {name}")
+            }
+            FormatError::CompoundFieldOutOfBounds {
+                name,
+                offset,
+                field_size,
+                compound_size,
+            } => {
+                write!(
+                    f,
+                    "compound field {name:?} at offset {offset} with size {field_size} \
+                     exceeds compound size {compound_size}"
+                )
+            }
+            FormatError::CompoundFieldOverlap { first, second } => {
+                write!(f, "compound fields {first:?} and {second:?} overlap")
+            }
+            FormatError::CompoundFieldMissing(name) => {
+                write!(f, "compound field {name:?} is missing")
+            }
+            FormatError::CompoundFieldTypeMismatch(name) => {
+                write!(f, "compound field {name:?} has an incompatible datatype")
+            }
             FormatError::InvalidDataspaceVersion(v) => {
                 write!(f, "invalid dataspace version: {v}")
             }
@@ -367,6 +439,19 @@ impl fmt::Display for FormatError {
             }
             FormatError::VlDataError(msg) => {
                 write!(f, "variable-length data error: {msg}")
+            }
+            FormatError::VariableLengthElementLimitExceeded { limit, actual } => {
+                write!(
+                    f,
+                    "variable-length element limit exceeded: limit is {limit}, data contains {actual}"
+                )
+            }
+            FormatError::VariableLengthByteLimitExceeded { limit, required } => {
+                write!(
+                    f,
+                    "variable-length payload limit exceeded: limit is {limit} bytes, \
+                     data requires {required} bytes"
+                )
             }
             FormatError::SerializationError(msg) => {
                 write!(f, "serialization error: {msg}")
