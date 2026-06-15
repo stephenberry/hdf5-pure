@@ -1,7 +1,9 @@
 //! Whole-file repack (issue #21): compaction, object dropping, fidelity of
 //! survivors, and fail-loud refusal of features that cannot be reproduced.
 
-use hdf5_pure::{AttrValue, FileBuilder, RepackOptions, repack};
+use hdf5_pure::{
+    AttrValue, Datatype, DatatypeByteOrder, FileBuilder, RepackOptions, ScaleOffset, repack,
+};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(name)
@@ -177,6 +179,121 @@ fn preserves_multidim_and_maxshape() {
     let ds = f.dataset("grid").unwrap();
     assert_eq!(ds.shape().unwrap(), vec![2, 3]);
     assert_eq!(ds.read_f64().unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    std::fs::remove_file(&src).ok();
+    std::fs::remove_file(&dst).ok();
+}
+
+#[test]
+fn roundtrips_integer_scale_offset() {
+    // Integer scale-offset is lossless, so repack re-applies it (decompress +
+    // recompress reconstructs the exact bytes). Highly compressible data (a tiny
+    // value range) makes the filter's survival observable from the file size.
+    let data: Vec<i32> = (0..4096).map(|i| i % 8).collect();
+
+    let so_src = tmp("hdf5_pure_repack_so_src.h5");
+    let so_dst = tmp("hdf5_pure_repack_so_dst.h5");
+    let plain_src = tmp("hdf5_pure_repack_soplain_src.h5");
+    let plain_dst = tmp("hdf5_pure_repack_soplain_dst.h5");
+
+    let mut b = FileBuilder::new();
+    b.create_dataset("vals")
+        .with_i32_data(&data)
+        .with_chunks(&[512])
+        .with_scale_offset(ScaleOffset::Integer(0));
+    b.write(&so_src).unwrap();
+
+    // The same data, chunked but unfiltered, as a baseline for the size check.
+    let mut p = FileBuilder::new();
+    p.create_dataset("vals")
+        .with_i32_data(&data)
+        .with_chunks(&[512]);
+    p.write(&plain_src).unwrap();
+
+    repack(&so_src, &so_dst, &RepackOptions::new()).unwrap();
+    repack(&plain_src, &plain_dst, &RepackOptions::new()).unwrap();
+
+    // Values survive byte-exact.
+    let f = hdf5_pure::File::open(&so_dst).unwrap();
+    assert_eq!(f.dataset("vals").unwrap().read_i32().unwrap(), data);
+
+    // The filter survived the repack: had it been dropped, the scale-offset copy
+    // would be no smaller than the unfiltered one.
+    let so_size = std::fs::metadata(&so_dst).unwrap().len();
+    let plain_size = std::fs::metadata(&plain_dst).unwrap().len();
+    assert!(
+        so_size < plain_size,
+        "repacked scale-offset file ({so_size}) should be smaller than the unfiltered repack ({plain_size}), proving the filter was re-applied"
+    );
+
+    for p in [so_src, so_dst, plain_src, plain_dst] {
+        std::fs::remove_file(p).ok();
+    }
+}
+
+#[test]
+fn refuses_lossy_float_scale_offset() {
+    // Float D-scale scale-offset is lossy; re-encoding already-rounded values is
+    // not guaranteed idempotent, so repack must refuse rather than risk silently
+    // perturbing the data.
+    let src = tmp("hdf5_pure_repack_fso_src.h5");
+    let dst = tmp("hdf5_pure_repack_fso_dst.h5");
+    let data: Vec<f64> = (0..1024).map(|i| (i as f64) * 0.01).collect();
+    let mut b = FileBuilder::new();
+    b.create_dataset("vals")
+        .with_f64_data(&data)
+        .with_chunks(&[256])
+        .with_scale_offset(ScaleOffset::FloatDScale(3));
+    b.write(&src).unwrap();
+
+    let err = repack(&src, &dst, &RepackOptions::new()).unwrap_err();
+    match err {
+        hdf5_pure::Error::RepackUnsupported(msg) => assert!(
+            msg.contains("vals") && msg.contains("scale-offset"),
+            "error should name the dataset and reason: {msg}"
+        ),
+        other => panic!("expected RepackUnsupported, got {other:?}"),
+    }
+    assert!(!dst.exists(), "dst must not be created when repack refuses");
+    std::fs::remove_file(&src).ok();
+}
+
+#[test]
+fn roundtrips_opaque_and_bitfield_datatypes() {
+    // Opaque and bit-field datatypes now serialize losslessly, so repack carries
+    // them through byte-for-byte instead of refusing.
+    let src = tmp("hdf5_pure_repack_dt_src.h5");
+    let dst = tmp("hdf5_pure_repack_dt_dst.h5");
+
+    let opaque_dt = Datatype::Opaque {
+        size: 4,
+        tag: b"rgba".to_vec(),
+    };
+    let opaque_raw: Vec<u8> = vec![0xDE, 0xAD, 0xBE, 0xEF, 1, 2, 3, 4, 9, 8, 7, 6];
+    let bitfield_dt = Datatype::BitField {
+        size: 2,
+        byte_order: DatatypeByteOrder::LittleEndian,
+        bit_offset: 0,
+        bit_precision: 12,
+    };
+    let bitfield_raw: Vec<u8> = vec![0x34, 0x12, 0xFF, 0x0F];
+
+    let mut b = FileBuilder::new();
+    b.create_dataset("blob")
+        .with_raw_data(opaque_dt.clone(), opaque_raw.clone(), 3);
+    b.create_dataset("flags")
+        .with_raw_data(bitfield_dt.clone(), bitfield_raw.clone(), 2);
+    b.write(&src).unwrap();
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    let f = hdf5_pure::File::open(&dst).unwrap();
+    let blob = f.dataset("blob").unwrap();
+    assert_eq!(blob.datatype().unwrap(), opaque_dt);
+    assert_eq!(blob.read_raw().unwrap(), opaque_raw);
+    let flags = f.dataset("flags").unwrap();
+    assert_eq!(flags.datatype().unwrap(), bitfield_dt);
+    assert_eq!(flags.read_raw().unwrap(), bitfield_raw);
+
     std::fs::remove_file(&src).ok();
     std::fs::remove_file(&dst).ok();
 }

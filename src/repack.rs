@@ -16,20 +16,23 @@
 //! [`Error::RepackUnsupported`] naming the object and the reason. It refuses
 //! rather than approximate. Currently reproducible:
 //!
-//! - Datasets with fixed-point, floating-point, fixed-length string, compound,
-//!   enumeration, and array datatypes, contiguous/compact or chunked, filtered
-//!   with deflate, shuffle, and/or fletcher32.
+//! - Datasets with fixed-point, floating-point, fixed-length string, time,
+//!   bit-field, opaque, compound, enumeration, and array datatypes,
+//!   contiguous/compact or chunked, filtered with deflate, shuffle, fletcher32,
+//!   and/or **lossless integer** scale-offset.
 //! - Group hierarchy of arbitrary depth.
 //! - Attributes representable as [`AttrValue`] (numbers, fixed and
 //!   variable-length strings and their arrays), on datasets, groups, and root.
 //!
-//! Refused (named, never dropped silently): variable-length, time, bitfield,
-//! opaque, and reference datatypes (their on-disk representation cannot yet be
-//! re-emitted faithfully — references in particular would carry stale absolute
-//! addresses); virtual and external data layouts; any filter other than
-//! deflate/shuffle/fletcher32 (e.g. scale-offset, szip, zfp); and any attribute
-//! whose datatype the reader cannot decode into an [`AttrValue`] (e.g. an
-//! enumeration, compound, or boolean attribute). An attribute that cannot be
+//! Repack reads each dataset's *decompressed* bytes and re-applies its filters,
+//! so it can only reproduce **lossless** filters (then the re-encoded chunks
+//! decompress to the exact same bytes). Refused (named, never dropped silently):
+//! variable-length and reference datatypes (a reference's stored absolute
+//! addresses would go stale on rewrite); virtual and external data layouts;
+//! lossy filters — float D-scale scale-offset and ZFP, whose re-encoding is not
+//! guaranteed idempotent — and SZIP, which this crate cannot write; and any
+//! attribute whose datatype the reader cannot decode into an [`AttrValue`] (e.g.
+//! an enumeration, compound, or boolean attribute). An attribute that cannot be
 //! reproduced fails the repack by name rather than being silently dropped.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -38,8 +41,11 @@ use std::path::Path;
 use crate::data_layout::DataLayout;
 use crate::datatype::Datatype;
 use crate::error::Error;
-use crate::filter_pipeline::{FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SHUFFLE, FilterPipeline};
+use crate::filter_pipeline::{
+    FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SCALEOFFSET, FILTER_SHUFFLE, FilterPipeline,
+};
 use crate::reader::{Dataset, File, Group};
+use crate::scaleoffset::{self, ScaleOffset};
 use crate::type_builders::{AttrValue, DatasetBuilder, FinishedGroup, GroupBuilder};
 use crate::writer::FileBuilder;
 
@@ -252,6 +258,18 @@ fn emit_dataset(db: &mut DatasetBuilder, ds: &Dataset, path: &str) -> Result<(),
                     // Client-data[0] is the deflate level; default to 6 if absent.
                     db.with_deflate(f.client_data.first().copied().unwrap_or(6));
                 }
+                FILTER_SCALEOFFSET => {
+                    // `check_pipeline` guarantees integer (lossless) mode here.
+                    // Re-apply with the source's minbits parameter; integer
+                    // scale-offset reconstructs the exact element bytes.
+                    if let Some(mode @ ScaleOffset::Integer(_)) =
+                        scaleoffset::scale_offset_mode(&f.client_data)
+                    {
+                        db.with_scale_offset(mode);
+                    } else {
+                        unreachable!("check_pipeline rejected non-integer scale-offset");
+                    }
+                }
                 _ => unreachable!("check_pipeline rejected unsupported filters"),
             }
         }
@@ -286,10 +304,10 @@ fn check_attr_completeness(
     Ok(())
 }
 
-/// Reject datatypes whose on-disk form this crate cannot re-serialize faithfully
-/// (variable-length, time, bitfield, opaque, reference), recursing into compound
-/// members, enumeration bases, and array element types so a nested occurrence is
-/// caught too.
+/// Reject datatypes whose on-disk form this crate cannot re-emit faithfully
+/// (variable-length, and reference, whose stored absolute addresses would go
+/// stale on rewrite), recursing into compound members, enumeration bases, and
+/// array element types so a nested occurrence is caught too.
 fn check_datatype(dt: &Datatype, path: &str) -> Result<(), Error> {
     let bad = |what: &str| {
         Err(Error::RepackUnsupported(format!(
@@ -297,12 +315,15 @@ fn check_datatype(dt: &Datatype, path: &str) -> Result<(), Error> {
         )))
     };
     match dt {
-        Datatype::FixedPoint { .. } | Datatype::FloatingPoint { .. } | Datatype::String { .. } => {
-            Ok(())
-        }
-        Datatype::Time { .. } => bad("time"),
-        Datatype::BitField { .. } => bad("bitfield"),
-        Datatype::Opaque { .. } => bad("opaque"),
+        // Scalar and opaque-bytes datatypes whose on-disk form `Datatype::serialize`
+        // reproduces exactly, so reading the raw element bytes and re-emitting them
+        // is byte-for-byte faithful.
+        Datatype::FixedPoint { .. }
+        | Datatype::FloatingPoint { .. }
+        | Datatype::String { .. }
+        | Datatype::Time { .. }
+        | Datatype::BitField { .. }
+        | Datatype::Opaque { .. } => Ok(()),
         Datatype::VariableLength { .. } => bad("variable-length"),
         Datatype::Reference { .. } => bad("reference"),
         Datatype::Compound { members, .. } => {
@@ -331,6 +352,14 @@ fn check_layout(layout: &DataLayout, path: &str) -> Result<(), Error> {
 
 /// Reject any filter the writer cannot reproduce, so a filtered dataset is never
 /// silently rewritten without its filters.
+///
+/// Repack reads each dataset's *decompressed* element bytes and re-applies its
+/// filters from scratch, so a filter is only safe to reproduce when it is
+/// **lossless** — then the re-encoded chunks decompress to the exact same bytes.
+/// Deflate, shuffle, fletcher32, and integer scale-offset qualify. Float D-scale
+/// scale-offset and ZFP are lossy: re-encoding already-decompressed values is not
+/// guaranteed idempotent, so reproducing them could silently perturb the data,
+/// and they are refused. SZIP this crate cannot write at all.
 fn check_pipeline(pipeline: Option<&FilterPipeline>, path: &str) -> Result<(), Error> {
     let Some(p) = pipeline else {
         return Ok(());
@@ -338,6 +367,14 @@ fn check_pipeline(pipeline: Option<&FilterPipeline>, path: &str) -> Result<(), E
     for f in &p.filters {
         match f.filter_id {
             FILTER_DEFLATE | FILTER_SHUFFLE | FILTER_FLETCHER32 => {}
+            FILTER_SCALEOFFSET => match scaleoffset::scale_offset_mode(&f.client_data) {
+                Some(ScaleOffset::Integer(_)) => {}
+                _ => {
+                    return Err(Error::RepackUnsupported(format!(
+                        "dataset {path}: only lossless integer scale-offset with an undefined fill value can be repacked faithfully"
+                    )));
+                }
+            },
             other => {
                 return Err(Error::RepackUnsupported(format!(
                     "dataset {path}: filter id {other} cannot be repacked yet"

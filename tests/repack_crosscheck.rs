@@ -73,6 +73,36 @@ fn c_file_repacked_then_read_by_c_library() {
 }
 
 #[test]
+fn c_reads_repacked_scale_offset() {
+    // hdf5-pure writes an integer dataset compressed with lossless scale-offset,
+    // hdf5-pure repacks it, and the reference C library decodes the *re-emitted*
+    // filter. That the C library reads the exact values back proves repack's
+    // re-applied scale-offset chunk format is valid and interoperable, not a
+    // malformed pipeline that merely happens to round-trip in-crate.
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("so_src.h5");
+    let dst = dir.path().join("so_repacked.h5");
+
+    let data: Vec<i32> = (0..1024).map(|i| 100 + i % 17).collect();
+    {
+        let mut b = hdf5_pure::FileBuilder::new();
+        b.create_dataset("vals")
+            .with_i32_data(&data)
+            .with_chunks(&[128])
+            .with_scale_offset(hdf5_pure::ScaleOffset::Integer(0));
+        b.write(&src).unwrap();
+    }
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    let f = File::open(&dst).unwrap();
+    assert_eq!(f.dataset("vals").unwrap().read_i32().unwrap(), data);
+
+    let c = hdf5::File::open(&dst).unwrap();
+    assert_eq!(c.dataset("vals").unwrap().read_raw::<i32>().unwrap(), data);
+}
+
+#[test]
 fn repack_refuses_c_vlen_string_dataset() {
     use hdf5::types::VarLenUnicode;
     use std::str::FromStr;
