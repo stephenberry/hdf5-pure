@@ -173,6 +173,79 @@ fn delete_subtree_reclaims_all_members() {
 }
 
 #[test]
+fn trailing_slack_past_recorded_eof_stays_readable() {
+    // `commit` makes the superblock recording the smaller end-of-file durable
+    // *before* it physically `set_len`s the file, so a crash in that window leaves
+    // a durable, smaller superblock EOF plus the not-yet-removed trailing bytes.
+    // This pins down the reader-side property that makes such a crash harmless:
+    // the reader navigates by the superblock's end-of-file address and never reads
+    // the slack past it. It reproduces that on-disk state by re-appending leftover
+    // bytes to a cleanly committed file and confirms the file still reads exactly.
+    // (It exercises the *outcome* of the ordering, not the ordering itself —
+    // fault-injecting between the superblock sync and `set_len` would need a seam
+    // EditSession does not yet expose, and remains future work.)
+    let path = tmp("hdf5_pure_fs_trailing_slack.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("keep").with_i32_data(&[11, 22, 33]);
+    b.write(&path).unwrap();
+
+    // Add then delete a large dataset so the second commit truncates the file
+    // back down, leaving the recorded end-of-file equal to the physical size.
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        s.create_dataset("scratch").with_f64_data(&vec![5.0; 2048]);
+        s.commit().unwrap();
+        s.delete("scratch");
+        s.commit().unwrap();
+    }
+
+    let (logical_eof, physical) = {
+        let f = File::open(&path).unwrap();
+        (f.superblock().eof_address, f.file_size())
+    };
+    assert_eq!(
+        logical_eof, physical,
+        "a clean truncating commit leaves no slack past the recorded end-of-file"
+    );
+
+    // Simulate the crash: the smaller-EOF superblock is already durable, but the
+    // process died before `set_len`, so the freed tail is still on disk. Re-append
+    // leftover bytes to reproduce that physical state.
+    const SLACK: u64 = 4096;
+    {
+        use std::io::Write;
+        let mut handle = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        handle.write_all(&vec![0xAB; SLACK as usize]).unwrap();
+        handle.flush().unwrap();
+    }
+
+    // The trailing slack is invisible to the reader: survivors read byte-exact and
+    // the deleted object stays gone, even though the physical file now exceeds the
+    // recorded end-of-file.
+    let f = File::open(&path).unwrap();
+    assert_eq!(
+        f.superblock().eof_address,
+        logical_eof,
+        "the durable end-of-file address is unaffected by trailing slack"
+    );
+    assert_eq!(
+        f.file_size(),
+        physical + SLACK,
+        "the physical file carries the leftover bytes the crash left behind"
+    );
+    assert_eq!(f.root().datasets().unwrap(), vec!["keep".to_string()]);
+    assert_eq!(
+        f.dataset("keep").unwrap().read_i32().unwrap(),
+        vec![11, 22, 33]
+    );
+    assert!(f.dataset("scratch").is_err());
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn deleting_chunked_dataset_leaks_but_does_not_corrupt() {
     // A chunked/compressed dataset's storage (B-tree index + chunks) is not one
     // of the block classes the free-walk enumerates, so its bytes are left
