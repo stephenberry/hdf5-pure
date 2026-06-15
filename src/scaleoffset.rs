@@ -180,6 +180,30 @@ pub fn build_cd_values(
     Ok(cd)
 }
 
+/// Recover the [`ScaleOffset`] mode a parsed filter encodes from its
+/// `cd_values`, so a tool like [`repack`](crate::repack) can re-apply it.
+///
+/// Returns `None` if the parameter array is too short, names a scale type this
+/// crate never writes (the reference library's float *E*-scale), or carries a
+/// **defined fill value**: this crate's writer only ever emits the
+/// fill-undefined form, so re-emitting a fill-defined filter would silently drop
+/// its chunk-fill semantics. Refusing keeps repack faithful rather than
+/// approximate.
+pub(crate) fn scale_offset_mode(cd_values: &[u32]) -> Option<ScaleOffset> {
+    let scale_type = *cd_values.get(PARM_SCALETYPE)?;
+    let scale_factor = *cd_values.get(PARM_SCALEFACTOR)?;
+    if cd_values.get(PARM_FILAVAIL).copied() != Some(FILL_UNDEFINED) {
+        return None;
+    }
+    match scale_type {
+        SO_INT => Some(ScaleOffset::Integer(scale_factor)),
+        SO_FLOAT_DSCALE => Some(ScaleOffset::FloatDScale(scale_factor as i32)),
+        // SO_FLOAT_ESCALE (and anything unrecognized) is never written by this
+        // crate and cannot be reproduced.
+        _ => None,
+    }
+}
+
 /// Decoded scale-offset parameters shared by the compress and decompress paths.
 struct Parms {
     scale_type: u32,
@@ -915,6 +939,32 @@ mod tests {
             client_data: build_cd_values(ScaleOffset::FloatDScale(decimals), ty, size, nelmts)
                 .unwrap(),
         }
+    }
+
+    #[test]
+    fn scale_offset_mode_recovers_and_refuses() {
+        // Lossless integer is recovered (the only mode repack will re-emit).
+        let f = int_filter(4, true, ORDER_LE, 16);
+        assert_eq!(
+            scale_offset_mode(&f.client_data),
+            Some(ScaleOffset::Integer(0))
+        );
+
+        // Lossy float D-scale is recognized as such; repack refuses it upstream.
+        let f = float_filter(8, 3, ORDER_LE, 16);
+        assert_eq!(
+            scale_offset_mode(&f.client_data),
+            Some(ScaleOffset::FloatDScale(3))
+        );
+
+        // A defined fill value cannot be reproduced faithfully -> None.
+        let mut fill_defined = int_filter(4, true, ORDER_LE, 16);
+        fill_defined.client_data[PARM_FILAVAIL] = FILL_DEFINED;
+        assert_eq!(scale_offset_mode(&fill_defined.client_data), None);
+
+        // Too-short parameter arrays -> None, never a panic.
+        assert_eq!(scale_offset_mode(&[]), None);
+        assert_eq!(scale_offset_mode(&[SO_INT, 0]), None);
     }
 
     #[test]

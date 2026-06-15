@@ -396,6 +396,23 @@ impl File {
         }
     }
 
+    /// Names of every attribute message on `hdr`, including ones whose datatype
+    /// [`attrs_of`](Self::attrs_of) cannot decode into an [`AttrValue`] (and so
+    /// silently omits from its map). Repack diffs this against the decoded map to
+    /// refuse rather than drop an attribute it cannot reproduce.
+    pub(crate) fn attr_message_names_of(&self, hdr: &ObjectHeader) -> Result<Vec<String>, Error> {
+        match &self.backend {
+            Backend::InMemory(v) => {
+                let attr_msgs =
+                    extract_attributes_full(v, hdr, self.offset_size(), self.length_size())?;
+                Ok(attr_msgs.into_iter().map(|a| a.name).collect())
+            }
+            Backend::Streaming(_) => Err(Error::Format(FormatError::ChunkedReadError(
+                "attribute reading is not yet supported on the streaming backend".into(),
+            ))),
+        }
+    }
+
     /// Read a dataset's raw bytes for the given layout, dispatching on the backend.
     fn read_dataset_raw(
         &self,
@@ -474,6 +491,14 @@ impl<'f> Group<'f> {
     pub fn attrs(&self) -> Result<HashMap<String, AttrValue>, Error> {
         let hdr = self.file.parse_header(self.address)?;
         self.file.attrs_of(&hdr)
+    }
+
+    /// Names of every attribute on this group, including any whose datatype
+    /// [`attrs`](Self::attrs) cannot represent. Used by repack to detect an
+    /// attribute it would otherwise drop.
+    pub(crate) fn attr_names(&self) -> Result<Vec<String>, Error> {
+        let hdr = self.file.parse_header(self.address)?;
+        self.file.attr_message_names_of(&hdr)
     }
 
     /// Get a dataset within this group by name.
@@ -712,6 +737,13 @@ impl<'f> Dataset<'f> {
         self.file.attrs_of(&self.header)
     }
 
+    /// Names of every attribute on this dataset, including any whose datatype
+    /// [`attrs`](Self::attrs) cannot represent. Used by repack to detect an
+    /// attribute it would otherwise drop.
+    pub(crate) fn attr_names(&self) -> Result<Vec<String>, Error> {
+        self.file.attr_message_names_of(&self.header)
+    }
+
     /// Returns the exact HDF5 datatype, including compound field offsets and
     /// total record size.
     pub fn datatype(&self) -> Result<Datatype, Error> {
@@ -720,12 +752,12 @@ impl<'f> Dataset<'f> {
         Ok(dt)
     }
 
-    fn dataspace(&self) -> Result<Dataspace, Error> {
+    pub(crate) fn dataspace(&self) -> Result<Dataspace, Error> {
         let msg = find_message(&self.header, MessageType::Dataspace)?;
         Ok(Dataspace::parse(&msg.data, self.file.length_size())?)
     }
 
-    fn data_layout(&self) -> Result<DataLayout, Error> {
+    pub(crate) fn data_layout(&self) -> Result<DataLayout, Error> {
         let msg = find_message(&self.header, MessageType::DataLayout)?;
         Ok(DataLayout::parse(
             &msg.data,
@@ -734,7 +766,7 @@ impl<'f> Dataset<'f> {
         )?)
     }
 
-    fn filter_pipeline(&self) -> Option<FilterPipeline> {
+    pub(crate) fn filter_pipeline(&self) -> Option<FilterPipeline> {
         self.header
             .messages
             .iter()

@@ -84,6 +84,9 @@ pub enum Datatype {
         exponent_bias: u32,
     },
     /// Class 2: Time type (rarely used).
+    ///
+    /// The byte-order bit is not modelled (this matches the parser, which has
+    /// always ignored it); a serialized time type is emitted little-endian.
     Time { size: u32, bit_precision: u16 },
     /// Class 3: Fixed-length string.
     String {
@@ -715,7 +718,42 @@ impl Datatype {
                 };
                 Self::build_header(7, 1, [bf0, 0, 0], *size)
             }
-            _ => Vec::new(),
+            Datatype::Time {
+                size,
+                bit_precision,
+            } => {
+                // bf0 bit 0 is the byte order; the struct does not model it, so
+                // emit little-endian (matching the parser, which ignores it).
+                let mut buf = Self::build_header(2, 1, [0, 0, 0], *size);
+                buf.extend_from_slice(&bit_precision.to_le_bytes());
+                buf
+            }
+            Datatype::BitField {
+                size,
+                byte_order,
+                bit_offset,
+                bit_precision,
+            } => {
+                let bf0 = if matches!(byte_order, DatatypeByteOrder::BigEndian) {
+                    0x01u8
+                } else {
+                    0
+                };
+                let mut buf = Self::build_header(4, 1, [bf0, 0, 0], *size);
+                buf.extend_from_slice(&bit_offset.to_le_bytes());
+                buf.extend_from_slice(&bit_precision.to_le_bytes());
+                buf
+            }
+            Datatype::Opaque { size, tag } => {
+                // bf0 carries the ASCII tag length; the tag is padded with zero
+                // bytes to a multiple of 8, mirroring `parse`.
+                let bf0 = tag.len() as u8;
+                let mut buf = Self::build_header(5, 1, [bf0, 0, 0], *size);
+                buf.extend_from_slice(tag);
+                let padded = (tag.len() + 7) & !7;
+                buf.resize(buf.len() + (padded - tag.len()), 0);
+                buf
+            }
         }
     }
 
@@ -1393,6 +1431,57 @@ mod tests {
         let bytes = dt.serialize();
         let (parsed, _) = Datatype::parse(&bytes).unwrap();
         assert_eq!(parsed, dt);
+    }
+
+    #[test]
+    fn serialize_parse_time_roundtrip() {
+        let dt = Datatype::Time {
+            size: 8,
+            bit_precision: 64,
+        };
+        let bytes = dt.serialize();
+        let (parsed, consumed) = Datatype::parse(&bytes).unwrap();
+        assert_eq!(parsed, dt);
+        assert_eq!(consumed, bytes.len());
+    }
+
+    #[test]
+    fn serialize_parse_bitfield_roundtrip() {
+        for byte_order in [
+            DatatypeByteOrder::LittleEndian,
+            DatatypeByteOrder::BigEndian,
+        ] {
+            let dt = Datatype::BitField {
+                size: 4,
+                byte_order,
+                bit_offset: 3,
+                bit_precision: 17,
+            };
+            let bytes = dt.serialize();
+            let (parsed, consumed) = Datatype::parse(&bytes).unwrap();
+            assert_eq!(parsed, dt);
+            assert_eq!(consumed, bytes.len());
+        }
+    }
+
+    #[test]
+    fn serialize_parse_opaque_roundtrip() {
+        // Tag lengths that do and do not land on an 8-byte boundary, to exercise
+        // the zero padding both ways.
+        for tag in [
+            b"abc".to_vec(),         // 3 bytes -> padded to 8
+            b"12345678".to_vec(),    // 8 bytes -> no padding
+            b"sensor-id\0".to_vec(), // 10 bytes -> padded to 16, embedded NUL preserved
+        ] {
+            let dt = Datatype::Opaque { size: 16, tag };
+            let bytes = dt.serialize();
+            // The property section (after the 8-byte header) must be a multiple
+            // of 8, matching what the reference library expects.
+            assert_eq!((bytes.len() - 8) % 8, 0);
+            let (parsed, consumed) = Datatype::parse(&bytes).unwrap();
+            assert_eq!(parsed, dt);
+            assert_eq!(consumed, bytes.len());
+        }
     }
 
     #[test]
