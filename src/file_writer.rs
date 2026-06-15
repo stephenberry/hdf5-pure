@@ -457,10 +457,11 @@ impl FileWriter {
     /// `H5Pset_file_space_strategy`. The choice is recorded in the file's
     /// superblock extension so other tools (and a later reopen) see it.
     ///
-    /// `persist` requests that freed space be tracked on disk across closes;
-    /// that requires writing free-space manager blocks and is not yet
-    /// implemented, so `persist = true` makes [`finish`](Self::finish) fail with
-    /// [`FormatError::FileSpacePersistUnsupported`]. `threshold` is the smallest
+    /// `persist` requests that freed space be tracked on disk across closes. A
+    /// freshly built file has no free space to track, so this records the persist
+    /// intent (matching what the C library writes for a brand-new persisted
+    /// file); a later [`EditSession`](crate::EditSession) that frees space writes
+    /// the on-disk free-space-manager blocks. `threshold` is the smallest
     /// free-space section size the managers track.
     pub fn with_file_space_strategy(
         &mut self,
@@ -480,28 +481,28 @@ impl FileWriter {
     }
 
     /// Reject file-space settings this writer cannot reproduce yet.
-    fn check_file_space(&self) -> Result<(), FormatError> {
-        if let Some((_, true, _)) = self.file_space_strategy {
-            return Err(FormatError::FileSpacePersistUnsupported);
-        }
-        Ok(())
-    }
-
     /// The File Space Info message to write, if any file-space option was set.
-    /// The writer emits the non-persistent form (no free-space manager blocks).
+    ///
+    /// A freshly built file has no free space, so `persist = true` emits the
+    /// persisting-but-empty form (persist flag set, all managers undefined, no
+    /// FSM blocks); a later [`EditSession`](crate::EditSession) that frees space
+    /// fills in the on-disk managers. `persist = false` emits the non-persistent
+    /// form.
     fn file_space_info(&self) -> Option<FileSpaceInfo> {
         if self.file_space_strategy.is_none() && self.file_space_page_size.is_none() {
             return None;
         }
-        let (strategy, _persist, threshold) = self.file_space_strategy.unwrap_or((
+        let (strategy, persist, threshold) = self.file_space_strategy.unwrap_or((
             FileSpaceStrategy::FsmAggr,
             false,
             DEFAULT_THRESHOLD,
         ));
         let page_size = self.file_space_page_size.unwrap_or(DEFAULT_PAGE_SIZE);
-        Some(FileSpaceInfo::non_persistent(
-            strategy, threshold, page_size,
-        ))
+        Some(if persist {
+            FileSpaceInfo::persistent_empty(strategy, threshold, page_size)
+        } else {
+            FileSpaceInfo::non_persistent(strategy, threshold, page_size)
+        })
     }
 
     /// The superblock-extension object header bytes carrying the File Space Info
@@ -536,7 +537,6 @@ impl FileWriter {
 
     pub fn finish(self) -> Result<Vec<u8>, FormatError> {
         self.check_libver_bounds()?;
-        self.check_file_space()?;
         // The superblock-extension header (carrying a File Space Info message)
         // is independent of the file layout, so build it up front and place it
         // after all other content below.

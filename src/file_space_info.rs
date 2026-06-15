@@ -27,7 +27,7 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 #[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 
 use crate::error::FormatError;
 
@@ -38,6 +38,9 @@ const UNDEF: u64 = u64::MAX;
 pub(crate) const DEFAULT_THRESHOLD: u64 = 1;
 /// The default file-space page size the C library uses.
 pub(crate) const DEFAULT_PAGE_SIZE: u64 = 4096;
+/// Number of free-space-manager address slots a persisting message carries (one
+/// per file memory type); the reference C library writes twelve.
+pub(crate) const NUM_FILE_FSM_MANAGERS: usize = 12;
 
 /// File-space management strategy, mirroring HDF5's `H5F_fspace_strategy_t`
 /// (set with `H5Pset_file_space_strategy`).
@@ -97,8 +100,8 @@ pub struct FileSpaceInfo {
     /// was allocated; [`u64::MAX`] when free space is not persisted.
     pub eoa_pre_fsm: u64,
     /// Free-space manager header addresses (present only when [`persist`] is
-    /// set); unused slots are [`u64::MAX`]. Read for fidelity but not yet
-    /// followed to their on-disk manager blocks.
+    /// set); unused slots are [`u64::MAX`]. Followed to their on-disk `FSHD`/
+    /// `FSSE` blocks by [`File::persisted_free_space`](crate::File::persisted_free_space).
     ///
     /// [`persist`]: Self::persist
     pub manager_addrs: Vec<u64>,
@@ -120,6 +123,52 @@ impl FileSpaceInfo {
             page_end_meta_threshold: 0,
             eoa_pre_fsm: UNDEF,
             manager_addrs: Vec::new(),
+        }
+    }
+
+    /// A persisting message for a file with no free space yet (the form
+    /// [`FileBuilder`](crate::FileBuilder) emits for `persist = true`): the
+    /// persist flag is set but every manager slot is undefined and no FSM space
+    /// has been allocated, so `eoa_pre_fsm` is [`UNDEF`]. This matches what the C
+    /// library records when persistence is on but nothing is tracked.
+    pub(crate) fn persistent_empty(
+        strategy: FileSpaceStrategy,
+        threshold: u64,
+        page_size: u64,
+    ) -> Self {
+        FileSpaceInfo {
+            strategy,
+            persist: true,
+            threshold,
+            page_size,
+            page_end_meta_threshold: 0,
+            eoa_pre_fsm: UNDEF,
+            manager_addrs: vec![UNDEF; NUM_FILE_FSM_MANAGERS],
+        }
+    }
+
+    /// A persisting message whose first free-space manager is at `manager0_addr`
+    /// (the others undefined), recording `eoa_pre_fsm` — the end-of-allocation
+    /// before the on-disk free-space-manager blocks were appended. This is the
+    /// form [`EditSession`](crate::EditSession) writes when it persists a non-empty
+    /// free list: every tracked region lives in that one manager.
+    pub(crate) fn persistent_single_manager(
+        strategy: FileSpaceStrategy,
+        threshold: u64,
+        page_size: u64,
+        manager0_addr: u64,
+        eoa_pre_fsm: u64,
+    ) -> Self {
+        let mut manager_addrs = vec![UNDEF; NUM_FILE_FSM_MANAGERS];
+        manager_addrs[0] = manager0_addr;
+        FileSpaceInfo {
+            strategy,
+            persist: true,
+            threshold,
+            page_size,
+            page_end_meta_threshold: 0,
+            eoa_pre_fsm,
+            manager_addrs,
         }
     }
 

@@ -106,7 +106,7 @@ b.write("out.h5").unwrap();
 assert_eq!(File::open("out.h5").unwrap().file_space_strategy(), Some(FileSpaceStrategy::Page));
 ```
 
-Persisting free space across reopen (`persist = true`) is not yet implemented — it requires writing the on-disk free-space manager blocks — so it fails loudly rather than write a file whose freed space would silently not persist.
+Passing `persist = true` persists free space across reopen: a file created this way records the regions an `EditSession` frees in on-disk free-space-manager blocks (`FSHD`/`FSSE`), so later sessions — this crate's and the reference C library's — recover and reuse them. `File::persisted_free_space()` returns the tracked free regions, and `EditSession::open` seeds its free list from them so reuse spans sessions rather than just the open session.
 
 ### Streaming large files
 

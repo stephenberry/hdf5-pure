@@ -68,12 +68,23 @@
 //! be enumerated exhaustively — chunked or variable-length storage, dense
 //! attribute/link heaps, a non–version-2 header — is left as dead bytes rather
 //! than risk freeing a region that is still in use; under-reclaiming only wastes
-//! space, while over-reclaiming would corrupt. As with the reference library's
-//! default file-space strategy, the free list is **not** persisted: it is
-//! forgotten when the session closes, so reuse and shrinkage apply to churn
-//! within a session, not across reopen, and a single delete-then-close shrinks
-//! the file only when the freed bytes reach end-of-file. Whole-file compaction
-//! that reclaims every hole across a reopen is the separate repack path.
+//! space, while over-reclaiming would corrupt.
+//!
+//! Whether the free list outlives the session depends on how the file was
+//! created. For the default (non-persisting) file it is **not** persisted: it is
+//! forgotten on close, so reuse and shrinkage apply to churn within a session,
+//! and a single delete-then-close shrinks the file only when the freed bytes
+//! reach end-of-file. A file created with
+//! `H5Pset_file_space_strategy(persist = true)` instead **persists** its free
+//! space: `open` seeds the list from the on-disk free-space managers (the
+//! `FSHD`/`FSSE` blocks the superblock-extension File Space Info message points
+//! at), and each commit rewrites those managers, so freed regions survive
+//! close/reopen and are reused across sessions — by this crate and the reference
+//! C library alike. A persisting commit *retains* freed space (recording it on
+//! disk) rather than truncating it; the blocks holding the managers are appended
+//! past all live data and the superblock is repointed last, so a crash before the
+//! repoint leaves the prior file wholly intact. Whole-file compaction that
+//! reclaims every hole at once is still the separate repack path.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -83,8 +94,10 @@ use std::path::Path;
 use crate::checksum::jenkins_lookup3;
 use crate::dataspace::{Dataspace, DataspaceType};
 use crate::error::Error;
+use crate::file_space_info::{FileSpaceInfo, FileSpaceStrategy};
 use crate::file_writer::{LENGTH_SIZE, OFFSET_SIZE, build_dataset_oh, make_link};
 use crate::free_space::FreeList;
+use crate::free_space_manager::{self, FreeSection, FsmHeader, fshd_len, serialize_file_fsm};
 use crate::group_v2::resolve_group_entries;
 use crate::link_message::{LinkMessage, LinkTarget};
 use crate::message_type::MessageType;
@@ -92,6 +105,9 @@ use crate::object_header::ObjectHeader;
 use crate::signature;
 use crate::superblock::Superblock;
 use crate::type_builders::{AttrValue, DatasetBuilder, build_attr_message};
+
+/// An undefined on-disk address (all bits set), HDF5's "no address" sentinel.
+const UNDEF: u64 = u64::MAX;
 
 /// Maximum number of compact attributes; beyond this HDF5 switches a dataset to
 /// dense (fractal-heap) attribute storage, which this engine does not emit.
@@ -153,10 +169,31 @@ pub struct EditSession {
     /// prior commits in this session — superseded object headers and the blocks
     /// of deleted objects — so later commits reuse them instead of growing the
     /// file, and so a freed run reaching end-of-file can be truncated away. It
-    /// starts empty on `open`: holes already present in the file from earlier
-    /// sessions or other tools are not tracked (there is no on-disk free-space
-    /// manager yet), only those this session creates.
+    /// starts empty on `open` for a non-persisting file: holes already present
+    /// from earlier sessions or other tools are not tracked. When the file
+    /// persists its free space (`persist` is `Some`), `open` instead seeds it
+    /// from the on-disk free-space managers, so reuse spans sessions.
     free: FreeList,
+    /// Free-space persistence read from the file's superblock extension on
+    /// `open` (the file-creation `H5Pset_file_space_strategy(persist = true)`
+    /// setting). `None` for the default non-persisting file; when `Some`, every
+    /// [`commit`](Self::commit) rewrites the on-disk free-space managers so the
+    /// free list survives close/reopen.
+    persist: Option<PersistState>,
+}
+
+/// State for a file that persists its free space on disk. Carries the file's
+/// fixed file-space parameters and the extents of the free-space-manager blocks
+/// (and superblock extension) the *current* on-disk file uses, so the next
+/// persisting commit can reclaim them when it writes fresh ones.
+struct PersistState {
+    strategy: FileSpaceStrategy,
+    threshold: u64,
+    page_size: u64,
+    /// `(addr, len)` of the on-disk superblock-extension header and every
+    /// free-space-manager `FSHD`/`FSSE` block currently in use. Superseded — and
+    /// therefore freed — by the next persisting commit.
+    old_blocks: Vec<(u64, u64)>,
 }
 
 impl EditSession {
@@ -191,7 +228,7 @@ impl EditSession {
             ));
         }
 
-        Ok(Self {
+        let mut session = Self {
             handle,
             data,
             sb_sig_off,
@@ -201,7 +238,120 @@ impl EditSession {
             pending_deletes: Vec::new(),
             pending_copies: Vec::new(),
             free: FreeList::new(),
-        })
+            persist: None,
+        };
+        // If the file persists its free space, seed the free list from the
+        // on-disk managers and arm persistence for future commits. Best-effort:
+        // an unreadable or non-persisting extension simply leaves the session in
+        // the default, non-persisting mode.
+        session.load_persisted_free_space();
+        Ok(session)
+    }
+
+    /// Read the superblock-extension File Space Info message; if it requests
+    /// persistence, seed [`self.free`](Self::free) from the on-disk free-space
+    /// managers and record the manager/extension block extents for reclamation on
+    /// the next commit. Silent on any malformed or absent metadata — persistence
+    /// is then simply off for this session.
+    fn load_persisted_free_space(&mut self) {
+        if self.superblock.version < 2 {
+            return; // no superblock extension exists before v2
+        }
+        let Some(ext_rel) = self.superblock.superblock_extension_address else {
+            return;
+        };
+        if ext_rel == UNDEF {
+            return;
+        }
+        let Ok(ext_addr) = usize::try_from(ext_rel) else {
+            return;
+        };
+        let Some(info) = self.extension_fsinfo(ext_addr) else {
+            return;
+        };
+        if !info.persist {
+            return;
+        }
+        let os = self.superblock.offset_size;
+
+        // Seed the free list with every persisted section (addresses are stored
+        // relative to the base address, which this editor requires to be 0).
+        // Defensive against a malformed or corrupt manager: skip a section that is
+        // empty, runs past end-of-file, or overlaps one already taken. A
+        // well-formed file (this crate's or the C library's) has none of these;
+        // tolerating them keeps a bad file from seeding a bogus or double-counted
+        // free region that a later commit would hand out into live data.
+        if let Ok(mut sections) =
+            free_space_manager::read_persisted_sections(&self.data, &info.manager_addrs, 0, os)
+        {
+            let file_len = self.data.len() as u64;
+            sections.sort_by_key(|s| s.addr);
+            let mut prev_end = 0u64;
+            for s in sections {
+                let Some(end) = s.addr.checked_add(s.size) else {
+                    continue;
+                };
+                if s.size == 0 || end > file_len || s.addr < prev_end {
+                    continue;
+                }
+                prev_end = end;
+                self.free.free(s.addr, s.size);
+            }
+        }
+
+        // Record the byte extents of the blocks the live file uses so the next
+        // persisting commit frees them when it writes replacements: the
+        // extension header, and each defined manager's FSHD + FSSE.
+        let mut old_blocks = Vec::new();
+        if let Ok(spans) = self.oh_chunk_spans(ext_addr) {
+            old_blocks.extend(spans);
+        }
+        for &m in &info.manager_addrs {
+            if m == UNDEF {
+                continue;
+            }
+            let Ok(m_us) = usize::try_from(m) else {
+                continue;
+            };
+            let Some(slice) = self.data.get(m_us..) else {
+                continue;
+            };
+            if let Ok(h) = FsmHeader::parse(slice, os) {
+                // `FsmHeader::parse` succeeding guarantees the header's own bytes
+                // are present, so the FSHD extent is in-bounds; validate the
+                // section-info extent before recording it, so a malformed
+                // `fsse_used` can't later free a region running past end-of-file.
+                old_blocks.push((m, fshd_len(os)));
+                if h.fsse_addr != UNDEF
+                    && h.fsse_addr
+                        .checked_add(h.fsse_used)
+                        .is_some_and(|end| end <= self.data.len() as u64)
+                {
+                    old_blocks.push((h.fsse_addr, h.fsse_used));
+                }
+            }
+        }
+
+        self.persist = Some(PersistState {
+            strategy: info.strategy,
+            threshold: info.threshold,
+            page_size: info.page_size,
+            old_blocks,
+        });
+    }
+
+    /// Parse the File Space Info message out of the superblock-extension object
+    /// header at `ext_addr`, if present and readable.
+    fn extension_fsinfo(&self, ext_addr: usize) -> Option<FileSpaceInfo> {
+        let os = self.superblock.offset_size;
+        let ls = self.superblock.length_size;
+        let base = self.superblock.base_address;
+        let oh = ObjectHeader::parse_with_base(&self.data, ext_addr, os, ls, base).ok()?;
+        let msg = oh
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::FileSpaceInfo)?;
+        FileSpaceInfo::parse(&msg.data, os, ls).ok()
     }
 
     /// Stage a new dataset, added on the next [`commit`](Self::commit). The
@@ -234,11 +384,12 @@ impl EditSession {
     /// end-of-file the file is truncated. Reclaim is best-effort — an object
     /// whose blocks this engine cannot enumerate exhaustively (chunked or
     /// variable-length storage, dense attribute/link heaps) is left as dead bytes
-    /// rather than risk freeing a region that is still in use. As in the
-    /// reference library's default file-space strategy, freed space is reused
-    /// only within the open session; it is not persisted across reopen, and an
-    /// object reference to a deleted object may, after reuse, resolve to an
-    /// unrelated object (deleting a referenced object is undefined in HDF5).
+    /// rather than risk freeing a region that is still in use. Freed space is
+    /// reused within the open session; for a file created with
+    /// `H5Pset_file_space_strategy(persist = true)` it is also recorded on disk so
+    /// it survives reopen (see the [module docs](self)), otherwise it is forgotten
+    /// on close. After reuse, an object reference to a deleted object may resolve
+    /// to an unrelated object (deleting a referenced object is undefined in HDF5).
     ///
     /// The path must exist. A deletion may not overlap another staged change in
     /// the same commit (e.g. delete `/a` while adding `/a/b`); split such
@@ -545,6 +696,12 @@ impl EditSession {
         // (the barrier), then flip the pointer, then sync the flip.
         let new_root = new_addr[&PathKey::new()];
 
+        // A persisting file keeps its freed space recorded on disk rather than
+        // truncating it away, so its commit takes a different, append-only tail.
+        if self.persist.is_some() {
+            return self.commit_persisting(new_root, to_free);
+        }
+
         // The new tree is fully written, so the regions this commit vacated are
         // now dead: hand them to the session free list. If the resulting free
         // space forms a run reaching end-of-file, the file can be physically
@@ -588,6 +745,190 @@ impl EditSession {
             self.handle.sync_all().map_err(Error::Io)?;
         }
         Ok(())
+    }
+
+    /// Commit tail for a file that persists its free space (issue #21). Unlike
+    /// the non-persisting path, freed space is *retained* and recorded on disk —
+    /// matching the reference library's persistent free-space strategy — so a
+    /// later reopen (by this crate or the C library) recovers it.
+    ///
+    /// The post-commit free list (this commit's vacated regions plus the now-dead
+    /// old free-space-manager and extension blocks) is serialized into a fresh
+    /// `FSHD`/`FSSE` pair and a rewritten superblock-extension File Space Info
+    /// message, all appended at the current end-of-file. Nothing live or
+    /// still-referenced is overwritten: the new blocks sit strictly past the old
+    /// ones, and the superblock — repointed last — is the linearization point. A
+    /// crash before it leaves the prior file (root, extension, and managers)
+    /// wholly intact.
+    fn commit_persisting(&mut self, new_root: u64, to_free: Vec<(u64, u64)>) -> Result<(), Error> {
+        let os = self.superblock.offset_size;
+        let (strategy, threshold, page_size, old_blocks) = {
+            // Copy what we need so no borrow of `self.persist` is held across the
+            // `&mut self` writes below; the old state stays in place so a failure
+            // leaves the session reusable.
+            let ps = self
+                .persist
+                .as_ref()
+                .expect("commit_persisting is only called when persistence is armed");
+            (
+                ps.strategy,
+                ps.threshold,
+                ps.page_size,
+                ps.old_blocks.clone(),
+            )
+        };
+
+        // The free list the new managers will record: this commit's vacated
+        // regions plus the superseded FSM/extension blocks (dead once we
+        // repoint), coalesced. Built in a temp so `self.free` and the on-disk old
+        // blocks stay untouched until after the superblock repoint.
+        let mut post = self.free.clone();
+        for &(a, l) in &to_free {
+            post.free(a, l);
+        }
+        for &(a, l) in &old_blocks {
+            post.free(a, l);
+        }
+        let sections: Vec<FreeSection> = post
+            .sections()
+            .into_iter()
+            .map(|(addr, size)| FreeSection { addr, size })
+            .collect();
+
+        let old_ext_rel = self
+            .superblock
+            .superblock_extension_address
+            .filter(|&a| a != UNDEF)
+            .ok_or(Error::EditUnsupported(
+                "a persisting file has no superblock extension to update",
+            ))?;
+        let old_ext_addr = usize::try_from(old_ext_rel)
+            .map_err(|_| Error::EditUnsupported("extension address exceeds this platform"))?;
+
+        // The persist File Space Info message is fixed-size, so the rewritten
+        // extension's length is independent of the addresses it will carry: size
+        // it with a placeholder to place the FSM blocks that follow it.
+        let placeholder =
+            FileSpaceInfo::persistent_single_manager(strategy, threshold, page_size, 0, 0);
+        let ext_len =
+            build_v2_object_header(&self.rewrite_extension_region(old_ext_addr, &placeholder)?)
+                .len() as u64;
+
+        let ext_addr = self.data.len() as u64;
+        let fshd_addr = ext_addr + ext_len;
+
+        // Build the real extension and the FSM blocks. With no free space to
+        // record we still refresh the extension (persist on, managers undefined).
+        let (ext_oh, fsm_blocks, final_eof) = if sections.is_empty() {
+            let info = FileSpaceInfo::persistent_empty(strategy, threshold, page_size);
+            let ext_oh =
+                build_v2_object_header(&self.rewrite_extension_region(old_ext_addr, &info)?);
+            let final_eof = ext_addr + ext_oh.len() as u64;
+            (ext_oh, None, final_eof)
+        } else {
+            let fsse_addr = fshd_addr + fshd_len(os);
+            // `eoa_pre_fsm` is the end-of-allocation before the free-space-manager
+            // section blocks (`FSHD`/`FSSE`) were allocated: a consumer may shrink
+            // back to here and rebuild them. It points at the FSHD, not the
+            // extension — the extension sits below it and persists, so shrinking
+            // leaves the superblock and its extension pointer valid (only the
+            // manager blocks, which are rewritten every commit, are discarded).
+            // This matches the C library's convention of keeping the superblock
+            // extension stable across closes, and is the value `H5Fget_freespace`
+            // accounts for correctly (verified in the crosscheck).
+            let eoa_pre_fsm = fshd_addr;
+            let info = FileSpaceInfo::persistent_single_manager(
+                strategy,
+                threshold,
+                page_size,
+                fshd_addr,
+                eoa_pre_fsm,
+            );
+            let ext_oh =
+                build_v2_object_header(&self.rewrite_extension_region(old_ext_addr, &info)?);
+            debug_assert_eq!(
+                ext_oh.len() as u64,
+                ext_len,
+                "extension length must be stable across the placeholder and real messages"
+            );
+            let (fshd, fsse) = serialize_file_fsm(&sections, fshd_addr, fsse_addr, os);
+            let final_eof = fsse_addr + fsse.len() as u64;
+            (ext_oh, Some((fshd, fsse)), final_eof)
+        };
+
+        // Append the extension, then the FSM blocks, at end-of-file. They are
+        // unreferenced until the superblock repoint, so a crash here is harmless.
+        let written_ext = self.append(&ext_oh)?;
+        debug_assert_eq!(written_ext, ext_addr);
+        let mut new_old_blocks = vec![(ext_addr, ext_oh.len() as u64)];
+        if let Some((fshd, fsse)) = fsm_blocks {
+            let wf = self.append(&fshd)?;
+            debug_assert_eq!(wf, fshd_addr);
+            new_old_blocks.push((fshd_addr, fshd.len() as u64));
+            let ws = self.append(&fsse)?;
+            new_old_blocks.push((ws, fsse.len() as u64));
+        }
+
+        // Barrier, then repoint the superblock (root, eof, and the new extension)
+        // — the linearization point — and sync it.
+        self.handle.sync_all().map_err(Error::Io)?;
+        let mut new_sb = self.superblock.clone();
+        new_sb.root_group_address = new_root;
+        new_sb.eof_address = final_eof;
+        new_sb.superblock_extension_address = Some(ext_addr);
+        let sb_bytes = new_sb.serialize();
+        self.write_at(self.sb_sig_off, &sb_bytes)?;
+        self.handle.sync_all().map_err(Error::Io)?;
+        self.superblock = new_sb;
+
+        // The repoint is durable: the prior free list plus this commit's vacated
+        // regions are now genuinely free, and the freshly written blocks become
+        // the ones a future commit will supersede.
+        self.free = post;
+        self.persist = Some(PersistState {
+            strategy,
+            threshold,
+            page_size,
+            old_blocks: new_old_blocks,
+        });
+        Ok(())
+    }
+
+    /// Rebuild the superblock-extension object header's message region with its
+    /// File Space Info message replaced by `info` (every other message preserved
+    /// verbatim), ready to wrap with [`build_v2_object_header`]. The persisting
+    /// message is fixed-size, so this never changes the region's length.
+    fn rewrite_extension_region(
+        &self,
+        ext_addr: usize,
+        info: &FileSpaceInfo,
+    ) -> Result<Vec<u8>, Error> {
+        let region = self.gather_oh_messages(ext_addr)?;
+        let new_body = info.serialize();
+        let mut out = Vec::with_capacity(region.len());
+        let mut p = 0;
+        let mut replaced = false;
+        while let Some((msg_type, _body, body_end)) = next_message(&region, p)? {
+            if msg_type == MessageType::FileSpaceInfo {
+                out.push(region[p]); // message type byte
+                out.extend_from_slice(&(new_body.len() as u16).to_le_bytes());
+                out.push(region[p + 3]); // preserve the message flags (0x14)
+                out.extend_from_slice(&new_body);
+                replaced = true;
+            } else {
+                out.extend_from_slice(&region[p..body_end]);
+            }
+            p = body_end;
+        }
+        if !replaced {
+            // No File Space Info present (unexpected when persistence is armed):
+            // add one with the flags the C library uses for it.
+            out.push(MessageType::FileSpaceInfo.to_u16() as u8);
+            out.extend_from_slice(&(new_body.len() as u16).to_le_bytes());
+            out.push(0x14);
+            out.extend_from_slice(&new_body);
+        }
+        Ok(out)
     }
 
     /// Repoint a version 0/1 superblock at the rebuilt (now v2) root group and

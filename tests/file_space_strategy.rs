@@ -144,18 +144,23 @@ fn survives_in_place_edit() {
 }
 
 #[test]
-fn persist_true_is_refused() {
+fn persist_true_records_intent_on_a_fresh_file() {
+    // A brand-new file has no free space, so persist = true records the persist
+    // flag with no on-disk managers (matching the C library's brand-new persisted
+    // file). A later EditSession that frees space fills the managers in.
     let path = tmp("hdf5_pure_fss_persist.h5");
     let mut b = FileBuilder::new();
-    b.create_dataset("d").with_i32_data(&[1]);
+    b.create_dataset("d").with_i32_data(&[1, 2, 3]);
     b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1);
-    let err = b.write(&path).unwrap_err();
-    assert!(
-        matches!(
-            err,
-            hdf5_pure::Error::Format(hdf5_pure::FormatError::FileSpacePersistUnsupported)
-        ),
-        "expected FileSpacePersistUnsupported, got {err:?}"
-    );
-    assert!(!path.exists(), "no file is written when finish() fails");
+    b.write(&path).unwrap();
+
+    let f = File::open(&path).unwrap();
+    let info = f.file_space_info().expect("file records a strategy");
+    assert_eq!(info.strategy, FileSpaceStrategy::FsmAggr);
+    assert!(info.persist, "persist flag is recorded");
+    // No free space yet: every manager slot is undefined and nothing is persisted.
+    assert!(info.manager_addrs.iter().all(|&a| a == u64::MAX));
+    assert!(f.persisted_free_space().is_empty());
+    assert_eq!(f.dataset("d").unwrap().read_i32().unwrap(), vec![1, 2, 3]);
+    std::fs::remove_file(&path).ok();
 }

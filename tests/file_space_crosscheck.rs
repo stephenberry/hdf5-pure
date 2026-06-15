@@ -8,11 +8,33 @@
 //! message carries free-space-manager addresses.
 
 use hdf5::plist::file_create::FileSpaceStrategy as CStrategy;
-use hdf5_pure::{File, FileBuilder, FileSpaceStrategy};
+use hdf5_pure::{EditSession, File, FileBuilder, FileSpaceStrategy};
+use std::sync::{Mutex, MutexGuard};
 use tempfile::tempdir;
+
+// The reference free-space query, resolved at link time from the statically
+// linked libhdf5. Returns the total free space the C library tracks for the open
+// file, which it can only report by loading and parsing the on-disk
+// free-space-manager (`FSHD`/`FSSE`) blocks — so a positive result proves the C
+// library accepts the managers hdf5-pure wrote.
+unsafe extern "C" {
+    fn H5Fget_freespace(file_id: i64) -> i64;
+}
+
+// `hdf5-metno` serializes its own C calls through an internal lock, but the raw
+// `H5Fget_freespace` FFI above bypasses it. Serialize every C-library call in this
+// file through one mutex so the raw call never races a concurrent libhdf5 call in
+// another test (the C library is not built thread-safe here). Poisoning is
+// ignored: a panic in one test must not cascade into the others.
+static C_LIB: Mutex<()> = Mutex::new(());
+
+fn c_lib_guard() -> MutexGuard<'static, ()> {
+    C_LIB.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 #[test]
 fn c_library_reads_our_strategy() {
+    let _c = c_lib_guard();
     let dir = tempdir().unwrap();
     for (i, (ours, expected)) in [
         (
@@ -62,6 +84,7 @@ fn c_library_reads_our_strategy() {
 
 #[test]
 fn we_read_c_library_persisted_free_space() {
+    let _c = c_lib_guard();
     // The C library writes a persisted FSM file with real free space (a deleted
     // dataset). hdf5-pure must follow the File Space Info manager addresses to the
     // on-disk FSHD/FSSE blocks and recover the freed sections.
@@ -125,7 +148,72 @@ fn we_read_c_library_persisted_free_space() {
 }
 
 #[test]
+fn c_library_reads_our_persisted_free_space() {
+    let _c = c_lib_guard();
+    // The mirror of `we_read_c_library_persisted_free_space`: hdf5-pure writes a
+    // persisted file with real free space (a deleted dataset), and the reference
+    // C library opens it, recovers the strategy, reads the survivors, and loads
+    // the on-disk free-space managers we wrote.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("ours_persisted.h5");
+
+    // Create a persisted file, then free a dataset's storage in place.
+    let mut b = FileBuilder::new();
+    b.create_dataset("a").with_i32_data(&[1; 100]);
+    b.create_dataset("big").with_i32_data(&[7; 400]); // 1600 bytes of raw data
+    b.create_dataset("c").with_i32_data(&[3; 100]);
+    b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1);
+    b.write(&path).unwrap();
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        s.delete("big");
+        s.commit().unwrap();
+    }
+
+    // hdf5-pure's own reader recovers the persisted sections (covering "big").
+    let ours = File::open(&path).unwrap();
+    let total_ours: u64 = ours.persisted_free_space().iter().map(|(_, l)| l).sum();
+    assert!(
+        total_ours >= 1600,
+        "we persist the freed storage: {total_ours}"
+    );
+    drop(ours);
+
+    // The C library opens the same file: strategy and persist flag round-trip,
+    // the survivors read byte-exact, and `H5Fget_freespace` parses our managers.
+    let f = hdf5::File::open(&path).unwrap();
+    let strat = f.create_plist().unwrap().get_file_space_strategy().unwrap();
+    assert_eq!(
+        strat,
+        CStrategy::FreeSpaceManager {
+            paged: false,
+            persist: true,
+            threshold: 1,
+        },
+        "C library recovers our persisted FSM strategy"
+    );
+    assert_eq!(
+        f.dataset("a").unwrap().read_raw::<i32>().unwrap(),
+        vec![1; 100]
+    );
+    assert_eq!(
+        f.dataset("c").unwrap().read_raw::<i32>().unwrap(),
+        vec![3; 100]
+    );
+    assert!(f.dataset("big").is_err(), "the deleted dataset is gone");
+
+    // Loading the managers requires parsing our FSHD/FSSE blocks; the C library
+    // reports at least the freed dataset's storage as free space.
+    let free_c = unsafe { H5Fget_freespace(f.id()) };
+    assert!(
+        free_c >= 1600,
+        "C library loads our free-space managers and reports the freed space (got {free_c})"
+    );
+}
+
+#[test]
 fn we_read_c_library_strategy() {
+    let _c = c_lib_guard();
     let dir = tempdir().unwrap();
 
     // Each case: a C-written strategy and what hdf5-pure should report. The C

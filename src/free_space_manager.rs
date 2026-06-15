@@ -49,7 +49,7 @@
 #[cfg(not(feature = "std"))]
 extern crate alloc;
 #[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
@@ -136,6 +136,107 @@ impl FsmHeader {
             fsse_used,
         })
     }
+}
+
+/// Section-class count the reference C library records in a file free-space
+/// manager header (`H5FS` registers three classes for the file client), and the
+/// shrink/expand percentages it writes. We track sections only as the simple
+/// class (id 0), but mirror these header fields so the block is byte-identical to
+/// what the C library writes and its reader validates.
+const FILE_FSM_NUM_CLASSES: u16 = 3;
+const FILE_FSM_SHRINK_PCT: u16 = 80;
+const FILE_FSM_EXPAND_PCT: u16 = 120;
+/// Free-space client id 1 = "file free space" (vs 0 = fractal heap).
+const FILE_FSM_CLIENT_ID: u8 = 1;
+/// The largest section size the file manager tracks, `2^63 - 1` (C default).
+const FILE_FSM_MAX_SECTION_SIZE: u64 = (1u64 << 63) - 1;
+
+/// Append `value` as a little-endian unsigned integer of `width` bytes.
+fn push_uint_le(buf: &mut Vec<u8>, value: u64, width: usize) {
+    for i in 0..width {
+        buf.push((value >> (8 * i)) as u8);
+    }
+}
+
+/// Serialize a single file free-space manager (the `FSHD` header and its `FSSE`
+/// section list) holding every region in `sections`. `fshd_addr`/`fsse_addr` are
+/// the absolute file offsets the two blocks will occupy: the header records the
+/// section-info address and the section info back-points at the header. Returns
+/// `(fshd_bytes, fsse_bytes)`, each ending in its Jenkins checksum, ready to write
+/// at those addresses. The encoding round-trips through [`FsmHeader::parse`] /
+/// [`parse_fsse`] and is byte-identical to the reference C library's.
+pub(crate) fn serialize_file_fsm(
+    sections: &[FreeSection],
+    fshd_addr: u64,
+    fsse_addr: u64,
+    offset_size: u8,
+) -> (Vec<u8>, Vec<u8>) {
+    let os = offset_size as usize;
+    let addr_space_bits = (offset_size as u16) * 8 - 1;
+    let total_sections = sections.len() as u64;
+    let total_space: u64 = sections.iter().map(|s| s.size).sum();
+
+    let off_w = offset_width(addr_space_bits);
+    let size_w = enc_size(FILE_FSM_MAX_SECTION_SIZE);
+    let count_w = enc_size(total_sections);
+
+    // --- FSSE: sections grouped by size (ascending), offsets ascending within
+    // a group, exactly as the C library serializes its size-ordered skip list. ---
+    let mut fsse = Vec::new();
+    fsse.extend_from_slice(FSSE_SIGNATURE);
+    fsse.push(0); // version
+    push_uint_le(&mut fsse, fshd_addr, os); // back-pointer to the header
+
+    // Group sections by size, then emit the groups in ascending size order with
+    // ascending offsets within each, matching the C library's size-ordered list.
+    let mut by_size: Vec<(u64, Vec<u64>)> = Vec::new();
+    for s in sections {
+        match by_size.iter_mut().find(|(size, _)| *size == s.size) {
+            Some((_, offsets)) => offsets.push(s.addr),
+            None => by_size.push((s.size, vec![s.addr])),
+        }
+    }
+    by_size.sort_by_key(|(size, _)| *size);
+    for (size, mut offsets) in by_size {
+        offsets.sort_unstable();
+        push_uint_le(&mut fsse, offsets.len() as u64, count_w);
+        push_uint_le(&mut fsse, size, size_w);
+        for addr in offsets {
+            push_uint_le(&mut fsse, addr, off_w);
+            fsse.push(0); // section class id 0 (simple; no class data)
+        }
+    }
+    let checksum = crate::checksum::jenkins_lookup3(&fsse);
+    fsse.extend_from_slice(&checksum.to_le_bytes());
+    let fsse_len = fsse.len() as u64;
+
+    // --- FSHD: fixed-layout header referencing the section info just built. ---
+    let mut fshd = Vec::with_capacity(4 + 1 + 1 + 4 * 8 + 2 * 4 + 8 + os + 8 + 8 + 4);
+    fshd.extend_from_slice(FSHD_SIGNATURE);
+    fshd.push(0); // version
+    fshd.push(FILE_FSM_CLIENT_ID);
+    push_uint_le(&mut fshd, total_space, 8);
+    push_uint_le(&mut fshd, total_sections, 8);
+    push_uint_le(&mut fshd, total_sections, 8); // serialized (all of them)
+    push_uint_le(&mut fshd, 0, 8); // ghost (none)
+    fshd.extend_from_slice(&FILE_FSM_NUM_CLASSES.to_le_bytes());
+    fshd.extend_from_slice(&FILE_FSM_SHRINK_PCT.to_le_bytes());
+    fshd.extend_from_slice(&FILE_FSM_EXPAND_PCT.to_le_bytes());
+    fshd.extend_from_slice(&addr_space_bits.to_le_bytes());
+    push_uint_le(&mut fshd, FILE_FSM_MAX_SECTION_SIZE, 8);
+    push_uint_le(&mut fshd, fsse_addr, os);
+    push_uint_le(&mut fshd, fsse_len, 8); // section info used
+    push_uint_le(&mut fshd, fsse_len, 8); // section info allocated (== used)
+    let checksum = crate::checksum::jenkins_lookup3(&fshd);
+    fshd.extend_from_slice(&checksum.to_le_bytes());
+
+    (fshd, fsse)
+}
+
+/// The fixed serialized byte length of an `FSHD` header for the given offset size
+/// (82 bytes for standard 8-byte offsets).
+pub(crate) fn fshd_len(offset_size: u8) -> u64 {
+    (4 + 1 + 1 + 4 * 8 + 2 * 4 + 8 + offset_size as usize + 8 + 8 + 4) as u64
 }
 
 /// Parse the `FSSE` section list `data` (the whole block, including checksum) for
@@ -321,6 +422,94 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn serialize_matches_c_library_single_section() {
+        // Byte-for-byte reproduction of the FSHD@619 / FSSE@701 fixtures,
+        // including the Jenkins checksums the C library verifies on read.
+        let fshd_fixture = bytes(
+            "46534844000140060000000000000100000000000000010000000000000000000000000000000300500078003f00ffffffffffffff7fbd0200000000000023000000000000002300000000000000ea133710",
+        );
+        let fsse_fixture =
+            bytes("46535345006b02000000000000014006000000000000200b000000000000005c797631");
+        let (fshd, fsse) = serialize_file_fsm(
+            &[FreeSection {
+                addr: 2848,
+                size: 1600,
+            }],
+            619,
+            701,
+            8,
+        );
+        assert_eq!(fshd, fshd_fixture, "FSHD bytes match the C library");
+        assert_eq!(fsse, fsse_fixture, "FSSE bytes match the C library");
+        // The header length helper agrees with the produced bytes.
+        assert_eq!(fshd_len(8), fshd.len() as u64);
+    }
+
+    #[test]
+    fn serialize_matches_c_library_two_sections() {
+        // FSHD@736 / FSSE@818: two differently-sized sections (16 @871, 893 @1155)
+        // emitted as two ascending size-groups.
+        let fshd_fixture = bytes(
+            "4653484400018d030000000000000200000000000000020000000000000000000000000000000300500078003f00ffffffffffffff7f320300000000000035000000000000003500000000000000d681e354",
+        );
+        let fsse_fixture = bytes(
+            "4653534500e002000000000000011000000000000000670300000000000000017d03000000000000830400000000000000910245b2",
+        );
+        let (fshd, fsse) = serialize_file_fsm(
+            &[
+                FreeSection {
+                    addr: 1155,
+                    size: 893,
+                },
+                FreeSection {
+                    addr: 871,
+                    size: 16,
+                },
+            ],
+            736,
+            818,
+            8,
+        );
+        assert_eq!(fshd, fshd_fixture, "FSHD bytes match the C library");
+        assert_eq!(fsse, fsse_fixture, "FSSE bytes match the C library");
+    }
+
+    #[test]
+    fn serialize_roundtrips_through_parse() {
+        let sections = [
+            FreeSection {
+                addr: 4096,
+                size: 512,
+            },
+            FreeSection {
+                addr: 9000,
+                size: 512,
+            },
+            FreeSection {
+                addr: 20000,
+                size: 70000,
+            },
+        ];
+        let (fshd, _fsse) = serialize_file_fsm(&sections, 1000, 1100, 8);
+        let header = FsmHeader::parse(&fshd, 8).unwrap();
+        assert_eq!(header.total_sections, 3);
+        assert_eq!(header.total_space, 512 + 512 + 70000);
+        assert_eq!(header.fsse_addr, 1100);
+
+        // Place both blocks in a buffer and read them back through the manager
+        // indirection; the recovered sections match (order-independent).
+        let (fshd, fsse) = serialize_file_fsm(&sections, 1000, 1100, 8);
+        let mut buf = vec![0u8; 1100 + fsse.len()];
+        buf[1000..1000 + fshd.len()].copy_from_slice(&fshd);
+        buf[1100..1100 + fsse.len()].copy_from_slice(&fsse);
+        let mut got = read_persisted_sections(&buf, &[1000], 0, 8).unwrap();
+        got.sort_by_key(|s| s.addr);
+        let mut want = sections.to_vec();
+        want.sort_by_key(|s| s.addr);
+        assert_eq!(got, want);
     }
 
     #[test]
