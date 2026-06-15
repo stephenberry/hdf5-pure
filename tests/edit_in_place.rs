@@ -578,6 +578,162 @@ fn add_dataset_with_attributes() {
 }
 
 #[test]
+fn create_group_with_attributes() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_group_attrs.h5");
+    write_starter(&path);
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.create_group("run");
+        session.set_group_attr("run", "kind", AttrValue::AsciiString("trial".into()));
+        session.set_group_attr("run", "count", AttrValue::I64(2));
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let attrs = file.group("run").unwrap().attrs().unwrap();
+    assert_eq!(attrs.get("kind"), Some(&AttrValue::String("trial".into())));
+    assert_eq!(attrs.get("count"), Some(&AttrValue::I64(2)));
+    assert_eq!(
+        file.dataset("original").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn edit_existing_group_attributes() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_existing_group_attrs.h5");
+    let mut b = FileBuilder::new();
+    let mut g = b.create_group("grp");
+    g.set_attr("status", AttrValue::String("old".into()));
+    g.set_attr("drop", AttrValue::I64(1));
+    g.create_dataset("data").with_i32_data(&[5, 6]);
+    b.add_group(g.finish());
+    b.write(&path).unwrap();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.set_group_attr("grp", "status", AttrValue::String("new".into()));
+        session.set_group_attr("grp", "added", AttrValue::F64(3.5));
+        session.remove_group_attr("grp", "drop");
+        session.set_group_attr("/", "root_tag", AttrValue::U64(9));
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let grp_attrs = file.group("grp").unwrap().attrs().unwrap();
+    assert_eq!(
+        grp_attrs.get("status"),
+        Some(&AttrValue::String("new".into()))
+    );
+    assert_eq!(grp_attrs.get("added"), Some(&AttrValue::F64(3.5)));
+    assert!(!grp_attrs.contains_key("drop"));
+    assert_eq!(
+        file.group("grp").unwrap().datasets().unwrap(),
+        vec!["data".to_string()]
+    );
+    assert_eq!(
+        file.root().attrs().unwrap().get("root_tag"),
+        Some(&AttrValue::U64(9))
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn group_attribute_edit_uses_final_compact_count() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_group_attr_final_count.h5");
+    let mut b = FileBuilder::new();
+    let mut g = b.create_group("grp");
+    for i in 0..8 {
+        g.set_attr(&format!("a{i}"), AttrValue::I64(i));
+    }
+    b.add_group(g.finish());
+    b.write(&path).unwrap();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.set_group_attr("grp", "new", AttrValue::I64(99));
+        session.remove_group_attr("grp", "a0");
+        session.commit().unwrap();
+    }
+
+    let attrs = File::open(&path)
+        .unwrap()
+        .group("grp")
+        .unwrap()
+        .attrs()
+        .unwrap();
+    assert_eq!(attrs.len(), 8);
+    assert!(!attrs.contains_key("a0"));
+    assert_eq!(attrs.get("new"), Some(&AttrValue::I64(99)));
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn remove_missing_group_attribute_is_rejected_without_writing() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_missing_group_attr.h5");
+    let mut b = FileBuilder::new();
+    let mut g = b.create_group("grp");
+    g.set_attr("present", AttrValue::I64(1));
+    b.add_group(g.finish());
+    b.write(&path).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.remove_group_attr("grp", "missing");
+        let err = session.commit().unwrap_err();
+        assert!(err.to_string().contains("not found"), "got: {err}");
+    }
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn variable_length_group_attribute_is_rejected_without_writing() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_vlen_group_attr.h5");
+    write_starter(&path);
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.set_group_attr(
+            "/",
+            "fields",
+            AttrValue::VarLenAsciiArray(vec!["a".into(), "b".into()]),
+        );
+        let err = session.commit().unwrap_err();
+        assert!(err.to_string().contains("variable-length"), "got: {err}");
+    }
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn deleting_group_with_attribute_edit_is_rejected_without_writing() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_delete_group_attr_overlap.h5");
+    let mut b = FileBuilder::new();
+    let mut g = b.create_group("grp");
+    g.set_attr("tag", AttrValue::I64(1));
+    b.add_group(g.finish());
+    b.write(&path).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.delete("grp");
+        session.set_group_attr("grp", "tag", AttrValue::I64(2));
+        let err = session.commit().unwrap_err();
+        assert!(err.to_string().contains("overlaps"), "got: {err}");
+    }
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn copy_preserves_dataset_attributes() {
     // Exercises the "verbatim message bytes" claim: a copied dataset's
     // attributes (separate header messages) must survive byte-for-byte.
