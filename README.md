@@ -72,7 +72,23 @@ session.delete("sensors/pressure");                 // H5Ldelete
 session.commit().unwrap();  // apply everything in place
 ```
 
-Contiguous, unfiltered datasets and compact-link groups are supported, and the editor edits files across every on-disk format the reference C library and h5py produce — version 0/1/2/3 superblocks, single- and multi-chunk object headers (a multi-chunk header is collapsed into one chunk on rewrite, and a version 0/1 symbol-table group on the edited path is converted to the latest compact-link format). It refuses, rather than silently degrade the file, anything it cannot reproduce faithfully — a userblock (non-zero base address), chunked/compressed additions, dense-storage headers on the edited path, or copying an existing version-1 object. The space left by deleted or superseded objects is not yet reclaimed.
+Contiguous, unfiltered datasets and compact-link groups are supported, and the editor edits files across every on-disk format the reference C library and h5py produce — version 0/1/2/3 superblocks, single- and multi-chunk object headers (a multi-chunk header is collapsed into one chunk on rewrite, and a version 0/1 symbol-table group on the edited path is converted to the latest compact-link format). It refuses, rather than silently degrade the file, anything it cannot reproduce faithfully — a userblock (non-zero base address), chunked/compressed additions, dense-storage headers on the edited path, or copying an existing version-1 object. Within a session the space a deletion frees is reused for later writes and the file is truncated when the freed bytes reach the end, so add/delete churn stays bounded instead of only ever growing; for guaranteed compaction across a reopen, see `repack` below.
+
+### Reclaiming space (`repack`)
+
+Deleting an object inside an `EditSession` reuses the freed space within the session, but a single delete-then-close cannot shrink a file whose freed region is not at the very end — the same reason the HDF5 C library ships `h5repack`. `repack` is the guaranteed-shrink answer: it reads every surviving object and rewrites the whole file compact, optionally dropping objects.
+
+```rust,no_run
+use hdf5_pure::{repack, RepackOptions};
+
+// Drop a dataset and a whole group subtree, then write a fresh, compact file.
+let options = RepackOptions::new()
+    .drop_path("scratch")
+    .drop_path("runs/aborted");
+repack("input.h5", "compact.h5", &options).unwrap();
+```
+
+`repack` never silently degrades data: every surviving object is reproduced byte-for-byte — datatype, shape, chunking, supported filters, raw data, and attributes — or the whole operation fails with `Error::RepackUnsupported` naming the object, leaving no output file. It reproduces fixed-point, floating-point, string, bit-field, opaque, compound, enumeration, and array datatypes, contiguous or chunked, filtered with deflate, shuffle, fletcher32, and/or lossless integer scale-offset. Anything it cannot reproduce exactly — variable-length, time, and reference datatypes, virtual layouts, lossy filters (float D-scale scale-offset, ZFP, SZIP), or an attribute the reader cannot decode — it refuses by name rather than write a file that quietly differs.
 
 ### Streaming large files
 
