@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Reading a dense group or dense attribute set whose link/attribute names are very long (the message exceeds the heap's ~4 KiB managed-object limit) failed with `InvalidObjectHeaderVersion` or `UnexpectedEof`. Such messages are stored as fractal-heap "huge" objects, but the reader took the heap-ID type from the wrong bits (the format version in bits 6-7 instead of the type in bits 4-5), so every huge object was mis-decoded as managed and resolved to a garbage address. The reader now classifies heap IDs correctly and resolves huge objects through the heap's huge-objects v2 B-tree (and tiny objects inline), in both the buffered and streaming readers. Validated against the reference HDF5 C library for long-named links and attributes, including a group mixing managed and huge links.
+
 ## [0.14.0] - 2026-06-15
 
 Completes free-space management ([#21](https://github.com/stephenberry/hdf5-pure/issues/21)) and closes several reader/writer interoperability gaps with the reference HDF5 C library. Additive: the new public surface (the file-space-strategy and persisted-free-space APIs) makes this a minor bump; cargo-semver-checks confirms no breaking change.

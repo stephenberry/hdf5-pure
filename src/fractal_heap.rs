@@ -6,9 +6,25 @@ use alloc::vec::Vec;
 #[cfg(feature = "checksum")]
 use byteorder::{ByteOrder, LittleEndian};
 
+use crate::btree_v2::{
+    BTreeV2Header, BTreeV2Record, collect_btree_v2_records, collect_btree_v2_records_from_source,
+};
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
 use crate::source::FileSource;
+
+/// The kind of object a fractal-heap heap ID refers to, encoded in bits 4-5 of
+/// the heap ID's first byte (bits 6-7 are the format version, which must be 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeapIdType {
+    /// Stored in the heap's managed direct/indirect blocks.
+    Managed,
+    /// Too large to manage; stored directly in the file and indexed by the
+    /// heap's huge-objects v2 B-tree (or, for wide heap IDs, inline).
+    Huge,
+    /// Small enough to be stored directly inside the heap ID.
+    Tiny,
+}
 
 /// A child entry of a fractal-heap indirect block: either a direct block (a leaf
 /// holding object bytes) or a nested indirect block. Returned by
@@ -38,8 +54,12 @@ pub struct FractalHeapHeader {
     pub heap_id_length: u16,
     /// I/O filter encoded length (0 = no filters).
     pub io_filter_encoded_length: u16,
-    /// Maximum size of a managed object.
+    /// Maximum size of a managed object. Objects larger than this are stored
+    /// as "huge" objects outside the managed direct/indirect blocks.
     pub max_managed_object_size: u32,
+    /// Address of the v2 B-tree that indexes "huge" objects (objects too large
+    /// to be managed). Undefined (all-ones) when the heap has no huge objects.
+    pub btree_huge_objects_address: u64,
     /// Width of the doubling table.
     pub table_width: u16,
     /// Starting block size in the doubling table.
@@ -113,6 +133,99 @@ fn log2_floor(v: u64) -> u32 {
     if v == 0 { 0 } else { 63 - v.leading_zeros() }
 }
 
+/// Read a little-endian integer from up to the first 8 bytes of `payload`. Used
+/// for the variable-width "huge object ID" packed into a heap ID.
+fn read_var_le(payload: &[u8]) -> u64 {
+    let mut value = 0u64;
+    for (i, &b) in payload.iter().take(8).enumerate() {
+        value |= (b as u64) << (i * 8);
+    }
+    value
+}
+
+/// Copy `len` bytes at `addr` out of an in-memory file image, bounds-checked.
+fn slice_object(file_data: &[u8], addr: u64, len: usize) -> Result<Vec<u8>, FormatError> {
+    let start = addr.to_usize()?;
+    let end = start.checked_add(len).ok_or(FormatError::OffsetOverflow {
+        offset: addr,
+        length: len as u64,
+    })?;
+    if end > file_data.len() {
+        return Err(FormatError::UnexpectedEof {
+            expected: end,
+            available: file_data.len(),
+        });
+    }
+    Ok(file_data[start..end].to_vec())
+}
+
+/// Read `len` bytes at `addr` from a streaming source.
+fn read_object_at_source<S: FileSource + ?Sized>(
+    source: &S,
+    addr: u64,
+    len: usize,
+) -> Result<Vec<u8>, FormatError> {
+    source.read_exact_at(addr, len)
+}
+
+/// Find the (address, length) of a huge object in the heap's huge-objects v2
+/// B-tree records. Each record (type 1, indirectly accessed, non-filtered) is
+/// `address(offset_size) + length(length_size) + id(length_size)`, sorted by id.
+fn find_huge_record(
+    records: &[BTreeV2Record],
+    huge_id: u64,
+    offset_size: u8,
+    length_size: u8,
+) -> Result<(u64, u64), FormatError> {
+    let os = offset_size as usize;
+    let ls = length_size as usize;
+    for record in records {
+        let data = &record.data;
+        if data.len() < os + 2 * ls {
+            continue;
+        }
+        let id = read_offset(data, os + ls, length_size)?;
+        if id == huge_id {
+            let addr = read_offset(data, 0, offset_size)?;
+            let len = read_offset(data, os, length_size)?;
+            return Ok((addr, len));
+        }
+    }
+    Err(FormatError::HugeObjectNotFound(huge_id))
+}
+
+/// Decode a "tiny" object whose bytes are stored directly inside the heap ID.
+/// HDF5 uses a short form (length in the low nibble of byte 0) and, when the ID
+/// is wide enough that the data would not otherwise fit, an extended form
+/// (12-bit length across bytes 0-1). Per `H5HFtiny.c` the short form is kept
+/// while `heap_id_length - 1 <= 16` (i.e. `heap_id_length <= 17`); the extended
+/// form begins at `heap_id_length == 18`. The format version (bits 6-7) must be 0.
+fn read_tiny_object(heap_id_length: u16, id_bytes: &[u8]) -> Result<Vec<u8>, FormatError> {
+    const TINY_LEN_SHORT: u16 = 16;
+    let extended = heap_id_length.saturating_sub(1) > TINY_LEN_SHORT;
+    let (len, data_start) = if extended {
+        if id_bytes.len() < 2 {
+            return Err(FormatError::UnexpectedEof {
+                expected: 2,
+                available: id_bytes.len(),
+            });
+        }
+        let len = ((((id_bytes[0] & 0x0F) as usize) << 8) | id_bytes[1] as usize) + 1;
+        (len, 2)
+    } else {
+        let len = (id_bytes[0] & 0x0F) as usize + 1;
+        (len, 1)
+    };
+    let end = data_start + len;
+    if end > id_bytes.len() {
+        return Err(FormatError::UnexpectedEof {
+            expected: end,
+            available: id_bytes.len(),
+        });
+    }
+    Ok(id_bytes[data_start..end].to_vec())
+}
+
 impl FractalHeapHeader {
     /// Parse a fractal heap header at the given offset.
     pub fn parse(
@@ -156,11 +269,21 @@ impl FractalHeapHeader {
         ]);
         pos += 4;
 
-        // Skip several fixed fields: next_huge_object_id(ls), btree_huge_objects_address(os),
-        // free_space_managed_blocks(ls), managed_block_free_space_manager_address(os),
-        // managed_space_in_heap(ls), allocated_managed_space_in_heap(ls),
+        // next_huge_object_id (length_size) — skip
+        ensure_len(file_data, pos, ls)?;
+        pos += ls;
+
+        // btree_huge_objects_address (offset_size) — root of the v2 B-tree that
+        // indexes "huge" objects (used when a stored object exceeds
+        // max_managed_object_size, e.g. links/attributes with very long names).
+        let btree_huge_objects_address = read_offset(file_data, pos, offset_size)?;
+        pos += os;
+
+        // Skip the remaining fixed fields: free_space_managed_blocks(ls),
+        // managed_block_free_space_manager_address(os), managed_space_in_heap(ls),
+        // allocated_managed_space_in_heap(ls),
         // direct_block_allocation_iterator_offset(ls)
-        let skip_size = 5 * ls + 2 * os;
+        let skip_size = 4 * ls + os;
         ensure_len(file_data, pos, skip_size)?;
         pos += skip_size;
 
@@ -238,6 +361,7 @@ impl FractalHeapHeader {
             heap_id_length,
             io_filter_encoded_length,
             max_managed_object_size,
+            btree_huge_objects_address,
             table_width,
             starting_block_size,
             max_direct_block_size,
@@ -252,7 +376,7 @@ impl FractalHeapHeader {
     /// Decode a managed heap ID into (offset_in_heap, object_length).
     ///
     /// The heap ID layout for managed objects (type 0):
-    /// - Byte 0: bits 6-7 = type (0), bits 4-5 = version (0), bits 0-3 = reserved
+    /// - Byte 0: bits 6-7 = version (0), bits 4-5 = type (0), bits 0-3 = reserved
     /// - Bytes 1+: offset (max_heap_size bits, LE) then length (remaining bits, LE)
     pub fn decode_managed_id(&self, id_bytes: &[u8]) -> Result<(u64, u64), FormatError> {
         if id_bytes.is_empty() {
@@ -262,7 +386,8 @@ impl FractalHeapHeader {
             });
         }
 
-        let id_type = (id_bytes[0] >> 6) & 0x03;
+        // Object type lives in bits 4-5 of byte 0 (bits 6-7 are the version).
+        let id_type = (id_bytes[0] >> 4) & 0x03;
         if id_type != 0 {
             return Err(FormatError::InvalidHeapIdType(id_type));
         }
@@ -342,6 +467,88 @@ impl FractalHeapHeader {
                 64, // max recursion depth
             )
         }
+    }
+
+    /// Classify a heap ID by its type bits (bits 4-5 of byte 0). Bits 6-7 carry
+    /// the format version, which must be 0.
+    fn heap_id_type(id_bytes: &[u8]) -> Result<HeapIdType, FormatError> {
+        let byte0 = *id_bytes.first().ok_or(FormatError::UnexpectedEof {
+            expected: 1,
+            available: 0,
+        })?;
+        match (byte0 >> 4) & 0x03 {
+            0 => Ok(HeapIdType::Managed),
+            1 => Ok(HeapIdType::Huge),
+            2 => Ok(HeapIdType::Tiny),
+            other => Err(FormatError::InvalidHeapIdType(other)),
+        }
+    }
+
+    /// Whether this heap stores "huge" object addresses and lengths inline in the
+    /// heap ID (`huge_ids_direct` in HDF5) rather than behind the huge-objects
+    /// v2 B-tree. The writer makes this choice from the heap ID length and the
+    /// address/length widths; a reader must recompute it the same way
+    /// (H5HFhuge.c, `H5HF__huge_init`).
+    fn huge_ids_direct(&self, offset_size: u8, length_size: u8) -> bool {
+        let avail = (self.heap_id_length as usize).saturating_sub(1);
+        if self.io_filter_encoded_length > 0 {
+            avail >= offset_size as usize + length_size as usize + 4 + length_size as usize
+        } else {
+            avail >= offset_size as usize + length_size as usize
+        }
+    }
+
+    /// Read an object from the heap given its raw heap ID bytes, dispatching on
+    /// the heap-ID type. Managed objects live in the doubling-table blocks; huge
+    /// objects are stored directly in the file (resolved here through the
+    /// huge-objects v2 B-tree); tiny objects are encoded in the ID itself.
+    pub fn read_object(
+        &self,
+        file_data: &[u8],
+        id_bytes: &[u8],
+        offset_size: u8,
+        length_size: u8,
+    ) -> Result<Vec<u8>, FormatError> {
+        match Self::heap_id_type(id_bytes)? {
+            HeapIdType::Managed => self.read_managed_object(file_data, id_bytes, offset_size),
+            HeapIdType::Huge => {
+                self.read_huge_object(file_data, id_bytes, offset_size, length_size)
+            }
+            HeapIdType::Tiny => read_tiny_object(self.heap_id_length, id_bytes),
+        }
+    }
+
+    /// Resolve and read a "huge" object given its heap ID.
+    fn read_huge_object(
+        &self,
+        file_data: &[u8],
+        id_bytes: &[u8],
+        offset_size: u8,
+        length_size: u8,
+    ) -> Result<Vec<u8>, FormatError> {
+        if self.io_filter_encoded_length > 0 {
+            return Err(FormatError::UnsupportedFilteredHeapObject);
+        }
+        let payload = &id_bytes[1..];
+
+        if self.huge_ids_direct(offset_size, length_size) {
+            // The address and length are stored inline in the heap ID.
+            let addr = read_offset(payload, 0, offset_size)?;
+            let len = read_offset(payload, offset_size as usize, length_size)?;
+            return slice_object(file_data, addr, len.to_usize()?);
+        }
+
+        // Indirect: the heap ID holds a B-tree key (the huge object ID); the
+        // huge-objects v2 B-tree maps it to (address, length).
+        let huge_id = read_var_le(payload);
+        if is_undefined(self.btree_huge_objects_address, offset_size) {
+            return Err(FormatError::HugeObjectNotFound(huge_id));
+        }
+        let btree_addr = self.btree_huge_objects_address.to_usize()?;
+        let header = BTreeV2Header::parse(file_data, btree_addr, offset_size, length_size)?;
+        let records = collect_btree_v2_records(file_data, &header, offset_size, length_size)?;
+        let (addr, len) = find_huge_record(&records, huge_id, offset_size, length_size)?;
+        slice_object(file_data, addr, len.to_usize()?)
     }
 
     /// Read an object from a direct block.
@@ -590,6 +797,60 @@ impl FractalHeapHeader {
                 64,
             )
         }
+    }
+
+    /// Streaming counterpart to [`FractalHeapHeader::read_object`].
+    pub fn read_object_from_source<S: FileSource + ?Sized>(
+        &self,
+        source: &S,
+        id_bytes: &[u8],
+        offset_size: u8,
+        length_size: u8,
+    ) -> Result<Vec<u8>, FormatError> {
+        match Self::heap_id_type(id_bytes)? {
+            HeapIdType::Managed => {
+                self.read_managed_object_from_source(source, id_bytes, offset_size)
+            }
+            HeapIdType::Huge => {
+                self.read_huge_object_from_source(source, id_bytes, offset_size, length_size)
+            }
+            HeapIdType::Tiny => read_tiny_object(self.heap_id_length, id_bytes),
+        }
+    }
+
+    /// Resolve and read a "huge" object via a [`FileSource`].
+    fn read_huge_object_from_source<S: FileSource + ?Sized>(
+        &self,
+        source: &S,
+        id_bytes: &[u8],
+        offset_size: u8,
+        length_size: u8,
+    ) -> Result<Vec<u8>, FormatError> {
+        if self.io_filter_encoded_length > 0 {
+            return Err(FormatError::UnsupportedFilteredHeapObject);
+        }
+        let payload = &id_bytes[1..];
+
+        if self.huge_ids_direct(offset_size, length_size) {
+            let addr = read_offset(payload, 0, offset_size)?;
+            let len = read_offset(payload, offset_size as usize, length_size)?;
+            return read_object_at_source(source, addr, len.to_usize()?);
+        }
+
+        let huge_id = read_var_le(payload);
+        if is_undefined(self.btree_huge_objects_address, offset_size) {
+            return Err(FormatError::HugeObjectNotFound(huge_id));
+        }
+        let header = BTreeV2Header::parse_from_source(
+            source,
+            self.btree_huge_objects_address,
+            offset_size,
+            length_size,
+        )?;
+        let records =
+            collect_btree_v2_records_from_source(source, &header, offset_size, length_size)?;
+        let (addr, len) = find_huge_record(&records, huge_id, offset_size, length_size)?;
+        read_object_at_source(source, addr, len.to_usize()?)
     }
 
     fn read_from_direct_block_from_source<S: FileSource + ?Sized>(
@@ -963,10 +1224,96 @@ mod tests {
     fn invalid_heap_id_type() {
         let (file_data, _) = build_simple_heap(8, 8);
         let hdr = FractalHeapHeader::parse(&file_data, 0, 8, 8).unwrap();
-        // Type = 1 (tiny) in bits 6-7
-        let id = vec![0x40u8, 0, 0, 0, 0, 0, 0]; // bit 6 set = type 1
+        // Type lives in bits 4-5; type 1 (huge) = 0x10. decode_managed_id only
+        // accepts managed (type 0) IDs.
+        let id = vec![0x10u8, 0, 0, 0, 0, 0, 0];
         let err = hdr.decode_managed_id(&id).unwrap_err();
         assert_eq!(err, FormatError::InvalidHeapIdType(1));
+    }
+
+    #[test]
+    fn heap_id_type_reads_bits_4_5() {
+        // Type is bits 4-5; the version (bits 6-7) must not be read as type.
+        assert_eq!(
+            FractalHeapHeader::heap_id_type(&[0x00]).unwrap(),
+            HeapIdType::Managed
+        );
+        assert_eq!(
+            FractalHeapHeader::heap_id_type(&[0x10]).unwrap(),
+            HeapIdType::Huge
+        );
+        assert_eq!(
+            FractalHeapHeader::heap_id_type(&[0x20]).unwrap(),
+            HeapIdType::Tiny
+        );
+        // Reserved type 3.
+        assert_eq!(
+            FractalHeapHeader::heap_id_type(&[0x30]),
+            Err(FormatError::InvalidHeapIdType(3))
+        );
+        // Version bits set (0xC0) must not change the decoded type.
+        assert_eq!(
+            FractalHeapHeader::heap_id_type(&[0xC0 | 0x10]).unwrap(),
+            HeapIdType::Huge
+        );
+    }
+
+    #[test]
+    fn huge_ids_direct_matches_hdf5_rule() {
+        // Unfiltered: direct when (id_len - 1) >= offset_size + length_size.
+        let mut h = dtable_header(512, 65536, 4);
+        h.heap_id_length = 7; // 6 payload bytes < 8 + 8 -> indirect (B-tree)
+        assert!(!h.huge_ids_direct(8, 8));
+        h.heap_id_length = 17; // 16 payload bytes == 8 + 8 -> direct
+        assert!(h.huge_ids_direct(8, 8));
+        // Filtered heaps need extra room (addr + len + filter_mask(4) + filtered
+        // len); 17 is no longer enough.
+        h.io_filter_encoded_length = 4;
+        assert!(!h.huge_ids_direct(8, 8));
+    }
+
+    #[test]
+    fn find_huge_record_matches_by_id() {
+        // Type-1 record: address(8) + length(8) + id(8), little-endian.
+        let rec = |addr: u64, len: u64, id: u64| {
+            let mut d = Vec::new();
+            d.extend_from_slice(&addr.to_le_bytes());
+            d.extend_from_slice(&len.to_le_bytes());
+            d.extend_from_slice(&id.to_le_bytes());
+            BTreeV2Record { data: d }
+        };
+        let records = vec![
+            rec(0x1000, 5000, 1),
+            rec(0x2000, 6000, 2),
+            rec(0x3000, 7000, 5),
+        ];
+        assert_eq!(find_huge_record(&records, 2, 8, 8).unwrap(), (0x2000, 6000));
+        assert_eq!(find_huge_record(&records, 5, 8, 8).unwrap(), (0x3000, 7000));
+        assert_eq!(
+            find_huge_record(&records, 9, 8, 8),
+            Err(FormatError::HugeObjectNotFound(9))
+        );
+    }
+
+    #[test]
+    fn read_tiny_object_short_and_extended() {
+        // Short form (heap ID <= 16 bytes): low nibble of byte 0 is length - 1.
+        let id = [0x20 | 0x03, b'a', b'b', b'c', b'd', 0, 0];
+        assert_eq!(read_tiny_object(7, &id).unwrap(), b"abcd");
+        // Extended form (heap ID >= 18 bytes): 12-bit length across bytes 0-1.
+        // length 5 -> stored value 4 = 0x004: byte0 low nibble 0x0, byte1 0x04.
+        let mut id = vec![0x20, 0x04];
+        id.extend_from_slice(b"hello");
+        id.resize(20, 0);
+        assert_eq!(read_tiny_object(20, &id).unwrap(), b"hello");
+
+        // Boundary: heap_id_length == 17 still uses the short form (HDF5 keeps
+        // short while heap_id_length - 1 <= 16). Decoding it as extended would
+        // misread the length, so this pins the off-by-one.
+        let mut id = vec![0x20 | 0x04]; // short form, length 5
+        id.extend_from_slice(b"world");
+        id.resize(17, 0);
+        assert_eq!(read_tiny_object(17, &id).unwrap(), b"world");
     }
 
     #[test]
@@ -992,6 +1339,7 @@ mod tests {
             heap_id_length: 7,
             io_filter_encoded_length: 0,
             max_managed_object_size: 0,
+            btree_huge_objects_address: u64::MAX,
             table_width,
             starting_block_size: start_block_size,
             max_direct_block_size,

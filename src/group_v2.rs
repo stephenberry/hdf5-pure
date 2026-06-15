@@ -101,8 +101,8 @@ fn resolve_dense_entries(
         }
         let id_bytes = &record.data[id_offset..id_offset + fh.heap_id_length as usize];
 
-        // Read managed object from fractal heap
-        let link_data = fh.read_managed_object(file_data, id_bytes, offset_size)?;
+        // Read the link message from the fractal heap (managed or huge object).
+        let link_data = fh.read_object(file_data, id_bytes, offset_size, length_size)?;
 
         // Parse as Link message
         let link = LinkMessage::parse(&link_data, offset_size)?;
@@ -348,7 +348,7 @@ fn resolve_dense_entries_from_source<S: FileSource + ?Sized>(
             continue;
         }
         let id_bytes = &record.data[id_offset..id_offset + fh.heap_id_length as usize];
-        let link_data = fh.read_managed_object_from_source(source, id_bytes, offset_size)?;
+        let link_data = fh.read_object_from_source(source, id_bytes, offset_size, length_size)?;
         let link = LinkMessage::parse(&link_data, offset_size)?;
         if let LinkTarget::Hard {
             object_header_address,

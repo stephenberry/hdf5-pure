@@ -141,6 +141,13 @@ pub enum FormatError {
     InvalidFractalHeapVersion(u8),
     /// Invalid heap ID type.
     InvalidHeapIdType(u8),
+    /// A fractal-heap "huge" object's heap ID referenced a B-tree key that is
+    /// not present in the heap's huge-objects v2 B-tree.
+    HugeObjectNotFound(u64),
+    /// A fractal-heap object uses an I/O filter pipeline (filtered huge or tiny
+    /// storage), which this reader does not support. Link and attribute heaps
+    /// are never filtered, so this does not arise for them.
+    UnsupportedFilteredHeapObject,
     /// Invalid attribute message version.
     InvalidAttributeVersion(u8),
     /// Invalid Attribute Info message version.
@@ -427,6 +434,12 @@ impl fmt::Display for FormatError {
             }
             FormatError::InvalidHeapIdType(t) => {
                 write!(f, "invalid heap ID type: {t}")
+            }
+            FormatError::HugeObjectNotFound(id) => {
+                write!(f, "fractal-heap huge object {id} not found in B-tree")
+            }
+            FormatError::UnsupportedFilteredHeapObject => {
+                write!(f, "filtered fractal-heap objects are not supported")
             }
             FormatError::InvalidAttributeVersion(v) => {
                 write!(f, "invalid attribute message version: {v}")
