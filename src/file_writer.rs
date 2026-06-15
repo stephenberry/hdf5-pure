@@ -18,6 +18,9 @@ use crate::attribute::AttributeMessage;
 use crate::chunked_write::{ChunkOptions, build_chunked_data_at_ext};
 use crate::dataspace::{Dataspace, DataspaceType};
 use crate::error::FormatError;
+use crate::file_space_info::{
+    DEFAULT_PAGE_SIZE, DEFAULT_THRESHOLD, FileSpaceInfo, FileSpaceStrategy,
+};
 use crate::libver::LibVer;
 use crate::link_message::{LinkMessage, LinkTarget};
 use crate::message_type::MessageType;
@@ -382,6 +385,11 @@ pub struct FileWriter {
     /// Requested library-version bounds (low, high), validated in `finish`.
     /// `None` means no constraint (any output the writer produces is accepted).
     libver_bounds: Option<(LibVer, LibVer)>,
+    /// File-space strategy `(strategy, persist, threshold)` from
+    /// `with_file_space_strategy`. `None` leaves the file-space defaults.
+    file_space_strategy: Option<(FileSpaceStrategy, bool, u64)>,
+    /// File-space page size from `with_file_space_page_size`.
+    file_space_page_size: Option<u64>,
 }
 
 impl Default for FileWriter {
@@ -398,6 +406,8 @@ impl FileWriter {
             groups: Vec::new(),
             userblock_size: 0,
             libver_bounds: None,
+            file_space_strategy: None,
+            file_space_page_size: None,
         }
     }
 
@@ -443,6 +453,70 @@ impl FileWriter {
         self
     }
 
+    /// Set the file-space management strategy, mirroring
+    /// `H5Pset_file_space_strategy`. The choice is recorded in the file's
+    /// superblock extension so other tools (and a later reopen) see it.
+    ///
+    /// `persist` requests that freed space be tracked on disk across closes;
+    /// that requires writing free-space manager blocks and is not yet
+    /// implemented, so `persist = true` makes [`finish`](Self::finish) fail with
+    /// [`FormatError::FileSpacePersistUnsupported`]. `threshold` is the smallest
+    /// free-space section size the managers track.
+    pub fn with_file_space_strategy(
+        &mut self,
+        strategy: FileSpaceStrategy,
+        persist: bool,
+        threshold: u64,
+    ) -> &mut Self {
+        self.file_space_strategy = Some((strategy, persist, threshold));
+        self
+    }
+
+    /// Set the file-space page size, mirroring `H5Pset_file_space_page_size`.
+    /// Recorded in the superblock extension; meaningful for the paged strategy.
+    pub fn with_file_space_page_size(&mut self, page_size: u64) -> &mut Self {
+        self.file_space_page_size = Some(page_size);
+        self
+    }
+
+    /// Reject file-space settings this writer cannot reproduce yet.
+    fn check_file_space(&self) -> Result<(), FormatError> {
+        if let Some((_, true, _)) = self.file_space_strategy {
+            return Err(FormatError::FileSpacePersistUnsupported);
+        }
+        Ok(())
+    }
+
+    /// The File Space Info message to write, if any file-space option was set.
+    /// The writer emits the non-persistent form (no free-space manager blocks).
+    fn file_space_info(&self) -> Option<FileSpaceInfo> {
+        if self.file_space_strategy.is_none() && self.file_space_page_size.is_none() {
+            return None;
+        }
+        let (strategy, _persist, threshold) = self.file_space_strategy.unwrap_or((
+            FileSpaceStrategy::FsmAggr,
+            false,
+            DEFAULT_THRESHOLD,
+        ));
+        let page_size = self.file_space_page_size.unwrap_or(DEFAULT_PAGE_SIZE);
+        Some(FileSpaceInfo::non_persistent(
+            strategy, threshold, page_size,
+        ))
+    }
+
+    /// The superblock-extension object header bytes carrying the File Space Info
+    /// message, if file-space was configured.
+    fn file_space_extension_oh(&self) -> Option<Vec<u8>> {
+        self.file_space_info().map(|info| {
+            let mut oh = ObjectHeaderWriter::new();
+            // Message flags 0x14 match what the reference C library writes for
+            // this message (do-not-share + mark-if-unknown); no must-understand
+            // bit, so older readers still open the file.
+            oh.add_message_with_flags(MessageType::FileSpaceInfo, info.serialize(), 0x14);
+            oh.serialize()
+        })
+    }
+
     pub fn create_group(&mut self, name: &str) -> GroupBuilder {
         GroupBuilder::new(name)
     }
@@ -462,6 +536,11 @@ impl FileWriter {
 
     pub fn finish(self) -> Result<Vec<u8>, FormatError> {
         self.check_libver_bounds()?;
+        self.check_file_space()?;
+        // The superblock-extension header (carrying a File Space Info message)
+        // is independent of the file layout, so build it up front and place it
+        // after all other content below.
+        let ext_oh = self.file_space_extension_oh();
         struct DsFlat {
             name: String,
             dt: Datatype,
@@ -965,8 +1044,14 @@ impl FileWriter {
         let actual_ds_oh_sizes2: Vec<usize> = ds_blobs2.iter().map(|b| b.oh_bytes.len()).collect();
         debug_assert_eq!(actual_ds_oh_sizes, actual_ds_oh_sizes2);
 
-        // eof_address is absolute file size (includes userblock + GCOLs)
-        let eof_addr2 = (ub + cursor2 + gcol_total_size) as u64;
+        // The superblock extension, if any, is appended after the GCOLs. Its
+        // address is base-relative (like every other stored address); the reader
+        // adds the base address. eof grows by the extension's size.
+        let ext_addr = ext_oh.as_ref().map(|_| (cursor2 + gcol_total_size) as u64);
+        let ext_len = ext_oh.as_ref().map_or(0, |b| b.len());
+
+        // eof_address is absolute file size (includes userblock + GCOLs + ext)
+        let eof_addr2 = (ub + cursor2 + gcol_total_size + ext_len) as u64;
         let mut buf = Vec::with_capacity(eof_addr2 as usize);
 
         // Userblock: prepend zeros
@@ -987,7 +1072,7 @@ impl FileWriter {
             free_space_address: None,
             driver_info_address: None,
             consistency_flags: 0,
-            superblock_extension_address: Some(u64::MAX),
+            superblock_extension_address: Some(ext_addr.unwrap_or(u64::MAX)),
             checksum: None,
         };
         buf.extend_from_slice(&sb.serialize());
@@ -1058,6 +1143,16 @@ impl FileWriter {
             for patch in patches {
                 buf.extend_from_slice(&patch.collection_bytes);
             }
+        }
+
+        // Superblock extension (File Space Info), at the address recorded above.
+        if let Some(bytes) = &ext_oh {
+            debug_assert_eq!(
+                buf.len(),
+                ub + ext_addr.unwrap() as usize,
+                "extension header must land at its recorded base-relative address"
+            );
+            buf.extend_from_slice(bytes);
         }
 
         Ok(buf)

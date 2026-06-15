@@ -7,6 +7,7 @@ use crate::type_builders::{
 };
 
 use crate::error::Error;
+use crate::file_space_info::FileSpaceStrategy;
 use crate::libver::LibVer;
 
 /// Builder for creating a new HDF5 file.
@@ -71,6 +72,34 @@ impl FileBuilder {
     /// bound older than it, or a lower bound newer than it) is rejected.
     pub fn with_libver_bounds(&mut self, low: LibVer, high: LibVer) -> &mut Self {
         self.writer.with_libver_bounds(low, high);
+        self
+    }
+
+    /// Set the file-space management strategy, mirroring HDF5's
+    /// `H5Pset_file_space_strategy`. The strategy, persist flag, and free-space
+    /// section `threshold` are recorded in the file's superblock extension, so
+    /// the reference C library and a later reopen observe the choice.
+    ///
+    /// Persisting free space on disk (`persist = true`) requires writing
+    /// free-space manager blocks and is not yet supported, so it makes
+    /// [`finish`](Self::finish) / [`write`](Self::write) fail with
+    /// [`Error::Format`] wrapping
+    /// [`FormatError::FileSpacePersistUnsupported`](crate::FormatError::FileSpacePersistUnsupported).
+    pub fn with_file_space_strategy(
+        &mut self,
+        strategy: FileSpaceStrategy,
+        persist: bool,
+        threshold: u64,
+    ) -> &mut Self {
+        self.writer
+            .with_file_space_strategy(strategy, persist, threshold);
+        self
+    }
+
+    /// Set the file-space page size, mirroring HDF5's
+    /// `H5Pset_file_space_page_size`. Recorded in the superblock extension.
+    pub fn with_file_space_page_size(&mut self, page_size: u64) -> &mut Self {
+        self.writer.with_file_space_page_size(page_size);
         self
     }
 
