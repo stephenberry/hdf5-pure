@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-06-15
+
 Free-space management, the two halves of [#21](https://github.com/stephenberry/hdf5-pure/issues/21) ([#45](https://github.com/stephenberry/hdf5-pure/pull/45)). Additive: existing code is unaffected.
 
 ### Added
@@ -133,7 +135,8 @@ Internal robustness and test-coverage work from [#26](https://github.com/stephen
 - The MAT serde deserializer now flattens 1×N and N×1 `Matrix` / `ComplexMatrix` values to a 1-D sequence inside `deserialize_any`, matching the existing behavior of `deserialize_seq`. This means untagged enums, `serde::de::Content` roundtrips, and custom `Visitor` impls that previously discriminated on the 2-D rows-of-rows shape when one axis was 1 will now see a flat sequence. Values with both axes greater than 1 still surface as a 2-D rows-of-rows.
 - Numeric / complex dataset readers no longer collapse a 1×N or N×1 dataset to a flat vector at the value layer. Shape is preserved through `MatValue::Matrix` / `ComplexMatrix`, and any flattening for `Vec<T>` callers happens at the serde-deserializer level (above). Direct consumers of `pub(crate)` value APIs are unaffected; this is an internal cleanup that fixes column-vector roundtrip ambiguity.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.12.1...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.12.1...v0.13.0
 [0.12.1]: https://github.com/stephenberry/hdf5-pure/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.10.0...v0.11.0
