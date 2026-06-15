@@ -905,13 +905,18 @@ impl EditSession {
     ) -> Result<Vec<u8>, Error> {
         let region = self.gather_oh_messages(ext_addr)?;
         let new_body = info.serialize();
+        // The message body is the fixed-size File Space Info record (≤ 125 bytes),
+        // so it always fits the u16 size field; `try_from` keeps this off the
+        // 32-bit narrowing-cast ledger.
+        let new_len = u16::try_from(new_body.len())
+            .map_err(|_| Error::EditUnsupported("File Space Info message too large"))?;
         let mut out = Vec::with_capacity(region.len());
         let mut p = 0;
         let mut replaced = false;
         while let Some((msg_type, _body, body_end)) = next_message(&region, p)? {
             if msg_type == MessageType::FileSpaceInfo {
                 out.push(region[p]); // message type byte
-                out.extend_from_slice(&(new_body.len() as u16).to_le_bytes());
+                out.extend_from_slice(&new_len.to_le_bytes());
                 out.push(region[p + 3]); // preserve the message flags (0x14)
                 out.extend_from_slice(&new_body);
                 replaced = true;
@@ -921,12 +926,12 @@ impl EditSession {
             p = body_end;
         }
         if !replaced {
-            // No File Space Info present (unexpected when persistence is armed):
-            // add one with the flags the C library uses for it.
-            out.push(MessageType::FileSpaceInfo.to_u16() as u8);
-            out.extend_from_slice(&(new_body.len() as u16).to_le_bytes());
-            out.push(0x14);
-            out.extend_from_slice(&new_body);
+            // Persistence is armed only when the extension already carries a File
+            // Space Info message, so this is unreachable; refuse rather than
+            // silently restructure an extension we did not understand.
+            return Err(Error::EditUnsupported(
+                "a persisting file's superblock extension has no File Space Info message",
+            ));
         }
         Ok(out)
     }

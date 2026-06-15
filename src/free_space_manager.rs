@@ -153,9 +153,9 @@ const FILE_FSM_MAX_SECTION_SIZE: u64 = (1u64 << 63) - 1;
 
 /// Append `value` as a little-endian unsigned integer of `width` bytes.
 fn push_uint_le(buf: &mut Vec<u8>, value: u64, width: usize) {
-    for i in 0..width {
-        buf.push((value >> (8 * i)) as u8);
-    }
+    // `width` is always 1..=8 (offset/size/count widths); take the low bytes of
+    // the little-endian encoding without a narrowing cast.
+    buf.extend_from_slice(&value.to_le_bytes()[..width]);
 }
 
 /// Serialize a single file free-space manager (the `FSHD` header and its `FSSE`
