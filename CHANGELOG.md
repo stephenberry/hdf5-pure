@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-06-15
+
+Completes free-space management ([#21](https://github.com/stephenberry/hdf5-pure/issues/21)) and closes several reader/writer interoperability gaps with the reference HDF5 C library. Additive: the new public surface (the file-space-strategy and persisted-free-space APIs) makes this a minor bump; cargo-semver-checks confirms no breaking change.
+
 ### Added
 
 - File-space management strategy via the file-creation property list, mirroring `H5Pset_file_space_strategy` and `H5Pset_file_space_page_size` (the [#21](https://github.com/stephenberry/hdf5-pure/issues/21) follow-on, [#55](https://github.com/stephenberry/hdf5-pure/pull/55)). `FileBuilder::with_file_space_strategy(strategy, persist, threshold)` and `with_file_space_page_size(size)` record the chosen `FileSpaceStrategy` (`FsmAggr`, `Page`, `Aggr`, `None`) in a superblock-extension File Space Info message (header message type `0x0017`), so the reference HDF5 C library — and a later reopen — observe the choice; the file space info is omitted entirely for the default (matching the C library). `File::file_space_strategy()` and `File::file_space_info()` read it back, including a file written elsewhere with persisted free space (the free-space-manager addresses are parsed, though not yet followed to their on-disk blocks). The strategy is preserved through `repack` (carried into the compact output) and through in-place `EditSession` edits. Validated bidirectionally against the C library: a strategy this crate writes is read back by the C library and vice versa, byte-for-byte.
@@ -147,7 +151,8 @@ Internal robustness and test-coverage work from [#26](https://github.com/stephen
 - The MAT serde deserializer now flattens 1×N and N×1 `Matrix` / `ComplexMatrix` values to a 1-D sequence inside `deserialize_any`, matching the existing behavior of `deserialize_seq`. This means untagged enums, `serde::de::Content` roundtrips, and custom `Visitor` impls that previously discriminated on the 2-D rows-of-rows shape when one axis was 1 will now see a flat sequence. Values with both axes greater than 1 still surface as a 2-D rows-of-rows.
 - Numeric / complex dataset readers no longer collapse a 1×N or N×1 dataset to a flat vector at the value layer. Shape is preserved through `MatValue::Matrix` / `ComplexMatrix`, and any flattening for `Vec<T>` callers happens at the serde-deserializer level (above). Direct consumers of `pub(crate)` value APIs are unaffected; this is an internal cleanup that fixes column-vector roundtrip ambiguity.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.12.1...v0.13.0
 [0.12.1]: https://github.com/stephenberry/hdf5-pure/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.11.0...v0.12.0
