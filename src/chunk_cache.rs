@@ -206,7 +206,9 @@ pub const DEFAULT_MAX_SLOTS: usize = 16;
 
 /// Configuration for a per-dataset chunk cache.
 ///
-/// The byte and slot limits apply to decompressed raw chunk data. The optional
+/// The byte and slot limits are the `hdf5-pure` counterpart of the
+/// `rdcc_nbytes` and `rdcc_nslots` raw-data chunk-cache settings from HDF5's
+/// `H5Pset_cache`. They apply to decompressed raw chunk data. The optional
 /// chunk-index cache controls whether `hdf5-pure` retains the parsed chunk
 /// address index between reads of the same [`crate::Dataset`]. Disabling the
 /// index cache lowers retained metadata memory at the cost of re-scanning the
@@ -225,6 +227,22 @@ impl ChunkCacheConfig {
         Self {
             max_bytes: DEFAULT_CACHE_BYTES,
             max_slots: DEFAULT_MAX_SLOTS,
+            cache_index: true,
+        }
+    }
+
+    /// Create a config from HDF5 `H5Pset_cache` raw data chunk-cache values.
+    ///
+    /// `rdcc_nslots` maps to the maximum retained chunk slots and
+    /// `rdcc_nbytes` maps to the maximum retained decompressed chunk bytes.
+    /// Modern HDF5 ignores `H5Pset_cache`'s `mdc_nelmts`; use
+    /// [`crate::MetadataCacheConfig`] for the metadata-cache budget. The
+    /// `rdcc_w0` preemption policy has no direct equivalent because this
+    /// read-only cache uses strict LRU eviction.
+    pub const fn from_h5p_cache(rdcc_nslots: usize, rdcc_nbytes: usize) -> Self {
+        Self {
+            max_bytes: rdcc_nbytes,
+            max_slots: rdcc_nslots,
             cache_index: true,
         }
     }
@@ -445,8 +463,16 @@ impl ChunkCache {
     /// The data is stored in a [`CacheAlignedBuffer`] so subsequent reads
     /// return cache-line-aligned memory.
     pub fn put_decompressed(&self, coord: ChunkCoord, data: Vec<u8>) {
+        if !self.accepts_decompressed_len(data.len()) {
+            return;
+        }
         let aligned = CacheAlignedBuffer::from_slice(&data);
         self.put_decompressed_aligned(coord, aligned);
+    }
+
+    fn accepts_decompressed_len(&self, data_len: usize) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.max_bytes != 0 && inner.max_slots != 0 && data_len <= inner.max_bytes
     }
 
     /// Insert an already-aligned buffer into the LRU cache.
@@ -627,6 +653,14 @@ mod tests {
         cache.put_decompressed(vec![0], vec![1, 2, 3]);
         assert_eq!(cache.cached_chunk_count(), 0);
         assert_eq!(cache.cached_bytes(), 0);
+    }
+
+    #[test]
+    fn h5p_cache_constructor_maps_raw_data_chunk_settings() {
+        let config = ChunkCacheConfig::from_h5p_cache(521, 2 * 1024 * 1024);
+        assert_eq!(config.max_slots(), 521);
+        assert_eq!(config.max_bytes(), 2 * 1024 * 1024);
+        assert!(config.index_cache_enabled());
     }
 
     #[test]

@@ -230,6 +230,14 @@ impl<S: FileSource + ?Sized> FileSource for &S {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
         (**self).read_at(offset, buf)
     }
+
+    fn read_exact_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
+        (**self).read_exact_at(offset, len)
+    }
+
+    fn read_metadata_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
+        (**self).read_metadata_at(offset, len)
+    }
 }
 
 #[cfg(feature = "std")]
@@ -239,6 +247,14 @@ impl<S: FileSource + ?Sized> FileSource for std::boxed::Box<S> {
     }
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
         (**self).read_at(offset, buf)
+    }
+
+    fn read_exact_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
+        (**self).read_exact_at(offset, len)
+    }
+
+    fn read_metadata_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
+        (**self).read_metadata_at(offset, len)
     }
 }
 
@@ -590,6 +606,42 @@ mod tests {
         let mut buf = [0u8; 2];
         r.read_at(1, &mut buf).unwrap();
         assert_eq!(buf, [8, 7]);
+    }
+
+    #[test]
+    fn forwarding_through_reference_preserves_metadata_reads() {
+        use core::cell::Cell;
+
+        struct MetadataSource {
+            metadata_reads: Cell<usize>,
+        }
+
+        impl FileSource for MetadataSource {
+            fn len(&self) -> u64 {
+                16
+            }
+
+            fn read_at(&self, _offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
+                buf.fill(0);
+                Ok(())
+            }
+
+            fn read_metadata_at(&self, _offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
+                self.metadata_reads.set(self.metadata_reads.get() + 1);
+                Ok(vec![0xAB; len])
+            }
+        }
+
+        fn read_metadata_via_trait<T: FileSource>(source: T) -> Vec<u8> {
+            source.read_metadata_at(4, 3).unwrap()
+        }
+
+        let source = MetadataSource {
+            metadata_reads: Cell::new(0),
+        };
+
+        assert_eq!(read_metadata_via_trait(&source), vec![0xAB; 3]);
+        assert_eq!(source.metadata_reads.get(), 1);
     }
 
     #[cfg(feature = "std")]
