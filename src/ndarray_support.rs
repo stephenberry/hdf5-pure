@@ -39,59 +39,10 @@
 use ndarray::{Array, ArrayBase, ArrayD, Data, Dimension, IxDyn};
 
 use crate::convert::TryToUsize;
+use crate::element::H5Element;
 use crate::error::Error;
 use crate::reader::Dataset;
 use crate::type_builders::DatasetBuilder;
-
-mod sealed {
-    pub trait Sealed {}
-}
-
-/// A Rust scalar type that can be stored as an HDF5 dataset element.
-///
-/// This trait is sealed: it is implemented for the fixed set of scalar types
-/// the crate's reader and writer support (`f32`, `f64`, the signed integers
-/// `i8`/`i16`/`i32`/`i64`, and the unsigned integers `u8`/`u16`/`u32`/`u64`)
-/// and cannot be implemented for other types. It is the element bound for the
-/// [`ndarray`] read/write helpers and dispatches to the existing per-type
-/// reader/writer methods, so an `ndarray` read or write has exactly the same
-/// datatype, endianness, and conversion behavior as the corresponding
-/// [`Dataset::read_f64`](crate::Dataset::read_f64) /
-/// [`DatasetBuilder::with_f64_data`] family.
-pub trait H5Element: sealed::Sealed + Copy {
-    /// Read every element of `ds` as `Self`, in row-major order.
-    #[doc(hidden)]
-    fn read_from(ds: &Dataset<'_>) -> Result<Vec<Self>, Error>;
-
-    /// Set `builder`'s data and datatype from a flat row-major slice.
-    #[doc(hidden)]
-    fn write_into(builder: &mut DatasetBuilder, data: &[Self]);
-}
-
-macro_rules! impl_h5_element {
-    ($ty:ty, $read:ident, $write:ident) => {
-        impl sealed::Sealed for $ty {}
-        impl H5Element for $ty {
-            fn read_from(ds: &Dataset<'_>) -> Result<Vec<Self>, Error> {
-                ds.$read()
-            }
-            fn write_into(builder: &mut DatasetBuilder, data: &[Self]) {
-                builder.$write(data);
-            }
-        }
-    };
-}
-
-impl_h5_element!(f32, read_f32, with_f32_data);
-impl_h5_element!(f64, read_f64, with_f64_data);
-impl_h5_element!(i8, read_i8, with_i8_data);
-impl_h5_element!(i16, read_i16, with_i16_data);
-impl_h5_element!(i32, read_i32, with_i32_data);
-impl_h5_element!(i64, read_i64, with_i64_data);
-impl_h5_element!(u8, read_u8, with_u8_data);
-impl_h5_element!(u16, read_u16, with_u16_data);
-impl_h5_element!(u32, read_u32, with_u32_data);
-impl_h5_element!(u64, read_u64, with_u64_data);
 
 impl Dataset<'_> {
     /// Read the dataset into a statically-ranked [`ndarray::Array`].

@@ -55,6 +55,35 @@ let attrs = file.root().attrs().unwrap();
 println!("version: {:?}", attrs.get("version"));  // Some(I64(2))
 ```
 
+### Generic over the element type
+
+The typed `with_f64_data` / `read_f64` family has a generic counterpart so you
+can write code that works for any supported scalar: `with_data(&[T])` to write
+and `read::<T>()` to read, bounded by the sealed `H5Element` trait (implemented
+for `f32`/`f64` and the 8/16/32/64-bit signed and unsigned integers).
+
+```rust
+use hdf5_pure::{File, FileBuilder, H5Element, Error};
+
+fn store<T: H5Element>(fb: &mut FileBuilder, name: &str, values: &[T]) {
+    fb.create_dataset(name).with_data(values);
+}
+
+fn load<T: H5Element>(file: &File, name: &str) -> Result<Vec<T>, Error> {
+    file.dataset(name)?.read::<T>()
+}
+
+let mut fb = FileBuilder::new();
+store(&mut fb, "counts", &[1u32, 2, 3]);
+let file = File::from_bytes(fb.finish().unwrap()).unwrap();
+
+let counts: Vec<u32> = load(&file, "counts").unwrap();  // [1, 2, 3]
+```
+
+`read::<T>()` requests delivery as `T` (coercing like `read_f64`); it is not an
+assertion about the stored datatype, so pick `T` to match the stored type for a
+lossless read. For N-dimensional arrays see the `ndarray` feature below.
+
 ### Editing in place
 
 `EditSession` opens an existing file and adds, deletes, or copies objects, or edits compact group attributes without reading it all in and rewriting it. New data and the rebuilt object headers are appended at the end of the file and the superblock is repointed last, so the cost is proportional to what changes and a failed commit leaves the file valid.
@@ -247,6 +276,7 @@ Supported subset: one unlimited dimension, chunked, unfiltered (no compression o
 
 | Method | HDF5 type |
 |---|---|
+| `with_data` (generic, any scalar below) | Inferred from the element type |
 | `with_f64_data` | IEEE 64-bit float |
 | `with_f32_data` | IEEE 32-bit float |
 | `with_i8_data` / `with_i16_data` / `with_i32_data` / `with_i64_data` | Signed integers |
