@@ -134,6 +134,18 @@ let options = FileAccessOptions::new()
 let file = File::open_streaming_with_options("huge.h5", options).unwrap();
 ```
 
+To override the chunk cache for a single dataset (HDF5's per-dataset access property list, `H5Pset_chunk_cache`), open it with `dataset_with_options`. The override replaces the file-wide default for that one dataset; other datasets keep the default. `Dataset::chunk_cache_config()` reports the effective setting (`H5Pget_chunk_cache`).
+
+```rust
+use hdf5_pure::{ChunkCacheConfig, DatasetAccessOptions, File};
+
+let file = File::open("data.h5").unwrap();
+// This dataset is read once front-to-back: skip caching its decompressed chunks.
+let dapl = DatasetAccessOptions::new().with_chunk_cache(ChunkCacheConfig::disabled());
+let ds = file.dataset_with_options("scan", dapl).unwrap();
+let values = ds.read_f64().unwrap();
+```
+
 ### In-memory (WASM)
 
 ```rust
