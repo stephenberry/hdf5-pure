@@ -1,5 +1,4 @@
 ---
-title: hdf5-pure
 description: Pure-Rust HDF5 reader, writer, and in-place editor. No C dependencies, no build scripts, WASM-compatible.
 hide:
   - navigation
