@@ -1,14 +1,16 @@
-//! OS advisory file-locking behavior for the write/edit/read open paths
-//! (issue #73). These tests use only hdf5-pure (no reference C library), so they
-//! run on every target. Same-process opens contend because the std lock uses
-//! `flock` (Unix) / `LockFileEx` (Windows), which are per-open-file-description.
+//! OS advisory file-locking behavior for the in-place editor (issue #73). Uses
+//! only hdf5-pure (no reference C library), so it runs on every target.
+//!
+//! Only `EditSession` takes a lock (exclusive); `SwmrWriter` and the readers take
+//! none. Assertions here are written to hold on both Unix (advisory `flock`) and
+//! Windows (mandatory `LockFileEx`): in particular we never read a file while an
+//! editor still holds its lock, because that read is permitted on Unix but
+//! blocked by the OS on Windows.
 
-use hdf5_pure::{
-    EditSession, Error, File, FileAccessOptions, FileBuilder, FileLocking, SwmrWriter,
-};
+use hdf5_pure::{EditSession, Error, File, FileBuilder, FileLocking, SwmrWriter};
 use tempfile::tempdir;
 
-/// A plain, in-place-editable starter file (consistency_flags = 0).
+/// A plain, in-place-editable starter file.
 fn write_starter(path: &std::path::Path) {
     let mut b = FileBuilder::new();
     b.create_dataset("d").with_i32_data(&[1, 2, 3]);
@@ -27,66 +29,59 @@ fn write_appendable(path: &std::path::Path) {
 }
 
 #[test]
-fn exclusive_writer_lock_blocks_second_writer_and_plain_reader() {
+fn editor_lock_blocks_a_second_editor() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("edit.h5");
     write_starter(&path);
 
     let session = EditSession::open(&path).unwrap(); // holds the exclusive lock
 
-    // A second writer is refused while the first is alive.
+    // A second editor cannot open the file while the first is alive.
     assert!(
         matches!(EditSession::open(&path), Err(Error::FileLocked(_))),
         "second EditSession::open should be FileLocked"
     );
-    // A plain reader (shared lock) is refused against the active exclusive lock.
-    assert!(
-        matches!(File::open(&path), Err(Error::FileLocked(_))),
-        "File::open should be FileLocked while a writer is active"
-    );
 
     drop(session); // releases the lock
 
-    // Once the writer is gone, a plain read succeeds again.
-    File::open(&path).expect("read should succeed after the writer is dropped");
+    // Once the editor is gone, opening (for edit or read) succeeds again.
+    EditSession::open(&path).expect("editor should open after the first is dropped");
+    File::open(&path).expect("read should succeed after the editor is dropped");
 }
 
 #[test]
-fn disabled_locking_bypasses_the_lock() {
+fn disabled_locking_takes_no_lock() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("edit.h5");
     write_starter(&path);
 
-    let _session = EditSession::open(&path).unwrap(); // Enabled: exclusive lock held
-
-    // An explicit FileLocking::Disabled reader ignores the held lock.
-    let opts = FileAccessOptions::new().with_file_locking(FileLocking::Disabled);
-    File::open_with_options(&path, opts)
-        .expect("Disabled locking should bypass the held exclusive lock");
-
-    // And a Disabled writer can open alongside it too.
+    // With locking disabled the editor takes no lock at all, so others can still
+    // open the file (true on every platform, since nothing is locked).
+    let _editor = EditSession::open_with_locking(&path, FileLocking::Disabled).unwrap();
+    File::open(&path).expect("read should succeed: the Disabled editor took no lock");
     EditSession::open_with_locking(&path, FileLocking::Disabled)
-        .expect("Disabled locking should bypass the held exclusive lock for writers");
+        .expect("a second Disabled editor should open: neither took a lock");
 }
 
 #[test]
-fn swmr_writer_lock_blocks_second_writer_but_not_swmr_reader() {
+fn swmr_writer_does_not_lock_so_a_reader_can_follow_it() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("swmr.h5");
     write_appendable(&path);
 
-    let writer = SwmrWriter::open(&path).unwrap(); // exclusive lock held
+    let mut writer = SwmrWriter::open(&path).unwrap(); // takes no lock
+    writer
+        .append_i32("d", &(4..20).collect::<Vec<_>>())
+        .unwrap();
 
-    // A second SWMR writer is refused.
-    assert!(
-        matches!(SwmrWriter::open(&path), Err(Error::FileLocked(_))),
-        "second SwmrWriter::open should be FileLocked"
+    // The writer is still alive: a SWMR reader opens and reads concurrently,
+    // which only works because neither side holds an OS lock (on Windows a lock
+    // would block the read outright).
+    let reader = File::open_swmr(&path).expect("open_swmr should coexist with a live SWMR writer");
+    assert_eq!(
+        reader.dataset("d").unwrap().read_i32().unwrap(),
+        (0..20).collect::<Vec<_>>()
     );
 
-    // A SWMR reader takes no lock by design and coexists with the live writer.
-    File::open_swmr(&path).expect("open_swmr should coexist with an active SWMR writer");
-
-    drop(writer); // releases the lock and clears the SWMR flag
-
-    SwmrWriter::open(&path).expect("a new SWMR writer should open after the first is dropped");
+    drop(writer);
 }

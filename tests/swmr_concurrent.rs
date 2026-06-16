@@ -11,7 +11,7 @@
 //!
 //! `uv run` puts a pinned python3 + h5py on PATH for the duration of the test.
 
-use hdf5_pure::{FileBuilder, FileLocking, SwmrWriter};
+use hdf5_pure::{FileBuilder, SwmrWriter};
 use tempfile::tempdir;
 
 /// Open `path` with h5py and return `(len, first, last)` of dataset `d`, or
@@ -138,13 +138,9 @@ fn swmr_flag_lifecycle() {
     }
     assert_eq!(flag(&path), 0x00, "flag cleared on clean close");
 
-    // Simulate a crashed writer (flag left set), then recover. Open with
-    // locking disabled so that leaking the handle via `mem::forget` reproduces
-    // exactly the post-crash on-disk state (flag set, no OS lock held): a real
-    // crash releases the kernel lock when the process dies, whereas a forgotten
-    // *locked* handle would leak the lock in-process and block recovery.
+    // Simulate a crashed writer (flag left set), then recover.
     {
-        let mut w = SwmrWriter::open_with_locking(&path, FileLocking::Disabled).unwrap();
+        let mut w = SwmrWriter::open(&path).unwrap();
         w.append_i32("d", &[8]).unwrap();
         std::mem::forget(w); // skip Drop -> flag stays set, as if crashed
     }

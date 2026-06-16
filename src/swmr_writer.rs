@@ -25,24 +25,21 @@
 //!   are allocated incrementally as block boundaries are crossed.
 //! - Files with a zero base address (no userblock).
 //!
-//! ## File locking and crash recovery
+//! ## Crash recovery (the consistency flag)
 //!
-//! Opening a writer takes an exclusive OS advisory lock (see
-//! [`crate::FileLocking`]), so a second writer — or a non-SWMR reader — cannot
-//! open the file concurrently. The lock is owned by the kernel and released
-//! automatically when the writer is dropped or the process exits, *including on
-//! a crash*, so a crashed writer never leaves a stale lock.
-//!
-//! Separately, the writer sets the superblock's SWMR-write *consistency flag*
-//! (`0x05`) while active and clears it on [`SwmrWriter::close`] / `Drop`. Unlike
-//! the lock, this flag is durable file data: a hard crash (`SIGKILL`, power
-//! loss, or a `panic = "abort"` build where `Drop` never runs) leaves it set,
-//! and the reference C library then refuses to open the file until it is cleared.
+//! The writer marks the file with the superblock's SWMR-write *consistency flag*
+//! (`0x05`) while active and clears it on [`SwmrWriter::close`] / `Drop`. This
+//! flag is durable file data, *not* an OS lock: a hard crash (`SIGKILL`, power
+//! loss, or a `panic = "abort"` build where `Drop` never runs) leaves it set, and
+//! the reference C library then refuses to open the file until it is cleared.
 //! Recover such a file with [`SwmrWriter::clear_swmr_flag`] (the `h5clear -s`
-//! equivalent). SWMR *readers* ([`crate::File::open_swmr`]) take no lock, so they
-//! always coexist with the writer; an external reader (h5py / the C library)
-//! should disable HDF5 file locking (`HDF5_USE_FILE_LOCKING=FALSE`), the standard
-//! SWMR-read practice.
+//! equivalent).
+//!
+//! Unlike [`crate::EditSession`], the SWMR writer takes **no OS file lock**: SWMR
+//! is single-writer by contract and built for concurrent reads (the reference
+//! library likewise runs SWMR with file locking disabled), so a whole-file lock
+//! would block readers — fatally so on Windows, where locks are mandatory. The
+//! single-writer invariant is the caller's responsibility, as it is in HDF5.
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
@@ -138,29 +135,19 @@ const SWMR_WRITE_FLAGS: u32 = 0x05;
 impl SwmrWriter {
     /// Open an existing HDF5 file for appending.
     ///
-    /// Takes an exclusive OS advisory lock so a second writer (or a non-SWMR
-    /// reader) cannot open the file concurrently; the lock is released
-    /// automatically when this writer is dropped or the process exits, including
-    /// on a crash. To control or disable locking (e.g. on a filesystem that does
-    /// not support it), use [`open_with_locking`](Self::open_with_locking) or set
-    /// `HDF5_USE_FILE_LOCKING=FALSE`.
+    /// Does **not** take an OS file lock: SWMR is single-writer *by contract* and
+    /// designed for concurrent reads, so (like the reference library, which runs
+    /// SWMR with locking off) a lock would defeat the multiple-reader half — and
+    /// on Windows, where locks are mandatory, it would block readers outright.
+    /// The writer instead marks the file with the superblock SWMR flag while
+    /// active; recover a file left flagged by a crashed writer with
+    /// [`clear_swmr_flag`](Self::clear_swmr_flag). See the [module docs](self).
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
-        Self::open_with_locking(path, FileLocking::Enabled)
-    }
-
-    /// Open an existing HDF5 file for appending, choosing the file-locking
-    /// policy explicitly. See [`open`](Self::open) and [`FileLocking`].
-    pub fn open_with_locking<P: AsRef<Path>>(path: P, locking: FileLocking) -> Result<Self, Error> {
-        let path = path.as_ref();
         let mut handle = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(path)
+            .open(path.as_ref())
             .map_err(Error::Io)?;
-        // Acquire the exclusive lock before reading or mutating; the retained
-        // `handle` holds it for the writer's life (the kernel releases it on
-        // drop/crash, so a crashed writer never leaves a stale lock).
-        file_lock::acquire_exclusive(&handle, locking, path)?;
         let mut data = Vec::new();
         handle.read_to_end(&mut data).map_err(Error::Io)?;
 
