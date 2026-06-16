@@ -116,6 +116,56 @@ impl FileAccessOptions {
     }
 }
 
+/// Dataset-access options applied when opening a single dataset.
+///
+/// This is the `hdf5-pure` analogue of an HDF5 Dataset Access Property List
+/// (DAPL). Its chunk cache corresponds to `H5Pset_chunk_cache`: it overrides,
+/// for this one dataset, the file-wide chunk-cache default configured with
+/// [`FileAccessOptions::with_chunk_cache`] (the `H5Pset_cache` analogue). When
+/// left unset, the dataset inherits that file-wide default — matching the DAPL
+/// default sentinels (`H5D_CHUNK_CACHE_*_DEFAULT`), which also mean "use the
+/// file's setting".
+///
+/// [`ChunkCacheConfig`] maps `H5Pset_chunk_cache`'s `rdcc_nslots` and
+/// `rdcc_nbytes`; its `rdcc_w0` preemption policy is not modeled, because this
+/// read cache uses strict LRU eviction (as noted on
+/// [`ChunkCacheConfig::from_h5p_cache`]).
+///
+/// Pass it to [`File::dataset_with_options`] or [`Group::dataset_with_options`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DatasetAccessOptions {
+    chunk_cache: Option<ChunkCacheConfig>,
+}
+
+impl DatasetAccessOptions {
+    /// Create options that inherit every file-wide access default.
+    pub const fn new() -> Self {
+        Self { chunk_cache: None }
+    }
+
+    /// Override the raw chunk cache for this one dataset, ignoring the file-wide
+    /// default. This is the `H5Pset_chunk_cache` analogue.
+    pub const fn with_chunk_cache(mut self, chunk_cache: ChunkCacheConfig) -> Self {
+        self.chunk_cache = Some(chunk_cache);
+        self
+    }
+
+    /// Return the chunk-cache override, or `None` when the dataset inherits the
+    /// file-wide default.
+    pub const fn chunk_cache(&self) -> Option<ChunkCacheConfig> {
+        self.chunk_cache
+    }
+
+    /// Resolve the effective chunk-cache config: the per-dataset override if one
+    /// was set, otherwise the file-wide `default`.
+    const fn resolved_chunk_cache(&self, default: ChunkCacheConfig) -> ChunkCacheConfig {
+        match self.chunk_cache {
+            Some(config) => config,
+            None => default,
+        }
+    }
+}
+
 /// Test whether a file looks like an HDF5 file, without reading it whole.
 ///
 /// This is the spelling of the C library's `H5Fis_accessible` /
@@ -435,16 +485,37 @@ impl File {
     }
 
     /// Resolve a path and return a `Dataset` handle.
+    ///
+    /// The dataset uses the file-wide chunk-cache default (configured with
+    /// [`FileAccessOptions::with_chunk_cache`]). To override the cache for this
+    /// one dataset, use [`dataset_with_options`](Self::dataset_with_options).
     pub fn dataset(&self, path: &str) -> Result<Dataset<'_>, Error> {
+        self.dataset_with_options(path, DatasetAccessOptions::new())
+    }
+
+    /// Resolve a path and return a `Dataset` handle, applying per-dataset
+    /// [`DatasetAccessOptions`] that override file-wide access defaults.
+    ///
+    /// This is the dataset-open-with-access-property-list path (HDF5's DAPL):
+    /// the options' chunk cache corresponds to `H5Pset_chunk_cache` and takes
+    /// precedence, for this dataset only, over the `H5Pset_cache`-style
+    /// file-wide default.
+    pub fn dataset_with_options(
+        &self,
+        path: &str,
+        options: DatasetAccessOptions,
+    ) -> Result<Dataset<'_>, Error> {
         let addr = self.resolve_path(path)?;
         let hdr = self.parse_header(addr)?;
         if !has_message(&hdr, MessageType::DataLayout) {
             return Err(Error::NotADataset(path.to_string()));
         }
+        let chunk_cache = options.resolved_chunk_cache(self.access_options.chunk_cache);
         Ok(Dataset {
             file: self,
             header: hdr,
-            chunk_cache: ChunkCache::with_config(self.access_options.chunk_cache),
+            chunk_cache: ChunkCache::with_config(chunk_cache),
+            chunk_cache_config: chunk_cache,
         })
     }
 
@@ -706,7 +777,22 @@ impl<'f> Group<'f> {
     }
 
     /// Get a dataset within this group by name.
+    ///
+    /// The dataset uses the file-wide chunk-cache default. To override the cache
+    /// for this one dataset, use
+    /// [`dataset_with_options`](Self::dataset_with_options).
     pub fn dataset(&self, name: &str) -> Result<Dataset<'f>, Error> {
+        self.dataset_with_options(name, DatasetAccessOptions::new())
+    }
+
+    /// Get a dataset within this group by name, applying per-dataset
+    /// [`DatasetAccessOptions`] that override file-wide access defaults (HDF5's
+    /// DAPL; see `H5Pset_chunk_cache`).
+    pub fn dataset_with_options(
+        &self,
+        name: &str,
+        options: DatasetAccessOptions,
+    ) -> Result<Dataset<'f>, Error> {
         let entries = self.children()?;
         let entry = entries
             .iter()
@@ -716,10 +802,12 @@ impl<'f> Group<'f> {
         if !has_message(&hdr, MessageType::DataLayout) {
             return Err(Error::NotADataset(name.to_string()));
         }
+        let chunk_cache = options.resolved_chunk_cache(self.file.access_options.chunk_cache);
         Ok(Dataset {
             file: self.file,
             header: hdr,
-            chunk_cache: ChunkCache::with_config(self.file.access_options.chunk_cache),
+            chunk_cache: ChunkCache::with_config(chunk_cache),
+            chunk_cache_config: chunk_cache,
         })
     }
 
@@ -753,6 +841,9 @@ pub struct Dataset<'f> {
     // Held per-dataset: the chunk index is keyed only by chunk coordinate, so
     // a file-level cache would alias chunk addresses across datasets.
     chunk_cache: ChunkCache,
+    // The effective chunk-cache config for this dataset: the file-wide default
+    // or a per-dataset DAPL override. Reported by `chunk_cache_config`.
+    chunk_cache_config: ChunkCacheConfig,
 }
 
 impl<'f> std::fmt::Debug for Dataset<'f> {
@@ -764,6 +855,16 @@ impl<'f> std::fmt::Debug for Dataset<'f> {
 }
 
 impl<'f> Dataset<'f> {
+    /// The effective raw chunk-cache configuration for this dataset.
+    ///
+    /// This reflects the per-dataset [`DatasetAccessOptions`] override when one
+    /// was supplied to [`File::dataset_with_options`] /
+    /// [`Group::dataset_with_options`], otherwise the file-wide default. It is
+    /// the read-side analogue of HDF5's `H5Pget_chunk_cache`.
+    pub const fn chunk_cache_config(&self) -> ChunkCacheConfig {
+        self.chunk_cache_config
+    }
+
     /// A point-in-time snapshot of this dataset handle's chunk-cache occupancy.
     ///
     /// Lets callers confirm a chunk-cache configuration (set with
@@ -1095,4 +1196,70 @@ fn is_group(header: &ObjectHeader) -> bool {
             || m.msg_type == MessageType::Link
             || m.msg_type == MessageType::SymbolTable
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::FileBuilder;
+
+    /// One 256-element i32 dataset, chunked into 32-element chunks, in memory.
+    fn chunked_file_bytes() -> Vec<u8> {
+        let data: Vec<i32> = (0..256).collect();
+        let mut b = FileBuilder::new();
+        b.create_dataset("chunked")
+            .with_i32_data(&data)
+            .with_shape(&[256])
+            .with_chunks(&[32]);
+        b.finish().unwrap()
+    }
+
+    // The DAPL override must drive the *live* `ChunkCache`, not merely the value
+    // reported by `chunk_cache_config()`. These assertions reach the crate's
+    // `#[cfg(test)]` cache introspection (unavailable to integration tests), so
+    // they fail if the resolved config ever stops flowing into the real cache.
+
+    #[test]
+    fn enabled_override_populates_live_cache_over_disabled_file_default() {
+        let file = File::from_bytes_with_options(
+            chunked_file_bytes(),
+            FileAccessOptions::new().with_chunk_cache(ChunkCacheConfig::disabled()),
+        )
+        .unwrap();
+
+        let ds = file
+            .dataset_with_options(
+                "chunked",
+                DatasetAccessOptions::new().with_chunk_cache(ChunkCacheConfig::new()),
+            )
+            .unwrap();
+        assert_eq!(ds.read_i32().unwrap(), (0..256).collect::<Vec<i32>>());
+
+        // The enabled override built the chunk index and retained chunks; the
+        // disabled file default would have left both empty.
+        assert!(ds.chunk_cache_stats().index_loaded());
+        assert!(ds.chunk_cache_stats().cached_chunks() > 0);
+    }
+
+    #[test]
+    fn disabled_override_suppresses_live_cache_over_enabled_file_default() {
+        let file = File::from_bytes_with_options(
+            chunked_file_bytes(),
+            FileAccessOptions::new().with_chunk_cache(ChunkCacheConfig::new()),
+        )
+        .unwrap();
+
+        let ds = file
+            .dataset_with_options(
+                "chunked",
+                DatasetAccessOptions::new().with_chunk_cache(ChunkCacheConfig::disabled()),
+            )
+            .unwrap();
+        assert_eq!(ds.read_i32().unwrap(), (0..256).collect::<Vec<i32>>());
+
+        // The disabled override suppressed the index and chunk retention; the
+        // enabled file default would have populated both.
+        assert!(!ds.chunk_cache_stats().index_loaded());
+        assert_eq!(ds.chunk_cache_stats().cached_chunks(), 0);
+    }
 }
