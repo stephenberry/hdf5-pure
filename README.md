@@ -10,7 +10,7 @@ Pure-Rust HDF5 reader, writer, and in-place editor. No C dependencies, no build 
 - **Read** HDF5 files (v0/v1/v2/v3 superblocks, v1/v2 object headers, contiguous/chunked/compact storage)
 - **Edit in place** — add, delete (`H5Ldelete`), and copy (`H5Ocopy`) datasets and groups in an existing file without reading it all in and rewriting it; the cost is proportional to what changes, not the file size
 - **SWMR** (single-writer / multiple-reader) append and refreshing read for 1-D unlimited datasets, interoperable with the reference C library and h5py
-- **No C dependencies** — compiles to `wasm32-unknown-unknown` with `--no-default-features`
+- **No C dependencies** — pure Rust, so it compiles to `wasm32-unknown-unknown` and to bare-metal `no_std` (with `alloc`)
 - **MATLAB v7.3 compatible** — userblock support, fixed-length ASCII attributes, variable-length string arrays, object references
 - Deflate, shuffle, and scale-offset (lossless integer / lossy float) compression
 - Compound types, enumerations, array types
@@ -435,7 +435,7 @@ builder.create_dataset("temperature")
     .with_zfp(16.0);  // 16 bits per value
 ```
 
-Interop is enforced by `tests/zfp_crosscheck.rs`, which compares against
+Interop is enforced by `src/zfp_crosscheck.rs`, which compares against
 fixtures produced by `h5py` + `hdf5plugin`. See `tests/fixtures/zfp/regen.py`
 for the generator — run it after any codec change.
 
@@ -567,12 +567,14 @@ Not supported in this release: non-unit enum variants, MATLAB objects (`classdef
 | `provenance` | no | SHA-256 data provenance tracking |
 | `zfp` | no | ZFP fixed-rate compression (HDF5 filter 32013), f32/f64/i32/i64 × 1D–4D |
 
-For WASM, disable default features:
+For bare-metal `no_std`, disable default features (keep `checksum` for object-header validation):
 
 ```toml
 [dependencies]
-hdf5-pure = { version = "0.8", default-features = false, features = ["checksum"] }
+hdf5-pure = { version = "0.14", default-features = false, features = ["checksum"] }
 ```
+
+The high-level `File` / `FileBuilder` API is `std`-gated, so a `no_std` build exposes only the lower-level primitives. WebAssembly builds keep the default features, since `std` is available on `wasm32-unknown-unknown`.
 
 ## Acknowledgements
 
