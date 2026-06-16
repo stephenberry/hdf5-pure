@@ -571,7 +571,6 @@ impl ChunkCache {
         inner.current_bytes = 0;
         inner.tick = 0;
     }
-
 }
 
 impl Default for ChunkCache {
