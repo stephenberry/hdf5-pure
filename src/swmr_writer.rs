@@ -24,10 +24,30 @@
 //! - Unbounded growth: super blocks and (past ~131060 chunks) paged data blocks
 //!   are allocated incrementally as block boundaries are crossed.
 //! - Files with a zero base address (no userblock).
+//!
+//! ## File locking and crash recovery
+//!
+//! Opening a writer takes an exclusive OS advisory lock (see
+//! [`crate::FileLocking`]), so a second writer — or a non-SWMR reader — cannot
+//! open the file concurrently. The lock is owned by the kernel and released
+//! automatically when the writer is dropped or the process exits, *including on
+//! a crash*, so a crashed writer never leaves a stale lock.
+//!
+//! Separately, the writer sets the superblock's SWMR-write *consistency flag*
+//! (`0x05`) while active and clears it on [`SwmrWriter::close`] / `Drop`. Unlike
+//! the lock, this flag is durable file data: a hard crash (`SIGKILL`, power
+//! loss, or a `panic = "abort"` build where `Drop` never runs) leaves it set,
+//! and the reference C library then refuses to open the file until it is cleared.
+//! Recover such a file with [`SwmrWriter::clear_swmr_flag`] (the `h5clear -s`
+//! equivalent). SWMR *readers* ([`crate::File::open_swmr`]) take no lock, so they
+//! always coexist with the writer; an external reader (h5py / the C library)
+//! should disable HDF5 file locking (`HDF5_USE_FILE_LOCKING=FALSE`), the standard
+//! SWMR-read practice.
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::Path;
 
 use crate::checksum::jenkins_lookup3;
 use crate::chunked_write::ea_compute_stats;
@@ -36,6 +56,7 @@ use crate::data_layout::DataLayout;
 use crate::dataspace::Dataspace;
 use crate::error::{Error, FormatError};
 use crate::extensible_array::{EaGeometry, ExtensibleArrayHeader};
+use crate::file_lock::{self, FileLocking};
 use crate::group_v2;
 use crate::message_type::MessageType;
 use crate::signature;
@@ -116,12 +137,30 @@ const SWMR_WRITE_FLAGS: u32 = 0x05;
 
 impl SwmrWriter {
     /// Open an existing HDF5 file for appending.
-    pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
+    ///
+    /// Takes an exclusive OS advisory lock so a second writer (or a non-SWMR
+    /// reader) cannot open the file concurrently; the lock is released
+    /// automatically when this writer is dropped or the process exits, including
+    /// on a crash. To control or disable locking (e.g. on a filesystem that does
+    /// not support it), use [`open_with_locking`](Self::open_with_locking) or set
+    /// `HDF5_USE_FILE_LOCKING=FALSE`.
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
+        Self::open_with_locking(path, FileLocking::Enabled)
+    }
+
+    /// Open an existing HDF5 file for appending, choosing the file-locking
+    /// policy explicitly. See [`open`](Self::open) and [`FileLocking`].
+    pub fn open_with_locking<P: AsRef<Path>>(path: P, locking: FileLocking) -> Result<Self, Error> {
+        let path = path.as_ref();
         let mut handle = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(path.as_ref())
+            .open(path)
             .map_err(Error::Io)?;
+        // Acquire the exclusive lock before reading or mutating; the retained
+        // `handle` holds it for the writer's life (the kernel releases it on
+        // drop/crash, so a crashed writer never leaves a stale lock).
+        file_lock::acquire_exclusive(&handle, locking, path)?;
         let mut data = Vec::new();
         handle.read_to_end(&mut data).map_err(Error::Io)?;
 
@@ -184,12 +223,18 @@ impl SwmrWriter {
     /// Clear a stale SWMR-write flag left in `path` by a writer that exited
     /// without a clean close (the h5clear equivalent). Safe to call on a file
     /// with the flag already clear.
-    pub fn clear_swmr_flag<P: AsRef<std::path::Path>>(path: P) -> Result<(), Error> {
+    pub fn clear_swmr_flag<P: AsRef<Path>>(path: P) -> Result<(), Error> {
+        let path = path.as_ref();
         let mut w = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(path.as_ref())
+            .open(path)
             .map_err(Error::Io)?;
+        // Refuse to clear the flag out from under a live writer: an exclusive
+        // lock here fails with `FileLocked` if another writer still holds the
+        // file. A stale flag from a *crashed* writer has no live lock, so this
+        // succeeds and the recovery proceeds.
+        file_lock::acquire_exclusive(&w, FileLocking::Enabled, path)?;
         let mut data = Vec::new();
         w.read_to_end(&mut data).map_err(Error::Io)?;
         let sig = signature::find_signature(&data)?;

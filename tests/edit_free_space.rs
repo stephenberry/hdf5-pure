@@ -357,11 +357,13 @@ fn persisted_managers_stay_consistent_across_many_commits() {
 
     // Churn across multiple sessions: delete some, add some, each its own commit.
     for round in 0..4 {
-        let mut s = EditSession::open(&path).unwrap();
-        s.delete(&format!("d{round}"));
-        s.create_dataset(&format!("n{round}"))
-            .with_i32_data(&vec![100 + round; 150]);
-        s.commit().unwrap();
+        {
+            let mut s = EditSession::open(&path).unwrap();
+            s.delete(&format!("d{round}"));
+            s.create_dataset(&format!("n{round}"))
+                .with_i32_data(&vec![100 + round; 150]);
+            s.commit().unwrap();
+        } // release the editor's lock before reading the file back
         // Free regions never overlap and the file remains valid after each round.
         assert_eof_matches_file(&path);
         let f = File::open(&path).unwrap();

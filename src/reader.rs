@@ -12,6 +12,7 @@ use crate::data_read;
 use crate::dataspace::Dataspace;
 use crate::datatype::Datatype;
 use crate::error::{Error, FormatError};
+use crate::file_lock::{self, FileLocking};
 use crate::file_space_info::{FileSpaceInfo, FileSpaceStrategy};
 use crate::filter_pipeline::FilterPipeline;
 use crate::free_space_manager;
@@ -81,6 +82,7 @@ impl FileSource for SourceView<'_> {
 pub struct FileAccessOptions {
     metadata_cache: MetadataCacheConfig,
     chunk_cache: ChunkCacheConfig,
+    file_locking: FileLocking,
 }
 
 impl FileAccessOptions {
@@ -89,6 +91,7 @@ impl FileAccessOptions {
         Self {
             metadata_cache: MetadataCacheConfig::disabled(),
             chunk_cache: ChunkCacheConfig::new(),
+            file_locking: FileLocking::Enabled,
         }
     }
 
@@ -105,6 +108,19 @@ impl FileAccessOptions {
         self
     }
 
+    /// Configure OS advisory file locking for the open.
+    ///
+    /// Non-SWMR reads take a shared lock by default, which fails with
+    /// [`Error::FileLocked`] if a writer ([`crate::SwmrWriter`] /
+    /// [`crate::EditSession`]) is active. Pass [`FileLocking::Disabled`] (or set
+    /// `HDF5_USE_FILE_LOCKING=FALSE`) on filesystems where advisory locking is
+    /// unavailable or unwanted. Has no effect on [`File::open_swmr`], which never
+    /// locks. This is the `H5Pset_file_locking` analogue.
+    pub const fn with_file_locking(mut self, file_locking: FileLocking) -> Self {
+        self.file_locking = file_locking;
+        self
+    }
+
     /// Return the configured streaming metadata cache.
     pub const fn metadata_cache(&self) -> MetadataCacheConfig {
         self.metadata_cache
@@ -113,6 +129,11 @@ impl FileAccessOptions {
     /// Return the configured per-dataset chunk cache.
     pub const fn chunk_cache(&self) -> ChunkCacheConfig {
         self.chunk_cache
+    }
+
+    /// Return the configured file-locking policy.
+    pub const fn file_locking(&self) -> FileLocking {
+        self.file_locking
     }
 }
 
@@ -232,7 +253,15 @@ impl File {
         path: P,
         options: FileAccessOptions,
     ) -> Result<Self, Error> {
-        let bytes = std::fs::read(path.as_ref()).map_err(Error::Io)?;
+        // Take a shared advisory lock for the duration of the read so the
+        // snapshot is not torn by a concurrent writer. The lock is released when
+        // `handle` drops at the end of this scope (the buffered backend keeps no
+        // handle). See [`File::open_swmr`] to read a file under active write.
+        let path = path.as_ref();
+        let mut handle = std::fs::File::open(path).map_err(Error::Io)?;
+        file_lock::acquire_shared(&handle, options.file_locking, path)?;
+        let mut bytes = Vec::new();
+        handle.read_to_end(&mut bytes).map_err(Error::Io)?;
         Self::from_bytes_with_options(bytes, options)
     }
 
@@ -258,7 +287,11 @@ impl File {
         path: P,
         options: FileAccessOptions,
     ) -> Result<Self, Error> {
-        let handle = std::fs::File::open(path.as_ref()).map_err(Error::Io)?;
+        let path = path.as_ref();
+        let handle = std::fs::File::open(path).map_err(Error::Io)?;
+        // Hold a shared lock for the streaming handle's whole life (released when
+        // the source drops), so a writer cannot mutate the file mid-stream.
+        file_lock::acquire_shared(&handle, options.file_locking, path)?;
         let source = ReadSeekSource::new(handle).map_err(Error::Format)?;
         let source: Box<dyn FileSource + Send + Sync> = if options.metadata_cache.is_enabled() {
             Box::new(MetadataCachingSource::new(source, options.metadata_cache))
@@ -292,7 +325,12 @@ impl File {
     /// Open an HDF5 file for SWMR reading with explicit access options.
     ///
     /// SWMR reads currently keep an in-memory mirror for refresh semantics, so
-    /// only the per-dataset chunk-cache settings affect this backend.
+    /// only the per-dataset chunk-cache settings affect this backend. The
+    /// `file_locking` option is intentionally ignored here: opting into reading a
+    /// file under concurrent write is the entire point of SWMR, and a shared lock
+    /// would conflict with the writer's exclusive one. Crash-consistency instead
+    /// comes from the writer publishing a consistent prefix (see
+    /// [`crate::SwmrWriter`]).
     pub fn open_swmr_with_options<P: AsRef<std::path::Path>>(
         path: P,
         options: FileAccessOptions,

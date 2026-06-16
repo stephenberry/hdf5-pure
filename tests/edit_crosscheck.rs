@@ -126,9 +126,11 @@ fn pure_written_file_edited_then_read_by_c_library() {
     b.add_group(g.finish());
     b.write(&path).unwrap();
 
-    let mut session = EditSession::open(&path).unwrap();
-    stage_edits(&mut session);
-    session.commit().unwrap();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        stage_edits(&mut session);
+        session.commit().unwrap();
+    } // drop the editor (release its exclusive lock) before reading back
 
     assert_edits_applied(&path);
 }
@@ -140,9 +142,11 @@ fn c_written_v2_file_edited_in_place() {
     write_c_starter(&path, LibraryVersion::V18, LibraryVersion::V18);
     assert_eq!(File::open(&path).unwrap().superblock().version, 2);
 
-    let mut session = EditSession::open(&path).unwrap();
-    stage_edits(&mut session);
-    session.commit().unwrap();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        stage_edits(&mut session);
+        session.commit().unwrap();
+    } // drop the editor (release its exclusive lock) before reading back
 
     assert_edits_applied(&path);
 }
@@ -154,9 +158,11 @@ fn c_written_v3_file_edited_in_place() {
     write_c_starter(&path, LibraryVersion::V110, LibraryVersion::latest());
     assert_eq!(File::open(&path).unwrap().superblock().version, 3);
 
-    let mut session = EditSession::open(&path).unwrap();
-    stage_edits(&mut session);
-    session.commit().unwrap();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        stage_edits(&mut session);
+        session.commit().unwrap();
+    } // drop the editor (release its exclusive lock) before reading back
 
     assert_edits_applied(&path);
 }

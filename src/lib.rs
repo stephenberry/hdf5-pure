@@ -185,6 +185,8 @@ pub(crate) mod nosync;
 #[cfg(feature = "std")]
 pub(crate) mod edit;
 #[cfg(feature = "std")]
+pub(crate) mod file_lock;
+#[cfg(feature = "std")]
 pub(crate) mod free_space;
 #[cfg(feature = "std")]
 pub(crate) mod reader;
@@ -218,6 +220,9 @@ pub use error::FormatError;
 pub use reader::{
     Dataset, DatasetAccessOptions, File, FileAccessOptions, Group, is_hdf5, is_hdf5_bytes,
 };
+
+#[cfg(feature = "std")]
+pub use file_lock::FileLocking;
 
 pub use chunk_cache::{ChunkCacheConfig, ChunkCacheStats};
 

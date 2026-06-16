@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Per-dataset chunk-cache control: `File::dataset_with_options` / `Group::dataset_with_options` take a `DatasetAccessOptions` that overrides the file-wide chunk-cache default for a single dataset, mirroring HDF5's `H5Pset_chunk_cache` access property list. `Dataset::chunk_cache_config()` reports the effective setting ([#48](https://github.com/stephenberry/hdf5-pure/issues/48)).
 - `Dataset::chunk_cache_stats()` reports a read-only snapshot of a dataset's chunk-cache occupancy (index loaded, retained chunks, retained bytes), so callers can confirm their chunk-cache tuning is taking effect.
 - A gallery of runnable, self-checking examples in `examples/` covering the core API: write/read, generic element I/O, groups & attributes, compression, compound & complex types, ndarray, in-place editing, repack, SWMR, and file-space strategy. Run any with `cargo run --example <name>` ([#54](https://github.com/stephenberry/hdf5-pure/issues/54)).
+- OS advisory file locking on the write/edit/read open paths, the crash-safe half of HDF5's concurrency model and the analogue of `H5Pset_file_locking`. Writers (`SwmrWriter`, `EditSession`) take an exclusive lock and a second writer (or a non-SWMR reader) gets the new `Error::FileLocked`; plain reads take a shared lock; `File::open_swmr` takes none. The kernel releases the lock on any process exit (including a crash), so a crashed writer leaves no stale lock. Control it with the new `FileLocking` policy (`open_with_locking`, `FileAccessOptions::with_file_locking`) or `HDF5_USE_FILE_LOCKING=FALSE` for filesystems where locking is unavailable ([#73](https://github.com/stephenberry/hdf5-pure/issues/73)).
 
 ### Changed
 
@@ -20,6 +21,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - Read dense groups and dense attributes whose link/attribute names are very long (stored as fractal-heap "huge" objects); previously failed with `InvalidObjectHeaderVersion` ([#63](https://github.com/stephenberry/hdf5-pure/pull/63)).
+- `EditSession` now clears the superblock's write/SWMR consistency flag on commit instead of preserving whatever the source file carried, so editing a file an interrupted SWMR writer left flagged produces a cleanly-closed file the reference C library can reopen ([#73](https://github.com/stephenberry/hdf5-pure/issues/73)).
 
 ## [0.14.0] - 2026-06-15
 
