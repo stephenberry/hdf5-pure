@@ -2,6 +2,8 @@
 
 Pure-Rust HDF5 reader, writer, and in-place editor. No C dependencies, no build scripts, WASM-compatible.
 
+**📖 [Documentation site](https://stephenberry.github.io/hdf5-pure/)** · [API reference (docs.rs)](https://docs.rs/hdf5-pure) · [Examples](examples) · [Changelog](CHANGELOG.md)
+
 ## Features
 
 - **Write** HDF5 files with datasets, groups, attributes, and nested hierarchies
