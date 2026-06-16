@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 
 use crate::attribute::extract_attributes_full;
-use crate::chunk_cache::{ChunkCache, ChunkCacheConfig};
+use crate::chunk_cache::{ChunkCache, ChunkCacheConfig, ChunkCacheStats};
 use crate::compound::CompoundType;
 use crate::convert::TryToUsize;
 use crate::data_layout::DataLayout;
@@ -764,6 +764,18 @@ impl<'f> std::fmt::Debug for Dataset<'f> {
 }
 
 impl<'f> Dataset<'f> {
+    /// A point-in-time snapshot of this dataset handle's chunk-cache occupancy.
+    ///
+    /// Lets callers confirm a chunk-cache configuration (set with
+    /// [`FileAccessOptions::with_chunk_cache`]) is taking effect: after a
+    /// chunked read, an enabled cache reports a loaded index and retained
+    /// chunks; a disabled one (or one over its budget) reports fewer or none.
+    /// The cache is per-handle, so a freshly opened [`Dataset`] reports an empty
+    /// snapshot until its first read.
+    pub fn chunk_cache_stats(&self) -> ChunkCacheStats {
+        self.chunk_cache.stats()
+    }
+
     /// Returns the shape (dimensions) of the dataset.
     pub fn shape(&self) -> Result<Vec<u64>, Error> {
         let ds = self.dataspace()?;

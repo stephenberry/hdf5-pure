@@ -296,6 +296,37 @@ impl Default for ChunkCacheConfig {
     }
 }
 
+/// A read-only snapshot of a dataset's chunk-cache occupancy.
+///
+/// Returned by [`crate::Dataset::chunk_cache_stats`]. Use it to confirm a
+/// chunk-cache configuration is taking effect: after reading a chunked dataset,
+/// an enabled cache reports a loaded index and retained chunks, a disabled one
+/// (or one over its byte/slot budget) reports fewer or none. The counts are a
+/// point-in-time view and change as further reads populate or evict chunks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ChunkCacheStats {
+    index_loaded: bool,
+    cached_chunks: usize,
+    cached_bytes: usize,
+}
+
+impl ChunkCacheStats {
+    /// Whether the parsed chunk index is currently held in memory.
+    pub const fn index_loaded(&self) -> bool {
+        self.index_loaded
+    }
+
+    /// Number of decompressed chunks currently retained.
+    pub const fn cached_chunks(&self) -> usize {
+        self.cached_chunks
+    }
+
+    /// Total bytes of decompressed chunk data currently retained.
+    pub const fn cached_bytes(&self) -> usize {
+        self.cached_bytes
+    }
+}
+
 // ---------------------------------------------------------------------------
 // LRU entry
 // ---------------------------------------------------------------------------
@@ -383,13 +414,22 @@ impl ChunkCache {
         }
     }
 
-    // ----- Index operations -----
-
-    /// Returns `true` if the chunk index has been built.
-    #[cfg(test)]
-    pub fn has_index(&self) -> bool {
-        self.inner.lock().unwrap().index.is_some()
+    /// Snapshot the current chunk-cache occupancy (index loaded, retained
+    /// chunk count, retained bytes).
+    ///
+    /// This is the public, read-only way to observe whether a chunk-cache
+    /// configuration is taking effect. It locks the cache briefly to read a
+    /// consistent snapshot.
+    pub fn stats(&self) -> ChunkCacheStats {
+        let inner = self.inner.lock().unwrap();
+        ChunkCacheStats {
+            index_loaded: inner.index.is_some(),
+            cached_chunks: inner.slots.len(),
+            cached_bytes: inner.current_bytes,
+        }
     }
+
+    // ----- Index operations -----
 
     /// Build the chunk index from a pre-collected list of `ChunkInfo`.
     ///
@@ -532,23 +572,6 @@ impl ChunkCache {
         inner.tick = 0;
     }
 
-    /// Number of decompressed chunks currently cached.
-    ///
-    /// Currently only exercised by unit tests; gated so it is not shipped as
-    /// dead code.
-    #[cfg(test)]
-    pub fn cached_chunk_count(&self) -> usize {
-        self.inner.lock().unwrap().slots.len()
-    }
-
-    /// Total bytes of decompressed data currently cached.
-    ///
-    /// Currently only exercised by unit tests; gated so it is not shipped as
-    /// dead code.
-    #[cfg(test)]
-    pub fn cached_bytes(&self) -> usize {
-        self.inner.lock().unwrap().current_bytes
-    }
 }
 
 impl Default for ChunkCache {
@@ -582,7 +605,7 @@ mod tests {
             make_chunk(vec![10, 0, 0], 0x2000, 80),
         ];
         cache.populate_index(&chunks, 2); // rank=2, truncate to [0,0] and [10,0]
-        assert!(cache.has_index());
+        assert!(cache.stats().index_loaded());
 
         let mut addrs: Vec<u64> = cache
             .all_indexed_chunks()
@@ -608,14 +631,14 @@ mod tests {
 
         cache.put_decompressed(vec![0], vec![1; 10]);
         cache.put_decompressed(vec![1], vec![2; 10]);
-        assert_eq!(cache.cached_chunk_count(), 2);
+        assert_eq!(cache.stats().cached_chunks(), 2);
 
         // Access slot 0 to make it more recent
         cache.get_decompressed(&[0]);
 
         // Insert slot 2 — should evict slot 1 (LRU)
         cache.put_decompressed(vec![2], vec![3; 10]);
-        assert_eq!(cache.cached_chunk_count(), 2);
+        assert_eq!(cache.stats().cached_chunks(), 2);
 
         assert!(cache.get_decompressed(&[0]).is_some());
         assert!(cache.get_decompressed(&[1]).is_none()); // evicted
@@ -628,11 +651,11 @@ mod tests {
 
         cache.put_decompressed(vec![0], vec![0; 20]);
         cache.put_decompressed(vec![1], vec![0; 20]);
-        assert_eq!(cache.cached_bytes(), 40);
+        assert_eq!(cache.stats().cached_bytes(), 40);
 
         // This needs 20 bytes but only 10 free — evict LRU
         cache.put_decompressed(vec![2], vec![0; 20]);
-        assert!(cache.cached_bytes() <= 50);
+        assert!(cache.stats().cached_bytes() <= 50);
         assert!(cache.get_decompressed(&[0]).is_none()); // evicted (LRU)
     }
 
@@ -640,7 +663,7 @@ mod tests {
     fn oversized_chunk_not_cached() {
         let cache = ChunkCache::with_capacity(10, 16);
         cache.put_decompressed(vec![0], vec![0; 100]); // too big
-        assert_eq!(cache.cached_chunk_count(), 0);
+        assert_eq!(cache.stats().cached_chunks(), 0);
     }
 
     #[test]
@@ -648,11 +671,11 @@ mod tests {
         let cache = ChunkCache::with_config(ChunkCacheConfig::disabled());
         let chunks = vec![make_chunk(vec![0, 0], 0x1000, 80)];
         cache.populate_index(&chunks, 1);
-        assert!(!cache.has_index());
+        assert!(!cache.stats().index_loaded());
 
         cache.put_decompressed(vec![0], vec![1, 2, 3]);
-        assert_eq!(cache.cached_chunk_count(), 0);
-        assert_eq!(cache.cached_bytes(), 0);
+        assert_eq!(cache.stats().cached_chunks(), 0);
+        assert_eq!(cache.stats().cached_bytes(), 0);
     }
 
     #[test]
@@ -671,9 +694,9 @@ mod tests {
         cache.put_decompressed(vec![0], vec![1, 2, 3]);
 
         cache.clear();
-        assert!(!cache.has_index());
-        assert_eq!(cache.cached_chunk_count(), 0);
-        assert_eq!(cache.cached_bytes(), 0);
+        assert!(!cache.stats().index_loaded());
+        assert_eq!(cache.stats().cached_chunks(), 0);
+        assert_eq!(cache.stats().cached_bytes(), 0);
     }
 
     #[test]
@@ -681,8 +704,8 @@ mod tests {
         let cache = ChunkCache::new();
         cache.put_decompressed(vec![0], vec![1, 2, 3]);
         cache.put_decompressed(vec![0], vec![1, 2, 3]); // duplicate
-        assert_eq!(cache.cached_chunk_count(), 1);
-        assert_eq!(cache.cached_bytes(), 3);
+        assert_eq!(cache.stats().cached_chunks(), 1);
+        assert_eq!(cache.stats().cached_bytes(), 3);
     }
 
     // --- CacheAlignedBuffer tests ---

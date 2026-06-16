@@ -1800,12 +1800,12 @@ mod tests {
         let datatype = make_f64_type();
         let cache = ChunkCache::new();
 
-        assert!(!cache.has_index());
+        assert!(!cache.stats().index_loaded());
         let raw = read_chunked_data_cached(
             &file_data, &layout, &dataspace, &datatype, None, 8, 8, &cache,
         )
         .unwrap();
-        assert!(cache.has_index());
+        assert!(cache.stats().index_loaded());
         assert_eq!(raw.len(), 20 * 8);
         for i in 0..20 {
             let val = f64::from_le_bytes(raw[i * 8..(i + 1) * 8].try_into().unwrap());
@@ -1825,8 +1825,8 @@ mod tests {
             &file_data, &layout, &dataspace, &datatype, None, 8, 8, &cache,
         )
         .unwrap();
-        assert!(cache.has_index());
-        assert!(cache.cached_chunk_count() > 0);
+        assert!(cache.stats().index_loaded());
+        assert!(cache.stats().cached_chunks() > 0);
 
         // Second read — should hit the decompressed cache
         let raw2 = read_chunked_data_cached(
