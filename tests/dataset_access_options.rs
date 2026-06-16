@@ -109,7 +109,10 @@ fn group_dataset_with_options_overrides_chunk_cache() {
     );
 
     let overridden = group
-        .dataset_with_options("inner", DatasetAccessOptions::new().with_chunk_cache(override_cfg))
+        .dataset_with_options(
+            "inner",
+            DatasetAccessOptions::new().with_chunk_cache(override_cfg),
+        )
         .unwrap();
     assert_eq!(overridden.chunk_cache_config(), override_cfg);
     assert_eq!(overridden.read_i32().unwrap(), expected);
