@@ -625,6 +625,15 @@ pub enum Error {
     /// or opaque datatype, a virtual/external data layout, an unsupported
     /// filter, or an object reference. The payload names the object and reason.
     RepackUnsupported(String),
+    /// The file could not be opened because another process holds a conflicting
+    /// OS advisory lock — for a writer ([`crate::SwmrWriter`],
+    /// [`crate::EditSession`]) this means another writer or reader is active;
+    /// for a plain reader it means a writer is active. The lock is released
+    /// automatically when the holder's process exits, so a crashed writer does
+    /// not leave a stale lock. Locking can be disabled per open with
+    /// [`crate::FileLocking::Disabled`] or globally with
+    /// `HDF5_USE_FILE_LOCKING=FALSE`. The payload is a human-readable reason.
+    FileLocked(String),
 }
 
 #[cfg(feature = "std")]
@@ -650,6 +659,7 @@ impl fmt::Display for Error {
             Error::RepackUnsupported(reason) => {
                 write!(f, "cannot repack faithfully: {reason}")
             }
+            Error::FileLocked(reason) => write!(f, "file is locked: {reason}"),
         }
     }
 }

@@ -39,6 +39,7 @@ fn main() {
     session.copy("temperature", "temperature_backup"); // H5Ocopy
     session.delete("sensors/pressure"); // H5Ldelete
     session.commit().expect("commit edits");
+    drop(session); // release the editor's exclusive lock before reopening to read
 
     // ---- Verify ---------------------------------------------------------
     let file = File::open(&path).expect("reopen");

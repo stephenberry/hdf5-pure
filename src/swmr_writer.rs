@@ -24,10 +24,27 @@
 //! - Unbounded growth: super blocks and (past ~131060 chunks) paged data blocks
 //!   are allocated incrementally as block boundaries are crossed.
 //! - Files with a zero base address (no userblock).
+//!
+//! ## Crash recovery (the consistency flag)
+//!
+//! The writer marks the file with the superblock's SWMR-write *consistency flag*
+//! (`0x05`) while active and clears it on [`SwmrWriter::close`] / `Drop`. This
+//! flag is durable file data, *not* an OS lock: a hard crash (`SIGKILL`, power
+//! loss, or a `panic = "abort"` build where `Drop` never runs) leaves it set, and
+//! the reference C library then refuses to open the file until it is cleared.
+//! Recover such a file with [`SwmrWriter::clear_swmr_flag`] (the `h5clear -s`
+//! equivalent).
+//!
+//! Unlike [`crate::EditSession`], the SWMR writer takes **no OS file lock**: SWMR
+//! is single-writer by contract and built for concurrent reads (the reference
+//! library likewise runs SWMR with file locking disabled), so a whole-file lock
+//! would block readers — fatally so on Windows, where locks are mandatory. The
+//! single-writer invariant is the caller's responsibility, as it is in HDF5.
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::Path;
 
 use crate::checksum::jenkins_lookup3;
 use crate::chunked_write::ea_compute_stats;
@@ -36,6 +53,7 @@ use crate::data_layout::DataLayout;
 use crate::dataspace::Dataspace;
 use crate::error::{Error, FormatError};
 use crate::extensible_array::{EaGeometry, ExtensibleArrayHeader};
+use crate::file_lock::{self, FileLocking};
 use crate::group_v2;
 use crate::message_type::MessageType;
 use crate::signature;
@@ -116,7 +134,15 @@ const SWMR_WRITE_FLAGS: u32 = 0x05;
 
 impl SwmrWriter {
     /// Open an existing HDF5 file for appending.
-    pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
+    ///
+    /// Does **not** take an OS file lock: SWMR is single-writer *by contract* and
+    /// designed for concurrent reads, so (like the reference library, which runs
+    /// SWMR with locking off) a lock would defeat the multiple-reader half — and
+    /// on Windows, where locks are mandatory, it would block readers outright.
+    /// The writer instead marks the file with the superblock SWMR flag while
+    /// active; recover a file left flagged by a crashed writer with
+    /// [`clear_swmr_flag`](Self::clear_swmr_flag). See the [module docs](self).
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
         let mut handle = OpenOptions::new()
             .read(true)
             .write(true)
@@ -184,12 +210,18 @@ impl SwmrWriter {
     /// Clear a stale SWMR-write flag left in `path` by a writer that exited
     /// without a clean close (the h5clear equivalent). Safe to call on a file
     /// with the flag already clear.
-    pub fn clear_swmr_flag<P: AsRef<std::path::Path>>(path: P) -> Result<(), Error> {
+    pub fn clear_swmr_flag<P: AsRef<Path>>(path: P) -> Result<(), Error> {
+        let path = path.as_ref();
         let mut w = OpenOptions::new()
             .read(true)
             .write(true)
-            .open(path.as_ref())
+            .open(path)
             .map_err(Error::Io)?;
+        // Refuse to clear the flag out from under a live writer: an exclusive
+        // lock here fails with `FileLocked` if another writer still holds the
+        // file. A stale flag from a *crashed* writer has no live lock, so this
+        // succeeds and the recovery proceeds.
+        file_lock::acquire_exclusive(&w, FileLocking::Enabled, path)?;
         let mut data = Vec::new();
         w.read_to_end(&mut data).map_err(Error::Io)?;
         let sig = signature::find_signature(&data)?;

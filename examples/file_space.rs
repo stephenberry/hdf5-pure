@@ -105,10 +105,12 @@ fn churn(path: &Path) -> u64 {
         .create_dataset("scratch")
         .with_f64_data(&vec![0.0; SCRATCH_LEN]);
     session.commit().unwrap();
+    drop(session); // release the editor's exclusive lock before the next session
 
     let mut session = EditSession::open(path).expect("reopen for editing");
     session.delete("scratch");
     session.commit().unwrap();
+    drop(session); // release the lock before reading the file back
     let after_delete = len(path);
 
     // For a persisting file these regions are on disk and a later session reuses
@@ -126,6 +128,7 @@ fn churn(path: &Path) -> u64 {
         .create_dataset("scratch2")
         .with_f64_data(&vec![7.0; SCRATCH_LEN]);
     session.commit().unwrap();
+    drop(session); // release the lock before reading the file back
     let after_readd = len(path);
     let growth = after_readd - after_delete;
     println!(

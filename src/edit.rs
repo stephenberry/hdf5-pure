@@ -96,6 +96,7 @@ use std::path::Path;
 use crate::checksum::jenkins_lookup3;
 use crate::dataspace::{Dataspace, DataspaceType};
 use crate::error::Error;
+use crate::file_lock::{self, FileLocking};
 use crate::file_space_info::{FileSpaceInfo, FileSpaceStrategy};
 use crate::file_writer::{LENGTH_SIZE, OFFSET_SIZE, build_dataset_oh, make_link};
 use crate::free_space::FreeList;
@@ -207,15 +208,31 @@ struct PersistState {
 impl EditSession {
     /// Open an existing HDF5 file for in-place editing.
     ///
-    /// Reads the file into memory and retains a read/write handle. Fails with
+    /// Reads the file into memory and retains a read/write handle. Takes an
+    /// exclusive OS advisory lock so the file cannot be opened concurrently by
+    /// another writer or reader; the lock is released automatically when the
+    /// session is dropped or the process exits (including on a crash). Fails with
+    /// [`Error::FileLocked`] if the file is already locked, or
     /// [`Error::EditUnsupported`] if the file is not a supported target (see the
-    /// [module docs](self) for the exact requirements).
+    /// [module docs](self) for the exact requirements). To control or disable
+    /// locking, use [`open_with_locking`](Self::open_with_locking) or set
+    /// `HDF5_USE_FILE_LOCKING=FALSE`.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
+        Self::open_with_locking(path, FileLocking::Enabled)
+    }
+
+    /// Open an existing HDF5 file for in-place editing, choosing the file-locking
+    /// policy explicitly. See [`open`](Self::open) and [`FileLocking`].
+    pub fn open_with_locking<P: AsRef<Path>>(path: P, locking: FileLocking) -> Result<Self, Error> {
+        let path = path.as_ref();
         let mut handle = fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(path.as_ref())
+            .open(path)
             .map_err(Error::Io)?;
+        // Acquire the exclusive lock before reading or mutating; the retained
+        // `handle` holds it for the session's life.
+        file_lock::acquire_exclusive(&handle, locking, path)?;
         let mut data = Vec::new();
         handle.read_to_end(&mut data).map_err(Error::Io)?;
 
@@ -803,6 +820,11 @@ impl EditSession {
             let mut new_sb = self.superblock.clone();
             new_sb.root_group_address = new_root;
             new_sb.eof_address = new_eof;
+            // Clear any write/SWMR consistency flag rather than re-emitting one
+            // the source file carried (e.g. left set by a crashed SWMR writer):
+            // this clean commit leaves the file properly closed for the C library
+            // (issue #73). serialize() recomputes the v2/v3 checksum.
+            new_sb.consistency_flags = 0;
             let sb_bytes = new_sb.serialize();
             self.write_at(self.sb_sig_off, &sb_bytes)?;
             self.handle.sync_all().map_err(Error::Io)?;
@@ -961,6 +983,9 @@ impl EditSession {
         new_sb.root_group_address = new_root;
         new_sb.eof_address = final_eof;
         new_sb.superblock_extension_address = Some(ext_addr);
+        // Clear any leftover write/SWMR consistency flag on a clean commit (see
+        // the non-persisting path above and issue #73).
+        new_sb.consistency_flags = 0;
         let sb_bytes = new_sb.serialize();
         self.write_at(self.sb_sig_off, &sb_bytes)?;
         self.handle.sync_all().map_err(Error::Io)?;
@@ -2187,5 +2212,56 @@ mod tests {
         let before = region.clone();
         ensure_group_info(&mut region).unwrap();
         assert_eq!(region, before);
+    }
+
+    #[test]
+    fn commit_clears_a_stale_consistency_flag() {
+        // A clean in-place edit must leave the file properly closed for the C
+        // library: the write/SWMR consistency flag a crashed SWMR writer left
+        // behind is cleared rather than re-emitted (issue #73).
+        use crate::writer::FileBuilder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale_flag.h5");
+
+        let mut b = FileBuilder::new();
+        b.create_dataset("d").with_i32_data(&[1, 2, 3]);
+        b.write(&path).unwrap();
+
+        // Simulate a crashed SWMR writer by stamping the on-disk write+SWMR flag
+        // (0x05) into the superblock, recomputing its checksum.
+        {
+            let mut data = std::fs::read(&path).unwrap();
+            let off = signature::find_signature(&data).unwrap();
+            let mut sb = Superblock::parse(&data, off).unwrap();
+            assert!(
+                sb.version >= 2,
+                "FileBuilder should emit a v2/v3 superblock"
+            );
+            sb.consistency_flags = 0x05;
+            let bytes = sb.serialize();
+            data[off..off + bytes.len()].copy_from_slice(&bytes);
+            std::fs::write(&path, &data).unwrap();
+            // Sanity: the stale flag is really set on disk now.
+            assert_eq!(
+                Superblock::parse(&data, off).unwrap().consistency_flags,
+                0x05
+            );
+        }
+
+        // A clean edit-and-commit cycle heals it.
+        {
+            let mut s = EditSession::open(&path).unwrap();
+            s.create_dataset("e").with_i32_data(&[4, 5]);
+            s.commit().unwrap();
+        }
+
+        let data = std::fs::read(&path).unwrap();
+        let off = signature::find_signature(&data).unwrap();
+        assert_eq!(
+            Superblock::parse(&data, off).unwrap().consistency_flags,
+            0,
+            "commit must clear the stale consistency flag"
+        );
     }
 }

@@ -2,6 +2,9 @@
 name = "hdf5-pure"
 version = "0.14.0"
 edition = "2024"
+# `std::fs::File` advisory locking (used by the write/edit/read open paths for
+# concurrent-writer detection, issue #73) stabilized in Rust 1.89.
+rust-version = "1.89"
 license = "MIT"
 description = "Pure-Rust HDF5 library: read, write, and edit files in place (WASM-compatible, no C dependencies)"
 repository = "https://github.com/stephenberry/hdf5-pure"
