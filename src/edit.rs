@@ -1,6 +1,7 @@
 //! In-place editing of an existing HDF5 file (issue #32, Group C).
 //!
-//! [`EditSession`] opens an existing file and adds objects to it **in place**:
+//! [`EditSession`] opens an existing file and adds objects or edits compact
+//! group attributes **in place**:
 //! new data and object headers are written at the end of the file, and the
 //! object headers of the touched groups (and their ancestors up to the root)
 //! are rewritten — also appended — so the superblock ends up pointing at the
@@ -8,14 +9,14 @@
 //! proportional to what you add, not to the file size — unlike the
 //! read-everything-then-rebuild path through [`FileBuilder`](crate::FileBuilder).
 //!
-//! Both new datasets and new (sub)groups are supported, at any existing group
-//! path. Adding into a nested group `/a/b` rewrites `b`'s header (with the new
-//! link), then `a`'s header (repointing its link to `b`'s new location), then
-//! the root's — "relocation up the tree". This is always safe for *additions*
-//! because no surviving object is relocated except the groups on the path being
-//! edited, and those are reachable only through links this same commit rewrites
-//! (the root through the superblock); absolute object-reference addresses to
-//! other objects stay valid.
+//! Both new datasets, new (sub)groups, and group attribute edits are supported,
+//! at any existing group path. Adding into a nested group `/a/b` rewrites `b`'s
+//! header (with the new link), then `a`'s header (repointing its link to `b`'s
+//! new location), then the root's — "relocation up the tree". This is always
+//! safe for *additions* because no surviving object is relocated except the
+//! groups on the path being edited, and those are reachable only through links
+//! this same commit rewrites (the root through the superblock); absolute
+//! object-reference addresses to other objects stay valid.
 //!
 //! Deletion ([`EditSession::delete`], the HDF5 `H5Ldelete`) is the mirror image:
 //! the parent group's header is rebuilt without the removed link, relocated up
@@ -48,7 +49,8 @@
 //! - Added datasets are contiguous and unfiltered (no chunking, compression,
 //!   shuffle, scale-offset, or extensible dimensions), have a fixed-size
 //!   datatype with a non-empty shape, and carry only fixed-size (non
-//!   variable-length) attributes, few enough to stay in compact storage.
+//!   variable-length) attributes, few enough to stay in compact storage. Group
+//!   attribute edits have the same compact, fixed-size attribute restriction.
 //! - A new group's parent must already exist or be created in the same session
 //!   (each level created explicitly); intermediate groups are not auto-created.
 //!
@@ -132,16 +134,19 @@ type PathKey = Vec<String>;
 ///
 /// Mirror the file in memory and keep a writable handle; every mutation is
 /// applied to both so the on-disk file stays consistent. Stage additions with
-/// [`create_dataset`](Self::create_dataset) / [`create_group`](Self::create_group),
-/// then apply them with [`commit`](Self::commit).
+/// [`create_dataset`](Self::create_dataset) / [`create_group`](Self::create_group)
+/// and group attribute edits with [`set_group_attr`](Self::set_group_attr) /
+/// [`remove_group_attr`](Self::remove_group_attr), then apply them with
+/// [`commit`](Self::commit).
 ///
 /// # Example
 ///
 /// ```no_run
-/// use hdf5_pure::EditSession;
+/// use hdf5_pure::{AttrValue, EditSession};
 ///
 /// let mut session = EditSession::open("existing.h5")?;
 /// session.create_group("run2");
+/// session.set_group_attr("run2", "kind", AttrValue::AsciiString("trial".into()));
 /// session
 ///     .create_dataset("run2/signal")
 ///     .with_f64_data(&[1.0, 2.0, 3.0]);
@@ -161,6 +166,9 @@ pub struct EditSession {
     pending_datasets: Vec<(PathKey, DatasetBuilder)>,
     /// New groups staged by `create_group`, as full paths.
     pending_groups: Vec<PathKey>,
+    /// Group attribute edits staged as (group path, operation). The path may be
+    /// a group created in this same session.
+    pending_group_attrs: Vec<(PathKey, GroupAttrOp)>,
     /// Links staged for removal by `delete`, as full paths.
     pending_deletes: Vec<PathKey>,
     /// Object copies staged by `copy`, as (source path, destination full path).
@@ -235,6 +243,7 @@ impl EditSession {
             superblock,
             pending_datasets: Vec::new(),
             pending_groups: Vec::new(),
+            pending_group_attrs: Vec::new(),
             pending_deletes: Vec::new(),
             pending_copies: Vec::new(),
             free: FreeList::new(),
@@ -376,6 +385,42 @@ impl EditSession {
         self.pending_groups.push(split_path(path));
     }
 
+    /// Stage an attribute add or replacement on a group, applied on the next
+    /// [`commit`](Self::commit).
+    ///
+    /// `path` names the group to edit; `""` or `"/"` names the root group. The
+    /// group may already exist or may be created earlier in the same session
+    /// with [`create_group`](Self::create_group). Attributes are stored compactly
+    /// in the rebuilt group header; variable-length attributes and edits that
+    /// would exceed the compact-attribute limit are refused before any file
+    /// bytes are changed.
+    pub fn set_group_attr(&mut self, path: &str, name: &str, value: AttrValue) -> &mut Self {
+        self.pending_group_attrs.push((
+            split_path(path),
+            GroupAttrOp::Set {
+                name: name.to_string(),
+                value,
+            },
+        ));
+        self
+    }
+
+    /// Stage removal of a compact attribute from a group, applied on the next
+    /// [`commit`](Self::commit).
+    ///
+    /// `path` names the group to edit; `""` or `"/"` names the root group. The
+    /// named attribute must exist in the committed group state after any earlier
+    /// staged attribute operations for the same group have been applied.
+    pub fn remove_group_attr(&mut self, path: &str, name: &str) -> &mut Self {
+        self.pending_group_attrs.push((
+            split_path(path),
+            GroupAttrOp::Remove {
+                name: name.to_string(),
+            },
+        ));
+        self
+    }
+
     /// Stage removal of the link at `path` (the HDF5 `H5Ldelete`), applied on the
     /// next [`commit`](Self::commit). The link's object — and, for a group, its
     /// whole subtree — becomes unreachable. The bytes it occupied are returned to
@@ -427,6 +472,7 @@ impl EditSession {
     pub fn commit(&mut self) -> Result<(), Error> {
         if self.pending_datasets.is_empty()
             && self.pending_groups.is_empty()
+            && self.pending_group_attrs.is_empty()
             && self.pending_deletes.is_empty()
             && self.pending_copies.is_empty()
         {
@@ -440,6 +486,7 @@ impl EditSession {
         let mut nodes: BTreeMap<PathKey, Node> = BTreeMap::new();
         nodes.entry(PathKey::new()).or_default(); // root is always dirty
         let mut add_targets: Vec<PathKey> = Vec::new();
+        let mut attr_targets: Vec<PathKey> = Vec::new();
 
         // Mark explicitly-created new groups, ensuring their ancestor chain.
         for path in std::mem::take(&mut self.pending_groups) {
@@ -458,6 +505,15 @@ impl EditSession {
             add_targets.push(full);
             ensure_ancestors(&mut nodes, &parent);
             nodes.entry(parent).or_default().datasets.push(db);
+        }
+
+        // Stage group attribute edits against their target groups. A target may
+        // be a newly-created group from this same commit, but not a copied
+        // destination or a dataset being added in the same commit.
+        for (path, op) in std::mem::take(&mut self.pending_group_attrs) {
+            ensure_ancestors(&mut nodes, &path);
+            nodes.entry(path.clone()).or_default().attr_ops.push(op);
+            attr_targets.push(path);
         }
 
         // Stage copies: validate the source subtree is copyable (read-only),
@@ -516,6 +572,13 @@ impl EditSession {
                     ));
                 }
             }
+            for t in &attr_targets {
+                if is_prefix(d, t) {
+                    return Err(Error::EditUnsupported(
+                        "a deletion overlaps a group-attribute edit in the same commit; use separate commits",
+                    ));
+                }
+            }
             for (j, d2) in deletes.iter().enumerate() {
                 if i != j && is_prefix(d, d2) {
                     return Err(Error::EditUnsupported(
@@ -558,6 +621,18 @@ impl EditSession {
                 let node = nodes.get_mut(key).unwrap();
                 node.base_region = info.region;
                 node.existing_links = info.link_names;
+            }
+        }
+
+        // Apply and validate group attribute edits before any writes. This keeps
+        // unsupported attribute edits under the same all-or-nothing preflight
+        // contract as unsupported dataset additions.
+        for key in &keys {
+            let node = nodes.get_mut(key).unwrap();
+            let ops = std::mem::take(&mut node.attr_ops);
+            if !ops.is_empty() {
+                let region = std::mem::take(&mut node.base_region);
+                node.base_region = apply_group_attr_ops(&region, &ops)?;
             }
         }
 
@@ -1520,12 +1595,20 @@ impl EditSession {
 struct Node {
     is_new: bool,
     datasets: Vec<DatasetBuilder>,
+    /// Compact group-attribute operations to apply to this group.
+    attr_ops: Vec<GroupAttrOp>,
     /// Names of links to remove from this group (from `delete`).
     deletes: Vec<String>,
     /// Copies to add to this group: (new link name, source object-header addr).
     copies: Vec<(String, u64)>,
     base_region: Vec<u8>,
     existing_links: Vec<String>,
+}
+
+/// A staged compact attribute edit for a group.
+enum GroupAttrOp {
+    Set { name: String, value: AttrValue },
+    Remove { name: String },
 }
 
 /// A source object parsed for copying. Headers are reproduced from their
@@ -1803,6 +1886,147 @@ fn remove_link_from_region(region: &[u8], name: &str) -> Result<Vec<u8>, Error> 
         ));
     }
     Ok(out)
+}
+
+/// Apply compact attribute edits to a group message `region`, preserving every
+/// non-attribute message verbatim. The result is still a compact-attribute
+/// header; dense attribute storage and shared attribute messages are refused.
+fn apply_group_attr_ops(region: &[u8], ops: &[GroupAttrOp]) -> Result<Vec<u8>, Error> {
+    let mut out = region.to_vec();
+    let mut wrote_attr = false;
+    for op in ops {
+        out = match op {
+            GroupAttrOp::Set { name, value } => {
+                wrote_attr = true;
+                set_attr_in_region(&out, name, value)?
+            }
+            GroupAttrOp::Remove { name } => remove_attr_from_region(&out, name)?,
+        };
+    }
+    if wrote_attr && compact_attr_count(&out)? > MAX_COMPACT_ATTRS {
+        return Err(Error::EditUnsupported(
+            "group attributes would exceed compact storage; dense attribute edits are not supported in place yet",
+        ));
+    }
+    Ok(out)
+}
+
+/// Copy a message region, dropping all Attribute messages named `name` and then
+/// appending a fresh compact Attribute message for `value`.
+fn set_attr_in_region(region: &[u8], name: &str, value: &AttrValue) -> Result<Vec<u8>, Error> {
+    let new_msg = encode_attr_message(name, value)?;
+    let mut out = Vec::with_capacity(region.len() + new_msg.len());
+    let mut p = 0;
+    while let Some((msg_type, body, body_end)) = next_message(region, p)? {
+        match msg_type {
+            MessageType::AttributeInfo => {
+                return Err(Error::EditUnsupported(
+                    "a target group uses dense (fractal-heap) attribute storage (not supported in place yet)",
+                ));
+            }
+            MessageType::Attribute => {
+                let attr_name = parse_compact_attr_name(region, p, body, body_end)?;
+                if attr_name == name {
+                    p = body_end;
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        out.extend_from_slice(&region[p..body_end]);
+        p = body_end;
+    }
+    out.extend_from_slice(&new_msg);
+    if p < region.len() {
+        out.extend_from_slice(&region[p..]);
+    }
+    Ok(out)
+}
+
+/// Copy a message region, dropping all Attribute messages named `name`.
+fn remove_attr_from_region(region: &[u8], name: &str) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::with_capacity(region.len());
+    let mut p = 0;
+    let mut removed = false;
+    while let Some((msg_type, body, body_end)) = next_message(region, p)? {
+        let mut skip = false;
+        match msg_type {
+            MessageType::AttributeInfo => {
+                return Err(Error::EditUnsupported(
+                    "a target group uses dense (fractal-heap) attribute storage (not supported in place yet)",
+                ));
+            }
+            MessageType::Attribute => {
+                let attr_name = parse_compact_attr_name(region, p, body, body_end)?;
+                if attr_name == name {
+                    skip = true;
+                    removed = true;
+                }
+            }
+            _ => {}
+        }
+        if !skip {
+            out.extend_from_slice(&region[p..body_end]);
+        }
+        p = body_end;
+    }
+    if p < region.len() {
+        out.extend_from_slice(&region[p..]);
+    }
+    if !removed {
+        return Err(Error::EditUnsupported(
+            "group attribute to remove was not found",
+        ));
+    }
+    Ok(out)
+}
+
+fn compact_attr_count(region: &[u8]) -> Result<usize, Error> {
+    let mut count = 0usize;
+    let mut p = 0;
+    while let Some((msg_type, _body, body_end)) = next_message(region, p)? {
+        if msg_type == MessageType::AttributeInfo {
+            return Err(Error::EditUnsupported(
+                "a target group uses dense (fractal-heap) attribute storage (not supported in place yet)",
+            ));
+        }
+        if msg_type == MessageType::Attribute {
+            count += 1;
+        }
+        p = body_end;
+    }
+    Ok(count)
+}
+
+fn parse_compact_attr_name(
+    region: &[u8],
+    msg_start: usize,
+    body: usize,
+    body_end: usize,
+) -> Result<String, Error> {
+    if region[msg_start + 3] != 0 {
+        return Err(Error::EditUnsupported(
+            "a target group has a shared attribute message (not editable in place yet)",
+        ));
+    }
+    crate::attribute::AttributeMessage::parse(&region[body..body_end], LENGTH_SIZE)
+        .map(|attr| attr.name)
+        .map_err(|_| Error::EditUnsupported("a target group has an unreadable attribute message"))
+}
+
+fn encode_attr_message(name: &str, value: &AttrValue) -> Result<Vec<u8>, Error> {
+    if matches!(value, AttrValue::VarLenAsciiArray(_)) {
+        return Err(Error::EditUnsupported(
+            "variable-length group attributes cannot be edited in place yet",
+        ));
+    }
+    let body = build_attr_message(name, value).serialize(LENGTH_SIZE);
+    if body.len() > u16::MAX as usize {
+        return Err(Error::EditUnsupported(
+            "group attribute is too large to encode in place",
+        ));
+    }
+    Ok(region_message(MessageType::Attribute, &body))
 }
 
 /// Whether `a` is a path prefix of (or equal to) `b`.

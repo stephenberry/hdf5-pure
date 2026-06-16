@@ -16,7 +16,7 @@
 //! repointed, and the result is read back correctly by the C library.
 
 use hdf5::file::LibraryVersion;
-use hdf5_pure::{EditSession, File, FileBuilder};
+use hdf5_pure::{AttrValue, EditSession, File, FileBuilder};
 use tempfile::tempdir;
 
 /// Stage an add, an add-into-a-group, a delete, and a copy — the full op set.
@@ -338,6 +338,47 @@ fn c_v0_root_attributes_survive_conversion() {
         c.dataset("extra").unwrap().read_raw::<i32>().unwrap(),
         vec![9]
     );
+}
+
+#[test]
+fn c_library_reads_group_attributes_edited_in_place() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_group_attrs.h5");
+    let mut b = FileBuilder::new();
+    let mut g = b.create_group("grp");
+    g.set_attr("count", AttrValue::I64(1));
+    g.set_attr("drop", AttrValue::I64(9));
+    b.add_group(g.finish());
+    b.write(&path).unwrap();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.set_group_attr("grp", "count", AttrValue::I64(2));
+        session.set_group_attr("grp", "added", AttrValue::I64(3));
+        session.remove_group_attr("grp", "drop");
+        session.create_group("new_grp");
+        session.set_group_attr("new_grp", "tag", AttrValue::I64(55));
+        session.commit().unwrap();
+    }
+
+    let c = hdf5::File::open(&path).unwrap();
+    let grp = c.group("grp").unwrap();
+    let count: i64 = grp.attr("count").unwrap().read_scalar().unwrap();
+    let added: i64 = grp.attr("added").unwrap().read_scalar().unwrap();
+    assert_eq!(count, 2);
+    assert_eq!(added, 3);
+    assert!(
+        grp.attr("drop").is_err(),
+        "removed group attribute still present"
+    );
+    let tag: i64 = c
+        .group("new_grp")
+        .unwrap()
+        .attr("tag")
+        .unwrap()
+        .read_scalar()
+        .unwrap();
+    assert_eq!(tag, 55);
 }
 
 #[test]

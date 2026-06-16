@@ -57,14 +57,15 @@ println!("version: {:?}", attrs.get("version"));  // Some(I64(2))
 
 ### Editing in place
 
-`EditSession` opens an existing file and adds, deletes, or copies objects without reading it all in and rewriting it. New data and the rebuilt object headers are appended at the end of the file and the superblock is repointed last, so the cost is proportional to what changes and a failed commit leaves the file valid.
+`EditSession` opens an existing file and adds, deletes, or copies objects, or edits compact group attributes without reading it all in and rewriting it. New data and the rebuilt object headers are appended at the end of the file and the superblock is repointed last, so the cost is proportional to what changes and a failed commit leaves the file valid.
 
 ```rust,no_run
-use hdf5_pure::EditSession;
+use hdf5_pure::{AttrValue, EditSession};
 
 let mut session = EditSession::open("output.h5").unwrap();
 
 session.create_group("run2");
+session.set_group_attr("run2", "kind", AttrValue::AsciiString("trial".into()));
 session.create_dataset("run2/signal").with_f64_data(&[1.0, 2.0, 3.0]);
 session.copy("temperature", "temperature_backup");  // H5Ocopy
 session.delete("sensors/pressure");                 // H5Ldelete
