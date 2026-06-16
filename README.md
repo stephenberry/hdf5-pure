@@ -31,7 +31,7 @@ Runnable, self-checking examples live in [`examples/`](examples). Run any with `
 | `edit_in_place` | Add, copy, and delete objects with `EditSession` |
 | `repack` | Shrink a file and drop objects with `repack` |
 | `swmr` | Single-writer / multiple-reader append and refresh |
-| `file_space` | File-space strategy and persistent free-space tracking |
+| `file_space` | File-space strategy and persistent free-space reuse across sessions |
 
 The `matlab_fixtures` example (run with `--features serde`) writes `.mat` v7.3 files for verification in MATLAB/Octave.
 

@@ -48,6 +48,35 @@ jobs:
           key: ${{ matrix.os }}-${{ matrix.config.name }}
       - run: cargo test --locked ${{ matrix.config.flags }}
 
+  # Run every example end-to-end. The examples are self-checking (each ends in
+  # `assert!`s and panics on mismatch), so a regression in the public API surfaces
+  # here as a failed job. `cargo clippy --all-targets` in the `lint` job already
+  # compiles them; this additionally *executes* them (issue #71).
+  examples:
+    name: Examples (run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: examples
+      - name: Run every example
+        run: |
+          set -euo pipefail
+          # Enumerate example targets from cargo metadata so a newly added
+          # example is covered automatically (no hand-maintained list to drift).
+          # The feature set is the superset the examples need: `ndarray_io`
+          # requires `ndarray` and `matlab_fixtures` requires `serde`; the rest
+          # ignore the extra features.
+          examples=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[].targets[] | select(.kind[] == "example") | .name')
+          for ex in $examples; do
+            echo "::group::cargo run --example $ex"
+            cargo run --locked --features "serde ndarray" --example "$ex"
+            echo "::endgroup::"
+          done
+
   no-std-check:
     name: Check (no_std)
     runs-on: ubuntu-latest
