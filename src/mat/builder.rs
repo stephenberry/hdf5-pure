@@ -554,6 +554,10 @@ impl MatBuilder {
 
         // 2. Register the payload path; the resulting object id is 1-based.
         self.string_object_payload_paths.push(payload_path);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "1-based object id written into a 4-byte on-disk field; a MAT file never registers more than u32::MAX string objects"
+        )]
         let object_id = self.string_object_payload_paths.len() as u32;
 
         // 3. Emit the parent metadata dataset at the current scope.

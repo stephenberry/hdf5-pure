@@ -185,8 +185,20 @@ impl AttributeMessage {
         let mut buf = Vec::new();
         buf.push(version);
         buf.push(0); // flags
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "attribute name length is written into the 2-byte name-size field of the attribute message"
+        )]
         buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "serialized datatype length is written into the 2-byte datatype-size field of the attribute message"
+        )]
         buf.extend_from_slice(&(dt_bytes.len() as u16).to_le_bytes());
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "serialized dataspace length is written into the 2-byte dataspace-size field of the attribute message"
+        )]
         buf.extend_from_slice(&(ds_bytes.len() as u16).to_le_bytes());
         if version >= 3 {
             buf.push(0x00); // character set encoding: ASCII

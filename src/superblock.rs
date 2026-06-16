@@ -98,6 +98,10 @@ impl Superblock {
         buf.push(self.version);
         buf.push(self.offset_size);
         buf.push(self.length_size);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "consistency flags occupy the 1-byte file-consistency-flags field of the superblock"
+        )]
         buf.push(self.consistency_flags as u8);
         // base_address
         Self::write_offset(&mut buf, self.base_address, self.offset_size);
@@ -115,6 +119,10 @@ impl Superblock {
     }
 
     fn write_offset(buf: &mut Vec<u8>, val: u64, size: u8) {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "size is the offset byte width chosen to hold val, so each arm casts to a width that fits by construction"
+        )]
         match size {
             2 => buf.extend_from_slice(&(val as u16).to_le_bytes()),
             4 => buf.extend_from_slice(&(val as u32).to_le_bytes()),

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use crate::convert::TryToUsize;
 use crate::file_writer::AttrValue;
 use crate::mat::class::MatClass;
 use crate::mat::error::MatError;
@@ -57,7 +58,7 @@ fn read_dataset(ds: &Dataset<'_>) -> Result<MatValue, MatError> {
         // `Matrix<Complex*>` round-trips back to a 0×0 complex matrix
         // rather than collapsing to a numeric empty vec.
         if matches!(class, MatClass::Double | MatClass::Single) && is_complex_dtype(&dtype) {
-            return Ok(empty_complex_value(class, &shape));
+            return empty_complex_value(class, &shape);
         }
         // Empty numeric/char: produce an empty 1-D vec of the correct tag.
         return Ok(empty_value_for_class(class));
@@ -126,9 +127,9 @@ fn is_empty_attr(attrs: &HashMap<String, AttrValue>) -> bool {
 /// Build an empty `ComplexMatrix*` whose `(rows, cols)` matches the dataspace
 /// shape, so deserializing into `Matrix<Complex*>` recovers the original
 /// shape (0×0, 0×N, N×0) instead of collapsing to 1×0.
-fn empty_complex_value(class: MatClass, shape: &[u64]) -> MatValue {
-    let (rows, cols, _total) = shape_decomposition(shape);
-    match class {
+fn empty_complex_value(class: MatClass, shape: &[u64]) -> Result<MatValue, MatError> {
+    let (rows, cols, _total) = shape_decomposition(shape)?;
+    Ok(match class {
         MatClass::Double => MatValue::ComplexMatrix64 {
             rows,
             cols,
@@ -140,7 +141,7 @@ fn empty_complex_value(class: MatClass, shape: &[u64]) -> MatValue {
             pairs: Vec::new(),
         },
         _ => unreachable!("empty_complex_value called with non-float class"),
-    }
+    })
 }
 
 fn empty_value_for_class(class: MatClass) -> MatValue {
@@ -199,7 +200,7 @@ fn is_complex_dtype(dtype: &DType) -> bool {
 // ---------------------------------------------------------------------------
 
 fn read_numeric(ds: &Dataset<'_>, shape: &[u64], class: MatClass) -> Result<MatValue, MatError> {
-    let (rows, cols, total) = shape_decomposition(shape);
+    let (rows, cols, total) = shape_decomposition(shape)?;
 
     // For a single-element dataset we emit a Scalar of the appropriate class.
     if total == 1 {
@@ -234,25 +235,33 @@ fn read_numeric(ds: &Dataset<'_>, shape: &[u64], class: MatClass) -> Result<MatV
     })
 }
 
-fn shape_decomposition(shape: &[u64]) -> (usize, usize, usize) {
+fn shape_decomposition(shape: &[u64]) -> Result<(usize, usize, usize), MatError> {
     // HDF5 shape for MATLAB data is [cols, rows] (column-major storage of a
     // [rows, cols] matrix). For a 1-D variant like [1, N] or [N, 1], treat as
-    // a vector of length N.
-    match shape.len() {
+    // a vector of length N. The dimensions come from the file, so each is
+    // narrowed to `usize` through the checked conversion that errors (rather
+    // than truncating) if a dimension exceeds the platform's pointer width.
+    Ok(match shape.len() {
         0 => (1, 1, 1),
-        1 => (1, shape[0] as usize, shape[0] as usize),
+        1 => {
+            let n = shape[0].to_usize()?;
+            (1, n, n)
+        }
         2 => {
-            let cols_hdf5 = shape[0] as usize;
-            let rows_hdf5 = shape[1] as usize;
+            let cols_hdf5 = shape[0].to_usize()?;
+            let rows_hdf5 = shape[1].to_usize()?;
             // MATLAB matrix has rows = rows_hdf5, cols = cols_hdf5.
             let total = cols_hdf5 * rows_hdf5;
             (rows_hdf5, cols_hdf5, total)
         }
         _ => {
-            let total: usize = shape.iter().map(|&d| d as usize).product();
+            let mut total: usize = 1;
+            for &d in shape {
+                total *= d.to_usize()?;
+            }
             (1, total, total)
         }
-    }
+    })
 }
 
 fn read_all_elements(ds: &Dataset<'_>, class: MatClass) -> Result<NumVec, MatError> {
@@ -329,7 +338,7 @@ fn transpose_col_major_to_row_major(
 // ---------------------------------------------------------------------------
 
 fn read_complex(ds: &Dataset<'_>, shape: &[u64], class: MatClass) -> Result<MatValue, MatError> {
-    let (rows, cols, total) = shape_decomposition(shape);
+    let (rows, cols, total) = shape_decomposition(shape)?;
     let bytes = ds.read_u8().map_err(MatError::Hdf5)?;
 
     match class {

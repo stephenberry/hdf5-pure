@@ -58,6 +58,10 @@ pub fn partition(num_items: usize, num_lanes: usize, seed: u64) -> Vec<Vec<usize
 
     for idx in 0..num_items {
         let h = fxhash_combine(seed, idx as u64);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "h % num_lanes is in 0..num_lanes, which is itself a usize"
+        )]
         let lane = (h % num_lanes as u64) as usize;
         lanes[lane].push(idx);
     }

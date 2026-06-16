@@ -197,6 +197,10 @@ pub(crate) fn scale_offset_mode(cd_values: &[u32]) -> Option<ScaleOffset> {
     }
     match scale_type {
         SO_INT => Some(ScaleOffset::Integer(scale_factor)),
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "scale_factor is a small decimal scale factor (D-scale parameter); the reference treats it as a signed int"
+        )]
         SO_FLOAT_DSCALE => Some(ScaleOffset::FloatDScale(scale_factor as i32)),
         // SO_FLOAT_ESCALE (and anything unrecognized) is never written by this
         // crate and cannot be reproduced.
@@ -245,6 +249,10 @@ impl Parms {
                 "scaleoffset: bad byte order".to_string(),
             ));
         }
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "scale_factor is a small filter parameter (decimal scale factor or bit width); the reference stores it in a signed int"
+        )]
         Ok(Parms {
             scale_type: cd[PARM_SCALETYPE],
             scale_factor: cd[PARM_SCALEFACTOR] as i32,
@@ -278,6 +286,10 @@ pub fn decompress(input: &[u8], filter: &FilterDescription) -> Result<Vec<u8>, F
         ));
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "p.size is validated to 1..=8, so p.size * 8 is 8..=64 and fits in u32"
+    )]
     let full_bits = (p.size * 8) as u32;
     // `nelmts` is file-derived; `nelmts * size` is an allocation size and a
     // slice bound. The product is computed in `u64` (it cannot overflow there:
@@ -287,6 +299,10 @@ pub fn decompress(input: &[u8], filter: &FilterDescription) -> Result<Vec<u8>, F
 
     // No-op mode: integer (non-DSCALE) datasets created with scale_factor equal
     // to the full bit width store the chunk verbatim, with no header.
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "full_bits is 8..=64 (p.size is 1..=8), so it fits in a non-negative i32"
+    )]
     if p.scale_type != SO_FLOAT_DSCALE && p.scale_factor == full_bits as i32 {
         return Ok(input.to_vec());
     }
@@ -402,6 +418,10 @@ pub fn compress(input: &[u8], filter: &FilterDescription) -> Result<Vec<u8>, For
     }
 
     let signed = cd[PARM_SIGN] == SGN_2;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "p.size is validated to 1..=8, so p.size * 8 is 8..=64 and fits in u32"
+    )]
     let full_bits = (p.size * 8) as u32;
 
     let (minbits, minval, offsets) = if p.class == CLS_INTEGER {
@@ -452,6 +472,10 @@ fn precompress_integer(input: &[u8], p: &Parms, signed: bool) -> (u32, u64, Vec<
     // a Vec<i128>. The intermediate dominated cache pressure on large chunks
     // (16 B/element vs the source's 1-8 B/element); two cache-warm passes
     // come out ahead.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "p.size is validated to 1..=8, so p.size * 8 is 8..=64 and fits in u32"
+    )]
     let full_bits = (p.size * 8) as u32;
     let read_as_i128 = |i: usize| -> i128 {
         let bits = read_value(&input[i * p.size..(i + 1) * p.size], p.size, p.order);
@@ -474,6 +498,10 @@ fn precompress_integer(input: &[u8], p: &Parms, signed: bool) -> (u32, u64, Vec<
         }
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "min is an element value read from at most 8 bytes (p.size 1..=8), so it fits in i64/u64 despite the i128 accumulator type"
+    )]
     let minval = if signed {
         (min as i64) as u64
     } else {
@@ -488,11 +516,19 @@ fn precompress_integer(input: &[u8], p: &Parms, signed: bool) -> (u32, u64, Vec<
         return (full_bits, minval, Vec::new());
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the guard above returns early unless spread <= width_max - 2, and width_max <= u64::MAX, so spread fits in u64"
+    )]
     let minbits = ceil_log2((spread as u64) + 1);
     if minbits >= full_bits {
         return (full_bits, minval, Vec::new());
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "each offset (value - min) is at most spread <= width_max <= u64::MAX, so it fits in u64"
+    )]
     let offsets = (0..p.nelmts)
         .map(|i| (read_as_i128(i) - min) as u64)
         .collect();
@@ -520,10 +556,18 @@ fn reconstruct_float(
     // loop-invariant. The compiler won't hoist the inner `match p.size`
     // across both branches by itself.
     if p.size == 4 {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "size == 4 branch: minval holds a 4-byte f32 bit pattern in its low 32 bits, so narrowing to u32 reconstructs that pattern"
+        )]
         let min = f32::from_bits(minval as u32);
         let pow = pow10_f32(decimals);
         for _ in 0..p.nelmts {
             let d = reader.read(minbits);
+            #[expect(
+                clippy::cast_possible_wrap,
+                reason = "d is a minbits-wide offset (minbits < full_bits <= 64); reinterpreting it as i64 matches the reference's signed reconstruction"
+            )]
             let bits = if let Some(fv) = filval.filter(|_| d == sentinel) {
                 fv
             } else {
@@ -536,6 +580,10 @@ fn reconstruct_float(
         let pow = pow10_f64(decimals);
         for _ in 0..p.nelmts {
             let d = reader.read(minbits);
+            #[expect(
+                clippy::cast_possible_wrap,
+                reason = "d is a minbits-wide offset (minbits < full_bits <= 64); reinterpreting it as i64 matches the reference's signed reconstruction"
+            )]
             let bits = if let Some(fv) = filval.filter(|_| d == sentinel) {
                 fv
             } else {
@@ -553,8 +601,16 @@ fn precompress_float(input: &[u8], p: &Parms) -> (u32, u64, Vec<u64>) {
     // out of the per-element loop so we don't recompute the same product N
     // times — bit-identical to the previous `v * pow - min * pow`.
     let decimals = p.scale_factor;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "p.size is validated to 1..=8, so p.size * 8 is 8..=64 and fits in u32"
+    )]
     let full_bits = (p.size * 8) as u32;
     if p.size == 4 {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "read_value with size 4 returns a u64 whose meaningful bits are the low 32, so narrowing to u32 reconstructs the f32 bit pattern"
+        )]
         let read_f32 = |i: usize| -> f32 {
             f32::from_bits(read_value(&input[i * 4..i * 4 + 4], 4, p.order) as u32)
         };
@@ -691,15 +747,31 @@ fn pack_offsets(offsets: &[u64], minbits: u32, nelmts: usize) -> Result<Vec<u8>,
         let combined = ((acc as u128) << minbits) | (v & mask) as u128;
         let total = nbits + minbits;
         if total <= 64 {
-            acc = combined as u64;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "this branch is guarded by total <= 64, and combined occupies exactly `total` bits, so it fits in u64"
+            )]
+            {
+                acc = combined as u64;
+            }
             nbits = total;
         } else {
             // The merged value spans more than a u64; emit 8 bytes from the
             // top and keep the spillover (always 1..=7 bits) for next round.
             let drop = total - 64;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "combined >> drop keeps the high 64 bits of a (64 + drop)-bit value, which fits in u64"
+            )]
             let top = (combined >> drop) as u64;
             buf.extend_from_slice(&top.to_be_bytes());
-            acc = (combined & ((1u128 << drop) - 1)) as u64;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "combined & ((1 << drop) - 1) masks to the low `drop` bits (drop is 1..=7 here), which fits in u64"
+            )]
+            {
+                acc = (combined & ((1u128 << drop) - 1)) as u64;
+            }
             nbits = drop;
         }
     }
@@ -743,6 +815,10 @@ impl<'a> BitReader<'a> {
     fn read(&mut self, minbits: u32) -> u64 {
         debug_assert!((1..=64).contains(&minbits));
         let byte = self.bit_pos >> 3;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "bit_pos & 7 masks to 0..=7, which trivially fits in u32"
+        )]
         let off = (self.bit_pos & 7) as u32;
 
         // Load a 72-bit window at `byte`. Hot path: payload has ≥ 9 bytes
@@ -815,6 +891,10 @@ fn write_value(out: &mut Vec<u8>, bits: u64, size: usize, order: u32) {
     }
 }
 
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "size >= 8: reinterpreting all 64 stored bits as i64 is the intentional sign reinterpretation of a full-width value; size < 8: ((bits << shift) as i64) >> shift sign-extends the `size`-byte value, an intentional wrap"
+)]
 fn sign_extend(bits: u64, size: usize) -> i64 {
     if size >= 8 {
         bits as i64
@@ -868,12 +948,20 @@ fn pow10_f64(exp: i32) -> f64 {
 }
 
 /// `10^exp` as `f32` (computed in `f64` for accuracy, then narrowed).
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "narrowing 10^exp from f64 to f32 is the intended value conversion; out-of-range magnitudes saturate to +/-inf, matching the C reference"
+)]
 fn pow10_f32(exp: i32) -> f32 {
     pow10_f64(exp) as f32
 }
 
 /// Round half away from zero to the nearest integer, matching C `llround`.
 /// Float-to-int `as` casts saturate in Rust, so out-of-range inputs are safe.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "float-to-int `as` saturates in Rust, so rounding x +/- 0.5 to i64 is safe even for out-of-range inputs (matches C llround)"
+)]
 fn round_half_away_f64(x: f64) -> i64 {
     if x >= 0.0 {
         (x + 0.5) as i64
@@ -883,6 +971,10 @@ fn round_half_away_f64(x: f64) -> i64 {
 }
 
 /// `f32` counterpart of [`round_half_away_f64`] (matches C `lroundf`).
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "float-to-int `as` saturates in Rust, so rounding x +/- 0.5 to i64 is safe even for out-of-range inputs (matches C lroundf)"
+)]
 fn round_half_away_f32(x: f32) -> i64 {
     if x >= 0.0 {
         (x + 0.5) as i64

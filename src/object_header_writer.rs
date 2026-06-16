@@ -56,6 +56,10 @@ impl ObjectHeaderWriter {
         // flags
         buf.push(flags);
         // chunk0 size
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "chunk_size_width is the byte width chosen to hold msg_bytes_total, so each arm casts to a width that fits by construction"
+        )]
         match chunk_size_width {
             1 => buf.push(msg_bytes_total as u8),
             2 => buf.extend_from_slice(&(msg_bytes_total as u16).to_le_bytes()),
@@ -65,7 +69,15 @@ impl ObjectHeaderWriter {
 
         // Messages
         for (msg_type, data, msg_flags) in &self.messages {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "message type id is a small enum value written into the 1-byte message-type field of the v2 object header"
+            )]
             buf.push(msg_type.to_u16() as u8); // type (1 byte in v2)
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "message data length is written into the 2-byte message-size field of the v2 object header"
+            )]
             buf.extend_from_slice(&(data.len() as u16).to_le_bytes()); // size (2 bytes)
             buf.push(*msg_flags); // flags
             buf.extend_from_slice(data);

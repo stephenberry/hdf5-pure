@@ -722,6 +722,11 @@ impl EditSession {
 
             // Deep-copy each source subtree and link its root into this group.
             for (leaf, src_addr) in copies {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "src_addr is an offset into self.data, the in-memory file image \
+                              (a Vec<u8>), so it always fits usize on the running target"
+                )]
                 let root = self.perform_copy(src_addr as usize, 0)?;
                 region.extend_from_slice(&encode_link_message(&leaf, root));
             }
@@ -816,6 +821,11 @@ impl EditSession {
         // could advertise an end-of-file past the actual file length.
         if let Some(cut) = trunc_to {
             self.handle.set_len(cut).map_err(Error::Io)?;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "cut is a shrink target <= the current file length, which equals \
+                          self.data.len() (a usize)"
+            )]
             self.data.truncate(cut as usize);
             self.handle.sync_all().map_err(Error::Io)?;
         }
@@ -1183,7 +1193,16 @@ impl EditSession {
                 }
                 // Re-wrap the attribute message body (it is self-describing) in a
                 // v2 message record.
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "message type ids are a small enum that fits the 1-byte v2 type field"
+                )]
                 region.push(MessageType::Attribute.to_u16() as u8);
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "attribute body length fits the 2-byte message-size field (oversized \
+                              bodies are rejected above)"
+                )]
                 region.extend_from_slice(&(m.data.len() as u16).to_le_bytes());
                 region.push(0); // message flags
                 region.extend_from_slice(&m.data);
@@ -1742,6 +1761,10 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
         } else {
             DataspaceType::Simple
         },
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "dataspace rank fits the 1-byte dimensionality field (HDF5 caps rank at 32)"
+        )]
         rank: shape.len() as u8,
         dimensions: shape,
         max_dimensions: None,
@@ -1775,7 +1798,15 @@ const GROUP_INFO_BODY: [u8; 2] = [0, 0];
 /// bodies are fixed and short.
 fn region_message(msg_type: MessageType, body: &[u8]) -> Vec<u8> {
     let mut m = Vec::with_capacity(4 + body.len());
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "message type ids are a small enum that fits the 1-byte v2 type field"
+    )]
     m.push(msg_type.to_u16() as u8);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "callers pass bodies that fit the 2-byte message-size field (see doc comment)"
+    )]
     m.extend_from_slice(&(body.len() as u16).to_le_bytes());
     m.push(0); // message flags
     m.extend_from_slice(body);
@@ -2069,6 +2100,10 @@ fn build_v2_object_header(region: &[u8]) -> Vec<u8> {
     buf.extend_from_slice(b"OHDR");
     buf.push(2); // version
     buf.push(flags);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "width was selected just above to be the smallest field that holds total"
+    )]
     match width {
         1 => buf.push(total as u8),
         2 => buf.extend_from_slice(&(total as u16).to_le_bytes()),
@@ -2081,6 +2116,11 @@ fn build_v2_object_header(region: &[u8]) -> Vec<u8> {
 }
 
 /// Read a little-endian unsigned integer of `bytes.len()` (≤ 8) bytes.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "callers parse in-file sizes/offsets bounded by the in-memory image; downstream \
+              slicing is length-checked, so a malformed oversized field errors rather than reads OOB"
+)]
 fn read_le(bytes: &[u8]) -> usize {
     let mut v = 0u64;
     for (i, &b) in bytes.iter().enumerate() {

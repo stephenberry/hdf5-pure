@@ -64,6 +64,11 @@ fn read_u32_le(data: &[u8], offset: usize) -> u32 {
 
 fn hashlittle(data: &[u8], initval: u32) -> u32 {
     let length = data.len();
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "lookup3 seeds the mix with length mod 2^32 by definition; matching the \
+                  reference (uint32_t) cast keeps checksums identical to the HDF5 C library"
+    )]
     let mut a: u32 = 0xdeadbeefu32
         .wrapping_add(length as u32)
         .wrapping_add(initval);

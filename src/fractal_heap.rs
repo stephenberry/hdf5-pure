@@ -411,6 +411,10 @@ impl FractalHeapHeader {
         };
         let heap_offset = combined & offset_mask;
 
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "payload is a single managed-object heap entry; its bit length fits u32"
+        )]
         let total_payload_bits = (payload.len() as u32) * 8;
         let length_bits = total_payload_bits.saturating_sub(offset_bits);
         let length_val = if length_bits == 0 {
@@ -645,6 +649,11 @@ impl FractalHeapHeader {
                 if !is_undefined(child_addr, offset_size) {
                     let block_end = current_heap_offset.saturating_add(total_child_space);
                     if target_offset >= current_heap_offset && target_offset < block_end {
+                        #[expect(
+                            clippy::cast_possible_truncation,
+                            reason = "fractal-heap row count is log-scale (bounded by \
+                                      max_heap_size bits), so it fits u16"
+                        )]
                         return Ok(Some(HeapChild::Indirect {
                             addr: child_addr,
                             nrows: child_nrows as u16,

@@ -398,6 +398,13 @@ fn parse_internal_child_pointers(
     for _ in 0..num_children {
         let addr = read_offset(node, pos, offset_size)?;
         pos += offset_size as usize;
+        // `read_var_uint` returns a value spanning `nrec_width` bytes, and
+        // `max_nrec_size` is sized to the node's record capacity, which the v2
+        // b-tree format keeps within a 2-byte field — so the count fits `u16`.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "records-per-node fits max_nrec_size (<= 2 bytes for valid files)"
+        )]
         let child_nrec = read_var_uint(node, pos, nrec_width)? as u16;
         pos += nrec_width;
         pos += total_nrec_width; // skip total-records-in-subtree

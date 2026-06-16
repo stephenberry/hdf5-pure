@@ -647,8 +647,16 @@ fn matrix_from_fields(fields: MatrixFields, kind: MatrixKind) -> Result<MatValue
 
 fn expect_usize(v: MatValue, field: &str) -> Result<usize, MatError> {
     match v {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "serde scalar accessor; conversion of a user-level MAT scalar (e.g. a Matrix rows/cols field) to usize, not a file-derived size"
+        )]
         MatValue::Scalar(ScalarNum::U64(x)) => Ok(x as usize),
         MatValue::Scalar(ScalarNum::U32(x)) => Ok(x as usize),
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the `x >= 0` guard keeps the I64 non-negative; serde scalar accessor converting a user-level MAT scalar to usize, not a file-derived size"
+        )]
         MatValue::Scalar(ScalarNum::I64(x)) if x >= 0 => Ok(x as usize),
         MatValue::Scalar(ScalarNum::I32(x)) if x >= 0 => Ok(x as usize),
         MatValue::Scalar(ScalarNum::U16(x)) => Ok(x as usize),
@@ -674,6 +682,10 @@ fn expect_f64(v: MatValue) -> Result<f64, MatError> {
 fn expect_f32(v: MatValue) -> Result<f32, MatError> {
     match v {
         MatValue::Scalar(ScalarNum::F32(x)) => Ok(x),
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "coercing a user-supplied F64 complex field to the requested f32; lossy float narrowing is the intended conversion"
+        )]
         MatValue::Scalar(ScalarNum::F64(x)) => Ok(x as f32),
         other => Err(MatError::Custom(format!(
             "Complex field must be f32, got {}",

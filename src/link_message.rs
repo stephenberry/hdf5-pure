@@ -135,6 +135,13 @@ impl LinkMessage {
             });
         }
 
+        // `name_size_width` was chosen above (1/2/4 bytes) to be the smallest
+        // field that holds `name_len`, so each arm's narrowing matches a width
+        // already proven to fit the value.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "name_size_width selected above to fit name_len"
+        )]
         match name_size_width {
             1 => buf.push(name_len as u8),
             2 => buf.extend_from_slice(&(name_len as u16).to_le_bytes()),
@@ -146,14 +153,27 @@ impl LinkMessage {
         match &self.link_target {
             LinkTarget::Hard {
                 object_header_address,
-            } => match offset_size {
-                2 => buf.extend_from_slice(&(*object_header_address as u16).to_le_bytes()),
-                4 => buf.extend_from_slice(&(*object_header_address as u32).to_le_bytes()),
-                8 => buf.extend_from_slice(&object_header_address.to_le_bytes()),
-                _ => {}
-            },
+            } =>
+            {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "offset_size is the file's on-disk address width; each arm \
+                              narrows to the width chosen to hold object header addresses"
+                )]
+                match offset_size {
+                    2 => buf.extend_from_slice(&(*object_header_address as u16).to_le_bytes()),
+                    4 => buf.extend_from_slice(&(*object_header_address as u32).to_le_bytes()),
+                    8 => buf.extend_from_slice(&object_header_address.to_le_bytes()),
+                    _ => {}
+                }
+            }
             LinkTarget::Soft { target_path } => {
                 let path_bytes = target_path.as_bytes();
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "soft-link length prefix is a 2-byte on-disk field; target \
+                              paths are bounded by that HDF5 format limit"
+                )]
                 buf.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
                 buf.extend_from_slice(path_bytes);
             }
@@ -167,6 +187,11 @@ impl LinkMessage {
                 ext_data.push(0);
                 ext_data.extend_from_slice(object_path.as_bytes());
                 ext_data.push(0);
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "external-link length prefix is a 2-byte on-disk field; the \
+                              filename + object path are bounded by that HDF5 format limit"
+                )]
                 buf.extend_from_slice(&(ext_data.len() as u16).to_le_bytes());
                 buf.extend_from_slice(&ext_data);
             }

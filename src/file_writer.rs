@@ -209,6 +209,11 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     let dblock_addr = frhp_addr + frhp_size as u64;
     let btree_addr = dblock_addr + starting_block_size;
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "starting_block_size is a fractal-heap direct-block size (KiB-scale heap \
+                  geometry), so it fits usize on every supported target"
+    )]
     let data_space = starting_block_size as usize - dblock_header_size;
     let free_space = data_space - total_data_size;
 
@@ -219,6 +224,11 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     frhp.extend_from_slice(&heap_id_length.to_le_bytes());
     frhp.extend_from_slice(&0u16.to_le_bytes()); // io_filter_encoded_length
     frhp.push(0x02); // flags: bit 1 = checksum direct blocks
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "max_direct_block_size and the header size are KiB-scale heap geometry that \
+                  fit the 4-byte max-managed-object-size field"
+    )]
     let max_managed = max_direct_block_size as u32 - dblock_header_size as u32;
     frhp.extend_from_slice(&max_managed.to_le_bytes());
     write_length(&mut frhp, 0, LENGTH_SIZE); // next_huge_object_id
@@ -246,6 +256,10 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     debug_assert_eq!(frhp.len(), frhp_size);
 
     // Build direct block: header (with checksum) + data + padding
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "starting_block_size is a KiB-scale heap direct-block size that fits usize"
+    )]
     let mut dblock = Vec::with_capacity(starting_block_size as usize);
     dblock.extend_from_slice(b"FHDB");
     dblock.push(0); // version
@@ -264,12 +278,16 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     }
 
     // Pad to full block size
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "starting_block_size is a KiB-scale heap direct-block size that fits usize"
+    )]
     dblock.resize(starting_block_size as usize, 0);
 
     // Checksum: computed over entire block with checksum field zeroed
     let dblock_checksum = crate::checksum::jenkins_lookup3(&dblock);
     dblock[cksum_pos..cksum_pos + 4].copy_from_slice(&dblock_checksum.to_le_bytes());
-    debug_assert_eq!(dblock.len(), starting_block_size as usize);
+    debug_assert_eq!(dblock.len() as u64, starting_block_size);
 
     // Build heap IDs
     let heap_ids: Vec<Vec<u8>> = attr_offsets
@@ -280,6 +298,10 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     // Build B-tree v2 type 8 records (17 bytes each)
     let record_size: u16 = heap_id_length + 1 + 4 + 4;
     let mut records: Vec<(u32, u32, Vec<u8>)> = Vec::with_capacity(attrs.len());
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "i is an attribute index bounded by the attribute count, far below u32::MAX"
+    )]
     for (i, heap_id) in heap_ids.iter().enumerate() {
         let mut rec = Vec::with_capacity(record_size as usize);
         rec.extend_from_slice(heap_id);
@@ -293,6 +315,11 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     let bthd_size = 4 + 1 + 1 + 4 + 2 + 2 + 1 + 1 + os + 2 + ls + 4;
     let num_records = attrs.len();
     let btlf_size = 4 + 1 + 1 + (num_records * record_size as usize) + 4;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "b-tree leaf node size is a small power of two (>= 512) written into the \
+                  4-byte node-size field"
+    )]
     let node_size = btlf_size.next_power_of_two().max(512) as u32;
 
     let bthd_addr = btree_addr;
@@ -308,6 +335,10 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     bthd.push(100); // split_percent
     bthd.push(40); // merge_percent
     write_offset(&mut bthd, btlf_addr, OFFSET_SIZE);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "record count is written into the 2-byte number-of-records field"
+    )]
     bthd.extend_from_slice(&(num_records as u16).to_le_bytes());
     write_length(&mut bthd, num_records as u64, LENGTH_SIZE);
     let bthd_checksum = crate::checksum::jenkins_lookup3(&bthd);
@@ -363,6 +394,10 @@ fn serialize_attribute_info(fh_addr: u64, btree_name_addr: u64) -> Vec<u8> {
 }
 
 fn write_offset(buf: &mut Vec<u8>, val: u64, offset_size: u8) {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "each arm narrows to offset_size, the on-disk address width chosen for this file"
+    )]
     match offset_size {
         2 => buf.extend_from_slice(&(val as u16).to_le_bytes()),
         4 => buf.extend_from_slice(&(val as u32).to_le_bytes()),
@@ -594,6 +629,10 @@ impl FileWriter {
             if !is_empty && elem_size > 0 {
                 let expected = shape.iter().product::<u64>().saturating_mul(elem_size);
                 if raw.len() as u64 != expected {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "byte counts reported in a shape-mismatch error; display-only"
+                    )]
                     return Err(FormatError::ShapeDataMismatch {
                         expected: expected as usize,
                         actual: raw.len(),
@@ -608,6 +647,11 @@ impl FileWriter {
                 } else {
                     DataspaceType::Simple
                 },
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "dataspace rank fits the 1-byte dimensionality field (HDF5 caps \
+                              rank at 32)"
+                )]
                 rank: shape.len() as u8,
                 dimensions: shape,
                 max_dimensions,
@@ -833,6 +877,11 @@ impl FileWriter {
         // Pass 2: compute real addresses.
         // All addresses stored in the file are relative to base_address.
         // base_address = userblock_size. cursor2 tracks relative positions.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "userblock_size is a small power-of-two header size used as an in-memory \
+                      buffer offset; it fits usize on every supported target"
+        )]
         let ub = self.userblock_size as usize;
         let root_group_addr = SUPERBLOCK_SIZE as u64;
         let mut cursor2 = SUPERBLOCK_SIZE + root_oh_size;
@@ -1016,7 +1065,14 @@ impl FileWriter {
                     gcol_cursor += patch.collection_bytes.len() as u64;
                 }
             }
-            gcol_total_size = (gcol_cursor - cursor2 as u64) as usize;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "global-heap total size is an in-memory output span bounded by \
+                          addressable memory on the target"
+            )]
+            {
+                gcol_total_size = (gcol_cursor - cursor2 as u64) as usize;
+            }
         }
 
         // Build dataset OHs now that attrs are patched.
@@ -1059,6 +1115,11 @@ impl FileWriter {
 
         // eof_address is absolute file size (includes userblock + GCOLs + ext)
         let eof_addr2 = (ub + cursor2 + gcol_total_size + ext_len) as u64;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "capacity for the output buffer; eof_addr2 is the size of a file being \
+                      built in memory, so it fits usize on the running target"
+        )]
         let mut buf = Vec::with_capacity(eof_addr2 as usize);
 
         // Userblock: prepend zeros
@@ -1155,8 +1216,8 @@ impl FileWriter {
         // Superblock extension (File Space Info), at the address recorded above.
         if let Some(bytes) = &ext_oh {
             debug_assert_eq!(
-                buf.len(),
-                ub + ext_addr.unwrap() as usize,
+                buf.len() as u64,
+                ub as u64 + ext_addr.unwrap(),
                 "extension header must land at its recorded base-relative address"
             );
             buf.extend_from_slice(bytes);

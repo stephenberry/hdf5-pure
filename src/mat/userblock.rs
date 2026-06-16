@@ -18,7 +18,7 @@ pub const DEFAULT_DESCRIPTION: &str = "MATLAB 7.3 MAT-file, Platform: hdf5-pure 
 /// untouched (zeros from `FileBuilder::with_userblock(512)`).
 pub fn write_header(file_bytes: &mut [u8], description: &str) {
     assert!(
-        file_bytes.len() >= USERBLOCK_SIZE as usize,
+        file_bytes.len() as u64 >= USERBLOCK_SIZE,
         "userblock requires at least 512 bytes, got {}",
         file_bytes.len()
     );
@@ -52,7 +52,7 @@ pub fn write_header(file_bytes: &mut [u8], description: &str) {
 /// Verify the bytes look like a MATLAB v7.3 userblock. Returns `Ok(())` on
 /// success.
 pub fn verify_header(file_bytes: &[u8]) -> Result<(), &'static str> {
-    if file_bytes.len() < USERBLOCK_SIZE as usize {
+    if (file_bytes.len() as u64) < USERBLOCK_SIZE {
         return Err("file too short for MAT v7.3 userblock");
     }
     if !file_bytes[..6].eq_ignore_ascii_case(b"MATLAB") {

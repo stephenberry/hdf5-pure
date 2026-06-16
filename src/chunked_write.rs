@@ -244,17 +244,35 @@ pub fn split_into_chunks(
     // Dataset strides (row-major)
     let mut ds_strides = vec![1usize; rank];
     for i in (0..rank.saturating_sub(1)).rev() {
-        ds_strides[i] = ds_strides[i + 1] * shape[i + 1] as usize;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "dataset dimension derived from the in-memory write request; bounded by addressable memory"
+        )]
+        let dim = shape[i + 1] as usize;
+        ds_strides[i] = ds_strides[i + 1] * dim;
     }
 
     // Chunk strides
     let mut chunk_strides = vec![1usize; rank];
     for i in (0..rank.saturating_sub(1)).rev() {
-        chunk_strides[i] = chunk_strides[i + 1] * chunk_dims[i + 1] as usize;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "chunk dimension derived from the in-memory write request; bounded by addressable memory"
+        )]
+        let dim = chunk_dims[i + 1] as usize;
+        chunk_strides[i] = chunk_strides[i + 1] * dim;
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "chunk dimensions derived from the in-memory write request; bounded by addressable memory"
+    )]
     let chunk_total_elements: usize = chunk_dims.iter().map(|&d| d as usize).product();
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "total_chunks derived from the in-memory write request; bounded by addressable memory"
+    )]
     let mut result = Vec::with_capacity(total_chunks as usize);
 
     for linear_idx in 0..total_chunks {
@@ -283,8 +301,17 @@ pub fn split_into_chunks(
                 let coord_in_chunk = remaining_idx / chunk_strides[d];
                 remaining_idx %= chunk_strides[d];
 
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "chunk offset derived from the in-memory write request; bounded by addressable memory"
+                )]
                 let global_coord = offsets[d] as usize + coord_in_chunk;
-                if global_coord >= shape[d] as usize {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "dataset dimension derived from the in-memory write request; bounded by addressable memory"
+                )]
+                let dim_extent = shape[d] as usize;
+                if global_coord >= dim_extent {
                     out_of_bounds = true;
                     break;
                 }
@@ -329,6 +356,10 @@ fn serialize_v4_single_chunk(
     buf.push(flags);
 
     // dimensionality = rank + 1 (chunk dims + element size dim)
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "rank written into the 1-byte dimensionality field selected for this file"
+    )]
     let ndims = chunk_dims.len() as u8 + 1;
     buf.push(ndims);
 
@@ -351,6 +382,10 @@ fn serialize_v4_single_chunk(
 
     // dimension sizes (chunk dims + element size)
     for &d in chunk_dims {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "dimension written into the on-disk encoding width selected for this file"
+        )]
         match dim_encoded_len {
             1 => buf.push(d as u8),
             2 => buf.extend_from_slice(&(d as u16).to_le_bytes()),
@@ -359,6 +394,10 @@ fn serialize_v4_single_chunk(
         }
     }
     // Element size dimension
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "element size written into the on-disk encoding width selected for this file"
+    )]
     match dim_encoded_len {
         1 => buf.push(element_size as u8),
         2 => buf.extend_from_slice(&(element_size as u16).to_le_bytes()),
@@ -377,6 +416,10 @@ fn serialize_v4_single_chunk(
     }
 
     // chunk address
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "chunk address written into the on-disk offset width selected for this file"
+    )]
     match offset_size {
         4 => buf.extend_from_slice(&(chunk_address as u32).to_le_bytes()),
         8 => buf.extend_from_slice(&chunk_address.to_le_bytes()),
@@ -401,6 +444,10 @@ fn serialize_v4_fixed_array(
     let flags: u8 = 0x00;
     buf.push(flags);
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "rank written into the 1-byte dimensionality field selected for this file"
+    )]
     let ndims = chunk_dims.len() as u8 + 1;
     buf.push(ndims);
 
@@ -420,6 +467,10 @@ fn serialize_v4_fixed_array(
     buf.push(dim_encoded_len);
 
     for &d in chunk_dims {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "dimension written into the on-disk encoding width selected for this file"
+        )]
         match dim_encoded_len {
             1 => buf.push(d as u8),
             2 => buf.extend_from_slice(&(d as u16).to_le_bytes()),
@@ -427,6 +478,10 @@ fn serialize_v4_fixed_array(
             _ => {}
         }
     }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "element size written into the on-disk encoding width selected for this file"
+    )]
     match dim_encoded_len {
         1 => buf.push(element_size as u8),
         2 => buf.extend_from_slice(&(element_size as u16).to_le_bytes()),
@@ -441,6 +496,10 @@ fn serialize_v4_fixed_array(
     buf.push(max_bits);
 
     // Fixed Array header address
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "fixed array header address written into the on-disk offset width selected for this file"
+    )]
     match offset_size {
         4 => buf.extend_from_slice(&(fixed_array_address as u32).to_le_bytes()),
         8 => buf.extend_from_slice(&fixed_array_address.to_le_bytes()),
@@ -496,17 +555,29 @@ pub fn build_fixed_array_at(
     fahd.extend_from_slice(b"FAHD");
     fahd.push(0); // version
     fahd.push(client_id);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "element record size written into the 1-byte FAHD field selected for this file"
+    )]
     fahd.push(elem_size as u8);
 
     let max_bits = FIXED_ARRAY_PAGE_BITS;
     fahd.push(max_bits);
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "element count written into the on-disk length width selected for this file"
+    )]
     match length_size {
         4 => fahd.extend_from_slice(&(num_elements as u32).to_le_bytes()),
         8 => fahd.extend_from_slice(&(num_elements as u64).to_le_bytes()),
         _ => fahd.extend_from_slice(&(num_elements as u64).to_le_bytes()),
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "FADB address written into the on-disk offset width selected for this file"
+    )]
     match offset_size {
         4 => fahd.extend_from_slice(&(fadb_address as u32).to_le_bytes()),
         8 => fahd.extend_from_slice(&fadb_address.to_le_bytes()),
@@ -521,6 +592,10 @@ pub fn build_fixed_array_at(
 
     // Append one element record (chunk address, plus filtered size + mask).
     let write_element = |buf: &mut Vec<u8>, chunk: &WrittenChunk| {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "chunk address written into the on-disk offset width selected for this file"
+        )]
         match offset_size {
             4 => buf.extend_from_slice(&(chunk.address as u32).to_le_bytes()),
             _ => buf.extend_from_slice(&chunk.address.to_le_bytes()),
@@ -538,6 +613,10 @@ pub fn build_fixed_array_at(
     fadb.extend_from_slice(b"FADB");
     fadb.push(0); // version
     fadb.push(client_id);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "fixed array base address written into the on-disk offset width selected for this file"
+    )]
     match offset_size {
         4 => fadb.extend_from_slice(&(fa_base_address as u32).to_le_bytes()),
         _ => fadb.extend_from_slice(&fa_base_address.to_le_bytes()),
@@ -596,6 +675,10 @@ fn serialize_v4_extensible_array(
     buf.push(2); // class = chunked
     buf.push(0x00); // flags
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "rank written into the 1-byte dimensionality field selected for this file"
+    )]
     let ndims = chunk_dims.len() as u8 + 1;
     buf.push(ndims);
 
@@ -615,6 +698,10 @@ fn serialize_v4_extensible_array(
     buf.push(dim_encoded_len);
 
     for &d in chunk_dims {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "dimension written into the on-disk encoding width selected for this file"
+        )]
         match dim_encoded_len {
             1 => buf.push(d as u8),
             2 => buf.extend_from_slice(&(d as u16).to_le_bytes()),
@@ -622,6 +709,10 @@ fn serialize_v4_extensible_array(
             _ => {}
         }
     }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "element size written into the on-disk encoding width selected for this file"
+    )]
     match dim_encoded_len {
         1 => buf.push(element_size as u8),
         2 => buf.extend_from_slice(&(element_size as u16).to_le_bytes()),
@@ -640,6 +731,10 @@ fn serialize_v4_extensible_array(
     buf.push(10); // max_dblk_page_nelmts_bits
 
     // EA header address
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "extensible array header address written into the on-disk offset width selected for this file"
+    )]
     match offset_size {
         4 => buf.extend_from_slice(&(ea_address as u32).to_le_bytes()),
         8 => buf.extend_from_slice(&ea_address.to_le_bytes()),
@@ -651,6 +746,10 @@ fn serialize_v4_extensible_array(
 
 /// Write an offset-sized address (little-endian) to `buf`.
 pub(crate) fn write_ea_addr(buf: &mut Vec<u8>, val: u64, offset_size: u8) {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "address written into the on-disk offset width selected for this file"
+    )]
     match offset_size {
         4 => buf.extend_from_slice(&(val as u32).to_le_bytes()),
         _ => buf.extend_from_slice(&val.to_le_bytes()),
@@ -806,7 +905,12 @@ pub(crate) fn eadb_size(
 ) -> u64 {
     let prefix = 4 + 1 + 1 + offset_size as usize + blk_off_size;
     if dblk_nelmts <= page_nelmts {
-        (prefix + dblk_nelmts as usize * elem_size + 4) as u64
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "data block element count derived from the in-memory write request; bounded by addressable memory"
+        )]
+        let nelmts = dblk_nelmts as usize;
+        (prefix + nelmts * elem_size + 4) as u64
     } else {
         // Paged: header carries its own checksum, then full pages follow.
         let npages = dblk_nelmts / page_nelmts;
@@ -825,13 +929,22 @@ pub(crate) fn aesb_size(
     blk_off_size: usize,
 ) -> u64 {
     let os = offset_size as usize;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "data block and page counts derived from the in-memory write request; bounded by addressable memory"
+    )]
     let bitmap = if dblk_nelmts > page_nelmts {
         let npages = dblk_nelmts / page_nelmts;
         ndblks as usize * npages.div_ceil(8) as usize
     } else {
         0
     };
-    (4 + 1 + 1 + os + blk_off_size + bitmap + ndblks as usize * os + 4) as u64
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "data block count derived from the in-memory write request; bounded by addressable memory"
+    )]
+    let ndblks_usize = ndblks as usize;
+    (4 + 1 + 1 + os + blk_off_size + bitmap + ndblks_usize * os + 4) as u64
 }
 
 /// Compute the six Extensible Array header statistics for an array holding
@@ -937,6 +1050,10 @@ pub fn build_extensible_array_at(
 
     // Derive the block-size geometry from the shared helper (single source of
     // truth shared with the reader).
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "element record size written into the 1-byte EA header field selected for this file"
+    )]
     let geom_header = ExtensibleArrayHeader {
         client_id,
         element_size: elem_size as u8,
@@ -1109,6 +1226,10 @@ pub fn build_extensible_array_at(
     }
 
     // ---- Build the header (EAHD) ------------------------------------------
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "statistic written into the on-disk length width selected for this file"
+    )]
     let write_length = |buf: &mut Vec<u8>, val: u64| match length_size {
         4 => buf.extend_from_slice(&(val as u32).to_le_bytes()),
         _ => buf.extend_from_slice(&val.to_le_bytes()),
@@ -1118,6 +1239,10 @@ pub fn build_extensible_array_at(
     aehd.extend_from_slice(b"EAHD");
     aehd.push(0); // version
     aehd.push(client_id);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "element record size written into the 1-byte EA header field selected for this file"
+    )]
     aehd.push(elem_size as u8);
     aehd.push(max_nelmts_bits);
     aehd.push(idx_blk_elmts);
@@ -1188,6 +1313,10 @@ fn write_chunk_element(
     has_filters: bool,
     chunk_size_bytes: usize,
 ) {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "chunk address written into the on-disk offset width selected for this file"
+    )]
     match offset_size {
         4 => buf.extend_from_slice(&(chunk.address as u32).to_le_bytes()),
         8 => buf.extend_from_slice(&chunk.address.to_le_bytes()),
@@ -1271,6 +1400,10 @@ pub fn build_chunked_data_at_ext(
         });
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "chunk dimensions written into the on-disk u32 dimension fields selected for this file"
+    )]
     let chunk_dims_u32: Vec<u32> = chunk_dims.iter().map(|&d| d as u32).collect();
     let offset_size: u8 = 8;
     let length_size: u8 = 8;
@@ -1284,6 +1417,10 @@ pub fn build_chunked_data_at_ext(
         data_buf.resize(aligned_idx, 0u8);
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "element size written into the on-disk u32 dimension field selected for this file"
+    )]
     let layout_message = if use_extensible {
         let ea_address = base_address + data_buf.len() as u64;
 

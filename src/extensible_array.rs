@@ -227,6 +227,12 @@ impl EaGeometry {
         } else {
             min_dblk.trailing_zeros() as u64
         };
+        // `max_nelmts_bits` is a bit-count header field, so the difference is a
+        // small super-block count that always fits `usize`.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "max_nelmts_bits is a bit count (<= 64); the super-block count fits usize"
+        )]
         let nsblks = (h.max_nelmts_bits as u64).saturating_sub(log2_min) as usize + 1;
 
         let mut sblks = Vec::with_capacity(nsblks);

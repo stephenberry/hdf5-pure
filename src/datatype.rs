@@ -601,6 +601,10 @@ impl Datatype {
                     _ => {}
                 }
                 // bf[1] = sign bit location (bit position of sign in the value)
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "size is an element byte size; *8-1 is a bit index that fits in a u8 (at most 63 for an 8-byte element)"
+                )]
                 let bf1 = (*size * 8 - 1) as u8;
                 let mut buf = Self::build_header(1, 1, [bf0, bf1, 0], *size);
                 buf.extend_from_slice(&bit_offset.to_le_bytes());
@@ -657,6 +661,10 @@ impl Datatype {
                 buf
             }
             Datatype::Compound { size, members } => {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "compound member count is written into the 2-byte member-count field of the datatype message"
+                )]
                 let num = members.len() as u16;
                 let bf0 = (num & 0xFF) as u8;
                 let bf1 = ((num >> 8) & 0xFF) as u8;
@@ -667,6 +675,10 @@ impl Datatype {
                     buf.extend_from_slice(m.name.as_bytes());
                     buf.push(0);
                     // Byte offset (variable-width)
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "ob is the offset-byte width chosen to hold byte_offset, so each arm casts to a width that fits by construction"
+                    )]
                     match ob {
                         1 => buf.push(m.byte_offset as u8),
                         2 => buf.extend_from_slice(&(m.byte_offset as u16).to_le_bytes()),
@@ -682,6 +694,10 @@ impl Datatype {
                 base_type,
                 members,
             } => {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "enumeration member count is written into the 2-byte member-count field of the datatype message"
+                )]
                 let num = members.len() as u16;
                 let bf0 = (num & 0xFF) as u8;
                 let bf1 = ((num >> 8) & 0xFF) as u8;
@@ -704,6 +720,10 @@ impl Datatype {
                 dimensions,
             } => {
                 let mut buf = Self::build_header(10, 3, [0, 0, 0], self.type_size());
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "array rank is written into the 1-byte dimensionality field; HDF5 caps array rank well below 255"
+                )]
                 buf.push(dimensions.len() as u8);
                 for &d in dimensions {
                     buf.extend_from_slice(&d.to_le_bytes());
@@ -747,6 +767,10 @@ impl Datatype {
             Datatype::Opaque { size, tag } => {
                 // bf0 carries the ASCII tag length; the tag is padded with zero
                 // bytes to a multiple of 8, mirroring `parse`.
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "opaque tag length is written into the 1-byte tag-length bit field (bf0)"
+                )]
                 let bf0 = tag.len() as u8;
                 let mut buf = Self::build_header(5, 1, [bf0, 0, 0], *size);
                 buf.extend_from_slice(tag);
