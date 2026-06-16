@@ -14,6 +14,25 @@ Pure-Rust HDF5 reader, writer, and in-place editor. No C dependencies, no build 
 - Compound types, enumerations, array types
 - Complex number datasets (as compound `{real, imag}`)
 
+## Examples
+
+Runnable, self-checking examples live in [`examples/`](examples). Run any with `cargo run --example <name>`:
+
+| Example | What it shows |
+|---|---|
+| `quickstart` | Build a file in memory and read it back |
+| `generic_io` | Read/write generically over the element type (`with_data` / `read::<T>`) |
+| `groups_and_attributes` | Nested groups and attributes of several types |
+| `compression` | Deflate, shuffle, and scale-offset filters |
+| `compound_types` | Compound (struct-like) records and complex numbers |
+| `ndarray_io` | N-dimensional array I/O (needs `--features ndarray`) |
+| `edit_in_place` | Add, copy, and delete objects with `EditSession` |
+| `repack` | Shrink a file and drop objects with `repack` |
+| `swmr` | Single-writer / multiple-reader append and refresh |
+| `file_space` | File-space strategy and persistent free-space tracking |
+
+The `matlab_fixtures` example (run with `--features serde`) writes `.mat` v7.3 files for verification in MATLAB/Octave.
+
 ## Quick start
 
 ### Writing
