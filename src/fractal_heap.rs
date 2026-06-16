@@ -165,7 +165,7 @@ fn read_object_at_source<S: FileSource + ?Sized>(
     addr: u64,
     len: usize,
 ) -> Result<Vec<u8>, FormatError> {
-    source.read_exact_at(addr, len)
+    source.read_metadata_at(addr, len)
 }
 
 /// Find the (address, length) of a huge object in the heap's huge-objects v2
@@ -759,7 +759,7 @@ impl FractalHeapHeader {
         let window = MAX_HEADER
             .min(source.len().saturating_sub(address))
             .to_usize()?;
-        let buf = source.read_exact_at(address, window)?;
+        let buf = source.read_metadata_at(address, window)?;
         Self::parse(&buf, 0, offset_size, length_size)
     }
 
@@ -868,7 +868,7 @@ impl FractalHeapHeader {
                 offset: block_addr,
                 length: local_offset,
             })?;
-        source.read_exact_at(pos, length)
+        source.read_metadata_at(pos, length)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -891,7 +891,7 @@ impl FractalHeapHeader {
         let region_len = (self.indirect_block_entries_len(nrows, offset_size) as u64)
             .min(source.len().saturating_sub(iblock_addr))
             .to_usize()?;
-        let block = source.read_exact_at(iblock_addr, region_len)?;
+        let block = source.read_metadata_at(iblock_addr, region_len)?;
         match self.find_child_for_offset(
             &block,
             nrows,

@@ -191,7 +191,11 @@ pub use error::Error;
 pub use error::FormatError;
 
 #[cfg(feature = "std")]
-pub use reader::{Dataset, File, Group, is_hdf5, is_hdf5_bytes};
+pub use reader::{Dataset, File, FileAccessOptions, Group, is_hdf5, is_hdf5_bytes};
+
+pub use chunk_cache::ChunkCacheConfig;
+
+pub use source::MetadataCacheConfig;
 
 #[cfg(feature = "std")]
 pub use vl_data::VlenStringReadOptions;

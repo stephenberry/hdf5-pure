@@ -5,7 +5,8 @@ use alloc::{string::String, vec, vec::Vec};
 
 use crate::chunk_cache::ChunkCache;
 use crate::chunked_read::{
-    read_chunked_data, read_chunked_data_cached, read_chunked_data_from_source,
+    read_chunked_data, read_chunked_data_cached, read_chunked_data_cached_from_source,
+    read_chunked_data_from_source,
 };
 use crate::convert::{TryToUsize, slice_range};
 use crate::data_layout::DataLayout;
@@ -206,10 +207,6 @@ pub fn read_raw_data_full_from_source<S: FileSource + ?Sized>(
 }
 
 /// Streaming counterpart of [`read_raw_data_cached`].
-///
-/// The chunk cache is not yet consulted on the streaming path (a follow-up); the
-/// result is identical to the buffered cached read, only the chunk index is
-/// re-scanned on each call.
 #[allow(clippy::too_many_arguments)]
 pub fn read_raw_data_cached_from_source<S: FileSource + ?Sized>(
     source: &S,
@@ -219,17 +216,29 @@ pub fn read_raw_data_cached_from_source<S: FileSource + ?Sized>(
     pipeline: Option<&FilterPipeline>,
     offset_size: u8,
     length_size: u8,
-    _cache: &ChunkCache,
+    cache: &ChunkCache,
 ) -> Result<Vec<u8>, FormatError> {
-    read_raw_data_full_from_source(
-        source,
-        layout,
-        dataspace,
-        datatype,
-        pipeline,
-        offset_size,
-        length_size,
-    )
+    match layout {
+        DataLayout::Chunked { .. } => read_chunked_data_cached_from_source(
+            source,
+            layout,
+            dataspace,
+            datatype,
+            pipeline,
+            offset_size,
+            length_size,
+            cache,
+        ),
+        _ => read_raw_data_full_from_source(
+            source,
+            layout,
+            dataspace,
+            datatype,
+            pipeline,
+            offset_size,
+            length_size,
+        ),
+    }
 }
 
 fn datatype_name(dt: &Datatype) -> &'static str {
