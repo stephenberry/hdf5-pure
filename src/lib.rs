@@ -27,6 +27,27 @@
 //! let values = ds.read_f64().unwrap();
 //! ```
 //!
+//! # Generic over the element type
+//!
+//! The typed `with_*_data` / `read_*` methods have generic counterparts bounded
+//! by [`H5Element`]: [`DatasetBuilder::with_data`] writes a flat slice of any
+//! supported scalar and [`Dataset::read`] reads one back, so you can write code
+//! generic over the stored type.
+//!
+//! ```rust
+//! use hdf5_pure::{File, FileBuilder, H5Element};
+//!
+//! fn store<T: H5Element>(fb: &mut FileBuilder, name: &str, values: &[T]) {
+//!     fb.create_dataset(name).with_data(values);
+//! }
+//!
+//! let mut fb = FileBuilder::new();
+//! store(&mut fb, "counts", &[1u32, 2, 3]);
+//! let file = File::from_bytes(fb.finish().unwrap()).unwrap();
+//! let counts: Vec<u32> = file.dataset("counts").unwrap().read().unwrap();
+//! assert_eq!(counts, vec![1, 2, 3]);
+//! ```
+//!
 //! # Editing files in place
 //!
 //! [`EditSession`] opens an existing file and adds, deletes, or copies objects
@@ -179,6 +200,9 @@ pub(crate) mod writer;
 #[cfg(feature = "std")]
 pub mod mat;
 
+#[cfg(feature = "std")]
+pub(crate) mod element;
+
 #[cfg(feature = "ndarray")]
 pub(crate) mod ndarray_support;
 
@@ -222,8 +246,8 @@ pub use edit::EditSession;
 #[cfg(feature = "std")]
 pub use repack::{RepackOptions, repack};
 
-#[cfg(feature = "ndarray")]
-pub use ndarray_support::H5Element;
+#[cfg(feature = "std")]
+pub use element::H5Element;
 
 pub use scaleoffset::ScaleOffset;
 
