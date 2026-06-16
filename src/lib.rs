@@ -195,7 +195,7 @@ pub use reader::{
     Dataset, DatasetAccessOptions, File, FileAccessOptions, Group, is_hdf5, is_hdf5_bytes,
 };
 
-pub use chunk_cache::ChunkCacheConfig;
+pub use chunk_cache::{ChunkCacheConfig, ChunkCacheStats};
 
 pub use source::MetadataCacheConfig;
 

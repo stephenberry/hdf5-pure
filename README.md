@@ -146,6 +146,18 @@ let ds = file.dataset_with_options("scan", dapl).unwrap();
 let values = ds.read_f64().unwrap();
 ```
 
+To confirm the cache is behaving as configured, `Dataset::chunk_cache_stats()` reports a read-only snapshot (index loaded, retained chunks, retained bytes) after a read.
+
+```rust
+use hdf5_pure::File;
+
+let file = File::open("data.h5").unwrap();
+let ds = file.dataset("signal").unwrap();
+let _ = ds.read_f64().unwrap();
+let stats = ds.chunk_cache_stats();
+assert!(stats.cached_chunks() > 0); // chunks were retained for reuse
+```
+
 ### In-memory (WASM)
 
 ```rust
