@@ -74,7 +74,9 @@ impl FileSource for SourceView<'_> {
 /// This is the `hdf5-pure` analogue of the HDF5 file access property list
 /// settings relevant to read-time memory usage. The metadata cache only affects
 /// streaming opens; in-memory opens already have the whole file in one buffer.
-/// The chunk cache applies to datasets opened from either backend.
+/// The chunk cache is the file-wide default corresponding to HDF5
+/// `H5Pset_cache`'s raw-data chunk-cache settings and applies to datasets
+/// opened from either backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FileAccessOptions {
     metadata_cache: MetadataCacheConfig,
@@ -96,7 +98,8 @@ impl FileAccessOptions {
         self
     }
 
-    /// Configure the per-dataset chunk cache.
+    /// Configure the per-dataset raw chunk cache used by datasets opened from
+    /// this file. This is the `H5Pset_cache`-style file-wide default.
     pub const fn with_chunk_cache(mut self, chunk_cache: ChunkCacheConfig) -> Self {
         self.chunk_cache = chunk_cache;
         self

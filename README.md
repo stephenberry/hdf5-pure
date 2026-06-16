@@ -123,14 +123,14 @@ let values = ds.read_f64().unwrap();  // only this dataset's chunks are read
 
 The reading API is identical to `File::open`; only the backing store differs. Dataset reads are fully supported: contiguous, compact, and every chunk-index layout (B-tree v1, fixed array, and extensible array). Two limits apply to the streaming backend that in-memory reading does not have: only latest-format (v2) groups resolve along a path (a v1 symbol-table group is rejected), and reading attributes is not yet supported. `open_streaming` requires the `std` filesystem.
 
-Use `File::open_streaming_with_options` to bound retained metadata and dataset chunk cache memory. `MetadataCacheConfig` controls the streaming metadata cache, while `ChunkCacheConfig` controls decompressed chunk data and whether parsed chunk indexes are retained between repeated reads of the same dataset.
+Use `File::open_streaming_with_options` to bound retained metadata and dataset chunk cache memory. `MetadataCacheConfig` mirrors the memory-budget role of `H5Pset_mdc_config`; `ChunkCacheConfig` mirrors the raw-data chunk-cache settings from `H5Pset_cache`, controlling decompressed chunk data and whether parsed chunk indexes are retained between repeated reads of the same dataset.
 
 ```rust
 use hdf5_pure::{ChunkCacheConfig, File, FileAccessOptions, MetadataCacheConfig};
 
 let options = FileAccessOptions::new()
     .with_metadata_cache(MetadataCacheConfig::new(8 * 1024 * 1024).with_max_entry_bytes(64 * 1024))
-    .with_chunk_cache(ChunkCacheConfig::new().with_max_bytes(256 * 1024));
+    .with_chunk_cache(ChunkCacheConfig::from_h5p_cache(521, 256 * 1024));
 let file = File::open_streaming_with_options("huge.h5", options).unwrap();
 ```
 

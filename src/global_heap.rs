@@ -80,7 +80,7 @@ impl GlobalHeapIndex {
         length_size: u8,
     ) -> Result<Self, FormatError> {
         let header_size = 8 + length_size as usize;
-        let header = source.read_exact_at(offset, header_size)?;
+        let header = source.read_metadata_at(offset, header_size)?;
 
         if header[..4] != GCOL_SIGNATURE {
             return Err(FormatError::InvalidGlobalHeapSignature);
@@ -124,7 +124,7 @@ impl GlobalHeapIndex {
             .checked_add(2)
             .is_some_and(|index_end| index_end <= collection_end)
         {
-            let index_bytes = source.read_exact_at(pos, 2)?;
+            let index_bytes = source.read_metadata_at(pos, 2)?;
             let object_index = u16::from_le_bytes([index_bytes[0], index_bytes[1]]);
             if object_index == 0 {
                 break;
@@ -142,7 +142,7 @@ impl GlobalHeapIndex {
                     available: collection_end.to_usize().unwrap_or(usize::MAX),
                 });
             }
-            let object_header = source.read_exact_at(pos, object_header_size)?;
+            let object_header = source.read_metadata_at(pos, object_header_size)?;
             let object_size = read_length(&object_header, 8, length_size)?;
             let data_address = object_header_end;
             let data_end =
@@ -262,6 +262,45 @@ mod tests {
                 .unwrap(),
             b"world!!!"
         );
+    }
+
+    #[test]
+    fn parse_reads_collection_headers_as_metadata() {
+        use core::cell::Cell;
+
+        struct TrackingSource {
+            data: Vec<u8>,
+            metadata_reads: Cell<usize>,
+            raw_reads: Cell<usize>,
+        }
+
+        impl FileSource for TrackingSource {
+            fn len(&self) -> u64 {
+                self.data.len() as u64
+            }
+
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
+                self.raw_reads.set(self.raw_reads.get() + 1);
+                BytesSource::new(&self.data).read_at(offset, buf)
+            }
+
+            fn read_metadata_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
+                self.metadata_reads.set(self.metadata_reads.get() + 1);
+                BytesSource::new(&self.data).read_exact_at(offset, len)
+            }
+        }
+
+        let source = TrackingSource {
+            data: build_collection(&[(1, 1, b"hello"), (2, 1, b"world")], 8),
+            metadata_reads: Cell::new(0),
+            raw_reads: Cell::new(0),
+        };
+
+        let coll = GlobalHeapIndex::parse(&source, 0, 8).unwrap();
+
+        assert_eq!(coll.objects.len(), 2);
+        assert!(source.metadata_reads.get() > 0);
+        assert_eq!(source.raw_reads.get(), 0);
     }
 
     #[test]
