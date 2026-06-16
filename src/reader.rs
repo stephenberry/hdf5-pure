@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 
 use crate::attribute::extract_attributes_full;
-use crate::chunk_cache::ChunkCache;
+use crate::chunk_cache::{ChunkCache, ChunkCacheConfig};
 use crate::compound::CompoundType;
 use crate::convert::TryToUsize;
 use crate::data_layout::DataLayout;
@@ -21,7 +21,9 @@ use crate::libver::LibVer;
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
 use crate::signature;
-use crate::source::{BytesSource, FileSource, ReadSeekSource};
+use crate::source::{
+    BytesSource, FileSource, MetadataCacheConfig, MetadataCachingSource, ReadSeekSource,
+};
 use crate::superblock::Superblock;
 use crate::vl_data::{self, VlenStringReadOptions};
 
@@ -57,6 +59,57 @@ impl FileSource for SourceView<'_> {
             SourceView::Mem(b) => BytesSource::new(*b).read_at(offset, buf),
             SourceView::Stream(s) => s.read_at(offset, buf),
         }
+    }
+
+    fn read_metadata_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
+        match self {
+            SourceView::Mem(b) => BytesSource::new(*b).read_metadata_at(offset, len),
+            SourceView::Stream(s) => s.read_metadata_at(offset, len),
+        }
+    }
+}
+
+/// File-access options applied when opening an HDF5 file.
+///
+/// This is the `hdf5-pure` analogue of the HDF5 file access property list
+/// settings relevant to read-time memory usage. The metadata cache only affects
+/// streaming opens; in-memory opens already have the whole file in one buffer.
+/// The chunk cache applies to datasets opened from either backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FileAccessOptions {
+    metadata_cache: MetadataCacheConfig,
+    chunk_cache: ChunkCacheConfig,
+}
+
+impl FileAccessOptions {
+    /// Create options with the crate's default access behavior.
+    pub const fn new() -> Self {
+        Self {
+            metadata_cache: MetadataCacheConfig::disabled(),
+            chunk_cache: ChunkCacheConfig::new(),
+        }
+    }
+
+    /// Configure the bounded streaming metadata cache.
+    pub const fn with_metadata_cache(mut self, metadata_cache: MetadataCacheConfig) -> Self {
+        self.metadata_cache = metadata_cache;
+        self
+    }
+
+    /// Configure the per-dataset chunk cache.
+    pub const fn with_chunk_cache(mut self, chunk_cache: ChunkCacheConfig) -> Self {
+        self.chunk_cache = chunk_cache;
+        self
+    }
+
+    /// Return the configured streaming metadata cache.
+    pub const fn metadata_cache(&self) -> MetadataCacheConfig {
+        self.metadata_cache
+    }
+
+    /// Return the configured per-dataset chunk cache.
+    pub const fn chunk_cache(&self) -> ChunkCacheConfig {
+        self.chunk_cache
     }
 }
 
@@ -103,6 +156,7 @@ pub struct File {
     /// one. Best-effort: a malformed or unreadable extension leaves this `None`
     /// rather than failing the open.
     file_space_info: Option<FileSpaceInfo>,
+    access_options: FileAccessOptions,
 }
 
 impl File {
@@ -113,8 +167,20 @@ impl File {
     /// To read a file larger than memory (e.g. on a 32-bit host) without
     /// buffering it, use [`File::open_streaming`].
     pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
+        Self::open_with_options(path, FileAccessOptions::new())
+    }
+
+    /// Open an HDF5 file from a filesystem path with explicit access options.
+    ///
+    /// Like [`open`](Self::open), this buffers the whole file in memory. Use
+    /// [`open_streaming_with_options`](Self::open_streaming_with_options) when
+    /// the metadata cache budget should apply to lazy metadata reads.
+    pub fn open_with_options<P: AsRef<std::path::Path>>(
+        path: P,
+        options: FileAccessOptions,
+    ) -> Result<Self, Error> {
         let bytes = std::fs::read(path.as_ref()).map_err(Error::Io)?;
-        Self::from_bytes(bytes)
+        Self::from_bytes_with_options(bytes, options)
     }
 
     /// Open an HDF5 file for **streaming** reads, fetching regions on demand from
@@ -131,14 +197,28 @@ impl File {
     /// supported. Dataset reads (contiguous, compact, and all chunked index
     /// types) are fully supported.
     pub fn open_streaming<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
+        Self::open_streaming_with_options(path, FileAccessOptions::new())
+    }
+
+    /// Open an HDF5 file for streaming reads with explicit access options.
+    pub fn open_streaming_with_options<P: AsRef<std::path::Path>>(
+        path: P,
+        options: FileAccessOptions,
+    ) -> Result<Self, Error> {
         let handle = std::fs::File::open(path.as_ref()).map_err(Error::Io)?;
         let source = ReadSeekSource::new(handle).map_err(Error::Format)?;
-        let (superblock, addr_offset) = Self::parse_superblock_source(&source)?;
+        let source: Box<dyn FileSource + Send + Sync> = if options.metadata_cache.is_enabled() {
+            Box::new(MetadataCachingSource::new(source, options.metadata_cache))
+        } else {
+            Box::new(source)
+        };
+        let (superblock, addr_offset) = Self::parse_superblock_source(source.as_ref())?;
         Ok(Self::from_parts(
-            Backend::Streaming(Box::new(source)),
+            Backend::Streaming(source),
             superblock,
             addr_offset,
             None,
+            options,
         ))
     }
 
@@ -153,6 +233,17 @@ impl File {
     /// Only the `std` build supports this (it requires a live filesystem
     /// handle); the in-memory [`File::from_bytes`] path cannot refresh.
     pub fn open_swmr<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
+        Self::open_swmr_with_options(path, FileAccessOptions::new())
+    }
+
+    /// Open an HDF5 file for SWMR reading with explicit access options.
+    ///
+    /// SWMR reads currently keep an in-memory mirror for refresh semantics, so
+    /// only the per-dataset chunk-cache settings affect this backend.
+    pub fn open_swmr_with_options<P: AsRef<std::path::Path>>(
+        path: P,
+        options: FileAccessOptions,
+    ) -> Result<Self, Error> {
         let mut handle = std::fs::File::open(path.as_ref()).map_err(Error::Io)?;
         let mut data = Vec::new();
         handle.read_to_end(&mut data).map_err(Error::Io)?;
@@ -162,17 +253,27 @@ impl File {
             superblock,
             addr_offset,
             Some(handle),
+            options,
         ))
     }
 
     /// Open an HDF5 file from an in-memory byte vector.
     pub fn from_bytes(data: Vec<u8>) -> Result<Self, Error> {
+        Self::from_bytes_with_options(data, FileAccessOptions::new())
+    }
+
+    /// Open an HDF5 file from an in-memory byte vector with explicit access options.
+    pub fn from_bytes_with_options(
+        data: Vec<u8>,
+        options: FileAccessOptions,
+    ) -> Result<Self, Error> {
         let (superblock, addr_offset) = Self::parse_superblock(&data)?;
         Ok(Self::from_parts(
             Backend::InMemory(data),
             superblock,
             addr_offset,
             None,
+            options,
         ))
     }
 
@@ -215,6 +316,7 @@ impl File {
         superblock: Superblock,
         addr_offset: u64,
         handle: Option<std::fs::File>,
+        access_options: FileAccessOptions,
     ) -> Self {
         let mut file = File {
             backend,
@@ -222,6 +324,7 @@ impl File {
             addr_offset,
             handle,
             file_space_info: None,
+            access_options,
         };
         file.file_space_info = file.read_file_space_info();
         file
@@ -338,7 +441,7 @@ impl File {
         Ok(Dataset {
             file: self,
             header: hdr,
-            chunk_cache: ChunkCache::new(),
+            chunk_cache: ChunkCache::with_config(self.access_options.chunk_cache),
         })
     }
 
@@ -358,6 +461,11 @@ impl File {
             Backend::InMemory(v) => v,
             Backend::Streaming(_) => &[],
         }
+    }
+
+    /// Return the access options used when opening this file.
+    pub const fn access_options(&self) -> FileAccessOptions {
+        self.access_options
     }
 
     /// Returns a reference to the parsed superblock.
@@ -608,7 +716,7 @@ impl<'f> Group<'f> {
         Ok(Dataset {
             file: self.file,
             header: hdr,
-            chunk_cache: ChunkCache::new(),
+            chunk_cache: ChunkCache::with_config(self.file.access_options.chunk_cache),
         })
     }
 

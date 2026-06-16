@@ -177,7 +177,7 @@ impl BTreeV2Header {
         let window = MAX_HEADER
             .min(source.len().saturating_sub(address))
             .to_usize()?;
-        let buf = source.read_exact_at(address, window)?;
+        let buf = source.read_metadata_at(address, window)?;
         Self::parse(&buf, 0, offset_size, length_size)
     }
 }
@@ -524,7 +524,7 @@ fn collect_node_from_source<S: FileSource + ?Sized>(
     let node_len = u64::from(node_size)
         .min(source.len().saturating_sub(address))
         .to_usize()?;
-    let node = source.read_exact_at(address, node_len)?;
+    let node = source.read_metadata_at(address, node_len)?;
 
     if depth == 0 {
         out.extend(parse_leaf_records(&node, 0, num_records, record_size)?);

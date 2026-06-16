@@ -170,7 +170,7 @@ impl ExtensibleArrayHeader {
         length_size: u8,
     ) -> Result<Self, FormatError> {
         let size = Self::serialized_size(offset_size, length_size);
-        let buf = source.read_exact_at(address, size)?;
+        let buf = source.read_metadata_at(address, size)?;
         Self::parse(&buf, 0, offset_size, length_size)
     }
 }
@@ -844,7 +844,7 @@ pub fn read_extensible_array_chunks_from_source<S: FileSource + ?Sized>(
             length: os as u64,
         })?;
     let ib_len = ib_header_size + inline_bytes + addr_bytes;
-    let ib = source.read_exact_at(header.index_block_address, ib_len)?;
+    let ib = source.read_metadata_at(header.index_block_address, ib_len)?;
     if &ib[0..4] != b"EAIB" {
         return Err(FormatError::ChunkedReadError(
             "invalid Extensible Array index block signature".into(),
@@ -972,7 +972,7 @@ fn read_data_block_elements_from_source<S: FileSource + ?Sized>(
             length: elem_stride as u64,
         })?;
     let region_len = db_header_size + blk_off_size + elem_bytes;
-    let block = source.read_exact_at(db_address, region_len)?;
+    let block = source.read_metadata_at(db_address, region_len)?;
     if &block[0..4] != b"EADB" {
         return Err(FormatError::ChunkedReadError(
             "invalid Extensible Array data block signature".into(),
@@ -1051,7 +1051,7 @@ fn read_paged_data_block_from_source<S: FileSource + ?Sized>(
             length: page_stride as u64,
         })?;
     let region_len = (db_header_size + pages_bytes).min(avail);
-    let block = source.read_exact_at(db_address, region_len)?;
+    let block = source.read_metadata_at(db_address, region_len)?;
     if block.len() < 4 || &block[0..4] != b"EADB" {
         return Err(FormatError::ChunkedReadError(
             "invalid Extensible Array data block signature".into(),
@@ -1135,7 +1135,7 @@ fn read_super_block_from_source<S: FileSource + ?Sized>(
         length: os as u64,
     })?;
     let region_len = sb_header_size + bitmap_size + addr_bytes;
-    let block = source.read_exact_at(sb_address, region_len)?;
+    let block = source.read_metadata_at(sb_address, region_len)?;
     if &block[0..4] != b"EASB" {
         return Err(FormatError::ChunkedReadError(
             "invalid Extensible Array super block signature".into(),

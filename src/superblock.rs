@@ -137,7 +137,7 @@ impl Superblock {
     ) -> Result<Superblock, FormatError> {
         let available = source.len().saturating_sub(signature_offset);
         let window = available.min(MAX_SUPERBLOCK_LEN).to_usize()?;
-        let buf = source.read_exact_at(signature_offset, window)?;
+        let buf = source.read_metadata_at(signature_offset, window)?;
         // The window begins at the signature, so within `buf` it sits at 0.
         Self::parse(&buf, 0)
     }

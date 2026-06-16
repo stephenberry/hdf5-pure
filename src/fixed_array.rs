@@ -115,7 +115,7 @@ impl FixedArrayHeader {
         length_size: u8,
     ) -> Result<Self, FormatError> {
         let min_size = 4 + 1 + 1 + 1 + 1 + length_size as usize + offset_size as usize + 4;
-        let buf = source.read_exact_at(address, min_size)?;
+        let buf = source.read_metadata_at(address, min_size)?;
         Self::parse(&buf, 0, offset_size, length_size)
     }
 }
@@ -355,7 +355,7 @@ pub fn read_fixed_array_chunks_from_source<S: FileSource + ?Sized>(
     let db_header_size = 4 + 1 + 1 + os;
 
     // Data block prefix: FADB(4) + version(1) + client_id(1) + header_address.
-    let prefix = source.read_exact_at(db_address, db_header_size)?;
+    let prefix = source.read_metadata_at(db_address, db_header_size)?;
     if &prefix[0..4] != b"FADB" {
         return Err(FormatError::ChunkedReadError(
             "invalid Fixed Array data block signature".into(),
@@ -393,7 +393,7 @@ pub fn read_fixed_array_chunks_from_source<S: FileSource + ?Sized>(
 
     if !is_paged {
         // All elements live directly after the prefix; read them in one window.
-        let region = source.read_exact_at(
+        let region = source.read_metadata_at(
             db_address + db_header_size as u64,
             num_elements
                 .checked_mul(elem_size)
@@ -425,7 +425,7 @@ pub fn read_fixed_array_chunks_from_source<S: FileSource + ?Sized>(
     let npages = num_elements.div_ceil(page_size);
     let bitmap_size = npages.div_ceil(8);
     let bitmap_addr = db_address + db_header_size as u64;
-    let bitmap = source.read_exact_at(bitmap_addr, bitmap_size)?;
+    let bitmap = source.read_metadata_at(bitmap_addr, bitmap_size)?;
     let pages_start_addr = bitmap_addr + bitmap_size as u64 + 4;
     let page_stride = page_size
         .checked_mul(elem_size)
@@ -448,7 +448,7 @@ pub fn read_fixed_array_chunks_from_source<S: FileSource + ?Sized>(
                 length: page_stride as u64,
             })?;
         let page_addr = pages_start_addr + page_offset as u64;
-        let region = source.read_exact_at(
+        let region = source.read_metadata_at(
             page_addr,
             nelem_in_page
                 .checked_mul(elem_size)

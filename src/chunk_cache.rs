@@ -204,6 +204,80 @@ pub const DEFAULT_CACHE_BYTES: usize = 1024 * 1024; // 1 MiB
 /// Default maximum number of cached decompressed chunks.
 pub const DEFAULT_MAX_SLOTS: usize = 16;
 
+/// Configuration for a per-dataset chunk cache.
+///
+/// The byte and slot limits apply to decompressed raw chunk data. The optional
+/// chunk-index cache controls whether `hdf5-pure` retains the parsed chunk
+/// address index between reads of the same [`crate::Dataset`]. Disabling the
+/// index cache lowers retained metadata memory at the cost of re-scanning the
+/// on-disk chunk index for repeated reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkCacheConfig {
+    max_bytes: usize,
+    max_slots: usize,
+    cache_index: bool,
+}
+
+impl ChunkCacheConfig {
+    /// Create a config matching the historical defaults: 1 MiB of decompressed
+    /// chunks, 16 slots, and retained parsed chunk indexes.
+    pub const fn new() -> Self {
+        Self {
+            max_bytes: DEFAULT_CACHE_BYTES,
+            max_slots: DEFAULT_MAX_SLOTS,
+            cache_index: true,
+        }
+    }
+
+    /// Disable retained decompressed chunks and parsed chunk indexes.
+    pub const fn disabled() -> Self {
+        Self {
+            max_bytes: 0,
+            max_slots: 0,
+            cache_index: false,
+        }
+    }
+
+    /// Set the maximum decompressed chunk bytes retained per dataset.
+    pub const fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_bytes = max_bytes;
+        self
+    }
+
+    /// Set the maximum number of decompressed chunk slots retained per dataset.
+    pub const fn with_max_slots(mut self, max_slots: usize) -> Self {
+        self.max_slots = max_slots;
+        self
+    }
+
+    /// Enable or disable retaining the parsed chunk index between reads.
+    pub const fn with_index_cache(mut self, enabled: bool) -> Self {
+        self.cache_index = enabled;
+        self
+    }
+
+    /// Return the maximum decompressed chunk bytes retained per dataset.
+    pub const fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    /// Return the maximum decompressed chunk slots retained per dataset.
+    pub const fn max_slots(&self) -> usize {
+        self.max_slots
+    }
+
+    /// Return whether parsed chunk indexes are retained between reads.
+    pub const fn index_cache_enabled(&self) -> bool {
+        self.cache_index
+    }
+}
+
+impl Default for ChunkCacheConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // LRU entry
 // ---------------------------------------------------------------------------
@@ -256,6 +330,9 @@ struct CacheInner {
 
     /// Monotonic counter for LRU ordering.
     tick: u64,
+
+    /// Whether the parsed chunk index should be retained between reads.
+    cache_index: bool,
 }
 
 impl ChunkCache {
@@ -266,14 +343,24 @@ impl ChunkCache {
 
     /// Create a new chunk cache with custom byte budget and slot count.
     pub fn with_capacity(max_bytes: usize, max_slots: usize) -> Self {
+        Self::with_config(
+            ChunkCacheConfig::new()
+                .with_max_bytes(max_bytes)
+                .with_max_slots(max_slots),
+        )
+    }
+
+    /// Create a new chunk cache from a full configuration.
+    pub fn with_config(config: ChunkCacheConfig) -> Self {
         Self {
             inner: Mutex::new(CacheInner {
                 index: None,
-                slots: Vec::with_capacity(max_slots.min(64)),
+                slots: Vec::with_capacity(config.max_slots.min(64)),
                 current_bytes: 0,
-                max_bytes,
-                max_slots,
+                max_bytes: config.max_bytes,
+                max_slots: config.max_slots,
                 tick: 0,
+                cache_index: config.cache_index,
             }),
         }
     }
@@ -281,6 +368,7 @@ impl ChunkCache {
     // ----- Index operations -----
 
     /// Returns `true` if the chunk index has been built.
+    #[cfg(test)]
     pub fn has_index(&self) -> bool {
         self.inner.lock().unwrap().index.is_some()
     }
@@ -291,6 +379,9 @@ impl ChunkCache {
     /// (B-tree v1 stores rank+1 offsets).
     pub fn populate_index(&self, chunks: &[ChunkInfo], rank: usize) {
         let mut inner = self.inner.lock().unwrap();
+        if !inner.cache_index {
+            return;
+        }
         if inner.index.is_some() {
             return; // already populated
         }
@@ -363,8 +454,8 @@ impl ChunkCache {
         let mut inner = self.inner.lock().unwrap();
         let data_len = data.len();
 
-        // Don't cache if single chunk exceeds budget
-        if data_len > inner.max_bytes {
+        // Don't cache if disabled or if a single chunk exceeds the budget.
+        if inner.max_bytes == 0 || inner.max_slots == 0 || data_len > inner.max_bytes {
             return;
         }
 
@@ -524,6 +615,18 @@ mod tests {
         let cache = ChunkCache::with_capacity(10, 16);
         cache.put_decompressed(vec![0], vec![0; 100]); // too big
         assert_eq!(cache.cached_chunk_count(), 0);
+    }
+
+    #[test]
+    fn disabled_cache_retains_no_index_or_chunks() {
+        let cache = ChunkCache::with_config(ChunkCacheConfig::disabled());
+        let chunks = vec![make_chunk(vec![0, 0], 0x1000, 80)];
+        cache.populate_index(&chunks, 1);
+        assert!(!cache.has_index());
+
+        cache.put_decompressed(vec![0], vec![1, 2, 3]);
+        assert_eq!(cache.cached_chunk_count(), 0);
+        assert_eq!(cache.cached_bytes(), 0);
     }
 
     #[test]

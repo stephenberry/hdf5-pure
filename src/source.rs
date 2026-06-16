@@ -83,6 +83,77 @@ use alloc::{vec, vec::Vec};
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
 
+/// Default maximum size of one entry admitted to a streaming metadata cache.
+pub const DEFAULT_METADATA_CACHE_MAX_ENTRY_BYTES: usize = 64 * 1024;
+
+/// Initial metadata-cache settings for streaming file access.
+///
+/// This is the `hdf5-pure` counterpart to the memory-budget portion of HDF5's
+/// `H5Pset_mdc_config`: it bounds the bytes retained for parsed metadata reads
+/// while a file is opened through [`crate::File::open_streaming_with_options`].
+/// Raw dataset payload reads use [`FileSource::read_exact_at`] and are not
+/// admitted to this cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MetadataCacheConfig {
+    max_bytes: usize,
+    max_entry_bytes: usize,
+}
+
+impl MetadataCacheConfig {
+    /// Create a metadata cache with the given total byte budget.
+    ///
+    /// Individual cached reads are capped at
+    /// [`DEFAULT_METADATA_CACHE_MAX_ENTRY_BYTES`] by default so one large heap
+    /// or index block cannot monopolize the cache. Use
+    /// [`with_max_entry_bytes`](Self::with_max_entry_bytes) to change that.
+    pub const fn new(max_bytes: usize) -> Self {
+        let max_entry_bytes = if max_bytes < DEFAULT_METADATA_CACHE_MAX_ENTRY_BYTES {
+            max_bytes
+        } else {
+            DEFAULT_METADATA_CACHE_MAX_ENTRY_BYTES
+        };
+        Self {
+            max_bytes,
+            max_entry_bytes,
+        }
+    }
+
+    /// Disable metadata read caching.
+    pub const fn disabled() -> Self {
+        Self {
+            max_bytes: 0,
+            max_entry_bytes: 0,
+        }
+    }
+
+    /// Set the maximum size of a single metadata read admitted to the cache.
+    pub const fn with_max_entry_bytes(mut self, max_entry_bytes: usize) -> Self {
+        self.max_entry_bytes = max_entry_bytes;
+        self
+    }
+
+    /// Return the total metadata-cache byte budget.
+    pub const fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    /// Return the maximum size of one cached metadata entry.
+    pub const fn max_entry_bytes(&self) -> usize {
+        self.max_entry_bytes
+    }
+
+    /// Whether metadata read caching is enabled.
+    pub const fn is_enabled(&self) -> bool {
+        self.max_bytes > 0 && self.max_entry_bytes > 0
+    }
+}
+
+impl Default for MetadataCacheConfig {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
 /// A random-access, read-only source of the bytes of an HDF5 file.
 ///
 /// Offsets are `u64` (HDF5's native address width); lengths of individual reads
@@ -137,6 +208,16 @@ pub trait FileSource {
         let mut buf = vec![0u8; len];
         self.read_at(offset, &mut buf)?;
         Ok(buf)
+    }
+
+    /// Read metadata bytes, allowing source implementations to apply a bounded
+    /// metadata cache.
+    ///
+    /// The default implementation performs an uncached exact read. Raw dataset
+    /// payload readers intentionally call [`read_exact_at`](Self::read_exact_at)
+    /// instead, so a metadata cache does not retain user data chunks.
+    fn read_metadata_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
+        self.read_exact_at(offset, len)
     }
 }
 
@@ -202,6 +283,155 @@ impl<T: AsRef<[u8]>> FileSource for BytesSource<T> {
         }
         buf.copy_from_slice(&bytes[start..end]);
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Metadata-caching wrapper (std)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "std")]
+struct CachedMetadataRead {
+    offset: u64,
+    len: usize,
+    bytes: Vec<u8>,
+    last_access: u64,
+}
+
+#[cfg(feature = "std")]
+struct MetadataReadCache {
+    entries: Vec<CachedMetadataRead>,
+    current_bytes: usize,
+    tick: u64,
+}
+
+#[cfg(feature = "std")]
+impl MetadataReadCache {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            current_bytes: 0,
+            tick: 0,
+        }
+    }
+
+    fn get(&mut self, offset: u64, len: usize) -> Option<Vec<u8>> {
+        self.tick = self.tick.wrapping_add(1);
+        let tick = self.tick;
+        for entry in &mut self.entries {
+            if entry.offset == offset && entry.len == len {
+                entry.last_access = tick;
+                return Some(entry.bytes.clone());
+            }
+        }
+        None
+    }
+
+    fn insert(&mut self, offset: u64, len: usize, bytes: Vec<u8>, max_bytes: usize) {
+        if len == 0 || bytes.len() > max_bytes {
+            return;
+        }
+
+        self.tick = self.tick.wrapping_add(1);
+        let tick = self.tick;
+
+        for entry in &mut self.entries {
+            if entry.offset == offset && entry.len == len {
+                self.current_bytes = self.current_bytes - entry.bytes.len() + bytes.len();
+                entry.bytes = bytes;
+                entry.last_access = tick;
+                self.evict_to_budget(max_bytes);
+                return;
+            }
+        }
+
+        self.current_bytes += bytes.len();
+        self.entries.push(CachedMetadataRead {
+            offset,
+            len,
+            bytes,
+            last_access: tick,
+        });
+        self.evict_to_budget(max_bytes);
+    }
+
+    fn evict_to_budget(&mut self, max_bytes: usize) {
+        while self.current_bytes > max_bytes && !self.entries.is_empty() {
+            let lru_idx = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.last_access)
+                .map(|(idx, _)| idx)
+                .unwrap();
+            let removed = self.entries.swap_remove(lru_idx);
+            self.current_bytes -= removed.bytes.len();
+        }
+    }
+}
+
+/// A [`FileSource`] wrapper with a bounded cache for metadata reads.
+///
+/// The wrapper only caches calls to [`FileSource::read_metadata_at`]. Plain
+/// [`FileSource::read_exact_at`] calls still go directly to the inner source,
+/// which keeps raw dataset payloads out of the metadata cache.
+#[cfg(feature = "std")]
+pub struct MetadataCachingSource<S> {
+    inner: S,
+    config: MetadataCacheConfig,
+    cache: std::sync::Mutex<MetadataReadCache>,
+}
+
+#[cfg(feature = "std")]
+impl<S> MetadataCachingSource<S> {
+    /// Wrap a source with the supplied metadata-cache configuration.
+    pub fn new(inner: S, config: MetadataCacheConfig) -> Self {
+        Self {
+            inner,
+            config,
+            cache: std::sync::Mutex::new(MetadataReadCache::new()),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl<S: FileSource> FileSource for MetadataCachingSource<S> {
+    fn len(&self) -> u64 {
+        self.inner.len()
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
+        self.inner.read_at(offset, buf)
+    }
+
+    fn read_exact_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
+        self.inner.read_exact_at(offset, len)
+    }
+
+    fn read_metadata_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
+        if !self.config.is_enabled()
+            || len == 0
+            || len > self.config.max_entry_bytes
+            || len > self.config.max_bytes
+        {
+            return self.inner.read_metadata_at(offset, len);
+        }
+
+        if let Some(bytes) = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(offset, len)
+        {
+            return Ok(bytes);
+        }
+
+        let bytes = self.inner.read_metadata_at(offset, len)?;
+        self.cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(offset, len, bytes.clone(), self.config.max_bytes);
+        Ok(bytes)
     }
 }
 
@@ -360,6 +590,48 @@ mod tests {
         let mut buf = [0u8; 2];
         r.read_at(1, &mut buf).unwrap();
         assert_eq!(buf, [8, 7]);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn metadata_cache_caches_only_metadata_reads() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        struct CountingSource {
+            data: Vec<u8>,
+            reads: Arc<AtomicUsize>,
+        }
+
+        impl FileSource for CountingSource {
+            fn len(&self) -> u64 {
+                self.data.len() as u64
+            }
+
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                BytesSource::new(&self.data).read_at(offset, buf)
+            }
+        }
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let source = MetadataCachingSource::new(
+            CountingSource {
+                data: (0u8..16).collect(),
+                reads: Arc::clone(&reads),
+            },
+            MetadataCacheConfig::new(16),
+        );
+
+        assert_eq!(source.read_metadata_at(4, 4).unwrap(), vec![4, 5, 6, 7]);
+        assert_eq!(source.read_metadata_at(4, 4).unwrap(), vec![4, 5, 6, 7]);
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+
+        assert_eq!(source.read_exact_at(4, 4).unwrap(), vec![4, 5, 6, 7]);
+        assert_eq!(source.read_exact_at(4, 4).unwrap(), vec![4, 5, 6, 7]);
+        assert_eq!(reads.load(Ordering::SeqCst), 3);
     }
 
     #[cfg(feature = "std")]

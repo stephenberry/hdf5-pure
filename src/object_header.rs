@@ -587,7 +587,7 @@ impl ObjectHeader {
         let head_len = MAX_PREFIX
             .min(source.len().saturating_sub(address))
             .to_usize()?;
-        let head = source.read_exact_at(address, head_len)?;
+        let head = source.read_metadata_at(address, head_len)?;
         if head.len() < 6 {
             return Err(FormatError::UnexpectedEof {
                 expected: 6,
@@ -646,7 +646,7 @@ impl ObjectHeader {
                     offset: chunk0_end as u64,
                     length: 4,
                 })?;
-        let chunk0 = source.read_exact_at(address, chunk0_total.to_usize()?)?;
+        let chunk0 = source.read_metadata_at(address, chunk0_total.to_usize()?)?;
 
         #[cfg(feature = "checksum")]
         {
@@ -682,7 +682,7 @@ impl ObjectHeader {
             }
             cont_remaining -= 1;
             let cont_len = cont_len.to_usize()?;
-            let region = source.read_exact_at(cont_off, cont_len)?;
+            let region = source.read_metadata_at(cont_off, cont_len)?;
             Self::parse_v2_continuation(
                 &region,
                 0,
@@ -716,7 +716,7 @@ impl ObjectHeader {
     ) -> Result<ObjectHeader, FormatError> {
         // version(1) + reserved(1) + num_messages(2) + ref_count(4) +
         // header_size(4) = 12, padded to 16 before the first message.
-        let prefix = source.read_exact_at(address, 16)?;
+        let prefix = source.read_metadata_at(address, 16)?;
         let version = prefix[0];
         if version != 1 {
             return Err(FormatError::InvalidObjectHeaderVersion(version));
@@ -768,7 +768,7 @@ impl ObjectHeader {
         if depth_remaining == 0 {
             return Err(FormatError::NestingDepthExceeded);
         }
-        let region = source.read_exact_at(region_addr, region_len.to_usize()?)?;
+        let region = source.read_metadata_at(region_addr, region_len.to_usize()?)?;
         let end = region.len();
         let mut pos = 0usize;
         let mut count = 0u16;
