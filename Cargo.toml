@@ -72,6 +72,10 @@ hdf5 = { package = "hdf5-metno", version = "0.12", features = ["static", "zlib"]
 name = "matlab_fixtures"
 required-features = ["serde"]
 
+[[example]]
+name = "ndarray_io"
+required-features = ["ndarray"]
+
 # Style-preference clippy lints muted crate-wide. The remaining clippy
 # surface is still on (`-D warnings` in CI), so genuinely problematic
 # patterns continue to fail the build.
