@@ -8,7 +8,7 @@ Pure-Rust HDF5 reader, writer, and in-place editor. No C dependencies, no build 
 
 - **Write** HDF5 files with datasets, groups, attributes, and nested hierarchies
 - **Read** HDF5 files (v0/v1/v2/v3 superblocks, v1/v2 object headers, contiguous/chunked/compact storage)
-- **Edit in place** — add, delete (`H5Ldelete`), and copy (`H5Ocopy`) datasets and groups in an existing file without reading it all in and rewriting it; the cost is proportional to what changes, not the file size
+- **Edit in place** — add, delete (`H5Ldelete`), and copy (`H5Ocopy`) datasets and groups in an existing file without reading it all in and rewriting it; the cost is proportional to what changes, not the file size, and an exclusive OS advisory lock guards against concurrent writers
 - **SWMR** (single-writer / multiple-reader) append and refreshing read for 1-D unlimited datasets, interoperable with the reference C library and h5py
 - **No C dependencies** — pure Rust, so it compiles to `wasm32-unknown-unknown` and to bare-metal `no_std` (with `alloc`)
 - **MATLAB v7.3 compatible** — userblock support, fixed-length ASCII attributes, variable-length string arrays, object references
@@ -124,6 +124,8 @@ session.commit().unwrap();  // apply everything in place
 ```
 
 Contiguous, unfiltered datasets and compact-link groups are supported, and the editor edits files across every on-disk format the reference C library and h5py produce — version 0/1/2/3 superblocks, single- and multi-chunk object headers (a multi-chunk header is collapsed into one chunk on rewrite, and a version 0/1 symbol-table group on the edited path is converted to the latest compact-link format). It refuses, rather than silently degrade the file, anything it cannot reproduce faithfully — a userblock (non-zero base address), chunked/compressed additions, dense-storage headers on the edited path, or copying an existing version-1 object. Within a session the space a deletion frees is reused for later writes and the file is truncated when the freed bytes reach the end, so add/delete churn stays bounded instead of only ever growing; for guaranteed compaction across a reopen, see `repack` below.
+
+`EditSession::open` takes an exclusive OS advisory lock (the analogue of `H5Pset_file_locking`), so a second editor or any concurrent writer gets `Error::FileLocked` rather than racing on the file. The kernel releases the lock on any process exit, including a crash, so a crashed editor never leaves a stale lock behind. Override the policy with `EditSession::open_with_locking` and the `FileLocking` enum, or set `HDF5_USE_FILE_LOCKING=FALSE` for filesystems (such as some network mounts) where locking is unavailable. `SwmrWriter` and the readers intentionally take no lock: SWMR is single-writer by contract and built for concurrent reads.
 
 ### Reclaiming space (`repack`)
 
@@ -571,7 +573,7 @@ For bare-metal `no_std`, disable default features (keep `checksum` for object-he
 
 ```toml
 [dependencies]
-hdf5-pure = { version = "0.14", default-features = false, features = ["checksum"] }
+hdf5-pure = { version = "0.15", default-features = false, features = ["checksum"] }
 ```
 
 The high-level `File` / `FileBuilder` API is `std`-gated, so a `no_std` build exposes only the lower-level primitives. WebAssembly builds keep the default features, since `std` is available on `wasm32-unknown-unknown`.
