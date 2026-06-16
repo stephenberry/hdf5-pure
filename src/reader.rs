@@ -930,12 +930,20 @@ impl<'f> Dataset<'f> {
     }
 
     /// Read all data as `i8` values.
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "read_i8 reinterprets each stored byte as the signed i8 the caller requested"
+    )]
     pub fn read_i8(&self) -> Result<Vec<i8>, Error> {
         let raw = self.read_raw()?;
         Ok(raw.iter().map(|&b| b as i8).collect())
     }
 
     /// Read all data as `i16` values.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "read_i16 narrows each stored value to the i16 element type the caller requested"
+    )]
     pub fn read_i16(&self) -> Result<Vec<i16>, Error> {
         let raw = self.read_raw()?;
         let dt = self.datatype()?;
@@ -944,6 +952,10 @@ impl<'f> Dataset<'f> {
     }
 
     /// Read all data as `u16` values.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "read_u16 narrows each stored value to the u16 element type the caller requested"
+    )]
     pub fn read_u16(&self) -> Result<Vec<u16>, Error> {
         let raw = self.read_raw()?;
         let dt = self.datatype()?;
@@ -952,6 +964,10 @@ impl<'f> Dataset<'f> {
     }
 
     /// Read all data as `u32` values.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "read_u32 narrows each stored value to the u32 element type the caller requested"
+    )]
     pub fn read_u32(&self) -> Result<Vec<u32>, Error> {
         let raw = self.read_raw()?;
         let dt = self.datatype()?;

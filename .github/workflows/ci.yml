@@ -187,55 +187,44 @@ jobs:
           cargo clippy --locked --target i686-unknown-linux-gnu --lib
           --features "serde zfp provenance parallel ndarray" -- -D warnings
 
-  # Ratchet for pointer-width-aware cast lints. On i686 clippy flags every
-  # potential `u64 as usize`-style narrowing; hundreds are benign (bounded
-  # counts/sizes) so we cannot `-D` them yet. Instead we cap the COUNT so a PR
-  # cannot introduce *new* narrowing casts. Drive CAST_BASELINE down over time
-  # (fix real ones; annotate benign ones with
-  # `#[expect(clippy::cast_possible_truncation, reason = "...")]`). When it
-  # reaches 0, replace this with `-D clippy::cast_possible_truncation`.
-  cast-ratchet-32bit:
-    name: 32-bit cast ratchet (i686)
+  # 32-bit narrowing-cast gate (issue #72). On i686 clippy flags every potential
+  # `u64 as usize`-style narrowing. Each such cast in the library is either
+  # routed through `crate::convert` (`to_usize`/`slice_range`/`u32_from`, which
+  # errors instead of truncating) or annotated at its site with
+  # `#[expect(clippy::cast_possible_truncation | cast_possible_wrap, reason = "...")]`
+  # stating why it cannot lose information. This job denies both lints, so a PR
+  # cannot introduce an unannotated narrowing cast, and denies
+  # `unfulfilled_lint_expectations`, so an `#[expect]` left behind after its cast
+  # is fixed or removed also fails — the annotations are self-cleaning.
+  #
+  # This replaces the earlier count-based ratchet, which a genuinely new cast
+  # could slip past as long as an unrelated one was removed in the same PR.
+  cast-deny-32bit:
+    name: 32-bit narrowing-cast gate (i686)
     runs-on: ubuntu-latest
-    env:
-      # Adjust DOWNWARD only, never upward. Measured on the pinned toolchain
-      # below; a different clippy version may report a slightly different count,
-      # in which case re-measure once and reset this.
-      CAST_BASELINE: 268
     steps:
       - uses: actions/checkout@v4
-      # Pinned so the baseline is stable against clippy-version drift.
+      # Pinned so the set of flagged casts is stable against clippy-version
+      # drift; bump deliberately and re-check the annotations when raising it.
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: clippy
           targets: i686-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
         with:
-          key: cast-ratchet-i686
-      - name: Count 32-bit narrowing-cast warnings
+          key: cast-deny-i686
+      - name: Deny 32-bit narrowing casts
         run: |
           set -euo pipefail
           # Force a fresh compile of OUR crate for the i686 target so clippy
-          # actually re-emits the lints (a cached build emits nothing);
-          # dependencies stay cached. The clean must be target-scoped.
+          # re-evaluates the lints (a cached build emits nothing, which would let
+          # a new cast slip through); dependencies stay cached. Target-scoped.
           cargo clean -p hdf5-pure --target i686-unknown-linux-gnu
-          # JSON is the only format that reliably carries the lint name per
-          # diagnostic (`--message-format=short` drops it).
           cargo clippy --locked --target i686-unknown-linux-gnu --lib \
             --features "serde zfp provenance parallel ndarray" \
-            --message-format=json \
-            -- -W clippy::cast_possible_truncation \
-               -W clippy::cast_possible_wrap > clippy.json
-          count=$(jq -r 'select(.reason == "compiler-message") | .message.code.code // empty' clippy.json \
-                  | grep -cE '^clippy::cast_possible_(truncation|wrap)$' || true)
-          echo "32-bit narrowing-cast warnings: $count (baseline ${CAST_BASELINE})"
-          if [ "$count" -gt "${CAST_BASELINE}" ]; then
-            echo "::error::32-bit narrowing-cast count rose to $count (> ${CAST_BASELINE}). A new u64-as-usize-style cast was added; route it through crate::convert (to_usize / slice_range / u32_from), or, if it is provably bounded, annotate it with #[expect(clippy::cast_possible_truncation, reason = \"...\")]."
-            exit 1
-          fi
-          if [ "$count" -lt "${CAST_BASELINE}" ]; then
-            echo "::notice::Cast count dropped to $count; lower CAST_BASELINE in ci.yml to lock it in."
-          fi
+            -- -D clippy::cast_possible_truncation \
+               -D clippy::cast_possible_wrap \
+               -D unfulfilled_lint_expectations
 
   # Real 32-bit execution under QEMU. The reference HDF5 C library
   # (`hdf5-metno`) is a 64-bit-only dev-dependency, so the C-crosscheck tests

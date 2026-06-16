@@ -113,12 +113,20 @@ pub fn build_string_filewrapper_metadata(object_count: usize) -> Vec<u8> {
     let mut saveobj_metadata = Vec::with_capacity(2 + object_count * 4);
     saveobj_metadata.extend_from_slice(&[0, 0]);
     for idx in 0..object_count {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "object index written into a 4-byte on-disk saveobj field; MAT files never hold more than u32::MAX objects"
+        )]
         saveobj_metadata.extend_from_slice(&[1, 1, 1, idx as u32]);
     }
     let saveobj_metadata = u32_bytes(&saveobj_metadata);
 
     let mut object_id_metadata = Vec::with_capacity(6 + object_count * 6);
     object_id_metadata.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "object count bounds a 4-byte on-disk object-id field; MAT files never hold more than u32::MAX objects"
+    )]
     for id in 1..=object_count as u32 {
         object_id_metadata.extend_from_slice(&[1, 0, 0, id, 0, id]);
     }
@@ -136,22 +144,31 @@ pub fn build_string_filewrapper_metadata(object_count: usize) -> Vec<u8> {
     let region6 = Vec::new();
     let region7 = vec![0u8; 8];
 
-    let mut offset = 40u32 + names_bytes.len() as u32;
-    region_offsets[0] = offset;
-    offset += class_id_metadata.len() as u32;
-    region_offsets[1] = offset;
-    offset += saveobj_metadata.len() as u32;
-    region_offsets[2] = offset;
-    offset += object_id_metadata.len() as u32;
-    region_offsets[3] = offset;
-    offset += nobj_metadata.len() as u32;
-    region_offsets[4] = offset;
-    offset += dynprop_metadata.len() as u32;
-    region_offsets[5] = offset;
-    offset += region6.len() as u32;
-    region_offsets[6] = offset;
-    offset += region7.len() as u32;
-    region_offsets[7] = offset;
+    // Accumulate each metadata region's length into the 4-byte filewrapper
+    // offsets. Every metadata region is far smaller than u32::MAX.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "region lengths accumulated into 4-byte on-disk filewrapper offsets; \
+                  metadata regions are far smaller than u32::MAX"
+    )]
+    {
+        let mut offset = 40u32 + names_bytes.len() as u32;
+        region_offsets[0] = offset;
+        offset += class_id_metadata.len() as u32;
+        region_offsets[1] = offset;
+        offset += saveobj_metadata.len() as u32;
+        region_offsets[2] = offset;
+        offset += object_id_metadata.len() as u32;
+        region_offsets[3] = offset;
+        offset += nobj_metadata.len() as u32;
+        region_offsets[4] = offset;
+        offset += dynprop_metadata.len() as u32;
+        region_offsets[5] = offset;
+        offset += region6.len() as u32;
+        region_offsets[6] = offset;
+        offset += region7.len() as u32;
+        region_offsets[7] = offset;
+    }
 
     regions.extend_from_slice(&version);
     regions.extend_from_slice(&num_names);

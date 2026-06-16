@@ -366,6 +366,10 @@ fn fwd_cast_f32_slice(vals: &[f32], coeffs: &mut [i32]) -> u32 {
     debug_assert_eq!(vals.len(), coeffs.len());
     let mut ieee_max: i32 = 0;
     for &v in vals {
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "8-bit IEEE-754 f32 exponent field (0..=255) cast to i32 never wraps"
+        )]
         let e = ((v.to_bits() >> 23) & 0xFF) as i32;
         if e > ieee_max {
             ieee_max = e;
@@ -381,7 +385,13 @@ fn fwd_cast_f32_slice(vals: &[f32], coeffs: &mut [i32]) -> u32 {
     let scale_exp = 30 + EBIAS_F32 - 1 - ieee_max;
     let scale = pow2_f64(scale_exp);
     for i in 0..vals.len() {
-        coeffs[i] = (vals[i] as f64 * scale) as i32;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "scaled block coefficient is bounded to |x| <= 2^30 by construction, fits i32"
+        )]
+        {
+            coeffs[i] = (vals[i] as f64 * scale) as i32;
+        }
     }
     emax_biased
 }
@@ -406,13 +416,23 @@ fn inv_cast_f32_slice(emax_biased: u32, coeffs: &[i32], out: &mut [f32]) {
     if emax_biased == 0 {
         return;
     }
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "emax_biased is a stored 8-bit f32 exponent (0..=255); cast to i32 never wraps"
+    )]
     let exp = emax_biased as i32 - EBIAS_F32 - 30;
     let scale = pow2_f64(exp);
     for (i, &c) in coeffs.iter().enumerate() {
         if c == 0 {
             continue;
         }
-        out[i] = ((c as f64) * scale) as f32;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "dequantized value is the original f32 magnitude, in range by construction"
+        )]
+        {
+            out[i] = ((c as f64) * scale) as f32;
+        }
     }
 }
 
@@ -446,7 +466,13 @@ fn fwd_cast_f64_slice(vals: &[f64], coeffs: &mut [i64]) -> u64 {
     let emax_biased = (ieee_max + 1) as u64;
     let scale = pow2_f64_wide(1084 - ieee_max);
     for i in 0..vals.len() {
-        coeffs[i] = (vals[i] * scale) as i64;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "scaled block coefficient is bounded to |x| <= 2^62 by construction, fits i64"
+        )]
+        {
+            coeffs[i] = (vals[i] * scale) as i64;
+        }
     }
     emax_biased
 }
@@ -466,6 +492,10 @@ fn inv_cast_f64_slice(emax_biased: u64, coeffs: &[i64], out: &mut [f64]) {
     if emax_biased == 0 {
         return;
     }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "emax_biased is a stored 11-bit f64 exponent (0..=2047), so it fits i32"
+    )]
     let exp = emax_biased as i32 - EBIAS_F64 - 62;
     let scale = pow2_f64_wide(exp);
     for (i, &c) in coeffs.iter().enumerate() {
@@ -821,6 +851,10 @@ fn int2uint_i32(x: i32) -> u32 {
     ((x as u32).wrapping_add(NBMASK_U32)) ^ NBMASK_U32
 }
 #[inline]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "negabinary-to-signed conversion: the u32 bit pattern is reinterpreted as i32 by design"
+)]
 fn uint2int_i32(x: u32) -> i32 {
     ((x ^ NBMASK_U32).wrapping_sub(NBMASK_U32)) as i32
 }
@@ -829,6 +863,10 @@ fn int2uint_i64(x: i64) -> u64 {
     ((x as u64).wrapping_add(NBMASK_U64)) ^ NBMASK_U64
 }
 #[inline]
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "negabinary-to-signed conversion: the u64 bit pattern is reinterpreted as i64 by design"
+)]
 fn uint2int_i64(x: u64) -> i64 {
     ((x ^ NBMASK_U64).wrapping_sub(NBMASK_U64)) as i64
 }
@@ -882,6 +920,10 @@ macro_rules! impl_few_ints {
                 let m = n.min(bits);
                 bits -= m;
                 if m > 0 {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "m is a bit count <= n <= size <= 64, fits u32"
+                    )]
                     w.write(m as u32, x);
                     x >>= m;
                 }
@@ -928,6 +970,10 @@ macro_rules! impl_few_ints {
                 k -= 1;
                 let m = n.min(bits);
                 bits -= m;
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "m is a bit count <= n <= size <= 64, fits u32"
+                )]
                 let mut x: u64 = if m > 0 { r.read(m as u32) } else { 0 };
                 while bits > 0 && n < size {
                     bits -= 1;
@@ -1129,6 +1175,10 @@ fn decode_block_f32(
     if !nonempty {
         // Skip remaining bits
         let remaining = maxbits.saturating_sub(1);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "min(64) caps the bit count at 64, well within u32"
+        )]
         r.read(remaining.min(64) as u32);
         if remaining > 64 {
             skip_bits(r, remaining - 64);
@@ -1137,6 +1187,10 @@ fn decode_block_f32(
     }
 
     // Read exponent — the stored value is `emax + 1` (see encode_block_f32).
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "r.read(EBITS_F32) yields an 8-bit value (returned as u64); fits u32"
+    )]
     let emax_biased = r.read(EBITS_F32) as u32;
 
     // Decode coefficients
@@ -1191,6 +1245,10 @@ fn decode_block_f64(
     let nonempty = r.read_bit();
     if !nonempty {
         let remaining = maxbits.saturating_sub(1);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "min(64) caps the bit count at 64, well within u32"
+        )]
         r.read(remaining.min(64) as u32);
         if remaining > 64 {
             skip_bits(r, remaining - 64);
@@ -1314,6 +1372,14 @@ macro_rules! impl_float_block_nd {
                 skip_bits(r, remaining);
                 return Ok([$zero; $bs]);
             }
+            // `#[allow]`, not `#[expect]`: `$emax_ty` is `u64` for f64 blocks
+            // (the cast is identity, so the lint never fires) and `u32` for f32
+            // blocks (a safe narrowing of an 8-bit exponent). An `#[expect]`
+            // would be unfulfilled in the u64 expansions.
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "exponent occupies $ebits (8 or 11) bits, so it fits the narrower $emax_ty"
+            )]
             let emax_biased: $emax_ty = r.read($ebits) as $emax_ty;
             let header_bits = 1 + ($ebits as usize);
             let coeff_bits = maxbits.saturating_sub(header_bits);
@@ -1600,6 +1666,10 @@ fn pad_bits(w: &mut BitWriter, n: usize) {
         remaining -= 64;
     }
     if remaining > 0 {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "loop above drains multiples of 64, so remaining is < 64 here; fits u32"
+        )]
         w.write(remaining as u32, 0);
     }
 }
@@ -1612,6 +1682,10 @@ fn skip_bits(r: &mut BitReader<'_>, n: usize) {
         remaining -= 64;
     }
     if remaining > 0 {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "loop above drains multiples of 64, so remaining is < 64 here; fits u32"
+        )]
         r.read(remaining as u32);
     }
 }
@@ -1713,6 +1787,10 @@ macro_rules! impl_codec {
             }
 
             fn compress_1d(data: &[u8], n: usize, rate: f64) -> Result<Vec<u8>, FormatError> {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "rate is bits-per-value (format-bounded); rate * 4 (1D block) is a small bit budget that fits usize"
+                )]
                 let maxbits = (rate * 4.0) as usize;
                 let total_bits = n.div_ceil(4) * maxbits;
                 let mut w = BitWriter::with_capacity(total_bits.div_ceil(8) + 8);
@@ -1740,6 +1818,10 @@ macro_rules! impl_codec {
                 n: usize,
                 rate: f64,
             ) -> Result<Vec<u8>, FormatError> {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "rate is bits-per-value (format-bounded); rate * 4 (1D block) is a small bit budget that fits usize"
+                )]
                 let maxbits = (rate * 4.0) as usize;
                 let mut r = BitReader::new(compressed);
                 let mut output = Vec::with_capacity(n * $esz);
@@ -1761,6 +1843,10 @@ macro_rules! impl_codec {
                 n0: usize,
                 rate: f64,
             ) -> Result<Vec<u8>, FormatError> {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "rate is bits-per-value (format-bounded); rate * 16 (2D block) is a small bit budget that fits usize"
+                )]
                 let maxbits = (rate * 16.0) as usize;
                 let nb1 = n1.div_ceil(4);
                 let nb0 = n0.div_ceil(4);
@@ -1800,6 +1886,10 @@ macro_rules! impl_codec {
                 n0: usize,
                 rate: f64,
             ) -> Result<Vec<u8>, FormatError> {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "rate is bits-per-value (format-bounded); rate * 16 (2D block) is a small bit budget that fits usize"
+                )]
                 let maxbits = (rate * 16.0) as usize;
                 let nb1 = n1.div_ceil(4);
                 let nb0 = n0.div_ceil(4);
@@ -1832,6 +1922,10 @@ macro_rules! impl_codec {
                 n0: usize,
                 rate: f64,
             ) -> Result<Vec<u8>, FormatError> {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "rate is bits-per-value (format-bounded); rate * 64 (3D block) is a small bit budget that fits usize"
+                )]
                 let maxbits = (rate * 64.0) as usize;
                 let nb2 = n2.div_ceil(4);
                 let nb1 = n1.div_ceil(4);
@@ -1904,6 +1998,10 @@ macro_rules! impl_codec {
                 n0: usize,
                 rate: f64,
             ) -> Result<Vec<u8>, FormatError> {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "rate is bits-per-value (format-bounded); rate * 64 (3D block) is a small bit budget that fits usize"
+                )]
                 let maxbits = (rate * 64.0) as usize;
                 let nb2 = n2.div_ceil(4);
                 let nb1 = n1.div_ceil(4);
@@ -1962,6 +2060,10 @@ macro_rules! impl_codec {
                 n0: usize,
                 rate: f64,
             ) -> Result<Vec<u8>, FormatError> {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "rate is bits-per-value (format-bounded); rate * 256 (4D block) is a small bit budget that fits usize"
+                )]
                 let maxbits = (rate * 256.0) as usize;
                 let nb3 = n3.div_ceil(4);
                 let nb2 = n2.div_ceil(4);
@@ -2080,6 +2182,10 @@ macro_rules! impl_codec {
                 n0: usize,
                 rate: f64,
             ) -> Result<Vec<u8>, FormatError> {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "rate is bits-per-value (format-bounded); rate * 256 (4D block) is a small bit budget that fits usize"
+                )]
                 let maxbits = (rate * 256.0) as usize;
                 let nb3 = n3.div_ceil(4);
                 let nb2 = n2.div_ceil(4);
@@ -2356,13 +2462,25 @@ pub fn zfp_cd_values_rate(
         .map(|&d| d.to_usize())
         .collect::<Result<_, _>>()?;
     let rank = dims_usize.len();
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "rank is a validated 1..=4 chunk rank; 4^rank <= 256, fits usize"
+    )]
     let block_values: usize = 4usize.pow(rank as u32);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "rate (bits-per-value) * block_values (<= 256) is a small bit budget that fits u64"
+    )]
     let maxbits = (rate * block_values as f64) as u64;
     // Encode header bits into a buffer.
     let mut w = BitWriter::new();
     w.write(8, u64::from(b'z'));
     w.write(8, u64::from(b'f'));
     w.write(8, u64::from(b'p'));
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "ZFP_CODEC is the constant 5; the codec id is a single magic byte and fits u8"
+    )]
     w.write(8, u64::from(ZFP_CODEC as u8));
     w.write(52, zfp_meta_for(element_type, &dims_usize));
     // Rate-mode short form: mode = maxbits - 1 for maxbits ≤ 2048.
@@ -2550,6 +2668,10 @@ pub fn zfp_rate_from_cd_values(cd_values: &[u32]) -> Option<f64> {
         let maxbits_enc = (mode >> 27) & 0x7FFF;
         maxbits_enc + 1
     };
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "rank is a validated 1..=4 chunk rank; 4^rank <= 256, fits u64"
+    )]
     let block_values = 4u64.pow(rank as u32);
     Some(maxbits as f64 / block_values as f64)
 }

@@ -368,6 +368,11 @@ pub fn generate_implicit_chunks(
     }
     let total_chunks: u64 = num_chunks_per_dim.iter().product();
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "with_capacity hint only; total_chunks is bounded by the dataset's chunk \
+                  grid and a truncated hint merely under-reserves (the Vec still grows)"
+    )]
     let mut chunks = Vec::with_capacity(total_chunks as usize);
     for linear_idx in 0..total_chunks {
         let mut offsets = vec![0u64; rank];
@@ -379,6 +384,11 @@ pub fn generate_implicit_chunks(
             offsets[d] = chunk_idx * chunk_dimensions[d] as u64;
         }
 
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "chunk byte size is stored in the 32-bit ChunkInfo.chunk_size field \
+                      (HDF5 caps a chunk at 4 GiB)"
+        )]
         chunks.push(ChunkInfo {
             chunk_size: chunk_byte_size as u32,
             filter_mask: 0,
@@ -443,7 +453,11 @@ pub fn read_chunked_data(
         .map(|&d| d as usize)
         .collect();
 
-    let ds_dims: Vec<usize> = dataspace.dimensions.iter().map(|&d| d as usize).collect();
+    let ds_dims: Vec<usize> = dataspace
+        .dimensions
+        .iter()
+        .map(|&d| d.to_usize())
+        .collect::<Result<_, _>>()?;
     if ds_dims.len() != rank {
         return Err(FormatError::ChunkedReadError(format!(
             "rank mismatch: dataspace has {} dims, layout has {} chunk dims (rank={})",
@@ -454,6 +468,11 @@ pub fn read_chunked_data(
     }
 
     // Collect chunks based on version and index type
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "chunk byte sizes and the datatype element size are encoded into 32-bit \
+                  chunk-info fields; both stay well below u32::MAX (HDF5 caps a chunk at 4 GiB)"
+    )]
     let chunks = match (version, chunk_index_type) {
         (3, _) => {
             let ndims = chunk_dimensions.len(); // rank+1
@@ -530,7 +549,7 @@ pub fn read_chunked_data(
     let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype);
     let decompressed_chunks = decompress_all_chunks(file_data, &chunks, pipeline, ctx)?;
 
-    let total_bytes = (dataspace.num_elements() as usize) * elem_size;
+    let total_bytes = dataspace.num_elements().to_usize()? * elem_size;
     Ok(assemble_chunks(
         &chunks,
         &decompressed_chunks,
@@ -906,6 +925,10 @@ fn assemble_chunks(
 
     for (chunk_info, decompressed) in chunks.iter().zip(decompressed.iter()) {
         // B-tree v1 (v3) offsets have rank+1 dims; v4 index offsets have rank dims
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "chunk coordinate offsets are bounded by ds_dims, which already fit usize"
+        )]
         let chunk_offsets: Vec<usize> = chunk_info
             .offsets
             .iter()
@@ -990,7 +1013,11 @@ pub fn read_chunked_data_cached(
         .map(|&d| d as usize)
         .collect();
 
-    let ds_dims: Vec<usize> = dataspace.dimensions.iter().map(|&d| d as usize).collect();
+    let ds_dims: Vec<usize> = dataspace
+        .dimensions
+        .iter()
+        .map(|&d| d.to_usize())
+        .collect::<Result<_, _>>()?;
     if ds_dims.len() != rank {
         return Err(FormatError::ChunkedReadError(format!(
             "rank mismatch: dataspace has {} dims, layout has {} chunk dims (rank={})",
@@ -1000,6 +1027,11 @@ pub fn read_chunked_data_cached(
         )));
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "chunk byte sizes and the datatype element size are encoded into 32-bit \
+                  chunk-info fields; both stay well below u32::MAX (HDF5 caps a chunk at 4 GiB)"
+    )]
     let chunks = if let Some(chunks) = cache.all_indexed_chunks() {
         chunks
     } else {
@@ -1071,7 +1103,7 @@ pub fn read_chunked_data_cached(
     };
 
     // Assemble output
-    let total_elements = dataspace.num_elements() as usize;
+    let total_elements = dataspace.num_elements().to_usize()?;
     let total_bytes = total_elements * elem_size;
     let mut output = vec![0u8; total_bytes];
 
@@ -1117,6 +1149,10 @@ pub fn read_chunked_data_cached(
             dec
         };
 
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "chunk coordinate offsets are bounded by ds_dims, which already fit usize"
+        )]
         let chunk_offsets: Vec<usize> = chunk_info
             .offsets
             .iter()

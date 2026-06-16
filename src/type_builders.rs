@@ -205,6 +205,10 @@ impl CompoundTypeBuilder {
             offset += sz as u64;
         }
         Datatype::Compound {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "accumulated compound size is stored in the 4-byte datatype size field"
+            )]
             size: offset as u32,
             members,
         }
@@ -461,6 +465,10 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
             AttributeMessage {
                 name: name.to_string(),
                 datatype: Datatype::String {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "string byte length is stored in the 4-byte fixed-string datatype size field"
+                    )]
                     size: bytes.len() as u32,
                     padding: StringPadding::NullPad,
                     charset: CharacterSet::Utf8,
@@ -480,6 +488,10 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
             AttributeMessage {
                 name: name.to_string(),
                 datatype: Datatype::String {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "max string byte length is stored in the 4-byte fixed-string datatype size field"
+                    )]
                     size: max_len as u32,
                     padding: StringPadding::NullPad,
                     charset: CharacterSet::Utf8,
@@ -493,6 +505,10 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
             AttributeMessage {
                 name: name.to_string(),
                 datatype: Datatype::String {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "string byte length is stored in the 4-byte fixed-string datatype size field"
+                    )]
                     size: bytes.len() as u32,
                     padding: StringPadding::NullPad,
                     charset: CharacterSet::Ascii,
@@ -512,6 +528,10 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
             AttributeMessage {
                 name: name.to_string(),
                 datatype: Datatype::String {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "max string byte length is stored in the 4-byte fixed-string datatype size field"
+                    )]
                     size: max_len as u32,
                     padding: StringPadding::NullPad,
                     charset: CharacterSet::Ascii,
@@ -532,8 +552,16 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
             let vl_ref_size = 16usize; // 4 + 8 + 4 for offset_size=8
             let mut raw = Vec::with_capacity(strings.len() * vl_ref_size);
             for (i, s) in strings.iter().enumerate() {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "VLEN string length is written into the 4-byte length prefix of the variable-length reference"
+                )]
                 raw.extend_from_slice(&(s.len() as u32).to_le_bytes());
                 raw.extend_from_slice(&0u64.to_le_bytes()); // patched later
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "1-based heap object index is written into the 4-byte object-index field of the variable-length reference"
+                )]
                 raw.extend_from_slice(&((i + 1) as u32).to_le_bytes());
             }
             AttributeMessage {
@@ -583,6 +611,10 @@ pub(crate) fn build_global_heap_collection(strings: &[&str]) -> Vec<u8> {
 
     // Objects (1-based indices)
     for (i, s) in strings.iter().enumerate() {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "1-based heap object index is written into the 2-byte heap-object index field"
+        )]
         let index = (i + 1) as u16;
         buf.extend_from_slice(&index.to_le_bytes());
         buf.extend_from_slice(&1u16.to_le_bytes()); // ref_count

@@ -22,10 +22,19 @@
 //! or size, a heap or collection size, `num_elements`, an element count, or any
 //! arithmetic on those that becomes a slice index or allocation size.
 //!
-//! Leave a plain `as` cast in place only when the source is **provably small on
-//! every supported target** (e.g. a `u8` "size of offsets" field that is 2/4/8,
-//! a version/flags byte, a `u16` message size capped at 64 KiB, or a small loop
+//! A narrowing `as` cast is acceptable only when the source is **provably
+//! bounded on every supported target** (e.g. a `u8` "size of offsets" field that
+//! is 2/4/8, a version/flags byte, a `u16` message size capped at 64 KiB, a
+//! match arm keyed on the on-disk field width it casts to, or a small loop
 //! counter). A `u8`/`u16` widening to `usize` never narrows and needs no guard.
+//!
+//! When you keep such a cast, annotate it at the site with
+//! `#[expect(clippy::cast_possible_truncation /* or cast_possible_wrap */,
+//! reason = "…")]`, where the `reason` states the bound that makes it safe. The
+//! 32-bit CI gate (the `cast-deny-32bit` job) denies both lints, so every
+//! narrowing cast must be either converted through the helpers above or
+//! explicitly accounted for this way; a leftover `#[expect]` whose cast was
+//! later removed fails the gate too, keeping the annotations honest.
 
 #[cfg(not(feature = "std"))]
 use core::ops::Range;

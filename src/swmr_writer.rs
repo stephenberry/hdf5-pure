@@ -942,6 +942,10 @@ impl SwmrWriter {
     }
 
     fn write_addr_at(&mut self, offset: usize, addr: u64) -> Result<(), Error> {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the 4-byte arm is taken only when this file's offset_size is 4 bytes"
+        )]
         match self.offset_size {
             4 => self.write_at(offset, &(addr as u32).to_le_bytes()),
             _ => self.write_at(offset, &addr.to_le_bytes()),
@@ -949,6 +953,10 @@ impl SwmrWriter {
     }
 
     fn write_length_at(&mut self, offset: usize, val: u64) -> Result<(), Error> {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the 4-byte arm is taken only when this file's length_size is 4 bytes"
+        )]
         match self.length_size {
             4 => self.write_at(offset, &(val as u32).to_le_bytes()),
             _ => self.write_at(offset, &val.to_le_bytes()),
@@ -1024,6 +1032,12 @@ fn locate_data_block(geom: &EaGeometry, idx_blk_elmts: u64, e: u64) -> DataBlock
         if e < elem + span {
             let sb_block_offset = elem - idx_blk_elmts;
             let within = e - elem;
+            // within/dn is a data-block index inside this super block, bounded by
+            // its data-block count (ndblks), which is small.
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "within/dn is a data-block index bounded by ndblks (small)"
+            )]
             let dblk_local = (within / dn) as usize;
             let db_start = elem + dblk_local as u64 * dn;
             return DataBlockLoc {

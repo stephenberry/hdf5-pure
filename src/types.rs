@@ -199,6 +199,11 @@ fn decode_attr_value(
                 Some(AttrValue::U64(vals[0]))
             } else {
                 // No U64Array variant, store as I64Array
+                #[expect(
+                    clippy::cast_possible_wrap,
+                    reason = "no U64Array AttrValue variant; values above i64::MAX are \
+                              reinterpreted as i64 by design (bit pattern preserved)"
+                )]
                 let i64_vals: Vec<i64> = vals.iter().map(|&v| v as i64).collect();
                 Some(AttrValue::I64Array(i64_vals))
             }
@@ -301,6 +306,11 @@ fn rebase_vl_refs(raw_data: &[u8], offset_size: u8, base_address: u64) -> Vec<u8
         };
         if !is_undef && addr != 0 {
             let new_addr = addr + base_address;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "each arm narrows to offset_size, the on-disk address width this \
+                          file uses to store the address being relocated"
+            )]
             match offset_size {
                 2 => out[addr_start..addr_end].copy_from_slice(&(new_addr as u16).to_le_bytes()),
                 4 => out[addr_start..addr_end].copy_from_slice(&(new_addr as u32).to_le_bytes()),

@@ -49,14 +49,26 @@ impl<'de> Deserializer<'de> for MatValueDeserializer {
 
     fn deserialize_i8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, MatError> {
         let v = to_i64(self.value, "i8")?;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "deserialize_i8 narrows the MAT scalar to the i8 the visitor requested; lossy by the serde contract"
+        )]
         visitor.visit_i8(v as i8)
     }
     fn deserialize_i16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, MatError> {
         let v = to_i64(self.value, "i16")?;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "deserialize_i16 narrows the MAT scalar to the i16 the visitor requested; lossy by the serde contract"
+        )]
         visitor.visit_i16(v as i16)
     }
     fn deserialize_i32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, MatError> {
         let v = to_i64(self.value, "i32")?;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "deserialize_i32 narrows the MAT scalar to the i32 the visitor requested; lossy by the serde contract"
+        )]
         visitor.visit_i32(v as i32)
     }
     fn deserialize_i64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, MatError> {
@@ -65,14 +77,26 @@ impl<'de> Deserializer<'de> for MatValueDeserializer {
     }
     fn deserialize_u8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, MatError> {
         let v = to_u64(self.value, "u8")?;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "deserialize_u8 narrows the MAT scalar to the u8 the visitor requested; lossy by the serde contract"
+        )]
         visitor.visit_u8(v as u8)
     }
     fn deserialize_u16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, MatError> {
         let v = to_u64(self.value, "u16")?;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "deserialize_u16 narrows the MAT scalar to the u16 the visitor requested; lossy by the serde contract"
+        )]
         visitor.visit_u16(v as u16)
     }
     fn deserialize_u32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, MatError> {
         let v = to_u64(self.value, "u32")?;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "deserialize_u32 narrows the MAT scalar to the u32 the visitor requested; lossy by the serde contract"
+        )]
         visitor.visit_u32(v as u32)
     }
     fn deserialize_u64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, MatError> {
@@ -81,6 +105,10 @@ impl<'de> Deserializer<'de> for MatValueDeserializer {
     }
     fn deserialize_f32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, MatError> {
         let v = to_f64(self.value, "f32")?;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "deserialize_f32 narrows the MAT scalar to the f32 the visitor requested; lossy by the serde contract"
+        )]
         visitor.visit_f32(v as f32)
     }
     fn deserialize_f64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, MatError> {
@@ -421,8 +449,20 @@ fn to_i64(v: MatValue, expected: &'static str) -> Result<i64, MatError> {
         MatValue::Scalar(ScalarNum::U8(x)) => Ok(x as i64),
         MatValue::Scalar(ScalarNum::U16(x)) => Ok(x as i64),
         MatValue::Scalar(ScalarNum::U32(x)) => Ok(x as i64),
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "the `x <= i64::MAX` guard keeps the U64 in i64 range, so `x as i64` cannot wrap"
+        )]
         MatValue::Scalar(ScalarNum::U64(x)) if x <= i64::MAX as u64 => Ok(x as i64),
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "coercing a MAT F64 scalar to the requested i64; float->int truncation is the intended numeric conversion"
+        )]
         MatValue::Scalar(ScalarNum::F64(x)) => Ok(x as i64),
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "coercing a MAT F32 scalar to the requested i64; float->int truncation is the intended numeric conversion"
+        )]
         MatValue::Scalar(ScalarNum::F32(x)) => Ok(x as i64),
         MatValue::Scalar(ScalarNum::Bool(b)) => Ok(i64::from(b)),
         other => mismatch(expected, other),
@@ -439,7 +479,15 @@ fn to_u64(v: MatValue, expected: &'static str) -> Result<u64, MatError> {
         MatValue::Scalar(ScalarNum::I16(x)) if x >= 0 => Ok(x as u64),
         MatValue::Scalar(ScalarNum::I32(x)) if x >= 0 => Ok(x as u64),
         MatValue::Scalar(ScalarNum::I64(x)) if x >= 0 => Ok(x as u64),
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the `x >= 0.0` guard keeps the F64 non-negative; float->int truncation to u64 is the intended numeric conversion"
+        )]
         MatValue::Scalar(ScalarNum::F64(x)) if x >= 0.0 => Ok(x as u64),
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the `x >= 0.0` guard keeps the F32 non-negative; float->int truncation to u64 is the intended numeric conversion"
+        )]
         MatValue::Scalar(ScalarNum::F32(x)) if x >= 0.0 => Ok(x as u64),
         MatValue::Scalar(ScalarNum::Bool(b)) => Ok(u64::from(b)),
         other => mismatch(expected, other),

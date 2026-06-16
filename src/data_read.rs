@@ -425,6 +425,10 @@ pub fn read_as_f32(raw: &[u8], datatype: &Datatype) -> Result<Vec<f32>, FormatEr
                 result.push(read_f32_bytes(chunk, &order));
             }
             Datatype::FloatingPoint { size: 8, .. } => {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "read_as_f32 narrows stored f64 values to the requested f32"
+                )]
                 result.push(read_f64_bytes(chunk, &order) as f32);
             }
             Datatype::FixedPoint {
@@ -466,6 +470,10 @@ pub fn read_as_i32(raw: &[u8], datatype: &Datatype) -> Result<Vec<i32>, FormatEr
     for i in 0..count {
         let chunk = &raw[i * elem_size..(i + 1) * elem_size];
         let v = read_signed_int(chunk, elem_size, &order);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "read_as_i32 narrows each stored signed value to the requested i32"
+        )]
         result.push(v as i32);
     }
     Ok(result)
@@ -572,6 +580,11 @@ fn read_unsigned_int(bytes: &[u8], size: usize, order: &DatatypeByteOrder) -> u6
     }
 }
 
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "reinterprets raw bytes as a signed integer; sign reinterpretation and \
+              sign-extension are the intended operations"
+)]
 fn read_signed_int(bytes: &[u8], size: usize, order: &DatatypeByteOrder) -> i64 {
     let buf = reorder_bytes(bytes, order);
     match size {

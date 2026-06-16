@@ -199,6 +199,10 @@ impl FilterPipeline {
     fn serialize_v1(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.push(1); // version
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "filter count is written into the 1-byte number-of-filters field of the v1 pipeline message"
+        )]
         buf.push(self.filters.len() as u8);
         buf.extend_from_slice(&[0u8; 6]); // reserved
 
@@ -213,9 +217,17 @@ impl FilterPipeline {
                 }
                 None => Vec::new(),
             };
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "filter name length is written into the 2-byte name-length field of the v1 pipeline message"
+            )]
             let name_length = name_bytes.len() as u16;
             buf.extend_from_slice(&name_length.to_le_bytes());
             buf.extend_from_slice(&f.flags.to_le_bytes());
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "client-data value count is written into the 2-byte client-data-values field of the v1 pipeline message"
+            )]
             buf.extend_from_slice(&(f.client_data.len() as u16).to_le_bytes());
 
             if !name_bytes.is_empty() {
@@ -242,6 +254,10 @@ impl FilterPipeline {
     fn serialize_v2(&self) -> Vec<u8> {
         let mut buf = Vec::new();
         buf.push(2); // version
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "filter count is written into the 1-byte number-of-filters field of the v2 pipeline message"
+        )]
         buf.push(self.filters.len() as u8);
 
         for f in &self.filters {
@@ -256,12 +272,24 @@ impl FilterPipeline {
                     }
                     None => vec![0],
                 };
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "filter name length is written into the 2-byte name-length field of the v2 pipeline message"
+                )]
                 buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
                 buf.extend_from_slice(&f.flags.to_le_bytes());
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "client-data value count is written into the 2-byte client-data-values field of the v2 pipeline message"
+                )]
                 buf.extend_from_slice(&(f.client_data.len() as u16).to_le_bytes());
                 buf.extend_from_slice(&name_bytes);
             } else {
                 buf.extend_from_slice(&f.flags.to_le_bytes());
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "client-data value count is written into the 2-byte client-data-values field of the v2 pipeline message"
+                )]
                 buf.extend_from_slice(&(f.client_data.len() as u16).to_le_bytes());
             }
 
