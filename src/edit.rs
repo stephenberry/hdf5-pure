@@ -96,7 +96,7 @@
 //! repoint leaves the prior file wholly intact. Whole-file compaction that
 //! reclaims every hole at once is still the separate repack path.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
@@ -134,6 +134,12 @@ const MAX_COMPACT_ATTRS: usize = 8;
 /// pathological or cyclic hard-link graph (HDF5 hard links can form cycles).
 /// Far deeper than any real group hierarchy.
 const MAX_COPY_DEPTH: u32 = 1000;
+
+/// Upper bound on the number of object headers walked when counting hard links
+/// across the file (issue #77 / reclaim safety). Far beyond any real file; a
+/// graph larger than this aborts the count, and the commit then leaves deleted
+/// objects unreclaimed (a safe leak) rather than risk an unbounded walk.
+const MAX_LINK_GRAPH_NODES: u32 = 1 << 24;
 
 /// Maximum number of object-header chunks to follow when gathering a header that
 /// spans continuation blocks, guarding against a cyclic continuation chain.
@@ -735,14 +741,37 @@ impl EditSession {
         // account for exhaustively, so the worst case is unreclaimed dead bytes,
         // never a freed-but-live region.
         let mut to_free: Vec<(u64, u64)> = Vec::new();
-        for &a in &deleted_addrs {
-            self.collect_free_spans(a, 0, &mut to_free);
+
+        // An object's storage is reclaimed only when the link being removed is
+        // its LAST hard link: HDF5 objects can have several hard links, and one
+        // reachable through a surviving link is still live (freeing it would
+        // corrupt the survivor). Count every hard link in the pre-commit file
+        // and reclaim a deleted object only when its count is exactly 1.
+        // `deleted_addrs` is de-duplicated first so two delete paths that are
+        // hard links to the same object are not visited (and freed) twice. If
+        // the link graph cannot be walked in full, no deleted object is
+        // reclaimed (a safe leak), but superseded headers — always dead once the
+        // root is repointed — still are.
+        deleted_addrs.sort_unstable();
+        deleted_addrs.dedup();
+        if let Some(incoming) = self.count_incoming_hard_links() {
+            for &a in &deleted_addrs {
+                self.collect_free_spans(a, 0, &incoming, &mut to_free);
+            }
         }
         for &a in &superseded_addrs {
             if let Ok(spans) = self.oh_chunk_spans(a) {
                 to_free.extend(spans);
             }
         }
+
+        // Defense in depth: never hand the free list an out-of-bounds or
+        // overlapping span. The last-link guard plus the per-object checks
+        // should already make the accumulated spans disjoint; this enforces it
+        // as a whole-commit invariant against the pre-commit end-of-file. Any
+        // dropped span (which should not occur for a well-formed file) only
+        // leaks, never corrupts.
+        retain_disjoint_in_bounds(&mut to_free, self.data.len() as u64);
 
         // --- Apply: process deepest groups first so each parent sees its
         // children's new addresses, then repoint the superblock last. ---
@@ -1658,6 +1687,59 @@ impl EditSession {
         Ok(spans)
     }
 
+    /// Count, for every object-header address reachable from the root, how many
+    /// hard links in the *pre-commit* file point to it. The result drives the
+    /// last-hard-link reclaim guard in [`collect_free_spans`](Self::collect_free_spans):
+    /// an object is freed only when its count is 1.
+    ///
+    /// Walks the whole link graph from the root, following hard links through
+    /// groups of any on-disk format (v0/v1 symbol-table, v2 compact, v2 dense)
+    /// via [`resolve_group_entries`], tallying each hard-link edge. Datasets and
+    /// other leaves contribute no edges. Returns `None` — so the caller reclaims
+    /// nothing for the deletions, a safe leak — if the graph cannot be walked in
+    /// full: an unparseable header, a group whose links cannot be enumerated, or
+    /// more than [`MAX_LINK_GRAPH_NODES`] objects. Cycles are handled by visiting
+    /// each object once. Assumes the editor's enforced `base_address == 0`.
+    fn count_incoming_hard_links(&self) -> Option<HashMap<u64, u32>> {
+        let os = self.superblock.offset_size;
+        let ls = self.superblock.length_size;
+        let base = self.superblock.base_address;
+        let mut counts: HashMap<u64, u32> = HashMap::new();
+        let mut visited: HashSet<u64> = HashSet::new();
+        let mut stack: Vec<u64> = vec![self.superblock.root_group_address];
+        let mut budget = MAX_LINK_GRAPH_NODES;
+        while let Some(addr) = stack.pop() {
+            if !visited.insert(addr) {
+                continue; // already expanded (also breaks hard-link cycles)
+            }
+            if budget == 0 {
+                return None; // graph larger than we will walk; leak conservatively
+            }
+            budget -= 1;
+            let off = usize::try_from(addr).ok()?;
+            let header = ObjectHeader::parse_with_base(&self.data, off, os, ls, base).ok()?;
+            // Datasets and other leaves are not groups and own no links.
+            let is_group = header.messages.iter().any(|m| {
+                matches!(
+                    m.msg_type,
+                    MessageType::SymbolTable | MessageType::Link | MessageType::LinkInfo
+                )
+            });
+            if !is_group {
+                continue;
+            }
+            // A group we cannot enumerate fully would undercount incoming links
+            // and risk over-reclaim; bail to the safe-leak fallback instead.
+            let entries = resolve_group_entries(&self.data, &header, os, ls, base).ok()?;
+            for e in entries {
+                let child = e.object_header_address.checked_add(base)?;
+                *counts.entry(child).or_insert(0) += 1;
+                stack.push(child);
+            }
+        }
+        Some(counts)
+    }
+
     /// Best-effort enumeration of every on-disk block owned by the object at
     /// `addr` (and, for a group, its whole subtree), accumulating `(addr, len)`
     /// spans into `out` for reclamation after a delete.
@@ -1672,8 +1754,29 @@ impl EditSession {
     /// use. Bounded by [`MAX_COPY_DEPTH`] against a hard-link cycle.
     /// Variable-length data in global-heap collections is never reclaimed here (a
     /// collection can be shared between objects), so it is simply left behind.
-    fn collect_free_spans(&self, addr: usize, depth: u32, out: &mut Vec<(u64, u64)>) {
+    ///
+    /// `incoming` is the file-wide hard-link count per object-header address
+    /// (from [`count_incoming_hard_links`](Self::count_incoming_hard_links)). An
+    /// object is reclaimed — and, for a group, descended into — only when its
+    /// count is exactly 1, i.e. the link being removed is its last: an object
+    /// still reachable through another hard link is live and is left untouched
+    /// (so is everything below a surviving group), which is what keeps deleting
+    /// one of several hard links from corrupting the survivor.
+    fn collect_free_spans(
+        &self,
+        addr: usize,
+        depth: u32,
+        incoming: &HashMap<u64, u32>,
+        out: &mut Vec<(u64, u64)>,
+    ) {
         if depth >= MAX_COPY_DEPTH {
+            return;
+        }
+        // Reclaim only when this delete removes the object's last hard link. A
+        // count other than 1 (it has surviving links, or the graph walk could
+        // not account for it) means the object — and a group's whole subtree —
+        // stays live and must not be freed.
+        if incoming.get(&(addr as u64)) != Some(&1) {
             return;
         }
         // The header's own chunks. If they cannot be mapped, account for nothing.
@@ -1705,7 +1808,7 @@ impl EditSession {
                 out.extend(spans);
                 for (_, child) in children {
                     if let Ok(c) = usize::try_from(child) {
-                        self.collect_free_spans(c, depth + 1, out);
+                        self.collect_free_spans(c, depth + 1, incoming, out);
                     }
                 }
             }
@@ -1902,6 +2005,26 @@ fn spans_disjoint_in_bounds(spans: &mut [(u64, u64)], eof: u64) -> bool {
     }
     spans.sort_unstable_by_key(|&(addr, _)| addr);
     spans.windows(2).all(|w| w[0].0 + w[0].1 <= w[1].0)
+}
+
+/// Sanitize the accumulated free spans for a whole commit so the free list never
+/// sees an out-of-bounds or overlapping (double-free) region: drop empty or
+/// past-`eof` spans, sort by address, then drop any span overlapping one already
+/// kept. Dropping only leaks (the bytes stay allocated); it never frees a live
+/// region. With the last-hard-link guard in force nothing should be dropped for
+/// a well-formed file — this is a backstop, not the primary defense.
+fn retain_disjoint_in_bounds(spans: &mut Vec<(u64, u64)>, eof: u64) {
+    spans.retain(|&(addr, len)| len > 0 && addr.checked_add(len).is_some_and(|e| e <= eof));
+    spans.sort_unstable_by_key(|&(addr, _)| addr);
+    let mut kept_end = 0u64;
+    spans.retain(|&(addr, len)| {
+        if addr >= kept_end {
+            kept_end = addr + len;
+            true
+        } else {
+            false // overlaps a span already kept; leak it rather than double-free
+        }
+    });
 }
 
 /// Validate a staged dataset and reduce it to a [`FlatDataset`]. Contiguous,
