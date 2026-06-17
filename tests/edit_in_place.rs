@@ -1465,3 +1465,240 @@ fn malformed_chunked_requests_are_rejected_without_writing() {
         std::fs::remove_file(&path).ok();
     }
 }
+
+// ---- write_dataset: in-place value overwrite (issue #79) ----
+
+#[test]
+fn write_dataset_same_size_overwrites_in_place() {
+    let path = std::env::temp_dir().join("hdf5_pure_write_same_size.h5");
+    write_starter(&path); // "original" = [1.0, 2.0, 3.0, 4.0] (contiguous f64)
+    let size_before = std::fs::metadata(&path).unwrap().len();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .write_dataset("original")
+            .with_f64_data(&[9.0, 8.0, 7.0, 6.0]);
+        session.commit().unwrap();
+    }
+
+    // Same-length overwrite reuses the existing block: the file does not grow.
+    let size_after = std::fs::metadata(&path).unwrap().len();
+    assert_eq!(size_after, size_before, "same-size write should not grow file");
+
+    let file = File::open(&path).unwrap();
+    let ds = file.dataset("original").unwrap();
+    assert_eq!(ds.dtype().unwrap(), DType::F64);
+    assert_eq!(ds.read_f64().unwrap(), vec![9.0, 8.0, 7.0, 6.0]);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn write_dataset_resize_keeping_shape_is_a_reshape_and_refused() {
+    // For a fixed-size datatype the byte length is shape * element size, so a
+    // different-length replacement necessarily changes the shape — which is a
+    // reshape, not a value overwrite, and is refused. (The genuine relocation
+    // path — overwriting a never-written, undefined-address dataset — is exercised
+    // in the crosscheck against the C library, which can create one.)
+    let path = std::env::temp_dir().join("hdf5_pure_write_resize_refused.h5");
+    write_starter(&path); // "original" = 4 f64
+    let before = std::fs::read(&path).unwrap();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.write_dataset("original").with_f64_data(&[42.0]);
+        let err = session.commit().unwrap_err();
+        assert!(
+            err.to_string().contains("shape does not match"),
+            "expected reshape refusal, got: {err}"
+        );
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before, "file modified on refusal");
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn write_dataset_in_a_nested_group() {
+    let path = std::env::temp_dir().join("hdf5_pure_write_nested.h5");
+    {
+        let mut b = FileBuilder::new();
+        let mut g = b.create_group("grp");
+        g.create_dataset("inner").with_i32_data(&[1, 2, 3]);
+        b.add_group(g.finish());
+        b.write(&path).unwrap();
+    }
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        // Same size (in place) for the nested dataset.
+        session
+            .write_dataset("grp/inner")
+            .with_i32_data(&[10, 20, 30]);
+        session.commit().unwrap();
+    }
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("grp/inner").unwrap().read_i32().unwrap(),
+        vec![10, 20, 30]
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn write_dataset_rejects_datatype_mismatch() {
+    let path = std::env::temp_dir().join("hdf5_pure_write_type_mismatch.h5");
+    write_starter(&path); // f64
+    let before = std::fs::read(&path).unwrap();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        // i32 data for an f64 dataset: a retype, refused.
+        session.write_dataset("original").with_i32_data(&[1, 2, 3, 4]);
+        let err = session.commit().unwrap_err();
+        assert!(
+            err.to_string().contains("datatype does not match"),
+            "expected datatype-mismatch refusal, got: {err}"
+        );
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before, "file modified on refusal");
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn write_dataset_rejects_shape_mismatch() {
+    let path = std::env::temp_dir().join("hdf5_pure_write_shape_mismatch.h5");
+    {
+        let mut b = FileBuilder::new();
+        // A 2-D dataset, so a 1-D replacement of the same element count is a
+        // reshape (different dataspace bytes), which is refused.
+        b.create_dataset("m")
+            .with_i32_data(&[1, 2, 3, 4, 5, 6])
+            .with_shape(&[2, 3]);
+        b.write(&path).unwrap();
+    }
+    let before = std::fs::read(&path).unwrap();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .write_dataset("m")
+            .with_i32_data(&[1, 2, 3, 4, 5, 6])
+            .with_shape(&[6]);
+        let err = session.commit().unwrap_err();
+        assert!(
+            err.to_string().contains("shape does not match"),
+            "expected shape-mismatch refusal, got: {err}"
+        );
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before, "file modified on refusal");
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn write_dataset_rejects_missing_target() {
+    let path = std::env::temp_dir().join("hdf5_pure_write_missing.h5");
+    write_starter(&path);
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.write_dataset("nope").with_f64_data(&[1.0]);
+        let err = session.commit().unwrap_err();
+        assert!(
+            err.to_string().contains("nothing to overwrite"),
+            "expected missing-target refusal, got: {err}"
+        );
+    }
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn write_dataset_rejects_chunked_target() {
+    let path = std::env::temp_dir().join("hdf5_pure_write_chunked.h5");
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("c")
+            .with_i32_data(&[1, 2, 3, 4, 5, 6, 7, 8])
+            .with_shape(&[8])
+            .with_chunks(&[4]);
+        b.write(&path).unwrap();
+    }
+    let before = std::fs::read(&path).unwrap();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .write_dataset("c")
+            .with_i32_data(&[8, 7, 6, 5, 4, 3, 2, 1])
+            .with_shape(&[8]);
+        let err = session.commit().unwrap_err();
+        assert!(
+            err.to_string().contains("chunked datasets cannot be overwritten"),
+            "expected chunked refusal, got: {err}"
+        );
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before, "file modified on refusal");
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn write_dataset_rejects_filtered_request() {
+    // A builder that itself requests chunking/filtering is refused as "not a
+    // value overwrite" before the on-disk dataset is even consulted.
+    let path = std::env::temp_dir().join("hdf5_pure_write_filtered_request.h5");
+    write_starter(&path);
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .write_dataset("original")
+            .with_f64_data(&[1.0, 2.0, 3.0, 4.0])
+            .with_shape(&[4])
+            .with_chunks(&[2]);
+        let err = session.commit().unwrap_err();
+        assert!(
+            err.to_string().contains("overwrites values only"),
+            "expected value-only refusal, got: {err}"
+        );
+    }
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn write_dataset_alongside_other_edits() {
+    // A value overwrite coexists with an addition and a delete in one commit.
+    let path = std::env::temp_dir().join("hdf5_pure_write_mixed.h5");
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("keep").with_f64_data(&[1.0, 2.0]);
+        b.create_dataset("doomed").with_i32_data(&[9]);
+        b.write(&path).unwrap();
+    }
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.write_dataset("keep").with_f64_data(&[5.0, 6.0]); // same size
+        session.create_dataset("added").with_i32_data(&[3, 4]);
+        session.delete("doomed");
+        session.commit().unwrap();
+    }
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.dataset("keep").unwrap().read_f64().unwrap(), vec![5.0, 6.0]);
+    assert_eq!(file.dataset("added").unwrap().read_i32().unwrap(), vec![3, 4]);
+    assert!(file.dataset("doomed").is_err());
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn write_dataset_with_no_other_edits_takes_inplace_fast_path() {
+    // A lone same-size overwrite must not rewrite headers or flip the root: the
+    // only on-disk bytes that change are the data block itself.
+    let path = std::env::temp_dir().join("hdf5_pure_write_fastpath.h5");
+    write_starter(&path);
+    let before = std::fs::read(&path).unwrap();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .write_dataset("original")
+            .with_f64_data(&[1.0, 2.0, 3.0, 4.0]); // identical bytes
+        session.commit().unwrap();
+    }
+    // Identical data written back in place leaves the file byte-for-byte the same.
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "in-place rewrite of identical data changed the file"
+    );
+    std::fs::remove_file(&path).ok();
+}

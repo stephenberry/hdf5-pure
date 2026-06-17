@@ -1,7 +1,7 @@
 //! In-place editing of an existing HDF5 file (issue #32, Group C).
 //!
-//! [`EditSession`] opens an existing file and adds objects or edits compact
-//! group attributes **in place**:
+//! [`EditSession`] opens an existing file and adds objects, overwrites dataset
+//! values, or edits compact group attributes **in place**:
 //! new data and object headers are written at the end of the file, and the
 //! object headers of the touched groups (and their ancestors up to the root)
 //! are rewritten — also appended — so the superblock ends up pointing at the
@@ -33,6 +33,21 @@
 //! that embeds a source-file absolute address (variable-length or reference data,
 //! a committed datatype), which an in-file copy keeps valid by sharing the source
 //! file's heaps and objects.
+//!
+//! Value overwrite ([`EditSession::write_dataset`], the HDF5 `H5Dwrite`) replaces
+//! an **existing** dataset's values. The replacement's datatype and shape must
+//! match the on-disk dataset (an overwrite, not a reshape or retype); only
+//! contiguous and compact datasets are supported, with chunked or filtered ones
+//! refused. A same-length contiguous overwrite is the cheapest edit there is — the
+//! new bytes go straight into the existing data block, so no header is rewritten
+//! and the superblock root is not flipped, and the synced data write is the
+//! commit's linearization point. When the length differs (e.g. filling a dataset
+//! the C library created but never wrote, whose data address was undefined) or the
+//! dataset is compact, the header relocates like an addition: the new data and a
+//! rewritten header are appended, the data-layout message is repointed, and the
+//! parent group's link is patched. A relocating overwrite of a dataset reachable
+//! through more than one hard link is refused, since only the one named link could
+//! be repointed at the moved header.
 //!
 //! # Scope
 //!
@@ -160,8 +175,9 @@ type PathKey = Vec<String>;
 ///
 /// Mirror the file in memory and keep a writable handle; every mutation is
 /// applied to both so the on-disk file stays consistent. Stage additions with
-/// [`create_dataset`](Self::create_dataset) / [`create_group`](Self::create_group)
-/// and group attribute edits with [`set_group_attr`](Self::set_group_attr) /
+/// [`create_dataset`](Self::create_dataset) / [`create_group`](Self::create_group),
+/// value overwrites with [`write_dataset`](Self::write_dataset), and group
+/// attribute edits with [`set_group_attr`](Self::set_group_attr) /
 /// [`remove_group_attr`](Self::remove_group_attr), then apply them with
 /// [`commit`](Self::commit).
 ///
@@ -190,6 +206,11 @@ pub struct EditSession {
     superblock: Superblock,
     /// Datasets staged by `create_dataset`, as (parent group path, builder).
     pending_datasets: Vec<(PathKey, DatasetBuilder)>,
+    /// Value overwrites staged by `write_dataset`, as (full dataset path,
+    /// builder). Each replaces an existing dataset's values in place; the new
+    /// datatype and shape must match the on-disk ones byte-exactly (this is a
+    /// value overwrite, not a reshape/retype). Applied on the next `commit`.
+    pending_writes: Vec<(PathKey, DatasetBuilder)>,
     /// New groups staged by `create_group`, as full paths.
     pending_groups: Vec<PathKey>,
     /// Group attribute edits staged as (group path, operation). The path may be
@@ -289,6 +310,7 @@ impl EditSession {
             sb_sig_off,
             superblock,
             pending_datasets: Vec::new(),
+            pending_writes: Vec::new(),
             pending_groups: Vec::new(),
             pending_group_attrs: Vec::new(),
             pending_deletes: Vec::new(),
@@ -429,6 +451,37 @@ impl EditSession {
         self.pending_datasets
             .push((comps, DatasetBuilder::new(&leaf)));
         &mut self.pending_datasets.last_mut().unwrap().1
+    }
+
+    /// Stage an in-place overwrite of an **existing** dataset's values (the HDF5
+    /// `H5Dwrite` whole-dataset write), applied on the next
+    /// [`commit`](Self::commit). `path` is the full path of a dataset that must
+    /// already exist; the returned [`DatasetBuilder`] — the same builder used by
+    /// [`create_dataset`](Self::create_dataset) — supplies the replacement data.
+    ///
+    /// This is a *value* overwrite, not a reshape or retype: the new data's
+    /// datatype and shape must match the on-disk dataset's exactly (byte-for-byte
+    /// after serialization, so endianness and compound layout must agree), or
+    /// `commit` reports [`Error::EditUnsupported`]. Only contiguous and compact
+    /// datasets are supported; a chunked or filtered dataset is refused by name.
+    /// Partial / sub-region writes are out of scope — the whole dataset is
+    /// replaced.
+    ///
+    /// When the new data is the same length as the existing contiguous data block
+    /// (the common case), the bytes are written straight into that block: no
+    /// object header is rewritten and the superblock root is not flipped, so the
+    /// commit's linearization point is the synced data write itself. When the
+    /// length differs (or the dataset previously had no data block at all), the
+    /// old extent is freed, the new bytes are placed at end-of-file or in a
+    /// reusable freed region, the data-layout message is repointed, the object
+    /// header is rewritten, and the parent group's link is patched — exactly like
+    /// an addition relocates the path up to the root.
+    pub fn write_dataset(&mut self, path: &str) -> &mut DatasetBuilder {
+        let comps = split_path(path);
+        let leaf = comps.last().cloned().unwrap_or_default();
+        self.pending_writes
+            .push((comps, DatasetBuilder::new(&leaf)));
+        &mut self.pending_writes.last_mut().unwrap().1
     }
 
     /// Stage a new (empty) group at `path`, created on the next
@@ -607,12 +660,95 @@ impl EditSession {
     /// are unreferenced slack.
     pub fn commit(&mut self) -> Result<(), Error> {
         if self.pending_datasets.is_empty()
+            && self.pending_writes.is_empty()
             && self.pending_groups.is_empty()
             && self.pending_group_attrs.is_empty()
             && self.pending_deletes.is_empty()
             && self.pending_copies.is_empty()
             && self.pending_cross_copies.is_empty()
         {
+            return Ok(());
+        }
+
+        // --- Preflight value overwrites (`write_dataset`) before any write, under
+        // the same all-or-nothing contract as additions. Each is resolved,
+        // validated (datatype and shape must match the on-disk dataset exactly),
+        // and classified: a same-length contiguous overwrite is applied straight
+        // in place (no header rewrite, no superblock flip), while a resize or
+        // compact rewrite relocates the header and is staged against its parent
+        // group so the commit below rebuilds it and patches the link. ---
+        let writes = std::mem::take(&mut self.pending_writes);
+        let mut inplace_writes: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut moving_writes: Vec<(PathKey, String, MovingWrite)> = Vec::new();
+        let mut write_targets: Vec<PathKey> = Vec::new();
+        // The file-wide hard-link count, computed lazily the first time a write
+        // relocates a header: such a write moves the dataset's object header and
+        // patches only the one parent link that names it, so a dataset reachable
+        // through more than one hard link would have its other links left pointing
+        // at the stale header. Refuse that rather than silently diverge the aliases
+        // (a same-length in-place overwrite is unaffected — it rewrites the shared
+        // data block, which every link sees).
+        let mut incoming_links: Option<Option<HashMap<u64, u32>>> = None;
+        for (full, db) in writes {
+            if full.is_empty() {
+                return Err(Error::EditUnsupported("cannot overwrite the root group"));
+            }
+            // A path named twice in one commit would write it twice (and double-
+            // free a resized extent); require separate commits.
+            if write_targets.contains(&full) {
+                return Err(Error::EditUnsupported(
+                    "the same dataset is overwritten twice in one commit; use separate commits",
+                ));
+            }
+            let path_str = full.join("/");
+            let addr = crate::group_v2::resolve_path_any(&self.data, &self.superblock, &path_str)
+                .map_err(|_| Error::EditUnsupported("nothing to overwrite at the given path"))?;
+            let addr = usize::try_from(addr)
+                .map_err(|_| Error::EditUnsupported("dataset address exceeds this platform"))?;
+            let fd = flatten_dataset(db)?;
+            match Self::prepare_write(&self.data, addr, &fd)? {
+                WritePlan::InPlace { data_addr, raw } => inplace_writes.push((data_addr, raw)),
+                WritePlan::Moving(mw) => {
+                    // A relocating overwrite is safe only when this is the
+                    // dataset's sole hard link. Compute the link graph once.
+                    let counts = incoming_links
+                        .get_or_insert_with(|| self.count_incoming_hard_links())
+                        .as_ref();
+                    match counts.and_then(|c| c.get(&(addr as u64))) {
+                        Some(&1) => {}
+                        _ => {
+                            return Err(Error::EditUnsupported(
+                                "overwriting a dataset that resizes or relocates its header is \
+                                 only supported when it has a single hard link",
+                            ));
+                        }
+                    }
+                    let leaf = full.last().unwrap().clone();
+                    let parent = full[..full.len() - 1].to_vec();
+                    moving_writes.push((parent, leaf, mw));
+                }
+            }
+            write_targets.push(full);
+        }
+
+        // Fast path: when the only staged edits are same-length in-place
+        // overwrites, apply them straight to their data blocks and return without
+        // rebuilding any header or flipping the superblock root. The commit's
+        // linearization point is the synced data write — there is no tree to
+        // repoint, so each overwrite stands alone. (A persisting file takes the
+        // same path: no free-space change occurs.)
+        if moving_writes.is_empty()
+            && self.pending_datasets.is_empty()
+            && self.pending_groups.is_empty()
+            && self.pending_group_attrs.is_empty()
+            && self.pending_deletes.is_empty()
+            && self.pending_copies.is_empty()
+            && self.pending_cross_copies.is_empty()
+        {
+            for (data_addr, raw) in &inplace_writes {
+                self.write_at(*data_addr, raw)?;
+            }
+            self.handle.sync_all().map_err(Error::Io)?;
             return Ok(());
         }
 
@@ -642,6 +778,14 @@ impl EditSession {
             add_targets.push(full);
             ensure_ancestors(&mut nodes, &parent);
             nodes.entry(parent).or_default().datasets.push(db);
+        }
+
+        // Attach relocating value overwrites (resized contiguous or compact) to
+        // their parent group nodes: the new header is written below and the
+        // parent's existing link patched to it, like an existing child group.
+        for (parent, leaf, mw) in moving_writes {
+            ensure_ancestors(&mut nodes, &parent);
+            nodes.entry(parent).or_default().writes.push((leaf, mw));
         }
 
         // Stage group attribute edits against their target groups. A target may
@@ -726,6 +870,13 @@ impl EditSession {
                 if is_prefix(d, t) {
                     return Err(Error::EditUnsupported(
                         "a deletion overlaps a group-attribute edit in the same commit; use separate commits",
+                    ));
+                }
+            }
+            for t in &write_targets {
+                if is_prefix(d, t) {
+                    return Err(Error::EditUnsupported(
+                        "a deletion overlaps a value overwrite in the same commit; use separate commits",
                     ));
                 }
             }
@@ -865,6 +1016,40 @@ impl EditSession {
             }
         }
 
+        // A relocating overwrite (`write_dataset` resize, or any compact rewrite)
+        // vacates the dataset's old object header, and a resized contiguous one
+        // also vacates its old data block: both become dead once the parent's
+        // relinked header lands. `superseded_addrs` covers only the rebuilt group
+        // headers, not the relocated dataset's own header, so record that here too.
+        // The pre-commit dataset-header address is resolved from the live file; its
+        // chunks and old data extent are freed only after the superblock repoint.
+        // The single-hard-link guard in the write preflight makes freeing the old
+        // header safe (no surviving link still points at it).
+        for key in &keys {
+            for (leaf, mw) in &nodes[key].writes {
+                if let MovingWrite::Contiguous {
+                    old_extent: Some(extent),
+                    ..
+                } = mw
+                {
+                    to_free.push(*extent);
+                }
+                // The relocated dataset's old header chunks are dead too.
+                let mut full = key.clone();
+                full.push(leaf.clone());
+                let path_str = full.join("/");
+                if let Ok(addr) =
+                    crate::group_v2::resolve_path_any(&self.data, &self.superblock, &path_str)
+                {
+                    if let Ok(a) = usize::try_from(addr) {
+                        if let Ok(spans) = self.oh_chunk_spans(a) {
+                            to_free.extend(spans);
+                        }
+                    }
+                }
+            }
+        }
+
         // Defense in depth: never hand the free list an out-of-bounds or
         // overlapping span. The last-link guard plus the per-object checks
         // should already make the accumulated spans disjoint; this enforces it
@@ -879,12 +1064,13 @@ impl EditSession {
         let mut by_depth = keys.clone();
         by_depth.sort_by_key(|k| std::cmp::Reverse(k.len())); // deepest first
         for key in &by_depth {
-            let (mut region, deletes, copies) = {
+            let (mut region, deletes, copies, writes) = {
                 let node = nodes.get_mut(key).unwrap();
                 (
                     std::mem::take(&mut node.base_region),
                     std::mem::take(&mut node.deletes),
                     std::mem::take(&mut node.copies),
+                    std::mem::take(&mut node.writes),
                 )
             };
 
@@ -918,6 +1104,13 @@ impl EditSession {
                 region.extend_from_slice(&encode_link_message(&fd.name, oh_addr));
             }
 
+            // Relocating value overwrites under this group: write the new data and
+            // rewritten header, then patch this group's existing link to it.
+            for (leaf, mw) in &writes {
+                let new_oh = self.write_moving(mw)?;
+                patch_link_target(&mut region, leaf, new_oh)?;
+            }
+
             // Wire links to dirty child groups (new → add a link; existing →
             // patch the existing link to the child's new address).
             for child in children.get(key).into_iter().flatten() {
@@ -933,6 +1126,16 @@ impl EditSession {
             let oh = build_v2_object_header(&region);
             let addr = self.alloc_or_append(&oh)?;
             new_addr.insert(key.clone(), addr);
+        }
+
+        // Same-length in-place overwrites (`write_dataset`) write straight into
+        // their existing, already-referenced data blocks. Those blocks are
+        // reachable from both the old and the new root (the dataset's header is
+        // unchanged), so the write is independent of the superblock flip; it is
+        // ordered before the barrier sync below so the new bytes are durable
+        // alongside everything else this commit appended.
+        for (data_addr, raw) in &inplace_writes {
+            self.write_at(*data_addr, raw)?;
         }
 
         // Repoint the superblock at the new root last: this is the commit's
@@ -1450,6 +1653,160 @@ impl EditSession {
         Ok(GroupInfo { region, link_names })
     }
 
+    /// Preflight a staged value overwrite (`write_dataset`): resolve the dataset
+    /// at `addr`, validate that the staged `fd` matches it byte-exactly in
+    /// datatype and shape, and classify how the bytes will be applied. No file
+    /// bytes are written here — this is part of the all-or-nothing preflight, so a
+    /// rejected write leaves the commit unapplied.
+    ///
+    /// Only contiguous and compact datasets are supported; a chunked or filtered
+    /// dataset (or a staged builder that itself requests chunking/filters/an
+    /// extensible shape) is refused with [`Error::EditUnsupported`], mirroring how
+    /// object copy refuses chunked storage. A datatype or shape that differs from
+    /// the on-disk dataset's is likewise refused — this is a value overwrite, not
+    /// a reshape or retype.
+    fn prepare_write(d: &[u8], addr: usize, fd: &FlatDataset) -> Result<WritePlan, Error> {
+        // A value overwrite never introduces chunking, filters, or an extensible
+        // shape: those would change the storage layout, not just the bytes.
+        if fd.chunk_options.is_chunked() || fd.maxshape.is_some() {
+            return Err(Error::EditUnsupported(
+                "write_dataset overwrites values only; it cannot make a dataset \
+                 chunked, filtered, or extensible",
+            ));
+        }
+
+        let region = Self::gather_oh_messages(d, addr)?;
+
+        // Locate the datatype, dataspace, and data-layout messages, and detect a
+        // filter pipeline (filtered storage is always chunked, never contiguous).
+        let mut datatype: Option<(usize, usize)> = None;
+        let mut dataspace: Option<(usize, usize)> = None;
+        let mut layout: Option<(usize, usize)> = None;
+        let mut has_filter = false;
+        let mut has_link = false;
+        let mut p = 0;
+        while let Some((msg_type, body, body_end)) = next_message(&region, p)? {
+            match msg_type {
+                MessageType::Datatype => datatype = Some((body, body_end)),
+                MessageType::Dataspace => dataspace = Some((body, body_end)),
+                MessageType::DataLayout => layout = Some((body, body_end)),
+                MessageType::FilterPipeline => has_filter = true,
+                MessageType::Link | MessageType::LinkInfo | MessageType::SymbolTable => {
+                    has_link = true;
+                }
+                _ => {}
+            }
+            p = body_end;
+        }
+
+        if has_link {
+            return Err(Error::EditUnsupported(
+                "write_dataset target is a group, not a dataset",
+            ));
+        }
+        if has_filter {
+            return Err(Error::EditUnsupported(
+                "filtered datasets cannot be overwritten in place yet",
+            ));
+        }
+        let (dt_b, dt_e) =
+            datatype.ok_or(Error::EditUnsupported("dataset header has no datatype"))?;
+        let (ds_b, ds_e) =
+            dataspace.ok_or(Error::EditUnsupported("dataset header has no dataspace"))?;
+        let (lb, le) = layout.ok_or(Error::EditUnsupported("dataset header has no data layout"))?;
+
+        // Compare datatype and shape structurally against the staged data. A
+        // value overwrite must keep both exactly: the datatype (including its
+        // class, size, endianness, and any compound/array/enumeration layout) so
+        // the bytes are interpreted the same, and the *current* dimensions so the
+        // byte count is unchanged. Parsing both sides and comparing the decoded
+        // values — rather than the raw message bytes — tolerates the harmless
+        // encoding differences between this crate's writer and the reference C
+        // library (e.g. the C library records a maximum-dimensions array equal to
+        // the current dimensions, which this crate omits) while still refusing any
+        // real retype or reshape.
+        let (disk_dt, _) = crate::datatype::Datatype::parse(&region[dt_b..dt_e])
+            .map_err(|_| Error::EditUnsupported("dataset header datatype could not be parsed"))?;
+        if disk_dt != fd.dt {
+            return Err(Error::EditUnsupported(
+                "write_dataset datatype does not match the on-disk dataset (overwrite, not retype)",
+            ));
+        }
+        let disk_ds = Dataspace::parse(&region[ds_b..ds_e], LENGTH_SIZE)
+            .map_err(|_| Error::EditUnsupported("dataset header dataspace could not be parsed"))?;
+        if disk_ds.space_type != fd.ds.space_type
+            || disk_ds.rank != fd.ds.rank
+            || disk_ds.dimensions != fd.ds.dimensions
+        {
+            return Err(Error::EditUnsupported(
+                "write_dataset shape does not match the on-disk dataset (overwrite, not reshape)",
+            ));
+        }
+
+        // Classify the layout. Version 3/4 contiguous (class 1) or compact
+        // (class 0) are supported; anything else (chunked, old-version) is refused.
+        if le - lb < 2 {
+            return Err(Error::EditUnsupported("malformed data-layout message"));
+        }
+        let version = region[lb];
+        if version != 3 && version != 4 {
+            return Err(Error::EditUnsupported(
+                "an unsupported data-layout version cannot be overwritten in place yet",
+            ));
+        }
+        match region[lb + 1] {
+            // Compact: the data is inline in the header. Rebuild the header with
+            // the new inline bytes (relocating it), patching the parent link.
+            0 => Ok(WritePlan::Moving(MovingWrite::Compact {
+                region,
+                raw: fd.raw.clone(),
+            })),
+            1 => {
+                if le - lb < 18 {
+                    return Err(Error::EditUnsupported("malformed contiguous data layout"));
+                }
+                let addr_off = lb + 2;
+                let data_addr =
+                    u64::from_le_bytes(region[addr_off..addr_off + 8].try_into().unwrap());
+                let data_size =
+                    u64::from_le_bytes(region[lb + 10..lb + 18].try_into().unwrap());
+
+                // Same length and a defined, in-bounds data block: overwrite the
+                // bytes straight in place. No header rewrite, no relink.
+                if data_addr != UNDEF && data_size == fd.raw.len() as u64 {
+                    if let Ok(start) = usize::try_from(data_addr) {
+                        if start
+                            .checked_add(fd.raw.len())
+                            .is_some_and(|e| e <= d.len())
+                        {
+                            return Ok(WritePlan::InPlace {
+                                data_addr: start,
+                                raw: fd.raw.clone(),
+                            });
+                        }
+                    }
+                }
+
+                // Length differs or the block was undefined/out of bounds: the new
+                // data goes elsewhere and the old extent (if any) is freed.
+                let old_extent = if data_addr != UNDEF && data_size > 0 {
+                    Some((data_addr, data_size))
+                } else {
+                    None
+                };
+                Ok(WritePlan::Moving(MovingWrite::Contiguous {
+                    region,
+                    addr_off,
+                    raw: fd.raw.clone(),
+                    old_extent,
+                }))
+            }
+            _ => Err(Error::EditUnsupported(
+                "chunked datasets cannot be overwritten in place yet",
+            )),
+        }
+    }
+
     /// Parse the object header at `addr` into a copyable model, validating that
     /// every message can be reproduced faithfully (verbatim message bytes, with
     /// only the contiguous data address and child link targets repointed).
@@ -1689,6 +2046,38 @@ impl EditSession {
                     let new_child = self.write_copy_subtree(child)?;
                     region.extend_from_slice(&encode_link_message(name, new_child));
                 }
+                let oh = build_v2_object_header(&region);
+                self.alloc_or_append(&oh)
+            }
+        }
+    }
+
+    /// Apply a relocating value overwrite (`write_dataset` resize / compact
+    /// rewrite): write the new data and a rewritten object header at end-of-file
+    /// (or into reusable freed space) and return the new header address. The
+    /// caller patches the parent group's link to this address. The old data
+    /// extent (for a resized contiguous dataset) is freed separately, after the
+    /// commit's superblock repoint, so it is never reused mid-commit.
+    fn write_moving(&mut self, mw: &MovingWrite) -> Result<u64, Error> {
+        match mw {
+            MovingWrite::Contiguous {
+                region,
+                addr_off,
+                raw,
+                ..
+            } => {
+                let new_data_addr = self.alloc_or_append(raw)?;
+                let mut region = region.clone();
+                region[*addr_off..*addr_off + 8].copy_from_slice(&new_data_addr.to_le_bytes());
+                // The data size field follows the 8-byte address in the contiguous
+                // layout body; keep it in sync with the new length.
+                let size_off = *addr_off + 8;
+                region[size_off..size_off + 8].copy_from_slice(&(raw.len() as u64).to_le_bytes());
+                let oh = build_v2_object_header(&region);
+                self.alloc_or_append(&oh)
+            }
+            MovingWrite::Compact { region, raw } => {
+                let region = rebuild_compact_layout_region(region, raw)?;
                 let oh = build_v2_object_header(&region);
                 self.alloc_or_append(&oh)
             }
@@ -2081,6 +2470,12 @@ struct Node {
     /// [`copy`](EditSession::copy)) or another open file (a cross-file
     /// [`copy_from`](EditSession::copy_from)).
     copies: Vec<(String, CopyTree)>,
+    /// Value overwrites whose dataset header relocates (a resize or compact
+    /// rewrite by `write_dataset`), as (child link name, the relocation plan). On
+    /// apply, the new data and header are written and this group's existing link
+    /// to the moved header is patched to its new address — exactly like an
+    /// existing child group's link.
+    writes: Vec<(String, MovingWrite)>,
     base_region: Vec<u8>,
     existing_links: Vec<String>,
 }
@@ -2144,6 +2539,37 @@ enum CopyTree {
 struct GroupInfo {
     region: Vec<u8>,
     link_names: Vec<String>,
+}
+
+/// How a staged value overwrite (`write_dataset`) will be applied, decided by
+/// [`EditSession::prepare_write`] during the all-or-nothing preflight.
+enum WritePlan {
+    /// A contiguous dataset whose new data is the same length as its existing,
+    /// defined data block: overwrite the bytes straight in place at `data_addr`.
+    /// No object header is rewritten and the superblock root is not flipped.
+    InPlace { data_addr: usize, raw: Vec<u8> },
+    /// The dataset's header relocates: a contiguous resize or a compact rewrite.
+    /// The parent group is rebuilt and its link patched. See [`MovingWrite`].
+    Moving(MovingWrite),
+}
+
+/// A value overwrite that relocates the dataset's object header — a contiguous
+/// dataset whose data length changed (or had no data block) or a compact dataset
+/// whose inline bytes are replaced. On apply the new data and a rewritten header
+/// are written at end-of-file (or into reusable freed space), and the parent
+/// group's link is repointed at the new header address.
+enum MovingWrite {
+    /// A contiguous dataset: write `raw` elsewhere, patch the data-layout address
+    /// at `addr_off` in the verbatim header `region`, rewrite the header, and free
+    /// `old_extent` (the prior data block, if any) after the commit lands.
+    Contiguous {
+        region: Vec<u8>,
+        addr_off: usize,
+        raw: Vec<u8>,
+        old_extent: Option<(u64, u64)>,
+    },
+    /// A compact dataset: rebuild the header `region` with `raw` inline.
+    Compact { region: Vec<u8>, raw: Vec<u8> },
 }
 
 /// A staged dataset reduced to the pieces the writer needs.
@@ -2483,6 +2909,67 @@ fn patch_link_target(region: &mut [u8], name: &str, new_addr: u64) -> Result<(),
     Err(Error::EditUnsupported(
         "expected child link not found in parent group",
     ))
+}
+
+/// Copy a chunk-0 message `region`, replacing the single (compact) Data Layout
+/// message's inline data with `raw` and preserving every other message verbatim.
+/// Used by `write_dataset` to overwrite a compact dataset's values. The message
+/// header (type and flags) and version byte are kept; only the inline data — and
+/// the message size and 2-byte inline-size fields — change. `raw` must fit the
+/// compact layout's 2-byte size field (HDF5's 64 KiB compact-storage limit),
+/// which an overwrite of an existing compact dataset always satisfies.
+fn rebuild_compact_layout_region(region: &[u8], raw: &[u8]) -> Result<Vec<u8>, Error> {
+    if raw.len() > u16::MAX as usize {
+        return Err(Error::EditUnsupported(
+            "compact dataset data is too large to overwrite in place",
+        ));
+    }
+    let mut out = Vec::with_capacity(region.len() + raw.len());
+    let mut p = 0;
+    let mut replaced = false;
+    while let Some((msg_type, body, body_end)) = next_message(region, p)? {
+        if msg_type == MessageType::DataLayout {
+            if body_end - body < 2 || region[body + 1] != 0 {
+                return Err(Error::EditUnsupported(
+                    "compact-layout overwrite found a non-compact data layout",
+                ));
+            }
+            // New compact layout body: version (kept), class=0, 2-byte inline
+            // size, then the data.
+            let mut layout = Vec::with_capacity(4 + raw.len());
+            layout.push(region[body]); // version (3 or 4)
+            layout.push(0); // class = compact
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "raw.len() bounded to u16::MAX above"
+            )]
+            layout.extend_from_slice(&(raw.len() as u16).to_le_bytes());
+            layout.extend_from_slice(raw);
+            // Message record: type byte, 2-byte size (LE), flags byte (kept).
+            out.push(region[p]);
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "layout body length is 4 + raw.len() <= u16::MAX + 4, and an OH \
+                          message size that overflows u16 is itself malformed"
+            )]
+            out.extend_from_slice(&(layout.len() as u16).to_le_bytes());
+            out.push(region[p + 3]);
+            out.extend_from_slice(&layout);
+            replaced = true;
+        } else {
+            out.extend_from_slice(&region[p..body_end]);
+        }
+        p = body_end;
+    }
+    if p < region.len() {
+        out.extend_from_slice(&region[p..]);
+    }
+    if !replaced {
+        return Err(Error::EditUnsupported(
+            "compact dataset header has no data-layout message",
+        ));
+    }
+    Ok(out)
 }
 
 /// Copy a chunk-0 message `region`, dropping the single Link message named
@@ -2894,6 +3381,71 @@ mod tests {
 
         let plain = region_message(MessageType::Dataspace, &[0u8; 8]);
         reject_foreign_addresses(&plain).unwrap();
+    }
+
+    /// Build a compact data-layout message body: version, class=0, 2-byte inline
+    /// size, then the data.
+    fn compact_layout_body(version: u8, data: &[u8]) -> Vec<u8> {
+        let mut b = vec![version, 0];
+        b.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        b.extend_from_slice(data);
+        b
+    }
+
+    #[test]
+    fn rebuild_compact_layout_replaces_inline_data_only() {
+        // A region with a Dataspace message, a compact Data Layout, and a trailing
+        // Attribute message: rewriting the inline data must replace exactly the
+        // layout's bytes and leave every other message verbatim.
+        let mut region = region_message(MessageType::Dataspace, &[0xAB; 8]);
+        region.extend_from_slice(&region_message(
+            MessageType::DataLayout,
+            &compact_layout_body(3, &[1, 2, 3, 4]),
+        ));
+        region.extend_from_slice(&region_message(MessageType::Attribute, &[0xCD; 5]));
+
+        let out = rebuild_compact_layout_region(&region, &[9, 8, 7, 6]).unwrap();
+
+        // Same messages in the same order; only the layout's inline data changed.
+        assert_eq!(
+            region_types(&out),
+            vec![
+                MessageType::Dataspace,
+                MessageType::DataLayout,
+                MessageType::Attribute,
+            ]
+        );
+        let mut p = 0;
+        while let Some((mt, body, end)) = next_message(&out, p).unwrap() {
+            match mt {
+                MessageType::Dataspace => assert_eq!(&out[body..end], &[0xAB; 8]),
+                MessageType::DataLayout => {
+                    assert_eq!(out[body], 3, "version preserved");
+                    assert_eq!(out[body + 1], 0, "still compact");
+                    let size = u16::from_le_bytes([out[body + 2], out[body + 3]]) as usize;
+                    assert_eq!(size, 4);
+                    assert_eq!(&out[body + 4..body + 4 + size], &[9, 8, 7, 6]);
+                }
+                MessageType::Attribute => assert_eq!(&out[body..end], &[0xCD; 5]),
+                other => panic!("unexpected message {other:?}"),
+            }
+            p = end;
+        }
+    }
+
+    #[test]
+    fn rebuild_compact_layout_refuses_non_compact() {
+        // A contiguous (class 1) data layout is not compact, so the rebuild refuses
+        // rather than corrupt it.
+        let mut region = region_message(MessageType::DataLayout, &{
+            let mut b = vec![3u8, 1]; // version 3, class 1 (contiguous)
+            b.extend_from_slice(&0u64.to_le_bytes());
+            b.extend_from_slice(&0u64.to_le_bytes());
+            b
+        });
+        region.extend_from_slice(&region_message(MessageType::Dataspace, &[0; 8]));
+        let err = rebuild_compact_layout_region(&region, &[1, 2]).unwrap_err();
+        assert!(err.to_string().contains("non-compact"), "got: {err}");
     }
 
     #[test]

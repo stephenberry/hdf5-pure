@@ -1,6 +1,6 @@
-//! Editing an existing file in place with `EditSession`: add, copy (within the
-//! file and across two open files), and delete objects, and edit group
-//! attributes, without reading the whole file in and rewriting it.
+//! Editing an existing file in place with `EditSession`: add, overwrite, copy
+//! (within the file and across two open files), and delete objects, and edit
+//! group attributes, without reading the whole file in and rewriting it.
 //!
 //! New data and rebuilt object headers are appended at end-of-file and the
 //! superblock is repointed last, so a failed commit leaves the original file
@@ -54,6 +54,11 @@ fn main() {
         .with_chunks(&[512])
         .with_shuffle()
         .with_deflate(6);
+    // Overwrite an existing dataset's values in place (H5Dwrite). Same datatype
+    // and shape (3 f64), so the new bytes go straight into the existing block.
+    session
+        .write_dataset("temperature")
+        .with_f64_data(&[24.0, 24.4, 23.9]);
     session.copy("temperature", "temperature_backup"); // H5Ocopy (same file)
     // Cross-file H5Ocopy: pull an object out of another open file.
     session
@@ -79,7 +84,10 @@ fn main() {
         .read_f64()
         .unwrap();
 
+    let temperature = file.dataset("temperature").unwrap().read_f64().unwrap();
+
     println!("added   run2/signal        = {signal:?}");
+    println!("overwr. temperature        = {temperature:?}");
     println!(
         "added   run2/waveform      = {} compressed samples",
         waveform_read.len()
@@ -98,6 +106,9 @@ fn main() {
 
     assert_eq!(signal, vec![1.0, 2.0, 3.0]);
     assert_eq!(waveform_read, waveform);
+    assert_eq!(temperature, vec![24.0, 24.4, 23.9]); // overwritten value
+    // The backup is a copy of the pre-commit on-disk dataset, captured before the
+    // overwrite was applied, so it keeps the original values.
     assert_eq!(backup, vec![22.5, 23.1, 21.8]);
     assert_eq!(calibration, vec![0.99, 1.00, 1.01]);
     assert!(file.dataset("sensors/pressure").is_err());
