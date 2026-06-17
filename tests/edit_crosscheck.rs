@@ -550,3 +550,231 @@ fn chunked_and_filtered_datasets_added_in_place_are_c_readable() {
         vec![1.0, 2.0, 3.0]
     );
 }
+
+#[test]
+fn deleting_chunked_datasets_in_place_stays_c_readable() {
+    // Reclaiming chunked storage on delete (issue #77) must leave a file the
+    // reference C library still reads. The starter is written by the C library
+    // with HDF5 1.8 bounds, so its chunked dataset uses a *B-tree v1* index — the
+    // foreign layout the editor's own writer never emits. The editor deletes it
+    // in place, then churns an editor-written (Fixed Array) chunked dataset to
+    // prove its storage is reclaimed and reused rather than leaked. Finally both
+    // readers see only the contiguous survivor in the shrunken, valid file.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_chunked_delete.h5");
+    {
+        let file = hdf5::File::with_options()
+            .with_fapl(|p| p.libver_bounds(LibraryVersion::V18, LibraryVersion::V18))
+            .create(&path)
+            .unwrap();
+        file.new_dataset::<f64>()
+            .shape((3,))
+            .create("keep")
+            .unwrap()
+            .write(&[1.0f64, 2.0, 3.0])
+            .unwrap();
+        let chunked: Vec<i32> = (0..2048).collect();
+        file.new_dataset::<i32>()
+            .shape((2048,))
+            .chunk((256,)) // 8 chunks of 256 i32 = 1024 bytes each, B-tree v1
+            .create("c_chunked")
+            .unwrap()
+            .write(&chunked)
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    let with_c_chunked = std::fs::metadata(&path).unwrap().len();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        // Reclaim the C-written B-tree-v1 chunked dataset.
+        session.delete("c_chunked");
+        session.commit().unwrap();
+        // Re-add *contiguous* datasets sized to the reclaimed 1024-byte chunk
+        // holes. (Chunked adds always append their blob, so contiguous adds are
+        // what exercise reuse of a freed interior hole.) Six 1024-byte blocks fit
+        // within the ~8 KB the delete freed, so the file barely grows; if the
+        // B-tree-v1 storage had leaked instead, they would all append and the
+        // file would grow by ~6 KB, failing the bound below.
+        for i in 0..6 {
+            session
+                .create_dataset(&format!("r{i}"))
+                .with_i32_data(&vec![i; 256]); // 256 i32 = 1024 bytes, one chunk hole
+            session.commit().unwrap();
+        }
+    }
+    let after = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        after < with_c_chunked + 4096,
+        "deleting the C-written B-tree-v1 chunked dataset must reclaim its storage \
+         for the contiguous re-adds to reuse, not leak it (was {with_c_chunked}, \
+         after six 1 KiB re-adds {after})"
+    );
+
+    // hdf5-pure: the deleted dataset is gone, the survivor and re-adds read back,
+    // and the recorded end-of-file matches the physical size.
+    let f = File::open(&path).unwrap();
+    assert_eq!(f.file_size(), std::fs::metadata(&path).unwrap().len());
+    assert!(f.dataset("c_chunked").is_err());
+    assert_eq!(
+        f.dataset("keep").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0]
+    );
+    for i in 0..6 {
+        assert_eq!(
+            f.dataset(&format!("r{i}")).unwrap().read_i32().unwrap(),
+            vec![i; 256]
+        );
+    }
+
+    // The reference C library reads the reclaimed file too.
+    let c = hdf5::File::open(&path).unwrap();
+    assert!(
+        c.dataset("c_chunked").is_err(),
+        "deleted chunked dataset still present (C)"
+    );
+    assert_eq!(
+        c.dataset("keep").unwrap().read_raw::<f64>().unwrap(),
+        vec![1.0, 2.0, 3.0]
+    );
+    for i in 0..6 {
+        assert_eq!(
+            c.dataset(&format!("r{i}"))
+                .unwrap()
+                .read_raw::<i32>()
+                .unwrap(),
+            vec![i; 256]
+        );
+    }
+}
+
+#[test]
+fn deleting_one_of_several_hard_links_keeps_the_survivor() {
+    // Issue #77 review (finding #1): an HDF5 object can have several hard links.
+    // Deleting ONE link must not reclaim the object's storage while another link
+    // still references it — freeing it would corrupt the survivor once the bytes
+    // are reused. Covers a chunked (Fixed Array) object and a contiguous one,
+    // each linked twice; one link of each is deleted, then churn forces the
+    // allocator to reuse anything wrongly freed.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_hardlink_survivor.h5");
+    let chunked: Vec<i32> = (0..512).collect();
+    {
+        let file = hdf5::File::with_options()
+            .with_fapl(|p| p.libver_bounds(LibraryVersion::V110, LibraryVersion::latest()))
+            .create(&path)
+            .unwrap();
+        file.new_dataset::<i32>()
+            .shape((512,))
+            .chunk((64,))
+            .create("chunked_orig")
+            .unwrap()
+            .write(&chunked)
+            .unwrap();
+        file.link_hard("/chunked_orig", "chunked_alias").unwrap();
+        file.new_dataset::<f64>()
+            .shape((4,))
+            .create("contig_orig")
+            .unwrap()
+            .write(&[1.0f64, 2.0, 3.0, 4.0])
+            .unwrap();
+        file.link_hard("/contig_orig", "contig_alias").unwrap();
+        file.close().unwrap();
+    }
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.delete("chunked_orig");
+        session.delete("contig_orig");
+        session.commit().unwrap();
+        for i in 0..6 {
+            session
+                .create_dataset(&format!("f{i}"))
+                .with_i32_data(&vec![i; 300]);
+            session.commit().unwrap();
+            session.delete(&format!("f{i}"));
+            session.commit().unwrap();
+        }
+    }
+
+    // The surviving aliases must still read their data through both readers; the
+    // deleted link names are gone.
+    let f = File::open(&path).unwrap();
+    assert!(f.dataset("chunked_orig").is_err());
+    assert!(f.dataset("contig_orig").is_err());
+    assert_eq!(
+        f.dataset("chunked_alias").unwrap().read_i32().unwrap(),
+        chunked
+    );
+    assert_eq!(
+        f.dataset("contig_alias").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+
+    let c = hdf5::File::open(&path).unwrap();
+    assert!(c.dataset("chunked_orig").is_err());
+    assert_eq!(
+        c.dataset("chunked_alias")
+            .unwrap()
+            .read_raw::<i32>()
+            .unwrap(),
+        chunked
+    );
+    assert_eq!(
+        c.dataset("contig_alias")
+            .unwrap()
+            .read_raw::<f64>()
+            .unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+}
+
+#[test]
+fn deleting_all_hard_links_to_an_object_in_one_commit_is_safe() {
+    // Issue #77 review (finding #2): deleting every hard link to a chunked object
+    // in a single commit must not double-free its storage (a debug-build panic in
+    // the free list) nor corrupt the file. The storage is conservatively left as
+    // dead bytes; the file stays valid and the unrelated survivor reads back.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_hardlink_all.h5");
+    {
+        let file = hdf5::File::with_options()
+            .with_fapl(|p| p.libver_bounds(LibraryVersion::V110, LibraryVersion::latest()))
+            .create(&path)
+            .unwrap();
+        file.new_dataset::<i32>()
+            .shape((512,))
+            .chunk((64,))
+            .create("orig")
+            .unwrap()
+            .write(&(0..512).collect::<Vec<i32>>())
+            .unwrap();
+        file.link_hard("/orig", "alias").unwrap();
+        file.new_dataset::<f64>()
+            .shape((2,))
+            .create("keep")
+            .unwrap()
+            .write(&[9.0f64, 8.0])
+            .unwrap();
+        file.close().unwrap();
+    }
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.delete("orig");
+        session.delete("alias"); // both links to the same object, one commit
+        session.commit().unwrap();
+    }
+    let f = File::open(&path).unwrap();
+    assert!(f.dataset("orig").is_err());
+    assert!(f.dataset("alias").is_err());
+    assert_eq!(
+        f.dataset("keep").unwrap().read_f64().unwrap(),
+        vec![9.0, 8.0]
+    );
+    let c = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        c.dataset("keep").unwrap().read_raw::<f64>().unwrap(),
+        vec![9.0, 8.0]
+    );
+}

@@ -924,6 +924,27 @@ pub(crate) fn build_aesb(
     buf
 }
 
+/// On-disk byte size of an Extensible Array index block (`EAIB`): the prefix
+/// (signature, version, client id, header address), the always-written inline
+/// element slots, the direct data-block and super-block address pointers, and a
+/// trailing checksum. The single source of truth shared by the bulk writer
+/// ([`build_extensible_array_at`]) and the in-place editor's reclaim walk, so
+/// the two cannot disagree on how many bytes the index block occupies.
+pub(crate) fn aeib_size(
+    offset_size: u8,
+    inline_elmts: usize,
+    elem_size: usize,
+    ndblk_addrs: usize,
+    nsblk_addrs: usize,
+) -> usize {
+    let os = offset_size as usize;
+    4 + 1 + 1 + os // signature + version + client id + header address
+        + inline_elmts * elem_size // inline element slots (always all written)
+        + ndblk_addrs * os // direct data-block addresses
+        + nsblk_addrs * os // super-block addresses
+        + 4 // checksum
+}
+
 /// The six Extensible Array header statistics, in the C library's stored order.
 /// Used by the SWMR append writer (`std` only).
 #[cfg(feature = "std")]
@@ -1119,11 +1140,7 @@ pub fn build_extensible_array_at(
 
     let ndblk_addrs = geom.direct_dblk_nelmts.len();
     let nsblk_addrs = geom.nsblk_addrs;
-    let aeib_size = 4 + 1 + 1 + os // sig + ver + client + hdr_addr
-        + inline * elem_size       // inline elements (always all slots)
-        + ndblk_addrs * os         // direct data block addresses
-        + nsblk_addrs * os         // super block addresses
-        + 4; // checksum
+    let aeib_size = aeib_size(offset_size, inline, elem_size, ndblk_addrs, nsblk_addrs);
     let body_base = aeib_address + aeib_size as u64;
 
     let undef_addr: u64 = match offset_size {

@@ -246,24 +246,38 @@ fn trailing_slack_past_recorded_eof_stays_readable() {
 }
 
 #[test]
-fn deleting_chunked_dataset_leaks_but_does_not_corrupt() {
-    // A chunked/compressed dataset's storage (B-tree index + chunks) is not one
-    // of the block classes the free-walk enumerates, so its bytes are left
-    // behind rather than risk freeing a region still in use. The delete must
-    // still succeed and leave a valid file with the survivor intact.
-    let path = tmp("hdf5_pure_fs_chunked_leak.h5");
+fn deleting_filtered_chunked_dataset_reclaims_storage() {
+    // A chunked, filtered (Fixed Array index) dataset's storage — chunk data
+    // blocks plus the FAHD/FADB index — is now reclaimed on delete. Deleting it
+    // shrinks the file below its size with the dataset present, the survivor
+    // stays byte-exact, and the file stays valid.
+    let path = tmp("hdf5_pure_fs_chunked_filtered.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("keep").with_i32_data(&[42, 43, 44]);
-    b.create_dataset("comp")
-        .with_f64_data(&vec![3.0; 4096])
-        .with_chunks(&[512])
-        .with_deflate(6);
     b.write(&path).unwrap();
+    let size_keep_only = std::fs::metadata(&path).unwrap().len();
 
     {
         let mut s = EditSession::open(&path).unwrap();
+        s.create_dataset("comp")
+            .with_f64_data(&vec![3.0; 4096])
+            .with_chunks(&[512])
+            .with_deflate(6);
+        s.commit().unwrap();
+        let size_with_comp = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            size_with_comp > size_keep_only,
+            "adding a chunked dataset should grow the file"
+        );
+
         s.delete("comp");
         s.commit().unwrap();
+        let size_after_delete = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            size_after_delete < size_with_comp,
+            "deleting the chunked dataset should reclaim its storage \
+             (was {size_with_comp}, now {size_after_delete})"
+        );
     }
 
     assert_eof_matches_file(&path);
@@ -274,6 +288,296 @@ fn deleting_chunked_dataset_leaks_but_does_not_corrupt() {
         vec![42, 43, 44]
     );
     assert!(file.dataset("comp").is_err());
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn deleting_unfiltered_chunked_dataset_truncates_fully() {
+    // An unfiltered chunked dataset whose chunk size is a cache-line multiple is
+    // laid out as one contiguous blob (chunk data + Fixed Array index, no
+    // inter-chunk padding). Adding it at end-of-file then deleting it in the same
+    // session reclaims the whole blob as a trailing run, truncating the file back
+    // to essentially its prior size.
+    let path = tmp("hdf5_pure_fs_chunked_unfiltered.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
+    b.write(&path).unwrap();
+    let size_start = std::fs::metadata(&path).unwrap().len();
+
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        // 8 chunks of 512 f64 = 4096 bytes each (a multiple of the cache line).
+        s.create_dataset("big")
+            .with_f64_data(&vec![7.0; 4096])
+            .with_chunks(&[512]);
+        s.commit().unwrap();
+        let size_with_big = std::fs::metadata(&path).unwrap().len();
+        assert!(size_with_big > size_start + 4096 * 8);
+
+        s.delete("big");
+        s.commit().unwrap();
+        let size_after_delete = std::fs::metadata(&path).unwrap().len();
+        // The reclaimed blob formed a trailing run, so the file is truncated back
+        // close to its starting size (a small, bounded amount of reused/rewritten
+        // header churn aside).
+        assert!(
+            size_after_delete < size_start + 4096,
+            "deleting an unfiltered chunked dataset should truncate the file back \
+             near its start (start {size_start}, after delete {size_after_delete})"
+        );
+    }
+
+    assert_eof_matches_file(&path);
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.root().datasets().unwrap(), vec!["keep".to_string()]);
+    assert_eq!(
+        file.dataset("keep").unwrap().read_i32().unwrap(),
+        vec![1, 2, 3]
+    );
+    assert!(file.dataset("big").is_err());
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn deleting_paged_fixed_array_dataset_reclaims_storage() {
+    // More than 1024 chunks puts the Fixed Array data block into its *paged*
+    // layout (a page-init bitmap and per-page checksums). 1100 chunks of 16 f64
+    // (128 bytes, a cache-line multiple) exercise that index-sizing path end to
+    // end: the whole index plus chunk data is reclaimed on delete.
+    let path = tmp("hdf5_pure_fs_paged_fa.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("keep").with_i32_data(&[7]);
+    b.write(&path).unwrap();
+    let size_start = std::fs::metadata(&path).unwrap().len();
+
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        s.create_dataset("paged")
+            .with_f64_data(&vec![1.0; 1100 * 16])
+            .with_chunks(&[16]); // 1100 chunks > 1024 page size
+        s.commit().unwrap();
+        let size_with_paged = std::fs::metadata(&path).unwrap().len();
+
+        s.delete("paged");
+        s.commit().unwrap();
+        let size_after_delete = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            size_after_delete < size_with_paged,
+            "deleting a paged fixed-array dataset should reclaim its storage \
+             (was {size_with_paged}, now {size_after_delete})"
+        );
+        // Cache-line-aligned chunks + the index form a trailing run, so the file
+        // truncates back near its start.
+        assert!(size_after_delete < size_start + 4096);
+    }
+
+    assert_eof_matches_file(&path);
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.root().datasets().unwrap(), vec!["keep".to_string()]);
+    assert_eq!(file.dataset("keep").unwrap().read_i32().unwrap(), vec![7]);
+    assert!(file.dataset("paged").is_err());
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn deleting_extensible_dataset_reclaims_storage() {
+    // A dataset with an unlimited maximum dimension uses an Extensible Array chunk
+    // index (EAHD/EAIB and, past the inline slots, data blocks). Deleting it
+    // reclaims the whole index plus its chunk data.
+    let path = tmp("hdf5_pure_fs_extensible.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("keep").with_i32_data(&[9]);
+    b.write(&path).unwrap();
+    let size_start = std::fs::metadata(&path).unwrap().len();
+
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        // 64 chunks of 64 f64 — enough to spill past the index block's inline
+        // slots into separate data blocks, exercising the data-block walk.
+        s.create_dataset("ext")
+            .with_f64_data(&vec![2.5; 4096])
+            .with_chunks(&[64])
+            .with_maxshape(&[u64::MAX]);
+        s.commit().unwrap();
+        let size_with_ext = std::fs::metadata(&path).unwrap().len();
+        assert!(size_with_ext > size_start);
+
+        s.delete("ext");
+        s.commit().unwrap();
+        let size_after_delete = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            size_after_delete < size_with_ext,
+            "deleting an extensible-array dataset should reclaim its storage \
+             (was {size_with_ext}, now {size_after_delete})"
+        );
+    }
+
+    assert_eof_matches_file(&path);
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.root().datasets().unwrap(), vec!["keep".to_string()]);
+    assert_eq!(file.dataset("keep").unwrap().read_i32().unwrap(), vec![9]);
+    assert!(file.dataset("ext").is_err());
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn deleting_single_chunk_dataset_reclaims_storage() {
+    // A dataset whose single chunk covers the whole shape uses the single-chunk
+    // index (the chunk address lives in the layout message, no separate index
+    // structure). Deleting it reclaims that one chunk block.
+    let path = tmp("hdf5_pure_fs_single_chunk.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("keep").with_i32_data(&[5, 6]);
+    b.write(&path).unwrap();
+    let size_start = std::fs::metadata(&path).unwrap().len();
+
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        // 1024 f64 = 8192 bytes (a cache-line multiple), so the single chunk's
+        // blob carries no trailing padding and reclaims as one trailing run.
+        s.create_dataset("one")
+            .with_f64_data(&vec![1.25; 1024])
+            .with_chunks(&[1024]); // one chunk covers the whole dataset
+        s.commit().unwrap();
+        let size_with_one = std::fs::metadata(&path).unwrap().len();
+        assert!(size_with_one > size_start + 8192);
+
+        s.delete("one");
+        s.commit().unwrap();
+        let size_after_delete = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            size_after_delete < size_with_one,
+            "deleting a single-chunk dataset should reclaim its chunk \
+             (was {size_with_one}, now {size_after_delete})"
+        );
+        // The 8192-byte chunk dominates; reclaim truncates the file back near
+        // its starting size.
+        assert!(size_after_delete < size_start + 4096);
+    }
+
+    assert_eof_matches_file(&path);
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.root().datasets().unwrap(), vec!["keep".to_string()]);
+    assert_eq!(
+        file.dataset("keep").unwrap().read_i32().unwrap(),
+        vec![5, 6]
+    );
+    assert!(file.dataset("one").is_err());
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn chunked_churn_within_session_stays_bounded() {
+    // Repeatedly add then delete a sizable chunked dataset in one session. With
+    // chunk + index reclaim and reuse the file must not grow without bound.
+    let path = tmp("hdf5_pure_fs_chunked_churn.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
+    b.write(&path).unwrap();
+
+    let mut high_water = 0u64;
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        for i in 0..8 {
+            s.create_dataset("scratch")
+                .with_f64_data(&vec![i as f64; 2048])
+                .with_chunks(&[256])
+                .with_deflate(4);
+            s.commit().unwrap();
+            high_water = high_water.max(std::fs::metadata(&path).unwrap().len());
+            s.delete("scratch");
+            s.commit().unwrap();
+        }
+    }
+
+    let final_size = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        final_size < high_water,
+        "chunked churn should reclaim space (peak {high_water}, final {final_size})"
+    );
+
+    assert_eof_matches_file(&path);
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.root().datasets().unwrap(), vec!["keep".to_string()]);
+    assert_eq!(
+        file.dataset("keep").unwrap().read_i32().unwrap(),
+        vec![1, 2, 3]
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn deleting_subtree_with_chunked_members_reclaims() {
+    // Deleting a group reclaims its chunked-dataset members' storage too (the
+    // free walk descends the subtree).
+    let path = tmp("hdf5_pure_fs_chunked_subtree.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("keep").with_i32_data(&[1]);
+    b.write(&path).unwrap();
+
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        s.create_group("grp");
+        s.create_dataset("grp/a")
+            .with_f64_data(&vec![1.0; 4096])
+            .with_chunks(&[512]);
+        s.create_dataset("grp/b")
+            .with_f64_data(&vec![2.0; 2048])
+            .with_chunks(&[256])
+            .with_deflate(6);
+        s.commit().unwrap();
+        let with_group = std::fs::metadata(&path).unwrap().len();
+
+        s.delete("grp");
+        s.commit().unwrap();
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            after < with_group,
+            "deleting a subtree with chunked members should reclaim them \
+             (was {with_group}, now {after})"
+        );
+    }
+
+    assert_eof_matches_file(&path);
+    let file = File::open(&path).unwrap();
+    assert!(file.group("grp").is_err());
+    assert_eq!(file.dataset("keep").unwrap().read_i32().unwrap(), vec![1]);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn persisted_chunked_reclaim_is_disjoint_and_reusable() {
+    // With persistence on, deleting a chunked dataset records its storage as
+    // free sections that stay disjoint and are reused across reopen.
+    let path = tmp("hdf5_pure_fs_chunked_persist.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("keep").with_i32_data(&[1; 50]);
+    b.create_dataset("comp")
+        .with_f64_data(&vec![3.0; 4096])
+        .with_chunks(&[512])
+        .with_deflate(6);
+    b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1);
+    b.write(&path).unwrap();
+
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        s.delete("comp");
+        s.commit().unwrap();
+    }
+    assert_eof_matches_file(&path);
+
+    let f = File::open(&path).unwrap();
+    assert!(f.file_space_info().unwrap().persist);
+    let mut free = f.persisted_free_space();
+    free.sort();
+    for w in free.windows(2) {
+        assert!(
+            w[0].0 + w[0].1 <= w[1].0,
+            "persisted free regions must be disjoint after a chunked delete: {free:?}"
+        );
+    }
+    assert_eq!(f.dataset("keep").unwrap().read_i32().unwrap(), vec![1; 50]);
+    assert!(f.dataset("comp").is_err());
     std::fs::remove_file(&path).ok();
 }
 

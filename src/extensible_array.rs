@@ -10,7 +10,7 @@ extern crate alloc;
 use alloc::{format, vec, vec::Vec};
 
 use crate::chunked_read::ChunkInfo;
-use crate::convert::{TryToUsize, u32_from};
+use crate::convert::{TryToUsize, is_undefined_addr, u32_from};
 use crate::error::FormatError;
 use crate::source::FileSource;
 
@@ -54,15 +54,6 @@ fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
         ]),
         _ => return Err(FormatError::InvalidOffsetSize(size)),
     })
-}
-
-fn is_undefined_addr(addr: u64, offset_size: u8) -> bool {
-    match offset_size {
-        2 => addr == 0xFFFF,
-        4 => addr == 0xFFFF_FFFF,
-        8 => addr == 0xFFFF_FFFF_FFFF_FFFF,
-        _ => false,
-    }
 }
 
 fn is_undefined(data: &[u8], pos: usize, size: u8) -> bool {
@@ -792,6 +783,191 @@ fn read_super_block(
     }
 
     Ok(chunks)
+}
+
+/// On-disk byte spans `(addr, len)` of an Extensible Array chunk index's own
+/// structure — the header (`EAHD`), the index block (`EAIB`), and every
+/// allocated super block (`EASB`) and data block (`EADB`, paged or not) — for
+/// reclaiming a deleted chunked dataset. The chunk *data* blocks the array
+/// points at are enumerated separately (via [`read_extensible_array_chunks`]),
+/// so they are not included here.
+///
+/// `ea_base` is the Extensible Array header address from the data-layout
+/// message. The walk mirrors [`read_extensible_array_chunks`] exactly — same
+/// [`EaGeometry`], same block addresses read from the index and super blocks —
+/// but records each block's extent (sized by [`eadb_size`] / [`aesb_size`],
+/// shared with the writer) instead of decoding chunk records. Only blocks with
+/// a defined (non-`0xFF`) address are emitted, so a partially-grown array
+/// contributes exactly its allocated blocks. The caller validates the spans
+/// against the file bounds.
+#[cfg(feature = "std")]
+pub(crate) fn extensible_array_index_spans(
+    file_data: &[u8],
+    ea_base: u64,
+    offset_size: u8,
+    length_size: u8,
+) -> Result<Vec<(u64, u64)>, FormatError> {
+    use crate::chunked_write::{aesb_size, eadb_size};
+
+    let header =
+        ExtensibleArrayHeader::parse(file_data, ea_base.to_usize()?, offset_size, length_size)?;
+    let os = offset_size as usize;
+    let elem_size = ea_elem_stride(&header, offset_size);
+    if header.max_dblk_nelmts_bits >= 64 {
+        return Err(FormatError::ChunkedReadError(
+            "Extensible Array page exponent out of range".into(),
+        ));
+    }
+    let page_nelmts = 1u64 << header.max_dblk_nelmts_bits;
+    let blk_off_size = (header.max_nelmts_bits as usize).div_ceil(8);
+
+    // EAHD header block.
+    let aehd_size = ExtensibleArrayHeader::serialized_size(offset_size, length_size) as u64;
+    let mut spans = vec![(ea_base, aehd_size)];
+
+    if is_undefined_addr(header.index_block_address, offset_size) {
+        return Ok(spans);
+    }
+
+    // EAIB index block. Its size — inline element slots plus direct- and
+    // super-block address pointers — comes from the same geometry the writer
+    // uses (see `build_extensible_array_at`).
+    let geom = EaGeometry::from_header(&header);
+    let ndblk_addrs = geom.direct_dblk_nelmts.len();
+    let nsblk_addrs = geom.nsblk_addrs;
+    let inline = header.idx_blk_elmts as usize;
+    let ib_header = 4 + 1 + 1 + os; // sig + ver + client + hdr_addr
+    let aeib_size =
+        crate::chunked_write::aeib_size(offset_size, inline, elem_size, ndblk_addrs, nsblk_addrs);
+    let ib_addr = header.index_block_address;
+    let ib_off = ib_addr.to_usize()?;
+    if ib_off + 4 > file_data.len() {
+        return Err(FormatError::UnexpectedEof {
+            expected: ib_off + 4,
+            available: file_data.len(),
+        });
+    }
+    if &file_data[ib_off..ib_off + 4] != b"EAIB" {
+        return Err(FormatError::ChunkedReadError(
+            "invalid Extensible Array index block signature".into(),
+        ));
+    }
+    spans.push((ib_addr, aeib_size as u64));
+
+    // Read the index block's direct data-block addresses, then its super-block
+    // addresses, immediately following the inline element slots.
+    let mut pos = ib_off + ib_header + inline * elem_size;
+    for &dblk_nelmts in &geom.direct_dblk_nelmts {
+        let addr = read_offset(file_data, pos, offset_size)?;
+        pos += os;
+        if is_undefined_addr(addr, offset_size) {
+            continue;
+        }
+        spans.push((
+            addr,
+            eadb_size(
+                dblk_nelmts,
+                elem_size,
+                page_nelmts,
+                offset_size,
+                blk_off_size,
+            ),
+        ));
+    }
+    for j in 0..nsblk_addrs {
+        let addr = read_offset(file_data, pos, offset_size)?;
+        pos += os;
+        if is_undefined_addr(addr, offset_size) {
+            continue;
+        }
+        let (ndblks, dblk_nelmts) = geom.sblks[geom.first_indirect_sblk + j];
+        spans.push((
+            addr,
+            aesb_size(ndblks, dblk_nelmts, page_nelmts, offset_size, blk_off_size),
+        ));
+        easb_data_block_spans(
+            file_data,
+            addr,
+            ndblks,
+            dblk_nelmts,
+            page_nelmts,
+            offset_size,
+            blk_off_size,
+            elem_size,
+            &mut spans,
+        )?;
+    }
+
+    Ok(spans)
+}
+
+/// Append the `(addr, len)` spans of the data blocks (`EADB`) reachable through
+/// one super block (`EASB`) at `sb_addr`. Mirrors [`read_super_block`]'s address
+/// reading (header, optional page-init bitmap, then `ndblks` data-block
+/// addresses), emitting an extent for each defined address.
+#[cfg(feature = "std")]
+#[allow(clippy::too_many_arguments)]
+fn easb_data_block_spans(
+    file_data: &[u8],
+    sb_addr: u64,
+    ndblks: u64,
+    dblk_nelmts: u64,
+    page_nelmts: u64,
+    offset_size: u8,
+    blk_off_size: usize,
+    elem_size: usize,
+    spans: &mut Vec<(u64, u64)>,
+) -> Result<(), FormatError> {
+    use crate::chunked_write::eadb_size;
+
+    let os = offset_size as usize;
+    let sb_off = sb_addr.to_usize()?;
+    let sb_header = 4 + 1 + 1 + os + blk_off_size; // sig + ver + client + hdr_addr + block_offset
+    if sb_off + sb_header > file_data.len() {
+        return Err(FormatError::UnexpectedEof {
+            expected: sb_off + sb_header,
+            available: file_data.len(),
+        });
+    }
+    if &file_data[sb_off..sb_off + 4] != b"EASB" {
+        return Err(FormatError::ChunkedReadError(
+            "invalid Extensible Array super block signature".into(),
+        ));
+    }
+
+    // When the super block's data blocks are paged, a page-init bitmap of
+    // `ndblks * ceil(npages / 8)` bytes precedes the data-block addresses.
+    let bitmap_size = if dblk_nelmts > page_nelmts {
+        let npages = (dblk_nelmts / page_nelmts).to_usize()?;
+        ndblks
+            .to_usize()?
+            .checked_mul(npages.div_ceil(8))
+            .ok_or(FormatError::OffsetOverflow {
+                offset: ndblks,
+                length: npages as u64,
+            })?
+    } else {
+        0
+    };
+    let mut pos = sb_off + sb_header + bitmap_size;
+    for _ in 0..ndblks {
+        let addr = read_offset(file_data, pos, offset_size)?;
+        pos += os;
+        if is_undefined_addr(addr, offset_size) {
+            continue;
+        }
+        spans.push((
+            addr,
+            eadb_size(
+                dblk_nelmts,
+                elem_size,
+                page_nelmts,
+                offset_size,
+                blk_off_size,
+            ),
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1626,5 +1802,81 @@ mod tests {
         assert_eq!(ci.filter_mask, 0);
         assert_eq!(ci.offsets, vec![20]);
         assert_eq!(consumed, elem_size);
+    }
+
+    /// `extensible_array_index_spans` must account for exactly the index
+    /// structure the writer lays down: its total must equal the header, index
+    /// block, and the super-/data-block bytes recorded in the EAHD statistics,
+    /// and the spans must be pairwise disjoint and lie within the built blob.
+    /// This pins the reclaim walk to `build_extensible_array_at` so the two
+    /// cannot drift (a too-large span would over-reclaim live bytes on delete).
+    #[cfg(feature = "std")]
+    #[test]
+    fn index_spans_match_builder_layout() {
+        use crate::chunked_write::{WrittenChunk, build_extensible_array_at};
+
+        let os: u8 = 8;
+        let ls: u8 = 8;
+        let base = 0x4000u64;
+        // Sizes spanning inline-only, direct data blocks, super blocks, and the
+        // paged regime — every branch of the walk.
+        for &n in &[1u64, 4, 20, 100, 244, 300, 2000, 50000, 140000] {
+            let chunks: Vec<WrittenChunk> = (0..n)
+                .map(|i| WrittenChunk {
+                    address: 0x100000 + i * 8,
+                    compressed_size: 8,
+                    raw_size: 8,
+                    filter_mask: 0,
+                })
+                .collect();
+            let ea = build_extensible_array_at(&chunks, os, ls, false, base).unwrap();
+            let mut file = vec![0u8; base as usize + ea.len()];
+            file[base as usize..].copy_from_slice(&ea);
+
+            let spans = extensible_array_index_spans(&file, base, os, ls).unwrap();
+
+            // Expected total = EAHD + EAIB + super_blk_size + data_blk_size, the
+            // last two read straight from the statistics the builder wrote.
+            let header = ExtensibleArrayHeader::parse(&file, base as usize, os, ls).unwrap();
+            let geom = EaGeometry::from_header(&header);
+            let aehd = ExtensibleArrayHeader::serialized_size(os, ls) as u64;
+            // Unfiltered EA: element stride equals the offset size.
+            let aeib = crate::chunked_write::aeib_size(
+                os,
+                header.idx_blk_elmts as usize,
+                os as usize,
+                geom.direct_dblk_nelmts.len(),
+                geom.nsblk_addrs,
+            ) as u64;
+            let stat = |k: usize| {
+                let off = base as usize + 12 + k * ls as usize;
+                u64::from_le_bytes(file[off..off + 8].try_into().unwrap())
+            };
+            let super_blk_size = stat(1);
+            let data_blk_size = stat(3);
+            let expected_total = aehd + aeib + super_blk_size + data_blk_size;
+
+            let total: u64 = spans.iter().map(|&(_, l)| l).sum();
+            assert_eq!(
+                total, expected_total,
+                "EA index span total mismatch at n={n}"
+            );
+
+            // Disjoint and inside the built blob.
+            let mut sorted = spans.clone();
+            sorted.sort_by_key(|&(a, _)| a);
+            for w in sorted.windows(2) {
+                assert!(
+                    w[0].0 + w[0].1 <= w[1].0,
+                    "EA index spans overlap at n={n}: {sorted:?}"
+                );
+            }
+            for &(a, l) in &spans {
+                assert!(
+                    a >= base && a + l <= base + ea.len() as u64,
+                    "EA index span out of the blob at n={n}: ({a}, {l})"
+                );
+            }
+        }
     }
 }
