@@ -7,7 +7,7 @@ extern crate alloc;
 use alloc::{format, vec, vec::Vec};
 
 use crate::chunked_read::ChunkInfo;
-use crate::convert::{TryToUsize, u32_from};
+use crate::convert::{TryToUsize, is_undefined_addr, u32_from};
 use crate::error::FormatError;
 use crate::source::FileSource;
 
@@ -195,16 +195,6 @@ pub(crate) fn fixed_array_index_spans(
 
     spans.push((header.data_block_address, fadb_size));
     Ok(spans)
-}
-
-/// True when an `offset_size`-wide address is the all-`0xFF` "undefined" value.
-fn is_undefined_addr(addr: u64, offset_size: u8) -> bool {
-    match offset_size {
-        2 => addr == 0xFFFF,
-        4 => addr == 0xFFFF_FFFF,
-        8 => addr == 0xFFFF_FFFF_FFFF_FFFF,
-        _ => false,
-    }
 }
 
 /// Decode one Fixed/Extensible-Array element record from `block` at `elem_pos`.

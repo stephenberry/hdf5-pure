@@ -10,7 +10,7 @@ extern crate alloc;
 use alloc::{format, vec, vec::Vec};
 
 use crate::chunked_read::ChunkInfo;
-use crate::convert::{TryToUsize, u32_from};
+use crate::convert::{TryToUsize, is_undefined_addr, u32_from};
 use crate::error::FormatError;
 use crate::source::FileSource;
 
@@ -54,15 +54,6 @@ fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
         ]),
         _ => return Err(FormatError::InvalidOffsetSize(size)),
     })
-}
-
-fn is_undefined_addr(addr: u64, offset_size: u8) -> bool {
-    match offset_size {
-        2 => addr == 0xFFFF,
-        4 => addr == 0xFFFF_FFFF,
-        8 => addr == 0xFFFF_FFFF_FFFF_FFFF,
-        _ => false,
-    }
 }
 
 fn is_undefined(data: &[u8], pos: usize, size: u8) -> bool {
@@ -846,7 +837,8 @@ pub(crate) fn extensible_array_index_spans(
     let nsblk_addrs = geom.nsblk_addrs;
     let inline = header.idx_blk_elmts as usize;
     let ib_header = 4 + 1 + 1 + os; // sig + ver + client + hdr_addr
-    let aeib_size = ib_header + inline * elem_size + ndblk_addrs * os + nsblk_addrs * os + 4;
+    let aeib_size =
+        crate::chunked_write::aeib_size(offset_size, inline, elem_size, ndblk_addrs, nsblk_addrs);
     let ib_addr = header.index_block_address;
     let ib_off = ib_addr.to_usize()?;
     if ib_off + 4 > file_data.len() {
@@ -1848,14 +1840,14 @@ mod tests {
             let header = ExtensibleArrayHeader::parse(&file, base as usize, os, ls).unwrap();
             let geom = EaGeometry::from_header(&header);
             let aehd = ExtensibleArrayHeader::serialized_size(os, ls) as u64;
-            let aeib = (4
-                + 1
-                + 1
-                + os as usize
-                + header.idx_blk_elmts as usize * os as usize
-                + geom.direct_dblk_nelmts.len() * os as usize
-                + geom.nsblk_addrs * os as usize
-                + 4) as u64;
+            // Unfiltered EA: element stride equals the offset size.
+            let aeib = crate::chunked_write::aeib_size(
+                os,
+                header.idx_blk_elmts as usize,
+                os as usize,
+                geom.direct_dblk_nelmts.len(),
+                geom.nsblk_addrs,
+            ) as u64;
             let stat = |k: usize| {
                 let off = base as usize + 12 + k * ls as usize;
                 u64::from_le_bytes(file[off..off + 8].try_into().unwrap())

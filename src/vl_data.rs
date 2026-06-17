@@ -7,7 +7,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::{format, string::String, vec::Vec};
 
-use crate::convert::TryToUsize;
+use crate::convert::{TryToUsize, is_undefined_addr};
 use crate::datatype::{CharacterSet, Datatype};
 use crate::error::FormatError;
 use crate::global_heap::GlobalHeapIndex;
@@ -145,16 +145,6 @@ pub fn parse_vl_references(
     Ok(elements)
 }
 
-/// Check if an address represents an undefined/null address.
-fn is_undefined_address(addr: u64, offset_size: u8) -> bool {
-    match offset_size {
-        2 => addr == 0xFFFF,
-        4 => addr == 0xFFFF_FFFF,
-        8 => addr == 0xFFFF_FFFF_FFFF_FFFF,
-        _ => false,
-    }
-}
-
 /// Whether a datatype is one of the string-shaped VL encodings understood by
 /// this module.
 pub(crate) fn is_vlen_string_datatype(datatype: &Datatype) -> bool {
@@ -246,13 +236,13 @@ where
     let mut collections: Vec<(u64, GlobalHeapIndex)> = Vec::new();
     for element in &refs {
         if element.length == 0
-            && (is_undefined_address(element.collection_address, offset_size)
+            && (is_undefined_addr(element.collection_address, offset_size)
                 || element.collection_address == 0)
         {
             visitor("");
             continue;
         }
-        if is_undefined_address(element.collection_address, offset_size) {
+        if is_undefined_addr(element.collection_address, offset_size) {
             return Err(FormatError::VlDataError(
                 "non-empty VL element has an undefined heap address".into(),
             ));
