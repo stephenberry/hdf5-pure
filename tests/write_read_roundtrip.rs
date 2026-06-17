@@ -1,5 +1,6 @@
 use hdf5_pure::{
-    AttrValue, CompoundTypeBuilder, DType, Datatype, File, FileBuilder, FormatError, make_f64_type,
+    AttrValue, CompoundTypeBuilder, DType, Datatype, Error, File, FileBuilder, FormatError,
+    make_f64_type,
 };
 
 #[test]
@@ -308,6 +309,72 @@ fn nested_compound_tuple_roundtrip() {
     let file = File::from_bytes(bytes).unwrap();
     let ds = file.dataset("nested").unwrap();
     assert_eq!(ds.read_compound::<((i8, u64), f32)>().unwrap(), values);
+}
+
+#[test]
+fn chunked_builder_rejects_invalid_geometry() {
+    // Each malformed chunk-geometry request must be refused with
+    // `InvalidChunkGeometry` rather than panicking in the chunk splitter or
+    // producing an unreadable dataset.
+    type Configure = fn(&mut hdf5_pure::DatasetBuilder);
+    let bad: &[(&str, Configure)] = &[
+        ("chunk rank mismatch", |b| {
+            b.with_i32_data(&[1, 2, 3, 4, 5, 6])
+                .with_shape(&[2, 3])
+                .with_chunks(&[2]);
+        }),
+        ("zero chunk dim", |b| {
+            b.with_i32_data(&[1, 2, 3, 4])
+                .with_shape(&[4])
+                .with_chunks(&[0]);
+        }),
+        ("maxshape rank mismatch", |b| {
+            b.with_i32_data(&[1, 2, 3, 4])
+                .with_shape(&[4])
+                .with_maxshape(&[u64::MAX, u64::MAX])
+                .with_chunks(&[2]);
+        }),
+        ("maxshape below shape", |b| {
+            b.with_i32_data(&[1, 2, 3, 4])
+                .with_shape(&[4])
+                .with_maxshape(&[2]);
+        }),
+        ("scalar with chunks", |b| {
+            b.with_f64_data(&[1.0]).with_shape(&[]).with_chunks(&[1]);
+        }),
+    ];
+
+    for (label, configure) in bad {
+        let mut builder = FileBuilder::new();
+        configure(builder.create_dataset("bad"));
+        let err = builder.finish().unwrap_err();
+        assert!(
+            matches!(err, Error::Format(FormatError::InvalidChunkGeometry(_))),
+            "[{label}] expected InvalidChunkGeometry, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn chunked_builder_accepts_empty_extensible_dataset() {
+    // A zero-element extensible dataset (shape `[0]`, unlimited max) is a valid,
+    // common pattern (create empty, append later); the geometry guard must not
+    // reject it.
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("stream")
+        .with_i32_data(&[])
+        .with_shape(&[0])
+        .with_maxshape(&[u64::MAX])
+        .with_chunks(&[16]);
+    let bytes = builder
+        .finish()
+        .expect("empty extensible dataset should build");
+
+    let file = File::from_bytes(bytes).unwrap();
+    let ds = file.dataset("stream").unwrap();
+    assert_eq!(ds.shape().unwrap(), vec![0]);
+    assert_eq!(ds.read_i32().unwrap(), Vec::<i32>::new());
 }
 
 #[test]
