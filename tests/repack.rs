@@ -232,10 +232,12 @@ fn roundtrips_integer_scale_offset() {
 }
 
 #[test]
-fn refuses_lossy_float_scale_offset() {
-    // Float D-scale scale-offset is lossy; re-encoding already-rounded values is
-    // not guaranteed idempotent, so repack must refuse rather than risk silently
-    // perturbing the data.
+fn roundtrips_lossy_float_scale_offset_verbatim() {
+    // Float D-scale scale-offset is lossy, but a CHUNKED dataset's compressed
+    // chunks are copied verbatim (never decoded), so repack reproduces the data
+    // byte-exact instead of refusing. The values read back from the repacked file
+    // must equal the values read back from the source (the lossy rounding is
+    // baked into the stored bytes and carried through unchanged).
     let src = tmp("hdf5_pure_repack_fso_src.h5");
     let dst = tmp("hdf5_pure_repack_fso_dst.h5");
     let data: Vec<f64> = (0..1024).map(|i| (i as f64) * 0.01).collect();
@@ -246,16 +248,35 @@ fn refuses_lossy_float_scale_offset() {
         .with_scale_offset(ScaleOffset::FloatDScale(3));
     b.write(&src).unwrap();
 
-    let err = repack(&src, &dst, &RepackOptions::new()).unwrap_err();
-    match err {
-        hdf5_pure::Error::RepackUnsupported(msg) => assert!(
-            msg.contains("vals") && msg.contains("scale-offset"),
-            "error should name the dataset and reason: {msg}"
-        ),
-        other => panic!("expected RepackUnsupported, got {other:?}"),
-    }
-    assert!(!dst.exists(), "dst must not be created when repack refuses");
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    let src_vals = hdf5_pure::File::open(&src)
+        .unwrap()
+        .dataset("vals")
+        .unwrap()
+        .read_f64()
+        .unwrap();
+    let dst_f = hdf5_pure::File::open(&dst).unwrap();
+    let dst_ds = dst_f.dataset("vals").unwrap();
+    assert_eq!(
+        dst_ds.read_f64().unwrap(),
+        src_vals,
+        "verbatim chunk copy must reproduce the (lossy-rounded) values exactly"
+    );
+    // The dataset is still chunked + filtered: a read loads the chunk index into
+    // the per-dataset chunk cache (a contiguous dataset never would), and the
+    // filter shrinks the file well below the raw 1024*8 bytes of element data.
+    assert!(
+        dst_ds.chunk_cache_stats().index_loaded(),
+        "repacked dataset should still be chunked"
+    );
+    assert!(
+        std::fs::metadata(&dst).unwrap().len() < 1024 * 8,
+        "scale-offset filter should keep the repacked file below the raw data size"
+    );
+
     std::fs::remove_file(&src).ok();
+    std::fs::remove_file(&dst).ok();
 }
 
 #[test]
@@ -347,6 +368,166 @@ fn rejects_nonexistent_drop_path() {
         !dst.exists(),
         "dst must not be created when the repack fails"
     );
+    std::fs::remove_file(&src).ok();
+    std::fs::remove_file(&dst).ok();
+}
+
+#[test]
+fn verbatim_chunk_copy_preserves_compressed_bytes() {
+    // A chunked + deflate dataset: repack copies its compressed chunks verbatim,
+    // so the values read back are byte-identical and the dataset stays chunked +
+    // compressed (the file remains far smaller than the raw element bytes).
+    let src = tmp("hdf5_pure_repack_verbatim_src.h5");
+    let dst = tmp("hdf5_pure_repack_verbatim_dst.h5");
+    // Highly compressible data so the filter's survival is observable by size.
+    let data: Vec<i32> = (0..4096).map(|i| i % 4).collect();
+    let mut b = FileBuilder::new();
+    b.create_dataset("vals")
+        .with_i32_data(&data)
+        .with_chunks(&[512])
+        .with_shuffle()
+        .with_deflate(6);
+    b.write(&src).unwrap();
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    let f = hdf5_pure::File::open(&dst).unwrap();
+    let ds = f.dataset("vals").unwrap();
+    assert_eq!(ds.read_i32().unwrap(), data, "values must round-trip exactly");
+    assert!(
+        ds.chunk_cache_stats().index_loaded(),
+        "repacked dataset must still be chunked"
+    );
+    assert!(
+        std::fs::metadata(&dst).unwrap().len() < 4096 * 4,
+        "deflate filter must survive (file smaller than raw element bytes)"
+    );
+
+    std::fs::remove_file(&src).ok();
+    std::fs::remove_file(&dst).ok();
+}
+
+#[test]
+fn repacks_multichunk_2d_fixed_array() {
+    // A 2D dataset chunked into a 2x2 grid uses a v4 Fixed Array index. Repack's
+    // verbatim path must lay the four chunks back in dense grid order so the
+    // values round-trip exactly.
+    let src = tmp("hdf5_pure_repack_fa_src.h5");
+    let dst = tmp("hdf5_pure_repack_fa_dst.h5");
+    // 4x4 grid, chunk 2x2 -> a 2x2 chunk grid (four chunks).
+    let data: Vec<f64> = (0..16).map(|i| i as f64 * 1.5).collect();
+    let mut b = FileBuilder::new();
+    b.create_dataset("grid")
+        .with_f64_data(&data)
+        .with_shape(&[4, 4])
+        .with_chunks(&[2, 2])
+        .with_deflate(4);
+    b.write(&src).unwrap();
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    let f = hdf5_pure::File::open(&dst).unwrap();
+    let ds = f.dataset("grid").unwrap();
+    assert_eq!(ds.shape().unwrap(), vec![4, 4]);
+    assert_eq!(ds.read_f64().unwrap(), data);
+    assert!(ds.chunk_cache_stats().index_loaded());
+
+    std::fs::remove_file(&src).ok();
+    std::fs::remove_file(&dst).ok();
+}
+
+#[test]
+fn repacks_resizable_extensible_array() {
+    // An unlimited-maxshape dataset uses a v4 Extensible Array index. Repack must
+    // carry the maxshape through and reproduce the values exactly.
+    let src = tmp("hdf5_pure_repack_ea_src.h5");
+    let dst = tmp("hdf5_pure_repack_ea_dst.h5");
+    let data: Vec<i64> = (0..1000).collect();
+    let mut b = FileBuilder::new();
+    b.create_dataset("series")
+        .with_i64_data(&data)
+        .with_shape(&[1000])
+        .with_maxshape(&[u64::MAX])
+        .with_chunks(&[128])
+        .with_deflate(3);
+    b.write(&src).unwrap();
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    let f = hdf5_pure::File::open(&dst).unwrap();
+    let ds = f.dataset("series").unwrap();
+    assert_eq!(ds.read_i64().unwrap(), data);
+    // Maxshape (resizability) is carried through.
+    assert_eq!(ds.shape().unwrap(), vec![1000]);
+    assert!(ds.chunk_cache_stats().index_loaded());
+
+    std::fs::remove_file(&src).ok();
+    std::fs::remove_file(&dst).ok();
+}
+
+#[cfg(feature = "zfp")]
+#[test]
+fn roundtrips_zfp_verbatim() {
+    // ZFP is a lossy filter this crate's read-raw path would refuse to re-encode,
+    // but a chunked dataset's compressed chunks are copied verbatim, so repack
+    // reproduces the stored (lossy-compressed) values byte-exact. The values read
+    // back from the repacked file must equal those read back from the source.
+    let src = tmp("hdf5_pure_repack_zfp_src.h5");
+    let dst = tmp("hdf5_pure_repack_zfp_dst.h5");
+    let data: Vec<f64> = (0..1024).map(|i| (i as f64).sin()).collect();
+    let mut b = FileBuilder::new();
+    b.create_dataset("vals")
+        .with_f64_data(&data)
+        .with_chunks(&[256])
+        .with_zfp(32.0);
+    b.write(&src).unwrap();
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    let src_vals = hdf5_pure::File::open(&src)
+        .unwrap()
+        .dataset("vals")
+        .unwrap()
+        .read_f64()
+        .unwrap();
+    let dst_f = hdf5_pure::File::open(&dst).unwrap();
+    let dst_ds = dst_f.dataset("vals").unwrap();
+    assert_eq!(
+        dst_ds.read_f64().unwrap(),
+        src_vals,
+        "verbatim ZFP chunk copy must reproduce the stored values exactly"
+    );
+    assert!(
+        dst_ds.chunk_cache_stats().index_loaded(),
+        "repacked ZFP dataset must still be chunked"
+    );
+
+    std::fs::remove_file(&src).ok();
+    std::fs::remove_file(&dst).ok();
+}
+
+#[test]
+fn repacks_single_chunk_filtered_verbatim() {
+    // A dataset whose single chunk covers the whole dataset uses the v4
+    // single-chunk index. The verbatim path must carry the chunk's real filter
+    // mask into that index and reproduce the values exactly.
+    let src = tmp("hdf5_pure_repack_single_src.h5");
+    let dst = tmp("hdf5_pure_repack_single_dst.h5");
+    let data: Vec<i32> = (0..256).map(|i| i % 5).collect();
+    let mut b = FileBuilder::new();
+    b.create_dataset("vals")
+        .with_i32_data(&data)
+        .with_chunks(&[256]) // one chunk covers all 256 elements
+        .with_deflate(6);
+    b.write(&src).unwrap();
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    let f = hdf5_pure::File::open(&dst).unwrap();
+    let ds = f.dataset("vals").unwrap();
+    assert_eq!(ds.read_i32().unwrap(), data);
+    assert!(ds.chunk_cache_stats().index_loaded());
+
     std::fs::remove_file(&src).ok();
     std::fs::remove_file(&dst).ok();
 }
