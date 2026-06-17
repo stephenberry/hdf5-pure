@@ -691,12 +691,14 @@ impl FractalHeapHeader {
         let boundary = self.max_direct_rows();
         let direct_rows = nrows_usize.min(boundary);
         let num_indirect_rows = nrows_usize.saturating_sub(boundary);
-        let direct_entry = offset_size as usize
-            + if self.io_filter_encoded_length > 0 {
-                4
-            } else {
-                0
-            };
+        // A filtered managed heap is refused before any indirect block is read
+        // (see `read_managed_object` / `read_managed_object_from_source`), so
+        // `io_filter_encoded_length` is always 0 by the time this sizing runs and
+        // every direct-block entry is a bare child address. The filtered entry is
+        // wider (child address + filtered size + filter mask), but encoding that
+        // width here would be a dead, easy-to-get-wrong constant, so it is omitted
+        // deliberately rather than guessed.
+        let direct_entry = offset_size as usize;
         let tw = self.table_width as usize;
         iblock_header
             + direct_rows * tw * direct_entry

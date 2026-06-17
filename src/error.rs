@@ -144,9 +144,10 @@ pub enum FormatError {
     /// A fractal-heap "huge" object's heap ID referenced a B-tree key that is
     /// not present in the heap's huge-objects v2 B-tree.
     HugeObjectNotFound(u64),
-    /// A fractal-heap object uses an I/O filter pipeline (filtered huge or tiny
-    /// storage), which this reader does not support. Link and attribute heaps
-    /// are never filtered, so this does not arise for them.
+    /// A fractal-heap object lives in an I/O-filter-encoded heap (filtered
+    /// managed or huge storage), whose filtered bytes this reader does not
+    /// decode. Link and attribute heaps are never filtered, so this does not
+    /// arise for them.
     UnsupportedFilteredHeapObject,
     /// Invalid attribute message version.
     InvalidAttributeVersion(u8),
