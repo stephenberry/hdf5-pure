@@ -38,7 +38,8 @@ After a successful `commit()`, the staged set is cleared and the session can be 
 | `create_dataset(path)` | Stage a new dataset and return a `DatasetBuilder` to configure data, shape, and attributes | — |
 | `set_group_attr(path, name, value)` | Stage adding or replacing a compact group attribute | — |
 | `remove_group_attr(path, name)` | Stage removing a compact group attribute | — |
-| `copy(src, dst)` | Stage a deep copy of a dataset or whole group subtree | `H5Ocopy` |
+| `copy(src, dst)` | Stage a deep copy of a dataset or whole group subtree within this file | `H5Ocopy` |
+| `copy_from(source, src, dst)` | Copy a dataset or subtree out of another open `File` into this one | `H5Ocopy` (across files) |
 | `delete(path)` | Stage removing the link at `path` (and, for a group, its whole subtree) | `H5Ldelete` |
 | `commit()` | Apply all staged operations in place and flush | — |
 
@@ -50,7 +51,20 @@ session.create_dataset("run2/signal").with_f64_data(&[1.0, 2.0, 3.0]);
 
 `set_group_attr` takes an `AttrValue`. The group it names may already exist or may be created earlier in the same session; `""` or `"/"` names the root group. Attributes are stored compactly in the rebuilt group header, and variable-length attributes or edits that would exceed the compact-attribute limit are refused before any file bytes change.
 
-`copy` performs a deep copy: fresh copies of every object's data and header are written, internal links and the contiguous data address are repointed to the copies, and a link named by the last component of `dst` is added to its parent group. The original is untouched. `src` must exist and `dst` must not (and may not lie inside `src`).
+`copy` performs a deep copy: fresh copies of every object's data and header are written, internal links and the contiguous data address are repointed to the copies, and a link named by the last component of `dst` is added to its parent group. The original is untouched. `src` must exist and `dst` must not (and may not lie inside `src`). Compact attributes are carried over byte-for-byte — including the latest-format form the C library and h5py write, where a handful of inline attributes are accompanied by an Attribute Info message; only genuinely dense (fractal-heap) attribute storage, which appears above 8 attributes, is refused.
+
+`copy_from` is the same operation **across two open files** — the cross-file form of `H5Ocopy`. The source lives in a separate [`File`](reading.md) reader rather than the file being edited:
+
+```rust
+use hdf5_pure::{EditSession, File};
+
+let library = File::open("library.h5").unwrap();
+let mut session = EditSession::open("output.h5").unwrap();
+session.copy_from(&library, "calibration", "run2/calibration").unwrap();
+session.commit().unwrap();
+```
+
+Unlike `copy`, the source subtree is read and validated **eagerly** (the `File` borrow need not outlive the call), so `copy_from` returns a `Result`; the destination still changes only on `commit()`. Because the copy is byte-for-byte verbatim, anything whose stored bytes embed a *source-file* absolute address — which would dangle in another file — is refused up front: variable-length and reference datasets and attributes, and any shared header message (a committed datatype, or an SOHM-shared dataspace, fill value, or filter pipeline). The same-file `copy` keeps these forms valid instead, by sharing the source file's global heaps and objects. The `source` must be a buffered file (`File::open` or `File::from_bytes`, not `File::open_streaming`) using 8-byte offsets and no userblock.
 
 ## How it works
 
@@ -63,7 +77,7 @@ The appended data is `fsync`ed before the root is repointed, so the "repoint las
 
 ## Supported targets and formats
 
-Contiguous, unfiltered datasets and compact-link groups are supported. The editor works across every on-disk format the reference HDF5 C library and h5py produce:
+Contiguous and chunked datasets (with any filter the whole-file writer supports) and compact-link groups are supported. The editor works across every on-disk format the reference HDF5 C library and h5py produce:
 
 - Version 0, 1, 2, and 3 superblocks.
 - Single- and multi-chunk object headers. A multi-chunk header is collapsed into a single chunk on rewrite.
@@ -72,9 +86,9 @@ Contiguous, unfiltered datasets and compact-link groups are supported. The edito
 Rather than silently degrade a file, `EditSession` refuses anything it cannot reproduce faithfully, returning `Error::EditUnsupported`:
 
 - A userblock or non-zero base address.
-- Chunked or compressed dataset additions.
 - Dense-storage headers on the edited path.
 - Copying an existing version-1 object.
+- Across files (`copy_from`): variable-length or reference datasets and attributes, any shared (committed/SOHM) header message, and a streaming source file — none of which can be reproduced verbatim in another file.
 
 See [`Error::EditUnsupported`](../reference/data-types.md) for the full set of refusals.
 

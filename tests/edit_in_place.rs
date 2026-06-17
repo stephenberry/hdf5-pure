@@ -825,6 +825,327 @@ fn mixed_add_delete_copy_in_one_commit() {
 }
 
 #[test]
+fn copy_from_file_dataset() {
+    // Cross-file H5Ocopy: copy a dataset out of a separate open file.
+    let src_path = std::env::temp_dir().join("hdf5_pure_xcopy_src_ds.h5");
+    let dst_path = std::env::temp_dir().join("hdf5_pure_xcopy_dst_ds.h5");
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("payload").with_f64_data(&[1.5, 2.5, 3.5]);
+        b.write(&src_path).unwrap();
+    }
+    write_starter(&dst_path);
+    let src_bytes_before = std::fs::read(&src_path).unwrap();
+
+    {
+        let source = File::open(&src_path).unwrap();
+        let mut session = EditSession::open(&dst_path).unwrap();
+        session.copy_from(&source, "payload", "imported").unwrap();
+        session.commit().unwrap();
+    }
+
+    // The copy landed in the destination, byte-equal to the source data.
+    let file = File::open(&dst_path).unwrap();
+    assert_eq!(
+        file.dataset("imported").unwrap().read_f64().unwrap(),
+        vec![1.5, 2.5, 3.5]
+    );
+    assert_eq!(
+        file.dataset("imported").unwrap().dtype().unwrap(),
+        DType::F64
+    );
+    // The destination's pre-existing dataset is untouched.
+    assert_eq!(
+        file.dataset("original").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    // The source file was not modified at all.
+    assert_eq!(std::fs::read(&src_path).unwrap(), src_bytes_before);
+
+    std::fs::remove_file(&src_path).ok();
+    std::fs::remove_file(&dst_path).ok();
+}
+
+#[test]
+fn copy_from_file_group_subtree() {
+    // A whole group subtree copied across files keeps its deep structure.
+    let src_path = std::env::temp_dir().join("hdf5_pure_xcopy_src_grp.h5");
+    let dst_path = std::env::temp_dir().join("hdf5_pure_xcopy_dst_grp.h5");
+    write_starter(&src_path);
+    {
+        // Build the nested source subtree (FileBuilder::create_dataset does not
+        // split paths into groups, so create the hierarchy explicitly).
+        let mut s = EditSession::open(&src_path).unwrap();
+        s.create_group("template");
+        s.create_group("template/inner");
+        s.create_dataset("template/a").with_i32_data(&[1, 2]);
+        s.create_dataset("template/inner/b").with_f64_data(&[9.0]);
+        s.commit().unwrap();
+    }
+    write_starter(&dst_path);
+
+    {
+        let source = File::open(&src_path).unwrap();
+        let mut session = EditSession::open(&dst_path).unwrap();
+        session.copy_from(&source, "template", "run1").unwrap();
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&dst_path).unwrap();
+    assert_eq!(
+        file.dataset("run1/a").unwrap().read_i32().unwrap(),
+        vec![1, 2]
+    );
+    assert_eq!(
+        file.dataset("run1/inner/b").unwrap().read_f64().unwrap(),
+        vec![9.0]
+    );
+    assert_eq!(
+        file.group("run1").unwrap().groups().unwrap(),
+        vec!["inner".to_string()]
+    );
+    std::fs::remove_file(&src_path).ok();
+    std::fs::remove_file(&dst_path).ok();
+}
+
+#[test]
+fn copy_from_file_into_subgroup_created_same_session() {
+    // The destination parent may be a group created earlier in this session.
+    let src_path = std::env::temp_dir().join("hdf5_pure_xcopy_src_into.h5");
+    let dst_path = std::env::temp_dir().join("hdf5_pure_xcopy_dst_into.h5");
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("payload").with_i32_data(&[7, 8, 9]);
+        b.write(&src_path).unwrap();
+    }
+    write_starter(&dst_path);
+
+    {
+        let source = File::open(&src_path).unwrap();
+        let mut session = EditSession::open(&dst_path).unwrap();
+        session.create_group("dest");
+        session
+            .copy_from(&source, "payload", "dest/payload_copy")
+            .unwrap();
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&dst_path).unwrap();
+    assert_eq!(
+        file.dataset("dest/payload_copy")
+            .unwrap()
+            .read_i32()
+            .unwrap(),
+        vec![7, 8, 9]
+    );
+    std::fs::remove_file(&src_path).ok();
+    std::fs::remove_file(&dst_path).ok();
+}
+
+#[test]
+fn copy_from_file_preserves_attributes() {
+    // Fixed-size attributes survive a cross-file copy byte-for-byte.
+    let src_path = std::env::temp_dir().join("hdf5_pure_xcopy_src_attrs.h5");
+    let dst_path = std::env::temp_dir().join("hdf5_pure_xcopy_dst_attrs.h5");
+    {
+        let mut b = FileBuilder::new();
+        let ds = b.create_dataset("src");
+        ds.with_i32_data(&[5, 6, 7]);
+        ds.set_attr("label", AttrValue::String("alpha".into()));
+        ds.set_attr("scale", AttrValue::F64(2.5));
+        b.write(&src_path).unwrap();
+    }
+    write_starter(&dst_path);
+
+    let src_attrs = {
+        let source = File::open(&src_path).unwrap();
+        let attrs = source.dataset("src").unwrap().attrs().unwrap();
+        let mut session = EditSession::open(&dst_path).unwrap();
+        session.copy_from(&source, "src", "dup").unwrap();
+        session.commit().unwrap();
+        attrs
+    };
+
+    let file = File::open(&dst_path).unwrap();
+    let dup = file.dataset("dup").unwrap();
+    assert_eq!(dup.read_i32().unwrap(), vec![5, 6, 7]);
+    assert_eq!(dup.attrs().unwrap(), src_attrs);
+    std::fs::remove_file(&src_path).ok();
+    std::fs::remove_file(&dst_path).ok();
+}
+
+#[test]
+fn copy_from_file_rejects_variable_length() {
+    // A variable-length attribute stores global-heap references into the source
+    // file; a verbatim cross-file copy cannot translate them, so it is refused.
+    let src_path = std::env::temp_dir().join("hdf5_pure_xcopy_src_vlen.h5");
+    let dst_path = std::env::temp_dir().join("hdf5_pure_xcopy_dst_vlen.h5");
+    {
+        let mut b = FileBuilder::new();
+        let ds = b.create_dataset("src");
+        ds.with_i32_data(&[1, 2, 3]);
+        ds.set_attr(
+            "tags",
+            AttrValue::VarLenAsciiArray(vec!["one".into(), "two".into()]),
+        );
+        b.write(&src_path).unwrap();
+    }
+    write_starter(&dst_path);
+    let dst_before = std::fs::read(&dst_path).unwrap();
+
+    {
+        let source = File::open(&src_path).unwrap();
+        let mut session = EditSession::open(&dst_path).unwrap();
+        let err = session.copy_from(&source, "src", "dup").unwrap_err();
+        assert!(
+            err.to_string().contains("variable-length or reference"),
+            "got: {err}"
+        );
+        // Nothing was staged successfully, so a commit is a no-op.
+        session.commit().unwrap();
+    }
+
+    // The destination is byte-unchanged; the same-file `copy` would have allowed
+    // this (shared heap), but the cross-file path refuses it up front.
+    assert_eq!(std::fs::read(&dst_path).unwrap(), dst_before);
+    std::fs::remove_file(&src_path).ok();
+    std::fs::remove_file(&dst_path).ok();
+}
+
+#[test]
+fn copy_from_file_rejects_reference_dataset() {
+    // An object-reference dataset stores absolute source-file object addresses; a
+    // verbatim cross-file copy cannot translate them. This exercises the
+    // datatype-message refusal branch (the variable-length test above covers the
+    // attribute branch).
+    let src_path = std::env::temp_dir().join("hdf5_pure_xcopy_src_ref.h5");
+    let dst_path = std::env::temp_dir().join("hdf5_pure_xcopy_dst_ref.h5");
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("target").with_i32_data(&[1, 2, 3]);
+        b.create_dataset("refs").with_path_references(&["target"]);
+        b.write(&src_path).unwrap();
+    }
+    write_starter(&dst_path);
+    let dst_before = std::fs::read(&dst_path).unwrap();
+
+    {
+        let source = File::open(&src_path).unwrap();
+        let mut session = EditSession::open(&dst_path).unwrap();
+        let err = session.copy_from(&source, "refs", "dup").unwrap_err();
+        assert!(
+            err.to_string().contains("variable-length or reference"),
+            "got: {err}"
+        );
+    }
+    assert_eq!(std::fs::read(&dst_path).unwrap(), dst_before);
+    std::fs::remove_file(&src_path).ok();
+    std::fs::remove_file(&dst_path).ok();
+}
+
+#[test]
+fn copy_from_file_rejects_missing_source() {
+    let src_path = std::env::temp_dir().join("hdf5_pure_xcopy_src_missing.h5");
+    let dst_path = std::env::temp_dir().join("hdf5_pure_xcopy_dst_missing.h5");
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("present").with_i32_data(&[1]);
+        b.write(&src_path).unwrap();
+    }
+    write_starter(&dst_path);
+
+    let source = File::open(&src_path).unwrap();
+    let mut session = EditSession::open(&dst_path).unwrap();
+    let err = session.copy_from(&source, "ghost", "x").unwrap_err();
+    assert!(err.to_string().contains("does not exist"), "got: {err}");
+
+    std::fs::remove_file(&src_path).ok();
+    std::fs::remove_file(&dst_path).ok();
+}
+
+#[test]
+fn copy_from_file_rejects_destination_collision() {
+    // A destination name already present in the parent group is refused at commit,
+    // leaving the file untouched.
+    let src_path = std::env::temp_dir().join("hdf5_pure_xcopy_src_collide.h5");
+    let dst_path = std::env::temp_dir().join("hdf5_pure_xcopy_dst_collide.h5");
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("payload").with_i32_data(&[1]);
+        b.write(&src_path).unwrap();
+    }
+    write_starter(&dst_path); // contains "original"
+    let dst_before = std::fs::read(&dst_path).unwrap();
+
+    {
+        let source = File::open(&src_path).unwrap();
+        let mut session = EditSession::open(&dst_path).unwrap();
+        session.copy_from(&source, "payload", "original").unwrap();
+        let err = session.commit().unwrap_err();
+        assert!(err.to_string().contains("already exists"), "got: {err}");
+    }
+    assert_eq!(std::fs::read(&dst_path).unwrap(), dst_before);
+
+    std::fs::remove_file(&src_path).ok();
+    std::fs::remove_file(&dst_path).ok();
+}
+
+#[test]
+fn copy_from_file_rejects_streaming_source() {
+    // The source must be buffered so its bytes are addressable; a streaming reader
+    // is refused with a clear message.
+    let src_path = std::env::temp_dir().join("hdf5_pure_xcopy_src_stream.h5");
+    let dst_path = std::env::temp_dir().join("hdf5_pure_xcopy_dst_stream.h5");
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("payload").with_i32_data(&[1, 2, 3]);
+        b.write(&src_path).unwrap();
+    }
+    write_starter(&dst_path);
+
+    let source = File::open_streaming(&src_path).unwrap();
+    let mut session = EditSession::open(&dst_path).unwrap();
+    let err = session.copy_from(&source, "payload", "dup").unwrap_err();
+    assert!(err.to_string().contains("buffered source"), "got: {err}");
+
+    std::fs::remove_file(&src_path).ok();
+    std::fs::remove_file(&dst_path).ok();
+}
+
+#[test]
+fn copy_same_file_still_allows_variable_length_attribute() {
+    // Regression guard: the foreign-address refusal is cross-file only. An in-file
+    // `copy` of a dataset carrying a variable-length attribute still works (the
+    // copy shares the source file's global heap).
+    let path = std::env::temp_dir().join("hdf5_pure_xcopy_infile_vlen.h5");
+    {
+        let mut b = FileBuilder::new();
+        let ds = b.create_dataset("src");
+        ds.with_i32_data(&[1, 2, 3]);
+        ds.set_attr(
+            "tags",
+            AttrValue::VarLenAsciiArray(vec!["one".into(), "two".into()]),
+        );
+        b.write(&path).unwrap();
+    }
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.copy("src", "dup");
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let src_attrs = file.dataset("src").unwrap().attrs().unwrap();
+    assert_eq!(file.dataset("dup").unwrap().attrs().unwrap(), src_attrs);
+    assert_eq!(
+        file.dataset("dup").unwrap().read_i32().unwrap(),
+        vec![1, 2, 3]
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn superblock_eof_matches_file_size_after_edit() {
     let path = std::env::temp_dir().join("hdf5_pure_edit_eof.h5");
     write_starter(&path);
