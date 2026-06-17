@@ -1,6 +1,6 @@
-//! Editing an existing file in place with `EditSession`: add, copy, and delete
-//! objects, and edit group attributes, without reading the whole file in and
-//! rewriting it.
+//! Editing an existing file in place with `EditSession`: add, copy (within the
+//! file and across two open files), and delete objects, and edit group
+//! attributes, without reading the whole file in and rewriting it.
 //!
 //! New data and rebuilt object headers are appended at end-of-file and the
 //! superblock is repointed last, so a failed commit leaves the original file
@@ -29,6 +29,15 @@ fn main() {
     builder.write(&path).expect("write initial file");
     let original_len = std::fs::metadata(&path).unwrap().len();
 
+    // ---- A second, separate file to copy an object out of ---------------
+    let lib_path = dir.path().join("library.h5");
+    let mut lib_builder = FileBuilder::new();
+    lib_builder
+        .create_dataset("calibration")
+        .with_f64_data(&[0.99, 1.00, 1.01]);
+    lib_builder.write(&lib_path).expect("write library file");
+    let library = File::open(&lib_path).expect("open library for reading");
+
     // ---- Edit it in place -----------------------------------------------
     let mut session = EditSession::open(&path).expect("open for editing");
     session.create_group("run2");
@@ -45,7 +54,11 @@ fn main() {
         .with_chunks(&[512])
         .with_shuffle()
         .with_deflate(6);
-    session.copy("temperature", "temperature_backup"); // H5Ocopy
+    session.copy("temperature", "temperature_backup"); // H5Ocopy (same file)
+    // Cross-file H5Ocopy: pull an object out of another open file.
+    session
+        .copy_from(&library, "calibration", "run2/calibration")
+        .expect("copy across files");
     session.delete("sensors/pressure"); // H5Ldelete
     session.commit().expect("commit edits");
     drop(session); // release the editor's exclusive lock before reopening to read
@@ -60,6 +73,11 @@ fn main() {
         .read_f64()
         .unwrap();
     let run2_attrs = file.group("run2").unwrap().attrs().unwrap();
+    let calibration = file
+        .dataset("run2/calibration")
+        .unwrap()
+        .read_f64()
+        .unwrap();
 
     println!("added   run2/signal        = {signal:?}");
     println!(
@@ -67,6 +85,7 @@ fn main() {
         waveform_read.len()
     );
     println!("copied  temperature_backup = {backup:?}");
+    println!("copied  run2/calibration   = {calibration:?} (from library.h5)");
     println!("group   run2.kind          = {:?}", run2_attrs.get("kind"));
     println!(
         "deleted sensors/pressure   -> {:?}",
@@ -80,6 +99,7 @@ fn main() {
     assert_eq!(signal, vec![1.0, 2.0, 3.0]);
     assert_eq!(waveform_read, waveform);
     assert_eq!(backup, vec![22.5, 23.1, 21.8]);
+    assert_eq!(calibration, vec![0.99, 1.00, 1.01]);
     assert!(file.dataset("sensors/pressure").is_err());
     println!("in-place edits verified");
 }

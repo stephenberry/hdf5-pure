@@ -778,3 +778,227 @@ fn deleting_all_hard_links_to_an_object_in_one_commit_is_safe() {
         vec![9.0, 8.0]
     );
 }
+
+#[test]
+fn cross_file_copy_from_read_by_c_library() {
+    // A cross-file `copy_from` must produce a destination the reference C library
+    // can read: the copied object's verbatim headers, data, and attributes have to
+    // be valid in the new file, not just resolvable by this crate's own reader.
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("xsrc.h5");
+    let dst_path = dir.path().join("xdst.h5");
+
+    // Source: an attributed dataset and a group subtree. Written with this crate
+    // (compact attributes, which the verbatim copy reproduces — the C library
+    // stores even a single latest-format attribute densely, which the copy path
+    // does not yet handle for either same- or cross-file copies).
+    {
+        let mut b = FileBuilder::new();
+        let ds = b.create_dataset("calibration");
+        ds.with_f64_data(&[0.99, 1.0, 1.01]);
+        ds.set_attr("revision", AttrValue::I64(7));
+        let mut bundle = b.create_group("bundle");
+        bundle.create_dataset("inner").with_i32_data(&[5, 6]);
+        b.add_group(bundle.finish());
+        b.write(&src_path).unwrap();
+    }
+
+    // Destination: a C-written starter (alpha, doomed, grp/beta).
+    write_c_starter(&dst_path, LibraryVersion::V110, LibraryVersion::latest());
+
+    {
+        let source = File::open(&src_path).unwrap();
+        let mut session = EditSession::open(&dst_path).unwrap();
+        session
+            .copy_from(&source, "calibration", "calibration")
+            .unwrap();
+        session.copy_from(&source, "bundle", "bundle").unwrap();
+        session.commit().unwrap();
+    } // drop the editor (release its exclusive lock) before reading back
+
+    // hdf5-pure reader.
+    let f = File::open(&dst_path).unwrap();
+    assert_eq!(
+        f.dataset("calibration").unwrap().read_f64().unwrap(),
+        vec![0.99, 1.0, 1.01]
+    );
+    assert_eq!(
+        f.dataset("bundle/inner").unwrap().read_i32().unwrap(),
+        vec![5, 6]
+    );
+
+    // Reference C library reader — the interop proof.
+    let c = hdf5::File::open(&dst_path).unwrap();
+    assert_eq!(
+        c.dataset("calibration").unwrap().read_raw::<f64>().unwrap(),
+        vec![0.99, 1.0, 1.01]
+    );
+    let revision: i64 = c
+        .dataset("calibration")
+        .unwrap()
+        .attr("revision")
+        .unwrap()
+        .read_scalar()
+        .unwrap();
+    assert_eq!(revision, 7);
+    assert_eq!(
+        c.dataset("bundle/inner")
+            .unwrap()
+            .read_raw::<i32>()
+            .unwrap(),
+        vec![5, 6]
+    );
+    // The destination's pre-existing objects survive.
+    assert_eq!(
+        c.dataset("alpha").unwrap().read_raw::<f64>().unwrap(),
+        vec![1.0, 2.0, 3.0]
+    );
+}
+
+#[test]
+fn cross_file_copy_from_c_written_attributed_dataset() {
+    // A C-library-written object with a few attributes stores them compactly but
+    // also carries an Attribute Info message with an *undefined* heap address; the
+    // copy path must treat that as compact (not dense), so `copy_from` succeeds and
+    // the C library reads the copy back — attributes included.
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("c_attr_src.h5");
+    let dst_path = dir.path().join("c_attr_dst.h5");
+    {
+        let file = hdf5::File::with_options()
+            .with_fapl(|p| p.libver_bounds(LibraryVersion::V110, LibraryVersion::latest()))
+            .create(&src_path)
+            .unwrap();
+        let ds = file
+            .new_dataset::<f64>()
+            .shape((3,))
+            .create("calibration")
+            .unwrap();
+        ds.write(&[0.99f64, 1.0, 1.01]).unwrap();
+        ds.new_attr::<i64>()
+            .shape(())
+            .create("revision")
+            .unwrap()
+            .write_scalar(&7i64)
+            .unwrap();
+        ds.new_attr::<f64>()
+            .shape(())
+            .create("gain")
+            .unwrap()
+            .write_scalar(&2.5f64)
+            .unwrap();
+        file.close().unwrap();
+    }
+    write_c_starter(&dst_path, LibraryVersion::V110, LibraryVersion::latest());
+
+    {
+        let source = File::open(&src_path).unwrap();
+        let mut session = EditSession::open(&dst_path).unwrap();
+        session
+            .copy_from(&source, "calibration", "calibration")
+            .unwrap();
+        session.commit().unwrap();
+    }
+
+    let c = hdf5::File::open(&dst_path).unwrap();
+    assert_eq!(
+        c.dataset("calibration").unwrap().read_raw::<f64>().unwrap(),
+        vec![0.99, 1.0, 1.01]
+    );
+    let revision: i64 = c
+        .dataset("calibration")
+        .unwrap()
+        .attr("revision")
+        .unwrap()
+        .read_scalar()
+        .unwrap();
+    assert_eq!(revision, 7);
+    let gain: f64 = c
+        .dataset("calibration")
+        .unwrap()
+        .attr("gain")
+        .unwrap()
+        .read_scalar()
+        .unwrap();
+    assert_eq!(gain, 2.5);
+}
+
+#[test]
+fn same_file_copy_of_c_written_attributed_object() {
+    // The same compact-attribute fix applies to the in-file `copy`: a C-written
+    // attributed object is now copyable in place and read back by the C library.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_attr_infile.h5");
+    {
+        let file = hdf5::File::with_options()
+            .with_fapl(|p| p.libver_bounds(LibraryVersion::V110, LibraryVersion::latest()))
+            .create(&path)
+            .unwrap();
+        let ds = file.new_dataset::<i32>().shape((2,)).create("src").unwrap();
+        ds.write(&[10i32, 20]).unwrap();
+        ds.new_attr::<i64>()
+            .shape(())
+            .create("tag")
+            .unwrap()
+            .write_scalar(&99i64)
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.copy("src", "dup");
+        session.commit().unwrap();
+    }
+
+    let c = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        c.dataset("dup").unwrap().read_raw::<i32>().unwrap(),
+        vec![10, 20]
+    );
+    let tag: i64 = c
+        .dataset("dup")
+        .unwrap()
+        .attr("tag")
+        .unwrap()
+        .read_scalar()
+        .unwrap();
+    assert_eq!(tag, 99);
+}
+
+#[test]
+fn cross_file_copy_from_rejects_dense_attributes() {
+    // Above the compact threshold (8 attributes) the C library stores attributes
+    // densely — a real fractal heap, whose address would dangle in another file —
+    // so a verbatim cross-file copy is refused, leaving the destination untouched.
+    let dir = tempdir().unwrap();
+    let src_path = dir.path().join("dense_src.h5");
+    let dst_path = dir.path().join("dense_dst.h5");
+    {
+        let file = hdf5::File::with_options()
+            .with_fapl(|p| p.libver_bounds(LibraryVersion::V110, LibraryVersion::latest()))
+            .create(&src_path)
+            .unwrap();
+        let ds = file.new_dataset::<i32>().shape((1,)).create("ds").unwrap();
+        ds.write(&[1i32]).unwrap();
+        for i in 0..12 {
+            ds.new_attr::<i64>()
+                .shape(())
+                .create(format!("a{i}").as_str())
+                .unwrap()
+                .write_scalar(&(i as i64))
+                .unwrap();
+        }
+        file.close().unwrap();
+    }
+    write_c_starter(&dst_path, LibraryVersion::V110, LibraryVersion::latest());
+    let dst_before = std::fs::read(&dst_path).unwrap();
+
+    {
+        let source = File::open(&src_path).unwrap();
+        let mut session = EditSession::open(&dst_path).unwrap();
+        let err = session.copy_from(&source, "ds", "dup").unwrap_err();
+        assert!(err.to_string().contains("dense"), "got: {err}");
+    }
+    assert_eq!(std::fs::read(&dst_path).unwrap(), dst_before);
+}

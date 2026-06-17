@@ -547,6 +547,25 @@ impl File {
         &self.superblock
     }
 
+    /// The whole-file byte image when this file is buffered in memory
+    /// ([`open`](Self::open) / [`from_bytes`](Self::from_bytes)); `None` for a
+    /// streaming file ([`open_streaming`](Self::open_streaming)). Cross-file
+    /// object copy ([`EditSession::copy_from`](crate::EditSession::copy_from))
+    /// uses this to read source objects by absolute address.
+    pub(crate) fn in_memory_image(&self) -> Option<&[u8]> {
+        match &self.backend {
+            Backend::InMemory(data) => Some(data),
+            Backend::Streaming(_) => None,
+        }
+    }
+
+    /// The base address (`H5F` superblock base address), i.e. the byte offset
+    /// added to every stored relative address. Zero for a file with no
+    /// userblock.
+    pub(crate) fn base_address(&self) -> u64 {
+        self.addr_offset
+    }
+
     /// The file-space management strategy this file records in its superblock
     /// extension (set with `H5Pset_file_space_strategy`), or `None` if the file
     /// records none — the default, which the C library also writes as "no

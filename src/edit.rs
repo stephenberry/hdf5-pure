@@ -26,7 +26,13 @@
 //! a source subtree — appending fresh copies of every object, repointing internal
 //! links and the contiguous data address — and links the copy in like an
 //! addition; the headers are reproduced from their verbatim message bytes, so
-//! datatypes, dataspaces, and attributes stay byte-exact.
+//! datatypes, dataspaces, and attributes stay byte-exact. The same machinery,
+//! [`EditSession::copy_from`], copies an object **across two open files** — the
+//! source being a separate [`File`](crate::File) reader rather than the file being
+//! edited. Because the copy is byte-for-byte, the cross-file path refuses anything
+//! that embeds a source-file absolute address (variable-length or reference data,
+//! a committed datatype), which an in-file copy keeps valid by sharing the source
+//! file's heaps and objects.
 //!
 //! # Scope
 //!
@@ -193,6 +199,11 @@ pub struct EditSession {
     pending_deletes: Vec<PathKey>,
     /// Object copies staged by `copy`, as (source path, destination full path).
     pending_copies: Vec<(PathKey, PathKey)>,
+    /// Cross-file object copies staged by `copy_from`, as (destination full path,
+    /// the source subtree already read out of the other file). The subtree is read
+    /// — and foreign-address-screened — eagerly in `copy_from` (the source file is
+    /// borrowed only for that call), then linked in at the next `commit`.
+    pending_cross_copies: Vec<(PathKey, CopyTree)>,
     /// Session-local free-space tracker (issue #21). Holds regions vacated by
     /// prior commits in this session — superseded object headers and the blocks
     /// of deleted objects — so later commits reuse them instead of growing the
@@ -282,6 +293,7 @@ impl EditSession {
             pending_group_attrs: Vec::new(),
             pending_deletes: Vec::new(),
             pending_copies: Vec::new(),
+            pending_cross_copies: Vec::new(),
             free: FreeList::new(),
             persist: None,
         };
@@ -505,6 +517,80 @@ impl EditSession {
         self.pending_copies.push((split_path(src), split_path(dst)));
     }
 
+    /// Stage a deep copy of the object at `src` in another open file `source` to a
+    /// new link at `dst` in this file — a *cross-file* HDF5 `H5Ocopy` — applied on
+    /// the next [`commit`](Self::commit). Like [`copy`](Self::copy) but the source
+    /// lives in a separate, independently-opened [`File`](crate::File) reader
+    /// rather than the file being edited.
+    ///
+    /// The source — a dataset or a whole group subtree — is duplicated faithfully:
+    /// fresh, byte-identical copies of every object's header and data are appended
+    /// to this file, internal links repointed, and a link named by `dst`'s last
+    /// component added to `dst`'s parent group (which must already exist or be
+    /// created earlier in this session). Both files are left otherwise untouched;
+    /// the destination only changes on `commit`.
+    ///
+    /// Unlike the same-file [`copy`](Self::copy), the source is read **eagerly**
+    /// here (the `source` borrow need not outlive the call), so this returns
+    /// `Result`: the source subtree is resolved, validated, and read out before
+    /// returning, and only an already-validated copy is queued for `commit`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::EditUnsupported`] if the copy cannot be reproduced exactly
+    /// in another file. Because the copy is byte-for-byte verbatim, anything that
+    /// embeds a *source-file* absolute address is refused (it would dangle here):
+    /// **variable-length** or **reference** datasets and attributes, and any
+    /// **shared header message** (a committed datatype, or an SOHM-shared
+    /// dataspace, fill value, or filter pipeline). As with [`copy`](Self::copy) the
+    /// source must also be contiguous/compact (no chunked/compressed storage), use
+    /// compact links and attributes, and single-chunk version-2 headers. The
+    /// `source` must be a buffered file ([`File::open`](crate::File::open) or
+    /// [`File::from_bytes`](crate::File::from_bytes), not
+    /// [`open_streaming`](crate::File::open_streaming)) using 8-byte offsets and no
+    /// userblock, and `src` must exist in it and not be the root group.
+    pub fn copy_from(
+        &mut self,
+        source: &crate::reader::File,
+        src: &str,
+        dst: &str,
+    ) -> Result<(), Error> {
+        // The source bytes must be addressable: a streaming file is refused.
+        let src_data = source.in_memory_image().ok_or(Error::EditUnsupported(
+            "cross-file copy requires a buffered source file (File::open or File::from_bytes), not a streaming one",
+        ))?;
+        let src_sb = source.superblock();
+        if src_sb.offset_size != OFFSET_SIZE || src_sb.length_size != LENGTH_SIZE {
+            return Err(Error::EditUnsupported(
+                "cross-file copy requires the source file to use 8-byte offsets and lengths",
+            ));
+        }
+        if source.base_address() != 0 {
+            return Err(Error::EditUnsupported(
+                "cross-file copy requires the source file to have no userblock (base address 0)",
+            ));
+        }
+
+        let src = split_path(src);
+        if src.is_empty() {
+            return Err(Error::EditUnsupported("cannot copy the root group"));
+        }
+        let dst = split_path(dst);
+        if dst.is_empty() {
+            return Err(Error::EditUnsupported("copy destination path is empty"));
+        }
+
+        let src_addr = crate::group_v2::resolve_path_any(src_data, src_sb, &src.join("/"))
+            .map_err(|_| Error::EditUnsupported("copy source does not exist in the source file"))?;
+        let src_addr = usize::try_from(src_addr)
+            .map_err(|_| Error::EditUnsupported("source address exceeds this platform"))?;
+        // Read (and foreign-address-screen) the whole subtree now, while `source`
+        // is borrowed; the owned tree carries every byte the commit will write.
+        let tree = Self::read_copy_subtree(src_data, src_addr, 0, true)?;
+        self.pending_cross_copies.push((dst, tree));
+        Ok(())
+    }
+
     /// Apply all staged additions and deletions to the file in place and flush.
     ///
     /// Appends each new dataset (its data — a contiguous blob, or the chunk data
@@ -525,6 +611,7 @@ impl EditSession {
             && self.pending_group_attrs.is_empty()
             && self.pending_deletes.is_empty()
             && self.pending_copies.is_empty()
+            && self.pending_cross_copies.is_empty()
         {
             return Ok(());
         }
@@ -586,16 +673,29 @@ impl EditSession {
                     .map_err(|_| Error::EditUnsupported("copy source does not exist"))?;
             let src_addr = usize::try_from(src_addr)
                 .map_err(|_| Error::EditUnsupported("source address exceeds this platform"))?;
-            self.plan_copy(src_addr, 0)?;
+            // Read the source subtree from this file's own mirror (`cross_file`
+            // false: same address space, so verbatim addresses stay valid).
+            let tree = Self::read_copy_subtree(&self.data, src_addr, 0, false)?;
             add_targets.push(dst.clone());
             let leaf = dst.last().unwrap().clone();
             let parent = dst[..dst.len() - 1].to_vec();
             ensure_ancestors(&mut nodes, &parent);
-            nodes
-                .entry(parent)
-                .or_default()
-                .copies
-                .push((leaf, src_addr as u64));
+            nodes.entry(parent).or_default().copies.push((leaf, tree));
+        }
+
+        // Stage cross-file copies: their subtrees were already read out of the
+        // source file (with foreign-address screening) when `copy_from` was
+        // called, so here they are simply linked into the destination parent like
+        // any other addition.
+        for (dst, tree) in std::mem::take(&mut self.pending_cross_copies) {
+            if dst.is_empty() {
+                return Err(Error::EditUnsupported("copy destination path is empty"));
+            }
+            add_targets.push(dst.clone());
+            let leaf = dst.last().unwrap().clone();
+            let parent = dst[..dst.len() - 1].to_vec();
+            ensure_ancestors(&mut nodes, &parent);
+            nodes.entry(parent).or_default().copies.push((leaf, tree));
         }
 
         // Stage deletions: each must exist, must not overlap any other staged
@@ -793,14 +893,9 @@ impl EditSession {
                 region = remove_link_from_region(&region, name)?;
             }
 
-            // Deep-copy each source subtree and link its root into this group.
-            for (leaf, src_addr) in copies {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "src_addr is an offset into self.data, the in-memory file image \
-                              (a Vec<u8>), so it always fits usize on the running target"
-                )]
-                let root = self.perform_copy(src_addr as usize, 0)?;
+            // Write each staged source subtree and link its root into this group.
+            for (leaf, tree) in copies {
+                let root = self.write_copy_subtree(&tree)?;
                 region.extend_from_slice(&encode_link_message(&leaf, root));
             }
 
@@ -1073,7 +1168,7 @@ impl EditSession {
         ext_addr: usize,
         info: &FileSpaceInfo,
     ) -> Result<Vec<u8>, Error> {
-        let region = self.gather_oh_messages(ext_addr)?;
+        let region = Self::gather_oh_messages(&self.data, ext_addr)?;
         let new_body = info.serialize();
         // The message body is the fixed-size File Space Info record (≤ 125 bytes),
         // so it always fits the u16 size field; `try_from` keeps this off the
@@ -1135,8 +1230,7 @@ impl EditSession {
     /// `addr`, returning the `[start, end)` byte range of its message region.
     /// Rejects headers that are not OHDR v2 or that track message creation order
     /// (whose 6-byte message records this engine does not emit).
-    fn oh_region(&self, addr: usize) -> Result<(usize, usize), Error> {
-        let d = &self.data;
+    fn oh_region(d: &[u8], addr: usize) -> Result<(usize, usize), Error> {
         if d.len() < addr + 6 || &d[addr..addr + 4] != b"OHDR" || d[addr + 4] != 2 {
             return Err(Error::EditUnsupported(
                 "an object does not use a version 2 object header",
@@ -1182,9 +1276,8 @@ impl EditSession {
     /// editor rebuilds headers. The chunk-0 prefix is validated by
     /// [`oh_region`]; each continuation block must be a well-formed `OCHK` block
     /// within the file.
-    fn gather_oh_messages(&self, addr: usize) -> Result<Vec<u8>, Error> {
-        let (rs, re) = self.oh_region(addr)?;
-        let d = &self.data;
+    fn gather_oh_messages(d: &[u8], addr: usize) -> Result<Vec<u8>, Error> {
+        let (rs, re) = Self::oh_region(d, addr)?;
         let mut out = Vec::new();
         // Worklist of (message-region start, end) per chunk, chunk 0 first.
         let mut chunks: Vec<(usize, usize)> = vec![(rs, re)];
@@ -1305,7 +1398,7 @@ impl EditSession {
         if self.data.len() < addr + 4 || self.data[addr..addr + 4] != *b"OHDR" {
             return self.reconstruct_v1_group(addr);
         }
-        let mut region = self.gather_oh_messages(addr)?;
+        let mut region = Self::gather_oh_messages(&self.data, addr)?;
         let mut p = 0;
         let mut has_link_info = false;
         let mut link_names = Vec::new();
@@ -1363,8 +1456,8 @@ impl EditSession {
     /// Rejects multi-chunk headers, dense attribute storage, dense or
     /// soft/external links, chunked/old-version data layouts, and headers that
     /// are neither a dataset nor a group.
-    fn read_object(&self, addr: usize) -> Result<ObjModel, Error> {
-        let region = self.gather_oh_messages(addr)?;
+    fn read_object(d: &[u8], addr: usize) -> Result<ObjModel, Error> {
+        let region = Self::gather_oh_messages(d, addr)?;
 
         let mut layout: Option<(usize, usize)> = None; // (body offset, size)
         let mut has_link_info = false;
@@ -1375,9 +1468,30 @@ impl EditSession {
         while let Some((msg_type, body, body_end)) = next_message(&region, p)? {
             match msg_type {
                 MessageType::AttributeInfo => {
-                    return Err(Error::EditUnsupported(
-                        "an object uses dense (fractal-heap) attribute storage (not supported in place yet)",
-                    ));
+                    // An Attribute Info message does not by itself mean dense
+                    // storage: the reference C library and h5py emit one (with an
+                    // *undefined* fractal-heap address) even for compact, inline
+                    // attributes in the latest format, to carry attribute
+                    // creation-order metadata. Only a *defined* heap address is
+                    // real dense (fractal-heap) storage, which a verbatim copy
+                    // cannot reproduce — mirror the Link Info handling below, which
+                    // likewise refuses dense link storage but accepts a compact
+                    // Link Info message. A message that cannot be parsed is refused
+                    // conservatively.
+                    let ai = crate::attribute_info::AttributeInfoMessage::parse(
+                        &region[body..body_end],
+                        OFFSET_SIZE,
+                    )
+                    .map_err(|_| {
+                        Error::EditUnsupported(
+                            "a source attribute-info message could not be parsed for copying",
+                        )
+                    })?;
+                    if ai.fractal_heap_address.is_some() {
+                        return Err(Error::EditUnsupported(
+                            "an object uses dense (fractal-heap) attribute storage (not supported in place yet)",
+                        ));
+                    }
                 }
                 MessageType::LinkInfo => {
                     has_link_info = true;
@@ -1463,69 +1577,117 @@ impl EditSession {
         }
     }
 
-    /// Recursively validate that the object at `addr` (and, for a group, its
-    /// whole subtree) can be copied, without writing anything.
-    fn plan_copy(&self, addr: usize, depth: u32) -> Result<(), Error> {
+    /// Read the object at `addr` in the source buffer `d` — and, for a group, its
+    /// whole subtree — into an owned [`CopyTree`], the read half of an object copy.
+    /// No bytes are written; this both validates that the subtree is copyable and
+    /// captures the bytes the write half ([`write_copy_subtree`](Self::write_copy_subtree))
+    /// later appends, so the source buffer need not outlive the read.
+    ///
+    /// `d` is the buffer the source object lives in: this session's own mirror for
+    /// an in-file [`copy`](Self::copy), or another file's image for a cross-file
+    /// [`copy_from`](Self::copy_from). When `cross_file` is set, every copied
+    /// object header is additionally screened by [`reject_foreign_addresses`] —
+    /// verbatim bytes that embed a *source-file* absolute address (variable-length
+    /// or reference data, a committed datatype) would dangle in another file and
+    /// are refused, whereas an in-file copy keeps them valid by sharing the source
+    /// file's heaps and objects.
+    fn read_copy_subtree(
+        d: &[u8],
+        addr: usize,
+        depth: u32,
+        cross_file: bool,
+    ) -> Result<CopyTree, Error> {
         if depth >= MAX_COPY_DEPTH {
             return Err(Error::EditUnsupported(
                 "copy source nests too deeply (possible hard-link cycle)",
             ));
         }
-        if let ObjModel::Group { children, .. } = self.read_object(addr)? {
-            for (_, child) in children {
-                let child = usize::try_from(child)
-                    .map_err(|_| Error::EditUnsupported("child address exceeds this platform"))?;
-                self.plan_copy(child, depth + 1)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Recursively deep-copy the object at `addr`, appending fresh copies of
-    /// every object (data blobs and headers) at end-of-file and returning the new
-    /// object-header address of the copied root.
-    fn perform_copy(&mut self, addr: usize, depth: u32) -> Result<u64, Error> {
-        if depth >= MAX_COPY_DEPTH {
-            return Err(Error::EditUnsupported(
-                "copy source nests too deeply (possible hard-link cycle)",
-            ));
-        }
-        match self.read_object(addr)? {
+        match Self::read_object(d, addr)? {
             ObjModel::DatasetVerbatim { region } => {
-                let oh = build_v2_object_header(&region);
-                self.alloc_or_append(&oh)
+                if cross_file {
+                    reject_foreign_addresses(&region)?;
+                }
+                Ok(CopyTree::DatasetVerbatim { region })
             }
             ObjModel::DatasetContiguous {
-                mut region,
+                region,
                 addr_off,
                 data_addr,
                 data_size,
             } => {
+                if cross_file {
+                    reject_foreign_addresses(&region)?;
+                }
                 let start = usize::try_from(data_addr)
                     .map_err(|_| Error::EditUnsupported("data address exceeds this platform"))?;
                 let len = usize::try_from(data_size)
                     .map_err(|_| Error::EditUnsupported("data size exceeds this platform"))?;
                 let end = start
                     .checked_add(len)
-                    .filter(|&e| e <= self.data.len())
+                    .filter(|&e| e <= d.len())
                     .ok_or(Error::EditUnsupported("dataset data is out of bounds"))?;
-                let data = self.data[start..end].to_vec();
-                let new_data_addr = self.alloc_or_append(&data)?;
-                region[addr_off..addr_off + 8].copy_from_slice(&new_data_addr.to_le_bytes());
-                let oh = build_v2_object_header(&region);
-                self.alloc_or_append(&oh)
+                Ok(CopyTree::DatasetContiguous {
+                    region,
+                    addr_off,
+                    data: d[start..end].to_vec(),
+                })
             }
             ObjModel::Group {
                 non_link_region,
                 children,
             } => {
-                let mut region = non_link_region;
+                if cross_file {
+                    reject_foreign_addresses(&non_link_region)?;
+                }
+                let mut kids = Vec::with_capacity(children.len());
                 for (name, child) in children {
                     let child = usize::try_from(child).map_err(|_| {
                         Error::EditUnsupported("child address exceeds this platform")
                     })?;
-                    let new_child = self.perform_copy(child, depth + 1)?;
-                    region.extend_from_slice(&encode_link_message(&name, new_child));
+                    kids.push((
+                        name,
+                        Self::read_copy_subtree(d, child, depth + 1, cross_file)?,
+                    ));
+                }
+                Ok(CopyTree::Group {
+                    non_link_region,
+                    children: kids,
+                })
+            }
+        }
+    }
+
+    /// Append the fresh copies described by `node` (data blobs and headers) into
+    /// this session at end-of-file or into reusable freed regions, returning the
+    /// new object-header address of the copied root. The write half of an object
+    /// copy; children are written before their parent group so each parent links
+    /// its children's new addresses, and a contiguous dataset's data-address field
+    /// is repointed at the freshly-written copy.
+    fn write_copy_subtree(&mut self, node: &CopyTree) -> Result<u64, Error> {
+        match node {
+            CopyTree::DatasetVerbatim { region } => {
+                let oh = build_v2_object_header(region);
+                self.alloc_or_append(&oh)
+            }
+            CopyTree::DatasetContiguous {
+                region,
+                addr_off,
+                data,
+            } => {
+                let new_data_addr = self.alloc_or_append(data)?;
+                let mut region = region.clone();
+                region[*addr_off..*addr_off + 8].copy_from_slice(&new_data_addr.to_le_bytes());
+                let oh = build_v2_object_header(&region);
+                self.alloc_or_append(&oh)
+            }
+            CopyTree::Group {
+                non_link_region,
+                children,
+            } => {
+                let mut region = non_link_region.clone();
+                for (name, child) in children {
+                    let new_child = self.write_copy_subtree(child)?;
+                    region.extend_from_slice(&encode_link_message(name, new_child));
                 }
                 let oh = build_v2_object_header(&region);
                 self.alloc_or_append(&oh)
@@ -1637,7 +1799,7 @@ impl EditSession {
     /// engine can fully account for, and the caller leaves it as dead bytes
     /// rather than guess its extent.
     fn oh_chunk_spans(&self, addr: usize) -> Result<Vec<(u64, u64)>, Error> {
-        let (rs, re) = self.oh_region(addr)?;
+        let (rs, re) = Self::oh_region(&self.data, addr)?;
         let d = &self.data;
         // Chunk 0 spans from the header start through its trailing checksum;
         // `oh_region` guarantees `re + 4 <= d.len()`.
@@ -1784,7 +1946,7 @@ impl EditSession {
             Ok(s) => s,
             Err(_) => return,
         };
-        match self.read_object(addr) {
+        match Self::read_object(&self.data, addr) {
             Ok(ObjModel::DatasetVerbatim { .. }) => out.extend(spans),
             Ok(ObjModel::DatasetContiguous {
                 data_addr,
@@ -1856,7 +2018,7 @@ impl EditSession {
     /// [module docs](self).
     fn chunked_storage_spans(&self, addr: usize) -> Option<Vec<(u64, u64)>> {
         // Locate the data-layout and dataspace messages in the object header.
-        let region = self.gather_oh_messages(addr).ok()?;
+        let region = Self::gather_oh_messages(&self.data, addr).ok()?;
         let mut layout_msg: Option<(usize, usize)> = None;
         let mut dataspace_msg: Option<(usize, usize)> = None;
         let mut p = 0;
@@ -1914,8 +2076,11 @@ struct Node {
     attr_ops: Vec<GroupAttrOp>,
     /// Names of links to remove from this group (from `delete`).
     deletes: Vec<String>,
-    /// Copies to add to this group: (new link name, source object-header addr).
-    copies: Vec<(String, u64)>,
+    /// Copies to add to this group: (new link name, the source subtree read out
+    /// for writing). Built at staging time from either this file (an in-file
+    /// [`copy`](EditSession::copy)) or another open file (a cross-file
+    /// [`copy_from`](EditSession::copy_from)).
+    copies: Vec<(String, CopyTree)>,
     base_region: Vec<u8>,
     existing_links: Vec<String>,
 }
@@ -1945,6 +2110,32 @@ enum ObjModel {
     Group {
         non_link_region: Vec<u8>,
         children: Vec<(String, u64)>,
+    },
+}
+
+/// An object subtree fully read out of a source buffer and owning every byte it
+/// will write, the read result of [`EditSession::read_copy_subtree`] and the
+/// input to [`EditSession::write_copy_subtree`]. Unlike [`ObjModel`] (a single
+/// object still referencing source addresses) it is recursive and self-contained:
+/// a contiguous dataset owns its data bytes, and a group owns its children, so it
+/// can be written into the destination without the source buffer still in hand —
+/// which is what lets a cross-file copy read the source at staging time and apply
+/// it at commit time.
+enum CopyTree {
+    /// A compact dataset: the header region is written verbatim (data is inline).
+    DatasetVerbatim { region: Vec<u8> },
+    /// A contiguous dataset: `data` is written first and its new address patched
+    /// into the header `region` at `addr_off` before the header is written.
+    DatasetContiguous {
+        region: Vec<u8>,
+        addr_off: usize,
+        data: Vec<u8>,
+    },
+    /// A group: every non-link message verbatim, plus the (name, child) subtrees
+    /// to write first and re-link by name.
+    Group {
+        non_link_region: Vec<u8>,
+        children: Vec<(String, CopyTree)>,
     },
 }
 
@@ -2492,6 +2683,99 @@ fn next_message(region: &[u8], p: usize) -> Result<Option<(MessageType, usize, u
     Ok(Some((msg_type, body, body_end)))
 }
 
+/// Version-2 object-header message flag bit marking a message as *shared* (stored
+/// once in the shared-message table and referenced by an object-header address or
+/// fractal-heap id) rather than inline. Whatever the message type, that reference
+/// points into the source file and is meaningless after a cross-file copy.
+const MSG_FLAG_SHARED: u8 = 0x02;
+
+/// Refuse to copy an object whose header embeds a *source-file* absolute address
+/// that a verbatim copy into another file cannot translate. An in-file copy keeps
+/// these valid by sharing the source file's heaps and objects; a cross-file copy
+/// cannot. Three things qualify:
+///
+/// - a **variable-length** datatype, whose element bytes are global-heap
+///   references (collection address + index) into the source file's heap;
+/// - a **reference** datatype (object or dataset-region), whose element bytes are
+///   absolute object addresses in the source file;
+/// - any **shared message** (the `MSG_FLAG_SHARED` bit set) — a committed datatype,
+///   but also a shared dataspace, fill value, or filter-pipeline message — whose
+///   body is a reference into the source file's shared-message storage.
+///
+/// The scan covers a copied object's whole message region (a dataset's or a
+/// group's): it refuses any shared message outright, and inspects Datatype
+/// messages (the element type) and Attribute messages (their own datatype),
+/// recursing through compound members, array elements, and enumeration bases so a
+/// nested variable-length or reference occurrence is caught too. It is applied
+/// only on the cross-file path; the same-file [`copy`](EditSession::copy)
+/// deliberately keeps these forms (their addresses stay valid in one file).
+fn reject_foreign_addresses(region: &[u8]) -> Result<(), Error> {
+    let mut p = 0;
+    while let Some((msg_type, body, body_end)) = next_message(region, p)? {
+        // A *shared* message stores, in place of its real body, a reference into
+        // the source file's shared-message storage — an object-header address or a
+        // fractal-heap (SOHM) id — which means nothing in another file. This
+        // catches committed (shared) datatypes and shared attributes as well as a
+        // shared dataspace, fill value, or filter-pipeline message, all of which
+        // HDF5 may place in the shared-message table. Refuse any of them, whatever
+        // the message type. The flags byte is the 4th of the record header (type,
+        // size, flags); `next_message` returning `Some` guarantees
+        // `p + 4 <= region.len()`.
+        if region[p + 3] & MSG_FLAG_SHARED != 0 {
+            return Err(Error::EditUnsupported(
+                "a shared (committed/SOHM) object-header message cannot be copied to another file yet",
+            ));
+        }
+        match msg_type {
+            MessageType::Datatype => {
+                let (dt, _) =
+                    crate::datatype::Datatype::parse(&region[body..body_end]).map_err(|_| {
+                        Error::EditUnsupported("a source datatype could not be parsed for copying")
+                    })?;
+                if datatype_copies_foreign_address(&dt) {
+                    return Err(Error::EditUnsupported(
+                        "variable-length or reference datasets cannot be copied to another file yet",
+                    ));
+                }
+            }
+            MessageType::Attribute => {
+                let attr =
+                    crate::attribute::AttributeMessage::parse(&region[body..body_end], LENGTH_SIZE)
+                        .map_err(|_| {
+                            Error::EditUnsupported(
+                                "a source attribute could not be parsed for copying",
+                            )
+                        })?;
+                if datatype_copies_foreign_address(&attr.datatype) {
+                    return Err(Error::EditUnsupported(
+                        "variable-length or reference attributes cannot be copied to another file yet",
+                    ));
+                }
+            }
+            _ => {}
+        }
+        p = body_end;
+    }
+    Ok(())
+}
+
+/// Whether `dt` stores, anywhere in its structure, a value that is a source-file
+/// absolute address: a variable-length (global-heap) or reference datatype, or a
+/// compound / array / enumeration built over one. See [`reject_foreign_addresses`].
+fn datatype_copies_foreign_address(dt: &crate::datatype::Datatype) -> bool {
+    use crate::datatype::Datatype;
+    match dt {
+        Datatype::VariableLength { .. } | Datatype::Reference { .. } => true,
+        Datatype::Compound { members, .. } => members
+            .iter()
+            .any(|m| datatype_copies_foreign_address(&m.datatype)),
+        Datatype::Array { base_type, .. } | Datatype::Enumeration { base_type, .. } => {
+            datatype_copies_foreign_address(base_type)
+        }
+        _ => false,
+    }
+}
+
 /// Wrap a chunk-0 message region in a fresh single-chunk version 2 object header
 /// (`OHDR` prefix + region + Jenkins checksum). Mirrors the encoding in
 /// [`crate::object_header_writer::ObjectHeaderWriter::serialize`].
@@ -2595,6 +2879,21 @@ mod tests {
         let before = region.clone();
         ensure_group_info(&mut region).unwrap();
         assert_eq!(region, before);
+    }
+
+    #[test]
+    fn reject_foreign_addresses_refuses_any_shared_message() {
+        // A shared (SOHM) message of *any* type — here a Dataspace — stores a
+        // source-file reference in place of its body, so a verbatim cross-file
+        // copy must refuse it, not only shared datatypes/attributes. (A plain,
+        // non-shared dataspace embeds no foreign address and is accepted.)
+        let mut shared = region_message(MessageType::Dataspace, &[0u8; 8]);
+        shared[3] = MSG_FLAG_SHARED; // set the message's shared flag
+        let err = reject_foreign_addresses(&shared).unwrap_err();
+        assert!(err.to_string().contains("shared"), "got: {err}");
+
+        let plain = region_message(MessageType::Dataspace, &[0u8; 8]);
+        reject_foreign_addresses(&plain).unwrap();
     }
 
     #[test]
