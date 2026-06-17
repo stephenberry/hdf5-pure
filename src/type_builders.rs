@@ -1003,8 +1003,15 @@ impl DatasetBuilder {
         pipeline_message: Option<Vec<u8>>,
         chunks: Vec<VerbatimChunk>,
     ) -> &mut Self {
-        let raw_size: u64 =
-            chunk_dims.iter().product::<u64>() * element_size as u64;
+        // Full uncompressed bytes of one chunk (drives the fixed/extensible-array
+        // chunk-size encoding width). Saturating arithmetic matches the writer's
+        // overflow discipline; the values come from an already-validated source
+        // file, so this only guards against an absurd input rather than a real case.
+        let raw_size: u64 = chunk_dims
+            .iter()
+            .copied()
+            .product::<u64>()
+            .saturating_mul(element_size as u64);
         self.datatype = Some(datatype);
         if self.shape.is_none() {
             self.shape = Some(dims.to_vec());
