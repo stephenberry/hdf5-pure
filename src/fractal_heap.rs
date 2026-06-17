@@ -438,6 +438,11 @@ impl FractalHeapHeader {
         id_bytes: &[u8],
         offset_size: u8,
     ) -> Result<Vec<u8>, FormatError> {
+        // A filtered managed heap stores its direct-block contents filter-encoded;
+        // we do not decode them, so refuse rather than return raw (wrong) bytes.
+        if self.io_filter_encoded_length > 0 {
+            return Err(FormatError::UnsupportedFilteredHeapObject);
+        }
         let (heap_offset, obj_len) = self.decode_managed_id(id_bytes)?;
 
         if is_undefined(self.root_block_address, offset_size) {
@@ -601,6 +606,16 @@ impl FractalHeapHeader {
             return Err(FormatError::InvalidFractalHeapSignature);
         }
 
+        // A filtered managed heap stores each direct-block child pointer followed
+        // by a `filtered_size` (length_size bytes) and a `filter_mask` (4 bytes),
+        // and the block contents are themselves filter-encoded. We do not decode
+        // filtered direct blocks, so rather than mis-stride the child-pointer walk
+        // (which would silently misalign every subsequent `child_addr`), refuse
+        // the heap cleanly — matching the huge-object read paths.
+        if self.io_filter_encoded_length > 0 {
+            return Err(FormatError::UnsupportedFilteredHeapObject);
+        }
+
         let block_offset_bytes = (self.max_heap_size as usize).div_ceil(8);
         let iblock_header = 5 + offset_size as usize + block_offset_bytes;
         let mut pos = iblock_header;
@@ -616,13 +631,11 @@ impl FractalHeapHeader {
         for row in 0..direct_rows {
             let block_size = self.block_size_for_row(row);
             for _col in 0..tw {
+                // Filtered direct-block child pointers carry trailing
+                // `filtered_size`/`filter_mask` fields; such heaps are refused
+                // up-front above, so here every entry is a bare child address.
                 let child_addr = read_offset(block, pos, offset_size)?;
                 pos += offset_size as usize;
-                if self.io_filter_encoded_length > 0 {
-                    // filtered_size + filter_mask — filtered direct blocks are not
-                    // yet supported; skip the (simplified) trailing field.
-                    pos += 4;
-                }
                 if !is_undefined(child_addr, offset_size) {
                     let block_end = current_heap_offset.saturating_add(block_size);
                     if target_offset >= current_heap_offset && target_offset < block_end {
@@ -678,12 +691,14 @@ impl FractalHeapHeader {
         let boundary = self.max_direct_rows();
         let direct_rows = nrows_usize.min(boundary);
         let num_indirect_rows = nrows_usize.saturating_sub(boundary);
-        let direct_entry = offset_size as usize
-            + if self.io_filter_encoded_length > 0 {
-                4
-            } else {
-                0
-            };
+        // A filtered managed heap is refused before any indirect block is read
+        // (see `read_managed_object` / `read_managed_object_from_source`), so
+        // `io_filter_encoded_length` is always 0 by the time this sizing runs and
+        // every direct-block entry is a bare child address. The filtered entry is
+        // wider (child address + filtered size + filter mask), but encoding that
+        // width here would be a dead, easy-to-get-wrong constant, so it is omitted
+        // deliberately rather than guessed.
+        let direct_entry = offset_size as usize;
         let tw = self.table_width as usize;
         iblock_header
             + direct_rows * tw * direct_entry
@@ -779,6 +794,10 @@ impl FractalHeapHeader {
         id_bytes: &[u8],
         offset_size: u8,
     ) -> Result<Vec<u8>, FormatError> {
+        // Filtered managed heaps are not decoded (see `read_managed_object`).
+        if self.io_filter_encoded_length > 0 {
+            return Err(FormatError::UnsupportedFilteredHeapObject);
+        }
         let (heap_offset, obj_len) = self.decode_managed_id(id_bytes)?;
         if is_undefined(self.root_block_address, offset_size) {
             return Err(FormatError::UnexpectedEof {
@@ -1279,6 +1298,52 @@ mod tests {
         // len); 17 is no longer enough.
         h.io_filter_encoded_length = 4;
         assert!(!h.huge_ids_direct(8, 8));
+    }
+
+    #[test]
+    fn filtered_managed_heap_is_refused_not_misparsed() {
+        // A filtered managed heap stores its direct-block contents filter-encoded
+        // and inserts per-child `filtered_size`/`filter_mask` fields in indirect
+        // blocks. We do not decode either, so every managed read path must refuse
+        // cleanly (UnsupportedFilteredHeapObject) rather than return raw bytes or
+        // mis-stride the child-pointer walk.
+        let managed_id = [0x00u8, 0, 0, 0, 0, 0, 0]; // type bits 0 -> Managed
+
+        // Root is a direct block.
+        let mut h = dtable_header(512, 65536, 4);
+        h.io_filter_encoded_length = 8;
+        h.root_block_address = 0x100;
+        h.current_rows_in_root_indirect_block = 0;
+        let file = vec![0u8; 0x400];
+        assert_eq!(
+            h.read_managed_object(&file, &managed_id, 8),
+            Err(FormatError::UnsupportedFilteredHeapObject)
+        );
+
+        // Root is an indirect block: the refusal happens before any child walk.
+        h.current_rows_in_root_indirect_block = 2;
+        assert_eq!(
+            h.read_managed_object(&file, &managed_id, 8),
+            Err(FormatError::UnsupportedFilteredHeapObject)
+        );
+
+        // The shared navigation helper also refuses directly, so any future
+        // caller inherits the same clean error instead of a misaligned read.
+        let mut block = b"FHIB".to_vec();
+        block.resize(256, 0);
+        assert!(matches!(
+            h.find_child_for_offset(&block, 2, 0, 0, 8),
+            Err(FormatError::UnsupportedFilteredHeapObject)
+        ));
+
+        // An unfiltered heap with the same shape still navigates (returns None
+        // for an out-of-range offset rather than erroring), confirming the
+        // refusal is specific to the filtered case.
+        h.io_filter_encoded_length = 0;
+        assert!(matches!(
+            h.find_child_for_offset(&block, 2, 0, u64::MAX, 8),
+            Ok(None)
+        ));
     }
 
     #[test]
