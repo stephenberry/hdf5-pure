@@ -550,3 +550,87 @@ fn chunked_and_filtered_datasets_added_in_place_are_c_readable() {
         vec![1.0, 2.0, 3.0]
     );
 }
+
+#[test]
+fn deleting_chunked_datasets_in_place_stays_c_readable() {
+    // Reclaiming chunked storage on delete (issue #77) must leave a file the
+    // reference C library still reads. The starter is written by the C library
+    // with HDF5 1.8 bounds, so its chunked dataset uses a *B-tree v1* index — the
+    // foreign layout the editor's own writer never emits. The editor deletes it
+    // in place, then churns an editor-written (Fixed Array) chunked dataset to
+    // prove its storage is reclaimed and reused rather than leaked. Finally both
+    // readers see only the contiguous survivor in the shrunken, valid file.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_chunked_delete.h5");
+    {
+        let file = hdf5::File::with_options()
+            .with_fapl(|p| p.libver_bounds(LibraryVersion::V18, LibraryVersion::V18))
+            .create(&path)
+            .unwrap();
+        file.new_dataset::<f64>()
+            .shape((3,))
+            .create("keep")
+            .unwrap()
+            .write(&[1.0f64, 2.0, 3.0])
+            .unwrap();
+        let chunked: Vec<i32> = (0..512).collect();
+        file.new_dataset::<i32>()
+            .shape((512,))
+            .chunk((64,))
+            .create("c_chunked")
+            .unwrap()
+            .write(&chunked)
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    let mut high_water;
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        // Reclaim the C-written B-tree-v1 chunked dataset.
+        session.delete("c_chunked");
+        session.commit().unwrap();
+        high_water = std::fs::metadata(&path).unwrap().len();
+
+        // Churn an editor-written chunked dataset: with reclaim the file stays
+        // bounded across cycles instead of growing on every add.
+        for i in 0..6 {
+            session
+                .create_dataset("scratch")
+                .with_f64_data(&vec![i as f64; 2048])
+                .with_chunks(&[256])
+                .with_deflate(5);
+            session.commit().unwrap();
+            high_water = high_water.max(std::fs::metadata(&path).unwrap().len());
+            session.delete("scratch");
+            session.commit().unwrap();
+        }
+    }
+    let final_size = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        final_size < high_water,
+        "chunked churn should reclaim space (peak {high_water}, final {final_size})"
+    );
+
+    // hdf5-pure: only the survivor remains and the recorded EOF matches the file.
+    let f = File::open(&path).unwrap();
+    assert_eq!(f.file_size(), std::fs::metadata(&path).unwrap().len());
+    assert_eq!(f.root().datasets().unwrap(), vec!["keep".to_string()]);
+    assert!(f.dataset("c_chunked").is_err());
+    assert!(f.dataset("scratch").is_err());
+
+    // The reference C library reads the survivor from the reclaimed file.
+    let c = hdf5::File::open(&path).unwrap();
+    assert!(
+        c.dataset("c_chunked").is_err(),
+        "deleted chunked dataset still present (C)"
+    );
+    assert!(
+        c.dataset("scratch").is_err(),
+        "deleted scratch dataset still present (C)"
+    );
+    assert_eq!(
+        c.dataset("keep").unwrap().read_raw::<f64>().unwrap(),
+        vec![1.0, 2.0, 3.0]
+    );
+}

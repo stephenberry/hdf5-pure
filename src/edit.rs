@@ -72,11 +72,13 @@
 //! is mid-way through freeing), and truncation happens only after the superblock
 //! recording the smaller end-of-file is itself durable.
 //!
-//! Reclaim is best-effort and conservative. A deleted object whose blocks cannot
-//! be enumerated exhaustively — chunked or variable-length storage, dense
-//! attribute/link heaps, a non–version-2 header — is left as dead bytes rather
-//! than risk freeing a region that is still in use; under-reclaiming only wastes
-//! space, while over-reclaiming would corrupt.
+//! Reclaim is best-effort and conservative. Contiguous and chunked datasets
+//! (chunk index plus chunk data) and whole group subtrees are reclaimed; a
+//! deleted object whose blocks cannot be enumerated exhaustively —
+//! variable-length global-heap storage, dense attribute/link heaps, a
+//! non–version-2 header, a version 2 B-tree chunk index — is left as dead bytes
+//! rather than risk freeing a region that is still in use; under-reclaiming only
+//! wastes space, while over-reclaiming would corrupt.
 //!
 //! Whether the free list outlives the session depends on how the file was
 //! created. For the default (non-persisting) file it is **not** persisted: it is
@@ -101,6 +103,7 @@ use std::path::Path;
 
 use crate::checksum::jenkins_lookup3;
 use crate::chunked_write::{ChunkOptions, build_chunked_data_at_ext};
+use crate::data_layout::DataLayout;
 use crate::dataspace::{Dataspace, DataspaceType};
 use crate::error::Error;
 use crate::file_lock::{self, FileLocking};
@@ -459,10 +462,12 @@ impl EditSession {
     /// whole subtree — becomes unreachable. The bytes it occupied are returned to
     /// this session's free list (issue #21): a later commit reuses them for new
     /// objects instead of growing the file, and if a freed run reaches
-    /// end-of-file the file is truncated. Reclaim is best-effort — an object
-    /// whose blocks this engine cannot enumerate exhaustively (chunked or
-    /// variable-length storage, dense attribute/link heaps) is left as dead bytes
-    /// rather than risk freeing a region that is still in use. Freed space is
+    /// end-of-file the file is truncated. Contiguous and chunked datasets (their
+    /// chunk index and chunk data blocks) and whole group subtrees are all
+    /// reclaimed. Reclaim is best-effort — an object whose blocks this engine
+    /// cannot enumerate exhaustively (variable-length global-heap storage, dense
+    /// attribute/link heaps, a version 2 B-tree chunk index) is left as dead
+    /// bytes rather than risk freeing a region that is still in use. Freed space is
     /// reused within the open session; for a file created with
     /// `H5Pset_file_space_strategy(persist = true)` it is also recorded on disk so
     /// it survives reopen (see the [module docs](self)), otherwise it is forgotten
@@ -1657,13 +1662,16 @@ impl EditSession {
     /// `addr` (and, for a group, its whole subtree), accumulating `(addr, len)`
     /// spans into `out` for reclamation after a delete.
     ///
-    /// Deliberately conservative: any object whose layout it cannot fully
-    /// account for — a non-v2 header, a chunked or otherwise unsupported data
-    /// layout, a group holding a soft/external link, dense attribute storage —
-    /// contributes nothing and is not descended into, so `out` never names a
-    /// region that might still be in use. Bounded by [`MAX_COPY_DEPTH`] against a
-    /// hard-link cycle. Variable-length data in global-heap collections is never
-    /// reclaimed here (a collection can be shared), so it is simply left behind.
+    /// Contiguous datasets (header + data block), chunked datasets (header +
+    /// chunk index + chunk data, via [`chunked_storage_spans`](Self::chunked_storage_spans)),
+    /// and whole group subtrees are reclaimed. Deliberately conservative: any
+    /// object whose layout it cannot fully account for — a non-v2 header, an
+    /// unsupported or only-partially-enumerable chunk index, a group holding a
+    /// soft/external link, dense attribute storage — contributes nothing and is
+    /// not descended into, so `out` never names a region that might still be in
+    /// use. Bounded by [`MAX_COPY_DEPTH`] against a hard-link cycle.
+    /// Variable-length data in global-heap collections is never reclaimed here (a
+    /// collection can be shared between objects), so it is simply left behind.
     fn collect_free_spans(&self, addr: usize, depth: u32, out: &mut Vec<(u64, u64)>) {
         if depth >= MAX_COPY_DEPTH {
             return;
@@ -1701,10 +1709,95 @@ impl EditSession {
                     }
                 }
             }
-            // Header maps but the content is unsupported: leak the whole object
-            // rather than free a header whose owned blocks we cannot enumerate.
-            Err(_) => {}
+            // `read_object` covers contiguous/compact datasets and groups; a
+            // chunked dataset (layout class 2) lands here, as do truly
+            // unsupported objects. Try to reclaim a chunked dataset's storage —
+            // its chunk index and chunk data blocks — alongside its header.
+            // `chunked_storage_spans` returns `None` for anything it cannot
+            // account for exhaustively (a non-chunked unsupported object, an
+            // index type with no walker, or spans that fail the bounds/overlap
+            // check), leaving it as dead bytes rather than freeing a region that
+            // might still be in use.
+            Err(_) => {
+                if let Some(storage) = self.chunked_storage_spans(addr) {
+                    out.extend(spans);
+                    out.extend(storage);
+                }
+            }
         }
+    }
+
+    /// Best-effort enumeration of every on-disk block a *chunked* dataset at
+    /// `addr` owns: its chunk index structure (B-tree v1 nodes, or fixed- /
+    /// extensible-array header, index, super, and data blocks) plus every
+    /// allocated chunk data block. The object-header chunks are freed by the
+    /// caller ([`collect_free_spans`](Self::collect_free_spans)); this returns
+    /// only the storage the data-layout message points at.
+    ///
+    /// Returns `None` — contribute nothing, leave the object as dead bytes —
+    /// whenever the dataset cannot be enumerated *exhaustively* and safely: a
+    /// header that does not parse or is not a chunked dataset, a chunk index
+    /// with no walker (a version 2 B-tree, index type 5), an undefined index
+    /// address (an empty, never-written dataset), or any resulting span that
+    /// falls outside the file image or overlaps another. This upholds the
+    /// editor's invariant that reclaimed space is never a region still in use:
+    /// under-reclaiming only wastes space, while over-reclaiming would corrupt.
+    ///
+    /// Chunk data addresses and sizes come from the same index walkers the
+    /// reader uses, so they match the bytes the writer laid down exactly. The
+    /// per-layout enumeration lives in
+    /// [`chunked_read::collect_chunked_storage_spans`](crate::chunked_read::collect_chunked_storage_spans);
+    /// this method only locates the layout and dataspace messages and validates
+    /// the result. Variable-length data in global-heap collections is still
+    /// never reclaimed (a collection can be shared between objects); see the
+    /// [module docs](self).
+    fn chunked_storage_spans(&self, addr: usize) -> Option<Vec<(u64, u64)>> {
+        // Locate the data-layout and dataspace messages in the object header.
+        let region = self.gather_oh_messages(addr).ok()?;
+        let mut layout_msg: Option<(usize, usize)> = None;
+        let mut dataspace_msg: Option<(usize, usize)> = None;
+        let mut p = 0;
+        loop {
+            match next_message(&region, p) {
+                Ok(Some((msg_type, body, body_end))) => {
+                    match msg_type {
+                        MessageType::DataLayout => layout_msg = Some((body, body_end)),
+                        MessageType::Dataspace => dataspace_msg = Some((body, body_end)),
+                        _ => {}
+                    }
+                    p = body_end;
+                }
+                Ok(None) => break,
+                Err(_) => return None,
+            }
+        }
+        let (lb, le) = layout_msg?;
+        let (db, de) = dataspace_msg?;
+
+        let layout = DataLayout::parse(&region[lb..le], OFFSET_SIZE, LENGTH_SIZE).ok()?;
+        if !matches!(layout, DataLayout::Chunked { .. }) {
+            return None;
+        }
+        let dataspace = Dataspace::parse(&region[db..de], LENGTH_SIZE).ok()?;
+
+        // Delegate the per-index-type enumeration to the chunked reader (the
+        // single owner of chunk-storage layout knowledge), then validate: every
+        // span must lie inside the current file image and be pairwise disjoint,
+        // or the free list would later hand out live bytes (and a debug build
+        // would panic on the double-free). On any error or violation, leave the
+        // whole dataset unreclaimed rather than free a region still in use.
+        let mut spans = crate::chunked_read::collect_chunked_storage_spans(
+            &self.data,
+            &layout,
+            &dataspace,
+            OFFSET_SIZE,
+            LENGTH_SIZE,
+        )
+        .ok()?;
+        if !spans_disjoint_in_bounds(&mut spans, self.data.len() as u64) {
+            return None;
+        }
+        Some(spans)
     }
 }
 
@@ -1792,6 +1885,23 @@ fn ensure_ancestors(nodes: &mut BTreeMap<PathKey, Node>, path: &[String]) {
     for len in 0..=path.len() {
         nodes.entry(path[..len].to_vec()).or_default();
     }
+}
+
+/// Validate that every reclaim span `(addr, len)` is non-empty, ends at or
+/// before `eof`, and that no two overlap; sorts `spans` by address as a side
+/// effect. Returns `false` on any violation so the caller can decline to
+/// reclaim the object rather than feed the free list an out-of-bounds or
+/// overlapping (double-free) region. Touching spans are allowed — the free list
+/// coalesces them.
+fn spans_disjoint_in_bounds(spans: &mut [(u64, u64)], eof: u64) -> bool {
+    for &(addr, len) in spans.iter() {
+        match addr.checked_add(len) {
+            Some(end) if len > 0 && end <= eof => {}
+            _ => return false,
+        }
+    }
+    spans.sort_unstable_by_key(|&(addr, _)| addr);
+    spans.windows(2).all(|w| w[0].0 + w[0].1 <= w[1].0)
 }
 
 /// Validate a staged dataset and reduce it to a [`FlatDataset`]. Contiguous,

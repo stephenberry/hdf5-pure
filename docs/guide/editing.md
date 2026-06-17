@@ -82,7 +82,7 @@ See [`Error::EditUnsupported`](../reference/data-types.md) for the full set of r
 
 Within a session, the space a deletion frees is reused for later writes in the same commit, so add/delete churn stays bounded instead of only ever growing the file. If a freed run reaches the end of the file, the file is truncated.
 
-Reclaim is best-effort: an object whose blocks cannot be enumerated exhaustively (chunked or variable-length storage, dense attribute or link heaps) is left as dead bytes rather than risk freeing a region still in use.
+Contiguous and chunked datasets (chunk index plus chunk data) and whole group subtrees are reclaimed. Reclaim is best-effort: an object whose blocks cannot be enumerated exhaustively (variable-length global-heap storage, dense attribute or link heaps, a version 2 B-tree chunk index) is left as dead bytes rather than risk freeing a region still in use.
 
 !!! note "Cross-session reuse and guaranteed compaction"
     By default, freed space is reused only within the open session and forgotten on close. For a file created with `H5Pset_file_space_strategy(persist = true)`, freed space is recorded on disk and survives reopen; see [File-space strategy](file-space.md). For a guaranteed shrink that rewrites the whole file compact across a reopen, see [Reclaiming space with repack](repack.md).

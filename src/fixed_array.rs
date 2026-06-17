@@ -120,6 +120,93 @@ impl FixedArrayHeader {
     }
 }
 
+/// On-disk byte spans `(addr, len)` of a Fixed Array chunk index's own
+/// structure — its header (`FAHD`) and its single data block (`FADB`, paged or
+/// not) — for reclaiming a deleted chunked dataset. The chunk *data* blocks the
+/// array points at are enumerated separately (via [`read_fixed_array_chunks`]),
+/// so they are not included here.
+///
+/// `fa_base` is the Fixed Array header address taken from the data-layout
+/// message. The returned spans are exact (the writer allocates each block at the
+/// size computed here); the caller validates them against the file bounds.
+pub(crate) fn fixed_array_index_spans(
+    file_data: &[u8],
+    fa_base: u64,
+    offset_size: u8,
+    length_size: u8,
+) -> Result<Vec<(u64, u64)>, FormatError> {
+    let header = FixedArrayHeader::parse(file_data, fa_base.to_usize()?, offset_size, length_size)?;
+    let os = offset_size as usize;
+
+    // FAHD: sig(4)+ver(1)+client(1)+elem_size(1)+max_bits(1)+num_elements(ls)+dblk_addr(os)+checksum(4).
+    let fahd_size = (4 + 1 + 1 + 1 + 1 + length_size as usize + os + 4) as u64;
+    let mut spans = vec![(fa_base, fahd_size)];
+
+    // An empty array has no data block (the address is the undefined sentinel);
+    // there is nothing more to reclaim.
+    if is_undefined_addr(header.data_block_address, offset_size) {
+        return Ok(spans);
+    }
+
+    // FADB element stride: just the chunk address when unfiltered, the full
+    // filtered element record otherwise.
+    let elem_size = if header.client_id == 0 {
+        os
+    } else {
+        header.element_size as usize
+    };
+    if header.max_nelmts_bits >= 64 {
+        return Err(FormatError::ChunkedReadError(
+            "Fixed Array page exponent out of range".into(),
+        ));
+    }
+    let page_size = 1usize << header.max_nelmts_bits;
+    let num_elements = header.num_elements.to_usize()?;
+    let db_prefix = 4 + 1 + 1 + os; // FADB sig(4)+ver(1)+client(1)+header_addr(os)
+
+    let fadb_size: u64 = if num_elements <= page_size {
+        // Non-paged: prefix + element records + checksum.
+        (db_prefix
+            + num_elements
+                .checked_mul(elem_size)
+                .ok_or(FormatError::OffsetOverflow {
+                    offset: num_elements as u64,
+                    length: elem_size as u64,
+                })?
+            + 4) as u64
+    } else {
+        // Paged: prefix + page-init bitmap + prefix checksum, then the element
+        // records (each written exactly once) split into `npages` pages, each
+        // followed by its own 4-byte checksum. Only the last page is partial;
+        // the writer does not pad it to full stride (see `build_fixed_array_at`),
+        // so the data block is `num_elements * elem_size + npages * 4` element
+        // and checksum bytes after the prefix.
+        let npages = num_elements.div_ceil(page_size);
+        let bitmap_size = npages.div_ceil(8);
+        let elements_bytes =
+            num_elements
+                .checked_mul(elem_size)
+                .ok_or(FormatError::OffsetOverflow {
+                    offset: num_elements as u64,
+                    length: elem_size as u64,
+                })?;
+        (db_prefix + bitmap_size + 4 + elements_bytes + npages * 4) as u64
+    };
+
+    spans.push((header.data_block_address, fadb_size));
+    Ok(spans)
+}
+
+/// True when an `offset_size`-wide address is the all-`0xFF` "undefined" value.
+fn is_undefined_addr(addr: u64, offset_size: u8) -> bool {
+    match offset_size {
+        2 => addr == 0xFFFF,
+        4 => addr == 0xFFFF_FFFF,
+        8 => addr == 0xFFFF_FFFF_FFFF_FFFF,
+        _ => false,
+    }
+}
+
 /// Decode one Fixed/Extensible-Array element record from `block` at `elem_pos`.
 ///
 /// Returns `None` for the all-`0xFF` sentinel (an unallocated chunk). `block`
@@ -901,5 +988,58 @@ mod tests {
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].address, 0x1000);
         assert_eq!(chunks[1].address, 0x2000);
+    }
+
+    /// `fixed_array_index_spans` must tile exactly the contiguous FAHD + FADB
+    /// blob the writer produces, in both the non-paged and paged regimes and for
+    /// filtered and unfiltered element records. This pins the reclaim sizing to
+    /// `build_fixed_array_at` so the two cannot drift.
+    #[cfg(feature = "std")]
+    #[test]
+    fn index_spans_tile_fixed_array_blob() {
+        use crate::chunked_write::{WrittenChunk, build_fixed_array_at};
+
+        let os: u8 = 8;
+        let ls: u8 = 8;
+        let base = 0x800u64;
+        for has_filters in [false, true] {
+            // 1024 = page_size, so 1025+ exercises the paged FADB layout.
+            for &n in &[1u64, 5, 1024, 1025, 3000] {
+                let chunks: Vec<WrittenChunk> = (0..n)
+                    .map(|i| WrittenChunk {
+                        address: 0x100000 + i * 8,
+                        compressed_size: if has_filters { 8 + (i % 7) } else { 8 },
+                        raw_size: 8,
+                        filter_mask: 0,
+                    })
+                    .collect();
+                let fa = build_fixed_array_at(&chunks, os, ls, has_filters, base);
+                let mut file = vec![0u8; base as usize + fa.len()];
+                file[base as usize..].copy_from_slice(&fa);
+
+                let spans = fixed_array_index_spans(&file, base, os, ls).unwrap();
+                assert_eq!(
+                    spans.len(),
+                    2,
+                    "FA index = FAHD + FADB (filters={has_filters}, n={n})"
+                );
+
+                let mut sorted = spans.clone();
+                sorted.sort_by_key(|&(a, _)| a);
+                // FAHD at the base, FADB immediately after, together covering the
+                // whole contiguous blob with no gap or overlap.
+                assert_eq!(sorted[0].0, base);
+                assert_eq!(
+                    sorted[0].0 + sorted[0].1,
+                    sorted[1].0,
+                    "FAHD must abut FADB (filters={has_filters}, n={n})"
+                );
+                assert_eq!(
+                    sorted[1].0 + sorted[1].1,
+                    base + fa.len() as u64,
+                    "FA index spans must tile the blob (filters={has_filters}, n={n})"
+                );
+            }
+        }
     }
 }
