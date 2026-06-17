@@ -194,11 +194,7 @@ mod tests {
             )
             .expect("parallel decode");
 
-            assert_eq!(
-                ordered.len(),
-                n,
-                "all chunks returned for seed {seed}"
-            );
+            assert_eq!(ordered.len(), n, "all chunks returned for seed {seed}");
             // Every chunk lands at its original index, byte-for-byte, matching
             // the serial decode. This is the property `sort_by_key` guarantees.
             assert_eq!(ordered, expected, "order restored for seed {seed}");
