@@ -604,10 +604,7 @@ impl FileWriter {
         /// dataset carries a raw-chunk payload, else the normal encode path. The
         /// single dispatch point keeps the dummy-sizing and real-address passes
         /// from diverging.
-        fn build_chunked(
-            d: &DsFlat,
-            base_address: u64,
-        ) -> Result<ChunkedDataResult, FormatError> {
+        fn build_chunked(d: &DsFlat, base_address: u64) -> Result<ChunkedDataResult, FormatError> {
             if let Some(rc) = &d.raw_chunks {
                 build_chunked_data_verbatim(
                     &rc.chunks,
@@ -827,9 +824,7 @@ impl FileWriter {
 
         let is_chunked: Vec<bool> = all_ds
             .iter()
-            .map(|d| {
-                d.chunk_options.is_chunked() || d.maxshape.is_some() || d.raw_chunks.is_some()
-            })
+            .map(|d| d.chunk_options.is_chunked() || d.maxshape.is_some() || d.raw_chunks.is_some())
             .collect();
         let root_dense = root_attrs.len() > DENSE_ATTR_THRESHOLD;
         let group_dense: Vec<bool> = groups

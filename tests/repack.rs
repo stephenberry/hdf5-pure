@@ -393,7 +393,11 @@ fn verbatim_chunk_copy_preserves_compressed_bytes() {
 
     let f = hdf5_pure::File::open(&dst).unwrap();
     let ds = f.dataset("vals").unwrap();
-    assert_eq!(ds.read_i32().unwrap(), data, "values must round-trip exactly");
+    assert_eq!(
+        ds.read_i32().unwrap(),
+        data,
+        "values must round-trip exactly"
+    );
     assert!(
         ds.chunk_cache_stats().index_loaded(),
         "repacked dataset must still be chunked"
