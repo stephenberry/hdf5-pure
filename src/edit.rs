@@ -1453,44 +1453,108 @@ impl EditSession {
     /// Parse the object header at `addr` into a copyable model, validating that
     /// every message can be reproduced faithfully (verbatim message bytes, with
     /// only the contiguous data address and child link targets repointed).
-    /// Rejects multi-chunk headers, dense attribute storage, dense or
-    /// soft/external links, chunked/old-version data layouts, and headers that
-    /// are neither a dataset nor a group.
+    /// Dense (fractal-heap) attribute storage is read out of the source heap into
+    /// a parsed attribute set carried on the model (`dense_attrs`) and re-emitted
+    /// into a fresh heap on write, provided it fits the single-direct-block layout
+    /// the emitter can build; an oversized set is refused. Rejects multi-chunk
+    /// headers, dense or soft/external links, chunked/old-version data layouts, and
+    /// headers that are neither a dataset nor a group.
     fn read_object(d: &[u8], addr: usize) -> Result<ObjModel, Error> {
         let region = Self::gather_oh_messages(d, addr)?;
 
-        let mut layout: Option<(usize, usize)> = None; // (body offset, size)
+        // First pass: detect whether attributes are stored densely (a defined
+        // fractal-heap address in the Attribute Info message). A dense object is
+        // copied by reading its attributes out of the source heap and rebuilding
+        // a fresh heap on write, so its Attribute Info message and any inline
+        // Attribute messages are dropped from the verbatim region — the rebuilt
+        // region carries neither, and `dense_attrs` carries the parsed set.
+        let mut dense = false;
+        let mut p = 0;
+        while let Some((msg_type, body, body_end)) = next_message(&region, p)? {
+            if msg_type == MessageType::AttributeInfo {
+                // An Attribute Info message does not by itself mean dense
+                // storage: the reference C library and h5py emit one (with an
+                // *undefined* fractal-heap address) even for compact, inline
+                // attributes in the latest format, to carry attribute
+                // creation-order metadata. Only a *defined* heap address is real
+                // dense (fractal-heap) storage. A message that cannot be parsed
+                // is refused conservatively.
+                let ai = crate::attribute_info::AttributeInfoMessage::parse(
+                    &region[body..body_end],
+                    OFFSET_SIZE,
+                )
+                .map_err(|_| {
+                    Error::EditUnsupported(
+                        "a source attribute-info message could not be parsed for copying",
+                    )
+                })?;
+                if ai.fractal_heap_address.is_some() {
+                    dense = true;
+                }
+            }
+            p = body_end;
+        }
+
+        // If dense, read the attribute set out of the source fractal heap now (so
+        // the source buffer need not outlive the read) and validate it can be
+        // re-emitted into a fresh heap on write. `extract_attributes_full` reads
+        // both compact and dense attributes; a dense object carries no inline
+        // Attribute messages, so it returns exactly the heap-resident set.
+        let dense_attrs = if dense {
+            let header =
+                ObjectHeader::parse_with_base(d, addr, OFFSET_SIZE, LENGTH_SIZE, 0).map_err(|_| {
+                    Error::EditUnsupported(
+                        "a source object header with dense attributes could not be parsed for copying",
+                    )
+                })?;
+            let attrs = crate::attribute::extract_attributes_full(
+                d,
+                &header,
+                OFFSET_SIZE,
+                LENGTH_SIZE,
+            )
+            .map_err(|_| {
+                Error::EditUnsupported(
+                    "a source object's dense (fractal-heap) attributes could not be read for copying",
+                )
+            })?;
+            if !crate::file_writer::dense_attrs_fit(&attrs) {
+                return Err(Error::EditUnsupported(
+                    "an object's dense (fractal-heap) attribute set is too large to reproduce (would need fractal-heap indirect blocks)",
+                ));
+            }
+            attrs
+        } else {
+            Vec::new()
+        };
+
+        let mut layout: Option<(usize, usize)> = None; // (body offset in kept, size)
         let mut has_link_info = false;
         let mut children: Vec<(String, u64)> = Vec::new();
-        let mut non_link: Vec<u8> = Vec::new();
+        // The rebuilt chunk-0 region: every message kept verbatim except hard
+        // Link messages (carried as `children`) and, when dense, the Attribute
+        // Info message and inline Attribute messages (carried as `dense_attrs`).
+        let mut kept: Vec<u8> = Vec::new();
 
         let mut p = 0;
         while let Some((msg_type, body, body_end)) = next_message(&region, p)? {
+            let mut keep = true;
             match msg_type {
                 MessageType::AttributeInfo => {
-                    // An Attribute Info message does not by itself mean dense
-                    // storage: the reference C library and h5py emit one (with an
-                    // *undefined* fractal-heap address) even for compact, inline
-                    // attributes in the latest format, to carry attribute
-                    // creation-order metadata. Only a *defined* heap address is
-                    // real dense (fractal-heap) storage, which a verbatim copy
-                    // cannot reproduce — mirror the Link Info handling below, which
-                    // likewise refuses dense link storage but accepts a compact
-                    // Link Info message. A message that cannot be parsed is refused
-                    // conservatively.
-                    let ai = crate::attribute_info::AttributeInfoMessage::parse(
-                        &region[body..body_end],
-                        OFFSET_SIZE,
-                    )
-                    .map_err(|_| {
-                        Error::EditUnsupported(
-                            "a source attribute-info message could not be parsed for copying",
-                        )
-                    })?;
-                    if ai.fractal_heap_address.is_some() {
-                        return Err(Error::EditUnsupported(
-                            "an object uses dense (fractal-heap) attribute storage (not supported in place yet)",
-                        ));
+                    // Already parsed in the first pass; drop the dense Attribute
+                    // Info message so the rebuilt header references the fresh heap
+                    // (spliced in on write) rather than the source one. A compact
+                    // (undefined-heap) Attribute Info message is kept verbatim.
+                    if dense {
+                        keep = false;
+                    }
+                }
+                MessageType::Attribute => {
+                    // A dense object should carry no inline Attribute messages,
+                    // but drop any defensively so the rebuilt header's only
+                    // attribute storage is the fresh heap.
+                    if dense {
+                        keep = false;
                     }
                 }
                 MessageType::LinkInfo => {
@@ -1508,54 +1572,65 @@ impl EditSession {
                         }
                     }
                 }
-                MessageType::Link => match LinkMessage::parse(&region[body..body_end], OFFSET_SIZE)
-                {
-                    Ok(LinkMessage {
-                        name,
-                        link_target:
-                            LinkTarget::Hard {
-                                object_header_address,
-                            },
-                        ..
-                    }) => children.push((name, object_header_address)),
-                    _ => {
-                        return Err(Error::EditUnsupported(
-                            "a group contains a soft/external link (not copyable in place yet)",
-                        ));
+                MessageType::Link => {
+                    keep = false;
+                    match LinkMessage::parse(&region[body..body_end], OFFSET_SIZE) {
+                        Ok(LinkMessage {
+                            name,
+                            link_target:
+                                LinkTarget::Hard {
+                                    object_header_address,
+                                },
+                            ..
+                        }) => children.push((name, object_header_address)),
+                        _ => {
+                            return Err(Error::EditUnsupported(
+                                "a group contains a soft/external link (not copyable in place yet)",
+                            ));
+                        }
                     }
-                },
-                MessageType::DataLayout => layout = Some((body, body_end - body)),
+                }
+                MessageType::DataLayout => {
+                    // Record the layout body offset within the *kept* region so a
+                    // contiguous dataset's data-address field can be repointed
+                    // even after earlier messages were dropped.
+                    layout = Some((kept.len() + (body - p), body_end - body));
+                }
                 _ => {}
             }
-            if msg_type != MessageType::Link {
-                non_link.extend_from_slice(&region[p..body_end]);
+            if keep {
+                kept.extend_from_slice(&region[p..body_end]);
             }
             p = body_end;
         }
 
         if let Some((lbody, lsize)) = layout {
-            let version = region[lbody];
+            let version = kept[lbody];
             if !(version == 3 || version == 4) || lsize < 2 {
                 return Err(Error::EditUnsupported(
                     "an unsupported data-layout version cannot be copied in place yet",
                 ));
             }
-            let class = region[lbody + 1];
+            let class = kept[lbody + 1];
             match class {
-                0 => Ok(ObjModel::DatasetVerbatim { region }),
+                0 => Ok(ObjModel::DatasetVerbatim {
+                    region: kept,
+                    dense_attrs,
+                }),
                 1 => {
-                    if lbody + 18 > region.len() {
+                    if lbody + 18 > kept.len() {
                         return Err(Error::EditUnsupported("malformed contiguous data layout"));
                     }
                     let data_addr =
-                        u64::from_le_bytes(region[lbody + 2..lbody + 10].try_into().unwrap());
+                        u64::from_le_bytes(kept[lbody + 2..lbody + 10].try_into().unwrap());
                     let data_size =
-                        u64::from_le_bytes(region[lbody + 10..lbody + 18].try_into().unwrap());
+                        u64::from_le_bytes(kept[lbody + 10..lbody + 18].try_into().unwrap());
                     Ok(ObjModel::DatasetContiguous {
-                        region,
+                        region: kept,
                         addr_off: lbody + 2,
                         data_addr,
                         data_size,
+                        dense_attrs,
                     })
                 }
                 _ => Err(Error::EditUnsupported(
@@ -1565,10 +1640,11 @@ impl EditSession {
         } else if has_link_info {
             // A copied group must carry a Group Info message so the copy stays
             // writable by the C library, even when the source omitted it.
-            ensure_group_info(&mut non_link)?;
+            ensure_group_info(&mut kept)?;
             Ok(ObjModel::Group {
-                non_link_region: non_link,
+                non_link_region: kept,
                 children,
+                dense_attrs,
             })
         } else {
             Err(Error::EditUnsupported(
@@ -1603,20 +1679,29 @@ impl EditSession {
             ));
         }
         match Self::read_object(d, addr)? {
-            ObjModel::DatasetVerbatim { region } => {
+            ObjModel::DatasetVerbatim {
+                region,
+                dense_attrs,
+            } => {
                 if cross_file {
                     reject_foreign_addresses(&region)?;
+                    reject_foreign_dense_attrs(&dense_attrs)?;
                 }
-                Ok(CopyTree::DatasetVerbatim { region })
+                Ok(CopyTree::DatasetVerbatim {
+                    region,
+                    dense_attrs,
+                })
             }
             ObjModel::DatasetContiguous {
                 region,
                 addr_off,
                 data_addr,
                 data_size,
+                dense_attrs,
             } => {
                 if cross_file {
                     reject_foreign_addresses(&region)?;
+                    reject_foreign_dense_attrs(&dense_attrs)?;
                 }
                 let start = usize::try_from(data_addr)
                     .map_err(|_| Error::EditUnsupported("data address exceeds this platform"))?;
@@ -1630,14 +1715,17 @@ impl EditSession {
                     region,
                     addr_off,
                     data: d[start..end].to_vec(),
+                    dense_attrs,
                 })
             }
             ObjModel::Group {
                 non_link_region,
                 children,
+                dense_attrs,
             } => {
                 if cross_file {
                     reject_foreign_addresses(&non_link_region)?;
+                    reject_foreign_dense_attrs(&dense_attrs)?;
                 }
                 let mut kids = Vec::with_capacity(children.len());
                 for (name, child) in children {
@@ -1652,6 +1740,7 @@ impl EditSession {
                 Ok(CopyTree::Group {
                     non_link_region,
                     children: kids,
+                    dense_attrs,
                 })
             }
         }
@@ -1665,34 +1754,82 @@ impl EditSession {
     /// is repointed at the freshly-written copy.
     fn write_copy_subtree(&mut self, node: &CopyTree) -> Result<u64, Error> {
         match node {
-            CopyTree::DatasetVerbatim { region } => {
-                let oh = build_v2_object_header(region);
+            CopyTree::DatasetVerbatim {
+                region,
+                dense_attrs,
+            } => {
+                let mut region = region.clone();
+                self.append_dense_attrs(&mut region, dense_attrs)?;
+                let oh = build_v2_object_header(&region);
                 self.alloc_or_append(&oh)
             }
             CopyTree::DatasetContiguous {
                 region,
                 addr_off,
                 data,
+                dense_attrs,
             } => {
                 let new_data_addr = self.alloc_or_append(data)?;
                 let mut region = region.clone();
                 region[*addr_off..*addr_off + 8].copy_from_slice(&new_data_addr.to_le_bytes());
+                // Append the dense heap *after* the data so the heap's base
+                // equals end-of-file (see `append_dense_attrs`).
+                self.append_dense_attrs(&mut region, dense_attrs)?;
                 let oh = build_v2_object_header(&region);
                 self.alloc_or_append(&oh)
             }
             CopyTree::Group {
                 non_link_region,
                 children,
+                dense_attrs,
             } => {
                 let mut region = non_link_region.clone();
                 for (name, child) in children {
                     let new_child = self.write_copy_subtree(child)?;
                     region.extend_from_slice(&encode_link_message(name, new_child));
                 }
+                // Append the dense heap after the children's headers/data so its
+                // base equals end-of-file (see `append_dense_attrs`).
+                self.append_dense_attrs(&mut region, dense_attrs)?;
                 let oh = build_v2_object_header(&region);
                 self.alloc_or_append(&oh)
             }
         }
+    }
+
+    /// When `attrs` is non-empty, build a fresh dense (fractal-heap) attribute
+    /// blob for it, append it at end-of-file, and splice the matching Attribute
+    /// Info message onto `region`. A no-op for an empty set.
+    ///
+    /// The blob produced by [`file_writer::build_dense_attrs`] is fully
+    /// relocatable: every address it embeds is `base + fixed offset`, so passing
+    /// the current end-of-file as the base makes those addresses land exactly
+    /// where the bytes are written. Like [`build_chunked_dataset`](Self::build_chunked_dataset)
+    /// the blob is therefore *appended* (never placed into an interior freed
+    /// region), and the caller must append it before any later append in the same
+    /// node so `base == end-of-file` still holds. The freshly built heap is
+    /// always same-file, so it never aliases the source heap even for an in-file
+    /// copy. The caller has already validated [`file_writer::dense_attrs_fit`].
+    fn append_dense_attrs(
+        &mut self,
+        region: &mut Vec<u8>,
+        attrs: &[crate::attribute::AttributeMessage],
+    ) -> Result<(), Error> {
+        if attrs.is_empty() {
+            return Ok(());
+        }
+        let base = self.data.len() as u64;
+        let blob = crate::file_writer::build_dense_attrs(attrs, base);
+        let written = self.append(&blob.blob)?;
+        debug_assert_eq!(
+            written, base,
+            "dense attribute blob must land at the base address it was built for",
+        );
+        region.extend_from_slice(&region_message(
+            MessageType::AttributeInfo,
+            &blob.attr_info_message,
+        ));
+        Ok(())
     }
 
     /// Append `bytes` at end-of-file, updating both the mirror and the file.
@@ -2096,20 +2233,31 @@ enum GroupAttrOp {
 /// targets are repointed to the freshly-written copies.
 enum ObjModel {
     /// A compact dataset (data inline in the header): copy the region verbatim.
-    DatasetVerbatim { region: Vec<u8> },
+    /// `dense_attrs` is empty unless the source stored its attributes densely, in
+    /// which case the Attribute Info message and inline Attribute messages have
+    /// been stripped from `region` and the parsed set is carried here to be
+    /// re-emitted into a fresh fractal heap on write.
+    DatasetVerbatim {
+        region: Vec<u8>,
+        dense_attrs: Vec<crate::attribute::AttributeMessage>,
+    },
     /// A contiguous dataset: copy the region, repointing the data address at
     /// `addr_off` (region-relative) to a fresh copy of `[data_addr, +data_size)`.
+    /// See [`DatasetVerbatim`](ObjModel::DatasetVerbatim) for `dense_attrs`.
     DatasetContiguous {
         region: Vec<u8>,
         addr_off: usize,
         data_addr: u64,
         data_size: u64,
+        dense_attrs: Vec<crate::attribute::AttributeMessage>,
     },
     /// A group: every non-link message verbatim, plus its hard-link children to
-    /// copy and re-link by name.
+    /// copy and re-link by name. See
+    /// [`DatasetVerbatim`](ObjModel::DatasetVerbatim) for `dense_attrs`.
     Group {
         non_link_region: Vec<u8>,
         children: Vec<(String, u64)>,
+        dense_attrs: Vec<crate::attribute::AttributeMessage>,
     },
 }
 
@@ -2123,19 +2271,29 @@ enum ObjModel {
 /// it at commit time.
 enum CopyTree {
     /// A compact dataset: the header region is written verbatim (data is inline).
-    DatasetVerbatim { region: Vec<u8> },
+    /// `dense_attrs`, when non-empty, is re-emitted into a freshly built fractal
+    /// heap appended just before the header, whose Attribute Info message is
+    /// spliced into the region on write.
+    DatasetVerbatim {
+        region: Vec<u8>,
+        dense_attrs: Vec<crate::attribute::AttributeMessage>,
+    },
     /// A contiguous dataset: `data` is written first and its new address patched
-    /// into the header `region` at `addr_off` before the header is written.
+    /// into the header `region` at `addr_off` before the header is written. See
+    /// [`DatasetVerbatim`](CopyTree::DatasetVerbatim) for `dense_attrs`.
     DatasetContiguous {
         region: Vec<u8>,
         addr_off: usize,
         data: Vec<u8>,
+        dense_attrs: Vec<crate::attribute::AttributeMessage>,
     },
     /// A group: every non-link message verbatim, plus the (name, child) subtrees
-    /// to write first and re-link by name.
+    /// to write first and re-link by name. See
+    /// [`DatasetVerbatim`](CopyTree::DatasetVerbatim) for `dense_attrs`.
     Group {
         non_link_region: Vec<u8>,
         children: Vec<(String, CopyTree)>,
+        dense_attrs: Vec<crate::attribute::AttributeMessage>,
     },
 }
 
@@ -2755,6 +2913,27 @@ fn reject_foreign_addresses(region: &[u8]) -> Result<(), Error> {
             _ => {}
         }
         p = body_end;
+    }
+    Ok(())
+}
+
+/// Cross-file screen for a dense (fractal-heap) attribute set. The bytes parsed
+/// out of the source heap can embed source-file absolute addresses just as inline
+/// attribute messages can — variable-length (global-heap) or reference attribute
+/// data — which would dangle in another file. [`reject_foreign_addresses`] screens
+/// the verbatim object-header region but not heap-resident attribute bytes, so a
+/// dense attribute set is screened here instead. Same-file copies skip this (their
+/// addresses stay valid); the fresh heap built on write is same-file by
+/// construction, so only the source datatypes matter.
+fn reject_foreign_dense_attrs(
+    attrs: &[crate::attribute::AttributeMessage],
+) -> Result<(), Error> {
+    for attr in attrs {
+        if datatype_copies_foreign_address(&attr.datatype) {
+            return Err(Error::EditUnsupported(
+                "variable-length or reference dense (fractal-heap) attributes cannot be copied to another file yet",
+            ));
+        }
     }
     Ok(())
 }

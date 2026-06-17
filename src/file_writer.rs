@@ -153,7 +153,42 @@ pub(crate) struct DenseAttrBlob {
     pub(crate) blob: Vec<u8>,
 }
 
+/// The largest direct block (and therefore the largest total managed data) the
+/// single-block [`build_dense_attrs`] emitter can represent. A heap whose data
+/// would need a larger root block would require indirect blocks, which the
+/// emitter does not build.
+pub(crate) const DENSE_ATTR_MAX_DIRECT_BLOCK: u64 = 65536;
+
+/// Whether [`build_dense_attrs`] can faithfully represent `attrs` in its
+/// single-direct-block, single-leaf-B-tree layout. Returns `false` when the
+/// serialized attribute set would overflow the one direct block the emitter
+/// allocates (it does not build indirect blocks) or exceed the record count a
+/// single B-tree v2 leaf can index. Callers that cannot fall back to a larger
+/// layout must refuse rather than mis-encode (see [`build_dense_attrs`]).
+pub(crate) fn dense_attrs_fit(attrs: &[AttributeMessage]) -> bool {
+    let os = OFFSET_SIZE as usize;
+    let max_heap_size: u16 = 40;
+    let block_offset_bytes = (max_heap_size as usize).div_ceil(8); // 5
+    // Direct block layout mirrors `build_dense_attrs`: sig(4) + ver(1) +
+    // heap_addr(os) + block_offset(bo_bytes) + checksum(4) + data.
+    let dblock_header_size = 4 + 1 + os + block_offset_bytes + 4;
+    let total_data_size: usize = attrs
+        .iter()
+        .map(|a| a.serialize_v3(LENGTH_SIZE).len())
+        .sum();
+    let dblock_content_size = (dblock_header_size + total_data_size) as u64;
+    if dblock_content_size > DENSE_ATTR_MAX_DIRECT_BLOCK {
+        return false;
+    }
+    // The single B-tree v2 leaf writes its record count into a 2-byte field.
+    attrs.len() <= u16::MAX as usize
+}
+
 /// Build dense attribute storage for a set of attributes.
+///
+/// The caller must have checked [`dense_attrs_fit`] first: this emitter builds a
+/// single direct block and a single-leaf B-tree, so an attribute set larger than
+/// that can hold would be mis-encoded.
 pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -> DenseAttrBlob {
     // Dense attrs use v3 attribute messages (adds character set encoding byte).
     let serialized: Vec<Vec<u8>> = attrs.iter().map(|a| a.serialize_v3(LENGTH_SIZE)).collect();
@@ -1450,5 +1485,30 @@ mod tests {
         let (off, len) = fh.decode_managed_id(&id).unwrap();
         assert_eq!(off, 100);
         assert_eq!(len, 42);
+    }
+
+    #[test]
+    fn dense_attrs_fit_bounds_the_single_direct_block() {
+        // A modest set fits the single direct block the emitter produces.
+        let small: Vec<AttributeMessage> = (0..30)
+            .map(|i| build_attr_message(&format!("a{i}"), &AttrValue::I64(i)))
+            .collect();
+        assert!(dense_attrs_fit(&small));
+
+        // A set whose serialized attributes overflow the one direct block (here
+        // via very long names) would need fractal-heap indirect blocks the
+        // emitter does not build, so it must report as not-fitting.
+        let big: Vec<AttributeMessage> = (0..40)
+            .map(|i| {
+                let name = format!("{}{i}", "n".repeat(3000));
+                build_attr_message(&name, &AttrValue::I64(i))
+            })
+            .collect();
+        let total: usize = big.iter().map(|a| a.serialize_v3(LENGTH_SIZE).len()).sum();
+        assert!(
+            total as u64 > DENSE_ATTR_MAX_DIRECT_BLOCK,
+            "test set should exceed one direct block (got {total} bytes)",
+        );
+        assert!(!dense_attrs_fit(&big));
     }
 }
