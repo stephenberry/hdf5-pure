@@ -1567,6 +1567,27 @@ mod tests {
     }
 
     #[test]
+    fn vlen_string_dataset_preserves_non_utf8_bytes() {
+        // The byte-exact write/read path must round-trip a payload that is not
+        // valid UTF-8 (the headline faithfulness claim for issue #83). A
+        // String-based path would corrupt this via lossy decoding; the
+        // VlStringElement::Bytes / read_vlen_string_bytes path must not.
+        use crate::type_builders::VlStringElement;
+        use crate::vl_data::VlByteObject;
+
+        let dt = crate::type_builders::make_vlen_string_type(CharacterSet::Ascii);
+        let payload = vec![0xffu8, 0xfe, 0x80, 0x00, 0x41];
+        let elements = vec![VlStringElement::Bytes(payload.clone())];
+        let mut fw = FileWriter::new();
+        fw.create_dataset("raw")
+            .with_vlen_string_elements(dt, &elements)
+            .unwrap();
+        let bytes = fw.finish().unwrap();
+        let objs = read_vl_bytes(bytes, "raw");
+        assert_eq!(objs, vec![VlByteObject::Bytes(payload)]);
+    }
+
+    #[test]
     fn vlen_string_dataset_2d_shape_roundtrips() {
         let mut fw = FileWriter::new();
         fw.create_dataset("grid")
