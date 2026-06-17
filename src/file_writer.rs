@@ -1113,11 +1113,7 @@ impl FileWriter {
             // in `flatten_dataset`, so every staged dataset is here non-chunked.
             for (i, d) in all_ds.iter().enumerate() {
                 if let Some(staging) = &d.vl_string_staging {
-                    patch_vl_refs_masked(
-                        &mut ds_layouts[i].data,
-                        &staging.patch_mask,
-                        gcol_cursor,
-                    );
+                    patch_vl_refs_masked(&mut ds_layouts[i].data, &staging.patch_mask, gcol_cursor);
                     gcol_cursor += staging.collection_bytes.len() as u64;
                 }
             }

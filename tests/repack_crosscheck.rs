@@ -134,9 +134,7 @@ fn repack_roundtrips_c_vlen_string_dataset() {
     // and non-ASCII elements.
     let f = File::open(&dst).unwrap();
     let labels = f.dataset("labels").unwrap();
-    let got = labels
-        .read_vlen_strings(Default::default())
-        .unwrap();
+    let got = labels.read_vlen_strings(Default::default()).unwrap();
     assert_eq!(got, words);
 
     // The datatype must remain variable-length, not be silently converted to a
@@ -193,10 +191,7 @@ fn repack_roundtrips_vlen_string_2d() {
     let f = File::open(&dst).unwrap();
     let grid = f.dataset("grid").unwrap();
     assert_eq!(grid.shape().unwrap(), vec![2, 3]);
-    assert_eq!(
-        grid.read_vlen_strings(Default::default()).unwrap(),
-        words
-    );
+    assert_eq!(grid.read_vlen_strings(Default::default()).unwrap(), words);
 
     // C library agrees on shape and values.
     let c = hdf5::File::open(&dst).unwrap();
