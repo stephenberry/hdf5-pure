@@ -6,7 +6,7 @@
 use alloc::{boxed::Box, string::String, string::ToString, vec, vec::Vec};
 
 use crate::attribute::AttributeMessage;
-use crate::chunked_write::ChunkOptions;
+use crate::chunked_write::{ChunkOptions, VerbatimChunk};
 use crate::compound::CompoundType;
 use crate::convert::TryToUsize;
 use crate::dataspace::{Dataspace, DataspaceType};
@@ -709,6 +709,24 @@ pub struct ProvenanceConfig {
     pub source: Option<String>,
 }
 
+/// Everything [`DatasetBuilder::with_raw_chunks`] needs to re-emit a chunked
+/// dataset by copying its source chunks verbatim (no decode/re-encode): the
+/// dense, grid-ordered compressed chunks, the source filter-pipeline message,
+/// and the chunk geometry. Built by repack from a source [`Dataset`].
+pub(crate) struct RawChunkPayload {
+    /// Logical chunk dimensions (rank entries, not the trailing element size).
+    pub(crate) chunk_dims: Vec<u64>,
+    /// Datatype element size in bytes.
+    pub(crate) element_size: usize,
+    /// Full uncompressed byte size of one chunk
+    /// (`product(chunk_dims) * element_size`), identical for every chunk.
+    pub(crate) raw_size: u64,
+    /// The verbatim source `FilterPipeline` message bytes, if the source had one.
+    pub(crate) pipeline_message: Option<Vec<u8>>,
+    /// The source chunks in dense row-major chunk-grid order, one per grid slot.
+    pub(crate) chunks: Vec<VerbatimChunk>,
+}
+
 /// Builder for datasets.
 pub struct DatasetBuilder {
     pub(crate) name: String,
@@ -718,6 +736,11 @@ pub struct DatasetBuilder {
     pub(crate) data: Option<Vec<u8>>,
     pub(crate) attrs: Vec<(String, AttrValue)>,
     pub(crate) chunk_options: ChunkOptions,
+    /// When set, this dataset's chunks are copied verbatim from a source file
+    /// (repack's verbatim path): the already-compressed chunk bytes, the source
+    /// filter-pipeline message, and the geometry needed to lay them out. This
+    /// takes precedence over `data` / `chunk_options` for chunked storage.
+    pub(crate) raw_chunks: Option<RawChunkPayload>,
     /// When set, this dataset contains object references that should be
     /// resolved by path during file serialization.
     pub(crate) reference_targets: Option<Vec<String>>,
@@ -735,6 +758,7 @@ impl DatasetBuilder {
             data: None,
             attrs: Vec::new(),
             chunk_options: ChunkOptions::default(),
+            raw_chunks: None,
             reference_targets: None,
             #[cfg(feature = "provenance")]
             provenance: None,
@@ -955,6 +979,54 @@ impl DatasetBuilder {
         if self.shape.is_none() {
             self.shape = Some(vec![num_elements]);
         }
+        self
+    }
+
+    /// Stage a chunked dataset whose chunks are copied verbatim from a source
+    /// file, without decoding or re-encoding any chunk.
+    ///
+    /// Repack's verbatim path: `chunks` are the source's already-compressed chunk
+    /// bytes plus their real filter masks, in dense row-major chunk-grid order
+    /// (one per grid slot). `pipeline_message` is the source's `FilterPipeline`
+    /// message bytes, reused as-is so every filter — including ones this crate
+    /// cannot itself apply (ZFP, SZIP, unknown) — is reproduced byte-for-byte.
+    /// `dims`/`maxshape`/`chunk_dims`/`element_size` describe the geometry. The
+    /// shape defaults to `dims` and the chunk dimensions to `chunk_dims`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn with_raw_chunks(
+        &mut self,
+        datatype: Datatype,
+        dims: &[u64],
+        maxshape: Option<&[u64]>,
+        chunk_dims: &[u64],
+        element_size: usize,
+        pipeline_message: Option<Vec<u8>>,
+        chunks: Vec<VerbatimChunk>,
+    ) -> &mut Self {
+        // Full uncompressed bytes of one chunk (drives the fixed/extensible-array
+        // chunk-size encoding width). Saturating arithmetic matches the writer's
+        // overflow discipline; the values come from an already-validated source
+        // file, so this only guards against an absurd input rather than a real case.
+        let raw_size: u64 = chunk_dims
+            .iter()
+            .copied()
+            .product::<u64>()
+            .saturating_mul(element_size as u64);
+        self.datatype = Some(datatype);
+        if self.shape.is_none() {
+            self.shape = Some(dims.to_vec());
+        }
+        if let Some(ms) = maxshape {
+            self.maxshape = Some(ms.to_vec());
+        }
+        self.chunk_options.chunk_dims = Some(chunk_dims.to_vec());
+        self.raw_chunks = Some(RawChunkPayload {
+            chunk_dims: chunk_dims.to_vec(),
+            element_size,
+            raw_size,
+            pipeline_message,
+            chunks,
+        });
         self
     }
 
