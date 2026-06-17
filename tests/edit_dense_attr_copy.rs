@@ -168,7 +168,10 @@ fn cross_file_copy_reproduces_dense_attrs() {
         assert_eq!(got, value, "cross-file group attr {name} mismatch");
     }
     // The destination's pre-existing object survives.
-    assert_eq!(c.dataset("keep").unwrap().read_raw::<f64>().unwrap(), vec![0.0]);
+    assert_eq!(
+        c.dataset("keep").unwrap().read_raw::<f64>().unwrap(),
+        vec![0.0]
+    );
 }
 
 #[test]
@@ -237,11 +240,7 @@ fn cross_file_copy_refuses_variable_length_dense_attrs() {
             .with_fapl(|p| p.libver_bounds(LibraryVersion::V110, LibraryVersion::latest()))
             .create(&src_path)
             .unwrap();
-        let ds = file
-            .new_dataset::<f64>()
-            .shape((2,))
-            .create("vds")
-            .unwrap();
+        let ds = file.new_dataset::<f64>().shape((2,)).create("vds").unwrap();
         ds.write(&[1.0f64, 2.0]).unwrap();
         // Enough variable-length string attributes to force dense storage.
         for i in 0..DENSE_ATTR_COUNT {
@@ -249,7 +248,11 @@ fn cross_file_copy_refuses_variable_length_dense_attrs() {
                 .shape(())
                 .create(format!("note_{i:02}").as_str())
                 .unwrap()
-                .write_scalar(&format!("value {i}").parse::<hdf5::types::VarLenUnicode>().unwrap())
+                .write_scalar(
+                    &format!("value {i}")
+                        .parse::<hdf5::types::VarLenUnicode>()
+                        .unwrap(),
+                )
                 .unwrap();
         }
         file.close().unwrap();

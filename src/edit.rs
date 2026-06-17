@@ -2925,9 +2925,7 @@ fn reject_foreign_addresses(region: &[u8]) -> Result<(), Error> {
 /// dense attribute set is screened here instead. Same-file copies skip this (their
 /// addresses stay valid); the fresh heap built on write is same-file by
 /// construction, so only the source datatypes matter.
-fn reject_foreign_dense_attrs(
-    attrs: &[crate::attribute::AttributeMessage],
-) -> Result<(), Error> {
+fn reject_foreign_dense_attrs(attrs: &[crate::attribute::AttributeMessage]) -> Result<(), Error> {
     for attr in attrs {
         if datatype_copies_foreign_address(&attr.datatype) {
             return Err(Error::EditUnsupported(
