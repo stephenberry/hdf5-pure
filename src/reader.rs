@@ -1084,6 +1084,48 @@ impl<'f> Dataset<'f> {
         )?)
     }
 
+    /// Read a VL string dataset's exact heap bytes, preserving the
+    /// null-vs-empty distinction and never lossily decoding.
+    ///
+    /// Unlike [`read_vlen_strings`](Self::read_vlen_strings), which returns
+    /// `String`s via `from_utf8_lossy` and so cannot reproduce embedded NULs or
+    /// non-UTF-8 payloads, this yields each element's raw bytes (or a null
+    /// marker). It underpins faithful rewriting (e.g. repack) of VL strings.
+    pub(crate) fn read_vlen_string_bytes(
+        &self,
+        options: VlenStringReadOptions,
+    ) -> Result<Vec<vl_data::VlByteObject>, Error> {
+        let datatype = self.datatype()?;
+        if !vl_data::is_vlen_string_datatype(&datatype) {
+            return Err(FormatError::TypeMismatch {
+                expected: "VariableLength string",
+                actual: "non-VariableLength string",
+            }
+            .into());
+        }
+        let dataspace = self.dataspace()?;
+        if let Some(limit) = options.max_elements()
+            && dataspace.num_elements() > limit as u64
+        {
+            return Err(FormatError::VariableLengthElementLimitExceeded {
+                limit,
+                actual: dataspace.num_elements(),
+            }
+            .into());
+        }
+        let raw = self.read_raw()?;
+        let source = self.file.source();
+        Ok(vl_data::read_vl_byte_objects_from_source(
+            &source,
+            &raw,
+            dataspace.num_elements(),
+            self.file.offset_size(),
+            self.file.length_size(),
+            self.file.addr_offset,
+            options,
+        )?)
+    }
+
     /// Read all attributes of this dataset.
     pub fn attrs(&self) -> Result<HashMap<String, AttrValue>, Error> {
         self.file.attrs_of(&self.header)

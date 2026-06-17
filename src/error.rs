@@ -187,6 +187,11 @@ pub enum FormatError {
     DatasetMissingData,
     /// Dataset is missing shape.
     DatasetMissingShape,
+    /// A variable-length string dataset was requested with chunked, filtered,
+    /// or resizable storage. VL element references live in the global heap,
+    /// whose addresses are only known after data layout, so they cannot be
+    /// patched into compressed chunks written beforehand.
+    ChunkedVlenStringUnsupported,
     /// The dataset's element count implied by its shape does not match the
     /// amount of data supplied (`shape.product() * element_size != data.len()`).
     ShapeDataMismatch {
@@ -497,6 +502,12 @@ impl fmt::Display for FormatError {
             }
             FormatError::DatasetMissingShape => {
                 write!(f, "dataset is missing shape")
+            }
+            FormatError::ChunkedVlenStringUnsupported => {
+                write!(
+                    f,
+                    "chunked, filtered, or resizable variable-length string datasets cannot be written"
+                )
             }
             FormatError::ShapeDataMismatch {
                 expected,

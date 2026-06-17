@@ -20,6 +20,11 @@
 //!   opaque, compound, enumeration, and array datatypes, contiguous/compact or
 //!   chunked, filtered with deflate, shuffle, fletcher32, and/or **lossless
 //!   integer** scale-offset.
+//! - Contiguous/compact **variable-length string** datasets (1D and ND), both
+//!   the `is_string: true` shape and the MATLAB VLEN-of-1-byte-ASCII-string
+//!   shape. Each element's exact heap bytes are read and re-staged through a
+//!   fresh global heap, preserving charset, padding, the null-vs-empty
+//!   distinction, embedded NULs, and non-UTF-8 payloads.
 //! - Group hierarchy of arbitrary depth.
 //! - Attributes representable as [`AttrValue`] (numbers, fixed and
 //!   variable-length strings and their arrays), on datasets, groups, and root.
@@ -30,9 +35,12 @@
 //! Repack reads each dataset's *decompressed* bytes and re-applies its filters,
 //! so it can only reproduce **lossless** filters (then the re-encoded chunks
 //! decompress to the exact same bytes). Refused (named, never dropped silently):
-//! variable-length, time (its byte order is not modelled), and reference
-//! datatypes (a reference's stored absolute addresses would go stale on
-//! rewrite); virtual and external data layouts;
+//! non-string variable-length (sequences of arbitrary base types); chunked,
+//! filtered, or resizable variable-length string datasets (their element
+//! references live inside compressed chunks written before the global heap
+//! addresses are known, so they cannot be patched in); time (its byte order is
+//! not modelled), and reference datatypes (a reference's stored absolute
+//! addresses would go stale on rewrite); virtual and external data layouts;
 //! lossy filters — float D-scale scale-offset and ZFP, whose re-encoding is not
 //! guaranteed idempotent — and SZIP, which this crate cannot write; and any
 //! attribute whose datatype the reader cannot decode into an [`AttrValue`] (e.g.
@@ -50,7 +58,10 @@ use crate::filter_pipeline::{
 };
 use crate::reader::{Dataset, File, Group};
 use crate::scaleoffset::{self, ScaleOffset};
-use crate::type_builders::{AttrValue, DatasetBuilder, FinishedGroup, GroupBuilder};
+use crate::type_builders::{
+    AttrValue, DatasetBuilder, FinishedGroup, GroupBuilder, VlStringElement,
+};
+use crate::vl_data::{VlByteObject, VlenStringReadOptions, is_vlen_string_datatype};
 use crate::writer::FileBuilder;
 
 /// Options controlling a [`repack`].
@@ -224,6 +235,21 @@ fn emit_dataset(db: &mut DatasetBuilder, ds: &Dataset, path: &str) -> Result<(),
     let dims = dataspace.dimensions.clone();
     let n_elements: u64 = dims.iter().product();
 
+    // Variable-length string datasets take a dedicated path: their element
+    // references point into the global heap, so they are re-emitted by reading
+    // each element's exact heap bytes and re-staging them, not by copying raw
+    // element bytes (whose stored heap addresses would go stale on rewrite).
+    if is_vlen_string_datatype(&datatype) {
+        emit_vlen_string_dataset(db, ds, path, &datatype, &dims, &layout)?;
+        // VL-string datasets carry attributes the same way as any other.
+        let attrs = ds.attrs()?;
+        check_attr_completeness(&attrs, &ds.attr_names()?, &format!("dataset {path}"))?;
+        for (name, value) in sorted(attrs) {
+            db.set_attr(&name, value);
+        }
+        return Ok(());
+    }
+
     if n_elements == 0 {
         // An empty dataset owns no element bytes: carry just the datatype and
         // shape so the reconstructed dataset has the same signature.
@@ -298,6 +324,57 @@ fn emit_dataset(db: &mut DatasetBuilder, ds: &Dataset, path: &str) -> Result<(),
     Ok(())
 }
 
+/// Re-emit a variable-length string dataset faithfully: read each element's
+/// exact heap bytes (preserving null-vs-empty, charset, padding, and the source
+/// VL datatype shape) and re-stage them through the writer's VL-string path.
+///
+/// Chunked/filtered/resizable VL-string layouts are refused by name: their
+/// element references live inside compressed chunks written before the global
+/// heap addresses are known, so they cannot be patched in.
+fn emit_vlen_string_dataset(
+    db: &mut DatasetBuilder,
+    ds: &Dataset,
+    path: &str,
+    datatype: &Datatype,
+    dims: &[u64],
+    layout: &DataLayout,
+) -> Result<(), Error> {
+    if matches!(layout, DataLayout::Chunked { .. }) {
+        return Err(Error::RepackUnsupported(format!(
+            "dataset {path}: chunked or filtered variable-length string datasets cannot be \
+             repacked (their element references live inside compressed chunks before the global \
+             heap addresses are known)"
+        )));
+    }
+    if let Some(maxshape) = &ds.dataspace()?.max_dimensions
+        && maxshape != dims
+    {
+        return Err(Error::RepackUnsupported(format!(
+            "dataset {path}: resizable variable-length string datasets cannot be repacked"
+        )));
+    }
+
+    // Read each element's exact heap bytes, preserving the null-vs-empty
+    // distinction. Reading bytes (not the lossily UTF-8-decoded `String`) keeps
+    // embedded NULs and non-UTF-8 payloads byte-exact.
+    let objects = ds.read_vlen_string_bytes(VlenStringReadOptions::default())?;
+    let elements: Vec<VlStringElement> = objects
+        .into_iter()
+        .map(|o| match o {
+            VlByteObject::Null => VlStringElement::Null,
+            VlByteObject::Bytes(bytes) => VlStringElement::Bytes(bytes),
+        })
+        .collect();
+
+    // Re-stage with the exact source datatype, then set the shape. ND datasets
+    // round-trip because the element references are stored row-major, matching
+    // the order `read_vlen_string_bytes` returns.
+    db.with_vlen_string_elements(datatype.clone(), &elements)
+        .map_err(Error::Format)?;
+    db.with_shape(dims);
+    Ok(())
+}
+
 /// Refuse the repack if `owner` has an attribute the reader cannot represent as
 /// an [`AttrValue`] and would therefore drop. `names` is every attribute on the
 /// object; `decoded` is the subset that read back, keyed by name. Any name not
@@ -340,7 +417,13 @@ fn check_datatype(dt: &Datatype, path: &str) -> Result<(), Error> {
         // The time type's serialized byte order is not modelled (always emitted
         // little-endian), so a big-endian source could not be reproduced exactly.
         Datatype::Time { .. } => bad("time"),
-        Datatype::VariableLength { .. } => bad("variable-length"),
+        // String-shaped variable-length datatypes (`is_string: true`, or the
+        // MATLAB VLEN-of-1-byte-ASCII-string shape) are reproduced by reading
+        // each element's exact heap bytes and re-staging them through the
+        // writer's VL-string path; the layout/filter checks gate chunked ones.
+        // Non-string VL (sequences of arbitrary base types) stays refused.
+        Datatype::VariableLength { .. } if is_vlen_string_datatype(dt) => Ok(()),
+        Datatype::VariableLength { .. } => bad("non-string variable-length"),
         Datatype::Reference { .. } => bad("reference"),
         Datatype::Compound { members, .. } => {
             for m in members {

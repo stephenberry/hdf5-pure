@@ -132,6 +132,25 @@ pub fn make_object_reference_type() -> Datatype {
     }
 }
 
+/// A variable-length string datatype with the given character set and
+/// null-terminated padding.
+///
+/// The character set and padding live in the variable-length datatype's own
+/// bitfields; the base element type is an 8-bit unsigned integer
+/// (`H5T_STD_U8LE`), exactly the shape the reference C library and h5py emit for
+/// a VL string (`H5Tvlen_create(H5T_C_S1)` stores the base as a 1-byte
+/// integer). Matching it byte-for-byte is what lets the C library read these
+/// datasets back into `VarLenUnicode`/`VarLenAscii` without a conversion-path
+/// error.
+pub fn make_vlen_string_type(charset: CharacterSet) -> Datatype {
+    Datatype::VariableLength {
+        is_string: true,
+        padding: Some(StringPadding::NullTerminate),
+        charset: Some(charset),
+        base_type: Box::new(make_u8_type()),
+    }
+}
+
 // ---- Compound / Enum type builders ----
 
 /// Builder for constructing HDF5 compound (struct) datatypes.
@@ -586,14 +605,23 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
 /// Build a global heap collection containing the given byte sequences.
 /// Returns the serialized collection bytes.
 pub(crate) fn build_global_heap_collection(strings: &[&str]) -> Vec<u8> {
+    let objects: Vec<&[u8]> = strings.iter().map(|s| s.as_bytes()).collect();
+    build_global_heap_collection_bytes(&objects)
+}
+
+/// Build a global heap collection from raw byte objects (no UTF-8 requirement),
+/// assigning 1-based object indices in order. Mirrors
+/// [`build_global_heap_collection`] but accepts arbitrary bytes so a faithful
+/// rewrite can carry embedded-NUL or non-UTF-8 VL-string payloads.
+pub(crate) fn build_global_heap_collection_bytes(objects: &[&[u8]]) -> Vec<u8> {
     let length_size = 8usize;
     let header_size = 8 + length_size; // sig(4) + ver(1) + reserved(3) + collection_size
 
     // Calculate total size
     let mut obj_size_total = 0usize;
-    for s in strings {
+    for obj in objects {
         let obj_header = 8 + length_size; // index(2) + refcount(2) + reserved(4) + size
-        let padded_data_len = (s.len() + 7) & !7; // pad to 8 bytes
+        let padded_data_len = (obj.len() + 7) & !7; // pad to 8 bytes
         obj_size_total += obj_header + padded_data_len;
     }
     obj_size_total += 8 + length_size; // free space marker (full object header size)
@@ -610,7 +638,7 @@ pub(crate) fn build_global_heap_collection(strings: &[&str]) -> Vec<u8> {
     buf.extend_from_slice(&(padded_collection as u64).to_le_bytes());
 
     // Objects (1-based indices)
-    for (i, s) in strings.iter().enumerate() {
+    for (i, obj) in objects.iter().enumerate() {
         #[expect(
             clippy::cast_possible_truncation,
             reason = "1-based heap object index is written into the 2-byte heap-object index field"
@@ -619,11 +647,11 @@ pub(crate) fn build_global_heap_collection(strings: &[&str]) -> Vec<u8> {
         buf.extend_from_slice(&index.to_le_bytes());
         buf.extend_from_slice(&1u16.to_le_bytes()); // ref_count
         buf.extend_from_slice(&[0u8; 4]); // reserved
-        buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
-        buf.extend_from_slice(s.as_bytes());
+        buf.extend_from_slice(&(obj.len() as u64).to_le_bytes());
+        buf.extend_from_slice(obj);
         // Pad to 8-byte boundary
-        let padded = (s.len() + 7) & !7;
-        for _ in s.len()..padded {
+        let padded = (obj.len() + 7) & !7;
+        for _ in obj.len()..padded {
             buf.push(0);
         }
     }
@@ -650,6 +678,111 @@ pub(crate) fn patch_vl_refs(raw_data: &mut [u8], collection_address: u64) {
     let count = raw_data.len() / vl_ref_size;
     for i in 0..count {
         let addr_offset = i * vl_ref_size + 4; // skip sequence_length
+        raw_data[addr_offset..addr_offset + 8].copy_from_slice(&collection_address.to_le_bytes());
+    }
+}
+
+/// A single element of a VL-string dataset being written: either a null
+/// reference (no heap object) or a heap object carrying these exact bytes.
+///
+/// The two are distinct in the HDF5 model: a null reference reads back as a
+/// null/empty element with no heap object, whereas a zero-length heap object
+/// reads back as an empty string `""`. Carrying both lets a faithful rewrite
+/// reproduce the source byte-for-byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VlStringElement {
+    /// A null reference: length 0, undefined heap address, no heap object.
+    Null,
+    /// A heap object holding these exact bytes (possibly empty).
+    Bytes(Vec<u8>),
+}
+
+/// 16-byte size of a single VL global-heap reference (offset_size = 8):
+/// length(4) + collection address(8) + object index(4).
+pub(crate) const VL_REF_SIZE: usize = 16;
+
+/// Staged VL-string dataset/attribute element data: the per-element 16-byte
+/// references (with placeholder heap addresses) plus the global heap collection
+/// holding the non-null elements' bytes.
+///
+/// Object indices are assigned 1-based and contiguous over the non-null
+/// elements in order, matching [`build_global_heap_collection_bytes`]. Null
+/// elements carry an undefined address and object index 0, and are never
+/// patched so they read back as null.
+pub(crate) struct VlStringStaging {
+    /// The dataset/attribute element bytes: one 16-byte reference per element.
+    pub refs: Vec<u8>,
+    /// The serialized global heap collection holding the non-null objects.
+    pub collection_bytes: Vec<u8>,
+    /// `true` for each element that references a heap object and must have its
+    /// address patched; `false` for a null element that must stay undefined.
+    pub patch_mask: Vec<bool>,
+}
+
+/// Stage the references and global-heap collection for a VL-string
+/// dataset/attribute from its per-element byte payloads.
+pub(crate) fn stage_vl_string_elements(elements: &[VlStringElement]) -> VlStringStaging {
+    // Collect the non-null payloads in order; their 1-based positions become
+    // the heap object indices.
+    let mut objects: Vec<&[u8]> = Vec::new();
+    let mut refs = Vec::with_capacity(elements.len() * VL_REF_SIZE);
+    let mut patch_mask = Vec::with_capacity(elements.len());
+    for element in elements {
+        match element {
+            VlStringElement::Null => {
+                refs.extend_from_slice(&0u32.to_le_bytes()); // length 0
+                refs.extend_from_slice(&u64::MAX.to_le_bytes()); // undefined address
+                refs.extend_from_slice(&0u32.to_le_bytes()); // object index 0
+                patch_mask.push(false);
+            }
+            VlStringElement::Bytes(bytes) => {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "VL element byte length is written into the 4-byte length prefix \
+                              of the variable-length reference"
+                )]
+                refs.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                refs.extend_from_slice(&0u64.to_le_bytes()); // patched later
+                let index = objects.len() + 1; // 1-based heap object index
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "1-based heap object index is written into the 4-byte object-index \
+                              field of the variable-length reference"
+                )]
+                refs.extend_from_slice(&(index as u32).to_le_bytes());
+                objects.push(bytes);
+                patch_mask.push(true);
+            }
+        }
+    }
+    // A dataset of only null elements (or an empty dataset) references no heap
+    // object, so emit no collection — there is nothing to patch and a 4096-byte
+    // empty GCOL would be dead weight.
+    let collection_bytes = if objects.is_empty() {
+        Vec::new()
+    } else {
+        build_global_heap_collection_bytes(&objects)
+    };
+    VlStringStaging {
+        refs,
+        collection_bytes,
+        patch_mask,
+    }
+}
+
+/// Patch the heap address of each VL reference flagged in `patch_mask`, leaving
+/// null references (mask `false`) with their undefined address. Mirrors
+/// [`patch_vl_refs`] but skips null elements so they read back as null.
+pub(crate) fn patch_vl_refs_masked(
+    raw_data: &mut [u8],
+    patch_mask: &[bool],
+    collection_address: u64,
+) {
+    for (i, &patch) in patch_mask.iter().enumerate() {
+        if !patch {
+            continue;
+        }
+        let addr_offset = i * VL_REF_SIZE + 4; // skip sequence_length
         raw_data[addr_offset..addr_offset + 8].copy_from_slice(&collection_address.to_le_bytes());
     }
 }
@@ -721,6 +854,11 @@ pub struct DatasetBuilder {
     /// When set, this dataset contains object references that should be
     /// resolved by path during file serialization.
     pub(crate) reference_targets: Option<Vec<String>>,
+    /// When set, this dataset stores variable-length strings: `data` holds the
+    /// 16-byte references with placeholder heap addresses, and this staging
+    /// carries the global heap collection plus the mask of references to patch
+    /// once the post-data cursor is known.
+    pub(crate) vl_string_staging: Option<VlStringStaging>,
     #[cfg(feature = "provenance")]
     pub(crate) provenance: Option<ProvenanceConfig>,
 }
@@ -736,6 +874,7 @@ impl DatasetBuilder {
             attrs: Vec::new(),
             chunk_options: ChunkOptions::default(),
             reference_targets: None,
+            vl_string_staging: None,
             #[cfg(feature = "provenance")]
             provenance: None,
         }
@@ -1014,6 +1153,67 @@ impl DatasetBuilder {
             self.shape = Some(vec![values.len() as u64]);
         }
         self
+    }
+
+    /// Write a variable-length UTF-8 string dataset.
+    ///
+    /// Each element is stored as a global-heap object holding the string's
+    /// bytes; the datatype is `H5T_VLEN { H5T_STRING { STRSIZE=VAR, ASCII or
+    /// UTF-8 } }`. The shape defaults to `[values.len()]` unless
+    /// [`with_shape`](Self::with_shape) sets it (use that for ND VL strings,
+    /// passing `values` in row-major order).
+    ///
+    /// Empty strings become zero-length heap objects (reading back as `""`).
+    /// For full fidelity over null-vs-empty elements, embedded NULs, non-UTF-8
+    /// payloads, or a specific charset/padding, use
+    /// [`with_vlen_string_elements`](Self::with_vlen_string_elements).
+    pub fn with_vlen_strings(&mut self, values: &[&str]) -> &mut Self {
+        let datatype = make_vlen_string_type(CharacterSet::Utf8);
+        let elements: Vec<VlStringElement> = values
+            .iter()
+            .map(|s| VlStringElement::Bytes(s.as_bytes().to_vec()))
+            .collect();
+        self.stage_vlen_strings(datatype, &elements);
+        self
+    }
+
+    /// Write a variable-length string dataset from an explicit source datatype
+    /// and per-element byte payloads, preserving the null-vs-empty distinction.
+    ///
+    /// `datatype` must be a string-shaped variable-length datatype
+    /// (`is_string: true`, or the MATLAB `H5T_VLEN { H5T_STRING { STRSIZE=1 } }`
+    /// shape); its charset, padding, and base type are reproduced verbatim. Each
+    /// [`VlStringElement`] is either a null reference or a heap object holding
+    /// exact bytes. This is the faithful re-emit path used by repack. Returns a
+    /// [`TypeMismatch`](crate::FormatError::TypeMismatch) if `datatype` is not a
+    /// VL-string datatype. The shape defaults to `[elements.len()]` unless
+    /// [`with_shape`](Self::with_shape) sets it.
+    pub(crate) fn with_vlen_string_elements(
+        &mut self,
+        datatype: Datatype,
+        elements: &[VlStringElement],
+    ) -> Result<&mut Self, crate::error::FormatError> {
+        if !crate::vl_data::is_vlen_string_datatype(&datatype) {
+            return Err(crate::error::FormatError::TypeMismatch {
+                expected: "VariableLength string",
+                actual: "non-VariableLength string",
+            });
+        }
+        self.stage_vlen_strings(datatype, elements);
+        Ok(self)
+    }
+
+    /// Shared body of the VL-string write entry points: stage the references
+    /// and global heap collection and record them on the builder.
+    fn stage_vlen_strings(&mut self, datatype: Datatype, elements: &[VlStringElement]) {
+        let n = elements.len() as u64;
+        let staging = stage_vl_string_elements(elements);
+        self.datatype = Some(datatype);
+        self.data = Some(staging.refs.clone());
+        self.vl_string_staging = Some(staging);
+        if self.shape.is_none() {
+            self.shape = Some(vec![n]);
+        }
     }
 
     /// Write an array-typed dataset.
