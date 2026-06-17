@@ -196,6 +196,50 @@ impl ChunkOptions {
             shape.to_vec()
         }
     }
+
+    /// Validate the chunk geometry of a dataset that will use chunked storage,
+    /// against its `shape` and optional `maxshape`. Returns a static reason on
+    /// the first problem; callers map it to their own error type. Only
+    /// meaningful when the dataset is actually chunked
+    /// ([`is_chunked`](Self::is_chunked) or a `maxshape` is set).
+    ///
+    /// These checks turn what would otherwise be a panic deep in the chunk
+    /// splitter ([`split_into_chunks`], which indexes `chunk_dims` by the shape's
+    /// rank and divides by each chunk dimension) — or a silently corrupt,
+    /// unreadable dataset — into an up-front, descriptive refusal. A
+    /// zero-element shape (e.g. `[0]` for an empty extensible dataset) is allowed:
+    /// it is not scalar and produces zero chunks, which is well-formed.
+    pub fn validate_geometry(
+        &self,
+        shape: &[u64],
+        maxshape: Option<&[u64]>,
+    ) -> Result<(), &'static str> {
+        if shape.is_empty() {
+            return Err("a scalar dataset cannot be chunked, filtered, or extensible");
+        }
+        // Explicit chunk dimensions must match the shape's rank and be non-zero;
+        // a zero would divide-by-zero when counting chunks per dimension, and a
+        // rank mismatch would index past the end of `chunk_dims`.
+        if let Some(dims) = self.chunk_dims.as_deref() {
+            if dims.len() != shape.len() {
+                return Err("chunk dimensions must have the same rank as the dataset shape");
+            }
+            if dims.contains(&0) {
+                return Err("chunk dimensions must all be non-zero");
+            }
+        }
+        // A maximum shape must match the rank and bound the current shape in
+        // every dimension (an unlimited dimension, `u64::MAX`, bounds anything).
+        if let Some(ms) = maxshape {
+            if ms.len() != shape.len() {
+                return Err("maxshape must have the same rank as the dataset shape");
+            }
+            if ms.iter().zip(shape).any(|(&m, &d)| m != u64::MAX && m < d) {
+                return Err("maxshape must be at least the current shape in every dimension");
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A chunk that has been written to the file buffer.

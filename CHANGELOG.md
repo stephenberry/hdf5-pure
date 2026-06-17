@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- In-place add of chunked, filtered, and extensible datasets: `EditSession::create_dataset` now accepts chunked storage (`with_chunks`), any filter the whole-file writer supports (`with_deflate`, `with_shuffle`, `with_fletcher32`, `with_scale_offset`, `with_zfp`), and extensible (optionally unlimited) dimensions (`with_maxshape`) — previously only contiguous, unfiltered datasets could be added in place. The chunk data, index, and filter pipeline are produced by the same builder the whole-file writer uses and appended at end-of-file, so the added dataset's object header is byte-identical to a freshly written one and is read back faithfully by the reference C library. The filter pipeline is validated before any byte is written, and a chunked dataset's append leaves the prior root intact until the superblock is repointed last, preserving the editor's crash-safety guarantee ([#76](https://github.com/stephenberry/hdf5-pure/issues/76)).
+
+### Fixed
+
+- Malformed chunk geometry is now refused up front by both `FileBuilder` and `EditSession` instead of panicking deep in the chunk splitter (an out-of-bounds index or a divide-by-zero) or producing an unreadable dataset: chunk dimensions whose rank disagrees with the shape, a zero chunk dimension, a maximum shape of the wrong rank or smaller than the current shape, and chunking a scalar dataset all return a descriptive error (`FormatError::InvalidChunkGeometry` from the writer, `Error::EditUnsupported` from the editor). An absurd shape whose element count overflows `u64` is likewise reported rather than panicking a debug build. Zero-element extensible datasets (e.g. shape `[0]` with an unlimited maximum) remain valid ([#76](https://github.com/stephenberry/hdf5-pure/issues/76)).
+
 ## [0.15.0] - 2026-06-16
 
 Adds generic element-typed dataset I/O, file- and dataset-level cache tuning, in-place group attribute editing, OS advisory file locking for the editor, and a gallery of runnable examples; also hardens the 32-bit/WASM readers against silent truncation. Additive minor bump, with two intended behavior changes (editor file locking and the new truncation guards) noted below.

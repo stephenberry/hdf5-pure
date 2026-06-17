@@ -627,7 +627,18 @@ impl FileWriter {
             // absurd shape from overflowing into a false match.
             let elem_size = dt.type_size() as u64;
             if !is_empty && elem_size > 0 {
-                let expected = shape.iter().product::<u64>().saturating_mul(elem_size);
+                // Multiply with checked arithmetic, saturating on overflow: an
+                // absurd shape whose element count exceeds `u64` must not panic a
+                // debug build in `Iterator::product` (nor silently wrap a release
+                // build into a false match). A saturated `u64::MAX` can never
+                // equal a real `data.len()`, so it is correctly reported as a
+                // mismatch.
+                let num_elements = shape
+                    .iter()
+                    .copied()
+                    .try_fold(1u64, |acc, d| acc.checked_mul(d))
+                    .unwrap_or(u64::MAX);
+                let expected = num_elements.saturating_mul(elem_size);
                 if raw.len() as u64 != expected {
                     #[expect(
                         clippy::cast_possible_truncation,
@@ -639,6 +650,16 @@ impl FileWriter {
                         element_size: elem_size as usize,
                     });
                 }
+            }
+            // Validate the chunk geometry up front for a chunked / filtered /
+            // extensible dataset, so a malformed request (chunk dimensions of the
+            // wrong rank, a zero chunk dimension, a bad maximum shape, or
+            // chunking a scalar) is refused here instead of panicking in the
+            // chunk splitter or producing an unreadable dataset.
+            if db.chunk_options.is_chunked() || db.maxshape.is_some() {
+                db.chunk_options
+                    .validate_geometry(&shape, db.maxshape.as_deref())
+                    .map_err(FormatError::InvalidChunkGeometry)?;
             }
             let max_dimensions = db.maxshape.clone();
             let dspace = Dataspace {

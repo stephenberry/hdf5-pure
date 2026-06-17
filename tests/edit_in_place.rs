@@ -1,7 +1,7 @@
 //! Tests for in-place editing via `EditSession` (issue #32, Group C):
 //! add, delete, and copy datasets and groups at any path.
 
-use hdf5_pure::{AttrValue, DType, EditSession, File, FileBuilder};
+use hdf5_pure::{AttrValue, DType, EditSession, File, FileBuilder, ScaleOffset};
 
 /// Write a starter file with one dataset, returning its path.
 fn write_starter(path: &std::path::Path) {
@@ -844,27 +844,303 @@ fn superblock_eof_matches_file_size_after_edit() {
     std::fs::remove_file(&path).ok();
 }
 
+/// A chunked (but unfiltered) dataset can be added in place and read back, and
+/// the original dataset is left intact.
 #[test]
-fn chunked_dataset_is_rejected_without_writing() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_reject_chunked.h5");
+fn add_chunked_dataset() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_chunked.h5");
     write_starter(&path);
-    let before = std::fs::read(&path).unwrap();
 
+    let data: Vec<f64> = (0..100).map(|i| i as f64 * 0.5).collect();
     {
         let mut session = EditSession::open(&path).unwrap();
         session
             .create_dataset("chunky")
-            .with_f64_data(&[1.0, 2.0, 3.0, 4.0])
-            .with_chunks(&[2]);
-        let err = session.commit().unwrap_err();
-        assert!(
-            err.to_string().contains("in-place edit"),
-            "unexpected error: {err}"
-        );
+            .with_f64_data(&data)
+            .with_chunks(&[25]);
+        session.commit().unwrap();
     }
 
-    // The guard runs before any write, so the file is untouched.
-    let after = std::fs::read(&path).unwrap();
-    assert_eq!(before, after);
+    let file = File::open(&path).unwrap();
+    let chunky = file.dataset("chunky").unwrap();
+    assert_eq!(chunky.shape().unwrap(), vec![100]);
+    assert_eq!(chunky.read_f64().unwrap(), data);
+    // Original dataset untouched.
+    assert_eq!(
+        file.dataset("original").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    // The superblock's end-of-file matches the physical size after appending the
+    // chunk data, index, and header.
+    assert_eq!(file.file_size(), std::fs::metadata(&path).unwrap().len());
     std::fs::remove_file(&path).ok();
+}
+
+/// Deflate, shuffle+deflate, and fletcher32 filtered datasets each round-trip
+/// through the in-place editor and the reader.
+#[test]
+fn add_filtered_datasets() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_filtered.h5");
+    write_starter(&path);
+
+    let data: Vec<f64> = (0..200).map(|i| i as f64).collect();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("deflated")
+            .with_f64_data(&data)
+            .with_chunks(&[50])
+            .with_deflate(6);
+        session
+            .create_dataset("shuffled")
+            .with_f64_data(&data)
+            .with_chunks(&[50])
+            .with_shuffle()
+            .with_deflate(4);
+        session
+            .create_dataset("checked")
+            .with_f64_data(&data)
+            .with_chunks(&[64])
+            .with_fletcher32();
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    for name in ["deflated", "shuffled", "checked"] {
+        assert_eq!(
+            file.dataset(name).unwrap().read_f64().unwrap(),
+            data,
+            "dataset {name} did not round-trip"
+        );
+    }
+    assert_eq!(file.file_size(), std::fs::metadata(&path).unwrap().len());
+    std::fs::remove_file(&path).ok();
+}
+
+/// A lossless integer scale-offset dataset round-trips.
+#[test]
+fn add_scale_offset_dataset() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_scaleoffset.h5");
+    write_starter(&path);
+
+    let data: Vec<i32> = (0..120).map(|i| 1000 + (i % 7)).collect();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("counts")
+            .with_i32_data(&data)
+            .with_chunks(&[40])
+            .with_scale_offset(ScaleOffset::Integer(0));
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.dataset("counts").unwrap().read_i32().unwrap(), data);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A 2-D chunked dataset whose chunks don't evenly divide the shape round-trips
+/// (exercises edge chunks and the fixed-array index used for >1 chunk).
+#[test]
+fn add_2d_chunked_dataset() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_2d_chunked.h5");
+    write_starter(&path);
+
+    let data: Vec<i32> = (0..(7 * 5)).collect();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("grid")
+            .with_i32_data(&data)
+            .with_shape(&[7, 5])
+            .with_chunks(&[3, 2]);
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let grid = file.dataset("grid").unwrap();
+    assert_eq!(grid.shape().unwrap(), vec![7, 5]);
+    assert_eq!(grid.read_i32().unwrap(), data);
+    std::fs::remove_file(&path).ok();
+}
+
+/// An extensible (unlimited-dimension) dataset can be added in place; its data
+/// reads back and the file remains valid. The unlimited dimension selects the
+/// Extensible-Array chunk index.
+#[test]
+fn add_extensible_dataset() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_extensible.h5");
+    write_starter(&path);
+
+    let data: Vec<i32> = (0..64).collect();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("stream")
+            .with_i32_data(&data)
+            .with_shape(&[64])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[16]);
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let stream = file.dataset("stream").unwrap();
+    assert_eq!(stream.shape().unwrap(), vec![64]);
+    assert_eq!(stream.read_i32().unwrap(), data);
+    assert_eq!(file.file_size(), std::fs::metadata(&path).unwrap().len());
+    std::fs::remove_file(&path).ok();
+}
+
+/// One commit can mix a contiguous dataset and a chunked/compressed dataset
+/// into a nested group, alongside the original.
+#[test]
+fn add_mixed_contiguous_and_chunked_in_group() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_mixed.h5");
+    write_starter(&path);
+
+    let wave: Vec<f64> = (0..512).map(|i| (i as f64 * 0.1).cos()).collect();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.create_group("run");
+        session
+            .create_dataset("run/scalarish")
+            .with_i32_data(&[1, 2, 3]);
+        session
+            .create_dataset("run/wave")
+            .with_f64_data(&wave)
+            .with_chunks(&[128])
+            .with_shuffle()
+            .with_deflate(6);
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("run/scalarish").unwrap().read_i32().unwrap(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(file.dataset("run/wave").unwrap().read_f64().unwrap(), wave);
+    assert_eq!(
+        file.dataset("original").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    assert_eq!(file.file_size(), std::fs::metadata(&path).unwrap().len());
+    std::fs::remove_file(&path).ok();
+}
+
+/// A chunked dataset whose datatype is `f64` still reports the right dtype after
+/// an in-place add, confirming the header is a faithful chunked dataset header.
+#[test]
+fn added_chunked_dataset_reports_dtype() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_chunked_dtype.h5");
+    write_starter(&path);
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("c")
+            .with_f64_data(&(0..50).map(f64::from).collect::<Vec<_>>())
+            .with_chunks(&[10])
+            .with_deflate(3);
+        session.commit().unwrap();
+    }
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.dataset("c").unwrap().dtype().unwrap(), DType::F64);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A ZFP fixed-rate compressed dataset can be added in place and reads back
+/// within ZFP's lossy tolerance (gated on the `zfp` feature).
+#[test]
+#[cfg(feature = "zfp")]
+fn add_zfp_dataset() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_zfp.h5");
+    write_starter(&path);
+
+    let data: Vec<f64> = (0..256).map(|i| (i as f64 * 0.05).sin()).collect();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("zfp")
+            .with_f64_data(&data)
+            .with_chunks(&[64])
+            .with_zfp(32.0);
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let back = file.dataset("zfp").unwrap().read_f64().unwrap();
+    assert_eq!(back.len(), data.len());
+    let max_err = data
+        .iter()
+        .zip(back.iter())
+        .map(|(&a, &b)| (a - b).abs())
+        .fold(0f64, f64::max);
+    assert!(max_err < 1e-6, "ZFP max_err {max_err} > 1e-6");
+    std::fs::remove_file(&path).ok();
+}
+
+/// Malformed chunked-dataset requests are refused before any byte is written,
+/// rather than panicking or producing a silently-corrupt dataset: an empty
+/// (zero-element) shape, chunk dims whose rank disagrees with the shape, a zero
+/// chunk dimension, and a maxshape whose rank disagrees with the shape.
+#[test]
+fn malformed_chunked_requests_are_rejected_without_writing() {
+    // A no-capture configurator per malformed case; `fn` pointers keep the case
+    // table a simple type.
+    type Configure = fn(&mut hdf5_pure::DatasetBuilder);
+    let bad: &[(&str, Configure)] = &[
+        ("empty shape", |b| {
+            b.with_f64_data(&[]).with_shape(&[0]).with_chunks(&[4]);
+        }),
+        ("chunk rank mismatch", |b| {
+            b.with_i32_data(&[1, 2, 3, 4, 5, 6])
+                .with_shape(&[2, 3])
+                .with_chunks(&[2]);
+        }),
+        ("zero chunk dim", |b| {
+            b.with_i32_data(&[1, 2, 3, 4])
+                .with_shape(&[4])
+                .with_chunks(&[0]);
+        }),
+        ("maxshape rank mismatch", |b| {
+            b.with_i32_data(&[1, 2, 3, 4])
+                .with_shape(&[4])
+                .with_maxshape(&[u64::MAX, u64::MAX])
+                .with_chunks(&[2]);
+        }),
+        ("scalar with chunks", |b| {
+            b.with_f64_data(&[1.0]).with_shape(&[]).with_chunks(&[1]);
+        }),
+        ("maxshape below shape", |b| {
+            b.with_i32_data(&[1, 2, 3, 4])
+                .with_shape(&[4])
+                .with_maxshape(&[2]);
+        }),
+    ];
+
+    for (label, configure) in bad {
+        let path = std::env::temp_dir().join(format!(
+            "hdf5_pure_edit_reject_{}.h5",
+            label.replace(' ', "_")
+        ));
+        write_starter(&path);
+        let before = std::fs::read(&path).unwrap();
+        {
+            let mut session = EditSession::open(&path).unwrap();
+            configure(session.create_dataset("bad"));
+            let err = session.commit().unwrap_err();
+            assert!(
+                err.to_string().contains("in-place edit"),
+                "[{label}] expected an EditUnsupported refusal, got: {err}"
+            );
+        }
+        // The guard runs before any write, so the file is untouched.
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "[{label}] file modified"
+        );
+        std::fs::remove_file(&path).ok();
+    }
 }

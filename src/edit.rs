@@ -46,11 +46,17 @@
 //!   converted to a compact-link v2 header, carrying its links and attributes
 //!   over (other group messages — symbol table, modification time — are
 //!   dropped); an attribute it cannot reproduce is refused.
-//! - Added datasets are contiguous and unfiltered (no chunking, compression,
-//!   shuffle, scale-offset, or extensible dimensions), have a fixed-size
-//!   datatype with a non-empty shape, and carry only fixed-size (non
-//!   variable-length) attributes, few enough to stay in compact storage. Group
-//!   attribute edits have the same compact, fixed-size attribute restriction.
+//! - Added datasets may be contiguous *or* chunked, with any filter the
+//!   whole-file writer supports (deflate, shuffle, fletcher32, scale-offset,
+//!   ZFP), and may declare extensible (maximum, optionally unlimited)
+//!   dimensions. A chunked dataset's data and index — and any filtered chunks —
+//!   are produced by the same builder the whole-file writer uses and appended at
+//!   end-of-file, so its object header is byte-identical to a freshly written
+//!   one. Every added dataset must have a fixed-size datatype with a non-empty
+//!   shape and carry only fixed-size (non variable-length) attributes, few
+//!   enough to stay in compact storage; object-reference and provenance
+//!   datasets are not added in place. Group attribute edits have the same
+//!   compact, fixed-size attribute restriction.
 //! - A new group's parent must already exist or be created in the same session
 //!   (each level created explicitly); intermediate groups are not auto-created.
 //!
@@ -94,11 +100,15 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::checksum::jenkins_lookup3;
+use crate::chunked_write::{ChunkOptions, build_chunked_data_at_ext};
 use crate::dataspace::{Dataspace, DataspaceType};
 use crate::error::Error;
 use crate::file_lock::{self, FileLocking};
 use crate::file_space_info::{FileSpaceInfo, FileSpaceStrategy};
-use crate::file_writer::{LENGTH_SIZE, OFFSET_SIZE, build_dataset_oh, make_link};
+use crate::file_writer::{
+    LENGTH_SIZE, OFFSET_SIZE, build_chunked_dataset_oh, build_dataset_oh, make_link,
+};
+use crate::filters::ChunkContext;
 use crate::free_space::FreeList;
 use crate::free_space_manager::{self, FreeSection, FsmHeader, fshd_len, serialize_file_fsm};
 use crate::group_v2::resolve_group_entries;
@@ -386,6 +396,12 @@ impl EditSession {
     /// session). Returns the [`DatasetBuilder`] — the same builder used by
     /// [`FileBuilder`](crate::FileBuilder) — to configure data, shape, and
     /// attributes.
+    ///
+    /// The dataset may be contiguous or chunked, and chunked datasets may be
+    /// filtered (`with_deflate`, `with_shuffle`, `with_fletcher32`,
+    /// `with_scale_offset`, `with_zfp`) and/or extensible (`with_maxshape`); see
+    /// the [module docs](self) for what stays unsupported (variable-length or
+    /// dense attributes, object-reference and provenance datasets, empty shapes).
     pub fn create_dataset(&mut self, path: &str) -> &mut DatasetBuilder {
         let mut comps = split_path(path);
         let leaf = comps.pop().unwrap_or_default();
@@ -480,12 +496,18 @@ impl EditSession {
 
     /// Apply all staged additions and deletions to the file in place and flush.
     ///
-    /// Appends each new dataset (data blob + object header) and each new group,
-    /// then appends rewritten object headers for every touched group and its
-    /// ancestors up to the root (omitting any deleted links), then repoints the
-    /// superblock at the new root. On success the staged set is cleared and the
-    /// session can be reused. On any [`Error::EditUnsupported`] the file on disk
-    /// is left untouched: every check runs before the first byte is written.
+    /// Appends each new dataset (its data — a contiguous blob, or the chunk data
+    /// and index for a chunked/filtered dataset — plus its object header) and
+    /// each new group, then appends rewritten object headers for every touched
+    /// group and its ancestors up to the root (omitting any deleted links), then
+    /// repoints the superblock at the new root. On success the staged set is
+    /// cleared and the session can be reused. On any [`Error::EditUnsupported`]
+    /// the file on disk is left untouched: the checks that raise it — including
+    /// each dataset's filter-pipeline and chunk-geometry validation — all run
+    /// before the first byte is written. Should a later step fail mid-apply (an
+    /// I/O error, or a residual build error), the superblock — repointed last —
+    /// still names the prior root, so the file stays valid and the appended bytes
+    /// are unreferenced slack.
     pub fn commit(&mut self) -> Result<(), Error> {
         if self.pending_datasets.is_empty()
             && self.pending_groups.is_empty()
@@ -750,15 +772,19 @@ impl EditSession {
 
             // Datasets directly under this group.
             for fd in flat.remove(key).into_iter().flatten() {
-                let data_addr = self.alloc_or_append(&fd.raw)?;
-                let oh = build_dataset_oh(
-                    &fd.dt,
-                    &fd.ds,
-                    data_addr,
-                    fd.raw.len() as u64,
-                    &fd.attrs,
-                    None,
-                );
+                let oh = if fd.chunk_options.is_chunked() || fd.maxshape.is_some() {
+                    self.build_chunked_dataset(&fd)?
+                } else {
+                    let data_addr = self.alloc_or_append(&fd.raw)?;
+                    build_dataset_oh(
+                        &fd.dt,
+                        &fd.ds,
+                        data_addr,
+                        fd.raw.len() as u64,
+                        &fd.attrs,
+                        None,
+                    )
+                };
                 let oh_addr = self.alloc_or_append(&oh)?;
                 region.extend_from_slice(&encode_link_message(&fd.name, oh_addr));
             }
@@ -1520,6 +1546,55 @@ impl EditSession {
         }
     }
 
+    /// Lay out a chunked / filtered / extensible dataset and return its object
+    /// header bytes (which the caller links into the parent group).
+    ///
+    /// The chunk data and index (B-tree v1 / fixed-array / extensible-array, with
+    /// any filter pipeline applied) are produced as one relocatable blob by
+    /// [`build_chunked_data_at_ext`], whose internal layout — and therefore total
+    /// size — is independent of the base address it is given. The blob is
+    /// appended at end-of-file, so passing the current end-of-file as the base
+    /// makes every absolute address it embeds (chunk addresses, index-structure
+    /// addresses, the addresses in the data-layout message) land exactly where
+    /// the bytes are written. The header is then built with
+    /// [`build_chunked_dataset_oh`] — the same function the whole-file writer
+    /// uses — so the header is byte-identical to one written fresh.
+    ///
+    /// Unlike the contiguous path the blob is always *appended* rather than
+    /// placed via [`alloc_or_append`]: reusing an interior freed region would
+    /// require knowing the blob's size before building it at that region's
+    /// address, and appending keeps the address known up front. Freed space is
+    /// still reused for the object header and for every other object in the
+    /// commit.
+    fn build_chunked_dataset(&mut self, fd: &FlatDataset) -> Result<Vec<u8>, Error> {
+        let base = self.data.len() as u64;
+        let chunk_dims = fd.chunk_options.resolve_chunk_dims(&fd.ds.dimensions);
+        let ctx = ChunkContext::from_datatype(&chunk_dims, &fd.dt);
+        let result = build_chunked_data_at_ext(
+            &fd.raw,
+            &fd.ds.dimensions,
+            ctx,
+            &fd.chunk_options,
+            base,
+            fd.maxshape.as_deref(),
+        )?;
+        // `append` writes at the current end-of-file, which equals `base`: the
+        // blob lands exactly where its embedded addresses expect.
+        let written = self.append(&result.data_bytes)?;
+        debug_assert_eq!(
+            written, base,
+            "chunk blob must land at the base address it was built for",
+        );
+        Ok(build_chunked_dataset_oh(
+            &fd.dt,
+            &fd.ds,
+            &result.layout_message,
+            result.pipeline_message.as_deref(),
+            &fd.attrs,
+            None,
+        ))
+    }
+
     /// On-disk byte spans `(addr, len)` of every chunk of the version 2 object
     /// header at `addr`: chunk 0 (signature, prefix, messages, checksum) plus
     /// each continuation (`OCHK`) block. Used to reclaim a header's storage when
@@ -1691,6 +1766,16 @@ struct FlatDataset {
     ds: Dataspace,
     raw: Vec<u8>,
     attrs: Vec<crate::attribute::AttributeMessage>,
+    /// Chunked/filtered storage options. When [`ChunkOptions::is_chunked`] is
+    /// false and `maxshape` is `None`, the dataset is written as contiguous,
+    /// unfiltered storage; otherwise its chunk data and index are built by
+    /// [`build_chunked_data_at_ext`] and appended at end-of-file.
+    chunk_options: ChunkOptions,
+    /// Maximum dimensions for an extensible dataset (an unlimited dimension is
+    /// `u64::MAX`), mirrored into `ds.max_dimensions`. `None` for a fixed-shape
+    /// dataset. A maxshape with an unlimited dimension selects the
+    /// extensible-array chunk index; a finite maxshape stays fixed-array/single.
+    maxshape: Option<Vec<u64>>,
 }
 
 /// Split a path into non-empty components.
@@ -1709,16 +1794,17 @@ fn ensure_ancestors(nodes: &mut BTreeMap<PathKey, Node>, path: &[String]) {
     }
 }
 
-/// Validate a staged dataset and reduce it to a [`FlatDataset`], rejecting any
-/// feature this engine cannot emit as contiguous, unfiltered storage.
+/// Validate a staged dataset and reduce it to a [`FlatDataset`]. Contiguous,
+/// unfiltered datasets are emitted as such; chunked, filtered, or extensible
+/// datasets carry their [`ChunkOptions`] and maxshape through to the commit,
+/// where [`build_chunked_data_at_ext`] lays out their chunk data and index.
+/// Rejects any remaining feature this engine cannot reproduce faithfully:
+/// object-reference or provenance datasets, variable-length or dense
+/// attributes, an empty (zero-element) shape, or a filter pipeline the build
+/// cannot construct.
 fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
     if db.name.is_empty() {
         return Err(Error::EditUnsupported("dataset path has an empty name"));
-    }
-    if db.chunk_options.is_chunked() || db.maxshape.is_some() {
-        return Err(Error::EditUnsupported(
-            "chunked / compressed / extensible datasets cannot be added in place yet",
-        ));
     }
     if db.reference_targets.is_some() {
         return Err(Error::EditUnsupported(
@@ -1749,12 +1835,72 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
 
     let elem = dt.type_size() as u64;
     if elem > 0 {
-        let expected = shape.iter().product::<u64>().saturating_mul(elem);
-        if raw.len() as u64 != expected {
+        // Multiply with checked arithmetic: an absurd shape whose element count
+        // (or byte size) overflows `u64` is refused rather than panicking in a
+        // debug build or silently wrapping in release (which could let a wrapped
+        // product spuriously match `raw.len()`).
+        let expected = shape
+            .iter()
+            .try_fold(1u64, |acc, &d| acc.checked_mul(d))
+            .and_then(|n| n.checked_mul(elem));
+        match expected {
+            Some(expected) if raw.len() as u64 == expected => {}
+            Some(_) => {
+                return Err(Error::EditUnsupported(
+                    "dataset data length does not match its shape",
+                ));
+            }
+            None => {
+                return Err(Error::EditUnsupported(
+                    "dataset shape is too large to address on this platform",
+                ));
+            }
+        }
+    }
+
+    let chunked = db.chunk_options.is_chunked() || db.maxshape.is_some();
+    if chunked {
+        // Refuse malformed chunk geometry up front (the same validation the
+        // whole-file writer applies), so a bad request — chunk dimensions of the
+        // wrong rank, a zero chunk dimension, an inconsistent maximum shape, or
+        // chunking a scalar — never reaches and panics the chunk splitter, nor
+        // yields a dataset the reader cannot decode.
+        db.chunk_options
+            .validate_geometry(&shape, db.maxshape.as_deref())
+            .map_err(Error::EditUnsupported)?;
+        // Deflate is compiled out unless the `deflate` feature is on, but
+        // `build_pipeline` emits its descriptor regardless; catch a
+        // disabled-feature request here so it is refused up front rather than
+        // failing mid-apply when a chunk is compressed.
+        #[cfg(not(feature = "deflate"))]
+        if db.chunk_options.deflate_level.is_some() {
             return Err(Error::EditUnsupported(
-                "dataset data length does not match its shape",
+                "deflate compression requires the `deflate` crate feature",
             ));
         }
+        // Validate the requested filter pipeline now — before any file bytes are
+        // written — so an unsupported filter, an incompatible datatype, or a
+        // disabled compression feature is refused up front; the chunk data
+        // itself is laid out in the commit's apply phase. Chunked/filtered
+        // storage flows through the very builder the normal writer uses
+        // ([`build_chunked_data_at_ext`] + [`build_chunked_dataset_oh`]), so the
+        // resulting object header is byte-identical to a freshly written one.
+        let chunk_dims = db.chunk_options.resolve_chunk_dims(&shape);
+        let ctx = ChunkContext::from_datatype(&chunk_dims, &dt);
+        db.chunk_options
+            .build_pipeline(
+                ctx.element_size,
+                &chunk_dims,
+                ctx.element_type,
+                ctx.scale_offset_type,
+            )
+            .map_err(|_| {
+                Error::EditUnsupported(
+                    "this dataset's filter pipeline cannot be added in place \
+                     (an unsupported filter, an incompatible datatype, or a \
+                     compression feature that is not enabled)",
+                )
+            })?;
     }
 
     if db
@@ -1792,7 +1938,9 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
         )]
         rank: shape.len() as u8,
         dimensions: shape,
-        max_dimensions: None,
+        // A chunked, extensible dataset records its maximum dimensions (an
+        // unlimited dimension is `u64::MAX`); a fixed-shape dataset has none.
+        max_dimensions: db.maxshape.clone(),
     };
     let attrs = db
         .attrs
@@ -1806,6 +1954,8 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
         ds,
         raw,
         attrs,
+        chunk_options: db.chunk_options,
+        maxshape: db.maxshape,
     })
 }
 

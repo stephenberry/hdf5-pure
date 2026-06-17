@@ -16,7 +16,7 @@
 //! repointed, and the result is read back correctly by the C library.
 
 use hdf5::file::LibraryVersion;
-use hdf5_pure::{AttrValue, EditSession, File, FileBuilder};
+use hdf5_pure::{AttrValue, EditSession, File, FileBuilder, ScaleOffset};
 use tempfile::tempdir;
 
 /// Stage an add, an add-into-a-group, a delete, and a copy — the full op set.
@@ -434,5 +434,119 @@ fn free_space_reuse_and_truncation_stay_c_readable() {
     assert_eq!(
         c.dataset("grp/beta").unwrap().read_raw::<i32>().unwrap(),
         vec![10, 20, 30, 40]
+    );
+}
+
+#[test]
+fn chunked_and_filtered_datasets_added_in_place_are_c_readable() {
+    // Issue #76: chunked / filtered / extensible datasets added in place to a
+    // file the editor did not write must be read back faithfully by the
+    // reference C library — the real interop proof that their chunk data, index,
+    // and filter pipeline are emitted correctly.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_chunked_edit.h5");
+    write_c_starter(&path, LibraryVersion::V110, LibraryVersion::latest());
+
+    let f64_data: Vec<f64> = (0..400).map(|i| i as f64 * 0.25).collect();
+    let i32_data: Vec<i32> = (0..256).map(|i| 1000 + (i % 11)).collect();
+    let ext_data: Vec<i32> = (0..128).collect();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("deflated")
+            .with_f64_data(&f64_data)
+            .with_chunks(&[100])
+            .with_deflate(6);
+        session
+            .create_dataset("shuffled")
+            .with_f64_data(&f64_data)
+            .with_chunks(&[64])
+            .with_shuffle()
+            .with_deflate(4);
+        session
+            .create_dataset("checked")
+            .with_i32_data(&i32_data)
+            .with_chunks(&[80])
+            .with_fletcher32();
+        session
+            .create_dataset("scaled")
+            .with_i32_data(&i32_data)
+            .with_chunks(&[80])
+            .with_scale_offset(ScaleOffset::Integer(0));
+        // Into a group the C library wrote, exercising header relocation.
+        session
+            .create_dataset("grp/grid")
+            .with_i32_data(&(0..(6 * 4)).collect::<Vec<i32>>())
+            .with_shape(&[6, 4])
+            .with_chunks(&[4, 3]);
+        // Extensible (unlimited) dataset → Extensible-Array chunk index.
+        session
+            .create_dataset("stream")
+            .with_i32_data(&ext_data)
+            .with_shape(&[128])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[32]);
+        session.commit().unwrap();
+    }
+
+    // hdf5-pure reads everything back.
+    {
+        let f = File::open(&path).unwrap();
+        assert_eq!(f.dataset("deflated").unwrap().read_f64().unwrap(), f64_data);
+        assert_eq!(f.dataset("shuffled").unwrap().read_f64().unwrap(), f64_data);
+        assert_eq!(f.dataset("checked").unwrap().read_i32().unwrap(), i32_data);
+        assert_eq!(f.dataset("scaled").unwrap().read_i32().unwrap(), i32_data);
+        assert_eq!(
+            f.dataset("grp/grid").unwrap().read_i32().unwrap(),
+            (0..(6 * 4)).collect::<Vec<i32>>()
+        );
+        assert_eq!(f.dataset("stream").unwrap().read_i32().unwrap(), ext_data);
+        // The C-written survivors are intact.
+        assert_eq!(
+            f.dataset("alpha").unwrap().read_f64().unwrap(),
+            vec![1.0, 2.0, 3.0]
+        );
+    }
+
+    // The reference C library reads the filtered/chunked/extensible additions and
+    // sees them as chunked storage.
+    let c = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        c.dataset("deflated").unwrap().read_raw::<f64>().unwrap(),
+        f64_data
+    );
+    assert_eq!(
+        c.dataset("shuffled").unwrap().read_raw::<f64>().unwrap(),
+        f64_data
+    );
+    assert_eq!(
+        c.dataset("checked").unwrap().read_raw::<i32>().unwrap(),
+        i32_data
+    );
+    assert_eq!(
+        c.dataset("scaled").unwrap().read_raw::<i32>().unwrap(),
+        i32_data
+    );
+    assert_eq!(
+        c.dataset("grp/grid").unwrap().read_raw::<i32>().unwrap(),
+        (0..(6 * 4)).collect::<Vec<i32>>()
+    );
+    assert_eq!(
+        c.dataset("stream").unwrap().read_raw::<i32>().unwrap(),
+        ext_data
+    );
+    for name in [
+        "deflated", "shuffled", "checked", "scaled", "grp/grid", "stream",
+    ] {
+        assert!(
+            c.dataset(name).unwrap().chunk().is_some(),
+            "C library does not see {name} as chunked"
+        );
+    }
+    // The C-written original is untouched.
+    assert_eq!(
+        c.dataset("alpha").unwrap().read_raw::<f64>().unwrap(),
+        vec![1.0, 2.0, 3.0]
     );
 }

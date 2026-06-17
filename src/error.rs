@@ -198,6 +198,14 @@ pub enum FormatError {
         /// non-zero; used to report the mismatch in elements as well as bytes.
         element_size: usize,
     },
+    /// A chunked/filtered/extensible dataset's chunk geometry is invalid — for
+    /// example chunk dimensions whose rank disagrees with the shape, a zero chunk
+    /// dimension, a maximum shape whose rank disagrees with the shape or that is
+    /// smaller than the current shape, or chunking requested on a scalar dataset.
+    /// Reported up front so a malformed request is refused instead of panicking
+    /// in the chunk splitter or producing an unreadable dataset. The payload is a
+    /// human-readable reason.
+    InvalidChunkGeometry(&'static str),
     /// Invalid filter pipeline version.
     InvalidFilterPipelineVersion(u8),
     /// Unsupported filter ID.
@@ -504,6 +512,9 @@ impl fmt::Display for FormatError {
                     expected / element_size,
                     actual / element_size,
                 )
+            }
+            FormatError::InvalidChunkGeometry(reason) => {
+                write!(f, "invalid chunk geometry: {reason}")
             }
             FormatError::InvalidFilterPipelineVersion(v) => {
                 write!(f, "invalid filter pipeline version: {v}")
