@@ -1484,7 +1484,10 @@ fn write_dataset_same_size_overwrites_in_place() {
 
     // Same-length overwrite reuses the existing block: the file does not grow.
     let size_after = std::fs::metadata(&path).unwrap().len();
-    assert_eq!(size_after, size_before, "same-size write should not grow file");
+    assert_eq!(
+        size_after, size_before,
+        "same-size write should not grow file"
+    );
 
     let file = File::open(&path).unwrap();
     let ds = file.dataset("original").unwrap();
@@ -1512,7 +1515,11 @@ fn write_dataset_resize_keeping_shape_is_a_reshape_and_refused() {
             "expected reshape refusal, got: {err}"
         );
     }
-    assert_eq!(std::fs::read(&path).unwrap(), before, "file modified on refusal");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "file modified on refusal"
+    );
     std::fs::remove_file(&path).ok();
 }
 
@@ -1550,14 +1557,20 @@ fn write_dataset_rejects_datatype_mismatch() {
     {
         let mut session = EditSession::open(&path).unwrap();
         // i32 data for an f64 dataset: a retype, refused.
-        session.write_dataset("original").with_i32_data(&[1, 2, 3, 4]);
+        session
+            .write_dataset("original")
+            .with_i32_data(&[1, 2, 3, 4]);
         let err = session.commit().unwrap_err();
         assert!(
             err.to_string().contains("datatype does not match"),
             "expected datatype-mismatch refusal, got: {err}"
         );
     }
-    assert_eq!(std::fs::read(&path).unwrap(), before, "file modified on refusal");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "file modified on refusal"
+    );
     std::fs::remove_file(&path).ok();
 }
 
@@ -1586,7 +1599,11 @@ fn write_dataset_rejects_shape_mismatch() {
             "expected shape-mismatch refusal, got: {err}"
         );
     }
-    assert_eq!(std::fs::read(&path).unwrap(), before, "file modified on refusal");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "file modified on refusal"
+    );
     std::fs::remove_file(&path).ok();
 }
 
@@ -1626,11 +1643,16 @@ fn write_dataset_rejects_chunked_target() {
             .with_shape(&[8]);
         let err = session.commit().unwrap_err();
         assert!(
-            err.to_string().contains("chunked datasets cannot be overwritten"),
+            err.to_string()
+                .contains("chunked datasets cannot be overwritten"),
             "expected chunked refusal, got: {err}"
         );
     }
-    assert_eq!(std::fs::read(&path).unwrap(), before, "file modified on refusal");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "file modified on refusal"
+    );
     std::fs::remove_file(&path).ok();
 }
 
@@ -1675,7 +1697,11 @@ fn write_dataset_rejects_staged_attributes() {
             "expected attribute refusal, got: {err}"
         );
     }
-    assert_eq!(std::fs::read(&path).unwrap(), before, "file modified on refusal");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "file modified on refusal"
+    );
     std::fs::remove_file(&path).ok();
 }
 
@@ -1697,8 +1723,14 @@ fn write_dataset_alongside_other_edits() {
         session.commit().unwrap();
     }
     let file = File::open(&path).unwrap();
-    assert_eq!(file.dataset("keep").unwrap().read_f64().unwrap(), vec![5.0, 6.0]);
-    assert_eq!(file.dataset("added").unwrap().read_i32().unwrap(), vec![3, 4]);
+    assert_eq!(
+        file.dataset("keep").unwrap().read_f64().unwrap(),
+        vec![5.0, 6.0]
+    );
+    assert_eq!(
+        file.dataset("added").unwrap().read_i32().unwrap(),
+        vec![3, 4]
+    );
     assert!(file.dataset("doomed").is_err());
     std::fs::remove_file(&path).ok();
 }

@@ -1032,7 +1032,9 @@ fn write_dataset_same_size_crosscheck() {
 
         {
             let mut session = EditSession::open(&path).unwrap();
-            session.write_dataset("d").with_f64_data(&[9.0, 8.0, 7.0, 6.0]);
+            session
+                .write_dataset("d")
+                .with_f64_data(&[9.0, 8.0, 7.0, 6.0]);
             session.commit().unwrap();
         }
 
@@ -1169,10 +1171,7 @@ fn write_dataset_relocate_with_multiple_hard_links_is_refused() {
             .unwrap();
         // Created but never written: contiguous address undefined, so an overwrite
         // relocates the header.
-        file.new_dataset::<i32>()
-            .shape((3,))
-            .create("a")
-            .unwrap();
+        file.new_dataset::<i32>().shape((3,)).create("a").unwrap();
         file.link_hard("a", "b").unwrap();
         file.close().unwrap();
     }
@@ -1186,5 +1185,9 @@ fn write_dataset_relocate_with_multiple_hard_links_is_refused() {
             "expected multi-link refusal, got: {err}"
         );
     }
-    assert_eq!(std::fs::read(&path).unwrap(), before, "file modified on refusal");
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "file modified on refusal"
+    );
 }

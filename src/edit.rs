@@ -702,7 +702,9 @@ impl EditSession {
             }
             let path_str = full.join("/");
             let addr = crate::group_v2::resolve_path_any(&self.data, &self.superblock, &path_str)
-                .map_err(|_| Error::EditUnsupported("nothing to overwrite at the given path"))?;
+                .map_err(|_| {
+                Error::EditUnsupported("nothing to overwrite at the given path")
+            })?;
             let addr = usize::try_from(addr)
                 .map_err(|_| Error::EditUnsupported("dataset address exceeds this platform"))?;
             let fd = flatten_dataset(db)?;
@@ -1787,8 +1789,7 @@ impl EditSession {
                 let addr_off = lb + 2;
                 let data_addr =
                     u64::from_le_bytes(region[addr_off..addr_off + 8].try_into().unwrap());
-                let data_size =
-                    u64::from_le_bytes(region[lb + 10..lb + 18].try_into().unwrap());
+                let data_size = u64::from_le_bytes(region[lb + 10..lb + 18].try_into().unwrap());
 
                 // Same length and a defined, in-bounds data block: overwrite the
                 // bytes straight in place. No header rewrite, no relink.
