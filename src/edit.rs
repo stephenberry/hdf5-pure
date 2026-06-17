@@ -737,6 +737,13 @@ impl EditSession {
         // linearization point is the synced data write — there is no tree to
         // repoint, so each overwrite stands alone. (A persisting file takes the
         // same path: no free-space change occurs.)
+        //
+        // Because this path never rewrites the superblock, it deliberately leaves
+        // it untouched — including a pre-existing stale consistency flag (e.g. one
+        // left by a crashed SWMR writer). A lone same-length value overwrite does
+        // not introduce any inconsistency, so it does not clear one either; an edit
+        // that takes the full path below (any header/root change) clears the flag
+        // as usual.
         if moving_writes.is_empty()
             && self.pending_datasets.is_empty()
             && self.pending_groups.is_empty()
@@ -1672,6 +1679,18 @@ impl EditSession {
             return Err(Error::EditUnsupported(
                 "write_dataset overwrites values only; it cannot make a dataset \
                  chunked, filtered, or extensible",
+            ));
+        }
+
+        // `write_dataset` overwrites element bytes only; it does not touch the
+        // object header's attribute messages. Attributes staged on the returned
+        // builder would otherwise be silently dropped (the in-place path rewrites
+        // only the data block, and the moving path reuses the verbatim on-disk
+        // header), so refuse rather than degrade — set them in a separate edit.
+        if !fd.attrs.is_empty() {
+            return Err(Error::EditUnsupported(
+                "write_dataset overwrites values only; it cannot set attributes \
+                 (set them with a separate edit)",
             ));
         }
 

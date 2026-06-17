@@ -1657,6 +1657,29 @@ fn write_dataset_rejects_filtered_request() {
 }
 
 #[test]
+fn write_dataset_rejects_staged_attributes() {
+    // Attributes set on the write_dataset builder cannot be applied by a value
+    // overwrite, so they must be refused rather than silently dropped.
+    let path = std::env::temp_dir().join("hdf5_pure_write_attr_refused.h5");
+    write_starter(&path);
+    let before = std::fs::read(&path).unwrap();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .write_dataset("original")
+            .with_f64_data(&[5.0, 6.0, 7.0, 8.0]) // same size, valid overwrite
+            .set_attr("units", AttrValue::String("m/s".into()));
+        let err = session.commit().unwrap_err();
+        assert!(
+            err.to_string().contains("cannot set attributes"),
+            "expected attribute refusal, got: {err}"
+        );
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before, "file modified on refusal");
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn write_dataset_alongside_other_edits() {
     // A value overwrite coexists with an addition and a delete in one commit.
     let path = std::env::temp_dir().join("hdf5_pure_write_mixed.h5");
