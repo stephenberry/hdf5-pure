@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-06-18
+
+Centers on `repack`: it now copies compressed chunks **verbatim** (so lossy filters survive byte-exact) and runs **fully out-of-core**, and gains variable-length-string support. Also adds in-place dataset-value overwrite, dense-attribute and cross-file object copy, in-place addition of chunked/filtered/extensible datasets, and free-space reclaim for chunked deletes; plus reader hardening (a multi-filter chunk-mask corruption fix, sub-byte integer precision, decompression-bomb bounds, and safer B-tree/heap refusals). Additive minor bump.
+
 ### Added
 
 - Repack now copies a chunked dataset's compressed chunks **verbatim** instead of decompressing and re-compressing them, eliminating the per-dataset decompression blowup and the decompress→recompress round-trip, so **lossy** filters now survive byte-exact — float D-scale scale-offset, ZFP, SZIP, and even filters this crate cannot itself apply ([#82](https://github.com/stephenberry/hdf5-pure/issues/82), [#84](https://github.com/stephenberry/hdf5-pure/issues/84), [#85](https://github.com/stephenberry/hdf5-pure/issues/85)). The verbatim path covers a fully-allocated chunk grid; a sparse chunked or a contiguous/compact filtered dataset still re-encodes and refuses a lossy filter by name.
@@ -194,7 +198,8 @@ Internal robustness and tests ([#26](https://github.com/stephenberry/hdf5-pure/i
 - The MAT deserializer flattens 1×N and N×1 values to a 1-D sequence in `deserialize_any` (matching `deserialize_seq`).
 - Numeric/complex readers preserve 1×N / N×1 shape at the value layer; any flattening happens at the serde level.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.12.1...v0.13.0
