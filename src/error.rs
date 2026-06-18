@@ -144,9 +144,10 @@ pub enum FormatError {
     /// A fractal-heap "huge" object's heap ID referenced a B-tree key that is
     /// not present in the heap's huge-objects v2 B-tree.
     HugeObjectNotFound(u64),
-    /// A fractal-heap object uses an I/O filter pipeline (filtered huge or tiny
-    /// storage), which this reader does not support. Link and attribute heaps
-    /// are never filtered, so this does not arise for them.
+    /// A fractal-heap object lives in an I/O-filter-encoded heap (filtered
+    /// managed or huge storage), whose filtered bytes this reader does not
+    /// decode. Link and attribute heaps are never filtered, so this does not
+    /// arise for them.
     UnsupportedFilteredHeapObject,
     /// Invalid attribute message version.
     InvalidAttributeVersion(u8),
@@ -187,6 +188,11 @@ pub enum FormatError {
     DatasetMissingData,
     /// Dataset is missing shape.
     DatasetMissingShape,
+    /// A variable-length string dataset was requested with chunked, filtered,
+    /// or resizable storage. VL element references live in the global heap,
+    /// whose addresses are only known after data layout, so they cannot be
+    /// patched into compressed chunks written beforehand.
+    ChunkedVlenStringUnsupported,
     /// The dataset's element count implied by its shape does not match the
     /// amount of data supplied (`shape.product() * element_size != data.len()`).
     ShapeDataMismatch {
@@ -497,6 +503,12 @@ impl fmt::Display for FormatError {
             }
             FormatError::DatasetMissingShape => {
                 write!(f, "dataset is missing shape")
+            }
+            FormatError::ChunkedVlenStringUnsupported => {
+                write!(
+                    f,
+                    "chunked, filtered, or resizable variable-length string datasets cannot be written"
+                )
             }
             FormatError::ShapeDataMismatch {
                 expected,
