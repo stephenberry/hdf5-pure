@@ -29,8 +29,8 @@ use crate::message_type::MessageType;
 use crate::object_header_writer::ObjectHeaderWriter;
 use crate::superblock::Superblock;
 use crate::type_builders::{
-    DatasetBuilder, FinishedGroup, GroupBuilder, build_attr_message, build_global_heap_collection,
-    patch_vl_refs,
+    DatasetBuilder, FinishedGroup, GroupBuilder, VlStringStaging, build_attr_message,
+    build_global_heap_collection, patch_vl_refs, patch_vl_refs_masked,
 };
 
 // `AttrValue` lives in `type_builders`; `types` and `mat` reference it through
@@ -597,6 +597,10 @@ impl FileWriter {
             /// copied compressed-as-is rather than encoded from `raw`.
             raw_chunks: Option<crate::type_builders::RawChunkPayload>,
             reference_targets: Option<Vec<String>>,
+            /// Staged global heap collection + patch mask for a VL-string
+            /// dataset, whose element references in `raw` need their heap
+            /// addresses patched once the post-data cursor is known.
+            vl_string_staging: Option<VlStringStaging>,
         }
 
         /// Build the chunked data + layout/pipeline messages for one chunked
@@ -700,6 +704,17 @@ impl FileWriter {
                     .validate_geometry(&shape, db.maxshape.as_deref())
                     .map_err(FormatError::InvalidChunkGeometry)?;
             }
+            // Variable-length string element references live in the global heap,
+            // whose addresses are only known after all dataset data is laid
+            // out. For chunked/filtered/resizable storage the references sit
+            // inside compressed chunks written before those addresses exist, so
+            // the heap addresses cannot be patched in. Refuse rather than emit a
+            // dataset with dangling VL references.
+            if db.vl_string_staging.is_some()
+                && (db.chunk_options.is_chunked() || db.maxshape.is_some())
+            {
+                return Err(FormatError::ChunkedVlenStringUnsupported);
+            }
             let max_dimensions = db.maxshape.clone();
             let dspace = Dataspace {
                 space_type: if shape.is_empty() {
@@ -741,6 +756,7 @@ impl FileWriter {
                 maxshape: db.maxshape,
                 raw_chunks,
                 reference_targets: db.reference_targets,
+                vl_string_staging: db.vl_string_staging,
             });
             ds_vl.push(patches);
             Ok(idx)
@@ -1078,10 +1094,15 @@ impl FileWriter {
             }
         }
 
-        // Patch VL attrs with pre-computed GCOL addresses (GCOLs go after all data).
+        // Patch VL references (attribute and dataset-element) with the GCOL
+        // addresses, which sit after all dataset data. Attribute collections are
+        // emitted first (root, groups, datasets), then dataset-element
+        // collections, and the cursor walk below assigns addresses in that same
+        // order so it matches the emission order at the end of the buffer.
         let has_vl = !vl_root.is_empty()
             || grp_vl.iter().any(|v| !v.is_empty())
-            || ds_vl.iter().any(|v| !v.is_empty());
+            || ds_vl.iter().any(|v| !v.is_empty())
+            || all_ds.iter().any(|d| d.vl_string_staging.is_some());
 
         let mut gcol_total_size = 0usize;
         if has_vl {
@@ -1106,6 +1127,16 @@ impl FileWriter {
                         gcol_cursor,
                     );
                     gcol_cursor += patch.collection_bytes.len() as u64;
+                }
+            }
+            // Dataset-element VL references. The references live in the
+            // contiguous/compact element bytes (`ds_layouts[i].data`, cloned
+            // from `d.raw`); chunked/filtered/resizable VL datasets were refused
+            // in `flatten_dataset`, so every staged dataset is here non-chunked.
+            for (i, d) in all_ds.iter().enumerate() {
+                if let Some(staging) = &d.vl_string_staging {
+                    patch_vl_refs_masked(&mut ds_layouts[i].data, &staging.patch_mask, gcol_cursor);
+                    gcol_cursor += staging.collection_bytes.len() as u64;
                 }
             }
             #[expect(
@@ -1253,6 +1284,13 @@ impl FileWriter {
         for patches in &ds_vl {
             for patch in patches {
                 buf.extend_from_slice(&patch.collection_bytes);
+            }
+        }
+        // Dataset-element VL string collections, in the same order their
+        // addresses were assigned above.
+        for d in &all_ds {
+            if let Some(staging) = &d.vl_string_staging {
+                buf.extend_from_slice(&staging.collection_bytes);
             }
         }
 
@@ -1472,5 +1510,144 @@ mod tests {
         let (off, len) = fh.decode_managed_id(&id).unwrap();
         assert_eq!(off, 100);
         assert_eq!(len, 42);
+    }
+
+    /// Read a dataset's VL-string byte objects from a freshly-written file.
+    fn read_vl_bytes(bytes: Vec<u8>, path: &str) -> Vec<crate::vl_data::VlByteObject> {
+        let file = crate::reader::File::from_bytes(bytes).unwrap();
+        file.dataset(path)
+            .unwrap()
+            .read_vlen_string_bytes(crate::vl_data::VlenStringReadOptions::default())
+            .unwrap()
+    }
+
+    #[test]
+    fn vlen_string_dataset_roundtrips_values() {
+        let mut fw = FileWriter::new();
+        fw.create_dataset("labels")
+            .with_vlen_strings(&["alpha", "beta", "gamma"]);
+        let bytes = fw.finish().unwrap();
+        let objs = read_vl_bytes(bytes, "labels");
+        let got: Vec<_> = objs
+            .iter()
+            .map(|o| match o {
+                crate::vl_data::VlByteObject::Bytes(b) => String::from_utf8(b.clone()).unwrap(),
+                crate::vl_data::VlByteObject::Null => "<null>".to_string(),
+            })
+            .collect();
+        assert_eq!(got, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn vlen_string_dataset_preserves_null_vs_empty() {
+        use crate::type_builders::VlStringElement;
+        use crate::vl_data::VlByteObject;
+
+        let dt = crate::type_builders::make_vlen_string_type(CharacterSet::Utf8);
+        let elements = vec![
+            VlStringElement::Bytes(b"hi".to_vec()),
+            VlStringElement::Null,
+            VlStringElement::Bytes(Vec::new()), // empty string, not null
+            VlStringElement::Bytes(b"end".to_vec()),
+        ];
+        let mut fw = FileWriter::new();
+        fw.create_dataset("mixed")
+            .with_vlen_string_elements(dt, &elements)
+            .unwrap();
+        let bytes = fw.finish().unwrap();
+        let objs = read_vl_bytes(bytes, "mixed");
+        assert_eq!(
+            objs,
+            vec![
+                VlByteObject::Bytes(b"hi".to_vec()),
+                VlByteObject::Null,
+                VlByteObject::Bytes(Vec::new()),
+                VlByteObject::Bytes(b"end".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn vlen_string_dataset_preserves_embedded_nul() {
+        use crate::type_builders::VlStringElement;
+        use crate::vl_data::VlByteObject;
+
+        let dt = crate::type_builders::make_vlen_string_type(CharacterSet::Ascii);
+        let payload = b"a\0b\0c".to_vec();
+        let elements = vec![VlStringElement::Bytes(payload.clone())];
+        let mut fw = FileWriter::new();
+        fw.create_dataset("nul")
+            .with_vlen_string_elements(dt, &elements)
+            .unwrap();
+        let bytes = fw.finish().unwrap();
+        let objs = read_vl_bytes(bytes, "nul");
+        assert_eq!(objs, vec![VlByteObject::Bytes(payload)]);
+    }
+
+    #[test]
+    fn vlen_string_dataset_preserves_non_utf8_bytes() {
+        // The byte-exact write/read path must round-trip a payload that is not
+        // valid UTF-8 (the headline faithfulness claim for issue #83). A
+        // String-based path would corrupt this via lossy decoding; the
+        // VlStringElement::Bytes / read_vlen_string_bytes path must not.
+        use crate::type_builders::VlStringElement;
+        use crate::vl_data::VlByteObject;
+
+        let dt = crate::type_builders::make_vlen_string_type(CharacterSet::Ascii);
+        let payload = vec![0xffu8, 0xfe, 0x80, 0x00, 0x41];
+        let elements = vec![VlStringElement::Bytes(payload.clone())];
+        let mut fw = FileWriter::new();
+        fw.create_dataset("raw")
+            .with_vlen_string_elements(dt, &elements)
+            .unwrap();
+        let bytes = fw.finish().unwrap();
+        let objs = read_vl_bytes(bytes, "raw");
+        assert_eq!(objs, vec![VlByteObject::Bytes(payload)]);
+    }
+
+    #[test]
+    fn vlen_string_dataset_2d_shape_roundtrips() {
+        let mut fw = FileWriter::new();
+        fw.create_dataset("grid")
+            .with_vlen_strings(&["a", "bb", "ccc", "dddd"])
+            .with_shape(&[2, 2]);
+        let bytes = fw.finish().unwrap();
+        let file = crate::reader::File::from_bytes(bytes).unwrap();
+        let ds = file.dataset("grid").unwrap();
+        assert_eq!(ds.shape().unwrap(), vec![2, 2]);
+        assert_eq!(
+            ds.read_vlen_strings(crate::vl_data::VlenStringReadOptions::default())
+                .unwrap(),
+            vec!["a", "bb", "ccc", "dddd"]
+        );
+    }
+
+    #[test]
+    fn vlen_string_dataset_all_null_no_heap() {
+        use crate::type_builders::VlStringElement;
+        use crate::vl_data::VlByteObject;
+
+        let dt = crate::type_builders::make_vlen_string_type(CharacterSet::Utf8);
+        let elements = vec![VlStringElement::Null, VlStringElement::Null];
+        let mut fw = FileWriter::new();
+        fw.create_dataset("nulls")
+            .with_vlen_string_elements(dt, &elements)
+            .unwrap();
+        let bytes = fw.finish().unwrap();
+        let objs = read_vl_bytes(bytes, "nulls");
+        assert_eq!(objs, vec![VlByteObject::Null, VlByteObject::Null]);
+    }
+
+    #[test]
+    fn chunked_vlen_string_dataset_refused() {
+        let mut fw = FileWriter::new();
+        fw.create_dataset("chunked")
+            .with_vlen_strings(&["a", "b", "c", "d"])
+            .with_chunks(&[2]);
+        let err = fw.finish().unwrap_err();
+        assert!(
+            matches!(err, FormatError::ChunkedVlenStringUnsupported),
+            "expected ChunkedVlenStringUnsupported, got {err:?}"
+        );
     }
 }

@@ -105,7 +105,7 @@ fn c_reads_repacked_scale_offset() {
 }
 
 #[test]
-fn repack_refuses_c_vlen_string_dataset() {
+fn repack_roundtrips_c_vlen_string_dataset() {
     use hdf5::types::VarLenUnicode;
     use std::str::FromStr;
 
@@ -113,28 +113,129 @@ fn repack_refuses_c_vlen_string_dataset() {
     let src = dir.path().join("c_vlen.h5");
     let dst = dir.path().join("vlen_repacked.h5");
 
+    let words = ["alpha", "beta", "gamma", "", "δelta"];
     {
         let file = hdf5::File::create(&src).unwrap();
-        let words: Vec<VarLenUnicode> = ["alpha", "beta", "gamma"]
+        let vals: Vec<VarLenUnicode> = words
             .iter()
             .map(|s| VarLenUnicode::from_str(s).unwrap())
             .collect();
         file.new_dataset::<VarLenUnicode>()
-            .shape((3,))
+            .shape((words.len(),))
             .create("labels")
             .unwrap()
-            .write(&words)
+            .write(&vals)
             .unwrap();
         file.close().unwrap();
     }
 
-    // A variable-length string dataset cannot be re-emitted faithfully yet, so
-    // repack must refuse by name rather than silently degrade it.
+    // A VL-string dataset the C library wrote must now round-trip faithfully.
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    // hdf5-pure reads the repacked values back, in order, including the empty
+    // and non-ASCII elements.
+    let f = File::open(&dst).unwrap();
+    let labels = f.dataset("labels").unwrap();
+    let got = labels.read_vlen_strings(Default::default()).unwrap();
+    assert_eq!(got, words);
+
+    // The datatype must remain variable-length, not be silently converted to a
+    // fixed-length string.
+    assert!(
+        matches!(
+            labels.datatype().unwrap(),
+            hdf5_pure::Datatype::VariableLength { .. }
+        ),
+        "repacked datatype must stay variable-length"
+    );
+
+    // The reference C library agrees on both values and that the datatype is
+    // variable-length — the real interop proof.
+    let c = hdf5::File::open(&dst).unwrap();
+    let cds = c.dataset("labels").unwrap();
+    let cvals = cds.read_raw::<VarLenUnicode>().unwrap();
+    let cstrings: Vec<String> = cvals.iter().map(|v| v.as_str().to_string()).collect();
+    assert_eq!(cstrings, words);
+    assert!(
+        cds.dtype().unwrap().is::<VarLenUnicode>(),
+        "C library must see a variable-length Unicode string datatype"
+    );
+}
+
+#[test]
+fn repack_roundtrips_vlen_string_2d() {
+    use hdf5::types::VarLenUnicode;
+    use std::str::FromStr;
+
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("c_vlen_2d.h5");
+    let dst = dir.path().join("vlen_2d_repacked.h5");
+
+    // 2x3 grid, row-major.
+    let words = ["a", "bb", "ccc", "", "ee", "ffffff"];
+    {
+        let file = hdf5::File::create(&src).unwrap();
+        let vals: Vec<VarLenUnicode> = words
+            .iter()
+            .map(|s| VarLenUnicode::from_str(s).unwrap())
+            .collect();
+        file.new_dataset::<VarLenUnicode>()
+            .shape((2, 3))
+            .create("grid")
+            .unwrap()
+            .write_raw(&vals)
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    let f = File::open(&dst).unwrap();
+    let grid = f.dataset("grid").unwrap();
+    assert_eq!(grid.shape().unwrap(), vec![2, 3]);
+    assert_eq!(grid.read_vlen_strings(Default::default()).unwrap(), words);
+
+    // C library agrees on shape and values.
+    let c = hdf5::File::open(&dst).unwrap();
+    let cds = c.dataset("grid").unwrap();
+    assert_eq!(cds.shape(), vec![2, 3]);
+    let cvals = cds.read_raw::<VarLenUnicode>().unwrap();
+    let cstrings: Vec<String> = cvals.iter().map(|v| v.as_str().to_string()).collect();
+    assert_eq!(cstrings, words);
+}
+
+#[test]
+fn repack_refuses_chunked_vlen_string_dataset() {
+    use hdf5::types::VarLenUnicode;
+    use std::str::FromStr;
+
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("c_vlen_chunked.h5");
+    let dst = dir.path().join("vlen_chunked_repacked.h5");
+
+    {
+        let file = hdf5::File::create(&src).unwrap();
+        let vals: Vec<VarLenUnicode> = (0..8)
+            .map(|i| VarLenUnicode::from_str(&format!("word{i}")).unwrap())
+            .collect();
+        file.new_dataset::<VarLenUnicode>()
+            .shape((8,))
+            .chunk((4,))
+            .create("chunked_labels")
+            .unwrap()
+            .write(&vals)
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    // Chunked VL-string datasets cannot be repacked faithfully (their element
+    // references live inside compressed chunks before the heap addresses are
+    // known), so repack must refuse by name.
     let err = repack(&src, &dst, &RepackOptions::new()).unwrap_err();
     match err {
         hdf5_pure::Error::RepackUnsupported(msg) => {
             assert!(
-                msg.contains("labels") && msg.contains("variable-length"),
+                msg.contains("chunked_labels") && msg.contains("chunked"),
                 "error should name the dataset and reason: {msg}"
             );
         }
