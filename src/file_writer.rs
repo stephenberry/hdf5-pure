@@ -1359,7 +1359,7 @@ impl FileWriter {
                 DsData::InMemory(bytes) => sink.put(bytes)?,
                 DsData::Streamed(plan) => {
                     let provider = match all_ds[i].raw_chunks.as_ref() {
-                        Some(rc) => rc.provider.as_ref(),
+                        Some(rc) => rc.provider.0.as_ref(),
                         None => unreachable!("a streamed data region implies a raw-chunk payload"),
                     };
                     emit_chunked_data_verbatim(sink, plan, provider)?;

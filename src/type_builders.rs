@@ -863,7 +863,14 @@ pub(crate) struct RawChunkPayload {
     /// Yields each chunk's compressed bytes on demand during the write, so no
     /// more than one chunk's bytes are resident. Owns its source (e.g. an
     /// `Arc<File>`), so it carries no borrowed lifetime.
-    pub(crate) provider: Box<dyn ChunkProvider>,
+    ///
+    /// Wrapped in [`AssertUnwindSafe`](core::panic::AssertUnwindSafe) so the
+    /// boxed trait object does not strip the `UnwindSafe`/`RefUnwindSafe`
+    /// auto-traits from the public builder types that transitively hold it
+    /// (removing an auto-trait impl is a semver break). The assertion is sound:
+    /// the provider performs only immutable reads and leaves no broken state on
+    /// a panic. `ChunkProvider: Send + Sync` keeps the other two auto-traits.
+    pub(crate) provider: core::panic::AssertUnwindSafe<Box<dyn ChunkProvider>>,
 }
 
 /// Builder for datasets.
@@ -1177,7 +1184,7 @@ impl DatasetBuilder {
             raw_size,
             pipeline_message,
             meta,
-            provider,
+            provider: core::panic::AssertUnwindSafe(provider),
         });
         self
     }

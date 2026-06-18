@@ -331,12 +331,17 @@ mod streaming_tests {
     }
 
     #[test]
-    fn file_builder_stays_send_and_sync() {
-        // The lazy chunk provider is boxed into `FileBuilder`; it must keep the
-        // builder `Send + Sync` (removing those auto-traits is a semver-major
-        // break, as `cargo-semver-checks` enforces in CI).
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<FileBuilder>();
+    fn file_builder_keeps_its_auto_traits() {
+        // The lazy chunk provider is boxed into `FileBuilder`; a bare boxed trait
+        // object would strip `Send`/`Sync` (fixed by the `ChunkProvider`
+        // supertrait) and `UnwindSafe`/`RefUnwindSafe` (fixed by wrapping it in
+        // `AssertUnwindSafe`). Removing any of these auto-trait impls is a semver
+        // break that `cargo-semver-checks` enforces in CI, so pin all four here.
+        fn assert_auto_traits<
+            T: Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe,
+        >() {
+        }
+        assert_auto_traits::<FileBuilder>();
     }
 
     #[test]
