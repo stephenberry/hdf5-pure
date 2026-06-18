@@ -967,10 +967,13 @@ fn same_file_copy_of_c_written_attributed_object() {
 }
 
 #[test]
-fn cross_file_copy_from_rejects_dense_attributes() {
+fn cross_file_copy_from_reproduces_c_written_dense_attributes() {
     // Above the compact threshold (8 attributes) the C library stores attributes
-    // densely — a real fractal heap, whose address would dangle in another file —
-    // so a verbatim cross-file copy is refused, leaving the destination untouched.
+    // densely — a real fractal heap. A cross-file copy of a *fixed-size* dense
+    // attribute set is now reproduced (issue #87): the attributes are read out of
+    // the source heap and a fresh heap is built in the destination, which the C
+    // library then reads back. (A variable-length/reference dense set is still
+    // refused cross-file; see `edit_dense_attr_copy.rs`.)
     let dir = tempdir().unwrap();
     let src_path = dir.path().join("dense_src.h5");
     let dst_path = dir.path().join("dense_dst.h5");
@@ -992,15 +995,21 @@ fn cross_file_copy_from_rejects_dense_attributes() {
         file.close().unwrap();
     }
     write_c_starter(&dst_path, LibraryVersion::V110, LibraryVersion::latest());
-    let dst_before = std::fs::read(&dst_path).unwrap();
 
     {
         let source = File::open(&src_path).unwrap();
         let mut session = EditSession::open(&dst_path).unwrap();
-        let err = session.copy_from(&source, "ds", "dup").unwrap_err();
-        assert!(err.to_string().contains("dense"), "got: {err}");
+        session.copy_from(&source, "ds", "dup").unwrap();
+        session.commit().unwrap();
     }
-    assert_eq!(std::fs::read(&dst_path).unwrap(), dst_before);
+
+    let c = hdf5::File::open(&dst_path).unwrap();
+    let ds = c.dataset("dup").unwrap();
+    assert_eq!(ds.read_raw::<i32>().unwrap(), vec![1]);
+    for i in 0..12 {
+        let got: i64 = ds.attr(&format!("a{i}")).unwrap().read_scalar().unwrap();
+        assert_eq!(got, i as i64, "dense attr a{i} mismatch");
+    }
 }
 
 // ---- write_dataset (issue #79): value-overwrite crosschecks ----
