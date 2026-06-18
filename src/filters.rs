@@ -182,30 +182,48 @@ fn expected_chunk_len(ctx: &ChunkContext<'_>) -> Option<usize> {
     usize::try_from(bytes).ok().filter(|&n| n != 0)
 }
 
-/// Upper bound for a deflate stage's decoded output. On decode, deflate is
-/// reversed BEFORE the lower-forward-index filters that ran before it when the
-/// chunk was written; any of those that EXPAND the data make deflate's
-/// legitimate output larger than the final chunk size. Among supported filters
-/// only Fletcher32 expands (by its 4-byte trailing checksum, reversed after
-/// deflate when it sits at a lower forward index), so the cap is the final chunk
-/// size plus 4 per surviving inner Fletcher32. `None` (size unknown) stays
-/// uncapped. The exact-size check after the whole pipeline still rejects
-/// genuinely wrong output, so this only needs to bound memory (the
-/// decompression-bomb guard) without rejecting a valid chunk.
+/// Upper bound on a filter's forward (compress) output for an input of
+/// `in_size` bytes. Used to bound a deflate stage's legitimate decoded output:
+/// on decode, deflate is reversed BEFORE the lower-forward-index filters that
+/// ran before it on the write path, so its output equals the chunk size pushed
+/// forward through those inner filters. Only an upper bound is needed — the
+/// exact chunk-size check after the whole pipeline still rejects wrong output —
+/// so this is the decompression-bomb memory guard, not a correctness gate.
+fn filter_max_forward_output(filter_id: u16, in_size: usize) -> usize {
+    match filter_id {
+        // Fletcher32 appends a 4-byte checksum.
+        FILTER_FLETCHER32 => in_size.saturating_add(4),
+        // Scale-offset prepends a fixed header and, when the data does not pack
+        // smaller, stores it verbatim after that header.
+        FILTER_SCALEOFFSET => in_size.saturating_add(crate::scaleoffset::HEADER_LEN),
+        // Deflate can slightly expand incompressible input (zlib "stored" blocks
+        // plus framing); bound it well above zlib's worst case.
+        FILTER_DEFLATE => in_size.saturating_add(in_size / 16).saturating_add(64),
+        // Shuffle is size-preserving; fixed-rate ZFP never exceeds the native
+        // element width. An unknown filter makes the read fail when it is reached
+        // after deflate regardless, so leaving the size unchanged is fine.
+        _ => in_size,
+    }
+}
+
+/// Upper bound for a deflate stage's decoded output: the final chunk size
+/// (`expected`) pushed forward through every surviving lower-forward-index
+/// filter. `None` (size unknown) leaves deflate uncapped. A masked filter did
+/// not run on the write path, so it does not change the intermediate size.
 fn deflate_output_cap(
     expected: Option<usize>,
     pipeline: &FilterPipeline,
     filter_mask: u32,
     deflate_index: usize,
 ) -> Option<usize> {
-    let expected = expected?;
-    let inner_overhead: usize = pipeline.filters[..deflate_index]
-        .iter()
-        .enumerate()
-        .filter(|(j, _)| !(*j < 32 && (filter_mask >> *j) & 1 == 1))
-        .map(|(_, f)| if f.filter_id == FILTER_FLETCHER32 { 4 } else { 0 })
-        .sum();
-    Some(expected.saturating_add(inner_overhead))
+    let mut size = expected?;
+    for (j, f) in pipeline.filters[..deflate_index].iter().enumerate() {
+        if j < 32 && (filter_mask >> j) & 1 == 1 {
+            continue;
+        }
+        size = filter_max_forward_output(f.filter_id, size);
+    }
+    Some(size)
 }
 
 /// Apply a filter pipeline to compress a chunk.
