@@ -200,7 +200,14 @@ pub fn collect_symbol_table_nodes(
     length_size: u8,
     base_address: u64,
 ) -> Result<Vec<u64>, FormatError> {
-    collect_symbol_table_nodes_inner(file_data, btree_address, offset_size, length_size, base_address, 0)
+    collect_symbol_table_nodes_inner(
+        file_data,
+        btree_address,
+        offset_size,
+        length_size,
+        base_address,
+        0,
+    )
 }
 
 /// Depth-tracking core of [`collect_symbol_table_nodes`]. The `depth` guard

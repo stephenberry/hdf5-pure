@@ -447,10 +447,13 @@ pub fn read_as_f32(raw: &[u8], datatype: &Datatype) -> Result<Vec<f32>, FormatEr
                 bit_precision,
                 ..
             } => {
-                result.push(
-                    read_signed_int(chunk, *size as usize, &order, *bit_offset, *bit_precision)
-                        as f32,
-                );
+                result.push(read_signed_int(
+                    chunk,
+                    *size as usize,
+                    &order,
+                    *bit_offset,
+                    *bit_precision,
+                ) as f32);
             }
             Datatype::FixedPoint {
                 signed: false,
@@ -459,10 +462,13 @@ pub fn read_as_f32(raw: &[u8], datatype: &Datatype) -> Result<Vec<f32>, FormatEr
                 bit_precision,
                 ..
             } => {
-                result.push(
-                    read_unsigned_int(chunk, *size as usize, &order, *bit_offset, *bit_precision)
-                        as f32,
-                );
+                result.push(read_unsigned_int(
+                    chunk,
+                    *size as usize,
+                    &order,
+                    *bit_offset,
+                    *bit_precision,
+                ) as f32);
             }
             _ => {
                 return Err(FormatError::TypeMismatch {
@@ -595,7 +601,9 @@ fn int_bits(dt: &Datatype) -> (u16, u16) {
             ..
         } => (*bit_offset, *bit_precision),
         _ => {
-            let bits = (get_size(dt) * 8).min(u16::MAX as usize) as u16;
+            // Full-width standard layout. `try_from` clamps the (always small,
+            // <= 64) bit width without a narrowing cast.
+            let bits = u16::try_from(get_size(dt) * 8).unwrap_or(u16::MAX);
             (0, bits)
         }
     }
@@ -1052,7 +1060,10 @@ mod tests {
     fn standard_width_integers_unchanged() {
         // Regression guard: full-width integers must decode exactly as before.
         let i32t = make_i32_le_type();
-        assert_eq!(read_as_i64(&(-5i32).to_le_bytes(), &i32t).unwrap(), vec![-5]);
+        assert_eq!(
+            read_as_i64(&(-5i32).to_le_bytes(), &i32t).unwrap(),
+            vec![-5]
+        );
         let i16t = make_i16_le_type();
         assert_eq!(
             read_as_i64(&(-12345i16).to_le_bytes(), &i16t).unwrap(),

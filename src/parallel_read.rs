@@ -80,7 +80,8 @@ pub fn decompress_chunks_lane_partitioned(
                 }
                 let raw_chunk = &file_data[r];
 
-                let decompressed = decompress_chunk(raw_chunk, pipeline, ctx, chunk_info.filter_mask)?;
+                let decompressed =
+                    decompress_chunk(raw_chunk, pipeline, ctx, chunk_info.filter_mask)?;
 
                 stats.chunks_processed += 1;
                 stats.compressed_bytes += u64::from(chunk_info.chunk_size);

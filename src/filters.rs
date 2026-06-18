@@ -141,9 +141,10 @@ pub fn decompress_chunk(
         let input: &[u8] = owned.as_deref().unwrap_or(compressed);
         let next = match filter.filter_id {
             FILTER_SHUFFLE => shuffle_decompress(input, ctx.element_size as usize)?,
-            FILTER_DEFLATE => {
-                deflate_decompress(input, deflate_output_cap(expected, pipeline, filter_mask, i))?
-            }
+            FILTER_DEFLATE => deflate_decompress(
+                input,
+                deflate_output_cap(expected, pipeline, filter_mask, i),
+            )?,
             FILTER_FLETCHER32 => fletcher32_verify(input)?,
             FILTER_SCALEOFFSET => crate::scaleoffset::decompress(input, filter)?,
             #[cfg(feature = "zfp")]
@@ -769,10 +770,16 @@ mod tests {
         // Bit 1 set => deflate (index 1) was skipped for this chunk.
         let mask = 1u32 << 1;
         let decoded = decompress_chunk(&stored, &pipeline, ctx, mask).unwrap();
-        assert_eq!(decoded, data, "shuffle must be reversed even when deflate is skipped");
+        assert_eq!(
+            decoded, data,
+            "shuffle must be reversed even when deflate is skipped"
+        );
 
         // The previous behaviour returned raw (still-shuffled) bytes — guard it.
-        assert_ne!(stored, data, "precondition: stored bytes are shuffled, not raw");
+        assert_ne!(
+            stored, data,
+            "precondition: stored bytes are shuffled, not raw"
+        );
     }
 
     /// Symmetric case: the low filter is skipped, the high one still applies.
@@ -796,7 +803,9 @@ mod tests {
                 },
             ],
         };
-        let data: Vec<u8> = (0u32..200).map(|i| (i.wrapping_mul(7) % 256) as u8).collect();
+        let data: Vec<u8> = (0u32..200)
+            .map(|i| (i.wrapping_mul(7) % 256) as u8)
+            .collect();
         let dims = [(data.len() / 8) as u64];
         let ctx = ChunkContext::basic(&dims, 8);
 
@@ -820,7 +829,10 @@ mod tests {
         let err = deflate_decompress(&compressed, Some(1024)).unwrap_err();
         assert!(matches!(err, FormatError::DecompressionError(_)));
         // Without a cap it still works (used where the size is genuinely unknown).
-        assert_eq!(deflate_decompress(&compressed, None).unwrap().len(), 100_000);
+        assert_eq!(
+            deflate_decompress(&compressed, None).unwrap().len(),
+            100_000
+        );
     }
 
     #[test]
@@ -849,7 +861,13 @@ mod tests {
         let compressed = compress_chunk(&data, &pipeline, ChunkContext::basic(&[50], 1)).unwrap();
         let ctx = ChunkContext::basic(&[10], 10); // expected = 100 bytes
         let err = decompress_chunk(&compressed, &pipeline, ctx, 0).unwrap_err();
-        assert!(matches!(err, FormatError::DataSizeMismatch { expected: 100, actual: 50 }));
+        assert!(matches!(
+            err,
+            FormatError::DataSizeMismatch {
+                expected: 100,
+                actual: 50
+            }
+        ));
     }
 
     #[test]
