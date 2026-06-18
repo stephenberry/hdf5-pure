@@ -578,6 +578,10 @@ hdf5-pure = { version = "0.15", default-features = false, features = ["checksum"
 
 The high-level `File` / `FileBuilder` API is `std`-gated, so a `no_std` build exposes only the lower-level primitives. WebAssembly builds keep the default features, since `std` is available on `wasm32-unknown-unknown`.
 
+## Limitations
+
+Where `hdf5-pure` cannot yet handle something, it returns a clear typed error rather than producing a wrong result. The [Limitations & Unsupported Features](https://stephenberry.github.io/hdf5-pure/reference/limitations/) reference catalogs every such refusal, split into **deliberately unsupported** (by-design constraints and foreign-format guards) and **planned support** (deferred features, each tracked by an issue).
+
 ## Acknowledgements
 
 The HDF5 format parsing and low-level I/O modules are derived from rustyhdf5 by the RustyStack project (MIT licensed).
