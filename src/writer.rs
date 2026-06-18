@@ -217,22 +217,25 @@ impl Default for FileBuilder {
 mod streaming_tests {
     use super::*;
     use crate::chunked_write::{ChunkMeta, ChunkProvider};
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
+
+    type Calls = Arc<Mutex<Vec<usize>>>;
 
     /// A test [`ChunkProvider`] serving fixed in-memory chunk bytes, recording
     /// the order of `chunk_bytes` calls so a test can assert the streaming
     /// writer pulls each chunk exactly once, in ascending slot order. With
     /// `short` set, slot 0 returns one byte fewer than planned (size-mismatch).
+    /// `Arc<Mutex<_>>` (not `Rc<RefCell<_>>`) keeps it `Send + Sync`, as the
+    /// `ChunkProvider` supertrait requires.
     struct MemProvider {
         chunks: Vec<Vec<u8>>,
-        calls: Rc<RefCell<Vec<usize>>>,
+        calls: Calls,
         short: bool,
     }
 
     impl ChunkProvider for MemProvider {
         fn chunk_bytes(&self, index: usize) -> Result<Vec<u8>, FormatError> {
-            self.calls.borrow_mut().push(index);
+            self.calls.lock().unwrap().push(index);
             let mut bytes = self.chunks[index].clone();
             if self.short && index == 0 {
                 bytes.pop();
@@ -257,7 +260,7 @@ mod streaming_tests {
         dims: &[u64],
         chunk_dims: &[u64],
         maxshape: Option<&[u64]>,
-        calls: Rc<RefCell<Vec<usize>>>,
+        calls: Calls,
         short: bool,
     ) -> FileBuilder {
         let meta: Vec<ChunkMeta> = chunk_bytes
@@ -302,12 +305,12 @@ mod streaming_tests {
             f64_chunk(&[5.0, 6.0]),
         ];
 
-        let calls_buf = Rc::new(RefCell::new(Vec::new()));
+        let calls_buf = Arc::new(Mutex::new(Vec::new()));
         let buffered = build_lazy(chunks.clone(), &[6], &[2], None, calls_buf.clone(), false)
             .finish()
             .unwrap();
 
-        let calls_str = Rc::new(RefCell::new(Vec::new()));
+        let calls_str = Arc::new(Mutex::new(Vec::new()));
         let mut streamed = Vec::new();
         build_lazy(chunks.clone(), &[6], &[2], None, calls_str.clone(), false)
             .finish_to(&mut streamed)
@@ -321,16 +324,25 @@ mod streaming_tests {
         );
         // Each chunk is pulled exactly once, in ascending slot order — i.e. the
         // writer streams chunk-by-chunk rather than collecting them all.
-        assert_eq!(*calls_buf.borrow(), vec![0, 1, 2]);
-        assert_eq!(*calls_str.borrow(), vec![0, 1, 2]);
+        assert_eq!(*calls_buf.lock().unwrap(), vec![0, 1, 2]);
+        assert_eq!(*calls_str.lock().unwrap(), vec![0, 1, 2]);
         // And the file reads back to the original values.
         assert_eq!(read_back_f64(buffered), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }
 
     #[test]
+    fn file_builder_stays_send_and_sync() {
+        // The lazy chunk provider is boxed into `FileBuilder`; it must keep the
+        // builder `Send + Sync` (removing those auto-traits is a semver-major
+        // break, as `cargo-semver-checks` enforces in CI).
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<FileBuilder>();
+    }
+
+    #[test]
     fn streaming_writer_rejects_provider_size_mismatch() {
         let chunks = vec![f64_chunk(&[1.0, 2.0]), f64_chunk(&[3.0, 4.0])];
-        let calls = Rc::new(RefCell::new(Vec::new()));
+        let calls = Arc::new(Mutex::new(Vec::new()));
         // `short` makes slot 0's provider return fewer bytes than the planned
         // size; the emitter must reject the desync rather than write a corrupt file.
         let err = build_lazy(chunks, &[4], &[2], None, calls, true)
@@ -355,7 +367,7 @@ mod streaming_tests {
             dims,
             chunk_dims,
             maxshape,
-            Rc::new(RefCell::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
             false,
         )
         .finish()
@@ -366,7 +378,7 @@ mod streaming_tests {
             dims,
             chunk_dims,
             maxshape,
-            Rc::new(RefCell::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
             false,
         )
         .finish_to(&mut streamed)

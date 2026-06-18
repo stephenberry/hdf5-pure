@@ -1561,7 +1561,11 @@ pub(crate) struct ChunkMeta {
 /// Yields one chunk's already-compressed bytes on demand. Called once per grid
 /// slot, in ascending slot order, during the streaming assembly pass — so a
 /// repacked dataset never holds more than a single chunk's bytes at a time.
-pub(crate) trait ChunkProvider {
+///
+/// `Send + Sync` is required so that a [`DatasetBuilder`](crate::type_builders::DatasetBuilder)
+/// holding a boxed provider — and thus the public `FileBuilder` — keeps its
+/// `Send`/`Sync` auto-traits. Real providers own an `Arc<File>`, which is both.
+pub(crate) trait ChunkProvider: Send + Sync {
     /// Return grid slot `index`'s compressed bytes. The returned length must
     /// equal the matching [`ChunkMeta::compressed_size`]; the emitter checks it.
     fn chunk_bytes(&self, index: usize) -> Result<Vec<u8>, FormatError>;
