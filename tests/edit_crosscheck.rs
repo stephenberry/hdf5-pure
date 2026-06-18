@@ -1002,3 +1002,192 @@ fn cross_file_copy_from_rejects_dense_attributes() {
     }
     assert_eq!(std::fs::read(&dst_path).unwrap(), dst_before);
 }
+
+// ---- write_dataset (issue #79): value-overwrite crosschecks ----
+
+/// Overwrite a C-library-written contiguous dataset in place (same size) and read
+/// the new values back through both readers. Covers the no-relocation fast path,
+/// in both the HDF5 1.8 (v2 superblock) and 1.10+ (v3 superblock) formats.
+#[test]
+fn write_dataset_same_size_crosscheck() {
+    for (low, high) in [
+        (LibraryVersion::V18, LibraryVersion::V18),
+        (LibraryVersion::V110, LibraryVersion::latest()),
+    ] {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("w.h5");
+        {
+            let file = hdf5::File::with_options()
+                .with_fapl(|p| p.libver_bounds(low, high))
+                .create(&path)
+                .unwrap();
+            file.new_dataset::<f64>()
+                .shape((4,))
+                .create("d")
+                .unwrap()
+                .write(&[1.0f64, 2.0, 3.0, 4.0])
+                .unwrap();
+            file.close().unwrap();
+        }
+
+        {
+            let mut session = EditSession::open(&path).unwrap();
+            session
+                .write_dataset("d")
+                .with_f64_data(&[9.0, 8.0, 7.0, 6.0]);
+            session.commit().unwrap();
+        }
+
+        let pure = File::open(&path).unwrap();
+        assert_eq!(
+            pure.dataset("d").unwrap().read_f64().unwrap(),
+            vec![9.0, 8.0, 7.0, 6.0]
+        );
+        let c = hdf5::File::open(&path).unwrap();
+        assert_eq!(
+            c.dataset("d").unwrap().read_raw::<f64>().unwrap(),
+            vec![9.0, 8.0, 7.0, 6.0]
+        );
+    }
+}
+
+/// Overwrite a dataset the C library created but never wrote — its contiguous
+/// data address is undefined, so the overwrite relocates the header, repoints the
+/// data-layout message, and relinks the parent. Read the result back with both
+/// readers (the relocation path proven against the reference library).
+#[test]
+fn write_dataset_undefined_address_relocates_crosscheck() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("empty.h5");
+    {
+        let file = hdf5::File::with_options()
+            .with_fapl(|p| p.libver_bounds(LibraryVersion::V110, LibraryVersion::latest()))
+            .create(&path)
+            .unwrap();
+        // `new_dataset(...).create(...)` creates without writing: a contiguous
+        // dataset whose data address stays undefined until data is written.
+        file.new_dataset::<i32>()
+            .shape((3,))
+            .create("blank")
+            .unwrap();
+        // A neighbour dataset so the group keeps a stable, re-linkable parent.
+        file.new_dataset::<f64>()
+            .shape((2,))
+            .create("keep")
+            .unwrap()
+            .write(&[1.0f64, 2.0])
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.write_dataset("blank").with_i32_data(&[5, 6, 7]);
+        session.commit().unwrap();
+    }
+
+    let pure = File::open(&path).unwrap();
+    assert_eq!(
+        pure.dataset("blank").unwrap().read_i32().unwrap(),
+        vec![5, 6, 7]
+    );
+    assert_eq!(
+        pure.dataset("keep").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0]
+    );
+    let c = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        c.dataset("blank").unwrap().read_raw::<i32>().unwrap(),
+        vec![5, 6, 7]
+    );
+    assert_eq!(
+        c.dataset("keep").unwrap().read_raw::<f64>().unwrap(),
+        vec![1.0, 2.0]
+    );
+}
+
+/// A dataset reachable by two hard links shares a single object header. A
+/// same-size in-place overwrite does not relocate that header, so both names see
+/// the new data — verified through both readers.
+#[test]
+fn write_dataset_shared_hard_link_crosscheck() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("shared.h5");
+    {
+        let file = hdf5::File::with_options()
+            .with_fapl(|p| p.libver_bounds(LibraryVersion::V110, LibraryVersion::latest()))
+            .create(&path)
+            .unwrap();
+        file.new_dataset::<i32>()
+            .shape((3,))
+            .create("a")
+            .unwrap()
+            .write(&[1i32, 2, 3])
+            .unwrap();
+        // Second hard link to the very same object header.
+        file.link_hard("a", "b").unwrap();
+        file.close().unwrap();
+    }
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.write_dataset("a").with_i32_data(&[40, 50, 60]);
+        session.commit().unwrap();
+    }
+
+    // Both links see the new data through both readers.
+    let pure = File::open(&path).unwrap();
+    assert_eq!(
+        pure.dataset("a").unwrap().read_i32().unwrap(),
+        vec![40, 50, 60]
+    );
+    assert_eq!(
+        pure.dataset("b").unwrap().read_i32().unwrap(),
+        vec![40, 50, 60]
+    );
+    let c = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        c.dataset("a").unwrap().read_raw::<i32>().unwrap(),
+        vec![40, 50, 60]
+    );
+    assert_eq!(
+        c.dataset("b").unwrap().read_raw::<i32>().unwrap(),
+        vec![40, 50, 60]
+    );
+}
+
+/// A relocating overwrite (here: filling a never-written, undefined-address
+/// dataset) of a multiply-hard-linked object is refused, because only one of its
+/// parent links could be repointed at the moved header — the others would diverge.
+/// The file is left untouched.
+#[test]
+fn write_dataset_relocate_with_multiple_hard_links_is_refused() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("shared_relocate.h5");
+    {
+        let file = hdf5::File::with_options()
+            .with_fapl(|p| p.libver_bounds(LibraryVersion::V110, LibraryVersion::latest()))
+            .create(&path)
+            .unwrap();
+        // Created but never written: contiguous address undefined, so an overwrite
+        // relocates the header.
+        file.new_dataset::<i32>().shape((3,)).create("a").unwrap();
+        file.link_hard("a", "b").unwrap();
+        file.close().unwrap();
+    }
+    let before = std::fs::read(&path).unwrap();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.write_dataset("a").with_i32_data(&[1, 2, 3]);
+        let err = session.commit().unwrap_err();
+        assert!(
+            err.to_string().contains("single hard link"),
+            "expected multi-link refusal, got: {err}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "file modified on refusal"
+    );
+}
