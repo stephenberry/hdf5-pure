@@ -119,3 +119,95 @@ pub fn decompress_chunks_lane_partitioned(
     let ordered = all_chunks.into_iter().map(|dc| dc.data).collect();
     Ok((ordered, partition_stats))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a file buffer holding `n` chunks of `chunk_len` bytes each, laid
+    /// out back to back, where chunk `i` is filled with the byte `i as u8`.
+    /// Returns the buffer and the matching `ChunkInfo` list (in index order).
+    fn build_chunks(n: usize, chunk_len: usize) -> (Vec<u8>, Vec<ChunkInfo>) {
+        let mut file_data = Vec::with_capacity(n * chunk_len);
+        let mut chunks = Vec::with_capacity(n);
+        for i in 0..n {
+            let address = file_data.len() as u64;
+            #[allow(clippy::cast_possible_truncation)]
+            file_data.extend(std::iter::repeat_n(i as u8, chunk_len));
+            chunks.push(ChunkInfo {
+                chunk_size: chunk_len as u32,
+                filter_mask: 0,
+                offsets: vec![i as u64],
+                address,
+            });
+        }
+        (file_data, chunks)
+    }
+
+    /// Serial reference decode: read each chunk in index order with an empty
+    /// pipeline (identity), mirroring what the parallel path must reproduce.
+    fn serial_decode(
+        file_data: &[u8],
+        chunks: &[ChunkInfo],
+        pipeline: &FilterPipeline,
+        ctx: ChunkContext<'_>,
+    ) -> Vec<Vec<u8>> {
+        chunks
+            .iter()
+            .map(|c| {
+                let r = slice_range(c.address, u64::from(c.chunk_size)).unwrap();
+                decompress_chunk(&file_data[r], pipeline, ctx).unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lane_partitioned_restores_chunk_order_like_serial() {
+        // A multi-chunk input comfortably above PARALLEL_THRESHOLD so the
+        // partitioner actually spreads chunks across lanes; with several lanes
+        // the per-lane flatten order is not the global index order, so this
+        // exercises the `sort_by_key` order-restoration specifically.
+        let n = 64;
+        assert!(should_use_parallel(n));
+        let chunk_len = 17; // non-power-of-two to catch any stride confusion
+        let (file_data, chunks) = build_chunks(n, chunk_len);
+
+        let pipeline = FilterPipeline {
+            version: 2,
+            filters: Vec::new(),
+        };
+        let chunk_dims = [chunk_len as u64];
+        let ctx = ChunkContext::basic(&chunk_dims, 1);
+
+        let expected = serial_decode(&file_data, &chunks, &pipeline, ctx);
+
+        // Several distinct seeds: order restoration must hold regardless of how
+        // the seeded permutation assigns chunks to lanes.
+        for seed in [0u64, 1, 7, 0xDEAD_BEEF, u64::MAX] {
+            let (ordered, stats) = decompress_chunks_lane_partitioned(
+                &file_data,
+                &chunks,
+                &pipeline,
+                ctx,
+                seed,
+                Some(8),
+            )
+            .expect("parallel decode");
+
+            assert_eq!(ordered.len(), n, "all chunks returned for seed {seed}");
+            // Every chunk lands at its original index, byte-for-byte, matching
+            // the serial decode. This is the property `sort_by_key` guarantees.
+            assert_eq!(ordered, expected, "order restored for seed {seed}");
+            // And each decoded chunk really is its own distinct content (guards
+            // against a degenerate all-equal buffer making the check vacuous).
+            #[allow(clippy::cast_possible_truncation)]
+            for (i, chunk) in ordered.iter().enumerate() {
+                assert_eq!(chunk.as_slice(), &vec![i as u8; chunk_len][..]);
+            }
+            // Stats account for every chunk exactly once across all lanes.
+            assert_eq!(stats.total_chunks, n);
+            let processed: usize = stats.per_lane.iter().map(|l| l.chunks_processed).sum();
+            assert_eq!(processed, n, "each chunk processed once for seed {seed}");
+        }
+    }
+}

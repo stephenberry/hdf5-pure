@@ -1546,6 +1546,158 @@ pub fn build_chunked_data_at_ext(
     })
 }
 
+/// One source chunk for [`build_chunked_data_verbatim`]: its already-compressed
+/// on-disk bytes and the real filter mask from the source index. The inputs are
+/// in dense row-major chunk-grid order (the same order [`split_into_chunks`]
+/// produces), one per grid slot.
+#[derive(Debug, Clone)]
+pub struct VerbatimChunk {
+    /// The chunk's compressed bytes, copied verbatim from the source file.
+    pub compressed: Vec<u8>,
+    /// The chunk's filter mask from the source index (bit i set = filter i was
+    /// *not* applied to this chunk). Carried through faithfully.
+    pub filter_mask: u32,
+}
+
+/// Build a chunked dataset by copying already-compressed source chunks verbatim,
+/// without decoding or re-encoding any of them.
+///
+/// The parallel of [`build_chunked_data_at_ext`] for repack's verbatim path: it
+/// produces the same [`ChunkedDataResult`] shape but lays each chunk's compressed
+/// bytes straight into the data buffer (cache-line aligned, like the normal
+/// path), preserving each chunk's real `filter_mask`, and reuses the source's
+/// `FilterPipeline` message bytes verbatim instead of rebuilding a pipeline from
+/// `ChunkOptions`. Because nothing is decoded, lossy filters (float scale-offset,
+/// ZFP) and filters this crate cannot apply (SZIP, unknown) survive byte-exact.
+///
+/// `chunks` must be in dense row-major chunk-grid order, one entry per grid slot
+/// (the caller — repack — guarantees density; a sparse index is handled by a
+/// separate fallback). `raw_size` is the full uncompressed byte size of a chunk
+/// (`product(chunk_dims) * element_size`), identical for every chunk including
+/// edge chunks since chunks are always stored full-size. The index is chosen
+/// exactly as in [`build_chunked_data_at_ext`]: extensible array if `maxshape`
+/// contains `u64::MAX`, single-chunk if there is one grid slot, else fixed array.
+pub fn build_chunked_data_verbatim(
+    chunks: &[VerbatimChunk],
+    chunk_dims: &[u64],
+    element_size: usize,
+    raw_size: u64,
+    pipeline_message: Option<&[u8]>,
+    base_address: u64,
+    maxshape: Option<&[u64]>,
+) -> Result<ChunkedDataResult, FormatError> {
+    if chunks.is_empty() {
+        return Err(FormatError::ChunkedReadError(
+            "build_chunked_data_verbatim requires at least one chunk".into(),
+        ));
+    }
+    let num_chunks = chunks.len();
+    let has_filters = pipeline_message.is_some();
+
+    // Lay each chunk's compressed bytes into the data buffer, cache-line aligned.
+    let mut data_buf = Vec::new();
+    let mut written_chunks = Vec::with_capacity(num_chunks);
+
+    for chunk in chunks {
+        let aligned_offset = align_to_cache_line(data_buf.len());
+        if aligned_offset > data_buf.len() {
+            data_buf.resize(aligned_offset, 0u8);
+        }
+
+        let address = base_address + data_buf.len() as u64;
+        let compressed_size = chunk.compressed.len() as u64;
+        data_buf.extend_from_slice(&chunk.compressed);
+
+        written_chunks.push(WrittenChunk {
+            address,
+            compressed_size,
+            raw_size,
+            filter_mask: chunk.filter_mask,
+        });
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "chunk dimensions written into the on-disk u32 dimension fields selected for this file"
+    )]
+    let chunk_dims_u32: Vec<u32> = chunk_dims.iter().map(|&d| d as u32).collect();
+    let offset_size: u8 = 8;
+    let length_size: u8 = 8;
+
+    let use_extensible = maxshape.is_some_and(|ms| ms.contains(&u64::MAX));
+
+    // Pad before index structures so they are also cache-line aligned.
+    let aligned_idx = align_to_cache_line(data_buf.len());
+    if aligned_idx > data_buf.len() {
+        data_buf.resize(aligned_idx, 0u8);
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "element size written into the on-disk u32 dimension field selected for this file"
+    )]
+    let layout_message = if use_extensible {
+        let ea_address = base_address + data_buf.len() as u64;
+        let ea_bytes = build_extensible_array_at(
+            &written_chunks,
+            offset_size,
+            length_size,
+            has_filters,
+            ea_address,
+        )?;
+        data_buf.extend_from_slice(&ea_bytes);
+        serialize_v4_extensible_array(
+            &chunk_dims_u32,
+            ea_address,
+            offset_size,
+            element_size as u32,
+        )
+    } else if num_chunks == 1 {
+        let chunk_addr = written_chunks[0].address;
+        let filtered_size = if has_filters {
+            Some(written_chunks[0].compressed_size)
+        } else {
+            None
+        };
+        let filter_mask = if has_filters {
+            Some(written_chunks[0].filter_mask)
+        } else {
+            None
+        };
+        serialize_v4_single_chunk(
+            &chunk_dims_u32,
+            chunk_addr,
+            filtered_size,
+            filter_mask,
+            offset_size,
+            element_size as u32,
+        )
+    } else {
+        let fa_address = base_address + data_buf.len() as u64;
+        let fa_bytes = build_fixed_array_at(
+            &written_chunks,
+            offset_size,
+            length_size,
+            has_filters,
+            fa_address,
+        );
+        data_buf.extend_from_slice(&fa_bytes);
+        serialize_v4_fixed_array(
+            &chunk_dims_u32,
+            fa_address,
+            offset_size,
+            element_size as u32,
+            FIXED_ARRAY_PAGE_BITS,
+        )
+    };
+
+    Ok(ChunkedDataResult {
+        data_bytes: data_buf,
+        layout_message,
+        pipeline_message: pipeline_message.map(<[u8]>::to_vec),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

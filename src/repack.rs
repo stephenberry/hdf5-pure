@@ -11,15 +11,20 @@
 //! # Fidelity contract
 //!
 //! Repack never silently degrades data. Every surviving object is reproduced
-//! faithfully — datatype, shape, max-shape, chunking, supported filters, and
-//! byte-exact element data — or the whole operation fails with
-//! [`Error::RepackUnsupported`] naming the object and the reason. It refuses
-//! rather than approximate. Currently reproducible:
+//! faithfully — datatype, shape, max-shape, chunking, filters, and byte-exact
+//! element data — or the whole operation fails with [`Error::RepackUnsupported`]
+//! naming the object and the reason. It refuses rather than approximate.
+//! Currently reproducible:
 //!
 //! - Datasets with fixed-point, floating-point, fixed-length string, bit-field,
 //!   opaque, compound, enumeration, and array datatypes, contiguous/compact or
-//!   chunked, filtered with deflate, shuffle, fletcher32, and/or **lossless
-//!   integer** scale-offset.
+//!   chunked.
+//! - **Chunked** datasets copy their compressed chunks **verbatim** (chunk by
+//!   chunk, never decoded), so *every* filter is preserved byte-exact: deflate,
+//!   shuffle, fletcher32, integer **and** float scale-offset, ZFP, SZIP, and
+//!   even filters this crate cannot itself apply. The destination always uses a
+//!   v4 chunk index (single-chunk / fixed-array / extensible-array) regardless
+//!   of the source index type.
 //! - Contiguous/compact **variable-length string** datasets (1D and ND), both
 //!   the `is_string: true` shape and the MATLAB VLEN-of-1-byte-ASCII-string
 //!   shape. Each element's exact heap bytes are read and re-staged through a
@@ -32,24 +37,31 @@
 //!   threshold), carried into the compact output as non-persistent — a repacked
 //!   file has no free space to persist.
 //!
-//! Repack reads each dataset's *decompressed* bytes and re-applies its filters,
-//! so it can only reproduce **lossless** filters (then the re-encoded chunks
-//! decompress to the exact same bytes). Refused (named, never dropped silently):
-//! non-string variable-length (sequences of arbitrary base types); chunked,
-//! filtered, or resizable variable-length string datasets (their element
-//! references live inside compressed chunks written before the global heap
-//! addresses are known, so they cannot be patched in); time (its byte order is
-//! not modelled), and reference datatypes (a reference's stored absolute
-//! addresses would go stale on rewrite); virtual and external data layouts;
-//! lossy filters — float D-scale scale-offset and ZFP, whose re-encoding is not
-//! guaranteed idempotent — and SZIP, which this crate cannot write; and any
-//! attribute whose datatype the reader cannot decode into an [`AttrValue`] (e.g.
-//! an enumeration, compound, or boolean attribute). An attribute that cannot be
-//! reproduced fails the repack by name rather than being silently dropped.
+//! The verbatim chunk copy never decodes, so it eliminates the
+//! decompress→recompress round-trip and the per-dataset decompression blowup,
+//! and a lossy filter survives byte-exact. Two paths still re-encode and so
+//! require **lossless** filters: a *contiguous/compact* filtered dataset, and a
+//! *sparse* chunked dataset (one with unallocated chunk-grid holes, which the
+//! dense verbatim path cannot lay out). A lossy pipeline on either of those is
+//! refused.
+//!
+//! Refused (named, never dropped silently): non-string variable-length
+//! (sequences of arbitrary base types); chunked, filtered, or resizable
+//! variable-length string datasets (their element references live inside
+//! compressed chunks written before the global heap addresses are known, so they
+//! cannot be patched in); time (its byte order is not modelled), and reference
+//! datatypes (a reference's stored absolute addresses would go stale on
+//! rewrite); virtual and external data layouts; a lossy filter on the contiguous
+//! re-encode or sparse-chunked fallback path; and any attribute whose datatype
+//! the reader cannot decode into an [`AttrValue`] (e.g. an enumeration, compound,
+//! or boolean attribute). An attribute that cannot be reproduced fails the
+//! repack by name rather than being silently dropped.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use crate::chunked_write::VerbatimChunk;
+use crate::convert::TryToUsize;
 use crate::data_layout::DataLayout;
 use crate::datatype::Datatype;
 use crate::error::Error;
@@ -230,7 +242,6 @@ fn emit_dataset(db: &mut DatasetBuilder, ds: &Dataset, path: &str) -> Result<(),
 
     check_datatype(&datatype, path)?;
     check_layout(&layout, path)?;
-    check_pipeline(pipeline.as_ref(), path)?;
 
     let dims = dataspace.dimensions.clone();
     let n_elements: u64 = dims.iter().product();
@@ -249,6 +260,65 @@ fn emit_dataset(db: &mut DatasetBuilder, ds: &Dataset, path: &str) -> Result<(),
         }
         return Ok(());
     }
+
+    // A chunked dataset with allocated chunks is copied chunk-by-chunk, verbatim:
+    // each compressed chunk is laid into the output without decoding, so any
+    // filter — including lossy ones (float scale-offset, ZFP) and ones this crate
+    // cannot itself apply (SZIP, unknown) — is reproduced byte-exact. This avoids
+    // the decompress→recompress round-trip and the whole-dataset decompression
+    // blowup of the read-raw path. `check_pipeline` is intentionally skipped here:
+    // never decoding makes every filter safe to carry. The datatype check above
+    // still refuses time/variable-length/reference types, whose reproduction or
+    // embedded addresses are unsafe even when copied verbatim.
+    if let DataLayout::Chunked {
+        chunk_dimensions, ..
+    } = &layout
+        && n_elements > 0
+    {
+        let rank = dims.len();
+        let chunk_dims: Vec<u64> = chunk_dimensions
+            .iter()
+            .take(rank)
+            .map(|&c| c as u64)
+            .collect();
+
+        if let Some(verbatim) = try_collect_dense_chunks(ds, &dims, &chunk_dims)? {
+            let maxshape = dataspace
+                .max_dimensions
+                .as_ref()
+                .filter(|ms| *ms != &dims)
+                .map(|ms| ms.as_slice());
+            let elem_size = datatype.type_size() as usize;
+            db.with_raw_chunks(
+                datatype,
+                &dims,
+                maxshape,
+                &chunk_dims,
+                elem_size,
+                ds.filter_pipeline_message_bytes(),
+                verbatim,
+            );
+
+            // Carry the dataset's attributes, refusing any that cannot be
+            // represented.
+            let attrs = ds.attrs()?;
+            check_attr_completeness(&attrs, &ds.attr_names()?, &format!("dataset {path}"))?;
+            for (name, value) in sorted(attrs) {
+                db.set_attr(&name, value);
+            }
+            return Ok(());
+        }
+
+        // Sparse (holes) chunked dataset: the verbatim path needs a dense grid,
+        // so fall through to the read-raw + re-encode path below. That path
+        // re-encodes, so it is only faithful for lossless filters; a lossy
+        // pipeline on a sparse dataset is refused by `check_pipeline`.
+    }
+
+    // Contiguous/compact, or a sparse chunked dataset: read the decompressed
+    // bytes and re-encode. This path can only reproduce lossless filters, so
+    // refuse a lossy pipeline before reading.
+    check_pipeline(pipeline.as_ref(), path)?;
 
     if n_elements == 0 {
         // An empty dataset owns no element bytes: carry just the datatype and
@@ -375,6 +445,77 @@ fn emit_vlen_string_dataset(
     Ok(())
 }
 
+/// Enumerate a chunked dataset's chunks and, if every chunk-grid slot is present
+/// exactly once (a dense grid), return its chunks in dense row-major grid order
+/// for the verbatim copy path. Returns `Ok(None)` when the grid has holes
+/// (a sparse dataset), so the caller can fall back to the read-raw path.
+///
+/// `dims` is the dataspace shape; `chunk_dims` the logical (rank-only) chunk
+/// dimensions. The grid has `num_chunks_per_dim[d] = ceil(dims[d]/chunk_dims[d])`
+/// slots per dimension; a chunk at N-d offset `o` maps to grid coordinate
+/// `o[d]/chunk_dims[d]` and linear (row-major) index over the grid.
+fn try_collect_dense_chunks(
+    ds: &Dataset,
+    dims: &[u64],
+    chunk_dims: &[u64],
+) -> Result<Option<Vec<VerbatimChunk>>, Error> {
+    let rank = dims.len();
+    let mut num_chunks_per_dim = Vec::with_capacity(rank);
+    for d in 0..rank {
+        if chunk_dims[d] == 0 {
+            return Ok(None);
+        }
+        num_chunks_per_dim.push(dims[d].div_ceil(chunk_dims[d]));
+    }
+    let total: u64 = num_chunks_per_dim.iter().product();
+
+    let infos = ds.raw_chunks()?;
+    if infos.len() as u64 != total {
+        // A different chunk count than the full grid means holes (or duplicates):
+        // not a dense grid.
+        return Ok(None);
+    }
+
+    // Map each chunk to its linear grid slot and place it; detect any hole or
+    // duplicate as a non-dense grid.
+    let mut slots: Vec<Option<VerbatimChunk>> = (0..total).map(|_| None).collect();
+    for info in &infos {
+        if info.offsets.len() < rank {
+            return Ok(None);
+        }
+        let mut linear: u64 = 0;
+        for d in 0..rank {
+            if !info.offsets[d].is_multiple_of(chunk_dims[d]) {
+                return Ok(None);
+            }
+            let grid_coord = info.offsets[d] / chunk_dims[d];
+            if grid_coord >= num_chunks_per_dim[d] {
+                return Ok(None);
+            }
+            linear = linear * num_chunks_per_dim[d] + grid_coord;
+        }
+        let slot = &mut slots[linear.to_usize()?];
+        if slot.is_some() {
+            return Ok(None); // duplicate offset
+        }
+        let compressed = ds.read_chunk_raw(info)?;
+        *slot = Some(VerbatimChunk {
+            compressed,
+            filter_mask: info.filter_mask,
+        });
+    }
+
+    // Every slot must be filled for a dense grid.
+    let mut chunks = Vec::with_capacity(slots.len());
+    for slot in slots {
+        match slot {
+            Some(c) => chunks.push(c),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(chunks))
+}
+
 /// Refuse the repack if `owner` has an attribute the reader cannot represent as
 /// an [`AttrValue`] and would therefore drop. `names` is every attribute on the
 /// object; `decoded` is the subset that read back, keyed by name. Any name not
@@ -449,16 +590,20 @@ fn check_layout(layout: &DataLayout, path: &str) -> Result<(), Error> {
     }
 }
 
-/// Reject any filter the writer cannot reproduce, so a filtered dataset is never
-/// silently rewritten without its filters.
+/// Reject any filter that cannot be reproduced **by the re-encoding path**, so a
+/// filtered dataset is never silently rewritten without its filters.
 ///
-/// Repack reads each dataset's *decompressed* element bytes and re-applies its
-/// filters from scratch, so a filter is only safe to reproduce when it is
+/// This guards only the two paths that read each dataset's *decompressed* bytes
+/// and re-apply its filters from scratch: a contiguous/compact filtered dataset,
+/// and the sparse-chunked fallback. A filter is safe there only when it is
 /// **lossless** — then the re-encoded chunks decompress to the exact same bytes.
 /// Deflate, shuffle, fletcher32, and integer scale-offset qualify. Float D-scale
 /// scale-offset and ZFP are lossy: re-encoding already-decompressed values is not
 /// guaranteed idempotent, so reproducing them could silently perturb the data,
 /// and they are refused. SZIP this crate cannot write at all.
+///
+/// The dense chunked path (the common case) copies compressed chunks verbatim
+/// and never calls this — there every filter is safe because nothing is decoded.
 fn check_pipeline(pipeline: Option<&FilterPipeline>, path: &str) -> Result<(), Error> {
     let Some(p) = pipeline else {
         return Ok(());

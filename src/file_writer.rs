@@ -15,7 +15,9 @@ use alloc::collections::BTreeMap as HashMap;
 use std::collections::HashMap;
 
 use crate::attribute::AttributeMessage;
-use crate::chunked_write::{ChunkOptions, build_chunked_data_at_ext};
+use crate::chunked_write::{
+    ChunkOptions, ChunkedDataResult, build_chunked_data_at_ext, build_chunked_data_verbatim,
+};
 use crate::dataspace::{Dataspace, DataspaceType};
 use crate::error::FormatError;
 use crate::file_space_info::{
@@ -591,11 +593,44 @@ impl FileWriter {
             attrs: Vec<AttributeMessage>,
             chunk_options: ChunkOptions,
             maxshape: Option<Vec<u64>>,
+            /// Repack's verbatim chunk payload, when this dataset's chunks are
+            /// copied compressed-as-is rather than encoded from `raw`.
+            raw_chunks: Option<crate::type_builders::RawChunkPayload>,
             reference_targets: Option<Vec<String>>,
             /// Staged global heap collection + patch mask for a VL-string
             /// dataset, whose element references in `raw` need their heap
             /// addresses patched once the post-data cursor is known.
             vl_string_staging: Option<VlStringStaging>,
+        }
+
+        /// Build the chunked data + layout/pipeline messages for one chunked
+        /// dataset at `base_address`, dispatching to the verbatim path when the
+        /// dataset carries a raw-chunk payload, else the normal encode path. The
+        /// single dispatch point keeps the dummy-sizing and real-address passes
+        /// from diverging.
+        fn build_chunked(d: &DsFlat, base_address: u64) -> Result<ChunkedDataResult, FormatError> {
+            if let Some(rc) = &d.raw_chunks {
+                build_chunked_data_verbatim(
+                    &rc.chunks,
+                    &rc.chunk_dims,
+                    rc.element_size,
+                    rc.raw_size,
+                    rc.pipeline_message.as_deref(),
+                    base_address,
+                    d.maxshape.as_deref(),
+                )
+            } else {
+                let chunk_dims = d.chunk_options.resolve_chunk_dims(&d.ds.dimensions);
+                let ctx = crate::filters::ChunkContext::from_datatype(&chunk_dims, &d.dt);
+                build_chunked_data_at_ext(
+                    &d.raw,
+                    &d.ds.dimensions,
+                    ctx,
+                    &d.chunk_options,
+                    base_address,
+                    d.maxshape.as_deref(),
+                )
+            }
         }
         struct GrpFlat {
             name: String,
@@ -616,9 +651,13 @@ impl FileWriter {
         ) -> Result<usize, FormatError> {
             let dt = db.datatype.ok_or(FormatError::DatasetMissingData)?;
             let shape = db.shape.ok_or(FormatError::DatasetMissingShape)?;
+            // A verbatim-chunk dataset (repack) owns no flat `raw` element bytes;
+            // its storage is the pre-compressed chunks in `raw_chunks`. Skip the
+            // flat-data requirement and the shape/data-length check for it.
+            let raw_chunks = db.raw_chunks;
             // Allow empty data for zero-element datasets (e.g. shape [0, 0]).
             let is_empty = shape.contains(&0);
-            let raw = if is_empty {
+            let raw = if is_empty || raw_chunks.is_some() {
                 db.data.unwrap_or_default()
             } else {
                 db.data.ok_or(FormatError::DatasetMissingData)?
@@ -630,7 +669,7 @@ impl FileWriter {
             // produce a file that fails to read back. `saturating_mul` keeps an
             // absurd shape from overflowing into a false match.
             let elem_size = dt.type_size() as u64;
-            if !is_empty && elem_size > 0 {
+            if !is_empty && raw_chunks.is_none() && elem_size > 0 {
                 // Multiply with checked arithmetic, saturating on overflow: an
                 // absurd shape whose element count exceeds `u64` must not panic a
                 // debug build in `Iterator::product` (nor silently wrap a release
@@ -715,6 +754,7 @@ impl FileWriter {
                 attrs,
                 chunk_options: db.chunk_options,
                 maxshape: db.maxshape,
+                raw_chunks,
                 reference_targets: db.reference_targets,
                 vl_string_staging: db.vl_string_staging,
             });
@@ -800,7 +840,7 @@ impl FileWriter {
 
         let is_chunked: Vec<bool> = all_ds
             .iter()
-            .map(|d| d.chunk_options.is_chunked() || d.maxshape.is_some())
+            .map(|d| d.chunk_options.is_chunked() || d.maxshape.is_some() || d.raw_chunks.is_some())
             .collect();
         let root_dense = root_attrs.len() > DENSE_ATTR_THRESHOLD;
         let group_dense: Vec<bool> = groups
@@ -860,16 +900,7 @@ impl FileWriter {
         let mut dummy_cursor = 0u64;
         for (i, d) in all_ds.iter().enumerate() {
             if is_chunked[i] {
-                let chunk_dims = d.chunk_options.resolve_chunk_dims(&d.ds.dimensions);
-                let ctx = crate::filters::ChunkContext::from_datatype(&chunk_dims, &d.dt);
-                let result = build_chunked_data_at_ext(
-                    &d.raw,
-                    &d.ds.dimensions,
-                    ctx,
-                    &d.chunk_options,
-                    dummy_cursor,
-                    d.maxshape.as_deref(),
-                )?;
+                let result = build_chunked(d, dummy_cursor)?;
                 dummy_cursor += result.data_bytes.len() as u64;
                 let dense_blob = if ds_dense[i] {
                     Some(build_dense_attrs(&d.attrs, 0))
@@ -1038,17 +1069,8 @@ impl FileWriter {
         let mut ds_layouts: Vec<DsLayout> = Vec::new();
         for (i, d) in all_ds.iter().enumerate() {
             if is_chunked[i] {
-                let chunk_dims = d.chunk_options.resolve_chunk_dims(&d.ds.dimensions);
                 let base_address = cursor2 as u64;
-                let ctx = crate::filters::ChunkContext::from_datatype(&chunk_dims, &d.dt);
-                let result = build_chunked_data_at_ext(
-                    &d.raw,
-                    &d.ds.dimensions,
-                    ctx,
-                    &d.chunk_options,
-                    base_address,
-                    d.maxshape.as_deref(),
-                )?;
+                let result = build_chunked(d, base_address)?;
                 cursor2 += result.data_bytes.len();
                 ds_layouts.push(DsLayout {
                     data: result.data_bytes,

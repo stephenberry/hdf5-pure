@@ -42,7 +42,7 @@ enum Backend {
 
 /// A borrowed `FileSource` view over a [`File`]'s backend, used by the
 /// streaming-capable read paths so one call site serves both backends.
-enum SourceView<'a> {
+pub(crate) enum SourceView<'a> {
     Mem(&'a [u8]),
     Stream(&'a (dyn FileSource + Send + Sync)),
 }
@@ -331,7 +331,7 @@ impl File {
     }
 
     /// A `FileSource` view over the backend, for the streaming-capable paths.
-    fn source(&self) -> SourceView<'_> {
+    pub(crate) fn source(&self) -> SourceView<'_> {
         match &self.backend {
             Backend::InMemory(v) => SourceView::Mem(v),
             Backend::Streaming(s) => SourceView::Stream(s.as_ref()),
@@ -1166,6 +1166,77 @@ impl<'f> Dataset<'f> {
             .iter()
             .find(|m| m.msg_type == MessageType::FilterPipeline)
             .and_then(|msg| FilterPipeline::parse(&msg.data).ok())
+    }
+
+    /// The raw, still-compressed on-disk bytes of every allocated chunk of this
+    /// chunked dataset, with each chunk's `(address, on-disk size, filter mask,
+    /// logical offset)` — the same `ChunkInfo`s the chunked reader walks before
+    /// decompressing. Used by repack to copy compressed chunks verbatim without
+    /// ever decoding them.
+    ///
+    /// Returns `Err` if the layout is not chunked. Returns `Ok(vec![])` for an
+    /// empty / never-allocated chunked dataset (no index address). Covers every
+    /// index type the reader supports (v3 B-tree and v4 single-chunk, implicit,
+    /// fixed-array, and extensible-array).
+    pub(crate) fn raw_chunks(&self) -> Result<Vec<crate::chunked_read::ChunkInfo>, Error> {
+        let DataLayout::Chunked {
+            chunk_dimensions,
+            btree_address,
+            version,
+            chunk_index_type,
+            single_chunk_filtered_size,
+            single_chunk_filter_mask,
+        } = self.data_layout()?
+        else {
+            return Err(Error::Format(crate::error::FormatError::ChunkedReadError(
+                "raw_chunks called on a non-chunked dataset".into(),
+            )));
+        };
+        // An undefined index address means no storage is allocated yet.
+        let Some(addr) = btree_address else {
+            return Ok(Vec::new());
+        };
+        let dataspace = self.dataspace()?;
+        let elem_size = self.datatype()?.type_size() as usize;
+        Ok(crate::chunked_read::collect_chunks_for_layout_from_source(
+            &self.file.source(),
+            version,
+            chunk_index_type,
+            addr,
+            single_chunk_filtered_size,
+            single_chunk_filter_mask,
+            &chunk_dimensions,
+            &dataspace,
+            elem_size,
+            self.file.offset_size(),
+            self.file.length_size(),
+        )?)
+    }
+
+    /// Read one chunk's still-compressed on-disk bytes — exactly the slice the
+    /// decompressor would consume — without decoding. Mirrors the chunked reader,
+    /// which slices `[address .. address + chunk_size]` directly (no
+    /// `addr_offset` adjustment) before `decompress_chunk`.
+    pub(crate) fn read_chunk_raw(
+        &self,
+        info: &crate::chunked_read::ChunkInfo,
+    ) -> Result<Vec<u8>, Error> {
+        Ok(self
+            .file
+            .source()
+            .read_exact_at(info.address, info.chunk_size as usize)?)
+    }
+
+    /// The raw `FilterPipeline` message bytes from this dataset's object header,
+    /// if it has one. Repack reuses this verbatim so that every filter — including
+    /// ones this crate cannot itself apply (ZFP, SZIP, unknown) — is reproduced
+    /// byte-for-byte in the repacked file's pipeline message.
+    pub(crate) fn filter_pipeline_message_bytes(&self) -> Option<Vec<u8>> {
+        self.header
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::FilterPipeline)
+            .map(|msg| msg.data.clone())
     }
 
     /// Read the dataset's exact unfiltered element bytes.

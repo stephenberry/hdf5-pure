@@ -1,6 +1,6 @@
 //! End-to-end write/read roundtrip through the full HDF5 stack with ZFP
 //! compression enabled. This is the Step 4 integration test — the codec
-//! itself is covered by `zfp_crosscheck.rs`; this harness checks that the
+//! itself is covered by `src/zfp_crosscheck.rs`; this harness checks that the
 //! chunked writer, filter pipeline, and chunked reader all thread the new
 //! ChunkContext through correctly.
 

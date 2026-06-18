@@ -75,10 +75,12 @@ fn c_file_repacked_then_read_by_c_library() {
 #[test]
 fn c_reads_repacked_scale_offset() {
     // hdf5-pure writes an integer dataset compressed with lossless scale-offset,
-    // hdf5-pure repacks it, and the reference C library decodes the *re-emitted*
-    // filter. That the C library reads the exact values back proves repack's
-    // re-applied scale-offset chunk format is valid and interoperable, not a
-    // malformed pipeline that merely happens to round-trip in-crate.
+    // hdf5-pure repacks it (a chunked dataset, so its compressed chunks are copied
+    // verbatim with the source filter-pipeline message carried through), and the
+    // reference C library decodes the result. That the C library reads the exact
+    // values back proves the verbatim-copied chunk format and reused pipeline
+    // message are valid and interoperable, not a layout that merely round-trips
+    // in-crate.
     let dir = tempdir().unwrap();
     let src = dir.path().join("so_src.h5");
     let dst = dir.path().join("so_repacked.h5");
@@ -278,6 +280,127 @@ fn repack_refuses_unrepresentable_attribute() {
                 "error should name the attribute and its dataset: {msg}"
             );
         }
+        other => panic!("expected RepackUnsupported, got {other:?}"),
+    }
+    assert!(!dst.exists(), "dst must not be created when repack refuses");
+}
+
+#[test]
+fn c_deflate_dataset_repacked_verbatim_read_by_both() {
+    // The reference C library writes a chunked + shuffle + deflate dataset.
+    // hdf5-pure repacks it by copying the C library's *own* compressed chunk
+    // streams verbatim (it never re-encodes them), then both readers decode the
+    // result. That the C library reads its exact values back proves the copied
+    // chunk bytes and the carried-through filter-pipeline message remain valid.
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("c_deflate.h5");
+    let dst = dir.path().join("c_deflate_repacked.h5");
+
+    let data: Vec<i32> = (0..4096).map(|i| i % 13).collect();
+    {
+        let file = hdf5::File::create(&src).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape((4096,))
+            .chunk((512,))
+            .shuffle()
+            .deflate(6)
+            .create("vals")
+            .unwrap();
+        ds.write_raw(data.as_slice()).unwrap();
+        file.close().unwrap();
+    }
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    let f = File::open(&dst).unwrap();
+    assert_eq!(f.dataset("vals").unwrap().read_i32().unwrap(), data);
+
+    let c = hdf5::File::open(&dst).unwrap();
+    assert_eq!(c.dataset("vals").unwrap().read_raw::<i32>().unwrap(), data);
+}
+
+#[test]
+fn c_sparse_chunked_lossless_repacked_falls_back() {
+    // The C library writes only the first chunks of a chunked dataset, leaving the
+    // tail unallocated (a sparse chunk grid). The verbatim path needs a dense
+    // grid, so repack falls back to the read-raw + re-encode path. With a lossless
+    // pipeline (deflate) that fallback is faithful: the written values survive and
+    // the unwritten tail reads back as the fill value (0).
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("c_sparse.h5");
+    let dst = dir.path().join("c_sparse_repacked.h5");
+
+    let n = 2000usize; // chunk 512 -> 4 chunks; only the first ~1000 written
+    let written = 1000usize;
+    let head: Vec<i32> = (1..=written as i32).collect();
+    {
+        let file = hdf5::FileBuilder::new()
+            .with_fapl(|fapl| fapl.libver_v110())
+            .create(&src)
+            .unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([n])
+            .chunk([512])
+            .deflate(4)
+            .create("data")
+            .unwrap();
+        ds.write_slice(head.as_slice(), 0..written).unwrap();
+        file.close().unwrap();
+    }
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    let f = File::open(&dst).unwrap();
+    let vals = f.dataset("data").unwrap().read_i32().unwrap();
+    assert_eq!(vals.len(), n);
+    assert_eq!(&vals[..written], head.as_slice());
+    assert!(
+        vals[written..].iter().all(|&v| v == 0),
+        "unwritten tail should read back as the fill value"
+    );
+}
+
+#[test]
+fn c_sparse_chunked_lossy_repack_refused() {
+    // The C library writes only the first chunks of a chunked dataset compressed
+    // with float D-scale scale-offset (a lossy filter), leaving the tail
+    // unallocated (a sparse grid). The verbatim path needs a dense grid, so repack
+    // would fall back to the read-raw + re-encode path — but re-encoding a lossy
+    // filter is not guaranteed idempotent, so repack must refuse by name rather
+    // than risk silently perturbing the data.
+    use hdf5::filters::ScaleOffset as CScaleOffset;
+
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("c_sparse_lossy.h5");
+    let dst = dir.path().join("c_sparse_lossy_repacked.h5");
+
+    let n = 2000usize;
+    let written = 1000usize;
+    let head: Vec<f64> = (0..written).map(|i| i as f64 * 0.01).collect();
+    {
+        let file = hdf5::FileBuilder::new()
+            .with_fapl(|fapl| fapl.libver_v110())
+            .create(&src)
+            .unwrap();
+        let ds = file
+            .new_dataset::<f64>()
+            .shape([n])
+            .chunk([512])
+            .scale_offset(CScaleOffset::FloatDScale(3))
+            .create("data")
+            .unwrap();
+        ds.write_slice(head.as_slice(), 0..written).unwrap();
+        file.close().unwrap();
+    }
+
+    let err = repack(&src, &dst, &RepackOptions::new()).unwrap_err();
+    match err {
+        hdf5_pure::Error::RepackUnsupported(msg) => assert!(
+            msg.contains("data") && msg.contains("scale-offset"),
+            "error should name the dataset and reason: {msg}"
+        ),
         other => panic!("expected RepackUnsupported, got {other:?}"),
     }
     assert!(!dst.exists(), "dst must not be created when repack refuses");
