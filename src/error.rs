@@ -149,6 +149,11 @@ pub enum FormatError {
     /// decode. Link and attribute heaps are never filtered, so this does not
     /// arise for them.
     UnsupportedFilteredHeapObject,
+    /// A dataset uses the Virtual (VDS) data layout, which maps its elements to
+    /// regions of other datasets, possibly in other files. This reader does not
+    /// yet resolve virtual mappings, so such a dataset is refused rather than
+    /// read as empty or wrong.
+    UnsupportedVirtualLayout,
     /// Invalid attribute message version.
     InvalidAttributeVersion(u8),
     /// Invalid Attribute Info message version.
@@ -454,6 +459,9 @@ impl fmt::Display for FormatError {
             }
             FormatError::UnsupportedFilteredHeapObject => {
                 write!(f, "filtered fractal-heap objects are not supported")
+            }
+            FormatError::UnsupportedVirtualLayout => {
+                write!(f, "virtual (VDS) data layout is not supported")
             }
             FormatError::InvalidAttributeVersion(v) => {
                 write!(f, "invalid attribute message version: {v}")

@@ -19,6 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Reading a virtual (VDS) dataset now fails with a clear `FormatError::UnsupportedVirtualLayout` instead of a misleading `UnsupportedVersion(0)` (which rendered as "unsupported superblock version: 0"); VDS reading is tracked as a planned feature ([#111](https://github.com/stephenberry/hdf5-pure/issues/111)).
 - Multi-filter chunks where only *some* filters were skipped for a chunk (the per-chunk `filter_mask`, e.g. shuffle+gzip on an incompressible chunk that the C library stores shuffled but not deflated) now have the surviving filters reversed instead of being returned raw, fixing silent value corruption on spec-valid files ([#97](https://github.com/stephenberry/hdf5-pure/issues/97)).
 - Integers with sub-byte precision or a non-zero bit offset (`H5Tset_precision` / `H5Tset_offset`) now decode correctly in the dataset and attribute readers — masked to the significant bits and sign-extended at the precision boundary — instead of returning the raw stored word with its padding bits; compound fields with such layouts are still refused by name ([#97](https://github.com/stephenberry/hdf5-pure/issues/97)).
 - A malformed v1 B-tree with a cyclic or pathologically deep internal node — in either the chunk index or a group's symbol table — now errors instead of recursing until the stack overflows and aborts the process; traversal is bounded by a depth cap ([#97](https://github.com/stephenberry/hdf5-pure/issues/97)).

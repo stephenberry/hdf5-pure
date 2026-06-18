@@ -92,7 +92,7 @@ pub fn read_raw_data_full(
             offset_size,
             length_size,
         ),
-        DataLayout::Virtual { .. } => Err(FormatError::UnsupportedVersion(0)),
+        DataLayout::Virtual { .. } => Err(FormatError::UnsupportedVirtualLayout),
     }
 }
 
@@ -202,7 +202,7 @@ pub fn read_raw_data_full_from_source<S: FileSource + ?Sized>(
             offset_size,
             length_size,
         ),
-        DataLayout::Virtual { .. } => Err(FormatError::UnsupportedVersion(0)),
+        DataLayout::Virtual { .. } => Err(FormatError::UnsupportedVirtualLayout),
     }
 }
 
