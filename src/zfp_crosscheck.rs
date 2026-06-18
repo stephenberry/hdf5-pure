@@ -325,4 +325,19 @@ fn zfp_crosscheck() {
         }
         panic!("{} supported fixtures failed crosscheck", failed.len());
     }
+
+    // A green result with zero positively-verified fixtures is not a real pass:
+    // it means the manifest listed no in-slice fixtures (e.g. fixtures were
+    // never generated). We do not fail the build for legitimately-absent
+    // fixtures, but make the "nothing was checked" outcome explicit/observable
+    // rather than a silent green.
+    if passed.is_empty() {
+        eprintln!(
+            "WARNING: ZFP crosscheck verified 0 fixtures \
+             ({} total in manifest, {} skipped). Nothing was cross-checked \
+             against the reference plugin; run regen.py to produce fixtures.",
+            manifest.fixtures.len(),
+            skipped.len()
+        );
+    }
 }

@@ -1686,3 +1686,39 @@ fn crosscheck_scale_offset_then_deflate() {
     let values = ds.read_raw::<i32>().unwrap();
     assert_eq!(values, data);
 }
+
+#[test]
+fn crosscheck_vlen_string_dataset() {
+    // hdf5-pure writes a variable-length UTF-8 string dataset; the reference C
+    // library reads back the values and confirms the datatype is VL Unicode.
+    use hdf5::types::VarLenUnicode;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vlen_strings.h5");
+
+    let words = ["alpha", "", "γάμμα", "delta"];
+    let mut builder = FileBuilder::new();
+    builder.create_dataset("labels").with_vlen_strings(&words);
+    builder.write(&path).unwrap();
+
+    // hdf5-pure round-trips the values.
+    let f = File::open(&path).unwrap();
+    assert_eq!(
+        f.dataset("labels")
+            .unwrap()
+            .read_vlen_strings(Default::default())
+            .unwrap(),
+        words
+    );
+
+    // The reference C library agrees on values and that the type is VL Unicode.
+    let file = hdf5::File::open(&path).unwrap();
+    let ds = file.dataset("labels").unwrap();
+    let vals = ds.read_raw::<VarLenUnicode>().unwrap();
+    let got: Vec<String> = vals.iter().map(|v| v.as_str().to_string()).collect();
+    assert_eq!(got, words);
+    assert!(
+        ds.dtype().unwrap().is::<VarLenUnicode>(),
+        "datatype must be variable-length Unicode"
+    );
+}

@@ -934,7 +934,7 @@ pub fn read_chunked_data_cached_from_source<S: FileSource + ?Sized>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn collect_chunks_for_layout_from_source<S: FileSource + ?Sized>(
+pub(crate) fn collect_chunks_for_layout_from_source<S: FileSource + ?Sized>(
     source: &S,
     version: u8,
     chunk_index_type: Option<u8>,

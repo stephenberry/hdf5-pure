@@ -317,6 +317,101 @@ pub fn read_vl_strings_from_source<S: FileSource + ?Sized>(
     Ok(strings)
 }
 
+/// One element of a variable-length string dataset/attribute, read as exact
+/// heap bytes rather than a lossily-decoded `String`.
+///
+/// `None` is a *null* reference (length 0 with an undefined or zero heap
+/// address), which the HDF5 model distinguishes from an empty string. `Some`
+/// is a real heap object, carrying its exact bytes (possibly empty, possibly
+/// containing embedded NULs or non-UTF-8 sequences). Preserving this
+/// distinction lets a faithful rewrite reproduce the source byte-for-byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VlByteObject {
+    /// A null VL reference (no heap object).
+    Null,
+    /// A heap object holding these exact bytes.
+    Bytes(Vec<u8>),
+}
+
+/// Resolve a VL-string element's exact heap bytes from a random-access source,
+/// preserving the null-vs-empty distinction and never lossily decoding.
+///
+/// This mirrors [`visit_vl_strings_from_source`] but yields raw bytes (and a
+/// null marker) instead of a `&str`, so a faithful rewrite can reproduce
+/// embedded-NUL and non-UTF-8 payloads exactly.
+pub(crate) fn read_vl_byte_objects_from_source<S: FileSource + ?Sized>(
+    source: &S,
+    raw_data: &[u8],
+    num_elements: u64,
+    offset_size: u8,
+    length_size: u8,
+    base_address: u64,
+    options: VlenStringReadOptions,
+) -> Result<Vec<VlByteObject>, FormatError> {
+    check_element_limit(num_elements, options)?;
+    let refs = parse_vl_references(raw_data, num_elements, offset_size)?;
+    payload_size(&refs, options)?;
+
+    let mut objects = Vec::with_capacity(refs.len());
+    let mut collections: Vec<(u64, GlobalHeapIndex)> = Vec::new();
+    for element in &refs {
+        if element.length == 0
+            && (is_undefined_addr(element.collection_address, offset_size)
+                || element.collection_address == 0)
+        {
+            objects.push(VlByteObject::Null);
+            continue;
+        }
+        if is_undefined_addr(element.collection_address, offset_size) {
+            return Err(FormatError::VlDataError(
+                "non-empty VL element has an undefined heap address".into(),
+            ));
+        }
+
+        let collection_address = element.collection_address.checked_add(base_address).ok_or(
+            FormatError::OffsetOverflow {
+                offset: element.collection_address,
+                length: base_address,
+            },
+        )?;
+        let collection_pos = match collections
+            .iter()
+            .position(|(address, _)| *address == collection_address)
+        {
+            Some(pos) => pos,
+            None => {
+                let collection = GlobalHeapIndex::parse(source, collection_address, length_size)?;
+                collections.push((collection_address, collection));
+                collections.len() - 1
+            }
+        };
+
+        let index = u16::try_from(element.object_index).map_err(|_| {
+            FormatError::VlDataError(format!(
+                "global heap object index {} does not fit u16",
+                element.object_index
+            ))
+        })?;
+        let object = collections[collection_pos].1.get_object(index).ok_or(
+            FormatError::GlobalHeapObjectNotFound {
+                collection_address,
+                index,
+            },
+        )?;
+        if u64::from(element.length) > object.size {
+            return Err(FormatError::VlDataError(format!(
+                "VL element length {} exceeds global heap object size {}",
+                element.length, object.size
+            )));
+        }
+
+        let bytes = source.read_exact_at(object.data_address, element.length as usize)?;
+        objects.push(VlByteObject::Bytes(bytes));
+    }
+
+    Ok(objects)
+}
+
 /// Resolve VL strings from raw data by looking up each element in the global heap.
 pub fn read_vl_strings(
     file_data: &[u8],
