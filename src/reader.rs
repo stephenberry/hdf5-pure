@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 
-use crate::attribute::extract_attributes_full;
+use crate::attribute::{extract_attributes_full, extract_attributes_full_from_source};
 use crate::chunk_cache::{ChunkCache, ChunkCacheConfig, ChunkCacheStats};
 use crate::compound::CompoundType;
 use crate::convert::TryToUsize;
@@ -659,7 +659,7 @@ impl File {
         let mut entries = match &self.backend {
             Backend::InMemory(v) => group_v2::resolve_group_entries(v, hdr, os, ls, base),
             Backend::Streaming(s) => {
-                group_v2::resolve_group_entries_from_source(s.as_ref(), hdr, os, ls)
+                group_v2::resolve_group_entries_from_source(s.as_ref(), hdr, os, ls, base)
             }
         }
         .map_err(Error::Format)?;
@@ -670,24 +670,11 @@ impl File {
     }
 
     /// Read all attributes attached to an object header, dispatching on the
-    /// backend. Attribute reading is not yet supported on the streaming backend.
+    /// backend.
     fn attrs_of(&self, hdr: &ObjectHeader) -> Result<HashMap<String, AttrValue>, Error> {
-        match &self.backend {
-            Backend::InMemory(v) => {
-                let attr_msgs =
-                    extract_attributes_full(v, hdr, self.offset_size(), self.length_size())?;
-                Ok(attrs_to_map(
-                    &attr_msgs,
-                    v,
-                    self.offset_size(),
-                    self.length_size(),
-                    self.addr_offset,
-                ))
-            }
-            Backend::Streaming(_) => Err(Error::Format(FormatError::ChunkedReadError(
-                "attribute reading is not yet supported on the streaming backend".into(),
-            ))),
-        }
+        let (os, ls, base) = (self.offset_size(), self.length_size(), self.addr_offset);
+        let attr_msgs = self.attr_messages_of(hdr)?;
+        Ok(attrs_to_map(&attr_msgs, &self.source(), os, ls, base))
     }
 
     /// Names of every attribute message on `hdr`, including ones whose datatype
@@ -695,15 +682,28 @@ impl File {
     /// silently omits from its map). Repack diffs this against the decoded map to
     /// refuse rather than drop an attribute it cannot reproduce.
     pub(crate) fn attr_message_names_of(&self, hdr: &ObjectHeader) -> Result<Vec<String>, Error> {
+        Ok(self
+            .attr_messages_of(hdr)?
+            .into_iter()
+            .map(|a| a.name)
+            .collect())
+    }
+
+    /// Extract every attribute message attached to an object header (compact,
+    /// shared, and dense storage), dispatching on the backend.
+    fn attr_messages_of(
+        &self,
+        hdr: &ObjectHeader,
+    ) -> Result<Vec<crate::attribute::AttributeMessage>, Error> {
+        let (os, ls) = (self.offset_size(), self.length_size());
         match &self.backend {
-            Backend::InMemory(v) => {
-                let attr_msgs =
-                    extract_attributes_full(v, hdr, self.offset_size(), self.length_size())?;
-                Ok(attr_msgs.into_iter().map(|a| a.name).collect())
-            }
-            Backend::Streaming(_) => Err(Error::Format(FormatError::ChunkedReadError(
-                "attribute reading is not yet supported on the streaming backend".into(),
-            ))),
+            Backend::InMemory(v) => Ok(extract_attributes_full(v, hdr, os, ls)?),
+            Backend::Streaming(s) => Ok(extract_attributes_full_from_source(
+                s.as_ref(),
+                hdr,
+                os,
+                ls,
+            )?),
         }
     }
 

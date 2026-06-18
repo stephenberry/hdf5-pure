@@ -126,3 +126,97 @@ fn open_streaming_with_access_options_reads_chunked_data() {
     assert_eq!(dataset.read_i32().unwrap(), data);
     assert_eq!(dataset.read_i32().unwrap(), data);
 }
+
+/// Recursively assert the streaming backend reports the identical groups,
+/// datasets, shapes, and attributes as the buffered backend for the group at
+/// `path`. Returns the number of attributes compared, so a caller can confirm
+/// the walk actually exercised attribute reads rather than passing trivially on
+/// empty maps.
+fn assert_group_parity(buffered: &File, streaming: &File, path: &str) -> usize {
+    let display = if path.is_empty() { "/" } else { path };
+    let bg = if path.is_empty() {
+        buffered.root()
+    } else {
+        buffered.group(path).unwrap()
+    };
+    let sg = if path.is_empty() {
+        streaming.root()
+    } else {
+        streaming.group(path).unwrap()
+    };
+
+    let b_attrs = bg.attrs().unwrap();
+    let s_attrs = sg.attrs().unwrap();
+    assert_eq!(b_attrs, s_attrs, "group attrs mismatch at '{display}'");
+    let mut count = b_attrs.len();
+
+    let mut b_ds = bg.datasets().unwrap();
+    b_ds.sort();
+    let mut s_ds = sg.datasets().unwrap();
+    s_ds.sort();
+    assert_eq!(b_ds, s_ds, "datasets mismatch at '{display}'");
+    for name in &b_ds {
+        let full = child_path(path, name);
+        let bd = buffered.dataset(&full).unwrap();
+        let sd = streaming.dataset(&full).unwrap();
+        assert_eq!(
+            bd.shape().unwrap(),
+            sd.shape().unwrap(),
+            "shape mismatch for '{full}'"
+        );
+        let bda = bd.attrs().unwrap();
+        let sda = sd.attrs().unwrap();
+        assert_eq!(bda, sda, "dataset attrs mismatch for '{full}'");
+        count += bda.len();
+    }
+
+    let mut b_g = bg.groups().unwrap();
+    b_g.sort();
+    let mut s_g = sg.groups().unwrap();
+    s_g.sort();
+    assert_eq!(b_g, s_g, "subgroups mismatch at '{display}'");
+    for name in &b_g {
+        count += assert_group_parity(buffered, streaming, &child_path(path, name));
+    }
+
+    count
+}
+
+fn child_path(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+/// The streaming backend must resolve v1 (symbol-table) groups and read
+/// compact, dense (fractal-heap), and variable-length attributes identically to
+/// the buffered backend. Each fixture's expected attribute count guards against
+/// a trivially-empty parity pass.
+#[test]
+fn streaming_matches_buffered_groups_and_attributes_across_fixtures() {
+    // (fixture, expected total attributes across the whole walk)
+    let cases = [
+        ("two_groups.h5", 0),        // v1 groups, no attributes
+        ("nested_groups.h5", 0),     // nested v1 groups
+        ("simple_dataset.h5", 0),    // v1 root group + dataset
+        ("attrs.h5", 4),             // v1 groups + compact attrs (root + dataset)
+        ("mixed_attrs.h5", 3),       // v1 subgroup + scalar/array compact attrs
+        ("vl_strings.h5", 1),        // v1 root + VL-string attr (global heap)
+        ("dense_attrs.h5", 50),      // v2 dataset + dense (fractal-heap) attrs
+        ("dense_attrs_root.h5", 20), // v2 root group + dense attrs
+        ("v2_groups.h5", 0),         // v2 groups, no attributes
+    ];
+
+    for (fixture, expected_attrs) in cases {
+        let path = format!("tests/fixtures/{fixture}");
+        let buffered = File::open(&path).unwrap();
+        let streaming = File::open_streaming(&path).unwrap();
+        let counted = assert_group_parity(&buffered, &streaming, "");
+        assert_eq!(
+            counted, expected_attrs,
+            "attribute count mismatch for {fixture}"
+        );
+    }
+}

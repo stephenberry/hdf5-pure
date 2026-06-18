@@ -4,7 +4,9 @@
 use alloc::{string::String, vec::Vec};
 
 use crate::attribute_info::AttributeInfoMessage;
-use crate::btree_v2::{BTreeV2Header, collect_btree_v2_records};
+use crate::btree_v2::{
+    BTreeV2Header, collect_btree_v2_records, collect_btree_v2_records_from_source,
+};
 use crate::convert::TryToUsize;
 use crate::data_read;
 use crate::dataspace::Dataspace;
@@ -14,6 +16,7 @@ use crate::fractal_heap::FractalHeapHeader;
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
 use crate::shared_message;
+use crate::source::FileSource;
 
 /// A parsed HDF5 attribute message.
 #[derive(Debug, Clone)]
@@ -345,6 +348,52 @@ pub fn extract_attributes_full(
     Ok(attrs)
 }
 
+/// Streaming counterpart of [`extract_attributes_full`].
+///
+/// Reads compact attribute messages from the (already-parsed) object header,
+/// resolves shared attribute references, and walks dense storage (fractal heap +
+/// B-tree v2) through a [`FileSource`] on demand instead of indexing a whole-file
+/// slice. Used by the streaming reader backend.
+pub fn extract_attributes_full_from_source<S: FileSource + ?Sized>(
+    source: &S,
+    header: &ObjectHeader,
+    offset_size: u8,
+    length_size: u8,
+) -> Result<Vec<AttributeMessage>, FormatError> {
+    let mut attrs = Vec::new();
+
+    // Collect compact attributes (inline in OH)
+    for msg in &header.messages {
+        if msg.msg_type == MessageType::Attribute {
+            if shared_message::is_shared(msg.flags) {
+                let shared_ref = shared_message::parse_shared_ref(&msg.data, offset_size)?;
+                let resolved_data = shared_message::resolve_shared_message_from_source(
+                    source,
+                    &shared_ref,
+                    MessageType::Attribute,
+                    offset_size,
+                    length_size,
+                )?;
+                attrs.push(AttributeMessage::parse(&resolved_data, length_size)?);
+            } else {
+                attrs.push(AttributeMessage::parse(&msg.data, length_size)?);
+            }
+        }
+    }
+
+    // Check for dense attributes via AttributeInfo message
+    let attr_info = find_attribute_info(header, offset_size)?;
+    if let Some(info) = attr_info
+        && let Some(fh_addr) = info.fractal_heap_address
+    {
+        let dense_attrs =
+            extract_dense_attributes_from_source(source, &info, fh_addr, offset_size, length_size)?;
+        attrs.extend(dense_attrs);
+    }
+
+    Ok(attrs)
+}
+
 /// Find and parse the Attribute Info message from an object header.
 fn find_attribute_info(
     header: &ObjectHeader,
@@ -399,6 +448,42 @@ fn extract_dense_attributes(
         // The data in the heap is a complete attribute message
         let attr = AttributeMessage::parse(&attr_data, length_size)?;
         attrs.push(attr);
+    }
+
+    Ok(attrs)
+}
+
+/// Streaming counterpart of [`extract_dense_attributes`]: walks the fractal heap
+/// and B-tree v2 through a [`FileSource`] on demand.
+fn extract_dense_attributes_from_source<S: FileSource + ?Sized>(
+    source: &S,
+    attr_info: &AttributeInfoMessage,
+    fh_addr: u64,
+    offset_size: u8,
+    length_size: u8,
+) -> Result<Vec<AttributeMessage>, FormatError> {
+    let fh = FractalHeapHeader::parse_from_source(source, fh_addr, offset_size, length_size)?;
+
+    let btree_addr = attr_info
+        .btree_name_index_address
+        .ok_or(FormatError::UnexpectedEof {
+            expected: 1,
+            available: 0,
+        })?;
+    let btree_hdr = BTreeV2Header::parse_from_source(source, btree_addr, offset_size, length_size)?;
+    let records =
+        collect_btree_v2_records_from_source(source, &btree_hdr, offset_size, length_size)?;
+
+    let mut attrs = Vec::new();
+    for record in &records {
+        // Both type 8 and type 9 records begin with the heap_id.
+        let id_offset = 0;
+        if record.data.len() < id_offset + fh.heap_id_length as usize {
+            continue;
+        }
+        let id_bytes = &record.data[id_offset..id_offset + fh.heap_id_length as usize];
+        let attr_data = fh.read_object_from_source(source, id_bytes, offset_size, length_size)?;
+        attrs.push(AttributeMessage::parse(&attr_data, length_size)?);
     }
 
     Ok(attrs)

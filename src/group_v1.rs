@@ -3,10 +3,11 @@
 #[cfg(not(feature = "std"))]
 use alloc::{string::String, vec::Vec};
 
-use crate::btree_v1::collect_symbol_table_nodes;
-use crate::convert::slice_range;
+use crate::btree_v1::{collect_symbol_table_nodes, collect_symbol_table_nodes_from_source};
+use crate::convert::{TryToUsize, slice_range};
 use crate::error::FormatError;
 use crate::local_heap::LocalHeap;
+use crate::source::FileSource;
 use crate::symbol_table::{SymbolTableMessage, SymbolTableNode};
 
 /// A resolved group entry (child name + object header address).
@@ -62,6 +63,77 @@ pub fn resolve_v1_group_entries(
         )?;
         for entry in &snod.entries {
             let name = heap.read_string(file_data, entry.link_name_offset)?;
+            entries.push(GroupEntry {
+                name,
+                object_header_address: entry.object_header_address,
+                cache_type: entry.cache_type,
+            });
+        }
+    }
+
+    Ok(entries)
+}
+
+/// Streaming counterpart of [`resolve_v1_group_entries`].
+///
+/// Reads the local heap header, B-tree v1, and each symbol-table node from a
+/// [`FileSource`] on demand. The heap's data segment (holding the link names) is
+/// read once and every name is sliced from that single buffer. As with the
+/// buffered version, the returned `object_header_address` values are relative to
+/// `base_address` (the caller adds it to obtain absolute file offsets).
+pub fn resolve_v1_group_entries_from_source<S: FileSource + ?Sized>(
+    source: &S,
+    sym_table_msg: &SymbolTableMessage,
+    offset_size: u8,
+    length_size: u8,
+    base_address: u64,
+) -> Result<Vec<GroupEntry>, FormatError> {
+    // Parse local heap (address is relative to base_address).
+    let heap_addr = sym_table_msg
+        .local_heap_address
+        .checked_add(base_address)
+        .ok_or(FormatError::OffsetOverflow {
+            offset: sym_table_msg.local_heap_address,
+            length: base_address,
+        })?;
+    let mut heap = LocalHeap::parse_from_source(source, heap_addr, offset_size, length_size)?;
+    // The data segment address stored in the heap is also relative to base_address.
+    heap.data_segment_address =
+        heap.data_segment_address
+            .checked_add(base_address)
+            .ok_or(FormatError::OffsetOverflow {
+                offset: heap.data_segment_address,
+                length: base_address,
+            })?;
+
+    // Read the heap data segment once; every link name is sliced from it.
+    let segment = source.read_metadata_at(
+        heap.data_segment_address,
+        heap.data_segment_size.to_usize()?,
+    )?;
+
+    // Collect all SNOD addresses from the B-tree (relative to base_address).
+    let snod_addrs = collect_symbol_table_nodes_from_source(
+        source,
+        sym_table_msg.btree_address,
+        offset_size,
+        length_size,
+        base_address,
+    )?;
+
+    let mut entries = Vec::new();
+    for snod_addr in snod_addrs {
+        // SNOD addresses from the B-tree are relative to base_address.
+        let snod_offset =
+            snod_addr
+                .checked_add(base_address)
+                .ok_or(FormatError::OffsetOverflow {
+                    offset: snod_addr,
+                    length: base_address,
+                })?;
+        let snod = SymbolTableNode::parse_from_source(source, snod_offset, offset_size)?;
+        for entry in &snod.entries {
+            let name = heap.read_string_in_segment(&segment, entry.link_name_offset)?;
             entries.push(GroupEntry {
                 name,
                 object_header_address: entry.object_header_address,

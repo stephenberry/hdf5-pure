@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
+use crate::source::FileSource;
 
 /// Size of the size-of-offsets-independent prefix of a version 1 B-tree node:
 /// `signature(4) + node_type(1) + node_level(1) + entries_used(2)`. The two
@@ -155,6 +156,30 @@ impl BTreeV1Node {
             children,
         })
     }
+
+    /// Parse a B-tree v1 (type 0, group) node from a [`FileSource`] on demand.
+    ///
+    /// Reads the fixed node prefix to learn `entries_used`, then the exact node
+    /// body, so no more than one node is resident at a time.
+    pub fn parse_from_source<S: FileSource + ?Sized>(
+        source: &S,
+        address: u64,
+        offset_size: u8,
+        length_size: u8,
+    ) -> Result<BTreeV1Node, FormatError> {
+        let prefix = source.read_metadata_at(address, BTREE_V1_NODE_PREFIX_LEN)?;
+        if &prefix[0..4] != b"TREE" {
+            return Err(FormatError::InvalidBTreeSignature);
+        }
+        let entries_used = u16::from_le_bytes([prefix[6], prefix[7]]) as usize;
+
+        // For type 0: header + entries_used*(key + child) + a trailing key,
+        // with key and child each `offset_size` bytes wide.
+        let os = offset_size as usize;
+        let total = btree_v1_node_header_size(offset_size) + entries_used * (os + os) + os;
+        let buf = source.read_metadata_at(address, total)?;
+        Self::parse(&buf, 0, offset_size, length_size)
+    }
 }
 
 /// Collect all leaf-level child addresses (SNOD addresses) by traversing the B-tree.
@@ -191,6 +216,50 @@ pub fn collect_symbol_table_nodes(
         for &child_addr in &node.children {
             let child_snods = collect_symbol_table_nodes(
                 file_data,
+                child_addr,
+                offset_size,
+                length_size,
+                base_address,
+            )?;
+            result.extend(child_snods);
+        }
+        Ok(result)
+    }
+}
+
+/// Streaming counterpart of [`collect_symbol_table_nodes`]: walks the v1 B-tree
+/// through a [`FileSource`], reading one node at a time.
+///
+/// `base_address` is the superblock base address; all B-tree node and SNOD
+/// addresses are stored relative to it. The returned SNOD addresses are also
+/// relative (the caller adds `base_address` to obtain absolute file offsets).
+pub fn collect_symbol_table_nodes_from_source<S: FileSource + ?Sized>(
+    source: &S,
+    btree_address: u64,
+    offset_size: u8,
+    length_size: u8,
+    base_address: u64,
+) -> Result<Vec<u64>, FormatError> {
+    let node_offset =
+        btree_address
+            .checked_add(base_address)
+            .ok_or(FormatError::OffsetOverflow {
+                offset: btree_address,
+                length: base_address,
+            })?;
+    let node = BTreeV1Node::parse_from_source(source, node_offset, offset_size, length_size)?;
+
+    if node.node_type != 0 {
+        return Err(FormatError::InvalidBTreeNodeType(node.node_type));
+    }
+
+    if node.node_level == 0 {
+        Ok(node.children)
+    } else {
+        let mut result = Vec::new();
+        for &child_addr in &node.children {
+            let child_snods = collect_symbol_table_nodes_from_source(
+                source,
                 child_addr,
                 offset_size,
                 length_size,

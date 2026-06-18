@@ -56,6 +56,18 @@
 //! the reader cannot decode into an [`AttrValue`] (e.g. an enumeration, compound,
 //! or boolean attribute). An attribute that cannot be reproduced fails the
 //! repack by name rather than being silently dropped.
+//!
+//! # Memory
+//!
+//! Repack is **out-of-core** (issue [#82]): it opens the source with
+//! [`File::open_streaming`], reading metadata and one working chunk on demand
+//! rather than buffering the whole file, copies each chunked dataset's
+//! compressed chunks verbatim one at a time, and streams the output straight to
+//! the destination. Peak memory is therefore bounded by a single chunk plus the
+//! file's metadata, independent of dataset (or file) size, so a file whose data
+//! exceeds available RAM repacks successfully.
+//!
+//! [#82]: https://github.com/stephenberry/hdf5-pure/issues/82
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -123,9 +135,11 @@ pub fn repack<P: AsRef<Path>, Q: AsRef<Path>>(
     dst: Q,
     options: &RepackOptions,
 ) -> Result<(), Error> {
-    // Shared so each streamed dataset's chunk provider can pull from the source
-    // during the write without an extra open; the source is read on demand.
-    let file = Arc::new(File::open(src)?);
+    // Open the source for on-demand streaming reads: metadata and one working
+    // chunk are resident at a time, never the whole file. Shared so each streamed
+    // dataset's chunk provider can pull from the same handle during the write
+    // without an extra open.
+    let file = Arc::new(File::open_streaming(src)?);
 
     // Normalize the drop set to canonical slash-free paths and remember which
     // ones actually match, so an unmatched drop can be reported as an error.

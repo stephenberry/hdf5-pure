@@ -149,27 +149,25 @@ pub(crate) fn classify_datatype(dt: &crate::datatype::Datatype) -> DType {
 /// `base_address` is the file-level userblock offset — needed so that
 /// variable-length attribute data (stored in global heap collections with
 /// addresses relative to the base) can be located correctly.
-pub(crate) fn attrs_to_map(
+pub(crate) fn attrs_to_map<S: crate::source::FileSource + ?Sized>(
     attrs: &[crate::attribute::AttributeMessage],
-    file_data: &[u8],
+    source: &S,
     offset_size: u8,
     length_size: u8,
     base_address: u64,
 ) -> HashMap<std::string::String, AttrValue> {
     let mut map = HashMap::new();
     for attr in attrs {
-        if let Some(val) =
-            decode_attr_value(attr, file_data, offset_size, length_size, base_address)
-        {
+        if let Some(val) = decode_attr_value(attr, source, offset_size, length_size, base_address) {
             map.insert(attr.name.clone(), val);
         }
     }
     map
 }
 
-fn decode_attr_value(
+fn decode_attr_value<S: crate::source::FileSource + ?Sized>(
     attr: &crate::attribute::AttributeMessage,
-    file_data: &[u8],
+    source: &S,
     offset_size: u8,
     length_size: u8,
     base_address: u64,
@@ -227,15 +225,16 @@ fn decode_attr_value(
             //   - is_string: true             — H5T_STRING{STRSIZE=VAR}
             //   - VLEN of H5T_STRING{SIZE=1}  — what matio / MATLAB emit
             //
-            // Patch collection addresses to absolute by adding
-            // base_address, then delegate to the VL string reader.
-            let patched = rebase_vl_refs(&attr.raw_data, offset_size, base_address);
-            let strings = crate::vl_data::read_vl_strings(
-                file_data,
-                &patched,
+            // The reader resolves each element from the global heap, adding
+            // `base_address` to the (relative) collection addresses.
+            let strings = crate::vl_data::read_vl_strings_from_source(
+                source,
+                &attr.raw_data,
                 attr.dataspace.num_elements(),
                 offset_size,
                 length_size,
+                base_address,
+                crate::vl_data::VlenStringReadOptions::default(),
             )
             .ok()?;
             if strings.len() == 1 {
@@ -262,63 +261,4 @@ fn is_ascii_char_vlen_base(base: &crate::datatype::Datatype) -> bool {
             ..
         }
     )
-}
-
-/// Copy `raw_data` and add `base_address` to each VL reference's
-/// `collection_address` field. The VL reference layout is
-/// `length(4) + address(offset_size) + index(4)` repeated per element.
-fn rebase_vl_refs(raw_data: &[u8], offset_size: u8, base_address: u64) -> Vec<u8> {
-    if base_address == 0 {
-        return raw_data.to_vec();
-    }
-    let elem_size = 4 + offset_size as usize + 4;
-    let mut out = raw_data.to_vec();
-    let mut pos = 0;
-    while pos + elem_size <= out.len() {
-        let addr_start = pos + 4;
-        let addr_end = addr_start + offset_size as usize;
-        let addr = match offset_size {
-            2 => u16::from_le_bytes([out[addr_start], out[addr_start + 1]]) as u64,
-            4 => u32::from_le_bytes([
-                out[addr_start],
-                out[addr_start + 1],
-                out[addr_start + 2],
-                out[addr_start + 3],
-            ]) as u64,
-            8 => u64::from_le_bytes([
-                out[addr_start],
-                out[addr_start + 1],
-                out[addr_start + 2],
-                out[addr_start + 3],
-                out[addr_start + 4],
-                out[addr_start + 5],
-                out[addr_start + 6],
-                out[addr_start + 7],
-            ]),
-            _ => return raw_data.to_vec(),
-        };
-        // Leave undefined/null addresses alone.
-        let is_undef = match offset_size {
-            2 => addr == 0xFFFF,
-            4 => addr == 0xFFFF_FFFF,
-            8 => addr == 0xFFFF_FFFF_FFFF_FFFF,
-            _ => false,
-        };
-        if !is_undef && addr != 0 {
-            let new_addr = addr + base_address;
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "each arm narrows to offset_size, the on-disk address width this \
-                          file uses to store the address being relocated"
-            )]
-            match offset_size {
-                2 => out[addr_start..addr_end].copy_from_slice(&(new_addr as u16).to_le_bytes()),
-                4 => out[addr_start..addr_end].copy_from_slice(&(new_addr as u32).to_le_bytes()),
-                8 => out[addr_start..addr_end].copy_from_slice(&new_addr.to_le_bytes()),
-                _ => {}
-            }
-        }
-        pos += elem_size;
-    }
-    out
 }
