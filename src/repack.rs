@@ -107,10 +107,15 @@ impl RepackOptions {
 ///
 /// Reads every object of `src` not excluded by [`RepackOptions::drop`] and
 /// writes them into a fresh, compact file at `dst`. On success `dst` is a normal
-/// HDF5 file holding exactly the surviving objects with no dead space. On any
-/// [`Error::RepackUnsupported`] (an object that cannot be reproduced faithfully,
-/// or a drop path that does not exist) nothing is written to `dst`: the entire
-/// source is validated and staged in memory before the first byte is committed.
+/// HDF5 file holding exactly the surviving objects with no dead space.
+///
+/// The fidelity checks run first: every object is validated while the output is
+/// staged, so an [`Error::RepackUnsupported`] (an object that cannot be
+/// reproduced faithfully, or a drop path that does not exist) is reported before
+/// any byte is written to `dst`. Dataset *chunk bytes*, by contrast, are streamed
+/// from `src` to `dst` during the write rather than buffered, so an I/O error
+/// reading the source or writing the destination partway through can leave a
+/// partial `dst` (remove it and retry).
 ///
 /// See the [module documentation](self) for the exact fidelity contract.
 pub fn repack<P: AsRef<Path>, Q: AsRef<Path>>(

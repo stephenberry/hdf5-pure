@@ -56,8 +56,10 @@ impl FileBuilder {
     }
 
     /// Set the userblock size in bytes. Must be a power of two >= 512 or 0 (no userblock).
-    /// The userblock region is filled with zeros. After calling `finish()`, write your
-    /// userblock data into `bytes[0..size]`.
+    /// The userblock region is filled with zeros. With the buffered [`finish`](Self::finish),
+    /// write your userblock data into `bytes[0..size]` afterwards; the streaming
+    /// [`finish_to`](Self::finish_to) / [`write`](Self::write) emit the zero-filled region
+    /// directly, so overwrite the file's first `size` bytes after the write instead.
     pub fn with_userblock(&mut self, size: u64) -> &mut Self {
         self.writer.with_userblock(size);
         self
@@ -224,20 +226,20 @@ mod streaming_tests {
     /// A test [`ChunkProvider`] serving fixed in-memory chunk bytes, recording
     /// the order of `chunk_bytes` calls so a test can assert the streaming
     /// writer pulls each chunk exactly once, in ascending slot order. With
-    /// `short` set, slot 0 returns one byte fewer than planned (size-mismatch).
-    /// `Arc<Mutex<_>>` (not `Rc<RefCell<_>>`) keeps it `Send + Sync`, as the
-    /// `ChunkProvider` supertrait requires.
+    /// `short_slot` set, that one slot returns one byte fewer than planned
+    /// (size-mismatch). `Arc<Mutex<_>>` (not `Rc<RefCell<_>>`) keeps it
+    /// `Send + Sync`, as the `ChunkProvider` supertrait requires.
     struct MemProvider {
         chunks: Vec<Vec<u8>>,
         calls: Calls,
-        short: bool,
+        short_slot: Option<usize>,
     }
 
     impl ChunkProvider for MemProvider {
         fn chunk_bytes(&self, index: usize) -> Result<Vec<u8>, FormatError> {
             self.calls.lock().unwrap().push(index);
             let mut bytes = self.chunks[index].clone();
-            if self.short && index == 0 {
+            if self.short_slot == Some(index) {
                 bytes.pop();
             }
             Ok(bytes)
@@ -252,31 +254,36 @@ mod streaming_tests {
         v
     }
 
-    /// Build a file with one lazily-streamed, unfiltered chunked f64 dataset.
-    /// Unfiltered means the "compressed" bytes are the raw element bytes, so the
-    /// produced file is a plain chunked f64 dataset that reads back.
-    fn build_lazy(
-        chunk_bytes: Vec<Vec<u8>>,
-        dims: &[u64],
-        chunk_dims: &[u64],
-        maxshape: Option<&[u64]>,
-        calls: Calls,
-        short: bool,
-    ) -> FileBuilder {
-        let meta: Vec<ChunkMeta> = chunk_bytes
+    fn meta_of(chunk_bytes: &[Vec<u8>]) -> Vec<ChunkMeta> {
+        chunk_bytes
             .iter()
             .map(|c| ChunkMeta {
                 compressed_size: c.len() as u64,
                 filter_mask: 0,
             })
-            .collect();
+            .collect()
+    }
+
+    /// Stage one lazily-streamed, unfiltered chunked f64 dataset named `name` on
+    /// `b`. Unfiltered means the "compressed" bytes are the raw element bytes, so
+    /// the produced file is a plain chunked f64 dataset that reads back.
+    fn stage_lazy(
+        b: &mut FileBuilder,
+        name: &str,
+        chunk_bytes: Vec<Vec<u8>>,
+        dims: &[u64],
+        chunk_dims: &[u64],
+        maxshape: Option<&[u64]>,
+        calls: Calls,
+        short_slot: Option<usize>,
+    ) {
+        let meta = meta_of(&chunk_bytes);
         let provider = MemProvider {
             chunks: chunk_bytes,
             calls,
-            short,
+            short_slot,
         };
-        let mut b = FileBuilder::new();
-        b.create_dataset("d").with_raw_chunks_lazy(
+        b.create_dataset(name).with_raw_chunks_lazy(
             crate::type_builders::make_f64_type(),
             dims,
             maxshape,
@@ -286,12 +293,34 @@ mod streaming_tests {
             meta,
             Box::new(provider),
         );
+    }
+
+    /// Build a file with one lazily-streamed chunked f64 dataset named `d`.
+    fn build_lazy(
+        chunk_bytes: Vec<Vec<u8>>,
+        dims: &[u64],
+        chunk_dims: &[u64],
+        maxshape: Option<&[u64]>,
+        calls: Calls,
+        short_slot: Option<usize>,
+    ) -> FileBuilder {
+        let mut b = FileBuilder::new();
+        stage_lazy(
+            &mut b,
+            "d",
+            chunk_bytes,
+            dims,
+            chunk_dims,
+            maxshape,
+            calls,
+            short_slot,
+        );
         b
     }
 
-    fn read_back_f64(bytes: Vec<u8>) -> Vec<f64> {
-        let file = crate::reader::File::from_bytes(bytes).unwrap();
-        let raw = file.dataset("d").unwrap().read_raw().unwrap();
+    fn read_back_f64(bytes: &[u8], path: &str) -> Vec<f64> {
+        let file = crate::reader::File::from_bytes(bytes.to_vec()).unwrap();
+        let raw = file.dataset(path).unwrap().read_raw().unwrap();
         raw.chunks_exact(8)
             .map(|b| f64::from_le_bytes(b.try_into().unwrap()))
             .collect()
@@ -306,13 +335,13 @@ mod streaming_tests {
         ];
 
         let calls_buf = Arc::new(Mutex::new(Vec::new()));
-        let buffered = build_lazy(chunks.clone(), &[6], &[2], None, calls_buf.clone(), false)
+        let buffered = build_lazy(chunks.clone(), &[6], &[2], None, calls_buf.clone(), None)
             .finish()
             .unwrap();
 
         let calls_str = Arc::new(Mutex::new(Vec::new()));
         let mut streamed = Vec::new();
-        build_lazy(chunks.clone(), &[6], &[2], None, calls_str.clone(), false)
+        build_lazy(chunks.clone(), &[6], &[2], None, calls_str.clone(), None)
             .finish_to(&mut streamed)
             .unwrap();
 
@@ -327,7 +356,10 @@ mod streaming_tests {
         assert_eq!(*calls_buf.lock().unwrap(), vec![0, 1, 2]);
         assert_eq!(*calls_str.lock().unwrap(), vec![0, 1, 2]);
         // And the file reads back to the original values.
-        assert_eq!(read_back_f64(buffered), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(
+            read_back_f64(&buffered, "d"),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        );
     }
 
     #[test]
@@ -346,26 +378,33 @@ mod streaming_tests {
 
     #[test]
     fn streaming_writer_rejects_provider_size_mismatch() {
-        let chunks = vec![f64_chunk(&[1.0, 2.0]), f64_chunk(&[3.0, 4.0])];
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        // `short` makes slot 0's provider return fewer bytes than the planned
-        // size; the emitter must reject the desync rather than write a corrupt file.
-        let err = build_lazy(chunks, &[4], &[2], None, calls, true)
-            .finish()
-            .unwrap_err();
-        match err {
-            Error::Format(FormatError::ChunkedReadError(_)) => {}
-            other => panic!("expected ChunkedReadError, got {other:?}"),
+        // A provider returning fewer bytes than planned — on slot 0 *or* any later
+        // slot — must be rejected rather than written as a corrupt file.
+        for short_slot in [0usize, 2] {
+            let chunks = vec![
+                f64_chunk(&[1.0, 2.0]),
+                f64_chunk(&[3.0, 4.0]),
+                f64_chunk(&[5.0, 6.0]),
+            ];
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let err = build_lazy(chunks, &[6], &[2], None, calls, Some(short_slot))
+                .finish()
+                .unwrap_err();
+            match err {
+                Error::Format(FormatError::ChunkedReadError(_)) => {}
+                other => panic!("slot {short_slot}: expected ChunkedReadError, got {other:?}"),
+            }
         }
     }
 
-    /// Assert the buffered and streamed outputs are byte-identical for one
-    /// chunked layout, and that the produced file reads back.
+    /// Assert the buffered and streamed outputs are byte-identical for one chunked
+    /// layout, and that the produced file reads back to `expected`.
     fn assert_variant_streams_identically(
         chunks: Vec<Vec<u8>>,
         dims: &[u64],
         chunk_dims: &[u64],
         maxshape: Option<&[u64]>,
+        expected: &[f64],
     ) {
         let buffered = build_lazy(
             chunks.clone(),
@@ -373,7 +412,7 @@ mod streaming_tests {
             chunk_dims,
             maxshape,
             Arc::new(Mutex::new(Vec::new())),
-            false,
+            None,
         )
         .finish()
         .unwrap();
@@ -384,7 +423,7 @@ mod streaming_tests {
             chunk_dims,
             maxshape,
             Arc::new(Mutex::new(Vec::new())),
-            false,
+            None,
         )
         .finish_to(&mut streamed)
         .unwrap();
@@ -392,15 +431,26 @@ mod streaming_tests {
             buffered, streamed,
             "index variant dims={dims:?} chunk={chunk_dims:?} must stream identically"
         );
-        // Sanity: the produced file reads back.
-        let _ = read_back_f64(buffered);
+        // The streamed file decodes to the expected values (not merely parses).
+        assert_eq!(
+            read_back_f64(&buffered, "d"),
+            expected,
+            "index variant dims={dims:?} chunk={chunk_dims:?} must read back correctly"
+        );
     }
 
     #[test]
     fn streamed_equals_buffered_across_index_variants() {
         // single-chunk, fixed-array (>1 chunk), and extensible-array (unlimited
-        // max shape) all lay out from sizes alone, so each must stream identically.
-        assert_variant_streams_identically(vec![f64_chunk(&[1.0, 2.0])], &[2], &[2], None);
+        // max shape) all lay out from sizes alone, so each must stream identically
+        // and read back to the right values.
+        assert_variant_streams_identically(
+            vec![f64_chunk(&[1.0, 2.0])],
+            &[2],
+            &[2],
+            None,
+            &[1.0, 2.0],
+        );
         assert_variant_streams_identically(
             (0..5)
                 .map(|i| f64_chunk(&[i as f64, i as f64 + 0.5]))
@@ -408,12 +458,102 @@ mod streaming_tests {
             &[10],
             &[2],
             None,
+            &[0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5],
         );
         assert_variant_streams_identically(
             vec![f64_chunk(&[1.0, 2.0]), f64_chunk(&[3.0, 4.0])],
             &[4],
             &[2],
             Some(&[u64::MAX]),
+            &[1.0, 2.0, 3.0, 4.0],
         );
+    }
+
+    /// A `Write` that accepts `limit` bytes total, then fails every later write —
+    /// to exercise the streaming I/O-error path.
+    struct FailAfter {
+        remaining: usize,
+    }
+    impl Write for FailAfter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::Error::other("write limit reached"));
+            }
+            let n = buf.len().min(self.remaining);
+            self.remaining -= n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn streaming_io_error_surfaces_as_error_io() {
+        // A dataset large enough to exceed the internal BufWriter so writes occur
+        // mid-stream; the sink fails partway and `finish_to` must surface it as
+        // `Error::Io`, not a format error or a panic.
+        let chunks: Vec<Vec<u8>> = (0..12).map(|_| f64_chunk(&[1.0; 256])).collect(); // 12 * 2 KiB
+        let builder = build_lazy(
+            chunks,
+            &[3072],
+            &[256],
+            None,
+            Arc::new(Mutex::new(Vec::new())),
+            None,
+        );
+        let err = builder
+            .finish_to(FailAfter { remaining: 4096 })
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Io(_)),
+            "a failing sink must surface as Error::Io, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn streamed_dataset_with_attribute_and_contiguous_sibling() {
+        // One file mixing a streamed (lazy chunked) dataset that also carries an
+        // attribute, a plain contiguous dataset, and a zero-element contiguous
+        // dataset — exercising the assembly loop's InMemory + Streamed dispatch and
+        // attribute handling together. Buffered and streamed must agree and read
+        // back.
+        let build = || {
+            let chunks = vec![f64_chunk(&[1.0, 2.0]), f64_chunk(&[3.0, 4.0])];
+            let meta = meta_of(&chunks);
+            let provider = MemProvider {
+                chunks,
+                calls: Arc::new(Mutex::new(Vec::new())),
+                short_slot: None,
+            };
+            let mut b = FileBuilder::new();
+            // Configure the one streamed dataset and its attribute on the same
+            // builder (a second `create_dataset` would add a *different* dataset).
+            b.create_dataset("chunked")
+                .with_raw_chunks_lazy(
+                    crate::type_builders::make_f64_type(),
+                    &[4],
+                    None,
+                    &[2],
+                    8,
+                    None,
+                    meta,
+                    Box::new(provider),
+                )
+                .set_attr("units", AttrValue::I64(7));
+            b.create_dataset("contig")
+                .with_f64_data(&[10.0, 11.0, 12.0]);
+            b.create_dataset("empty").with_f64_data(&[]);
+            b
+        };
+        let buffered = build().finish().unwrap();
+        let mut streamed = Vec::new();
+        build().finish_to(&mut streamed).unwrap();
+        assert_eq!(buffered, streamed, "mixed file must stream identically");
+        assert_eq!(
+            read_back_f64(&buffered, "chunked"),
+            vec![1.0, 2.0, 3.0, 4.0]
+        );
+        assert_eq!(read_back_f64(&buffered, "contig"), vec![10.0, 11.0, 12.0]);
     }
 }

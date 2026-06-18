@@ -1280,6 +1280,10 @@ impl FileWriter {
         // eof_address is absolute file size (includes userblock + GCOLs + ext)
         let eof_addr2 = (ub + cursor2 + gcol_total_size + ext_len) as u64;
 
+        // Let a buffered (Vec) sink preallocate the whole file up front, as the
+        // writer did before streaming; a streaming sink ignores this.
+        sink.reserve(eof_addr2.to_usize()?);
+
         // Userblock: prepend zeros
         if ub > 0 {
             sink.put_zeros(ub)?;
