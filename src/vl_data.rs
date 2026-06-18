@@ -11,7 +11,9 @@ use crate::convert::{TryToUsize, is_undefined_addr};
 use crate::datatype::{CharacterSet, Datatype};
 use crate::error::FormatError;
 use crate::global_heap::GlobalHeapIndex;
-use crate::source::{BytesSource, FileSource};
+#[cfg(test)]
+use crate::source::BytesSource;
+use crate::source::FileSource;
 
 /// Allocation limits for reading variable-length strings.
 ///
@@ -412,7 +414,11 @@ pub(crate) fn read_vl_byte_objects_from_source<S: FileSource + ?Sized>(
     Ok(objects)
 }
 
-/// Resolve VL strings from raw data by looking up each element in the global heap.
+/// Resolve VL strings from an in-memory buffer by looking up each element in the
+/// global heap. A thin convenience wrapper over
+/// [`read_vl_strings_from_source`] used by the unit tests; production callers go
+/// straight to the source-based reader so a streaming backend works unchanged.
+#[cfg(test)]
 pub fn read_vl_strings(
     file_data: &[u8],
     raw_data: &[u8],

@@ -88,6 +88,57 @@ fn pure_compaction_preserves_everything() {
 }
 
 #[test]
+fn repacks_v1_symbol_table_source_with_attributes() {
+    // `attrs.h5` is an older-format file (v0 superblock => v1 symbol-table
+    // groups) carrying compact attributes. Repack now opens the source via the
+    // streaming backend, so this drives v1 group traversal and compact attribute
+    // reads end to end through the repack entry point (issues #82 / #27).
+    let dst = tmp("hdf5_pure_repack_v1_attrs_dst.h5");
+    let src = "tests/fixtures/attrs.h5";
+
+    let source = hdf5_pure::File::open(src).unwrap();
+    let src_data = source.dataset("data").unwrap().read_f64().unwrap();
+    let src_data_attrs = source.dataset("data").unwrap().attrs().unwrap();
+    let src_root_attrs = source.root().attrs().unwrap();
+    assert!(!src_data_attrs.is_empty() && !src_root_attrs.is_empty());
+
+    repack(src, &dst, &RepackOptions::new()).unwrap();
+
+    let f = hdf5_pure::File::open(&dst).unwrap();
+    assert_eq!(f.dataset("data").unwrap().read_f64().unwrap(), src_data);
+    assert_eq!(f.dataset("data").unwrap().attrs().unwrap(), src_data_attrs);
+    assert_eq!(f.root().attrs().unwrap(), src_root_attrs);
+
+    std::fs::remove_file(&dst).ok();
+}
+
+#[test]
+fn repacks_v1_nested_symbol_table_groups() {
+    // `two_groups.h5` has v1 symbol-table groups nested under the root. Repacking
+    // it exercises the streaming v1 B-tree/local-heap/SNOD traversal across
+    // multiple groups and preserves the full subtree.
+    let dst = tmp("hdf5_pure_repack_v1_groups_dst.h5");
+    let src = "tests/fixtures/two_groups.h5";
+
+    repack(src, &dst, &RepackOptions::new()).unwrap();
+
+    let f = hdf5_pure::File::open(&dst).unwrap();
+    let mut groups = f.root().groups().unwrap();
+    groups.sort();
+    assert_eq!(groups, vec!["group1".to_string(), "group2".to_string()]);
+    assert_eq!(
+        f.dataset("group1/values").unwrap().read_i32().unwrap(),
+        vec![10, 20, 30]
+    );
+    assert_eq!(
+        f.group("group2").unwrap().datasets().unwrap(),
+        vec!["temps".to_string()]
+    );
+
+    std::fs::remove_file(&dst).ok();
+}
+
+#[test]
 fn carries_dataset_attributes() {
     let src = tmp("hdf5_pure_repack_dsattr_src.h5");
     let dst = tmp("hdf5_pure_repack_dsattr_dst.h5");

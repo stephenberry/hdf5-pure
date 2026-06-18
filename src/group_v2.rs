@@ -272,7 +272,7 @@ pub fn resolve_path_any_from_source<S: FileSource + ?Sized>(
         ObjectHeader::parse_from_source(source, superblock.root_group_address, os, ls, base)?;
 
     for (i, component) in components.iter().enumerate() {
-        let entries = resolve_group_entries_from_source(source, &current_header, os, ls)?;
+        let entries = resolve_group_entries_from_source(source, &current_header, os, ls, base)?;
         match entries.iter().find(|e| e.name == *component) {
             Some(entry) => {
                 let abs_addr = entry.object_header_address + base;
@@ -290,17 +290,31 @@ pub fn resolve_path_any_from_source<S: FileSource + ?Sized>(
     Ok(current_addr)
 }
 
-/// Streaming counterpart of [`resolve_group_entries`] (v2 groups only).
+/// Streaming counterpart of [`resolve_group_entries`], auto-detecting v1 vs v2.
+///
+/// `base_address` is the superblock base address, used to convert the relative
+/// addresses stored in v1 (symbol-table) groups to absolute file offsets.
 pub fn resolve_group_entries_from_source<S: FileSource + ?Sized>(
     source: &S,
     object_header: &ObjectHeader,
     offset_size: u8,
     length_size: u8,
+    base_address: u64,
 ) -> Result<Vec<GroupEntry>, FormatError> {
     if is_v1_group(object_header) {
-        Err(FormatError::PathNotFound(String::from(
-            "v1 (symbol-table) groups are not yet supported by the streaming reader",
-        )))
+        let sym_msg = object_header
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::SymbolTable)
+            .ok_or_else(|| FormatError::PathNotFound(String::from("no symbol table message")))?;
+        let stm = SymbolTableMessage::parse(&sym_msg.data, offset_size)?;
+        group_v1::resolve_v1_group_entries_from_source(
+            source,
+            &stm,
+            offset_size,
+            length_size,
+            base_address,
+        )
     } else if is_v2_group(object_header) {
         resolve_v2_group_entries_from_source(source, object_header, offset_size, length_size)
     } else {

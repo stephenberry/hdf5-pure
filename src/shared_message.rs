@@ -18,6 +18,7 @@ use crate::convert::TryToUsize;
 use crate::error::FormatError;
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
+use crate::source::FileSource;
 
 /// Fractal heap ID length for SOHM entries (fixed at 8 bytes).
 const FHEAP_ID_LEN: usize = 8;
@@ -149,42 +150,79 @@ pub fn resolve_shared_message(
 ) -> Result<Vec<u8>, FormatError> {
     match shared_ref.ref_type {
         1 | 3 => {
-            let addr = shared_ref
-                .object_header_address
-                .ok_or(FormatError::UnexpectedEof {
-                    expected: 1,
-                    available: 0,
-                })?;
+            let addr = shared_object_header_address(shared_ref)?;
             let target_header =
                 ObjectHeader::parse(file_data, addr.to_usize()?, offset_size, length_size)?;
-            for msg in &target_header.messages {
-                if msg.msg_type == target_msg_type && !is_shared(msg.flags) {
-                    return Ok(msg.data.clone());
-                }
-            }
-            // The message at that OH address is the message itself
-            // In many cases with type 1, the entire OH at that address IS the shared message
-            // Try returning the first message of any type that isn't Nil
-            for msg in &target_header.messages {
-                if msg.msg_type == target_msg_type {
-                    return Ok(msg.data.clone());
-                }
-            }
-            // Fall back to first non-nil message
-            for msg in &target_header.messages {
-                if msg.msg_type != MessageType::Nil {
-                    return Ok(msg.data.clone());
-                }
-            }
-            Err(FormatError::UnexpectedEof {
-                expected: 1,
-                available: 0,
-            })
+            select_shared_message(&target_header, target_msg_type)
         }
         _ => Err(FormatError::InvalidSharedMessageVersion(
             shared_ref.ref_type,
         )),
     }
+}
+
+/// Streaming counterpart of [`resolve_shared_message`]: reads the target object
+/// header from a [`FileSource`] on demand instead of indexing a whole-file slice.
+pub fn resolve_shared_message_from_source<S: FileSource + ?Sized>(
+    source: &S,
+    shared_ref: &SharedMessageRef,
+    target_msg_type: MessageType,
+    offset_size: u8,
+    length_size: u8,
+) -> Result<Vec<u8>, FormatError> {
+    match shared_ref.ref_type {
+        1 | 3 => {
+            let addr = shared_object_header_address(shared_ref)?;
+            // base_address 0 matches the buffered path's `ObjectHeader::parse`,
+            // which treats the shared-message address as absolute.
+            let target_header =
+                ObjectHeader::parse_from_source(source, addr, offset_size, length_size, 0)?;
+            select_shared_message(&target_header, target_msg_type)
+        }
+        _ => Err(FormatError::InvalidSharedMessageVersion(
+            shared_ref.ref_type,
+        )),
+    }
+}
+
+/// Address of the object header holding a type 1/3 shared message.
+fn shared_object_header_address(shared_ref: &SharedMessageRef) -> Result<u64, FormatError> {
+    shared_ref
+        .object_header_address
+        .ok_or(FormatError::UnexpectedEof {
+            expected: 1,
+            available: 0,
+        })
+}
+
+/// Pick the message of `target_msg_type` out of a resolved target object header.
+///
+/// Prefers a non-shared message of the requested type; falls back to a shared
+/// one of that type, then to the first non-Nil message (with type 1 references
+/// the whole target object header often *is* the shared message).
+fn select_shared_message(
+    target_header: &ObjectHeader,
+    target_msg_type: MessageType,
+) -> Result<Vec<u8>, FormatError> {
+    for msg in &target_header.messages {
+        if msg.msg_type == target_msg_type && !is_shared(msg.flags) {
+            return Ok(msg.data.clone());
+        }
+    }
+    for msg in &target_header.messages {
+        if msg.msg_type == target_msg_type {
+            return Ok(msg.data.clone());
+        }
+    }
+    for msg in &target_header.messages {
+        if msg.msg_type != MessageType::Nil {
+            return Ok(msg.data.clone());
+        }
+    }
+    Err(FormatError::UnexpectedEof {
+        expected: 1,
+        available: 0,
+    })
 }
 
 #[cfg(test)]

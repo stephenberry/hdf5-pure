@@ -4,6 +4,7 @@
 use alloc::vec::Vec;
 
 use crate::error::FormatError;
+use crate::source::FileSource;
 
 /// Symbol Table message (type 0x0011) found in v1 group object headers.
 #[derive(Debug, Clone, PartialEq)]
@@ -142,6 +143,33 @@ impl SymbolTableNode {
         }
 
         Ok(SymbolTableNode { entries })
+    }
+
+    /// Parse a Symbol Table Node from a [`FileSource`] on demand.
+    ///
+    /// Reads the 8-byte SNOD header to learn the symbol count, then the exact
+    /// node body, so no more than one node is resident at a time.
+    pub fn parse_from_source<S: FileSource + ?Sized>(
+        source: &S,
+        address: u64,
+        offset_size: u8,
+    ) -> Result<SymbolTableNode, FormatError> {
+        let header = source.read_metadata_at(address, 8)?;
+        if &header[0..4] != b"SNOD" {
+            return Err(FormatError::InvalidSymbolTableNodeSignature);
+        }
+        let version = header[4];
+        if version != 1 {
+            return Err(FormatError::InvalidSymbolTableNodeVersion(version));
+        }
+        let num_symbols = u16::from_le_bytes([header[6], header[7]]) as usize;
+
+        let os = offset_size as usize;
+        // link_name_offset(os) + obj_hdr_addr(os) + cache_type(4) + reserved(4) + scratch(16)
+        let entry_size = os + os + 4 + 4 + 16;
+        let total = 8 + num_symbols * entry_size;
+        let buf = source.read_metadata_at(address, total)?;
+        Self::parse(&buf, 0, offset_size)
     }
 }
 

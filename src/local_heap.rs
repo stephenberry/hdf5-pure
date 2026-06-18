@@ -5,6 +5,7 @@ use alloc::string::String;
 
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
+use crate::source::FileSource;
 
 /// Parsed HDF5 Local Heap header.
 #[derive(Debug, Clone)]
@@ -119,6 +120,60 @@ impl LocalHeap {
         }
 
         let s = core::str::from_utf8(&file_data[str_start..end])
+            .map_err(|_| FormatError::InvalidLocalHeapSignature)?;
+        Ok(String::from(s))
+    }
+
+    /// Parse a local heap header from a [`FileSource`] (small bounded window).
+    pub fn parse_from_source<S: FileSource + ?Sized>(
+        source: &S,
+        address: u64,
+        offset_size: u8,
+        length_size: u8,
+    ) -> Result<LocalHeap, FormatError> {
+        // signature(4) + version(1) + reserved(3) + length_size*2 + offset_size
+        let total = 8 + (length_size as usize) * 2 + offset_size as usize;
+        let buf = source.read_metadata_at(address, total)?;
+        Self::parse(&buf, 0, offset_size, length_size)
+    }
+
+    /// Read a null-terminated string from a pre-fetched copy of the heap's data
+    /// segment (the `data_segment_size` bytes starting at
+    /// [`data_segment_address`](Self::data_segment_address)).
+    ///
+    /// This is the streaming counterpart of [`read_string`](Self::read_string):
+    /// the caller reads the data segment once via [`FileSource`] and slices every
+    /// name out of it, so a group with many links costs one segment read rather
+    /// than one read per name.
+    pub fn read_string_in_segment(
+        &self,
+        segment: &[u8],
+        string_offset: u64,
+    ) -> Result<String, FormatError> {
+        let start = string_offset.to_usize()?;
+        let seg_len = self.data_segment_size.to_usize()?;
+        let search_end = seg_len.min(segment.len());
+
+        if start >= search_end {
+            return Err(FormatError::UnexpectedEof {
+                expected: start + 1,
+                available: search_end,
+            });
+        }
+
+        let mut end = start;
+        while end < search_end && segment[end] != 0 {
+            end += 1;
+        }
+
+        if end >= search_end {
+            return Err(FormatError::UnexpectedEof {
+                expected: end + 1,
+                available: search_end,
+            });
+        }
+
+        let s = core::str::from_utf8(&segment[start..end])
             .map_err(|_| FormatError::InvalidLocalHeapSignature)?;
         Ok(String::from(s))
     }
