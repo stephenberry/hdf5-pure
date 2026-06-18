@@ -6,7 +6,7 @@
 use alloc::{boxed::Box, string::String, string::ToString, vec, vec::Vec};
 
 use crate::attribute::AttributeMessage;
-use crate::chunked_write::{ChunkOptions, VerbatimChunk};
+use crate::chunked_write::{ChunkMeta, ChunkOptions, ChunkProvider};
 use crate::compound::CompoundType;
 use crate::convert::TryToUsize;
 use crate::dataspace::{Dataspace, DataspaceType};
@@ -842,10 +842,12 @@ pub struct ProvenanceConfig {
     pub source: Option<String>,
 }
 
-/// Everything [`DatasetBuilder::with_raw_chunks`] needs to re-emit a chunked
+/// Everything [`DatasetBuilder::with_raw_chunks_lazy`] needs to re-emit a chunked
 /// dataset by copying its source chunks verbatim (no decode/re-encode): the
-/// dense, grid-ordered compressed chunks, the source filter-pipeline message,
-/// and the chunk geometry. Built by repack from a source [`Dataset`].
+/// per-chunk sizes/masks (enough to plan the destination layout without reading
+/// any bytes), a provider that yields each chunk's bytes on demand at write time,
+/// the source filter-pipeline message, and the chunk geometry. Built by repack
+/// from a source [`Dataset`].
 pub(crate) struct RawChunkPayload {
     /// Logical chunk dimensions (rank entries, not the trailing element size).
     pub(crate) chunk_dims: Vec<u64>,
@@ -856,8 +858,19 @@ pub(crate) struct RawChunkPayload {
     pub(crate) raw_size: u64,
     /// The verbatim source `FilterPipeline` message bytes, if the source had one.
     pub(crate) pipeline_message: Option<Vec<u8>>,
-    /// The source chunks in dense row-major chunk-grid order, one per grid slot.
-    pub(crate) chunks: Vec<VerbatimChunk>,
+    /// Per-chunk sizes + filter masks in dense row-major grid order, one per slot.
+    pub(crate) meta: Vec<ChunkMeta>,
+    /// Yields each chunk's compressed bytes on demand during the write, so no
+    /// more than one chunk's bytes are resident. Owns its source (e.g. an
+    /// `Arc<File>`), so it carries no borrowed lifetime.
+    ///
+    /// Wrapped in [`AssertUnwindSafe`](core::panic::AssertUnwindSafe) so the
+    /// boxed trait object does not strip the `UnwindSafe`/`RefUnwindSafe`
+    /// auto-traits from the public builder types that transitively hold it
+    /// (removing an auto-trait impl is a semver break). The assertion is sound:
+    /// the provider performs only immutable reads and leaves no broken state on
+    /// a panic. `ChunkProvider: Send + Sync` keeps the other two auto-traits.
+    pub(crate) provider: core::panic::AssertUnwindSafe<Box<dyn ChunkProvider>>,
 }
 
 /// Builder for datasets.
@@ -1121,18 +1134,23 @@ impl DatasetBuilder {
         self
     }
 
-    /// Stage a chunked dataset whose chunks are copied verbatim from a source
-    /// file, without decoding or re-encoding any chunk.
+    /// Stage a chunked dataset whose chunks are streamed verbatim from a source
+    /// file one at a time, without decoding or re-encoding any chunk and without
+    /// holding more than one chunk's bytes in memory.
     ///
-    /// Repack's verbatim path: `chunks` are the source's already-compressed chunk
-    /// bytes plus their real filter masks, in dense row-major chunk-grid order
-    /// (one per grid slot). `pipeline_message` is the source's `FilterPipeline`
+    /// Repack's out-of-core verbatim path: `meta` is the per-chunk sizes + filter
+    /// masks in dense row-major chunk-grid order (one per slot), and `provider`
+    /// yields each chunk's already-compressed bytes on demand at write time. The
+    /// destination layout is computed from `meta` alone, so the chunks are never
+    /// all resident at once. `pipeline_message` is the source's `FilterPipeline`
     /// message bytes, reused as-is so every filter — including ones this crate
     /// cannot itself apply (ZFP, SZIP, unknown) — is reproduced byte-for-byte.
     /// `dims`/`maxshape`/`chunk_dims`/`element_size` describe the geometry. The
-    /// shape defaults to `dims` and the chunk dimensions to `chunk_dims`.
+    /// shape defaults to `dims` and the chunk dimensions to `chunk_dims`. The
+    /// provider owns its source (e.g. an `Arc<File>`), so this carries no
+    /// borrowed lifetime.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn with_raw_chunks(
+    pub(crate) fn with_raw_chunks_lazy(
         &mut self,
         datatype: Datatype,
         dims: &[u64],
@@ -1140,7 +1158,8 @@ impl DatasetBuilder {
         chunk_dims: &[u64],
         element_size: usize,
         pipeline_message: Option<Vec<u8>>,
-        chunks: Vec<VerbatimChunk>,
+        meta: Vec<ChunkMeta>,
+        provider: Box<dyn ChunkProvider>,
     ) -> &mut Self {
         // Full uncompressed bytes of one chunk (drives the fixed/extensible-array
         // chunk-size encoding width). Saturating arithmetic matches the writer's
@@ -1164,7 +1183,8 @@ impl DatasetBuilder {
             element_size,
             raw_size,
             pipeline_message,
-            chunks,
+            meta,
+            provider: core::panic::AssertUnwindSafe(provider),
         });
         self
     }

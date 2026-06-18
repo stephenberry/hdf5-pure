@@ -1213,20 +1213,6 @@ impl<'f> Dataset<'f> {
         )?)
     }
 
-    /// Read one chunk's still-compressed on-disk bytes — exactly the slice the
-    /// decompressor would consume — without decoding. Mirrors the chunked reader,
-    /// which slices `[address .. address + chunk_size]` directly (no
-    /// `addr_offset` adjustment) before `decompress_chunk`.
-    pub(crate) fn read_chunk_raw(
-        &self,
-        info: &crate::chunked_read::ChunkInfo,
-    ) -> Result<Vec<u8>, Error> {
-        Ok(self
-            .file
-            .source()
-            .read_exact_at(info.address, info.chunk_size as usize)?)
-    }
-
     /// The raw `FilterPipeline` message bytes from this dataset's object header,
     /// if it has one. Repack reuses this verbatim so that every filter — including
     /// ones this crate cannot itself apply (ZFP, SZIP, unknown) — is reproduced

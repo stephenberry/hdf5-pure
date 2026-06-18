@@ -59,17 +59,20 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
+use std::sync::Arc;
 
-use crate::chunked_write::VerbatimChunk;
+use crate::chunked_read::ChunkInfo;
+use crate::chunked_write::{ChunkMeta, ChunkProvider};
 use crate::convert::TryToUsize;
 use crate::data_layout::DataLayout;
 use crate::datatype::Datatype;
-use crate::error::Error;
+use crate::error::{Error, FormatError};
 use crate::filter_pipeline::{
     FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SCALEOFFSET, FILTER_SHUFFLE, FilterPipeline,
 };
 use crate::reader::{Dataset, File, Group};
 use crate::scaleoffset::{self, ScaleOffset};
+use crate::source::FileSource;
 use crate::type_builders::{
     AttrValue, DatasetBuilder, FinishedGroup, GroupBuilder, VlStringElement,
 };
@@ -104,10 +107,15 @@ impl RepackOptions {
 ///
 /// Reads every object of `src` not excluded by [`RepackOptions::drop`] and
 /// writes them into a fresh, compact file at `dst`. On success `dst` is a normal
-/// HDF5 file holding exactly the surviving objects with no dead space. On any
-/// [`Error::RepackUnsupported`] (an object that cannot be reproduced faithfully,
-/// or a drop path that does not exist) nothing is written to `dst`: the entire
-/// source is validated and staged in memory before the first byte is committed.
+/// HDF5 file holding exactly the surviving objects with no dead space.
+///
+/// The fidelity checks run first: every object is validated while the output is
+/// staged, so an [`Error::RepackUnsupported`] (an object that cannot be
+/// reproduced faithfully, or a drop path that does not exist) is reported before
+/// any byte is written to `dst`. Dataset *chunk bytes*, by contrast, are streamed
+/// from `src` to `dst` during the write rather than buffered, so an I/O error
+/// reading the source or writing the destination partway through can leave a
+/// partial `dst` (remove it and retry).
 ///
 /// See the [module documentation](self) for the exact fidelity contract.
 pub fn repack<P: AsRef<Path>, Q: AsRef<Path>>(
@@ -115,7 +123,9 @@ pub fn repack<P: AsRef<Path>, Q: AsRef<Path>>(
     dst: Q,
     options: &RepackOptions,
 ) -> Result<(), Error> {
-    let file = File::open(src)?;
+    // Shared so each streamed dataset's chunk provider can pull from the source
+    // during the write without an extra open; the source is read on demand.
+    let file = Arc::new(File::open(src)?);
 
     // Normalize the drop set to canonical slash-free paths and remember which
     // ones actually match, so an unmatched drop can be reported as an error.
@@ -133,7 +143,7 @@ pub fn repack<P: AsRef<Path>, Q: AsRef<Path>>(
             .with_file_space_page_size(info.page_size);
     }
     let root = file.root();
-    populate(&mut builder, &root, "", &drop, &mut matched)?;
+    populate(&mut builder, &root, "", &drop, &mut matched, &file)?;
 
     // Every requested drop must have named a real object.
     if let Some(missing) = drop.iter().find(|d| !matched.contains(*d)) {
@@ -188,6 +198,7 @@ fn populate<S: GroupSink>(
     path: &str,
     drop: &BTreeSet<String>,
     matched: &mut BTreeSet<String>,
+    file: &Arc<File>,
 ) -> Result<(), Error> {
     // Attributes, in name order for a deterministic output. Refuse if any
     // attribute on this group cannot be represented (and would be dropped).
@@ -212,7 +223,7 @@ fn populate<S: GroupSink>(
             continue;
         }
         let ds = src.dataset(&name)?;
-        emit_dataset(sink.sink_dataset(&name), &ds, &child_path)?;
+        emit_dataset(sink.sink_dataset(&name), &ds, &child_path, file)?;
     }
 
     // Subgroups, sorted by name; built depth-first into a FinishedGroup.
@@ -226,7 +237,7 @@ fn populate<S: GroupSink>(
         }
         let child = src.group(&name)?;
         let mut gb = GroupBuilder::new(&name);
-        populate(&mut gb, &child, &child_path, drop, matched)?;
+        populate(&mut gb, &child, &child_path, drop, matched, file)?;
         sink.sink_add_group(gb.finish());
     }
     Ok(())
@@ -234,7 +245,12 @@ fn populate<S: GroupSink>(
 
 /// Capture one dataset's full description and stage it on `db`, or fail with a
 /// named [`Error::RepackUnsupported`] if any part cannot be reproduced.
-fn emit_dataset(db: &mut DatasetBuilder, ds: &Dataset, path: &str) -> Result<(), Error> {
+fn emit_dataset(
+    db: &mut DatasetBuilder,
+    ds: &Dataset,
+    path: &str,
+    file: &Arc<File>,
+) -> Result<(), Error> {
     let datatype = ds.datatype()?;
     let dataspace = ds.dataspace()?;
     let layout = ds.data_layout()?;
@@ -282,21 +298,31 @@ fn emit_dataset(db: &mut DatasetBuilder, ds: &Dataset, path: &str) -> Result<(),
             .map(|&c| c as u64)
             .collect();
 
-        if let Some(verbatim) = try_collect_dense_chunks(ds, &dims, &chunk_dims)? {
+        if let Some(DenseChunkPlan { meta, grid_order }) =
+            try_plan_dense_chunks(ds, &dims, &chunk_dims)?
+        {
             let maxshape = dataspace
                 .max_dimensions
                 .as_ref()
                 .filter(|ms| *ms != &dims)
                 .map(|ms| ms.as_slice());
             let elem_size = datatype.type_size() as usize;
-            db.with_raw_chunks(
+            // Stream the chunks from the source at write time rather than reading
+            // them all now: the provider holds an `Arc<File>` and fetches one
+            // chunk at a time, so a huge dataset never sits in memory.
+            let provider = DatasetChunkProvider {
+                file: Arc::clone(file),
+                grid_order,
+            };
+            db.with_raw_chunks_lazy(
                 datatype,
                 &dims,
                 maxshape,
                 &chunk_dims,
                 elem_size,
                 ds.filter_pipeline_message_bytes(),
-                verbatim,
+                meta,
+                Box::new(provider),
             );
 
             // Carry the dataset's attributes, refusing any that cannot be
@@ -445,20 +471,52 @@ fn emit_vlen_string_dataset(
     Ok(())
 }
 
-/// Enumerate a chunked dataset's chunks and, if every chunk-grid slot is present
-/// exactly once (a dense grid), return its chunks in dense row-major grid order
-/// for the verbatim copy path. Returns `Ok(None)` when the grid has holes
-/// (a sparse dataset), so the caller can fall back to the read-raw path.
+/// A [`ChunkProvider`] that streams a dense chunked dataset's chunks from the
+/// source file one at a time during the write, so repack never holds more than a
+/// single chunk's bytes. Holds an `Arc<File>` (so it owns its source with no
+/// borrowed lifetime) and the source [`ChunkInfo`] for each grid slot.
+struct DatasetChunkProvider {
+    file: Arc<File>,
+    /// Source chunk descriptors in dense row-major grid order, one per slot.
+    grid_order: Vec<ChunkInfo>,
+}
+
+impl ChunkProvider for DatasetChunkProvider {
+    fn chunk_bytes(&self, index: usize) -> Result<Vec<u8>, FormatError> {
+        // Read exactly the chunk's compressed bytes at its recorded address, with
+        // no decode and no `addr_offset` adjustment — the same slice the chunked
+        // reader consumes. `read_exact_at` returns exactly `chunk_size` bytes or
+        // errors, and the emitter additionally checks the length against the
+        // planned size, so the layout cannot silently desync from the data.
+        let info = &self.grid_order[index];
+        self.file
+            .source()
+            .read_exact_at(info.address, info.chunk_size as usize)
+    }
+}
+
+/// A planned dense chunked dataset: per-chunk sizes/masks (enough to lay out the
+/// destination) plus the source chunk descriptors, both in dense grid order.
+struct DenseChunkPlan {
+    meta: Vec<ChunkMeta>,
+    grid_order: Vec<ChunkInfo>,
+}
+
+/// Plan a chunked dataset's verbatim copy without reading any chunk bytes: if
+/// every chunk-grid slot is present exactly once (a dense grid), return the
+/// per-chunk [`ChunkMeta`] (sizes + filter masks) and the source [`ChunkInfo`]
+/// for each slot, both in dense row-major grid order. Returns `Ok(None)` when
+/// the grid has holes (a sparse dataset), so the caller falls back to read-raw.
 ///
 /// `dims` is the dataspace shape; `chunk_dims` the logical (rank-only) chunk
 /// dimensions. The grid has `num_chunks_per_dim[d] = ceil(dims[d]/chunk_dims[d])`
 /// slots per dimension; a chunk at N-d offset `o` maps to grid coordinate
 /// `o[d]/chunk_dims[d]` and linear (row-major) index over the grid.
-fn try_collect_dense_chunks(
+fn try_plan_dense_chunks(
     ds: &Dataset,
     dims: &[u64],
     chunk_dims: &[u64],
-) -> Result<Option<Vec<VerbatimChunk>>, Error> {
+) -> Result<Option<DenseChunkPlan>, Error> {
     let rank = dims.len();
     let mut num_chunks_per_dim = Vec::with_capacity(rank);
     for d in 0..rank {
@@ -476,10 +534,10 @@ fn try_collect_dense_chunks(
         return Ok(None);
     }
 
-    // Map each chunk to its linear grid slot and place it; detect any hole or
-    // duplicate as a non-dense grid.
-    let mut slots: Vec<Option<VerbatimChunk>> = (0..total).map(|_| None).collect();
-    for info in &infos {
+    // Map each chunk to its linear grid slot and place its descriptor; detect any
+    // hole or duplicate as a non-dense grid. No chunk bytes are read here.
+    let mut slots: Vec<Option<ChunkInfo>> = (0..total).map(|_| None).collect();
+    for info in infos {
         if info.offsets.len() < rank {
             return Ok(None);
         }
@@ -498,22 +556,25 @@ fn try_collect_dense_chunks(
         if slot.is_some() {
             return Ok(None); // duplicate offset
         }
-        let compressed = ds.read_chunk_raw(info)?;
-        *slot = Some(VerbatimChunk {
-            compressed,
-            filter_mask: info.filter_mask,
-        });
+        *slot = Some(info);
     }
 
     // Every slot must be filled for a dense grid.
-    let mut chunks = Vec::with_capacity(slots.len());
+    let mut grid_order = Vec::with_capacity(slots.len());
     for slot in slots {
         match slot {
-            Some(c) => chunks.push(c),
+            Some(info) => grid_order.push(info),
             None => return Ok(None),
         }
     }
-    Ok(Some(chunks))
+    let meta = grid_order
+        .iter()
+        .map(|info| ChunkMeta {
+            compressed_size: u64::from(info.chunk_size),
+            filter_mask: info.filter_mask,
+        })
+        .collect();
+    Ok(Some(DenseChunkPlan { meta, grid_order }))
 }
 
 /// Refuse the repack if `owner` has an attribute the reader cannot represent as

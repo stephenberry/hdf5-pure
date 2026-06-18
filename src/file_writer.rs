@@ -16,8 +16,10 @@ use std::collections::HashMap;
 
 use crate::attribute::AttributeMessage;
 use crate::chunked_write::{
-    ChunkOptions, ChunkedDataResult, build_chunked_data_at_ext, build_chunked_data_verbatim,
+    ByteSink, ChunkOptions, VerbatimLayout, VerbatimPlan, build_chunked_data_at_ext,
+    emit_chunked_data_verbatim, plan_chunked_data_verbatim,
 };
+use crate::convert::TryToUsize;
 use crate::dataspace::{Dataspace, DataspaceType};
 use crate::error::FormatError;
 use crate::file_space_info::{
@@ -615,6 +617,17 @@ impl FileWriter {
     }
 
     pub fn finish(self) -> Result<Vec<u8>, FormatError> {
+        let mut buf = Vec::new();
+        self.finish_to_sink(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Assemble the file and write it to `sink` in ascending-address order.
+    /// Backs both the buffered [`finish`](Self::finish) (a `Vec<u8>` sink) and
+    /// the streaming `FileBuilder::finish_to` (an `io::Write` sink), so the two
+    /// produce byte-identical files. A streamed dataset's chunk bytes are pulled
+    /// from its provider one chunk at a time here, never all held at once.
+    pub(crate) fn finish_to_sink<S: ByteSink>(self, sink: &mut S) -> Result<(), FormatError> {
         self.check_libver_bounds()?;
         // The superblock-extension header (carrying a File Space Info message)
         // is independent of the file layout, so build it up front and place it
@@ -638,33 +651,78 @@ impl FileWriter {
             vl_string_staging: Option<VlStringStaging>,
         }
 
+        /// One dataset's data region for the assembly pass: either materialized
+        /// in memory, or a plan whose chunk bytes are streamed from a provider.
+        enum DsData {
+            InMemory(Vec<u8>),
+            /// A verbatim chunked dataset streamed one chunk at a time; the
+            /// provider lives in the matching `DsFlat.raw_chunks` (`Lazy`).
+            Streamed(VerbatimPlan),
+        }
+        impl DsData {
+            fn len(&self) -> u64 {
+                match self {
+                    DsData::InMemory(v) => v.len() as u64,
+                    DsData::Streamed(plan) => plan.total_len,
+                }
+            }
+        }
+
+        /// A built chunked dataset's layout/pipeline messages plus its data
+        /// region (materialized for the encode and eager-verbatim paths, planned
+        /// for the streamed verbatim path).
+        struct ChunkedBuilt {
+            layout_message: Vec<u8>,
+            pipeline_message: Option<Vec<u8>>,
+            data: DsData,
+        }
+
         /// Build the chunked data + layout/pipeline messages for one chunked
         /// dataset at `base_address`, dispatching to the verbatim path when the
         /// dataset carries a raw-chunk payload, else the normal encode path. The
         /// single dispatch point keeps the dummy-sizing and real-address passes
-        /// from diverging.
-        fn build_chunked(d: &DsFlat, base_address: u64) -> Result<ChunkedDataResult, FormatError> {
+        /// from diverging. The layout is computed from chunk *sizes* alone, so
+        /// it is identical whether the chunks are in memory or streamed.
+        fn build_chunked(d: &DsFlat, base_address: u64) -> Result<ChunkedBuilt, FormatError> {
             if let Some(rc) = &d.raw_chunks {
-                build_chunked_data_verbatim(
-                    &rc.chunks,
+                // Verbatim chunks are always streamed: the layout is planned from
+                // chunk sizes alone, and the bytes are pulled from the provider in
+                // the assembly loop (buffered `finish` and streaming `finish_to`
+                // share that one emitter, so their output is byte-identical).
+                let VerbatimLayout {
+                    plan,
+                    layout_message,
+                    pipeline_message,
+                } = plan_chunked_data_verbatim(
+                    &rc.meta,
                     &rc.chunk_dims,
                     rc.element_size,
                     rc.raw_size,
                     rc.pipeline_message.as_deref(),
                     base_address,
                     d.maxshape.as_deref(),
-                )
+                )?;
+                Ok(ChunkedBuilt {
+                    layout_message,
+                    pipeline_message,
+                    data: DsData::Streamed(plan),
+                })
             } else {
                 let chunk_dims = d.chunk_options.resolve_chunk_dims(&d.ds.dimensions);
                 let ctx = crate::filters::ChunkContext::from_datatype(&chunk_dims, &d.dt);
-                build_chunked_data_at_ext(
+                let result = build_chunked_data_at_ext(
                     &d.raw,
                     &d.ds.dimensions,
                     ctx,
                     &d.chunk_options,
                     base_address,
                     d.maxshape.as_deref(),
-                )
+                )?;
+                Ok(ChunkedBuilt {
+                    layout_message: result.layout_message,
+                    pipeline_message: result.pipeline_message,
+                    data: DsData::InMemory(result.data_bytes),
+                })
             }
         }
         struct GrpFlat {
@@ -926,56 +984,42 @@ impl FileWriter {
             build_group_oh(&root_dummy_links, &root_attrs, None).len()
         };
 
-        struct DataBlob {
-            data: Vec<u8>,
-            oh_bytes: Vec<u8>,
-        }
-
-        let mut dummy_blobs: Vec<DataBlob> = Vec::new();
+        // Pass 1: compute dataset object-header sizes from a dummy layout. No
+        // data bytes are materialized here — the object-header size depends only
+        // on the layout/pipeline messages, and a chunk index's byte size is a
+        // function of chunk count/size, not of the (dummy) base address. For a
+        // streamed (lazy) dataset this touches no chunk bytes at all.
+        let mut actual_ds_oh_sizes: Vec<usize> = Vec::with_capacity(all_ds.len());
         let mut dummy_cursor = 0u64;
         for (i, d) in all_ds.iter().enumerate() {
-            if is_chunked[i] {
-                let result = build_chunked(d, dummy_cursor)?;
-                dummy_cursor += result.data_bytes.len() as u64;
-                let dense_blob = if ds_dense[i] {
-                    Some(build_dense_attrs(&d.attrs, 0))
-                } else {
-                    None
-                };
-                let oh = build_chunked_dataset_oh(
+            let dense_blob = if ds_dense[i] {
+                Some(build_dense_attrs(&d.attrs, 0))
+            } else {
+                None
+            };
+            let oh = if is_chunked[i] {
+                let built = build_chunked(d, dummy_cursor)?;
+                dummy_cursor += built.data.len();
+                build_chunked_dataset_oh(
                     &d.dt,
                     &d.ds,
-                    &result.layout_message,
-                    result.pipeline_message.as_deref(),
+                    &built.layout_message,
+                    built.pipeline_message.as_deref(),
                     &d.attrs,
                     dense_blob.as_ref(),
-                );
-                dummy_blobs.push(DataBlob {
-                    data: result.data_bytes,
-                    oh_bytes: oh,
-                });
+                )
             } else {
-                let dense_blob = if ds_dense[i] {
-                    Some(build_dense_attrs(&d.attrs, 0))
-                } else {
-                    None
-                };
-                let oh = build_dataset_oh(
+                build_dataset_oh(
                     &d.dt,
                     &d.ds,
                     0,
                     d.raw.len() as u64,
                     &d.attrs,
                     dense_blob.as_ref(),
-                );
-                dummy_blobs.push(DataBlob {
-                    data: d.raw.clone(),
-                    oh_bytes: oh,
-                });
-            }
+                )
+            };
+            actual_ds_oh_sizes.push(oh.len());
         }
-
-        let actual_ds_oh_sizes: Vec<usize> = dummy_blobs.iter().map(|b| b.oh_bytes.len()).collect();
 
         // Pass 2: compute real addresses.
         // All addresses stored in the file are relative to base_address.
@@ -1097,7 +1141,7 @@ impl FileWriter {
         // Compute data layout (addresses + chunked data blobs) separately from OHs
         // so we can patch VL attrs before building OHs.
         struct DsLayout {
-            data: Vec<u8>,
+            data: DsData,
             data_addr: u64,
             chunked_msgs: Option<(Vec<u8>, Option<Vec<u8>>)>,
         }
@@ -1105,12 +1149,12 @@ impl FileWriter {
         for (i, d) in all_ds.iter().enumerate() {
             if is_chunked[i] {
                 let base_address = cursor2 as u64;
-                let result = build_chunked(d, base_address)?;
-                cursor2 += result.data_bytes.len();
+                let built = build_chunked(d, base_address)?;
+                cursor2 += built.data.len().to_usize()?;
                 ds_layouts.push(DsLayout {
-                    data: result.data_bytes,
+                    data: built.data,
                     data_addr: base_address,
-                    chunked_msgs: Some((result.layout_message, result.pipeline_message)),
+                    chunked_msgs: Some((built.layout_message, built.pipeline_message)),
                 });
             } else {
                 let data = d.raw.clone();
@@ -1122,7 +1166,7 @@ impl FileWriter {
                     a
                 };
                 ds_layouts.push(DsLayout {
-                    data,
+                    data: DsData::InMemory(data),
                     data_addr: addr,
                     chunked_msgs: None,
                 });
@@ -1170,7 +1214,18 @@ impl FileWriter {
             // in `flatten_dataset`, so every staged dataset is here non-chunked.
             for (i, d) in all_ds.iter().enumerate() {
                 if let Some(staging) = &d.vl_string_staging {
-                    patch_vl_refs_masked(&mut ds_layouts[i].data, &staging.patch_mask, gcol_cursor);
+                    // A staged VL-string dataset is always non-chunked (chunked
+                    // VL is refused in `flatten_dataset`), so its element bytes
+                    // are in memory and patchable in place. A streamed (lazy)
+                    // dataset never carries VL staging, so this is unreachable for
+                    // it — assert that rather than risk silently corrupting one.
+                    let DsData::InMemory(ref mut bytes) = ds_layouts[i].data else {
+                        unreachable!(
+                            "VL-string staging is refused on chunked datasets, so a staged \
+                             VL dataset's data is always in memory"
+                        );
+                    };
+                    patch_vl_refs_masked(bytes, &staging.patch_mask, gcol_cursor);
                     gcol_cursor += staging.collection_bytes.len() as u64;
                 }
             }
@@ -1184,8 +1239,11 @@ impl FileWriter {
             }
         }
 
-        // Build dataset OHs now that attrs are patched.
-        let mut ds_blobs2: Vec<DataBlob> = Vec::new();
+        // Build dataset OHs now that attrs are patched. Only the header bytes
+        // are kept here; each dataset's data is emitted directly from
+        // `ds_layouts` in the assembly loop (a streamed dataset has no data
+        // bytes to keep at all).
+        let mut ds_oh_bytes2: Vec<Vec<u8>> = Vec::with_capacity(all_ds.len());
         for (i, d) in all_ds.iter().enumerate() {
             let layout = &ds_layouts[i];
             let oh = if let Some((ref lm, ref pm)) = layout.chunked_msgs {
@@ -1202,18 +1260,15 @@ impl FileWriter {
                     &d.dt,
                     &d.ds,
                     layout.data_addr,
-                    layout.data.len() as u64,
+                    layout.data.len(),
                     &d.attrs,
                     ds_dense_blobs[i].as_ref(),
                 )
             };
-            ds_blobs2.push(DataBlob {
-                data: layout.data.clone(),
-                oh_bytes: oh,
-            });
+            ds_oh_bytes2.push(oh);
         }
 
-        let actual_ds_oh_sizes2: Vec<usize> = ds_blobs2.iter().map(|b| b.oh_bytes.len()).collect();
+        let actual_ds_oh_sizes2: Vec<usize> = ds_oh_bytes2.iter().map(|b| b.len()).collect();
         debug_assert_eq!(actual_ds_oh_sizes, actual_ds_oh_sizes2);
 
         // The superblock extension, if any, is appended after the GCOLs. Its
@@ -1224,16 +1279,14 @@ impl FileWriter {
 
         // eof_address is absolute file size (includes userblock + GCOLs + ext)
         let eof_addr2 = (ub + cursor2 + gcol_total_size + ext_len) as u64;
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "capacity for the output buffer; eof_addr2 is the size of a file being \
-                      built in memory, so it fits usize on the running target"
-        )]
-        let mut buf = Vec::with_capacity(eof_addr2 as usize);
+
+        // Let a buffered (Vec) sink preallocate the whole file up front, as the
+        // writer did before streaming; a streaming sink ignores this.
+        sink.reserve(eof_addr2.to_usize()?);
 
         // Userblock: prepend zeros
         if ub > 0 {
-            buf.resize(ub, 0);
+            sink.put_zeros(ub)?;
         }
 
         let sb = Superblock {
@@ -1252,7 +1305,7 @@ impl FileWriter {
             superblock_extension_address: Some(ext_addr.unwrap_or(u64::MAX)),
             checksum: None,
         };
-        buf.extend_from_slice(&sb.serialize());
+        sink.put(&sb.serialize())?;
 
         // Root group OH
         let root_links: Vec<LinkMessage> = {
@@ -1265,13 +1318,13 @@ impl FileWriter {
             }
             v
         };
-        buf.extend_from_slice(&build_group_oh(
+        sink.put(&build_group_oh(
             &root_links,
             &root_attrs,
             root_dense_blob.as_ref(),
-        ));
+        ))?;
         if let Some(ref blob) = root_dense_blob {
-            buf.extend_from_slice(&blob.blob);
+            sink.put(&blob.blob)?;
         }
 
         // Group OHs + dense blobs
@@ -1284,62 +1337,73 @@ impl FileWriter {
             for &sgi in &g.sub_group_indices {
                 links.push(make_link(&groups[sgi].name, group_addrs2[sgi]));
             }
-            buf.extend_from_slice(&build_group_oh(
+            sink.put(&build_group_oh(
                 &links,
                 &g.attrs,
                 group_dense_blobs[gi].as_ref(),
-            ));
+            ))?;
             if let Some(ref blob) = group_dense_blobs[gi] {
-                buf.extend_from_slice(&blob.blob);
+                sink.put(&blob.blob)?;
             }
         }
 
         // Dataset OHs + dense blobs
-        for (i, blob) in ds_blobs2.iter().enumerate() {
-            buf.extend_from_slice(&blob.oh_bytes);
+        for (i, oh) in ds_oh_bytes2.iter().enumerate() {
+            sink.put(oh)?;
             if let Some(ref dense) = ds_dense_blobs[i] {
-                buf.extend_from_slice(&dense.blob);
+                sink.put(&dense.blob)?;
             }
         }
 
-        // Data
-        for blob in &ds_blobs2 {
-            buf.extend_from_slice(&blob.data);
+        // Data. Contiguous/compact and eager chunked datasets emit their
+        // in-memory bytes; a streamed (lazy) chunked dataset pulls each chunk
+        // from its provider one at a time, so its bytes never all reside here.
+        for (i, layout) in ds_layouts.iter().enumerate() {
+            match &layout.data {
+                DsData::InMemory(bytes) => sink.put(bytes)?,
+                DsData::Streamed(plan) => {
+                    let provider = match all_ds[i].raw_chunks.as_ref() {
+                        Some(rc) => rc.provider.0.as_ref(),
+                        None => unreachable!("a streamed data region implies a raw-chunk payload"),
+                    };
+                    emit_chunked_data_verbatim(sink, plan, provider)?;
+                }
+            }
         }
 
         // Global heap collections
         for patch in &vl_root {
-            buf.extend_from_slice(&patch.collection_bytes);
+            sink.put(&patch.collection_bytes)?;
         }
         for patches in &grp_vl {
             for patch in patches {
-                buf.extend_from_slice(&patch.collection_bytes);
+                sink.put(&patch.collection_bytes)?;
             }
         }
         for patches in &ds_vl {
             for patch in patches {
-                buf.extend_from_slice(&patch.collection_bytes);
+                sink.put(&patch.collection_bytes)?;
             }
         }
         // Dataset-element VL string collections, in the same order their
         // addresses were assigned above.
         for d in &all_ds {
             if let Some(staging) = &d.vl_string_staging {
-                buf.extend_from_slice(&staging.collection_bytes);
+                sink.put(&staging.collection_bytes)?;
             }
         }
 
         // Superblock extension (File Space Info), at the address recorded above.
         if let Some(bytes) = &ext_oh {
             debug_assert_eq!(
-                buf.len() as u64,
+                sink.position(),
                 ub as u64 + ext_addr.unwrap(),
                 "extension header must land at its recorded base-relative address"
             );
-            buf.extend_from_slice(bytes);
+            sink.put(bytes)?;
         }
 
-        Ok(buf)
+        Ok(())
     }
 }
 

@@ -1546,74 +1546,143 @@ pub fn build_chunked_data_at_ext(
     })
 }
 
-/// One source chunk for [`build_chunked_data_verbatim`]: its already-compressed
-/// on-disk bytes and the real filter mask from the source index. The inputs are
-/// in dense row-major chunk-grid order (the same order [`split_into_chunks`]
-/// produces), one per grid slot.
+/// Per-chunk metadata in dense row-major grid order — enough to compute the
+/// destination layout (chunk addresses, index structures, cache-line padding)
+/// *without* the chunk bytes. `compressed_size` is the exact byte count the
+/// matching [`ChunkProvider::chunk_bytes`] call must return.
 #[derive(Debug, Clone)]
-pub struct VerbatimChunk {
-    /// The chunk's compressed bytes, copied verbatim from the source file.
-    pub compressed: Vec<u8>,
-    /// The chunk's filter mask from the source index (bit i set = filter i was
-    /// *not* applied to this chunk). Carried through faithfully.
-    pub filter_mask: u32,
+pub(crate) struct ChunkMeta {
+    /// Compressed on-disk size of this chunk, in bytes.
+    pub(crate) compressed_size: u64,
+    /// The chunk's filter mask from the source index, carried through verbatim.
+    pub(crate) filter_mask: u32,
 }
 
-/// Build a chunked dataset by copying already-compressed source chunks verbatim,
-/// without decoding or re-encoding any of them.
+/// Yields one chunk's already-compressed bytes on demand. Called once per grid
+/// slot, in ascending slot order, during the streaming assembly pass — so a
+/// repacked dataset never holds more than a single chunk's bytes at a time.
 ///
-/// The parallel of [`build_chunked_data_at_ext`] for repack's verbatim path: it
-/// produces the same [`ChunkedDataResult`] shape but lays each chunk's compressed
-/// bytes straight into the data buffer (cache-line aligned, like the normal
-/// path), preserving each chunk's real `filter_mask`, and reuses the source's
-/// `FilterPipeline` message bytes verbatim instead of rebuilding a pipeline from
-/// `ChunkOptions`. Because nothing is decoded, lossy filters (float scale-offset,
-/// ZFP) and filters this crate cannot apply (SZIP, unknown) survive byte-exact.
-///
-/// `chunks` must be in dense row-major chunk-grid order, one entry per grid slot
-/// (the caller — repack — guarantees density; a sparse index is handled by a
-/// separate fallback). `raw_size` is the full uncompressed byte size of a chunk
-/// (`product(chunk_dims) * element_size`), identical for every chunk including
-/// edge chunks since chunks are always stored full-size. The index is chosen
-/// exactly as in [`build_chunked_data_at_ext`]: extensible array if `maxshape`
-/// contains `u64::MAX`, single-chunk if there is one grid slot, else fixed array.
-pub fn build_chunked_data_verbatim(
-    chunks: &[VerbatimChunk],
+/// `Send + Sync` is required so that a [`DatasetBuilder`](crate::type_builders::DatasetBuilder)
+/// holding a boxed provider — and thus the public `FileBuilder` — keeps its
+/// `Send`/`Sync` auto-traits. Real providers own an `Arc<File>`, which is both.
+pub(crate) trait ChunkProvider: Send + Sync {
+    /// Return grid slot `index`'s compressed bytes. The returned length must
+    /// equal the matching [`ChunkMeta::compressed_size`]; the emitter checks it.
+    fn chunk_bytes(&self, index: usize) -> Result<Vec<u8>, FormatError>;
+}
+
+/// A minimal byte sink so the verbatim chunk emitter works against both an
+/// in-memory `Vec<u8>` (the buffered / `no_std` path) and a streaming
+/// `std::io::Write` (the out-of-core path), without pulling `std::io` into
+/// `no_std` builds.
+pub(crate) trait ByteSink {
+    /// Append `bytes` to the output.
+    fn put(&mut self, bytes: &[u8]) -> Result<(), FormatError>;
+    /// Append `n` zero bytes (cache-line padding).
+    fn put_zeros(&mut self, n: usize) -> Result<(), FormatError>;
+    /// Total bytes written so far (used to assert layout addresses on a
+    /// non-seekable sink).
+    fn position(&self) -> u64;
+    /// Hint that `additional` more bytes are about to be written. Lets a buffered
+    /// (`Vec`) sink preallocate the whole file in one shot, as the writer did
+    /// before streaming. A no-op for sinks that do not benefit (e.g. a streaming
+    /// `Write`).
+    fn reserve(&mut self, _additional: usize) {}
+}
+
+impl ByteSink for Vec<u8> {
+    fn put(&mut self, bytes: &[u8]) -> Result<(), FormatError> {
+        self.extend_from_slice(bytes);
+        Ok(())
+    }
+    fn put_zeros(&mut self, n: usize) -> Result<(), FormatError> {
+        self.resize(self.len() + n, 0u8);
+        Ok(())
+    }
+    fn position(&self) -> u64 {
+        self.len() as u64
+    }
+    fn reserve(&mut self, additional: usize) {
+        Vec::reserve(self, additional);
+    }
+}
+
+/// One grid slot's placement in the data region: the zero padding before it and
+/// the chunk's compressed byte count.
+pub(crate) struct ChunkSlotPlan {
+    pub(crate) pad_before: u64,
+    pub(crate) compressed_size: u64,
+}
+
+/// The full destination layout of a verbatim chunked dataset's data region,
+/// computed from chunk *sizes* alone (no chunk bytes). Feeds both the object
+/// header (via the separately returned layout/pipeline messages) and the
+/// streaming emit ([`emit_chunked_data_verbatim`]).
+pub(crate) struct VerbatimPlan {
+    /// One entry per grid slot, in ascending address order.
+    pub(crate) slots: Vec<ChunkSlotPlan>,
+    /// Zero padding before the index structure (cache-line alignment).
+    pub(crate) index_pad: u64,
+    /// The serialized chunk-index structure (Fixed Array / Extensible Array),
+    /// emitted after the chunk bytes. Empty for the single-chunk layout (whose
+    /// address is embedded in the layout message instead).
+    pub(crate) index_tail: Vec<u8>,
+    /// Total byte length of the data region (chunks + padding + index tail).
+    pub(crate) total_len: u64,
+}
+
+/// The result of planning a verbatim chunked dataset: the data-region
+/// [`VerbatimPlan`] (for the streaming emit) plus the object-header messages it
+/// implies (the v4 layout message and the verbatim pipeline message).
+pub(crate) struct VerbatimLayout {
+    pub(crate) plan: VerbatimPlan,
+    pub(crate) layout_message: Vec<u8>,
+    pub(crate) pipeline_message: Option<Vec<u8>>,
+}
+
+/// Compute the [`VerbatimLayout`] (data-region plan plus the v4 layout and
+/// verbatim pipeline messages) for a dense, grid-ordered set of chunks, from
+/// their sizes and filter masks alone — no chunk bytes. The byte layout is
+/// identical whether the chunks are later buffered or streamed.
+pub(crate) fn plan_chunked_data_verbatim(
+    meta: &[ChunkMeta],
     chunk_dims: &[u64],
     element_size: usize,
     raw_size: u64,
     pipeline_message: Option<&[u8]>,
     base_address: u64,
     maxshape: Option<&[u64]>,
-) -> Result<ChunkedDataResult, FormatError> {
-    if chunks.is_empty() {
+) -> Result<VerbatimLayout, FormatError> {
+    if meta.is_empty() {
         return Err(FormatError::ChunkedReadError(
-            "build_chunked_data_verbatim requires at least one chunk".into(),
+            "a verbatim chunked dataset requires at least one chunk".into(),
         ));
     }
-    let num_chunks = chunks.len();
+    let num_chunks = meta.len();
     let has_filters = pipeline_message.is_some();
 
-    // Lay each chunk's compressed bytes into the data buffer, cache-line aligned.
-    let mut data_buf = Vec::new();
+    // Walk a running cursor instead of pushing bytes; padding and addresses are a
+    // pure function of preceding chunk sizes, mirroring the buffered builder.
+    let mut cursor: u64 = 0;
+    let mut slots = Vec::with_capacity(num_chunks);
     let mut written_chunks = Vec::with_capacity(num_chunks);
 
-    for chunk in chunks {
-        let aligned_offset = align_to_cache_line(data_buf.len());
-        if aligned_offset > data_buf.len() {
-            data_buf.resize(aligned_offset, 0u8);
-        }
-
-        let address = base_address + data_buf.len() as u64;
-        let compressed_size = chunk.compressed.len() as u64;
-        data_buf.extend_from_slice(&chunk.compressed);
-
+    for m in meta {
+        let aligned_offset = align_to_cache_line(cursor.to_usize()?) as u64;
+        let pad_before = aligned_offset - cursor;
+        let address = base_address + aligned_offset;
+        let compressed_size = m.compressed_size;
+        slots.push(ChunkSlotPlan {
+            pad_before,
+            compressed_size,
+        });
         written_chunks.push(WrittenChunk {
             address,
             compressed_size,
             raw_size,
-            filter_mask: chunk.filter_mask,
+            filter_mask: m.filter_mask,
         });
+        cursor = aligned_offset + compressed_size;
     }
 
     #[expect(
@@ -1626,18 +1695,18 @@ pub fn build_chunked_data_verbatim(
 
     let use_extensible = maxshape.is_some_and(|ms| ms.contains(&u64::MAX));
 
-    // Pad before index structures so they are also cache-line aligned.
-    let aligned_idx = align_to_cache_line(data_buf.len());
-    if aligned_idx > data_buf.len() {
-        data_buf.resize(aligned_idx, 0u8);
-    }
+    // Pad before the index structure so it is also cache-line aligned.
+    let aligned_idx = align_to_cache_line(cursor.to_usize()?) as u64;
+    let index_pad = aligned_idx - cursor;
+    cursor = aligned_idx;
 
+    let mut index_tail = Vec::new();
     #[expect(
         clippy::cast_possible_truncation,
         reason = "element size written into the on-disk u32 dimension field selected for this file"
     )]
     let layout_message = if use_extensible {
-        let ea_address = base_address + data_buf.len() as u64;
+        let ea_address = base_address + cursor;
         let ea_bytes = build_extensible_array_at(
             &written_chunks,
             offset_size,
@@ -1645,7 +1714,8 @@ pub fn build_chunked_data_verbatim(
             has_filters,
             ea_address,
         )?;
-        data_buf.extend_from_slice(&ea_bytes);
+        cursor += ea_bytes.len() as u64;
+        index_tail = ea_bytes;
         serialize_v4_extensible_array(
             &chunk_dims_u32,
             ea_address,
@@ -1673,7 +1743,7 @@ pub fn build_chunked_data_verbatim(
             element_size as u32,
         )
     } else {
-        let fa_address = base_address + data_buf.len() as u64;
+        let fa_address = base_address + cursor;
         let fa_bytes = build_fixed_array_at(
             &written_chunks,
             offset_size,
@@ -1681,7 +1751,8 @@ pub fn build_chunked_data_verbatim(
             has_filters,
             fa_address,
         );
-        data_buf.extend_from_slice(&fa_bytes);
+        cursor += fa_bytes.len() as u64;
+        index_tail = fa_bytes;
         serialize_v4_fixed_array(
             &chunk_dims_u32,
             fa_address,
@@ -1691,11 +1762,42 @@ pub fn build_chunked_data_verbatim(
         )
     };
 
-    Ok(ChunkedDataResult {
-        data_bytes: data_buf,
+    Ok(VerbatimLayout {
+        plan: VerbatimPlan {
+            slots,
+            index_pad,
+            index_tail,
+            total_len: cursor,
+        },
         layout_message,
         pipeline_message: pipeline_message.map(<[u8]>::to_vec),
     })
+}
+
+/// Stream a planned verbatim dataset's data region to `sink`, pulling each
+/// chunk's bytes from `provider` one at a time. The emitted bytes are identical
+/// to the concatenation [`plan_chunked_data_verbatim`] describes, so a streamed
+/// file and a buffered file are byte-for-byte equal.
+pub(crate) fn emit_chunked_data_verbatim<S: ByteSink>(
+    sink: &mut S,
+    plan: &VerbatimPlan,
+    provider: &dyn ChunkProvider,
+) -> Result<(), FormatError> {
+    for (i, slot) in plan.slots.iter().enumerate() {
+        sink.put_zeros(slot.pad_before.to_usize()?)?;
+        let bytes = provider.chunk_bytes(i)?;
+        if bytes.len() as u64 != slot.compressed_size {
+            return Err(FormatError::ChunkedReadError(
+                "verbatim chunk provider returned a chunk whose size differs from the \
+                 planned size"
+                    .into(),
+            ));
+        }
+        sink.put(&bytes)?;
+    }
+    sink.put_zeros(plan.index_pad.to_usize()?)?;
+    sink.put(&plan.index_tail)?;
+    Ok(())
 }
 
 #[cfg(test)]
