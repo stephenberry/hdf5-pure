@@ -16,20 +16,24 @@
 //! naming the object and the reason. It refuses rather than approximate.
 //! Currently reproducible:
 //!
-//! - Datasets with fixed-point, floating-point, fixed-length string, bit-field,
-//!   opaque, compound, enumeration, and array datatypes, contiguous/compact or
-//!   chunked.
+//! - Datasets with fixed-point, floating-point, time, fixed-length string,
+//!   bit-field, opaque, compound, enumeration, and array datatypes,
+//!   contiguous/compact or chunked.
 //! - **Chunked** datasets copy their compressed chunks **verbatim** (chunk by
 //!   chunk, never decoded), so *every* filter is preserved byte-exact: deflate,
 //!   shuffle, fletcher32, integer **and** float scale-offset, ZFP, SZIP, and
 //!   even filters this crate cannot itself apply. The destination always uses a
 //!   v4 chunk index (single-chunk / fixed-array / extensible-array) regardless
 //!   of the source index type.
-//! - Contiguous/compact **variable-length string** datasets (1D and ND), both
-//!   the `is_string: true` shape and the MATLAB VLEN-of-1-byte-ASCII-string
-//!   shape. Each element's exact heap bytes are read and re-staged through a
-//!   fresh global heap, preserving charset, padding, the null-vs-empty
-//!   distinction, embedded NULs, and non-UTF-8 payloads.
+//! - Contiguous/compact **variable-length** datasets (1D and ND): string-shaped
+//!   (`is_string: true` and the MATLAB VLEN-of-1-byte-ASCII-string shape) and
+//!   non-string sequences over any base type that embeds no addresses. Each
+//!   element's exact heap bytes are read and re-staged through a fresh global
+//!   heap, preserving charset, padding, the null-vs-empty distinction, embedded
+//!   NULs, and non-UTF-8 payloads.
+//! - Contiguous/compact **object-reference** datasets: each stored address is
+//!   rewritten to its target object's new location in the compacted file (null
+//!   and undefined references are carried verbatim).
 //! - Group hierarchy of arbitrary depth.
 //! - Attributes representable as [`AttrValue`] (numbers, fixed and
 //!   variable-length strings and their arrays), on datasets, groups, and root.
@@ -45,17 +49,19 @@
 //! dense verbatim path cannot lay out). A lossy pipeline on either of those is
 //! refused.
 //!
-//! Refused (named, never dropped silently): non-string variable-length
-//! (sequences of arbitrary base types); chunked, filtered, or resizable
-//! variable-length string datasets (their element references live inside
-//! compressed chunks written before the global heap addresses are known, so they
-//! cannot be patched in); time (its byte order is not modelled), and reference
-//! datatypes (a reference's stored absolute addresses would go stale on
-//! rewrite); virtual and external data layouts; a lossy filter on the contiguous
-//! re-encode or sparse-chunked fallback path; and any attribute whose datatype
-//! the reader cannot decode into an [`AttrValue`] (e.g. an enumeration, compound,
-//! or boolean attribute). An attribute that cannot be reproduced fails the
-//! repack by name rather than being silently dropped.
+//! Refused (named, never dropped silently): chunked, filtered, or resizable
+//! variable-length (string or sequence) and object-reference datasets (their
+//! element references live inside compressed chunks written before the global
+//! heap addresses are known, so they cannot be patched in); region references and
+//! non-8-byte object references; an object reference to a dropped object or to a
+//! target outside the hard-link hierarchy (a dangling, named-datatype, or region
+//! target), and object references in a userblock file (non-zero base address); a
+//! non-string vlen sequence whose base type embeds an address (nested vlen or
+//! reference); virtual and external data layouts; a lossy filter on the
+//! contiguous re-encode or sparse-chunked fallback path; and any attribute whose
+//! datatype the reader cannot decode into an [`AttrValue`] (e.g. an enumeration,
+//! compound, reference, or boolean attribute). An object that cannot be
+//! reproduced fails the repack by name rather than being silently dropped.
 //!
 //! # Memory
 //!
@@ -69,7 +75,7 @@
 //!
 //! [#82]: https://github.com/stephenberry/hdf5-pure/issues/82
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -77,7 +83,7 @@ use crate::chunked_read::ChunkInfo;
 use crate::chunked_write::{ChunkMeta, ChunkProvider};
 use crate::convert::TryToUsize;
 use crate::data_layout::DataLayout;
-use crate::datatype::Datatype;
+use crate::datatype::{Datatype, ReferenceType};
 use crate::error::{Error, FormatError};
 use crate::filter_pipeline::{
     FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SCALEOFFSET, FILTER_SHUFFLE, FilterPipeline,
@@ -86,7 +92,7 @@ use crate::reader::{Dataset, File, Group};
 use crate::scaleoffset::{self, ScaleOffset};
 use crate::source::FileSource;
 use crate::type_builders::{
-    AttrValue, DatasetBuilder, FinishedGroup, GroupBuilder, VlStringElement,
+    AttrValue, DatasetBuilder, FinishedGroup, GroupBuilder, ObjectRefTarget, VlStringElement,
 };
 use crate::vl_data::{VlByteObject, VlenStringReadOptions, is_vlen_string_datatype};
 use crate::writer::FileBuilder;
@@ -156,8 +162,21 @@ pub fn repack<P: AsRef<Path>, Q: AsRef<Path>>(
             .with_file_space_strategy(info.strategy, false, info.threshold)
             .with_file_space_page_size(info.page_size);
     }
+    // Map every source object's (relative) header address to its path, so an
+    // object-reference dataset can be rewritten to point at the same objects in
+    // the compacted output rather than at their stale source addresses.
+    let addr_map = build_object_address_map(&file)?;
+
     let root = file.root();
-    populate(&mut builder, &root, "", &drop, &mut matched, &file)?;
+    populate(
+        &mut builder,
+        &root,
+        "",
+        &drop,
+        &mut matched,
+        &file,
+        &addr_map,
+    )?;
 
     // Every requested drop must have named a real object.
     if let Some(missing) = drop.iter().find(|d| !matched.contains(*d)) {
@@ -213,6 +232,7 @@ fn populate<S: GroupSink>(
     drop: &BTreeSet<String>,
     matched: &mut BTreeSet<String>,
     file: &Arc<File>,
+    addr_map: &HashMap<u64, String>,
 ) -> Result<(), Error> {
     // Attributes, in name order for a deterministic output. Refuse if any
     // attribute on this group cannot be represented (and would be dropped).
@@ -237,7 +257,14 @@ fn populate<S: GroupSink>(
             continue;
         }
         let ds = src.dataset(&name)?;
-        emit_dataset(sink.sink_dataset(&name), &ds, &child_path, file)?;
+        emit_dataset(
+            sink.sink_dataset(&name),
+            &ds,
+            &child_path,
+            file,
+            drop,
+            addr_map,
+        )?;
     }
 
     // Subgroups, sorted by name; built depth-first into a FinishedGroup.
@@ -251,7 +278,7 @@ fn populate<S: GroupSink>(
         }
         let child = src.group(&name)?;
         let mut gb = GroupBuilder::new(&name);
-        populate(&mut gb, &child, &child_path, drop, matched, file)?;
+        populate(&mut gb, &child, &child_path, drop, matched, file, addr_map)?;
         sink.sink_add_group(gb.finish());
     }
     Ok(())
@@ -264,6 +291,8 @@ fn emit_dataset(
     ds: &Dataset,
     path: &str,
     file: &Arc<File>,
+    drop: &BTreeSet<String>,
+    addr_map: &HashMap<u64, String>,
 ) -> Result<(), Error> {
     let datatype = ds.datatype()?;
     let dataspace = ds.dataspace()?;
@@ -283,6 +312,36 @@ fn emit_dataset(
     if is_vlen_string_datatype(&datatype) {
         emit_vlen_string_dataset(db, ds, path, &datatype, &dims, &layout)?;
         // VL-string datasets carry attributes the same way as any other.
+        let attrs = ds.attrs()?;
+        check_attr_completeness(&attrs, &ds.attr_names()?, &format!("dataset {path}"))?;
+        for (name, value) in sorted(attrs) {
+            db.set_attr(&name, value);
+        }
+        return Ok(());
+    }
+
+    // Non-string variable-length (sequence) datasets take the same global-heap
+    // re-staging path as VL strings: each element's exact heap bytes are read and
+    // re-emitted through a fresh global heap, so the stored heap addresses are
+    // rebuilt rather than copied stale. Routed here before the verbatim chunk-copy
+    // path so a chunked one is refused (not copied with stale references).
+    if is_nonstring_vlen(&datatype) {
+        emit_vlen_sequence_dataset(db, ds, path, &datatype, &dims, &layout)?;
+        let attrs = ds.attrs()?;
+        check_attr_completeness(&attrs, &ds.attr_names()?, &format!("dataset {path}"))?;
+        for (name, value) in sorted(attrs) {
+            db.set_attr(&name, value);
+        }
+        return Ok(());
+    }
+
+    // Object-reference datasets store absolute object-header addresses that would
+    // go stale on rewrite, so each reference is resolved to its target's *new*
+    // address (via the source address->path map and the writer's path resolution)
+    // rather than copied. Routed here before the verbatim chunk-copy path so a
+    // chunked one is refused (not copied with stale addresses).
+    if is_object_reference(&datatype) {
+        emit_object_reference_dataset(db, ds, path, &dims, &layout, file, drop, addr_map)?;
         let attrs = ds.attrs()?;
         check_attr_completeness(&attrs, &ds.attr_names()?, &format!("dataset {path}"))?;
         for (name, value) in sorted(attrs) {
@@ -485,6 +544,53 @@ fn emit_vlen_string_dataset(
     Ok(())
 }
 
+/// Re-emit a non-string variable-length (sequence) dataset faithfully: read each
+/// element's exact heap bytes and re-stage them through a fresh global heap, so
+/// the rewritten file's heap addresses are rebuilt rather than copied stale.
+///
+/// Chunked/filtered/resizable layouts are refused by name for the same reason as
+/// VL strings: the element references live inside compressed chunks written
+/// before the global heap addresses are known.
+fn emit_vlen_sequence_dataset(
+    db: &mut DatasetBuilder,
+    ds: &Dataset,
+    path: &str,
+    datatype: &Datatype,
+    dims: &[u64],
+    layout: &DataLayout,
+) -> Result<(), Error> {
+    if matches!(layout, DataLayout::Chunked { .. }) {
+        return Err(Error::RepackUnsupported(format!(
+            "dataset {path}: chunked or filtered non-string variable-length datasets cannot be \
+             repacked (their element references live inside compressed chunks before the global \
+             heap addresses are known)"
+        )));
+    }
+    if let Some(maxshape) = &ds.dataspace()?.max_dimensions
+        && maxshape != dims
+    {
+        return Err(Error::RepackUnsupported(format!(
+            "dataset {path}: resizable non-string variable-length datasets cannot be repacked"
+        )));
+    }
+
+    // Read each element's exact heap bytes (preserving the null-vs-empty
+    // distinction and any embedded NULs), then re-stage with the source datatype.
+    let (objects, _element_size) = ds.read_vlen_sequence_bytes(VlenStringReadOptions::default())?;
+    let elements: Vec<VlStringElement> = objects
+        .into_iter()
+        .map(|o| match o {
+            VlByteObject::Null => VlStringElement::Null,
+            VlByteObject::Bytes(bytes) => VlStringElement::Bytes(bytes),
+        })
+        .collect();
+
+    db.with_vlen_sequence_elements(datatype.clone(), &elements)
+        .map_err(Error::Format)?;
+    db.with_shape(dims);
+    Ok(())
+}
+
 /// A [`ChunkProvider`] that streams a dense chunked dataset's chunks from the
 /// source file one at a time during the write, so repack never holds more than a
 /// single chunk's bytes. Holds an `Arc<File>` (so it owns its source with no
@@ -610,11 +716,11 @@ fn check_attr_completeness(
     Ok(())
 }
 
-/// Reject datatypes whose on-disk form this crate cannot re-emit faithfully
-/// (variable-length; time, whose byte order is not modelled; and reference,
-/// whose stored absolute addresses would go stale on rewrite), recursing into
-/// compound members, enumeration bases, and array element types so a nested
-/// occurrence is caught too.
+/// Reject datatypes whose on-disk form this crate cannot re-emit faithfully,
+/// recursing into compound members, enumeration bases, and array element types so
+/// a nested occurrence is caught too. Region and non-8-byte object references are
+/// the remaining refusals (their stored selections/addresses are not yet
+/// rewritten); 8-byte object references are handled by the reference rewrite path.
 fn check_datatype(dt: &Datatype, path: &str) -> Result<(), Error> {
     let bad = |what: &str| {
         Err(Error::RepackUnsupported(format!(
@@ -623,24 +729,39 @@ fn check_datatype(dt: &Datatype, path: &str) -> Result<(), Error> {
     };
     match dt {
         // Scalar and opaque-bytes datatypes whose on-disk form `Datatype::serialize`
-        // reproduces exactly, so reading the raw element bytes and re-emitting them
-        // is byte-for-byte faithful.
+        // reproduces exactly (including the time type's byte order), so reading the
+        // raw element bytes and re-emitting them is byte-for-byte faithful.
         Datatype::FixedPoint { .. }
         | Datatype::FloatingPoint { .. }
+        | Datatype::Time { .. }
         | Datatype::String { .. }
         | Datatype::BitField { .. }
         | Datatype::Opaque { .. } => Ok(()),
-        // The time type's serialized byte order is not modelled (always emitted
-        // little-endian), so a big-endian source could not be reproduced exactly.
-        Datatype::Time { .. } => bad("time"),
         // String-shaped variable-length datatypes (`is_string: true`, or the
         // MATLAB VLEN-of-1-byte-ASCII-string shape) are reproduced by reading
         // each element's exact heap bytes and re-staging them through the
         // writer's VL-string path; the layout/filter checks gate chunked ones.
-        // Non-string VL (sequences of arbitrary base types) stays refused.
         Datatype::VariableLength { .. } if is_vlen_string_datatype(dt) => Ok(()),
-        Datatype::VariableLength { .. } => bad("non-string variable-length"),
-        Datatype::Reference { .. } => bad("reference"),
+        // Non-string VL (sequences of arbitrary base types) are re-staged the
+        // same way, but only when the base type's bytes carry no embedded heap or
+        // file addresses that a verbatim copy would leave stale.
+        Datatype::VariableLength { base_type, .. } => check_vlen_base_type(base_type, path),
+        // Object references (8-byte object-header addresses) are repacked by
+        // rewriting each address to its target's new location. Region references
+        // (which embed a dataspace selection in the global heap) and non-8-byte
+        // object references are not reproduced yet.
+        Datatype::Reference {
+            ref_type: ReferenceType::Object,
+            size: 8,
+        } => Ok(()),
+        Datatype::Reference {
+            ref_type: ReferenceType::Object,
+            ..
+        } => bad("non-8-byte object reference"),
+        Datatype::Reference {
+            ref_type: ReferenceType::DatasetRegion,
+            ..
+        } => bad("dataset-region reference"),
         Datatype::Compound { members, .. } => {
             for m in members {
                 check_datatype(&m.datatype, path)?;
@@ -650,6 +771,201 @@ fn check_datatype(dt: &Datatype, path: &str) -> Result<(), Error> {
         Datatype::Enumeration { base_type, .. } => check_datatype(base_type, path),
         Datatype::Array { base_type, .. } => check_datatype(base_type, path),
     }
+}
+
+/// Whether `dt` is a non-string variable-length (sequence) datatype — the kind
+/// re-emitted by [`emit_vlen_sequence_dataset`]. Excludes the string-shaped VL
+/// datatypes, which [`emit_vlen_string_dataset`] handles.
+fn is_nonstring_vlen(dt: &Datatype) -> bool {
+    matches!(dt, Datatype::VariableLength { .. }) && !is_vlen_string_datatype(dt)
+}
+
+/// A non-string VL sequence is repacked by re-staging each element's exact heap
+/// bytes verbatim. That is faithful only when the base type's bytes embed no
+/// addresses that would go stale on rewrite: a nested variable-length type (its
+/// elements are themselves global-heap references) and a reference (a stale file
+/// address) are refused, recursing through compound members, array elements, and
+/// enumeration bases so a nested occurrence is caught too.
+fn check_vlen_base_type(dt: &Datatype, path: &str) -> Result<(), Error> {
+    let bad = |what: &str| {
+        Err(Error::RepackUnsupported(format!(
+            "dataset {path}: variable-length sequence of {what} cannot be repacked faithfully yet"
+        )))
+    };
+    match dt {
+        Datatype::FixedPoint { .. }
+        | Datatype::FloatingPoint { .. }
+        | Datatype::Time { .. }
+        | Datatype::String { .. }
+        | Datatype::BitField { .. }
+        | Datatype::Opaque { .. } => Ok(()),
+        Datatype::Reference { .. } => bad("references"),
+        Datatype::VariableLength { .. } => bad("variable-length elements"),
+        Datatype::Compound { members, .. } => {
+            for m in members {
+                check_vlen_base_type(&m.datatype, path)?;
+            }
+            Ok(())
+        }
+        Datatype::Enumeration { base_type, .. } => check_vlen_base_type(base_type, path),
+        Datatype::Array { base_type, .. } => check_vlen_base_type(base_type, path),
+    }
+}
+
+/// Whether `dt` is an object-reference datatype handled by
+/// [`emit_object_reference_dataset`].
+fn is_object_reference(dt: &Datatype) -> bool {
+    matches!(
+        dt,
+        Datatype::Reference {
+            ref_type: ReferenceType::Object,
+            ..
+        }
+    )
+}
+
+/// Whether `path` is dropped from the output: either listed in `drop`, or nested
+/// under a dropped group (so its whole subtree is gone).
+fn is_dropped(path: &str, drop: &BTreeSet<String>) -> bool {
+    if drop.contains(path) {
+        return true;
+    }
+    let mut p = path;
+    while let Some(idx) = p.rfind('/') {
+        p = &p[..idx];
+        if drop.contains(p) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Build a map from each source object's header address to its slash-free path,
+/// for resolving object references. With a zero base address (the case object
+/// references are repacked for) the stored reference value is exactly this
+/// header address, so the lookup is direct.
+fn build_object_address_map(file: &File) -> Result<HashMap<u64, String>, Error> {
+    let mut map = HashMap::new();
+    let root = file.root();
+    // The root group can itself be referenced (the writer registers it under the
+    // empty path).
+    map.insert(root.header_address(), String::new());
+    collect_addresses(&root, "", &mut map)?;
+    Ok(map)
+}
+
+/// Recursively record `(header address -> path)` for every dataset and subgroup.
+fn collect_addresses(
+    group: &Group,
+    prefix: &str,
+    map: &mut HashMap<u64, String>,
+) -> Result<(), Error> {
+    for name in group.datasets()? {
+        let ds = group.dataset(&name)?;
+        map.insert(ds.header_address(), join(prefix, &name));
+    }
+    for name in group.groups()? {
+        let child = group.group(&name)?;
+        let child_path = join(prefix, &name);
+        map.insert(child.header_address(), child_path.clone());
+        collect_addresses(&child, &child_path, map)?;
+    }
+    Ok(())
+}
+
+/// Re-emit an object-reference dataset faithfully: rewrite each stored address to
+/// point at its target's destination location instead of its stale source one.
+///
+/// Each reference is read, resolved through `addr_map` to a source path, and
+/// re-staged as a path target the writer resolves once destination addresses are
+/// known. Null (address 0) and undefined (`HADDR_UNDEF`) references are carried
+/// verbatim. Refused by name: chunked/filtered or resizable layouts, a non-zero
+/// base address, a reference to a dropped object, and a reference whose target is
+/// not a hard-linked group or dataset in the source (dangling, or a named
+/// datatype / region target not modelled yet).
+#[allow(clippy::too_many_arguments)]
+fn emit_object_reference_dataset(
+    db: &mut DatasetBuilder,
+    ds: &Dataset,
+    path: &str,
+    dims: &[u64],
+    layout: &DataLayout,
+    file: &Arc<File>,
+    drop: &BTreeSet<String>,
+    addr_map: &HashMap<u64, String>,
+) -> Result<(), Error> {
+    if matches!(layout, DataLayout::Chunked { .. }) {
+        return Err(Error::RepackUnsupported(format!(
+            "dataset {path}: chunked or filtered object-reference datasets cannot be repacked \
+             (their addresses live inside compressed chunks and would need rewriting in place)"
+        )));
+    }
+    if let Some(maxshape) = &ds.dataspace()?.max_dimensions
+        && maxshape != dims
+    {
+        return Err(Error::RepackUnsupported(format!(
+            "dataset {path}: resizable object-reference datasets cannot be repacked"
+        )));
+    }
+    // Object references store addresses relative to the base address; the rewrite
+    // path assumes a zero base (the universal case), so a userblock file is
+    // refused rather than risk a mis-resolved address.
+    if file.base_address() != 0 {
+        return Err(Error::RepackUnsupported(format!(
+            "dataset {path}: object references in a file with a non-zero base address (userblock) \
+             cannot be repacked yet"
+        )));
+    }
+
+    let n_elements: usize = dims.iter().product::<u64>().to_usize()?;
+    let targets = if n_elements == 0 {
+        Vec::new()
+    } else {
+        let raw = ds.read_raw()?;
+        let needed = n_elements
+            .checked_mul(8)
+            .ok_or(FormatError::OffsetOverflow {
+                offset: n_elements as u64,
+                length: 8,
+            })?;
+        if raw.len() < needed {
+            return Err(FormatError::UnexpectedEof {
+                expected: needed,
+                available: raw.len(),
+            }
+            .into());
+        }
+        let mut targets = Vec::with_capacity(n_elements);
+        for chunk in raw[..needed].chunks_exact(8) {
+            let v = u64::from_le_bytes(chunk.try_into().expect("chunks_exact(8) yields 8 bytes"));
+            // 0 = null, all-ones = HADDR_UNDEF: both point at nothing, carried as-is.
+            if v == 0 || v == u64::MAX {
+                targets.push(ObjectRefTarget::Raw(v));
+                continue;
+            }
+            match addr_map.get(&v) {
+                Some(target_path) if is_dropped(target_path, drop) => {
+                    return Err(Error::RepackUnsupported(format!(
+                        "dataset {path}: object reference to dropped object {target_path:?} \
+                         cannot be repacked"
+                    )));
+                }
+                Some(target_path) => targets.push(ObjectRefTarget::Path(target_path.clone())),
+                None => {
+                    return Err(Error::RepackUnsupported(format!(
+                        "dataset {path}: object reference to address {v:#x} resolves to no \
+                         hard-linked object in the source (dangling, or a named-datatype / \
+                         region target not supported yet)"
+                    )));
+                }
+            }
+        }
+        targets
+    };
+
+    db.with_object_references(targets);
+    db.with_shape(dims);
+    Ok(())
 }
 
 /// Reject data layouts that cannot be read and re-emitted (virtual datasets;
@@ -728,5 +1044,74 @@ fn join(parent: &str, name: &str) -> String {
         name.to_string()
     } else {
         format!("{parent}/{name}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repack_preserves_big_endian_time_dataset() {
+        // The reference C library cannot create H5T_TIME, so this round-trips a
+        // big-endian time dataset through our own writer and reader: repack must
+        // preserve both the byte order (bf0 bit 0) and the raw element bytes.
+        use crate::datatype::{Datatype, DatatypeByteOrder};
+        use crate::reader::File;
+        use crate::writer::FileBuilder;
+
+        let dir = std::env::temp_dir();
+        let src = dir.join("hdf5_pure_repack_time_src.h5");
+        let dst = dir.join("hdf5_pure_repack_time_dst.h5");
+
+        let dt = Datatype::Time {
+            size: 4,
+            byte_order: DatatypeByteOrder::BigEndian,
+            bit_precision: 32,
+        };
+        let raw: Vec<u8> = vec![
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03,
+        ];
+        {
+            let mut b = FileBuilder::new();
+            b.create_dataset("t")
+                .with_raw_data(dt.clone(), raw.clone(), 3)
+                .with_shape(&[3]);
+            b.write(&src).unwrap();
+        }
+
+        repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+        let f = File::open(&dst).unwrap();
+        let ds = f.dataset("t").unwrap();
+        assert_eq!(
+            ds.datatype().unwrap(),
+            dt,
+            "time datatype incl. byte order must survive repack"
+        );
+        assert_eq!(
+            ds.read_raw().unwrap(),
+            raw,
+            "time element bytes must be preserved"
+        );
+
+        std::fs::remove_file(&src).ok();
+        std::fs::remove_file(&dst).ok();
+    }
+
+    #[test]
+    fn is_dropped_matches_self_and_ancestors() {
+        let drop: BTreeSet<String> = ["g/old", "lone"].iter().map(|s| s.to_string()).collect();
+        // The dropped path itself.
+        assert!(is_dropped("lone", &drop));
+        assert!(is_dropped("g/old", &drop));
+        // A descendant of a dropped group is dropped (the whole subtree goes).
+        assert!(is_dropped("g/old/child", &drop));
+        assert!(is_dropped("g/old/a/b", &drop));
+        // Unrelated paths and partial-name collisions are not dropped.
+        assert!(!is_dropped("g", &drop));
+        assert!(!is_dropped("g/older", &drop));
+        assert!(!is_dropped("lonely", &drop));
+        assert!(!is_dropped("other/old", &drop));
     }
 }

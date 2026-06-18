@@ -205,6 +205,177 @@ fn repack_roundtrips_vlen_string_2d() {
 }
 
 #[test]
+fn repack_roundtrips_c_vlen_sequence_dataset() {
+    use hdf5::types::VarLenArray;
+
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("c_vlen_seq.h5");
+    let dst = dir.path().join("vlen_seq_repacked.h5");
+
+    // The C library writes a non-string VL dataset (`H5T_VLEN { i32 }`),
+    // including an empty sequence.
+    let seqs: Vec<Vec<i32>> = vec![vec![1, 2, 3], vec![], vec![-7, 42, 0, 99], vec![5]];
+    {
+        let file = hdf5::File::create(&src).unwrap();
+        let vals: Vec<VarLenArray<i32>> = seqs
+            .iter()
+            .map(|s| VarLenArray::from_slice(s.as_slice()))
+            .collect();
+        file.new_dataset::<VarLenArray<i32>>()
+            .shape((seqs.len(),))
+            .create("seqs")
+            .unwrap()
+            .write(&vals)
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    // hdf5-pure must see the repacked datatype as a non-string variable-length
+    // sequence (not silently converted).
+    let f = File::open(&dst).unwrap();
+    let ds = f.dataset("seqs").unwrap();
+    assert!(
+        matches!(
+            ds.datatype().unwrap(),
+            hdf5_pure::Datatype::VariableLength {
+                is_string: false,
+                ..
+            }
+        ),
+        "repacked datatype must stay a non-string variable-length sequence"
+    );
+
+    // The reference C library reads the exact sequences back — the interop proof
+    // that the re-staged global heap and rebuilt references are valid.
+    let c = hdf5::File::open(&dst).unwrap();
+    let cds = c.dataset("seqs").unwrap();
+    let cvals = cds.read_raw::<VarLenArray<i32>>().unwrap();
+    let got: Vec<Vec<i32>> = cvals.iter().map(|v| v.as_slice().to_vec()).collect();
+    assert_eq!(got, seqs);
+}
+
+#[test]
+fn repack_roundtrips_c_object_reference_dataset() {
+    use hdf5::{ObjectReference, ObjectReference1, ReferencedObject};
+
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("c_refs.h5");
+    let dst = dir.path().join("refs_repacked.h5");
+
+    // The C library writes two targets plus a dataset of object references to
+    // them (one in the root, one in a subgroup).
+    {
+        let file = hdf5::File::create(&src).unwrap();
+        file.new_dataset::<f64>()
+            .shape((3,))
+            .create("alpha")
+            .unwrap()
+            .write(&[1.0f64, 2.0, 3.0])
+            .unwrap();
+        let grp = file.create_group("grp").unwrap();
+        grp.new_dataset::<i32>()
+            .shape((4,))
+            .create("beta")
+            .unwrap()
+            .write(&[10i32, 20, 30, 40])
+            .unwrap();
+        let refs = vec![
+            ObjectReference1::create(&file, "alpha").unwrap(),
+            ObjectReference1::create(&file, "grp/beta").unwrap(),
+            // A reference to the root group exercises the empty-path resolution.
+            ObjectReference1::create(&file, "/").unwrap(),
+        ];
+        file.new_dataset::<ObjectReference1>()
+            .shape((3,))
+            .create("refs")
+            .unwrap()
+            .write(&refs)
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    // hdf5-pure sees the repacked datatype as an object reference (not converted).
+    let f = File::open(&dst).unwrap();
+    assert!(
+        matches!(
+            f.dataset("refs").unwrap().datatype().unwrap(),
+            hdf5_pure::Datatype::Reference {
+                ref_type: hdf5_pure::ReferenceType::Object,
+                ..
+            }
+        ),
+        "repacked datatype must stay an object reference"
+    );
+
+    // The reference C library dereferences each repacked reference to the right
+    // object — the proof that the addresses were rewritten to the new locations
+    // rather than copied stale.
+    let c = hdf5::File::open(&dst).unwrap();
+    let cds = c.dataset("refs").unwrap();
+    let cvals = cds.read_raw::<ObjectReference1>().unwrap();
+    assert_eq!(cvals.len(), 3);
+    match cvals[0].dereference(&c).unwrap() {
+        ReferencedObject::Dataset(d) => {
+            assert_eq!(d.read_raw::<f64>().unwrap(), vec![1.0, 2.0, 3.0]);
+        }
+        other => panic!("ref 0 should resolve to a dataset, got {other:?}"),
+    }
+    match cvals[1].dereference(&c).unwrap() {
+        ReferencedObject::Dataset(d) => {
+            assert_eq!(d.read_raw::<i32>().unwrap(), vec![10, 20, 30, 40]);
+        }
+        other => panic!("ref 1 should resolve to a dataset, got {other:?}"),
+    }
+    match cvals[2].dereference(&c).unwrap() {
+        ReferencedObject::Group(_) => {}
+        other => panic!("ref 2 should resolve to the root group, got {other:?}"),
+    }
+}
+
+#[test]
+fn repack_refuses_reference_to_dropped_object() {
+    use hdf5::{ObjectReference, ObjectReference1};
+
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("c_refs_drop.h5");
+    let dst = dir.path().join("refs_drop_repacked.h5");
+
+    {
+        let file = hdf5::File::create(&src).unwrap();
+        file.new_dataset::<f64>()
+            .shape((2,))
+            .create("target")
+            .unwrap()
+            .write(&[1.0f64, 2.0])
+            .unwrap();
+        let refs = vec![ObjectReference1::create(&file, "target").unwrap()];
+        file.new_dataset::<ObjectReference1>()
+            .shape((1,))
+            .create("refs")
+            .unwrap()
+            .write(&refs)
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    // Dropping the referenced object must fail the repack by name rather than
+    // silently leave a dangling reference.
+    let err = repack(&src, &dst, &RepackOptions::new().drop_path("target")).unwrap_err();
+    match err {
+        hdf5_pure::Error::RepackUnsupported(msg) => assert!(
+            msg.contains("refs") && msg.contains("target") && msg.contains("dropped"),
+            "error should name the reference dataset and the dropped target: {msg}"
+        ),
+        other => panic!("expected RepackUnsupported, got {other:?}"),
+    }
+    assert!(!dst.exists(), "dst must not be created when repack refuses");
+}
+
+#[test]
 fn repack_refuses_chunked_vlen_string_dataset() {
     use hdf5::types::VarLenUnicode;
     use std::str::FromStr;

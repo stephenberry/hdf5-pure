@@ -719,9 +719,19 @@ pub(crate) struct VlStringStaging {
     pub patch_mask: Vec<bool>,
 }
 
-/// Stage the references and global-heap collection for a VL-string
+/// Stage the references and global-heap collection for a variable-length
 /// dataset/attribute from its per-element byte payloads.
-pub(crate) fn stage_vl_string_elements(elements: &[VlStringElement]) -> VlStringStaging {
+///
+/// `element_size` is the byte width of the VL base type. A VL string's base type
+/// is a single byte (`element_size == 1`), so the reference's stored `length`
+/// equals the payload's byte count. A non-string VL sequence stores an element
+/// *count* in that field, so the length written is `bytes.len() / element_size`,
+/// while the heap object still holds the exact bytes.
+pub(crate) fn stage_vl_elements(
+    elements: &[VlStringElement],
+    element_size: usize,
+) -> VlStringStaging {
+    let element_size = element_size.max(1);
     // Collect the non-null payloads in order; their 1-based positions become
     // the heap object indices.
     let mut objects: Vec<&[u8]> = Vec::new();
@@ -730,18 +740,22 @@ pub(crate) fn stage_vl_string_elements(elements: &[VlStringElement]) -> VlString
     for element in elements {
         match element {
             VlStringElement::Null => {
+                // A null VL reference: HDF5 marks "no heap object" with a zero
+                // heap address (`H5T__vlen_disk_isnull` tests addr == 0), not the
+                // all-ones "undefined address" sentinel — the reference C library
+                // rejects the latter as a bad heap index when reading.
                 refs.extend_from_slice(&0u32.to_le_bytes()); // length 0
-                refs.extend_from_slice(&u64::MAX.to_le_bytes()); // undefined address
+                refs.extend_from_slice(&0u64.to_le_bytes()); // null heap address
                 refs.extend_from_slice(&0u32.to_le_bytes()); // object index 0
                 patch_mask.push(false);
             }
             VlStringElement::Bytes(bytes) => {
                 #[expect(
                     clippy::cast_possible_truncation,
-                    reason = "VL element byte length is written into the 4-byte length prefix \
-                              of the variable-length reference"
+                    reason = "VL element length (element count) is written into the 4-byte \
+                              length prefix of the variable-length reference"
                 )]
-                refs.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                refs.extend_from_slice(&((bytes.len() / element_size) as u32).to_le_bytes());
                 refs.extend_from_slice(&0u64.to_le_bytes()); // patched later
                 let index = objects.len() + 1; // 1-based heap object index
                 #[expect(
@@ -873,6 +887,21 @@ pub(crate) struct RawChunkPayload {
     pub(crate) provider: core::panic::AssertUnwindSafe<Box<dyn ChunkProvider>>,
 }
 
+/// One element of an object-reference dataset written through the builder.
+///
+/// A reference either names an object by path (resolved to that object's
+/// destination address during serialization) or carries a raw address verbatim.
+/// The raw form preserves a null reference (address 0) or an undefined reference
+/// (`HADDR_UNDEF`, all-ones) exactly, which a faithful rewrite (repack) needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ObjectRefTarget {
+    /// Resolve to the destination address of the object at this path.
+    Path(String),
+    /// Write this exact 8-byte address (e.g. 0 for null, `u64::MAX` for
+    /// undefined).
+    Raw(u64),
+}
+
 /// Builder for datasets.
 pub struct DatasetBuilder {
     pub(crate) name: String,
@@ -887,9 +916,10 @@ pub struct DatasetBuilder {
     /// filter-pipeline message, and the geometry needed to lay them out. This
     /// takes precedence over `data` / `chunk_options` for chunked storage.
     pub(crate) raw_chunks: Option<RawChunkPayload>,
-    /// When set, this dataset contains object references that should be
-    /// resolved by path during file serialization.
-    pub(crate) reference_targets: Option<Vec<String>>,
+    /// When set, this dataset is an object-reference dataset whose element
+    /// addresses are resolved (per-element by path, or written raw) during file
+    /// serialization once every object's destination address is known.
+    pub(crate) reference_targets: Option<Vec<ObjectRefTarget>>,
     /// When set, this dataset stores variable-length strings: `data` holds the
     /// 16-byte references with placeholder heap addresses, and this staging
     /// carries the global heap collection plus the mask of references to patch
@@ -1062,13 +1092,28 @@ impl DatasetBuilder {
     /// each path is resolved to the absolute address of the named object.
     /// Paths use `/` separators (e.g., `"#refs#/child1"`).
     pub fn with_path_references(&mut self, paths: &[&str]) -> &mut Self {
+        let targets = paths
+            .iter()
+            .map(|s| ObjectRefTarget::Path(s.to_string()))
+            .collect();
+        self.with_object_references(targets)
+    }
+
+    /// Write an object-reference dataset from explicit per-element targets,
+    /// preserving null/undefined references verbatim. The datatype is set to the
+    /// 8-byte object-reference type; each [`ObjectRefTarget::Path`] is resolved to
+    /// its destination address during serialization, while
+    /// [`ObjectRefTarget::Raw`] is written as-is. This is the faithful re-emit
+    /// path used by repack. The shape defaults to `[targets.len()]` unless
+    /// [`with_shape`](Self::with_shape) sets it.
+    pub(crate) fn with_object_references(&mut self, targets: Vec<ObjectRefTarget>) -> &mut Self {
         self.datatype = Some(make_object_reference_type());
-        // Placeholder zeros — will be patched during finish()
-        self.data = Some(vec![0u8; paths.len() * 8]);
-        self.reference_targets = Some(paths.iter().map(|s| s.to_string()).collect());
+        // Placeholder zeros — patched once all destination addresses are known.
+        self.data = Some(vec![0u8; targets.len() * 8]);
         if self.shape.is_none() {
-            self.shape = Some(vec![paths.len() as u64]);
+            self.shape = Some(vec![targets.len() as u64]);
         }
+        self.reference_targets = Some(targets);
         self
     }
 
@@ -1298,8 +1343,60 @@ impl DatasetBuilder {
     /// Shared body of the VL-string write entry points: stage the references
     /// and global heap collection and record them on the builder.
     fn stage_vlen_strings(&mut self, datatype: Datatype, elements: &[VlStringElement]) {
+        // A VL string's base type is one byte, so the reference length is the
+        // byte count (element_size = 1).
+        self.stage_vlen_elements(datatype, elements, 1);
+    }
+
+    /// Write a *non-string* variable-length (sequence) dataset from an explicit
+    /// source datatype and per-element byte payloads.
+    ///
+    /// `datatype` must be a non-string VL datatype (e.g. `H5T_VLEN
+    /// { H5T_NATIVE_DOUBLE }`); its base type is reproduced verbatim. Each
+    /// element's exact heap bytes are re-staged through a fresh global heap, and
+    /// the per-element reference stores the base-type element count. This is the
+    /// faithful re-emit path used by repack. Returns a
+    /// [`TypeMismatch`](crate::FormatError::TypeMismatch) if `datatype` is a
+    /// string-shaped VL datatype or not variable-length at all. The shape
+    /// defaults to `[elements.len()]` unless [`with_shape`](Self::with_shape)
+    /// sets it.
+    pub(crate) fn with_vlen_sequence_elements(
+        &mut self,
+        datatype: Datatype,
+        elements: &[VlStringElement],
+    ) -> Result<&mut Self, crate::error::FormatError> {
+        let Datatype::VariableLength { base_type, .. } = &datatype else {
+            return Err(crate::error::FormatError::TypeMismatch {
+                expected: "non-string VariableLength",
+                actual: "non-VariableLength",
+            });
+        };
+        if crate::vl_data::is_vlen_string_datatype(&datatype) {
+            return Err(crate::error::FormatError::TypeMismatch {
+                expected: "non-string VariableLength",
+                actual: "VariableLength string",
+            });
+        }
+        let element_size = base_type.type_size() as usize;
+        if element_size == 0 {
+            return Err(crate::error::FormatError::VlDataError(
+                "non-string VL base type has zero size".into(),
+            ));
+        }
+        self.stage_vlen_elements(datatype, elements, element_size);
+        Ok(self)
+    }
+
+    /// Shared body of the VL write entry points (string and sequence): stage the
+    /// references and global heap collection and record them on the builder.
+    fn stage_vlen_elements(
+        &mut self,
+        datatype: Datatype,
+        elements: &[VlStringElement],
+        element_size: usize,
+    ) {
         let n = elements.len() as u64;
-        let staging = stage_vl_string_elements(elements);
+        let staging = stage_vl_elements(elements, element_size);
         self.datatype = Some(datatype);
         self.data = Some(staging.refs.clone());
         self.vl_string_staging = Some(staging);
