@@ -203,10 +203,16 @@ impl<'a> BitReader<'a> {
             self.byte_pos += 8;
             self.bits = 64;
         } else {
-            // Partial or exhausted -- zero-fill
+            // Partial or exhausted -- zero-fill the remaining bytes. Clamp the
+            // start index to the buffer length: a prior partial refill bumps
+            // `byte_pos` past the end (the `+= 8` below is unconditional), so on
+            // the next call `byte_pos > len`, and slicing `data[byte_pos..byte_pos]`
+            // would panic on the `start <= len` bounds check even though the range
+            // is empty. Clamping keeps the slice in bounds and yields a zero word.
             let mut bytes = [0u8; 8];
-            let avail = self.data.len().saturating_sub(self.byte_pos);
-            bytes[..avail].copy_from_slice(&self.data[self.byte_pos..self.byte_pos + avail]);
+            let start = self.byte_pos.min(self.data.len());
+            let avail = self.data.len() - start;
+            bytes[..avail].copy_from_slice(&self.data[start..start + avail]);
             self.word = u64::from_le_bytes(bytes);
             self.byte_pos += 8;
             self.bits = 64;
@@ -223,7 +229,10 @@ impl<'a> BitReader<'a> {
         if n <= self.bits {
             let mask = if n == 64 { u64::MAX } else { (1u64 << n) - 1 };
             let val = self.word & mask;
-            self.word >>= n;
+            // Shifting a u64 right by 64 overflows (panics in debug). When the
+            // whole word is consumed, `bits` reaches 0 and we refill, so the
+            // residual word is never observed — just zero it.
+            self.word = if n == 64 { 0 } else { self.word >> n };
             self.bits -= n;
             if self.bits == 0 {
                 self.refill();
@@ -2733,6 +2742,29 @@ mod tests {
         assert_eq!(r.read(1), 1);
         assert!(!r.read_bit());
         assert_eq!(r.read(64), 0xDEAD_BEEF_CAFE_BABE);
+    }
+
+    #[test]
+    fn bitreader_reads_past_eof_without_panic() {
+        // A truncated buffer (< one 8-byte word) must not panic. Each refill
+        // advances byte_pos by 8 unconditionally, so after the first partial
+        // refill byte_pos > len; a naive `data[byte_pos..byte_pos]` would panic
+        // on the bounds check even though the range is empty. Past EOF the
+        // reader yields zeros.
+        let mut r = BitReader::new(&[0xAB, 0xCD, 0xEF]);
+        for _ in 0..64 {
+            let _ = r.read(64);
+        }
+        assert_eq!(r.read(64), 0);
+    }
+
+    #[test]
+    fn decompress_truncated_chunk_does_not_panic() {
+        // A truncated fixed-rate ZFP chunk must not abort the process. The
+        // decoded values are irrelevant; the test passes if decompress returns
+        // (Ok or Err) instead of panicking.
+        let _ = decompress(&[0x12, 0x34], &[8usize], 4.0, ZfpElementType::F32);
+        let _ = decompress(&[], &[8usize], 4.0, ZfpElementType::F64);
     }
 
     // -- Negabinary --

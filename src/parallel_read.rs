@@ -80,11 +80,7 @@ pub fn decompress_chunks_lane_partitioned(
                 }
                 let raw_chunk = &file_data[r];
 
-                let decompressed = if chunk_info.filter_mask == 0 {
-                    decompress_chunk(raw_chunk, pipeline, ctx)?
-                } else {
-                    raw_chunk.to_vec()
-                };
+                let decompressed = decompress_chunk(raw_chunk, pipeline, ctx, chunk_info.filter_mask)?;
 
                 stats.chunks_processed += 1;
                 stats.compressed_bytes += u64::from(chunk_info.chunk_size);
@@ -156,7 +152,7 @@ mod tests {
             .iter()
             .map(|c| {
                 let r = slice_range(c.address, u64::from(c.chunk_size)).unwrap();
-                decompress_chunk(&file_data[r], pipeline, ctx).unwrap()
+                decompress_chunk(&file_data[r], pipeline, ctx, c.filter_mask).unwrap()
             })
             .collect()
     }

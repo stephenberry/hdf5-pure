@@ -347,12 +347,19 @@ fn convert_to_f64(
                 actual: *size as usize,
             }),
         },
-        Datatype::FixedPoint { size, signed, .. } => {
+        Datatype::FixedPoint {
+            size,
+            signed,
+            bit_offset,
+            bit_precision,
+            ..
+        } => {
             if *signed {
-                let v = read_signed_int(bytes, *size as usize, order);
+                let v = read_signed_int(bytes, *size as usize, order, *bit_offset, *bit_precision);
                 Ok(v as f64)
             } else {
-                let v = read_unsigned_int(bytes, *size as usize, order);
+                let v =
+                    read_unsigned_int(bytes, *size as usize, order, *bit_offset, *bit_precision);
                 Ok(v as f64)
             }
         }
@@ -375,10 +382,11 @@ pub fn read_as_i64(raw: &[u8], datatype: &Datatype) -> Result<Vec<i64>, FormatEr
     }
     let count = raw.len() / elem_size;
     let order = get_byte_order(datatype);
+    let (bit_offset, bit_precision) = int_bits(datatype);
     let mut result = Vec::with_capacity(count);
     for i in 0..count {
         let chunk = &raw[i * elem_size..(i + 1) * elem_size];
-        let v = read_signed_int(chunk, elem_size, &order);
+        let v = read_signed_int(chunk, elem_size, &order, bit_offset, bit_precision);
         result.push(v);
     }
     Ok(result)
@@ -396,10 +404,11 @@ pub fn read_as_u64(raw: &[u8], datatype: &Datatype) -> Result<Vec<u64>, FormatEr
     }
     let count = raw.len() / elem_size;
     let order = get_byte_order(datatype);
+    let (bit_offset, bit_precision) = int_bits(datatype);
     let mut result = Vec::with_capacity(count);
     for i in 0..count {
         let chunk = &raw[i * elem_size..(i + 1) * elem_size];
-        let v = read_unsigned_int(chunk, elem_size, &order);
+        let v = read_unsigned_int(chunk, elem_size, &order, bit_offset, bit_precision);
         result.push(v);
     }
     Ok(result)
@@ -432,16 +441,28 @@ pub fn read_as_f32(raw: &[u8], datatype: &Datatype) -> Result<Vec<f32>, FormatEr
                 result.push(read_f64_bytes(chunk, &order) as f32);
             }
             Datatype::FixedPoint {
-                signed: true, size, ..
+                signed: true,
+                size,
+                bit_offset,
+                bit_precision,
+                ..
             } => {
-                result.push(read_signed_int(chunk, *size as usize, &order) as f32);
+                result.push(
+                    read_signed_int(chunk, *size as usize, &order, *bit_offset, *bit_precision)
+                        as f32,
+                );
             }
             Datatype::FixedPoint {
                 signed: false,
                 size,
+                bit_offset,
+                bit_precision,
                 ..
             } => {
-                result.push(read_unsigned_int(chunk, *size as usize, &order) as f32);
+                result.push(
+                    read_unsigned_int(chunk, *size as usize, &order, *bit_offset, *bit_precision)
+                        as f32,
+                );
             }
             _ => {
                 return Err(FormatError::TypeMismatch {
@@ -466,10 +487,11 @@ pub fn read_as_i32(raw: &[u8], datatype: &Datatype) -> Result<Vec<i32>, FormatEr
     }
     let count = raw.len() / elem_size;
     let order = get_byte_order(datatype);
+    let (bit_offset, bit_precision) = int_bits(datatype);
     let mut result = Vec::with_capacity(count);
     for i in 0..count {
         let chunk = &raw[i * elem_size..(i + 1) * elem_size];
-        let v = read_signed_int(chunk, elem_size, &order);
+        let v = read_signed_int(chunk, elem_size, &order, bit_offset, bit_precision);
         #[expect(
             clippy::cast_possible_truncation,
             reason = "read_as_i32 narrows each stored signed value to the requested i32"
@@ -562,42 +584,84 @@ fn read_f32_bytes(bytes: &[u8], order: &DatatypeByteOrder) -> f32 {
     f32::from_le_bytes(buf)
 }
 
-fn read_unsigned_int(bytes: &[u8], size: usize, order: &DatatypeByteOrder) -> u64 {
-    let buf = reorder_bytes(bytes, order);
-    match size {
-        1 => buf[0] as u64,
-        2 => u16::from_le_bytes([buf[0], buf[1]]) as u64,
-        4 => u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as u64,
-        8 => u64::from_le_bytes(buf),
+/// Fixed-point `(bit_offset, bit_precision)` for a datatype. Non-fixed-point
+/// numeric types (the float-reinterpreted-as-int fallbacks) report a full-width
+/// standard layout, so their decoding is byte-for-byte unchanged.
+fn int_bits(dt: &Datatype) -> (u16, u16) {
+    match dt {
+        Datatype::FixedPoint {
+            bit_offset,
+            bit_precision,
+            ..
+        } => (*bit_offset, *bit_precision),
         _ => {
-            // Generic: read as LE
-            let mut val = 0u64;
-            for (i, &byte) in buf.iter().enumerate().take(size.min(8)) {
-                val |= (byte as u64) << (i * 8);
-            }
-            val
+            let bits = (get_size(dt) * 8).min(u16::MAX as usize) as u16;
+            (0, bits)
         }
     }
 }
 
+/// Read the raw stored integer word (zero-extended to `u64`), honoring byte
+/// order. Widths beyond 8 bytes keep only the low 8, matching the `u64`/`i64`
+/// element model.
+fn read_raw_word(bytes: &[u8], size: usize, order: &DatatypeByteOrder) -> u64 {
+    let buf = reorder_bytes(bytes, order);
+    let mut val = 0u64;
+    for (i, &byte) in buf.iter().enumerate().take(size.min(8)) {
+        val |= (byte as u64) << (i * 8);
+    }
+    val
+}
+
+/// Extract the significant bits of a fixed-point value per the HDF5 layout:
+/// drop the `bit_offset` low padding bits and mask to `bit_precision`
+/// significant bits, right-justified. Returns the unsigned magnitude. For the
+/// standard full-width case (`bit_offset == 0`, `bit_precision == size*8`) this
+/// is the identity, so normal integers decode exactly as before.
+fn extract_unsigned_bits(raw: u64, bit_offset: u16, bit_precision: u16) -> u64 {
+    let off = u32::from(bit_offset);
+    let prec = u32::from(bit_precision);
+    let shifted = if off >= 64 { 0 } else { raw >> off };
+    if prec == 0 {
+        0
+    } else if prec >= 64 {
+        shifted
+    } else {
+        shifted & ((1u64 << prec) - 1)
+    }
+}
+
+fn read_unsigned_int(
+    bytes: &[u8],
+    size: usize,
+    order: &DatatypeByteOrder,
+    bit_offset: u16,
+    bit_precision: u16,
+) -> u64 {
+    let raw = read_raw_word(bytes, size, order);
+    extract_unsigned_bits(raw, bit_offset, bit_precision)
+}
+
 #[expect(
     clippy::cast_possible_wrap,
-    reason = "reinterprets raw bytes as a signed integer; sign reinterpretation and \
+    reason = "reinterprets raw bits as a signed integer; sign reinterpretation and \
               sign-extension are the intended operations"
 )]
-fn read_signed_int(bytes: &[u8], size: usize, order: &DatatypeByteOrder) -> i64 {
-    let buf = reorder_bytes(bytes, order);
-    match size {
-        1 => buf[0] as i8 as i64,
-        2 => i16::from_le_bytes([buf[0], buf[1]]) as i64,
-        4 => i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64,
-        8 => i64::from_le_bytes(buf),
-        _ => {
-            let u = read_unsigned_int(bytes, size, order);
-            // Sign extend
-            let shift = 64 - (size * 8);
-            ((u as i64) << shift) >> shift
-        }
+fn read_signed_int(
+    bytes: &[u8],
+    size: usize,
+    order: &DatatypeByteOrder,
+    bit_offset: u16,
+    bit_precision: u16,
+) -> i64 {
+    let magnitude = read_unsigned_int(bytes, size, order, bit_offset, bit_precision);
+    let prec = u32::from(bit_precision);
+    if prec == 0 || prec >= 64 {
+        magnitude as i64
+    } else {
+        // Sign-extend from the precision boundary: replicate bit (prec - 1).
+        let shift = 64 - prec;
+        ((magnitude << shift) as i64) >> shift
     }
 }
 
@@ -932,5 +996,69 @@ mod tests {
         );
         assert!(matches!(buffered, Err(FormatError::NoDataAllocated)));
         assert!(matches!(streamed, Err(FormatError::NoDataAllocated)));
+    }
+
+    // --- Sub-byte precision / bit-offset integers (#6) ---
+
+    #[test]
+    fn unsigned_subbyte_precision_masks_padding() {
+        // 12 significant bits stored in 2 bytes; the top 4 bits are padding and
+        // must be masked off (previously returned as part of the value).
+        let dt = Datatype::FixedPoint {
+            size: 2,
+            byte_order: DatatypeByteOrder::LittleEndian,
+            signed: false,
+            bit_offset: 0,
+            bit_precision: 12,
+        };
+        // Stored word 0xF123: low 12 bits = 0x123 (= 291), high nibble padding.
+        let raw = 0xF123u16.to_le_bytes();
+        assert_eq!(read_as_u64(&raw, &dt).unwrap(), vec![0x123]);
+    }
+
+    #[test]
+    fn unsigned_bit_offset_shifts_value() {
+        // 8 significant bits living in bits [4, 12) of a 16-bit word; both the
+        // low 4 (offset) and high 4 bits are padding.
+        let dt = Datatype::FixedPoint {
+            size: 2,
+            byte_order: DatatypeByteOrder::LittleEndian,
+            signed: false,
+            bit_offset: 4,
+            bit_precision: 8,
+        };
+        // 0xCAB7 -> (>>4) = 0xCAB -> &0xFF = 0xAB (= 171).
+        let raw = 0xCAB7u16.to_le_bytes();
+        assert_eq!(read_as_u64(&raw, &dt).unwrap(), vec![0xAB]);
+    }
+
+    #[test]
+    fn signed_subbyte_precision_sign_extends() {
+        // 4-bit signed value 0b1111 == -1; the high nibble is padding that must
+        // not leak in, and the sign bit is at bit 3, not bit 7.
+        let dt = Datatype::FixedPoint {
+            size: 1,
+            byte_order: DatatypeByteOrder::LittleEndian,
+            signed: true,
+            bit_offset: 0,
+            bit_precision: 4,
+        };
+        assert_eq!(read_as_i64(&[0x3F], &dt).unwrap(), vec![-1]);
+        // 0b0111 == +7 (still inside 4-bit range, stays positive).
+        assert_eq!(read_as_i64(&[0x07], &dt).unwrap(), vec![7]);
+    }
+
+    #[test]
+    fn standard_width_integers_unchanged() {
+        // Regression guard: full-width integers must decode exactly as before.
+        let i32t = make_i32_le_type();
+        assert_eq!(read_as_i64(&(-5i32).to_le_bytes(), &i32t).unwrap(), vec![-5]);
+        let i16t = make_i16_le_type();
+        assert_eq!(
+            read_as_i64(&(-12345i16).to_le_bytes(), &i16t).unwrap(),
+            vec![-12345]
+        );
+        let u8t = make_u8_type();
+        assert_eq!(read_as_u64(&[200u8], &u8t).unwrap(), vec![200]);
     }
 }

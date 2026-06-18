@@ -62,11 +62,7 @@ fn decompress_all_chunks(
         let raw_chunk = &file_data[r];
 
         let decompressed = if let Some(pl) = pipeline {
-            if chunk_info.filter_mask == 0 {
-                decompress_chunk(raw_chunk, pl, ctx)?
-            } else {
-                raw_chunk.to_vec()
-            }
+            decompress_chunk(raw_chunk, pl, ctx, chunk_info.filter_mask)?
         } else {
             raw_chunk.to_vec()
         };
@@ -92,11 +88,7 @@ fn decompress_all_chunks_from_source<S: FileSource + ?Sized>(
         let raw_chunk =
             source.read_exact_at(chunk_info.address, chunk_info.chunk_size.to_usize()?)?;
         let decompressed = if let Some(pl) = pipeline {
-            if chunk_info.filter_mask == 0 {
-                decompress_chunk(&raw_chunk, pl, ctx)?
-            } else {
-                raw_chunk
-            }
+            decompress_chunk(&raw_chunk, pl, ctx, chunk_info.filter_mask)?
         } else {
             raw_chunk
         };
@@ -155,8 +147,28 @@ pub fn collect_chunk_info(
     btree_address: u64,
     ndims: usize,
     offset_size: u8,
-    _length_size: u8,
+    length_size: u8,
 ) -> Result<Vec<ChunkInfo>, FormatError> {
+    collect_chunk_info_inner(file_data, btree_address, ndims, offset_size, length_size, 0)
+}
+
+/// Depth-tracking core of [`collect_chunk_info`]. The `depth` guard mirrors
+/// [`collect_chunk_btree_node_spans_inner`]: a cyclic or pathologically deep
+/// internal node in a foreign file errors out instead of recursing until the
+/// stack overflows (which would abort the process uncatchably).
+fn collect_chunk_info_inner(
+    file_data: &[u8],
+    btree_address: u64,
+    ndims: usize,
+    offset_size: u8,
+    _length_size: u8,
+    depth: u32,
+) -> Result<Vec<ChunkInfo>, FormatError> {
+    if depth > MAX_CHUNK_BTREE_DEPTH {
+        return Err(FormatError::ChunkedReadError(
+            "chunk B-tree nested too deeply".into(),
+        ));
+    }
     let offset = btree_address.to_usize()?;
     let os = offset_size as usize;
 
@@ -252,8 +264,14 @@ pub fn collect_chunk_info(
 
         let mut all_chunks = Vec::new();
         for child_addr in child_addrs {
-            let child_chunks =
-                collect_chunk_info(file_data, child_addr, ndims, offset_size, _length_size)?;
+            let child_chunks = collect_chunk_info_inner(
+                file_data,
+                child_addr,
+                ndims,
+                offset_size,
+                _length_size,
+                depth + 1,
+            )?;
             all_chunks.extend(child_chunks);
         }
         Ok(all_chunks)
@@ -382,8 +400,26 @@ pub fn collect_chunk_info_from_source<S: FileSource + ?Sized>(
     btree_address: u64,
     ndims: usize,
     offset_size: u8,
-    _length_size: u8,
+    length_size: u8,
 ) -> Result<Vec<ChunkInfo>, FormatError> {
+    collect_chunk_info_from_source_inner(source, btree_address, ndims, offset_size, length_size, 0)
+}
+
+/// Depth-tracking core of [`collect_chunk_info_from_source`]; see
+/// [`collect_chunk_info_inner`] for why the bound is required.
+fn collect_chunk_info_from_source_inner<S: FileSource + ?Sized>(
+    source: &S,
+    btree_address: u64,
+    ndims: usize,
+    offset_size: u8,
+    _length_size: u8,
+    depth: u32,
+) -> Result<Vec<ChunkInfo>, FormatError> {
+    if depth > MAX_CHUNK_BTREE_DEPTH {
+        return Err(FormatError::ChunkedReadError(
+            "chunk B-tree nested too deeply".into(),
+        ));
+    }
     let os = offset_size as usize;
     let header_size = btree_v1_node_header_size(offset_size);
 
@@ -445,12 +481,13 @@ pub fn collect_chunk_info_from_source<S: FileSource + ?Sized>(
         }
         let mut all_chunks = Vec::new();
         for child_addr in child_addrs {
-            all_chunks.extend(collect_chunk_info_from_source(
+            all_chunks.extend(collect_chunk_info_from_source_inner(
                 source,
                 child_addr,
                 ndims,
                 offset_size,
                 _length_size,
+                depth + 1,
             )?);
         }
         Ok(all_chunks)
@@ -893,11 +930,7 @@ pub fn read_chunked_data_cached_from_source<S: FileSource + ?Sized>(
             let raw_chunk =
                 source.read_exact_at(chunk_info.address, chunk_info.chunk_size.to_usize()?)?;
             let dec = if let Some(pl) = pipeline {
-                if chunk_info.filter_mask == 0 {
-                    decompress_chunk(&raw_chunk, pl, ctx)?
-                } else {
-                    raw_chunk
-                }
+                decompress_chunk(&raw_chunk, pl, ctx, chunk_info.filter_mask)?
             } else {
                 raw_chunk
             };
@@ -1382,11 +1415,7 @@ pub fn read_chunked_data_cached(
             }
             let raw_chunk = &file_data[r];
             let dec = if let Some(pl) = pipeline {
-                if chunk_info.filter_mask == 0 {
-                    decompress_chunk(raw_chunk, pl, ctx)?
-                } else {
-                    raw_chunk.to_vec()
-                }
+                decompress_chunk(raw_chunk, pl, ctx, chunk_info.filter_mask)?
             } else {
                 raw_chunk.to_vec()
             };
@@ -1715,6 +1744,21 @@ mod tests {
 
         let result = collect_chunk_info(&file_data, 0, ndims, os, os).unwrap();
         assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn collect_chunk_info_rejects_cyclic_btree() {
+        // An internal node whose only child points back at itself. Without a
+        // depth guard this recurses forever and overflows the stack (an
+        // uncatchable process abort); the guard must turn it into an error.
+        let ndims = 2;
+        let os: u8 = 8;
+        let node = build_chunk_btree_internal(1, &[0u64], ndims, os);
+        let mut file_data = vec![0u8; 0x1000];
+        file_data[..node.len()].copy_from_slice(&node);
+
+        let err = collect_chunk_info(&file_data, 0, ndims, os, os).unwrap_err();
+        assert!(matches!(err, FormatError::ChunkedReadError(_)));
     }
 
     // --- Chunked read tests (synthetic) ---
