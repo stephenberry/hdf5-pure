@@ -1048,6 +1048,38 @@ fn roundtrip_scale_offset_integer_then_deflate() {
 }
 
 #[test]
+fn roundtrip_scale_offset_incompressible_then_deflate() {
+    // Regression for #97 (PR review): a full i32 dynamic range forces
+    // scale-offset's raw fallback, whose output is HEADER_LEN bytes LARGER than
+    // the chunk. On read deflate is reversed first and must legitimately produce
+    // that larger buffer, so the deflate output cap must account for the inner
+    // scale-offset expansion instead of rejecting it as a decompression bomb.
+    let n = 256usize;
+    let data: Vec<i32> = (0..n)
+        .map(|i| match i % 4 {
+            0 => i32::MIN,
+            1 => i32::MAX,
+            2 => -(i as i32).wrapping_mul(7919),
+            _ => (i as i32).wrapping_mul(104_729),
+        })
+        .collect();
+
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("data")
+        .with_i32_data(&data)
+        .with_shape(&[n as u64])
+        .with_chunks(&[64])
+        .with_scale_offset(hdf5_pure::ScaleOffset::Integer(0))
+        .with_deflate(5);
+    let bytes = builder.finish().unwrap();
+
+    let file = File::from_bytes(bytes).unwrap();
+    let ds = file.dataset("data").unwrap();
+    assert_eq!(ds.read_i32().unwrap(), data);
+}
+
+#[test]
 fn shape_data_mismatch_is_rejected() {
     use hdf5_pure::{Error, FormatError};
 

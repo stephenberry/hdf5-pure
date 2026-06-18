@@ -118,13 +118,33 @@ pub fn decompress_chunk(
     compressed: &[u8],
     pipeline: &FilterPipeline,
     ctx: ChunkContext<'_>,
+    filter_mask: u32,
 ) -> Result<Vec<u8>, FormatError> {
+    // Expected size of the fully decoded chunk. Every chunk, even one straddling
+    // a dataset edge, is stored at full chunk size, so this is the exact decoded
+    // length. Used to bound deflate output (decompression-bomb guard) and to
+    // reject a chunk that decodes to the wrong size.
+    let expected = expected_chunk_len(&ctx);
+
     let mut owned: Option<Vec<u8>> = None;
-    for filter in pipeline.filters.iter().rev() {
+    // Filters are listed in application (forward) order; decoding reverses them.
+    // `i` is the filter's forward index, which is also its bit position in
+    // `filter_mask` (HDF5 H5Z pipeline numbering): bit `i` set means filter `i`
+    // was skipped for THIS chunk and must NOT be reversed. Treating any non-zero
+    // mask as "return raw" (the prior behaviour) corrupts chunks in a multi-filter
+    // pipeline where only some filters were skipped (e.g. shuffle+gzip on an
+    // incompressible chunk, which is stored shuffled but not deflated).
+    for (i, filter) in pipeline.filters.iter().enumerate().rev() {
+        if i < 32 && (filter_mask >> i) & 1 == 1 {
+            continue;
+        }
         let input: &[u8] = owned.as_deref().unwrap_or(compressed);
         let next = match filter.filter_id {
             FILTER_SHUFFLE => shuffle_decompress(input, ctx.element_size as usize)?,
-            FILTER_DEFLATE => deflate_decompress(input)?,
+            FILTER_DEFLATE => deflate_decompress(
+                input,
+                deflate_output_cap(expected, pipeline, filter_mask, i),
+            )?,
             FILTER_FLETCHER32 => fletcher32_verify(input)?,
             FILTER_SCALEOFFSET => crate::scaleoffset::decompress(input, filter)?,
             #[cfg(feature = "zfp")]
@@ -133,7 +153,78 @@ pub fn decompress_chunk(
         };
         owned = Some(next);
     }
-    Ok(owned.unwrap_or_else(|| compressed.to_vec()))
+    let result = owned.unwrap_or_else(|| compressed.to_vec());
+
+    // A valid chunk always decodes to exactly the full chunk size. A mismatch
+    // means a corrupt or hostile filter stream; erroring here prevents silently
+    // zero-filling (when short) or dropping (when long) data during chunk
+    // assembly, which copies only the in-range overlap.
+    if let Some(expected) = expected {
+        if result.len() != expected {
+            return Err(FormatError::DataSizeMismatch {
+                expected,
+                actual: result.len(),
+            });
+        }
+    }
+    Ok(result)
+}
+
+/// Expected byte length of a fully decoded chunk: product of the chunk element
+/// dimensions times the element size. Returns `None` when the product can't be
+/// represented (treated as "unknown", so the size-dependent guards are skipped
+/// rather than misfiring) or is zero.
+fn expected_chunk_len(ctx: &ChunkContext<'_>) -> Option<usize> {
+    let elems = ctx
+        .chunk_dims
+        .iter()
+        .try_fold(1u64, |acc, &d| acc.checked_mul(d))?;
+    let bytes = elems.checked_mul(u64::from(ctx.element_size))?;
+    usize::try_from(bytes).ok().filter(|&n| n != 0)
+}
+
+/// Upper bound on a filter's forward (compress) output for an input of
+/// `in_size` bytes. Used to bound a deflate stage's legitimate decoded output:
+/// on decode, deflate is reversed BEFORE the lower-forward-index filters that
+/// ran before it on the write path, so its output equals the chunk size pushed
+/// forward through those inner filters. Only an upper bound is needed — the
+/// exact chunk-size check after the whole pipeline still rejects wrong output —
+/// so this is the decompression-bomb memory guard, not a correctness gate.
+fn filter_max_forward_output(filter_id: u16, in_size: usize) -> usize {
+    match filter_id {
+        // Fletcher32 appends a 4-byte checksum.
+        FILTER_FLETCHER32 => in_size.saturating_add(4),
+        // Scale-offset prepends a fixed header and, when the data does not pack
+        // smaller, stores it verbatim after that header.
+        FILTER_SCALEOFFSET => in_size.saturating_add(crate::scaleoffset::HEADER_LEN),
+        // Deflate can slightly expand incompressible input (zlib "stored" blocks
+        // plus framing); bound it well above zlib's worst case.
+        FILTER_DEFLATE => in_size.saturating_add(in_size / 16).saturating_add(64),
+        // Shuffle is size-preserving; fixed-rate ZFP never exceeds the native
+        // element width. An unknown filter makes the read fail when it is reached
+        // after deflate regardless, so leaving the size unchanged is fine.
+        _ => in_size,
+    }
+}
+
+/// Upper bound for a deflate stage's decoded output: the final chunk size
+/// (`expected`) pushed forward through every surviving lower-forward-index
+/// filter. `None` (size unknown) leaves deflate uncapped. A masked filter did
+/// not run on the write path, so it does not change the intermediate size.
+fn deflate_output_cap(
+    expected: Option<usize>,
+    pipeline: &FilterPipeline,
+    filter_mask: u32,
+    deflate_index: usize,
+) -> Option<usize> {
+    let mut size = expected?;
+    for (j, f) in pipeline.filters[..deflate_index].iter().enumerate() {
+        if j < 32 && (filter_mask >> j) & 1 == 1 {
+            continue;
+        }
+        size = filter_max_forward_output(f.filter_id, size);
+    }
+    Some(size)
 }
 
 /// Apply a filter pipeline to compress a chunk.
@@ -220,19 +311,44 @@ fn zfp_decompress(
 }
 
 /// Decompress zlib-compressed data.
+///
+/// `max_output`, when known, bounds the decompressed size: a deflate stage in a
+/// chunk pipeline never expands beyond the chunk's expected byte size, so a
+/// stream that inflates past it signals a decompression bomb and is rejected
+/// instead of being allowed to allocate unbounded memory (OOM).
 #[cfg(feature = "deflate")]
-fn deflate_decompress(data: &[u8]) -> Result<Vec<u8>, FormatError> {
+fn deflate_decompress(data: &[u8], max_output: Option<usize>) -> Result<Vec<u8>, FormatError> {
     use std::io::Read;
-    let mut decoder = flate2::read::ZlibDecoder::new(data);
+    let decoder = flate2::read::ZlibDecoder::new(data);
     let mut result = Vec::new();
-    decoder
-        .read_to_end(&mut result)
-        .map_err(|e| FormatError::DecompressionError(e.to_string()))?;
+    match max_output {
+        Some(limit) => {
+            // Read at most `limit + 1` bytes: anything beyond `limit` proves the
+            // stream exceeds the expected chunk size, so reject rather than OOM.
+            let cap = (limit as u64).saturating_add(1);
+            decoder
+                .take(cap)
+                .read_to_end(&mut result)
+                .map_err(|e| FormatError::DecompressionError(e.to_string()))?;
+            if result.len() > limit {
+                return Err(FormatError::DecompressionError(format!(
+                    "deflate output exceeds expected chunk size of {limit} bytes \
+                     (possible decompression bomb)"
+                )));
+            }
+        }
+        None => {
+            let mut decoder = decoder;
+            decoder
+                .read_to_end(&mut result)
+                .map_err(|e| FormatError::DecompressionError(e.to_string()))?;
+        }
+    }
     Ok(result)
 }
 
 #[cfg(not(feature = "deflate"))]
-fn deflate_decompress(_data: &[u8]) -> Result<Vec<u8>, FormatError> {
+fn deflate_decompress(_data: &[u8], _max_output: Option<usize>) -> Result<Vec<u8>, FormatError> {
     Err(FormatError::UnsupportedFilter(FILTER_DEFLATE))
 }
 
@@ -395,7 +511,7 @@ mod tests {
     fn deflate_compress_decompress_roundtrip() {
         let data: Vec<u8> = (0..256).map(|i| (i % 256) as u8).collect();
         let compressed = deflate_compress(&data, 6).unwrap();
-        let decompressed = deflate_decompress(&compressed).unwrap();
+        let decompressed = deflate_decompress(&compressed, None).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -408,7 +524,7 @@ mod tests {
         let compressed: Vec<u8> = vec![
             120, 156, 99, 96, 100, 98, 102, 97, 101, 99, 231, 224, 4, 0, 0, 175, 0, 46,
         ];
-        let decompressed = deflate_decompress(&compressed).unwrap();
+        let decompressed = deflate_decompress(&compressed, None).unwrap();
         assert_eq!(decompressed, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
     }
 
@@ -419,7 +535,7 @@ mod tests {
         let data = vec![0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9];
         let compressed = deflate_compress(&data, 6).unwrap();
         assert!(!compressed.is_empty());
-        let decompressed = deflate_decompress(&compressed).unwrap();
+        let decompressed = deflate_decompress(&compressed, None).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -519,7 +635,7 @@ mod tests {
         let dims = [data.len() as u64];
         let ctx = ChunkContext::basic(&dims, 1);
         let compressed = compress_chunk(&data, &pipeline, ctx).unwrap();
-        let decompressed = decompress_chunk(&compressed, &pipeline, ctx).unwrap();
+        let decompressed = decompress_chunk(&compressed, &pipeline, ctx, 0).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -548,7 +664,7 @@ mod tests {
         let dims = [(data.len() / 8) as u64];
         let ctx = ChunkContext::basic(&dims, 8);
         let compressed = compress_chunk(&data, &pipeline, ctx).unwrap();
-        let decompressed = decompress_chunk(&compressed, &pipeline, ctx).unwrap();
+        let decompressed = decompress_chunk(&compressed, &pipeline, ctx, 0).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -582,7 +698,7 @@ mod tests {
         let dims = [(data.len() / 8) as u64];
         let ctx = ChunkContext::basic(&dims, 8);
         let compressed = compress_chunk(&data, &pipeline, ctx).unwrap();
-        let decompressed = decompress_chunk(&compressed, &pipeline, ctx).unwrap();
+        let decompressed = decompress_chunk(&compressed, &pipeline, ctx, 0).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -617,7 +733,172 @@ mod tests {
         let dims = [(data.len() / 8) as u64];
         let ctx = ChunkContext::basic(&dims, 8);
         let compressed = compress_chunk(&data, &pipeline, ctx).unwrap();
-        let decompressed = decompress_chunk(&compressed, &pipeline, ctx).unwrap();
+        let decompressed = decompress_chunk(&compressed, &pipeline, ctx, 0).unwrap();
         assert_eq!(decompressed, data);
+    }
+
+    /// A non-zero `filter_mask` is per-filter: only the masked filters were
+    /// skipped for this chunk; the rest still apply. The common case is a
+    /// shuffle+deflate pipeline where an incompressible chunk is stored shuffled
+    /// but NOT deflated. Decoding must reverse shuffle while skipping deflate.
+    #[test]
+    #[cfg(feature = "deflate")]
+    fn pipeline_partial_mask_reverses_surviving_filter() {
+        let pipeline = FilterPipeline {
+            version: 2,
+            filters: vec![
+                FilterDescription {
+                    filter_id: FILTER_SHUFFLE, // forward index 0
+                    name: None,
+                    flags: 0,
+                    client_data: vec![],
+                },
+                FilterDescription {
+                    filter_id: FILTER_DEFLATE, // forward index 1
+                    name: None,
+                    flags: 0,
+                    client_data: vec![6],
+                },
+            ],
+        };
+        let data: Vec<u8> = (0..200).map(|i| (i % 256) as u8).collect();
+        let dims = [(data.len() / 8) as u64];
+        let ctx = ChunkContext::basic(&dims, 8);
+
+        // Stored form when deflate was declined: shuffled only.
+        let stored = shuffle_compress(&data, 8).unwrap();
+        // Bit 1 set => deflate (index 1) was skipped for this chunk.
+        let mask = 1u32 << 1;
+        let decoded = decompress_chunk(&stored, &pipeline, ctx, mask).unwrap();
+        assert_eq!(
+            decoded, data,
+            "shuffle must be reversed even when deflate is skipped"
+        );
+
+        // The previous behaviour returned raw (still-shuffled) bytes — guard it.
+        assert_ne!(
+            stored, data,
+            "precondition: stored bytes are shuffled, not raw"
+        );
+    }
+
+    /// Symmetric case: the low filter is skipped, the high one still applies.
+    #[test]
+    #[cfg(feature = "deflate")]
+    fn pipeline_partial_mask_skips_low_filter() {
+        let pipeline = FilterPipeline {
+            version: 2,
+            filters: vec![
+                FilterDescription {
+                    filter_id: FILTER_SHUFFLE, // forward index 0
+                    name: None,
+                    flags: 0,
+                    client_data: vec![],
+                },
+                FilterDescription {
+                    filter_id: FILTER_DEFLATE, // forward index 1
+                    name: None,
+                    flags: 0,
+                    client_data: vec![6],
+                },
+            ],
+        };
+        let data: Vec<u8> = (0u32..200)
+            .map(|i| (i.wrapping_mul(7) % 256) as u8)
+            .collect();
+        let dims = [(data.len() / 8) as u64];
+        let ctx = ChunkContext::basic(&dims, 8);
+
+        // Shuffle skipped: stored = deflate(data) directly.
+        let stored = deflate_compress(&data, 6).unwrap();
+        let mask = 1u32 << 0; // bit 0 => shuffle (index 0) skipped
+        let decoded = decompress_chunk(&stored, &pipeline, ctx, mask).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    // --- Decompression-bomb / size guards (#5) ---
+
+    #[test]
+    #[cfg(feature = "deflate")]
+    fn deflate_decompress_rejects_bomb() {
+        // A few bytes that inflate to 100 KB; with a 1 KB cap this is rejected
+        // rather than allowed to allocate unbounded memory.
+        let huge = vec![0u8; 100_000];
+        let compressed = deflate_compress(&huge, 9).unwrap();
+        assert!(compressed.len() < 1024);
+        let err = deflate_decompress(&compressed, Some(1024)).unwrap_err();
+        assert!(matches!(err, FormatError::DecompressionError(_)));
+        // Without a cap it still works (used where the size is genuinely unknown).
+        assert_eq!(
+            deflate_decompress(&compressed, None).unwrap().len(),
+            100_000
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "deflate")]
+    fn deflate_decompress_within_cap_ok() {
+        let data = vec![7u8; 500];
+        let compressed = deflate_compress(&data, 6).unwrap();
+        // Cap equal to the exact output length must pass.
+        assert_eq!(deflate_decompress(&compressed, Some(500)).unwrap(), data);
+    }
+
+    #[test]
+    #[cfg(feature = "deflate")]
+    fn decompress_chunk_rejects_wrong_decoded_size() {
+        let pipeline = FilterPipeline {
+            version: 2,
+            filters: vec![FilterDescription {
+                filter_id: FILTER_DEFLATE,
+                name: None,
+                flags: 0,
+                client_data: vec![6],
+            }],
+        };
+        // Chunk decodes to 50 bytes, but the context expects 100 (10 elems x 10).
+        let data = vec![3u8; 50];
+        let compressed = compress_chunk(&data, &pipeline, ChunkContext::basic(&[50], 1)).unwrap();
+        let ctx = ChunkContext::basic(&[10], 10); // expected = 100 bytes
+        let err = decompress_chunk(&compressed, &pipeline, ctx, 0).unwrap_err();
+        assert!(matches!(
+            err,
+            FormatError::DataSizeMismatch {
+                expected: 100,
+                actual: 50
+            }
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "deflate")]
+    fn pipeline_fletcher32_inner_deflate_outer_roundtrips() {
+        // Fletcher32 BEFORE deflate on the write path (forward index 0): the
+        // 4-byte checksum is appended first, then deflate compresses data+4. On
+        // decode, deflate is reversed first and legitimately produces
+        // `expected + 4` bytes, which must NOT be mistaken for a decompression
+        // bomb by the deflate output cap.
+        let pipeline = FilterPipeline {
+            version: 2,
+            filters: vec![
+                FilterDescription {
+                    filter_id: FILTER_FLETCHER32, // forward index 0 (inner)
+                    name: None,
+                    flags: 0,
+                    client_data: vec![],
+                },
+                FilterDescription {
+                    filter_id: FILTER_DEFLATE, // forward index 1 (outer)
+                    name: None,
+                    flags: 0,
+                    client_data: vec![6],
+                },
+            ],
+        };
+        let data: Vec<u8> = (0u32..200).map(|i| (i % 256) as u8).collect();
+        let ctx = ChunkContext::basic(&[200], 1); // expected = 200
+        let compressed = compress_chunk(&data, &pipeline, ctx).unwrap();
+        let decoded = decompress_chunk(&compressed, &pipeline, ctx, 0).unwrap();
+        assert_eq!(decoded, data);
     }
 }

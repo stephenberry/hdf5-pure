@@ -72,8 +72,10 @@ const FILL_UNDEFINED: u32 = 0;
 const FILL_DEFINED: u32 = 1;
 
 /// Length of the fixed parameter header that precedes the bit-packed payload
-/// (`buf_offset` in the reference filter).
-const HEADER_LEN: usize = 21;
+/// (`buf_offset` in the reference filter). This is also the most this filter can
+/// expand a chunk on the forward path: when the data does not pack smaller it
+/// falls back to storing the input verbatim after the header.
+pub(crate) const HEADER_LEN: usize = 21;
 
 /// Scale-offset compression mode requested by the writer.
 ///

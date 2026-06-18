@@ -182,6 +182,12 @@ impl BTreeV1Node {
     }
 }
 
+/// Recursion-depth cap for the symbol-table (group) B-tree walk, guarding
+/// against a stack overflow on a cyclic or pathological internal node in a
+/// foreign file. A real group B-tree is only a few levels deep, so this is far
+/// beyond any valid tree. Mirrors `MAX_CHUNK_BTREE_DEPTH` in `chunked_read`.
+const MAX_SYMBOL_TABLE_BTREE_DEPTH: u32 = 64;
+
 /// Collect all leaf-level child addresses (SNOD addresses) by traversing the B-tree.
 ///
 /// `base_address` is the superblock base address. All addresses stored in the
@@ -194,6 +200,30 @@ pub fn collect_symbol_table_nodes(
     length_size: u8,
     base_address: u64,
 ) -> Result<Vec<u64>, FormatError> {
+    collect_symbol_table_nodes_inner(
+        file_data,
+        btree_address,
+        offset_size,
+        length_size,
+        base_address,
+        0,
+    )
+}
+
+/// Depth-tracking core of [`collect_symbol_table_nodes`]. The `depth` guard
+/// stops a cyclic or pathologically deep internal node from recursing until the
+/// stack overflows (an uncatchable process abort) when listing a v1 group.
+fn collect_symbol_table_nodes_inner(
+    file_data: &[u8],
+    btree_address: u64,
+    offset_size: u8,
+    length_size: u8,
+    base_address: u64,
+    depth: u32,
+) -> Result<Vec<u64>, FormatError> {
+    if depth > MAX_SYMBOL_TABLE_BTREE_DEPTH {
+        return Err(FormatError::NestingDepthExceeded);
+    }
     let node_offset = btree_address
         .checked_add(base_address)
         .ok_or(FormatError::OffsetOverflow {
@@ -214,12 +244,13 @@ pub fn collect_symbol_table_nodes(
         // Internal: recurse into children (child addresses are relative to base_address)
         let mut result = Vec::new();
         for &child_addr in &node.children {
-            let child_snods = collect_symbol_table_nodes(
+            let child_snods = collect_symbol_table_nodes_inner(
                 file_data,
                 child_addr,
                 offset_size,
                 length_size,
                 base_address,
+                depth + 1,
             )?;
             result.extend(child_snods);
         }
@@ -240,6 +271,29 @@ pub fn collect_symbol_table_nodes_from_source<S: FileSource + ?Sized>(
     length_size: u8,
     base_address: u64,
 ) -> Result<Vec<u64>, FormatError> {
+    collect_symbol_table_nodes_from_source_inner(
+        source,
+        btree_address,
+        offset_size,
+        length_size,
+        base_address,
+        0,
+    )
+}
+
+/// Depth-tracking core of [`collect_symbol_table_nodes_from_source`]; see
+/// [`collect_symbol_table_nodes_inner`] for why the bound is required.
+fn collect_symbol_table_nodes_from_source_inner<S: FileSource + ?Sized>(
+    source: &S,
+    btree_address: u64,
+    offset_size: u8,
+    length_size: u8,
+    base_address: u64,
+    depth: u32,
+) -> Result<Vec<u64>, FormatError> {
+    if depth > MAX_SYMBOL_TABLE_BTREE_DEPTH {
+        return Err(FormatError::NestingDepthExceeded);
+    }
     let node_offset =
         btree_address
             .checked_add(base_address)
@@ -258,12 +312,13 @@ pub fn collect_symbol_table_nodes_from_source<S: FileSource + ?Sized>(
     } else {
         let mut result = Vec::new();
         for &child_addr in &node.children {
-            let child_snods = collect_symbol_table_nodes_from_source(
+            let child_snods = collect_symbol_table_nodes_from_source_inner(
                 source,
                 child_addr,
                 offset_size,
                 length_size,
                 base_address,
+                depth + 1,
             )?;
             result.extend(child_snods);
         }
@@ -387,5 +442,19 @@ mod tests {
         let node = BTreeV1Node::parse(&data, 0, 4, 4).unwrap();
         assert_eq!(node.entries_used, 1);
         assert_eq!(node.children, vec![0x50]);
+    }
+
+    #[test]
+    fn collect_symbol_table_nodes_rejects_cyclic_btree() {
+        // An internal node (level 1) whose only child points back at itself.
+        // Listing a malicious v1 group must error via the depth guard rather
+        // than recurse until the stack overflows (an uncatchable abort).
+        let os: u8 = 8;
+        let node = build_btree_node(0, 1, &[0, 0], &[0], None, None, os);
+        let mut file = vec![0u8; 1024];
+        file[..node.len()].copy_from_slice(&node);
+
+        let err = collect_symbol_table_nodes(&file, 0, os, os, 0).unwrap_err();
+        assert_eq!(err, FormatError::NestingDepthExceeded);
     }
 }
