@@ -1,12 +1,15 @@
 //! Writing API: FileBuilder and GroupBuilder for creating HDF5 files.
 
+use std::io::Write;
+
+use crate::chunked_write::ByteSink;
 use crate::file_writer::FileWriter as FormatWriter;
 use crate::type_builders::{
     AttrValue, DatasetBuilder as FormatDatasetBuilder, FinishedGroup,
     GroupBuilder as FormatGroupBuilder,
 };
 
-use crate::error::Error;
+use crate::error::{Error, FormatError};
 use crate::file_space_info::FileSpaceStrategy;
 use crate::libver::LibVer;
 
@@ -112,15 +115,288 @@ impl FileBuilder {
         Ok(self.writer.finish()?)
     }
 
+    /// Serialize the file directly to a [`Write`] sink, without first buffering
+    /// the whole file in memory.
+    ///
+    /// Produces byte-for-byte the same file as [`finish`](Self::finish), but a
+    /// dataset staged for verbatim chunk *streaming* (repack's out-of-core path)
+    /// has its chunks pulled from the source and written one at a time, so peak
+    /// memory stays bounded by a single chunk plus the file metadata rather than
+    /// the whole dataset. The sink is written front-to-back, so it need not be
+    /// seekable.
+    pub fn finish_to<W: Write>(self, w: W) -> Result<(), Error> {
+        let mut sink = WriteSink::new(std::io::BufWriter::new(w));
+        if let Err(fe) = self.writer.finish_to_sink(&mut sink) {
+            // If the failure came from the sink's I/O, surface the real
+            // `io::Error`; otherwise it is a genuine format error.
+            return match sink.err.take() {
+                Some(io_err) => Err(Error::Io(io_err)),
+                None => Err(Error::Format(fe)),
+            };
+        }
+        sink.into_inner().flush().map_err(Error::Io)
+    }
+
     /// Serialize and write the file to the given path.
+    ///
+    /// Streams the file to disk (see [`finish_to`](Self::finish_to)), so a repack
+    /// staging streamed chunks does not hold the whole output in memory.
     pub fn write<P: AsRef<std::path::Path>>(self, path: P) -> Result<(), Error> {
-        let bytes = self.finish()?;
-        std::fs::write(path, bytes).map_err(Error::Io)
+        let file = std::fs::File::create(path).map_err(Error::Io)?;
+        self.finish_to(file)
+    }
+}
+
+/// Adapts a [`std::io::Write`] to the writer's [`ByteSink`] so a file can be
+/// assembled straight onto the sink. Because `ByteSink` is `no_std` and cannot
+/// carry a `std::io::Error`, an I/O failure is stashed here and the surrounding
+/// [`FileBuilder::finish_to`] turns it back into [`Error::Io`].
+struct WriteSink<W: Write> {
+    inner: W,
+    written: u64,
+    err: Option<std::io::Error>,
+}
+
+impl<W: Write> WriteSink<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            written: 0,
+            err: None,
+        }
+    }
+
+    fn into_inner(self) -> W {
+        self.inner
+    }
+}
+
+impl<W: Write> ByteSink for WriteSink<W> {
+    fn put(&mut self, bytes: &[u8]) -> Result<(), FormatError> {
+        match self.inner.write_all(bytes) {
+            Ok(()) => {
+                self.written += bytes.len() as u64;
+                Ok(())
+            }
+            Err(e) => {
+                self.err = Some(e);
+                // A placeholder format error; `finish_to` replaces it with the
+                // stashed `io::Error` above, so its message is never surfaced.
+                Err(FormatError::SerializationError(
+                    "streaming output write failed".into(),
+                ))
+            }
+        }
+    }
+
+    fn put_zeros(&mut self, n: usize) -> Result<(), FormatError> {
+        // Emit padding in bounded blocks so a large userblock never allocates a
+        // matching buffer.
+        const ZEROS: [u8; 4096] = [0u8; 4096];
+        let mut remaining = n;
+        while remaining > 0 {
+            let take = remaining.min(ZEROS.len());
+            self.put(&ZEROS[..take])?;
+            remaining -= take;
+        }
+        Ok(())
+    }
+
+    fn position(&self) -> u64 {
+        self.written
     }
 }
 
 impl Default for FileBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::*;
+    use crate::chunked_write::{ChunkMeta, ChunkProvider};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// A test [`ChunkProvider`] serving fixed in-memory chunk bytes, recording
+    /// the order of `chunk_bytes` calls so a test can assert the streaming
+    /// writer pulls each chunk exactly once, in ascending slot order. With
+    /// `short` set, slot 0 returns one byte fewer than planned (size-mismatch).
+    struct MemProvider {
+        chunks: Vec<Vec<u8>>,
+        calls: Rc<RefCell<Vec<usize>>>,
+        short: bool,
+    }
+
+    impl ChunkProvider for MemProvider {
+        fn chunk_bytes(&self, index: usize) -> Result<Vec<u8>, FormatError> {
+            self.calls.borrow_mut().push(index);
+            let mut bytes = self.chunks[index].clone();
+            if self.short && index == 0 {
+                bytes.pop();
+            }
+            Ok(bytes)
+        }
+    }
+
+    fn f64_chunk(vals: &[f64]) -> Vec<u8> {
+        let mut v = Vec::new();
+        for &x in vals {
+            v.extend_from_slice(&x.to_le_bytes());
+        }
+        v
+    }
+
+    /// Build a file with one lazily-streamed, unfiltered chunked f64 dataset.
+    /// Unfiltered means the "compressed" bytes are the raw element bytes, so the
+    /// produced file is a plain chunked f64 dataset that reads back.
+    fn build_lazy(
+        chunk_bytes: Vec<Vec<u8>>,
+        dims: &[u64],
+        chunk_dims: &[u64],
+        maxshape: Option<&[u64]>,
+        calls: Rc<RefCell<Vec<usize>>>,
+        short: bool,
+    ) -> FileBuilder {
+        let meta: Vec<ChunkMeta> = chunk_bytes
+            .iter()
+            .map(|c| ChunkMeta {
+                compressed_size: c.len() as u64,
+                filter_mask: 0,
+            })
+            .collect();
+        let provider = MemProvider {
+            chunks: chunk_bytes,
+            calls,
+            short,
+        };
+        let mut b = FileBuilder::new();
+        b.create_dataset("d").with_raw_chunks_lazy(
+            crate::type_builders::make_f64_type(),
+            dims,
+            maxshape,
+            chunk_dims,
+            8,
+            None,
+            meta,
+            Box::new(provider),
+        );
+        b
+    }
+
+    fn read_back_f64(bytes: Vec<u8>) -> Vec<f64> {
+        let file = crate::reader::File::from_bytes(bytes).unwrap();
+        let raw = file.dataset("d").unwrap().read_raw().unwrap();
+        raw.chunks_exact(8)
+            .map(|b| f64::from_le_bytes(b.try_into().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn streamed_output_matches_buffered_and_streams_one_chunk_at_a_time() {
+        let chunks = vec![
+            f64_chunk(&[1.0, 2.0]),
+            f64_chunk(&[3.0, 4.0]),
+            f64_chunk(&[5.0, 6.0]),
+        ];
+
+        let calls_buf = Rc::new(RefCell::new(Vec::new()));
+        let buffered = build_lazy(chunks.clone(), &[6], &[2], None, calls_buf.clone(), false)
+            .finish()
+            .unwrap();
+
+        let calls_str = Rc::new(RefCell::new(Vec::new()));
+        let mut streamed = Vec::new();
+        build_lazy(chunks.clone(), &[6], &[2], None, calls_str.clone(), false)
+            .finish_to(&mut streamed)
+            .unwrap();
+
+        // The streaming (io::Write) path and the buffered (Vec) path must produce
+        // byte-for-byte the same file.
+        assert_eq!(
+            buffered, streamed,
+            "streamed output must be byte-identical to buffered output"
+        );
+        // Each chunk is pulled exactly once, in ascending slot order — i.e. the
+        // writer streams chunk-by-chunk rather than collecting them all.
+        assert_eq!(*calls_buf.borrow(), vec![0, 1, 2]);
+        assert_eq!(*calls_str.borrow(), vec![0, 1, 2]);
+        // And the file reads back to the original values.
+        assert_eq!(read_back_f64(buffered), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn streaming_writer_rejects_provider_size_mismatch() {
+        let chunks = vec![f64_chunk(&[1.0, 2.0]), f64_chunk(&[3.0, 4.0])];
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        // `short` makes slot 0's provider return fewer bytes than the planned
+        // size; the emitter must reject the desync rather than write a corrupt file.
+        let err = build_lazy(chunks, &[4], &[2], None, calls, true)
+            .finish()
+            .unwrap_err();
+        match err {
+            Error::Format(FormatError::ChunkedReadError(_)) => {}
+            other => panic!("expected ChunkedReadError, got {other:?}"),
+        }
+    }
+
+    /// Assert the buffered and streamed outputs are byte-identical for one
+    /// chunked layout, and that the produced file reads back.
+    fn assert_variant_streams_identically(
+        chunks: Vec<Vec<u8>>,
+        dims: &[u64],
+        chunk_dims: &[u64],
+        maxshape: Option<&[u64]>,
+    ) {
+        let buffered = build_lazy(
+            chunks.clone(),
+            dims,
+            chunk_dims,
+            maxshape,
+            Rc::new(RefCell::new(Vec::new())),
+            false,
+        )
+        .finish()
+        .unwrap();
+        let mut streamed = Vec::new();
+        build_lazy(
+            chunks,
+            dims,
+            chunk_dims,
+            maxshape,
+            Rc::new(RefCell::new(Vec::new())),
+            false,
+        )
+        .finish_to(&mut streamed)
+        .unwrap();
+        assert_eq!(
+            buffered, streamed,
+            "index variant dims={dims:?} chunk={chunk_dims:?} must stream identically"
+        );
+        // Sanity: the produced file reads back.
+        let _ = read_back_f64(buffered);
+    }
+
+    #[test]
+    fn streamed_equals_buffered_across_index_variants() {
+        // single-chunk, fixed-array (>1 chunk), and extensible-array (unlimited
+        // max shape) all lay out from sizes alone, so each must stream identically.
+        assert_variant_streams_identically(vec![f64_chunk(&[1.0, 2.0])], &[2], &[2], None);
+        assert_variant_streams_identically(
+            (0..5)
+                .map(|i| f64_chunk(&[i as f64, i as f64 + 0.5]))
+                .collect(),
+            &[10],
+            &[2],
+            None,
+        );
+        assert_variant_streams_identically(
+            vec![f64_chunk(&[1.0, 2.0]), f64_chunk(&[3.0, 4.0])],
+            &[4],
+            &[2],
+            Some(&[u64::MAX]),
+        );
     }
 }
