@@ -7,7 +7,7 @@ extern crate alloc;
 use alloc::{format, vec, vec::Vec};
 
 use crate::btree_v1::btree_v1_node_header_size;
-use crate::chunk_cache::{CacheAlignedBuffer, ChunkCache};
+use crate::chunk_cache::ChunkCache;
 use crate::convert::{TryToUsize, slice_range, u32_from};
 use crate::data_layout::DataLayout;
 use crate::dataspace::Dataspace;
@@ -26,15 +26,14 @@ use crate::source::FileSource;
 #[cfg(feature = "parallel")]
 use crate::parallel_read;
 
-/// Decompress all chunks into cache-line-aligned buffers, using lane-partitioned
-/// parallel decompression when the `parallel` feature is enabled and the chunk
-/// count exceeds the threshold.
+/// Decompress all chunks, using lane-partitioned parallel decompression when the
+/// `parallel` feature is enabled and the chunk count exceeds the threshold.
 fn decompress_all_chunks(
     file_data: &[u8],
     chunks: &[ChunkInfo],
     pipeline: Option<&FilterPipeline>,
     ctx: ChunkContext<'_>,
-) -> Result<Vec<CacheAlignedBuffer>, FormatError> {
+) -> Result<Vec<Vec<u8>>, FormatError> {
     #[cfg(feature = "parallel")]
     {
         if let Some(pl) = pipeline {
@@ -44,12 +43,11 @@ fn decompress_all_chunks(
                 let (data, _stats) = parallel_read::decompress_chunks_lane_partitioned(
                     file_data, chunks, pl, ctx, seed, None, // auto-detect lane count
                 )?;
-                return Ok(data.into_iter().map(CacheAlignedBuffer::from_vec).collect());
+                return Ok(data);
             }
         }
     }
 
-    // Sequential fallback — allocate into aligned buffers
     let mut result = Vec::with_capacity(chunks.len());
     for chunk_info in chunks {
         let r = slice_range(chunk_info.address, u64::from(chunk_info.chunk_size))?;
@@ -66,7 +64,7 @@ fn decompress_all_chunks(
         } else {
             raw_chunk.to_vec()
         };
-        result.push(CacheAlignedBuffer::from_vec(decompressed));
+        result.push(decompressed);
     }
     Ok(result)
 }
@@ -82,7 +80,7 @@ fn decompress_all_chunks_from_source<S: FileSource + ?Sized>(
     chunks: &[ChunkInfo],
     pipeline: Option<&FilterPipeline>,
     ctx: ChunkContext<'_>,
-) -> Result<Vec<CacheAlignedBuffer>, FormatError> {
+) -> Result<Vec<Vec<u8>>, FormatError> {
     let mut result = Vec::with_capacity(chunks.len());
     for chunk_info in chunks {
         let raw_chunk =
@@ -92,7 +90,7 @@ fn decompress_all_chunks_from_source<S: FileSource + ?Sized>(
         } else {
             raw_chunk
         };
-        result.push(CacheAlignedBuffer::from_vec(decompressed));
+        result.push(decompressed);
     }
     Ok(result)
 }
@@ -924,20 +922,6 @@ pub fn read_chunked_data_cached_from_source<S: FileSource + ?Sized>(
 
     for chunk_info in &chunks {
         let coord: Vec<u64> = chunk_info.offsets.iter().take(rank).copied().collect();
-        let decompressed = if let Some(cached) = cache.get_decompressed(&coord) {
-            cached
-        } else {
-            let raw_chunk =
-                source.read_exact_at(chunk_info.address, chunk_info.chunk_size.to_usize()?)?;
-            let dec = if let Some(pl) = pipeline {
-                decompress_chunk(&raw_chunk, pl, ctx, chunk_info.filter_mask)?
-            } else {
-                raw_chunk
-            };
-            cache.put_decompressed(coord.clone(), dec.clone());
-            dec
-        };
-
         let chunk_offsets: Vec<usize> = chunk_info
             .offsets
             .iter()
@@ -945,12 +929,10 @@ pub fn read_chunked_data_cached_from_source<S: FileSource + ?Sized>(
             .map(|&o| o.to_usize())
             .collect::<Result<_, _>>()?;
 
-        if rank == 0 {
-            let copy_len = decompressed.len().min(output.len());
-            output[..copy_len].copy_from_slice(&decompressed[..copy_len]);
-        } else {
-            copy_chunk_to_output(
-                &decompressed,
+        // Scatter straight from the cached chunk under the lock (no copy out).
+        let hit = cache.with_decompressed(&coord, |bytes| {
+            place_chunk(
+                bytes,
                 &mut output,
                 &chunk_offsets,
                 &chunk_dims,
@@ -960,7 +942,31 @@ pub fn read_chunked_data_cached_from_source<S: FileSource + ?Sized>(
                 elem_size,
                 rank,
             );
+        });
+        if hit.is_some() {
+            continue;
         }
+
+        // Cache miss: fetch the chunk's bytes from the source (already owned).
+        let raw_chunk =
+            source.read_exact_at(chunk_info.address, chunk_info.chunk_size.to_usize()?)?;
+        let dec = if let Some(pl) = pipeline {
+            decompress_chunk(&raw_chunk, pl, ctx, chunk_info.filter_mask)?
+        } else {
+            raw_chunk
+        };
+        place_chunk(
+            &dec,
+            &mut output,
+            &chunk_offsets,
+            &chunk_dims,
+            &ds_dims,
+            &ds_strides,
+            &chunk_strides,
+            elem_size,
+            rank,
+        );
+        cache.put_decompressed(coord, dec); // move; dropped if not admitted
     }
 
     Ok(output)
@@ -1183,7 +1189,7 @@ fn collect_chunk_index_spans(
 /// access): shared by the buffered and streaming chunked readers.
 fn assemble_chunks(
     chunks: &[ChunkInfo],
-    decompressed: &[CacheAlignedBuffer],
+    decompressed: &[Vec<u8>],
     rank: usize,
     chunk_dims: &[usize],
     ds_dims: &[usize],
@@ -1214,22 +1220,17 @@ fn assemble_chunks(
             .map(|&o| o as usize)
             .collect();
 
-        if rank == 0 {
-            let copy_len = decompressed.len().min(output.len());
-            output[..copy_len].copy_from_slice(&decompressed[..copy_len]);
-        } else {
-            copy_chunk_to_output(
-                decompressed,
-                &mut output,
-                &chunk_offsets,
-                chunk_dims,
-                ds_dims,
-                &ds_strides,
-                &chunk_strides,
-                elem_size,
-                rank,
-            );
-        }
+        place_chunk(
+            decompressed,
+            &mut output,
+            &chunk_offsets,
+            chunk_dims,
+            ds_dims,
+            &ds_strides,
+            &chunk_strides,
+            elem_size,
+            rank,
+        );
     }
 
     output
@@ -1401,28 +1402,6 @@ pub fn read_chunked_data_cached(
     for chunk_info in &chunks {
         let coord: Vec<u64> = chunk_info.offsets.iter().take(rank).copied().collect();
 
-        // Try decompressed cache first
-        let decompressed = if let Some(cached) = cache.get_decompressed(&coord) {
-            cached
-        } else {
-            // Decompress from file
-            let r = slice_range(chunk_info.address, u64::from(chunk_info.chunk_size))?;
-            if r.end > file_data.len() {
-                return Err(FormatError::UnexpectedEof {
-                    expected: r.end,
-                    available: file_data.len(),
-                });
-            }
-            let raw_chunk = &file_data[r];
-            let dec = if let Some(pl) = pipeline {
-                decompress_chunk(raw_chunk, pl, ctx, chunk_info.filter_mask)?
-            } else {
-                raw_chunk.to_vec()
-            };
-            cache.put_decompressed(coord, dec.clone());
-            dec
-        };
-
         #[expect(
             clippy::cast_possible_truncation,
             reason = "chunk coordinate offsets are bounded by ds_dims, which already fit usize"
@@ -1434,12 +1413,10 @@ pub fn read_chunked_data_cached(
             .map(|&o| o as usize)
             .collect();
 
-        if rank == 0 {
-            let copy_len = decompressed.len().min(output.len());
-            output[..copy_len].copy_from_slice(&decompressed[..copy_len]);
-        } else {
-            copy_chunk_to_output(
-                &decompressed,
+        // Scatter straight from the cached chunk under the lock (no copy out).
+        let hit = cache.with_decompressed(&coord, |bytes| {
+            place_chunk(
+                bytes,
                 &mut output,
                 &chunk_offsets,
                 &chunk_dims,
@@ -1449,13 +1426,103 @@ pub fn read_chunked_data_cached(
                 elem_size,
                 rank,
             );
+        });
+        if hit.is_some() {
+            continue;
+        }
+
+        // Cache miss: read the chunk's bytes from the file.
+        let r = slice_range(chunk_info.address, u64::from(chunk_info.chunk_size))?;
+        if r.end > file_data.len() {
+            return Err(FormatError::UnexpectedEof {
+                expected: r.end,
+                available: file_data.len(),
+            });
+        }
+        let raw_chunk = &file_data[r];
+        if let Some(pl) = pipeline {
+            let dec = decompress_chunk(raw_chunk, pl, ctx, chunk_info.filter_mask)?;
+            place_chunk(
+                &dec,
+                &mut output,
+                &chunk_offsets,
+                &chunk_dims,
+                &ds_dims,
+                &ds_strides,
+                &chunk_strides,
+                elem_size,
+                rank,
+            );
+            cache.put_decompressed(coord, dec); // move; dropped if not admitted
+        } else {
+            // No pipeline: scatter directly from the file buffer, and copy into
+            // the cache only if it would actually be retained.
+            place_chunk(
+                raw_chunk,
+                &mut output,
+                &chunk_offsets,
+                &chunk_dims,
+                &ds_dims,
+                &ds_strides,
+                &chunk_strides,
+                elem_size,
+                rank,
+            );
+            cache.put_decompressed_slice(coord, raw_chunk);
         }
     }
 
     Ok(output)
 }
 
+/// Place one decompressed chunk into the dense output buffer, handling the
+/// scalar (`rank == 0`) case and delegating the N-D case to the row-copy kernel.
+/// Shared by the buffered, cached, and streaming chunked readers so they all use
+/// the same scatter logic.
+#[allow(clippy::too_many_arguments)]
+fn place_chunk(
+    chunk_data: &[u8],
+    output: &mut [u8],
+    chunk_offsets: &[usize],
+    chunk_dims: &[usize],
+    ds_dims: &[usize],
+    ds_strides: &[usize],
+    chunk_strides: &[usize],
+    elem_size: usize,
+    rank: usize,
+) {
+    if rank == 0 {
+        let copy_len = chunk_data.len().min(output.len());
+        output[..copy_len].copy_from_slice(&chunk_data[..copy_len]);
+    } else {
+        copy_chunk_to_output(
+            chunk_data,
+            output,
+            chunk_offsets,
+            chunk_dims,
+            ds_dims,
+            ds_strides,
+            chunk_strides,
+            elem_size,
+            rank,
+        );
+    }
+}
+
 /// Copy chunk data into the output buffer at the correct N-D position.
+///
+/// The innermost dimension is contiguous in both the chunk and the dataset (both
+/// have stride 1 there in a row-major layout), so each in-bounds row of the
+/// chunk is moved with a single `copy_from_slice` instead of one tiny copy per
+/// element. Only the outer `rank - 1` dimensions are walked (with an odometer),
+/// which removes the per-element flat→N-D coordinate division/modulo that
+/// dominated the old kernel. Edge chunks that overhang the dataset are clamped in
+/// the innermost dimension (a shortened row) and skipped per-row in the outer
+/// dimensions (a row whose outer global coordinate is past the dataset bound),
+/// reproducing the old per-element out-of-bounds skip exactly. The per-row length
+/// is also clamped to the bytes actually available on both sides, so a malformed
+/// (short) chunk copies only its valid prefix and is never an out-of-bounds
+/// access — matching the old per-element guard's silent-skip behavior.
 #[allow(clippy::too_many_arguments)]
 fn copy_chunk_to_output(
     chunk_data: &[u8],
@@ -1468,36 +1535,63 @@ fn copy_chunk_to_output(
     elem_size: usize,
     rank: usize,
 ) {
-    // Iterate over all elements in the chunk using a flat index
-    let chunk_total: usize = chunk_dims.iter().product();
-    for flat_idx in 0..chunk_total {
-        // Convert flat index to N-D chunk-local coordinates
-        let mut remaining = flat_idx;
-        let mut ds_flat = 0usize;
-        let mut out_of_bounds = false;
+    debug_assert!(rank >= 1, "rank == 0 is handled by the callers");
+    // Row contiguity (the whole optimization) relies on a unit innermost stride
+    // in both layouts, which the row-major stride construction guarantees.
+    debug_assert_eq!(chunk_strides[rank - 1], 1);
+    debug_assert_eq!(ds_strides[rank - 1], 1);
 
-        for d in 0..rank {
-            let coord_in_chunk = remaining / chunk_strides[d];
-            remaining %= chunk_strides[d];
+    let inner = rank - 1;
 
-            let global_coord = chunk_offsets[d] + coord_in_chunk;
-            if global_coord >= ds_dims[d] {
-                out_of_bounds = true;
+    // In-bounds run length along the contiguous innermost dimension: the chunk
+    // is stored at full size but may hang over the dataset's edge.
+    let inner_row_len = chunk_dims[inner].min(ds_dims[inner].saturating_sub(chunk_offsets[inner]));
+    if inner_row_len == 0 {
+        return; // the chunk lies entirely past the inner edge
+    }
+    let row_bytes = inner_row_len * elem_size;
+    // Destination offset contributed by the innermost dimension (stride 1).
+    let inner_dst = chunk_offsets[inner] * ds_strides[inner];
+
+    // Walk the outer dimensions with an odometer (`coord` is the chunk-local
+    // coordinate of each outer dim), copying one contiguous row per step.
+    let outer_total: usize = chunk_dims[..inner].iter().product();
+    let mut coord = vec![0usize; inner];
+
+    for _ in 0..outer_total {
+        let mut chunk_base = 0usize;
+        let mut ds_base = inner_dst;
+        let mut in_bounds = true;
+        for d in 0..inner {
+            chunk_base += coord[d] * chunk_strides[d];
+            let global = chunk_offsets[d] + coord[d];
+            if global >= ds_dims[d] {
+                in_bounds = false;
                 break;
             }
-            ds_flat += global_coord * ds_strides[d];
+            ds_base += global * ds_strides[d];
         }
 
-        if out_of_bounds {
-            continue;
+        if in_bounds {
+            let src = chunk_base * elem_size;
+            let dst = ds_base * elem_size;
+            // Clamp to the bytes available on each side, on an element boundary.
+            let mut avail = row_bytes
+                .min(chunk_data.len().saturating_sub(src))
+                .min(output.len().saturating_sub(dst));
+            avail -= avail % elem_size;
+            if avail > 0 {
+                output[dst..dst + avail].copy_from_slice(&chunk_data[src..src + avail]);
+            }
         }
 
-        let src_start = flat_idx * elem_size;
-        let dst_start = ds_flat * elem_size;
-
-        if src_start + elem_size <= chunk_data.len() && dst_start + elem_size <= output.len() {
-            output[dst_start..dst_start + elem_size]
-                .copy_from_slice(&chunk_data[src_start..src_start + elem_size]);
+        // Advance the odometer over the outer dims (last outer dim varies fastest).
+        for d in (0..inner).rev() {
+            coord[d] += 1;
+            if coord[d] < chunk_dims[d] {
+                break;
+            }
+            coord[d] = 0;
         }
     }
 }

@@ -12,16 +12,9 @@ extern crate alloc;
 use alloc::vec::Vec;
 
 #[cfg(not(feature = "std"))]
-use alloc::alloc::{alloc_zeroed, dealloc, handle_alloc_error};
-#[cfg(feature = "std")]
-use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error};
-
-#[cfg(not(feature = "std"))]
 use crate::nosync::Mutex;
 #[cfg(feature = "std")]
 use std::sync::Mutex;
-
-use core::ops::{Deref, DerefMut};
 
 #[cfg(not(feature = "std"))]
 use alloc::collections::BTreeMap;
@@ -31,13 +24,14 @@ use std::collections::HashMap;
 use crate::chunked_read::ChunkInfo;
 
 // ---------------------------------------------------------------------------
-// Cache-line alignment constants (TVL — Tensor Virtualization Layout)
+// Cache-line alignment
 // ---------------------------------------------------------------------------
 
 /// Cache line size in bytes for the target architecture.
 ///
-/// ARM64 uses 128-byte cache lines; x86_64 uses 64-byte. We align all chunk
-/// buffers to this boundary so SIMD operations can assume aligned input.
+/// ARM64 uses 128-byte cache lines; x86_64 uses 64-byte. The writer aligns
+/// chunk data blocks to this boundary on disk so a chunk read lands on a
+/// cache-line-aligned file offset.
 #[cfg(target_arch = "aarch64")]
 pub const CACHE_LINE_SIZE: usize = 128;
 
@@ -51,148 +45,6 @@ pub const CACHE_LINE_SIZE: usize = 64;
 #[inline]
 pub fn align_to_cache_line(size: usize) -> usize {
     (size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1)
-}
-
-// ---------------------------------------------------------------------------
-// CacheAlignedBuffer
-// ---------------------------------------------------------------------------
-
-/// A byte buffer whose data pointer is aligned to [`CACHE_LINE_SIZE`].
-///
-/// This enables SIMD operations to use aligned loads/stores when processing
-/// chunk data, avoiding the penalty of misaligned memory accesses.
-///
-/// The buffer is backed by `std::alloc::Layout`-controlled allocation. It
-/// dereferences to `&[u8]` / `&mut [u8]` for seamless use.
-pub struct CacheAlignedBuffer {
-    ptr: *mut u8,
-    len: usize,
-    capacity: usize,
-}
-
-// SAFETY: The raw pointer is exclusively owned — no aliasing.
-unsafe impl Send for CacheAlignedBuffer {}
-unsafe impl Sync for CacheAlignedBuffer {}
-
-impl CacheAlignedBuffer {
-    /// Allocate a new cache-line-aligned buffer of exactly `len` bytes,
-    /// initialized to zero.
-    pub fn zeroed(len: usize) -> Self {
-        if len == 0 {
-            return Self {
-                ptr: core::ptr::NonNull::dangling().as_ptr(),
-                len: 0,
-                capacity: 0,
-            };
-        }
-        let capacity = align_to_cache_line(len);
-        let layout = core::alloc::Layout::from_size_align(capacity, CACHE_LINE_SIZE)
-            .expect("invalid layout");
-        // SAFETY: layout has non-zero size.
-        let ptr = unsafe { alloc_zeroed(layout) };
-        if ptr.is_null() {
-            handle_alloc_error(layout);
-        }
-        Self { ptr, len, capacity }
-    }
-
-    /// Create a cache-line-aligned copy of an existing byte slice.
-    pub fn from_slice(data: &[u8]) -> Self {
-        let mut buf = Self::zeroed(data.len());
-        buf.as_mut_slice()[..data.len()].copy_from_slice(data);
-        buf
-    }
-
-    /// Create from an existing `Vec<u8>`, copying into an aligned allocation.
-    pub fn from_vec(v: Vec<u8>) -> Self {
-        Self::from_slice(&v)
-    }
-
-    /// The length of the valid data (may be less than capacity).
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    /// Whether the buffer is empty.
-    #[inline]
-    #[allow(dead_code)] // exercised by unit tests; companion to `len`
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// Borrow as a byte slice.
-    #[inline]
-    pub fn as_slice(&self) -> &[u8] {
-        if self.len == 0 {
-            return &[];
-        }
-        // SAFETY: ptr is valid for `len` bytes and properly aligned.
-        unsafe { core::slice::from_raw_parts(self.ptr, self.len) }
-    }
-
-    /// Borrow as a mutable byte slice.
-    #[inline]
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        if self.len == 0 {
-            return &mut [];
-        }
-        // SAFETY: ptr is valid for `len` bytes and properly aligned.
-        unsafe { core::slice::from_raw_parts_mut(self.ptr, self.len) }
-    }
-
-    /// Convert to a `Vec<u8>` (copies data into a standard allocation).
-    pub fn to_vec(&self) -> Vec<u8> {
-        self.as_slice().to_vec()
-    }
-
-    /// Returns `true` if the data pointer is aligned to `CACHE_LINE_SIZE`.
-    #[inline]
-    pub fn is_aligned(&self) -> bool {
-        self.len == 0 || (self.ptr as usize).is_multiple_of(CACHE_LINE_SIZE)
-    }
-}
-
-impl Drop for CacheAlignedBuffer {
-    fn drop(&mut self) {
-        if self.capacity > 0 {
-            let layout = core::alloc::Layout::from_size_align(self.capacity, CACHE_LINE_SIZE)
-                .expect("invalid layout");
-            // SAFETY: ptr was allocated with this layout.
-            unsafe { dealloc(self.ptr, layout) };
-        }
-    }
-}
-
-impl Clone for CacheAlignedBuffer {
-    fn clone(&self) -> Self {
-        Self::from_slice(self.as_slice())
-    }
-}
-
-impl Deref for CacheAlignedBuffer {
-    type Target = [u8];
-    #[inline]
-    fn deref(&self) -> &[u8] {
-        self.as_slice()
-    }
-}
-
-impl DerefMut for CacheAlignedBuffer {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut [u8] {
-        self.as_mut_slice()
-    }
-}
-
-impl core::fmt::Debug for CacheAlignedBuffer {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("CacheAlignedBuffer")
-            .field("len", &self.len)
-            .field("capacity", &self.capacity)
-            .field("aligned", &self.is_aligned())
-            .finish()
-    }
 }
 
 /// Coordinate key for a chunk — the N-dimensional offset vector.
@@ -333,7 +185,7 @@ impl ChunkCacheStats {
 
 struct CachedChunk {
     coord: ChunkCoord,
-    data: CacheAlignedBuffer,
+    data: Vec<u8>,
     /// Monotonically increasing access counter for LRU ordering.
     last_access: u64,
 }
@@ -463,60 +315,38 @@ impl ChunkCache {
 
     // ----- Decompressed data cache (LRU) -----
 
-    /// Try to get cached decompressed data for a chunk coordinate.
+    /// Run `f` over a borrowed view of a cached chunk's decompressed bytes, if
+    /// present, returning its result.
     ///
-    /// Returns a clone of the cache-line-aligned buffer.
-    pub fn get_decompressed(&self, coord: &[u64]) -> Option<Vec<u8>> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.tick += 1;
-        let tick = inner.tick;
-
-        for slot in inner.slots.iter_mut() {
-            if slot.coord.as_slice() == coord {
-                slot.last_access = tick;
-                return Some(slot.data.to_vec());
-            }
-        }
-        None
-    }
-
-    /// Try to get a reference-counted clone of the aligned buffer for a chunk.
-    ///
-    /// Currently only exercised by unit tests; gated so it is not shipped as
-    /// dead code.
-    #[cfg(test)]
-    pub fn get_decompressed_aligned(&self, coord: &[u64]) -> Option<CacheAlignedBuffer> {
+    /// The closure runs while the cache lock is held, which lets the caller copy
+    /// the chunk straight into its output buffer with no intermediate `Vec`
+    /// allocation or clone. The closure must not touch this cache (it would
+    /// deadlock); the chunk-assembly scatter it is used for does not.
+    pub fn with_decompressed<R>(&self, coord: &[u64], f: impl FnOnce(&[u8]) -> R) -> Option<R> {
         let mut inner = self.inner.lock().unwrap();
         inner.tick += 1;
         let tick = inner.tick;
         for slot in inner.slots.iter_mut() {
             if slot.coord.as_slice() == coord {
                 slot.last_access = tick;
-                return Some(slot.data.clone());
+                return Some(f(&slot.data));
             }
         }
         None
     }
 
-    /// Insert decompressed chunk data into the LRU cache.
-    ///
-    /// The data is stored in a [`CacheAlignedBuffer`] so subsequent reads
-    /// return cache-line-aligned memory.
-    pub fn put_decompressed(&self, coord: ChunkCoord, data: Vec<u8>) {
-        if !self.accepts_decompressed_len(data.len()) {
-            return;
-        }
-        let aligned = CacheAlignedBuffer::from_slice(&data);
-        self.put_decompressed_aligned(coord, aligned);
-    }
-
+    /// Whether a decompressed chunk of `data_len` bytes would be admitted to the
+    /// cache (cache enabled and the chunk within the per-chunk byte budget). Used
+    /// to skip copying a chunk into an owned buffer when it would be rejected.
     fn accepts_decompressed_len(&self, data_len: usize) -> bool {
         let inner = self.inner.lock().unwrap();
         inner.max_bytes != 0 && inner.max_slots != 0 && data_len <= inner.max_bytes
     }
 
-    /// Insert an already-aligned buffer into the LRU cache.
-    pub fn put_decompressed_aligned(&self, coord: ChunkCoord, data: CacheAlignedBuffer) {
+    /// Insert decompressed chunk data into the LRU cache, taking ownership of the
+    /// buffer (no copy). A chunk too large for the budget, or a disabled cache,
+    /// drops the buffer instead of storing it.
+    pub fn put_decompressed(&self, coord: ChunkCoord, data: Vec<u8>) {
         let mut inner = self.inner.lock().unwrap();
         let data_len = data.len();
 
@@ -557,6 +387,17 @@ impl ChunkCache {
             data,
             last_access: tick,
         });
+    }
+
+    /// Insert a copy of `data` into the LRU cache, but only if it would actually
+    /// be admitted. This lets the unfiltered read path scatter directly from the
+    /// file buffer and copy into the cache only when caching is enabled and the
+    /// chunk fits the budget (avoiding a throwaway copy otherwise).
+    pub fn put_decompressed_slice(&self, coord: ChunkCoord, data: &[u8]) {
+        if !self.accepts_decompressed_len(data.len()) {
+            return;
+        }
+        self.put_decompressed(coord, data.to_vec());
     }
 
     /// Clear the entire cache (index + decompressed data).
@@ -616,11 +457,17 @@ mod tests {
         assert_eq!(addrs, vec![0x1000, 0x2000]);
     }
 
+    /// Test helper: clone a cached chunk's bytes if present (the production
+    /// path uses `with_decompressed` to avoid this copy).
+    fn get_decompressed(cache: &ChunkCache, coord: &[u64]) -> Option<Vec<u8>> {
+        cache.with_decompressed(coord, <[u8]>::to_vec)
+    }
+
     #[test]
     fn decompressed_cache_hit() {
         let cache = ChunkCache::new();
         cache.put_decompressed(vec![0, 0], vec![1, 2, 3, 4]);
-        let got = cache.get_decompressed(&[0, 0]).unwrap();
+        let got = get_decompressed(&cache, &[0, 0]).unwrap();
         assert_eq!(got, vec![1, 2, 3, 4]);
     }
 
@@ -633,15 +480,15 @@ mod tests {
         assert_eq!(cache.stats().cached_chunks(), 2);
 
         // Access slot 0 to make it more recent
-        cache.get_decompressed(&[0]);
+        get_decompressed(&cache, &[0]);
 
         // Insert slot 2 — should evict slot 1 (LRU)
         cache.put_decompressed(vec![2], vec![3; 10]);
         assert_eq!(cache.stats().cached_chunks(), 2);
 
-        assert!(cache.get_decompressed(&[0]).is_some());
-        assert!(cache.get_decompressed(&[1]).is_none()); // evicted
-        assert!(cache.get_decompressed(&[2]).is_some());
+        assert!(get_decompressed(&cache, &[0]).is_some());
+        assert!(get_decompressed(&cache, &[1]).is_none()); // evicted
+        assert!(get_decompressed(&cache, &[2]).is_some());
     }
 
     #[test]
@@ -655,7 +502,25 @@ mod tests {
         // This needs 20 bytes but only 10 free — evict LRU
         cache.put_decompressed(vec![2], vec![0; 20]);
         assert!(cache.stats().cached_bytes() <= 50);
-        assert!(cache.get_decompressed(&[0]).is_none()); // evicted (LRU)
+        assert!(get_decompressed(&cache, &[0]).is_none()); // evicted (LRU)
+    }
+
+    #[test]
+    fn put_decompressed_slice_only_copies_when_admitted() {
+        // Disabled cache: the slice is not copied or stored.
+        let cache = ChunkCache::with_config(ChunkCacheConfig::disabled());
+        cache.put_decompressed_slice(vec![0], &[1, 2, 3]);
+        assert_eq!(cache.stats().cached_chunks(), 0);
+
+        // Enabled cache within budget: stored.
+        let cache = ChunkCache::with_capacity(1024, 16);
+        cache.put_decompressed_slice(vec![0], &[1, 2, 3, 4]);
+        assert_eq!(get_decompressed(&cache, &[0]).unwrap(), vec![1, 2, 3, 4]);
+
+        // Over the per-chunk budget: not stored.
+        let cache = ChunkCache::with_capacity(2, 16);
+        cache.put_decompressed_slice(vec![0], &[1, 2, 3, 4]);
+        assert_eq!(cache.stats().cached_chunks(), 0);
     }
 
     #[test]
@@ -705,76 +570,6 @@ mod tests {
         cache.put_decompressed(vec![0], vec![1, 2, 3]); // duplicate
         assert_eq!(cache.stats().cached_chunks(), 1);
         assert_eq!(cache.stats().cached_bytes(), 3);
-    }
-
-    // --- CacheAlignedBuffer tests ---
-
-    #[test]
-    fn aligned_buffer_basic() {
-        let buf = CacheAlignedBuffer::zeroed(256);
-        assert_eq!(buf.len(), 256);
-        assert!(buf.is_aligned());
-        assert_eq!(&buf[..4], &[0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn aligned_buffer_from_slice() {
-        let data = vec![1u8, 2, 3, 4, 5];
-        let buf = CacheAlignedBuffer::from_slice(&data);
-        assert_eq!(buf.len(), 5);
-        assert!(buf.is_aligned());
-        assert_eq!(buf.to_vec(), data);
-    }
-
-    #[test]
-    fn aligned_buffer_from_vec() {
-        let data = vec![42u8; 1024];
-        let buf = CacheAlignedBuffer::from_vec(data.clone());
-        assert!(buf.is_aligned());
-        assert_eq!(buf.to_vec(), data);
-    }
-
-    #[test]
-    fn aligned_buffer_empty() {
-        let buf = CacheAlignedBuffer::zeroed(0);
-        assert!(buf.is_empty());
-        assert!(buf.is_aligned());
-        assert_eq!(buf.to_vec(), Vec::<u8>::new());
-    }
-
-    #[test]
-    fn aligned_buffer_clone_is_aligned() {
-        let buf = CacheAlignedBuffer::from_slice(&[1, 2, 3, 4]);
-        let cloned = buf.clone();
-        assert!(cloned.is_aligned());
-        assert_eq!(buf.to_vec(), cloned.to_vec());
-    }
-
-    #[test]
-    fn aligned_buffer_deref_works() {
-        let buf = CacheAlignedBuffer::from_slice(&[10, 20, 30]);
-        assert_eq!(buf[0], 10);
-        assert_eq!(buf[1], 20);
-        assert_eq!(buf[2], 30);
-    }
-
-    #[test]
-    fn aligned_buffer_various_sizes() {
-        // Test alignment for various sizes including non-power-of-two
-        for size in [1, 7, 63, 64, 65, 127, 128, 129, 255, 256, 1000, 4096] {
-            let buf = CacheAlignedBuffer::zeroed(size);
-            assert!(buf.is_aligned(), "not aligned for size {size}");
-            assert_eq!(buf.len(), size);
-        }
-    }
-
-    #[test]
-    fn cached_data_is_aligned() {
-        let cache = ChunkCache::new();
-        cache.put_decompressed(vec![0, 0], vec![1, 2, 3, 4, 5, 6, 7, 8]);
-        let aligned = cache.get_decompressed_aligned(&[0, 0]).unwrap();
-        assert!(aligned.is_aligned());
-        assert_eq!(aligned.to_vec(), vec![1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]
