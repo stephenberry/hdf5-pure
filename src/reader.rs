@@ -976,39 +976,24 @@ impl<'f> Dataset<'f> {
     }
 
     /// Read all data as `i16` values.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "read_i16 narrows each stored value to the i16 element type the caller requested"
-    )]
     pub fn read_i16(&self) -> Result<Vec<i16>, Error> {
         let raw = self.read_raw()?;
         let dt = self.datatype()?;
-        let vals = data_read::read_as_i32(&raw, &dt)?;
-        Ok(vals.into_iter().map(|v| v as i16).collect())
+        Ok(data_read::read_as_i16(&raw, &dt)?)
     }
 
     /// Read all data as `u16` values.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "read_u16 narrows each stored value to the u16 element type the caller requested"
-    )]
     pub fn read_u16(&self) -> Result<Vec<u16>, Error> {
         let raw = self.read_raw()?;
         let dt = self.datatype()?;
-        let vals = data_read::read_as_u64(&raw, &dt)?;
-        Ok(vals.into_iter().map(|v| v as u16).collect())
+        Ok(data_read::read_as_u16(&raw, &dt)?)
     }
 
     /// Read all data as `u32` values.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "read_u32 narrows each stored value to the u32 element type the caller requested"
-    )]
     pub fn read_u32(&self) -> Result<Vec<u32>, Error> {
         let raw = self.read_raw()?;
         let dt = self.datatype()?;
-        let vals = data_read::read_as_u64(&raw, &dt)?;
-        Ok(vals.into_iter().map(|v| v as u32).collect())
+        Ok(data_read::read_as_u32(&raw, &dt)?)
     }
 
     /// Read all data as `String` values.
