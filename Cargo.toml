@@ -59,6 +59,10 @@ serde = { version = "1", features = ["derive"] }
 # Property-based testing for the write/read roundtrip and parser-robustness
 # invariants (issue #26).
 proptest = "1"
+# Benchmark harness for the read/write hot paths (benches/hot_paths.rs). Default
+# features are off to avoid pulling the plotting/HTML-report dependency tree; the
+# benches report to the terminal, which is enough for before/after comparison.
+criterion = { version = "0.5", default-features = false }
 
 # The reference HDF5 C library, used only by the byte-level crosscheck tests.
 # Its `static` feature compiles libhdf5 from source via CMake, which does not
@@ -78,6 +82,10 @@ required-features = ["serde"]
 [[example]]
 name = "ndarray_io"
 required-features = ["ndarray"]
+
+[[bench]]
+name = "hot_paths"
+harness = false
 
 # Style-preference clippy lints muted crate-wide. The remaining clippy
 # surface is still on (`-D warnings` in CI), so genuinely problematic
