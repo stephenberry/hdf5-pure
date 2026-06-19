@@ -573,7 +573,7 @@ For bare-metal `no_std`, disable default features (keep `checksum` for object-he
 
 ```toml
 [dependencies]
-hdf5-pure = { version = "0.16", default-features = false, features = ["checksum"] }
+hdf5-pure = { version = "0.17", default-features = false, features = ["checksum"] }
 ```
 
 The high-level `File` / `FileBuilder` API is `std`-gated, so a `no_std` build exposes only the lower-level primitives. WebAssembly builds keep the default features, since `std` is available on `wasm32-unknown-unknown`.

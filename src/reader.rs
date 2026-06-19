@@ -513,6 +513,7 @@ impl File {
         let chunk_cache = options.resolved_chunk_cache(self.access_options.chunk_cache);
         Ok(Dataset {
             file: self,
+            address: addr,
             header: hdr,
             chunk_cache: ChunkCache::with_config(chunk_cache),
             chunk_cache_config: chunk_cache,
@@ -755,6 +756,12 @@ pub struct Group<'f> {
 }
 
 impl<'f> Group<'f> {
+    /// Address of this group's object header (base-adjusted, file-absolute).
+    /// Used to resolve object references that point at this group.
+    pub(crate) fn header_address(&self) -> u64 {
+        self.address
+    }
+
     /// List the names of datasets in this group.
     pub fn datasets(&self) -> Result<Vec<String>, Error> {
         let entries = self.children()?;
@@ -824,6 +831,7 @@ impl<'f> Group<'f> {
         let chunk_cache = options.resolved_chunk_cache(self.file.access_options.chunk_cache);
         Ok(Dataset {
             file: self.file,
+            address: entry.object_header_address,
             header: hdr,
             chunk_cache: ChunkCache::with_config(chunk_cache),
             chunk_cache_config: chunk_cache,
@@ -856,6 +864,9 @@ impl<'f> Group<'f> {
 /// A lightweight handle to an HDF5 dataset.
 pub struct Dataset<'f> {
     file: &'f File,
+    /// Address of this dataset's object header (base-adjusted, file-absolute).
+    /// Used to resolve object references that point at this dataset.
+    address: u64,
     header: ObjectHeader,
     // Held per-dataset: the chunk index is keyed only by chunk coordinate, so
     // a file-level cache would alias chunk addresses across datasets.
@@ -874,6 +885,12 @@ impl<'f> std::fmt::Debug for Dataset<'f> {
 }
 
 impl<'f> Dataset<'f> {
+    /// Address of this dataset's object header (base-adjusted, file-absolute).
+    /// Used to resolve object references that point at this dataset.
+    pub(crate) fn header_address(&self) -> u64 {
+        self.address
+    }
+
     /// The effective raw chunk-cache configuration for this dataset.
     ///
     /// This reflects the per-dataset [`DatasetAccessOptions`] override when one
@@ -1122,8 +1139,69 @@ impl<'f> Dataset<'f> {
             self.file.offset_size(),
             self.file.length_size(),
             self.file.addr_offset,
+            1, // a VL string's base type is a single byte
             options,
         )?)
+    }
+
+    /// Read every element of a *non-string* variable-length (sequence) dataset as
+    /// its exact heap bytes, alongside the base-type element size in bytes.
+    ///
+    /// Each element's heap object holds `length * element_size` bytes, where
+    /// `length` is the stored element count and `element_size` is the byte width
+    /// of the sequence's base type. Returning the raw bytes (not decoded values)
+    /// keeps a faithful rewrite (repack) byte-exact for any base type whose bytes
+    /// carry no embedded heap or file addresses. Errors with a
+    /// [`TypeMismatch`](crate::FormatError::TypeMismatch) if the datatype is not a
+    /// non-string VL datatype.
+    pub(crate) fn read_vlen_sequence_bytes(
+        &self,
+        options: VlenStringReadOptions,
+    ) -> Result<(Vec<vl_data::VlByteObject>, usize), Error> {
+        let datatype = self.datatype()?;
+        let Datatype::VariableLength { base_type, .. } = &datatype else {
+            return Err(FormatError::TypeMismatch {
+                expected: "non-string VariableLength",
+                actual: "non-VariableLength",
+            }
+            .into());
+        };
+        if vl_data::is_vlen_string_datatype(&datatype) {
+            return Err(FormatError::TypeMismatch {
+                expected: "non-string VariableLength",
+                actual: "VariableLength string",
+            }
+            .into());
+        }
+        let element_size = base_type.type_size() as usize;
+        if element_size == 0 {
+            return Err(
+                FormatError::VlDataError("non-string VL base type has zero size".into()).into(),
+            );
+        }
+        let dataspace = self.dataspace()?;
+        if let Some(limit) = options.max_elements()
+            && dataspace.num_elements() > limit as u64
+        {
+            return Err(FormatError::VariableLengthElementLimitExceeded {
+                limit,
+                actual: dataspace.num_elements(),
+            }
+            .into());
+        }
+        let raw = self.read_raw()?;
+        let source = self.file.source();
+        let objects = vl_data::read_vl_byte_objects_from_source(
+            &source,
+            &raw,
+            dataspace.num_elements(),
+            self.file.offset_size(),
+            self.file.length_size(),
+            self.file.addr_offset,
+            element_size,
+            options,
+        )?;
+        Ok((objects, element_size))
     }
 
     /// Read all attributes of this dataset.

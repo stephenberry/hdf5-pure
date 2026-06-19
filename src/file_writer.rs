@@ -644,7 +644,7 @@ impl FileWriter {
             /// Repack's verbatim chunk payload, when this dataset's chunks are
             /// copied compressed-as-is rather than encoded from `raw`.
             raw_chunks: Option<crate::type_builders::RawChunkPayload>,
-            reference_targets: Option<Vec<String>>,
+            reference_targets: Option<Vec<crate::type_builders::ObjectRefTarget>>,
             /// Staged global heap collection + patch mask for a VL-string
             /// dataset, whose element references in `raw` need their heap
             /// addresses patched once the post-data cursor is known.
@@ -1085,6 +1085,9 @@ impl FileWriter {
             // Group-level datasets: path = group_name/dataset_name (recursive)
             // Groups: path = group_name (recursive)
             let mut path_map = HashMap::<String, u64>::new();
+            // The root group is referenceable under the empty path (repack maps a
+            // reference to the source root group to "").
+            path_map.insert(String::new(), root_group_addr);
             for &i in &root_ds_indices {
                 path_map.insert(all_ds[i].name.clone(), ds_oh_addrs2[i]);
             }
@@ -1125,12 +1128,19 @@ impl FileWriter {
                 );
             }
 
-            // Patch reference datasets
+            // Patch reference datasets: a path target resolves to its object's
+            // destination address (an unknown path falls back to the undefined
+            // address); a raw target is written verbatim (null / undefined).
             for d in all_ds.iter_mut() {
                 if let Some(ref targets) = d.reference_targets {
                     let mut patched = Vec::with_capacity(targets.len() * 8);
-                    for path in targets {
-                        let addr = path_map.get(path).copied().unwrap_or(u64::MAX);
+                    for target in targets {
+                        let addr = match target {
+                            crate::type_builders::ObjectRefTarget::Path(path) => {
+                                path_map.get(path).copied().unwrap_or(u64::MAX)
+                            }
+                            crate::type_builders::ObjectRefTarget::Raw(addr) => *addr,
+                        };
                         patched.extend_from_slice(&addr.to_le_bytes());
                     }
                     d.raw = patched;
@@ -1773,5 +1783,72 @@ mod tests {
             matches!(err, FormatError::ChunkedVlenStringUnsupported),
             "expected ChunkedVlenStringUnsupported, got {err:?}"
         );
+    }
+
+    #[test]
+    fn vlen_sequence_dataset_roundtrips_i32() {
+        // Non-string VL (`H5T_VLEN { i32 }`): the per-element reference stores an
+        // element *count*, while the heap object holds count*4 bytes. The
+        // writer/reader pair must agree on that, including an empty sequence.
+        use crate::type_builders::VlStringElement;
+        use crate::vl_data::{VlByteObject, VlenStringReadOptions};
+
+        let dt = Datatype::VariableLength {
+            is_string: false,
+            padding: None,
+            charset: None,
+            base_type: Box::new(crate::type_builders::make_i32_type()),
+        };
+        let seqs: Vec<Vec<i32>> = vec![vec![1, 2, 3], vec![], vec![-7, 42]];
+        let elements: Vec<VlStringElement> = seqs
+            .iter()
+            .map(|s| VlStringElement::Bytes(s.iter().flat_map(|v| v.to_le_bytes()).collect()))
+            .collect();
+        let mut fw = FileWriter::new();
+        fw.create_dataset("seq")
+            .with_vlen_sequence_elements(dt, &elements)
+            .unwrap();
+        let bytes = fw.finish().unwrap();
+
+        let file = crate::reader::File::from_bytes(bytes).unwrap();
+        let ds = file.dataset("seq").unwrap();
+        assert!(
+            matches!(
+                ds.datatype().unwrap(),
+                Datatype::VariableLength {
+                    is_string: false,
+                    ..
+                }
+            ),
+            "datatype must stay a non-string variable-length sequence"
+        );
+        let (objs, elem_size) = ds
+            .read_vlen_sequence_bytes(VlenStringReadOptions::default())
+            .unwrap();
+        assert_eq!(elem_size, 4);
+        let got: Vec<Vec<i32>> = objs
+            .iter()
+            .map(|o| match o {
+                VlByteObject::Null => Vec::new(),
+                VlByteObject::Bytes(b) => b
+                    .chunks_exact(4)
+                    .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect(),
+            })
+            .collect();
+        assert_eq!(got, seqs);
+    }
+
+    #[test]
+    fn vlen_sequence_rejects_string_datatype() {
+        // The sequence builder must refuse a string-shaped VL datatype, which
+        // belongs to the VL-string path.
+        use crate::type_builders::VlStringElement;
+        let dt = crate::type_builders::make_vlen_string_type(CharacterSet::Utf8);
+        let mut fw = FileWriter::new();
+        let res = fw
+            .create_dataset("x")
+            .with_vlen_sequence_elements(dt, &[VlStringElement::Bytes(b"hi".to_vec())]);
+        assert!(matches!(res, Err(FormatError::TypeMismatch { .. })));
     }
 }

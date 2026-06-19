@@ -335,12 +335,19 @@ pub(crate) enum VlByteObject {
     Bytes(Vec<u8>),
 }
 
-/// Resolve a VL-string element's exact heap bytes from a random-access source,
+/// Resolve a VL element's exact heap bytes from a random-access source,
 /// preserving the null-vs-empty distinction and never lossily decoding.
 ///
 /// This mirrors [`visit_vl_strings_from_source`] but yields raw bytes (and a
 /// null marker) instead of a `&str`, so a faithful rewrite can reproduce
 /// embedded-NUL and non-UTF-8 payloads exactly.
+///
+/// `element_size` is the byte width of one base-type element of the sequence.
+/// For VL strings the base type is a single byte, so `element_size == 1` and the
+/// reference's stored `length` (an element count) equals the byte count. For a
+/// non-string VL sequence (e.g. `H5T_VLEN { H5T_NATIVE_DOUBLE }`) the stored
+/// `length` counts base-type elements, so the heap object holds
+/// `length * element_size` bytes — exactly what is read here.
 pub(crate) fn read_vl_byte_objects_from_source<S: FileSource + ?Sized>(
     source: &S,
     raw_data: &[u8],
@@ -348,6 +355,7 @@ pub(crate) fn read_vl_byte_objects_from_source<S: FileSource + ?Sized>(
     offset_size: u8,
     length_size: u8,
     base_address: u64,
+    element_size: usize,
     options: VlenStringReadOptions,
 ) -> Result<Vec<VlByteObject>, FormatError> {
     check_element_limit(num_elements, options)?;
@@ -400,14 +408,23 @@ pub(crate) fn read_vl_byte_objects_from_source<S: FileSource + ?Sized>(
                 index,
             },
         )?;
-        if u64::from(element.length) > object.size {
+        // The heap object holds `length` base-type elements of `element_size`
+        // bytes each. Compute the byte count with checked arithmetic so a hostile
+        // `length` cannot overflow, and bound it by the heap object's own size.
+        let byte_len = (element.length as u64)
+            .checked_mul(element_size as u64)
+            .ok_or(FormatError::OffsetOverflow {
+                offset: u64::from(element.length),
+                length: element_size as u64,
+            })?;
+        if byte_len > object.size {
             return Err(FormatError::VlDataError(format!(
-                "VL element length {} exceeds global heap object size {}",
-                element.length, object.size
+                "VL element length {} ({} bytes) exceeds global heap object size {}",
+                element.length, byte_len, object.size
             )));
         }
 
-        let bytes = source.read_exact_at(object.data_address, element.length as usize)?;
+        let bytes = source.read_exact_at(object.data_address, byte_len.to_usize()?)?;
         objects.push(VlByteObject::Bytes(bytes));
     }
 

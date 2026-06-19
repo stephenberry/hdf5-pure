@@ -60,7 +60,7 @@ Refused today with a `... yet` message, intended to land. Each row links to its 
 
 | Capability | Tracking |
 |---|---|
-| Faithful repack of **time / non-string-vlen / reference** datatypes and unrecognized filters | [#107](https://github.com/stephenberry/hdf5-pure/issues/107) |
+| Repack of **region references**, non-8-byte object references, chunked/filtered/resizable variable-length & reference datasets, and unrecognized filter pipelines (time, contiguous non-string-vlen sequences, and 8-byte object references now repack faithfully) | [#107](https://github.com/stephenberry/hdf5-pure/issues/107) |
 
 ### Reading
 
