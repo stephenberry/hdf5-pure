@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-06-18
+
+Repack now reproduces three more datatype classes faithfully — non-string variable-length sequences, object-reference datasets, and time datatypes — and the dataset read and write hot paths are several times faster (bulk numeric decode, contiguous-row chunk scatter, compress-once filtered writes). **Breaking:** `Datatype::Time` gained a `byte_order` field, so code matching that variant must account for it; minor bump.
+
 ### Added
 
 - Repack now reproduces three more datatype classes faithfully: non-string variable-length sequences (re-staged through a fresh global heap), object-reference datasets (each address rewritten to its target's new location in the compacted file), and time datatypes (byte order preserved). Chunked/filtered/resizable VL and reference datasets, region or non-8-byte object references, and an object reference to a dropped or out-of-hierarchy target are still refused by name ([#107](https://github.com/stephenberry/hdf5-pure/issues/107)).
@@ -214,7 +218,8 @@ Internal robustness and tests ([#26](https://github.com/stephenberry/hdf5-pure/i
 - The MAT deserializer flattens 1×N and N×1 values to a 1-D sequence in `deserialize_any` (matching `deserialize_seq`).
 - Numeric/complex readers preserve 1×N / N×1 shape at the value layer; any flattening happens at the serde level.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.13.0...v0.14.0
