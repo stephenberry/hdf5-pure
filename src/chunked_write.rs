@@ -7,7 +7,7 @@ extern crate alloc;
 use alloc::{vec, vec::Vec};
 
 use crate::checksum::jenkins_lookup3;
-use crate::chunk_cache::align_to_cache_line;
+use crate::chunk_cache::{CACHE_LINE_SIZE, align_to_cache_line};
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
 use crate::extensible_array::{EaGeometry, ExtensibleArrayHeader};
@@ -309,9 +309,13 @@ pub fn split_into_chunks(
 
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "chunk dimensions derived from the in-memory write request; bounded by addressable memory"
+        reason = "chunk/dataset dimensions derived from the in-memory write request; bounded by addressable memory"
     )]
-    let chunk_total_elements: usize = chunk_dims.iter().map(|&d| d as usize).product();
+    let (chunk_dims_us, shape_us): (Vec<usize>, Vec<usize>) = (
+        chunk_dims.iter().map(|&d| d as usize).collect(),
+        shape.iter().map(|&d| d as usize).collect(),
+    );
+    let chunk_total_elements: usize = chunk_dims_us.iter().product();
 
     #[expect(
         clippy::cast_possible_truncation,
@@ -319,60 +323,74 @@ pub fn split_into_chunks(
     )]
     let mut result = Vec::with_capacity(total_chunks as usize);
 
+    // Innermost dimension is contiguous in both the dataset (`raw_data`) and the
+    // chunk buffer, so each in-bounds row is gathered with a single
+    // `copy_from_slice`. Only the outer `rank - 1` dims are walked (odometer),
+    // matching the read-side `copy_chunk_to_output` kernel.
+    let inner = rank - 1;
+    let mut coord = vec![0usize; inner];
+
     for linear_idx in 0..total_chunks {
-        // Convert linear index to chunk grid coordinates
+        // Convert linear index to chunk grid coordinates and the chunk's
+        // dataset-space offset.
         let mut chunk_grid_coords = vec![0u64; rank];
         let mut remaining = linear_idx;
         for d in (0..rank).rev() {
             chunk_grid_coords[d] = remaining % num_chunks_per_dim[d];
             remaining /= num_chunks_per_dim[d];
         }
-
-        // Chunk offset in dataset space
         let offsets: Vec<u64> = (0..rank)
             .map(|d| chunk_grid_coords[d] * chunk_dims[d])
             .collect();
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "chunk offset derived from the in-memory write request; bounded by addressable memory"
+        )]
+        let offsets_us: Vec<usize> = offsets.iter().map(|&o| o as usize).collect();
 
-        // Extract chunk data
         let mut chunk_bytes = vec![0u8; chunk_total_elements * element_size];
 
-        for flat_idx in 0..chunk_total_elements {
-            let mut remaining_idx = flat_idx;
-            let mut ds_flat = 0usize;
-            let mut out_of_bounds = false;
-
-            for d in 0..rank {
-                let coord_in_chunk = remaining_idx / chunk_strides[d];
-                remaining_idx %= chunk_strides[d];
-
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "chunk offset derived from the in-memory write request; bounded by addressable memory"
-                )]
-                let global_coord = offsets[d] as usize + coord_in_chunk;
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "dataset dimension derived from the in-memory write request; bounded by addressable memory"
-                )]
-                let dim_extent = shape[d] as usize;
-                if global_coord >= dim_extent {
-                    out_of_bounds = true;
-                    break;
+        // In-bounds run length along the contiguous innermost dimension.
+        let inner_row_len =
+            chunk_dims_us[inner].min(shape_us[inner].saturating_sub(offsets_us[inner]));
+        if inner_row_len > 0 {
+            let row_bytes = inner_row_len * element_size;
+            let inner_src = offsets_us[inner] * ds_strides[inner];
+            let outer_total: usize = chunk_dims_us[..inner].iter().product();
+            for c in coord.iter_mut() {
+                *c = 0;
+            }
+            for _ in 0..outer_total {
+                let mut dst_base = 0usize;
+                let mut src_base = inner_src;
+                let mut in_bounds = true;
+                for d in 0..inner {
+                    dst_base += coord[d] * chunk_strides[d];
+                    let global = offsets_us[d] + coord[d];
+                    if global >= shape_us[d] {
+                        in_bounds = false;
+                        break;
+                    }
+                    src_base += global * ds_strides[d];
                 }
-                ds_flat += global_coord * ds_strides[d];
-            }
 
-            if out_of_bounds {
-                // Zero-filled (already initialized)
-                continue;
-            }
+                if in_bounds {
+                    let src = src_base * element_size;
+                    let dst = dst_base * element_size;
+                    let mut avail = row_bytes.min(raw_data.len().saturating_sub(src));
+                    avail -= avail % element_size;
+                    if avail > 0 {
+                        chunk_bytes[dst..dst + avail].copy_from_slice(&raw_data[src..src + avail]);
+                    }
+                }
 
-            let src_start = ds_flat * element_size;
-            let dst_start = flat_idx * element_size;
-
-            if src_start + element_size <= raw_data.len() {
-                chunk_bytes[dst_start..dst_start + element_size]
-                    .copy_from_slice(&raw_data[src_start..src_start + element_size]);
+                for d in (0..inner).rev() {
+                    coord[d] += 1;
+                    if coord[d] < chunk_dims_us[d] {
+                        break;
+                    }
+                    coord[d] = 0;
+                }
             }
         }
 
@@ -1404,19 +1422,39 @@ fn write_undefined_element(
     }
 }
 
-/// Build chunked data with absolute addresses and optional maxshape.
-///
-/// `ctx` carries chunk_dims, element_size, and (for type-aware filters like
-/// ZFP) the scalar element type. Build it via [`ChunkContext::from_datatype`]
-/// when a `Datatype` is in scope.
-pub fn build_chunked_data_at_ext(
+/// A chunked dataset's chunks already split and compressed — the expensive,
+/// **address-independent** half of building a chunked layout. The compressed
+/// bytes, the chunk-index choice, and the pipeline message do not depend on
+/// where the data lands in the file; only the absolute addresses embedded in the
+/// chunk index do. The writer sizes a dataset's object header in one pass and
+/// emits its data in a later pass (it needs every prior object's size to know
+/// this object's address), so it computes this set once and feeds it to
+/// [`assemble_chunked_at`] twice — sizing at a dummy address, then emitting at
+/// the real one — instead of recompressing the whole dataset each pass.
+pub(crate) struct CompressedChunkSet {
+    /// Per-chunk compressed bytes, in dense row-major grid order.
+    compressed: Vec<Vec<u8>>,
+    /// Per-chunk uncompressed size (a full chunk is stored at full size, edge
+    /// overhang zero-filled, so these are all equal in practice).
+    raw_sizes: Vec<u64>,
+    chunk_dims_u32: Vec<u32>,
+    element_size: usize,
+    has_filters: bool,
+    use_extensible: bool,
+    pipeline_message: Option<Vec<u8>>,
+}
+
+/// Split `raw_data` into chunks and compress each one, producing the
+/// address-independent [`CompressedChunkSet`]. This performs the dataset's only
+/// pass of the filter pipeline (shuffle/deflate/ZFP/…); [`assemble_chunked_at`]
+/// then lays the result out at a concrete address without recompressing.
+pub(crate) fn compress_chunks(
     raw_data: &[u8],
     shape: &[u64],
     ctx: ChunkContext<'_>,
     options: &ChunkOptions,
-    base_address: u64,
     maxshape: Option<&[u64]>,
-) -> Result<ChunkedDataResult, FormatError> {
+) -> Result<CompressedChunkSet, FormatError> {
     let chunk_dims = ctx.chunk_dims;
     let element_size = ctx.element_size as usize;
     let pipeline = options.build_pipeline(
@@ -1430,35 +1468,18 @@ pub fn build_chunked_data_at_ext(
     let num_chunks = chunks.len();
     let has_filters = pipeline.is_some();
 
-    // Compress each chunk, padding to cache-line boundaries for aligned access
-    let mut data_buf = Vec::new();
-    let mut written_chunks = Vec::with_capacity(num_chunks);
-
-    for (_offsets, chunk_bytes) in &chunks {
-        let compressed = if let Some(ref pl) = pipeline {
-            compress_chunk(chunk_bytes, pl, ctx)?
+    let mut compressed = Vec::with_capacity(num_chunks);
+    let mut raw_sizes = Vec::with_capacity(num_chunks);
+    for (_offsets, chunk_bytes) in chunks {
+        raw_sizes.push(chunk_bytes.len() as u64);
+        let c = if let Some(ref pl) = pipeline {
+            compress_chunk(&chunk_bytes, pl, ctx)?
         } else {
-            chunk_bytes.clone()
+            // No pipeline: the split already produced an owned chunk buffer;
+            // move it into the set instead of cloning.
+            chunk_bytes
         };
-
-        // Pad current position to cache-line boundary
-        let aligned_offset = align_to_cache_line(data_buf.len());
-        if aligned_offset > data_buf.len() {
-            data_buf.resize(aligned_offset, 0u8);
-        }
-
-        let address = base_address + data_buf.len() as u64;
-        let compressed_size = compressed.len() as u64;
-        let raw_size = chunk_bytes.len() as u64;
-
-        data_buf.extend_from_slice(&compressed);
-
-        written_chunks.push(WrittenChunk {
-            address,
-            compressed_size,
-            raw_size,
-            filter_mask: 0,
-        });
+        compressed.push(c);
     }
 
     #[expect(
@@ -1466,13 +1487,67 @@ pub fn build_chunked_data_at_ext(
         reason = "chunk dimensions written into the on-disk u32 dimension fields selected for this file"
     )]
     let chunk_dims_u32: Vec<u32> = chunk_dims.iter().map(|&d| d as u32).collect();
+
+    Ok(CompressedChunkSet {
+        compressed,
+        raw_sizes,
+        chunk_dims_u32,
+        element_size,
+        has_filters,
+        use_extensible: maxshape.is_some_and(|ms| ms.contains(&u64::MAX)),
+        pipeline_message: pipeline.as_ref().map(|pl| pl.serialize()),
+    })
+}
+
+/// Lay an already-[`compress`ed](compress_chunks) chunk set out at `base_address`,
+/// producing the on-disk data region (chunk bytes + cache-line padding + chunk
+/// index) and the v4 data-layout message. Cheap: this only concatenates and
+/// builds the index, so it can be run more than once (different addresses)
+/// without repeating the dataset's compression.
+pub(crate) fn assemble_chunked_at(
+    set: &CompressedChunkSet,
+    base_address: u64,
+) -> Result<ChunkedDataResult, FormatError> {
+    let CompressedChunkSet {
+        compressed,
+        raw_sizes,
+        chunk_dims_u32,
+        element_size,
+        has_filters,
+        use_extensible,
+        pipeline_message,
+    } = set;
+    let element_size = *element_size;
+    let has_filters = *has_filters;
+    let num_chunks = compressed.len();
+
+    // Pre-size the data buffer: chunk bytes plus a cache-line slack per chunk.
+    let chunk_bytes_total: usize = compressed.iter().map(Vec::len).sum();
+    let mut data_buf = Vec::with_capacity(chunk_bytes_total + (num_chunks + 1) * CACHE_LINE_SIZE);
+    let mut written_chunks = Vec::with_capacity(num_chunks);
+
+    for (chunk, &raw_size) in compressed.iter().zip(raw_sizes.iter()) {
+        // Pad current position to cache-line boundary.
+        let aligned_offset = align_to_cache_line(data_buf.len());
+        if aligned_offset > data_buf.len() {
+            data_buf.resize(aligned_offset, 0u8);
+        }
+
+        let address = base_address + data_buf.len() as u64;
+        data_buf.extend_from_slice(chunk);
+
+        written_chunks.push(WrittenChunk {
+            address,
+            compressed_size: chunk.len() as u64,
+            raw_size,
+            filter_mask: 0,
+        });
+    }
+
     let offset_size: u8 = 8;
     let length_size: u8 = 8;
 
-    // Determine if we should use Extensible Array (resizable datasets)
-    let use_extensible = maxshape.is_some_and(|ms| ms.contains(&u64::MAX));
-
-    // Pad before index structures so they are also cache-line aligned
+    // Pad before index structures so they are also cache-line aligned.
     let aligned_idx = align_to_cache_line(data_buf.len());
     if aligned_idx > data_buf.len() {
         data_buf.resize(aligned_idx, 0u8);
@@ -1482,7 +1557,7 @@ pub fn build_chunked_data_at_ext(
         clippy::cast_possible_truncation,
         reason = "element size written into the on-disk u32 dimension field selected for this file"
     )]
-    let layout_message = if use_extensible {
+    let layout_message = if *use_extensible {
         let ea_address = base_address + data_buf.len() as u64;
 
         let ea_bytes = build_extensible_array_at(
@@ -1494,12 +1569,7 @@ pub fn build_chunked_data_at_ext(
         )?;
         data_buf.extend_from_slice(&ea_bytes);
 
-        serialize_v4_extensible_array(
-            &chunk_dims_u32,
-            ea_address,
-            offset_size,
-            element_size as u32,
-        )
+        serialize_v4_extensible_array(chunk_dims_u32, ea_address, offset_size, element_size as u32)
     } else if num_chunks == 1 {
         let chunk_addr = written_chunks[0].address;
         let filtered_size = if has_filters {
@@ -1509,7 +1579,7 @@ pub fn build_chunked_data_at_ext(
         };
         let filter_mask = if has_filters { Some(0u32) } else { None };
         serialize_v4_single_chunk(
-            &chunk_dims_u32,
+            chunk_dims_u32,
             chunk_addr,
             filtered_size,
             filter_mask,
@@ -1529,7 +1599,7 @@ pub fn build_chunked_data_at_ext(
         data_buf.extend_from_slice(&fa_bytes);
 
         serialize_v4_fixed_array(
-            &chunk_dims_u32,
+            chunk_dims_u32,
             fa_address,
             offset_size,
             element_size as u32,
@@ -1537,13 +1607,34 @@ pub fn build_chunked_data_at_ext(
         )
     };
 
-    let pipeline_message = pipeline.as_ref().map(|pl| pl.serialize());
-
     Ok(ChunkedDataResult {
         data_bytes: data_buf,
         layout_message,
-        pipeline_message,
+        pipeline_message: pipeline_message.clone(),
     })
+}
+
+/// Build chunked data with absolute addresses and optional maxshape.
+///
+/// Convenience composition of [`compress_chunks`] + [`assemble_chunked_at`] for
+/// callers (the in-place editor, tests) that build a single chunked dataset at a
+/// known address in one shot. The file writer instead keeps the
+/// [`CompressedChunkSet`] between its sizing and emit passes so it compresses
+/// each dataset only once.
+///
+/// `ctx` carries chunk_dims, element_size, and (for type-aware filters like
+/// ZFP) the scalar element type. Build it via [`ChunkContext::from_datatype`]
+/// when a `Datatype` is in scope.
+pub fn build_chunked_data_at_ext(
+    raw_data: &[u8],
+    shape: &[u64],
+    ctx: ChunkContext<'_>,
+    options: &ChunkOptions,
+    base_address: u64,
+    maxshape: Option<&[u64]>,
+) -> Result<ChunkedDataResult, FormatError> {
+    let set = compress_chunks(raw_data, shape, ctx, options, maxshape)?;
+    assemble_chunked_at(&set, base_address)
 }
 
 /// Per-chunk metadata in dense row-major grid order — enough to compute the

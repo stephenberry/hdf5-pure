@@ -15,6 +15,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - A null or empty variable-length element now writes a zero heap address (HDF5's null-reference convention) instead of an all-ones undefined-address sentinel, which the reference C library rejected as a bad heap index when reading such an element back ([#107](https://github.com/stephenberry/hdf5-pure/issues/107)).
 
+### Performance
+
+- Decoding a numeric dataset into a typed `Vec` (`Dataset::read_i32`/`read_u16`/`read_f64` and siblings) now bulk-decodes native-/big-endian standard-layout values instead of going element by element, making integer reads several times faster (≈15× for `read_i32`, ≈9× for `read_u16` on a 1M-element array); sub-byte-precision and unusual layouts keep the exact same results ([#113](https://github.com/stephenberry/hdf5-pure/pull/113)).
+- Reading a chunked dataset now scatters each chunk into the output one contiguous row at a time rather than element by element, ≈3× faster chunk assembly (a 1024×1024 uncompressed read drops from ~7.6 ms to ~2.2 ms) ([#113](https://github.com/stephenberry/hdf5-pure/pull/113)).
+- Writing a chunked, filtered dataset now compresses each chunk once instead of twice (the object-header sizing pass no longer recompresses), ≈2–3× faster compressed writes (a 1024×1024 shuffle+deflate write drops from ~45 ms to ~16 ms) ([#113](https://github.com/stephenberry/hdf5-pure/pull/113)).
+- The byte-shuffle filter is specialized for the common element widths, the chunk cache no longer copies decompressed chunks in and out on the hot path, and the deflate decoder pre-sizes its output buffer ([#113](https://github.com/stephenberry/hdf5-pure/pull/113)).
+
 ## [0.16.0] - 2026-06-18
 
 Centers on `repack`: it now copies compressed chunks **verbatim** (so lossy filters survive byte-exact) and runs **fully out-of-core**, and gains variable-length-string support. Also adds in-place dataset-value overwrite, dense-attribute and cross-file object copy, in-place addition of chunked/filtered/extensible datasets, and free-space reclaim for chunked deletes; plus reader hardening (a multi-filter chunk-mask corruption fix, sub-byte integer precision, decompression-bomb bounds, and safer B-tree/heap refusals). Additive minor bump.

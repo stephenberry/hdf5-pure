@@ -320,9 +320,12 @@ fn zfp_decompress(
 fn deflate_decompress(data: &[u8], max_output: Option<usize>) -> Result<Vec<u8>, FormatError> {
     use std::io::Read;
     let decoder = flate2::read::ZlibDecoder::new(data);
-    let mut result = Vec::new();
     match max_output {
         Some(limit) => {
+            // The decoded size is known a priori (the chunk's expected byte
+            // size), so reserve it up front instead of letting `read_to_end`
+            // reallocate through ~log2(N) doublings.
+            let mut result = Vec::with_capacity(limit);
             // Read at most `limit + 1` bytes: anything beyond `limit` proves the
             // stream exceeds the expected chunk size, so reject rather than OOM.
             let cap = (limit as u64).saturating_add(1);
@@ -336,15 +339,17 @@ fn deflate_decompress(data: &[u8], max_output: Option<usize>) -> Result<Vec<u8>,
                      (possible decompression bomb)"
                 )));
             }
+            Ok(result)
         }
         None => {
             let mut decoder = decoder;
+            let mut result = Vec::new();
             decoder
                 .read_to_end(&mut result)
                 .map_err(|e| FormatError::DecompressionError(e.to_string()))?;
+            Ok(result)
         }
     }
-    Ok(result)
 }
 
 #[cfg(not(feature = "deflate"))]
@@ -370,6 +375,29 @@ fn deflate_compress(_data: &[u8], _level: u32) -> Result<Vec<u8>, FormatError> {
     Err(FormatError::UnsupportedFilter(FILTER_DEFLATE))
 }
 
+/// Unshuffle one element width `N` (const-generic, so the inner byte loop is
+/// unrolled): gather byte `j` of element `i` from plane `j` and write the `N`
+/// reconstructed bytes of the element as one contiguous store.
+fn unshuffle_n<const N: usize>(data: &[u8], result: &mut [u8], num_elements: usize) {
+    for (i, out) in result.chunks_exact_mut(N).enumerate() {
+        let mut elem = [0u8; N];
+        for (j, b) in elem.iter_mut().enumerate() {
+            *b = data[j * num_elements + i];
+        }
+        out.copy_from_slice(&elem);
+    }
+}
+
+/// Shuffle one element width `N` (const-generic): read the `N` contiguous bytes
+/// of element `i` and scatter byte `j` into plane `j`.
+fn shuffle_n<const N: usize>(data: &[u8], result: &mut [u8], num_elements: usize) {
+    for (i, elem) in data.chunks_exact(N).enumerate() {
+        for (j, &b) in elem.iter().enumerate() {
+            result[j * num_elements + i] = b;
+        }
+    }
+}
+
 /// Unshuffle (decompress direction): reconstruct interleaved element bytes.
 /// On disk: all byte-0s of each element together, then all byte-1s, etc.
 /// Output: elements in natural order.
@@ -385,9 +413,20 @@ fn shuffle_decompress(data: &[u8], element_size: usize) -> Result<Vec<u8>, Forma
     let num_elements = data.len() / element_size;
     let mut result = vec![0u8; data.len()];
 
-    for i in 0..num_elements {
-        for j in 0..element_size {
-            result[i * element_size + j] = data[j * num_elements + i];
+    // Specialize the common scalar widths so the inner loop unrolls and each
+    // element is written as one contiguous store; fall back to the generic loop
+    // for unusual widths (compound members, wide types).
+    match element_size {
+        2 => unshuffle_n::<2>(data, &mut result, num_elements),
+        4 => unshuffle_n::<4>(data, &mut result, num_elements),
+        8 => unshuffle_n::<8>(data, &mut result, num_elements),
+        16 => unshuffle_n::<16>(data, &mut result, num_elements),
+        _ => {
+            for i in 0..num_elements {
+                for j in 0..element_size {
+                    result[i * element_size + j] = data[j * num_elements + i];
+                }
+            }
         }
     }
 
@@ -407,9 +446,17 @@ fn shuffle_compress(data: &[u8], element_size: usize) -> Result<Vec<u8>, FormatE
     let num_elements = data.len() / element_size;
     let mut result = vec![0u8; data.len()];
 
-    for i in 0..num_elements {
-        for j in 0..element_size {
-            result[j * num_elements + i] = data[i * element_size + j];
+    match element_size {
+        2 => shuffle_n::<2>(data, &mut result, num_elements),
+        4 => shuffle_n::<4>(data, &mut result, num_elements),
+        8 => shuffle_n::<8>(data, &mut result, num_elements),
+        16 => shuffle_n::<16>(data, &mut result, num_elements),
+        _ => {
+            for i in 0..num_elements {
+                for j in 0..element_size {
+                    result[j * num_elements + i] = data[i * element_size + j];
+                }
+            }
         }
     }
 
@@ -557,6 +604,41 @@ mod tests {
         let shuffled = shuffle_compress(&data, 4).unwrap();
         let unshuffled = shuffle_decompress(&shuffled, 4).unwrap();
         assert_eq!(unshuffled, data);
+    }
+
+    #[test]
+    fn shuffle_roundtrip_all_widths() {
+        // Every specialized width (2/4/8/16) plus generic fallbacks (3, 6, 7).
+        for &es in &[2usize, 3, 4, 6, 7, 8, 16] {
+            let data: Vec<u8> = (0..(es * 50)).map(|i| (i * 31 % 256) as u8).collect();
+            let shuffled = shuffle_compress(&data, es).unwrap();
+            assert_eq!(shuffled.len(), data.len(), "es={es}");
+            let back = shuffle_decompress(&shuffled, es).unwrap();
+            assert_eq!(back, data, "shuffle roundtrip failed for element_size {es}");
+        }
+    }
+
+    #[test]
+    fn shuffle_specialized_matches_generic() {
+        // The const-generic specialization must produce byte-identical output to
+        // the plain transpose for the same width.
+        fn generic_shuffle(data: &[u8], es: usize) -> Vec<u8> {
+            let ne = data.len() / es;
+            let mut out = vec![0u8; data.len()];
+            for i in 0..ne {
+                for j in 0..es {
+                    out[j * ne + i] = data[i * es + j];
+                }
+            }
+            out
+        }
+        for &es in &[2usize, 4, 8, 16] {
+            let data: Vec<u8> = (0..(es * 37)).map(|i| (i * 17 + 3) as u8).collect();
+            assert_eq!(
+                shuffle_compress(&data, es).unwrap(),
+                generic_shuffle(&data, es)
+            );
+        }
     }
 
     #[test]

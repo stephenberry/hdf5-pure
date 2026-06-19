@@ -16,8 +16,8 @@ use std::collections::HashMap;
 
 use crate::attribute::AttributeMessage;
 use crate::chunked_write::{
-    ByteSink, ChunkOptions, VerbatimLayout, VerbatimPlan, build_chunked_data_at_ext,
-    emit_chunked_data_verbatim, plan_chunked_data_verbatim,
+    ByteSink, ChunkOptions, CompressedChunkSet, VerbatimLayout, VerbatimPlan, assemble_chunked_at,
+    compress_chunks, emit_chunked_data_verbatim, plan_chunked_data_verbatim,
 };
 use crate::convert::TryToUsize;
 use crate::dataspace::{Dataspace, DataspaceType};
@@ -683,7 +683,11 @@ impl FileWriter {
         /// single dispatch point keeps the dummy-sizing and real-address passes
         /// from diverging. The layout is computed from chunk *sizes* alone, so
         /// it is identical whether the chunks are in memory or streamed.
-        fn build_chunked(d: &DsFlat, base_address: u64) -> Result<ChunkedBuilt, FormatError> {
+        fn build_chunked(
+            d: &DsFlat,
+            base_address: u64,
+            chunk_set: Option<&CompressedChunkSet>,
+        ) -> Result<ChunkedBuilt, FormatError> {
             if let Some(rc) = &d.raw_chunks {
                 // Verbatim chunks are always streamed: the layout is planned from
                 // chunk sizes alone, and the bytes are pulled from the provider in
@@ -708,16 +712,11 @@ impl FileWriter {
                     data: DsData::Streamed(plan),
                 })
             } else {
-                let chunk_dims = d.chunk_options.resolve_chunk_dims(&d.ds.dimensions);
-                let ctx = crate::filters::ChunkContext::from_datatype(&chunk_dims, &d.dt);
-                let result = build_chunked_data_at_ext(
-                    &d.raw,
-                    &d.ds.dimensions,
-                    ctx,
-                    &d.chunk_options,
-                    base_address,
-                    d.maxshape.as_deref(),
-                )?;
+                // Encode path: the chunks were compressed once up front; just lay
+                // the cached set out at this address (no recompression).
+                let set = chunk_set
+                    .expect("an encode-path chunked dataset must have a precomputed chunk set");
+                let result = assemble_chunked_at(set, base_address)?;
                 Ok(ChunkedBuilt {
                     layout_message: result.layout_message,
                     pipeline_message: result.pipeline_message,
@@ -935,6 +934,35 @@ impl FileWriter {
             .iter()
             .map(|d| d.chunk_options.is_chunked() || d.maxshape.is_some() || d.raw_chunks.is_some())
             .collect();
+
+        // Compress each encode-path chunked dataset exactly once, up front. The
+        // object-header sizing pass and the data-emit pass both need the chunk
+        // layout, but only the embedded addresses differ between them — the
+        // (expensive) compression does not. Caching the `CompressedChunkSet` here
+        // lets both passes call the cheap `assemble_chunked_at` instead of
+        // recompressing the whole dataset twice. Verbatim datasets carry their
+        // bytes pre-compressed and are planned (not recompressed), so they get no
+        // entry.
+        let chunk_sets: Vec<Option<CompressedChunkSet>> = all_ds
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                if is_chunked[i] && d.raw_chunks.is_none() {
+                    let chunk_dims = d.chunk_options.resolve_chunk_dims(&d.ds.dimensions);
+                    let ctx = crate::filters::ChunkContext::from_datatype(&chunk_dims, &d.dt);
+                    Ok(Some(compress_chunks(
+                        &d.raw,
+                        &d.ds.dimensions,
+                        ctx,
+                        &d.chunk_options,
+                        d.maxshape.as_deref(),
+                    )?))
+                } else {
+                    Ok(None)
+                }
+            })
+            .collect::<Result<_, FormatError>>()?;
+
         let root_dense = root_attrs.len() > DENSE_ATTR_THRESHOLD;
         let group_dense: Vec<bool> = groups
             .iter()
@@ -998,7 +1026,7 @@ impl FileWriter {
                 None
             };
             let oh = if is_chunked[i] {
-                let built = build_chunked(d, dummy_cursor)?;
+                let built = build_chunked(d, dummy_cursor, chunk_sets[i].as_ref())?;
                 dummy_cursor += built.data.len();
                 build_chunked_dataset_oh(
                     &d.dt,
@@ -1156,10 +1184,10 @@ impl FileWriter {
             chunked_msgs: Option<(Vec<u8>, Option<Vec<u8>>)>,
         }
         let mut ds_layouts: Vec<DsLayout> = Vec::new();
-        for (i, d) in all_ds.iter().enumerate() {
+        for (i, d) in all_ds.iter_mut().enumerate() {
             if is_chunked[i] {
                 let base_address = cursor2 as u64;
-                let built = build_chunked(d, base_address)?;
+                let built = build_chunked(d, base_address, chunk_sets[i].as_ref())?;
                 cursor2 += built.data.len().to_usize()?;
                 ds_layouts.push(DsLayout {
                     data: built.data,
@@ -1167,7 +1195,9 @@ impl FileWriter {
                     chunked_msgs: Some((built.layout_message, built.pipeline_message)),
                 });
             } else {
-                let data = d.raw.clone();
+                // `d.raw` is not read again for a contiguous/compact dataset, so
+                // move its element buffer into the layout rather than cloning it.
+                let data = core::mem::take(&mut d.raw);
                 let addr = if data.is_empty() {
                     u64::MAX
                 } else {
