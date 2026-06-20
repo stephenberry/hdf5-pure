@@ -143,10 +143,64 @@ fn bench_write(c: &mut Criterion) {
     g.finish();
 }
 
+// ---------------------------------------------------------------------------
+// MATLAB v7.3 serde round-trip (write transpose + numeric seq decode)
+// ---------------------------------------------------------------------------
+
+/// Exercise the MAT serde path end to end: serializing a struct holding a large
+/// 2-D matrix (column-major transpose) and large numeric vectors, then reading
+/// it back (per-element sequence decode). This is the path `mat::to_bytes` /
+/// `mat::from_bytes` users actually pay for; the low-level benches above bypass
+/// it. No-op unless the `serde` feature is enabled.
+#[cfg(feature = "serde")]
+fn bench_mat_roundtrip(c: &mut Criterion) {
+    use hdf5_pure::mat::{self, Matrix};
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize)]
+    struct Payload {
+        matrix: Matrix<f64>,
+        samples: Vec<f64>,
+        labels: Vec<i32>,
+    }
+
+    let rows = 512usize;
+    let cols = 512usize;
+    let matrix = Matrix::from_row_major(
+        rows,
+        cols,
+        (0..rows * cols).map(|i| i as f64 * 0.5).collect(),
+    );
+    let samples: Vec<f64> = (0..(1usize << 20)).map(|i| i as f64).collect();
+    let labels: Vec<i32> = (0..(1usize << 20)).map(|i| i as i32).collect();
+    let payload = Payload {
+        matrix,
+        samples,
+        labels,
+    };
+    let bytes = mat::to_bytes(&payload).expect("serialize payload");
+
+    let mut g = c.benchmark_group("mat_roundtrip");
+    g.bench_function("to_bytes", |b| {
+        b.iter(|| black_box(mat::to_bytes(black_box(&payload)).unwrap()))
+    });
+    g.bench_function("from_bytes", |b| {
+        b.iter(|| {
+            let p: Payload = mat::from_bytes(black_box(&bytes)).unwrap();
+            black_box(p)
+        })
+    });
+    g.finish();
+}
+
+#[cfg(not(feature = "serde"))]
+fn bench_mat_roundtrip(_c: &mut Criterion) {}
+
 criterion_group!(
     benches,
     bench_contiguous_decode,
     bench_chunked_assembly,
-    bench_write
+    bench_write,
+    bench_mat_roundtrip
 );
 criterion_main!(benches);

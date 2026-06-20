@@ -170,7 +170,7 @@ impl Serializer for ValueSerializer {
         Ok(MapSer::new())
     }
 
-    fn serialize_struct(self, name: &'static str, _len: usize) -> Result<StructSer, MatError> {
+    fn serialize_struct(self, name: &'static str, len: usize) -> Result<StructSer, MatError> {
         Ok(match name {
             MATRIX_SENTINEL => StructSer::Matrix(MatrixFields::default(), MatrixKind::Numeric),
             MATRIX_COMPLEX64_SENTINEL => {
@@ -181,7 +181,9 @@ impl Serializer for ValueSerializer {
             }
             COMPLEX64_SENTINEL => StructSer::Complex64(ComplexFields::default()),
             COMPLEX32_SENTINEL => StructSer::Complex32(ComplexFields::default()),
-            _ => StructSer::Plain(PlainStructFields::default()),
+            // serde supplies the exact field count, so the field Vec can be
+            // sized once instead of growing by reallocation.
+            _ => StructSer::Plain(PlainStructFields::with_capacity(len)),
         })
     }
 
@@ -298,7 +300,7 @@ fn try_unify_homogeneous(elements: Vec<MatValue>) -> Result<MatValue, Vec<MatVal
             .iter()
             .all(|e| matches!(e, MatValue::Scalar(s) if s.tag() == first_tag))
         {
-            let mut vec = NumVec::empty_with_tag(first_tag);
+            let mut vec = NumVec::with_capacity_for_tag(first_tag, elements.len());
             for e in elements {
                 let MatValue::Scalar(s) = e else {
                     unreachable!()
@@ -317,7 +319,7 @@ fn try_unify_homogeneous(elements: Vec<MatValue>) -> Result<MatValue, Vec<MatVal
             |e| matches!(e, MatValue::Vec1D(v) if v.tag() == first_tag && v.len() == first_len),
         ) {
             let rows = elements.len();
-            let mut flat = NumVec::empty_with_tag(first_tag);
+            let mut flat = NumVec::with_capacity_for_tag(first_tag, rows * first_len);
             for e in elements {
                 let MatValue::Vec1D(v) = e else {
                     unreachable!()
@@ -500,6 +502,14 @@ pub(crate) struct ComplexFields<T> {
 #[derive(Default)]
 pub(crate) struct PlainStructFields {
     fields: Vec<(String, MatValue)>,
+}
+
+impl PlainStructFields {
+    fn with_capacity(n: usize) -> Self {
+        Self {
+            fields: Vec::with_capacity(n),
+        }
+    }
 }
 
 impl SerializeStruct for StructSer {

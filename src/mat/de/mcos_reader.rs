@@ -784,8 +784,8 @@ fn decode_datetime(
         Some(data) => complex_pairs(data, "datetime `data`")?,
         None => Vec::new(),
     };
-    let millis_utc: Vec<f64> = pairs.iter().map(|&(re, _)| re).collect();
-    let sub_ms: Vec<f64> = pairs.iter().map(|&(_, im)| im).collect();
+    // Split the (real, imag) pairs into parallel vectors in a single pass.
+    let (millis_utc, sub_ms): (Vec<f64>, Vec<f64>) = pairs.into_iter().unzip();
 
     let mut out = vec![
         (

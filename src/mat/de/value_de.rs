@@ -602,59 +602,18 @@ fn to_f64(v: MatValue, expected: &'static str) -> Result<f64, MatError> {
 // Vec1D SeqAccess
 // ---------------------------------------------------------------------------
 
+/// `SeqAccess` over a numeric vector. The source `NumVec` is already a
+/// contiguous `Vec<Copy>`, so we walk it with a cursor and build exactly one
+/// `MatValue::Scalar` per element on demand rather than pre-expanding the whole
+/// vector into a `VecDeque<MatValue>` of widened, boxed scalars.
 struct Vec1DSeq {
-    items: VecDeque<MatValue>,
+    vec: NumVec,
+    cursor: usize,
 }
 
 impl Vec1DSeq {
     fn new(v: NumVec) -> Self {
-        let items = match v {
-            NumVec::Bool(vs) => vs
-                .into_iter()
-                .map(|b| MatValue::Scalar(ScalarNum::Bool(b)))
-                .collect(),
-            NumVec::F64(vs) => vs
-                .into_iter()
-                .map(|x| MatValue::Scalar(ScalarNum::F64(x)))
-                .collect(),
-            NumVec::F32(vs) => vs
-                .into_iter()
-                .map(|x| MatValue::Scalar(ScalarNum::F32(x)))
-                .collect(),
-            NumVec::I64(vs) => vs
-                .into_iter()
-                .map(|x| MatValue::Scalar(ScalarNum::I64(x)))
-                .collect(),
-            NumVec::I32(vs) => vs
-                .into_iter()
-                .map(|x| MatValue::Scalar(ScalarNum::I32(x)))
-                .collect(),
-            NumVec::I16(vs) => vs
-                .into_iter()
-                .map(|x| MatValue::Scalar(ScalarNum::I16(x)))
-                .collect(),
-            NumVec::I8(vs) => vs
-                .into_iter()
-                .map(|x| MatValue::Scalar(ScalarNum::I8(x)))
-                .collect(),
-            NumVec::U64(vs) => vs
-                .into_iter()
-                .map(|x| MatValue::Scalar(ScalarNum::U64(x)))
-                .collect(),
-            NumVec::U32(vs) => vs
-                .into_iter()
-                .map(|x| MatValue::Scalar(ScalarNum::U32(x)))
-                .collect(),
-            NumVec::U16(vs) => vs
-                .into_iter()
-                .map(|x| MatValue::Scalar(ScalarNum::U16(x)))
-                .collect(),
-            NumVec::U8(vs) => vs
-                .into_iter()
-                .map(|x| MatValue::Scalar(ScalarNum::U8(x)))
-                .collect(),
-        };
-        Self { items }
+        Self { vec: v, cursor: 0 }
     }
 }
 
@@ -664,13 +623,17 @@ impl<'de> SeqAccess<'de> for Vec1DSeq {
         &mut self,
         seed: T,
     ) -> Result<Option<T::Value>, MatError> {
-        match self.items.pop_front() {
-            Some(v) => seed.deserialize(MatValueDeserializer::new(v)).map(Some),
+        match self.vec.get(self.cursor) {
+            Some(scalar) => {
+                self.cursor += 1;
+                seed.deserialize(MatValueDeserializer::new(MatValue::Scalar(scalar)))
+                    .map(Some)
+            }
             None => Ok(None),
         }
     }
     fn size_hint(&self) -> Option<usize> {
-        Some(self.items.len())
+        Some(self.vec.len() - self.cursor)
     }
 }
 

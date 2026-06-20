@@ -299,6 +299,10 @@ fn read_dataset(
     // `string`/`datetime`/`categorical` column inside a table's `data` cell).
     // The exact-length validation in `parse_opaque_metadata`, plus the
     // reserved `MAGIC` first word, keeps genuine `uint32` data from matching.
+    // Retain the probe's decoded buffer: when the payload turns out to be a
+    // plain uint32 array rather than an object reference, it is reused below
+    // instead of reading (and decompressing) the same dataset a second time.
+    let mut probed_u32: Option<Vec<u32>> = None;
     if in_heap && !is_empty && dtype == DType::U32 {
         if let Some(mcos) = mcos {
             let raw = ds.read_u32().map_err(MatError::Hdf5)?;
@@ -307,6 +311,7 @@ fn read_dataset(
                     return decode_object_ids(mcos, &meta.object_ids, depth);
                 }
             }
+            probed_u32 = Some(raw);
         }
     }
 
@@ -329,6 +334,16 @@ fn read_dataset(
         }
         // Empty numeric/char: produce an empty 1-D vec of the correct tag.
         return Ok(empty_value_for_class(class));
+    }
+
+    // The object-reference probe above already read this uint32 payload. When
+    // the value is a plain uint32 array (the resolved class is `UInt32`, so the
+    // `UInt32` match arm below would take the non-complex `read_numeric` path),
+    // reuse that buffer rather than reading the dataset again.
+    if class == MatClass::UInt32 {
+        if let Some(raw) = probed_u32 {
+            return numeric_value_from_flat(NumVec::U32(raw), &shape);
+        }
     }
 
     match class {
@@ -597,15 +612,33 @@ fn is_complex_dtype(dtype: &DType) -> bool {
 // ---------------------------------------------------------------------------
 
 fn read_numeric(ds: &Dataset<'_>, shape: &[u64], class: MatClass) -> Result<MatValue, MatError> {
-    let (rows, cols, total) = shape_decomposition(shape)?;
+    let (_, _, total) = shape_decomposition(shape)?;
 
     // For a single-element dataset we emit a Scalar of the appropriate class.
     if total == 1 {
         return Ok(MatValue::Scalar(read_scalar(ds, class)?));
     }
 
-    // Read all elements as the MATLAB class's native type.
+    // Read all elements as the MATLAB class's native type, then apply the shape
+    // dispatch shared with the reuse path in `read_dataset`.
     let flat = read_all_elements(ds, class)?;
+    numeric_value_from_flat(flat, shape)
+}
+
+/// Build a numeric [`MatValue`] from an already-decoded column-major flat
+/// vector and the dataset's HDF5 shape. Shared by [`read_numeric`] and the
+/// uint32 object-reference probe reuse path so the two cannot diverge: a single
+/// element becomes a `Scalar`, a 1-D shape a `Vec1D`, and a 2-D shape a
+/// row-major `Matrix` (skipping the no-op transpose when a dimension is 1).
+fn numeric_value_from_flat(flat: NumVec, shape: &[u64]) -> Result<MatValue, MatError> {
+    let (rows, cols, total) = shape_decomposition(shape)?;
+
+    if total == 1 {
+        return flat
+            .get(0)
+            .map(MatValue::Scalar)
+            .ok_or_else(|| MatError::Custom("single-element dataset had no element".into()));
+    }
 
     // A 1-D HDF5 dataset (no recorded cols/rows split) is treated as a flat
     // Vec1D. Files produced by MATLAB/this library are always 2-D, but some

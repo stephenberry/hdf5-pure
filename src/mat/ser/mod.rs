@@ -3,6 +3,7 @@
 mod emit;
 mod emit_with_builder;
 mod root;
+mod transpose;
 mod value_ser;
 
 pub use root::{to_bytes, to_bytes_with_options};
