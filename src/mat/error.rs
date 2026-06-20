@@ -37,6 +37,12 @@ pub enum MatError {
     MissingField(String),
     /// A `MATLAB_class` attribute value wasn't recognized.
     UnknownClass(String),
+    /// A recognized but not-yet-supported MATLAB class was encountered on read
+    /// — an MCOS opaque class (`datetime`, `categorical`, `table`,
+    /// `containers.Map`, `dictionary`, an enumeration, a user `classdef`, …)
+    /// whose decoder is not yet implemented. Refused by name rather than
+    /// misread; the modern `string` class is supported.
+    UnsupportedMatlabClass(String),
     /// UTF-16 decoding of a `char` dataset failed.
     Utf16Decode(String),
     /// A generic serde-originated error (from `Error::custom`).
@@ -67,6 +73,11 @@ impl fmt::Display for MatError {
             }
             MatError::MissingField(name) => write!(f, "missing required field: {name}"),
             MatError::UnknownClass(c) => write!(f, "unknown MATLAB_class: {c:?}"),
+            MatError::UnsupportedMatlabClass(c) => write!(
+                f,
+                "MATLAB class {c:?} is not yet supported for reading (modern `string` is; \
+                 other MCOS opaque classes such as datetime/categorical/table are refused for now)"
+            ),
             MatError::Utf16Decode(msg) => write!(f, "UTF-16 decode: {msg}"),
             MatError::Custom(msg) => write!(f, "{msg}"),
         }

@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- MATLAB **cell arrays** now deserialize: `mat::from_bytes` / `mat::from_file` resolve each element's `#refs#` object reference and rebuild the sequence, so `Vec<Struct>`, ragged `Vec<Vec<T>>`, `Vec<Option<T>>` (with `None` slots restored), and nested cells round-trip — previously refused with `UnsupportedType("cell array")`. New public `Dataset::dereference` and `Object` resolve an HDF5 object reference (`H5R_OBJECT`) to the group or dataset it names, and MATLAB's reserved `#refs#` / `#subsystem#` groups are skipped on read ([#114](https://github.com/stephenberry/hdf5-pure/issues/114)).
+- The modern MATLAB **`string`** class now deserializes: an opaque (`MATLAB_object_decode=3`) `string` dataset's object id is resolved against the `#subsystem#/MCOS` store and its UTF-16 saveobj payload decoded, so values written with `Options::with_modern_strings()` round-trip and a scalar `string` reads back as a Rust `String`. The remaining MCOS opaque classes (`datetime`, `categorical`, `table`, `containers.Map`, `dictionary`, …) are refused with the typed `MatError::UnsupportedMatlabClass` rather than misread ([#114](https://github.com/stephenberry/hdf5-pure/issues/114)).
+
 ## [0.17.0] - 2026-06-18
 
 Repack now reproduces three more datatype classes faithfully — non-string variable-length sequences, object-reference datasets, and time datatypes — and the dataset read and write hot paths are several times faster (bulk numeric decode, contiguous-row chunk scatter, compress-once filtered writes). **Breaking:** `Datatype::Time` gained a `byte_order` field, so code matching that variant must account for it; minor bump.

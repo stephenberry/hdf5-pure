@@ -3,13 +3,22 @@
 use std::collections::HashMap;
 
 use crate::convert::TryToUsize;
+use crate::error::FormatError;
 use crate::file_writer::AttrValue;
 use crate::mat::class::MatClass;
+use crate::mat::de::mcos_reader::{self, Mcos};
 use crate::mat::error::MatError;
 use crate::mat::utf16;
 use crate::mat::value::{MatValue, NumVec, ScalarNum};
-use crate::reader::{Dataset, File, Group};
+use crate::reader::{Dataset, File, Group, Object};
 use crate::types::DType;
+
+/// Maximum struct/cell nesting depth followed when reading. Real MATLAB data
+/// nests a handful of levels deep; this bound is generous headroom that still
+/// turns a malformed file — e.g. a cell whose object reference points back at
+/// itself, or a cyclic group link — into a typed error instead of unbounded
+/// recursion and a stack overflow.
+const MAX_NESTING_DEPTH: usize = 256;
 
 /// Parse a MAT v7.3 file into an ordered list of `(name, value)` fields
 /// rooted at the file's top level.
@@ -17,35 +26,76 @@ pub(crate) fn read_file(bytes: &[u8]) -> Result<Vec<(String, MatValue)>, MatErro
     // Accept raw HDF5 too — we don't require the MATLAB signature to be
     // present to deserialize successfully.
     let file = File::from_bytes(bytes.to_vec()).map_err(MatError::Hdf5)?;
+    // Parse the MCOS opaque-object store once; opaque datasets (modern `string`,
+    // …) anywhere in the file resolve their payloads against it. `None` when the
+    // file has no `#subsystem#` group.
+    let mcos = Mcos::parse(&file)?;
     let root = file.root();
-    read_group(&root)
+    read_group(&root, mcos.as_ref(), 0)
 }
 
-fn read_group(group: &Group<'_>) -> Result<Vec<(String, MatValue)>, MatError> {
+fn read_group(
+    group: &Group<'_>,
+    mcos: Option<&Mcos<'_>>,
+    depth: usize,
+) -> Result<Vec<(String, MatValue)>, MatError> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(MatError::Format(FormatError::NestingDepthExceeded));
+    }
     let mut out = Vec::new();
 
     // Collect datasets first, then subgroups. Preserve iteration order from
-    // the HDF5 link table.
+    // the HDF5 link table. Skip MATLAB's reserved internal entries — `#refs#`
+    // (cell/object-reference payloads) and `#subsystem#` (the MCOS opaque-class
+    // store): MATLAB hides them, no variable name can begin with `#`, and their
+    // contents are reached by reference from the variables that use them, not
+    // by walking the top level.
     for name in group.datasets().map_err(MatError::Hdf5)? {
+        if name.starts_with('#') {
+            continue;
+        }
         let ds = group.dataset(&name).map_err(MatError::Hdf5)?;
-        out.push((name, read_dataset(&ds)?));
+        out.push((name, read_dataset(&ds, mcos, depth)?));
     }
     for name in group.groups().map_err(MatError::Hdf5)? {
+        if name.starts_with('#') {
+            continue;
+        }
         let sub = group.group(&name).map_err(MatError::Hdf5)?;
-        out.push((name, read_group_as_value(&sub)?));
+        out.push((name, read_group_as_value(&sub, mcos, depth + 1)?));
     }
     Ok(out)
 }
 
-fn read_group_as_value(group: &Group<'_>) -> Result<MatValue, MatError> {
-    let fields = read_group(group)?;
+fn read_group_as_value(
+    group: &Group<'_>,
+    mcos: Option<&Mcos<'_>>,
+    depth: usize,
+) -> Result<MatValue, MatError> {
+    let fields = read_group(group, mcos, depth)?;
     Ok(MatValue::Struct(fields))
 }
 
 /// Read a single dataset into a `MatValue` using its MATLAB_class attribute
-/// (if present) and its HDF5 shape.
-fn read_dataset(ds: &Dataset<'_>) -> Result<MatValue, MatError> {
+/// (if present) and its HDF5 shape. `depth` bounds struct/cell nesting.
+fn read_dataset(
+    ds: &Dataset<'_>,
+    mcos: Option<&Mcos<'_>>,
+    depth: usize,
+) -> Result<MatValue, MatError> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(MatError::Format(FormatError::NestingDepthExceeded));
+    }
     let attrs = ds.attrs().map_err(MatError::Hdf5)?;
+
+    // An `mxOPAQUE_CLASS` object (`MATLAB_object_decode` set) stores its data in
+    // the `#subsystem#` MCOS store, not on this dataset. Decode it there before
+    // the builtin-class path — its `MATLAB_class` (e.g. `string`) is not a
+    // `MatClass` variant.
+    if let Some(decode) = mcos_reader::matlab_object_decode(&attrs) {
+        return mcos_reader::decode_opaque(ds, &attrs, decode, mcos);
+    }
+
     let class = matlab_class_from_attrs(&attrs)?;
     let shape = ds.shape().map_err(MatError::Hdf5)?;
     let dtype = ds.dtype().map_err(MatError::Hdf5)?;
@@ -59,6 +109,14 @@ fn read_dataset(ds: &Dataset<'_>) -> Result<MatValue, MatError> {
         // rather than collapsing to a numeric empty vec.
         if matches!(class, MatClass::Double | MatClass::Single) && is_complex_dtype(&dtype) {
             return empty_complex_value(class, &shape);
+        }
+        // An empty struct-classed *dataset* (`MATLAB_empty=1`) is `struct([])`,
+        // the marker the serializer writes for `Option::None` inside a
+        // sequence. Surface it as `EmptyStructArray` so an `Option` field
+        // round-trips to `None` (an empty struct *group*, by contrast, reads as
+        // an empty struct via `read_group_as_value`).
+        if class == MatClass::Struct {
+            return Ok(MatValue::EmptyStructArray);
         }
         // Empty numeric/char: produce an empty 1-D vec of the correct tag.
         return Ok(empty_value_for_class(class));
@@ -90,8 +148,30 @@ fn read_dataset(ds: &Dataset<'_>) -> Result<MatValue, MatError> {
         MatClass::Struct => Err(MatError::Custom(
             "dataset has MATLAB_class='struct'; expected a group".into(),
         )),
-        MatClass::Cell => Err(MatError::UnsupportedType("cell array")),
+        MatClass::Cell => read_cell(ds, mcos, depth),
     }
+}
+
+/// Read a cell-array dataset: a vector of HDF5 object references, each pointing
+/// at a member object (struct group, numeric/char dataset, nested cell, …)
+/// interned under `#refs#`. Members are decoded in storage order and collected
+/// into a flat [`MatValue::Cell`], matching the column-vector layout the
+/// serializer writes (the deserializer flattens a cell to a sequence).
+fn read_cell(
+    ds: &Dataset<'_>,
+    mcos: Option<&Mcos<'_>>,
+    depth: usize,
+) -> Result<MatValue, MatError> {
+    let members = ds.dereference().map_err(MatError::Hdf5)?;
+    let mut elems = Vec::with_capacity(members.len());
+    for member in members {
+        let value = match member {
+            Object::Dataset(d) => read_dataset(&d, mcos, depth + 1)?,
+            Object::Group(g) => read_group_as_value(&g, mcos, depth + 1)?,
+        };
+        elems.push(value);
+    }
+    Ok(MatValue::Cell(elems))
 }
 
 /// Extract and parse the `MATLAB_class` attribute value, if present.
@@ -160,7 +240,7 @@ fn empty_value_for_class(class: MatClass) -> MatValue {
         MatClass::UInt32 => MatValue::Vec1D(NumVec::empty_with_tag(ScalarTag::U32)),
         MatClass::UInt64 => MatValue::Vec1D(NumVec::empty_with_tag(ScalarTag::U64)),
         MatClass::Struct => MatValue::Struct(Vec::new()),
-        MatClass::Cell => MatValue::Struct(Vec::new()),
+        MatClass::Cell => MatValue::Cell(Vec::new()),
     }
 }
 

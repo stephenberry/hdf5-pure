@@ -225,7 +225,7 @@ pub use error::FormatError;
 
 #[cfg(feature = "std")]
 pub use reader::{
-    Dataset, DatasetAccessOptions, File, FileAccessOptions, Group, is_hdf5, is_hdf5_bytes,
+    Dataset, DatasetAccessOptions, File, FileAccessOptions, Group, Object, is_hdf5, is_hdf5_bytes,
 };
 
 #[cfg(feature = "std")]

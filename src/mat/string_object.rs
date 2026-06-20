@@ -10,8 +10,10 @@
 //! 1. A `uint64` "saveobj" payload per string scalar/array (lives in `#refs#`).
 //!    Encodes a version, the dimensions, the per-string lengths, and packed
 //!    UTF-16 code units.
-//! 2. A `uint32` 6-element metadata array on the parent dataset:
-//!    `[MCOS_MAGIC=0xDD000000, 2, 1, 1, object_id, 1]`. Carries the
+//! 2. A `uint32` metadata array on the parent dataset. The general form is
+//!    `[MCOS_MAGIC=0xDD000000, ndims, dims…, object_ids…, class_id]`; for the
+//!    scalar string this writer emits it is the 6 elements
+//!    `[0xDD000000, 2, 1, 1, object_id, 1]`. Carries the
 //!    `MATLAB_class="string"` and `MATLAB_object_decode=3` attributes.
 //! 3. A `#subsystem#/MCOS` reference dataset that points to a `FileWrapper__`
 //!    metadata blob, a canonical empty placeholder, every per-string saveobj
