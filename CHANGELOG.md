@@ -12,6 +12,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - The modern MATLAB **`string`** class now deserializes: an opaque (`MATLAB_object_decode=3`) `string` dataset's object id is resolved against the `#subsystem#/MCOS` store and its UTF-16 saveobj payload decoded, so values written with `Options::with_modern_strings()` round-trip and a scalar `string` reads back as a Rust `String` ([#114](https://github.com/stephenberry/hdf5-pure/issues/114)).
 - MATLAB **`datetime`**, **`duration`**, and **`categorical`** now deserialize into the new public `MatDatetime` / `MatDuration` / `MatCategorical` types (Unix-epoch millisecond instants, durations in milliseconds, and category codes plus names — lossless, with `nanoseconds()` / `seconds()` / `labels()` helpers). Any other MCOS opaque class (`table`, `containers.Map`, `dictionary`, user `classdef`s, …) is surfaced losslessly as its raw property map rather than refused, so unknown opaque variables still read; function handles and legacy objects (`MATLAB_object_decode` 1/2) remain refused by name. **Breaking:** `MatError` is now `#[non_exhaustive]` ([#114](https://github.com/stephenberry/hdf5-pure/issues/114)).
 
+### Fixed
+
+- Read HDF5 **version-1 and version-2 compound datatypes** correctly: the member layout was misparsed (the v1 dimension block skipped one 4-byte reserved field, and v2 names were left unpadded), so complex data written by MATLAB and older HDF5 writers — including real-MATLAB `datetime` arrays — now decodes instead of failing with a type mismatch ([#114](https://github.com/stephenberry/hdf5-pure/issues/114)).
+
 ## [0.17.0] - 2026-06-18
 
 Repack now reproduces three more datatype classes faithfully — non-string variable-length sequences, object-reference datasets, and time datatypes — and the dataset read and write hot paths are several times faster (bulk numeric decode, contiguous-row chunk scatter, compress-once filtered writes). **Breaking:** `Datatype::Time` gained a `byte_order` field, so code matching that variant must account for it; minor bump.

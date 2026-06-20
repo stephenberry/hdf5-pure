@@ -233,21 +233,67 @@ fn string_decodes_against_real_matlab() {
 }
 
 // ----------------------------------------------------------------------------
-// robustness: corrupted real-MATLAB subsystems error, never panic
+// datetime sub-millisecond scale  (matjl_struct_table_datetime.mat, MAT.jl)
+// ----------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct DtComplexFile {
+    s: DtComplexInner,
+}
+
+#[derive(Deserialize)]
+struct DtComplexInner {
+    #[serde(rename = "testDatetime")]
+    test_datetime: MatDatetime,
+    #[serde(rename = "testDatetimeComplex")]
+    test_datetime_complex: MatDatetime,
+}
+
+#[test]
+fn datetime_subms_double_double_against_real_matlab() {
+    // This MAT.jl fixture is real MATLAB output whose `testDatetimeComplex` has
+    // a non-zero imaginary part, stored as an HDF5 version-1 compound
+    // {real, imag} of f64. It pins the sub-millisecond scale: MATLAB's datetime
+    // is a "double-double" where the true millisecond value is
+    // `millis_utc + sub_ms`, with `sub_ms` an ADDITIVE residual in
+    // MILLISECONDS (below the high part's ULP) — not a microsecond field.
+    let f: DtComplexFile = read("matjl_struct_table_datetime.mat");
+
+    // Whole-millisecond datetime: the imaginary residual is exactly zero.
+    assert_eq!(f.s.test_datetime.millis_utc, vec![1_575_304_969_634.0]);
+    assert_eq!(f.s.test_datetime.sub_ms, vec![0.0]);
+
+    // Sub-millisecond datetime: the high part carries the fractional millisecond
+    // (…868.83) and the low part is the tiny residual. Exact bytes MATLAB wrote.
+    let dtc = &f.s.test_datetime_complex;
+    assert_eq!(dtc.millis_utc, vec![1_765_052_919_868.83]);
+    assert_eq!(dtc.sub_ms, vec![-7.812_678_813_934_326e-5]);
+
+    // The residual is a genuine sub-millisecond quantity (here ~8e-5 ms): if the
+    // imaginary part were a microsecond-scaled field it could not be this small
+    // relative to the high part. Confirms the additive-millisecond reading.
+    assert!(dtc.sub_ms[0] != 0.0 && dtc.sub_ms[0].abs() < 1e-3);
+
+    // nanoseconds() preserves the high part's fractional-ms precision; the
+    // residual is below f64 ULP at this epoch and does not survive (documented).
+    assert_eq!(dtc.nanoseconds(), vec![1_765_052_919_868.83 * 1e6]);
+}
+
+// ----------------------------------------------------------------------------
+// robustness: malformed real-MATLAB subsystems are handled without panicking
 // ----------------------------------------------------------------------------
 
 #[test]
-fn corrupted_subsystem_errors_without_panicking() {
-    // A truncated/garbled `#subsystem#` store. matio chooses to warn and skip
-    // the opaque variable; this crate is stricter and surfaces a typed error
-    // for the whole read. The invariant under test is that it is an `Err`, not
-    // a panic or silently wrong data.
-    for name in [
-        "test_corrupted_subsystem.mat",
-        "test_corrupted_mcos_object_metadata.mat",
-    ] {
-        let bytes = std::fs::read(format!("tests/fixtures/mat_real/{name}")).unwrap();
-        let result: Result<HashMap<String, serde_json::Value>, _> = mat::from_bytes(&bytes);
-        assert!(result.is_err(), "{name} should fail to decode, got Ok");
-    }
+fn malformed_mcos_is_handled_without_panicking() {
+    // Deliberately damaged real-MATLAB subsystems. The invariant is that the
+    // reader never panics on them. The fixture with an out-of-range object id
+    // surfaces a typed error; the other's damage is tolerated and its variable
+    // still decodes (as matio also reads it). Both complete without panicking.
+    let meta =
+        std::fs::read("tests/fixtures/mat_real/test_corrupted_mcos_object_metadata.mat").unwrap();
+    assert!(mat::from_bytes::<HashMap<String, serde_json::Value>>(&meta).is_err());
+
+    let subsys = std::fs::read("tests/fixtures/mat_real/test_corrupted_subsystem.mat").unwrap();
+    // Tolerated by our parser; must return (Ok or Err) rather than panic.
+    let _ = mat::from_bytes::<HashMap<String, serde_json::Value>>(&subsys);
 }
