@@ -214,6 +214,11 @@ fn apply_value_to_dataset(
             apply_empty_struct_array(ds);
             Ok(())
         }
+        MatValue::Opaque { .. } => {
+            unreachable!(
+                "MatValue::Opaque is read-only; produced by the deserializer, never serialized"
+            )
+        }
     }
 }
 

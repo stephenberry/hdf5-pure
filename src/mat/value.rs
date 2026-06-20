@@ -211,6 +211,32 @@ pub(crate) enum MatValue {
     /// as MATLAB's `struct([])` (a `[0, 0]` empty marker with
     /// `MATLAB_class="struct"` and `MATLAB_empty=1`).
     EmptyStructArray,
+    /// A decoded MATLAB MCOS opaque object (`MATLAB_object_decode = 3`).
+    ///
+    /// Aside from the modern `string` class (which lowers to [`MatValue::String`]
+    /// / [`MatValue::Cell`]), MATLAB stores `datetime`, `duration`,
+    /// `categorical`, `table`, `containers.Map`, `dictionary`, user `classdef`
+    /// instances, … as opaque objects in the hidden `#subsystem#/MCOS` store.
+    /// This variant carries the MATLAB class name and the object's resolved
+    /// properties in declaration order:
+    ///
+    /// - For a class with a dedicated decoder (`datetime`, `duration`,
+    ///   `categorical`) `fields` holds the decoded logical components (e.g.
+    ///   datetime's `millis_utc` / `sub_ms`), which deserialize into the
+    ///   matching public type ([`MatDatetime`](crate::mat::MatDatetime), …) or
+    ///   any struct with the same field names.
+    /// - For every other opaque class `fields` holds the raw property values,
+    ///   so the object is still losslessly readable as a struct rather than
+    ///   failing the whole file.
+    ///
+    /// Read-only: the serializer never produces this variant (writing MCOS
+    /// opaque objects beyond `string` is not supported).
+    Opaque {
+        /// The MATLAB class name (`"datetime"`, `"categorical"`, `"table"`, …).
+        class_name: String,
+        /// Resolved properties in declaration order.
+        fields: Vec<(String, MatValue)>,
+    },
 }
 
 impl MatValue {
@@ -228,6 +254,7 @@ impl MatValue {
             MatValue::Struct(_) => "struct",
             MatValue::Cell(_) => "cell array",
             MatValue::EmptyStructArray => "empty struct array",
+            MatValue::Opaque { .. } => "opaque object",
         }
     }
 }
