@@ -1923,10 +1923,12 @@ impl EditSession {
                 };
 
                 // Fast path: overwrite each chunk straight in its slot when every
-                // new chunk fits exactly. No header rewrite, no index change, no
-                // superblock flip — the chunk blocks are reachable from both roots.
+                // new chunk fits. No header rewrite and no superblock flip — the
+                // chunk (and index) blocks are reachable from both roots. The index
+                // is left untouched when chunks keep their size and rebuilt in place
+                // when they shrink.
                 if let Some(writes) =
-                    try_inplace_chunk_writes(d, &dl, &disk_ds, &spatial, &new_chunk_bytes)
+                    try_inplace_chunk_writes(d, &dl, &disk_ds, &spatial, raw_size, &new_chunk_bytes)
                 {
                     return Ok(WritePlan::InPlaceChunks { writes });
                 }
@@ -3567,19 +3569,31 @@ fn chunked_geometry(
     })
 }
 
-/// Try to overwrite a chunked dataset's chunks in place: when the dataset's
+/// Try to overwrite a chunked dataset's chunks in place. When the dataset's
 /// on-disk chunks form a dense grid aligned with `new_bytes` (dense row-major
-/// order) and every new chunk is the same byte length as the slot it would
-/// replace, with the slot unmasked (`filter_mask == 0`) and in bounds, return the
-/// `(slot_address, bytes)` writes. Returns `None` — so the caller relocates the
-/// dataset instead — when the index cannot be enumerated, the grid is sparse, a
-/// new chunk's size differs from its slot, a slot is masked, or any write would be
-/// out of bounds or overlap another.
+/// order), every slot is unmasked (`filter_mask == 0`), and every new chunk
+/// **fits** the slot it replaces (`new_len <= slot`), return the in-place
+/// `(address, bytes)` writes:
+///
+/// - When every new chunk is **exactly** its slot's size, only the chunk data is
+///   written; the index is untouched (so any enumerable index type works, and a
+///   crash can tear at most a chunk's value bytes, not the structure).
+/// - When some new chunks are **smaller** (fit with slack), the chunk index
+///   records each chunk's stored size, so the index is rebuilt in place to record
+///   the new sizes (see [`try_rebuild_index_in_place`]). This is supported only
+///   for a v4 fixed-array or extensible-array index occupying a single contiguous
+///   on-disk region; any other case returns `None` to relocate.
+///
+/// Returns `None` — so the caller relocates the dataset instead — when the index
+/// cannot be enumerated, the grid is sparse, a slot is masked, a new chunk does
+/// not fit, the index cannot be rebuilt in place, or any write would be out of
+/// bounds or overlap another.
 fn try_inplace_chunk_writes(
     d: &[u8],
     layout: &DataLayout,
     ds: &Dataspace,
     spatial: &[u64],
+    raw_size: u64,
     new_bytes: &[Vec<u8>],
 ) -> Option<Vec<(usize, Vec<u8>)>> {
     let infos = enumerate_chunks_buffered(d, layout, ds, OFFSET_SIZE, LENGTH_SIZE).ok()?;
@@ -3587,8 +3601,9 @@ fn try_inplace_chunk_writes(
     if grid.grid_order.len() != new_bytes.len() {
         return None;
     }
-    let mut writes = Vec::with_capacity(new_bytes.len());
-    let mut spans: Vec<(u64, u64)> = Vec::with_capacity(new_bytes.len());
+    let mut writes = Vec::with_capacity(new_bytes.len() + 1);
+    let mut spans: Vec<(u64, u64)> = Vec::with_capacity(new_bytes.len() + 1);
+    let mut any_shrunk = false;
     for (ci, bytes) in grid.grid_order.iter().zip(new_bytes.iter()) {
         // A nonzero filter mask means the source left some filter unapplied for
         // this chunk; re-encoding always applies every filter (mask 0), so an
@@ -3596,22 +3611,134 @@ fn try_inplace_chunk_writes(
         if ci.filter_mask != 0 {
             return None;
         }
-        // Equal-size only: the index records the slot's stored size, so a
-        // different length would need an index edit this path deliberately avoids.
-        if u64::from(ci.chunk_size) != bytes.len() as u64 {
+        let new_len = bytes.len() as u64;
+        let slot = u64::from(ci.chunk_size);
+        // A chunk that no longer fits its slot must relocate.
+        if new_len > slot {
             return None;
+        }
+        if new_len < slot {
+            any_shrunk = true;
         }
         let start = usize::try_from(ci.address).ok()?;
         start.checked_add(bytes.len()).filter(|&e| e <= d.len())?;
         writes.push((start, bytes.clone()));
-        spans.push((ci.address, bytes.len() as u64));
+        spans.push((ci.address, new_len));
     }
-    // Refuse to perform overlapping in-place writes (a malformed source index);
-    // relocate instead so two slots never clobber each other.
+
+    // A shrinking overwrite changes the index-recorded chunk sizes, so the index
+    // must be rebuilt in place to match; an equal-size one leaves it untouched.
+    if any_shrunk {
+        let (index_addr, index_bytes) =
+            try_rebuild_index_in_place(d, layout, raw_size, &grid.grid_order, new_bytes)?;
+        spans.push((index_addr as u64, index_bytes.len() as u64));
+        writes.push((index_addr, index_bytes));
+    }
+
+    // Refuse to perform overlapping in-place writes (a malformed source index, or
+    // an index region that overlaps a chunk slot); relocate instead so two writes
+    // never clobber each other.
     if !spans_disjoint_in_bounds(&mut spans, d.len() as u64) {
         return None;
     }
     Some(writes)
+}
+
+/// Rebuild a chunked dataset's index **in place** so it records the new
+/// (smaller) per-chunk stored sizes after a fits-with-slack overwrite, returning
+/// the `(address, bytes)` write that replaces it. The chunks keep their existing
+/// addresses (only their stored bytes shrank), so the rebuilt index points at the
+/// same slots with the new sizes.
+///
+/// Supported only for a v4 **fixed-array** or **extensible-array** index whose
+/// on-disk structure is a single contiguous region starting at the index address
+/// — the layout this crate's own writer produces. The element width derives from
+/// the unchanged raw chunk size, so the rebuilt structure is byte-for-byte the
+/// same length as the original; this is required to match exactly, which rejects a
+/// scattered or differently-laid-out (e.g. C-written) index, leaving the caller
+/// to relocate. Single-chunk (size in the layout message) and B-tree-v1 (no
+/// writer) indexes are not rebuilt here.
+///
+/// Like any in-place value overwrite (the HDF5 `H5Dwrite` model) this is not
+/// atomic: a crash mid-write can tear the index and leave the dataset needing a
+/// rewrite. It is used only on the in-place path, whose linearization point is the
+/// synced data write.
+fn try_rebuild_index_in_place(
+    d: &[u8],
+    layout: &DataLayout,
+    raw_size: u64,
+    grid_order: &[crate::chunked_read::ChunkInfo],
+    new_bytes: &[Vec<u8>],
+) -> Option<(usize, Vec<u8>)> {
+    let DataLayout::Chunked {
+        btree_address: Some(index_addr),
+        chunk_index_type,
+        version,
+        ..
+    } = layout
+    else {
+        return None;
+    };
+    let written: Vec<crate::chunked_write::WrittenChunk> = grid_order
+        .iter()
+        .zip(new_bytes)
+        .map(|(ci, b)| crate::chunked_write::WrittenChunk {
+            address: ci.address,
+            compressed_size: b.len() as u64,
+            raw_size,
+            filter_mask: 0,
+        })
+        .collect();
+    let new_index = match (version, chunk_index_type) {
+        (4, Some(3)) => crate::chunked_write::build_fixed_array_at(
+            &written,
+            OFFSET_SIZE,
+            LENGTH_SIZE,
+            true,
+            *index_addr,
+        ),
+        (4, Some(4)) => crate::chunked_write::build_extensible_array_at(
+            &written,
+            OFFSET_SIZE,
+            LENGTH_SIZE,
+            true,
+            *index_addr,
+        )
+        .ok()?,
+        // Single-chunk records its size in the layout message (a header rewrite),
+        // and a B-tree-v1 index has no writer; both relocate instead.
+        _ => return None,
+    };
+
+    // The on-disk index must be a single contiguous region starting at the index
+    // address, and the rebuilt structure must be exactly the same length (true for
+    // an index this crate wrote). A scattered or different on-disk layout fails
+    // the check and the caller relocates.
+    let mut spans =
+        crate::chunked_read::chunk_index_spans_buffered(d, layout, OFFSET_SIZE, LENGTH_SIZE)
+            .ok()?;
+    if spans.is_empty() {
+        return None;
+    }
+    spans.sort_unstable_by_key(|&(a, _)| a);
+    if spans[0].0 != *index_addr {
+        return None;
+    }
+    let mut end = *index_addr;
+    for &(a, l) in &spans {
+        if a != end {
+            return None; // a gap means the index is not contiguous
+        }
+        end = a.checked_add(l)?;
+    }
+    if new_index.len() as u64 != end - *index_addr {
+        return None;
+    }
+    let start = usize::try_from(*index_addr).ok()?;
+    start
+        .checked_add(new_index.len())
+        .filter(|&e| e <= d.len())?;
+    Some((start, new_index))
 }
 
 /// A [`ChunkProvider`] over chunk bytes already held in memory, in dense

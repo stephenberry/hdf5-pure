@@ -1324,6 +1324,46 @@ fn collect_chunk_index_spans(
     }
 }
 
+/// The on-disk byte spans of a chunked dataset's index *structure* (not its chunk
+/// data), from an in-memory file image and a parsed [`DataLayout::Chunked`]. A
+/// buffered convenience wrapper over [`collect_chunk_index_spans`], used by the
+/// in-place editor to test whether a chunked dataset's index occupies a single
+/// contiguous region it can rebuild in place. Returns an empty vector for an
+/// undefined index address or a single-chunk / implicit index (no separate
+/// structure); errors for an index type with no walker (a version-2 B-tree).
+#[cfg(feature = "std")]
+pub(crate) fn chunk_index_spans_buffered(
+    file_data: &[u8],
+    layout: &DataLayout,
+    offset_size: u8,
+    length_size: u8,
+) -> Result<Vec<(u64, u64)>, FormatError> {
+    let DataLayout::Chunked {
+        chunk_dimensions,
+        btree_address,
+        version,
+        chunk_index_type,
+        ..
+    } = layout
+    else {
+        return Err(FormatError::ChunkedReadError(
+            "chunk_index_spans_buffered called on a non-chunked layout".into(),
+        ));
+    };
+    let Some(index_addr) = *btree_address else {
+        return Ok(Vec::new());
+    };
+    collect_chunk_index_spans(
+        file_data,
+        *version,
+        *chunk_index_type,
+        index_addr,
+        chunk_dimensions.len(),
+        offset_size,
+        length_size,
+    )
+}
+
 /// Scatter decompressed chunks into the dense output buffer. Pure (no file
 /// access): shared by the buffered and streaming chunked readers.
 fn assemble_chunks(
