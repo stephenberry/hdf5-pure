@@ -560,12 +560,54 @@ pub(crate) fn decode_object_fields(
     fields: Vec<(String, MatValue)>,
 ) -> Result<MatValue, MatError> {
     match class_name.as_str() {
+        "string" => decode_string_object(fields),
         "datetime" => decode_datetime(class_name, fields),
         "duration" => decode_duration(class_name, fields),
         "categorical" => decode_categorical(class_name, fields),
         // Every other opaque class (table, containers.Map, dictionary, user
         // classdefs, …) is surfaced losslessly with its raw properties.
         _ => Ok(MatValue::Opaque { class_name, fields }),
+    }
+}
+
+/// Decode a nested `string` object from its resolved properties.
+///
+/// Unlike a top-level `string` dataset (decoded directly from the parent
+/// dataset's metadata by [`Mcos::decode_string`]), a `string` reached as a
+/// nested object — e.g. a `string` column inside a table's `data` cell — arrives
+/// here as a property set: a single property (named `any`) carrying the
+/// self-describing `uint64` saveobj payload. Decode that payload the same way.
+fn decode_string_object(mut fields: Vec<(String, MatValue)>) -> Result<MatValue, MatError> {
+    // The saveobj payload is the object's sole property; prefer the canonical
+    // `any` name but fall back to the first property for resilience.
+    let payload =
+        take_field(&mut fields, "any").or_else(|| fields.into_iter().next().map(|(_, v)| v));
+    let units = match payload {
+        Some(value) => matvalue_to_u64(value)?,
+        // A propertyless `string` object is the empty string.
+        None => return Ok(MatValue::String(String::new())),
+    };
+    let mut values = decode_string_saveobj(&units)?;
+    Ok(match values.len() {
+        1 => MatValue::String(values.pop().expect("len checked")),
+        _ => MatValue::Cell(values.into_iter().map(MatValue::String).collect()),
+    })
+}
+
+/// Extract the backing `uint64` payload of a `string` object's saveobj
+/// property. The payload is always stored as a `uint64` array.
+fn matvalue_to_u64(value: MatValue) -> Result<Vec<u64>, MatError> {
+    match value {
+        MatValue::Vec1D(NumVec::U64(v)) => Ok(v),
+        MatValue::Matrix {
+            vec: NumVec::U64(v),
+            ..
+        } => Ok(v),
+        MatValue::Scalar(ScalarNum::U64(v)) => Ok(vec![v]),
+        other => Err(MatError::Custom(format!(
+            "string object payload is not a uint64 array (got {})",
+            other.kind()
+        ))),
     }
 }
 
@@ -577,9 +619,13 @@ fn decode_datetime(
     class_name: String,
     mut fields: Vec<(String, MatValue)>,
 ) -> Result<MatValue, MatError> {
-    let data = take_field(&mut fields, "data")
-        .ok_or_else(|| MatError::Custom("datetime object is missing its `data` property".into()))?;
-    let pairs = complex_pairs(data, "datetime `data`")?;
+    // An empty `datetime` (e.g. `NaT(0,0)` or a zero-row timetable's row-times)
+    // can be stored with no `data` property; decode that as an empty datetime
+    // rather than aborting the whole-file read.
+    let pairs = match take_field(&mut fields, "data") {
+        Some(data) => complex_pairs(data, "datetime `data`")?,
+        None => Vec::new(),
+    };
     let millis_utc: Vec<f64> = pairs.iter().map(|&(re, _)| re).collect();
     let sub_ms: Vec<f64> = pairs.iter().map(|&(_, im)| im).collect();
 
@@ -609,10 +655,14 @@ fn decode_duration(
     class_name: String,
     mut fields: Vec<(String, MatValue)>,
 ) -> Result<MatValue, MatError> {
-    let millis = take_field(&mut fields, "millis").ok_or_else(|| {
-        MatError::Custom("duration object is missing its `millis` property".into())
-    })?;
-    let millis = numeric_f64_vec(millis, "duration `millis`")?;
+    // An empty or default-constructed `duration` (e.g. `duration.empty` or a
+    // zero-row timetable's row-times) is stored by MATLAB with no `millis`
+    // property at all; decode that as an empty duration rather than erroring,
+    // which would otherwise abort the whole-file read.
+    let millis = match take_field(&mut fields, "millis") {
+        Some(millis) => numeric_f64_vec(millis, "duration `millis`")?,
+        None => Vec::new(),
+    };
     let mut out = vec![("millis".to_owned(), MatValue::Vec1D(NumVec::F64(millis)))];
     if let Some(fmt) = take_field(&mut fields, "fmt") {
         out.push(("fmt".to_owned(), string_or_empty(fmt)));

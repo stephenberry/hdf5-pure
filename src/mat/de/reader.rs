@@ -31,12 +31,17 @@ pub(crate) fn read_file(bytes: &[u8]) -> Result<Vec<(String, MatValue)>, MatErro
     // file has no `#subsystem#` group.
     let mcos = Mcos::parse(&file)?;
     let root = file.root();
-    read_group(&root, mcos.as_ref(), 0)
+    read_group(&root, mcos.as_ref(), false, 0)
 }
 
+/// Read a struct group's `(name, value)` fields.
+///
+/// `in_heap` marks reads that descend from an MCOS opaque object's property
+/// heap (see [`read_dataset`]); the top level passes `false`.
 fn read_group(
     group: &Group<'_>,
     mcos: Option<&Mcos<'_>>,
+    in_heap: bool,
     depth: usize,
 ) -> Result<Vec<(String, MatValue)>, MatError> {
     if depth > MAX_NESTING_DEPTH {
@@ -55,14 +60,14 @@ fn read_group(
             continue;
         }
         let ds = group.dataset(&name).map_err(MatError::Hdf5)?;
-        out.push((name, read_dataset(&ds, mcos, depth)?));
+        out.push((name, read_dataset(&ds, mcos, in_heap, depth)?));
     }
     for name in group.groups().map_err(MatError::Hdf5)? {
         if name.starts_with('#') {
             continue;
         }
         let sub = group.group(&name).map_err(MatError::Hdf5)?;
-        out.push((name, read_group_as_value(&sub, mcos, depth + 1)?));
+        out.push((name, read_group_as_value(&sub, mcos, in_heap, depth + 1)?));
     }
     Ok(out)
 }
@@ -70,17 +75,29 @@ fn read_group(
 fn read_group_as_value(
     group: &Group<'_>,
     mcos: Option<&Mcos<'_>>,
+    in_heap: bool,
     depth: usize,
 ) -> Result<MatValue, MatError> {
-    let fields = read_group(group, mcos, depth)?;
+    let fields = read_group(group, mcos, in_heap, depth)?;
     Ok(MatValue::Struct(fields))
 }
 
 /// Read a single dataset into a `MatValue` using its MATLAB_class attribute
 /// (if present) and its HDF5 shape. `depth` bounds struct/cell nesting.
+///
+/// `in_heap` is `true` when this dataset is reached through an MCOS opaque
+/// object's property heap (a property value, or an element of a cell / field of
+/// a struct nested under one). Inside that heap a property that is *itself* an
+/// opaque object is stored as a bare `uint32` metadata array (the same
+/// `[MAGIC, ndims, dims…, object ids…, class id]` layout an opaque parent
+/// dataset carries) **without** a `MATLAB_object_decode` attribute. Such
+/// embedded references are resolved here; a top-level dataset (`in_heap ==
+/// false`) is never treated this way, so ordinary `uint32` data cannot be
+/// misread as a reference.
 fn read_dataset(
     ds: &Dataset<'_>,
     mcos: Option<&Mcos<'_>>,
+    in_heap: bool,
     depth: usize,
 ) -> Result<MatValue, MatError> {
     if depth > MAX_NESTING_DEPTH {
@@ -100,6 +117,22 @@ fn read_dataset(
     let shape = ds.shape().map_err(MatError::Hdf5)?;
     let dtype = ds.dtype().map_err(MatError::Hdf5)?;
     let is_empty = is_empty_attr(&attrs) || shape.contains(&0);
+
+    // Embedded MCOS object reference: a non-empty `uint32` heap value whose
+    // contents parse as opaque metadata names one or more nested objects (e.g. a
+    // `string`/`datetime`/`categorical` column inside a table's `data` cell).
+    // The exact-length validation in `parse_opaque_metadata`, plus the
+    // reserved `MAGIC` first word, keeps genuine `uint32` data from matching.
+    if in_heap && !is_empty && dtype == DType::U32 {
+        if let Some(mcos) = mcos {
+            let raw = ds.read_u32().map_err(MatError::Hdf5)?;
+            if let Ok(meta) = mcos_reader::parse_opaque_metadata(&raw) {
+                if !meta.object_ids.is_empty() {
+                    return decode_object_ids(mcos, &meta.object_ids, depth);
+                }
+            }
+        }
+    }
 
     let class = class.unwrap_or_else(|| class_from_dtype(&dtype));
 
@@ -148,7 +181,7 @@ fn read_dataset(
         MatClass::Struct => Err(MatError::Custom(
             "dataset has MATLAB_class='struct'; expected a group".into(),
         )),
-        MatClass::Cell => read_cell(ds, mcos, depth),
+        MatClass::Cell => read_cell(ds, mcos, in_heap, depth),
     }
 }
 
@@ -160,12 +193,13 @@ fn read_dataset(
 fn read_cell(
     ds: &Dataset<'_>,
     mcos: Option<&Mcos<'_>>,
+    in_heap: bool,
     depth: usize,
 ) -> Result<MatValue, MatError> {
     let members = ds.dereference().map_err(MatError::Hdf5)?;
     let mut elems = Vec::with_capacity(members.len());
     for member in members {
-        elems.push(read_object(&member, mcos, depth + 1)?);
+        elems.push(read_object(&member, mcos, in_heap, depth + 1)?);
     }
     Ok(MatValue::Cell(elems))
 }
@@ -175,11 +209,12 @@ fn read_cell(
 fn read_object(
     obj: &Object<'_>,
     mcos: Option<&Mcos<'_>>,
+    in_heap: bool,
     depth: usize,
 ) -> Result<MatValue, MatError> {
     match obj {
-        Object::Dataset(d) => read_dataset(d, mcos, depth),
-        Object::Group(g) => read_group_as_value(g, mcos, depth),
+        Object::Dataset(d) => read_dataset(d, mcos, in_heap, depth),
+        Object::Group(g) => read_group_as_value(g, mcos, in_heap, depth),
     }
 }
 
@@ -230,12 +265,21 @@ fn decode_opaque(
         });
     }
 
-    let mut values = Vec::with_capacity(parsed.object_ids.len());
-    for object_id in parsed.object_ids {
+    decode_object_ids(mcos, &parsed.object_ids, depth)
+}
+
+/// Decode one or more MCOS object ids (from an opaque parent dataset or an
+/// embedded heap reference) into a value. A single id is the object itself; a
+/// genuine object array becomes a cell of the decoded objects.
+fn decode_object_ids(
+    mcos: &Mcos<'_>,
+    object_ids: &[u32],
+    depth: usize,
+) -> Result<MatValue, MatError> {
+    let mut values = Vec::with_capacity(object_ids.len());
+    for &object_id in object_ids {
         values.push(decode_opaque_object(mcos, object_id, depth)?);
     }
-    // A scalar opaque variable is a single object; a genuine object array
-    // becomes a cell of the decoded objects.
     if values.len() == 1 {
         Ok(values.pop().expect("len checked"))
     } else {
@@ -257,8 +301,12 @@ fn decode_opaque_object(
     let class_name = mcos.object_class_name(object_id)?;
     let mut fields = Vec::new();
     for prop in mcos.properties(object_id)? {
+        // Property values descend from the opaque object's heap, so read them
+        // with `in_heap = true`: a property (or a cell element / struct field
+        // beneath it) that is itself an opaque object decodes instead of
+        // surfacing as its raw `uint32` reference metadata.
         let value = match prop.value {
-            PropValue::Heap(v) => read_object(mcos.heap_object(v)?, Some(mcos), depth + 1)?,
+            PropValue::Heap(v) => read_object(mcos.heap_object(v)?, Some(mcos), true, depth + 1)?,
             PropValue::Inline(n) => MatValue::Scalar(mcos_reader::inline_to_scalar(n)),
             PropValue::Name(s) => MatValue::String(s),
         };
