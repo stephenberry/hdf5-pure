@@ -1987,20 +1987,22 @@ fn write_dataset_chunked_relocate_then_reuse_stays_valid() {
             .with_deflate(6);
         b.write(&path).unwrap();
     }
-    let mut session = EditSession::open(&path).unwrap();
     // Force a relocate (different compressibility => different stored size), which
     // frees the old chunk storage into the session free list.
     let updated: Vec<i32> = vec![0; 4096];
-    session
-        .write_dataset("d")
-        .with_i32_data(&updated)
-        .with_shape(&[4096]);
-    session.commit().unwrap();
-
-    // A later addition in the same session draws from the freed regions.
     let filler: Vec<f64> = (0..64).map(|i| i as f64).collect();
-    session.create_dataset("filler").with_f64_data(&filler);
-    session.commit().unwrap();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .write_dataset("d")
+            .with_i32_data(&updated)
+            .with_shape(&[4096]);
+        session.commit().unwrap();
+
+        // A later addition in the same session draws from the freed regions.
+        session.create_dataset("filler").with_f64_data(&filler);
+        session.commit().unwrap();
+    } // drop the editor (release its file lock) before reading back
 
     let file = File::open(&path).unwrap();
     assert_eq!(file.dataset("d").unwrap().read_i32().unwrap(), updated);
