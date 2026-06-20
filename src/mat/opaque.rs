@@ -32,11 +32,14 @@ use serde::Deserialize;
 
 /// A decoded MATLAB `datetime` array.
 ///
-/// MATLAB stores datetimes as milliseconds since the Unix epoch
-/// (1970-01-01 UTC, with no time-zone offset folded in). [`millis_utc`] holds
-/// the whole-millisecond instant of each element and [`sub_ms`] a
-/// sub-millisecond correction, both preserved losslessly. [`tz`] and [`fmt`] are
-/// display metadata and do not shift the stored instant.
+/// MATLAB stores datetimes as milliseconds since the Unix epoch (1970-01-01
+/// UTC, with no time-zone offset folded in) using a two-part "double-double"
+/// value: the true millisecond count of each element is [`millis_utc`] `+`
+/// [`sub_ms`]. [`millis_utc`] already carries sub-millisecond precision in its
+/// fractional part; [`sub_ms`] is the residual below that part's `f64` ULP.
+/// Both are preserved losslessly, and this split has been validated against
+/// real MATLAB output. [`tz`] and [`fmt`] are display metadata and do not shift
+/// the stored instant.
 ///
 /// `NaT` (not-a-time) elements appear as `NaN` in [`millis_utc`].
 ///
@@ -46,9 +49,11 @@ use serde::Deserialize;
 /// [`fmt`]: MatDatetime::fmt
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct MatDatetime {
-    /// Milliseconds since 1970-01-01 UTC, one per element (row-major order).
+    /// Milliseconds since 1970-01-01 UTC (the high part of the double-double;
+    /// may be fractional), one per element in row-major order.
     pub millis_utc: Vec<f64>,
-    /// Sub-millisecond correction per element, paired with `millis_utc`.
+    /// Sub-millisecond residual (the low part of the double-double) per element,
+    /// paired with `millis_utc`. Usually below the `f64` ULP of `millis_utc`.
     #[serde(default)]
     pub sub_ms: Vec<f64>,
     /// Time-zone name when the datetime is zoned (display metadata only).
@@ -60,13 +65,15 @@ pub struct MatDatetime {
 }
 
 impl MatDatetime {
-    /// Nanoseconds since the Unix epoch for each element, combining the whole-
-    /// and sub-millisecond parts.
+    /// Nanoseconds since the Unix epoch for each element.
     ///
-    /// The sub-millisecond part is combined as `(millis_utc + sub_ms) * 1e6`.
-    /// The exact scale of the stored sub-millisecond component has not been
-    /// pinned against real MATLAB output yet; for whole-millisecond datetimes
-    /// (where `sub_ms` is zero) the result is exact regardless.
+    /// The true millisecond value is `millis_utc + sub_ms` (MATLAB's
+    /// double-double), so this returns `(millis_utc + sub_ms) * 1e6`.
+    /// `millis_utc` already carries sub-millisecond precision in its fractional
+    /// part, which this preserves; the much smaller `sub_ms` residual is below
+    /// the `f64` ULP at present-day epochs and so does not survive the
+    /// arithmetic. For lossless sub-millisecond work read `millis_utc` and
+    /// `sub_ms` directly. For whole-millisecond datetimes the result is exact.
     #[must_use]
     pub fn nanoseconds(&self) -> Vec<f64> {
         self.millis_utc

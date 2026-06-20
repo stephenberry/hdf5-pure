@@ -374,23 +374,23 @@ impl Datatype {
                         });
                     }
                 } else if version == 1 || version == 2 {
-                    // v1/v2: name, offset(4), dimensionality(1), reserved(3), dim_perm(4),
-                    //         reserved_dims(up to 4*4=16), member datatype
+                    // v1 and v2: the member name is NUL-terminated and padded with
+                    // additional NULs to a multiple of 8 bytes, followed by a
+                    // 4-byte member byte offset. v1 then carries a fixed 28-byte
+                    // dimension block — dimensionality(1) + reserved(3) +
+                    // dimension permutation(4) + reserved(4) + dimension sizes(16)
+                    // — before the member datatype message; v2 drops that block.
                     for _ in 0..num_members {
                         let (name, name_len) = read_null_terminated_string(data, pos)?;
-                        pos += name_len;
-                        // v1: names padded to 8-byte boundary
-                        if version == 1 {
-                            let total_name_bytes = name_len;
-                            let padded = (total_name_bytes + 7) & !7;
-                            pos = pos - name_len + padded;
-                        }
+                        let padded = (name_len + 7) & !7;
+                        pos += padded;
                         ensure_len(data, pos, 4)?;
                         let byte_offset = LittleEndian::read_u32(&data[pos..pos + 4]) as u64;
                         pos += 4;
-                        // dimensionality(1) + reserved(3) + dim_perm(4) + 4 dim slots(16) = 24
-                        ensure_len(data, pos, 24)?;
-                        pos += 24;
+                        if version == 1 {
+                            ensure_len(data, pos, 28)?;
+                            pos += 28;
+                        }
                         let (member_dt, consumed) = Datatype::parse(&data[pos..])?;
                         pos += consumed;
                         members.push(CompoundMember {
@@ -1082,6 +1082,47 @@ mod tests {
                 match &members[1].datatype {
                     Datatype::FloatingPoint { size: 8, .. } => {}
                     other => panic!("expected f64, got {other:?}"),
+                }
+            }
+            _ => panic!("expected Compound"),
+        }
+    }
+
+    #[test]
+    fn test_compound_v1_complex_matlab_layout() {
+        // MATLAB stores a complex value as a version-1 compound of two f64
+        // members named "real" and "imag" at offsets 0 and 8. v1 members pad
+        // the NUL-terminated name to a multiple of 8 bytes and carry a fixed
+        // 28-byte dimension block — dimensionality(1) + reserved(3) +
+        // dimension permutation(4) + reserved(4) + dimension sizes(16) —
+        // between the byte offset and the member datatype message. Regression
+        // test for a stride bug that skipped only 24 bytes (omitting the second
+        // reserved field) and so misread every real-MATLAB complex compound.
+        let mut buf = build_dt_header(6, 1, [2, 0, 0], 16); // v1, 2 members, size 16
+        for (name, offset) in [(&b"real\0\0\0\0"[..], 0u32), (&b"imag\0\0\0\0"[..], 8)] {
+            buf.extend_from_slice(name); // NUL-terminated, padded to 8
+            let mut off = [0u8; 4];
+            LittleEndian::write_u32(&mut off, offset);
+            buf.extend_from_slice(&off);
+            buf.extend_from_slice(&[0u8; 28]); // v1 dimension block
+            buf.extend_from_slice(&build_float(8, 52, 11, 0, 52, 1023));
+        }
+
+        let (dt, _) = Datatype::parse(&buf).unwrap();
+        match dt {
+            Datatype::Compound { size, members } => {
+                assert_eq!(size, 16);
+                assert_eq!(members.len(), 2);
+                assert_eq!(members[0].name, "real");
+                assert_eq!(members[0].byte_offset, 0);
+                assert_eq!(members[1].name, "imag");
+                assert_eq!(members[1].byte_offset, 8);
+                for m in &members {
+                    assert!(
+                        matches!(m.datatype, Datatype::FloatingPoint { size: 8, .. }),
+                        "expected f64 member, got {:?}",
+                        m.datatype
+                    );
                 }
             }
             _ => panic!("expected Compound"),

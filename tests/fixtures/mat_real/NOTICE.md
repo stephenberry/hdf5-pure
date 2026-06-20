@@ -22,10 +22,24 @@ transcribed from that project's MATLAB generator scripts
 (`tests/test_datetime.py`, `test_duration.py`, `test_categorical.py`,
 `test_matstring.py`).
 
-## License
+### Also vendored: `matjl_struct_table_datetime.mat`
 
-`foreverallama/matio` is distributed under the BSD 3-Clause License. Its
-copyright notice is retained below as required.
+From the **`JuliaIO/MAT.jl`** project (`test/v7.3/struct_table_datetime.mat`),
+real MATLAB output (`Platform: PCWIN64`):
+
+- Repository: <https://github.com/JuliaIO/MAT.jl>
+- Commit: `4e05a0169282b6b7d835569175f07dff14ddabad`
+- License: MIT (see below)
+
+It holds a `datetime` with a non-zero imaginary (sub-millisecond) component,
+stored as an HDF5 **version-1 compound** `{real, imag}` of `f64` — the case used
+to pin the datetime double-double scale and to regression-test compound parsing.
+
+## Licenses
+
+`foreverallama/matio` is distributed under the BSD 3-Clause License and
+`JuliaIO/MAT.jl` under the MIT License. Their copyright notices are retained
+below as required.
 
 ```
 BSD 3-Clause License
@@ -56,4 +70,27 @@ SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
 CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
 OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+```
+The MIT License (MIT)
+
+Copyright (c) 2012 Simon Kornblith and Timothy E. Holy
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
