@@ -630,9 +630,13 @@ fn decode_categorical(
     class_name: String,
     mut fields: Vec<(String, MatValue)>,
 ) -> Result<MatValue, MatError> {
-    let codes = take_field(&mut fields, "codes").ok_or_else(|| {
-        MatError::Custom("categorical object is missing its `codes` property".into())
-    })?;
+    // An empty or fully-default categorical (e.g. `categorical({})`) is stored
+    // by MATLAB with *no* properties at all, so `codes` can be legitimately
+    // absent. Decode that as an empty categorical (empty codes, no categories)
+    // rather than erroring, which would otherwise abort the whole-file read.
+    let codes = take_field(&mut fields, "codes")
+        .map(flatten_to_1d)
+        .unwrap_or_else(|| MatValue::Vec1D(NumVec::U32(Vec::new())));
     let categories = take_field(&mut fields, "categoryNames")
         .or_else(|| take_field(&mut fields, "categories"))
         .unwrap_or(MatValue::Cell(Vec::new()));
@@ -706,6 +710,36 @@ fn complex_pairs(value: MatValue, what: &str) -> Result<Vec<(f64, f64)>, MatErro
             )));
         }
     })
+}
+
+/// Flatten a numeric property to a 1-D vector, preserving its integer width.
+/// A 2-D categorical's `codes` matrix is already stored row-major, so its
+/// backing vector is taken as-is; a scalar becomes a length-1 vector. Used so
+/// `categorical` `codes` always surface as a flat 1-D array (matching how
+/// `datetime`/`duration` arrays flatten), regardless of the source rank.
+fn flatten_to_1d(value: MatValue) -> MatValue {
+    match value {
+        MatValue::Matrix { vec, .. } => MatValue::Vec1D(vec),
+        MatValue::Scalar(s) => MatValue::Vec1D(scalar_to_numvec(s)),
+        other => other,
+    }
+}
+
+/// Wrap a numeric scalar in a length-1 [`NumVec`] of the same width.
+fn scalar_to_numvec(s: ScalarNum) -> NumVec {
+    match s {
+        ScalarNum::F64(x) => NumVec::F64(vec![x]),
+        ScalarNum::F32(x) => NumVec::F32(vec![x]),
+        ScalarNum::I64(x) => NumVec::I64(vec![x]),
+        ScalarNum::I32(x) => NumVec::I32(vec![x]),
+        ScalarNum::I16(x) => NumVec::I16(vec![x]),
+        ScalarNum::I8(x) => NumVec::I8(vec![x]),
+        ScalarNum::U64(x) => NumVec::U64(vec![x]),
+        ScalarNum::U32(x) => NumVec::U32(vec![x]),
+        ScalarNum::U16(x) => NumVec::U16(vec![x]),
+        ScalarNum::U8(x) => NumVec::U8(vec![x]),
+        ScalarNum::Bool(b) => NumVec::Bool(vec![b]),
+    }
 }
 
 fn numvec_to_f64(v: NumVec) -> Vec<f64> {
