@@ -1,6 +1,6 @@
 //! Deserializer for MATLAB v7.3 `.mat` files.
 
-mod mcos_reader;
+pub(crate) mod mcos_reader;
 mod reader;
 mod value_de;
 
