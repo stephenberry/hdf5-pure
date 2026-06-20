@@ -21,6 +21,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Read HDF5 **version-1 and version-2 compound datatypes** correctly: the member layout was misparsed (the v1 dimension block skipped one 4-byte reserved field, and v2 names were left unpadded), so complex data written by MATLAB and older HDF5 writers — including real-MATLAB `datetime` arrays — now decodes instead of failing with a type mismatch ([#114](https://github.com/stephenberry/hdf5-pure/issues/114)).
 - An empty `datetime` or `duration` object stored with no `data` / `millis` property (e.g. a zero-row timetable's row-times) now decodes as empty instead of aborting the whole-file read ([#114](https://github.com/stephenberry/hdf5-pure/issues/114)).
 
+### Performance
+
+- Serializing a MATLAB v7.3 file is faster: the default `mat::to_bytes` write path now shares the cache-tiled column-major transpose (≈8% faster on a 512×512 `f64` matrix) instead of a strided copy, and numeric/field buffers across the read and write paths are pre-sized or filled in a single pass. Reading a numeric array no longer materializes an intermediate boxed-scalar buffer, and a `uint32` array nested under an MCOS object is decoded once instead of twice ([#122](https://github.com/stephenberry/hdf5-pure/pull/122)).
+
 ## [0.17.0] - 2026-06-18
 
 Repack now reproduces three more datatype classes faithfully — non-string variable-length sequences, object-reference datasets, and time datatypes — and the dataset read and write hot paths are several times faster (bulk numeric decode, contiguous-row chunk scatter, compress-once filtered writes). **Breaking:** `Datatype::Time` gained a `byte_order` field, so code matching that variant must account for it; minor bump.

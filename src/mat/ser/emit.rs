@@ -14,6 +14,8 @@ use crate::writer::FileBuilder;
 
 use crate::mat::value::{MatValue, NumVec, ScalarNum, ScalarTag};
 
+use super::transpose::{transpose_pairs, transpose_scalars};
+
 /// Hidden MATLAB conventional group that holds the targets of object
 /// references. Cell-array elements live here, addressed by absolute path.
 const REFS_GROUP: &str = "#refs#";
@@ -138,8 +140,10 @@ fn build_struct_group(
         if matches!(value, MatValue::Omit) {
             continue;
         }
-        live_names.push(fname.clone());
         emit_into_group(&mut group, &fname, value, refs)?;
+        // `emit_into_group` only borrows the name, so move it in afterward
+        // rather than cloning.
+        live_names.push(fname);
     }
     group.set_attr(
         "MATLAB_class",
@@ -376,8 +380,16 @@ fn apply_matrix(
     let shape = [cols as u64, rows as u64];
     match vec {
         NumVec::Bool(row_major) => {
-            let col_major = transpose_scalars(rows, cols, &row_major);
-            let bytes: Vec<u8> = col_major.into_iter().map(u8::from).collect();
+            // Fuse the column-major transpose with the bool->u8 conversion into
+            // a single pass, dropping the intermediate Vec<bool>. Iteration order
+            // and index expression match `transpose_scalars` exactly so the
+            // column-major byte layout is identical.
+            let mut bytes = Vec::with_capacity(rows * cols);
+            for c in 0..cols {
+                for r in 0..rows {
+                    bytes.push(u8::from(row_major[r * cols + c]));
+                }
+            }
             ds.with_u8_data(&bytes).with_shape(&shape);
             set_class(ds, MatClass::Logical);
             set_logical_decode(ds);
@@ -526,26 +538,6 @@ fn set_logical_decode(ds: &mut DatasetBuilder) {
 /// UTF-16 characters rather than a numeric array.
 fn set_char_decode(ds: &mut DatasetBuilder) {
     ds.set_attr("MATLAB_int_decode", AttrValue::I32(2));
-}
-
-fn transpose_scalars<T: Copy>(rows: usize, cols: usize, row_major: &[T]) -> Vec<T> {
-    let mut out = Vec::with_capacity(rows * cols);
-    for c in 0..cols {
-        for r in 0..rows {
-            out.push(row_major[r * cols + c]);
-        }
-    }
-    out
-}
-
-fn transpose_pairs<T: Copy>(rows: usize, cols: usize, row_major: &[(T, T)]) -> Vec<(T, T)> {
-    let mut out = Vec::with_capacity(rows * cols);
-    for c in 0..cols {
-        for r in 0..rows {
-            out.push(row_major[r * cols + c]);
-        }
-    }
-    out
 }
 
 // Silence the "unused import" on the no-test build.

@@ -89,6 +89,25 @@ impl NumVec {
         self.len() == 0
     }
 
+    /// Return the scalar at `index`, or `None` if out of bounds. Lets callers
+    /// walk a numeric vector element-by-element without materializing a
+    /// `Vec<MatValue>` of boxed scalars.
+    pub(crate) fn get(&self, index: usize) -> Option<ScalarNum> {
+        match self {
+            NumVec::Bool(v) => v.get(index).copied().map(ScalarNum::Bool),
+            NumVec::F64(v) => v.get(index).copied().map(ScalarNum::F64),
+            NumVec::F32(v) => v.get(index).copied().map(ScalarNum::F32),
+            NumVec::I64(v) => v.get(index).copied().map(ScalarNum::I64),
+            NumVec::I32(v) => v.get(index).copied().map(ScalarNum::I32),
+            NumVec::I16(v) => v.get(index).copied().map(ScalarNum::I16),
+            NumVec::I8(v) => v.get(index).copied().map(ScalarNum::I8),
+            NumVec::U64(v) => v.get(index).copied().map(ScalarNum::U64),
+            NumVec::U32(v) => v.get(index).copied().map(ScalarNum::U32),
+            NumVec::U16(v) => v.get(index).copied().map(ScalarNum::U16),
+            NumVec::U8(v) => v.get(index).copied().map(ScalarNum::U8),
+        }
+    }
+
     pub(crate) fn tag(&self) -> ScalarTag {
         match self {
             NumVec::Bool(_) => ScalarTag::Bool,
@@ -118,6 +137,25 @@ impl NumVec {
             ScalarTag::U32 => NumVec::U32(Vec::new()),
             ScalarTag::U16 => NumVec::U16(Vec::new()),
             ScalarTag::U8 => NumVec::U8(Vec::new()),
+        }
+    }
+
+    /// Like [`empty_with_tag`](Self::empty_with_tag) but reserves `cap` elements
+    /// up front, so a known-size fill via [`push`](Self::push) /
+    /// [`extend`](Self::extend) never reallocates.
+    pub(crate) fn with_capacity_for_tag(tag: ScalarTag, cap: usize) -> Self {
+        match tag {
+            ScalarTag::Bool => NumVec::Bool(Vec::with_capacity(cap)),
+            ScalarTag::F64 => NumVec::F64(Vec::with_capacity(cap)),
+            ScalarTag::F32 => NumVec::F32(Vec::with_capacity(cap)),
+            ScalarTag::I64 => NumVec::I64(Vec::with_capacity(cap)),
+            ScalarTag::I32 => NumVec::I32(Vec::with_capacity(cap)),
+            ScalarTag::I16 => NumVec::I16(Vec::with_capacity(cap)),
+            ScalarTag::I8 => NumVec::I8(Vec::with_capacity(cap)),
+            ScalarTag::U64 => NumVec::U64(Vec::with_capacity(cap)),
+            ScalarTag::U32 => NumVec::U32(Vec::with_capacity(cap)),
+            ScalarTag::U16 => NumVec::U16(Vec::with_capacity(cap)),
+            ScalarTag::U8 => NumVec::U8(Vec::with_capacity(cap)),
         }
     }
 

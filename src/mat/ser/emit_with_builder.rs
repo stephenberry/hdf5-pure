@@ -10,6 +10,8 @@ use crate::mat::error::MatError;
 use crate::mat::options::{Options, StringClass};
 use crate::mat::value::{MatValue, NumVec, ScalarNum, ScalarTag};
 
+use super::transpose::{transpose_pairs, transpose_scalars};
+
 /// Walk top-level fields and emit through a `MatBuilder`.
 pub(crate) fn emit_file_with_options(
     fields: Vec<(String, MatValue)>,
@@ -520,51 +522,4 @@ fn scalar_class(tag: ScalarTag) -> MatClass {
         ScalarTag::U16 => MatClass::UInt16,
         ScalarTag::U8 => MatClass::UInt8,
     }
-}
-
-/// Transpose a row-major matrix of shape `[rows, cols]` into column-major.
-/// Tiled to keep both reads and writes cache-resident on large matrices.
-fn transpose_2d<T: Copy>(rows: usize, cols: usize, row_major: &[T]) -> Vec<T> {
-    debug_assert_eq!(row_major.len(), rows * cols);
-    let n = rows * cols;
-    let mut out: Vec<T> = Vec::with_capacity(n);
-    if n == 0 {
-        return out;
-    }
-
-    const BLK: usize = 32;
-    let dst = out.as_mut_ptr();
-    for cb in (0..cols).step_by(BLK) {
-        let c_end = (cb + BLK).min(cols);
-        for rb in (0..rows).step_by(BLK) {
-            let r_end = (rb + BLK).min(rows);
-            for r in rb..r_end {
-                let src_row_base = r * cols;
-                for c in cb..c_end {
-                    let value = row_major[src_row_base + c];
-                    // SAFETY: c < cols and r < rows so c*rows + r < cols*rows = n,
-                    // and out has capacity n.
-                    unsafe {
-                        dst.add(c * rows + r).write(value);
-                    }
-                }
-            }
-        }
-    }
-    // SAFETY: every index 0..n was written above (each (r, c) maps to a unique
-    // c * rows + r in 0..n).
-    unsafe {
-        out.set_len(n);
-    }
-    out
-}
-
-#[inline]
-fn transpose_pairs<T: Copy>(rows: usize, cols: usize, row_major: &[(T, T)]) -> Vec<(T, T)> {
-    transpose_2d(rows, cols, row_major)
-}
-
-#[inline]
-fn transpose_scalars<T: Copy>(rows: usize, cols: usize, row_major: &[T]) -> Vec<T> {
-    transpose_2d(rows, cols, row_major)
 }
