@@ -271,8 +271,8 @@ impl<'de> Deserializer<'de> for MatValueDeserializer {
             // field names deserialize from it directly. A decoded table/timetable
             // carries a reserved metadata entry that ordinary targets must not
             // see (only `MatTable`/`MatTimetable` read it, via their sentinel).
-            MatValue::Opaque { fields, .. } => {
-                visitor.visit_map(StructMap::new(strip_table_meta(fields)))
+            MatValue::Opaque { class_name, fields } => {
+                visitor.visit_map(StructMap::new(strip_table_meta(&class_name, fields)))
             }
             other => mismatch("map/struct", other),
         }
@@ -459,8 +459,8 @@ fn dispatch_any<'de, V: Visitor<'de>>(value: MatValue, visitor: V) -> Result<V::
         // unknown opaque classes alike deserialize into a matching Rust struct.
         // The reserved table/timetable metadata entry is hidden from this
         // general path (only `MatTable`/`MatTimetable` read it via their sentinel).
-        MatValue::Opaque { fields, .. } => {
-            visitor.visit_map(StructMap::new(strip_table_meta(fields)))
+        MatValue::Opaque { class_name, fields } => {
+            visitor.visit_map(StructMap::new(strip_table_meta(&class_name, fields)))
         }
     }
 }
@@ -468,8 +468,17 @@ fn dispatch_any<'de, V: Visitor<'de>>(value: MatValue, visitor: V) -> Result<V::
 /// Drop the reserved table/timetable metadata entry (see `TABLE_META_KEY`) so it
 /// never surfaces as a field to an ordinary struct/map deserialization target.
 /// Mirrors how the reader hides MATLAB's reserved `#refs#` / `#subsystem#`
-/// groups. Non-tabular opaques contain no such key, so this is a no-op for them.
-fn strip_table_meta(fields: Vec<(String, MatValue)>) -> Vec<(String, MatValue)> {
+/// groups.
+///
+/// Gated on the opaque `class_name`: only `table` / `timetable` carry this
+/// reserved entry (the decoder adds it). Other opaque classes are left untouched
+/// because their field names can be user-controlled — a `containers.Map` re-keyed
+/// by its string keys could legitimately have a key equal to `TABLE_META_KEY`,
+/// which must be preserved rather than silently dropped.
+fn strip_table_meta(class_name: &str, fields: Vec<(String, MatValue)>) -> Vec<(String, MatValue)> {
+    if class_name != "table" && class_name != "timetable" {
+        return fields;
+    }
     let mut fields = fields;
     fields.retain(|(name, _)| name != TABLE_META_KEY);
     fields
@@ -1217,4 +1226,55 @@ impl NumVec {
 #[allow(dead_code)]
 fn _touch<E: de::Error>() -> E {
     E::custom("x")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Deserialize;
+    use std::collections::BTreeMap;
+
+    fn opaque(class_name: &str, fields: Vec<(String, MatValue)>) -> MatValue {
+        MatValue::Opaque {
+            class_name: class_name.to_owned(),
+            fields,
+        }
+    }
+
+    // A `containers.Map` re-keys by its (user-controlled) string keys, so a key
+    // equal to the reserved table metadata string must NOT be stripped — only
+    // `table` / `timetable` carry that reserved entry.
+    #[test]
+    fn reserved_meta_key_is_preserved_for_non_tabular_opaque() {
+        let value = opaque(
+            "containers.Map",
+            vec![
+                (
+                    TABLE_META_KEY.to_owned(),
+                    MatValue::Scalar(ScalarNum::F64(1.0)),
+                ),
+                ("other".to_owned(), MatValue::Scalar(ScalarNum::F64(2.0))),
+            ],
+        );
+        let map: BTreeMap<String, f64> =
+            Deserialize::deserialize(MatValueDeserializer::new(value)).unwrap();
+        assert_eq!(map.get(TABLE_META_KEY), Some(&1.0));
+        assert_eq!(map.get("other"), Some(&2.0));
+    }
+
+    // A `table`'s reserved metadata entry is still hidden from ordinary targets.
+    #[test]
+    fn reserved_meta_key_is_stripped_for_tabular_opaque() {
+        let value = opaque(
+            "table",
+            vec![
+                (TABLE_META_KEY.to_owned(), MatValue::Struct(Vec::new())),
+                ("Var1".to_owned(), MatValue::Scalar(ScalarNum::F64(3.0))),
+            ],
+        );
+        let map: BTreeMap<String, f64> =
+            Deserialize::deserialize(MatValueDeserializer::new(value)).unwrap();
+        assert!(!map.contains_key(TABLE_META_KEY));
+        assert_eq!(map.get("Var1"), Some(&3.0));
+    }
 }

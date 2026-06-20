@@ -566,8 +566,9 @@ pub(crate) fn decode_object_fields(
         "categorical" => decode_categorical(class_name, fields),
         "table" => Ok(decode_table(class_name, fields)),
         "timetable" => Ok(decode_timetable(class_name, fields)),
-        // Every other opaque class (`containers.Map`, `dictionary`, user
-        // classdefs, …) is surfaced losslessly with its raw properties.
+        "containers.Map" => Ok(decode_containermap(class_name, fields)),
+        // Every other opaque class (`dictionary`, user classdefs, …) is surfaced
+        // losslessly with its raw properties.
         _ => Ok(MatValue::Opaque { class_name, fields }),
     }
 }
@@ -861,6 +862,185 @@ fn decode_categorical(
             ("is_protected".to_owned(), is_protected),
         ],
     })
+}
+
+/// Re-key a decoded `containers.Map` so it deserializes straight into a Rust map.
+///
+/// A `containers.Map` object resolves to a single `serialization` property: a
+/// struct holding parallel `keys` and `values` (plus `keyType` / `valueType` /
+/// `uniformity` metadata). This pairs each key with its value, presenting the
+/// map as a `key -> value` field set so it deserializes directly into a
+/// `HashMap<String, V>` / `BTreeMap<String, V>` or a matching struct.
+///
+/// Keys are presented as strings: `char` / `string` keys verbatim, numeric keys
+/// formatted (`1.0 -> "1"`, `1.5 -> "1.5"`). The MATLAB key/value *type*
+/// metadata is not surfaced; the Rust type a value deserializes into is the
+/// type information that matters. An object without the expected `serialization`
+/// struct falls back to the lossless raw property map.
+fn decode_containermap(class_name: String, mut fields: Vec<(String, MatValue)>) -> MatValue {
+    let mut ser = match take_field(&mut fields, "serialization") {
+        Some(MatValue::Struct(inner)) => inner,
+        // No serialization struct: surface whatever properties exist losslessly.
+        _ => return MatValue::Opaque { class_name, fields },
+    };
+    let (keys_raw, values_raw) =
+        match (take_field(&mut ser, "keys"), take_field(&mut ser, "values")) {
+            (Some(k), Some(v)) => (k, v),
+            // A serialization struct missing `keys` or `values` is malformed;
+            // surface the raw properties rather than emit a half/empty map.
+            (k, v) => return containermap_lossless(class_name, fields, ser, k, v),
+        };
+
+    let key_strings = map_key_strings(&keys_raw);
+    // A well-formed `containers.Map` stores `values` as a cell with exactly one
+    // element per key, and its keys are unique (and so stringify uniquely). If
+    // either invariant fails — a count mismatch, or two keys that collide once
+    // stringified — pairing would silently drop entries, so surface the raw
+    // properties losslessly instead.
+    if key_strings.len() != value_split_count(&values_raw) || has_duplicate_key(&key_strings) {
+        return containermap_lossless(class_name, fields, ser, Some(keys_raw), Some(values_raw));
+    }
+
+    let entries = key_strings
+        .into_iter()
+        .zip(map_values(values_raw))
+        .collect();
+    MatValue::Opaque {
+        class_name,
+        fields: entries,
+    }
+}
+
+/// Surface a `containers.Map` losslessly as its raw `serialization` struct when
+/// it cannot be safely re-keyed, restoring any `keys` / `values` already taken.
+fn containermap_lossless(
+    class_name: String,
+    mut fields: Vec<(String, MatValue)>,
+    mut ser: Vec<(String, MatValue)>,
+    keys: Option<MatValue>,
+    values: Option<MatValue>,
+) -> MatValue {
+    if let Some(k) = keys {
+        ser.push(("keys".to_owned(), k));
+    }
+    if let Some(v) = values {
+        ser.push(("values".to_owned(), v));
+    }
+    fields.push(("serialization".to_owned(), MatValue::Struct(ser)));
+    MatValue::Opaque { class_name, fields }
+}
+
+/// Flatten a `containers.Map` `keys` property to one string per key. `char` /
+/// `string` keys pass through; numeric keys are formatted (an integer-valued
+/// `double` as `"1"`, not `"1.0"`).
+fn map_key_strings(value: &MatValue) -> Vec<String> {
+    match value {
+        MatValue::String(s) => vec![s.clone()],
+        MatValue::Scalar(s) => vec![scalar_key_string(s)],
+        MatValue::Vec1D(v) | MatValue::Matrix { vec: v, .. } => numvec_key_strings(v),
+        MatValue::Cell(elems) => elems
+            .iter()
+            .map(|e| match e {
+                MatValue::String(s) => s.clone(),
+                MatValue::Scalar(s) => scalar_key_string(s),
+                _ => String::new(),
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Count how many per-key values [`map_values`] will produce for a `values`
+/// property, without consuming it — used to verify the key/value counts match
+/// before pairing.
+fn value_split_count(value: &MatValue) -> usize {
+    match value {
+        MatValue::Cell(elems) => elems.len(),
+        MatValue::Vec1D(v) | MatValue::Matrix { vec: v, .. } => v.len(),
+        // A single scalar / string / other shape is one value.
+        _ => 1,
+    }
+}
+
+/// Whether any key string repeats (distinct MATLAB keys that collide once
+/// stringified), which would otherwise silently drop a map entry.
+fn has_duplicate_key(keys: &[String]) -> bool {
+    let mut seen = std::collections::HashSet::with_capacity(keys.len());
+    !keys.iter().all(|k| seen.insert(k))
+}
+
+/// Split a `containers.Map` `values` property into one [`MatValue`] per key.
+///
+/// Uniform scalar values are stored as a single numeric row (one scalar per
+/// key); heterogeneous or non-scalar values are stored as a cell (one element
+/// per key). Both forms yield a per-key value list with its element class
+/// preserved, so each value deserializes into the user's chosen type.
+fn map_values(value: MatValue) -> Vec<MatValue> {
+    match value {
+        MatValue::Cell(elems) => elems,
+        MatValue::Vec1D(v) | MatValue::Matrix { vec: v, .. } => numvec_to_scalars(v),
+        // A single scalar / string value belongs to a single key.
+        other @ (MatValue::Scalar(_) | MatValue::String(_)) => vec![other],
+        // An unexpected shape is one value rather than a silent panic.
+        other => vec![other],
+    }
+}
+
+/// Format one numeric scalar as a `containers.Map` key string.
+fn scalar_key_string(s: &ScalarNum) -> String {
+    match s {
+        ScalarNum::F64(x) => format!("{x}"),
+        ScalarNum::F32(x) => format!("{x}"),
+        ScalarNum::I64(x) => x.to_string(),
+        ScalarNum::I32(x) => x.to_string(),
+        ScalarNum::I16(x) => x.to_string(),
+        ScalarNum::I8(x) => x.to_string(),
+        ScalarNum::U64(x) => x.to_string(),
+        ScalarNum::U32(x) => x.to_string(),
+        ScalarNum::U16(x) => x.to_string(),
+        ScalarNum::U8(x) => x.to_string(),
+        ScalarNum::Bool(b) => u8::from(*b).to_string(),
+    }
+}
+
+/// Format each element of a numeric vector as a key string.
+fn numvec_key_strings(v: &NumVec) -> Vec<String> {
+    match v {
+        NumVec::F64(xs) => xs.iter().map(|x| format!("{x}")).collect(),
+        NumVec::F32(xs) => xs.iter().map(|x| format!("{x}")).collect(),
+        NumVec::I64(xs) => xs.iter().map(ToString::to_string).collect(),
+        NumVec::I32(xs) => xs.iter().map(ToString::to_string).collect(),
+        NumVec::I16(xs) => xs.iter().map(ToString::to_string).collect(),
+        NumVec::I8(xs) => xs.iter().map(ToString::to_string).collect(),
+        NumVec::U64(xs) => xs.iter().map(ToString::to_string).collect(),
+        NumVec::U32(xs) => xs.iter().map(ToString::to_string).collect(),
+        NumVec::U16(xs) => xs.iter().map(ToString::to_string).collect(),
+        NumVec::U8(xs) => xs.iter().map(ToString::to_string).collect(),
+        NumVec::Bool(xs) => xs.iter().map(|b| u8::from(*b).to_string()).collect(),
+    }
+}
+
+/// Split a numeric vector into one scalar [`MatValue`] per element, preserving
+/// each element's class.
+fn numvec_to_scalars(v: NumVec) -> Vec<MatValue> {
+    match v {
+        NumVec::F64(xs) => xs.into_iter().map(|x| scalar(ScalarNum::F64(x))).collect(),
+        NumVec::F32(xs) => xs.into_iter().map(|x| scalar(ScalarNum::F32(x))).collect(),
+        NumVec::I64(xs) => xs.into_iter().map(|x| scalar(ScalarNum::I64(x))).collect(),
+        NumVec::I32(xs) => xs.into_iter().map(|x| scalar(ScalarNum::I32(x))).collect(),
+        NumVec::I16(xs) => xs.into_iter().map(|x| scalar(ScalarNum::I16(x))).collect(),
+        NumVec::I8(xs) => xs.into_iter().map(|x| scalar(ScalarNum::I8(x))).collect(),
+        NumVec::U64(xs) => xs.into_iter().map(|x| scalar(ScalarNum::U64(x))).collect(),
+        NumVec::U32(xs) => xs.into_iter().map(|x| scalar(ScalarNum::U32(x))).collect(),
+        NumVec::U16(xs) => xs.into_iter().map(|x| scalar(ScalarNum::U16(x))).collect(),
+        NumVec::U8(xs) => xs.into_iter().map(|x| scalar(ScalarNum::U8(x))).collect(),
+        NumVec::Bool(xs) => xs.into_iter().map(|b| scalar(ScalarNum::Bool(b))).collect(),
+    }
+}
+
+/// Wrap a scalar in a [`MatValue::Scalar`].
+fn scalar(s: ScalarNum) -> MatValue {
+    MatValue::Scalar(s)
 }
 
 /// Remove and return the first field named `name`, if present.
@@ -1256,5 +1436,84 @@ mod tests {
     fn parse_opaque_metadata_rejects_bad_magic() {
         let meta = [0x1234_5678, 2, 1, 1, 1, 1];
         assert!(parse_opaque_metadata(&meta).is_err());
+    }
+
+    // --- containers.Map ---
+
+    fn str_cell(items: &[&str]) -> MatValue {
+        MatValue::Cell(
+            items
+                .iter()
+                .map(|s| MatValue::String((*s).to_owned()))
+                .collect(),
+        )
+    }
+    fn f64_cell(items: &[f64]) -> MatValue {
+        MatValue::Cell(
+            items
+                .iter()
+                .map(|x| MatValue::Scalar(ScalarNum::F64(*x)))
+                .collect(),
+        )
+    }
+    fn serialization(keys: MatValue, values: MatValue) -> Vec<(String, MatValue)> {
+        vec![(
+            "serialization".to_owned(),
+            MatValue::Struct(vec![
+                ("keys".to_owned(), keys),
+                ("values".to_owned(), values),
+            ]),
+        )]
+    }
+
+    #[test]
+    fn containermap_rekeys_to_key_value_fields() {
+        let v = decode_containermap(
+            "containers.Map".to_owned(),
+            serialization(str_cell(&["a", "b"]), f64_cell(&[1.0, 2.0])),
+        );
+        match v {
+            MatValue::Opaque { fields, .. } => {
+                let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+                assert_eq!(names, ["a", "b"]);
+                // No leftover `serialization` wrapper on the happy path.
+                assert!(!names.contains(&"serialization"));
+            }
+            other => panic!("expected re-keyed opaque, got {}", other.kind()),
+        }
+    }
+
+    #[test]
+    fn containermap_falls_back_losslessly_on_count_mismatch() {
+        // Two keys but one value: surface the raw `serialization` rather than
+        // silently dropping the unpaired key.
+        let v = decode_containermap(
+            "containers.Map".to_owned(),
+            serialization(str_cell(&["a", "b"]), f64_cell(&[1.0])),
+        );
+        match v {
+            MatValue::Opaque { fields, .. } => {
+                assert_eq!(fields.len(), 1);
+                assert_eq!(fields[0].0, "serialization");
+            }
+            other => panic!("expected lossless opaque, got {}", other.kind()),
+        }
+    }
+
+    #[test]
+    fn containermap_falls_back_losslessly_on_duplicate_keys() {
+        // Distinct numeric keys 1.0 and 1.0 collide once stringified; rather than
+        // drop one entry, surface the raw `serialization`.
+        let v = decode_containermap(
+            "containers.Map".to_owned(),
+            serialization(f64_cell(&[1.0, 1.0]), str_cell(&["x", "y"])),
+        );
+        match v {
+            MatValue::Opaque { fields, .. } => {
+                assert_eq!(fields.len(), 1);
+                assert_eq!(fields[0].0, "serialization");
+            }
+            other => panic!("expected lossless opaque, got {}", other.kind()),
+        }
     }
 }
