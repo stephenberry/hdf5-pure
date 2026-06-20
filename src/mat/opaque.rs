@@ -152,3 +152,39 @@ impl MatCategorical {
             .collect()
     }
 }
+
+/// A decoded MATLAB enumeration array.
+///
+/// MATLAB enumerations (`classdef … enumeration … end`) store each element as a
+/// named member of an enumeration class. [`class_name`] is the fully qualified
+/// class (e.g. `"MyPkg.Color"`, or a bare `"Weekday"` for an unpackaged class);
+/// [`names`] is the member name of each element (e.g. `"Red"`) in row-major
+/// order.
+///
+/// The member name is the enumeration's identity, so it is what this view
+/// surfaces. The underlying value backing each member (the `double` / integer
+/// the member maps to) is not decoded.
+///
+/// [`class_name`]: MatEnum::class_name
+/// [`names`]: MatEnum::names
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct MatEnum {
+    /// The fully qualified enumeration class name.
+    pub class_name: String,
+    /// The member name of each element, row-major.
+    pub names: Vec<String>,
+}
+
+impl MatEnum {
+    /// The number of elements in the enumeration array.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    /// Whether the enumeration array is empty (`0×0`).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+}
