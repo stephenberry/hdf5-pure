@@ -637,56 +637,14 @@ fn try_plan_dense_chunks(
     dims: &[u64],
     chunk_dims: &[u64],
 ) -> Result<Option<DenseChunkPlan>, Error> {
-    let rank = dims.len();
-    let mut num_chunks_per_dim = Vec::with_capacity(rank);
-    for d in 0..rank {
-        if chunk_dims[d] == 0 {
-            return Ok(None);
-        }
-        num_chunks_per_dim.push(dims[d].div_ceil(chunk_dims[d]));
-    }
-    let total: u64 = num_chunks_per_dim.iter().product();
-
-    let infos = ds.raw_chunks()?;
-    if infos.len() as u64 != total {
-        // A different chunk count than the full grid means holes (or duplicates):
-        // not a dense grid.
+    // Map the source chunks onto the dense grid via the shared planner (the
+    // single owner of grid-mapping logic, also used by the in-place editor); a
+    // sparse grid (holes/duplicates/misalignment) returns `None`.
+    let Some(grid) = crate::chunked_read::plan_dense_grid(ds.raw_chunks()?, dims, chunk_dims)
+    else {
         return Ok(None);
-    }
-
-    // Map each chunk to its linear grid slot and place its descriptor; detect any
-    // hole or duplicate as a non-dense grid. No chunk bytes are read here.
-    let mut slots: Vec<Option<ChunkInfo>> = (0..total).map(|_| None).collect();
-    for info in infos {
-        if info.offsets.len() < rank {
-            return Ok(None);
-        }
-        let mut linear: u64 = 0;
-        for d in 0..rank {
-            if !info.offsets[d].is_multiple_of(chunk_dims[d]) {
-                return Ok(None);
-            }
-            let grid_coord = info.offsets[d] / chunk_dims[d];
-            if grid_coord >= num_chunks_per_dim[d] {
-                return Ok(None);
-            }
-            linear = linear * num_chunks_per_dim[d] + grid_coord;
-        }
-        let slot = &mut slots[linear.to_usize()?];
-        if slot.is_some() {
-            return Ok(None); // duplicate offset
-        }
-        *slot = Some(info);
-    }
-
-    // Every slot must be filled for a dense grid.
-    let mut grid_order = Vec::with_capacity(slots.len());
-    for slot in slots {
-        match slot {
-            Some(info) => grid_order.push(info),
-            None => return Ok(None),
-        }
-    }
+    };
+    let grid_order = grid.grid_order;
     let meta = grid_order
         .iter()
         .map(|info| ChunkMeta {

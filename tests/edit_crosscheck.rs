@@ -650,6 +650,241 @@ fn deleting_chunked_datasets_in_place_stays_c_readable() {
 }
 
 #[test]
+fn overwriting_chunked_datasets_in_place_stays_c_readable() {
+    // Issue #101: overwriting a chunked dataset's values in place must leave a
+    // file the reference C library still reads. Two paths are exercised:
+    //  - a C-written HDF5-1.8 dataset uses a *B-tree v1* chunk index (the foreign
+    //    layout the editor never emits); an unfiltered same-shape overwrite reuses
+    //    its chunk slots without rewriting the index, so it stays B-tree v1; and
+    //  - an editor-written deflate dataset whose values change compressibility is
+    //    rebuilt and relocated, staying chunked + compressed.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_chunked_overwrite.h5");
+    let btree: Vec<i32> = (0..2048).collect();
+    {
+        let file = hdf5::File::with_options()
+            .with_fapl(|p| p.libver_bounds(LibraryVersion::V18, LibraryVersion::V18))
+            .create(&path)
+            .unwrap();
+        file.new_dataset::<i32>()
+            .shape((2048,))
+            .chunk((256,)) // 8 chunks, B-tree v1 index
+            .create("c_chunked")
+            .unwrap()
+            .write(&btree)
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    // Add an editor-written deflate dataset (highly compressible to start).
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("deflated")
+            .with_i32_data(&vec![0i32; 2048])
+            .with_shape(&[2048])
+            .with_chunks(&[256])
+            .with_deflate(6);
+        session.commit().unwrap();
+    }
+
+    let size_before = std::fs::metadata(&path).unwrap().len();
+
+    // Overwrite both: the B-tree-v1 one in place (unfiltered, same slots), the
+    // deflate one with incompressible values (forces a relocate).
+    let btree_new: Vec<i32> = btree.iter().rev().copied().collect();
+    let deflate_new: Vec<i32> = (0..2048i32)
+        .map(|i| i.wrapping_mul(2_654_435_761u32 as i32) ^ (i << 3))
+        .collect();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .write_dataset("c_chunked")
+            .with_i32_data(&btree_new)
+            .with_shape(&[2048]);
+        session
+            .write_dataset("deflated")
+            .with_i32_data(&deflate_new)
+            .with_shape(&[2048]);
+        session.commit().unwrap();
+    }
+
+    // The unfiltered B-tree-v1 overwrite touched only chunk payload bytes, so the
+    // file grew only by the relocated deflate dataset's storage.
+    assert!(std::fs::metadata(&path).unwrap().len() >= size_before);
+
+    // hdf5-pure reads both back.
+    {
+        let f = File::open(&path).unwrap();
+        assert_eq!(
+            f.dataset("c_chunked").unwrap().read_i32().unwrap(),
+            btree_new
+        );
+        assert_eq!(
+            f.dataset("deflated").unwrap().read_i32().unwrap(),
+            deflate_new
+        );
+    }
+    // The reference C library reads both and still sees them as chunked.
+    let c = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        c.dataset("c_chunked").unwrap().read_raw::<i32>().unwrap(),
+        btree_new
+    );
+    assert_eq!(
+        c.dataset("deflated").unwrap().read_raw::<i32>().unwrap(),
+        deflate_new
+    );
+    for name in ["c_chunked", "deflated"] {
+        assert!(
+            c.dataset(name).unwrap().chunk().is_some(),
+            "C library does not see {name} as chunked after overwrite"
+        );
+    }
+}
+
+#[test]
+fn copying_chunked_datasets_in_place_stays_c_readable() {
+    // Issue #101: copying a chunked/filtered dataset in place must leave a file
+    // the reference C library still reads, with the copy chunked + compressed. A
+    // C-written B-tree-v1 source is reproduced with a v4 index (the writer emits
+    // only single/fixed/extensible), which the C library reads as chunked too.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_chunked_copy.h5");
+    let btree: Vec<i32> = (0..2048).collect();
+    {
+        let file = hdf5::File::with_options()
+            .with_fapl(|p| p.libver_bounds(LibraryVersion::V18, LibraryVersion::V18))
+            .create(&path)
+            .unwrap();
+        file.new_dataset::<i32>()
+            .shape((2048,))
+            .chunk((256,)) // B-tree v1 index
+            .create("c_chunked")
+            .unwrap()
+            .write(&btree)
+            .unwrap();
+        file.close().unwrap();
+    }
+    // An editor-written, highly compressible deflate dataset to copy too.
+    let deflate: Vec<i32> = (0..4096).map(|i| i % 4).collect();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("deflated")
+            .with_i32_data(&deflate)
+            .with_shape(&[4096])
+            .with_chunks(&[512])
+            .with_shuffle()
+            .with_deflate(6);
+        session.commit().unwrap();
+    }
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.copy("c_chunked", "c_chunked_copy");
+        session.copy("deflated", "deflated_copy");
+        session.commit().unwrap();
+    }
+
+    // hdf5-pure: sources untouched, copies correct.
+    {
+        let f = File::open(&path).unwrap();
+        assert_eq!(f.dataset("c_chunked").unwrap().read_i32().unwrap(), btree);
+        assert_eq!(
+            f.dataset("c_chunked_copy").unwrap().read_i32().unwrap(),
+            btree
+        );
+        assert_eq!(f.dataset("deflated").unwrap().read_i32().unwrap(), deflate);
+        assert_eq!(
+            f.dataset("deflated_copy").unwrap().read_i32().unwrap(),
+            deflate
+        );
+    }
+    // The reference C library reads the copies and sees them as chunked.
+    let c = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        c.dataset("c_chunked_copy")
+            .unwrap()
+            .read_raw::<i32>()
+            .unwrap(),
+        btree
+    );
+    assert_eq!(
+        c.dataset("deflated_copy")
+            .unwrap()
+            .read_raw::<i32>()
+            .unwrap(),
+        deflate
+    );
+    for name in ["c_chunked_copy", "deflated_copy"] {
+        assert!(
+            c.dataset(name).unwrap().chunk().is_some(),
+            "C library does not see {name} as chunked after copy"
+        );
+    }
+}
+
+#[test]
+fn overwriting_multiply_linked_chunked_that_relocates_is_refused() {
+    // A relocating chunked overwrite (a filtered dataset whose re-encoded chunks
+    // change size) moves the object header, so only one of several hard links
+    // could be repointed; it is refused when the object has more than one, and the
+    // file is left untouched.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_chunked_multilink.h5");
+    {
+        let file = hdf5::File::with_options()
+            .with_fapl(|p| p.libver_bounds(LibraryVersion::V110, LibraryVersion::latest()))
+            .create(&path)
+            .unwrap();
+        file.new_dataset::<f64>()
+            .shape((3,))
+            .create("anchor")
+            .unwrap();
+        file.close().unwrap();
+    }
+    // Editor adds a deflate dataset (highly compressible).
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("d")
+            .with_i32_data(&vec![0i32; 1024])
+            .with_shape(&[1024])
+            .with_chunks(&[256])
+            .with_deflate(6);
+        session.commit().unwrap();
+    }
+    // C library adds a second hard link to it.
+    {
+        let file = hdf5::File::open_rw(&path).unwrap();
+        file.link_hard("d", "d_alias").unwrap();
+        file.close().unwrap();
+    }
+    let before = std::fs::read(&path).unwrap();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        // Incompressible new values change the stored size => relocate.
+        let updated: Vec<i32> = (0..1024i32)
+            .map(|i| i.wrapping_mul(2_654_435_761u32 as i32) ^ (i << 3))
+            .collect();
+        session
+            .write_dataset("d")
+            .with_i32_data(&updated)
+            .with_shape(&[1024]);
+        let err = session.commit().unwrap_err();
+        assert!(
+            err.to_string().contains("single hard link"),
+            "expected multi-link relocate refusal, got: {err}"
+        );
+    }
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "file modified on refusal"
+    );
+}
+
+#[test]
 fn deleting_one_of_several_hard_links_keeps_the_survivor() {
     // Issue #77 review (finding #1): an HDF5 object can have several hard links.
     // Deleting ONE link must not reclaim the object's storage while another link
