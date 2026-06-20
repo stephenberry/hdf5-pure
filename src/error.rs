@@ -293,6 +293,11 @@ pub enum FormatError {
         /// The requested upper bound.
         requested_high: &'static str,
     },
+    /// An HDF5 object reference (`H5R_OBJECT`) could not be resolved to an
+    /// object: the stored address is null or undefined (`HADDR_UNDEF`), or it
+    /// does not point at a group or dataset object header. The payload is the
+    /// stored (base-relative) address, preserved for diagnostics.
+    InvalidObjectReference(u64),
 }
 
 impl fmt::Display for FormatError {
@@ -603,6 +608,13 @@ impl fmt::Display for FormatError {
                     f,
                     "requested library-version bounds [{requested_low}, {requested_high}] \
                      cannot be satisfied: this crate writes the {writes} format"
+                )
+            }
+            FormatError::InvalidObjectReference(addr) => {
+                write!(
+                    f,
+                    "invalid HDF5 object reference: address {addr:#x} is null/undefined \
+                     or does not point at a group or dataset"
                 )
             }
         }

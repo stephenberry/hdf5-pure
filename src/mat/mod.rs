@@ -137,6 +137,16 @@ pub fn to_file_with_options<T: Serialize + ?Sized, P: AsRef<std::path::Path>>(
 }
 
 /// Deserialize a MAT v7.3 file from a byte slice.
+///
+/// Numeric arrays, `char` strings, complex values, structs, **cell arrays**, and
+/// the modern **`string`** class are reconstructed. A cell array's element
+/// references into the hidden `#refs#` group are resolved so the [`to_bytes`]
+/// sequence fallbacks (`Vec<Struct>`, ragged `Vec<Vec<T>>`, `Vec<Option<T>>`,
+/// nested cells) round-trip; a `string` object's payload is resolved against the
+/// `#subsystem#/MCOS` store. MATLAB's reserved `#refs#` / `#subsystem#` groups
+/// are not surfaced as variables. The other MCOS opaque classes (`datetime`,
+/// `categorical`, `table`, `containers.Map`, `dictionary`, …) are refused with a
+/// typed error rather than misread.
 #[cfg(feature = "serde")]
 pub fn from_bytes<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, MatError> {
     de::from_bytes(bytes)

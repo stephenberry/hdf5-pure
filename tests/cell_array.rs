@@ -269,13 +269,13 @@ fn empty_vec_of_struct_serializes_as_empty_double() {
     assert_eq!(cls.as_str(), "double");
 }
 
-/// Cell-array reading is not yet supported on the deserializer side: the
-/// reader emits `UnsupportedType("cell array")` for any dataset with
-/// `MATLAB_class="cell"`. The writer-side tests above pin the on-disk
-/// shape; full read parity (resolving `#refs#` paths back into element
-/// `MatValue`s) is a separate follow-up.
+/// Cell-array reading resolves each element's `#refs#` object reference back
+/// into a `MatValue` and reconstructs the sequence, so a `Vec<Struct>`
+/// round-trips through the pure-Rust deserializer. (Pure-Rust read coverage
+/// lives in `tests/mat_cell_read.rs`; this case pairs it with the C-library
+/// write checks above.)
 #[test]
-fn from_file_on_cell_array_currently_errors() {
+fn from_file_on_cell_array_roundtrips() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("roundtrip_cell.mat");
 
@@ -284,11 +284,8 @@ fn from_file_on_cell_array_currently_errors() {
     };
     mat::to_file(&original, &path).unwrap();
 
-    let result: Result<PathRoot, _> = mat::from_file(&path);
-    assert!(
-        result.is_err(),
-        "cell-array deserialization not yet implemented"
-    );
+    let back: PathRoot = mat::from_file(&path).expect("cell array should deserialize");
+    assert_eq!(back, original);
 }
 
 #[test]

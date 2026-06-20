@@ -10,7 +10,7 @@ use crate::convert::TryToUsize;
 use crate::data_layout::DataLayout;
 use crate::data_read;
 use crate::dataspace::Dataspace;
-use crate::datatype::Datatype;
+use crate::datatype::{Datatype, ReferenceType};
 use crate::error::{Error, FormatError};
 use crate::file_space_info::{FileSpaceInfo, FileSpaceStrategy};
 use crate::filter_pipeline::FilterPipeline;
@@ -645,6 +645,43 @@ impl File {
         }
     }
 
+    /// Resolve a base-relative object-header address (the value stored in an
+    /// HDF5 `H5R_OBJECT` reference element) to the [`Object`] it points at.
+    ///
+    /// The stored address is relative to the superblock base address, so any
+    /// MAT-file userblock is accounted for here. A null (`0`) or undefined
+    /// (`HADDR_UNDEF`) address, or one whose object header is neither a dataset
+    /// nor a group, yields [`FormatError::InvalidObjectReference`].
+    fn object_at_relative(&self, rel_addr: u64) -> Result<Object<'_>, Error> {
+        // HADDR_UNDEF and the null address never name a real object. (Relative
+        // address 0 is where the superblock sits, not an object header.)
+        if rel_addr == u64::MAX || rel_addr == 0 {
+            return Err(FormatError::InvalidObjectReference(rel_addr).into());
+        }
+        let abs = rel_addr
+            .checked_add(self.addr_offset)
+            .ok_or(FormatError::InvalidObjectReference(rel_addr))?;
+        let hdr = self.parse_header(abs)?;
+        if has_message(&hdr, MessageType::DataLayout) {
+            let chunk_cache =
+                DatasetAccessOptions::new().resolved_chunk_cache(self.access_options.chunk_cache);
+            Ok(Object::Dataset(Box::new(Dataset {
+                file: self,
+                address: abs,
+                header: hdr,
+                chunk_cache: ChunkCache::with_config(chunk_cache),
+                chunk_cache_config: chunk_cache,
+            })))
+        } else if is_group(&hdr) {
+            Ok(Object::Group(Group {
+                file: self,
+                address: abs,
+            }))
+        } else {
+            Err(FormatError::InvalidObjectReference(rel_addr).into())
+        }
+    }
+
     fn offset_size(&self) -> u8 {
         self.superblock.offset_size
     }
@@ -742,6 +779,40 @@ impl std::fmt::Debug for File {
             .field("size", &self.source().len())
             .field("superblock_version", &self.superblock.version)
             .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Object reference target
+// ---------------------------------------------------------------------------
+
+/// The resolved target of an HDF5 object reference (`H5R_OBJECT`): either a
+/// group or a dataset.
+///
+/// Produced by [`Dataset::dereference`]. MATLAB `.mat` files use object
+/// references pervasively — a cell array stores one reference per element, and
+/// the `#subsystem#` machinery references its payloads — so resolving a
+/// reference to the group or dataset it names is the foundation for reading
+/// those structures.
+///
+/// The [`Dataset`](Object::Dataset) handle is boxed: it carries a parsed object
+/// header and is much larger than a [`Group`](Object::Group) handle, so boxing
+/// keeps `Object` (and a `Vec<Object>`) compact without a size disparity. The
+/// `Box` derefs transparently, so `&obj_dataset` is usable wherever a
+/// `&Dataset` is expected.
+pub enum Object<'f> {
+    /// The reference points at a group's object header.
+    Group(Group<'f>),
+    /// The reference points at a dataset's object header.
+    Dataset(Box<Dataset<'f>>),
+}
+
+impl std::fmt::Debug for Object<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Object::Group(_) => f.write_str("Object::Group"),
+            Object::Dataset(_) => f.write_str("Object::Dataset"),
+        }
     }
 }
 
@@ -1309,6 +1380,65 @@ impl<'f> Dataset<'f> {
         Ok(self
             .file
             .read_dataset_raw(&dl, &ds, &dt, pipeline.as_ref(), &self.chunk_cache)?)
+    }
+
+    /// Interpret this dataset as an array of HDF5 object references
+    /// (`H5R_OBJECT`) and resolve each, in storage order, to the [`Object`] it
+    /// points at.
+    ///
+    /// MATLAB cell arrays and the `#subsystem#` machinery store their members
+    /// this way: the dataset holds one object-header address per element, each
+    /// naming an object elsewhere in the file (conventionally under the hidden
+    /// `#refs#` group).
+    ///
+    /// # Errors
+    ///
+    /// - [`FormatError::TypeMismatch`] if this dataset's datatype is not an
+    ///   object reference.
+    /// - [`FormatError::InvalidObjectReference`] if an element is a null or
+    ///   undefined reference, or does not point at a group or dataset.
+    pub fn dereference(&self) -> Result<Vec<Object<'f>>, Error> {
+        let dt = self.datatype()?;
+        if !matches!(
+            dt,
+            Datatype::Reference {
+                ref_type: ReferenceType::Object,
+                ..
+            }
+        ) {
+            return Err(FormatError::TypeMismatch {
+                expected: "object reference",
+                actual: "non-reference datatype",
+            }
+            .into());
+        }
+        // An object reference stores an 8-byte object-header address. Refuse a
+        // sub-address-width element rather than read a truncated address.
+        let elem_size = dt.type_size().to_usize()?;
+        if elem_size < 8 {
+            return Err(FormatError::TypeMismatch {
+                expected: "8-byte object reference",
+                actual: "object reference narrower than 8 bytes",
+            }
+            .into());
+        }
+        let raw = self.read_raw()?;
+        if raw.is_empty() {
+            return Ok(Vec::new());
+        }
+        if !raw.len().is_multiple_of(elem_size) {
+            return Err(FormatError::DataSizeMismatch {
+                expected: elem_size,
+                actual: raw.len(),
+            }
+            .into());
+        }
+        let mut out = Vec::with_capacity(raw.len() / elem_size);
+        for chunk in raw.chunks_exact(elem_size) {
+            let addr = u64::from_le_bytes(chunk[..8].try_into().expect("chunk has >= 8 bytes"));
+            out.push(self.file.object_at_relative(addr)?);
+        }
+        Ok(out)
     }
 
     /// Decode all elements of a compound dataset field by field.
