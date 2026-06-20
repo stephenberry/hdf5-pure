@@ -70,6 +70,8 @@ pub mod matrix;
 #[cfg(feature = "serde")]
 pub mod opaque;
 #[cfg(feature = "serde")]
+pub mod table;
+#[cfg(feature = "serde")]
 pub(crate) mod value;
 
 #[cfg(feature = "serde")]
@@ -91,6 +93,8 @@ pub use complex::{Complex32, Complex64};
 pub use matrix::{MatElement, Matrix};
 #[cfg(feature = "serde")]
 pub use opaque::{MatCategorical, MatDatetime, MatDuration};
+#[cfg(feature = "serde")]
+pub use table::{MatColumn, MatTable, MatTimetable};
 
 #[cfg(feature = "serde")]
 use serde::Serialize;

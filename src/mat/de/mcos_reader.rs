@@ -564,9 +564,143 @@ pub(crate) fn decode_object_fields(
         "datetime" => decode_datetime(class_name, fields),
         "duration" => decode_duration(class_name, fields),
         "categorical" => decode_categorical(class_name, fields),
-        // Every other opaque class (table, containers.Map, dictionary, user
+        "table" => Ok(decode_table(class_name, fields)),
+        "timetable" => Ok(decode_timetable(class_name, fields)),
+        // Every other opaque class (`containers.Map`, `dictionary`, user
         // classdefs, …) is surfaced losslessly with its raw properties.
         _ => Ok(MatValue::Opaque { class_name, fields }),
+    }
+}
+
+/// The reserved property name under which a decoded `table` / `timetable`
+/// carries its row metadata (row names or row times, and the row count).
+///
+/// Collision-safety rests on the full reserved string being one no real table
+/// would use, not on the leading `@` (MATLAB *can* produce `@`-prefixed
+/// variable names under `VariableNamingRule='preserve'`); the key is only ever
+/// matched exactly, never by prefix. The deserializer filters this entry out of
+/// every ordinary struct/map target, so only [`MatTable`](crate::mat::MatTable)
+/// / [`MatTimetable`](crate::mat::MatTimetable) observe it.
+pub(crate) const TABLE_META_KEY: &str = "@__hdf5_pure_table_meta__";
+
+/// Re-key a decoded `table` so each column is addressable by its MATLAB
+/// variable name.
+///
+/// A `table` object resolves to the properties `data` (a cell of column
+/// values), `varnames` (the variable names), `rownames`, `nrows`, plus shape
+/// and `props` metadata. This pairs each `data` column with its name, so the
+/// table deserializes straight into a struct whose fields are the columns (and
+/// feeds the public [`MatTable`](crate::mat::MatTable) view). Row names and the
+/// row count are attached under [`TABLE_META_KEY`].
+fn decode_table(class_name: String, mut fields: Vec<(String, MatValue)>) -> MatValue {
+    // A timetable wraps its payload in a single `any` struct; a table exposes
+    // its properties directly. Unwrap defensively so both layouts work.
+    if let Some(MatValue::Struct(inner)) = take_field(&mut fields, "any") {
+        fields = inner;
+    }
+    let columns = match take_field(&mut fields, "data") {
+        Some(MatValue::Cell(cols)) => cols,
+        // A single-column table may surface the column directly.
+        Some(other) => vec![other],
+        None => Vec::new(),
+    };
+    let names = field_strings(&mut fields, &["varnames", "varNames"]);
+    // Normalize row names to a cell of strings (a single row name can arrive as
+    // a bare string), mirroring how variable names are flattened.
+    let row_names = take_field(&mut fields, "rownames").map(cell_of_strings);
+    let num_rows = take_field(&mut fields, "nrows");
+    keyed_table(class_name, columns, &names, row_names, num_rows, None)
+}
+
+/// Re-key a decoded `timetable` like [`decode_table`], additionally carrying the
+/// row-time vector (a `datetime` / `duration` column, or a sample-rate/time-step
+/// descriptor) under [`TABLE_META_KEY`].
+fn decode_timetable(class_name: String, mut fields: Vec<(String, MatValue)>) -> MatValue {
+    if let Some(MatValue::Struct(inner)) = take_field(&mut fields, "any") {
+        fields = inner;
+    }
+    let columns = match take_field(&mut fields, "data") {
+        Some(MatValue::Cell(cols)) => cols,
+        Some(other) => vec![other],
+        None => Vec::new(),
+    };
+    let names = field_strings(&mut fields, &["varNames", "varnames"]);
+    let row_times = take_field(&mut fields, "rowTimes");
+    let num_rows = take_field(&mut fields, "numRows").or_else(|| take_field(&mut fields, "nrows"));
+    keyed_table(class_name, columns, &names, None, num_rows, row_times)
+}
+
+/// Build the column-keyed opaque value shared by [`decode_table`] and
+/// [`decode_timetable`].
+fn keyed_table(
+    class_name: String,
+    columns: Vec<MatValue>,
+    names: &[String],
+    row_names: Option<MatValue>,
+    num_rows: Option<MatValue>,
+    row_times: Option<MatValue>,
+) -> MatValue {
+    let mut out: Vec<(String, MatValue)> = Vec::with_capacity(columns.len() + 1);
+    for (i, col) in columns.into_iter().enumerate() {
+        // Fall back to MATLAB's own default name when a name is missing.
+        let name = names
+            .get(i)
+            .cloned()
+            .unwrap_or_else(|| format!("Var{}", i + 1));
+        out.push((name, col));
+    }
+    let mut meta: Vec<(String, MatValue)> = Vec::new();
+    if let Some(rn) = row_names {
+        meta.push(("row_names".to_owned(), rn));
+    }
+    if let Some(rt) = row_times {
+        meta.push(("row_times".to_owned(), rt));
+    }
+    if let Some(nr) = num_rows {
+        meta.push(("num_rows".to_owned(), nr));
+    }
+    out.push((TABLE_META_KEY.to_owned(), MatValue::Struct(meta)));
+    MatValue::Opaque {
+        class_name,
+        fields: out,
+    }
+}
+
+/// Resolve a cell-of-strings property (trying each candidate name) to a list of
+/// strings, used for `varnames` / `rownames`.
+fn field_strings(fields: &mut Vec<(String, MatValue)>, candidates: &[&str]) -> Vec<String> {
+    for name in candidates {
+        if let Some(value) = take_field(fields, name) {
+            return matvalue_strings(value);
+        }
+    }
+    Vec::new()
+}
+
+/// Normalize a string-bearing property to a `cell` of strings, so a single
+/// row/variable name (stored as a bare string) still deserializes as a list.
+fn cell_of_strings(value: MatValue) -> MatValue {
+    MatValue::Cell(
+        matvalue_strings(value)
+            .into_iter()
+            .map(MatValue::String)
+            .collect(),
+    )
+}
+
+/// Flatten a string-bearing property — a `cell` of strings, a single string, or
+/// an empty value — into a `Vec<String>`.
+fn matvalue_strings(value: MatValue) -> Vec<String> {
+    match value {
+        MatValue::String(s) => vec![s],
+        MatValue::Cell(elems) => elems
+            .into_iter()
+            .map(|e| match e {
+                MatValue::String(s) => s,
+                _ => String::new(),
+            })
+            .collect(),
+        _ => Vec::new(),
     }
 }
 

@@ -12,8 +12,10 @@ use serde::de::{
 use serde::forward_to_deserialize_any;
 
 use crate::mat::complex::{COMPLEX32_SENTINEL, COMPLEX64_SENTINEL};
+use crate::mat::de::mcos_reader::TABLE_META_KEY;
 use crate::mat::error::MatError;
 use crate::mat::matrix::{MATRIX_COMPLEX32_SENTINEL, MATRIX_COMPLEX64_SENTINEL, MATRIX_SENTINEL};
+use crate::mat::table::{MATCOLUMN_SENTINEL, MATTABLE_SENTINEL};
 use crate::mat::value::{MatValue, NumVec, ScalarNum};
 
 // ---------------------------------------------------------------------------
@@ -266,8 +268,12 @@ impl<'de> Deserializer<'de> for MatValueDeserializer {
             MatValue::Struct(fields) => visitor.visit_map(StructMap::new(fields)),
             // An opaque object's properties form a map keyed by property name,
             // so `MatDatetime`/`MatCategorical`/… and any struct with matching
-            // field names deserialize from it directly.
-            MatValue::Opaque { fields, .. } => visitor.visit_map(StructMap::new(fields)),
+            // field names deserialize from it directly. A decoded table/timetable
+            // carries a reserved metadata entry that ordinary targets must not
+            // see (only `MatTable`/`MatTimetable` read it, via their sentinel).
+            MatValue::Opaque { fields, .. } => {
+                visitor.visit_map(StructMap::new(strip_table_meta(fields)))
+            }
             other => mismatch("map/struct", other),
         }
     }
@@ -338,6 +344,24 @@ impl<'de> Deserializer<'de> for MatValueDeserializer {
                     visitor.visit_map(ComplexStructMap32::new(re, 0.0))
                 }
                 other => mismatch("Complex32", other),
+            },
+            // A `MatColumn` asks for the underlying table-column value tagged by
+            // kind, so the right variant can be built with full type fidelity.
+            MATCOLUMN_SENTINEL => {
+                let (kind, payload) = classify_column(self.value);
+                let fields = vec![
+                    ("kind".to_owned(), MatValue::String(kind.to_owned())),
+                    ("value".to_owned(), payload),
+                ];
+                visitor.visit_map(StructMap::new(fields))
+            }
+            // `MatTable`/`MatTimetable` request the table's full field map,
+            // including the reserved metadata entry that other targets never see.
+            MATTABLE_SENTINEL => match self.value {
+                MatValue::Opaque { fields, .. } | MatValue::Struct(fields) => {
+                    visitor.visit_map(StructMap::new(fields))
+                }
+                other => mismatch("table", other),
             },
             _ => {
                 // Plain struct: deserialize from a MATLAB struct group.
@@ -433,8 +457,22 @@ fn dispatch_any<'de, V: Visitor<'de>>(value: MatValue, visitor: V) -> Result<V::
         // A decoded opaque object presents as a map over its (decoded or raw)
         // properties, identical to a struct — so `datetime`/`categorical`/… and
         // unknown opaque classes alike deserialize into a matching Rust struct.
-        MatValue::Opaque { fields, .. } => visitor.visit_map(StructMap::new(fields)),
+        // The reserved table/timetable metadata entry is hidden from this
+        // general path (only `MatTable`/`MatTimetable` read it via their sentinel).
+        MatValue::Opaque { fields, .. } => {
+            visitor.visit_map(StructMap::new(strip_table_meta(fields)))
+        }
     }
+}
+
+/// Drop the reserved table/timetable metadata entry (see `TABLE_META_KEY`) so it
+/// never surfaces as a field to an ordinary struct/map deserialization target.
+/// Mirrors how the reader hides MATLAB's reserved `#refs#` / `#subsystem#`
+/// groups. Non-tabular opaques contain no such key, so this is a no-op for them.
+fn strip_table_meta(fields: Vec<(String, MatValue)>) -> Vec<(String, MatValue)> {
+    let mut fields = fields;
+    fields.retain(|(name, _)| name != TABLE_META_KEY);
+    fields
 }
 
 // ---------------------------------------------------------------------------
@@ -446,6 +484,38 @@ fn mismatch<T>(expected: &'static str, got: MatValue) -> Result<T, MatError> {
         "expected {expected}, got {}",
         got.kind()
     )))
+}
+
+/// Classify a table-column value into a [`MatColumn`](crate::mat::MatColumn)
+/// kind tag plus the payload to deserialize for that variant. Numeric widths
+/// collapse to a single `numeric` kind (read as `f64`); `datetime` / `duration`
+/// / `categorical` are recognized by the opaque class name; everything this
+/// enum does not model (`cell`, `struct`, user objects) is `other`.
+fn classify_column(value: MatValue) -> (&'static str, MatValue) {
+    let kind = match &value {
+        MatValue::Opaque { class_name, .. } => match class_name.as_str() {
+            "datetime" => "datetime",
+            "duration" => "duration",
+            "categorical" => "categorical",
+            _ => "other",
+        },
+        MatValue::Scalar(ScalarNum::Bool(_)) | MatValue::Vec1D(NumVec::Bool(_)) => "logical",
+        MatValue::Matrix {
+            vec: NumVec::Bool(_),
+            ..
+        } => "logical",
+        MatValue::Scalar(_) | MatValue::Vec1D(_) | MatValue::Matrix { .. } => "numeric",
+        MatValue::String(_) => "text",
+        MatValue::Cell(elems) if elems.iter().all(|e| matches!(e, MatValue::String(_))) => "text",
+        _ => "other",
+    };
+    // A single-string column must present as a one-element list so the `text`
+    // variant's `Vec<String>` deserializes.
+    let payload = match (kind, value) {
+        ("text", MatValue::String(s)) => MatValue::Cell(vec![MatValue::String(s)]),
+        (_, other) => other,
+    };
+    (kind, payload)
 }
 
 fn to_i64(v: MatValue, expected: &'static str) -> Result<i64, MatError> {
