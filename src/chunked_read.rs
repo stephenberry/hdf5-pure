@@ -1051,6 +1051,145 @@ pub(crate) fn collect_chunks_for_layout_from_source<S: FileSource + ?Sized>(
     }
 }
 
+/// Enumerate every allocated chunk of a chunked dataset from an in-memory file
+/// image, one [`ChunkInfo`] per chunk (file address, on-disk stored size, filter
+/// mask, logical offsets). A buffered convenience wrapper over
+/// [`collect_chunks_for_layout_from_source`] for callers that hold the whole
+/// file as a byte slice (the in-place editor): it accepts a parsed
+/// [`DataLayout::Chunked`] and the dataset's [`Dataspace`] and reads through a
+/// [`BytesSource`](crate::source::BytesSource).
+///
+/// Returns an empty vector when the index address is undefined (a chunked
+/// dataset with no storage allocated yet). Errors — propagated from the index
+/// walkers — for a version-2 B-tree (index type 5) or any unknown index type,
+/// which have no walker.
+#[cfg(feature = "std")]
+pub(crate) fn enumerate_chunks_buffered(
+    file_data: &[u8],
+    layout: &DataLayout,
+    dataspace: &Dataspace,
+    offset_size: u8,
+    length_size: u8,
+) -> Result<Vec<ChunkInfo>, FormatError> {
+    let DataLayout::Chunked {
+        chunk_dimensions,
+        btree_address,
+        version,
+        chunk_index_type,
+        single_chunk_filtered_size,
+        single_chunk_filter_mask,
+    } = layout
+    else {
+        return Err(FormatError::ChunkedReadError(
+            "enumerate_chunks_buffered called on a non-chunked layout".into(),
+        ));
+    };
+    // An undefined index address means no storage is allocated yet.
+    let Some(index_addr) = *btree_address else {
+        return Ok(Vec::new());
+    };
+    if chunk_dimensions.is_empty() {
+        return Err(FormatError::ChunkedReadError(
+            "chunked layout has no dimensions".into(),
+        ));
+    }
+    // `chunk_dimensions` is rank + 1 entries; the last is the element size.
+    let rank = chunk_dimensions.len() - 1;
+    let elem_size = chunk_dimensions[rank] as usize;
+    if elem_size == 0 {
+        return Err(FormatError::ChunkedReadError(
+            "chunked layout has a zero element size".into(),
+        ));
+    }
+    let source = crate::source::BytesSource::new(file_data);
+    collect_chunks_for_layout_from_source(
+        &source,
+        *version,
+        *chunk_index_type,
+        index_addr,
+        *single_chunk_filtered_size,
+        *single_chunk_filter_mask,
+        chunk_dimensions,
+        dataspace,
+        elem_size,
+        offset_size,
+        length_size,
+    )
+}
+
+/// A chunked dataset's chunks mapped onto a dense logical grid: every grid slot
+/// filled exactly once, ordered row-major (last dimension fastest) so the order
+/// matches [`split_into_chunks`](crate::chunked_write::split_into_chunks) and the
+/// verbatim layout planner.
+#[cfg(feature = "std")]
+pub(crate) struct DenseChunkGrid {
+    /// One [`ChunkInfo`] per grid slot, in row-major grid order.
+    pub(crate) grid_order: Vec<ChunkInfo>,
+}
+
+/// Map enumerated `infos` onto the logical chunk grid implied by `dims` (the
+/// dataspace shape) and `chunk_dims` (the rank-only spatial chunk dimensions),
+/// returning each slot's [`ChunkInfo`] in row-major order. Returns `None` when
+/// the grid is *not* dense — a hole, a duplicate, a misaligned or out-of-range
+/// chunk offset, a zero chunk dimension, or a chunk count other than the full
+/// grid — so a caller that needs every slot filled (a verbatim copy, a
+/// whole-dataset overwrite) can fall back or refuse. No chunk bytes are read.
+#[cfg(feature = "std")]
+pub(crate) fn plan_dense_grid(
+    infos: Vec<ChunkInfo>,
+    dims: &[u64],
+    chunk_dims: &[u64],
+) -> Option<DenseChunkGrid> {
+    let rank = dims.len();
+    if chunk_dims.len() < rank {
+        return None;
+    }
+    let mut num_chunks_per_dim = Vec::with_capacity(rank);
+    for d in 0..rank {
+        if chunk_dims[d] == 0 {
+            return None;
+        }
+        num_chunks_per_dim.push(dims[d].div_ceil(chunk_dims[d]));
+    }
+    let total: u64 = num_chunks_per_dim.iter().product();
+    if infos.len() as u64 != total {
+        // A different chunk count than the full grid means holes (or duplicates).
+        return None;
+    }
+    let total_us = usize::try_from(total).ok()?;
+
+    // Map each chunk to its linear grid slot; detect any hole or duplicate.
+    let mut slots: Vec<Option<ChunkInfo>> = (0..total_us).map(|_| None).collect();
+    for info in infos {
+        if info.offsets.len() < rank {
+            return None;
+        }
+        let mut linear: u64 = 0;
+        for d in 0..rank {
+            if !info.offsets[d].is_multiple_of(chunk_dims[d]) {
+                return None;
+            }
+            let grid_coord = info.offsets[d] / chunk_dims[d];
+            if grid_coord >= num_chunks_per_dim[d] {
+                return None;
+            }
+            linear = linear * num_chunks_per_dim[d] + grid_coord;
+        }
+        let idx = usize::try_from(linear).ok()?;
+        if slots[idx].is_some() {
+            return None; // duplicate offset
+        }
+        slots[idx] = Some(info);
+    }
+
+    // Every slot must be filled for a dense grid.
+    let mut grid_order = Vec::with_capacity(total_us);
+    for slot in slots {
+        grid_order.push(slot?);
+    }
+    Some(DenseChunkGrid { grid_order })
+}
+
 /// Every on-disk byte span `(addr, len)` a chunked dataset owns: each allocated
 /// chunk data block plus the chunk index's own structure blocks. This is the
 /// single place that maps a chunked layout to the regions it occupies on disk;

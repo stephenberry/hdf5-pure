@@ -764,6 +764,137 @@ fn copy_preserves_dataset_attributes() {
     std::fs::remove_file(&path).ok();
 }
 
+/// An unfiltered 2-D chunked dataset is copied: the values round-trip and the
+/// copy is still chunked (the index is rebuilt at the new location).
+#[test]
+fn copy_unfiltered_chunked_dataset() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_copy_chunked.h5");
+    let data: Vec<i32> = (0..24).collect();
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("src")
+            .with_i32_data(&data)
+            .with_shape(&[4, 6])
+            .with_chunks(&[2, 3]);
+        b.write(&path).unwrap();
+    }
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.copy("src", "dup");
+        session.commit().unwrap();
+    }
+    let file = File::open(&path).unwrap();
+    // Source untouched.
+    assert_eq!(file.dataset("src").unwrap().read_i32().unwrap(), data);
+    let dup = file.dataset("dup").unwrap();
+    assert_eq!(dup.shape().unwrap(), vec![4, 6]);
+    assert_eq!(dup.read_i32().unwrap(), data);
+    assert!(
+        dup.chunk_cache_stats().index_loaded(),
+        "copied dataset must still be chunked"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// A filtered (shuffle + deflate) chunked dataset is copied verbatim: the chunk
+/// bytes and filter pipeline are preserved (no recompression), the values round-
+/// trip, the filter survives (the file stays far smaller than the raw bytes), and
+/// the dataset's attributes are carried over.
+#[test]
+fn copy_filtered_chunked_dataset_preserves_pipeline_and_attrs() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_copy_filtered_chunked.h5");
+    let data: Vec<i32> = (0..4096).map(|i| i % 4).collect(); // highly compressible
+    {
+        let mut b = FileBuilder::new();
+        let ds = b.create_dataset("src");
+        ds.with_i32_data(&data)
+            .with_shape(&[4096])
+            .with_chunks(&[512])
+            .with_shuffle()
+            .with_deflate(6);
+        ds.set_attr("units", AttrValue::String("counts".into()));
+        b.write(&path).unwrap();
+    }
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.copy("src", "dup");
+        session.commit().unwrap();
+    }
+    let file = File::open(&path).unwrap();
+    let dup = file.dataset("dup").unwrap();
+    assert_eq!(dup.read_i32().unwrap(), data);
+    assert!(
+        dup.chunk_cache_stats().index_loaded(),
+        "copied dataset must still be chunked"
+    );
+    // The filter survived: the whole file is far smaller than the raw element
+    // bytes of a single copy, let alone two.
+    assert!(
+        std::fs::metadata(&path).unwrap().len() < (4096 * 4) as u64,
+        "deflate filter must survive the copy"
+    );
+    // Attributes were preserved (the header is kept verbatim except its layout).
+    assert_eq!(
+        dup.attrs().unwrap().get("units"),
+        Some(&AttrValue::String("counts".into()))
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// An extensible (unlimited-dimension) chunked dataset copied within the file
+/// stays readable; the copy uses an Extensible-Array index (selected from the
+/// source's unlimited maxshape).
+#[test]
+fn copy_extensible_chunked_dataset() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_copy_extensible.h5");
+    let data: Vec<f64> = (0..80).map(|i| i as f64 * 0.25).collect();
+    write_starter(&path);
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("src")
+            .with_f64_data(&data)
+            .with_shape(&[80])
+            .with_chunks(&[16])
+            .with_maxshape(&[u64::MAX]);
+        session.commit().unwrap();
+    }
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.copy("src", "dup");
+        session.commit().unwrap();
+    }
+    let file = File::open(&path).unwrap();
+    let dup = file.dataset("dup").unwrap();
+    assert_eq!(dup.read_f64().unwrap(), data);
+    assert!(dup.chunk_cache_stats().index_loaded());
+    std::fs::remove_file(&path).ok();
+}
+
+/// A single-chunk dataset is copied (the chunk address lives in the layout
+/// message; the verbatim path re-emits a single-chunk layout).
+#[test]
+fn copy_single_chunk_dataset() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_copy_single_chunk.h5");
+    let data: Vec<i32> = (0..16).collect();
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("src")
+            .with_i32_data(&data)
+            .with_shape(&[16])
+            .with_chunks(&[16]); // one chunk covers the whole dataset
+        b.write(&path).unwrap();
+    }
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.copy("src", "dup");
+        session.commit().unwrap();
+    }
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.dataset("dup").unwrap().read_i32().unwrap(), data);
+    std::fs::remove_file(&path).ok();
+}
+
 #[test]
 fn edit_preserves_multiple_root_datasets() {
     let path = std::env::temp_dir().join("hdf5_pure_edit_multi_root.h5");
@@ -1623,8 +1754,11 @@ fn write_dataset_rejects_missing_target() {
     std::fs::remove_file(&path).ok();
 }
 
+/// An unfiltered chunked dataset is overwritten chunk-by-chunk straight in its
+/// existing slots: the file does not grow (no header rewrite, no index change)
+/// and the new values read back.
 #[test]
-fn write_dataset_rejects_chunked_target() {
+fn write_dataset_overwrites_unfiltered_chunked_in_place() {
     let path = std::env::temp_dir().join("hdf5_pure_write_chunked.h5");
     {
         let mut b = FileBuilder::new();
@@ -1634,25 +1768,245 @@ fn write_dataset_rejects_chunked_target() {
             .with_chunks(&[4]);
         b.write(&path).unwrap();
     }
-    let before = std::fs::read(&path).unwrap();
+    let size_before = std::fs::metadata(&path).unwrap().len();
     {
         let mut session = EditSession::open(&path).unwrap();
         session
             .write_dataset("c")
             .with_i32_data(&[8, 7, 6, 5, 4, 3, 2, 1])
             .with_shape(&[8]);
-        let err = session.commit().unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("chunked datasets cannot be overwritten"),
-            "expected chunked refusal, got: {err}"
-        );
+        session.commit().unwrap();
+    }
+    // An unfiltered chunked overwrite is a true in-place write: the chunk slots
+    // are reused, so the file did not grow.
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        size_before,
+        "unfiltered chunked overwrite should not grow the file"
+    );
+    let file = File::open(&path).unwrap();
+    let c = file.dataset("c").unwrap();
+    assert_eq!(c.shape().unwrap(), vec![8]);
+    assert_eq!(c.read_i32().unwrap(), vec![8, 7, 6, 5, 4, 3, 2, 1]);
+    assert!(
+        c.chunk_cache_stats().index_loaded(),
+        "dataset must still be chunked"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// A 2-D chunked dataset whose chunks do not evenly divide the shape (edge
+/// chunks, Fixed-Array index) is overwritten in place.
+#[test]
+fn write_dataset_overwrites_2d_edge_chunked_in_place() {
+    let path = std::env::temp_dir().join("hdf5_pure_write_2d_edge_chunked.h5");
+    let orig: Vec<i32> = (0..35).collect();
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("g")
+            .with_i32_data(&orig)
+            .with_shape(&[7, 5])
+            .with_chunks(&[3, 2]);
+        b.write(&path).unwrap();
+    }
+    let size_before = std::fs::metadata(&path).unwrap().len();
+    let updated: Vec<i32> = orig.iter().rev().copied().collect();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .write_dataset("g")
+            .with_i32_data(&updated)
+            .with_shape(&[7, 5]);
+        session.commit().unwrap();
+    }
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), size_before);
+    let file = File::open(&path).unwrap();
+    let g = file.dataset("g").unwrap();
+    assert_eq!(g.shape().unwrap(), vec![7, 5]);
+    assert_eq!(g.read_i32().unwrap(), updated);
+    std::fs::remove_file(&path).ok();
+}
+
+/// An extensible (unlimited-dimension, Extensible-Array index) chunked dataset is
+/// overwritten in place.
+#[test]
+fn write_dataset_overwrites_extensible_chunked_in_place() {
+    let path = std::env::temp_dir().join("hdf5_pure_write_extensible_chunked.h5");
+    let orig: Vec<f64> = (0..60).map(|i| i as f64).collect();
+    write_starter(&path);
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("ext")
+            .with_f64_data(&orig)
+            .with_shape(&[60])
+            .with_chunks(&[16])
+            .with_maxshape(&[u64::MAX]);
+        session.commit().unwrap();
+    }
+    let updated: Vec<f64> = orig.iter().map(|v| v * 2.0).collect();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .write_dataset("ext")
+            .with_f64_data(&updated)
+            .with_shape(&[60]);
+        session.commit().unwrap();
+    }
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.dataset("ext").unwrap().read_f64().unwrap(), updated);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A size-preserving filter (Fletcher32 always appends a 4-byte checksum, so the
+/// stored size is independent of the values) lets a filtered chunked dataset be
+/// overwritten in place even when the values change.
+#[test]
+fn write_dataset_overwrites_fletcher32_chunked_in_place() {
+    let path = std::env::temp_dir().join("hdf5_pure_write_fletcher_chunked.h5");
+    let orig: Vec<f64> = (0..128).map(|i| i as f64).collect();
+    write_starter(&path);
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("ck")
+            .with_f64_data(&orig)
+            .with_shape(&[128])
+            .with_chunks(&[64])
+            .with_fletcher32();
+        session.commit().unwrap();
+    }
+    let size_before = std::fs::metadata(&path).unwrap().len();
+    let updated: Vec<f64> = orig.iter().map(|v| v + 1000.0).collect();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .write_dataset("ck")
+            .with_f64_data(&updated)
+            .with_shape(&[128]);
+        session.commit().unwrap();
     }
     assert_eq!(
-        std::fs::read(&path).unwrap(),
-        before,
-        "file modified on refusal"
+        std::fs::metadata(&path).unwrap().len(),
+        size_before,
+        "a Fletcher32 overwrite keeps each chunk's stored size, so it stays in place"
     );
+    let file = File::open(&path).unwrap();
+    let ck = file.dataset("ck").unwrap();
+    assert_eq!(ck.read_f64().unwrap(), updated);
+    assert!(ck.chunk_cache_stats().index_loaded());
+    std::fs::remove_file(&path).ok();
+}
+
+/// Rewriting a deflate dataset with the *same* values reproduces identical
+/// compressed bytes, so the overwrite fits the existing slots and stays in place.
+#[test]
+fn write_dataset_overwrites_deflate_chunked_equal_size_in_place() {
+    let path = std::env::temp_dir().join("hdf5_pure_write_deflate_equal.h5");
+    let data: Vec<f64> = (0..200).map(|i| i as f64).collect();
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("d")
+            .with_f64_data(&data)
+            .with_shape(&[200])
+            .with_chunks(&[50])
+            .with_deflate(6);
+        b.write(&path).unwrap();
+    }
+    let size_before = std::fs::metadata(&path).unwrap().len();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .write_dataset("d")
+            .with_f64_data(&data)
+            .with_shape(&[200]);
+        session.commit().unwrap();
+    }
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        size_before,
+        "re-encoding identical values is byte-identical, so the overwrite stays in place"
+    );
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.dataset("d").unwrap().read_f64().unwrap(), data);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A deflate dataset overwritten with values of different compressibility
+/// re-encodes to a different size, so the dataset is rebuilt and relocated; the
+/// new values still read back and the dataset stays chunked + compressed.
+#[test]
+fn write_dataset_overwrites_deflate_chunked_relocates_on_size_change() {
+    let path = std::env::temp_dir().join("hdf5_pure_write_deflate_relocate.h5");
+    // Highly compressible original, then incompressible-ish replacement.
+    let orig: Vec<i32> = vec![0; 4096];
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("d")
+            .with_i32_data(&orig)
+            .with_shape(&[4096])
+            .with_chunks(&[512])
+            .with_deflate(6);
+        b.write(&path).unwrap();
+    }
+    let updated: Vec<i32> = (0..4096i32)
+        .map(|i| i.wrapping_mul(2_654_435_761u32 as i32) ^ (i << 3))
+        .collect();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .write_dataset("d")
+            .with_i32_data(&updated)
+            .with_shape(&[4096]);
+        session.commit().unwrap();
+    }
+    let file = File::open(&path).unwrap();
+    let d = file.dataset("d").unwrap();
+    assert_eq!(d.read_i32().unwrap(), updated);
+    assert!(
+        d.chunk_cache_stats().index_loaded(),
+        "relocated dataset must still be chunked"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// A relocating chunked overwrite returns the old chunk storage to the session's
+/// free list (the same path the delete reclaim uses), and a subsequent addition
+/// in the same session draws from it. This exercises the relocate -> free ->
+/// reuse interplay: the file must stay valid and both datasets read back exactly
+/// (a double-free or stale span would corrupt one of them).
+#[test]
+fn write_dataset_chunked_relocate_then_reuse_stays_valid() {
+    let path = std::env::temp_dir().join("hdf5_pure_write_chunked_reclaim.h5");
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("d")
+            .with_i32_data(&(0..4096).collect::<Vec<i32>>())
+            .with_shape(&[4096])
+            .with_chunks(&[512])
+            .with_deflate(6);
+        b.write(&path).unwrap();
+    }
+    // Force a relocate (different compressibility => different stored size), which
+    // frees the old chunk storage into the session free list.
+    let updated: Vec<i32> = vec![0; 4096];
+    let filler: Vec<f64> = (0..64).map(|i| i as f64).collect();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .write_dataset("d")
+            .with_i32_data(&updated)
+            .with_shape(&[4096]);
+        session.commit().unwrap();
+
+        // A later addition in the same session draws from the freed regions.
+        session.create_dataset("filler").with_f64_data(&filler);
+        session.commit().unwrap();
+    } // drop the editor (release its file lock) before reading back
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.dataset("d").unwrap().read_i32().unwrap(), updated);
+    assert_eq!(file.dataset("filler").unwrap().read_f64().unwrap(), filler);
     std::fs::remove_file(&path).ok();
 }
 

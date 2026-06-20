@@ -26,7 +26,9 @@
 //! a source subtree — appending fresh copies of every object, repointing internal
 //! links and the contiguous data address — and links the copy in like an
 //! addition; the headers are reproduced from their verbatim message bytes, so
-//! datatypes, dataspaces, and attributes stay byte-exact. The same machinery,
+//! datatypes, dataspaces, and attributes stay byte-exact. A chunked (and filtered)
+//! dataset is copied with its chunk payloads and filter pipeline preserved
+//! byte-for-byte, its index rebuilt at the new location. The same machinery,
 //! [`EditSession::copy_from`], copies an object **across two open files** — the
 //! source being a separate [`File`](crate::File) reader rather than the file being
 //! edited. Because the copy is byte-for-byte, the cross-file path refuses anything
@@ -36,18 +38,22 @@
 //!
 //! Value overwrite ([`EditSession::write_dataset`], the HDF5 `H5Dwrite`) replaces
 //! an **existing** dataset's values. The replacement's datatype and shape must
-//! match the on-disk dataset (an overwrite, not a reshape or retype); only
-//! contiguous and compact datasets are supported, with chunked or filtered ones
-//! refused. A same-length contiguous overwrite is the cheapest edit there is — the
-//! new bytes go straight into the existing data block, so no header is rewritten
-//! and the superblock root is not flipped, and the synced data write is the
-//! commit's linearization point. When the length differs (e.g. filling a dataset
-//! the C library created but never wrote, whose data address was undefined) or the
-//! dataset is compact, the header relocates like an addition: the new data and a
-//! rewritten header are appended, the data-layout message is repointed, and the
-//! parent group's link is patched. A relocating overwrite of a dataset reachable
-//! through more than one hard link is refused, since only the one named link could
-//! be repointed at the moved header.
+//! match the on-disk dataset (an overwrite, not a reshape or retype); contiguous,
+//! compact, and chunked (including filtered) datasets are all supported, the chunk
+//! geometry and filter pipeline taken from the on-disk header. A same-length
+//! contiguous overwrite is the cheapest edit there is — the new bytes go straight
+//! into the existing data block, so no header is rewritten and the superblock root
+//! is not flipped, and the synced data write is the commit's linearization point.
+//! A chunked overwrite takes the same in-place path when every (re-encoded) chunk
+//! still fits its slot — always for unfiltered storage (chunk sizes are fixed by
+//! the unchanged shape), and for filtered storage when the re-encoded chunks match.
+//! When a length differs (a resized contiguous block, a filtered chunk that no
+//! longer fits, or a compact dataset) the dataset's storage is rebuilt and its
+//! header relocated like an addition: the new data and a rewritten header are
+//! appended, the data-layout message is repointed, the old storage is freed, and
+//! the parent group's link is patched. A relocating overwrite of a dataset
+//! reachable through more than one hard link is refused, since only the one named
+//! link could be repointed at the moved header.
 //!
 //! # Scope
 //!
@@ -123,16 +129,23 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::checksum::jenkins_lookup3;
-use crate::chunked_write::{ChunkOptions, build_chunked_data_at_ext};
+use crate::chunked_read::{enumerate_chunks_buffered, plan_dense_grid};
+use crate::chunked_write::{
+    ChunkMeta, ChunkOptions, ChunkProvider, build_chunked_data_at_ext, emit_chunked_data_verbatim,
+    plan_chunked_data_verbatim, split_into_chunks,
+};
 use crate::data_layout::DataLayout;
 use crate::dataspace::{Dataspace, DataspaceType};
-use crate::error::Error;
+use crate::error::{Error, FormatError};
 use crate::file_lock::{self, FileLocking};
 use crate::file_space_info::{FileSpaceInfo, FileSpaceStrategy};
 use crate::file_writer::{
     LENGTH_SIZE, OFFSET_SIZE, build_chunked_dataset_oh, build_dataset_oh, make_link,
 };
-use crate::filters::ChunkContext;
+use crate::filter_pipeline::{
+    FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SCALEOFFSET, FILTER_SHUFFLE, FilterPipeline,
+};
+use crate::filters::{ChunkContext, compress_chunk};
 use crate::free_space::FreeList;
 use crate::free_space_manager::{self, FreeSection, FsmHeader, fshd_len, serialize_file_fsm};
 use crate::group_v2::resolve_group_entries;
@@ -462,20 +475,29 @@ impl EditSession {
     /// This is a *value* overwrite, not a reshape or retype: the new data's
     /// datatype and shape must match the on-disk dataset's exactly (byte-for-byte
     /// after serialization, so endianness and compound layout must agree), or
-    /// `commit` reports [`Error::EditUnsupported`]. Only contiguous and compact
-    /// datasets are supported; a chunked or filtered dataset is refused by name.
-    /// Partial / sub-region writes are out of scope — the whole dataset is
-    /// replaced.
+    /// `commit` reports [`Error::EditUnsupported`]. Contiguous, compact, and
+    /// chunked (including filtered) datasets are all supported; the dataset's
+    /// existing chunk geometry, filter pipeline, and chunk index are taken from the
+    /// on-disk header (a builder that itself requests chunking/filtering is refused
+    /// as "not a value overwrite"). A chunk index this engine cannot enumerate (a
+    /// version-2 B-tree) is refused. Partial / sub-region writes are out of scope —
+    /// the whole dataset is replaced.
     ///
     /// When the new data is the same length as the existing contiguous data block
     /// (the common case), the bytes are written straight into that block: no
     /// object header is rewritten and the superblock root is not flipped, so the
-    /// commit's linearization point is the synced data write itself. When the
-    /// length differs (or the dataset previously had no data block at all), the
-    /// old extent is freed, the new bytes are placed at end-of-file or in a
-    /// reusable freed region, the data-layout message is repointed, the object
-    /// header is rewritten, and the parent group's link is patched — exactly like
-    /// an addition relocates the path up to the root.
+    /// commit's linearization point is the synced data write itself. A chunked
+    /// dataset is handled the same way when every (re-encoded) chunk is the same
+    /// byte length as the slot it replaces — an unfiltered overwrite (chunk sizes
+    /// are fixed by the unchanged shape) or a filtered one whose re-encoded chunks
+    /// match — so it too writes straight into the existing chunk slots. When the
+    /// length differs (a resized contiguous block, or a filtered chunk that no
+    /// longer fits), the dataset's storage is rebuilt at end-of-file (or in
+    /// reusable freed space), the old extent is freed, the data-layout message is
+    /// repointed, the object header is rewritten, and the parent group's link is
+    /// patched — exactly like an addition relocates the path up to the root. A
+    /// relocating overwrite moves the object header, so it is refused unless the
+    /// dataset has a single hard link.
     pub fn write_dataset(&mut self, path: &str) -> &mut DatasetBuilder {
         let comps = split_path(path);
         let leaf = comps.last().cloned().unwrap_or_default();
@@ -562,10 +584,14 @@ impl EditSession {
     /// component is added to `dst`'s parent group. The original is untouched.
     ///
     /// The copy reflects the file's on-disk state at commit time. `src` must
-    /// exist and `dst` must not (and may not lie inside `src`). The source
-    /// subtree must be copyable in place: contiguous/compact datasets only (no
-    /// chunked/compressed storage), compact links and attributes, single-chunk
-    /// headers — otherwise `commit` reports [`Error::EditUnsupported`].
+    /// exist and `dst` must not (and may not lie inside `src`). A chunked (and
+    /// filtered) dataset is copied with its chunk payloads and filter pipeline
+    /// preserved byte-for-byte (the index is rebuilt at the new location, so a
+    /// source using a B-tree-v1 or implicit index is reproduced with an equivalent
+    /// v4 index). The source subtree must otherwise be copyable in place: compact
+    /// links and attributes, single-chunk headers, and a chunk index this engine
+    /// can enumerate (a version-2 B-tree, or a sparse/unallocated chunk grid, is
+    /// refused) — otherwise `commit` reports [`Error::EditUnsupported`].
     pub fn copy(&mut self, src: &str, dst: &str) {
         self.pending_copies.push((split_path(src), split_path(dst)));
     }
@@ -593,11 +619,15 @@ impl EditSession {
     /// Returns [`Error::EditUnsupported`] if the copy cannot be reproduced exactly
     /// in another file. Because the copy is byte-for-byte verbatim, anything that
     /// embeds a *source-file* absolute address is refused (it would dangle here):
-    /// **variable-length** or **reference** datasets and attributes, and any
-    /// **shared header message** (a committed datatype, or an SOHM-shared
-    /// dataspace, fill value, or filter pipeline). As with [`copy`](Self::copy) the
-    /// source must also be contiguous/compact (no chunked/compressed storage), use
-    /// compact links and attributes, and single-chunk version-2 headers. The
+    /// **variable-length** or **reference** datasets and attributes (including a
+    /// chunked dataset whose elements are variable-length or references, whose
+    /// chunk payloads embed such addresses), and any **shared header message** (a
+    /// committed datatype, or an SOHM-shared dataspace, fill value, or filter
+    /// pipeline). As with [`copy`](Self::copy) a chunked/filtered source is copied
+    /// with its chunk payloads and pipeline preserved (index rebuilt at the new
+    /// location); the source must use compact links and attributes, single-chunk
+    /// version-2 headers, and a chunk index this engine can enumerate (a
+    /// version-2 B-tree, or a sparse chunk grid, is refused). The
     /// `source` must be a buffered file ([`File::open`](crate::File::open) or
     /// [`File::from_bytes`](crate::File::from_bytes), not
     /// [`open_streaming`](crate::File::open_streaming)) using 8-byte offsets and no
@@ -710,6 +740,7 @@ impl EditSession {
             let fd = flatten_dataset(db)?;
             match Self::prepare_write(&self.data, addr, &fd)? {
                 WritePlan::InPlace { data_addr, raw } => inplace_writes.push((data_addr, raw)),
+                WritePlan::InPlaceChunks { writes } => inplace_writes.extend(writes),
                 WritePlan::Moving(mw) => {
                     // A relocating overwrite is safe only when this is the
                     // dataset's sole hard link. Compute the link graph once.
@@ -1036,12 +1067,24 @@ impl EditSession {
         // header safe (no surviving link still points at it).
         for key in &keys {
             for (leaf, mw) in &nodes[key].writes {
-                if let MovingWrite::Contiguous {
-                    old_extent: Some(extent),
-                    ..
-                } = mw
-                {
-                    to_free.push(*extent);
+                match mw {
+                    MovingWrite::Contiguous {
+                        old_extent: Some(extent),
+                        ..
+                    } => to_free.push(*extent),
+                    // A relocated chunked dataset vacates its old chunk index and
+                    // chunk data blocks. `chunked_storage_spans` returns `None` for
+                    // anything it cannot enumerate exhaustively (leaving dead bytes
+                    // rather than freeing a region still in use); the old header
+                    // chunks are freed generically below.
+                    MovingWrite::Chunked { old_addr, .. } => {
+                        if let Ok(a) = usize::try_from(*old_addr) {
+                            if let Some(spans) = self.chunked_storage_spans(a) {
+                                to_free.extend(spans);
+                            }
+                        }
+                    }
+                    _ => {}
                 }
                 // The relocated dataset's old header chunks are dead too.
                 let mut full = key.clone();
@@ -1668,12 +1711,13 @@ impl EditSession {
     /// bytes are written here — this is part of the all-or-nothing preflight, so a
     /// rejected write leaves the commit unapplied.
     ///
-    /// Only contiguous and compact datasets are supported; a chunked or filtered
-    /// dataset (or a staged builder that itself requests chunking/filters/an
-    /// extensible shape) is refused with [`Error::EditUnsupported`], mirroring how
-    /// object copy refuses chunked storage. A datatype or shape that differs from
-    /// the on-disk dataset's is likewise refused — this is a value overwrite, not
-    /// a reshape or retype.
+    /// Contiguous, compact, and chunked (including filtered) datasets are all
+    /// supported; the chunk geometry, filter pipeline, and chunk index come from
+    /// the on-disk header (a staged builder that itself requests chunking/filters/an
+    /// extensible shape is refused as "not a value overwrite", and a chunk index
+    /// this engine cannot enumerate — a version-2 B-tree — is refused too). A
+    /// datatype or shape that differs from the on-disk dataset's is likewise
+    /// refused — this is a value overwrite, not a reshape or retype.
     fn prepare_write(d: &[u8], addr: usize, fd: &FlatDataset) -> Result<WritePlan, Error> {
         // A value overwrite never introduces chunking, filters, or an extensible
         // shape: those would change the storage layout, not just the bytes.
@@ -1703,7 +1747,7 @@ impl EditSession {
         let mut datatype: Option<(usize, usize)> = None;
         let mut dataspace: Option<(usize, usize)> = None;
         let mut layout: Option<(usize, usize)> = None;
-        let mut has_filter = false;
+        let mut filter: Option<(usize, usize)> = None;
         let mut has_link = false;
         let mut p = 0;
         while let Some((msg_type, body, body_end)) = next_message(&region, p)? {
@@ -1711,7 +1755,7 @@ impl EditSession {
                 MessageType::Datatype => datatype = Some((body, body_end)),
                 MessageType::Dataspace => dataspace = Some((body, body_end)),
                 MessageType::DataLayout => layout = Some((body, body_end)),
-                MessageType::FilterPipeline => has_filter = true,
+                MessageType::FilterPipeline => filter = Some((body, body_end)),
                 MessageType::Link | MessageType::LinkInfo | MessageType::SymbolTable => {
                     has_link = true;
                 }
@@ -1723,11 +1767,6 @@ impl EditSession {
         if has_link {
             return Err(Error::EditUnsupported(
                 "write_dataset target is a group, not a dataset",
-            ));
-        }
-        if has_filter {
-            return Err(Error::EditUnsupported(
-                "filtered datasets cannot be overwritten in place yet",
             ));
         }
         let (dt_b, dt_e) =
@@ -1764,8 +1803,9 @@ impl EditSession {
             ));
         }
 
-        // Classify the layout. Version 3/4 contiguous (class 1) or compact
-        // (class 0) are supported; anything else (chunked, old-version) is refused.
+        // Classify the layout. Version 3/4 compact (class 0), contiguous (class
+        // 1), and chunked (class 2) are supported; an old-version layout or a
+        // virtual layout (class 3) is refused.
         if le - lb < 2 {
             return Err(Error::EditUnsupported("malformed data-layout message"));
         }
@@ -1821,8 +1861,101 @@ impl EditSession {
                     old_extent,
                 }))
             }
+            // Chunked: overwrite each chunk in place when every new (re-encoded)
+            // chunk is the same byte length as its slot, else rebuild and relocate
+            // the whole chunk storage. The chunk geometry, filter pipeline, and
+            // index type all come from the existing on-disk header (the staged
+            // builder carries none — chunked/filtered/extensible builders are
+            // refused at the top of this function as "not a value overwrite").
+            2 => {
+                let dl =
+                    DataLayout::parse(&region[lb..le], OFFSET_SIZE, LENGTH_SIZE).map_err(|_| {
+                        Error::EditUnsupported("dataset header data layout could not be parsed")
+                    })?;
+                let DataLayout::Chunked {
+                    version: lversion,
+                    chunk_index_type,
+                    ..
+                } = dl
+                else {
+                    return Err(Error::EditUnsupported("dataset is not chunked"));
+                };
+                if !chunk_index_enumerable(lversion, chunk_index_type) {
+                    return Err(Error::EditUnsupported(
+                        "a chunked dataset with a version-2 B-tree or unknown chunk index \
+                         cannot be overwritten in place yet",
+                    ));
+                }
+
+                let ChunkedGeometry {
+                    spatial,
+                    element_size,
+                    raw_size,
+                    maxshape,
+                } = chunked_geometry(&fd.dt, &disk_ds, &dl)?;
+
+                // Split the new value into full-size chunk buffers in dense
+                // row-major grid order (edge overhang zero-filled, matching how
+                // unfiltered chunks are stored), then re-encode through the on-disk
+                // pipeline when the dataset is filtered.
+                let split = split_into_chunks(&fd.raw, &disk_ds.dimensions, &spatial, element_size);
+                let pipeline_message: Option<Vec<u8>> =
+                    filter.map(|(fb, fe)| region[fb..fe].to_vec());
+
+                let new_chunk_bytes: Vec<Vec<u8>> = if let Some(pm) = &pipeline_message {
+                    let pipeline = FilterPipeline::parse(pm).map_err(|_| {
+                        Error::EditUnsupported("dataset filter pipeline could not be parsed")
+                    })?;
+                    if !pipeline_reencodable(&pipeline) {
+                        return Err(Error::EditUnsupported(
+                            "a chunked dataset using a filter this engine cannot re-encode \
+                             cannot be overwritten in place yet",
+                        ));
+                    }
+                    let ctx = ChunkContext::from_datatype(&spatial, &fd.dt);
+                    let mut encoded = Vec::with_capacity(split.len());
+                    for (_, buf) in &split {
+                        encoded.push(compress_chunk(buf, &pipeline, ctx)?);
+                    }
+                    encoded
+                } else {
+                    split.into_iter().map(|(_, buf)| buf).collect()
+                };
+
+                // Fast path: overwrite each chunk straight in its slot when every
+                // new chunk fits exactly. No header rewrite, no index change, no
+                // superblock flip — the chunk blocks are reachable from both roots.
+                if let Some(writes) =
+                    try_inplace_chunk_writes(d, &dl, &disk_ds, &spatial, &new_chunk_bytes)
+                {
+                    return Ok(WritePlan::InPlaceChunks { writes });
+                }
+
+                // Otherwise relocate: rebuild a fresh chunk blob + index at
+                // end-of-file (carrying the re-encoded chunk bytes and the source
+                // pipeline verbatim), swap the data-layout message in the verbatim
+                // header, and free the old chunk storage after the commit lands.
+                let meta = new_chunk_bytes
+                    .iter()
+                    .map(|c| ChunkMeta {
+                        compressed_size: c.len() as u64,
+                        filter_mask: 0,
+                    })
+                    .collect();
+                Ok(WritePlan::Moving(MovingWrite::Chunked {
+                    region,
+                    chunk_dims: spatial,
+                    element_size,
+                    raw_size,
+                    maxshape,
+                    pipeline_message,
+                    meta,
+                    chunk_bytes: new_chunk_bytes,
+                    old_addr: addr as u64,
+                }))
+            }
             _ => Err(Error::EditUnsupported(
-                "chunked datasets cannot be overwritten in place yet",
+                "an unsupported data-layout class cannot be overwritten in place yet",
             )),
         }
     }
@@ -2010,8 +2143,16 @@ impl EditSession {
                         dense_attrs,
                     })
                 }
+                // Chunked: the verbatim header carries the data-layout and filter-
+                // pipeline messages; `read_copy_subtree` (which holds the source
+                // buffer) enumerates and captures the chunk bytes and rebuilds the
+                // index on write.
+                2 => Ok(ObjModel::DatasetChunked {
+                    region: kept,
+                    dense_attrs,
+                }),
                 _ => Err(Error::EditUnsupported(
-                    "chunked datasets cannot be copied in place yet",
+                    "an unsupported data-layout class cannot be copied in place yet",
                 )),
             }
         } else if has_link_info {
@@ -2095,6 +2236,96 @@ impl EditSession {
                     dense_attrs,
                 })
             }
+            ObjModel::DatasetChunked {
+                region,
+                dense_attrs,
+            } => {
+                // Screen the verbatim header on the cross-file path. This refuses a
+                // variable-length or reference datatype (whose chunk payload embeds
+                // source-file global-heap / object addresses that would dangle in
+                // another file) and any shared message — exactly the forms repack
+                // also refuses for a cross-file verbatim chunk copy. An in-file copy
+                // keeps them valid by sharing the source file's heaps.
+                if cross_file {
+                    reject_foreign_addresses(&region)?;
+                    reject_foreign_dense_attrs(&dense_attrs)?;
+                }
+                let ChunkedHeaderParts {
+                    dt,
+                    ds,
+                    layout,
+                    pipeline_message,
+                } = parse_chunked_header(&region)?;
+                let DataLayout::Chunked {
+                    version: lversion,
+                    chunk_index_type,
+                    ..
+                } = layout
+                else {
+                    return Err(Error::EditUnsupported("dataset is not chunked"));
+                };
+                if !chunk_index_enumerable(lversion, chunk_index_type) {
+                    return Err(Error::EditUnsupported(
+                        "a chunked dataset with a version-2 B-tree or unknown chunk index \
+                         cannot be copied in place yet",
+                    ));
+                }
+                let ChunkedGeometry {
+                    spatial: chunk_dims,
+                    element_size,
+                    raw_size,
+                    maxshape,
+                } = chunked_geometry(&dt, &ds, &layout)?;
+
+                // Enumerate the source chunks and map them onto a dense grid; a
+                // sparse (holed/unallocated) dataset cannot be reproduced by the
+                // verbatim layout path, which needs every grid slot filled.
+                let infos = enumerate_chunks_buffered(d, &layout, &ds, OFFSET_SIZE, LENGTH_SIZE)?;
+                let grid = plan_dense_grid(infos, &ds.dimensions, &chunk_dims).ok_or(
+                    Error::EditUnsupported(
+                        "a chunked dataset with unallocated (sparse) chunks cannot be copied in place yet",
+                    ),
+                )?;
+                if grid.grid_order.is_empty() {
+                    return Err(Error::EditUnsupported(
+                        "an empty chunked dataset cannot be copied in place yet",
+                    ));
+                }
+
+                // Capture each chunk's already-compressed bytes (no decode) into an
+                // owned buffer, in dense row-major grid order, so the copy can be
+                // written after the source buffer is gone (cross-file copy reads at
+                // staging time). Sizes and masks are carried verbatim.
+                let mut meta = Vec::with_capacity(grid.grid_order.len());
+                let mut chunk_bytes = Vec::with_capacity(grid.grid_order.len());
+                for ci in &grid.grid_order {
+                    let start = usize::try_from(ci.address).map_err(|_| {
+                        Error::EditUnsupported("chunk address exceeds this platform")
+                    })?;
+                    let len = ci.chunk_size as usize;
+                    let end = start
+                        .checked_add(len)
+                        .filter(|&e| e <= d.len())
+                        .ok_or(Error::EditUnsupported("chunk data is out of bounds"))?;
+                    chunk_bytes.push(d[start..end].to_vec());
+                    meta.push(ChunkMeta {
+                        compressed_size: ci.chunk_size as u64,
+                        filter_mask: ci.filter_mask,
+                    });
+                }
+
+                Ok(CopyTree::DatasetChunked {
+                    region,
+                    chunk_dims,
+                    element_size,
+                    raw_size,
+                    maxshape,
+                    pipeline_message,
+                    meta,
+                    chunk_bytes,
+                    dense_attrs,
+                })
+            }
             ObjModel::Group {
                 non_link_region,
                 children,
@@ -2155,6 +2386,27 @@ impl EditSession {
                 let oh = build_v2_object_header(&region);
                 self.alloc_or_append(&oh)
             }
+            CopyTree::DatasetChunked {
+                region,
+                chunk_dims,
+                element_size,
+                raw_size,
+                maxshape,
+                pipeline_message,
+                meta,
+                chunk_bytes,
+                dense_attrs,
+            } => self.write_chunked_relocatable(
+                region,
+                chunk_dims,
+                *element_size,
+                *raw_size,
+                maxshape.as_deref(),
+                pipeline_message.as_deref(),
+                meta,
+                chunk_bytes,
+                dense_attrs,
+            ),
             CopyTree::Group {
                 non_link_region,
                 children,
@@ -2172,6 +2424,73 @@ impl EditSession {
                 self.alloc_or_append(&oh)
             }
         }
+    }
+
+    /// Write a chunked dataset's storage at end-of-file and return its new
+    /// object-header address — the shared write half of a chunked copy
+    /// ([`CopyTree::DatasetChunked`]) and a relocating chunked overwrite
+    /// ([`MovingWrite::Chunked`]).
+    ///
+    /// A fresh chunk-data blob and index are laid out relocatably at the current
+    /// end-of-file via [`plan_chunked_data_verbatim`] / [`emit_chunked_data_verbatim`],
+    /// pulling each chunk's already-compressed bytes from `chunk_bytes` (in dense
+    /// row-major grid order) and carrying `meta`'s sizes and filter masks and the
+    /// source `pipeline_message` verbatim — no recompression, no filter-parameter
+    /// reconstruction. The blob is *appended* (not placed via [`alloc_or_append`])
+    /// because its embedded addresses assume `base == end-of-file`, exactly like
+    /// [`build_chunked_dataset`](Self::build_chunked_dataset). The verbatim header
+    /// `region`'s data-layout message is then swapped for the one the planner
+    /// produced (every other message preserved), any dense attribute heap is
+    /// appended after the blob, and the header is written into reusable freed space
+    /// or at end-of-file.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the chunked rebuild needs the full geometry, \
+        pipeline, and chunk payloads; bundling them into a struct would only move the list"
+    )]
+    fn write_chunked_relocatable(
+        &mut self,
+        region: &[u8],
+        chunk_dims: &[u64],
+        element_size: usize,
+        raw_size: u64,
+        maxshape: Option<&[u64]>,
+        pipeline_message: Option<&[u8]>,
+        meta: &[ChunkMeta],
+        chunk_bytes: &[Vec<u8>],
+        dense_attrs: &[crate::attribute::AttributeMessage],
+    ) -> Result<u64, Error> {
+        let base = self.data.len() as u64;
+        let layout = plan_chunked_data_verbatim(
+            meta,
+            chunk_dims,
+            element_size,
+            raw_size,
+            pipeline_message,
+            base,
+            maxshape,
+        )?;
+        let mut buf = Vec::with_capacity(usize::try_from(layout.plan.total_len).unwrap_or(0));
+        emit_chunked_data_verbatim(
+            &mut buf,
+            &layout.plan,
+            &SliceChunkProvider {
+                chunks: chunk_bytes,
+            },
+        )?;
+        let written = self.append(&buf)?;
+        debug_assert_eq!(
+            written, base,
+            "chunk blob must land at the base address it was built for",
+        );
+        // Swap the data-layout message for the rebuilt one; keep every other header
+        // message (datatype, dataspace, fill value, filter pipeline, attributes)
+        // verbatim. A dense attribute heap, if any, is appended after the blob so
+        // its base equals end-of-file (see `append_dense_attrs`).
+        let mut new_region = replace_layout_message(region, &layout.layout_message)?;
+        self.append_dense_attrs(&mut new_region, dense_attrs)?;
+        let oh = build_v2_object_header(&new_region);
+        self.alloc_or_append(&oh)
     }
 
     /// When `attrs` is non-empty, build a fresh dense (fractal-heap) attribute
@@ -2238,6 +2557,27 @@ impl EditSession {
                 let oh = build_v2_object_header(&region);
                 self.alloc_or_append(&oh)
             }
+            MovingWrite::Chunked {
+                region,
+                chunk_dims,
+                element_size,
+                raw_size,
+                maxshape,
+                pipeline_message,
+                meta,
+                chunk_bytes,
+                ..
+            } => self.write_chunked_relocatable(
+                region,
+                chunk_dims,
+                *element_size,
+                *raw_size,
+                maxshape.as_deref(),
+                pipeline_message.as_deref(),
+                meta,
+                chunk_bytes,
+                &[],
+            ),
         }
     }
 
@@ -2520,21 +2860,21 @@ impl EditSession {
                     }
                 }
             }
-            // `read_object` covers contiguous/compact datasets and groups; a
-            // chunked dataset (layout class 2) lands here, as do truly
-            // unsupported objects. Try to reclaim a chunked dataset's storage —
-            // its chunk index and chunk data blocks — alongside its header.
-            // `chunked_storage_spans` returns `None` for anything it cannot
-            // account for exhaustively (a non-chunked unsupported object, an
-            // index type with no walker, or spans that fail the bounds/overlap
-            // check), leaving it as dead bytes rather than freeing a region that
-            // might still be in use.
-            Err(_) => {
+            // A chunked dataset: reclaim its chunk index and chunk data blocks
+            // alongside its header. `chunked_storage_spans` returns `None` for
+            // anything it cannot account for exhaustively (an index type with no
+            // walker, an undefined index address, or spans that fail the
+            // bounds/overlap check), leaving the whole dataset as dead bytes
+            // rather than freeing a region that might still be in use.
+            Ok(ObjModel::DatasetChunked { .. }) => {
                 if let Some(storage) = self.chunked_storage_spans(addr) {
                     out.extend(spans);
                     out.extend(storage);
                 }
             }
+            // A truly unsupported object (one `read_object` cannot model): leave
+            // its bytes in place rather than guess its extent.
+            Err(_) => {}
         }
     }
 
@@ -2666,6 +3006,16 @@ enum ObjModel {
         data_size: u64,
         dense_attrs: Vec<crate::attribute::AttributeMessage>,
     },
+    /// A chunked (and possibly filtered) dataset: the verbatim header `region`
+    /// (datatype, dataspace, fill value, data layout, and filter pipeline kept as
+    /// written). The chunk data is not captured here — [`read_copy_subtree`](EditSession::read_copy_subtree)
+    /// enumerates and reads the chunks (it holds the source buffer), repointing the
+    /// rebuilt index on write. See [`DatasetVerbatim`](ObjModel::DatasetVerbatim)
+    /// for `dense_attrs`.
+    DatasetChunked {
+        region: Vec<u8>,
+        dense_attrs: Vec<crate::attribute::AttributeMessage>,
+    },
     /// A group: every non-link message verbatim, plus its hard-link children to
     /// copy and re-link by name. See
     /// [`DatasetVerbatim`](ObjModel::DatasetVerbatim) for `dense_attrs`.
@@ -2702,6 +3052,26 @@ enum CopyTree {
         data: Vec<u8>,
         dense_attrs: Vec<crate::attribute::AttributeMessage>,
     },
+    /// A chunked (and possibly filtered) dataset. The header `region` is written
+    /// verbatim except its data-layout message, which is swapped for one naming the
+    /// freshly rebuilt index; `chunk_bytes` (each chunk's already-compressed bytes,
+    /// in dense row-major grid order, with sizes/masks in `meta`) and the source
+    /// `pipeline_message` are carried unchanged, so the copy preserves the filter
+    /// pipeline and chunk payloads byte-for-byte. The on-disk index *type* is
+    /// reselected from `maxshape`/chunk count (single / fixed-array / extensible-
+    /// array), so a B-tree-v1 or implicit source is reproduced with a v4 index. See
+    /// [`DatasetVerbatim`](CopyTree::DatasetVerbatim) for `dense_attrs`.
+    DatasetChunked {
+        region: Vec<u8>,
+        chunk_dims: Vec<u64>,
+        element_size: usize,
+        raw_size: u64,
+        maxshape: Option<Vec<u64>>,
+        pipeline_message: Option<Vec<u8>>,
+        meta: Vec<ChunkMeta>,
+        chunk_bytes: Vec<Vec<u8>>,
+        dense_attrs: Vec<crate::attribute::AttributeMessage>,
+    },
     /// A group: every non-link message verbatim, plus the (name, child) subtrees
     /// to write first and re-link by name. See
     /// [`DatasetVerbatim`](CopyTree::DatasetVerbatim) for `dense_attrs`.
@@ -2726,8 +3096,17 @@ enum WritePlan {
     /// defined data block: overwrite the bytes straight in place at `data_addr`.
     /// No object header is rewritten and the superblock root is not flipped.
     InPlace { data_addr: usize, raw: Vec<u8> },
-    /// The dataset's header relocates: a contiguous resize or a compact rewrite.
-    /// The parent group is rebuilt and its link patched. See [`MovingWrite`].
+    /// A chunked dataset overwritten chunk-by-chunk in place: each `(addr, bytes)`
+    /// pair is written straight over an existing chunk slot. Used when every new
+    /// (re-encoded) chunk is the same byte length as the slot it replaces — an
+    /// unfiltered chunked overwrite (chunk sizes are fixed by the unchanged shape)
+    /// or a filtered one whose re-encoded chunks happen to match. Like
+    /// [`InPlace`](WritePlan::InPlace) it touches no header and no chunk index, so
+    /// the superblock root is not flipped.
+    InPlaceChunks { writes: Vec<(usize, Vec<u8>)> },
+    /// The dataset's header relocates: a contiguous resize, a compact rewrite, or
+    /// a chunked rebuild. The parent group is rebuilt and its link patched. See
+    /// [`MovingWrite`].
     Moving(MovingWrite),
 }
 
@@ -2748,6 +3127,27 @@ enum MovingWrite {
     },
     /// A compact dataset: rebuild the header `region` with `raw` inline.
     Compact { region: Vec<u8>, raw: Vec<u8> },
+    /// A chunked dataset whose new (re-encoded) chunks do not all fit their
+    /// existing slots, so its whole storage is rebuilt and relocated. A fresh
+    /// chunk-data blob and index are appended at end-of-file (via the verbatim
+    /// layout path, carrying `chunk_bytes` and the source filter `pipeline_message`
+    /// unchanged — no recompression and no filter-parameter reconstruction), the
+    /// data-layout message in the verbatim header `region` is swapped for the new
+    /// one (every other header message — datatype, dataspace, fill value, filter
+    /// pipeline, and attributes, including a dense attribute heap referenced by an
+    /// untouched Attribute Info message — is preserved verbatim), and the old
+    /// chunk storage at `old_addr` is freed after the commit lands.
+    Chunked {
+        region: Vec<u8>,
+        chunk_dims: Vec<u64>,
+        element_size: usize,
+        raw_size: u64,
+        maxshape: Option<Vec<u64>>,
+        pipeline_message: Option<Vec<u8>>,
+        meta: Vec<ChunkMeta>,
+        chunk_bytes: Vec<Vec<u8>>,
+        old_addr: u64,
+    },
 }
 
 /// A staged dataset reduced to the pieces the writer needs.
@@ -2999,6 +3399,237 @@ const GROUP_INFO_BODY: [u8; 2] = [0, 0];
 /// message region. Callers pass bodies that fit the u16 length field: link
 /// bodies are validated in [`flatten_dataset`], and the Link Info / Group Info
 /// bodies are fixed and short.
+/// Whether a chunked dataset with this data-layout version and chunk index type
+/// can be enumerated chunk-by-chunk (and therefore overwritten or copied in
+/// place). Mirrors the dispatch in
+/// [`chunked_read::collect_chunks_for_layout_from_source`](crate::chunked_read):
+/// version-3 B-tree v1 and the version-4 single / implicit / fixed-array /
+/// extensible-array indexes have walkers; a version-2 B-tree (index type 5) or
+/// any unknown index type does not.
+fn chunk_index_enumerable(version: u8, chunk_index_type: Option<u8>) -> bool {
+    matches!((version, chunk_index_type), (3, _) | (4, Some(1..=4)))
+}
+
+/// Whether every filter in `pipeline` is one this crate can *apply* (re-encode a
+/// chunk through) — not merely decode. A pipeline with any other filter cannot be
+/// re-encoded for an in-place overwrite, so the caller refuses with a typed error
+/// rather than letting [`compress_chunk`] surface a raw `UnsupportedFilter`.
+fn pipeline_reencodable(pipeline: &FilterPipeline) -> bool {
+    pipeline.filters.iter().all(|f| match f.filter_id {
+        FILTER_DEFLATE | FILTER_SHUFFLE | FILTER_FLETCHER32 | FILTER_SCALEOFFSET => true,
+        #[cfg(feature = "zfp")]
+        crate::filter_pipeline::FILTER_ZFP => true,
+        _ => false,
+    })
+}
+
+/// Rebuild a header message `region`, replacing the single Data Layout message's
+/// record with one carrying `new_layout_body` and leaving every other message
+/// (datatype, dataspace, fill value, filter pipeline, attributes, attribute info)
+/// byte-for-byte. The replacement may differ in length from the original — a
+/// chunked rebuild can change the index type and thus the layout message size — so
+/// the record is rebuilt via [`region_message`] rather than patched in place. The
+/// chunked overwrite and copy paths use this to relocate a dataset's chunk storage
+/// while preserving the rest of its header exactly.
+fn replace_layout_message(region: &[u8], new_layout_body: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::with_capacity(region.len());
+    let mut p = 0;
+    let mut replaced = false;
+    while let Some((msg_type, _body, body_end)) = next_message(region, p)? {
+        if msg_type == MessageType::DataLayout && !replaced {
+            out.extend_from_slice(&region_message(MessageType::DataLayout, new_layout_body));
+            replaced = true;
+        } else {
+            out.extend_from_slice(&region[p..body_end]);
+        }
+        p = body_end;
+    }
+    if !replaced {
+        return Err(Error::EditUnsupported(
+            "chunked dataset header has no data-layout message to relocate",
+        ));
+    }
+    Ok(out)
+}
+
+/// The datatype, dataspace, parsed chunked data layout, and verbatim filter-
+/// pipeline message bytes (if any) of a chunked dataset header, parsed by
+/// [`parse_chunked_header`].
+struct ChunkedHeaderParts {
+    dt: crate::datatype::Datatype,
+    ds: Dataspace,
+    layout: DataLayout,
+    pipeline_message: Option<Vec<u8>>,
+}
+
+/// Parse the datatype, dataspace, chunked data layout, and verbatim filter-
+/// pipeline message bytes (if any) from a chunked dataset header `region`. Used by
+/// the chunked copy path to derive chunk geometry and the on-disk filter pipeline.
+/// Errors if any required message is missing or the layout is not chunked.
+fn parse_chunked_header(region: &[u8]) -> Result<ChunkedHeaderParts, Error> {
+    let mut datatype: Option<(usize, usize)> = None;
+    let mut dataspace: Option<(usize, usize)> = None;
+    let mut layout: Option<(usize, usize)> = None;
+    let mut pipeline: Option<(usize, usize)> = None;
+    let mut p = 0;
+    while let Some((msg_type, body, body_end)) = next_message(region, p)? {
+        match msg_type {
+            MessageType::Datatype => datatype = Some((body, body_end)),
+            MessageType::Dataspace => dataspace = Some((body, body_end)),
+            MessageType::DataLayout => layout = Some((body, body_end)),
+            MessageType::FilterPipeline => pipeline = Some((body, body_end)),
+            _ => {}
+        }
+        p = body_end;
+    }
+    let (dt_b, dt_e) = datatype.ok_or(Error::EditUnsupported("dataset header has no datatype"))?;
+    let (ds_b, ds_e) =
+        dataspace.ok_or(Error::EditUnsupported("dataset header has no dataspace"))?;
+    let (lb, le) = layout.ok_or(Error::EditUnsupported("dataset header has no data layout"))?;
+    let (dt, _) = crate::datatype::Datatype::parse(&region[dt_b..dt_e])
+        .map_err(|_| Error::EditUnsupported("dataset header datatype could not be parsed"))?;
+    let ds = Dataspace::parse(&region[ds_b..ds_e], LENGTH_SIZE)
+        .map_err(|_| Error::EditUnsupported("dataset header dataspace could not be parsed"))?;
+    let dl = DataLayout::parse(&region[lb..le], OFFSET_SIZE, LENGTH_SIZE)
+        .map_err(|_| Error::EditUnsupported("dataset header data layout could not be parsed"))?;
+    if !matches!(dl, DataLayout::Chunked { .. }) {
+        return Err(Error::EditUnsupported("dataset is not chunked"));
+    }
+    let pipeline_message = pipeline.map(|(b, e)| region[b..e].to_vec());
+    Ok(ChunkedHeaderParts {
+        dt,
+        ds,
+        layout: dl,
+        pipeline_message,
+    })
+}
+
+/// The chunk geometry a verbatim chunked rebuild needs, derived by
+/// [`chunked_geometry`] from a chunked dataset's datatype, dataspace, and parsed
+/// [`DataLayout::Chunked`].
+struct ChunkedGeometry {
+    /// Rank-only spatial chunk dimensions.
+    spatial: Vec<u64>,
+    /// Element size in bytes.
+    element_size: usize,
+    /// Full (uncompressed) chunk byte size, `product(spatial) * element_size`.
+    raw_size: u64,
+    /// The on-disk maximum dimensions when they differ from the current shape; an
+    /// unlimited dimension selects the extensible-array index, a finite one the
+    /// fixed-array index. `None` keeps the fixed-array / single-chunk index.
+    maxshape: Option<Vec<u64>>,
+}
+
+/// Derive the [`ChunkedGeometry`] for a chunked dataset from its datatype,
+/// dataspace, and parsed [`DataLayout::Chunked`].
+fn chunked_geometry(
+    dt: &crate::datatype::Datatype,
+    ds: &Dataspace,
+    layout: &DataLayout,
+) -> Result<ChunkedGeometry, Error> {
+    let DataLayout::Chunked {
+        chunk_dimensions, ..
+    } = layout
+    else {
+        return Err(Error::EditUnsupported("dataset is not chunked"));
+    };
+    let rank = ds.dimensions.len();
+    if chunk_dimensions.len() <= rank {
+        return Err(Error::EditUnsupported(
+            "chunked layout has malformed dimensions",
+        ));
+    }
+    let spatial: Vec<u64> = chunk_dimensions[..rank]
+        .iter()
+        .map(|&c| u64::from(c))
+        .collect();
+    let element_size = dt.type_size() as usize;
+    if element_size == 0 {
+        return Err(Error::EditUnsupported(
+            "chunked dataset has a zero element size",
+        ));
+    }
+    let raw_size = spatial
+        .iter()
+        .copied()
+        .product::<u64>()
+        .saturating_mul(element_size as u64);
+    let maxshape = ds
+        .max_dimensions
+        .as_ref()
+        .filter(|ms| *ms != &ds.dimensions)
+        .cloned();
+    Ok(ChunkedGeometry {
+        spatial,
+        element_size,
+        raw_size,
+        maxshape,
+    })
+}
+
+/// Try to overwrite a chunked dataset's chunks in place: when the dataset's
+/// on-disk chunks form a dense grid aligned with `new_bytes` (dense row-major
+/// order) and every new chunk is the same byte length as the slot it would
+/// replace, with the slot unmasked (`filter_mask == 0`) and in bounds, return the
+/// `(slot_address, bytes)` writes. Returns `None` — so the caller relocates the
+/// dataset instead — when the index cannot be enumerated, the grid is sparse, a
+/// new chunk's size differs from its slot, a slot is masked, or any write would be
+/// out of bounds or overlap another.
+fn try_inplace_chunk_writes(
+    d: &[u8],
+    layout: &DataLayout,
+    ds: &Dataspace,
+    spatial: &[u64],
+    new_bytes: &[Vec<u8>],
+) -> Option<Vec<(usize, Vec<u8>)>> {
+    let infos = enumerate_chunks_buffered(d, layout, ds, OFFSET_SIZE, LENGTH_SIZE).ok()?;
+    let grid = plan_dense_grid(infos, &ds.dimensions, spatial)?;
+    if grid.grid_order.len() != new_bytes.len() {
+        return None;
+    }
+    let mut writes = Vec::with_capacity(new_bytes.len());
+    let mut spans: Vec<(u64, u64)> = Vec::with_capacity(new_bytes.len());
+    for (ci, bytes) in grid.grid_order.iter().zip(new_bytes.iter()) {
+        // A nonzero filter mask means the source left some filter unapplied for
+        // this chunk; re-encoding always applies every filter (mask 0), so an
+        // in-place overwrite would desync the index-recorded mask. Relocate.
+        if ci.filter_mask != 0 {
+            return None;
+        }
+        // Equal-size only: the index records the slot's stored size, so a
+        // different length would need an index edit this path deliberately avoids.
+        if u64::from(ci.chunk_size) != bytes.len() as u64 {
+            return None;
+        }
+        let start = usize::try_from(ci.address).ok()?;
+        start.checked_add(bytes.len()).filter(|&e| e <= d.len())?;
+        writes.push((start, bytes.clone()));
+        spans.push((ci.address, bytes.len() as u64));
+    }
+    // Refuse to perform overlapping in-place writes (a malformed source index);
+    // relocate instead so two slots never clobber each other.
+    if !spans_disjoint_in_bounds(&mut spans, d.len() as u64) {
+        return None;
+    }
+    Some(writes)
+}
+
+/// A [`ChunkProvider`] over chunk bytes already held in memory, in dense
+/// row-major grid order. Used by the editor's chunked copy and relocating
+/// overwrite, which own each chunk's bytes (a [`CopyTree`] or [`MovingWrite`]
+/// captured them) rather than streaming from a source file like repack.
+struct SliceChunkProvider<'a> {
+    chunks: &'a [Vec<u8>],
+}
+
+impl ChunkProvider for SliceChunkProvider<'_> {
+    fn chunk_bytes(&self, index: usize) -> Result<Vec<u8>, FormatError> {
+        self.chunks.get(index).cloned().ok_or_else(|| {
+            FormatError::ChunkedReadError("chunk index out of range for in-memory provider".into())
+        })
+    }
+}
+
 fn region_message(msg_type: MessageType, body: &[u8]) -> Vec<u8> {
     let mut m = Vec::with_capacity(4 + body.len());
     #[expect(
