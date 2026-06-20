@@ -5,7 +5,15 @@ use core::fmt;
 use crate::error::{Error as Hdf5Error, FormatError};
 
 /// Errors that can occur when (de)serializing `.mat` v7.3 files.
+///
+/// Marked `#[non_exhaustive]`: reading MATLAB's MCOS opaque classes is an
+/// ongoing effort (`datetime`, `categorical`, `table`, `containers.Map`,
+/// `dictionary`, …), and each newly decoded — or newly refused — class can
+/// introduce a more specific error variant. Keeping the enum open lets those
+/// additions land without a breaking change, so downstream `match`es must
+/// include a wildcard arm.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum MatError {
     /// Underlying HDF5 I/O or format error.
     Hdf5(Hdf5Error),

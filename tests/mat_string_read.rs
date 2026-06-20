@@ -124,31 +124,32 @@ fn vec_of_strings_roundtrips_as_cell_of_string_objects() {
 }
 
 #[test]
-fn unsupported_opaque_class_is_refused_by_name() {
+fn unsupported_object_decode_is_refused_by_name() {
     use hdf5_pure::mat::MatError;
     use hdf5_pure::{AttrValue, FileBuilder};
 
-    // Hand-craft an opaque dataset that claims to be `datetime` (decode = 3),
-    // which the reader does not yet decode. It must refuse by name rather than
-    // misread or panic. (The metadata shape mirrors a real opaque parent:
-    // `[MAGIC, ndims=2, 1, 1, object_id=1, class_id=1]`.)
+    // `MATLAB_object_decode == 1` marks a function handle, whose on-disk layout
+    // differs from MCOS opaque objects and is not yet decoded. It must refuse by
+    // name rather than misread or panic. (MCOS classes — `datetime`,
+    // `categorical`, … with decode = 3 — are decoded or surfaced as `Opaque`
+    // instead; see `mat_opaque_read`.)
     let mut builder = FileBuilder::new();
     builder
-        .create_dataset("t")
-        .with_u32_data(&[0xDD00_0000, 2, 1, 1, 1, 1])
-        .with_shape(&[1, 6])
-        .set_attr("MATLAB_class", AttrValue::String("datetime".into()))
-        .set_attr("MATLAB_object_decode", AttrValue::I32(3));
+        .create_dataset("f")
+        .with_u32_data(&[0, 0, 0, 0])
+        .with_shape(&[1, 4])
+        .set_attr("MATLAB_class", AttrValue::String("function_handle".into()))
+        .set_attr("MATLAB_object_decode", AttrValue::I32(1));
     let bytes = builder.finish().unwrap();
 
     #[derive(Deserialize, Debug)]
     struct Root {
         #[allow(dead_code)]
-        t: f64,
+        f: f64,
     }
-    let err = mat::from_bytes::<Root>(&bytes).expect_err("datetime is not yet supported");
+    let err = mat::from_bytes::<Root>(&bytes).expect_err("function_handle is not yet supported");
     assert!(
-        matches!(err, MatError::UnsupportedMatlabClass(ref c) if c == "datetime"),
-        "expected UnsupportedMatlabClass(\"datetime\"), got: {err}"
+        matches!(err, MatError::UnsupportedMatlabClass(ref c) if c == "function_handle"),
+        "expected UnsupportedMatlabClass(\"function_handle\"), got: {err}"
     );
 }
