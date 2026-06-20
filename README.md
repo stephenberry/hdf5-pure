@@ -553,7 +553,7 @@ In MATLAB this loads as `iscell(path) == true`, `path{1}.x`, etc. Empty `None` s
 
 **Reader compatibility.** Cell arrays load correctly in MATLAB, libmatio (reference C library), Julia's `MAT.jl`, and Python via `pymatreader` / `hdf5storage`. GNU Octave 11's `load` does not yet follow object references for v7.3 cells (warns "unknown datatype"); load such files with one of the above instead.
 
-Not supported in this release: non-unit enum variants, MATLAB objects (`classdef`), datetime / categorical types.
+Reading decodes the MATLAB opaque value classes `datetime`, `duration`, and `categorical` into `MatDatetime` / `MatDuration` / `MatCategorical`, and surfaces any other opaque class (`table`, `containers.Map`, …) losslessly as its raw property map. Not supported for *writing*: non-unit enum variants, MATLAB objects (`classdef`), datetime / duration / categorical types.
 
 ## Cargo features
 

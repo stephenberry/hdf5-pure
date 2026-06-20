@@ -264,6 +264,10 @@ impl<'de> Deserializer<'de> for MatValueDeserializer {
     fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, MatError> {
         match self.value {
             MatValue::Struct(fields) => visitor.visit_map(StructMap::new(fields)),
+            // An opaque object's properties form a map keyed by property name,
+            // so `MatDatetime`/`MatCategorical`/… and any struct with matching
+            // field names deserialize from it directly.
+            MatValue::Opaque { fields, .. } => visitor.visit_map(StructMap::new(fields)),
             other => mismatch("map/struct", other),
         }
     }
@@ -426,6 +430,10 @@ fn dispatch_any<'de, V: Visitor<'de>>(value: MatValue, visitor: V) -> Result<V::
         MatValue::Struct(fields) => visitor.visit_map(StructMap::new(fields)),
         MatValue::Cell(elements) => visitor.visit_seq(CellSeq::new(elements)),
         MatValue::EmptyStructArray => visitor.visit_none(),
+        // A decoded opaque object presents as a map over its (decoded or raw)
+        // properties, identical to a struct — so `datetime`/`categorical`/… and
+        // unknown opaque classes alike deserialize into a matching Rust struct.
+        MatValue::Opaque { fields, .. } => visitor.visit_map(StructMap::new(fields)),
     }
 }
 

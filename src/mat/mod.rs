@@ -65,6 +65,10 @@ pub mod string_object;
 pub mod complex;
 #[cfg(feature = "serde")]
 pub mod matrix;
+// Public Rust views over decoded MCOS opaque value classes (datetime,
+// duration, categorical). Deserialized from the reader's decoded form.
+#[cfg(feature = "serde")]
+pub mod opaque;
 #[cfg(feature = "serde")]
 pub(crate) mod value;
 
@@ -85,6 +89,8 @@ pub use options::{
 pub use complex::{Complex32, Complex64};
 #[cfg(feature = "serde")]
 pub use matrix::{MatElement, Matrix};
+#[cfg(feature = "serde")]
+pub use opaque::{MatCategorical, MatDatetime, MatDuration};
 
 #[cfg(feature = "serde")]
 use serde::Serialize;
@@ -144,9 +150,15 @@ pub fn to_file_with_options<T: Serialize + ?Sized, P: AsRef<std::path::Path>>(
 /// sequence fallbacks (`Vec<Struct>`, ragged `Vec<Vec<T>>`, `Vec<Option<T>>`,
 /// nested cells) round-trip; a `string` object's payload is resolved against the
 /// `#subsystem#/MCOS` store. MATLAB's reserved `#refs#` / `#subsystem#` groups
-/// are not surfaced as variables. The other MCOS opaque classes (`datetime`,
-/// `categorical`, `table`, `containers.Map`, `dictionary`, …) are refused with a
-/// typed error rather than misread.
+/// are not surfaced as variables.
+///
+/// MCOS opaque value classes are decoded from the `#subsystem#` store:
+/// **`datetime`**, **`duration`**, and **`categorical`** deserialize into
+/// [`MatDatetime`], [`MatDuration`], and [`MatCategorical`]. Any other opaque
+/// class (`table`, `containers.Map`, `dictionary`, user `classdef`s, …) is
+/// surfaced losslessly as its raw property map, so it still deserializes into a
+/// matching struct. Function handles and legacy objects (`MATLAB_object_decode`
+/// 1 / 2) are refused with the typed [`MatError::UnsupportedMatlabClass`].
 #[cfg(feature = "serde")]
 pub fn from_bytes<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, MatError> {
     de::from_bytes(bytes)

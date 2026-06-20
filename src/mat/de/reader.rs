@@ -6,7 +6,7 @@ use crate::convert::TryToUsize;
 use crate::error::FormatError;
 use crate::file_writer::AttrValue;
 use crate::mat::class::MatClass;
-use crate::mat::de::mcos_reader::{self, Mcos};
+use crate::mat::de::mcos_reader::{self, Mcos, PropValue};
 use crate::mat::error::MatError;
 use crate::mat::utf16;
 use crate::mat::value::{MatValue, NumVec, ScalarNum};
@@ -93,7 +93,7 @@ fn read_dataset(
     // the builtin-class path — its `MATLAB_class` (e.g. `string`) is not a
     // `MatClass` variant.
     if let Some(decode) = mcos_reader::matlab_object_decode(&attrs) {
-        return mcos_reader::decode_opaque(ds, &attrs, decode, mcos);
+        return decode_opaque(ds, &attrs, decode, mcos, depth);
     }
 
     let class = matlab_class_from_attrs(&attrs)?;
@@ -165,13 +165,106 @@ fn read_cell(
     let members = ds.dereference().map_err(MatError::Hdf5)?;
     let mut elems = Vec::with_capacity(members.len());
     for member in members {
-        let value = match member {
-            Object::Dataset(d) => read_dataset(&d, mcos, depth + 1)?,
-            Object::Group(g) => read_group_as_value(&g, mcos, depth + 1)?,
-        };
-        elems.push(value);
+        elems.push(read_object(&member, mcos, depth + 1)?);
     }
     Ok(MatValue::Cell(elems))
+}
+
+/// Decode a dereferenced object (a `#refs#`/`#subsystem#` dataset or struct
+/// group) into a `MatValue`, dispatching on whether it is a dataset or group.
+fn read_object(
+    obj: &Object<'_>,
+    mcos: Option<&Mcos<'_>>,
+    depth: usize,
+) -> Result<MatValue, MatError> {
+    match obj {
+        Object::Dataset(d) => read_dataset(d, mcos, depth),
+        Object::Group(g) => read_group_as_value(g, mcos, depth),
+    }
+}
+
+/// Decode an `mxOPAQUE_CLASS` dataset (one with `MATLAB_object_decode` set).
+///
+/// The modern `string` class keeps its dedicated saveobj decoder; every other
+/// opaque class resolves its object id(s) from the parent `uint32` metadata and
+/// decodes each object through the `#subsystem#/MCOS` FileWrapper property
+/// tables — to a typed value (`datetime`, `duration`, `categorical`) or a
+/// lossless [`MatValue::Opaque`] for classes without a dedicated decoder.
+fn decode_opaque(
+    ds: &Dataset<'_>,
+    attrs: &HashMap<String, AttrValue>,
+    decode: i64,
+    mcos: Option<&Mcos<'_>>,
+    depth: usize,
+) -> Result<MatValue, MatError> {
+    let class = mcos_reader::raw_matlab_class(attrs).ok_or_else(|| {
+        MatError::Custom("opaque object (MATLAB_object_decode set) has no MATLAB_class".into())
+    })?;
+    // Only `MATLAB_object_decode == 3` (mxOPAQUE_CLASS / MCOS) is decoded here.
+    // `1` (function handle) and `2` (legacy object) have different on-disk
+    // layouts; refuse them by name rather than misread.
+    if !mcos_reader::is_mcos_decode(decode) {
+        return Err(MatError::UnsupportedMatlabClass(class));
+    }
+    let mcos = mcos.ok_or_else(|| {
+        MatError::Custom(
+            "file references an MCOS opaque object but has no #subsystem# store".into(),
+        )
+    })?;
+
+    if mcos_reader::is_string_class(&class, decode) {
+        return mcos.decode_string(ds);
+    }
+
+    let meta = ds.read_u32().map_err(MatError::Hdf5)?;
+    let parsed = mcos_reader::parse_opaque_metadata(&meta)?;
+    if parsed.object_ids.is_empty() {
+        // An empty opaque array names no objects; resolve its declared class
+        // from the parent metadata's trailing class id (falling back to the
+        // dataset's `MATLAB_class`) and surface it with no properties so the
+        // read still succeeds rather than erroring.
+        let class_name = mcos.class_name(parsed.class_id).unwrap_or(class);
+        return Ok(MatValue::Opaque {
+            class_name,
+            fields: Vec::new(),
+        });
+    }
+
+    let mut values = Vec::with_capacity(parsed.object_ids.len());
+    for object_id in parsed.object_ids {
+        values.push(decode_opaque_object(mcos, object_id, depth)?);
+    }
+    // A scalar opaque variable is a single object; a genuine object array
+    // becomes a cell of the decoded objects.
+    if values.len() == 1 {
+        Ok(values.pop().expect("len checked"))
+    } else {
+        Ok(MatValue::Cell(values))
+    }
+}
+
+/// Assemble one MCOS object's resolved properties (reading heap cells through
+/// the full read path so nested objects/cells decode too) and finish it via a
+/// typed decoder or the lossless `Opaque` fallback.
+fn decode_opaque_object(
+    mcos: &Mcos<'_>,
+    object_id: u32,
+    depth: usize,
+) -> Result<MatValue, MatError> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(MatError::Format(FormatError::NestingDepthExceeded));
+    }
+    let class_name = mcos.object_class_name(object_id)?;
+    let mut fields = Vec::new();
+    for prop in mcos.properties(object_id)? {
+        let value = match prop.value {
+            PropValue::Heap(v) => read_object(mcos.heap_object(v)?, Some(mcos), depth + 1)?,
+            PropValue::Inline(n) => MatValue::Scalar(mcos_reader::inline_to_scalar(n)),
+            PropValue::Name(s) => MatValue::String(s),
+        };
+        fields.push((prop.name, value));
+    }
+    mcos_reader::decode_object_fields(class_name, fields)
 }
 
 /// Extract and parse the `MATLAB_class` attribute value, if present.
