@@ -158,13 +158,14 @@ pub fn to_file_with_options<T: Serialize + ?Sized, P: AsRef<std::path::Path>>(
 ///
 /// MCOS opaque value classes are decoded from the `#subsystem#` store:
 /// **`datetime`**, **`duration`**, and **`categorical`** deserialize into
-/// [`MatDatetime`], [`MatDuration`], and [`MatCategorical`], and an
-/// **enumeration** deserializes into [`MatEnum`] (its member names). Any other
-/// opaque class (`table`, `containers.Map`, `dictionary`, user `classdef`s, …)
-/// is surfaced losslessly as its raw property map, so it still deserializes into
-/// a matching struct. Function handles and legacy objects
-/// (`MATLAB_object_decode` 1 / 2) are refused with the typed
-/// [`MatError::UnsupportedMatlabClass`].
+/// [`MatDatetime`], [`MatDuration`], and [`MatCategorical`], an **enumeration**
+/// deserializes into [`MatEnum`] (its member names), and a **`containers.Map`**
+/// deserializes as a `key -> value` map (string/char keys verbatim, numeric keys
+/// stringified) straight into a `HashMap<String, V>` / `BTreeMap<String, V>` or a
+/// matching struct. Any other opaque class (`dictionary`, user `classdef`s, …) is
+/// surfaced losslessly as its raw property map, so it still deserializes into a
+/// matching struct. Function handles and legacy objects (`MATLAB_object_decode`
+/// 1 / 2) are refused with the typed [`MatError::UnsupportedMatlabClass`].
 #[cfg(feature = "serde")]
 pub fn from_bytes<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, MatError> {
     de::from_bytes(bytes)
