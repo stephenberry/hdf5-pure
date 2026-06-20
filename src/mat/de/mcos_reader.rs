@@ -304,7 +304,7 @@ impl<'f> Mcos<'f> {
 
     /// Look up a 1-based name-heap index. Index 0 is MATLAB's "absent" sentinel
     /// and resolves to the empty string.
-    fn name(&self, idx: u32) -> Result<String, MatError> {
+    pub(crate) fn name(&self, idx: u32) -> Result<String, MatError> {
         if idx == 0 {
             return Ok(String::new());
         }
@@ -569,6 +569,29 @@ pub(crate) fn decode_object_fields(
         // Every other opaque class (`containers.Map`, `dictionary`, user
         // classdefs, …) is surfaced losslessly with its raw properties.
         _ => Ok(MatValue::Opaque { class_name, fields }),
+    }
+}
+
+/// Build the decoded value for an MCOS enumeration array from its resolved
+/// class name and per-element member names.
+///
+/// The result is a [`MatValue::Opaque`] carrying `class_name` and a `names` cell
+/// of strings, so it deserializes into [`MatEnum`](crate::mat::MatEnum) (or any
+/// struct with those fields) directly. The reader detects and assembles the
+/// enumeration instance itself (it is stored as a group of metadata datasets,
+/// not as a heap property set), so this is kept separate from
+/// [`decode_object_fields`].
+pub(crate) fn build_enum_value(class_name: String, names: Vec<String>) -> MatValue {
+    let name_cells = names.into_iter().map(MatValue::String).collect();
+    MatValue::Opaque {
+        fields: vec![
+            (
+                "class_name".to_owned(),
+                MatValue::String(class_name.clone()),
+            ),
+            ("names".to_owned(), MatValue::Cell(name_cells)),
+        ],
+        class_name,
     }
 }
 

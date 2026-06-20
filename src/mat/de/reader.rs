@@ -8,6 +8,7 @@ use crate::file_writer::AttrValue;
 use crate::mat::class::MatClass;
 use crate::mat::de::mcos_reader::{self, Mcos, PropValue};
 use crate::mat::error::MatError;
+use crate::mat::string_object::MCOS_MAGIC_NUMBER;
 use crate::mat::utf16;
 use crate::mat::value::{MatValue, NumVec, ScalarNum};
 use crate::reader::{Dataset, File, Group, Object};
@@ -78,8 +79,183 @@ fn read_group_as_value(
     in_heap: bool,
     depth: usize,
 ) -> Result<MatValue, MatError> {
+    // An MCOS enumeration instance is stored as a group of metadata datasets,
+    // not as an ordinary struct: a top-level enum variable (with
+    // `MATLAB_object_decode=3` and the enum class as `MATLAB_class`), or an
+    // enum reached as a struct/heap cell (`MATLAB_class="struct"`). Both forms
+    // are the same group shape, and every group read funnels through here, so
+    // detect and decode the enumeration before falling back to a struct.
+    if let Some(mcos) = mcos {
+        if let Some(value) = try_decode_enum_instance(group, mcos, depth)? {
+            return Ok(value);
+        }
+    }
     let fields = read_group(group, mcos, in_heap, depth)?;
     Ok(MatValue::Struct(fields))
+}
+
+/// Detect and decode an MCOS enumeration-instance group, returning `Ok(None)`
+/// when `group` is an ordinary struct rather than an enumeration.
+///
+/// An enumeration instance is a group of six metadata datasets:
+/// - `EnumerationInstanceTag` — a scalar `uint32` whose value is the MCOS magic
+///   number; this is the unambiguous marker that the group is an enumeration.
+/// - `ClassName` — the enum class as a 1-based MCOS class-table id.
+/// - `ValueNames` — the member-name pool, as 1-based name-heap indices.
+/// - `ValueIndices` — the per-element 0-based index into that pool, carrying the
+///   array's MATLAB shape.
+/// - `Values` — the underlying value backing each member (not surfaced).
+/// - `BuiltinClassName` — the storage class of the underlying value (unused).
+///
+/// Only the absent tag (or a tag that is not the magic number) means "ordinary
+/// group, not an enumeration". Once the magic tag matches, `ClassName`,
+/// `ValueNames`, and `ValueIndices` are required: their absence, an unresolvable
+/// class id, or an out-of-range member index is treated as a corrupt enumeration
+/// and surfaced as an error. This deliberately differs from the optional-property
+/// opaque decoders (`datetime` / `duration` / `categorical`), which substitute
+/// empty defaults — there MATLAB genuinely omits a property for an empty value,
+/// whereas a valid enumeration never omits these datasets.
+fn try_decode_enum_instance(
+    group: &Group<'_>,
+    mcos: &Mcos<'_>,
+    depth: usize,
+) -> Result<Option<MatValue>, MatError> {
+    // The tag dataset's absence means an ordinary group, so a failed lookup is
+    // "not an enumeration", not an error.
+    let tag_ds = match group.dataset("EnumerationInstanceTag") {
+        Ok(ds) => ds,
+        Err(_) => return Ok(None),
+    };
+    let tag = tag_ds.read_u32().map_err(MatError::Hdf5)?;
+    if tag.first() != Some(&MCOS_MAGIC_NUMBER) {
+        return Ok(None);
+    }
+
+    // Resolve the fully qualified class from its class id, falling back to the
+    // group's `MATLAB_class` attribute if the id does not resolve (it is
+    // `"struct"` for an in-heap enum cell, which the fallback discards). Both the
+    // top-level and in-heap cases normally resolve via the class id; the error
+    // is only reached when the id is out of range *and* no usable attribute
+    // remains, i.e. a corrupt instance.
+    let class_id = read_enum_scalar_u32(group, "ClassName")?;
+    let class_name = mcos
+        .class_name(class_id)
+        .ok()
+        .filter(|name| !name.is_empty())
+        .or_else(|| enum_class_from_attr(group))
+        .ok_or_else(|| {
+            MatError::Custom(format!(
+                "enum ClassName id {class_id} did not resolve and no MATLAB_class fallback was usable"
+            ))
+        })?;
+
+    // The member-name pool: each `ValueNames` entry is a 1-based name index.
+    let pool: Vec<String> = read_enum_u32_vec(group, "ValueNames")?
+        .iter()
+        .map(|&idx| mcos.name(idx))
+        .collect::<Result<_, _>>()?;
+
+    // Map each element's pool index to its member name, row-major. An
+    // out-of-range index is corruption, not a silently-empty name.
+    let names = enum_member_names(&pool, &read_enum_indices(group, depth)?)?;
+
+    Ok(Some(mcos_reader::build_enum_value(class_name, names)))
+}
+
+/// Map each element's 0-based `ValueIndices` entry to its member name in the
+/// `ValueNames` pool. An out-of-range index is a corrupt enumeration, surfaced
+/// as an error rather than a silently-empty name (matching how `ValueNames`'
+/// own name-heap indices are resolved, and the out-of-range handling throughout
+/// the MCOS reader).
+fn enum_member_names(pool: &[String], indices: &[usize]) -> Result<Vec<String>, MatError> {
+    indices
+        .iter()
+        .map(|&i| {
+            pool.get(i).cloned().ok_or_else(|| {
+                MatError::Custom(format!(
+                    "enum ValueIndices index {i} out of range (pool has {} members)",
+                    pool.len()
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Open a required enumeration-metadata dataset. The magic tag has already
+/// matched, so a missing dataset is a corrupt enumeration; map the HDF5 lookup
+/// error to a clear message rather than a bare "link not found".
+fn enum_dataset<'f>(group: &Group<'f>, field: &str) -> Result<Dataset<'f>, MatError> {
+    group.dataset(field).map_err(|e| {
+        MatError::Custom(format!(
+            "malformed enum instance: cannot read required dataset {field:?} ({e})"
+        ))
+    })
+}
+
+/// Read an enumeration metadata field as a single `uint32` (its first element,
+/// or `0` if the dataset is empty).
+fn read_enum_scalar_u32(group: &Group<'_>, field: &str) -> Result<u32, MatError> {
+    let ds = enum_dataset(group, field)?;
+    Ok(ds
+        .read_u32()
+        .map_err(MatError::Hdf5)?
+        .first()
+        .copied()
+        .unwrap_or(0))
+}
+
+/// Read an enumeration metadata field as a flat `uint32` vector. The member-name
+/// pool is a `1×N` row, so its storage order is its presentation order.
+fn read_enum_u32_vec(group: &Group<'_>, field: &str) -> Result<Vec<u32>, MatError> {
+    let ds = enum_dataset(group, field)?;
+    ds.read_u32().map_err(MatError::Hdf5)
+}
+
+/// Read the `ValueIndices` array as a flat `Vec<usize>` in the crate's row-major
+/// presentation order.
+fn read_enum_indices(group: &Group<'_>, depth: usize) -> Result<Vec<usize>, MatError> {
+    let ds = enum_dataset(group, "ValueIndices")?;
+    // Reject a non-`uint32` index array up front with a dtype-specific message
+    // (mirrors the saveobj-payload datatype guard), so corruption surfaces
+    // clearly rather than as a vaguer downstream shape mismatch.
+    let dtype = ds.dtype().map_err(MatError::Hdf5)?;
+    if dtype != DType::U32 {
+        return Err(MatError::Custom(format!(
+            "enum ValueIndices has datatype {dtype:?}; expected uint32"
+        )));
+    }
+    // Reuse the numeric read path so the column-major HDF5 buffer is transposed
+    // into row-major, matching how other opaque arrays present their elements.
+    let value = read_dataset(&ds, None, false, depth)?;
+    enum_indices_to_usize(&value)
+}
+
+/// Flatten a decoded `ValueIndices` value (a `uint32` scalar, vector, or matrix)
+/// into row-major `usize` indices.
+fn enum_indices_to_usize(value: &MatValue) -> Result<Vec<usize>, MatError> {
+    match value {
+        MatValue::Scalar(ScalarNum::U32(x)) => Ok(vec![x.to_usize().map_err(MatError::Format)?]),
+        MatValue::Vec1D(NumVec::U32(v))
+        | MatValue::Matrix {
+            vec: NumVec::U32(v),
+            ..
+        } => v
+            .iter()
+            .map(|&x| x.to_usize().map_err(MatError::Format))
+            .collect(),
+        other => Err(MatError::Custom(format!(
+            "enum ValueIndices is not a uint32 array (got {})",
+            other.kind()
+        ))),
+    }
+}
+
+/// The group's `MATLAB_class` attribute, unless it is the generic `"struct"`
+/// (an in-heap enum cell carries no real class name there).
+fn enum_class_from_attr(group: &Group<'_>) -> Option<String> {
+    let attrs = group.attrs().ok()?;
+    let class = mcos_reader::raw_matlab_class(&attrs)?;
+    (class != "struct").then_some(class)
 }
 
 /// Read a single dataset into a `MatValue` using its MATLAB_class attribute
@@ -655,4 +831,57 @@ fn transpose_pairs_col_to_row<T: Copy>(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enum_member_names_maps_indices_to_pool() {
+        let pool = vec!["enum1".to_owned(), "enum2".to_owned(), "enum3".to_owned()];
+        // Repeated and out-of-order indices both resolve through the shared pool.
+        let names = enum_member_names(&pool, &[0, 2, 1, 0]).unwrap();
+        assert_eq!(names, ["enum1", "enum3", "enum2", "enum1"]);
+    }
+
+    #[test]
+    fn enum_member_names_rejects_out_of_range_index() {
+        // An index past the member pool is corruption, not a silently-empty name.
+        let pool = vec!["enum1".to_owned()];
+        let err = enum_member_names(&pool, &[0, 5]).unwrap_err();
+        assert!(
+            matches!(&err, MatError::Custom(m) if m.contains("out of range")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn enum_indices_to_usize_accepts_uint32_shapes() {
+        assert_eq!(
+            enum_indices_to_usize(&MatValue::Scalar(ScalarNum::U32(4))).unwrap(),
+            [4]
+        );
+        assert_eq!(
+            enum_indices_to_usize(&MatValue::Vec1D(NumVec::U32(vec![1, 2, 3]))).unwrap(),
+            [1, 2, 3]
+        );
+        assert_eq!(
+            enum_indices_to_usize(&MatValue::Matrix {
+                rows: 2,
+                cols: 2,
+                vec: NumVec::U32(vec![0, 1, 2, 3]),
+            })
+            .unwrap(),
+            [0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn enum_indices_to_usize_rejects_non_uint32() {
+        // The dtype guard in `read_enum_indices` rejects this up front; the
+        // flattener is the backstop and must not silently produce wrong indices.
+        let err = enum_indices_to_usize(&MatValue::Vec1D(NumVec::F64(vec![1.0]))).unwrap_err();
+        assert!(matches!(err, MatError::Custom(_)), "unexpected: {err:?}");
+    }
 }

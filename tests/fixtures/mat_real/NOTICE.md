@@ -14,13 +14,14 @@ library), directory `tests/data/`:
 - Repository: <https://github.com/foreverallama/matio>
 - Commit: `77a578b6605f90035a4030b4dbce0cbe69e0a3d5`
 - Files: `test_string_v73.mat`, `test_time_v73.mat`, `test_tables_v73.mat`,
-  `test_corrupted_subsystem.mat`, `test_corrupted_mcos_object_metadata.mat`
+  `test_enum_v73.mat`, `test_corrupted_subsystem.mat`,
+  `test_corrupted_mcos_object_metadata.mat`
 
 The expected decoded values asserted in `tests/mat_opaque_real_read.rs` are
 transcribed from that project's MATLAB generator scripts
 (`tests/data/generators/*.m`) and its independent pytest oracle
 (`tests/test_datetime.py`, `test_duration.py`, `test_categorical.py`,
-`test_matstring.py`).
+`test_matstring.py`, `test_enum.py`).
 
 ### Also vendored: `matjl_struct_table_datetime.mat`
 
