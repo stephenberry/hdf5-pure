@@ -744,6 +744,69 @@ fn overwriting_chunked_datasets_in_place_stays_c_readable() {
 }
 
 #[test]
+fn fits_with_slack_filtered_overwrite_stays_c_readable() {
+    // Issue #101 follow-up: when a filtered chunked dataset is overwritten with
+    // more-compressible values, the re-encoded chunks shrink and fit their slots,
+    // so the chunk index is rebuilt *in place* to record the new sizes. The
+    // reference C library must still read the rebuilt index and the new values.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_fits_with_slack.h5");
+    write_c_starter(&path, LibraryVersion::V110, LibraryVersion::latest());
+
+    // Editor writes an incompressible deflate dataset (large chunk slots, v4
+    // Fixed-Array index).
+    let orig: Vec<i32> = (0..2048i32)
+        .map(|i| i.wrapping_mul(2_654_435_761u32 as i32) ^ (i << 3))
+        .collect();
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("d")
+            .with_i32_data(&orig)
+            .with_shape(&[2048])
+            .with_chunks(&[512])
+            .with_deflate(6);
+        session.commit().unwrap();
+    }
+    let size_before = std::fs::metadata(&path).unwrap().len();
+
+    // Overwrite with highly compressible values: chunks shrink and fit with slack.
+    let updated: Vec<i32> = vec![5; 2048];
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .write_dataset("d")
+            .with_i32_data(&updated)
+            .with_shape(&[2048]);
+        session.commit().unwrap();
+    }
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        size_before,
+        "fits-with-slack overwrite should reuse slots and rebuild the index in place"
+    );
+
+    // hdf5-pure reads the new values.
+    assert_eq!(
+        File::open(&path)
+            .unwrap()
+            .dataset("d")
+            .unwrap()
+            .read_i32()
+            .unwrap(),
+        updated
+    );
+    // The reference C library reads the in-place-rebuilt index + new values, and
+    // still sees the dataset as chunked.
+    let c = hdf5::File::open(&path).unwrap();
+    assert_eq!(c.dataset("d").unwrap().read_raw::<i32>().unwrap(), updated);
+    assert!(
+        c.dataset("d").unwrap().chunk().is_some(),
+        "C library does not see the dataset as chunked after in-place index rebuild"
+    );
+}
+
+#[test]
 fn copying_chunked_datasets_in_place_stays_c_readable() {
     // Issue #101: copying a chunked/filtered dataset in place must leave a file
     // the reference C library still reads, with the copy chunked + compressed. A

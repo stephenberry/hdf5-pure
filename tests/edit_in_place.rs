@@ -1980,16 +1980,19 @@ fn write_dataset_chunked_relocate_then_reuse_stays_valid() {
     let path = std::env::temp_dir().join("hdf5_pure_write_chunked_reclaim.h5");
     {
         let mut b = FileBuilder::new();
+        // Highly compressible start => tiny chunk slots.
         b.create_dataset("d")
-            .with_i32_data(&(0..4096).collect::<Vec<i32>>())
+            .with_i32_data(&vec![0i32; 4096])
             .with_shape(&[4096])
             .with_chunks(&[512])
             .with_deflate(6);
         b.write(&path).unwrap();
     }
-    // Force a relocate (different compressibility => different stored size), which
-    // frees the old chunk storage into the session free list.
-    let updated: Vec<i32> = vec![0; 4096];
+    // Incompressible new values grow the chunks past their tiny slots, forcing a
+    // relocate that frees the old chunk storage into the session free list.
+    let updated: Vec<i32> = (0..4096i32)
+        .map(|i| i.wrapping_mul(2_654_435_761u32 as i32) ^ (i << 3))
+        .collect();
     let filler: Vec<f64> = (0..64).map(|i| i as f64).collect();
     {
         let mut session = EditSession::open(&path).unwrap();
@@ -2007,6 +2010,96 @@ fn write_dataset_chunked_relocate_then_reuse_stays_valid() {
     let file = File::open(&path).unwrap();
     assert_eq!(file.dataset("d").unwrap().read_i32().unwrap(), updated);
     assert_eq!(file.dataset("filler").unwrap().read_f64().unwrap(), filler);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A filtered (deflate, Fixed-Array index) overwrite whose re-encoded chunks are
+/// *smaller* than their slots is applied in place: each shrunk chunk is written
+/// into its existing slot and the chunk index is rebuilt in place to record the
+/// new sizes, so the file does not grow and the new values read back (which would
+/// be impossible if the index still recorded the old, larger sizes).
+#[test]
+fn write_dataset_overwrites_filtered_chunked_fits_with_slack_in_place() {
+    let path = std::env::temp_dir().join("hdf5_pure_write_fits_slack_fa.h5");
+    // Incompressible start => large chunk slots (Fixed Array: 4 finite chunks).
+    let orig: Vec<i32> = (0..2048i32)
+        .map(|i| i.wrapping_mul(2_654_435_761u32 as i32) ^ (i << 3))
+        .collect();
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("d")
+            .with_i32_data(&orig)
+            .with_shape(&[2048])
+            .with_chunks(&[512])
+            .with_deflate(6);
+        b.write(&path).unwrap();
+    }
+    let size_before = std::fs::metadata(&path).unwrap().len();
+    // Highly compressible replacement => much smaller chunks that fit with slack.
+    let updated: Vec<i32> = vec![7; 2048];
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .write_dataset("d")
+            .with_i32_data(&updated)
+            .with_shape(&[2048]);
+        session.commit().unwrap();
+    }
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        size_before,
+        "a fits-with-slack overwrite reuses the chunk slots and rebuilds the index \
+         in place, so the file must not grow"
+    );
+    let file = File::open(&path).unwrap();
+    let d = file.dataset("d").unwrap();
+    assert_eq!(d.read_i32().unwrap(), updated);
+    assert!(d.chunk_cache_stats().index_loaded(), "still chunked");
+    std::fs::remove_file(&path).ok();
+}
+
+/// The fits-with-slack in-place path also covers an extensible (unlimited,
+/// Extensible-Array index) dataset: the shrunk chunks reuse their slots and the
+/// EA index is rebuilt in place, so the file does not grow and the values read
+/// back.
+#[test]
+fn write_dataset_overwrites_filtered_extensible_fits_with_slack() {
+    let path = std::env::temp_dir().join("hdf5_pure_write_fits_slack_ea.h5");
+    let orig: Vec<i32> = (0..2048i32)
+        .map(|i| i.wrapping_mul(2_654_435_761u32 as i32) ^ (i << 3))
+        .collect();
+    write_starter(&path);
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("d")
+            .with_i32_data(&orig)
+            .with_shape(&[2048])
+            .with_chunks(&[512])
+            .with_maxshape(&[u64::MAX]) // unlimited => Extensible Array index
+            .with_deflate(6);
+        session.commit().unwrap();
+    }
+    let size_before = std::fs::metadata(&path).unwrap().len();
+    let updated: Vec<i32> = vec![3; 2048];
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .write_dataset("d")
+            .with_i32_data(&updated)
+            .with_shape(&[2048]);
+        session.commit().unwrap();
+    }
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        size_before,
+        "an extensible-array fits-with-slack overwrite also rebuilds the index in \
+         place, so the file must not grow"
+    );
+    let file = File::open(&path).unwrap();
+    let d = file.dataset("d").unwrap();
+    assert_eq!(d.read_i32().unwrap(), updated);
+    assert!(d.chunk_cache_stats().index_loaded(), "still chunked");
     std::fs::remove_file(&path).ok();
 }
 
