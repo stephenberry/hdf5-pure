@@ -798,11 +798,14 @@ impl EditSession {
                 WritePlan::InPlaceChunks { writes } => inplace_writes.extend(writes),
                 WritePlan::Moving(mw) => {
                     // A relocating overwrite rewrites the dataset's header and data
-                    // address; that path is not yet base-aware on a userblock file.
-                    if base != 0 {
+                    // address. The chunked variant is base-aware on a userblock file
+                    // (it rebuilds the chunk blob with stored addresses and reclaims
+                    // the old storage base-relative); the contiguous/compact resize
+                    // variant is not yet, so refuse it on a userblock file.
+                    if base != 0 && !matches!(mw, MovingWrite::Chunked { .. }) {
                         return Err(Error::EditUnsupported(
-                            "overwriting a dataset that resizes or relocates its header is not \
-                             supported on a file with a userblock yet",
+                            "overwriting a contiguous or compact dataset that resizes or relocates \
+                             its header is not supported on a file with a userblock yet",
                         ));
                     }
                     // A relocating overwrite is safe only when this is the
@@ -1115,16 +1118,13 @@ impl EditSession {
                 }
             }
         }
-        // Reclamation of vacated bytes is gated to base-0 files in this slice: the
-        // span enumerators (`oh_chunk_spans`/`collect_free_spans`/`chunked_storage_spans`)
-        // index the file with base-relative addresses and are not yet base-aware, so
-        // on a userblock file the superseded headers are left as harmless dead space
-        // rather than risk freeing a live region. (Deletes and relocating overwrites
-        // — the other reclamation sources — are refused on userblock files above.)
+        // A superseded group header is dead once the root is repointed. Its chunk
+        // spans are enumerated base-aware (`oh_chunk_spans` shifts continuation
+        // addresses by the userblock base and returns absolute file offsets), so
+        // this reclamation works on userblock files too. `collect_free_spans` (the
+        // delete path) is the one enumerator still gated to base-0, because object
+        // deletion is itself refused on a userblock file above.
         for &a in &superseded_addrs {
-            if base != 0 {
-                break;
-            }
             if let Ok(spans) = self.oh_chunk_spans(a) {
                 to_free.extend(spans);
             }
@@ -1219,12 +1219,6 @@ impl EditSession {
             // target are stored relative to the base address (`- base`).
             for fd in flat.remove(key).into_iter().flatten() {
                 let oh = if fd.chunk_options.is_chunked() || fd.maxshape.is_some() {
-                    if base != 0 {
-                        return Err(Error::EditUnsupported(
-                            "adding a chunked, filtered, or resizable dataset to a file with a \
-                             userblock is not supported in place yet",
-                        ));
-                    }
                     self.build_chunked_dataset(&fd)?
                 } else {
                     let data_addr = self.alloc_or_append(&fd.raw)?;
@@ -1972,15 +1966,12 @@ impl EditSession {
             // builder carries none — chunked/filtered/extensible builders are
             // refused at the top of this function as "not a value overwrite").
             2 => {
-                // Chunked overwrite (in-place or relocating) walks and rewrites
-                // chunk-index and chunk addresses, which are not yet base-aware on a
-                // userblock file; refuse rather than mis-address the chunk storage.
-                if base != 0 {
-                    return Err(Error::EditUnsupported(
-                        "overwriting a chunked dataset on a file with a userblock is not \
-                         supported in place yet",
-                    ));
-                }
+                // Chunked overwrite (in-place or relocating). On a userblock file
+                // every stored chunk-index and chunk address is relative to `base`:
+                // the in-place path below walks the index on a base-relative view of
+                // the file and shifts the resulting write offsets back by `base`,
+                // and the relocating path rebuilds the chunk blob with stored
+                // addresses (see `write_chunked_relocatable`).
                 let dl =
                     DataLayout::parse(&region[lb..le], OFFSET_SIZE, LENGTH_SIZE).map_err(|_| {
                         Error::EditUnsupported("dataset header data layout could not be parsed")
@@ -2039,10 +2030,25 @@ impl EditSession {
                 // new chunk fits. No header rewrite and no superblock flip — the
                 // chunk (and index) blocks are reachable from both roots. The index
                 // is left untouched when chunks keep their size and rebuilt in place
-                // when they shrink.
-                if let Some(writes) =
-                    try_inplace_chunk_writes(d, &dl, &disk_ds, &spatial, raw_size, &new_chunk_bytes)
-                {
+                // when they shrink. The index walk runs on a base-relative view of
+                // the file (so the layout's stored addresses index correctly), and
+                // the returned write offsets are shifted back to absolute file
+                // offsets by adding `base` (a no-op on a base-0 file).
+                let base_off = usize::try_from(base).map_err(|_| {
+                    Error::EditUnsupported("userblock base address exceeds this platform")
+                })?;
+                if let Some(writes) = try_inplace_chunk_writes(
+                    &d[base_off..],
+                    &dl,
+                    &disk_ds,
+                    &spatial,
+                    raw_size,
+                    &new_chunk_bytes,
+                ) {
+                    let writes = writes
+                        .into_iter()
+                        .map(|(off, b)| (off + base_off, b))
+                        .collect();
                     return Ok(WritePlan::InPlaceChunks { writes });
                 }
 
@@ -2578,14 +2584,19 @@ impl EditSession {
         chunk_bytes: &[Vec<u8>],
         dense_attrs: &[crate::attribute::AttributeMessage],
     ) -> Result<u64, Error> {
-        let base = self.data.len() as u64;
+        let eof = self.data.len() as u64;
+        // Build with the *stored* (base-relative) address the blob will occupy, so
+        // its embedded addresses resolve to its real file offset once the reader adds
+        // the userblock base back (see `build_chunked_dataset`). On a base-0 file this
+        // equals `eof`.
+        let stored_base = eof - self.superblock.base_address;
         let layout = plan_chunked_data_verbatim(
             meta,
             chunk_dims,
             element_size,
             raw_size,
             pipeline_message,
-            base,
+            stored_base,
             maxshape,
         )?;
         let mut buf = Vec::with_capacity(usize::try_from(layout.plan.total_len).unwrap_or(0));
@@ -2598,8 +2609,8 @@ impl EditSession {
         )?;
         let written = self.append(&buf)?;
         debug_assert_eq!(
-            written, base,
-            "chunk blob must land at the base address it was built for",
+            written, eof,
+            "chunk blob must land at end-of-file",
         );
         // Swap the data-layout message for the rebuilt one; keep every other header
         // message (datatype, dataspace, fill value, filter pipeline, attributes)
@@ -2632,12 +2643,17 @@ impl EditSession {
         if attrs.is_empty() {
             return Ok(());
         }
-        let base = self.data.len() as u64;
-        let blob = crate::file_writer::build_dense_attrs(attrs, base);
+        let eof = self.data.len() as u64;
+        // Build with the *stored* (base-relative) address the blob will occupy, so
+        // every address it embeds resolves to its real file offset once the reader
+        // adds the userblock base back (see `build_chunked_dataset`). On a base-0
+        // file this equals `eof`.
+        let stored_base = eof - self.superblock.base_address;
+        let blob = crate::file_writer::build_dense_attrs(attrs, stored_base);
         let written = self.append(&blob.blob)?;
         debug_assert_eq!(
-            written, base,
-            "dense attribute blob must land at the base address it was built for",
+            written, eof,
+            "dense attribute blob must land at end-of-file",
         );
         region.extend_from_slice(&region_message(
             MessageType::AttributeInfo,
@@ -2767,7 +2783,13 @@ impl EditSession {
     /// still reused for the object header and for every other object in the
     /// commit.
     fn build_chunked_dataset(&mut self, fd: &FlatDataset) -> Result<Vec<u8>, Error> {
-        let base = self.data.len() as u64;
+        let eof = self.data.len() as u64;
+        // The blob embeds *stored* (base-relative) addresses, so the planner base is
+        // the stored address the blob will occupy: its end-of-file offset minus the
+        // userblock base. The reader recovers each as `stored + base_address`, which
+        // resolves back to the blob's real file offset. On a base-0 file this is just
+        // `eof`.
+        let stored_base = eof - self.superblock.base_address;
         let chunk_dims = fd.chunk_options.resolve_chunk_dims(&fd.ds.dimensions);
         let ctx = ChunkContext::from_datatype(&chunk_dims, &fd.dt);
         let result = build_chunked_data_at_ext(
@@ -2775,15 +2797,16 @@ impl EditSession {
             &fd.ds.dimensions,
             ctx,
             &fd.chunk_options,
-            base,
+            stored_base,
             fd.maxshape.as_deref(),
         )?;
-        // `append` writes at the current end-of-file, which equals `base`: the
-        // blob lands exactly where its embedded addresses expect.
+        // `append` writes at the current end-of-file, which equals `eof`: the blob
+        // lands exactly where its embedded (stored) addresses expect once the reader
+        // adds the base back.
         let written = self.append(&result.data_bytes)?;
         debug_assert_eq!(
-            written, base,
-            "chunk blob must land at the base address it was built for",
+            written, eof,
+            "chunk blob must land at end-of-file",
         );
         Ok(build_chunked_dataset_oh(
             &fd.dt,
@@ -2805,6 +2828,11 @@ impl EditSession {
     fn oh_chunk_spans(&self, addr: usize) -> Result<Vec<(u64, u64)>, Error> {
         let (rs, re) = Self::oh_region(&self.data, addr)?;
         let d = &self.data;
+        // A continuation message records the OCHK block's address relative to the
+        // userblock base, so it is shifted to an absolute file offset before
+        // indexing the file or recording the span (a no-op on a base-0 file). Chunk
+        // 0 sits at the absolute header address itself, which is already absolute.
+        let base = self.superblock.base_address;
         // Chunk 0 spans from the header start through its trailing checksum;
         // `oh_region` guarantees `re + 4 <= d.len()`.
         let mut spans: Vec<(u64, u64)> = vec![(addr as u64, (re + 4 - addr) as u64)];
@@ -2829,7 +2857,10 @@ impl EditSession {
                     }
                     let off = u64::from_le_bytes(d[body..body + 8].try_into().unwrap());
                     let len = u64::from_le_bytes(d[body + 8..body + 16].try_into().unwrap());
-                    let off_us = usize::try_from(off).map_err(|_| {
+                    let off_abs = off.checked_add(base).ok_or(Error::EditUnsupported(
+                        "continuation address exceeds this platform",
+                    ))?;
+                    let off_us = usize::try_from(off_abs).map_err(|_| {
                         Error::EditUnsupported("continuation address exceeds this platform")
                     })?;
                     let len_us = usize::try_from(len).map_err(|_| {
@@ -2844,7 +2875,7 @@ impl EditSession {
                             "invalid continuation block signature",
                         ));
                     }
-                    spans.push((off, len));
+                    spans.push((off_abs, len));
                     chunks.push((off_us + 4, blk_end - 4));
                 }
                 p = body_end;
@@ -3055,14 +3086,25 @@ impl EditSession {
         // or the free list would later hand out live bytes (and a debug build
         // would panic on the double-free). On any error or violation, leave the
         // whole dataset unreclaimed rather than free a region still in use.
+        //
+        // The layout's stored addresses are relative to the userblock base, so the
+        // enumeration runs on a base-relative view of the file and each returned
+        // span address is shifted back to an absolute file offset by adding `base`
+        // (a no-op on a base-0 file). The free list and the bounds check below both
+        // work in absolute file offsets.
+        let base = self.superblock.base_address;
+        let base_off = usize::try_from(base).ok()?;
         let mut spans = crate::chunked_read::collect_chunked_storage_spans(
-            &self.data,
+            &self.data[base_off..],
             &layout,
             &dataspace,
             OFFSET_SIZE,
             LENGTH_SIZE,
         )
         .ok()?;
+        for (addr, _) in &mut spans {
+            *addr = addr.checked_add(base)?;
+        }
         if !spans_disjoint_in_bounds(&mut spans, self.data.len() as u64) {
             return None;
         }

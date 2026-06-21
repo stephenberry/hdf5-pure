@@ -83,3 +83,85 @@ fn real_mat_edited_then_read_by_c_library() {
         before
     );
 }
+
+#[test]
+fn userblock_chunked_add_and_overwrite_read_by_c_library() {
+    // Adding a chunked/filtered dataset and overwriting an existing one on a
+    // userblock file both write chunk-index and chunk-data addresses relative to
+    // the base. The C library reading the result back is the external proof that
+    // every such address was stored correctly.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("pure_ub_chunk.h5");
+
+    let seed = vec![2.0f64; 300];
+    let mut b = FileBuilder::new();
+    b.with_userblock(UB);
+    b.create_dataset("contig").with_i32_data(&[1, 2, 3]);
+    b.create_dataset("c")
+        .with_f64_data(&seed)
+        .with_shape(&[300])
+        .with_chunks(&[30])
+        .with_deflate(6);
+    std::fs::write(&path, b.finish().unwrap()).unwrap();
+
+    let added: Vec<f64> = (0..400).map(|i| (i % 11) as f64 * 0.5).collect();
+    let updated: Vec<f64> = (0..300).map(|i| (i as f64).cos()).collect();
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        // Add a new chunked dataset and relocate-overwrite the existing one.
+        s.create_dataset("added")
+            .with_f64_data(&added)
+            .with_shape(&[400])
+            .with_chunks(&[50])
+            .with_deflate(6);
+        s.write_dataset("c").with_f64_data(&updated);
+        s.commit().unwrap();
+    }
+
+    // pure reader
+    let f = File::open(&path).unwrap();
+    assert_eq!(f.dataset("c").unwrap().read_f64().unwrap(), updated);
+    assert_eq!(f.dataset("added").unwrap().read_f64().unwrap(), added);
+
+    // reference C library reader — the real interop proof.
+    let c = hdf5::File::open(&path).unwrap();
+    assert_eq!(c.dataset("c").unwrap().read_raw::<f64>().unwrap(), updated);
+    assert_eq!(c.dataset("added").unwrap().read_raw::<f64>().unwrap(), added);
+    assert_eq!(c.dataset("contig").unwrap().read_raw::<i32>().unwrap(), vec![1, 2, 3]);
+}
+
+#[test]
+fn userblock_chunked_reclaimed_space_reused_read_by_c_library() {
+    // A relocating chunked overwrite frees the old chunk storage; a later commit
+    // in the same session reuses it. The C library reading every dataset back
+    // confirms the reclaim freed only dead bytes (a base-address mistake in the
+    // span enumerators would have corrupted a live region the reuse then wrote).
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("pure_ub_reclaim.h5");
+
+    let seed = vec![5.0f64; 600];
+    let mut b = FileBuilder::new();
+    b.with_userblock(UB);
+    b.create_dataset("keep").with_f64_data(&[10.0, 20.0, 30.0]);
+    b.create_dataset("c")
+        .with_f64_data(&seed)
+        .with_shape(&[600])
+        .with_chunks(&[40])
+        .with_deflate(6);
+    std::fs::write(&path, b.finish().unwrap()).unwrap();
+
+    let updated: Vec<f64> = (0..600).map(|i| (i as f64) * 0.01).collect();
+    let reuse: Vec<f64> = (0..80).map(|i| (i as f64) + 0.5).collect();
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        s.write_dataset("c").with_f64_data(&updated);
+        s.commit().unwrap();
+        s.create_dataset("reuse").with_f64_data(&reuse);
+        s.commit().unwrap();
+    }
+
+    let c = hdf5::File::open(&path).unwrap();
+    assert_eq!(c.dataset("c").unwrap().read_raw::<f64>().unwrap(), updated);
+    assert_eq!(c.dataset("reuse").unwrap().read_raw::<f64>().unwrap(), reuse);
+    assert_eq!(c.dataset("keep").unwrap().read_raw::<f64>().unwrap(), vec![10.0, 20.0, 30.0]);
+}

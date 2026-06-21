@@ -7,9 +7,11 @@
 //! by this crate and a real `.mat` fixture — and verify that the userblock bytes
 //! survive an edit byte-for-byte.
 //!
-//! This first slice supports same-length contiguous value overwrites, additions
-//! of contiguous datasets, group creation, and compact group attributes. Chunked
-//! additions/overwrites, deletions, copies, and relocating overwrites are
+//! This slice supports contiguous value overwrites, additions of contiguous and
+//! chunked/filtered datasets, overwrites of chunked datasets (in place when the
+//! re-encoded chunks fit their slots, otherwise rebuilt and relocated with the
+//! old storage reclaimed), group creation, and compact group attributes.
+//! Deletions, copies, and relocating overwrites of *contiguous* datasets are
 //! refused cleanly on a userblock file (covered below); they remain follow-up
 //! work, and a refusal never corrupts the file.
 
@@ -135,25 +137,6 @@ fn userblock_inplace_overwrite_only_takes_fast_path() {
 /// `EditUnsupported`, and the file must remain valid with its original contents.
 #[test]
 fn userblock_unsupported_ops_are_refused_cleanly() {
-    // chunked/filtered addition
-    {
-        let path = std::env::temp_dir().join("hdf5_pure_ub_refuse_chunk_add.h5");
-        build_userblock_file(&path);
-        let mut s = EditSession::open(&path).unwrap();
-        s.create_dataset("chk")
-            .with_f64_data(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
-            .with_deflate(6);
-        assert!(s.commit().is_err(), "chunked add should be refused");
-        drop(s);
-        let file = File::open(&path).unwrap();
-        assert!(file.dataset("chk").is_err());
-        assert_eq!(
-            file.dataset("alpha").unwrap().read_f64().unwrap(),
-            vec![1.0, 2.0, 3.0, 4.0]
-        );
-        std::fs::remove_file(&path).ok();
-    }
-
     // deletion
     {
         let path = std::env::temp_dir().join("hdf5_pure_ub_refuse_delete.h5");
@@ -187,31 +170,30 @@ fn userblock_unsupported_ops_are_refused_cleanly() {
         std::fs::remove_file(&path).ok();
     }
 
-    // overwrite of a chunked dataset. The refusal happens in `prepare_write`
-    // before any byte is written, so the file must be byte-identical afterward and
-    // the original chunk data must still read back.
+    // relocating overwrite of a *contiguous* dataset (a resize). The refusal
+    // happens in the write preflight before any byte is written, so the file must
+    // be byte-identical afterward and the original data must still read back.
     {
-        let path = std::env::temp_dir().join("hdf5_pure_ub_refuse_chunk_over.h5");
-        let original = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let mut b = FileBuilder::new();
-        b.with_userblock(UB as u64);
-        b.create_dataset("chk").with_f64_data(&original).with_deflate(6);
-        std::fs::write(&path, b.finish().unwrap()).unwrap();
+        let path = std::env::temp_dir().join("hdf5_pure_ub_refuse_contig_resize.h5");
+        build_userblock_file(&path);
         let before = std::fs::read(&path).unwrap();
 
         let mut s = EditSession::open(&path).unwrap();
-        s.write_dataset("chk")
-            .with_f64_data(&[8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0]);
-        assert!(s.commit().is_err(), "chunked overwrite should be refused");
+        // A longer value than the on-disk extent forces a relocation.
+        s.write_dataset("alpha").with_f64_data(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert!(
+            s.commit().is_err(),
+            "contiguous resizing overwrite should be refused"
+        );
         drop(s);
         assert_eq!(
             std::fs::read(&path).unwrap(),
             before,
-            "a refused chunked overwrite must not modify the file"
+            "a refused resizing overwrite must not modify the file"
         );
         assert_eq!(
-            File::open(&path).unwrap().dataset("chk").unwrap().read_f64().unwrap(),
-            original
+            File::open(&path).unwrap().dataset("alpha").unwrap().read_f64().unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0]
         );
         std::fs::remove_file(&path).ok();
     }
