@@ -10,10 +10,11 @@
 //! This slice supports contiguous value overwrites, additions of contiguous and
 //! chunked/filtered datasets, overwrites of chunked datasets (in place when the
 //! re-encoded chunks fit their slots, otherwise rebuilt and relocated with the
-//! old storage reclaimed), group creation, and compact group attributes.
-//! Deletions, copies, and relocating overwrites of *contiguous* datasets are
-//! refused cleanly on a userblock file (covered below); they remain follow-up
-//! work, and a refusal never corrupts the file.
+//! old storage reclaimed), group creation, and compact group attributes. The
+//! delete, copy, and relocating contiguous/compact overwrite paths are covered in
+//! `edit_userblock_followups.rs` and `edit_userblock_crosscheck.rs`. The one
+//! userblock-specific operation still refused — cross-file copy from a userblock
+//! *source* — is covered below; a refusal never corrupts the file.
 
 use hdf5_pure::{AttrValue, EditSession, File, FileBuilder};
 
@@ -135,76 +136,37 @@ fn userblock_inplace_overwrite_only_takes_fast_path() {
     std::fs::remove_file(&path).ok();
 }
 
-/// Each unsupported operation on a userblock file must be refused with
-/// `EditUnsupported`, and the file must remain valid with its original contents.
+/// Cross-file copy *from* a userblock source is still refused (the source-file
+/// base-address restriction in `copy_from`); the destination file must be left
+/// byte-identical by the refusal. Delete, in-file copy, cross-file copy into a
+/// userblock destination, and resizing overwrites are all supported now and are
+/// exercised in `edit_userblock_followups.rs` / `edit_userblock_crosscheck.rs`.
 #[test]
-fn userblock_unsupported_ops_are_refused_cleanly() {
-    // deletion
-    {
-        let path = std::env::temp_dir().join("hdf5_pure_ub_refuse_delete.h5");
-        build_userblock_file(&path);
-        let mut s = EditSession::open(&path).unwrap();
-        s.delete("alpha");
-        assert!(s.commit().is_err(), "delete should be refused");
-        drop(s);
-        let file = File::open(&path).unwrap();
-        assert_eq!(
-            file.dataset("alpha").unwrap().read_f64().unwrap(),
-            vec![1.0, 2.0, 3.0, 4.0]
-        );
-        std::fs::remove_file(&path).ok();
-    }
+fn userblock_cross_file_copy_from_userblock_source_is_refused() {
+    let src_path = std::env::temp_dir().join("hdf5_pure_ub_xcopy_src_refuse.h5");
+    let dst_path = std::env::temp_dir().join("hdf5_pure_ub_xcopy_dst_refuse.h5");
+    build_userblock_file(&src_path);
+    build_userblock_file(&dst_path);
+    let dst_before = std::fs::read(&dst_path).unwrap();
 
-    // copy
-    {
-        let path = std::env::temp_dir().join("hdf5_pure_ub_refuse_copy.h5");
-        build_userblock_file(&path);
-        let mut s = EditSession::open(&path).unwrap();
-        s.copy("alpha", "alpha_copy");
-        assert!(s.commit().is_err(), "copy should be refused");
-        drop(s);
-        let file = File::open(&path).unwrap();
-        assert!(file.dataset("alpha_copy").is_err());
-        assert_eq!(
-            file.dataset("alpha").unwrap().read_f64().unwrap(),
-            vec![1.0, 2.0, 3.0, 4.0]
-        );
-        std::fs::remove_file(&path).ok();
-    }
+    let source = File::open(&src_path).unwrap();
+    let mut s = EditSession::open(&dst_path).unwrap();
+    // The eager read happens in `copy_from`, so the refusal surfaces there.
+    let err = s.copy_from(&source, "alpha", "imported");
+    assert!(
+        err.is_err(),
+        "cross-file copy from a userblock source should be refused"
+    );
+    drop(s);
 
-    // relocating overwrite of a *contiguous* dataset (a resize). The refusal
-    // happens in the write preflight before any byte is written, so the file must
-    // be byte-identical afterward and the original data must still read back.
-    {
-        let path = std::env::temp_dir().join("hdf5_pure_ub_refuse_contig_resize.h5");
-        build_userblock_file(&path);
-        let before = std::fs::read(&path).unwrap();
+    assert_eq!(
+        std::fs::read(&dst_path).unwrap(),
+        dst_before,
+        "a refused cross-file copy must not modify the destination"
+    );
 
-        let mut s = EditSession::open(&path).unwrap();
-        // A longer value than the on-disk extent forces a relocation.
-        s.write_dataset("alpha")
-            .with_f64_data(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        assert!(
-            s.commit().is_err(),
-            "contiguous resizing overwrite should be refused"
-        );
-        drop(s);
-        assert_eq!(
-            std::fs::read(&path).unwrap(),
-            before,
-            "a refused resizing overwrite must not modify the file"
-        );
-        assert_eq!(
-            File::open(&path)
-                .unwrap()
-                .dataset("alpha")
-                .unwrap()
-                .read_f64()
-                .unwrap(),
-            vec![1.0, 2.0, 3.0, 4.0]
-        );
-        std::fs::remove_file(&path).ok();
-    }
+    std::fs::remove_file(&src_path).ok();
+    std::fs::remove_file(&dst_path).ok();
 }
 
 #[test]

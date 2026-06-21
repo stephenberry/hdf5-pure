@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- `EditSession` now opens and edits files that carry a **userblock** (non-zero base address), such as MATLAB v7.3 `.mat` files: it reads and writes addresses relative to the base and preserves the userblock bytes verbatim. Supported edits include contiguous value overwrites, additions of contiguous and chunked/filtered datasets, in-place and relocating overwrites of chunked datasets (with the old chunk storage reclaimed), group creation, and compact attributes; deletions, copies, and resizing overwrites of contiguous datasets on a userblock file are still refused ([#104](https://github.com/stephenberry/hdf5-pure/issues/104)).
+- `EditSession` now opens and edits files that carry a **userblock** (non-zero base address), such as MATLAB v7.3 `.mat` files: it reads and writes addresses relative to the base and preserves the userblock bytes verbatim. Every edit is supported — value overwrites, additions, relocating overwrites of every layout (with old storage reclaimed), object deletion, in-file and cross-file copy, group creation, and compact attributes; only cross-file copy from a userblock *source* is still refused ([#104](https://github.com/stephenberry/hdf5-pure/issues/104)).
 
 ### Fixed
 
