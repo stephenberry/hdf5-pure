@@ -8,10 +8,34 @@
 //! result back through `hdf5` is the external tripwire that the editor stored
 //! every root/link/layout address relative to the base address correctly.
 
+use hdf5::dataset::Layout;
+use hdf5::file::LibraryVersion;
 use hdf5_pure::{EditSession, File, FileBuilder};
 use tempfile::tempdir;
 
 const UB: u64 = 512;
+
+/// Create a userblock file with the reference C library. The closure adds
+/// datasets; the file is created with a 512-byte userblock and the modern library
+/// bounds so its on-disk format matches what a real `.mat`-style file carries.
+fn c_userblock_file(path: &std::path::Path, build: impl FnOnce(&hdf5::File)) {
+    let file = hdf5::File::with_options()
+        .with_fcpl(|p| {
+            p.userblock(UB);
+            p
+        })
+        .with_fapl(|p| p.libver_bounds(LibraryVersion::V110, LibraryVersion::latest()))
+        .create(path)
+        .unwrap();
+    build(&file);
+    file.close().unwrap();
+    // Sanity: the file really carries a userblock.
+    assert_eq!(
+        hdf5::File::open(path).unwrap().userblock(),
+        UB,
+        "C library did not produce a userblock file"
+    );
+}
 
 #[test]
 fn pure_userblock_file_edited_then_read_by_c_library() {
@@ -200,6 +224,232 @@ fn userblock_chunked_reclaimed_space_reused_read_by_c_library() {
     assert_eq!(
         c.dataset("keep").unwrap().read_raw::<f64>().unwrap(),
         vec![10.0, 20.0, 30.0]
+    );
+}
+
+#[test]
+fn userblock_contiguous_undefined_address_relocates_read_by_c_library() {
+    // A contiguous dataset the C library created but never wrote has an undefined
+    // data address, so overwriting it relocates the header and writes a fresh data
+    // block. On a userblock file the new data address must be stored relative to
+    // the base; the C library reading it back confirms it was.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("ub_contig_reloc.h5");
+    c_userblock_file(&path, |file| {
+        // Created without a write: the contiguous data address stays undefined.
+        file.new_dataset::<i32>()
+            .shape((3,))
+            .create("blank")
+            .unwrap();
+        file.new_dataset::<f64>()
+            .shape((2,))
+            .create("keep")
+            .unwrap()
+            .write(&[1.0f64, 2.0])
+            .unwrap();
+    });
+
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        s.write_dataset("blank").with_i32_data(&[5, 6, 7]);
+        s.commit().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    assert_eq!(
+        f.dataset("blank").unwrap().read_i32().unwrap(),
+        vec![5, 6, 7]
+    );
+    assert_eq!(
+        f.dataset("keep").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0]
+    );
+
+    let c = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        c.dataset("blank").unwrap().read_raw::<i32>().unwrap(),
+        vec![5, 6, 7]
+    );
+    assert_eq!(
+        c.dataset("keep").unwrap().read_raw::<f64>().unwrap(),
+        vec![1.0, 2.0]
+    );
+}
+
+#[test]
+fn userblock_compact_overwrite_read_by_c_library() {
+    // A compact dataset carries its data inline in the header, so any overwrite
+    // rewrites and relocates the header and relinks the parent. On a userblock file
+    // that relink must be stored relative to the base; the C library reading the
+    // new values back confirms it was.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("ub_compact.h5");
+    c_userblock_file(&path, |file| {
+        file.new_dataset::<i32>()
+            .shape((4,))
+            .layout(Layout::Compact)
+            .create("cpt")
+            .unwrap()
+            .write(&[1i32, 2, 3, 4])
+            .unwrap();
+        file.new_dataset::<f64>()
+            .shape((2,))
+            .create("keep")
+            .unwrap()
+            .write(&[1.0f64, 2.0])
+            .unwrap();
+    });
+
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        // Same shape, but a compact overwrite always relocates the header.
+        s.write_dataset("cpt").with_i32_data(&[9, 8, 7, 6]);
+        s.commit().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    assert_eq!(
+        f.dataset("cpt").unwrap().read_i32().unwrap(),
+        vec![9, 8, 7, 6]
+    );
+
+    let c = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        c.dataset("cpt").unwrap().read_raw::<i32>().unwrap(),
+        vec![9, 8, 7, 6]
+    );
+    assert_eq!(
+        c.dataset("keep").unwrap().read_raw::<f64>().unwrap(),
+        vec![1.0, 2.0]
+    );
+}
+
+#[test]
+fn userblock_delete_then_reuse_read_by_c_library() {
+    // Deleting objects from a userblock file reclaims their storage base-relative;
+    // a later add reuses a freed hole. The C library reading every survivor back
+    // confirms the reclaim freed only dead bytes — a base mistake in the subtree
+    // walk would have freed a live region the reuse then overwrote, corrupting it.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("ub_delete_reuse.h5");
+    c_userblock_file(&path, |file| {
+        let big: Vec<f64> = (0..256).map(|i| i as f64).collect();
+        file.new_dataset::<f64>()
+            .shape((256,))
+            .create("doomed")
+            .unwrap()
+            .write(&big)
+            .unwrap();
+        file.new_dataset::<f64>()
+            .shape((3,))
+            .create("keep")
+            .unwrap()
+            .write(&[10.0f64, 20.0, 30.0])
+            .unwrap();
+        // A chunked dataset whose storage is reclaimed via the index walker.
+        let chunked: Vec<i32> = (0..512).collect();
+        file.new_dataset::<i32>()
+            .shape((512,))
+            .chunk((64,))
+            .create("c")
+            .unwrap()
+            .write(&chunked)
+            .unwrap();
+    });
+
+    let reuse: Vec<f64> = (0..64).map(|i| (i as f64) * -1.5).collect();
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        s.delete("doomed");
+        s.delete("c");
+        s.commit().unwrap();
+        s.create_dataset("reuse").with_f64_data(&reuse);
+        s.commit().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    assert!(f.dataset("doomed").is_err());
+    assert!(f.dataset("c").is_err());
+    assert_eq!(f.dataset("reuse").unwrap().read_f64().unwrap(), reuse);
+
+    let c = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        c.dataset("reuse").unwrap().read_raw::<f64>().unwrap(),
+        reuse
+    );
+    assert_eq!(
+        c.dataset("keep").unwrap().read_raw::<f64>().unwrap(),
+        vec![10.0, 20.0, 30.0]
+    );
+    assert!(c.dataset("doomed").is_err());
+    assert!(c.dataset("c").is_err());
+}
+
+#[test]
+fn userblock_copy_read_by_c_library() {
+    // Copying objects within a userblock file writes fresh data, chunk storage, and
+    // link addresses, all base-relative. The C library reading every copy back is
+    // the external proof those addresses were stored correctly (a base mistake
+    // would dangle the copy's data/index pointer and error or read garbage).
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("ub_copy.h5");
+    c_userblock_file(&path, |file| {
+        file.new_dataset::<f64>()
+            .shape((4,))
+            .create("alpha")
+            .unwrap()
+            .write(&[1.0f64, 2.0, 3.0, 4.0])
+            .unwrap();
+        let chunked: Vec<i32> = (0..400).collect();
+        file.new_dataset::<i32>()
+            .shape((400,))
+            .chunk((50,))
+            .create("c")
+            .unwrap()
+            .write(&chunked)
+            .unwrap();
+        let grp = file.create_group("grp").unwrap();
+        grp.new_dataset::<f64>()
+            .shape((2,))
+            .create("leaf")
+            .unwrap()
+            .write(&[7.5f64, 8.5])
+            .unwrap();
+    });
+
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        s.copy("alpha", "alpha_copy");
+        s.copy("c", "c_copy");
+        s.copy("grp", "grp_copy");
+        s.commit().unwrap();
+    }
+
+    let expected_c: Vec<i32> = (0..400).collect();
+    let c = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        c.dataset("alpha_copy").unwrap().read_raw::<f64>().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    assert_eq!(
+        c.dataset("c_copy").unwrap().read_raw::<i32>().unwrap(),
+        expected_c
+    );
+    assert_eq!(
+        c.dataset("grp_copy/leaf")
+            .unwrap()
+            .read_raw::<f64>()
+            .unwrap(),
+        vec![7.5, 8.5]
+    );
+    // Originals untouched.
+    assert_eq!(
+        c.dataset("alpha").unwrap().read_raw::<f64>().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    assert_eq!(
+        c.dataset("c").unwrap().read_raw::<i32>().unwrap(),
+        expected_c
     );
 }
 
