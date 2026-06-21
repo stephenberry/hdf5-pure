@@ -1142,7 +1142,10 @@ fn userblock_contiguous_read() {
     let file = userblock_roundtrip_f64(|b| {
         b.create_dataset("d").with_f64_data(&[1.0, 2.0, 3.0, 4.0]);
     });
-    assert_eq!(file.dataset("d").unwrap().read_f64().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(
+        file.dataset("d").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
 }
 
 #[test]

@@ -26,7 +26,8 @@ const MARKER: &[u8] = b"USERBLOCK-MARKER-0104";
 fn build_userblock_file(path: &std::path::Path) -> Vec<u8> {
     let mut b = FileBuilder::new();
     b.with_userblock(UB as u64);
-    b.create_dataset("alpha").with_f64_data(&[1.0, 2.0, 3.0, 4.0]);
+    b.create_dataset("alpha")
+        .with_f64_data(&[1.0, 2.0, 3.0, 4.0]);
     b.create_dataset("beta").with_i32_data(&[10, 20, 30]);
     let mut g = b.create_group("grp");
     g.create_dataset("inner").with_f64_data(&[7.5, 8.5]);
@@ -51,7 +52,8 @@ fn synthetic_userblock_file_roundtrip() {
     {
         let mut s = EditSession::open(&path).unwrap();
         // Same-length in-place overwrite of an existing contiguous dataset.
-        s.write_dataset("alpha").with_f64_data(&[9.0, 8.0, 7.0, 6.0]);
+        s.write_dataset("alpha")
+            .with_f64_data(&[9.0, 8.0, 7.0, 6.0]);
         // Add contiguous datasets at the root and inside the nested group.
         s.create_dataset("added").with_i32_data(&[100, 200]);
         s.create_dataset("grp/added_inner").with_f64_data(&[3.25]);
@@ -180,7 +182,8 @@ fn userblock_unsupported_ops_are_refused_cleanly() {
 
         let mut s = EditSession::open(&path).unwrap();
         // A longer value than the on-disk extent forces a relocation.
-        s.write_dataset("alpha").with_f64_data(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        s.write_dataset("alpha")
+            .with_f64_data(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         assert!(
             s.commit().is_err(),
             "contiguous resizing overwrite should be refused"
@@ -192,7 +195,12 @@ fn userblock_unsupported_ops_are_refused_cleanly() {
             "a refused resizing overwrite must not modify the file"
         );
         assert_eq!(
-            File::open(&path).unwrap().dataset("alpha").unwrap().read_f64().unwrap(),
+            File::open(&path)
+                .unwrap()
+                .dataset("alpha")
+                .unwrap()
+                .read_f64()
+                .unwrap(),
             vec![1.0, 2.0, 3.0, 4.0]
         );
         std::fs::remove_file(&path).ok();
@@ -241,8 +249,16 @@ fn real_mat_add_dataset_preserves_userblock_and_data() {
     );
     // The original variables and MATLAB's MCOS groups are still present.
     let datasets = file.root().datasets().unwrap();
-    for name in ["string_array", "string_empty", "string_scalar", "hdf5_pure_probe"] {
-        assert!(datasets.contains(&name.to_string()), "missing dataset {name}");
+    for name in [
+        "string_array",
+        "string_empty",
+        "string_scalar",
+        "hdf5_pure_probe",
+    ] {
+        assert!(
+            datasets.contains(&name.to_string()),
+            "missing dataset {name}"
+        );
     }
     let groups = file.root().groups().unwrap();
     assert!(groups.contains(&"#refs#".to_string()));

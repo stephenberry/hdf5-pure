@@ -1643,9 +1643,9 @@ impl EditSession {
                     let len = u64::from_le_bytes(d[body + 8..body + 16].try_into().unwrap());
                     // The continuation block address is stored relative to the base
                     // address; convert to an absolute file offset to index `d`.
-                    let off = off.checked_add(base).ok_or(Error::EditUnsupported(
-                        "continuation address overflow",
-                    ))?;
+                    let off = off
+                        .checked_add(base)
+                        .ok_or(Error::EditUnsupported("continuation address overflow"))?;
                     let off = usize::try_from(off).map_err(|_| {
                         Error::EditUnsupported("continuation address exceeds this platform")
                     })?;
@@ -1810,7 +1810,12 @@ impl EditSession {
     /// this engine cannot enumerate — a version-2 B-tree — is refused too). A
     /// datatype or shape that differs from the on-disk dataset's is likewise
     /// refused — this is a value overwrite, not a reshape or retype.
-    fn prepare_write(d: &[u8], addr: usize, fd: &FlatDataset, base: u64) -> Result<WritePlan, Error> {
+    fn prepare_write(
+        d: &[u8],
+        addr: usize,
+        fd: &FlatDataset,
+        base: u64,
+    ) -> Result<WritePlan, Error> {
         // A value overwrite never introduces chunking, filters, or an extensible
         // shape: those would change the storage layout, not just the bytes.
         if fd.chunk_options.is_chunked() || fd.maxshape.is_some() {
@@ -1928,8 +1933,9 @@ impl EditSession {
                 // address is base-relative; the in-place write targets the absolute
                 // file offset `data_addr + base`.
                 if data_addr != UNDEF && data_size == fd.raw.len() as u64 {
-                    if let Some(start) =
-                        data_addr.checked_add(base).and_then(|a| usize::try_from(a).ok())
+                    if let Some(start) = data_addr
+                        .checked_add(base)
+                        .and_then(|a| usize::try_from(a).ok())
                     {
                         if start
                             .checked_add(fd.raw.len())
@@ -2608,10 +2614,7 @@ impl EditSession {
             },
         )?;
         let written = self.append(&buf)?;
-        debug_assert_eq!(
-            written, eof,
-            "chunk blob must land at end-of-file",
-        );
+        debug_assert_eq!(written, eof, "chunk blob must land at end-of-file",);
         // Swap the data-layout message for the rebuilt one; keep every other header
         // message (datatype, dataspace, fill value, filter pipeline, attributes)
         // verbatim. A dense attribute heap, if any, is appended after the blob so
@@ -2804,10 +2807,7 @@ impl EditSession {
         // lands exactly where its embedded (stored) addresses expect once the reader
         // adds the base back.
         let written = self.append(&result.data_bytes)?;
-        debug_assert_eq!(
-            written, eof,
-            "chunk blob must land at end-of-file",
-        );
+        debug_assert_eq!(written, eof, "chunk blob must land at end-of-file",);
         Ok(build_chunked_dataset_oh(
             &fd.dt,
             &fd.ds,
@@ -3053,7 +3053,8 @@ impl EditSession {
     /// [module docs](self).
     fn chunked_storage_spans(&self, addr: usize) -> Option<Vec<(u64, u64)>> {
         // Locate the data-layout and dataspace messages in the object header.
-        let region = Self::gather_oh_messages(&self.data, addr, self.superblock.base_address).ok()?;
+        let region =
+            Self::gather_oh_messages(&self.data, addr, self.superblock.base_address).ok()?;
         let mut layout_msg: Option<(usize, usize)> = None;
         let mut dataspace_msg: Option<(usize, usize)> = None;
         let mut p = 0;

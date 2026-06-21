@@ -36,19 +36,37 @@ fn pure_userblock_file_edited_then_read_by_c_library() {
 
     // pure reader
     let f = File::open(&path).unwrap();
-    assert_eq!(f.dataset("alpha").unwrap().read_f64().unwrap(), vec![9.0, 8.0, 7.0]);
-    assert_eq!(f.dataset("added").unwrap().read_f64().unwrap(), vec![100.0, 200.0]);
-    assert_eq!(f.dataset("grp/gamma").unwrap().read_i32().unwrap(), vec![1, 2, 3]);
+    assert_eq!(
+        f.dataset("alpha").unwrap().read_f64().unwrap(),
+        vec![9.0, 8.0, 7.0]
+    );
+    assert_eq!(
+        f.dataset("added").unwrap().read_f64().unwrap(),
+        vec![100.0, 200.0]
+    );
+    assert_eq!(
+        f.dataset("grp/gamma").unwrap().read_i32().unwrap(),
+        vec![1, 2, 3]
+    );
 
     // reference C library reader — the real interop proof.
     let c = hdf5::File::open(&path).unwrap();
-    assert_eq!(c.dataset("alpha").unwrap().read_raw::<f64>().unwrap(), vec![9.0, 8.0, 7.0]);
-    assert_eq!(c.dataset("added").unwrap().read_raw::<f64>().unwrap(), vec![100.0, 200.0]);
+    assert_eq!(
+        c.dataset("alpha").unwrap().read_raw::<f64>().unwrap(),
+        vec![9.0, 8.0, 7.0]
+    );
+    assert_eq!(
+        c.dataset("added").unwrap().read_raw::<f64>().unwrap(),
+        vec![100.0, 200.0]
+    );
     assert_eq!(
         c.dataset("grp/beta").unwrap().read_raw::<i32>().unwrap(),
         vec![10, 20, 30, 40]
     );
-    assert_eq!(c.dataset("grp/gamma").unwrap().read_raw::<i32>().unwrap(), vec![1, 2, 3]);
+    assert_eq!(
+        c.dataset("grp/gamma").unwrap().read_raw::<i32>().unwrap(),
+        vec![1, 2, 3]
+    );
 }
 
 #[test]
@@ -66,7 +84,8 @@ fn real_mat_edited_then_read_by_c_library() {
 
     {
         let mut s = EditSession::open(&path).unwrap();
-        s.create_dataset("hdf5_pure_probe").with_f64_data(&[42.0, -1.0, 3.5]);
+        s.create_dataset("hdf5_pure_probe")
+            .with_f64_data(&[42.0, -1.0, 3.5]);
         s.commit().unwrap();
     }
 
@@ -75,11 +94,17 @@ fn real_mat_edited_then_read_by_c_library() {
     // relative to the 512-byte MATLAB userblock.
     let c = hdf5::File::open(&path).unwrap();
     assert_eq!(
-        c.dataset("hdf5_pure_probe").unwrap().read_raw::<f64>().unwrap(),
+        c.dataset("hdf5_pure_probe")
+            .unwrap()
+            .read_raw::<f64>()
+            .unwrap(),
         vec![42.0, -1.0, 3.5]
     );
     assert_eq!(
-        c.dataset("string_scalar").unwrap().read_raw::<u32>().unwrap(),
+        c.dataset("string_scalar")
+            .unwrap()
+            .read_raw::<u32>()
+            .unwrap(),
         before
     );
 }
@@ -126,8 +151,14 @@ fn userblock_chunked_add_and_overwrite_read_by_c_library() {
     // reference C library reader — the real interop proof.
     let c = hdf5::File::open(&path).unwrap();
     assert_eq!(c.dataset("c").unwrap().read_raw::<f64>().unwrap(), updated);
-    assert_eq!(c.dataset("added").unwrap().read_raw::<f64>().unwrap(), added);
-    assert_eq!(c.dataset("contig").unwrap().read_raw::<i32>().unwrap(), vec![1, 2, 3]);
+    assert_eq!(
+        c.dataset("added").unwrap().read_raw::<f64>().unwrap(),
+        added
+    );
+    assert_eq!(
+        c.dataset("contig").unwrap().read_raw::<i32>().unwrap(),
+        vec![1, 2, 3]
+    );
 }
 
 #[test]
@@ -162,6 +193,12 @@ fn userblock_chunked_reclaimed_space_reused_read_by_c_library() {
 
     let c = hdf5::File::open(&path).unwrap();
     assert_eq!(c.dataset("c").unwrap().read_raw::<f64>().unwrap(), updated);
-    assert_eq!(c.dataset("reuse").unwrap().read_raw::<f64>().unwrap(), reuse);
-    assert_eq!(c.dataset("keep").unwrap().read_raw::<f64>().unwrap(), vec![10.0, 20.0, 30.0]);
+    assert_eq!(
+        c.dataset("reuse").unwrap().read_raw::<f64>().unwrap(),
+        reuse
+    );
+    assert_eq!(
+        c.dataset("keep").unwrap().read_raw::<f64>().unwrap(),
+        vec![10.0, 20.0, 30.0]
+    );
 }
