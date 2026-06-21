@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `EditSession` now opens and edits files that carry a **userblock** (non-zero base address), such as MATLAB v7.3 `.mat` files: it reads and writes addresses relative to the base and preserves the userblock bytes verbatim. This first slice covers same-length value overwrites plus additions of contiguous datasets, groups, and compact attributes; chunked additions/overwrites, deletions, copies, and relocating overwrites on a userblock file are still refused ([#104](https://github.com/stephenberry/hdf5-pure/issues/104)).
+
 ### Fixed
 
 - Reading a **chunked dataset from a file with a userblock** (non-zero base address) now works: the reader applied the base address only to contiguous data, so a chunked dataset's index and chunk data were read at the wrong offset (e.g. "corrupt deflate stream"). Base handling is now applied uniformly to every layout, and repack reads such chunks correctly too ([#104](https://github.com/stephenberry/hdf5-pure/issues/104)).

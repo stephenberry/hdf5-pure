@@ -61,8 +61,13 @@
 //! refuses with [`Error::EditUnsupported`] any case it cannot reproduce
 //! faithfully. Requirements:
 //!
-//! - The file uses 8-byte offsets/lengths and has **no** userblock (base
-//!   address 0). Any superblock version (0–3) is accepted: a version 0/1
+//! - The file uses 8-byte offsets/lengths. A **userblock** (non-zero base
+//!   address, as every MATLAB v7.3 `.mat` file has) is supported for a first
+//!   slice of edits: same-length value overwrites and additions of contiguous
+//!   datasets, groups, and compact attributes, with the userblock bytes
+//!   preserved verbatim. On a userblock file, chunked/filtered additions,
+//!   chunked or relocating overwrites, deletions, copies, and free-space reuse
+//!   are still refused. Any superblock version (0–3) is accepted: a version 0/1
 //!   (symbol-table) file is edited by converting each group on the edited path
 //!   to the latest format and repointing the superblock's root symbol-table
 //!   entry.
@@ -214,8 +219,11 @@ pub struct EditSession {
     data: Vec<u8>,
     /// Absolute offset of the superblock signature in the file.
     sb_sig_off: usize,
-    /// Parsed superblock. Addresses are as stored on disk (relative to the base
-    /// address, which this editor requires to be 0).
+    /// Parsed superblock. On-disk addresses are stored relative to `base_address`;
+    /// the in-memory `root_group_address` is normalized to an absolute file offset
+    /// on open and converted back to a base-relative address when serialized on
+    /// commit. `base_address` equals the superblock's file location (`sb_sig_off`):
+    /// 0 for a plain file, the userblock size for one with a userblock.
     superblock: Superblock,
     /// Datasets staged by `create_dataset`, as (parent group path, builder).
     pending_datasets: Vec<(PathKey, DatasetBuilder)>,
@@ -301,7 +309,7 @@ impl EditSession {
         handle.read_to_end(&mut data).map_err(Error::Io)?;
 
         let sb_sig_off = signature::find_signature(&data)?;
-        let superblock = Superblock::parse(&data, sb_sig_off)?;
+        let mut superblock = Superblock::parse(&data, sb_sig_off)?;
 
         if superblock.version > 3 {
             return Err(Error::EditUnsupported("unsupported superblock version"));
@@ -311,11 +319,25 @@ impl EditSession {
                 "only 8-byte offsets and lengths are supported for in-place editing",
             ));
         }
-        if superblock.base_address != 0 {
+        // A userblock shifts the whole HDF5 image forward by `base_address`: the
+        // superblock sits at the base address and every stored address is relative
+        // to it (the end-of-file address is the sole absolute field). The editor
+        // supports this by reading at `stored + base` and writing back
+        // `file_offset - base`. Only the canonical layout — superblock located
+        // exactly at the base address (e.g. a MATLAB v7.3 `.mat` file's 512-byte
+        // userblock) — is accepted; a base address that disagrees with the
+        // superblock's location is a relocated or malformed file we will not rewrite.
+        if superblock.base_address != sb_sig_off as u64 {
             return Err(Error::EditUnsupported(
-                "files with a userblock (non-zero base address) are not editable in place yet",
+                "a file whose superblock is not located at its base address is not editable in place",
             ));
         }
+        // Normalize the root group address to an absolute file offset, exactly as
+        // the reader does (`reader::parse_superblock`), so `resolve_path_any` and
+        // the link-graph walk index `self.data` correctly. It is converted back to a
+        // stored (base-relative) address only when the superblock is serialized on
+        // commit.
+        superblock.root_group_address += superblock.base_address;
 
         let mut session = Self {
             handle,
@@ -348,6 +370,15 @@ impl EditSession {
     fn load_persisted_free_space(&mut self) {
         if self.superblock.version < 2 {
             return; // no superblock extension exists before v2
+        }
+        // Free-space reuse and persistence are not yet base-address aware: the
+        // persisted section addresses (and the extension/manager block walk below)
+        // are read as absolute, so on a userblock file they would seed `self.free`
+        // with wrong regions that `alloc_or_append` could later hand out into live
+        // data. Leave persistence off for such a file — the on-disk managers stay
+        // untouched and valid, this session simply appends rather than reusing.
+        if self.superblock.base_address != 0 {
+            return;
         }
         let Some(ext_rel) = self.superblock.superblock_extension_address else {
             return;
@@ -700,6 +731,30 @@ impl EditSession {
             return Ok(());
         }
 
+        // On a file with a userblock, stored addresses are relative to this base
+        // and the editor converts at every disk boundary (read `stored + base`,
+        // write `file_offset - base`). This first slice of userblock support covers
+        // same-length and relocating value overwrites of contiguous datasets,
+        // additions of contiguous datasets, group creation, and compact group
+        // attributes. Operations whose address rewriting is not yet base-aware are
+        // refused up front (a clean refusal, never a partial/corrupting edit):
+        // object copies, deletions, relocating overwrites, and chunked/filtered
+        // additions; chunked overwrites are refused in `prepare_write`.
+        let base = self.superblock.base_address;
+        if base != 0 {
+            if !self.pending_copies.is_empty() || !self.pending_cross_copies.is_empty() {
+                return Err(Error::EditUnsupported(
+                    "copying objects within or into a file with a userblock is not supported \
+                     in place yet",
+                ));
+            }
+            if !self.pending_deletes.is_empty() {
+                return Err(Error::EditUnsupported(
+                    "deleting objects from a file with a userblock is not supported in place yet",
+                ));
+            }
+        }
+
         // --- Preflight value overwrites (`write_dataset`) before any write, under
         // the same all-or-nothing contract as additions. Each is resolved,
         // validated (datatype and shape must match the on-disk dataset exactly),
@@ -738,10 +793,18 @@ impl EditSession {
             let addr = usize::try_from(addr)
                 .map_err(|_| Error::EditUnsupported("dataset address exceeds this platform"))?;
             let fd = flatten_dataset(db)?;
-            match Self::prepare_write(&self.data, addr, &fd)? {
+            match Self::prepare_write(&self.data, addr, &fd, base)? {
                 WritePlan::InPlace { data_addr, raw } => inplace_writes.push((data_addr, raw)),
                 WritePlan::InPlaceChunks { writes } => inplace_writes.extend(writes),
                 WritePlan::Moving(mw) => {
+                    // A relocating overwrite rewrites the dataset's header and data
+                    // address; that path is not yet base-aware on a userblock file.
+                    if base != 0 {
+                        return Err(Error::EditUnsupported(
+                            "overwriting a dataset that resizes or relocates its header is not \
+                             supported on a file with a userblock yet",
+                        ));
+                    }
                     // A relocating overwrite is safe only when this is the
                     // dataset's sole hard link. Compute the link graph once.
                     let counts = incoming_links
@@ -1045,12 +1108,23 @@ impl EditSession {
         // root is repointed — still are.
         deleted_addrs.sort_unstable();
         deleted_addrs.dedup();
-        if let Some(incoming) = self.count_incoming_hard_links() {
-            for &a in &deleted_addrs {
-                self.collect_free_spans(a, 0, &incoming, &mut to_free);
+        if !deleted_addrs.is_empty() {
+            if let Some(incoming) = self.count_incoming_hard_links() {
+                for &a in &deleted_addrs {
+                    self.collect_free_spans(a, 0, &incoming, &mut to_free);
+                }
             }
         }
+        // Reclamation of vacated bytes is gated to base-0 files in this slice: the
+        // span enumerators (`oh_chunk_spans`/`collect_free_spans`/`chunked_storage_spans`)
+        // index the file with base-relative addresses and are not yet base-aware, so
+        // on a userblock file the superseded headers are left as harmless dead space
+        // rather than risk freeing a live region. (Deletes and relocating overwrites
+        // — the other reclamation sources — are refused on userblock files above.)
         for &a in &superseded_addrs {
+            if base != 0 {
+                break;
+            }
             if let Ok(spans) = self.oh_chunk_spans(a) {
                 to_free.extend(spans);
             }
@@ -1132,42 +1206,56 @@ impl EditSession {
             }
 
             // Write each staged source subtree and link its root into this group.
+            // Link targets are stored relative to the base address (copies are
+            // refused on userblock files, so `base` is 0 here, but keep the
+            // conversion explicit and uniform).
             for (leaf, tree) in copies {
                 let root = self.write_copy_subtree(&tree)?;
-                region.extend_from_slice(&encode_link_message(&leaf, root));
+                region.extend_from_slice(&encode_link_message(&leaf, root - base));
             }
 
-            // Datasets directly under this group.
+            // Datasets directly under this group. Appended addresses are absolute
+            // file offsets; the contiguous data-layout address and the parent link
+            // target are stored relative to the base address (`- base`).
             for fd in flat.remove(key).into_iter().flatten() {
                 let oh = if fd.chunk_options.is_chunked() || fd.maxshape.is_some() {
+                    if base != 0 {
+                        return Err(Error::EditUnsupported(
+                            "adding a chunked, filtered, or resizable dataset to a file with a \
+                             userblock is not supported in place yet",
+                        ));
+                    }
                     self.build_chunked_dataset(&fd)?
                 } else {
                     let data_addr = self.alloc_or_append(&fd.raw)?;
                     build_dataset_oh(
                         &fd.dt,
                         &fd.ds,
-                        data_addr,
+                        data_addr - base,
                         fd.raw.len() as u64,
                         &fd.attrs,
                         None,
                     )
                 };
                 let oh_addr = self.alloc_or_append(&oh)?;
-                region.extend_from_slice(&encode_link_message(&fd.name, oh_addr));
+                region.extend_from_slice(&encode_link_message(&fd.name, oh_addr - base));
             }
 
             // Relocating value overwrites under this group: write the new data and
             // rewritten header, then patch this group's existing link to it.
+            // (Relocating overwrites are refused on userblock files, so `base` is 0
+            // here.)
             for (leaf, mw) in &writes {
                 let new_oh = self.write_moving(mw)?;
-                patch_link_target(&mut region, leaf, new_oh)?;
+                patch_link_target(&mut region, leaf, new_oh - base)?;
             }
 
             // Wire links to dirty child groups (new → add a link; existing →
-            // patch the existing link to the child's new address).
+            // patch the existing link to the child's new address). Link targets are
+            // stored relative to the base address.
             for child in children.get(key).into_iter().flatten() {
                 let child_name = child.last().unwrap();
-                let child_addr = new_addr[child];
+                let child_addr = new_addr[child] - base;
                 if nodes[child].is_new {
                     region.extend_from_slice(&encode_link_message(child_name, child_addr));
                 } else {
@@ -1223,12 +1311,15 @@ impl EditSession {
         let new_eof = trunc_to.unwrap_or(cur_eof);
 
         self.handle.sync_all().map_err(Error::Io)?;
+        // The root address is stored relative to the base address; the end-of-file
+        // address is absolute. After writing the relative root to disk, keep the
+        // in-memory `root_group_address` absolute (the open-time convention).
         if self.superblock.version >= 2 {
             // Build the new superblock off a clone and adopt it only once the
             // write succeeds, so a failed write does not desync the in-memory
             // state. The v2/v3 superblock carries its own checksum.
             let mut new_sb = self.superblock.clone();
-            new_sb.root_group_address = new_root;
+            new_sb.root_group_address = new_root - base;
             new_sb.eof_address = new_eof;
             // Clear any write/SWMR consistency flag rather than re-emitting one
             // the source file carried (e.g. left set by a crashed SWMR writer):
@@ -1238,9 +1329,10 @@ impl EditSession {
             let sb_bytes = new_sb.serialize();
             self.write_at(self.sb_sig_off, &sb_bytes)?;
             self.handle.sync_all().map_err(Error::Io)?;
+            new_sb.root_group_address = new_root;
             self.superblock = new_sb;
         } else {
-            self.repoint_v0v1_root(new_root, new_eof)?;
+            self.repoint_v0v1_root(new_root - base, new_eof)?;
             self.handle.sync_all().map_err(Error::Io)?;
             self.superblock.root_group_address = new_root;
             self.superblock.eof_address = new_eof;
@@ -1423,7 +1515,7 @@ impl EditSession {
         ext_addr: usize,
         info: &FileSpaceInfo,
     ) -> Result<Vec<u8>, Error> {
-        let region = Self::gather_oh_messages(&self.data, ext_addr)?;
+        let region = Self::gather_oh_messages(&self.data, ext_addr, self.superblock.base_address)?;
         let new_body = info.serialize();
         // The message body is the fixed-size File Space Info record (≤ 125 bytes),
         // so it always fits the u16 size field; `try_from` keeps this off the
@@ -1531,7 +1623,7 @@ impl EditSession {
     /// editor rebuilds headers. The chunk-0 prefix is validated by
     /// [`oh_region`]; each continuation block must be a well-formed `OCHK` block
     /// within the file.
-    fn gather_oh_messages(d: &[u8], addr: usize) -> Result<Vec<u8>, Error> {
+    fn gather_oh_messages(d: &[u8], addr: usize, base: u64) -> Result<Vec<u8>, Error> {
         let (rs, re) = Self::oh_region(d, addr)?;
         let mut out = Vec::new();
         // Worklist of (message-region start, end) per chunk, chunk 0 first.
@@ -1555,6 +1647,11 @@ impl EditSession {
                     }
                     let off = u64::from_le_bytes(d[body..body + 8].try_into().unwrap());
                     let len = u64::from_le_bytes(d[body + 8..body + 16].try_into().unwrap());
+                    // The continuation block address is stored relative to the base
+                    // address; convert to an absolute file offset to index `d`.
+                    let off = off.checked_add(base).ok_or(Error::EditUnsupported(
+                        "continuation address overflow",
+                    ))?;
                     let off = usize::try_from(off).map_err(|_| {
                         Error::EditUnsupported("continuation address exceeds this platform")
                     })?;
@@ -1607,8 +1704,9 @@ impl EditSession {
         let mut region = fresh_group_region();
         let mut link_names = Vec::with_capacity(entries.len());
         for e in &entries {
-            // Group-entry addresses are stored relative to the base address (0
-            // here), matching how link targets are stored.
+            // Group-entry addresses are already stored relative to the base address,
+            // matching how `encode_link_message` stores link targets — so they are
+            // re-emitted verbatim, no base conversion needed.
             region.extend_from_slice(&encode_link_message(&e.name, e.object_header_address));
             link_names.push(e.name.clone());
         }
@@ -1653,7 +1751,7 @@ impl EditSession {
         if self.data.len() < addr + 4 || self.data[addr..addr + 4] != *b"OHDR" {
             return self.reconstruct_v1_group(addr);
         }
-        let mut region = Self::gather_oh_messages(&self.data, addr)?;
+        let mut region = Self::gather_oh_messages(&self.data, addr, self.superblock.base_address)?;
         let mut p = 0;
         let mut has_link_info = false;
         let mut link_names = Vec::new();
@@ -1718,7 +1816,7 @@ impl EditSession {
     /// this engine cannot enumerate — a version-2 B-tree — is refused too). A
     /// datatype or shape that differs from the on-disk dataset's is likewise
     /// refused — this is a value overwrite, not a reshape or retype.
-    fn prepare_write(d: &[u8], addr: usize, fd: &FlatDataset) -> Result<WritePlan, Error> {
+    fn prepare_write(d: &[u8], addr: usize, fd: &FlatDataset, base: u64) -> Result<WritePlan, Error> {
         // A value overwrite never introduces chunking, filters, or an extensible
         // shape: those would change the storage layout, not just the bytes.
         if fd.chunk_options.is_chunked() || fd.maxshape.is_some() {
@@ -1740,7 +1838,7 @@ impl EditSession {
             ));
         }
 
-        let region = Self::gather_oh_messages(d, addr)?;
+        let region = Self::gather_oh_messages(d, addr, base)?;
 
         // Locate the datatype, dataspace, and data-layout messages, and detect a
         // filter pipeline (filtered storage is always chunked, never contiguous).
@@ -1832,9 +1930,13 @@ impl EditSession {
                 let data_size = u64::from_le_bytes(region[lb + 10..lb + 18].try_into().unwrap());
 
                 // Same length and a defined, in-bounds data block: overwrite the
-                // bytes straight in place. No header rewrite, no relink.
+                // bytes straight in place. No header rewrite, no relink. The stored
+                // address is base-relative; the in-place write targets the absolute
+                // file offset `data_addr + base`.
                 if data_addr != UNDEF && data_size == fd.raw.len() as u64 {
-                    if let Ok(start) = usize::try_from(data_addr) {
+                    if let Some(start) =
+                        data_addr.checked_add(base).and_then(|a| usize::try_from(a).ok())
+                    {
                         if start
                             .checked_add(fd.raw.len())
                             .is_some_and(|e| e <= d.len())
@@ -1848,9 +1950,11 @@ impl EditSession {
                 }
 
                 // Length differs or the block was undefined/out of bounds: the new
-                // data goes elsewhere and the old extent (if any) is freed.
+                // data goes elsewhere and the old extent (if any) is freed. The
+                // freed extent is recorded as an absolute file offset (`+ base`) to
+                // match the session free list.
                 let old_extent = if data_addr != UNDEF && data_size > 0 {
-                    Some((data_addr, data_size))
+                    Some((data_addr + base, data_size))
                 } else {
                     None
                 };
@@ -1868,6 +1972,15 @@ impl EditSession {
             // builder carries none — chunked/filtered/extensible builders are
             // refused at the top of this function as "not a value overwrite").
             2 => {
+                // Chunked overwrite (in-place or relocating) walks and rewrites
+                // chunk-index and chunk addresses, which are not yet base-aware on a
+                // userblock file; refuse rather than mis-address the chunk storage.
+                if base != 0 {
+                    return Err(Error::EditUnsupported(
+                        "overwriting a chunked dataset on a file with a userblock is not \
+                         supported in place yet",
+                    ));
+                }
                 let dl =
                     DataLayout::parse(&region[lb..le], OFFSET_SIZE, LENGTH_SIZE).map_err(|_| {
                         Error::EditUnsupported("dataset header data layout could not be parsed")
@@ -1971,8 +2084,8 @@ impl EditSession {
     /// the emitter can build; an oversized set is refused. Rejects multi-chunk
     /// headers, dense or soft/external links, chunked/old-version data layouts, and
     /// headers that are neither a dataset nor a group.
-    fn read_object(d: &[u8], addr: usize) -> Result<ObjModel, Error> {
-        let region = Self::gather_oh_messages(d, addr)?;
+    fn read_object(d: &[u8], addr: usize, base: u64) -> Result<ObjModel, Error> {
+        let region = Self::gather_oh_messages(d, addr, base)?;
 
         // First pass: detect whether attributes are stored densely (a defined
         // fractal-heap address in the Attribute Info message). A dense object is
@@ -2014,7 +2127,7 @@ impl EditSession {
         // Attribute messages, so it returns exactly the heap-resident set.
         let dense_attrs = if dense {
             let header =
-                ObjectHeader::parse_with_base(d, addr, OFFSET_SIZE, LENGTH_SIZE, 0).map_err(|_| {
+                ObjectHeader::parse_with_base(d, addr, OFFSET_SIZE, LENGTH_SIZE, base).map_err(|_| {
                     Error::EditUnsupported(
                         "a source object header with dense attributes could not be parsed for copying",
                     )
@@ -2198,7 +2311,10 @@ impl EditSession {
                 "copy source nests too deeply (possible hard-link cycle)",
             ));
         }
-        match Self::read_object(d, addr)? {
+        // `read_copy_subtree` only runs on base-0 address spaces: a cross-file
+        // source is gated to base 0, and an in-file copy is refused on a userblock
+        // file (see `commit`), so the source addresses here are already absolute.
+        match Self::read_object(d, addr, 0)? {
             ObjModel::DatasetVerbatim {
                 region,
                 dense_attrs,
@@ -2834,7 +2950,7 @@ impl EditSession {
             Ok(s) => s,
             Err(_) => return,
         };
-        match Self::read_object(&self.data, addr) {
+        match Self::read_object(&self.data, addr, self.superblock.base_address) {
             Ok(ObjModel::DatasetVerbatim { .. }) => out.extend(spans),
             Ok(ObjModel::DatasetContiguous {
                 data_addr,
@@ -2906,7 +3022,7 @@ impl EditSession {
     /// [module docs](self).
     fn chunked_storage_spans(&self, addr: usize) -> Option<Vec<(u64, u64)>> {
         // Locate the data-layout and dataspace messages in the object header.
-        let region = Self::gather_oh_messages(&self.data, addr).ok()?;
+        let region = Self::gather_oh_messages(&self.data, addr, self.superblock.base_address).ok()?;
         let mut layout_msg: Option<(usize, usize)> = None;
         let mut dataspace_msg: Option<(usize, usize)> = None;
         let mut p = 0;
