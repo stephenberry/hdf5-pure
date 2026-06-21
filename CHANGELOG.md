@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-06-20
+
+Broad MATLAB v7.3 read support for MCOS opaque types — cell arrays, the modern `string` class, `datetime` / `duration` / `categorical`, `table` / `timetable`, enumeration arrays, and `containers.Map`, including objects nested inside structs, cells, and table columns, all resolved through the file's `#subsystem#`/MCOS store. Also adds in-place overwrite and copy of chunked & filtered datasets in `EditSession`, a faster MAT write path, and two compound-datatype read fixes. **Breaking:** `MatError` is now `#[non_exhaustive]`; minor bump.
+
 ### Added
 
 - `EditSession::write_dataset` now overwrites **chunked and filtered** datasets in place: unfiltered chunks (and filtered chunks that re-encode to the same size or smaller) are written into their existing slots — a shrinking filtered overwrite rebuilds the fixed-/extensible-array index in place to record the new sizes — while one whose re-encoded chunks no longer fit is rebuilt and relocated with the old storage reclaimed. A version-2 B-tree chunk index is still refused ([#101](https://github.com/stephenberry/hdf5-pure/issues/101)).
@@ -239,7 +243,8 @@ Internal robustness and tests ([#26](https://github.com/stephenberry/hdf5-pure/i
 - The MAT deserializer flattens 1×N and N×1 values to a 1-D sequence in `deserialize_any` (matching `deserialize_seq`).
 - Numeric/complex readers preserve 1×N / N×1 shape at the value layer; any flattening happens at the serde level.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.14.0...v0.15.0
