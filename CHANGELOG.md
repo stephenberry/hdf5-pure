@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `EditSession` now opens and edits files that carry a **userblock** (non-zero base address), such as MATLAB v7.3 `.mat` files: it reads and writes addresses relative to the base and preserves the userblock bytes verbatim. Supported edits include contiguous value overwrites, additions of contiguous and chunked/filtered datasets, in-place and relocating overwrites of chunked datasets (with the old chunk storage reclaimed), group creation, and compact attributes; deletions, copies, and resizing overwrites of contiguous datasets on a userblock file are still refused ([#104](https://github.com/stephenberry/hdf5-pure/issues/104)).
+
+### Fixed
+
+- Reading and repacking a **chunked dataset from a file with a userblock** (non-zero base address) now works; previously the base address was applied only to contiguous data, so chunked reads from such a file failed ([#104](https://github.com/stephenberry/hdf5-pure/issues/104)).
+
 ## [0.18.0] - 2026-06-20
 
 Broad MATLAB v7.3 read support for MCOS opaque types — cell arrays, the modern `string` class, `datetime` / `duration` / `categorical`, `table` / `timetable`, enumeration arrays, and `containers.Map`, including objects nested inside structs, cells, and table columns, all resolved through the file's `#subsystem#`/MCOS store. Also adds in-place overwrite and copy of chunked & filtered datasets in `EditSession`, a faster MAT write path, and two compound-datatype read fixes. **Breaking:** `MatError` is now `#[non_exhaustive]`; minor bump.

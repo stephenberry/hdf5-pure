@@ -1,0 +1,238 @@
+// Crosschecks link the reference HDF5 C library (the `hdf5-metno` dev-dependency),
+// which is gated to 64-bit-pointer targets; skip them on 32-bit so the pure-Rust
+// suite can run under `cross test --target i686-...`.
+#![cfg(not(target_pointer_width = "32"))]
+//! Cross-validation for editing files with a userblock (the userblock slice of
+//! issue #104) against the reference C library. A single off-by-base address in
+//! an edited file makes the C library error or read garbage, so reading the
+//! result back through `hdf5` is the external tripwire that the editor stored
+//! every root/link/layout address relative to the base address correctly.
+
+use hdf5_pure::{EditSession, File, FileBuilder};
+use tempfile::tempdir;
+
+const UB: u64 = 512;
+
+#[test]
+fn pure_userblock_file_edited_then_read_by_c_library() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("pure_ub.h5");
+
+    let mut b = FileBuilder::new();
+    b.with_userblock(UB);
+    b.create_dataset("alpha").with_f64_data(&[1.0, 2.0, 3.0]);
+    let mut g = b.create_group("grp");
+    g.create_dataset("beta").with_i32_data(&[10, 20, 30, 40]);
+    b.add_group(g.finish());
+    std::fs::write(&path, b.finish().unwrap()).unwrap();
+
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        s.write_dataset("alpha").with_f64_data(&[9.0, 8.0, 7.0]);
+        s.create_dataset("added").with_f64_data(&[100.0, 200.0]);
+        s.create_dataset("grp/gamma").with_i32_data(&[1, 2, 3]);
+        s.commit().unwrap();
+    }
+
+    // pure reader
+    let f = File::open(&path).unwrap();
+    assert_eq!(
+        f.dataset("alpha").unwrap().read_f64().unwrap(),
+        vec![9.0, 8.0, 7.0]
+    );
+    assert_eq!(
+        f.dataset("added").unwrap().read_f64().unwrap(),
+        vec![100.0, 200.0]
+    );
+    assert_eq!(
+        f.dataset("grp/gamma").unwrap().read_i32().unwrap(),
+        vec![1, 2, 3]
+    );
+
+    // reference C library reader — the real interop proof.
+    let c = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        c.dataset("alpha").unwrap().read_raw::<f64>().unwrap(),
+        vec![9.0, 8.0, 7.0]
+    );
+    assert_eq!(
+        c.dataset("added").unwrap().read_raw::<f64>().unwrap(),
+        vec![100.0, 200.0]
+    );
+    assert_eq!(
+        c.dataset("grp/beta").unwrap().read_raw::<i32>().unwrap(),
+        vec![10, 20, 30, 40]
+    );
+    assert_eq!(
+        c.dataset("grp/gamma").unwrap().read_raw::<i32>().unwrap(),
+        vec![1, 2, 3]
+    );
+}
+
+#[test]
+fn real_mat_edited_then_read_by_c_library() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("real.mat");
+    std::fs::copy("tests/fixtures/mat_real/test_string_v73.mat", &path).unwrap();
+
+    let before = File::open(&path)
+        .unwrap()
+        .dataset("string_scalar")
+        .unwrap()
+        .read_u32()
+        .unwrap();
+
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        s.create_dataset("hdf5_pure_probe")
+            .with_f64_data(&[42.0, -1.0, 3.5]);
+        s.commit().unwrap();
+    }
+
+    // The C library opens the edited real .mat file and reads both the added
+    // dataset and an untouched original — proving every address survived the edit
+    // relative to the 512-byte MATLAB userblock.
+    let c = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        c.dataset("hdf5_pure_probe")
+            .unwrap()
+            .read_raw::<f64>()
+            .unwrap(),
+        vec![42.0, -1.0, 3.5]
+    );
+    assert_eq!(
+        c.dataset("string_scalar")
+            .unwrap()
+            .read_raw::<u32>()
+            .unwrap(),
+        before
+    );
+}
+
+#[test]
+fn userblock_chunked_add_and_overwrite_read_by_c_library() {
+    // Adding a chunked/filtered dataset and overwriting an existing one on a
+    // userblock file both write chunk-index and chunk-data addresses relative to
+    // the base. The C library reading the result back is the external proof that
+    // every such address was stored correctly.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("pure_ub_chunk.h5");
+
+    let seed = vec![2.0f64; 300];
+    let mut b = FileBuilder::new();
+    b.with_userblock(UB);
+    b.create_dataset("contig").with_i32_data(&[1, 2, 3]);
+    b.create_dataset("c")
+        .with_f64_data(&seed)
+        .with_shape(&[300])
+        .with_chunks(&[30])
+        .with_deflate(6);
+    std::fs::write(&path, b.finish().unwrap()).unwrap();
+
+    let added: Vec<f64> = (0..400).map(|i| (i % 11) as f64 * 0.5).collect();
+    let updated: Vec<f64> = (0..300).map(|i| (i as f64).cos()).collect();
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        // Add a new chunked dataset and relocate-overwrite the existing one.
+        s.create_dataset("added")
+            .with_f64_data(&added)
+            .with_shape(&[400])
+            .with_chunks(&[50])
+            .with_deflate(6);
+        s.write_dataset("c").with_f64_data(&updated);
+        s.commit().unwrap();
+    }
+
+    // pure reader
+    let f = File::open(&path).unwrap();
+    assert_eq!(f.dataset("c").unwrap().read_f64().unwrap(), updated);
+    assert_eq!(f.dataset("added").unwrap().read_f64().unwrap(), added);
+
+    // reference C library reader — the real interop proof.
+    let c = hdf5::File::open(&path).unwrap();
+    assert_eq!(c.dataset("c").unwrap().read_raw::<f64>().unwrap(), updated);
+    assert_eq!(
+        c.dataset("added").unwrap().read_raw::<f64>().unwrap(),
+        added
+    );
+    assert_eq!(
+        c.dataset("contig").unwrap().read_raw::<i32>().unwrap(),
+        vec![1, 2, 3]
+    );
+}
+
+#[test]
+fn userblock_chunked_reclaimed_space_reused_read_by_c_library() {
+    // A relocating chunked overwrite frees the old chunk storage; a later commit
+    // in the same session reuses it. The C library reading every dataset back
+    // confirms the reclaim freed only dead bytes (a base-address mistake in the
+    // span enumerators would have corrupted a live region the reuse then wrote).
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("pure_ub_reclaim.h5");
+
+    let seed = vec![5.0f64; 600];
+    let mut b = FileBuilder::new();
+    b.with_userblock(UB);
+    b.create_dataset("keep").with_f64_data(&[10.0, 20.0, 30.0]);
+    b.create_dataset("c")
+        .with_f64_data(&seed)
+        .with_shape(&[600])
+        .with_chunks(&[40])
+        .with_deflate(6);
+    std::fs::write(&path, b.finish().unwrap()).unwrap();
+
+    let updated: Vec<f64> = (0..600).map(|i| (i as f64) * 0.01).collect();
+    let reuse: Vec<f64> = (0..80).map(|i| (i as f64) + 0.5).collect();
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        s.write_dataset("c").with_f64_data(&updated);
+        s.commit().unwrap();
+        s.create_dataset("reuse").with_f64_data(&reuse);
+        s.commit().unwrap();
+    }
+
+    let c = hdf5::File::open(&path).unwrap();
+    assert_eq!(c.dataset("c").unwrap().read_raw::<f64>().unwrap(), updated);
+    assert_eq!(
+        c.dataset("reuse").unwrap().read_raw::<f64>().unwrap(),
+        reuse
+    );
+    assert_eq!(
+        c.dataset("keep").unwrap().read_raw::<f64>().unwrap(),
+        vec![10.0, 20.0, 30.0]
+    );
+}
+
+#[test]
+fn userblock_extensible_array_add_read_by_c_library() {
+    // An unlimited-maxshape dataset uses the extensible-array chunk index, which
+    // embeds many internal addresses built off the planner base. Adding one to a
+    // userblock file and reading it back through the C library confirms every EA
+    // address was stored relative to the base correctly.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("pure_ub_ea.h5");
+
+    let mut b = FileBuilder::new();
+    b.with_userblock(UB);
+    b.create_dataset("keep").with_i32_data(&[7, 8, 9]);
+    std::fs::write(&path, b.finish().unwrap()).unwrap();
+
+    let added: Vec<f64> = (0..500).map(|i| (i as f64).sin() * 1e3).collect();
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        s.create_dataset("ea")
+            .with_f64_data(&added)
+            .with_shape(&[500])
+            .with_chunks(&[40])
+            .with_maxshape(&[u64::MAX])
+            .with_deflate(6);
+        s.commit().unwrap();
+    }
+
+    let c = hdf5::File::open(&path).unwrap();
+    assert_eq!(c.dataset("ea").unwrap().read_raw::<f64>().unwrap(), added);
+    assert_eq!(
+        c.dataset("keep").unwrap().read_raw::<i32>().unwrap(),
+        vec![7, 8, 9]
+    );
+}

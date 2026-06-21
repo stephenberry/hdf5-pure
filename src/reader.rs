@@ -69,6 +69,50 @@ impl FileSource for SourceView<'_> {
     }
 }
 
+/// A `FileSource` view shifted forward by a base address: every read at a
+/// base-relative `offset` is served from `inner` at `offset + base`. Used by the
+/// dataset-payload read path on a file with a userblock, where the data-layout's
+/// on-disk addresses (contiguous data, chunk index, and chunk data) are stored
+/// relative to the base address — presenting the reader this shifted view lets
+/// those relative addresses index it directly, exactly as the in-memory path
+/// slices the buffer at `base`. `len`/`read_at` shift by the base; `read_metadata_at`
+/// forwards to the inner source (at the absolute offset) so its metadata cache is
+/// shared, while payload reads keep the default uncached `read_exact_at`.
+struct BaseOffsetSource<'a, S: FileSource + ?Sized> {
+    inner: &'a S,
+    base: u64,
+}
+
+impl<S: FileSource + ?Sized> FileSource for BaseOffsetSource<'_, S> {
+    fn len(&self) -> u64 {
+        self.inner.len().saturating_sub(self.base)
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
+        let abs = offset
+            .checked_add(self.base)
+            .ok_or(FormatError::OffsetOverflow {
+                offset,
+                length: buf.len() as u64,
+            })?;
+        self.inner.read_at(abs, buf)
+    }
+
+    /// Forward metadata reads to the inner source at the absolute offset so the
+    /// inner source's metadata cache is shared (chunk-index walks on a streaming
+    /// userblock file otherwise re-read every node). Payload reads keep the default
+    /// `read_exact_at`, which stays uncached so user data does not evict metadata.
+    fn read_metadata_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
+        let abs = offset
+            .checked_add(self.base)
+            .ok_or(FormatError::OffsetOverflow {
+                offset,
+                length: len as u64,
+            })?;
+        self.inner.read_metadata_at(abs, len)
+    }
+}
+
 /// File-access options applied when opening an HDF5 file.
 ///
 /// This is the `hdf5-pure` analogue of the HDF5 file access property list
@@ -755,11 +799,28 @@ impl File {
         cache: &ChunkCache,
     ) -> Result<Vec<u8>, FormatError> {
         let (os, ls) = (self.offset_size(), self.length_size());
+        // Every on-disk address in `dl` — the contiguous data address, the chunk
+        // index root, and (followed deeper in the chunked reader) every B-tree /
+        // fixed-array / extensible-array node and chunk-data address — is stored
+        // relative to the base address. Present the payload reader a base-relative
+        // view of the file so all of them index it directly: slice the in-memory
+        // buffer at `base`, or wrap the streaming source to add `base` to each
+        // read. For a plain file (`base == 0`) this is the identity.
+        let base = self.addr_offset;
         match &self.backend {
             Backend::InMemory(v) => {
-                data_read::read_raw_data_cached(v, dl, ds, dt, pipeline, os, ls, cache)
+                let frame = if base == 0 {
+                    v.as_slice()
+                } else {
+                    let start = base.to_usize()?;
+                    v.get(start..).ok_or(FormatError::UnexpectedEof {
+                        expected: start,
+                        available: v.len(),
+                    })?
+                };
+                data_read::read_raw_data_cached(frame, dl, ds, dt, pipeline, os, ls, cache)
             }
-            Backend::Streaming(s) => data_read::read_raw_data_cached_from_source(
+            Backend::Streaming(s) if base == 0 => data_read::read_raw_data_cached_from_source(
                 s.as_ref(),
                 dl,
                 ds,
@@ -769,6 +830,15 @@ impl File {
                 ls,
                 cache,
             ),
+            Backend::Streaming(s) => {
+                let framed = BaseOffsetSource {
+                    inner: s.as_ref(),
+                    base,
+                };
+                data_read::read_raw_data_cached_from_source(
+                    &framed, dl, ds, dt, pipeline, os, ls, cache,
+                )
+            }
         }
     }
 }
@@ -1332,8 +1402,34 @@ impl<'f> Dataset<'f> {
         };
         let dataspace = self.dataspace()?;
         let elem_size = self.datatype()?.type_size() as usize;
-        Ok(crate::chunked_read::collect_chunks_for_layout_from_source(
-            &self.file.source(),
+        let base = self.file.addr_offset;
+        let source = self.file.source();
+        // The chunk index — its root at `addr` and every internal node — stores
+        // addresses relative to the base address. Walk it through a base-relative
+        // view so those resolve, then shift each returned chunk address back to an
+        // absolute file offset, since callers (repack) read the chunk bytes from
+        // the full file source.
+        if base == 0 {
+            return Ok(crate::chunked_read::collect_chunks_for_layout_from_source(
+                &source,
+                version,
+                chunk_index_type,
+                addr,
+                single_chunk_filtered_size,
+                single_chunk_filter_mask,
+                &chunk_dimensions,
+                &dataspace,
+                elem_size,
+                self.file.offset_size(),
+                self.file.length_size(),
+            )?);
+        }
+        let framed = BaseOffsetSource {
+            inner: &source,
+            base,
+        };
+        let mut chunks = crate::chunked_read::collect_chunks_for_layout_from_source(
+            &framed,
             version,
             chunk_index_type,
             addr,
@@ -1344,7 +1440,17 @@ impl<'f> Dataset<'f> {
             elem_size,
             self.file.offset_size(),
             self.file.length_size(),
-        )?)
+        )?;
+        for c in &mut chunks {
+            c.address =
+                c.address
+                    .checked_add(base)
+                    .ok_or(crate::error::FormatError::OffsetOverflow {
+                        offset: c.address,
+                        length: 0,
+                    })?;
+        }
+        Ok(chunks)
     }
 
     /// The raw `FilterPipeline` message bytes from this dataset's object header,
@@ -1366,16 +1472,11 @@ impl<'f> Dataset<'f> {
     pub fn read_raw(&self) -> Result<Vec<u8>, Error> {
         let dt = self.datatype()?;
         let ds = self.dataspace()?;
-        let mut dl = self.data_layout()?;
-        // Adjust contiguous data address by base_address offset
-        if self.file.addr_offset != 0
-            && let DataLayout::Contiguous {
-                ref mut address, ..
-            } = dl
-            && let Some(addr) = address
-        {
-            *addr += self.file.addr_offset;
-        }
+        let dl = self.data_layout()?;
+        // The data layout's on-disk addresses are left base-relative here;
+        // `read_dataset_raw` applies the base address centrally (for both
+        // contiguous and chunked layouts) by reading from a base-relative view of
+        // the file.
         let pipeline = self.filter_pipeline();
         Ok(self
             .file
