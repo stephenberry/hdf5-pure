@@ -586,3 +586,34 @@ fn repacks_single_chunk_filtered_verbatim() {
     std::fs::remove_file(&src).ok();
     std::fs::remove_file(&dst).ok();
 }
+
+#[test]
+fn repacks_chunked_dataset_from_a_userblock_file() {
+    // The source carries a userblock (non-zero base address), so its chunk index
+    // and chunk data are stored base-relative. Repack reads each chunk verbatim
+    // from the source; it must apply the base address, or it reads the wrong bytes
+    // and produces a corrupt copy.
+    let src = tmp("hdf5_pure_repack_ub_src.h5");
+    let dst = tmp("hdf5_pure_repack_ub_dst.h5");
+    let data: Vec<f64> = (0..1000).map(|i| i as f64 * 0.25).collect();
+    let mut b = FileBuilder::new();
+    b.with_userblock(512);
+    b.create_dataset("chk")
+        .with_f64_data(&data)
+        .with_shape(&[1000])
+        .with_deflate(6);
+    b.create_dataset("plain").with_f64_data(&[1.0, 2.0, 3.0]);
+    std::fs::write(&src, b.finish().unwrap()).unwrap();
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    let f = hdf5_pure::File::open(&dst).unwrap();
+    assert_eq!(f.dataset("chk").unwrap().read_f64().unwrap(), data);
+    assert_eq!(
+        f.dataset("plain").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0]
+    );
+
+    std::fs::remove_file(&src).ok();
+    std::fs::remove_file(&dst).ok();
+}

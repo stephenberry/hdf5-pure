@@ -1117,3 +1117,60 @@ fn matching_shape_and_data_is_accepted() {
     assert_eq!(ds.shape().unwrap(), vec![2, 3]);
     assert_eq!(ds.read_f64().unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 }
+
+// ---------------------------------------------------------------------------
+// Userblock (non-zero base address) reads. A userblock shifts the HDF5 image
+// forward, so every stored address is relative to the base; the reader must
+// apply the base to contiguous data, the chunk index, and each chunk's data.
+// (These exercise the in-memory read path; the C-library cross-checks live in
+// `edit_userblock_crosscheck.rs`.)
+// ---------------------------------------------------------------------------
+
+/// Build a file with a 512-byte userblock and read a dataset back.
+fn userblock_roundtrip_f64(build: impl FnOnce(&mut FileBuilder)) -> File {
+    let mut b = FileBuilder::new();
+    b.with_userblock(512);
+    build(&mut b);
+    let mut bytes = b.finish().unwrap();
+    // Stamp the userblock so a stray read into it would corrupt the marker.
+    bytes[..6].copy_from_slice(b"UBMARK");
+    File::from_bytes(bytes).unwrap()
+}
+
+#[test]
+fn userblock_contiguous_read() {
+    let file = userblock_roundtrip_f64(|b| {
+        b.create_dataset("d").with_f64_data(&[1.0, 2.0, 3.0, 4.0]);
+    });
+    assert_eq!(file.dataset("d").unwrap().read_f64().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+}
+
+#[test]
+fn userblock_chunked_deflate_read() {
+    // A multi-chunk deflate dataset: exercises the chunk-index walk plus per-chunk
+    // data reads, all base-relative.
+    let data: Vec<f64> = (0..1000).map(|i| i as f64 * 0.5).collect();
+    let expect = data.clone();
+    let file = userblock_roundtrip_f64(|b| {
+        b.create_dataset("d")
+            .with_f64_data(&data)
+            .with_shape(&[1000])
+            .with_deflate(6);
+    });
+    assert_eq!(file.dataset("d").unwrap().read_f64().unwrap(), expect);
+}
+
+#[test]
+fn userblock_chunked_unfiltered_2d_read() {
+    let data: Vec<f64> = (0..64).map(|i| i as f64).collect();
+    let expect = data.clone();
+    let file = userblock_roundtrip_f64(|b| {
+        b.create_dataset("d")
+            .with_f64_data(&data)
+            .with_shape(&[8, 8])
+            .with_chunks(&[4, 4]);
+    });
+    let ds = file.dataset("d").unwrap();
+    assert_eq!(ds.shape().unwrap(), vec![8, 8]);
+    assert_eq!(ds.read_f64().unwrap(), expect);
+}

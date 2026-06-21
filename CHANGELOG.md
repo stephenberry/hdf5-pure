@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Reading a **chunked dataset from a file with a userblock** (non-zero base address) now works: the reader applied the base address only to contiguous data, so a chunked dataset's index and chunk data were read at the wrong offset (e.g. "corrupt deflate stream"). Base handling is now applied uniformly to every layout, and repack reads such chunks correctly too ([#104](https://github.com/stephenberry/hdf5-pure/issues/104)).
+
 ## [0.18.0] - 2026-06-20
 
 Broad MATLAB v7.3 read support for MCOS opaque types — cell arrays, the modern `string` class, `datetime` / `duration` / `categorical`, `table` / `timetable`, enumeration arrays, and `containers.Map`, including objects nested inside structs, cells, and table columns, all resolved through the file's `#subsystem#`/MCOS store. Also adds in-place overwrite and copy of chunked & filtered datasets in `EditSession`, a faster MAT write path, and two compound-datatype read fixes. **Breaking:** `MatError` is now `#[non_exhaustive]`; minor bump.
