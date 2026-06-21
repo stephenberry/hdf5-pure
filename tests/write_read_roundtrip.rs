@@ -1177,3 +1177,37 @@ fn userblock_chunked_unfiltered_2d_read() {
     assert_eq!(ds.shape().unwrap(), vec![8, 8]);
     assert_eq!(ds.read_f64().unwrap(), expect);
 }
+
+#[test]
+fn userblock_chunked_deflate_streaming_read() {
+    // The streaming reader walks the chunk index through `BaseOffsetSource`. This
+    // covers that path (and its metadata-cache forwarding) on a userblock file and
+    // checks it matches a buffered read byte-for-byte.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ub_chunk_stream.h5");
+    let data: Vec<f64> = (0..1000).map(|i| (i % 19) as f64 * 0.25).collect();
+
+    let mut b = FileBuilder::new();
+    b.with_userblock(512);
+    b.create_dataset("d")
+        .with_f64_data(&data)
+        .with_shape(&[1000])
+        .with_chunks(&[64])
+        .with_deflate(6);
+    std::fs::write(&path, b.finish().unwrap()).unwrap();
+
+    let buffered = File::open(&path)
+        .unwrap()
+        .dataset("d")
+        .unwrap()
+        .read_f64()
+        .unwrap();
+    let streamed = File::open_streaming(&path)
+        .unwrap()
+        .dataset("d")
+        .unwrap()
+        .read_f64()
+        .unwrap();
+    assert_eq!(buffered, data);
+    assert_eq!(streamed, data);
+}

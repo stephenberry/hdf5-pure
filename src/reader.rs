@@ -75,9 +75,9 @@ impl FileSource for SourceView<'_> {
 /// on-disk addresses (contiguous data, chunk index, and chunk data) are stored
 /// relative to the base address — presenting the reader this shifted view lets
 /// those relative addresses index it directly, exactly as the in-memory path
-/// slices the buffer at `base`. Overriding `len`/`read_at` is enough: the trait's
-/// default `read_exact_at`/`read_metadata_at` bound against this `len` (the
-/// base-relative length) and delegate through this `read_at`.
+/// slices the buffer at `base`. `len`/`read_at` shift by the base; `read_metadata_at`
+/// forwards to the inner source (at the absolute offset) so its metadata cache is
+/// shared, while payload reads keep the default uncached `read_exact_at`.
 struct BaseOffsetSource<'a, S: FileSource + ?Sized> {
     inner: &'a S,
     base: u64,
@@ -96,6 +96,20 @@ impl<S: FileSource + ?Sized> FileSource for BaseOffsetSource<'_, S> {
                 length: buf.len() as u64,
             })?;
         self.inner.read_at(abs, buf)
+    }
+
+    /// Forward metadata reads to the inner source at the absolute offset so the
+    /// inner source's metadata cache is shared (chunk-index walks on a streaming
+    /// userblock file otherwise re-read every node). Payload reads keep the default
+    /// `read_exact_at`, which stays uncached so user data does not evict metadata.
+    fn read_metadata_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
+        let abs = offset
+            .checked_add(self.base)
+            .ok_or(FormatError::OffsetOverflow {
+                offset,
+                length: len as u64,
+            })?;
+        self.inner.read_metadata_at(abs, len)
     }
 }
 

@@ -12,7 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- Reading a **chunked dataset from a file with a userblock** (non-zero base address) now works: the reader applied the base address only to contiguous data, so a chunked dataset's index and chunk data were read at the wrong offset (e.g. "corrupt deflate stream"). Base handling is now applied uniformly to every layout, and repack reads such chunks correctly too ([#104](https://github.com/stephenberry/hdf5-pure/issues/104)).
+- Reading and repacking a **chunked dataset from a file with a userblock** (non-zero base address) now works; previously the base address was applied only to contiguous data, so chunked reads from such a file failed ([#104](https://github.com/stephenberry/hdf5-pure/issues/104)).
 
 ## [0.18.0] - 2026-06-20
 

@@ -202,3 +202,37 @@ fn userblock_chunked_reclaimed_space_reused_read_by_c_library() {
         vec![10.0, 20.0, 30.0]
     );
 }
+
+#[test]
+fn userblock_extensible_array_add_read_by_c_library() {
+    // An unlimited-maxshape dataset uses the extensible-array chunk index, which
+    // embeds many internal addresses built off the planner base. Adding one to a
+    // userblock file and reading it back through the C library confirms every EA
+    // address was stored relative to the base correctly.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("pure_ub_ea.h5");
+
+    let mut b = FileBuilder::new();
+    b.with_userblock(UB);
+    b.create_dataset("keep").with_i32_data(&[7, 8, 9]);
+    std::fs::write(&path, b.finish().unwrap()).unwrap();
+
+    let added: Vec<f64> = (0..500).map(|i| (i as f64).sin() * 1e3).collect();
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        s.create_dataset("ea")
+            .with_f64_data(&added)
+            .with_shape(&[500])
+            .with_chunks(&[40])
+            .with_maxshape(&[u64::MAX])
+            .with_deflate(6);
+        s.commit().unwrap();
+    }
+
+    let c = hdf5::File::open(&path).unwrap();
+    assert_eq!(c.dataset("ea").unwrap().read_raw::<f64>().unwrap(), added);
+    assert_eq!(
+        c.dataset("keep").unwrap().read_raw::<i32>().unwrap(),
+        vec![7, 8, 9]
+    );
+}

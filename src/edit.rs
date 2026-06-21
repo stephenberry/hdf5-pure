@@ -62,12 +62,14 @@
 //! faithfully. Requirements:
 //!
 //! - The file uses 8-byte offsets/lengths. A **userblock** (non-zero base
-//!   address, as every MATLAB v7.3 `.mat` file has) is supported for a first
-//!   slice of edits: same-length value overwrites and additions of contiguous
-//!   datasets, groups, and compact attributes, with the userblock bytes
-//!   preserved verbatim. On a userblock file, chunked/filtered additions,
-//!   chunked or relocating overwrites, deletions, copies, and free-space reuse
-//!   are still refused. Any superblock version (0–3) is accepted: a version 0/1
+//!   address, as every MATLAB v7.3 `.mat` file has) is supported: addresses are
+//!   read and written relative to the base and the userblock bytes are preserved
+//!   verbatim. Value overwrites, additions of contiguous and chunked/filtered
+//!   datasets, in-place and relocating overwrites of chunked datasets (with the
+//!   old chunk storage reclaimed), group creation, compact attributes, and
+//!   free-space reuse all work on a userblock file; deletions, copies, and
+//!   resizing overwrites of *contiguous* datasets are still refused there. Any
+//!   superblock version (0–3) is accepted: a version 0/1
 //!   (symbol-table) file is edited by converting each group on the edited path
 //!   to the latest format and repointing the superblock's root symbol-table
 //!   entry.
@@ -733,13 +735,14 @@ impl EditSession {
 
         // On a file with a userblock, stored addresses are relative to this base
         // and the editor converts at every disk boundary (read `stored + base`,
-        // write `file_offset - base`). This first slice of userblock support covers
-        // same-length and relocating value overwrites of contiguous datasets,
-        // additions of contiguous datasets, group creation, and compact group
-        // attributes. Operations whose address rewriting is not yet base-aware are
-        // refused up front (a clean refusal, never a partial/corrupting edit):
-        // object copies, deletions, relocating overwrites, and chunked/filtered
-        // additions; chunked overwrites are refused in `prepare_write`.
+        // write `file_offset - base`). Userblock support covers value overwrites,
+        // additions of contiguous and chunked/filtered datasets, in-place and
+        // relocating overwrites of chunked datasets (with reclaim), group creation,
+        // and compact group attributes. Operations whose address rewriting is not
+        // yet base-aware are refused up front (a clean refusal, never a
+        // partial/corrupting edit): object copies, deletions, and relocating
+        // (resizing) overwrites of contiguous/compact datasets — the latter refused
+        // in the write preflight below.
         let base = self.superblock.base_address;
         if base != 0 {
             if !self.pending_copies.is_empty() || !self.pending_cross_copies.is_empty() {
@@ -1236,9 +1239,10 @@ impl EditSession {
             }
 
             // Relocating value overwrites under this group: write the new data and
-            // rewritten header, then patch this group's existing link to it.
-            // (Relocating overwrites are refused on userblock files, so `base` is 0
-            // here.)
+            // rewritten header, then patch this group's existing link to it. The
+            // link target is stored relative to the base address (`- base`); on a
+            // userblock file only the chunked variant reaches here (contiguous and
+            // compact resizes are refused in the write preflight).
             for (leaf, mw) in &writes {
                 let new_oh = self.write_moving(mw)?;
                 patch_link_target(&mut region, leaf, new_oh - base)?;
@@ -2857,9 +2861,9 @@ impl EditSession {
                     }
                     let off = u64::from_le_bytes(d[body..body + 8].try_into().unwrap());
                     let len = u64::from_le_bytes(d[body + 8..body + 16].try_into().unwrap());
-                    let off_abs = off.checked_add(base).ok_or(Error::EditUnsupported(
-                        "continuation address exceeds this platform",
-                    ))?;
+                    let off_abs = off
+                        .checked_add(base)
+                        .ok_or(Error::EditUnsupported("continuation address overflow"))?;
                     let off_us = usize::try_from(off_abs).map_err(|_| {
                         Error::EditUnsupported("continuation address exceeds this platform")
                     })?;
@@ -2896,7 +2900,8 @@ impl EditSession {
     /// nothing for the deletions, a safe leak — if the graph cannot be walked in
     /// full: an unparseable header, a group whose links cannot be enumerated, or
     /// more than [`MAX_LINK_GRAPH_NODES`] objects. Cycles are handled by visiting
-    /// each object once. Assumes the editor's enforced `base_address == 0`.
+    /// each object once. Base-aware: stored child addresses are shifted by the
+    /// userblock base, so the returned keys are absolute file offsets.
     fn count_incoming_hard_links(&self) -> Option<HashMap<u64, u32>> {
         let os = self.superblock.offset_size;
         let ls = self.superblock.length_size;
@@ -2966,6 +2971,14 @@ impl EditSession {
         incoming: &HashMap<u64, u32>,
         out: &mut Vec<(u64, u64)>,
     ) {
+        // NOTE (base): this path runs only for deletions, which are refused on a
+        // userblock file, so `base_address` is always 0 when this is reached. That
+        // is why the contiguous `data_addr` and group child addresses returned by
+        // `read_object` below — which are *stored* (base-relative) values — are used
+        // here as absolute file offsets without a `+ base` shift. Before lifting the
+        // delete refusal for userblock files, shift those by the base (as
+        // `chunked_storage_spans`/`oh_chunk_spans` already do) or the free list
+        // would be seeded with wrong, possibly-live regions.
         if depth >= MAX_COPY_DEPTH {
             return;
         }
