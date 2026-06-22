@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-06-22
+
+`EditSession` now edits files that carry a **userblock** (non-zero base address), such as MATLAB v7.3 `.mat` files: it reads and writes addresses relative to the base and preserves the userblock bytes, so every edit works — value overwrites, additions, relocating overwrites of every layout with old storage reclaimed, object deletion, in-file and cross-file copy, group creation, and compact attributes — with only cross-file copy from a userblock *source* still refused. Also fixes reading and repacking a chunked dataset from such a file. Additive minor bump.
+
 ### Added
 
 - `EditSession` now opens and edits files that carry a **userblock** (non-zero base address), such as MATLAB v7.3 `.mat` files: it reads and writes addresses relative to the base and preserves the userblock bytes verbatim. Every edit is supported — value overwrites, additions, relocating overwrites of every layout (with old storage reclaimed), object deletion, in-file and cross-file copy, group creation, and compact attributes; only cross-file copy from a userblock *source* is still refused ([#104](https://github.com/stephenberry/hdf5-pure/issues/104)).
@@ -251,7 +255,8 @@ Internal robustness and tests ([#26](https://github.com/stephenberry/hdf5-pure/i
 - The MAT deserializer flattens 1×N and N×1 values to a 1-D sequence in `deserialize_any` (matching `deserialize_seq`).
 - Numeric/complex readers preserve 1×N / N×1 shape at the value layer; any flattening happens at the serde level.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.15.0...v0.16.0
