@@ -249,6 +249,25 @@ pub(crate) enum MatValue {
     /// as MATLAB's `struct([])` (a `[0, 0]` empty marker with
     /// `MATLAB_class="struct"` and `MATLAB_empty=1`).
     EmptyStructArray,
+    /// A MATLAB struct *array* (`1×N` / `N×1` / `M×N` struct with fields).
+    ///
+    /// On disk MATLAB stores a struct array as a `MATLAB_class="struct"` group
+    /// whose every field is a dataset of object references — one reference per
+    /// array element — i.e. a struct-of-arrays. The reader transposes that into
+    /// this array-of-structs: `elements` lists each element's fields in
+    /// row-major order, and `rows`/`cols` carry the array shape so the
+    /// deserializer mirrors [`MatValue::Matrix`] (a `1×N`/`N×1` array flattens
+    /// to a sequence of structs → `Vec<T>`; a true `M×N` array yields a
+    /// sequence of rows → `Vec<Vec<T>>`).
+    ///
+    /// Read-only: the serializer lowers a `Vec<Struct>` to a cell array (see
+    /// [`MatValue::Cell`]), never to this native struct-array layout, so it
+    /// never produces this variant.
+    StructArray {
+        rows: usize,
+        cols: usize,
+        elements: Vec<Vec<(String, MatValue)>>,
+    },
     /// A decoded MATLAB MCOS opaque object (`MATLAB_object_decode = 3`).
     ///
     /// Aside from the modern `string` class (which lowers to [`MatValue::String`]
@@ -292,6 +311,7 @@ impl MatValue {
             MatValue::Struct(_) => "struct",
             MatValue::Cell(_) => "cell array",
             MatValue::EmptyStructArray => "empty struct array",
+            MatValue::StructArray { .. } => "struct array",
             MatValue::Opaque { .. } => "opaque object",
         }
     }

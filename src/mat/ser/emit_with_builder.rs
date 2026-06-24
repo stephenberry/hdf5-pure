@@ -118,9 +118,9 @@ fn emit_cell_element(cw: &mut CellWriter, value: MatValue) -> Result<(), MatErro
         MatValue::EmptyStructArray => {
             cw.push_empty_struct_array()?;
         }
-        MatValue::Opaque { .. } => {
+        MatValue::Opaque { .. } | MatValue::StructArray { .. } => {
             unreachable!(
-                "MatValue::Opaque is read-only; produced by the deserializer, never serialized"
+                "MatValue::Opaque / StructArray are read-only; produced by the deserializer, never serialized"
             )
         }
     }
@@ -289,9 +289,9 @@ fn emit_leaf_at_builder(mb: &mut MatBuilder, name: &str, value: MatValue) -> Res
                 .map(|_| ())
         }
         MatValue::EmptyStructArray => mb.write_empty_struct_array(name).map(|_| ()),
-        MatValue::Opaque { .. } => {
+        MatValue::Opaque { .. } | MatValue::StructArray { .. } => {
             unreachable!(
-                "MatValue::Opaque is read-only; produced by the deserializer, never serialized"
+                "MatValue::Opaque / StructArray are read-only; produced by the deserializer, never serialized"
             )
         }
     }
@@ -327,9 +327,9 @@ fn emit_leaf_at_struct(sw: &mut StructWriter, name: &str, value: MatValue) -> Re
                 .map(|_| ())
         }
         MatValue::EmptyStructArray => sw.write_empty_struct_array(name).map(|_| ()),
-        MatValue::Opaque { .. } => {
+        MatValue::Opaque { .. } | MatValue::StructArray { .. } => {
             unreachable!(
-                "MatValue::Opaque is read-only; produced by the deserializer, never serialized"
+                "MatValue::Opaque / StructArray are read-only; produced by the deserializer, never serialized"
             )
         }
     }

@@ -230,6 +230,14 @@ impl<'de> Deserializer<'de> for MatValueDeserializer {
                 visitor.visit_seq(ComplexMatrixRowsSeq::new32(rows, cols, pairs))
             }
             MatValue::Cell(elements) => visitor.visit_seq(CellSeq::new(elements)),
+            // A struct array deserializes like `Matrix`: a `1×N`/`N×1` array
+            // flattens to a sequence of structs (`Vec<T>`); a true `M×N` array
+            // yields a sequence of rows (`Vec<Vec<T>>`).
+            MatValue::StructArray {
+                rows,
+                cols,
+                elements,
+            } => visitor.visit_seq(struct_array_seq(rows, cols, elements)),
             // `deserialize_seq` is called when the target IS a sequence (e.g.
             // `Vec<T>`): yield zero elements rather than failing, so a sender
             // that emitted `struct([])` for an empty optional sequence still
@@ -453,6 +461,15 @@ fn dispatch_any<'de, V: Visitor<'de>>(value: MatValue, visitor: V) -> Result<V::
         }
         MatValue::Struct(fields) => visitor.visit_map(StructMap::new(fields)),
         MatValue::Cell(elements) => visitor.visit_seq(CellSeq::new(elements)),
+        // Mirror `deserialize_seq`: a struct array presents as a sequence so
+        // callers going through `deserialize_any` (untagged enums, custom
+        // `Visitor`s, serde-derive's `Content` round-trip) see the same shape as
+        // `Vec<T>` callers.
+        MatValue::StructArray {
+            rows,
+            cols,
+            elements,
+        } => visitor.visit_seq(struct_array_seq(rows, cols, elements)),
         MatValue::EmptyStructArray => visitor.visit_none(),
         // A decoded opaque object presents as a map over its (decoded or raw)
         // properties, identical to a struct — so `datetime`/`categorical`/… and
@@ -635,6 +652,30 @@ impl<'de> SeqAccess<'de> for Vec1DSeq {
     fn size_hint(&self) -> Option<usize> {
         Some(self.vec.len() - self.cursor)
     }
+}
+
+/// Build a [`SeqAccess`] over a struct array, mirroring how a numeric
+/// [`MatValue::Matrix`] flattens. `elements` is row-major.
+///
+/// - A `1×N` / `N×1` array (one dimension is 1) yields each element as a
+///   [`MatValue::Struct`], so the array deserializes as a flat `Vec<T>`.
+/// - A true `M×N` array yields each row as its own `1×cols` struct array, so it
+///   deserializes as `Vec<Vec<T>>` — the same row-of-rows shape `Matrix` uses.
+fn struct_array_seq(rows: usize, cols: usize, elements: Vec<Vec<(String, MatValue)>>) -> CellSeq {
+    if rows <= 1 || cols <= 1 {
+        return CellSeq::new(elements.into_iter().map(MatValue::Struct).collect());
+    }
+    let mut rows_vec: Vec<MatValue> = Vec::with_capacity(rows);
+    let mut it = elements.into_iter();
+    for _ in 0..rows {
+        let row: Vec<Vec<(String, MatValue)>> = it.by_ref().take(cols).collect();
+        rows_vec.push(MatValue::StructArray {
+            rows: 1,
+            cols,
+            elements: row,
+        });
+    }
+    CellSeq::new(rows_vec)
 }
 
 // ---------------------------------------------------------------------------

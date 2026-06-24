@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- MATLAB **struct arrays** now deserialize: a `MATLAB_class="struct"` group whose fields are datasets of per-element object references is transposed into an array-of-structs, so `mat::from_bytes` / `mat::from_file` read a `1×N` / `N×1` struct array into `Vec<T>` and an `M×N` array into `Vec<Vec<T>>` — previously refused with a `Reference` type mismatch. A scalar struct still reads as a single struct ([#127](https://github.com/stephenberry/hdf5-pure/issues/127)).
+
 ## [0.19.0] - 2026-06-22
 
 `EditSession` now edits files that carry a **userblock** (non-zero base address), such as MATLAB v7.3 `.mat` files: it reads and writes addresses relative to the base and preserves the userblock bytes, so every edit works — value overwrites, additions, relocating overwrites of every layout with old storage reclaimed, object deletion, in-file and cross-file copy, group creation, and compact attributes — with only cross-file copy from a userblock *source* still refused. Also fixes reading and repacking a chunked dataset from such a file. Additive minor bump.
