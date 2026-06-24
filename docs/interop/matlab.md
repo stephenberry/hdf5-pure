@@ -124,6 +124,13 @@ In MATLAB this loads as `iscell(path) == true`, with elements addressed as `path
 !!! note "Reader compatibility"
     Cell arrays load correctly in MATLAB, libmatio (the reference C library), Julia's `MAT.jl`, and Python via `pymatreader` / `hdf5storage`. GNU Octave 11's `load` does not yet follow object references for v7.3 cells (it warns "unknown datatype"); load such files with one of the other tools instead.
 
+## Struct arrays (reading)
+
+A struct array authored in MATLAB (`s(1).x = …; s(2).x = …`) is stored as a `MATLAB_class = "struct"` group whose every field is a dataset of per-element object references — a struct-of-arrays. `mat::from_file` / `mat::from_bytes` transpose that into an array-of-structs: a `1×N` / `N×1` array reads into `Vec<T>`, and a true `M×N` array into `Vec<Vec<T>>`, where `T` is your own struct. A scalar struct still reads as a single struct.
+
+!!! note "Write/read asymmetry"
+    This is a read-only path. Writing a `Vec<Struct>` from Rust produces a MATLAB **cell array** (see [Cell arrays](#cell-arrays)), not a native struct array, so a `.mat` you write and one MATLAB writes from the same Rust type differ on disk. Both read back into `Vec<Struct>`.
+
 ## Opaque value classes
 
 Reading (`from_bytes`) decodes the MCOS opaque value classes `datetime`, `duration`, and `categorical` into the public `MatDatetime`, `MatDuration`, and `MatCategorical` types (Unix-epoch millisecond instants, durations in milliseconds, and category codes plus names). Any other opaque class (`table`, `containers.Map`, `dictionary`, user `classdef`s, …) is surfaced losslessly as its raw property map, so it still deserializes into a matching struct; function handles and legacy objects are refused by name with `MatError::UnsupportedMatlabClass`.
