@@ -218,9 +218,9 @@ fn apply_value_to_dataset(
             apply_empty_struct_array(ds);
             Ok(())
         }
-        MatValue::Opaque { .. } => {
+        MatValue::Opaque { .. } | MatValue::StructArray { .. } => {
             unreachable!(
-                "MatValue::Opaque is read-only; produced by the deserializer, never serialized"
+                "MatValue::Opaque / StructArray are read-only; produced by the deserializer, never serialized"
             )
         }
     }

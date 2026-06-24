@@ -90,8 +90,137 @@ fn read_group_as_value(
             return Ok(value);
         }
     }
+    // A struct *array* stores each field as a dataset of per-element object
+    // references rather than as a direct value; detect that layout and transpose
+    // it into an array-of-structs before falling back to reading the group as a
+    // scalar struct.
+    if is_struct_array(group)? {
+        return read_struct_array(group, mcos, in_heap, depth);
+    }
     let fields = read_group(group, mcos, in_heap, depth)?;
     Ok(MatValue::Struct(fields))
+}
+
+/// Detect MATLAB's struct-*array* on-disk layout: a `MATLAB_class="struct"`
+/// group whose every field is a dataset of object references (one reference per
+/// array element), as opposed to a *scalar* struct whose fields are direct value
+/// datasets or nested-struct subgroups.
+///
+/// Mirrors matio's `is_struct_matrix` heuristic — no subgroups, and no field
+/// dataset carries a `MATLAB_class` attribute — with an added object-reference
+/// dtype guard. The guard matters because the reader also accepts raw (non-MAT)
+/// HDF5: a plain group of numeric datasets has no `MATLAB_class` either, and
+/// must still read as an ordinary struct rather than be misread as a struct
+/// array (and then fail trying to dereference non-references). A *cell* field of
+/// a scalar struct is a reference dataset too, but carries `MATLAB_class="cell"`,
+/// so the class-attribute check keeps that case a scalar struct.
+fn is_struct_array(group: &Group<'_>) -> Result<bool, MatError> {
+    // A nested-struct field of a scalar struct is stored as a subgroup, so any
+    // subgroup means this is a scalar struct, not a struct array.
+    if !group.groups().map_err(MatError::Hdf5)?.is_empty() {
+        return Ok(false);
+    }
+    let mut saw_field = false;
+    for name in group.datasets().map_err(MatError::Hdf5)? {
+        if name.starts_with('#') {
+            continue;
+        }
+        saw_field = true;
+        let ds = group.dataset(&name).map_err(MatError::Hdf5)?;
+        // Check the (cheaper, value-excluding) dtype first: a scalar struct's
+        // numeric/char field is not a reference, so this short-circuits without
+        // parsing attributes.
+        if ds.dtype().map_err(MatError::Hdf5)? != DType::ObjectReference {
+            return Ok(false);
+        }
+        if ds
+            .attrs()
+            .map_err(MatError::Hdf5)?
+            .contains_key("MATLAB_class")
+        {
+            return Ok(false);
+        }
+    }
+    Ok(saw_field)
+}
+
+/// Read a struct-array group into a [`MatValue::StructArray`].
+///
+/// Each field is a dataset of object references — one per array element — so the
+/// fields form a struct-of-arrays on disk. This dereferences and decodes each
+/// element's field value through the normal read path (so nested structs, cells,
+/// and opaque objects all decode), then transposes the column-major storage into
+/// a row-major array-of-structs, matching how numeric matrices present their
+/// elements.
+fn read_struct_array(
+    group: &Group<'_>,
+    mcos: Option<&Mcos<'_>>,
+    in_heap: bool,
+    depth: usize,
+) -> Result<MatValue, MatError> {
+    if depth > MAX_NESTING_DEPTH {
+        return Err(MatError::Format(FormatError::NestingDepthExceeded));
+    }
+    // Field order follows the group's dataset link order, matching how a scalar
+    // struct's fields are read (serde matches fields by name, so order is only
+    // cosmetic).
+    let field_names: Vec<String> = group
+        .datasets()
+        .map_err(MatError::Hdf5)?
+        .into_iter()
+        .filter(|n| !n.starts_with('#'))
+        .collect();
+    let first_name = field_names
+        .first()
+        .ok_or_else(|| MatError::Custom("struct array group has no fields".into()))?;
+
+    // Every field's reference dataset shares the struct array's dimensions.
+    let first = group.dataset(first_name).map_err(MatError::Hdf5)?;
+    let (rows, cols, total) = shape_decomposition(&first.shape().map_err(MatError::Hdf5)?)?;
+
+    // Decode each field's per-element values in column-major storage order. Each
+    // value is wrapped in `Option` so the transpose below can move it out exactly
+    // once without cloning potentially large field values.
+    let mut columns: Vec<(String, Vec<Option<MatValue>>)> = Vec::with_capacity(field_names.len());
+    for name in &field_names {
+        let ds = group.dataset(name).map_err(MatError::Hdf5)?;
+        let members = ds.dereference().map_err(MatError::Hdf5)?;
+        if members.len() != total {
+            return Err(MatError::Custom(format!(
+                "struct array field {name:?} has {} elements; expected {total} to match the array shape",
+                members.len()
+            )));
+        }
+        let mut col = Vec::with_capacity(total);
+        for member in &members {
+            col.push(Some(read_object(member, mcos, in_heap, depth + 1)?));
+        }
+        columns.push((name.clone(), col));
+    }
+
+    // Transpose column-major storage (`storage = c * rows + r`) into row-major
+    // array-of-structs. For a `1×N` / `N×1` array one of `rows`/`cols` is 1, so
+    // storage order already equals linear order and this is an identity walk.
+    let mut elements: Vec<Vec<(String, MatValue)>> = Vec::with_capacity(total);
+    for r in 0..rows {
+        for c in 0..cols {
+            let storage = c * rows + r;
+            let mut fields = Vec::with_capacity(columns.len());
+            for (name, col) in columns.iter_mut() {
+                let value = col[storage]
+                    .take()
+                    .expect("each storage slot is consumed exactly once");
+                fields.push((name.clone(), value));
+            }
+            elements.push(fields);
+        }
+    }
+
+    Ok(MatValue::StructArray {
+        rows,
+        cols,
+        elements,
+    })
 }
 
 /// Detect and decode an MCOS enumeration-instance group, returning `Ok(None)`
