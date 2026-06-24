@@ -88,17 +88,35 @@ fn grid_struct_array_reads_as_rows() {
     assert_eq!(
         grid[0],
         vec![
-            GridElem { id: 0.0, tag: "a".into() },
-            GridElem { id: 1.0, tag: "b".into() },
-            GridElem { id: 2.0, tag: "c".into() },
+            GridElem {
+                id: 0.0,
+                tag: "a".into()
+            },
+            GridElem {
+                id: 1.0,
+                tag: "b".into()
+            },
+            GridElem {
+                id: 2.0,
+                tag: "c".into()
+            },
         ]
     );
     assert_eq!(
         grid[1],
         vec![
-            GridElem { id: 10.0, tag: "d".into() },
-            GridElem { id: 11.0, tag: "e".into() },
-            GridElem { id: 12.0, tag: "f".into() },
+            GridElem {
+                id: 10.0,
+                tag: "d".into()
+            },
+            GridElem {
+                id: 11.0,
+                tag: "e".into()
+            },
+            GridElem {
+                id: 12.0,
+                tag: "f".into()
+            },
         ]
     );
 }
@@ -115,8 +133,14 @@ fn nested_scalar_struct_in_array_decodes() {
     assert_eq!(
         nested,
         vec![
-            Nested { fieldA: 1.0, inner: Inner { p: 0.0 } },
-            Nested { fieldA: 2.0, inner: Inner { p: 100.0 } },
+            Nested {
+                fieldA: 1.0,
+                inner: Inner { p: 0.0 }
+            },
+            Nested {
+                fieldA: 2.0,
+                inner: Inner { p: 100.0 }
+            },
         ]
     );
 }
