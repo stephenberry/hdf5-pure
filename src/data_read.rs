@@ -267,6 +267,22 @@ fn ensure_numeric(dt: &Datatype, expected: &'static str) -> Result<(), FormatErr
     }
 }
 
+/// Returns the datatype that governs numeric decoding of `dt`.
+///
+/// An HDF5 enumeration is stored as values of its integer base type, so — like
+/// `hdf5-rs`, which reads an enum dataset as its base — the numeric readers
+/// decode enum data through that base type, inheriting its signedness, byte
+/// order, precision, and width. The unwrap is recursive for defensiveness (an
+/// enum's base is always a leaf integer in practice) and returns any non-enum
+/// datatype unchanged, so the value+name round-trip works: the readers surface
+/// the codes while [`crate::DType::Enum`] surfaces the member names.
+fn effective_numeric(dt: &Datatype) -> &Datatype {
+    match dt {
+        Datatype::Enumeration { base_type, .. } => effective_numeric(base_type),
+        other => other,
+    }
+}
+
 fn get_byte_order(dt: &Datatype) -> DatatypeByteOrder {
     match dt {
         Datatype::FixedPoint { byte_order, .. } => byte_order.clone(),
@@ -346,6 +362,7 @@ macro_rules! bulk_decode {
 
 /// Convert raw bytes to `f64` values.
 pub fn read_as_f64(raw: &[u8], datatype: &Datatype) -> Result<Vec<f64>, FormatError> {
+    let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FloatingPoint or FixedPoint")?;
     let elem_size = get_size(datatype);
     if elem_size == 0 || !raw.len().is_multiple_of(elem_size) {
@@ -442,6 +459,7 @@ fn convert_to_f64(
 
 /// Convert raw bytes to `i64` values.
 pub fn read_as_i64(raw: &[u8], datatype: &Datatype) -> Result<Vec<i64>, FormatError> {
+    let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FixedPoint (signed)")?;
     let elem_size = get_size(datatype);
     if elem_size == 0 || !raw.len().is_multiple_of(elem_size) {
@@ -478,6 +496,7 @@ pub fn read_as_i64(raw: &[u8], datatype: &Datatype) -> Result<Vec<i64>, FormatEr
 
 /// Convert raw bytes to `u64` values.
 pub fn read_as_u64(raw: &[u8], datatype: &Datatype) -> Result<Vec<u64>, FormatError> {
+    let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FixedPoint (unsigned)")?;
     let elem_size = get_size(datatype);
     if elem_size == 0 || !raw.len().is_multiple_of(elem_size) {
@@ -513,6 +532,7 @@ pub fn read_as_u64(raw: &[u8], datatype: &Datatype) -> Result<Vec<u64>, FormatEr
 
 /// Convert raw bytes to `f32` values.
 pub fn read_as_f32(raw: &[u8], datatype: &Datatype) -> Result<Vec<f32>, FormatError> {
+    let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FloatingPoint")?;
     let elem_size = get_size(datatype);
     if elem_size == 0 || !raw.len().is_multiple_of(elem_size) {
@@ -613,6 +633,7 @@ pub fn read_as_f32(raw: &[u8], datatype: &Datatype) -> Result<Vec<f32>, FormatEr
 
 /// Convert raw bytes to `i32` values.
 pub fn read_as_i32(raw: &[u8], datatype: &Datatype) -> Result<Vec<i32>, FormatError> {
+    let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FixedPoint")?;
     let elem_size = get_size(datatype);
     if elem_size == 0 || !raw.len().is_multiple_of(elem_size) {
@@ -653,6 +674,7 @@ pub fn read_as_i32(raw: &[u8], datatype: &Datatype) -> Result<Vec<i32>, FormatEr
 /// Convert raw bytes to `i16` values (counterpart of [`read_as_i32`] for the
 /// narrower element type, used by [`crate::Dataset::read_i16`]).
 pub fn read_as_i16(raw: &[u8], datatype: &Datatype) -> Result<Vec<i16>, FormatError> {
+    let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FixedPoint")?;
     let elem_size = get_size(datatype);
     if elem_size == 0 || !raw.len().is_multiple_of(elem_size) {
@@ -690,6 +712,7 @@ pub fn read_as_i16(raw: &[u8], datatype: &Datatype) -> Result<Vec<i16>, FormatEr
 /// Convert raw bytes to `u32` values (counterpart of [`read_as_u64`] for the
 /// narrower element type, used by [`crate::Dataset::read_u32`]).
 pub fn read_as_u32(raw: &[u8], datatype: &Datatype) -> Result<Vec<u32>, FormatError> {
+    let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FixedPoint (unsigned)")?;
     let elem_size = get_size(datatype);
     if elem_size == 0 || !raw.len().is_multiple_of(elem_size) {
@@ -725,6 +748,7 @@ pub fn read_as_u32(raw: &[u8], datatype: &Datatype) -> Result<Vec<u32>, FormatEr
 /// Convert raw bytes to `u16` values (counterpart of [`read_as_u64`] for the
 /// narrower element type, used by [`crate::Dataset::read_u16`]).
 pub fn read_as_u16(raw: &[u8], datatype: &Datatype) -> Result<Vec<u16>, FormatError> {
+    let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FixedPoint (unsigned)")?;
     let elem_size = get_size(datatype);
     if elem_size == 0 || !raw.len().is_multiple_of(elem_size) {
@@ -1042,6 +1066,39 @@ mod tests {
         let raw = read_raw_data(&[], &layout, &ds, &dt).unwrap();
         let result = read_as_u64(&raw, &dt).unwrap();
         assert_eq!(result, vec![10, 20, 30, 40, 50]);
+    }
+
+    fn make_enum_type(base: Datatype, members: &[(&str, i64)]) -> Datatype {
+        let width = base.type_size() as usize;
+        Datatype::Enumeration {
+            size: base.type_size(),
+            base_type: Box::new(base),
+            members: members
+                .iter()
+                .map(|(name, v)| crate::datatype::EnumMember {
+                    name: (*name).to_string(),
+                    value: v.to_le_bytes()[..width].to_vec(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn read_enum_decodes_through_base_type() {
+        // An enum datatype is decoded via its integer base type; before the
+        // enum-unwrap this hit `ensure_numeric` and returned a `TypeMismatch`.
+        let dt = make_enum_type(make_i32_le_type(), &[("A", 0), ("B", 1), ("C", 2)]);
+        let mut raw = Vec::new();
+        for v in [0i32, 2, 1, 0] {
+            raw.extend_from_slice(&v.to_le_bytes());
+        }
+        assert_eq!(read_as_i32(&raw, &dt).unwrap(), vec![0, 2, 1, 0]);
+        assert_eq!(read_as_i64(&raw, &dt).unwrap(), vec![0, 2, 1, 0]);
+
+        // A u8-based enum decodes unsigned through its u8 base.
+        let dt8 = make_enum_type(make_u8_type(), &[("OFF", 0), ("ON", 1)]);
+        let raw8 = vec![0u8, 1, 1, 0];
+        assert_eq!(read_as_u64(&raw8, &dt8).unwrap(), vec![0, 1, 1, 0]);
     }
 
     #[test]

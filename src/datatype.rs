@@ -1515,6 +1515,107 @@ mod tests {
         assert_eq!(parsed, dt);
     }
 
+    /// Fixed-point base type for enum round-trip tests.
+    fn enum_base_fp(size: u32, be: bool, signed: bool) -> Datatype {
+        Datatype::FixedPoint {
+            size,
+            byte_order: if be {
+                DatatypeByteOrder::BigEndian
+            } else {
+                DatatypeByteOrder::LittleEndian
+            },
+            signed,
+            bit_offset: 0,
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "test builds byte-width base types; size*8 is well within u16"
+            )]
+            bit_precision: (size * 8) as u16,
+        }
+    }
+
+    /// Build an enum datatype over `base`, storing each member value truncated to
+    /// the base width (the value blob is opaque bytes, so any content round-trips).
+    fn make_enum(base: Datatype, members: &[(&str, i64)]) -> Datatype {
+        let size = base.type_size();
+        let width = size as usize;
+        Datatype::Enumeration {
+            size,
+            base_type: Box::new(base),
+            members: members
+                .iter()
+                .map(|(name, v)| EnumMember {
+                    name: (*name).to_string(),
+                    value: v.to_le_bytes()[..width].to_vec(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn serialize_parse_enum_base_type_variety() {
+        // The i32 base is already covered above; here u8, big-endian i16, and i64
+        // bases all round-trip through the enum wrapper.
+        for base in [
+            enum_base_fp(1, false, false), // u8
+            enum_base_fp(2, true, true),   // i16 big-endian
+            enum_base_fp(8, false, true),  // i64
+        ] {
+            let dt = make_enum(base.clone(), &[("A", 0), ("B", 1), ("NEG", -1)]);
+            let bytes = dt.serialize();
+            let (parsed, consumed) = Datatype::parse(&bytes).unwrap();
+            assert_eq!(parsed, dt, "round-trip failed for base {base:?}");
+            assert_eq!(consumed, bytes.len());
+        }
+    }
+
+    #[test]
+    fn serialize_parse_enum_large_member_count() {
+        // More than 256 members exercises the 2-byte member-count field, which is
+        // split across bf0/bf1 in the datatype message header.
+        let owned: Vec<(String, i64)> = (0..300).map(|i| (format!("M{i}"), i)).collect();
+        let members: Vec<(&str, i64)> = owned.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+        let dt = make_enum(enum_base_fp(4, false, true), &members);
+        let bytes = dt.serialize();
+        let (parsed, _) = Datatype::parse(&bytes).unwrap();
+        assert_eq!(parsed, dt);
+        match parsed {
+            Datatype::Enumeration { members, .. } => {
+                assert_eq!(members.len(), 300);
+                assert_eq!(members[299].name, "M299");
+            }
+            other => panic!("expected Enumeration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enum_value_width_is_not_validated_against_base_size() {
+        // `EnumTypeBuilder::build`/`Datatype::Enumeration` take the element size
+        // from the base type only, with no check that member value blobs match it.
+        // A 4-byte value on a 1-byte base therefore serializes in full but parses
+        // back reading just `base_size` (1) byte per member, silently truncating.
+        // This documents the current permissiveness; it is NOT a supported
+        // round-trip, and the assertion guards against a silent change either way.
+        let dt = Datatype::Enumeration {
+            size: 1,
+            base_type: Box::new(enum_base_fp(1, false, false)),
+            members: vec![EnumMember {
+                name: "X".to_string(),
+                value: 5i32.to_le_bytes().to_vec(), // 4 bytes on a 1-byte base
+            }],
+        };
+        let bytes = dt.serialize();
+        let (parsed, _) = Datatype::parse(&bytes).unwrap();
+        assert_ne!(
+            parsed, dt,
+            "a value wider than the base silently truncates on parse"
+        );
+        match parsed {
+            Datatype::Enumeration { members, .. } => assert_eq!(members[0].value, vec![5]),
+            other => panic!("expected Enumeration, got {other:?}"),
+        }
+    }
+
     #[test]
     fn serialize_parse_array_roundtrip() {
         let dt = Datatype::Array {

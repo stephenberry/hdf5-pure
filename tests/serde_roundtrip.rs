@@ -887,3 +887,128 @@ fn roundtrip_option_complex_inner() {
         none_vec: None,
     });
 }
+
+// ---------------------------------------------------------------------------
+// Enum edge cases (issue #129). The `.mat` serde path encodes a Rust enum only
+// as a unit variant, by variant name, as a MATLAB char string. Non-unit
+// variants and unknown names must be rejected cleanly, renamed variants must
+// honor the serde name, and enums must round-trip inside sequences.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+enum NewtypeVariant {
+    N(i32),
+}
+#[derive(Serialize)]
+enum TupleVariant {
+    T(i32, i32),
+}
+#[derive(Serialize)]
+enum StructVariant {
+    S { a: i32 },
+}
+#[derive(Serialize)]
+struct HoldsNewtype {
+    v: NewtypeVariant,
+}
+#[derive(Serialize)]
+struct HoldsTuple {
+    v: TupleVariant,
+}
+#[derive(Serialize)]
+struct HoldsStruct {
+    v: StructVariant,
+}
+
+#[test]
+fn non_unit_enum_variants_are_unsupported() {
+    assert!(matches!(
+        mat::to_bytes(&HoldsNewtype {
+            v: NewtypeVariant::N(1)
+        }),
+        Err(mat::MatError::UnsupportedType(_))
+    ));
+    assert!(matches!(
+        mat::to_bytes(&HoldsTuple {
+            v: TupleVariant::T(1, 2)
+        }),
+        Err(mat::MatError::UnsupportedType(_))
+    ));
+    assert!(matches!(
+        mat::to_bytes(&HoldsStruct {
+            v: StructVariant::S { a: 1 }
+        }),
+        Err(mat::MatError::UnsupportedType(_))
+    ));
+}
+
+#[derive(Serialize)]
+struct StateStr {
+    state: String,
+}
+#[derive(Deserialize, Debug)]
+struct StateFlag {
+    #[allow(dead_code)]
+    state: Flag,
+}
+
+#[test]
+fn deserialize_unknown_enum_variant_errors() {
+    // A char dataset whose value isn't a known variant name deserializes to a
+    // clean serde `unknown variant` error, not a silent wrong variant.
+    let bytes = mat::to_bytes(&StateStr {
+        state: "Maybe".into(),
+    })
+    .unwrap();
+    let err = mat::from_bytes::<StateFlag>(&bytes).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unknown variant") && msg.contains("Maybe"),
+        "expected an unknown-variant error mentioning \"Maybe\", got: {msg}"
+    );
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+enum Color {
+    #[serde(rename = "rouge")]
+    Red,
+    #[serde(rename = "vert")]
+    Green,
+    Blue,
+}
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+struct Palette {
+    c: Color,
+}
+
+#[test]
+fn renamed_enum_variant_uses_serde_name() {
+    let bytes = mat::to_bytes(&Palette { c: Color::Red }).unwrap();
+    // The on-disk char string is the serde-renamed identifier, not "Red".
+    let file = File::from_bytes(bytes.clone()).unwrap();
+    let ds = file.dataset("c").unwrap();
+    let units = ds.read_u16().unwrap();
+    assert_eq!(String::from_utf16(&units).unwrap(), "rouge");
+    // And it round-trips back to the original variant by that name.
+    let back: Palette = mat::from_bytes(&bytes).unwrap();
+    assert_eq!(back, Palette { c: Color::Red });
+}
+
+#[test]
+fn all_enum_variants_roundtrip() {
+    for c in [Color::Red, Color::Green, Color::Blue] {
+        rt(Palette { c });
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+struct FlagList {
+    states: Vec<Flag>,
+}
+
+#[test]
+fn vec_of_unit_enums_roundtrips() {
+    rt(FlagList {
+        states: vec![Flag::On, Flag::Off, Flag::On],
+    });
+}
