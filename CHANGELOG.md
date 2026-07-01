@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Typed integer and float readers (`Dataset::read_i32`, `read_u8`, …) now decode an **HDF5 enumeration dataset** as its integer base type, so an enum dataset written with `EnumTypeBuilder` / `DatasetBuilder::with_enum_i32_data` reads its codes back instead of failing with a `TypeMismatch`; member names stay available via `DType::Enum`, and no name-based enum-to-enum conversion is performed ([#129](https://github.com/stephenberry/hdf5-pure/issues/129)).
+
 ## [0.20.0] - 2026-06-24
 
 MATLAB **struct arrays** now read: a `MATLAB_class="struct"` group whose fields are datasets of per-element object references is transposed into an array-of-structs, so `mat::from_file` / `mat::from_bytes` read a `1×N` / `N×1` struct array into `Vec<T>` and an `M×N` array into `Vec<Vec<T>>`. Additive minor bump.
