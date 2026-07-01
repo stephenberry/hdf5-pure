@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-07-01
+
+HDF5 **enumeration datasets** now read back through the typed integer/float readers via their integer base type, so an enum dataset written with `EnumTypeBuilder` / `DatasetBuilder::with_enum_i32_data` reads its codes instead of failing with a `TypeMismatch`. Non-breaking patch.
+
 ### Fixed
 
 - Typed integer and float readers (`Dataset::read_i32`, `read_u8`, …) now decode an **HDF5 enumeration dataset** as its integer base type, so an enum dataset written with `EnumTypeBuilder` / `DatasetBuilder::with_enum_i32_data` reads its codes back instead of failing with a `TypeMismatch`; member names stay available via `DType::Enum`, and no name-based enum-to-enum conversion is performed ([#129](https://github.com/stephenberry/hdf5-pure/issues/129)).
@@ -267,7 +271,8 @@ Internal robustness and tests ([#26](https://github.com/stephenberry/hdf5-pure/i
 - The MAT deserializer flattens 1×N and N×1 values to a 1-D sequence in `deserialize_any` (matching `deserialize_seq`).
 - Numeric/complex readers preserve 1×N / N×1 shape at the value layer; any flattening happens at the serde level.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.20.1...HEAD
+[0.20.1]: https://github.com/stephenberry/hdf5-pure/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.17.0...v0.18.0
