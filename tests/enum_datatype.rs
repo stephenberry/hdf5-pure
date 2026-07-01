@@ -24,7 +24,8 @@ fn i32_enum_dataset_preserves_members_and_values() {
         .value("BLUE", 2)
         .build();
     let file = write_then_open(|b| {
-        b.create_dataset("color").with_enum_i32_data(dt, &[0, 1, 2, 1]);
+        b.create_dataset("color")
+            .with_enum_i32_data(dt, &[0, 1, 2, 1]);
     });
     let ds = file.dataset("color").unwrap();
     assert_eq!(ds.shape().unwrap(), vec![4]);
@@ -75,7 +76,8 @@ fn i32_enum_dataset_reads_back_through_base_type() {
         .value("BLUE", 2)
         .build();
     let file = write_then_open(|b| {
-        b.create_dataset("color").with_enum_i32_data(dt, &[0, 1, 2, 1]);
+        b.create_dataset("color")
+            .with_enum_i32_data(dt, &[0, 1, 2, 1]);
     });
     let ds = file.dataset("color").unwrap();
 
@@ -113,7 +115,8 @@ fn u8_enum_dataset_roundtrips() {
         .u8_value("ON", 1)
         .build();
     let file = write_then_open(|b| {
-        b.create_dataset("switch").with_enum_u8_data(dt, &[0, 1, 1, 0]);
+        b.create_dataset("switch")
+            .with_enum_u8_data(dt, &[0, 1, 1, 0]);
     });
     let ds = file.dataset("switch").unwrap();
 
@@ -186,7 +189,10 @@ fn non_enum_reads_are_unaffected_by_the_enum_unwrap() {
         b.create_dataset("ints").with_i32_data(&[10, 20, 30]);
         b.create_dataset("text").with_vlen_strings(&["a", "bc"]);
     });
-    assert_eq!(file.dataset("ints").unwrap().read_i32().unwrap(), vec![10, 20, 30]);
+    assert_eq!(
+        file.dataset("ints").unwrap().read_i32().unwrap(),
+        vec![10, 20, 30]
+    );
     let err = file.dataset("text").unwrap().read_i32().unwrap_err();
     assert!(
         matches!(

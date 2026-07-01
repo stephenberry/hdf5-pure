@@ -1606,7 +1606,10 @@ mod tests {
         };
         let bytes = dt.serialize();
         let (parsed, _) = Datatype::parse(&bytes).unwrap();
-        assert_ne!(parsed, dt, "a value wider than the base silently truncates on parse");
+        assert_ne!(
+            parsed, dt,
+            "a value wider than the base silently truncates on parse"
+        );
         match parsed {
             Datatype::Enumeration { members, .. } => assert_eq!(members[0].value, vec![5]),
             other => panic!("expected Enumeration, got {other:?}"),
