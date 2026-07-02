@@ -1255,8 +1255,12 @@ impl EditSession {
             group_datasets.sort_by_key(|fd| fd.reference_targets.is_some());
             for mut fd in group_datasets {
                 // Place each variable-length attribute's global heap collection
-                // and patch its placeholder heap address (chunked datasets never
-                // carry these — `flatten_dataset` refuses that combination).
+                // and patch its placeholder heap address. Unlike VL-string
+                // *data* (`vl_string_staging`, refused when chunked below), a
+                // chunked/extensible dataset can carry a VL *attribute* just
+                // fine — attributes live in the object header, not inside a
+                // chunk, so patching them here before either apply branch runs
+                // covers both.
                 for (idx, collection_bytes) in std::mem::take(&mut fd.vl_attrs) {
                     let addr = self.place_vl_collection(&collection_bytes)?;
                     patch_vl_refs(&mut fd.attrs[idx].raw_data, addr);
@@ -1933,6 +1937,22 @@ impl EditSession {
             return Err(Error::EditUnsupported(
                 "write_dataset overwrites values only; it cannot set attributes \
                  (set them with a separate edit)",
+            ));
+        }
+
+        // `with_vlen_strings` stages placeholder element references that only the
+        // add path's apply loop knows how to resolve (place the global heap
+        // collection, then patch the placeholders once its address is known,
+        // before the data block itself is written). `prepare_write` runs during
+        // preflight, before any bytes are written and without `&mut self`
+        // access to place a heap collection, and its result can be flushed by
+        // the same-length fast path with no apply loop at all — so refuse
+        // rather than write unpatched (heap address 0) placeholders as if they
+        // were final.
+        if fd.vl_string_staging.is_some() {
+            return Err(Error::EditUnsupported(
+                "write_dataset cannot overwrite a variable-length-string dataset's \
+                 data in place yet",
             ));
         }
 
@@ -3706,11 +3726,14 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
     };
 
     let elem = dt.type_size() as u64;
-    if !is_empty && elem > 0 {
+    if elem > 0 {
         // Multiply with checked arithmetic: an absurd shape whose element count
         // (or byte size) overflows `u64` is refused rather than panicking in a
         // debug build or silently wrapping in release (which could let a wrapped
-        // product spuriously match `raw.len()`).
+        // product spuriously match `raw.len()`). For a zero-element shape this
+        // expected length is always 0 (a `0` dimension makes every checked
+        // multiplication `Some(0)` regardless of the other dimensions), so this
+        // also catches data mistakenly supplied for a shape that holds nothing.
         let expected = shape
             .iter()
             .try_fold(1u64, |acc, &d| acc.checked_mul(d))
@@ -3799,11 +3822,10 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
         // unlimited dimension is `u64::MAX`); a fixed-shape dataset has none.
         max_dimensions: db.maxshape.clone(),
     };
-    let mut attrs: Vec<crate::attribute::AttributeMessage> = db
-        .attrs
-        .iter()
-        .map(|(n, v)| build_attr_message(n, v))
-        .collect();
+    let mut attrs: Vec<crate::attribute::AttributeMessage> = Vec::with_capacity(db.attrs.len());
+    for (n, v) in &db.attrs {
+        attrs.push(build_attr_message(n, v));
+    }
     // `build_attr_message` already writes a placeholder (heap address 0) for a
     // `VarLenAsciiArray` attribute; stage its self-contained global heap
     // collection here (no address of its own to resolve yet) and record which
@@ -3828,6 +3850,18 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
             source: prov.source.clone(),
         };
         attrs.extend(p.build_attrs(&raw));
+    }
+    // The object-header message-size field is 2 bytes wide, so an oversized
+    // attribute (most reachable via a `VarLenAsciiArray` with many/long
+    // strings) would silently truncate and corrupt the header if written
+    // as-is; refuse it instead, mirroring `apply_group_attr_ops`'s and
+    // `encode_attr_message`'s equivalent checks for group/root attributes.
+    for a in &attrs {
+        if a.serialize(LENGTH_SIZE).len() > u16::MAX as usize {
+            return Err(Error::EditUnsupported(
+                "dataset attribute is too large to encode in place",
+            ));
+        }
     }
     if attrs.len() > MAX_COMPACT_ATTRS {
         return Err(Error::EditUnsupported(
@@ -4566,11 +4600,14 @@ fn parse_compact_attr_name(
 }
 
 fn encode_attr_message(name: &str, value: &AttrValue) -> Result<Vec<u8>, Error> {
-    if matches!(value, AttrValue::VarLenAsciiArray(_)) {
-        return Err(Error::EditUnsupported(
-            "variable-length group attributes cannot be edited in place yet",
-        ));
-    }
+    // `apply_group_attr_ops`'s `Set` branch — this function's only caller —
+    // handles `VarLenAsciiArray` itself (staging it into `pending_vl` instead
+    // of calling `set_attr_in_region`/here), so this value is always
+    // fixed-size by construction, not by a check made at this call site.
+    debug_assert!(
+        !matches!(value, AttrValue::VarLenAsciiArray(_)),
+        "VarLenAsciiArray must be intercepted by apply_group_attr_ops before reaching encode_attr_message"
+    );
     let body = build_attr_message(name, value).serialize(LENGTH_SIZE);
     if body.len() > u16::MAX as usize {
         return Err(Error::EditUnsupported(

@@ -169,6 +169,131 @@ fn userblock_cross_file_copy_from_userblock_source_is_refused() {
     std::fs::remove_file(&dst_path).ok();
 }
 
+/// An empty (zero-element) dataset added on a userblock file must round-trip
+/// correctly. This is the one test in the suite that can actually
+/// discriminate correct behavior from a broken `u64::MAX - base` regression:
+/// at `base_address == 0` the empty-dataset sentinel (`u64::MAX`, written
+/// with no subtraction) and a wrongly-adjusted sentinel are numerically
+/// identical, so only a non-zero base can catch a mistake here.
+#[test]
+fn userblock_add_empty_dataset_roundtrip() {
+    let path = std::env::temp_dir().join("hdf5_pure_ub_add_empty.h5");
+    let userblock = build_userblock_file(&path);
+
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        s.create_dataset("empty")
+            .with_f64_data(&[])
+            .with_shape(&[0, 3]);
+        s.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let empty = file.dataset("empty").unwrap();
+    assert_eq!(empty.shape().unwrap(), vec![0, 3]);
+    assert_eq!(empty.read_f64().unwrap(), Vec::<f64>::new());
+    // Untouched original still reads correctly.
+    assert_eq!(
+        file.dataset("alpha").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    assert_eq!(&std::fs::read(&path).unwrap()[..UB], &userblock[..]);
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// A provenance-tagged dataset added on a userblock file must round-trip
+/// correctly, exercising the same base-relative address arithmetic as the
+/// non-userblock case above but where a `- base` bug would actually be
+/// observable.
+#[cfg(feature = "provenance")]
+#[test]
+fn userblock_add_provenance_dataset_roundtrip() {
+    use hdf5_pure::VerifyResult;
+
+    let path = std::env::temp_dir().join("hdf5_pure_ub_add_provenance.h5");
+    let userblock = build_userblock_file(&path);
+
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        s.create_dataset("sensor")
+            .with_f64_data(&[1.0, 2.0, 3.0])
+            .with_provenance("test-suite", "2026-02-19T12:00:00Z", Some("bench"));
+        s.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let ds = file.dataset("sensor").unwrap();
+    assert_eq!(ds.read_f64().unwrap(), vec![1.0, 2.0, 3.0]);
+    assert_eq!(ds.verify_provenance().unwrap(), VerifyResult::Ok);
+    assert_eq!(
+        ds.attrs().unwrap().get("_provenance_creator"),
+        Some(&AttrValue::String("test-suite".into()))
+    );
+    assert_eq!(&std::fs::read(&path).unwrap()[..UB], &userblock[..]);
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// A dataset with a variable-length attribute, added on a userblock file,
+/// must round-trip correctly: `EditSession::place_vl_collection`'s
+/// `addr - base_address` arithmetic is only actually exercised (as opposed to
+/// a no-op at `base == 0`) once `base` is non-zero.
+#[test]
+fn userblock_add_dataset_with_vlen_attribute_roundtrip() {
+    let path = std::env::temp_dir().join("hdf5_pure_ub_add_vlen_attr.h5");
+    let userblock = build_userblock_file(&path);
+
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        s.create_dataset("labeled")
+            .with_i32_data(&[1, 2, 3])
+            .set_attr(
+                "tags",
+                AttrValue::VarLenAsciiArray(vec!["one".into(), "two".into()]),
+            );
+        s.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let ds = file.dataset("labeled").unwrap();
+    assert_eq!(ds.read_i32().unwrap(), vec![1, 2, 3]);
+    assert_eq!(
+        ds.attrs().unwrap().get("tags"),
+        Some(&AttrValue::StringArray(vec!["one".into(), "two".into()]))
+    );
+    assert_eq!(&std::fs::read(&path).unwrap()[..UB], &userblock[..]);
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// A variable-length-string dataset added on a userblock file must round-trip
+/// correctly, exercising the same `place_vl_collection` base-relative
+/// arithmetic as the attribute case above but for dataset *data* rather than
+/// an attribute.
+#[test]
+fn userblock_add_vlen_string_dataset_roundtrip() {
+    let path = std::env::temp_dir().join("hdf5_pure_ub_add_vlen_string_ds.h5");
+    let userblock = build_userblock_file(&path);
+
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        s.create_dataset("labels")
+            .with_vlen_strings(&["alpha", "", "gamma"]);
+        s.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let ds = file.dataset("labels").unwrap();
+    assert_eq!(
+        ds.read_string().unwrap(),
+        vec!["alpha".to_string(), String::new(), "gamma".to_string()]
+    );
+    assert_eq!(&std::fs::read(&path).unwrap()[..UB], &userblock[..]);
+
+    std::fs::remove_file(&path).ok();
+}
+
 #[test]
 fn real_mat_add_dataset_preserves_userblock_and_data() {
     // Copy the fixture so the test never mutates the checked-in file.
