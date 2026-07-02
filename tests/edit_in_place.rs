@@ -2204,3 +2204,238 @@ fn write_dataset_with_no_other_edits_takes_inplace_fast_path() {
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// A zero-element (empty) contiguous dataset — the on-disk equivalent of the
+/// whole-file writer's `HADDR_UNDEF` data address for "no storage allocated"
+/// (issue #105) — can be added in place, alongside an ordinary dataset in the
+/// same commit.
+#[test]
+fn add_empty_dataset_via_edit_session() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_empty.h5");
+    write_starter(&path);
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("empty")
+            .with_f64_data(&[])
+            .with_shape(&[0, 3]);
+        session.create_dataset("added").with_i32_data(&[7, 8]);
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let empty = file.dataset("empty").unwrap();
+    assert_eq!(empty.shape().unwrap(), vec![0, 3]);
+    assert_eq!(empty.dtype().unwrap(), DType::F64);
+    assert_eq!(empty.read_f64().unwrap(), Vec::<f64>::new());
+    assert_eq!(
+        file.dataset("added").unwrap().read_i32().unwrap(),
+        vec![7, 8]
+    );
+    // The original, pre-existing dataset is untouched.
+    assert_eq!(
+        file.dataset("original").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// Chunking a zero-element shape stays refused in place (it's a distinct,
+/// separately-tracked capability from the plain contiguous empty dataset
+/// above): `malformed_chunked_requests_are_rejected_without_writing` already
+/// covers the whole-file-writer-equivalent geometry refusal; this confirms
+/// `EditSession` refuses it too, cleanly, without writing anything.
+#[test]
+fn add_chunked_empty_dataset_is_rejected_without_writing() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_chunked_empty.h5");
+    write_starter(&path);
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("stream")
+            .with_i32_data(&[])
+            .with_shape(&[0])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[16]);
+        let err = session.commit().unwrap_err();
+        assert!(err.to_string().contains("empty"), "got: {err}");
+    }
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
+/// An empty dataset whose supplied data does not match its (zero-element)
+/// shape is rejected rather than silently written as unreachable, orphaned
+/// storage: `flatten_dataset` must validate `raw` against the shape even when
+/// the shape contains a `0` dimension, not just for non-empty shapes.
+#[test]
+fn add_empty_dataset_with_mismatched_data_is_rejected_without_writing() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_empty_mismatched.h5");
+    write_starter(&path);
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("bogus")
+            .with_f64_data(&[9.0, 9.0, 9.0])
+            .with_shape(&[0, 3]);
+        let err = session.commit().unwrap_err();
+        assert!(err.to_string().contains("shape"), "got: {err}");
+    }
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A provenance-tagged dataset (issue #105) can be added in place; the
+/// SHA-256/creator/timestamp/source attributes are computed and stored
+/// exactly as the whole-file writer does, and `verify_provenance` confirms
+/// the hash while the attribute values themselves are checked directly.
+#[cfg(feature = "provenance")]
+#[test]
+fn add_provenance_dataset_via_edit_session() {
+    use hdf5_pure::VerifyResult;
+
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_provenance.h5");
+    write_starter(&path);
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("sensor")
+            .with_f64_data(&[1.0, 2.0, 3.0])
+            .with_provenance("test-suite", "2026-02-19T12:00:00Z", Some("bench"));
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let ds = file.dataset("sensor").unwrap();
+    assert_eq!(ds.read_f64().unwrap(), vec![1.0, 2.0, 3.0]);
+    assert_eq!(ds.verify_provenance().unwrap(), VerifyResult::Ok);
+    let attrs = ds.attrs().unwrap();
+    assert_eq!(
+        attrs.get("_provenance_creator"),
+        Some(&AttrValue::String("test-suite".into()))
+    );
+    assert_eq!(
+        attrs.get("_provenance_timestamp"),
+        Some(&AttrValue::String("2026-02-19T12:00:00Z".into()))
+    );
+    assert_eq!(
+        attrs.get("_provenance_source"),
+        Some(&AttrValue::String("bench".into()))
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// A provenance-tagged dataset can also be chunked/compressed in the same
+/// commit: provenance attributes and chunked storage flow through the same
+/// `attrs` vec and apply-loop path independently, so this combination should
+/// just work — this test is the regression guard for that claim.
+#[cfg(all(feature = "provenance", feature = "deflate"))]
+#[test]
+fn add_provenance_chunked_dataset_via_edit_session() {
+    use hdf5_pure::VerifyResult;
+
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_provenance_chunked.h5");
+    write_starter(&path);
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("sensor_chunked")
+            .with_f64_data(&[1.0, 2.0, 3.0, 4.0])
+            .with_shape(&[4])
+            .with_chunks(&[2])
+            .with_deflate(6)
+            .with_provenance("test-suite", "2026-02-19T12:00:00Z", None);
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let ds = file.dataset("sensor_chunked").unwrap();
+    assert_eq!(ds.read_f64().unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(ds.verify_provenance().unwrap(), VerifyResult::Ok);
+    let attrs = ds.attrs().unwrap();
+    assert_eq!(
+        attrs.get("_provenance_creator"),
+        Some(&AttrValue::String("test-suite".into()))
+    );
+    assert!(
+        !attrs.contains_key("_provenance_source"),
+        "no source was given, so no source attribute should be written"
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// Provenance attributes (up to 4) are appended to `attrs` before the
+/// dense-attribute (`MAX_COMPACT_ATTRS` = 8) budget check runs, so a dataset
+/// that would otherwise fit can be pushed over the limit by its own
+/// provenance metadata. Exactly at the boundary (8 total) must succeed with
+/// every value intact.
+#[cfg(feature = "provenance")]
+#[test]
+fn add_provenance_dataset_at_attr_budget_boundary_via_edit_session() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_provenance_at_budget.h5");
+    write_starter(&path);
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        let ds = session.create_dataset("sensor_at_budget");
+        ds.with_f64_data(&[1.0, 2.0]);
+        // 4 plain attributes + 4 provenance attributes (source included) = 8.
+        for i in 0..4i64 {
+            ds.set_attr(&format!("plain_{i}"), AttrValue::I64(i));
+        }
+        ds.with_provenance("test-suite", "2026-02-19T12:00:00Z", Some("bench"));
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let ds = file.dataset("sensor_at_budget").unwrap();
+    assert_eq!(ds.read_f64().unwrap(), vec![1.0, 2.0]);
+    let attrs = ds.attrs().unwrap();
+    for i in 0..4i64 {
+        assert_eq!(
+            attrs.get(&format!("plain_{i}")),
+            Some(&AttrValue::I64(i)),
+            "plain_{i} attribute value mismatch"
+        );
+    }
+    assert_eq!(
+        attrs.get("_provenance_creator"),
+        Some(&AttrValue::String("test-suite".into()))
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// One attribute past the boundary above (9 total, once provenance is
+/// appended) is refused, and the refusal must not write anything.
+#[cfg(feature = "provenance")]
+#[test]
+fn add_provenance_dataset_over_attr_budget_is_rejected_without_writing() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_provenance_over_budget.h5");
+    write_starter(&path);
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        let ds = session.create_dataset("sensor_over_budget");
+        ds.with_f64_data(&[1.0, 2.0]);
+        // 5 plain attributes + 4 provenance attributes (source included) = 9.
+        for i in 0..5 {
+            ds.set_attr(&format!("plain_{i}"), AttrValue::I32(i));
+        }
+        ds.with_provenance("test-suite", "2026-02-19T12:00:00Z", Some("bench"));
+        let err = session.commit().unwrap_err();
+        assert!(err.to_string().contains("dense"), "got: {err}");
+    }
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
