@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-07-02
+
+`EditSession` gains three in-place additions: an **empty (zero-element) contiguous dataset** and a **provenance-tagged dataset** (`DatasetBuilder::with_provenance`, behind the `provenance` feature); a **variable-length attribute value** (`AttrValue::VarLenAsciiArray`) and a **variable-length-string dataset** (`DatasetBuilder::with_vlen_strings`); and an **object-reference dataset** (`DatasetBuilder::with_path_references`). Chunked/extensible variants of each stay refused. Additive minor bump.
+
 ### Added
 
 - `EditSession` now adds, in place, an **empty (zero-element) contiguous dataset** and a **provenance-tagged dataset** (`DatasetBuilder::with_provenance`, behind the `provenance` feature); a chunked/extensible empty dataset stays refused ([#105](https://github.com/stephenberry/hdf5-pure/issues/105)).
@@ -281,7 +285,8 @@ Internal robustness and tests ([#26](https://github.com/stephenberry/hdf5-pure/i
 - The MAT deserializer flattens 1×N and N×1 values to a 1-D sequence in `deserialize_any` (matching `deserialize_seq`).
 - Numeric/complex readers preserve 1×N / N×1 shape at the value layer; any flattening happens at the serde level.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.20.1...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.20.1...v0.21.0
 [0.20.1]: https://github.com/stephenberry/hdf5-pure/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.18.0...v0.19.0
