@@ -3581,11 +3581,14 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
     };
 
     let elem = dt.type_size() as u64;
-    if !is_empty && elem > 0 {
+    if elem > 0 {
         // Multiply with checked arithmetic: an absurd shape whose element count
         // (or byte size) overflows `u64` is refused rather than panicking in a
         // debug build or silently wrapping in release (which could let a wrapped
-        // product spuriously match `raw.len()`).
+        // product spuriously match `raw.len()`). For a zero-element shape this
+        // expected length is always 0 (a `0` dimension makes every checked
+        // multiplication `Some(0)` regardless of the other dimensions), so this
+        // also catches data mistakenly supplied for a shape that holds nothing.
         let expected = shape
             .iter()
             .try_fold(1u64, |acc, &d| acc.checked_mul(d))
@@ -3674,11 +3677,10 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
         // unlimited dimension is `u64::MAX`); a fixed-shape dataset has none.
         max_dimensions: db.maxshape.clone(),
     };
-    let mut attrs: Vec<crate::attribute::AttributeMessage> = db
-        .attrs
-        .iter()
-        .map(|(n, v)| build_attr_message(n, v))
-        .collect();
+    let mut attrs: Vec<crate::attribute::AttributeMessage> = Vec::with_capacity(db.attrs.len());
+    for (n, v) in &db.attrs {
+        attrs.push(build_attr_message(n, v));
+    }
     // `build_attr_message` already writes a placeholder (heap address 0) for a
     // `VarLenAsciiArray` attribute; stage its self-contained global heap
     // collection here (no address of its own to resolve yet) and record which
