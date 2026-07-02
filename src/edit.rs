@@ -92,12 +92,19 @@
 //!   shape is not supported. A provenance dataset (`with_provenance`) is
 //!   supported, its attributes computed the same way the whole-file writer
 //!   computes them. A contiguous dataset may carry a variable-length-string
-//!   payload (`with_vlen_strings`); chunking one is not supported. Every added
-//!   dataset must have a fixed-size datatype, few enough attributes (compact or
-//!   variable-length) to stay in compact storage; object-reference datasets are
-//!   not added in place. Group and root attribute edits (`set_group_attr`) may
-//!   likewise be fixed-size or variable-length, under the same compact-storage
-//!   limit; dense (fractal-heap) attribute storage is not supported.
+//!   payload (`with_vlen_strings`) or per-element object-reference targets
+//!   (`with_path_references`); chunking either is not supported. A
+//!   path-resolved reference may target any object this commit is not itself
+//!   still writing (an ancestor group, a same-depth sibling group ordered
+//!   later in the same commit, a copy destination or its interior, or a
+//!   `write_dataset` target) — targeting one of those is refused rather than
+//!   resolved to a stale or wrong address; a path that resolves nowhere at all
+//!   becomes an undefined reference, matching the whole-file writer. Every
+//!   added dataset must have a fixed-size datatype, few enough attributes
+//!   (compact or variable-length) to stay in compact storage. Group and root
+//!   attribute edits (`set_group_attr`) may likewise be fixed-size or
+//!   variable-length, under the same compact-storage limit; dense
+//!   (fractal-heap) attribute storage is not supported.
 //! - A new group's parent must already exist or be created in the same session
 //!   (each level created explicitly); intermediate groups are not auto-created.
 //!
@@ -169,8 +176,8 @@ use crate::object_header::ObjectHeader;
 use crate::signature;
 use crate::superblock::Superblock;
 use crate::type_builders::{
-    AttrValue, DatasetBuilder, VlStringStaging, build_attr_message, build_global_heap_collection,
-    patch_vl_refs, patch_vl_refs_masked,
+    AttrValue, DatasetBuilder, ObjectRefTarget, VlStringStaging, build_attr_message,
+    build_global_heap_collection, patch_vl_refs, patch_vl_refs_masked,
 };
 
 /// An undefined on-disk address (all bits set), HDF5's "no address" sentinel.
@@ -506,10 +513,12 @@ impl EditSession {
     /// `with_scale_offset`, `with_zfp`) and/or extensible (`with_maxshape`). An
     /// empty (zero-element) contiguous dataset is supported (chunking one is
     /// not), a provenance dataset (`with_provenance`) is supported, and a
-    /// contiguous dataset may carry variable-length attributes or a
-    /// variable-length-string payload (`with_vlen_strings`; chunking one is
-    /// not supported); see the [module docs](self) for what still stays
-    /// unsupported (dense attributes, object-reference datasets).
+    /// contiguous dataset may carry variable-length attributes, a
+    /// variable-length-string payload (`with_vlen_strings`), or path-resolved
+    /// object-reference elements (`with_path_references`; chunking any of
+    /// these is not supported — see the [module docs](self) for the
+    /// path-resolution rule and what still stays unsupported (dense
+    /// attributes)).
     pub fn create_dataset(&mut self, path: &str) -> &mut DatasetBuilder {
         let mut comps = split_path(path);
         let leaf = comps.pop().unwrap_or_default();
@@ -1199,8 +1208,13 @@ impl EditSession {
         retain_disjoint_in_bounds(&mut to_free, self.data.len() as u64);
 
         // --- Apply: process deepest groups first so each parent sees its
-        // children's new addresses, then repoint the superblock last. ---
-        let mut new_addr: BTreeMap<PathKey, u64> = BTreeMap::new();
+        // children's new addresses, then repoint the superblock last.
+        // `path_addr` accumulates every group's and dataset's address as it is
+        // placed — read by `resolve_reference_target` to resolve a same-commit
+        // object-reference target (see the dataset-placement loop below for the
+        // group/dataset key convention: a group's own path, or a dataset's
+        // full parent+name path). ---
+        let mut path_addr: BTreeMap<PathKey, u64> = BTreeMap::new();
         let mut by_depth = keys.clone();
         by_depth.sort_by_key(|k| std::cmp::Reverse(k.len())); // deepest first
         for key in &by_depth {
@@ -1230,14 +1244,42 @@ impl EditSession {
 
             // Datasets directly under this group. Appended addresses are absolute
             // file offsets; the contiguous data-layout address and the parent link
-            // target are stored relative to the base address (`- base`).
-            for mut fd in flat.remove(key).into_iter().flatten() {
+            // target are stored relative to the base address (`- base`). Placed
+            // non-reference datasets first (recording each into `path_addr`),
+            // then reference datasets — a reference to a sibling added in the
+            // same group's batch resolves regardless of `pending_datasets` call
+            // order (`Vec::sort_by_key` is stable, so within each of the two
+            // groups the original order is preserved).
+            let mut group_datasets: Vec<FlatDataset> =
+                flat.remove(key).into_iter().flatten().collect();
+            group_datasets.sort_by_key(|fd| fd.reference_targets.is_some());
+            for mut fd in group_datasets {
                 // Place each variable-length attribute's global heap collection
                 // and patch its placeholder heap address (chunked datasets never
                 // carry these — `flatten_dataset` refuses that combination).
                 for (idx, collection_bytes) in std::mem::take(&mut fd.vl_attrs) {
                     let addr = self.place_vl_collection(&collection_bytes)?;
                     patch_vl_refs(&mut fd.attrs[idx].raw_data, addr);
+                }
+                // Resolve an object-reference dataset's per-element targets now
+                // that every earlier-placed object in this commit is in
+                // `path_addr` (chunked datasets never carry these —
+                // `flatten_dataset` refuses that combination).
+                if let Some(targets) = fd.reference_targets.take() {
+                    let mut patched = Vec::with_capacity(targets.len() * 8);
+                    for target in &targets {
+                        let addr = Self::resolve_reference_target(
+                            target,
+                            &path_addr,
+                            &nodes,
+                            &add_targets,
+                            &write_targets,
+                            &self.data,
+                            &self.superblock,
+                        )?;
+                        patched.extend_from_slice(&addr.to_le_bytes());
+                    }
+                    fd.raw = patched;
                 }
                 let oh = if fd.chunk_options.is_chunked() || fd.maxshape.is_some() {
                     self.build_chunked_dataset(&fd)?
@@ -1273,6 +1315,9 @@ impl EditSession {
                 };
                 let oh_addr = self.alloc_or_append(&oh)?;
                 region.extend_from_slice(&encode_link_message(&fd.name, oh_addr - base));
+                let mut full = key.clone();
+                full.push(fd.name.clone());
+                path_addr.insert(full, oh_addr);
             }
 
             // Relocating value overwrites under this group: write the new data and
@@ -1290,7 +1335,7 @@ impl EditSession {
             // stored relative to the base address.
             for child in children.get(key).into_iter().flatten() {
                 let child_name = child.last().unwrap();
-                let child_addr = new_addr[child] - base;
+                let child_addr = path_addr[child] - base;
                 if nodes[child].is_new {
                     region.extend_from_slice(&encode_link_message(child_name, child_addr));
                 } else {
@@ -1313,7 +1358,7 @@ impl EditSession {
 
             let oh = build_v2_object_header(&region);
             let addr = self.alloc_or_append(&oh)?;
-            new_addr.insert(key.clone(), addr);
+            path_addr.insert(key.clone(), addr);
         }
 
         // Same-length in-place overwrites (`write_dataset`) write straight into
@@ -1337,7 +1382,7 @@ impl EditSession {
         // pointing at bytes that never reached disk. `flush` on a plain `File`
         // does not force a write-back, so sync the appended bytes to disk first
         // (the barrier), then flip the pointer, then sync the flip.
-        let new_root = new_addr[&PathKey::new()];
+        let new_root = path_addr[&PathKey::new()];
 
         // A persisting file keeps its freed space recorded on disk rather than
         // truncating it away, so its commit takes a different, append-only tail.
@@ -2869,6 +2914,73 @@ impl EditSession {
         Ok(addr - self.superblock.base_address)
     }
 
+    /// Resolve one object-reference element's target to the base-relative
+    /// address that should be stored on disk. [`ObjectRefTarget::Raw`] is
+    /// written back verbatim (a null or undefined reference is a sentinel, not
+    /// a real address, so it needs no base adjustment — mirrors the whole-file
+    /// writer). [`ObjectRefTarget::Path`] resolves, in order:
+    ///
+    /// 1. Against `path_addr` — every group and dataset this commit has
+    ///    already placed (a sibling dataset placed earlier in the same
+    ///    group's batch — see the apply loop's non-reference-first ordering —
+    ///    or a descendant subtree fully processed earlier in the deepest-first
+    ///    walk).
+    /// 2. Against the pre-commit on-disk file
+    ///    ([`resolve_path_any`](crate::group_v2::resolve_path_any)), but only
+    ///    when the path is untouched by this commit, so its pre-commit
+    ///    address is guaranteed to still be valid post-commit. "Touched"
+    ///    means: a dirty group (`nodes`, new or merely rewritten because an
+    ///    addition lives under it — its own address changes either way); a
+    ///    path this commit adds, or that lies under a subtree this commit
+    ///    copies in (`add_targets`, checked by prefix so a copy's interior is
+    ///    covered even though only its root is enumerated there); or a
+    ///    `write_dataset` target (`write_targets`) — conservatively refused
+    ///    even for a same-length overwrite that does not actually relocate,
+    ///    since resolving that distinction here is not worth the complexity.
+    /// 3. If the path resolves nowhere at all (neither this commit nor the
+    ///    pre-commit file has ever heard of it), as an undefined reference
+    ///    (`HADDR_UNDEF`) — mirroring [`ObjectRefTarget::Path`]'s existing
+    ///    whole-file-writer resolution convention for the same builder type.
+    ///
+    /// A path that step 1 misses but step 2 identifies as commit-touched is
+    /// refused with a clear [`Error::EditUnsupported`] rather than resolved to
+    /// a stale or wrong address — the one case this engine cannot resolve
+    /// without the whole-file writer's two-pass dummy/real-address scheme.
+    fn resolve_reference_target(
+        target: &ObjectRefTarget,
+        path_addr: &BTreeMap<PathKey, u64>,
+        nodes: &BTreeMap<PathKey, Node>,
+        add_targets: &[PathKey],
+        write_targets: &[PathKey],
+        data: &[u8],
+        superblock: &Superblock,
+    ) -> Result<u64, Error> {
+        let path = match target {
+            ObjectRefTarget::Raw(addr) => return Ok(*addr),
+            ObjectRefTarget::Path(path) => path,
+        };
+        let base = superblock.base_address;
+        let key = split_path(path);
+        if let Some(&addr) = path_addr.get(&key) {
+            return Ok(addr - base);
+        }
+        if nodes.contains_key(&key)
+            || add_targets.iter().any(|t| is_prefix(t, &key))
+            || write_targets.contains(&key)
+        {
+            return Err(Error::EditUnsupported(
+                "an object-reference dataset targets a path this commit is still writing (an \
+                 ancestor group, a same-depth sibling group processed later, a copy destination \
+                 or its interior, or a value-overwrite target); split the reference into a later \
+                 commit",
+            ));
+        }
+        match crate::group_v2::resolve_path_any(data, superblock, path) {
+            Ok(addr) => Ok(addr - base),
+            Err(_) => Ok(UNDEF),
+        }
+    }
+
     /// Lay out a chunked / filtered / extensible dataset and return its object
     /// header bytes (which the caller links into the parent group).
     ///
@@ -3468,6 +3580,11 @@ struct FlatDataset {
     /// carrying placeholder heap addresses in `raw`) and global heap collection.
     /// Resolved in the apply loop right before `raw` is appended.
     vl_string_staging: Option<VlStringStaging>,
+    /// An object-reference dataset's per-element targets, still unresolved.
+    /// Resolved (see [`EditSession::resolve_reference_target`]) and patched
+    /// into `raw` in the apply loop, once every object this commit places has
+    /// a known address. `None` for an ordinary dataset.
+    reference_targets: Option<Vec<ObjectRefTarget>>,
 }
 
 /// Split a path into non-empty components.
@@ -3536,20 +3653,18 @@ fn retain_disjoint_in_bounds(spans: &mut Vec<(u64, u64)>, eof: u64) {
 /// fully self-contained — no address of its own) but placed and patched later,
 /// in the apply loop, once its final address is known; likewise a
 /// variable-length-string dataset's staged references and collection
-/// (`db.vl_string_staging`) are carried through unresolved. Rejects any
-/// remaining feature this engine cannot reproduce faithfully: object-reference
-/// datasets, dense attributes, a chunked/extensible variable-length-string
-/// dataset, or a filter pipeline the build cannot construct.
+/// (`db.vl_string_staging`) are carried through unresolved. An object-reference
+/// dataset's per-element targets (`db.reference_targets`) are likewise carried
+/// through unresolved — resolving a path target requires knowing every other
+/// object this commit places, which is only known well into the apply loop
+/// (see [`EditSession::resolve_reference_target`]). Rejects any remaining
+/// feature this engine cannot reproduce faithfully: dense attributes, a
+/// chunked/extensible variable-length-string or object-reference dataset, or a
+/// filter pipeline the build cannot construct.
 fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
     if db.name.is_empty() {
         return Err(Error::EditUnsupported("dataset path has an empty name"));
     }
-    if db.reference_targets.is_some() {
-        return Err(Error::EditUnsupported(
-            "object-reference datasets cannot be added in place yet",
-        ));
-    }
-
     let dt = db
         .datatype
         .ok_or(Error::EditUnsupported("dataset has no datatype/data"))?;
@@ -3571,6 +3686,16 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
     if db.vl_string_staging.is_some() && chunked {
         return Err(Error::EditUnsupported(
             "chunked or extensible variable-length-string datasets cannot be added in place yet",
+        ));
+    }
+    // Object-reference elements are resolved (see `resolve_reference_target`)
+    // and patched into `raw` right before it is appended; for chunked storage
+    // that patch would need to reach inside already-built chunk data, which
+    // this engine does not support (mirrors the variable-length-string
+    // refusal above — untested and unneeded combination for v1).
+    if db.reference_targets.is_some() && chunked {
+        return Err(Error::EditUnsupported(
+            "chunked or extensible object-reference datasets cannot be added in place yet",
         ));
     }
     let raw = if is_empty {
@@ -3720,6 +3845,7 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
         maxshape: db.maxshape,
         vl_attrs,
         vl_string_staging: db.vl_string_staging,
+        reference_targets: db.reference_targets,
     })
 }
 
