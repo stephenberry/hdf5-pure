@@ -1,7 +1,7 @@
 //! Tests for in-place editing via `EditSession` (issue #32, Group C):
 //! add, delete, and copy datasets and groups at any path.
 
-use hdf5_pure::{AttrValue, DType, EditSession, File, FileBuilder, ScaleOffset};
+use hdf5_pure::{AttrValue, DType, EditSession, File, FileBuilder, Object, ScaleOffset};
 
 /// Write a starter file with one dataset, returning its path.
 fn write_starter(path: &std::path::Path) {
@@ -2469,6 +2469,153 @@ fn add_chunked_vlen_string_dataset_is_rejected_without_writing() {
             err.to_string().contains("variable-length-string"),
             "got: {err}"
         );
+    }
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
+/// An object-reference dataset (issue #105) can be added in place, targeting
+/// an object that already existed before this commit — resolved via the
+/// pre-commit-file fallback in `resolve_reference_target` since the target is
+/// untouched by this commit.
+#[test]
+fn add_reference_dataset_targeting_preexisting_object_via_edit_session() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_preexisting.h5");
+    write_starter(&path);
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("refs")
+            .with_path_references(&["original"]);
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let targets = file.dataset("refs").unwrap().dereference().unwrap();
+    assert_eq!(targets.len(), 1);
+    match &targets[0] {
+        Object::Dataset(ds) => assert_eq!(ds.read_f64().unwrap(), vec![1.0, 2.0, 3.0, 4.0]),
+        Object::Group(_) => panic!("expected a dataset reference"),
+    }
+    std::fs::remove_file(&path).ok();
+}
+
+/// A reference dataset may target a sibling dataset added in the **same**
+/// commit and the **same** group, regardless of which one was staged first —
+/// the apply loop places every non-reference dataset in a group before any
+/// reference dataset in that group (issue #105).
+#[test]
+fn add_reference_dataset_targeting_sibling_added_in_same_commit() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_sibling.h5");
+    write_starter(&path);
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        // Stage the reference dataset BEFORE its target to prove placement
+        // order is independent of `pending_datasets` staging order.
+        session
+            .create_dataset("refs")
+            .with_path_references(&["target"]);
+        session.create_dataset("target").with_i32_data(&[7, 8, 9]);
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let targets = file.dataset("refs").unwrap().dereference().unwrap();
+    assert_eq!(targets.len(), 1);
+    match &targets[0] {
+        Object::Dataset(ds) => assert_eq!(ds.read_i32().unwrap(), vec![7, 8, 9]),
+        Object::Group(_) => panic!("expected a dataset reference"),
+    }
+    std::fs::remove_file(&path).ok();
+}
+
+/// A path with no object anywhere — neither pre-existing nor added in this
+/// commit — becomes an undefined reference rather than an error, mirroring
+/// the whole-file writer's resolution convention for the same builder type
+/// (issue #105).
+#[test]
+fn add_reference_dataset_targeting_nonexistent_path_becomes_undefined() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_nonexistent.h5");
+    write_starter(&path);
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("refs")
+            .with_path_references(&["does/not/exist"]);
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let err = file.dataset("refs").unwrap().dereference().unwrap_err();
+    assert!(err.to_string().contains("null/undefined"), "got: {err}");
+    std::fs::remove_file(&path).ok();
+}
+
+/// A reference targeting an **ancestor group of its own dataset** is refused:
+/// the ancestor's own address is not known until after all of its children —
+/// including this reference dataset — are placed, so resolving it now would
+/// require a stale or made-up address (issue #105).
+#[test]
+fn add_reference_dataset_targeting_unprocessed_ancestor_is_rejected_without_writing() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_ancestor.h5");
+    write_starter(&path);
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.create_dataset("refs").with_path_references(&[""]); // root, its own parent
+        let err = session.commit().unwrap_err();
+        assert!(err.to_string().contains("still writing"), "got: {err}");
+    }
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A reference targeting a same-depth sibling **group** that the deepest-first
+/// apply order has not reached yet is refused for the same reason as an
+/// unprocessed ancestor: `"a"` sorts (and is therefore processed) before
+/// `"b"`, so `"b"`'s address is not yet known when `"a/refs"` resolves
+/// (issue #105).
+#[test]
+fn add_reference_dataset_targeting_unprocessed_sibling_group_is_rejected_without_writing() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_sibling_group.h5");
+    write_starter(&path);
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.create_group("a");
+        session.create_group("b");
+        session
+            .create_dataset("a/refs")
+            .with_path_references(&["b"]);
+        let err = session.commit().unwrap_err();
+        assert!(err.to_string().contains("still writing"), "got: {err}");
+    }
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn add_chunked_reference_dataset_is_rejected_without_writing() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_chunked_ref.h5");
+    write_starter(&path);
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("refs")
+            .with_path_references(&["original"])
+            .with_chunks(&[1]);
+        let err = session.commit().unwrap_err();
+        assert!(err.to_string().contains("object-reference"), "got: {err}");
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
