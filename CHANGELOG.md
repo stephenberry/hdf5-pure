@@ -10,7 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - `EditSession` now adds, in place, an **empty (zero-element) contiguous dataset** and a **provenance-tagged dataset** (`DatasetBuilder::with_provenance`, behind the `provenance` feature); a chunked/extensible empty dataset stays refused ([#105](https://github.com/stephenberry/hdf5-pure/issues/105)).
 - `EditSession` now adds, in place, a dataset, group, or root attribute with a **variable-length value** (`AttrValue::VarLenAsciiArray`) and a **variable-length-string dataset** (`DatasetBuilder::with_vlen_strings`); dense-attribute storage and a chunked/extensible variable-length-string dataset stay refused ([#105](https://github.com/stephenberry/hdf5-pure/issues/105)).
-- `EditSession` now adds, in place, an **object-reference dataset** (`DatasetBuilder::with_path_references`), resolving each path target against every object the commit places; a target this same commit is still writing (an unprocessed ancestor or sibling group, a copy destination, or a value-overwrite target) is refused rather than resolved to a stale address, and a chunked/extensible reference dataset stays refused. This closes the #105 catalog ([#105](https://github.com/stephenberry/hdf5-pure/issues/105)).
+- `EditSession` now adds, in place, an **object-reference dataset** (`DatasetBuilder::with_path_references`); a target the same commit is still writing is refused rather than resolved to a stale address, and a chunked/extensible reference dataset stays refused ([#105](https://github.com/stephenberry/hdf5-pure/issues/105)).
 
 ### Fixed
 

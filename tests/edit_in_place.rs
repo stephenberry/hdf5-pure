@@ -2880,8 +2880,13 @@ fn add_reference_dataset_targeting_nonexistent_path_becomes_undefined() {
     }
 
     let file = File::open(&path).unwrap();
-    let err = file.dataset("refs").unwrap().dereference().unwrap_err();
+    let ds = file.dataset("refs").unwrap();
+    let err = ds.dereference().unwrap_err();
     assert!(err.to_string().contains("null/undefined"), "got: {err}");
+    // The dereference error alone doesn't distinguish an undefined reference
+    // (`u64::MAX`) from address 0 or any other unresolvable garbage address —
+    // check the stored 8-byte element directly.
+    assert_eq!(ds.read_raw().unwrap(), u64::MAX.to_le_bytes());
     std::fs::remove_file(&path).ok();
 }
 
@@ -2946,6 +2951,190 @@ fn add_chunked_reference_dataset_is_rejected_without_writing() {
             .with_chunks(&[1]);
         let err = session.commit().unwrap_err();
         assert!(err.to_string().contains("object-reference"), "got: {err}");
+    }
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
+/// Every element of a multi-element `with_path_references` array is resolved
+/// independently and in order — repeating a target (element 0 and 2 both
+/// point at `original`) also catches an indexing bug that a single-target
+/// test cannot.
+#[test]
+fn add_reference_dataset_with_multiple_elements_via_edit_session() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_multi_element.h5");
+    write_starter(&path);
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.create_dataset("second").with_i32_data(&[42]);
+        session
+            .create_dataset("refs")
+            .with_path_references(&["original", "second", "original"]);
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let targets = file.dataset("refs").unwrap().dereference().unwrap();
+    assert_eq!(targets.len(), 3);
+    match &targets[0] {
+        Object::Dataset(ds) => assert_eq!(ds.read_f64().unwrap(), vec![1.0, 2.0, 3.0, 4.0]),
+        Object::Group(_) => panic!("expected a dataset reference"),
+    }
+    match &targets[1] {
+        Object::Dataset(ds) => assert_eq!(ds.read_i32().unwrap(), vec![42]),
+        Object::Group(_) => panic!("expected a dataset reference"),
+    }
+    match &targets[2] {
+        Object::Dataset(ds) => assert_eq!(ds.read_f64().unwrap(), vec![1.0, 2.0, 3.0, 4.0]),
+        Object::Group(_) => panic!("expected a dataset reference"),
+    }
+    std::fs::remove_file(&path).ok();
+}
+
+/// A reference can resolve to a **group**, not just a dataset — the existing
+/// positive reference tests only ever target a dataset, so `Object::Group`'s
+/// arm of `dereference()`'s result was previously unexercised.
+#[test]
+fn add_reference_dataset_targeting_a_group_via_edit_session() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_group.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("original")
+        .with_f64_data(&[1.0, 2.0, 3.0, 4.0]);
+    let mut g = b.create_group("grp");
+    g.create_dataset("inner").with_i32_data(&[5, 6]);
+    g.set_attr("tag", AttrValue::I64(7));
+    b.add_group(g.finish());
+    b.write(&path).unwrap();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("refs")
+            .with_path_references(&["grp"]);
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let targets = file.dataset("refs").unwrap().dereference().unwrap();
+    assert_eq!(targets.len(), 1);
+    match &targets[0] {
+        Object::Group(g) => {
+            assert_eq!(g.dataset("inner").unwrap().read_i32().unwrap(), vec![5, 6]);
+            assert_eq!(g.attrs().unwrap().get("tag"), Some(&AttrValue::I64(7)));
+        }
+        Object::Dataset(_) => panic!("expected a group reference"),
+    }
+    std::fs::remove_file(&path).ok();
+}
+
+/// `with_path_references(&[])` is a valid degenerate case, consistent with
+/// the empty-dataset and empty-vlen-string-dataset edge cases already
+/// supported elsewhere in this #105 stack: no target needs resolving, and the
+/// layout falls back to the same undefined-address sentinel as any other
+/// empty dataset.
+#[test]
+fn add_zero_element_reference_dataset_via_edit_session() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_zero_element.h5");
+    write_starter(&path);
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.create_dataset("refs").with_path_references(&[]);
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let ds = file.dataset("refs").unwrap();
+    assert_eq!(ds.shape().unwrap(), vec![0]);
+    assert_eq!(ds.dereference().unwrap().len(), 0);
+    std::fs::remove_file(&path).ok();
+}
+
+/// Regression test: a reference targeting an object **deleted in the same
+/// commit** must not resolve to that object's soon-to-be-freed pre-commit
+/// address — `resolve_reference_target`'s "still writing" guard must check
+/// `pending_deletes`, not just `nodes`/`add_targets`/`write_targets`. A
+/// nested group/dataset is staged first so it would already be durably
+/// written (deepest-first apply order) before the root-level delete is even
+/// reached; the whole commit must still leave the file untouched.
+#[test]
+fn add_reference_dataset_targeting_same_commit_delete_is_rejected_without_writing() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_deleted_target.h5");
+    write_starter(&path);
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.create_group("grp");
+        session
+            .create_dataset("grp/inner")
+            .with_i32_data(&[1, 2, 3]);
+        session.delete("original");
+        session
+            .create_dataset("refs")
+            .with_path_references(&["original"]);
+        let err = session.commit().unwrap_err();
+        assert!(err.to_string().contains("still writing"), "got: {err}");
+    }
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
+/// Regression test: a reference targeting a **copy destination** in the same
+/// commit is refused (a copy's root address is never recorded in
+/// `path_addr`), and — like the delete case above — an earlier-processed
+/// nested addition must not leak into the file when the refusal fires later.
+#[test]
+fn add_reference_dataset_targeting_copy_destination_is_rejected_without_writing() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_copy_dest.h5");
+    write_starter(&path);
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.create_group("grp");
+        session
+            .create_dataset("grp/inner")
+            .with_i32_data(&[1, 2, 3]);
+        session.copy("original", "dup");
+        session
+            .create_dataset("refs")
+            .with_path_references(&["dup"]);
+        let err = session.commit().unwrap_err();
+        assert!(err.to_string().contains("still writing"), "got: {err}");
+    }
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
+/// Regression test: a reference targeting a `write_dataset` (value-overwrite)
+/// target in the same commit is refused, conservatively, regardless of
+/// whether the overwrite would relocate the header or land in place — and,
+/// again, an earlier-processed nested addition must not leak.
+#[test]
+fn add_reference_dataset_targeting_write_overwrite_target_is_rejected_without_writing() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_ref_write_target.h5");
+    write_starter(&path);
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.create_group("grp");
+        session
+            .create_dataset("grp/inner")
+            .with_i32_data(&[1, 2, 3]);
+        session
+            .write_dataset("original")
+            .with_f64_data(&[9.0, 9.0, 9.0, 9.0]);
+        session
+            .create_dataset("refs")
+            .with_path_references(&["original"]);
+        let err = session.commit().unwrap_err();
+        assert!(err.to_string().contains("still writing"), "got: {err}");
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);

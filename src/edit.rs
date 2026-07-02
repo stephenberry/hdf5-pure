@@ -96,10 +96,12 @@
 //!   (`with_path_references`); chunking either is not supported. A
 //!   path-resolved reference may target any object this commit is not itself
 //!   still writing (an ancestor group, a same-depth sibling group ordered
-//!   later in the same commit, a copy destination or its interior, or a
-//!   `write_dataset` target) — targeting one of those is refused rather than
-//!   resolved to a stale or wrong address; a path that resolves nowhere at all
-//!   becomes an undefined reference, matching the whole-file writer. Every
+//!   later in the same commit, a copy destination or its interior, a
+//!   `write_dataset` target, or an object this commit deletes) — targeting
+//!   one of those is refused, up front and before any byte of the commit is
+//!   written, rather than resolved to a stale or wrong address; a path that
+//!   resolves nowhere at all becomes an undefined reference, matching the
+//!   whole-file writer. Every
 //!   added dataset must have a fixed-size datatype, few enough attributes
 //!   (compact or variable-length) to stay in compact storage. Group and root
 //!   attribute edits (`set_group_attr`) may likewise be fixed-size or
@@ -971,9 +973,9 @@ impl EditSession {
         // change, and is recorded against its parent group (which becomes dirty).
         // `deleted_addrs` keeps each removed object's header address so its owned
         // blocks can be reclaimed after the commit lands (issue #21).
-        let deletes = std::mem::take(&mut self.pending_deletes);
+        let delete_targets = std::mem::take(&mut self.pending_deletes);
         let mut deleted_addrs: Vec<usize> = Vec::new();
-        for (i, d) in deletes.iter().enumerate() {
+        for (i, d) in delete_targets.iter().enumerate() {
             if d.is_empty() {
                 return Err(Error::EditUnsupported("cannot delete the root group"));
             }
@@ -1005,7 +1007,7 @@ impl EditSession {
                     ));
                 }
             }
-            for (j, d2) in deletes.iter().enumerate() {
+            for (j, d2) in delete_targets.iter().enumerate() {
                 if i != j && is_prefix(d, d2) {
                     return Err(Error::EditUnsupported(
                         "overlapping deletions in one commit; delete the common parent only",
@@ -1112,6 +1114,22 @@ impl EditSession {
             }
             flat.insert(key.clone(), v);
         }
+
+        // Prove every object-reference target resolves before any write (see
+        // `preflight_reference_targets`'s doc comment): otherwise a reference
+        // resolution failure discovered mid-apply-loop would leave every
+        // earlier-processed group's real writes (headers, data, copied
+        // subtrees) orphaned in the file despite `commit()` returning `Err`.
+        Self::preflight_reference_targets(
+            &keys,
+            &flat,
+            &nodes,
+            &add_targets,
+            &write_targets,
+            &delete_targets,
+            &self.data,
+            &self.superblock,
+        )?;
 
         // Gather the regions this commit will vacate, read from the current
         // on-disk layout before any byte moves: every deleted object's owned
@@ -1245,11 +1263,15 @@ impl EditSession {
             // Datasets directly under this group. Appended addresses are absolute
             // file offsets; the contiguous data-layout address and the parent link
             // target are stored relative to the base address (`- base`). Placed
-            // non-reference datasets first (recording each into `path_addr`),
-            // then reference datasets — a reference to a sibling added in the
-            // same group's batch resolves regardless of `pending_datasets` call
-            // order (`Vec::sort_by_key` is stable, so within each of the two
-            // groups the original order is preserved).
+            // non-reference datasets first (recording each into `path_addr`), then
+            // reference datasets — a reference to a *non-reference* sibling added
+            // in the same group's batch resolves regardless of `pending_datasets`
+            // call order (`Vec::sort_by_key` is stable, so within each of the two
+            // groups the original order is preserved). Two reference datasets that
+            // target each other in the same batch are still call-order-dependent —
+            // whichever is placed first resolves the other, and the reverse
+            // direction is safely refused as "still writing" (never corrupted),
+            // caught up front by `preflight_reference_targets`.
             let mut group_datasets: Vec<FlatDataset> =
                 flat.remove(key).into_iter().flatten().collect();
             group_datasets.sort_by_key(|fd| fd.reference_targets.is_some());
@@ -1278,6 +1300,7 @@ impl EditSession {
                             &nodes,
                             &add_targets,
                             &write_targets,
+                            &delete_targets,
                             &self.data,
                             &self.superblock,
                         )?;
@@ -2966,12 +2989,17 @@ impl EditSession {
     /// refused with a clear [`Error::EditUnsupported`] rather than resolved to
     /// a stale or wrong address — the one case this engine cannot resolve
     /// without the whole-file writer's two-pass dummy/real-address scheme.
+    /// "Touched" also covers a path this same commit deletes (`pending_deletes`):
+    /// without that check the deleted object's pre-commit address would still
+    /// resolve via step 2, and the reference would end up pointing at storage
+    /// this same commit is about to reclaim and hand out to something else.
     fn resolve_reference_target(
         target: &ObjectRefTarget,
         path_addr: &BTreeMap<PathKey, u64>,
         nodes: &BTreeMap<PathKey, Node>,
         add_targets: &[PathKey],
         write_targets: &[PathKey],
+        pending_deletes: &[PathKey],
         data: &[u8],
         superblock: &Superblock,
     ) -> Result<u64, Error> {
@@ -2987,18 +3015,77 @@ impl EditSession {
         if nodes.contains_key(&key)
             || add_targets.iter().any(|t| is_prefix(t, &key))
             || write_targets.contains(&key)
+            || pending_deletes.contains(&key)
         {
             return Err(Error::EditUnsupported(
-                "an object-reference dataset targets a path this commit is still writing (an \
-                 ancestor group, a same-depth sibling group processed later, a copy destination \
-                 or its interior, or a value-overwrite target); split the reference into a later \
-                 commit",
+                "an object-reference dataset targets a path this commit is still writing; \
+                 use separate commits",
             ));
         }
         match crate::group_v2::resolve_path_any(data, superblock, path) {
             Ok(addr) => Ok(addr - base),
             Err(_) => Ok(UNDEF),
         }
+    }
+
+    /// Prove, before any byte of this commit is written, that every
+    /// object-reference target across every staged dataset will resolve
+    /// successfully — either against a pre-existing untouched object or
+    /// against something this same commit places. [`resolve_reference_target`]
+    /// classifies a target purely from *whether* a `PathKey` has been placed
+    /// yet (`path_addr.get`), never from the address *value*, so replaying the
+    /// apply loop's placement order here with placeholder addresses (`0`)
+    /// standing in for "already placed" reproduces the exact same verdict the
+    /// apply loop's own calls will reach later, without writing anything. If
+    /// this preflight pass returns `Ok`, none of the apply loop's own
+    /// `resolve_reference_target` calls can fail, so a reference-resolution
+    /// error can no longer leave earlier-processed groups' real writes
+    /// orphaned in the file (the failure surfaces here instead, before the
+    /// apply loop's first `alloc_or_append`/`write_at`).
+    fn preflight_reference_targets(
+        keys: &[PathKey],
+        flat: &BTreeMap<PathKey, Vec<FlatDataset>>,
+        nodes: &BTreeMap<PathKey, Node>,
+        add_targets: &[PathKey],
+        write_targets: &[PathKey],
+        pending_deletes: &[PathKey],
+        data: &[u8],
+        superblock: &Superblock,
+    ) -> Result<(), Error> {
+        let mut by_depth = keys.to_vec();
+        by_depth.sort_by_key(|k| std::cmp::Reverse(k.len()));
+        let mut sim_addr: BTreeMap<PathKey, u64> = BTreeMap::new();
+        for key in &by_depth {
+            if let Some(datasets) = flat.get(key) {
+                // Mirrors the apply loop's `group_datasets.sort_by_key(|fd|
+                // fd.reference_targets.is_some())`: non-reference datasets are
+                // placed (and so become resolvable) before any reference
+                // dataset in the same group.
+                let mut ordered: Vec<&FlatDataset> = datasets.iter().collect();
+                ordered.sort_by_key(|fd| fd.reference_targets.is_some());
+                for fd in ordered {
+                    if let Some(targets) = &fd.reference_targets {
+                        for target in targets {
+                            Self::resolve_reference_target(
+                                target,
+                                &sim_addr,
+                                nodes,
+                                add_targets,
+                                write_targets,
+                                pending_deletes,
+                                data,
+                                superblock,
+                            )?;
+                        }
+                    }
+                    let mut full = key.clone();
+                    full.push(fd.name.clone());
+                    sim_addr.insert(full, 0);
+                }
+            }
+            sim_addr.insert(key.clone(), 0);
+        }
+        Ok(())
     }
 
     /// Lay out a chunked / filtered / extensible dataset and return its object
