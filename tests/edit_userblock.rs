@@ -16,7 +16,7 @@
 //! userblock-specific operation still refused — cross-file copy from a userblock
 //! *source* — is covered below; a refusal never corrupts the file.
 
-use hdf5_pure::{AttrValue, EditSession, File, FileBuilder};
+use hdf5_pure::{AttrValue, EditSession, File, FileBuilder, Object};
 
 const UB: usize = 512;
 const MARKER: &[u8] = b"USERBLOCK-MARKER-0104";
@@ -289,6 +289,36 @@ fn userblock_add_vlen_string_dataset_roundtrip() {
         ds.read_string().unwrap(),
         vec!["alpha".to_string(), String::new(), "gamma".to_string()]
     );
+    assert_eq!(&std::fs::read(&path).unwrap()[..UB], &userblock[..]);
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// An object-reference dataset added on a userblock file must round-trip
+/// correctly: `resolve_reference_target`'s `- base` adjustment for a resolved
+/// address is otherwise only ever exercised as a no-op at `base == 0`.
+#[test]
+fn userblock_add_reference_dataset_roundtrip() {
+    let path = std::env::temp_dir().join("hdf5_pure_ub_add_ref.h5");
+    let userblock = build_userblock_file(&path);
+
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        s.create_dataset("refs").with_path_references(&["alpha"]);
+        s.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let targets = file.dataset("refs").unwrap().dereference().unwrap();
+    assert_eq!(targets.len(), 1);
+    match &targets[0] {
+        Object::Dataset(ds) => assert_eq!(
+            ds.read_f64().unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0],
+            "reference should resolve to `alpha`'s original contents"
+        ),
+        Object::Group(_) => panic!("expected a dataset reference"),
+    }
     assert_eq!(&std::fs::read(&path).unwrap()[..UB], &userblock[..]);
 
     std::fs::remove_file(&path).ok();

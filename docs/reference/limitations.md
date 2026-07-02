@@ -41,6 +41,8 @@ SWMR append requires a **latest-format** file (v2/v3 superblock) and **no userbl
 
 In-place editing operates on files with **8-byte offsets and lengths** (what the writer emits and what modern files use). Other offset/length widths are not editable in place.
 
+Adding an **object-reference dataset** (`EditSession::create_dataset(...).with_path_references(...)`) resolves a path target against every object this commit places, but only once that object has actually been placed: `commit()` processes groups deepest-first and, within a group, non-reference datasets before reference ones, so a target that is itself still being written when the reference is resolved — an ancestor group, a same-depth sibling group ordered later, a copy destination (or its interior), or a `write_dataset` target — is refused rather than resolved to a stale or wrong address. A target untouched by the commit resolves against the pre-commit file; a path that resolves nowhere at all becomes an undefined reference, matching `FileBuilder`'s resolution convention for the same builder type. This is a permanent scope line (not a `... yet` gap): reproducing the whole-file writer's two-pass dummy/real-address scheme inside `EditSession`'s single-pass commit would be a large rewrite of the core apply loop for a narrow benefit.
+
 ### Group creation property list (GCPL)
 
 There is no property-list API for group creation, and none of its settings are configurable — every group `hdf5-pure` writes (including the root group) has exactly one fixed shape: a new-style (v2 object header) group with compact link storage and no stored timestamps. This is equivalent to always creating every group with `obj_track_times = false`, and never switching to old-style (symbol-table) or dense (fractal-heap) link storage, regardless of file version or child count. Unlike the reference library, whose GCPL defaults vary by version, this shape is fixed on purpose: it keeps output byte-for-byte reproducible, which is exactly what makes `hdf5-pure` a good fit for stable snapshot files. See [#131](https://github.com/stephenberry/hdf5-pure/issues/131).
@@ -57,7 +59,7 @@ Refused today with a `... yet` message, intended to land. Each row links to its 
 | **Dense** (fractal-heap) link & attribute storage | [#102](https://github.com/stephenberry/hdf5-pure/issues/102) |
 | Editing across **soft / external links** | [#103](https://github.com/stephenberry/hdf5-pure/issues/103) |
 | Userblock files, creation-order tracking, shared/SOHM messages, v0/v1 conversion | [#104](https://github.com/stephenberry/hdf5-pure/issues/104) |
-| Adding **object-reference** or **chunked/extensible variable-length-string** datasets | [#105](https://github.com/stephenberry/hdf5-pure/issues/105) |
+| Adding **chunked/extensible variable-length-string** datasets | [#105](https://github.com/stephenberry/hdf5-pure/issues/105) |
 | **Cross-file copy** of variable-length / reference / shared data | [#106](https://github.com/stephenberry/hdf5-pure/issues/106) |
 
 ### Repack
