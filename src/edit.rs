@@ -91,11 +91,13 @@
 //!   one. A contiguous dataset may be empty (zero-element); chunking an empty
 //!   shape is not supported. A provenance dataset (`with_provenance`) is
 //!   supported, its attributes computed the same way the whole-file writer
-//!   computes them. Every added dataset must have a fixed-size datatype and
-//!   carry only fixed-size (non variable-length) attributes, few enough to stay
-//!   in compact storage; object-reference datasets are not added in place.
-//!   Group attribute edits have the same compact, fixed-size attribute
-//!   restriction.
+//!   computes them. A contiguous dataset may carry a variable-length-string
+//!   payload (`with_vlen_strings`); chunking one is not supported. Every added
+//!   dataset must have a fixed-size datatype, few enough attributes (compact or
+//!   variable-length) to stay in compact storage; object-reference datasets are
+//!   not added in place. Group and root attribute edits (`set_group_attr`) may
+//!   likewise be fixed-size or variable-length, under the same compact-storage
+//!   limit; dense (fractal-heap) attribute storage is not supported.
 //! - A new group's parent must already exist or be created in the same session
 //!   (each level created explicitly); intermediate groups are not auto-created.
 //!
@@ -166,7 +168,10 @@ use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
 use crate::signature;
 use crate::superblock::Superblock;
-use crate::type_builders::{AttrValue, DatasetBuilder, build_attr_message};
+use crate::type_builders::{
+    AttrValue, DatasetBuilder, VlStringStaging, build_attr_message, build_global_heap_collection,
+    patch_vl_refs, patch_vl_refs_masked,
+};
 
 /// An undefined on-disk address (all bits set), HDF5's "no address" sentinel.
 const UNDEF: u64 = u64::MAX;
@@ -195,6 +200,11 @@ const MAX_OH_CHUNKS: usize = 256;
 /// A path identified by its components (no leading/trailing empties); the root
 /// group is the empty vector.
 type PathKey = Vec<String>;
+
+/// Variable-length group/root attributes staged by [`apply_group_attr_ops`],
+/// each an (attribute message still carrying a placeholder heap address, its
+/// global heap collection bytes) pair, resolved in the apply loop.
+type PendingVlAttrs = Vec<(crate::attribute::AttributeMessage, Vec<u8>)>;
 
 /// An open HDF5 file being edited in place.
 ///
@@ -495,9 +505,11 @@ impl EditSession {
     /// filtered (`with_deflate`, `with_shuffle`, `with_fletcher32`,
     /// `with_scale_offset`, `with_zfp`) and/or extensible (`with_maxshape`). An
     /// empty (zero-element) contiguous dataset is supported (chunking one is
-    /// not), and a provenance dataset (`with_provenance`) is supported; see the
-    /// [module docs](self) for what still stays unsupported (variable-length or
-    /// dense attributes, object-reference datasets).
+    /// not), a provenance dataset (`with_provenance`) is supported, and a
+    /// contiguous dataset may carry variable-length attributes or a
+    /// variable-length-string payload (`with_vlen_strings`; chunking one is
+    /// not supported); see the [module docs](self) for what still stays
+    /// unsupported (dense attributes, object-reference datasets).
     pub fn create_dataset(&mut self, path: &str) -> &mut DatasetBuilder {
         let mut comps = split_path(path);
         let leaf = comps.pop().unwrap_or_default();
@@ -559,10 +571,11 @@ impl EditSession {
     ///
     /// `path` names the group to edit; `""` or `"/"` names the root group. The
     /// group may already exist or may be created earlier in the same session
-    /// with [`create_group`](Self::create_group). Attributes are stored compactly
-    /// in the rebuilt group header; variable-length attributes and edits that
-    /// would exceed the compact-attribute limit are refused before any file
-    /// bytes are changed.
+    /// with [`create_group`](Self::create_group). Attributes — fixed-size or
+    /// variable-length (`AttrValue::VarLenAsciiArray`) — are stored compactly in
+    /// the rebuilt group header; an edit that would exceed the compact-attribute
+    /// limit, or a group using dense (fractal-heap) attribute storage, is
+    /// refused before any file bytes are changed.
     pub fn set_group_attr(&mut self, path: &str, name: &str, value: AttrValue) -> &mut Self {
         self.pending_group_attrs.push((
             split_path(path),
@@ -1030,13 +1043,18 @@ impl EditSession {
 
         // Apply and validate group attribute edits before any writes. This keeps
         // unsupported attribute edits under the same all-or-nothing preflight
-        // contract as unsupported dataset additions.
+        // contract as unsupported dataset additions. A variable-length attribute
+        // is not fully resolved here — its global heap collection is built (it
+        // is self-contained, no address needed yet) but placed and patched into
+        // `base_region` only in the apply loop below, once its address is known.
         for key in &keys {
             let node = nodes.get_mut(key).unwrap();
             let ops = std::mem::take(&mut node.attr_ops);
             if !ops.is_empty() {
                 let region = std::mem::take(&mut node.base_region);
-                node.base_region = apply_group_attr_ops(&region, &ops)?;
+                let (region, pending_vl_attrs) = apply_group_attr_ops(&region, &ops)?;
+                node.base_region = region;
+                node.pending_vl_attrs = pending_vl_attrs;
             }
         }
 
@@ -1186,13 +1204,14 @@ impl EditSession {
         let mut by_depth = keys.clone();
         by_depth.sort_by_key(|k| std::cmp::Reverse(k.len())); // deepest first
         for key in &by_depth {
-            let (mut region, deletes, copies, writes) = {
+            let (mut region, deletes, copies, writes, pending_vl_attrs) = {
                 let node = nodes.get_mut(key).unwrap();
                 (
                     std::mem::take(&mut node.base_region),
                     std::mem::take(&mut node.deletes),
                     std::mem::take(&mut node.copies),
                     std::mem::take(&mut node.writes),
+                    std::mem::take(&mut node.pending_vl_attrs),
                 )
             };
 
@@ -1212,10 +1231,31 @@ impl EditSession {
             // Datasets directly under this group. Appended addresses are absolute
             // file offsets; the contiguous data-layout address and the parent link
             // target are stored relative to the base address (`- base`).
-            for fd in flat.remove(key).into_iter().flatten() {
+            for mut fd in flat.remove(key).into_iter().flatten() {
+                // Place each variable-length attribute's global heap collection
+                // and patch its placeholder heap address. Unlike VL-string
+                // *data* (`vl_string_staging`, refused when chunked below), a
+                // chunked/extensible dataset can carry a VL *attribute* just
+                // fine — attributes live in the object header, not inside a
+                // chunk, so patching them here before either apply branch runs
+                // covers both.
+                for (idx, collection_bytes) in std::mem::take(&mut fd.vl_attrs) {
+                    let addr = self.place_vl_collection(&collection_bytes)?;
+                    patch_vl_refs(&mut fd.attrs[idx].raw_data, addr);
+                }
                 let oh = if fd.chunk_options.is_chunked() || fd.maxshape.is_some() {
                     self.build_chunked_dataset(&fd)?
                 } else {
+                    // A staged variable-length-string dataset's element
+                    // references still carry a placeholder heap address; place
+                    // its collection and patch them before `raw` is appended
+                    // (chunked datasets never carry staging — refused above).
+                    if let Some(staging) = fd.vl_string_staging.take() {
+                        if !staging.collection_bytes.is_empty() {
+                            let addr = self.place_vl_collection(&staging.collection_bytes)?;
+                            patch_vl_refs_masked(&mut fd.raw, &staging.patch_mask, addr);
+                        }
+                    }
                     // A zero-element dataset has no data block to allocate; its
                     // layout address is the undefined-address sentinel (never
                     // base-relative — see `build_dataset_oh`'s empty-data callers
@@ -1260,6 +1300,19 @@ impl EditSession {
                 } else {
                     patch_link_target(&mut region, child_name, child_addr)?;
                 }
+            }
+
+            // Variable-length group/root attributes staged by
+            // `apply_group_attr_ops`: place each collection and patch its
+            // attribute message's placeholder heap address, then append the
+            // resolved message to this group's header region.
+            for (mut msg, collection_bytes) in pending_vl_attrs {
+                let addr = self.place_vl_collection(&collection_bytes)?;
+                patch_vl_refs(&mut msg.raw_data, addr);
+                region.extend_from_slice(&region_message(
+                    MessageType::Attribute,
+                    &msg.serialize(LENGTH_SIZE),
+                ));
             }
 
             let oh = build_v2_object_header(&region);
@@ -1839,6 +1892,22 @@ impl EditSession {
             return Err(Error::EditUnsupported(
                 "write_dataset overwrites values only; it cannot set attributes \
                  (set them with a separate edit)",
+            ));
+        }
+
+        // `with_vlen_strings` stages placeholder element references that only the
+        // add path's apply loop knows how to resolve (place the global heap
+        // collection, then patch the placeholders once its address is known,
+        // before the data block itself is written). `prepare_write` runs during
+        // preflight, before any bytes are written and without `&mut self`
+        // access to place a heap collection, and its result can be flushed by
+        // the same-length fast path with no apply loop at all — so refuse
+        // rather than write unpatched (heap address 0) placeholders as if they
+        // were final.
+        if fd.vl_string_staging.is_some() {
+            return Err(Error::EditUnsupported(
+                "write_dataset cannot overwrite a variable-length-string dataset's \
+                 data in place yet",
             ));
         }
 
@@ -2808,6 +2877,18 @@ impl EditSession {
         }
     }
 
+    /// Place an already-built, self-contained global heap collection (from
+    /// [`build_global_heap_collection`] or a [`VlStringStaging::collection_bytes`])
+    /// and return the base-relative address a variable-length reference into it
+    /// should be patched to. A `GCOL` blob embeds no addresses of its own, so it
+    /// can be appended (or dropped into reused free space) at any point in the
+    /// apply loop, unlike a group or dataset header, which must be built last so
+    /// it can name its children's real addresses.
+    fn place_vl_collection(&mut self, collection_bytes: &[u8]) -> Result<u64, Error> {
+        let addr = self.alloc_or_append(collection_bytes)?;
+        Ok(addr - self.superblock.base_address)
+    }
+
     /// Lay out a chunked / filtered / extensible dataset and return its object
     /// header bytes (which the caller links into the parent group).
     ///
@@ -3200,6 +3281,13 @@ struct Node {
     writes: Vec<(String, MovingWrite)>,
     base_region: Vec<u8>,
     existing_links: Vec<String>,
+    /// Variable-length group/root attributes staged by [`apply_group_attr_ops`],
+    /// each still carrying a placeholder heap address: (the attribute message,
+    /// its global heap collection bytes). Resolved in the apply loop right
+    /// before this node's header is built — [`EditSession::place_vl_collection`]
+    /// appends the collection, then the patched message is appended to
+    /// `base_region`.
+    pending_vl_attrs: PendingVlAttrs,
 }
 
 /// A staged compact attribute edit for a group.
@@ -3392,6 +3480,14 @@ struct FlatDataset {
     /// dataset. A maxshape with an unlimited dimension selects the
     /// extensible-array chunk index; a finite maxshape stays fixed-array/single.
     maxshape: Option<Vec<u64>>,
+    /// Variable-length attributes still carrying a placeholder heap address:
+    /// (index into `attrs`, that attribute's global heap collection bytes).
+    /// Resolved in the apply loop right before this dataset's header is built.
+    vl_attrs: Vec<(usize, Vec<u8>)>,
+    /// A staged variable-length-string dataset's element references (still
+    /// carrying placeholder heap addresses in `raw`) and global heap collection.
+    /// Resolved in the apply loop right before `raw` is appended.
+    vl_string_staging: Option<VlStringStaging>,
 }
 
 /// Split a path into non-empty components.
@@ -3455,10 +3551,15 @@ fn retain_disjoint_in_bounds(spans: &mut Vec<(u64, u64)>, eof: u64) {
 /// whole-file writer, its data address is `HADDR_UNDEF` — see the apply loop),
 /// but chunking one stays refused via the geometry validation below. A
 /// `provenance` dataset has its SHA-256/creator/timestamp/source attributes
-/// computed here from `raw`, exactly as the whole-file writer does. Rejects
-/// any remaining feature this engine cannot reproduce faithfully:
-/// object-reference datasets, variable-length or dense attributes, or a filter
-/// pipeline the build cannot construct.
+/// computed here from `raw`, exactly as the whole-file writer does. A
+/// variable-length attribute's global heap collection is built here (it is
+/// fully self-contained — no address of its own) but placed and patched later,
+/// in the apply loop, once its final address is known; likewise a
+/// variable-length-string dataset's staged references and collection
+/// (`db.vl_string_staging`) are carried through unresolved. Rejects any
+/// remaining feature this engine cannot reproduce faithfully: object-reference
+/// datasets, dense attributes, a chunked/extensible variable-length-string
+/// dataset, or a filter pipeline the build cannot construct.
 fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
     if db.name.is_empty() {
         return Err(Error::EditUnsupported("dataset path has an empty name"));
@@ -3480,6 +3581,16 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
     if is_empty && chunked {
         return Err(Error::EditUnsupported(
             "chunked or extensible empty (zero-element) datasets cannot be added in place yet",
+        ));
+    }
+    // Variable-length string element references live in the global heap, whose
+    // address is only known once the apply loop places the collection. For
+    // chunked/filtered/resizable storage the references sit inside chunks
+    // written before that address exists, so patching them in is impossible —
+    // mirrors the whole-file writer's `ChunkedVlenStringUnsupported` refusal.
+    if db.vl_string_staging.is_some() && chunked {
+        return Err(Error::EditUnsupported(
+            "chunked or extensible variable-length-string datasets cannot be added in place yet",
         ));
     }
     let raw = if is_empty {
@@ -3561,15 +3672,6 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
             })?;
     }
 
-    if db
-        .attrs
-        .iter()
-        .any(|(_, v)| matches!(v, AttrValue::VarLenAsciiArray(_)))
-    {
-        return Err(Error::EditUnsupported(
-            "variable-length attributes cannot be added in place yet",
-        ));
-    }
     // The link message body (whose length is independent of the address) must
     // fit the object-header message's u16 size field; a pathologically long
     // name would otherwise overflow it into silent corruption.
@@ -3599,6 +3701,22 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
     for (n, v) in &db.attrs {
         attrs.push(build_attr_message(n, v));
     }
+    // `build_attr_message` already writes a placeholder (heap address 0) for a
+    // `VarLenAsciiArray` attribute; stage its self-contained global heap
+    // collection here (no address of its own to resolve yet) and record which
+    // `attrs` slot it patches once the apply loop places it.
+    let vl_attrs: Vec<(usize, Vec<u8>)> = db
+        .attrs
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (_, v))| match v {
+            AttrValue::VarLenAsciiArray(strings) => {
+                let str_refs: Vec<&str> = strings.iter().map(String::as_str).collect();
+                Some((i, build_global_heap_collection(&str_refs)))
+            }
+            _ => None,
+        })
+        .collect();
     #[cfg(feature = "provenance")]
     if let Some(ref prov) = db.provenance {
         let p = crate::provenance::Provenance {
@@ -3607,6 +3725,18 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
             source: prov.source.clone(),
         };
         attrs.extend(p.build_attrs(&raw));
+    }
+    // The object-header message-size field is 2 bytes wide, so an oversized
+    // attribute (most reachable via a `VarLenAsciiArray` with many/long
+    // strings) would silently truncate and corrupt the header if written
+    // as-is; refuse it instead, mirroring `apply_group_attr_ops`'s and
+    // `encode_attr_message`'s equivalent checks for group/root attributes.
+    for a in &attrs {
+        if a.serialize(LENGTH_SIZE).len() > u16::MAX as usize {
+            return Err(Error::EditUnsupported(
+                "dataset attribute is too large to encode in place",
+            ));
+        }
     }
     if attrs.len() > MAX_COMPACT_ATTRS {
         return Err(Error::EditUnsupported(
@@ -3622,6 +3752,8 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
         attrs,
         chunk_options: db.chunk_options,
         maxshape: db.maxshape,
+        vl_attrs,
+        vl_string_staging: db.vl_string_staging,
     })
 }
 
@@ -4178,26 +4310,60 @@ fn remove_link_from_region(region: &[u8], name: &str) -> Result<Vec<u8>, Error> 
 }
 
 /// Apply compact attribute edits to a group message `region`, preserving every
-/// non-attribute message verbatim. The result is still a compact-attribute
-/// header; dense attribute storage and shared attribute messages are refused.
-fn apply_group_attr_ops(region: &[u8], ops: &[GroupAttrOp]) -> Result<Vec<u8>, Error> {
+/// non-attribute message verbatim. A fixed-size `Set`/`Remove` is resolved
+/// into `region` directly; a variable-length `Set` (`VarLenAsciiArray`) is
+/// instead collected into the returned `pending_vl_attrs` — its placeholder
+/// heap address is only patched, and the message appended to the group's
+/// header, by the apply loop once its global heap collection's real address
+/// is known (see [`EditSession::place_vl_collection`]). A later op for the
+/// same name (another `Set`, fixed-size or not, or a `Remove`) replaces or
+/// cancels an earlier still-pending variable-length entry, keeping the net
+/// effect the same regardless of op order within one commit. `region`'s
+/// fixed-size portion is a complete compact-attribute header on return; dense
+/// attribute storage and shared attribute messages are refused.
+fn apply_group_attr_ops(
+    region: &[u8],
+    ops: &[GroupAttrOp],
+) -> Result<(Vec<u8>, PendingVlAttrs), Error> {
     let mut out = region.to_vec();
+    let mut pending_vl: PendingVlAttrs = Vec::new();
     let mut wrote_attr = false;
     for op in ops {
-        out = match op {
+        match op {
             GroupAttrOp::Set { name, value } => {
                 wrote_attr = true;
-                set_attr_in_region(&out, name, value)?
+                pending_vl.retain(|(msg, _)| &msg.name != name);
+                if let AttrValue::VarLenAsciiArray(strings) = value {
+                    // Nothing yet to remove from `region` if this name has
+                    // never been set as a fixed-size attribute.
+                    out = remove_attr_from_region(&out, name, false)?;
+                    let msg = build_attr_message(name, value);
+                    if msg.serialize(LENGTH_SIZE).len() > u16::MAX as usize {
+                        return Err(Error::EditUnsupported(
+                            "group attribute is too large to encode in place",
+                        ));
+                    }
+                    let str_refs: Vec<&str> = strings.iter().map(String::as_str).collect();
+                    pending_vl.push((msg, build_global_heap_collection(&str_refs)));
+                } else {
+                    out = set_attr_in_region(&out, name, value)?;
+                }
             }
-            GroupAttrOp::Remove { name } => remove_attr_from_region(&out, name)?,
-        };
+            GroupAttrOp::Remove { name } => {
+                let before = pending_vl.len();
+                pending_vl.retain(|(msg, _)| &msg.name != name);
+                if pending_vl.len() == before {
+                    out = remove_attr_from_region(&out, name, true)?;
+                }
+            }
+        }
     }
-    if wrote_attr && compact_attr_count(&out)? > MAX_COMPACT_ATTRS {
+    if wrote_attr && compact_attr_count(&out)? + pending_vl.len() > MAX_COMPACT_ATTRS {
         return Err(Error::EditUnsupported(
             "group attributes would exceed compact storage; dense attribute edits are not supported in place yet",
         ));
     }
-    Ok(out)
+    Ok((out, pending_vl))
 }
 
 /// Copy a message region, dropping all Attribute messages named `name` and then
@@ -4232,8 +4398,12 @@ fn set_attr_in_region(region: &[u8], name: &str, value: &AttrValue) -> Result<Ve
     Ok(out)
 }
 
-/// Copy a message region, dropping all Attribute messages named `name`.
-fn remove_attr_from_region(region: &[u8], name: &str) -> Result<Vec<u8>, Error> {
+/// Copy a message region, dropping all Attribute messages named `name`. When
+/// `required` is true, an absent `name` is an [`Error::EditUnsupported`] (a
+/// `Remove` of a nonexistent attribute); when false, it is not an error (a
+/// `Set` of a fresh variable-length attribute may have no fixed-size message
+/// to remove from the region yet).
+fn remove_attr_from_region(region: &[u8], name: &str, required: bool) -> Result<Vec<u8>, Error> {
     let mut out = Vec::with_capacity(region.len());
     let mut p = 0;
     let mut removed = false;
@@ -4262,7 +4432,7 @@ fn remove_attr_from_region(region: &[u8], name: &str) -> Result<Vec<u8>, Error> 
     if p < region.len() {
         out.extend_from_slice(&region[p..]);
     }
-    if !removed {
+    if !removed && required {
         return Err(Error::EditUnsupported(
             "group attribute to remove was not found",
         ));
@@ -4304,11 +4474,14 @@ fn parse_compact_attr_name(
 }
 
 fn encode_attr_message(name: &str, value: &AttrValue) -> Result<Vec<u8>, Error> {
-    if matches!(value, AttrValue::VarLenAsciiArray(_)) {
-        return Err(Error::EditUnsupported(
-            "variable-length group attributes cannot be edited in place yet",
-        ));
-    }
+    // `apply_group_attr_ops`'s `Set` branch — this function's only caller —
+    // handles `VarLenAsciiArray` itself (staging it into `pending_vl` instead
+    // of calling `set_attr_in_region`/here), so this value is always
+    // fixed-size by construction, not by a check made at this call site.
+    debug_assert!(
+        !matches!(value, AttrValue::VarLenAsciiArray(_)),
+        "VarLenAsciiArray must be intercepted by apply_group_attr_ops before reaching encode_attr_message"
+    );
     let body = build_attr_message(name, value).serialize(LENGTH_SIZE);
     if body.len() > u16::MAX as usize {
         return Err(Error::EditUnsupported(
@@ -4687,6 +4860,50 @@ mod tests {
             Superblock::parse(&data, off).unwrap().consistency_flags,
             0,
             "commit must clear the stale consistency flag"
+        );
+    }
+
+    #[test]
+    fn add_vlen_string_dataset_with_null_elements_via_edit_session() {
+        // Regression test for a silent-corruption bug (issue #105): a
+        // VL-string dataset added via `EditSession` used to commit `Ok(())`
+        // without ever writing its global heap collection or patching its
+        // placeholder references, so the dataset failed to read back. A null
+        // element (no heap object at all, distinct from an empty string) must
+        // stay untouched by the patch — only `patch_mask`-flagged elements'
+        // placeholder addresses are resolved; exercising both keeps the mask
+        // itself, not just the common all-`Bytes` case, under test.
+        use crate::type_builders::VlStringElement;
+        use crate::writer::FileBuilder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vlen_null.h5");
+
+        let mut b = FileBuilder::new();
+        b.create_dataset("seed").with_i32_data(&[0]);
+        b.write(&path).unwrap();
+
+        let datatype =
+            crate::type_builders::make_vlen_string_type(crate::datatype::CharacterSet::Utf8);
+        let elements = vec![
+            VlStringElement::Bytes(b"alpha".to_vec()),
+            VlStringElement::Null,
+            VlStringElement::Bytes(b"gamma".to_vec()),
+        ];
+
+        {
+            let mut s = EditSession::open(&path).unwrap();
+            s.create_dataset("labels")
+                .with_vlen_string_elements(datatype, &elements)
+                .unwrap();
+            s.commit().unwrap();
+        }
+
+        let file = crate::reader::File::open(&path).unwrap();
+        let ds = file.dataset("labels").unwrap();
+        assert_eq!(
+            ds.read_string().unwrap(),
+            vec!["alpha".to_string(), String::new(), "gamma".to_string()]
         );
     }
 }
