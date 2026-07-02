@@ -1233,8 +1233,12 @@ impl EditSession {
             // target are stored relative to the base address (`- base`).
             for mut fd in flat.remove(key).into_iter().flatten() {
                 // Place each variable-length attribute's global heap collection
-                // and patch its placeholder heap address (chunked datasets never
-                // carry these — `flatten_dataset` refuses that combination).
+                // and patch its placeholder heap address. Unlike VL-string
+                // *data* (`vl_string_staging`, refused when chunked below), a
+                // chunked/extensible dataset can carry a VL *attribute* just
+                // fine — attributes live in the object header, not inside a
+                // chunk, so patching them here before either apply branch runs
+                // covers both.
                 for (idx, collection_bytes) in std::mem::take(&mut fd.vl_attrs) {
                     let addr = self.place_vl_collection(&collection_bytes)?;
                     patch_vl_refs(&mut fd.attrs[idx].raw_data, addr);
@@ -1888,6 +1892,22 @@ impl EditSession {
             return Err(Error::EditUnsupported(
                 "write_dataset overwrites values only; it cannot set attributes \
                  (set them with a separate edit)",
+            ));
+        }
+
+        // `with_vlen_strings` stages placeholder element references that only the
+        // add path's apply loop knows how to resolve (place the global heap
+        // collection, then patch the placeholders once its address is known,
+        // before the data block itself is written). `prepare_write` runs during
+        // preflight, before any bytes are written and without `&mut self`
+        // access to place a heap collection, and its result can be flushed by
+        // the same-length fast path with no apply loop at all — so refuse
+        // rather than write unpatched (heap address 0) placeholders as if they
+        // were final.
+        if fd.vl_string_staging.is_some() {
+            return Err(Error::EditUnsupported(
+                "write_dataset cannot overwrite a variable-length-string dataset's \
+                 data in place yet",
             ));
         }
 
@@ -3706,6 +3726,18 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
         };
         attrs.extend(p.build_attrs(&raw));
     }
+    // The object-header message-size field is 2 bytes wide, so an oversized
+    // attribute (most reachable via a `VarLenAsciiArray` with many/long
+    // strings) would silently truncate and corrupt the header if written
+    // as-is; refuse it instead, mirroring `apply_group_attr_ops`'s and
+    // `encode_attr_message`'s equivalent checks for group/root attributes.
+    for a in &attrs {
+        if a.serialize(LENGTH_SIZE).len() > u16::MAX as usize {
+            return Err(Error::EditUnsupported(
+                "dataset attribute is too large to encode in place",
+            ));
+        }
+    }
     if attrs.len() > MAX_COMPACT_ATTRS {
         return Err(Error::EditUnsupported(
             "datasets with dense (many) attributes cannot be added in place yet",
@@ -4442,11 +4474,14 @@ fn parse_compact_attr_name(
 }
 
 fn encode_attr_message(name: &str, value: &AttrValue) -> Result<Vec<u8>, Error> {
-    if matches!(value, AttrValue::VarLenAsciiArray(_)) {
-        return Err(Error::EditUnsupported(
-            "variable-length group attributes cannot be edited in place yet",
-        ));
-    }
+    // `apply_group_attr_ops`'s `Set` branch — this function's only caller —
+    // handles `VarLenAsciiArray` itself (staging it into `pending_vl` instead
+    // of calling `set_attr_in_region`/here), so this value is always
+    // fixed-size by construction, not by a check made at this call site.
+    debug_assert!(
+        !matches!(value, AttrValue::VarLenAsciiArray(_)),
+        "VarLenAsciiArray must be intercepted by apply_group_attr_ops before reaching encode_attr_message"
+    );
     let body = build_attr_message(name, value).serialize(LENGTH_SIZE);
     if body.len() > u16::MAX as usize {
         return Err(Error::EditUnsupported(
