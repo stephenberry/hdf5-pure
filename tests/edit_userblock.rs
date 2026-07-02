@@ -235,6 +235,65 @@ fn userblock_add_provenance_dataset_roundtrip() {
     std::fs::remove_file(&path).ok();
 }
 
+/// A dataset with a variable-length attribute, added on a userblock file,
+/// must round-trip correctly: `EditSession::place_vl_collection`'s
+/// `addr - base_address` arithmetic is only actually exercised (as opposed to
+/// a no-op at `base == 0`) once `base` is non-zero.
+#[test]
+fn userblock_add_dataset_with_vlen_attribute_roundtrip() {
+    let path = std::env::temp_dir().join("hdf5_pure_ub_add_vlen_attr.h5");
+    let userblock = build_userblock_file(&path);
+
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        s.create_dataset("labeled")
+            .with_i32_data(&[1, 2, 3])
+            .set_attr(
+                "tags",
+                AttrValue::VarLenAsciiArray(vec!["one".into(), "two".into()]),
+            );
+        s.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let ds = file.dataset("labeled").unwrap();
+    assert_eq!(ds.read_i32().unwrap(), vec![1, 2, 3]);
+    assert_eq!(
+        ds.attrs().unwrap().get("tags"),
+        Some(&AttrValue::StringArray(vec!["one".into(), "two".into()]))
+    );
+    assert_eq!(&std::fs::read(&path).unwrap()[..UB], &userblock[..]);
+
+    std::fs::remove_file(&path).ok();
+}
+
+/// A variable-length-string dataset added on a userblock file must round-trip
+/// correctly, exercising the same `place_vl_collection` base-relative
+/// arithmetic as the attribute case above but for dataset *data* rather than
+/// an attribute.
+#[test]
+fn userblock_add_vlen_string_dataset_roundtrip() {
+    let path = std::env::temp_dir().join("hdf5_pure_ub_add_vlen_string_ds.h5");
+    let userblock = build_userblock_file(&path);
+
+    {
+        let mut s = EditSession::open(&path).unwrap();
+        s.create_dataset("labels")
+            .with_vlen_strings(&["alpha", "", "gamma"]);
+        s.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let ds = file.dataset("labels").unwrap();
+    assert_eq!(
+        ds.read_string().unwrap(),
+        vec!["alpha".to_string(), String::new(), "gamma".to_string()]
+    );
+    assert_eq!(&std::fs::read(&path).unwrap()[..UB], &userblock[..]);
+
+    std::fs::remove_file(&path).ok();
+}
+
 #[test]
 fn real_mat_add_dataset_preserves_userblock_and_data() {
     // Copy the fixture so the test never mutates the checked-in file.
