@@ -41,6 +41,10 @@ SWMR append requires a **latest-format** file (v2/v3 superblock) and **no userbl
 
 In-place editing operates on files with **8-byte offsets and lengths** (what the writer emits and what modern files use). Other offset/length widths are not editable in place.
 
+### Group creation property list (GCPL)
+
+There is no property-list API for group creation, and none of its settings are configurable — every group `hdf5-pure` writes (including the root group) has exactly one fixed shape: a new-style (v2 object header) group with compact link storage and no stored timestamps. This is equivalent to always creating every group with `obj_track_times = false`, and never switching to old-style (symbol-table) or dense (fractal-heap) link storage, regardless of file version or child count. Unlike the reference library, whose GCPL defaults vary by version, this shape is fixed on purpose: it keeps output byte-for-byte reproducible, which is exactly what makes `hdf5-pure` a good fit for stable snapshot files. See [#131](https://github.com/stephenberry/hdf5-pure/issues/131).
+
 ## Planned support
 
 Refused today with a `... yet` message, intended to land. Each row links to its tracking issue.

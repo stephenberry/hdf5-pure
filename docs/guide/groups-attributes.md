@@ -47,6 +47,9 @@ The pattern is uniform at every level: build, finish, attach. A child must be fi
 
 See the [writing guide](writing.md) for the full dataset builder API used inside groups.
 
+!!! note "Group format is fixed, not configurable"
+    There is no group creation property list: every group is written with the same fixed, timestamp-free, new-style layout regardless of settings or child count. See [Limitations](../reference/limitations.md#group-creation-property-list-gcpl) for details.
+
 ## Attributes
 
 Attributes are small named pieces of metadata. Set them on the root via `FileBuilder::set_attr`, on a group via `GroupBuilder::set_attr`, or on a dataset via `DatasetBuilder::set_attr` (the dataset form is chainable and returns `&mut Self`). The value is an `AttrValue`, an enum covering the common scalar, array, and string encodings:
