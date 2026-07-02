@@ -88,11 +88,14 @@
 //!   dimensions. A chunked dataset's data and index — and any filtered chunks —
 //!   are produced by the same builder the whole-file writer uses and appended at
 //!   end-of-file, so its object header is byte-identical to a freshly written
-//!   one. Every added dataset must have a fixed-size datatype with a non-empty
-//!   shape and carry only fixed-size (non variable-length) attributes, few
-//!   enough to stay in compact storage; object-reference and provenance
-//!   datasets are not added in place. Group attribute edits have the same
-//!   compact, fixed-size attribute restriction.
+//!   one. A contiguous dataset may be empty (zero-element); chunking an empty
+//!   shape is not supported. A provenance dataset (`with_provenance`) is
+//!   supported, its attributes computed the same way the whole-file writer
+//!   computes them. Every added dataset must have a fixed-size datatype and
+//!   carry only fixed-size (non variable-length) attributes, few enough to stay
+//!   in compact storage; object-reference datasets are not added in place.
+//!   Group attribute edits have the same compact, fixed-size attribute
+//!   restriction.
 //! - A new group's parent must already exist or be created in the same session
 //!   (each level created explicitly); intermediate groups are not auto-created.
 //!
@@ -490,9 +493,11 @@ impl EditSession {
     ///
     /// The dataset may be contiguous or chunked, and chunked datasets may be
     /// filtered (`with_deflate`, `with_shuffle`, `with_fletcher32`,
-    /// `with_scale_offset`, `with_zfp`) and/or extensible (`with_maxshape`); see
-    /// the [module docs](self) for what stays unsupported (variable-length or
-    /// dense attributes, object-reference and provenance datasets, empty shapes).
+    /// `with_scale_offset`, `with_zfp`) and/or extensible (`with_maxshape`). An
+    /// empty (zero-element) contiguous dataset is supported (chunking one is
+    /// not), and a provenance dataset (`with_provenance`) is supported; see the
+    /// [module docs](self) for what still stays unsupported (variable-length or
+    /// dense attributes, object-reference datasets).
     pub fn create_dataset(&mut self, path: &str) -> &mut DatasetBuilder {
         let mut comps = split_path(path);
         let leaf = comps.pop().unwrap_or_default();
@@ -1211,11 +1216,20 @@ impl EditSession {
                 let oh = if fd.chunk_options.is_chunked() || fd.maxshape.is_some() {
                     self.build_chunked_dataset(&fd)?
                 } else {
-                    let data_addr = self.alloc_or_append(&fd.raw)?;
+                    // A zero-element dataset has no data block to allocate; its
+                    // layout address is the undefined-address sentinel (never
+                    // base-relative — see `build_dataset_oh`'s empty-data callers
+                    // in the whole-file writer), matching every reader's and the
+                    // reference C library's convention for "no storage allocated".
+                    let data_addr = if fd.raw.is_empty() {
+                        u64::MAX
+                    } else {
+                        self.alloc_or_append(&fd.raw)? - base
+                    };
                     build_dataset_oh(
                         &fd.dt,
                         &fd.ds,
-                        data_addr - base,
+                        data_addr,
                         fd.raw.len() as u64,
                         &fd.attrs,
                         None,
@@ -3436,11 +3450,15 @@ fn retain_disjoint_in_bounds(spans: &mut Vec<(u64, u64)>, eof: u64) {
 /// Validate a staged dataset and reduce it to a [`FlatDataset`]. Contiguous,
 /// unfiltered datasets are emitted as such; chunked, filtered, or extensible
 /// datasets carry their [`ChunkOptions`] and maxshape through to the commit,
-/// where [`build_chunked_data_at_ext`] lays out their chunk data and index.
-/// Rejects any remaining feature this engine cannot reproduce faithfully:
-/// object-reference or provenance datasets, variable-length or dense
-/// attributes, an empty (zero-element) shape, or a filter pipeline the build
-/// cannot construct.
+/// where [`build_chunked_data_at_ext`] lays out their chunk data and index. An
+/// empty (zero-element) shape is allowed for contiguous storage (mirroring the
+/// whole-file writer, its data address is `HADDR_UNDEF` — see the apply loop),
+/// but chunking one stays refused via the geometry validation below. A
+/// `provenance` dataset has its SHA-256/creator/timestamp/source attributes
+/// computed here from `raw`, exactly as the whole-file writer does. Rejects
+/// any remaining feature this engine cannot reproduce faithfully:
+/// object-reference datasets, variable-length or dense attributes, or a filter
+/// pipeline the build cannot construct.
 fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
     if db.name.is_empty() {
         return Err(Error::EditUnsupported("dataset path has an empty name"));
@@ -3450,12 +3468,6 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
             "object-reference datasets cannot be added in place yet",
         ));
     }
-    #[cfg(feature = "provenance")]
-    if db.provenance.is_some() {
-        return Err(Error::EditUnsupported(
-            "provenance datasets cannot be added in place yet",
-        ));
-    }
 
     let dt = db
         .datatype
@@ -3463,17 +3475,22 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
     let shape = db
         .shape
         .ok_or(Error::EditUnsupported("dataset has no shape"))?;
-    if shape.contains(&0) {
+    let is_empty = shape.contains(&0);
+    let chunked = db.chunk_options.is_chunked() || db.maxshape.is_some();
+    if is_empty && chunked {
         return Err(Error::EditUnsupported(
-            "empty (zero-element) datasets cannot be added in place yet",
+            "chunked or extensible empty (zero-element) datasets cannot be added in place yet",
         ));
     }
-    let raw = db
-        .data
-        .ok_or(Error::EditUnsupported("dataset has no data"))?;
+    let raw = if is_empty {
+        db.data.unwrap_or_default()
+    } else {
+        db.data
+            .ok_or(Error::EditUnsupported("dataset has no data"))?
+    };
 
     let elem = dt.type_size() as u64;
-    if elem > 0 {
+    if !is_empty && elem > 0 {
         // Multiply with checked arithmetic: an absurd shape whose element count
         // (or byte size) overflows `u64` is refused rather than panicking in a
         // debug build or silently wrapping in release (which could let a wrapped
@@ -3497,7 +3514,6 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
         }
     }
 
-    let chunked = db.chunk_options.is_chunked() || db.maxshape.is_some();
     if chunked {
         // Refuse malformed chunk geometry up front (the same validation the
         // whole-file writer applies), so a bad request — chunk dimensions of the
@@ -3551,11 +3567,6 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
             "variable-length attributes cannot be added in place yet",
         ));
     }
-    if db.attrs.len() > MAX_COMPACT_ATTRS {
-        return Err(Error::EditUnsupported(
-            "datasets with dense (many) attributes cannot be added in place yet",
-        ));
-    }
     // The link message body (whose length is independent of the address) must
     // fit the object-header message's u16 size field; a pathologically long
     // name would otherwise overflow it into silent corruption.
@@ -3581,11 +3592,25 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
         // unlimited dimension is `u64::MAX`); a fixed-shape dataset has none.
         max_dimensions: db.maxshape.clone(),
     };
-    let attrs = db
+    let mut attrs: Vec<crate::attribute::AttributeMessage> = db
         .attrs
         .iter()
         .map(|(n, v)| build_attr_message(n, v))
         .collect();
+    #[cfg(feature = "provenance")]
+    if let Some(ref prov) = db.provenance {
+        let p = crate::provenance::Provenance {
+            creator: prov.creator.clone(),
+            timestamp: prov.timestamp.clone(),
+            source: prov.source.clone(),
+        };
+        attrs.extend(p.build_attrs(&raw));
+    }
+    if attrs.len() > MAX_COMPACT_ATTRS {
+        return Err(Error::EditUnsupported(
+            "datasets with dense (many) attributes cannot be added in place yet",
+        ));
+    }
 
     Ok(FlatDataset {
         name: db.name,

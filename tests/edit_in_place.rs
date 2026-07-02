@@ -2204,3 +2204,93 @@ fn write_dataset_with_no_other_edits_takes_inplace_fast_path() {
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// A zero-element (empty) contiguous dataset — the on-disk equivalent of the
+/// whole-file writer's `HADDR_UNDEF` data address for "no storage allocated"
+/// (issue #105) — can be added in place, alongside an ordinary dataset in the
+/// same commit.
+#[test]
+fn add_empty_dataset_via_edit_session() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_empty.h5");
+    write_starter(&path);
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("empty")
+            .with_f64_data(&[])
+            .with_shape(&[0, 3]);
+        session.create_dataset("added").with_i32_data(&[7, 8]);
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let empty = file.dataset("empty").unwrap();
+    assert_eq!(empty.shape().unwrap(), vec![0, 3]);
+    assert_eq!(empty.dtype().unwrap(), DType::F64);
+    assert_eq!(empty.read_f64().unwrap(), Vec::<f64>::new());
+    assert_eq!(
+        file.dataset("added").unwrap().read_i32().unwrap(),
+        vec![7, 8]
+    );
+    // The original, pre-existing dataset is untouched.
+    assert_eq!(
+        file.dataset("original").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// Chunking a zero-element shape stays refused in place (it's a distinct,
+/// separately-tracked capability from the plain contiguous empty dataset
+/// above): `malformed_chunked_requests_are_rejected_without_writing` already
+/// covers the whole-file-writer-equivalent geometry refusal; this confirms
+/// `EditSession` refuses it too, cleanly, without writing anything.
+#[test]
+fn add_chunked_empty_dataset_is_rejected_without_writing() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_chunked_empty.h5");
+    write_starter(&path);
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("stream")
+            .with_i32_data(&[])
+            .with_shape(&[0])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[16]);
+        let err = session.commit().unwrap_err();
+        assert!(err.to_string().contains("empty"), "got: {err}");
+    }
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A provenance-tagged dataset (issue #105) can be added in place; the
+/// SHA-256/creator/timestamp attributes are computed and stored exactly as
+/// the whole-file writer does, and `verify_provenance` confirms them.
+#[cfg(feature = "provenance")]
+#[test]
+fn add_provenance_dataset_via_edit_session() {
+    use hdf5_pure::VerifyResult;
+
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_provenance.h5");
+    write_starter(&path);
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("sensor")
+            .with_f64_data(&[1.0, 2.0, 3.0])
+            .with_provenance("test-suite", "2026-02-19T12:00:00Z", Some("bench"));
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let ds = file.dataset("sensor").unwrap();
+    assert_eq!(ds.read_f64().unwrap(), vec![1.0, 2.0, 3.0]);
+    assert_eq!(ds.verify_provenance().unwrap(), VerifyResult::Ok);
+    std::fs::remove_file(&path).ok();
+}
