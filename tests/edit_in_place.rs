@@ -691,10 +691,9 @@ fn remove_missing_group_attribute_is_rejected_without_writing() {
 }
 
 #[test]
-fn variable_length_group_attribute_is_rejected_without_writing() {
+fn add_variable_length_root_attribute_via_edit_session() {
     let path = std::env::temp_dir().join("hdf5_pure_edit_vlen_group_attr.h5");
     write_starter(&path);
-    let before = std::fs::read(&path).unwrap();
 
     {
         let mut session = EditSession::open(&path).unwrap();
@@ -703,8 +702,92 @@ fn variable_length_group_attribute_is_rejected_without_writing() {
             "fields",
             AttrValue::VarLenAsciiArray(vec!["a".into(), "b".into()]),
         );
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let attrs = file.root().attrs().unwrap();
+    assert_eq!(
+        attrs.get("fields"),
+        Some(&AttrValue::StringArray(vec!["a".into(), "b".into()]))
+    );
+    // The rest of the file is untouched.
+    assert_eq!(
+        file.dataset("original").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn add_variable_length_group_attribute_then_remove_then_reset_in_one_commit() {
+    // A Set/Remove/Set sequence for the same name in one commit must leave
+    // only the final value, whether or not the intermediate states are
+    // variable-length — exercising `apply_group_attr_ops`'s pending-VL-attr
+    // bookkeeping (a plain region edit alone cannot represent an unresolved
+    // variable-length attribute).
+    let path = std::env::temp_dir().join("hdf5_pure_edit_vlen_group_attr_sequence.h5");
+    let mut b = FileBuilder::new();
+    let mut g = b.create_group("grp");
+    g.set_attr(
+        "fields",
+        AttrValue::VarLenAsciiArray(vec!["old1".into(), "old2".into()]),
+    );
+    b.add_group(g.finish());
+    b.write(&path).unwrap();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        // Replace the existing variable-length attribute with a fixed-size
+        // one, then remove it, then set a fresh variable-length value.
+        session.set_group_attr("grp", "fields", AttrValue::I64(1));
+        session.remove_group_attr("grp", "fields");
+        session.set_group_attr(
+            "grp",
+            "fields",
+            AttrValue::VarLenAsciiArray(vec!["new1".into(), "new2".into(), "new3".into()]),
+        );
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let attrs = file.root().group("grp").unwrap().attrs().unwrap();
+    assert_eq!(
+        attrs.get("fields"),
+        Some(&AttrValue::StringArray(vec![
+            "new1".into(),
+            "new2".into(),
+            "new3".into()
+        ]))
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn dense_group_attribute_storage_is_still_rejected_without_writing() {
+    // Dense (fractal-heap) attribute storage stays out of scope regardless of
+    // whether the edit is fixed-size or variable-length; this guards that the
+    // variable-length `Set` path added for issue #105 still refuses it rather
+    // than silently mishandling it.
+    let path = std::env::temp_dir().join("hdf5_pure_edit_dense_group_attr.h5");
+    let mut b = FileBuilder::new();
+    let mut g = b.create_group("grp");
+    for i in 0..12 {
+        g.set_attr(&format!("a{i}"), AttrValue::I64(i));
+    }
+    b.add_group(g.finish());
+    b.write(&path).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session.set_group_attr(
+            "grp",
+            "fields",
+            AttrValue::VarLenAsciiArray(vec!["a".into(), "b".into()]),
+        );
         let err = session.commit().unwrap_err();
-        assert!(err.to_string().contains("variable-length"), "got: {err}");
+        assert!(err.to_string().contains("dense"), "got: {err}");
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -2292,5 +2375,102 @@ fn add_provenance_dataset_via_edit_session() {
     let ds = file.dataset("sensor").unwrap();
     assert_eq!(ds.read_f64().unwrap(), vec![1.0, 2.0, 3.0]);
     assert_eq!(ds.verify_provenance().unwrap(), VerifyResult::Ok);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A dataset with a variable-length attribute (issue #105) can be added in
+/// place: its global heap collection is placed and its placeholder reference
+/// patched during commit, alongside the dataset's own fixed-size attributes.
+#[test]
+fn add_dataset_with_variable_length_attribute_via_edit_session() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_dataset_vlen_attr.h5");
+    write_starter(&path);
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        let ds = session.create_dataset("labeled");
+        ds.with_i32_data(&[1, 2, 3]);
+        ds.set_attr(
+            "tags",
+            AttrValue::VarLenAsciiArray(vec!["one".into(), "two".into(), "three".into()]),
+        );
+        ds.set_attr("scale", AttrValue::F64(2.5));
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let ds = file.dataset("labeled").unwrap();
+    assert_eq!(ds.read_i32().unwrap(), vec![1, 2, 3]);
+    let attrs = ds.attrs().unwrap();
+    assert_eq!(
+        attrs.get("tags"),
+        Some(&AttrValue::StringArray(vec![
+            "one".into(),
+            "two".into(),
+            "three".into()
+        ]))
+    );
+    assert_eq!(attrs.get("scale"), Some(&AttrValue::F64(2.5)));
+    // The original, pre-existing dataset is untouched.
+    assert_eq!(
+        file.dataset("original").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+/// Regression test for issue #105's silent-corruption bug: a variable-length
+/// string dataset (`with_vlen_strings`) added via `EditSession` used to commit
+/// `Ok(())` without ever writing its global heap collection or patching its
+/// placeholder references, so the dataset failed to read back
+/// (`InvalidGlobalHeapSignature`). It must now round-trip like any other
+/// added dataset.
+#[test]
+fn add_vlen_string_dataset_via_edit_session() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_vlen_string_dataset.h5");
+    write_starter(&path);
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("labels")
+            .with_vlen_strings(&["alpha", "", "gamma"]);
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let ds = file.dataset("labels").unwrap();
+    assert_eq!(
+        ds.read_string().unwrap(),
+        vec!["alpha".to_string(), String::new(), "gamma".to_string()]
+    );
+    // The original, pre-existing dataset is untouched.
+    assert_eq!(
+        file.dataset("original").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn add_chunked_vlen_string_dataset_is_rejected_without_writing() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_add_chunked_vlen_string.h5");
+    write_starter(&path);
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let mut session = EditSession::open(&path).unwrap();
+        session
+            .create_dataset("labels")
+            .with_vlen_strings(&["a", "b", "c"])
+            .with_chunks(&[2]);
+        let err = session.commit().unwrap_err();
+        assert!(
+            err.to_string().contains("variable-length-string"),
+            "got: {err}"
+        );
+    }
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
     std::fs::remove_file(&path).ok();
 }

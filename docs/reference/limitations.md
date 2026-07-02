@@ -57,7 +57,7 @@ Refused today with a `... yet` message, intended to land. Each row links to its 
 | **Dense** (fractal-heap) link & attribute storage | [#102](https://github.com/stephenberry/hdf5-pure/issues/102) |
 | Editing across **soft / external links** | [#103](https://github.com/stephenberry/hdf5-pure/issues/103) |
 | Userblock files, creation-order tracking, shared/SOHM messages, v0/v1 conversion | [#104](https://github.com/stephenberry/hdf5-pure/issues/104) |
-| Adding **object-reference** datasets and **variable-length-attribute** datasets/groups | [#105](https://github.com/stephenberry/hdf5-pure/issues/105) |
+| Adding **object-reference** datasets | [#105](https://github.com/stephenberry/hdf5-pure/issues/105) |
 | **Cross-file copy** of variable-length / reference / shared data | [#106](https://github.com/stephenberry/hdf5-pure/issues/106) |
 
 ### Repack

@@ -9,6 +9,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - `EditSession` now adds, in place, an **empty (zero-element) contiguous dataset** and a **provenance-tagged dataset** (`DatasetBuilder::with_provenance`, behind the `provenance` feature); a chunked/extensible empty dataset stays refused ([#105](https://github.com/stephenberry/hdf5-pure/issues/105)).
+- `EditSession` now adds, in place, a dataset, group, or root attribute with a **variable-length value** (`AttrValue::VarLenAsciiArray`) and a **variable-length-string dataset** (`DatasetBuilder::with_vlen_strings`); dense-attribute storage and a chunked/extensible variable-length-string dataset stay refused ([#105](https://github.com/stephenberry/hdf5-pure/issues/105)).
+
+### Fixed
+
+- `EditSession::create_dataset(...).with_vlen_strings(...)` no longer silently corrupts the added dataset: `commit()` now writes and patches its global heap collection, so the dataset reads back instead of failing with `InvalidGlobalHeapSignature` ([#105](https://github.com/stephenberry/hdf5-pure/issues/105)).
 
 ## [0.20.1] - 2026-07-01
 
