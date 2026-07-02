@@ -1451,6 +1451,7 @@ impl FileWriter {
 mod tests {
     use super::*;
     use crate::group_v2::resolve_path_any;
+    use crate::link_info::LinkInfoMessage;
     use crate::object_header::ObjectHeader;
     use crate::signature;
 
@@ -1542,6 +1543,85 @@ mod tests {
         fw.add_group(gb.finish());
         let bytes = fw.finish().unwrap();
         assert_eq!(read_dataset_f64(&bytes, "grp/vals"), vec![10.0, 20.0]);
+    }
+
+    // hdf5-pure has no group creation property list: every object header it
+    // writes is fixed to one shape, equivalent to the C library's
+    // `obj_track_times = false` (see issue #131) — never toggleable, so these
+    // lock in the "no timestamps" half of that fixed shape for both the root
+    // group and an ordinary sub-group.
+    #[test]
+    fn root_group_carries_no_timestamps() {
+        let fw = FileWriter::new();
+        let bytes = fw.finish().unwrap();
+        let (_, oh) = parse_file(&bytes);
+        assert_eq!(oh.flags & 0x20, 0, "times-stored flag must be clear");
+        assert!(oh.modification_time.is_none());
+        assert!(oh.access_time.is_none());
+        assert!(oh.change_time.is_none());
+        assert!(oh.birth_time.is_none());
+    }
+
+    #[test]
+    fn sub_group_carries_no_timestamps() {
+        let mut fw = FileWriter::new();
+        let mut gb = fw.create_group("grp");
+        gb.create_dataset("vals").with_f64_data(&[1.0]);
+        fw.add_group(gb.finish());
+        let bytes = fw.finish().unwrap();
+        let sig = signature::find_signature(&bytes).unwrap();
+        let sb = Superblock::parse(&bytes, sig).unwrap();
+        let addr = resolve_path_any(&bytes, &sb, "grp").unwrap();
+        let hdr =
+            ObjectHeader::parse(&bytes, addr as usize, sb.offset_size, sb.length_size).unwrap();
+        assert_eq!(hdr.flags & 0x20, 0, "times-stored flag must be clear");
+        assert!(hdr.modification_time.is_none());
+    }
+
+    // The other half of the fixed shape: every group is "new style" (a Link
+    // Info + Group Info message pair) with links stored inline, regardless of
+    // child count — hdf5-pure never converts a group to dense (fractal-heap)
+    // link storage on write (see issue #131 and the tracked gap in #102).
+    #[test]
+    fn group_links_stay_compact_regardless_of_child_count() {
+        let mut fw = FileWriter::new();
+        let mut gb = fw.create_group("grp");
+        for i in 0..20 {
+            gb.create_dataset(&format!("d{i}"))
+                .with_f64_data(&[i as f64]);
+        }
+        fw.add_group(gb.finish());
+        let bytes = fw.finish().unwrap();
+        let sig = signature::find_signature(&bytes).unwrap();
+        let sb = Superblock::parse(&bytes, sig).unwrap();
+        let addr = resolve_path_any(&bytes, &sb, "grp").unwrap();
+        let hdr =
+            ObjectHeader::parse(&bytes, addr as usize, sb.offset_size, sb.length_size).unwrap();
+
+        let link_info_msg = hdr
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::LinkInfo)
+            .unwrap();
+        let link_info = LinkInfoMessage::parse(&link_info_msg.data, sb.offset_size).unwrap();
+        assert!(
+            link_info.fractal_heap_address.is_none(),
+            "no dense link storage is ever used"
+        );
+
+        let group_info_msg = hdr
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::GroupInfo)
+            .unwrap();
+        assert_eq!(group_info_msg.data, vec![0, 0]);
+
+        let link_count = hdr
+            .messages
+            .iter()
+            .filter(|m| m.msg_type == MessageType::Link)
+            .count();
+        assert_eq!(link_count, 20);
     }
 
     #[test]
