@@ -363,7 +363,13 @@ impl EditSession {
         // the link-graph walk index `self.data` correctly. It is converted back to a
         // stored (base-relative) address only when the superblock is serialized on
         // commit.
-        superblock.root_group_address += superblock.base_address;
+        superblock.root_group_address = superblock
+            .root_group_address
+            .checked_add(superblock.base_address)
+            .ok_or(FormatError::OffsetOverflow {
+                offset: superblock.root_group_address,
+                length: superblock.base_address,
+            })?;
 
         let mut session = Self {
             handle,
@@ -5118,5 +5124,45 @@ mod tests {
             ds.read_string().unwrap(),
             vec!["alpha".to_string(), String::new(), "gamma".to_string()]
         );
+    }
+
+    #[test]
+    fn edit_session_root_group_base_address_overflow_is_rejected() {
+        // The edit-path sibling of issue #137. A userblock file has a nonzero base
+        // address that `EditSession::open` adds to the stored root-group address.
+        // A crafted address of HADDR_UNDEF must be rejected rather than overflow
+        // (panicking in debug, wrapping in release).
+        use crate::writer::FileBuilder;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("edit_root_overflow.h5");
+
+        const UB: u64 = 512;
+        let mut b = FileBuilder::new();
+        b.with_userblock(UB);
+        b.create_dataset("d").with_i32_data(&[1, 2, 3]);
+        b.write(&path).unwrap();
+
+        // Rewrite the stored (base-relative) root-group address to HADDR_UNDEF,
+        // recomputing the superblock checksum via `serialize`. The base address
+        // still equals the superblock offset, so the file stays editable and the
+        // editor reaches the `root_group_address + base` normalization.
+        let mut data = std::fs::read(&path).unwrap();
+        let off = signature::find_signature(&data).unwrap();
+        let mut sb = Superblock::parse(&data, off).unwrap();
+        assert_eq!(sb.base_address, UB, "userblock file must have base == UB");
+        sb.root_group_address = u64::MAX;
+        let bytes = sb.serialize();
+        data[off..off + bytes.len()].copy_from_slice(&bytes);
+        std::fs::write(&path, &data).unwrap();
+
+        let err = EditSession::open(&path).err().expect("open must fail");
+        match err {
+            Error::Format(FormatError::OffsetOverflow { offset, length }) => {
+                assert_eq!(offset, u64::MAX);
+                assert_eq!(length, UB);
+            }
+            other => panic!("expected root-group address overflow, got {other:?}"),
+        }
     }
 }

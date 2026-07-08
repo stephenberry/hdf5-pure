@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- Reject superblocks whose base-address normalization overflows instead of panicking or wrapping.
+- Reject base-address normalization that overflows `u64` instead of panicking or wrapping, covering the superblock root-group address (read and edit paths) and group-child object-header addresses.
 
 ## [0.21.0] - 2026-07-02
 
