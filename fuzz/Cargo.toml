@@ -8,6 +8,7 @@ edition = "2024"
 cargo-fuzz = true
 
 [dependencies]
+arbitrary = { version = "1", features = ["derive"] }
 hdf5-pure = { path = ".." }
 libfuzzer-sys = "0.4"
 tempfile = "3"
@@ -21,5 +22,11 @@ doc = false
 [[bin]]
 name = "streaming_differential"
 path = "fuzz_targets/streaming_differential.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "roundtrip_simple"
+path = "fuzz_targets/roundtrip_simple.rs"
 test = false
 doc = false
