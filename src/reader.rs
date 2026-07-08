@@ -389,7 +389,13 @@ impl File {
         let mut superblock = Superblock::parse(data, sig_offset)?;
         let addr_offset = superblock.base_address;
         // Normalize root_group_address to absolute so resolve_path_any works.
-        superblock.root_group_address += addr_offset;
+        superblock.root_group_address = superblock
+            .root_group_address
+            .checked_add(addr_offset)
+            .ok_or(FormatError::OffsetOverflow {
+                offset: superblock.root_group_address,
+                length: addr_offset,
+            })?;
         Ok((superblock, addr_offset))
     }
 
@@ -401,7 +407,13 @@ impl File {
         let sig_offset = signature::find_signature_in(source)?;
         let mut superblock = Superblock::parse_from_source(source, sig_offset)?;
         let addr_offset = superblock.base_address;
-        superblock.root_group_address += addr_offset;
+        superblock.root_group_address = superblock
+            .root_group_address
+            .checked_add(addr_offset)
+            .ok_or(FormatError::OffsetOverflow {
+                offset: superblock.root_group_address,
+                length: addr_offset,
+            })?;
         Ok((superblock, addr_offset))
     }
 
@@ -746,7 +758,15 @@ impl File {
         }
         .map_err(Error::Format)?;
         for entry in &mut entries {
-            entry.object_header_address += base;
+            // The stored address is relative to the base address; normalize to an
+            // absolute file offset. A crafted entry (e.g. the HADDR_UNDEF sentinel)
+            // must not wrap or panic.
+            entry.object_header_address = entry.object_header_address.checked_add(base).ok_or(
+                FormatError::OffsetOverflow {
+                    offset: entry.object_header_address,
+                    length: base,
+                },
+            )?;
         }
         Ok(entries)
     }
@@ -1689,5 +1709,85 @@ mod tests {
         // enabled file default would have populated both.
         assert!(!ds.chunk_cache_stats().index_loaded());
         assert_eq!(ds.chunk_cache_stats().cached_chunks(), 0);
+    }
+
+    /// A group child whose stored (base-relative) object-header address overflows
+    /// `u64` once the base address is added must be rejected, not wrapped or
+    /// panicked on. Reaching this needs a nonzero base address, so the file
+    /// carries a userblock; the child link's stored address is then rewritten to
+    /// `HADDR_UNDEF` (all ones) so `group_children`'s normalization overflows.
+    #[test]
+    fn group_child_address_base_overflow_is_rejected() {
+        const UB: u64 = 512;
+        let mut b = FileBuilder::new();
+        b.with_userblock(UB);
+        let mut child = b.create_group("child");
+        child.create_dataset("inner").with_i32_data(&[1, 2, 3]);
+        b.add_group(child.finish());
+        let mut bytes = b.finish().unwrap();
+
+        // Baseline: the file reads and the subgroup is listed.
+        let file = File::from_bytes(bytes.clone()).unwrap();
+        assert_eq!(file.root().groups().unwrap(), vec!["child".to_string()]);
+
+        // Rewrite the child's stored object-header address to HADDR_UNDEF. It is
+        // stored base-relative (absolute minus the userblock base) and, for this
+        // single-child file, appears exactly once in the bytes. The link lives in
+        // the root object header's chunk-0.
+        let stored = file.root().group("child").unwrap().address - UB;
+        let needle = stored.to_le_bytes();
+        let matches: Vec<usize> = bytes
+            .windows(8)
+            .enumerate()
+            .filter(|(_, w)| *w == needle)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "stored child address {stored:#x} was not uniquely locatable: {matches:?}"
+        );
+        bytes[matches[0]..matches[0] + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+
+        // The v2 object header is checksum-protected, so a real crafted file would
+        // carry a matching checksum; recompute the root header's over the edited
+        // bytes so parsing reaches the address normalization rather than failing on
+        // the checksum first. Mirrors the chunk-0 extent from `parse_v2`.
+        #[cfg(feature = "checksum")]
+        {
+            let root_addr = file.root().address as usize;
+            assert_eq!(&bytes[root_addr..root_addr + 4], b"OHDR");
+            let flags = bytes[root_addr + 5];
+            let mut pos = root_addr + 6;
+            if flags & 0x20 != 0 {
+                pos += 16;
+            }
+            if flags & 0x10 != 0 {
+                pos += 4;
+            }
+            let width = 1usize << (flags & 0x03);
+            let chunk0 = (0..width).fold(0usize, |acc, i| {
+                acc | ((bytes[pos + i] as usize) << (8 * i))
+            });
+            pos += width;
+            let chunk0_end = pos + chunk0;
+            assert!(
+                matches[0] < chunk0_end,
+                "patched link address is outside the root header's chunk-0"
+            );
+            let cs = crate::checksum::jenkins_lookup3(&bytes[root_addr..chunk0_end]);
+            bytes[chunk0_end..chunk0_end + 4].copy_from_slice(&cs.to_le_bytes());
+        }
+
+        // Iterating the root now normalizes `u64::MAX + base` and must surface the
+        // overflow as a format error rather than panicking or wrapping.
+        let file = File::from_bytes(bytes).unwrap();
+        match file.root().groups() {
+            Err(Error::Format(FormatError::OffsetOverflow { offset, length })) => {
+                assert_eq!(offset, u64::MAX);
+                assert_eq!(length, UB);
+            }
+            other => panic!("expected group-child address overflow, got {other:?}"),
+        }
     }
 }
