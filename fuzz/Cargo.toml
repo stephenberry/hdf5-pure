@@ -10,9 +10,16 @@ cargo-fuzz = true
 [dependencies]
 hdf5-pure = { path = ".." }
 libfuzzer-sys = "0.4"
+tempfile = "3"
 
 [[bin]]
 name = "parse_file"
 path = "fuzz_targets/parse_file.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "streaming_differential"
+path = "fuzz_targets/streaming_differential.rs"
 test = false
 doc = false

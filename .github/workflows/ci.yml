@@ -144,6 +144,8 @@ jobs:
         run: cargo install cargo-fuzz --version 0.13.2 --locked
       - name: Run parser fuzz target
         run: cargo +nightly fuzz run parse_file -- -runs=1024
+      - name: Run streaming differential fuzz target
+        run: cargo +nightly fuzz run streaming_differential fuzz/corpus/parse_file -- -runs=256
 
   # Detect accidental or unversioned public-API changes by diffing the crate
   # against the latest version published to crates.io. A breaking change (e.g.
