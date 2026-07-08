@@ -131,6 +131,24 @@ jobs:
           tool: cargo-shear
       - run: cargo shear
 
+  fuzz:
+    name: Fuzz (cargo-fuzz smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cargo-fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Run parser fuzz target
+        run: cargo +nightly fuzz run parse_file -- -runs=1024
+      - name: Run streaming differential fuzz target
+        run: cargo +nightly fuzz run streaming_differential fuzz/corpus/parse_file -- -runs=256
+      - name: Run simple roundtrip fuzz target
+        run: cargo +nightly fuzz run roundtrip_simple -- -runs=1024
+
   # Detect accidental or unversioned public-API changes by diffing the crate
   # against the latest version published to crates.io. A breaking change (e.g.
   # removing a `pub fn`) fails the job unless the version in Cargo.toml is

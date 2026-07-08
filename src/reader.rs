@@ -396,6 +396,7 @@ impl File {
                 offset: superblock.root_group_address,
                 length: addr_offset,
             })?;
+        debug_assert!(superblock.root_group_address >= addr_offset);
         Ok((superblock, addr_offset))
     }
 
@@ -414,6 +415,7 @@ impl File {
                 offset: superblock.root_group_address,
                 length: addr_offset,
             })?;
+        debug_assert!(superblock.root_group_address >= addr_offset);
         Ok((superblock, addr_offset))
     }
 
