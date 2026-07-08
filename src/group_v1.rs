@@ -42,7 +42,13 @@ pub fn resolve_v1_group_entries(
         length_size,
     )?;
     // The data segment address stored in the heap is also relative to base_address
-    heap.data_segment_address += base_address;
+    heap.data_segment_address =
+        heap.data_segment_address
+            .checked_add(base_address)
+            .ok_or(FormatError::OffsetOverflow {
+                offset: heap.data_segment_address,
+                length: base_address,
+            })?;
 
     // Collect all SNOD addresses from B-tree (btree_address is relative to base_address)
     let snod_addrs = collect_symbol_table_nodes(

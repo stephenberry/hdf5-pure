@@ -389,7 +389,13 @@ impl File {
         let mut superblock = Superblock::parse(data, sig_offset)?;
         let addr_offset = superblock.base_address;
         // Normalize root_group_address to absolute so resolve_path_any works.
-        superblock.root_group_address += addr_offset;
+        superblock.root_group_address = superblock
+            .root_group_address
+            .checked_add(addr_offset)
+            .ok_or(FormatError::OffsetOverflow {
+                offset: superblock.root_group_address,
+                length: addr_offset,
+            })?;
         Ok((superblock, addr_offset))
     }
 
@@ -401,7 +407,13 @@ impl File {
         let sig_offset = signature::find_signature_in(source)?;
         let mut superblock = Superblock::parse_from_source(source, sig_offset)?;
         let addr_offset = superblock.base_address;
-        superblock.root_group_address += addr_offset;
+        superblock.root_group_address = superblock
+            .root_group_address
+            .checked_add(addr_offset)
+            .ok_or(FormatError::OffsetOverflow {
+                offset: superblock.root_group_address,
+                length: addr_offset,
+            })?;
         Ok((superblock, addr_offset))
     }
 
