@@ -75,7 +75,7 @@ fn read_length(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
 /// Check if all bytes in a slice are 0xFF (undefined address).
 fn is_undefined(data: &[u8], pos: usize, size: u8) -> bool {
     let s = size as usize;
-    if pos + s > data.len() {
+    if s > data.len() || pos > data.len() - s {
         return false;
     }
     data[pos..pos + s].iter().all(|&b| b == 0xFF)

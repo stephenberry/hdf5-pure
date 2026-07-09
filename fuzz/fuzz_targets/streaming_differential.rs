@@ -1,7 +1,8 @@
 #![no_main]
 
-use hdf5_pure::{Dataset, File, Group};
+use hdf5_pure::{AttrValue, Dataset, File, Group};
 use libfuzzer_sys::fuzz_target;
+use std::collections::HashMap;
 use std::io::Write;
 use tempfile::NamedTempFile;
 
@@ -58,7 +59,7 @@ fn assert_same_group(
     path: &str,
     depth: usize,
 ) {
-    assert_same_result(buffered_group.attrs(), streaming_group.attrs());
+    assert_same_attrs(buffered_group.attrs(), streaming_group.attrs());
 
     let buffered_datasets = buffered_group.datasets();
     let streaming_datasets = streaming_group.datasets();
@@ -114,7 +115,7 @@ fn assert_same_group(
 fn assert_same_dataset(buffered: &Dataset<'_>, streaming: &Dataset<'_>) {
     assert_same_result(buffered.shape(), streaming.shape());
     assert_same_result(buffered.dtype(), streaming.dtype());
-    assert_same_result(buffered.attrs(), streaming.attrs());
+    assert_same_attrs(buffered.attrs(), streaming.attrs());
     assert_eq!(
         buffered.chunk_cache_stats().index_loaded(),
         streaming.chunk_cache_stats().index_loaded()
@@ -135,6 +136,32 @@ fn assert_same_result<T: PartialEq>(
 ) {
     if let (Ok(buffered), Ok(streaming)) = (buffered, streaming) {
         assert!(buffered == streaming);
+    }
+}
+
+/// Compare two attribute maps NaN-tolerantly and order-independently.
+///
+/// An attribute value may be a floating-point `NaN`, and `NaN != NaN` makes the
+/// derived `PartialEq` on `AttrValue`/`HashMap` report a difference even when
+/// both backends decoded the identical bytes. Debug-format each value (a `NaN`
+/// renders as a stable `"NaN"`) and compare the sorted key/value pairs, so a
+/// genuine divergence still fails while the `NaN` artifact does not.
+fn assert_same_attrs(
+    buffered: Result<HashMap<String, AttrValue>, hdf5_pure::Error>,
+    streaming: Result<HashMap<String, AttrValue>, hdf5_pure::Error>,
+) {
+    if let (Ok(buffered), Ok(streaming)) = (buffered, streaming) {
+        let mut left: Vec<(String, String)> = buffered
+            .iter()
+            .map(|(k, v)| (k.clone(), format!("{v:?}")))
+            .collect();
+        let mut right: Vec<(String, String)> = streaming
+            .iter()
+            .map(|(k, v)| (k.clone(), format!("{v:?}")))
+            .collect();
+        left.sort();
+        right.sort();
+        assert_eq!(left, right);
     }
 }
 

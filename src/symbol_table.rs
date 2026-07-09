@@ -17,9 +17,9 @@ pub struct SymbolTableMessage {
 
 fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
     let s = size as usize;
-    if pos + s > data.len() {
+    if s > data.len() || pos > data.len() - s {
         return Err(FormatError::UnexpectedEof {
-            expected: pos + s,
+            expected: pos.saturating_add(s),
             available: data.len(),
         });
     }
@@ -83,9 +83,9 @@ impl SymbolTableNode {
         offset_size: u8,
     ) -> Result<SymbolTableNode, FormatError> {
         // signature(4) + version(1) + reserved(1) + number_of_symbols(2) = 8
-        if offset + 8 > file_data.len() {
+        if 8 > file_data.len() || offset > file_data.len() - 8 {
             return Err(FormatError::UnexpectedEof {
-                expected: offset + 8,
+                expected: offset.saturating_add(8),
                 available: file_data.len(),
             });
         }
