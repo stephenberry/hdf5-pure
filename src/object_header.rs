@@ -170,6 +170,16 @@ impl ObjectHeader {
             // reserved(3) at pos+5..pos+8
             pos += 8;
 
+            // A message must lie entirely within chunk 0 (`header_data_size`).
+            // The buffered continuation parser and both streaming parsers already
+            // enforce this; without the same check here, a message that overruns
+            // `msg_end` would be read from the whole-file buffer and followed,
+            // while the streaming backend stops at the chunk boundary — the two
+            // backends would then disagree on a malformed header (issue #140).
+            if pos + msg_data_size > msg_end {
+                break;
+            }
+
             ensure_len(data, pos, msg_data_size)?;
             let msg_type = MessageType::from_u16(msg_type_raw);
 
@@ -1233,5 +1243,55 @@ mod tests {
         file_data[cont_offset..cont_offset + cont_chunk.len()].copy_from_slice(&cont_chunk);
 
         parse_three_ways(file_data, 8, 8, 0);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn streaming_v1_message_overrunning_chunk0_matches_buffered() {
+        // Regression for #140: a v1 chunk-0 message whose data overruns the
+        // declared object-header size (`header_data_size`). The buffered chunk-0
+        // parser must stop at the chunk boundary exactly as the buffered
+        // continuation parser and the streaming parser already do — otherwise it
+        // reads (and follows) a continuation message the streaming backend drops,
+        // so the two readers disagree on a malformed header.
+        let cont_msg_data = [0xBE, 0xEF];
+        let mut cont_chunk = Vec::new();
+        cont_chunk.extend_from_slice(&0x03u16.to_le_bytes()); // Datatype
+        cont_chunk.extend_from_slice(&(cont_msg_data.len() as u16).to_le_bytes());
+        cont_chunk.push(0);
+        cont_chunk.extend_from_slice(&[0u8; 3]); // reserved
+        cont_chunk.extend_from_slice(&cont_msg_data);
+
+        let cont_offset = 256usize;
+        let mut cont_ptr = Vec::new();
+        cont_ptr.extend_from_slice(&(cont_offset as u64).to_le_bytes());
+        cont_ptr.extend_from_slice(&(cont_chunk.len() as u64).to_le_bytes());
+
+        // Build the v1 prefix by hand so `header_data_size` can be understated:
+        // the sole continuation message occupies 8 (prefix) + 16 (pointer) = 24
+        // bytes, but we declare only 16, so its data overruns chunk 0 by 8 bytes.
+        let mut header = Vec::new();
+        header.push(1); // version
+        header.push(0); // reserved
+        header.extend_from_slice(&1u16.to_le_bytes()); // num_messages
+        header.extend_from_slice(&1u32.to_le_bytes()); // reference_count
+        header.extend_from_slice(&16u32.to_le_bytes()); // header_data_size (understated)
+        header.extend_from_slice(&[0u8; 4]); // pad prefix to 16 bytes
+        header.extend_from_slice(&0x0010u16.to_le_bytes()); // Continuation
+        header.extend_from_slice(&(cont_ptr.len() as u16).to_le_bytes()); // size = 16
+        header.push(0); // flags
+        header.extend_from_slice(&[0u8; 3]); // reserved
+        header.extend_from_slice(&cont_ptr); // pointer (overruns chunk 0)
+
+        let mut file_data = vec![0u8; cont_offset + cont_chunk.len()];
+        file_data[..header.len()].copy_from_slice(&header);
+        file_data[cont_offset..cont_offset + cont_chunk.len()].copy_from_slice(&cont_chunk);
+
+        // All three backends must agree — and, with the overrunning message
+        // dropped, agree on an empty message list (the continuation is never
+        // followed, so its Datatype message is unreachable too).
+        parse_three_ways(file_data.clone(), 8, 8, 0);
+        let buffered = ObjectHeader::parse_with_base(&file_data, 0, 8, 8, 0).unwrap();
+        assert_eq!(buffered.messages.len(), 0);
     }
 }
