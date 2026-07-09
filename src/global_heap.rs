@@ -8,7 +8,7 @@ use crate::error::FormatError;
 use crate::source::FileSource;
 
 /// Magic signature for global heap collections.
-const GCOL_SIGNATURE: [u8; 4] = [b'G', b'C', b'O', b'L'];
+const GCOL_SIGNATURE: [u8; 4] = *b"GCOL";
 
 /// Metadata index for a global heap collection.
 ///

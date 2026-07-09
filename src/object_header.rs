@@ -11,10 +11,10 @@ use crate::message_type::MessageType;
 use crate::source::FileSource;
 
 /// OHDR signature for v2 object headers.
-const OHDR_SIGNATURE: [u8; 4] = [b'O', b'H', b'D', b'R'];
+const OHDR_SIGNATURE: [u8; 4] = *b"OHDR";
 
 /// OCHK signature for v2 continuation chunks.
-const OCHK_SIGNATURE: [u8; 4] = [b'O', b'C', b'H', b'K'];
+const OCHK_SIGNATURE: [u8; 4] = *b"OCHK";
 
 /// A single parsed header message.
 ///
