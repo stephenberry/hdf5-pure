@@ -28,9 +28,9 @@ pub struct FixedArrayHeader {
 
 fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
     let s = size as usize;
-    if pos + s > data.len() {
+    if s > data.len() || pos > data.len() - s {
         return Err(FormatError::UnexpectedEof {
-            expected: pos + s,
+            expected: pos.saturating_add(s),
             available: data.len(),
         });
     }
@@ -51,7 +51,7 @@ fn read_length(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
 
 fn is_undefined(data: &[u8], pos: usize, size: u8) -> bool {
     let s = size as usize;
-    if pos + s > data.len() {
+    if s > data.len() || pos > data.len() - s {
         return false;
     }
     data[pos..pos + s].iter().all(|&b| b == 0xFF)
@@ -68,9 +68,9 @@ impl FixedArrayHeader {
         // FAHD signature(4) + version(1) + client_id(1) + element_size(1) +
         // max_nelmts_bits(1) + num_elements(length_size) + data_block_addr(offset_size) + checksum(4)
         let min_size = 4 + 1 + 1 + 1 + 1 + length_size as usize + offset_size as usize + 4;
-        if offset + min_size > file_data.len() {
+        if min_size > file_data.len() || offset > file_data.len() - min_size {
             return Err(FormatError::UnexpectedEof {
-                expected: offset + min_size,
+                expected: offset.saturating_add(min_size),
                 available: file_data.len(),
             });
         }
@@ -215,9 +215,9 @@ fn parse_fa_element(
     num_chunks_per_dim: &[u64],
     chunk_dimensions: &[u32],
 ) -> Result<Option<ChunkInfo>, FormatError> {
-    if elem_pos + elem_size > block.len() {
+    if elem_size > block.len() || elem_pos > block.len() - elem_size {
         return Err(FormatError::UnexpectedEof {
-            expected: elem_pos + elem_size,
+            expected: elem_pos.saturating_add(elem_size),
             available: block.len(),
         });
     }
@@ -279,9 +279,9 @@ pub fn read_fixed_array_chunks(
 
     // Parse data block prefix: FADB(4) + version(1) + client_id(1) + header_address(offset_size)
     let db_header_size = 4 + 1 + 1 + os;
-    if db_offset + db_header_size > file_data.len() {
+    if db_header_size > file_data.len() || db_offset > file_data.len() - db_header_size {
         return Err(FormatError::UnexpectedEof {
-            expected: db_offset + db_header_size,
+            expected: db_offset.saturating_add(db_header_size),
             available: file_data.len(),
         });
     }
@@ -357,9 +357,15 @@ pub fn read_fixed_array_chunks(
     let npages = num_elements.div_ceil(page_size);
     let bitmap_size = npages.div_ceil(8);
     let bitmap_pos = db_offset + db_header_size;
-    if bitmap_pos + bitmap_size + 4 > file_data.len() {
+    // `bitmap_size` derives from a crafted element count, so the end offset can
+    // overflow `usize`; bound it with checked arithmetic (issue #140).
+    let fits = bitmap_pos
+        .checked_add(bitmap_size)
+        .and_then(|x| x.checked_add(4))
+        .is_some_and(|end| end <= file_data.len());
+    if !fits {
         return Err(FormatError::UnexpectedEof {
-            expected: bitmap_pos + bitmap_size + 4,
+            expected: bitmap_pos.saturating_add(bitmap_size).saturating_add(4),
             available: file_data.len(),
         });
     }

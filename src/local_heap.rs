@@ -22,13 +22,19 @@ pub struct LocalHeap {
 
 fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
     let s = size as usize;
-    if pos + s > data.len() {
+    // `pos` is derived from a crafted file address, so `pos + s` can overflow
+    // `usize`; check the bound without wrapping (issue #140).
+    let end = pos.checked_add(s).ok_or(FormatError::UnexpectedEof {
+        expected: usize::MAX,
+        available: data.len(),
+    })?;
+    if end > data.len() {
         return Err(FormatError::UnexpectedEof {
-            expected: pos + s,
+            expected: end,
             available: data.len(),
         });
     }
-    let slice = &data[pos..pos + s];
+    let slice = &data[pos..end];
     Ok(match size {
         2 => u16::from_le_bytes([slice[0], slice[1]]) as u64,
         4 => u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]) as u64,
@@ -51,9 +57,17 @@ impl LocalHeap {
         let ls = length_size as usize;
         let os = offset_size as usize;
         let total = 8 + ls * 2 + os;
-        if offset + total > file_data.len() {
+        // `offset` is a crafted file address; guard `offset + total` against a
+        // `usize` overflow instead of wrapping past the bounds check (issue #140).
+        let end = offset
+            .checked_add(total)
+            .ok_or(FormatError::UnexpectedEof {
+                expected: usize::MAX,
+                available: file_data.len(),
+            })?;
+        if end > file_data.len() {
             return Err(FormatError::UnexpectedEof {
-                expected: offset + total,
+                expected: end,
                 available: file_data.len(),
             });
         }
@@ -100,7 +114,9 @@ impl LocalHeap {
 
         if str_start >= file_data.len() || str_start >= seg_end {
             return Err(FormatError::UnexpectedEof {
-                expected: str_start + 1,
+                // `str_start` is a crafted address and can be near `usize::MAX`;
+                // this diagnostic must not overflow (issue #140).
+                expected: str_start.saturating_add(1),
                 available: file_data.len(),
             });
         }
@@ -156,7 +172,9 @@ impl LocalHeap {
 
         if start >= search_end {
             return Err(FormatError::UnexpectedEof {
-                expected: start + 1,
+                // `start` is a crafted string offset and can be near `usize::MAX`;
+                // this diagnostic must not overflow (issue #140).
+                expected: start.saturating_add(1),
                 available: search_end,
             });
         }
@@ -287,5 +305,24 @@ mod tests {
         file[4] = 1; // bad version
         let err = LocalHeap::parse(&file, 0, 8, 8).unwrap_err();
         assert_eq!(err, FormatError::InvalidLocalHeapVersion(1));
+    }
+
+    #[test]
+    fn parse_offset_near_usize_max_errors_without_overflow() {
+        // A crafted heap address near `usize::MAX` must yield an EOF error, not
+        // panic on `offset + total` overflowing `usize` (issue #140).
+        let file = build_heap_file(0, 80, &["test"], 8, 8);
+        let err = LocalHeap::parse(&file, usize::MAX - 3, 8, 8).unwrap_err();
+        assert!(matches!(err, FormatError::UnexpectedEof { .. }));
+    }
+
+    #[test]
+    fn read_string_offset_near_usize_max_errors_without_overflow() {
+        // A crafted string offset near `usize::MAX` must not overflow the
+        // diagnostic `start + 1` in either read path (issue #140).
+        let file = build_heap_file(0, 80, &["test"], 8, 8);
+        let heap = LocalHeap::parse(&file, 0, 8, 8).unwrap();
+        assert!(heap.read_string(&file, u64::MAX).is_err());
+        assert!(heap.read_string_in_segment(&file, u64::MAX).is_err());
     }
 }

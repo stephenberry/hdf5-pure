@@ -71,7 +71,11 @@ pub(crate) fn classify_datatype(dt: &crate::datatype::Datatype) -> DType {
     match dt {
         Datatype::FloatingPoint { size: 4, .. } => DType::F32,
         Datatype::FloatingPoint { size: 8, .. } => DType::F64,
-        Datatype::FloatingPoint { size, .. } => DType::Other(format!("float{}", size * 8)),
+        // Widen before `* 8`: `size` is an on-disk `u32`, so a crafted odd size
+        // near `u32::MAX` would overflow a `u32` bit-width computation (issue #140).
+        Datatype::FloatingPoint { size, .. } => {
+            DType::Other(format!("float{}", u64::from(*size) * 8))
+        }
         Datatype::FixedPoint {
             size: 1,
             signed: true,
@@ -114,7 +118,7 @@ pub(crate) fn classify_datatype(dt: &crate::datatype::Datatype) -> DType {
         } => DType::U64,
         Datatype::FixedPoint { size, signed, .. } => {
             let prefix = if *signed { "i" } else { "u" };
-            DType::Other(format!("{prefix}{}", size * 8))
+            DType::Other(format!("{prefix}{}", u64::from(*size) * 8))
         }
         Datatype::String { .. } => DType::String,
         Datatype::VariableLength {
@@ -261,4 +265,44 @@ fn is_ascii_char_vlen_base(base: &crate::datatype::Datatype) -> bool {
             ..
         }
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::datatype::{Datatype, DatatypeByteOrder};
+
+    #[test]
+    fn classify_unusual_size_does_not_overflow() {
+        // A crafted datatype `size` near `u32::MAX` must not overflow the
+        // `size * 8` bit-width computation used for the `Other(..)` label
+        // (issue #140); the value is widened to `u64` first.
+        let int = Datatype::FixedPoint {
+            size: u32::MAX,
+            byte_order: DatatypeByteOrder::LittleEndian,
+            signed: true,
+            bit_offset: 0,
+            bit_precision: 0,
+        };
+        assert_eq!(
+            classify_datatype(&int),
+            DType::Other(format!("i{}", u64::from(u32::MAX) * 8))
+        );
+
+        let float = Datatype::FloatingPoint {
+            size: u32::MAX,
+            byte_order: DatatypeByteOrder::LittleEndian,
+            bit_offset: 0,
+            bit_precision: 0,
+            exponent_location: 0,
+            exponent_size: 0,
+            mantissa_location: 0,
+            mantissa_size: 0,
+            exponent_bias: 0,
+        };
+        assert_eq!(
+            classify_datatype(&float),
+            DType::Other(format!("float{}", u64::from(u32::MAX) * 8))
+        );
+    }
 }

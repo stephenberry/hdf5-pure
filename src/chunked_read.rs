@@ -110,9 +110,9 @@ pub struct ChunkInfo {
 
 fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
     let s = size as usize;
-    if pos + s > data.len() {
+    if s > data.len() || pos > data.len() - s {
         return Err(FormatError::UnexpectedEof {
-            expected: pos + s,
+            expected: pos.saturating_add(s),
             available: data.len(),
         });
     }
@@ -172,9 +172,9 @@ fn collect_chunk_info_inner(
 
     // Parse B-tree v1 header
     let header_size = btree_v1_node_header_size(offset_size);
-    if offset + header_size > file_data.len() {
+    if header_size > file_data.len() || offset > file_data.len() - header_size {
         return Err(FormatError::UnexpectedEof {
-            expected: offset + header_size,
+            expected: offset.saturating_add(header_size),
             available: file_data.len(),
         });
     }
@@ -199,9 +199,9 @@ fn collect_chunk_info_inner(
         // Leaf node: keys and children interleaved
         // key[0], child[0], key[1], child[1], ..., key[N-1], child[N-1], key[N]
         let needed = entries_used * (key_size + os) + key_size;
-        if pos + needed > file_data.len() {
+        if needed > file_data.len() || pos > file_data.len() - needed {
             return Err(FormatError::UnexpectedEof {
-                expected: pos + needed,
+                expected: pos.saturating_add(needed),
                 available: file_data.len(),
             });
         }
@@ -245,9 +245,9 @@ fn collect_chunk_info_inner(
     } else {
         // Internal node: recurse into children
         let needed = entries_used * (key_size + os) + key_size;
-        if pos + needed > file_data.len() {
+        if needed > file_data.len() || pos > file_data.len() - needed {
             return Err(FormatError::UnexpectedEof {
-                expected: pos + needed,
+                expected: pos.saturating_add(needed),
                 available: file_data.len(),
             });
         }
@@ -331,9 +331,9 @@ fn collect_chunk_btree_node_spans_inner(
     let offset = btree_address.to_usize()?;
     let os = offset_size as usize;
     let header_size = btree_v1_node_header_size(offset_size);
-    if offset + header_size > file_data.len() {
+    if header_size > file_data.len() || offset > file_data.len() - header_size {
         return Err(FormatError::UnexpectedEof {
-            expected: offset + header_size,
+            expected: offset.saturating_add(header_size),
             available: file_data.len(),
         });
     }
@@ -358,9 +358,9 @@ fn collect_chunk_btree_node_spans_inner(
             length: (key_size + os) as u64,
         })?;
     let node_len = header_size + body;
-    if offset + node_len > file_data.len() {
+    if node_len > file_data.len() || offset > file_data.len() - node_len {
         return Err(FormatError::UnexpectedEof {
-            expected: offset + node_len,
+            expected: offset.saturating_add(node_len),
             available: file_data.len(),
         });
     }
@@ -593,7 +593,9 @@ pub fn read_chunked_data(
 
     // Both v3 and v4 include element size as last dim (rank+1)
     let ndims = chunk_dimensions.len();
-    let rank = ndims - 1;
+    let rank = ndims
+        .checked_sub(1)
+        .ok_or_else(|| FormatError::ChunkedReadError("chunked layout has no dimensions".into()))?;
     let chunk_dims: Vec<usize> = chunk_dimensions[..rank]
         .iter()
         .map(|&d| d as usize)
@@ -759,7 +761,9 @@ pub fn read_chunked_data_from_source<S: FileSource + ?Sized>(
 
     let elem_size = datatype.type_size() as usize;
     let ndims = chunk_dimensions.len();
-    let rank = ndims - 1;
+    let rank = ndims
+        .checked_sub(1)
+        .ok_or_else(|| FormatError::ChunkedReadError("chunked layout has no dimensions".into()))?;
     // `chunk_dimensions` are u32, so this widens; the dataspace dims are u64 and
     // are narrowed with a checked conversion.
     let chunk_dims: Vec<usize> = chunk_dimensions[..rank]
@@ -859,7 +863,9 @@ pub fn read_chunked_data_cached_from_source<S: FileSource + ?Sized>(
 
     let elem_size = datatype.type_size() as usize;
     let ndims = chunk_dimensions.len();
-    let rank = ndims - 1;
+    let rank = ndims
+        .checked_sub(1)
+        .ok_or_else(|| FormatError::ChunkedReadError("chunked layout has no dimensions".into()))?;
     let chunk_dims: Vec<usize> = chunk_dimensions[..rank]
         .iter()
         .map(|&d| d as usize)
@@ -987,7 +993,9 @@ pub(crate) fn collect_chunks_for_layout_from_source<S: FileSource + ?Sized>(
     length_size: u8,
 ) -> Result<Vec<ChunkInfo>, FormatError> {
     let ndims = chunk_dimensions.len();
-    let rank = ndims - 1;
+    let rank = ndims
+        .checked_sub(1)
+        .ok_or_else(|| FormatError::ChunkedReadError("chunked layout has no dimensions".into()))?;
     match (version, chunk_index_type) {
         (3, _) => collect_chunk_info_from_source(source, addr, ndims, offset_size, length_size),
         (4, Some(1)) => {
@@ -1094,7 +1102,10 @@ pub(crate) fn enumerate_chunks_buffered(
         ));
     }
     // `chunk_dimensions` is rank + 1 entries; the last is the element size.
-    let rank = chunk_dimensions.len() - 1;
+    let rank = chunk_dimensions
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| FormatError::ChunkedReadError("chunked layout has no dimensions".into()))?;
     let elem_size = chunk_dimensions[rank] as usize;
     if elem_size == 0 {
         return Err(FormatError::ChunkedReadError(
@@ -1239,7 +1250,10 @@ pub(crate) fn collect_chunked_storage_spans(
         ));
     }
     // `chunk_dimensions` is rank + 1 entries; the last is the element size.
-    let rank = chunk_dimensions.len() - 1;
+    let rank = chunk_dimensions
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| FormatError::ChunkedReadError("chunked layout has no dimensions".into()))?;
     let elem_size = chunk_dimensions[rank] as usize;
     if elem_size == 0 {
         return Err(FormatError::ChunkedReadError(
@@ -1465,7 +1479,9 @@ pub fn read_chunked_data_cached(
 
     let elem_size = datatype.type_size() as usize;
     let ndims = chunk_dimensions.len();
-    let rank = ndims - 1;
+    let rank = ndims
+        .checked_sub(1)
+        .ok_or_else(|| FormatError::ChunkedReadError("chunked layout has no dimensions".into()))?;
     let chunk_dims: Vec<usize> = chunk_dimensions[..rank]
         .iter()
         .map(|&d| d as usize)

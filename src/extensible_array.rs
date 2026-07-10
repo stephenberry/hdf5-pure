@@ -39,9 +39,9 @@ pub struct ExtensibleArrayHeader {
 
 fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
     let s = size as usize;
-    if pos + s > data.len() {
+    if s > data.len() || pos > data.len() - s {
         return Err(FormatError::UnexpectedEof {
-            expected: pos + s,
+            expected: pos.saturating_add(s),
             available: data.len(),
         });
     }
@@ -58,7 +58,7 @@ fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
 
 fn is_undefined(data: &[u8], pos: usize, size: u8) -> bool {
     let s = size as usize;
-    if pos + s > data.len() {
+    if s > data.len() || pos > data.len() - s {
         return false;
     }
     data[pos..pos + s].iter().all(|&b| b == 0xFF)
@@ -91,9 +91,9 @@ impl ExtensibleArrayHeader {
         //   6 stats fields (each length_size) + index_block_address(offset_size) + checksum(4)
         let min_size =
             4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 6 * length_size as usize + offset_size as usize + 4;
-        if offset + min_size > file_data.len() {
+        if min_size > file_data.len() || offset > file_data.len() - min_size {
             return Err(FormatError::UnexpectedEof {
-                expected: offset + min_size,
+                expected: offset.saturating_add(min_size),
                 available: file_data.len(),
             });
         }
@@ -274,9 +274,9 @@ fn read_element(
 
     if client_id == 0 {
         // Non-filtered: just address
-        if pos + os > data.len() {
+        if os > data.len() || pos > data.len() - os {
             return Err(FormatError::UnexpectedEof {
-                expected: pos + os,
+                expected: pos.saturating_add(os),
                 available: data.len(),
             });
         }
@@ -298,9 +298,9 @@ fn read_element(
         // Filtered: address + compressed_size + filter_mask
         let chunk_size_bytes = element_size as usize - os - 4;
         let elem_total = os + chunk_size_bytes + 4;
-        if pos + elem_total > data.len() {
+        if elem_total > data.len() || pos > data.len() - elem_total {
             return Err(FormatError::UnexpectedEof {
-                expected: pos + elem_total,
+                expected: pos.saturating_add(elem_total),
                 available: data.len(),
             });
         }
@@ -363,9 +363,9 @@ fn read_data_block_elements(
 ) -> Result<Vec<ChunkInfo>, FormatError> {
     // AEDB: signature(4) + version(1) + client_id(1) + header_address(offset_size)
     let db_header_size = 4 + 1 + 1 + offset_size as usize;
-    if db_offset + db_header_size > file_data.len() {
+    if db_header_size > file_data.len() || db_offset > file_data.len() - db_header_size {
         return Err(FormatError::UnexpectedEof {
-            expected: db_offset + db_header_size,
+            expected: db_offset.saturating_add(db_header_size),
             available: file_data.len(),
         });
     }
@@ -451,9 +451,9 @@ fn read_paged_data_block(
     let blk_off_size = (header.max_nelmts_bits as usize).div_ceil(8);
     // Header includes its own checksum: sig(4)+ver(1)+cid(1)+hdr_addr+block_offset+checksum(4)
     let db_header_size = 4 + 1 + 1 + offset_size as usize + blk_off_size + 4;
-    if db_offset + db_header_size > file_data.len() {
+    if db_header_size > file_data.len() || db_offset > file_data.len() - db_header_size {
         return Err(FormatError::UnexpectedEof {
-            expected: db_offset + db_header_size,
+            expected: db_offset.saturating_add(db_header_size),
             available: file_data.len(),
         });
     }
@@ -532,9 +532,9 @@ pub fn read_extensible_array_chunks(
     // Parse index block (AEIB)
     let ib_offset = header.index_block_address.to_usize()?;
     let ib_header_size = 4 + 1 + 1 + offset_size as usize; // sig + ver + client + hdr_addr
-    if ib_offset + ib_header_size > file_data.len() {
+    if ib_header_size > file_data.len() || ib_offset > file_data.len() - ib_header_size {
         return Err(FormatError::UnexpectedEof {
-            expected: ib_offset + ib_header_size,
+            expected: ib_offset.saturating_add(ib_header_size),
             available: file_data.len(),
         });
     }
@@ -628,7 +628,7 @@ pub fn read_extensible_array_chunks(
     //    refers to super block `first_indirect_sblk + j`.
     let mut sblk_addrs: Vec<u64> = Vec::with_capacity(geom.nsblk_addrs);
     for _ in 0..geom.nsblk_addrs {
-        if pos + os > file_data.len() {
+        if os > file_data.len() || pos > file_data.len() - os {
             break;
         }
         sblk_addrs.push(read_offset(file_data, pos, offset_size)?);
@@ -687,9 +687,9 @@ fn read_super_block(
     //       + checksum
     let blk_off_size = (header.max_nelmts_bits as usize).div_ceil(8);
     let sb_header_size = 4 + 1 + 1 + os + blk_off_size;
-    if sb_offset + sb_header_size > file_data.len() {
+    if sb_header_size > file_data.len() || sb_offset > file_data.len() - sb_header_size {
         return Err(FormatError::UnexpectedEof {
-            expected: sb_offset + sb_header_size,
+            expected: sb_offset.saturating_add(sb_header_size),
             available: file_data.len(),
         });
     }
@@ -715,9 +715,9 @@ fn read_super_block(
     };
     let page_bitmap: Vec<u8> = if is_paged {
         let bitmap_size = ndblks * npages.div_ceil(8);
-        if pos + bitmap_size > file_data.len() {
+        if bitmap_size > file_data.len() || pos > file_data.len() - bitmap_size {
             return Err(FormatError::UnexpectedEof {
-                expected: pos + bitmap_size,
+                expected: pos.saturating_add(bitmap_size),
                 available: file_data.len(),
             });
         }
@@ -731,9 +731,9 @@ fn read_super_block(
     // Read data block addresses.
     let mut dblk_addrs: Vec<u64> = Vec::with_capacity(ndblks);
     for _ in 0..ndblks {
-        if pos + os > file_data.len() {
+        if os > file_data.len() || pos > file_data.len() - os {
             return Err(FormatError::UnexpectedEof {
-                expected: pos + os,
+                expected: pos.saturating_add(os),
                 available: file_data.len(),
             });
         }
@@ -841,9 +841,9 @@ pub(crate) fn extensible_array_index_spans(
         crate::chunked_write::aeib_size(offset_size, inline, elem_size, ndblk_addrs, nsblk_addrs);
     let ib_addr = header.index_block_address;
     let ib_off = ib_addr.to_usize()?;
-    if ib_off + 4 > file_data.len() {
+    if 4 > file_data.len() || ib_off > file_data.len() - 4 {
         return Err(FormatError::UnexpectedEof {
-            expected: ib_off + 4,
+            expected: ib_off.saturating_add(4),
             available: file_data.len(),
         });
     }
@@ -923,9 +923,9 @@ fn easb_data_block_spans(
     let os = offset_size as usize;
     let sb_off = sb_addr.to_usize()?;
     let sb_header = 4 + 1 + 1 + os + blk_off_size; // sig + ver + client + hdr_addr + block_offset
-    if sb_off + sb_header > file_data.len() {
+    if sb_header > file_data.len() || sb_off > file_data.len() - sb_header {
         return Err(FormatError::UnexpectedEof {
-            expected: sb_off + sb_header,
+            expected: sb_off.saturating_add(sb_header),
             available: file_data.len(),
         });
     }

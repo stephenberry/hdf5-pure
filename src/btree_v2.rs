@@ -38,9 +38,9 @@ pub struct BTreeV2Record {
 
 fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
     let s = size as usize;
-    if pos + s > data.len() {
+    if s > data.len() || pos > data.len() - s {
         return Err(FormatError::UnexpectedEof {
-            expected: pos + s,
+            expected: pos.saturating_add(s),
             available: data.len(),
         });
     }

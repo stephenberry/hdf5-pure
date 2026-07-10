@@ -48,9 +48,9 @@ pub struct BTreeV1Node {
 
 fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
     let s = size as usize;
-    if pos + s > data.len() {
+    if s > data.len() || pos > data.len() - s {
         return Err(FormatError::UnexpectedEof {
-            expected: pos + s,
+            expected: pos.saturating_add(s),
             available: data.len(),
         });
     }
@@ -67,7 +67,7 @@ fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
 
 fn is_undefined(data: &[u8], pos: usize, size: u8) -> bool {
     let s = size as usize;
-    if pos + s > data.len() {
+    if s > data.len() || pos > data.len() - s {
         return false;
     }
     data[pos..pos + s].iter().all(|&b| b == 0xFF)
@@ -87,9 +87,9 @@ impl BTreeV1Node {
         // then left_sibling(offset_size) + right_sibling(offset_size).
         let os = offset_size as usize;
         let header_size = btree_v1_node_header_size(offset_size);
-        if offset + header_size > file_data.len() {
+        if header_size > file_data.len() || offset > file_data.len() - header_size {
             return Err(FormatError::UnexpectedEof {
-                expected: offset + header_size,
+                expected: offset.saturating_add(header_size),
                 available: file_data.len(),
             });
         }
@@ -121,9 +121,9 @@ impl BTreeV1Node {
         let eu = entries_used as usize;
         let key_size = os; // For type 0, key = offset_size
         let needed = eu * (key_size + os) + key_size; // eu children + (eu+1) keys
-        if pos + needed > file_data.len() {
+        if needed > file_data.len() || pos > file_data.len() - needed {
             return Err(FormatError::UnexpectedEof {
-                expected: pos + needed,
+                expected: pos.saturating_add(needed),
                 available: file_data.len(),
             });
         }
