@@ -230,10 +230,43 @@ fn null_field_is_omitted_like_none() {
     // Must not abort the encode the way it used to with
     // `UnsupportedType("() / unit")`.
     let bytes = mat::to_bytes(&v).expect("Null field must not abort the encode");
-    let file = File::from_bytes(bytes).unwrap();
+    let file = File::from_bytes(bytes.clone()).unwrap();
     // `id` survives; the Null `meta` field is dropped, just like `None`.
     assert!(file.dataset("id").is_ok());
     assert!(file.dataset("meta").is_err());
+    // The dropped field reads back to its serde default: `Value`'s default is
+    // `Value::Null`, so the whole record round-trips.
+    let back: WithNullMeta = mat::from_bytes(&bytes).unwrap();
+    assert_eq!(back, v);
+}
+
+#[test]
+fn dropped_unit_field_without_default_fails_to_deserialize() {
+    // Documents the read-back contract the docs describe: a non-`Option` field
+    // that serialized away must carry `#[serde(default)]` to reconstruct. The
+    // encode still succeeds; only the deserialize of the absent field fails.
+    #[derive(Serialize)]
+    struct Writer {
+        id: u32,
+        meta: serde_json::Value, // Null -> dropped
+    }
+    #[derive(Deserialize, Debug)]
+    struct ReaderNoDefault {
+        #[allow(dead_code)]
+        id: u32,
+        #[allow(dead_code)]
+        meta: serde_json::Value, // no #[serde(default)]
+    }
+    let bytes = mat::to_bytes(&Writer {
+        id: 1,
+        meta: serde_json::Value::Null,
+    })
+    .unwrap();
+    let err = mat::from_bytes::<ReaderNoDefault>(&bytes).unwrap_err();
+    assert!(
+        err.to_string().contains("meta"),
+        "expected a missing-field error naming `meta`, got: {err}"
+    );
 }
 
 #[test]
@@ -253,6 +286,64 @@ fn some_null_is_omitted_like_none() {
     let file = File::from_bytes(mat::to_bytes(&v).unwrap()).unwrap();
     assert!(file.dataset("id").is_ok());
     assert!(file.dataset("meta").is_err());
+}
+
+#[test]
+fn unit_struct_field_is_omitted() {
+    #[derive(Serialize)]
+    struct Marker;
+    #[derive(Serialize)]
+    struct S {
+        id: u32,
+        marker: Marker,
+    }
+    let file = File::from_bytes(
+        mat::to_bytes(&S {
+            id: 5,
+            marker: Marker,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(file.dataset("id").is_ok());
+    assert!(file.dataset("marker").is_err());
+}
+
+#[test]
+fn vec_of_unit_roundtrips() {
+    // A unit inside a sequence lowers to a `struct([])` cell slot on write; the
+    // reader accepts `struct([])` back as `()` so the degenerate `Vec<()>` still
+    // round-trips rather than failing on read.
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    struct S {
+        units: Vec<()>,
+    }
+    let v = S {
+        units: vec![(), (), ()],
+    };
+    let bytes = mat::to_bytes(&v).unwrap();
+    let back: S = mat::from_bytes(&bytes).unwrap();
+    assert_eq!(back, v);
+}
+
+#[test]
+fn vec_of_values_with_null_roundtrips() {
+    // The realistic sequence case: a `serde_json::Value` array carrying a `Null`
+    // among numbers round-trips element-for-element.
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    struct S {
+        items: Vec<serde_json::Value>,
+    }
+    let v = S {
+        items: vec![
+            serde_json::Value::from(1),
+            serde_json::Value::Null,
+            serde_json::Value::from(3),
+        ],
+    };
+    let bytes = mat::to_bytes(&v).unwrap();
+    let back: S = mat::from_bytes(&bytes).unwrap();
+    assert_eq!(back, v);
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
