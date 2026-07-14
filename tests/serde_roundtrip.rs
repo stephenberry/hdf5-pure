@@ -210,6 +210,51 @@ fn option_some_serializes_underlying() {
     assert_eq!(ds.shape().unwrap(), vec![5, 1]);
 }
 
+// A Rust unit `()` — the shape `serde_json::Value::Null` serializes as — is
+// dropped from its parent struct exactly like `Option::None`, instead of
+// aborting the whole encode. See the `serialize_unit` handler in
+// `mat/ser/value_ser.rs`.
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+struct WithNullMeta {
+    id: u32,
+    #[serde(default)]
+    meta: serde_json::Value,
+}
+
+#[test]
+fn null_field_is_omitted_like_none() {
+    let v = WithNullMeta {
+        id: 7,
+        meta: serde_json::Value::Null,
+    };
+    // Must not abort the encode the way it used to with
+    // `UnsupportedType("() / unit")`.
+    let bytes = mat::to_bytes(&v).expect("Null field must not abort the encode");
+    let file = File::from_bytes(bytes).unwrap();
+    // `id` survives; the Null `meta` field is dropped, just like `None`.
+    assert!(file.dataset("id").is_ok());
+    assert!(file.dataset("meta").is_err());
+}
+
+#[test]
+fn some_null_is_omitted_like_none() {
+    // `Some(Value::Null)` forwards through `serialize_some` to the inner
+    // `serialize_unit`, so it drops the field too — the pre-fix behavior made
+    // wrapping in `Option` an unreliable workaround.
+    #[derive(Serialize)]
+    struct S {
+        id: u32,
+        meta: Option<serde_json::Value>,
+    }
+    let v = S {
+        id: 3,
+        meta: Some(serde_json::Value::Null),
+    };
+    let file = File::from_bytes(mat::to_bytes(&v).unwrap()).unwrap();
+    assert!(file.dataset("id").is_ok());
+    assert!(file.dataset("meta").is_err());
+}
+
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 struct WithComplex {
     z: Complex64,

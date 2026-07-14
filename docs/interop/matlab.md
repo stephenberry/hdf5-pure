@@ -69,8 +69,12 @@ The serializer maps Rust types to HDF5 datasets and the MATLAB classes MATLAB ex
 | `Complex32` / `Complex64` | compound `{real, imag}` dataset |
 | nested struct | HDF5 group with `MATLAB_class = "struct"`, `MATLAB_fields` |
 | `Option<T>` (struct field) | omitted if `None` |
+| unit `()` / unit struct / `serde_json::Value::Null` (struct field) | omitted, same as `None` (see caveat below) |
 | unit enum variant | UTF-16 char dataset holding the variant name |
 | `Vec<Struct>` / `Vec<Option<T>>` / ragged `Vec<Vec<T>>` | cell array (`MATLAB_class = "cell"`, object references into `#refs#`); `None` slots become `struct([])` |
+
+!!! note "Unit and `null` fields round-trip with `#[serde(default)]`"
+    A struct field that serializes as a Rust unit `()` is dropped from the output, exactly like `Option::None`. The most common case is a `serde_json::Value::Null` field, since `serde_json` serializes `Value::Null` via `serialize_unit`. Because the field is absent on disk, reading it back needs `#[serde(default)]` on the field (or an `Option<T>` field, which serde defaults automatically); with a default, a `serde_json::Value` field reconstructs as `Value::Null`. A field that serializes as unit and has no serde default fails to deserialize the dropped field, which is the same contract as a non-defaulted `Option` field.
 
 ### Matrices and the column-major convention
 

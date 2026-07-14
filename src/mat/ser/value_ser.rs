@@ -110,11 +110,18 @@ impl Serializer for ValueSerializer {
     }
 
     fn serialize_unit(self) -> Result<MatValue, MatError> {
-        Err(MatError::UnsupportedType("() / unit"))
+        // Unit maps to `Omit`, exactly like `serialize_none` above. This drops
+        // the field from its parent struct (see `emit::build_struct_group`) and
+        // keeps the nested serializer consistent with `RootSerializer`, which
+        // already treats a root-level `()`/`None`/unit-struct as an empty
+        // workspace. The common way to hit this is `serde_json::Value::Null`,
+        // which serializes via `serialize_unit`; without this it aborted the
+        // whole encode even though the equivalent `Option::None` encoded fine.
+        Ok(MatValue::Omit)
     }
 
     fn serialize_unit_struct(self, _name: &'static str) -> Result<MatValue, MatError> {
-        Err(MatError::UnsupportedType("unit struct"))
+        Ok(MatValue::Omit)
     }
 
     fn serialize_unit_variant(
