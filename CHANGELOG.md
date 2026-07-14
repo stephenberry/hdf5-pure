@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- `mat::to_bytes` no longer aborts the whole encode when a struct field serializes as a Rust unit `()` — most commonly a `serde_json::Value::Null` field: the field is now dropped like `Option::None` (read it back with `#[serde(default)]`) instead of failing with `UnsupportedType("() / unit")` ([#141](https://github.com/stephenberry/hdf5-pure/pull/141)).
 - The buffered and streaming readers now agree on a malformed v1 object header: the buffered path stops at the declared object-header size instead of reading (and following) a chunk-0 message that overruns it ([#140](https://github.com/stephenberry/hdf5-pure/pull/140)).
 - Parsing a crafted file now returns a format error instead of panicking on an arithmetic overflow, hardening address and size computations across the metadata parsers (local heap, symbol table, datatype sizing, and the chunk/fixed-array/extensible-array indexes) ([#140](https://github.com/stephenberry/hdf5-pure/pull/140)).
 

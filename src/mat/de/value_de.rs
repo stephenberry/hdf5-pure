@@ -174,7 +174,12 @@ impl<'de> Deserializer<'de> for MatValueDeserializer {
 
     fn deserialize_unit<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, MatError> {
         match self.value {
-            MatValue::Omit => visitor.visit_unit(),
+            // `Omit` is the in-memory placeholder for a missing value;
+            // `EmptyStructArray` is its on-disk encoding (`struct([])`) inside a
+            // cell array. Accept both, mirroring `deserialize_option` above, so a
+            // unit that lowered to `struct([])` in a sequence round-trips back to
+            // `()` instead of failing on read.
+            MatValue::Omit | MatValue::EmptyStructArray => visitor.visit_unit(),
             other => mismatch("unit", other),
         }
     }
