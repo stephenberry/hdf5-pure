@@ -1082,6 +1082,65 @@ impl<'f> Dataset<'f> {
         Ok(ds.dimensions.clone())
     }
 
+    /// The dataset's maximum dimensions, when it is extensible. An unlimited
+    /// dimension is reported as `u64::MAX`. Returns `Ok(None)` for a fixed-shape
+    /// dataset (no maximum-dimensions record, or one equal to the current shape).
+    ///
+    /// Together with [`is_chunked`](Self::is_chunked) and
+    /// [`chunk_shape`](Self::chunk_shape), this lets a caller check up front
+    /// whether a dataset is eligible for
+    /// [`EditSession::append_dataset`](crate::EditSession::append_dataset)
+    /// (which requires a chunked dataset whose first maximum dimension is
+    /// `u64::MAX`) instead of relying on the append's refusal error.
+    pub fn maxshape(&self) -> Result<Option<Vec<u64>>, Error> {
+        let ds = self.dataspace()?;
+        match &ds.max_dimensions {
+            Some(md) if *md != ds.dimensions => Ok(Some(md.clone())),
+            _ => Ok(None),
+        }
+    }
+
+    /// Whether the dataset uses chunked storage (as opposed to contiguous or
+    /// compact). Filtered datasets are always chunked. Returns `false` for a
+    /// dataset with no data-layout message or a non-chunked layout.
+    pub fn is_chunked(&self) -> bool {
+        matches!(self.data_layout(), Ok(DataLayout::Chunked { .. }))
+    }
+
+    /// The dataset's chunk dimensions (one per dataset rank), or `Ok(None)` when
+    /// the dataset is not chunked. The element-size dimension the on-disk layout
+    /// appends is stripped, so the result lines up with
+    /// [`shape`](Self::shape) / [`maxshape`](Self::maxshape).
+    pub fn chunk_shape(&self) -> Result<Option<Vec<u64>>, Error> {
+        let DataLayout::Chunked {
+            chunk_dimensions, ..
+        } = self.data_layout()?
+        else {
+            return Ok(None);
+        };
+        let rank = self.dataspace()?.dimensions.len();
+        if chunk_dimensions.len() <= rank {
+            return Ok(None);
+        }
+        Ok(Some(
+            chunk_dimensions[..rank]
+                .iter()
+                .map(|&c| u64::from(c))
+                .collect(),
+        ))
+    }
+
+    /// The HDF5 filter IDs applied to this dataset's chunks, in pipeline
+    /// (application) order, or an empty vector when the dataset is unfiltered.
+    /// The IDs are the registered HDF5 filter numbers — e.g. 1 = deflate,
+    /// 2 = shuffle, 3 = fletcher32, 6 = scale-offset — so a caller can inspect
+    /// the pipeline without decoding a chunk.
+    pub fn filters(&self) -> Vec<u16> {
+        self.filter_pipeline()
+            .map(|p| p.filters.iter().map(|f| f.filter_id).collect())
+            .unwrap_or_default()
+    }
+
     /// Returns the simplified datatype of the dataset.
     pub fn dtype(&self) -> Result<DType, Error> {
         let dt = self.datatype()?;

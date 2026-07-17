@@ -253,7 +253,7 @@ pub use writer::FileBuilder;
 pub use swmr_writer::SwmrWriter;
 
 #[cfg(feature = "std")]
-pub use edit::EditSession;
+pub use edit::{AppendBuilder, EditSession};
 
 #[cfg(feature = "std")]
 pub use repack::{RepackOptions, repack};

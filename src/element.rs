@@ -35,6 +35,7 @@
 //! round_trip("floats", &[1.0f32, 2.5, -3.0]);
 //! ```
 
+use crate::edit::AppendBuilder;
 use crate::error::Error;
 use crate::reader::Dataset;
 use crate::type_builders::DatasetBuilder;
@@ -65,10 +66,15 @@ pub trait H5Element: sealed::Sealed + Copy {
     /// Set `builder`'s data and datatype from a flat row-major slice.
     #[doc(hidden)]
     fn write_into(builder: &mut DatasetBuilder, data: &[Self]);
+
+    /// Append a flat row-major slice to `builder`, recording the implied
+    /// element datatype for the commit-time datatype-match check.
+    #[doc(hidden)]
+    fn append_into(builder: &mut AppendBuilder, data: &[Self]);
 }
 
 macro_rules! impl_h5_element {
-    ($ty:ty, $read:ident, $write:ident) => {
+    ($ty:ty, $read:ident, $write:ident, $append:ident) => {
         impl sealed::Sealed for $ty {}
         impl H5Element for $ty {
             fn read_from(ds: &Dataset<'_>) -> Result<Vec<Self>, Error> {
@@ -77,20 +83,23 @@ macro_rules! impl_h5_element {
             fn write_into(builder: &mut DatasetBuilder, data: &[Self]) {
                 builder.$write(data);
             }
+            fn append_into(builder: &mut AppendBuilder, data: &[Self]) {
+                builder.$append(data);
+            }
         }
     };
 }
 
-impl_h5_element!(f32, read_f32, with_f32_data);
-impl_h5_element!(f64, read_f64, with_f64_data);
-impl_h5_element!(i8, read_i8, with_i8_data);
-impl_h5_element!(i16, read_i16, with_i16_data);
-impl_h5_element!(i32, read_i32, with_i32_data);
-impl_h5_element!(i64, read_i64, with_i64_data);
-impl_h5_element!(u8, read_u8, with_u8_data);
-impl_h5_element!(u16, read_u16, with_u16_data);
-impl_h5_element!(u32, read_u32, with_u32_data);
-impl_h5_element!(u64, read_u64, with_u64_data);
+impl_h5_element!(f32, read_f32, with_f32_data, append_f32);
+impl_h5_element!(f64, read_f64, with_f64_data, append_f64);
+impl_h5_element!(i8, read_i8, with_i8_data, append_i8);
+impl_h5_element!(i16, read_i16, with_i16_data, append_i16);
+impl_h5_element!(i32, read_i32, with_i32_data, append_i32);
+impl_h5_element!(i64, read_i64, with_i64_data, append_i64);
+impl_h5_element!(u8, read_u8, with_u8_data, append_u8);
+impl_h5_element!(u16, read_u16, with_u16_data, append_u16);
+impl_h5_element!(u32, read_u32, with_u32_data, append_u32);
+impl_h5_element!(u64, read_u64, with_u64_data, append_u64);
 
 impl DatasetBuilder {
     /// Set the dataset's data and datatype from a flat slice of any supported

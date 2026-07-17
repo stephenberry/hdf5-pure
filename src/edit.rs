@@ -152,14 +152,17 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::checksum::jenkins_lookup3;
-use crate::chunked_read::{enumerate_chunks_buffered, plan_dense_grid};
+use crate::chunked_read::{chunk_index_spans_buffered, enumerate_chunks_buffered, plan_dense_grid};
 use crate::chunked_write::{
-    ChunkMeta, ChunkOptions, ChunkProvider, build_chunked_data_at_ext, emit_chunked_data_verbatim,
-    plan_chunked_data_verbatim, split_into_chunks,
+    ChunkMeta, ChunkOptions, ChunkProvider, WrittenChunk, build_chunked_data_at_ext,
+    build_extensible_array_at, emit_chunked_data_verbatim, plan_chunked_data_verbatim,
+    serialize_v4_extensible_array, split_into_chunks,
 };
 use crate::data_layout::DataLayout;
 use crate::dataspace::{Dataspace, DataspaceType};
+use crate::datatype::{Datatype, DatatypeByteOrder};
 use crate::error::{Error, FormatError};
+use crate::extensible_array::ExtensibleArrayHeader;
 use crate::file_lock::{self, FileLocking};
 use crate::file_space_info::{FileSpaceInfo, FileSpaceStrategy};
 use crate::file_writer::{
@@ -168,7 +171,7 @@ use crate::file_writer::{
 use crate::filter_pipeline::{
     FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SCALEOFFSET, FILTER_SHUFFLE, FilterPipeline,
 };
-use crate::filters::{ChunkContext, compress_chunk};
+use crate::filters::{ChunkContext, compress_chunk, decompress_chunk};
 use crate::free_space::FreeList;
 use crate::free_space_manager::{self, FreeSection, FsmHeader, fshd_len, serialize_file_fsm};
 use crate::group_v2::resolve_group_entries;
@@ -179,7 +182,9 @@ use crate::signature;
 use crate::superblock::Superblock;
 use crate::type_builders::{
     AttrValue, DatasetBuilder, ObjectRefTarget, VlStringStaging, build_attr_message,
-    build_global_heap_collection, patch_vl_refs, patch_vl_refs_masked,
+    build_global_heap_collection, make_f32_type, make_f64_type, make_i8_type, make_i16_type,
+    make_i32_type, make_i64_type, make_u8_type, make_u16_type, make_u32_type, make_u64_type,
+    patch_vl_refs, patch_vl_refs_masked,
 };
 
 /// An undefined on-disk address (all bits set), HDF5's "no address" sentinel.
@@ -214,6 +219,97 @@ type PathKey = Vec<String>;
 /// each an (attribute message still carrying a placeholder heap address, its
 /// global heap collection bytes) pair, resolved in the apply loop.
 type PendingVlAttrs = Vec<(crate::attribute::AttributeMessage, Vec<u8>)>;
+
+/// Accumulates elements to append to an existing chunked, unlimited dataset via
+/// [`EditSession::append_dataset`], in call order along the dataset's first
+/// (axis-0) dimension.
+///
+/// It mirrors [`DatasetBuilder`]'s typed/generic vocabulary. Repeated typed or
+/// [`append_raw`](Self::append_raw) calls concatenate; each typed method also
+/// records the element datatype it implies, which `commit` checks against the
+/// dataset's on-disk datatype (a mismatch — including a mix of element types in
+/// one builder — is refused with [`Error::AppendUnsupported`], never written as
+/// garbage).
+pub struct AppendBuilder {
+    /// Accumulated little-endian element bytes to append, in call order.
+    raw: Vec<u8>,
+    /// The element datatype implied by the typed `append_*` calls, if any were
+    /// used. `None` when only [`append_raw`](Self::append_raw) was called (a raw
+    /// append is checked structurally — element-size alignment and little-endian
+    /// on-disk order — rather than by datatype equality).
+    elem_dt: Option<Datatype>,
+    /// Set when two typed calls implied different element datatypes; `commit`
+    /// refuses such a builder rather than write a mix of encodings.
+    dt_conflict: bool,
+}
+
+impl AppendBuilder {
+    fn new() -> Self {
+        Self {
+            raw: Vec::new(),
+            elem_dt: None,
+            dt_conflict: false,
+        }
+    }
+
+    /// Record the datatype a typed append implies, flagging a conflict if an
+    /// earlier typed call implied a different one.
+    fn set_dt(&mut self, dt: Datatype) {
+        match &self.elem_dt {
+            Some(prev) if *prev != dt => self.dt_conflict = true,
+            Some(_) => {}
+            None => self.elem_dt = Some(dt),
+        }
+    }
+
+    /// Append already-little-endian element bytes verbatim. The concatenated
+    /// length must be a whole multiple of the dataset's on-disk element size, and
+    /// the dataset's element datatype must be little-endian; no datatype is
+    /// otherwise inferred. Prefer the typed methods when the element type is known.
+    pub fn append_raw(&mut self, bytes: &[u8]) -> &mut Self {
+        self.raw.extend_from_slice(bytes);
+        self
+    }
+
+    /// Generic append of a flat slice of any supported scalar type — the
+    /// counterpart of [`DatasetBuilder::with_data`](crate::DatasetBuilder::with_data).
+    pub fn append<T: crate::element::H5Element>(&mut self, data: &[T]) -> &mut Self {
+        T::append_into(self, data);
+        self
+    }
+}
+
+/// Generate the typed `append_*` methods: serialize each value little-endian and
+/// record the implied element datatype.
+macro_rules! append_typed {
+    ($($method:ident, $ty:ty, $make:ident;)*) => {
+        impl AppendBuilder {
+            $(
+                #[doc = concat!("Append `", stringify!($ty), "` values to the dataset.")]
+                pub fn $method(&mut self, data: &[$ty]) -> &mut Self {
+                    self.set_dt($make());
+                    for &v in data {
+                        self.raw.extend_from_slice(&v.to_le_bytes());
+                    }
+                    self
+                }
+            )*
+        }
+    };
+}
+
+append_typed! {
+    append_f64, f64, make_f64_type;
+    append_f32, f32, make_f32_type;
+    append_i8, i8, make_i8_type;
+    append_i16, i16, make_i16_type;
+    append_i32, i32, make_i32_type;
+    append_i64, i64, make_i64_type;
+    append_u8, u8, make_u8_type;
+    append_u16, u16, make_u16_type;
+    append_u32, u32, make_u32_type;
+    append_u64, u64, make_u64_type;
+}
 
 /// An open HDF5 file being edited in place.
 ///
@@ -258,6 +354,12 @@ pub struct EditSession {
     /// datatype and shape must match the on-disk ones byte-exactly (this is a
     /// value overwrite, not a reshape/retype). Applied on the next `commit`.
     pending_writes: Vec<(PathKey, DatasetBuilder)>,
+    /// Appends staged by `append_dataset`, as (full dataset path, builder). Each
+    /// grows an existing chunked, unlimited, Extensible-Array-indexed dataset
+    /// along axis 0 by keeping its existing chunk data in place and rebuilding the
+    /// index over the kept plus newly-appended (and any rewritten trailing) chunks.
+    /// Applied on the next `commit`.
+    pending_appends: Vec<(PathKey, AppendBuilder)>,
     /// New groups staged by `create_group`, as full paths.
     pending_groups: Vec<PathKey>,
     /// Group attribute edits staged as (group path, operation). The path may be
@@ -378,6 +480,7 @@ impl EditSession {
             superblock,
             pending_datasets: Vec::new(),
             pending_writes: Vec::new(),
+            pending_appends: Vec::new(),
             pending_groups: Vec::new(),
             pending_group_attrs: Vec::new(),
             pending_deletes: Vec::new(),
@@ -575,6 +678,46 @@ impl EditSession {
         &mut self.pending_writes.last_mut().unwrap().1
     }
 
+    /// Stage an append of new elements to an **existing** chunked, unlimited
+    /// dataset, applied on the next [`commit`](Self::commit). `path` names a
+    /// dataset that must already exist; the returned [`AppendBuilder`] supplies
+    /// the elements to add via its typed / generic / raw `append_*` methods.
+    ///
+    /// Unlike [`write_dataset`](Self::write_dataset) (a value overwrite that
+    /// forbids any shape change) this **grows** the dataset along its first
+    /// (axis-0) dimension. It works on **filtered** datasets: the appended chunks
+    /// are compressed through the dataset's own on-disk filter pipeline
+    /// (deflate / shuffle / fletcher32 / scale-offset, and ZFP with the `zfp`
+    /// feature), and the pipeline, datatype, fill value, and attributes are
+    /// preserved verbatim. Appends of any length are supported — when the
+    /// dataset's current length is not a whole multiple of the chunk length, the
+    /// single trailing partial chunk is read, extended, and re-encoded; every
+    /// other existing chunk is carried by metadata alone, so the existing data is
+    /// not rewritten and the file does not grow by the whole dataset per append.
+    ///
+    /// This does **not** use SWMR and sets no consistency flag. Like every other
+    /// [`EditSession`] edit it commits by appending the new chunks and a rebuilt
+    /// index at end-of-file and repointing the superblock last (under the
+    /// session's exclusive lock), so a crash leaves either the original dataset or
+    /// the fully-grown one, never a torn state.
+    ///
+    /// The first release supports the Extensible-Array chunk index (the index the
+    /// reference C library and h5py select for a single unlimited dimension under
+    /// the latest format, and the one this crate writes for every unlimited
+    /// dataset), rank-1 datasets, and datasets with a single hard link. A dataset
+    /// that is not chunked, not unlimited along axis 0, not Extensible-Array
+    /// indexed, higher than rank 1, uses a filter this engine cannot re-encode,
+    /// has a sparse chunk grid, or (for [`append_raw`](AppendBuilder::append_raw))
+    /// has a big-endian element datatype is refused with
+    /// [`Error::AppendUnsupported`]. Use [`Dataset::is_chunked`](crate::Dataset::is_chunked),
+    /// [`maxshape`](crate::Dataset::maxshape), and [`filters`](crate::Dataset::filters)
+    /// to check eligibility up front.
+    pub fn append_dataset(&mut self, path: &str) -> &mut AppendBuilder {
+        self.pending_appends
+            .push((split_path(path), AppendBuilder::new()));
+        &mut self.pending_appends.last_mut().unwrap().1
+    }
+
     /// Stage a new (empty) group at `path`, created on the next
     /// [`commit`](Self::commit). The parent must already exist or be created in
     /// the same session; populate the group with datasets via
@@ -762,6 +905,7 @@ impl EditSession {
     pub fn commit(&mut self) -> Result<(), Error> {
         if self.pending_datasets.is_empty()
             && self.pending_writes.is_empty()
+            && self.pending_appends.is_empty()
             && self.pending_groups.is_empty()
             && self.pending_group_attrs.is_empty()
             && self.pending_deletes.is_empty()
@@ -852,6 +996,58 @@ impl EditSession {
                     moving_writes.push((parent, leaf, mw));
                 }
             }
+            write_targets.push(full);
+        }
+
+        // --- Preflight appends (`append_dataset`) under the same all-or-nothing,
+        // single-hard-link contract. Each plans a relocating append — existing
+        // chunk data stays in place; the appended (and any rewritten trailing)
+        // chunks and a rebuilt Extensible-Array index are staged, and the whole is
+        // treated like a relocating overwrite of the dataset's header (staged
+        // against its parent group so the commit patches the link). A zero-length
+        // append is a no-op and is dropped here. ---
+        let appends = std::mem::take(&mut self.pending_appends);
+        for (full, ab) in appends {
+            if full.is_empty() {
+                return Err(Error::AppendUnsupported("cannot append to the root group"));
+            }
+            if ab.raw.is_empty() {
+                continue; // nothing to append
+            }
+            // A dataset overwritten or appended earlier in this commit would be
+            // planned against a stale header and its old storage double-freed;
+            // require separate commits.
+            if write_targets.contains(&full) {
+                return Err(Error::AppendUnsupported(
+                    "the same dataset is edited more than once in one commit; use separate commits",
+                ));
+            }
+            let path_str = full.join("/");
+            let addr = crate::group_v2::resolve_path_any(&self.data, &self.superblock, &path_str)
+                .map_err(|_| {
+                Error::AppendUnsupported("nothing to append to at the given path")
+            })?;
+            let addr = usize::try_from(addr)
+                .map_err(|_| Error::AppendUnsupported("dataset address exceeds this platform"))?;
+            let mw = Self::prepare_append(&self.data, addr, &ab, base)?;
+            // A relocating append moves the dataset's object header and patches only
+            // the one parent link that names it, so it is safe only when this is the
+            // dataset's sole hard link (same rule as a relocating overwrite).
+            let counts = incoming_links
+                .get_or_insert_with(|| self.count_incoming_hard_links())
+                .as_ref();
+            match counts.and_then(|c| c.get(&(addr as u64))) {
+                Some(&1) => {}
+                _ => {
+                    return Err(Error::AppendUnsupported(
+                        "appending relocates the dataset header; only supported when it \
+                         has a single hard link",
+                    ));
+                }
+            }
+            let leaf = full.last().unwrap().clone();
+            let parent = full[..full.len() - 1].to_vec();
+            moving_writes.push((parent, leaf, mw));
             write_targets.push(full);
         }
 
@@ -1203,6 +1399,24 @@ impl EditSession {
                             if let Some(spans) = self.chunked_storage_spans(a) {
                                 to_free.extend(spans);
                             }
+                        }
+                    }
+                    // A relocating append keeps the existing chunk *data* in place
+                    // (shared by both indexes during the commit), so only the old
+                    // index structure and the relocated old trailing chunk are dead.
+                    // The old header chunks are freed by the generic path below.
+                    MovingWrite::AppendedChunks {
+                        old_addr,
+                        old_tail_extent,
+                        ..
+                    } => {
+                        if let Ok(a) = usize::try_from(*old_addr) {
+                            if let Some(spans) = self.chunked_index_spans(a) {
+                                to_free.extend(spans);
+                            }
+                        }
+                        if let Some(ext) = old_tail_extent {
+                            to_free.push(*ext);
                         }
                     }
                     _ => {}
@@ -2235,6 +2449,316 @@ impl EditSession {
         }
     }
 
+    /// Plan a relocating append to an existing chunked, unlimited,
+    /// Extensible-Array-indexed dataset at `addr`. Validates the target, splits
+    /// the appended elements into new (and one rewritten trailing) chunks —
+    /// compressed through the on-disk pipeline when filtered — and gathers the
+    /// existing complete chunks by metadata alone. Returns the
+    /// [`MovingWrite::AppendedChunks`] plan; the commit machinery appends the new
+    /// chunks and a rebuilt index and repoints the header (see
+    /// [`write_appended_chunks`](Self::write_appended_chunks)).
+    ///
+    /// Reads only `d` (the file mirror); no bytes are written here. `d` is the
+    /// whole file image and `base` its userblock base; the dataset's stored
+    /// (base-relative) structures are read through a `base`-shifted view.
+    fn prepare_append(
+        d: &[u8],
+        addr: usize,
+        ab: &AppendBuilder,
+        base: u64,
+    ) -> Result<MovingWrite, Error> {
+        if ab.dt_conflict {
+            return Err(Error::AppendUnsupported(
+                "append mixes element types in one builder; use one element type per \
+                 append_dataset call",
+            ));
+        }
+
+        let region = Self::gather_oh_messages(d, addr, base)?;
+
+        // Locate the datatype, dataspace, data-layout, and filter-pipeline
+        // messages, and detect a group (link) header.
+        let mut datatype: Option<(usize, usize)> = None;
+        let mut dataspace: Option<(usize, usize)> = None;
+        let mut layout: Option<(usize, usize)> = None;
+        let mut filter: Option<(usize, usize)> = None;
+        let mut has_link = false;
+        let mut p = 0;
+        while let Some((msg_type, body, body_end)) = next_message(&region, p)? {
+            match msg_type {
+                MessageType::Datatype => datatype = Some((body, body_end)),
+                MessageType::Dataspace => dataspace = Some((body, body_end)),
+                MessageType::DataLayout => layout = Some((body, body_end)),
+                MessageType::FilterPipeline => filter = Some((body, body_end)),
+                MessageType::Link | MessageType::LinkInfo | MessageType::SymbolTable => {
+                    has_link = true;
+                }
+                _ => {}
+            }
+            p = body_end;
+        }
+        if has_link {
+            return Err(Error::AppendUnsupported(
+                "append target is a group, not a dataset",
+            ));
+        }
+        let (dt_b, dt_e) =
+            datatype.ok_or(Error::AppendUnsupported("dataset header has no datatype"))?;
+        let (ds_b, ds_e) =
+            dataspace.ok_or(Error::AppendUnsupported("dataset header has no dataspace"))?;
+        let (lb, le) = layout.ok_or(Error::AppendUnsupported(
+            "dataset header has no data layout",
+        ))?;
+
+        let (disk_dt, _) = Datatype::parse(&region[dt_b..dt_e])
+            .map_err(|_| Error::AppendUnsupported("dataset header datatype could not be parsed"))?;
+        let disk_ds = Dataspace::parse(&region[ds_b..ds_e], LENGTH_SIZE).map_err(|_| {
+            Error::AppendUnsupported("dataset header dataspace could not be parsed")
+        })?;
+        let dl = DataLayout::parse(&region[lb..le], OFFSET_SIZE, LENGTH_SIZE).map_err(|_| {
+            Error::AppendUnsupported("dataset header data layout could not be parsed")
+        })?;
+
+        // Require chunked, data-layout version 4, Extensible-Array index (type 4).
+        let DataLayout::Chunked {
+            version: lversion,
+            chunk_index_type,
+            btree_address,
+            ..
+        } = &dl
+        else {
+            return Err(Error::AppendUnsupported(
+                "append requires a chunked dataset",
+            ));
+        };
+        if *lversion != 4 || *chunk_index_type != Some(4) {
+            return Err(Error::AppendUnsupported(
+                "append requires an Extensible-Array-indexed chunked dataset (a single \
+                 unlimited dimension under the latest format)",
+            ));
+        }
+
+        // Require rank 1, unlimited along axis 0.
+        if disk_ds.space_type != DataspaceType::Simple || disk_ds.dimensions.len() != 1 {
+            return Err(Error::AppendUnsupported(
+                "append requires a rank-1 dataset in this release",
+            ));
+        }
+        match &disk_ds.max_dimensions {
+            Some(md) if md.first() == Some(&u64::MAX) => {}
+            _ => {
+                return Err(Error::AppendUnsupported(
+                    "append requires a dataset that is unlimited along its first dimension",
+                ));
+            }
+        }
+
+        let ChunkedGeometry {
+            spatial,
+            element_size,
+            raw_size,
+            ..
+        } = chunked_geometry(&disk_dt, &disk_ds, &dl)?;
+        let chunk_elems = spatial[0];
+        if chunk_elems == 0 {
+            return Err(Error::AppendUnsupported(
+                "append requires a nonzero chunk length",
+            ));
+        }
+
+        // Validate the appended bytes against the on-disk element type.
+        if ab.raw.len() % element_size != 0 {
+            return Err(Error::AppendUnsupported(
+                "appended byte length is not a whole number of elements",
+            ));
+        }
+        match &ab.elem_dt {
+            // A typed append must match the on-disk datatype exactly (class, size,
+            // and byte order) — this is a value append, not a retype.
+            Some(expected) if *expected != disk_dt => {
+                return Err(Error::AppendUnsupported(
+                    "append datatype does not match the on-disk dataset (wrong element \
+                     type or byte order)",
+                ));
+            }
+            Some(_) => {}
+            // A raw append trusts the caller's bytes but still refuses any datatype
+            // whose flat little-endian bytes cannot be written verbatim: a
+            // big-endian numeric leaf would silently misencode, and a
+            // variable-length or reference leaf embeds heap/object addresses a byte
+            // append cannot reproduce. A typed append is byte-order- and
+            // class-checked by the datatype-equality arm above.
+            None => {
+                if !datatype_is_raw_appendable(&disk_dt) {
+                    return Err(Error::AppendUnsupported(
+                        "append_raw onto this dataset's datatype (non-little-endian, \
+                         variable-length, or reference) could misencode the bytes; use a \
+                         typed append",
+                    ));
+                }
+            }
+        }
+
+        let new_elems = (ab.raw.len() / element_size) as u64;
+        let current_dim0 = disk_ds.dimensions[0];
+        let new_dim0 = current_dim0
+            .checked_add(new_elems)
+            .ok_or(Error::AppendUnsupported(
+                "append would overflow the dataset dimension",
+            ))?;
+
+        // The filter pipeline is preserved verbatim in the rebuilt header; parse it
+        // to re-encode the new chunks. An engine-unencodable filter is refused.
+        let pipeline_message: Option<Vec<u8>> = filter.map(|(fb, fe)| region[fb..fe].to_vec());
+        let has_filters = pipeline_message.is_some();
+        let pipeline = match &pipeline_message {
+            Some(pm) => {
+                let parsed = FilterPipeline::parse(pm).map_err(|_| {
+                    Error::AppendUnsupported("dataset filter pipeline could not be parsed")
+                })?;
+                if !pipeline_reencodable(&parsed) {
+                    return Err(Error::AppendUnsupported(
+                        "dataset uses a filter this engine cannot re-encode",
+                    ));
+                }
+                Some(parsed)
+            }
+            None => None,
+        };
+
+        let base_off = usize::try_from(base).map_err(|_| {
+            Error::AppendUnsupported("userblock base address exceeds this platform")
+        })?;
+        let view = d.get(base_off..).ok_or(Error::AppendUnsupported(
+            "userblock base address past end-of-file",
+        ))?;
+
+        // The rebuilt index's element format (bare address vs address+size+mask) is
+        // chosen by `has_filters`; it must agree with the source index's client id,
+        // or the kept chunks — carried by metadata into the new index — would be
+        // re-encoded in the wrong element width.
+        if let Some(idx_addr) = *btree_address {
+            let src = crate::source::BytesSource::new(view);
+            let hdr =
+                ExtensibleArrayHeader::parse_from_source(&src, idx_addr, OFFSET_SIZE, LENGTH_SIZE)
+                    .map_err(|_| {
+                        Error::AppendUnsupported(
+                            "dataset extensible-array header could not be parsed",
+                        )
+                    })?;
+            if (hdr.client_id == 1) != has_filters {
+                return Err(Error::AppendUnsupported(
+                    "dataset filter metadata is inconsistent (chunk-index client id \
+                     disagrees with the filter pipeline)",
+                ));
+            }
+        }
+
+        // Enumerate the existing chunks (base-relative addresses) and require a
+        // dense grid: `plan_dense_grid` returns the chunks in index order and
+        // `None` on any hole, duplicate, or count mismatch against the dimension.
+        let infos = enumerate_chunks_buffered(view, &dl, &disk_ds, OFFSET_SIZE, LENGTH_SIZE)
+            .map_err(|_| Error::AppendUnsupported("dataset chunk index could not be enumerated"))?;
+        let grid = plan_dense_grid(infos, &disk_ds.dimensions, &spatial).ok_or(
+            Error::AppendUnsupported(
+                "dataset has a sparse or inconsistent chunk grid; cannot append",
+            ),
+        )?;
+        let grid_order = grid.grid_order;
+
+        // Complete chunks are kept by metadata; a trailing partial chunk (when the
+        // current length is not chunk-aligned) is rewritten.
+        let n_full = usize::try_from(current_dim0 / chunk_elems)
+            .map_err(|_| Error::AppendUnsupported("chunk count exceeds this platform"))?;
+        let has_partial = current_dim0 % chunk_elems != 0;
+
+        let mut kept_chunks: Vec<WrittenChunk> = Vec::with_capacity(n_full);
+        for ci in grid_order.iter().take(n_full) {
+            kept_chunks.push(WrittenChunk {
+                address: ci.address,
+                compressed_size: u64::from(ci.chunk_size),
+                raw_size,
+                // Preserve the source mask verbatim: a C/h5py file records a nonzero
+                // mask for a chunk whose filter was skipped (e.g. deflate on
+                // incompressible data), and forcing it to 0 would corrupt that chunk.
+                filter_mask: ci.filter_mask,
+            });
+        }
+
+        // Build the raw byte region for the tail (from the last chunk boundary to
+        // the new end): the live prefix of any rewritten partial chunk, then the
+        // appended bytes.
+        let mut tail_raw: Vec<u8> = Vec::new();
+        let mut old_tail_extent: Option<(u64, u64)> = None;
+        if has_partial {
+            let partial = &grid_order[n_full];
+            let start = usize::try_from(partial.address)
+                .map_err(|_| Error::AppendUnsupported("chunk address exceeds this platform"))?;
+            let len = partial.chunk_size as usize;
+            let end = start.checked_add(len).filter(|&e| e <= view.len()).ok_or(
+                Error::AppendUnsupported("trailing chunk extends past end-of-file"),
+            )?;
+            let stored = &view[start..end];
+            let full = if let Some(pl) = &pipeline {
+                let ctx = ChunkContext::from_datatype(&spatial, &disk_dt);
+                decompress_chunk(stored, pl, ctx, partial.filter_mask).map_err(Error::Format)?
+            } else {
+                stored.to_vec()
+            };
+            let live_elems = usize::try_from(current_dim0 % chunk_elems)
+                .map_err(|_| Error::AppendUnsupported("chunk length exceeds this platform"))?;
+            let live_bytes = live_elems * element_size;
+            if full.len() < live_bytes {
+                return Err(Error::AppendUnsupported(
+                    "trailing chunk decoded shorter than its live element count",
+                ));
+            }
+            tail_raw.extend_from_slice(&full[..live_bytes]);
+            // The old partial chunk's data block is dead once the new index lands.
+            old_tail_extent = Some((partial.address + base, u64::from(partial.chunk_size)));
+        }
+        tail_raw.extend_from_slice(&ab.raw);
+
+        // Split the tail into full chunk buffers (edge overhang zero-filled) and
+        // compress each through the pipeline when filtered.
+        let tail_len_elems = new_dim0 - (n_full as u64) * chunk_elems;
+        let split = split_into_chunks(&tail_raw, &[tail_len_elems], &spatial, element_size);
+        let new_chunk_bytes: Vec<Vec<u8>> = if let Some(pl) = &pipeline {
+            let ctx = ChunkContext::from_datatype(&spatial, &disk_dt);
+            let mut out = Vec::with_capacity(split.len());
+            for (_, buf) in &split {
+                out.push(compress_chunk(buf, pl, ctx).map_err(Error::Format)?);
+            }
+            out
+        } else {
+            split.into_iter().map(|(_, buf)| buf).collect()
+        };
+
+        // Grow the dataspace along axis 0, preserving the (unlimited) max-dims.
+        let mut grown = disk_ds.clone();
+        grown.dimensions[0] = new_dim0;
+        let new_dataspace_body = grown.serialize(LENGTH_SIZE);
+
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "spatial chunk dims come from the on-disk u32 chunk_dimensions, so they fit u32"
+        )]
+        let chunk_dims_u32: Vec<u32> = spatial.iter().map(|&dm| dm as u32).collect();
+
+        Ok(MovingWrite::AppendedChunks {
+            region,
+            new_dataspace_body,
+            chunk_dims_u32,
+            element_size,
+            raw_size,
+            has_filters,
+            kept_chunks,
+            new_chunk_bytes,
+            old_addr: addr as u64,
+            old_tail_extent,
+        })
+    }
+
     /// Parse the object header at `addr` into a copyable model, validating that
     /// every message can be reproduced faithfully (verbatim message bytes, with
     /// only the contiguous data address and child link targets repointed).
@@ -2901,7 +3425,103 @@ impl EditSession {
                 chunk_bytes,
                 &[],
             ),
+            MovingWrite::AppendedChunks {
+                region,
+                new_dataspace_body,
+                chunk_dims_u32,
+                element_size,
+                raw_size,
+                has_filters,
+                kept_chunks,
+                new_chunk_bytes,
+                ..
+            } => self.write_appended_chunks(
+                region,
+                new_dataspace_body,
+                chunk_dims_u32,
+                *element_size,
+                *raw_size,
+                *has_filters,
+                kept_chunks,
+                new_chunk_bytes,
+            ),
         }
+    }
+
+    /// Apply a relocating append ([`MovingWrite::AppendedChunks`]): append the new
+    /// (and any rewritten trailing) chunk bytes at end-of-file, rebuild a fresh
+    /// Extensible Array over the kept plus appended chunks, grow the dataspace and
+    /// repoint the data layout in the verbatim header `region`, and write the
+    /// relocated header. Returns the new header address; the caller patches the
+    /// parent link. The kept chunk data is untouched (referenced by both the old
+    /// and new index during the commit); the old index/header/trailing chunk are
+    /// freed only after the superblock repoint.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the append rebuild needs the header region, grown dataspace, chunk \
+        geometry, and both chunk sets; bundling them into a struct would only move the list"
+    )]
+    fn write_appended_chunks(
+        &mut self,
+        region: &[u8],
+        new_dataspace_body: &[u8],
+        chunk_dims_u32: &[u32],
+        element_size: usize,
+        raw_size: u64,
+        has_filters: bool,
+        kept_chunks: &[WrittenChunk],
+        new_chunk_bytes: &[Vec<u8>],
+    ) -> Result<u64, Error> {
+        let base = self.superblock.base_address;
+        // Append each new chunk at true end-of-file (never `alloc_or_append`: the
+        // rebuilt index below records base-relative addresses computed from the
+        // end-of-file the appends land at). Existing chunks keep their in-place
+        // addresses and are carried by metadata alone.
+        let mut combined: Vec<WrittenChunk> = kept_chunks.to_vec();
+        for cb in new_chunk_bytes {
+            let abs = self.append(cb)?;
+            combined.push(WrittenChunk {
+                address: abs - base,
+                compressed_size: cb.len() as u64,
+                raw_size,
+                // This engine applies every filter to a new chunk (no per-chunk
+                // skipping), so an appended chunk's mask is always 0. Kept chunks
+                // carry their own (possibly nonzero) mask in `combined` already.
+                filter_mask: 0,
+            });
+        }
+
+        // Build the fresh Extensible Array at the current end-of-file. Its embedded
+        // block addresses are computed from `ea_base` (base-relative), so appending
+        // the blob at the matching file offset makes them resolve correctly, on a
+        // userblock (`base != 0`) file too.
+        let ea_base = self.data.len() as u64 - base;
+        let ea_bytes =
+            build_extensible_array_at(&combined, OFFSET_SIZE, LENGTH_SIZE, has_filters, ea_base)
+                .map_err(Error::Format)?;
+        let written = self.append(&ea_bytes)?;
+        debug_assert_eq!(
+            written,
+            ea_base + base,
+            "extensible-array index must land at end-of-file",
+        );
+
+        // Swap the dataspace (grown) and data-layout (repointed at the new index)
+        // messages; every other header message is preserved verbatim.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "element size is a datatype byte width that fits u32"
+        )]
+        let layout_body = serialize_v4_extensible_array(
+            chunk_dims_u32,
+            ea_base,
+            OFFSET_SIZE,
+            element_size as u32,
+        );
+        let region = replace_dataspace_message(region, new_dataspace_body)?;
+        let region = replace_layout_message(&region, &layout_body)?;
+        let oh = build_v2_object_header(&region);
+        self.alloc_or_append(&oh)
     }
 
     /// Append `bytes` at end-of-file, updating both the mirror and the file.
@@ -3461,6 +4081,50 @@ impl EditSession {
         }
         Some(spans)
     }
+
+    /// Every on-disk byte span of a chunked dataset's *index structure only* (not
+    /// its chunk data), for reclaiming the old index after a relocating append
+    /// ([`MovingWrite::AppendedChunks`]) that keeps the chunk data in place. Mirror
+    /// of [`chunked_storage_spans`](Self::chunked_storage_spans) but delegating to
+    /// [`chunk_index_spans_buffered`], which enumerates only the EA header/index/
+    /// data/super blocks and never a chunk-data address, so the shared kept chunk
+    /// data is never freed. Base-aware and validated disjoint/in-bounds; returns
+    /// `None` (leave unreclaimed) on any error or violation.
+    fn chunked_index_spans(&self, addr: usize) -> Option<Vec<(u64, u64)>> {
+        let region =
+            Self::gather_oh_messages(&self.data, addr, self.superblock.base_address).ok()?;
+        let mut layout_msg: Option<(usize, usize)> = None;
+        let mut p = 0;
+        loop {
+            match next_message(&region, p) {
+                Ok(Some((msg_type, body, body_end))) => {
+                    if msg_type == MessageType::DataLayout {
+                        layout_msg = Some((body, body_end));
+                    }
+                    p = body_end;
+                }
+                Ok(None) => break,
+                Err(_) => return None,
+            }
+        }
+        let (lb, le) = layout_msg?;
+        let layout = DataLayout::parse(&region[lb..le], OFFSET_SIZE, LENGTH_SIZE).ok()?;
+        if !matches!(layout, DataLayout::Chunked { .. }) {
+            return None;
+        }
+        let base = self.superblock.base_address;
+        let base_off = usize::try_from(base).ok()?;
+        let mut spans =
+            chunk_index_spans_buffered(&self.data[base_off..], &layout, OFFSET_SIZE, LENGTH_SIZE)
+                .ok()?;
+        for (a, _) in &mut spans {
+            *a = a.checked_add(base)?;
+        }
+        if !spans_disjoint_in_bounds(&mut spans, self.data.len() as u64) {
+            return None;
+        }
+        Some(spans)
+    }
 }
 
 /// A dirty group in the edit plan: its base object-header message region and the
@@ -3665,6 +4329,44 @@ enum MovingWrite {
         meta: Vec<ChunkMeta>,
         chunk_bytes: Vec<Vec<u8>>,
         old_addr: u64,
+    },
+    /// A relocating **append** to a chunked, unlimited, Extensible-Array-indexed
+    /// dataset (`append_dataset`). The dataset's existing chunk *data* stays in
+    /// place; only the newly-appended chunks and any rewritten trailing partial
+    /// chunk (`new_chunk_bytes`, already compressed through the on-disk pipeline)
+    /// are appended at end-of-file, a fresh Extensible Array is rebuilt over
+    /// `kept_chunks ++ new_chunk_bytes`, the verbatim header `region`'s dataspace
+    /// message is grown (`new_dataspace_body`) and its data-layout message
+    /// repointed at the new index (every other message — datatype, filter
+    /// pipeline, fill value, attributes — preserved verbatim), and the header is
+    /// relocated. After the commit lands, only the old index structure at
+    /// `old_addr`, the old header, and the relocated old trailing chunk
+    /// (`old_tail_extent`) are freed — never the kept chunk data, which both the
+    /// old and new index share during the commit.
+    AppendedChunks {
+        region: Vec<u8>,
+        /// The grown dataspace message body (v2-serialized), current axis-0
+        /// dimension increased, maximum dimensions (unlimited) preserved.
+        new_dataspace_body: Vec<u8>,
+        /// Rank-only spatial chunk dimensions, for the rebuilt v4 layout message.
+        chunk_dims_u32: Vec<u32>,
+        element_size: usize,
+        /// Full (uncompressed) chunk byte size = product(spatial) * element_size.
+        raw_size: u64,
+        has_filters: bool,
+        /// Existing complete chunks, in index order, carried by metadata alone —
+        /// their base-relative addresses, on-disk stored sizes, and filter masks
+        /// preserved exactly (a nonzero mask from a C/h5py-skipped filter is kept).
+        kept_chunks: Vec<WrittenChunk>,
+        /// The appended chunks in index order: the recompressed trailing partial
+        /// chunk first (when present), then the remaining new full chunks.
+        new_chunk_bytes: Vec<Vec<u8>>,
+        /// The dataset header address, for old-index and old-header reclaim.
+        old_addr: u64,
+        /// The absolute `(addr, len)` of the old trailing partial chunk's data
+        /// block when it was rewritten, freed after the commit lands. `None` when
+        /// the append was chunk-aligned (no partial chunk to rewrite).
+        old_tail_extent: Option<(u64, u64)>,
     },
 }
 
@@ -4039,6 +4741,66 @@ fn replace_layout_message(region: &[u8], new_layout_body: &[u8]) -> Result<Vec<u
         ));
     }
     Ok(out)
+}
+
+/// Rebuild a header message `region`, replacing the single Dataspace message's
+/// record with one carrying `new_dataspace_body` (the grown current dimensions,
+/// v2-serialized, maximum dimensions preserved) and leaving every other message
+/// byte-for-byte. Used by the append path to grow a dataset's axis-0 dimension.
+/// The replacement may differ in length from the original (a v1 on-disk
+/// dataspace is normalized to v2 in the rebuilt header), so the record is rebuilt
+/// via [`region_message`] rather than patched in place.
+fn replace_dataspace_message(region: &[u8], new_dataspace_body: &[u8]) -> Result<Vec<u8>, Error> {
+    let mut out = Vec::with_capacity(region.len());
+    let mut p = 0;
+    let mut replaced = false;
+    while let Some((msg_type, _body, body_end)) = next_message(region, p)? {
+        if msg_type == MessageType::Dataspace && !replaced {
+            out.extend_from_slice(&region_message(MessageType::Dataspace, new_dataspace_body));
+            replaced = true;
+        } else {
+            out.extend_from_slice(&region[p..body_end]);
+        }
+        p = body_end;
+    }
+    if !replaced {
+        return Err(Error::AppendUnsupported(
+            "dataset header has no dataspace message to grow",
+        ));
+    }
+    Ok(out)
+}
+
+/// Whether a datatype's raw on-disk bytes can be appended verbatim from a caller
+/// via [`AppendBuilder::append_raw`]. True only when every scalar leaf is safe to
+/// write as flat little-endian bytes:
+///
+/// - numeric leaves (fixed-point, floating-point, time, bit field) must be
+///   little-endian, or the caller's little-endian bytes would silently misencode
+///   into a big-endian (or VAX) field;
+/// - string and opaque leaves are byte arrays with no numeric byte order, so they
+///   are order-agnostic and safe;
+/// - aggregates (enumeration, array, compound) are appendable iff every leaf is;
+/// - variable-length and reference leaves embed global-heap or object addresses
+///   that a flat byte append cannot reproduce, so they are never raw-appendable.
+///
+/// A typed `append_*` bypasses this: it checks full datatype equality instead, so
+/// it already refuses every non-little-endian and non-scalar dataset.
+fn datatype_is_raw_appendable(dt: &Datatype) -> bool {
+    match dt {
+        Datatype::FixedPoint { byte_order, .. }
+        | Datatype::FloatingPoint { byte_order, .. }
+        | Datatype::Time { byte_order, .. }
+        | Datatype::BitField { byte_order, .. } => *byte_order == DatatypeByteOrder::LittleEndian,
+        Datatype::String { .. } | Datatype::Opaque { .. } => true,
+        Datatype::Enumeration { base_type, .. } | Datatype::Array { base_type, .. } => {
+            datatype_is_raw_appendable(base_type)
+        }
+        Datatype::Compound { members, .. } => members
+            .iter()
+            .all(|m| datatype_is_raw_appendable(&m.datatype)),
+        Datatype::VariableLength { .. } | Datatype::Reference { .. } => false,
+    }
 }
 
 /// The datatype, dataspace, parsed chunked data layout, and verbatim filter-
@@ -4904,6 +5666,66 @@ mod tests {
             p = end;
         }
         out
+    }
+
+    #[test]
+    fn raw_appendable_recurses_into_aggregates() {
+        use crate::datatype::{CompoundMember, DatatypeByteOrder};
+
+        let f64_with = |byte_order| Datatype::FloatingPoint {
+            size: 8,
+            byte_order,
+            bit_offset: 0,
+            bit_precision: 64,
+            exponent_location: 52,
+            exponent_size: 11,
+            mantissa_location: 0,
+            mantissa_size: 52,
+            exponent_bias: 1023,
+        };
+        let le_f64 = f64_with(DatatypeByteOrder::LittleEndian);
+        let be_f64 = f64_with(DatatypeByteOrder::BigEndian);
+
+        // Little-endian scalar: appendable. Big-endian scalar: not.
+        assert!(datatype_is_raw_appendable(&le_f64));
+        assert!(!datatype_is_raw_appendable(&be_f64));
+
+        // The confirmed bug: a compound / array whose leaf is big-endian must be
+        // refused (it was wrongly accepted before recursion was added).
+        let be_member = Datatype::Compound {
+            size: 8,
+            members: vec![CompoundMember {
+                name: "x".into(),
+                byte_offset: 0,
+                datatype: be_f64.clone(),
+            }],
+        };
+        assert!(!datatype_is_raw_appendable(&be_member));
+        let le_member = Datatype::Compound {
+            size: 8,
+            members: vec![CompoundMember {
+                name: "x".into(),
+                byte_offset: 0,
+                datatype: le_f64.clone(),
+            }],
+        };
+        assert!(datatype_is_raw_appendable(&le_member));
+        assert!(!datatype_is_raw_appendable(&Datatype::Array {
+            base_type: Box::new(be_f64.clone()),
+            dimensions: vec![4],
+        }));
+
+        // Variable-length / reference leaves are never raw-appendable, even LE.
+        assert!(!datatype_is_raw_appendable(&Datatype::VariableLength {
+            is_string: false,
+            padding: None,
+            charset: None,
+            base_type: Box::new(le_f64.clone()),
+        }));
+        assert!(!datatype_is_raw_appendable(&Datatype::Reference {
+            size: 8,
+            ref_type: crate::datatype::ReferenceType::Object,
+        }));
     }
 
     #[test]

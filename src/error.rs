@@ -656,6 +656,14 @@ pub enum Error {
     /// filtered, not rank-1 with an unlimited dimension, or not
     /// Extensible-Array indexed). The payload is a human-readable reason.
     SwmrAppendUnsupported(&'static str),
+    /// The dataset is not a supported target for
+    /// [`EditSession::append_dataset`](crate::EditSession::append_dataset) — for
+    /// example a dataset that is not chunked, not extensible along its first
+    /// dimension, not indexed by an Extensible Array, higher than rank 1, uses a
+    /// filter this engine cannot re-encode, has a big-endian on-disk element
+    /// datatype (for a raw append), or has more than one hard link. The payload
+    /// is a human-readable reason.
+    AppendUnsupported(&'static str),
     /// The file or the requested object is not a supported target for the
     /// in-place editor ([`crate::EditSession`]) — for example a userblock or
     /// non-latest-format file, a group whose links are densely stored, or a
@@ -695,6 +703,9 @@ impl fmt::Display for Error {
             ),
             Error::SwmrAppendUnsupported(reason) => {
                 write!(f, "unsupported SWMR append target: {reason}")
+            }
+            Error::AppendUnsupported(reason) => {
+                write!(f, "unsupported append target: {reason}")
             }
             Error::EditUnsupported(reason) => {
                 write!(f, "unsupported in-place edit target: {reason}")

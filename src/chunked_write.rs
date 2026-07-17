@@ -726,7 +726,7 @@ pub fn build_fixed_array_at(
 }
 
 /// Serialize a v4 Extensible Array layout message.
-fn serialize_v4_extensible_array(
+pub(crate) fn serialize_v4_extensible_array(
     chunk_dims: &[u32],
     ea_address: u64,
     offset_size: u8,

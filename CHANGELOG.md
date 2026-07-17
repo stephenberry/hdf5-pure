@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `EditSession::append_dataset` grows an existing **chunked, unlimited dataset** in place along its first dimension — **filtered** (deflate/shuffle/fletcher32/scale-offset, and ZFP with the `zfp` feature) or not, and of any length (a trailing partial chunk is rewritten) — without requiring SWMR; existing chunk data stays put while the appended chunks and a rebuilt Extensible-Array index are added, and the result reads back in the reference C library and h5py. Datasets that are not Extensible-Array-indexed (a version-1 B-tree, fixed-array, or single-chunk index), higher than rank 1, use a filter this engine cannot re-encode, or have more than one hard link are refused ([#144](https://github.com/stephenberry/hdf5-pure/issues/144)).
+- `Dataset` gains read-only introspection — `is_chunked`, `maxshape`, `chunk_shape`, and `filters` — so callers can check a dataset's storage, extensibility, and filter pipeline (for example append eligibility) without decoding any data ([#144](https://github.com/stephenberry/hdf5-pure/issues/144)).
+
 ### Fixed
 
 - Reading an attribute or dataset whose dataspace declares dimensions whose product overflows `u64` no longer panics: the element count now saturates so the size and limit checks reject the file as a format error ([#142](https://github.com/stephenberry/hdf5-pure/issues/142)).
