@@ -172,6 +172,11 @@ impl Dataspace {
     }
 
     /// Total number of elements. Scalar = 1, Null = 0.
+    ///
+    /// The count saturates at `u64::MAX` rather than panicking when a malformed
+    /// dataspace declares dimensions whose product overflows `u64`. Every caller
+    /// treats the saturated value as an impossibly large element count, so the
+    /// downstream size and limit checks reject it as an error instead.
     pub fn num_elements(&self) -> u64 {
         match self.space_type {
             DataspaceType::Null => 0,
@@ -180,7 +185,9 @@ impl Dataspace {
                 if self.dimensions.is_empty() {
                     0
                 } else {
-                    self.dimensions.iter().product()
+                    self.dimensions
+                        .iter()
+                        .fold(1u64, |acc, &dim| acc.saturating_mul(dim))
                 }
             }
         }
@@ -282,6 +289,16 @@ mod tests {
         let md = ds.max_dimensions.clone().unwrap();
         assert_eq!(md, vec![10, u64::MAX, 100]);
         assert_eq!(ds.num_elements(), 24);
+    }
+
+    #[test]
+    fn num_elements_saturates_on_overflow() {
+        // A malformed dataspace can declare dimensions whose product exceeds
+        // u64::MAX. num_elements() must saturate instead of panicking, so the
+        // callers can reject the impossibly large count as an error.
+        let data = build_v1_dataspace(3, 0, &[1 << 40, 1 << 40, 1 << 40], None);
+        let ds = Dataspace::parse(&data, 8).unwrap();
+        assert_eq!(ds.num_elements(), u64::MAX);
     }
 
     #[test]
