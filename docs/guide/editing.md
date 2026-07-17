@@ -92,6 +92,28 @@ Element types are checked, never coerced: each typed `append_*` call records the
 !!! tip "Runnable example"
     This section mirrors [`examples/append_dataset.rs`](https://github.com/stephenberry/hdf5-pure/blob/main/examples/append_dataset.rs). Run it with `cargo run --example append_dataset`.
 
+### Streaming appends with `AppendWriter`
+
+`append_dataset` re-reads the whole file and rebuilds the chunk index on every `commit`, which is the right trade for a one-off append composed alongside other edits, but not for a high-frequency append loop. For that, `AppendWriter` opens the file **once** and appends many times, growing the Extensible-Array index *in place* — so each append costs `O(appended bytes)` plus amortized `O(1)` index overhead, with no whole-file re-read and no index rebuild.
+
+```rust
+use hdf5_pure::AppendWriter;
+
+let mut writer = AppendWriter::open("log.h5").unwrap();
+writer.append_i32("samples", &[8, 9, 10, 11]).unwrap();
+writer.append_i32("samples", &[12, 13]).unwrap(); // unfiltered: any length
+writer.close().unwrap();
+```
+
+It addresses datasets by name so one open writer can feed several, takes an exclusive file lock for its lifetime, and sets no SWMR flag. **Every append it performs is crash-atomic**: writes are ordered child-before-parent with `fsync` barriers and the dataspace dimension is published last as the single commit point, so a crash between appends leaves either the previous length or the new one — never a torn or lost view.
+
+That atomicity is why filtered and unfiltered datasets have different length rules. An **unfiltered** append may be **any length**: when the current length is not chunk-aligned, the trailing partial chunk is rewritten and its index element — a single chunk address — is repointed with one atomic write. A **filtered** append must be **chunk-aligned** (the current length and the appended length both whole multiples of the chunk length), because a filtered index element is a multi-field record whose in-place repoint is not power-loss atomic; a filtered append therefore only ever inserts new chunks. For a non-chunk-aligned filtered append, use `append_dataset`, which rebuilds the index and repoints the superblock last (fully atomic).
+
+The remaining eligibility rules match `append_dataset` (chunked, unlimited axis 0, Extensible-Array index, rank 1, a re-encodable filter pipeline), with one difference: because it grows the index in place rather than rebuilding it, the index must already be allocated. This crate allocates it eagerly, so an empty dataset it wrote can be grown from the first append; an empty dataset the C library created without any initial data defers its index and is refused — make that first append with `append_dataset` (which materializes the index), or create the dataset with initial data. The dead bytes left when an unfiltered partial chunk is relocated are reclaimed by [repack](repack.md) rather than reused within the session in this release. It is the throughput-oriented counterpart to `append_dataset` and the filter-capable counterpart to the [SWMR writer](swmr.md).
+
+!!! tip "Runnable example"
+    `AppendWriter` has its own demo in [`examples/append_writer.rs`](https://github.com/stephenberry/hdf5-pure/blob/main/examples/append_writer.rs). Run it with `cargo run --example append_writer`.
+
 ## How it works
 
 `commit()` appends each new dataset (its data blob and object header) and each new group, then appends rewritten object headers for every touched group and its ancestors up to the root (omitting any deleted links), and finally repoints the superblock at the new root.

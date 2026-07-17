@@ -190,6 +190,10 @@ pub(crate) mod nosync;
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "std")]
+pub(crate) mod append_writer;
+#[cfg(feature = "std")]
+pub(crate) mod chunk_index_inplace;
+#[cfg(feature = "std")]
 pub(crate) mod edit;
 #[cfg(feature = "std")]
 pub(crate) mod file_lock;
@@ -251,6 +255,9 @@ pub use writer::FileBuilder;
 
 #[cfg(feature = "std")]
 pub use swmr_writer::SwmrWriter;
+
+#[cfg(feature = "std")]
+pub use append_writer::AppendWriter;
 
 #[cfg(feature = "std")]
 pub use edit::{AppendBuilder, EditSession};
