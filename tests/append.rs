@@ -3,7 +3,7 @@
 //! filtered and unfiltered, chunk-aligned and not — and read the result back
 //! with this crate. C-library interop lives in `append_crosscheck.rs`.
 
-use hdf5_pure::{EditSession, Error, File, FileBuilder, ScaleOffset};
+use hdf5_pure::{AppendBuilder, EditSession, Error, File, FileBuilder, ScaleOffset};
 use tempfile::tempdir;
 
 /// Create a rank-1, unlimited i32 dataset with the given chunk length and
@@ -272,6 +272,22 @@ fn introspection_on_contiguous_dataset() {
 // --- Refusal matrix: every case leaves the file unchanged and returns
 // Error::AppendUnsupported. ---
 
+/// Stage an append on `dataset` via `build`, commit, and return the result —
+/// dropping the session (and its exclusive file lock) before returning so a
+/// subsequent readback can reopen the file. On Windows the write lock is
+/// mandatory, so a still-open session makes `File::open` fail with a lock
+/// violation; keeping the session scoped here is what lets each case verify the
+/// file is unchanged after a refused commit.
+fn commit_append(
+    path: &std::path::Path,
+    dataset: &str,
+    build: impl FnOnce(&mut AppendBuilder),
+) -> Result<(), Error> {
+    let mut s = EditSession::open(path).unwrap();
+    build(s.append_dataset(dataset));
+    s.commit()
+}
+
 fn assert_append_unsupported(res: Result<(), Error>) {
     match res {
         Err(Error::AppendUnsupported(_)) => {}
@@ -288,9 +304,9 @@ fn refuse_contiguous() {
         .with_i32_data(&[1, 2, 3])
         .with_shape(&[3]);
     b.write(&path).unwrap();
-    let mut s = EditSession::open(&path).unwrap();
-    s.append_dataset("d").append_i32(&[4, 5]);
-    assert_append_unsupported(s.commit());
+    assert_append_unsupported(commit_append(&path, "d", |a| {
+        a.append_i32(&[4, 5]);
+    }));
     assert_eq!(read_i32(&path), vec![1, 2, 3]);
 }
 
@@ -306,9 +322,9 @@ fn refuse_fixed_chunked_not_unlimited() {
         .with_maxshape(&[100])
         .with_chunks(&[3]);
     b.write(&path).unwrap();
-    let mut s = EditSession::open(&path).unwrap();
-    s.append_dataset("d").append_i32(&[6, 7, 8]);
-    assert_append_unsupported(s.commit());
+    assert_append_unsupported(commit_append(&path, "d", |a| {
+        a.append_i32(&[6, 7, 8]);
+    }));
     assert_eq!(read_i32(&path), (0..6).collect::<Vec<_>>());
 }
 
@@ -324,9 +340,9 @@ fn refuse_rank2() {
         .with_maxshape(&[u64::MAX, 4])
         .with_chunks(&[1, 4]);
     b.write(&path).unwrap();
-    let mut s = EditSession::open(&path).unwrap();
-    s.append_dataset("d").append_i32(&[0, 0, 0, 0]);
-    assert_append_unsupported(s.commit());
+    assert_append_unsupported(commit_append(&path, "d", |a| {
+        a.append_i32(&[0, 0, 0, 0]);
+    }));
 }
 
 #[test]
@@ -334,9 +350,9 @@ fn refuse_datatype_mismatch() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("d.h5");
     create_i32(&path, 4, 4, true, false, false);
-    let mut s = EditSession::open(&path).unwrap();
-    s.append_dataset("d").append_f64(&[1.0, 2.0]); // f64 onto i32
-    assert_append_unsupported(s.commit());
+    assert_append_unsupported(commit_append(&path, "d", |a| {
+        a.append_f64(&[1.0, 2.0]); // f64 onto i32
+    }));
     assert_eq!(read_i32(&path), (0..4).collect::<Vec<_>>());
 }
 
@@ -345,9 +361,9 @@ fn refuse_raw_wrong_length() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("d.h5");
     create_i32(&path, 4, 4, true, false, false);
-    let mut s = EditSession::open(&path).unwrap();
-    s.append_dataset("d").append_raw(&[1, 2, 3]); // 3 bytes, elem size 4
-    assert_append_unsupported(s.commit());
+    assert_append_unsupported(commit_append(&path, "d", |a| {
+        a.append_raw(&[1, 2, 3]); // 3 bytes, elem size 4
+    }));
     assert_eq!(read_i32(&path), (0..4).collect::<Vec<_>>());
 }
 
@@ -356,9 +372,9 @@ fn refuse_mixed_element_types() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("d.h5");
     create_i32(&path, 4, 4, true, false, false);
-    let mut s = EditSession::open(&path).unwrap();
-    s.append_dataset("d").append_i32(&[4, 5]).append_i64(&[6]);
-    assert_append_unsupported(s.commit());
+    assert_append_unsupported(commit_append(&path, "d", |a| {
+        a.append_i32(&[4, 5]).append_i64(&[6]);
+    }));
     assert_eq!(read_i32(&path), (0..4).collect::<Vec<_>>());
 }
 
@@ -367,7 +383,7 @@ fn refuse_nonexistent_dataset() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("d.h5");
     create_i32(&path, 4, 4, true, false, false);
-    let mut s = EditSession::open(&path).unwrap();
-    s.append_dataset("missing").append_i32(&[1]);
-    assert_append_unsupported(s.commit());
+    assert_append_unsupported(commit_append(&path, "missing", |a| {
+        a.append_i32(&[1]);
+    }));
 }
