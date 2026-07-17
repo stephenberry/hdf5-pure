@@ -75,6 +75,29 @@ println!("shape: {:?}", ds.shape().unwrap());
 println!("dtype: {:?}", ds.dtype().unwrap());
 ```
 
+### Chunking, filters, and append eligibility
+
+Four accessors describe a dataset's storage layout without reading any data. They also tell you whether a dataset can be grown in place with [`EditSession::append_dataset`](editing.md#appending-to-an-unlimited-dataset) before you attempt the append:
+
+| Method | Returns |
+|---|---|
+| `Dataset::is_chunked()` | `bool` — `true` for chunked storage; filtered datasets are always chunked |
+| `Dataset::maxshape()` | `Option<Vec<u64>>` — maximum dimensions, an unlimited axis reported as `u64::MAX`; `None` for a fixed-shape dataset |
+| `Dataset::chunk_shape()` | `Option<Vec<u64>>` — chunk dimensions, one per rank; `None` when not chunked |
+| `Dataset::filters()` | `Vec<u16>` — HDF5 filter IDs in pipeline order (1 = deflate, 2 = shuffle, 3 = fletcher32, 6 = scale-offset); empty when unfiltered |
+
+```rust
+use hdf5_pure::File;
+
+let file = File::open("log.h5").unwrap();
+let ds = file.dataset("samples").unwrap();
+
+// Broadly appendable: chunked and unlimited along axis 0. The full rules
+// (rank 1, Extensible-Array index, single hard link) are in the editing guide.
+let appendable = ds.is_chunked()
+    && matches!(ds.maxshape().unwrap().as_deref(), Some([u64::MAX, ..]));
+```
+
 ## Reading dataset data
 
 ### Typed reads

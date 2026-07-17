@@ -109,3 +109,6 @@ SWMR append supports the following subset, distinct from the general [editing](e
 | Build | requires `std` (the default); the in-memory/WASM path cannot refresh |
 
 `SwmrWriter::open` rejects files that fall outside this subset, returning `Error::SwmrAppendUnsupported` for a non-latest-format superblock or a userblock file before performing any mutating write.
+
+!!! tip "Appending without SWMR"
+    If you don't need concurrent readers, [`EditSession::append_dataset`](editing.md#appending-to-an-unlimited-dataset) appends to an unlimited dataset in place with fewer restrictions — it handles **filtered** (compressed) datasets and **any-length**, non-chunk-aligned appends, neither of which the SWMR writer supports. Reach for SWMR only when a separate process must read the dataset while it grows.
