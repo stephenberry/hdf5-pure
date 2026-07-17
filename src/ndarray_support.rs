@@ -47,7 +47,7 @@ use crate::type_builders::DatasetBuilder;
 impl Dataset<'_> {
     /// Read the dataset into a statically-ranked [`ndarray::Array`].
     ///
-    /// The dimensionality `D` (e.g. [`ndarray::Ix2`]) is usually inferred from
+    /// The dimensionality `D` (e.g. [`ndarray::Ix2`](tyalias@ndarray::Ix2)) is usually inferred from
     /// the binding, so a call site reads as `let m: Array2<f64> =
     /// ds.read_array()?;`.
     ///

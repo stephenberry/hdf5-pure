@@ -135,7 +135,8 @@ impl RepackOptions {
 /// reading the source or writing the destination partway through can leave a
 /// partial `dst` (remove it and retry).
 ///
-/// See the [module documentation](self) for the exact fidelity contract.
+/// See [`Error::RepackUnsupported`] for the objects that cannot be reproduced
+/// faithfully.
 pub fn repack<P: AsRef<Path>, Q: AsRef<Path>>(
     src: P,
     dst: Q,

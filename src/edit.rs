@@ -413,8 +413,8 @@ impl EditSession {
     /// another writer or reader; the lock is released automatically when the
     /// session is dropped or the process exits (including on a crash). Fails with
     /// [`Error::FileLocked`] if the file is already locked, or
-    /// [`Error::EditUnsupported`] if the file is not a supported target (see the
-    /// [module docs](self) for the exact requirements). To control or disable
+    /// [`Error::EditUnsupported`] if the file is not a supported target; its
+    /// documentation enumerates the exact requirements. To control or disable
     /// locking, use [`open_with_locking`](Self::open_with_locking) or set
     /// `HDF5_USE_FILE_LOCKING=FALSE`.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
@@ -627,9 +627,7 @@ impl EditSession {
     /// contiguous dataset may carry variable-length attributes, a
     /// variable-length-string payload (`with_vlen_strings`), or path-resolved
     /// object-reference elements (`with_path_references`; chunking any of
-    /// these is not supported — see the [module docs](self) for the
-    /// path-resolution rule and what still stays unsupported (dense
-    /// attributes)).
+    /// these is not supported, and dense attributes remain unsupported).
     pub fn create_dataset(&mut self, path: &str) -> &mut DatasetBuilder {
         let mut comps = split_path(path);
         let leaf = comps.pop().unwrap_or_default();
@@ -776,7 +774,7 @@ impl EditSession {
     /// bytes rather than risk freeing a region that is still in use. Freed space is
     /// reused within the open session; for a file created with
     /// `H5Pset_file_space_strategy(persist = true)` it is also recorded on disk so
-    /// it survives reopen (see the [module docs](self)), otherwise it is forgotten
+    /// it survives reopen (see [`EditSession`]), otherwise it is forgotten
     /// on close. After reuse, an object reference to a deleted object may resolve
     /// to an unrelated object (deleting a referenced object is undefined in HDF5).
     ///
