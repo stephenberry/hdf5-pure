@@ -77,7 +77,7 @@ println!("dtype: {:?}", ds.dtype().unwrap());
 
 ### Chunking, filters, and append eligibility
 
-Four accessors describe a dataset's storage layout without reading any data. They also tell you whether a dataset can be grown in place with [`EditSession::append_dataset`](editing.md#appending-to-an-unlimited-dataset) before you attempt the append:
+Four accessors describe a dataset's storage layout without reading any data. They also tell you whether a dataset can be grown in place with [`EditSession::append_dataset`](editing.md#appending-to-an-unlimited-dataset) or the streaming [`AppendWriter`](editing.md#streaming-appends-with-appendwriter) before you attempt the append:
 
 | Method | Returns |
 |---|---|

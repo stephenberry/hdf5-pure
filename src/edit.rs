@@ -244,12 +244,28 @@ pub struct AppendBuilder {
 }
 
 impl AppendBuilder {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             raw: Vec::new(),
             elem_dt: None,
             dt_conflict: false,
         }
+    }
+
+    /// Accumulated little-endian element bytes (for the general append writer,
+    /// which reuses this builder to gather typed/generic appends).
+    pub(crate) fn raw(&self) -> &[u8] {
+        &self.raw
+    }
+
+    /// The element datatype implied by typed appends, if any.
+    pub(crate) fn elem_dt(&self) -> Option<&Datatype> {
+        self.elem_dt.as_ref()
+    }
+
+    /// Whether two typed appends implied conflicting element datatypes.
+    pub(crate) fn dt_conflict(&self) -> bool {
+        self.dt_conflict
     }
 
     /// Record the datatype a typed append implies, flagging a conflict if an
@@ -4705,7 +4721,7 @@ fn chunk_index_enumerable(version: u8, chunk_index_type: Option<u8>) -> bool {
 /// chunk through) — not merely decode. A pipeline with any other filter cannot be
 /// re-encoded for an in-place overwrite, so the caller refuses with a typed error
 /// rather than letting [`compress_chunk`] surface a raw `UnsupportedFilter`.
-fn pipeline_reencodable(pipeline: &FilterPipeline) -> bool {
+pub(crate) fn pipeline_reencodable(pipeline: &FilterPipeline) -> bool {
     pipeline.filters.iter().all(|f| match f.filter_id {
         FILTER_DEFLATE | FILTER_SHUFFLE | FILTER_FLETCHER32 | FILTER_SCALEOFFSET => true,
         #[cfg(feature = "zfp")]
@@ -4786,7 +4802,7 @@ fn replace_dataspace_message(region: &[u8], new_dataspace_body: &[u8]) -> Result
 ///
 /// A typed `append_*` bypasses this: it checks full datatype equality instead, so
 /// it already refuses every non-little-endian and non-scalar dataset.
-fn datatype_is_raw_appendable(dt: &Datatype) -> bool {
+pub(crate) fn datatype_is_raw_appendable(dt: &Datatype) -> bool {
     match dt {
         Datatype::FixedPoint { byte_order, .. }
         | Datatype::FloatingPoint { byte_order, .. }

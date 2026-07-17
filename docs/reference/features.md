@@ -27,7 +27,7 @@ The default feature set is `std`, `checksum`, and `deflate`.
 
 ### `std`
 
-Enables the standard library. This brings in the entire high-level reader and writer surface — `File`, `FileBuilder`, `Group`, `Dataset`, `EditSession`, `SwmrWriter`, `repack`, the `mat` module, and both the in-memory and filesystem entry points (`FileBuilder::finish`, `File::from_bytes`, `File::open`, `File::open_streaming`, `FileBuilder::write`). The whole high-level API is `std`-gated: with `std` disabled the crate is `no_std` and exposes only the lower-level datatype and builder primitives, not `File` / `FileBuilder`. Because `std` is available on `wasm32-unknown-unknown`, a WASM build keeps it (the WASM and `no_std` section below has the details).
+Enables the standard library. This brings in the entire high-level reader and writer surface — `File`, `FileBuilder`, `Group`, `Dataset`, `EditSession`, `SwmrWriter`, `AppendWriter`, `repack`, the `mat` module, and both the in-memory and filesystem entry points (`FileBuilder::finish`, `File::from_bytes`, `File::open`, `File::open_streaming`, `FileBuilder::write`). The whole high-level API is `std`-gated: with `std` disabled the crate is `no_std` and exposes only the lower-level datatype and builder primitives, not `File` / `FileBuilder`. Because `std` is available on `wasm32-unknown-unknown`, a WASM build keeps it (the WASM and `no_std` section below has the details).
 
 ### `checksum`
 

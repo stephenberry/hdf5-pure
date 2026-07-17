@@ -49,7 +49,8 @@ produce in the wild:
 - **Storage layouts** — contiguous, compact, and chunked.
 - **Chunk indexes** — B-tree v1, fixed array (including the paged data-block
   layout), and extensible array (which also backs [SWMR](../guide/swmr.md)
-  append).
+  append and the in-place append paths, `EditSession::append_dataset` and
+  `AppendWriter`).
 - **Groups** — both the old symbol-table form (v0/v1) and the modern
   compact-link and dense (fractal-heap + v2 B-tree) forms.
 - **Datatypes** — fixed-point, floating-point, string (fixed and
