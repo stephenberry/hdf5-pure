@@ -119,6 +119,10 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --locked --features "serde ndarray" --all-targets -- -D warnings
+      - name: Rustdoc (deny warnings)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps --features "provenance parallel zfp ndarray serde"
 
   shear:
     name: Unused dependencies (cargo-shear)

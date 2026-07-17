@@ -86,7 +86,7 @@ impl SwmrWriter {
     /// on Windows, where locks are mandatory, it would block readers outright.
     /// The writer instead marks the file with the superblock SWMR flag while
     /// active; recover a file left flagged by a crashed writer with
-    /// [`clear_swmr_flag`](Self::clear_swmr_flag). See the [module docs](self).
+    /// [`clear_swmr_flag`](Self::clear_swmr_flag).
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
         let file = InPlaceFile::open(path, None, Error::SwmrAppendUnsupported)?;
         let mut w = Self {

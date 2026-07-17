@@ -1301,9 +1301,9 @@ impl DatasetBuilder {
     /// passing `values` in row-major order).
     ///
     /// Empty strings become zero-length heap objects (reading back as `""`).
-    /// For full fidelity over null-vs-empty elements, embedded NULs, non-UTF-8
-    /// payloads, or a specific charset/padding, use
-    /// [`with_vlen_string_elements`](Self::with_vlen_string_elements).
+    /// This convenience method cannot distinguish a null element from an empty
+    /// one, nor carry embedded NULs, non-UTF-8 payloads, or a specific
+    /// charset/padding.
     pub fn with_vlen_strings(&mut self, values: &[&str]) -> &mut Self {
         let datatype = make_vlen_string_type(CharacterSet::Utf8);
         let elements: Vec<VlStringElement> = values

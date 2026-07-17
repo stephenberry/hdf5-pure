@@ -112,7 +112,7 @@ const MAX_DEDUPE_ATTEMPTS: usize = 1_000_000;
 /// Append a numeric suffix to `candidate` until it is not present in `used`.
 /// The suffix is `_1`, `_2`, ...; the base is truncated as needed to keep the
 /// total length under [`MATLAB_NAME_MAX`]. Panics after
-/// [`MAX_DEDUPE_ATTEMPTS`] collisions.
+/// `MAX_DEDUPE_ATTEMPTS` collisions.
 pub fn dedupe_name(mut candidate: String, used: &HashSet<String>) -> String {
     if !used.contains(&candidate) {
         return candidate;

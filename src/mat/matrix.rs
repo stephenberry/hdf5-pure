@@ -14,8 +14,8 @@
 //!
 //! # Why three sentinel constants
 //!
-//! [`MATRIX_SENTINEL`], [`MATRIX_COMPLEX64_SENTINEL`], and
-//! [`MATRIX_COMPLEX32_SENTINEL`] are not redundant. The element class for a
+//! `MATRIX_SENTINEL`, `MATRIX_COMPLEX64_SENTINEL`, and
+//! `MATRIX_COMPLEX32_SENTINEL` are not redundant. The element class for a
 //! non-empty `Matrix<T>` can always be recovered from the serialized data
 //! (the inner `Vec<T>` carries enough type information through the seq
 //! unification path), so a single sentinel would suffice for the common
