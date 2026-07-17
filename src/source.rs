@@ -91,7 +91,7 @@ pub const DEFAULT_METADATA_CACHE_MAX_ENTRY_BYTES: usize = 64 * 1024;
 /// This is the `hdf5-pure` counterpart to the memory-budget portion of HDF5's
 /// `H5Pset_mdc_config`: it bounds the bytes retained for parsed metadata reads
 /// while a file is opened through [`crate::File::open_streaming_with_options`].
-/// Raw dataset payload reads use [`FileSource::read_exact_at`] and are not
+/// Raw dataset payload reads use `FileSource::read_exact_at` and are not
 /// admitted to this cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetadataCacheConfig {
@@ -103,8 +103,8 @@ impl MetadataCacheConfig {
     /// Create a metadata cache with the given total byte budget.
     ///
     /// Individual cached reads are capped at
-    /// [`DEFAULT_METADATA_CACHE_MAX_ENTRY_BYTES`] by default so one large heap
-    /// or index block cannot monopolize the cache. Use
+    /// `DEFAULT_METADATA_CACHE_MAX_ENTRY_BYTES` (64 KiB) by default so one large
+    /// heap or index block cannot monopolize the cache. Use
     /// [`with_max_entry_bytes`](Self::with_max_entry_bytes) to change that.
     pub const fn new(max_bytes: usize) -> Self {
         let max_entry_bytes = if max_bytes < DEFAULT_METADATA_CACHE_MAX_ENTRY_BYTES {

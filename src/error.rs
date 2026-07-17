@@ -273,7 +273,7 @@ pub enum FormatError {
         /// Second operand (typically the length/size).
         length: u64,
     },
-    /// A random-access byte source (see [`crate::source::FileSource`]) failed to
+    /// A random-access byte source failed to
     /// supply the requested bytes. The string carries a backend-specific reason
     /// (e.g. an underlying `std::io::Error` rendered to text), so this stays
     /// `no_std`/`alloc`-friendly and free of an `std::io` dependency.

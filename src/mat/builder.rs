@@ -505,7 +505,7 @@ impl MatBuilder {
         Ok(self)
     }
 
-    /// Write a complex `f32` array. See [`write_complex_f64`] for empty-input
+    /// Write a complex `f32` array. See [`write_complex_f64`](Self::write_complex_f64) for empty-input
     /// and compression semantics.
     pub fn write_complex_f32(
         &mut self,
@@ -1320,7 +1320,7 @@ impl<'a> StructWriter<'a> {
     pub fn options(&self) -> &Options {
         self.mb.options()
     }
-    /// Convenience: configured [`StringClass`].
+    /// Convenience: configured [`StringClass`](crate::mat::options::StringClass).
     #[inline]
     pub fn string_class(&self) -> crate::mat::options::StringClass {
         self.options().string_class

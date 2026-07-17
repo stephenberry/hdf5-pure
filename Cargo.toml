@@ -15,6 +15,13 @@ build = "build.rs"
 # are needed only for maintainer CI and stay in the git repo for that purpose.
 exclude = ["tests/fixtures/**", "fuzz/**"]
 
+# Publish the full public API on docs.rs. The default feature set hides the
+# `ndarray`, `serde` (`mat`), `zfp`, `provenance`, and `parallel` surfaces (and
+# leaves their cross-references as dead links); `matio-crosscheck` is a
+# test-only feature and is deliberately excluded.
+[package.metadata.docs.rs]
+features = ["provenance", "parallel", "zfp", "ndarray", "serde"]
+
 [features]
 default = ["std", "checksum", "deflate"]
 std = []

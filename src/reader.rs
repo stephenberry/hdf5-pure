@@ -285,7 +285,7 @@ impl File {
     ///
     /// This lets a host read a file larger than its address space — the original
     /// motivation being 32-bit targets reading multi-gigabyte files (issue #27).
-    /// Metadata and dataset chunks are read through a [`ReadSeekSource`], so peak
+    /// Metadata and dataset chunks are read through a `ReadSeekSource`, so peak
     /// memory stays close to one chunk plus the metadata being parsed.
     ///
     /// Current limits (the buffered [`File::open`] has none of these): only
@@ -675,7 +675,7 @@ impl File {
     /// file the length reported by its source, for an in-memory file the length
     /// of its buffer. It includes any userblock prefix and trailing bytes, so it
     /// may exceed the superblock's logical end-of-file address; compare against
-    /// [`Superblock::eof_address`](crate::superblock::Superblock) (reachable via
+    /// `Superblock::eof_address` (reachable via
     /// [`File::superblock`]) to detect appended or unaccounted tail bytes.
     pub fn file_size(&self) -> u64 {
         self.source().len()
