@@ -36,6 +36,7 @@ After a successful `commit()`, the staged set is cleared and the session can be 
 | `EditSession::open(path)` | Open an existing file for editing | — |
 | `create_group(path)` | Stage a new empty group; its parent must exist or be created in the same session | — |
 | `create_dataset(path)` | Stage a new dataset and return a `DatasetBuilder` to configure data, shape, and attributes | — |
+| `append_dataset(path)` | Stage appending elements along axis 0 of an existing chunked, unlimited dataset; returns an `AppendBuilder` | `H5Dset_extent` + write |
 | `set_group_attr(path, name, value)` | Stage adding or replacing a compact group attribute | — |
 | `remove_group_attr(path, name)` | Stage removing a compact group attribute | — |
 | `copy(src, dst)` | Stage a deep copy of a dataset or whole group subtree within this file | `H5Ocopy` |
@@ -65,6 +66,31 @@ session.commit().unwrap();
 ```
 
 Unlike `copy`, the source subtree is read and validated **eagerly** (the `File` borrow need not outlive the call), so `copy_from` returns a `Result`; the destination still changes only on `commit()`. Because the copy is byte-for-byte verbatim, anything whose stored bytes embed a *source-file* absolute address — which would dangle in another file — is refused up front: variable-length and reference datasets and attributes (whether compact or dense), and any shared header message (a committed datatype, or an SOHM-shared dataspace, fill value, or filter pipeline). The same-file `copy` keeps these forms valid instead, by sharing the source file's global heaps and objects. The `source` must be a buffered file (`File::open` or `File::from_bytes`, not `File::open_streaming`) using 8-byte offsets and no userblock.
+
+## Appending to an unlimited dataset
+
+`append_dataset` grows an existing **chunked, unlimited** dataset in place along its first (axis-0) dimension, **including filtered** datasets (deflate, shuffle, fletcher32, scale-offset, and ZFP with the `zfp` feature). It is the general, non-SWMR counterpart to the [SWMR writer](swmr.md), which appends only to *unfiltered*, chunk-aligned datasets. It returns an `AppendBuilder` whose typed and generic methods mirror the writer's; repeated calls concatenate in call order.
+
+```rust
+use hdf5_pure::EditSession;
+
+let mut session = EditSession::open("log.h5").unwrap();
+session.append_dataset("samples").append_i32(&[8, 9, 10, 11]);
+session.commit().unwrap();
+```
+
+Existing chunks stay exactly where they are. Only the newly appended chunks — plus the single trailing partial chunk, when the dataset's current length is not a whole multiple of the chunk length — are compressed and written; every other chunk is carried into the rebuilt index by metadata alone. So an append does not rewrite existing data and the file does not grow by the whole dataset each time. Appends of any length are allowed, and the datatype, fill value, filter pipeline, and attributes are preserved.
+
+Like every `EditSession` edit, an append commits by writing the new chunks and a rebuilt index at end-of-file and repointing the superblock last (under the session's exclusive lock), so a crash leaves either the original dataset or the fully grown one, never a torn state. It sets no SWMR flag.
+
+### Eligibility
+
+The first release supports the Extensible-Array chunk index — the index the reference C library and h5py select for a single unlimited dimension under the latest format, and the one this crate writes for every unlimited dataset — with rank-1 datasets that have a single hard link. A dataset that is not chunked, not unlimited along axis 0, not Extensible-Array indexed, higher than rank 1, uses a filter this engine cannot re-encode, or has a sparse chunk grid is refused with `Error::AppendUnsupported` before any file bytes change. Check eligibility up front with the read-side accessors [`is_chunked`, `maxshape`, `chunk_shape`, and `filters`](reading.md#chunking-filters-and-append-eligibility) rather than relying on the refusal error.
+
+Element types are checked, never coerced: each typed `append_*` call records the datatype it implies, and `commit` refuses a mismatch against the dataset's on-disk datatype — including a mix of element types in one builder. `append_raw` appends already-little-endian element bytes verbatim; its length must be a whole multiple of the element size and the dataset's datatype must be little-endian.
+
+!!! tip "Runnable example"
+    This section mirrors [`examples/append_dataset.rs`](https://github.com/stephenberry/hdf5-pure/blob/main/examples/append_dataset.rs). Run it with `cargo run --example append_dataset`.
 
 ## How it works
 

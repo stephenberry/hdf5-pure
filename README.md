@@ -107,7 +107,7 @@ lossless read. For N-dimensional arrays see the `ndarray` feature below.
 
 ### Editing in place
 
-`EditSession` opens an existing file and adds, deletes, or copies objects, or edits compact group attributes without reading it all in and rewriting it. New data and the rebuilt object headers are appended at the end of the file and the superblock is repointed last, so the cost is proportional to what changes and a failed commit leaves the file valid.
+`EditSession` opens an existing file and adds, deletes, or copies objects, appends to chunked unlimited datasets in place (including filtered/compressed ones, via `append_dataset`), or edits compact group attributes without reading it all in and rewriting it. New data and the rebuilt object headers are appended at the end of the file and the superblock is repointed last, so the cost is proportional to what changes and a failed commit leaves the file valid.
 
 ```rust,no_run
 use hdf5_pure::{AttrValue, EditSession};
