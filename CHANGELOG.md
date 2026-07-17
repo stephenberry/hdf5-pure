@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- Reading an attribute or dataset whose dataspace declares dimensions whose product overflows `u64` no longer panics: the element count now saturates so the size and limit checks reject the file as a format error ([#142](https://github.com/stephenberry/hdf5-pure/issues/142)).
+
 ## [0.21.2] - 2026-07-14
 
 The `.mat` serializer now drops a struct field that serializes as a Rust unit `()` — most commonly a `serde_json::Value::Null` — like `Option::None` instead of aborting the encode. Parser hardening: the buffered and streaming readers agree on a malformed v1 object header, and crafted files return a format error instead of panicking on an arithmetic overflow across the metadata parsers. Non-breaking patch.

@@ -697,7 +697,15 @@ pub fn read_chunked_data(
     let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype);
     let decompressed_chunks = decompress_all_chunks(file_data, &chunks, pipeline, ctx)?;
 
-    let total_bytes = dataspace.num_elements().to_usize()? * elem_size;
+    let num_elements = dataspace.num_elements();
+    let total_bytes =
+        num_elements
+            .to_usize()?
+            .checked_mul(elem_size)
+            .ok_or(FormatError::OffsetOverflow {
+                offset: num_elements,
+                length: elem_size as u64,
+            })?;
     Ok(assemble_chunks(
         &chunks,
         &decompressed_chunks,
@@ -801,7 +809,15 @@ pub fn read_chunked_data_from_source<S: FileSource + ?Sized>(
     let chunk_dims_u64: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
     let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype);
     let decompressed_chunks = decompress_all_chunks_from_source(source, &chunks, pipeline, ctx)?;
-    let total_bytes = dataspace.num_elements().to_usize()? * elem_size;
+    let num_elements = dataspace.num_elements();
+    let total_bytes =
+        num_elements
+            .to_usize()?
+            .checked_mul(elem_size)
+            .ok_or(FormatError::OffsetOverflow {
+                offset: num_elements,
+                length: elem_size as u64,
+            })?;
     Ok(assemble_chunks(
         &chunks,
         &decompressed_chunks,
