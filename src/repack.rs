@@ -298,7 +298,7 @@ fn emit_dataset(
     let datatype = ds.datatype()?;
     let dataspace = ds.dataspace()?;
     let layout = ds.data_layout()?;
-    let pipeline = ds.filter_pipeline();
+    let pipeline = ds.filter_pipeline_parsed();
 
     check_datatype(&datatype, path)?;
     check_layout(&layout, path)?;
