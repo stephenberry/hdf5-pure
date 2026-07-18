@@ -473,6 +473,66 @@ struct PersistState {
     old_blocks: Vec<(u64, u64)>,
 }
 
+/// A snapshot of an [`EditSession`]'s live space usage (issue #150).
+///
+/// This is the mutating-session counterpart of the read-only accounting on
+/// [`File`](crate::File) ([`file_size`](crate::File::file_size) and
+/// [`persisted_free_space`](crate::File::persisted_free_space)): it describes the
+/// file *as the session currently holds it*, taken atomically at the moment of
+/// the [`space_accounting`](EditSession::space_accounting) call.
+///
+/// It reflects the committed file plus any immediate in-place appends
+/// ([`append_inplace`](EditSession::append_inplace)), but **not** edits still
+/// staged for the next [`commit`](EditSession::commit) — `create_group`,
+/// `create_dataset`, `write_dataset`, `append_dataset`, `delete`, `copy`,
+/// `copy_from`, and attribute edits change these figures only when they are
+/// applied at commit. Use [`has_staged_edits`](EditSession::has_staged_edits) to
+/// tell whether such pending work exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SpaceAccounting {
+    /// The session's current logical size in bytes: the byte length of the file
+    /// as the session holds it. It equals what
+    /// [`File::file_size`](crate::File::file_size) reports for the file on disk
+    /// right now (the HDF5 `H5Fget_filesize` value), because the session keeps its
+    /// in-memory mirror byte-for-byte identical to the file — every committed
+    /// write and every immediate in-place append
+    /// ([`append_inplace`](EditSession::append_inplace)) updates both together.
+    ///
+    /// It is not monotonic: [`commit`](EditSession::commit) can reclaim trailing
+    /// free space and *shrink* the file. It can also exceed the superblock's
+    /// recorded end-of-file address when the file was opened carrying unaccounted
+    /// trailing bytes (the same slack [`File::file_size`](crate::File::file_size)
+    /// surfaces), since opening does not rewrite that address.
+    pub logical_size: u64,
+    /// Total reusable free bytes the next allocation or [`commit`](EditSession::commit)
+    /// can draw from before the file has to grow — the summed length of
+    /// [`reusable_free_space`](Self::reusable_free_space).
+    ///
+    /// Counts holes left inside [`logical_size`](Self::logical_size) by this
+    /// session's earlier commits (superseded object headers, the blocks of
+    /// deleted objects) and, for a file created with
+    /// `H5Pset_file_space_strategy(persist = true)` and no userblock, the regions
+    /// seeded from the on-disk free-space managers when the session was opened (so
+    /// reuse spans sessions). A fresh non-persisting session reports `0` even if
+    /// the file contains holes left by other tools — those are never tracked. It
+    /// is neither a lower bound on the next write's growth nor a promise of
+    /// shrinkage: a region counted here may be truncated away at commit — rather
+    /// than reused — if adjacent space is later freed and the coalesced run
+    /// reaches end-of-file.
+    pub reusable_free_bytes: u64,
+    /// The reusable free regions as `(offset, length)` pairs, sorted ascending by
+    /// offset and fully coalesced (no two regions touch or overlap).
+    ///
+    /// The offsets are **absolute** file offsets (from byte 0, including any
+    /// userblock prefix), matching [`logical_size`](Self::logical_size). This
+    /// differs from [`File::persisted_free_space`](crate::File::persisted_free_space),
+    /// whose pairs are relative to the superblock base address; the two coincide
+    /// for a file with no userblock (base address 0), which is the only kind whose
+    /// persisted free space a session seeds. Empty when nothing is reusable.
+    pub reusable_free_space: Vec<(u64, u64)>,
+}
+
 impl EditSession {
     /// Open an existing HDF5 file for in-place editing.
     ///
@@ -861,8 +921,9 @@ impl EditSession {
     /// ([`append_inplace`](Self::append_inplace)) are applied immediately and are
     /// never staged, so they never affect this; it reflects only edits awaiting
     /// [`commit`](Self::commit) — `create_group`, `create_dataset`,
-    /// `write_dataset`, `append_dataset`, group attribute edits, `delete`, and
-    /// `copy`. Dropping the session silently discards any staged edits.
+    /// `write_dataset`, `append_dataset`, group and dataset attribute edits,
+    /// `delete`, `copy`, and `copy_from`. Dropping the session silently discards
+    /// any staged edits.
     pub fn has_staged_edits(&self) -> bool {
         !self.pending_datasets.is_empty()
             || !self.pending_writes.is_empty()
@@ -873,6 +934,42 @@ impl EditSession {
             || !self.pending_deletes.is_empty()
             || !self.pending_copies.is_empty()
             || !self.pending_cross_copies.is_empty()
+    }
+
+    /// A snapshot of this session's live space usage — the current file size and
+    /// the free space it can reuse — as a [`SpaceAccounting`].
+    ///
+    /// This is the mutating-session analogue of the read-only accounting on
+    /// [`File`](crate::File): it answers "how big is the file right now, and how
+    /// much space can be reused before it must grow?" from the session's own live
+    /// state. The snapshot reflects the committed file plus any immediate in-place
+    /// appends ([`append_inplace`](Self::append_inplace)) but excludes edits still
+    /// staged for the next [`commit`](Self::commit); see [`SpaceAccounting`] for
+    /// the field-by-field semantics and [`has_staged_edits`](Self::has_staged_edits)
+    /// for detecting pending work.
+    ///
+    /// ```no_run
+    /// use hdf5_pure::EditSession;
+    ///
+    /// let session = EditSession::open("existing.h5")?;
+    /// let acct = session.space_accounting();
+    /// println!(
+    ///     "{} bytes on disk, {} reusable in {} free region(s)",
+    ///     acct.logical_size,
+    ///     acct.reusable_free_bytes,
+    ///     acct.reusable_free_space.len(),
+    /// );
+    /// # Ok::<(), hdf5_pure::Error>(())
+    /// ```
+    #[must_use]
+    pub fn space_accounting(&self) -> SpaceAccounting {
+        let reusable_free_space = self.free.sections();
+        let reusable_free_bytes = reusable_free_space.iter().map(|(_, len)| len).sum();
+        SpaceAccounting {
+            logical_size: self.data.len() as u64,
+            reusable_free_bytes,
+            reusable_free_space,
+        }
     }
 
     /// Apply a gathered in-place append (typed / generic / raw bytes) to `dataset`,

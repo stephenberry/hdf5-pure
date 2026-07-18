@@ -127,7 +127,8 @@ impl FreeList {
     }
 
     /// The free regions as `(addr, len)` pairs, sorted ascending by address and
-    /// fully coalesced. Used to persist the free list to disk (issue #21).
+    /// fully coalesced. Used to persist the free list to disk (issue #21) and to
+    /// report the session's live reusable free space (issue #150).
     pub(crate) fn sections(&self) -> Vec<(u64, u64)> {
         self.regions.iter().map(|r| (r.addr, r.len)).collect()
     }
