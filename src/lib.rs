@@ -159,6 +159,7 @@ pub(crate) mod group_v1;
 pub(crate) mod group_v2;
 #[cfg(feature = "parallel")]
 pub(crate) mod lane_partition;
+pub(crate) mod layout_info;
 pub(crate) mod libver;
 pub(crate) mod link_info;
 pub(crate) mod link_message;
@@ -231,6 +232,12 @@ pub use error::FormatError;
 pub use reader::{
     Dataset, DatasetAccessOptions, File, FileAccessOptions, Group, Object, is_hdf5, is_hdf5_bytes,
 };
+
+// Curated layout / filter introspection (issue #149). Only the std-only reader
+// `Dataset` produces these, so gate the re-export to match the reader block
+// above; the types themselves are `alloc`-clean.
+#[cfg(feature = "std")]
+pub use layout_info::{Chunk, ChunkIndex, Filter, Layout};
 
 #[cfg(feature = "std")]
 pub use file_lock::FileLocking;

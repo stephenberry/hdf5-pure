@@ -17,6 +17,7 @@ use crate::filter_pipeline::FilterPipeline;
 use crate::free_space_manager;
 use crate::group_v1::GroupEntry;
 use crate::group_v2;
+use crate::layout_info::{Chunk, ChunkIndex, Filter, Layout};
 use crate::libver::LibVer;
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
@@ -1136,9 +1137,137 @@ impl<'f> Dataset<'f> {
     /// 2 = shuffle, 3 = fletcher32, 6 = scale-offset — so a caller can inspect
     /// the pipeline without decoding a chunk.
     pub fn filters(&self) -> Vec<u16> {
-        self.filter_pipeline()
+        self.filter_pipeline_parsed()
             .map(|p| p.filters.iter().map(|f| f.filter_id).collect())
             .unwrap_or_default()
+    }
+
+    /// How and where this dataset's raw data is stored: compact, contiguous,
+    /// chunked, or virtual.
+    ///
+    /// The structured companion to [`is_chunked`](Self::is_chunked) and
+    /// [`chunk_shape`](Self::chunk_shape), which it subsumes: one call that
+    /// classifies the layout and, for a [`Layout::Contiguous`] dataset, gives the
+    /// absolute address and byte size to seek to, or for a [`Layout::Chunked`]
+    /// dataset the chunk shape and [`ChunkIndex`] kind. This parses only the
+    /// data-layout message; it never walks the chunk index or reads any data —
+    /// use [`chunks`](Self::chunks) for per-chunk locations. The curated analogue
+    /// of `H5Pget_layout`.
+    ///
+    /// Returns `Err` if the dataset has no data-layout message, if it cannot be
+    /// parsed, or if a chunked dataset uses an index kind this crate does not
+    /// recognize.
+    pub fn layout(&self) -> Result<Layout, Error> {
+        Ok(match self.data_layout()? {
+            DataLayout::Compact { data } => Layout::Compact {
+                size: data.len() as u64,
+            },
+            DataLayout::Contiguous { address, size } => Layout::Contiguous {
+                address: self.absolute_address(address)?,
+                size,
+            },
+            DataLayout::Chunked {
+                version,
+                chunk_index_type,
+                ..
+            } => Layout::Chunked {
+                // Reuse `chunk_shape` so the two accessors can never disagree on
+                // how the element-size dimension is stripped.
+                chunk_shape: self.chunk_shape()?.unwrap_or_default(),
+                index: ChunkIndex::from_layout(version, chunk_index_type)?,
+            },
+            DataLayout::Virtual { .. } => Layout::Virtual,
+        })
+    }
+
+    /// The [`ChunkIndex`] kind of this chunked dataset, or `Ok(None)` when the
+    /// dataset is not chunked.
+    ///
+    /// A convenience shortcut for the `index` of [`Layout::Chunked`], for the
+    /// common up-front append-eligibility check
+    /// ([`ChunkIndex::supports_inplace_append`]). Complements
+    /// [`maxshape`](Self::maxshape) and [`chunk_shape`](Self::chunk_shape).
+    ///
+    /// Returns `Err` if the data-layout message is missing or cannot be parsed,
+    /// or if a chunked dataset uses an index kind this crate does not recognize.
+    pub fn chunk_index(&self) -> Result<Option<ChunkIndex>, Error> {
+        match self.data_layout()? {
+            DataLayout::Chunked {
+                version,
+                chunk_index_type,
+                ..
+            } => Ok(Some(ChunkIndex::from_layout(version, chunk_index_type)?)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Enumerate every allocated chunk of this chunked dataset — one [`Chunk`]
+    /// (logical offset, absolute file address, on-disk stored size, filter mask)
+    /// per chunk, in index order.
+    ///
+    /// This reads only the chunk index, not the chunk data, so a caller can seek
+    /// to and decode chunks one at a time without materializing the whole
+    /// dataset. The curated analogue of `H5Dget_num_chunks` + `H5Dget_chunk_info`
+    /// (`chunks()?.len()` is the chunk count).
+    ///
+    /// Returns `Ok(vec![])` for a chunked dataset whose storage has not been
+    /// allocated yet (including a not-yet-written dataset that will use a
+    /// [`ChunkIndex::BTreeV2`] index). Returns `Err` if the dataset is not chunked
+    /// (check [`layout`](Self::layout) or [`is_chunked`](Self::is_chunked) first),
+    /// or if its allocated storage is indexed by a [`ChunkIndex::BTreeV2`] index,
+    /// which has no enumerator yet.
+    pub fn chunks(&self) -> Result<Vec<Chunk>, Error> {
+        let rank = self.dataspace()?.dimensions.len();
+        Ok(self
+            .raw_chunks()?
+            .into_iter()
+            .map(|c| Chunk {
+                offset: c.offsets.into_iter().take(rank).collect(),
+                address: c.address,
+                storage_size: u64::from(c.chunk_size),
+                filter_mask: c.filter_mask,
+            })
+            .collect())
+    }
+
+    /// This dataset's filter pipeline as an ordered list of [`Filter`]s — each
+    /// with its identifier, optional name, optional/mandatory flag, and client
+    /// data — or an empty vector when the dataset is unfiltered.
+    ///
+    /// The detailed companion to [`filters`](Self::filters), which returns just
+    /// the identifiers. Filters are listed in application (write) order — the
+    /// on-disk pipeline order, matching [`filters`](Self::filters); a reader
+    /// inverts them in the *reverse* of this order to decode a chunk. The curated
+    /// analogue of `H5Pget_nfilters` + `H5Pget_filter2`.
+    pub fn filter_pipeline(&self) -> Vec<Filter> {
+        self.filter_pipeline_parsed()
+            .map(|p| {
+                p.filters
+                    .into_iter()
+                    .map(|f| Filter {
+                        id: f.filter_id,
+                        name: f.name,
+                        is_optional: f.flags & 0x1 != 0,
+                        client_data: f.client_data,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Shift a base-relative on-disk address to an absolute file offset using the
+    /// superblock base address (`addr_offset`). A no-op for the common
+    /// base-zero file. Returns `Ok(None)` for an unallocated (undefined) address.
+    fn absolute_address(&self, address: Option<u64>) -> Result<Option<u64>, Error> {
+        match address {
+            Some(rel) => Ok(Some(rel.checked_add(self.file.addr_offset).ok_or(
+                crate::error::FormatError::OffsetOverflow {
+                    offset: rel,
+                    length: 0,
+                },
+            )?)),
+            None => Ok(None),
+        }
     }
 
     /// Returns the simplified datatype of the dataset.
@@ -1445,7 +1574,7 @@ impl<'f> Dataset<'f> {
         )?)
     }
 
-    pub(crate) fn filter_pipeline(&self) -> Option<FilterPipeline> {
+    pub(crate) fn filter_pipeline_parsed(&self) -> Option<FilterPipeline> {
         self.header
             .messages
             .iter()
@@ -1474,7 +1603,7 @@ impl<'f> Dataset<'f> {
         } = self.data_layout()?
         else {
             return Err(Error::Format(crate::error::FormatError::ChunkedReadError(
-                "raw_chunks called on a non-chunked dataset".into(),
+                "chunk enumeration requires a chunked dataset".into(),
             )));
         };
         // An undefined index address means no storage is allocated yet.
@@ -1558,7 +1687,7 @@ impl<'f> Dataset<'f> {
         // `read_dataset_raw` applies the base address centrally (for both
         // contiguous and chunked layouts) by reading from a base-relative view of
         // the file.
-        let pipeline = self.filter_pipeline();
+        let pipeline = self.filter_pipeline_parsed();
         Ok(self
             .file
             .read_dataset_raw(&dl, &ds, &dt, pipeline.as_ref(), &self.chunk_cache)?)
