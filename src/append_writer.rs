@@ -55,16 +55,13 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::chunk_index_inplace::{ElemRecord, InPlaceFile, Located};
-use crate::chunked_write::split_into_chunks;
-use crate::convert::TryToUsize;
+use crate::chunk_index_inplace::{InPlaceFile, Located, apply_ea_append, plan_ea_append};
 use crate::datatype::Datatype;
 use crate::edit::{AppendBuilder, datatype_is_raw_appendable, pipeline_reencodable};
 use crate::element::H5Element;
 use crate::error::Error;
 use crate::file_lock::FileLocking;
 use crate::filter_pipeline::FilterPipeline;
-use crate::filters::{ChunkContext, compress_chunk, decompress_chunk};
 
 /// Per-dataset state located once, then maintained across appends.
 struct DatasetState {
@@ -301,78 +298,30 @@ impl AppendWriter {
             return Ok(());
         }
 
-        // ---- Read phase: compute the new chunk blobs and the dead tail extent
-        // using only immutable borrows, so nothing is published yet.
-        let plan = self.plan_append(dataset, raw, new_elems)?;
-
-        // ---- Write phase, ordered child-before-parent with fsync barriers, so a
-        // crash between appends leaves either the old length or the new one:
-        //
-        //   1. new/relocated chunk bytes at EOF, then advance the superblock's
-        //      recorded end-of-file to cover them. This must precede the index
-        //      writes: the trailing partial chunk's element is *visible* at the
-        //      old dimension, so once it is repointed to the relocated chunk that
-        //      chunk must already lie within the recorded EOF (unlike the SWMR
-        //      writer, which only ever inserts elements the reader clamps away).
-        //   2. the index element writes: a fresh insert for each new chunk, or an
-        //      in-place repoint of the trailing element (which only ever points at
-        //      data whose live prefix reproduces the old view's bytes). This may
-        //      allocate new EA blocks past EOF, so advance the EOF again.
-        //   3. the EA header element count; and
-        //   4. the dataspace dimension -- the single commit point.
-        let mut chunk_addrs = Vec::with_capacity(plan.new_chunk_bytes.len());
-        for blob in &plan.new_chunk_bytes {
-            chunk_addrs.push((self.file.append_bytes(blob)?, blob.len() as u64));
-        }
-        self.file.sync()?;
-        self.file.patch_superblock_eof()?;
-        self.file.sync()?;
-        if max_phase < 2 {
-            return Ok(());
-        }
-
-        for (k, &(addr, stored_size)) in chunk_addrs.iter().enumerate() {
-            let e = plan.n_full + k as u64;
-            let rec = ElemRecord {
-                addr,
-                stored_size,
-                filter_mask: 0,
-            };
-            self.datasets[dataset]
-                .loc
-                .ea_insert(&mut self.file, e, rec)?;
-        }
-        self.file.sync()?;
-        if max_phase < 3 {
-            return Ok(());
-        }
-
-        // Cover any EA blocks allocated during the element writes, then publish
-        // the element count.
-        self.file.patch_superblock_eof()?;
-        self.datasets[dataset]
-            .loc
-            .update_ea_header(&mut self.file, plan.new_num_chunks)?;
-        self.file.sync()?;
-        if max_phase < 4 {
-            return Ok(());
-        }
-
-        self.datasets[dataset]
-            .loc
-            .patch_dimension(&mut self.file, plan.new_dim)?;
-        self.file.sync()?;
-
-        // The relocated trailing chunk's old bytes are now dead (reclaimed by
-        // repack, not reused in-session in this release).
-
+        // Read/plan phase (immutable borrows only, nothing published yet), then
+        // the ordered, fsync-barriered write phase. Both are shared with
+        // `EditSession::append_inplace` through the chunk-index engine, so the
+        // crash-safety sequence lives in exactly one place. The relocated trailing
+        // chunk's old bytes become dead space (reclaimed by repack, not reused
+        // in-session in this release).
+        let plan = {
+            let st = &self.datasets[dataset];
+            plan_ea_append(
+                &self.file,
+                &st.loc,
+                &st.datatype,
+                &st.spatial,
+                st.element_size,
+                st.pipeline.as_ref(),
+                raw,
+                new_elems,
+            )?
+        };
         let st = self
             .datasets
             .get_mut(dataset)
             .expect("dataset was located above");
-        st.loc.current_dim = plan.new_dim;
-        st.loc.num_chunks = plan.new_num_chunks;
-        Ok(())
+        apply_ea_append(&mut self.file, &mut st.loc, &plan, max_phase)
     }
 
     /// Test-only phased append (stops after `max_phase` durability phases) used by
@@ -388,122 +337,6 @@ impl AppendWriter {
         b.append_i32(values);
         self.append_gathered(dataset, &b, max_phase)
     }
-
-    /// Compute, without mutating the file, the new chunk blobs to write, the
-    /// first element index they occupy, and the new dimension/chunk count.
-    fn plan_append(&self, dataset: &str, raw: &[u8], new_elems: u64) -> Result<AppendPlan, Error> {
-        let st = &self.datasets[dataset];
-        let chunk_elems = st.loc.chunk_elems;
-        let element_size = st.element_size;
-        let current_dim = st.loc.current_dim;
-        let new_dim = current_dim
-            .checked_add(new_elems)
-            .ok_or(Error::AppendUnsupported(
-                "append would overflow the dataset dimension",
-            ))?;
-        let n_full = current_dim / chunk_elems;
-        let has_partial = current_dim % chunk_elems != 0;
-
-        // Filtered appends must be chunk-aligned. Growing a *filtered* partial
-        // trailing chunk would repoint that chunk's existing index element in
-        // place, and a filtered element is a multi-field record
-        // (address + compressed_size + filter_mask) that is visible at the old
-        // dimension before the commit — so a power-loss crash tearing that record
-        // across a disk sector could leave the committed view unreadable. Refuse
-        // rather than weaken the all-or-nothing guarantee; the trailing element of
-        // an *unfiltered* dataset is a single address whose overwrite is atomic,
-        // so any-length unfiltered appends are allowed. For a filtered, non-
-        // chunk-aligned append use `EditSession::append_dataset`, which rebuilds
-        // the index and repoints the superblock last (fully atomic).
-        if st.pipeline.is_some() && (has_partial || new_elems % chunk_elems != 0) {
-            return Err(Error::AppendUnsupported(
-                "a filtered dataset can only be appended in place in whole chunks (the current \
-                 length and the appended length must both be multiples of the chunk length); \
-                 use EditSession::append_dataset for a non-chunk-aligned filtered append",
-            ));
-        }
-
-        // Build the raw tail region: the live prefix of any rewritten partial
-        // chunk, then the appended bytes.
-        let mut tail_raw: Vec<u8> = Vec::new();
-        if has_partial {
-            let rec = st
-                .loc
-                .read_element(&self.file, n_full)?
-                .ok_or(Error::AppendUnsupported(
-                    "trailing partial chunk is missing from the index",
-                ))?;
-            let start = usize::try_from(rec.addr)
-                .map_err(|_| Error::AppendUnsupported("chunk address exceeds this platform"))?;
-            let stored_len = if st.pipeline.is_some() {
-                usize::try_from(rec.stored_size)
-                    .map_err(|_| Error::AppendUnsupported("chunk size exceeds this platform"))?
-            } else {
-                chunk_elems.to_usize()? * element_size
-            };
-            let data = self.file.data();
-            let end = start
-                .checked_add(stored_len)
-                .filter(|&e| e <= data.len())
-                .ok_or(Error::AppendUnsupported(
-                    "trailing chunk extends past end-of-file",
-                ))?;
-            let stored = &data[start..end];
-            let full = if let Some(pl) = &st.pipeline {
-                let ctx = ChunkContext::from_datatype(&st.spatial, &st.datatype);
-                decompress_chunk(stored, pl, ctx, rec.filter_mask).map_err(Error::Format)?
-            } else {
-                stored.to_vec()
-            };
-            let live_elems = usize::try_from(current_dim % chunk_elems)
-                .map_err(|_| Error::AppendUnsupported("chunk length exceeds this platform"))?;
-            let live_bytes = live_elems * element_size;
-            if full.len() < live_bytes {
-                return Err(Error::AppendUnsupported(
-                    "trailing chunk decoded shorter than its live element count",
-                ));
-            }
-            tail_raw.extend_from_slice(&full[..live_bytes]);
-        }
-        tail_raw.extend_from_slice(raw);
-
-        // Split the tail into full chunk buffers (edge overhang zero-filled) and
-        // compress each through the pipeline when filtered.
-        let tail_len_elems = new_dim - n_full * chunk_elems;
-        let split = split_into_chunks(&tail_raw, &[tail_len_elems], &st.spatial, element_size);
-        let new_chunk_bytes: Vec<Vec<u8>> = if let Some(pl) = &st.pipeline {
-            let ctx = ChunkContext::from_datatype(&st.spatial, &st.datatype);
-            let mut out = Vec::with_capacity(split.len());
-            for (_, buf) in &split {
-                out.push(compress_chunk(buf, pl, ctx).map_err(Error::Format)?);
-            }
-            out
-        } else {
-            split.into_iter().map(|(_, buf)| buf).collect()
-        };
-
-        let new_num_chunks = n_full + new_chunk_bytes.len() as u64;
-        Ok(AppendPlan {
-            new_chunk_bytes,
-            n_full,
-            new_dim,
-            new_num_chunks,
-        })
-    }
-}
-
-/// The mutation-free result of planning one append.
-struct AppendPlan {
-    /// Per-chunk (possibly compressed) bytes to write, in element order starting
-    /// at `n_full`. The first entry is the rewritten trailing chunk when the
-    /// current length was not chunk-aligned.
-    new_chunk_bytes: Vec<Vec<u8>>,
-    /// Element index the first new chunk occupies.
-    n_full: u64,
-    /// New axis-0 dimension after the append (the commit value).
-    new_dim: u64,
-    /// New number of indexed chunks.
-    new_num_chunks: u64,
 }
 
 /// Generate the typed `append_*` methods, mirroring [`AppendBuilder`]'s

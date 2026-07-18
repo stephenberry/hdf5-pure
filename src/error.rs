@@ -664,6 +664,18 @@ pub enum Error {
     /// datatype (for a raw append), or has more than one hard link. The payload
     /// is a human-readable reason.
     AppendUnsupported(&'static str),
+    /// The dataset or file is not a supported target for the fast, immediate
+    /// in-place append
+    /// ([`EditSession::append_inplace`](crate::EditSession::append_inplace)) — for
+    /// example a userblock or non-latest-format file, a dataset whose
+    /// Extensible-Array index is not yet allocated, one that is not rank-1 /
+    /// unlimited / Extensible-Array indexed, one reachable through more than one
+    /// hard link, or a path an uncommitted staged edit in the same session will
+    /// relocate or delete. Distinct from [`AppendUnsupported`](Self::AppendUnsupported)
+    /// so a caller can catch this fast-path refusal and fall back to the staged
+    /// [`EditSession::append_dataset`](crate::EditSession::append_dataset). The
+    /// payload is a human-readable reason.
+    AppendInPlaceUnsupported(&'static str),
     /// The file or the requested object is not a supported target for the
     /// in-place editor ([`crate::EditSession`]) — for example a userblock or
     /// non-latest-format file, a group whose links are densely stored, or a
@@ -706,6 +718,9 @@ impl fmt::Display for Error {
             }
             Error::AppendUnsupported(reason) => {
                 write!(f, "unsupported append target: {reason}")
+            }
+            Error::AppendInPlaceUnsupported(reason) => {
+                write!(f, "unsupported in-place append target: {reason}")
             }
             Error::EditUnsupported(reason) => {
                 write!(f, "unsupported in-place edit target: {reason}")

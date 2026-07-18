@@ -103,12 +103,21 @@
 //!   resolves nowhere at all becomes an undefined reference, matching the
 //!   whole-file writer. Every
 //!   added dataset must have a fixed-size datatype, few enough attributes
-//!   (compact or variable-length) to stay in compact storage. Group and root
-//!   attribute edits (`set_group_attr`) may likewise be fixed-size or
-//!   variable-length, under the same compact-storage limit; dense
-//!   (fractal-heap) attribute storage is not supported.
+//!   (compact or variable-length) to stay in compact storage. Group, root, and
+//!   **dataset** attribute edits (`set_group_attr` / `set_dataset_attr`) may
+//!   likewise be fixed-size or variable-length, under the same compact-storage
+//!   limit; dense (fractal-heap) attribute storage is not editable. A dataset
+//!   attribute edit relocates the dataset header and so requires a single hard
+//!   link.
 //! - A new group's parent must already exist or be created in the same session
 //!   (each level created explicitly); intermediate groups are not auto-created.
+//! - Rows can be appended to an existing chunked, unlimited, Extensible-Array
+//!   dataset **immediately and in place** with `append_inplace` (amortized O(1),
+//!   crash-atomic, no `commit`), interleaved with the staged edits above. A
+//!   target the fast path cannot handle — a userblock or pre-v2 file, an
+//!   unallocated index, a non-Extensible-Array or multi-hard-link dataset, a
+//!   non-chunk-aligned filtered append — is refused with
+//!   [`Error::AppendInPlaceUnsupported`]; use the staged `append_dataset` instead.
 //!
 //! # Free-space reuse (issue #21)
 //!
@@ -152,6 +161,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::checksum::jenkins_lookup3;
+use crate::chunk_index_inplace::{InPlaceBytes, Located, apply_ea_append, plan_ea_append};
 use crate::chunked_read::{chunk_index_spans_buffered, enumerate_chunks_buffered, plan_dense_grid};
 use crate::chunked_write::{
     ChunkMeta, ChunkOptions, ChunkProvider, WrittenChunk, build_chunked_data_at_ext,
@@ -330,12 +340,24 @@ append_typed! {
 /// An open HDF5 file being edited in place.
 ///
 /// Mirror the file in memory and keep a writable handle; every mutation is
-/// applied to both so the on-disk file stays consistent. Stage additions with
-/// [`create_dataset`](Self::create_dataset) / [`create_group`](Self::create_group),
-/// value overwrites with [`write_dataset`](Self::write_dataset), and group
-/// attribute edits with [`set_group_attr`](Self::set_group_attr) /
-/// [`remove_group_attr`](Self::remove_group_attr), then apply them with
-/// [`commit`](Self::commit).
+/// applied to both so the on-disk file stays consistent.
+///
+/// The session has **two commit models** that compose on one open file:
+///
+/// - **Staged** edits are batched and applied together by [`commit`](Self::commit):
+///   additions ([`create_dataset`](Self::create_dataset) /
+///   [`create_group`](Self::create_group)), value overwrites
+///   ([`write_dataset`](Self::write_dataset)), staged appends
+///   ([`append_dataset`](Self::append_dataset)), group and dataset attribute edits
+///   ([`set_group_attr`](Self::set_group_attr) / [`set_dataset_attr`](Self::set_dataset_attr)
+///   and their `remove_*` counterparts), object [`copy`](Self::copy), and
+///   [`delete`](Self::delete). Dropping the session discards uncommitted staged
+///   edits ([`has_staged_edits`](Self::has_staged_edits) reports whether any remain).
+/// - **Immediate** in-place row appends ([`append_inplace`](Self::append_inplace))
+///   are applied and made durable the moment they are called — amortized O(1),
+///   crash-atomic, needing no `commit` — and can be freely interleaved with staged
+///   edits on the same session, so a high-frequency append loop and occasional tree
+///   edits share one open file with no reopening between them.
 ///
 /// # Example
 ///
@@ -380,7 +402,14 @@ pub struct EditSession {
     pending_groups: Vec<PathKey>,
     /// Group attribute edits staged as (group path, operation). The path may be
     /// a group created in this same session.
-    pending_group_attrs: Vec<(PathKey, GroupAttrOp)>,
+    pending_group_attrs: Vec<(PathKey, AttrOp)>,
+    /// Dataset attribute edits staged as (full dataset path, operation), applied
+    /// on the next `commit`. Each relocates the dataset's object header (like a
+    /// relocating overwrite): the header is rebuilt with the compact-attribute
+    /// change, its single naming link is patched, and the old header freed — the
+    /// dataset's data and chunk index stay in place. The target must be an existing,
+    /// single-hard-link dataset using compact (not dense fractal-heap) attributes.
+    pending_dataset_attrs: Vec<(PathKey, AttrOp)>,
     /// Links staged for removal by `delete`, as full paths.
     pending_deletes: Vec<PathKey>,
     /// Object copies staged by `copy`, as (source path, destination full path).
@@ -405,6 +434,29 @@ pub struct EditSession {
     /// [`commit`](Self::commit) rewrites the on-disk free-space managers so the
     /// free list survives close/reopen.
     persist: Option<PersistState>,
+    /// Per-dataset geometry cache for the immediate O(1) in-place append
+    /// ([`append_inplace`](Self::append_inplace)), keyed by the dataset's resolved
+    /// **object-header address** (not its path, so two hard links to one dataset
+    /// share one entry). Populated on the first append to a dataset and maintained
+    /// across appends; cleared wholesale at the entry of every non-trivial
+    /// [`commit`](Self::commit), since a commit can relocate a cached header or
+    /// free the region it points into (see `commit`).
+    located: HashMap<u64, LocatedState>,
+}
+
+/// A dataset located once for [`EditSession::append_inplace`], then maintained
+/// across appends. Mirrors the append writer's per-dataset state.
+struct LocatedState {
+    loc: Located,
+    /// The dataset's on-disk element datatype (for the append type check and the
+    /// filter chunk context).
+    datatype: Datatype,
+    /// Spatial (rank-length) chunk dimensions in elements: `[chunk_elems]`.
+    spatial: Vec<u64>,
+    /// Bytes per element (datatype size).
+    element_size: usize,
+    /// The re-encodable filter pipeline, when the dataset is filtered.
+    pipeline: Option<FilterPipeline>,
 }
 
 /// State for a file that persists its free space on disk. Carries the file's
@@ -499,11 +551,13 @@ impl EditSession {
             pending_appends: Vec::new(),
             pending_groups: Vec::new(),
             pending_group_attrs: Vec::new(),
+            pending_dataset_attrs: Vec::new(),
             pending_deletes: Vec::new(),
             pending_copies: Vec::new(),
             pending_cross_copies: Vec::new(),
             free: FreeList::new(),
             persist: None,
+            located: HashMap::new(),
         };
         // If the file persists its free space, seed the free list from the
         // on-disk managers and arm persistence for future commits. Best-effort:
@@ -732,6 +786,279 @@ impl EditSession {
         &mut self.pending_appends.last_mut().unwrap().1
     }
 
+    /// Immediately append rows to an **existing** chunked, unlimited,
+    /// Extensible-Array-indexed dataset **in place**, at amortized O(1) index cost
+    /// — the throughput-oriented, self-committing counterpart to the staged
+    /// [`append_dataset`](Self::append_dataset).
+    ///
+    /// Unlike every other [`EditSession`] edit, an in-place append is **not**
+    /// staged: it is applied and made durable before it returns (writes ordered
+    /// child-before-parent with `fsync` barriers, the dataspace dimension
+    /// published last as the single commit point), exactly like
+    /// [`AppendWriter`](crate::AppendWriter). It needs no [`commit`](Self::commit),
+    /// and it composes with staged tree edits on the same session: append rows,
+    /// stage `create_group` / `create_dataset` / attribute / `delete` edits,
+    /// `commit` them, and keep appending — all without reopening the file between
+    /// the fast appends and the tree edits.
+    ///
+    /// # Length rules and crash safety
+    ///
+    /// Identical to [`AppendWriter`](crate::AppendWriter): an **unfiltered** dataset
+    /// accepts any-length appends (a partial trailing chunk is rewritten and its
+    /// single-address index element repointed with one atomic write); a
+    /// **filtered** dataset accepts whole-chunk appends only (its multi-field index
+    /// element cannot be repointed power-loss-atomically). Every append is
+    /// crash-atomic — a crash between appends leaves the previous length or the new
+    /// one, never a torn view.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::AppendInPlaceUnsupported`] — deliberately distinct from
+    /// [`Error::AppendUnsupported`] so a caller can catch it and fall back to the
+    /// staged [`append_dataset`](Self::append_dataset) — when the file has a
+    /// userblock or a pre-v2 superblock, the dataset's Extensible-Array index is
+    /// not yet allocated, the dataset is not rank-1 / unlimited / Extensible-Array
+    /// indexed, a filtered append is not chunk-aligned, the append datatype does
+    /// not match the dataset, or the target path (or an ancestor) has a staged edit
+    /// still pending in this session (commit those first). A dataset reachable
+    /// through more than one hard link is handled through the staged
+    /// [`append_dataset`](Self::append_dataset), not here.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use hdf5_pure::EditSession;
+    ///
+    /// let mut session = EditSession::open("log.h5")?;
+    /// session.append_inplace_i32("samples", &[8, 9, 10, 11])?; // immediate + durable
+    /// session.create_group("run2"); // staged
+    /// session.append_inplace_i32("samples", &[12, 13])?;
+    /// session.commit()?; // applies the staged group; appends already durable
+    /// # Ok::<(), hdf5_pure::Error>(())
+    /// ```
+    pub fn append_inplace<T: crate::element::H5Element>(
+        &mut self,
+        dataset: &str,
+        data: &[T],
+    ) -> Result<(), Error> {
+        let mut b = AppendBuilder::new();
+        b.append(data);
+        self.append_inplace_gathered(dataset, &b, 4)
+    }
+
+    /// Append raw little-endian element bytes to `dataset` in place. See
+    /// [`append_inplace`](Self::append_inplace) for the full contract; the byte
+    /// length must be a whole multiple of the dataset's on-disk element size and
+    /// the element datatype must be little-endian (and neither variable-length nor
+    /// a reference). Prefer the typed methods when the element type is known.
+    pub fn append_inplace_raw(&mut self, dataset: &str, bytes: &[u8]) -> Result<(), Error> {
+        let mut b = AppendBuilder::new();
+        b.append_raw(bytes);
+        self.append_inplace_gathered(dataset, &b, 4)
+    }
+
+    /// Whether any staged tree edit is still uncommitted. In-place appends
+    /// ([`append_inplace`](Self::append_inplace)) are applied immediately and are
+    /// never staged, so they never affect this; it reflects only edits awaiting
+    /// [`commit`](Self::commit) — `create_group`, `create_dataset`,
+    /// `write_dataset`, `append_dataset`, group attribute edits, `delete`, and
+    /// `copy`. Dropping the session silently discards any staged edits.
+    pub fn has_staged_edits(&self) -> bool {
+        !self.pending_datasets.is_empty()
+            || !self.pending_writes.is_empty()
+            || !self.pending_appends.is_empty()
+            || !self.pending_groups.is_empty()
+            || !self.pending_group_attrs.is_empty()
+            || !self.pending_dataset_attrs.is_empty()
+            || !self.pending_deletes.is_empty()
+            || !self.pending_copies.is_empty()
+            || !self.pending_cross_copies.is_empty()
+    }
+
+    /// Apply a gathered in-place append (typed / generic / raw bytes) to `dataset`,
+    /// immediately and crash-atomically, driving the shared Extensible-Array engine
+    /// against the session's own mirror through an [`EditMirror`] adapter. Runs only
+    /// the first `max_phase` durability phases; production callers pass 4, the
+    /// crash-consistency tests stop at a boundary to simulate a crash.
+    fn append_inplace_gathered(
+        &mut self,
+        dataset: &str,
+        b: &AppendBuilder,
+        max_phase: u8,
+    ) -> Result<(), Error> {
+        if b.dt_conflict() {
+            return Err(Error::AppendInPlaceUnsupported(
+                "append mixes element types in one call; use one element type per append",
+            ));
+        }
+        // The fast in-place append is only sound on a base-0 latest-format file:
+        // the slot math assumes absolute addresses and the superblock is patched in
+        // place per call. A userblock or pre-v2 file falls back to the staged
+        // `append_dataset`, which rebuilds the index and repoints the superblock
+        // last.
+        if self.superblock.base_address != 0 {
+            return Err(Error::AppendInPlaceUnsupported(
+                "in-place append does not support a file with a userblock (non-zero base \
+                 address); use EditSession::append_dataset",
+            ));
+        }
+        if self.superblock.version < 2 {
+            return Err(Error::AppendInPlaceUnsupported(
+                "in-place append requires a latest-format file (v2/v3 superblock); use \
+                 EditSession::append_dataset",
+            ));
+        }
+        // A file that persists its free space keeps on-disk free-space managers (and,
+        // for a paged strategy, a page-aligned end-of-file) that only a staged
+        // `commit` rewrites consistently. An immediate EOF append bypasses that
+        // rewrite, so fall back to the staged path, which rebuilds the managers and
+        // repoints the superblock last.
+        if self.persist.is_some() {
+            return Err(Error::AppendInPlaceUnsupported(
+                "in-place append is not supported on a file that persists its free space \
+                 (H5Pset_file_space_strategy persist=true); use EditSession::append_dataset",
+            ));
+        }
+
+        // Refuse an append against a dataset (or a subtree) that a still-staged edit
+        // in this same session will relocate, replace, or delete — which would
+        // strand the durably-appended rows or plan against a header the commit
+        // moves. The caller must commit those edits first.
+        let target = split_path(dataset);
+        if self.append_conflicts_with_pending(&target) {
+            return Err(Error::AppendInPlaceUnsupported(
+                "the dataset or an ancestor has a staged edit pending in this session; commit \
+                 the staged edits before appending in place, or use EditSession::append_dataset",
+            ));
+        }
+
+        // Resolve the dataset's object-header address — the geometry cache key.
+        // base == 0 here, so the resolved address is absolute; two hard links to
+        // one dataset share the one entry.
+        let oh_addr = crate::group_v2::resolve_path_any(&self.data, &self.superblock, dataset)
+            .map_err(|_| {
+                Error::AppendInPlaceUnsupported("nothing to append to at the given path")
+            })?;
+
+        // Locate the dataset on the first append (cache miss) against the session's
+        // own borrowed mirror — no second lock, no second mirror, no re-read.
+        if !self.located.contains_key(&oh_addr) {
+            let mirror = EditMirror {
+                handle: &mut self.handle,
+                data: &mut self.data,
+                superblock: &mut self.superblock,
+                sb_sig_off: self.sb_sig_off,
+            };
+            let state = locate_dataset_state(&mirror, dataset)?;
+            self.located.insert(oh_addr, state);
+        }
+
+        // Validate the appended bytes against the on-disk datatype.
+        let raw = b.raw();
+        {
+            let st = &self.located[&oh_addr];
+            if raw.len() % st.element_size != 0 {
+                return Err(Error::AppendInPlaceUnsupported(
+                    "appended byte length is not a whole number of elements",
+                ));
+            }
+            match b.elem_dt() {
+                Some(expected) if *expected != st.datatype => {
+                    return Err(Error::AppendInPlaceUnsupported(
+                        "append datatype does not match the on-disk dataset (wrong element \
+                         type or byte order)",
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    if !datatype_is_raw_appendable(&st.datatype) {
+                        return Err(Error::AppendInPlaceUnsupported(
+                            "append_raw onto this dataset's datatype (non-little-endian, \
+                             variable-length, or reference) could misencode the bytes; use a \
+                             typed append",
+                        ));
+                    }
+                }
+            }
+        }
+
+        let new_elems = (raw.len() / self.located[&oh_addr].element_size) as u64;
+        if new_elems == 0 {
+            return Ok(());
+        }
+
+        // Read/plan phase (immutable borrows only, nothing published yet), then the
+        // ordered, fsync-barriered write phase — both shared with `AppendWriter`
+        // through the chunk-index engine. `EditMirror` borrows only the
+        // mirror-carrying fields, so `self.located` stays independently borrowable.
+        let plan_result = {
+            let st = &self.located[&oh_addr];
+            let mirror = EditMirror {
+                handle: &mut self.handle,
+                data: &mut self.data,
+                superblock: &mut self.superblock,
+                sb_sig_off: self.sb_sig_off,
+            };
+            plan_ea_append(
+                &mirror,
+                &st.loc,
+                &st.datatype,
+                &st.spatial,
+                st.element_size,
+                st.pipeline.as_ref(),
+                raw,
+                new_elems,
+            )
+        };
+        let plan = plan_result.map_err(as_inplace_error)?;
+        let st = self
+            .located
+            .get_mut(&oh_addr)
+            .expect("dataset located above");
+        let mut mirror = EditMirror {
+            handle: &mut self.handle,
+            data: &mut self.data,
+            superblock: &mut self.superblock,
+            sb_sig_off: self.sb_sig_off,
+        };
+        apply_ea_append(&mut mirror, &mut st.loc, &plan, max_phase).map_err(as_inplace_error)
+    }
+
+    /// Test-only phased in-place append (stops after `max_phase` durability phases)
+    /// used by the crash-consistency tests, mirroring `AppendWriter`'s harness.
+    #[cfg(test)]
+    fn append_inplace_i32_phased(
+        &mut self,
+        dataset: &str,
+        values: &[i32],
+        max_phase: u8,
+    ) -> Result<(), Error> {
+        let mut b = AppendBuilder::new();
+        b.append_i32(values);
+        self.append_inplace_gathered(dataset, &b, max_phase)
+    }
+
+    /// Whether `target` (an [`append_inplace`](Self::append_inplace) dataset path)
+    /// or any of its ancestors is named by a staged edit that a later
+    /// [`commit`](Self::commit) would relocate, replace, or delete. `create_group`
+    /// and group-attribute edits are excluded: they rewrite a group header without
+    /// moving a descendant dataset's header or freeing its storage, so they cannot
+    /// stale the append geometry cache.
+    fn append_conflicts_with_pending(&self, target: &[String]) -> bool {
+        let hits = |p: &[String]| paths_overlap(target, p);
+        self.pending_writes.iter().any(|(p, _)| hits(p))
+            || self.pending_appends.iter().any(|(p, _)| hits(p))
+            || self.pending_deletes.iter().any(|p| hits(p))
+            || self.pending_copies.iter().any(|(_, dst)| hits(dst))
+            || self.pending_cross_copies.iter().any(|(dst, _)| hits(dst))
+            || self.pending_dataset_attrs.iter().any(|(p, _)| hits(p))
+            || self.pending_datasets.iter().any(|(parent, db)| {
+                let mut full = parent.clone();
+                full.push(db.name.clone());
+                paths_overlap(target, &full)
+            })
+    }
+
     /// Stage a new (empty) group at `path`, created on the next
     /// [`commit`](Self::commit). The parent must already exist or be created in
     /// the same session; populate the group with datasets via
@@ -753,7 +1080,7 @@ impl EditSession {
     pub fn set_group_attr(&mut self, path: &str, name: &str, value: AttrValue) -> &mut Self {
         self.pending_group_attrs.push((
             split_path(path),
-            GroupAttrOp::Set {
+            AttrOp::Set {
                 name: name.to_string(),
                 value,
             },
@@ -770,7 +1097,48 @@ impl EditSession {
     pub fn remove_group_attr(&mut self, path: &str, name: &str) -> &mut Self {
         self.pending_group_attrs.push((
             split_path(path),
-            GroupAttrOp::Remove {
+            AttrOp::Remove {
+                name: name.to_string(),
+            },
+        ));
+        self
+    }
+
+    /// Stage an attribute add or replacement on an **existing dataset**, applied on
+    /// the next [`commit`](Self::commit).
+    ///
+    /// `path` names the dataset to edit. Attributes — fixed-size or variable-length
+    /// (`AttrValue::VarLenAsciiArray`) — are stored compactly in the rebuilt dataset
+    /// header. Applying it relocates the dataset's object header (the header is
+    /// rewritten and its single naming link repointed; the dataset's data and chunk
+    /// index stay in place), so it is supported only when the dataset has a **single
+    /// hard link**. An edit that would exceed the compact-attribute limit, or a
+    /// dataset using dense (fractal-heap) attribute storage, is refused before any
+    /// file bytes change. To set attributes on a dataset being *created* in this
+    /// session, use the builder's [`set_attr`](crate::DatasetBuilder::set_attr)
+    /// instead.
+    pub fn set_dataset_attr(&mut self, path: &str, name: &str, value: AttrValue) -> &mut Self {
+        self.pending_dataset_attrs.push((
+            split_path(path),
+            AttrOp::Set {
+                name: name.to_string(),
+                value,
+            },
+        ));
+        self
+    }
+
+    /// Stage removal of a compact attribute from an **existing dataset**, applied on
+    /// the next [`commit`](Self::commit).
+    ///
+    /// `path` names the dataset to edit; the named attribute must exist in the
+    /// committed dataset state after any earlier staged attribute operations for the
+    /// same dataset have been applied. Like [`set_dataset_attr`](Self::set_dataset_attr)
+    /// it relocates the dataset header and requires a single hard link.
+    pub fn remove_dataset_attr(&mut self, path: &str, name: &str) -> &mut Self {
+        self.pending_dataset_attrs.push((
+            split_path(path),
+            AttrOp::Remove {
                 name: name.to_string(),
             },
         ));
@@ -922,12 +1290,24 @@ impl EditSession {
             && self.pending_appends.is_empty()
             && self.pending_groups.is_empty()
             && self.pending_group_attrs.is_empty()
+            && self.pending_dataset_attrs.is_empty()
             && self.pending_deletes.is_empty()
             && self.pending_copies.is_empty()
             && self.pending_cross_copies.is_empty()
         {
             return Ok(());
         }
+
+        // Invalidate the in-place-append geometry cache before doing any work. A
+        // commit that reaches here rewrites and relocates object headers, frees
+        // vacated regions into `self.free`, and may truncate the file — any of
+        // which can leave a cached `Located` pointing at a moved header or into a
+        // now-free-eligible region. Clearing at *entry* (rather than the success
+        // tail) means a later failure — including one after the durable root flip,
+        // which leaves the session reusable — never strands a stale cache. The
+        // no-op fast return above does no such work, so it keeps the cache. The
+        // next `append_inplace` re-locates against the fresh mirror.
+        self.located.clear();
 
         // On a file with a userblock, stored addresses are relative to this base
         // and the editor converts at every disk boundary (read `stored + base`,
@@ -1063,6 +1443,81 @@ impl EditSession {
             let parent = full[..full.len() - 1].to_vec();
             moving_writes.push((parent, leaf, mw));
             write_targets.push(full);
+        }
+
+        // --- Preflight dataset attribute edits (`set_dataset_attr` /
+        // `remove_dataset_attr`) under the same all-or-nothing, single-hard-link
+        // contract. Each gathers the dataset's verbatim object-header region,
+        // applies the compact attribute ops to it, and stages a relocating
+        // `AttrEdit` header rewrite against the parent group — like a value
+        // overwrite, but the data-layout message (and thus the chunk data and index)
+        // is preserved verbatim, so only the header moves. ---
+        let dataset_attrs = std::mem::take(&mut self.pending_dataset_attrs);
+        if !dataset_attrs.is_empty() {
+            // Collect the ops per dataset in first-seen path order, so multiple edits
+            // to one dataset produce a single relocating header rewrite.
+            let mut order: Vec<PathKey> = Vec::new();
+            let mut ops_by_path: HashMap<PathKey, Vec<AttrOp>> = HashMap::new();
+            for (path, op) in dataset_attrs {
+                if !ops_by_path.contains_key(&path) {
+                    order.push(path.clone());
+                }
+                ops_by_path.entry(path).or_default().push(op);
+            }
+            for full in order {
+                let ops = ops_by_path.remove(&full).unwrap();
+                if full.is_empty() {
+                    return Err(Error::EditUnsupported(
+                        "cannot set a dataset attribute on the root group; use set_group_attr",
+                    ));
+                }
+                // A dataset already overwritten or appended in this commit would be
+                // planned against a stale header; require separate commits.
+                if write_targets.contains(&full) {
+                    return Err(Error::EditUnsupported(
+                        "the same dataset is edited more than once in one commit (an attribute \
+                         edit plus another edit); use separate commits",
+                    ));
+                }
+                let path_str = full.join("/");
+                let addr =
+                    crate::group_v2::resolve_path_any(&self.data, &self.superblock, &path_str)
+                        .map_err(|_| {
+                            Error::EditUnsupported(
+                                "nothing to set an attribute on at the given path",
+                            )
+                        })?;
+                let addr = usize::try_from(addr)
+                    .map_err(|_| Error::EditUnsupported("dataset address exceeds this platform"))?;
+                // An attribute edit relocates the dataset's object header and patches
+                // only the one naming link, so it is safe only when this is the
+                // dataset's sole hard link (same rule as a relocating overwrite).
+                let counts = incoming_links
+                    .get_or_insert_with(|| self.count_incoming_hard_links())
+                    .as_ref();
+                match counts.and_then(|c| c.get(&(addr as u64))) {
+                    Some(&1) => {}
+                    _ => {
+                        return Err(Error::EditUnsupported(
+                            "editing a dataset attribute relocates its header; only supported \
+                             when it has a single hard link",
+                        ));
+                    }
+                }
+                let region = Self::gather_oh_messages(&self.data, addr, base)?;
+                let (region, pending_vl_attrs) = apply_group_attr_ops(&region, &ops)?;
+                let leaf = full.last().unwrap().clone();
+                let parent = full[..full.len() - 1].to_vec();
+                moving_writes.push((
+                    parent,
+                    leaf,
+                    MovingWrite::AttrEdit {
+                        region,
+                        pending_vl_attrs,
+                    },
+                ));
+                write_targets.push(full);
+            }
         }
 
         // Fast path: when the only staged edits are same-length in-place
@@ -3459,6 +3914,30 @@ impl EditSession {
                 kept_chunks,
                 new_chunk_bytes,
             ),
+            MovingWrite::AttrEdit {
+                region,
+                pending_vl_attrs,
+            } => {
+                // `region` already carries the fixed-size attribute edits (applied
+                // in the commit preflight). Place each variable-length attribute's
+                // global heap collection, patch its placeholder heap address, and
+                // append the resolved message — exactly as the group-attribute apply
+                // loop does — then build and place the relocated dataset header. The
+                // data-layout message is untouched, so the dataset's chunk data and
+                // index stay in place; only the header moves.
+                let mut region = region.clone();
+                for (msg, collection_bytes) in pending_vl_attrs {
+                    let mut msg = msg.clone();
+                    let addr = self.place_vl_collection(collection_bytes)?;
+                    patch_vl_refs(&mut msg.raw_data, addr);
+                    region.extend_from_slice(&region_message(
+                        MessageType::Attribute,
+                        &msg.serialize(LENGTH_SIZE),
+                    ));
+                }
+                let oh = build_v2_object_header(&region);
+                self.alloc_or_append(&oh)
+            }
         }
     }
 
@@ -4148,7 +4627,7 @@ struct Node {
     is_new: bool,
     datasets: Vec<DatasetBuilder>,
     /// Compact group-attribute operations to apply to this group.
-    attr_ops: Vec<GroupAttrOp>,
+    attr_ops: Vec<AttrOp>,
     /// Names of links to remove from this group (from `delete`).
     deletes: Vec<String>,
     /// Copies to add to this group: (new link name, the source subtree read out
@@ -4173,8 +4652,10 @@ struct Node {
     pending_vl_attrs: PendingVlAttrs,
 }
 
-/// A staged compact attribute edit for a group.
-enum GroupAttrOp {
+/// A staged compact attribute edit for a group or dataset (shared by
+/// [`EditSession::set_group_attr`]/`remove_group_attr` and
+/// [`EditSession::set_dataset_attr`]/`remove_dataset_attr`).
+enum AttrOp {
     Set { name: String, value: AttrValue },
     Remove { name: String },
 }
@@ -4382,6 +4863,18 @@ enum MovingWrite {
         /// the append was chunk-aligned (no partial chunk to rewrite).
         old_tail_extent: Option<(u64, u64)>,
     },
+    /// A compact dataset-attribute edit (`set_dataset_attr` / `remove_dataset_attr`).
+    /// The verbatim header `region` already carries the fixed-size attribute change
+    /// (applied by [`apply_group_attr_ops`] in the commit preflight); any
+    /// variable-length attribute is placed and patched in [`EditSession::write_moving`]
+    /// via `pending_vl_attrs`. The rewritten header is relocated and the parent link
+    /// repointed, exactly like the other relocating writes — but the data-layout
+    /// message is preserved verbatim, so the dataset's chunk data and index stay in
+    /// place; only the old header is freed.
+    AttrEdit {
+        region: Vec<u8>,
+        pending_vl_attrs: PendingVlAttrs,
+    },
 }
 
 /// A staged dataset reduced to the pieces the writer needs.
@@ -4414,6 +4907,161 @@ struct FlatDataset {
     /// into `raw` in the apply loop, once every object this commit places has
     /// a known address. `None` for an ordinary dataset.
     reference_targets: Option<Vec<ObjectRefTarget>>,
+}
+
+/// A borrow adapter that drives the shared Extensible-Array append engine
+/// ([`crate::chunk_index_inplace`]) against an [`EditSession`]'s *own* mirror,
+/// handle, and superblock, so a session runs an immediate O(1) in-place append
+/// without constructing a second `InPlaceFile` (which would take a second exclusive
+/// lock and keep a divergent mirror). It borrows only the mirror-carrying fields,
+/// leaving [`EditSession::located`] independently borrowable. Its primitives write
+/// to disk *before* the mirror — the session's discipline, the opposite of the
+/// append/SWMR writers' mirror-before-disk order; the [`InPlaceBytes`] trait lets
+/// each owner keep its own failure-path discipline while sharing the checksummed
+/// slot/block mechanics.
+struct EditMirror<'a> {
+    handle: &'a mut fs::File,
+    data: &'a mut Vec<u8>,
+    superblock: &'a mut Superblock,
+    sb_sig_off: usize,
+}
+
+impl InPlaceBytes for EditMirror<'_> {
+    fn data(&self) -> &[u8] {
+        &self.data[..]
+    }
+    fn offset_size(&self) -> u8 {
+        self.superblock.offset_size
+    }
+    fn length_size(&self) -> u8 {
+        self.superblock.length_size
+    }
+    fn superblock(&self) -> &Superblock {
+        &*self.superblock
+    }
+    fn append_bytes(&mut self, bytes: &[u8]) -> Result<u64, Error> {
+        // Disk before mirror, so a failed write never leaves the mirror ahead of
+        // the file (matching `EditSession::append`).
+        let addr = self.data.len() as u64;
+        self.handle.seek(SeekFrom::Start(addr)).map_err(Error::Io)?;
+        self.handle.write_all(bytes).map_err(Error::Io)?;
+        self.data.extend_from_slice(bytes);
+        Ok(addr)
+    }
+    fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), Error> {
+        // Disk before mirror (see `append_bytes`).
+        self.handle
+            .seek(SeekFrom::Start(offset as u64))
+            .map_err(Error::Io)?;
+        self.handle.write_all(bytes).map_err(Error::Io)?;
+        self.data[offset..offset + bytes.len()].copy_from_slice(bytes);
+        Ok(())
+    }
+    fn patch_superblock_eof(&mut self) -> Result<(), Error> {
+        // Advance only the recorded end-of-file and re-serialize the superblock in
+        // place. Unlike `EditSession::commit`, this deliberately does NOT clear the
+        // consistency flags and does NOT repoint the root group: base_address is 0
+        // for every in-place-append-eligible file, so the normalized-absolute root
+        // address serializes back to the same stored value.
+        let eof = self.data.len() as u64;
+        self.superblock.eof_address = eof;
+        let bytes = self.superblock.serialize();
+        self.write_at(self.sb_sig_off, &bytes)
+    }
+    fn sync(&mut self) -> Result<(), Error> {
+        self.handle.flush().map_err(Error::Io)?;
+        self.handle.sync_data().map_err(Error::Io)?;
+        Ok(())
+    }
+}
+
+/// Whether two object paths are equal or one is an ancestor of the other.
+fn paths_overlap(a: &[String], b: &[String]) -> bool {
+    a.starts_with(b) || b.starts_with(a)
+}
+
+/// Re-tag a refusal from the shared append engine (`AppendUnsupported`) as the
+/// fast-path [`Error::AppendInPlaceUnsupported`], so a caller can catch it and fall
+/// back to the staged [`append_dataset`](EditSession::append_dataset) — which
+/// handles the non-chunk-aligned filtered case, index-geometry limits, and
+/// platform-width limits that the engine reports this way. Genuine I/O and format
+/// errors pass through unchanged.
+fn as_inplace_error(e: Error) -> Error {
+    match e {
+        Error::AppendUnsupported(m) => Error::AppendInPlaceUnsupported(m),
+        other => other,
+    }
+}
+
+/// Locate `dataset` in `file` and build its [`LocatedState`], validating in-place
+/// append eligibility (rank-1 / unlimited / Extensible-Array indexed, a nonzero
+/// chunk length, and a re-encodable filter pipeline). Mirrors the append writer's
+/// `ensure_located`, reporting through [`Error::AppendInPlaceUnsupported`].
+fn locate_dataset_state<F: InPlaceBytes>(file: &F, dataset: &str) -> Result<LocatedState, Error> {
+    let result = Located::locate(file, dataset, Error::AppendInPlaceUnsupported)?;
+    if result.located.chunk_elems == 0 {
+        return Err(Error::AppendInPlaceUnsupported(
+            "in-place append requires a nonzero chunk length",
+        ));
+    }
+    let data = file.data();
+    let (dt_off, dt_size) = result.spans.datatype;
+    let (datatype, _) = Datatype::parse(&data[dt_off..dt_off + dt_size])
+        .map_err(|_| Error::AppendInPlaceUnsupported("dataset datatype could not be parsed"))?;
+    let pipeline = match result.spans.filter {
+        Some((fb, fsize)) => {
+            let parsed = FilterPipeline::parse(&data[fb..fb + fsize]).map_err(|_| {
+                Error::AppendInPlaceUnsupported("dataset filter pipeline could not be parsed")
+            })?;
+            if !pipeline_reencodable(&parsed) {
+                return Err(Error::AppendInPlaceUnsupported(
+                    "dataset uses a filter this engine cannot re-encode",
+                ));
+            }
+            Some(parsed)
+        }
+        None => None,
+    };
+    let element_size = result.located.elem_bytes;
+    let spatial = vec![result.located.chunk_elems];
+    Ok(LocatedState {
+        loc: result.located,
+        datatype,
+        spatial,
+        element_size,
+        pipeline,
+    })
+}
+
+/// Generate the typed `append_inplace_*` methods, mirroring [`AppendBuilder`]'s
+/// vocabulary: each gathers into a builder and applies the append immediately.
+macro_rules! append_inplace_typed {
+    ($($method:ident, $builder:ident, $ty:ty;)*) => {
+        impl EditSession {
+            $(
+                #[doc = concat!("Append `", stringify!($ty), "` values to `dataset` in \
+                    place. See [`append_inplace`](Self::append_inplace) for the contract.")]
+                pub fn $method(&mut self, dataset: &str, data: &[$ty]) -> Result<(), Error> {
+                    let mut b = AppendBuilder::new();
+                    b.$builder(data);
+                    self.append_inplace_gathered(dataset, &b, 4)
+                }
+            )*
+        }
+    };
+}
+
+append_inplace_typed! {
+    append_inplace_f64, append_f64, f64;
+    append_inplace_f32, append_f32, f32;
+    append_inplace_i8, append_i8, i8;
+    append_inplace_i16, append_i16, i16;
+    append_inplace_i32, append_i32, i32;
+    append_inplace_i64, append_i64, i64;
+    append_inplace_u8, append_u8, u8;
+    append_inplace_u16, append_u16, u16;
+    append_inplace_u32, append_u32, u32;
+    append_inplace_u64, append_u64, u64;
 }
 
 /// Split a path into non-empty components.
@@ -5316,16 +5964,13 @@ fn remove_link_from_region(region: &[u8], name: &str) -> Result<Vec<u8>, Error> 
 /// effect the same regardless of op order within one commit. `region`'s
 /// fixed-size portion is a complete compact-attribute header on return; dense
 /// attribute storage and shared attribute messages are refused.
-fn apply_group_attr_ops(
-    region: &[u8],
-    ops: &[GroupAttrOp],
-) -> Result<(Vec<u8>, PendingVlAttrs), Error> {
+fn apply_group_attr_ops(region: &[u8], ops: &[AttrOp]) -> Result<(Vec<u8>, PendingVlAttrs), Error> {
     let mut out = region.to_vec();
     let mut pending_vl: PendingVlAttrs = Vec::new();
     let mut wrote_attr = false;
     for op in ops {
         match op {
-            GroupAttrOp::Set { name, value } => {
+            AttrOp::Set { name, value } => {
                 wrote_attr = true;
                 pending_vl.retain(|(msg, _)| &msg.name != name);
                 if let AttrValue::VarLenAsciiArray(strings) = value {
@@ -5335,7 +5980,7 @@ fn apply_group_attr_ops(
                     let msg = build_attr_message(name, value);
                     if msg.serialize(LENGTH_SIZE).len() > u16::MAX as usize {
                         return Err(Error::EditUnsupported(
-                            "group attribute is too large to encode in place",
+                            "attribute is too large to encode in place",
                         ));
                     }
                     let str_refs: Vec<&str> = strings.iter().map(String::as_str).collect();
@@ -5344,7 +5989,7 @@ fn apply_group_attr_ops(
                     out = set_attr_in_region(&out, name, value)?;
                 }
             }
-            GroupAttrOp::Remove { name } => {
+            AttrOp::Remove { name } => {
                 let before = pending_vl.len();
                 pending_vl.retain(|(msg, _)| &msg.name != name);
                 if pending_vl.len() == before {
@@ -5355,10 +6000,25 @@ fn apply_group_attr_ops(
     }
     if wrote_attr && compact_attr_count(&out)? + pending_vl.len() > MAX_COMPACT_ATTRS {
         return Err(Error::EditUnsupported(
-            "group attributes would exceed compact storage; dense attribute edits are not supported in place yet",
+            "attributes would exceed compact storage; dense attribute edits are not supported in place yet",
         ));
     }
     Ok((out, pending_vl))
+}
+
+/// Whether an Attribute Info (0x0015) message body denotes *dense* (fractal-heap)
+/// attribute storage — a *defined* heap address. The reference C library and h5py
+/// emit an Attribute Info message with an *undefined* heap address even for
+/// compact, inline attributes in the latest format (to carry creation-order
+/// metadata), so its mere presence is not dense storage; only a defined heap
+/// address is. An unparseable message is treated as dense (refused conservatively).
+/// Mirrors the copy path's dense detection so the compact-attribute editors accept
+/// the undefined-address message that nearly every real-world object carries.
+fn attribute_info_is_dense(body: &[u8]) -> bool {
+    match crate::attribute_info::AttributeInfoMessage::parse(body, OFFSET_SIZE) {
+        Ok(ai) => ai.fractal_heap_address.is_some(),
+        Err(_) => true,
+    }
 }
 
 /// Copy a message region, dropping all Attribute messages named `name` and then
@@ -5370,9 +6030,14 @@ fn set_attr_in_region(region: &[u8], name: &str, value: &AttrValue) -> Result<Ve
     while let Some((msg_type, body, body_end)) = next_message(region, p)? {
         match msg_type {
             MessageType::AttributeInfo => {
-                return Err(Error::EditUnsupported(
-                    "a target group uses dense (fractal-heap) attribute storage (not supported in place yet)",
-                ));
+                if attribute_info_is_dense(&region[body..body_end]) {
+                    return Err(Error::EditUnsupported(
+                        "a target object uses dense (fractal-heap) attribute storage (not supported in place yet)",
+                    ));
+                }
+                // An undefined-heap Attribute Info message is creation-order
+                // metadata, not dense storage; preserve it verbatim (fall through
+                // to copy the message below).
             }
             MessageType::Attribute => {
                 let attr_name = parse_compact_attr_name(region, p, body, body_end)?;
@@ -5406,9 +6071,13 @@ fn remove_attr_from_region(region: &[u8], name: &str, required: bool) -> Result<
         let mut skip = false;
         match msg_type {
             MessageType::AttributeInfo => {
-                return Err(Error::EditUnsupported(
-                    "a target group uses dense (fractal-heap) attribute storage (not supported in place yet)",
-                ));
+                if attribute_info_is_dense(&region[body..body_end]) {
+                    return Err(Error::EditUnsupported(
+                        "a target object uses dense (fractal-heap) attribute storage (not supported in place yet)",
+                    ));
+                }
+                // An undefined-heap Attribute Info message is creation-order
+                // metadata, not dense storage; preserve it verbatim.
             }
             MessageType::Attribute => {
                 let attr_name = parse_compact_attr_name(region, p, body, body_end)?;
@@ -5428,9 +6097,7 @@ fn remove_attr_from_region(region: &[u8], name: &str, required: bool) -> Result<
         out.extend_from_slice(&region[p..]);
     }
     if !removed && required {
-        return Err(Error::EditUnsupported(
-            "group attribute to remove was not found",
-        ));
+        return Err(Error::EditUnsupported("attribute to remove was not found"));
     }
     Ok(out)
 }
@@ -5438,10 +6105,12 @@ fn remove_attr_from_region(region: &[u8], name: &str, required: bool) -> Result<
 fn compact_attr_count(region: &[u8]) -> Result<usize, Error> {
     let mut count = 0usize;
     let mut p = 0;
-    while let Some((msg_type, _body, body_end)) = next_message(region, p)? {
-        if msg_type == MessageType::AttributeInfo {
+    while let Some((msg_type, body, body_end)) = next_message(region, p)? {
+        if msg_type == MessageType::AttributeInfo
+            && attribute_info_is_dense(&region[body..body_end])
+        {
             return Err(Error::EditUnsupported(
-                "a target group uses dense (fractal-heap) attribute storage (not supported in place yet)",
+                "a target object uses dense (fractal-heap) attribute storage (not supported in place yet)",
             ));
         }
         if msg_type == MessageType::Attribute {
@@ -5460,12 +6129,12 @@ fn parse_compact_attr_name(
 ) -> Result<String, Error> {
     if region[msg_start + 3] != 0 {
         return Err(Error::EditUnsupported(
-            "a target group has a shared attribute message (not editable in place yet)",
+            "a target object has a shared attribute message (not editable in place yet)",
         ));
     }
     crate::attribute::AttributeMessage::parse(&region[body..body_end], LENGTH_SIZE)
         .map(|attr| attr.name)
-        .map_err(|_| Error::EditUnsupported("a target group has an unreadable attribute message"))
+        .map_err(|_| Error::EditUnsupported("a target object has an unreadable attribute message"))
 }
 
 fn encode_attr_message(name: &str, value: &AttrValue) -> Result<Vec<u8>, Error> {
@@ -5680,6 +6349,57 @@ mod tests {
             p = end;
         }
         out
+    }
+
+    /// Stopping an in-place append (`append_inplace`) at any phase boundary must
+    /// leave the file readable as a consistent prefix — the old length until the
+    /// phase-4 dimension commit, the new length after it — even though a
+    /// partial-tail append repoints the visible trailing element in place. Mirrors
+    /// `AppendWriter`'s crash-consistency harness, but driven through
+    /// `EditSession`'s own mirror (disk-before-mirror ordering) to prove the shared
+    /// engine is crash-safe under both owners. Two starting layouts: the trailing
+    /// element inline in the index block (chunk 4, n 6), and in a data block
+    /// (chunk 2, n 9, slot 0).
+    #[test]
+    fn append_inplace_crash_consistency_partial_tail_prefix() {
+        use crate::reader::File as PureFile;
+        use crate::writer::FileBuilder;
+        use tempfile::tempdir;
+
+        let build = |path: &std::path::Path, n: i32, chunk: u64| {
+            let data: Vec<i32> = (0..n).collect();
+            let mut b = FileBuilder::new();
+            b.create_dataset("d")
+                .with_i32_data(&data)
+                .with_shape(&[n as u64])
+                .with_maxshape(&[u64::MAX])
+                .with_chunks(&[chunk]);
+            b.write(path).unwrap();
+        };
+
+        for (n, chunk, add) in [(6i32, 4u64, 5i32), (9, 2, 6)] {
+            let dir = tempdir().unwrap();
+            let base = dir.path().join("base.h5");
+            build(&base, n, chunk);
+
+            for max_phase in 1u8..=4 {
+                let p = dir.path().join(format!("crash_{n}_{chunk}_{max_phase}.h5"));
+                std::fs::copy(&base, &p).unwrap();
+                {
+                    let mut s = EditSession::open(&p).unwrap();
+                    s.append_inplace_i32_phased("d", &(n..n + add).collect::<Vec<_>>(), max_phase)
+                        .unwrap();
+                    // session dropped here, simulating a crash after `max_phase`
+                }
+                let expected_len = if max_phase == 4 { n + add } else { n };
+                let f = PureFile::from_bytes(std::fs::read(&p).unwrap()).unwrap();
+                assert_eq!(
+                    f.dataset("d").unwrap().read_i32().unwrap(),
+                    (0..expected_len).collect::<Vec<_>>(),
+                    "inconsistent view after crash at phase {max_phase} (n={n}, chunk={chunk})"
+                );
+            }
+        }
     }
 
     #[test]

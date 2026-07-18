@@ -27,13 +27,16 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::checksum::jenkins_lookup3;
-use crate::chunked_write::{ea_compute_stats, write_ea_addr};
+use crate::chunked_write::{ea_compute_stats, split_into_chunks, write_ea_addr};
 use crate::convert::TryToUsize;
 use crate::data_layout::DataLayout;
 use crate::dataspace::Dataspace;
+use crate::datatype::Datatype;
 use crate::error::{Error, FormatError};
 use crate::extensible_array::{EaGeometry, ExtensibleArrayHeader};
 use crate::file_lock::{self, FileLocking};
+use crate::filter_pipeline::FilterPipeline;
+use crate::filters::{ChunkContext, compress_chunk, decompress_chunk};
 use crate::group_v2;
 use crate::message_type::MessageType;
 use crate::signature;
@@ -176,42 +179,6 @@ impl InPlaceFile {
         Ok(())
     }
 
-    pub(crate) fn write_addr_at(&mut self, offset: usize, addr: u64) -> Result<(), Error> {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "the 4-byte arm is taken only when this file's offset_size is 4 bytes"
-        )]
-        match self.offset_size {
-            4 => self.write_at(offset, &(addr as u32).to_le_bytes()),
-            _ => self.write_at(offset, &addr.to_le_bytes()),
-        }
-    }
-
-    pub(crate) fn write_length_at(&mut self, offset: usize, val: u64) -> Result<(), Error> {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "the 4-byte arm is taken only when this file's length_size is 4 bytes"
-        )]
-        match self.length_size {
-            4 => self.write_at(offset, &(val as u32).to_le_bytes()),
-            _ => self.write_at(offset, &val.to_le_bytes()),
-        }
-    }
-
-    pub(crate) fn read_addr_at(&self, offset: usize) -> u64 {
-        match self.offset_size {
-            4 => u32::from_le_bytes(self.data[offset..offset + 4].try_into().unwrap()) as u64,
-            _ => u64::from_le_bytes(self.data[offset..offset + 8].try_into().unwrap()),
-        }
-    }
-
-    /// Recompute the Jenkins checksum over `[start, cks_off)` and write it at
-    /// `cks_off`.
-    pub(crate) fn rechecksum_range(&mut self, start: usize, cks_off: usize) -> Result<(), Error> {
-        let cks = jenkins_lookup3(&self.data[start..cks_off]);
-        self.write_at(cks_off, &cks.to_le_bytes())
-    }
-
     /// Advance the superblock's recorded end-of-file to the current mirror length
     /// and rewrite the superblock.
     pub(crate) fn patch_superblock_eof(&mut self) -> Result<(), Error> {
@@ -235,6 +202,104 @@ impl InPlaceFile {
         self.handle.flush().map_err(Error::Io)?;
         self.handle.sync_data().map_err(Error::Io)?;
         Ok(())
+    }
+}
+
+/// Byte-level in-place I/O the Extensible-Array growth engine ([`Located`])
+/// depends on, abstracted over its two owners: [`InPlaceFile`] (the append/SWMR
+/// writers' own mirror + handle) and [`EditSession`](crate::EditSession)'s
+/// borrowed mirror. Genericizing the engine over this trait lets a long-lived
+/// `EditSession` drive an O(1) in-place append against its *own* single mirror and
+/// exclusive lock rather than constructing a second `InPlaceFile` (which would
+/// take a second exclusive lock and keep a divergent mirror). Each owner keeps its
+/// own crash-safety discipline for the primitives — `InPlaceFile` mirrors before
+/// disk, the edit mirror writes disk before mirror — while sharing the checksummed
+/// slot/block/super-block mechanics through the derived operations below.
+pub(crate) trait InPlaceBytes {
+    /// The full in-memory mirror of the file.
+    fn data(&self) -> &[u8];
+    /// This file's address (offset) field width in bytes.
+    fn offset_size(&self) -> u8;
+    /// This file's length field width in bytes.
+    fn length_size(&self) -> u8;
+    fn superblock(&self) -> &Superblock;
+
+    /// Append `bytes` at end-of-file, returning their start address. The bytes are
+    /// made durable-visible immediately (not buffered until the next `sync`), so a
+    /// later in-place patch of the region lands on bytes that already exist.
+    fn append_bytes(&mut self, bytes: &[u8]) -> Result<u64, Error>;
+    /// Overwrite `[offset, offset + bytes.len())` in place.
+    fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), Error>;
+    /// Advance the superblock's recorded end-of-file to the current mirror length
+    /// and rewrite the superblock.
+    fn patch_superblock_eof(&mut self) -> Result<(), Error>;
+    /// Flush buffered writes to durable storage (an `fsync` barrier).
+    fn sync(&mut self) -> Result<(), Error>;
+
+    /// Write an offset-sized address at `offset`.
+    fn write_addr_at(&mut self, offset: usize, addr: u64) -> Result<(), Error> {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the 4-byte arm is taken only when this file's offset_size is 4 bytes"
+        )]
+        match self.offset_size() {
+            4 => self.write_at(offset, &(addr as u32).to_le_bytes()),
+            _ => self.write_at(offset, &addr.to_le_bytes()),
+        }
+    }
+
+    /// Write a length-sized value at `offset`.
+    fn write_length_at(&mut self, offset: usize, val: u64) -> Result<(), Error> {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the 4-byte arm is taken only when this file's length_size is 4 bytes"
+        )]
+        match self.length_size() {
+            4 => self.write_at(offset, &(val as u32).to_le_bytes()),
+            _ => self.write_at(offset, &val.to_le_bytes()),
+        }
+    }
+
+    /// Read an offset-sized address at `offset` from the mirror.
+    fn read_addr_at(&self, offset: usize) -> u64 {
+        match self.offset_size() {
+            4 => u32::from_le_bytes(self.data()[offset..offset + 4].try_into().unwrap()) as u64,
+            _ => u64::from_le_bytes(self.data()[offset..offset + 8].try_into().unwrap()),
+        }
+    }
+
+    /// Recompute the Jenkins checksum over `[start, cks_off)` and store it at
+    /// `cks_off`.
+    fn rechecksum_range(&mut self, start: usize, cks_off: usize) -> Result<(), Error> {
+        let cks = jenkins_lookup3(&self.data()[start..cks_off]);
+        self.write_at(cks_off, &cks.to_le_bytes())
+    }
+}
+
+impl InPlaceBytes for InPlaceFile {
+    fn data(&self) -> &[u8] {
+        &self.data
+    }
+    fn offset_size(&self) -> u8 {
+        self.offset_size
+    }
+    fn length_size(&self) -> u8 {
+        self.length_size
+    }
+    fn superblock(&self) -> &Superblock {
+        &self.superblock
+    }
+    fn append_bytes(&mut self, bytes: &[u8]) -> Result<u64, Error> {
+        InPlaceFile::append_bytes(self, bytes)
+    }
+    fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), Error> {
+        InPlaceFile::write_at(self, offset, bytes)
+    }
+    fn patch_superblock_eof(&mut self) -> Result<(), Error> {
+        InPlaceFile::patch_superblock_eof(self)
+    }
+    fn sync(&mut self) -> Result<(), Error> {
+        InPlaceFile::sync(self)
     }
 }
 
@@ -299,14 +364,14 @@ impl Located {
     /// returns the datatype/filter message spans, leaving the accept/reject
     /// policy to the caller. `unsupported` builds the caller's "unsupported
     /// target" error so each writer reports through its own variant.
-    pub(crate) fn locate(
-        file: &InPlaceFile,
+    pub(crate) fn locate<F: InPlaceBytes>(
+        file: &F,
         dataset: &str,
         unsupported: fn(&'static str) -> Error,
     ) -> Result<LocateResult, Error> {
-        let oh_addr = group_v2::resolve_path_any(file.data(), &file.superblock, dataset)?;
-        let os = file.offset_size;
-        let ls = file.length_size;
+        let oh_addr = group_v2::resolve_path_any(file.data(), file.superblock(), dataset)?;
+        let os = file.offset_size();
+        let ls = file.length_size();
 
         let walk = walk_v2_object_header(file.data(), oh_addr.to_usize()?, os, ls)?;
 
@@ -460,16 +525,16 @@ impl Located {
     /// For an unfiltered array only the address is written; for a filtered array
     /// the full `address + compressed_size + filter_mask` record is written,
     /// refusing a stored size that does not fit the array's fixed element width.
-    fn write_element_at(
+    fn write_element_at<F: InPlaceBytes>(
         &self,
-        file: &mut InPlaceFile,
+        file: &mut F,
         off: usize,
         rec: ElemRecord,
     ) -> Result<(), Error> {
         if self.client_id == 0 {
             return file.write_addr_at(off, rec.addr);
         }
-        let os = file.offset_size as usize;
+        let os = file.offset_size() as usize;
         let csz = self.ea_elem_size - os - 4;
         if csz < 8 && rec.stored_size >= (1u64 << (8 * csz)) {
             return Err(Error::AppendUnsupported(
@@ -482,8 +547,8 @@ impl Located {
     }
 
     /// Read the element record stored at byte offset `off`.
-    fn read_element_at(&self, file: &InPlaceFile, off: usize) -> ElemRecord {
-        let os = file.offset_size as usize;
+    fn read_element_at<F: InPlaceBytes>(&self, file: &F, off: usize) -> ElemRecord {
+        let os = file.offset_size() as usize;
         let addr = file.read_addr_at(off);
         if self.client_id == 0 {
             return ElemRecord::addr_only(addr);
@@ -506,8 +571,8 @@ impl Located {
     /// Byte offset of element `e`'s record, or `None` when the containing block
     /// (or super block) is not yet allocated, i.e. the element does not exist on
     /// disk yet.
-    fn elem_slot_off(&self, file: &InPlaceFile, e: u64) -> Result<Option<usize>, Error> {
-        let os = file.offset_size as usize;
+    fn elem_slot_off<F: InPlaceBytes>(&self, file: &F, e: u64) -> Result<Option<usize>, Error> {
+        let os = file.offset_size() as usize;
         let elem_size = self.ea_elem_size;
         let idx = self.idx_blk_elmts;
         let blk_off = self.blk_off_size;
@@ -534,7 +599,7 @@ impl Located {
         let sblk_addr = match region.parent {
             Parent::Super { sblk_j, .. } => {
                 let a = self.super_block_addr(file, sblk_j);
-                if is_undef(a, file.offset_size) {
+                if is_undef(a, file.offset_size()) {
                     return Ok(None);
                 }
                 Some(a)
@@ -543,7 +608,7 @@ impl Located {
         };
         let dblk_ptr_off = self.dblk_ptr_off(sblk_addr, &region, os, blk_off)?;
         let dblk_addr = file.read_addr_at(dblk_ptr_off);
-        if is_undef(dblk_addr, file.offset_size) {
+        if is_undef(dblk_addr, file.offset_size()) {
             return Ok(None);
         }
 
@@ -595,16 +660,16 @@ impl Located {
     }
 
     /// Read element `e`, or `None` if its slot is not allocated / is undefined.
-    pub(crate) fn read_element(
+    pub(crate) fn read_element<F: InPlaceBytes>(
         &self,
-        file: &InPlaceFile,
+        file: &F,
         e: u64,
     ) -> Result<Option<ElemRecord>, Error> {
         match self.elem_slot_off(file, e)? {
             None => Ok(None),
             Some(off) => {
                 let rec = self.read_element_at(file, off);
-                if is_undef(rec.addr, file.offset_size) {
+                if is_undef(rec.addr, file.offset_size()) {
                     Ok(None)
                 } else {
                     Ok(Some(rec))
@@ -619,13 +684,13 @@ impl Located {
     /// block is allocated on first touch) and an in-place update of an existing
     /// element (the block already exists, so it is reused rather than
     /// re-allocated). Handles non-paged and paged data blocks.
-    pub(crate) fn ea_insert(
+    pub(crate) fn ea_insert<F: InPlaceBytes>(
         &self,
-        file: &mut InPlaceFile,
+        file: &mut F,
         e: u64,
         rec: ElemRecord,
     ) -> Result<(), Error> {
-        let os = file.offset_size as usize;
+        let os = file.offset_size() as usize;
         let elem_size = self.ea_elem_size;
         let idx = self.idx_blk_elmts;
         let blk_off = self.blk_off_size;
@@ -669,7 +734,7 @@ impl Located {
         // in-place element update reuse the existing block instead of leaking it.
         let dblk_ptr_off = self.dblk_ptr_off(sblk_addr, &region, os, blk_off)?;
         let existing = file.read_addr_at(dblk_ptr_off);
-        let dblk_addr = if is_undef(existing, file.offset_size) {
+        let dblk_addr = if is_undef(existing, file.offset_size()) {
             let new_addr = if is_paged {
                 self.alloc_undef_paged_data_block(file, dblk_nelmts, block_offset_rel)?
             } else {
@@ -732,8 +797,8 @@ impl Located {
 
     /// Address of an already-allocated super block (`sblk_j`-th super-block
     /// pointer in the index block); the undefined sentinel when not yet allocated.
-    fn super_block_addr(&self, file: &InPlaceFile, sblk_j: usize) -> u64 {
-        let os = file.offset_size as usize;
+    fn super_block_addr<F: InPlaceBytes>(&self, file: &F, sblk_j: usize) -> u64 {
+        let os = file.offset_size() as usize;
         let ib_prefix = 4 + 1 + 1 + os;
         let ndblk_addrs = self.geom.direct_dblk_nelmts.len();
         let slot_off = self.index_block_addr
@@ -747,30 +812,30 @@ impl Located {
     /// Return the address of super block `sblk_j`, allocating an empty one (all
     /// data-block pointers undefined, plus a zeroed page-init bitmap when its data
     /// blocks are paged) at EOF if it does not exist yet.
-    fn ensure_super_block(
+    fn ensure_super_block<F: InPlaceBytes>(
         &self,
-        file: &mut InPlaceFile,
+        file: &mut F,
         sblk_j: usize,
         sb_block_offset: u64,
         ndblks: u64,
         dblk_nelmts: u64,
     ) -> Result<u64, Error> {
         let existing = self.super_block_addr(file, sblk_j);
-        if !is_undef(existing, file.offset_size) {
+        if !is_undef(existing, file.offset_size()) {
             return Ok(existing);
         }
-        let os = file.offset_size as usize;
+        let os = file.offset_size() as usize;
         let ib_prefix = 4 + 1 + 1 + os;
         let ndblk_addrs = self.geom.direct_dblk_nelmts.len();
 
         let bitmap = vec![0u8; sb_bitmap_size(ndblks, dblk_nelmts, self.page_nelmts)?];
-        let undef = vec![undef_addr(file.offset_size); ndblks.to_usize()?];
+        let undef = vec![undef_addr(file.offset_size()); ndblks.to_usize()?];
         let aesb = crate::chunked_write::build_aesb(
             self.ea_addr as u64,
             sb_block_offset,
             &bitmap,
             &undef,
-            file.offset_size,
+            file.offset_size(),
             self.blk_off_size,
             self.client_id,
         );
@@ -788,13 +853,13 @@ impl Located {
 
     /// Allocate a fresh non-paged data block (`EADB`) at EOF with every element
     /// slot undefined, returning its address.
-    fn alloc_undef_data_block(
+    fn alloc_undef_data_block<F: InPlaceBytes>(
         &self,
-        file: &mut InPlaceFile,
+        file: &mut F,
         dblk_nelmts: u64,
         block_offset_rel: u64,
     ) -> Result<u64, Error> {
-        let os = file.offset_size;
+        let os = file.offset_size();
         let mut buf = Vec::new();
         buf.extend_from_slice(b"EADB");
         buf.push(0); // version
@@ -812,13 +877,13 @@ impl Located {
     /// Allocate a fresh *paged* data block (`EADB`) at EOF: a header carrying its
     /// own checksum, followed by `dblk_nelmts / page_nelmts` fully-undefined pages
     /// (each `page_nelmts` undefined elements + a checksum).
-    fn alloc_undef_paged_data_block(
+    fn alloc_undef_paged_data_block<F: InPlaceBytes>(
         &self,
-        file: &mut InPlaceFile,
+        file: &mut F,
         dblk_nelmts: u64,
         block_offset_rel: u64,
     ) -> Result<u64, Error> {
-        let os = file.offset_size;
+        let os = file.offset_size();
         let page_nelmts = self.page_nelmts;
         let mut buf = Vec::new();
         buf.extend_from_slice(b"EADB");
@@ -844,14 +909,14 @@ impl Located {
 
     /// Set page `global_page`'s bit in a super block's page-init bitmap
     /// (MSB-first), in memory and on disk.
-    fn set_sb_page_bit(
+    fn set_sb_page_bit<F: InPlaceBytes>(
         &self,
-        file: &mut InPlaceFile,
+        file: &mut F,
         sblk_addr: u64,
         blk_off: usize,
         global_page: usize,
     ) -> Result<(), Error> {
-        let os = file.offset_size as usize;
+        let os = file.offset_size() as usize;
         let bitmap_start = sblk_addr.to_usize()? + 4 + 1 + 1 + os + blk_off;
         let byte = bitmap_start + global_page / 8;
         let mask = 0x80u8 >> (global_page % 8);
@@ -860,8 +925,8 @@ impl Located {
     }
 
     /// Recompute the index block checksum from the located dataset metadata.
-    fn rechecksum_index_block(&self, file: &mut InPlaceFile) -> Result<(), Error> {
-        let os = file.offset_size as usize;
+    fn rechecksum_index_block<F: InPlaceBytes>(&self, file: &mut F) -> Result<(), Error> {
+        let os = file.offset_size() as usize;
         let ib_prefix = 4 + 1 + 1 + os;
         let ndblk_addrs = self.geom.direct_dblk_nelmts.len();
         let nsblk_addrs = self.geom.nsblk_addrs;
@@ -873,16 +938,16 @@ impl Located {
         file.rechecksum_range(self.index_block_addr, cks_off)
     }
 
-    fn rechecksum_super_block(
+    fn rechecksum_super_block<F: InPlaceBytes>(
         &self,
-        file: &mut InPlaceFile,
+        file: &mut F,
         sblk_addr: u64,
         ndblks: u64,
         dblk_nelmts: u64,
         page_nelmts: u64,
         blk_off: usize,
     ) -> Result<(), Error> {
-        let os = file.offset_size as usize;
+        let os = file.offset_size() as usize;
         let prefix = 4 + 1 + 1 + os + blk_off;
         let bitmap = sb_bitmap_size(ndblks, dblk_nelmts, page_nelmts)?;
         let sblk_off = sblk_addr.to_usize()?;
@@ -891,9 +956,9 @@ impl Located {
     }
 
     /// Patch the six EA header statistics and recompute the header checksum.
-    pub(crate) fn update_ea_header(
+    pub(crate) fn update_ea_header<F: InPlaceBytes>(
         &self,
-        file: &mut InPlaceFile,
+        file: &mut F,
         num_chunks: u64,
     ) -> Result<(), Error> {
         let stats = ea_compute_stats(
@@ -901,11 +966,11 @@ impl Located {
             self.idx_blk_elmts,
             self.ea_elem_size,
             self.page_nelmts,
-            file.offset_size,
+            file.offset_size(),
             self.blk_off_size,
             num_chunks,
         );
-        let ls = file.length_size as usize;
+        let ls = file.length_size() as usize;
         let ea_addr = self.ea_addr;
         file.write_length_at(ea_addr + 12, stats.nsuper_blks)?;
         file.write_length_at(ea_addr + 12 + ls, stats.super_blk_size)?;
@@ -913,21 +978,218 @@ impl Located {
         file.write_length_at(ea_addr + 12 + 3 * ls, stats.data_blk_size)?;
         file.write_length_at(ea_addr + 12 + 4 * ls, stats.max_idx_set)?;
         file.write_length_at(ea_addr + 12 + 5 * ls, stats.nelmts)?;
-        let aehd_size = ExtensibleArrayHeader::serialized_size(file.offset_size, file.length_size);
+        let aehd_size =
+            ExtensibleArrayHeader::serialized_size(file.offset_size(), file.length_size());
         let cks_off = ea_addr + aehd_size - 4;
         file.rechecksum_range(ea_addr, cks_off)
     }
 
     /// Publish `new_dim` as the dataspace axis-0 dimension (the commit point) and
     /// recompute the containing object-header chunk's checksum.
-    pub(crate) fn patch_dimension(
+    pub(crate) fn patch_dimension<F: InPlaceBytes>(
         &self,
-        file: &mut InPlaceFile,
+        file: &mut F,
         new_dim: u64,
     ) -> Result<(), Error> {
         file.write_length_at(self.dim0_off, new_dim)?;
         file.rechecksum_range(self.ohdr_chunk_start, self.ohdr_chunk_msg_end)
     }
+}
+
+/// The mutation-free result of planning one in-place Extensible-Array append: the
+/// per-chunk (possibly compressed) blobs to write at end-of-file plus the
+/// bookkeeping the write phase publishes.
+pub(crate) struct AppendPlan {
+    /// Per-chunk (possibly compressed) bytes to write, in element order starting
+    /// at `n_full`. The first entry is the rewritten trailing chunk when the
+    /// current length was not chunk-aligned.
+    pub new_chunk_bytes: Vec<Vec<u8>>,
+    /// Element index the first new chunk occupies.
+    pub n_full: u64,
+    /// New axis-0 dimension after the append (the commit value).
+    pub new_dim: u64,
+    /// New number of indexed chunks.
+    pub new_num_chunks: u64,
+}
+
+/// Compute, without mutating the file, the new chunk blobs to write for an append
+/// of `new_elems` elements (`raw` little-endian bytes) to the Extensible-Array
+/// dataset described by `loc`, together with the first element index they occupy
+/// and the new dimension / chunk count. Shared by the general append writer and
+/// `EditSession`'s in-place append so the read/plan logic lives in one place.
+///
+/// A *filtered* dataset can only be appended in whole chunks: a non-chunk-aligned
+/// filtered append is refused here rather than repointing a multi-field trailing
+/// element whose in-place overwrite is not power-loss atomic; use
+/// [`EditSession::append_dataset`](crate::EditSession::append_dataset) for that.
+pub(crate) fn plan_ea_append<F: InPlaceBytes>(
+    file: &F,
+    loc: &Located,
+    datatype: &Datatype,
+    spatial: &[u64],
+    element_size: usize,
+    pipeline: Option<&FilterPipeline>,
+    raw: &[u8],
+    new_elems: u64,
+) -> Result<AppendPlan, Error> {
+    let chunk_elems = loc.chunk_elems;
+    let current_dim = loc.current_dim;
+    let new_dim = current_dim
+        .checked_add(new_elems)
+        .ok_or(Error::AppendUnsupported(
+            "append would overflow the dataset dimension",
+        ))?;
+    let n_full = current_dim / chunk_elems;
+    let has_partial = current_dim % chunk_elems != 0;
+
+    // Filtered appends must be chunk-aligned. Growing a *filtered* partial trailing
+    // chunk would repoint that chunk's existing index element in place, and a
+    // filtered element is a multi-field record (address + compressed_size +
+    // filter_mask) that is visible at the old dimension before the commit — so a
+    // power-loss crash tearing that record across a disk sector could leave the
+    // committed view unreadable. The trailing element of an *unfiltered* dataset is
+    // a single address whose overwrite is atomic, so any-length unfiltered appends
+    // are allowed.
+    if pipeline.is_some() && (has_partial || new_elems % chunk_elems != 0) {
+        return Err(Error::AppendUnsupported(
+            "a filtered dataset can only be appended in place in whole chunks (the current \
+             length and the appended length must both be multiples of the chunk length); \
+             use EditSession::append_dataset for a non-chunk-aligned filtered append",
+        ));
+    }
+
+    // Build the raw tail region: the live prefix of any rewritten partial chunk,
+    // then the appended bytes.
+    let mut tail_raw: Vec<u8> = Vec::new();
+    if has_partial {
+        let rec = loc
+            .read_element(file, n_full)?
+            .ok_or(Error::AppendUnsupported(
+                "trailing partial chunk is missing from the index",
+            ))?;
+        let start = usize::try_from(rec.addr)
+            .map_err(|_| Error::AppendUnsupported("chunk address exceeds this platform"))?;
+        let stored_len = if pipeline.is_some() {
+            usize::try_from(rec.stored_size)
+                .map_err(|_| Error::AppendUnsupported("chunk size exceeds this platform"))?
+        } else {
+            chunk_elems.to_usize()? * element_size
+        };
+        let data = file.data();
+        let end = start
+            .checked_add(stored_len)
+            .filter(|&e| e <= data.len())
+            .ok_or(Error::AppendUnsupported(
+                "trailing chunk extends past end-of-file",
+            ))?;
+        let stored = &data[start..end];
+        let full = if let Some(pl) = pipeline {
+            let ctx = ChunkContext::from_datatype(spatial, datatype);
+            decompress_chunk(stored, pl, ctx, rec.filter_mask).map_err(Error::Format)?
+        } else {
+            stored.to_vec()
+        };
+        let live_elems = usize::try_from(current_dim % chunk_elems)
+            .map_err(|_| Error::AppendUnsupported("chunk length exceeds this platform"))?;
+        let live_bytes = live_elems * element_size;
+        if full.len() < live_bytes {
+            return Err(Error::AppendUnsupported(
+                "trailing chunk decoded shorter than its live element count",
+            ));
+        }
+        tail_raw.extend_from_slice(&full[..live_bytes]);
+    }
+    tail_raw.extend_from_slice(raw);
+
+    // Split the tail into full chunk buffers (edge overhang zero-filled) and
+    // compress each through the pipeline when filtered.
+    let tail_len_elems = new_dim - n_full * chunk_elems;
+    let split = split_into_chunks(&tail_raw, &[tail_len_elems], spatial, element_size);
+    let new_chunk_bytes: Vec<Vec<u8>> = if let Some(pl) = pipeline {
+        let ctx = ChunkContext::from_datatype(spatial, datatype);
+        let mut out = Vec::with_capacity(split.len());
+        for (_, buf) in &split {
+            out.push(compress_chunk(buf, pl, ctx).map_err(Error::Format)?);
+        }
+        out
+    } else {
+        split.into_iter().map(|(_, buf)| buf).collect()
+    };
+
+    let new_num_chunks = n_full + new_chunk_bytes.len() as u64;
+    Ok(AppendPlan {
+        new_chunk_bytes,
+        n_full,
+        new_dim,
+        new_num_chunks,
+    })
+}
+
+/// Apply a planned append to `file` in place, ordered child-before-parent with
+/// `fsync` barriers so a crash between calls leaves either the old length or the
+/// new one, never a torn or lost view. `max_phase` runs only the first N of the
+/// four durability phases (production callers pass 4; the crash-consistency tests
+/// stop at a boundary to simulate a crash). On a full (phase-4) apply, `loc`'s
+/// cached `current_dim` / `num_chunks` are advanced to match. Shared by the
+/// general append writer and `EditSession`'s in-place append so this ordered
+/// write sequence — the crash-safety heart of the engine — lives in exactly one
+/// place and is never copy-pasted.
+pub(crate) fn apply_ea_append<F: InPlaceBytes>(
+    file: &mut F,
+    loc: &mut Located,
+    plan: &AppendPlan,
+    max_phase: u8,
+) -> Result<(), Error> {
+    // Phase 1: new/relocated chunk bytes at EOF, then advance the superblock's
+    // recorded end-of-file to cover them. This must precede the index writes: the
+    // trailing partial chunk's element is *visible* at the old dimension, so once
+    // it is repointed to the relocated chunk that chunk must already lie within the
+    // recorded EOF.
+    let mut chunk_addrs = Vec::with_capacity(plan.new_chunk_bytes.len());
+    for blob in &plan.new_chunk_bytes {
+        chunk_addrs.push((file.append_bytes(blob)?, blob.len() as u64));
+    }
+    file.sync()?;
+    file.patch_superblock_eof()?;
+    file.sync()?;
+    if max_phase < 2 {
+        return Ok(());
+    }
+
+    // Phase 2: the index element writes — a fresh insert for each new chunk, or an
+    // in-place repoint of the trailing element (which only ever points at data
+    // whose live prefix reproduces the old view's bytes). This may allocate new EA
+    // blocks past EOF, covered by the phase-3 EOF patch.
+    for (k, &(addr, stored_size)) in chunk_addrs.iter().enumerate() {
+        let e = plan.n_full + k as u64;
+        let rec = ElemRecord {
+            addr,
+            stored_size,
+            filter_mask: 0,
+        };
+        loc.ea_insert(file, e, rec)?;
+    }
+    file.sync()?;
+    if max_phase < 3 {
+        return Ok(());
+    }
+
+    // Phase 3: cover any EA blocks allocated during the element writes, then
+    // publish the EA header element count.
+    file.patch_superblock_eof()?;
+    loc.update_ea_header(file, plan.new_num_chunks)?;
+    file.sync()?;
+    if max_phase < 4 {
+        return Ok(());
+    }
+
+    // Phase 4: publish the dataspace dimension — the single commit point.
+    loc.patch_dimension(file, plan.new_dim)?;
+    file.sync()?;
+
+    loc.current_dim = plan.new_dim;
+    loc.num_chunks = plan.new_num_chunks;
+    Ok(())
 }
 
 /// Byte size of a super block's page-init bitmap (0 when its data blocks are not
