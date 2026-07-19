@@ -152,24 +152,28 @@ fn reused_free_shrinks_the_reusable_total() {
     let p = dir.path().join("reuse.h5");
     build_a_big_c(&p, false);
 
-    let mut s = EditSession::open(&p).unwrap();
-    s.delete("big");
-    s.commit().unwrap();
-    let free_before = s.space_accounting().reusable_free_bytes;
-    assert!(free_before >= 1600);
+    {
+        let mut s = EditSession::open(&p).unwrap();
+        s.delete("big");
+        s.commit().unwrap();
+        let free_before = s.space_accounting().reusable_free_bytes;
+        assert!(free_before >= 1600);
 
-    // A new dataset that fits the freed hole reuses it rather than growing the file,
-    // so the reusable total drops.
-    s.create_dataset("d").with_i32_data(&[9; 300]); // 1200 bytes, fits the hole
-    s.commit().unwrap();
-    let acct = s.space_accounting();
-    assert!(
-        acct.reusable_free_bytes < free_before,
-        "reusing the hole must shrink the reusable total ({free_before} -> {})",
-        acct.reusable_free_bytes
-    );
-    assert_internally_consistent(&acct);
+        // A new dataset that fits the freed hole reuses it rather than growing the
+        // file, so the reusable total drops.
+        s.create_dataset("d").with_i32_data(&[9; 300]); // 1200 bytes, fits the hole
+        s.commit().unwrap();
+        let acct = s.space_accounting();
+        assert!(
+            acct.reusable_free_bytes < free_before,
+            "reusing the hole must shrink the reusable total ({free_before} -> {})",
+            acct.reusable_free_bytes
+        );
+        assert_internally_consistent(&acct);
+    }
 
+    // Reopen only after the session (and its exclusive file lock) is dropped —
+    // Windows enforces the lock against a concurrent `File::open`.
     let f = File::open(&p).unwrap();
     assert_eq!(f.dataset("d").unwrap().read_i32().unwrap(), vec![9; 300]);
     assert_eq!(f.dataset("a").unwrap().read_i32().unwrap(), vec![1; 100]);
