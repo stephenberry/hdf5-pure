@@ -149,6 +149,7 @@ pub(crate) mod error;
 pub(crate) mod extensible_array;
 pub(crate) mod file_space_info;
 pub(crate) mod file_writer;
+pub(crate) mod fill_value;
 pub(crate) mod filter_pipeline;
 pub(crate) mod filters;
 pub(crate) mod fixed_array;

@@ -298,6 +298,20 @@ pub enum FormatError {
     /// does not point at a group or dataset object header. The payload is the
     /// stored (base-relative) address, preserved for diagnostics.
     InvalidObjectReference(u64),
+    /// A Fill Value message (`0x0005`) has an on-disk version this crate does
+    /// not recognize (only 1, 2, and 3 are defined). The payload is the version
+    /// byte found.
+    UnsupportedFillValueVersion(u8),
+    /// A user-supplied fill value's byte width does not match the dataset's
+    /// datatype element size (for example a `u8` fill value on an `i32`
+    /// dataset). The fields carry the datatype element size and the fill value
+    /// size, both in bytes.
+    FillValueSizeMismatch {
+        /// The dataset datatype's element size in bytes.
+        expected: usize,
+        /// The supplied fill value's size in bytes.
+        actual: usize,
+    },
 }
 
 impl fmt::Display for FormatError {
@@ -615,6 +629,16 @@ impl fmt::Display for FormatError {
                     f,
                     "invalid HDF5 object reference: address {addr:#x} is null/undefined \
                      or does not point at a group or dataset"
+                )
+            }
+            FormatError::UnsupportedFillValueVersion(v) => {
+                write!(f, "unsupported fill value message version: {v}")
+            }
+            FormatError::FillValueSizeMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "fill value size {actual} bytes does not match the dataset datatype \
+                     element size of {expected} bytes"
                 )
             }
         }
