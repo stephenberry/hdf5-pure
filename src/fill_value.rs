@@ -55,9 +55,14 @@ pub(crate) fn fill_value_message_v3(fill: Option<&[u8]>) -> Vec<u8> {
             let mut msg = Vec::with_capacity(6 + bytes.len());
             msg.push(3); // version
             msg.push(V3_FLAGS_DEFAULT | V3_FLAG_DEFINED);
-            // A scalar fill value is only a few bytes wide; the cast cannot lose
-            // information (see the module contract).
-            msg.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            // A scalar fill value is only a few bytes wide, so its length always
+            // fits `u32` (see the module contract).
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a scalar fill value is at most a few bytes; its length fits u32"
+            )]
+            let len = bytes.len() as u32;
+            msg.extend_from_slice(&len.to_le_bytes());
             msg.extend_from_slice(bytes);
             msg
         }

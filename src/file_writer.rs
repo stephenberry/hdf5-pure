@@ -854,9 +854,10 @@ impl FileWriter {
             // A user-defined fill value is one element wide, so its byte length
             // must equal the datatype's element size.
             if let Some(fill) = &db.fill {
-                if fill.len() as u64 != elem_size {
+                let expected = elem_size.to_usize()?;
+                if fill.len() != expected {
                     return Err(FormatError::FillValueSizeMismatch {
-                        expected: elem_size as usize,
+                        expected,
                         actual: fill.len(),
                     });
                 }

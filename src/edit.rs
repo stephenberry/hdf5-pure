@@ -168,6 +168,7 @@ use crate::chunked_write::{
     build_extensible_array_at, emit_chunked_data_verbatim, plan_chunked_data_verbatim,
     serialize_v4_extensible_array, split_into_chunks,
 };
+use crate::convert::TryToUsize;
 use crate::data_layout::DataLayout;
 use crate::dataspace::{Dataspace, DataspaceType};
 use crate::datatype::{Datatype, DatatypeByteOrder};
@@ -5445,9 +5446,10 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
     // A user-defined fill value is one element wide, so its byte length must
     // equal the datatype's element size (mirrors the whole-file writer's check).
     if let Some(fill) = &db.fill {
-        if fill.len() as u64 != elem {
+        let expected = elem.to_usize()?;
+        if fill.len() != expected {
             return Err(Error::Format(FormatError::FillValueSizeMismatch {
-                expected: elem as usize,
+                expected,
                 actual: fill.len(),
             }));
         }
