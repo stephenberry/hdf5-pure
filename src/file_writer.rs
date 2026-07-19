@@ -57,11 +57,16 @@ pub(crate) fn build_chunked_dataset_oh(
     pipeline_message: Option<&[u8]>,
     attrs: &[AttributeMessage],
     dense_blob: Option<&DenseAttrBlob>,
+    fill: Option<&[u8]>,
 ) -> Vec<u8> {
     let mut w = ObjectHeaderWriter::new();
     w.add_message_with_flags(MessageType::Datatype, dt.serialize(), 0x01);
     w.add_message(MessageType::Dataspace, ds.serialize(LENGTH_SIZE));
-    w.add_message_with_flags(MessageType::FillValue, vec![3, 0x0a], 0x01);
+    w.add_message_with_flags(
+        MessageType::FillValue,
+        crate::fill_value::fill_value_message_v3(fill),
+        0x01,
+    );
     w.add_message(MessageType::DataLayout, layout_message.to_vec());
     if let Some(pm) = pipeline_message {
         w.add_message(MessageType::FilterPipeline, pm.to_vec());
@@ -83,11 +88,16 @@ pub(crate) fn build_dataset_oh(
     data_size: u64,
     attrs: &[AttributeMessage],
     dense_blob: Option<&DenseAttrBlob>,
+    fill: Option<&[u8]>,
 ) -> Vec<u8> {
     let mut w = ObjectHeaderWriter::new();
     w.add_message_with_flags(MessageType::Datatype, dt.serialize(), 0x01);
     w.add_message(MessageType::Dataspace, ds.serialize(LENGTH_SIZE));
-    w.add_message_with_flags(MessageType::FillValue, vec![3, 0x0a], 0x01);
+    w.add_message_with_flags(
+        MessageType::FillValue,
+        crate::fill_value::fill_value_message_v3(fill),
+        0x01,
+    );
     let mut dl = Vec::new();
     dl.push(4); // version
     dl.push(1); // class = contiguous
@@ -649,6 +659,10 @@ impl FileWriter {
             /// dataset, whose element references in `raw` need their heap
             /// addresses patched once the post-data cursor is known.
             vl_string_staging: Option<VlStringStaging>,
+            /// A user-defined fill value, encoded in the dataset's datatype, or
+            /// `None` for the library default. Validated against the datatype
+            /// element size in `flatten_dataset`.
+            fill: Option<Vec<u8>>,
         }
 
         /// One dataset's data region for the assembly pass: either materialized
@@ -837,6 +851,16 @@ impl FileWriter {
                 };
                 attrs.extend(p.build_attrs(&raw));
             }
+            // A user-defined fill value is one element wide, so its byte length
+            // must equal the datatype's element size.
+            if let Some(fill) = &db.fill {
+                if fill.len() as u64 != elem_size {
+                    return Err(FormatError::FillValueSizeMismatch {
+                        expected: elem_size as usize,
+                        actual: fill.len(),
+                    });
+                }
+            }
             let idx = all_ds.len();
             all_ds.push(DsFlat {
                 name: db.name,
@@ -849,6 +873,7 @@ impl FileWriter {
                 raw_chunks,
                 reference_targets: db.reference_targets,
                 vl_string_staging: db.vl_string_staging,
+                fill: db.fill,
             });
             ds_vl.push(patches);
             Ok(idx)
@@ -1035,6 +1060,7 @@ impl FileWriter {
                     built.pipeline_message.as_deref(),
                     &d.attrs,
                     dense_blob.as_ref(),
+                    d.fill.as_deref(),
                 )
             } else {
                 build_dataset_oh(
@@ -1044,6 +1070,7 @@ impl FileWriter {
                     d.raw.len() as u64,
                     &d.attrs,
                     dense_blob.as_ref(),
+                    d.fill.as_deref(),
                 )
             };
             actual_ds_oh_sizes.push(oh.len());
@@ -1294,6 +1321,7 @@ impl FileWriter {
                     pm.as_deref(),
                     &d.attrs,
                     ds_dense_blobs[i].as_ref(),
+                    d.fill.as_deref(),
                 )
             } else {
                 build_dataset_oh(
@@ -1303,6 +1331,7 @@ impl FileWriter {
                     layout.data.len(),
                     &d.attrs,
                     ds_dense_blobs[i].as_ref(),
+                    d.fill.as_deref(),
                 )
             };
             ds_oh_bytes2.push(oh);

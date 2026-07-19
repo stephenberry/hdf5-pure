@@ -1276,6 +1276,32 @@ impl<'f> Dataset<'f> {
         Ok(classify_datatype(&dt))
     }
 
+    /// The raw bytes of this dataset's user-defined fill value, encoded in its
+    /// datatype, or `None` when no user-defined fill value is set (the library
+    /// default or an explicitly undefined fill). Reads whichever Fill Value
+    /// message the header carries — the current `0x0005` (versions 1/2/3) or the
+    /// legacy `0x0004` — so files from this crate, the reference C library, and
+    /// h5py are all handled.
+    pub(crate) fn defined_fill_bytes(&self) -> Result<Option<Vec<u8>>, Error> {
+        let msg = self
+            .header
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::FillValue)
+            .or_else(|| {
+                self.header
+                    .messages
+                    .iter()
+                    .find(|m| m.msg_type == MessageType::FillValueOld)
+            });
+        match msg {
+            Some(m) => Ok(crate::fill_value::parse_defined_fill_value(
+                m.msg_type, &m.data,
+            )?),
+            None => Ok(None),
+        }
+    }
+
     /// Read all data as `f64` values.
     pub fn read_f64(&self) -> Result<Vec<f64>, Error> {
         let raw = self.read_raw()?;

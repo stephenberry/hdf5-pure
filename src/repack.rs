@@ -306,6 +306,25 @@ fn emit_dataset(
     let dims = dataspace.dimensions.clone();
     let n_elements: u64 = dims.iter().product();
 
+    // A user-defined fill value is fixed element bytes in the datatype, so it
+    // reproduces exactly on the fixed-size paths below (dense-chunked verbatim,
+    // and contiguous/compact/sparse re-encode). The variable-length and
+    // object-reference paths that follow rebuild global-heap references and
+    // object addresses from scratch, so a fill value there could carry stale heap
+    // or address bytes; refuse rather than copy it, matching the crate's
+    // never-degrade-on-rewrite contract.
+    let fill = ds.defined_fill_bytes()?;
+    if fill.is_some()
+        && (is_vlen_string_datatype(&datatype)
+            || is_nonstring_vlen(&datatype)
+            || is_object_reference(&datatype))
+    {
+        return Err(Error::RepackUnsupported(format!(
+            "dataset {path}: a fill value on a variable-length or object-reference \
+             dataset cannot be repacked faithfully"
+        )));
+    }
+
     // Variable-length string datasets take a dedicated path: their element
     // references point into the global heap, so they are re-emitted by reading
     // each element's exact heap bytes and re-staging them, not by copying raw
@@ -350,6 +369,10 @@ fn emit_dataset(
         }
         return Ok(());
     }
+
+    // Past the reference-bearing paths: carry the fill value through the
+    // fixed-size storage paths below, both of which reproduce it exactly.
+    db.fill = fill;
 
     // A chunked dataset with allocated chunks is copied chunk-by-chunk, verbatim:
     // each compressed chunk is laid into the output without decoding, so any

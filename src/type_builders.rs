@@ -925,6 +925,11 @@ pub struct DatasetBuilder {
     /// carries the global heap collection plus the mask of references to patch
     /// once the post-data cursor is known.
     pub(crate) vl_string_staging: Option<VlStringStaging>,
+    /// A user-defined fill value, encoded in the dataset's datatype (little-
+    /// endian, one element wide). `None` leaves the crate's library-default fill
+    /// value message untouched. Its byte width is checked against the datatype's
+    /// element size when the dataset is serialized.
+    pub(crate) fill: Option<Vec<u8>>,
     #[cfg(feature = "provenance")]
     pub(crate) provenance: Option<ProvenanceConfig>,
 }
@@ -942,6 +947,7 @@ impl DatasetBuilder {
             raw_chunks: None,
             reference_targets: None,
             vl_string_staging: None,
+            fill: None,
             #[cfg(feature = "provenance")]
             provenance: None,
         }
