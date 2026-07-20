@@ -77,7 +77,7 @@ let ds = file.dataset("log").unwrap();
 println!("now {} rows", ds.shape().unwrap()[0]);
 ```
 
-`refresh()` is the SWMR reader's refresh primitive, analogous to the C library's `H5Drefresh` and h5py's `Dataset.refresh()`. After it returns, newly fetched `Dataset` and `Group` handles observe the appended chunks and extended dimensions. Existing handles borrow `&self`, so they must be dropped before calling `refresh()`; re-fetch them afterward, as shown above. See [reading](reading.md) for the dataset access APIs used here.
+`refresh()` is the SWMR reader's refresh primitive, analogous to the C library's `H5Drefresh` and h5py's `Dataset.refresh()`. After it returns, newly fetched `Dataset` and `Group` handles observe the appended chunks and extended dimensions. Handles are owned and keep the file open, so `refresh()` needs exclusive access: drop any outstanding `Dataset`/`Group` handle (and any `File` clone) before calling it — otherwise it returns `Error::HandlesOutstanding` — then re-fetch the handles afterward, as shown above. See [reading](reading.md) for the dataset access APIs used here.
 
 !!! note "Refresh cost"
     Each `refresh()` re-reads the entire file from disk (`O(file size)`) and re-validates the superblock checksum; a transient parse failure from catching a writer mid-flush is retried a bounded number of times. When following a large, steadily growing log, budget refresh frequency accordingly. `refresh()` returns an error if the file was not opened with `File::open_swmr` (the in-memory `File::from_bytes` path cannot refresh).

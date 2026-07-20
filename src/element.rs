@@ -63,7 +63,7 @@ mod sealed {
 pub trait H5Element: sealed::Sealed + Copy {
     /// Read every element of `ds` as `Self`, in row-major order.
     #[doc(hidden)]
-    fn read_from(ds: &Dataset<'_>) -> Result<Vec<Self>, Error>;
+    fn read_from(ds: &Dataset) -> Result<Vec<Self>, Error>;
 
     /// Set `builder`'s data and datatype from a flat row-major slice.
     #[doc(hidden)]
@@ -90,7 +90,7 @@ macro_rules! impl_h5_element {
     ($ty:ty, $read:ident, $write:ident, $append:ident, |$raw:ident, $dt:ident| $convert:expr) => {
         impl sealed::Sealed for $ty {}
         impl H5Element for $ty {
-            fn read_from(ds: &Dataset<'_>) -> Result<Vec<Self>, Error> {
+            fn read_from(ds: &Dataset) -> Result<Vec<Self>, Error> {
                 ds.$read()
             }
             fn write_into(builder: &mut DatasetBuilder, data: &[Self]) {
@@ -209,7 +209,7 @@ impl DatasetBuilder {
     }
 }
 
-impl Dataset<'_> {
+impl Dataset {
     /// Read the dataset into a `Vec<T>` for any supported scalar type, in
     /// row-major order.
     ///

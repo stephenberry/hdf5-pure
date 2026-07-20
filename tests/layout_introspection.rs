@@ -11,12 +11,12 @@
 use hdf5_pure::{ChunkIndex, Dataset, File, FileBuilder, Layout};
 use tempfile::tempdir;
 
-fn open<'a>(f: &'a File, name: &str) -> Dataset<'a> {
+fn open(f: &File, name: &str) -> Dataset {
     f.dataset(name).unwrap()
 }
 
 /// Chunk offsets returned by `chunks()`, sorted for order-independent asserts.
-fn sorted_offsets(ds: &Dataset<'_>) -> Vec<Vec<u64>> {
+fn sorted_offsets(ds: &Dataset) -> Vec<Vec<u64>> {
     let mut offs: Vec<Vec<u64>> = ds.chunks().unwrap().into_iter().map(|c| c.offset).collect();
     offs.sort();
     offs
