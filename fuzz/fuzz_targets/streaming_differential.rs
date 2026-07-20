@@ -54,8 +54,8 @@ fn assert_same_file_metadata(buffered: &File, streaming: &File) {
 fn assert_same_group(
     buffered_file: &File,
     streaming_file: &File,
-    buffered_group: &Group<'_>,
-    streaming_group: &Group<'_>,
+    buffered_group: &Group,
+    streaming_group: &Group,
     path: &str,
     depth: usize,
 ) {
@@ -112,7 +112,7 @@ fn assert_same_group(
     }
 }
 
-fn assert_same_dataset(buffered: &Dataset<'_>, streaming: &Dataset<'_>) {
+fn assert_same_dataset(buffered: &Dataset, streaming: &Dataset) {
     assert_same_result(buffered.shape(), streaming.shape());
     assert_same_result(buffered.dtype(), streaming.dtype());
     assert_same_attrs(buffered.attrs(), streaming.attrs());

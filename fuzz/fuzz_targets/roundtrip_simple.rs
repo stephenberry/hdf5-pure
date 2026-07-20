@@ -76,7 +76,7 @@ impl ExpectedDataset {
         }
     }
 
-    fn assert_readback(&self, dataset: &hdf5_pure::Dataset<'_>) {
+    fn assert_readback(&self, dataset: &hdf5_pure::Dataset) {
         match self {
             Self::I32(expected) => {
                 assert_eq!(dataset.read_i32().expect("read i32"), *expected);
