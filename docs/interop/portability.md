@@ -85,7 +85,7 @@ shown above, is available on `wasm32-unknown-unknown`.
 | Write a file to a path | `FileBuilder::write` | yes |
 | Edit a file in place | [`EditSession`](../guide/editing.md) | yes |
 | Append in SWMR mode | [`SwmrWriter`](../guide/swmr.md) | yes |
-| Append in place (non-SWMR) | [`AppendWriter`](../guide/editing.md#streaming-appends-with-appendwriter) | yes |
+| Append in place (non-SWMR) | [`File::open_rw` + `Dataset::append`](../guide/editing.md#streaming-appends) | yes |
 | Compact a file | [`repack`](../guide/repack.md) | yes |
 | MATLAB `.mat` via serde | `mat` module | yes (`serde`) |
 | N-dimensional array I/O | `with_ndarray` / `read_array` | yes (`ndarray`) |

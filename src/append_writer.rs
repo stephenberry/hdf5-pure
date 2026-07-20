@@ -1,5 +1,9 @@
 //! General (non-SWMR) in-place append writer.
 //!
+//! **Deprecated:** superseded by the owned-handle API — open with
+//! [`crate::File::open_rw`] and append through a [`crate::Dataset`] handle. See
+//! the [`AppendWriter`] type docs for the migration.
+//!
 //! [`AppendWriter`] opens an existing HDF5 file once and appends to a
 //! one-dimensional, unlimited, Extensible-Array-indexed dataset *in place*,
 //! across many calls, at amortized `O(1)` index cost per append: an appended
@@ -134,23 +138,43 @@ struct DatasetState {
 /// Eligibility is validated on the first append to a dataset, not at
 /// [`open`](Self::open).
 ///
-/// # Example
+/// # Deprecated
+///
+/// Superseded by the owned-handle API: open the file for writing with
+/// [`File::open_rw`](crate::File::open_rw) and append through a
+/// [`Dataset`](crate::Dataset) handle. That path gives the same amortized
+/// `O(1)` in-place append under the same contract (filtered whole-chunk /
+/// unfiltered any-length, an exclusive OS lock, no SWMR flag), and the one open
+/// file also reads, edits, and reaches every dataset by name — no separate
+/// writer type.
 ///
 /// ```no_run
-/// use hdf5_pure::AppendWriter;
+/// use hdf5_pure::File;
 ///
-/// let mut writer = AppendWriter::open("log.h5")?;
-/// writer.append_i32("samples", &[8, 9, 10, 11])?;
-/// writer.append_i32("samples", &[12, 13])?; // unfiltered: any length
-/// writer.close()?;
+/// let file = File::open_rw("log.h5")?;
+/// let mut samples = file.dataset("samples")?;
+/// samples.append(&[8i32, 9, 10, 11])?;
+/// samples.append(&[12i32, 13])?; // unfiltered: any length
+/// file.close()?;
 /// # Ok::<(), hdf5_pure::Error>(())
 /// ```
+///
+/// The one behavior with no [`File::open_rw`](crate::File::open_rw) equivalent yet is
+/// [`open_with_locking`](Self::open_with_locking) with
+/// [`FileLocking::Disabled`](crate::FileLocking) — keep using `AppendWriter` if
+/// you must open without the exclusive lock. The type will be removed in a later
+/// release.
+#[deprecated(
+    since = "0.22.0",
+    note = "use File::open_rw + Dataset::append; see the AppendWriter type docs for migration"
+)]
 pub struct AppendWriter {
     /// In-memory mirror + on-disk handle, shared with the SWMR writer.
     file: InPlaceFile,
     datasets: HashMap<String, DatasetState>,
 }
 
+#[allow(deprecated)] // this type's own impl legitimately touches its (deprecated) fields
 impl AppendWriter {
     /// Open an existing HDF5 file for in-place appends, taking an exclusive OS
     /// file lock held for the writer's life.
@@ -343,6 +367,7 @@ impl AppendWriter {
 /// vocabulary: each gathers into a builder and applies the append in place.
 macro_rules! append_typed {
     ($($method:ident, $ty:ty;)*) => {
+        #[allow(deprecated)] // impl of the deprecated type; each method delegates to append_gathered
         impl AppendWriter {
             $(
                 #[doc = concat!("Append `", stringify!($ty), "` values to `dataset`. \
@@ -372,6 +397,7 @@ append_typed! {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // exercises the deprecated shim's shared crash-safety engine
 mod tests {
     use super::*;
     use crate::reader::File as PureFile;
