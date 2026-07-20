@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Breaking
+
+- **Breaking:** `Dataset`, `Group`, and `Object` are now owned handles with no `<'f>` lifetime — `File::dataset`/`group`/`root` hand back handles that share ownership of the open file (internally `Arc`), so a handle can be stored in a struct, cached, sent across threads, and outlive the `File` value it came from, and `File` is now cheaply cloneable. Code that never named the handle lifetime is unaffected; code that wrote `Dataset<'_>` should drop the lifetime, and `File::refresh` now returns `Error::HandlesOutstanding` when a handle or `File` clone is still alive instead of enforcing it at compile time ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)).
+
 ### Added
 
 - `EditSession::append_inplace` grows an existing **chunked, unlimited, Extensible-Array dataset** in place at amortized `O(1)` cost — immediate and crash-atomic, needing no `commit` — and can be interleaved with the session's staged group/dataset/attribute/delete edits on one open file, with no reopening between the fast appends and the tree edits. Unfiltered datasets accept any-length appends, filtered datasets whole chunks only; a userblock or pre-v2 file, an unallocated or non-Extensible-Array index, or a multi-hard-link dataset is refused with `Error::AppendInPlaceUnsupported` (use `append_dataset` instead) ([#146](https://github.com/stephenberry/hdf5-pure/issues/146)).

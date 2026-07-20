@@ -40,8 +40,8 @@ pub(crate) fn read_file(bytes: &[u8]) -> Result<Vec<(String, MatValue)>, MatErro
 /// `in_heap` marks reads that descend from an MCOS opaque object's property
 /// heap (see [`read_dataset`]); the top level passes `false`.
 fn read_group(
-    group: &Group<'_>,
-    mcos: Option<&Mcos<'_>>,
+    group: &Group,
+    mcos: Option<&Mcos>,
     in_heap: bool,
     depth: usize,
 ) -> Result<Vec<(String, MatValue)>, MatError> {
@@ -74,8 +74,8 @@ fn read_group(
 }
 
 fn read_group_as_value(
-    group: &Group<'_>,
-    mcos: Option<&Mcos<'_>>,
+    group: &Group,
+    mcos: Option<&Mcos>,
     in_heap: bool,
     depth: usize,
 ) -> Result<MatValue, MatError> {
@@ -114,7 +114,7 @@ fn read_group_as_value(
 /// array (and then fail trying to dereference non-references). A *cell* field of
 /// a scalar struct is a reference dataset too, but carries `MATLAB_class="cell"`,
 /// so the class-attribute check keeps that case a scalar struct.
-fn is_struct_array(group: &Group<'_>) -> Result<bool, MatError> {
+fn is_struct_array(group: &Group) -> Result<bool, MatError> {
     // A nested-struct field of a scalar struct is stored as a subgroup, so any
     // subgroup means this is a scalar struct, not a struct array.
     if !group.groups().map_err(MatError::Hdf5)?.is_empty() {
@@ -153,8 +153,8 @@ fn is_struct_array(group: &Group<'_>) -> Result<bool, MatError> {
 /// a row-major array-of-structs, matching how numeric matrices present their
 /// elements.
 fn read_struct_array(
-    group: &Group<'_>,
-    mcos: Option<&Mcos<'_>>,
+    group: &Group,
+    mcos: Option<&Mcos>,
     in_heap: bool,
     depth: usize,
 ) -> Result<MatValue, MatError> {
@@ -245,8 +245,8 @@ fn read_struct_array(
 /// empty defaults — there MATLAB genuinely omits a property for an empty value,
 /// whereas a valid enumeration never omits these datasets.
 fn try_decode_enum_instance(
-    group: &Group<'_>,
-    mcos: &Mcos<'_>,
+    group: &Group,
+    mcos: &Mcos,
     depth: usize,
 ) -> Result<Option<MatValue>, MatError> {
     // The tag dataset's absence means an ordinary group, so a failed lookup is
@@ -313,7 +313,7 @@ fn enum_member_names(pool: &[String], indices: &[usize]) -> Result<Vec<String>, 
 /// Open a required enumeration-metadata dataset. The magic tag has already
 /// matched, so a missing dataset is a corrupt enumeration; map the HDF5 lookup
 /// error to a clear message rather than a bare "link not found".
-fn enum_dataset<'f>(group: &Group<'f>, field: &str) -> Result<Dataset<'f>, MatError> {
+fn enum_dataset(group: &Group, field: &str) -> Result<Dataset, MatError> {
     group.dataset(field).map_err(|e| {
         MatError::Custom(format!(
             "malformed enum instance: cannot read required dataset {field:?} ({e})"
@@ -323,7 +323,7 @@ fn enum_dataset<'f>(group: &Group<'f>, field: &str) -> Result<Dataset<'f>, MatEr
 
 /// Read an enumeration metadata field as a single `uint32` (its first element,
 /// or `0` if the dataset is empty).
-fn read_enum_scalar_u32(group: &Group<'_>, field: &str) -> Result<u32, MatError> {
+fn read_enum_scalar_u32(group: &Group, field: &str) -> Result<u32, MatError> {
     let ds = enum_dataset(group, field)?;
     Ok(ds
         .read_u32()
@@ -335,14 +335,14 @@ fn read_enum_scalar_u32(group: &Group<'_>, field: &str) -> Result<u32, MatError>
 
 /// Read an enumeration metadata field as a flat `uint32` vector. The member-name
 /// pool is a `1×N` row, so its storage order is its presentation order.
-fn read_enum_u32_vec(group: &Group<'_>, field: &str) -> Result<Vec<u32>, MatError> {
+fn read_enum_u32_vec(group: &Group, field: &str) -> Result<Vec<u32>, MatError> {
     let ds = enum_dataset(group, field)?;
     ds.read_u32().map_err(MatError::Hdf5)
 }
 
 /// Read the `ValueIndices` array as a flat `Vec<usize>` in the crate's row-major
 /// presentation order.
-fn read_enum_indices(group: &Group<'_>, depth: usize) -> Result<Vec<usize>, MatError> {
+fn read_enum_indices(group: &Group, depth: usize) -> Result<Vec<usize>, MatError> {
     let ds = enum_dataset(group, "ValueIndices")?;
     // Reject a non-`uint32` index array up front with a dtype-specific message
     // (mirrors the saveobj-payload datatype guard), so corruption surfaces
@@ -381,7 +381,7 @@ fn enum_indices_to_usize(value: &MatValue) -> Result<Vec<usize>, MatError> {
 
 /// The group's `MATLAB_class` attribute, unless it is the generic `"struct"`
 /// (an in-heap enum cell carries no real class name there).
-fn enum_class_from_attr(group: &Group<'_>) -> Option<String> {
+fn enum_class_from_attr(group: &Group) -> Option<String> {
     let attrs = group.attrs().ok()?;
     let class = mcos_reader::raw_matlab_class(&attrs)?;
     (class != "struct").then_some(class)
@@ -400,8 +400,8 @@ fn enum_class_from_attr(group: &Group<'_>) -> Option<String> {
 /// false`) is never treated this way, so ordinary `uint32` data cannot be
 /// misread as a reference.
 fn read_dataset(
-    ds: &Dataset<'_>,
-    mcos: Option<&Mcos<'_>>,
+    ds: &Dataset,
+    mcos: Option<&Mcos>,
     in_heap: bool,
     depth: usize,
 ) -> Result<MatValue, MatError> {
@@ -511,8 +511,8 @@ fn read_dataset(
 /// into a flat [`MatValue::Cell`], matching the column-vector layout the
 /// serializer writes (the deserializer flattens a cell to a sequence).
 fn read_cell(
-    ds: &Dataset<'_>,
-    mcos: Option<&Mcos<'_>>,
+    ds: &Dataset,
+    mcos: Option<&Mcos>,
     in_heap: bool,
     depth: usize,
 ) -> Result<MatValue, MatError> {
@@ -527,8 +527,8 @@ fn read_cell(
 /// Decode a dereferenced object (a `#refs#`/`#subsystem#` dataset or struct
 /// group) into a `MatValue`, dispatching on whether it is a dataset or group.
 fn read_object(
-    obj: &Object<'_>,
-    mcos: Option<&Mcos<'_>>,
+    obj: &Object,
+    mcos: Option<&Mcos>,
     in_heap: bool,
     depth: usize,
 ) -> Result<MatValue, MatError> {
@@ -546,10 +546,10 @@ fn read_object(
 /// tables — to a typed value (`datetime`, `duration`, `categorical`) or a
 /// lossless [`MatValue::Opaque`] for classes without a dedicated decoder.
 fn decode_opaque(
-    ds: &Dataset<'_>,
+    ds: &Dataset,
     attrs: &HashMap<String, AttrValue>,
     decode: i64,
-    mcos: Option<&Mcos<'_>>,
+    mcos: Option<&Mcos>,
     depth: usize,
 ) -> Result<MatValue, MatError> {
     let class = mcos_reader::raw_matlab_class(attrs).ok_or_else(|| {
@@ -591,11 +591,7 @@ fn decode_opaque(
 /// Decode one or more MCOS object ids (from an opaque parent dataset or an
 /// embedded heap reference) into a value. A single id is the object itself; a
 /// genuine object array becomes a cell of the decoded objects.
-fn decode_object_ids(
-    mcos: &Mcos<'_>,
-    object_ids: &[u32],
-    depth: usize,
-) -> Result<MatValue, MatError> {
+fn decode_object_ids(mcos: &Mcos, object_ids: &[u32], depth: usize) -> Result<MatValue, MatError> {
     let mut values = Vec::with_capacity(object_ids.len());
     for &object_id in object_ids {
         values.push(decode_opaque_object(mcos, object_id, depth)?);
@@ -610,11 +606,7 @@ fn decode_object_ids(
 /// Assemble one MCOS object's resolved properties (reading heap cells through
 /// the full read path so nested objects/cells decode too) and finish it via a
 /// typed decoder or the lossless `Opaque` fallback.
-fn decode_opaque_object(
-    mcos: &Mcos<'_>,
-    object_id: u32,
-    depth: usize,
-) -> Result<MatValue, MatError> {
+fn decode_opaque_object(mcos: &Mcos, object_id: u32, depth: usize) -> Result<MatValue, MatError> {
     if depth > MAX_NESTING_DEPTH {
         return Err(MatError::Format(FormatError::NestingDepthExceeded));
     }
@@ -740,7 +732,7 @@ fn is_complex_dtype(dtype: &DType) -> bool {
 // Numeric reading
 // ---------------------------------------------------------------------------
 
-fn read_numeric(ds: &Dataset<'_>, shape: &[u64], class: MatClass) -> Result<MatValue, MatError> {
+fn read_numeric(ds: &Dataset, shape: &[u64], class: MatClass) -> Result<MatValue, MatError> {
     let (_, _, total) = shape_decomposition(shape)?;
 
     // For a single-element dataset we emit a Scalar of the appropriate class.
@@ -823,7 +815,7 @@ fn shape_decomposition(shape: &[u64]) -> Result<(usize, usize, usize), MatError>
     })
 }
 
-fn read_all_elements(ds: &Dataset<'_>, class: MatClass) -> Result<NumVec, MatError> {
+fn read_all_elements(ds: &Dataset, class: MatClass) -> Result<NumVec, MatError> {
     Ok(match class {
         MatClass::Double => NumVec::F64(ds.read_f64().map_err(MatError::Hdf5)?),
         MatClass::Single => NumVec::F32(ds.read_f32().map_err(MatError::Hdf5)?),
@@ -843,7 +835,7 @@ fn read_all_elements(ds: &Dataset<'_>, class: MatClass) -> Result<NumVec, MatErr
     })
 }
 
-fn read_scalar(ds: &Dataset<'_>, class: MatClass) -> Result<ScalarNum, MatError> {
+fn read_scalar(ds: &Dataset, class: MatClass) -> Result<ScalarNum, MatError> {
     Ok(match class {
         MatClass::Double => ScalarNum::F64(ds.read_f64().map_err(MatError::Hdf5)?[0]),
         MatClass::Single => ScalarNum::F32(ds.read_f32().map_err(MatError::Hdf5)?[0]),
@@ -896,7 +888,7 @@ fn transpose_col_major_to_row_major(
 // Complex reading
 // ---------------------------------------------------------------------------
 
-fn read_complex(ds: &Dataset<'_>, shape: &[u64], class: MatClass) -> Result<MatValue, MatError> {
+fn read_complex(ds: &Dataset, shape: &[u64], class: MatClass) -> Result<MatValue, MatError> {
     let (rows, cols, total) = shape_decomposition(shape)?;
     let bytes = ds.read_u8().map_err(MatError::Hdf5)?;
 

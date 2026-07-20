@@ -106,8 +106,8 @@ const FIELD_TYPE_INLINE: u32 = 2;
 /// Holds the dereferenced MCOS cell array (the property-value heap) and the
 /// parsed [`FileWrapper`] metadata. Opaque parent datasets index into it by
 /// object id. Parsed once per file and shared across every opaque dataset read.
-pub(crate) struct Mcos<'f> {
-    cells: Vec<Object<'f>>,
+pub(crate) struct Mcos {
+    cells: Vec<Object>,
     wrapper: FileWrapper,
 }
 
@@ -179,10 +179,10 @@ pub(crate) enum PropValue {
     Name(String),
 }
 
-impl<'f> Mcos<'f> {
+impl Mcos {
     /// Parse the `#subsystem#/MCOS` store, or `Ok(None)` if the file has no
     /// `#subsystem#` group (a file with no opaque objects).
-    pub(crate) fn parse(file: &'f File) -> Result<Option<Self>, MatError> {
+    pub(crate) fn parse(file: &File) -> Result<Option<Self>, MatError> {
         let subsystem = match file.group("#subsystem#") {
             Ok(g) => g,
             // No subsystem group: the file holds no opaque objects.
@@ -272,7 +272,7 @@ impl<'f> Mcos<'f> {
     }
 
     /// The property-heap cell for a 0-based `field_type == 1` heap value.
-    pub(crate) fn heap_object(&self, value: u32) -> Result<&Object<'f>, MatError> {
+    pub(crate) fn heap_object(&self, value: u32) -> Result<&Object, MatError> {
         let idx = MCOS_RESERVED_CELL_PREFIX
             .checked_add(value.to_usize()?)
             .ok_or_else(|| MatError::Custom("MCOS heap index overflow".into()))?;
@@ -321,7 +321,7 @@ impl<'f> Mcos<'f> {
     /// self-describing `uint64` blob in the property heap rather than a set of
     /// named properties, so it is read directly instead of through the property
     /// tables.
-    pub(crate) fn decode_string(&self, ds: &Dataset<'_>) -> Result<MatValue, MatError> {
+    pub(crate) fn decode_string(&self, ds: &Dataset) -> Result<MatValue, MatError> {
         let metadata = ds.read_u32().map_err(MatError::Hdf5)?;
         let object_ids = parse_opaque_metadata(&metadata)?.object_ids;
 

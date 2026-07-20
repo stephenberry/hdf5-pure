@@ -14,7 +14,7 @@ fuzz_target!(|data: &[u8]| {
     }
 });
 
-fn exercise_group(file: &File, group: &Group<'_>, path: &str, depth: usize) {
+fn exercise_group(file: &File, group: &Group, path: &str, depth: usize) {
     let _ = group.attrs();
 
     if let Ok(datasets) = group.datasets() {
@@ -44,7 +44,7 @@ fn exercise_group(file: &File, group: &Group<'_>, path: &str, depth: usize) {
     }
 }
 
-fn exercise_dataset(dataset: &Dataset<'_>) {
+fn exercise_dataset(dataset: &Dataset) {
     let shape = dataset.shape();
     let dtype = dataset.dtype();
     let _ = dataset.attrs();

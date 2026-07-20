@@ -675,6 +675,11 @@ pub enum Error {
     /// A SWMR operation (e.g. [`crate::File::refresh`]) was requested on a file
     /// that was not opened for SWMR reading via `File::open_swmr`.
     SwmrUnsupported,
+    /// An operation that needs exclusive access to the open file (e.g.
+    /// [`crate::File::refresh`]) was requested while owned [`crate::Dataset`] /
+    /// [`crate::Group`] handles, or a clone of the [`crate::File`], are still
+    /// alive. Drop them and retry.
+    HandlesOutstanding,
     /// The file or dataset is not a supported target for the SWMR append writer
     /// (e.g. a userblock or non-latest-format file, or a dataset that is
     /// filtered, not rank-1 with an unlimited dimension, or not
@@ -736,6 +741,10 @@ impl fmt::Display for Error {
             Error::SwmrUnsupported => write!(
                 f,
                 "refresh requires a file opened with File::open_swmr (live handle)"
+            ),
+            Error::HandlesOutstanding => write!(
+                f,
+                "operation needs exclusive file access: drop outstanding Dataset/Group handles and File clones first"
             ),
             Error::SwmrAppendUnsupported(reason) => {
                 write!(f, "unsupported SWMR append target: {reason}")

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::Arc;
 
 use crate::attribute::{extract_attributes_full, extract_attributes_full_from_source};
 use crate::chunk_cache::{ChunkCache, ChunkCacheConfig, ChunkCacheStats};
@@ -242,7 +243,7 @@ pub fn is_hdf5_bytes(data: &[u8]) -> bool {
 }
 
 /// An open HDF5 file for reading.
-pub struct File {
+struct FileInner {
     backend: Backend,
     superblock: Superblock,
     /// Byte offset to add to all relative addresses (= original base_address).
@@ -257,7 +258,7 @@ pub struct File {
     access_options: FileAccessOptions,
 }
 
-impl File {
+impl FileInner {
     /// Open an HDF5 file from a filesystem path.
     ///
     /// Reads the file into memory once. To follow a file that a concurrent
@@ -430,7 +431,7 @@ impl File {
         handle: Option<std::fs::File>,
         access_options: FileAccessOptions,
     ) -> Self {
-        let mut file = File {
+        let mut file = FileInner {
             backend,
             superblock,
             addr_offset,
@@ -524,15 +525,6 @@ impl File {
         Err(last_err.expect("refresh retried at least once before failing"))
     }
 
-    /// Returns a handle to the root group.
-    pub fn root(&self) -> Group<'_> {
-        Group {
-            file: self,
-            // root_group_address was normalized to absolute in from_bytes()
-            address: self.superblock.root_group_address,
-        }
-    }
-
     /// Resolve a path to an object-header address, dispatching on the backend.
     fn resolve_path(&self, path: &str) -> Result<u64, Error> {
         Ok(match &self.backend {
@@ -540,51 +532,6 @@ impl File {
             Backend::Streaming(s) => {
                 group_v2::resolve_path_any_from_source(s.as_ref(), &self.superblock, path)?
             }
-        })
-    }
-
-    /// Resolve a path and return a `Dataset` handle.
-    ///
-    /// The dataset uses the file-wide chunk-cache default (configured with
-    /// [`FileAccessOptions::with_chunk_cache`]). To override the cache for this
-    /// one dataset, use [`dataset_with_options`](Self::dataset_with_options).
-    pub fn dataset(&self, path: &str) -> Result<Dataset<'_>, Error> {
-        self.dataset_with_options(path, DatasetAccessOptions::new())
-    }
-
-    /// Resolve a path and return a `Dataset` handle, applying per-dataset
-    /// [`DatasetAccessOptions`] that override file-wide access defaults.
-    ///
-    /// This is the dataset-open-with-access-property-list path (HDF5's DAPL):
-    /// the options' chunk cache corresponds to `H5Pset_chunk_cache` and takes
-    /// precedence, for this dataset only, over the `H5Pset_cache`-style
-    /// file-wide default.
-    pub fn dataset_with_options(
-        &self,
-        path: &str,
-        options: DatasetAccessOptions,
-    ) -> Result<Dataset<'_>, Error> {
-        let addr = self.resolve_path(path)?;
-        let hdr = self.parse_header(addr)?;
-        if !has_message(&hdr, MessageType::DataLayout) {
-            return Err(Error::NotADataset(path.to_string()));
-        }
-        let chunk_cache = options.resolved_chunk_cache(self.access_options.chunk_cache);
-        Ok(Dataset {
-            file: self,
-            address: addr,
-            header: hdr,
-            chunk_cache: ChunkCache::with_config(chunk_cache),
-            chunk_cache_config: chunk_cache,
-        })
-    }
-
-    /// Resolve a path and return a `Group` handle.
-    pub fn group(&self, path: &str) -> Result<Group<'_>, Error> {
-        let addr = self.resolve_path(path)?;
-        Ok(Group {
-            file: self,
-            address: addr,
         })
     }
 
@@ -711,21 +658,21 @@ impl File {
     /// MAT-file userblock is accounted for here. A null (`0`) or undefined
     /// (`HADDR_UNDEF`) address, or one whose object header is neither a dataset
     /// nor a group, yields [`FormatError::InvalidObjectReference`].
-    fn object_at_relative(&self, rel_addr: u64) -> Result<Object<'_>, Error> {
+    fn object_at_relative(file: &Arc<FileInner>, rel_addr: u64) -> Result<Object, Error> {
         // HADDR_UNDEF and the null address never name a real object. (Relative
         // address 0 is where the superblock sits, not an object header.)
         if rel_addr == u64::MAX || rel_addr == 0 {
             return Err(FormatError::InvalidObjectReference(rel_addr).into());
         }
         let abs = rel_addr
-            .checked_add(self.addr_offset)
+            .checked_add(file.addr_offset)
             .ok_or(FormatError::InvalidObjectReference(rel_addr))?;
-        let hdr = self.parse_header(abs)?;
+        let hdr = file.parse_header(abs)?;
         if has_message(&hdr, MessageType::DataLayout) {
             let chunk_cache =
-                DatasetAccessOptions::new().resolved_chunk_cache(self.access_options.chunk_cache);
+                DatasetAccessOptions::new().resolved_chunk_cache(file.access_options.chunk_cache);
             Ok(Object::Dataset(Box::new(Dataset {
-                file: self,
+                file: file.clone(),
                 address: abs,
                 header: hdr,
                 chunk_cache: ChunkCache::with_config(chunk_cache),
@@ -733,7 +680,7 @@ impl File {
             })))
         } else if is_group(&hdr) {
             Ok(Object::Group(Group {
-                file: self,
+                file: file.clone(),
                 address: abs,
             }))
         } else {
@@ -866,12 +813,248 @@ impl File {
     }
 }
 
-impl std::fmt::Debug for File {
+impl std::fmt::Debug for FileInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("File")
             .field("size", &self.source().len())
             .field("superblock_version", &self.superblock.version)
             .finish()
+    }
+}
+
+/// An open HDF5 file.
+///
+/// A `File` is an owned, cheaply cloneable handle to an open file: cloning it (or
+/// deriving a [`Dataset`]/[`Group`] from it) shares one underlying open file
+/// rather than re-reading it. Object handles returned by [`dataset`](Self::dataset),
+/// [`group`](Self::group), and [`root`](Self::root) are **owned** — they keep the
+/// file open for as long as they live and carry no borrow of the `File`, so they
+/// can be stored in a struct, cached, and moved across threads.
+#[derive(Clone)]
+pub struct File {
+    inner: Arc<FileInner>,
+}
+
+impl std::fmt::Debug for File {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&*self.inner, f)
+    }
+}
+
+impl File {
+    /// Open an HDF5 file from a filesystem path.
+    ///
+    /// Reads the file into memory once. To follow a file that a concurrent
+    /// single writer is appending to (SWMR), use [`File::open_swmr`] instead.
+    /// To read a file larger than memory (e.g. on a 32-bit host) without
+    /// buffering it, use [`File::open_streaming`].
+    pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
+        Ok(File {
+            inner: Arc::new(FileInner::open(path)?),
+        })
+    }
+
+    /// Open an HDF5 file from a filesystem path with explicit access options.
+    pub fn open_with_options<P: AsRef<std::path::Path>>(
+        path: P,
+        options: FileAccessOptions,
+    ) -> Result<Self, Error> {
+        Ok(File {
+            inner: Arc::new(FileInner::open_with_options(path, options)?),
+        })
+    }
+
+    /// Open an HDF5 file for **streaming** reads, fetching regions on demand from
+    /// the file instead of buffering it whole.
+    ///
+    /// This lets a host read a file larger than its address space. Metadata and
+    /// dataset chunks are read through a `ReadSeekSource`, so peak memory stays
+    /// close to one chunk plus the metadata being parsed. Attribute reading and
+    /// v1 symbol-table groups on the resolved path are not yet supported on this
+    /// backend.
+    pub fn open_streaming<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
+        Ok(File {
+            inner: Arc::new(FileInner::open_streaming(path)?),
+        })
+    }
+
+    /// Open an HDF5 file for streaming reads with explicit access options.
+    pub fn open_streaming_with_options<P: AsRef<std::path::Path>>(
+        path: P,
+        options: FileAccessOptions,
+    ) -> Result<Self, Error> {
+        Ok(File {
+            inner: Arc::new(FileInner::open_streaming_with_options(path, options)?),
+        })
+    }
+
+    /// Open an HDF5 file for SWMR (single-writer/multiple-reader) reading.
+    ///
+    /// Like [`File::open`], but retains a live handle to the file so that
+    /// [`File::refresh`] can re-read data appended by a concurrent writer.
+    pub fn open_swmr<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
+        Ok(File {
+            inner: Arc::new(FileInner::open_swmr(path)?),
+        })
+    }
+
+    /// Open an HDF5 file for SWMR reading with explicit access options.
+    pub fn open_swmr_with_options<P: AsRef<std::path::Path>>(
+        path: P,
+        options: FileAccessOptions,
+    ) -> Result<Self, Error> {
+        Ok(File {
+            inner: Arc::new(FileInner::open_swmr_with_options(path, options)?),
+        })
+    }
+
+    /// Open an HDF5 file from an in-memory byte vector.
+    pub fn from_bytes(data: Vec<u8>) -> Result<Self, Error> {
+        Ok(File {
+            inner: Arc::new(FileInner::from_bytes(data)?),
+        })
+    }
+
+    /// Open an HDF5 file from an in-memory byte vector with explicit access options.
+    pub fn from_bytes_with_options(
+        data: Vec<u8>,
+        options: FileAccessOptions,
+    ) -> Result<Self, Error> {
+        Ok(File {
+            inner: Arc::new(FileInner::from_bytes_with_options(data, options)?),
+        })
+    }
+
+    /// Returns an owned handle to the root group.
+    pub fn root(&self) -> Group {
+        Group {
+            // root_group_address was normalized to absolute in from_bytes()
+            address: self.inner.superblock.root_group_address,
+            file: self.inner.clone(),
+        }
+    }
+
+    /// Resolve a path and return an owned [`Dataset`] handle.
+    ///
+    /// The dataset uses the file-wide chunk-cache default (configured with
+    /// [`FileAccessOptions::with_chunk_cache`]). To override the cache for this
+    /// one dataset, use [`dataset_with_options`](Self::dataset_with_options).
+    pub fn dataset(&self, path: &str) -> Result<Dataset, Error> {
+        self.dataset_with_options(path, DatasetAccessOptions::new())
+    }
+
+    /// Resolve a path and return an owned [`Dataset`] handle, applying per-dataset
+    /// [`DatasetAccessOptions`] that override file-wide access defaults.
+    ///
+    /// This is the dataset-open-with-access-property-list path (HDF5's DAPL):
+    /// the options' chunk cache corresponds to `H5Pset_chunk_cache` and takes
+    /// precedence, for this dataset only, over the `H5Pset_cache`-style
+    /// file-wide default.
+    pub fn dataset_with_options(
+        &self,
+        path: &str,
+        options: DatasetAccessOptions,
+    ) -> Result<Dataset, Error> {
+        let addr = self.inner.resolve_path(path)?;
+        let hdr = self.inner.parse_header(addr)?;
+        if !has_message(&hdr, MessageType::DataLayout) {
+            return Err(Error::NotADataset(path.to_string()));
+        }
+        let chunk_cache = options.resolved_chunk_cache(self.inner.access_options.chunk_cache);
+        Ok(Dataset {
+            file: self.inner.clone(),
+            address: addr,
+            header: hdr,
+            chunk_cache: ChunkCache::with_config(chunk_cache),
+            chunk_cache_config: chunk_cache,
+        })
+    }
+
+    /// Resolve a path and return an owned [`Group`] handle.
+    pub fn group(&self, path: &str) -> Result<Group, Error> {
+        let addr = self.inner.resolve_path(path)?;
+        Ok(Group {
+            file: self.inner.clone(),
+            address: addr,
+        })
+    }
+
+    /// Re-read the file from disk to pick up data appended by a concurrent
+    /// writer, then re-parse the superblock.
+    ///
+    /// This is the SWMR reader's refresh primitive. Returns
+    /// [`Error::SwmrUnsupported`] if the file was not opened with
+    /// [`File::open_swmr`], and [`Error::HandlesOutstanding`] if any owned
+    /// [`Dataset`]/[`Group`] handle (or a clone of this `File`) is still alive —
+    /// drop them before refreshing, then re-fetch them afterward, since they
+    /// observe the new bytes only when re-derived from the refreshed file.
+    pub fn refresh(&mut self) -> Result<(), Error> {
+        let inner = Arc::get_mut(&mut self.inner).ok_or(Error::HandlesOutstanding)?;
+        inner.refresh()
+    }
+
+    // --- delegating value getters (forward to the shared inner state) ---
+
+    /// Returns the raw file bytes for an in-memory file, or an empty slice for a
+    /// streaming file (which has no whole-file buffer).
+    pub fn as_bytes(&self) -> &[u8] {
+        self.inner.as_bytes()
+    }
+
+    /// Return the access options used when opening this file.
+    pub fn access_options(&self) -> FileAccessOptions {
+        self.inner.access_options()
+    }
+
+    /// Returns a reference to the parsed superblock.
+    pub fn superblock(&self) -> &Superblock {
+        self.inner.superblock()
+    }
+
+    /// The file-space management strategy this file records in its superblock
+    /// extension, or `None` if it records none.
+    pub fn file_space_strategy(&self) -> Option<FileSpaceStrategy> {
+        self.inner.file_space_strategy()
+    }
+
+    /// The full [`FileSpaceInfo`] recorded in this file's superblock extension,
+    /// if present and readable.
+    pub fn file_space_info(&self) -> Option<&FileSpaceInfo> {
+        self.inner.file_space_info()
+    }
+
+    /// The free regions a file persists on disk in its free-space managers, as
+    /// `(address, length)` pairs sorted by address.
+    pub fn persisted_free_space(&self) -> Vec<(u64, u64)> {
+        self.inner.persisted_free_space()
+    }
+
+    /// The size of the underlying file in bytes (the HDF5 `H5Fget_filesize`).
+    pub fn file_size(&self) -> u64 {
+        self.inner.file_size()
+    }
+
+    /// The minimum library version required to read this file, derived from its
+    /// superblock version (the *low bound* of HDF5's `H5Fget_libver_bounds`).
+    pub fn libver_bound(&self) -> LibVer {
+        self.inner.libver_bound()
+    }
+
+    /// A `FileSource` view over the backend, for the streaming-capable paths.
+    pub(crate) fn source(&self) -> SourceView<'_> {
+        self.inner.source()
+    }
+
+    /// The whole-file byte image when this file is buffered in memory; `None`
+    /// for a streaming file. Used by cross-file object copy.
+    pub(crate) fn in_memory_image(&self) -> Option<&[u8]> {
+        self.inner.in_memory_image()
+    }
+
+    /// The base address (superblock base address) added to every stored relative
+    /// address. Zero for a file with no userblock.
+    pub(crate) fn base_address(&self) -> u64 {
+        self.inner.base_address()
     }
 }
 
@@ -893,14 +1076,14 @@ impl std::fmt::Debug for File {
 /// keeps `Object` (and a `Vec<Object>`) compact without a size disparity. The
 /// `Box` derefs transparently, so `&obj_dataset` is usable wherever a
 /// `&Dataset` is expected.
-pub enum Object<'f> {
+pub enum Object {
     /// The reference points at a group's object header.
-    Group(Group<'f>),
+    Group(Group),
     /// The reference points at a dataset's object header.
-    Dataset(Box<Dataset<'f>>),
+    Dataset(Box<Dataset>),
 }
 
-impl std::fmt::Debug for Object<'_> {
+impl std::fmt::Debug for Object {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Object::Group(_) => f.write_str("Object::Group"),
@@ -913,13 +1096,13 @@ impl std::fmt::Debug for Object<'_> {
 // Group handle
 // ---------------------------------------------------------------------------
 
-/// A lightweight handle to an HDF5 group.
-pub struct Group<'f> {
-    file: &'f File,
+/// An owned handle to an HDF5 group.
+pub struct Group {
+    file: Arc<FileInner>,
     address: u64,
 }
 
-impl<'f> Group<'f> {
+impl Group {
     /// Address of this group's object header (base-adjusted, file-absolute).
     /// Used to resolve object references that point at this group.
     pub(crate) fn header_address(&self) -> u64 {
@@ -971,7 +1154,7 @@ impl<'f> Group<'f> {
     /// The dataset uses the file-wide chunk-cache default. To override the cache
     /// for this one dataset, use
     /// [`dataset_with_options`](Self::dataset_with_options).
-    pub fn dataset(&self, name: &str) -> Result<Dataset<'f>, Error> {
+    pub fn dataset(&self, name: &str) -> Result<Dataset, Error> {
         self.dataset_with_options(name, DatasetAccessOptions::new())
     }
 
@@ -982,7 +1165,7 @@ impl<'f> Group<'f> {
         &self,
         name: &str,
         options: DatasetAccessOptions,
-    ) -> Result<Dataset<'f>, Error> {
+    ) -> Result<Dataset, Error> {
         let entries = self.children()?;
         let entry = entries
             .iter()
@@ -994,7 +1177,7 @@ impl<'f> Group<'f> {
         }
         let chunk_cache = options.resolved_chunk_cache(self.file.access_options.chunk_cache);
         Ok(Dataset {
-            file: self.file,
+            file: self.file.clone(),
             address: entry.object_header_address,
             header: hdr,
             chunk_cache: ChunkCache::with_config(chunk_cache),
@@ -1003,14 +1186,14 @@ impl<'f> Group<'f> {
     }
 
     /// Get a subgroup within this group by name.
-    pub fn group(&self, name: &str) -> Result<Group<'f>, Error> {
+    pub fn group(&self, name: &str) -> Result<Group, Error> {
         let entries = self.children()?;
         let entry = entries
             .iter()
             .find(|e| e.name == name)
             .ok_or_else(|| Error::Format(FormatError::PathNotFound(name.to_string())))?;
         Ok(Group {
-            file: self.file,
+            file: self.file.clone(),
             address: entry.object_header_address,
         })
     }
@@ -1025,9 +1208,9 @@ impl<'f> Group<'f> {
 // Dataset handle
 // ---------------------------------------------------------------------------
 
-/// A lightweight handle to an HDF5 dataset.
-pub struct Dataset<'f> {
-    file: &'f File,
+/// An owned handle to an HDF5 dataset.
+pub struct Dataset {
+    file: Arc<FileInner>,
     /// Address of this dataset's object header (base-adjusted, file-absolute).
     /// Used to resolve object references that point at this dataset.
     address: u64,
@@ -1040,7 +1223,7 @@ pub struct Dataset<'f> {
     chunk_cache_config: ChunkCacheConfig,
 }
 
-impl<'f> std::fmt::Debug for Dataset<'f> {
+impl std::fmt::Debug for Dataset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Dataset")
             .field("messages", &self.header.messages.len())
@@ -1048,7 +1231,7 @@ impl<'f> std::fmt::Debug for Dataset<'f> {
     }
 }
 
-impl<'f> Dataset<'f> {
+impl Dataset {
     /// Address of this dataset's object header (base-adjusted, file-absolute).
     /// Used to resolve object references that point at this dataset.
     pub(crate) fn header_address(&self) -> u64 {
@@ -1734,7 +1917,7 @@ impl<'f> Dataset<'f> {
     ///   object reference.
     /// - [`FormatError::InvalidObjectReference`] if an element is a null or
     ///   undefined reference, or does not point at a group or dataset.
-    pub fn dereference(&self) -> Result<Vec<Object<'f>>, Error> {
+    pub fn dereference(&self) -> Result<Vec<Object>, Error> {
         let dt = self.datatype()?;
         if !matches!(
             dt,
@@ -1773,7 +1956,7 @@ impl<'f> Dataset<'f> {
         let mut out = Vec::with_capacity(raw.len() / elem_size);
         for chunk in raw.chunks_exact(elem_size) {
             let addr = u64::from_le_bytes(chunk[..8].try_into().expect("chunk has >= 8 bytes"));
-            out.push(self.file.object_at_relative(addr)?);
+            out.push(FileInner::object_at_relative(&self.file, addr)?);
         }
         Ok(out)
     }

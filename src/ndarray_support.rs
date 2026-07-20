@@ -44,7 +44,7 @@ use crate::error::Error;
 use crate::reader::Dataset;
 use crate::type_builders::DatasetBuilder;
 
-impl Dataset<'_> {
+impl Dataset {
     /// Read the dataset into a statically-ranked [`ndarray::Array`].
     ///
     /// The dimensionality `D` (e.g. [`ndarray::Ix2`](tyalias@ndarray::Ix2)) is usually inferred from

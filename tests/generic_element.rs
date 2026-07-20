@@ -129,6 +129,6 @@ fn store_group<T: H5Element>(g: &mut hdf5_pure::GroupBuilder, name: &str, values
 /// `_ = Dataset::read` keeps the import used even if the inherent method is
 /// renamed; serves as a compile-time signature check.
 #[allow(dead_code)]
-fn signature_check(ds: &Dataset<'_>) -> Result<Vec<u8>, Error> {
+fn signature_check(ds: &Dataset) -> Result<Vec<u8>, Error> {
     ds.read::<u8>()
 }

@@ -182,7 +182,7 @@ proptest! {
 /// the test; the goal here is "parsing primitives never panic", not exhaustive
 /// traversal.
 fn exercise(file: &File) {
-    let root: Group<'_> = file.root();
+    let root: Group = file.root();
     if let Ok(names) = root.datasets() {
         for name in names.iter().take(16) {
             if let Ok(ds) = root.dataset(name) {
