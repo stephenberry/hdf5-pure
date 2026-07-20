@@ -269,6 +269,7 @@ pub use writer::FileBuilder;
 pub use swmr_writer::SwmrWriter;
 
 #[cfg(feature = "std")]
+#[allow(deprecated)] // re-exporting the deprecated shim; users still see the deprecation
 pub use append_writer::AppendWriter;
 
 #[cfg(feature = "std")]

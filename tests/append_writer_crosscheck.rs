@@ -9,6 +9,7 @@
 //! filter mask that in-place appends must leave untouched. Because `AppendWriter`
 //! mutates the index in place (rather than rebuilding it), this also exercises
 //! byte-for-byte-compatible incremental Extensible-Array growth.
+#![allow(deprecated)] // AppendWriter is deprecated; this interop test still covers the shim
 
 use hdf5::Extent;
 use hdf5::file::LibraryVersion;

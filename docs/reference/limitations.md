@@ -89,4 +89,4 @@ Virtual datasets are also refused by `repack` (it cannot relocate data living ou
 |---|---|
 | Append to **multi-dimensional** and **filtered** datasets | [#110](https://github.com/stephenberry/hdf5-pure/issues/110) |
 
-This gap is specific to SWMR (concurrent-reader) append. Appending to a **filtered** 1-D unlimited dataset without concurrent readers is already supported via [`EditSession::append_dataset`](../guide/editing.md#appending-to-an-unlimited-dataset) (any length) and [`AppendWriter`](../guide/editing.md#streaming-appends-with-appendwriter) (whole chunks).
+This gap is specific to SWMR (concurrent-reader) append. Appending to a **filtered** 1-D unlimited dataset without concurrent readers is already supported via [`EditSession::append_dataset`](../guide/editing.md#appending-to-an-unlimited-dataset) (any length) and [streaming `Dataset::append`](../guide/editing.md#streaming-appends) (whole chunks).

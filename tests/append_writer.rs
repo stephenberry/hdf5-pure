@@ -3,6 +3,7 @@
 //! unfiltered, chunk-aligned and not, across one or many calls and sessions —
 //! read back with this crate. C-library interop lives in
 //! `append_writer_crosscheck.rs`.
+#![allow(deprecated)] // AppendWriter is deprecated; these tests still cover the shim + shared engine
 
 use hdf5_pure::{AppendWriter, Error, File, FileBuilder, ScaleOffset};
 use tempfile::tempdir;

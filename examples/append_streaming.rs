@@ -1,11 +1,12 @@
-//! Streaming in-place appends with `AppendWriter` — open the file once and
-//! append many times at amortized `O(1)` index cost.
+//! Streaming in-place appends through an owned handle — open the file once with
+//! [`File::open_rw`] and append many times at amortized `O(1)` index cost.
 //!
-//! `AppendWriter` is the throughput-oriented append path: it keeps the file open
-//! across appends and grows the Extensible-Array index in place, so it never
-//! re-reads the file or rebuilds the index the way `EditSession::append_dataset`
+//! `File::open_rw` opens an existing file for reading and writing; each
+//! `Dataset::append` grows the dataset's Extensible-Array index *in place*, so it
+//! never re-reads the file or rebuilds the index the way `EditSession::append_dataset`
 //! does. Every append is crash-atomic (the dataspace dimension is published
-//! last), and the result reads back in the reference C library and h5py.
+//! last), and the result reads back in the reference C library and h5py. This is
+//! the owned-handle replacement for the deprecated `AppendWriter`.
 //!
 //! An unfiltered dataset (this example) accepts **any-length** appends; a
 //! filtered dataset must be appended in whole chunks (see the guide).
@@ -13,10 +14,10 @@
 //! Run with:
 //!
 //! ```bash
-//! cargo run --example append_writer
+//! cargo run --example append_streaming
 //! ```
 
-use hdf5_pure::{AppendWriter, File, FileBuilder};
+use hdf5_pure::{File, FileBuilder};
 
 fn main() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -36,21 +37,22 @@ fn main() {
         .with_chunks(&[4]);
     builder.write(&path).expect("write initial file");
 
-    // ---- Stream appends through a single open writer --------------------
+    // ---- Stream appends through one open, read-write file ---------------
     // The dataset starts at length 6 with a chunk length of 4, so its trailing
     // chunk is partial (2 of 4). Each append below is an arbitrary length: the
     // partial chunk is rewritten, its index element (a single chunk address) is
     // repointed with one atomic write, then any further whole chunks are
-    // inserted. The writer holds an exclusive lock for its lifetime.
+    // inserted. `File::open_rw` holds an exclusive lock for the file's lifetime.
     {
-        let mut writer = AppendWriter::open(&path).expect("open for appending");
-        writer.append_i32("samples", &[6, 7, 8]).expect("append 1"); // -> 9
-        writer.append_i32("samples", &[9, 10]).expect("append 2"); // -> 11
-        writer
-            .append_i32("samples", &(11..20).collect::<Vec<_>>())
+        let file = File::open_rw(&path).expect("open for appending");
+        let mut samples = file.dataset("samples").expect("open dataset handle");
+        samples.append(&[6i32, 7, 8]).expect("append 1"); // -> 9
+        samples.append(&[9i32, 10]).expect("append 2"); // -> 11
+        samples
+            .append(&(11..20).collect::<Vec<i32>>())
             .expect("append 3"); // -> 20
-        writer.close().expect("flush and release the lock");
-    } // the lock is released here; drop() would release it too
+        file.close().expect("flush and release the lock");
+    } // the lock is released here; dropping the file would release it too
 
     // ---- Verify ---------------------------------------------------------
     let file = File::open(&path).expect("reopen");
