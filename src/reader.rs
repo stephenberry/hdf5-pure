@@ -2,9 +2,10 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::edit::EditSession;
+use crate::edit::{AppendBuilder, EditSession, SpaceAccounting};
 use crate::element::H5Element;
 use crate::type_builders::DatasetBuilder;
 
@@ -17,6 +18,7 @@ use crate::data_read;
 use crate::dataspace::Dataspace;
 use crate::datatype::{Datatype, ReferenceType};
 use crate::error::{Error, FormatError};
+use crate::file_lock::FileLocking;
 use crate::file_space_info::{FileSpaceInfo, FileSpaceStrategy};
 use crate::filter_pipeline::FilterPipeline;
 use crate::free_space_manager;
@@ -268,6 +270,11 @@ struct FileInner {
     /// rather than failing the open.
     file_space_info: Option<FileSpaceInfo>,
     access_options: FileAccessOptions,
+    /// Set by [`File::close`] to seal a read-write file: after it, a write
+    /// through any surviving [`Dataset`]/[`Group`] handle or [`File`] clone
+    /// returns [`Error::FileClosed`]. Reads still work. Only ever set on a
+    /// `Backend::Mirror` file.
+    closed: AtomicBool,
 }
 
 impl FileInner {
@@ -388,11 +395,22 @@ impl FileInner {
         ))
     }
 
-    /// Open an existing HDF5 file for reading **and** in-place appends, taking an
-    /// exclusive OS file lock held for the file's life. Requires a latest-format
-    /// (version-2/3 superblock) file with no userblock.
+    /// Open an existing HDF5 file for reading **and** in-place editing, taking an
+    /// exclusive OS file lock held for the file's life.
     fn open_rw<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
-        let session = EditSession::open(path)?;
+        Self::from_rw_session(EditSession::open(path)?)
+    }
+
+    /// Like [`open_rw`](Self::open_rw), but with an explicit file-locking policy.
+    fn open_rw_with_locking<P: AsRef<std::path::Path>>(
+        path: P,
+        locking: FileLocking,
+    ) -> Result<Self, Error> {
+        Self::from_rw_session(EditSession::open_with_locking(path, locking)?)
+    }
+
+    /// Wrap an opened [`EditSession`] as a read-write [`Backend::Mirror`] file.
+    fn from_rw_session(session: EditSession) -> Result<Self, Error> {
         let (superblock, addr_offset) = Self::parse_superblock(session.mirror_bytes())?;
         Ok(Self::from_parts(
             Backend::Mirror(Box::new(Mutex::new(session))),
@@ -469,6 +487,7 @@ impl FileInner {
             handle,
             file_space_info: None,
             access_options,
+            closed: AtomicBool::new(false),
         };
         file.file_space_info = file.read_file_space_info();
         file
@@ -574,6 +593,20 @@ impl FileInner {
                 group_v2::resolve_path_any(data, &sb, path)?
             }
         })
+    }
+
+    /// The current root-group address (base-adjusted, absolute). For a read-write
+    /// [`Backend::Mirror`] file a prior relocating commit can have moved the
+    /// root, so re-parse the live mirror's superblock; other backends use the
+    /// cached superblock. Falls back to the cached address if the re-parse fails.
+    fn mirror_root_address(&self) -> u64 {
+        if let Backend::Mirror(m) = &self.backend {
+            let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Ok((sb, _base)) = Self::parse_superblock(core.mirror_bytes()) {
+                return sb.root_group_address;
+            }
+        }
+        self.superblock.root_group_address
     }
 
     /// Returns the raw file bytes for an in-memory file, or an empty slice for a
@@ -1019,18 +1052,44 @@ impl File {
         })
     }
 
-    /// Open an existing HDF5 file for reading **and** in-place appends.
+    /// Open an existing HDF5 file for reading **and** in-place editing.
     ///
     /// Unlike [`open`](Self::open) (read-only, buffered), this takes an exclusive
-    /// OS file lock held for the file's life and lets owned [`Dataset`] handles
-    /// grow a chunked, unlimited, Extensible-Array-indexed dataset in place via
-    /// [`Dataset::append`], reading the appended data back through the same
-    /// handle. Requires a latest-format (version-2/3 superblock) file with no
-    /// userblock; other files are refused with
+    /// OS file lock held for the file's life and lets owned handles modify the
+    /// file — immediate [`Dataset::append`]s, plus [`Dataset::write`]/`set_attr`,
+    /// [`Group::create_dataset`]/`create_group`/`delete`/`set_attr`, and
+    /// [`copy`](Self::copy)/[`copy_from`](Self::copy_from) staged until
+    /// [`commit`](Self::commit). The file must use 8-byte offsets and lengths and
+    /// keep its superblock at its base address (a canonical userblock, as in a
+    /// MATLAB `.mat` file, is supported); anything else is refused with
     /// [`Error::EditUnsupported`](crate::Error::EditUnsupported).
+    ///
+    /// The fast immediate [`Dataset::append`] additionally requires a
+    /// latest-format (version-2/3) file with no userblock and an
+    /// Extensible-Array-indexed dataset; [`Dataset::append_staged`] covers the
+    /// general case.
     pub fn open_rw<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
         Ok(File {
             inner: Arc::new(FileInner::open_rw(path)?),
+        })
+    }
+
+    /// Open an existing file for reading and in-place editing with an explicit
+    /// file-locking policy — the owned-handle counterpart of HDF5's
+    /// `H5Pset_file_locking`.
+    ///
+    /// [`open_rw`](Self::open_rw) takes an exclusive OS lock for the file's life;
+    /// use this with [`FileLocking::Disabled`](crate::FileLocking) only when an
+    /// external mechanism already guarantees single-writer access, or on a
+    /// filesystem (such as some network mounts) where the OS lock is
+    /// unavailable. Setting `HDF5_USE_FILE_LOCKING` in the environment overrides
+    /// the requested policy, as in the C library.
+    pub fn open_rw_with_locking<P: AsRef<std::path::Path>>(
+        path: P,
+        locking: FileLocking,
+    ) -> Result<Self, Error> {
+        Ok(File {
+            inner: Arc::new(FileInner::open_rw_with_locking(path, locking)?),
         })
     }
 
@@ -1056,13 +1115,7 @@ impl File {
     /// [`Error::ReadOnly`](crate::Error::ReadOnly). A commit that relocates
     /// objects invalidates outstanding handles — re-fetch any you keep using.
     pub fn commit(&self) -> Result<(), Error> {
-        match &self.inner.backend {
-            Backend::Mirror(m) => {
-                let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                session.commit()
-            }
-            _ => Err(Error::ReadOnly),
-        }
+        self.with_mirror_session(|session| session.commit())
     }
 
     /// Copy the object at `src` to `dst` within this file (the in-file
@@ -1071,30 +1124,98 @@ impl File {
     /// Requires a read-write file ([`File::open_rw`]); a read-only file returns
     /// [`Error::ReadOnly`](crate::Error::ReadOnly).
     pub fn copy(&self, src: &str, dst: &str) -> Result<(), Error> {
+        self.with_mirror_session(|session| {
+            session.copy(&normalize_path(src), &normalize_path(dst));
+            Ok(())
+        })
+    }
+
+    /// Copy the object at `src` in `source` — a separate, buffered read-only
+    /// file — into this file at `dst`: the cross-file `H5Ocopy`, staged until
+    /// [`commit`](Self::commit).
+    ///
+    /// `source` must be a buffered file ([`File::open`] or [`File::from_bytes`],
+    /// not [`File::open_streaming`]) that uses 8-byte offsets and has no
+    /// userblock; anything else is refused with
+    /// [`Error::EditUnsupported`](crate::Error::EditUnsupported). The source
+    /// subtree is read and validated eagerly, so `source` need not outlive this
+    /// call. Requires a read-write destination ([`File::open_rw`]); a read-only
+    /// one returns [`Error::ReadOnly`](crate::Error::ReadOnly).
+    pub fn copy_from(&self, source: &File, src: &str, dst: &str) -> Result<(), Error> {
+        self.with_mirror_session(|session| session.copy_from(source, src, dst))
+    }
+
+    /// Report whether this file has structural edits staged but not yet applied
+    /// by [`commit`](Self::commit) — [`Dataset::write`]/`set_attr`/`remove_attr`,
+    /// [`Dataset::append_staged`], [`Group::create_group`]/`create_dataset`/
+    /// `delete`/`set_attr`/`remove_attr`, and [`copy`](Self::copy)/
+    /// [`copy_from`](Self::copy_from). Immediate [`Dataset::append`]s are never
+    /// staged and do not count. Always `false` for a read-only file.
+    pub fn has_staged_edits(&self) -> bool {
         match &self.inner.backend {
             Backend::Mirror(m) => {
-                let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                session.copy(&normalize_path(src), &normalize_path(dst));
-                Ok(())
+                let session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                session.has_staged_edits()
+            }
+            _ => false,
+        }
+    }
+
+    /// Report this read-write file's live space usage as a [`SpaceAccounting`] —
+    /// the current logical size, total reusable free bytes, and reusable free
+    /// regions. It reflects committed state plus immediate in-place appends, not
+    /// edits still staged for [`commit`](Self::commit).
+    ///
+    /// Requires a read-write file ([`File::open_rw`]); a read-only file returns
+    /// [`Error::ReadOnly`](crate::Error::ReadOnly).
+    pub fn space_accounting(&self) -> Result<SpaceAccounting, Error> {
+        match &self.inner.backend {
+            Backend::Mirror(m) => {
+                let session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                Ok(session.space_accounting())
             }
             _ => Err(Error::ReadOnly),
         }
     }
 
-    /// Commit any staged edits and drop this file handle. The exclusive OS lock
-    /// is released once the last handle derived from this file is also dropped.
+    /// Commit any staged edits and seal this file. The exclusive OS lock is
+    /// released once the last handle derived from this file is also dropped.
+    ///
+    /// After `close`, a write through any surviving [`Dataset`]/[`Group`] handle
+    /// or [`File`] clone returns [`Error::FileClosed`](crate::Error::FileClosed);
+    /// reads still work.
     pub fn close(self) -> Result<(), Error> {
         if matches!(self.inner.backend, Backend::Mirror(_)) {
             self.commit()?;
+            self.inner.closed.store(true, Ordering::Release);
         }
         Ok(())
+    }
+
+    /// Run `f` with the locked write session of a read-write file. Returns
+    /// [`Error::ReadOnly`](crate::Error::ReadOnly) for a read-only file and
+    /// [`Error::FileClosed`](crate::Error::FileClosed) once the file has been
+    /// sealed by [`close`](Self::close).
+    fn with_mirror_session<R>(
+        &self,
+        f: impl FnOnce(&mut EditSession) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        let Backend::Mirror(m) = &self.inner.backend else {
+            return Err(Error::ReadOnly);
+        };
+        if self.inner.closed.load(Ordering::Acquire) {
+            return Err(Error::FileClosed);
+        }
+        let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&mut session)
     }
 
     /// Returns an owned handle to the root group.
     pub fn root(&self) -> Group {
         Group {
-            // root_group_address was normalized to absolute in from_bytes()
-            address: self.inner.superblock.root_group_address,
+            // A relocating commit on a read-write file can move the root, so
+            // resolve it from the live mirror rather than the cached superblock.
+            address: self.inner.mirror_root_address(),
             file: self.inner.clone(),
             path: Some(String::new()),
         }
@@ -1422,6 +1543,30 @@ impl Group {
         })
     }
 
+    /// Add or update a compact attribute on this group, staged until
+    /// [`File::commit`]. Use [`remove_attr`](Self::remove_attr) to remove one.
+    /// The [`root`](File::root) group's attributes are edited the same way.
+    ///
+    /// Requires a read-write file ([`File::open_rw`]), else
+    /// [`Error::ReadOnly`](crate::Error::ReadOnly). An attribute set too large
+    /// for compact storage, or a group using dense (fractal-heap) attribute
+    /// storage, is refused on [`File::commit`].
+    pub fn set_attr(&self, name: &str, value: AttrValue) -> Result<(), Error> {
+        self.with_own_session(|session, path| {
+            session.set_group_attr(path, name, value);
+            Ok(())
+        })
+    }
+
+    /// Remove a compact attribute from this group, staged until [`File::commit`].
+    /// See [`set_attr`](Self::set_attr) for the file-mode rules.
+    pub fn remove_attr(&self, name: &str) -> Result<(), Error> {
+        self.with_own_session(|session, path| {
+            session.remove_group_attr(path, name);
+            Ok(())
+        })
+    }
+
     /// Run `f` with the writable session and the root-relative path of child
     /// `name`. Returns [`Error::ReadOnly`](crate::Error::ReadOnly) if the file is
     /// read-only or this group has no resolvable path.
@@ -1433,9 +1578,32 @@ impl Group {
         let Backend::Mirror(m) = &self.file.backend else {
             return Err(Error::ReadOnly);
         };
+        if self.file.closed.load(Ordering::Acquire) {
+            return Err(Error::FileClosed);
+        }
         let child = self.child_path(name).ok_or(Error::ReadOnly)?;
         let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         f(&mut session, &child)
+    }
+
+    /// Run `f` with the writable session and this group's *own* root-relative
+    /// path (for attribute edits, which act on the group itself rather than a
+    /// child). Returns [`Error::ReadOnly`](crate::Error::ReadOnly) if the file is
+    /// read-only or this group has no resolvable path, and
+    /// [`Error::FileClosed`](crate::Error::FileClosed) once the file is sealed.
+    fn with_own_session<R>(
+        &self,
+        f: impl FnOnce(&mut EditSession, &str) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        let Backend::Mirror(m) = &self.file.backend else {
+            return Err(Error::ReadOnly);
+        };
+        if self.file.closed.load(Ordering::Acquire) {
+            return Err(Error::FileClosed);
+        }
+        let path = self.path.clone().ok_or(Error::ReadOnly)?;
+        let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&mut session, &path)
     }
 
     fn children(&self) -> Result<Vec<GroupEntry>, Error> {
@@ -1519,6 +1687,30 @@ impl Dataset {
         })
     }
 
+    /// Stage an append to this dataset applied on [`File::commit`] — the staged,
+    /// index-rebuilding counterpart of the immediate [`append`](Self::append).
+    ///
+    /// Unlike [`append`](Self::append) (immediate, amortized `O(1)`,
+    /// Extensible-Array only, unfiltered any-length / filtered whole-chunk), this
+    /// rebuilds the chunk index on commit and so also grows **filtered** datasets
+    /// by any length (a trailing partial chunk is rewritten) and datasets whose
+    /// Extensible-Array index is not yet allocated. Configure the appended
+    /// elements through `build` on the [`AppendBuilder`]; repeated calls within
+    /// the builder concatenate in order. The dataset must be chunked, unlimited
+    /// along axis 0, Extensible-Array indexed, rank 1, use a re-encodable filter
+    /// pipeline, and have a single hard link, otherwise
+    /// [`Error::AppendUnsupported`](crate::Error::AppendUnsupported) is returned
+    /// on [`File::commit`].
+    ///
+    /// The file must have been opened with [`File::open_rw`], else
+    /// [`Error::ReadOnly`](crate::Error::ReadOnly).
+    pub fn append_staged(&mut self, build: impl FnOnce(&mut AppendBuilder)) -> Result<(), Error> {
+        self.with_session_mut(|session, path| {
+            build(session.append_dataset(path));
+            Ok(())
+        })
+    }
+
     /// Add or update a compact attribute on this dataset, staged until
     /// [`File::commit`]. Use [`remove_attr`](Self::remove_attr) to remove one.
     ///
@@ -1552,6 +1744,9 @@ impl Dataset {
         let Backend::Mirror(m) = &self.file.backend else {
             return Err(Error::ReadOnly);
         };
+        if self.file.closed.load(Ordering::Acquire) {
+            return Err(Error::FileClosed);
+        }
         let path = self.path.clone().ok_or(Error::ReadOnly)?;
         let out = {
             let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);

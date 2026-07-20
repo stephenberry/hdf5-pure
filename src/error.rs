@@ -683,6 +683,11 @@ pub enum Error {
     /// A write (e.g. [`crate::Dataset::append`]) was requested on a file opened
     /// read-only. Open it with [`crate::File::open_rw`] to modify it in place.
     ReadOnly,
+    /// A write was requested through a handle whose [`crate::File`] has already
+    /// been sealed by [`crate::File::close`]. Immediate and staged edits are
+    /// refused; reads through surviving handles still work. Re-open the file to
+    /// modify it again.
+    FileClosed,
     /// The file or dataset is not a supported target for the SWMR append writer
     /// (e.g. a userblock or non-latest-format file, or a dataset that is
     /// filtered, not rank-1 with an unlimited dimension, or not
@@ -752,6 +757,10 @@ impl fmt::Display for Error {
             Error::ReadOnly => write!(
                 f,
                 "cannot write to a read-only file; open it with File::open_rw"
+            ),
+            Error::FileClosed => write!(
+                f,
+                "cannot write through a handle after File::close; re-open the file to modify it"
             ),
             Error::SwmrAppendUnsupported(reason) => {
                 write!(f, "unsupported SWMR append target: {reason}")
