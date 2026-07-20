@@ -2,6 +2,9 @@
 
 `EditSession` opens an existing HDF5 file and adds, copies, or deletes objects, or edits group attributes, without reading the whole file in and rewriting it. New data and rebuilt object headers are appended at the end of the file and the superblock is repointed last, so the cost is proportional to what changes rather than to the file size, and a failed commit leaves the original file valid.
 
+!!! warning "Deprecated"
+    `EditSession` is superseded by the owned-handle API and will be removed in a later release. Open a file for reading **and** writing with `File::open_rw` and edit it through owned `Dataset` and `Group` handles that reach every object by name: `Dataset::append`/`write`/`append_staged`, `Group::create_dataset`/`create_group`/`delete`/`set_attr`, and `File::copy`/`copy_from`/`commit`. One open file both writes and reads back, with no separate session type.
+
 !!! tip "Runnable example"
     This page mirrors [`examples/edit_in_place.rs`](https://github.com/stephenberry/hdf5-pure/blob/main/examples/edit_in_place.rs). Run it with:
 

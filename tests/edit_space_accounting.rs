@@ -8,6 +8,7 @@
 //! its reusable free from disk on open, and the total always equals the summed
 //! region lengths.
 
+#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5_pure::{EditSession, File, FileBuilder, FileSpaceStrategy};
 use tempfile::tempdir;
 

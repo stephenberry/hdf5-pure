@@ -109,18 +109,20 @@ lossless read. For N-dimensional arrays see the `ndarray` feature below.
 
 `EditSession` opens an existing file and adds, deletes, or copies objects, appends to chunked unlimited datasets in place (including filtered/compressed ones, via `append_dataset`), or edits compact group attributes without reading it all in and rewriting it. New data and the rebuilt object headers are appended at the end of the file and the superblock is repointed last, so the cost is proportional to what changes and a failed commit leaves the file valid. For many repeated appends to a single 1-D unlimited dataset, `AppendWriter` holds the file open and grows the index in place at amortized `O(1)` cost instead of re-reading and rebuilding it on every `append_dataset` commit; unfiltered appends may be any length, while filtered appends this way must be chunk-aligned.
 
+> **Deprecated:** the path-based `EditSession` API is superseded by the owned-handle API shown here — open with `File::open_rw` and edit through owned `Dataset`/`Group` handles that also read back by name — and will be removed in a later release.
+
 ```rust,no_run
-use hdf5_pure::{AttrValue, EditSession};
+use hdf5_pure::File;
 
-let mut session = EditSession::open("output.h5").unwrap();
+let file = File::open_rw("output.h5").unwrap();
+let root = file.root();
 
-session.create_group("run2");
-session.set_group_attr("run2", "kind", AttrValue::AsciiString("trial".into()));
-session.create_dataset("run2/signal").with_f64_data(&[1.0, 2.0, 3.0]);
-session.copy("temperature", "temperature_backup");  // H5Ocopy
-session.delete("sensors/pressure");                 // H5Ldelete
+root.create_group("run2").unwrap();
+root.create_dataset("run2/signal", |b| { b.with_f64_data(&[1.0, 2.0, 3.0]); }).unwrap();
+file.copy("temperature", "temperature_backup").unwrap();  // H5Ocopy
+root.delete("sensors/pressure").unwrap();                 // H5Ldelete
 
-session.commit().unwrap();  // apply everything in place
+file.commit().unwrap();  // apply staged edits in place
 ```
 
 Contiguous and chunked datasets — the latter with any supported filter (deflate, shuffle, fletcher32, scale-offset) and optionally extensible (unlimited) dimensions — and compact-link groups are supported, and the editor edits files across every on-disk format the reference C library and h5py produce — version 0/1/2/3 superblocks, single- and multi-chunk object headers (a multi-chunk header is collapsed into one chunk on rewrite, and a version 0/1 symbol-table group on the edited path is converted to the latest compact-link format). It refuses, rather than silently degrade the file, anything it cannot reproduce faithfully — a chunked or extensible variable-length addition, dense-storage headers on the edited path, or copying a chunked or version-1 object. Within a session the space a deletion frees — for contiguous and chunked datasets alike, including the chunk index — is reused for later writes and the file is truncated when the freed bytes reach the end, so add/delete churn stays bounded instead of only ever growing; for guaranteed compaction across a reopen, see `repack` below.
@@ -269,13 +271,16 @@ builder.write("stream.h5").unwrap();
 
 Append in place (each call flushes durably; the file stays valid for concurrent readers throughout):
 
-```rust
-use hdf5_pure::SwmrWriter;
+> **Deprecated:** the `SwmrWriter` type is superseded by the owned-handle API shown here — open with `File::open_swmr_writer` and append through a `Dataset` handle — and will be removed in a later release.
 
-let mut writer = SwmrWriter::open("stream.h5").unwrap();
-writer.append_i32("log", &[3, 4, 5]).unwrap();
-writer.append_i32("log", &[6, 7]).unwrap();
-writer.close().unwrap(); // clears the SWMR flag; or just drop the writer
+```rust,no_run
+use hdf5_pure::File;
+
+let file = File::open_swmr_writer("stream.h5").unwrap();
+let mut log = file.dataset("log").unwrap();
+log.append(&[3i32, 4, 5]).unwrap();
+log.append(&[6, 7]).unwrap();
+file.close().unwrap(); // clears the SWMR flag; or just drop the file
 ```
 
 Follow a growing file from another process (or the reference C library / h5py writing in SWMR mode):
@@ -291,7 +296,7 @@ let ds = file.dataset("log").unwrap();
 println!("now {} rows", ds.shape().unwrap()[0]);
 ```
 
-Supported subset: one unlimited dimension, chunked, unfiltered (no compression on the appended dataset), chunk-aligned appends, no userblock. Growth is unbounded. SWMR requires the `std` filesystem (not the in-memory/WASM path). If a writer process exits without `close()`, the file is left marked as having an active SWMR writer; recover it with `SwmrWriter::clear_swmr_flag(path)` (the equivalent of `h5clear`).
+Supported subset: one unlimited dimension, chunked, unfiltered (no compression on the appended dataset), chunk-aligned appends, no userblock. Growth is unbounded. SWMR requires the `std` filesystem (not the in-memory/WASM path). If a writer process exits without `close()`, the file is left marked as having an active SWMR writer; recover it with `File::clear_swmr_flag(path)` (the equivalent of `h5clear`).
 
 ## Supported data types
 

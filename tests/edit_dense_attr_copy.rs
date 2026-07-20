@@ -14,6 +14,7 @@
 //! sources, copy them, and verify every attribute (name + value) survives, in
 //! this crate's reader and the reference C library.
 
+#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5::file::LibraryVersion;
 use hdf5_pure::{AttrValue, EditSession, File, FileBuilder};
 use std::collections::HashMap;

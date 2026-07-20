@@ -13,6 +13,7 @@
 //! cargo run --example swmr
 //! ```
 
+#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5_pure::{File, FileBuilder, SwmrWriter};
 
 fn main() {

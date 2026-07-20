@@ -24,6 +24,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `EditSession::space_accounting` reports a mutating session's live space usage as a `SpaceAccounting` — the current logical file size, the total reusable free bytes, and the reusable free regions as absolute `(offset, length)` pairs — the active-editor counterpart of `File::file_size` and `persisted_free_space`; it reflects committed state plus immediate in-place appends, not edits still staged for `commit` ([#150](https://github.com/stephenberry/hdf5-pure/issues/150)).
 - `DatasetBuilder::with_fill_value` records a dataset's fill value — the value HDF5 reports for never-written elements — and `Dataset::fill_value` reads one back, from this crate's files as well as the reference C library's and h5py's; the fill value's type must match the dataset datatype ([#151](https://github.com/stephenberry/hdf5-pure/issues/151)).
 
+### Deprecated
+
+- `SwmrWriter` and `EditSession` are deprecated in favor of the owned-handle API and will be removed in a later release: open with `File::open_swmr_writer` or `File::open_rw` and mutate through owned `Dataset`/`Group` handles that read and write one file by name (`Dataset::append`/`append_staged`/`write`, `Group::create_dataset`/`create_group`/`delete`, `File::copy_from`/`commit`/`clear_swmr_flag`) ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)).
+
 ### Fixed
 
 - Reading an attribute or dataset whose dataspace declares dimensions whose product overflows `u64` no longer panics: the element count now saturates so the size and limit checks reject the file as a format error ([#142](https://github.com/stephenberry/hdf5-pure/issues/142)).

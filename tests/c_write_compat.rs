@@ -20,6 +20,7 @@
 //! Every call here goes through the safe `hdf5-metno` API, which serializes its
 //! own C calls through an internal lock, so these tests need no extra guard.
 
+#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5_pure::{EditSession, File, FileBuilder};
 use tempfile::tempdir;
 

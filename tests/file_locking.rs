@@ -7,6 +7,7 @@
 //! editor still holds its lock, because that read is permitted on Unix but
 //! blocked by the OS on Windows.
 
+#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5_pure::{EditSession, Error, File, FileBuilder, FileLocking, SwmrWriter};
 use tempfile::tempdir;
 

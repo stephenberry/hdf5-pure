@@ -19,6 +19,7 @@
 //! cargo run --example file_space
 //! ```
 
+#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5_pure::{EditSession, File, FileBuilder, FileSpaceStrategy};
 use std::path::Path;
 

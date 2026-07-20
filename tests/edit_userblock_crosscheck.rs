@@ -8,6 +8,7 @@
 //! result back through `hdf5` is the external tripwire that the editor stored
 //! every root/link/layout address relative to the base address correctly.
 
+#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5::dataset::Layout;
 use hdf5::file::LibraryVersion;
 use hdf5_pure::{EditSession, File, FileBuilder};

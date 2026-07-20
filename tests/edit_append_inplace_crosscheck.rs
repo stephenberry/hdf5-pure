@@ -13,6 +13,7 @@
 //! compact-attribute walkers must accept it rather than mistake it for dense
 //! storage.
 
+#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5::Extent;
 use hdf5::file::LibraryVersion;
 use hdf5_pure::{AttrValue, EditSession, Error, File};

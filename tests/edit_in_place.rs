@@ -1,6 +1,7 @@
 //! Tests for in-place editing via `EditSession` (issue #32, Group C):
 //! add, delete, and copy datasets and groups at any path.
 
+#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5_pure::{AttrValue, DType, EditSession, File, FileBuilder, Object, ScaleOffset};
 
 /// Write a starter file with one dataset, returning its path.

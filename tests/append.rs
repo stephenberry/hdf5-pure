@@ -3,6 +3,7 @@
 //! filtered and unfiltered, chunk-aligned and not — and read the result back
 //! with this crate. C-library interop lives in `append_crosscheck.rs`.
 
+#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5_pure::{AppendBuilder, EditSession, Error, File, FileBuilder, ScaleOffset};
 use tempfile::tempdir;
 

@@ -12,6 +12,7 @@
 //! cargo run --example edit_in_place
 //! ```
 
+#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5_pure::{AttrValue, EditSession, File, FileBuilder};
 
 fn main() {

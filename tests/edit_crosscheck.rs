@@ -15,6 +15,7 @@
 //! compact-link format on rewrite, the superblock's root symbol-table entry is
 //! repointed, and the result is read back correctly by the C library.
 
+#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5::file::LibraryVersion;
 use hdf5_pure::{AttrValue, EditSession, File, FileBuilder, ScaleOffset};
 use tempfile::tempdir;

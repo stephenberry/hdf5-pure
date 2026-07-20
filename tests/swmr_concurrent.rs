@@ -11,6 +11,7 @@
 //!
 //! `uv run` puts a pinned python3 + h5py on PATH for the duration of the test.
 
+#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5_pure::{FileBuilder, SwmrWriter};
 use tempfile::tempdir;
 

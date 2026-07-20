@@ -2,6 +2,9 @@
 
 SWMR lets a single process append to an unlimited dataset in place while other processes read it concurrently, and it interoperates with the reference HDF5 C library and h5py in both directions. This page covers how to lay out a SWMR-capable dataset, append to it durably, follow it from a reader, and recover a file left flagged by a writer that exited uncleanly.
 
+!!! warning "Deprecated"
+    `SwmrWriter` is superseded by the owned-handle API and will be removed in a later release. Open with `File::open_swmr_writer` and append through a `Dataset` handle, then `File::close` to clear the SWMR-write flag; recover a flag left set by a crashed writer with `File::clear_swmr_flag`. The same no-lock, unfiltered, chunk-aligned SWMR contract applies.
+
 !!! tip "Runnable example"
     A complete single-process demonstration lives in [`examples/swmr.rs`](https://github.com/stephenberry/hdf5-pure/blob/main/examples/swmr.rs). Run it with:
 

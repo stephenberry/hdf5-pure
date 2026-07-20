@@ -5,6 +5,7 @@
 //! (dataset and group), the dense-storage refusal, and the single-hard-link refusal
 //! — lives in `edit_crosscheck.rs`.
 
+#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5_pure::{AttrValue, EditSession, Error, File, FileBuilder};
 use tempfile::tempdir;
 

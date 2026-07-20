@@ -8,6 +8,7 @@
 //! datasets the C library itself created, whose incompressible chunks carry a
 //! nonzero per-chunk filter mask that the append must preserve.
 
+#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5::Extent;
 use hdf5::file::LibraryVersion;
 use hdf5_pure::{EditSession, File, FileBuilder};

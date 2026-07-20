@@ -16,6 +16,7 @@
 //! userblock-specific operation still refused — cross-file copy from a userblock
 //! *source* — is covered below; a refusal never corrupts the file.
 
+#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5_pure::{AttrValue, EditSession, File, FileBuilder, Object};
 
 const UB: usize = 512;

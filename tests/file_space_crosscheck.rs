@@ -7,6 +7,7 @@
 //! hdf5-pure — including a persisted (persist=true) file whose File Space Info
 //! message carries free-space-manager addresses.
 
+#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5::plist::file_create::FileSpaceStrategy as CStrategy;
 use hdf5_pure::{EditSession, File, FileBuilder, FileSpaceStrategy};
 use std::sync::{Mutex, MutexGuard};

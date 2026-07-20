@@ -442,12 +442,12 @@ impl Located {
                 // yet: an empty dataset the C library created without writing any
                 // chunk (this crate's writer allocates it eagerly). In-place
                 // growth needs an existing index; make the first append through
-                // `EditSession::append_dataset`, which materializes the index, or
+                // `Dataset::append_staged`, which materializes the index, or
                 // create the dataset with initial data.
                 return Err(unsupported(
                     "the dataset's extensible-array index is not allocated yet (an empty \
                      dataset with no chunks); write initial data at creation or make the \
-                     first append with EditSession::append_dataset",
+                     first append with Dataset::append_staged",
                 ));
             }
             _ => {
@@ -1065,7 +1065,7 @@ pub(crate) fn plan_ea_append<F: InPlaceBytes>(
         return Err(Error::AppendUnsupported(
             "a filtered dataset can only be appended in place in whole chunks (the current \
              length and the appended length must both be multiples of the chunk length); \
-             use EditSession::append_dataset for a non-chunk-aligned filtered append",
+             use Dataset::append_staged for a non-chunk-aligned filtered append",
         ));
     }
 
