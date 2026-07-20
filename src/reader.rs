@@ -5,7 +5,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::edit::{AppendBuilder, EditSession, SpaceAccounting};
+use crate::edit::{AppendBuilder, SpaceAccounting, WriteEngine};
 use crate::element::H5Element;
 use crate::type_builders::DatasetBuilder;
 
@@ -46,14 +46,14 @@ use crate::types::{AttrValue, DType, attrs_to_map, classify_datatype};
 enum Backend {
     InMemory(Vec<u8>),
     Streaming(Box<dyn FileSource + Send + Sync>),
-    /// A read-write file opened with [`File::open_rw`]: an [`EditSession`] (a
+    /// A read-write file opened with [`File::open_rw`]: a [`WriteEngine`] (a
     /// whole-file mirror + exclusive OS lock + staged-edit queues) behind a lock,
     /// so owned handles can both read and mutate in place. Reads slice the
-    /// session's mirror; handle write methods route to the session, and
+    /// engine's mirror; handle write methods route to the engine, and
     /// `File::commit` applies staged structural edits. Boxed to keep the
-    /// `Backend` enum small (an `EditSession` is far larger than the other
+    /// `Backend` enum small (a `WriteEngine` is far larger than the other
     /// variants).
-    Mirror(Box<Mutex<EditSession>>),
+    Mirror(Box<Mutex<WriteEngine>>),
 }
 
 /// A borrowed `FileSource` view over a [`File`]'s backend, used by the
@@ -418,7 +418,7 @@ impl FileInner {
     /// Open an existing HDF5 file for reading **and** in-place editing, taking an
     /// exclusive OS file lock held for the file's life.
     fn open_rw<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
-        Self::from_rw_session(EditSession::open(path)?)
+        Self::from_rw_session(WriteEngine::open(path)?)
     }
 
     /// Like [`open_rw`](Self::open_rw), but with an explicit file-locking policy.
@@ -426,11 +426,11 @@ impl FileInner {
         path: P,
         locking: FileLocking,
     ) -> Result<Self, Error> {
-        Self::from_rw_session(EditSession::open_with_locking(path, locking)?)
+        Self::from_rw_session(WriteEngine::open_with_locking(path, locking)?)
     }
 
-    /// Wrap an opened [`EditSession`] as a read-write [`Backend::Mirror`] file.
-    fn from_rw_session(session: EditSession) -> Result<Self, Error> {
+    /// Wrap an opened [`WriteEngine`] as a read-write [`Backend::Mirror`] file.
+    fn from_rw_session(session: WriteEngine) -> Result<Self, Error> {
         let (superblock, addr_offset) = Self::parse_superblock(session.mirror_bytes())?;
         Ok(Self::from_parts(
             Backend::Mirror(Box::new(Mutex::new(session))),
@@ -443,7 +443,7 @@ impl FileInner {
 
     /// Open for SWMR writing: no OS lock, superblock SWMR-write flag raised.
     fn open_swmr_writer<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
-        let mut inner = Self::from_rw_session(EditSession::open_swmr_writer(path)?)?;
+        let mut inner = Self::from_rw_session(WriteEngine::open_swmr_writer(path)?)?;
         inner.swmr_write = true;
         Ok(inner)
     }
@@ -1288,7 +1288,7 @@ impl File {
     fn with_mirror_session<R>(
         &self,
         staged: bool,
-        f: impl FnOnce(&mut EditSession) -> Result<R, Error>,
+        f: impl FnOnce(&mut WriteEngine) -> Result<R, Error>,
     ) -> Result<R, Error> {
         let Backend::Mirror(m) = &self.inner.backend else {
             return Err(Error::ReadOnly);
@@ -1661,7 +1661,7 @@ impl Group {
     fn with_child_session<R>(
         &self,
         name: &str,
-        f: impl FnOnce(&mut EditSession, &str) -> Result<R, Error>,
+        f: impl FnOnce(&mut WriteEngine, &str) -> Result<R, Error>,
     ) -> Result<R, Error> {
         let Backend::Mirror(m) = &self.file.backend else {
             return Err(Error::ReadOnly);
@@ -1679,7 +1679,7 @@ impl Group {
     /// [`Error::FileClosed`](crate::Error::FileClosed) once the file is sealed.
     fn with_own_session<R>(
         &self,
-        f: impl FnOnce(&mut EditSession, &str) -> Result<R, Error>,
+        f: impl FnOnce(&mut WriteEngine, &str) -> Result<R, Error>,
     ) -> Result<R, Error> {
         let Backend::Mirror(m) = &self.file.backend else {
             return Err(Error::ReadOnly);
@@ -1826,7 +1826,7 @@ impl Dataset {
     fn with_session_mut<R>(
         &mut self,
         staged: bool,
-        f: impl FnOnce(&mut EditSession, &str) -> Result<R, Error>,
+        f: impl FnOnce(&mut WriteEngine, &str) -> Result<R, Error>,
     ) -> Result<R, Error> {
         let Backend::Mirror(m) = &self.file.backend else {
             return Err(Error::ReadOnly);
