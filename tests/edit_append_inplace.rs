@@ -6,6 +6,7 @@
 //! hard-link aliasing and a combined mixed-edit file) lives in
 //! `edit_crosscheck.rs`.
 
+#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5_pure::{AttrValue, EditSession, Error, File, FileBuilder, FileSpaceStrategy};
 use tempfile::tempdir;
 

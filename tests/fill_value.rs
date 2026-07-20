@@ -6,6 +6,7 @@
 //! value" default, the datatype/size validation, and that a fill value set on an
 //! `EditSession`-created dataset is honored.
 
+#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5_pure::{Dataset, EditSession, Error, File, FileBuilder, FormatError, H5Element};
 use tempfile::tempdir;
 

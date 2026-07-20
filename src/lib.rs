@@ -50,29 +50,32 @@
 //!
 //! # Editing files in place
 //!
-//! [`EditSession`] opens an existing file and adds, deletes, copies, or
-//! overwrites objects without reading it all in and rewriting it. New data and
-//! rebuilt object headers are appended at end-of-file and the superblock is
-//! repointed last, so the cost is proportional to what changes rather than to the
-//! file size. It edits files written by this crate, the reference HDF5 C library,
-//! and h5py across all of their on-disk formats, and refuses — rather than
-//! silently degrade the file — anything it cannot reproduce faithfully.
+//! Open an existing file for reading **and** writing with [`File::open_rw`] and
+//! reach every object by name through owned [`Dataset`] and [`Group`] handles
+//! that add, delete, copy, or overwrite objects without reading it all in and
+//! rewriting it. New data and rebuilt object headers are appended at end-of-file
+//! and the superblock is repointed last, so the cost is proportional to what
+//! changes rather than to the file size. It edits files written by this crate,
+//! the reference HDF5 C library, and h5py across all of their on-disk formats,
+//! and refuses — rather than silently degrade the file — anything it cannot
+//! reproduce faithfully.
 //!
 //! ```rust,no_run
-//! use hdf5_pure::EditSession;
+//! use hdf5_pure::File;
 //!
-//! let mut session = EditSession::open("output.h5").unwrap();
-//! session.create_dataset("extra").with_f64_data(&[4.0, 5.0]);
-//! session.write_dataset("data").with_f64_data(&[7.0, 8.0]); // H5Dwrite (overwrite)
-//! session.delete("old");             // H5Ldelete
-//! session.commit().unwrap();
+//! let file = File::open_rw("output.h5").unwrap();
+//! let root = file.root();
+//! root.create_dataset("extra", |b| { b.with_f64_data(&[4.0, 5.0]); }).unwrap();
+//! file.dataset("data").unwrap().write(&[7.0, 8.0]).unwrap(); // H5Dwrite (overwrite)
+//! root.delete("old").unwrap();                               // H5Ldelete
+//! file.commit().unwrap();                                    // apply staged edits
 //! ```
 //!
-//! [`write_dataset`](EditSession::write_dataset) overwrites an existing
-//! contiguous or compact dataset's values; the replacement must match the
-//! on-disk datatype and shape (it is a value write, not a reshape/retype), and a
-//! same-length contiguous overwrite is applied straight into the existing data
-//! block without rewriting any header.
+//! A value overwrite ([`Dataset::write`]) must match the on-disk datatype and
+//! shape (it is a value write, not a reshape/retype); a same-length contiguous
+//! overwrite is applied straight into the existing data block without rewriting
+//! any header. Immediate, amortized-`O(1)` row appends use [`Dataset::append`]
+//! and need no commit.
 //!
 //! # Streaming large files
 //!
@@ -262,13 +265,18 @@ pub use types::{AttrValue, DType};
 pub use writer::FileBuilder;
 
 #[cfg(feature = "std")]
+#[allow(deprecated)] // re-exporting the deprecated shim; users still see the deprecation
 pub use swmr_writer::SwmrWriter;
 
 #[cfg(feature = "std")]
 pub use append_writer::AppendWriter;
 
 #[cfg(feature = "std")]
-pub use edit::{AppendBuilder, EditSession, SpaceAccounting};
+pub use edit::{AppendBuilder, SpaceAccounting};
+
+#[cfg(feature = "std")]
+#[allow(deprecated)] // re-exporting the deprecated shim; users still see the deprecation
+pub use edit::EditSession;
 
 #[cfg(feature = "std")]
 pub use repack::{RepackOptions, repack};

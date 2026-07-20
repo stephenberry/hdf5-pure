@@ -7,6 +7,7 @@
 //! reference C library. Appends cross the inline -> direct-block -> super-block
 //! boundaries so the in-place index growth is exercised.
 
+#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5::Extent;
 use hdf5::file::LibraryVersion;
 use hdf5_pure::{Error, File, FileBuilder, FormatError, SwmrWriter};

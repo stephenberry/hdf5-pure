@@ -1,5 +1,11 @@
 //! SWMR (single-writer / multiple-reader) append writer.
 //!
+//! **Deprecated:** superseded by the owned-handle API — open with
+//! [`crate::File::open_swmr_writer`] and append through a [`crate::Dataset`]
+//! handle, then [`crate::File::close`] to clear the flag; recover a stale flag
+//! with [`crate::File::clear_swmr_flag`]. See the [`SwmrWriter`] type docs for the
+//! migration.
+//!
 //! Opens an existing HDF5 file (created by this crate, the reference C library,
 //! or h5py with the latest format) and appends chunks to a one-dimensional,
 //! unlimited, Extensible-Array-indexed dataset *in place*: each appended chunk
@@ -40,7 +46,8 @@
 //! Recover such a file with [`SwmrWriter::clear_swmr_flag`] (the `h5clear -s`
 //! equivalent).
 //!
-//! Unlike [`crate::EditSession`], the SWMR writer takes **no OS file lock**: SWMR
+//! Unlike a read-write [`crate::File::open_rw`] handle, the SWMR writer takes
+//! **no OS file lock**: SWMR
 //! is single-writer by contract and built for concurrent reads (the reference
 //! library likewise runs SWMR with file locking disabled), so a whole-file lock
 //! would block readers — fatally so on Windows, where locks are mandatory. The
@@ -63,6 +70,33 @@ use crate::superblock::Superblock;
 /// so it can read existing structures and recompute checksums without hitting
 /// the disk. For the unbounded "streaming log" use case this grows with the
 /// file; a future revision could bound it, but v1 favors simplicity.
+///
+/// # Deprecated
+///
+/// Superseded by the owned-handle API: open the file with
+/// [`File::open_swmr_writer`](crate::File::open_swmr_writer) and append through a
+/// [`Dataset`](crate::Dataset) handle. That path layers the same SWMR policy on
+/// the shared in-place engine — no OS lock, the `0x05` SWMR-write flag raised
+/// while active and cleared on [`File::close`](crate::File::close), and the same
+/// unfiltered, chunk-aligned append subset — and the one open file also reads
+/// back what it appends. Recover a flag left set by a crashed writer with
+/// [`File::clear_swmr_flag`](crate::File::clear_swmr_flag).
+///
+/// ```no_run
+/// use hdf5_pure::File;
+///
+/// let file = File::open_swmr_writer("log.h5")?;
+/// let mut samples = file.dataset("samples")?;
+/// samples.append(&[8i32, 9, 10, 11])?; // one whole chunk
+/// file.close()?; // clears the SWMR-write flag
+/// # Ok::<(), hdf5_pure::Error>(())
+/// ```
+///
+/// The type will be removed in a later release.
+#[deprecated(
+    since = "0.22.0",
+    note = "use File::open_swmr_writer + Dataset::append; see the SwmrWriter type docs for migration"
+)]
 pub struct SwmrWriter {
     /// In-memory mirror + on-disk handle, shared with the general append writer.
     file: InPlaceFile,
@@ -77,6 +111,7 @@ pub struct SwmrWriter {
 /// clean close — matching the reference C library and h5py.
 const SWMR_WRITE_FLAGS: u32 = 0x05;
 
+#[allow(deprecated)] // this type's own impl legitimately names and builds the (deprecated) type
 impl SwmrWriter {
     /// Open an existing HDF5 file for appending.
     ///
@@ -121,38 +156,7 @@ impl SwmrWriter {
     /// without a clean close (the h5clear equivalent). Safe to call on a file
     /// with the flag already clear.
     pub fn clear_swmr_flag<P: AsRef<Path>>(path: P) -> Result<(), Error> {
-        let path = path.as_ref();
-        let mut w = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(Error::Io)?;
-        // Refuse to clear the flag out from under a live writer: an exclusive
-        // lock here fails with `FileLocked` if another writer still holds the
-        // file. A stale flag from a *crashed* writer has no live lock, so this
-        // succeeds and the recovery proceeds.
-        file_lock::acquire_exclusive(&w, FileLocking::Enabled, path)?;
-        let mut data = Vec::new();
-        w.read_to_end(&mut data).map_err(Error::Io)?;
-        let sig = signature::find_signature(&data)?;
-        let mut sb = Superblock::parse(&data, sig)?;
-        if sb.version < 2 {
-            // `Superblock::serialize` emits the v2/v3 layout, so rewriting a
-            // v0/v1 superblock here would corrupt it (the same hazard `open`
-            // guards against). This crate never SWMR-flags a v0/v1 file, so
-            // there is nothing to clear; treat it as already clean rather than
-            // risk a destructive rewrite.
-            return Ok(());
-        }
-        if sb.consistency_flags == 0 {
-            return Ok(());
-        }
-        sb.consistency_flags = 0;
-        let bytes = sb.serialize();
-        w.seek(SeekFrom::Start(sig as u64)).map_err(Error::Io)?;
-        w.write_all(&bytes).map_err(Error::Io)?;
-        w.sync_data().map_err(Error::Io)?;
-        Ok(())
+        clear_swmr_flag_at(path.as_ref())
     }
 
     /// Append `i32` values to an unlimited dataset.
@@ -298,6 +302,46 @@ impl SwmrWriter {
     }
 }
 
+/// Clear a stale SWMR-write flag left in `path` by a writer that exited without a
+/// clean close — the `h5clear -s` equivalent, shared by the deprecated
+/// [`SwmrWriter::clear_swmr_flag`] and the owned
+/// [`File::clear_swmr_flag`](crate::File::clear_swmr_flag). Safe to call on a file
+/// whose flag is already clear.
+pub(crate) fn clear_swmr_flag_at(path: &Path) -> Result<(), Error> {
+    let mut w = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(Error::Io)?;
+    // Refuse to clear the flag out from under a live writer: an exclusive
+    // lock here fails with `FileLocked` if another writer still holds the
+    // file. A stale flag from a *crashed* writer has no live lock, so this
+    // succeeds and the recovery proceeds.
+    file_lock::acquire_exclusive(&w, FileLocking::Enabled, path)?;
+    let mut data = Vec::new();
+    w.read_to_end(&mut data).map_err(Error::Io)?;
+    let sig = signature::find_signature(&data)?;
+    let mut sb = Superblock::parse(&data, sig)?;
+    if sb.version < 2 {
+        // `Superblock::serialize` emits the v2/v3 layout, so rewriting a
+        // v0/v1 superblock here would corrupt it (the same hazard `open`
+        // guards against). This crate never SWMR-flags a v0/v1 file, so
+        // there is nothing to clear; treat it as already clean rather than
+        // risk a destructive rewrite.
+        return Ok(());
+    }
+    if sb.consistency_flags == 0 {
+        return Ok(());
+    }
+    sb.consistency_flags = 0;
+    let bytes = sb.serialize();
+    w.seek(SeekFrom::Start(sig as u64)).map_err(Error::Io)?;
+    w.write_all(&bytes).map_err(Error::Io)?;
+    w.sync_data().map_err(Error::Io)?;
+    Ok(())
+}
+
+#[allow(deprecated)] // Drop impl of the deprecated type
 impl Drop for SwmrWriter {
     /// Best-effort clear of the SWMR-write flag so a writer that is merely
     /// dropped (rather than `close`d) still leaves the file cleanly marked. Use
@@ -310,6 +354,7 @@ impl Drop for SwmrWriter {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // exercises the deprecated SwmrWriter shim
 mod tests {
     use super::*;
     use crate::reader::File as PureFile;

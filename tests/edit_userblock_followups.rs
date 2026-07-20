@@ -11,6 +11,7 @@
 //! create the never-written-contiguous and compact-layout fixtures those paths
 //! need.)
 
+#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5_pure::{AttrValue, EditSession, File, FileBuilder};
 
 const UB: usize = 512;

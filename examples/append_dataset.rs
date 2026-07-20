@@ -16,6 +16,7 @@
 //! cargo run --example append_dataset
 //! ```
 
+#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5_pure::{EditSession, File, FileBuilder};
 
 fn main() {

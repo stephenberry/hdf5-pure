@@ -674,8 +674,8 @@ impl FileInner {
     /// The whole-file byte image when this file is buffered in memory
     /// ([`open`](Self::open) / [`from_bytes`](Self::from_bytes)); `None` for a
     /// streaming file ([`open_streaming`](Self::open_streaming)). Cross-file
-    /// object copy ([`EditSession::copy_from`](crate::EditSession::copy_from))
-    /// uses this to read source objects by absolute address.
+    /// object copy ([`File::copy_from`](crate::File::copy_from)) uses this to read
+    /// source objects by absolute address.
     pub(crate) fn in_memory_image(&self) -> Option<&[u8]> {
         match &self.backend {
             Backend::InMemory(data) => Some(data),
@@ -1166,7 +1166,7 @@ impl File {
     /// recovering a file the reference C library then refuses to open. A no-op if
     /// the flag is already clear.
     pub fn clear_swmr_flag<P: AsRef<std::path::Path>>(path: P) -> Result<(), Error> {
-        crate::swmr_writer::SwmrWriter::clear_swmr_flag(path)
+        crate::swmr_writer::clear_swmr_flag_at(path.as_ref())
     }
 
     /// Create a new, empty HDF5 file at `path` and open it for reading and
@@ -1876,7 +1876,7 @@ impl Dataset {
     /// Together with [`is_chunked`](Self::is_chunked) and
     /// [`chunk_shape`](Self::chunk_shape), this lets a caller check up front
     /// whether a dataset is eligible for
-    /// [`EditSession::append_dataset`](crate::EditSession::append_dataset)
+    /// [`Dataset::append_staged`](crate::Dataset::append_staged)
     /// (which requires a chunked dataset whose first maximum dimension is
     /// `u64::MAX`) instead of relying on the append's refusal error.
     pub fn maxshape(&self) -> Result<Option<Vec<u64>>, Error> {

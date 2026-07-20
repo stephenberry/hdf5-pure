@@ -121,7 +121,7 @@ pub(crate) fn acquire_exclusive(
         Err(TryLockError::WouldBlock) => Err(Error::FileLocked(format!(
             "{}: file is already locked by another process. If a previous writer \
              crashed, the OS lock is released automatically (try again); a leftover \
-             on-disk SWMR flag can be cleared with SwmrWriter::clear_swmr_flag. Set \
+             on-disk SWMR flag can be cleared with File::clear_swmr_flag. Set \
              HDF5_USE_FILE_LOCKING=FALSE or pass FileLocking::Disabled to bypass locking.",
             path.display(),
         ))),

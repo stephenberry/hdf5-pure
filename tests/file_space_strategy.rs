@@ -3,6 +3,7 @@
 //! issue #21): the writer records the chosen strategy in a superblock-extension
 //! File Space Info message, and the reader reads it back.
 
+#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5_pure::{File, FileBuilder, FileSpaceStrategy};
 
 fn tmp(name: &str) -> std::path::PathBuf {

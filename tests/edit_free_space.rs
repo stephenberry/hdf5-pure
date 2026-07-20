@@ -6,6 +6,7 @@
 //! run reaches end-of-file. These tests pin down both the size behavior and that
 //! survivors stay byte-exact and the file stays valid.
 
+#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5_pure::{EditSession, File, FileBuilder, FileSpaceStrategy};
 
 fn tmp(name: &str) -> std::path::PathBuf {

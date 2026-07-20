@@ -1042,13 +1042,13 @@ impl WriteEngine {
         if self.superblock.base_address != 0 {
             return Err(Error::AppendInPlaceUnsupported(
                 "in-place append does not support a file with a userblock (non-zero base \
-                 address); use EditSession::append_dataset",
+                 address); use Dataset::append_staged",
             ));
         }
         if self.superblock.version < 2 {
             return Err(Error::AppendInPlaceUnsupported(
                 "in-place append requires a latest-format file (v2/v3 superblock); use \
-                 EditSession::append_dataset",
+                 Dataset::append_staged",
             ));
         }
         // A file that persists its free space keeps on-disk free-space managers (and,
@@ -1059,7 +1059,7 @@ impl WriteEngine {
         if self.persist.is_some() {
             return Err(Error::AppendInPlaceUnsupported(
                 "in-place append is not supported on a file that persists its free space \
-                 (H5Pset_file_space_strategy persist=true); use EditSession::append_dataset",
+                 (H5Pset_file_space_strategy persist=true); use Dataset::append_staged",
             ));
         }
 
@@ -1071,7 +1071,7 @@ impl WriteEngine {
         if self.append_conflicts_with_pending(&target) {
             return Err(Error::AppendInPlaceUnsupported(
                 "the dataset or an ancestor has a staged edit pending in this session; commit \
-                 the staged edits before appending in place, or use EditSession::append_dataset",
+                 the staged edits before appending in place, or use Dataset::append_staged",
             ));
         }
 
@@ -5275,6 +5275,7 @@ append_inplace_typed! {
 /// # Example
 ///
 /// ```no_run
+/// # #![allow(deprecated)]
 /// use hdf5_pure::{AttrValue, EditSession};
 ///
 /// let mut session = EditSession::open("existing.h5")?;
@@ -5290,10 +5291,46 @@ append_inplace_typed! {
 /// This type is the public face of the crate's in-place write engine: every
 /// method forwards to it, and the owned read-write [`File`](crate::File) drives
 /// the same engine directly behind its `Backend::Mirror`.
+///
+/// # Deprecated
+///
+/// Superseded by the owned-handle API. Open a file for reading **and** writing
+/// with [`File::open_rw`](crate::File::open_rw), then reach every object by name
+/// through owned [`Dataset`](crate::Dataset) and [`Group`](crate::Group) handles
+/// that both read and mutate in place — no separate, write-blind session type.
+/// The two commit models carry over unchanged: immediate
+/// [`Dataset::append`](crate::Dataset::append), and staged
+/// [`Group::create_dataset`](crate::Group::create_dataset) /
+/// [`Group::create_group`](crate::Group::create_group) /
+/// [`Dataset::write`](crate::Dataset::write) /
+/// [`Dataset::append_staged`](crate::Dataset::append_staged) / attribute edits /
+/// [`File::copy`](crate::File::copy) / [`Group::delete`](crate::Group::delete),
+/// applied by [`File::commit`](crate::File::commit).
+///
+/// ```no_run
+/// use hdf5_pure::File;
+///
+/// let file = File::open_rw("existing.h5")?;
+/// let root = file.root();
+/// root.create_group("run2")?; // staged
+/// root.create_dataset("run2/signal", |b| {
+///     b.with_f64_data(&[1.0, 2.0, 3.0]);
+/// })?; // staged
+/// file.commit()?; // apply staged edits
+/// let _values: Vec<f64> = file.dataset("run2/signal")?.read()?; // read back, one handle
+/// # Ok::<(), hdf5_pure::Error>(())
+/// ```
+///
+/// The type will be removed in a later release.
+#[deprecated(
+    since = "0.22.0",
+    note = "use File::open_rw and owned Dataset/Group handles; see the EditSession type docs for migration"
+)]
 pub struct EditSession {
     engine: WriteEngine,
 }
 
+#[allow(deprecated)] // this wrapper's own impl legitimately names and builds the (deprecated) type
 impl EditSession {
     /// Open an existing HDF5 file for in-place editing, taking an exclusive OS
     /// advisory lock held for the session's life. Fails with
@@ -5436,6 +5473,7 @@ impl EditSession {
 /// each delegating to the [`WriteEngine`] method of the same name.
 macro_rules! forward_append_inplace_typed {
     ($($method:ident, $ty:ty;)*) => {
+        #[allow(deprecated)] // forwarders on the deprecated wrapper
         impl EditSession {
             $(
                 #[doc = concat!("Append `", stringify!($ty), "` values to `dataset` in \

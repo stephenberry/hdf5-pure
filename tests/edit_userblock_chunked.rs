@@ -13,6 +13,7 @@
 //!     the old chunk storage reclaimed), including reuse of that reclaimed space
 //!     by a later commit in the same session.
 
+#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5_pure::{EditSession, File, FileBuilder};
 
 const UB: usize = 512;
