@@ -443,7 +443,17 @@ pub struct EditSession {
     /// [`commit`](Self::commit), since a commit can relocate a cached header or
     /// free the region it points into (see `commit`).
     located: HashMap<u64, LocatedState>,
+    /// True when this session was opened for SWMR writing
+    /// ([`open_swmr_writer`](Self::open_swmr_writer)): the append engine then
+    /// enforces the SWMR subset (unfiltered, chunk-aligned) so a concurrent
+    /// reader never observes a torn view. `false` for an ordinary edit session.
+    swmr_mode: bool,
 }
+
+/// Superblock consistency-flag bits raised while a SWMR writer is active: bit 0
+/// (write access) | bit 2 (SWMR write access). Cleared on a clean close. Matches
+/// the reference C library, h5py, and [`crate::SwmrWriter`].
+const SWMR_WRITE_FLAGS: u32 = 0x05;
 
 /// A dataset located once for [`EditSession::append_inplace`], then maintained
 /// across appends. Mirrors the append writer's per-dataset state.
@@ -553,15 +563,67 @@ impl EditSession {
     /// Open an existing HDF5 file for in-place editing, choosing the file-locking
     /// policy explicitly. See [`open`](Self::open) and [`FileLocking`].
     pub fn open_with_locking<P: AsRef<Path>>(path: P, locking: FileLocking) -> Result<Self, Error> {
-        let path = path.as_ref();
+        Self::open_inner(path.as_ref(), Some(locking))
+    }
+
+    /// Open an existing file for SWMR (single-writer/multiple-reader) writing:
+    /// take **no** OS lock at all and raise the superblock's SWMR-write
+    /// consistency flag. Backs [`File::open_swmr_writer`](crate::File::open_swmr_writer).
+    ///
+    /// The no-lock is unconditional — `lock = None` never reaches
+    /// `acquire_exclusive`, so `HDF5_USE_FILE_LOCKING` cannot reintroduce a lock
+    /// that would block the concurrent readers SWMR exists to permit (fatally so
+    /// on Windows, where OS locks are mandatory). Requires a latest-format
+    /// (version-2/3 superblock) file with no userblock and no persisted
+    /// free-space, so the superblock can be rewritten in place.
+    pub(crate) fn open_swmr_writer<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
+        let mut session = Self::open_inner(path.as_ref(), None)?;
+        if session.superblock.version < 2
+            || session.superblock.base_address != 0
+            || session.persist.is_some()
+        {
+            return Err(Error::SwmrAppendUnsupported(
+                "SWMR writing requires a latest-format file (v2/v3 superblock) with no userblock \
+                 and no persisted free-space",
+            ));
+        }
+        session.swmr_mode = true;
+        session.set_consistency_flags(SWMR_WRITE_FLAGS)?;
+        Ok(session)
+    }
+
+    /// Set the superblock's consistency flags in the mirror and on disk, then
+    /// flush. Used to raise the SWMR-write flag on open and clear it on close.
+    /// Requires a base-0, version-2/3 file (checked by `open_swmr_writer`), since
+    /// [`Superblock::serialize`] emits the v2/v3 layout at the base address.
+    pub(crate) fn set_consistency_flags(&mut self, flags: u32) -> Result<(), Error> {
+        self.superblock.consistency_flags = flags;
+        let bytes = self.superblock.serialize();
+        self.data[self.sb_sig_off..self.sb_sig_off + bytes.len()].copy_from_slice(&bytes);
+        self.handle
+            .seek(SeekFrom::Start(self.sb_sig_off as u64))
+            .map_err(Error::Io)?;
+        self.handle.write_all(&bytes).map_err(Error::Io)?;
+        self.handle.flush().map_err(Error::Io)?;
+        self.handle.sync_data().map_err(Error::Io)?;
+        Ok(())
+    }
+
+    /// Shared open path. `lock = Some(policy)` acquires an exclusive OS lock under
+    /// that policy (the ordinary read-write session); `lock = None` takes no lock
+    /// at all (the SWMR writer — see [`open_swmr_writer`](Self::open_swmr_writer)).
+    fn open_inner(path: &Path, lock: Option<FileLocking>) -> Result<Self, Error> {
         let mut handle = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
             .map_err(Error::Io)?;
         // Acquire the exclusive lock before reading or mutating; the retained
-        // `handle` holds it for the session's life.
-        file_lock::acquire_exclusive(&handle, locking, path)?;
+        // `handle` holds it for the session's life. A `None` policy (SWMR) never
+        // reaches `acquire_exclusive`, so no lock is ever taken.
+        if let Some(policy) = lock {
+            file_lock::acquire_exclusive(&handle, policy, path)?;
+        }
         let mut data = Vec::new();
         handle.read_to_end(&mut data).map_err(Error::Io)?;
 
@@ -619,6 +681,7 @@ impl EditSession {
             free: FreeList::new(),
             persist: None,
             located: HashMap::new(),
+            swmr_mode: false,
         };
         // If the file persists its free space, seed the free list from the
         // on-disk managers and arm persistence for future commits. Best-effort:
@@ -1091,6 +1154,30 @@ impl EditSession {
         let new_elems = (raw.len() / self.located[&oh_addr].element_size) as u64;
         if new_elems == 0 {
             return Ok(());
+        }
+
+        // In SWMR mode, hold to the subset a concurrent reader can follow safely:
+        // unfiltered (a filtered element is a multi-field record whose in-place
+        // repoint is not power-loss atomic) and chunk-aligned (so an append only
+        // ever inserts new, not-yet-visible elements and never rewrites a visible
+        // trailing chunk out from under a reader).
+        if self.swmr_mode {
+            let st = &self.located[&oh_addr];
+            if st.pipeline.is_some() {
+                return Err(Error::SwmrAppendUnsupported(
+                    "filtered datasets are not supported for SWMR append",
+                ));
+            }
+            let chunk_elems = st.loc.chunk_elems;
+            if chunk_elems == 0
+                || st.loc.current_dim % chunk_elems != 0
+                || new_elems % chunk_elems != 0
+            {
+                return Err(Error::SwmrAppendUnsupported(
+                    "SWMR append must be chunk-aligned: the current length and the appended \
+                     length must both be whole multiples of the chunk length",
+                ));
+            }
         }
 
         // Read/plan phase (immutable borrows only, nothing published yet), then the
