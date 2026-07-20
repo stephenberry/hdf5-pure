@@ -1034,6 +1034,19 @@ impl File {
         })
     }
 
+    /// Create a new, empty HDF5 file at `path` and open it for reading and
+    /// writing, so its contents can be built entirely through owned handles
+    /// ([`Group::create_dataset`]/[`create_group`](Group::create_group), then
+    /// [`commit`](Self::commit)).
+    ///
+    /// Overwrites any existing file at `path`. For an all-at-once write, use
+    /// [`FileBuilder`](crate::FileBuilder) instead.
+    pub fn create<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
+        let bytes = crate::writer::FileBuilder::new().finish()?;
+        std::fs::write(path.as_ref(), bytes).map_err(Error::Io)?;
+        Self::open_rw(path)
+    }
+
     /// Apply all staged structural edits made through this file's handles —
     /// [`Dataset::write`]/`set_attr`/`remove_attr` and
     /// [`Group::create_group`]/`delete` — as one transaction. Immediate
@@ -1047,6 +1060,22 @@ impl File {
             Backend::Mirror(m) => {
                 let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 session.commit()
+            }
+            _ => Err(Error::ReadOnly),
+        }
+    }
+
+    /// Copy the object at `src` to `dst` within this file (the in-file
+    /// `H5Ocopy`), staged until [`commit`](Self::commit).
+    ///
+    /// Requires a read-write file ([`File::open_rw`]); a read-only file returns
+    /// [`Error::ReadOnly`](crate::Error::ReadOnly).
+    pub fn copy(&self, src: &str, dst: &str) -> Result<(), Error> {
+        match &self.inner.backend {
+            Backend::Mirror(m) => {
+                let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                session.copy(&normalize_path(src), &normalize_path(dst));
+                Ok(())
             }
             _ => Err(Error::ReadOnly),
         }

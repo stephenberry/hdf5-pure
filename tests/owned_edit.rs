@@ -121,3 +121,45 @@ fn create_dataset_and_read_back() {
         vec![7, 8, 9]
     );
 }
+
+#[test]
+fn create_file_and_build_through_handles() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("new.h5");
+    let file = File::create(&path).unwrap();
+    file.root()
+        .create_dataset("d", |b| {
+            b.with_i32_data(&[1, 2, 3]).with_shape(&[3]);
+        })
+        .unwrap();
+    file.root().create_group("grp").unwrap();
+    file.commit().unwrap();
+    assert_eq!(
+        file.dataset("d").unwrap().read_i32().unwrap(),
+        vec![1, 2, 3]
+    );
+    assert!(file.group("grp").is_ok());
+    // Reopen read-only to confirm it persisted as a valid file.
+    drop(file);
+    let ro = File::open(&path).unwrap();
+    assert_eq!(ro.dataset("d").unwrap().read_i32().unwrap(), vec![1, 2, 3]);
+}
+
+#[test]
+fn copy_dataset_within_file() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("d.h5");
+    create_i32(&path, &[1, 2, 3]);
+    let file = File::open_rw(&path).unwrap();
+    file.copy("d", "d_copy").unwrap();
+    file.commit().unwrap();
+    assert_eq!(
+        file.dataset("d_copy").unwrap().read_i32().unwrap(),
+        vec![1, 2, 3]
+    );
+    // Original is untouched.
+    assert_eq!(
+        file.dataset("d").unwrap().read_i32().unwrap(),
+        vec![1, 2, 3]
+    );
+}
