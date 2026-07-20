@@ -937,6 +937,14 @@ impl EditSession {
             || !self.pending_cross_copies.is_empty()
     }
 
+    /// The session's whole-file in-memory mirror, reflecting committed state plus
+    /// immediate in-place appends (not edits still staged for `commit`). Used by
+    /// the owned read-write [`File`](crate::File) to serve reads on a mirror
+    /// backend.
+    pub(crate) fn mirror_bytes(&self) -> &[u8] {
+        &self.data
+    }
+
     /// A snapshot of this session's live space usage — the current file size and
     /// the free space it can reuse — as a [`SpaceAccounting`].
     ///
