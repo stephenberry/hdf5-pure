@@ -370,6 +370,17 @@ impl Located {
         unsupported: fn(&'static str) -> Error,
     ) -> Result<LocateResult, Error> {
         let oh_addr = group_v2::resolve_path_any(file.data(), file.superblock(), dataset)?;
+        Self::locate_at(file, oh_addr, unsupported)
+    }
+
+    /// Like [`locate`](Self::locate), but for a dataset whose object-header
+    /// address is already known — an owned handle carries its address, so the
+    /// path-resolution step is skipped.
+    pub(crate) fn locate_at<F: InPlaceBytes>(
+        file: &F,
+        oh_addr: u64,
+        unsupported: fn(&'static str) -> Error,
+    ) -> Result<LocateResult, Error> {
         let os = file.offset_size();
         let ls = file.length_size();
 

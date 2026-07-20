@@ -55,7 +55,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::chunk_index_inplace::{InPlaceFile, Located, apply_ea_append, plan_ea_append};
+use crate::chunk_index_inplace::{
+    InPlaceBytes, InPlaceFile, Located, apply_ea_append, plan_ea_append,
+};
 use crate::datatype::Datatype;
 use crate::edit::{AppendBuilder, datatype_is_raw_appendable, pipeline_reencodable};
 use crate::element::H5Element;
@@ -64,7 +66,7 @@ use crate::file_lock::FileLocking;
 use crate::filter_pipeline::FilterPipeline;
 
 /// Per-dataset state located once, then maintained across appends.
-struct DatasetState {
+pub(crate) struct DatasetState {
     loc: Located,
     /// The dataset's on-disk element datatype (for the append type check and the
     /// filter chunk context).
@@ -75,6 +77,124 @@ struct DatasetState {
     element_size: usize,
     /// The re-encodable filter pipeline, when the dataset is filtered.
     pipeline: Option<FilterPipeline>,
+}
+
+/// Locate a dataset by its object-header address (validating append eligibility)
+/// and cache the per-dataset state, if not already cached. Shared by the
+/// held-open [`AppendWriter`] and the owned-handle append path
+/// ([`crate::Dataset::append`]); both drive the same in-place engine, so the
+/// eligibility rules live in one place.
+pub(crate) fn ensure_located_at<F: InPlaceBytes>(
+    file: &F,
+    cache: &mut HashMap<u64, DatasetState>,
+    oh_addr: u64,
+    unsupported: fn(&'static str) -> Error,
+) -> Result<(), Error> {
+    if cache.contains_key(&oh_addr) {
+        return Ok(());
+    }
+    let result = Located::locate_at(file, oh_addr, unsupported)?;
+    if result.located.chunk_elems == 0 {
+        return Err(unsupported("append requires a nonzero chunk length"));
+    }
+    let data = file.data();
+    let (dt_off, dt_size) = result.spans.datatype;
+    let (datatype, _) = Datatype::parse(&data[dt_off..dt_off + dt_size])
+        .map_err(|_| unsupported("dataset datatype could not be parsed"))?;
+    let pipeline = match result.spans.filter {
+        Some((fb, fsize)) => {
+            let parsed = FilterPipeline::parse(&data[fb..fb + fsize])
+                .map_err(|_| unsupported("dataset filter pipeline could not be parsed"))?;
+            if !pipeline_reencodable(&parsed) {
+                return Err(unsupported(
+                    "dataset uses a filter this engine cannot re-encode",
+                ));
+            }
+            Some(parsed)
+        }
+        None => None,
+    };
+    let element_size = result.located.elem_bytes;
+    let spatial = vec![result.located.chunk_elems];
+    cache.insert(
+        oh_addr,
+        DatasetState {
+            loc: result.located,
+            datatype,
+            spatial,
+            element_size,
+            pipeline,
+        },
+    );
+    Ok(())
+}
+
+/// Apply a gathered append to the dataset at object-header address `oh_addr`,
+/// running the first `max_phase` durability phases. Shared engine entry point
+/// for [`AppendWriter`] and [`crate::Dataset::append`].
+pub(crate) fn append_gathered_at<F: InPlaceBytes>(
+    file: &mut F,
+    cache: &mut HashMap<u64, DatasetState>,
+    oh_addr: u64,
+    b: &AppendBuilder,
+    max_phase: u8,
+    unsupported: fn(&'static str) -> Error,
+) -> Result<(), Error> {
+    if b.dt_conflict() {
+        return Err(unsupported(
+            "append mixes element types in one call; use one element type per append",
+        ));
+    }
+    ensure_located_at(file, cache, oh_addr, unsupported)?;
+
+    let raw = b.raw();
+    {
+        let st = &cache[&oh_addr];
+        if raw.len() % st.element_size != 0 {
+            return Err(unsupported(
+                "appended byte length is not a whole number of elements",
+            ));
+        }
+        match b.elem_dt() {
+            Some(expected) if *expected != st.datatype => {
+                return Err(unsupported(
+                    "append datatype does not match the on-disk dataset (wrong element \
+                     type or byte order)",
+                ));
+            }
+            Some(_) => {}
+            None => {
+                if !datatype_is_raw_appendable(&st.datatype) {
+                    return Err(unsupported(
+                        "append_raw onto this dataset's datatype (non-little-endian, \
+                         variable-length, or reference) could misencode the bytes; use a \
+                         typed append",
+                    ));
+                }
+            }
+        }
+    }
+
+    let new_elems = (raw.len() / cache[&oh_addr].element_size) as u64;
+    if new_elems == 0 {
+        return Ok(());
+    }
+
+    let plan = {
+        let st = &cache[&oh_addr];
+        plan_ea_append(
+            file,
+            &st.loc,
+            &st.datatype,
+            &st.spatial,
+            st.element_size,
+            st.pipeline.as_ref(),
+            raw,
+            new_elems,
+        )?
+    };
+    let st = cache.get_mut(&oh_addr).expect("dataset was located above");
+    apply_ea_append(file, &mut st.loc, &plan, max_phase)
 }
 
 /// A throughput-oriented in-place append writer for a chunked, unlimited dataset.

@@ -2,7 +2,13 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use crate::append_writer::{DatasetState, append_gathered_at};
+use crate::chunk_index_inplace::InPlaceFile;
+use crate::edit::AppendBuilder;
+use crate::element::H5Element;
+use crate::file_lock::FileLocking;
 
 use crate::attribute::{extract_attributes_full, extract_attributes_full_from_source};
 use crate::chunk_cache::{ChunkCache, ChunkCacheConfig, ChunkCacheStats};
@@ -40,6 +46,18 @@ use crate::types::{AttrValue, DType, attrs_to_map, classify_datatype};
 enum Backend {
     InMemory(Vec<u8>),
     Streaming(Box<dyn FileSource + Send + Sync>),
+    /// A read-write file opened with [`File::open_rw`]: a whole-file mirror plus
+    /// an exclusive OS lock and a per-dataset append cache, behind a lock so
+    /// owned handles can both read and append in place. Reads slice the mirror;
+    /// `Dataset::append` mutates it through the same lock.
+    Mirror(Mutex<MirrorCore>),
+}
+
+/// The mutable state behind a [`Backend::Mirror`]: the in-place file engine and
+/// the located per-dataset append cache (keyed by object-header address).
+struct MirrorCore {
+    inplace: InPlaceFile,
+    located: HashMap<u64, DatasetState>,
 }
 
 /// A borrowed `FileSource` view over a [`File`]'s backend, used by the
@@ -376,11 +394,34 @@ impl FileInner {
         ))
     }
 
+    /// Open an existing HDF5 file for reading **and** in-place appends, taking an
+    /// exclusive OS file lock held for the file's life. Requires a latest-format
+    /// (version-2/3 superblock) file with no userblock.
+    fn open_rw<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
+        let inplace = InPlaceFile::open(path, Some(FileLocking::Enabled), Error::EditUnsupported)?;
+        let (superblock, addr_offset) = Self::parse_superblock(inplace.data())?;
+        let core = MirrorCore {
+            inplace,
+            located: HashMap::new(),
+        };
+        Ok(Self::from_parts(
+            Backend::Mirror(Mutex::new(core)),
+            superblock,
+            addr_offset,
+            None,
+            FileAccessOptions::new(),
+        ))
+    }
+
     /// A `FileSource` view over the backend, for the streaming-capable paths.
     pub(crate) fn source(&self) -> SourceView<'_> {
         match &self.backend {
             Backend::InMemory(v) => SourceView::Mem(v),
             Backend::Streaming(s) => SourceView::Stream(s.as_ref()),
+            // A mirror file's bytes live behind a lock and cannot be lent out as
+            // a borrowed view; its read paths take the lock directly instead, so
+            // this arm is never reached.
+            Backend::Mirror(_) => SourceView::Mem(&[]),
         }
     }
 
@@ -532,6 +573,10 @@ impl FileInner {
             Backend::Streaming(s) => {
                 group_v2::resolve_path_any_from_source(s.as_ref(), &self.superblock, path)?
             }
+            Backend::Mirror(m) => {
+                let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                group_v2::resolve_path_any(core.inplace.data(), &self.superblock, path)?
+            }
         })
     }
 
@@ -540,7 +585,8 @@ impl FileInner {
     pub fn as_bytes(&self) -> &[u8] {
         match &self.backend {
             Backend::InMemory(v) => v,
-            Backend::Streaming(_) => &[],
+            // A streaming or mirror file has no borrowable whole-file buffer.
+            Backend::Streaming(_) | Backend::Mirror(_) => &[],
         }
     }
 
@@ -562,7 +608,7 @@ impl FileInner {
     pub(crate) fn in_memory_image(&self) -> Option<&[u8]> {
         match &self.backend {
             Backend::InMemory(data) => Some(data),
-            Backend::Streaming(_) => None,
+            Backend::Streaming(_) | Backend::Mirror(_) => None,
         }
     }
 
@@ -626,7 +672,13 @@ impl FileInner {
     /// `Superblock::eof_address` (reachable via
     /// [`File::superblock`]) to detect appended or unaccounted tail bytes.
     pub fn file_size(&self) -> u64 {
-        self.source().len()
+        match &self.backend {
+            Backend::Mirror(m) => {
+                let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                core.inplace.data().len() as u64
+            }
+            _ => self.source().len(),
+        }
     }
 
     /// The minimum library version required to read this file, derived from its
@@ -647,6 +699,16 @@ impl FileInner {
             }
             Backend::Streaming(s) => {
                 ObjectHeader::parse_from_source(s.as_ref(), address, os, ls, self.addr_offset)
+            }
+            Backend::Mirror(m) => {
+                let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                ObjectHeader::parse_with_base(
+                    core.inplace.data(),
+                    address.to_usize()?,
+                    os,
+                    ls,
+                    self.addr_offset,
+                )
             }
         }
     }
@@ -705,6 +767,10 @@ impl FileInner {
             Backend::Streaming(s) => {
                 group_v2::resolve_group_entries_from_source(s.as_ref(), hdr, os, ls, base)
             }
+            Backend::Mirror(m) => {
+                let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                group_v2::resolve_group_entries(core.inplace.data(), hdr, os, ls, base)
+            }
         }
         .map_err(Error::Format)?;
         for entry in &mut entries {
@@ -726,7 +792,19 @@ impl FileInner {
     fn attrs_of(&self, hdr: &ObjectHeader) -> Result<HashMap<String, AttrValue>, Error> {
         let (os, ls, base) = (self.offset_size(), self.length_size(), self.addr_offset);
         let attr_msgs = self.attr_messages_of(hdr)?;
-        Ok(attrs_to_map(&attr_msgs, &self.source(), os, ls, base))
+        match &self.backend {
+            Backend::Mirror(m) => {
+                let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                Ok(attrs_to_map(
+                    &attr_msgs,
+                    &BytesSource::new(core.inplace.data()),
+                    os,
+                    ls,
+                    base,
+                ))
+            }
+            _ => Ok(attrs_to_map(&attr_msgs, &self.source(), os, ls, base)),
+        }
     }
 
     /// Names of every attribute message on `hdr`, including ones whose datatype
@@ -756,6 +834,10 @@ impl FileInner {
                 os,
                 ls,
             )?),
+            Backend::Mirror(m) => {
+                let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                Ok(extract_attributes_full(core.inplace.data(), hdr, os, ls)?)
+            }
         }
     }
 
@@ -809,6 +891,20 @@ impl FileInner {
                     &framed, dl, ds, dt, pipeline, os, ls, cache,
                 )
             }
+            Backend::Mirror(m) => {
+                let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let data = core.inplace.data();
+                let frame = if base == 0 {
+                    data
+                } else {
+                    let start = base.to_usize()?;
+                    data.get(start..).ok_or(FormatError::UnexpectedEof {
+                        expected: start,
+                        available: data.len(),
+                    })?
+                };
+                data_read::read_raw_data_cached(frame, dl, ds, dt, pipeline, os, ls, cache)
+            }
         }
     }
 }
@@ -816,7 +912,7 @@ impl FileInner {
 impl std::fmt::Debug for FileInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("File")
-            .field("size", &self.source().len())
+            .field("size", &self.file_size())
             .field("superblock_version", &self.superblock.version)
             .finish()
     }
@@ -922,6 +1018,21 @@ impl File {
     ) -> Result<Self, Error> {
         Ok(File {
             inner: Arc::new(FileInner::from_bytes_with_options(data, options)?),
+        })
+    }
+
+    /// Open an existing HDF5 file for reading **and** in-place appends.
+    ///
+    /// Unlike [`open`](Self::open) (read-only, buffered), this takes an exclusive
+    /// OS file lock held for the file's life and lets owned [`Dataset`] handles
+    /// grow a chunked, unlimited, Extensible-Array-indexed dataset in place via
+    /// [`Dataset::append`], reading the appended data back through the same
+    /// handle. Requires a latest-format (version-2/3 superblock) file with no
+    /// userblock; other files are refused with
+    /// [`Error::EditUnsupported`](crate::Error::EditUnsupported).
+    pub fn open_rw<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
+        Ok(File {
+            inner: Arc::new(FileInner::open_rw(path)?),
         })
     }
 
@@ -1236,6 +1347,57 @@ impl Dataset {
     /// Used to resolve object references that point at this dataset.
     pub(crate) fn header_address(&self) -> u64 {
         self.address
+    }
+
+    /// Append `data` to this dataset in place, growing it along its first
+    /// (unlimited) dimension, and refresh this handle so subsequent reads observe
+    /// the new length.
+    ///
+    /// The file must have been opened for writing with [`File::open_rw`]; a
+    /// read-only file returns [`Error::ReadOnly`](crate::Error::ReadOnly). The
+    /// target must be a chunked, rank-1, unlimited, Extensible-Array-indexed
+    /// dataset — the same contract as [`AppendWriter`](crate::AppendWriter),
+    /// including filtered whole-chunk / unfiltered any-length rules — otherwise
+    /// [`Error::AppendUnsupported`](crate::Error::AppendUnsupported) is returned.
+    /// Each append is crash-atomic.
+    pub fn append<T: H5Element>(&mut self, data: &[T]) -> Result<(), Error> {
+        let mut b = AppendBuilder::new();
+        b.append(data);
+        self.append_gathered(&b)
+    }
+
+    /// Append raw little-endian element bytes to this dataset in place. Prefer
+    /// [`append`](Self::append) when the element type is known; see it for the
+    /// file-mode and eligibility rules.
+    pub fn append_raw(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        let mut b = AppendBuilder::new();
+        b.append_raw(bytes);
+        self.append_gathered(&b)
+    }
+
+    fn append_gathered(&mut self, b: &AppendBuilder) -> Result<(), Error> {
+        if !matches!(self.file.backend, Backend::Mirror(_)) {
+            return Err(Error::ReadOnly);
+        }
+        {
+            let Backend::Mirror(m) = &self.file.backend else {
+                unreachable!("checked above")
+            };
+            let mut core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let MirrorCore { inplace, located } = &mut *core;
+            append_gathered_at(
+                inplace,
+                located,
+                self.address,
+                b,
+                4,
+                Error::AppendUnsupported,
+            )?;
+        }
+        // The append changed the on-disk dataspace dimension; re-parse the cached
+        // header so this handle's reads (shape, read_*) see the new length.
+        self.header = self.file.parse_header(self.address)?;
+        Ok(())
     }
 
     /// The effective raw chunk-cache configuration for this dataset.
