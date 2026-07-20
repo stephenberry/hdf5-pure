@@ -275,6 +275,26 @@ struct FileInner {
     /// returns [`Error::FileClosed`]. Reads still work. Only ever set on a
     /// `Backend::Mirror` file.
     closed: AtomicBool,
+    /// True for a file opened with [`File::open_swmr_writer`]: no OS lock is held,
+    /// the superblock's SWMR-write flag is raised, only immediate
+    /// [`Dataset::append`] is permitted (the staged surface is refused), and the
+    /// flag is cleared on [`File::close`] / `Drop`. `false` for every other file.
+    swmr_write: bool,
+}
+
+impl Drop for FileInner {
+    /// Best-effort clear of the SWMR-write flag for a writer dropped without an
+    /// explicit [`File::close`] (mirroring `SwmrWriter::drop`). Runs only when the
+    /// last `Arc<FileInner>` clone drops; a clean `close` already cleared the flag
+    /// and set `closed`, so this is idempotent and skipped in that case.
+    fn drop(&mut self) {
+        if self.swmr_write && !self.closed.load(Ordering::Acquire) {
+            if let Backend::Mirror(m) = &self.backend {
+                let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = session.set_consistency_flags(0);
+            }
+        }
+    }
 }
 
 impl FileInner {
@@ -421,6 +441,27 @@ impl FileInner {
         ))
     }
 
+    /// Open for SWMR writing: no OS lock, superblock SWMR-write flag raised.
+    fn open_swmr_writer<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
+        let mut inner = Self::from_rw_session(EditSession::open_swmr_writer(path)?)?;
+        inner.swmr_write = true;
+        Ok(inner)
+    }
+
+    /// After the caller has confirmed a [`Backend::Mirror`] backend, gate the
+    /// mutation: refuse a sealed file with [`Error::FileClosed`], and in
+    /// SWMR-writer mode refuse a staged edit (`staged = true`) with
+    /// [`Error::SwmrStagedUnsupported`] — only immediate appends are allowed.
+    fn check_mutable(&self, staged: bool) -> Result<(), Error> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(Error::FileClosed);
+        }
+        if staged && self.swmr_write {
+            return Err(Error::SwmrStagedUnsupported);
+        }
+        Ok(())
+    }
+
     /// A `FileSource` view over the backend, for the streaming-capable paths.
     pub(crate) fn source(&self) -> SourceView<'_> {
         match &self.backend {
@@ -488,6 +529,7 @@ impl FileInner {
             file_space_info: None,
             access_options,
             closed: AtomicBool::new(false),
+            swmr_write: false,
         };
         file.file_space_info = file.read_file_space_info();
         file
@@ -1093,6 +1135,40 @@ impl File {
         })
     }
 
+    /// Open an existing file for **SWMR** (single-writer/multiple-reader)
+    /// appending: take **no** OS lock (so concurrent readers, and Windows'
+    /// mandatory locks, are never blocked) and raise the superblock's SWMR-write
+    /// flag so a reader may attach with [`File::open_swmr`], the C library's
+    /// `H5F_ACC_SWMR_READ`, or h5py `swmr=True`.
+    ///
+    /// Only immediate [`Dataset::append`] is permitted, and only over the SWMR
+    /// subset — an **unfiltered**, chunk-aligned append, so a concurrent reader
+    /// only ever observes a consistent prefix; a filtered or non-chunk-aligned
+    /// append returns [`Error::SwmrAppendUnsupported`](crate::Error::SwmrAppendUnsupported).
+    /// The staged edit surface (`write`/`set_attr`/`create_*`/`delete`/`copy`/
+    /// `commit`) returns
+    /// [`Error::SwmrStagedUnsupported`](crate::Error::SwmrStagedUnsupported).
+    /// [`close`](Self::close) clears the SWMR-write flag; a writer that exits
+    /// without a clean close leaves it set — recover with
+    /// [`clear_swmr_flag`](Self::clear_swmr_flag).
+    ///
+    /// Requires a latest-format (version-2/3 superblock) file with no userblock
+    /// and no persisted free-space; other files are refused with
+    /// [`Error::SwmrAppendUnsupported`](crate::Error::SwmrAppendUnsupported).
+    pub fn open_swmr_writer<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
+        Ok(File {
+            inner: Arc::new(FileInner::open_swmr_writer(path)?),
+        })
+    }
+
+    /// Clear a stale SWMR-write flag left in `path` by a writer that exited
+    /// without a clean [`close`](Self::close) — the `h5clear -s` equivalent, for
+    /// recovering a file the reference C library then refuses to open. A no-op if
+    /// the flag is already clear.
+    pub fn clear_swmr_flag<P: AsRef<std::path::Path>>(path: P) -> Result<(), Error> {
+        crate::swmr_writer::SwmrWriter::clear_swmr_flag(path)
+    }
+
     /// Create a new, empty HDF5 file at `path` and open it for reading and
     /// writing, so its contents can be built entirely through owned handles
     /// ([`Group::create_dataset`]/[`create_group`](Group::create_group), then
@@ -1115,7 +1191,7 @@ impl File {
     /// [`Error::ReadOnly`](crate::Error::ReadOnly). A commit that relocates
     /// objects invalidates outstanding handles — re-fetch any you keep using.
     pub fn commit(&self) -> Result<(), Error> {
-        self.with_mirror_session(|session| session.commit())
+        self.with_mirror_session(true, |session| session.commit())
     }
 
     /// Copy the object at `src` to `dst` within this file (the in-file
@@ -1124,7 +1200,7 @@ impl File {
     /// Requires a read-write file ([`File::open_rw`]); a read-only file returns
     /// [`Error::ReadOnly`](crate::Error::ReadOnly).
     pub fn copy(&self, src: &str, dst: &str) -> Result<(), Error> {
-        self.with_mirror_session(|session| {
+        self.with_mirror_session(true, |session| {
             session.copy(&normalize_path(src), &normalize_path(dst));
             Ok(())
         })
@@ -1142,7 +1218,7 @@ impl File {
     /// call. Requires a read-write destination ([`File::open_rw`]); a read-only
     /// one returns [`Error::ReadOnly`](crate::Error::ReadOnly).
     pub fn copy_from(&self, source: &File, src: &str, dst: &str) -> Result<(), Error> {
-        self.with_mirror_session(|session| session.copy_from(source, src, dst))
+        self.with_mirror_session(true, |session| session.copy_from(source, src, dst))
     }
 
     /// Report whether this file has structural edits staged but not yet applied
@@ -1186,26 +1262,38 @@ impl File {
     /// reads still work.
     pub fn close(self) -> Result<(), Error> {
         if matches!(self.inner.backend, Backend::Mirror(_)) {
-            self.commit()?;
+            if self.inner.swmr_write {
+                // SWMR mode stages nothing (the staged surface is refused), so do
+                // not commit — clear the SWMR-write flag and flush, marking the
+                // file cleanly closed for any concurrent reader.
+                if let Backend::Mirror(m) = &self.inner.backend {
+                    let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    session.set_consistency_flags(0)?;
+                }
+            } else {
+                self.commit()?;
+            }
             self.inner.closed.store(true, Ordering::Release);
         }
         Ok(())
     }
 
-    /// Run `f` with the locked write session of a read-write file. Returns
-    /// [`Error::ReadOnly`](crate::Error::ReadOnly) for a read-only file and
-    /// [`Error::FileClosed`](crate::Error::FileClosed) once the file has been
-    /// sealed by [`close`](Self::close).
+    /// Run `f` with the locked write session of a read-write file. `staged`
+    /// distinguishes an edit applied by [`commit`](Self::commit) from an immediate
+    /// one. Returns [`Error::ReadOnly`](crate::Error::ReadOnly) for a read-only
+    /// file, [`Error::FileClosed`](crate::Error::FileClosed) once the file is
+    /// sealed by [`close`](Self::close), and
+    /// [`Error::SwmrStagedUnsupported`](crate::Error::SwmrStagedUnsupported) for a
+    /// staged edit on a SWMR-writer file.
     fn with_mirror_session<R>(
         &self,
+        staged: bool,
         f: impl FnOnce(&mut EditSession) -> Result<R, Error>,
     ) -> Result<R, Error> {
         let Backend::Mirror(m) = &self.inner.backend else {
             return Err(Error::ReadOnly);
         };
-        if self.inner.closed.load(Ordering::Acquire) {
-            return Err(Error::FileClosed);
-        }
+        self.inner.check_mutable(staged)?;
         let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         f(&mut session)
     }
@@ -1578,9 +1666,7 @@ impl Group {
         let Backend::Mirror(m) = &self.file.backend else {
             return Err(Error::ReadOnly);
         };
-        if self.file.closed.load(Ordering::Acquire) {
-            return Err(Error::FileClosed);
-        }
+        self.file.check_mutable(true)?;
         let child = self.child_path(name).ok_or(Error::ReadOnly)?;
         let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         f(&mut session, &child)
@@ -1598,9 +1684,7 @@ impl Group {
         let Backend::Mirror(m) = &self.file.backend else {
             return Err(Error::ReadOnly);
         };
-        if self.file.closed.load(Ordering::Acquire) {
-            return Err(Error::FileClosed);
-        }
+        self.file.check_mutable(true)?;
         let path = self.path.clone().ok_or(Error::ReadOnly)?;
         let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         f(&mut session, &path)
@@ -1663,14 +1747,16 @@ impl Dataset {
     /// [`Error::AppendUnsupported`](crate::Error::AppendUnsupported) is returned.
     /// The append is immediate and crash-atomic (no `commit` needed).
     pub fn append<T: H5Element>(&mut self, data: &[T]) -> Result<(), Error> {
-        self.with_session_mut(|session, path| session.append_inplace(path, data))
+        self.with_session_mut(false, |session, path| session.append_inplace(path, data))
     }
 
     /// Append raw little-endian element bytes to this dataset in place. Prefer
     /// [`append`](Self::append) when the element type is known; see it for the
     /// file-mode and eligibility rules.
     pub fn append_raw(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        self.with_session_mut(|session, path| session.append_inplace_raw(path, bytes))
+        self.with_session_mut(false, |session, path| {
+            session.append_inplace_raw(path, bytes)
+        })
     }
 
     /// Overwrite this dataset's values, staged until [`File::commit`]. The new
@@ -1680,7 +1766,7 @@ impl Dataset {
     /// [`Error::ReadOnly`](crate::Error::ReadOnly). Unlike [`append`](Self::append)
     /// (immediate), this is a staged edit applied on [`File::commit`].
     pub fn write<T: H5Element>(&mut self, data: &[T]) -> Result<(), Error> {
-        self.with_session_mut(|session, path| {
+        self.with_session_mut(true, |session, path| {
             let builder = session.write_dataset(path);
             T::write_into(builder, data);
             Ok(())
@@ -1705,7 +1791,7 @@ impl Dataset {
     /// The file must have been opened with [`File::open_rw`], else
     /// [`Error::ReadOnly`](crate::Error::ReadOnly).
     pub fn append_staged(&mut self, build: impl FnOnce(&mut AppendBuilder)) -> Result<(), Error> {
-        self.with_session_mut(|session, path| {
+        self.with_session_mut(true, |session, path| {
             build(session.append_dataset(path));
             Ok(())
         })
@@ -1717,7 +1803,7 @@ impl Dataset {
     /// The file must have been opened with [`File::open_rw`], else
     /// [`Error::ReadOnly`](crate::Error::ReadOnly).
     pub fn set_attr(&mut self, name: &str, value: AttrValue) -> Result<(), Error> {
-        self.with_session_mut(|session, path| {
+        self.with_session_mut(true, |session, path| {
             session.set_dataset_attr(path, name, value);
             Ok(())
         })
@@ -1726,7 +1812,7 @@ impl Dataset {
     /// Remove a compact attribute from this dataset, staged until
     /// [`File::commit`]. See [`set_attr`](Self::set_attr) for the file-mode rules.
     pub fn remove_attr(&mut self, name: &str) -> Result<(), Error> {
-        self.with_session_mut(|session, path| {
+        self.with_session_mut(true, |session, path| {
             session.remove_dataset_attr(path, name);
             Ok(())
         })
@@ -1739,14 +1825,13 @@ impl Dataset {
     /// handle has no resolvable path (reached by object reference).
     fn with_session_mut<R>(
         &mut self,
+        staged: bool,
         f: impl FnOnce(&mut EditSession, &str) -> Result<R, Error>,
     ) -> Result<R, Error> {
         let Backend::Mirror(m) = &self.file.backend else {
             return Err(Error::ReadOnly);
         };
-        if self.file.closed.load(Ordering::Acquire) {
-            return Err(Error::FileClosed);
-        }
+        self.file.check_mutable(staged)?;
         let path = self.path.clone().ok_or(Error::ReadOnly)?;
         let out = {
             let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);

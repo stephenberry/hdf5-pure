@@ -688,6 +688,13 @@ pub enum Error {
     /// refused; reads through surviving handles still work. Re-open the file to
     /// modify it again.
     FileClosed,
+    /// A staged edit (`write` / `set_attr` / `create_*` / `delete` / `copy` /
+    /// `commit`) was requested on a file opened with
+    /// [`crate::File::open_swmr_writer`], which permits only immediate
+    /// [`crate::Dataset::append`]. Committing a structural edit would clear the
+    /// SWMR-write flag out from under a concurrent reader, so the whole staged
+    /// surface is refused in SWMR-writer mode.
+    SwmrStagedUnsupported,
     /// The file or dataset is not a supported target for the SWMR append writer
     /// (e.g. a userblock or non-latest-format file, or a dataset that is
     /// filtered, not rank-1 with an unlimited dimension, or not
@@ -761,6 +768,10 @@ impl fmt::Display for Error {
             Error::FileClosed => write!(
                 f,
                 "cannot write through a handle after File::close; re-open the file to modify it"
+            ),
+            Error::SwmrStagedUnsupported => write!(
+                f,
+                "a file opened with File::open_swmr_writer allows only immediate Dataset::append, not staged edits"
             ),
             Error::SwmrAppendUnsupported(reason) => {
                 write!(f, "unsupported SWMR append target: {reason}")
