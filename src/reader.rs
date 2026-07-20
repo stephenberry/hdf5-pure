@@ -4,11 +4,9 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::{Arc, Mutex};
 
-use crate::append_writer::{DatasetState, append_gathered_at};
-use crate::chunk_index_inplace::InPlaceFile;
-use crate::edit::AppendBuilder;
+use crate::edit::EditSession;
 use crate::element::H5Element;
-use crate::file_lock::FileLocking;
+use crate::type_builders::DatasetBuilder;
 
 use crate::attribute::{extract_attributes_full, extract_attributes_full_from_source};
 use crate::chunk_cache::{ChunkCache, ChunkCacheConfig, ChunkCacheStats};
@@ -46,18 +44,14 @@ use crate::types::{AttrValue, DType, attrs_to_map, classify_datatype};
 enum Backend {
     InMemory(Vec<u8>),
     Streaming(Box<dyn FileSource + Send + Sync>),
-    /// A read-write file opened with [`File::open_rw`]: a whole-file mirror plus
-    /// an exclusive OS lock and a per-dataset append cache, behind a lock so
-    /// owned handles can both read and append in place. Reads slice the mirror;
-    /// `Dataset::append` mutates it through the same lock.
-    Mirror(Mutex<MirrorCore>),
-}
-
-/// The mutable state behind a [`Backend::Mirror`]: the in-place file engine and
-/// the located per-dataset append cache (keyed by object-header address).
-struct MirrorCore {
-    inplace: InPlaceFile,
-    located: HashMap<u64, DatasetState>,
+    /// A read-write file opened with [`File::open_rw`]: an [`EditSession`] (a
+    /// whole-file mirror + exclusive OS lock + staged-edit queues) behind a lock,
+    /// so owned handles can both read and mutate in place. Reads slice the
+    /// session's mirror; handle write methods route to the session, and
+    /// `File::commit` applies staged structural edits. Boxed to keep the
+    /// `Backend` enum small (an `EditSession` is far larger than the other
+    /// variants).
+    Mirror(Box<Mutex<EditSession>>),
 }
 
 /// A borrowed `FileSource` view over a [`File`]'s backend, used by the
@@ -398,14 +392,10 @@ impl FileInner {
     /// exclusive OS file lock held for the file's life. Requires a latest-format
     /// (version-2/3 superblock) file with no userblock.
     fn open_rw<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
-        let inplace = InPlaceFile::open(path, Some(FileLocking::Enabled), Error::EditUnsupported)?;
-        let (superblock, addr_offset) = Self::parse_superblock(inplace.data())?;
-        let core = MirrorCore {
-            inplace,
-            located: HashMap::new(),
-        };
+        let session = EditSession::open(path)?;
+        let (superblock, addr_offset) = Self::parse_superblock(session.mirror_bytes())?;
         Ok(Self::from_parts(
-            Backend::Mirror(Mutex::new(core)),
+            Backend::Mirror(Box::new(Mutex::new(session))),
             superblock,
             addr_offset,
             None,
@@ -575,7 +565,13 @@ impl FileInner {
             }
             Backend::Mirror(m) => {
                 let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                group_v2::resolve_path_any(core.inplace.data(), &self.superblock, path)?
+                let data = core.mirror_bytes();
+                // A staged commit can relocate the object tree's root, so the
+                // cached superblock's root address may be stale; re-parse the
+                // (small, fixed) superblock from the live mirror to resolve
+                // against the committed root.
+                let (sb, _base) = Self::parse_superblock(data)?;
+                group_v2::resolve_path_any(data, &sb, path)?
             }
         })
     }
@@ -675,7 +671,7 @@ impl FileInner {
         match &self.backend {
             Backend::Mirror(m) => {
                 let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                core.inplace.data().len() as u64
+                core.mirror_bytes().len() as u64
             }
             _ => self.source().len(),
         }
@@ -703,7 +699,7 @@ impl FileInner {
             Backend::Mirror(m) => {
                 let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 ObjectHeader::parse_with_base(
-                    core.inplace.data(),
+                    core.mirror_bytes(),
                     address.to_usize()?,
                     os,
                     ls,
@@ -739,11 +735,13 @@ impl FileInner {
                 header: hdr,
                 chunk_cache: ChunkCache::with_config(chunk_cache),
                 chunk_cache_config: chunk_cache,
+                path: None,
             })))
         } else if is_group(&hdr) {
             Ok(Object::Group(Group {
                 file: file.clone(),
                 address: abs,
+                path: None,
             }))
         } else {
             Err(FormatError::InvalidObjectReference(rel_addr).into())
@@ -769,7 +767,7 @@ impl FileInner {
             }
             Backend::Mirror(m) => {
                 let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                group_v2::resolve_group_entries(core.inplace.data(), hdr, os, ls, base)
+                group_v2::resolve_group_entries(core.mirror_bytes(), hdr, os, ls, base)
             }
         }
         .map_err(Error::Format)?;
@@ -797,7 +795,7 @@ impl FileInner {
                 let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 Ok(attrs_to_map(
                     &attr_msgs,
-                    &BytesSource::new(core.inplace.data()),
+                    &BytesSource::new(core.mirror_bytes()),
                     os,
                     ls,
                     base,
@@ -836,7 +834,7 @@ impl FileInner {
             )?),
             Backend::Mirror(m) => {
                 let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                Ok(extract_attributes_full(core.inplace.data(), hdr, os, ls)?)
+                Ok(extract_attributes_full(core.mirror_bytes(), hdr, os, ls)?)
             }
         }
     }
@@ -893,7 +891,7 @@ impl FileInner {
             }
             Backend::Mirror(m) => {
                 let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let data = core.inplace.data();
+                let data = core.mirror_bytes();
                 let frame = if base == 0 {
                     data
                 } else {
@@ -1036,12 +1034,40 @@ impl File {
         })
     }
 
+    /// Apply all staged structural edits made through this file's handles —
+    /// [`Dataset::write`]/`set_attr`/`remove_attr` and
+    /// [`Group::create_group`]/`delete` — as one transaction. Immediate
+    /// [`Dataset::append`]s need no commit.
+    ///
+    /// Requires a read-write file ([`File::open_rw`]); a read-only file returns
+    /// [`Error::ReadOnly`](crate::Error::ReadOnly). A commit that relocates
+    /// objects invalidates outstanding handles — re-fetch any you keep using.
+    pub fn commit(&self) -> Result<(), Error> {
+        match &self.inner.backend {
+            Backend::Mirror(m) => {
+                let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                session.commit()
+            }
+            _ => Err(Error::ReadOnly),
+        }
+    }
+
+    /// Commit any staged edits and drop this file handle. The exclusive OS lock
+    /// is released once the last handle derived from this file is also dropped.
+    pub fn close(self) -> Result<(), Error> {
+        if matches!(self.inner.backend, Backend::Mirror(_)) {
+            self.commit()?;
+        }
+        Ok(())
+    }
+
     /// Returns an owned handle to the root group.
     pub fn root(&self) -> Group {
         Group {
             // root_group_address was normalized to absolute in from_bytes()
             address: self.inner.superblock.root_group_address,
             file: self.inner.clone(),
+            path: Some(String::new()),
         }
     }
 
@@ -1078,6 +1104,7 @@ impl File {
             header: hdr,
             chunk_cache: ChunkCache::with_config(chunk_cache),
             chunk_cache_config: chunk_cache,
+            path: Some(normalize_path(path)),
         })
     }
 
@@ -1087,6 +1114,7 @@ impl File {
         Ok(Group {
             file: self.inner.clone(),
             address: addr,
+            path: Some(normalize_path(path)),
         })
     }
 
@@ -1211,6 +1239,11 @@ impl std::fmt::Debug for Object {
 pub struct Group {
     file: Arc<FileInner>,
     address: u64,
+    /// Root-relative path of this group (e.g. `""` for the root, `"a/b"`), used
+    /// to address the group and its children for write operations on a
+    /// read-write file. `None` for a group reached by object reference
+    /// ([`Dataset::dereference`]), which has no resolvable path.
+    path: Option<String>,
 }
 
 impl Group {
@@ -1293,6 +1326,7 @@ impl Group {
             header: hdr,
             chunk_cache: ChunkCache::with_config(chunk_cache),
             chunk_cache_config: chunk_cache,
+            path: self.child_path(name),
         })
     }
 
@@ -1306,7 +1340,73 @@ impl Group {
         Ok(Group {
             file: self.file.clone(),
             address: entry.object_header_address,
+            path: self.child_path(name),
         })
+    }
+
+    /// The root-relative path of a child named `name`, or `None` if this group
+    /// itself has no resolvable path (reached by object reference).
+    fn child_path(&self, name: &str) -> Option<String> {
+        self.path.as_ref().map(|p| {
+            if p.is_empty() {
+                name.to_string()
+            } else {
+                format!("{p}/{name}")
+            }
+        })
+    }
+
+    /// Create a subgroup `name` within this group, staged until [`File::commit`].
+    ///
+    /// Requires a read-write file ([`File::open_rw`]), else
+    /// [`Error::ReadOnly`](crate::Error::ReadOnly).
+    pub fn create_group(&self, name: &str) -> Result<(), Error> {
+        self.with_child_session(name, |session, child| {
+            session.create_group(child);
+            Ok(())
+        })
+    }
+
+    /// Create a dataset `name` within this group, configuring it through `build`
+    /// (shape, data, chunks, filters, …), staged until [`File::commit`].
+    ///
+    /// Requires a read-write file ([`File::open_rw`]), else
+    /// [`Error::ReadOnly`](crate::Error::ReadOnly).
+    pub fn create_dataset(
+        &self,
+        name: &str,
+        build: impl FnOnce(&mut DatasetBuilder),
+    ) -> Result<(), Error> {
+        self.with_child_session(name, |session, child| {
+            build(session.create_dataset(child));
+            Ok(())
+        })
+    }
+
+    /// Delete the object named `name` from this group, staged until
+    /// [`File::commit`]. See [`create_group`](Self::create_group) for the
+    /// file-mode rules.
+    pub fn delete(&self, name: &str) -> Result<(), Error> {
+        self.with_child_session(name, |session, child| {
+            session.delete(child);
+            Ok(())
+        })
+    }
+
+    /// Run `f` with the writable session and the root-relative path of child
+    /// `name`. Returns [`Error::ReadOnly`](crate::Error::ReadOnly) if the file is
+    /// read-only or this group has no resolvable path.
+    fn with_child_session<R>(
+        &self,
+        name: &str,
+        f: impl FnOnce(&mut EditSession, &str) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        let Backend::Mirror(m) = &self.file.backend else {
+            return Err(Error::ReadOnly);
+        };
+        let child = self.child_path(name).ok_or(Error::ReadOnly)?;
+        let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        f(&mut session, &child)
     }
 
     fn children(&self) -> Result<Vec<GroupEntry>, Error> {
@@ -1332,6 +1432,10 @@ pub struct Dataset {
     // The effective chunk-cache config for this dataset: the file-wide default
     // or a per-dataset DAPL override. Reported by `chunk_cache_config`.
     chunk_cache_config: ChunkCacheConfig,
+    /// Root-relative path of this dataset, used to address it for write
+    /// operations on a read-write file. `None` for a dataset reached by object
+    /// reference ([`Dataset::dereference`]), which has no resolvable path.
+    path: Option<String>,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -1354,50 +1458,78 @@ impl Dataset {
     /// the new length.
     ///
     /// The file must have been opened for writing with [`File::open_rw`]; a
-    /// read-only file returns [`Error::ReadOnly`](crate::Error::ReadOnly). The
-    /// target must be a chunked, rank-1, unlimited, Extensible-Array-indexed
-    /// dataset — the same contract as [`AppendWriter`](crate::AppendWriter),
-    /// including filtered whole-chunk / unfiltered any-length rules — otherwise
+    /// read-only file (or a handle reached by object reference, which has no
+    /// path) returns [`Error::ReadOnly`](crate::Error::ReadOnly). The target must
+    /// be a chunked, rank-1, unlimited, Extensible-Array-indexed dataset — the
+    /// same contract as [`AppendWriter`](crate::AppendWriter), including filtered
+    /// whole-chunk / unfiltered any-length rules — otherwise
     /// [`Error::AppendUnsupported`](crate::Error::AppendUnsupported) is returned.
-    /// Each append is crash-atomic.
+    /// The append is immediate and crash-atomic (no `commit` needed).
     pub fn append<T: H5Element>(&mut self, data: &[T]) -> Result<(), Error> {
-        let mut b = AppendBuilder::new();
-        b.append(data);
-        self.append_gathered(&b)
+        self.with_session_mut(|session, path| session.append_inplace(path, data))
     }
 
     /// Append raw little-endian element bytes to this dataset in place. Prefer
     /// [`append`](Self::append) when the element type is known; see it for the
     /// file-mode and eligibility rules.
     pub fn append_raw(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        let mut b = AppendBuilder::new();
-        b.append_raw(bytes);
-        self.append_gathered(&b)
+        self.with_session_mut(|session, path| session.append_inplace_raw(path, bytes))
     }
 
-    fn append_gathered(&mut self, b: &AppendBuilder) -> Result<(), Error> {
-        if !matches!(self.file.backend, Backend::Mirror(_)) {
+    /// Overwrite this dataset's values, staged until [`File::commit`]. The new
+    /// data must match the dataset's existing shape and datatype.
+    ///
+    /// The file must have been opened with [`File::open_rw`], else
+    /// [`Error::ReadOnly`](crate::Error::ReadOnly). Unlike [`append`](Self::append)
+    /// (immediate), this is a staged edit applied on [`File::commit`].
+    pub fn write<T: H5Element>(&mut self, data: &[T]) -> Result<(), Error> {
+        self.with_session_mut(|session, path| {
+            let builder = session.write_dataset(path);
+            T::write_into(builder, data);
+            Ok(())
+        })
+    }
+
+    /// Add or update a compact attribute on this dataset, staged until
+    /// [`File::commit`]. Use [`remove_attr`](Self::remove_attr) to remove one.
+    ///
+    /// The file must have been opened with [`File::open_rw`], else
+    /// [`Error::ReadOnly`](crate::Error::ReadOnly).
+    pub fn set_attr(&mut self, name: &str, value: AttrValue) -> Result<(), Error> {
+        self.with_session_mut(|session, path| {
+            session.set_dataset_attr(path, name, value);
+            Ok(())
+        })
+    }
+
+    /// Remove a compact attribute from this dataset, staged until
+    /// [`File::commit`]. See [`set_attr`](Self::set_attr) for the file-mode rules.
+    pub fn remove_attr(&mut self, name: &str) -> Result<(), Error> {
+        self.with_session_mut(|session, path| {
+            session.remove_dataset_attr(path, name);
+            Ok(())
+        })
+    }
+
+    /// Run `f` with the writable session and this dataset's path, then refresh
+    /// the cached header so a later read on this handle reflects any immediate
+    /// change (e.g. an append's new dimension). Returns
+    /// [`Error::ReadOnly`](crate::Error::ReadOnly) if the file is read-only or the
+    /// handle has no resolvable path (reached by object reference).
+    fn with_session_mut<R>(
+        &mut self,
+        f: impl FnOnce(&mut EditSession, &str) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        let Backend::Mirror(m) = &self.file.backend else {
             return Err(Error::ReadOnly);
-        }
-        {
-            let Backend::Mirror(m) = &self.file.backend else {
-                unreachable!("checked above")
-            };
-            let mut core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let MirrorCore { inplace, located } = &mut *core;
-            append_gathered_at(
-                inplace,
-                located,
-                self.address,
-                b,
-                4,
-                Error::AppendUnsupported,
-            )?;
-        }
-        // The append changed the on-disk dataspace dimension; re-parse the cached
-        // header so this handle's reads (shape, read_*) see the new length.
+        };
+        let path = self.path.clone().ok_or(Error::ReadOnly)?;
+        let out = {
+            let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            f(&mut session, &path)?
+        };
         self.header = self.file.parse_header(self.address)?;
-        Ok(())
+        Ok(out)
     }
 
     /// The effective raw chunk-cache configuration for this dataset.
@@ -2193,6 +2325,13 @@ fn find_message(
         .iter()
         .find(|m| m.msg_type == msg_type)
         .ok_or(Error::MissingMessage(msg_type))
+}
+
+/// Normalize a user-supplied object path to the root-relative form the write
+/// session addresses by: strip any leading/trailing `/` so `"/a/b"` and `"a/b"`
+/// name the same object.
+fn normalize_path(path: &str) -> String {
+    path.trim_matches('/').to_string()
 }
 
 fn has_message(header: &ObjectHeader, msg_type: MessageType) -> bool {
