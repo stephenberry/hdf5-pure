@@ -680,6 +680,9 @@ pub enum Error {
     /// [`crate::Group`] handles, or a clone of the [`crate::File`], are still
     /// alive. Drop them and retry.
     HandlesOutstanding,
+    /// A write (e.g. [`crate::Dataset::append`]) was requested on a file opened
+    /// read-only. Open it with [`crate::File::open_rw`] to modify it in place.
+    ReadOnly,
     /// The file or dataset is not a supported target for the SWMR append writer
     /// (e.g. a userblock or non-latest-format file, or a dataset that is
     /// filtered, not rank-1 with an unlimited dimension, or not
@@ -745,6 +748,10 @@ impl fmt::Display for Error {
             Error::HandlesOutstanding => write!(
                 f,
                 "operation needs exclusive file access: drop outstanding Dataset/Group handles and File clones first"
+            ),
+            Error::ReadOnly => write!(
+                f,
+                "cannot write to a read-only file; open it with File::open_rw"
             ),
             Error::SwmrAppendUnsupported(reason) => {
                 write!(f, "unsupported SWMR append target: {reason}")
