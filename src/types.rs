@@ -153,7 +153,7 @@ pub(crate) fn classify_datatype(dt: &crate::datatype::Datatype) -> DType {
 /// `base_address` is the file-level userblock offset — needed so that
 /// variable-length attribute data (stored in global heap collections with
 /// addresses relative to the base) can be located correctly.
-pub(crate) fn attrs_to_map<S: crate::source::FileSource + ?Sized>(
+pub(crate) fn attrs_to_map<S: crate::source::Source + ?Sized>(
     attrs: &[crate::attribute::AttributeMessage],
     source: &S,
     offset_size: u8,
@@ -169,7 +169,7 @@ pub(crate) fn attrs_to_map<S: crate::source::FileSource + ?Sized>(
     map
 }
 
-fn decode_attr_value<S: crate::source::FileSource + ?Sized>(
+fn decode_attr_value<S: crate::source::Source + ?Sized>(
     attr: &crate::attribute::AttributeMessage,
     source: &S,
     offset_size: u8,

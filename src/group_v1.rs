@@ -7,7 +7,7 @@ use crate::btree_v1::{collect_symbol_table_nodes, collect_symbol_table_nodes_fro
 use crate::convert::{TryToUsize, slice_range};
 use crate::error::FormatError;
 use crate::local_heap::LocalHeap;
-use crate::source::FileSource;
+use crate::source::Source;
 use crate::symbol_table::{SymbolTableMessage, SymbolTableNode};
 
 /// A resolved group entry (child name + object header address).
@@ -83,11 +83,11 @@ pub fn resolve_v1_group_entries(
 /// Streaming counterpart of [`resolve_v1_group_entries`].
 ///
 /// Reads the local heap header, B-tree v1, and each symbol-table node from a
-/// [`FileSource`] on demand. The heap's data segment (holding the link names) is
+/// [`Source`] on demand. The heap's data segment (holding the link names) is
 /// read once and every name is sliced from that single buffer. As with the
 /// buffered version, the returned `object_header_address` values are relative to
 /// `base_address` (the caller adds it to obtain absolute file offsets).
-pub fn resolve_v1_group_entries_from_source<S: FileSource + ?Sized>(
+pub fn resolve_v1_group_entries_from_source<S: Source + ?Sized>(
     source: &S,
     sym_table_msg: &SymbolTableMessage,
     offset_size: u8,

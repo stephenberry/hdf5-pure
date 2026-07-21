@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
-use crate::source::FileSource;
+use crate::source::Source;
 
 /// Size of the size-of-offsets-independent prefix of a version 1 B-tree node:
 /// `signature(4) + node_type(1) + node_level(1) + entries_used(2)`. The two
@@ -157,11 +157,11 @@ impl BTreeV1Node {
         })
     }
 
-    /// Parse a B-tree v1 (type 0, group) node from a [`FileSource`] on demand.
+    /// Parse a B-tree v1 (type 0, group) node from a [`Source`] on demand.
     ///
     /// Reads the fixed node prefix to learn `entries_used`, then the exact node
     /// body, so no more than one node is resident at a time.
-    pub fn parse_from_source<S: FileSource + ?Sized>(
+    pub fn parse_from_source<S: Source + ?Sized>(
         source: &S,
         address: u64,
         offset_size: u8,
@@ -259,12 +259,12 @@ fn collect_symbol_table_nodes_inner(
 }
 
 /// Streaming counterpart of [`collect_symbol_table_nodes`]: walks the v1 B-tree
-/// through a [`FileSource`], reading one node at a time.
+/// through a [`Source`], reading one node at a time.
 ///
 /// `base_address` is the superblock base address; all B-tree node and SNOD
 /// addresses are stored relative to it. The returned SNOD addresses are also
 /// relative (the caller adds `base_address` to obtain absolute file offsets).
-pub fn collect_symbol_table_nodes_from_source<S: FileSource + ?Sized>(
+pub fn collect_symbol_table_nodes_from_source<S: Source + ?Sized>(
     source: &S,
     btree_address: u64,
     offset_size: u8,
@@ -283,7 +283,7 @@ pub fn collect_symbol_table_nodes_from_source<S: FileSource + ?Sized>(
 
 /// Depth-tracking core of [`collect_symbol_table_nodes_from_source`]; see
 /// [`collect_symbol_table_nodes_inner`] for why the bound is required.
-fn collect_symbol_table_nodes_from_source_inner<S: FileSource + ?Sized>(
+fn collect_symbol_table_nodes_from_source_inner<S: Source + ?Sized>(
     source: &S,
     btree_address: u64,
     offset_size: u8,

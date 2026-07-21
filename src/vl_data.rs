@@ -13,7 +13,7 @@ use crate::error::FormatError;
 use crate::global_heap::GlobalHeapIndex;
 #[cfg(test)]
 use crate::source::BytesSource;
-use crate::source::FileSource;
+use crate::source::Source;
 
 /// Allocation limits for reading variable-length strings.
 ///
@@ -228,7 +228,7 @@ pub fn visit_vl_strings_from_source<S, F>(
     mut visitor: F,
 ) -> Result<(), FormatError>
 where
-    S: FileSource + ?Sized,
+    S: Source + ?Sized,
     F: FnMut(&str),
 {
     check_element_limit(num_elements, options)?;
@@ -296,7 +296,7 @@ where
 }
 
 /// Resolve VL strings from a random-access file source.
-pub fn read_vl_strings_from_source<S: FileSource + ?Sized>(
+pub fn read_vl_strings_from_source<S: Source + ?Sized>(
     source: &S,
     raw_data: &[u8],
     num_elements: u64,
@@ -348,7 +348,7 @@ pub(crate) enum VlByteObject {
 /// non-string VL sequence (e.g. `H5T_VLEN { H5T_NATIVE_DOUBLE }`) the stored
 /// `length` counts base-type elements, so the heap object holds
 /// `length * element_size` bytes — exactly what is read here.
-pub(crate) fn read_vl_byte_objects_from_source<S: FileSource + ?Sized>(
+pub(crate) fn read_vl_byte_objects_from_source<S: Source + ?Sized>(
     source: &S,
     raw_data: &[u8],
     num_elements: u64,

@@ -17,7 +17,7 @@ use crate::link_info::LinkInfoMessage;
 use crate::link_message::{LinkMessage, LinkTarget};
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
-use crate::source::FileSource;
+use crate::source::Source;
 use crate::superblock::Superblock;
 use crate::symbol_table::SymbolTableMessage;
 
@@ -244,16 +244,16 @@ pub fn resolve_group_entries(
 
 // ---------------------------------------------------------------------------
 // Streaming path resolution (latest-format / v2 groups), reading each metadata
-// structure from a `FileSource` on demand.
+// structure from a `Source` on demand.
 // ---------------------------------------------------------------------------
 
 /// Streaming counterpart of [`resolve_path_any`] for latest-format files.
 ///
 /// Resolves a path to an object-header address by reading the object headers
-/// and (for dense groups) the fractal heap + B-tree v2 from a [`FileSource`].
+/// and (for dense groups) the fractal heap + B-tree v2 from a [`Source`].
 /// Only v2 (latest-format) groups are supported; a v1 symbol-table group on the
 /// path returns an error (the v1 group traversal is not yet migrated).
-pub fn resolve_path_any_from_source<S: FileSource + ?Sized>(
+pub fn resolve_path_any_from_source<S: Source + ?Sized>(
     source: &S,
     superblock: &Superblock,
     path: &str,
@@ -294,7 +294,7 @@ pub fn resolve_path_any_from_source<S: FileSource + ?Sized>(
 ///
 /// `base_address` is the superblock base address, used to convert the relative
 /// addresses stored in v1 (symbol-table) groups to absolute file offsets.
-pub fn resolve_group_entries_from_source<S: FileSource + ?Sized>(
+pub fn resolve_group_entries_from_source<S: Source + ?Sized>(
     source: &S,
     object_header: &ObjectHeader,
     offset_size: u8,
@@ -324,7 +324,7 @@ pub fn resolve_group_entries_from_source<S: FileSource + ?Sized>(
     }
 }
 
-fn resolve_v2_group_entries_from_source<S: FileSource + ?Sized>(
+fn resolve_v2_group_entries_from_source<S: Source + ?Sized>(
     source: &S,
     object_header: &ObjectHeader,
     offset_size: u8,
@@ -339,7 +339,7 @@ fn resolve_v2_group_entries_from_source<S: FileSource + ?Sized>(
     }
 }
 
-fn resolve_dense_entries_from_source<S: FileSource + ?Sized>(
+fn resolve_dense_entries_from_source<S: Source + ?Sized>(
     source: &S,
     link_info: &LinkInfoMessage,
     fh_addr: u64,

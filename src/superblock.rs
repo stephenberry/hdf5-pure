@@ -8,7 +8,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
 use crate::signature::HDF5_SIGNATURE;
-use crate::source::FileSource;
+use crate::source::Source;
 
 /// Upper bound on the on-disk size of a superblock across all versions: the
 /// largest is v1 with 8-byte offsets at 100 bytes (28 prefix + 4 addresses +
@@ -131,7 +131,7 @@ impl Superblock {
         }
     }
 
-    /// Parse a superblock from a [`FileSource`], given the byte offset where its
+    /// Parse a superblock from a [`Source`], given the byte offset where its
     /// signature was found (see [`crate::signature::find_signature_in`]).
     ///
     /// The superblock is fully self-contained: every field is stored inline and
@@ -139,7 +139,7 @@ impl Superblock {
     /// window ([`MAX_SUPERBLOCK_LEN`] bytes, clamped to the bytes available) is
     /// read. This lets the entry point be parsed from a lazy streaming source
     /// without materializing the whole file.
-    pub fn parse_from_source<S: FileSource + ?Sized>(
+    pub fn parse_from_source<S: Source + ?Sized>(
         source: &S,
         signature_offset: u64,
     ) -> Result<Superblock, FormatError> {

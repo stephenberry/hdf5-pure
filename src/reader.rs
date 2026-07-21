@@ -30,7 +30,7 @@ use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
 use crate::signature;
 use crate::source::{
-    BytesSource, FileSource, MetadataCacheConfig, MetadataCachingSource, ReadSeekSource,
+    BytesSource, Source, MetadataCacheConfig, MetadataCachingSource, ReadSeekSource,
 };
 use crate::superblock::Superblock;
 use crate::vl_data::{self, VlenStringReadOptions};
@@ -42,10 +42,10 @@ use crate::types::{AttrValue, DType, attrs_to_map, classify_datatype};
 // ---------------------------------------------------------------------------
 
 /// Backing store for a [`File`]: either the whole file buffered in memory, or a
-/// lazy [`FileSource`] that reads regions on demand (see [`File::open_streaming`]).
+/// lazy [`Source`] that reads regions on demand (see [`File::open_streaming`]).
 enum Backend {
     InMemory(Vec<u8>),
-    Streaming(Box<dyn FileSource + Send + Sync>),
+    Streaming(Box<dyn Source + Send + Sync>),
     /// A read-write file opened with [`File::open_rw`]: a [`WriteEngine`] (a
     /// whole-file mirror + exclusive OS lock + staged-edit queues) behind a lock,
     /// so owned handles can both read and mutate in place. Reads slice the
@@ -56,14 +56,14 @@ enum Backend {
     Mirror(Box<Mutex<WriteEngine>>),
 }
 
-/// A borrowed `FileSource` view over a [`File`]'s backend, used by the
+/// A borrowed `Source` view over a [`File`]'s backend, used by the
 /// streaming-capable read paths so one call site serves both backends.
 pub(crate) enum SourceView<'a> {
     Mem(&'a [u8]),
-    Stream(&'a (dyn FileSource + Send + Sync)),
+    Stream(&'a (dyn Source + Send + Sync)),
 }
 
-impl FileSource for SourceView<'_> {
+impl Source for SourceView<'_> {
     fn len(&self) -> u64 {
         match self {
             SourceView::Mem(b) => b.len() as u64,
@@ -85,7 +85,7 @@ impl FileSource for SourceView<'_> {
     }
 }
 
-/// A `FileSource` view shifted forward by a base address: every read at a
+/// A `Source` view shifted forward by a base address: every read at a
 /// base-relative `offset` is served from `inner` at `offset + base`. Used by the
 /// dataset-payload read path on a file with a userblock, where the data-layout's
 /// on-disk addresses (contiguous data, chunk index, and chunk data) are stored
@@ -94,12 +94,12 @@ impl FileSource for SourceView<'_> {
 /// slices the buffer at `base`. `len`/`read_at` shift by the base; `read_metadata_at`
 /// forwards to the inner source (at the absolute offset) so its metadata cache is
 /// shared, while payload reads keep the default uncached `read_exact_at`.
-struct BaseOffsetSource<'a, S: FileSource + ?Sized> {
+struct BaseOffsetSource<'a, S: Source + ?Sized> {
     inner: &'a S,
     base: u64,
 }
 
-impl<S: FileSource + ?Sized> FileSource for BaseOffsetSource<'_, S> {
+impl<S: Source + ?Sized> Source for BaseOffsetSource<'_, S> {
     fn len(&self) -> u64 {
         self.inner.len().saturating_sub(self.base)
     }
@@ -345,7 +345,7 @@ impl FileInner {
     ) -> Result<Self, Error> {
         let handle = std::fs::File::open(path.as_ref()).map_err(Error::Io)?;
         let source = ReadSeekSource::new(handle).map_err(Error::Format)?;
-        let source: Box<dyn FileSource + Send + Sync> = if options.metadata_cache.is_enabled() {
+        let source: Box<dyn Source + Send + Sync> = if options.metadata_cache.is_enabled() {
             Box::new(MetadataCachingSource::new(source, options.metadata_cache))
         } else {
             Box::new(source)
@@ -462,7 +462,7 @@ impl FileInner {
         Ok(())
     }
 
-    /// A `FileSource` view over the backend, for the streaming-capable paths.
+    /// A `Source` view over the backend, for the streaming-capable paths.
     pub(crate) fn source(&self) -> SourceView<'_> {
         match &self.backend {
             Backend::InMemory(v) => SourceView::Mem(v),
@@ -494,7 +494,7 @@ impl FileInner {
 
     /// Streaming counterpart of [`parse_superblock`]: locate and parse the
     /// superblock by reading only small windows from the source.
-    fn parse_superblock_source<S: FileSource + ?Sized>(
+    fn parse_superblock_source<S: Source + ?Sized>(
         source: &S,
     ) -> Result<(Superblock, u64), Error> {
         let sig_offset = signature::find_signature_in(source)?;
@@ -1417,7 +1417,7 @@ impl File {
         self.inner.libver_bound()
     }
 
-    /// A `FileSource` view over the backend, for the streaming-capable paths.
+    /// A `Source` view over the backend, for the streaming-capable paths.
     pub(crate) fn source(&self) -> SourceView<'_> {
         self.inner.source()
     }

@@ -21,7 +21,7 @@ use crate::filters::{ChunkContext, decompress_chunk};
 use crate::fixed_array::{
     FixedArrayHeader, read_fixed_array_chunks, read_fixed_array_chunks_from_source,
 };
-use crate::source::FileSource;
+use crate::source::Source;
 
 #[cfg(feature = "parallel")]
 use crate::parallel_read;
@@ -69,13 +69,13 @@ fn decompress_all_chunks(
     Ok(result)
 }
 
-/// Decompress all chunks, reading each chunk's bytes from a [`FileSource`].
+/// Decompress all chunks, reading each chunk's bytes from a [`Source`].
 ///
 /// Streaming counterpart of [`decompress_all_chunks`]. Sequential only: the
 /// lane-partitioned parallel path borrows a whole-file `&[u8]` inside a `Send`
 /// rayon closure, and a `ReadSeekSource` serializes on its mutex anyway, so a
 /// parallel streaming variant is a separate follow-up.
-fn decompress_all_chunks_from_source<S: FileSource + ?Sized>(
+fn decompress_all_chunks_from_source<S: Source + ?Sized>(
     source: &S,
     chunks: &[ChunkInfo],
     pipeline: Option<&FilterPipeline>,
@@ -387,13 +387,13 @@ fn collect_chunk_btree_node_spans_inner(
     Ok(())
 }
 
-/// Traverse B-tree v1 type 1 from a [`FileSource`], reading each node on demand.
+/// Traverse B-tree v1 type 1 from a [`Source`], reading each node on demand.
 ///
 /// The streaming counterpart of [`collect_chunk_info`]: it reads the node header
 /// and the key/child region as two bounded windows via `read_at`, recursing into
 /// child nodes by reading their regions, so the index can be walked without a
 /// whole-file buffer.
-pub fn collect_chunk_info_from_source<S: FileSource + ?Sized>(
+pub fn collect_chunk_info_from_source<S: Source + ?Sized>(
     source: &S,
     btree_address: u64,
     ndims: usize,
@@ -405,7 +405,7 @@ pub fn collect_chunk_info_from_source<S: FileSource + ?Sized>(
 
 /// Depth-tracking core of [`collect_chunk_info_from_source`]; see
 /// [`collect_chunk_info_inner`] for why the bound is required.
-fn collect_chunk_info_from_source_inner<S: FileSource + ?Sized>(
+fn collect_chunk_info_from_source_inner<S: Source + ?Sized>(
     source: &S,
     btree_address: u64,
     ndims: usize,
@@ -717,7 +717,7 @@ pub fn read_chunked_data(
     ))
 }
 
-/// Read a chunked dataset from a [`FileSource`], reading the chunk index and
+/// Read a chunked dataset from a [`Source`], reading the chunk index and
 /// each chunk's bytes on demand via `read_at`.
 ///
 /// Streaming counterpart of [`read_chunked_data`], with the same chunk-index
@@ -725,7 +725,7 @@ pub fn read_chunked_data(
 /// Fixed-Array, and Extensible-Array indexes (index types 1-4). A v4 index
 /// type 5 (version-2 B-tree) is not supported, matching the buffered reader.
 /// The decompression is sequential.
-pub fn read_chunked_data_from_source<S: FileSource + ?Sized>(
+pub fn read_chunked_data_from_source<S: Source + ?Sized>(
     source: &S,
     layout: &DataLayout,
     dataspace: &Dataspace,
@@ -829,12 +829,12 @@ pub fn read_chunked_data_from_source<S: FileSource + ?Sized>(
     ))
 }
 
-/// Read a chunked dataset from a [`FileSource`] with parsed-index and
+/// Read a chunked dataset from a [`Source`] with parsed-index and
 /// decompressed-chunk caching.
 ///
 /// This is the streaming counterpart of [`read_chunked_data_cached`].
 #[allow(clippy::too_many_arguments)]
-pub fn read_chunked_data_cached_from_source<S: FileSource + ?Sized>(
+pub fn read_chunked_data_cached_from_source<S: Source + ?Sized>(
     source: &S,
     layout: &DataLayout,
     dataspace: &Dataspace,
@@ -995,7 +995,7 @@ pub fn read_chunked_data_cached_from_source<S: FileSource + ?Sized>(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn collect_chunks_for_layout_from_source<S: FileSource + ?Sized>(
+pub(crate) fn collect_chunks_for_layout_from_source<S: Source + ?Sized>(
     source: &S,
     version: u8,
     chunk_index_type: Option<u8>,

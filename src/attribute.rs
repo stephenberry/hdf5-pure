@@ -16,7 +16,7 @@ use crate::fractal_heap::FractalHeapHeader;
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
 use crate::shared_message;
-use crate::source::FileSource;
+use crate::source::Source;
 
 /// A parsed HDF5 attribute message.
 #[derive(Debug, Clone)]
@@ -352,9 +352,9 @@ pub fn extract_attributes_full(
 ///
 /// Reads compact attribute messages from the (already-parsed) object header,
 /// resolves shared attribute references, and walks dense storage (fractal heap +
-/// B-tree v2) through a [`FileSource`] on demand instead of indexing a whole-file
+/// B-tree v2) through a [`Source`] on demand instead of indexing a whole-file
 /// slice. Used by the streaming reader backend.
-pub fn extract_attributes_full_from_source<S: FileSource + ?Sized>(
+pub fn extract_attributes_full_from_source<S: Source + ?Sized>(
     source: &S,
     header: &ObjectHeader,
     offset_size: u8,
@@ -454,8 +454,8 @@ fn extract_dense_attributes(
 }
 
 /// Streaming counterpart of [`extract_dense_attributes`]: walks the fractal heap
-/// and B-tree v2 through a [`FileSource`] on demand.
-fn extract_dense_attributes_from_source<S: FileSource + ?Sized>(
+/// and B-tree v2 through a [`Source`] on demand.
+fn extract_dense_attributes_from_source<S: Source + ?Sized>(
     source: &S,
     attr_info: &AttributeInfoMessage,
     fh_addr: u64,
