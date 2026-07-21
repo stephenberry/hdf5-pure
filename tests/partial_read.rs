@@ -278,3 +278,27 @@ fn read_raw_rows_matches_read_raw() {
         }
     }
 }
+
+#[test]
+fn userblock_windows_go_through_base_framing() {
+    // A userblock makes the superblock base non-zero, so reads route through the
+    // base-framed source. Exercise that path for both contiguous and chunked
+    // windowed reads, on both backends.
+    let chunked: Vec<f64> = (0..300).map(|i| i as f64 * 0.5).collect();
+    let contig: Vec<f64> = (0..40).map(f64::from).collect();
+    let (buffered, streaming, _dir) = on_both_backends(|b| {
+        b.with_userblock(512);
+        b.create_dataset("chunked")
+            .with_f64_data(&chunked)
+            .with_shape(&[300])
+            .with_chunks(&[64])
+            .with_deflate(3);
+        b.create_dataset("contig")
+            .with_f64_data(&contig)
+            .with_shape(&[40]);
+    });
+    check_f64(&buffered, "chunked", 1, &[(70, 100), (63, 5)]);
+    check_f64(&streaming, "chunked", 1, &[(70, 100), (63, 5)]);
+    check_f64(&buffered, "contig", 1, &[(10, 20)]);
+    check_f64(&streaming, "contig", 1, &[(10, 20)]);
+}

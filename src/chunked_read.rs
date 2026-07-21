@@ -546,6 +546,36 @@ pub fn generate_implicit_chunks(
     chunks
 }
 
+/// The per-dimension geometry the chunked readers share: the data rank (the chunk
+/// layout's dimensions minus the trailing element-size dim), the chunk dimensions,
+/// and the dataset dimensions, all as `usize`. `chunk_dimensions` are `u32` and
+/// widen; the dataspace dims are `u64` and narrow with a checked conversion. Errors
+/// when the layout carries no dimensions or its rank disagrees with the dataspace.
+fn chunked_dims(
+    chunk_dimensions: &[u32],
+    dataspace: &Dataspace,
+) -> Result<(usize, Vec<usize>, Vec<usize>), FormatError> {
+    let rank = chunk_dimensions
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| FormatError::ChunkedReadError("chunked layout has no dimensions".into()))?;
+    let chunk_dims: Vec<usize> = chunk_dimensions[..rank].iter().map(|&d| d as usize).collect();
+    let ds_dims: Vec<usize> = dataspace
+        .dimensions
+        .iter()
+        .map(|&d| d.to_usize())
+        .collect::<Result<_, _>>()?;
+    if ds_dims.len() != rank {
+        return Err(FormatError::ChunkedReadError(format!(
+            "rank mismatch: dataspace has {} dims, layout has {} chunk dims (rank={})",
+            ds_dims.len(),
+            chunk_dimensions.len(),
+            rank
+        )));
+    }
+    Ok((rank, chunk_dims, ds_dims))
+}
+
 /// Read a chunked dataset, decompressing chunks as needed.
 pub fn read_chunked_data(
     file_data: &[u8],
@@ -591,29 +621,7 @@ pub fn read_chunked_data(
 
     let elem_size = datatype.type_size() as usize;
 
-    // Both v3 and v4 include element size as last dim (rank+1)
-    let ndims = chunk_dimensions.len();
-    let rank = ndims
-        .checked_sub(1)
-        .ok_or_else(|| FormatError::ChunkedReadError("chunked layout has no dimensions".into()))?;
-    let chunk_dims: Vec<usize> = chunk_dimensions[..rank]
-        .iter()
-        .map(|&d| d as usize)
-        .collect();
-
-    let ds_dims: Vec<usize> = dataspace
-        .dimensions
-        .iter()
-        .map(|&d| d.to_usize())
-        .collect::<Result<_, _>>()?;
-    if ds_dims.len() != rank {
-        return Err(FormatError::ChunkedReadError(format!(
-            "rank mismatch: dataspace has {} dims, layout has {} chunk dims (rank={})",
-            ds_dims.len(),
-            chunk_dimensions.len(),
-            rank
-        )));
-    }
+    let (rank, chunk_dims, ds_dims) = chunked_dims(chunk_dimensions, dataspace)?;
 
     // Collect chunks based on version and index type
     #[expect(
@@ -768,29 +776,7 @@ pub fn read_chunked_data_from_source<S: FileSource + ?Sized>(
         .ok_or_else(|| FormatError::ChunkedReadError("no address for chunked layout".into()))?;
 
     let elem_size = datatype.type_size() as usize;
-    let ndims = chunk_dimensions.len();
-    let rank = ndims
-        .checked_sub(1)
-        .ok_or_else(|| FormatError::ChunkedReadError("chunked layout has no dimensions".into()))?;
-    // `chunk_dimensions` are u32, so this widens; the dataspace dims are u64 and
-    // are narrowed with a checked conversion.
-    let chunk_dims: Vec<usize> = chunk_dimensions[..rank]
-        .iter()
-        .map(|&d| d as usize)
-        .collect();
-    let ds_dims: Vec<usize> = dataspace
-        .dimensions
-        .iter()
-        .map(|&d| d.to_usize())
-        .collect::<Result<_, _>>()?;
-    if ds_dims.len() != rank {
-        return Err(FormatError::ChunkedReadError(format!(
-            "rank mismatch: dataspace has {} dims, layout has {} chunk dims (rank={})",
-            ds_dims.len(),
-            chunk_dimensions.len(),
-            rank
-        )));
-    }
+    let (rank, chunk_dims, ds_dims) = chunked_dims(chunk_dimensions, dataspace)?;
 
     let chunks = collect_chunks_for_layout_from_source(
         source,
@@ -871,24 +857,7 @@ pub(crate) fn read_chunked_rows_from_source<S: FileSource + ?Sized>(
     };
 
     let elem_size = datatype.type_size() as usize;
-    let ndims = chunk_dimensions.len();
-    let rank = ndims
-        .checked_sub(1)
-        .ok_or_else(|| FormatError::ChunkedReadError("chunked layout has no dimensions".into()))?;
-    let chunk_dims: Vec<usize> = chunk_dimensions[..rank].iter().map(|&d| d as usize).collect();
-    let ds_dims: Vec<usize> = dataspace
-        .dimensions
-        .iter()
-        .map(|&d| d.to_usize())
-        .collect::<Result<_, _>>()?;
-    if ds_dims.len() != rank {
-        return Err(FormatError::ChunkedReadError(format!(
-            "rank mismatch: dataspace has {} dims, layout has {} chunk dims (rank={})",
-            ds_dims.len(),
-            chunk_dimensions.len(),
-            rank
-        )));
-    }
+    let (rank, chunk_dims, ds_dims) = chunked_dims(chunk_dimensions, dataspace)?;
 
     // A row is contiguous in the chunk only when the chunk spans the full inner
     // extent; inner-chunked layouts fall back to the whole-dataset reader.
@@ -1058,27 +1027,7 @@ pub fn read_chunked_data_cached_from_source<S: FileSource + ?Sized>(
         .ok_or_else(|| FormatError::ChunkedReadError("no address for chunked layout".into()))?;
 
     let elem_size = datatype.type_size() as usize;
-    let ndims = chunk_dimensions.len();
-    let rank = ndims
-        .checked_sub(1)
-        .ok_or_else(|| FormatError::ChunkedReadError("chunked layout has no dimensions".into()))?;
-    let chunk_dims: Vec<usize> = chunk_dimensions[..rank]
-        .iter()
-        .map(|&d| d as usize)
-        .collect();
-    let ds_dims: Vec<usize> = dataspace
-        .dimensions
-        .iter()
-        .map(|&d| d.to_usize())
-        .collect::<Result<_, _>>()?;
-    if ds_dims.len() != rank {
-        return Err(FormatError::ChunkedReadError(format!(
-            "rank mismatch: dataspace has {} dims, layout has {} chunk dims (rank={})",
-            ds_dims.len(),
-            chunk_dimensions.len(),
-            rank
-        )));
-    }
+    let (rank, chunk_dims, ds_dims) = chunked_dims(chunk_dimensions, dataspace)?;
 
     let chunks = if let Some(chunks) = cache.all_indexed_chunks() {
         chunks
@@ -1674,28 +1623,8 @@ pub fn read_chunked_data_cached(
         .ok_or_else(|| FormatError::ChunkedReadError("no address for chunked layout".into()))?;
 
     let elem_size = datatype.type_size() as usize;
-    let ndims = chunk_dimensions.len();
-    let rank = ndims
-        .checked_sub(1)
-        .ok_or_else(|| FormatError::ChunkedReadError("chunked layout has no dimensions".into()))?;
-    let chunk_dims: Vec<usize> = chunk_dimensions[..rank]
-        .iter()
-        .map(|&d| d as usize)
-        .collect();
-
-    let ds_dims: Vec<usize> = dataspace
-        .dimensions
-        .iter()
-        .map(|&d| d.to_usize())
-        .collect::<Result<_, _>>()?;
-    if ds_dims.len() != rank {
-        return Err(FormatError::ChunkedReadError(format!(
-            "rank mismatch: dataspace has {} dims, layout has {} chunk dims (rank={})",
-            ds_dims.len(),
-            chunk_dimensions.len(),
-            rank
-        )));
-    }
+    let (rank, chunk_dims, ds_dims) = chunked_dims(chunk_dimensions, dataspace)?;
+    let ndims = rank + 1; // rank + the trailing element-size dimension
 
     #[expect(
         clippy::cast_possible_truncation,
