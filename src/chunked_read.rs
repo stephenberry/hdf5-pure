@@ -829,6 +829,158 @@ pub fn read_chunked_data_from_source<S: FileSource + ?Sized>(
     ))
 }
 
+/// Read the raw element bytes of the leading-dimension row window
+/// `[row_start, row_start + num_rows)` of a chunked dataset, decoding only the
+/// chunks that overlap the window.
+///
+/// This is the windowed counterpart of [`read_chunked_data_from_source`]: rather
+/// than materialize the whole dataset, it touches only the chunks whose dim-0
+/// span intersects the window, so peak memory is bounded by the window (plus one
+/// chunk) instead of the dataset.
+///
+/// Fast path only: it assumes every chunk spans the **full inner extent**
+/// (`chunk_dims[i] == ds_dims[i]` for every inner dim `i >= 1`), so a dim-0 slab
+/// is `row_elems` contiguous elements in both the chunk and the dataset and the
+/// scatter is a plain row-band copy. That holds for every frame-per-chunk layout
+/// (the common case, and all image/tensor-per-row data). When an inner dimension
+/// is itself chunked this returns `Ok(None)`, signaling the caller to fall back
+/// to a whole-dataset read; otherwise it returns `Ok(Some(bytes))` with exactly
+/// `num_rows * row_elems` elements' worth of bytes. `row_start + num_rows` must
+/// not exceed the dataset's leading dimension (callers clamp first).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn read_chunked_rows_from_source<S: FileSource + ?Sized>(
+    source: &S,
+    layout: &DataLayout,
+    dataspace: &Dataspace,
+    datatype: &Datatype,
+    pipeline: Option<&FilterPipeline>,
+    offset_size: u8,
+    length_size: u8,
+    row_start: u64,
+    num_rows: u64,
+) -> Result<Option<Vec<u8>>, FormatError> {
+    let DataLayout::Chunked {
+        chunk_dimensions,
+        btree_address,
+        version,
+        chunk_index_type,
+        single_chunk_filtered_size,
+        single_chunk_filter_mask,
+    } = layout
+    else {
+        return Err(FormatError::ChunkedReadError(
+            "expected chunked layout".into(),
+        ));
+    };
+
+    let elem_size = datatype.type_size() as usize;
+    let ndims = chunk_dimensions.len();
+    let rank = ndims
+        .checked_sub(1)
+        .ok_or_else(|| FormatError::ChunkedReadError("chunked layout has no dimensions".into()))?;
+    let chunk_dims: Vec<usize> = chunk_dimensions[..rank].iter().map(|&d| d as usize).collect();
+    let ds_dims: Vec<usize> = dataspace
+        .dimensions
+        .iter()
+        .map(|&d| d.to_usize())
+        .collect::<Result<_, _>>()?;
+    if ds_dims.len() != rank {
+        return Err(FormatError::ChunkedReadError(format!(
+            "rank mismatch: dataspace has {} dims, layout has {} chunk dims (rank={})",
+            ds_dims.len(),
+            chunk_dimensions.len(),
+            rank
+        )));
+    }
+
+    // The windowed scatter is a contiguous row-band copy only when a dim-0 slab
+    // is contiguous in the chunk — i.e. the chunk covers the full inner extent.
+    // Anything else (inner-chunked) falls back to the whole-dataset reader.
+    if (1..rank).any(|i| chunk_dims[i] != ds_dims[i]) {
+        return Ok(None);
+    }
+
+    // Elements per dim-0 row (the product of the inner dims; 1 for a 1-D dataset).
+    let row_elems: usize = ds_dims.iter().skip(1).product();
+    let row_bytes = row_elems
+        .checked_mul(elem_size)
+        .ok_or(FormatError::OffsetOverflow {
+            offset: row_elems as u64,
+            length: elem_size as u64,
+        })?;
+
+    let out_rows = num_rows.to_usize()?;
+    let total_bytes = out_rows
+        .checked_mul(row_bytes)
+        .ok_or(FormatError::OffsetOverflow {
+            offset: out_rows as u64,
+            length: row_bytes as u64,
+        })?;
+    let mut output = vec![0u8; total_bytes];
+    if total_bytes == 0 {
+        return Ok(Some(output));
+    }
+
+    // Unallocated storage: the window is all fill/zeros, matching the
+    // whole-dataset reader's treatment of a not-yet-written chunked dataset.
+    let Some(addr) = *btree_address else {
+        return Ok(Some(output));
+    };
+
+    let chunks = collect_chunks_for_layout_from_source(
+        source,
+        *version,
+        *chunk_index_type,
+        addr,
+        *single_chunk_filtered_size,
+        *single_chunk_filter_mask,
+        chunk_dimensions,
+        dataspace,
+        elem_size,
+        offset_size,
+        length_size,
+    )?;
+
+    let chunk_dims_u64: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
+    let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype);
+
+    let row_lo = row_start.to_usize()?;
+    let row_hi = row_lo + out_rows; // exclusive; the caller has clamped to the dataset
+    let cd0 = chunk_dims[0];
+
+    for chunk in &chunks {
+        let c0 = chunk.offsets.first().copied().unwrap_or(0).to_usize()?;
+        if c0 >= row_hi || c0 + cd0 <= row_lo {
+            continue; // this chunk lies entirely outside the row window
+        }
+
+        let raw = source.read_exact_at(chunk.address, chunk.chunk_size as usize)?;
+        let dec = match pipeline {
+            Some(pl) => decompress_chunk(&raw, pl, ctx, chunk.filter_mask)?,
+            None => raw,
+        };
+
+        // Row-band overlap of the chunk with the window, in element rows.
+        let lo = c0.max(row_lo);
+        let hi = (c0 + cd0).min(row_hi);
+        let src = (lo - c0) * row_bytes;
+        let dst = (lo - row_lo) * row_bytes;
+        // Clamp to the bytes available on both sides (on an element boundary), so
+        // an edge chunk that overhangs the dataset — or a short/malformed chunk —
+        // copies only its valid prefix and is never an out-of-bounds access. This
+        // mirrors the clamp discipline of `copy_chunk_to_output`.
+        let mut len = ((hi - lo) * row_bytes)
+            .min(dec.len().saturating_sub(src))
+            .min(output.len().saturating_sub(dst));
+        len -= len % elem_size;
+        if len > 0 {
+            output[dst..dst + len].copy_from_slice(&dec[src..src + len]);
+        }
+    }
+
+    Ok(Some(output))
+}
+
 /// Read a chunked dataset from a [`FileSource`] with parsed-index and
 /// decompressed-chunk caching.
 ///

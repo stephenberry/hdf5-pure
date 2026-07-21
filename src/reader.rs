@@ -980,6 +980,214 @@ impl FileInner {
             }
         }
     }
+
+    /// Windowed counterpart of [`read_dataset_raw`](Self::read_dataset_raw): read
+    /// the raw element bytes of the leading-dimension row window
+    /// `[start_row, start_row + num_rows)`, touching only the storage that overlaps
+    /// the window. `start_row + num_rows` must not exceed the dataset's leading
+    /// dimension (the caller clamps first). Reads through the same base-framed
+    /// `FileSource` as `read_dataset_raw`, so base-relative on-disk addresses
+    /// resolve identically.
+    #[allow(clippy::too_many_arguments)]
+    fn read_dataset_rows_raw(
+        &self,
+        dl: &DataLayout,
+        ds: &Dataspace,
+        dt: &Datatype,
+        pipeline: Option<&FilterPipeline>,
+        cache: &ChunkCache,
+        start_row: u64,
+        num_rows: u64,
+    ) -> Result<Vec<u8>, FormatError> {
+        let (os, ls) = (self.offset_size(), self.length_size());
+        let elem_size = dt.type_size() as usize;
+        // Elements per dim-0 row: the product of the inner dims (1 for a 0-D or
+        // 1-D dataset, whose rows are single elements).
+        let row_elems: usize = ds
+            .dimensions
+            .iter()
+            .skip(1)
+            .map(|&d| d.to_usize())
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .product();
+        let row_bytes = row_elems
+            .checked_mul(elem_size)
+            .ok_or(FormatError::OffsetOverflow {
+                offset: row_elems as u64,
+                length: elem_size as u64,
+            })?;
+
+        // Compact data lives inline in the layout message — no I/O, no framing.
+        if let DataLayout::Compact { data } = dl {
+            let start = start_row.to_usize()?.checked_mul(row_bytes);
+            let len = num_rows.to_usize()?.checked_mul(row_bytes);
+            let (Some(start), Some(len)) = (start, len) else {
+                return Err(FormatError::OffsetOverflow {
+                    offset: start_row,
+                    length: row_bytes as u64,
+                });
+            };
+            return data
+                .get(start..start + len)
+                .map(<[u8]>::to_vec)
+                .ok_or(FormatError::DataSizeMismatch {
+                    expected: start + len,
+                    actual: data.len(),
+                });
+        }
+
+        let base = self.addr_offset;
+        match &self.backend {
+            Backend::InMemory(v) => {
+                let frame = if base == 0 {
+                    v.as_slice()
+                } else {
+                    let start = base.to_usize()?;
+                    v.get(start..).ok_or(FormatError::UnexpectedEof {
+                        expected: start,
+                        available: v.len(),
+                    })?
+                };
+                read_rows_framed(
+                    &BytesSource::new(frame),
+                    dl,
+                    ds,
+                    dt,
+                    pipeline,
+                    os,
+                    ls,
+                    cache,
+                    start_row,
+                    num_rows,
+                    row_bytes,
+                )
+            }
+            Backend::Streaming(s) if base == 0 => read_rows_framed(
+                s.as_ref(),
+                dl,
+                ds,
+                dt,
+                pipeline,
+                os,
+                ls,
+                cache,
+                start_row,
+                num_rows,
+                row_bytes,
+            ),
+            Backend::Streaming(s) => {
+                let framed = BaseOffsetSource {
+                    inner: s.as_ref(),
+                    base,
+                };
+                read_rows_framed(
+                    &framed, dl, ds, dt, pipeline, os, ls, cache, start_row, num_rows, row_bytes,
+                )
+            }
+            Backend::Mirror(m) => {
+                let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let data = core.mirror_bytes();
+                let frame = if base == 0 {
+                    data
+                } else {
+                    let start = base.to_usize()?;
+                    data.get(start..).ok_or(FormatError::UnexpectedEof {
+                        expected: start,
+                        available: data.len(),
+                    })?
+                };
+                read_rows_framed(
+                    &BytesSource::new(frame),
+                    dl,
+                    ds,
+                    dt,
+                    pipeline,
+                    os,
+                    ls,
+                    cache,
+                    start_row,
+                    num_rows,
+                    row_bytes,
+                )
+            }
+        }
+    }
+}
+
+/// Read a leading-dimension row window through an already base-framed
+/// `FileSource`, shared by every backend arm of
+/// [`FileInner::read_dataset_rows_raw`]. Contiguous layouts are a single bounded
+/// sub-read; chunked layouts use the windowed chunk reader, falling back to a
+/// whole-dataset read + slice when an inner dimension is itself chunked.
+#[allow(clippy::too_many_arguments)]
+fn read_rows_framed<S: FileSource + ?Sized>(
+    source: &S,
+    dl: &DataLayout,
+    ds: &Dataspace,
+    dt: &Datatype,
+    pipeline: Option<&FilterPipeline>,
+    os: u8,
+    ls: u8,
+    cache: &ChunkCache,
+    start_row: u64,
+    num_rows: u64,
+    row_bytes: usize,
+) -> Result<Vec<u8>, FormatError> {
+    match dl {
+        DataLayout::Compact { .. } => unreachable!("compact is handled before framing"),
+        DataLayout::Contiguous { address, size } => {
+            let addr = address.ok_or(FormatError::NoDataAllocated)?;
+            let start = start_row
+                .checked_mul(row_bytes as u64)
+                .ok_or(FormatError::OffsetOverflow {
+                    offset: start_row,
+                    length: row_bytes as u64,
+                })?;
+            let len = num_rows.to_usize()?.checked_mul(row_bytes).ok_or(
+                FormatError::OffsetOverflow {
+                    offset: num_rows,
+                    length: row_bytes as u64,
+                },
+            )?;
+            // Never read past the dataset's own contiguous storage.
+            if start.saturating_add(len as u64) > *size {
+                return Err(FormatError::DataSizeMismatch {
+                    expected: (start as usize).saturating_add(len),
+                    actual: (*size).to_usize()?,
+                });
+            }
+            let off = addr
+                .checked_add(start)
+                .ok_or(FormatError::OffsetOverflow {
+                    offset: addr,
+                    length: start,
+                })?;
+            source.read_exact_at(off, len)
+        }
+        DataLayout::Chunked { .. } => {
+            match crate::chunked_read::read_chunked_rows_from_source(
+                source, dl, ds, dt, pipeline, os, ls, start_row, num_rows,
+            )? {
+                Some(bytes) => Ok(bytes),
+                // Inner-chunked: fall back to a whole-dataset read, then slice.
+                None => {
+                    let full = data_read::read_raw_data_cached_from_source(
+                        source, dl, ds, dt, pipeline, os, ls, cache,
+                    )?;
+                    let start = start_row.to_usize()? * row_bytes;
+                    let len = num_rows.to_usize()? * row_bytes;
+                    full.get(start..start + len).map(<[u8]>::to_vec).ok_or(
+                        FormatError::DataSizeMismatch {
+                            expected: start + len,
+                            actual: full.len(),
+                        },
+                    )
+                }
+            }
+        }
+        DataLayout::Virtual { .. } => Err(FormatError::UnsupportedVirtualLayout),
+    }
 }
 
 impl std::fmt::Debug for FileInner {
@@ -2503,6 +2711,128 @@ impl Dataset {
         Ok(self
             .file
             .read_dataset_raw(&dl, &ds, &dt, pipeline.as_ref(), &self.chunk_cache)?)
+    }
+
+    /// Read the raw element bytes of the leading-dimension row window
+    /// `[start_row, start_row + num_rows)`.
+    ///
+    /// The windowed companion to [`read_raw`](Self::read_raw): only the storage
+    /// overlapping the window is touched — a bounded sub-read for compact and
+    /// contiguous layouts, and just the chunks overlapping the window for chunked
+    /// layouts — so peak memory is proportional to the window rather than the whole
+    /// dataset. This is the building block for streaming a large dataset a bounded
+    /// number of rows at a time.
+    ///
+    /// The window is a slice along the first dimension only; every row keeps its
+    /// full inner shape, and the bytes are laid out exactly as
+    /// [`read_raw`](Self::read_raw) would produce for those rows — so the typed
+    /// `read_*_rows` helpers decode a window identically to their whole-dataset
+    /// counterparts. The window is clamped to the dataset's leading dimension, so a
+    /// read past the end returns only the rows that exist (an empty vector once
+    /// `start_row` is at or beyond the end). A 0-D scalar behaves as a single row.
+    ///
+    /// For variable-length string datasets the raw bytes are heap references, not
+    /// decoded text; use [`read_string_rows`](Self::read_string_rows) instead.
+    pub fn read_rows_raw(&self, start_row: u64, num_rows: u64) -> Result<Vec<u8>, Error> {
+        let dt = self.datatype()?;
+        let ds = self.dataspace()?;
+        let dl = self.data_layout()?;
+
+        let n0 = ds.dimensions.first().copied().unwrap_or(1);
+        let start = start_row.min(n0);
+        let count = num_rows.min(n0 - start);
+
+        Ok(self.file.read_dataset_rows_raw(
+            &dl,
+            &ds,
+            &dt,
+            self.filter_pipeline_parsed().as_ref(),
+            &self.chunk_cache,
+            start,
+            count,
+        )?)
+    }
+
+    /// Windowed [`read_f64`](Self::read_f64) — decodes only the row window.
+    pub fn read_f64_rows(&self, start_row: u64, num_rows: u64) -> Result<Vec<f64>, Error> {
+        let raw = self.read_rows_raw(start_row, num_rows)?;
+        Ok(data_read::read_as_f64(&raw, &self.datatype()?)?)
+    }
+
+    /// Windowed [`read_f32`](Self::read_f32) — decodes only the row window.
+    pub fn read_f32_rows(&self, start_row: u64, num_rows: u64) -> Result<Vec<f32>, Error> {
+        let raw = self.read_rows_raw(start_row, num_rows)?;
+        Ok(data_read::read_as_f32(&raw, &self.datatype()?)?)
+    }
+
+    /// Windowed [`read_i8`](Self::read_i8) — decodes only the row window.
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "read_i8 reinterprets each stored byte as the signed i8 the caller requested"
+    )]
+    pub fn read_i8_rows(&self, start_row: u64, num_rows: u64) -> Result<Vec<i8>, Error> {
+        let raw = self.read_rows_raw(start_row, num_rows)?;
+        Ok(raw.iter().map(|&b| b as i8).collect())
+    }
+
+    /// Windowed [`read_i16`](Self::read_i16) — decodes only the row window.
+    pub fn read_i16_rows(&self, start_row: u64, num_rows: u64) -> Result<Vec<i16>, Error> {
+        let raw = self.read_rows_raw(start_row, num_rows)?;
+        Ok(data_read::read_as_i16(&raw, &self.datatype()?)?)
+    }
+
+    /// Windowed [`read_i32`](Self::read_i32) — decodes only the row window.
+    pub fn read_i32_rows(&self, start_row: u64, num_rows: u64) -> Result<Vec<i32>, Error> {
+        let raw = self.read_rows_raw(start_row, num_rows)?;
+        Ok(data_read::read_as_i32(&raw, &self.datatype()?)?)
+    }
+
+    /// Windowed [`read_i64`](Self::read_i64) — decodes only the row window.
+    pub fn read_i64_rows(&self, start_row: u64, num_rows: u64) -> Result<Vec<i64>, Error> {
+        let raw = self.read_rows_raw(start_row, num_rows)?;
+        Ok(data_read::read_as_i64(&raw, &self.datatype()?)?)
+    }
+
+    /// Windowed [`read_u8`](Self::read_u8) — reads only the row window.
+    pub fn read_u8_rows(&self, start_row: u64, num_rows: u64) -> Result<Vec<u8>, Error> {
+        self.read_rows_raw(start_row, num_rows)
+    }
+
+    /// Windowed [`read_u16`](Self::read_u16) — decodes only the row window.
+    pub fn read_u16_rows(&self, start_row: u64, num_rows: u64) -> Result<Vec<u16>, Error> {
+        let raw = self.read_rows_raw(start_row, num_rows)?;
+        Ok(data_read::read_as_u16(&raw, &self.datatype()?)?)
+    }
+
+    /// Windowed [`read_u32`](Self::read_u32) — decodes only the row window.
+    pub fn read_u32_rows(&self, start_row: u64, num_rows: u64) -> Result<Vec<u32>, Error> {
+        let raw = self.read_rows_raw(start_row, num_rows)?;
+        Ok(data_read::read_as_u32(&raw, &self.datatype()?)?)
+    }
+
+    /// Windowed [`read_u64`](Self::read_u64) — decodes only the row window.
+    pub fn read_u64_rows(&self, start_row: u64, num_rows: u64) -> Result<Vec<u64>, Error> {
+        let raw = self.read_rows_raw(start_row, num_rows)?;
+        Ok(data_read::read_as_u64(&raw, &self.datatype()?)?)
+    }
+
+    /// Windowed [`read_string`](Self::read_string) — returns only the row window.
+    ///
+    /// Fixed-length string datasets decode directly from the row window (bounded
+    /// memory). For variable-length strings, whose payloads live in a shared heap
+    /// and are not row-local, the whole dataset is read and the window sliced out,
+    /// so the memory bound does not apply to that case.
+    pub fn read_string_rows(&self, start_row: u64, num_rows: u64) -> Result<Vec<String>, Error> {
+        let dt = self.datatype()?;
+        if vl_data::is_vlen_string_datatype(&dt) {
+            let all = self.read_string()?;
+            let n0 = self.dataspace()?.dimensions.first().copied().unwrap_or(1);
+            let start = start_row.min(n0).to_usize()?;
+            let end = start_row.saturating_add(num_rows).min(n0).to_usize()?;
+            return Ok(all.get(start..end).unwrap_or_default().to_vec());
+        }
+        let raw = self.read_rows_raw(start_row, num_rows)?;
+        Ok(data_read::read_as_strings(&raw, &dt)?)
     }
 
     /// Interpret this dataset as an array of HDF5 object references
