@@ -829,24 +829,20 @@ pub fn read_chunked_data_from_source<S: FileSource + ?Sized>(
     ))
 }
 
-/// Read the raw element bytes of the leading-dimension row window
-/// `[row_start, row_start + num_rows)` of a chunked dataset, decoding only the
-/// chunks that overlap the window.
+/// Read the raw element bytes of the row window `[row_start, row_start + num_rows)`
+/// — a range along the leading dimension — decoding only the chunks it overlaps.
 ///
-/// This is the windowed counterpart of [`read_chunked_data_from_source`]: rather
-/// than materialize the whole dataset, it touches only the chunks whose dim-0
-/// span intersects the window, so peak memory is bounded by the window (plus one
-/// chunk) instead of the dataset.
+/// The windowed counterpart of [`read_chunked_data_from_source`]: peak memory is
+/// one window plus one chunk, not the whole dataset. `cache` holds the parsed index
+/// and decompressed chunks, so successive windows on the same handle walk the index
+/// once and reuse boundary chunks.
 ///
-/// Fast path only: it assumes every chunk spans the **full inner extent**
-/// (`chunk_dims[i] == ds_dims[i]` for every inner dim `i >= 1`), so a dim-0 slab
-/// is `row_elems` contiguous elements in both the chunk and the dataset and the
-/// scatter is a plain row-band copy. That holds for every frame-per-chunk layout
-/// (the common case, and all image/tensor-per-row data). When an inner dimension
-/// is itself chunked this returns `Ok(None)`, signaling the caller to fall back
-/// to a whole-dataset read; otherwise it returns `Ok(Some(bytes))` with exactly
-/// `num_rows * row_elems` elements' worth of bytes. `row_start + num_rows` must
-/// not exceed the dataset's leading dimension (callers clamp first).
+/// Handles only chunks that span the full inner extent (`chunk_dims[i] == ds_dims[i]`
+/// for `i >= 1`), where each row is contiguous in the chunk and the copy is a plain
+/// row band — true for every frame-per-chunk dataset. Returns `Ok(None)` when an
+/// inner dimension is chunked, so the caller falls back to a whole read. Otherwise
+/// returns `num_rows * row_elems` elements. The caller clamps the window to the
+/// dataset.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn read_chunked_rows_from_source<S: FileSource + ?Sized>(
     source: &S,
@@ -856,6 +852,7 @@ pub(crate) fn read_chunked_rows_from_source<S: FileSource + ?Sized>(
     pipeline: Option<&FilterPipeline>,
     offset_size: u8,
     length_size: u8,
+    cache: &ChunkCache,
     row_start: u64,
     num_rows: u64,
 ) -> Result<Option<Vec<u8>>, FormatError> {
@@ -893,14 +890,13 @@ pub(crate) fn read_chunked_rows_from_source<S: FileSource + ?Sized>(
         )));
     }
 
-    // The windowed scatter is a contiguous row-band copy only when a dim-0 slab
-    // is contiguous in the chunk — i.e. the chunk covers the full inner extent.
-    // Anything else (inner-chunked) falls back to the whole-dataset reader.
+    // A row is contiguous in the chunk only when the chunk spans the full inner
+    // extent; inner-chunked layouts fall back to the whole-dataset reader.
     if (1..rank).any(|i| chunk_dims[i] != ds_dims[i]) {
         return Ok(None);
     }
 
-    // Elements per dim-0 row (the product of the inner dims; 1 for a 1-D dataset).
+    // Elements per row (product of the inner dims; 1 when 0-D or 1-D).
     let row_elems: usize = ds_dims.iter().skip(1).product();
     let row_bytes = row_elems
         .checked_mul(elem_size)
@@ -921,25 +917,31 @@ pub(crate) fn read_chunked_rows_from_source<S: FileSource + ?Sized>(
         return Ok(Some(output));
     }
 
-    // Unallocated storage: the window is all fill/zeros, matching the
-    // whole-dataset reader's treatment of a not-yet-written chunked dataset.
+    // Unallocated storage: the window is all zeros.
     let Some(addr) = *btree_address else {
         return Ok(Some(output));
     };
 
-    let chunks = collect_chunks_for_layout_from_source(
-        source,
-        *version,
-        *chunk_index_type,
-        addr,
-        *single_chunk_filtered_size,
-        *single_chunk_filter_mask,
-        chunk_dimensions,
-        dataspace,
-        elem_size,
-        offset_size,
-        length_size,
-    )?;
+    // Walk the index once, then reuse it for later windows on this handle.
+    let chunks = if let Some(chunks) = cache.all_indexed_chunks() {
+        chunks
+    } else {
+        let chunks = collect_chunks_for_layout_from_source(
+            source,
+            *version,
+            *chunk_index_type,
+            addr,
+            *single_chunk_filtered_size,
+            *single_chunk_filter_mask,
+            chunk_dimensions,
+            dataspace,
+            elem_size,
+            offset_size,
+            length_size,
+        )?;
+        cache.populate_index(&chunks, rank);
+        chunks
+    };
 
     let chunk_dims_u64: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
     let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype);
@@ -951,34 +953,60 @@ pub(crate) fn read_chunked_rows_from_source<S: FileSource + ?Sized>(
     for chunk in &chunks {
         let c0 = chunk.offsets.first().copied().unwrap_or(0).to_usize()?;
         if c0 >= row_hi || c0 + cd0 <= row_lo {
-            continue; // this chunk lies entirely outside the row window
+            continue; // no overlap with the window
         }
 
-        let raw = source.read_exact_at(chunk.address, chunk.chunk_size as usize)?;
-        let dec = match pipeline {
-            Some(pl) => decompress_chunk(&raw, pl, ctx, chunk.filter_mask)?,
-            None => raw,
-        };
-
-        // Row-band overlap of the chunk with the window, in element rows.
+        // Rows of this chunk that fall in the window, as byte offsets.
         let lo = c0.max(row_lo);
         let hi = (c0 + cd0).min(row_hi);
         let src = (lo - c0) * row_bytes;
         let dst = (lo - row_lo) * row_bytes;
-        // Clamp to the bytes available on both sides (on an element boundary), so
-        // an edge chunk that overhangs the dataset — or a short/malformed chunk —
-        // copies only its valid prefix and is never an out-of-bounds access. This
-        // mirrors the clamp discipline of `copy_chunk_to_output`.
-        let mut len = ((hi - lo) * row_bytes)
-            .min(dec.len().saturating_sub(src))
-            .min(output.len().saturating_sub(dst));
-        len -= len % elem_size;
-        if len > 0 {
-            output[dst..dst + len].copy_from_slice(&dec[src..src + len]);
+        let band = (hi - lo) * row_bytes;
+
+        let coord: Vec<u64> = chunk.offsets.iter().take(rank).copied().collect();
+        let hit = cache.with_decompressed(&coord, |bytes| {
+            row_band_copy(&mut output, dst, bytes, src, band, elem_size);
+        });
+        if hit.is_some() {
+            continue;
+        }
+
+        let raw = source.read_exact_at(chunk.address, chunk.chunk_size as usize)?;
+        match pipeline {
+            Some(pl) => {
+                let dec = decompress_chunk(&raw, pl, ctx, chunk.filter_mask)?;
+                row_band_copy(&mut output, dst, &dec, src, band, elem_size);
+                cache.put_decompressed(coord, dec);
+            }
+            None => {
+                row_band_copy(&mut output, dst, &raw, src, band, elem_size);
+                cache.put_decompressed_slice(coord, &raw);
+            }
         }
     }
 
     Ok(Some(output))
+}
+
+/// Copy one chunk's overlapping row band into the window buffer at `dst`, clamped
+/// to the bytes present on each side (element-aligned). An edge or short chunk
+/// copies only its valid prefix and never reads or writes out of bounds — the same
+/// discipline as [`copy_chunk_to_output`].
+fn row_band_copy(
+    output: &mut [u8],
+    dst: usize,
+    chunk: &[u8],
+    src: usize,
+    band: usize,
+    elem_size: usize,
+) {
+    let mut len = band
+        .min(chunk.len().saturating_sub(src))
+        .min(output.len().saturating_sub(dst));
+    len -= len % elem_size;
+    if len > 0 {
+        output[dst..dst + len].copy_from_slice(&chunk[src..src + len]);
+    }
 }
 
 /// Read a chunked dataset from a [`FileSource`] with parsed-index and

@@ -1,5 +1,5 @@
 //! Tests for the windowed (leading-dimension row-range) read API:
-//! `Dataset::read_rows_raw` and the typed `read_*_rows` helpers (issue: partial
+//! `Dataset::read_raw_rows` and the typed `read_*_rows` helpers (issue: partial
 //! reads).
 //!
 //! The invariant under test everywhere: a row window must be byte-for-byte the
@@ -8,7 +8,7 @@
 //! streaming backend, and across edge windows (empty, past-the-end, straddling
 //! chunk boundaries).
 
-use hdf5_pure::{File, FileBuilder};
+use hdf5_pure::{CharacterSet, Datatype, File, FileBuilder, StringPadding};
 
 /// Open the bytes produced by `build` on both backends: buffered (in-memory) and
 /// streaming (from a temp file). The windowed read dispatches per backend, so
@@ -190,6 +190,34 @@ fn scalar_0d_is_a_single_row() {
 
 #[test]
 fn fixed_length_strings_window() {
+    // Fixed-length strings decode straight from the raw window (the bounded path).
+    let (buffered, streaming, _dir) = on_both_backends(|b| {
+        let dtype = Datatype::String {
+            size: 4,
+            padding: StringPadding::NullPad,
+            charset: CharacterSet::Utf8,
+        };
+        let mut bytes = Vec::new();
+        for value in ["ab", "cde", "f", "ghij"] {
+            let mut element = value.as_bytes().to_vec();
+            element.resize(4, 0);
+            bytes.extend_from_slice(&element);
+        }
+        b.create_dataset("fixed").with_raw_data(dtype, bytes, 4);
+    });
+    for file in [&buffered, &streaming] {
+        let ds = file.dataset("fixed").unwrap();
+        let full = ds.read_string().unwrap();
+        assert_eq!(ds.read_string_rows(0, 4).unwrap(), full);
+        assert_eq!(ds.read_string_rows(1, 2).unwrap(), &full[1..3]);
+        assert_eq!(ds.read_string_rows(3, 5).unwrap(), &full[3..4]);
+    }
+}
+
+#[test]
+fn vlen_strings_window_falls_back_to_slice() {
+    // Variable-length strings are heap-backed, so `read_string_rows` reads the whole
+    // dataset and slices; the window must still match.
     let (buffered, streaming, _dir) = on_both_backends(|b| {
         b.create_dataset("labels")
             .with_vlen_strings(&["idle", "reach", "grasp", "lift", "place"]);
@@ -228,7 +256,7 @@ fn typed_readers_match_whole_dataset() {
 }
 
 #[test]
-fn read_rows_raw_matches_read_raw() {
+fn read_raw_rows_matches_read_raw() {
     // The raw-byte contract, independent of dtype decoding, on a compressed chunked
     // dataset large enough to span chunks.
     let data: Vec<f64> = (0..500).map(|i| i as f64 * -0.5).collect();
@@ -246,7 +274,7 @@ fn read_rows_raw_matches_read_raw() {
         for (start, count) in [(0u64, 500u64), (150, 200), (99, 3), (450, 100)] {
             let s = start as usize * elem;
             let e = (start + count).min(500) as usize * elem;
-            assert_eq!(ds.read_rows_raw(start, count).unwrap(), &full[s..e]);
+            assert_eq!(ds.read_raw_rows(start, count).unwrap(), &full[s..e]);
         }
     }
 }
