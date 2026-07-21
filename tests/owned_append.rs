@@ -84,3 +84,25 @@ fn open_rw_reads_like_open() {
     );
     assert_eq!(file.dataset("d").unwrap().shape().unwrap(), vec![6]);
 }
+
+/// Regression: interleaved read -> append -> read through ONE handle must
+/// observe every append. The handle's chunk cache retains the parsed chunk
+/// index, and an any-length append relocates the trailing chunk and adds new
+/// index entries; before the post-mutation cache clear, the second read served
+/// the stale index and returned zeros for the appended elements.
+#[test]
+fn interleaved_reads_observe_every_append() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("interleaved.h5");
+    create_i32(&p, 6, 4);
+    let file = File::open_rw(&p).unwrap();
+    let mut ds = file.dataset("d").unwrap();
+    ds.append(&[6i32, 7, 8]).unwrap();
+    assert_eq!(ds.read_i32().unwrap(), (0..9).collect::<Vec<_>>());
+    // The read above cached the chunk index; this append repoints the trailing
+    // chunk (element 8's chunk moves) and must invalidate that cache.
+    ds.append(&[9i32]).unwrap();
+    assert_eq!(ds.read_i32().unwrap(), (0..10).collect::<Vec<_>>());
+    ds.append(&[10i32, 11, 12, 13]).unwrap();
+    assert_eq!(ds.read_i32().unwrap(), (0..14).collect::<Vec<_>>());
+}

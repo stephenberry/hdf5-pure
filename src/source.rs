@@ -314,8 +314,11 @@ struct CachedMetadataRead {
     last_access: u64,
 }
 
+/// The bounded LRU store behind [`MetadataCachingSource`], also embedded
+/// directly by the bounded read-write backend (`crate::bounded`), which must
+/// invalidate entries that overlap an in-place write.
 #[cfg(feature = "std")]
-struct MetadataReadCache {
+pub(crate) struct MetadataReadCache {
     entries: Vec<CachedMetadataRead>,
     current_bytes: usize,
     tick: u64,
@@ -323,7 +326,7 @@ struct MetadataReadCache {
 
 #[cfg(feature = "std")]
 impl MetadataReadCache {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             entries: Vec::new(),
             current_bytes: 0,
@@ -331,7 +334,26 @@ impl MetadataReadCache {
         }
     }
 
-    fn get(&mut self, offset: u64, len: usize) -> Option<Vec<u8>> {
+    /// Drop every cached entry that overlaps `[offset, offset + len)`, so a
+    /// read after an in-place write never observes stale bytes.
+    pub(crate) fn invalidate_overlapping(&mut self, offset: u64, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let end = offset.saturating_add(len as u64);
+        let mut removed = 0usize;
+        self.entries.retain(|entry| {
+            let entry_end = entry.offset.saturating_add(entry.len as u64);
+            let overlaps = entry.offset < end && offset < entry_end;
+            if overlaps {
+                removed += entry.bytes.len();
+            }
+            !overlaps
+        });
+        self.current_bytes -= removed;
+    }
+
+    pub(crate) fn get(&mut self, offset: u64, len: usize) -> Option<Vec<u8>> {
         self.tick = self.tick.wrapping_add(1);
         let tick = self.tick;
         for entry in &mut self.entries {
@@ -343,7 +365,7 @@ impl MetadataReadCache {
         None
     }
 
-    fn insert(&mut self, offset: u64, len: usize, bytes: Vec<u8>, max_bytes: usize) {
+    pub(crate) fn insert(&mut self, offset: u64, len: usize, bytes: Vec<u8>, max_bytes: usize) {
         if len == 0 || bytes.len() > max_bytes {
             return;
         }

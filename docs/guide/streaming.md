@@ -41,6 +41,8 @@ Dataset reads are fully supported across every storage layout:
 
     If a file uses v1 groups or you need attributes, open it with `File::open` instead.
 
+Streaming opens are read-only. To **append** to a file with the same bounded-memory discipline, open it with [`File::open_rw_bounded`](editing.md#bounded-memory-appends) — the read-write sibling of `open_streaming`, sharing this backend's read capabilities and the `FileAccessOptions` cache budgets below.
+
 ## Tuning retained memory
 
 `File::open_streaming_with_options(path, FileAccessOptions)` bounds the memory the streaming backend retains. `FileAccessOptions::new()` returns the crate's default access behavior; you layer on two independent caches with its builder methods.
