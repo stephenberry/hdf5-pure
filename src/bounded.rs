@@ -41,6 +41,22 @@ use crate::superblock::Superblock;
 /// a valid shorter dataset — exactly as if the caller had looped.
 const APPEND_BATCH_BYTES: u64 = 1 << 20;
 
+/// One dataset's append geometry, handed to the public append path so it can
+/// slice a large call into aligned batches without materializing the whole
+/// call's bytes first.
+pub(crate) struct AppendGeometry {
+    /// Elements per chunk along axis 0 (>= 1).
+    pub(crate) chunk_elems: u64,
+    /// Bytes per on-disk element.
+    pub(crate) element_size: usize,
+    /// Current length along the unlimited dimension.
+    pub(crate) current_dim: u64,
+    /// Whether a filter pipeline applies (whole-chunk appends only).
+    pub(crate) filtered: bool,
+    /// Whole-chunk elements in one full batch (>= one chunk's worth).
+    pub(crate) full_batch_elems: u64,
+}
+
 /// Read exactly `buf.len()` bytes at `offset` from a shared file handle,
 /// bounds-checked against `len` (mirroring `ReadSeekSource`). Uses the
 /// `Read`/`Seek` impls on `&std::fs::File`; callers serialize access through
@@ -282,6 +298,29 @@ impl BoundedEngine {
         Store::sync(&mut self.store)
     }
 
+    /// Locate (or fetch the cached) append geometry for the dataset at
+    /// `oh_addr`, so the public append path can slice a large call into
+    /// aligned batches *before* building each batch's byte buffer — keeping
+    /// peak memory at one batch rather than the whole call.
+    pub(crate) fn append_geometry(&mut self, oh_addr: u64) -> Result<AppendGeometry, Error> {
+        let Self { store, located } = self;
+        let st = match located.entry(oh_addr) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(locate_dataset_state(&*store, oh_addr)?)
+            }
+        };
+        let chunk_elems = st.loc.chunk_elems.max(1);
+        let batch_chunks = (APPEND_BATCH_BYTES / (st.loc.chunk_bytes.max(1) as u64)).max(1);
+        Ok(AppendGeometry {
+            chunk_elems,
+            element_size: st.element_size,
+            current_dim: st.loc.current_dim,
+            filtered: st.pipeline.is_some(),
+            full_batch_elems: batch_chunks * chunk_elems,
+        })
+    }
+
     /// Immediate in-place append of a gathered builder to the dataset whose
     /// object header sits at `oh_addr` — the bounded counterpart of
     /// `WriteEngine::append_inplace_gathered`, sharing its locate, validation,
@@ -318,6 +357,19 @@ impl BoundedEngine {
         let raw = b.raw();
 
         let chunk_elems = st.loc.chunk_elems.max(1);
+        // Refuse a non-chunk-aligned filtered append before ANY batch applies,
+        // so the refusal is as atomic as the mirror path's. Without this,
+        // `plan_ea_append` would reject it only when the final (unaligned)
+        // batch is reached — after earlier batches had durably committed.
+        if st.pipeline.is_some()
+            && (st.loc.current_dim % chunk_elems != 0 || new_elems % chunk_elems != 0)
+        {
+            return Err(Error::AppendInPlaceUnsupported(
+                "a filtered dataset can only be appended in place in whole chunks (the current \
+                 length and the appended length must both be multiples of the chunk length); \
+                 use Dataset::append_staged for a non-chunk-aligned filtered append",
+            ));
+        }
         let elem_bytes = st.element_size as u64;
         let batch_chunks = (APPEND_BATCH_BYTES / (st.loc.chunk_bytes.max(1) as u64)).max(1);
         let full_batch_elems = batch_chunks * chunk_elems;

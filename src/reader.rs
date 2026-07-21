@@ -496,9 +496,32 @@ impl FileInner {
             Backend::InMemory(v) => SourceView::Mem(v),
             Backend::Streaming(s) => SourceView::Stream(s.as_ref()),
             // A mirror or bounded file's bytes live behind a lock and cannot be
-            // lent out as a borrowed view; their read paths take the lock
-            // directly instead, so these arms are never reached.
+            // lent out as a borrowed view; the read paths that reach every
+            // backend go through [`with_source`](Self::with_source) instead.
             Backend::Mirror(_) | Backend::Bounded(_) => SourceView::Mem(&[]),
+        }
+    }
+
+    /// Run `f` with a random-access view of this file's bytes, taking the
+    /// write-engine lock when the backend requires one. Unlike
+    /// [`source`](Self::source) — which cannot lend a borrowed view out of a
+    /// lock and returns an empty view for the mirror and bounded backends —
+    /// this serves every backend, so it is the dispatch for read paths (heap
+    /// reads for variable-length data, chunk enumeration) that must also work
+    /// on a read-write file. `f` must not re-enter this file's backend (the
+    /// engine lock is held while it runs).
+    pub(crate) fn with_source<R>(&self, f: impl FnOnce(&dyn Source) -> R) -> R {
+        match &self.backend {
+            Backend::InMemory(v) => f(&BytesSource::new(v.as_slice())),
+            Backend::Streaming(s) => f(s.as_ref()),
+            Backend::Mirror(m) => {
+                let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                f(&BytesSource::new(core.mirror_bytes()))
+            }
+            Backend::Bounded(m) => {
+                let engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                f(engine.store())
+            }
         }
     }
 
@@ -1885,9 +1908,13 @@ impl Dataset {
     /// (unlimited) dimension, and refresh this handle so subsequent reads observe
     /// the new length.
     ///
-    /// The file must have been opened for writing with [`File::open_rw`]; a
-    /// read-only file (or a handle reached by object reference, which has no
-    /// path) returns [`Error::ReadOnly`](crate::Error::ReadOnly). The target must
+    /// The file must have been opened for writing with [`File::open_rw`] or
+    /// [`File::open_rw_bounded`]; a read-only file returns
+    /// [`Error::ReadOnly`](crate::Error::ReadOnly). On an `open_rw` file a
+    /// handle reached by object reference (which has no resolvable path) also
+    /// returns `ReadOnly`; on an `open_rw_bounded` file appends are keyed by
+    /// the handle's object-header address, so such a handle can append. The
+    /// target must
     /// be a chunked, rank-1, unlimited, Extensible-Array-indexed dataset — the
     /// same contract as [`AppendWriter`](crate::AppendWriter), including filtered
     /// whole-chunk / unfiltered any-length rules — otherwise
@@ -1895,9 +1922,10 @@ impl Dataset {
     /// The append is immediate and crash-atomic (no `commit` needed).
     pub fn append<T: H5Element>(&mut self, data: &[T]) -> Result<(), Error> {
         if matches!(self.file.backend, Backend::Bounded(_)) {
-            let mut b = AppendBuilder::new();
-            b.append(data);
-            return self.bounded_append(&b);
+            let g = self.bounded_geometry()?;
+            return self.bounded_append_batches(g, data.len() as u64, |b, r| {
+                b.append(&data[r]);
+            });
         }
         self.with_session_mut(false, |session, path| session.append_inplace(path, data))
     }
@@ -1907,27 +1935,84 @@ impl Dataset {
     /// file-mode and eligibility rules.
     pub fn append_raw(&mut self, bytes: &[u8]) -> Result<(), Error> {
         if matches!(self.file.backend, Backend::Bounded(_)) {
-            let mut b = AppendBuilder::new();
-            b.append_raw(bytes);
-            return self.bounded_append(&b);
+            let g = self.bounded_geometry()?;
+            let es = g.element_size.max(1);
+            // Whole-element length is checked before any batch applies, so the
+            // refusal is atomic (the per-batch validation would only reject the
+            // final, short batch after earlier ones had durably committed).
+            if bytes.len() % es != 0 {
+                return Err(Error::AppendInPlaceUnsupported(
+                    "appended byte length is not a whole number of elements",
+                ));
+            }
+            let total = (bytes.len() / es) as u64;
+            return self.bounded_append_batches(g, total, |b, r| {
+                b.append_raw(&bytes[r.start * es..r.end * es]);
+            });
         }
         self.with_session_mut(false, |session, path| {
             session.append_inplace_raw(path, bytes)
         })
     }
 
-    /// Immediate append on a bounded file: keyed by this handle's object-header
-    /// address (no path resolution — a handle reached by object reference can
-    /// append too), then the cached header is refreshed so later reads on this
-    /// handle observe the new length.
-    fn bounded_append(&mut self, b: &AppendBuilder) -> Result<(), Error> {
+    /// Fetch (locating on first use) this dataset's append geometry from a
+    /// bounded file's engine.
+    fn bounded_geometry(&self) -> Result<crate::bounded::AppendGeometry, Error> {
         let Backend::Bounded(m) = &self.file.backend else {
             return Err(Error::ReadOnly);
         };
         self.file.check_mutable(false)?;
-        {
-            let mut engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            engine.append_gathered(self.address, b, 4)?;
+        let mut engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        engine.append_geometry(self.address)
+    }
+
+    /// Immediate append on a bounded file, keyed by this handle's object-header
+    /// address (no path resolution — a handle reached by object reference can
+    /// append too). The call is split into aligned batches — the trailing
+    /// partial chunk is filled first, then whole-chunk batches under the
+    /// engine's byte budget — and `fill` builds each batch's bytes on demand,
+    /// so peak memory holds one batch rather than the whole call. Each batch is
+    /// its own crash-atomic apply; every predictable refusal (wrong datatype,
+    /// ineligible dataset, non-chunk-aligned filtered append) is raised before
+    /// the first batch is applied. The cached header and chunk cache are then
+    /// refreshed so later reads on this handle observe the new length.
+    fn bounded_append_batches(
+        &mut self,
+        g: crate::bounded::AppendGeometry,
+        total_elems: u64,
+        fill: impl Fn(&mut AppendBuilder, std::ops::Range<usize>),
+    ) -> Result<(), Error> {
+        let Backend::Bounded(m) = &self.file.backend else {
+            return Err(Error::ReadOnly);
+        };
+        // Atomic refusal before any batch: a filtered append must be
+        // whole-chunk (the engine re-checks per batch as a backstop).
+        if g.filtered && (g.current_dim % g.chunk_elems != 0 || total_elems % g.chunk_elems != 0) {
+            return Err(Error::AppendInPlaceUnsupported(
+                "a filtered dataset can only be appended in place in whole chunks (the current \
+                 length and the appended length must both be multiples of the chunk length); \
+                 use Dataset::append_staged for a non-chunk-aligned filtered append",
+            ));
+        }
+        let mut dim = g.current_dim;
+        let mut done = 0u64;
+        loop {
+            // An empty append still runs one (empty) engine call so datatype
+            // validation matches the mirror path.
+            self.file.check_mutable(false)?;
+            let to_boundary = (g.chunk_elems - dim % g.chunk_elems) % g.chunk_elems;
+            let take = (total_elems - done).min(to_boundary + g.full_batch_elems);
+            let mut b = AppendBuilder::new();
+            fill(&mut b, done.to_usize()?..(done + take).to_usize()?);
+            {
+                let mut engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                engine.append_gathered(self.address, &b, 4)?;
+            }
+            dim += take;
+            done += take;
+            if done >= total_elems {
+                break;
+            }
         }
         self.header = self.file.parse_header(self.address)?;
         // Same staleness rule as `with_session_mut`: the append repointed or
@@ -2396,6 +2481,11 @@ impl Dataset {
     ///
     /// The string slice passed to `visitor` is valid only for the duration of
     /// that callback. This avoids retaining all decoded string payloads at once.
+    ///
+    /// On a read-write file ([`File::open_rw`] / [`File::open_rw_bounded`]) the
+    /// visitor runs while the file's engine lock is held, so it must not read
+    /// or write through this file (or a clone / handle of it) — doing so
+    /// deadlocks. Collect values and act on them after the call instead.
     pub fn visit_vlen_strings<F>(
         &self,
         options: VlenStringReadOptions,
@@ -2423,17 +2513,18 @@ impl Dataset {
             .into());
         }
         let raw = self.read_raw()?;
-        let source = self.file.source();
-        Ok(vl_data::visit_vl_strings_from_source(
-            &source,
-            &raw,
-            dataspace.num_elements(),
-            self.file.offset_size(),
-            self.file.length_size(),
-            self.file.addr_offset,
-            options,
-            visitor,
-        )?)
+        self.file.with_source(|source| {
+            Ok(vl_data::visit_vl_strings_from_source(
+                source,
+                &raw,
+                dataspace.num_elements(),
+                self.file.offset_size(),
+                self.file.length_size(),
+                self.file.addr_offset,
+                options,
+                visitor,
+            )?)
+        })
     }
 
     /// Read a VL string dataset's exact heap bytes, preserving the
@@ -2466,17 +2557,18 @@ impl Dataset {
             .into());
         }
         let raw = self.read_raw()?;
-        let source = self.file.source();
-        Ok(vl_data::read_vl_byte_objects_from_source(
-            &source,
-            &raw,
-            dataspace.num_elements(),
-            self.file.offset_size(),
-            self.file.length_size(),
-            self.file.addr_offset,
-            1, // a VL string's base type is a single byte
-            options,
-        )?)
+        self.file.with_source(|source| {
+            Ok(vl_data::read_vl_byte_objects_from_source(
+                source,
+                &raw,
+                dataspace.num_elements(),
+                self.file.offset_size(),
+                self.file.length_size(),
+                self.file.addr_offset,
+                1, // a VL string's base type is a single byte
+                options,
+            )?)
+        })
     }
 
     /// Read every element of a *non-string* variable-length (sequence) dataset as
@@ -2525,17 +2617,18 @@ impl Dataset {
             .into());
         }
         let raw = self.read_raw()?;
-        let source = self.file.source();
-        let objects = vl_data::read_vl_byte_objects_from_source(
-            &source,
-            &raw,
-            dataspace.num_elements(),
-            self.file.offset_size(),
-            self.file.length_size(),
-            self.file.addr_offset,
-            element_size,
-            options,
-        )?;
+        let objects = self.file.with_source(|source| {
+            vl_data::read_vl_byte_objects_from_source(
+                source,
+                &raw,
+                dataspace.num_elements(),
+                self.file.offset_size(),
+                self.file.length_size(),
+                self.file.addr_offset,
+                element_size,
+                options,
+            )
+        })?;
         Ok((objects, element_size))
     }
 
@@ -2612,15 +2705,33 @@ impl Dataset {
         let dataspace = self.dataspace()?;
         let elem_size = self.datatype()?.type_size() as usize;
         let base = self.file.addr_offset;
-        let source = self.file.source();
         // The chunk index — its root at `addr` and every internal node — stores
         // addresses relative to the base address. Walk it through a base-relative
         // view so those resolve, then shift each returned chunk address back to an
         // absolute file offset, since callers (repack) read the chunk bytes from
         // the full file source.
-        if base == 0 {
-            return Ok(crate::chunked_read::collect_chunks_for_layout_from_source(
-                &source,
+        self.file.with_source(|source| {
+            if base == 0 {
+                return Ok(crate::chunked_read::collect_chunks_for_layout_from_source(
+                    source,
+                    version,
+                    chunk_index_type,
+                    addr,
+                    single_chunk_filtered_size,
+                    single_chunk_filter_mask,
+                    &chunk_dimensions,
+                    &dataspace,
+                    elem_size,
+                    self.file.offset_size(),
+                    self.file.length_size(),
+                )?);
+            }
+            let framed = BaseOffsetSource {
+                inner: source,
+                base,
+            };
+            let mut chunks = crate::chunked_read::collect_chunks_for_layout_from_source(
+                &framed,
                 version,
                 chunk_index_type,
                 addr,
@@ -2631,35 +2742,17 @@ impl Dataset {
                 elem_size,
                 self.file.offset_size(),
                 self.file.length_size(),
-            )?);
-        }
-        let framed = BaseOffsetSource {
-            inner: &source,
-            base,
-        };
-        let mut chunks = crate::chunked_read::collect_chunks_for_layout_from_source(
-            &framed,
-            version,
-            chunk_index_type,
-            addr,
-            single_chunk_filtered_size,
-            single_chunk_filter_mask,
-            &chunk_dimensions,
-            &dataspace,
-            elem_size,
-            self.file.offset_size(),
-            self.file.length_size(),
-        )?;
-        for c in &mut chunks {
-            c.address =
-                c.address
-                    .checked_add(base)
-                    .ok_or(crate::error::FormatError::OffsetOverflow {
+            )?;
+            for c in &mut chunks {
+                c.address = c.address.checked_add(base).ok_or(
+                    crate::error::FormatError::OffsetOverflow {
                         offset: c.address,
                         length: 0,
-                    })?;
-        }
-        Ok(chunks)
+                    },
+                )?;
+            }
+            Ok(chunks)
+        })
     }
 
     /// The raw `FilterPipeline` message bytes from this dataset's object header,

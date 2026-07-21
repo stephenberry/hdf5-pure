@@ -281,3 +281,64 @@ fn reads_match_streaming_capabilities() {
         vec![1, 2, 3]
     );
 }
+
+#[test]
+fn unaligned_filtered_multi_batch_append_is_refused_atomically() {
+    // A filtered append that is (a) not chunk-aligned and (b) larger than the
+    // internal batch budget must be refused up front with NO batch applied —
+    // the same atomic refusal as open_rw — not partially committed before the
+    // final short batch errors.
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("atomic.h5");
+    build(&p, 256, 256, true);
+    let before = std::fs::read(&p).unwrap();
+    {
+        let file = File::open_rw_bounded(&p).unwrap();
+        let mut ds = file.dataset("d").unwrap();
+        // ~2 MiB of i32, one element past chunk alignment.
+        let unaligned: Vec<i32> = (0..524_289).collect();
+        let err = ds.append(&unaligned).unwrap_err();
+        assert!(
+            matches!(err, Error::AppendInPlaceUnsupported(_)),
+            "got: {err:?}"
+        );
+        assert_eq!(ds.shape().unwrap(), vec![256]);
+    }
+    assert_eq!(
+        std::fs::read(&p).unwrap(),
+        before,
+        "a refused append modified the file"
+    );
+    // Same atomicity for a raw append whose byte length is not a whole number
+    // of elements.
+    let before = std::fs::read(&p).unwrap();
+    {
+        let file = File::open_rw_bounded(&p).unwrap();
+        let mut ds = file.dataset("d").unwrap();
+        let mut bytes = vec![0u8; 2 * 1024 * 1024];
+        bytes.push(0); // not a whole i32
+        let err = ds.append_raw(&bytes).unwrap_err();
+        assert!(
+            matches!(err, Error::AppendInPlaceUnsupported(_)),
+            "got: {err:?}"
+        );
+    }
+    assert_eq!(std::fs::read(&p).unwrap(), before);
+}
+
+#[test]
+fn chunk_introspection_works_on_bounded_files() {
+    // chunks() walks the chunk index through the file source; on a bounded
+    // (and mirror) file that must go through the engine's store, not the
+    // empty borrowed view.
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("chunks.h5");
+    build(&p, 8, 4, false);
+    let file = File::open_rw_bounded(&p).unwrap();
+    let mut ds = file.dataset("d").unwrap();
+    let chunks = ds.chunks().unwrap();
+    assert_eq!(chunks.len(), 2);
+    ds.append(&[8i32, 9]).unwrap();
+    let chunks = file.dataset("d").unwrap().chunks().unwrap();
+    assert_eq!(chunks.len(), 3);
+}

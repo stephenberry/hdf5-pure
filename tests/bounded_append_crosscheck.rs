@@ -118,3 +118,60 @@ fn bounded_batched_large_append_reads_back_in_c() {
     assert!(got.iter().enumerate().all(|(i, &v)| v == i as i32));
     assert_eq!(read_pure(&path, "d").len(), total as usize);
 }
+
+/// Variable-length string reads route through the file source; on read-write
+/// backends (bounded AND mirror) that must reach the real bytes through the
+/// engine, not the empty borrowed view (which made every heap-backed VL read
+/// fail with UnexpectedEof).
+#[test]
+fn vlen_strings_read_on_bounded_and_mirror_files() {
+    use hdf5::types::VarLenUnicode;
+    use std::str::FromStr;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vlen.h5");
+    let words = ["alpha", "beta", "", "δelta"];
+    {
+        let file = hdf5::File::with_options()
+            .with_fapl(|p| p.libver_bounds(LibraryVersion::V110, LibraryVersion::latest()))
+            .create(&path)
+            .unwrap();
+        let vals: Vec<VarLenUnicode> = words
+            .iter()
+            .map(|s| VarLenUnicode::from_str(s).unwrap())
+            .collect();
+        file.new_dataset::<VarLenUnicode>()
+            .shape((words.len(),))
+            .create("labels")
+            .unwrap()
+            .write(&vals)
+            .unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .chunk((4,))
+            .shape((Extent::resizable(4),))
+            .create("samples")
+            .unwrap();
+        ds.write(&[0i32, 1, 2, 3]).unwrap();
+        file.close().unwrap();
+    }
+    let expected: Vec<String> = words.iter().map(|s| s.to_string()).collect();
+
+    {
+        let file = File::open_rw_bounded(&path).unwrap();
+        let labels = file.dataset("labels").unwrap();
+        assert_eq!(labels.read_string().unwrap(), expected);
+        // Interleave an append, then read the heap-backed strings again.
+        let mut samples = file.dataset("samples").unwrap();
+        samples.append(&[4i32, 5]).unwrap();
+        assert_eq!(labels.read_string().unwrap(), expected);
+    }
+    {
+        let file = File::open_rw(&path).unwrap();
+        assert_eq!(
+            file.dataset("labels").unwrap().read_string().unwrap(),
+            expected
+        );
+    }
+    assert_eq!(read_c(&path, "samples"), (0..6).collect::<Vec<_>>());
+}
