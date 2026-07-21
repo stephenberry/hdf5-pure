@@ -61,6 +61,7 @@ use std::path::Path;
 use crate::chunk_index_inplace::{ElemRecord, InPlaceFile, Located};
 use crate::error::{Error, FormatError};
 use crate::file_lock::{self, FileLocking};
+use crate::group_v2;
 use crate::signature;
 use crate::superblock::Superblock;
 
@@ -195,7 +196,9 @@ impl SwmrWriter {
     /// callers always use `append_raw` (`max_phase = 4`).
     fn append_phased(&mut self, dataset: &str, bytes: &[u8], max_phase: u8) -> Result<(), Error> {
         if !self.located.contains_key(dataset) {
-            let result = Located::locate(&self.file, dataset, Error::SwmrAppendUnsupported)?;
+            let oh_addr =
+                group_v2::resolve_path_any(self.file.data(), &self.file.superblock, dataset)?;
+            let result = Located::locate_at(&self.file, oh_addr, Error::SwmrAppendUnsupported)?;
             if result.has_filters {
                 // The SWMR path stores bare-address EA elements and never
                 // compresses; filtered append is the general writer's job.

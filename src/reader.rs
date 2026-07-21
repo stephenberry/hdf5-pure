@@ -30,7 +30,7 @@ use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
 use crate::signature;
 use crate::source::{
-    BytesSource, Source, MetadataCacheConfig, MetadataCachingSource, ReadSeekSource,
+    BytesSource, MetadataCacheConfig, MetadataCachingSource, ReadSeekSource, Source,
 };
 use crate::superblock::Superblock;
 use crate::vl_data::{self, VlenStringReadOptions};
@@ -494,9 +494,7 @@ impl FileInner {
 
     /// Streaming counterpart of [`parse_superblock`]: locate and parse the
     /// superblock by reading only small windows from the source.
-    fn parse_superblock_source<S: Source + ?Sized>(
-        source: &S,
-    ) -> Result<(Superblock, u64), Error> {
+    fn parse_superblock_source<S: Source + ?Sized>(source: &S) -> Result<(Superblock, u64), Error> {
         let sig_offset = signature::find_signature_in(source)?;
         let mut superblock = Superblock::parse_from_source(source, sig_offset)?;
         let addr_offset = superblock.base_address;
