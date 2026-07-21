@@ -1458,3 +1458,228 @@ fn read_uint(data: &[u8], pos: usize, size: usize) -> Result<u64, Error> {
     }
     Ok(v)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::group_v2;
+    use crate::writer::FileBuilder;
+    use std::cell::{Cell, RefCell};
+
+    /// An in-test [`Store`] over a `Vec<u8>` that records every read window, so
+    /// the tests below can assert the engine's bounded-memory contract: the
+    /// append path never reads more than a bounded window at once, no matter how
+    /// large the file is. This is the seam contract issue #147's mirror-less
+    /// bounded backend relies on.
+    struct WindowProbeStore {
+        data: Vec<u8>,
+        superblock: Superblock,
+        sb_sig_off: usize,
+        max_read: Cell<usize>,
+        total_read: Cell<usize>,
+        reads: RefCell<Vec<(u64, usize)>>,
+    }
+
+    impl WindowProbeStore {
+        fn open(data: Vec<u8>) -> Self {
+            let sb_sig_off = signature::find_signature(&data).unwrap();
+            let superblock = Superblock::parse(&data, sb_sig_off).unwrap();
+            Self {
+                data,
+                superblock,
+                sb_sig_off,
+                max_read: Cell::new(0),
+                total_read: Cell::new(0),
+                reads: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn reset_counters(&self) {
+            self.max_read.set(0);
+            self.total_read.set(0);
+            self.reads.borrow_mut().clear();
+        }
+    }
+
+    impl Source for WindowProbeStore {
+        fn len(&self) -> u64 {
+            self.data.len() as u64
+        }
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
+            self.max_read.set(self.max_read.get().max(buf.len()));
+            self.total_read.set(self.total_read.get() + buf.len());
+            self.reads.borrow_mut().push((offset, buf.len()));
+            BytesSource::new(&self.data).read_at(offset, buf)
+        }
+    }
+
+    impl Store for WindowProbeStore {
+        fn offset_size(&self) -> u8 {
+            self.superblock.offset_size
+        }
+        fn length_size(&self) -> u8 {
+            self.superblock.length_size
+        }
+        fn append_bytes(&mut self, bytes: &[u8]) -> Result<u64, Error> {
+            let addr = self.data.len() as u64;
+            self.data.extend_from_slice(bytes);
+            Ok(addr)
+        }
+        fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Error> {
+            let offset = offset.to_usize()?;
+            self.data[offset..offset + bytes.len()].copy_from_slice(bytes);
+            Ok(())
+        }
+        fn patch_superblock_eof(&mut self) -> Result<(), Error> {
+            self.superblock.eof_address = self.data.len() as u64;
+            let bytes = self.superblock.serialize();
+            let off = self.sb_sig_off;
+            self.data[off..off + bytes.len()].copy_from_slice(&bytes);
+            Ok(())
+        }
+        fn sync(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    /// Build an in-memory latest-format file with one unlimited chunked i32
+    /// dataset seeded with `0..n`, returning its bytes.
+    fn build_unlimited(n: i32, chunk: u64) -> Vec<u8> {
+        let data: Vec<i32> = (0..n).collect();
+        let mut b = FileBuilder::new();
+        b.create_dataset("d")
+            .with_i32_data(&data)
+            .with_shape(&[n as u64])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[chunk]);
+        b.finish().unwrap()
+    }
+
+    /// Drive the full located-append path (`locate_at` + `plan_ea_append` +
+    /// `apply_ea_append`) through the probe store and return the located state.
+    fn locate(store: &WindowProbeStore) -> (Located, crate::datatype::Datatype) {
+        let oh_addr = group_v2::resolve_path_any(&store.data, &store.superblock, "d").unwrap();
+        let result = Located::locate_at(store, oh_addr, Error::AppendUnsupported).unwrap();
+        let (dt_off, dt_size) = result.spans.datatype;
+        let dt_bytes = store.read_metadata_at(dt_off, dt_size).unwrap();
+        let (datatype, _) = crate::datatype::Datatype::parse(&dt_bytes).unwrap();
+        (result.located, datatype)
+    }
+
+    fn append_i32s(
+        store: &mut WindowProbeStore,
+        loc: &mut Located,
+        datatype: &crate::datatype::Datatype,
+        values: std::ops::Range<i32>,
+    ) {
+        let raw: Vec<u8> = values.clone().flat_map(|v| v.to_le_bytes()).collect();
+        let new_elems = (values.end - values.start) as u64;
+        let spatial = vec![loc.chunk_elems];
+        let plan = plan_ea_append(
+            store,
+            loc,
+            datatype,
+            &spatial,
+            loc.elem_bytes,
+            None,
+            &raw,
+            new_elems,
+        )
+        .unwrap();
+        apply_ea_append(store, loc, &plan, 4).unwrap();
+    }
+
+    /// The engine's bounded-read contract: appends against a file far larger
+    /// than any metadata structure never read more than a bounded window at
+    /// once, and never the whole file.
+    #[test]
+    fn append_reads_stay_bounded_windows() {
+        // ~400 KiB of data: far larger than any single bounded window below.
+        let n = 100_000i32;
+        let mut store = WindowProbeStore::open(build_unlimited(n, 256));
+        let file_len = store.data.len();
+        assert!(
+            file_len > 300_000,
+            "test file unexpectedly small: {file_len}"
+        );
+
+        let (mut loc, datatype) = locate(&store);
+        // Setup (locate + datatype) already obeys the window bound.
+        const WINDOW: usize = 16 * 1024;
+        assert!(
+            store.max_read.get() <= WINDOW,
+            "locate read a {}-byte window (> {WINDOW})",
+            store.max_read.get()
+        );
+
+        // A small append against the large file: every read (trailing chunk,
+        // element slots, checksum regions) stays within the window bound, and
+        // the total read volume is a small constant, not O(file size).
+        store.reset_counters();
+        append_i32s(&mut store, &mut loc, &datatype, n..n + 10);
+        assert!(
+            store.max_read.get() <= WINDOW,
+            "append read a {}-byte window (> {WINDOW})",
+            store.max_read.get()
+        );
+        assert!(
+            store.total_read.get() <= 64 * 1024,
+            "append read {} bytes total (> 64 KiB) on a {file_len}-byte file",
+            store.total_read.get()
+        );
+        assert!(
+            store
+                .reads
+                .borrow()
+                .iter()
+                .all(|&(_, len)| len < file_len / 2),
+            "an append read scaled with file size"
+        );
+
+        // Growth loop: the per-append read volume stays flat as the file grows.
+        let mut worst = 0usize;
+        let mut next = n + 10;
+        for _ in 0..20 {
+            store.reset_counters();
+            append_i32s(&mut store, &mut loc, &datatype, next..next + 300);
+            worst = worst.max(store.total_read.get());
+            next += 300;
+        }
+        assert!(
+            worst <= 64 * 1024,
+            "per-append read volume grew to {worst} bytes"
+        );
+
+        // The grown file reads back correctly through the public reader.
+        let file = crate::File::from_bytes(store.data).unwrap();
+        let ds = file.dataset("d").unwrap();
+        let got = ds.read_i32().unwrap();
+        let expected: Vec<i32> = (0..next).collect();
+        assert_eq!(got.len(), expected.len());
+        assert_eq!(got, expected);
+    }
+
+    /// Unaligned appends rewrite the trailing partial chunk: still bounded — the
+    /// one chunk is the largest data read the plan performs.
+    #[test]
+    fn partial_tail_append_reads_one_chunk_window() {
+        let n = 50_000i32;
+        let chunk = 256u64;
+        let mut store = WindowProbeStore::open(build_unlimited(n + 7, chunk));
+        let (mut loc, datatype) = locate(&store);
+
+        store.reset_counters();
+        append_i32s(&mut store, &mut loc, &datatype, n + 7..n + 7 + 13);
+        let chunk_bytes = (chunk as usize) * 4;
+        assert!(
+            store.max_read.get() <= chunk_bytes.max(8 * 1024),
+            "partial-tail append read a {}-byte window",
+            store.max_read.get()
+        );
+
+        let file = crate::File::from_bytes(store.data).unwrap();
+        let got = file.dataset("d").unwrap().read_i32().unwrap();
+        let expected: Vec<i32> = (0..n + 7 + 13).collect();
+        assert_eq!(got, expected);
+    }
+}
