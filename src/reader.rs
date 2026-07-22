@@ -1124,12 +1124,17 @@ impl FileInner {
                     length: row_bytes as u64,
                 });
             };
-            return data.get(start..start + len).map(<[u8]>::to_vec).ok_or(
-                FormatError::DataSizeMismatch {
-                    expected: start + len,
+            let end = start.checked_add(len).ok_or(FormatError::OffsetOverflow {
+                offset: start as u64,
+                length: len as u64,
+            })?;
+            return data
+                .get(start..end)
+                .map(<[u8]>::to_vec)
+                .ok_or(FormatError::DataSizeMismatch {
+                    expected: end,
                     actual: data.len(),
-                },
-            );
+                });
         }
 
         let base = self.addr_offset;
@@ -1247,6 +1252,16 @@ fn read_rows_framed<S: Source + ?Sized>(
     num_rows: u64,
     row_bytes: usize,
 ) -> Result<Vec<u8>, FormatError> {
+    // A zero-row window reads nothing, uniformly across the *supported* layouts.
+    // Return early so that over unallocated storage — where the whole-dataset
+    // readers differ (a contiguous None errors with `NoDataAllocated`, a chunked
+    // None errors with "no address") — the contiguous and chunked arms agree
+    // instead of one erroring and one succeeding. A `Virtual` layout is
+    // unsupported and must still error like `read_raw` does, so it is excluded
+    // here and falls through to the match.
+    if num_rows == 0 && !matches!(dl, DataLayout::Virtual { .. }) {
+        return Ok(Vec::new());
+    }
     match dl {
         DataLayout::Compact { .. } => unreachable!("compact is handled before framing"),
         DataLayout::Contiguous { address, size } => {
@@ -3419,5 +3434,71 @@ mod tests {
             }
             other => panic!("expected group-child address overflow, got {other:?}"),
         }
+    }
+
+    /// A zero-row window returns `Ok(empty)` uniformly, even over an unallocated
+    /// contiguous dataset where the whole-dataset reader errors with
+    /// `NoDataAllocated`. Without the early return in `read_rows_framed`, the
+    /// contiguous arm's `address.ok_or(NoDataAllocated)?` would error here, while
+    /// the chunked arm returns `Ok(empty)` — the cross-layout divergence this
+    /// guards against.
+    #[test]
+    fn read_rows_framed_zero_row_window_is_ok_even_when_unallocated() {
+        let dl = DataLayout::Contiguous {
+            address: None,
+            size: 0,
+        };
+        let ds = Dataspace {
+            space_type: crate::dataspace::DataspaceType::Simple,
+            rank: 1,
+            dimensions: vec![0],
+            max_dimensions: None,
+        };
+        let dt = Datatype::FixedPoint {
+            size: 8,
+            byte_order: crate::datatype::DatatypeByteOrder::LittleEndian,
+            signed: false,
+            bit_offset: 0,
+            bit_precision: 64,
+        };
+        let cache = ChunkCache::new();
+        let out = read_rows_framed(
+            &BytesSource::new(b""),
+            &dl,
+            &ds,
+            &dt,
+            None,
+            8,
+            8,
+            &cache,
+            0,
+            0,
+            8,
+        )
+        .expect("a zero-row window must be Ok(empty), not NoDataAllocated");
+        assert!(out.is_empty());
+
+        // A Virtual layout is unsupported and must still error for a zero-row
+        // window, matching `read_raw`, rather than being swallowed by the early
+        // return.
+        let virtual_dl = DataLayout::Virtual { version: 4 };
+        let err = read_rows_framed(
+            &BytesSource::new(b""),
+            &virtual_dl,
+            &ds,
+            &dt,
+            None,
+            8,
+            8,
+            &cache,
+            0,
+            0,
+            8,
+        )
+        .expect_err("a virtual layout must error even for a zero-row window");
+        assert!(
+            matches!(err, FormatError::UnsupportedVirtualLayout),
+            "expected UnsupportedVirtualLayout, got {err:?}"
+        );
     }
 }

@@ -933,19 +933,27 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
     let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype);
 
     let row_lo = row_start.to_usize()?;
-    let row_hi = row_lo + out_rows; // exclusive; the caller has clamped to the dataset
+    let row_hi = row_lo.saturating_add(out_rows); // exclusive; caller clamped to the dataset
     let cd0 = chunk_dims[0];
 
     for chunk in &chunks {
         let c0 = chunk.offsets.first().copied().unwrap_or(0).to_usize()?;
-        if c0 >= row_hi || c0 + cd0 <= row_lo {
+        // This chunk's exclusive leading-dim end. The saturating add/mul here and
+        // below keep a crafted huge chunk offset or dimension from overflowing
+        // `usize` on 32-bit (a panic in debug, a silently wrong window in
+        // release): a saturated span still compares and clamps correctly, and
+        // `row_band_copy` bounds the copy to the bytes actually present. `dst` and
+        // `band` need no guard — both are bounded by the already-checked
+        // `total_bytes` allocation.
+        let c_end = c0.saturating_add(cd0);
+        if c0 >= row_hi || c_end <= row_lo {
             continue; // no overlap with the window
         }
 
         // Rows of this chunk that fall in the window, as byte offsets.
         let lo = c0.max(row_lo);
-        let hi = (c0 + cd0).min(row_hi);
-        let src = (lo - c0) * row_bytes;
+        let hi = c_end.min(row_hi);
+        let src = (lo - c0).saturating_mul(row_bytes);
         let dst = (lo - row_lo) * row_bytes;
         let band = (hi - lo) * row_bytes;
 
