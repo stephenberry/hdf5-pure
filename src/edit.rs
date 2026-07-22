@@ -424,6 +424,13 @@ pub(crate) struct WriteEngine {
     /// enforces the SWMR subset (unfiltered, chunk-aligned) so a concurrent
     /// reader never observes a torn view. `false` for an ordinary edit session.
     swmr_mode: bool,
+    /// True when the file uses the paged file-space strategy
+    /// (`H5F_FSPACE_STRATEGY_PAGE`), read from the superblock extension at `open`
+    /// regardless of the persist flag. The whole-file editor cannot mutate a paged
+    /// file without breaking its page alignment, so both the in-place append and
+    /// the commit refuse a paged file and direct the caller to the bounded backend
+    /// (issue #173 Phase 2).
+    paged: bool,
 }
 
 /// Superblock consistency-flag bits raised while a SWMR writer is active: bit 0
@@ -659,6 +666,7 @@ impl WriteEngine {
             persist: None,
             located: HashMap::new(),
             swmr_mode: false,
+            paged: false,
         };
         // If the file persists its free space, seed the free list from the
         // on-disk managers and arm persistence for future commits. Best-effort:
@@ -698,6 +706,10 @@ impl WriteEngine {
         let Some(info) = self.extension_fsinfo(ext_addr) else {
             return;
         };
+        // Record the paged strategy regardless of the persist flag: a paged file
+        // cannot be safely mutated through the whole-file editor (issue #173), and
+        // this flag gates the in-place-append and commit refusals below.
+        self.paged = info.strategy == FileSpaceStrategy::Page;
         if !info.persist {
             return;
         }
@@ -1054,11 +1066,21 @@ impl WriteEngine {
                  Dataset::append_staged",
             ));
         }
-        // A file that persists its free space keeps on-disk free-space managers (and,
-        // for a paged strategy, a page-aligned end-of-file) that only a staged
-        // `commit` rewrites consistently. An immediate EOF append bypasses that
-        // rewrite, so fall back to the staged path, which rebuilds the managers and
-        // repoints the superblock last.
+        // A paged file (`H5F_FSPACE_STRATEGY_PAGE`) cannot be grown by an immediate
+        // EOF append without breaking its page alignment, and the staged commit
+        // path refuses it too, so direct the caller to the bounded backend, which
+        // grows a paged file correctly (issue #173 Phase 2). Checked before the
+        // persist guard so a paged file (persisting or not) gets this message.
+        if self.paged {
+            return Err(Error::AppendInPlaceUnsupported(
+                "in-place append is not supported on a paged file \
+                 (H5F_FSPACE_STRATEGY_PAGE); use File::open_rw_bounded to grow a paged file",
+            ));
+        }
+        // A file that persists its free space keeps on-disk free-space managers that
+        // only a staged `commit` rewrites consistently. An immediate EOF append
+        // bypasses that rewrite, so fall back to the staged path, which rebuilds the
+        // managers and repoints the superblock last.
         if self.persist.is_some() {
             return Err(Error::AppendInPlaceUnsupported(
                 "in-place append is not supported on a file that persists its free space \
@@ -1439,6 +1461,20 @@ impl WriteEngine {
             && self.pending_cross_copies.is_empty()
         {
             return Ok(());
+        }
+
+        // A genuine paged file (`H5F_FSPACE_STRATEGY_PAGE`) cannot be committed
+        // through the whole-file editor: a persisting commit's tail rewrite emits a
+        // single generic (non-paged) manager, and a non-persisting commit appends
+        // and truncates without page alignment — either would silently degrade the
+        // paging. Refuse up front, before any writes, whether or not the file
+        // persists its free space, and direct the caller to the bounded path that
+        // grows paged files correctly (issue #173 Phase 2).
+        if self.paged {
+            return Err(Error::EditUnsupported(
+                "committing an edit to a paged file (H5F_FSPACE_STRATEGY_PAGE) is not supported \
+                 through the whole-file editor; use File::open_rw_bounded to grow a paged file",
+            ));
         }
 
         // Invalidate the in-place-append geometry cache before doing any work. A

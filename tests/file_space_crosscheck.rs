@@ -421,3 +421,145 @@ fn c_library_reads_our_paged_chunked_file() {
         vec![1.0, 2.0, 3.0, 4.0]
     );
 }
+
+#[test]
+fn c_library_reads_our_bounded_mutated_paged_file() {
+    let _c = c_lib_guard();
+    // hdf5-pure creates a genuine paged persisting file, then grows it through the
+    // bounded backend (`File::open_rw_bounded`), appending enough rows to force
+    // extensible-array index growth so the append allocates metadata as well as
+    // raw chunks (exercising page segregation). The reference C library must then
+    // recover the paged strategy, read every row, load the per-page-type managers
+    // (H5Fget_freespace parses our FSHD/FSSE blocks), and reopen it read-write.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("ours_paged_mutated.h5");
+
+    // Create with one chunk, then bounded-append to 5000 rows.
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("d")
+            .with_i32_data(&(0..64).collect::<Vec<i32>>())
+            .with_shape(&[64])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[64]);
+        b.with_file_space_strategy(FileSpaceStrategy::Page, true, 0)
+            .with_file_space_page_size(4096);
+        b.write(&path).unwrap();
+    }
+    {
+        let file = File::open_rw_bounded(&path).unwrap();
+        let mut ds = file.dataset("d").unwrap();
+        ds.append(&(64..5000).collect::<Vec<i32>>()).unwrap();
+        file.close().unwrap();
+    }
+
+    // hdf5-pure's own view of the tracked free space after the mutation.
+    let want: Vec<i32> = (0..5000).collect();
+    let ours = File::open(&path).unwrap();
+    assert_eq!(ours.dataset("d").unwrap().read_i32().unwrap(), want);
+    let total_ours: u64 = ours.persisted_free_space().iter().map(|(_, l)| l).sum();
+    drop(ours);
+
+    // The C library recovers the paged strategy and reads every row.
+    let f = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        f.create_plist().unwrap().get_file_space_strategy().unwrap(),
+        CStrategy::FreeSpaceManager {
+            paged: true,
+            persist: true,
+            threshold: 0,
+        },
+        "C library recovers our paged strategy after a bounded mutation"
+    );
+    assert_eq!(f.dataset("d").unwrap().read_raw::<i32>().unwrap(), want);
+    // Loading the managers parses our rewritten FSHD/FSSE blocks; the C library's
+    // free-space total equals the sum of the sections we wrote.
+    let free_c = unsafe { H5Fget_freespace(f.id()) };
+    assert_eq!(
+        free_c as u64, total_ours,
+        "C free-space total matches our rewritten paged managers"
+    );
+    drop(f);
+
+    // The C library reopens the mutated paged file read-write and appends more
+    // rows, then reads everything back: the paged layout survives a C round-trip.
+    {
+        let f = hdf5::File::open_rw(&path).unwrap();
+        let ds = f.dataset("d").unwrap();
+        ds.resize((5100,)).unwrap();
+        ds.write_slice(&(5000..5100).collect::<Vec<i32>>(), 5000..5100)
+            .unwrap();
+        f.close().unwrap();
+    }
+    let f = hdf5::File::open(&path).unwrap();
+    let after = f.dataset("d").unwrap().read_raw::<i32>().unwrap();
+    assert_eq!(after.len(), 5100);
+    assert_eq!(after[..5000], want[..]);
+    assert_eq!(after[5099], 5099);
+}
+
+#[test]
+fn pure_bounded_mutates_c_created_paged_file() {
+    let _c = c_lib_guard();
+    // The reverse direction: the reference C library creates a genuine paged
+    // persisting file with an unlimited chunked dataset; hdf5-pure grows it through
+    // the bounded backend; then both the C library and hdf5-pure read every row
+    // back and the C library re-parses the rewritten managers.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_paged_pure_mutated.h5");
+
+    {
+        let file = hdf5::FileBuilder::new()
+            .with_fapl(|fapl| fapl.libver_v110())
+            .with_fcpl(|fcpl| {
+                fcpl.file_space_strategy(CStrategy::FreeSpaceManager {
+                    paged: true,
+                    persist: true,
+                    threshold: 1,
+                })
+                .file_space_page_size(4096)
+            })
+            .create(&path)
+            .unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .chunk((64,))
+            .shape((hdf5::Extent::resizable(64),))
+            .create("d")
+            .unwrap();
+        ds.write(&(0..64).collect::<Vec<i32>>()).unwrap();
+        file.close().unwrap();
+    }
+
+    // hdf5-pure grows the C-created paged file.
+    {
+        let file = File::open_rw_bounded(&path).unwrap();
+        let mut ds = file.dataset("d").unwrap();
+        ds.append(&(64..4000).collect::<Vec<i32>>()).unwrap();
+        file.close().unwrap();
+    }
+
+    let want: Vec<i32> = (0..4000).collect();
+    // hdf5-pure reads its own mutation back.
+    let ours = File::open(&path).unwrap();
+    assert_eq!(ours.dataset("d").unwrap().read_i32().unwrap(), want);
+    let total_ours: u64 = ours.persisted_free_space().iter().map(|(_, l)| l).sum();
+    drop(ours);
+
+    // The C library reads it back and re-parses the managers.
+    let f = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        f.create_plist().unwrap().get_file_space_strategy().unwrap(),
+        CStrategy::FreeSpaceManager {
+            paged: true,
+            persist: true,
+            threshold: 1,
+        },
+    );
+    assert_eq!(f.dataset("d").unwrap().read_raw::<i32>().unwrap(), want);
+    let free_c = unsafe { H5Fget_freespace(f.id()) };
+    assert_eq!(
+        free_c as u64, total_ours,
+        "C free-space matches our managers"
+    );
+}

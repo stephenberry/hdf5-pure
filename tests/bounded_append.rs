@@ -347,29 +347,29 @@ fn persisted_free_space_noop_close_does_not_grow() {
     assert_eq!(std::fs::metadata(&p).unwrap().len(), before);
 }
 
-/// The paged file-space strategy is refused by the bounded backend (issue #173
-/// Phase 2), whether or not it persists free space: page-aligned allocation is
-/// not implemented yet.
+/// A paged file that does NOT persist its free space is refused by the bounded
+/// backend (issue #173 Phase 2): without on-disk managers there is no record of
+/// which pages are metadata vs raw, so bounded appends cannot keep the paging
+/// segregated. A paged file that *does* persist is supported (see
+/// `tests/paged_mutation.rs`).
 #[test]
-fn paged_file_is_refused_at_open() {
+fn paged_non_persist_is_refused_at_open() {
     let dir = tempdir().unwrap();
-    for (name, persist) in [("paged_persist.h5", true), ("paged_plain.h5", false)] {
-        let p = dir.path().join(name);
-        let mut b = FileBuilder::new();
-        b.with_file_space_strategy(FileSpaceStrategy::Page, persist, 0)
-            .with_file_space_page_size(4096);
-        b.create_dataset("d")
-            .with_i32_data(&[1, 2, 3])
-            .with_shape(&[3])
-            .with_maxshape(&[u64::MAX])
-            .with_chunks(&[2]);
-        b.write(&p).unwrap();
-        let err = File::open_rw_bounded(&p).unwrap_err();
-        assert!(
-            matches!(err, Error::EditUnsupported(_)),
-            "{name} persist={persist} got: {err:?}"
-        );
-    }
+    let p = dir.path().join("paged_plain.h5");
+    let mut b = FileBuilder::new();
+    b.with_file_space_strategy(FileSpaceStrategy::Page, false, 0)
+        .with_file_space_page_size(4096);
+    b.create_dataset("d")
+        .with_i32_data(&[1, 2, 3])
+        .with_shape(&[3])
+        .with_maxshape(&[u64::MAX])
+        .with_chunks(&[2]);
+    b.write(&p).unwrap();
+    let err = File::open_rw_bounded(&p).unwrap_err();
+    assert!(
+        matches!(err, Error::EditUnsupported(_)),
+        "paged non-persist should be refused, got: {err:?}"
+    );
 }
 
 #[test]

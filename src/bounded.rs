@@ -28,10 +28,11 @@ use crate::edit::{
 };
 use crate::error::{Error, FormatError};
 use crate::file_lock::{self, FileLocking};
-use crate::file_space_info::{FileSpaceInfo, FileSpaceStrategy};
+use crate::file_space_info::{FileSpaceInfo, FileSpaceStrategy, NUM_FILE_FSM_MANAGERS};
 use crate::free_space::FreeList;
 use crate::free_space_manager::{
-    FreeSection, SECT_CLASS_SIMPLE, fshd_len, read_persisted_sections_source, serialize_file_fsm,
+    FreeSection, SECT_CLASS_LARGE, SECT_CLASS_SIMPLE, SECT_CLASS_SMALL, fshd_len, fsse_len,
+    read_persisted_sections_source, serialize_file_fsm,
 };
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
@@ -121,11 +122,129 @@ pub(crate) struct BoundedStore {
     sb_sig_off: u64,
     superblock: Superblock,
     metadata_cache: Option<(MetadataCacheConfig, std::sync::Mutex<MetadataReadCache>)>,
+    /// Paged-append state for a genuine paged file (`H5F_FSPACE_STRATEGY_PAGE`,
+    /// issue #173 Phase 2). `None` for the common non-paged file, where
+    /// [`append_raw`](Store::append_raw) / [`append_meta`](Store::append_meta) are
+    /// plain end-of-file appends. When `Some`, they keep pages homogeneous.
+    paged: Option<PagedAppend>,
+}
+
+/// Page type of a paged allocation. A paged file never mixes metadata and raw
+/// data within one page, so appends of the two types are kept in separate pages.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PageType {
+    /// File metadata (extensible-array blocks, headers, free-space blocks).
+    Meta,
+    /// Raw dataset data (chunk contents).
+    Raw,
+}
+
+/// Paged-append bookkeeping on a paged [`BoundedStore`] (issue #173 Phase 2). The
+/// bounded backend only ever appends at end-of-file (it never reuses a hole), so
+/// keeping a paged file's pages homogeneous reduces to: whenever an append's page
+/// type differs from the tail page's, pad the tail page to a page boundary first.
+/// The padded tails are recorded per page type so [`finalize_persist`] can hand
+/// them to the SUPER (metadata) / DRAW (raw) managers.
+struct PagedAppend {
+    page_size: u64,
+    /// Page type of the current tail page. `None` until the first typed append of
+    /// the session; the file is page-aligned at open, so the first append never
+    /// needs to pad regardless of this.
+    last: Option<PageType>,
+    /// Free tails left by padding a metadata page before a raw append.
+    meta_pad: Vec<(u64, u64)>,
+    /// Free tails left by padding a raw page before a metadata append.
+    raw_pad: Vec<(u64, u64)>,
 }
 
 impl BoundedStore {
     pub(crate) fn superblock(&self) -> &Superblock {
         &self.superblock
+    }
+
+    /// Append `bytes` at end-of-file as page type `ty`. For a non-paged store this
+    /// is a plain [`append_bytes`](Store::append_bytes). For a paged store it keeps
+    /// pages homogeneous: if the tail page holds the *other* page type and is only
+    /// partially filled, it is first padded to a page boundary (the padding being
+    /// recorded as free space of the outgoing type), so `bytes` start a fresh page.
+    fn append_typed(&mut self, bytes: &[u8], ty: PageType) -> Result<u64, Error> {
+        // Decide the pad without holding a borrow of `self.paged` across the append.
+        // `prev` is the outgoing page type to record the padding under, or `None`
+        // for a crash-recovery pad whose tail-page type is unknown.
+        let pad = match &self.paged {
+            Some(pg) if self.len % pg.page_size != 0 => {
+                let pad_len = pg.page_size - self.len % pg.page_size;
+                match pg.last {
+                    // Normal case: the tail page holds a known type; pad only on a
+                    // type switch, recording the tail as free of the outgoing type.
+                    Some(prev) if prev != ty => Some((Some(prev), pad_len)),
+                    Some(_) => None, // same type: keep packing the tail page
+                    // Crash recovery: a previous bounded session grew this paged
+                    // file and was killed before finalize page-aligned the tail, so
+                    // the file opened non-page-aligned with no known tail type. Pad
+                    // it up (extending whatever the tail page holds, so the page
+                    // stays homogeneous) and leave the padding untracked, since
+                    // recording it under the wrong page type could let the reader
+                    // reuse it and mix the page.
+                    None => Some((None, pad_len)),
+                }
+            }
+            _ => None,
+        };
+        if let Some((prev, pad_len)) = pad {
+            let pad_at = self.len;
+            self.append_at_eof(&vec![0u8; pad_len.to_usize()?])?;
+            if let Some(pg) = self.paged.as_mut() {
+                match prev {
+                    Some(PageType::Meta) => pg.meta_pad.push((pad_at, pad_len)),
+                    Some(PageType::Raw) => pg.raw_pad.push((pad_at, pad_len)),
+                    None => {} // crash-recovery pad: untracked (tail type unknown)
+                }
+            }
+        }
+        let addr = self.append_at_eof(bytes)?;
+        if let Some(pg) = self.paged.as_mut() {
+            pg.last = Some(ty);
+        }
+        Ok(addr)
+    }
+
+    /// Pad the file to a page boundary if it is a paged store whose tail page is
+    /// partially filled, recording the padding as free space of the tail page's
+    /// type. Returns the file's (now page-aligned, for a paged store) length.
+    /// Called once by [`finalize_persist`] before it lays the rewritten managers
+    /// into a fresh metadata page. A no-op for a non-paged store.
+    fn pad_to_page(&mut self) -> Result<u64, Error> {
+        let pad = match &self.paged {
+            Some(pg) if self.len % pg.page_size != 0 => {
+                Some((pg.last, pg.page_size - self.len % pg.page_size))
+            }
+            _ => None,
+        };
+        if let Some((last, pad_len)) = pad {
+            let pad_at = self.len;
+            self.append_at_eof(&vec![0u8; pad_len.to_usize()?])?;
+            if let Some(pg) = self.paged.as_mut() {
+                match last {
+                    // A partially-filled tail page at finalize is a raw page (the
+                    // last thing an append writes is raw chunk data); default an
+                    // unknown tail (no typed append this session) to raw too.
+                    Some(PageType::Meta) => pg.meta_pad.push((pad_at, pad_len)),
+                    _ => pg.raw_pad.push((pad_at, pad_len)),
+                }
+            }
+        }
+        Ok(self.len)
+    }
+
+    /// The unconditional end-of-file append (no page bookkeeping); the primitive
+    /// [`append_typed`](Self::append_typed) and the `Store` impl build on.
+    fn append_at_eof(&mut self, bytes: &[u8]) -> Result<u64, Error> {
+        let addr = self.len;
+        self.handle.seek(SeekFrom::Start(addr)).map_err(Error::Io)?;
+        self.handle.write_all(bytes).map_err(Error::Io)?;
+        self.len += bytes.len() as u64;
+        Ok(addr)
     }
 
     fn write_at_raw(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Error> {
@@ -236,6 +355,171 @@ impl BoundedStore {
         Ok(new_old_blocks)
     }
 
+    /// The paged (`H5F_FSPACE_STRATEGY_PAGE`) counterpart of
+    /// [`write_persist_tail`](Self::write_persist_tail) (issue #173 Phase 2).
+    /// Instead of one generic manager it lays *per-page-type* managers into a fresh
+    /// metadata page at end-of-file — SUPER (slot 0) for the metadata free tails,
+    /// DRAW (slot 2) for small-raw tails, and the generic-large manager (slot 6) for
+    /// any large-raw fragments — with a page-aligned `eoa_pre_fsm` at the (padded)
+    /// file end, matching the paged file the writer creates from scratch. The caller
+    /// has page-aligned the file first, so the extension and manager blocks begin on
+    /// a page boundary and stay in metadata pages. Crash-atomic exactly as the
+    /// non-paged path: the new blocks are unreferenced until the superblock repoint.
+    #[allow(clippy::too_many_arguments)]
+    fn write_persist_tail_paged(
+        &mut self,
+        old_ext_region: &[u8],
+        strategy: FileSpaceStrategy,
+        threshold: u64,
+        page_size: u64,
+        meta: &[FreeSection],
+        raw_small: &[FreeSection],
+        raw_large: &[FreeSection],
+    ) -> Result<Vec<(u64, u64)>, Error> {
+        let os = self.superblock.offset_size;
+        let new_root = self.superblock.root_group_address;
+        let ext_addr = self.len;
+        debug_assert_eq!(
+            ext_addr % page_size,
+            0,
+            "extension begins on a page boundary"
+        );
+
+        // The 12-slot persist message is fixed-size, so a placeholder sizes the
+        // rewritten extension before its manager addresses are known.
+        let placeholder = FileSpaceInfo::persistent_managers(
+            strategy,
+            threshold,
+            page_size,
+            [u64::MAX; NUM_FILE_FSM_MANAGERS],
+            0,
+        );
+        let ext_len = build_v2_object_header(&rewrite_extension_region_bytes(
+            old_ext_region,
+            &placeholder,
+        )?)
+        .len() as u64;
+
+        // Split every section at page boundaries, then class each fragment by size:
+        // an intra-page (< page) fragment stays in its SMALL-class per-type manager
+        // (SUPER=0 for metadata, DRAW=2 for small raw), while a whole free page
+        // (>= page, which only arises from freeing a page's worth of metadata below
+        // a page tail) goes to the single generic-large manager (slot 6), together
+        // with any pre-existing large-raw fragments. This keeps a SMALL section from
+        // ever spanning a page or reaching page_size, matching the reference library.
+        let mut slot0 = Vec::new();
+        let mut slot2 = Vec::new();
+        let mut slot6 = Vec::new();
+        for s in split_at_pages(meta, page_size) {
+            if s.size < page_size {
+                slot0.push(s)
+            } else {
+                slot6.push(s)
+            }
+        }
+        for s in split_at_pages(raw_small, page_size) {
+            if s.size < page_size {
+                slot2.push(s)
+            } else {
+                slot6.push(s)
+            }
+        }
+        for s in split_at_pages(raw_large, page_size) {
+            slot6.push(s);
+        }
+        slot6.sort_by_key(|s| s.addr);
+        let managers: [(usize, u8, &[FreeSection]); 3] = [
+            (0, SECT_CLASS_SMALL, &slot0),
+            (2, SECT_CLASS_SMALL, &slot2),
+            (6, SECT_CLASS_LARGE, &slot6),
+        ];
+
+        if managers.iter().all(|(_, _, s)| s.is_empty()) {
+            // No free space to track: an empty persist message, page-aligned.
+            let info = FileSpaceInfo::persistent_empty(strategy, threshold, page_size);
+            let ext_oh =
+                build_v2_object_header(&rewrite_extension_region_bytes(old_ext_region, &info)?);
+            let written_ext = self.append_bytes(&ext_oh)?;
+            debug_assert_eq!(written_ext, ext_addr);
+            let final_eof = align_up(ext_addr + ext_oh.len() as u64, page_size);
+            self.pad_zeros_to(final_eof)?;
+            Store::sync(self)?;
+            self.repoint_persist_superblock(new_root, final_eof, ext_addr)?;
+            Store::sync(self)?;
+            return Ok(vec![(ext_addr, ext_oh.len() as u64)]);
+        }
+
+        // Closed-form layout: the extension, then each active manager's FSHD/FSSE.
+        // FSSE byte length depends only on section count (fixed field widths), so a
+        // single forward pass fixes every address with no fixpoint iteration.
+        let mut slots = [u64::MAX; NUM_FILE_FSM_MANAGERS];
+        let mut blocks: Vec<(usize, u64, u64, u8, &[FreeSection])> = Vec::new(); // slot, fshd, fsse, class, sections
+        let mut cursor = ext_addr + ext_len;
+        for &(slot, class, sections) in &managers {
+            if sections.is_empty() {
+                continue;
+            }
+            let fshd_addr = cursor;
+            let fsse_addr = fshd_addr + fshd_len(os);
+            let section_sizes: Vec<u64> = sections.iter().map(|s| s.size).collect();
+            cursor = fsse_addr + fsse_len(&section_sizes, os);
+            slots[slot] = fshd_addr;
+            blocks.push((slot, fshd_addr, fsse_addr, class, sections));
+        }
+        let end_of_managers = cursor;
+        let final_eof = align_up(end_of_managers, page_size);
+        // Paged convention (matching the from-scratch writer): the managers are
+        // ordinary metadata below a page-aligned end-of-allocation.
+        let eoa_pre_fsm = final_eof;
+
+        let info =
+            FileSpaceInfo::persistent_managers(strategy, threshold, page_size, slots, eoa_pre_fsm);
+        let ext_oh =
+            build_v2_object_header(&rewrite_extension_region_bytes(old_ext_region, &info)?);
+        debug_assert_eq!(
+            ext_oh.len() as u64,
+            ext_len,
+            "extension length must be stable across the placeholder and real messages"
+        );
+
+        // Append the extension, then every manager block, at (page-aligned) EOF.
+        // They are unreferenced until the repoint, so a crash here is harmless.
+        let written_ext = self.append_bytes(&ext_oh)?;
+        debug_assert_eq!(written_ext, ext_addr);
+        let mut new_old_blocks = vec![(ext_addr, ext_oh.len() as u64)];
+        for &(_slot, fshd_addr, fsse_addr, class, sections) in &blocks {
+            let (fshd, fsse) = serialize_file_fsm(sections, fshd_addr, fsse_addr, os, class);
+            let wf = self.append_bytes(&fshd)?;
+            debug_assert_eq!(wf, fshd_addr);
+            new_old_blocks.push((fshd_addr, fshd.len() as u64));
+            let ws = self.append_bytes(&fsse)?;
+            debug_assert_eq!(ws, fsse_addr);
+            new_old_blocks.push((ws, fsse.len() as u64));
+        }
+        debug_assert_eq!(self.len, end_of_managers);
+        // Pad the final metadata page to its boundary. This trailing tail is left
+        // untracked (a valid free-space under-report), keeping the manager layout
+        // closed-form rather than self-referential.
+        self.pad_zeros_to(final_eof)?;
+
+        // Barrier, then repoint the superblock (the linearization point), then sync.
+        Store::sync(self)?;
+        self.repoint_persist_superblock(new_root, final_eof, ext_addr)?;
+        Store::sync(self)?;
+        Ok(new_old_blocks)
+    }
+
+    /// Extend the file with zeros up to `target` (>= current length). Used by the
+    /// paged finalize to pad to a page boundary.
+    fn pad_zeros_to(&mut self, target: u64) -> Result<(), Error> {
+        if target > self.len {
+            let pad = (target - self.len).to_usize()?;
+            self.append_at_eof(&vec![0u8; pad])?;
+        }
+        debug_assert_eq!(self.len, target);
+        Ok(())
+    }
+
     /// Repoint the superblock at `new_root`/`new_eof`/`new_ext_addr` and clear the
     /// consistency flags, rewriting it in place. Called last by
     /// [`write_persist_tail`](Self::write_persist_tail).
@@ -297,11 +581,13 @@ impl Store for BoundedStore {
         self.superblock.length_size
     }
     fn append_bytes(&mut self, bytes: &[u8]) -> Result<u64, Error> {
-        let addr = self.len;
-        self.handle.seek(SeekFrom::Start(addr)).map_err(Error::Io)?;
-        self.handle.write_all(bytes).map_err(Error::Io)?;
-        self.len += bytes.len() as u64;
-        Ok(addr)
+        self.append_at_eof(bytes)
+    }
+    fn append_raw(&mut self, bytes: &[u8]) -> Result<u64, Error> {
+        self.append_typed(bytes, PageType::Raw)
+    }
+    fn append_meta(&mut self, bytes: &[u8]) -> Result<u64, Error> {
+        self.append_typed(bytes, PageType::Meta)
     }
     fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Error> {
         self.write_at_raw(offset, bytes)
@@ -329,16 +615,43 @@ struct BoundedPersistState {
     strategy: FileSpaceStrategy,
     threshold: u64,
     page_size: u64,
-    /// The live free list: the on-disk holes seeded at open (never handed out —
+    /// The live free space seeded from the on-disk managers (never handed out —
     /// the bounded engine appends only), plus, at finalize, the superseded old
-    /// manager/extension blocks.
-    free: FreeList,
+    /// manager/extension blocks. A non-paged file tracks one generic manager; a
+    /// paged file tracks per-page-type managers.
+    free: PersistFree,
     /// `(addr, len)` of the superblock-extension header and every `FSHD`/`FSSE`
     /// block the *current* on-disk file uses; freed and rewritten by the next
     /// finalize.
     old_blocks: Vec<(u64, u64)>,
     /// Absolute address of the current superblock-extension object header.
     old_ext_addr: u64,
+}
+
+/// The free space a persisting bounded session tracks, in the shape its managers
+/// take at finalize. A non-paged file has a single generic free-space manager; a
+/// paged file (issue #173 Phase 2) has one manager per page type.
+enum PersistFree {
+    /// Non-paged: one generic (simple-class) free-space manager.
+    Flat(FreeList),
+    /// Paged: the SUPER (metadata), DRAW (small raw), and generic-large (raw)
+    /// managers, kept separate because a paged manager holds one page type only.
+    Paged {
+        meta: FreeList,
+        raw_small: FreeList,
+        raw_large: FreeList,
+    },
+}
+
+impl PagedAppend {
+    fn new(page_size: u64) -> Self {
+        Self {
+            page_size,
+            last: None,
+            meta_pad: Vec::new(),
+            raw_pad: Vec::new(),
+        }
+    }
 }
 
 /// The engine behind [`Backend::Bounded`](crate::reader): the store plus the
@@ -401,11 +714,28 @@ impl BoundedEngine {
                  (non-zero base address); use File::open_rw",
             ));
         }
-        // A file that persists its free space is now supported (issue #173): seed
-        // the free list from its on-disk managers and rewrite them at close. The
-        // paged strategy is still refused here (it needs page-aligned allocation,
-        // issue #173 Phase 2); `load_bounded_persist` returns that error.
+        // A file that persists its free space is supported (issue #173): seed the
+        // free list from its on-disk managers and rewrite them at close. A genuine
+        // paged file (persist=true) is supported in Phase 2 by segregating appends
+        // into metadata vs raw pages; a paged non-persisting file is refused (it
+        // has no managers to describe the segregated free space).
         let persist = load_bounded_persist(&raw, &superblock)?;
+        // Arm the paged-append machinery for a paged file so raw and metadata
+        // appends land in separate pages. The file is page-aligned at open (a
+        // genuine paged file has a page-aligned end-of-allocation), so the first
+        // typed append never needs to pad.
+        // Arm paged appends whenever the file is paged. A cleanly written or closed
+        // paged file is page-aligned at open, but a bounded session that grew a
+        // paged file and was killed before finalize leaves the physical end
+        // non-page-aligned; that file still opens and reads correctly, and the
+        // first typed append re-aligns the tail page (see `append_typed`), so no
+        // page-alignment is assumed here.
+        let paged = match &persist {
+            Some(ps) if ps.strategy == FileSpaceStrategy::Page => {
+                Some(PagedAppend::new(ps.page_size))
+            }
+            _ => None,
+        };
 
         Ok(Self {
             store: BoundedStore {
@@ -419,6 +749,7 @@ impl BoundedEngine {
                         std::sync::Mutex::new(MetadataReadCache::new()),
                     )
                 }),
+                paged,
             },
             located: HashMap::new(),
             persist,
@@ -470,37 +801,80 @@ impl BoundedEngine {
             strategy,
             threshold,
             page_size,
-            mut free,
+            free,
             old_blocks,
             old_ext_addr,
         } = ps;
 
-        // The old extension + manager blocks are superseded by the rewrite, so
-        // they join the free list (their space becomes reclaimable).
-        for &(a, l) in &old_blocks {
-            free.free(a, l);
-        }
-        let sections: Vec<FreeSection> = free
-            .sections()
-            .into_iter()
-            .map(|(addr, size)| FreeSection { addr, size })
-            .collect();
-
         // Read the current extension's message region (single chunk), then write
         // the canonical tail past the appended data and repoint the superblock.
         let (region, _ext_len) = read_single_chunk_ext_region(&self.store, old_ext_addr)?;
-        let new_old_blocks = self
-            .store
-            .write_persist_tail(&region, strategy, threshold, page_size, &sections)?;
+
+        let (new_old_blocks, new_free) = match free {
+            PersistFree::Flat(mut free) => {
+                // The old extension + manager blocks are superseded by the rewrite,
+                // so they join the free list (their space becomes reclaimable).
+                for &(a, l) in &old_blocks {
+                    free.free(a, l);
+                }
+                let sections = free_sections(&free);
+                let nob = self
+                    .store
+                    .write_persist_tail(&region, strategy, threshold, page_size, &sections)?;
+                (nob, PersistFree::Flat(free))
+            }
+            PersistFree::Paged {
+                mut meta,
+                mut raw_small,
+                raw_large,
+            } => {
+                // Page-align the file first, then fold the session's page-padding
+                // tails into their managers (metadata pad -> SUPER, raw pad -> DRAW)
+                // and free the superseded old extension + manager blocks (metadata)
+                // into SUPER. Do this before laying the new managers so the free
+                // lists describe every reclaimable hole below the managers.
+                self.store.pad_to_page()?;
+                if let Some(pg) = self.store.paged.as_mut() {
+                    for &(a, l) in &pg.meta_pad {
+                        meta.free(a, l);
+                    }
+                    for &(a, l) in &pg.raw_pad {
+                        raw_small.free(a, l);
+                    }
+                    pg.meta_pad.clear();
+                    pg.raw_pad.clear();
+                }
+                for &(a, l) in &old_blocks {
+                    meta.free(a, l);
+                }
+                let nob = self.store.write_persist_tail_paged(
+                    &region,
+                    strategy,
+                    threshold,
+                    page_size,
+                    &free_sections(&meta),
+                    &free_sections(&raw_small),
+                    &free_sections(&raw_large),
+                )?;
+                (
+                    nob,
+                    PersistFree::Paged {
+                        meta,
+                        raw_small,
+                        raw_large,
+                    },
+                )
+            }
+        };
 
         // Re-arm from the just-written shape so a subsequent finalize (or a
-        // future append+finalize) stays consistent. `free` is the post list; the
-        // new extension address is the one the repoint recorded.
+        // future append+finalize) stays consistent. `new_free` is the post list;
+        // the new extension address is the one the repoint recorded.
         self.persist = Some(BoundedPersistState {
             strategy,
             threshold,
             page_size,
-            free,
+            free: new_free,
             old_blocks: new_old_blocks,
             old_ext_addr: self
                 .store
@@ -650,8 +1024,10 @@ fn ext_file_space_info(raw: &RawSource<'_>, superblock: &Superblock) -> Option<F
 /// #173), or `Ok(None)` when the file does not persist. Mirrors
 /// `WriteEngine::load_persisted_free_space` over a random-access [`Source`]: it
 /// reads only the small manager/extension blocks, so it stays bounded-memory.
-/// The paged strategy is refused (it needs page-aligned allocation, Phase 2).
-/// The caller has already validated `base_address == 0` and a v2/v3 superblock.
+/// A genuine paged file (persist=true) is supported by seeding its per-page-type
+/// managers; a paged *non-persisting* file is refused (it has no managers to
+/// describe the segregated free space). The caller has already validated
+/// `base_address == 0` and a v2/v3 superblock.
 fn load_bounded_persist(
     raw: &RawSource<'_>,
     superblock: &Superblock,
@@ -659,15 +1035,14 @@ fn load_bounded_persist(
     let Some(info) = ext_file_space_info(raw, superblock) else {
         return Ok(None);
     };
-    // Refuse the paged strategy regardless of the persist flag: the writer does
-    // not yet do page-aligned allocation, so appending at a raw end-of-file would
-    // break the paged invariants (issue #173 Phase 2). Checked before the persist
-    // early-return so a paged, non-persisting file is refused too, matching the
-    // documented behavior.
-    if info.strategy == FileSpaceStrategy::Page {
+    let paged = info.strategy == FileSpaceStrategy::Page;
+    if paged && !info.persist {
+        // A paged file without persisted managers has no on-disk record of which
+        // pages are metadata vs raw, so bounded appends cannot keep the free space
+        // segregated. Refuse rather than corrupt the paging.
         return Err(Error::EditUnsupported(
-            "bounded read-write does not yet support the paged file-space strategy \
-             (H5F_FSPACE_STRATEGY_PAGE); use File::open_rw",
+            "bounded read-write of a paged file (H5F_FSPACE_STRATEGY_PAGE) requires \
+             persisted free space (persist=true); use File::open_rw",
         ));
     }
     if !info.persist {
@@ -677,32 +1052,81 @@ fn load_bounded_persist(
     let ext_addr = superblock
         .superblock_extension_address
         .expect("ext_file_space_info returned Some, so the extension address is set");
-
-    // Seed the free list from the on-disk managers. A malformed or truncated
-    // manager is tolerated exactly as the mirror loader tolerates it (open, arm
-    // persistence, seed nothing) rather than failing the open — the file stays
-    // openable, and the finalize simply rewrites whatever we could recover.
-    let (mut sections, manager_blocks) =
-        read_persisted_sections_source(raw, &info.manager_addrs, 0, os)
-            .unwrap_or_else(|_| (Vec::new(), Vec::new()));
-    let mut free = FreeList::new();
     let file_len = raw.len();
-    sections.sort_by_key(|s| s.addr);
-    let mut prev_end = 0u64;
-    for s in sections {
-        let Some(end) = s.addr.checked_add(s.size) else {
-            continue;
-        };
-        if s.size == 0 || end > file_len || s.addr < prev_end {
-            continue;
-        }
-        prev_end = end;
-        free.free(s.addr, s.size);
-    }
 
-    // Record the blocks the live file uses (extension header + each FSHD/FSSE) so
-    // the next finalize frees them when it writes replacements.
-    let mut old_blocks = manager_blocks;
+    // Record the blocks the live file uses (each FSHD/FSSE + the extension header)
+    // so the next finalize frees them when it writes replacements. A malformed or
+    // truncated manager is tolerated exactly as the mirror loader tolerates it
+    // (seed nothing) rather than failing the open.
+    let mut old_blocks = Vec::new();
+    let free = if paged {
+        // Seed the per-page-type managers by their on-disk slot: SUPER (slot 0) is
+        // metadata, DRAW (slot 2) is small raw, and the generic-large manager (slot
+        // 6) holds large-raw fragments. Genuine paged files use only these slots.
+        let mut tagged: Vec<(FreeSection, u8)> = Vec::new(); // 0 = meta, 1 = raw_small, 2 = raw_large
+        for (k, &m) in info.manager_addrs.iter().enumerate() {
+            if m == u64::MAX {
+                continue;
+            }
+            let (secs, blocks) = read_persisted_sections_source(raw, &[m], 0, os)
+                .unwrap_or_else(|_| (Vec::new(), Vec::new()));
+            old_blocks.extend(blocks);
+            let which = match k {
+                2 => 1u8,
+                6 => 2u8,
+                _ => 0u8, // slot 0 and any other (unexpected) slot -> metadata
+            };
+            for s in secs {
+                tagged.push((s, which));
+            }
+        }
+        // Validate globally (sorted, non-overlapping, within the file), then route
+        // each surviving section into its page-type list.
+        tagged.sort_by_key(|(s, _)| s.addr);
+        let mut meta = FreeList::new();
+        let mut raw_small = FreeList::new();
+        let mut raw_large = FreeList::new();
+        let mut prev_end = 0u64;
+        for (s, which) in tagged {
+            let Some(end) = s.addr.checked_add(s.size) else {
+                continue;
+            };
+            if s.size == 0 || end > file_len || s.addr < prev_end {
+                continue;
+            }
+            prev_end = end;
+            match which {
+                1 => raw_small.free(s.addr, s.size),
+                2 => raw_large.free(s.addr, s.size),
+                _ => meta.free(s.addr, s.size),
+            }
+        }
+        PersistFree::Paged {
+            meta,
+            raw_small,
+            raw_large,
+        }
+    } else {
+        let (mut sections, manager_blocks) =
+            read_persisted_sections_source(raw, &info.manager_addrs, 0, os)
+                .unwrap_or_else(|_| (Vec::new(), Vec::new()));
+        old_blocks.extend(manager_blocks);
+        let mut free = FreeList::new();
+        sections.sort_by_key(|s| s.addr);
+        let mut prev_end = 0u64;
+        for s in sections {
+            let Some(end) = s.addr.checked_add(s.size) else {
+                continue;
+            };
+            if s.size == 0 || end > file_len || s.addr < prev_end {
+                continue;
+            }
+            prev_end = end;
+            free.free(s.addr, s.size);
+        }
+        PersistFree::Flat(free)
+    };
+
     let (_region, ext_len) = read_single_chunk_ext_region(raw, ext_addr)?;
     old_blocks.push((ext_addr, ext_len));
 
@@ -714,6 +1138,45 @@ fn load_bounded_persist(
         old_blocks,
         old_ext_addr: ext_addr,
     }))
+}
+
+/// The free `(addr, size)` runs a [`FreeList`] holds, as [`FreeSection`]s in the
+/// shape the manager serializer expects.
+fn free_sections(free: &FreeList) -> Vec<FreeSection> {
+    free.sections()
+        .into_iter()
+        .map(|(addr, size)| FreeSection { addr, size })
+        .collect()
+}
+
+/// Round `value` up to the next multiple of `page` (`page` is a power of two >=
+/// 512, validated at file creation).
+fn align_up(value: u64, page: u64) -> u64 {
+    value.div_ceil(page) * page
+}
+
+/// Split each free section at page boundaries so no section spans a page. The
+/// bounded finalize coalesces a page-tail free section with freed manager blocks
+/// below it, which can produce a run that crosses a page boundary or reaches
+/// `page`; splitting lets each intra-page fragment stay in its SMALL-class manager
+/// while a whole free page is routed to the generic-large manager, matching the
+/// reference library's small-vs-large section classes.
+fn split_at_pages(sections: &[FreeSection], page: u64) -> Vec<FreeSection> {
+    let mut out = Vec::new();
+    for s in sections {
+        let end = s.addr.saturating_add(s.size);
+        let mut start = s.addr;
+        while start < end {
+            let boundary = (start / page + 1) * page;
+            let piece_end = end.min(boundary);
+            out.push(FreeSection {
+                addr: start,
+                size: piece_end - start,
+            });
+            start = piece_end;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -842,5 +1305,131 @@ mod tests {
             .read_i32()
             .unwrap();
         assert_eq!(got, (0..20).collect::<Vec<_>>());
+    }
+
+    /// A bounded session grows a PAGED persisting file and is killed before
+    /// finalize (models a crash), leaving the file non-page-aligned. Reopening it
+    /// must not panic, and the next append must re-align the crashed tail page
+    /// before writing raw data (so no page mixes metadata and raw); a clean close
+    /// then re-page-aligns the file and every row reads back.
+    #[test]
+    fn paged_reopen_after_crash_realigns_and_stays_readable() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("paged_crash.h5");
+        let mut b = FileBuilder::new();
+        b.with_file_space_strategy(crate::FileSpaceStrategy::Page, true, 0)
+            .with_file_space_page_size(4096);
+        b.create_dataset("d")
+            .with_i32_data(&(0..64).collect::<Vec<i32>>())
+            .with_shape(&[64])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[64]);
+        b.write(&p).unwrap();
+
+        // Grow enough to force extensible-array index growth, so the last write of
+        // the session is metadata and the tail page is a partial metadata page.
+        {
+            let mut engine = BoundedEngine::open(&p, MetadataCacheConfig::disabled()).unwrap();
+            let addr = dataset_addr(&engine);
+            let mut ab = AppendBuilder::new();
+            ab.append_i32(&(64..2000).collect::<Vec<_>>());
+            engine.append_gathered(addr, &ab, 4).unwrap();
+            // Drop without finalize: models a crash and releases the OS lock.
+        }
+        assert_ne!(
+            std::fs::metadata(&p).unwrap().len() % 4096,
+            0,
+            "a crashed (un-finalized) paged session leaves the file non-page-aligned"
+        );
+
+        // Reopen must not panic on the non-aligned file; the next append re-aligns
+        // the crashed tail page, and finalize re-page-aligns the whole file.
+        {
+            let mut engine = BoundedEngine::open(&p, MetadataCacheConfig::disabled()).unwrap();
+            let addr = dataset_addr(&engine);
+            let mut ab = AppendBuilder::new();
+            ab.append_i32(&(2000..2500).collect::<Vec<_>>());
+            engine.append_gathered(addr, &ab, 4).unwrap();
+            engine.finalize_persist().unwrap();
+            engine.sync().unwrap();
+        }
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().len() % 4096,
+            0,
+            "reopen + append + finalize re-aligns the paged file"
+        );
+        let got = crate::File::open(&p)
+            .unwrap()
+            .dataset("d")
+            .unwrap()
+            .read_i32()
+            .unwrap();
+        assert_eq!(got, (0..2500).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn split_at_pages_splits_on_boundaries_preserving_total() {
+        let page = 4096;
+        // A run that crosses one boundary splits into a sub-page head and a whole
+        // free page (the accounting fix routes the >= page piece to slot 6).
+        assert_eq!(
+            split_at_pages(
+                &[FreeSection {
+                    addr: 3740,
+                    size: 4452
+                }],
+                page
+            ),
+            vec![
+                FreeSection {
+                    addr: 3740,
+                    size: 356
+                }, // [3740, 4096)
+                FreeSection {
+                    addr: 4096,
+                    size: 4096
+                }, // [4096, 8192)
+            ]
+        );
+        // A sub-page section is returned unchanged (the common case is a no-op).
+        assert_eq!(
+            split_at_pages(
+                &[FreeSection {
+                    addr: 100,
+                    size: 200
+                }],
+                page
+            ),
+            vec![FreeSection {
+                addr: 100,
+                size: 200
+            }]
+        );
+        // A page-aligned multi-page run splits into whole pages.
+        let whole = split_at_pages(
+            &[FreeSection {
+                addr: 0,
+                size: 3 * 4096,
+            }],
+            page,
+        );
+        assert_eq!(whole.len(), 3);
+        assert!(whole.iter().all(|s| s.size == 4096));
+        // Splitting never loses or overlaps space: pieces are contiguous and sum
+        // to the original size.
+        let pieces = split_at_pages(
+            &[FreeSection {
+                addr: 5000,
+                size: 10000,
+            }],
+            page,
+        );
+        assert_eq!(pieces.iter().map(|s| s.size).sum::<u64>(), 10000);
+        let mut prev = pieces[0].addr;
+        for s in &pieces {
+            assert_eq!(s.addr, prev);
+            prev = s.addr + s.size;
+        }
+        assert_eq!(prev, 15000);
     }
 }

@@ -35,18 +35,20 @@ fn main() {
     let persisting = dir.path().join("managed.h5");
     let mut builder = FileBuilder::new();
     builder.create_dataset("keep").with_i32_data(&[1, 2, 3]);
-    builder
-        .with_file_space_strategy(FileSpaceStrategy::Page, true, 1) // strategy, persist, threshold
-        .with_file_space_page_size(4096);
+    // A free-space-manager strategy that persists across sessions. (The paged
+    // strategy also persists, but a paged file is grown only through the
+    // append-only `File::open_rw_bounded`, which cannot reuse a freed hole the
+    // way this delete-then-re-add demo does.)
+    builder.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1); // strategy, persist, threshold
     builder.write(&persisting).expect("write file");
 
     // The strategy is stored in a superblock-extension message and survives a
     // reopen (the reference C library observes it too).
     let strategy = File::open(&persisting).unwrap().file_space_strategy();
-    assert_eq!(strategy, Some(FileSpaceStrategy::Page));
+    assert_eq!(strategy, Some(FileSpaceStrategy::FsmAggr));
     println!("recorded strategy: {strategy:?}\n");
 
-    println!("persisting file (strategy = Page, persist = true):");
+    println!("persisting file (strategy = FsmAggr, persist = true):");
     let reuse_growth = churn(&persisting);
 
     // Because the file persists free space, deleting `scratch` recorded its
