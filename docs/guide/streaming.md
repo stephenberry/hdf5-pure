@@ -43,6 +43,27 @@ Dataset reads are fully supported across every storage layout:
 
 Streaming opens are read-only. To **append** to a file with the same bounded-memory discipline, open it with [`File::open_rw_bounded`](editing.md#bounded-memory-appends) — the read-write sibling of `open_streaming`, sharing this backend's read capabilities and the `FileAccessOptions` cache budgets below.
 
+## Reading a large dataset a window at a time
+
+The whole-dataset reads above materialize one dataset in full. When a single dataset is itself too large to hold decompressed, read it in **row windows**: `read_raw_rows(start, count)` and the typed `read_f64_rows` / … / `read_string_rows` decode only the leading-dimension rows `[start, start + count)`, touching only the chunks that window overlaps. Peak memory then tracks the window (plus one chunk), not the dataset.
+
+```rust
+use hdf5_pure::File;
+
+let file = File::open_streaming("huge.h5").unwrap();
+let ds = file.dataset("signal").unwrap();
+let rows = ds.shape().unwrap()[0];
+
+// Process a million rows at a time, never holding the whole dataset.
+for start in (0..rows).step_by(1_000_000) {
+    let window = ds.read_f64_rows(start, 1_000_000).unwrap();
+    // ... process `window` ...
+    let _ = window;
+}
+```
+
+The window is clamped to the dataset, so the final short window needs no special-casing. See [Reading a row window](reading.md#reading-a-row-window) for the full method list and the fallback for inner-chunked and variable-length datasets.
+
 ## Tuning retained memory
 
 `File::open_streaming_with_options(path, FileAccessOptions)` bounds the memory the streaming backend retains. `FileAccessOptions::new()` returns the crate's default access behavior; you layer on two independent caches with its builder methods.
