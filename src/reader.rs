@@ -291,16 +291,33 @@ struct FileInner {
 }
 
 impl Drop for FileInner {
-    /// Best-effort clear of the SWMR-write flag for a writer dropped without an
-    /// explicit [`File::close`] (mirroring `SwmrWriter::drop`). Runs only when the
-    /// last `Arc<FileInner>` clone drops; a clean `close` already cleared the flag
-    /// and set `closed`, so this is idempotent and skipped in that case.
+    /// Best-effort cleanup for a writer dropped without an explicit
+    /// [`File::close`], running only when the last `Arc<FileInner>` clone drops;
+    /// a clean `close` already did this work and set `closed`, so this is
+    /// idempotent and skipped in that case.
+    ///
+    /// - A SWMR writer clears the superblock's SWMR-write flag (mirroring
+    ///   `SwmrWriter::drop`).
+    /// - A bounded read-write file that persists its free space rewrites its
+    ///   on-disk free-space managers into canonical shape (issue #173), so a
+    ///   dropped-without-`close` handle leaves the same file a clean `close`
+    ///   would (a no-op unless an append grew the file). A true crash (`SIGKILL`,
+    ///   power loss) skips `drop` entirely; the appended data is still durable.
     fn drop(&mut self) {
-        if self.swmr_write && !self.closed.load(Ordering::Acquire) {
-            if let Backend::Mirror(m) = &self.backend {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        match &self.backend {
+            Backend::Mirror(m) if self.swmr_write => {
                 let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let _ = session.set_consistency_flags(0);
             }
+            Backend::Bounded(m) => {
+                let mut engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let _ = engine.finalize_persist();
+                let _ = engine.sync();
+            }
+            _ => {}
         }
     }
 }
@@ -1522,10 +1539,20 @@ impl File {
     /// [`Error::BoundedStagedUnsupported`](crate::Error::BoundedStagedUnsupported);
     /// open with [`open_rw`](Self::open_rw) for those.
     ///
+    /// A file that persists its free space
+    /// (`H5Pset_file_space_strategy(persist = true)`, non-paged) is supported:
+    /// its on-disk free-space managers are seeded at open and rewritten into
+    /// canonical shape when the file is closed — by an explicit
+    /// [`close`](Self::close) or, best-effort, when the last handle drops (issue
+    /// #173). Only a true crash (`SIGKILL`, power loss) skips that rewrite; the
+    /// appended data is still durable and reopens correctly, the managers merely
+    /// stay non-canonical until the next clean rewrite. The **paged** file-space
+    /// strategy (`H5F_FSPACE_STRATEGY_PAGE`) is not yet supported here and is
+    /// refused at open.
+    ///
     /// Requires a latest-format (v2/v3 superblock) file with 8-byte offsets and
-    /// lengths, no userblock, and no persisted free-space managers; other files
-    /// are refused at open with
-    /// [`Error::EditUnsupported`](crate::Error::EditUnsupported).
+    /// lengths and no userblock; other files (including paged ones) are refused
+    /// at open with [`Error::EditUnsupported`](crate::Error::EditUnsupported).
     pub fn open_rw_bounded<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
         Self::open_rw_bounded_with_options(path, FileAccessOptions::new())
     }
@@ -1650,10 +1677,14 @@ impl File {
     /// reads still work.
     pub fn close(self) -> Result<(), Error> {
         if let Backend::Bounded(m) = &self.inner.backend {
-            // Every bounded append is already durable; issue a final barrier
-            // and seal the file. The exclusive lock releases when the last
-            // derived handle drops, as for a mirror file.
+            // Every bounded append is already durable. For a file that persists
+            // its free space, rewrite the on-disk free-space managers into their
+            // canonical (manager-at-tail) shape here — the one place a bounded
+            // session has to do it, since it has no staged commit (issue #173).
+            // Then issue a final barrier and seal the file. The exclusive lock
+            // releases when the last derived handle drops, as for a mirror file.
             let mut engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            engine.finalize_persist()?;
             engine.sync()?;
             drop(engine);
             self.inner.closed.store(true, Ordering::Release);
