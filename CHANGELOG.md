@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-07-22
+
+The owned-handle API lands ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)): `Dataset`, `Group`, and `Object` are now owned handles with no `<'f>` lifetime and `File` is cheaply cloneable, so a handle can be stored, cached, sent across threads, and outlive its `File`. A file opened with `File::open_rw` or `File::create` reads, appends, edits, and commits through those handles (`Dataset::append` is immediate and crash-atomic), with `File::open_swmr_writer` for lock-free SWMR appends and `File::open_rw_bounded` for reading and appending with memory bounded independent of file size. The legacy `EditSession`, `SwmrWriter`, and `AppendWriter` are deprecated in favor of it. Also new: filtered in-place append ([#144](https://github.com/stephenberry/hdf5-pure/issues/144)), layout/filter and live-space introspection ([#149](https://github.com/stephenberry/hdf5-pure/issues/149), [#150](https://github.com/stephenberry/hdf5-pure/issues/150)), and configurable fill values ([#151](https://github.com/stephenberry/hdf5-pure/issues/151)). **Breaking:** the handle lifetime is gone (drop `Dataset<'_>`), and `File::refresh` now reports outstanding handles at runtime with `Error::HandlesOutstanding`.
+
 ### Breaking
 
 - **Breaking:** `Dataset`, `Group`, and `Object` are now owned handles with no `<'f>` lifetime — `File::dataset`/`group`/`root` hand back handles that share ownership of the open file (internally `Arc`), so a handle can be stored in a struct, cached, sent across threads, and outlive the `File` value it came from, and `File` is now cheaply cloneable. Code that never named the handle lifetime is unaffected; code that wrote `Dataset<'_>` should drop the lifetime, and `File::refresh` now returns `Error::HandlesOutstanding` when a handle or `File` clone is still alive instead of enforcing it at compile time ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)).
@@ -333,7 +337,9 @@ Internal robustness and tests ([#26](https://github.com/stephenberry/hdf5-pure/i
 - The MAT deserializer flattens 1×N and N×1 values to a 1-D sequence in `deserialize_any` (matching `deserialize_seq`).
 - Numeric/complex readers preserve 1×N / N×1 shape at the value layer; any flattening happens at the serde level.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.21.1...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.21.2...v0.22.0
+[0.21.2]: https://github.com/stephenberry/hdf5-pure/compare/v0.21.1...v0.21.2
 [0.21.1]: https://github.com/stephenberry/hdf5-pure/compare/v0.21.0...v0.21.1
 [0.21.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.20.1...v0.21.0
 [0.20.1]: https://github.com/stephenberry/hdf5-pure/compare/v0.20.0...v0.20.1
