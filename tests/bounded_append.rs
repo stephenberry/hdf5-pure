@@ -214,20 +214,162 @@ fn userblock_file_is_refused_at_open() {
     assert!(matches!(err, Error::EditUnsupported(_)), "got: {err:?}");
 }
 
+/// A file that persists its free space (non-paged) is now supported by the
+/// bounded backend (issue #173): append in place, then `close` rewrites the
+/// on-disk free-space managers so a reopen recovers the data and the strategy.
 #[test]
-fn persisted_free_space_file_is_refused_at_open() {
+fn persisted_free_space_file_appends_and_finalizes() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("persist.h5");
     let mut b = FileBuilder::new();
     b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1);
     b.create_dataset("d")
-        .with_i32_data(&[1, 2, 3])
-        .with_shape(&[3])
+        .with_i32_data(&(0..10).collect::<Vec<i32>>())
+        .with_shape(&[10])
         .with_maxshape(&[u64::MAX])
-        .with_chunks(&[2]);
+        .with_chunks(&[4]);
     b.write(&p).unwrap();
-    let err = File::open_rw_bounded(&p).unwrap_err();
-    assert!(matches!(err, Error::EditUnsupported(_)), "got: {err:?}");
+
+    {
+        let file = File::open_rw_bounded(&p).unwrap();
+        let mut ds = file.dataset("d").unwrap();
+        ds.append(&(10..25).collect::<Vec<i32>>()).unwrap();
+        file.close().unwrap();
+    }
+
+    // The reopened file reads the full sequence and still records the persisting
+    // strategy, and hdf5-pure recovers free space the finalize wrote on disk.
+    let f = File::open(&p).unwrap();
+    assert_eq!(
+        f.dataset("d").unwrap().read_i32().unwrap(),
+        (0..25).collect::<Vec<_>>()
+    );
+    assert_eq!(f.file_space_strategy(), Some(FileSpaceStrategy::FsmAggr));
+    assert!(
+        f.file_space_info().unwrap().persist,
+        "the finalize keeps the persist flag set"
+    );
+    // The finalize freed the superseded extension + manager blocks, so the
+    // reopened file recovers at least one persisted free section.
+    assert!(
+        !f.persisted_free_space().is_empty(),
+        "expected persisted free sections after finalize"
+    );
+}
+
+/// Several bounded appends over one held-open persisting file, then one close:
+/// the finalize runs once and the reopened file reads the whole sequence.
+#[test]
+fn persisted_free_space_many_appends_one_finalize() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("persist_many.h5");
+    let mut b = FileBuilder::new();
+    b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 3);
+    b.create_dataset("d")
+        .with_i32_data(&[0])
+        .with_shape(&[1])
+        .with_maxshape(&[u64::MAX])
+        .with_chunks(&[16]);
+    b.write(&p).unwrap();
+
+    {
+        let file = File::open_rw_bounded(&p).unwrap();
+        let mut ds = file.dataset("d").unwrap();
+        for start in (1..200).step_by(20) {
+            let end = (start + 20).min(200);
+            ds.append(&(start..end).collect::<Vec<i32>>()).unwrap();
+        }
+        file.close().unwrap();
+    }
+    assert_eq!(read_i32(&p), (0..200).collect::<Vec<_>>());
+}
+
+/// A dropped bounded persisting session (no `close`, i.e. an unclean exit) still
+/// leaves a file whose appended data is durable and readable — the finalize is
+/// on a persist file finalizes it (rewrites the managers into canonical shape),
+/// just like an explicit `close`.
+#[test]
+fn persisted_free_space_drop_finalizes() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("persist_drop.h5");
+    let mut b = FileBuilder::new();
+    b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1);
+    b.create_dataset("d")
+        .with_i32_data(&(0..8).collect::<Vec<i32>>())
+        .with_shape(&[8])
+        .with_maxshape(&[u64::MAX])
+        .with_chunks(&[4]);
+    b.write(&p).unwrap();
+
+    {
+        let file = File::open_rw_bounded(&p).unwrap();
+        let mut ds = file.dataset("d").unwrap();
+        ds.append(&(8..16).collect::<Vec<i32>>()).unwrap();
+        // Drop without close: the Drop guard runs the finalize best-effort.
+    }
+    assert_eq!(read_i32(&p), (0..16).collect::<Vec<_>>());
+    // The dropped-without-close file is finalized: managers are canonical, so a
+    // reopen recovers persisted free space, exactly as after an explicit close.
+    let f = File::open(&p).unwrap();
+    assert_eq!(f.file_space_strategy(), Some(FileSpaceStrategy::FsmAggr));
+    assert!(
+        !f.persisted_free_space().is_empty(),
+        "a dropped handle finalizes like close"
+    );
+}
+
+/// Opening a persist file and closing it without appending anything must not
+/// grow the file — the finalize is skipped when nothing was appended.
+#[test]
+fn persisted_free_space_noop_close_does_not_grow() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("persist_noop.h5");
+    let mut b = FileBuilder::new();
+    b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1);
+    b.create_dataset("d")
+        .with_i32_data(&(0..8).collect::<Vec<i32>>())
+        .with_shape(&[8])
+        .with_maxshape(&[u64::MAX])
+        .with_chunks(&[4]);
+    b.write(&p).unwrap();
+    let before = std::fs::metadata(&p).unwrap().len();
+
+    File::open_rw_bounded(&p).unwrap().close().unwrap();
+    assert_eq!(
+        std::fs::metadata(&p).unwrap().len(),
+        before,
+        "a no-append close must not grow the file"
+    );
+    // Repeated open/close cycles also leave the size fixed.
+    for _ in 0..3 {
+        File::open_rw_bounded(&p).unwrap().close().unwrap();
+    }
+    assert_eq!(std::fs::metadata(&p).unwrap().len(), before);
+}
+
+/// The paged file-space strategy is refused by the bounded backend (issue #173
+/// Phase 2), whether or not it persists free space: page-aligned allocation is
+/// not implemented yet.
+#[test]
+fn paged_file_is_refused_at_open() {
+    let dir = tempdir().unwrap();
+    for (name, persist) in [("paged_persist.h5", true), ("paged_plain.h5", false)] {
+        let p = dir.path().join(name);
+        let mut b = FileBuilder::new();
+        b.with_file_space_strategy(FileSpaceStrategy::Page, persist, 0)
+            .with_file_space_page_size(4096);
+        b.create_dataset("d")
+            .with_i32_data(&[1, 2, 3])
+            .with_shape(&[3])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[2]);
+        b.write(&p).unwrap();
+        let err = File::open_rw_bounded(&p).unwrap_err();
+        assert!(
+            matches!(err, Error::EditUnsupported(_)),
+            "{name} persist={persist} got: {err:?}"
+        );
+    }
 }
 
 #[test]

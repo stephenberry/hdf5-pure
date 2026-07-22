@@ -359,6 +359,46 @@ pub(crate) fn read_persisted_sections(
     Ok(sections)
 }
 
+/// The free sections recovered from the on-disk managers, paired with the
+/// `(addr, len)` extents of every `FSHD`/`FSSE` block that was read (so a caller
+/// rewriting the managers can reclaim those blocks).
+pub(crate) type PersistedSections = (Vec<FreeSection>, Vec<(u64, u64)>);
+
+/// The bounded-memory counterpart of [`read_persisted_sections`]: read every
+/// persisted free section from the managers named in `manager_addrs` over a
+/// random-access [`Source`] instead of a whole-file `&[u8]`, so the bounded
+/// backend can seed its free list without a mirror. Only the small manager
+/// blocks are read; nothing scales with file size.
+pub(crate) fn read_persisted_sections_source<S: crate::source::Source>(
+    src: &S,
+    manager_addrs: &[u64],
+    base: u64,
+    offset_size: u8,
+) -> Result<PersistedSections, FormatError> {
+    let bad = || FormatError::InvalidFreeSpaceManager;
+    let mut sections = Vec::new();
+    let mut blocks = Vec::new();
+    let hdr_len = fshd_len(offset_size);
+    for &addr in manager_addrs {
+        if addr == u64::MAX {
+            continue;
+        }
+        let a = base.checked_add(addr).ok_or_else(bad)?;
+        let fshd = src.read_exact_at(a, hdr_len.to_usize()?)?;
+        let header = FsmHeader::parse(&fshd, offset_size)?;
+        blocks.push((a, hdr_len));
+        if header.fsse_addr == u64::MAX {
+            continue;
+        }
+        let fa = base.checked_add(header.fsse_addr).ok_or_else(bad)?;
+        let used = header.fsse_used;
+        let block = src.read_exact_at(fa, used.to_usize()?)?;
+        sections.extend(parse_fsse(&block, &header, offset_size)?);
+        blocks.push((fa, used));
+    }
+    Ok((sections, blocks))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

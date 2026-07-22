@@ -9,8 +9,26 @@
 
 use hdf5::Extent;
 use hdf5::file::LibraryVersion;
-use hdf5_pure::{File, FileBuilder};
+use hdf5::plist::file_create::FileSpaceStrategy as CStrategy;
+use hdf5_pure::{File, FileBuilder, FileSpaceStrategy};
+use std::sync::{Mutex, MutexGuard};
 use tempfile::tempdir;
+
+// The reference free-space query, resolved at link time from the statically
+// linked libhdf5: a positive result proves the C library loaded and parsed the
+// on-disk free-space managers this crate's bounded finalize wrote.
+unsafe extern "C" {
+    fn H5Fget_freespace(file_id: i64) -> i64;
+}
+
+// Serialize the raw FFI call above (which bypasses `hdf5-metno`'s internal lock)
+// against every other C-library call in this file; libhdf5 is not built
+// thread-safe here. Poisoning is ignored so one test's panic does not cascade.
+static C_LIB: Mutex<()> = Mutex::new(());
+
+fn c_lib_guard() -> MutexGuard<'static, ()> {
+    C_LIB.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Create a rank-1 unlimited (Extensible-Array indexed) i32 dataset `name` with the
 /// C library under the latest format, seeded with `0..n`, chunk length `chunk`.
@@ -117,6 +135,101 @@ fn bounded_batched_large_append_reads_back_in_c() {
     assert_eq!(got.len(), total as usize);
     assert!(got.iter().enumerate().all(|(i, &v)| v == i as i32));
     assert_eq!(read_pure(&path, "d").len(), total as usize);
+}
+
+/// A persisting file (this crate's writer, `persist = true`, non-paged) grown
+/// through the bounded backend and finalized at `close` reads back byte-correct
+/// in the C library, which also loads the free-space managers the finalize wrote
+/// (issue #173).
+#[test]
+fn bounded_persist_finalize_reads_back_in_c() {
+    let _c = c_lib_guard();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("pure_persist.h5");
+
+    let mut b = FileBuilder::new();
+    b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1);
+    b.create_dataset("d")
+        .with_i32_data(&(0..10).collect::<Vec<i32>>())
+        .with_shape(&[10])
+        .with_maxshape(&[u64::MAX])
+        .with_chunks(&[4]);
+    b.write(&path).unwrap();
+
+    {
+        let file = File::open_rw_bounded(&path).unwrap();
+        let mut ds = file.dataset("d").unwrap();
+        ds.append(&(10..30).collect::<Vec<i32>>()).unwrap();
+        file.close().unwrap();
+    }
+
+    let expected: Vec<i32> = (0..30).collect();
+    assert_eq!(read_pure(&path, "d"), expected);
+
+    // The C library reads the data, recovers the persisting strategy, and its
+    // free-space query parses the managers the finalize wrote.
+    let f = hdf5::File::open(&path).unwrap();
+    assert_eq!(f.dataset("d").unwrap().read_raw::<i32>().unwrap(), expected);
+    let strat = f.create_plist().unwrap().get_file_space_strategy().unwrap();
+    assert!(
+        matches!(
+            strat,
+            CStrategy::FreeSpaceManager {
+                paged: false,
+                persist: true,
+                ..
+            }
+        ),
+        "C recovers our persisting FSM strategy, got {strat:?}"
+    );
+    let free = unsafe { H5Fget_freespace(f.id()) };
+    assert!(
+        free >= 0,
+        "C loads our free-space managers without error (got {free})"
+    );
+}
+
+/// The mirror of the above: the C library creates the persisting file, the
+/// bounded backend grows it and finalizes at `close`, and both libraries read
+/// the full sequence back.
+#[test]
+fn bounded_persist_on_c_created_file_reads_back() {
+    let _c = c_lib_guard();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_persist.h5");
+
+    {
+        let file = hdf5::File::with_options()
+            .with_fapl(|p| p.libver_bounds(LibraryVersion::V110, LibraryVersion::latest()))
+            .with_fcpl(|fcpl| {
+                fcpl.file_space_strategy(CStrategy::FreeSpaceManager {
+                    paged: false,
+                    persist: true,
+                    threshold: 1,
+                })
+            })
+            .create(&path)
+            .unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .chunk((4,))
+            .shape((Extent::resizable(8),))
+            .create("d")
+            .unwrap();
+        ds.write(&(0..8).collect::<Vec<_>>()).unwrap();
+        file.close().unwrap();
+    }
+
+    {
+        let file = File::open_rw_bounded(&path).unwrap();
+        let mut ds = file.dataset("d").unwrap();
+        ds.append(&(8..20).collect::<Vec<i32>>()).unwrap();
+        file.close().unwrap();
+    }
+
+    let expected: Vec<i32> = (0..20).collect();
+    assert_eq!(read_pure(&path, "d"), expected);
+    assert_eq!(read_c(&path, "d"), expected);
 }
 
 /// Variable-length string reads route through the file source; on read-write

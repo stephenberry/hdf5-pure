@@ -2470,36 +2470,7 @@ impl WriteEngine {
         info: &FileSpaceInfo,
     ) -> Result<Vec<u8>, Error> {
         let region = Self::gather_oh_messages(&self.data, ext_addr, self.superblock.base_address)?;
-        let new_body = info.serialize();
-        // The message body is the fixed-size File Space Info record (≤ 125 bytes),
-        // so it always fits the u16 size field; `try_from` keeps this off the
-        // 32-bit narrowing-cast ledger.
-        let new_len = u16::try_from(new_body.len())
-            .map_err(|_| Error::EditUnsupported("File Space Info message too large"))?;
-        let mut out = Vec::with_capacity(region.len());
-        let mut p = 0;
-        let mut replaced = false;
-        while let Some((msg_type, _body, body_end)) = next_message(&region, p)? {
-            if msg_type == MessageType::FileSpaceInfo {
-                out.push(region[p]); // message type byte
-                out.extend_from_slice(&new_len.to_le_bytes());
-                out.push(region[p + 3]); // preserve the message flags (0x14)
-                out.extend_from_slice(&new_body);
-                replaced = true;
-            } else {
-                out.extend_from_slice(&region[p..body_end]);
-            }
-            p = body_end;
-        }
-        if !replaced {
-            // Persistence is armed only when the extension already carries a File
-            // Space Info message, so this is unreachable; refuse rather than
-            // silently restructure an extension we did not understand.
-            return Err(Error::EditUnsupported(
-                "a persisting file's superblock extension has no File Space Info message",
-            ));
-        }
-        Ok(out)
+        rewrite_extension_region_bytes(&region, info)
     }
 
     /// Repoint a version 0/1 superblock at the rebuilt (now v2) root group and
@@ -2531,7 +2502,7 @@ impl WriteEngine {
     /// `addr`, returning the `[start, end)` byte range of its message region.
     /// Rejects headers that are not OHDR v2 or that track message creation order
     /// (whose 6-byte message records this engine does not emit).
-    fn oh_region(d: &[u8], addr: usize) -> Result<(usize, usize), Error> {
+    pub(crate) fn oh_region(d: &[u8], addr: usize) -> Result<(usize, usize), Error> {
         if d.len() < addr + 6 || &d[addr..addr + 4] != b"OHDR" || d[addr + 4] != 2 {
             return Err(Error::EditUnsupported(
                 "an object does not use a version 2 object header",
@@ -6637,7 +6608,95 @@ fn is_prefix(a: &[String], b: &[String]) -> bool {
 /// record begins at `body end`. Returns `Ok(None)` once fewer than 4 bytes
 /// remain (a clean end of the region), and `Err` if a record's declared body
 /// runs past the region. Centralizes the bounds check shared by every walker.
-fn next_message(region: &[u8], p: usize) -> Result<Option<(MessageType, usize, usize)>, Error> {
+/// Rebuild a superblock-extension object header's message region (as collapsed by
+/// [`WriteEngine::gather_oh_messages`] or [`read_single_chunk_ext_region`]) with
+/// its File Space Info message replaced by `info`, preserving every other message
+/// verbatim. The persisting message is fixed-size, so the region length is stable.
+/// Shared by the whole-file mirror commit and the bounded finalize so both write
+/// the same extension bytes.
+pub(crate) fn rewrite_extension_region_bytes(
+    region: &[u8],
+    info: &FileSpaceInfo,
+) -> Result<Vec<u8>, Error> {
+    let new_body = info.serialize();
+    // The message body is the fixed-size File Space Info record (≤ 125 bytes),
+    // so it always fits the u16 size field; `try_from` keeps this off the
+    // 32-bit narrowing-cast ledger.
+    let new_len = u16::try_from(new_body.len())
+        .map_err(|_| Error::EditUnsupported("File Space Info message too large"))?;
+    let mut out = Vec::with_capacity(region.len());
+    let mut p = 0;
+    let mut replaced = false;
+    while let Some((msg_type, _body, body_end)) = next_message(region, p)? {
+        if msg_type == MessageType::FileSpaceInfo {
+            out.push(region[p]); // message type byte
+            out.extend_from_slice(&new_len.to_le_bytes());
+            out.push(region[p + 3]); // preserve the message flags (0x14)
+            out.extend_from_slice(&new_body);
+            replaced = true;
+        } else {
+            out.extend_from_slice(&region[p..body_end]);
+        }
+        p = body_end;
+    }
+    if !replaced {
+        // Persistence is armed only when the extension already carries a File
+        // Space Info message, so this is unreachable; refuse rather than
+        // silently restructure an extension we did not understand.
+        return Err(Error::EditUnsupported(
+            "a persisting file's superblock extension has no File Space Info message",
+        ));
+    }
+    Ok(out)
+}
+
+/// Read and collapse a **single-chunk** superblock-extension object header's
+/// message region from a random-access [`Source`], for the bounded backend which
+/// has no whole-file mirror to hand [`WriteEngine::gather_oh_messages`] a `&[u8]`.
+/// The extension every writer (this crate's and the C library's) emits for a
+/// persisting file is a single OHDR chunk; a multi-chunk extension (a
+/// `Continuation` message) is refused so the caller falls back to `File::open_rw`.
+/// Returns the collapsed message region and the full byte length of the
+/// single-chunk object header at `ext_addr` (`OHDR` prefix + region + 4-byte
+/// checksum), so the caller can both rewrite the extension and record its extent
+/// as reclaimable free space.
+pub(crate) fn read_single_chunk_ext_region<S: crate::source::Source>(
+    src: &S,
+    ext_addr: u64,
+) -> Result<(Vec<u8>, u64), Error> {
+    // The extension is tiny (a File Space Info message plus at most a few small
+    // messages); a bounded window covers its whole chunk. Reading past end-of-file
+    // is clamped so a near-EOF extension still reads.
+    const WINDOW: u64 = 4096;
+    let avail = src.len().saturating_sub(ext_addr);
+    let want = WINDOW.min(avail).to_usize()?;
+    let buf = src.read_exact_at(ext_addr, want).map_err(Error::Format)?;
+    let (rs, re) = WriteEngine::oh_region(&buf, 0).map_err(|_| {
+        Error::EditUnsupported(
+            "bounded read-write cannot read the superblock extension (not a single-chunk \
+             version 2 object header); use File::open_rw",
+        )
+    })?;
+    // Refuse a continuation: the bounded reader only understands a single chunk.
+    let mut p = rs;
+    while let Some((msg_type, _body, body_end)) = next_message(&buf[..re], p)? {
+        if msg_type == MessageType::ObjectHeaderContinuation {
+            return Err(Error::EditUnsupported(
+                "bounded read-write does not support a multi-chunk superblock extension; \
+                 use File::open_rw",
+            ));
+        }
+        p = body_end;
+    }
+    // `oh_region` validated `re + 4 <= buf.len()`, so the checksum is present and
+    // the full object-header length is `re + 4`.
+    Ok((buf[rs..re].to_vec(), (re + 4) as u64))
+}
+
+pub(crate) fn next_message(
+    region: &[u8],
+    p: usize,
+) -> Result<Option<(MessageType, usize, usize)>, Error> {
     if p + 4 > region.len() {
         return Ok(None);
     }
@@ -6766,7 +6825,7 @@ fn datatype_copies_foreign_address(dt: &crate::datatype::Datatype) -> bool {
 /// Wrap a chunk-0 message region in a fresh single-chunk version 2 object header
 /// (`OHDR` prefix + region + Jenkins checksum). Mirrors the encoding in
 /// [`crate::object_header_writer::ObjectHeaderWriter::serialize`].
-fn build_v2_object_header(region: &[u8]) -> Vec<u8> {
+pub(crate) fn build_v2_object_header(region: &[u8]) -> Vec<u8> {
     let total = region.len();
     let (flags, width) = if total <= 255 {
         (0u8, 1usize)
