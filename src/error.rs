@@ -695,6 +695,14 @@ pub enum Error {
     /// SWMR-write flag out from under a concurrent reader, so the whole staged
     /// surface is refused in SWMR-writer mode.
     SwmrStagedUnsupported,
+    /// A staged edit (`write` / `set_attr` / `create_*` / `delete` / `copy` /
+    /// `commit`) or another mirror-backed operation (e.g.
+    /// [`crate::File::space_accounting`]) was requested on a file opened with
+    /// [`crate::File::open_rw_bounded`], which keeps only bounded state in
+    /// memory and supports reads plus immediate [`crate::Dataset::append`].
+    /// Staged edits rebuild the object tree over a whole-file mirror; open the
+    /// file with [`crate::File::open_rw`] for them.
+    BoundedStagedUnsupported,
     /// The file or dataset is not a supported target for the SWMR append writer
     /// (e.g. a userblock or non-latest-format file, or a dataset that is
     /// filtered, not rank-1 with an unlimited dimension, or not
@@ -772,6 +780,10 @@ impl fmt::Display for Error {
             Error::SwmrStagedUnsupported => write!(
                 f,
                 "a file opened with File::open_swmr_writer allows only immediate Dataset::append, not staged edits"
+            ),
+            Error::BoundedStagedUnsupported => write!(
+                f,
+                "a file opened with File::open_rw_bounded allows reads and immediate Dataset::append only; open it with File::open_rw for staged edits"
             ),
             Error::SwmrAppendUnsupported(reason) => {
                 write!(f, "unsupported SWMR append target: {reason}")

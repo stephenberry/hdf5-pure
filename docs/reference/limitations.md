@@ -41,6 +41,10 @@ SWMR append requires a **latest-format** file (v2/v3 superblock) and **no userbl
 
 In-place editing operates on files with **8-byte offsets and lengths** (what the writer emits and what modern files use). Other offset/length widths are not editable in place.
 
+### Bounded-memory read-write
+
+A file opened with [`File::open_rw_bounded`](../guide/editing.md#bounded-memory-appends) supports reads and immediate `Dataset::append` only; the staged edit surface (`write`, attribute edits, `create_*`/`delete`, `copy`, `commit`, `space_accounting`) needs the whole-file mirror and returns `Error::BoundedStagedUnsupported` — open with `File::open_rw` for those. It requires a latest-format file with 8-byte offsets, no userblock, and no persisted free-space managers, and shares the streaming backend's path-resolution limits.
+
 Adding an **object-reference dataset** (`EditSession::create_dataset(...).with_path_references(...)`) resolves a path target against every object this commit places, but only once that object has actually been placed: `commit()` processes groups deepest-first and, within a group, non-reference datasets before reference ones, so a target that is itself still being written when the reference is resolved — an ancestor group, a same-depth sibling group ordered later, a copy destination (or its interior), or a `write_dataset` target — is refused rather than resolved to a stale or wrong address. A target untouched by the commit resolves against the pre-commit file; a path that resolves nowhere at all becomes an undefined reference, matching `FileBuilder`'s resolution convention for the same builder type. This is a permanent scope line (not a `... yet` gap): reproducing the whole-file writer's two-pass dummy/real-address scheme inside `EditSession`'s single-pass commit would be a large rewrite of the core apply loop for a narrow benefit.
 
 ### Group creation property list (GCPL)

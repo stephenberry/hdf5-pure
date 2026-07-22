@@ -429,19 +429,20 @@ pub(crate) struct WriteEngine {
 /// the reference C library, h5py, and [`crate::SwmrWriter`].
 const SWMR_WRITE_FLAGS: u32 = 0x05;
 
-/// A dataset located once for [`EditSession::append_inplace`], then maintained
-/// across appends. Mirrors the append writer's per-dataset state.
-struct LocatedState {
-    loc: Located,
+/// A dataset located once for [`EditSession::append_inplace`] (or the bounded
+/// backend's immediate append), then maintained across appends. Mirrors the
+/// append writer's per-dataset state.
+pub(crate) struct LocatedState {
+    pub(crate) loc: Located,
     /// The dataset's on-disk element datatype (for the append type check and the
     /// filter chunk context).
-    datatype: Datatype,
+    pub(crate) datatype: Datatype,
     /// Spatial (rank-length) chunk dimensions in elements: `[chunk_elems]`.
-    spatial: Vec<u64>,
+    pub(crate) spatial: Vec<u64>,
     /// Bytes per element (datatype size).
-    element_size: usize,
+    pub(crate) element_size: usize,
     /// The re-encodable filter pipeline, when the dataset is filtered.
-    pipeline: Option<FilterPipeline>,
+    pub(crate) pipeline: Option<FilterPipeline>,
 }
 
 /// State for a file that persists its free space on disk. Carries the file's
@@ -1098,34 +1099,7 @@ impl WriteEngine {
 
         // Validate the appended bytes against the on-disk datatype.
         let raw = b.raw();
-        {
-            let st = &self.located[&oh_addr];
-            if raw.len() % st.element_size != 0 {
-                return Err(Error::AppendInPlaceUnsupported(
-                    "appended byte length is not a whole number of elements",
-                ));
-            }
-            match b.elem_dt() {
-                Some(expected) if *expected != st.datatype => {
-                    return Err(Error::AppendInPlaceUnsupported(
-                        "append datatype does not match the on-disk dataset (wrong element \
-                         type or byte order)",
-                    ));
-                }
-                Some(_) => {}
-                None => {
-                    if !datatype_is_raw_appendable(&st.datatype) {
-                        return Err(Error::AppendInPlaceUnsupported(
-                            "append_raw onto this dataset's datatype (non-little-endian, \
-                             variable-length, or reference) could misencode the bytes; use a \
-                             typed append",
-                        ));
-                    }
-                }
-            }
-        }
-
-        let new_elems = (raw.len() / self.located[&oh_addr].element_size) as u64;
+        let new_elems = validate_gathered_append(&self.located[&oh_addr], b)?;
         if new_elems == 0 {
             return Ok(());
         }
@@ -5176,11 +5150,45 @@ fn paths_overlap(a: &[String], b: &[String]) -> bool {
 /// handles the non-chunk-aligned filtered case, index-geometry limits, and
 /// platform-width limits that the engine reports this way. Genuine I/O and format
 /// errors pass through unchanged.
-fn as_inplace_error(e: Error) -> Error {
+pub(crate) fn as_inplace_error(e: Error) -> Error {
     match e {
         Error::AppendUnsupported(m) => Error::AppendInPlaceUnsupported(m),
         other => other,
     }
+}
+
+/// Validate a gathered append's bytes against a located dataset: the byte
+/// length must be a whole number of elements, and the element datatype must
+/// match the on-disk datatype (or, for a raw append, be raw-appendable).
+/// Returns the appended element count (`0` = nothing to do). Shared by
+/// [`WriteEngine::append_inplace`]'s path and the bounded backend's immediate
+/// append so the acceptance rules stay identical.
+pub(crate) fn validate_gathered_append(st: &LocatedState, b: &AppendBuilder) -> Result<u64, Error> {
+    let raw = b.raw();
+    if raw.len() % st.element_size != 0 {
+        return Err(Error::AppendInPlaceUnsupported(
+            "appended byte length is not a whole number of elements",
+        ));
+    }
+    match b.elem_dt() {
+        Some(expected) if *expected != st.datatype => {
+            return Err(Error::AppendInPlaceUnsupported(
+                "append datatype does not match the on-disk dataset (wrong element \
+                 type or byte order)",
+            ));
+        }
+        Some(_) => {}
+        None => {
+            if !datatype_is_raw_appendable(&st.datatype) {
+                return Err(Error::AppendInPlaceUnsupported(
+                    "append_raw onto this dataset's datatype (non-little-endian, \
+                     variable-length, or reference) could misencode the bytes; use a \
+                     typed append",
+                ));
+            }
+        }
+    }
+    Ok((raw.len() / st.element_size) as u64)
 }
 
 /// Locate the dataset at `oh_addr` in `file` and build its [`LocatedState`],
@@ -5188,7 +5196,10 @@ fn as_inplace_error(e: Error) -> Error {
 /// indexed, a nonzero chunk length, and a re-encodable filter pipeline). Mirrors
 /// the append writer's `ensure_located`, reporting through
 /// [`Error::AppendInPlaceUnsupported`].
-fn locate_dataset_state<F: Store>(file: &F, oh_addr: u64) -> Result<LocatedState, Error> {
+pub(crate) fn locate_dataset_state<F: Store>(
+    file: &F,
+    oh_addr: u64,
+) -> Result<LocatedState, Error> {
     let result = Located::locate_at(file, oh_addr, Error::AppendInPlaceUnsupported)?;
     if result.located.chunk_elems == 0 {
         return Err(Error::AppendInPlaceUnsupported(
