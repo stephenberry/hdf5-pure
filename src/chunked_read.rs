@@ -862,14 +862,23 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
     let elem_size = datatype.type_size() as usize;
     let (rank, chunk_dims, ds_dims) = chunked_dims(chunk_dimensions, dataspace)?;
 
-    // A row is contiguous in the chunk only when the chunk spans the full inner
-    // extent; inner-chunked layouts fall back to the whole-dataset reader.
-    if (1..rank).any(|i| chunk_dims[i] != ds_dims[i]) {
+    // A rank-0 (scalar) chunked layout has no leading dimension to window, and a
+    // row is contiguous in the chunk only when the chunk spans the full inner
+    // extent; both cases fall back to the whole-dataset reader (which handles
+    // rank 0 and inner chunking) rather than the row-band fast path.
+    if rank == 0 || (1..rank).any(|i| chunk_dims[i] != ds_dims[i]) {
         return Ok(None);
     }
 
-    // Elements per row (product of the inner dims; 1 when 0-D or 1-D).
-    let row_elems: usize = ds_dims.iter().skip(1).product();
+    // Elements per row (product of the inner dims; 1 when 1-D). Checked so a
+    // crafted dataspace whose inner dims overflow `usize` errors instead of
+    // panicking (debug) or wrapping (release).
+    let row_elems: usize = ds_dims.iter().skip(1).try_fold(1usize, |acc, &d| {
+        acc.checked_mul(d).ok_or(FormatError::OffsetOverflow {
+            offset: acc as u64,
+            length: d as u64,
+        })
+    })?;
     let row_bytes = row_elems
         .checked_mul(elem_size)
         .ok_or(FormatError::OffsetOverflow {
@@ -889,9 +898,14 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
         return Ok(Some(output));
     }
 
-    // Unallocated storage: the window is all zeros.
+    // Unallocated chunk index: a non-empty window has no storage to read. Match
+    // the whole-dataset reader, which errors here, so `read_raw_rows` stays
+    // consistent with `read_raw` rather than fabricating a window of zeros. (An
+    // empty window has already returned above.)
     let Some(addr) = *btree_address else {
-        return Ok(Some(output));
+        return Err(FormatError::ChunkedReadError(
+            "no address for chunked layout".into(),
+        ));
     };
 
     // Walk the index once, then reuse it for later windows on this handle.
@@ -2182,6 +2196,7 @@ mod tests {
 
     use crate::dataspace::{Dataspace, DataspaceType};
     use crate::datatype::{Datatype, DatatypeByteOrder};
+    use crate::source::BytesSource;
 
     fn make_f64_type() -> Datatype {
         Datatype::FloatingPoint {
@@ -2316,7 +2331,7 @@ mod tests {
         datatype: &Datatype,
         pipeline: Option<&FilterPipeline>,
     ) {
-        use crate::source::{BytesSource, ReadSeekSource};
+        use crate::source::ReadSeekSource;
         let buffered =
             read_chunked_data(file_data, layout, dataspace, datatype, pipeline, 8, 8).unwrap();
         let from_mem = read_chunked_data_from_source(
@@ -2694,5 +2709,141 @@ mod tests {
             let val = f64::from_le_bytes(raw[i * 8..(i + 1) * 8].try_into().unwrap());
             assert_eq!(val, i as f64, "mismatch at index {i}");
         }
+    }
+
+    // --- Windowed row-read guards (read_chunked_rows_from_source) ---
+
+    /// A rank-0 (scalar) chunked layout leaves `chunk_dims` empty; the windowed
+    /// reader must fall back (`Ok(None)`) rather than index `chunk_dims[0]` and
+    /// panic. Only a crafted file reaches this (valid chunked layouts are rank
+    /// >= 1), but the reader parses untrusted input.
+    #[test]
+    fn windowed_rows_rank0_chunked_falls_back() {
+        let layout = DataLayout::Chunked {
+            chunk_dimensions: vec![8], // dimensionality 1 => rank 0
+            btree_address: Some(0),
+            version: 3,
+            chunk_index_type: None,
+            single_chunk_filtered_size: None,
+            single_chunk_filter_mask: None,
+        };
+        let dataspace = Dataspace {
+            space_type: DataspaceType::Scalar,
+            rank: 0,
+            dimensions: vec![],
+            max_dimensions: None,
+        };
+        let cache = ChunkCache::new();
+        let out = read_chunked_rows_from_source(
+            &BytesSource::new(b""),
+            &layout,
+            &dataspace,
+            &make_f64_type(),
+            None,
+            8,
+            8,
+            &cache,
+            0,
+            1,
+        )
+        .expect("rank-0 chunked must not panic");
+        assert!(
+            out.is_none(),
+            "rank-0 chunked should fall back to the whole reader"
+        );
+    }
+
+    /// Inner dimensions whose product overflows `usize` must error rather than
+    /// panic (debug) or wrap (release). `(2^22)^3` overflows 64-bit `usize`;
+    /// `(2^22)^2` already overflows 32-bit, so this holds on both.
+    #[test]
+    fn windowed_rows_inner_dim_product_overflow_errors() {
+        let big: u32 = 1 << 22;
+        let layout = DataLayout::Chunked {
+            chunk_dimensions: vec![1, big, big, big, 8],
+            btree_address: Some(0),
+            version: 3,
+            chunk_index_type: None,
+            single_chunk_filtered_size: None,
+            single_chunk_filter_mask: None,
+        };
+        let dataspace = Dataspace {
+            space_type: DataspaceType::Simple,
+            rank: 4,
+            dimensions: vec![1, big.into(), big.into(), big.into()],
+            max_dimensions: None,
+        };
+        let cache = ChunkCache::new();
+        let err = read_chunked_rows_from_source(
+            &BytesSource::new(b""),
+            &layout,
+            &dataspace,
+            &make_f64_type(),
+            None,
+            8,
+            8,
+            &cache,
+            0,
+            1,
+        )
+        .expect_err("overflowing inner-dim product must error");
+        assert!(
+            matches!(err, FormatError::OffsetOverflow { .. }),
+            "expected OffsetOverflow, got {err:?}"
+        );
+    }
+
+    /// An unallocated chunk index (`btree_address == None`, e.g. a late-allocated
+    /// never-written dataset) must error for a non-empty window, matching the
+    /// whole-dataset reader, instead of fabricating a window of zeros; an empty
+    /// (zero-row) window still succeeds.
+    #[test]
+    fn windowed_rows_unallocated_index_matches_whole_read() {
+        let layout = DataLayout::Chunked {
+            chunk_dimensions: vec![4, 8],
+            btree_address: None,
+            version: 3,
+            chunk_index_type: None,
+            single_chunk_filtered_size: None,
+            single_chunk_filter_mask: None,
+        };
+        let dataspace = Dataspace {
+            space_type: DataspaceType::Simple,
+            rank: 1,
+            dimensions: vec![10],
+            max_dimensions: None,
+        };
+        let cache = ChunkCache::new();
+        let err = read_chunked_rows_from_source(
+            &BytesSource::new(b""),
+            &layout,
+            &dataspace,
+            &make_f64_type(),
+            None,
+            8,
+            8,
+            &cache,
+            0,
+            4,
+        )
+        .expect_err("non-empty window over an unallocated index must error");
+        assert!(
+            matches!(err, FormatError::ChunkedReadError(_)),
+            "expected ChunkedReadError, got {err:?}"
+        );
+        let empty = read_chunked_rows_from_source(
+            &BytesSource::new(b""),
+            &layout,
+            &dataspace,
+            &make_f64_type(),
+            None,
+            8,
+            8,
+            &cache,
+            0,
+            0,
+        )
+        .expect("empty window must still be Ok");
+        assert_eq!(empty, Some(Vec::new()));
     }
 }

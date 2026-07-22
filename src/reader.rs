@@ -1097,15 +1097,16 @@ impl FileInner {
     ) -> Result<Vec<u8>, FormatError> {
         let (os, ls) = (self.offset_size(), self.length_size());
         let elem_size = dt.type_size() as usize;
-        // Elements per row (product of inner dims; 1 when 0-D or 1-D).
-        let row_elems: usize = ds
-            .dimensions
-            .iter()
-            .skip(1)
-            .map(|&d| d.to_usize())
-            .collect::<Result<Vec<_>, _>>()?
-            .iter()
-            .product();
+        // Elements per row (product of inner dims; 1 when 0-D or 1-D). Checked so
+        // a crafted dataspace whose inner dims overflow `usize` errors instead of
+        // panicking (debug) or wrapping (release).
+        let row_elems: usize = ds.dimensions.iter().skip(1).try_fold(1usize, |acc, &d| {
+            acc.checked_mul(d.to_usize()?)
+                .ok_or(FormatError::OffsetOverflow {
+                    offset: acc as u64,
+                    length: d,
+                })
+        })?;
         let row_bytes = row_elems
             .checked_mul(elem_size)
             .ok_or(FormatError::OffsetOverflow {
