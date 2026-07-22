@@ -184,7 +184,9 @@ use crate::filter_pipeline::{
 };
 use crate::filters::{ChunkContext, compress_chunk, decompress_chunk};
 use crate::free_space::FreeList;
-use crate::free_space_manager::{self, FreeSection, FsmHeader, fshd_len, serialize_file_fsm};
+use crate::free_space_manager::{
+    self, FreeSection, FsmHeader, SECT_CLASS_SIMPLE, fshd_len, serialize_file_fsm,
+};
 use crate::group_v2::resolve_group_entries;
 use crate::link_message::{LinkMessage, LinkTarget};
 use crate::message_type::MessageType;
@@ -2411,7 +2413,8 @@ impl WriteEngine {
                 ext_len,
                 "extension length must be stable across the placeholder and real messages"
             );
-            let (fshd, fsse) = serialize_file_fsm(&sections, fshd_addr, fsse_addr, os);
+            let (fshd, fsse) =
+                serialize_file_fsm(&sections, fshd_addr, fsse_addr, os, SECT_CLASS_SIMPLE);
             let final_eof = fsse_addr + fsse.len() as u64;
             (ext_oh, Some((fshd, fsse)), final_eof)
         };

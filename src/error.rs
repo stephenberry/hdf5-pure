@@ -57,6 +57,9 @@ pub enum FormatError {
     InvalidFileSpaceStrategy(u8),
     /// Unsupported File Space Info message version (only version 1 is handled).
     UnsupportedFileSpaceInfoVersion(u8),
+    /// A paged file-space strategy was requested with a page size the writer
+    /// cannot use: it must be a power of two of at least 512 bytes.
+    InvalidFileSpacePageSize(u64),
     /// A free-space manager block (`FSHD`/`FSSE`) is malformed.
     InvalidFreeSpaceManager,
     /// A compound datatype has a zero total size.
@@ -370,6 +373,12 @@ impl fmt::Display for FormatError {
             }
             FormatError::UnsupportedFileSpaceInfoVersion(v) => {
                 write!(f, "unsupported File Space Info message version: {v}")
+            }
+            FormatError::InvalidFileSpacePageSize(p) => {
+                write!(
+                    f,
+                    "invalid file-space page size {p}: must be a power of two >= 512"
+                )
             }
             FormatError::InvalidFreeSpaceManager => {
                 write!(f, "malformed free-space manager block (FSHD/FSSE)")

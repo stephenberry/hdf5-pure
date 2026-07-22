@@ -23,7 +23,10 @@ use crate::convert::TryToUsize;
 use crate::dataspace::{Dataspace, DataspaceType};
 use crate::error::FormatError;
 use crate::file_space_info::{
-    DEFAULT_PAGE_SIZE, DEFAULT_THRESHOLD, FileSpaceInfo, FileSpaceStrategy,
+    DEFAULT_PAGE_SIZE, DEFAULT_THRESHOLD, FileSpaceInfo, FileSpaceStrategy, NUM_FILE_FSM_MANAGERS,
+};
+use crate::free_space_manager::{
+    FreeSection, SECT_CLASS_LARGE, SECT_CLASS_SMALL, fshd_len, fsse_len, serialize_file_fsm,
 };
 use crate::libver::LibVer;
 use crate::link_message::{LinkMessage, LinkTarget};
@@ -47,6 +50,12 @@ const SUPERBLOCK_SIZE: usize = 48;
 
 /// Threshold for switching from compact (inline) to dense attribute storage.
 const DENSE_ATTR_THRESHOLD: usize = 8;
+
+/// Round `value` up to the next multiple of `page` (a power of two). Used by the
+/// paged file-space writer to page-align region starts and the end-of-allocation.
+fn align_up(value: u64, page: u64) -> u64 {
+    value.div_ceil(page) * page
+}
 
 // ---- OH builders ----
 
@@ -639,6 +648,28 @@ impl FileWriter {
     /// from its provider one chunk at a time here, never all held at once.
     pub(crate) fn finish_to_sink<S: ByteSink>(self, sink: &mut S) -> Result<(), FormatError> {
         self.check_libver_bounds()?;
+
+        // Genuine paged allocation: page-align every allocation and, when
+        // persisting, emit per-page-type free-space managers. Gated entirely on
+        // the Page strategy so every other strategy keeps its exact byte layout.
+        let (paged, persist_paged, page_size, fs_threshold) = match self.file_space_strategy {
+            Some((FileSpaceStrategy::Page, persist, threshold)) => {
+                let ps = self.file_space_page_size.unwrap_or(DEFAULT_PAGE_SIZE);
+                if ps < 512 || !ps.is_power_of_two() {
+                    return Err(FormatError::InvalidFileSpacePageSize(ps));
+                }
+                // File-space pages are measured from the file base; the layout
+                // below is base-relative, so base-relative boundaries coincide
+                // with absolute ones only when the userblock is a whole number of
+                // pages (zero trivially qualifies).
+                if self.userblock_size % ps != 0 {
+                    return Err(FormatError::InvalidFileSpacePageSize(ps));
+                }
+                (true, persist, ps, threshold)
+            }
+            _ => (false, false, 0, DEFAULT_THRESHOLD),
+        };
+
         // The superblock-extension header (carrying a File Space Info message)
         // is independent of the file layout, so build it up front and place it
         // after all other content below.
@@ -678,6 +709,27 @@ impl FileWriter {
                 match self {
                     DsData::InMemory(v) => v.len() as u64,
                     DsData::Streamed(plan) => plan.total_len,
+                }
+            }
+        }
+
+        /// Emit one dataset's data region: in-memory bytes directly, or a
+        /// streamed verbatim plan pulled from its raw-chunk provider one chunk at
+        /// a time (so a streamed dataset's bytes never all reside in memory).
+        fn emit_ds_data<Sk: ByteSink>(
+            sink: &mut Sk,
+            data: &DsData,
+            raw_chunks: Option<&crate::type_builders::RawChunkPayload>,
+        ) -> Result<(), FormatError> {
+            match data {
+                DsData::InMemory(bytes) => sink.put(bytes),
+                DsData::Streamed(plan) => {
+                    let provider = raw_chunks
+                        .expect("a streamed data region implies a raw-chunk payload")
+                        .provider
+                        .0
+                        .as_ref();
+                    emit_chunked_data_verbatim(sink, plan, provider)
                 }
             }
         }
@@ -1044,6 +1096,12 @@ impl FileWriter {
         // function of chunk count/size, not of the (dummy) base address. For a
         // streamed (lazy) dataset this touches no chunk bytes at all.
         let mut actual_ds_oh_sizes: Vec<usize> = Vec::with_capacity(all_ds.len());
+        // Each dataset's data-region byte length, captured here (where chunked
+        // data is already built once for OH sizing) so the paged layout can
+        // classify small vs large allocations and size its free-space managers
+        // without a second build. A chunked data length is base-address
+        // independent, so the dummy-base build gives the true length.
+        let mut ds_data_lens: Vec<u64> = Vec::with_capacity(all_ds.len());
         let mut dummy_cursor = 0u64;
         for (i, d) in all_ds.iter().enumerate() {
             let dense_blob = if ds_dense[i] {
@@ -1054,6 +1112,7 @@ impl FileWriter {
             let oh = if is_chunked[i] {
                 let built = build_chunked(d, dummy_cursor, chunk_sets[i].as_ref())?;
                 dummy_cursor += built.data.len();
+                ds_data_lens.push(built.data.len());
                 build_chunked_dataset_oh(
                     &d.dt,
                     &d.ds,
@@ -1064,6 +1123,7 @@ impl FileWriter {
                     d.fill.as_deref(),
                 )
             } else {
+                ds_data_lens.push(d.raw.len() as u64);
                 build_dataset_oh(
                     &d.dt,
                     &d.ds,
@@ -1211,6 +1271,474 @@ impl FileWriter {
             data_addr: u64,
             chunked_msgs: Option<(Vec<u8>, Option<Vec<u8>>)>,
         }
+
+        // ---- Paged file-space layout + emission ----
+        // Lay the metadata (object headers, dense blobs, global heaps, the
+        // superblock extension, and the free-space-manager blocks) into a
+        // page-0+ metadata region, then start the raw data on a fresh page
+        // boundary. Small (< page) raw data packs into its own page run; each
+        // large (>= page) block gets its own page-aligned run. Every region's
+        // page tail is tracked in a per-page-type free-space manager (SUPER for
+        // metadata, DRAW for small raw, generic-large for large fragments) when
+        // persisting. Emission is address-driven: gaps are zero-filled so the
+        // physical file reaches the page-aligned end-of-allocation.
+        if paged {
+            let os = OFFSET_SIZE;
+            let base = ub as u64;
+            let mut meta = cursor2 as u64; // metadata cursor, base-relative
+
+            // (a) Global-heap collections live in the metadata region. Assign
+            // their addresses and patch attribute VL references now; dataset
+            // element references are patched after their data is built below.
+            let gcol_start = meta;
+            let mut gcol_cursor = meta;
+            let mut elem_gcol: Vec<(usize, u64)> = Vec::new();
+            {
+                for patch in &vl_root {
+                    patch_vl_refs(&mut root_attrs[patch.attr_index].raw_data, gcol_cursor);
+                    gcol_cursor += patch.collection_bytes.len() as u64;
+                }
+                for (gi, patches) in grp_vl.iter().enumerate() {
+                    for patch in patches {
+                        patch_vl_refs(
+                            &mut groups[gi].attrs[patch.attr_index].raw_data,
+                            gcol_cursor,
+                        );
+                        gcol_cursor += patch.collection_bytes.len() as u64;
+                    }
+                }
+                for (di, patches) in ds_vl.iter().enumerate() {
+                    for patch in patches {
+                        patch_vl_refs(
+                            &mut all_ds[di].attrs[patch.attr_index].raw_data,
+                            gcol_cursor,
+                        );
+                        gcol_cursor += patch.collection_bytes.len() as u64;
+                    }
+                }
+                for (i, d) in all_ds.iter().enumerate() {
+                    if let Some(staging) = &d.vl_string_staging {
+                        elem_gcol.push((i, gcol_cursor));
+                        gcol_cursor += staging.collection_bytes.len() as u64;
+                    }
+                }
+            }
+            let gcol_total_size = gcol_cursor - gcol_start;
+            meta += gcol_total_size;
+
+            // (b) Superblock extension (File Space Info) in the metadata region.
+            let ext_addr = meta;
+            let ext_len = ext_oh.as_ref().map_or(0, |b| b.len()) as u64;
+            meta += ext_len;
+            let meta_content_end = meta;
+
+            // (c) Classify each dataset's data region by length. Contiguous empty
+            // data is unallocated (undefined address); a chunked region always
+            // has index bytes, so it is never "empty".
+            let mut empty_indices: Vec<usize> = Vec::new();
+            let mut small_indices: Vec<usize> = Vec::new();
+            let mut large_indices: Vec<usize> = Vec::new();
+            for i in 0..all_ds.len() {
+                let len = ds_data_lens[i];
+                if !is_chunked[i] && len == 0 {
+                    empty_indices.push(i);
+                } else if len < page_size {
+                    small_indices.push(i);
+                } else {
+                    large_indices.push(i);
+                }
+            }
+            let small_raw_total: u64 = small_indices.iter().map(|&i| ds_data_lens[i]).sum();
+            let large_frag_sizes: Vec<u64> = large_indices
+                .iter()
+                .map(|&i| align_up(ds_data_lens[i], page_size) - ds_data_lens[i])
+                .filter(|&f| f > 0)
+                .collect();
+
+            // (d) Which per-page-type managers are active, and place their
+            // FSHD/FSSE blocks in the metadata region (persisting only). Block
+            // lengths depend only on section counts (fixed field widths), so the
+            // page tails are computed in a single forward pass with no iteration.
+            let draw_active =
+                small_raw_total > 0 && align_up(small_raw_total, page_size) != small_raw_total;
+            let large_active = !large_frag_sizes.is_empty();
+            let mut slots = [u64::MAX; NUM_FILE_FSM_MANAGERS];
+            let mut super_fsm: Option<(u64, u64)> = None;
+            let mut draw_fsm: Option<(u64, u64)> = None;
+            let mut large_fsm: Option<(u64, u64)> = None;
+            let super_block_len = fshd_len(os) + fsse_len(&[0], os);
+            let draw_block_len = if draw_active {
+                fshd_len(os) + fsse_len(&[0], os)
+            } else {
+                0
+            };
+            let large_block_len = if large_active {
+                fshd_len(os) + fsse_len(&large_frag_sizes, os)
+            } else {
+                0
+            };
+            // SUPER tracks the metadata page tail. Placing its own block shifts
+            // that tail, so only keep SUPER when a tail actually remains; in the
+            // (astronomically rare) exact-fill case, drop it and leave the tiny
+            // tail untracked. This decision is O(1), not a fixpoint.
+            let super_active = if persist_paged {
+                let with = meta_content_end + super_block_len + draw_block_len + large_block_len;
+                align_up(with, page_size) > with
+            } else {
+                false
+            };
+            if persist_paged {
+                if super_active {
+                    let fshd_addr = meta;
+                    meta += fshd_len(os);
+                    let fsse_addr = meta;
+                    meta += fsse_len(&[0], os);
+                    slots[0] = fshd_addr;
+                    super_fsm = Some((fshd_addr, fsse_addr));
+                }
+                if draw_active {
+                    let fshd_addr = meta;
+                    meta += fshd_len(os);
+                    let fsse_addr = meta;
+                    meta += fsse_len(&[0], os);
+                    slots[2] = fshd_addr;
+                    draw_fsm = Some((fshd_addr, fsse_addr));
+                }
+                if large_active {
+                    let fshd_addr = meta;
+                    meta += fshd_len(os);
+                    let fsse_addr = meta;
+                    meta += fsse_len(&large_frag_sizes, os);
+                    slots[6] = fshd_addr;
+                    large_fsm = Some((fshd_addr, fsse_addr));
+                }
+            }
+            let meta_end = meta;
+
+            // (e) The raw-data region starts on a fresh page boundary. The
+            // metadata page tail is the SUPER section (when active).
+            let raw_start = align_up(meta_end, page_size);
+            let super_section = super_fsm.map(|_| FreeSection {
+                addr: meta_end,
+                size: raw_start - meta_end,
+            });
+
+            // (f) Build the raw data. Small blocks pack; the region is padded to
+            // a page boundary (DRAW tail). Each large block starts a fresh page
+            // run and its sub-page remainder becomes a generic-large section.
+            let mut layouts: Vec<Option<DsLayout>> = (0..all_ds.len()).map(|_| None).collect();
+            for &i in &empty_indices {
+                let raw = core::mem::take(&mut all_ds[i].raw);
+                layouts[i] = Some(DsLayout {
+                    data: DsData::InMemory(raw),
+                    data_addr: u64::MAX,
+                    chunked_msgs: None,
+                });
+            }
+            let mut c = raw_start;
+            for &i in &small_indices {
+                let base_addr = c;
+                let layout = if is_chunked[i] {
+                    let built = build_chunked(&all_ds[i], base_addr, chunk_sets[i].as_ref())?;
+                    // The small/large classification and the free-space-manager
+                    // sizing used the sizing-pass length (`ds_data_lens[i]`); the
+                    // real build must match it, or the reserved manager space and
+                    // the emitted layout would diverge (chunk-index byte length is
+                    // base-address independent, so this always holds).
+                    debug_assert_eq!(built.data.len(), ds_data_lens[i]);
+                    c += built.data.len();
+                    DsLayout {
+                        data: built.data,
+                        data_addr: base_addr,
+                        chunked_msgs: Some((built.layout_message, built.pipeline_message)),
+                    }
+                } else {
+                    let raw = core::mem::take(&mut all_ds[i].raw);
+                    c += raw.len() as u64;
+                    DsLayout {
+                        data: DsData::InMemory(raw),
+                        data_addr: base_addr,
+                        chunked_msgs: None,
+                    }
+                };
+                layouts[i] = Some(layout);
+            }
+            let small_raw_end = c;
+            let draw_section = if draw_active {
+                let padded = align_up(small_raw_end, page_size);
+                c = padded;
+                Some(FreeSection {
+                    addr: small_raw_end,
+                    size: padded - small_raw_end,
+                })
+            } else {
+                if small_raw_total > 0 {
+                    c = align_up(small_raw_end, page_size);
+                }
+                None
+            };
+            let mut large_sections: Vec<FreeSection> = Vec::new();
+            for &i in &large_indices {
+                c = align_up(c, page_size);
+                let data_addr = c;
+                let built_len;
+                let layout = if is_chunked[i] {
+                    let built = build_chunked(&all_ds[i], data_addr, chunk_sets[i].as_ref())?;
+                    // See the small-run note: the real build length must equal the
+                    // sizing-pass length the large classification/fragment used.
+                    debug_assert_eq!(built.data.len(), ds_data_lens[i]);
+                    built_len = built.data.len();
+                    DsLayout {
+                        data: built.data,
+                        data_addr,
+                        chunked_msgs: Some((built.layout_message, built.pipeline_message)),
+                    }
+                } else {
+                    let raw = core::mem::take(&mut all_ds[i].raw);
+                    built_len = raw.len() as u64;
+                    DsLayout {
+                        data: DsData::InMemory(raw),
+                        data_addr,
+                        chunked_msgs: None,
+                    }
+                };
+                layouts[i] = Some(layout);
+                let data_end = data_addr + built_len;
+                let frag = align_up(data_end, page_size) - data_end;
+                if frag > 0 {
+                    large_sections.push(FreeSection {
+                        addr: data_end,
+                        size: frag,
+                    });
+                }
+                c = align_up(data_end, page_size);
+            }
+            let eoa_rel = c; // already page-aligned
+            let eof_addr2 = base + eoa_rel;
+            let eoa_pre_fsm = eoa_rel;
+
+            // (g) Now that the element bytes exist, patch dataset-element VL refs.
+            for (i, gaddr) in &elem_gcol {
+                let staging = all_ds[*i]
+                    .vl_string_staging
+                    .as_ref()
+                    .expect("elem_gcol only holds datasets with VL staging");
+                let Some(DsLayout {
+                    data: DsData::InMemory(bytes),
+                    ..
+                }) = layouts[*i].as_mut()
+                else {
+                    unreachable!(
+                        "a staged VL-string dataset is non-chunked, so its data is in memory"
+                    )
+                };
+                patch_vl_refs_masked(bytes, &staging.patch_mask, *gaddr);
+            }
+
+            let ds_layouts: Vec<DsLayout> = layouts
+                .into_iter()
+                .map(|o| o.expect("every dataset placed"))
+                .collect();
+
+            // (h) Build dataset OHs from the final data addresses.
+            let mut ds_oh_bytes: Vec<Vec<u8>> = Vec::with_capacity(all_ds.len());
+            for (i, d) in all_ds.iter().enumerate() {
+                let layout = &ds_layouts[i];
+                let oh = if let Some((ref lm, ref pm)) = layout.chunked_msgs {
+                    build_chunked_dataset_oh(
+                        &d.dt,
+                        &d.ds,
+                        lm,
+                        pm.as_deref(),
+                        &d.attrs,
+                        ds_dense_blobs[i].as_ref(),
+                        d.fill.as_deref(),
+                    )
+                } else {
+                    build_dataset_oh(
+                        &d.dt,
+                        &d.ds,
+                        layout.data_addr,
+                        layout.data.len(),
+                        &d.attrs,
+                        ds_dense_blobs[i].as_ref(),
+                        d.fill.as_deref(),
+                    )
+                };
+                ds_oh_bytes.push(oh);
+            }
+            debug_assert_eq!(
+                ds_oh_bytes.iter().map(|b| b.len()).collect::<Vec<_>>(),
+                actual_ds_oh_sizes
+            );
+
+            // (i) Rebuild the real superblock-extension header. For persisting
+            // files this replaces the placeholder (empty-manager) message with
+            // the per-page-type manager addresses; its length is unchanged.
+            let real_ext_oh = if persist_paged {
+                let info = FileSpaceInfo::persistent_managers(
+                    FileSpaceStrategy::Page,
+                    fs_threshold,
+                    page_size,
+                    slots,
+                    eoa_pre_fsm,
+                );
+                let mut oh = ObjectHeaderWriter::new();
+                oh.add_message_with_flags(MessageType::FileSpaceInfo, info.serialize(), 0x14);
+                oh.serialize()
+            } else {
+                ext_oh
+                    .clone()
+                    .expect("a paged file always emits a File Space Info message")
+            };
+            debug_assert_eq!(real_ext_oh.len() as u64, ext_len);
+
+            // (j) Serialize the free-space-manager blocks.
+            let super_blocks = super_fsm.map(|(fshd_addr, fsse_addr)| {
+                serialize_file_fsm(
+                    &[super_section.expect("SUPER active implies a section")],
+                    fshd_addr,
+                    fsse_addr,
+                    os,
+                    SECT_CLASS_SMALL,
+                )
+            });
+            let draw_blocks = draw_fsm.map(|(fshd_addr, fsse_addr)| {
+                serialize_file_fsm(
+                    &[draw_section.expect("DRAW active implies a section")],
+                    fshd_addr,
+                    fsse_addr,
+                    os,
+                    SECT_CLASS_SMALL,
+                )
+            });
+            let large_blocks = large_fsm.map(|(fshd_addr, fsse_addr)| {
+                serialize_file_fsm(&large_sections, fshd_addr, fsse_addr, os, SECT_CLASS_LARGE)
+            });
+
+            // (k) Emit, address-ascending, zero-filling every alignment gap.
+            sink.reserve(eof_addr2.to_usize()?);
+            if ub > 0 {
+                sink.put_zeros(ub)?;
+            }
+            let sb = Superblock {
+                version: 3,
+                offset_size: OFFSET_SIZE,
+                length_size: LENGTH_SIZE,
+                base_address: base,
+                eof_address: eof_addr2,
+                root_group_address: root_group_addr,
+                group_leaf_node_k: None,
+                group_internal_node_k: None,
+                indexed_storage_internal_node_k: None,
+                free_space_address: None,
+                driver_info_address: None,
+                consistency_flags: 0,
+                superblock_extension_address: Some(ext_addr),
+                checksum: None,
+            };
+            sink.put(&sb.serialize())?;
+
+            // Root group OH + dense blob.
+            let root_links: Vec<LinkMessage> = {
+                let mut v = Vec::new();
+                for &i in &root_ds_indices {
+                    v.push(make_link(&all_ds[i].name, ds_oh_addrs2[i]));
+                }
+                for &gi in &root_group_indices {
+                    v.push(make_link(&groups[gi].name, group_addrs2[gi]));
+                }
+                v
+            };
+            sink.put(&build_group_oh(
+                &root_links,
+                &root_attrs,
+                root_dense_blob.as_ref(),
+            ))?;
+            if let Some(ref blob) = root_dense_blob {
+                sink.put(&blob.blob)?;
+            }
+            // Group OHs + dense blobs.
+            for (gi, g) in groups.iter().enumerate() {
+                let mut links: Vec<LinkMessage> = g
+                    .ds_indices
+                    .iter()
+                    .map(|&i| make_link(&all_ds[i].name, ds_oh_addrs2[i]))
+                    .collect();
+                for &sgi in &g.sub_group_indices {
+                    links.push(make_link(&groups[sgi].name, group_addrs2[sgi]));
+                }
+                sink.put(&build_group_oh(
+                    &links,
+                    &g.attrs,
+                    group_dense_blobs[gi].as_ref(),
+                ))?;
+                if let Some(ref blob) = group_dense_blobs[gi] {
+                    sink.put(&blob.blob)?;
+                }
+            }
+            // Dataset OHs + dense blobs.
+            for (i, oh) in ds_oh_bytes.iter().enumerate() {
+                sink.put(oh)?;
+                if let Some(ref dense) = ds_dense_blobs[i] {
+                    sink.put(&dense.blob)?;
+                }
+            }
+            // Global heap collections.
+            for patch in &vl_root {
+                sink.put(&patch.collection_bytes)?;
+            }
+            for patches in &grp_vl {
+                for patch in patches {
+                    sink.put(&patch.collection_bytes)?;
+                }
+            }
+            for patches in &ds_vl {
+                for patch in patches {
+                    sink.put(&patch.collection_bytes)?;
+                }
+            }
+            for d in &all_ds {
+                if let Some(staging) = &d.vl_string_staging {
+                    sink.put(&staging.collection_bytes)?;
+                }
+            }
+            debug_assert_eq!(sink.position(), base + ext_addr);
+            sink.put(&real_ext_oh)?;
+            // Free-space-manager blocks (SUPER, DRAW, generic-large), ascending.
+            for blocks in [&super_blocks, &draw_blocks, &large_blocks]
+                .into_iter()
+                .flatten()
+            {
+                sink.put(&blocks.0)?;
+                sink.put(&blocks.1)?;
+            }
+            debug_assert_eq!(sink.position(), base + meta_end);
+
+            // Raw data region: metadata page tail, then small data, DRAW tail,
+            // large runs (with their fragments), padded to the page-aligned EOA.
+            sink.put_zeros((raw_start - meta_end).to_usize()?)?;
+            for &i in &small_indices {
+                debug_assert_eq!(sink.position(), base + ds_layouts[i].data_addr);
+                emit_ds_data(sink, &ds_layouts[i].data, all_ds[i].raw_chunks.as_ref())?;
+            }
+            if small_raw_total > 0 {
+                sink.put_zeros((align_up(small_raw_end, page_size) - small_raw_end).to_usize()?)?;
+            }
+            for &i in &large_indices {
+                let data_addr = ds_layouts[i].data_addr;
+                let gap = (base + data_addr) - sink.position();
+                sink.put_zeros(gap.to_usize()?)?;
+                emit_ds_data(sink, &ds_layouts[i].data, all_ds[i].raw_chunks.as_ref())?;
+                let end_rel = sink.position() - base;
+                sink.put_zeros((align_up(end_rel, page_size) - end_rel).to_usize()?)?;
+            }
+            let final_pad = eof_addr2 - sink.position();
+            sink.put_zeros(final_pad.to_usize()?)?;
+            debug_assert_eq!(sink.position(), eof_addr2);
+            return Ok(());
+        }
+
         let mut ds_layouts: Vec<DsLayout> = Vec::new();
         for (i, d) in all_ds.iter_mut().enumerate() {
             if is_chunked[i] {
@@ -1429,16 +1957,7 @@ impl FileWriter {
         // in-memory bytes; a streamed (lazy) chunked dataset pulls each chunk
         // from its provider one at a time, so its bytes never all reside here.
         for (i, layout) in ds_layouts.iter().enumerate() {
-            match &layout.data {
-                DsData::InMemory(bytes) => sink.put(bytes)?,
-                DsData::Streamed(plan) => {
-                    let provider = match all_ds[i].raw_chunks.as_ref() {
-                        Some(rc) => rc.provider.0.as_ref(),
-                        None => unreachable!("a streamed data region implies a raw-chunk payload"),
-                    };
-                    emit_chunked_data_verbatim(sink, plan, provider)?;
-                }
-            }
+            emit_ds_data(sink, &layout.data, all_ds[i].raw_chunks.as_ref())?;
         }
 
         // Global heap collections

@@ -31,7 +31,7 @@ use crate::file_lock::{self, FileLocking};
 use crate::file_space_info::{FileSpaceInfo, FileSpaceStrategy};
 use crate::free_space::FreeList;
 use crate::free_space_manager::{
-    FreeSection, fshd_len, read_persisted_sections_source, serialize_file_fsm,
+    FreeSection, SECT_CLASS_SIMPLE, fshd_len, read_persisted_sections_source, serialize_file_fsm,
 };
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
@@ -210,7 +210,8 @@ impl BoundedStore {
                 ext_len,
                 "extension length must be stable across the placeholder and real messages"
             );
-            let (fshd, fsse) = serialize_file_fsm(sections, fshd_addr, fsse_addr, os);
+            let (fshd, fsse) =
+                serialize_file_fsm(sections, fshd_addr, fsse_addr, os, SECT_CLASS_SIMPLE);
             let final_eof = fsse_addr + fsse.len() as u64;
             (ext_oh, Some((fshd, fsse)), final_eof)
         };
