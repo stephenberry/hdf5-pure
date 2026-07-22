@@ -21,9 +21,15 @@ unsafe extern "C" {
     fn H5Fget_freespace(file_id: i64) -> i64;
 }
 
-// Serialize the raw FFI call above (which bypasses `hdf5-metno`'s internal lock)
-// against every other C-library call in this file; libhdf5 is not built
-// thread-safe here. Poisoning is ignored so one test's panic does not cascade.
+// libhdf5 is not built thread-safe here. `hdf5-metno` serializes its own calls
+// through a private global lock, but the raw `H5Fget_freespace` FFI above bypasses
+// it, so that raw call can race a `hdf5-metno` operation running on another test
+// thread and crash the C library. To prevent it, EVERY test that touches the C
+// library takes this guard as its first line and holds it for the whole body, so
+// no two tests ever run C-library code at once (matching `file_space_crosscheck`).
+// A new test that calls into `hdf5::…` without the guard reintroduces the race —
+// it surfaces as an intermittent SIGSEGV, typically only on CI. Poisoning is
+// ignored so one test's panic does not cascade.
 static C_LIB: Mutex<()> = Mutex::new(());
 
 fn c_lib_guard() -> MutexGuard<'static, ()> {
@@ -81,6 +87,7 @@ fn pure_create(path: &std::path::Path, n: i32, chunk: u64, deflate: bool) {
 
 #[test]
 fn bounded_append_to_c_dataset_both_read() {
+    let _c = c_lib_guard();
     let dir = tempdir().unwrap();
     let path = dir.path().join("c.h5");
     c_create_unlimited(&path, "d", 8, 4);
@@ -99,6 +106,7 @@ fn bounded_append_to_c_dataset_both_read() {
 
 #[test]
 fn bounded_filtered_append_reads_back_in_c() {
+    let _c = c_lib_guard();
     let dir = tempdir().unwrap();
     let path = dir.path().join("filtered.h5");
     pure_create(&path, 8, 4, true);
@@ -117,6 +125,7 @@ fn bounded_filtered_append_reads_back_in_c() {
 
 #[test]
 fn bounded_batched_large_append_reads_back_in_c() {
+    let _c = c_lib_guard();
     let dir = tempdir().unwrap();
     let path = dir.path().join("large.h5");
     pure_create(&path, 3, 256, false);
@@ -241,6 +250,7 @@ fn vlen_strings_read_on_bounded_and_mirror_files() {
     use hdf5::types::VarLenUnicode;
     use std::str::FromStr;
 
+    let _c = c_lib_guard();
     let dir = tempdir().unwrap();
     let path = dir.path().join("vlen.h5");
     let words = ["alpha", "beta", "", "δelta"];
