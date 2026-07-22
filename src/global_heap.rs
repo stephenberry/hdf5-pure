@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
-use crate::source::FileSource;
+use crate::source::Source;
 
 /// Magic signature for global heap collections.
 const GCOL_SIGNATURE: [u8; 4] = *b"GCOL";
@@ -74,7 +74,7 @@ fn pad8_u64(x: u64) -> Result<u64, FormatError> {
 impl GlobalHeapIndex {
     /// Parse collection metadata from a random-access source without copying
     /// object payloads.
-    pub fn parse<S: FileSource + ?Sized>(
+    pub fn parse<S: Source + ?Sized>(
         source: &S,
         offset: u64,
         length_size: u8,
@@ -274,7 +274,7 @@ mod tests {
             raw_reads: Cell<usize>,
         }
 
-        impl FileSource for TrackingSource {
+        impl Source for TrackingSource {
             fn len(&self) -> u64 {
                 self.data.len() as u64
             }

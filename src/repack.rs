@@ -90,7 +90,7 @@ use crate::filter_pipeline::{
 };
 use crate::reader::{Dataset, File, Group};
 use crate::scaleoffset::{self, ScaleOffset};
-use crate::source::FileSource;
+use crate::source::Source;
 use crate::type_builders::{
     AttrValue, DatasetBuilder, FinishedGroup, GroupBuilder, ObjectRefTarget, VlStringElement,
 };

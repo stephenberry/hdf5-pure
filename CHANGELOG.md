@@ -6,13 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `Dataset::read_raw_rows` and the typed `read_f64_rows`/`read_f32_rows`/`read_i8_rows`/`read_i16_rows`/`read_i32_rows`/`read_i64_rows`/`read_u8_rows`/`read_u16_rows`/`read_u32_rows`/`read_u64_rows`/`read_string_rows` read a leading-dimension row window `[start, start + count)` without materializing the whole dataset, so a large dataset can be streamed a fixed number of rows at a time; inner-chunked and variable-length string windows fall back to a whole read sliced to the window ([#170](https://github.com/stephenberry/hdf5-pure/pull/170)).
+
+## [0.22.0] - 2026-07-22
+
+The owned-handle API lands ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)): `Dataset`, `Group`, and `Object` are now owned handles with no `<'f>` lifetime and `File` is cheaply cloneable, so a handle can be stored, cached, sent across threads, and outlive its `File`. A file opened with `File::open_rw` or `File::create` reads, appends, edits, and commits through those handles (`Dataset::append` is immediate and crash-atomic), with `File::open_swmr_writer` for lock-free SWMR appends and `File::open_rw_bounded` for reading and appending with memory bounded independent of file size. The legacy `EditSession`, `SwmrWriter`, and `AppendWriter` are deprecated in favor of it. Also new: filtered in-place append ([#144](https://github.com/stephenberry/hdf5-pure/issues/144)), layout/filter and live-space introspection ([#149](https://github.com/stephenberry/hdf5-pure/issues/149), [#150](https://github.com/stephenberry/hdf5-pure/issues/150)), and configurable fill values ([#151](https://github.com/stephenberry/hdf5-pure/issues/151)). **Breaking:** the handle lifetime is gone (drop `Dataset<'_>`), and `File::refresh` now reports outstanding handles at runtime with `Error::HandlesOutstanding`.
+
 ### Breaking
 
 - **Breaking:** `Dataset`, `Group`, and `Object` are now owned handles with no `<'f>` lifetime — `File::dataset`/`group`/`root` hand back handles that share ownership of the open file (internally `Arc`), so a handle can be stored in a struct, cached, sent across threads, and outlive the `File` value it came from, and `File` is now cheaply cloneable. Code that never named the handle lifetime is unaffected; code that wrote `Dataset<'_>` should drop the lifetime, and `File::refresh` now returns `Error::HandlesOutstanding` when a handle or `File` clone is still alive instead of enforcing it at compile time ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)).
 
 ### Added
 
-- `Dataset::read_raw_rows` and the typed `read_f64_rows`/`read_f32_rows`/`read_i8_rows`/`read_i16_rows`/`read_i32_rows`/`read_i64_rows`/`read_u8_rows`/`read_u16_rows`/`read_u32_rows`/`read_u64_rows`/`read_string_rows` read a **leading-dimension row window** `[start, start + count)` without materializing the whole dataset: compact and contiguous layouts do a single bounded sub-read, and chunked layouts decode only the chunks whose first-dimension span overlaps the window, so peak memory is bounded by the window (plus one chunk) rather than the dataset — a large dataset can be streamed a fixed number of rows at a time. The window is clamped to the dataset's leading dimension (reads past the end return only the rows that exist); an inner-chunked dataset transparently falls back to a whole-dataset read sliced to the window, and variable-length string windows likewise fall back to a slice since their payloads are not row-local.
+- `File::open_rw_bounded` (and `_with_options`) opens a file for reading and appending with **bounded memory** — no whole-file mirror: streaming-grade reads plus the same immediate, crash-atomic `Dataset::append` as `open_rw`, with large appends applied in whole-chunk batches so peak memory stays at the configured caches plus a few chunks regardless of file or call size. The staged edit surface returns the new `Error::BoundedStagedUnsupported` ([#147](https://github.com/stephenberry/hdf5-pure/issues/147)).
 - `File::open_rw` opens a file for reading **and** writing through owned handles, and `File::create` builds a new file the same way: `Dataset::append` grows a chunked, unlimited, Extensible-Array-indexed dataset in place (immediate and crash-atomic, reading back through the same handle), while `Dataset::write`/`set_attr`/`remove_attr`, `Group::create_dataset`/`create_group`/`delete`, and `File::copy` stage edits that `File::commit` applies as one transaction. A write on a read-only file returns `Error::ReadOnly` ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)).
 - The owned-handle write surface reaches parity with `EditSession`: `Dataset::append_staged` grows a dataset with a rebuilt index staged until `commit` — including the **filtered** and non-chunk-aligned appends the immediate `Dataset::append` refuses; `File::copy_from` stages a cross-file `H5Ocopy` from a buffered read-only file; `Group::set_attr`/`remove_attr` edit a group's (or the root's) compact attributes; `File::space_accounting` and `File::has_staged_edits` report live space use and whether a commit is pending; and `File::open_rw_with_locking` opens with an explicit `FileLocking` policy. `File::close` now seals the file, so a write through a surviving handle returns the new `Error::FileClosed` ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)).
 - `File::open_swmr_writer` opens a file for SWMR (single-writer/multiple-reader) appending through owned handles: it takes **no** OS lock (so concurrent readers, and Windows' mandatory locks, are never blocked) and raises the superblock's SWMR-write flag, cleared on `File::close`. Only immediate `Dataset::append` is allowed, over the unfiltered, chunk-aligned SWMR subset; the staged edit surface returns the new `Error::SwmrStagedUnsupported`, and `File::clear_swmr_flag` recovers a flag left set by a crashed writer ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)).
@@ -31,6 +39,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Reading through a `Dataset` handle after appending through that same handle no longer returns stale data: the append now invalidates the handle's cached chunk index, which previously still pointed at the relocated trailing chunk ([#147](https://github.com/stephenberry/hdf5-pure/issues/147)).
+- Variable-length string/sequence reads and `Dataset::chunks` introspection now work on read-write files (`File::open_rw` and the new bounded mode): these paths previously read the global heap through an empty byte view on the mirror backend and failed with an EOF error ([#147](https://github.com/stephenberry/hdf5-pure/issues/147)).
 - Reading an attribute or dataset whose dataspace declares dimensions whose product overflows `u64` no longer panics: the element count now saturates so the size and limit checks reject the file as a format error ([#142](https://github.com/stephenberry/hdf5-pure/issues/142)).
 - docs.rs now documents the full public API — the `ndarray`, `serde` (`mat`), `zfp`, `provenance`, and `parallel` surfaces, previously hidden by a default-features-only build — and repairs the broken rustdoc intra-doc links across the public API ([#154](https://github.com/stephenberry/hdf5-pure/pull/154)).
 
@@ -331,7 +341,9 @@ Internal robustness and tests ([#26](https://github.com/stephenberry/hdf5-pure/i
 - The MAT deserializer flattens 1×N and N×1 values to a 1-D sequence in `deserialize_any` (matching `deserialize_seq`).
 - Numeric/complex readers preserve 1×N / N×1 shape at the value layer; any flattening happens at the serde level.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.21.1...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.21.2...v0.22.0
+[0.21.2]: https://github.com/stephenberry/hdf5-pure/compare/v0.21.1...v0.21.2
 [0.21.1]: https://github.com/stephenberry/hdf5-pure/compare/v0.21.0...v0.21.1
 [0.21.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.20.1...v0.21.0
 [0.20.1]: https://github.com/stephenberry/hdf5-pure/compare/v0.20.0...v0.20.1

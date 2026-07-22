@@ -161,7 +161,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::checksum::jenkins_lookup3;
-use crate::chunk_index_inplace::{InPlaceBytes, Located, apply_ea_append, plan_ea_append};
+use crate::chunk_index_inplace::{Located, Store, apply_ea_append, plan_ea_append};
 use crate::chunked_read::{chunk_index_spans_buffered, enumerate_chunks_buffered, plan_dense_grid};
 use crate::chunked_write::{
     ChunkMeta, ChunkOptions, ChunkProvider, WrittenChunk, build_chunked_data_at_ext,
@@ -429,19 +429,20 @@ pub(crate) struct WriteEngine {
 /// the reference C library, h5py, and [`crate::SwmrWriter`].
 const SWMR_WRITE_FLAGS: u32 = 0x05;
 
-/// A dataset located once for [`EditSession::append_inplace`], then maintained
-/// across appends. Mirrors the append writer's per-dataset state.
-struct LocatedState {
-    loc: Located,
+/// A dataset located once for [`EditSession::append_inplace`] (or the bounded
+/// backend's immediate append), then maintained across appends. Mirrors the
+/// append writer's per-dataset state.
+pub(crate) struct LocatedState {
+    pub(crate) loc: Located,
     /// The dataset's on-disk element datatype (for the append type check and the
     /// filter chunk context).
-    datatype: Datatype,
+    pub(crate) datatype: Datatype,
     /// Spatial (rank-length) chunk dimensions in elements: `[chunk_elems]`.
-    spatial: Vec<u64>,
+    pub(crate) spatial: Vec<u64>,
     /// Bytes per element (datatype size).
-    element_size: usize,
+    pub(crate) element_size: usize,
     /// The re-encodable filter pipeline, when the dataset is filtered.
-    pipeline: Option<FilterPipeline>,
+    pub(crate) pipeline: Option<FilterPipeline>,
 }
 
 /// State for a file that persists its free space on disk. Carries the file's
@@ -1092,40 +1093,13 @@ impl WriteEngine {
                 superblock: &mut self.superblock,
                 sb_sig_off: self.sb_sig_off,
             };
-            let state = locate_dataset_state(&mirror, dataset)?;
+            let state = locate_dataset_state(&mirror, oh_addr)?;
             self.located.insert(oh_addr, state);
         }
 
         // Validate the appended bytes against the on-disk datatype.
         let raw = b.raw();
-        {
-            let st = &self.located[&oh_addr];
-            if raw.len() % st.element_size != 0 {
-                return Err(Error::AppendInPlaceUnsupported(
-                    "appended byte length is not a whole number of elements",
-                ));
-            }
-            match b.elem_dt() {
-                Some(expected) if *expected != st.datatype => {
-                    return Err(Error::AppendInPlaceUnsupported(
-                        "append datatype does not match the on-disk dataset (wrong element \
-                         type or byte order)",
-                    ));
-                }
-                Some(_) => {}
-                None => {
-                    if !datatype_is_raw_appendable(&st.datatype) {
-                        return Err(Error::AppendInPlaceUnsupported(
-                            "append_raw onto this dataset's datatype (non-little-endian, \
-                             variable-length, or reference) could misencode the bytes; use a \
-                             typed append",
-                        ));
-                    }
-                }
-            }
-        }
-
-        let new_elems = (raw.len() / self.located[&oh_addr].element_size) as u64;
+        let new_elems = validate_gathered_append(&self.located[&oh_addr], b)?;
         if new_elems == 0 {
             return Ok(());
         }
@@ -5102,7 +5076,7 @@ struct FlatDataset {
 /// lock and keep a divergent mirror). It borrows only the mirror-carrying fields,
 /// leaving [`EditSession::located`] independently borrowable. Its primitives write
 /// to disk *before* the mirror — the session's discipline, the opposite of the
-/// append/SWMR writers' mirror-before-disk order; the [`InPlaceBytes`] trait lets
+/// append/SWMR writers' mirror-before-disk order; the [`Store`] trait lets
 /// each owner keep its own failure-path discipline while sharing the checksummed
 /// slot/block mechanics.
 struct EditMirror<'a> {
@@ -5112,18 +5086,21 @@ struct EditMirror<'a> {
     sb_sig_off: usize,
 }
 
-impl InPlaceBytes for EditMirror<'_> {
-    fn data(&self) -> &[u8] {
-        &self.data[..]
+impl crate::source::Source for EditMirror<'_> {
+    fn len(&self) -> u64 {
+        self.data.len() as u64
     }
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), crate::error::FormatError> {
+        crate::source::BytesSource::new(&self.data[..]).read_at(offset, buf)
+    }
+}
+
+impl Store for EditMirror<'_> {
     fn offset_size(&self) -> u8 {
         self.superblock.offset_size
     }
     fn length_size(&self) -> u8 {
         self.superblock.length_size
-    }
-    fn superblock(&self) -> &Superblock {
-        &*self.superblock
     }
     fn append_bytes(&mut self, bytes: &[u8]) -> Result<u64, Error> {
         // Disk before mirror, so a failed write never leaves the mirror ahead of
@@ -5134,12 +5111,13 @@ impl InPlaceBytes for EditMirror<'_> {
         self.data.extend_from_slice(bytes);
         Ok(addr)
     }
-    fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), Error> {
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Error> {
         // Disk before mirror (see `append_bytes`).
         self.handle
-            .seek(SeekFrom::Start(offset as u64))
+            .seek(SeekFrom::Start(offset))
             .map_err(Error::Io)?;
         self.handle.write_all(bytes).map_err(Error::Io)?;
+        let offset = offset.to_usize()?;
         self.data[offset..offset + bytes.len()].copy_from_slice(bytes);
         Ok(())
     }
@@ -5152,7 +5130,7 @@ impl InPlaceBytes for EditMirror<'_> {
         let eof = self.data.len() as u64;
         self.superblock.eof_address = eof;
         let bytes = self.superblock.serialize();
-        self.write_at(self.sb_sig_off, &bytes)
+        self.write_at(self.sb_sig_off as u64, &bytes)
     }
     fn sync(&mut self) -> Result<(), Error> {
         self.handle.flush().map_err(Error::Io)?;
@@ -5172,31 +5150,74 @@ fn paths_overlap(a: &[String], b: &[String]) -> bool {
 /// handles the non-chunk-aligned filtered case, index-geometry limits, and
 /// platform-width limits that the engine reports this way. Genuine I/O and format
 /// errors pass through unchanged.
-fn as_inplace_error(e: Error) -> Error {
+pub(crate) fn as_inplace_error(e: Error) -> Error {
     match e {
         Error::AppendUnsupported(m) => Error::AppendInPlaceUnsupported(m),
         other => other,
     }
 }
 
-/// Locate `dataset` in `file` and build its [`LocatedState`], validating in-place
-/// append eligibility (rank-1 / unlimited / Extensible-Array indexed, a nonzero
-/// chunk length, and a re-encodable filter pipeline). Mirrors the append writer's
-/// `ensure_located`, reporting through [`Error::AppendInPlaceUnsupported`].
-fn locate_dataset_state<F: InPlaceBytes>(file: &F, dataset: &str) -> Result<LocatedState, Error> {
-    let result = Located::locate(file, dataset, Error::AppendInPlaceUnsupported)?;
+/// Validate a gathered append's bytes against a located dataset: the byte
+/// length must be a whole number of elements, and the element datatype must
+/// match the on-disk datatype (or, for a raw append, be raw-appendable).
+/// Returns the appended element count (`0` = nothing to do). Shared by
+/// [`WriteEngine::append_inplace`]'s path and the bounded backend's immediate
+/// append so the acceptance rules stay identical.
+pub(crate) fn validate_gathered_append(st: &LocatedState, b: &AppendBuilder) -> Result<u64, Error> {
+    let raw = b.raw();
+    if raw.len() % st.element_size != 0 {
+        return Err(Error::AppendInPlaceUnsupported(
+            "appended byte length is not a whole number of elements",
+        ));
+    }
+    match b.elem_dt() {
+        Some(expected) if *expected != st.datatype => {
+            return Err(Error::AppendInPlaceUnsupported(
+                "append datatype does not match the on-disk dataset (wrong element \
+                 type or byte order)",
+            ));
+        }
+        Some(_) => {}
+        None => {
+            if !datatype_is_raw_appendable(&st.datatype) {
+                return Err(Error::AppendInPlaceUnsupported(
+                    "append_raw onto this dataset's datatype (non-little-endian, \
+                     variable-length, or reference) could misencode the bytes; use a \
+                     typed append",
+                ));
+            }
+        }
+    }
+    Ok((raw.len() / st.element_size) as u64)
+}
+
+/// Locate the dataset at `oh_addr` in `file` and build its [`LocatedState`],
+/// validating in-place append eligibility (rank-1 / unlimited / Extensible-Array
+/// indexed, a nonzero chunk length, and a re-encodable filter pipeline). Mirrors
+/// the append writer's `ensure_located`, reporting through
+/// [`Error::AppendInPlaceUnsupported`].
+pub(crate) fn locate_dataset_state<F: Store>(
+    file: &F,
+    oh_addr: u64,
+) -> Result<LocatedState, Error> {
+    let result = Located::locate_at(file, oh_addr, Error::AppendInPlaceUnsupported)?;
     if result.located.chunk_elems == 0 {
         return Err(Error::AppendInPlaceUnsupported(
             "in-place append requires a nonzero chunk length",
         ));
     }
-    let data = file.data();
     let (dt_off, dt_size) = result.spans.datatype;
-    let (datatype, _) = Datatype::parse(&data[dt_off..dt_off + dt_size])
+    let dt_bytes = file
+        .read_metadata_at(dt_off, dt_size)
+        .map_err(|_| Error::AppendInPlaceUnsupported("dataset datatype could not be parsed"))?;
+    let (datatype, _) = Datatype::parse(&dt_bytes)
         .map_err(|_| Error::AppendInPlaceUnsupported("dataset datatype could not be parsed"))?;
     let pipeline = match result.spans.filter {
         Some((fb, fsize)) => {
-            let parsed = FilterPipeline::parse(&data[fb..fb + fsize]).map_err(|_| {
+            let fp_bytes = file.read_metadata_at(fb, fsize).map_err(|_| {
+                Error::AppendInPlaceUnsupported("dataset filter pipeline could not be parsed")
+            })?;
+            let parsed = FilterPipeline::parse(&fp_bytes).map_err(|_| {
                 Error::AppendInPlaceUnsupported("dataset filter pipeline could not be parsed")
             })?;
             if !pipeline_reencodable(&parsed) {

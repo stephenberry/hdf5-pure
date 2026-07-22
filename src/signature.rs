@@ -2,18 +2,18 @@
 
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
-use crate::source::{BytesSource, FileSource};
+use crate::source::{BytesSource, Source};
 
 /// The 8-byte HDF5 magic signature.
 pub const HDF5_SIGNATURE: [u8; 8] = [0x89, b'H', b'D', b'F', b'\r', b'\n', 0x1A, b'\n'];
 
-/// Search a [`FileSource`] for the HDF5 signature, returning its byte offset.
+/// Search a [`Source`] for the HDF5 signature, returning its byte offset.
 ///
 /// The HDF5 spec allows the signature at offset 0, 512, 1024, 2048, 4096, …
 /// (powers of two starting at 512, plus offset 0). Only the candidate 8-byte
 /// windows are read, so this works against a lazy streaming source without
 /// pulling the whole file.
-pub fn find_signature_in<S: FileSource + ?Sized>(source: &S) -> Result<u64, FormatError> {
+pub fn find_signature_in<S: Source + ?Sized>(source: &S) -> Result<u64, FormatError> {
     let len = source.len();
     let mut sig = [0u8; 8];
 

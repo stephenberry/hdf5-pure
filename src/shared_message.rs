@@ -18,7 +18,7 @@ use crate::convert::TryToUsize;
 use crate::error::FormatError;
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
-use crate::source::FileSource;
+use crate::source::Source;
 
 /// Fractal heap ID length for SOHM entries (fixed at 8 bytes).
 const FHEAP_ID_LEN: usize = 8;
@@ -162,8 +162,8 @@ pub fn resolve_shared_message(
 }
 
 /// Streaming counterpart of [`resolve_shared_message`]: reads the target object
-/// header from a [`FileSource`] on demand instead of indexing a whole-file slice.
-pub fn resolve_shared_message_from_source<S: FileSource + ?Sized>(
+/// header from a [`Source`] on demand instead of indexing a whole-file slice.
+pub fn resolve_shared_message_from_source<S: Source + ?Sized>(
     source: &S,
     shared_ref: &SharedMessageRef,
     target_msg_type: MessageType,

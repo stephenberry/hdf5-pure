@@ -12,7 +12,7 @@ use alloc::{format, vec, vec::Vec};
 use crate::chunked_read::ChunkInfo;
 use crate::convert::{TryToUsize, is_undefined_addr, u32_from};
 use crate::error::FormatError;
-use crate::source::FileSource;
+use crate::source::Source;
 
 /// Parsed Extensible Array header (AEHD).
 #[derive(Debug, Clone)]
@@ -153,8 +153,8 @@ impl ExtensibleArrayHeader {
         4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 6 * length_size as usize + offset_size as usize + 4
     }
 
-    /// Parse an Extensible Array header from a [`FileSource`] (bounded window).
-    pub fn parse_from_source<S: FileSource + ?Sized>(
+    /// Parse an Extensible Array header from a [`Source`] (bounded window).
+    pub fn parse_from_source<S: Source + ?Sized>(
         source: &S,
         address: u64,
         offset_size: u8,
@@ -971,17 +971,17 @@ fn easb_data_block_spans(
 }
 
 // ---------------------------------------------------------------------------
-// Streaming traversal (read each block from a `FileSource` on demand)
+// Streaming traversal (read each block from a `Source` on demand)
 // ---------------------------------------------------------------------------
 
-/// Read chunk records from an Extensible Array via a [`FileSource`].
+/// Read chunk records from an Extensible Array via a [`Source`].
 ///
 /// Streaming counterpart of [`read_extensible_array_chunks`]: reads the index
 /// block, then each direct data block and super block (and its paged data
 /// blocks) as bounded windows via `read_at`. The shared `read_element` /
 /// `EaGeometry` drive the decoding, so the layout logic stays in one place.
 #[allow(clippy::too_many_arguments)]
-pub fn read_extensible_array_chunks_from_source<S: FileSource + ?Sized>(
+pub fn read_extensible_array_chunks_from_source<S: Source + ?Sized>(
     source: &S,
     header: &ExtensibleArrayHeader,
     dataset_dims: &[u64],
@@ -1127,7 +1127,7 @@ pub fn read_extensible_array_chunks_from_source<S: FileSource + ?Sized>(
 
 /// Collect elements from a (non-paged) data block read from the source.
 #[allow(clippy::too_many_arguments)]
-fn read_data_block_elements_from_source<S: FileSource + ?Sized>(
+fn read_data_block_elements_from_source<S: Source + ?Sized>(
     source: &S,
     db_address: u64,
     nelmts: usize,
@@ -1185,7 +1185,7 @@ fn read_data_block_elements_from_source<S: FileSource + ?Sized>(
 
 /// Read a paged Extensible Array data block from the source.
 #[allow(clippy::too_many_arguments)]
-fn read_paged_data_block_from_source<S: FileSource + ?Sized>(
+fn read_paged_data_block_from_source<S: Source + ?Sized>(
     source: &S,
     db_address: u64,
     page_nelmts: usize,
@@ -1276,7 +1276,7 @@ fn read_paged_data_block_from_source<S: FileSource + ?Sized>(
 
 /// Read a super block (AESB) and its data blocks from the source.
 #[allow(clippy::too_many_arguments)]
-fn read_super_block_from_source<S: FileSource + ?Sized>(
+fn read_super_block_from_source<S: Source + ?Sized>(
     source: &S,
     sb_address: u64,
     ndblks: usize,

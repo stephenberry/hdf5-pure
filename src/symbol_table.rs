@@ -4,7 +4,7 @@
 use alloc::vec::Vec;
 
 use crate::error::FormatError;
-use crate::source::FileSource;
+use crate::source::Source;
 
 /// Symbol Table message (type 0x0011) found in v1 group object headers.
 #[derive(Debug, Clone, PartialEq)]
@@ -145,11 +145,11 @@ impl SymbolTableNode {
         Ok(SymbolTableNode { entries })
     }
 
-    /// Parse a Symbol Table Node from a [`FileSource`] on demand.
+    /// Parse a Symbol Table Node from a [`Source`] on demand.
     ///
     /// Reads the 8-byte SNOD header to learn the symbol count, then the exact
     /// node body, so no more than one node is resident at a time.
-    pub fn parse_from_source<S: FileSource + ?Sized>(
+    pub fn parse_from_source<S: Source + ?Sized>(
         source: &S,
         address: u64,
         offset_size: u8,

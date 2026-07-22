@@ -402,9 +402,10 @@ impl ChunkCache {
 
     /// Clear the entire cache (index + decompressed data).
     ///
-    /// Currently only exercised by unit tests; gated so it is not shipped as
-    /// dead code.
-    #[cfg(test)]
+    /// Called after a mutation through the owning [`Dataset`](crate::Dataset)
+    /// handle: an append relocates the trailing chunk and adds new index
+    /// entries, so both the cached chunk index and any retained decompressed
+    /// chunks may be stale.
     pub fn clear(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.index = None;

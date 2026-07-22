@@ -121,6 +121,21 @@ The remaining eligibility rules match `append_dataset` (chunked, unlimited axis 
 !!! tip "Runnable example"
     This section mirrors [`examples/append_streaming.rs`](https://github.com/stephenberry/hdf5-pure/blob/main/examples/append_streaming.rs). Run it with `cargo run --example append_streaming`.
 
+### Bounded-memory appends
+
+`File::open_rw` keeps a full in-memory mirror of the file, so its memory cost is `O(file size)`. When the file is large — or the host is small — open it with **`File::open_rw_bounded`** instead: the read-write sibling of [`open_streaming`](streaming.md), which never builds a mirror. Reads are served by positioned I/O with the streaming backend's capabilities, and `Dataset::append` runs the same crash-atomic in-place engine as `open_rw`, reading and patching only bounded windows (the object header, the extensible-array blocks it touches, and the trailing chunk). A large append is applied in whole-chunk batches, each crash-atomic on its own, so peak memory stays at the configured caches plus a few chunks — independent of the file size and of how much one call appends.
+
+```rust
+use hdf5_pure::File;
+
+let file = File::open_rw_bounded("huge-log.h5").unwrap();
+let mut samples = file.dataset("samples").unwrap();
+samples.append(&[8i32, 9, 10, 11]).unwrap(); // same rules as open_rw
+file.close().unwrap();
+```
+
+The append rules (filtered whole-chunk / unfiltered any-length, Extensible-Array index required) are identical to `open_rw`. What a bounded file does **not** offer is the staged edit surface — `write`, attribute edits, `create_*`/`delete`, `copy`, `commit`, and `space_accounting` all need the whole-file mirror and return `Error::BoundedStagedUnsupported`. It also requires a latest-format file with 8-byte offsets, no userblock, and no persisted free-space managers (refused at open with `Error::EditUnsupported`), and its path resolution has the [streaming backend's limits](streaming.md) (no v1 symbol-table groups). Memory budgets are set with the same `FileAccessOptions` as the streaming reader via `File::open_rw_bounded_with_options`; cached metadata windows touched by an append are invalidated automatically, so reads through the same file never observe stale bytes.
+
 ## How it works
 
 `commit()` appends each new dataset (its data blob and object header) and each new group, then appends rewritten object headers for every touched group and its ancestors up to the root (omitting any deleted links), and finally repoints the superblock at the new root.

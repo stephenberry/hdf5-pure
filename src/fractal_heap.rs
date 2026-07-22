@@ -11,7 +11,7 @@ use crate::btree_v2::{
 };
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
-use crate::source::FileSource;
+use crate::source::Source;
 
 /// The kind of object a fractal-heap heap ID refers to, encoded in bits 4-5 of
 /// the heap ID's first byte (bits 6-7 are the format version, which must be 0).
@@ -160,7 +160,7 @@ fn slice_object(file_data: &[u8], addr: u64, len: usize) -> Result<Vec<u8>, Form
 }
 
 /// Read `len` bytes at `addr` from a streaming source.
-fn read_object_at_source<S: FileSource + ?Sized>(
+fn read_object_at_source<S: Source + ?Sized>(
     source: &S,
     addr: u64,
     len: usize,
@@ -767,11 +767,11 @@ impl FractalHeapHeader {
     }
 
     // -----------------------------------------------------------------------
-    // Streaming readers (fetch each block from a `FileSource` on demand)
+    // Streaming readers (fetch each block from a `Source` on demand)
     // -----------------------------------------------------------------------
 
-    /// Parse a fractal heap header from a [`FileSource`] (small bounded window).
-    pub fn parse_from_source<S: FileSource + ?Sized>(
+    /// Parse a fractal heap header from a [`Source`] (small bounded window).
+    pub fn parse_from_source<S: Source + ?Sized>(
         source: &S,
         address: u64,
         offset_size: u8,
@@ -787,8 +787,8 @@ impl FractalHeapHeader {
         Self::parse(&buf, 0, offset_size, length_size)
     }
 
-    /// Read a managed object from the heap (by raw heap ID) via a [`FileSource`].
-    pub fn read_managed_object_from_source<S: FileSource + ?Sized>(
+    /// Read a managed object from the heap (by raw heap ID) via a [`Source`].
+    pub fn read_managed_object_from_source<S: Source + ?Sized>(
         &self,
         source: &S,
         id_bytes: &[u8],
@@ -828,7 +828,7 @@ impl FractalHeapHeader {
     }
 
     /// Streaming counterpart to [`FractalHeapHeader::read_object`].
-    pub fn read_object_from_source<S: FileSource + ?Sized>(
+    pub fn read_object_from_source<S: Source + ?Sized>(
         &self,
         source: &S,
         id_bytes: &[u8],
@@ -846,8 +846,8 @@ impl FractalHeapHeader {
         }
     }
 
-    /// Resolve and read a "huge" object via a [`FileSource`].
-    fn read_huge_object_from_source<S: FileSource + ?Sized>(
+    /// Resolve and read a "huge" object via a [`Source`].
+    fn read_huge_object_from_source<S: Source + ?Sized>(
         &self,
         source: &S,
         id_bytes: &[u8],
@@ -881,7 +881,7 @@ impl FractalHeapHeader {
         read_object_at_source(source, addr, len.to_usize()?)
     }
 
-    fn read_from_direct_block_from_source<S: FileSource + ?Sized>(
+    fn read_from_direct_block_from_source<S: Source + ?Sized>(
         &self,
         source: &S,
         block_addr: u64,
@@ -900,7 +900,7 @@ impl FractalHeapHeader {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn read_from_indirect_block_from_source<S: FileSource + ?Sized>(
+    fn read_from_indirect_block_from_source<S: Source + ?Sized>(
         &self,
         source: &S,
         iblock_addr: u64,

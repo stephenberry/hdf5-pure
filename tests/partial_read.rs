@@ -14,9 +14,7 @@ use hdf5_pure::{CharacterSet, Datatype, File, FileBuilder, StringPadding};
 /// streaming (from a temp file). The windowed read dispatches per backend, so
 /// every case is checked on both. The `TempDir` is returned so it outlives the
 /// streaming file handle.
-fn on_both_backends(
-    build: impl FnOnce(&mut FileBuilder),
-) -> (File, File, tempfile::TempDir) {
+fn on_both_backends(build: impl FnOnce(&mut FileBuilder)) -> (File, File, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test.h5");
     let mut builder = FileBuilder::new();
@@ -39,7 +37,7 @@ fn windows(n0: u64) -> Vec<(u64, u64)> {
         (n0.saturating_sub(1), 1.min(n0)),
         (n0 / 3, n0 / 3),
         (0, 0),
-        (n0, 5),         // start past the end -> empty
+        (n0, 5),                     // start past the end -> empty
         (n0.saturating_sub(2), 100), // over-long -> clamps to the tail
     ];
     w.dedup();
@@ -90,7 +88,9 @@ fn check_u8(file: &File, name: &str, row_elems: usize, extra: &[(u64, u64)]) {
 fn contiguous_1d_f64() {
     let data: Vec<f64> = (0..100).map(|i| i as f64 * 1.5).collect();
     let (buffered, streaming, _dir) = on_both_backends(|b| {
-        b.create_dataset("x").with_f64_data(&data).with_shape(&[100]);
+        b.create_dataset("x")
+            .with_f64_data(&data)
+            .with_shape(&[100]);
     });
     check_f64(&buffered, "x", 1, &[]);
     check_f64(&streaming, "x", 1, &[]);
@@ -101,7 +101,9 @@ fn contiguous_2d_f64_preserves_inner_shape() {
     // shape [20, 3]: each row is 3 elements; the window must keep that stride.
     let data: Vec<f64> = (0..60).map(f64::from).collect();
     let (buffered, streaming, _dir) = on_both_backends(|b| {
-        b.create_dataset("m").with_f64_data(&data).with_shape(&[20, 3]);
+        b.create_dataset("m")
+            .with_f64_data(&data)
+            .with_shape(&[20, 3]);
     });
     check_f64(&buffered, "m", 3, &[(5, 7), (0, 20)]);
     check_f64(&streaming, "m", 3, &[(5, 7), (0, 20)]);
@@ -245,13 +247,22 @@ fn typed_readers_match_whole_dataset() {
     });
     for file in [&buffered, &streaming] {
         let i32s = file.dataset("i32").unwrap();
-        assert_eq!(i32s.read_i32_rows(1, 3).unwrap(), &i32s.read_i32().unwrap()[1..4]);
+        assert_eq!(
+            i32s.read_i32_rows(1, 3).unwrap(),
+            &i32s.read_i32().unwrap()[1..4]
+        );
 
         let u64s = file.dataset("u64").unwrap();
-        assert_eq!(u64s.read_u64_rows(1, 2).unwrap(), &u64s.read_u64().unwrap()[1..3]);
+        assert_eq!(
+            u64s.read_u64_rows(1, 2).unwrap(),
+            &u64s.read_u64().unwrap()[1..3]
+        );
 
         let f32s = file.dataset("f32").unwrap();
-        assert_eq!(f32s.read_f32_rows(0, 2).unwrap(), &f32s.read_f32().unwrap()[0..2]);
+        assert_eq!(
+            f32s.read_f32_rows(0, 2).unwrap(),
+            &f32s.read_f32().unwrap()[0..2]
+        );
     }
 }
 

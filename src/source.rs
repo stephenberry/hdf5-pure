@@ -1,4 +1,4 @@
-//! Random-access byte sources for the reader: the [`FileSource`] trait and its
+//! Random-access byte sources for the reader: the [`Source`] trait and its
 //! backends.
 //!
 //! # Why this exists
@@ -20,7 +20,7 @@
 //! working set (the metadata being parsed, plus the data chunks currently being
 //! decompressed) resident at any time.
 //!
-//! [`FileSource`] is that abstraction. It is deliberately minimal and
+//! [`Source`] is that abstraction. It is deliberately minimal and
 //! `no_std`/`alloc`-friendly (the trait and the in-memory backends need no
 //! `std`), so it works on the same constrained targets the rest of the crate
 //! supports.
@@ -46,21 +46,21 @@
 //!
 //! # Migration plan (this is the first increment)
 //!
-//! The reader is not yet ported onto `FileSource`; that is a staged effort
+//! The reader is not yet ported onto `Source`; that is a staged effort
 //! tracked by issue #27. This module is the foundation the later stages build
 //! on. The intended path, smallest-risk first:
 //!
 //! 1. **Foundation (this commit).** Land the trait + in-memory and `Read+Seek`
 //!    backends + tests. Nothing in the existing reader changes, so there is no
 //!    risk to the current in-memory path.
-//! 2. **A cursor.** Introduce a small `Cursor<'a>` over a `&'a dyn FileSource`
+//! 2. **A cursor.** Introduce a small `Cursor<'a>` over a `&'a dyn Source`
 //!    that offers the `read_offset` / `read_length` / "give me bytes at
 //!    `[off, off+len)`" idioms the parsers already use, with the checked
 //!    [`crate::convert`] conversions built in. The ~15 duplicated per-module
 //!    `read_offset` helpers collapse into it.
 //! 3. **Bulk path first.** Port the contiguous and chunked **data** readers
 //!    (`data_read`, `chunked_read`, `parallel_read`) to fetch each chunk via
-//!    [`FileSource::read_at`] instead of slicing the whole-file buffer. This is
+//!    [`Source::read_at`] instead of slicing the whole-file buffer. This is
 //!    self-contained (a chunk is already `{address, size}`) and captures most of
 //!    the memory win, since the data payload is what is actually large. The
 //!    zero-copy `&'a [u8]` return of `data_read::read_raw_data_zerocopy` becomes
@@ -91,7 +91,7 @@ pub const DEFAULT_METADATA_CACHE_MAX_ENTRY_BYTES: usize = 64 * 1024;
 /// This is the `hdf5-pure` counterpart to the memory-budget portion of HDF5's
 /// `H5Pset_mdc_config`: it bounds the bytes retained for parsed metadata reads
 /// while a file is opened through [`crate::File::open_streaming_with_options`].
-/// Raw dataset payload reads use `FileSource::read_exact_at` and are not
+/// Raw dataset payload reads use `Source::read_exact_at` and are not
 /// admitted to this cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MetadataCacheConfig {
@@ -160,7 +160,7 @@ impl Default for MetadataCacheConfig {
 /// are `usize` (they must fit in a caller-provided buffer). Implementations must
 /// either fill the whole request or return an error — a short read is always an
 /// error, never silently truncated.
-pub trait FileSource {
+pub trait Source {
     /// Total number of bytes the source can supply.
     fn len(&self) -> u64;
 
@@ -181,17 +181,17 @@ pub trait FileSource {
 
     /// Read `len` bytes starting at `offset` into a freshly allocated `Vec`.
     ///
-    /// Convenience wrapper over [`read_at`](FileSource::read_at) for callers that
+    /// Convenience wrapper over [`read_at`](Source::read_at) for callers that
     /// want an owned buffer; the lazy backends keep no more than this resident.
     ///
-    /// The request is bounds-checked against [`len`](FileSource::len) *before* the
+    /// The request is bounds-checked against [`len`](Source::len) *before* the
     /// buffer is allocated. The metadata parsers feed `len` values straight from
     /// the file (a chunk-0 body size, a continuation-block length, a heap object
     /// size), so a malformed file could otherwise name a multi-gigabyte length
     /// and make this reserve `vec![0u8; len]` up front only for the read to fail
     /// EOF anyway — a cheap denial of service. Rejecting an out-of-range request
     /// before allocating avoids that; the error returned is identical to the one
-    /// the underlying [`read_at`](FileSource::read_at) would have produced.
+    /// the underlying [`read_at`](Source::read_at) would have produced.
     fn read_exact_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
         let end = offset
             .checked_add(len as u64)
@@ -221,9 +221,9 @@ pub trait FileSource {
     }
 }
 
-// Forward `FileSource` through references and boxes so `&S`, `&dyn FileSource`,
-// and `Box<dyn FileSource>` are all usable wherever an `S: FileSource` is.
-impl<S: FileSource + ?Sized> FileSource for &S {
+// Forward `Source` through references and boxes so `&S`, `&dyn Source`,
+// and `Box<dyn Source>` are all usable wherever an `S: Source` is.
+impl<S: Source + ?Sized> Source for &S {
     fn len(&self) -> u64 {
         (**self).len()
     }
@@ -241,7 +241,7 @@ impl<S: FileSource + ?Sized> FileSource for &S {
 }
 
 #[cfg(feature = "std")]
-impl<S: FileSource + ?Sized> FileSource for std::boxed::Box<S> {
+impl<S: Source + ?Sized> Source for std::boxed::Box<S> {
     fn len(&self) -> u64 {
         (**self).len()
     }
@@ -262,7 +262,7 @@ impl<S: FileSource + ?Sized> FileSource for std::boxed::Box<S> {
 // In-memory backend
 // ---------------------------------------------------------------------------
 
-/// A [`FileSource`] over an in-memory byte buffer: anything that is
+/// A [`Source`] over an in-memory byte buffer: anything that is
 /// `AsRef<[u8]>` (`Vec<u8>`, `&[u8]`, `Box<[u8]>`, `Arc<[u8]>`, …).
 ///
 /// This is the always-available backend that mirrors the crate's current
@@ -277,7 +277,7 @@ impl<T: AsRef<[u8]>> BytesSource<T> {
     }
 }
 
-impl<T: AsRef<[u8]>> FileSource for BytesSource<T> {
+impl<T: AsRef<[u8]>> Source for BytesSource<T> {
     fn len(&self) -> u64 {
         self.0.as_ref().len() as u64
     }
@@ -314,8 +314,11 @@ struct CachedMetadataRead {
     last_access: u64,
 }
 
+/// The bounded LRU store behind [`MetadataCachingSource`], also embedded
+/// directly by the bounded read-write backend (`crate::bounded`), which must
+/// invalidate entries that overlap an in-place write.
 #[cfg(feature = "std")]
-struct MetadataReadCache {
+pub(crate) struct MetadataReadCache {
     entries: Vec<CachedMetadataRead>,
     current_bytes: usize,
     tick: u64,
@@ -323,7 +326,7 @@ struct MetadataReadCache {
 
 #[cfg(feature = "std")]
 impl MetadataReadCache {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             entries: Vec::new(),
             current_bytes: 0,
@@ -331,7 +334,26 @@ impl MetadataReadCache {
         }
     }
 
-    fn get(&mut self, offset: u64, len: usize) -> Option<Vec<u8>> {
+    /// Drop every cached entry that overlaps `[offset, offset + len)`, so a
+    /// read after an in-place write never observes stale bytes.
+    pub(crate) fn invalidate_overlapping(&mut self, offset: u64, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let end = offset.saturating_add(len as u64);
+        let mut removed = 0usize;
+        self.entries.retain(|entry| {
+            let entry_end = entry.offset.saturating_add(entry.len as u64);
+            let overlaps = entry.offset < end && offset < entry_end;
+            if overlaps {
+                removed += entry.bytes.len();
+            }
+            !overlaps
+        });
+        self.current_bytes -= removed;
+    }
+
+    pub(crate) fn get(&mut self, offset: u64, len: usize) -> Option<Vec<u8>> {
         self.tick = self.tick.wrapping_add(1);
         let tick = self.tick;
         for entry in &mut self.entries {
@@ -343,7 +365,7 @@ impl MetadataReadCache {
         None
     }
 
-    fn insert(&mut self, offset: u64, len: usize, bytes: Vec<u8>, max_bytes: usize) {
+    pub(crate) fn insert(&mut self, offset: u64, len: usize, bytes: Vec<u8>, max_bytes: usize) {
         if len == 0 || bytes.len() > max_bytes {
             return;
         }
@@ -386,10 +408,10 @@ impl MetadataReadCache {
     }
 }
 
-/// A [`FileSource`] wrapper with a bounded cache for metadata reads.
+/// A [`Source`] wrapper with a bounded cache for metadata reads.
 ///
-/// The wrapper only caches calls to [`FileSource::read_metadata_at`]. Plain
-/// [`FileSource::read_exact_at`] calls still go directly to the inner source,
+/// The wrapper only caches calls to [`Source::read_metadata_at`]. Plain
+/// [`Source::read_exact_at`] calls still go directly to the inner source,
 /// which keeps raw dataset payloads out of the metadata cache.
 #[cfg(feature = "std")]
 pub struct MetadataCachingSource<S> {
@@ -411,7 +433,7 @@ impl<S> MetadataCachingSource<S> {
 }
 
 #[cfg(feature = "std")]
-impl<S: FileSource> FileSource for MetadataCachingSource<S> {
+impl<S: Source> Source for MetadataCachingSource<S> {
     fn len(&self) -> u64 {
         self.inner.len()
     }
@@ -455,10 +477,10 @@ impl<S: FileSource> FileSource for MetadataCachingSource<S> {
 // Read + Seek backend (std)
 // ---------------------------------------------------------------------------
 
-/// A lazy [`FileSource`] over any [`std::io::Read`] + [`std::io::Seek`] (a
+/// A lazy [`Source`] over any [`std::io::Read`] + [`std::io::Seek`] (a
 /// [`std::fs::File`], an in-memory `Cursor`, etc.).
 ///
-/// Each [`read_at`](FileSource::read_at) performs a `seek` + `read_exact`, so no
+/// Each [`read_at`](Source::read_at) performs a `seek` + `read_exact`, so no
 /// more than the requested bytes are ever held in memory. This is the backend
 /// that lets a 32-bit host read a file larger than its address space: the
 /// metadata and one working chunk fit even when the whole file does not.
@@ -489,7 +511,7 @@ impl<R: std::io::Read + std::io::Seek> ReadSeekSource<R> {
 }
 
 #[cfg(feature = "std")]
-impl<R: std::io::Read + std::io::Seek> FileSource for ReadSeekSource<R> {
+impl<R: std::io::Read + std::io::Seek> Source for ReadSeekSource<R> {
     fn len(&self) -> u64 {
         self.len
     }
@@ -602,7 +624,7 @@ mod tests {
     #[test]
     fn forwarding_through_reference() {
         let src = BytesSource::new(vec![9u8, 8, 7]);
-        let r: &dyn FileSource = &src;
+        let r: &dyn Source = &src;
         let mut buf = [0u8; 2];
         r.read_at(1, &mut buf).unwrap();
         assert_eq!(buf, [8, 7]);
@@ -616,7 +638,7 @@ mod tests {
             metadata_reads: Cell<usize>,
         }
 
-        impl FileSource for MetadataSource {
+        impl Source for MetadataSource {
             fn len(&self) -> u64 {
                 16
             }
@@ -632,7 +654,7 @@ mod tests {
             }
         }
 
-        fn read_metadata_via_trait<T: FileSource>(source: T) -> Vec<u8> {
+        fn read_metadata_via_trait<T: Source>(source: T) -> Vec<u8> {
             source.read_metadata_at(4, 3).unwrap()
         }
 
@@ -657,7 +679,7 @@ mod tests {
             reads: Arc<AtomicUsize>,
         }
 
-        impl FileSource for CountingSource {
+        impl Source for CountingSource {
             fn len(&self) -> u64 {
                 self.data.len() as u64
             }

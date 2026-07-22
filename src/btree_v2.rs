@@ -8,7 +8,7 @@ use byteorder::{ByteOrder, LittleEndian};
 
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
-use crate::source::FileSource;
+use crate::source::Source;
 
 /// Parsed B-tree v2 header (signature "BTHD").
 #[derive(Debug, Clone)]
@@ -161,11 +161,11 @@ impl BTreeV2Header {
         })
     }
 
-    /// Parse a B-tree v2 header from a [`FileSource`].
+    /// Parse a B-tree v2 header from a [`Source`].
     ///
     /// The header is fully self-contained (signature + fixed fields + a root
     /// pointer + checksum), so only a small bounded window is read.
-    pub fn parse_from_source<S: FileSource + ?Sized>(
+    pub fn parse_from_source<S: Source + ?Sized>(
         source: &S,
         address: u64,
         offset_size: u8,
@@ -479,9 +479,9 @@ fn collect_internal_records(
 }
 
 /// Collect all records from a B-tree v2 by traversing from the root, reading
-/// each fixed-size node from a [`FileSource`] on demand rather than indexing a
+/// each fixed-size node from a [`Source`] on demand rather than indexing a
 /// whole-file buffer.
-pub fn collect_btree_v2_records_from_source<S: FileSource + ?Sized>(
+pub fn collect_btree_v2_records_from_source<S: Source + ?Sized>(
     source: &S,
     header: &BTreeV2Header,
     offset_size: u8,
@@ -515,7 +515,7 @@ pub fn collect_btree_v2_records_from_source<S: FileSource + ?Sized>(
 /// children. Mirrors the buffered [`collect_btree_v2_records`] traversal and
 /// produces records in the same order.
 #[allow(clippy::too_many_arguments)]
-fn collect_node_from_source<S: FileSource + ?Sized>(
+fn collect_node_from_source<S: Source + ?Sized>(
     source: &S,
     address: u64,
     num_records: u16,
