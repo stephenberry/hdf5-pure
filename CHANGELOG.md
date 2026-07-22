@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `File::open_rw_bounded` now supports a file that persists its free space (`H5Pset_file_space_strategy(persist = true)`, non-paged): its on-disk free-space managers are seeded on open and rewritten into canonical shape at `File::close`, so bounded-memory appends round-trip through the reference C library; the paged strategy (`H5F_FSPACE_STRATEGY_PAGE`) is still refused at open ([#173](https://github.com/stephenberry/hdf5-pure/issues/173)).
 - `Dataset::read_raw_rows` and the typed `read_f64_rows`/`read_f32_rows`/`read_i8_rows`/`read_i16_rows`/`read_i32_rows`/`read_i64_rows`/`read_u8_rows`/`read_u16_rows`/`read_u32_rows`/`read_u64_rows`/`read_string_rows` read a leading-dimension row window `[start, start + count)` without materializing the whole dataset, so a large dataset can be streamed a fixed number of rows at a time; inner-chunked and variable-length string windows fall back to a whole read sliced to the window ([#170](https://github.com/stephenberry/hdf5-pure/pull/170)).
 
 ## [0.22.0] - 2026-07-22
