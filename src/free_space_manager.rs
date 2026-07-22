@@ -151,6 +151,19 @@ const FILE_FSM_CLIENT_ID: u8 = 1;
 /// The largest section size the file manager tracks, `2^63 - 1` (C default).
 const FILE_FSM_MAX_SECTION_SIZE: u64 = (1u64 << 63) - 1;
 
+/// On-disk free-space section class ids (the `H5MF` file section classes). All
+/// three carry zero class-specific serialized data — a section is always
+/// `[offset][class_id]` — so the class id only selects which manager/page-type a
+/// section belongs to, never its byte width.
+/// Simple section: non-paged (`FSM_AGGR`) free space.
+pub(crate) const SECT_CLASS_SIMPLE: u8 = 0;
+/// Small section: paged free space smaller than a page (SUPER / DRAW managers).
+pub(crate) const SECT_CLASS_SMALL: u8 = 1;
+/// Large section: the trailing fragment of a paged multi-page allocation
+/// (the generic-large manager). Note this fragment is itself smaller than a page;
+/// the class reflects the manager, not the section size.
+pub(crate) const SECT_CLASS_LARGE: u8 = 2;
+
 /// Append `value` as a little-endian unsigned integer of `width` bytes.
 fn push_uint_le(buf: &mut Vec<u8>, value: u64, width: usize) {
     // `width` is always 1..=8 (offset/size/count widths); take the low bytes of
@@ -165,11 +178,17 @@ fn push_uint_le(buf: &mut Vec<u8>, value: u64, width: usize) {
 /// `(fshd_bytes, fsse_bytes)`, each ending in its Jenkins checksum, ready to write
 /// at those addresses. The encoding round-trips through [`FsmHeader::parse`] /
 /// [`parse_fsse`] and is byte-identical to the reference C library's.
+///
+/// `class_id` is the on-disk section class every section is tagged with
+/// ([`SECT_CLASS_SIMPLE`] for non-paged managers, [`SECT_CLASS_SMALL`] /
+/// [`SECT_CLASS_LARGE`] for the paged SUPER/DRAW and generic-large managers). A
+/// single manager holds sections of one class, so one id applies to all of them.
 pub(crate) fn serialize_file_fsm(
     sections: &[FreeSection],
     fshd_addr: u64,
     fsse_addr: u64,
     offset_size: u8,
+    class_id: u8,
 ) -> (Vec<u8>, Vec<u8>) {
     let os = offset_size as usize;
     let addr_space_bits = (offset_size as u16) * 8 - 1;
@@ -203,7 +222,7 @@ pub(crate) fn serialize_file_fsm(
         push_uint_le(&mut fsse, size, size_w);
         for addr in offsets {
             push_uint_le(&mut fsse, addr, off_w);
-            fsse.push(0); // section class id 0 (simple; no class data)
+            fsse.push(class_id); // section class id (no class-specific data)
         }
     }
     let checksum = crate::checksum::jenkins_lookup3(&fsse);
@@ -237,6 +256,22 @@ pub(crate) fn serialize_file_fsm(
 /// (82 bytes for standard 8-byte offsets).
 pub(crate) fn fshd_len(offset_size: u8) -> u64 {
     (4 + 1 + 1 + 4 * 8 + 2 * 4 + 8 + offset_size as usize + 8 + 8 + 4) as u64
+}
+
+/// The serialized byte length an `FSSE` block will occupy for a manager holding
+/// sections of the given `section_sizes` — needed so the paged writer can reserve
+/// space for a manager's section list before it knows the sections' offsets. The
+/// length depends only on the sizes (they determine the size-group count) and the
+/// section count, never on the offsets or class id, so this defers to
+/// [`serialize_file_fsm`] with placeholder addresses and stays exact by
+/// construction.
+pub(crate) fn fsse_len(section_sizes: &[u64], offset_size: u8) -> u64 {
+    let sections: Vec<FreeSection> = section_sizes
+        .iter()
+        .map(|&size| FreeSection { addr: 0, size })
+        .collect();
+    let (_fshd, fsse) = serialize_file_fsm(&sections, 0, 0, offset_size, SECT_CLASS_SIMPLE);
+    fsse.len() as u64
 }
 
 /// Parse the `FSSE` section list `data` (the whole block, including checksum) for
@@ -441,6 +476,7 @@ mod tests {
             619,
             701,
             8,
+            SECT_CLASS_SIMPLE,
         );
         assert_eq!(fshd, fshd_fixture, "FSHD bytes match the C library");
         assert_eq!(fsse, fsse_fixture, "FSSE bytes match the C library");
@@ -472,6 +508,7 @@ mod tests {
             736,
             818,
             8,
+            SECT_CLASS_SIMPLE,
         );
         assert_eq!(fshd, fshd_fixture, "FSHD bytes match the C library");
         assert_eq!(fsse, fsse_fixture, "FSSE bytes match the C library");
@@ -493,7 +530,7 @@ mod tests {
                 size: 70000,
             },
         ];
-        let (fshd, _fsse) = serialize_file_fsm(&sections, 1000, 1100, 8);
+        let (fshd, _fsse) = serialize_file_fsm(&sections, 1000, 1100, 8, SECT_CLASS_SIMPLE);
         let header = FsmHeader::parse(&fshd, 8).unwrap();
         assert_eq!(header.total_sections, 3);
         assert_eq!(header.total_space, 512 + 512 + 70000);
@@ -501,7 +538,7 @@ mod tests {
 
         // Place both blocks in a buffer and read them back through the manager
         // indirection; the recovered sections match (order-independent).
-        let (fshd, fsse) = serialize_file_fsm(&sections, 1000, 1100, 8);
+        let (fshd, fsse) = serialize_file_fsm(&sections, 1000, 1100, 8, SECT_CLASS_SIMPLE);
         let mut buf = vec![0u8; 1100 + fsse.len()];
         buf[1000..1000 + fshd.len()].copy_from_slice(&fshd);
         buf[1100..1100 + fsse.len()].copy_from_slice(&fsse);
@@ -510,6 +547,50 @@ mod tests {
         let mut want = sections.to_vec();
         want.sort_by_key(|s| s.addr);
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn fsse_len_matches_serialized_length() {
+        // For any section set, the reserved FSSE length equals the serializer's
+        // output length regardless of offsets or class id (fixed field widths).
+        for sizes in [
+            vec![],
+            vec![100u64],
+            vec![100, 100, 100],   // one size group
+            vec![10, 20, 30],      // three size groups
+            vec![16384, 512, 512], // large + repeated small
+        ] {
+            let sections: Vec<FreeSection> = sizes
+                .iter()
+                .enumerate()
+                .map(|(i, &size)| FreeSection {
+                    addr: 4096 + i as u64 * 8,
+                    size,
+                })
+                .collect();
+            let (_fshd, fsse) = serialize_file_fsm(&sections, 1000, 1100, 8, SECT_CLASS_LARGE);
+            assert_eq!(fsse_len(&sizes, 8), fsse.len() as u64, "sizes {sizes:?}");
+        }
+    }
+
+    #[test]
+    fn class_id_is_emitted_and_ignored_on_read() {
+        // The class-id byte is written per section and round-trips (the reader
+        // ignores its value, recovering the same offsets/sizes for any class).
+        let sections = [FreeSection {
+            addr: 2000,
+            size: 12768,
+        }];
+        for class in [SECT_CLASS_SIMPLE, SECT_CLASS_SMALL, SECT_CLASS_LARGE] {
+            let (fshd, fsse) = serialize_file_fsm(&sections, 1000, 1100, 8, class);
+            // The last section record's class byte precedes the 4-byte checksum.
+            assert_eq!(fsse[fsse.len() - 5], class, "class byte written");
+            let mut buf = vec![0u8; 1100 + fsse.len()];
+            buf[1000..1000 + fshd.len()].copy_from_slice(&fshd);
+            buf[1100..1100 + fsse.len()].copy_from_slice(&fsse);
+            let got = read_persisted_sections(&buf, &[1000], 0, 8).unwrap();
+            assert_eq!(got, sections, "class {class} round-trips");
+        }
     }
 
     #[test]

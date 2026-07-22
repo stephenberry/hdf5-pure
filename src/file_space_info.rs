@@ -172,6 +172,32 @@ impl FileSpaceInfo {
         }
     }
 
+    /// A persisting message for a paged file whose free space is tracked by
+    /// per-page-type managers. `slots[k]` is the `FSHD` address of the manager for
+    /// page type `k + 1` (or [`UNDEF`] when that page type tracks no free space);
+    /// `eoa_pre_fsm` is the page-aligned end-of-allocation. This is the form the
+    /// paged writer emits: metadata free space lives in the SUPER manager
+    /// (`slots[0]`), small raw data in DRAW (`slots[2]`), and the trailing
+    /// fragments of large multi-page allocations in the generic-large manager
+    /// (`slots[6]`).
+    pub(crate) fn persistent_managers(
+        strategy: FileSpaceStrategy,
+        threshold: u64,
+        page_size: u64,
+        slots: [u64; NUM_FILE_FSM_MANAGERS],
+        eoa_pre_fsm: u64,
+    ) -> Self {
+        FileSpaceInfo {
+            strategy,
+            persist: true,
+            threshold,
+            page_size,
+            page_end_meta_threshold: 0,
+            eoa_pre_fsm,
+            manager_addrs: slots.to_vec(),
+        }
+    }
+
     /// Serialize the version-1 message body (without the object-header message
     /// prefix). Manager addresses are written only when [`persist`] is set.
     ///
@@ -320,6 +346,29 @@ mod tests {
             FileSpaceInfo::parse(&bytes, 8, 8),
             Err(FormatError::UnsupportedFileSpaceInfoVersion(0))
         ));
+    }
+
+    #[test]
+    fn persistent_managers_roundtrips_multiple_slots() {
+        // The paged writer's form: SUPER (slot 0), DRAW (slot 2), and the
+        // generic-large manager (slot 6) defined, the rest undefined.
+        let mut slots = [UNDEF; NUM_FILE_FSM_MANAGERS];
+        slots[0] = 841;
+        slots[2] = 18384;
+        slots[6] = 806;
+        let info =
+            FileSpaceInfo::persistent_managers(FileSpaceStrategy::Page, 0, 16384, slots, 65536);
+        assert!(info.persist);
+        assert_eq!(info.eoa_pre_fsm, 65536);
+        let bytes = info.serialize();
+        // 29-byte head + 12 * 8 manager slots.
+        assert_eq!(bytes.len(), 29 + NUM_FILE_FSM_MANAGERS * 8);
+        let parsed = FileSpaceInfo::parse(&bytes, 8, 8).unwrap();
+        assert_eq!(parsed, info);
+        assert_eq!(parsed.manager_addrs[0], 841);
+        assert_eq!(parsed.manager_addrs[2], 18384);
+        assert_eq!(parsed.manager_addrs[6], 806);
+        assert_eq!(parsed.manager_addrs[1], UNDEF);
     }
 
     #[test]

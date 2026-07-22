@@ -275,3 +275,149 @@ fn we_read_c_library_strategy() {
     // The data still reads correctly.
     assert_eq!(f.dataset("d").unwrap().read_i32().unwrap(), vec![1, 2, 3]);
 }
+
+#[test]
+fn c_library_reads_our_paged_file() {
+    let _c = c_lib_guard();
+    // hdf5-pure writes a genuine paged (H5F_FSPACE_STRATEGY_PAGE) persisting file
+    // with small and large datasets. The reference C library must recover the
+    // paged strategy, read every dataset, load the per-page-type free-space
+    // managers (H5Fget_freespace parses our FSHD/FSSE blocks), and reopen the
+    // file read-write to mutate it (proving the paged layout is consistent).
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("ours_paged.h5");
+
+    let small_a: Vec<i32> = (0..100).collect();
+    let small_b: Vec<i32> = (0..400).collect();
+    let big: Vec<i32> = (0..5000).collect(); // 20000 bytes >= page: its own run
+
+    let mut b = FileBuilder::new();
+    b.create_dataset("a").with_i32_data(&small_a);
+    b.create_dataset("b").with_i32_data(&small_b);
+    b.create_dataset("big").with_i32_data(&big);
+    b.with_file_space_strategy(FileSpaceStrategy::Page, true, 0)
+        .with_file_space_page_size(16384);
+    b.write(&path).unwrap();
+
+    // hdf5-pure's own view of the tracked free space (SUPER + DRAW + LARGE tails).
+    let ours = File::open(&path).unwrap();
+    let total_ours: u64 = ours.persisted_free_space().iter().map(|(_, l)| l).sum();
+    assert!(total_ours > 0, "paged persist tracks page-tail free space");
+    drop(ours);
+
+    // The C library recovers the paged strategy and reads every dataset.
+    let f = hdf5::File::open(&path).unwrap();
+    let strat = f.create_plist().unwrap().get_file_space_strategy().unwrap();
+    assert_eq!(
+        strat,
+        CStrategy::FreeSpaceManager {
+            paged: true,
+            persist: true,
+            threshold: 0,
+        },
+        "C library recovers our paged strategy"
+    );
+    assert_eq!(f.dataset("a").unwrap().read_raw::<i32>().unwrap(), small_a);
+    assert_eq!(f.dataset("b").unwrap().read_raw::<i32>().unwrap(), small_b);
+    assert_eq!(f.dataset("big").unwrap().read_raw::<i32>().unwrap(), big);
+
+    // Loading the managers requires parsing our FSHD/FSSE blocks; the C library's
+    // free-space total equals the sum of the sections we wrote.
+    let free_c = unsafe { H5Fget_freespace(f.id()) };
+    assert_eq!(
+        free_c as u64, total_ours,
+        "C library free-space total matches our paged managers"
+    );
+    drop(f);
+
+    // The C library reopens the paged file read-write and adds a dataset, then
+    // reads everything back: the paged layout survives a C round-trip.
+    {
+        let f = hdf5::File::open_rw(&path).unwrap();
+        f.new_dataset::<i32>()
+            .shape((30,))
+            .create("added")
+            .unwrap()
+            .write(&(0..30).collect::<Vec<i32>>())
+            .unwrap();
+        f.close().unwrap();
+    }
+    let f = hdf5::File::open(&path).unwrap();
+    assert_eq!(f.dataset("a").unwrap().read_raw::<i32>().unwrap(), small_a);
+    assert_eq!(f.dataset("big").unwrap().read_raw::<i32>().unwrap(), big);
+    assert_eq!(
+        f.dataset("added").unwrap().read_raw::<i32>().unwrap(),
+        (0..30).collect::<Vec<i32>>()
+    );
+}
+
+#[test]
+fn c_library_reads_our_paged_chunked_file() {
+    let _c = c_lib_guard();
+    // Paged interop for chunked datasets: hdf5-pure writes a paged persisting
+    // file with a small chunked dataset and a large compressed (shuffle+deflate)
+    // chunked dataset whose data begins a page-aligned run. The C library must
+    // read both, parse the managers, and reopen read-write.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("ours_paged_chunked.h5");
+
+    let small: Vec<f64> = (0..64).map(|i| i as f64).collect();
+    let big: Vec<f64> = (0..8000).map(|i| i as f64 * 0.5).collect();
+
+    let mut b = FileBuilder::new();
+    b.create_dataset("s")
+        .with_f64_data(&small)
+        .with_shape(&[64])
+        .with_chunks(&[16]);
+    {
+        let ds = b
+            .create_dataset("big")
+            .with_f64_data(&big)
+            .with_shape(&[8000])
+            .with_chunks(&[1000]);
+        ds.with_shuffle().with_deflate(6);
+    }
+    b.with_file_space_strategy(FileSpaceStrategy::Page, true, 0)
+        .with_file_space_page_size(16384);
+    b.write(&path).unwrap();
+
+    let ours = File::open(&path).unwrap();
+    let total_ours: u64 = ours.persisted_free_space().iter().map(|(_, l)| l).sum();
+    drop(ours);
+
+    let f = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        f.create_plist().unwrap().get_file_space_strategy().unwrap(),
+        CStrategy::FreeSpaceManager {
+            paged: true,
+            persist: true,
+            threshold: 0,
+        },
+    );
+    assert_eq!(f.dataset("s").unwrap().read_raw::<f64>().unwrap(), small);
+    assert_eq!(f.dataset("big").unwrap().read_raw::<f64>().unwrap(), big);
+    let free_c = unsafe { H5Fget_freespace(f.id()) };
+    assert_eq!(
+        free_c as u64, total_ours,
+        "C free-space matches our managers"
+    );
+    drop(f);
+
+    // C reopens read-write and appends a dataset without corrupting the file.
+    {
+        let f = hdf5::File::open_rw(&path).unwrap();
+        f.new_dataset::<f64>()
+            .shape((4,))
+            .create("extra")
+            .unwrap()
+            .write(&[1.0f64, 2.0, 3.0, 4.0])
+            .unwrap();
+        f.close().unwrap();
+    }
+    let f = hdf5::File::open(&path).unwrap();
+    assert_eq!(f.dataset("big").unwrap().read_raw::<f64>().unwrap(), big);
+    assert_eq!(
+        f.dataset("extra").unwrap().read_raw::<f64>().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+}
