@@ -177,6 +177,20 @@ let values = ds.read_f64().unwrap();  // only this dataset's chunks are read
 
 The reading API is identical to `File::open`; only the backing store differs. Dataset reads are fully supported: contiguous, compact, and every chunk-index layout (B-tree v1, fixed array, and extensible array). Two limits apply to the streaming backend that in-memory reading does not have: only latest-format (v2) groups resolve along a path (a v1 symbol-table group is rejected), and reading attributes is not yet supported. `open_streaming` requires the `std` filesystem.
 
+To read a single dataset that is itself too large to hold decompressed, read it in **row windows** rather than whole: `read_raw_rows(start, count)` and the typed `read_f64_rows` … `read_string_rows` decode only the leading-dimension rows `[start, start + count)`, touching only the chunks that window overlaps, so peak memory scales with the window rather than the dataset.
+
+```rust
+use hdf5_pure::File;
+
+let file = File::open_streaming("huge.h5").unwrap();
+let ds = file.dataset("signal").unwrap();
+let rows = ds.shape().unwrap()[0];
+for start in (0..rows).step_by(1_000_000) {
+    let window = ds.read_f64_rows(start, 1_000_000).unwrap(); // clamped at the end
+    let _ = window; // ... process it ...
+}
+```
+
 Use `File::open_streaming_with_options` to bound retained metadata and dataset chunk cache memory. `MetadataCacheConfig` mirrors the memory-budget role of `H5Pset_mdc_config`; `ChunkCacheConfig` mirrors the raw-data chunk-cache settings from `H5Pset_cache`, controlling decompressed chunk data and whether parsed chunk indexes are retained between repeated reads of the same dataset.
 
 ```rust

@@ -148,6 +148,22 @@ For the writing side and more detail, see [Generic I/O](generic-io.md). For N-di
 
 `Dataset::read_raw` returns the complete unfiltered record bytes, and `Dataset::read_compound::<T>()` decodes compound (struct-like) records. See [Compound Types](compound-types.md) and the [data types reference](../reference/data-types.md).
 
+### Reading a row window
+
+The `read_*` methods above deliver a whole dataset. To read only a range of leading-dimension rows — a **row window** `[start, start + count)` — without materializing the rest, use `read_raw_rows(start, count)` and the typed `read_f64_rows` / `read_f32_rows` / `read_i8_rows` … `read_u64_rows` / `read_string_rows` counterparts. Each decodes exactly like its whole-dataset form, so a window is that whole read sliced to the given row range.
+
+```rust
+use hdf5_pure::File;
+
+let file = File::open("frames.h5").unwrap();
+let ds = file.dataset("frames").unwrap();
+let window = ds.read_f64_rows(100, 50).unwrap(); // rows 100..150 only
+```
+
+Only the storage the window touches is read: a single bounded sub-read for compact and contiguous layouts, and just the chunks whose first-dimension span overlaps the window for chunked layouts, so peak memory scales with the window (plus one chunk) rather than the dataset. The window is clamped to the leading dimension, so a read past the end returns only the rows that exist and a zero-row request returns an empty `Vec`. Datasets chunked along an inner dimension, and variable-length string datasets, transparently fall back to a whole read sliced to the window.
+
+Combined with a [streaming open](streaming.md#reading-a-large-dataset-a-window-at-a-time), this reads a dataset too large to hold in memory a fixed number of rows at a time.
+
 ## Navigating groups and attributes
 
 `File::root()` returns the root `Group`, and `File::group(path)` resolves a subgroup by path. A `Group` lists its children with `groups()` and `datasets()` (each returning `Vec<String>` of names), opens a child dataset with `dataset(name)`, and opens a child subgroup with `group(name)`.

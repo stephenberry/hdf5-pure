@@ -546,6 +546,39 @@ pub fn generate_implicit_chunks(
     chunks
 }
 
+/// The per-dimension geometry the chunked readers share: the data rank (the chunk
+/// layout's dimensions minus the trailing element-size dim), the chunk dimensions,
+/// and the dataset dimensions, all as `usize`. `chunk_dimensions` are `u32` and
+/// widen; the dataspace dims are `u64` and narrow with a checked conversion. Errors
+/// when the layout carries no dimensions or its rank disagrees with the dataspace.
+fn chunked_dims(
+    chunk_dimensions: &[u32],
+    dataspace: &Dataspace,
+) -> Result<(usize, Vec<usize>, Vec<usize>), FormatError> {
+    let rank = chunk_dimensions
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| FormatError::ChunkedReadError("chunked layout has no dimensions".into()))?;
+    let chunk_dims: Vec<usize> = chunk_dimensions[..rank]
+        .iter()
+        .map(|&d| d as usize)
+        .collect();
+    let ds_dims: Vec<usize> = dataspace
+        .dimensions
+        .iter()
+        .map(|&d| d.to_usize())
+        .collect::<Result<_, _>>()?;
+    if ds_dims.len() != rank {
+        return Err(FormatError::ChunkedReadError(format!(
+            "rank mismatch: dataspace has {} dims, layout has {} chunk dims (rank={})",
+            ds_dims.len(),
+            chunk_dimensions.len(),
+            rank
+        )));
+    }
+    Ok((rank, chunk_dims, ds_dims))
+}
+
 /// Read a chunked dataset, decompressing chunks as needed.
 pub fn read_chunked_data(
     file_data: &[u8],
@@ -591,29 +624,7 @@ pub fn read_chunked_data(
 
     let elem_size = datatype.type_size() as usize;
 
-    // Both v3 and v4 include element size as last dim (rank+1)
-    let ndims = chunk_dimensions.len();
-    let rank = ndims
-        .checked_sub(1)
-        .ok_or_else(|| FormatError::ChunkedReadError("chunked layout has no dimensions".into()))?;
-    let chunk_dims: Vec<usize> = chunk_dimensions[..rank]
-        .iter()
-        .map(|&d| d as usize)
-        .collect();
-
-    let ds_dims: Vec<usize> = dataspace
-        .dimensions
-        .iter()
-        .map(|&d| d.to_usize())
-        .collect::<Result<_, _>>()?;
-    if ds_dims.len() != rank {
-        return Err(FormatError::ChunkedReadError(format!(
-            "rank mismatch: dataspace has {} dims, layout has {} chunk dims (rank={})",
-            ds_dims.len(),
-            chunk_dimensions.len(),
-            rank
-        )));
-    }
+    let (rank, chunk_dims, ds_dims) = chunked_dims(chunk_dimensions, dataspace)?;
 
     // Collect chunks based on version and index type
     #[expect(
@@ -768,29 +779,7 @@ pub fn read_chunked_data_from_source<S: Source + ?Sized>(
         .ok_or_else(|| FormatError::ChunkedReadError("no address for chunked layout".into()))?;
 
     let elem_size = datatype.type_size() as usize;
-    let ndims = chunk_dimensions.len();
-    let rank = ndims
-        .checked_sub(1)
-        .ok_or_else(|| FormatError::ChunkedReadError("chunked layout has no dimensions".into()))?;
-    // `chunk_dimensions` are u32, so this widens; the dataspace dims are u64 and
-    // are narrowed with a checked conversion.
-    let chunk_dims: Vec<usize> = chunk_dimensions[..rank]
-        .iter()
-        .map(|&d| d as usize)
-        .collect();
-    let ds_dims: Vec<usize> = dataspace
-        .dimensions
-        .iter()
-        .map(|&d| d.to_usize())
-        .collect::<Result<_, _>>()?;
-    if ds_dims.len() != rank {
-        return Err(FormatError::ChunkedReadError(format!(
-            "rank mismatch: dataspace has {} dims, layout has {} chunk dims (rank={})",
-            ds_dims.len(),
-            chunk_dimensions.len(),
-            rank
-        )));
-    }
+    let (rank, chunk_dims, ds_dims) = chunked_dims(chunk_dimensions, dataspace)?;
 
     let chunks = collect_chunks_for_layout_from_source(
         source,
@@ -827,6 +816,191 @@ pub fn read_chunked_data_from_source<S: Source + ?Sized>(
         elem_size,
         total_bytes,
     ))
+}
+
+/// Read the raw element bytes of the row window `[row_start, row_start + num_rows)`
+/// — a range along the leading dimension — decoding only the chunks it overlaps.
+///
+/// The windowed counterpart of [`read_chunked_data_from_source`]: peak memory is
+/// one window plus one chunk, not the whole dataset. `cache` holds the parsed index
+/// and decompressed chunks, so successive windows on the same handle walk the index
+/// once and reuse boundary chunks.
+///
+/// Handles only chunks that span the full inner extent (`chunk_dims[i] == ds_dims[i]`
+/// for `i >= 1`), where each row is contiguous in the chunk and the copy is a plain
+/// row band — true for every frame-per-chunk dataset. Returns `Ok(None)` when an
+/// inner dimension is chunked, so the caller falls back to a whole read. Otherwise
+/// returns `num_rows * row_elems` elements. The caller clamps the window to the
+/// dataset.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
+    source: &S,
+    layout: &DataLayout,
+    dataspace: &Dataspace,
+    datatype: &Datatype,
+    pipeline: Option<&FilterPipeline>,
+    offset_size: u8,
+    length_size: u8,
+    cache: &ChunkCache,
+    row_start: u64,
+    num_rows: u64,
+) -> Result<Option<Vec<u8>>, FormatError> {
+    let DataLayout::Chunked {
+        chunk_dimensions,
+        btree_address,
+        version,
+        chunk_index_type,
+        single_chunk_filtered_size,
+        single_chunk_filter_mask,
+    } = layout
+    else {
+        return Err(FormatError::ChunkedReadError(
+            "expected chunked layout".into(),
+        ));
+    };
+
+    let elem_size = datatype.type_size() as usize;
+    let (rank, chunk_dims, ds_dims) = chunked_dims(chunk_dimensions, dataspace)?;
+
+    // A rank-0 (scalar) chunked layout has no leading dimension to window, and a
+    // row is contiguous in the chunk only when the chunk spans the full inner
+    // extent; both cases fall back to the whole-dataset reader (which handles
+    // rank 0 and inner chunking) rather than the row-band fast path.
+    if rank == 0 || (1..rank).any(|i| chunk_dims[i] != ds_dims[i]) {
+        return Ok(None);
+    }
+
+    // Elements per row (product of the inner dims; 1 when 1-D). Checked so a
+    // crafted dataspace whose inner dims overflow `usize` errors instead of
+    // panicking (debug) or wrapping (release).
+    let row_elems: usize = ds_dims.iter().skip(1).try_fold(1usize, |acc, &d| {
+        acc.checked_mul(d).ok_or(FormatError::OffsetOverflow {
+            offset: acc as u64,
+            length: d as u64,
+        })
+    })?;
+    let row_bytes = row_elems
+        .checked_mul(elem_size)
+        .ok_or(FormatError::OffsetOverflow {
+            offset: row_elems as u64,
+            length: elem_size as u64,
+        })?;
+
+    let out_rows = num_rows.to_usize()?;
+    let total_bytes = out_rows
+        .checked_mul(row_bytes)
+        .ok_or(FormatError::OffsetOverflow {
+            offset: out_rows as u64,
+            length: row_bytes as u64,
+        })?;
+    let mut output = vec![0u8; total_bytes];
+    if total_bytes == 0 {
+        return Ok(Some(output));
+    }
+
+    // Unallocated chunk index: a non-empty window has no storage to read. Match
+    // the whole-dataset reader, which errors here, so `read_raw_rows` stays
+    // consistent with `read_raw` rather than fabricating a window of zeros. (An
+    // empty window has already returned above.)
+    let Some(addr) = *btree_address else {
+        return Err(FormatError::ChunkedReadError(
+            "no address for chunked layout".into(),
+        ));
+    };
+
+    // Walk the index once, then reuse it for later windows on this handle.
+    let chunks = if let Some(chunks) = cache.all_indexed_chunks() {
+        chunks
+    } else {
+        let chunks = collect_chunks_for_layout_from_source(
+            source,
+            *version,
+            *chunk_index_type,
+            addr,
+            *single_chunk_filtered_size,
+            *single_chunk_filter_mask,
+            chunk_dimensions,
+            dataspace,
+            elem_size,
+            offset_size,
+            length_size,
+        )?;
+        cache.populate_index(&chunks, rank);
+        chunks
+    };
+
+    let chunk_dims_u64: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
+    let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype);
+
+    let row_lo = row_start.to_usize()?;
+    let row_hi = row_lo.saturating_add(out_rows); // exclusive; caller clamped to the dataset
+    let cd0 = chunk_dims[0];
+
+    for chunk in &chunks {
+        let c0 = chunk.offsets.first().copied().unwrap_or(0).to_usize()?;
+        // This chunk's exclusive leading-dim end. The saturating add/mul here and
+        // below keep a crafted huge chunk offset or dimension from overflowing
+        // `usize` on 32-bit (a panic in debug, a silently wrong window in
+        // release): a saturated span still compares and clamps correctly, and
+        // `row_band_copy` bounds the copy to the bytes actually present. `dst` and
+        // `band` need no guard — both are bounded by the already-checked
+        // `total_bytes` allocation.
+        let c_end = c0.saturating_add(cd0);
+        if c0 >= row_hi || c_end <= row_lo {
+            continue; // no overlap with the window
+        }
+
+        // Rows of this chunk that fall in the window, as byte offsets.
+        let lo = c0.max(row_lo);
+        let hi = c_end.min(row_hi);
+        let src = (lo - c0).saturating_mul(row_bytes);
+        let dst = (lo - row_lo) * row_bytes;
+        let band = (hi - lo) * row_bytes;
+
+        let coord: Vec<u64> = chunk.offsets.iter().take(rank).copied().collect();
+        let hit = cache.with_decompressed(&coord, |bytes| {
+            row_band_copy(&mut output, dst, bytes, src, band, elem_size);
+        });
+        if hit.is_some() {
+            continue;
+        }
+
+        let raw = source.read_exact_at(chunk.address, chunk.chunk_size as usize)?;
+        match pipeline {
+            Some(pl) => {
+                let dec = decompress_chunk(&raw, pl, ctx, chunk.filter_mask)?;
+                row_band_copy(&mut output, dst, &dec, src, band, elem_size);
+                cache.put_decompressed(coord, dec);
+            }
+            None => {
+                row_band_copy(&mut output, dst, &raw, src, band, elem_size);
+                cache.put_decompressed_slice(coord, &raw);
+            }
+        }
+    }
+
+    Ok(Some(output))
+}
+
+/// Copy one chunk's overlapping row band into the window buffer at `dst`, clamped
+/// to the bytes present on each side (element-aligned). An edge or short chunk
+/// copies only its valid prefix and never reads or writes out of bounds — the same
+/// discipline as [`copy_chunk_to_output`].
+fn row_band_copy(
+    output: &mut [u8],
+    dst: usize,
+    chunk: &[u8],
+    src: usize,
+    band: usize,
+    elem_size: usize,
+) {
+    let mut len = band
+        .min(chunk.len().saturating_sub(src))
+        .min(output.len().saturating_sub(dst));
+    len -= len % elem_size;
+    if len > 0 {
+        output[dst..dst + len].copy_from_slice(&chunk[src..src + len]);
+    }
 }
 
 /// Read a chunked dataset from a [`Source`] with parsed-index and
@@ -878,27 +1052,7 @@ pub fn read_chunked_data_cached_from_source<S: Source + ?Sized>(
         .ok_or_else(|| FormatError::ChunkedReadError("no address for chunked layout".into()))?;
 
     let elem_size = datatype.type_size() as usize;
-    let ndims = chunk_dimensions.len();
-    let rank = ndims
-        .checked_sub(1)
-        .ok_or_else(|| FormatError::ChunkedReadError("chunked layout has no dimensions".into()))?;
-    let chunk_dims: Vec<usize> = chunk_dimensions[..rank]
-        .iter()
-        .map(|&d| d as usize)
-        .collect();
-    let ds_dims: Vec<usize> = dataspace
-        .dimensions
-        .iter()
-        .map(|&d| d.to_usize())
-        .collect::<Result<_, _>>()?;
-    if ds_dims.len() != rank {
-        return Err(FormatError::ChunkedReadError(format!(
-            "rank mismatch: dataspace has {} dims, layout has {} chunk dims (rank={})",
-            ds_dims.len(),
-            chunk_dimensions.len(),
-            rank
-        )));
-    }
+    let (rank, chunk_dims, ds_dims) = chunked_dims(chunk_dimensions, dataspace)?;
 
     let chunks = if let Some(chunks) = cache.all_indexed_chunks() {
         chunks
@@ -1494,28 +1648,8 @@ pub fn read_chunked_data_cached(
         .ok_or_else(|| FormatError::ChunkedReadError("no address for chunked layout".into()))?;
 
     let elem_size = datatype.type_size() as usize;
-    let ndims = chunk_dimensions.len();
-    let rank = ndims
-        .checked_sub(1)
-        .ok_or_else(|| FormatError::ChunkedReadError("chunked layout has no dimensions".into()))?;
-    let chunk_dims: Vec<usize> = chunk_dimensions[..rank]
-        .iter()
-        .map(|&d| d as usize)
-        .collect();
-
-    let ds_dims: Vec<usize> = dataspace
-        .dimensions
-        .iter()
-        .map(|&d| d.to_usize())
-        .collect::<Result<_, _>>()?;
-    if ds_dims.len() != rank {
-        return Err(FormatError::ChunkedReadError(format!(
-            "rank mismatch: dataspace has {} dims, layout has {} chunk dims (rank={})",
-            ds_dims.len(),
-            chunk_dimensions.len(),
-            rank
-        )));
-    }
+    let (rank, chunk_dims, ds_dims) = chunked_dims(chunk_dimensions, dataspace)?;
+    let ndims = rank + 1; // rank + the trailing element-size dimension
 
     #[expect(
         clippy::cast_possible_truncation,
@@ -2070,6 +2204,7 @@ mod tests {
 
     use crate::dataspace::{Dataspace, DataspaceType};
     use crate::datatype::{Datatype, DatatypeByteOrder};
+    use crate::source::BytesSource;
 
     fn make_f64_type() -> Datatype {
         Datatype::FloatingPoint {
@@ -2204,7 +2339,7 @@ mod tests {
         datatype: &Datatype,
         pipeline: Option<&FilterPipeline>,
     ) {
-        use crate::source::{BytesSource, ReadSeekSource};
+        use crate::source::ReadSeekSource;
         let buffered =
             read_chunked_data(file_data, layout, dataspace, datatype, pipeline, 8, 8).unwrap();
         let from_mem = read_chunked_data_from_source(
@@ -2582,5 +2717,141 @@ mod tests {
             let val = f64::from_le_bytes(raw[i * 8..(i + 1) * 8].try_into().unwrap());
             assert_eq!(val, i as f64, "mismatch at index {i}");
         }
+    }
+
+    // --- Windowed row-read guards (read_chunked_rows_from_source) ---
+
+    /// A rank-0 (scalar) chunked layout leaves `chunk_dims` empty; the windowed
+    /// reader must fall back (`Ok(None)`) rather than index `chunk_dims[0]` and
+    /// panic. Only a crafted file reaches this (valid chunked layouts are rank
+    /// >= 1), but the reader parses untrusted input.
+    #[test]
+    fn windowed_rows_rank0_chunked_falls_back() {
+        let layout = DataLayout::Chunked {
+            chunk_dimensions: vec![8], // dimensionality 1 => rank 0
+            btree_address: Some(0),
+            version: 3,
+            chunk_index_type: None,
+            single_chunk_filtered_size: None,
+            single_chunk_filter_mask: None,
+        };
+        let dataspace = Dataspace {
+            space_type: DataspaceType::Scalar,
+            rank: 0,
+            dimensions: vec![],
+            max_dimensions: None,
+        };
+        let cache = ChunkCache::new();
+        let out = read_chunked_rows_from_source(
+            &BytesSource::new(b""),
+            &layout,
+            &dataspace,
+            &make_f64_type(),
+            None,
+            8,
+            8,
+            &cache,
+            0,
+            1,
+        )
+        .expect("rank-0 chunked must not panic");
+        assert!(
+            out.is_none(),
+            "rank-0 chunked should fall back to the whole reader"
+        );
+    }
+
+    /// Inner dimensions whose product overflows `usize` must error rather than
+    /// panic (debug) or wrap (release). `(2^22)^3` overflows 64-bit `usize`;
+    /// `(2^22)^2` already overflows 32-bit, so this holds on both.
+    #[test]
+    fn windowed_rows_inner_dim_product_overflow_errors() {
+        let big: u32 = 1 << 22;
+        let layout = DataLayout::Chunked {
+            chunk_dimensions: vec![1, big, big, big, 8],
+            btree_address: Some(0),
+            version: 3,
+            chunk_index_type: None,
+            single_chunk_filtered_size: None,
+            single_chunk_filter_mask: None,
+        };
+        let dataspace = Dataspace {
+            space_type: DataspaceType::Simple,
+            rank: 4,
+            dimensions: vec![1, big.into(), big.into(), big.into()],
+            max_dimensions: None,
+        };
+        let cache = ChunkCache::new();
+        let err = read_chunked_rows_from_source(
+            &BytesSource::new(b""),
+            &layout,
+            &dataspace,
+            &make_f64_type(),
+            None,
+            8,
+            8,
+            &cache,
+            0,
+            1,
+        )
+        .expect_err("overflowing inner-dim product must error");
+        assert!(
+            matches!(err, FormatError::OffsetOverflow { .. }),
+            "expected OffsetOverflow, got {err:?}"
+        );
+    }
+
+    /// An unallocated chunk index (`btree_address == None`, e.g. a late-allocated
+    /// never-written dataset) must error for a non-empty window, matching the
+    /// whole-dataset reader, instead of fabricating a window of zeros; an empty
+    /// (zero-row) window still succeeds.
+    #[test]
+    fn windowed_rows_unallocated_index_matches_whole_read() {
+        let layout = DataLayout::Chunked {
+            chunk_dimensions: vec![4, 8],
+            btree_address: None,
+            version: 3,
+            chunk_index_type: None,
+            single_chunk_filtered_size: None,
+            single_chunk_filter_mask: None,
+        };
+        let dataspace = Dataspace {
+            space_type: DataspaceType::Simple,
+            rank: 1,
+            dimensions: vec![10],
+            max_dimensions: None,
+        };
+        let cache = ChunkCache::new();
+        let err = read_chunked_rows_from_source(
+            &BytesSource::new(b""),
+            &layout,
+            &dataspace,
+            &make_f64_type(),
+            None,
+            8,
+            8,
+            &cache,
+            0,
+            4,
+        )
+        .expect_err("non-empty window over an unallocated index must error");
+        assert!(
+            matches!(err, FormatError::ChunkedReadError(_)),
+            "expected ChunkedReadError, got {err:?}"
+        );
+        let empty = read_chunked_rows_from_source(
+            &BytesSource::new(b""),
+            &layout,
+            &dataspace,
+            &make_f64_type(),
+            None,
+            8,
+            8,
+            &cache,
+            0,
+            0,
+        )
+        .expect("empty window must still be Ok");
+        assert_eq!(empty, Some(Vec::new()));
     }
 }
