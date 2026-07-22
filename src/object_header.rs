@@ -8,7 +8,7 @@ use byteorder::{ByteOrder, LittleEndian};
 use crate::convert::{TryToUsize, slice_range};
 use crate::error::FormatError;
 use crate::message_type::MessageType;
-use crate::source::FileSource;
+use crate::source::Source;
 
 /// OHDR signature for v2 object headers.
 const OHDR_SIGNATURE: [u8; 4] = *b"OHDR";
@@ -557,18 +557,18 @@ impl ObjectHeader {
     }
 
     // -----------------------------------------------------------------------
-    // Streaming parsers (read each header chunk from a `FileSource` on demand)
+    // Streaming parsers (read each header chunk from a `Source` on demand)
     // -----------------------------------------------------------------------
 
-    /// Parse an object header from a [`FileSource`], reading each header chunk
+    /// Parse an object header from a [`Source`], reading each header chunk
     /// (and continuation chunk) as a small bounded window via
-    /// [`FileSource::read_at`] rather than indexing a whole-file buffer.
+    /// [`Source::read_at`] rather than indexing a whole-file buffer.
     ///
     /// `base_address` is added to v1 continuation offsets (as in
     /// [`Self::parse_with_base`]). The result is identical to the buffered
     /// parser; this path simply never holds more than one chunk at a time, so it
     /// works against a file larger than the address space on a 32-bit host.
-    pub fn parse_from_source<S: FileSource + ?Sized>(
+    pub fn parse_from_source<S: Source + ?Sized>(
         source: &S,
         address: u64,
         offset_size: u8,
@@ -584,7 +584,7 @@ impl ObjectHeader {
         }
     }
 
-    fn parse_v2_from_source<S: FileSource + ?Sized>(
+    fn parse_v2_from_source<S: Source + ?Sized>(
         source: &S,
         address: u64,
         offset_size: u8,
@@ -717,7 +717,7 @@ impl ObjectHeader {
         })
     }
 
-    fn parse_v1_from_source<S: FileSource + ?Sized>(
+    fn parse_v1_from_source<S: Source + ?Sized>(
         source: &S,
         address: u64,
         offset_size: u8,
@@ -764,7 +764,7 @@ impl ObjectHeader {
     /// each continuation depth-first (as the buffered v1 parser does) so the
     /// resulting message order is identical.
     #[allow(clippy::too_many_arguments)]
-    fn parse_v1_chunk_from_source<S: FileSource + ?Sized>(
+    fn parse_v1_chunk_from_source<S: Source + ?Sized>(
         source: &S,
         region_addr: u64,
         region_len: u64,

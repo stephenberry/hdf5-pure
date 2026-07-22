@@ -14,7 +14,7 @@ use crate::dataspace::Dataspace;
 use crate::datatype::{Datatype, DatatypeByteOrder};
 use crate::error::FormatError;
 use crate::filter_pipeline::FilterPipeline;
-use crate::source::FileSource;
+use crate::source::Source;
 
 /// Read raw bytes for a dataset given its layout and the file data buffer,
 /// using default filter/size parameters.
@@ -135,20 +135,20 @@ pub fn read_raw_data_cached(
 }
 
 // ---------------------------------------------------------------------------
-// Streaming variants (read from a `FileSource` instead of a whole-file buffer)
+// Streaming variants (read from a `Source` instead of a whole-file buffer)
 // ---------------------------------------------------------------------------
 //
 // These mirror `read_raw_data_full` / `read_raw_data` / `read_raw_data_cached`
-// but fetch bytes on demand via `FileSource::read_exact_at`, so a 32-bit host
+// but fetch bytes on demand via `Source::read_exact_at`, so a 32-bit host
 // can read a dataset out of a file larger than its address space. They always
 // return an owned `Vec<u8>`: a lazy source cannot hand out a borrow, and the
 // public API already returns owned data. The zero-copy `read_raw_data_zerocopy`
 // stays the in-memory-only fast path and is intentionally not given a streaming
 // variant.
 
-/// Read raw bytes for a dataset from a [`FileSource`] (streaming counterpart of
+/// Read raw bytes for a dataset from a [`Source`] (streaming counterpart of
 /// [`read_raw_data_full`]).
-pub fn read_raw_data_full_from_source<S: FileSource + ?Sized>(
+pub fn read_raw_data_full_from_source<S: Source + ?Sized>(
     source: &S,
     layout: &DataLayout,
     dataspace: &Dataspace,
@@ -208,7 +208,7 @@ pub fn read_raw_data_full_from_source<S: FileSource + ?Sized>(
 
 /// Streaming counterpart of [`read_raw_data_cached`].
 #[allow(clippy::too_many_arguments)]
-pub fn read_raw_data_cached_from_source<S: FileSource + ?Sized>(
+pub fn read_raw_data_cached_from_source<S: Source + ?Sized>(
     source: &S,
     layout: &DataLayout,
     dataspace: &Dataspace,

@@ -5,7 +5,7 @@ use alloc::string::String;
 
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
-use crate::source::FileSource;
+use crate::source::Source;
 
 /// Parsed HDF5 Local Heap header.
 #[derive(Debug, Clone)]
@@ -140,8 +140,8 @@ impl LocalHeap {
         Ok(String::from(s))
     }
 
-    /// Parse a local heap header from a [`FileSource`] (small bounded window).
-    pub fn parse_from_source<S: FileSource + ?Sized>(
+    /// Parse a local heap header from a [`Source`] (small bounded window).
+    pub fn parse_from_source<S: Source + ?Sized>(
         source: &S,
         address: u64,
         offset_size: u8,
@@ -158,7 +158,7 @@ impl LocalHeap {
     /// [`data_segment_address`](Self::data_segment_address)).
     ///
     /// This is the streaming counterpart of [`read_string`](Self::read_string):
-    /// the caller reads the data segment once via [`FileSource`] and slices every
+    /// the caller reads the data segment once via [`Source`] and slices every
     /// name out of it, so a group with many links costs one segment read rather
     /// than one read per name.
     pub fn read_string_in_segment(

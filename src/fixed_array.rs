@@ -9,7 +9,7 @@ use alloc::{format, vec, vec::Vec};
 use crate::chunked_read::ChunkInfo;
 use crate::convert::{TryToUsize, is_undefined_addr, u32_from};
 use crate::error::FormatError;
-use crate::source::FileSource;
+use crate::source::Source;
 
 /// Parsed Fixed Array header (FAHD).
 #[derive(Debug, Clone)]
@@ -107,8 +107,8 @@ impl FixedArrayHeader {
         })
     }
 
-    /// Parse a Fixed Array header from a [`FileSource`] (bounded window).
-    pub fn parse_from_source<S: FileSource + ?Sized>(
+    /// Parse a Fixed Array header from a [`Source`] (bounded window).
+    pub fn parse_from_source<S: Source + ?Sized>(
         source: &S,
         address: u64,
         offset_size: u8,
@@ -417,13 +417,13 @@ pub fn read_fixed_array_chunks(
     Ok(chunks)
 }
 
-/// Read chunk records from a Fixed Array via a [`FileSource`].
+/// Read chunk records from a Fixed Array via a [`Source`].
 ///
 /// Streaming counterpart of [`read_fixed_array_chunks`]: it reads the data-block
 /// prefix, then the element array (non-paged) or each initialized page
 /// (paged) as bounded windows via `read_at`, decoding the same records.
 #[allow(clippy::too_many_arguments)]
-pub fn read_fixed_array_chunks_from_source<S: FileSource + ?Sized>(
+pub fn read_fixed_array_chunks_from_source<S: Source + ?Sized>(
     source: &S,
     header: &FixedArrayHeader,
     dataset_dims: &[u64],

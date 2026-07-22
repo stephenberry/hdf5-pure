@@ -66,6 +66,8 @@ use crate::element::H5Element;
 use crate::error::Error;
 use crate::file_lock::FileLocking;
 use crate::filter_pipeline::FilterPipeline;
+use crate::group_v2;
+use crate::source::Source;
 
 /// Per-dataset state located once, then maintained across appends.
 struct DatasetState {
@@ -232,19 +234,26 @@ impl AppendWriter {
         if self.datasets.contains_key(dataset) {
             return Ok(());
         }
-        let result = Located::locate(&self.file, dataset, Error::AppendUnsupported)?;
+        let oh_addr = group_v2::resolve_path_any(self.file.data(), &self.file.superblock, dataset)?;
+        let result = Located::locate_at(&self.file, oh_addr, Error::AppendUnsupported)?;
         if result.located.chunk_elems == 0 {
             return Err(Error::AppendUnsupported(
                 "append requires a nonzero chunk length",
             ));
         }
-        let data = self.file.data();
         let (dt_off, dt_size) = result.spans.datatype;
-        let (datatype, _) = Datatype::parse(&data[dt_off..dt_off + dt_size])
+        let dt_bytes = self
+            .file
+            .read_metadata_at(dt_off, dt_size)
+            .map_err(|_| Error::AppendUnsupported("dataset datatype could not be parsed"))?;
+        let (datatype, _) = Datatype::parse(&dt_bytes)
             .map_err(|_| Error::AppendUnsupported("dataset datatype could not be parsed"))?;
         let pipeline = match result.spans.filter {
             Some((fb, fsize)) => {
-                let parsed = FilterPipeline::parse(&data[fb..fb + fsize]).map_err(|_| {
+                let fp_bytes = self.file.read_metadata_at(fb, fsize).map_err(|_| {
+                    Error::AppendUnsupported("dataset filter pipeline could not be parsed")
+                })?;
+                let parsed = FilterPipeline::parse(&fp_bytes).map_err(|_| {
                     Error::AppendUnsupported("dataset filter pipeline could not be parsed")
                 })?;
                 if !pipeline_reencodable(&parsed) {
