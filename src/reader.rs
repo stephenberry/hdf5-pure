@@ -1269,7 +1269,7 @@ fn read_rows_framed<S: Source + ?Sized>(
             // Never read past the dataset's own contiguous storage.
             if start.saturating_add(len as u64) > *size {
                 return Err(FormatError::DataSizeMismatch {
-                    expected: (start as usize).saturating_add(len),
+                    expected: start.to_usize()?.saturating_add(len),
                     actual: (*size).to_usize()?,
                 });
             }
