@@ -1,6 +1,6 @@
 //! Editing an existing file in place with `EditSession`: add, overwrite, copy
 //! (within the file and across two open files), and delete objects, and edit
-//! group attributes, without reading the whole file in and rewriting it.
+//! group attributes, without rewriting the file from scratch.
 //!
 //! New data and rebuilt object headers are appended at end-of-file and the
 //! superblock is repointed last, so a failed commit leaves the original file

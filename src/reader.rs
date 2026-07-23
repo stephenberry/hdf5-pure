@@ -354,11 +354,14 @@ impl FileInner {
     /// Metadata and dataset chunks are read through a `ReadSeekSource`, so peak
     /// memory stays close to one chunk plus the metadata being parsed.
     ///
-    /// Current limits (the buffered [`File::open`] has none of these): only
-    /// latest-format (v2) groups resolve — a v1 symbol-table group on the path
-    /// is rejected — and attribute reading on the streaming backend is not yet
-    /// supported. Dataset reads (contiguous, compact, and all chunked index
-    /// types) are fully supported.
+    /// Reads match the buffered [`File::open`]: every storage layout and chunk
+    /// index type, both group forms (v2 and v1 symbol-table), and compact,
+    /// dense, shared, and variable-length attributes. What differs:
+    /// [`as_bytes`](Self::as_bytes) returns an empty slice (there is no
+    /// whole-file buffer), [`persisted_free_space`](Self::persisted_free_space)
+    /// returns no regions, a streaming file cannot be the *source* of a
+    /// cross-file copy, and chunk decompression is sequential (the `parallel`
+    /// feature accelerates only buffered reads).
     pub fn open_streaming<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
         Self::open_streaming_with_options(path, FileAccessOptions::new())
     }
@@ -1522,9 +1525,8 @@ impl File {
     /// and of the size of each append call.
     ///
     /// This is the read-write sibling of [`open_streaming`](Self::open_streaming):
-    /// reads are served by positioned I/O with the same capabilities and limits
-    /// as the streaming backend (v1 symbol-table groups on a resolved path are
-    /// not supported), while immediate [`Dataset::append`] runs the same
+    /// reads are served by positioned I/O with the same capabilities as the
+    /// streaming backend, while immediate [`Dataset::append`] runs the same
     /// crash-atomic engine as [`open_rw`](Self::open_rw) — filtered whole-chunk
     /// / unfiltered any-length, durable before it returns, no `commit` needed.
     /// A large append is applied in whole-chunk batches, each crash-atomic, so
@@ -1546,13 +1548,16 @@ impl File {
     /// [`close`](Self::close) or, best-effort, when the last handle drops (issue
     /// #173). Only a true crash (`SIGKILL`, power loss) skips that rewrite; the
     /// appended data is still durable and reopens correctly, the managers merely
-    /// stay non-canonical until the next clean rewrite. The **paged** file-space
-    /// strategy (`H5F_FSPACE_STRATEGY_PAGE`) is not yet supported here and is
-    /// refused at open.
+    /// stay non-canonical until the next clean rewrite. A genuine **paged** file
+    /// (`H5F_FSPACE_STRATEGY_PAGE` with `persist = true`) is also supported:
+    /// appends stay page-homogeneous (raw and metadata in separate pages) and
+    /// the per-page-type managers are rewritten at close. A paged file that
+    /// does *not* persist its free space is refused at open — recreate it with
+    /// `persist = true` to grow it in place.
     ///
     /// Requires a latest-format (v2/v3 superblock) file with 8-byte offsets and
-    /// lengths and no userblock; other files (including paged ones) are refused
-    /// at open with [`Error::EditUnsupported`](crate::Error::EditUnsupported).
+    /// lengths and no userblock; other files are refused at open with
+    /// [`Error::EditUnsupported`](crate::Error::EditUnsupported).
     pub fn open_rw_bounded<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
         Self::open_rw_bounded_with_options(path, FileAccessOptions::new())
     }

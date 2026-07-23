@@ -33,13 +33,12 @@ Dataset reads are fully supported across every storage layout:
 | Chunked (fixed array index) | Yes |
 | Chunked (extensible array index) | Yes |
 
-!!! warning
-    Two limits apply to the streaming backend that in-memory reading does not have:
+!!! note
+    The streaming backend resolves both group forms (v2 and v1 symbol-table) and reads compact, dense, shared, and variable-length attributes, same as `File::open`. The remaining differences:
 
-    - Only latest-format (v2) groups resolve along a path. A v1 symbol-table group is rejected.
-    - Reading attributes is not yet supported.
-
-    If a file uses v1 groups or you need attributes, open it with `File::open` instead.
+    - `File::as_bytes` returns an empty slice (there is no whole-file buffer), and `persisted_free_space` returns no regions (the free-space-manager blocks are not loaded).
+    - A streaming file cannot be the **source** of a cross-file [`copy_from`](editing.md) — that copy requires a buffered source.
+    - Chunk decompression is sequential; the `parallel` feature accelerates only buffered reads.
 
 Streaming opens are read-only. To **append** to a file with the same bounded-memory discipline, open it with [`File::open_rw_bounded`](editing.md#bounded-memory-appends) — the read-write sibling of `open_streaming`, sharing this backend's read capabilities and the `FileAccessOptions` cache budgets below.
 

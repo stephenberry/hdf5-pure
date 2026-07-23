@@ -79,7 +79,7 @@ b.with_file_space_strategy(FileSpaceStrategy::Page, true, 0) // persist so it ca
 b.write("paged.h5").unwrap();
 ```
 
-A paged file is grown in place only through [`File::open_rw_bounded`](editing.md#bounded-memory-appends), which keeps each new page homogeneous (raw and metadata never share a page) and rewrites the per-page-type managers at `File::close`. Growing one through the whole-file editor (`File::open_rw`, or the deprecated `EditSession`) is refused, because a whole-file commit would collapse the per-page-type managers into a single non-paged manager and lose the page alignment. A paged file created **without** `persist = true` has no on-disk record of which pages hold metadata versus raw data, so it cannot be grown at all — recreate it with `persist = true` if you need to append to it later.
+A paged file is grown in place only through [`File::open_rw_bounded`](editing.md#bounded-memory-appends), which keeps each new page homogeneous (raw and metadata never share a page) and rewrites the per-page-type managers at `File::close`. Growing one through `File::open_rw` (or the deprecated `EditSession`) is refused up front, before any byte changes: that editor's commit appends without page alignment and serializes a single generic free-space manager, either of which would silently degrade the paging. (The refusal is not about rewriting — [no commit ever rewrites a file](../about/architecture.md#write-paths).) A paged file created **without** `persist = true` has no on-disk record of which pages hold metadata versus raw data, so it cannot be grown at all — recreate it with `persist = true` if you need to append to it later.
 
 ## Persisting free space across sessions
 

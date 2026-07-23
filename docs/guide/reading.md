@@ -194,10 +194,7 @@ let ds = file.dataset("temperature").unwrap();
 println!("unit: {:?}", ds.attrs().unwrap().get("unit"));
 ```
 
-See [Groups and Attributes](groups-attributes.md) for the full `AttrValue` set and writing patterns.
-
-!!! warning "Streaming attribute limits"
-    Reading attributes is not yet supported on the `File::open_streaming` backend, which also resolves only latest-format (v2) groups along a path. In-memory reads (`File::open` / `File::from_bytes`) have neither limit. See [Streaming](streaming.md).
+See [Groups and Attributes](groups-attributes.md) for the full `AttrValue` set and writing patterns. Attributes read identically on every backend, including [`File::open_streaming`](streaming.md).
 
 ## Inspecting a file
 

@@ -1,6 +1,6 @@
 # Editing in Place
 
-`EditSession` opens an existing HDF5 file and adds, copies, or deletes objects, or edits group attributes, without reading the whole file in and rewriting it. New data and rebuilt object headers are appended at the end of the file and the superblock is repointed last, so the cost is proportional to what changes rather than to the file size, and a failed commit leaves the original file valid.
+`EditSession` opens an existing HDF5 file and adds, copies, or deletes objects, or edits group attributes, without rewriting the file from scratch. New data and rebuilt object headers are appended at the end of the file and the superblock is repointed last, so the cost is proportional to what changes rather than to the file size, and a failed commit leaves the original file valid.
 
 !!! warning "Deprecated"
     `EditSession` is superseded by the owned-handle API and will be removed in a later release. Open a file for reading **and** writing with `File::open_rw` and edit it through owned `Dataset` and `Group` handles that reach every object by name: `Dataset::append`/`write`/`append_staged`, `Group::create_dataset`/`create_group`/`delete`/`set_attr`, and `File::copy`/`copy_from`/`commit`. One open file both writes and reads back, with no separate session type.
@@ -11,6 +11,39 @@
     ```bash
     cargo run --example edit_in_place
     ```
+
+## Choosing a write path
+
+Two open modes edit an existing file in place. `File::open_rw` reads the file into a whole-file **mirror** — `O(file size)` memory — and offers the full edit vocabulary. `File::open_rw_bounded` never builds a mirror — memory stays at the [configured caches](streaming.md) — and offers the full read surface plus the immediate, crash-atomic `Dataset::append`. Both mutate the file the same way: new bytes are appended and a small, fixed set of locations is patched. Neither ever rewrites the file on commit; see [write paths](../about/architecture.md#write-paths) for the mechanics.
+
+| Operation | `File::open_rw` (mirror) | `File::open_rw_bounded` (bounded) |
+| --- | --- | --- |
+| Reads (datasets, attributes, groups, row windows) | Yes | Yes |
+| `Dataset::append` / `append_raw` — immediate, crash-atomic | Yes — see the strategy table below | Yes — see the strategy table below |
+| `Dataset::write` — whole-value overwrite | Yes, on `commit` | No |
+| `Dataset::append_staged` — index-rebuilding append | Yes, on `commit` | No |
+| `set_attr` / `remove_attr` on datasets and groups | Yes, on `commit` | No |
+| `Group::create_dataset` / `create_group` | Yes, on `commit` | No |
+| `Group::delete` — frees space for reuse | Yes, on `commit` | No |
+| `File::copy` / `copy_from` | Yes, on `commit` | No |
+| `File::commit` / `space_accounting` | Yes | No |
+| Memory | `O(file size)` | configured caches |
+| Accepted files | superblock v0–3, 8-byte offsets and lengths; a canonical userblock is fine | superblock v2/v3, 8-byte offsets and lengths, no userblock |
+
+Every **No** in the bounded column is refused with `Error::BoundedStagedUnsupported` before any byte changes. One caveat inside the mirror column: the immediate `Dataset::append` is stricter than the staged surface — it also needs a latest-format (v2/v3-superblock) file with no userblock, and the refusal (`Error::AppendInPlaceUnsupported`) names `Dataset::append_staged` as the fallback.
+
+The file's [file-space strategy](file-space.md) gates the write paths further. This is the one place where the file's internal storage strategy, not just your memory budget, steers the choice of open:
+
+| File-space strategy | Staged edits + `commit` (`open_rw`) | Immediate append (`open_rw`) | Immediate append (`open_rw_bounded`) |
+| --- | --- | --- | --- |
+| None recorded, or `FsmAggr` / `Aggr` / `None` with `persist = false` | Yes | Yes | Yes |
+| `FsmAggr` / `Aggr` / `None` with `persist = true` | Yes — freed space is recorded on disk | No — use `Dataset::append_staged` | Yes — managers rewritten at `close` |
+| `Page` with `persist = true` | No — appends via `open_rw_bounded` are the only in-place edit | No — use `open_rw_bounded` | Yes — appends stay page-homogeneous |
+| `Page` with `persist = false` | No | No | No — refused at open; recreate the file with `persist = true` |
+
+The refusals are `Error::EditUnsupported` for a staged `commit` on a paged file and for the bounded open of a non-persisting paged file, and `Error::AppendInPlaceUnsupported` for an immediate `open_rw` append on a persisting or paged file. Each fires before any byte of the file changes. A `Page` / `persist = false` file stays fully readable through every read path and can be rewritten compactly by [repack](repack.md).
+
+For a brand-new file, use [`FileBuilder`](writing.md); to append while readers are live, use the [SWMR writer](swmr.md); to compact a file or drop objects across a reopen, use [repack](repack.md). The [file properties reference](../reference/property-support.md) has the corresponding fcpl/fapl support matrix.
 
 ## Staging and committing edits
 
@@ -97,7 +130,7 @@ Element types are checked, never coerced: each typed `append_*` call records the
 
 ### Streaming appends
 
-`append_dataset` re-reads the whole file and rebuilds the chunk index on every `commit`, which is the right trade for a one-off append composed alongside other edits, but not for a high-frequency append loop. For that, open the file **once** with `File::open_rw` and append many times through a `Dataset` handle, growing the Extensible-Array index *in place* — so each append costs `O(appended bytes)` plus amortized `O(1)` index overhead, with no whole-file re-read and no index rebuild.
+`append_dataset` rebuilds the dataset's chunk index and relocates its header on every `commit` (and each new `EditSession` re-reads the whole file at open), which is the right trade for a one-off append composed alongside other edits, but not for a high-frequency append loop. For that, open the file **once** with `File::open_rw` and append many times through a `Dataset` handle, growing the Extensible-Array index *in place* — so each append costs `O(appended bytes)` plus amortized `O(1)` index overhead, with no whole-file re-read and no index rebuild.
 
 ```rust
 use hdf5_pure::File;
@@ -113,7 +146,7 @@ One open file reaches every dataset by name, takes an exclusive file lock for it
 
 That atomicity is why filtered and unfiltered datasets have different length rules. An **unfiltered** append may be **any length**: when the current length is not chunk-aligned, the trailing partial chunk is rewritten and its index element — a single chunk address — is repointed with one atomic write. A **filtered** append must be **chunk-aligned** (the current length and the appended length both whole multiples of the chunk length), because a filtered index element is a multi-field record whose in-place repoint is not power-loss atomic; a filtered append therefore only ever inserts new chunks. For a non-chunk-aligned filtered append, use `append_dataset`, which rebuilds the index and repoints the superblock last (fully atomic).
 
-The remaining eligibility rules match `append_dataset` (chunked, unlimited axis 0, Extensible-Array index, rank 1, a re-encodable filter pipeline), with one difference: because it grows the index in place rather than rebuilding it, the index must already be allocated. This crate allocates it eagerly, so an empty dataset it wrote can be grown from the first append; an empty dataset the C library created without any initial data defers its index and is refused — make that first append with `append_dataset` (which materializes the index), or create the dataset with initial data. The dead bytes left when an unfiltered partial chunk is relocated are reclaimed by [repack](repack.md) rather than reused within the session in this release. This is the throughput-oriented counterpart to `append_dataset` and the filter-capable counterpart to the [SWMR writer](swmr.md).
+The remaining eligibility rules match `append_dataset` (chunked, unlimited axis 0, Extensible-Array index, rank 1, a re-encodable filter pipeline), plus the file-level gates in [the tables above](#choosing-a-write-path), with one difference: because it grows the index in place rather than rebuilding it, the index must already be allocated. This crate allocates it eagerly, so an empty dataset it wrote can be grown from the first append; an empty dataset the C library created without any initial data defers its index and is refused — make that first append with `append_dataset` (which materializes the index), or create the dataset with initial data. The dead bytes left when an unfiltered partial chunk is relocated are reclaimed by [repack](repack.md) rather than reused within the session in this release. This is the throughput-oriented counterpart to `append_dataset` and the filter-capable counterpart to the [SWMR writer](swmr.md).
 
 !!! note "Deprecated: `AppendWriter`"
     The standalone `AppendWriter` type provided this same in-place streaming append before the owned-handle API existed. It is now **deprecated** in favor of `File::open_rw` + `Dataset::append` — identical mechanics, rules, and crash-atomicity — and will be removed in a later release. The one behavior without a `File::open_rw` equivalent yet is opening with file locking disabled (`AppendWriter::open_with_locking`).
@@ -134,7 +167,7 @@ samples.append(&[8i32, 9, 10, 11]).unwrap(); // same rules as open_rw
 file.close().unwrap();
 ```
 
-The append rules (filtered whole-chunk / unfiltered any-length, Extensible-Array index required) are identical to `open_rw`. What a bounded file does **not** offer is the staged edit surface — `write`, attribute edits, `create_*`/`delete`, `copy`, `commit`, and `space_accounting` all need the whole-file mirror and return `Error::BoundedStagedUnsupported`. It also requires a latest-format file with 8-byte offsets and no userblock, and its path resolution has the [streaming backend's limits](streaming.md) (no v1 symbol-table groups). It **does** grow a file that persists its free space — including a genuine paged file (`H5F_FSPACE_STRATEGY_PAGE`) — seeding the on-disk free-space managers on open and rewriting them at `File::close`, with paged appends kept page-homogeneous (raw and metadata in separate pages); a paged file that does *not* persist its free space is the one file-space case it refuses (`Error::EditUnsupported` — recreate it with `persist = true` to grow it in place). See [File-Space Strategy](file-space.md) for the paged details. Memory budgets are set with the same `FileAccessOptions` as the streaming reader via `File::open_rw_bounded_with_options`; cached metadata windows touched by an append are invalidated automatically, so reads through the same file never observe stale bytes.
+The append rules (filtered whole-chunk / unfiltered any-length, Extensible-Array index required) are identical to `open_rw`. What a bounded file does **not** offer is the staged edit surface — `write`, attribute edits, `create_*`/`delete`, `copy`, `commit`, and `space_accounting` all need the whole-file mirror and return `Error::BoundedStagedUnsupported`. It also requires a latest-format file with 8-byte offsets and no userblock, and reads have the [streaming backend's capabilities](streaming.md). It **does** grow a file that persists its free space — including a genuine paged file (`H5F_FSPACE_STRATEGY_PAGE`) — seeding the on-disk free-space managers on open and rewriting them at `File::close`, with paged appends kept page-homogeneous (raw and metadata in separate pages); a paged file that does *not* persist its free space is the one file-space case it refuses (`Error::EditUnsupported` — recreate it with `persist = true` to grow it in place). See [File-Space Strategy](file-space.md) for the paged details. Memory budgets are set with the same `FileAccessOptions` as the streaming reader via `File::open_rw_bounded_with_options`; cached metadata windows touched by an append are invalidated automatically, so reads through the same file never observe stale bytes.
 
 ## How it works
 
@@ -155,7 +188,7 @@ Contiguous and chunked datasets (with any filter the whole-file writer supports)
 
 Rather than silently degrade a file, `EditSession` refuses anything it cannot reproduce faithfully, returning `Error::EditUnsupported`:
 
-- A userblock or non-zero base address.
+- A file whose superblock is not located at its base address — a relocated or malformed userblock layout. (A canonical userblock, such as a MATLAB v7.3 `.mat` file's 512-byte userblock, is supported: addresses are read and written relative to the base and the userblock bytes are preserved.)
 - Dense-storage headers on the edited path.
 - Copying an existing version-1 object.
 - Across files (`copy_from`): variable-length or reference datasets and attributes, any shared (committed/SOHM) header message, and a streaming source file — none of which can be reproduced verbatim in another file.
