@@ -277,6 +277,52 @@ fn we_read_c_library_strategy() {
 }
 
 #[test]
+fn c_library_reads_our_fresh_persisting_file() {
+    let _c = c_lib_guard();
+    // Regression for issue #178: a fresh `persist = true` non-paged file must record
+    // a defined `eoa_fsm_fsalloc` in its File Space Info message. hdf5-pure once
+    // wrote the UNDEF sentinel, which an assertion-enabled libhdf5 rejects on open
+    // (H5Fsuper.c: `fs_persist => eoa_fsm_fsalloc != UNDEF`). No dataset is deleted,
+    // so the file genuinely tracks no free space — the corner the strategy
+    // crosschecks (persist = false, or persist = true only after a delete) missed.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("ours_fresh_persist.h5");
+
+    let mut b = FileBuilder::new();
+    b.create_dataset("d").with_i32_data(&[1, 2, 3]);
+    b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1);
+    b.write(&path).unwrap();
+
+    // Nothing is freed, so our own tracked free space is zero.
+    let total_ours: u64 = File::open(&path)
+        .unwrap()
+        .persisted_free_space()
+        .iter()
+        .map(|(_, l)| l)
+        .sum();
+    assert_eq!(total_ours, 0);
+
+    // The C library opens the persisting file (which would abort before the fix),
+    // recovers the persist flag, reads the data, and reports a matching (zero)
+    // free-space total.
+    let f = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        f.create_plist().unwrap().get_file_space_strategy().unwrap(),
+        CStrategy::FreeSpaceManager {
+            paged: false,
+            persist: true,
+            threshold: 1,
+        }
+    );
+    assert_eq!(
+        f.dataset("d").unwrap().read_raw::<i32>().unwrap(),
+        vec![1, 2, 3]
+    );
+    let free_c = unsafe { H5Fget_freespace(f.id()) };
+    assert_eq!(free_c as u64, total_ours);
+}
+
+#[test]
 fn c_library_reads_our_paged_file() {
     let _c = c_lib_guard();
     // hdf5-pure writes a genuine paged (H5F_FSPACE_STRATEGY_PAGE) persisting file

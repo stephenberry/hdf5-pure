@@ -128,9 +128,12 @@ impl FileSpaceInfo {
 
     /// A persisting message for a file with no free space yet (the form
     /// [`FileBuilder`](crate::FileBuilder) emits for `persist = true`): the
-    /// persist flag is set but every manager slot is undefined and no FSM space
-    /// has been allocated, so `eoa_pre_fsm` is [`UNDEF`]. This matches what the C
-    /// library records when persistence is on but nothing is tracked.
+    /// persist flag is set and every manager slot is undefined because no FSM
+    /// space has been allocated. `eoa_pre_fsm` is left [`UNDEF`] here as a
+    /// placeholder; the writer overwrites it with the real end-of-allocation once
+    /// the layout is known, because libhdf5 requires a persisting file to record a
+    /// defined `eoa_fsm_fsalloc` (an assertion-enabled build aborts on the
+    /// sentinel — issue #178).
     pub(crate) fn persistent_empty(
         strategy: FileSpaceStrategy,
         threshold: u64,

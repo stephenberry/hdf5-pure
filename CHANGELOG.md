@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- A fresh file written with `persist = true` and a non-paged file-space strategy (`FsmAggr`/`Aggr`/`None`) now records a defined end-of-allocation in its File Space Info message instead of the undefined sentinel, so an assertion-enabled build of the reference C library opens it instead of aborting; release builds already tolerated it ([#178](https://github.com/stephenberry/hdf5-pure/issues/178)).
 - The refusal when opening a *non-persisting* paged file with `File::open_rw_bounded` no longer points at `File::open_rw` (which also refuses a paged file); it now advises recreating the file with `persist = true`, the way to grow a paged file in place ([#178](https://github.com/stephenberry/hdf5-pure/issues/178)).
 
 ## [0.23.0] - 2026-07-22

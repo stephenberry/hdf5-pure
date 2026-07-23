@@ -674,6 +674,23 @@ impl FileWriter {
         // is independent of the file layout, so build it up front and place it
         // after all other content below.
         let ext_oh = self.file_space_extension_oh();
+        // A persisting *non-paged* file's placeholder File Space Info message (built
+        // just above) records `eoa_pre_fsm` = UNDEF, because a fresh file has no
+        // free-space-manager blocks. libhdf5 requires `fs_persist => eoa_fsm_fsalloc
+        // != UNDEF`, and an assertion-enabled build aborts on the sentinel
+        // (H5Fsuper.c), so the non-paged tail below rewrites the message with a real
+        // end-of-allocation once the layout is known (issue #178). Capture the
+        // parameters here, while `self` is intact. (The paged path has its own
+        // manager-aware rewrite; a `Page` file never reaches the non-paged tail.)
+        let nonpaged_persist: Option<(FileSpaceStrategy, u64, u64)> = match self.file_space_strategy
+        {
+            Some((strategy, true, threshold)) if strategy != FileSpaceStrategy::Page => Some((
+                strategy,
+                threshold,
+                self.file_space_page_size.unwrap_or(DEFAULT_PAGE_SIZE),
+            )),
+            _ => None,
+        };
         struct DsFlat {
             name: String,
             dt: Datatype,
@@ -1983,7 +2000,27 @@ impl FileWriter {
         }
 
         // Superblock extension (File Space Info), at the address recorded above.
-        if let Some(bytes) = &ext_oh {
+        // For a persisting non-paged file, rebuild the message with a real
+        // end-of-allocation — the end of all content, since no FSM blocks follow —
+        // in place of the UNDEF placeholder (see the capture above; issue #178). The
+        // message length is unchanged (only the `eoa_pre_fsm` field differs), so the
+        // reserved layout still holds.
+        let real_ext_oh = match (&ext_oh, nonpaged_persist) {
+            (Some(_), Some((strategy, threshold, np_page_size))) => {
+                let mut info = FileSpaceInfo::persistent_empty(strategy, threshold, np_page_size);
+                info.eoa_pre_fsm = eof_addr2 - ub as u64;
+                let mut oh = ObjectHeaderWriter::new();
+                oh.add_message_with_flags(MessageType::FileSpaceInfo, info.serialize(), 0x14);
+                Some(oh.serialize())
+            }
+            (other, _) => other.clone(),
+        };
+        debug_assert_eq!(
+            real_ext_oh.as_ref().map_or(0, |b| b.len()),
+            ext_len,
+            "rebuilt extension header length must match the reserved length"
+        );
+        if let Some(bytes) = &real_ext_oh {
             debug_assert_eq!(
                 sink.position(),
                 ub as u64 + ext_addr.unwrap(),
