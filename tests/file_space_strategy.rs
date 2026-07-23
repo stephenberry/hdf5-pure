@@ -116,13 +116,14 @@ fn survives_in_place_edit() {
     // Editing a strategy-bearing file in place must keep the strategy: the
     // superblock extension is preserved across the append-only commit, including
     // a delete that frees space (the extension pins end-of-file, so it is never
-    // cut by truncation).
+    // cut by truncation). Uses a non-paged strategy: a paged file cannot be edited
+    // through the whole-file editor (issue #173 Phase 2), which is covered in
+    // `tests/paged_mutation.rs`.
     use hdf5_pure::EditSession;
     let path = tmp("hdf5_pure_fss_edit.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
-    b.with_file_space_strategy(FileSpaceStrategy::Page, false, 1)
-        .with_file_space_page_size(4096);
+    b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, false, 1);
     b.write(&path).unwrap();
 
     {
@@ -134,8 +135,7 @@ fn survives_in_place_edit() {
     }
 
     let f = File::open(&path).unwrap();
-    assert_eq!(f.file_space_strategy(), Some(FileSpaceStrategy::Page));
-    assert_eq!(f.file_space_info().unwrap().page_size, 4096);
+    assert_eq!(f.file_space_strategy(), Some(FileSpaceStrategy::FsmAggr));
     assert_eq!(
         f.dataset("keep").unwrap().read_i32().unwrap(),
         vec![1, 2, 3]

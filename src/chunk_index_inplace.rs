@@ -228,6 +228,22 @@ pub(crate) trait Store: Source {
     /// made durable-visible immediately (not buffered until the next `sync`), so a
     /// later in-place patch of the region lands on bytes that already exist.
     fn append_bytes(&mut self, bytes: &[u8]) -> Result<u64, Error>;
+
+    /// Append `bytes` that are *raw dataset data* (chunk contents). Identical to
+    /// [`append_bytes`](Self::append_bytes) for every store except the paged
+    /// bounded store, which keeps a paged file's pages homogeneous by never letting
+    /// raw and metadata bytes share a page (issue #173): a raw append after a
+    /// metadata one first pads the current metadata page to a page boundary.
+    fn append_raw(&mut self, bytes: &[u8]) -> Result<u64, Error> {
+        self.append_bytes(bytes)
+    }
+
+    /// Append `bytes` that are *file metadata* (extensible-array data/super blocks,
+    /// object headers, free-space-manager blocks). The metadata counterpart of
+    /// [`append_raw`](Self::append_raw); see it for the paged-homogeneity contract.
+    fn append_meta(&mut self, bytes: &[u8]) -> Result<u64, Error> {
+        self.append_bytes(bytes)
+    }
     /// Overwrite `[offset, offset + bytes.len())` in place.
     fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Error>;
     /// Advance the superblock's recorded end-of-file to the store's current
@@ -847,7 +863,7 @@ impl Located {
             self.blk_off_size,
             self.client_id,
         );
-        let new_addr = file.append_bytes(&aesb)?;
+        let new_addr = file.append_meta(&aesb)?;
 
         let slot_off = self.index_block_addr
             + ib_prefix
@@ -878,7 +894,7 @@ impl Located {
         }
         let cks = jenkins_lookup3(&buf);
         buf.extend_from_slice(&cks.to_le_bytes());
-        file.append_bytes(&buf)
+        file.append_meta(&buf)
     }
 
     /// Allocate a fresh *paged* data block (`EADB`) at EOF: a header carrying its
@@ -911,7 +927,7 @@ impl Located {
             page.extend_from_slice(&page_cks.to_le_bytes());
             buf.extend_from_slice(&page);
         }
-        file.append_bytes(&buf)
+        file.append_meta(&buf)
     }
 
     /// Set page `global_page`'s bit in a super block's page-init bitmap
@@ -1151,7 +1167,7 @@ pub(crate) fn apply_ea_append<F: Store>(
     // recorded EOF.
     let mut chunk_addrs = Vec::with_capacity(plan.new_chunk_bytes.len());
     for blob in &plan.new_chunk_bytes {
-        chunk_addrs.push((file.append_bytes(blob)?, blob.len() as u64));
+        chunk_addrs.push((file.append_raw(blob)?, blob.len() as u64));
     }
     file.sync()?;
     file.patch_superblock_eof()?;
