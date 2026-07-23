@@ -6,9 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.23.2] - 2026-07-23
+
+Two fixes to the windowed row-read API introduced in 0.23.0: a full-range `Dataset::read_raw_rows` / `read_*_rows` window now delegates to the whole read instead of paying a full-size copy on top of it on layouts whose windowed reads fall back to one (inner-chunked storage, variable-length strings), and `Dataset::read_string_rows` now slices a multi-dimensional variable-length string dataset by row rather than by first-dimension index. Non-breaking patch.
+
 ### Fixed
 
-- `Dataset::read_raw_rows` and the typed `read_*_rows` now delegate to a whole read when the window covers every row, so full-range windows on layouts whose windowed reads fall back to a whole read (inner-chunked storage, variable-length strings) no longer pay a full-size copy on top of it.
+- `Dataset::read_raw_rows` and the typed `read_*_rows` now delegate to a whole read when the window covers every row, so full-range windows on layouts whose windowed reads fall back to a whole read (inner-chunked storage, variable-length strings) no longer pay a full-size copy on top of it ([#181](https://github.com/stephenberry/hdf5-pure/pull/181)).
 - `Dataset::read_string_rows` on a multi-dimensional variable-length string dataset now slices by row — each row spanning its inner dimensions — instead of treating the flat element array as one string per row, so a windowed read returns the same rows as `read_raw_rows` ([#182](https://github.com/stephenberry/hdf5-pure/pull/182)).
 
 ## [0.23.1] - 2026-07-23
@@ -361,7 +365,8 @@ Internal robustness and tests ([#26](https://github.com/stephenberry/hdf5-pure/i
 - The MAT deserializer flattens 1×N and N×1 values to a 1-D sequence in `deserialize_any` (matching `deserialize_seq`).
 - Numeric/complex readers preserve 1×N / N×1 shape at the value layer; any flattening happens at the serde level.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.23.1...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.23.2...HEAD
+[0.23.2]: https://github.com/stephenberry/hdf5-pure/compare/v0.23.1...v0.23.2
 [0.23.1]: https://github.com/stephenberry/hdf5-pure/compare/v0.23.0...v0.23.1
 [0.23.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.21.2...v0.22.0
