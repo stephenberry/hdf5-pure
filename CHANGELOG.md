@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-07-22
+
+Paged file-space support lands ([#173](https://github.com/stephenberry/hdf5-pure/issues/173)): `FileBuilder::with_file_space_strategy(FileSpaceStrategy::Page, …)` now writes a **genuine paged file** — page-aligned allocations with metadata and raw data in separate pages and per-page-type free-space managers — and `File::open_rw_bounded` grows a file that persists its free space, including a paged one, with bounded memory, rewriting its managers at `File::close` so the reference C library reads the result. Also new: `Dataset::read_raw_rows` and the typed `read_*_rows` stream a `[start, start + count)` leading-dimension row window without materializing the whole dataset ([#170](https://github.com/stephenberry/hdf5-pure/pull/170)). Additive minor bump.
+
 ### Added
 
 - `FileBuilder::with_file_space_strategy(FileSpaceStrategy::Page, …)` now writes a **genuine paged file** instead of only recording the label: allocations are aligned to `with_file_space_page_size`, metadata and raw data occupy separate pages, and each page's free tail is tracked in a per-page-type free-space manager, so the reference C library reads it as a paged file, parses the managers (`H5Fget_freespace`), and re-paginates it on write ([#173](https://github.com/stephenberry/hdf5-pure/issues/173)).
@@ -343,7 +347,8 @@ Internal robustness and tests ([#26](https://github.com/stephenberry/hdf5-pure/i
 - The MAT deserializer flattens 1×N and N×1 values to a 1-D sequence in `deserialize_any` (matching `deserialize_seq`).
 - Numeric/complex readers preserve 1×N / N×1 shape at the value layer; any flattening happens at the serde level.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.23.0...HEAD
+[0.23.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.22.0...v0.23.0
 [0.22.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.21.2...v0.22.0
 [0.21.2]: https://github.com/stephenberry/hdf5-pure/compare/v0.21.1...v0.21.2
 [0.21.1]: https://github.com/stephenberry/hdf5-pure/compare/v0.21.0...v0.21.1
