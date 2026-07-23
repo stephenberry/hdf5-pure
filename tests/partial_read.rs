@@ -291,6 +291,36 @@ fn read_raw_rows_matches_read_raw() {
 }
 
 #[test]
+fn full_range_window_delegates_to_whole_read() {
+    // A window covering every row (including one clamped down from over-long)
+    // delegates to the whole read, so it stays a single read even on the layouts
+    // whose windowed reads fall back to a whole read internally: inner-chunked
+    // storage and variable-length strings. The observable contract is equality
+    // with the whole read.
+    let data: Vec<f64> = (0..120).map(f64::from).collect();
+    let (buffered, streaming, _dir) = on_both_backends(|b| {
+        b.create_dataset("t")
+            .with_f64_data(&data)
+            .with_shape(&[20, 6])
+            .with_chunks(&[4, 2]); // inner dim chunked -> windowed reads fall back
+        b.create_dataset("labels")
+            .with_vlen_strings(&["idle", "reach", "grasp", "lift", "place"]);
+    });
+    for file in [&buffered, &streaming] {
+        let ds = file.dataset("t").unwrap();
+        let full = ds.read_raw().unwrap();
+        assert_eq!(ds.read_raw_rows(0, 20).unwrap(), full); // exact full range
+        assert_eq!(ds.read_raw_rows(0, 21).unwrap(), full); // over-long clamps to full range
+        assert_eq!(ds.read_f64_rows(0, 20).unwrap(), data);
+
+        let ds = file.dataset("labels").unwrap();
+        let full = ds.read_string().unwrap();
+        assert_eq!(ds.read_string_rows(0, 5).unwrap(), full);
+        assert_eq!(ds.read_string_rows(0, 99).unwrap(), full);
+    }
+}
+
+#[test]
 fn userblock_windows_go_through_base_framing() {
     // A userblock makes the superblock base non-zero, so reads route through the
     // base-framed source. Exercise that path for both contiguous and chunked

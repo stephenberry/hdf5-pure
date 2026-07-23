@@ -3068,7 +3068,10 @@ impl Dataset {
     /// [`read_raw`](Self::read_raw) produces for those rows, so the typed
     /// `read_*_rows` helpers decode a window like their whole-dataset forms. The
     /// window is clamped to the first dimension: a read past the end returns only
-    /// the rows that exist, and a 0-D scalar is one row. Variable-length string
+    /// the rows that exist, and a 0-D scalar is one row. A window covering every
+    /// row delegates to [`read_raw`](Self::read_raw), so a full-range window never
+    /// costs more than a whole read — even on the layouts whose windowed reads
+    /// fall back to one internally. Variable-length string
     /// bytes are heap references, not text — use
     /// [`read_string_rows`](Self::read_string_rows).
     pub fn read_raw_rows(&self, start_row: u64, num_rows: u64) -> Result<Vec<u8>, Error> {
@@ -3079,6 +3082,20 @@ impl Dataset {
         let n0 = ds.dimensions.first().copied().unwrap_or(1);
         let start = start_row.min(n0);
         let count = num_rows.min(n0 - start);
+
+        // A window covering every row is exactly a whole read: delegate, so the
+        // layouts whose windowed reads fall back to a whole read (inner-chunked)
+        // don't pay a full-size copy on top of it.
+        if start == 0 && count == n0 {
+            let pipeline = self.filter_pipeline_parsed();
+            return Ok(self.file.read_dataset_raw(
+                &dl,
+                &ds,
+                &dt,
+                pipeline.as_ref(),
+                &self.chunk_cache,
+            )?);
+        }
 
         Ok(self.file.read_dataset_raw_rows(
             &dl,
@@ -3162,8 +3179,13 @@ impl Dataset {
     pub fn read_string_rows(&self, start_row: u64, num_rows: u64) -> Result<Vec<String>, Error> {
         let dt = self.datatype()?;
         if vl_data::is_vlen_string_datatype(&dt) {
-            let all = self.read_string()?;
             let n0 = self.dataspace()?.dimensions.first().copied().unwrap_or(1);
+            // A window covering every row is exactly `read_string` — skip the
+            // whole-read-then-clone fallback.
+            if start_row == 0 && num_rows >= n0 {
+                return self.read_string();
+            }
+            let all = self.read_string()?;
             let start = start_row.min(n0).to_usize()?;
             let end = start_row.saturating_add(num_rows).min(n0).to_usize()?;
             return Ok(all.get(start..end).unwrap_or_default().to_vec());

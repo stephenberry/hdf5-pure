@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- `Dataset::read_raw_rows` and the typed `read_*_rows` now delegate to a whole read when the window covers every row, so full-range windows on layouts whose windowed reads fall back to a whole read (inner-chunked storage, variable-length strings) no longer pay a full-size copy on top of it.
+
 ## [0.23.1] - 2026-07-23
 
 Two file-space fixes from documenting and fuzz-testing the paged and persisted surface ([#178](https://github.com/stephenberry/hdf5-pure/issues/178)): a fresh `persist = true` file with a non-paged strategy now records a defined end-of-allocation, so an assertion-enabled build of the reference C library opens it instead of aborting, and the `File::open_rw_bounded` refusal for a non-persisting paged file now advises the right recovery. Non-breaking patch.
