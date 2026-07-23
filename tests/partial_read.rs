@@ -235,6 +235,47 @@ fn vlen_strings_window_falls_back_to_slice() {
 }
 
 #[test]
+fn vlen_strings_multidim_window_slices_by_row() {
+    // On a multi-dimensional VL string dataset a row spans its inner dimensions,
+    // so `read_string_rows` must slice by row — the same rows `read_raw_rows`
+    // returns — not treat the flat per-element array as one string per row.
+    let (buffered, streaming, _dir) = on_both_backends(|b| {
+        b.create_dataset("grid")
+            .with_vlen_strings(&["a", "bb", "ccc", "dddd", "e", "ff"])
+            .with_shape(&[3, 2]); // 3 rows x 2 columns -> each row is 2 elements
+    });
+    for file in [&buffered, &streaming] {
+        let ds = file.dataset("grid").unwrap();
+        let all = ds.read_string().unwrap();
+        assert_eq!(all.len(), 6);
+
+        // Each row is the pair of inner-dimension elements, not a single string.
+        assert_eq!(ds.read_string_rows(0, 1).unwrap(), vec!["a", "bb"]);
+        assert_eq!(ds.read_string_rows(1, 1).unwrap(), vec!["ccc", "dddd"]);
+        assert_eq!(ds.read_string_rows(2, 1).unwrap(), vec!["e", "ff"]);
+        assert_eq!(
+            ds.read_string_rows(1, 2).unwrap(),
+            vec!["ccc", "dddd", "e", "ff"]
+        );
+
+        // Full-range and over-long windows return every element.
+        assert_eq!(ds.read_string_rows(0, 3).unwrap(), all);
+        assert_eq!(ds.read_string_rows(0, 99).unwrap(), all);
+        // A window starting past the last row is empty.
+        assert!(ds.read_string_rows(3, 1).unwrap().is_empty());
+
+        // Lockstep with the raw path: the string count of a window equals the
+        // number of elements `read_raw_rows` reads for the same window.
+        let elem = ds.datatype().unwrap().type_size() as usize;
+        for (start, count) in [(0u64, 1u64), (1, 1), (2, 1), (0, 2), (1, 2), (0, 3)] {
+            let n_strings = ds.read_string_rows(start, count).unwrap().len();
+            let n_raw_elems = ds.read_raw_rows(start, count).unwrap().len() / elem;
+            assert_eq!(n_strings, n_raw_elems, "window ({start}, {count})");
+        }
+    }
+}
+
+#[test]
 fn typed_readers_match_whole_dataset() {
     // Spot-check several dtypes go through the same window path and decode right.
     let (buffered, streaming, _dir) = on_both_backends(|b| {
