@@ -52,8 +52,8 @@
 //!
 //! Open an existing file for reading **and** writing with [`File::open_rw`] and
 //! reach every object by name through owned [`Dataset`] and [`Group`] handles
-//! that add, delete, copy, or overwrite objects without reading it all in and
-//! rewriting it. New data and rebuilt object headers are appended at end-of-file
+//! that add, delete, copy, or overwrite objects without rewriting the file from
+//! scratch. New data and rebuilt object headers are appended at end-of-file
 //! and the superblock is repointed last, so the cost is proportional to what
 //! changes rather than to the file size. It edits files written by this crate,
 //! the reference HDF5 C library, and h5py across all of their on-disk formats,

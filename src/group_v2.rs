@@ -247,12 +247,12 @@ pub fn resolve_group_entries(
 // structure from a `Source` on demand.
 // ---------------------------------------------------------------------------
 
-/// Streaming counterpart of [`resolve_path_any`] for latest-format files.
+/// Streaming counterpart of [`resolve_path_any`].
 ///
 /// Resolves a path to an object-header address by reading the object headers
 /// and (for dense groups) the fractal heap + B-tree v2 from a [`Source`].
-/// Only v2 (latest-format) groups are supported; a v1 symbol-table group on the
-/// path returns an error (the v1 group traversal is not yet migrated).
+/// Both group forms resolve: v2 (compact or dense) groups, and v1 symbol-table
+/// groups via [`group_v1::resolve_v1_group_entries_from_source`].
 pub fn resolve_path_any_from_source<S: Source + ?Sized>(
     source: &S,
     superblock: &Superblock,

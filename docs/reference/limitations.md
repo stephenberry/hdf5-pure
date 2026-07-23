@@ -43,7 +43,7 @@ In-place editing operates on files with **8-byte offsets and lengths** (what the
 
 ### Bounded-memory read-write
 
-A file opened with [`File::open_rw_bounded`](../guide/editing.md#bounded-memory-appends) supports reads and immediate `Dataset::append` only; the staged edit surface (`write`, attribute edits, `create_*`/`delete`, `copy`, `commit`, `space_accounting`) needs the whole-file mirror and returns `Error::BoundedStagedUnsupported` — open with `File::open_rw` for those. It requires a latest-format file with 8-byte offsets and no userblock, and shares the streaming backend's path-resolution limits. It grows a file that persists its free space, including a genuine paged file (`H5F_FSPACE_STRATEGY_PAGE`); a paged file that does *not* persist its free space is refused with `Error::EditUnsupported` (recreate it with `persist = true`). Growing a paged file through the whole-file editor (`File::open_rw` / the deprecated `EditSession`) is refused for either persist setting — `open_rw_bounded` is the paged-mutation path.
+A file opened with [`File::open_rw_bounded`](../guide/editing.md#bounded-memory-appends) supports reads and immediate `Dataset::append` only; the staged edit surface (`write`, attribute edits, `create_*`/`delete`, `copy`, `commit`, `space_accounting`) needs the whole-file mirror and returns `Error::BoundedStagedUnsupported` — open with `File::open_rw` for those. It requires a latest-format file with 8-byte offsets and no userblock; reads have the [streaming backend's capabilities](../guide/streaming.md). It grows a file that persists its free space, including a genuine paged file (`H5F_FSPACE_STRATEGY_PAGE`); a paged file that does *not* persist its free space is refused with `Error::EditUnsupported` (recreate it with `persist = true`). Growing a paged file through the whole-file editor (`File::open_rw` / the deprecated `EditSession`) is refused for either persist setting — `open_rw_bounded` is the paged-mutation path.
 
 Adding an **object-reference dataset** (`EditSession::create_dataset(...).with_path_references(...)`) resolves a path target against every object this commit places, but only once that object has actually been placed: `commit()` processes groups deepest-first and, within a group, non-reference datasets before reference ones, so a target that is itself still being written when the reference is resolved — an ancestor group, a same-depth sibling group ordered later, a copy destination (or its interior), or a `write_dataset` target — is refused rather than resolved to a stale or wrong address. A target untouched by the commit resolves against the pre-commit file; a path that resolves nowhere at all becomes an undefined reference, matching `FileBuilder`'s resolution convention for the same builder type. This is a permanent scope line (not a `... yet` gap): reproducing the whole-file writer's two-pass dummy/real-address scheme inside `EditSession`'s single-pass commit would be a large rewrite of the core apply loop for a narrow benefit.
 
@@ -59,10 +59,9 @@ Refused today with a `... yet` message, intended to land. Each row links to its 
 
 | Capability | Tracking |
 |---|---|
-| Overwrite & copy of **chunked / filtered** datasets | [#101](https://github.com/stephenberry/hdf5-pure/issues/101) |
 | **Dense** (fractal-heap) link & attribute storage | [#102](https://github.com/stephenberry/hdf5-pure/issues/102) |
 | Editing across **soft / external links** | [#103](https://github.com/stephenberry/hdf5-pure/issues/103) |
-| Userblock files, creation-order tracking, shared/SOHM messages, v0/v1 conversion | [#104](https://github.com/stephenberry/hdf5-pure/issues/104) |
+| Creation-order tracking, shared/SOHM messages, copying a **version-1** object | [#104](https://github.com/stephenberry/hdf5-pure/issues/104) |
 | Adding **chunked/extensible variable-length-string** datasets | [#105](https://github.com/stephenberry/hdf5-pure/issues/105) |
 | **Cross-file copy** of variable-length / reference / shared data | [#106](https://github.com/stephenberry/hdf5-pure/issues/106) |
 

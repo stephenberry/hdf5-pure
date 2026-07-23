@@ -38,6 +38,26 @@ into the writer, the writer drives chunked I/O, and so on — so the engine is a
 single strongly-connected component that cannot be cleanly split into separate
 "reader" and "writer" crates without dependency inversion.
 
+## Write paths
+
+Three paths put bytes on disk, with different cost models:
+
+| Path | Entry point | What it writes |
+|---|---|---|
+| **Whole-file writer** | [`FileBuilder`](../guide/writing.md) | Serializes a brand-new file from scratch |
+| **In-place editors** | [`File::open_rw`, `File::open_rw_bounded`](../guide/editing.md) | Appends new bytes to the existing file and patches a small, fixed set of locations |
+| **Repack** | [`repack`](../guide/repack.md) | Reads a source file and writes a fresh, compact copy to a separate destination through `FileBuilder` |
+
+`File::open_rw` is an **append-and-patch** editor. It reads the file into a whole-file in-memory mirror at open — a statement about *memory* (`O(file size)`), not about what gets written back. An immediate `Dataset::append` writes the new chunks, fills Extensible-Array index slots, and publishes the grown dataspace dimension last under `fsync` barriers, so each append is durable and crash-atomic before the call returns. Every other edit is staged and applied by one `commit()`: new data and new object headers are appended at the end of the file (or placed into space freed by earlier commits), a rewritten header for each touched group and its ancestors up to the root is appended, and the superblock is repointed at the new root **last**, as the single crash-atomic commit point. A same-length value overwrite patches the existing bytes where they lie. Space freed by deletions and relocations goes to a session free list for reuse; a freed run reaching the end of the file is truncated, and on a file that persists its free space the free list is instead serialized into on-disk free-space managers that survive reopen.
+
+**Nothing re-serializes the file on commit.** The cost of a commit is proportional to the edit, not to the file size: a staged append re-encodes at most the trailing partial chunk and carries every other kept chunk into the rebuilt index by metadata alone, and no existing object moves except the object headers on the edited path. A failed or interrupted commit leaves the file valid: structural changes become visible only at the superblock repoint, so a crash before it leaves the old object tree in place. (Same-length value overwrites patch live data blocks directly and are the one staged edit outside that gate.)
+
+`File::open_rw_bounded` is the same append engine minus the mirror: reads are positioned I/O through bounded caches (the read-write sibling of [`open_streaming`](../guide/streaming.md)), `Dataset::append` reads and patches only the metadata windows it touches with the same crash-atomicity, and `close()` rewrites the on-disk free-space managers of a file that persists them — including the per-page-type managers of a paged file, whose appends stay page-homogeneous. It refuses the staged edit surface rather than emulate it with unbounded memory. The two editors share the Extensible-Array append planner and the free-space-manager serialization; the [capability matrix](../guide/editing.md#choosing-a-write-path) documents which operations each supports on which file-space strategy.
+
+The [SWMR writer](../guide/swmr.md) is a restriction of the same immediate append engine — unfiltered, chunk-aligned appends only — chosen so a concurrent reader never observes a torn view.
+
+`repack` is the one operation that rewrites a file from scratch, and it never does so in place: it reads every surviving object and writes a fresh, compact copy at a separate destination path, refusing (`Error::RepackUnsupported`) anything it cannot reproduce faithfully.
+
 ## On-disk format coverage
 
 The reader and editor handle the formats the reference C library and h5py

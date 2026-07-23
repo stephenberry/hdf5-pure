@@ -40,9 +40,9 @@ Selected through the `File` open-mode constructor, with memory budgets and locki
 | HDF5 property / driver | `hdf5-pure` | Status | Behavior |
 |---|---|---|---|
 | `H5Fopen(RDONLY)`, default sec2 | `File::open` | **Genuine (read-only)** | Whole-file buffered read; takes no lock. |
-| positioned / on-demand reads | `File::open_streaming` | **Genuine (read-only, bounded)** | Fetches metadata and chunks on demand; peak memory near one chunk. Latest-format groups only. |
+| positioned / on-demand reads | `File::open_streaming` | **Genuine (read-only, bounded)** | Fetches metadata and chunks on demand; peak memory near one chunk. |
 | `H5Pset_fapl_core` / `H5Pset_file_image` | `File::from_bytes` / `FileBuilder::finish` | **Genuine** | Read an in-memory file image, or build one into a `Vec<u8>`. |
-| `H5Fopen(RDWR)` | `File::open_rw` | **Genuine (read-write, O(file))** | Whole-file in-memory mirror; reads, appends, and staged edits + `commit`. Refuses a paged file (use `open_rw_bounded`). |
+| `H5Fopen(RDWR)` | `File::open_rw` | **Genuine (read-write, O(file))** | Whole-file in-memory mirror; reads, appends, and staged edits + `commit`. On a paged file, reads work but commits and appends refuse (grow it via `open_rw_bounded`). |
 | `H5Fopen(RDWR)`, bounded memory | `File::open_rw_bounded` | **Genuine (read-write, bounded)** | Bounded reads + immediate crash-atomic `Dataset::append`. The path for growing a file that persists its free space, **including a paged file**. The staged edit surface returns `Error::BoundedStagedUnsupported`. |
 | `H5F_ACC_SWMR_READ` / `H5F_ACC_SWMR_WRITE` | `File::open_swmr` / `open_swmr_writer` | **Genuine** | No OS lock; the writer raises the superblock SWMR-write flag and appends only. |
 | `H5Pset_file_locking` + `HDF5_USE_FILE_LOCKING` | `FileLocking`, `File::open_rw_with_locking` | **Genuine** | Exclusive advisory lock on the edit path (non-blocking → `Error::FileLocked`); the env var override recognizes the same values as the C library. Readers and the SWMR writer take no lock by design. |
@@ -58,7 +58,7 @@ The paged and persistent-free-space paths are exercised by C-library crosschecks
 
 Current limits worth knowing:
 
-- **Paged mutation goes through `File::open_rw_bounded` only.** The whole-file editor (`File::open_rw` / the deprecated `EditSession`) refuses a paged file, and a paged file created **without** `persist = true` cannot be grown at all — recreate it with `persist = true`.
+- **Paged mutation goes through `File::open_rw_bounded` only.** The whole-file editor (`File::open_rw` / the deprecated `EditSession`) opens and reads a paged file but refuses to commit edits or append to it, and a paged file created **without** `persist = true` cannot be grown at all — recreate it with `persist = true`.
 - **Free space is under-reported, never over-reported.** A final metadata-page tail and the old bytes of a relocated partial chunk are left untracked, so `H5Fget_freespace` can read slightly low. The file stays valid.
 - **`threshold` is advisory** and **the non-paged `userblock` size is not validated** (see the tables above).
 - Only **File Space Info message version 1** is emitted and read.
