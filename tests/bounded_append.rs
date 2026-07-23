@@ -366,9 +366,15 @@ fn paged_non_persist_is_refused_at_open() {
         .with_chunks(&[2]);
     b.write(&p).unwrap();
     let err = File::open_rw_bounded(&p).unwrap_err();
+    let Error::EditUnsupported(msg) = err else {
+        panic!("paged non-persist should be refused with EditUnsupported, got: {err:?}");
+    };
+    // The guidance must be actionable: a paged file is grown in place only when it
+    // persists its free space, so the message points at recreating with persist=true,
+    // not at File::open_rw (which also refuses a paged file — issue #178).
     assert!(
-        matches!(err, Error::EditUnsupported(_)),
-        "paged non-persist should be refused, got: {err:?}"
+        msg.contains("persist"),
+        "refusal should guide toward persisted free space, got: {msg:?}"
     );
 }
 

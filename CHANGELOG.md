@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- The refusal when opening a *non-persisting* paged file with `File::open_rw_bounded` no longer points at `File::open_rw` (which also refuses a paged file); it now advises recreating the file with `persist = true`, the way to grow a paged file in place ([#178](https://github.com/stephenberry/hdf5-pure/issues/178)).
+
 ## [0.23.0] - 2026-07-22
 
 Paged file-space support lands ([#173](https://github.com/stephenberry/hdf5-pure/issues/173)): `FileBuilder::with_file_space_strategy(FileSpaceStrategy::Page, …)` now writes a **genuine paged file** — page-aligned allocations with metadata and raw data in separate pages and per-page-type free-space managers — and `File::open_rw_bounded` grows a file that persists its free space, including a paged one, with bounded memory, rewriting its managers at `File::close` so the reference C library reads the result. Also new: `Dataset::read_raw_rows` and the typed `read_*_rows` stream a `[start, start + count)` leading-dimension row window without materializing the whole dataset ([#170](https://github.com/stephenberry/hdf5-pure/pull/170)). Additive minor bump.
