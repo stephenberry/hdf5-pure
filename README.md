@@ -161,7 +161,7 @@ b.write("out.h5").unwrap();
 assert_eq!(File::open("out.h5").unwrap().file_space_strategy(), Some(FileSpaceStrategy::Page));
 ```
 
-Passing `persist = true` persists free space across reopen: a file created this way records the regions an `EditSession` frees in on-disk free-space-manager blocks (`FSHD`/`FSSE`), so later sessions — this crate's and the reference C library's — recover and reuse them. `File::persisted_free_space()` returns the tracked free regions, and `EditSession::open` seeds its free list from them so reuse spans sessions rather than just the open session.
+Passing `persist = true` persists free space across reopen: the regions a later read-write session frees (`File::open_rw`, then `Group::delete` + `File::commit`) are recorded in on-disk free-space-manager blocks (`FSHD`/`FSSE`), so later sessions — this crate's and the reference C library's — recover and reuse them. `File::persisted_free_space()` returns the tracked free regions. `FileSpaceStrategy::Page` goes further and writes a genuine paged file — page-aligned allocations with metadata and raw data in separate pages — that the reference C library reads as paged and that this crate grows in place through the bounded editor `File::open_rw_bounded`.
 
 ### Streaming large files
 

@@ -679,9 +679,11 @@ impl BoundedEngine {
     /// superblock discovery, and the eligibility rules refused up front (at open)
     /// because this backend has no staged fallback: a latest-format (v2/v3)
     /// superblock, 8-byte offsets and lengths, and no userblock. A file that
-    /// persists its free space is supported when non-paged (its managers are
-    /// seeded here and rewritten at [`finalize_persist`](Self::finalize_persist));
-    /// the paged strategy is refused (issue #173).
+    /// persists its free space is supported — its managers are seeded here and
+    /// rewritten at [`finalize_persist`](Self::finalize_persist) — including a
+    /// genuine paged file (`H5F_FSPACE_STRATEGY_PAGE`), whose appends are kept
+    /// page-homogeneous; a paged file that does not persist its free space is
+    /// refused (issue #173).
     pub(crate) fn open(path: &Path, metadata_cache: MetadataCacheConfig) -> Result<Self, Error> {
         let handle = std::fs::OpenOptions::new()
             .read(true)
@@ -1042,7 +1044,8 @@ fn load_bounded_persist(
         // segregated. Refuse rather than corrupt the paging.
         return Err(Error::EditUnsupported(
             "bounded read-write of a paged file (H5F_FSPACE_STRATEGY_PAGE) requires \
-             persisted free space (persist=true); use File::open_rw",
+             persisted free space; recreate the file with \
+             with_file_space_strategy(FileSpaceStrategy::Page, true, ..) to grow it in place",
         ));
     }
     if !info.persist {
