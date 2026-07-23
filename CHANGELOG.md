@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- `Dataset::read_raw_rows` and the typed `read_*_rows` now stream a row window of a dataset whose storage chunks split inner dimensions by decoding only the overlapping chunks and scattering each into the window, instead of falling back to a whole read — peak memory for inner-chunked layouts now scales with the window plus one chunk, not the dataset.
+- `Dataset::read_raw_rows` and the typed `read_*_rows` now stream a row window of an inner-chunked dataset by decoding only the chunks the window overlaps, instead of falling back to a whole read, so peak memory scales with the window plus one chunk rather than the dataset ([#183](https://github.com/stephenberry/hdf5-pure/pull/183)).
 
 ## [0.23.2] - 2026-07-23
 

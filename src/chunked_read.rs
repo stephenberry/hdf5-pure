@@ -975,8 +975,8 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
         // Inner-split scatter parameters. `place_chunk` takes non-negative
         // offsets, so a chunk straddling the window start is instead entered
         // `skip` leading slabs in (dim 0 is outermost, so one slab is
-        // `chunk_strides[0]` elements) with its leading dim shrunk to match;
-        // the kernel's own bound check against `win_dims[0]` clips a chunk
+        // `chunk_strides[0]` elements), and its leading dim becomes exactly
+        // the `hi - lo` slabs the window keeps, which also clips a chunk
         // straddling the window end. A saturated `advance` (crafted dims) makes
         // `bytes.get(advance..)` come up empty and the chunk copies nothing —
         // the kernel's clamping discipline for short chunks.
@@ -990,7 +990,7 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
             let skip = lo - c0;
             offsets[0] = lo - row_lo;
             let mut dims = chunk_dims.clone();
-            dims[0] = cd0 - skip;
+            dims[0] = hi - lo;
             let advance = skip
                 .saturating_mul(chunk_strides[0])
                 .saturating_mul(elem_size);

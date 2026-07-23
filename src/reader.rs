@@ -1253,8 +1253,8 @@ impl FileInner {
 
 /// Read a row window through an already base-framed `Source`. Contiguous
 /// layouts are one bounded sub-read; chunked layouts use the windowed chunk
-/// reader, or fall back to a whole read plus slice when an inner dimension is
-/// chunked.
+/// reader (only the rank-0 crafted-file corner falls back to a whole read
+/// plus slice).
 #[allow(clippy::too_many_arguments)]
 fn read_rows_framed<S: Source + ?Sized>(
     source: &S,
