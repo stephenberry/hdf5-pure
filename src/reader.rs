@@ -3179,15 +3179,41 @@ impl Dataset {
     pub fn read_string_rows(&self, start_row: u64, num_rows: u64) -> Result<Vec<String>, Error> {
         let dt = self.datatype()?;
         if vl_data::is_vlen_string_datatype(&dt) {
-            let n0 = self.dataspace()?.dimensions.first().copied().unwrap_or(1);
+            let dims = self.dataspace()?.dimensions;
+            let n0 = dims.first().copied().unwrap_or(1);
             // A window covering every row is exactly `read_string` — skip the
             // whole-read-then-clone fallback.
             if start_row == 0 && num_rows >= n0 {
                 return self.read_string();
             }
+            // `read_string` returns one entry per *element* (the product of all
+            // dimensions), so the row window is scaled by the inner-dimension
+            // element count to slice whole rows — matching `read_raw_rows`
+            // rather than treating each element as its own row. Checked so a
+            // crafted dataspace whose inner dims overflow `usize` errors instead
+            // of wrapping.
+            let row_elems: usize = dims.iter().skip(1).try_fold(1usize, |acc, &d| {
+                acc.checked_mul(d.to_usize()?)
+                    .ok_or(FormatError::OffsetOverflow {
+                        offset: acc as u64,
+                        length: d,
+                    })
+            })?;
             let all = self.read_string()?;
-            let start = start_row.min(n0).to_usize()?;
-            let end = start_row.saturating_add(num_rows).min(n0).to_usize()?;
+            let start_row_idx = start_row.min(n0);
+            let end_row_idx = start_row.saturating_add(num_rows).min(n0);
+            let start = start_row_idx.to_usize()?.checked_mul(row_elems).ok_or(
+                FormatError::OffsetOverflow {
+                    offset: start_row_idx,
+                    length: row_elems as u64,
+                },
+            )?;
+            let end = end_row_idx.to_usize()?.checked_mul(row_elems).ok_or(
+                FormatError::OffsetOverflow {
+                    offset: end_row_idx,
+                    length: row_elems as u64,
+                },
+            )?;
             return Ok(all.get(start..end).unwrap_or_default().to_vec());
         }
         let raw = self.read_raw_rows(start_row, num_rows)?;

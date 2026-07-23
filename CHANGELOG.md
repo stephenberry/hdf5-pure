@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - `Dataset::read_raw_rows` and the typed `read_*_rows` now delegate to a whole read when the window covers every row, so full-range windows on layouts whose windowed reads fall back to a whole read (inner-chunked storage, variable-length strings) no longer pay a full-size copy on top of it.
+- `Dataset::read_string_rows` on a multi-dimensional variable-length string dataset now slices by row — each row spanning its inner dimensions — instead of treating the flat element array as one string per row, so a windowed read returns the same rows as `read_raw_rows` ([#182](https://github.com/stephenberry/hdf5-pure/pull/182)).
 
 ## [0.23.1] - 2026-07-23
 
