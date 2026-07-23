@@ -4,7 +4,7 @@
 //!
 //! The invariant under test everywhere: a row window must be byte-for-byte the
 //! same as the whole-dataset read sliced to that row range — for every layout
-//! (contiguous, chunked, inner-chunked fallback), on both the in-memory and the
+//! (contiguous, chunked, inner-chunked grids), on both the in-memory and the
 //! streaming backend, and across edge windows (empty, past-the-end, straddling
 //! chunk boundaries).
 
@@ -161,10 +161,10 @@ fn chunked_multi_row_chunk_partial_edges() {
 }
 
 #[test]
-fn inner_chunked_falls_back_to_whole_read() {
-    // shape [20, 6], chunks [4, 2]: the inner dim is chunked, so the windowed chunk
-    // reader returns None and the caller falls back to a sliced whole-read. The
-    // result must still be correct.
+fn inner_chunked_2d_grid_windows() {
+    // shape [20, 6], chunks [4, 2]: the inner dim is chunked, so each window
+    // scatters the overlapping chunks of a 2-D chunk grid into a window-shaped
+    // output (no whole-read fallback).
     let data: Vec<f64> = (0..120).map(f64::from).collect();
     let (buffered, streaming, _dir) = on_both_backends(|b| {
         b.create_dataset("t")
@@ -175,6 +175,43 @@ fn inner_chunked_falls_back_to_whole_read() {
     let extra = &[(3, 5), (0, 20), (10, 1)];
     check_f64(&buffered, "t", 6, extra);
     check_f64(&streaming, "t", 6, extra);
+}
+
+#[test]
+fn inner_chunked_edge_overhang_deflate() {
+    // shape [23, 10], chunks [4, 3], deflated: neither dimension is a multiple of
+    // its chunk extent, so the grid's last chunk row and column overhang the
+    // dataset — the scatter must clip them in both the leading and inner dims,
+    // and windows straddling chunk boundaries must trim inside a chunk.
+    let data: Vec<f64> = (0..230).map(|i| f64::from(i) * 0.5 - 3.0).collect();
+    let (buffered, streaming, _dir) = on_both_backends(|b| {
+        b.create_dataset("e")
+            .with_f64_data(&data)
+            .with_shape(&[23, 10])
+            .with_chunks(&[4, 3])
+            .with_deflate(4);
+    });
+    let extra = &[(3, 2), (4, 4), (7, 9), (19, 4), (22, 1), (0, 23)];
+    check_f64(&buffered, "e", 10, extra);
+    check_f64(&streaming, "e", 10, extra);
+}
+
+#[test]
+fn inner_chunked_4d_image_grid() {
+    // The image-tile case: shape [13, 5, 7, 3] u8 with chunks [4, 2, 3, 2] — an
+    // inner-split grid in every dimension, with overhanging edge chunks in every
+    // dimension. Windows must assemble each row from the full inner chunk grid.
+    let data: Vec<u8> = (0..13 * 5 * 7 * 3).map(|i| (i % 251) as u8).collect();
+    let (buffered, streaming, _dir) = on_both_backends(|b| {
+        b.create_dataset("img")
+            .with_u8_data(&data)
+            .with_shape(&[13, 5, 7, 3])
+            .with_chunks(&[4, 2, 3, 2])
+            .with_deflate(2);
+    });
+    let extra = &[(3, 2), (4, 4), (11, 2), (12, 1), (0, 13)];
+    check_u8(&buffered, "img", 5 * 7 * 3, extra);
+    check_u8(&streaming, "img", 5 * 7 * 3, extra);
 }
 
 #[test]
@@ -334,16 +371,16 @@ fn read_raw_rows_matches_read_raw() {
 #[test]
 fn full_range_window_delegates_to_whole_read() {
     // A window covering every row (including one clamped down from over-long)
-    // delegates to the whole read, so it stays a single read even on the layouts
-    // whose windowed reads fall back to a whole read internally: inner-chunked
-    // storage and variable-length strings. The observable contract is equality
-    // with the whole read.
+    // delegates to the whole read, so it never costs a window-shaped copy on top
+    // of one — checked here on an inner-chunked grid and on variable-length
+    // strings (whose windowed reads still fall back to a whole read internally).
+    // The observable contract is equality with the whole read.
     let data: Vec<f64> = (0..120).map(f64::from).collect();
     let (buffered, streaming, _dir) = on_both_backends(|b| {
         b.create_dataset("t")
             .with_f64_data(&data)
             .with_shape(&[20, 6])
-            .with_chunks(&[4, 2]); // inner dim chunked -> windowed reads fall back
+            .with_chunks(&[4, 2]); // inner dim chunked
         b.create_dataset("labels")
             .with_vlen_strings(&["idle", "reach", "grasp", "lift", "place"]);
     });

@@ -177,7 +177,7 @@ let values = ds.read_f64().unwrap();  // only this dataset's chunks are read
 
 The reading API is identical to `File::open`; only the backing store differs. Dataset reads are fully supported: contiguous, compact, and every chunk-index layout (B-tree v1, fixed array, and extensible array). Both group forms (v2 and v1 symbol-table) resolve along a path and attributes read the same as `File::open`; the differences are that `File::as_bytes` returns an empty slice, a streaming file cannot be the source of a cross-file copy, and chunk decompression is sequential. `open_streaming` requires the `std` filesystem.
 
-To read a single dataset that is itself too large to hold decompressed, read it in **row windows** rather than whole: `read_raw_rows(start, count)` and the typed `read_f64_rows` … `read_string_rows` decode only the leading-dimension rows `[start, start + count)`, touching only the chunks that window overlaps, so peak memory scales with the window rather than the dataset.
+To read a single dataset that is itself too large to hold decompressed, read it in **row windows** rather than whole: `read_raw_rows(start, count)` and the typed `read_f64_rows` … `read_string_rows` decode only the leading-dimension rows `[start, start + count)`, touching only the chunks that window overlaps, so peak memory scales with the window rather than the dataset. The exception is `read_string_rows` on variable-length strings, which still reads the whole dataset and slices out the window.
 
 ```rust
 use hdf5_pure::File;

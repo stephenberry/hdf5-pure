@@ -61,7 +61,7 @@ for start in (0..rows).step_by(1_000_000) {
 }
 ```
 
-The window is clamped to the dataset, so the final short window needs no special-casing. See [Reading a row window](reading.md#reading-a-row-window) for the full method list and the fallback for inner-chunked and variable-length datasets.
+The window is clamped to the dataset, so the final short window needs no special-casing. See [Reading a row window](reading.md#reading-a-row-window) for the full method list and the `read_string_rows` fallback for variable-length strings.
 
 ## Tuning retained memory
 
