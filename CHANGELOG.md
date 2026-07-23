@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- `Dataset::read_raw_rows` and the typed `read_*_rows` now stream a row window of a dataset whose storage chunks split inner dimensions by decoding only the overlapping chunks and scattering each into the window, instead of falling back to a whole read — peak memory for inner-chunked layouts now scales with the window plus one chunk, not the dataset.
+
 ## [0.23.2] - 2026-07-23
 
 Two fixes to the windowed row-read API introduced in 0.23.0: a full-range `Dataset::read_raw_rows` / `read_*_rows` window now delegates to the whole read instead of paying a full-size copy on top of it on layouts whose windowed reads fall back to one (inner-chunked storage, variable-length strings), and `Dataset::read_string_rows` now slices a multi-dimensional variable-length string dataset by row rather than by first-dimension index. Non-breaking patch.

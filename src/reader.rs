@@ -1316,7 +1316,8 @@ fn read_rows_framed<S: Source + ?Sized>(
                 source, dl, ds, dt, pipeline, os, ls, cache, start_row, num_rows,
             )? {
                 Some(bytes) => Ok(bytes),
-                // Inner-chunked: fall back to a whole read, then slice.
+                // Rank-0 chunked (a crafted-file corner): fall back to a whole
+                // read, then slice.
                 None => {
                     let full = data_read::read_raw_data_cached_from_source(
                         source, dl, ds, dt, pipeline, os, ls, cache,
@@ -3070,8 +3071,7 @@ impl Dataset {
     /// window is clamped to the first dimension: a read past the end returns only
     /// the rows that exist, and a 0-D scalar is one row. A window covering every
     /// row delegates to [`read_raw`](Self::read_raw), so a full-range window never
-    /// costs more than a whole read — even on the layouts whose windowed reads
-    /// fall back to one internally. Variable-length string
+    /// costs more than a whole read. Variable-length string
     /// bytes are heap references, not text — use
     /// [`read_string_rows`](Self::read_string_rows).
     pub fn read_raw_rows(&self, start_row: u64, num_rows: u64) -> Result<Vec<u8>, Error> {
@@ -3083,9 +3083,9 @@ impl Dataset {
         let start = start_row.min(n0);
         let count = num_rows.min(n0 - start);
 
-        // A window covering every row is exactly a whole read: delegate, so the
-        // layouts whose windowed reads fall back to a whole read (inner-chunked)
-        // don't pay a full-size copy on top of it.
+        // A window covering every row is exactly a whole read: delegate, so it
+        // never costs a window-shaped copy on top of one (and vlen-string reads,
+        // which still fall back to a whole read, don't pay it twice).
         if start == 0 && count == n0 {
             let pipeline = self.filter_pipeline_parsed();
             return Ok(self.file.read_dataset_raw(

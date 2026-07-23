@@ -826,12 +826,15 @@ pub fn read_chunked_data_from_source<S: Source + ?Sized>(
 /// and decompressed chunks, so successive windows on the same handle walk the index
 /// once and reuse boundary chunks.
 ///
-/// Handles only chunks that span the full inner extent (`chunk_dims[i] == ds_dims[i]`
-/// for `i >= 1`), where each row is contiguous in the chunk and the copy is a plain
-/// row band — true for every frame-per-chunk dataset. Returns `Ok(None)` when an
-/// inner dimension is chunked, so the caller falls back to a whole read. Otherwise
-/// returns `num_rows * row_elems` elements. The caller clamps the window to the
-/// dataset.
+/// A chunk that spans the dataset's full inner extent (`chunk_dims[i] == ds_dims[i]`
+/// for `i >= 1` — every 1-D and frame-per-chunk layout) holds each row contiguously,
+/// so its contribution is a plain row band copied in one move. A chunk of an
+/// inner-split grid scatters into the window through the same N-D kernel the whole
+/// read uses ([`place_chunk`]), aimed at a window-shaped output. Either way only the
+/// chunks overlapping the window are decoded, and `num_rows * row_elems` elements
+/// are returned. Returns `Ok(None)` only for a rank-0 (scalar) chunked layout — a
+/// crafted-file corner with no leading dimension to window — so the caller falls
+/// back to a whole read. The caller clamps the window to the dataset.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
     source: &S,
@@ -862,13 +865,18 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
     let elem_size = datatype.type_size() as usize;
     let (rank, chunk_dims, ds_dims) = chunked_dims(chunk_dimensions, dataspace)?;
 
-    // A rank-0 (scalar) chunked layout has no leading dimension to window, and a
-    // row is contiguous in the chunk only when the chunk spans the full inner
-    // extent; both cases fall back to the whole-dataset reader (which handles
-    // rank 0 and inner chunking) rather than the row-band fast path.
-    if rank == 0 || (1..rank).any(|i| chunk_dims[i] != ds_dims[i]) {
+    // A rank-0 (scalar) chunked layout has no leading dimension to window; fall
+    // back to the whole-dataset reader, which handles rank 0. Only a crafted
+    // file reaches this (valid chunked layouts are rank >= 1), but the reader
+    // parses untrusted input.
+    if rank == 0 {
         return Ok(None);
     }
+
+    // When every chunk spans the dataset's full inner extent, each row is
+    // contiguous in its chunk and a window is one row band per chunk; an
+    // inner-split chunk grid instead scatters each chunk through the N-D kernel.
+    let full_inner = (1..rank).all(|i| chunk_dims[i] == ds_dims[i]);
 
     // Elements per row (product of the inner dims; 1 when 1-D). Checked so a
     // crafted dataspace whose inner dims overflow `usize` errors instead of
@@ -897,6 +905,16 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
     if total_bytes == 0 {
         return Ok(Some(output));
     }
+
+    // Scatter geometry for the inner-split path: the output is a dataset whose
+    // leading dimension is the window (`[out_rows, inner dims…]`), row-major.
+    // Checked before any I/O: crafted chunk dimensions (u32 each) can overflow
+    // the stride product where a real chunk's byte size cannot. For a full-inner
+    // chunk the product equals `row_elems`, already checked above.
+    let mut win_dims = ds_dims.clone();
+    win_dims[0] = out_rows;
+    let win_strides = row_major_strides(&win_dims)?;
+    let chunk_strides = row_major_strides(&chunk_dims)?;
 
     // Unallocated chunk index: a non-empty window has no storage to read. Match
     // the whole-dataset reader, which errors here, so `read_raw_rows` stays
@@ -950,17 +968,57 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
             continue; // no overlap with the window
         }
 
-        // Rows of this chunk that fall in the window, as byte offsets.
+        // Rows of this chunk that fall in the window.
         let lo = c0.max(row_lo);
         let hi = c_end.min(row_hi);
+
+        // Inner-split scatter parameters. `place_chunk` takes non-negative
+        // offsets, so a chunk straddling the window start is instead entered
+        // `skip` leading slabs in (dim 0 is outermost, so one slab is
+        // `chunk_strides[0]` elements) with its leading dim shrunk to match;
+        // the kernel's own bound check against `win_dims[0]` clips a chunk
+        // straddling the window end. A saturated `advance` (crafted dims) makes
+        // `bytes.get(advance..)` come up empty and the chunk copies nothing —
+        // the kernel's clamping discipline for short chunks.
+        let scatter: Option<(Vec<usize>, Vec<usize>, usize)> = if full_inner {
+            None
+        } else {
+            let mut offsets = Vec::with_capacity(rank);
+            for &o in chunk.offsets.iter().take(rank) {
+                offsets.push(o.to_usize()?);
+            }
+            let skip = lo - c0;
+            offsets[0] = lo - row_lo;
+            let mut dims = chunk_dims.clone();
+            dims[0] = cd0 - skip;
+            let advance = skip
+                .saturating_mul(chunk_strides[0])
+                .saturating_mul(elem_size);
+            Some((offsets, dims, advance))
+        };
+
+        // Byte offsets of the contiguous row band (full-inner path).
         let src = (lo - c0).saturating_mul(row_bytes);
         let dst = (lo - row_lo) * row_bytes;
         let band = (hi - lo) * row_bytes;
 
+        let copy = |output: &mut [u8], bytes: &[u8]| match &scatter {
+            None => row_band_copy(output, dst, bytes, src, band, elem_size),
+            Some((offsets, dims, advance)) => place_chunk(
+                bytes.get(*advance..).unwrap_or(&[]),
+                output,
+                offsets,
+                dims,
+                &win_dims,
+                &win_strides,
+                &chunk_strides,
+                elem_size,
+                rank,
+            ),
+        };
+
         let coord: Vec<u64> = chunk.offsets.iter().take(rank).copied().collect();
-        let hit = cache.with_decompressed(&coord, |bytes| {
-            row_band_copy(&mut output, dst, bytes, src, band, elem_size);
-        });
+        let hit = cache.with_decompressed(&coord, |bytes| copy(&mut output, bytes));
         if hit.is_some() {
             continue;
         }
@@ -969,11 +1027,11 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
         match pipeline {
             Some(pl) => {
                 let dec = decompress_chunk(&raw, pl, ctx, chunk.filter_mask)?;
-                row_band_copy(&mut output, dst, &dec, src, band, elem_size);
+                copy(&mut output, &dec);
                 cache.put_decompressed(coord, dec);
             }
             None => {
-                row_band_copy(&mut output, dst, &raw, src, band, elem_size);
+                copy(&mut output, &raw);
                 cache.put_decompressed_slice(coord, &raw);
             }
         }
@@ -1001,6 +1059,22 @@ fn row_band_copy(
     if len > 0 {
         output[dst..dst + len].copy_from_slice(&chunk[src..src + len]);
     }
+}
+
+/// Row-major strides for `dims` (innermost stride 1), checked so crafted
+/// dimensions error instead of panicking (debug) or wrapping (release).
+fn row_major_strides(dims: &[usize]) -> Result<Vec<usize>, FormatError> {
+    let mut strides = vec![1usize; dims.len()];
+    for i in (0..dims.len().saturating_sub(1)).rev() {
+        strides[i] =
+            strides[i + 1]
+                .checked_mul(dims[i + 1])
+                .ok_or(FormatError::OffsetOverflow {
+                    offset: strides[i + 1] as u64,
+                    length: dims[i + 1] as u64,
+                })?;
+    }
+    Ok(strides)
 }
 
 /// Read a chunked dataset from a [`Source`] with parsed-index and
@@ -2795,6 +2869,49 @@ mod tests {
             1,
         )
         .expect_err("overflowing inner-dim product must error");
+        assert!(
+            matches!(err, FormatError::OffsetOverflow { .. }),
+            "expected OffsetOverflow, got {err:?}"
+        );
+    }
+
+    /// An inner-split chunk grid whose *chunk* dimensions overflow the stride
+    /// product must error rather than panic (debug) or wrap (release) — the
+    /// dataset itself is small, so the `row_elems` guard doesn't catch it; the
+    /// checked stride construction must. `(2^22)^3` overflows 64-bit `usize`;
+    /// `(2^22)^2` already overflows 32-bit, so this holds on both. Checked
+    /// before any I/O: the empty source would otherwise EOF first.
+    #[test]
+    fn windowed_rows_chunk_stride_overflow_errors() {
+        let big: u32 = 1 << 22;
+        let layout = DataLayout::Chunked {
+            chunk_dimensions: vec![2, big, big, big, 8],
+            btree_address: Some(0),
+            version: 3,
+            chunk_index_type: None,
+            single_chunk_filtered_size: None,
+            single_chunk_filter_mask: None,
+        };
+        let dataspace = Dataspace {
+            space_type: DataspaceType::Simple,
+            rank: 4,
+            dimensions: vec![4, 2, 2, 2],
+            max_dimensions: None,
+        };
+        let cache = ChunkCache::new();
+        let err = read_chunked_rows_from_source(
+            &BytesSource::new(b""),
+            &layout,
+            &dataspace,
+            &make_f64_type(),
+            None,
+            8,
+            8,
+            &cache,
+            0,
+            1,
+        )
+        .expect_err("overflowing chunk-dim stride product must error");
         assert!(
             matches!(err, FormatError::OffsetOverflow { .. }),
             "expected OffsetOverflow, got {err:?}"
