@@ -162,6 +162,61 @@ fn repack_roundtrips_c_vlen_string_dataset() {
     );
 }
 
+/// The C library fills a collection and allocates another, so a large enough
+/// variable-length dataset it writes already spans several of them. Repack
+/// re-stages that data through fresh collections of its own, which is only
+/// faithful if both the read and the write sides carry each element's
+/// collection along with its index.
+#[test]
+fn repack_roundtrips_c_vlen_dataset_spanning_many_collections() {
+    use hdf5::types::VarLenUnicode;
+    use std::str::FromStr;
+
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("c_vlen_many.h5");
+    let dst = dir.path().join("vlen_many_repacked.h5");
+
+    // Past one collection's 65,535-object index, so the destination splits too.
+    let count = u16::MAX as usize + 5_000;
+    let words: Vec<String> = (0..count).map(|i| format!("s{i}")).collect();
+    {
+        let file = hdf5::File::create(&src).unwrap();
+        let vals: Vec<VarLenUnicode> = words
+            .iter()
+            .map(|s| VarLenUnicode::from_str(s).unwrap())
+            .collect();
+        file.new_dataset::<VarLenUnicode>()
+            .shape((count,))
+            .create("labels")
+            .unwrap()
+            .write(&vals)
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    let f = File::open(&dst).unwrap();
+    let got = f
+        .dataset("labels")
+        .unwrap()
+        .read_vlen_strings(Default::default())
+        .unwrap();
+    assert_eq!(got, words);
+
+    // The reference library agrees, element for element.
+    let c = hdf5::File::open(&dst).unwrap();
+    let cvals = c
+        .dataset("labels")
+        .unwrap()
+        .read_raw::<VarLenUnicode>()
+        .unwrap();
+    assert_eq!(cvals.len(), count);
+    for i in [0, 65_534, 65_535, count - 1] {
+        assert_eq!(cvals[i].as_str(), words[i], "element {i} differs");
+    }
+}
+
 #[test]
 fn repack_roundtrips_vlen_string_2d() {
     use hdf5::types::VarLenUnicode;

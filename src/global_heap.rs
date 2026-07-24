@@ -196,8 +196,20 @@ impl GlobalHeapIndex {
     }
 
     /// Get object metadata by its collection-local index.
+    ///
+    /// A collection holds up to 65,535 objects and a variable-length read
+    /// resolves one lookup per element, so the common case must not be a linear
+    /// scan. Writers lay objects out in ascending index order (this crate's
+    /// certainly, and the reference C library's while a collection is only
+    /// appended to), which makes the directory sorted and the lookup a binary
+    /// search; the format does not guarantee that ordering, so an out-of-order
+    /// collection falls back to a scan rather than reporting a present object
+    /// as missing.
     pub fn get_object(&self, index: u16) -> Option<&GlobalHeapObjectInfo> {
-        self.objects.iter().find(|object| object.index == index)
+        match self.objects.binary_search_by_key(&index, |o| o.index) {
+            Ok(pos) => Some(&self.objects[pos]),
+            Err(_) => self.objects.iter().find(|object| object.index == index),
+        }
     }
 }
 

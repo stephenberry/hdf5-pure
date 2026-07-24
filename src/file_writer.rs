@@ -35,7 +35,7 @@ use crate::object_header_writer::ObjectHeaderWriter;
 use crate::superblock::Superblock;
 use crate::type_builders::{
     DatasetBuilder, FinishedGroup, GroupBuilder, VlStringStaging, build_attr_message,
-    build_global_heap_collection, check_heap_object_limit, patch_vl_refs, patch_vl_refs_masked,
+    build_global_heap_collections, patch_vl_refs, patch_vl_refs_masked,
 };
 
 // `AttrValue` lives in `type_builders`; `types` and `mat` reference it through
@@ -703,7 +703,7 @@ impl FileWriter {
             /// copied compressed-as-is rather than encoded from `raw`.
             raw_chunks: Option<crate::type_builders::RawChunkPayload>,
             reference_targets: Option<Vec<crate::type_builders::ObjectRefTarget>>,
-            /// Staged global heap collection + patch mask for a VL-string
+            /// Staged global heap collections + patch mask for a VL-string
             /// dataset, whose element references in `raw` need their heap
             /// addresses patched once the post-data cursor is known.
             vl_string_staging: Option<VlStringStaging>,
@@ -749,6 +749,19 @@ impl FileWriter {
                     emit_chunked_data_verbatim(sink, plan, provider)
                 }
             }
+        }
+
+        /// Emit one variable-length dataset's or attribute's global heap
+        /// collections back to back, in the order `place_collections` assigned
+        /// their addresses.
+        fn emit_collections<Sk: ByteSink>(
+            sink: &mut Sk,
+            collections: &[Vec<u8>],
+        ) -> Result<(), FormatError> {
+            for collection in collections {
+                sink.put(collection)?;
+            }
+            Ok(())
         }
 
         /// A built chunked dataset's layout/pipeline messages plus its data
@@ -890,11 +903,6 @@ impl FileWriter {
             {
                 return Err(FormatError::ChunkedVlenStringUnsupported);
             }
-            // One collection indexes at most 65535 objects (u16); refuse rather
-            // than write references no reader can resolve.
-            if let Some(staging) = &db.vl_string_staging {
-                check_heap_object_limit(staging.object_count)?;
-            }
             let max_dimensions = db.maxshape.clone();
             let dspace = Dataspace {
                 space_type: if shape.is_empty() {
@@ -911,7 +919,7 @@ impl FileWriter {
                 dimensions: shape,
                 max_dimensions,
             };
-            let patches = collect_vl_patches(&db.attrs)?;
+            let patches = collect_vl_patches(&db.attrs);
             let mut attrs = Vec::new();
             for (n, v) in &db.attrs {
                 attrs.push(build_attr_message(n, v));
@@ -961,7 +969,7 @@ impl FileWriter {
             grp_vl: &mut Vec<Vec<VlPatch>>,
             ds_vl: &mut Vec<Vec<VlPatch>>,
         ) -> Result<usize, FormatError> {
-            let patches = collect_vl_patches(&g.attrs)?;
+            let patches = collect_vl_patches(&g.attrs);
             let mut gattrs = Vec::new();
             for (n, v) in &g.attrs {
                 gattrs.push(build_attr_message(n, v));
@@ -1005,28 +1013,42 @@ impl FileWriter {
         // Build global heap collections for VarLenAsciiArray attributes.
         // Track which attribute messages need VL patching, across root, groups, and datasets.
         struct VlPatch {
-            collection_bytes: Vec<u8>,
+            /// The attribute's collections, in the order their objects appear.
+            collections: Vec<Vec<u8>>,
             attr_index: usize, // index into the relevant attrs Vec
         }
 
-        fn collect_vl_patches(
-            attrs_raw: &[(String, AttrValue)],
-        ) -> Result<Vec<VlPatch>, FormatError> {
+        /// Assign consecutive addresses to `collections` starting at `*cursor`,
+        /// advancing it past them, and return those addresses in order. The
+        /// GCOL emission loops below walk the collections in this same order,
+        /// so the addresses patched into the references are the ones the
+        /// collections land at.
+        fn place_collections(collections: &[Vec<u8>], cursor: &mut u64) -> Vec<u64> {
+            collections
+                .iter()
+                .map(|c| {
+                    let addr = *cursor;
+                    *cursor += c.len() as u64;
+                    addr
+                })
+                .collect()
+        }
+
+        fn collect_vl_patches(attrs_raw: &[(String, AttrValue)]) -> Vec<VlPatch> {
             let mut patches = Vec::new();
             for (i, (_n, v)) in attrs_raw.iter().enumerate() {
                 if let AttrValue::VarLenAsciiArray(strings) = v {
-                    check_heap_object_limit(strings.len())?;
                     let str_refs: Vec<&str> = strings.iter().map(|s| s.as_str()).collect();
                     patches.push(VlPatch {
-                        collection_bytes: build_global_heap_collection(&str_refs),
+                        collections: build_global_heap_collections(&str_refs),
                         attr_index: i,
                     });
                 }
             }
-            Ok(patches)
+            patches
         }
 
-        let vl_root = collect_vl_patches(&self.root_attrs)?;
+        let vl_root = collect_vl_patches(&self.root_attrs);
 
         let mut root_attrs: Vec<AttributeMessage> = Vec::new();
         for (n, v) in &self.root_attrs {
@@ -1317,34 +1339,28 @@ impl FileWriter {
             // element references are patched after their data is built below.
             let gcol_start = meta;
             let mut gcol_cursor = meta;
-            let mut elem_gcol: Vec<(usize, u64)> = Vec::new();
+            let mut elem_gcol: Vec<(usize, Vec<u64>)> = Vec::new();
             {
                 for patch in &vl_root {
-                    patch_vl_refs(&mut root_attrs[patch.attr_index].raw_data, gcol_cursor);
-                    gcol_cursor += patch.collection_bytes.len() as u64;
+                    let addrs = place_collections(&patch.collections, &mut gcol_cursor);
+                    patch_vl_refs(&mut root_attrs[patch.attr_index].raw_data, &addrs);
                 }
                 for (gi, patches) in grp_vl.iter().enumerate() {
                     for patch in patches {
-                        patch_vl_refs(
-                            &mut groups[gi].attrs[patch.attr_index].raw_data,
-                            gcol_cursor,
-                        );
-                        gcol_cursor += patch.collection_bytes.len() as u64;
+                        let addrs = place_collections(&patch.collections, &mut gcol_cursor);
+                        patch_vl_refs(&mut groups[gi].attrs[patch.attr_index].raw_data, &addrs);
                     }
                 }
                 for (di, patches) in ds_vl.iter().enumerate() {
                     for patch in patches {
-                        patch_vl_refs(
-                            &mut all_ds[di].attrs[patch.attr_index].raw_data,
-                            gcol_cursor,
-                        );
-                        gcol_cursor += patch.collection_bytes.len() as u64;
+                        let addrs = place_collections(&patch.collections, &mut gcol_cursor);
+                        patch_vl_refs(&mut all_ds[di].attrs[patch.attr_index].raw_data, &addrs);
                     }
                 }
                 for (i, d) in all_ds.iter().enumerate() {
                     if let Some(staging) = &d.vl_string_staging {
-                        elem_gcol.push((i, gcol_cursor));
-                        gcol_cursor += staging.collection_bytes.len() as u64;
+                        elem_gcol
+                            .push((i, place_collections(&staging.collections, &mut gcol_cursor)));
                     }
                 }
             }
@@ -1543,7 +1559,7 @@ impl FileWriter {
             let eoa_pre_fsm = eoa_rel;
 
             // (g) Now that the element bytes exist, patch dataset-element VL refs.
-            for (i, gaddr) in &elem_gcol {
+            for (i, gaddrs) in &elem_gcol {
                 let staging = all_ds[*i]
                     .vl_string_staging
                     .as_ref()
@@ -1557,7 +1573,7 @@ impl FileWriter {
                         "a staged VL-string dataset is non-chunked, so its data is in memory"
                     )
                 };
-                patch_vl_refs_masked(bytes, &staging.patch_mask, *gaddr);
+                patch_vl_refs_masked(bytes, &staging.patch_mask, gaddrs);
             }
 
             let ds_layouts: Vec<DsLayout> = layouts
@@ -1711,21 +1727,21 @@ impl FileWriter {
             }
             // Global heap collections.
             for patch in &vl_root {
-                sink.put(&patch.collection_bytes)?;
+                emit_collections(sink, &patch.collections)?;
             }
             for patches in &grp_vl {
                 for patch in patches {
-                    sink.put(&patch.collection_bytes)?;
+                    emit_collections(sink, &patch.collections)?;
                 }
             }
             for patches in &ds_vl {
                 for patch in patches {
-                    sink.put(&patch.collection_bytes)?;
+                    emit_collections(sink, &patch.collections)?;
                 }
             }
             for d in &all_ds {
                 if let Some(staging) = &d.vl_string_staging {
-                    sink.put(&staging.collection_bytes)?;
+                    emit_collections(sink, &staging.collections)?;
                 }
             }
             debug_assert_eq!(sink.position(), base + ext_addr);
@@ -1808,25 +1824,19 @@ impl FileWriter {
         if has_vl {
             let mut gcol_cursor = cursor2 as u64;
             for patch in &vl_root {
-                patch_vl_refs(&mut root_attrs[patch.attr_index].raw_data, gcol_cursor);
-                gcol_cursor += patch.collection_bytes.len() as u64;
+                let addrs = place_collections(&patch.collections, &mut gcol_cursor);
+                patch_vl_refs(&mut root_attrs[patch.attr_index].raw_data, &addrs);
             }
             for (gi, patches) in grp_vl.iter().enumerate() {
                 for patch in patches {
-                    patch_vl_refs(
-                        &mut groups[gi].attrs[patch.attr_index].raw_data,
-                        gcol_cursor,
-                    );
-                    gcol_cursor += patch.collection_bytes.len() as u64;
+                    let addrs = place_collections(&patch.collections, &mut gcol_cursor);
+                    patch_vl_refs(&mut groups[gi].attrs[patch.attr_index].raw_data, &addrs);
                 }
             }
             for (di, patches) in ds_vl.iter().enumerate() {
                 for patch in patches {
-                    patch_vl_refs(
-                        &mut all_ds[di].attrs[patch.attr_index].raw_data,
-                        gcol_cursor,
-                    );
-                    gcol_cursor += patch.collection_bytes.len() as u64;
+                    let addrs = place_collections(&patch.collections, &mut gcol_cursor);
+                    patch_vl_refs(&mut all_ds[di].attrs[patch.attr_index].raw_data, &addrs);
                 }
             }
             // Dataset-element VL references. The references live in the
@@ -1846,8 +1856,8 @@ impl FileWriter {
                              VL dataset's data is always in memory"
                         );
                     };
-                    patch_vl_refs_masked(bytes, &staging.patch_mask, gcol_cursor);
-                    gcol_cursor += staging.collection_bytes.len() as u64;
+                    let addrs = place_collections(&staging.collections, &mut gcol_cursor);
+                    patch_vl_refs_masked(bytes, &staging.patch_mask, &addrs);
                 }
             }
             #[expect(
@@ -1987,23 +1997,23 @@ impl FileWriter {
 
         // Global heap collections
         for patch in &vl_root {
-            sink.put(&patch.collection_bytes)?;
+            emit_collections(sink, &patch.collections)?;
         }
         for patches in &grp_vl {
             for patch in patches {
-                sink.put(&patch.collection_bytes)?;
+                emit_collections(sink, &patch.collections)?;
             }
         }
         for patches in &ds_vl {
             for patch in patches {
-                sink.put(&patch.collection_bytes)?;
+                emit_collections(sink, &patch.collections)?;
             }
         }
         // Dataset-element VL string collections, in the same order their
         // addresses were assigned above.
         for d in &all_ds {
             if let Some(staging) = &d.vl_string_staging {
-                sink.put(&staging.collection_bytes)?;
+                emit_collections(sink, &staging.collections)?;
             }
         }
 
@@ -2474,6 +2484,46 @@ mod tests {
         let bytes = fw.finish().unwrap();
         let objs = read_vl_bytes(bytes, "nulls");
         assert_eq!(objs, vec![VlByteObject::Null, VlByteObject::Null]);
+    }
+
+    #[test]
+    fn vlen_string_dataset_with_nulls_spans_multiple_heap_collections() {
+        // A null element takes no heap object, so the collection an element's
+        // reference resolves to follows its *object* position, not its element
+        // position: interleaving nulls shifts the split point away from element
+        // 65,535. Elements around both are checked, plus the nulls themselves.
+        use crate::type_builders::VlStringElement;
+        use crate::vl_data::VlByteObject;
+
+        let count = 100_000;
+        let elements: Vec<VlStringElement> = (0..count)
+            .map(|i| {
+                if i % 3 == 0 {
+                    VlStringElement::Null
+                } else {
+                    VlStringElement::Bytes(format!("s{i}").into_bytes())
+                }
+            })
+            .collect();
+        let dt = crate::type_builders::make_vlen_string_type(CharacterSet::Utf8);
+        let mut fw = FileWriter::new();
+        fw.create_dataset("mixed")
+            .with_vlen_string_elements(dt, &elements)
+            .unwrap();
+        let bytes = fw.finish().unwrap();
+        let objs = read_vl_bytes(bytes, "mixed");
+
+        assert_eq!(objs.len(), count);
+        // Two thirds of the elements carry objects, so the 65,536th object —
+        // the first of the second collection — is element 98,303, not 65,535.
+        for i in [0, 1, 65_535, 98_302, 98_303, 98_304, count - 1] {
+            let expected = if i % 3 == 0 {
+                VlByteObject::Null
+            } else {
+                VlByteObject::Bytes(format!("s{i}").into_bytes())
+            };
+            assert_eq!(objs[i], expected, "element {i} did not round-trip");
+        }
     }
 
     #[test]

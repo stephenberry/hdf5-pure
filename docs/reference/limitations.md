@@ -85,9 +85,6 @@ Virtual datasets are also refused by `repack` (it cannot relocate data living ou
 | Capability | Tracking |
 |---|---|
 | **Chunked / filtered / resizable variable-length-string** datasets | [#109](https://github.com/stephenberry/hdf5-pure/issues/109) |
-| More than **65,535 variable-length elements** in one dataset or attribute (`FormatError::GlobalHeapObjectLimitExceeded`) | [#189](https://github.com/stephenberry/hdf5-pure/issues/189) |
-
-The heap limit is a write-side one: the writer stages a single global heap collection per variable-length dataset or attribute, and a collection's object index is a `u16`. Reading is unaffected — a file whose variable-length data spans several collections (what the reference library writes past that size) reads normally. `repack` of such a file is refused for the same reason, since it re-stages the heap rather than copying it.
 
 ### SWMR
 
