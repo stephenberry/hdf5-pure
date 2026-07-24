@@ -79,6 +79,22 @@ impl GlobalHeapIndex {
         offset: u64,
         length_size: u8,
     ) -> Result<Self, FormatError> {
+        Self::parse_filtered(source, offset, length_size, |_| true)
+    }
+
+    /// [`parse`](Self::parse), retaining only the objects `keep` accepts.
+    ///
+    /// The walk still visits every object header — each object's size chains
+    /// the position of the next — but the directory holds just the accepted
+    /// entries, so a caller resolving a few objects of a large collection
+    /// (e.g. a row window of a variable-length string dataset) is not charged
+    /// the whole collection's directory.
+    pub(crate) fn parse_filtered<S: Source + ?Sized>(
+        source: &S,
+        offset: u64,
+        length_size: u8,
+        keep: impl Fn(u16) -> bool,
+    ) -> Result<Self, FormatError> {
         let header_size = 8 + length_size as usize;
         let header = source.read_metadata_at(offset, header_size)?;
 
@@ -159,11 +175,13 @@ impl GlobalHeapIndex {
                 });
             }
 
-            objects.push(GlobalHeapObjectInfo {
-                index: object_index,
-                data_address,
-                size: object_size,
-            });
+            if keep(object_index) {
+                objects.push(GlobalHeapObjectInfo {
+                    index: object_index,
+                    data_address,
+                    size: object_size,
+                });
+            }
 
             let padded_size = pad8_u64(object_size)?;
             pos = data_address
