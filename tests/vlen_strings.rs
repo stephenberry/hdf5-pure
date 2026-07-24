@@ -95,3 +95,57 @@ fn vlen_specific_apis_reject_non_vlen_datasets() {
         Err(Error::Format(FormatError::TypeMismatch { .. }))
     ));
 }
+
+// --- One-collection heap object limit (u16 index; issue: silent corruption) ---
+
+/// Exactly `u16::MAX` strings is the most one collection can index; the file
+/// must round-trip. One past it must be refused at write time — previously the
+/// on-disk object index wrapped (the 65,536th object's header read as the
+/// free-space marker) and the file's references could not be resolved by this
+/// crate or the C library.
+#[test]
+fn heap_object_limit_boundary_roundtrips() {
+    let values: Vec<String> = (0..u16::MAX as usize).map(|i| format!("s{i}")).collect();
+    let refs: Vec<&str> = values.iter().map(String::as_str).collect();
+    let mut builder = hdf5_pure::FileBuilder::new();
+    builder.create_dataset("labels").with_vlen_strings(&refs);
+    let bytes = builder.finish().unwrap();
+
+    let file = File::from_bytes(bytes).unwrap();
+    let read = file.dataset("labels").unwrap().read_string().unwrap();
+    assert_eq!(read.len(), u16::MAX as usize);
+    assert_eq!(read.first().map(String::as_str), Some("s0"));
+    assert_eq!(read.last().map(String::as_str), Some("s65534"));
+}
+
+#[test]
+fn heap_object_limit_refused_for_datasets() {
+    let values: Vec<String> = (0..=u16::MAX as usize).map(|i| format!("s{i}")).collect();
+    let refs: Vec<&str> = values.iter().map(String::as_str).collect();
+    let mut builder = hdf5_pure::FileBuilder::new();
+    builder.create_dataset("labels").with_vlen_strings(&refs);
+    let error = builder.finish().unwrap_err();
+    assert!(
+        matches!(
+            error,
+            Error::Format(FormatError::GlobalHeapObjectLimitExceeded { count: 65_536 })
+        ),
+        "expected GlobalHeapObjectLimitExceeded, got {error:?}"
+    );
+}
+
+#[test]
+fn heap_object_limit_refused_for_attributes() {
+    let values: Vec<String> = (0..=u16::MAX as usize).map(|i| format!("s{i}")).collect();
+    let mut builder = hdf5_pure::FileBuilder::new();
+    builder.set_attr("labels", hdf5_pure::AttrValue::VarLenAsciiArray(values));
+    builder.create_dataset("x").with_f64_data(&[1.0]);
+    let error = builder.finish().unwrap_err();
+    assert!(
+        matches!(
+            error,
+            Error::Format(FormatError::GlobalHeapObjectLimitExceeded { count: 65_536 })
+        ),
+        "expected GlobalHeapObjectLimitExceeded, got {error:?}"
+    );
+}

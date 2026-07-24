@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- `FileBuilder::write`/`finish` and the edit session now refuse a variable-length dataset or attribute holding more than 65,535 heap objects (`FormatError::GlobalHeapObjectLimitExceeded`) instead of silently writing a corrupt global heap. The writer stages one collection per dataset or attribute, and its 2-byte object index wrapped past that limit — the 65,536th object's header read as the free-space marker — leaving references neither this crate nor the reference C library could resolve.
 - `Dataset::read_raw_rows` and the typed `read_*_rows` now stream a row window of an inner-chunked dataset by decoding only the chunks the window overlaps, instead of falling back to a whole read, so peak memory scales with the window plus one chunk rather than the dataset ([#183](https://github.com/stephenberry/hdf5-pure/pull/183)).
 
 ## [0.23.2] - 2026-07-23
