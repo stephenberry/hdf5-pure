@@ -12,19 +12,34 @@
 //! place. So this writes right up against it and reads the values back through
 //! libhdf5.
 
-use hdf5_pure::{AttrValue, FileBuilder, OBJECT_HEADER_MESSAGE_MAX};
+use hdf5_pure::{AttrValue, Error, FileBuilder, FormatError, OBJECT_HEADER_MESSAGE_MAX};
 use tempfile::tempdir;
+
+/// Whether the writer accepts a root `i64` attribute of `n` elements.
+fn accepts_i64_attr(n: usize) -> Result<(), Error> {
+    let mut builder = FileBuilder::new();
+    builder.set_attr("probe", AttrValue::I64Array(vec![0; n]));
+    builder.create_dataset("x").with_f64_data(&[1.0]);
+    builder.finish().map(|_| ())
+}
 
 /// The largest `i64` attribute the writer accepts, found by probing down from
 /// the size field's limit. The exact element count depends on the encoder's
 /// per-message overhead (name, datatype, dataspace), and this test wants the
 /// boundary itself rather than an approximation that drifts away from it.
+///
+/// The probe would happily settle on a much smaller attribute if `finish` ever
+/// started failing at large `n` for an unrelated reason — leaving both tests
+/// below green while testing nothing near the limit — so the element it stops
+/// at is checked to be the boundary: one more must be refused, and refused for
+/// *this* reason.
 fn largest_accepted_i64_attr() -> Vec<i64> {
     for n in (1..=OBJECT_HEADER_MESSAGE_MAX / 8).rev() {
-        let mut builder = FileBuilder::new();
-        builder.set_attr("probe", AttrValue::I64Array(vec![0; n]));
-        builder.create_dataset("x").with_f64_data(&[1.0]);
-        if builder.finish().is_ok() {
+        if accepts_i64_attr(n).is_ok() {
+            match accepts_i64_attr(n + 1) {
+                Err(Error::Format(FormatError::AttributeMessageTooLarge { .. })) => {}
+                other => panic!("{} elements accepted, but {} gave {other:?}", n, n + 1),
+            }
             return (0..n as i64).collect();
         }
     }

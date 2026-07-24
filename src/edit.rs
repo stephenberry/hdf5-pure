@@ -172,7 +172,7 @@ use crate::convert::TryToUsize;
 use crate::data_layout::DataLayout;
 use crate::dataspace::{Dataspace, DataspaceType};
 use crate::datatype::{Datatype, DatatypeByteOrder};
-use crate::error::{Error, FormatError};
+use crate::error::{Error, FormatError, OBJECT_HEADER_MESSAGE_MAX};
 use crate::extensible_array::ExtensibleArrayHeader;
 use crate::file_lock::{self, FileLocking};
 use crate::file_space_info::{FileSpaceInfo, FileSpaceStrategy};
@@ -2678,7 +2678,7 @@ impl WriteEngine {
                         "a v0/v1 group has a shared attribute message (not convertible in place yet)",
                     ));
                 }
-                if m.data.len() > u16::MAX as usize {
+                if m.data.len() > OBJECT_HEADER_MESSAGE_MAX {
                     return Err(Error::EditUnsupported(
                         "a v0/v1 group attribute is too large to convert in place",
                     ));
@@ -5731,7 +5731,7 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
     // The link message body (whose length is independent of the address) must
     // fit the object-header message's u16 size field; a pathologically long
     // name would otherwise overflow it into silent corruption.
-    if make_link(&db.name, 0).serialize(OFFSET_SIZE).len() > u16::MAX as usize {
+    if make_link(&db.name, 0).serialize(OFFSET_SIZE).len() > OBJECT_HEADER_MESSAGE_MAX {
         return Err(Error::EditUnsupported(
             "dataset name is too long to encode as a link message",
         ));
@@ -5783,7 +5783,7 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
     // as-is; refuse it instead, mirroring `apply_group_attr_ops`'s and
     // `encode_attr_message`'s equivalent checks for group/root attributes.
     for a in &attrs {
-        if a.serialize(LENGTH_SIZE).len() > u16::MAX as usize {
+        if a.serialize(LENGTH_SIZE).len() > OBJECT_HEADER_MESSAGE_MAX {
             return Err(Error::EditUnsupported(
                 "dataset attribute is too large to encode in place",
             ));
@@ -6340,15 +6340,25 @@ fn patch_link_target(region: &mut [u8], name: &str, new_addr: u64) -> Result<(),
     ))
 }
 
+/// Bytes a compact Data Layout message carries ahead of its inline data:
+/// version(1) + class(1) + the 2-byte inline size.
+const COMPACT_LAYOUT_PREAMBLE: usize = 4;
+
 /// Copy a chunk-0 message `region`, replacing the single (compact) Data Layout
 /// message's inline data with `raw` and preserving every other message verbatim.
 /// Used by `write_dataset` to overwrite a compact dataset's values. The message
 /// header (type and flags) and version byte are kept; only the inline data — and
-/// the message size and 2-byte inline-size fields — change. `raw` must fit the
-/// compact layout's 2-byte size field (HDF5's 64 KiB compact-storage limit),
-/// which an overwrite of an existing compact dataset always satisfies.
+/// the message size and 2-byte inline-size fields — change. `raw` must fit both
+/// the compact layout's own 2-byte size field (HDF5's 64 KiB compact-storage
+/// limit) and, once the 4-byte layout preamble is added, the object header's
+/// 2-byte message-size field — the tighter of the two, which an overwrite of an
+/// existing compact dataset always satisfies.
 fn rebuild_compact_layout_region(region: &[u8], raw: &[u8]) -> Result<Vec<u8>, Error> {
-    if raw.len() > u16::MAX as usize {
+    // The bound is on the *message body* the layout becomes — version, class,
+    // and the 2-byte inline size ahead of the data — not on `raw` alone, or the
+    // last four lengths below the limit would truncate the size field written
+    // for them.
+    if raw.len() > OBJECT_HEADER_MESSAGE_MAX - COMPACT_LAYOUT_PREAMBLE {
         return Err(Error::EditUnsupported(
             "compact dataset data is too large to overwrite in place",
         ));
@@ -6365,12 +6375,12 @@ fn rebuild_compact_layout_region(region: &[u8], raw: &[u8]) -> Result<Vec<u8>, E
             }
             // New compact layout body: version (kept), class=0, 2-byte inline
             // size, then the data.
-            let mut layout = Vec::with_capacity(4 + raw.len());
+            let mut layout = Vec::with_capacity(COMPACT_LAYOUT_PREAMBLE + raw.len());
             layout.push(region[body]); // version (3 or 4)
             layout.push(0); // class = compact
             #[expect(
                 clippy::cast_possible_truncation,
-                reason = "raw.len() bounded to u16::MAX above"
+                reason = "raw.len() bounded below the u16 inline-size field above"
             )]
             layout.extend_from_slice(&(raw.len() as u16).to_le_bytes());
             layout.extend_from_slice(raw);
@@ -6378,8 +6388,8 @@ fn rebuild_compact_layout_region(region: &[u8], raw: &[u8]) -> Result<Vec<u8>, E
             out.push(region[p]);
             #[expect(
                 clippy::cast_possible_truncation,
-                reason = "layout body length is 4 + raw.len() <= u16::MAX + 4, and an OH \
-                          message size that overflows u16 is itself malformed"
+                reason = "the guard above bounds COMPACT_LAYOUT_PREAMBLE + raw.len(), this \
+                          body's exact length, to the 2-byte message-size field"
             )]
             out.extend_from_slice(&(layout.len() as u16).to_le_bytes());
             out.push(region[p + 3]);
@@ -6460,7 +6470,7 @@ fn apply_group_attr_ops(region: &[u8], ops: &[AttrOp]) -> Result<(Vec<u8>, Pendi
                     // never been set as a fixed-size attribute.
                     out = remove_attr_from_region(&out, name, false)?;
                     let msg = build_attr_message(name, value);
-                    if msg.serialize(LENGTH_SIZE).len() > u16::MAX as usize {
+                    if msg.serialize(LENGTH_SIZE).len() > OBJECT_HEADER_MESSAGE_MAX {
                         return Err(Error::EditUnsupported(
                             "attribute is too large to encode in place",
                         ));
@@ -6629,7 +6639,7 @@ fn encode_attr_message(name: &str, value: &AttrValue) -> Result<Vec<u8>, Error> 
         "VarLenAsciiArray must be intercepted by apply_group_attr_ops before reaching encode_attr_message"
     );
     let body = build_attr_message(name, value).serialize(LENGTH_SIZE);
-    if body.len() > u16::MAX as usize {
+    if body.len() > OBJECT_HEADER_MESSAGE_MAX {
         return Err(Error::EditUnsupported(
             "group attribute is too large to encode in place",
         ));

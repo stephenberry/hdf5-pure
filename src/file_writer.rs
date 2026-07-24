@@ -1057,6 +1057,58 @@ impl FileWriter {
             root_attrs.push(build_attr_message(n, v));
         }
 
+        let root_dense = root_attrs.len() > DENSE_ATTR_THRESHOLD;
+        let group_dense: Vec<bool> = groups
+            .iter()
+            .map(|g| g.attrs.len() > DENSE_ATTR_THRESHOLD)
+            .collect();
+        let ds_dense: Vec<bool> = all_ds
+            .iter()
+            .map(|d| d.attrs.len() > DENSE_ATTR_THRESHOLD)
+            .collect();
+
+        // A compact attribute is stored as an object-header message, whose size
+        // field is 2 bytes wide. An oversized one would be written with a
+        // truncated length, which silently loses the attribute or leaves the
+        // reader parsing the next message body as a message header, so refuse it
+        // here — while the attribute's name is still at hand — before any header
+        // is built. `ObjectHeaderWriter::serialize` is the unnamed backstop for
+        // every other message this writer emits.
+        //
+        // This runs before the compression pass below so a file that will be
+        // refused does not first pay to compress every chunked dataset in it.
+        //
+        // Dense attributes are stored in a fractal heap rather than the header,
+        // so this limit does not apply to them and the check skips them. That
+        // leaves an object with more than `DENSE_ATTR_THRESHOLD` attributes
+        // unguarded, where the dense emitter has a mis-encoding gap of its own
+        // (issue #191); this check deliberately does not paper over it.
+        fn check_compact_attrs(attrs: &[AttributeMessage]) -> Result<(), FormatError> {
+            for a in attrs {
+                let size = a.serialize(LENGTH_SIZE).len();
+                if size > OBJECT_HEADER_MESSAGE_MAX {
+                    return Err(FormatError::AttributeMessageTooLarge {
+                        name: a.name.clone(),
+                        size,
+                    });
+                }
+            }
+            Ok(())
+        }
+        if !root_dense {
+            check_compact_attrs(&root_attrs)?;
+        }
+        for (gi, g) in groups.iter().enumerate() {
+            if !group_dense[gi] {
+                check_compact_attrs(&g.attrs)?;
+            }
+        }
+        for (i, d) in all_ds.iter().enumerate() {
+            if !ds_dense[i] {
+                check_compact_attrs(&d.attrs)?;
+            }
+        }
+
         let is_chunked: Vec<bool> = all_ds
             .iter()
             .map(|d| d.chunk_options.is_chunked() || d.maxshape.is_some() || d.raw_chunks.is_some())
@@ -1089,50 +1141,6 @@ impl FileWriter {
                 }
             })
             .collect::<Result<_, FormatError>>()?;
-
-        let root_dense = root_attrs.len() > DENSE_ATTR_THRESHOLD;
-        let group_dense: Vec<bool> = groups
-            .iter()
-            .map(|g| g.attrs.len() > DENSE_ATTR_THRESHOLD)
-            .collect();
-        let ds_dense: Vec<bool> = all_ds
-            .iter()
-            .map(|d| d.attrs.len() > DENSE_ATTR_THRESHOLD)
-            .collect();
-
-        // A compact attribute is stored as an object-header message, whose size
-        // field is 2 bytes wide. An oversized one would be written with a
-        // truncated length, which silently loses the attribute or leaves the
-        // reader parsing the next message body as a message header, so refuse it
-        // here — while the attribute's name is still at hand — before any header
-        // is built. `ObjectHeaderWriter::serialize` is the unnamed backstop for
-        // every other message. Dense attributes live in a fractal heap instead
-        // of the header, so this limit does not apply to them.
-        fn check_compact_attrs(attrs: &[AttributeMessage]) -> Result<(), FormatError> {
-            for a in attrs {
-                let size = a.serialize(LENGTH_SIZE).len();
-                if size > OBJECT_HEADER_MESSAGE_MAX {
-                    return Err(FormatError::AttributeMessageTooLarge {
-                        name: a.name.clone(),
-                        size,
-                    });
-                }
-            }
-            Ok(())
-        }
-        if !root_dense {
-            check_compact_attrs(&root_attrs)?;
-        }
-        for (gi, g) in groups.iter().enumerate() {
-            if !group_dense[gi] {
-                check_compact_attrs(&g.attrs)?;
-            }
-        }
-        for (i, d) in all_ds.iter().enumerate() {
-            if !ds_dense[i] {
-                check_compact_attrs(&d.attrs)?;
-            }
-        }
 
         // Pass 1: compute OH sizes with dummy addresses
         let group_oh_sizes: Vec<usize> = groups
@@ -2410,7 +2418,14 @@ mod tests {
     fn compact_attr_at_the_message_size_limit_is_written() {
         let n = largest_fitting_i64_attr_elements();
         let attr = build_attr_message("boundary", &AttrValue::I64Array(vec![7i64; n]));
-        assert!(attr.serialize(LENGTH_SIZE).len() <= OBJECT_HEADER_MESSAGE_MAX);
+        // Pin the probe to the boundary itself: one more element must not fit,
+        // or this test would still pass while exercising a tiny attribute.
+        let size = attr.serialize(LENGTH_SIZE).len();
+        assert!(size <= OBJECT_HEADER_MESSAGE_MAX);
+        assert!(
+            size + 8 > OBJECT_HEADER_MESSAGE_MAX,
+            "probe is not at the limit (got {size})"
+        );
 
         let mut fw = FileWriter::new();
         fw.set_root_attr("boundary", AttrValue::I64Array(vec![7i64; n]));

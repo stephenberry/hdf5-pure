@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `OBJECT_HEADER_MESSAGE_MAX` is the largest message a version 2 object header can describe (65,535 bytes), the bound behind the new oversized-message refusals ([#190](https://github.com/stephenberry/hdf5-pure/issues/190)).
 - `Dataset::element_size` returns the on-disk byte width of one element (HDF5's `H5Tget_size`), so a caller reading an untrusted file can multiply it by the element count from `shape` to bound a read's allocation before requesting it, rather than trusting the file's declared extent ([#185](https://github.com/stephenberry/hdf5-pure/issues/185)).
 
 ### Fixed
@@ -17,7 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Resolving a variable-length element now binary-searches its heap collection's directory instead of scanning it, so reading a large variable-length string dataset is no longer quadratic in its element count ([#189](https://github.com/stephenberry/hdf5-pure/issues/189)).
 - `Dataset::read_raw_rows` and the typed `read_*_rows` now stream a row window of an inner-chunked dataset by decoding only the chunks the window overlaps, instead of falling back to a whole read, so peak memory scales with the window plus one chunk rather than the dataset ([#183](https://github.com/stephenberry/hdf5-pure/pull/183)).
 - `Dataset::read_string_rows` on variable-length strings now resolves only the window's heap references instead of reading and resolving the whole dataset before slicing, so the row-window memory bound holds for every windowed read: peak allocation is the window's references, its text, and the metadata of the heap collections it touches ([#186](https://github.com/stephenberry/hdf5-pure/pull/186)).
-- `FileBuilder::write`/`finish` now refuse an attribute whose object-header message exceeds 65,535 bytes (the new `FormatError::AttributeMessageTooLarge`, naming the attribute) instead of truncating its size field, which silently dropped the attribute or left the file unreadable; root, group, and dataset attributes are all covered ([#190](https://github.com/stephenberry/hdf5-pure/issues/190)).
+- `FileBuilder::write`/`finish` and `repack` now refuse a compact attribute whose object-header message exceeds `OBJECT_HEADER_MESSAGE_MAX` (the new `FormatError::AttributeMessageTooLarge`, naming the attribute) instead of truncating its size field, which silently dropped the attribute or left the file unreadable; an object with more than eight attributes uses dense storage, whose separate gap is [#191](https://github.com/stephenberry/hdf5-pure/issues/191) ([#190](https://github.com/stephenberry/hdf5-pure/issues/190)).
 
 ## [0.23.2] - 2026-07-23
 

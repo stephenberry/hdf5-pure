@@ -328,11 +328,14 @@ pub enum FormatError {
         size: usize,
     },
     /// An object-header message is larger than the version 2 object header's
-    /// 2-byte message-size field can describe. This is the writer's backstop
-    /// against emitting a truncated size field; callers that can name the
-    /// offending object (for example an attribute) report a more specific error
-    /// first. The fields carry the message type code and the message's
-    /// serialized size in bytes; the limit is [`OBJECT_HEADER_MESSAGE_MAX`].
+    /// 2-byte message-size field can describe. This is the whole-file writer's
+    /// backstop against emitting a truncated size field, covering every message
+    /// it builds; callers that can name the offending object (for example an
+    /// attribute) report a more specific error first. The in-place editor
+    /// encodes headers separately and refuses the same condition with
+    /// [`Error::EditUnsupported`](crate::Error::EditUnsupported). The fields
+    /// carry the message type code and the message's serialized size in bytes;
+    /// the limit is [`OBJECT_HEADER_MESSAGE_MAX`].
     ObjectHeaderMessageTooLarge {
         /// The header message's type code (see the HDF5 message type table).
         message_type: u16,

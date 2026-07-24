@@ -76,8 +76,11 @@ fn dataset_attr_past_the_limit_is_refused() {
     assert_eq!(too_large(&builder.finish().unwrap_err()).0, "big");
 }
 
+/// `write` refuses too, rather than only `finish`. It creates the destination
+/// before serializing, so a refusal leaves an empty file behind — no HDF5
+/// content, but the path exists. Asserted so the behaviour is on the record.
 #[test]
-fn write_to_disk_refuses_instead_of_leaving_a_broken_file() {
+fn write_to_disk_refuses_and_leaves_an_empty_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("oversized.h5");
 
@@ -86,6 +89,26 @@ fn write_to_disk_refuses_instead_of_leaving_a_broken_file() {
     builder.create_dataset("x").with_f64_data(&[1.0]);
 
     assert_eq!(too_large(&builder.write(&path).unwrap_err()).0, "big");
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+}
+
+/// An oversized attribute is not the only way to overflow the message-size
+/// field: a long enough dataset name does it through the Link message. That has
+/// no name-carrying check in front of it, so it lands on the writer's backstop —
+/// which must still refuse rather than truncate.
+#[test]
+fn oversized_link_message_hits_the_writer_backstop() {
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset(&"a".repeat(70_000))
+        .with_f64_data(&[1.0]);
+
+    match builder.finish().unwrap_err() {
+        Error::Format(FormatError::ObjectHeaderMessageTooLarge { size, .. }) => {
+            assert!(size > OBJECT_HEADER_MESSAGE_MAX);
+        }
+        other => panic!("expected ObjectHeaderMessageTooLarge, got {other:?}"),
+    }
 }
 
 /// The refusal must bite only past the limit: a large attribute that still fits
