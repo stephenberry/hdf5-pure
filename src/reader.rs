@@ -3089,8 +3089,7 @@ impl Dataset {
         let count = num_rows.min(n0 - start);
 
         // A window covering every row is exactly a whole read: delegate, so it
-        // never costs a window-shaped copy on top of one (and vlen-string reads,
-        // which still fall back to a whole read, don't pay it twice).
+        // never costs a window-shaped copy on top of one.
         if start == 0 && count == n0 {
             let pipeline = self.filter_pipeline_parsed();
             return Ok(self.file.read_dataset_raw(
@@ -3179,47 +3178,34 @@ impl Dataset {
     /// Windowed [`read_string`](Self::read_string).
     ///
     /// Fixed-length strings decode straight from the window. Variable-length
-    /// strings live in a shared heap, so the whole dataset is read and then
-    /// sliced — the memory bound does not apply there.
+    /// strings resolve only the window's heap references, so the window memory
+    /// bound holds for them too: peak allocation is the window's references,
+    /// its text, and the metadata of the heap collections it touches.
     pub fn read_string_rows(&self, start_row: u64, num_rows: u64) -> Result<Vec<String>, Error> {
         let dt = self.datatype()?;
         if vl_data::is_vlen_string_datatype(&dt) {
-            let dims = self.dataspace()?.dimensions;
-            let n0 = dims.first().copied().unwrap_or(1);
-            // A window covering every row is exactly `read_string` — skip the
-            // whole-read-then-clone fallback.
-            if start_row == 0 && num_rows >= n0 {
-                return self.read_string();
-            }
-            // `read_string` returns one entry per *element* (the product of all
-            // dimensions), so the row window is scaled by the inner-dimension
-            // element count to slice whole rows — matching `read_raw_rows`
-            // rather than treating each element as its own row. Checked so a
-            // crafted dataspace whose inner dims overflow `usize` errors instead
-            // of wrapping.
-            let row_elems: usize = dims.iter().skip(1).try_fold(1usize, |acc, &d| {
-                acc.checked_mul(d.to_usize()?)
-                    .ok_or(FormatError::OffsetOverflow {
-                        offset: acc as u64,
-                        length: d,
-                    })
+            // The window's heap references, read memory-bounded like any other
+            // fixed-size element (4-byte length + collection address + 4-byte
+            // object index), one row spanning its inner dimensions. Resolving
+            // only those against the global heap keeps the bound — the same
+            // resolution `read_string` runs over the whole dataset's references.
+            let raw = self.read_raw_rows(start_row, num_rows)?;
+            let ref_size = 4 + self.file.offset_size() as usize + 4;
+            let num_elements = (raw.len() / ref_size) as u64;
+            let mut strings = Vec::new();
+            self.file.with_source(|source| -> Result<(), Error> {
+                Ok(vl_data::visit_vl_strings_from_source(
+                    source,
+                    &raw,
+                    num_elements,
+                    self.file.offset_size(),
+                    self.file.length_size(),
+                    self.file.addr_offset,
+                    VlenStringReadOptions::default(),
+                    |string| strings.push(String::from(string)),
+                )?)
             })?;
-            let all = self.read_string()?;
-            let start_row_idx = start_row.min(n0);
-            let end_row_idx = start_row.saturating_add(num_rows).min(n0);
-            let start = start_row_idx.to_usize()?.checked_mul(row_elems).ok_or(
-                FormatError::OffsetOverflow {
-                    offset: start_row_idx,
-                    length: row_elems as u64,
-                },
-            )?;
-            let end = end_row_idx.to_usize()?.checked_mul(row_elems).ok_or(
-                FormatError::OffsetOverflow {
-                    offset: end_row_idx,
-                    length: row_elems as u64,
-                },
-            )?;
-            return Ok(all.get(start..end).unwrap_or_default().to_vec());
+            return Ok(strings);
         }
         let raw = self.read_raw_rows(start_row, num_rows)?;
         Ok(data_read::read_as_strings(&raw, &dt)?)

@@ -235,6 +235,35 @@ where
     let refs = parse_vl_references(raw_data, num_elements, offset_size)?;
     payload_size(&refs, options)?;
 
+    // This call's object indices per (base-adjusted) collection address, so
+    // each collection's directory walk retains only the entries the call
+    // resolves — a row window of a large dataset would otherwise be charged
+    // the full directory of every touched collection (a writer may pack every
+    // string into one collection). Grouping collects only references the
+    // resolve loop below will look up; invalid ones surface their errors
+    // there, in element order.
+    let mut wanted: Vec<(u64, Vec<u16>)> = Vec::new();
+    for element in &refs {
+        if is_undefined_addr(element.collection_address, offset_size)
+            || (element.length == 0 && element.collection_address == 0)
+        {
+            continue;
+        }
+        let Some(address) = element.collection_address.checked_add(base_address) else {
+            continue;
+        };
+        let Ok(index) = u16::try_from(element.object_index) else {
+            continue;
+        };
+        match wanted.binary_search_by_key(&address, |&(a, _)| a) {
+            Ok(pos) => wanted[pos].1.push(index),
+            Err(pos) => wanted.insert(pos, (address, Vec::from([index]))),
+        }
+    }
+    for (_, indices) in &mut wanted {
+        indices.sort_unstable();
+    }
+
     let mut collections: Vec<(u64, GlobalHeapIndex)> = Vec::new();
     for element in &refs {
         if element.length == 0
@@ -262,7 +291,16 @@ where
         {
             Some(pos) => pos,
             None => {
-                let collection = GlobalHeapIndex::parse(source, collection_address, length_size)?;
+                let keep = wanted
+                    .binary_search_by_key(&collection_address, |&(a, _)| a)
+                    .map(|pos| wanted[pos].1.as_slice())
+                    .unwrap_or(&[]);
+                let collection = GlobalHeapIndex::parse_filtered(
+                    source,
+                    collection_address,
+                    length_size,
+                    |i| keep.binary_search(&i).is_ok(),
+                )?;
                 collections.push((collection_address, collection));
                 collections.len() - 1
             }

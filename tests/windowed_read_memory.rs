@@ -1,23 +1,29 @@
-//! Peak-allocation regression test for the windowed row-read API: a small row
-//! window of a large inner-chunked dataset must allocate on the order of the
-//! window (plus a few decompressed chunks), not the dataset. A whole-read
-//! fallback peaks above the full dataset size and fails the assertion.
+//! Peak-allocation regression tests for the windowed row-read API: a small row
+//! window of a large dataset must allocate on the order of the window (plus a
+//! few decompressed chunks or heap-collection directories), not the dataset. A
+//! whole-read fallback peaks above the full dataset size and fails the
+//! assertion.
 //!
-//! The counting allocator applies to this whole test binary, so this file must
-//! hold exactly one `#[test]`: a second test running in parallel would pollute
-//! the counter.
+//! The counting allocator applies to this whole test binary, so every test
+//! serializes on [`LOCK`] and resets the peak inside the critical section — a
+//! test measuring outside the lock would attribute other tests' allocations to
+//! itself.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hdf5_pure::{File, FileBuilder};
 
 /// Bytes currently allocated and the high-water mark, maintained by the
-/// counting allocator below. Relaxed ordering is fine: the test is effectively
-/// single-threaded during the measured section, and the assertion bound has a
-/// 4x margin — exactness is not required, only the order of magnitude.
+/// counting allocator below. Relaxed ordering is fine: the measured section is
+/// single-threaded (under [`LOCK`]), and the assertion bounds have a 4x margin
+/// — exactness is not required, only the order of magnitude.
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+/// Serializes the tests in this binary so [`PEAK`] measures one at a time.
+static LOCK: Mutex<()> = Mutex::new(());
 
 struct CountingAlloc;
 
@@ -56,6 +62,10 @@ static ALLOC: CountingAlloc = CountingAlloc;
 
 #[test]
 fn inner_chunked_window_read_is_memory_bounded() {
+    let _guard = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     // 4 MiB of f64 rows with inner-split storage chunks: [2048, 32, 8] in
     // [64, 16, 4] chunks — a 2x2 inner chunk grid per 64-row band, deflated so
     // chunks really decode (32 KiB decompressed each).
@@ -103,6 +113,67 @@ fn inner_chunked_window_read_is_memory_bounded() {
     // The window must still be the right bytes.
     let expected: Vec<f64> = (992 * ROW_ELEMS..(992 + 64) * ROW_ELEMS)
         .map(|i| i as f64)
+        .collect();
+    assert_eq!(window, expected);
+}
+
+#[test]
+fn vlen_string_window_read_is_memory_bounded() {
+    let _guard = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // ~4 MiB of variable-length string payload: 32k rows of 128-byte strings,
+    // plus ~512 KiB of heap references in the dataset itself. The writer packs
+    // the strings into one giant heap collection — the degenerate case for a
+    // windowed read, whose directory alone rivals the window if parsed whole.
+    const N0: usize = 32 * 1024;
+    const STR_LEN: usize = 128;
+    const PAYLOAD_BYTES: usize = N0 * STR_LEN;
+
+    let strings: Vec<String> = (0..N0)
+        .map(|i| format!("{i:0>width$}", width = STR_LEN))
+        .collect();
+    let refs: Vec<&str> = strings.iter().map(String::as_str).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.h5");
+    let mut builder = FileBuilder::new();
+    builder.create_dataset("labels").with_vlen_strings(&refs);
+    builder.write(&path).unwrap();
+    drop(refs);
+    drop(strings);
+
+    let file = File::open_streaming(&path).unwrap();
+    let ds = file.dataset("labels").unwrap();
+
+    // Measure only the windowed read: 256 mid-file rows — ~32 KiB of text plus
+    // ~4 KiB of references, resolved against a window-filtered slice of the
+    // collection's directory.
+    let base = LIVE.load(Ordering::Relaxed);
+    PEAK.store(base, Ordering::Relaxed);
+
+    let window = ds.read_string_rows(15_000, 256).unwrap();
+
+    let peak = PEAK.load(Ordering::Relaxed) - base;
+    eprintln!(
+        "peak allocation during the windowed vlen read: {peak} bytes (payload: {PAYLOAD_BYTES})"
+    );
+
+    // Window references + text + touched heap-collection directories land far
+    // under 1 MiB; resolving every reference first peaks above the full payload
+    // (all references plus a Vec<String> of every row). This also catches a
+    // collection parse that starts buffering whole collections instead of
+    // walking their metadata.
+    assert!(
+        peak < PAYLOAD_BYTES / 4,
+        "peak allocation during the windowed vlen read must be bounded by the window, \
+         not the {PAYLOAD_BYTES}-byte payload; measured {peak} bytes"
+    );
+
+    // The window must still be the right strings.
+    assert_eq!(window.len(), 256);
+    let expected: Vec<String> = (15_000..15_000 + 256)
+        .map(|i| format!("{i:0>width$}", width = STR_LEN))
         .collect();
     assert_eq!(window, expected);
 }

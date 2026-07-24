@@ -254,9 +254,10 @@ fn fixed_length_strings_window() {
 }
 
 #[test]
-fn vlen_strings_window_falls_back_to_slice() {
-    // Variable-length strings are heap-backed, so `read_string_rows` reads the whole
-    // dataset and slices; the window must still match.
+fn vlen_strings_window() {
+    // Variable-length strings are heap-backed; `read_string_rows` resolves only
+    // the window's heap references, and the window must match the whole read
+    // sliced to the same rows.
     let (buffered, streaming, _dir) = on_both_backends(|b| {
         b.create_dataset("labels")
             .with_vlen_strings(&["idle", "reach", "grasp", "lift", "place"]);
@@ -371,10 +372,10 @@ fn read_raw_rows_matches_read_raw() {
 #[test]
 fn full_range_window_delegates_to_whole_read() {
     // A window covering every row (including one clamped down from over-long)
-    // delegates to the whole read, so it never costs a window-shaped copy on top
-    // of one — checked here on an inner-chunked grid and on variable-length
-    // strings (whose windowed reads still fall back to a whole read internally).
-    // The observable contract is equality with the whole read.
+    // must cost and return exactly the whole read: `read_raw_rows` delegates to
+    // it, and a vlen-string window resolves the same full set of heap
+    // references. Checked on an inner-chunked grid and on variable-length
+    // strings; the observable contract is equality with the whole read.
     let data: Vec<f64> = (0..120).map(f64::from).collect();
     let (buffered, streaming, _dir) = on_both_backends(|b| {
         b.create_dataset("t")
