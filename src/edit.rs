@@ -2207,7 +2207,7 @@ impl WriteEngine {
                         &fd.attrs,
                         None,
                         fd.fill.as_deref(),
-                    )
+                    )?
                 };
                 let oh_addr = self.alloc_or_append(&oh)?;
                 region.extend_from_slice(&encode_link_message(&fd.name, oh_addr - base));
@@ -4431,7 +4431,7 @@ impl WriteEngine {
             &fd.attrs,
             None,
             fd.fill.as_deref(),
-        ))
+        )?)
     }
 
     /// On-disk byte spans `(addr, len)` of every chunk of the version 2 object

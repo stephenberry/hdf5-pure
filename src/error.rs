@@ -315,7 +315,37 @@ pub enum FormatError {
         /// The supplied fill value's size in bytes.
         actual: usize,
     },
+    /// An attribute's serialized message is larger than the version 2 object
+    /// header's 2-byte message-size field can describe, so it cannot be stored
+    /// as a compact (in-header) attribute. Refused rather than written, because
+    /// a truncated size field would desynchronize every message after it. The
+    /// fields carry the attribute name and its serialized message size in
+    /// bytes; the limit is [`OBJECT_HEADER_MESSAGE_MAX`].
+    AttributeMessageTooLarge {
+        /// The attribute's name.
+        name: String,
+        /// The attribute message's serialized size in bytes.
+        size: usize,
+    },
+    /// An object-header message is larger than the version 2 object header's
+    /// 2-byte message-size field can describe. This is the writer's backstop
+    /// against emitting a truncated size field; callers that can name the
+    /// offending object (for example an attribute) report a more specific error
+    /// first. The fields carry the message type code and the message's
+    /// serialized size in bytes; the limit is [`OBJECT_HEADER_MESSAGE_MAX`].
+    ObjectHeaderMessageTooLarge {
+        /// The header message's type code (see the HDF5 message type table).
+        message_type: u16,
+        /// The message's serialized size in bytes.
+        size: usize,
+    },
 }
+
+/// The largest message a version 2 object header can describe: its per-message
+/// size field is 2 bytes wide. A message past this must be refused rather than
+/// written with a truncated length (see
+/// [`FormatError::ObjectHeaderMessageTooLarge`]).
+pub const OBJECT_HEADER_MESSAGE_MAX: usize = u16::MAX as usize;
 
 impl fmt::Display for FormatError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -648,6 +678,22 @@ impl fmt::Display for FormatError {
                     f,
                     "fill value size {actual} bytes does not match the dataset datatype \
                      element size of {expected} bytes"
+                )
+            }
+            FormatError::AttributeMessageTooLarge { name, size } => {
+                write!(
+                    f,
+                    "attribute {name:?} serializes to {size} bytes, past the \
+                     {OBJECT_HEADER_MESSAGE_MAX}-byte limit of the object header's \
+                     message size field"
+                )
+            }
+            FormatError::ObjectHeaderMessageTooLarge { message_type, size } => {
+                write!(
+                    f,
+                    "object header message {message_type:#06x} is {size} bytes, past the \
+                     {OBJECT_HEADER_MESSAGE_MAX}-byte limit of the object header's \
+                     message size field"
                 )
             }
         }
