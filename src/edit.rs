@@ -195,9 +195,9 @@ use crate::signature;
 use crate::superblock::Superblock;
 use crate::type_builders::{
     AttrValue, DatasetBuilder, ObjectRefTarget, VlStringStaging, build_attr_message,
-    build_global_heap_collection, make_f32_type, make_f64_type, make_i8_type, make_i16_type,
-    make_i32_type, make_i64_type, make_u8_type, make_u16_type, make_u32_type, make_u64_type,
-    patch_vl_refs, patch_vl_refs_masked,
+    build_global_heap_collection, check_heap_object_limit, make_f32_type, make_f64_type,
+    make_i8_type, make_i16_type, make_i32_type, make_i64_type, make_u8_type, make_u16_type,
+    make_u32_type, make_u64_type, patch_vl_refs, patch_vl_refs_masked,
 };
 
 /// An undefined on-disk address (all bits set), HDF5's "no address" sentinel.
@@ -5753,18 +5753,19 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
     // `VarLenAsciiArray` attribute; stage its self-contained global heap
     // collection here (no address of its own to resolve yet) and record which
     // `attrs` slot it patches once the apply loop places it.
-    let vl_attrs: Vec<(usize, Vec<u8>)> = db
-        .attrs
-        .iter()
-        .enumerate()
-        .filter_map(|(i, (_, v))| match v {
-            AttrValue::VarLenAsciiArray(strings) => {
-                let str_refs: Vec<&str> = strings.iter().map(String::as_str).collect();
-                Some((i, build_global_heap_collection(&str_refs)))
-            }
-            _ => None,
-        })
-        .collect();
+    let mut vl_attrs: Vec<(usize, Vec<u8>)> = Vec::new();
+    for (i, (_, v)) in db.attrs.iter().enumerate() {
+        if let AttrValue::VarLenAsciiArray(strings) = v {
+            check_heap_object_limit(strings.len())?;
+            let str_refs: Vec<&str> = strings.iter().map(String::as_str).collect();
+            vl_attrs.push((i, build_global_heap_collection(&str_refs)));
+        }
+    }
+    // One collection indexes at most 65535 objects (u16); refuse rather than
+    // write references no reader can resolve.
+    if let Some(staging) = &db.vl_string_staging {
+        check_heap_object_limit(staging.patch_mask.iter().filter(|&&patch| patch).count())?;
+    }
     #[cfg(feature = "provenance")]
     if let Some(ref prov) = db.provenance {
         let p = crate::provenance::Provenance {
@@ -6462,6 +6463,7 @@ fn apply_group_attr_ops(region: &[u8], ops: &[AttrOp]) -> Result<(Vec<u8>, Pendi
                             "attribute is too large to encode in place",
                         ));
                     }
+                    check_heap_object_limit(strings.len())?;
                     let str_refs: Vec<&str> = strings.iter().map(String::as_str).collect();
                     pending_vl.push((msg, build_global_heap_collection(&str_refs)));
                 } else {

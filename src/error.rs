@@ -174,6 +174,11 @@ pub enum FormatError {
         /// Index that was not found.
         index: u16,
     },
+    /// More variable-length elements than one global heap collection can index.
+    GlobalHeapObjectLimitExceeded {
+        /// Number of heap objects (non-null variable-length elements) staged.
+        count: usize,
+    },
     /// Variable-length data error.
     VlDataError(String),
     /// A variable-length read exceeded its configured element limit.
@@ -513,6 +518,14 @@ impl fmt::Display for FormatError {
                 write!(
                     f,
                     "global heap object not found: collection {collection_address:#x}, index {index}"
+                )
+            }
+            FormatError::GlobalHeapObjectLimitExceeded { count } => {
+                write!(
+                    f,
+                    "cannot write {count} variable-length elements: one global heap collection \
+                     indexes at most 65535 objects (the heap object index is a u16, 0 reserved \
+                     for free space)"
                 )
             }
             FormatError::VlDataError(msg) => {

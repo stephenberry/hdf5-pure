@@ -602,6 +602,22 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
     }
 }
 
+/// Refuse more heap objects than one global heap collection can index.
+///
+/// The heap-object index field is a u16 with 0 reserved for the free-space
+/// marker, so a collection holds at most `u16::MAX` objects, and the writer
+/// stages one collection per dataset or attribute. Past the limit,
+/// [`build_global_heap_collection_bytes`] would wrap the on-disk index — the
+/// 65,536th object's header would read as the free-space marker — and write
+/// references no reader (this crate or the C library) can resolve. Every path
+/// that stages a collection must run this check before its write is accepted.
+pub(crate) fn check_heap_object_limit(count: usize) -> Result<(), crate::error::FormatError> {
+    if count > u16::MAX as usize {
+        return Err(crate::error::FormatError::GlobalHeapObjectLimitExceeded { count });
+    }
+    Ok(())
+}
+
 /// Build a global heap collection containing the given byte sequences.
 /// Returns the serialized collection bytes.
 pub(crate) fn build_global_heap_collection(strings: &[&str]) -> Vec<u8> {
@@ -613,6 +629,12 @@ pub(crate) fn build_global_heap_collection(strings: &[&str]) -> Vec<u8> {
 /// assigning 1-based object indices in order. Mirrors
 /// [`build_global_heap_collection`] but accepts arbitrary bytes so a faithful
 /// rewrite can carry embedded-NUL or non-UTF-8 VL-string payloads.
+///
+/// The 2-byte index field wraps past `u16::MAX` objects, corrupting the
+/// collection — every write pipeline runs [`check_heap_object_limit`] before
+/// accepting staged collection bytes, so an over-limit collection (which an
+/// infallible builder entry point like `with_vlen_strings` may stage eagerly)
+/// never reaches a file.
 pub(crate) fn build_global_heap_collection_bytes(objects: &[&[u8]]) -> Vec<u8> {
     let length_size = 8usize;
     let header_size = 8 + length_size; // sig(4) + ver(1) + reserved(3) + collection_size
@@ -1310,6 +1332,10 @@ impl DatasetBuilder {
     /// This convenience method cannot distinguish a null element from an empty
     /// one, nor carry embedded NULs, non-UTF-8 payloads, or a specific
     /// charset/padding.
+    ///
+    /// A dataset stages one global heap collection, which indexes at most
+    /// 65,535 objects — `write`/`finish` refuses more with
+    /// [`GlobalHeapObjectLimitExceeded`](crate::FormatError::GlobalHeapObjectLimitExceeded).
     pub fn with_vlen_strings(&mut self, values: &[&str]) -> &mut Self {
         let datatype = make_vlen_string_type(CharacterSet::Utf8);
         let elements: Vec<VlStringElement> = values

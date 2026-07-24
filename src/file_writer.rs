@@ -35,7 +35,7 @@ use crate::object_header_writer::ObjectHeaderWriter;
 use crate::superblock::Superblock;
 use crate::type_builders::{
     DatasetBuilder, FinishedGroup, GroupBuilder, VlStringStaging, build_attr_message,
-    build_global_heap_collection, patch_vl_refs, patch_vl_refs_masked,
+    build_global_heap_collection, check_heap_object_limit, patch_vl_refs, patch_vl_refs_masked,
 };
 
 // `AttrValue` lives in `type_builders`; `types` and `mat` reference it through
@@ -890,6 +890,11 @@ impl FileWriter {
             {
                 return Err(FormatError::ChunkedVlenStringUnsupported);
             }
+            // One collection indexes at most 65535 objects (u16); refuse rather
+            // than write references no reader can resolve.
+            if let Some(staging) = &db.vl_string_staging {
+                check_heap_object_limit(staging.patch_mask.iter().filter(|&&patch| patch).count())?;
+            }
             let max_dimensions = db.maxshape.clone();
             let dspace = Dataspace {
                 space_type: if shape.is_empty() {
@@ -906,7 +911,7 @@ impl FileWriter {
                 dimensions: shape,
                 max_dimensions,
             };
-            let patches = collect_vl_patches(&db.attrs);
+            let patches = collect_vl_patches(&db.attrs)?;
             let mut attrs = Vec::new();
             for (n, v) in &db.attrs {
                 attrs.push(build_attr_message(n, v));
@@ -956,7 +961,7 @@ impl FileWriter {
             grp_vl: &mut Vec<Vec<VlPatch>>,
             ds_vl: &mut Vec<Vec<VlPatch>>,
         ) -> Result<usize, FormatError> {
-            let patches = collect_vl_patches(&g.attrs);
+            let patches = collect_vl_patches(&g.attrs)?;
             let mut gattrs = Vec::new();
             for (n, v) in &g.attrs {
                 gattrs.push(build_attr_message(n, v));
@@ -1004,10 +1009,13 @@ impl FileWriter {
             attr_index: usize, // index into the relevant attrs Vec
         }
 
-        fn collect_vl_patches(attrs_raw: &[(String, AttrValue)]) -> Vec<VlPatch> {
+        fn collect_vl_patches(
+            attrs_raw: &[(String, AttrValue)],
+        ) -> Result<Vec<VlPatch>, FormatError> {
             let mut patches = Vec::new();
             for (i, (_n, v)) in attrs_raw.iter().enumerate() {
                 if let AttrValue::VarLenAsciiArray(strings) = v {
+                    check_heap_object_limit(strings.len())?;
                     let str_refs: Vec<&str> = strings.iter().map(|s| s.as_str()).collect();
                     patches.push(VlPatch {
                         collection_bytes: build_global_heap_collection(&str_refs),
@@ -1015,10 +1023,10 @@ impl FileWriter {
                     });
                 }
             }
-            patches
+            Ok(patches)
         }
 
-        let vl_root = collect_vl_patches(&self.root_attrs);
+        let vl_root = collect_vl_patches(&self.root_attrs)?;
 
         let mut root_attrs: Vec<AttributeMessage> = Vec::new();
         for (n, v) in &self.root_attrs {
