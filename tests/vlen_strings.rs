@@ -97,16 +97,30 @@ fn vlen_specific_apis_reject_non_vlen_datasets() {
     ));
 }
 
-// --- One-collection heap object limit (u16 index; issue: silent corruption) ---
+// --- Multiple global heap collections (one collection indexes 65,535 objects) ---
 
-/// Exactly `u16::MAX` strings is the most one collection can index; the file
-/// must round-trip. One past it must be refused at write time — previously the
-/// on-disk object index wrapped (the 65,536th object's header read as the
-/// free-space marker) and the file's references could not be resolved by this
-/// crate or the C library.
+/// One collection's object index is a `u16` with 0 reserved for the free-space
+/// marker, so the writer splits past 65,535 objects into a second collection
+/// whose indices restart at 1. Elements on both sides of that boundary, and the
+/// boundary elements themselves, must read back.
+fn assert_split_labels_roundtrip(read: &[String], count: usize) {
+    assert_eq!(read.len(), count);
+    for i in [0, 1, 65_534, 65_535, 65_536, count - 1] {
+        assert_eq!(read[i], format!("s{i}"), "element {i} did not round-trip");
+    }
+}
+
+fn labels(count: usize) -> Vec<String> {
+    (0..count).map(|i| format!("s{i}")).collect()
+}
+
+/// Just past two collections' worth, so the split is exercised twice and the
+/// third collection is only partly filled.
+const SPLIT_COUNT: usize = 2 * (u16::MAX as usize) + 7;
+
 #[test]
-fn heap_object_limit_boundary_roundtrips() {
-    let values: Vec<String> = (0..u16::MAX as usize).map(|i| format!("s{i}")).collect();
+fn vlen_dataset_spans_multiple_heap_collections() {
+    let values = labels(SPLIT_COUNT);
     let refs: Vec<&str> = values.iter().map(String::as_str).collect();
     let mut builder = hdf5_pure::FileBuilder::new();
     builder.create_dataset("labels").with_vlen_strings(&refs);
@@ -114,81 +128,39 @@ fn heap_object_limit_boundary_roundtrips() {
 
     let file = File::from_bytes(bytes).unwrap();
     let read = file.dataset("labels").unwrap().read_string().unwrap();
-    assert_eq!(read.len(), u16::MAX as usize);
-    assert_eq!(read.first().map(String::as_str), Some("s0"));
-    assert_eq!(read.last().map(String::as_str), Some("s65534"));
+    assert_split_labels_roundtrip(&read, SPLIT_COUNT);
 }
 
+/// The paged writer lays the collections out in its own metadata region and
+/// patches the references in a separate pass, so it needs its own coverage.
 #[test]
-fn heap_object_limit_refused_for_datasets() {
-    let values: Vec<String> = (0..=u16::MAX as usize).map(|i| format!("s{i}")).collect();
+fn paged_vlen_dataset_spans_multiple_heap_collections() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("paged.h5");
+    let values = labels(SPLIT_COUNT);
     let refs: Vec<&str> = values.iter().map(String::as_str).collect();
     let mut builder = hdf5_pure::FileBuilder::new();
+    builder.with_file_space_strategy(hdf5_pure::FileSpaceStrategy::Page, true, 1);
     builder.create_dataset("labels").with_vlen_strings(&refs);
-    let error = builder.finish().unwrap_err();
-    assert!(
-        matches!(
-            error,
-            Error::Format(FormatError::GlobalHeapObjectLimitExceeded { count: 65_536 })
-        ),
-        "expected GlobalHeapObjectLimitExceeded, got {error:?}"
-    );
-}
+    builder.write(&path).unwrap();
 
-#[test]
-fn heap_object_limit_refused_for_attributes() {
-    let values: Vec<String> = (0..=u16::MAX as usize).map(|i| format!("s{i}")).collect();
-    let mut builder = hdf5_pure::FileBuilder::new();
-    builder.set_attr("labels", hdf5_pure::AttrValue::VarLenAsciiArray(values));
-    builder.create_dataset("x").with_f64_data(&[1.0]);
-    let error = builder.finish().unwrap_err();
-    assert!(
-        matches!(
-            error,
-            Error::Format(FormatError::GlobalHeapObjectLimitExceeded { count: 65_536 })
-        ),
-        "expected GlobalHeapObjectLimitExceeded, got {error:?}"
-    );
-}
-
-/// Strings one past the limit, as the shared over-limit payload for the edit
-/// session cases below.
-fn over_limit_strings() -> Vec<String> {
-    (0..=u16::MAX as usize).map(|i| format!("s{i}")).collect()
-}
-
-/// Assert a staged edit was refused with the typed limit error, whether it
-/// surfaced when staging or on commit.
-#[track_caller]
-fn assert_over_limit(result: Result<(), Error>) {
-    let error = result.expect_err("expected the over-limit write to be refused");
-    assert!(
-        matches!(
-            error,
-            Error::Format(FormatError::GlobalHeapObjectLimitExceeded { count: 65_536 })
-        ),
-        "expected GlobalHeapObjectLimitExceeded, got {error:?}"
-    );
-}
-
-/// A starter file for the edit-session cases: one small dataset, nothing
-/// variable-length.
-fn write_starter(path: &std::path::Path) {
-    let mut builder = hdf5_pure::FileBuilder::new();
-    builder.create_dataset("d").with_f64_data(&[1.0]);
-    builder.write(path).unwrap();
+    let file = File::open(&path).unwrap();
+    let read = file.dataset("labels").unwrap().read_string().unwrap();
+    assert_split_labels_roundtrip(&read, SPLIT_COUNT);
 }
 
 /// The edit session stages a dataset through a different pipeline than
-/// `FileBuilder` (`flatten_dataset`), so it needs its own refusal: adding an
-/// over-limit variable-length dataset to an existing file must fail on commit.
+/// `FileBuilder` (`flatten_dataset`), and places each collection separately
+/// (they need not land contiguously), so it needs its own coverage.
 #[test]
-fn heap_object_limit_refused_by_edit_session_dataset() {
+fn edit_session_vlen_dataset_spans_multiple_heap_collections() {
     let dir = tempdir().unwrap();
-    let path = dir.path().join("d.h5");
-    write_starter(&path);
+    let path = dir.path().join("edit.h5");
+    let mut builder = hdf5_pure::FileBuilder::new();
+    builder.create_dataset("d").with_f64_data(&[1.0]);
+    builder.write(&path).unwrap();
 
-    let values = over_limit_strings();
+    let values = labels(SPLIT_COUNT);
     let refs: Vec<&str> = values.iter().map(String::as_str).collect();
     let file = File::open_rw(&path).unwrap();
     file.root()
@@ -196,48 +168,56 @@ fn heap_object_limit_refused_by_edit_session_dataset() {
             b.with_vlen_strings(&refs);
         })
         .unwrap();
-    assert_over_limit(file.commit());
+    file.commit().unwrap();
+    drop(file);
+
+    let file = File::open(&path).unwrap();
+    let read = file.dataset("labels").unwrap().read_string().unwrap();
+    assert_split_labels_roundtrip(&read, SPLIT_COUNT);
+    assert_eq!(file.dataset("d").unwrap().read_f64().unwrap(), vec![1.0]);
 }
 
-/// Same pipeline, the attribute half: a variable-length attribute carried on a
-/// dataset staged by the edit session.
+/// Repack re-stages variable-length data through fresh collections, so a file
+/// whose data spans several of them must survive the round trip.
 #[test]
-fn heap_object_limit_refused_by_edit_session_dataset_attr() {
+fn repack_preserves_multi_collection_vlen_dataset() {
     let dir = tempdir().unwrap();
-    let path = dir.path().join("da.h5");
-    write_starter(&path);
+    let src = dir.path().join("src.h5");
+    let dst = dir.path().join("dst.h5");
+    let values = labels(SPLIT_COUNT);
+    let refs: Vec<&str> = values.iter().map(String::as_str).collect();
+    let mut builder = hdf5_pure::FileBuilder::new();
+    builder.create_dataset("labels").with_vlen_strings(&refs);
+    builder.write(&src).unwrap();
 
-    let values = over_limit_strings();
-    let file = File::open_rw(&path).unwrap();
-    file.root()
-        .create_dataset("x", |b| {
-            b.with_f64_data(&[1.0])
-                .set_attr("labels", hdf5_pure::AttrValue::VarLenAsciiArray(values));
-        })
-        .unwrap();
-    assert_over_limit(file.commit());
+    hdf5_pure::repack(&src, &dst, &hdf5_pure::RepackOptions::default()).unwrap();
+
+    let file = File::open(&dst).unwrap();
+    let read = file.dataset("labels").unwrap().read_string().unwrap();
+    assert_split_labels_roundtrip(&read, SPLIT_COUNT);
 }
 
-/// The in-place attribute path (`apply_group_attr_ops`) is a third pipeline,
-/// and it refuses an over-limit variable-length attribute *earlier*: a compact
-/// attribute message is capped at 65,535 serialized bytes, and 16 bytes of
-/// reference per element means that cap binds long before the heap-object one.
-/// Pinned here so the ordering is deliberate — the heap-object guard behind it
-/// only becomes load-bearing if the compact cap lifts (dense attribute storage,
-/// [#102](https://github.com/stephenberry/hdf5-pure/issues/102)).
+/// A variable-length *attribute* is capped well below the heap-object boundary
+/// by the compact attribute message's 65,535-byte size field (16 bytes of
+/// reference per element binds at ~4,090 elements), so its refusal is a size
+/// refusal, not a heap one. Pinned so the ordering stays deliberate.
 #[test]
-fn in_place_group_attr_refuses_over_limit_by_message_size() {
+fn vlen_attribute_is_bounded_by_compact_message_size() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("ga.h5");
-    write_starter(&path);
+    let mut builder = hdf5_pure::FileBuilder::new();
+    builder.create_dataset("d").with_f64_data(&[1.0]);
+    builder.write(&path).unwrap();
 
-    let values = over_limit_strings();
     let file = File::open_rw(&path).unwrap();
     let error = file
         .root()
-        .set_attr("labels", hdf5_pure::AttrValue::VarLenAsciiArray(values))
+        .set_attr(
+            "labels",
+            hdf5_pure::AttrValue::VarLenAsciiArray(labels(u16::MAX as usize + 1)),
+        )
         .and_then(|()| file.commit())
-        .expect_err("expected the over-limit attribute to be refused");
+        .expect_err("expected the oversized attribute to be refused");
     match error {
         Error::EditUnsupported(msg) => assert!(
             msg.contains("too large"),

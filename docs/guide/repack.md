@@ -77,7 +77,6 @@ These are reported as `Error::RepackUnsupported` naming the object, never silent
 | variable-length sequences whose base type is itself variable-length, or a reference | the copied element bytes would carry addresses that go stale on rewrite |
 | region references, and object references other than 8 bytes wide | their stored selections and addresses are not rewritten yet |
 | object references in a file with a userblock, or to an object being dropped | the new target address cannot be resolved safely, or will not exist |
-| more than 65,535 variable-length elements in one dataset or attribute | repack re-stages the heap, and one collection indexes no more ([#189](https://github.com/stephenberry/hdf5-pure/issues/189)) |
 | virtual and external data layouts | not reproducible by rewriting |
 | lossy filters: float D-scale scale-offset and ZFP | re-encoding is not guaranteed idempotent |
 | SZIP filter | this crate cannot write it |

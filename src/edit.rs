@@ -195,9 +195,9 @@ use crate::signature;
 use crate::superblock::Superblock;
 use crate::type_builders::{
     AttrValue, DatasetBuilder, ObjectRefTarget, VlStringStaging, build_attr_message,
-    build_global_heap_collection, check_heap_object_limit, make_f32_type, make_f64_type,
-    make_i8_type, make_i16_type, make_i32_type, make_i64_type, make_u8_type, make_u16_type,
-    make_u32_type, make_u64_type, patch_vl_refs, patch_vl_refs_masked,
+    build_global_heap_collections, make_f32_type, make_f64_type, make_i8_type, make_i16_type,
+    make_i32_type, make_i64_type, make_u8_type, make_u16_type, make_u32_type, make_u64_type,
+    patch_vl_refs, patch_vl_refs_masked,
 };
 
 /// An undefined on-disk address (all bits set), HDF5's "no address" sentinel.
@@ -230,8 +230,8 @@ type PathKey = Vec<String>;
 
 /// Variable-length group/root attributes staged by [`apply_group_attr_ops`],
 /// each an (attribute message still carrying a placeholder heap address, its
-/// global heap collection bytes) pair, resolved in the apply loop.
-type PendingVlAttrs = Vec<(crate::attribute::AttributeMessage, Vec<u8>)>;
+/// global heap collections) pair, resolved in the apply loop.
+type PendingVlAttrs = Vec<(crate::attribute::AttributeMessage, Vec<Vec<u8>>)>;
 
 /// Accumulates elements to append to an existing chunked, unlimited dataset via
 /// [`EditSession::append_dataset`], in call order along the dataset's first
@@ -2151,9 +2151,9 @@ impl WriteEngine {
                 // fine — attributes live in the object header, not inside a
                 // chunk, so patching them here before either apply branch runs
                 // covers both.
-                for (idx, collection_bytes) in std::mem::take(&mut fd.vl_attrs) {
-                    let addr = self.place_vl_collection(&collection_bytes)?;
-                    patch_vl_refs(&mut fd.attrs[idx].raw_data, addr);
+                for (idx, collections) in std::mem::take(&mut fd.vl_attrs) {
+                    let addrs = self.place_vl_collections(&collections)?;
+                    patch_vl_refs(&mut fd.attrs[idx].raw_data, &addrs);
                 }
                 // Resolve an object-reference dataset's per-element targets now
                 // that every earlier-placed object in this commit is in
@@ -2184,9 +2184,9 @@ impl WriteEngine {
                     // its collection and patch them before `raw` is appended
                     // (chunked datasets never carry staging — refused above).
                     if let Some(staging) = fd.vl_string_staging.take() {
-                        if !staging.collection_bytes.is_empty() {
-                            let addr = self.place_vl_collection(&staging.collection_bytes)?;
-                            patch_vl_refs_masked(&mut fd.raw, &staging.patch_mask, addr);
+                        if !staging.collections.is_empty() {
+                            let addrs = self.place_vl_collections(&staging.collections)?;
+                            patch_vl_refs_masked(&mut fd.raw, &staging.patch_mask, &addrs);
                         }
                     }
                     // A zero-element dataset has no data block to allocate; its
@@ -2243,9 +2243,9 @@ impl WriteEngine {
             // `apply_group_attr_ops`: place each collection and patch its
             // attribute message's placeholder heap address, then append the
             // resolved message to this group's header region.
-            for (mut msg, collection_bytes) in pending_vl_attrs {
-                let addr = self.place_vl_collection(&collection_bytes)?;
-                patch_vl_refs(&mut msg.raw_data, addr);
+            for (mut msg, collections) in pending_vl_attrs {
+                let addrs = self.place_vl_collections(&collections)?;
+                patch_vl_refs(&mut msg.raw_data, &addrs);
                 region.extend_from_slice(&region_message(
                     MessageType::Attribute,
                     &msg.serialize(LENGTH_SIZE),
@@ -4091,10 +4091,10 @@ impl WriteEngine {
                 // data-layout message is untouched, so the dataset's chunk data and
                 // index stay in place; only the header moves.
                 let mut region = region.clone();
-                for (msg, collection_bytes) in pending_vl_attrs {
+                for (msg, collections) in pending_vl_attrs {
                     let mut msg = msg.clone();
-                    let addr = self.place_vl_collection(collection_bytes)?;
-                    patch_vl_refs(&mut msg.raw_data, addr);
+                    let addrs = self.place_vl_collections(collections)?;
+                    patch_vl_refs(&mut msg.raw_data, &addrs);
                     region.extend_from_slice(&region_message(
                         MessageType::Attribute,
                         &msg.serialize(LENGTH_SIZE),
@@ -4229,16 +4229,24 @@ impl WriteEngine {
         }
     }
 
-    /// Place an already-built, self-contained global heap collection (from
-    /// [`build_global_heap_collection`] or a [`VlStringStaging::collection_bytes`])
-    /// and return the base-relative address a variable-length reference into it
-    /// should be patched to. A `GCOL` blob embeds no addresses of its own, so it
-    /// can be appended (or dropped into reused free space) at any point in the
-    /// apply loop, unlike a group or dataset header, which must be built last so
-    /// it can name its children's real addresses.
-    fn place_vl_collection(&mut self, collection_bytes: &[u8]) -> Result<u64, Error> {
-        let addr = self.alloc_or_append(collection_bytes)?;
-        Ok(addr - self.superblock.base_address)
+    /// Place one variable-length dataset's or attribute's already-built,
+    /// self-contained global heap collections (from
+    /// [`build_global_heap_collections`] or a
+    /// [`VlStringStaging::collections`]) and return, in the same order, the
+    /// base-relative addresses its variable-length references should be patched
+    /// to. A `GCOL` blob embeds no addresses of its own, so it can be appended
+    /// (or dropped into reused free space) at any point in the apply loop,
+    /// unlike a group or dataset header, which must be built last so it can name
+    /// its children's real addresses. Each collection is placed independently,
+    /// so they need not land contiguously.
+    fn place_vl_collections(&mut self, collections: &[Vec<u8>]) -> Result<Vec<u64>, Error> {
+        collections
+            .iter()
+            .map(|collection| {
+                let addr = self.alloc_or_append(collection)?;
+                Ok(addr - self.superblock.base_address)
+            })
+            .collect()
     }
 
     /// Resolve one object-reference element's target to the base-relative
@@ -5061,12 +5069,12 @@ struct FlatDataset {
     /// extensible-array chunk index; a finite maxshape stays fixed-array/single.
     maxshape: Option<Vec<u64>>,
     /// Variable-length attributes still carrying a placeholder heap address:
-    /// (index into `attrs`, that attribute's global heap collection bytes).
+    /// (index into `attrs`, that attribute's global heap collections).
     /// Resolved in the apply loop right before this dataset's header is built.
-    vl_attrs: Vec<(usize, Vec<u8>)>,
+    vl_attrs: Vec<(usize, Vec<Vec<u8>>)>,
     /// A staged variable-length-string dataset's element references (still
-    /// carrying placeholder heap addresses in `raw`) and global heap collection.
-    /// Resolved in the apply loop right before `raw` is appended.
+    /// carrying placeholder heap addresses in `raw`) and global heap
+    /// collections. Resolved in the apply loop right before `raw` is appended.
     vl_string_staging: Option<VlStringStaging>,
     /// An object-reference dataset's per-element targets, still unresolved.
     /// Resolved (see [`EditSession::resolve_reference_target`]) and patched
@@ -5751,20 +5759,14 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
     }
     // `build_attr_message` already writes a placeholder (heap address 0) for a
     // `VarLenAsciiArray` attribute; stage its self-contained global heap
-    // collection here (no address of its own to resolve yet) and record which
-    // `attrs` slot it patches once the apply loop places it.
-    let mut vl_attrs: Vec<(usize, Vec<u8>)> = Vec::new();
+    // collections here (no address of their own to resolve yet) and record which
+    // `attrs` slot they patch once the apply loop places them.
+    let mut vl_attrs: Vec<(usize, Vec<Vec<u8>>)> = Vec::new();
     for (i, (_, v)) in db.attrs.iter().enumerate() {
         if let AttrValue::VarLenAsciiArray(strings) = v {
-            check_heap_object_limit(strings.len())?;
             let str_refs: Vec<&str> = strings.iter().map(String::as_str).collect();
-            vl_attrs.push((i, build_global_heap_collection(&str_refs)));
+            vl_attrs.push((i, build_global_heap_collections(&str_refs)));
         }
-    }
-    // One collection indexes at most 65535 objects (u16); refuse rather than
-    // write references no reader can resolve.
-    if let Some(staging) = &db.vl_string_staging {
-        check_heap_object_limit(staging.object_count)?;
     }
     #[cfg(feature = "provenance")]
     if let Some(ref prov) = db.provenance {
@@ -6463,13 +6465,8 @@ fn apply_group_attr_ops(region: &[u8], ops: &[AttrOp]) -> Result<(Vec<u8>, Pendi
                             "attribute is too large to encode in place",
                         ));
                     }
-                    // Defense in depth: at 16 bytes of reference per element the
-                    // compact-size cap above always fires first today, so this
-                    // only becomes load-bearing if that cap lifts (dense
-                    // attribute storage, issue #102).
-                    check_heap_object_limit(strings.len())?;
                     let str_refs: Vec<&str> = strings.iter().map(String::as_str).collect();
-                    pending_vl.push((msg, build_global_heap_collection(&str_refs)));
+                    pending_vl.push((msg, build_global_heap_collections(&str_refs)));
                 } else {
                     out = set_attr_in_region(&out, name, value)?;
                 }

@@ -577,11 +577,14 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
                 )]
                 raw.extend_from_slice(&(s.len() as u32).to_le_bytes());
                 raw.extend_from_slice(&0u64.to_le_bytes()); // patched later
+                // 1-based index within this element's own collection; the
+                // writer splits the strings across collections the same way
+                // (see `build_global_heap_collections`).
                 #[expect(
                     clippy::cast_possible_truncation,
                     reason = "1-based heap object index is written into the 4-byte object-index field of the variable-length reference"
                 )]
-                raw.extend_from_slice(&((i + 1) as u32).to_le_bytes());
+                raw.extend_from_slice(&((i % MAX_HEAP_OBJECTS + 1) as u32).to_le_bytes());
             }
             AttributeMessage {
                 name: name.to_string(),
@@ -602,40 +605,47 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
     }
 }
 
-/// Refuse more heap objects than one global heap collection can index.
+/// Maximum number of objects one global heap collection can index.
 ///
-/// The heap-object index field is a u16 with 0 reserved for the free-space
-/// marker, so a collection holds at most `u16::MAX` objects, and the writer
-/// stages one collection per dataset or attribute. Past the limit,
-/// [`build_global_heap_collection_bytes`] would wrap the on-disk index — the
-/// 65,536th object's header would read as the free-space marker — and write
-/// references no reader (this crate or the C library) can resolve. Every path
-/// that stages a collection must run this check before its write is accepted.
-pub(crate) fn check_heap_object_limit(count: usize) -> Result<(), crate::error::FormatError> {
-    if count > u16::MAX as usize {
-        return Err(crate::error::FormatError::GlobalHeapObjectLimitExceeded { count });
-    }
-    Ok(())
-}
+/// The heap-object index field is a `u16` with 0 reserved for the free-space
+/// marker, so a single collection addresses at most `u16::MAX` objects. Data
+/// with more objects than this is split across consecutive collections, whose
+/// indices restart at 1 — the same thing the reference C library does when a
+/// collection fills.
+pub(crate) const MAX_HEAP_OBJECTS: usize = u16::MAX as usize;
 
-/// Build a global heap collection containing the given byte sequences.
-/// Returns the serialized collection bytes.
-pub(crate) fn build_global_heap_collection(strings: &[&str]) -> Vec<u8> {
+/// Build the global heap collections holding the given strings, splitting them
+/// across as many collections as their count needs.
+pub(crate) fn build_global_heap_collections(strings: &[&str]) -> Vec<Vec<u8>> {
     let objects: Vec<&[u8]> = strings.iter().map(|s| s.as_bytes()).collect();
-    build_global_heap_collection_bytes(&objects)
+    build_global_heap_collections_from_bytes(&objects)
 }
 
-/// Build a global heap collection from raw byte objects (no UTF-8 requirement),
-/// assigning 1-based object indices in order. Mirrors
-/// [`build_global_heap_collection`] but accepts arbitrary bytes so a faithful
-/// rewrite can carry embedded-NUL or non-UTF-8 VL-string payloads.
+/// Build the global heap collections holding the given raw byte objects (no
+/// UTF-8 requirement), in order. Mirrors [`build_global_heap_collections`] but
+/// accepts arbitrary bytes so a faithful rewrite can carry embedded-NUL or
+/// non-UTF-8 VL payloads.
 ///
-/// The 2-byte index field wraps past `u16::MAX` objects, corrupting the
-/// collection — every write pipeline runs [`check_heap_object_limit`] before
-/// accepting staged collection bytes, so an over-limit collection (which an
-/// infallible builder entry point like `with_vlen_strings` may stage eagerly)
-/// never reaches a file.
-pub(crate) fn build_global_heap_collection_bytes(objects: &[&[u8]]) -> Vec<u8> {
+/// Objects are packed [`MAX_HEAP_OBJECTS`] to a collection, so object `n` lives
+/// in collection `n / MAX_HEAP_OBJECTS` at 1-based index
+/// `n % MAX_HEAP_OBJECTS + 1`. [`patch_vl_refs`] and [`patch_vl_refs_masked`]
+/// resolve references with that same rule, and [`stage_vl_elements`] and
+/// [`build_attr_message`] write the matching indices.
+pub(crate) fn build_global_heap_collections_from_bytes(objects: &[&[u8]]) -> Vec<Vec<u8>> {
+    objects
+        .chunks(MAX_HEAP_OBJECTS)
+        .map(build_global_heap_collection_bytes)
+        .collect()
+}
+
+/// Build one global heap collection holding `objects` (at most
+/// [`MAX_HEAP_OBJECTS`] of them), assigning 1-based object indices in order.
+/// Returns the serialized collection bytes.
+fn build_global_heap_collection_bytes(objects: &[&[u8]]) -> Vec<u8> {
+    debug_assert!(
+        objects.len() <= MAX_HEAP_OBJECTS,
+        "a collection's 2-byte object index cannot address more than {MAX_HEAP_OBJECTS} objects"
+    );
     let length_size = 8usize;
     let header_size = 8 + length_size; // sig(4) + ver(1) + reserved(3) + collection_size
 
@@ -693,14 +703,17 @@ pub(crate) fn build_global_heap_collection_bytes(objects: &[&[u8]]) -> Vec<u8> {
     buf
 }
 
-/// Patch VL attribute references with the actual global heap collection address.
-/// The raw_data contains VL references with placeholder addresses (0).
-pub(crate) fn patch_vl_refs(raw_data: &mut [u8], collection_address: u64) {
-    let vl_ref_size = 16; // 4 + 8 + 4
-    let count = raw_data.len() / vl_ref_size;
+/// Patch VL attribute references with the actual global heap collection
+/// addresses. The raw_data contains VL references with placeholder addresses
+/// (0), one per attribute element, each holding an object of the collection its
+/// position selects (see [`build_global_heap_collections_from_bytes`]);
+/// `collection_addresses` gives those collections' placed addresses in order.
+pub(crate) fn patch_vl_refs(raw_data: &mut [u8], collection_addresses: &[u64]) {
+    let count = raw_data.len() / VL_REF_SIZE;
     for i in 0..count {
-        let addr_offset = i * vl_ref_size + 4; // skip sequence_length
-        raw_data[addr_offset..addr_offset + 8].copy_from_slice(&collection_address.to_le_bytes());
+        let address = collection_addresses[i / MAX_HEAP_OBJECTS];
+        let addr_offset = i * VL_REF_SIZE + 4; // skip sequence_length
+        raw_data[addr_offset..addr_offset + 8].copy_from_slice(&address.to_le_bytes());
     }
 }
 
@@ -724,28 +737,27 @@ pub(crate) enum VlStringElement {
 pub(crate) const VL_REF_SIZE: usize = 16;
 
 /// Staged VL-string dataset/attribute element data: the per-element 16-byte
-/// references (with placeholder heap addresses) plus the global heap collection
-/// holding the non-null elements' bytes.
+/// references (with placeholder heap addresses) plus the global heap
+/// collections holding the non-null elements' bytes.
 ///
-/// Object indices are assigned 1-based and contiguous over the non-null
-/// elements in order, matching [`build_global_heap_collection_bytes`]. Null
-/// elements carry an undefined address and object index 0, and are never
-/// patched so they read back as null.
+/// The non-null elements' bytes become heap objects in order, packed
+/// [`MAX_HEAP_OBJECTS`] to a collection, and each reference carries its
+/// object's 1-based index within its own collection — matching
+/// [`build_global_heap_collections_from_bytes`]. Null elements carry an
+/// undefined address and object index 0, and are never patched so they read
+/// back as null.
 pub(crate) struct VlStringStaging {
     /// The dataset/attribute element bytes: one 16-byte reference per element.
     pub refs: Vec<u8>,
-    /// The serialized global heap collection holding the non-null objects.
-    pub collection_bytes: Vec<u8>,
+    /// The serialized global heap collections holding the non-null objects, in
+    /// the order their objects appear. Empty when there are no such objects.
+    pub collections: Vec<Vec<u8>>,
     /// `true` for each element that references a heap object and must have its
     /// address patched; `false` for a null element that must stay undefined.
     pub patch_mask: Vec<bool>,
-    /// Number of objects in `collection_bytes` (the non-null elements). Each
-    /// write pipeline checks it with [`check_heap_object_limit`] before the
-    /// staged bytes are accepted.
-    pub object_count: usize,
 }
 
-/// Stage the references and global-heap collection for a variable-length
+/// Stage the references and global-heap collections for a variable-length
 /// dataset/attribute from its per-element byte payloads.
 ///
 /// `element_size` is the byte width of the VL base type. A VL string's base type
@@ -758,8 +770,8 @@ pub(crate) fn stage_vl_elements(
     element_size: usize,
 ) -> VlStringStaging {
     let element_size = element_size.max(1);
-    // Collect the non-null payloads in order; their 1-based positions become
-    // the heap object indices.
+    // Collect the non-null payloads in order; their positions become the heap
+    // object indices, 1-based within each collection.
     let mut objects: Vec<&[u8]> = Vec::new();
     let mut refs = Vec::with_capacity(elements.len() * VL_REF_SIZE);
     let mut patch_mask = Vec::with_capacity(elements.len());
@@ -783,7 +795,8 @@ pub(crate) fn stage_vl_elements(
                 )]
                 refs.extend_from_slice(&((bytes.len() / element_size) as u32).to_le_bytes());
                 refs.extend_from_slice(&0u64.to_le_bytes()); // patched later
-                let index = objects.len() + 1; // 1-based heap object index
+                // 1-based index within this object's own collection.
+                let index = objects.len() % MAX_HEAP_OBJECTS + 1;
                 #[expect(
                     clippy::cast_possible_truncation,
                     reason = "1-based heap object index is written into the 4-byte object-index \
@@ -796,35 +809,35 @@ pub(crate) fn stage_vl_elements(
         }
     }
     // A dataset of only null elements (or an empty dataset) references no heap
-    // object, so emit no collection — there is nothing to patch and a 4096-byte
-    // empty GCOL would be dead weight.
-    let collection_bytes = if objects.is_empty() {
-        Vec::new()
-    } else {
-        build_global_heap_collection_bytes(&objects)
-    };
+    // object, so it gets no collection at all — there is nothing to patch and a
+    // 4096-byte empty GCOL would be dead weight.
     VlStringStaging {
         refs,
-        collection_bytes,
+        collections: build_global_heap_collections_from_bytes(&objects),
         patch_mask,
-        object_count: objects.len(),
     }
 }
 
 /// Patch the heap address of each VL reference flagged in `patch_mask`, leaving
 /// null references (mask `false`) with their undefined address. Mirrors
-/// [`patch_vl_refs`] but skips null elements so they read back as null.
+/// [`patch_vl_refs`] but skips null elements so they read back as null, so the
+/// collection a reference resolves to is selected by its *object* position
+/// rather than its element position. `collection_addresses` holds the placed
+/// addresses of [`VlStringStaging::collections`], in order.
 pub(crate) fn patch_vl_refs_masked(
     raw_data: &mut [u8],
     patch_mask: &[bool],
-    collection_address: u64,
+    collection_addresses: &[u64],
 ) {
+    let mut object_ordinal = 0usize;
     for (i, &patch) in patch_mask.iter().enumerate() {
         if !patch {
             continue;
         }
+        let address = collection_addresses[object_ordinal / MAX_HEAP_OBJECTS];
         let addr_offset = i * VL_REF_SIZE + 4; // skip sequence_length
-        raw_data[addr_offset..addr_offset + 8].copy_from_slice(&collection_address.to_le_bytes());
+        raw_data[addr_offset..addr_offset + 8].copy_from_slice(&address.to_le_bytes());
+        object_ordinal += 1;
     }
 }
 
@@ -1337,10 +1350,6 @@ impl DatasetBuilder {
     /// This convenience method cannot distinguish a null element from an empty
     /// one, nor carry embedded NULs, non-UTF-8 payloads, or a specific
     /// charset/padding.
-    ///
-    /// A dataset stages one global heap collection, which indexes at most
-    /// 65,535 objects — `write`/`finish` refuses more with
-    /// [`GlobalHeapObjectLimitExceeded`](crate::FormatError::GlobalHeapObjectLimitExceeded).
     pub fn with_vlen_strings(&mut self, values: &[&str]) -> &mut Self {
         let datatype = make_vlen_string_type(CharacterSet::Utf8);
         let elements: Vec<VlStringElement> = values
