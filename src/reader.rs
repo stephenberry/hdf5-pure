@@ -2610,6 +2610,24 @@ impl Dataset {
         Ok(classify_datatype(&dt))
     }
 
+    /// The size in bytes of one on-disk element of this dataset's datatype —
+    /// HDF5's datatype storage size (`H5Tget_size`).
+    ///
+    /// This is the byte width of a single stored element: 8 for `f64`, the
+    /// declared length for a fixed-length string, the record size for a compound
+    /// type, or the reference/descriptor size for a variable-length type (whose
+    /// payload lives separately in the file's global heaps).
+    ///
+    /// Multiplied by the element count from [`shape`](Self::shape), it is the
+    /// exact number of raw bytes a full [`read_raw`](Self::read_raw)
+    /// materializes. A caller reading an untrusted file can use it to bound that
+    /// allocation up front rather than trusting the file's declared extent: a
+    /// dataset can name a small element count yet a per-element size of billions
+    /// of bytes, so the product — not the count alone — is what a read allocates.
+    pub fn element_size(&self) -> Result<u64, Error> {
+        Ok(u64::from(self.datatype()?.type_size()))
+    }
+
     /// The raw bytes of this dataset's user-defined fill value, encoded in its
     /// datatype, or `None` when no user-defined fill value is set (the library
     /// default or an explicitly undefined fill). Reads whichever Fill Value

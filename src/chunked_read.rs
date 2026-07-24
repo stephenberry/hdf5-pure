@@ -579,6 +579,43 @@ fn chunked_dims(
     Ok((rank, chunk_dims, ds_dims))
 }
 
+/// The largest logical (unfiltered) byte size a single chunk may declare.
+///
+/// HDF5 stores a chunk's on-disk size in a 32-bit field, so a chunk cannot
+/// occupy more than `u32::MAX` bytes on disk. An unfiltered chunk's logical size
+/// equals its on-disk size, and the reader also narrows the computed chunk byte
+/// size to `u32` on the single-chunk and implicit index paths, so a declared
+/// chunk larger than this is not representable in the format regardless.
+const MAX_CHUNK_LOGICAL_BYTES: u64 = u32::MAX as u64;
+
+/// Reject a chunk geometry whose logical byte size — `product(chunk_dims) *
+/// elem_size` — is impossible for the format, before it is used to size a
+/// full-extent output allocation.
+///
+/// The chunk edge lengths come from the data-layout message and `elem_size` from
+/// the datatype message, both attacker-controlled in an untrusted file. A crafted
+/// datatype size (for example a fixed-length string element of billions of bytes)
+/// or chunk extent otherwise multiplies into a multi-gigabyte `vec![0u8; …]` for
+/// the assembled dataset — an out-of-memory abort driven by a tiny file — even
+/// though the on-disk chunk data is small. Bounding the *per-chunk* logical size
+/// (rather than the whole dataset) refuses that case while leaving a genuinely
+/// large dataset, which is large through its element count across many
+/// normally-sized chunks, entirely readable.
+fn ensure_chunk_bytes_representable(
+    chunk_dims: &[usize],
+    elem_size: usize,
+) -> Result<(), FormatError> {
+    let logical = chunk_dims
+        .iter()
+        .try_fold(elem_size as u64, |acc, &d| acc.checked_mul(d as u64));
+    match logical {
+        Some(bytes) if bytes <= MAX_CHUNK_LOGICAL_BYTES => Ok(()),
+        _ => Err(FormatError::InvalidChunkGeometry(
+            "chunk logical byte size exceeds the 4 GiB format limit",
+        )),
+    }
+}
+
 /// Read a chunked dataset, decompressing chunks as needed.
 pub fn read_chunked_data(
     file_data: &[u8],
@@ -625,6 +662,7 @@ pub fn read_chunked_data(
     let elem_size = datatype.type_size() as usize;
 
     let (rank, chunk_dims, ds_dims) = chunked_dims(chunk_dimensions, dataspace)?;
+    ensure_chunk_bytes_representable(&chunk_dims, elem_size)?;
 
     // Collect chunks based on version and index type
     #[expect(
@@ -780,6 +818,7 @@ pub fn read_chunked_data_from_source<S: Source + ?Sized>(
 
     let elem_size = datatype.type_size() as usize;
     let (rank, chunk_dims, ds_dims) = chunked_dims(chunk_dimensions, dataspace)?;
+    ensure_chunk_bytes_representable(&chunk_dims, elem_size)?;
 
     let chunks = collect_chunks_for_layout_from_source(
         source,
@@ -864,6 +903,7 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
 
     let elem_size = datatype.type_size() as usize;
     let (rank, chunk_dims, ds_dims) = chunked_dims(chunk_dimensions, dataspace)?;
+    ensure_chunk_bytes_representable(&chunk_dims, elem_size)?;
 
     // A rank-0 (scalar) chunked layout has no leading dimension to window; fall
     // back to the whole-dataset reader, which handles rank 0. Only a crafted
@@ -1127,6 +1167,7 @@ pub fn read_chunked_data_cached_from_source<S: Source + ?Sized>(
 
     let elem_size = datatype.type_size() as usize;
     let (rank, chunk_dims, ds_dims) = chunked_dims(chunk_dimensions, dataspace)?;
+    ensure_chunk_bytes_representable(&chunk_dims, elem_size)?;
 
     let chunks = if let Some(chunks) = cache.all_indexed_chunks() {
         chunks
@@ -1723,6 +1764,7 @@ pub fn read_chunked_data_cached(
 
     let elem_size = datatype.type_size() as usize;
     let (rank, chunk_dims, ds_dims) = chunked_dims(chunk_dimensions, dataspace)?;
+    ensure_chunk_bytes_representable(&chunk_dims, elem_size)?;
     let ndims = rank + 1; // rank + the trailing element-size dimension
 
     #[expect(
@@ -2018,6 +2060,25 @@ fn copy_chunk_to_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_bytes_within_limit_are_accepted() {
+        // A realistic chunk: 256 KiB of f64 elements.
+        assert!(ensure_chunk_bytes_representable(&[128, 256], 8).is_ok());
+        // A single chunk right at the 4 GiB limit is still representable.
+        assert!(ensure_chunk_bytes_representable(&[u32::MAX as usize], 1).is_ok());
+    }
+
+    #[test]
+    fn chunk_bytes_over_limit_are_refused() {
+        // The issue #185 shape: 10 elements of a ~2.86 GB fixed-length string
+        // (0xAAAAAAAA bytes) is ~28.6 GB per chunk — impossible for the format.
+        let err = ensure_chunk_bytes_representable(&[10], 0xAAAA_AAAA).unwrap_err();
+        assert!(matches!(err, FormatError::InvalidChunkGeometry(_)));
+
+        // A geometry whose product overflows u64 is refused, not wrapped.
+        assert!(ensure_chunk_bytes_representable(&[usize::MAX, usize::MAX], usize::MAX).is_err());
+    }
 
     fn write_offset(buf: &mut Vec<u8>, val: u64, size: u8) {
         match size {
@@ -2835,14 +2896,16 @@ mod tests {
         );
     }
 
-    /// Inner dimensions whose product overflows `usize` must error rather than
-    /// panic (debug) or wrap (release). `(2^22)^3` overflows 64-bit `usize`;
-    /// `(2^22)^2` already overflows 32-bit, so this holds on both.
+    /// Inner *dataspace* dimensions whose product overflows `usize` must error
+    /// rather than panic (debug) or wrap (release). The chunk edges stay small so
+    /// the per-chunk geometry guard passes and the `row_elems` check is what
+    /// catches the overflow. `(2^22)^3` overflows 64-bit `usize`; `(2^22)^2`
+    /// already overflows 32-bit, so this holds on both.
     #[test]
     fn windowed_rows_inner_dim_product_overflow_errors() {
         let big: u32 = 1 << 22;
         let layout = DataLayout::Chunked {
-            chunk_dimensions: vec![1, big, big, big, 8],
+            chunk_dimensions: vec![1, 2, 2, 2, 8],
             btree_address: Some(0),
             version: 3,
             chunk_index_type: None,
@@ -2875,14 +2938,14 @@ mod tests {
         );
     }
 
-    /// An inner-split chunk grid whose *chunk* dimensions overflow the stride
-    /// product must error rather than panic (debug) or wrap (release) — the
-    /// dataset itself is small, so the `row_elems` guard doesn't catch it; the
-    /// checked stride construction must. `(2^22)^3` overflows 64-bit `usize`;
-    /// `(2^22)^2` already overflows 32-bit, so this holds on both. Checked
-    /// before any I/O: the empty source would otherwise EOF first.
+    /// A chunk whose edges declare an impossible logical byte size — here a
+    /// `(2^22)^3` element chunk of `f64`, far past the 4 GiB format limit — must
+    /// be refused up front, even when the dataset itself is small. The per-chunk
+    /// geometry guard catches it before the windowed reader sizes any allocation
+    /// or builds strides, so a crafted chunk extent cannot drive an out-of-memory
+    /// abort. Checked before any I/O: the empty source would otherwise EOF first.
     #[test]
-    fn windowed_rows_chunk_stride_overflow_errors() {
+    fn windowed_rows_huge_chunk_geometry_refused() {
         let big: u32 = 1 << 22;
         let layout = DataLayout::Chunked {
             chunk_dimensions: vec![2, big, big, big, 8],
@@ -2911,10 +2974,10 @@ mod tests {
             0,
             1,
         )
-        .expect_err("overflowing chunk-dim stride product must error");
+        .expect_err("an impossible chunk geometry must error");
         assert!(
-            matches!(err, FormatError::OffsetOverflow { .. }),
-            "expected OffsetOverflow, got {err:?}"
+            matches!(err, FormatError::InvalidChunkGeometry(_)),
+            "expected InvalidChunkGeometry, got {err:?}"
         );
     }
 

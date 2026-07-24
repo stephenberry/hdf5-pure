@@ -6,6 +6,14 @@ use libfuzzer_sys::fuzz_target;
 const MAX_GROUP_DEPTH: usize = 3;
 const MAX_CHILDREN_PER_GROUP: usize = 16;
 const MAX_READ_ELEMENTS: u64 = 64;
+/// Upper bound on the bytes a single exercised read may materialize. The element
+/// count alone does not bound the allocation: a crafted datatype can declare a
+/// per-element size of billions of bytes (a fixed-length string element, say), so
+/// a few elements still multiply into a multi-gigabyte buffer and an out-of-memory
+/// abort (issue #185). Gating on `element_count * element_size` keeps the target
+/// exercising the decode paths on small data instead of re-discovering allocation
+/// limits.
+const MAX_READ_BYTES: u64 = 1 << 20; // 1 MiB
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(file) = File::from_bytes(data.to_vec()) {
@@ -61,7 +69,20 @@ fn exercise_dataset(dataset: &Dataset) {
         .iter()
         .copied()
         .try_fold(1u64, |acc, dim| acc.checked_mul(dim));
-    if !matches!(element_count, Some(0..=MAX_READ_ELEMENTS)) {
+    let Some(element_count @ 0..=MAX_READ_ELEMENTS) = element_count else {
+        return;
+    };
+
+    // Bound the read by its byte size, not just its element count: the datatype's
+    // on-disk element size is attacker-controlled, so a tiny element count can
+    // still declare a huge allocation.
+    let Ok(element_size) = dataset.element_size() else {
+        return;
+    };
+    if element_count
+        .checked_mul(element_size)
+        .is_none_or(|bytes| bytes > MAX_READ_BYTES)
+    {
         return;
     }
 

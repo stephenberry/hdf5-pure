@@ -6,8 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `Dataset::element_size` returns the on-disk byte width of one element (HDF5's `H5Tget_size`), so a caller reading an untrusted file can multiply it by the element count from `shape` to bound a read's allocation before requesting it, rather than trusting the file's declared extent ([#185](https://github.com/stephenberry/hdf5-pure/issues/185)).
+
 ### Fixed
 
+- Reading a chunked dataset whose datatype or chunk extent declares an impossible per-chunk logical size (over the 4 GiB format limit, e.g. a fixed-length string element of billions of bytes) is now refused with an `InvalidChunkGeometry` error instead of eagerly allocating the whole declared extent, so a crafted file can no longer drive a multi-gigabyte out-of-memory allocation from a few kilobytes ([#185](https://github.com/stephenberry/hdf5-pure/issues/185)).
 - `Dataset::read_raw_rows` and the typed `read_*_rows` now stream a row window of an inner-chunked dataset by decoding only the chunks the window overlaps, instead of falling back to a whole read, so peak memory scales with the window plus one chunk rather than the dataset ([#183](https://github.com/stephenberry/hdf5-pure/pull/183)).
 - `Dataset::read_string_rows` on variable-length strings now resolves only the window's heap references instead of reading and resolving the whole dataset before slicing, so the row-window memory bound holds for every windowed read: peak allocation is the window's references, its text, and the metadata of the heap collections it touches ([#186](https://github.com/stephenberry/hdf5-pure/pull/186)).
 
