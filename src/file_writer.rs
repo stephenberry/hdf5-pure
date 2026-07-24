@@ -191,7 +191,11 @@ const DENSE_ATTR_DBLOCK_HEADER: usize =
 /// no larger, matching what the reference C library writes for an attribute
 /// heap. A heap whose root block is bigger declares that larger size instead,
 /// so the header never claims a maximum its own block exceeds.
-const DENSE_ATTR_DEFAULT_MAX_DIRECT_BLOCK: u64 = 65536;
+///
+/// A byte size rather than an on-disk address, so it is a `usize`: it is compared
+/// and subtracted against in-memory buffer sizes, and only widened to the 8-byte
+/// on-disk length field at the point it is written.
+const DENSE_ATTR_DEFAULT_MAX_DIRECT_BLOCK: usize = 65536;
 
 /// The largest attribute [`build_dense_attrs`] can store as a managed object.
 ///
@@ -209,7 +213,7 @@ const DENSE_ATTR_DEFAULT_MAX_DIRECT_BLOCK: u64 = 65536;
 /// emitter does not write, so it must be refused rather than stored as managed
 /// (see [`dense_attrs_check`]).
 pub(crate) const DENSE_ATTR_MAX_MANAGED_OBJECT: usize =
-    DENSE_ATTR_DEFAULT_MAX_DIRECT_BLOCK as usize - DENSE_ATTR_DBLOCK_HEADER;
+    DENSE_ATTR_DEFAULT_MAX_DIRECT_BLOCK - DENSE_ATTR_DBLOCK_HEADER;
 
 /// The most attributes the single B-tree v2 leaf can index: it writes its record
 /// count into a 2-byte field.
@@ -222,9 +226,12 @@ pub(crate) const DENSE_ATTR_MAX_COUNT: usize = u16::MAX as usize;
 /// exactly what [`build_dense_attrs`] emits, and so the declared maximum cannot
 /// drift below the block actually written.
 fn dense_attr_block_geometry(serialized_total: usize) -> (u64, u64) {
-    let content = DENSE_ATTR_DBLOCK_HEADER + serialized_total;
-    let starting_block_size = content.next_power_of_two().max(512) as u64;
-    let max_direct_block_size = starting_block_size.max(DENSE_ATTR_DEFAULT_MAX_DIRECT_BLOCK);
+    // Rounded up in `u64`, not `usize`: on a 32-bit host the power-of-two
+    // rounding of a large heap would otherwise overflow (and panic) before
+    // `dense_attrs_check` got the chance to refuse it.
+    let content = DENSE_ATTR_DBLOCK_HEADER as u64 + serialized_total as u64;
+    let starting_block_size = content.next_power_of_two().max(512);
+    let max_direct_block_size = starting_block_size.max(DENSE_ATTR_DEFAULT_MAX_DIRECT_BLOCK as u64);
     (starting_block_size, max_direct_block_size)
 }
 
@@ -2517,7 +2524,7 @@ mod tests {
         // output is unchanged.
         assert_eq!(
             dense_attr_block_geometry(100).1,
-            DENSE_ATTR_DEFAULT_MAX_DIRECT_BLOCK
+            DENSE_ATTR_DEFAULT_MAX_DIRECT_BLOCK as u64
         );
     }
 
