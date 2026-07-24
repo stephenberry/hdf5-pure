@@ -21,7 +21,7 @@ use crate::chunked_write::{
 };
 use crate::convert::TryToUsize;
 use crate::dataspace::{Dataspace, DataspaceType};
-use crate::error::FormatError;
+use crate::error::{FormatError, OBJECT_HEADER_MESSAGE_MAX};
 use crate::file_space_info::{
     DEFAULT_PAGE_SIZE, DEFAULT_THRESHOLD, FileSpaceInfo, FileSpaceStrategy, NUM_FILE_FSM_MANAGERS,
 };
@@ -67,7 +67,7 @@ pub(crate) fn build_chunked_dataset_oh(
     attrs: &[AttributeMessage],
     dense_blob: Option<&DenseAttrBlob>,
     fill: Option<&[u8]>,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, FormatError> {
     let mut w = ObjectHeaderWriter::new();
     w.add_message_with_flags(MessageType::Datatype, dt.serialize(), 0x01);
     w.add_message(MessageType::Dataspace, ds.serialize(LENGTH_SIZE));
@@ -98,7 +98,7 @@ pub(crate) fn build_dataset_oh(
     attrs: &[AttributeMessage],
     dense_blob: Option<&DenseAttrBlob>,
     fill: Option<&[u8]>,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, FormatError> {
     let mut w = ObjectHeaderWriter::new();
     w.add_message_with_flags(MessageType::Datatype, dt.serialize(), 0x01);
     w.add_message(MessageType::Dataspace, ds.serialize(LENGTH_SIZE));
@@ -127,7 +127,7 @@ pub(crate) fn build_group_oh(
     links: &[LinkMessage],
     attrs: &[AttributeMessage],
     dense_blob: Option<&DenseAttrBlob>,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, FormatError> {
     let mut w = ObjectHeaderWriter::new();
     let mut li = Vec::new();
     li.push(0); // version
@@ -607,15 +607,17 @@ impl FileWriter {
 
     /// The superblock-extension object header bytes carrying the File Space Info
     /// message, if file-space was configured.
-    fn file_space_extension_oh(&self) -> Option<Vec<u8>> {
-        self.file_space_info().map(|info| {
-            let mut oh = ObjectHeaderWriter::new();
-            // Message flags 0x14 match what the reference C library writes for
-            // this message (do-not-share + mark-if-unknown); no must-understand
-            // bit, so older readers still open the file.
-            oh.add_message_with_flags(MessageType::FileSpaceInfo, info.serialize(), 0x14);
-            oh.serialize()
-        })
+    fn file_space_extension_oh(&self) -> Result<Option<Vec<u8>>, FormatError> {
+        self.file_space_info()
+            .map(|info| {
+                let mut oh = ObjectHeaderWriter::new();
+                // Message flags 0x14 match what the reference C library writes for
+                // this message (do-not-share + mark-if-unknown); no must-understand
+                // bit, so older readers still open the file.
+                oh.add_message_with_flags(MessageType::FileSpaceInfo, info.serialize(), 0x14);
+                oh.serialize()
+            })
+            .transpose()
     }
 
     pub fn create_group(&mut self, name: &str) -> GroupBuilder {
@@ -673,7 +675,7 @@ impl FileWriter {
         // The superblock-extension header (carrying a File Space Info message)
         // is independent of the file layout, so build it up front and place it
         // after all other content below.
-        let ext_oh = self.file_space_extension_oh();
+        let ext_oh = self.file_space_extension_oh()?;
         // A persisting *non-paged* file's placeholder File Space Info message (built
         // just above) records `eoa_pre_fsm` = UNDEF, because a fresh file has no
         // free-space-manager blocks. libhdf5 requires `fs_persist => eoa_fsm_fsalloc
@@ -1055,6 +1057,58 @@ impl FileWriter {
             root_attrs.push(build_attr_message(n, v));
         }
 
+        let root_dense = root_attrs.len() > DENSE_ATTR_THRESHOLD;
+        let group_dense: Vec<bool> = groups
+            .iter()
+            .map(|g| g.attrs.len() > DENSE_ATTR_THRESHOLD)
+            .collect();
+        let ds_dense: Vec<bool> = all_ds
+            .iter()
+            .map(|d| d.attrs.len() > DENSE_ATTR_THRESHOLD)
+            .collect();
+
+        // A compact attribute is stored as an object-header message, whose size
+        // field is 2 bytes wide. An oversized one would be written with a
+        // truncated length, which silently loses the attribute or leaves the
+        // reader parsing the next message body as a message header, so refuse it
+        // here — while the attribute's name is still at hand — before any header
+        // is built. `ObjectHeaderWriter::serialize` is the unnamed backstop for
+        // every other message this writer emits.
+        //
+        // This runs before the compression pass below so a file that will be
+        // refused does not first pay to compress every chunked dataset in it.
+        //
+        // Dense attributes are stored in a fractal heap rather than the header,
+        // so this limit does not apply to them and the check skips them. That
+        // leaves an object with more than `DENSE_ATTR_THRESHOLD` attributes
+        // unguarded, where the dense emitter has a mis-encoding gap of its own
+        // (issue #191); this check deliberately does not paper over it.
+        fn check_compact_attrs(attrs: &[AttributeMessage]) -> Result<(), FormatError> {
+            for a in attrs {
+                let size = a.serialize(LENGTH_SIZE).len();
+                if size > OBJECT_HEADER_MESSAGE_MAX {
+                    return Err(FormatError::AttributeMessageTooLarge {
+                        name: a.name.clone(),
+                        size,
+                    });
+                }
+            }
+            Ok(())
+        }
+        if !root_dense {
+            check_compact_attrs(&root_attrs)?;
+        }
+        for (gi, g) in groups.iter().enumerate() {
+            if !group_dense[gi] {
+                check_compact_attrs(&g.attrs)?;
+            }
+        }
+        for (i, d) in all_ds.iter().enumerate() {
+            if !ds_dense[i] {
+                check_compact_attrs(&d.attrs)?;
+            }
+        }
+
         let is_chunked: Vec<bool> = all_ds
             .iter()
             .map(|d| d.chunk_options.is_chunked() || d.maxshape.is_some() || d.raw_chunks.is_some())
@@ -1088,16 +1142,6 @@ impl FileWriter {
             })
             .collect::<Result<_, FormatError>>()?;
 
-        let root_dense = root_attrs.len() > DENSE_ATTR_THRESHOLD;
-        let group_dense: Vec<bool> = groups
-            .iter()
-            .map(|g| g.attrs.len() > DENSE_ATTR_THRESHOLD)
-            .collect();
-        let ds_dense: Vec<bool> = all_ds
-            .iter()
-            .map(|d| d.attrs.len() > DENSE_ATTR_THRESHOLD)
-            .collect();
-
         // Pass 1: compute OH sizes with dummy addresses
         let group_oh_sizes: Vec<usize> = groups
             .iter()
@@ -1111,14 +1155,15 @@ impl FileWriter {
                 for &sgi in &g.sub_group_indices {
                     dummy_links.push(make_link(&groups[sgi].name, 0));
                 }
-                if group_dense[gi] {
+                let oh = if group_dense[gi] {
                     let dummy_blob = build_dense_attrs(&g.attrs, 0);
-                    build_group_oh(&dummy_links, &g.attrs, Some(&dummy_blob)).len()
+                    build_group_oh(&dummy_links, &g.attrs, Some(&dummy_blob))?
                 } else {
-                    build_group_oh(&dummy_links, &g.attrs, None).len()
-                }
+                    build_group_oh(&dummy_links, &g.attrs, None)?
+                };
+                Ok(oh.len())
             })
-            .collect();
+            .collect::<Result<_, FormatError>>()?;
 
         let root_dummy_links: Vec<LinkMessage> = {
             let mut links = Vec::new();
@@ -1132,9 +1177,9 @@ impl FileWriter {
         };
         let root_oh_size = if root_dense {
             let dummy_blob = build_dense_attrs(&root_attrs, 0);
-            build_group_oh(&root_dummy_links, &root_attrs, Some(&dummy_blob)).len()
+            build_group_oh(&root_dummy_links, &root_attrs, Some(&dummy_blob))?.len()
         } else {
-            build_group_oh(&root_dummy_links, &root_attrs, None).len()
+            build_group_oh(&root_dummy_links, &root_attrs, None)?.len()
         };
 
         // Pass 1: compute dataset object-header sizes from a dummy layout. No
@@ -1168,7 +1213,7 @@ impl FileWriter {
                     &d.attrs,
                     dense_blob.as_ref(),
                     d.fill.as_deref(),
-                )
+                )?
             } else {
                 ds_data_lens.push(d.raw.len() as u64);
                 build_dataset_oh(
@@ -1179,7 +1224,7 @@ impl FileWriter {
                     &d.attrs,
                     dense_blob.as_ref(),
                     d.fill.as_deref(),
-                )
+                )?
             };
             actual_ds_oh_sizes.push(oh.len());
         }
@@ -1594,7 +1639,7 @@ impl FileWriter {
                         &d.attrs,
                         ds_dense_blobs[i].as_ref(),
                         d.fill.as_deref(),
-                    )
+                    )?
                 } else {
                     build_dataset_oh(
                         &d.dt,
@@ -1604,7 +1649,7 @@ impl FileWriter {
                         &d.attrs,
                         ds_dense_blobs[i].as_ref(),
                         d.fill.as_deref(),
-                    )
+                    )?
                 };
                 ds_oh_bytes.push(oh);
             }
@@ -1626,7 +1671,7 @@ impl FileWriter {
                 );
                 let mut oh = ObjectHeaderWriter::new();
                 oh.add_message_with_flags(MessageType::FileSpaceInfo, info.serialize(), 0x14);
-                oh.serialize()
+                oh.serialize()?
             } else {
                 ext_oh
                     .clone()
@@ -1695,7 +1740,7 @@ impl FileWriter {
                 &root_links,
                 &root_attrs,
                 root_dense_blob.as_ref(),
-            ))?;
+            )?)?;
             if let Some(ref blob) = root_dense_blob {
                 sink.put(&blob.blob)?;
             }
@@ -1713,7 +1758,7 @@ impl FileWriter {
                     &links,
                     &g.attrs,
                     group_dense_blobs[gi].as_ref(),
-                ))?;
+                )?)?;
                 if let Some(ref blob) = group_dense_blobs[gi] {
                     sink.put(&blob.blob)?;
                 }
@@ -1886,7 +1931,7 @@ impl FileWriter {
                     &d.attrs,
                     ds_dense_blobs[i].as_ref(),
                     d.fill.as_deref(),
-                )
+                )?
             } else {
                 build_dataset_oh(
                     &d.dt,
@@ -1896,7 +1941,7 @@ impl FileWriter {
                     &d.attrs,
                     ds_dense_blobs[i].as_ref(),
                     d.fill.as_deref(),
-                )
+                )?
             };
             ds_oh_bytes2.push(oh);
         }
@@ -1955,7 +2000,7 @@ impl FileWriter {
             &root_links,
             &root_attrs,
             root_dense_blob.as_ref(),
-        ))?;
+        )?)?;
         if let Some(ref blob) = root_dense_blob {
             sink.put(&blob.blob)?;
         }
@@ -1974,7 +2019,7 @@ impl FileWriter {
                 &links,
                 &g.attrs,
                 group_dense_blobs[gi].as_ref(),
-            ))?;
+            )?)?;
             if let Some(ref blob) = group_dense_blobs[gi] {
                 sink.put(&blob.blob)?;
             }
@@ -2029,7 +2074,7 @@ impl FileWriter {
                 info.eoa_pre_fsm = eof_addr2 - ub as u64;
                 let mut oh = ObjectHeaderWriter::new();
                 oh.add_message_with_flags(MessageType::FileSpaceInfo, info.serialize(), 0x14);
-                Some(oh.serialize())
+                Some(oh.serialize()?)
             }
             (other, _) => other.clone(),
         };
@@ -2358,6 +2403,58 @@ mod tests {
             "test set should exceed one direct block (got {total} bytes)",
         );
         assert!(!dense_attrs_fit(&big));
+    }
+
+    /// The number of `i64` elements in the largest attribute whose serialized
+    /// message still fits the object header's 2-byte message-size field, derived
+    /// from a measured probe rather than hard-coded so it tracks the encoder.
+    fn largest_fitting_i64_attr_elements() -> usize {
+        let one = build_attr_message("boundary", &AttrValue::I64Array(vec![0i64; 1]));
+        let overhead = one.serialize(LENGTH_SIZE).len() - 8;
+        (OBJECT_HEADER_MESSAGE_MAX - overhead) / 8
+    }
+
+    #[test]
+    fn compact_attr_at_the_message_size_limit_is_written() {
+        let n = largest_fitting_i64_attr_elements();
+        let attr = build_attr_message("boundary", &AttrValue::I64Array(vec![7i64; n]));
+        // Pin the probe to the boundary itself: one more element must not fit,
+        // or this test would still pass while exercising a tiny attribute.
+        let size = attr.serialize(LENGTH_SIZE).len();
+        assert!(size <= OBJECT_HEADER_MESSAGE_MAX);
+        assert!(
+            size + 8 > OBJECT_HEADER_MESSAGE_MAX,
+            "probe is not at the limit (got {size})"
+        );
+
+        let mut fw = FileWriter::new();
+        fw.set_root_attr("boundary", AttrValue::I64Array(vec![7i64; n]));
+        fw.create_dataset("d").with_f64_data(&[1.0]);
+        let bytes = fw.finish().unwrap();
+
+        let file = crate::reader::File::from_bytes(bytes).unwrap();
+        let attrs = file.root().attrs().unwrap();
+        assert_eq!(attrs.len(), 1);
+    }
+
+    #[test]
+    fn compact_attr_past_the_message_size_limit_is_refused() {
+        let n = largest_fitting_i64_attr_elements() + 1;
+        let size = build_attr_message("boundary", &AttrValue::I64Array(vec![0i64; n]))
+            .serialize(LENGTH_SIZE)
+            .len();
+        assert!(size > OBJECT_HEADER_MESSAGE_MAX);
+
+        let mut fw = FileWriter::new();
+        fw.set_root_attr("boundary", AttrValue::I64Array(vec![7i64; n]));
+        fw.create_dataset("d").with_f64_data(&[1.0]);
+        assert_eq!(
+            fw.finish(),
+            Err(FormatError::AttributeMessageTooLarge {
+                name: "boundary".to_string(),
+                size,
+            })
+        );
     }
 
     /// Read a dataset's VL-string byte objects from a freshly-written file.

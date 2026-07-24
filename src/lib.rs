@@ -232,7 +232,7 @@ pub(crate) mod ndarray_support;
 
 #[cfg(feature = "std")]
 pub use error::Error;
-pub use error::FormatError;
+pub use error::{FormatError, OBJECT_HEADER_MESSAGE_MAX};
 
 #[cfg(feature = "std")]
 pub use reader::{

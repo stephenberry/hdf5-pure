@@ -4,6 +4,7 @@
 use alloc::vec::Vec;
 
 use crate::checksum::jenkins_lookup3;
+use crate::error::{FormatError, OBJECT_HEADER_MESSAGE_MAX};
 use crate::message_type::MessageType;
 
 /// Writer for v2 object headers with proper checksums.
@@ -30,7 +31,26 @@ impl ObjectHeaderWriter {
     }
 
     /// Serialize the complete v2 object header (OHDR + messages + checksum).
-    pub fn serialize(&self) -> Vec<u8> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FormatError::ObjectHeaderMessageTooLarge`] if any message is
+    /// larger than [`OBJECT_HEADER_MESSAGE_MAX`]. The per-message size field is
+    /// 2 bytes wide, so a larger message could only be written by truncating
+    /// its own length, which desynchronizes every message that follows it.
+    /// Callers that can name the offending object (the whole-file writer names
+    /// the attribute) check first and report a more specific error; this is the
+    /// backstop for every other message the writer emits.
+    pub fn serialize(&self) -> Result<Vec<u8>, FormatError> {
+        for (msg_type, data, _) in &self.messages {
+            if data.len() > OBJECT_HEADER_MESSAGE_MAX {
+                return Err(FormatError::ObjectHeaderMessageTooLarge {
+                    message_type: msg_type.to_u16(),
+                    size: data.len(),
+                });
+            }
+        }
+
         // Calculate total message bytes: each message has type(1) + size(2) + flags(1) + data
         let msg_bytes_total: usize = self
             .messages
@@ -76,7 +96,7 @@ impl ObjectHeaderWriter {
             buf.push(msg_type.to_u16() as u8); // type (1 byte in v2)
             #[expect(
                 clippy::cast_possible_truncation,
-                reason = "message data length is written into the 2-byte message-size field of the v2 object header"
+                reason = "message data length is bounded by OBJECT_HEADER_MESSAGE_MAX above, so it fits the 2-byte message-size field of the v2 object header"
             )]
             buf.extend_from_slice(&(data.len() as u16).to_le_bytes()); // size (2 bytes)
             buf.push(*msg_flags); // flags
@@ -87,7 +107,7 @@ impl ObjectHeaderWriter {
         let checksum = jenkins_lookup3(&buf);
         buf.extend_from_slice(&checksum.to_le_bytes());
 
-        buf
+        Ok(buf)
     }
 }
 
@@ -105,7 +125,7 @@ mod tests {
     #[test]
     fn empty_header_roundtrip() {
         let writer = ObjectHeaderWriter::new();
-        let bytes = writer.serialize();
+        let bytes = writer.serialize().unwrap();
         let hdr = ObjectHeader::parse(&bytes, 0, 8, 8).unwrap();
         assert_eq!(hdr.version, 2);
         assert_eq!(hdr.messages.len(), 0);
@@ -116,7 +136,7 @@ mod tests {
         let mut writer = ObjectHeaderWriter::new();
         writer.add_message(MessageType::Dataspace, vec![1, 2, 3, 4]);
         writer.add_message(MessageType::Datatype, vec![5, 6]);
-        let bytes = writer.serialize();
+        let bytes = writer.serialize().unwrap();
         let hdr = ObjectHeader::parse(&bytes, 0, 8, 8).unwrap();
         assert_eq!(hdr.messages.len(), 2);
         assert_eq!(hdr.messages[0].msg_type, MessageType::Dataspace);
@@ -130,9 +150,39 @@ mod tests {
         let mut writer = ObjectHeaderWriter::new();
         // Add a message with >255 bytes of payload
         writer.add_message(MessageType::Datatype, vec![0xAA; 300]);
-        let bytes = writer.serialize();
+        let bytes = writer.serialize().unwrap();
         let hdr = ObjectHeader::parse(&bytes, 0, 8, 8).unwrap();
         assert_eq!(hdr.messages.len(), 1);
         assert_eq!(hdr.messages[0].data.len(), 300);
+    }
+
+    #[test]
+    fn message_at_the_size_field_limit_still_serializes() {
+        let mut writer = ObjectHeaderWriter::new();
+        writer.add_message(
+            MessageType::Attribute,
+            vec![0xAA; OBJECT_HEADER_MESSAGE_MAX],
+        );
+        let bytes = writer.serialize().unwrap();
+        let hdr = ObjectHeader::parse(&bytes, 0, 8, 8).unwrap();
+        assert_eq!(hdr.messages.len(), 1);
+        assert_eq!(hdr.messages[0].data.len(), OBJECT_HEADER_MESSAGE_MAX);
+    }
+
+    #[test]
+    fn message_past_the_size_field_limit_is_refused() {
+        let mut writer = ObjectHeaderWriter::new();
+        writer.add_message(MessageType::Dataspace, vec![0u8; 8]);
+        writer.add_message(
+            MessageType::Attribute,
+            vec![0xAA; OBJECT_HEADER_MESSAGE_MAX + 1],
+        );
+        assert_eq!(
+            writer.serialize(),
+            Err(FormatError::ObjectHeaderMessageTooLarge {
+                message_type: MessageType::Attribute.to_u16(),
+                size: OBJECT_HEADER_MESSAGE_MAX + 1,
+            })
+        );
     }
 }
