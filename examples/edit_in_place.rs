@@ -42,7 +42,7 @@ fn main() {
     let session = File::open_rw(&path).expect("open for editing");
     session
         .root()
-        .create_group_with("run2", |g| {
+        .create_group("run2", |g| {
             g.set_attr("kind", AttrValue::AsciiString("trial".into()));
         })
         .unwrap();

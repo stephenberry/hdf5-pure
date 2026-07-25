@@ -945,7 +945,7 @@ impl WriteEngine {
     /// let file = File::open_rw("log.h5")?;
     /// let mut samples = file.dataset("samples")?;
     /// samples.append(&[8i32, 9, 10, 11])?; // immediate + durable
-    /// file.root().create_group("run2")?; // staged
+    /// file.root().create_group("run2", |_| {})?; // staged
     /// samples.append(&[12i32, 13])?;
     /// file.commit()?; // applies the staged group; appends already durable
     /// # Ok::<(), hdf5_pure::Error>(())

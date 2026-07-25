@@ -116,7 +116,7 @@ fn interleave_append_stage_commit_append() {
 
         // Stage a batch of tree edits.
         s.root()
-            .create_group_with("run2", |g| {
+            .create_group("run2", |g| {
                 g.set_attr("count", AttrValue::I64(7));
             })
             .unwrap();

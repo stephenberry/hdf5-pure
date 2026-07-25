@@ -103,7 +103,7 @@ fn group_attrs_on_subgroup_and_root() {
     build_simple(&path, &[1]);
 
     let file = File::open_rw(&path).unwrap();
-    file.root().create_group("grp").unwrap();
+    file.root().create_group("grp", |_| {}).unwrap();
     file.commit().unwrap();
 
     file.group("grp")
@@ -158,7 +158,7 @@ fn open_rw_with_locking_disabled_edits() {
     build_simple(&path, &[1, 2, 3]);
 
     let file = File::open_rw_with_locking(&path, FileLocking::Disabled).unwrap();
-    file.root().create_group("g").unwrap();
+    file.root().create_group("g", |_| {}).unwrap();
     file.commit().unwrap();
     assert!(file.group("g").is_ok());
 }
@@ -181,7 +181,10 @@ fn writes_after_close_are_sealed() {
         ds.set_attr("x", AttrValue::I64(1)),
         Err(Error::FileClosed)
     ));
-    assert!(matches!(root.create_group("g"), Err(Error::FileClosed)));
+    assert!(matches!(
+        root.create_group("g", |_| {}),
+        Err(Error::FileClosed)
+    ));
     assert!(matches!(
         root.set_attr("v", AttrValue::I64(1)),
         Err(Error::FileClosed)

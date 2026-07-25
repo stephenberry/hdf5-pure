@@ -1914,7 +1914,7 @@ impl std::fmt::Debug for Object {
 // ---------------------------------------------------------------------------
 
 /// A group that exists only as a staged edit, handed to
-/// [`Group::create_group_with`]'s closure so attributes can be set on a group
+/// [`Group::create_group`]'s closure so attributes can be set on a group
 /// that is not yet committed (and so has no resolvable header to hang a
 /// [`Group`] handle off).
 ///
@@ -1933,7 +1933,7 @@ impl StagedGroup<'_> {
     }
 
     /// Stage a subgroup of this group, configured through `build`.
-    pub fn create_group_with(
+    pub fn create_group(
         &mut self,
         name: &str,
         build: impl FnOnce(&mut StagedGroup<'_>),
@@ -2081,21 +2081,14 @@ impl Group {
         })
     }
 
-    /// Create a subgroup `name` within this group, staged until [`File::commit`].
+    /// Create a subgroup `name` within this group, configuring it through
+    /// `build` (attributes, nested groups and datasets), staged until
+    /// [`File::commit`].
     ///
-    /// Requires a read-write file ([`File::open_rw`]), else
-    /// [`Error::ReadOnly`](crate::Error::ReadOnly).
-    pub fn create_group(&self, name: &str) -> Result<(), Error> {
-        self.create_group_with(name, |_| {})
-    }
-
-    /// Create a subgroup `name` and stage attribute edits on it in the same
-    /// batch, applied together by [`File::commit`] — the group counterpart of
-    /// [`create_dataset`](Self::create_dataset)'s builder.
-    ///
-    /// [`set_attr`](Self::set_attr) needs a *resolvable* group, so it cannot
-    /// reach a group that is itself still staged. This can: both the creation
-    /// and the attributes land in one commit.
+    /// Pass `|_| {}` for a plain empty group. The closure exists because
+    /// [`set_attr`](Self::set_attr) needs a group that already *resolves*, so it
+    /// cannot reach a group that is itself still staged; this can, and the
+    /// creation and its attributes land in one commit.
     ///
     /// Requires a read-write file ([`File::open_rw`]), else
     /// [`Error::ReadOnly`](crate::Error::ReadOnly).
@@ -2104,15 +2097,16 @@ impl Group {
     /// # use hdf5_pure::{AttrValue, File};
     /// # fn main() -> Result<(), hdf5_pure::Error> {
     /// let file = File::open_rw("runs.h5")?;
-    /// file.root().create_group_with("run2", |g| {
+    /// file.root().create_group("run2", |g| {
     ///     g.set_attr("count", AttrValue::I64(7));
     ///     g.set_attr("label", AttrValue::String("second".into()));
     /// })?;
+    /// file.root().create_group("empty", |_| {})?;
     /// file.commit()?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn create_group_with(
+    pub fn create_group(
         &self,
         name: &str,
         build: impl FnOnce(&mut StagedGroup<'_>),

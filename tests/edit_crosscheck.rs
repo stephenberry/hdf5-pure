@@ -389,7 +389,7 @@ fn c_library_reads_group_attributes_edited_in_place() {
         session.group("grp").unwrap().remove_attr("drop").unwrap();
         session
             .root()
-            .create_group_with("new_grp", |g| {
+            .create_group("new_grp", |g| {
                 g.set_attr("tag", AttrValue::I64(55));
             })
             .unwrap();

@@ -168,7 +168,7 @@ fn create_group_at_root() {
 
     {
         let session = File::open_rw(&path).unwrap();
-        session.root().create_group("results").unwrap();
+        session.root().create_group("results", |_| {}).unwrap();
         session.commit().unwrap();
     }
 
@@ -197,8 +197,11 @@ fn add_dataset_into_new_nested_group() {
 
     {
         let session = File::open_rw(&path).unwrap();
-        session.root().create_group("measurements").unwrap();
-        session.root().create_group("measurements/run1").unwrap();
+        session.root().create_group("measurements", |_| {}).unwrap();
+        session
+            .root()
+            .create_group("measurements/run1", |_| {})
+            .unwrap();
         session
             .root()
             .create_dataset("measurements/run1/signal", |b| {
@@ -230,7 +233,7 @@ fn add_into_existing_group_across_commits() {
 
     {
         let session = File::open_rw(&path).unwrap();
-        session.root().create_group("g").unwrap();
+        session.root().create_group("g", |_| {}).unwrap();
         session
             .root()
             .create_dataset("g/a", |b| {
@@ -264,8 +267,8 @@ fn add_into_two_sibling_groups_one_commit() {
 
     {
         let session = File::open_rw(&path).unwrap();
-        session.root().create_group("x").unwrap();
-        session.root().create_group("y").unwrap();
+        session.root().create_group("x", |_| {}).unwrap();
+        session.root().create_group("y", |_| {}).unwrap();
         session
             .root()
             .create_dataset("x/d", |b| {
@@ -380,7 +383,7 @@ fn delete_nested_group_subtree() {
     write_starter(&path);
     {
         let session = File::open_rw(&path).unwrap();
-        session.root().create_group("grp").unwrap();
+        session.root().create_group("grp", |_| {}).unwrap();
         session
             .root()
             .create_dataset("grp/inner", |b| {
@@ -428,7 +431,7 @@ fn delete_one_of_nested_then_keep_group() {
     write_starter(&path);
     {
         let session = File::open_rw(&path).unwrap();
-        session.root().create_group("g").unwrap();
+        session.root().create_group("g", |_| {}).unwrap();
         session
             .root()
             .create_dataset("g/a", |b| {
@@ -503,7 +506,7 @@ fn delete_missing_or_overlapping_is_rejected() {
     // Delete /g while adding under it in the same commit → overlap rejected.
     {
         let session = File::open_rw(&path).unwrap();
-        session.root().create_group("g").unwrap();
+        session.root().create_group("g", |_| {}).unwrap();
         session.commit().unwrap();
     }
     let mid = std::fs::read(&path).unwrap();
@@ -556,8 +559,11 @@ fn copy_group_subtree() {
     write_starter(&path);
     {
         let session = File::open_rw(&path).unwrap();
-        session.root().create_group("template").unwrap();
-        session.root().create_group("template/inner").unwrap();
+        session.root().create_group("template", |_| {}).unwrap();
+        session
+            .root()
+            .create_group("template/inner", |_| {})
+            .unwrap();
         session
             .root()
             .create_dataset("template/a", |b| {
@@ -610,7 +616,7 @@ fn copy_into_subgroup() {
     b.write(&path).unwrap();
     {
         let session = File::open_rw(&path).unwrap();
-        session.root().create_group("dest").unwrap();
+        session.root().create_group("dest", |_| {}).unwrap();
         session.copy("payload", "dest/payload_copy").unwrap();
         session.commit().unwrap();
     }
@@ -636,7 +642,7 @@ fn copy_rejects_missing_source_and_cycle() {
     write_starter(&path);
     {
         let session = File::open_rw(&path).unwrap();
-        session.root().create_group("g").unwrap();
+        session.root().create_group("g", |_| {}).unwrap();
         session.commit().unwrap();
     }
     let before = std::fs::read(&path).unwrap();
@@ -698,7 +704,7 @@ fn create_group_with_attributes() {
         let session = File::open_rw(&path).unwrap();
         session
             .root()
-            .create_group_with("run", |g| {
+            .create_group("run", |g| {
                 g.set_attr("kind", AttrValue::AsciiString("trial".into()));
                 g.set_attr("count", AttrValue::I64(2));
             })
@@ -1279,7 +1285,7 @@ fn edit_preserves_multiple_root_datasets() {
 
     {
         let session = File::open_rw(&path).unwrap();
-        session.root().create_group("extra").unwrap();
+        session.root().create_group("extra", |_| {}).unwrap();
         session.commit().unwrap();
     }
 
@@ -1385,8 +1391,8 @@ fn copy_from_file_group_subtree() {
         // Build the nested source subtree (FileBuilder::create_dataset does not
         // split paths into groups, so create the hierarchy explicitly).
         let s = File::open_rw(&src_path).unwrap();
-        s.root().create_group("template").unwrap();
-        s.root().create_group("template/inner").unwrap();
+        s.root().create_group("template", |_| {}).unwrap();
+        s.root().create_group("template/inner", |_| {}).unwrap();
         s.root()
             .create_dataset("template/a", |b| {
                 b.with_i32_data(&[1, 2]);
@@ -1440,7 +1446,7 @@ fn copy_from_file_into_subgroup_created_same_session() {
     {
         let source = File::open(&src_path).unwrap();
         let session = File::open_rw(&dst_path).unwrap();
-        session.root().create_group("dest").unwrap();
+        session.root().create_group("dest", |_| {}).unwrap();
         session
             .copy_from(&source, "payload", "dest/payload_copy")
             .unwrap();
@@ -1859,7 +1865,7 @@ fn add_mixed_contiguous_and_chunked_in_group() {
     let wave: Vec<f64> = (0..512).map(|i| (i as f64 * 0.1).cos()).collect();
     {
         let session = File::open_rw(&path).unwrap();
-        session.root().create_group("run").unwrap();
+        session.root().create_group("run", |_| {}).unwrap();
         session
             .root()
             .create_dataset("run/scalarish", |b| {
@@ -3281,8 +3287,8 @@ fn add_reference_dataset_targeting_unprocessed_sibling_group_is_rejected_without
 
     {
         let session = File::open_rw(&path).unwrap();
-        session.root().create_group("a").unwrap();
-        session.root().create_group("b").unwrap();
+        session.root().create_group("a", |_| {}).unwrap();
+        session.root().create_group("b", |_| {}).unwrap();
         session
             .root()
             .create_dataset("a/refs", |b| {
@@ -3445,7 +3451,7 @@ fn add_reference_dataset_targeting_same_commit_delete_is_rejected_without_writin
 
     {
         let session = File::open_rw(&path).unwrap();
-        session.root().create_group("grp").unwrap();
+        session.root().create_group("grp", |_| {}).unwrap();
         session
             .root()
             .create_dataset("grp/inner", |b| {
@@ -3479,7 +3485,7 @@ fn add_reference_dataset_targeting_copy_destination_is_rejected_without_writing(
 
     {
         let session = File::open_rw(&path).unwrap();
-        session.root().create_group("grp").unwrap();
+        session.root().create_group("grp", |_| {}).unwrap();
         session
             .root()
             .create_dataset("grp/inner", |b| {
@@ -3513,7 +3519,7 @@ fn add_reference_dataset_targeting_write_overwrite_target_is_rejected_without_wr
 
     {
         let session = File::open_rw(&path).unwrap();
-        session.root().create_group("grp").unwrap();
+        session.root().create_group("grp", |_| {}).unwrap();
         session
             .root()
             .create_dataset("grp/inner", |b| {

@@ -72,7 +72,7 @@ fn synthetic_userblock_file_roundtrip() {
             .unwrap();
         // Create a new group and set a compact attribute on it, in one batch.
         s.root()
-            .create_group_with("newgrp", |g| {
+            .create_group("newgrp", |g| {
                 g.set_attr("tag", AttrValue::AsciiString("v104".into()));
             })
             .unwrap();

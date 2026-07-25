@@ -8,8 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- `Group::create_group_with` stages a new group *and* its attributes in one batch, which `set_attr` cannot do because it needs a group that already resolves ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)).
 - `Dataset::write_staged` overwrites a dataset through its full `DatasetBuilder`, the builder-level counterpart of `Dataset::write` for element kinds that are not `H5Element` ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)).
+
+### Changed
+
+- **Breaking:** `Group::create_group` now takes a builder closure, matching `create_dataset`, so a new group's attributes can be staged with its creation (`set_attr` cannot, since it needs a group that already resolves). Pass `|_| {}` for a plain empty group ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)).
 
 ### Removed
 

@@ -52,7 +52,7 @@ use hdf5_pure::{AttrValue, File};
 let file = File::open_rw("output.h5").unwrap();
 let root = file.root();
 
-root.create_group_with("run2", |g| {
+root.create_group("run2", |g| {
     g.set_attr("kind", AttrValue::AsciiString("trial".into()));
 })
 .unwrap();
@@ -73,8 +73,7 @@ After a successful `commit()`, the staged set is cleared and the open file can b
 | Method | Effect | HDF5 analog |
 | --- | --- | --- |
 | `File::open_rw(path)` | Open an existing file for reading and writing | — |
-| `Group::create_group(name)` | Stage a new empty group; its parent must exist or be created in the same batch | — |
-| `Group::create_group_with(name, build)` | Stage a new group *and* its attributes together, for a group that is not yet committed | — |
+| `Group::create_group(name, build)` | Stage a new group, configured through `build` (attributes, nested objects); pass `\|_\| {}` for a plain empty group | — |
 | `Group::create_dataset(name, build)` | Stage a new dataset, configured through a `DatasetBuilder` | — |
 | `Dataset::append_staged(build)` | Stage appending elements along axis 0 of an existing chunked, unlimited dataset, via an `AppendBuilder` | `H5Dset_extent` + write |
 | `Dataset::append(data)` | Append immediately and durably, no `commit` needed | `H5Dset_extent` + write |
@@ -95,7 +94,7 @@ root.create_dataset("run2/signal", |b| {
 .unwrap();
 ```
 
-`set_attr` needs a group that already resolves, so a group staged in this same batch is not reachable through it — use `create_group_with` to give a brand-new group its attributes in one step.
+`set_attr` needs a group that already resolves, so a group staged in this same batch is not reachable through it — pass those attributes to `create_group`'s closure instead.
 
 `set_attr` takes an `AttrValue`, fixed-size or variable-length (`AttrValue::VarLenAsciiArray`). `File::root()` names the root group. Attributes are stored compactly in the rebuilt group header; an edit that would exceed the compact-attribute limit, or a group using dense (fractal-heap) attribute storage, is refused before any file bytes change.
 

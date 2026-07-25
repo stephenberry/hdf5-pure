@@ -159,7 +159,7 @@ fn delete_subtree_reclaims_all_members() {
 
     {
         let s = File::open_rw(&path).unwrap();
-        s.root().create_group("grp").unwrap();
+        s.root().create_group("grp", |_| {}).unwrap();
         s.root()
             .create_dataset("grp/x", |b| {
                 b.with_f64_data(&vec![1.0; 256]);
@@ -555,7 +555,7 @@ fn deleting_subtree_with_chunked_members_reclaims() {
 
     {
         let s = File::open_rw(&path).unwrap();
-        s.root().create_group("grp").unwrap();
+        s.root().create_group("grp", |_| {}).unwrap();
         s.root()
             .create_dataset("grp/a", |b| {
                 b.with_f64_data(&vec![1.0; 4096]).with_chunks(&[512]);

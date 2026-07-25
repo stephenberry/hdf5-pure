@@ -75,7 +75,7 @@ fn create_group_and_delete_object() {
     create_i32(&path, &[1, 2, 3]);
     let file = File::open_rw(&path).unwrap();
 
-    file.root().create_group("newgrp").unwrap();
+    file.root().create_group("newgrp", |_| {}).unwrap();
     file.commit().unwrap();
     assert!(file.group("newgrp").is_ok());
 
@@ -99,7 +99,7 @@ fn writes_on_readonly_file_are_refused() {
     ));
     assert!(matches!(file.commit(), Err(Error::ReadOnly)));
     assert!(matches!(
-        file.root().create_group("g"),
+        file.root().create_group("g", |_| {}),
         Err(Error::ReadOnly)
     ));
 }
@@ -132,7 +132,7 @@ fn create_file_and_build_through_handles() {
             b.with_i32_data(&[1, 2, 3]).with_shape(&[3]);
         })
         .unwrap();
-    file.root().create_group("grp").unwrap();
+    file.root().create_group("grp", |_| {}).unwrap();
     file.commit().unwrap();
     assert_eq!(
         file.dataset("d").unwrap().read_i32().unwrap(),

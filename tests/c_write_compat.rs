@@ -96,7 +96,7 @@ fn c_library_writes_after_an_in_place_edit() {
     // `fresh_group_region`); both must carry a Group Info message.
     {
         let s = File::open_rw(&path).unwrap();
-        s.root().create_group("edited_grp").unwrap();
+        s.root().create_group("edited_grp", |_| {}).unwrap();
         s.commit().unwrap();
     }
 
