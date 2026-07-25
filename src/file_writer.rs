@@ -1056,17 +1056,14 @@ impl FileWriter {
                     .validate_geometry(&shape, db.maxshape.as_deref())
                     .map_err(FormatError::InvalidChunkGeometry)?;
             }
-            // Variable-length string element references live in the global heap,
-            // whose addresses are only known after all dataset data is laid
-            // out. For chunked/filtered/resizable storage the references sit
-            // inside compressed chunks written before those addresses exist, so
-            // the heap addresses cannot be patched in. Refuse rather than emit a
-            // dataset with dangling VL references.
-            if db.vl_string_staging.is_some()
-                && (db.chunk_options.is_chunked() || db.maxshape.is_some())
-            {
-                return Err(FormatError::ChunkedVlenStringUnsupported);
-            }
+            // Variable-length string element references live in the global heap.
+            // For chunked/filtered/resizable storage the references sit inside
+            // chunks that are split (and possibly compressed) before the rest of
+            // the file is laid out, so their heap addresses cannot be patched in
+            // afterwards. Such a dataset instead has its collections placed
+            // *ahead* of everything else, at a fixed address known before any
+            // chunk is encoded — see `place_early_element_gcol` in
+            // `finish_to_sink`. Nothing is refused here.
             let max_dimensions = db.maxshape.clone();
             let dspace = Dataspace {
                 space_type: if shape.is_empty() {
@@ -1286,6 +1283,38 @@ impl FileWriter {
             .map(|d| d.chunk_options.is_chunked() || d.maxshape.is_some() || d.raw_chunks.is_some())
             .collect();
 
+        // A chunked/filtered/resizable variable-length dataset's element
+        // references are split into chunks (and compressed) below, before the
+        // file layout that would normally fix its global-heap addresses. Placing
+        // those collections *first* — immediately after the superblock, at an
+        // address that depends on nothing but the userblock — makes the addresses
+        // known up front, so the references can be patched into `raw` before a
+        // single chunk is encoded. Everything else shifts down by the collections'
+        // total size, which is known here because staging serialized them
+        // already.
+        //
+        // Only a chunked dataset takes this path. A contiguous one keeps the
+        // established late placement (its element bytes stay patchable in place
+        // until emission), so a file without a chunked VL dataset is laid out
+        // byte-for-byte as before.
+        let mut early_gcol: Vec<usize> = Vec::new();
+        let early_gcol_size = {
+            let mut cursor = SUPERBLOCK_SIZE as u64;
+            for i in 0..all_ds.len() {
+                if !is_chunked[i] {
+                    continue;
+                }
+                let Some(staging) = all_ds[i].vl_string_staging.take() else {
+                    continue;
+                };
+                let addrs = place_collections(&staging.collections, &mut cursor);
+                patch_vl_refs_masked(&mut all_ds[i].raw, &staging.patch_mask, &addrs);
+                all_ds[i].vl_string_staging = Some(staging);
+                early_gcol.push(i);
+            }
+            (cursor - SUPERBLOCK_SIZE as u64).to_usize()?
+        };
+
         // Compress each encode-path chunked dataset exactly once, up front. The
         // object-header sizing pass and the data-emit pass both need the chunk
         // layout, but only the embedded addresses differ between them — the
@@ -1410,8 +1439,12 @@ impl FileWriter {
                       buffer offset; it fits usize on every supported target"
         )]
         let ub = self.userblock_size as usize;
-        let root_group_addr = SUPERBLOCK_SIZE as u64;
-        let mut cursor2 = SUPERBLOCK_SIZE + root_oh_size;
+        // Early-placed VL collections (if any) occupy the span immediately after
+        // the superblock, so the root object header — and everything after it —
+        // starts past them. `early_gcol_size` is 0 for a file without a chunked
+        // VL dataset, leaving every other file's addresses unchanged.
+        let root_group_addr = (SUPERBLOCK_SIZE + early_gcol_size) as u64;
+        let mut cursor2 = SUPERBLOCK_SIZE + early_gcol_size + root_oh_size;
 
         let root_dense_blob = if root_dense {
             let blob = build_dense_attrs(&root_attrs, cursor2 as u64);
@@ -1575,6 +1608,12 @@ impl FileWriter {
                     }
                 }
                 for (i, d) in all_ds.iter().enumerate() {
+                    // A chunked VL dataset's collections were placed and patched
+                    // before its chunks were encoded; only the contiguous ones
+                    // are still awaiting an address here.
+                    if early_gcol.contains(&i) {
+                        continue;
+                    }
                     if let Some(staging) = &d.vl_string_staging {
                         elem_gcol
                             .push((i, place_collections(&staging.collections, &mut gcol_cursor)));
@@ -1897,6 +1936,16 @@ impl FileWriter {
             };
             sink.put(&sb.serialize())?;
 
+            // Early-placed VL collections, at the addresses patched into the
+            // chunked datasets' references before their chunks were encoded.
+            for &i in &early_gcol {
+                let staging = all_ds[i]
+                    .vl_string_staging
+                    .as_ref()
+                    .expect("early_gcol only holds datasets with VL staging");
+                emit_collections(sink, &staging.collections)?;
+            }
+
             // Root group OH + dense blob.
             let root_links: Vec<LinkMessage> = {
                 let mut v = Vec::new();
@@ -1956,7 +2005,10 @@ impl FileWriter {
                     emit_collections(sink, &patch.collections)?;
                 }
             }
-            for d in &all_ds {
+            for (i, d) in all_ds.iter().enumerate() {
+                if early_gcol.contains(&i) {
+                    continue; // emitted right after the superblock
+                }
                 if let Some(staging) = &d.vl_string_staging {
                     emit_collections(sink, &staging.collections)?;
                 }
@@ -2061,16 +2113,21 @@ impl FileWriter {
             // from `d.raw`); chunked/filtered/resizable VL datasets were refused
             // in `flatten_dataset`, so every staged dataset is here non-chunked.
             for (i, d) in all_ds.iter().enumerate() {
+                // A chunked VL dataset was placed and patched before its chunks
+                // were encoded; its references are already final.
+                if early_gcol.contains(&i) {
+                    continue;
+                }
                 if let Some(staging) = &d.vl_string_staging {
-                    // A staged VL-string dataset is always non-chunked (chunked
-                    // VL is refused in `flatten_dataset`), so its element bytes
-                    // are in memory and patchable in place. A streamed (lazy)
-                    // dataset never carries VL staging, so this is unreachable for
-                    // it — assert that rather than risk silently corrupting one.
+                    // Every dataset still awaiting an address here is contiguous
+                    // or compact, so its element bytes are in memory and
+                    // patchable in place. A streamed (lazy) dataset never carries
+                    // VL staging, so this is unreachable for it — assert that
+                    // rather than risk silently corrupting one.
                     let DsData::InMemory(ref mut bytes) = ds_layouts[i].data else {
                         unreachable!(
-                            "VL-string staging is refused on chunked datasets, so a staged \
-                             VL dataset's data is always in memory"
+                            "a chunked VL-string dataset is patched before encoding, so a \
+                             dataset patched here always has its data in memory"
                         );
                     };
                     let addrs = place_collections(&staging.collections, &mut gcol_cursor);
@@ -2157,6 +2214,16 @@ impl FileWriter {
         };
         sink.put(&sb.serialize())?;
 
+        // Early-placed VL collections, at the addresses patched into the chunked
+        // datasets' references before their chunks were encoded.
+        for &i in &early_gcol {
+            let staging = all_ds[i]
+                .vl_string_staging
+                .as_ref()
+                .expect("early_gcol only holds datasets with VL staging");
+            emit_collections(sink, &staging.collections)?;
+        }
+
         // Root group OH
         let root_links: Vec<LinkMessage> = {
             let mut v = Vec::new();
@@ -2228,7 +2295,10 @@ impl FileWriter {
         }
         // Dataset-element VL string collections, in the same order their
         // addresses were assigned above.
-        for d in &all_ds {
+        for (i, d) in all_ds.iter().enumerate() {
+            if early_gcol.contains(&i) {
+                continue; // emitted right after the superblock
+            }
             if let Some(staging) = &d.vl_string_staging {
                 emit_collections(sink, &staging.collections)?;
             }
@@ -2867,16 +2937,108 @@ mod tests {
         }
     }
 
+    /// A chunked VL-string dataset has its heap collections placed ahead of the
+    /// object headers, so the references inside its chunks carry real addresses
+    /// (issue #109). Reading the elements back is the check that the addresses
+    /// patched before chunk encoding are the ones the collections landed at.
     #[test]
-    fn chunked_vlen_string_dataset_refused() {
+    fn chunked_vlen_string_dataset_roundtrips() {
         let mut fw = FileWriter::new();
         fw.create_dataset("chunked")
-            .with_vlen_strings(&["a", "b", "c", "d"])
+            .with_vlen_strings(&["a", "bb", "ccc", "dddd"])
             .with_chunks(&[2]);
-        let err = fw.finish().unwrap_err();
-        assert!(
-            matches!(err, FormatError::ChunkedVlenStringUnsupported),
-            "expected ChunkedVlenStringUnsupported, got {err:?}"
+        let bytes = fw.finish().unwrap();
+        let f = crate::reader::File::from_bytes(bytes).unwrap();
+        let ds = f.dataset("chunked").unwrap();
+        assert_eq!(ds.read_string().unwrap(), ["a", "bb", "ccc", "dddd"]);
+    }
+
+    /// The compressed case: the filter runs over element bytes whose heap
+    /// addresses are already final, which is the whole reason the collections are
+    /// placed first. A stale placeholder address would survive compression and
+    /// read back as a dangling reference.
+    #[test]
+    #[cfg(feature = "deflate")]
+    fn filtered_chunked_vlen_string_dataset_roundtrips() {
+        let mut fw = FileWriter::new();
+        fw.create_dataset("filtered")
+            .with_vlen_strings(&["alpha", "beta", "gamma", "delta"])
+            .with_chunks(&[2])
+            .with_deflate(6);
+        let bytes = fw.finish().unwrap();
+        let f = crate::reader::File::from_bytes(bytes).unwrap();
+        let ds = f.dataset("filtered").unwrap();
+        assert_eq!(
+            ds.read_string().unwrap(),
+            ["alpha", "beta", "gamma", "delta"]
+        );
+    }
+
+    /// A resizable (unlimited) VL-string dataset takes the same path — `maxshape`
+    /// alone makes a dataset chunked.
+    #[test]
+    fn resizable_vlen_string_dataset_roundtrips() {
+        let mut fw = FileWriter::new();
+        fw.create_dataset("growable")
+            .with_vlen_strings(&["one", "two", "three"])
+            .with_shape(&[3])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[2]);
+        let bytes = fw.finish().unwrap();
+        let f = crate::reader::File::from_bytes(bytes).unwrap();
+        let ds = f.dataset("growable").unwrap();
+        assert_eq!(ds.read_string().unwrap(), ["one", "two", "three"]);
+    }
+
+    /// Null elements keep an undefined address through the early patch, exactly as
+    /// they do on the contiguous path: the mask selects which references move.
+    #[test]
+    fn chunked_vlen_string_dataset_preserves_nulls() {
+        use crate::type_builders::VlStringElement;
+        use crate::vl_data::VlByteObject;
+
+        let dt = crate::type_builders::make_vlen_string_type(CharacterSet::Utf8);
+        let elements = vec![
+            VlStringElement::Bytes(b"set".to_vec()),
+            VlStringElement::Null,
+            VlStringElement::Bytes(Vec::new()), // empty string, not null
+            VlStringElement::Bytes(b"tail".to_vec()),
+        ];
+        let mut fw = FileWriter::new();
+        fw.create_dataset("mixed")
+            .with_vlen_string_elements(dt, &elements)
+            .unwrap()
+            .with_chunks(&[2]);
+        let bytes = fw.finish().unwrap();
+        assert_eq!(
+            read_vl_bytes(bytes, "mixed"),
+            vec![
+                VlByteObject::Bytes(b"set".to_vec()),
+                VlByteObject::Null,
+                VlByteObject::Bytes(Vec::new()),
+                VlByteObject::Bytes(b"tail".to_vec()),
+            ]
+        );
+    }
+
+    /// A file with only *contiguous* VL datasets must keep the established layout
+    /// (collections after the data, nothing placed early), so adding the chunked
+    /// capability cannot perturb the bytes of files that do not use it.
+    #[test]
+    fn contiguous_vlen_layout_is_unchanged_by_the_early_path() {
+        let build = || {
+            let mut fw = FileWriter::new();
+            fw.create_dataset("plain")
+                .with_vlen_strings(&["a", "bb", "ccc"]);
+            fw.finish().unwrap()
+        };
+        // The root group object header sits immediately after the superblock when
+        // nothing is placed early.
+        let bytes = build();
+        assert_eq!(
+            &bytes[SUPERBLOCK_SIZE..SUPERBLOCK_SIZE + 4],
+            b"OHDR",
+            "a contiguous-only VL file must still open with the root OH at SUPERBLOCK_SIZE"
         );
     }
 

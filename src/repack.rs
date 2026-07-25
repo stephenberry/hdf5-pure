@@ -25,12 +25,14 @@
 //!   even filters this crate cannot itself apply. The destination always uses a
 //!   v4 chunk index (single-chunk / fixed-array / extensible-array) regardless
 //!   of the source index type.
-//! - Contiguous/compact **variable-length** datasets (1D and ND): string-shaped
-//!   (`is_string: true` and the MATLAB VLEN-of-1-byte-ASCII-string shape) and
-//!   non-string sequences over any base type that embeds no addresses. Each
-//!   element's exact heap bytes are read and re-staged through a fresh global
-//!   heap, preserving charset, padding, the null-vs-empty distinction, embedded
-//!   NULs, and non-UTF-8 payloads.
+//! - **Variable-length** datasets (1D and ND, contiguous/compact as well as
+//!   chunked, filtered, or resizable): string-shaped (`is_string: true` and the
+//!   MATLAB VLEN-of-1-byte-ASCII-string shape) and non-string sequences over any
+//!   base type that embeds no addresses. Each element's exact heap bytes are read
+//!   and re-staged through a fresh global heap, preserving charset, padding, the
+//!   null-vs-empty distinction, embedded NULs, and non-UTF-8 payloads, and the
+//!   source's chunk geometry, filters, and resizability are carried onto the
+//!   rebuilt dataset.
 //! - Contiguous/compact **object-reference** datasets: each stored address is
 //!   rewritten to its target object's new location in the compacted file (null
 //!   and undefined references are carried verbatim).
@@ -50,9 +52,9 @@
 //! refused.
 //!
 //! Refused (named, never dropped silently): chunked, filtered, or resizable
-//! variable-length (string or sequence) and object-reference datasets (their
-//! element references live inside compressed chunks written before the global
-//! heap addresses are known, so they cannot be patched in); region references and
+//! object-reference datasets (their element addresses are resolved as elements
+//! are re-staged, which a compressed chunk would need rewritten in place);
+//! region references and
 //! non-8-byte object references; an object reference to a dropped object or to a
 //! target outside the hard-link hierarchy (a dangling, named-datatype, or region
 //! target), and object references in a userblock file (non-zero base address); a
@@ -330,7 +332,7 @@ fn emit_dataset(
     // each element's exact heap bytes and re-staging them, not by copying raw
     // element bytes (whose stored heap addresses would go stale on rewrite).
     if is_vlen_string_datatype(&datatype) {
-        emit_vlen_string_dataset(db, ds, path, &datatype, &dims, &layout)?;
+        emit_vlen_string_dataset(db, ds, path, &datatype, &dims, &layout, &pipeline)?;
         // VL-string datasets carry attributes the same way as any other.
         let attrs = ds.attrs()?;
         check_attr_completeness(&attrs, &ds.attr_names()?, &format!("dataset {path}"))?;
@@ -346,7 +348,7 @@ fn emit_dataset(
     // rebuilt rather than copied stale. Routed here before the verbatim chunk-copy
     // path so a chunked one is refused (not copied with stale references).
     if is_nonstring_vlen(&datatype) {
-        emit_vlen_sequence_dataset(db, ds, path, &datatype, &dims, &layout)?;
+        emit_vlen_sequence_dataset(db, ds, path, &datatype, &dims, &layout, &pipeline)?;
         let attrs = ds.attrs()?;
         check_attr_completeness(&attrs, &ds.attr_names()?, &format!("dataset {path}"))?;
         for (name, value) in sorted(attrs) {
@@ -453,9 +455,42 @@ fn emit_dataset(
             .with_shape(&dims);
     }
 
+    carry_shape_and_pipeline(
+        db,
+        &dims,
+        dataspace.max_dimensions.as_deref(),
+        &layout,
+        &pipeline,
+    );
+
+    // Carry the dataset's attributes, refusing if any cannot be represented.
+    let attrs = ds.attrs()?;
+    check_attr_completeness(&attrs, &ds.attr_names()?, &format!("dataset {path}"))?;
+    for (name, value) in sorted(attrs) {
+        db.set_attr(&name, value);
+    }
+
+    Ok(())
+}
+
+/// Carry the source dataset's resizability, chunk geometry, and filter pipeline
+/// onto the rebuilt dataset, so a repack reproduces the layout it read rather
+/// than flattening it. Shared by the fixed-size re-encode path and the
+/// variable-length re-staging paths, which both rebuild their elements from
+/// scratch and so must reapply the layout themselves.
+///
+/// `check_pipeline` has already rejected any filter not handled here, so the
+/// match over filter ids is exhaustive.
+fn carry_shape_and_pipeline(
+    db: &mut DatasetBuilder,
+    dims: &[u64],
+    max_dimensions: Option<&[u64]>,
+    layout: &DataLayout,
+    pipeline: &Option<FilterPipeline>,
+) {
     // A max-shape that differs from the current shape means a resizable dataset.
-    if let Some(maxshape) = &dataspace.max_dimensions
-        && maxshape != &dims
+    if let Some(maxshape) = max_dimensions
+        && maxshape != dims
     {
         db.with_maxshape(maxshape);
     }
@@ -464,7 +499,7 @@ fn emit_dataset(
     // dimension, so keep only the first `rank` entries; v4 already stores `rank`.
     if let DataLayout::Chunked {
         chunk_dimensions, ..
-    } = &layout
+    } = layout
     {
         let rank = dims.len();
         let logical: Vec<u64> = chunk_dimensions
@@ -475,9 +510,8 @@ fn emit_dataset(
         db.with_chunks(&logical);
     }
 
-    // Re-apply supported filters in their stored order. `check_pipeline` has
-    // already rejected anything not in this set, so the match is exhaustive.
-    if let Some(p) = &pipeline {
+    // Re-apply supported filters in their stored order.
+    if let Some(p) = pipeline {
         for f in &p.filters {
             match f.filter_id {
                 FILTER_SHUFFLE => {
@@ -506,24 +540,17 @@ fn emit_dataset(
             }
         }
     }
-
-    // Carry the dataset's attributes, refusing if any cannot be represented.
-    let attrs = ds.attrs()?;
-    check_attr_completeness(&attrs, &ds.attr_names()?, &format!("dataset {path}"))?;
-    for (name, value) in sorted(attrs) {
-        db.set_attr(&name, value);
-    }
-
-    Ok(())
 }
 
 /// Re-emit a variable-length string dataset faithfully: read each element's
 /// exact heap bytes (preserving null-vs-empty, charset, padding, and the source
-/// VL datatype shape) and re-stage them through the writer's VL-string path.
+/// VL datatype shape) and re-stage them through the writer's VL-string path,
+/// then reapply the source's chunk geometry, filters, and resizability.
 ///
-/// Chunked/filtered/resizable VL-string layouts are refused by name: their
-/// element references live inside compressed chunks written before the global
-/// heap addresses are known, so they cannot be patched in.
+/// The rebuilt references carry the *new* file's heap addresses. For a chunked
+/// or filtered layout the writer places those collections ahead of the chunk
+/// data so the addresses are known before encoding (issue #109), which is what
+/// makes this path reproduce such a dataset rather than refuse it.
 fn emit_vlen_string_dataset(
     db: &mut DatasetBuilder,
     ds: &Dataset,
@@ -531,21 +558,11 @@ fn emit_vlen_string_dataset(
     datatype: &Datatype,
     dims: &[u64],
     layout: &DataLayout,
+    pipeline: &Option<FilterPipeline>,
 ) -> Result<(), Error> {
-    if matches!(layout, DataLayout::Chunked { .. }) {
-        return Err(Error::RepackUnsupported(format!(
-            "dataset {path}: chunked or filtered variable-length string datasets cannot be \
-             repacked (their element references live inside compressed chunks before the global \
-             heap addresses are known)"
-        )));
-    }
-    if let Some(maxshape) = &ds.dataspace()?.max_dimensions
-        && maxshape != dims
-    {
-        return Err(Error::RepackUnsupported(format!(
-            "dataset {path}: resizable variable-length string datasets cannot be repacked"
-        )));
-    }
+    // A lossy pipeline cannot be reproduced, so refuse it before reading — the
+    // same guard the fixed-size re-encode path applies.
+    check_pipeline(pipeline.as_ref(), path)?;
 
     // Read each element's exact heap bytes, preserving the null-vs-empty
     // distinction. Reading bytes (not the lossily UTF-8-decoded `String`) keeps
@@ -565,6 +582,13 @@ fn emit_vlen_string_dataset(
     db.with_vlen_string_elements(datatype.clone(), &elements)
         .map_err(Error::Format)?;
     db.with_shape(dims);
+    carry_shape_and_pipeline(
+        db,
+        dims,
+        ds.dataspace()?.max_dimensions.as_deref(),
+        layout,
+        pipeline,
+    );
     Ok(())
 }
 
@@ -572,9 +596,10 @@ fn emit_vlen_string_dataset(
 /// element's exact heap bytes and re-stage them through a fresh global heap, so
 /// the rewritten file's heap addresses are rebuilt rather than copied stale.
 ///
-/// Chunked/filtered/resizable layouts are refused by name for the same reason as
-/// VL strings: the element references live inside compressed chunks written
-/// before the global heap addresses are known.
+/// A chunked, filtered, or resizable layout is reproduced rather than refused:
+/// sequences stage through the same global-heap path as VL strings, so they
+/// inherit the early collection placement that makes the heap addresses known
+/// before the chunks are encoded (issue #109).
 fn emit_vlen_sequence_dataset(
     db: &mut DatasetBuilder,
     ds: &Dataset,
@@ -582,21 +607,9 @@ fn emit_vlen_sequence_dataset(
     datatype: &Datatype,
     dims: &[u64],
     layout: &DataLayout,
+    pipeline: &Option<FilterPipeline>,
 ) -> Result<(), Error> {
-    if matches!(layout, DataLayout::Chunked { .. }) {
-        return Err(Error::RepackUnsupported(format!(
-            "dataset {path}: chunked or filtered non-string variable-length datasets cannot be \
-             repacked (their element references live inside compressed chunks before the global \
-             heap addresses are known)"
-        )));
-    }
-    if let Some(maxshape) = &ds.dataspace()?.max_dimensions
-        && maxshape != dims
-    {
-        return Err(Error::RepackUnsupported(format!(
-            "dataset {path}: resizable non-string variable-length datasets cannot be repacked"
-        )));
-    }
+    check_pipeline(pipeline.as_ref(), path)?;
 
     // Read each element's exact heap bytes (preserving the null-vs-empty
     // distinction and any embedded NULs), then re-stage with the source datatype.
@@ -612,6 +625,13 @@ fn emit_vlen_sequence_dataset(
     db.with_vlen_sequence_elements(datatype.clone(), &elements)
         .map_err(Error::Format)?;
     db.with_shape(dims);
+    carry_shape_and_pipeline(
+        db,
+        dims,
+        ds.dataspace()?.max_dimensions.as_deref(),
+        layout,
+        pipeline,
+    );
     Ok(())
 }
 

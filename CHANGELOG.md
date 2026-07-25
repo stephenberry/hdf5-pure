@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Chunked, filtered, and resizable variable-length datasets now write: `DatasetBuilder::with_vlen_strings` accepts `with_chunks`, `with_deflate`, and `with_maxshape`, and `repack` reproduces such a dataset with its chunk geometry, filters, and unlimited dimension intact. Adding one to an existing file through the in-place edit engine is still refused ([#109](https://github.com/stephenberry/hdf5-pure/issues/109)).
+
+### Removed
+
+- **Breaking:** `FormatError::ChunkedVlenStringUnsupported` is gone, as nothing refuses those datasets any more ([#109](https://github.com/stephenberry/hdf5-pure/issues/109)).
+
 ## [0.24.0] - 2026-07-24
 
 Variable-length writes lose their 65,535-element cap: `DatasetBuilder::with_vlen_strings` and `repack` now split across as many global heap collections as they need, and resolving an element is no longer quadratic ([#189](https://github.com/stephenberry/hdf5-pure/issues/189)). Attributes too large for compact or dense storage are now refused by name instead of silently dropped or written unreadable ([#190](https://github.com/stephenberry/hdf5-pure/issues/190), [#191](https://github.com/stephenberry/hdf5-pure/issues/191)). Reads gain bounds: a chunked dataset declaring an impossible per-chunk size is refused rather than allocated, with the new `Dataset::element_size` to size a read up front ([#185](https://github.com/stephenberry/hdf5-pure/issues/185)), and row windows of inner-chunked and variable-length string datasets stream instead of falling back to a whole read ([#183](https://github.com/stephenberry/hdf5-pure/pull/183), [#186](https://github.com/stephenberry/hdf5-pure/pull/186)). Additive minor bump.

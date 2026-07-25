@@ -90,7 +90,7 @@ Refused today with a `... yet` message, intended to land. Each row links to its 
 
 | Capability | Tracking |
 |---|---|
-| Repack of **region references**, non-8-byte object references, chunked/filtered/resizable variable-length & reference datasets, and unrecognized filter pipelines (time, contiguous non-string-vlen sequences, and 8-byte object references now repack faithfully) | [#107](https://github.com/stephenberry/hdf5-pure/issues/107) |
+| Repack of **region references**, non-8-byte object references, chunked/filtered/resizable **reference** datasets, and unrecognized filter pipelines (time, variable-length sequences, and 8-byte object references now repack faithfully; chunked, filtered, and resizable variable-length datasets repack as of [#109](https://github.com/stephenberry/hdf5-pure/issues/109)) | [#107](https://github.com/stephenberry/hdf5-pure/issues/107) |
 
 ### Reading
 
@@ -103,9 +103,7 @@ Virtual datasets are also refused by `repack` (it cannot relocate data living ou
 
 ### Writing
 
-| Capability | Tracking |
-|---|---|
-| **Chunked / filtered / resizable variable-length-string** datasets | [#109](https://github.com/stephenberry/hdf5-pure/issues/109) |
+Nothing on the write path is currently tracked as an outright refusal; the entries that were here (chunked, filtered, and resizable variable-length datasets) now write ([#109](https://github.com/stephenberry/hdf5-pure/issues/109)). Adding such a dataset to an *existing* file through the in-place edit engine is still refused — the engine appends into a fixed layout, with nowhere to place the heap collections ahead of the chunks.
 
 ### SWMR
 

@@ -73,7 +73,7 @@ These are reported as `Error::RepackUnsupported` naming the object, never silent
 
 | Refused | Reason |
 | --- | --- |
-| chunked, filtered, or resizable variable-length or object-reference datasets | their heap and object addresses are assigned as elements are re-staged, which a compressed chunk would need rewritten in place |
+| chunked, filtered, or resizable **object-reference** datasets | their object addresses are assigned as elements are re-staged, which a compressed chunk would need rewritten in place |
 | variable-length sequences whose base type is itself variable-length, or a reference | the copied element bytes would carry addresses that go stale on rewrite |
 | region references, and object references other than 8 bytes wide | their stored selections and addresses are not rewritten yet |
 | object references in a file with a userblock, or to an object being dropped | the new target address cannot be resolved safely, or will not exist |
