@@ -342,6 +342,43 @@ pub enum FormatError {
         /// The message's serialized size in bytes.
         size: usize,
     },
+    /// An attribute is too large to store in dense (fractal-heap) attribute
+    /// storage: past this size the format wants a fractal-heap *huge* object,
+    /// which this writer does not emit, so storing it as a managed object would
+    /// produce a heap the reference C library rejects. Refused rather than
+    /// written. The fields carry the attribute name, its serialized size, and
+    /// the limit, all in bytes.
+    ///
+    /// Dense storage is chosen by attribute count, so the same attribute may
+    /// instead be refused as [`FormatError::AttributeMessageTooLarge`] when it
+    /// sits on an object with few enough attributes to be stored compactly.
+    DenseAttributeTooLarge {
+        /// The attribute's name.
+        name: String,
+        /// The attribute's serialized size in bytes.
+        size: usize,
+        /// The largest attribute dense storage can hold, in bytes.
+        limit: usize,
+    },
+    /// An object carries more attributes than dense (fractal-heap) storage can
+    /// index. The single B-tree v2 leaf this writer emits has a record capacity
+    /// that follows its declared node size, and past this count the reference C
+    /// library cannot describe that capacity in the bytes it allots for it.
+    TooManyDenseAttributes {
+        /// The number of attributes requested.
+        count: usize,
+        /// The largest number that can be indexed.
+        limit: usize,
+    },
+    /// An object's attributes need a larger fractal-heap direct block than the
+    /// format's own limit for one, so the heap could not be read back reliably.
+    /// Reaching this takes gigabytes of attributes on a single object.
+    DenseAttributeHeapTooLarge {
+        /// The direct block size the attribute set would need, in bytes.
+        block_size: u64,
+        /// The largest direct block size, in bytes.
+        limit: u64,
+    },
 }
 
 /// The largest message a version 2 object header can describe: its per-message
@@ -697,6 +734,27 @@ impl fmt::Display for FormatError {
                     "object header message {message_type:#06x} is {size} bytes, past the \
                      {OBJECT_HEADER_MESSAGE_MAX}-byte limit of the object header's \
                      message size field"
+                )
+            }
+            FormatError::DenseAttributeTooLarge { name, size, limit } => {
+                write!(
+                    f,
+                    "attribute {name:?} serializes to {size} bytes, past the {limit}-byte limit \
+                     for dense (fractal-heap) attribute storage"
+                )
+            }
+            FormatError::TooManyDenseAttributes { count, limit } => {
+                write!(
+                    f,
+                    "{count} attributes exceed the {limit} that dense (fractal-heap) storage \
+                     can index"
+                )
+            }
+            FormatError::DenseAttributeHeapTooLarge { block_size, limit } => {
+                write!(
+                    f,
+                    "these attributes need a {block_size}-byte fractal-heap direct block, past \
+                     the {limit}-byte maximum"
                 )
             }
         }

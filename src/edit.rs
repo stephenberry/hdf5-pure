@@ -3398,8 +3398,9 @@ impl WriteEngine {
     /// only the contiguous data address and child link targets repointed).
     /// Dense (fractal-heap) attribute storage is read out of the source heap into
     /// a parsed attribute set carried on the model (`dense_attrs`) and re-emitted
-    /// into a fresh heap on write, provided it fits the single-direct-block layout
-    /// the emitter can build; an oversized set is refused. Rejects multi-chunk
+    /// into a fresh heap on write, provided every attribute fits what that heap can
+    /// hold as a managed object (see `file_writer::dense_attrs_check`); an
+    /// attribute past that is refused by name. Rejects multi-chunk
     /// headers, dense or soft/external links, chunked/old-version data layouts, and
     /// headers that are neither a dataset nor a group.
     fn read_object(d: &[u8], addr: usize, base: u64) -> Result<ObjModel, Error> {
@@ -3461,11 +3462,9 @@ impl WriteEngine {
                     "a source object's dense (fractal-heap) attributes could not be read for copying",
                 )
             })?;
-            if !crate::file_writer::dense_attrs_fit(&attrs) {
-                return Err(Error::EditUnsupported(
-                    "an object's dense (fractal-heap) attribute set is too large to reproduce (would need fractal-heap indirect blocks)",
-                ));
-            }
+            // The typed error names the offending attribute, which the previous
+            // blanket `EditUnsupported` message could not.
+            crate::file_writer::dense_attrs_check(&attrs).map_err(Error::Format)?;
             attrs
         } else {
             Vec::new()
@@ -3976,7 +3975,7 @@ impl WriteEngine {
     /// region), and the caller must append it before any later append in the same
     /// node so `base == end-of-file` still holds. The freshly built heap is
     /// always same-file, so it never aliases the source heap even for an in-file
-    /// copy. The caller has already validated [`file_writer::dense_attrs_fit`].
+    /// copy. The caller has already validated [`file_writer::dense_attrs_check`].
     fn append_dense_attrs(
         &mut self,
         region: &mut Vec<u8>,

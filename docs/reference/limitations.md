@@ -54,10 +54,19 @@ A version 2 object header describes each message's length in a 2-byte field, so 
 - A **compact attribute** past the limit is refused with `FormatError::AttributeMessageTooLarge`, naming the attribute. The limit is on the *message* — name, datatype, dataspace, and data — not on the element count. Root, group, and dataset attributes are all checked, on the writer's own path and through `repack`. Attributes are metadata; store a payload that large as a dataset instead.
 - Any **other** oversized message — most reachably a Link message from a very long dataset or group name — is refused with `FormatError::ObjectHeaderMessageTooLarge`, carrying the message type.
 
-!!! warning "Not covered: attributes on an object that uses dense storage"
-    An object with more than eight attributes stores them in a fractal heap instead of the header, where this limit does not apply — and that emitter has an unchecked size gap of its own ([#191](https://github.com/stephenberry/hdf5-pure/issues/191)), so an oversized attribute there is still mis-encoded rather than refused. Until #191 lands, whether an oversized attribute is refused or silently lost depends on how many *other* attributes its object carries.
+An object with more than eight attributes stores them in a fractal heap instead of the header, so this particular limit does not apply to it — the [dense attribute limits](#dense-attribute-storage) below do instead. Either way an oversized attribute is refused, never written.
 
 The [in-place editor](../guide/editing.md) enforces the same limit separately, reporting `Error::EditUnsupported`.
+
+### Dense attribute storage
+
+An object with more than eight attributes stores them in a fractal heap. The writer emits a single root direct block indexed by a single-leaf B-tree, with every attribute stored as a heap *managed* object, and refuses what that layout cannot represent:
+
+- An attribute serializing past **65,514 bytes** is refused with `FormatError::DenseAttributeTooLarge`, naming the attribute. Past that size the format wants a fractal-heap *huge* object, which this writer does not emit; storing it as a managed object produces a heap the reference C library rejects (an assertion-enabled build aborts on it). Supporting huge objects is tracked separately.
+- More than **61,680 attributes** on one object is refused with `FormatError::TooManyDenseAttributes`. The limit is not the 65,535 the B-tree v2 leaf's 2-byte entry-count field suggests: the reference C library derives the width it needs from the leaf's record *capacity*, which follows the declared node size, and that size is rounded up to a power of two — so one attribute past this point pushes the implied capacity into a 3-byte width and aborts an assertion-enabled build.
+- Gigabytes of attributes on one object are refused with `FormatError::DenseAttributeHeapTooLarge`, which needs a direct block past the format's 2 GiB maximum for one.
+
+The *total* is otherwise not limited — the root direct block is sized to the content, so multi-megabyte heaps of individually small attributes are written normally. Note that block is padded up to a power of two, so a large dense attribute set can occupy up to roughly twice its own size on disk.
 
 ### Group creation property list (GCPL)
 
