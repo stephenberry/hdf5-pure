@@ -63,9 +63,10 @@ The [in-place editor](../guide/editing.md) enforces the same limit separately, r
 An object with more than eight attributes stores them in a fractal heap. The writer emits a single root direct block indexed by a single-leaf B-tree, with every attribute stored as a heap *managed* object, and refuses what that layout cannot represent:
 
 - An attribute serializing past **65,514 bytes** is refused with `FormatError::DenseAttributeTooLarge`, naming the attribute. Past that size the format wants a fractal-heap *huge* object, which this writer does not emit; storing it as a managed object produces a heap the reference C library rejects (an assertion-enabled build aborts on it). Supporting huge objects is tracked separately.
-- More than **65,535 attributes** on one object is refused with `FormatError::TooManyAttributes`: the single B-tree v2 leaf records its entry count in a 2-byte field.
+- More than **61,680 attributes** on one object is refused with `FormatError::TooManyDenseAttributes`. The limit is not the 65,535 the B-tree v2 leaf's 2-byte entry-count field suggests: the reference C library derives the width it needs from the leaf's record *capacity*, which follows the declared node size, and that size is rounded up to a power of two — so one attribute past this point pushes the implied capacity into a 3-byte width and aborts an assertion-enabled build.
+- Gigabytes of attributes on one object are refused with `FormatError::DenseAttributeHeapTooLarge`, which needs a direct block past the format's 2 GiB maximum for one.
 
-The *total* is not limited — the root direct block is sized to the content, so multi-megabyte heaps of individually small attributes are written normally.
+The *total* is otherwise not limited — the root direct block is sized to the content, so multi-megabyte heaps of individually small attributes are written normally. Note that block is padded up to a power of two, so a large dense attribute set can occupy up to roughly twice its own size on disk.
 
 ### Group creation property list (GCPL)
 

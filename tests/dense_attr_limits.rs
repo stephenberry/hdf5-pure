@@ -105,6 +105,37 @@ fn a_multi_megabyte_set_of_small_attributes_is_written() {
     assert_eq!(file.root().attrs().unwrap().len(), 40);
 }
 
+/// The attribute *count* has its own bound, and it is not the 65,535 the B-tree
+/// leaf's 2-byte record-count field suggests: the reference C library derives the
+/// width it needs from the leaf's capacity, which follows the power-of-two node
+/// size this writer declares, so the real limit is 61,680. One more silently
+/// produced a file that aborted libhdf5 — the same failure this issue is about.
+#[test]
+fn the_attribute_count_boundary_is_enforced() {
+    let build = |n: usize| {
+        let mut builder = FileBuilder::new();
+        for i in 0..n {
+            builder.set_attr(&format!("a{i:06}"), AttrValue::I64(i as i64));
+        }
+        builder.create_dataset("x").with_f64_data(&[1.0]);
+        builder
+    };
+
+    let bytes = build(61_680)
+        .finish()
+        .expect("the limit itself is writable");
+    let file = File::from_bytes(bytes).unwrap();
+    assert_eq!(file.root().attrs().unwrap().len(), 61_680);
+
+    match build(61_681).finish().unwrap_err() {
+        Error::Format(FormatError::TooManyDenseAttributes { count, limit }) => {
+            assert_eq!(count, 61_681);
+            assert_eq!(limit, 61_680);
+        }
+        other => panic!("expected TooManyDenseAttributes, got {other:?}"),
+    }
+}
+
 /// Dense storage applies to group and dataset attributes too, and both are
 /// checked.
 #[test]

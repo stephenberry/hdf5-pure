@@ -361,13 +361,23 @@ pub enum FormatError {
         limit: usize,
     },
     /// An object carries more attributes than dense (fractal-heap) storage can
-    /// index: the single B-tree v2 leaf this writer emits records its entry count
-    /// in a 2-byte field, and a deeper B-tree is not emitted.
-    TooManyAttributes {
+    /// index. The single B-tree v2 leaf this writer emits has a record capacity
+    /// that follows its declared node size, and past this count the reference C
+    /// library cannot describe that capacity in the bytes it allots for it.
+    TooManyDenseAttributes {
         /// The number of attributes requested.
         count: usize,
         /// The largest number that can be indexed.
         limit: usize,
+    },
+    /// An object's attributes need a larger fractal-heap direct block than the
+    /// format's own limit for one, so the heap could not be read back reliably.
+    /// Reaching this takes gigabytes of attributes on a single object.
+    DenseAttributeHeapTooLarge {
+        /// The direct block size the attribute set would need, in bytes.
+        block_size: u64,
+        /// The largest direct block size, in bytes.
+        limit: u64,
     },
 }
 
@@ -733,11 +743,18 @@ impl fmt::Display for FormatError {
                      for dense (fractal-heap) attribute storage"
                 )
             }
-            FormatError::TooManyAttributes { count, limit } => {
+            FormatError::TooManyDenseAttributes { count, limit } => {
                 write!(
                     f,
                     "{count} attributes exceed the {limit} that dense (fractal-heap) storage \
                      can index"
+                )
+            }
+            FormatError::DenseAttributeHeapTooLarge { block_size, limit } => {
+                write!(
+                    f,
+                    "these attributes need a {block_size}-byte fractal-heap direct block, past \
+                     the {limit}-byte maximum"
                 )
             }
         }

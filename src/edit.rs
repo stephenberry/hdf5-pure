@@ -3398,8 +3398,9 @@ impl WriteEngine {
     /// only the contiguous data address and child link targets repointed).
     /// Dense (fractal-heap) attribute storage is read out of the source heap into
     /// a parsed attribute set carried on the model (`dense_attrs`) and re-emitted
-    /// into a fresh heap on write, provided it fits the single-direct-block layout
-    /// the emitter can build; an oversized set is refused. Rejects multi-chunk
+    /// into a fresh heap on write, provided every attribute fits what that heap can
+    /// hold as a managed object (see `file_writer::dense_attrs_check`); an
+    /// attribute past that is refused by name. Rejects multi-chunk
     /// headers, dense or soft/external links, chunked/old-version data layouts, and
     /// headers that are neither a dataset nor a group.
     fn read_object(d: &[u8], addr: usize, base: u64) -> Result<ObjModel, Error> {

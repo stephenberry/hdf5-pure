@@ -147,6 +147,33 @@ fn c_rejects_a_heap_whose_objects_exceed_its_declared_limit() {
     assert!(nine_attrs(largest_accepted_payload() + 1).finish().is_err());
 }
 
+/// The attribute-count boundary, against the library that defines it. The limit
+/// is 61,680 rather than the 65,535 the B-tree leaf's record-count field would
+/// suggest, because libhdf5 derives the width it needs from the leaf's capacity,
+/// which follows the power-of-two node size this writer declares. Getting this
+/// wrong is not a near-miss: at 61,681 the file it produced aborted libhdf5, so
+/// the accepted side has to be confirmed here and not just against our own
+/// reader.
+#[test]
+fn c_reads_the_largest_accepted_attribute_count() {
+    let build = |n: usize| {
+        let mut builder = FileBuilder::new();
+        for i in 0..n {
+            builder.set_attr(&format!("a{i:06}"), AttrValue::I64(i as i64));
+        }
+        builder.create_dataset("x").with_f64_data(&[1.0]);
+        builder
+    };
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("count_limit.h5");
+    build(61_680).write(&path).unwrap();
+    assert_eq!(c_reads(&path), CReads::Attrs(61_680));
+
+    // And one past it never reaches a file at all.
+    assert!(build(61_681).finish().is_err());
+}
+
 /// A multi-megabyte dense heap of individually small attributes is inside what
 /// the emitter can encode, and libhdf5 must accept it — including the maximum
 /// direct block size the header now declares to match its own root block.
