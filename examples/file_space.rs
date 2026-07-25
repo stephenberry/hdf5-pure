@@ -2,7 +2,7 @@
 //!
 //! Mirroring `H5Pset_file_space_strategy` / `H5Pset_file_space_page_size`, a
 //! written file can record how it manages free space. With `persist = true`, the
-//! regions an `EditSession` frees are written to on-disk free-space-manager
+//! regions a `File::open_rw` session frees are written to on-disk free-space-manager
 //! blocks, so a *later* session (this crate's or the reference C library's) seeds
 //! its free list from them and writes new objects into the holes instead of
 //! growing the file.
@@ -19,8 +19,7 @@
 //! cargo run --example file_space
 //! ```
 
-#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
-use hdf5_pure::{EditSession, File, FileBuilder, FileSpaceStrategy};
+use hdf5_pure::{File, FileBuilder, FileSpaceStrategy};
 use std::path::Path;
 
 /// 4096 f64 values = 32 KiB of raw data — large enough that whether the file
@@ -103,15 +102,18 @@ fn main() {
 /// reveals whether the freed region was reused (small) or not (≈ the data size).
 fn churn(path: &Path) -> u64 {
     // Add `scratch`, then delete it in its own session so the region is freed.
-    let mut session = EditSession::open(path).expect("open for editing");
+    let session = File::open_rw(path).expect("open for editing");
     session
-        .create_dataset("scratch")
-        .with_f64_data(&vec![0.0; SCRATCH_LEN]);
+        .root()
+        .create_dataset("scratch", |b| {
+            b.with_f64_data(&vec![0.0; SCRATCH_LEN]);
+        })
+        .unwrap();
     session.commit().unwrap();
     drop(session); // release the editor's exclusive lock before the next session
 
-    let mut session = EditSession::open(path).expect("reopen for editing");
-    session.delete("scratch");
+    let session = File::open_rw(path).expect("reopen for editing");
+    session.root().delete("scratch").unwrap();
     session.commit().unwrap();
     drop(session); // release the lock before reading the file back
     let after_delete = len(path);
@@ -126,10 +128,13 @@ fn churn(path: &Path) -> u64 {
     );
 
     // Add a same-sized dataset in a fresh session and measure the growth.
-    let mut session = EditSession::open(path).expect("reopen for editing");
+    let session = File::open_rw(path).expect("reopen for editing");
     session
-        .create_dataset("scratch2")
-        .with_f64_data(&vec![7.0; SCRATCH_LEN]);
+        .root()
+        .create_dataset("scratch2", |b| {
+            b.with_f64_data(&vec![7.0; SCRATCH_LEN]);
+        })
+        .unwrap();
     session.commit().unwrap();
     drop(session); // release the lock before reading the file back
     let after_readd = len(path);

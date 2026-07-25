@@ -2,16 +2,15 @@
 // gated to 64-bit-pointer targets; skip on 32-bit so the pure-Rust suite still
 // runs under `cross test --target i686-...`.
 #![cfg(not(target_pointer_width = "32"))]
-//! Interop tests for `EditSession::append_dataset`: append to a filtered,
+//! Interop tests for `Dataset::append_staged`: append to a filtered,
 //! unlimited, Extensible-Array-indexed dataset and confirm the reference C
 //! library (`hdf5-metno`) reads the grown dataset back exactly — including
 //! datasets the C library itself created, whose incompressible chunks carry a
 //! nonzero per-chunk filter mask that the append must preserve.
 
-#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5::Extent;
 use hdf5::file::LibraryVersion;
-use hdf5_pure::{EditSession, File, FileBuilder};
+use hdf5_pure::{File, FileBuilder};
 use tempfile::tempdir;
 
 /// A deterministic incompressible i32 stream (LCG), so deflate stores chunks
@@ -73,8 +72,13 @@ fn pure_create_filtered(path: &std::path::Path, data: &[i32], chunk: u64) {
 }
 
 fn pure_append(path: &std::path::Path, values: &[i32]) {
-    let mut s = EditSession::open(path).unwrap();
-    s.append_dataset("d").append_i32(values);
+    let s = File::open_rw(path).unwrap();
+    s.dataset("d")
+        .unwrap()
+        .append_staged(|b| {
+            b.append_i32(values);
+        })
+        .unwrap();
     s.commit().unwrap();
 }
 
@@ -187,9 +191,13 @@ fn large_paged_ea_append_c_reads() {
     let base: Vec<i32> = (0..64).collect();
     pure_create_filtered(&path, &base, 1);
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.append_dataset("d")
-            .append_i32(&(64..4096).collect::<Vec<_>>());
+        let s = File::open_rw(&path).unwrap();
+        s.dataset("d")
+            .unwrap()
+            .append_staged(|b| {
+                b.append_i32(&(64..4096).collect::<Vec<_>>());
+            })
+            .unwrap();
         s.commit().unwrap();
     }
     let expected: Vec<i32> = (0..4096).collect();

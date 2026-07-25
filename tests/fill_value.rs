@@ -4,10 +4,9 @@
 //! dataset's Fill Value message, and [`Dataset::fill_value`] reads it back. These
 //! tests pin the round trip across storage classes and datatypes, the "no fill
 //! value" default, the datatype/size validation, and that a fill value set on an
-//! `EditSession`-created dataset is honored.
+//! `File::open_rw`-created dataset is honored.
 
-#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
-use hdf5_pure::{Dataset, EditSession, Error, File, FileBuilder, FormatError, H5Element};
+use hdf5_pure::{Dataset, Error, File, FileBuilder, FormatError, H5Element};
 use tempfile::tempdir;
 
 /// Build a file with `build`, serialize it, and return it parsed back, ready for
@@ -221,10 +220,12 @@ fn edit_session_created_dataset_carries_fill() {
     // Add a dataset with a fill value through an edit session, then commit and
     // drop the session (releasing its exclusive lock) before reopening.
     {
-        let mut s = EditSession::open(&p).unwrap();
-        s.create_dataset("added")
-            .with_f64_data(&[1.0, 2.0])
-            .with_fill_value(-9.5_f64);
+        let s = File::open_rw(&p).unwrap();
+        s.root()
+            .create_dataset("added", |b| {
+                b.with_f64_data(&[1.0, 2.0]).with_fill_value(-9.5_f64);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
 
@@ -248,10 +249,12 @@ fn edit_session_fill_size_mismatch_is_refused() {
         fb.create_dataset("seed").with_i32_data(&[0]);
         fb.write(&p).unwrap();
     }
-    let mut s = EditSession::open(&p).unwrap();
-    s.create_dataset("added")
-        .with_i32_data(&[1, 2, 3])
-        .with_fill_value(1_u16); // 2-byte fill on a 4-byte element
+    let s = File::open_rw(&p).unwrap();
+    s.root()
+        .create_dataset("added", |b| {
+            b.with_i32_data(&[1, 2, 3]).with_fill_value(1_u16);
+        })
+        .unwrap(); // 2-byte fill on a 4-byte element
     let err = s.commit().unwrap_err();
     assert!(
         matches!(
@@ -277,10 +280,13 @@ fn write_dataset_refuses_a_fill_value() {
         fb.create_dataset("d").with_i32_data(&[1, 2, 3]);
         fb.write(&p).unwrap();
     }
-    let mut s = EditSession::open(&p).unwrap();
-    s.write_dataset("d")
-        .with_i32_data(&[4, 5, 6])
-        .with_fill_value(-1_i32);
+    let s = File::open_rw(&p).unwrap();
+    s.dataset("d")
+        .unwrap()
+        .write_staged(|b| {
+            b.with_i32_data(&[4, 5, 6]).with_fill_value(-1_i32);
+        })
+        .unwrap();
     let err = s.commit().unwrap_err();
     assert!(
         matches!(&err, Error::EditUnsupported(m) if m.contains("fill value")),

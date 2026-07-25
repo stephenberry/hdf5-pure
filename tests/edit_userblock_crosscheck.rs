@@ -8,10 +8,9 @@
 //! result back through `hdf5` is the external tripwire that the editor stored
 //! every root/link/layout address relative to the base address correctly.
 
-#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5::dataset::Layout;
 use hdf5::file::LibraryVersion;
-use hdf5_pure::{EditSession, File, FileBuilder};
+use hdf5_pure::{File, FileBuilder};
 use tempfile::tempdir;
 
 const UB: u64 = 512;
@@ -52,10 +51,23 @@ fn pure_userblock_file_edited_then_read_by_c_library() {
     std::fs::write(&path, b.finish().unwrap()).unwrap();
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.write_dataset("alpha").with_f64_data(&[9.0, 8.0, 7.0]);
-        s.create_dataset("added").with_f64_data(&[100.0, 200.0]);
-        s.create_dataset("grp/gamma").with_i32_data(&[1, 2, 3]);
+        let s = File::open_rw(&path).unwrap();
+        s.dataset("alpha")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_f64_data(&[9.0, 8.0, 7.0]);
+            })
+            .unwrap();
+        s.root()
+            .create_dataset("added", |b| {
+                b.with_f64_data(&[100.0, 200.0]);
+            })
+            .unwrap();
+        s.root()
+            .create_dataset("grp/gamma", |b| {
+                b.with_i32_data(&[1, 2, 3]);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
 
@@ -108,9 +120,12 @@ fn real_mat_edited_then_read_by_c_library() {
         .unwrap();
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.create_dataset("hdf5_pure_probe")
-            .with_f64_data(&[42.0, -1.0, 3.5]);
+        let s = File::open_rw(&path).unwrap();
+        s.root()
+            .create_dataset("hdf5_pure_probe", |b| {
+                b.with_f64_data(&[42.0, -1.0, 3.5]);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
 
@@ -157,14 +172,22 @@ fn userblock_chunked_add_and_overwrite_read_by_c_library() {
     let added: Vec<f64> = (0..400).map(|i| (i % 11) as f64 * 0.5).collect();
     let updated: Vec<f64> = (0..300).map(|i| (i as f64).cos()).collect();
     {
-        let mut s = EditSession::open(&path).unwrap();
+        let s = File::open_rw(&path).unwrap();
         // Add a new chunked dataset and relocate-overwrite the existing one.
-        s.create_dataset("added")
-            .with_f64_data(&added)
-            .with_shape(&[400])
-            .with_chunks(&[50])
-            .with_deflate(6);
-        s.write_dataset("c").with_f64_data(&updated);
+        s.root()
+            .create_dataset("added", |b| {
+                b.with_f64_data(&added)
+                    .with_shape(&[400])
+                    .with_chunks(&[50])
+                    .with_deflate(6);
+            })
+            .unwrap();
+        s.dataset("c")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_f64_data(&updated);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
 
@@ -209,10 +232,19 @@ fn userblock_chunked_reclaimed_space_reused_read_by_c_library() {
     let updated: Vec<f64> = (0..600).map(|i| (i as f64) * 0.01).collect();
     let reuse: Vec<f64> = (0..80).map(|i| (i as f64) + 0.5).collect();
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.write_dataset("c").with_f64_data(&updated);
+        let s = File::open_rw(&path).unwrap();
+        s.dataset("c")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_f64_data(&updated);
+            })
+            .unwrap();
         s.commit().unwrap();
-        s.create_dataset("reuse").with_f64_data(&reuse);
+        s.root()
+            .create_dataset("reuse", |b| {
+                b.with_f64_data(&reuse);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
 
@@ -251,8 +283,13 @@ fn userblock_contiguous_undefined_address_relocates_read_by_c_library() {
     });
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.write_dataset("blank").with_i32_data(&[5, 6, 7]);
+        let s = File::open_rw(&path).unwrap();
+        s.dataset("blank")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_i32_data(&[5, 6, 7]);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
 
@@ -302,9 +339,14 @@ fn userblock_compact_overwrite_read_by_c_library() {
     });
 
     {
-        let mut s = EditSession::open(&path).unwrap();
+        let s = File::open_rw(&path).unwrap();
         // Same shape, but a compact overwrite always relocates the header.
-        s.write_dataset("cpt").with_i32_data(&[9, 8, 7, 6]);
+        s.dataset("cpt")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_i32_data(&[9, 8, 7, 6]);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
 
@@ -360,11 +402,15 @@ fn userblock_delete_then_reuse_read_by_c_library() {
 
     let reuse: Vec<f64> = (0..64).map(|i| (i as f64) * -1.5).collect();
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.delete("doomed");
-        s.delete("c");
+        let s = File::open_rw(&path).unwrap();
+        s.root().delete("doomed").unwrap();
+        s.root().delete("c").unwrap();
         s.commit().unwrap();
-        s.create_dataset("reuse").with_f64_data(&reuse);
+        s.root()
+            .create_dataset("reuse", |b| {
+                b.with_f64_data(&reuse);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
 
@@ -419,10 +465,10 @@ fn userblock_copy_read_by_c_library() {
     });
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.copy("alpha", "alpha_copy");
-        s.copy("c", "c_copy");
-        s.copy("grp", "grp_copy");
+        let s = File::open_rw(&path).unwrap();
+        s.copy("alpha", "alpha_copy").unwrap();
+        s.copy("c", "c_copy").unwrap();
+        s.copy("grp", "grp_copy").unwrap();
         s.commit().unwrap();
     }
 
@@ -470,13 +516,16 @@ fn userblock_extensible_array_add_read_by_c_library() {
 
     let added: Vec<f64> = (0..500).map(|i| (i as f64).sin() * 1e3).collect();
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.create_dataset("ea")
-            .with_f64_data(&added)
-            .with_shape(&[500])
-            .with_chunks(&[40])
-            .with_maxshape(&[u64::MAX])
-            .with_deflate(6);
+        let s = File::open_rw(&path).unwrap();
+        s.root()
+            .create_dataset("ea", |b| {
+                b.with_f64_data(&added)
+                    .with_shape(&[500])
+                    .with_chunks(&[40])
+                    .with_maxshape(&[u64::MAX])
+                    .with_deflate(6);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
 

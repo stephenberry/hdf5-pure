@@ -1,6 +1,6 @@
 //! Reclaiming space and dropping objects with `repack`.
 //!
-//! Deleting an object inside an `EditSession` reuses the freed space within that
+//! Deleting an object inside a `File::open_rw` session reuses the freed space within that
 //! session, but a single delete cannot shrink a file whose freed region is not
 //! at the very end (the same reason the HDF5 C library ships `h5repack`).
 //! `repack` reads every surviving object and rewrites the whole file compact,

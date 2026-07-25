@@ -1,6 +1,6 @@
-//! Owned-handle parity with `EditSession` (issue #148, PR A).
+//! Owned-handle parity with `File::open_rw` (issue #148, PR A).
 //!
-//! The capabilities that were previously reachable only through `EditSession` —
+//! The capabilities that were previously reachable only through `File::open_rw` —
 //! a staged, index-rebuilding append (filtered / any-length), cross-file copy,
 //! group attributes, live space accounting, staged-edit introspection, and a
 //! per-open file-locking policy — now work through owned `File` / `Dataset` /

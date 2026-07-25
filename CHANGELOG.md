@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `Group::create_group_with` stages a new group *and* its attributes in one batch, which `set_attr` cannot do because it needs a group that already resolves ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)).
+- `Dataset::write_staged` overwrites a dataset through its full `DatasetBuilder`, the builder-level counterpart of `Dataset::write` for element kinds that are not `H5Element` ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)).
+
+### Removed
+
+- **Breaking:** `AppendWriter`, `SwmrWriter`, and `EditSession`, deprecated since 0.22.0, are gone. Use `File::open_rw` (or `File::open_swmr_writer`) with owned `Dataset` and `Group` handles; `File::open_rw_with_locking` replaces `AppendWriter::open_with_locking` and `File::clear_swmr_flag` replaces `SwmrWriter::clear_swmr_flag` ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)).
+
 ## [0.24.0] - 2026-07-24
 
 Variable-length writes lose their 65,535-element cap: `DatasetBuilder::with_vlen_strings` and `repack` now split across as many global heap collections as they need, and resolving an element is no longer quadratic ([#189](https://github.com/stephenberry/hdf5-pure/issues/189)). Attributes too large for compact or dense storage are now refused by name instead of silently dropped or written unreadable ([#190](https://github.com/stephenberry/hdf5-pure/issues/190), [#191](https://github.com/stephenberry/hdf5-pure/issues/191)). Reads gain bounds: a chunked dataset declaring an impossible per-chunk size is refused rather than allocated, with the new `Dataset::element_size` to size a read up front ([#185](https://github.com/stephenberry/hdf5-pure/issues/185)), and row windows of inner-chunked and variable-length string datasets stream instead of falling back to a whole read ([#183](https://github.com/stephenberry/hdf5-pure/pull/183), [#186](https://github.com/stephenberry/hdf5-pure/pull/186)). Additive minor bump.

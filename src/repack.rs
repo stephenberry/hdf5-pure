@@ -1,7 +1,7 @@
 //! Whole-file repack (issue #21): copy an existing HDF5 file into a fresh,
 //! compact one, optionally dropping objects.
 //!
-//! [`EditSession`](crate::EditSession) deletes objects in place but reclaims
+//! [`File::open_rw`](crate::File::open_rw) deletes objects in place but reclaims
 //! space only within a session and cannot return a single deleted-and-closed
 //! file's bytes to the OS. Repack is the complementary answer — the same one the
 //! HDF5 C ecosystem ships as `h5repack`: it reads every surviving object and

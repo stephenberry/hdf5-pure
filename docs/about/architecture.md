@@ -30,7 +30,7 @@ above them; data flows up from raw bytes to typed values.
 | **Format structures** | Superblocks, object headers, datatypes, dataspaces, data layouts, links, heaps (local, global, fractal), B-trees (v1/v2), symbol tables |
 | **Filters** | The filter pipeline plus deflate, shuffle, scale-offset, and the optional ZFP codec |
 | **Engine** | The chunked read/write core, chunk indexes (B-tree v1, fixed array, extensible array), the chunk cache, the file writer, attribute and group machinery |
-| **High-level API** | `File`, `Dataset`, `Group`, `FileBuilder`, `EditSession`, `SwmrWriter`, and the `ndarray` integration |
+| **High-level API** | `File`, `Dataset`, `Group`, `FileBuilder`, `File::open_rw`, `File::open_swmr_writer`, and the `ndarray` integration |
 | **MATLAB v7.3** | The serde-based `.mat` reader/writer, built on top of the engine and the high-level API |
 
 The read and write paths are mutually recursive — index structures call back
@@ -69,7 +69,7 @@ produce in the wild:
 - **Storage layouts** — contiguous, compact, and chunked.
 - **Chunk indexes** — B-tree v1, fixed array (including the paged data-block
   layout), and extensible array (which also backs [SWMR](../guide/swmr.md)
-  append and the in-place append paths — `EditSession::append_dataset` and the
+  append and the in-place append paths — `Dataset::append_staged` and the
   owned-handle `File::open_rw` + `Dataset::append`).
 - **Groups** — both the old symbol-table form (v0/v1) and the modern
   compact-link and dense (fractal-heap + v2 B-tree) forms.
@@ -85,7 +85,7 @@ consistent while its reader remains broad.
 
 A recurring theme across the [editing](../guide/editing.md),
 [repack](../guide/repack.md), and [streaming](../guide/streaming.md) APIs is
-that they decline anything they cannot reproduce exactly. An `EditSession` that
+that they decline anything they cannot reproduce exactly. An `File::open_rw` that
 cannot reproduce an object faithfully fails with `Error::EditUnsupported`;
 `repack` fails with `Error::RepackUnsupported`, naming the object, and writes no
 output file. The guarantee this buys you: an operation either produces a file

@@ -87,7 +87,7 @@ impl FileBuilder {
     ///
     /// `persist = true` records that freed space should be tracked on disk across
     /// closes. A brand-new file has nothing to track, so this only records the
-    /// intent; freeing space in a later [`EditSession`](crate::EditSession) then
+    /// intent; freeing space in a later [`File::open_rw`](crate::File::open_rw) then
     /// writes the on-disk free-space-manager blocks that survive a reopen.
     pub fn with_file_space_strategy(
         &mut self,

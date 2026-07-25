@@ -11,7 +11,7 @@
 
 ## Why a delete cannot always shrink a file
 
-Deleting an object inside an [`EditSession`](editing.md) reuses the freed space *within that session*, and the file is truncated when the freed bytes happen to reach the very end. But a single delete-then-close cannot shrink a file whose freed region sits in the middle: an HDF5 file is a single address space, and a hole in the middle cannot be removed by truncating the tail. This is the same reason the HDF5 C library ships a separate `h5repack` tool rather than relying on deletion alone.
+Deleting an object inside an [`File::open_rw`](editing.md) reuses the freed space *within that session*, and the file is truncated when the freed bytes happen to reach the very end. But a single delete-then-close cannot shrink a file whose freed region sits in the middle: an HDF5 file is a single address space, and a hole in the middle cannot be removed by truncating the tail. This is the same reason the HDF5 C library ships a separate `h5repack` tool rather than relying on deletion alone.
 
 `repack` solves this by reading every surviving object and rewriting the whole file from scratch through [`FileBuilder`](writing.md), so the result has no dead space and is strictly smaller when objects are dropped.
 
@@ -100,11 +100,11 @@ assert!(file.group("runs").is_err());
 
 ## Repack vs. in-place editing
 
-| | `EditSession` delete | `repack` |
+| | `File::open_rw` delete | `repack` |
 | --- | --- | --- |
 | Reclaims space mid-session | Yes (reused for later writes) | n/a |
 | Shrinks a closed file | Only if freed bytes reach the end | Always |
 | Spans a reopen | No | Yes (writes a new file) |
 | Output | edits the same file | a fresh file at `dst` |
 
-For incremental edits where add/delete churn stays bounded, prefer an [`EditSession`](editing.md). For guaranteed compaction across a reopen, or to drop objects and reclaim their space unconditionally, use `repack`.
+For incremental edits where add/delete churn stays bounded, prefer an [`File::open_rw`](editing.md). For guaranteed compaction across a reopen, or to drop objects and reclaim their space unconditionally, use `repack`.

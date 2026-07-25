@@ -1,9 +1,6 @@
 # Editing in Place
 
-`EditSession` opens an existing HDF5 file and adds, copies, or deletes objects, or edits group attributes, without rewriting the file from scratch. New data and rebuilt object headers are appended at the end of the file and the superblock is repointed last, so the cost is proportional to what changes rather than to the file size, and a failed commit leaves the original file valid.
-
-!!! warning "Deprecated"
-    `EditSession` is superseded by the owned-handle API and will be removed in a later release. Open a file for reading **and** writing with `File::open_rw` and edit it through owned `Dataset` and `Group` handles that reach every object by name: `Dataset::append`/`write`/`append_staged`, `Group::create_dataset`/`create_group`/`delete`/`set_attr`, and `File::copy`/`copy_from`/`commit`. One open file both writes and reads back, with no separate session type.
+`File::open_rw` opens an existing HDF5 file for reading **and** writing, and edits it through owned `Dataset` and `Group` handles that reach every object by name — adding, copying, or deleting objects, or editing attributes, without rewriting the file from scratch. New data and rebuilt object headers are appended at the end of the file and the superblock is repointed last, so the cost is proportional to what changes rather than to the file size, and a failed commit leaves the original file valid.
 
 !!! tip "Runnable example"
     This page mirrors [`examples/edit_in_place.rs`](https://github.com/stephenberry/hdf5-pure/blob/main/examples/edit_in_place.rs). Run it with:
@@ -50,74 +47,93 @@ For a brand-new file, use [`FileBuilder`](writing.md); to append while readers a
 An edit session is transactional: you stage operations on an open file, then apply them all at once with `commit()`. Nothing on disk changes until `commit()` succeeds.
 
 ```rust
-use hdf5_pure::{AttrValue, EditSession};
+use hdf5_pure::{AttrValue, File};
 
-let mut session = EditSession::open("output.h5").unwrap();
+let file = File::open_rw("output.h5").unwrap();
+let root = file.root();
 
-session.create_group("run2");
-session.set_group_attr("run2", "kind", AttrValue::AsciiString("trial".into()));
-session.create_dataset("run2/signal").with_f64_data(&[1.0, 2.0, 3.0]);
-session.copy("temperature", "temperature_backup"); // H5Ocopy
-session.delete("sensors/pressure");                // H5Ldelete
+root.create_group_with("run2", |g| {
+    g.set_attr("kind", AttrValue::AsciiString("trial".into()));
+})
+.unwrap();
+root.create_dataset("run2/signal", |b| {
+    b.with_f64_data(&[1.0, 2.0, 3.0]);
+})
+.unwrap();
+file.copy("temperature", "temperature_backup").unwrap(); // H5Ocopy
+root.delete("sensors/pressure").unwrap();                // H5Ldelete
 
-session.commit().unwrap(); // apply everything in place
+file.commit().unwrap(); // apply everything in place
 ```
 
-After a successful `commit()`, the staged set is cleared and the session can be reused for further edits.
+After a successful `commit()`, the staged set is cleared and the open file can be reused for further edits.
 
 ## Operations
 
 | Method | Effect | HDF5 analog |
 | --- | --- | --- |
-| `EditSession::open(path)` | Open an existing file for editing | — |
-| `create_group(path)` | Stage a new empty group; its parent must exist or be created in the same session | — |
-| `create_dataset(path)` | Stage a new dataset and return a `DatasetBuilder` to configure data, shape, and attributes | — |
-| `append_dataset(path)` | Stage appending elements along axis 0 of an existing chunked, unlimited dataset; returns an `AppendBuilder` | `H5Dset_extent` + write |
-| `set_group_attr(path, name, value)` | Stage adding or replacing a compact group attribute | — |
-| `remove_group_attr(path, name)` | Stage removing a compact group attribute | — |
-| `copy(src, dst)` | Stage a deep copy of a dataset or whole group subtree within this file | `H5Ocopy` |
-| `copy_from(source, src, dst)` | Copy a dataset or subtree out of another open `File` into this one | `H5Ocopy` (across files) |
-| `delete(path)` | Stage removing the link at `path` (and, for a group, its whole subtree) | `H5Ldelete` |
-| `commit()` | Apply all staged operations in place and flush | — |
+| `File::open_rw(path)` | Open an existing file for reading and writing | — |
+| `Group::create_group(name)` | Stage a new empty group; its parent must exist or be created in the same batch | — |
+| `Group::create_group_with(name, build)` | Stage a new group *and* its attributes together, for a group that is not yet committed | — |
+| `Group::create_dataset(name, build)` | Stage a new dataset, configured through a `DatasetBuilder` | — |
+| `Dataset::append_staged(build)` | Stage appending elements along axis 0 of an existing chunked, unlimited dataset, via an `AppendBuilder` | `H5Dset_extent` + write |
+| `Dataset::append(data)` | Append immediately and durably, no `commit` needed | `H5Dset_extent` + write |
+| `Dataset::write(data)` / `write_staged(build)` | Stage a value overwrite of the same datatype and shape | `H5Dwrite` |
+| `Group::set_attr(name, value)` / `Dataset::set_attr` | Stage adding or replacing a compact attribute | — |
+| `Group::remove_attr(name)` / `Dataset::remove_attr` | Stage removing a compact attribute | — |
+| `File::copy(src, dst)` | Stage a deep copy of a dataset or whole group subtree within this file | `H5Ocopy` |
+| `File::copy_from(source, src, dst)` | Copy a dataset or subtree out of another open `File` into this one | `H5Ocopy` (across files) |
+| `Group::delete(name)` | Stage removing the link at `name` (and, for a group, its whole subtree) | `H5Ldelete` |
+| `File::commit()` | Apply all staged operations in place and flush | — |
 
-`create_dataset` returns the same `DatasetBuilder` used by [`FileBuilder`](writing.md), so you configure the new dataset exactly as you would when creating a file from scratch:
+`create_dataset` hands you the same `DatasetBuilder` used by [`FileBuilder`](writing.md), so you configure the new dataset exactly as you would when creating a file from scratch:
 
 ```rust
-session.create_dataset("run2/signal").with_f64_data(&[1.0, 2.0, 3.0]);
+root.create_dataset("run2/signal", |b| {
+    b.with_f64_data(&[1.0, 2.0, 3.0]);
+})
+.unwrap();
 ```
 
-`set_group_attr` takes an `AttrValue`, fixed-size or variable-length (`AttrValue::VarLenAsciiArray`). The group it names may already exist or may be created earlier in the same session; `""` or `"/"` names the root group. Attributes are stored compactly in the rebuilt group header; an edit that would exceed the compact-attribute limit, or a group using dense (fractal-heap) attribute storage, is refused before any file bytes change.
+`set_attr` needs a group that already resolves, so a group staged in this same batch is not reachable through it — use `create_group_with` to give a brand-new group its attributes in one step.
+
+`set_attr` takes an `AttrValue`, fixed-size or variable-length (`AttrValue::VarLenAsciiArray`). `File::root()` names the root group. Attributes are stored compactly in the rebuilt group header; an edit that would exceed the compact-attribute limit, or a group using dense (fractal-heap) attribute storage, is refused before any file bytes change.
 
 `copy` performs a deep copy: fresh copies of every object's data and header are written, internal links and the contiguous data address are repointed to the copies, and a link named by the last component of `dst` is added to its parent group. The original is untouched. `src` must exist and `dst` must not (and may not lie inside `src`). Compact attributes are carried over byte-for-byte — including the latest-format form the C library and h5py write, where a handful of inline attributes are accompanied by an Attribute Info message. Dense (fractal-heap) attribute storage, which appears above 8 attributes, is also reproduced: the source attributes are read out of the source heap and re-emitted into a fresh single-direct-block fractal heap plus B-tree v2 name index in the destination (the copy tracks only the name index, not the creation-order index). An individual attribute too large for that heap's managed-object limit is refused by name rather than mis-encoded, as are more attributes than its single B-tree leaf can index; the set's *total* size is not limited, since the heap's one block is sized to the content (see [Limitations](../reference/limitations.md#dense-attribute-storage)).
 
 `copy_from` is the same operation **across two open files** — the cross-file form of `H5Ocopy`. The source lives in a separate [`File`](reading.md) reader rather than the file being edited:
 
 ```rust
-use hdf5_pure::{EditSession, File};
+use hdf5_pure::File;
 
 let library = File::open("library.h5").unwrap();
-let mut session = EditSession::open("output.h5").unwrap();
-session.copy_from(&library, "calibration", "run2/calibration").unwrap();
-session.commit().unwrap();
+let file = File::open_rw("output.h5").unwrap();
+file.copy_from(&library, "calibration", "run2/calibration").unwrap();
+file.commit().unwrap();
 ```
 
 Unlike `copy`, the source subtree is read and validated **eagerly** (the `File` borrow need not outlive the call), so `copy_from` returns a `Result`; the destination still changes only on `commit()`. Because the copy is byte-for-byte verbatim, anything whose stored bytes embed a *source-file* absolute address — which would dangle in another file — is refused up front: variable-length and reference datasets and attributes (whether compact or dense), and any shared header message (a committed datatype, or an SOHM-shared dataspace, fill value, or filter pipeline). The same-file `copy` keeps these forms valid instead, by sharing the source file's global heaps and objects. The `source` must be a buffered file (`File::open` or `File::from_bytes`, not `File::open_streaming`) using 8-byte offsets and no userblock.
 
 ## Appending to an unlimited dataset
 
-`append_dataset` grows an existing **chunked, unlimited** dataset in place along its first (axis-0) dimension, **including filtered** datasets (deflate, shuffle, fletcher32, scale-offset, and ZFP with the `zfp` feature). It is the general, non-SWMR counterpart to the [SWMR writer](swmr.md), which appends only to *unfiltered*, chunk-aligned datasets. It returns an `AppendBuilder` whose typed and generic methods mirror the writer's; repeated calls concatenate in call order.
+`Dataset::append_staged` grows an existing **chunked, unlimited** dataset in place along its first (axis-0) dimension, **including filtered** datasets (deflate, shuffle, fletcher32, scale-offset, and ZFP with the `zfp` feature). It is the general, non-SWMR counterpart to the [SWMR writer](swmr.md), which appends only to *unfiltered*, chunk-aligned datasets. It returns an `AppendBuilder` whose typed and generic methods mirror the writer's; repeated calls concatenate in call order.
 
 ```rust
-use hdf5_pure::EditSession;
+use hdf5_pure::File;
 
-let mut session = EditSession::open("log.h5").unwrap();
-session.append_dataset("samples").append_i32(&[8, 9, 10, 11]);
-session.commit().unwrap();
+let file = File::open_rw("log.h5").unwrap();
+file.dataset("samples")
+    .unwrap()
+    .append_staged(|a| {
+        a.append_i32(&[8, 9, 10, 11]);
+    })
+    .unwrap();
+file.commit().unwrap();
 ```
 
 Existing chunks stay exactly where they are. Only the newly appended chunks — plus the single trailing partial chunk, when the dataset's current length is not a whole multiple of the chunk length — are compressed and written; every other chunk is carried into the rebuilt index by metadata alone. So an append does not rewrite existing data and the file does not grow by the whole dataset each time. Appends of any length are allowed, and the datatype, fill value, filter pipeline, and attributes are preserved.
 
-Like every `EditSession` edit, an append commits by writing the new chunks and a rebuilt index at end-of-file and repointing the superblock last (under the session's exclusive lock), so a crash leaves either the original dataset or the fully grown one, never a torn state. It sets no SWMR flag.
+Like every staged edit, an append commits by writing the new chunks and a rebuilt index at end-of-file and repointing the superblock last (under the file's exclusive lock), so a crash leaves either the original dataset or the fully grown one, never a torn state. It sets no SWMR flag.
 
 ### Eligibility
 
@@ -130,7 +146,7 @@ Element types are checked, never coerced: each typed `append_*` call records the
 
 ### Streaming appends
 
-`append_dataset` rebuilds the dataset's chunk index and relocates its header on every `commit` (and each new `EditSession` re-reads the whole file at open), which is the right trade for a one-off append composed alongside other edits, but not for a high-frequency append loop. For that, open the file **once** with `File::open_rw` and append many times through a `Dataset` handle, growing the Extensible-Array index *in place* — so each append costs `O(appended bytes)` plus amortized `O(1)` index overhead, with no whole-file re-read and no index rebuild.
+`append_staged` rebuilds the dataset's chunk index and relocates its header on every `commit` (and each new `File::open_rw` re-reads the whole file at open), which is the right trade for a one-off append composed alongside other edits, but not for a high-frequency append loop. For that, open the file **once** with `File::open_rw` and append many times through a `Dataset` handle, growing the Extensible-Array index *in place* — so each append costs `O(appended bytes)` plus amortized `O(1)` index overhead, with no whole-file re-read and no index rebuild.
 
 ```rust
 use hdf5_pure::File;
@@ -148,8 +164,7 @@ That atomicity is why filtered and unfiltered datasets have different length rul
 
 The remaining eligibility rules match `append_dataset` (chunked, unlimited axis 0, Extensible-Array index, rank 1, a re-encodable filter pipeline), plus the file-level gates in [the tables above](#choosing-a-write-path), with one difference: because it grows the index in place rather than rebuilding it, the index must already be allocated. This crate allocates it eagerly, so an empty dataset it wrote can be grown from the first append; an empty dataset the C library created without any initial data defers its index and is refused — make that first append with `append_dataset` (which materializes the index), or create the dataset with initial data. The dead bytes left when an unfiltered partial chunk is relocated are reclaimed by [repack](repack.md) rather than reused within the session in this release. This is the throughput-oriented counterpart to `append_dataset` and the filter-capable counterpart to the [SWMR writer](swmr.md).
 
-!!! note "Deprecated: `AppendWriter`"
-    The standalone `AppendWriter` type provided this same in-place streaming append before the owned-handle API existed. It is now **deprecated** in favor of `File::open_rw` + `Dataset::append` — identical mechanics, rules, and crash-atomicity — and will be removed in a later release. The one behavior without a `File::open_rw` equivalent yet is opening with file locking disabled (`AppendWriter::open_with_locking`).
+!!! note "Deprecated: `Dataset::append`"
 
 !!! tip "Runnable example"
     This section mirrors [`examples/append_streaming.rs`](https://github.com/stephenberry/hdf5-pure/blob/main/examples/append_streaming.rs). Run it with `cargo run --example append_streaming`.
@@ -186,7 +201,7 @@ Contiguous and chunked datasets (with any filter the whole-file writer supports)
 - Single- and multi-chunk object headers. A multi-chunk header is collapsed into a single chunk on rewrite.
 - A version 0/1 symbol-table group on the edited path is converted to the latest compact-link format. Adding and deleting are supported on these older files; copying a version-1 object is not.
 
-Rather than silently degrade a file, `EditSession` refuses anything it cannot reproduce faithfully, returning `Error::EditUnsupported`:
+Rather than silently degrade a file, the editor refuses anything it cannot reproduce faithfully, returning `Error::EditUnsupported`:
 
 - A file whose superblock is not located at its base address — a relocated or malformed userblock layout. (A canonical userblock, such as a MATLAB v7.3 `.mat` file's 512-byte userblock, is supported: addresses are read and written relative to the base and the userblock bytes are preserved.)
 - Dense-storage headers on the edited path.

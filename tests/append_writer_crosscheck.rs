@@ -2,18 +2,18 @@
 // gated to 64-bit-pointer targets; skip on 32-bit so the pure-Rust suite still
 // runs under `cross test --target i686-...`.
 #![cfg(not(target_pointer_width = "32"))]
-//! Interop tests for `AppendWriter`: append in place to a filtered, unlimited,
+//! Interop tests for in-place appends through an owned handle: append to a
+//! filtered, unlimited,
 //! Extensible-Array-indexed dataset and confirm the reference C library
 //! (`hdf5-metno`) reads the grown dataset back exactly — including datasets the C
 //! library itself created, whose incompressible chunks carry a nonzero per-chunk
-//! filter mask that in-place appends must leave untouched. Because `AppendWriter`
+//! filter mask that in-place appends must leave untouched. Because `File::open_rw` + `Dataset::append`
 //! mutates the index in place (rather than rebuilding it), this also exercises
 //! byte-for-byte-compatible incremental Extensible-Array growth.
-#![allow(deprecated)] // AppendWriter is deprecated; this interop test still covers the shim
 
 use hdf5::Extent;
 use hdf5::file::LibraryVersion;
-use hdf5_pure::{AppendWriter, File, FileBuilder};
+use hdf5_pure::{File, FileBuilder};
 use tempfile::tempdir;
 
 fn incompressible(seed: u32, n: usize) -> Vec<i32> {
@@ -73,18 +73,20 @@ fn pure_create_filtered(path: &std::path::Path, data: &[i32], chunk: u64) {
 
 /// Append `values` in one call, releasing the writer's lock before returning.
 fn writer_append(path: &std::path::Path, values: &[i32]) {
-    let mut w = AppendWriter::open(path).unwrap();
-    w.append_i32("d", values).unwrap();
-    w.close().unwrap();
+    let file = File::open_rw(path).unwrap();
+    file.dataset("d").unwrap().append(values).unwrap();
+    file.close().unwrap();
 }
 
 /// Append `values` one element per call in a single session.
 fn writer_append_each(path: &std::path::Path, values: &[i32]) {
-    let mut w = AppendWriter::open(path).unwrap();
+    let file = File::open_rw(path).unwrap();
+    let mut ds = file.dataset("d").unwrap();
     for &v in values {
-        w.append_i32("d", &[v]).unwrap();
+        ds.append(&[v]).unwrap();
     }
-    w.close().unwrap();
+    drop(ds);
+    file.close().unwrap();
 }
 
 #[test]
@@ -137,18 +139,21 @@ fn c_incompressible_kept_chunks_untouched() {
 fn c_empty_unallocated_index_is_refused() {
     // The C library defers allocating an empty resizable dataset's
     // Extensible-Array index until the first chunk is written, so there is no
-    // index block for in-place growth. `AppendWriter` refuses it cleanly; the
-    // batch path (`EditSession::append_dataset`) materializes the index instead.
+    // index block for in-place growth. `File::open_rw` + `Dataset::append` refuses it cleanly; the
+    // batch path (`Dataset::append_staged`) materializes the index instead.
     let dir = tempdir().unwrap();
     let path = dir.path().join("d.h5");
     c_create_filtered(&path, &[], 4);
-    let mut w = AppendWriter::open(&path).unwrap();
-    let r = w.append_i32("d", &(0..10).collect::<Vec<_>>());
+    let file = File::open_rw(&path).unwrap();
+    let r = file
+        .dataset("d")
+        .unwrap()
+        .append(&(0..10).collect::<Vec<_>>());
     assert!(
-        matches!(r, Err(hdf5_pure::Error::AppendUnsupported(_))),
+        matches!(r, Err(hdf5_pure::Error::AppendInPlaceUnsupported(_))),
         "expected a clean refusal, got {r:?}"
     );
-    drop(w);
+    drop(file);
     // The file is unchanged and still readable by C.
     assert!(read_c(&path).is_empty());
 }
@@ -202,16 +207,16 @@ fn reopen_across_sessions_c_reads() {
 #[test]
 fn c_creates_writer_refuses_unaligned_filtered() {
     // A filtered dataset whose current length is not chunk-aligned cannot be
-    // grown in place; AppendWriter refuses and leaves the file for C to read.
+    // grown in place; the append refuses and leaves the file for C to read.
     let dir = tempdir().unwrap();
     let path = dir.path().join("d.h5");
     let base: Vec<i32> = (0..7).collect(); // 7 of chunk 5 => a partial tail
     c_create_filtered(&path, &base, 5);
-    let mut w = AppendWriter::open(&path).unwrap();
+    let file = File::open_rw(&path).unwrap();
     assert!(matches!(
-        w.append_i32("d", &[7, 8, 9]),
-        Err(hdf5_pure::Error::AppendUnsupported(_))
+        file.dataset("d").unwrap().append(&[7, 8, 9]),
+        Err(hdf5_pure::Error::AppendInPlaceUnsupported(_))
     ));
-    drop(w);
+    drop(file);
     assert_eq!(read_c(&path), base);
 }

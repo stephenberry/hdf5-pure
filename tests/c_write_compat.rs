@@ -20,8 +20,7 @@
 //! Every call here goes through the safe `hdf5-metno` API, which serializes its
 //! own C calls through an internal lock, so these tests need no extra guard.
 
-#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
-use hdf5_pure::{EditSession, File, FileBuilder};
+use hdf5_pure::{File, FileBuilder};
 use tempfile::tempdir;
 
 #[test]
@@ -83,7 +82,7 @@ fn c_library_adds_objects_to_our_file() {
 #[test]
 fn c_library_writes_after_an_in_place_edit() {
     // A file hdf5-pure wrote and then edited in place must still be writable by
-    // the C library: the EditSession rewrites the affected group headers, and
+    // the C library: the edit engine rewrites the affected group headers, and
     // those rewrites must keep (or add) the Group Info message.
     let dir = tempdir().unwrap();
     let path = dir.path().join("edited.h5");
@@ -96,13 +95,13 @@ fn c_library_writes_after_an_in_place_edit() {
     // `inspect_group`) and writes a fresh subgroup header (via
     // `fresh_group_region`); both must carry a Group Info message.
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.create_group("edited_grp");
+        let s = File::open_rw(&path).unwrap();
+        s.root().create_group("edited_grp").unwrap();
         s.commit().unwrap();
     }
 
     // The C library adds objects to both the rewritten root and the
-    // EditSession-created subgroup.
+    // open_rw-created subgroup.
     {
         let f = hdf5::File::open_rw(&path).unwrap();
         f.new_dataset::<i32>()

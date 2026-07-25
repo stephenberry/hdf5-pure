@@ -1,10 +1,9 @@
-//! Pure-Rust tests for `EditSession::append_dataset`: append new elements to an
+//! Pure-Rust tests for `Dataset::append_staged`: append new elements to an
 //! existing chunked, unlimited, Extensible-Array-indexed dataset in place —
 //! filtered and unfiltered, chunk-aligned and not — and read the result back
 //! with this crate. C-library interop lives in `append_crosscheck.rs`.
 
-#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
-use hdf5_pure::{AppendBuilder, EditSession, Error, File, FileBuilder, ScaleOffset};
+use hdf5_pure::{AppendBuilder, Error, File, FileBuilder, FormatError, ScaleOffset};
 use tempfile::tempdir;
 
 /// Create a rank-1, unlimited i32 dataset with the given chunk length and
@@ -43,8 +42,13 @@ fn read_i32(path: &std::path::Path) -> Vec<i32> {
 }
 
 fn append_i32(path: &std::path::Path, values: &[i32]) {
-    let mut s = EditSession::open(path).unwrap();
-    s.append_dataset("d").append_i32(values);
+    let s = File::open_rw(path).unwrap();
+    s.dataset("d")
+        .unwrap()
+        .append_staged(|b| {
+            b.append_i32(values);
+        })
+        .unwrap();
     s.commit().unwrap();
 }
 
@@ -114,8 +118,13 @@ fn append_scale_offset_f64() {
 
     let more: Vec<f64> = (6..14).map(|i| i as f64 * 0.25).collect();
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.append_dataset("d").append_f64(&more);
+        let s = File::open_rw(&path).unwrap();
+        s.dataset("d")
+            .unwrap()
+            .append_staged(|b| {
+                b.append_f64(&more);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
     let back = File::open(&path)
@@ -138,18 +147,28 @@ fn append_generic_and_raw() {
     create_i32(&path, 4, 4, true, false, false);
     // Generic append<T>.
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.append_dataset("d").append(&[4i32, 5, 6, 7]);
+        let s = File::open_rw(&path).unwrap();
+        s.dataset("d")
+            .unwrap()
+            .append_staged(|b| {
+                b.append(&[4i32, 5, 6, 7]);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
     // Raw append (little-endian i32 bytes).
     {
-        let mut s = EditSession::open(&path).unwrap();
+        let s = File::open_rw(&path).unwrap();
         let mut bytes = Vec::new();
         for v in [8i32, 9, 10] {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
-        s.append_dataset("d").append_raw(&bytes);
+        s.dataset("d")
+            .unwrap()
+            .append_staged(|b| {
+                b.append_raw(&bytes);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
     assert_eq!(read_i32(&path), (0..11).collect::<Vec<_>>());
@@ -182,8 +201,13 @@ fn zero_length_append_is_noop() {
     let path = dir.path().join("d.h5");
     create_i32(&path, 5, 4, true, false, false);
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.append_dataset("d").append_i32(&[]);
+        let s = File::open_rw(&path).unwrap();
+        s.dataset("d")
+            .unwrap()
+            .append_staged(|b| {
+                b.append_i32(&[]);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
     assert_eq!(read_i32(&path), (0..5).collect::<Vec<_>>());
@@ -219,11 +243,16 @@ fn many_appends_do_not_rewrite_existing_data() {
 
     let mut expected = base;
     {
-        let mut s = EditSession::open(&path).unwrap();
+        let s = File::open_rw(&path).unwrap();
         for _ in 0..10 {
             let batch: Vec<i32> = (0..200).map(|_| rng()).collect();
             expected.extend_from_slice(&batch);
-            s.append_dataset("d").append_i32(&batch);
+            s.dataset("d")
+                .unwrap()
+                .append_staged(|b| {
+                    b.append_i32(&batch);
+                })
+                .unwrap();
             s.commit().unwrap();
         }
     }
@@ -284,9 +313,9 @@ fn commit_append(
     dataset: &str,
     build: impl FnOnce(&mut AppendBuilder),
 ) -> Result<(), Error> {
-    let mut s = EditSession::open(path).unwrap();
-    build(s.append_dataset(dataset));
-    s.commit()
+    let file = File::open_rw(path).unwrap();
+    file.dataset(dataset)?.append_staged(build)?;
+    file.commit()
 }
 
 fn assert_append_unsupported(res: Result<(), Error>) {
@@ -384,7 +413,14 @@ fn refuse_nonexistent_dataset() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("d.h5");
     create_i32(&path, 4, 4, true, false, false);
-    assert_append_unsupported(commit_append(&path, "missing", |a| {
+    // A missing dataset is now caught when the handle is resolved, before an
+    // append can be staged at all, rather than at commit.
+    let err = commit_append(&path, "missing", |a| {
         a.append_i32(&[1]);
-    }));
+    })
+    .unwrap_err();
+    assert!(
+        matches!(err, Error::Format(FormatError::PathNotFound(_))),
+        "expected PathNotFound, got {err:?}"
+    );
 }

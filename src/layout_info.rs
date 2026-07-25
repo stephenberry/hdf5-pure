@@ -88,8 +88,8 @@ pub enum ChunkIndex {
     /// dataspace with more than one chunk).
     FixedArray,
     /// An extensible array indexes chunks along a single unlimited dimension.
-    /// This is the index [`AppendWriter`](crate::AppendWriter) and
-    /// [`EditSession::append_dataset`](crate::EditSession::append_dataset) grow
+    /// This is the index [`Dataset::append`](crate::Dataset::append) and
+    /// [`Dataset::append_staged`](crate::Dataset::append_staged) grow
     /// in place.
     ExtensibleArray,
     /// A version-2 B-tree indexes the chunks (several unlimited dimensions). A
@@ -100,7 +100,7 @@ pub enum ChunkIndex {
 
 impl ChunkIndex {
     /// Whether a dataset with this index kind can be grown in place with
-    /// [`AppendWriter`](crate::AppendWriter) — true only for
+    /// [`Dataset::append`](crate::Dataset::append) — true only for
     /// [`ExtensibleArray`](ChunkIndex::ExtensibleArray).
     ///
     /// This reflects the index *structure* alone; an actual append also requires

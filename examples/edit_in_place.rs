@@ -1,4 +1,4 @@
-//! Editing an existing file in place with `EditSession`: add, overwrite, copy
+//! Editing an existing file in place with `File::open_rw`: add, overwrite, copy
 //! (within the file and across two open files), and delete objects, and edit
 //! group attributes, without rewriting the file from scratch.
 //!
@@ -12,8 +12,7 @@
 //! cargo run --example edit_in_place
 //! ```
 
-#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
-use hdf5_pure::{AttrValue, EditSession, File, FileBuilder};
+use hdf5_pure::{AttrValue, File, FileBuilder};
 
 fn main() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -40,32 +39,46 @@ fn main() {
     let library = File::open(&lib_path).expect("open library for reading");
 
     // ---- Edit it in place -----------------------------------------------
-    let mut session = EditSession::open(&path).expect("open for editing");
-    session.create_group("run2");
-    session.set_group_attr("run2", "kind", AttrValue::AsciiString("trial".into()));
+    let session = File::open_rw(&path).expect("open for editing");
     session
-        .create_dataset("run2/signal")
-        .with_f64_data(&[1.0, 2.0, 3.0]);
+        .root()
+        .create_group_with("run2", |g| {
+            g.set_attr("kind", AttrValue::AsciiString("trial".into()));
+        })
+        .unwrap();
+    session
+        .root()
+        .create_dataset("run2/signal", |b| {
+            b.with_f64_data(&[1.0, 2.0, 3.0]);
+        })
+        .unwrap();
     // A chunked, shuffled, deflate-compressed dataset can be added in place too;
     // its chunk data and index are appended just like a contiguous blob.
     let waveform: Vec<f64> = (0..4096).map(|i| (i as f64 * 0.01).sin()).collect();
     session
-        .create_dataset("run2/waveform")
-        .with_f64_data(&waveform)
-        .with_chunks(&[512])
-        .with_shuffle()
-        .with_deflate(6);
+        .root()
+        .create_dataset("run2/waveform", |b| {
+            b.with_f64_data(&waveform)
+                .with_chunks(&[512])
+                .with_shuffle()
+                .with_deflate(6);
+        })
+        .unwrap();
     // Overwrite an existing dataset's values in place (H5Dwrite). Same datatype
     // and shape (3 f64), so the new bytes go straight into the existing block.
     session
-        .write_dataset("temperature")
-        .with_f64_data(&[24.0, 24.4, 23.9]);
-    session.copy("temperature", "temperature_backup"); // H5Ocopy (same file)
+        .dataset("temperature")
+        .unwrap()
+        .write_staged(|b| {
+            b.with_f64_data(&[24.0, 24.4, 23.9]);
+        })
+        .unwrap();
+    session.copy("temperature", "temperature_backup").unwrap(); // H5Ocopy (same file)
     // Cross-file H5Ocopy: pull an object out of another open file.
     session
         .copy_from(&library, "calibration", "run2/calibration")
         .expect("copy across files");
-    session.delete("sensors/pressure"); // H5Ldelete
+    session.root().delete("sensors/pressure").unwrap(); // H5Ldelete
     session.commit().expect("commit edits");
     drop(session); // release the editor's exclusive lock before reopening to read
 

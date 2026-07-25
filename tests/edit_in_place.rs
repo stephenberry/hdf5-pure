@@ -1,8 +1,7 @@
-//! Tests for in-place editing via `EditSession` (issue #32, Group C):
+//! Tests for in-place editing via `File::open_rw` (issue #32, Group C):
 //! add, delete, and copy datasets and groups at any path.
 
-#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
-use hdf5_pure::{AttrValue, DType, EditSession, File, FileBuilder, Object, ScaleOffset};
+use hdf5_pure::{AttrValue, DType, File, FileBuilder, Object, ScaleOffset};
 
 /// Write a starter file with one dataset, returning its path.
 fn write_starter(path: &std::path::Path) {
@@ -19,8 +18,13 @@ fn add_dataset_preserves_original_and_adds_new() {
     let size_before = std::fs::metadata(&path).unwrap().len();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_dataset("added").with_i32_data(&[10, 20, 30]);
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("added", |b| {
+                b.with_i32_data(&[10, 20, 30]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -52,9 +56,19 @@ fn add_multiple_datasets_in_one_commit() {
     write_starter(&path);
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_dataset("a").with_f64_data(&[1.5, 2.5]);
-        session.create_dataset("b").with_i32_data(&[7, 8, 9]);
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("a", |b| {
+                b.with_f64_data(&[1.5, 2.5]);
+            })
+            .unwrap();
+        session
+            .root()
+            .create_dataset("b", |b| {
+                b.with_i32_data(&[7, 8, 9]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -80,10 +94,20 @@ fn successive_commits_accumulate() {
     write_starter(&path);
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_dataset("first").with_i32_data(&[1]);
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("first", |b| {
+                b.with_i32_data(&[1]);
+            })
+            .unwrap();
         session.commit().unwrap();
-        session.create_dataset("second").with_i32_data(&[2]);
+        session
+            .root()
+            .create_dataset("second", |b| {
+                b.with_i32_data(&[2]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -103,11 +127,14 @@ fn add_dataset_with_multidim_shape() {
     write_starter(&path);
 
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("matrix")
-            .with_f64_data(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
-            .with_shape(&[2, 3]);
+            .root()
+            .create_dataset("matrix", |b| {
+                b.with_f64_data(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+                    .with_shape(&[2, 3]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -125,7 +152,7 @@ fn commit_without_staged_datasets_is_noop() {
     let before = std::fs::read(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session.commit().unwrap();
     }
 
@@ -140,8 +167,8 @@ fn create_group_at_root() {
     write_starter(&path);
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_group("results");
+        let session = File::open_rw(&path).unwrap();
+        session.root().create_group("results").unwrap();
         session.commit().unwrap();
     }
 
@@ -169,12 +196,15 @@ fn add_dataset_into_new_nested_group() {
     write_starter(&path);
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_group("measurements");
-        session.create_group("measurements/run1");
+        let session = File::open_rw(&path).unwrap();
+        session.root().create_group("measurements").unwrap();
+        session.root().create_group("measurements/run1").unwrap();
         session
-            .create_dataset("measurements/run1/signal")
-            .with_f64_data(&[10.0, 11.0, 12.0]);
+            .root()
+            .create_dataset("measurements/run1/signal", |b| {
+                b.with_f64_data(&[10.0, 11.0, 12.0]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -199,12 +229,22 @@ fn add_into_existing_group_across_commits() {
     write_starter(&path);
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_group("g");
-        session.create_dataset("g/a").with_i32_data(&[1, 2]);
+        let session = File::open_rw(&path).unwrap();
+        session.root().create_group("g").unwrap();
+        session
+            .root()
+            .create_dataset("g/a", |b| {
+                b.with_i32_data(&[1, 2]);
+            })
+            .unwrap();
         session.commit().unwrap();
         // Second commit adds into the now-existing group g.
-        session.create_dataset("g/b").with_i32_data(&[3, 4]);
+        session
+            .root()
+            .create_dataset("g/b", |b| {
+                b.with_i32_data(&[3, 4]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -223,11 +263,21 @@ fn add_into_two_sibling_groups_one_commit() {
     write_starter(&path);
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_group("x");
-        session.create_group("y");
-        session.create_dataset("x/d").with_i32_data(&[1]);
-        session.create_dataset("y/d").with_i32_data(&[2]);
+        let session = File::open_rw(&path).unwrap();
+        session.root().create_group("x").unwrap();
+        session.root().create_group("y").unwrap();
+        session
+            .root()
+            .create_dataset("x/d", |b| {
+                b.with_i32_data(&[1]);
+            })
+            .unwrap();
+        session
+            .root()
+            .create_dataset("y/d", |b| {
+                b.with_i32_data(&[2]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -244,8 +294,13 @@ fn dataset_into_missing_group_is_rejected() {
     let before = std::fs::read(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_dataset("nope/d").with_i32_data(&[1]);
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("nope/d", |b| {
+                b.with_i32_data(&[1]);
+            })
+            .unwrap();
         let err = session.commit().unwrap_err();
         assert!(err.to_string().contains("does not exist"), "got: {err}");
     }
@@ -261,8 +316,13 @@ fn duplicate_name_is_rejected_without_writing() {
 
     // Collide with the existing "original" dataset.
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_dataset("original").with_i32_data(&[1, 2]);
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("original", |b| {
+                b.with_i32_data(&[1, 2]);
+            })
+            .unwrap();
         let err = session.commit().unwrap_err();
         assert!(err.to_string().contains("already exists"), "got: {err}");
     }
@@ -270,9 +330,19 @@ fn duplicate_name_is_rejected_without_writing() {
 
     // Collide between two datasets staged in the same commit.
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_dataset("dup").with_i32_data(&[1]);
-        session.create_dataset("dup").with_i32_data(&[2]);
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("dup", |b| {
+                b.with_i32_data(&[1]);
+            })
+            .unwrap();
+        session
+            .root()
+            .create_dataset("dup", |b| {
+                b.with_i32_data(&[2]);
+            })
+            .unwrap();
         assert!(session.commit().is_err());
     }
     assert_eq!(std::fs::read(&path).unwrap(), before);
@@ -289,8 +359,8 @@ fn delete_dataset_from_root() {
     b.write(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.delete("remove");
+        let session = File::open_rw(&path).unwrap();
+        session.root().delete("remove").unwrap();
         session.commit().unwrap();
     }
 
@@ -309,17 +379,27 @@ fn delete_nested_group_subtree() {
     let path = std::env::temp_dir().join("hdf5_pure_edit_del_nested.h5");
     write_starter(&path);
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_group("grp");
-        session.create_dataset("grp/inner").with_i32_data(&[5, 6]);
-        session.create_dataset("sibling").with_i32_data(&[7]);
+        let session = File::open_rw(&path).unwrap();
+        session.root().create_group("grp").unwrap();
+        session
+            .root()
+            .create_dataset("grp/inner", |b| {
+                b.with_i32_data(&[5, 6]);
+            })
+            .unwrap();
+        session
+            .root()
+            .create_dataset("sibling", |b| {
+                b.with_i32_data(&[7]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
     // Delete the whole group "grp" (its subtree becomes unreachable).
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.delete("grp");
+        let session = File::open_rw(&path).unwrap();
+        session.root().delete("grp").unwrap();
         session.commit().unwrap();
     }
 
@@ -347,15 +427,25 @@ fn delete_one_of_nested_then_keep_group() {
     let path = std::env::temp_dir().join("hdf5_pure_edit_del_one.h5");
     write_starter(&path);
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_group("g");
-        session.create_dataset("g/a").with_i32_data(&[1]);
-        session.create_dataset("g/b").with_i32_data(&[2]);
+        let session = File::open_rw(&path).unwrap();
+        session.root().create_group("g").unwrap();
+        session
+            .root()
+            .create_dataset("g/a", |b| {
+                b.with_i32_data(&[1]);
+            })
+            .unwrap();
+        session
+            .root()
+            .create_dataset("g/b", |b| {
+                b.with_i32_data(&[2]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.delete("g/a"); // remove one member, keep the group and g/b
+        let session = File::open_rw(&path).unwrap();
+        session.root().delete("g/a").unwrap(); // remove one member, keep the group and g/b
         session.commit().unwrap();
     }
 
@@ -377,9 +467,14 @@ fn add_and_delete_in_one_commit() {
     b.write(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_dataset("new").with_i32_data(&[2]);
-        session.delete("old");
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("new", |b| {
+                b.with_i32_data(&[2]);
+            })
+            .unwrap();
+        session.root().delete("old").unwrap();
         session.commit().unwrap();
     }
 
@@ -398,8 +493,8 @@ fn delete_missing_or_overlapping_is_rejected() {
 
     // Nothing to delete.
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.delete("ghost");
+        let session = File::open_rw(&path).unwrap();
+        session.root().delete("ghost").unwrap();
         let err = session.commit().unwrap_err();
         assert!(err.to_string().contains("nothing to delete"), "got: {err}");
     }
@@ -407,15 +502,20 @@ fn delete_missing_or_overlapping_is_rejected() {
 
     // Delete /g while adding under it in the same commit → overlap rejected.
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_group("g");
+        let session = File::open_rw(&path).unwrap();
+        session.root().create_group("g").unwrap();
         session.commit().unwrap();
     }
     let mid = std::fs::read(&path).unwrap();
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.delete("g");
-        session.create_dataset("g/x").with_i32_data(&[1]);
+        let session = File::open_rw(&path).unwrap();
+        session.root().delete("g").unwrap();
+        session
+            .root()
+            .create_dataset("g/x", |b| {
+                b.with_i32_data(&[1]);
+            })
+            .unwrap();
         let err = session.commit().unwrap_err();
         assert!(err.to_string().contains("overlaps"), "got: {err}");
     }
@@ -431,8 +531,8 @@ fn copy_dataset_to_new_name() {
     b.write(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.copy("src", "dup");
+        let session = File::open_rw(&path).unwrap();
+        session.copy("src", "dup").unwrap();
         session.commit().unwrap();
     }
 
@@ -455,20 +555,28 @@ fn copy_group_subtree() {
     let path = std::env::temp_dir().join("hdf5_pure_edit_copy_grp.h5");
     write_starter(&path);
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_group("template");
-        session.create_group("template/inner");
-        session.create_dataset("template/a").with_i32_data(&[1, 2]);
+        let session = File::open_rw(&path).unwrap();
+        session.root().create_group("template").unwrap();
+        session.root().create_group("template/inner").unwrap();
         session
-            .create_dataset("template/inner/b")
-            .with_f64_data(&[9.0]);
+            .root()
+            .create_dataset("template/a", |b| {
+                b.with_i32_data(&[1, 2]);
+            })
+            .unwrap();
+        session
+            .root()
+            .create_dataset("template/inner/b", |b| {
+                b.with_f64_data(&[9.0]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
     // Copy the whole subtree under a new name.
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.copy("template", "run1");
+        let session = File::open_rw(&path).unwrap();
+        session.copy("template", "run1").unwrap();
         session.commit().unwrap();
     }
 
@@ -501,9 +609,9 @@ fn copy_into_subgroup() {
     b.create_dataset("payload").with_i32_data(&[7, 8, 9]);
     b.write(&path).unwrap();
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_group("dest");
-        session.copy("payload", "dest/payload_copy");
+        let session = File::open_rw(&path).unwrap();
+        session.root().create_group("dest").unwrap();
+        session.copy("payload", "dest/payload_copy").unwrap();
         session.commit().unwrap();
     }
 
@@ -527,16 +635,16 @@ fn copy_rejects_missing_source_and_cycle() {
     let path = std::env::temp_dir().join("hdf5_pure_edit_copy_reject.h5");
     write_starter(&path);
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_group("g");
+        let session = File::open_rw(&path).unwrap();
+        session.root().create_group("g").unwrap();
         session.commit().unwrap();
     }
     let before = std::fs::read(&path).unwrap();
 
     // Missing source.
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.copy("ghost", "x");
+        let session = File::open_rw(&path).unwrap();
+        session.copy("ghost", "x").unwrap();
         let err = session.commit().unwrap_err();
         assert!(
             err.to_string().contains("source does not exist"),
@@ -547,8 +655,8 @@ fn copy_rejects_missing_source_and_cycle() {
 
     // Copy a group into its own subtree.
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.copy("g", "g/inside");
+        let session = File::open_rw(&path).unwrap();
+        session.copy("g", "g/inside").unwrap();
         let err = session.commit().unwrap_err();
         assert!(err.to_string().contains("itself"), "got: {err}");
     }
@@ -561,11 +669,15 @@ fn add_dataset_with_attributes() {
     let path = std::env::temp_dir().join("hdf5_pure_edit_add_attrs.h5");
     write_starter(&path);
     {
-        let mut session = EditSession::open(&path).unwrap();
-        let ds = session.create_dataset("measured");
-        ds.with_f64_data(&[1.0, 2.0]);
-        ds.set_attr("count", AttrValue::I64(2));
-        ds.set_attr("unit", AttrValue::String("m/s".into()));
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("measured", |ds| {
+                ds.with_f64_data(&[1.0, 2.0]);
+                ds.set_attr("count", AttrValue::I64(2));
+                ds.set_attr("unit", AttrValue::String("m/s".into()));
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -583,10 +695,14 @@ fn create_group_with_attributes() {
     let path = std::env::temp_dir().join("hdf5_pure_edit_group_attrs.h5");
     write_starter(&path);
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_group("run");
-        session.set_group_attr("run", "kind", AttrValue::AsciiString("trial".into()));
-        session.set_group_attr("run", "count", AttrValue::I64(2));
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_group_with("run", |g| {
+                g.set_attr("kind", AttrValue::AsciiString("trial".into()));
+                g.set_attr("count", AttrValue::I64(2));
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -613,11 +729,22 @@ fn edit_existing_group_attributes() {
     b.write(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.set_group_attr("grp", "status", AttrValue::String("new".into()));
-        session.set_group_attr("grp", "added", AttrValue::F64(3.5));
-        session.remove_group_attr("grp", "drop");
-        session.set_group_attr("/", "root_tag", AttrValue::U64(9));
+        let session = File::open_rw(&path).unwrap();
+        session
+            .group("grp")
+            .unwrap()
+            .set_attr("status", AttrValue::String("new".into()))
+            .unwrap();
+        session
+            .group("grp")
+            .unwrap()
+            .set_attr("added", AttrValue::F64(3.5))
+            .unwrap();
+        session.group("grp").unwrap().remove_attr("drop").unwrap();
+        session
+            .root()
+            .set_attr("root_tag", AttrValue::U64(9))
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -652,9 +779,13 @@ fn group_attribute_edit_uses_final_compact_count() {
     b.write(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.set_group_attr("grp", "new", AttrValue::I64(99));
-        session.remove_group_attr("grp", "a0");
+        let session = File::open_rw(&path).unwrap();
+        session
+            .group("grp")
+            .unwrap()
+            .set_attr("new", AttrValue::I64(99))
+            .unwrap();
+        session.group("grp").unwrap().remove_attr("a0").unwrap();
         session.commit().unwrap();
     }
 
@@ -681,8 +812,12 @@ fn remove_missing_group_attribute_is_rejected_without_writing() {
     let before = std::fs::read(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.remove_group_attr("grp", "missing");
+        let session = File::open_rw(&path).unwrap();
+        session
+            .group("grp")
+            .unwrap()
+            .remove_attr("missing")
+            .unwrap();
         let err = session.commit().unwrap_err();
         assert!(err.to_string().contains("not found"), "got: {err}");
     }
@@ -697,12 +832,14 @@ fn add_variable_length_root_attribute_via_edit_session() {
     write_starter(&path);
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.set_group_attr(
-            "/",
-            "fields",
-            AttrValue::VarLenAsciiArray(vec!["a".into(), "b".into()]),
-        );
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .set_attr(
+                "fields",
+                AttrValue::VarLenAsciiArray(vec!["a".into(), "b".into()]),
+            )
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -738,16 +875,23 @@ fn add_variable_length_group_attribute_then_remove_then_reset_in_one_commit() {
     b.write(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         // Replace the existing variable-length attribute with a fixed-size
         // one, then remove it, then set a fresh variable-length value.
-        session.set_group_attr("grp", "fields", AttrValue::I64(1));
-        session.remove_group_attr("grp", "fields");
-        session.set_group_attr(
-            "grp",
-            "fields",
-            AttrValue::VarLenAsciiArray(vec!["new1".into(), "new2".into(), "new3".into()]),
-        );
+        session
+            .group("grp")
+            .unwrap()
+            .set_attr("fields", AttrValue::I64(1))
+            .unwrap();
+        session.group("grp").unwrap().remove_attr("fields").unwrap();
+        session
+            .group("grp")
+            .unwrap()
+            .set_attr(
+                "fields",
+                AttrValue::VarLenAsciiArray(vec!["new1".into(), "new2".into(), "new3".into()]),
+            )
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -779,12 +923,15 @@ fn set_variable_length_group_attribute_over_existing_fixed_attribute_in_one_comm
     b.write(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.set_group_attr(
-            "grp",
-            "fields",
-            AttrValue::VarLenAsciiArray(vec!["new1".into(), "new2".into()]),
-        );
+        let session = File::open_rw(&path).unwrap();
+        session
+            .group("grp")
+            .unwrap()
+            .set_attr(
+                "fields",
+                AttrValue::VarLenAsciiArray(vec!["new1".into(), "new2".into()]),
+            )
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -817,21 +964,27 @@ fn add_variable_length_group_attributes_at_budget_boundary_in_one_commit() {
     b.write(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         // Two elements each: a single-element `VarLenAsciiArray` collapses to
         // `AttrValue::String` on read (matching every other array `AttrValue`
         // variant's len-1 collapse), which would make the read-back
         // assertions below ambiguous with a fixed-size string attribute.
-        session.set_group_attr(
-            "grp",
-            "b0",
-            AttrValue::VarLenAsciiArray(vec!["x0".into(), "x1".into()]),
-        );
-        session.set_group_attr(
-            "grp",
-            "b1",
-            AttrValue::VarLenAsciiArray(vec!["y0".into(), "y1".into()]),
-        );
+        session
+            .group("grp")
+            .unwrap()
+            .set_attr(
+                "b0",
+                AttrValue::VarLenAsciiArray(vec!["x0".into(), "x1".into()]),
+            )
+            .unwrap();
+        session
+            .group("grp")
+            .unwrap()
+            .set_attr(
+                "b1",
+                AttrValue::VarLenAsciiArray(vec!["y0".into(), "y1".into()]),
+            )
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -871,13 +1024,16 @@ fn add_variable_length_group_attributes_over_budget_is_rejected_without_writing(
     let before = std::fs::read(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         for i in 0..3 {
-            session.set_group_attr(
-                "grp",
-                &format!("b{i}"),
-                AttrValue::VarLenAsciiArray(vec!["x".into()]),
-            );
+            session
+                .group("grp")
+                .unwrap()
+                .set_attr(
+                    &format!("b{i}"),
+                    AttrValue::VarLenAsciiArray(vec!["x".into()]),
+                )
+                .unwrap();
         }
         let err = session.commit().unwrap_err();
         assert!(err.to_string().contains("dense"), "got: {err}");
@@ -904,12 +1060,15 @@ fn dense_group_attribute_storage_is_still_rejected_without_writing() {
     let before = std::fs::read(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.set_group_attr(
-            "grp",
-            "fields",
-            AttrValue::VarLenAsciiArray(vec!["a".into(), "b".into()]),
-        );
+        let session = File::open_rw(&path).unwrap();
+        session
+            .group("grp")
+            .unwrap()
+            .set_attr(
+                "fields",
+                AttrValue::VarLenAsciiArray(vec!["a".into(), "b".into()]),
+            )
+            .unwrap();
         let err = session.commit().unwrap_err();
         assert!(err.to_string().contains("dense"), "got: {err}");
     }
@@ -929,9 +1088,13 @@ fn deleting_group_with_attribute_edit_is_rejected_without_writing() {
     let before = std::fs::read(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.delete("grp");
-        session.set_group_attr("grp", "tag", AttrValue::I64(2));
+        let session = File::open_rw(&path).unwrap();
+        session.root().delete("grp").unwrap();
+        session
+            .group("grp")
+            .unwrap()
+            .set_attr("tag", AttrValue::I64(2))
+            .unwrap();
         let err = session.commit().unwrap_err();
         assert!(err.to_string().contains("overlaps"), "got: {err}");
     }
@@ -953,8 +1116,8 @@ fn copy_preserves_dataset_attributes() {
     b.write(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.copy("src", "dup");
+        let session = File::open_rw(&path).unwrap();
+        session.copy("src", "dup").unwrap();
         session.commit().unwrap();
     }
 
@@ -986,8 +1149,8 @@ fn copy_unfiltered_chunked_dataset() {
         b.write(&path).unwrap();
     }
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.copy("src", "dup");
+        let session = File::open_rw(&path).unwrap();
+        session.copy("src", "dup").unwrap();
         session.commit().unwrap();
     }
     let file = File::open(&path).unwrap();
@@ -1023,8 +1186,8 @@ fn copy_filtered_chunked_dataset_preserves_pipeline_and_attrs() {
         b.write(&path).unwrap();
     }
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.copy("src", "dup");
+        let session = File::open_rw(&path).unwrap();
+        session.copy("src", "dup").unwrap();
         session.commit().unwrap();
     }
     let file = File::open(&path).unwrap();
@@ -1057,18 +1220,21 @@ fn copy_extensible_chunked_dataset() {
     let data: Vec<f64> = (0..80).map(|i| i as f64 * 0.25).collect();
     write_starter(&path);
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("src")
-            .with_f64_data(&data)
-            .with_shape(&[80])
-            .with_chunks(&[16])
-            .with_maxshape(&[u64::MAX]);
+            .root()
+            .create_dataset("src", |b| {
+                b.with_f64_data(&data)
+                    .with_shape(&[80])
+                    .with_chunks(&[16])
+                    .with_maxshape(&[u64::MAX]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.copy("src", "dup");
+        let session = File::open_rw(&path).unwrap();
+        session.copy("src", "dup").unwrap();
         session.commit().unwrap();
     }
     let file = File::open(&path).unwrap();
@@ -1093,8 +1259,8 @@ fn copy_single_chunk_dataset() {
         b.write(&path).unwrap();
     }
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.copy("src", "dup");
+        let session = File::open_rw(&path).unwrap();
+        session.copy("src", "dup").unwrap();
         session.commit().unwrap();
     }
     let file = File::open(&path).unwrap();
@@ -1112,8 +1278,8 @@ fn edit_preserves_multiple_root_datasets() {
     b.write(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_group("extra");
+        let session = File::open_rw(&path).unwrap();
+        session.root().create_group("extra").unwrap();
         session.commit().unwrap();
     }
 
@@ -1138,10 +1304,15 @@ fn mixed_add_delete_copy_in_one_commit() {
     b.write(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_dataset("fresh").with_i32_data(&[42]); // add
-        session.delete("remove"); // delete
-        session.copy("source", "source_copy"); // copy
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("fresh", |b| {
+                b.with_i32_data(&[42]);
+            })
+            .unwrap(); // add
+        session.root().delete("remove").unwrap(); // delete
+        session.copy("source", "source_copy").unwrap(); // copy
         session.commit().unwrap();
     }
 
@@ -1177,7 +1348,7 @@ fn copy_from_file_dataset() {
 
     {
         let source = File::open(&src_path).unwrap();
-        let mut session = EditSession::open(&dst_path).unwrap();
+        let session = File::open_rw(&dst_path).unwrap();
         session.copy_from(&source, "payload", "imported").unwrap();
         session.commit().unwrap();
     }
@@ -1213,18 +1384,26 @@ fn copy_from_file_group_subtree() {
     {
         // Build the nested source subtree (FileBuilder::create_dataset does not
         // split paths into groups, so create the hierarchy explicitly).
-        let mut s = EditSession::open(&src_path).unwrap();
-        s.create_group("template");
-        s.create_group("template/inner");
-        s.create_dataset("template/a").with_i32_data(&[1, 2]);
-        s.create_dataset("template/inner/b").with_f64_data(&[9.0]);
+        let s = File::open_rw(&src_path).unwrap();
+        s.root().create_group("template").unwrap();
+        s.root().create_group("template/inner").unwrap();
+        s.root()
+            .create_dataset("template/a", |b| {
+                b.with_i32_data(&[1, 2]);
+            })
+            .unwrap();
+        s.root()
+            .create_dataset("template/inner/b", |b| {
+                b.with_f64_data(&[9.0]);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
     write_starter(&dst_path);
 
     {
         let source = File::open(&src_path).unwrap();
-        let mut session = EditSession::open(&dst_path).unwrap();
+        let session = File::open_rw(&dst_path).unwrap();
         session.copy_from(&source, "template", "run1").unwrap();
         session.commit().unwrap();
     }
@@ -1260,8 +1439,8 @@ fn copy_from_file_into_subgroup_created_same_session() {
 
     {
         let source = File::open(&src_path).unwrap();
-        let mut session = EditSession::open(&dst_path).unwrap();
-        session.create_group("dest");
+        let session = File::open_rw(&dst_path).unwrap();
+        session.root().create_group("dest").unwrap();
         session
             .copy_from(&source, "payload", "dest/payload_copy")
             .unwrap();
@@ -1298,7 +1477,7 @@ fn copy_from_file_preserves_attributes() {
     let src_attrs = {
         let source = File::open(&src_path).unwrap();
         let attrs = source.dataset("src").unwrap().attrs().unwrap();
-        let mut session = EditSession::open(&dst_path).unwrap();
+        let session = File::open_rw(&dst_path).unwrap();
         session.copy_from(&source, "src", "dup").unwrap();
         session.commit().unwrap();
         attrs
@@ -1333,7 +1512,7 @@ fn copy_from_file_rejects_variable_length() {
 
     {
         let source = File::open(&src_path).unwrap();
-        let mut session = EditSession::open(&dst_path).unwrap();
+        let session = File::open_rw(&dst_path).unwrap();
         let err = session.copy_from(&source, "src", "dup").unwrap_err();
         assert!(
             err.to_string().contains("variable-length or reference"),
@@ -1369,7 +1548,7 @@ fn copy_from_file_rejects_reference_dataset() {
 
     {
         let source = File::open(&src_path).unwrap();
-        let mut session = EditSession::open(&dst_path).unwrap();
+        let session = File::open_rw(&dst_path).unwrap();
         let err = session.copy_from(&source, "refs", "dup").unwrap_err();
         assert!(
             err.to_string().contains("variable-length or reference"),
@@ -1393,7 +1572,7 @@ fn copy_from_file_rejects_missing_source() {
     write_starter(&dst_path);
 
     let source = File::open(&src_path).unwrap();
-    let mut session = EditSession::open(&dst_path).unwrap();
+    let session = File::open_rw(&dst_path).unwrap();
     let err = session.copy_from(&source, "ghost", "x").unwrap_err();
     assert!(err.to_string().contains("does not exist"), "got: {err}");
 
@@ -1417,7 +1596,7 @@ fn copy_from_file_rejects_destination_collision() {
 
     {
         let source = File::open(&src_path).unwrap();
-        let mut session = EditSession::open(&dst_path).unwrap();
+        let session = File::open_rw(&dst_path).unwrap();
         session.copy_from(&source, "payload", "original").unwrap();
         let err = session.commit().unwrap_err();
         assert!(err.to_string().contains("already exists"), "got: {err}");
@@ -1442,7 +1621,7 @@ fn copy_from_file_rejects_streaming_source() {
     write_starter(&dst_path);
 
     let source = File::open_streaming(&src_path).unwrap();
-    let mut session = EditSession::open(&dst_path).unwrap();
+    let session = File::open_rw(&dst_path).unwrap();
     let err = session.copy_from(&source, "payload", "dup").unwrap_err();
     assert!(err.to_string().contains("buffered source"), "got: {err}");
 
@@ -1468,8 +1647,8 @@ fn copy_same_file_still_allows_variable_length_attribute() {
     }
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.copy("src", "dup");
+        let session = File::open_rw(&path).unwrap();
+        session.copy("src", "dup").unwrap();
         session.commit().unwrap();
     }
 
@@ -1488,10 +1667,13 @@ fn superblock_eof_matches_file_size_after_edit() {
     let path = std::env::temp_dir().join("hdf5_pure_edit_eof.h5");
     write_starter(&path);
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("more")
-            .with_f64_data(&[1.0, 2.0, 3.0]);
+            .root()
+            .create_dataset("more", |b| {
+                b.with_f64_data(&[1.0, 2.0, 3.0]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -1512,11 +1694,13 @@ fn add_chunked_dataset() {
 
     let data: Vec<f64> = (0..100).map(|i| i as f64 * 0.5).collect();
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("chunky")
-            .with_f64_data(&data)
-            .with_chunks(&[25]);
+            .root()
+            .create_dataset("chunky", |b| {
+                b.with_f64_data(&data).with_chunks(&[25]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -1544,23 +1728,28 @@ fn add_filtered_datasets() {
 
     let data: Vec<f64> = (0..200).map(|i| i as f64).collect();
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("deflated")
-            .with_f64_data(&data)
-            .with_chunks(&[50])
-            .with_deflate(6);
+            .root()
+            .create_dataset("deflated", |b| {
+                b.with_f64_data(&data).with_chunks(&[50]).with_deflate(6);
+            })
+            .unwrap();
         session
-            .create_dataset("shuffled")
-            .with_f64_data(&data)
-            .with_chunks(&[50])
-            .with_shuffle()
-            .with_deflate(4);
+            .root()
+            .create_dataset("shuffled", |b| {
+                b.with_f64_data(&data)
+                    .with_chunks(&[50])
+                    .with_shuffle()
+                    .with_deflate(4);
+            })
+            .unwrap();
         session
-            .create_dataset("checked")
-            .with_f64_data(&data)
-            .with_chunks(&[64])
-            .with_fletcher32();
+            .root()
+            .create_dataset("checked", |b| {
+                b.with_f64_data(&data).with_chunks(&[64]).with_fletcher32();
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -1584,12 +1773,15 @@ fn add_scale_offset_dataset() {
 
     let data: Vec<i32> = (0..120).map(|i| 1000 + (i % 7)).collect();
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("counts")
-            .with_i32_data(&data)
-            .with_chunks(&[40])
-            .with_scale_offset(ScaleOffset::Integer(0));
+            .root()
+            .create_dataset("counts", |b| {
+                b.with_i32_data(&data)
+                    .with_chunks(&[40])
+                    .with_scale_offset(ScaleOffset::Integer(0));
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -1607,12 +1799,15 @@ fn add_2d_chunked_dataset() {
 
     let data: Vec<i32> = (0..(7 * 5)).collect();
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("grid")
-            .with_i32_data(&data)
-            .with_shape(&[7, 5])
-            .with_chunks(&[3, 2]);
+            .root()
+            .create_dataset("grid", |b| {
+                b.with_i32_data(&data)
+                    .with_shape(&[7, 5])
+                    .with_chunks(&[3, 2]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -1633,13 +1828,16 @@ fn add_extensible_dataset() {
 
     let data: Vec<i32> = (0..64).collect();
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("stream")
-            .with_i32_data(&data)
-            .with_shape(&[64])
-            .with_maxshape(&[u64::MAX])
-            .with_chunks(&[16]);
+            .root()
+            .create_dataset("stream", |b| {
+                b.with_i32_data(&data)
+                    .with_shape(&[64])
+                    .with_maxshape(&[u64::MAX])
+                    .with_chunks(&[16]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -1660,17 +1858,23 @@ fn add_mixed_contiguous_and_chunked_in_group() {
 
     let wave: Vec<f64> = (0..512).map(|i| (i as f64 * 0.1).cos()).collect();
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_group("run");
+        let session = File::open_rw(&path).unwrap();
+        session.root().create_group("run").unwrap();
         session
-            .create_dataset("run/scalarish")
-            .with_i32_data(&[1, 2, 3]);
+            .root()
+            .create_dataset("run/scalarish", |b| {
+                b.with_i32_data(&[1, 2, 3]);
+            })
+            .unwrap();
         session
-            .create_dataset("run/wave")
-            .with_f64_data(&wave)
-            .with_chunks(&[128])
-            .with_shuffle()
-            .with_deflate(6);
+            .root()
+            .create_dataset("run/wave", |b| {
+                b.with_f64_data(&wave)
+                    .with_chunks(&[128])
+                    .with_shuffle()
+                    .with_deflate(6);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -1695,12 +1899,15 @@ fn added_chunked_dataset_reports_dtype() {
     let path = std::env::temp_dir().join("hdf5_pure_edit_chunked_dtype.h5");
     write_starter(&path);
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("c")
-            .with_f64_data(&(0..50).map(f64::from).collect::<Vec<_>>())
-            .with_chunks(&[10])
-            .with_deflate(3);
+            .root()
+            .create_dataset("c", |b| {
+                b.with_f64_data(&(0..50).map(f64::from).collect::<Vec<_>>())
+                    .with_chunks(&[10])
+                    .with_deflate(3);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
     let file = File::open(&path).unwrap();
@@ -1718,12 +1925,13 @@ fn add_zfp_dataset() {
 
     let data: Vec<f64> = (0..256).map(|i| (i as f64 * 0.05).sin()).collect();
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("zfp")
-            .with_f64_data(&data)
-            .with_chunks(&[64])
-            .with_zfp(32.0);
+            .root()
+            .create_dataset("zfp", |b| {
+                b.with_f64_data(&data).with_chunks(&[64]).with_zfp(32.0);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -1786,8 +1994,8 @@ fn malformed_chunked_requests_are_rejected_without_writing() {
         write_starter(&path);
         let before = std::fs::read(&path).unwrap();
         {
-            let mut session = EditSession::open(&path).unwrap();
-            configure(session.create_dataset("bad"));
+            let session = File::open_rw(&path).unwrap();
+            session.root().create_dataset("bad", configure).unwrap();
             let err = session.commit().unwrap_err();
             assert!(
                 err.to_string().contains("in-place edit"),
@@ -1813,10 +2021,14 @@ fn write_dataset_same_size_overwrites_in_place() {
     let size_before = std::fs::metadata(&path).unwrap().len();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .write_dataset("original")
-            .with_f64_data(&[9.0, 8.0, 7.0, 6.0]);
+            .dataset("original")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_f64_data(&[9.0, 8.0, 7.0, 6.0]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -1845,8 +2057,14 @@ fn write_dataset_resize_keeping_shape_is_a_reshape_and_refused() {
     write_starter(&path); // "original" = 4 f64
     let before = std::fs::read(&path).unwrap();
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.write_dataset("original").with_f64_data(&[42.0]);
+        let session = File::open_rw(&path).unwrap();
+        session
+            .dataset("original")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_f64_data(&[42.0]);
+            })
+            .unwrap();
         let err = session.commit().unwrap_err();
         assert!(
             err.to_string().contains("shape does not match"),
@@ -1872,11 +2090,15 @@ fn write_dataset_in_a_nested_group() {
         b.write(&path).unwrap();
     }
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         // Same size (in place) for the nested dataset.
         session
-            .write_dataset("grp/inner")
-            .with_i32_data(&[10, 20, 30]);
+            .dataset("grp/inner")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_i32_data(&[10, 20, 30]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
     let file = File::open(&path).unwrap();
@@ -1893,11 +2115,15 @@ fn write_dataset_rejects_datatype_mismatch() {
     write_starter(&path); // f64
     let before = std::fs::read(&path).unwrap();
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         // i32 data for an f64 dataset: a retype, refused.
         session
-            .write_dataset("original")
-            .with_i32_data(&[1, 2, 3, 4]);
+            .dataset("original")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_i32_data(&[1, 2, 3, 4]);
+            })
+            .unwrap();
         let err = session.commit().unwrap_err();
         assert!(
             err.to_string().contains("datatype does not match"),
@@ -1926,11 +2152,14 @@ fn write_dataset_rejects_shape_mismatch() {
     }
     let before = std::fs::read(&path).unwrap();
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .write_dataset("m")
-            .with_i32_data(&[1, 2, 3, 4, 5, 6])
-            .with_shape(&[6]);
+            .dataset("m")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_i32_data(&[1, 2, 3, 4, 5, 6]).with_shape(&[6]);
+            })
+            .unwrap();
         let err = session.commit().unwrap_err();
         assert!(
             err.to_string().contains("shape does not match"),
@@ -1950,13 +2179,15 @@ fn write_dataset_rejects_missing_target() {
     let path = std::env::temp_dir().join("hdf5_pure_write_missing.h5");
     write_starter(&path);
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.write_dataset("nope").with_f64_data(&[1.0]);
-        let err = session.commit().unwrap_err();
+        let session = File::open_rw(&path).unwrap();
+        // The missing target is now reported when the handle is resolved, before
+        // an overwrite can be staged, rather than at commit.
+        let err = session.dataset("nope").unwrap_err();
         assert!(
-            err.to_string().contains("nothing to overwrite"),
-            "expected missing-target refusal, got: {err}"
+            err.to_string().contains("nope"),
+            "expected the refusal to name the missing dataset, got: {err}"
         );
+        assert!(!session.has_staged_edits());
     }
     std::fs::remove_file(&path).ok();
 }
@@ -1977,11 +2208,14 @@ fn write_dataset_overwrites_unfiltered_chunked_in_place() {
     }
     let size_before = std::fs::metadata(&path).unwrap().len();
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .write_dataset("c")
-            .with_i32_data(&[8, 7, 6, 5, 4, 3, 2, 1])
-            .with_shape(&[8]);
+            .dataset("c")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_i32_data(&[8, 7, 6, 5, 4, 3, 2, 1]).with_shape(&[8]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
     // An unfiltered chunked overwrite is a true in-place write: the chunk slots
@@ -2019,11 +2253,14 @@ fn write_dataset_overwrites_2d_edge_chunked_in_place() {
     let size_before = std::fs::metadata(&path).unwrap().len();
     let updated: Vec<i32> = orig.iter().rev().copied().collect();
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .write_dataset("g")
-            .with_i32_data(&updated)
-            .with_shape(&[7, 5]);
+            .dataset("g")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_i32_data(&updated).with_shape(&[7, 5]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
     assert_eq!(std::fs::metadata(&path).unwrap().len(), size_before);
@@ -2042,22 +2279,28 @@ fn write_dataset_overwrites_extensible_chunked_in_place() {
     let orig: Vec<f64> = (0..60).map(|i| i as f64).collect();
     write_starter(&path);
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("ext")
-            .with_f64_data(&orig)
-            .with_shape(&[60])
-            .with_chunks(&[16])
-            .with_maxshape(&[u64::MAX]);
+            .root()
+            .create_dataset("ext", |b| {
+                b.with_f64_data(&orig)
+                    .with_shape(&[60])
+                    .with_chunks(&[16])
+                    .with_maxshape(&[u64::MAX]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
     let updated: Vec<f64> = orig.iter().map(|v| v * 2.0).collect();
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .write_dataset("ext")
-            .with_f64_data(&updated)
-            .with_shape(&[60]);
+            .dataset("ext")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_f64_data(&updated).with_shape(&[60]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
     let file = File::open(&path).unwrap();
@@ -2074,23 +2317,29 @@ fn write_dataset_overwrites_fletcher32_chunked_in_place() {
     let orig: Vec<f64> = (0..128).map(|i| i as f64).collect();
     write_starter(&path);
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("ck")
-            .with_f64_data(&orig)
-            .with_shape(&[128])
-            .with_chunks(&[64])
-            .with_fletcher32();
+            .root()
+            .create_dataset("ck", |b| {
+                b.with_f64_data(&orig)
+                    .with_shape(&[128])
+                    .with_chunks(&[64])
+                    .with_fletcher32();
+            })
+            .unwrap();
         session.commit().unwrap();
     }
     let size_before = std::fs::metadata(&path).unwrap().len();
     let updated: Vec<f64> = orig.iter().map(|v| v + 1000.0).collect();
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .write_dataset("ck")
-            .with_f64_data(&updated)
-            .with_shape(&[128]);
+            .dataset("ck")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_f64_data(&updated).with_shape(&[128]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
     assert_eq!(
@@ -2122,11 +2371,14 @@ fn write_dataset_overwrites_deflate_chunked_equal_size_in_place() {
     }
     let size_before = std::fs::metadata(&path).unwrap().len();
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .write_dataset("d")
-            .with_f64_data(&data)
-            .with_shape(&[200]);
+            .dataset("d")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_f64_data(&data).with_shape(&[200]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
     assert_eq!(
@@ -2160,11 +2412,14 @@ fn write_dataset_overwrites_deflate_chunked_relocates_on_size_change() {
         .map(|i| i.wrapping_mul(2_654_435_761u32 as i32) ^ (i << 3))
         .collect();
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .write_dataset("d")
-            .with_i32_data(&updated)
-            .with_shape(&[4096]);
+            .dataset("d")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_i32_data(&updated).with_shape(&[4096]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
     let file = File::open(&path).unwrap();
@@ -2202,15 +2457,23 @@ fn write_dataset_chunked_relocate_then_reuse_stays_valid() {
         .collect();
     let filler: Vec<f64> = (0..64).map(|i| i as f64).collect();
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .write_dataset("d")
-            .with_i32_data(&updated)
-            .with_shape(&[4096]);
+            .dataset("d")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_i32_data(&updated).with_shape(&[4096]);
+            })
+            .unwrap();
         session.commit().unwrap();
 
         // A later addition in the same session draws from the freed regions.
-        session.create_dataset("filler").with_f64_data(&filler);
+        session
+            .root()
+            .create_dataset("filler", |b| {
+                b.with_f64_data(&filler);
+            })
+            .unwrap();
         session.commit().unwrap();
     } // drop the editor (release its file lock) before reading back
 
@@ -2245,11 +2508,14 @@ fn write_dataset_overwrites_filtered_chunked_fits_with_slack_in_place() {
     // Highly compressible replacement => much smaller chunks that fit with slack.
     let updated: Vec<i32> = vec![7; 2048];
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .write_dataset("d")
-            .with_i32_data(&updated)
-            .with_shape(&[2048]);
+            .dataset("d")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_i32_data(&updated).with_shape(&[2048]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
     assert_eq!(
@@ -2277,24 +2543,30 @@ fn write_dataset_overwrites_filtered_extensible_fits_with_slack() {
         .collect();
     write_starter(&path);
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("d")
-            .with_i32_data(&orig)
-            .with_shape(&[2048])
-            .with_chunks(&[512])
-            .with_maxshape(&[u64::MAX]) // unlimited => Extensible Array index
-            .with_deflate(6);
+            .root()
+            .create_dataset("d", |b| {
+                b.with_i32_data(&orig)
+                    .with_shape(&[2048])
+                    .with_chunks(&[512])
+                    .with_maxshape(&[u64::MAX]) // unlimited => Extensible Array index
+                    .with_deflate(6);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
     let size_before = std::fs::metadata(&path).unwrap().len();
     let updated: Vec<i32> = vec![3; 2048];
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .write_dataset("d")
-            .with_i32_data(&updated)
-            .with_shape(&[2048]);
+            .dataset("d")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_i32_data(&updated).with_shape(&[2048]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
     assert_eq!(
@@ -2317,12 +2589,16 @@ fn write_dataset_rejects_filtered_request() {
     let path = std::env::temp_dir().join("hdf5_pure_write_filtered_request.h5");
     write_starter(&path);
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .write_dataset("original")
-            .with_f64_data(&[1.0, 2.0, 3.0, 4.0])
-            .with_shape(&[4])
-            .with_chunks(&[2]);
+            .dataset("original")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_f64_data(&[1.0, 2.0, 3.0, 4.0])
+                    .with_shape(&[4])
+                    .with_chunks(&[2]);
+            })
+            .unwrap();
         let err = session.commit().unwrap_err();
         assert!(
             err.to_string().contains("overwrites values only"),
@@ -2340,11 +2616,15 @@ fn write_dataset_rejects_staged_attributes() {
     write_starter(&path);
     let before = std::fs::read(&path).unwrap();
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .write_dataset("original")
-            .with_f64_data(&[5.0, 6.0, 7.0, 8.0]) // same size, valid overwrite
-            .set_attr("units", AttrValue::String("m/s".into()));
+            .dataset("original")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_f64_data(&[5.0, 6.0, 7.0, 8.0]) // same size, valid overwrite
+                    .set_attr("units", AttrValue::String("m/s".into()));
+            })
+            .unwrap();
         let err = session.commit().unwrap_err();
         assert!(
             err.to_string().contains("cannot set attributes"),
@@ -2370,10 +2650,21 @@ fn write_dataset_alongside_other_edits() {
         b.write(&path).unwrap();
     }
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.write_dataset("keep").with_f64_data(&[5.0, 6.0]); // same size
-        session.create_dataset("added").with_i32_data(&[3, 4]);
-        session.delete("doomed");
+        let session = File::open_rw(&path).unwrap();
+        session
+            .dataset("keep")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_f64_data(&[5.0, 6.0]);
+            })
+            .unwrap(); // same size
+        session
+            .root()
+            .create_dataset("added", |b| {
+                b.with_i32_data(&[3, 4]);
+            })
+            .unwrap();
+        session.root().delete("doomed").unwrap();
         session.commit().unwrap();
     }
     let file = File::open(&path).unwrap();
@@ -2397,10 +2688,14 @@ fn write_dataset_with_no_other_edits_takes_inplace_fast_path() {
     write_starter(&path);
     let before = std::fs::read(&path).unwrap();
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .write_dataset("original")
-            .with_f64_data(&[1.0, 2.0, 3.0, 4.0]); // identical bytes
+            .dataset("original")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_f64_data(&[1.0, 2.0, 3.0, 4.0]);
+            })
+            .unwrap(); // identical bytes
         session.commit().unwrap();
     }
     // Identical data written back in place leaves the file byte-for-byte the same.
@@ -2422,12 +2717,19 @@ fn add_empty_dataset_via_edit_session() {
     write_starter(&path);
 
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("empty")
-            .with_f64_data(&[])
-            .with_shape(&[0, 3]);
-        session.create_dataset("added").with_i32_data(&[7, 8]);
+            .root()
+            .create_dataset("empty", |b| {
+                b.with_f64_data(&[]).with_shape(&[0, 3]);
+            })
+            .unwrap();
+        session
+            .root()
+            .create_dataset("added", |b| {
+                b.with_i32_data(&[7, 8]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -2452,7 +2754,7 @@ fn add_empty_dataset_via_edit_session() {
 /// separately-tracked capability from the plain contiguous empty dataset
 /// above): `malformed_chunked_requests_are_rejected_without_writing` already
 /// covers the whole-file-writer-equivalent geometry refusal; this confirms
-/// `EditSession` refuses it too, cleanly, without writing anything.
+/// `File::open_rw` refuses it too, cleanly, without writing anything.
 #[test]
 fn add_chunked_empty_dataset_is_rejected_without_writing() {
     let path = std::env::temp_dir().join("hdf5_pure_edit_add_chunked_empty.h5");
@@ -2460,13 +2762,16 @@ fn add_chunked_empty_dataset_is_rejected_without_writing() {
     let before = std::fs::read(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("stream")
-            .with_i32_data(&[])
-            .with_shape(&[0])
-            .with_maxshape(&[u64::MAX])
-            .with_chunks(&[16]);
+            .root()
+            .create_dataset("stream", |b| {
+                b.with_i32_data(&[])
+                    .with_shape(&[0])
+                    .with_maxshape(&[u64::MAX])
+                    .with_chunks(&[16]);
+            })
+            .unwrap();
         let err = session.commit().unwrap_err();
         assert!(err.to_string().contains("empty"), "got: {err}");
     }
@@ -2486,11 +2791,13 @@ fn add_empty_dataset_with_mismatched_data_is_rejected_without_writing() {
     let before = std::fs::read(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("bogus")
-            .with_f64_data(&[9.0, 9.0, 9.0])
-            .with_shape(&[0, 3]);
+            .root()
+            .create_dataset("bogus", |b| {
+                b.with_f64_data(&[9.0, 9.0, 9.0]).with_shape(&[0, 3]);
+            })
+            .unwrap();
         let err = session.commit().unwrap_err();
         assert!(err.to_string().contains("shape"), "got: {err}");
     }
@@ -2512,11 +2819,17 @@ fn add_provenance_dataset_via_edit_session() {
     write_starter(&path);
 
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("sensor")
-            .with_f64_data(&[1.0, 2.0, 3.0])
-            .with_provenance("test-suite", "2026-02-19T12:00:00Z", Some("bench"));
+            .root()
+            .create_dataset("sensor", |b| {
+                b.with_f64_data(&[1.0, 2.0, 3.0]).with_provenance(
+                    "test-suite",
+                    "2026-02-19T12:00:00Z",
+                    Some("bench"),
+                );
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -2553,14 +2866,17 @@ fn add_provenance_chunked_dataset_via_edit_session() {
     write_starter(&path);
 
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("sensor_chunked")
-            .with_f64_data(&[1.0, 2.0, 3.0, 4.0])
-            .with_shape(&[4])
-            .with_chunks(&[2])
-            .with_deflate(6)
-            .with_provenance("test-suite", "2026-02-19T12:00:00Z", None);
+            .root()
+            .create_dataset("sensor_chunked", |b| {
+                b.with_f64_data(&[1.0, 2.0, 3.0, 4.0])
+                    .with_shape(&[4])
+                    .with_chunks(&[2])
+                    .with_deflate(6)
+                    .with_provenance("test-suite", "2026-02-19T12:00:00Z", None);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -2592,14 +2908,18 @@ fn add_provenance_dataset_at_attr_budget_boundary_via_edit_session() {
     write_starter(&path);
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        let ds = session.create_dataset("sensor_at_budget");
-        ds.with_f64_data(&[1.0, 2.0]);
-        // 4 plain attributes + 4 provenance attributes (source included) = 8.
-        for i in 0..4i64 {
-            ds.set_attr(&format!("plain_{i}"), AttrValue::I64(i));
-        }
-        ds.with_provenance("test-suite", "2026-02-19T12:00:00Z", Some("bench"));
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("sensor_at_budget", |ds| {
+                ds.with_f64_data(&[1.0, 2.0]);
+                // 4 plain attributes + 4 provenance attributes (source included) = 8.
+                for i in 0..4i64 {
+                    ds.set_attr(&format!("plain_{i}"), AttrValue::I64(i));
+                }
+                ds.with_provenance("test-suite", "2026-02-19T12:00:00Z", Some("bench"));
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -2631,14 +2951,18 @@ fn add_provenance_dataset_over_attr_budget_is_rejected_without_writing() {
     let before = std::fs::read(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        let ds = session.create_dataset("sensor_over_budget");
-        ds.with_f64_data(&[1.0, 2.0]);
-        // 5 plain attributes + 4 provenance attributes (source included) = 9.
-        for i in 0..5 {
-            ds.set_attr(&format!("plain_{i}"), AttrValue::I32(i));
-        }
-        ds.with_provenance("test-suite", "2026-02-19T12:00:00Z", Some("bench"));
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("sensor_over_budget", |ds| {
+                ds.with_f64_data(&[1.0, 2.0]);
+                // 5 plain attributes + 4 provenance attributes (source included) = 9.
+                for i in 0..5 {
+                    ds.set_attr(&format!("plain_{i}"), AttrValue::I32(i));
+                }
+                ds.with_provenance("test-suite", "2026-02-19T12:00:00Z", Some("bench"));
+            })
+            .unwrap();
         let err = session.commit().unwrap_err();
         assert!(err.to_string().contains("dense"), "got: {err}");
     }
@@ -2656,14 +2980,18 @@ fn add_dataset_with_variable_length_attribute_via_edit_session() {
     write_starter(&path);
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        let ds = session.create_dataset("labeled");
-        ds.with_i32_data(&[1, 2, 3]);
-        ds.set_attr(
-            "tags",
-            AttrValue::VarLenAsciiArray(vec!["one".into(), "two".into(), "three".into()]),
-        );
-        ds.set_attr("scale", AttrValue::F64(2.5));
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("labeled", |ds| {
+                ds.with_i32_data(&[1, 2, 3]);
+                ds.set_attr(
+                    "tags",
+                    AttrValue::VarLenAsciiArray(vec!["one".into(), "two".into(), "three".into()]),
+                );
+                ds.set_attr("scale", AttrValue::F64(2.5));
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -2699,15 +3027,16 @@ fn add_chunked_dataset_with_variable_length_attribute_via_edit_session() {
 
     let data: Vec<f64> = (0..100).map(|i| i as f64 * 0.5).collect();
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("chunky_labeled")
-            .with_f64_data(&data)
-            .with_chunks(&[25])
-            .set_attr(
-                "tags",
-                AttrValue::VarLenAsciiArray(vec!["one".into(), "two".into()]),
-            );
+            .root()
+            .create_dataset("chunky_labeled", |b| {
+                b.with_f64_data(&data).with_chunks(&[25]).set_attr(
+                    "tags",
+                    AttrValue::VarLenAsciiArray(vec!["one".into(), "two".into()]),
+                );
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -2733,15 +3062,18 @@ fn add_dataset_with_oversized_variable_length_attribute_is_rejected_without_writ
     let before = std::fs::read(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         // Each element serializes to a fixed-size 16-byte global-heap
         // reference; 5000 of them (80000 bytes) comfortably overflows the
         // object header's 2-byte (`u16::MAX` = 65535) message-size field.
         let strings: Vec<String> = (0..5000).map(|i| i.to_string()).collect();
         session
-            .create_dataset("oversized")
-            .with_i32_data(&[1])
-            .set_attr("tags", AttrValue::VarLenAsciiArray(strings));
+            .root()
+            .create_dataset("oversized", |b| {
+                b.with_i32_data(&[1])
+                    .set_attr("tags", AttrValue::VarLenAsciiArray(strings));
+            })
+            .unwrap();
         let err = session.commit().unwrap_err();
         assert!(err.to_string().contains("too large"), "got: {err}");
     }
@@ -2751,7 +3083,7 @@ fn add_dataset_with_oversized_variable_length_attribute_is_rejected_without_writ
 }
 
 /// Regression test for issue #105's silent-corruption bug: a variable-length
-/// string dataset (`with_vlen_strings`) added via `EditSession` used to commit
+/// string dataset (`with_vlen_strings`) added via `File::open_rw` used to commit
 /// `Ok(())` without ever writing its global heap collection or patching its
 /// placeholder references, so the dataset failed to read back
 /// (`InvalidGlobalHeapSignature`). It must now round-trip like any other
@@ -2762,10 +3094,13 @@ fn add_vlen_string_dataset_via_edit_session() {
     write_starter(&path);
 
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("labels")
-            .with_vlen_strings(&["alpha", "", "gamma"]);
+            .root()
+            .create_dataset("labels", |b| {
+                b.with_vlen_strings(&["alpha", "", "gamma"]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -2790,11 +3125,13 @@ fn add_chunked_vlen_string_dataset_is_rejected_without_writing() {
     let before = std::fs::read(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("labels")
-            .with_vlen_strings(&["a", "b", "c"])
-            .with_chunks(&[2]);
+            .root()
+            .create_dataset("labels", |b| {
+                b.with_vlen_strings(&["a", "b", "c"]).with_chunks(&[2]);
+            })
+            .unwrap();
         let err = session.commit().unwrap_err();
         assert!(
             err.to_string().contains("variable-length-string"),
@@ -2816,10 +3153,13 @@ fn add_reference_dataset_targeting_preexisting_object_via_edit_session() {
     write_starter(&path);
 
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("refs")
-            .with_path_references(&["original"]);
+            .root()
+            .create_dataset("refs", |b| {
+                b.with_path_references(&["original"]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -2843,13 +3183,21 @@ fn add_reference_dataset_targeting_sibling_added_in_same_commit() {
     write_starter(&path);
 
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         // Stage the reference dataset BEFORE its target to prove placement
         // order is independent of `pending_datasets` staging order.
         session
-            .create_dataset("refs")
-            .with_path_references(&["target"]);
-        session.create_dataset("target").with_i32_data(&[7, 8, 9]);
+            .root()
+            .create_dataset("refs", |b| {
+                b.with_path_references(&["target"]);
+            })
+            .unwrap();
+        session
+            .root()
+            .create_dataset("target", |b| {
+                b.with_i32_data(&[7, 8, 9]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -2873,10 +3221,13 @@ fn add_reference_dataset_targeting_nonexistent_path_becomes_undefined() {
     write_starter(&path);
 
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("refs")
-            .with_path_references(&["does/not/exist"]);
+            .root()
+            .create_dataset("refs", |b| {
+                b.with_path_references(&["does/not/exist"]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -2902,8 +3253,13 @@ fn add_reference_dataset_targeting_unprocessed_ancestor_is_rejected_without_writ
     let before = std::fs::read(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_dataset("refs").with_path_references(&[""]); // root, its own parent
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("refs", |b| {
+                b.with_path_references(&[""]);
+            })
+            .unwrap(); // root, its own parent
         let err = session.commit().unwrap_err();
         assert!(err.to_string().contains("still writing"), "got: {err}");
     }
@@ -2924,12 +3280,15 @@ fn add_reference_dataset_targeting_unprocessed_sibling_group_is_rejected_without
     let before = std::fs::read(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_group("a");
-        session.create_group("b");
+        let session = File::open_rw(&path).unwrap();
+        session.root().create_group("a").unwrap();
+        session.root().create_group("b").unwrap();
         session
-            .create_dataset("a/refs")
-            .with_path_references(&["b"]);
+            .root()
+            .create_dataset("a/refs", |b| {
+                b.with_path_references(&["b"]);
+            })
+            .unwrap();
         let err = session.commit().unwrap_err();
         assert!(err.to_string().contains("still writing"), "got: {err}");
     }
@@ -2945,11 +3304,13 @@ fn add_chunked_reference_dataset_is_rejected_without_writing() {
     let before = std::fs::read(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("refs")
-            .with_path_references(&["original"])
-            .with_chunks(&[1]);
+            .root()
+            .create_dataset("refs", |b| {
+                b.with_path_references(&["original"]).with_chunks(&[1]);
+            })
+            .unwrap();
         let err = session.commit().unwrap_err();
         assert!(err.to_string().contains("object-reference"), "got: {err}");
     }
@@ -2968,11 +3329,19 @@ fn add_reference_dataset_with_multiple_elements_via_edit_session() {
     write_starter(&path);
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_dataset("second").with_i32_data(&[42]);
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("refs")
-            .with_path_references(&["original", "second", "original"]);
+            .root()
+            .create_dataset("second", |b| {
+                b.with_i32_data(&[42]);
+            })
+            .unwrap();
+        session
+            .root()
+            .create_dataset("refs", |b| {
+                b.with_path_references(&["original", "second", "original"]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -3010,10 +3379,13 @@ fn add_reference_dataset_targeting_a_group_via_edit_session() {
     b.write(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("refs")
-            .with_path_references(&["grp"]);
+            .root()
+            .create_dataset("refs", |b| {
+                b.with_path_references(&["grp"]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -3041,8 +3413,13 @@ fn add_zero_element_reference_dataset_via_edit_session() {
     write_starter(&path);
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_dataset("refs").with_path_references(&[]);
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("refs", |b| {
+                b.with_path_references(&[]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -3067,15 +3444,21 @@ fn add_reference_dataset_targeting_same_commit_delete_is_rejected_without_writin
     let before = std::fs::read(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_group("grp");
+        let session = File::open_rw(&path).unwrap();
+        session.root().create_group("grp").unwrap();
         session
-            .create_dataset("grp/inner")
-            .with_i32_data(&[1, 2, 3]);
-        session.delete("original");
+            .root()
+            .create_dataset("grp/inner", |b| {
+                b.with_i32_data(&[1, 2, 3]);
+            })
+            .unwrap();
+        session.root().delete("original").unwrap();
         session
-            .create_dataset("refs")
-            .with_path_references(&["original"]);
+            .root()
+            .create_dataset("refs", |b| {
+                b.with_path_references(&["original"]);
+            })
+            .unwrap();
         let err = session.commit().unwrap_err();
         assert!(err.to_string().contains("still writing"), "got: {err}");
     }
@@ -3095,15 +3478,21 @@ fn add_reference_dataset_targeting_copy_destination_is_rejected_without_writing(
     let before = std::fs::read(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_group("grp");
+        let session = File::open_rw(&path).unwrap();
+        session.root().create_group("grp").unwrap();
         session
-            .create_dataset("grp/inner")
-            .with_i32_data(&[1, 2, 3]);
-        session.copy("original", "dup");
+            .root()
+            .create_dataset("grp/inner", |b| {
+                b.with_i32_data(&[1, 2, 3]);
+            })
+            .unwrap();
+        session.copy("original", "dup").unwrap();
         session
-            .create_dataset("refs")
-            .with_path_references(&["dup"]);
+            .root()
+            .create_dataset("refs", |b| {
+                b.with_path_references(&["dup"]);
+            })
+            .unwrap();
         let err = session.commit().unwrap_err();
         assert!(err.to_string().contains("still writing"), "got: {err}");
     }
@@ -3123,17 +3512,27 @@ fn add_reference_dataset_targeting_write_overwrite_target_is_rejected_without_wr
     let before = std::fs::read(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_group("grp");
+        let session = File::open_rw(&path).unwrap();
+        session.root().create_group("grp").unwrap();
         session
-            .create_dataset("grp/inner")
-            .with_i32_data(&[1, 2, 3]);
+            .root()
+            .create_dataset("grp/inner", |b| {
+                b.with_i32_data(&[1, 2, 3]);
+            })
+            .unwrap();
         session
-            .write_dataset("original")
-            .with_f64_data(&[9.0, 9.0, 9.0, 9.0]);
+            .dataset("original")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_f64_data(&[9.0, 9.0, 9.0, 9.0]);
+            })
+            .unwrap();
         session
-            .create_dataset("refs")
-            .with_path_references(&["original"]);
+            .root()
+            .create_dataset("refs", |b| {
+                b.with_path_references(&["original"]);
+            })
+            .unwrap();
         let err = session.commit().unwrap_err();
         assert!(err.to_string().contains("still writing"), "got: {err}");
     }
@@ -3153,11 +3552,14 @@ fn add_extensible_vlen_string_dataset_is_rejected_without_writing() {
     let before = std::fs::read(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("labels")
-            .with_vlen_strings(&["a", "b", "c"])
-            .with_maxshape(&[u64::MAX]);
+            .root()
+            .create_dataset("labels", |b| {
+                b.with_vlen_strings(&["a", "b", "c"])
+                    .with_maxshape(&[u64::MAX]);
+            })
+            .unwrap();
         let err = session.commit().unwrap_err();
         assert!(
             err.to_string().contains("variable-length-string"),
@@ -3179,8 +3581,13 @@ fn add_zero_element_vlen_string_dataset_via_edit_session() {
     write_starter(&path);
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_dataset("labels").with_vlen_strings(&[]);
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("labels", |b| {
+                b.with_vlen_strings(&[]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -3205,10 +3612,14 @@ fn write_dataset_rejects_vlen_strings_without_writing() {
     let before = std::fs::read(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .write_dataset("labels")
-            .with_vlen_strings(&["x", "y"]);
+            .dataset("labels")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_vlen_strings(&["x", "y"]);
+            })
+            .unwrap();
         let err = session.commit().unwrap_err();
         assert!(
             err.to_string().contains("variable-length-string"),

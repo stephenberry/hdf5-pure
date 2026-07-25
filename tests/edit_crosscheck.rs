@@ -4,7 +4,7 @@
 #![cfg(not(target_pointer_width = "32"))]
 //! Cross-validation for in-place editing against the reference C library
 //! (issue #32): files the C library *writes* are edited in place by
-//! `EditSession`, and the result is read back by both `hdf5-pure` and the C
+//! `File::open_rw`, and the result is read back by both `hdf5-pure` and the C
 //! library. This proves the editor works on files it did not itself produce, in
 //! both the HDF5 1.8 (v2 superblock) and 1.10+ (v3 superblock) formats, and
 //! including headers the C library splits across multiple chunks (which the
@@ -15,21 +15,26 @@
 //! compact-link format on rewrite, the superblock's root symbol-table entry is
 //! repointed, and the result is read back correctly by the C library.
 
-#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5::file::LibraryVersion;
-use hdf5_pure::{AttrValue, EditSession, File, FileBuilder, ScaleOffset};
+use hdf5_pure::{AttrValue, File, FileBuilder, ScaleOffset};
 use tempfile::tempdir;
 
 /// Stage an add, an add-into-a-group, a delete, and a copy — the full op set.
-fn stage_edits(session: &mut EditSession) {
+fn stage_edits(session: &File) {
     session
-        .create_dataset("added")
-        .with_f64_data(&[100.0, 200.0]);
+        .root()
+        .create_dataset("added", |b| {
+            b.with_f64_data(&[100.0, 200.0]);
+        })
+        .unwrap();
     session
-        .create_dataset("grp/gamma")
-        .with_i32_data(&[1, 2, 3]);
-    session.delete("doomed");
-    session.copy("alpha", "alpha_copy");
+        .root()
+        .create_dataset("grp/gamma", |b| {
+            b.with_i32_data(&[1, 2, 3]);
+        })
+        .unwrap();
+    session.root().delete("doomed").unwrap();
+    session.copy("alpha", "alpha_copy").unwrap();
 }
 
 /// Read the edited file back through both readers and assert every object is
@@ -128,8 +133,8 @@ fn pure_written_file_edited_then_read_by_c_library() {
     b.write(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        stage_edits(&mut session);
+        let session = File::open_rw(&path).unwrap();
+        stage_edits(&session);
         session.commit().unwrap();
     } // drop the editor (release its exclusive lock) before reading back
 
@@ -144,8 +149,8 @@ fn c_written_v2_file_edited_in_place() {
     assert_eq!(File::open(&path).unwrap().superblock().version, 2);
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        stage_edits(&mut session);
+        let session = File::open_rw(&path).unwrap();
+        stage_edits(&session);
         session.commit().unwrap();
     } // drop the editor (release its exclusive lock) before reading back
 
@@ -160,8 +165,8 @@ fn c_written_v3_file_edited_in_place() {
     assert_eq!(File::open(&path).unwrap().superblock().version, 3);
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        stage_edits(&mut session);
+        let session = File::open_rw(&path).unwrap();
+        stage_edits(&session);
         session.commit().unwrap();
     } // drop the editor (release its exclusive lock) before reading back
 
@@ -213,8 +218,8 @@ fn c_multichunk_group_header_is_collapsed_and_edited() {
     }
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        stage_edits(&mut session);
+        let session = File::open_rw(&path).unwrap();
+        stage_edits(&session);
         session.commit().unwrap();
     }
 
@@ -247,14 +252,20 @@ fn c_v0_symboltable_file_edited_then_read_by_c_library() {
     // Add at root, add into the (symbol-table) group, and delete a root dataset.
     // (Copy of the existing v1 objects is not supported, so it is not staged.)
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("added")
-            .with_f64_data(&[100.0, 200.0]);
+            .root()
+            .create_dataset("added", |b| {
+                b.with_f64_data(&[100.0, 200.0]);
+            })
+            .unwrap();
         session
-            .create_dataset("grp/gamma")
-            .with_i32_data(&[1, 2, 3]);
-        session.delete("doomed");
+            .root()
+            .create_dataset("grp/gamma", |b| {
+                b.with_i32_data(&[1, 2, 3]);
+            })
+            .unwrap();
+        session.root().delete("doomed").unwrap();
         session.commit().unwrap();
     }
 
@@ -329,8 +340,13 @@ fn c_v0_root_attributes_survive_conversion() {
     assert!(File::open(&path).unwrap().superblock().version <= 1);
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.create_dataset("extra").with_i32_data(&[9]);
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("extra", |b| {
+                b.with_i32_data(&[9]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -359,12 +375,24 @@ fn c_library_reads_group_attributes_edited_in_place() {
     b.write(&path).unwrap();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.set_group_attr("grp", "count", AttrValue::I64(2));
-        session.set_group_attr("grp", "added", AttrValue::I64(3));
-        session.remove_group_attr("grp", "drop");
-        session.create_group("new_grp");
-        session.set_group_attr("new_grp", "tag", AttrValue::I64(55));
+        let session = File::open_rw(&path).unwrap();
+        session
+            .group("grp")
+            .unwrap()
+            .set_attr("count", AttrValue::I64(2))
+            .unwrap();
+        session
+            .group("grp")
+            .unwrap()
+            .set_attr("added", AttrValue::I64(3))
+            .unwrap();
+        session.group("grp").unwrap().remove_attr("drop").unwrap();
+        session
+            .root()
+            .create_group_with("new_grp", |g| {
+                g.set_attr("tag", AttrValue::I64(55));
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -400,15 +428,18 @@ fn free_space_reuse_and_truncation_stay_c_readable() {
     let size_start = std::fs::metadata(&path).unwrap().len();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("bulk")
-            .with_f64_data(&vec![9.0; 2048]);
+            .root()
+            .create_dataset("bulk", |b| {
+                b.with_f64_data(&vec![9.0; 2048]);
+            })
+            .unwrap();
         session.commit().unwrap();
         let size_with_bulk = std::fs::metadata(&path).unwrap().len();
         assert!(size_with_bulk > size_start);
 
-        session.delete("bulk");
+        session.root().delete("bulk").unwrap();
         session.commit().unwrap();
         let size_after = std::fs::metadata(&path).unwrap().len();
         assert!(
@@ -453,41 +484,59 @@ fn chunked_and_filtered_datasets_added_in_place_are_c_readable() {
     let ext_data: Vec<i32> = (0..128).collect();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("deflated")
-            .with_f64_data(&f64_data)
-            .with_chunks(&[100])
-            .with_deflate(6);
+            .root()
+            .create_dataset("deflated", |b| {
+                b.with_f64_data(&f64_data)
+                    .with_chunks(&[100])
+                    .with_deflate(6);
+            })
+            .unwrap();
         session
-            .create_dataset("shuffled")
-            .with_f64_data(&f64_data)
-            .with_chunks(&[64])
-            .with_shuffle()
-            .with_deflate(4);
+            .root()
+            .create_dataset("shuffled", |b| {
+                b.with_f64_data(&f64_data)
+                    .with_chunks(&[64])
+                    .with_shuffle()
+                    .with_deflate(4);
+            })
+            .unwrap();
         session
-            .create_dataset("checked")
-            .with_i32_data(&i32_data)
-            .with_chunks(&[80])
-            .with_fletcher32();
+            .root()
+            .create_dataset("checked", |b| {
+                b.with_i32_data(&i32_data)
+                    .with_chunks(&[80])
+                    .with_fletcher32();
+            })
+            .unwrap();
         session
-            .create_dataset("scaled")
-            .with_i32_data(&i32_data)
-            .with_chunks(&[80])
-            .with_scale_offset(ScaleOffset::Integer(0));
+            .root()
+            .create_dataset("scaled", |b| {
+                b.with_i32_data(&i32_data)
+                    .with_chunks(&[80])
+                    .with_scale_offset(ScaleOffset::Integer(0));
+            })
+            .unwrap();
         // Into a group the C library wrote, exercising header relocation.
         session
-            .create_dataset("grp/grid")
-            .with_i32_data(&(0..(6 * 4)).collect::<Vec<i32>>())
-            .with_shape(&[6, 4])
-            .with_chunks(&[4, 3]);
+            .root()
+            .create_dataset("grp/grid", |b| {
+                b.with_i32_data(&(0..(6 * 4)).collect::<Vec<i32>>())
+                    .with_shape(&[6, 4])
+                    .with_chunks(&[4, 3]);
+            })
+            .unwrap();
         // Extensible (unlimited) dataset → Extensible-Array chunk index.
         session
-            .create_dataset("stream")
-            .with_i32_data(&ext_data)
-            .with_shape(&[128])
-            .with_maxshape(&[u64::MAX])
-            .with_chunks(&[32]);
+            .root()
+            .create_dataset("stream", |b| {
+                b.with_i32_data(&ext_data)
+                    .with_shape(&[128])
+                    .with_maxshape(&[u64::MAX])
+                    .with_chunks(&[32]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -588,9 +637,9 @@ fn deleting_chunked_datasets_in_place_stays_c_readable() {
     let with_c_chunked = std::fs::metadata(&path).unwrap().len();
 
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         // Reclaim the C-written B-tree-v1 chunked dataset.
-        session.delete("c_chunked");
+        session.root().delete("c_chunked").unwrap();
         session.commit().unwrap();
         // Re-add *contiguous* datasets sized to the reclaimed 1024-byte chunk
         // holes. (Chunked adds always append their blob, so contiguous adds are
@@ -600,8 +649,11 @@ fn deleting_chunked_datasets_in_place_stays_c_readable() {
         // file would grow by ~6 KB, failing the bound below.
         for i in 0..6 {
             session
-                .create_dataset(&format!("r{i}"))
-                .with_i32_data(&vec![i; 256]); // 256 i32 = 1024 bytes, one chunk hole
+                .root()
+                .create_dataset(&format!("r{i}"), |b| {
+                    b.with_i32_data(&vec![i; 256]);
+                })
+                .unwrap(); // 256 i32 = 1024 bytes, one chunk hole
             session.commit().unwrap();
         }
     }
@@ -679,13 +731,16 @@ fn overwriting_chunked_datasets_in_place_stays_c_readable() {
 
     // Add an editor-written deflate dataset (highly compressible to start).
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("deflated")
-            .with_i32_data(&vec![0i32; 2048])
-            .with_shape(&[2048])
-            .with_chunks(&[256])
-            .with_deflate(6);
+            .root()
+            .create_dataset("deflated", |b| {
+                b.with_i32_data(&vec![0i32; 2048])
+                    .with_shape(&[2048])
+                    .with_chunks(&[256])
+                    .with_deflate(6);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -698,15 +753,21 @@ fn overwriting_chunked_datasets_in_place_stays_c_readable() {
         .map(|i| i.wrapping_mul(2_654_435_761u32 as i32) ^ (i << 3))
         .collect();
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .write_dataset("c_chunked")
-            .with_i32_data(&btree_new)
-            .with_shape(&[2048]);
+            .dataset("c_chunked")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_i32_data(&btree_new).with_shape(&[2048]);
+            })
+            .unwrap();
         session
-            .write_dataset("deflated")
-            .with_i32_data(&deflate_new)
-            .with_shape(&[2048]);
+            .dataset("deflated")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_i32_data(&deflate_new).with_shape(&[2048]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -760,13 +821,16 @@ fn fits_with_slack_filtered_overwrite_stays_c_readable() {
         .map(|i| i.wrapping_mul(2_654_435_761u32 as i32) ^ (i << 3))
         .collect();
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("d")
-            .with_i32_data(&orig)
-            .with_shape(&[2048])
-            .with_chunks(&[512])
-            .with_deflate(6);
+            .root()
+            .create_dataset("d", |b| {
+                b.with_i32_data(&orig)
+                    .with_shape(&[2048])
+                    .with_chunks(&[512])
+                    .with_deflate(6);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
     let size_before = std::fs::metadata(&path).unwrap().len();
@@ -774,11 +838,14 @@ fn fits_with_slack_filtered_overwrite_stays_c_readable() {
     // Overwrite with highly compressible values: chunks shrink and fit with slack.
     let updated: Vec<i32> = vec![5; 2048];
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .write_dataset("d")
-            .with_i32_data(&updated)
-            .with_shape(&[2048]);
+            .dataset("d")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_i32_data(&updated).with_shape(&[2048]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
     assert_eq!(
@@ -833,20 +900,23 @@ fn copying_chunked_datasets_in_place_stays_c_readable() {
     // An editor-written, highly compressible deflate dataset to copy too.
     let deflate: Vec<i32> = (0..4096).map(|i| i % 4).collect();
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("deflated")
-            .with_i32_data(&deflate)
-            .with_shape(&[4096])
-            .with_chunks(&[512])
-            .with_shuffle()
-            .with_deflate(6);
+            .root()
+            .create_dataset("deflated", |b| {
+                b.with_i32_data(&deflate)
+                    .with_shape(&[4096])
+                    .with_chunks(&[512])
+                    .with_shuffle()
+                    .with_deflate(6);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.copy("c_chunked", "c_chunked_copy");
-        session.copy("deflated", "deflated_copy");
+        let session = File::open_rw(&path).unwrap();
+        session.copy("c_chunked", "c_chunked_copy").unwrap();
+        session.copy("deflated", "deflated_copy").unwrap();
         session.commit().unwrap();
     }
 
@@ -909,13 +979,16 @@ fn overwriting_multiply_linked_chunked_that_relocates_is_refused() {
     }
     // Editor adds a deflate dataset (highly compressible).
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         session
-            .create_dataset("d")
-            .with_i32_data(&vec![0i32; 1024])
-            .with_shape(&[1024])
-            .with_chunks(&[256])
-            .with_deflate(6);
+            .root()
+            .create_dataset("d", |b| {
+                b.with_i32_data(&vec![0i32; 1024])
+                    .with_shape(&[1024])
+                    .with_chunks(&[256])
+                    .with_deflate(6);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
     // C library adds a second hard link to it.
@@ -926,15 +999,18 @@ fn overwriting_multiply_linked_chunked_that_relocates_is_refused() {
     }
     let before = std::fs::read(&path).unwrap();
     {
-        let mut session = EditSession::open(&path).unwrap();
+        let session = File::open_rw(&path).unwrap();
         // Incompressible new values change the stored size => relocate.
         let updated: Vec<i32> = (0..1024i32)
             .map(|i| i.wrapping_mul(2_654_435_761u32 as i32) ^ (i << 3))
             .collect();
         session
-            .write_dataset("d")
-            .with_i32_data(&updated)
-            .with_shape(&[1024]);
+            .dataset("d")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_i32_data(&updated).with_shape(&[1024]);
+            })
+            .unwrap();
         let err = session.commit().unwrap_err();
         assert!(
             err.to_string().contains("single hard link"),
@@ -983,16 +1059,19 @@ fn deleting_one_of_several_hard_links_keeps_the_survivor() {
     }
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.delete("chunked_orig");
-        session.delete("contig_orig");
+        let session = File::open_rw(&path).unwrap();
+        session.root().delete("chunked_orig").unwrap();
+        session.root().delete("contig_orig").unwrap();
         session.commit().unwrap();
         for i in 0..6 {
             session
-                .create_dataset(&format!("f{i}"))
-                .with_i32_data(&vec![i; 300]);
+                .root()
+                .create_dataset(&format!("f{i}"), |b| {
+                    b.with_i32_data(&vec![i; 300]);
+                })
+                .unwrap();
             session.commit().unwrap();
-            session.delete(&format!("f{i}"));
+            session.root().delete(&format!("f{i}")).unwrap();
             session.commit().unwrap();
         }
     }
@@ -1059,9 +1138,9 @@ fn deleting_all_hard_links_to_an_object_in_one_commit_is_safe() {
         file.close().unwrap();
     }
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.delete("orig");
-        session.delete("alias"); // both links to the same object, one commit
+        let session = File::open_rw(&path).unwrap();
+        session.root().delete("orig").unwrap();
+        session.root().delete("alias").unwrap(); // both links to the same object, one commit
         session.commit().unwrap();
     }
     let f = File::open(&path).unwrap();
@@ -1107,7 +1186,7 @@ fn cross_file_copy_from_read_by_c_library() {
 
     {
         let source = File::open(&src_path).unwrap();
-        let mut session = EditSession::open(&dst_path).unwrap();
+        let session = File::open_rw(&dst_path).unwrap();
         session
             .copy_from(&source, "calibration", "calibration")
             .unwrap();
@@ -1192,7 +1271,7 @@ fn cross_file_copy_from_c_written_attributed_dataset() {
 
     {
         let source = File::open(&src_path).unwrap();
-        let mut session = EditSession::open(&dst_path).unwrap();
+        let session = File::open_rw(&dst_path).unwrap();
         session
             .copy_from(&source, "calibration", "calibration")
             .unwrap();
@@ -1245,8 +1324,8 @@ fn same_file_copy_of_c_written_attributed_object() {
     }
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.copy("src", "dup");
+        let session = File::open_rw(&path).unwrap();
+        session.copy("src", "dup").unwrap();
         session.commit().unwrap();
     }
 
@@ -1297,7 +1376,7 @@ fn cross_file_copy_from_reproduces_c_written_dense_attributes() {
 
     {
         let source = File::open(&src_path).unwrap();
-        let mut session = EditSession::open(&dst_path).unwrap();
+        let session = File::open_rw(&dst_path).unwrap();
         session.copy_from(&source, "ds", "dup").unwrap();
         session.commit().unwrap();
     }
@@ -1339,10 +1418,14 @@ fn write_dataset_same_size_crosscheck() {
         }
 
         {
-            let mut session = EditSession::open(&path).unwrap();
+            let session = File::open_rw(&path).unwrap();
             session
-                .write_dataset("d")
-                .with_f64_data(&[9.0, 8.0, 7.0, 6.0]);
+                .dataset("d")
+                .unwrap()
+                .write_staged(|b| {
+                    b.with_f64_data(&[9.0, 8.0, 7.0, 6.0]);
+                })
+                .unwrap();
             session.commit().unwrap();
         }
 
@@ -1389,8 +1472,14 @@ fn write_dataset_undefined_address_relocates_crosscheck() {
     }
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.write_dataset("blank").with_i32_data(&[5, 6, 7]);
+        let session = File::open_rw(&path).unwrap();
+        session
+            .dataset("blank")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_i32_data(&[5, 6, 7]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -1438,8 +1527,14 @@ fn write_dataset_shared_hard_link_crosscheck() {
     }
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.write_dataset("a").with_i32_data(&[40, 50, 60]);
+        let session = File::open_rw(&path).unwrap();
+        session
+            .dataset("a")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_i32_data(&[40, 50, 60]);
+            })
+            .unwrap();
         session.commit().unwrap();
     }
 
@@ -1485,8 +1580,14 @@ fn write_dataset_relocate_with_multiple_hard_links_is_refused() {
     }
     let before = std::fs::read(&path).unwrap();
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.write_dataset("a").with_i32_data(&[1, 2, 3]);
+        let session = File::open_rw(&path).unwrap();
+        session
+            .dataset("a")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_i32_data(&[1, 2, 3]);
+            })
+            .unwrap();
         let err = session.commit().unwrap_err();
         assert!(
             err.to_string().contains("single hard link"),

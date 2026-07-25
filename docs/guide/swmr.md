@@ -3,7 +3,7 @@
 SWMR lets a single process append to an unlimited dataset in place while other processes read it concurrently, and it interoperates with the reference HDF5 C library and h5py in both directions. This page covers how to lay out a SWMR-capable dataset, append to it durably, follow it from a reader, and recover a file left flagged by a writer that exited uncleanly.
 
 !!! warning "Deprecated"
-    `SwmrWriter` is superseded by the owned-handle API and will be removed in a later release. Open with `File::open_swmr_writer` and append through a `Dataset` handle, then `File::close` to clear the SWMR-write flag; recover a flag left set by a crashed writer with `File::clear_swmr_flag`. The same no-lock, unfiltered, chunk-aligned SWMR contract applies.
+    `File::open_swmr_writer` is superseded by the owned-handle API and will be removed in a later release. Open with `File::open_swmr_writer` and append through a `Dataset` handle, then `File::close` to clear the SWMR-write flag; recover a flag left set by a crashed writer with `File::clear_swmr_flag`. The same no-lock, unfiltered, chunk-aligned SWMR contract applies.
 
 !!! tip "Runnable example"
     A complete single-process demonstration lives in [`examples/swmr.rs`](https://github.com/stephenberry/hdf5-pure/blob/main/examples/swmr.rs). Run it with:
@@ -39,15 +39,17 @@ builder.write("stream.h5").unwrap();
 
 ## Appending in place
 
-Open the existing file with `SwmrWriter::open` and append with one of the typed helpers. Each append call flushes durably, leaving the file valid for any concurrent reader throughout.
+Open the existing file with `File::open_swmr_writer` and append through a `Dataset` handle. Each append call flushes durably, leaving the file valid for any concurrent reader throughout.
 
 ```rust
-use hdf5_pure::SwmrWriter;
+use hdf5_pure::File;
 
-let mut writer = SwmrWriter::open("stream.h5").unwrap();
-writer.append_i32("log", &[3, 4, 5]).unwrap();
-writer.append_i32("log", &[6, 7]).unwrap();
-writer.close().unwrap(); // clears the SWMR flag; or just drop the writer
+let writer = File::open_swmr_writer("stream.h5").unwrap();
+let mut log = writer.dataset("log").unwrap();
+log.append(&[3i32, 4, 5]).unwrap();
+log.append(&[6i32, 7]).unwrap();
+drop(log);
+writer.close().unwrap(); // clears the SWMR flag; or just drop the file
 ```
 
 `close()` clears the file's SWMR-write flag and flushes, marking the file cleanly closed. Prefer calling it over relying on `Drop`, so the rare flush error surfaces; dropping the writer also clears the flag.
@@ -56,14 +58,13 @@ The append helpers are:
 
 | Method | Appends |
 | --- | --- |
-| `append_i32(dataset, &[i32])` | `i32` values |
-| `append_f64(dataset, &[f64])` | `f64` values |
-| `append_raw(dataset, &[u8])` | raw little-endian element bytes |
+| `Dataset::append(&[T])` | values of any `H5Element` type (`i32`, `f64`, …) |
+| `Dataset::append_raw(&[u8])` | raw little-endian element bytes |
 
-The typed helpers encode their values as little-endian bytes and forward to `append_raw`. With any of them, the appended length must be a whole number of chunks and the dataset's current length must already be chunk-aligned.
+`append` encodes its values as little-endian bytes and forwards to `append_raw`. With any of them, the appended length must be a whole number of chunks and the dataset's current length must already be chunk-aligned.
 
 !!! warning "Appends must be chunk-aligned"
-    Both the dataset's current length and each appended length must be multiples of the chunk length. An append that is not chunk-aligned, or whose byte length is not a whole number of elements, returns an error and publishes nothing, so a reader still sees the prior consistent prefix. After such an error the writer should be dropped rather than reused, because its in-memory mirror may have advanced past what reached disk.
+    Both the dataset's current length and each appended length must be multiples of the chunk length. An append that is not chunk-aligned, or whose byte length is not a whole number of elements, returns an error and publishes nothing, so a reader still sees the prior consistent prefix. After such an error the file should be dropped rather than reused, because its in-memory mirror may have advanced past what reached disk.
 
 ## Following a growing file
 
@@ -87,12 +88,12 @@ println!("now {} rows", ds.shape().unwrap()[0]);
 
 ## Recovering a flagged file
 
-While a `SwmrWriter` is open, the file's superblock carries an active-SWMR-writer flag (matching the reference C library and h5py) so concurrent readers may open it accordingly. `close()` or dropping the writer clears it. If a writer process exits without a clean close, the file is left flagged. Recover it with the h5clear equivalent:
+While a `File::open_swmr_writer` is open, the file's superblock carries an active-SWMR-writer flag (matching the reference C library and h5py) so concurrent readers may open it accordingly. `close()` or dropping the writer clears it. If a writer process exits without a clean close, the file is left flagged. Recover it with the h5clear equivalent:
 
 ```rust
-use hdf5_pure::SwmrWriter;
+use hdf5_pure::File;
 
-SwmrWriter::clear_swmr_flag("stream.h5").unwrap();
+File::clear_swmr_flag("stream.h5").unwrap();
 ```
 
 `clear_swmr_flag` is safe to call on a file whose flag is already clear.
@@ -111,7 +112,7 @@ SWMR append supports the following subset, distinct from the general [editing](e
 | Growth | unbounded |
 | Build | requires `std` (the default); the in-memory/WASM path cannot refresh |
 
-`SwmrWriter::open` rejects files that fall outside this subset, returning `Error::SwmrAppendUnsupported` for a non-latest-format superblock or a userblock file before performing any mutating write.
+`File::open_swmr_writer` rejects files that fall outside this subset, returning `Error::SwmrAppendUnsupported` for a non-latest-format superblock or a userblock file before performing any mutating write.
 
 !!! tip "Appending without SWMR"
-    If you don't need concurrent readers, two paths append to an unlimited dataset in place with fewer restrictions than the SWMR writer — both handle **filtered** (compressed) datasets. [`EditSession::append_dataset`](editing.md#appending-to-an-unlimited-dataset) is the general, composable one-off path and takes **any-length** appends on filtered and unfiltered datasets alike. [`File::open_rw` + `Dataset::append`](editing.md#streaming-appends) is the throughput path that stays open across many appends and grows the index in place at amortized `O(1)` cost; it takes any-length appends on unfiltered datasets and whole-chunk appends on filtered ones. Reach for SWMR only when a separate process must read the dataset while it grows.
+    If you don't need concurrent readers, two paths append to an unlimited dataset in place with fewer restrictions than the SWMR writer — both handle **filtered** (compressed) datasets. [`Dataset::append_staged`](editing.md#appending-to-an-unlimited-dataset) is the general, composable one-off path and takes **any-length** appends on filtered and unfiltered datasets alike. [`File::open_rw` + `Dataset::append`](editing.md#streaming-appends) is the throughput path that stays open across many appends and grows the index in place at amortized `O(1)` cost; it takes any-length appends on unfiltered datasets and whole-chunk appends on filtered ones. Reach for SWMR only when a separate process must read the dataset while it grows.

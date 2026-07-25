@@ -722,7 +722,7 @@ impl FileWriter {
     /// `persist` requests that freed space be tracked on disk across closes. A
     /// freshly built file has no free space to track, so this records the persist
     /// intent (matching what the C library writes for a brand-new persisted
-    /// file); a later [`EditSession`](crate::EditSession) that frees space writes
+    /// file); a later [`File::open_rw`](crate::File::open_rw) that frees space writes
     /// the on-disk free-space-manager blocks. `threshold` is the smallest
     /// free-space section size the managers track.
     pub fn with_file_space_strategy(
@@ -747,7 +747,7 @@ impl FileWriter {
     ///
     /// A freshly built file has no free space, so `persist = true` emits the
     /// persisting-but-empty form (persist flag set, all managers undefined, no
-    /// FSM blocks); a later [`EditSession`](crate::EditSession) that frees space
+    /// FSM blocks); a later [`File::open_rw`](crate::File::open_rw) that frees space
     /// fills in the on-disk managers. `persist = false` emits the non-persistent
     /// form.
     fn file_space_info(&self) -> Option<FileSpaceInfo> {

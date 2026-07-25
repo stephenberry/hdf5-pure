@@ -7,9 +7,8 @@
 //! hdf5-pure — including a persisted (persist=true) file whose File Space Info
 //! message carries free-space-manager addresses.
 
-#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5::plist::file_create::FileSpaceStrategy as CStrategy;
-use hdf5_pure::{EditSession, File, FileBuilder, FileSpaceStrategy};
+use hdf5_pure::{File, FileBuilder, FileSpaceStrategy};
 use std::sync::{Mutex, MutexGuard};
 use tempfile::tempdir;
 
@@ -166,8 +165,8 @@ fn c_library_reads_our_persisted_free_space() {
     b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1);
     b.write(&path).unwrap();
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.delete("big");
+        let s = File::open_rw(&path).unwrap();
+        s.root().delete("big").unwrap();
         s.commit().unwrap();
     }
 

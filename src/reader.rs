@@ -297,7 +297,7 @@ impl Drop for FileInner {
     /// idempotent and skipped in that case.
     ///
     /// - A SWMR writer clears the superblock's SWMR-write flag (mirroring
-    ///   `SwmrWriter::drop`).
+    ///   `File::close`).
     /// - A bounded read-write file that persists its free space rewrites its
     ///   on-disk free-space managers into canonical shape (issue #173), so a
     ///   dropped-without-`close` handle leaves the same file a clean `close`
@@ -1584,7 +1584,7 @@ impl File {
     /// recovering a file the reference C library then refuses to open. A no-op if
     /// the flag is already clear.
     pub fn clear_swmr_flag<P: AsRef<std::path::Path>>(path: P) -> Result<(), Error> {
-        crate::swmr_writer::clear_swmr_flag_at(path.as_ref())
+        crate::file_lock::clear_swmr_flag_at(path.as_ref())
     }
 
     /// Create a new, empty HDF5 file at `path` and open it for reading and
@@ -1913,6 +1913,53 @@ impl std::fmt::Debug for Object {
 // Group handle
 // ---------------------------------------------------------------------------
 
+/// A group that exists only as a staged edit, handed to
+/// [`Group::create_group_with`]'s closure so attributes can be set on a group
+/// that is not yet committed (and so has no resolvable header to hang a
+/// [`Group`] handle off).
+///
+/// Every method stages; nothing is written until [`File::commit`].
+pub struct StagedGroup<'a> {
+    session: &'a mut WriteEngine,
+    path: String,
+}
+
+impl StagedGroup<'_> {
+    /// Stage an attribute on this group, applied with its creation on
+    /// [`File::commit`].
+    pub fn set_attr(&mut self, name: &str, value: AttrValue) -> &mut Self {
+        self.session.set_group_attr(&self.path, name, value);
+        self
+    }
+
+    /// Stage a subgroup of this group, configured through `build`.
+    pub fn create_group_with(
+        &mut self,
+        name: &str,
+        build: impl FnOnce(&mut StagedGroup<'_>),
+    ) -> &mut Self {
+        let child = format!("{}/{}", self.path, name);
+        self.session.create_group(&child);
+        let mut staged = StagedGroup {
+            session: self.session,
+            path: child,
+        };
+        build(&mut staged);
+        self
+    }
+
+    /// Stage a dataset in this group, configured through `build`.
+    pub fn create_dataset(
+        &mut self,
+        name: &str,
+        build: impl FnOnce(&mut DatasetBuilder),
+    ) -> &mut Self {
+        let child = format!("{}/{}", self.path, name);
+        build(self.session.create_dataset(&child));
+        self
+    }
+}
+
 /// An owned handle to an HDF5 group.
 pub struct Group {
     file: Arc<FileInner>,
@@ -2039,8 +2086,44 @@ impl Group {
     /// Requires a read-write file ([`File::open_rw`]), else
     /// [`Error::ReadOnly`](crate::Error::ReadOnly).
     pub fn create_group(&self, name: &str) -> Result<(), Error> {
+        self.create_group_with(name, |_| {})
+    }
+
+    /// Create a subgroup `name` and stage attribute edits on it in the same
+    /// batch, applied together by [`File::commit`] — the group counterpart of
+    /// [`create_dataset`](Self::create_dataset)'s builder.
+    ///
+    /// [`set_attr`](Self::set_attr) needs a *resolvable* group, so it cannot
+    /// reach a group that is itself still staged. This can: both the creation
+    /// and the attributes land in one commit.
+    ///
+    /// Requires a read-write file ([`File::open_rw`]), else
+    /// [`Error::ReadOnly`](crate::Error::ReadOnly).
+    ///
+    /// ```no_run
+    /// # use hdf5_pure::{AttrValue, File};
+    /// # fn main() -> Result<(), hdf5_pure::Error> {
+    /// let file = File::open_rw("runs.h5")?;
+    /// file.root().create_group_with("run2", |g| {
+    ///     g.set_attr("count", AttrValue::I64(7));
+    ///     g.set_attr("label", AttrValue::String("second".into()));
+    /// })?;
+    /// file.commit()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn create_group_with(
+        &self,
+        name: &str,
+        build: impl FnOnce(&mut StagedGroup<'_>),
+    ) -> Result<(), Error> {
         self.with_child_session(name, |session, child| {
             session.create_group(child);
+            let mut staged = StagedGroup {
+                session,
+                path: child.to_string(),
+            };
+            build(&mut staged);
             Ok(())
         })
     }
@@ -2192,7 +2275,7 @@ impl Dataset {
     /// the handle's object-header address, so such a handle can append. The
     /// target must
     /// be a chunked, rank-1, unlimited, Extensible-Array-indexed dataset — the
-    /// same contract as [`AppendWriter`](crate::AppendWriter), including filtered
+    /// same contract as [`Dataset::append`](crate::Dataset::append), including filtered
     /// whole-chunk / unfiltered any-length rules — otherwise
     /// [`Error::AppendUnsupported`](crate::Error::AppendUnsupported) is returned.
     /// The append is immediate and crash-atomic (no `commit` needed).
@@ -2307,6 +2390,36 @@ impl Dataset {
         self.with_session_mut(true, |session, path| {
             let builder = session.write_dataset(path);
             T::write_into(builder, data);
+            Ok(())
+        })
+    }
+
+    /// Overwrite this dataset's values through its full [`DatasetBuilder`],
+    /// staged until [`File::commit`] — the builder-level counterpart of
+    /// [`write`](Self::write), for element kinds that are not [`H5Element`]
+    /// (variable-length strings, raw bytes with an explicit datatype).
+    ///
+    /// The replacement must match the on-disk datatype and shape exactly; a
+    /// reshape or retype is refused on [`File::commit`].
+    ///
+    /// The file must have been opened with [`File::open_rw`], else
+    /// [`Error::ReadOnly`](crate::Error::ReadOnly).
+    ///
+    /// ```no_run
+    /// # use hdf5_pure::File;
+    /// # fn main() -> Result<(), hdf5_pure::Error> {
+    /// let file = File::open_rw("labels.h5")?;
+    /// let mut ds = file.dataset("names")?;
+    /// ds.write_staged(|b| {
+    ///     b.with_vlen_strings(&["ada", "grace", "katherine"]);
+    /// })?;
+    /// file.commit()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn write_staged(&mut self, build: impl FnOnce(&mut DatasetBuilder)) -> Result<(), Error> {
+        self.with_session_mut(true, |session, path| {
+            build(session.write_dataset(path));
             Ok(())
         })
     }

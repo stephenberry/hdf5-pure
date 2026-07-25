@@ -1,6 +1,6 @@
 //! Session-local free-space tracking for in-place editing (issue #21).
 //!
-//! [`EditSession`](crate::EditSession) writes by appending at end-of-file and,
+//! [`File::open_rw`](crate::File::open_rw) writes by appending at end-of-file and,
 //! on each commit, leaves the superseded object headers and any deleted-object
 //! blocks behind as dead bytes. This module records those freed regions so a
 //! later allocation can reuse them instead of growing the file, and so a run of
@@ -10,7 +10,7 @@
 //! without persistence (the default) it is purely session-local: freed-but-
 //! unreused space is invisible to other tools, exactly as the reference C
 //! library's default `FSM_AGGR` strategy with persistence off leaves it. When the
-//! file was created with `persist = true`, [`EditSession`](crate::EditSession)
+//! file was created with `persist = true`, [`File::open_rw`](crate::File::open_rw)
 //! seeds this list from the on-disk free-space managers (the `FSHD`/`FSSE` blocks
 //! the File Space Info superblock-extension message points at) on open and writes
 //! it back on each commit, so reuse spans sessions (see

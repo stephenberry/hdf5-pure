@@ -13,8 +13,7 @@
 //!     the old chunk storage reclaimed), including reuse of that reclaimed space
 //!     by a later commit in the same session.
 
-#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
-use hdf5_pure::{EditSession, File, FileBuilder};
+use hdf5_pure::{File, FileBuilder};
 
 const UB: usize = 512;
 const MARKER: &[u8] = b"USERBLOCK-CHUNK-0104";
@@ -51,12 +50,15 @@ fn userblock_chunked_add_roundtrip() {
 
     let added: Vec<f64> = (0..1000).map(|i| (i % 13) as f64 * 0.25).collect();
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.create_dataset("chunked")
-            .with_f64_data(&added)
-            .with_shape(&[1000])
-            .with_chunks(&[64])
-            .with_deflate(6);
+        let s = File::open_rw(&path).unwrap();
+        s.root()
+            .create_dataset("chunked", |b| {
+                b.with_f64_data(&added)
+                    .with_shape(&[1000])
+                    .with_chunks(&[64])
+                    .with_deflate(6);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
 
@@ -92,8 +94,13 @@ fn userblock_chunked_unfiltered_inplace_overwrite() {
 
     let updated: Vec<f64> = (0..200).map(|i| (i as f64) * -2.0 + 1.0).collect();
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.write_dataset("c").with_f64_data(&updated);
+        let s = File::open_rw(&path).unwrap();
+        s.dataset("c")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_f64_data(&updated);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
 
@@ -141,8 +148,13 @@ fn userblock_chunked_shrinking_inplace_overwrite() {
 
     let updated = vec![1.5f64; 400];
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.write_dataset("c").with_f64_data(&updated);
+        let s = File::open_rw(&path).unwrap();
+        s.dataset("c")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_f64_data(&updated);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
 
@@ -185,12 +197,15 @@ fn real_mat_add_chunked_dataset_preserves_userblock() {
 
     let added: Vec<f64> = (0..600).map(|i| (i % 17) as f64 * 0.5).collect();
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.create_dataset("hdf5_pure_chunk_probe")
-            .with_f64_data(&added)
-            .with_shape(&[600])
-            .with_chunks(&[64])
-            .with_deflate(6);
+        let s = File::open_rw(&path).unwrap();
+        s.root()
+            .create_dataset("hdf5_pure_chunk_probe", |b| {
+                b.with_f64_data(&added)
+                    .with_shape(&[600])
+                    .with_chunks(&[64])
+                    .with_deflate(6);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
 
@@ -231,13 +246,16 @@ fn userblock_extensible_array_add_and_overwrite_roundtrip() {
 
     let added: Vec<f64> = (0..500).map(|i| (i as f64).sin() * 1e3).collect();
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.create_dataset("ea")
-            .with_f64_data(&added)
-            .with_shape(&[500])
-            .with_chunks(&[40])
-            .with_maxshape(&[u64::MAX])
-            .with_deflate(6);
+        let s = File::open_rw(&path).unwrap();
+        s.root()
+            .create_dataset("ea", |b| {
+                b.with_f64_data(&added)
+                    .with_shape(&[500])
+                    .with_chunks(&[40])
+                    .with_maxshape(&[u64::MAX])
+                    .with_deflate(6);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
     assert_eq!(
@@ -254,8 +272,13 @@ fn userblock_extensible_array_add_and_overwrite_roundtrip() {
     // sizes), which rebuilds the EA index + chunk blob and reclaims the old storage.
     let updated: Vec<f64> = (0..500).map(|i| (i as f64) * 0.001).collect();
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.write_dataset("ea").with_f64_data(&updated);
+        let s = File::open_rw(&path).unwrap();
+        s.dataset("ea")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_f64_data(&updated);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
 
@@ -284,12 +307,15 @@ fn userblock_single_chunk_index_add_and_overwrite() {
 
     let added: Vec<f64> = (0..50).map(|i| i as f64 * 0.5).collect();
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.create_dataset("sc")
-            .with_f64_data(&added)
-            .with_shape(&[50])
-            .with_chunks(&[50])
-            .with_deflate(6);
+        let s = File::open_rw(&path).unwrap();
+        s.root()
+            .create_dataset("sc", |b| {
+                b.with_f64_data(&added)
+                    .with_shape(&[50])
+                    .with_chunks(&[50])
+                    .with_deflate(6);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
     assert_eq!(
@@ -304,8 +330,13 @@ fn userblock_single_chunk_index_add_and_overwrite() {
 
     let updated: Vec<f64> = (0..50).map(|i| (i as f64).cos()).collect();
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.write_dataset("sc").with_f64_data(&updated);
+        let s = File::open_rw(&path).unwrap();
+        s.dataset("sc")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_f64_data(&updated);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
     let file = File::open(&path).unwrap();
@@ -338,8 +369,13 @@ fn userblock_chunked_relocating_overwrite_roundtrip() {
 
     let updated: Vec<f64> = (0..500).map(|i| (i as f64).sin()).collect();
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.write_dataset("c").with_f64_data(&updated);
+        let s = File::open_rw(&path).unwrap();
+        s.dataset("c")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_f64_data(&updated);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
 
@@ -387,13 +423,22 @@ fn userblock_chunked_overwrite_reuses_reclaimed_space() {
     let reuse_data_bytes = (reuse.len() * 8) as u64;
     let len_after_commit1;
     {
-        let mut s = EditSession::open(&path).unwrap();
+        let s = File::open_rw(&path).unwrap();
         // Commit 1: relocate "c", reclaiming its old chunk storage.
-        s.write_dataset("c").with_f64_data(&updated);
+        s.dataset("c")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_f64_data(&updated);
+            })
+            .unwrap();
         s.commit().unwrap();
         len_after_commit1 = std::fs::metadata(&path).unwrap().len();
         // Commit 2: add a small contiguous dataset that fits the reclaimed hole.
-        s.create_dataset("reuse").with_f64_data(&reuse);
+        s.root()
+            .create_dataset("reuse", |b| {
+                b.with_f64_data(&reuse);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
 

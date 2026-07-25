@@ -16,8 +16,7 @@
 //! userblock-specific operation still refused — cross-file copy from a userblock
 //! *source* — is covered below; a refusal never corrupts the file.
 
-#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
-use hdf5_pure::{AttrValue, EditSession, File, FileBuilder, Object};
+use hdf5_pure::{AttrValue, File, FileBuilder, Object};
 
 const UB: usize = 512;
 const MARKER: &[u8] = b"USERBLOCK-MARKER-0104";
@@ -52,16 +51,31 @@ fn synthetic_userblock_file_roundtrip() {
     let userblock = build_userblock_file(&path);
 
     {
-        let mut s = EditSession::open(&path).unwrap();
+        let s = File::open_rw(&path).unwrap();
         // Same-length in-place overwrite of an existing contiguous dataset.
-        s.write_dataset("alpha")
-            .with_f64_data(&[9.0, 8.0, 7.0, 6.0]);
+        s.dataset("alpha")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_f64_data(&[9.0, 8.0, 7.0, 6.0]);
+            })
+            .unwrap();
         // Add contiguous datasets at the root and inside the nested group.
-        s.create_dataset("added").with_i32_data(&[100, 200]);
-        s.create_dataset("grp/added_inner").with_f64_data(&[3.25]);
-        // Create a new group and set a compact attribute on it.
-        s.create_group("newgrp");
-        s.set_group_attr("newgrp", "tag", AttrValue::AsciiString("v104".into()));
+        s.root()
+            .create_dataset("added", |b| {
+                b.with_i32_data(&[100, 200]);
+            })
+            .unwrap();
+        s.root()
+            .create_dataset("grp/added_inner", |b| {
+                b.with_f64_data(&[3.25]);
+            })
+            .unwrap();
+        // Create a new group and set a compact attribute on it, in one batch.
+        s.root()
+            .create_group_with("newgrp", |g| {
+                g.set_attr("tag", AttrValue::AsciiString("v104".into()));
+            })
+            .unwrap();
         s.commit().unwrap();
     }
 
@@ -118,8 +132,13 @@ fn userblock_inplace_overwrite_only_takes_fast_path() {
     let userblock = build_userblock_file(&path);
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.write_dataset("beta").with_i32_data(&[-1, -2, -3]);
+        let s = File::open_rw(&path).unwrap();
+        s.dataset("beta")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_i32_data(&[-1, -2, -3]);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
 
@@ -151,7 +170,7 @@ fn userblock_cross_file_copy_from_userblock_source_is_refused() {
     let dst_before = std::fs::read(&dst_path).unwrap();
 
     let source = File::open(&src_path).unwrap();
-    let mut s = EditSession::open(&dst_path).unwrap();
+    let s = File::open_rw(&dst_path).unwrap();
     // The eager read happens in `copy_from`, so the refusal surfaces there.
     let err = s.copy_from(&source, "alpha", "imported");
     assert!(
@@ -182,10 +201,12 @@ fn userblock_add_empty_dataset_roundtrip() {
     let userblock = build_userblock_file(&path);
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.create_dataset("empty")
-            .with_f64_data(&[])
-            .with_shape(&[0, 3]);
+        let s = File::open_rw(&path).unwrap();
+        s.root()
+            .create_dataset("empty", |b| {
+                b.with_f64_data(&[]).with_shape(&[0, 3]);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
 
@@ -216,10 +237,16 @@ fn userblock_add_provenance_dataset_roundtrip() {
     let userblock = build_userblock_file(&path);
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.create_dataset("sensor")
-            .with_f64_data(&[1.0, 2.0, 3.0])
-            .with_provenance("test-suite", "2026-02-19T12:00:00Z", Some("bench"));
+        let s = File::open_rw(&path).unwrap();
+        s.root()
+            .create_dataset("sensor", |b| {
+                b.with_f64_data(&[1.0, 2.0, 3.0]).with_provenance(
+                    "test-suite",
+                    "2026-02-19T12:00:00Z",
+                    Some("bench"),
+                );
+            })
+            .unwrap();
         s.commit().unwrap();
     }
 
@@ -237,7 +264,7 @@ fn userblock_add_provenance_dataset_roundtrip() {
 }
 
 /// A dataset with a variable-length attribute, added on a userblock file,
-/// must round-trip correctly: `EditSession::place_vl_collection`'s
+/// must round-trip correctly: `File::open_rw::place_vl_collection`'s
 /// `addr - base_address` arithmetic is only actually exercised (as opposed to
 /// a no-op at `base == 0`) once `base` is non-zero.
 #[test]
@@ -246,13 +273,15 @@ fn userblock_add_dataset_with_vlen_attribute_roundtrip() {
     let userblock = build_userblock_file(&path);
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.create_dataset("labeled")
-            .with_i32_data(&[1, 2, 3])
-            .set_attr(
-                "tags",
-                AttrValue::VarLenAsciiArray(vec!["one".into(), "two".into()]),
-            );
+        let s = File::open_rw(&path).unwrap();
+        s.root()
+            .create_dataset("labeled", |b| {
+                b.with_i32_data(&[1, 2, 3]).set_attr(
+                    "tags",
+                    AttrValue::VarLenAsciiArray(vec!["one".into(), "two".into()]),
+                );
+            })
+            .unwrap();
         s.commit().unwrap();
     }
 
@@ -278,9 +307,12 @@ fn userblock_add_vlen_string_dataset_roundtrip() {
     let userblock = build_userblock_file(&path);
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.create_dataset("labels")
-            .with_vlen_strings(&["alpha", "", "gamma"]);
+        let s = File::open_rw(&path).unwrap();
+        s.root()
+            .create_dataset("labels", |b| {
+                b.with_vlen_strings(&["alpha", "", "gamma"]);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
 
@@ -304,8 +336,12 @@ fn userblock_add_reference_dataset_roundtrip() {
     let userblock = build_userblock_file(&path);
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.create_dataset("refs").with_path_references(&["alpha"]);
+        let s = File::open_rw(&path).unwrap();
+        s.root()
+            .create_dataset("refs", |b| {
+                b.with_path_references(&["alpha"]);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
 
@@ -348,9 +384,12 @@ fn real_mat_add_dataset_preserves_userblock_and_data() {
         .unwrap();
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.create_dataset("hdf5_pure_probe")
-            .with_f64_data(&[42.0, -1.0, 3.5]);
+        let s = File::open_rw(&path).unwrap();
+        s.root()
+            .create_dataset("hdf5_pure_probe", |b| {
+                b.with_f64_data(&[42.0, -1.0, 3.5]);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
 

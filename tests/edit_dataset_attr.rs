@@ -1,12 +1,11 @@
-//! Pure-Rust tests for `EditSession::set_dataset_attr` / `remove_dataset_attr`
+//! Pure-Rust tests for `File::open_rw::set_dataset_attr` / `remove_dataset_attr`
 //! (issue #146): compact dataset-attribute add / update / remove, staged and
 //! applied on commit by relocating the dataset's object header while preserving its
 //! data and chunk index. C-library interop — undefined-`AttributeInfo` acceptance
 //! (dataset and group), the dense-storage refusal, and the single-hard-link refusal
 //! — lives in `edit_crosscheck.rs`.
 
-#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
-use hdf5_pure::{AttrValue, EditSession, Error, File, FileBuilder};
+use hdf5_pure::{AttrValue, Error, File, FileBuilder, FormatError};
 use tempfile::tempdir;
 
 fn build_contig(path: &std::path::Path) {
@@ -32,9 +31,15 @@ fn set_fixed_attrs_preserves_data() {
     build_contig(&p);
 
     {
-        let mut s = EditSession::open(&p).unwrap();
-        s.set_dataset_attr("d", "count", AttrValue::I64(42));
-        s.set_dataset_attr("d", "unit", AttrValue::String("m/s".into()));
+        let s = File::open_rw(&p).unwrap();
+        s.dataset("d")
+            .unwrap()
+            .set_attr("count", AttrValue::I64(42))
+            .unwrap();
+        s.dataset("d")
+            .unwrap()
+            .set_attr("unit", AttrValue::String("m/s".into()))
+            .unwrap();
         s.commit().unwrap();
     }
 
@@ -53,15 +58,24 @@ fn update_and_remove_attr() {
     build_contig(&p);
 
     {
-        let mut s = EditSession::open(&p).unwrap();
-        s.set_dataset_attr("d", "a", AttrValue::I64(1));
-        s.set_dataset_attr("d", "b", AttrValue::I64(2));
+        let s = File::open_rw(&p).unwrap();
+        s.dataset("d")
+            .unwrap()
+            .set_attr("a", AttrValue::I64(1))
+            .unwrap();
+        s.dataset("d")
+            .unwrap()
+            .set_attr("b", AttrValue::I64(2))
+            .unwrap();
         s.commit().unwrap();
     }
     {
-        let mut s = EditSession::open(&p).unwrap();
-        s.set_dataset_attr("d", "a", AttrValue::I64(99)); // replace
-        s.remove_dataset_attr("d", "b"); // remove
+        let s = File::open_rw(&p).unwrap();
+        s.dataset("d")
+            .unwrap()
+            .set_attr("a", AttrValue::I64(99))
+            .unwrap(); // replace
+        s.dataset("d").unwrap().remove_attr("b").unwrap(); // remove
         s.commit().unwrap();
     }
 
@@ -78,12 +92,14 @@ fn set_vlstring_attr() {
     build_contig(&p);
 
     {
-        let mut s = EditSession::open(&p).unwrap();
-        s.set_dataset_attr(
-            "d",
-            "labels",
-            AttrValue::VarLenAsciiArray(vec!["alpha".into(), "beta".into()]),
-        );
+        let s = File::open_rw(&p).unwrap();
+        s.dataset("d")
+            .unwrap()
+            .set_attr(
+                "labels",
+                AttrValue::VarLenAsciiArray(vec!["alpha".into(), "beta".into()]),
+            )
+            .unwrap();
         s.commit().unwrap();
     }
 
@@ -102,15 +118,18 @@ fn attr_edit_on_chunked_preserves_data_and_index() {
     build_chunked(&p, 8, 4);
 
     {
-        let mut s = EditSession::open(&p).unwrap();
+        let s = File::open_rw(&p).unwrap();
         // Immediate append grows the Extensible Array in place.
-        s.append_inplace_i32("d", &[8, 9, 10, 11]).unwrap(); // 0..12
+        s.dataset("d").unwrap().append(&[8, 9, 10, 11]).unwrap(); // 0..12
         // A staged attribute edit relocates the header at commit (preserving the
         // grown index and data). The cache is invalidated at commit entry.
-        s.set_dataset_attr("d", "tag", AttrValue::I64(5));
+        s.dataset("d")
+            .unwrap()
+            .set_attr("tag", AttrValue::I64(5))
+            .unwrap();
         s.commit().unwrap();
         // Append again: re-locates at the dataset's new header address.
-        s.append_inplace_i32("d", &[12, 13]).unwrap(); // 0..14
+        s.dataset("d").unwrap().append(&[12, 13]).unwrap(); // 0..14
     }
 
     let f = File::open(&p).unwrap();
@@ -125,12 +144,15 @@ fn guard_refuses_append_after_staged_dataset_attr() {
     let p = dir.path().join("d.h5");
     build_chunked(&p, 4, 4);
 
-    let mut s = EditSession::open(&p).unwrap();
-    s.append_inplace_i32("d", &[4, 5, 6, 7]).unwrap(); // fine, nothing staged
-    s.set_dataset_attr("d", "tag", AttrValue::I64(1)); // now stage an attr edit
+    let s = File::open_rw(&p).unwrap();
+    s.dataset("d").unwrap().append(&[4, 5, 6, 7]).unwrap(); // fine, nothing staged
+    s.dataset("d")
+        .unwrap()
+        .set_attr("tag", AttrValue::I64(1))
+        .unwrap(); // now stage an attr edit
     // A second in-place append is refused: commit would relocate the header this
     // append planned against.
-    let err = s.append_inplace_i32("d", &[8]).unwrap_err();
+    let err = s.dataset("d").unwrap().append(&[8]).unwrap_err();
     assert!(matches!(err, Error::AppendInPlaceUnsupported(_)));
 }
 
@@ -140,9 +162,17 @@ fn attr_edit_plus_append_dataset_same_commit_refused() {
     let p = dir.path().join("d.h5");
     build_chunked(&p, 8, 4);
 
-    let mut s = EditSession::open(&p).unwrap();
-    s.set_dataset_attr("d", "tag", AttrValue::I64(1));
-    s.append_dataset("d").append_i32(&[8, 9, 10, 11]);
+    let s = File::open_rw(&p).unwrap();
+    s.dataset("d")
+        .unwrap()
+        .set_attr("tag", AttrValue::I64(1))
+        .unwrap();
+    s.dataset("d")
+        .unwrap()
+        .append_staged(|b| {
+            b.append_i32(&[8, 9, 10, 11]);
+        })
+        .unwrap();
     let err = s.commit().unwrap_err();
     assert!(matches!(err, Error::EditUnsupported(_)));
 }
@@ -160,8 +190,11 @@ fn compact_limit_refused() {
         b.write(&p).unwrap();
     }
 
-    let mut s = EditSession::open(&p).unwrap();
-    s.set_dataset_attr("d", "overflow", AttrValue::I64(9)); // would be the 9th
+    let s = File::open_rw(&p).unwrap();
+    s.dataset("d")
+        .unwrap()
+        .set_attr("overflow", AttrValue::I64(9))
+        .unwrap(); // would be the 9th
     let err = s.commit().unwrap_err();
     assert!(matches!(err, Error::EditUnsupported(_)));
 }
@@ -172,8 +205,14 @@ fn set_attr_on_missing_dataset_refused() {
     let p = dir.path().join("d.h5");
     build_contig(&p);
 
-    let mut s = EditSession::open(&p).unwrap();
-    s.set_dataset_attr("nope", "x", AttrValue::I64(1));
-    let err = s.commit().unwrap_err();
-    assert!(matches!(err, Error::EditUnsupported(_)));
+    let s = File::open_rw(&p).unwrap();
+    // Resolving the handle is where a missing dataset is now caught, rather than
+    // at commit — the edit never gets staged at all.
+    let err = s.dataset("nope").unwrap_err();
+    assert!(
+        matches!(err, Error::Format(FormatError::PathNotFound(_))),
+        "expected PathNotFound, got {err:?}"
+    );
+    assert!(!s.has_staged_edits());
+    s.commit().unwrap();
 }
