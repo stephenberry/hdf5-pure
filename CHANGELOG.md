@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-07-24
+
+Variable-length writes lose their 65,535-element cap: `DatasetBuilder::with_vlen_strings` and `repack` now split across as many global heap collections as they need, and resolving an element is no longer quadratic ([#189](https://github.com/stephenberry/hdf5-pure/issues/189)). Attributes too large for compact or dense storage are now refused by name instead of silently dropped or written unreadable ([#190](https://github.com/stephenberry/hdf5-pure/issues/190), [#191](https://github.com/stephenberry/hdf5-pure/issues/191)). Reads gain bounds: a chunked dataset declaring an impossible per-chunk size is refused rather than allocated, with the new `Dataset::element_size` to size a read up front ([#185](https://github.com/stephenberry/hdf5-pure/issues/185)), and row windows of inner-chunked and variable-length string datasets stream instead of falling back to a whole read ([#183](https://github.com/stephenberry/hdf5-pure/pull/183), [#186](https://github.com/stephenberry/hdf5-pure/pull/186)). Additive minor bump.
+
 ### Added
 
 - `OBJECT_HEADER_MESSAGE_MAX` is the largest message a version 2 object header can describe (65,535 bytes), the bound behind the new oversized-message refusals ([#190](https://github.com/stephenberry/hdf5-pure/issues/190)).
@@ -382,7 +386,8 @@ Internal robustness and tests ([#26](https://github.com/stephenberry/hdf5-pure/i
 - The MAT deserializer flattens 1×N and N×1 values to a 1-D sequence in `deserialize_any` (matching `deserialize_seq`).
 - Numeric/complex readers preserve 1×N / N×1 shape at the value layer; any flattening happens at the serde level.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.23.2...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.24.0...HEAD
+[0.24.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.23.2...v0.24.0
 [0.23.2]: https://github.com/stephenberry/hdf5-pure/compare/v0.23.1...v0.23.2
 [0.23.1]: https://github.com/stephenberry/hdf5-pure/compare/v0.23.0...v0.23.1
 [0.23.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.22.0...v0.23.0
