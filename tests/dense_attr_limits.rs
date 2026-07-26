@@ -6,13 +6,15 @@
 //! that it was refused outright, which was itself a fix for writing a heap that
 //! read back empty and aborted an assertion-enabled reference C library (#191).
 //!
-//! Dense storage kicks in above eight attributes, so every case here uses nine
-//! or more; below that the compact path and its own size limit apply.
+//! Dense storage is selected by either of two things: more than eight
+//! attributes, or one attribute too large for an object-header message. Most
+//! cases here use nine or more to reach it by count; the ones that deliberately
+//! use fewer reach it by size, and say so.
 
 use hdf5_pure::{AttrValue, Error, File, FileBuilder, FormatError};
 
 mod common;
-use common::heap::{huge_object_bytes, huge_object_count, managed_object_count};
+use common::heap::{has_fractal_heap, huge_object_bytes, huge_object_count, managed_object_count};
 
 /// Nine attributes, the first sized to `payload` bytes of text and the rest
 /// small, which is enough to select dense storage.
@@ -78,6 +80,61 @@ fn an_attribute_past_the_managed_object_limit_becomes_a_huge_object() {
     let big = text(&attrs, "big");
     assert_eq!(big.len(), payload + 1);
     assert!(big.bytes().all(|b| b == b'y'), "huge object bytes differ");
+}
+
+/// Dense storage is not chosen by attribute count alone. An attribute too large
+/// for an object-header message forces it on its own, which is the only way a
+/// *single* large attribute can be written at all — the compact path's answer to
+/// one is `AttributeMessageTooLarge`, no matter that dense storage could hold it.
+///
+/// This mirrors the reference C library's own disjunction, and it is what makes
+/// the ordinary case work: one big attribute on an object with no others.
+#[test]
+fn one_large_attribute_forces_dense_storage_on_its_own() {
+    for others in [0usize, 2, 7] {
+        let mut builder = FileBuilder::new();
+        builder.set_attr("big", AttrValue::AsciiString("y".repeat(100_000)));
+        for i in 0..others {
+            builder.set_attr(&format!("a{i}"), AttrValue::I64(i as i64));
+        }
+        builder.create_dataset("x").with_f64_data(&[1.0]);
+
+        let bytes = builder
+            .finish()
+            .unwrap_or_else(|e| panic!("{} attributes refused: {e}", others + 1));
+        assert_eq!(
+            huge_object_count(&bytes),
+            1,
+            "with {} attributes the large one should be a huge object",
+            others + 1
+        );
+
+        let file = File::from_bytes(bytes).unwrap();
+        let attrs = file.root().attrs().unwrap();
+        assert_eq!(attrs.len(), others + 1);
+        assert_eq!(text(&attrs, "big").len(), 100_000);
+    }
+}
+
+/// The other half of that disjunction still holds: a small set of small
+/// attributes stays in the object header, so the size rule has not quietly
+/// promoted every file to dense storage.
+#[test]
+fn small_attributes_below_the_count_threshold_stay_compact() {
+    let mut builder = FileBuilder::new();
+    for i in 0..8 {
+        builder.set_attr(&format!("a{i}"), AttrValue::AsciiString("y".repeat(1_000)));
+    }
+    builder.create_dataset("x").with_f64_data(&[1.0]);
+
+    let bytes = builder.finish().unwrap();
+    assert!(
+        !has_fractal_heap(&bytes),
+        "eight small attributes must stay compact"
+    );
+
+    let file = File::from_bytes(bytes).unwrap();
+    assert_eq!(file.root().attrs().unwrap().len(), 8);
 }
 
 /// The shape reported in #191: nine attributes of 100,000 bytes each. It was

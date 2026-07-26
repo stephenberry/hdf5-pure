@@ -197,6 +197,46 @@ const DENSE_ATTR_DBLOCK_HEADER: usize =
 /// on-disk length field at the point it is written.
 const DENSE_ATTR_DEFAULT_MAX_DIRECT_BLOCK: usize = 65536;
 
+/// Whether `attrs` must go in a fractal heap rather than the object header.
+///
+/// Two independent reasons, matching the reference C library's own disjunction in
+/// `H5Oattribute.c` (`nattrs == max_compact || raw_size >= H5O_MESG_MAX_SIZE`):
+/// too many attributes to keep compact, *or* one attribute too large for an
+/// object-header message, whose size field is 2 bytes wide.
+///
+/// The second is what lets a single large attribute be written at all. Selecting
+/// on count alone would send it to the compact path, where the only available
+/// answer is [`FormatError::AttributeMessageTooLarge`] — even though dense
+/// storage can hold it, as a huge object if need be.
+///
+/// The size comparison is `>` rather than the C library's `>=`, so an attribute
+/// serializing to exactly [`OBJECT_HEADER_MESSAGE_MAX`] stays compact here and
+/// goes dense there. Both are readable; this keeps the existing boundary where it
+/// was rather than moving every such file's layout.
+///
+/// Size never selects dense storage for a set containing variable-length data.
+/// Those attributes' global-heap references are patched with real addresses well
+/// after the dense blob has been built from a snapshot of their bytes, so the
+/// heap would embed unpatched ones — a file this crate's reader silently drops
+/// the attribute from. That defect predates this rule and still reaches a set of
+/// more than [`DENSE_ATTR_THRESHOLD`] attributes; withholding size-based
+/// selection keeps this from being a *new* way in, where the alternative is
+/// turning a loud refusal into a silent loss.
+fn needs_dense_attrs(attrs: &[AttributeMessage]) -> bool {
+    if attrs.len() > DENSE_ATTR_THRESHOLD {
+        return true;
+    }
+    if attrs
+        .iter()
+        .any(|a| crate::vl_data::is_vlen_string_datatype(&a.datatype))
+    {
+        return false;
+    }
+    attrs
+        .iter()
+        .any(|a| a.serialize(LENGTH_SIZE).len() > OBJECT_HEADER_MESSAGE_MAX)
+}
+
 /// The largest attribute [`build_dense_attrs`] stores as a managed object.
 ///
 /// The externally imposed limit is the heap ID: the 8-byte managed IDs this
@@ -1405,15 +1445,9 @@ impl FileWriter {
             root_attrs.push(build_attr_message(n, v));
         }
 
-        let root_dense = root_attrs.len() > DENSE_ATTR_THRESHOLD;
-        let group_dense: Vec<bool> = groups
-            .iter()
-            .map(|g| g.attrs.len() > DENSE_ATTR_THRESHOLD)
-            .collect();
-        let ds_dense: Vec<bool> = all_ds
-            .iter()
-            .map(|d| d.attrs.len() > DENSE_ATTR_THRESHOLD)
-            .collect();
+        let root_dense = needs_dense_attrs(&root_attrs);
+        let group_dense: Vec<bool> = groups.iter().map(|g| needs_dense_attrs(&g.attrs)).collect();
+        let ds_dense: Vec<bool> = all_ds.iter().map(|d| needs_dense_attrs(&d.attrs)).collect();
 
         // A compact attribute is stored as an object-header message, whose size
         // field is 2 bytes wide. An oversized one would be written with a
@@ -1428,7 +1462,9 @@ impl FileWriter {
         //
         // Dense attributes are stored in a fractal heap rather than the header, so
         // this limit does not apply to them and the check skips them; the dense
-        // check just below bounds those instead.
+        // check just below bounds those instead. An attribute that would exceed it
+        // is *why* `needs_dense_attrs` picked the dense path, so what reaches here
+        // is only what a header can hold — this is a backstop, not the decision.
         fn check_compact_attrs(attrs: &[AttributeMessage]) -> Result<(), FormatError> {
             for a in attrs {
                 let size = a.serialize(LENGTH_SIZE).len();
@@ -3014,24 +3050,47 @@ mod tests {
         assert_eq!(attrs.len(), 1);
     }
 
+    /// One byte past the compact limit the attribute is not refused — it moves to
+    /// the fractal heap, which has no such field. This is the only way a lone
+    /// large attribute can be written, since an object with one attribute is far
+    /// below the count at which dense storage would otherwise be chosen.
     #[test]
-    fn compact_attr_past_the_message_size_limit_is_refused() {
+    fn an_attr_past_the_message_size_limit_moves_to_dense_storage() {
         let n = largest_fitting_i64_attr_elements() + 1;
-        let size = build_attr_message("boundary", &AttrValue::I64Array(vec![0i64; n]))
-            .serialize(LENGTH_SIZE)
-            .len();
-        assert!(size > OBJECT_HEADER_MESSAGE_MAX);
+        let attrs = vec![build_attr_message(
+            "boundary",
+            &AttrValue::I64Array(vec![0i64; n]),
+        )];
+        assert!(attrs[0].serialize(LENGTH_SIZE).len() > OBJECT_HEADER_MESSAGE_MAX);
+        assert!(
+            needs_dense_attrs(&attrs),
+            "one oversized attribute must select dense storage by itself"
+        );
 
         let mut fw = FileWriter::new();
         fw.set_root_attr("boundary", AttrValue::I64Array(vec![7i64; n]));
         fw.create_dataset("d").with_f64_data(&[1.0]);
-        assert_eq!(
-            fw.finish(),
-            Err(FormatError::AttributeMessageTooLarge {
-                name: "boundary".to_string(),
-                size,
-            })
-        );
+        let bytes = fw.finish().expect("written, not refused");
+
+        let file = crate::reader::File::from_bytes(bytes).unwrap();
+        let attrs = file.root().attrs().unwrap();
+        assert_eq!(attrs.len(), 1);
+        match attrs.get("boundary") {
+            Some(AttrValue::I64Array(v)) => assert_eq!(v.len(), n),
+            other => panic!("expected the attribute back, got {other:?}"),
+        }
+    }
+
+    /// And the compact path is still chosen for everything that fits, so the size
+    /// rule has not promoted every attribute to a heap.
+    #[test]
+    fn an_attr_at_the_message_size_limit_stays_compact() {
+        let n = largest_fitting_i64_attr_elements();
+        let attrs = vec![build_attr_message(
+            "boundary",
+            &AttrValue::I64Array(vec![0i64; n]),
+        )];
+        assert!(!needs_dense_attrs(&attrs));
     }
 
     /// Read a dataset's VL-string byte objects from a freshly-written file.

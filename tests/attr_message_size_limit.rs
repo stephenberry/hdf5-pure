@@ -2,9 +2,18 @@
 //! size field is 2 bytes wide. The whole-file writer used to cast the message
 //! length into that field unchecked, so an oversized attribute either vanished
 //! from the file it was written to or left the header unparseable (issue #190).
-//! These tests pin the refusal on every object that carries attributes.
+//!
+//! Since #195 an oversized attribute is not refused but moved to a fractal heap,
+//! which has no such field — so most of these now pin the *write*. The exception
+//! is variable-length data, which is still refused: its global-heap references
+//! are patched after a dense blob would already have been built from them, so a
+//! heap would embed unpatched addresses. These tests hold that line, and
+//! [`oversized_vlen`] is why the storage rule has an exception in it.
 
 use hdf5_pure::{AttrValue, Error, File, FileBuilder, FormatError, OBJECT_HEADER_MESSAGE_MAX};
+
+mod common;
+use common::heap::has_fractal_heap;
 
 /// A `VarLenAsciiArray` past the message-size limit: each element contributes a
 /// 16-byte global-heap reference, so ~4,100 elements cross it. This is the shape
@@ -43,53 +52,76 @@ fn root_vlen_attr_past_the_limit_is_refused() {
     assert!(size > OBJECT_HEADER_MESSAGE_MAX);
 }
 
+/// A fixed-width attribute past the limit is no longer refused: it selects heap
+/// storage, where the 2-byte field does not apply, and comes back intact. On
+/// every object that carries attributes, since each reaches the writer's storage
+/// choice by a different route.
 #[test]
-fn root_fixed_width_attr_past_the_limit_is_refused() {
+fn fixed_width_attrs_past_the_limit_move_to_heap_storage() {
+    let expected = match oversized_fixed() {
+        AttrValue::StringArray(v) => v,
+        other => panic!("fixture changed shape: {other:?}"),
+    };
+
     let mut builder = FileBuilder::new();
     builder.set_attr("big", oversized_fixed());
-    builder.create_dataset("x").with_f64_data(&[1.0]);
-
-    let (name, size) = too_large(&builder.finish().unwrap_err());
-    assert_eq!(name, "big");
-    assert!(size > OBJECT_HEADER_MESSAGE_MAX);
-}
-
-#[test]
-fn group_attr_past_the_limit_is_refused() {
-    let mut builder = FileBuilder::new();
-    let mut group = builder.create_group("g");
-    group.set_attr("big", oversized_fixed());
-    group.create_dataset("x").with_f64_data(&[1.0]);
-    builder.add_group(group.finish());
-
-    assert_eq!(too_large(&builder.finish().unwrap_err()).0, "big");
-}
-
-#[test]
-fn dataset_attr_past_the_limit_is_refused() {
-    let mut builder = FileBuilder::new();
     builder
         .create_dataset("x")
         .with_f64_data(&[1.0])
         .set_attr("big", oversized_fixed());
+    let mut group = builder.create_group("g");
+    group.set_attr("big", oversized_fixed());
+    group.create_dataset("y").with_f64_data(&[2.0]);
+    builder.add_group(group.finish());
 
-    assert_eq!(too_large(&builder.finish().unwrap_err()).0, "big");
+    let bytes = builder.finish().expect("written, not refused");
+    assert!(has_fractal_heap(&bytes));
+
+    let file = File::from_bytes(bytes).unwrap();
+    for attrs in [
+        file.root().attrs().unwrap(),
+        file.dataset("x").unwrap().attrs().unwrap(),
+        file.group("g").unwrap().attrs().unwrap(),
+    ] {
+        match attrs.get("big") {
+            Some(AttrValue::StringArray(v)) => assert_eq!(*v, expected),
+            other => panic!("oversized attribute came back as {other:?}"),
+        }
+    }
 }
 
-/// `write` refuses too, rather than only `finish`. It creates the destination
-/// before serializing, so a refusal leaves an empty file behind — no HDF5
-/// content, but the path exists. Asserted so the behaviour is on the record.
+/// `write` refuses a variable-length one too, rather than only `finish`. It
+/// creates the destination before serializing, so a refusal leaves an empty file
+/// behind — no HDF5 content, but the path exists. Asserted so the behaviour is on
+/// the record.
 #[test]
 fn write_to_disk_refuses_and_leaves_an_empty_file() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("oversized.h5");
 
     let mut builder = FileBuilder::new();
-    builder.set_attr("big", oversized_fixed());
+    builder.set_attr("labels", oversized_vlen());
     builder.create_dataset("x").with_f64_data(&[1.0]);
 
-    assert_eq!(too_large(&builder.write(&path).unwrap_err()).0, "big");
+    assert_eq!(too_large(&builder.write(&path).unwrap_err()).0, "labels");
     assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+}
+
+/// The variable-length exception is about the *set*, not one attribute: a small
+/// variable-length attribute alongside an oversized fixed-width one also holds
+/// the whole set back from heap storage, because the heap would embed that small
+/// one's unpatched references just the same.
+#[test]
+fn a_variable_length_attribute_holds_back_the_whole_set() {
+    let mut builder = FileBuilder::new();
+    builder.set_attr("big", oversized_fixed());
+    builder.set_attr(
+        "labels",
+        AttrValue::VarLenAsciiArray(vec!["a".to_string(), "b".to_string()]),
+    );
+    builder.create_dataset("x").with_f64_data(&[1.0]);
+
+    assert_eq!(too_large(&builder.finish().unwrap_err()).0, "big");
 }
 
 /// An oversized attribute is not the only way to overflow the message-size

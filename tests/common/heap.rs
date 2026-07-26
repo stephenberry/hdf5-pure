@@ -13,6 +13,12 @@
 /// Byte offsets are for the 8-byte offset/length sizes this writer emits.
 const SIZE: usize = 8;
 
+/// Whether the file contains a fractal heap at all — the signature of dense
+/// (heap) rather than compact (in-object-header) storage.
+pub fn has_fractal_heap(bytes: &[u8]) -> bool {
+    bytes.windows(4).any(|w| w == b"FRHP")
+}
+
 /// Offset of the fractal-heap header in `bytes`.
 ///
 /// Panics if there is none, since a caller asking about heap storage has already

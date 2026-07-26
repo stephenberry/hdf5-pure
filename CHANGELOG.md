@@ -8,11 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- Dense attribute storage writes an attribute of any size: one too large to be a managed fractal-heap object becomes a *huge* object, indexed by a huge-objects B-tree, instead of being refused. Attribute names, datatypes, and dataspaces are still bounded by the 2-byte fields the attribute message encodes them in ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
+- An attribute of any size is written rather than refused: one too large for an object-header message now selects fractal-heap storage on its own (previously only attribute *count* did), and one too large for a managed heap object becomes a *huge* object. Variable-length attributes are unchanged, and a name, datatype, or dataspace past the 2-byte field describing it is refused as the new `FormatError::AttributeFieldTooLong` (joined by `FormatError::TooManyHugeDenseAttributes`) ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
 
 ### Removed
 
-- **Breaking:** `FormatError::DenseAttributeTooLarge` is gone, as no attribute size is refused any more. `FormatError::AttributeFieldTooLong` replaces it for an attribute name, datatype, or dataspace past what the message can describe ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
+- **Breaking:** `FormatError::DenseAttributeTooLarge` is gone, as no attribute size is refused any more ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
 
 ## [0.25.0] - 2026-07-26
 

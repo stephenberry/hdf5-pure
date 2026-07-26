@@ -325,6 +325,12 @@ pub enum FormatError {
     /// a truncated size field would desynchronize every message after it. The
     /// fields carry the attribute name and its serialized message size in
     /// bytes; the limit is [`OBJECT_HEADER_MESSAGE_MAX`].
+    ///
+    /// A backstop rather than an outcome you should expect to see: the
+    /// whole-file writer selects dense (fractal-heap) storage for exactly the
+    /// attributes that would trip this, so no input reaches it today. It stays
+    /// because the limit it describes is a real property of the object header,
+    /// and any future path that must keep an attribute compact needs it.
     AttributeMessageTooLarge {
         /// The attribute's name.
         name: String,
@@ -354,6 +360,10 @@ pub enum FormatError {
     /// This bounds the attribute's *description*, not its data. An attribute
     /// whose data is arbitrarily large is written to dense storage as a
     /// fractal-heap huge object.
+    ///
+    /// Reported by the whole-file writer (including through `repack`), which
+    /// sends any attribute too large for an object-header message to dense
+    /// storage and so reaches this check.
     AttributeFieldTooLong {
         /// The attribute's name.
         name: String,

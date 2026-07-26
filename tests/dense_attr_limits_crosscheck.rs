@@ -161,6 +161,57 @@ fn child_reads_attribute_sizes() {
     }
 }
 
+/// The child half of [`c_inserts_then_reads`]. Opens the file read-write with
+/// libhdf5, adds an attribute large enough to need huge storage, then reopens and
+/// reports what is there.
+///
+/// Reading alone never consults the heap header's `next_huge_object_id`; only an
+/// insert does, because that is where the C library derives the next ID from it.
+/// A heap that declares the wrong value reads back perfectly and then collides on
+/// the first write.
+#[test]
+fn child_inserts_with_libhdf5() {
+    let Ok(path) = std::env::var(CHILD_ENV) else {
+        return;
+    };
+    let added: Vec<i64> = (0..12_000).collect();
+    {
+        let f = match hdf5::File::open_rw(&path) {
+            Ok(f) => f,
+            Err(_) => {
+                println!("OPEN_FAILED");
+                return;
+            }
+        };
+        f.new_attr::<i64>()
+            .shape([added.len()])
+            .create("inserted")
+            .expect("create attribute")
+            .write(&added)
+            .expect("write attribute");
+        f.close().expect("close");
+    }
+    match hdf5::File::open(&path) {
+        Ok(f) => {
+            let names = f.attr_names().expect("attribute names");
+            println!("ATTRS={}", names.len());
+            for name in names {
+                let attr = f.attr(&name).expect("open attribute");
+                let dtype = attr.dtype().expect("attribute datatype");
+                println!("SIZE={name}={}", dtype.size() * attr.size());
+            }
+            f.close().expect("close");
+        }
+        Err(_) => println!("OPEN_FAILED"),
+    }
+}
+
+/// Have libhdf5 add a huge attribute to a heap this crate wrote, then read the
+/// result back.
+fn c_inserts_then_reads(path: &std::path::Path) -> CDetail {
+    c_child(path, "child_inserts_with_libhdf5")
+}
+
 /// Nine attributes — enough to select dense storage — the first sized to
 /// `payload` bytes of text and the rest small.
 fn nine_attrs(payload: usize) -> FileBuilder {
@@ -235,6 +286,79 @@ fn counting_sum(first: i64, len: usize) -> i64 {
     (first..first + len as i64)
         .reduce(i64::wrapping_add)
         .unwrap_or(0)
+}
+
+/// A single large attribute, with no others to push the object over the compact
+/// count. This is the shape the capability exists for, and it reaches dense
+/// storage only because one oversized attribute selects it on its own.
+///
+/// Worth crosschecking separately rather than assuming it follows from the
+/// nine-attribute case: an object carrying dense storage for *one* attribute is
+/// well below the count at which the C library would have converted, and nothing
+/// but the library itself settles whether it minds.
+#[test]
+fn c_reads_a_lone_huge_attribute() {
+    let dir = tempdir().unwrap();
+    let len = 12_000usize;
+
+    for others in [0usize, 2] {
+        let path = dir.path().join(format!("lone{others}.h5"));
+        let mut builder = FileBuilder::new();
+        builder.set_attr("big", counting_attr(0, len));
+        for i in 0..others {
+            builder.set_attr(&format!("a{i}"), AttrValue::I64(i as i64));
+        }
+        builder.create_dataset("x").with_f64_data(&[1.0]);
+        builder.write(&path).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(huge_object_count(&bytes), 1);
+        assert_eq!(managed_object_count(&bytes), others as u64);
+
+        let detail = c_reads_in_detail(&path);
+        assert_eq!(detail.verdict, CReads::Attrs(others + 1));
+        assert_eq!(detail.size_of("big"), Some(len * 8));
+        assert_eq!(detail.sum_of("big"), Some(counting_sum(0, len)));
+    }
+}
+
+/// The heap header's `next_huge_object_id` holds the *last* ID assigned, not the
+/// next one free, because the C library pre-increments it. Nothing that only
+/// reads a file can tell the two apart — libhdf5 resolves a huge object through
+/// the B-tree and never consults the counter. It consults it when *inserting*, so
+/// an off-by-one there produces a file that reads back perfectly and then
+/// collides ("record is already in B-tree") the first time anything adds to it.
+///
+/// This is the only test that exercises that field, and it also covers the header
+/// accounting an insert has to build on: `free_space`, `managed_space_in_heap`
+/// and the two object counts.
+///
+/// It pins the direction that matters rather than the exact value. A counter
+/// below the last ID assigned collides, and this fails; one above merely skips an
+/// ID, which the C library tolerates, so this would not catch it.
+#[test]
+fn c_adds_a_huge_attribute_to_a_heap_this_crate_wrote() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("insert.h5");
+    let len = 12_000usize;
+
+    let mut builder = FileBuilder::new();
+    builder.set_attr("big", counting_attr(0, len));
+    for i in 0..8 {
+        builder.set_attr(&format!("a{i}"), AttrValue::I64(i as i64));
+    }
+    builder.create_dataset("x").with_f64_data(&[1.0]);
+    builder.write(&path).unwrap();
+    assert_eq!(huge_object_count(&std::fs::read(&path).unwrap()), 1);
+
+    let detail = c_inserts_then_reads(&path);
+    assert_eq!(
+        detail.verdict,
+        CReads::Attrs(10),
+        "libhdf5 could not add a huge attribute to this heap"
+    );
+    assert_eq!(detail.size_of("big"), Some(len * 8));
+    assert_eq!(detail.size_of("inserted"), Some(len * 8));
 }
 
 /// A heap that mixes both storage classes: the direct block is sized by the
