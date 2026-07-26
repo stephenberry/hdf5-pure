@@ -211,11 +211,17 @@ pub(crate) fn embedded_vlen_slots(datatype: &Datatype) -> Option<Vec<EmbeddedVlS
     let element_size = datatype.type_size() as usize;
     let capacity = element_size / VL_REF_BYTES;
     let mut slots = Vec::new();
-    collect_vlen_slots(datatype, 0, capacity, &mut slots);
+    if !collect_vlen_slots(datatype, 0, capacity, &mut slots) {
+        return None;
+    }
+    // `checked_add`: an offset near the top of the address space would otherwise
+    // wrap here and read as "fits".
     if slots.len() > capacity
-        || slots
-            .iter()
-            .any(|s| s.byte_offset + VL_REF_BYTES > element_size)
+        || slots.iter().any(|s| {
+            s.byte_offset
+                .checked_add(VL_REF_BYTES)
+                .is_none_or(|end| end > element_size)
+        })
     {
         return None;
     }
@@ -226,15 +232,20 @@ pub(crate) fn embedded_vlen_slots(datatype: &Datatype) -> Option<Vec<EmbeddedVlS
 /// the only offset size the write path emits and the only one repack re-stages.
 const VL_REF_BYTES: usize = 16;
 
+/// Walk `datatype`, appending a slot for each variable-length reference it
+/// reaches. Returns `false` if it cannot be walked on this target: an offset the
+/// file declares that does not fit `usize`, or one that overflows it, names a
+/// position this platform cannot address, and silently truncating it would place
+/// a slot somewhere plausible but wrong.
 fn collect_vlen_slots(
     datatype: &Datatype,
     base: usize,
     capacity: usize,
     out: &mut Vec<EmbeddedVlSlot>,
-) {
+) -> bool {
     // Stop one past the bound so the caller can still tell "too many" from "fits".
     if out.len() > capacity {
-        return;
+        return true;
     }
     match datatype {
         Datatype::VariableLength { base_type, .. } => {
@@ -249,11 +260,21 @@ fn collect_vlen_slots(
                 byte_offset: base,
                 element_size,
             });
+            true
         }
         Datatype::Compound { members, .. } => {
             for m in members {
-                collect_vlen_slots(&m.datatype, base + m.byte_offset as usize, capacity, out);
+                let Some(at) = usize::try_from(m.byte_offset)
+                    .ok()
+                    .and_then(|off| base.checked_add(off))
+                else {
+                    return false;
+                };
+                if !collect_vlen_slots(&m.datatype, at, capacity, out) {
+                    return false;
+                }
             }
+            true
         }
         Datatype::Array {
             base_type,
@@ -265,25 +286,43 @@ fn collect_vlen_slots(
             // and makes every iteration below push at least one slot — so the
             // `capacity` bound terminates the loop.
             let mut probe = Vec::new();
-            collect_vlen_slots(base_type, 0, capacity, &mut probe);
+            if !collect_vlen_slots(base_type, 0, capacity, &mut probe) {
+                return false;
+            }
             if probe.is_empty() {
-                return;
+                return true;
             }
             let count = dimensions
                 .iter()
                 .copied()
                 .fold(1u64, |a, b| a.saturating_mul(u64::from(b)));
+            // Every entry contributes at least one slot, so more entries than the
+            // element has room for cannot fit however the walk goes. Reject up
+            // front rather than materializing that many slots for the caller to
+            // discard: for a datatype whose declared size saturates, `capacity`
+            // runs to hundreds of millions, which is merely wasteful on a 64-bit
+            // target and an outright allocation failure on a 32-bit one.
+            if count > capacity as u64 {
+                return false;
+            }
+            let entries = usize::try_from(count).unwrap_or(usize::MAX);
             let stride = base_type.type_size() as usize;
-            for i in 0..count {
-                collect_vlen_slots(base_type, base + (i as usize) * stride, capacity, out);
+            for i in 0..entries {
+                let Some(at) = i.checked_mul(stride).and_then(|off| base.checked_add(off)) else {
+                    return false;
+                };
+                if !collect_vlen_slots(base_type, at, capacity, out) {
+                    return false;
+                }
                 if out.len() > capacity {
-                    return;
+                    return true;
                 }
             }
+            true
         }
         // An enumeration's base is an integer, and no other class can reach a
         // variable-length reference.
-        _ => {}
+        _ => true,
     }
 }
 
@@ -921,6 +960,20 @@ mod embedded_slot_tests {
         let dt = Datatype::Array {
             base_type: Box::new(vlen_string()),
             dimensions: vec![u32::MAX, u32::MAX],
+        };
+        assert_eq!(embedded_vlen_slots(&dt), None);
+    }
+
+    /// A member offset is read from the file as a `u64`, so it can name a
+    /// position no `usize` can address. Truncating it would land the slot
+    /// somewhere plausible *inside* the element, where the size check below would
+    /// wave it through and the rewrite would corrupt an unrelated field; the walk
+    /// has to refuse instead. On 64-bit the offset simply exceeds the element.
+    #[test]
+    fn a_member_offset_beyond_the_address_space_is_rejected() {
+        let dt = Datatype::Compound {
+            size: 40,
+            members: vec![member("s", u64::MAX - 8, vlen_string())],
         };
         assert_eq!(embedded_vlen_slots(&dt), None);
     }

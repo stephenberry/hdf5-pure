@@ -1205,19 +1205,33 @@ fn resolve_reference_address(
 /// first. Returns `None` if the offsets found do not fit the datatype's declared
 /// element size, which means the element bytes cannot be walked safely.
 fn embedded_reference_slots(datatype: &Datatype) -> Option<Vec<usize>> {
-    fn collect(datatype: &Datatype, base: usize, capacity: usize, out: &mut Vec<usize>) {
+    /// Returns `false` when the datatype cannot be walked on this target, for the
+    /// reasons [`embedded_vlen_slots`]' walker documents.
+    fn collect(datatype: &Datatype, base: usize, capacity: usize, out: &mut Vec<usize>) -> bool {
         if out.len() > capacity {
-            return;
+            return true;
         }
         match datatype {
             Datatype::Reference {
                 ref_type: ReferenceType::Object,
                 size: 8,
-            } => out.push(base),
+            } => {
+                out.push(base);
+                true
+            }
             Datatype::Compound { members, .. } => {
                 for m in members {
-                    collect(&m.datatype, base + m.byte_offset as usize, capacity, out);
+                    let Some(at) = usize::try_from(m.byte_offset)
+                        .ok()
+                        .and_then(|off| base.checked_add(off))
+                    else {
+                        return false;
+                    };
+                    if !collect(&m.datatype, at, capacity, out) {
+                        return false;
+                    }
                 }
+                true
             }
             Datatype::Array {
                 base_type,
@@ -1227,31 +1241,54 @@ fn embedded_reference_slots(datatype: &Datatype) -> Option<Vec<usize>> {
                 // never contribute do not drive a walk over huge declared
                 // dimensions, and so every iteration below pushes at least one slot.
                 let mut probe = Vec::new();
-                collect(base_type, 0, capacity, &mut probe);
+                if !collect(base_type, 0, capacity, &mut probe) {
+                    return false;
+                }
                 if probe.is_empty() {
-                    return;
+                    return true;
                 }
                 let count = dimensions
                     .iter()
                     .copied()
                     .fold(1u64, |a, b| a.saturating_mul(u64::from(b)));
+                // As in `embedded_vlen_slots`: more entries than the element has
+                // room for cannot fit, so reject without walking them.
+                if count > capacity as u64 {
+                    return false;
+                }
+                let entries = usize::try_from(count).unwrap_or(usize::MAX);
                 let stride = base_type.type_size() as usize;
-                for i in 0..count {
-                    collect(base_type, base + (i as usize) * stride, capacity, out);
+                for i in 0..entries {
+                    let Some(at) = i.checked_mul(stride).and_then(|off| base.checked_add(off))
+                    else {
+                        return false;
+                    };
+                    if !collect(base_type, at, capacity, out) {
+                        return false;
+                    }
                     if out.len() > capacity {
-                        return;
+                        return true;
                     }
                 }
+                true
             }
-            _ => {}
+            _ => true,
         }
     }
 
     let element_size = datatype.type_size() as usize;
     let capacity = element_size / 8;
     let mut slots = Vec::new();
-    collect(datatype, 0, capacity, &mut slots);
-    if slots.len() > capacity || slots.iter().any(|&s| s + 8 > element_size) {
+    if !collect(datatype, 0, capacity, &mut slots) {
+        return None;
+    }
+    // `checked_add`: an offset near the top of the address space would otherwise
+    // wrap here and read as "fits".
+    if slots.len() > capacity
+        || slots
+            .iter()
+            .any(|&s| s.checked_add(8).is_none_or(|end| end > element_size))
+    {
         return None;
     }
     Some(slots)
