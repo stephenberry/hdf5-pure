@@ -1013,9 +1013,14 @@ pub(crate) struct ObjectRefPatch {
 ///
 /// The offset comes from the datatype's own layout and `raw` is sized from the
 /// same datatype, so a slot that does not fit means the two disagree — a bug in
-/// whoever staged them, not input this can correct. Skipping the write leaves the
-/// placeholder zeros (a null reference) rather than corrupting a neighbouring
-/// field, and the debug assertion catches it in the test suite.
+/// whoever staged them, not input this can correct. The debug assertion catches
+/// that in the test suite; in release the write is skipped rather than allowed to
+/// corrupt a neighbouring field. Note what a skip leaves behind depends on the
+/// caller: placeholder zeros (a null reference) for a dataset staged by
+/// [`DatasetBuilder::with_object_references`], but the *source's* address for one
+/// staged by [`DatasetBuilder::with_embedded_object_references`], whose buffer is
+/// the source's element bytes. Neither is reachable without the assertion firing
+/// first.
 pub(crate) fn write_reference_address(raw: &mut [u8], byte_offset: usize, address: u64) {
     debug_assert!(
         byte_offset + 8 <= raw.len(),

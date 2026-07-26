@@ -2523,7 +2523,7 @@ impl Dataset {
     pub fn write<T: H5Element>(&mut self, data: &[T]) -> Result<(), Error> {
         // Build off the lock — `H5Element` is user-implementable, so
         // `write_into` is potentially user code (see `write_staged`).
-        self.file.check_staged_writable()?;
+        self.check_staged_edit()?;
         let mut builder = DatasetBuilder::new("");
         T::write_into(&mut builder, data);
         self.with_session_mut(true, |session, path| {
@@ -2558,10 +2558,10 @@ impl Dataset {
     /// The closure configures a standalone builder, not the file, so it may read
     /// the same [`File`]; nothing it stages resolves until [`File::commit`].
     pub fn write_staged(&mut self, build: impl FnOnce(&mut DatasetBuilder)) -> Result<(), Error> {
-        // Report a read-only or sealed file before running the closure, then run
-        // it with no lock held; `stage_dataset_write` names the builder from the
-        // dataset's path (issue #200).
-        self.file.check_staged_writable()?;
+        // Report a read-only, sealed, or unaddressable dataset before running the
+        // closure, then run it with no lock held; `stage_dataset_write` names the
+        // builder from the dataset's path (issue #200).
+        self.check_staged_edit()?;
         let mut builder = DatasetBuilder::new("");
         build(&mut builder);
         self.with_session_mut(true, |session, path| {
@@ -2590,7 +2590,7 @@ impl Dataset {
     /// The closure configures a standalone builder, not the file, so it may read
     /// the same [`File`]; nothing it stages resolves until [`File::commit`].
     pub fn append_staged(&mut self, build: impl FnOnce(&mut AppendBuilder)) -> Result<(), Error> {
-        self.file.check_staged_writable()?;
+        self.check_staged_edit()?;
         let mut builder = AppendBuilder::new();
         build(&mut builder);
         self.with_session_mut(true, |session, path| {
@@ -2618,6 +2618,23 @@ impl Dataset {
             session.remove_dataset_attr(path, name);
             Ok(())
         })
+    }
+
+    /// Gate a staged edit on this dataset *without* taking the session lock:
+    /// the file must accept staged edits, and this handle must have a resolvable
+    /// path.
+    ///
+    /// The path check belongs here rather than only in
+    /// [`with_session_mut`](Self::with_session_mut) so that every reason to
+    /// refuse is reported *before* a user closure runs, not after. A handle
+    /// reached by object reference ([`dereference`](Self::dereference)) has no
+    /// path, and would otherwise have its closure run and its result discarded.
+    fn check_staged_edit(&self) -> Result<(), Error> {
+        self.file.check_staged_writable()?;
+        if self.path.is_none() {
+            return Err(Error::ReadOnly);
+        }
+        Ok(())
     }
 
     /// Run `f` with the writable session and this dataset's path, then refresh
@@ -3218,7 +3235,10 @@ impl Dataset {
             );
         }
 
-        let raw = self.read_raw()?;
+        // A zero-element dataset owns no element bytes, and the C library leaves
+        // such a dataset's storage unallocated — reading it would fail for a
+        // missing chunk address rather than yield an empty buffer.
+        let raw = if n == 0 { Vec::new() } else { self.read_raw()? };
         let n_usize = n.to_usize()?;
         let needed = n_usize
             .checked_mul(stride)

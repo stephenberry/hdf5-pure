@@ -56,7 +56,7 @@ The operation is all-or-nothing: the entire source is validated and staged in me
 | Aspect | Supported |
 | --- | --- |
 | Datatypes | fixed-point, floating-point, fixed-length string, time, bit-field, opaque, compound, enumeration, array; variable-length strings and sequences, and 8-byte object references (rewritten to their targets' new addresses) |
-| Embedded references | a compound with a variable-length or object-reference member, an array of such compounds, and nesting of either: the embedded references are rewritten, the surrounding bytes carried through untouched |
+| Embedded addresses | a compound with a variable-length member, an object-reference member, or both; an array of such compounds; and nesting of either. The embedded addresses are rewritten, the surrounding bytes carried through untouched |
 | Layout | contiguous / compact or chunked |
 | Filters | deflate, shuffle, fletcher32, and/or lossless integer scale-offset |
 | Structure | group hierarchy of arbitrary depth |

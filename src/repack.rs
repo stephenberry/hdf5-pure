@@ -33,10 +33,12 @@
 //!   null-vs-empty distinction, embedded NULs, and non-UTF-8 payloads, and the
 //!   source's chunk geometry, filters, and resizability are carried onto the
 //!   rebuilt dataset.
-//! - Datatypes that *contain* a variable-length member without being one — a
-//!   compound with a VL member, an array of such compounds, and nesting of
-//!   either. The embedded heap references are re-staged exactly as a top-level
-//!   one is, while every other byte of the element is carried through untouched.
+//! - Datatypes that *contain* an address without being one — a compound with a
+//!   variable-length member, an object-reference member, or both; an array of
+//!   such compounds; and nesting of either. The embedded heap references are
+//!   re-staged and the embedded object addresses resolved exactly as their
+//!   top-level counterparts are, in a single pass, while every other byte of the
+//!   element is carried through untouched.
 //! - Contiguous/compact **object-reference** datasets, and contiguous/compact
 //!   datatypes containing an object-reference member: each stored address is
 //!   rewritten to its target object's new location in the compacted file (null
@@ -397,14 +399,19 @@ fn emit_dataset(
         return Ok(());
     }
 
-    // A datatype that merely *contains* variable-length members — a compound with
-    // a VL member, or an array of them — embeds a global-heap reference inside
-    // each element. Those references go stale on rewrite exactly as a top-level
-    // one does, so this dataset is re-staged through a fresh heap rather than
-    // copied. Routed before the verbatim chunk-copy path so a chunked one is
-    // rebuilt, not copied with source addresses (issue #201).
-    if !vlen_slots.is_empty() {
-        emit_embedded_vlen_dataset(
+    // A datatype that merely *contains* a variable-length member or an object
+    // reference — a compound with either, or an array of them — embeds the
+    // address inside each element. Those addresses go stale on rewrite exactly as
+    // a top-level one does, so this dataset is re-staged rather than copied.
+    // Routed before the verbatim chunk-copy path so a chunked one is rebuilt, not
+    // copied with source addresses (issue #201).
+    //
+    // Both kinds are handled together rather than in sequence: a compound can
+    // carry one of each, and rewriting only the first kind found would leave the
+    // other pointing into the source file — reintroducing the very bug this path
+    // exists to fix, and skipping the other kind's refusals with it.
+    if !vlen_slots.is_empty() || !reference_slots.is_empty() {
+        emit_embedded_address_dataset(
             db,
             ds,
             path,
@@ -413,30 +420,10 @@ fn emit_dataset(
             &layout,
             &pipeline,
             &vlen_slots,
-        )?;
-        let attrs = ds.attrs()?;
-        check_attr_completeness(&attrs, &ds.attr_names()?, &format!("dataset {path}"))?;
-        for (name, value) in sorted(attrs) {
-            db.set_attr(&name, value);
-        }
-        return Ok(());
-    }
-
-    // The same argument for an object-header address embedded in a compound
-    // member or array entry: it names an object in the source file, and the
-    // destination puts that object elsewhere.
-    if !reference_slots.is_empty() {
-        emit_embedded_reference_dataset(
-            db,
-            ds,
-            path,
-            &datatype,
-            &dims,
-            &layout,
+            &reference_slots,
             file,
             drop,
             addr_map,
-            &reference_slots,
         )?;
         let attrs = ds.attrs()?;
         check_attr_completeness(&attrs, &ds.attr_names()?, &format!("dataset {path}"))?;
@@ -709,21 +696,25 @@ fn emit_vlen_sequence_dataset(
     Ok(())
 }
 
-/// Re-emit a dataset whose datatype *contains* variable-length references
-/// without being one — a compound with a variable-length member, or an array of
-/// such compounds (issue #201).
+/// Re-emit a dataset whose datatype *contains* an address without being one — a
+/// compound with a variable-length or object-reference member, an array of such
+/// compounds, or nesting of either (issue #201).
 ///
-/// The element bytes are read as they stand and each embedded reference is
-/// resolved against the source's global heap; the payloads are then re-staged
-/// into the destination's own heap and the references rewritten in place. Copying
-/// the element bytes verbatim instead would leave every reference naming a
-/// collection in the *source* file's address space, which the destination never
-/// allocates — a file that reads back plausibly here and not at all in the
+/// The element bytes are read as they stand; each embedded variable-length
+/// reference is resolved against the source's global heap and its payload
+/// re-staged into the destination's own, and each embedded object address is
+/// resolved to the path it names so the writer can fill in the target's *new*
+/// location. Copying the element bytes verbatim instead would leave every
+/// address pointing into the source file, which the destination never
+/// reproduces — a file that reads back plausibly here and not at all in the
 /// reference C library.
 ///
-/// Everything outside the references is carried byte-for-byte, so the fixed-size
-/// members keep their exact stored bytes and byte order.
-fn emit_embedded_vlen_dataset(
+/// Both kinds are handled in one pass because a single compound can carry one of
+/// each, and they patch disjoint byte ranges of the same buffer. Everything
+/// outside those ranges is carried byte-for-byte, so the fixed-size members keep
+/// their exact stored bytes and byte order.
+#[allow(clippy::too_many_arguments)]
+fn emit_embedded_address_dataset(
     db: &mut DatasetBuilder,
     ds: &Dataset,
     path: &str,
@@ -731,30 +722,69 @@ fn emit_embedded_vlen_dataset(
     dims: &[u64],
     layout: &DataLayout,
     pipeline: &Option<FilterPipeline>,
-    slots: &[EmbeddedVlSlot],
+    vlen_slots: &[EmbeddedVlSlot],
+    reference_slots: &[usize],
+    file: &Arc<File>,
+    drop: &BTreeSet<String>,
+    addr_map: &HashMap<u64, String>,
 ) -> Result<(), Error> {
     // This path re-encodes, so a lossy filter cannot be reproduced — the same
     // guard the other re-staging paths apply.
     check_pipeline(pipeline.as_ref(), path)?;
 
-    let data = ds.read_embedded_vlen_bytes(slots, VlenStringReadOptions::default())?;
-    let elements: Vec<VlStringElement> = data
-        .objects
-        .into_iter()
-        .map(|o| match o {
-            VlByteObject::Null => VlStringElement::Null,
-            VlByteObject::Bytes(bytes) => VlStringElement::Bytes(bytes),
-        })
-        .collect();
+    // An embedded object address is resolved as the elements are re-staged, which
+    // a compressed chunk would need rewritten in place, so the layout guards that
+    // protect a top-level object-reference dataset apply here too. They are
+    // checked before anything is read, and before the variable-length work, so a
+    // compound carrying both kinds is refused rather than half-rewritten.
+    if !reference_slots.is_empty() {
+        check_embedded_reference_layout(ds, path, dims, layout, file)?;
+    }
 
     let n_elements: u64 = dims.iter().product();
-    db.with_embedded_vlen_elements(
-        datatype.clone(),
-        data.raw,
-        n_elements,
-        &data.offsets,
-        &elements,
-    );
+
+    // Read the element bytes once, resolving the variable-length payloads in the
+    // same pass when there are any.
+    let (raw, vl_offsets, vl_elements) = if vlen_slots.is_empty() {
+        let raw = if n_elements == 0 {
+            Vec::new()
+        } else {
+            ds.read_raw()?
+        };
+        (raw, Vec::new(), Vec::new())
+    } else {
+        let data = ds.read_embedded_vlen_bytes(vlen_slots, VlenStringReadOptions::default())?;
+        let elements: Vec<VlStringElement> = data
+            .objects
+            .into_iter()
+            .map(|o| match o {
+                VlByteObject::Null => VlStringElement::Null,
+                VlByteObject::Bytes(bytes) => VlStringElement::Bytes(bytes),
+            })
+            .collect();
+        (data.raw, data.offsets, elements)
+    };
+
+    // Resolve the object addresses from the bytes as read, before the
+    // variable-length staging below consumes `raw`. The two kinds occupy disjoint
+    // slots, so reading one is unaffected by rewriting the other.
+    let reference_patches =
+        resolve_embedded_references(&raw, datatype, dims, path, drop, addr_map, reference_slots)?;
+
+    if vlen_slots.is_empty() {
+        db.with_embedded_object_references(datatype.clone(), raw, n_elements, reference_patches);
+    } else {
+        db.with_embedded_vlen_elements(
+            datatype.clone(),
+            raw,
+            n_elements,
+            &vl_offsets,
+            &vl_elements,
+        );
+        if !reference_patches.is_empty() {
+            db.reference_targets = Some(reference_patches);
+        }
+    }
     db.with_shape(dims);
     carry_shape_and_pipeline(
         db,
@@ -764,6 +794,54 @@ fn emit_embedded_vlen_dataset(
         pipeline,
     );
     Ok(())
+}
+
+/// Turn every embedded object address in `raw` into the target the writer
+/// resolves at serialization time.
+fn resolve_embedded_references(
+    raw: &[u8],
+    datatype: &Datatype,
+    dims: &[u64],
+    path: &str,
+    drop: &BTreeSet<String>,
+    addr_map: &HashMap<u64, String>,
+    slots: &[usize],
+) -> Result<Vec<ObjectRefPatch>, Error> {
+    if slots.is_empty() {
+        return Ok(Vec::new());
+    }
+    let stride = datatype.type_size() as usize;
+    let n_elements: usize = dims.iter().product::<u64>().to_usize()?;
+    let needed = n_elements
+        .checked_mul(stride)
+        .ok_or(FormatError::OffsetOverflow {
+            offset: n_elements as u64,
+            length: stride as u64,
+        })?;
+    if raw.len() < needed {
+        return Err(FormatError::UnexpectedEof {
+            expected: needed,
+            available: raw.len(),
+        }
+        .into());
+    }
+
+    let mut patches = Vec::with_capacity(n_elements * slots.len());
+    for e in 0..n_elements {
+        for &slot in slots {
+            let at = e * stride + slot;
+            let v = u64::from_le_bytes(
+                raw[at..at + 8]
+                    .try_into()
+                    .expect("slot offsets leave 8 bytes inside the element"),
+            );
+            patches.push(ObjectRefPatch {
+                byte_offset: at,
+                target: resolve_reference_address(v, path, drop, addr_map)?,
+            });
+        }
+    }
+    Ok(patches)
 }
 
 /// A [`ChunkProvider`] that streams a dense chunked dataset's chunks from the
@@ -1081,30 +1159,18 @@ fn emit_object_reference_dataset(
     Ok(())
 }
 
-/// Re-emit a dataset whose datatype *contains* object references without being
-/// one — a compound with a reference member, or an array of them.
+/// The layout guards that protect a dataset carrying an embedded object address.
 ///
-/// The same staleness that afflicts a top-level reference dataset applies here:
-/// the stored address names an object header in the source file, and the
-/// destination puts that object somewhere else. Copying the element bytes
-/// verbatim yields a file whose fixed-size members read back correctly and whose
-/// references dereference into whatever now occupies that address.
-///
-/// Each embedded address is resolved through `addr_map` to a source path and
-/// re-staged as a path target, exactly as [`emit_object_reference_dataset`] does,
-/// while every other byte of the element is carried through untouched.
-#[allow(clippy::too_many_arguments)]
-fn emit_embedded_reference_dataset(
-    db: &mut DatasetBuilder,
+/// The address is resolved as the elements are re-staged, which a compressed
+/// chunk would need rewritten in place, and a userblock shifts every address by a
+/// base this rewrite path does not model. Each is refused by name rather than
+/// risking a mis-resolved address.
+fn check_embedded_reference_layout(
     ds: &Dataset,
     path: &str,
-    datatype: &Datatype,
     dims: &[u64],
     layout: &DataLayout,
     file: &Arc<File>,
-    drop: &BTreeSet<String>,
-    addr_map: &HashMap<u64, String>,
-    slots: &[usize],
 ) -> Result<(), Error> {
     if matches!(layout, DataLayout::Chunked { .. }) {
         return Err(Error::RepackUnsupported(format!(
@@ -1126,46 +1192,6 @@ fn emit_embedded_reference_dataset(
              cannot be repacked yet"
         )));
     }
-
-    let stride = datatype.type_size() as usize;
-    let n_elements: usize = dims.iter().product::<u64>().to_usize()?;
-    let raw = if n_elements == 0 {
-        Vec::new()
-    } else {
-        ds.read_raw()?
-    };
-    let needed = n_elements
-        .checked_mul(stride)
-        .ok_or(FormatError::OffsetOverflow {
-            offset: n_elements as u64,
-            length: stride as u64,
-        })?;
-    if raw.len() < needed {
-        return Err(FormatError::UnexpectedEof {
-            expected: needed,
-            available: raw.len(),
-        }
-        .into());
-    }
-
-    let mut patches = Vec::with_capacity(n_elements * slots.len());
-    for e in 0..n_elements {
-        for &slot in slots {
-            let at = e * stride + slot;
-            let v = u64::from_le_bytes(
-                raw[at..at + 8]
-                    .try_into()
-                    .expect("slot offsets leave 8 bytes inside the element"),
-            );
-            patches.push(ObjectRefPatch {
-                byte_offset: at,
-                target: resolve_reference_address(v, path, drop, addr_map)?,
-            });
-        }
-    }
-
-    db.with_embedded_object_references(datatype.clone(), raw, n_elements as u64, patches);
-    db.with_shape(dims);
     Ok(())
 }
 
@@ -1240,6 +1266,9 @@ fn embedded_reference_slots(datatype: &Datatype) -> Option<Vec<usize>> {
                 // As in `embedded_vlen_slots`: probe once so that entries which can
                 // never contribute do not drive a walk over huge declared
                 // dimensions, and so every iteration below pushes at least one slot.
+                // Walked once and translated per entry, for the reason
+                // `embedded_vlen_slots` documents: re-walking is exponential in
+                // nesting depth.
                 let mut probe = Vec::new();
                 if !collect(base_type, 0, capacity, &mut probe) {
                     return false;
@@ -1263,11 +1292,14 @@ fn embedded_reference_slots(datatype: &Datatype) -> Option<Vec<usize>> {
                     else {
                         return false;
                     };
-                    if !collect(base_type, at, capacity, out) {
-                        return false;
-                    }
-                    if out.len() > capacity {
-                        return true;
+                    for &slot in &probe {
+                        let Some(off) = at.checked_add(slot) else {
+                            return false;
+                        };
+                        out.push(off);
+                        if out.len() > capacity {
+                            return true;
+                        }
                     }
                 }
                 true

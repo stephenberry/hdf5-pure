@@ -1043,3 +1043,180 @@ fn repack_refuses_compound_reference_to_dropped_object() {
     }
     assert!(!dst.exists(), "dst must not be created when repack refuses");
 }
+
+/// A compound can carry a variable-length member *and* an object-reference
+/// member. Both kinds of embedded address go stale on rewrite, so rewriting only
+/// the first kind found leaves the other pointing into the source file — the
+/// original defect surviving for the one shape that reaches both paths.
+///
+/// The reference is dereferenced rather than merely read back, because a stale
+/// address reads as a perfectly ordinary 8 bytes.
+#[test]
+fn repack_roundtrips_c_compound_with_both_vlen_and_reference_members() {
+    use hdf5::types::VarLenUnicode;
+    use hdf5::{ObjectReference, ObjectReference1, ReferencedObject};
+    use std::str::FromStr;
+
+    #[derive(hdf5::H5Type, Clone, Debug)]
+    #[repr(C)]
+    struct Row {
+        label: VarLenUnicode,
+        id: i32,
+        target: ObjectReference1,
+    }
+
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("c_compound_both.h5");
+    let dst = dir.path().join("compound_both_repacked.h5");
+
+    let labels = ["alpha", "", "gamma"];
+    {
+        let file = hdf5::File::create(&src).unwrap();
+        file.new_dataset::<i32>()
+            .shape((3,))
+            .create("pointee")
+            .unwrap()
+            .write(&[11i32, 22, 33])
+            .unwrap();
+        let vals: Vec<Row> = labels
+            .iter()
+            .enumerate()
+            .map(|(i, l)| Row {
+                label: VarLenUnicode::from_str(l).unwrap(),
+                id: i as i32,
+                target: ObjectReference1::create(&file, "pointee").unwrap(),
+            })
+            .collect();
+        file.new_dataset::<Row>()
+            .shape((labels.len(),))
+            .create("rows")
+            .unwrap()
+            .write(&vals)
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    let c = hdf5::File::open(&dst).unwrap();
+    let cvals = c.dataset("rows").unwrap().read_raw::<Row>().unwrap();
+    assert_eq!(cvals.len(), labels.len());
+    for (i, row) in cvals.iter().enumerate() {
+        assert_eq!(row.label.as_str(), labels[i], "row {i} label differs");
+        assert_eq!(row.id, i as i32, "row {i} id differs");
+        match row.target.dereference(&c).unwrap() {
+            ReferencedObject::Dataset(ds) => assert_eq!(
+                ds.read_raw::<i32>().unwrap(),
+                vec![11, 22, 33],
+                "row {i} reference resolves to the wrong data"
+            ),
+            other => panic!("row {i}: expected a dataset, got {other:?}"),
+        }
+    }
+}
+
+/// The object-reference refusals must not be reachable-around by adding a
+/// variable-length member: a reference into a dropped subtree cannot be rewritten
+/// to anything meaningful whatever else the compound carries.
+#[test]
+fn repack_refuses_dropped_target_in_a_compound_that_also_has_a_vlen_member() {
+    use hdf5::types::VarLenUnicode;
+    use hdf5::{ObjectReference, ObjectReference1};
+    use std::str::FromStr;
+
+    #[derive(hdf5::H5Type, Clone, Debug)]
+    #[repr(C)]
+    struct Row {
+        label: VarLenUnicode,
+        target: ObjectReference1,
+    }
+
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("c_both_dropped.h5");
+    let dst = dir.path().join("both_dropped_repacked.h5");
+
+    {
+        let file = hdf5::File::create(&src).unwrap();
+        file.new_dataset::<i32>()
+            .shape((2,))
+            .create("doomed")
+            .unwrap()
+            .write(&[1i32, 2])
+            .unwrap();
+        let vals = vec![Row {
+            label: VarLenUnicode::from_str("x").unwrap(),
+            target: ObjectReference1::create(&file, "doomed").unwrap(),
+        }];
+        file.new_dataset::<Row>()
+            .shape((1,))
+            .create("rows")
+            .unwrap()
+            .write(&vals)
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    let err = repack(&src, &dst, &RepackOptions::new().drop_path("doomed")).unwrap_err();
+    match err {
+        hdf5_pure::Error::RepackUnsupported(msg) => assert!(
+            msg.contains("rows") && msg.contains("doomed"),
+            "error should name the dataset and its dropped target: {msg}"
+        ),
+        other => panic!("expected RepackUnsupported, got {other:?}"),
+    }
+    assert!(!dst.exists(), "dst must not be created when repack refuses");
+}
+
+/// Likewise the chunked refusal: an object address inside a compressed chunk
+/// would need rewriting in place, and a variable-length member alongside it does
+/// not make that possible.
+#[test]
+fn repack_refuses_chunked_compound_with_both_vlen_and_reference_members() {
+    use hdf5::types::VarLenUnicode;
+    use hdf5::{ObjectReference, ObjectReference1};
+    use std::str::FromStr;
+
+    #[derive(hdf5::H5Type, Clone, Debug)]
+    #[repr(C)]
+    struct Row {
+        label: VarLenUnicode,
+        target: ObjectReference1,
+    }
+
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("c_both_chunked.h5");
+    let dst = dir.path().join("both_chunked_repacked.h5");
+
+    {
+        let file = hdf5::File::create(&src).unwrap();
+        file.new_dataset::<i32>()
+            .shape((2,))
+            .create("pointee")
+            .unwrap()
+            .write(&[1i32, 2])
+            .unwrap();
+        let vals: Vec<Row> = (0..8)
+            .map(|i| Row {
+                label: VarLenUnicode::from_str(&format!("r{i}")).unwrap(),
+                target: ObjectReference1::create(&file, "pointee").unwrap(),
+            })
+            .collect();
+        file.new_dataset::<Row>()
+            .shape((8,))
+            .chunk((4,))
+            .create("rows")
+            .unwrap()
+            .write(&vals)
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    let err = repack(&src, &dst, &RepackOptions::new()).unwrap_err();
+    match err {
+        hdf5_pure::Error::RepackUnsupported(msg) => assert!(
+            msg.contains("rows") && msg.contains("object-reference"),
+            "error should name the dataset and the reason: {msg}"
+        ),
+        other => panic!("expected RepackUnsupported, got {other:?}"),
+    }
+}

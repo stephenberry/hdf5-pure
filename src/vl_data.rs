@@ -285,10 +285,17 @@ fn collect_vlen_slots(
             // dimensions from spinning through entries that can never contribute,
             // and makes every iteration below push at least one slot — so the
             // `capacity` bound terminates the loop.
+            // Walk the entry type *once*, at offset 0, then translate that result
+            // to each entry's base. Re-walking per entry would recompute the same
+            // sub-tree `entries` times at every level of nesting, which is
+            // exponential in nesting depth: a ~300-byte datatype of nested arrays
+            // is enough to burn hours of CPU on work whose output is bounded by
+            // `capacity`.
             let mut probe = Vec::new();
             if !collect_vlen_slots(base_type, 0, capacity, &mut probe) {
                 return false;
             }
+            // No reference in one entry means none in any repetition of it.
             if probe.is_empty() {
                 return true;
             }
@@ -311,11 +318,19 @@ fn collect_vlen_slots(
                 let Some(at) = i.checked_mul(stride).and_then(|off| base.checked_add(off)) else {
                     return false;
                 };
-                if !collect_vlen_slots(base_type, at, capacity, out) {
-                    return false;
-                }
-                if out.len() > capacity {
-                    return true;
+                for slot in &probe {
+                    let Some(byte_offset) = at.checked_add(slot.byte_offset) else {
+                        return false;
+                    };
+                    out.push(EmbeddedVlSlot {
+                        byte_offset,
+                        element_size: slot.element_size,
+                    });
+                    // Stop one past the bound so the caller can still tell
+                    // "too many" from "fits".
+                    if out.len() > capacity {
+                        return true;
+                    }
                 }
             }
             true
@@ -962,6 +977,39 @@ mod embedded_slot_tests {
             dimensions: vec![u32::MAX, u32::MAX],
         };
         assert_eq!(embedded_vlen_slots(&dt), None);
+    }
+
+    /// Deeply nested arrays must cost time proportional to the slots they
+    /// produce, not exponential in nesting depth.
+    ///
+    /// Walking each entry from scratch recomputes the same sub-tree once per
+    /// entry at every level, so a datatype of ~13 bytes per level — trivially
+    /// small in an object header, and depth-unlimited in `Datatype::parse` — used
+    /// to burn seconds here and hours a few levels further down. Any repack of an
+    /// untrusted file reaches this walk.
+    #[test]
+    fn deeply_nested_arrays_cost_time_proportional_to_their_slots() {
+        let mut dt = vlen_string();
+        for _ in 0..17 {
+            dt = Datatype::Array {
+                base_type: Box::new(dt),
+                dimensions: vec![2],
+            };
+        }
+        let started = std::time::Instant::now();
+        let slots = embedded_vlen_slots(&dt).expect("a well-formed nesting must be walkable");
+        let elapsed = started.elapsed();
+
+        assert_eq!(slots.len(), 1 << 17, "one slot per leaf entry");
+        // The linear walk does this in milliseconds even unoptimized; the
+        // exponential one took seconds in release. A wide margin keeps the test
+        // from being a CI-timing flake while still failing the regression by
+        // orders of magnitude.
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "walking {} slots took {elapsed:?}; the walk is no longer linear in its output",
+            slots.len()
+        );
     }
 
     /// A member offset is read from the file as a `u64`, so it can name a

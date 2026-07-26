@@ -205,3 +205,39 @@ fn a_read_only_file_is_refused_without_running_the_closure() {
     assert!(matches!(err, hdf5_pure::Error::ReadOnly), "got {err:?}");
     assert!(!ran, "the closure must not run on a read-only file");
 }
+
+/// The same property for the other reason a staged edit is refused: a `Dataset`
+/// reached by object reference has no resolvable path, so it cannot be edited.
+/// Every reason to refuse must be reported before the closure runs, not after —
+/// otherwise the caller's closure runs and its work is silently discarded.
+#[test]
+fn a_pathless_dataset_handle_is_refused_without_running_the_closure() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("refs.h5");
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("target").with_i32_data(&[1, 2, 3]);
+        b.create_dataset("refs").with_path_references(&["target"]);
+        b.write(&path).unwrap();
+    }
+
+    let file = File::open_rw(&path).unwrap();
+    let refs = file.dataset("refs").unwrap();
+    let mut resolved = refs.dereference().unwrap();
+    let hdf5_pure::Object::Dataset(mut reached) = resolved.remove(0) else {
+        panic!("expected the reference to resolve to a dataset");
+    };
+
+    let mut ran = false;
+    let err = reached
+        .write_staged(|b| {
+            ran = true;
+            b.with_i32_data(&[9, 9, 9]);
+        })
+        .unwrap_err();
+    assert!(matches!(err, hdf5_pure::Error::ReadOnly), "got {err:?}");
+    assert!(
+        !ran,
+        "the closure must not run for a handle with no resolvable path"
+    );
+}
