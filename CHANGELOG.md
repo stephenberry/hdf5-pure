@@ -12,6 +12,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `Dataset::write_staged` overwrites a dataset through its full `DatasetBuilder`, the builder-level counterpart of `Dataset::write` for element kinds that are not `H5Element` ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)).
 - `Group::create_group_with` stages a new group configured through a `StagedGroup` closure, so a group's attributes and children land with its creation (`set_attr` cannot reach it, since it needs a group that already resolves). `create_group(name)` is unchanged ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)).
 
+### Fixed
+
+- Reading the same `File` from inside a builder closure (`Group::create_dataset`, `create_group_with`, `Dataset::write_staged`, `append_staged`) no longer hangs the process. The closures now configure a builder off the session lock, so a staged dataset may depend on data already in the file; it sees the file as it was before the call, since staged edits resolve only on `commit` ([#200](https://github.com/stephenberry/hdf5-pure/issues/200)).
+- `repack` no longer corrupts a dataset whose datatype *contains* a variable-length member, an object-reference member, or both — such as a compound with a variable-length string field. The embedded addresses were copied verbatim and left pointing into the source file, producing a destination this crate read back without complaint and the reference C library could not read at all; they are now rewritten like top-level ones ([#201](https://github.com/stephenberry/hdf5-pure/issues/201)).
+
 ### Changed
 
 - **Breaking:** three refusals on the owned write path now report a more specific error: an unaligned SWMR append gives `SwmrAppendUnsupported` instead of a `ChunkedReadError`, an ineligible immediate append gives `AppendInPlaceUnsupported` instead of `AppendUnsupported`, and a missing edit target gives `PathNotFound` when the handle is resolved instead of `AppendUnsupported`/`EditUnsupported` at commit ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)).

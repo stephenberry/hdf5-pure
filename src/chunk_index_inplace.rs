@@ -1,8 +1,9 @@
-//! In-place Extensible-Array chunk-index growth, shared by the SWMR append
-//! writer ([`crate::swmr_writer`]) and the general append writer
-//! ([`crate::append_writer`]).
+//! In-place Extensible-Array chunk-index growth, shared by the mirror-backed
+//! edit engine ([`crate::edit`]) and the bounded engine ([`crate::bounded`]) —
+//! the two owners behind [`Dataset::append`](crate::Dataset::append) and
+//! [`File::open_swmr_writer`](crate::File::open_swmr_writer).
 //!
-//! Both writers grow a one-dimensional, unlimited, Extensible-Array-indexed
+//! Both owners grow a one-dimensional, unlimited, Extensible-Array-indexed
 //! dataset *in place*: an appended chunk is written at end-of-file, its record is
 //! stored into an element slot of the chunk index, the index grows by appending
 //! new blocks only when a block boundary is crossed (never relocating existing
@@ -87,7 +88,7 @@ impl ElemRecord {
 /// bounded backend adds a store with no mirror at all, which is why every engine
 /// *read* goes through [`Source`] (bounded, random-access) rather than a
 /// whole-file `&[u8]`. Genericizing the engine over this trait lets a long-lived
-/// the in-place edit engine drive an O(1) in-place append against its *own* single mirror and
+/// edit engine drive an O(1) in-place append against its *own* single mirror and
 /// exclusive lock rather than constructing a second `InPlaceFile` (which would
 /// take a second exclusive lock and keep a divergent mirror). Each owner keeps its
 /// own crash-safety discipline for the primitives — `InPlaceFile` mirrors before

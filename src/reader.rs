@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use crate::bounded::BoundedEngine;
 use crate::edit::{AppendBuilder, SpaceAccounting, WriteEngine};
 use crate::element::H5Element;
-use crate::type_builders::DatasetBuilder;
+use crate::type_builders::{DatasetBuilder, VL_REF_SIZE};
 
 use crate::attribute::{extract_attributes_full, extract_attributes_full_from_source};
 use crate::chunk_cache::{ChunkCache, ChunkCacheConfig, ChunkCacheStats};
@@ -508,6 +508,23 @@ impl FileInner {
             return Err(Error::SwmrStagedUnsupported);
         }
         Ok(())
+    }
+
+    /// Gate a staged edit *without* taking the session lock: the backend must
+    /// offer the staged surface, and the file must still be mutable.
+    ///
+    /// This is the same gate the locking helpers apply before locking, split out
+    /// so a public method taking a user closure can report a read-only or sealed
+    /// file up front, run the closure with no lock held, and take the lock only
+    /// to record the result (issue #200).
+    fn check_staged_writable(&self) -> Result<(), Error> {
+        match &self.backend {
+            Backend::Mirror(_) => self.check_mutable(true),
+            // A bounded file is writable but has no staged surface; everything
+            // else is read-only.
+            Backend::Bounded(_) => Err(Error::BoundedStagedUnsupported),
+            _ => Err(Error::ReadOnly),
+        }
     }
 
     /// A `Source` view over the backend, for the streaming-capable paths.
@@ -1921,12 +1938,12 @@ impl std::fmt::Debug for Object {
 /// Every method stages; nothing is written until [`File::commit`], and a staged
 /// object is not resolvable by name until then.
 ///
-/// The closure holding this runs while the file's writable session is locked, so
-/// it must not call back into the same [`File`] (including through a [`Group`] or
-/// [`Dataset`] handle) — that would deadlock. Everything a staged group needs is
-/// on this type.
+/// The closure holding this records into a buffer rather than into the file's
+/// writable session, so nothing is locked while it runs. The recorded operations
+/// are applied together when it returns, which is also why a staged object is not
+/// resolvable until [`File::commit`].
 pub struct StagedGroup<'a> {
-    session: &'a mut WriteEngine,
+    ops: &'a mut Vec<StagedOp>,
     path: String,
 }
 
@@ -1934,7 +1951,11 @@ impl StagedGroup<'_> {
     /// Stage an attribute on this group, applied with its creation on
     /// [`File::commit`].
     pub fn set_attr(&mut self, name: &str, value: AttrValue) -> &mut Self {
-        self.session.set_group_attr(&self.path, name, value);
+        self.ops.push(StagedOp::SetGroupAttr {
+            path: self.path.clone(),
+            name: name.to_string(),
+            value,
+        });
         self
     }
 
@@ -1953,9 +1974,9 @@ impl StagedGroup<'_> {
         build: impl FnOnce(&mut StagedGroup<'_>),
     ) -> &mut Self {
         let child = format!("{}/{}", self.path, name);
-        self.session.create_group(&child);
+        self.ops.push(StagedOp::CreateGroup(child.clone()));
         let mut staged = StagedGroup {
-            session: self.session,
+            ops: &mut *self.ops,
             path: child,
         };
         build(&mut staged);
@@ -1968,9 +1989,51 @@ impl StagedGroup<'_> {
         name: &str,
         build: impl FnOnce(&mut DatasetBuilder),
     ) -> &mut Self {
-        let child = format!("{}/{}", self.path, name);
-        build(self.session.create_dataset(&child));
+        let mut builder = DatasetBuilder::new(name);
+        build(&mut builder);
+        self.ops.push(StagedOp::CreateDataset {
+            path: format!("{}/{}", self.path, name),
+            builder: Box::new(builder),
+        });
         self
+    }
+}
+
+/// One edit recorded by a [`StagedGroup`] closure, replayed onto the writable
+/// session after the closure returns.
+///
+/// The indirection is what keeps user code off the session lock: the closure
+/// touches only this buffer, so calling back into the same [`File`] from inside
+/// it is at worst wrongly ordered rather than a deadlock (issue #200).
+enum StagedOp {
+    CreateGroup(String),
+    SetGroupAttr {
+        path: String,
+        name: String,
+        value: AttrValue,
+    },
+    CreateDataset {
+        path: String,
+        /// Boxed because a `DatasetBuilder` dwarfs the other variants, and a
+        /// closure staging many groups would otherwise pay its size per entry.
+        builder: Box<DatasetBuilder>,
+    },
+}
+
+impl StagedOp {
+    /// Record this edit on the session. Applied in the order the closure made
+    /// the calls, so a group is always staged before its own attributes and
+    /// children.
+    fn apply(self, session: &mut WriteEngine) {
+        match self {
+            StagedOp::CreateGroup(path) => session.create_group(&path),
+            StagedOp::SetGroupAttr { path, name, value } => {
+                session.set_group_attr(&path, &name, value);
+            }
+            StagedOp::CreateDataset { path, builder } => {
+                session.stage_created_dataset(&path, *builder);
+            }
+        }
     }
 }
 
@@ -2126,8 +2189,9 @@ impl Group {
     /// staged; this can, and the creation and its attributes land in one commit.
     /// For a plain empty group use [`create_group`](Self::create_group).
     ///
-    /// The closure runs while this file's writable session is locked, so it must
-    /// not call back into the same [`File`] (see [`StagedGroup`]).
+    /// The closure records into a buffer rather than into the file itself, and
+    /// nothing it stages resolves until [`File::commit`], so reading the same
+    /// [`File`] from inside it sees the file as it was before this call.
     ///
     /// Requires a read-write file ([`File::open_rw`]), else
     /// [`Error::ReadOnly`](crate::Error::ReadOnly).
@@ -2149,19 +2213,21 @@ impl Group {
         name: &str,
         build: impl FnOnce(&mut StagedGroup<'_>),
     ) -> Result<(), Error> {
-        self.with_child_session(name, |session, child| {
-            session.create_group(child);
-            let mut staged = StagedGroup {
-                session,
-                path: child.to_string(),
-            };
-            build(&mut staged);
-            Ok(())
-        })
+        let child = self.child_edit_path(name)?;
+        let mut ops = vec![StagedOp::CreateGroup(child.clone())];
+        build(&mut StagedGroup {
+            ops: &mut ops,
+            path: child,
+        });
+        self.apply_staged(ops)
     }
 
     /// Create a dataset `name` within this group, configuring it through `build`
     /// (shape, data, chunks, filters, …), staged until [`File::commit`].
+    ///
+    /// As with [`create_group_with`](Self::create_group_with), the closure
+    /// configures a builder rather than the file, so it may read the same
+    /// [`File`] — it will see the file as it was before this call.
     ///
     /// Requires a read-write file ([`File::open_rw`]), else
     /// [`Error::ReadOnly`](crate::Error::ReadOnly).
@@ -2170,10 +2236,13 @@ impl Group {
         name: &str,
         build: impl FnOnce(&mut DatasetBuilder),
     ) -> Result<(), Error> {
-        self.with_child_session(name, |session, child| {
-            build(session.create_dataset(child));
-            Ok(())
-        })
+        let child = self.child_edit_path(name)?;
+        let mut builder = DatasetBuilder::new(name);
+        build(&mut builder);
+        self.apply_staged(vec![StagedOp::CreateDataset {
+            path: child,
+            builder: Box::new(builder),
+        }])
     }
 
     /// Delete the object named `name` from this group, staged until
@@ -2228,6 +2297,38 @@ impl Group {
         let child = self.child_path(name).ok_or(Error::ReadOnly)?;
         let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         f(&mut session, &child)
+    }
+
+    /// Validate that this group can stage an edit to child `name` and return the
+    /// child's root-relative path, *without* taking the session lock.
+    ///
+    /// Paired with [`apply_staged`](Self::apply_staged): the checks run first so
+    /// a read-only or sealed file is reported before any user closure runs, the
+    /// closure then runs unlocked, and the lock is taken only to record what it
+    /// built (issue #200).
+    fn child_edit_path(&self, name: &str) -> Result<String, Error> {
+        self.file.check_staged_writable()?;
+        self.child_path(name).ok_or(Error::ReadOnly)
+    }
+
+    /// Record already-built edits on the writable session, holding the lock only
+    /// for the duration of the replay.
+    ///
+    /// The file is re-checked here because the closure that produced `ops` ran
+    /// unlocked and could have closed the file in the meantime; staging into a
+    /// sealed file would otherwise be silently accepted and then dropped.
+    fn apply_staged(&self, ops: Vec<StagedOp>) -> Result<(), Error> {
+        self.file.check_staged_writable()?;
+        let Backend::Mirror(m) = &self.file.backend else {
+            // `check_staged_writable` accepts only a mirror backend, and a
+            // file's backend is fixed for its lifetime.
+            return Err(Error::ReadOnly);
+        };
+        let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for op in ops {
+            op.apply(&mut session);
+        }
+        Ok(())
     }
 
     /// Run `f` with the writable session and this group's *own* root-relative
@@ -2420,9 +2521,13 @@ impl Dataset {
     /// [`Error::ReadOnly`](crate::Error::ReadOnly). Unlike [`append`](Self::append)
     /// (immediate), this is a staged edit applied on [`File::commit`].
     pub fn write<T: H5Element>(&mut self, data: &[T]) -> Result<(), Error> {
+        // Build off the lock — `H5Element` is user-implementable, so
+        // `write_into` is potentially user code (see `write_staged`).
+        self.check_staged_edit()?;
+        let mut builder = DatasetBuilder::new("");
+        T::write_into(&mut builder, data);
         self.with_session_mut(true, |session, path| {
-            let builder = session.write_dataset(path);
-            T::write_into(builder, data);
+            session.stage_dataset_write(path, builder);
             Ok(())
         })
     }
@@ -2450,9 +2555,17 @@ impl Dataset {
     /// # Ok(())
     /// # }
     /// ```
+    /// The closure configures a standalone builder, not the file, so it may read
+    /// the same [`File`]; nothing it stages resolves until [`File::commit`].
     pub fn write_staged(&mut self, build: impl FnOnce(&mut DatasetBuilder)) -> Result<(), Error> {
+        // Report a read-only, sealed, or unaddressable dataset before running the
+        // closure, then run it with no lock held; `stage_dataset_write` names the
+        // builder from the dataset's path (issue #200).
+        self.check_staged_edit()?;
+        let mut builder = DatasetBuilder::new("");
+        build(&mut builder);
         self.with_session_mut(true, |session, path| {
-            build(session.write_dataset(path));
+            session.stage_dataset_write(path, builder);
             Ok(())
         })
     }
@@ -2474,9 +2587,14 @@ impl Dataset {
     ///
     /// The file must have been opened with [`File::open_rw`], else
     /// [`Error::ReadOnly`](crate::Error::ReadOnly).
+    /// The closure configures a standalone builder, not the file, so it may read
+    /// the same [`File`]; nothing it stages resolves until [`File::commit`].
     pub fn append_staged(&mut self, build: impl FnOnce(&mut AppendBuilder)) -> Result<(), Error> {
+        self.check_staged_edit()?;
+        let mut builder = AppendBuilder::new();
+        build(&mut builder);
         self.with_session_mut(true, |session, path| {
-            build(session.append_dataset(path));
+            session.stage_dataset_append(path, builder);
             Ok(())
         })
     }
@@ -2500,6 +2618,23 @@ impl Dataset {
             session.remove_dataset_attr(path, name);
             Ok(())
         })
+    }
+
+    /// Gate a staged edit on this dataset *without* taking the session lock:
+    /// the file must accept staged edits, and this handle must have a resolvable
+    /// path.
+    ///
+    /// The path check belongs here rather than only in
+    /// [`with_session_mut`](Self::with_session_mut) so that every reason to
+    /// refuse is reported *before* a user closure runs, not after. A handle
+    /// reached by object reference ([`dereference`](Self::dereference)) has no
+    /// path, and would otherwise have its closure run and its result discarded.
+    fn check_staged_edit(&self) -> Result<(), Error> {
+        self.file.check_staged_writable()?;
+        if self.path.is_none() {
+            return Err(Error::ReadOnly);
+        }
+        Ok(())
     }
 
     /// Run `f` with the writable session and this dataset's path, then refresh
@@ -3070,6 +3205,87 @@ impl Dataset {
             )
         })?;
         Ok((objects, element_size))
+    }
+
+    /// Read a dataset whose datatype *contains* variable-length references
+    /// without being variable-length itself — a compound with a VL member, or an
+    /// array of them (issue #201).
+    ///
+    /// Returns everything a rewrite needs: the element bytes, where each embedded
+    /// reference sits within them, and the heap payload each one names. That lets
+    /// the writer re-stage the payloads into a new file's global heap and rewrite
+    /// the references in place, which is what keeps a rewrite from carrying the
+    /// source file's heap addresses into the destination.
+    ///
+    /// The references are resolved one slot at a time, so `options`' limits apply
+    /// per slot rather than across the whole dataset.
+    pub(crate) fn read_embedded_vlen_bytes(
+        &self,
+        slots: &[vl_data::EmbeddedVlSlot],
+        options: VlenStringReadOptions,
+    ) -> Result<vl_data::EmbeddedVlData, Error> {
+        let stride = self.datatype()?.type_size() as usize;
+        let dataspace = self.dataspace()?;
+        let n = dataspace.num_elements();
+        if let Some(limit) = options.max_elements()
+            && n > limit as u64
+        {
+            return Err(
+                FormatError::VariableLengthElementLimitExceeded { limit, actual: n }.into(),
+            );
+        }
+
+        // A zero-element dataset owns no element bytes, and the C library leaves
+        // such a dataset's storage unallocated — reading it would fail for a
+        // missing chunk address rather than yield an empty buffer.
+        let raw = if n == 0 { Vec::new() } else { self.read_raw()? };
+        let n_usize = n.to_usize()?;
+        let needed = n_usize
+            .checked_mul(stride)
+            .ok_or(FormatError::OffsetOverflow {
+                offset: n,
+                length: stride as u64,
+            })?;
+        if raw.len() < needed {
+            return Err(FormatError::UnexpectedEof {
+                expected: needed,
+                available: raw.len(),
+            }
+            .into());
+        }
+
+        let mut offsets = Vec::with_capacity(n_usize * slots.len());
+        let mut objects = Vec::with_capacity(n_usize * slots.len());
+        for slot in slots {
+            // Gather this slot's reference from every element into a dense buffer,
+            // which is the shape the shared VL reader consumes. Each slot has its
+            // own base-type width, so they are resolved a slot at a time rather
+            // than in one pass.
+            let mut dense = Vec::with_capacity(n_usize * VL_REF_SIZE);
+            for e in 0..n_usize {
+                let at = e * stride + slot.byte_offset;
+                dense.extend_from_slice(&raw[at..at + VL_REF_SIZE]);
+                offsets.push(at);
+            }
+            let resolved = self.file.with_source(|source| {
+                vl_data::read_vl_byte_objects_from_source(
+                    source,
+                    &dense,
+                    n,
+                    self.file.offset_size(),
+                    self.file.length_size(),
+                    self.file.addr_offset,
+                    slot.element_size,
+                    options,
+                )
+            })?;
+            objects.extend(resolved);
+        }
+        Ok(vl_data::EmbeddedVlData {
+            raw,
+            offsets,
+            objects,
+        })
     }
 
     /// Read all attributes of this dataset.

@@ -97,7 +97,7 @@ root.create_dataset("run2/signal", |b| {
 
 `set_attr` needs a group that already resolves, so a group staged in this same batch is not reachable through it — stage those attributes with `create_group_with` instead. A staged object is not resolvable by name until `commit`, so `File::group`/`File::dataset` will not find it before then.
 
-The `create_group_with`/`create_dataset`/`write_staged` closures run while the file's writable session is locked, so a closure must not call back into the same `File`.
+The `create_group_with`/`create_dataset`/`write_staged`/`append_staged` closures configure a builder rather than the file itself, so a closure may read the same `File` — staging a dataset whose contents depend on one already there works. What it reads is the file as it was before the call, since nothing staged resolves until `commit`.
 
 `set_attr` takes an `AttrValue`, fixed-size or variable-length (`AttrValue::VarLenAsciiArray`). `File::root()` names the root group. Attributes are stored compactly in the rebuilt group header; an edit that would exceed the compact-attribute limit, or a group using dense (fractal-heap) attribute storage, is refused before any file bytes change.
 

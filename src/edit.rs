@@ -194,10 +194,10 @@ use crate::object_header::ObjectHeader;
 use crate::signature;
 use crate::superblock::Superblock;
 use crate::type_builders::{
-    AttrValue, DatasetBuilder, ObjectRefTarget, VlStringStaging, build_attr_message,
-    build_global_heap_collections, make_f32_type, make_f64_type, make_i8_type, make_i16_type,
-    make_i32_type, make_i64_type, make_u8_type, make_u16_type, make_u32_type, make_u64_type,
-    patch_vl_refs, patch_vl_refs_masked,
+    AttrValue, DatasetBuilder, ObjectRefPatch, ObjectRefTarget, VlStringStaging,
+    build_attr_message, build_global_heap_collections, make_f32_type, make_f64_type, make_i8_type,
+    make_i16_type, make_i32_type, make_i64_type, make_u8_type, make_u16_type, make_u32_type,
+    make_u64_type, patch_vl_refs, patch_vl_refs_masked, write_reference_address,
 };
 
 /// An undefined on-disk address (all bits set), HDF5's "no address" sentinel.
@@ -792,12 +792,19 @@ impl WriteEngine {
         FileSpaceInfo::parse(&msg.data, os, ls).ok()
     }
 
-    /// Stage a new dataset, added on the next [`commit`](Self::commit). The
-    /// argument is the full path of the dataset; everything before the last
-    /// component names the parent group, which must exist (or be created in this
-    /// session). Returns the [`DatasetBuilder`] — the same builder used by
-    /// [`FileBuilder`](crate::FileBuilder) — to configure data, shape, and
-    /// attributes.
+    /// Stage a new dataset, added on the next [`commit`](Self::commit).
+    ///
+    /// `path` is the dataset's full path; everything before the last component
+    /// names the parent group, which must exist (or be created in this session).
+    /// `builder` is the same [`DatasetBuilder`] [`FileBuilder`](crate::FileBuilder)
+    /// uses, configured by the caller; its name is taken from `path`, so the two
+    /// cannot disagree.
+    ///
+    /// The builder is passed in finished rather than handed out as a `&mut` into
+    /// this engine. That is deliberate: a borrow into the engine forces the
+    /// caller to hold it — and, above this layer, its lock — for as long as the
+    /// builder is being configured, which is what let a user closure deadlock
+    /// against the same file it was reading (issue #200).
     ///
     /// The dataset may be contiguous or chunked, and chunked datasets may be
     /// filtered (`with_deflate`, `with_shuffle`, `with_fletcher32`,
@@ -808,19 +815,19 @@ impl WriteEngine {
     /// variable-length-string payload (`with_vlen_strings`), or path-resolved
     /// object-reference elements (`with_path_references`; chunking any of
     /// these is not supported, and dense attributes remain unsupported).
-    pub fn create_dataset(&mut self, path: &str) -> &mut DatasetBuilder {
+    pub(crate) fn stage_created_dataset(&mut self, path: &str, mut builder: DatasetBuilder) {
         let mut comps = split_path(path);
-        let leaf = comps.pop().unwrap_or_default();
-        self.pending_datasets
-            .push((comps, DatasetBuilder::new(&leaf)));
-        &mut self.pending_datasets.last_mut().unwrap().1
+        builder.name = comps.pop().unwrap_or_default();
+        self.pending_datasets.push((comps, builder));
     }
 
     /// Stage an in-place overwrite of an **existing** dataset's values (the HDF5
     /// `H5Dwrite` whole-dataset write), applied on the next
-    /// [`commit`](Self::commit). `path` is the full path of a dataset that must
-    /// already exist; the returned [`DatasetBuilder`] — the same builder used by
-    /// [`create_dataset`](Self::create_dataset) — supplies the replacement data.
+    /// [`commit`](Self::commit).
+    ///
+    /// `path` is the full path of a dataset that must already exist; `builder`
+    /// supplies the replacement data and is named from `path`, as in
+    /// [`stage_created_dataset`](Self::stage_created_dataset).
     ///
     /// This is a *value* overwrite, not a reshape or retype: the new data's
     /// datatype and shape must match the on-disk dataset's exactly (byte-for-byte
@@ -848,25 +855,24 @@ impl WriteEngine {
     /// patched — exactly like an addition relocates the path up to the root. A
     /// relocating overwrite moves the object header, so it is refused unless the
     /// dataset has a single hard link.
-    pub fn write_dataset(&mut self, path: &str) -> &mut DatasetBuilder {
+    pub(crate) fn stage_dataset_write(&mut self, path: &str, mut builder: DatasetBuilder) {
         let comps = split_path(path);
-        let leaf = comps.last().cloned().unwrap_or_default();
-        self.pending_writes
-            .push((comps, DatasetBuilder::new(&leaf)));
-        &mut self.pending_writes.last_mut().unwrap().1
+        builder.name = comps.last().cloned().unwrap_or_default();
+        self.pending_writes.push((comps, builder));
     }
 
     /// Stage an append of new elements to an **existing** chunked, unlimited
-    /// dataset, applied on the next [`commit`](Self::commit). `path` names a
-    /// dataset that must already exist; the returned [`AppendBuilder`] supplies
-    /// the elements to add via its typed / generic / raw `append_*` methods.
+    /// dataset, applied on the next [`commit`](Self::commit).
     ///
-    /// Unlike [`write_dataset`](Self::write_dataset) (a value overwrite that
-    /// forbids any shape change) this **grows** the dataset along its first
-    /// (axis-0) dimension. It works on **filtered** datasets: the appended chunks
-    /// are compressed through the dataset's own on-disk filter pipeline
-    /// (deflate / shuffle / fletcher32 / scale-offset, and ZFP with the `zfp`
-    /// feature), and the pipeline, datatype, fill value, and attributes are
+    /// `path` names a dataset that must already exist; `builder` supplies the
+    /// elements to add via its typed / generic / raw `append_*` methods.
+    ///
+    /// Unlike [`stage_dataset_write`](Self::stage_dataset_write) (a value
+    /// overwrite that forbids any shape change) this **grows** the dataset along
+    /// its first (axis-0) dimension. It works on **filtered** datasets: the
+    /// appended chunks are compressed through the dataset's own on-disk filter
+    /// pipeline (deflate / shuffle / fletcher32 / scale-offset, and ZFP with the
+    /// `zfp` feature), and the pipeline, datatype, fill value, and attributes are
     /// preserved verbatim. Appends of any length are supported — when the
     /// dataset's current length is not a whole multiple of the chunk length, the
     /// single trailing partial chunk is read, extended, and re-encoded; every
@@ -890,10 +896,8 @@ impl WriteEngine {
     /// [`Error::AppendUnsupported`]. Use [`Dataset::is_chunked`](crate::Dataset::is_chunked),
     /// [`maxshape`](crate::Dataset::maxshape), and [`filters`](crate::Dataset::filters)
     /// to check eligibility up front.
-    pub fn append_dataset(&mut self, path: &str) -> &mut AppendBuilder {
-        self.pending_appends
-            .push((split_path(path), AppendBuilder::new()));
-        &mut self.pending_appends.last_mut().unwrap().1
+    pub(crate) fn stage_dataset_append(&mut self, path: &str, builder: AppendBuilder) {
+        self.pending_appends.push((split_path(path), builder));
     }
 
     /// Immediately append rows to an **existing** chunked, unlimited,
@@ -2157,11 +2161,10 @@ impl WriteEngine {
                 // that every earlier-placed object in this commit is in
                 // `path_addr` (chunked datasets never carry these —
                 // `flatten_dataset` refuses that combination).
-                if let Some(targets) = fd.reference_targets.take() {
-                    let mut patched = Vec::with_capacity(targets.len() * 8);
-                    for target in &targets {
+                if let Some(patches) = fd.reference_targets.take() {
+                    for patch in &patches {
                         let addr = Self::resolve_reference_target(
-                            target,
+                            &patch.target,
                             &path_addr,
                             &nodes,
                             &add_targets,
@@ -2170,9 +2173,8 @@ impl WriteEngine {
                             &self.data,
                             &self.superblock,
                         )?;
-                        patched.extend_from_slice(&addr.to_le_bytes());
+                        write_reference_address(&mut fd.raw, patch.byte_offset, addr);
                     }
-                    fd.raw = patched;
                 }
                 let oh = if fd.chunk_options.is_chunked() || fd.maxshape.is_some() {
                     self.build_chunked_dataset(&fd)?
@@ -2184,7 +2186,7 @@ impl WriteEngine {
                     if let Some(staging) = fd.vl_string_staging.take() {
                         if !staging.collections.is_empty() {
                             let addrs = self.place_vl_collections(&staging.collections)?;
-                            patch_vl_refs_masked(&mut fd.raw, &staging.patch_mask, &addrs);
+                            patch_vl_refs_masked(&mut fd.raw, &staging.patch_offsets, &addrs);
                         }
                     }
                     // A zero-element dataset has no data block to allocate; its
@@ -4353,10 +4355,10 @@ impl WriteEngine {
                 let mut ordered: Vec<&FlatDataset> = datasets.iter().collect();
                 ordered.sort_by_key(|fd| fd.reference_targets.is_some());
                 for fd in ordered {
-                    if let Some(targets) = &fd.reference_targets {
-                        for target in targets {
+                    if let Some(patches) = &fd.reference_targets {
+                        for patch in patches {
                             Self::resolve_reference_target(
-                                target,
+                                &patch.target,
                                 &sim_addr,
                                 nodes,
                                 add_targets,
@@ -5077,7 +5079,7 @@ struct FlatDataset {
     /// Resolved (see [`WriteEngine::resolve_reference_target`]) and patched
     /// into `raw` in the apply loop, once every object this commit places has
     /// a known address. `None` for an ordinary dataset.
-    reference_targets: Option<Vec<ObjectRefTarget>>,
+    reference_targets: Option<Vec<ObjectRefPatch>>,
     /// A user-defined fill value, encoded in the dataset's datatype, or `None`
     /// for the library default. Validated against the datatype element size in
     /// [`flatten_dataset`].
@@ -6703,6 +6705,231 @@ mod tests {
         }
     }
 
+    /// Build a one-element-per-chunk unlimited `d` holding `0..n`, the shape the
+    /// crash-consistency harnesses below grow.
+    fn build_unit_chunked(path: &std::path::Path, n: i32) {
+        use crate::writer::FileBuilder;
+        let data: Vec<i32> = (0..n).collect();
+        let mut b = FileBuilder::new();
+        b.create_dataset("d")
+            .with_i32_data(&data)
+            .with_shape(&[n as u64])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[1]);
+        b.write(path).unwrap();
+    }
+
+    /// Stop an append after `max_phase` durability phases and hand back the
+    /// resulting file. Dropping the engine inside is the simulated crash: no
+    /// further phases run and no close barrier is written.
+    fn append_stopped_at(
+        base: &std::path::Path,
+        out: &std::path::Path,
+        values: std::ops::Range<i32>,
+        max_phase: u8,
+    ) {
+        std::fs::copy(base, out).unwrap();
+        let mut s = WriteEngine::open(out).unwrap();
+        s.append_inplace_i32_phased("d", &values.collect::<Vec<_>>(), max_phase)
+            .unwrap();
+    }
+
+    /// Growing an Extensible-Array index across its inline -> direct-block ->
+    /// super-block boundaries touches far more index structure than the
+    /// partial-tail case above. Stopping at any phase boundary must still read
+    /// back as a consistent prefix.
+    ///
+    /// Restores coverage lost with the deprecated `SwmrWriter` (issue #202); the
+    /// owned path drives the same `apply_ea_append` engine.
+    #[test]
+    fn append_inplace_crash_consistency_across_ea_boundaries() {
+        use crate::reader::File as PureFile;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("base.h5");
+        let (n, target) = (50i32, 250i32);
+        build_unit_chunked(&base, n);
+
+        for max_phase in 1u8..=4 {
+            let p = dir.path().join(format!("crash_ea_{max_phase}.h5"));
+            append_stopped_at(&base, &p, n..target, max_phase);
+            let expected_len = if max_phase == 4 { target } else { n };
+            let f = PureFile::from_bytes(std::fs::read(&p).unwrap()).unwrap();
+            assert_eq!(
+                f.dataset("d").unwrap().read_i32().unwrap(),
+                (0..expected_len).collect::<Vec<_>>(),
+                "inconsistent view after crash at phase {max_phase}"
+            );
+        }
+    }
+
+    /// The same guarantee for an append that crosses the paged-data-block
+    /// boundary (~131,060 chunks), where phase 1 allocates a paged super block,
+    /// paged data blocks, the per-page checksums, and the page-init bitmap. This
+    /// is the most intricate in-place growth the engine performs, and truncating
+    /// it partway is exactly what a power loss does.
+    ///
+    /// Restores coverage lost with the deprecated `SwmrWriter` (issue #202).
+    #[test]
+    fn append_inplace_crash_consistency_paged_prefix() {
+        use crate::reader::File as PureFile;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("base.h5");
+        let (start, target) = (131_000i32, 132_000i32);
+        build_unit_chunked(&base, start);
+
+        for max_phase in 1u8..=4 {
+            let p = dir.path().join(format!("crash_paged_{max_phase}.h5"));
+            append_stopped_at(&base, &p, start..target, max_phase);
+            let expected_len = if max_phase == 4 { target } else { start };
+            let f = PureFile::from_bytes(std::fs::read(&p).unwrap()).unwrap();
+            assert_eq!(
+                f.dataset("d").unwrap().read_i32().unwrap(),
+                (0..expected_len).collect::<Vec<_>>(),
+                "inconsistent paged view after crash at phase {max_phase}"
+            );
+        }
+    }
+
+    /// The consistent-prefix guarantee must hold for the *reference C library*,
+    /// not only this crate's reader — and this crate's reader is the more lenient
+    /// of the two, so it cannot stand in for it.
+    ///
+    /// The pure reader bounds chunk reads by `min(EA count, dimension)`, which
+    /// makes it tolerate a phase-3 state where the element count has advanced
+    /// past the dimension. The C library instead walks strictly by the dataspace
+    /// dimension and re-validates block checksums, so a stale end-of-file, a
+    /// half-grown index, or a mis-checksummed block could satisfy the reader here
+    /// and still break C or h5py. That gap is the whole point of the test:
+    /// crash-safety for the append path is an interop guarantee.
+    ///
+    /// Both starting layouts are covered — a partial trailing chunk and the
+    /// EA-boundary growth above — since they exercise different index writes.
+    ///
+    /// Restores coverage lost with the deprecated `SwmrWriter` and `AppendWriter`
+    /// (issue #202).
+    #[test]
+    // Reads back with the reference HDF5 C library (`hdf5-metno`), a
+    // 64-bit-only dev-dependency; skip on 32-bit so the lib tests run there.
+    #[cfg(not(target_pointer_width = "32"))]
+    fn append_inplace_crash_consistency_c_library_reads_prefix() {
+        use tempfile::tempdir;
+
+        // (initial length, chunk length, appended length): a partial trailing
+        // chunk, a chunk-aligned start, and the EA-boundary crossing.
+        for (n, chunk, add) in [(6i32, 4u64, 5i32), (8, 2, 6), (50, 1, 200)] {
+            let dir = tempdir().unwrap();
+            let base = dir.path().join("base.h5");
+            {
+                use crate::writer::FileBuilder;
+                let mut b = FileBuilder::new();
+                b.create_dataset("d")
+                    .with_i32_data(&(0..n).collect::<Vec<i32>>())
+                    .with_shape(&[n as u64])
+                    .with_maxshape(&[u64::MAX])
+                    .with_chunks(&[chunk]);
+                b.write(&base).unwrap();
+            }
+
+            for max_phase in 1u8..=4 {
+                let p = dir
+                    .path()
+                    .join(format!("crash_c_{n}_{chunk}_{max_phase}.h5"));
+                append_stopped_at(&base, &p, n..n + add, max_phase);
+                let expected_len = if max_phase == 4 { n + add } else { n };
+                let f = hdf5::File::open(&p).unwrap();
+                assert_eq!(
+                    f.dataset("d").unwrap().read_raw::<i32>().unwrap(),
+                    (0..expected_len).collect::<Vec<_>>(),
+                    "C library saw an inconsistent view after crash at phase {max_phase} \
+                     (n={n}, chunk={chunk})"
+                );
+                f.close().unwrap();
+            }
+        }
+    }
+
+    /// Crash recovery across the phase-3/phase-4 gap.
+    ///
+    /// A writer that crashes after publishing the Extensible-Array element count
+    /// (phase 3) but before publishing the dataspace dimension (phase 4) leaves
+    /// the on-disk count ahead of the committed dimension. A fresh writer must
+    /// roll forward from the *committed dimension*, overwriting the uncommitted
+    /// slots, rather than appending past them and leaving a gap.
+    ///
+    /// The crashed and recovering appends deliberately write different values at
+    /// the overlapping positions, so a regression that seeds the chunk count from
+    /// the stale EA header surfaces the crashed writer's values rather than
+    /// merely producing plausible-looking data.
+    ///
+    /// Restores coverage lost with the deprecated `SwmrWriter` (issue #202); the
+    /// surviving `recover_and_reappend_after_clean_phase4` covers only the clean
+    /// case.
+    #[test]
+    // Reads back with the reference HDF5 C library (`hdf5-metno`), a
+    // 64-bit-only dev-dependency; skip on 32-bit so the lib tests run there.
+    #[cfg(not(target_pointer_width = "32"))]
+    fn append_inplace_recover_and_reappend_after_phase3_crash() {
+        use crate::reader::File as PureFile;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("phase3_recover.h5");
+        let n = 50i32;
+        build_unit_chunked(&path, n);
+
+        // Writer 1 crashes after phase 3: the element count advances but the
+        // dimension stays at `n`. Its values are far from the correct
+        // continuation, so a leak is unmistakable.
+        {
+            let mut s = WriteEngine::open(&path).unwrap();
+            s.append_inplace_i32_phased("d", &(1000..1200).collect::<Vec<_>>(), 3)
+                .unwrap();
+        }
+        let committed: Vec<i32> = (0..n).collect();
+        let pf = PureFile::from_bytes(std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            pf.dataset("d").unwrap().read_i32().unwrap(),
+            committed,
+            "phase-3 crash exposed uncommitted data to the pure reader"
+        );
+        {
+            let f = hdf5::File::open(&path).unwrap();
+            assert_eq!(
+                f.dataset("d").unwrap().read_raw::<i32>().unwrap(),
+                committed,
+                "phase-3 crash exposed uncommitted data to the C library"
+            );
+            f.close().unwrap();
+        }
+
+        // Writer 2 recovers: roll forward from the committed dimension,
+        // overwriting the uncommitted slots with the real continuation.
+        {
+            let mut s = WriteEngine::open(&path).unwrap();
+            s.append_inplace_i32_phased("d", &(n..150).collect::<Vec<_>>(), 4)
+                .unwrap();
+        }
+
+        let expected: Vec<i32> = (0..150).collect();
+        let pf = PureFile::from_bytes(std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            pf.dataset("d").unwrap().read_i32().unwrap(),
+            expected,
+            "recovery did not roll forward correctly (pure reader)"
+        );
+        let f = hdf5::File::open(&path).unwrap();
+        assert_eq!(
+            f.dataset("d").unwrap().read_raw::<i32>().unwrap(),
+            expected,
+            "recovery did not roll forward correctly (C library)"
+        );
+        f.close().unwrap();
+    }
+
     #[test]
     fn raw_appendable_recurses_into_aggregates() {
         use crate::datatype::{CompoundMember, DatatypeByteOrder};
@@ -6926,7 +7153,9 @@ mod tests {
         // A clean edit-and-commit cycle heals it.
         {
             let mut s = WriteEngine::open(&path).unwrap();
-            s.create_dataset("e").with_i32_data(&[4, 5]);
+            let mut b = DatasetBuilder::new("e");
+            b.with_i32_data(&[4, 5]);
+            s.stage_created_dataset("e", b);
             s.commit().unwrap();
         }
 
@@ -6946,7 +7175,7 @@ mod tests {
         // without ever writing its global heap collection or patching its
         // placeholder references, so the dataset failed to read back. A null
         // element (no heap object at all, distinct from an empty string) must
-        // stay untouched by the patch — only `patch_mask`-flagged elements'
+        // stay untouched by the patch — only heap-backed elements'
         // placeholder addresses are resolved; exercising both keeps the mask
         // itself, not just the common all-`Bytes` case, under test.
         use crate::type_builders::VlStringElement;
@@ -6969,9 +7198,9 @@ mod tests {
 
         {
             let mut s = WriteEngine::open(&path).unwrap();
-            s.create_dataset("labels")
-                .with_vlen_string_elements(datatype, &elements)
-                .unwrap();
+            let mut b = DatasetBuilder::new("labels");
+            b.with_vlen_string_elements(datatype, &elements).unwrap();
+            s.stage_created_dataset("labels", b);
             s.commit().unwrap();
         }
 

@@ -35,7 +35,7 @@ use crate::object_header_writer::ObjectHeaderWriter;
 use crate::superblock::Superblock;
 use crate::type_builders::{
     DatasetBuilder, FinishedGroup, GroupBuilder, VlStringStaging, build_attr_message,
-    build_global_heap_collections, patch_vl_refs, patch_vl_refs_masked,
+    build_global_heap_collections, patch_vl_refs, patch_vl_refs_masked, write_reference_address,
 };
 
 // `AttrValue` lives in `type_builders`; `types` and `mat` reference it through
@@ -866,7 +866,7 @@ impl FileWriter {
             /// Repack's verbatim chunk payload, when this dataset's chunks are
             /// copied compressed-as-is rather than encoded from `raw`.
             raw_chunks: Option<crate::type_builders::RawChunkPayload>,
-            reference_targets: Option<Vec<crate::type_builders::ObjectRefTarget>>,
+            reference_targets: Option<Vec<crate::type_builders::ObjectRefPatch>>,
             /// Staged global heap collections + patch mask for a VL-string
             /// dataset, whose element references in `raw` need their heap
             /// addresses patched once the post-data cursor is known.
@@ -1311,7 +1311,7 @@ impl FileWriter {
                     continue;
                 };
                 let addrs = place_collections(&staging.collections, &mut cursor);
-                patch_vl_refs_masked(&mut all_ds[i].raw, &staging.patch_mask, &addrs);
+                patch_vl_refs_masked(&mut all_ds[i].raw, &staging.patch_offsets, &addrs);
                 all_ds[i].vl_string_staging = Some(staging);
                 early_gcol.push(i);
             }
@@ -1548,18 +1548,17 @@ impl FileWriter {
             // destination address (an unknown path falls back to the undefined
             // address); a raw target is written verbatim (null / undefined).
             for d in all_ds.iter_mut() {
-                if let Some(ref targets) = d.reference_targets {
-                    let mut patched = Vec::with_capacity(targets.len() * 8);
-                    for target in targets {
-                        let addr = match target {
-                            crate::type_builders::ObjectRefTarget::Path(path) => {
-                                path_map.get(path).copied().unwrap_or(u64::MAX)
-                            }
-                            crate::type_builders::ObjectRefTarget::Raw(addr) => *addr,
-                        };
-                        patched.extend_from_slice(&addr.to_le_bytes());
-                    }
-                    d.raw = patched;
+                let Some(ref patches) = d.reference_targets else {
+                    continue;
+                };
+                for patch in patches {
+                    let addr = match &patch.target {
+                        crate::type_builders::ObjectRefTarget::Path(path) => {
+                            path_map.get(path).copied().unwrap_or(u64::MAX)
+                        }
+                        crate::type_builders::ObjectRefTarget::Raw(addr) => *addr,
+                    };
+                    write_reference_address(&mut d.raw, patch.byte_offset, addr);
                 }
             }
         }
@@ -1832,7 +1831,7 @@ impl FileWriter {
                         "a staged VL-string dataset is non-chunked, so its data is in memory"
                     )
                 };
-                patch_vl_refs_masked(bytes, &staging.patch_mask, gaddrs);
+                patch_vl_refs_masked(bytes, &staging.patch_offsets, gaddrs);
             }
 
             let ds_layouts: Vec<DsLayout> = layouts
@@ -2136,7 +2135,7 @@ impl FileWriter {
                         );
                     };
                     let addrs = place_collections(&staging.collections, &mut gcol_cursor);
-                    patch_vl_refs_masked(bytes, &staging.patch_mask, &addrs);
+                    patch_vl_refs_masked(bytes, &staging.patch_offsets, &addrs);
                 }
             }
             #[expect(

@@ -736,25 +736,30 @@ pub(crate) enum VlStringElement {
 /// length(4) + collection address(8) + object index(4).
 pub(crate) const VL_REF_SIZE: usize = 16;
 
-/// Staged VL-string dataset/attribute element data: the per-element 16-byte
-/// references (with placeholder heap addresses) plus the global heap
+/// Staged variable-length dataset/attribute element data: the element bytes
+/// (carrying VL references with placeholder heap addresses) plus the global heap
 /// collections holding the non-null elements' bytes.
 ///
 /// The non-null elements' bytes become heap objects in order, packed
 /// [`MAX_HEAP_OBJECTS`] to a collection, and each reference carries its
 /// object's 1-based index within its own collection — matching
-/// [`build_global_heap_collections_from_bytes`]. Null elements carry an
-/// undefined address and object index 0, and are never patched so they read
-/// back as null.
+/// [`build_global_heap_collections_from_bytes`]. Null elements carry a zero
+/// address and object index 0, and are never patched so they read back as null.
 pub(crate) struct VlStringStaging {
-    /// The dataset/attribute element bytes: one 16-byte reference per element.
+    /// The dataset/attribute element bytes. For a dataset whose datatype *is*
+    /// variable-length this is one 16-byte reference per element; for one that
+    /// merely *contains* variable-length members (a compound, or an array of
+    /// them) it is the full element bytes with the embedded references stamped
+    /// in place.
     pub refs: Vec<u8>,
     /// The serialized global heap collections holding the non-null objects, in
     /// the order their objects appear. Empty when there are no such objects.
     pub collections: Vec<Vec<u8>>,
-    /// `true` for each element that references a heap object and must have its
-    /// address patched; `false` for a null element that must stay undefined.
-    pub patch_mask: Vec<bool>,
+    /// Byte offset within [`refs`](Self::refs) of each reference that names a
+    /// heap object and so needs its address patched once the collections are
+    /// placed, in the same order as those objects. Null references are absent:
+    /// their address must stay zero so they read back as null.
+    pub patch_offsets: Vec<usize>,
 }
 
 /// Stage the references and global-heap collections for a variable-length
@@ -774,7 +779,7 @@ pub(crate) fn stage_vl_elements(
     // object indices, 1-based within each collection.
     let mut objects: Vec<&[u8]> = Vec::new();
     let mut refs = Vec::with_capacity(elements.len() * VL_REF_SIZE);
-    let mut patch_mask = Vec::with_capacity(elements.len());
+    let mut patch_offsets = Vec::with_capacity(elements.len());
     for element in elements {
         match element {
             VlStringElement::Null => {
@@ -785,9 +790,9 @@ pub(crate) fn stage_vl_elements(
                 refs.extend_from_slice(&0u32.to_le_bytes()); // length 0
                 refs.extend_from_slice(&0u64.to_le_bytes()); // null heap address
                 refs.extend_from_slice(&0u32.to_le_bytes()); // object index 0
-                patch_mask.push(false);
             }
             VlStringElement::Bytes(bytes) => {
+                patch_offsets.push(refs.len());
                 #[expect(
                     clippy::cast_possible_truncation,
                     reason = "VL element length (element count) is written into the 4-byte \
@@ -804,7 +809,6 @@ pub(crate) fn stage_vl_elements(
                 )]
                 refs.extend_from_slice(&(index as u32).to_le_bytes());
                 objects.push(bytes);
-                patch_mask.push(true);
             }
         }
     }
@@ -814,30 +818,78 @@ pub(crate) fn stage_vl_elements(
     VlStringStaging {
         refs,
         collections: build_global_heap_collections_from_bytes(&objects),
-        patch_mask,
+        patch_offsets,
     }
 }
 
-/// Patch the heap address of each VL reference flagged in `patch_mask`, leaving
-/// null references (mask `false`) with their undefined address. Mirrors
-/// [`patch_vl_refs`] but skips null elements so they read back as null, so the
-/// collection a reference resolves to is selected by its *object* position
-/// rather than its element position. `collection_addresses` holds the placed
-/// addresses of [`VlStringStaging::collections`], in order.
+/// Stage the global-heap collections for a dataset whose datatype merely
+/// *contains* variable-length members — a compound with a VL member, or an array
+/// of such compounds — rather than being variable-length itself.
+///
+/// `raw` is the dataset's element bytes as read from the source, and `offsets`
+/// gives the byte offset of every embedded VL reference within `raw`, in the same
+/// order as `elements`. Each reference is rewritten in place: a null element is
+/// zeroed outright, and a heap-backed one keeps the source's `length` field
+/// (which counts base-type elements, whose width varies per member) while
+/// gaining the destination's object index. The addresses stay at zero until
+/// [`patch_vl_refs_masked`] fills them in, exactly as for a top-level VL dataset.
+pub(crate) fn stage_embedded_vl_elements(
+    mut raw: Vec<u8>,
+    offsets: &[usize],
+    elements: &[VlStringElement],
+) -> VlStringStaging {
+    debug_assert_eq!(
+        offsets.len(),
+        elements.len(),
+        "one staged payload per embedded variable-length reference"
+    );
+    let mut objects: Vec<&[u8]> = Vec::new();
+    let mut patch_offsets = Vec::with_capacity(elements.len());
+    for (&offset, element) in offsets.iter().zip(elements) {
+        let slot = &mut raw[offset..offset + VL_REF_SIZE];
+        match element {
+            VlStringElement::Null => slot.fill(0),
+            VlStringElement::Bytes(bytes) => {
+                patch_offsets.push(offset);
+                // Leave the source's element-count `length` in bytes 0..4 alone,
+                // and blank the address so an unpatched reference is visibly null
+                // rather than a stale source address.
+                slot[4..12].fill(0);
+                let index = objects.len() % MAX_HEAP_OBJECTS + 1;
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "1-based heap object index is written into the 4-byte object-index \
+                              field of the variable-length reference"
+                )]
+                slot[12..16].copy_from_slice(&(index as u32).to_le_bytes());
+                objects.push(bytes);
+            }
+        }
+    }
+    VlStringStaging {
+        collections: build_global_heap_collections_from_bytes(&objects),
+        refs: raw,
+        patch_offsets,
+    }
+}
+
+/// Patch the heap address of each VL reference named by `patch_offsets`, leaving
+/// null references (which are absent from that list) with their zero address so
+/// they read back as null. Mirrors [`patch_vl_refs`], but because only
+/// heap-backed references are listed, the collection a reference resolves to is
+/// selected by its *object* position rather than its element position — and the
+/// references need not sit at a fixed stride, which is what lets a compound with
+/// variable-length members share this path. `collection_addresses` holds the
+/// placed addresses of [`VlStringStaging::collections`], in order.
 pub(crate) fn patch_vl_refs_masked(
     raw_data: &mut [u8],
-    patch_mask: &[bool],
+    patch_offsets: &[usize],
     collection_addresses: &[u64],
 ) {
-    let mut object_ordinal = 0usize;
-    for (i, &patch) in patch_mask.iter().enumerate() {
-        if !patch {
-            continue;
-        }
+    for (object_ordinal, &offset) in patch_offsets.iter().enumerate() {
         let address = collection_addresses[object_ordinal / MAX_HEAP_OBJECTS];
-        let addr_offset = i * VL_REF_SIZE + 4; // skip sequence_length
+        let addr_offset = offset + 4; // skip sequence_length
         raw_data[addr_offset..addr_offset + 8].copy_from_slice(&address.to_le_bytes());
-        object_ordinal += 1;
     }
 }
 
@@ -942,6 +994,44 @@ pub(crate) enum ObjectRefTarget {
     Raw(u64),
 }
 
+/// One object-reference address to resolve during serialization, and where in
+/// the dataset's element bytes it sits.
+///
+/// The offset is explicit rather than implied by a fixed stride so that a
+/// reference embedded in a larger element — a compound member, or an array entry
+/// — is rewritten in place alongside the fixed-size bytes around it. A dataset
+/// whose datatype *is* an object reference simply has one patch every 8 bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ObjectRefPatch {
+    /// Byte offset of the 8-byte address within the dataset's element bytes.
+    pub byte_offset: usize,
+    /// What to write there.
+    pub target: ObjectRefTarget,
+}
+
+/// Write a resolved object-reference address into a dataset's element bytes.
+///
+/// The offset comes from the datatype's own layout and `raw` is sized from the
+/// same datatype, so a slot that does not fit means the two disagree — a bug in
+/// whoever staged them, not input this can correct. The debug assertion catches
+/// that in the test suite; in release the write is skipped rather than allowed to
+/// corrupt a neighbouring field. Note what a skip leaves behind depends on the
+/// caller: placeholder zeros (a null reference) for a dataset staged by
+/// [`DatasetBuilder::with_object_references`], but the *source's* address for one
+/// staged by [`DatasetBuilder::with_embedded_object_references`], whose buffer is
+/// the source's element bytes. Neither is reachable without the assertion firing
+/// first.
+pub(crate) fn write_reference_address(raw: &mut [u8], byte_offset: usize, address: u64) {
+    debug_assert!(
+        byte_offset + 8 <= raw.len(),
+        "object-reference slot at {byte_offset} does not fit {} element bytes",
+        raw.len()
+    );
+    if let Some(slot) = raw.get_mut(byte_offset..byte_offset + 8) {
+        slot.copy_from_slice(&address.to_le_bytes());
+    }
+}
+
 /// Builder for datasets.
 pub struct DatasetBuilder {
     pub(crate) name: String,
@@ -959,7 +1049,7 @@ pub struct DatasetBuilder {
     /// When set, this dataset is an object-reference dataset whose element
     /// addresses are resolved (per-element by path, or written raw) during file
     /// serialization once every object's destination address is known.
-    pub(crate) reference_targets: Option<Vec<ObjectRefTarget>>,
+    pub(crate) reference_targets: Option<Vec<ObjectRefPatch>>,
     /// When set, this dataset stores variable-length strings: `data` holds the
     /// 16-byte references with placeholder heap addresses, and this staging
     /// carries the global heap collection plus the mask of references to patch
@@ -1159,7 +1249,40 @@ impl DatasetBuilder {
         if self.shape.is_none() {
             self.shape = Some(vec![targets.len() as u64]);
         }
-        self.reference_targets = Some(targets);
+        self.reference_targets = Some(
+            targets
+                .into_iter()
+                .enumerate()
+                .map(|(i, target)| ObjectRefPatch {
+                    byte_offset: i * 8,
+                    target,
+                })
+                .collect(),
+        );
+        self
+    }
+
+    /// Write a dataset whose datatype *contains* object references without being
+    /// one — a compound with a reference member, or an array of them.
+    ///
+    /// `raw` is the source's element bytes; each [`ObjectRefPatch`] names an
+    /// address within them to resolve during serialization. Every other byte is
+    /// carried through untouched, so the fixed-size members keep their exact
+    /// stored bytes. The shape defaults to `[num_elements]` unless
+    /// [`with_shape`](Self::with_shape) sets it.
+    pub(crate) fn with_embedded_object_references(
+        &mut self,
+        datatype: Datatype,
+        raw: Vec<u8>,
+        num_elements: u64,
+        patches: Vec<ObjectRefPatch>,
+    ) -> &mut Self {
+        self.datatype = Some(datatype);
+        self.data = Some(raw);
+        if self.shape.is_none() {
+            self.shape = Some(vec![num_elements]);
+        }
+        self.reference_targets = Some(patches);
         self
     }
 
@@ -1431,6 +1554,35 @@ impl DatasetBuilder {
         }
         self.stage_vlen_elements(datatype, elements, element_size);
         Ok(self)
+    }
+
+    /// Write a dataset whose datatype *contains* variable-length members without
+    /// being variable-length itself — a compound with a VL member, or an array of
+    /// such compounds.
+    ///
+    /// `raw` is the source's element bytes and `offsets` gives the byte offset of
+    /// every embedded VL reference within them, paired in order with `elements`
+    /// (each either a null reference or the exact heap bytes it named). The
+    /// references are re-stamped to point at this file's own global heap, so the
+    /// source's addresses never survive into the output. This is the faithful
+    /// re-emit path used by repack; the shape defaults to `[num_elements]` unless
+    /// [`with_shape`](Self::with_shape) sets it.
+    pub(crate) fn with_embedded_vlen_elements(
+        &mut self,
+        datatype: Datatype,
+        raw: Vec<u8>,
+        num_elements: u64,
+        offsets: &[usize],
+        elements: &[VlStringElement],
+    ) -> &mut Self {
+        let staging = stage_embedded_vl_elements(raw, offsets, elements);
+        self.datatype = Some(datatype);
+        self.data = Some(staging.refs.clone());
+        self.vl_string_staging = Some(staging);
+        if self.shape.is_none() {
+            self.shape = Some(vec![num_elements]);
+        }
+        self
     }
 
     /// Shared body of the VL write entry points (string and sequence): stage the
