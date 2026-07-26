@@ -400,12 +400,14 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     // reference C library's `H5HF__huge_insert` pre-increments, so 0 is never a
     // valid ID and the header's `next_huge_object_id` ends up holding the last
     // one assigned rather than the next one free.
+    // A count of attributes, so a `usize` — it is bounded by `attrs.len()` and
+    // widened only where it goes into one of the header's 8-byte fields.
     let mut huge_id_of: Vec<Option<u64>> = vec![None; attrs.len()];
-    let mut huge_count: u64 = 0;
+    let mut huge_count: usize = 0;
     for (slot, bytes) in huge_id_of.iter_mut().zip(&serialized) {
         if bytes.len() > DENSE_ATTR_MAX_MANAGED_OBJECT {
             huge_count += 1;
-            *slot = Some(huge_count);
+            *slot = Some(huge_count as u64);
         }
     }
     let huge_total: u64 = serialized
@@ -467,7 +469,7 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     // one size covers both the name index and the huge-objects index.
     let bthd_size = 4 + 1 + 1 + 4 + 2 + 2 + 1 + 1 + os + 2 + ls + 4;
     let name_node_size = dense_attr_leaf_node_size(attrs.len());
-    let huge_node_size = leaf_node_size(huge_count as usize, DENSE_ATTR_HUGE_BTREE_RECORD);
+    let huge_node_size = leaf_node_size(huge_count, DENSE_ATTR_HUGE_BTREE_RECORD);
 
     // Blob layout, all relative to `base_address` so the caller can size the blob
     // with a throwaway build at address 0 and get the same bytes back at the real
@@ -520,7 +522,7 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     )]
     let max_managed = DENSE_ATTR_MAX_MANAGED_OBJECT as u32;
     frhp.extend_from_slice(&max_managed.to_le_bytes());
-    write_length(&mut frhp, huge_count, LENGTH_SIZE); // next_huge_object_id
+    write_length(&mut frhp, huge_count as u64, LENGTH_SIZE); // next_huge_object_id
     if huge_count == 0 {
         write_undef_offset(&mut frhp, OFFSET_SIZE); // btree_huge_objects_address
     } else {
@@ -533,10 +535,10 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     write_length(&mut frhp, 0, LENGTH_SIZE); // dblock_alloc_iter
     // Managed and huge objects are counted separately; an attribute is in exactly
     // one of the two.
-    let managed_count = attrs.len() as u64 - huge_count;
+    let managed_count = (attrs.len() - huge_count) as u64;
     write_length(&mut frhp, managed_count, LENGTH_SIZE); // managed_objects_count
     write_length(&mut frhp, huge_total, LENGTH_SIZE); // huge_objects_size
-    write_length(&mut frhp, huge_count, LENGTH_SIZE); // huge_objects_count
+    write_length(&mut frhp, huge_count as u64, LENGTH_SIZE); // huge_objects_count
     write_length(&mut frhp, 0, LENGTH_SIZE); // tiny_objects_size
     write_length(&mut frhp, 0, LENGTH_SIZE); // tiny_objects_count
     frhp.extend_from_slice(&4u16.to_le_bytes()); // table_width
@@ -570,7 +572,7 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     // carries a B-tree key instead of a block offset.
     let mut heap_ids: Vec<Vec<u8>> = Vec::with_capacity(attrs.len());
     // (huge object ID, address, length) for the huge-objects B-tree, in ID order.
-    let mut huge_records: Vec<(u64, u64, u64)> = Vec::with_capacity(huge_count as usize);
+    let mut huge_records: Vec<(u64, u64, u64)> = Vec::with_capacity(huge_count);
     let mut next_huge_addr = huge_data_addr;
     for (s, huge_id) in serialized.iter().zip(&huge_id_of) {
         match huge_id {
@@ -707,7 +709,7 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
         )]
         let huge_nrec = huge_count as u16;
         huge_bthd.extend_from_slice(&huge_nrec.to_le_bytes());
-        write_length(&mut huge_bthd, huge_count, LENGTH_SIZE);
+        write_length(&mut huge_bthd, huge_count as u64, LENGTH_SIZE);
         let huge_bthd_checksum = crate::checksum::jenkins_lookup3(&huge_bthd);
         huge_bthd.extend_from_slice(&huge_bthd_checksum.to_le_bytes());
         debug_assert_eq!(huge_bthd.len(), bthd_size);
