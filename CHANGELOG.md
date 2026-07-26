@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-07-26
+
+An API-consolidation release. File properties are now reusable values rather than scattered function variants: one `FileAccessOptions` (the `fapl` analogue) carries cache budgets and the locking policy to every open, and the new `FileCreateOptions` (the `fcpl` analogue) lets a file layout be defined once and applied to any write, including through `File::create_with_options`. Two long-standing gaps fell out of that work — the read-write mirror backend was silently discarding access options, and the bounded backend always locked regardless of policy. Public types the HDF5 format will keep growing are now `#[non_exhaustive]`, so a future datatype class, reference kind, or MATLAB class is an additive change instead of a breaking one, and a test guards each seal against silent removal. Enumerations can finally be built over any integer base type. Two defects from 0.24.0 are fixed: `repack` corrupting a dataset whose datatype contains a variable-length or reference member, and a hang when reading a file from inside a builder closure. The release carries a number of breaking changes, all listed below; most are one-line call-site edits.
+
 ### Added
 
 - `FileCreateOptions` collects the file-creation properties (userblock, file-space strategy and page size, library-version bounds) into one reusable value — the `fcpl` analogue — applied with `FileBuilder::with_create_options` or the new `File::create_with_options`, which mirrors `H5Fcreate(name, flags, fcpl, fapl)` and is the first way to reach creation properties from the owned-handle path ([#205](https://github.com/stephenberry/hdf5-pure/issues/205)).
@@ -415,7 +419,8 @@ Internal robustness and tests ([#26](https://github.com/stephenberry/hdf5-pure/i
 - The MAT deserializer flattens 1×N and N×1 values to a 1-D sequence in `deserialize_any` (matching `deserialize_seq`).
 - Numeric/complex readers preserve 1×N / N×1 shape at the value layer; any flattening happens at the serde level.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.24.0...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.25.0...HEAD
+[0.25.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.23.2...v0.24.0
 [0.23.2]: https://github.com/stephenberry/hdf5-pure/compare/v0.23.1...v0.23.2
 [0.23.1]: https://github.com/stephenberry/hdf5-pure/compare/v0.23.0...v0.23.1
