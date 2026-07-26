@@ -1,6 +1,6 @@
 # File Property Support (`fapl` / `fcpl`)
 
-HDF5 configures a file through two property lists: a **file-creation property list** (`fcpl`, passed to `H5Fcreate`) and a **file-access property list** (`fapl`, passed to `H5Fcreate`/`H5Fopen`). `hdf5-pure` does not expose property-list handles. Instead, creation properties are methods on [`FileBuilder`](../guide/writing.md) and access properties are open-mode constructors on `File` plus the `FileAccessOptions` / `DatasetAccessOptions` structs and the `FileLocking` enum.
+HDF5 configures a file through two property lists: a **file-creation property list** (`fcpl`, passed to `H5Fcreate`) and a **file-access property list** (`fapl`, passed to `H5Fcreate`/`H5Fopen`). `hdf5-pure` does not expose property-list *handles*, but it does model both lists as plain reusable values: `FileCreateOptions` (the `fcpl`) and `FileAccessOptions` (the `fapl`). Build either once and pass it to `FileBuilder::with_create_options` / `File::create_with_options`, or to any `*_with_options` open. The equivalent `FileBuilder` methods set the same creation properties one at a time, and `DatasetAccessOptions` overrides access properties per dataset.
 
 This page is the consolidated map from each HDF5 property to what the crate supports. For the file-space details behind the first table, see [File-Space Strategy](../guide/file-space.md); for the read-write access modes, see [Editing in Place](../guide/editing.md) and [Streaming Large Files](../guide/streaming.md).
 
@@ -17,7 +17,7 @@ This page is the consolidated map from each HDF5 property to what the crate supp
 
 ## File-creation properties (`fcpl`)
 
-Set through [`FileBuilder`](../guide/writing.md) before `write` / `finish`.
+Set through [`FileBuilder`](../guide/writing.md) before `write` / `finish`, individually or all at once with `FileBuilder::with_create_options(FileCreateOptions)`. `File::create_with_options(path, fcpl, fapl)` applies them on the owned-handle path, mirroring `H5Fcreate(name, flags, fcpl_id, fapl_id)`.
 
 | HDF5 property (C API) | `hdf5-pure` | Status | Behavior |
 |---|---|---|---|
@@ -42,12 +42,12 @@ Selected through the `File` open-mode constructor, with memory budgets and locki
 | `H5Fopen(RDONLY)`, default sec2 | `File::open` | **Genuine (read-only)** | Whole-file buffered read; takes no lock. |
 | positioned / on-demand reads | `File::open_streaming` | **Genuine (read-only, bounded)** | Fetches metadata and chunks on demand; peak memory near one chunk. |
 | `H5Pset_fapl_core` / `H5Pset_file_image` | `File::from_bytes` / `FileBuilder::finish` | **Genuine** | Read an in-memory file image, or build one into a `Vec<u8>`. |
-| `H5Fopen(RDWR)` | `File::open_rw` | **Genuine (read-write, O(file))** | Whole-file in-memory mirror; reads, appends, and staged edits + `commit`. On a paged file, reads work but commits and appends refuse (grow it via `open_rw_bounded`). |
+| `H5Fopen(RDWR)` | `File::open_rw` / `open_rw_with_options` | **Genuine (read-write, O(file))** | Whole-file in-memory mirror; reads, appends, and staged edits + `commit`. On a paged file, reads work but commits and appends refuse (grow it via `open_rw_bounded`). |
 | `H5Fopen(RDWR)`, bounded memory | `File::open_rw_bounded` | **Genuine (read-write, bounded)** | Bounded reads + immediate crash-atomic `Dataset::append`. The path for growing a file that persists its free space, **including a paged file**. The staged edit surface returns `Error::BoundedStagedUnsupported`. |
-| `H5F_ACC_SWMR_READ` / `H5F_ACC_SWMR_WRITE` | `File::open_swmr` / `open_swmr_writer` | **Genuine** | No OS lock; the writer raises the superblock SWMR-write flag and appends only. |
-| `H5Pset_file_locking` + `HDF5_USE_FILE_LOCKING` | `FileLocking`, `File::open_rw_with_locking` | **Genuine** | Exclusive advisory lock on the edit path (non-blocking → `Error::FileLocked`); the env var override recognizes the same values as the C library. Readers and the SWMR writer take no lock by design. |
+| `H5F_ACC_SWMR_READ` / `H5F_ACC_SWMR_WRITE` | `File::open_swmr` / `open_swmr_writer` (`*_with_options`) | **Genuine** | No OS lock; the writer raises the superblock SWMR-write flag and appends only. |
+| `H5Pset_file_locking` + `HDF5_USE_FILE_LOCKING` | `FileAccessOptions::with_locking`, `FileLocking` | **Genuine** | Exclusive advisory lock on both read-write paths, mirror and bounded (non-blocking → `Error::FileLocked`); the env var override recognizes the same values as the C library. Readers and the SWMR writer take no lock by design and ignore the setting. |
 | `H5Fget_libver_bounds` (read) | `File::libver_bound` | **Read-only** | Reports the low library-version bound the superblock version implies. |
-| `H5Pset_cache` (rdcc) / `H5Pset_chunk_cache` | `FileAccessOptions::with_chunk_cache`, `DatasetAccessOptions::with_chunk_cache` | **Read-only** | A decompressed-chunk + parsed-index LRU (default 1 MiB / 16 slots). No write coalescing (a mutation clears it) and no `rdcc_w0` preemption policy. |
+| `H5Pset_cache` (rdcc) / `H5Pset_chunk_cache` | `FileAccessOptions::with_chunk_cache`, `DatasetAccessOptions::with_chunk_cache` | **Genuine (all backends)** | A decompressed-chunk + parsed-index LRU (default 1 MiB / 16 slots). No write coalescing (a mutation clears it) and no `rdcc_w0` preemption policy. |
 | `H5Pset_mdc_config` | `FileAccessOptions::with_metadata_cache` | **Read-only (partial)** | A byte budget for a metadata-read LRU on the streaming and bounded backends; default off. Only the memory-budget portion of `H5AC_cache_config_t`, none of the adaptive-resize/flush policy. |
 | `H5Pset_page_buffer_size` | none | **Unsupported** | There is no page buffer and no write buffering; paging is a layout-time concern only. |
 | `H5Pset_fapl_family` / `split` / `multi` / `mpio` / `direct` / `ros3` / `log` | none | **Unsupported** | Only two implicit drivers exist: an in-memory buffer and `Read + Seek` positioned I/O. A multi-file, parallel, or remote-object file is not opened. |

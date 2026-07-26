@@ -7,7 +7,7 @@
 //! editor still holds its lock, because that read is permitted on Unix but
 //! blocked by the OS on Windows.
 
-use hdf5_pure::{Error, File, FileBuilder, FileLocking};
+use hdf5_pure::{Error, File, FileAccessOptions, FileBuilder, FileLocking};
 use tempfile::tempdir;
 
 /// A plain, in-place-editable starter file.
@@ -57,10 +57,17 @@ fn disabled_locking_takes_no_lock() {
 
     // With locking disabled the editor takes no lock at all, so others can still
     // open the file (true on every platform, since nothing is locked).
-    let _editor = File::open_rw_with_locking(&path, FileLocking::Disabled).unwrap();
+    let _editor = File::open_rw_with_options(
+        &path,
+        FileAccessOptions::new().with_locking(FileLocking::Disabled),
+    )
+    .unwrap();
     File::open(&path).expect("read should succeed: the Disabled editor took no lock");
-    File::open_rw_with_locking(&path, FileLocking::Disabled)
-        .expect("a second Disabled editor should open: neither took a lock");
+    File::open_rw_with_options(
+        &path,
+        FileAccessOptions::new().with_locking(FileLocking::Disabled),
+    )
+    .expect("a second Disabled editor should open: neither took a lock");
 }
 
 #[test]

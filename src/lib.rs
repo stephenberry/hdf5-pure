@@ -150,6 +150,7 @@ pub(crate) mod dataspace;
 pub(crate) mod datatype;
 pub(crate) mod error;
 pub(crate) mod extensible_array;
+pub(crate) mod file_create_options;
 pub(crate) mod file_space_info;
 pub(crate) mod file_writer;
 pub(crate) mod fill_value;
@@ -274,6 +275,7 @@ pub use element::H5Element;
 
 pub use scaleoffset::ScaleOffset;
 
+pub use file_create_options::FileCreateOptions;
 pub use file_space_info::{FileSpaceInfo, FileSpaceStrategy};
 
 // The HDF5 datatype handle returned by the `make_*_type` constructors and
