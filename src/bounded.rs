@@ -684,13 +684,17 @@ impl BoundedEngine {
     /// genuine paged file (`H5F_FSPACE_STRATEGY_PAGE`), whose appends are kept
     /// page-homogeneous; a paged file that does not persist its free space is
     /// refused (issue #173).
-    pub(crate) fn open(path: &Path, metadata_cache: MetadataCacheConfig) -> Result<Self, Error> {
+    pub(crate) fn open(
+        path: &Path,
+        metadata_cache: MetadataCacheConfig,
+        locking: FileLocking,
+    ) -> Result<Self, Error> {
         let handle = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
             .map_err(Error::Io)?;
-        file_lock::acquire_exclusive(&handle, FileLocking::Enabled, path)?;
+        file_lock::acquire_exclusive(&handle, locking, path)?;
         let len = handle.metadata().map_err(Error::Io)?.len();
 
         let raw = RawSource {
@@ -1222,8 +1226,12 @@ mod tests {
                 let p = dir.path().join(std::format!("crash_{case}_{max_phase}.h5"));
                 std::fs::copy(&base, &p).unwrap();
                 {
-                    let mut engine =
-                        BoundedEngine::open(&p, MetadataCacheConfig::disabled()).unwrap();
+                    let mut engine = BoundedEngine::open(
+                        &p,
+                        MetadataCacheConfig::disabled(),
+                        FileLocking::Enabled,
+                    )
+                    .unwrap();
                     let addr = dataset_addr(&engine);
                     let mut b = AppendBuilder::new();
                     b.append_i32(&(n..n + add).collect::<Vec<_>>());
@@ -1257,7 +1265,9 @@ mod tests {
         build(&p, 5, 512);
         let total = 700_000i32;
         {
-            let mut engine = BoundedEngine::open(&p, MetadataCacheConfig::disabled()).unwrap();
+            let mut engine =
+                BoundedEngine::open(&p, MetadataCacheConfig::disabled(), FileLocking::Enabled)
+                    .unwrap();
             let addr = dataset_addr(&engine);
             let mut b = AppendBuilder::new();
             b.append_i32(&(5..total).collect::<Vec<_>>());
@@ -1292,7 +1302,9 @@ mod tests {
             .with_chunks(&[4]);
         b.write(&p).unwrap();
         {
-            let mut engine = BoundedEngine::open(&p, MetadataCacheConfig::disabled()).unwrap();
+            let mut engine =
+                BoundedEngine::open(&p, MetadataCacheConfig::disabled(), FileLocking::Enabled)
+                    .unwrap();
             assert!(engine.persist.is_some(), "persist state is armed at open");
             let addr = dataset_addr(&engine);
             let mut ab = AppendBuilder::new();
@@ -1332,7 +1344,9 @@ mod tests {
         // Grow enough to force extensible-array index growth, so the last write of
         // the session is metadata and the tail page is a partial metadata page.
         {
-            let mut engine = BoundedEngine::open(&p, MetadataCacheConfig::disabled()).unwrap();
+            let mut engine =
+                BoundedEngine::open(&p, MetadataCacheConfig::disabled(), FileLocking::Enabled)
+                    .unwrap();
             let addr = dataset_addr(&engine);
             let mut ab = AppendBuilder::new();
             ab.append_i32(&(64..2000).collect::<Vec<_>>());
@@ -1348,7 +1362,9 @@ mod tests {
         // Reopen must not panic on the non-aligned file; the next append re-aligns
         // the crashed tail page, and finalize re-page-aligns the whole file.
         {
-            let mut engine = BoundedEngine::open(&p, MetadataCacheConfig::disabled()).unwrap();
+            let mut engine =
+                BoundedEngine::open(&p, MetadataCacheConfig::disabled(), FileLocking::Enabled)
+                    .unwrap();
             let addr = dataset_addr(&engine);
             let mut ab = AppendBuilder::new();
             ab.append_i32(&(2000..2500).collect::<Vec<_>>());

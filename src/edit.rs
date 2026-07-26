@@ -526,23 +526,18 @@ pub struct SpaceAccounting {
 }
 
 impl WriteEngine {
-    /// Open an existing HDF5 file for in-place editing.
+    /// Open an existing HDF5 file for in-place editing under an explicit
+    /// file-locking policy.
     ///
-    /// Reads the file into memory and retains a read/write handle. Takes an
-    /// exclusive OS advisory lock so the file cannot be opened concurrently by
-    /// another writer or reader; the lock is released automatically when the
-    /// session is dropped or the process exits (including on a crash). Fails with
-    /// [`Error::FileLocked`] if the file is already locked, or
-    /// [`Error::EditUnsupported`] if the file is not a supported target; its
-    /// documentation enumerates the exact requirements. To control or disable
-    /// locking, use [`open_with_locking`](Self::open_with_locking) or set
-    /// `HDF5_USE_FILE_LOCKING=FALSE`.
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
-        Self::open_with_locking(path, FileLocking::Enabled)
-    }
-
-    /// Open an existing HDF5 file for in-place editing, choosing the file-locking
-    /// policy explicitly. See [`open`](Self::open) and [`FileLocking`].
+    /// Reads the file into memory and retains a read/write handle. Under
+    /// [`FileLocking::Enabled`] it takes an exclusive OS advisory lock so the file
+    /// cannot be opened concurrently by another writer or reader; the lock is
+    /// released automatically when the session is dropped or the process exits
+    /// (including on a crash). Fails with [`Error::FileLocked`] if the file is
+    /// already locked, or [`Error::EditUnsupported`] if the file is not a
+    /// supported target; its documentation enumerates the exact requirements.
+    /// `HDF5_USE_FILE_LOCKING` overrides the requested policy, as in the C
+    /// library.
     pub fn open_with_locking<P: AsRef<Path>>(path: P, locking: FileLocking) -> Result<Self, Error> {
         Self::open_inner(path.as_ref(), Some(locking))
     }
@@ -6689,7 +6684,7 @@ mod tests {
                 let p = dir.path().join(format!("crash_{n}_{chunk}_{max_phase}.h5"));
                 std::fs::copy(&base, &p).unwrap();
                 {
-                    let mut s = WriteEngine::open(&p).unwrap();
+                    let mut s = WriteEngine::open_with_locking(&p, FileLocking::Enabled).unwrap();
                     s.append_inplace_i32_phased("d", &(n..n + add).collect::<Vec<_>>(), max_phase)
                         .unwrap();
                     // session dropped here, simulating a crash after `max_phase`
@@ -6729,7 +6724,7 @@ mod tests {
         max_phase: u8,
     ) {
         std::fs::copy(base, out).unwrap();
-        let mut s = WriteEngine::open(out).unwrap();
+        let mut s = WriteEngine::open_with_locking(out, FileLocking::Enabled).unwrap();
         s.append_inplace_i32_phased("d", &values.collect::<Vec<_>>(), max_phase)
             .unwrap();
     }
@@ -6885,7 +6880,7 @@ mod tests {
         // dimension stays at `n`. Its values are far from the correct
         // continuation, so a leak is unmistakable.
         {
-            let mut s = WriteEngine::open(&path).unwrap();
+            let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
             s.append_inplace_i32_phased("d", &(1000..1200).collect::<Vec<_>>(), 3)
                 .unwrap();
         }
@@ -6909,7 +6904,7 @@ mod tests {
         // Writer 2 recovers: roll forward from the committed dimension,
         // overwriting the uncommitted slots with the real continuation.
         {
-            let mut s = WriteEngine::open(&path).unwrap();
+            let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
             s.append_inplace_i32_phased("d", &(n..150).collect::<Vec<_>>(), 4)
                 .unwrap();
         }
@@ -7152,7 +7147,7 @@ mod tests {
 
         // A clean edit-and-commit cycle heals it.
         {
-            let mut s = WriteEngine::open(&path).unwrap();
+            let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
             let mut b = DatasetBuilder::new("e");
             b.with_i32_data(&[4, 5]);
             s.stage_created_dataset("e", b);
@@ -7197,7 +7192,7 @@ mod tests {
         ];
 
         {
-            let mut s = WriteEngine::open(&path).unwrap();
+            let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
             let mut b = DatasetBuilder::new("labels");
             b.with_vlen_string_elements(datatype, &elements).unwrap();
             s.stage_created_dataset("labels", b);
@@ -7242,7 +7237,9 @@ mod tests {
         data[off..off + bytes.len()].copy_from_slice(&bytes);
         std::fs::write(&path, &data).unwrap();
 
-        let err = WriteEngine::open(&path).err().expect("open must fail");
+        let err = WriteEngine::open_with_locking(&path, FileLocking::Enabled)
+            .err()
+            .expect("open must fail");
         match err {
             Error::Format(FormatError::OffsetOverflow { offset, length }) => {
                 assert_eq!(offset, u64::MAX);

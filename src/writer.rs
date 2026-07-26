@@ -10,6 +10,7 @@ use crate::type_builders::{
 };
 
 use crate::error::{Error, FormatError};
+use crate::file_create_options::FileCreateOptions;
 use crate::file_space_info::FileSpaceStrategy;
 use crate::libver::LibVer;
 
@@ -53,6 +54,28 @@ impl FileBuilder {
     /// Add a finished group to the file.
     pub fn add_group(&mut self, group: FinishedGroup) {
         self.writer.add_group(group);
+    }
+
+    /// Apply every creation property in `options` at once — the `fcpl` analogue
+    /// of handing a property list to `H5Fcreate`.
+    ///
+    /// Each property is applied exactly as the individual setter would, so this
+    /// **overwrites** any value set individually before the call. The two
+    /// spellings interoperate: apply a shared [`FileCreateOptions`] first, then
+    /// override one property for this file.
+    #[doc(alias = "fcpl")]
+    pub fn with_create_options(&mut self, options: FileCreateOptions) -> &mut Self {
+        self.with_userblock(options.userblock());
+        if let Some((low, high)) = options.libver_bounds() {
+            self.with_libver_bounds(low, high);
+        }
+        if let Some((strategy, persist, threshold)) = options.file_space_strategy() {
+            self.with_file_space_strategy(strategy, persist, threshold);
+        }
+        if let Some(page_size) = options.file_space_page_size() {
+            self.with_file_space_page_size(page_size);
+        }
+        self
     }
 
     /// Set the userblock size in bytes. Must be a power of two >= 512 or 0 (no userblock).
