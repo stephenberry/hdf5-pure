@@ -5631,8 +5631,12 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
     // Variable-length string element references live in the global heap, whose
     // address is only known once the apply loop places the collection. For
     // chunked/filtered/resizable storage the references sit inside chunks
-    // written before that address exists, so patching them in is impossible —
-    // mirrors the whole-file writer's `ChunkedVlenStringUnsupported` refusal.
+    // written before that address exists, so patching them in is impossible.
+    //
+    // The whole-file writer lifted the same restriction by placing such a
+    // dataset's collections ahead of everything else (issue #109); this engine
+    // appends into an existing layout, where there is no "ahead" to place them
+    // in, so the equivalent fix is a separate piece of work.
     if db.vl_string_staging.is_some() && chunked {
         return Err(Error::EditUnsupported(
             "chunked or extensible variable-length-string datasets cannot be added in place yet",

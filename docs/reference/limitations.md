@@ -90,7 +90,7 @@ Refused today with a `... yet` message, intended to land. Each row links to its 
 
 | Capability | Tracking |
 |---|---|
-| Repack of **region references**, non-8-byte object references, chunked/filtered/resizable variable-length & reference datasets, and unrecognized filter pipelines (time, contiguous non-string-vlen sequences, and 8-byte object references now repack faithfully) | [#107](https://github.com/stephenberry/hdf5-pure/issues/107) |
+| Repack of **region references**, non-8-byte object references, chunked/filtered/resizable **reference** datasets, and unrecognized filter pipelines (time, variable-length sequences, and 8-byte object references now repack faithfully; chunked, filtered, and resizable variable-length datasets repack as of [#109](https://github.com/stephenberry/hdf5-pure/issues/109)) | [#107](https://github.com/stephenberry/hdf5-pure/issues/107) |
 
 ### Reading
 
@@ -105,7 +105,10 @@ Virtual datasets are also refused by `repack` (it cannot relocate data living ou
 
 | Capability | Tracking |
 |---|---|
-| **Chunked / filtered / resizable variable-length-string** datasets | [#109](https://github.com/stephenberry/hdf5-pure/issues/109) |
+| **Append** to a variable-length dataset (writing one resizable is supported; growing it is not) | [#109](https://github.com/stephenberry/hdf5-pure/issues/109) |
+| Add a **chunked variable-length** dataset to an *existing* file in place | [#109](https://github.com/stephenberry/hdf5-pure/issues/109) |
+
+Chunked, filtered, and resizable variable-length datasets now write, so the entries that were here for those have gone ([#109](https://github.com/stephenberry/hdf5-pure/issues/109)). Two gaps remain. A resizable one can be created but not grown: `Dataset::append` is typed and `H5Element` covers only numeric scalars, and `append_raw` refuses a variable-length datatype because it cannot encode the heap references. And adding such a dataset to an existing file through the in-place edit engine is refused, since the engine appends into a fixed layout with nowhere to place the heap collections ahead of the chunks.
 
 ### SWMR
 

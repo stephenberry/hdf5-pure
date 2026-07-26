@@ -430,8 +430,12 @@ fn repack_refuses_reference_to_dropped_object() {
     assert!(!dst.exists(), "dst must not be created when repack refuses");
 }
 
+/// A chunked VL-string dataset the C library wrote repacks into an equally
+/// chunked one, with its heap references rebuilt against the new file's
+/// collections (issue #109). The C library reading the *output* is the check
+/// that those rebuilt addresses are real.
 #[test]
-fn repack_refuses_chunked_vlen_string_dataset() {
+fn repack_roundtrips_chunked_vlen_string_dataset() {
     use hdf5::types::VarLenUnicode;
     use std::str::FromStr;
 
@@ -439,10 +443,12 @@ fn repack_refuses_chunked_vlen_string_dataset() {
     let src = dir.path().join("c_vlen_chunked.h5");
     let dst = dir.path().join("vlen_chunked_repacked.h5");
 
+    let expected: Vec<String> = (0..8).map(|i| format!("word{i}")).collect();
     {
         let file = hdf5::File::create(&src).unwrap();
-        let vals: Vec<VarLenUnicode> = (0..8)
-            .map(|i| VarLenUnicode::from_str(&format!("word{i}")).unwrap())
+        let vals: Vec<VarLenUnicode> = expected
+            .iter()
+            .map(|s| VarLenUnicode::from_str(s).unwrap())
             .collect();
         file.new_dataset::<VarLenUnicode>()
             .shape((8,))
@@ -454,20 +460,91 @@ fn repack_refuses_chunked_vlen_string_dataset() {
         file.close().unwrap();
     }
 
-    // Chunked VL-string datasets cannot be repacked faithfully (their element
-    // references live inside compressed chunks before the heap addresses are
-    // known), so repack must refuse by name.
-    let err = repack(&src, &dst, &RepackOptions::new()).unwrap_err();
-    match err {
-        hdf5_pure::Error::RepackUnsupported(msg) => {
-            assert!(
-                msg.contains("chunked_labels") && msg.contains("chunked"),
-                "error should name the dataset and reason: {msg}"
-            );
-        }
-        other => panic!("expected RepackUnsupported, got {other:?}"),
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    assert_eq!(
+        File::open(&dst)
+            .unwrap()
+            .dataset("chunked_labels")
+            .unwrap()
+            .read_string()
+            .unwrap(),
+        expected
+    );
+    let f = hdf5::File::open(&dst).unwrap();
+    let ds = f.dataset("chunked_labels").unwrap();
+    assert!(
+        ds.is_chunked(),
+        "repack must reproduce the source's chunked layout, not flatten it"
+    );
+    let read: Vec<String> = ds
+        .read_raw::<VarLenUnicode>()
+        .unwrap()
+        .into_iter()
+        .map(|s| s.as_str().to_owned())
+        .collect();
+    assert_eq!(read, expected);
+}
+
+/// The compressed and resizable variants of the same path, written by this crate
+/// and repacked: the pipeline and the unlimited dimension must survive, and the
+/// C library must read the result.
+#[test]
+fn repack_roundtrips_filtered_and_resizable_vlen_string_datasets() {
+    use hdf5::types::VarLenUnicode;
+
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("filtered_vlen.h5");
+    let dst = dir.path().join("filtered_vlen_repacked.h5");
+
+    let words: Vec<String> = (0..40).map(|i| format!("label-{i}")).collect();
+    let refs: Vec<&str> = words.iter().map(String::as_str).collect();
+    {
+        let mut b = hdf5_pure::FileBuilder::new();
+        b.create_dataset("compressed")
+            .with_vlen_strings(&refs)
+            .with_chunks(&[8])
+            .with_deflate(6);
+        b.create_dataset("growable")
+            .with_vlen_strings(&refs)
+            .with_shape(&[words.len() as u64])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[8]);
+        b.write(&src).unwrap();
     }
-    assert!(!dst.exists(), "dst must not be created when repack refuses");
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    let out = File::open(&dst).unwrap();
+    for name in ["compressed", "growable"] {
+        assert_eq!(
+            out.dataset(name).unwrap().read_string().unwrap(),
+            words,
+            "{name} did not survive the repack"
+        );
+    }
+
+    let f = hdf5::File::open(&dst).unwrap();
+    let compressed = f.dataset("compressed").unwrap();
+    assert!(
+        !compressed.filters().is_empty(),
+        "repack must carry the deflate pipeline onto the rebuilt dataset"
+    );
+    assert!(
+        f.dataset("growable").unwrap().is_resizable(),
+        "repack must carry the unlimited dimension onto the rebuilt dataset"
+    );
+    for name in ["compressed", "growable"] {
+        let read: Vec<String> = f
+            .dataset(name)
+            .unwrap()
+            .read_raw::<VarLenUnicode>()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.as_str().to_owned())
+            .collect();
+        assert_eq!(read, words, "C library disagreed on {name}");
+    }
 }
 
 #[test]
