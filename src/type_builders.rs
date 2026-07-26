@@ -13,6 +13,7 @@ use crate::dataspace::{Dataspace, DataspaceType};
 use crate::datatype::{
     CharacterSet, CompoundMember, Datatype, DatatypeByteOrder, EnumMember, StringPadding,
 };
+use crate::error::FormatError;
 use crate::scaleoffset::ScaleOffset;
 
 // ---- Datatype constructors ----
@@ -372,52 +373,137 @@ impl CompoundTypeBuilder {
 /// Builder for constructing HDF5 enumeration datatypes.
 pub struct EnumTypeBuilder {
     base_type: Datatype,
-    members: Vec<EnumMember>,
+    members: Vec<(String, PendingEnumValue)>,
+}
+
+/// A member value awaiting the base type's width, resolved by
+/// [`EnumTypeBuilder::build`].
+enum PendingEnumValue {
+    /// An integer, encoded little-endian into the base type's size at build.
+    Int(i64),
+    /// Raw little-endian bytes, which must already match the base type's size.
+    Raw(Vec<u8>),
 }
 
 impl EnumTypeBuilder {
     /// Create a new enum builder with i32 base type.
     pub fn i32_based() -> Self {
-        Self {
-            base_type: make_i32_type(),
-            members: Vec::new(),
-        }
+        Self::with_base(make_i32_type())
     }
 
     /// Create a new enum builder with u8 base type.
     pub fn u8_based() -> Self {
+        Self::with_base(make_u8_type())
+    }
+
+    /// Create an enum builder over an arbitrary integer base type, such as
+    /// [`make_u16_type`] or [`make_i64_type`].
+    ///
+    /// The enumeration's element size comes from `base_type`. A non-integer base
+    /// is refused by [`build`](Self::build) with
+    /// [`FormatError::EnumBaseNotInteger`].
+    pub fn with_base(base_type: Datatype) -> Self {
         Self {
-            base_type: make_u8_type(),
+            base_type,
             members: Vec::new(),
         }
     }
 
-    /// Add a named value.
+    /// Add a named value, encoded little-endian into the base type's width.
+    ///
+    /// A value that does not fit the base type is refused by
+    /// [`build`](Self::build) with [`FormatError::EnumMemberValueRange`].
     pub fn value(mut self, name: &str, val: i32) -> Self {
-        self.members.push(EnumMember {
-            name: name.to_string(),
-            value: val.to_le_bytes().to_vec(),
-        });
+        self.members
+            .push((name.to_string(), PendingEnumValue::Int(val as i64)));
         self
     }
 
     /// Add a named u8 value.
-    pub fn u8_value(mut self, name: &str, val: u8) -> Self {
-        self.members.push(EnumMember {
-            name: name.to_string(),
-            value: vec![val],
-        });
+    pub fn u8_value(self, name: &str, val: u8) -> Self {
+        self.value(name, i32::from(val))
+    }
+
+    /// Add a named value from an integer wide enough for any base type.
+    pub fn i64_value(mut self, name: &str, val: i64) -> Self {
+        self.members
+            .push((name.to_string(), PendingEnumValue::Int(val)));
         self
     }
 
-    /// Build the enumeration datatype.
-    pub fn build(self) -> Datatype {
+    /// Add a named value from its raw little-endian bytes — the form the format
+    /// stores and [`EnumMember::value`] holds.
+    ///
+    /// `bytes` must be exactly the base type's size, or [`build`](Self::build)
+    /// refuses it with [`FormatError::EnumMemberValueSize`]. Use this for a base
+    /// type whose values do not fit an `i64`, or to reproduce stored bytes
+    /// verbatim.
+    pub fn raw_value(mut self, name: &str, bytes: &[u8]) -> Self {
+        self.members
+            .push((name.to_string(), PendingEnumValue::Raw(bytes.to_vec())));
+        self
+    }
+
+    /// Build the enumeration datatype, resolving every member against the base
+    /// type's width.
+    ///
+    /// Fails if the base type is not an integer, if a member's raw byte length
+    /// disagrees with the base type's size, or if a member's integer value does
+    /// not fit — rather than emitting a datatype message the reference C library
+    /// cannot read.
+    pub fn build(self) -> Result<Datatype, FormatError> {
         let size = self.base_type.type_size();
-        Datatype::Enumeration {
+        let signed = match &self.base_type {
+            Datatype::FixedPoint { signed, .. } => *signed,
+            _ => return Err(FormatError::EnumBaseNotInteger),
+        };
+        let width = size.to_usize()?;
+
+        let mut members = Vec::with_capacity(self.members.len());
+        for (name, pending) in self.members {
+            let value = match pending {
+                PendingEnumValue::Raw(bytes) => {
+                    if bytes.len() != width {
+                        return Err(FormatError::EnumMemberValueSize(name, size, bytes.len()));
+                    }
+                    bytes
+                }
+                PendingEnumValue::Int(v) => {
+                    if !int_fits(v, width, signed) {
+                        return Err(FormatError::EnumMemberValueRange(name, v, size));
+                    }
+                    v.to_le_bytes()[..width].to_vec()
+                }
+            };
+            members.push(EnumMember { name, value });
+        }
+
+        Ok(Datatype::Enumeration {
             size,
             base_type: Box::new(self.base_type),
-            members: self.members,
-        }
+            members,
+        })
+    }
+}
+
+/// Whether `v` is representable in `width` bytes under `signed`.
+fn int_fits(v: i64, width: usize, signed: bool) -> bool {
+    if width == 0 {
+        return false;
+    }
+    if width >= 8 {
+        // Every `i64` fits eight signed bytes; an unsigned eight-byte base needs
+        // a non-negative value (larger magnitudes need `raw_value`).
+        return signed || v >= 0;
+    }
+    let bits = width * 8;
+    if signed {
+        let min = -(1i64 << (bits - 1));
+        let max = (1i64 << (bits - 1)) - 1;
+        (min..=max).contains(&v)
+    } else {
+        let max = (1i64 << bits) - 1;
+        (0..=max).contains(&v)
     }
 }
 
