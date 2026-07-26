@@ -11,12 +11,12 @@
 //! placed *first* — immediately after the superblock — and patched in before any
 //! chunk is encoded.
 //!
-//! That is a layout this crate had never emitted, which is exactly why a
-//! self-round-trip proves little here: this crate's reader resolves a heap
-//! reference from whatever address it carries, so a systematically wrong address
-//! would still read back correctly as long as the collections landed there. Only
-//! the C library independently validates that the addresses point at real
-//! collections in a file it did not write.
+//! That is a layout this crate had never emitted. The pure reader catches an
+//! address that lands on no collection at all (it checks the `GCOL` signature),
+//! but not one that lands on the *wrong* collection, and it accepts any file
+//! whose placement and emission are consistently wrong in the same way. The C
+//! library independently validates that the addresses name real collections at
+//! offsets it computes itself, in a file it did not write.
 
 use hdf5::types::VarLenUnicode;
 use hdf5_pure::{File, FileBuilder, FileSpaceStrategy};
@@ -232,4 +232,75 @@ fn c_library_reads_mixed_chunked_and_contiguous_vlen_strings() {
 
     assert_both_read(&path, "chunked", &chunked);
     assert_both_read(&path, "plain", &contiguous);
+}
+
+/// Two chunked VL datasets whose collections are both placed early, with
+/// **distinct** content.
+///
+/// This is what pins the placement/emission ordering invariant: `early_gcol` is
+/// walked once to assign addresses and again to write the bytes, and the two
+/// walks must agree. With one early dataset no ordering is expressible, and with
+/// two identical ones a swap is a no-op — so a reversed emission order would be
+/// invisible. Here it makes each dataset read the other's strings, and the C
+/// library rejects the file outright.
+#[test]
+fn c_library_reads_two_distinct_chunked_vlen_string_datasets() {
+    let _c = c_lib_guard();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("two_early.h5");
+
+    // Different lengths as well as different text, so a swap cannot survive by
+    // the two collections happening to be the same size.
+    let first: Vec<String> = (0..12).map(|i| format!("first-{i}")).collect();
+    let second: Vec<String> = (0..30)
+        .map(|i| format!("second-{i}-with-a-longer-body"))
+        .collect();
+
+    let mut b = FileBuilder::new();
+    b.create_dataset("a")
+        .with_vlen_strings(&first.iter().map(String::as_str).collect::<Vec<_>>())
+        .with_chunks(&[4]);
+    b.create_dataset("b")
+        .with_vlen_strings(&second.iter().map(String::as_str).collect::<Vec<_>>())
+        .with_chunks(&[7])
+        .with_deflate(6);
+    b.write(&path).unwrap();
+
+    assert_both_read(&path, "a", &first);
+    assert_both_read(&path, "b", &second);
+}
+
+/// Five early-placed datasets, mixed with a contiguous VL dataset that keeps the
+/// late placement. Exercises the two cursors in one file and makes an ordering
+/// slip anywhere in the middle of `early_gcol` detectable, not just a full
+/// reversal of two.
+#[test]
+fn c_library_reads_many_chunked_vlen_string_datasets() {
+    let _c = c_lib_guard();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("many_early.h5");
+
+    let sets: Vec<Vec<String>> = (0..5)
+        .map(|d| {
+            (0..(6 + d * 5))
+                .map(|i| format!("ds{d}-item{i}{}", "x".repeat(d)))
+                .collect()
+        })
+        .collect();
+    let contiguous: Vec<String> = (0..4).map(|i| format!("late-{i}")).collect();
+
+    let mut b = FileBuilder::new();
+    for (d, data) in sets.iter().enumerate() {
+        b.create_dataset(&format!("chunked{d}"))
+            .with_vlen_strings(&data.iter().map(String::as_str).collect::<Vec<_>>())
+            .with_chunks(&[3]);
+    }
+    b.create_dataset("contiguous")
+        .with_vlen_strings(&contiguous.iter().map(String::as_str).collect::<Vec<_>>());
+    b.write(&path).unwrap();
+
+    for (d, data) in sets.iter().enumerate() {
+        assert_both_read(&path, &format!("chunked{d}"), data);
+    }
+    assert_both_read(&path, "contiguous", &contiguous);
 }

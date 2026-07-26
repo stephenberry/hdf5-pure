@@ -103,7 +103,12 @@ Virtual datasets are also refused by `repack` (it cannot relocate data living ou
 
 ### Writing
 
-Nothing on the write path is currently tracked as an outright refusal; the entries that were here (chunked, filtered, and resizable variable-length datasets) now write ([#109](https://github.com/stephenberry/hdf5-pure/issues/109)). Adding such a dataset to an *existing* file through the in-place edit engine is still refused — the engine appends into a fixed layout, with nowhere to place the heap collections ahead of the chunks.
+| Capability | Tracking |
+|---|---|
+| **Append** to a variable-length dataset (writing one resizable is supported; growing it is not) | [#109](https://github.com/stephenberry/hdf5-pure/issues/109) |
+| Add a **chunked variable-length** dataset to an *existing* file in place | [#109](https://github.com/stephenberry/hdf5-pure/issues/109) |
+
+Chunked, filtered, and resizable variable-length datasets now write, so the entries that were here for those have gone ([#109](https://github.com/stephenberry/hdf5-pure/issues/109)). Two gaps remain. A resizable one can be created but not grown: `Dataset::append` is typed and `H5Element` covers only numeric scalars, and `append_raw` refuses a variable-length datatype because it cannot encode the heap references. And adding such a dataset to an existing file through the in-place edit engine is refused, since the engine appends into a fixed layout with nowhere to place the heap collections ahead of the chunks.
 
 ### SWMR
 

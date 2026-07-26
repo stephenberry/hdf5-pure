@@ -1062,8 +1062,8 @@ impl FileWriter {
             // the file is laid out, so their heap addresses cannot be patched in
             // afterwards. Such a dataset instead has its collections placed
             // *ahead* of everything else, at a fixed address known before any
-            // chunk is encoded — see `place_early_element_gcol` in
-            // `finish_to_sink`. Nothing is refused here.
+            // chunk is encoded — see the early-placement block in
+            // `finish_to_sink` that fills `early_gcol`. Nothing is refused here.
             let max_dimensions = db.maxshape.clone();
             let dspace = Dataspace {
                 space_type: if shape.is_empty() {
@@ -1301,7 +1301,10 @@ impl FileWriter {
         let early_gcol_size = {
             let mut cursor = SUPERBLOCK_SIZE as u64;
             for i in 0..all_ds.len() {
-                if !is_chunked[i] {
+                // `raw_chunks` is excluded for the same reason the `chunk_sets`
+                // loop below excludes it: a verbatim chunk payload is emitted
+                // as-is and its `raw` is empty, so there is nothing to patch.
+                if !is_chunked[i] || all_ds[i].raw_chunks.is_some() {
                     continue;
                 }
                 let Some(staging) = all_ds[i].vl_string_staging.take() else {
@@ -2110,8 +2113,10 @@ impl FileWriter {
             }
             // Dataset-element VL references. The references live in the
             // contiguous/compact element bytes (`ds_layouts[i].data`, cloned
-            // from `d.raw`); chunked/filtered/resizable VL datasets were refused
-            // in `flatten_dataset`, so every staged dataset is here non-chunked.
+            // from `d.raw`). A chunked dataset's references are *not* here: they
+            // sit inside chunks that were encoded earlier, so the loop below must
+            // skip it. Dropping that skip would patch heap addresses into the
+            // encoded (possibly compressed) chunk blob and silently corrupt it.
             for (i, d) in all_ds.iter().enumerate() {
                 // A chunked VL dataset was placed and patched before its chunks
                 // were encoded; its references are already final.
@@ -2215,7 +2220,9 @@ impl FileWriter {
         sink.put(&sb.serialize())?;
 
         // Early-placed VL collections, at the addresses patched into the chunked
-        // datasets' references before their chunks were encoded.
+        // datasets' references before their chunks were encoded. This must walk
+        // `early_gcol` in the order the placement loop built it, or the patched
+        // addresses name the wrong collections.
         for &i in &early_gcol {
             let staging = all_ds[i]
                 .vl_string_staging
@@ -2223,6 +2230,11 @@ impl FileWriter {
                 .expect("early_gcol only holds datasets with VL staging");
             emit_collections(sink, &staging.collections)?;
         }
+        debug_assert_eq!(
+            sink.position(),
+            ub as u64 + root_group_addr,
+            "early VL collections must occupy exactly the space reserved for them"
+        );
 
         // Root group OH
         let root_links: Vec<LinkMessage> = {
