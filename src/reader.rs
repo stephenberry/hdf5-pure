@@ -1910,6 +1910,12 @@ impl File {
 /// keeps `Object` (and a `Vec<Object>`) compact without a size disparity. The
 /// `Box` derefs transparently, so `&obj_dataset` is usable wherever a
 /// `&Dataset` is expected.
+///
+/// Non-exhaustive: a reference can name an object kind this crate does not yet
+/// resolve — a committed (named) datatype is refused with
+/// [`FormatError::InvalidObjectReference`](crate::FormatError::InvalidObjectReference)
+/// today — so match with a `_` arm.
+#[non_exhaustive]
 pub enum Object {
     /// The reference points at a group's object header.
     Group(Group),

@@ -8,7 +8,11 @@
 use super::error::MatError;
 
 /// A recognized `MATLAB_class` value.
+///
+/// Non-exhaustive: MATLAB has classes this crate does not yet recognize (see the
+/// module docs), so match with a `_` arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MatClass {
     /// IEEE 754 64-bit float.
     Double,

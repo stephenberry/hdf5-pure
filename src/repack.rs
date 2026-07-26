@@ -116,7 +116,6 @@ use crate::writer::FileBuilder;
 /// Built with [`new`](Self::new) and [`drop_path`](Self::drop_path); the fields
 /// are private so a future option is an additive change.
 #[derive(Debug, Default, Clone)]
-#[non_exhaustive]
 pub struct RepackOptions {
     /// Full paths of objects to omit from the output. See
     /// [`drop_path`](Self::drop_path).

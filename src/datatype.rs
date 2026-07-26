@@ -46,8 +46,10 @@ pub enum ReferenceType {
 
 /// A member of a compound datatype.
 ///
-/// Non-exhaustive: parsed from a datatype message, never constructed by a
-/// caller. Build a compound with [`CompoundTypeBuilder`](crate::CompoundTypeBuilder).
+/// Non-exhaustive: parsed from a datatype message, and
+/// [`CompoundTypeBuilder`](crate::CompoundTypeBuilder) builds one over an
+/// arbitrary offset and member datatype, so nothing needs to construct this
+/// directly.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct CompoundMember {
@@ -61,10 +63,11 @@ pub struct CompoundMember {
 
 /// A member of an enumeration datatype.
 ///
-/// Non-exhaustive: parsed from a datatype message, never constructed by a
-/// caller. Build an enumeration with [`EnumTypeBuilder`](crate::EnumTypeBuilder).
+/// Deliberately *not* sealed, unlike [`CompoundMember`]:
+/// [`EnumTypeBuilder`](crate::EnumTypeBuilder) covers only `i32`- and `u8`-based
+/// enumerations, so a hand-built literal is the only way to describe one over
+/// another base type. Sealing this would remove that with nothing to replace it.
 #[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
 pub struct EnumMember {
     /// Member name.
     pub name: String,
@@ -75,9 +78,11 @@ pub struct EnumMember {
 /// Parsed HDF5 datatype.
 ///
 /// Non-exhaustive: the format's class set is not closed (HDF5 1.14.6 added a
-/// complex-number class), so match with a `_` arm. The variants themselves stay
-/// open, so an exotic type this crate has no constructor for can still be built
-/// as a literal.
+/// complex-number class), so match with a `_` arm. Only the *class* set is
+/// sealed — the variants stay open, so an exotic type this crate has no
+/// constructor for can still be built as a literal, and surfacing a format field
+/// this crate currently discards (a fixed-point type's padding bits, say) would
+/// still be a breaking change.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum Datatype {

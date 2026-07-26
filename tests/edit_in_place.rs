@@ -3168,7 +3168,7 @@ fn add_reference_dataset_targeting_preexisting_object_via_edit_session() {
     assert_eq!(targets.len(), 1);
     match &targets[0] {
         Object::Dataset(ds) => assert_eq!(ds.read_f64().unwrap(), vec![1.0, 2.0, 3.0, 4.0]),
-        Object::Group(_) => panic!("expected a dataset reference"),
+        other => panic!("expected a dataset reference, got {other:?}"),
     }
     std::fs::remove_file(&path).ok();
 }
@@ -3206,7 +3206,7 @@ fn add_reference_dataset_targeting_sibling_added_in_same_commit() {
     assert_eq!(targets.len(), 1);
     match &targets[0] {
         Object::Dataset(ds) => assert_eq!(ds.read_i32().unwrap(), vec![7, 8, 9]),
-        Object::Group(_) => panic!("expected a dataset reference"),
+        other => panic!("expected a dataset reference, got {other:?}"),
     }
     std::fs::remove_file(&path).ok();
 }
@@ -3350,15 +3350,15 @@ fn add_reference_dataset_with_multiple_elements_via_edit_session() {
     assert_eq!(targets.len(), 3);
     match &targets[0] {
         Object::Dataset(ds) => assert_eq!(ds.read_f64().unwrap(), vec![1.0, 2.0, 3.0, 4.0]),
-        Object::Group(_) => panic!("expected a dataset reference"),
+        other => panic!("expected a dataset reference, got {other:?}"),
     }
     match &targets[1] {
         Object::Dataset(ds) => assert_eq!(ds.read_i32().unwrap(), vec![42]),
-        Object::Group(_) => panic!("expected a dataset reference"),
+        other => panic!("expected a dataset reference, got {other:?}"),
     }
     match &targets[2] {
         Object::Dataset(ds) => assert_eq!(ds.read_f64().unwrap(), vec![1.0, 2.0, 3.0, 4.0]),
-        Object::Group(_) => panic!("expected a dataset reference"),
+        other => panic!("expected a dataset reference, got {other:?}"),
     }
     std::fs::remove_file(&path).ok();
 }
@@ -3397,7 +3397,7 @@ fn add_reference_dataset_targeting_a_group_via_edit_session() {
             assert_eq!(g.dataset("inner").unwrap().read_i32().unwrap(), vec![5, 6]);
             assert_eq!(g.attrs().unwrap().get("tag"), Some(&AttrValue::I64(7)));
         }
-        Object::Dataset(_) => panic!("expected a group reference"),
+        other => panic!("expected a group reference, got {other:?}"),
     }
     std::fs::remove_file(&path).ok();
 }

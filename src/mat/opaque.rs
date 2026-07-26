@@ -48,6 +48,7 @@ use serde::Deserialize;
 /// [`tz`]: MatDatetime::tz
 /// [`fmt`]: MatDatetime::fmt
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[non_exhaustive]
 pub struct MatDatetime {
     /// Milliseconds since 1970-01-01 UTC (the high part of the double-double;
     /// may be fractional), one per element in row-major order.
@@ -95,6 +96,7 @@ impl MatDatetime {
 /// [`millis`]: MatDuration::millis
 /// [`fmt`]: MatDuration::fmt
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[non_exhaustive]
 pub struct MatDuration {
     /// Length of each element in milliseconds (row-major order).
     pub millis: Vec<f64>,
@@ -122,6 +124,7 @@ impl MatDuration {
 /// [`is_ordinal`]: MatCategorical::is_ordinal
 /// [`is_protected`]: MatCategorical::is_protected
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[non_exhaustive]
 pub struct MatCategorical {
     /// 1-based category index per element (`0` = `<undefined>`), row-major.
     pub codes: Vec<u32>,
@@ -168,6 +171,7 @@ impl MatCategorical {
 /// [`class_name`]: MatEnum::class_name
 /// [`names`]: MatEnum::names
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[non_exhaustive]
 pub struct MatEnum {
     /// The fully qualified enumeration class name.
     pub class_name: String,
