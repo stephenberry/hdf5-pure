@@ -10,6 +10,9 @@
 use hdf5_pure::{File, RepackOptions, repack};
 use tempfile::tempdir;
 
+mod common;
+use common::assert_c_absent;
+
 #[test]
 fn c_file_repacked_then_read_by_c_library() {
     let dir = tempdir().unwrap();
@@ -66,10 +69,7 @@ fn c_file_repacked_then_read_by_c_library() {
         c.dataset("grp/beta").unwrap().read_raw::<i32>().unwrap(),
         vec![10, 20, 30, 40]
     );
-    assert!(
-        c.dataset("doomed").is_err(),
-        "dropped dataset still present (C library)"
-    );
+    assert_c_absent(&c.dataset("doomed").unwrap_err(), "doomed");
 }
 
 #[test]

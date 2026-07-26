@@ -18,6 +18,9 @@ use hdf5::file::LibraryVersion;
 use hdf5_pure::{AttrValue, Error, File};
 use tempfile::tempdir;
 
+mod common;
+use common::assert_c_absent;
+
 /// Create a rank-1 unlimited (Extensible-Array indexed) i32 dataset `name` with the
 /// C library under the latest format, seeded with `0..n`, chunk length `chunk`.
 fn c_create_unlimited(path: &std::path::Path, name: &str, n: i32, chunk: usize) {
@@ -321,7 +324,7 @@ fn combined_mixed_edits_c_readable() {
         .unwrap();
     assert_eq!(checked, 1);
     assert!(c.group("run").is_ok(), "created group missing");
-    assert!(c.group("old").is_err(), "deleted group still present");
+    assert_c_absent(&c.group("old").unwrap_err(), "old");
     c.close().unwrap();
 
     // Pure reader agrees on the grown dataset.
