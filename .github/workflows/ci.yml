@@ -140,6 +140,12 @@ jobs:
   # removing a `pub fn`) fails the job unless the version in Cargo.toml is
   # bumped accordingly (under 0.x, breaking changes require a minor bump).
   #
+  # So a PR that breaks the public API on purpose bumps Cargo.toml to the next
+  # minor as part of the PR, which is this repo's convention regardless (the
+  # manifest carries the version being developed — see "Versioning" in
+  # CLAUDE.md). Red here means the break is either unintended or undeclared;
+  # it is not the expected state of a breaking PR.
+  #
   # `parallel_read`/`lane_partition` are gated behind `parallel`, so the feature
   # set below must enable the public-API-bearing features to see their surface.
   # `fast-deflate` is omitted (a flate2 backend swap, no API delta) along with
