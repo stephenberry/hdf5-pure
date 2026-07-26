@@ -62,6 +62,15 @@ pub enum FormatError {
     InvalidFileSpacePageSize(u64),
     /// A free-space manager block (`FSHD`/`FSSE`) is malformed.
     InvalidFreeSpaceManager,
+    /// An enumeration datatype was built over a base type that is not an
+    /// integer. HDF5 enumerations must have a fixed-point base.
+    EnumBaseNotInteger,
+    /// An enumeration member's value does not occupy exactly the base type's
+    /// size: `(member name, expected bytes, actual bytes)`.
+    EnumMemberValueSize(String, u32, usize),
+    /// An enumeration member's integer value does not fit in the base type:
+    /// `(member name, value, base size in bytes)`.
+    EnumMemberValueRange(String, i64, u32),
     /// A compound datatype has a zero total size.
     InvalidCompoundSize,
     /// A compound datatype contains no fields.
@@ -447,6 +456,26 @@ impl fmt::Display for FormatError {
             }
             FormatError::InvalidFreeSpaceManager => {
                 write!(f, "malformed free-space manager block (FSHD/FSSE)")
+            }
+            FormatError::EnumBaseNotInteger => {
+                write!(
+                    f,
+                    "an enumeration's base type must be an integer (fixed-point) type"
+                )
+            }
+            FormatError::EnumMemberValueSize(name, expected, actual) => {
+                write!(
+                    f,
+                    "enumeration member '{name}' has a {actual}-byte value, but its base type is \
+                     {expected} bytes"
+                )
+            }
+            FormatError::EnumMemberValueRange(name, value, size) => {
+                write!(
+                    f,
+                    "enumeration member '{name}' value {value} does not fit in its \
+                     {size}-byte base type"
+                )
             }
             FormatError::InvalidCompoundSize => {
                 write!(f, "compound datatype size must be greater than zero")

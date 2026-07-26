@@ -22,7 +22,8 @@ fn i32_enum_dataset_preserves_members_and_values() {
         .value("RED", 0)
         .value("GREEN", 1)
         .value("BLUE", 2)
-        .build();
+        .build()
+        .unwrap();
     let file = write_then_open(|b| {
         b.create_dataset("color")
             .with_enum_i32_data(dt, &[0, 1, 2, 1]);
@@ -74,7 +75,8 @@ fn i32_enum_dataset_reads_back_through_base_type() {
         .value("RED", 0)
         .value("GREEN", 1)
         .value("BLUE", 2)
-        .build();
+        .build()
+        .unwrap();
     let file = write_then_open(|b| {
         b.create_dataset("color")
             .with_enum_i32_data(dt, &[0, 1, 2, 1]);
@@ -93,7 +95,8 @@ fn enum_dataset_classifies_as_dtype_enum_of_member_names() {
         .value("RED", 0)
         .value("GREEN", 1)
         .value("BLUE", 2)
-        .build();
+        .build()
+        .unwrap();
     let file = write_then_open(|b| {
         b.create_dataset("color").with_enum_i32_data(dt, &[0, 1, 2]);
     });
@@ -113,7 +116,8 @@ fn u8_enum_dataset_roundtrips() {
     let dt = EnumTypeBuilder::u8_based()
         .u8_value("OFF", 0)
         .u8_value("ON", 1)
-        .build();
+        .build()
+        .unwrap();
     let file = write_then_open(|b| {
         b.create_dataset("switch")
             .with_enum_u8_data(dt, &[0, 1, 1, 0]);
@@ -140,7 +144,8 @@ fn u8_enum_reads_identically_to_a_plain_u8_dataset() {
     let dt = EnumTypeBuilder::u8_based()
         .u8_value("LO", 0)
         .u8_value("HI", 255)
-        .build();
+        .build()
+        .unwrap();
     let file = write_then_open(|b| {
         b.create_dataset("level").with_enum_u8_data(dt, &[0, 255]);
         b.create_dataset("plain").with_u8_data(&[0, 255]);
@@ -162,7 +167,8 @@ fn enum_i32_data_into_u8_enum_type_is_rejected() {
     let u8_enum = EnumTypeBuilder::u8_based()
         .u8_value("OFF", 0)
         .u8_value("ON", 1)
-        .build();
+        .build()
+        .unwrap();
     let mut builder = FileBuilder::new();
     builder
         .create_dataset("bad")
@@ -201,4 +207,131 @@ fn non_enum_reads_are_unaffected_by_the_enum_unwrap() {
         ),
         "reading a vlen-string dataset as i32 should still be a TypeMismatch, got {err:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Enumerations over an arbitrary integer base type (issue #208)
+// ---------------------------------------------------------------------------
+
+/// `with_base` reaches base types the `i32`/`u8` constructors cannot, and
+/// `value` encodes into the base type's width.
+#[test]
+fn enum_over_u16_base_round_trips() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("u16_enum.h5");
+
+    let dt = EnumTypeBuilder::with_base(hdf5_pure::make_u16_type())
+        .value("low", 1)
+        .value("high", 40_000)
+        .build()
+        .unwrap();
+
+    match &dt {
+        Datatype::Enumeration {
+            size,
+            base_type,
+            members,
+        } => {
+            assert_eq!(*size, 2, "element size comes from the base type");
+            assert!(matches!(**base_type, Datatype::FixedPoint { size: 2, .. }));
+            assert_eq!(members[0].value, 1u16.to_le_bytes().to_vec());
+            assert_eq!(members[1].value, 40_000u16.to_le_bytes().to_vec());
+        }
+        other => panic!("expected an Enumeration, got {other:?}"),
+    }
+
+    let mut b = FileBuilder::new();
+    b.create_dataset("e")
+        .with_raw_data(dt, vec![1u8, 0, 0x40, 0x9C], 2)
+        .with_shape(&[2]);
+    b.write(&path).unwrap();
+
+    let file = File::open(&path).unwrap();
+    match file.dataset("e").unwrap().datatype().unwrap() {
+        Datatype::Enumeration { size, members, .. } => {
+            assert_eq!(size, 2);
+            assert_eq!(members.len(), 2);
+            assert_eq!(members[1].name, "high");
+            assert_eq!(members[1].value, 40_000u16.to_le_bytes().to_vec());
+        }
+        other => panic!("expected an Enumeration, got {other:?}"),
+    }
+}
+
+/// `raw_value` carries stored bytes verbatim, for values an `i64` cannot express.
+#[test]
+fn raw_value_carries_bytes_verbatim() {
+    let dt = EnumTypeBuilder::with_base(hdf5_pure::make_u64_type())
+        .raw_value("max", &u64::MAX.to_le_bytes())
+        .build()
+        .unwrap();
+    match &dt {
+        Datatype::Enumeration { members, .. } => {
+            assert_eq!(members[0].value, u64::MAX.to_le_bytes().to_vec());
+        }
+        other => panic!("expected an Enumeration, got {other:?}"),
+    }
+}
+
+#[test]
+fn build_refuses_a_value_too_wide_for_the_base() {
+    let err = EnumTypeBuilder::with_base(hdf5_pure::make_u8_type())
+        .value("too_big", 300)
+        .build()
+        .expect_err("300 does not fit one unsigned byte");
+    assert!(
+        matches!(err, FormatError::EnumMemberValueRange(ref n, 300, 1) if n == "too_big"),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn build_refuses_a_negative_value_for_an_unsigned_base() {
+    let err = EnumTypeBuilder::with_base(hdf5_pure::make_u16_type())
+        .value("negative", -1)
+        .build()
+        .expect_err("an unsigned base cannot hold -1");
+    assert!(
+        matches!(err, FormatError::EnumMemberValueRange(..)),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn build_refuses_raw_bytes_of_the_wrong_width() {
+    let err = EnumTypeBuilder::with_base(hdf5_pure::make_u16_type())
+        .raw_value("three_bytes", &[1, 2, 3])
+        .build()
+        .expect_err("three bytes cannot back a two-byte base");
+    assert!(
+        matches!(err, FormatError::EnumMemberValueSize(ref n, 2, 3) if n == "three_bytes"),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn build_refuses_a_non_integer_base() {
+    let err = EnumTypeBuilder::with_base(hdf5_pure::make_f64_type())
+        .value("x", 1)
+        .build()
+        .expect_err("an enumeration base must be an integer");
+    assert!(
+        matches!(err, FormatError::EnumBaseNotInteger),
+        "got {err:?}"
+    );
+}
+
+/// A signed base keeps negative values, and the i32 path is unchanged.
+#[test]
+fn signed_bases_keep_negative_values() {
+    let dt = EnumTypeBuilder::with_base(hdf5_pure::make_i16_type())
+        .value("neg", -2)
+        .build()
+        .unwrap();
+    match &dt {
+        Datatype::Enumeration { members, .. } => {
+            assert_eq!(members[0].value, (-2i16).to_le_bytes().to_vec());
+        }
+        other => panic!("expected an Enumeration, got {other:?}"),
+    }
 }

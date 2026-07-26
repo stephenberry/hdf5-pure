@@ -63,11 +63,12 @@ pub struct CompoundMember {
 
 /// A member of an enumeration datatype.
 ///
-/// Deliberately *not* sealed, unlike [`CompoundMember`]:
-/// [`EnumTypeBuilder`](crate::EnumTypeBuilder) covers only `i32`- and `u8`-based
-/// enumerations, so a hand-built literal is the only way to describe one over
-/// another base type. Sealing this would remove that with nothing to replace it.
+/// Non-exhaustive: parsed from a datatype message, and
+/// [`EnumTypeBuilder`](crate::EnumTypeBuilder) builds one over any integer base
+/// type (`with_base` plus `raw_value`), so nothing needs to construct this
+/// directly.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct EnumMember {
     /// Member name.
     pub name: String,

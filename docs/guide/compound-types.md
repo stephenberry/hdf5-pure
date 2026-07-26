@@ -114,7 +114,7 @@ Several other structured dataset kinds round out the type system. See the [data 
 | `with_array_data(base_type, array_dims, raw_data, num_elements)` | Fixed-size array elements |
 | `with_path_references(paths)` | Object references, resolved by path |
 
-Enumeration datatypes are constructed with `EnumTypeBuilder`. Use `EnumTypeBuilder::i32_based()` or `EnumTypeBuilder::u8_based()`, add named values with `value(name, val)` or `u8_value(name, val)`, and finish with `build()`:
+Enumeration datatypes are constructed with `EnumTypeBuilder`. Use `EnumTypeBuilder::i32_based()` or `EnumTypeBuilder::u8_based()`, add named values with `value(name, val)` or `u8_value(name, val)`, and finish with `build()`, which returns a `Result` because a member value has to fit its base type:
 
 ```rust
 use hdf5_pure::EnumTypeBuilder;
@@ -123,11 +123,27 @@ let datatype = EnumTypeBuilder::i32_based()
     .value("Red", 0)
     .value("Green", 1)
     .value("Blue", 2)
-    .build();
+    .build()
+    .unwrap();
 
 builder
     .create_dataset("colors")
     .with_enum_i32_data(datatype, &[0, 1, 2, 1]);
+```
+
+For any other integer base type, use `EnumTypeBuilder::with_base(datatype)` — the enumeration's element size comes from the base type, and `value(name, val)` encodes into that width:
+
+```rust
+use hdf5_pure::{EnumTypeBuilder, make_u16_type};
+
+let datatype = EnumTypeBuilder::with_base(make_u16_type())
+    .value("Low", 1)
+    .value("High", 40_000)
+    .build()
+    .unwrap();
+```
+
+`raw_value(name, bytes)` takes a member's raw little-endian bytes instead, for values wider than an `i64` (a `u64` base near its maximum) or to reproduce stored bytes verbatim. `build()` refuses a non-integer base, a value that does not fit the base type, and raw bytes whose length disagrees with it, rather than writing a datatype message the reference C library cannot read.
 ```
 
 For more on the writing entry points used throughout this page, see the [writing guide](writing.md).
