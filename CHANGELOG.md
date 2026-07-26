@@ -25,6 +25,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Removed
 
+- **Breaking:** `Datatype::parse` and `Datatype::serialize` are now crate-internal. Read a dataset's type with `Dataset::datatype` and pass a `Datatype` to `DatasetBuilder::with_dtype`, which encodes it; `Datatype::type_size` stays public ([#206](https://github.com/stephenberry/hdf5-pure/pull/206)).
 - **Breaking:** `FormatError::ChunkedVlenStringUnsupported` is gone, as nothing refuses those datasets any more ([#109](https://github.com/stephenberry/hdf5-pure/issues/109)).
 - **Breaking:** `AppendWriter`, `SwmrWriter`, and `EditSession`, deprecated since 0.22.0, are gone. Use `File::open_rw` (or `File::open_swmr_writer`) with owned `Dataset` and `Group` handles; `File::open_rw_with_locking` replaces `AppendWriter::open_with_locking` and `File::clear_swmr_flag` replaces `SwmrWriter::clear_swmr_flag`. The former `EditSession` methods map to `Dataset::append`/`append_staged`/`write`/`write_staged`/`set_attr`/`remove_attr`, `Group::create_group`/`create_dataset`/`delete`/`set_attr`, and `File::copy`/`copy_from`/`space_accounting`, with an object staged in an uncommitted batch reachable only through `create_group_with` ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)).
 

@@ -235,7 +235,10 @@ impl Datatype {
     /// Parse a datatype message from raw bytes.
     ///
     /// Returns `(Datatype, bytes_consumed)` for recursive parsing.
-    pub fn parse(data: &[u8]) -> Result<(Datatype, usize), FormatError> {
+    ///
+    /// Crate-internal: no public API hands out datatype-message bytes to feed it.
+    /// Read a dataset's type with [`Dataset::datatype`](crate::Dataset::datatype).
+    pub(crate) fn parse(data: &[u8]) -> Result<(Datatype, usize), FormatError> {
         // Minimum header: 4 bytes (class_and_version + 3 bytes bit field) + 4 bytes size = 8
         ensure_len(data, 0, 8)?;
 
@@ -588,7 +591,12 @@ impl Datatype {
     }
 
     /// Serialize datatype to HDF5 message bytes.
-    pub fn serialize(&self) -> Vec<u8> {
+    ///
+    /// Crate-internal: hand a `Datatype` to
+    /// [`DatasetBuilder::with_dtype`](crate::DatasetBuilder::with_dtype) and the
+    /// writer encodes it. Widening this again is additive if a caller ever needs
+    /// the raw encoding.
+    pub(crate) fn serialize(&self) -> Vec<u8> {
         match self {
             Datatype::FixedPoint {
                 size,
