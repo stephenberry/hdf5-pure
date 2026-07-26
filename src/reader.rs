@@ -19,6 +19,7 @@ use crate::data_read;
 use crate::dataspace::Dataspace;
 use crate::datatype::{Datatype, ReferenceType};
 use crate::error::{Error, FormatError};
+use crate::file_create_options::FileCreateOptions;
 use crate::file_lock::FileLocking;
 use crate::file_space_info::{FileSpaceInfo, FileSpaceStrategy};
 use crate::filter_pipeline::FilterPipeline;
@@ -139,16 +140,31 @@ impl<S: Source + ?Sized> Source for BaseOffsetSource<'_, S> {
 
 /// File-access options applied when opening an HDF5 file.
 ///
-/// This is the `hdf5-pure` analogue of the HDF5 file access property list
-/// settings relevant to read-time memory usage. The metadata cache only affects
-/// streaming opens; in-memory opens already have the whole file in one buffer.
-/// The chunk cache is the file-wide default corresponding to HDF5
-/// `H5Pset_cache`'s raw-data chunk-cache settings and applies to datasets
-/// opened from either backend.
+/// This is the `hdf5-pure` analogue of an HDF5 **file access property list**
+/// (`fapl`): one value carrying every access-time setting, built once and passed
+/// to whichever open a caller reaches for, exactly as a `fapl` is handed to
+/// `H5Fopen`. Every `*_with_options` constructor on [`File`] accepts it, so a
+/// read path and a read-write path can share one configuration.
+///
+/// - The metadata cache (`H5Pset_mdc_config`) applies to the streaming and
+///   bounded backends; an in-memory open already holds the whole file in one
+///   buffer.
+/// - The chunk cache (`H5Pset_cache`) is the file-wide default for datasets
+///   opened from any backend, overridable per dataset with
+///   [`DatasetAccessOptions`].
+/// - The locking policy (`H5Pset_file_locking`) applies to the read-write opens.
+///   Readers and the SWMR writer take no lock by design, so they ignore it.
+///
+/// See the [property-support reference] for the full property-by-property map.
+///
+/// [property-support reference]: https://github.com/stephenberry/hdf5-pure/blob/main/docs/reference/property-support.md
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[doc(alias = "fapl")]
+#[doc(alias = "H5Pset_fapl")]
 pub struct FileAccessOptions {
     metadata_cache: MetadataCacheConfig,
     chunk_cache: ChunkCacheConfig,
+    locking: FileLocking,
 }
 
 impl FileAccessOptions {
@@ -157,10 +173,12 @@ impl FileAccessOptions {
         Self {
             metadata_cache: MetadataCacheConfig::disabled(),
             chunk_cache: ChunkCacheConfig::new(),
+            locking: FileLocking::Enabled,
         }
     }
 
     /// Configure the bounded streaming metadata cache.
+    #[doc(alias = "H5Pset_mdc_config")]
     pub const fn with_metadata_cache(mut self, metadata_cache: MetadataCacheConfig) -> Self {
         self.metadata_cache = metadata_cache;
         self
@@ -168,8 +186,25 @@ impl FileAccessOptions {
 
     /// Configure the per-dataset raw chunk cache used by datasets opened from
     /// this file. This is the `H5Pset_cache`-style file-wide default.
+    #[doc(alias = "H5Pset_cache")]
     pub const fn with_chunk_cache(mut self, chunk_cache: ChunkCacheConfig) -> Self {
         self.chunk_cache = chunk_cache;
+        self
+    }
+
+    /// Set the OS advisory file-locking policy for the read-write opens.
+    ///
+    /// Defaults to [`FileLocking::Enabled`]. Use [`FileLocking::Disabled`] only
+    /// when an external mechanism already guarantees single-writer access, or
+    /// [`FileLocking::BestEffort`] on a filesystem (such as some network mounts)
+    /// where the OS lock is unavailable. Setting `HDF5_USE_FILE_LOCKING` in the
+    /// environment overrides this, as in the C library.
+    ///
+    /// Readers and [`File::open_swmr_writer`] take no lock by design and ignore
+    /// this.
+    #[doc(alias = "H5Pset_file_locking")]
+    pub const fn with_locking(mut self, locking: FileLocking) -> Self {
+        self.locking = locking;
         self
     }
 
@@ -181,6 +216,11 @@ impl FileAccessOptions {
     /// Return the configured per-dataset chunk cache.
     pub const fn chunk_cache(&self) -> ChunkCacheConfig {
         self.chunk_cache
+    }
+
+    /// Return the configured file-locking policy.
+    pub const fn locking(&self) -> FileLocking {
+        self.locking
     }
 }
 
@@ -443,35 +483,37 @@ impl FileInner {
         ))
     }
 
-    /// Open an existing HDF5 file for reading **and** in-place editing, taking an
-    /// exclusive OS file lock held for the file's life.
-    fn open_rw<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
-        Self::from_rw_session(WriteEngine::open(path)?)
-    }
-
-    /// Like [`open_rw`](Self::open_rw), but with an explicit file-locking policy.
-    fn open_rw_with_locking<P: AsRef<std::path::Path>>(
+    /// Open an existing HDF5 file for reading **and** in-place editing, applying
+    /// `options` (its [`FileLocking`] policy governs the OS file lock held for
+    /// the file's life, and its chunk cache is the file-wide default).
+    fn open_rw<P: AsRef<std::path::Path>>(
         path: P,
-        locking: FileLocking,
+        options: FileAccessOptions,
     ) -> Result<Self, Error> {
-        Self::from_rw_session(WriteEngine::open_with_locking(path, locking)?)
+        Self::from_rw_session(
+            WriteEngine::open_with_locking(path, options.locking)?,
+            options,
+        )
     }
 
     /// Wrap an opened [`WriteEngine`] as a read-write [`Backend::Mirror`] file.
-    fn from_rw_session(session: WriteEngine) -> Result<Self, Error> {
+    fn from_rw_session(session: WriteEngine, options: FileAccessOptions) -> Result<Self, Error> {
         let (superblock, addr_offset) = Self::parse_superblock(session.mirror_bytes())?;
         Ok(Self::from_parts(
             Backend::Mirror(Box::new(Mutex::new(session))),
             superblock,
             addr_offset,
             None,
-            FileAccessOptions::new(),
+            options,
         ))
     }
 
     /// Open for SWMR writing: no OS lock, superblock SWMR-write flag raised.
-    fn open_swmr_writer<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
-        let mut inner = Self::from_rw_session(WriteEngine::open_swmr_writer(path)?)?;
+    fn open_swmr_writer<P: AsRef<std::path::Path>>(
+        path: P,
+        options: FileAccessOptions,
+    ) -> Result<Self, Error> {
+        let mut inner = Self::from_rw_session(WriteEngine::open_swmr_writer(path)?, options)?;
         inner.swmr_write = true;
         Ok(inner)
     }
@@ -482,7 +524,7 @@ impl FileInner {
         path: P,
         options: FileAccessOptions,
     ) -> Result<Self, Error> {
-        let engine = BoundedEngine::open(path.as_ref(), options.metadata_cache)?;
+        let engine = BoundedEngine::open(path.as_ref(), options.metadata_cache, options.locking)?;
         // A bounded file's base address is validated to be 0 at open, so the
         // store's as-parsed superblock is already in the reader's normalized
         // (absolute-root) form.
@@ -1485,28 +1527,25 @@ impl File {
     /// latest-format (version-2/3) file with no userblock and an
     /// Extensible-Array-indexed dataset; [`Dataset::append_staged`] covers the
     /// general case.
+    #[doc(alias = "H5Fopen")]
     pub fn open_rw<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
-        Ok(File {
-            inner: Arc::new(FileInner::open_rw(path)?),
-        })
+        Self::open_rw_with_options(path, FileAccessOptions::new())
     }
 
-    /// Open an existing file for reading and in-place editing with an explicit
-    /// file-locking policy — the owned-handle counterpart of HDF5's
-    /// `H5Pset_file_locking`.
+    /// Open an existing file for reading and in-place editing with explicit
+    /// access options — see [`open_rw`](Self::open_rw).
     ///
-    /// [`open_rw`](Self::open_rw) takes an exclusive OS lock for the file's life;
-    /// use this with [`FileLocking::Disabled`](crate::FileLocking) only when an
-    /// external mechanism already guarantees single-writer access, or on a
-    /// filesystem (such as some network mounts) where the OS lock is
-    /// unavailable. Setting `HDF5_USE_FILE_LOCKING` in the environment overrides
-    /// the requested policy, as in the C library.
-    pub fn open_rw_with_locking<P: AsRef<std::path::Path>>(
+    /// The options carry the locking policy (the `H5Pset_file_locking` analogue,
+    /// [`FileAccessOptions::with_locking`]) and the file-wide chunk-cache default
+    /// applied to datasets opened from this file. Because one
+    /// [`FileAccessOptions`] value serves every open, the same configuration can
+    /// be shared with a read path.
+    pub fn open_rw_with_options<P: AsRef<std::path::Path>>(
         path: P,
-        locking: FileLocking,
+        options: FileAccessOptions,
     ) -> Result<Self, Error> {
         Ok(File {
-            inner: Arc::new(FileInner::open_rw_with_locking(path, locking)?),
+            inner: Arc::new(FileInner::open_rw(path, options)?),
         })
     }
 
@@ -1530,9 +1569,23 @@ impl File {
     /// Requires a latest-format (version-2/3 superblock) file with no userblock
     /// and no persisted free-space; other files are refused with
     /// [`Error::SwmrAppendUnsupported`](crate::Error::SwmrAppendUnsupported).
+    #[doc(alias = "H5F_ACC_SWMR_WRITE")]
     pub fn open_swmr_writer<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
+        Self::open_swmr_writer_with_options(path, FileAccessOptions::new())
+    }
+
+    /// Open for SWMR appending with explicit access options — see
+    /// [`open_swmr_writer`](Self::open_swmr_writer).
+    ///
+    /// The options' chunk cache is the file-wide default for datasets opened from
+    /// this file. Its locking policy is ignored: SWMR takes no OS lock by design,
+    /// so concurrent readers are never blocked.
+    pub fn open_swmr_writer_with_options<P: AsRef<std::path::Path>>(
+        path: P,
+        options: FileAccessOptions,
+    ) -> Result<Self, Error> {
         Ok(File {
-            inner: Arc::new(FileInner::open_swmr_writer(path)?),
+            inner: Arc::new(FileInner::open_swmr_writer(path, options)?),
         })
     }
 
@@ -1611,10 +1664,35 @@ impl File {
     ///
     /// Overwrites any existing file at `path`. For an all-at-once write, use
     /// [`FileBuilder`](crate::FileBuilder) instead.
+    #[doc(alias = "H5Fcreate")]
     pub fn create<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
-        let bytes = crate::writer::FileBuilder::new().finish()?;
+        Self::create_with_options(path, FileCreateOptions::new(), FileAccessOptions::new())
+    }
+
+    /// Create a new, empty HDF5 file with explicit creation and access options,
+    /// then open it for reading and writing — see [`create`](Self::create).
+    ///
+    /// Mirrors `H5Fcreate(name, flags, fcpl_id, fapl_id)`: `create` carries the
+    /// creation properties recorded in the new file (userblock, file-space
+    /// strategy, library-version bounds), and `access` the properties governing
+    /// the handle returned (locking policy, chunk cache). Both are values, so a
+    /// layout defined once can be reused across every file an application writes.
+    ///
+    /// A creation property is validated as the file is written, so an invalid
+    /// userblock or page size surfaces here rather than when the options were
+    /// built. Note that a file created with [`FileSpaceStrategy::Page`] must be
+    /// grown through [`open_rw_bounded`](Self::open_rw_bounded): the staged-commit
+    /// path does not yet allocate page-aligned (issue #198).
+    pub fn create_with_options<P: AsRef<std::path::Path>>(
+        path: P,
+        create: FileCreateOptions,
+        access: FileAccessOptions,
+    ) -> Result<Self, Error> {
+        let mut builder = crate::writer::FileBuilder::new();
+        builder.with_create_options(create);
+        let bytes = builder.finish()?;
         std::fs::write(path.as_ref(), bytes).map_err(Error::Io)?;
-        Self::open_rw(path)
+        Self::open_rw_with_options(path, access)
     }
 
     /// Apply all staged structural edits made through this file's handles —
