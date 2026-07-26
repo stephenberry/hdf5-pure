@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- Dense attribute storage writes an attribute of any size: one too large to be a managed fractal-heap object becomes a *huge* object, indexed by a huge-objects B-tree, instead of being refused. Attribute names, datatypes, and dataspaces are still bounded by the 2-byte fields the attribute message encodes them in ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
+
+### Removed
+
+- **Breaking:** `FormatError::DenseAttributeTooLarge` is gone, as no attribute size is refused any more. `FormatError::AttributeFieldTooLong` replaces it for an attribute name, datatype, or dataspace past what the message can describe ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
+
 ## [0.25.0] - 2026-07-26
 
 An API-consolidation release. File properties are now reusable values rather than scattered function variants: one `FileAccessOptions` (the `fapl` analogue) carries cache budgets and the locking policy to every open, and the new `FileCreateOptions` (the `fcpl` analogue) lets a file layout be defined once and applied to any write, including through `File::create_with_options`. Two long-standing gaps fell out of that work — the read-write mirror backend was silently discarding access options, and the bounded backend always locked regardless of policy. Public types the HDF5 format will keep growing are now `#[non_exhaustive]`, so a future datatype class, reference kind, or MATLAB class is an additive change instead of a breaking one, and a test guards each seal against silent removal. Enumerations can finally be built over any integer base type. Two defects from 0.24.0 are fixed: `repack` corrupting a dataset whose datatype contains a variable-length or reference member, and a hang when reading a file from inside a builder closure. The release carries a number of breaking changes, all listed below; most are one-line call-site edits.

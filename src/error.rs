@@ -346,22 +346,22 @@ pub enum FormatError {
         /// The message's serialized size in bytes.
         size: usize,
     },
-    /// An attribute is too large to store in dense (fractal-heap) attribute
-    /// storage: past this size the format wants a fractal-heap *huge* object,
-    /// which this writer does not emit, so storing it as a managed object would
-    /// produce a heap the reference C library rejects. Refused rather than
-    /// written. The fields carry the attribute name, its serialized size, and
-    /// the limit, all in bytes.
+    /// An attribute's name, datatype or dataspace is longer than the attribute
+    /// message can describe: each of the three has a 2-byte length field, so a
+    /// longer one would truncate and produce a message that decodes as something
+    /// else. Refused rather than written.
     ///
-    /// Dense storage is chosen by attribute count, so the same attribute may
-    /// instead be refused as [`FormatError::AttributeMessageTooLarge`] when it
-    /// sits on an object with few enough attributes to be stored compactly.
-    DenseAttributeTooLarge {
+    /// This bounds the attribute's *description*, not its data. An attribute
+    /// whose data is arbitrarily large is written to dense storage as a
+    /// fractal-heap huge object.
+    AttributeFieldTooLong {
         /// The attribute's name.
         name: String,
-        /// The attribute's serialized size in bytes.
+        /// Which field is too long: `"name"`, `"datatype"` or `"dataspace"`.
+        field: &'static str,
+        /// That field's encoded length in bytes.
         size: usize,
-        /// The largest attribute dense storage can hold, in bytes.
+        /// The largest length the message can describe, in bytes.
         limit: usize,
     },
     /// An object carries more attributes than dense (fractal-heap) storage can
@@ -370,6 +370,16 @@ pub enum FormatError {
     /// library cannot describe that capacity in the bytes it allots for it.
     TooManyDenseAttributes {
         /// The number of attributes requested.
+        count: usize,
+        /// The largest number that can be indexed.
+        limit: usize,
+    },
+    /// An object carries more attributes needing fractal-heap *huge* storage than
+    /// one huge-objects B-tree leaf can index. Same single-leaf constraint as
+    /// [`FormatError::TooManyDenseAttributes`], reached sooner because a huge
+    /// record is wider than a name-index record.
+    TooManyHugeDenseAttributes {
+        /// The number of attributes large enough to need huge storage.
         count: usize,
         /// The largest number that can be indexed.
         limit: usize,
@@ -754,11 +764,16 @@ impl fmt::Display for FormatError {
                      message size field"
                 )
             }
-            FormatError::DenseAttributeTooLarge { name, size, limit } => {
+            FormatError::AttributeFieldTooLong {
+                name,
+                field,
+                size,
+                limit,
+            } => {
                 write!(
                     f,
-                    "attribute {name:?} serializes to {size} bytes, past the {limit}-byte limit \
-                     for dense (fractal-heap) attribute storage"
+                    "attribute {name:?} has a {size}-byte {field}, past the {limit}-byte limit of \
+                     the attribute message's {field} size field"
                 )
             }
             FormatError::TooManyDenseAttributes { count, limit } => {
@@ -766,6 +781,13 @@ impl fmt::Display for FormatError {
                     f,
                     "{count} attributes exceed the {limit} that dense (fractal-heap) storage \
                      can index"
+                )
+            }
+            FormatError::TooManyHugeDenseAttributes { count, limit } => {
+                write!(
+                    f,
+                    "{count} attributes need fractal-heap huge storage, past the {limit} that one \
+                     huge-objects B-tree can index"
                 )
             }
             FormatError::DenseAttributeHeapTooLarge { block_size, limit } => {
