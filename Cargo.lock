@@ -417,9 +417,9 @@ dependencies = [
 
 [[package]]
 name = "hdf5-metno-src"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5284a978be0edc848d21e7e3e903dbb0cab29267f63784f27997ed0628cd8289"
+checksum = "3e8dfed88a20aca1e594f0e2e2f2c9115e0812ba20bbea1ef7c99e0142dc84b9"
 dependencies = [
  "cmake",
  "libz-sys",
