@@ -13,6 +13,9 @@ use hdf5::file::LibraryVersion;
 use hdf5_pure::{File, FileBuilder};
 use tempfile::tempdir;
 
+mod common;
+use common::assert_c_absent;
+
 const UB: u64 = 512;
 
 /// Create a userblock file with the reference C library. The closure adds
@@ -428,8 +431,8 @@ fn userblock_delete_then_reuse_read_by_c_library() {
         c.dataset("keep").unwrap().read_raw::<f64>().unwrap(),
         vec![10.0, 20.0, 30.0]
     );
-    assert!(c.dataset("doomed").is_err());
-    assert!(c.dataset("c").is_err());
+    assert_c_absent(&c.dataset("doomed").unwrap_err(), "doomed");
+    assert_c_absent(&c.dataset("c").unwrap_err(), "c");
 }
 
 #[test]

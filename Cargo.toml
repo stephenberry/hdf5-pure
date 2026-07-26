@@ -79,7 +79,7 @@ criterion = { version = "0.5", default-features = false }
 # crosscheck test files carry
 # the matching `#![cfg(not(target_pointer_width = "32"))]` gate.
 [target.'cfg(not(target_pointer_width = "32"))'.dev-dependencies]
-hdf5 = { package = "hdf5-metno", version = "0.12", features = ["static", "zlib"] }
+hdf5 = { package = "hdf5-metno", version = "0.14", features = ["static", "zlib"] }
 
 [[example]]
 name = "matlab_fixtures"

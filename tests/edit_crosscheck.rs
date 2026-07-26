@@ -19,6 +19,9 @@ use hdf5::file::LibraryVersion;
 use hdf5_pure::{AttrValue, File, FileBuilder, ScaleOffset};
 use tempfile::tempdir;
 
+mod common;
+use common::assert_c_absent;
+
 /// Stage an add, an add-into-a-group, a delete, and a copy — the full op set.
 fn stage_edits(session: &File) {
     session
@@ -85,10 +88,7 @@ fn assert_edits_applied(path: &std::path::Path) {
         c.dataset("grp/gamma").unwrap().read_raw::<i32>().unwrap(),
         vec![1, 2, 3]
     );
-    assert!(
-        c.dataset("doomed").is_err(),
-        "deleted dataset still present (C library)"
-    );
+    assert_c_absent(&c.dataset("doomed").unwrap_err(), "doomed");
 }
 
 /// Write the starter file (two root datasets + a group with a dataset) with the
@@ -308,7 +308,7 @@ fn c_v0_symboltable_file_edited_then_read_by_c_library() {
         c.dataset("grp/gamma").unwrap().read_raw::<i32>().unwrap(),
         vec![1, 2, 3]
     );
-    assert!(c.dataset("doomed").is_err());
+    assert_c_absent(&c.dataset("doomed").unwrap_err(), "doomed");
 }
 
 #[test]
@@ -402,10 +402,7 @@ fn c_library_reads_group_attributes_edited_in_place() {
     let added: i64 = grp.attr("added").unwrap().read_scalar().unwrap();
     assert_eq!(count, 2);
     assert_eq!(added, 3);
-    assert!(
-        grp.attr("drop").is_err(),
-        "removed group attribute still present"
-    );
+    assert_c_absent(&grp.attr("drop").unwrap_err(), "grp/@drop");
     let tag: i64 = c
         .group("new_grp")
         .unwrap()
@@ -455,10 +452,7 @@ fn free_space_reuse_and_truncation_stay_c_readable() {
 
     // The reference C library reads the shrunken file and the survivors intact.
     let c = hdf5::File::open(&path).unwrap();
-    assert!(
-        c.dataset("bulk").is_err(),
-        "deleted dataset still present (C)"
-    );
+    assert_c_absent(&c.dataset("bulk").unwrap_err(), "bulk");
     assert_eq!(
         c.dataset("alpha").unwrap().read_raw::<f64>().unwrap(),
         vec![1.0, 2.0, 3.0]
@@ -683,10 +677,7 @@ fn deleting_chunked_datasets_in_place_stays_c_readable() {
 
     // The reference C library reads the reclaimed file too.
     let c = hdf5::File::open(&path).unwrap();
-    assert!(
-        c.dataset("c_chunked").is_err(),
-        "deleted chunked dataset still present (C)"
-    );
+    assert_c_absent(&c.dataset("c_chunked").unwrap_err(), "c_chunked");
     assert_eq!(
         c.dataset("keep").unwrap().read_raw::<f64>().unwrap(),
         vec![1.0, 2.0, 3.0]
@@ -1091,7 +1082,7 @@ fn deleting_one_of_several_hard_links_keeps_the_survivor() {
     );
 
     let c = hdf5::File::open(&path).unwrap();
-    assert!(c.dataset("chunked_orig").is_err());
+    assert_c_absent(&c.dataset("chunked_orig").unwrap_err(), "chunked_orig");
     assert_eq!(
         c.dataset("chunked_alias")
             .unwrap()

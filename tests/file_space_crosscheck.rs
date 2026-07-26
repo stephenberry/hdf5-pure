@@ -12,6 +12,9 @@ use hdf5_pure::{File, FileBuilder, FileSpaceStrategy};
 use std::sync::{Mutex, MutexGuard};
 use tempfile::tempdir;
 
+mod common;
+use common::assert_c_absent;
+
 // The reference free-space query, resolved at link time from the statically
 // linked libhdf5. Returns the total free space the C library tracks for the open
 // file, which it can only report by loading and parsing the on-disk
@@ -200,7 +203,7 @@ fn c_library_reads_our_persisted_free_space() {
         f.dataset("c").unwrap().read_raw::<i32>().unwrap(),
         vec![3; 100]
     );
-    assert!(f.dataset("big").is_err(), "the deleted dataset is gone");
+    assert_c_absent(&f.dataset("big").unwrap_err(), "big");
 
     // Loading the managers requires parsing our FSHD/FSSE blocks; the C library
     // reports at least the freed dataset's storage as free space.
