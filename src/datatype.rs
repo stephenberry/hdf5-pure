@@ -34,14 +34,22 @@ pub enum CharacterSet {
 }
 
 /// Reference type.
+///
+/// Non-exhaustive: the format has gained reference kinds since (HDF5 1.12 added
+/// attribute references), so match with a `_` arm.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum ReferenceType {
     Object,
     DatasetRegion,
 }
 
 /// A member of a compound datatype.
+///
+/// Non-exhaustive: parsed from a datatype message, never constructed by a
+/// caller. Build a compound with [`CompoundTypeBuilder`](crate::CompoundTypeBuilder).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct CompoundMember {
     /// Member name.
     pub name: String,
@@ -52,7 +60,11 @@ pub struct CompoundMember {
 }
 
 /// A member of an enumeration datatype.
+///
+/// Non-exhaustive: parsed from a datatype message, never constructed by a
+/// caller. Build an enumeration with [`EnumTypeBuilder`](crate::EnumTypeBuilder).
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct EnumMember {
     /// Member name.
     pub name: String,
@@ -61,7 +73,13 @@ pub struct EnumMember {
 }
 
 /// Parsed HDF5 datatype.
+///
+/// Non-exhaustive: the format's class set is not closed (HDF5 1.14.6 added a
+/// complex-number class), so match with a `_` arm. The variants themselves stay
+/// open, so an exotic type this crate has no constructor for can still be built
+/// as a literal.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Datatype {
     /// Class 0: Fixed-point (integer) types.
     FixedPoint {

@@ -112,14 +112,15 @@ use crate::vl_data::{
 use crate::writer::FileBuilder;
 
 /// Options controlling a [`repack`].
+///
+/// Built with [`new`](Self::new) and [`drop_path`](Self::drop_path); the fields
+/// are private so a future option is an additive change.
 #[derive(Debug, Default, Clone)]
+#[non_exhaustive]
 pub struct RepackOptions {
-    /// Full paths of objects to omit from the output (e.g. `"grp/old"` or
-    /// `"/grp/old"`; leading and trailing slashes are ignored). Dropping a group
-    /// drops its whole subtree. Every listed path must exist in the source, or
-    /// the repack fails — a no-op drop is treated as a mistake rather than
-    /// silently ignored.
-    pub drop: Vec<String>,
+    /// Full paths of objects to omit from the output. See
+    /// [`drop_path`](Self::drop_path).
+    drop: Vec<String>,
 }
 
 impl RepackOptions {
@@ -128,16 +129,25 @@ impl RepackOptions {
         Self::default()
     }
 
-    /// Add a path to omit from the output. Chainable.
+    /// Omit the object at `path` from the output (e.g. `"grp/old"` or
+    /// `"/grp/old"`; leading and trailing slashes are ignored). Dropping a group
+    /// drops its whole subtree. Every listed path must exist in the source, or
+    /// the repack fails — a no-op drop is treated as a mistake rather than
+    /// silently ignored. Chainable.
     pub fn drop_path(mut self, path: &str) -> Self {
         self.drop.push(path.to_string());
         self
+    }
+
+    /// The paths this repack will omit, in the order they were added.
+    pub fn drop_paths(&self) -> &[String] {
+        &self.drop
     }
 }
 
 /// Repack `src` into a new file at `dst`, applying `options`.
 ///
-/// Reads every object of `src` not excluded by [`RepackOptions::drop`] and
+/// Reads every object of `src` not excluded by [`RepackOptions::drop_path`] and
 /// writes them into a fresh, compact file at `dst`. On success `dst` is a normal
 /// HDF5 file holding exactly the surviving objects with no dead space.
 ///
