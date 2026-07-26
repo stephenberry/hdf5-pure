@@ -4,7 +4,8 @@
 #
 # Automates the mechanical, easy-to-botch parts of a release so they come out
 # identical every time:
-#   * bump the version in Cargo.toml and Cargo.lock
+#   * bump the version in Cargo.toml and Cargo.lock, or accept one a breaking
+#     PR already bumped (see "Versioning" in CLAUDE.md)
 #   * promote the CHANGELOG's [Unreleased] section into a dated `## [X.Y.Z]`
 #     section and refresh the two compare links at the bottom
 #   * verify the crate still packages (`cargo publish --dry-run`)
@@ -45,7 +46,9 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 note() { printf '\033[1m==>\033[0m %s\n' "$*"; }
 
 usage() {
-  sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'
+  # The leading comment block, minus the shebang and the `#` markers. Ends at
+  # the first line that is not a comment, so it stays correct as the block grows.
+  awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"
   exit "${1:-0}"
 }
 
@@ -89,14 +92,28 @@ REPO_URL="$(awk -F'"' '/^repository = /{print $2; exit}' "$CARGO_TOML")"
 [ -n "$CUR_VERSION" ] || die "could not read current version from $CARGO_TOML"
 [ -n "$REPO_URL" ] || die "could not read repository URL from $CARGO_TOML"
 
+# The version this release follows comes from the latest version tag, not from
+# Cargo.toml. Under this repo's convention (see "Versioning" in CLAUDE.md) the
+# manifest carries the version being *developed*, so once a breaking PR has
+# merged it already reads $NEW_VERSION and is no longer the previous release.
+PREV_VERSION="$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1 | sed 's/^v//')"
+[ -n "$PREV_VERSION" ] || PREV_VERSION="$CUR_VERSION"
+
 # ---------------------------------------------------------------------------
 # Preflight
 # ---------------------------------------------------------------------------
-note "Releasing ${CUR_VERSION} -> ${NEW_VERSION}"
+note "Releasing ${PREV_VERSION} -> ${NEW_VERSION}"
 
 printf '%s\n' "$NEW_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
   || die "version must be X.Y.Z (got '$NEW_VERSION')"
-[ "$NEW_VERSION" != "$CUR_VERSION" ] || die "version is already $NEW_VERSION"
+
+# Cargo.toml may legitimately read either the last release (nothing breaking has
+# merged this cycle) or the version being released (something has). Anything
+# else means the manifest and the requested version disagree about what is
+# being cut, which is a mistake worth stopping on rather than overwriting.
+if [ "$CUR_VERSION" != "$NEW_VERSION" ] && [ "$CUR_VERSION" != "$PREV_VERSION" ]; then
+  die "$CARGO_TOML reads $CUR_VERSION, which is neither the last release ($PREV_VERSION) nor $NEW_VERSION"
+fi
 
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 [ "$BRANCH" = "main" ] || die "not on main (on '$BRANCH'); release from main"
@@ -145,9 +162,13 @@ bump_version() {
   ' "$file" > "$tmp"
   mv "$tmp" "$file"
 }
-note "Bumping version in $CARGO_TOML and $CARGO_LOCK"
-bump_version "$CARGO_TOML"
-bump_version "$CARGO_LOCK"
+if [ "$CUR_VERSION" = "$NEW_VERSION" ]; then
+  note "Version already reads $NEW_VERSION (bumped by the PR that required it)"
+else
+  note "Bumping version in $CARGO_TOML and $CARGO_LOCK"
+  bump_version "$CARGO_TOML"
+  bump_version "$CARGO_LOCK"
+fi
 
 # ---------------------------------------------------------------------------
 # 2. Promote [Unreleased] into a dated section and refresh the compare links
@@ -155,7 +176,7 @@ bump_version "$CARGO_LOCK"
 note "Updating $CHANGELOG"
 CL_TMP="$(mktemp)"
 SUMMARY="$SUMMARY" awk \
-  -v new="$NEW_VERSION" -v prev="$CUR_VERSION" -v date="$TODAY" -v repo="$REPO_URL" '
+  -v new="$NEW_VERSION" -v prev="$PREV_VERSION" -v date="$TODAY" -v repo="$REPO_URL" '
   # Insert the new version header + summary as the first content under
   # [Unreleased] (i.e. before the first non-blank line that follows it).
   /^## \[Unreleased\]/ { print; seen=1; next }
@@ -232,7 +253,7 @@ if [ "$DO_GH" -eq 1 ]; then
     grab && /^## \[/ { exit }                        # stop at the next version header
     grab { print }
   ' "$CHANGELOG" > "$NOTES_TMP"
-  printf '\n**Full changelog:** %s/compare/v%s...v%s\n' "$REPO_URL" "$CUR_VERSION" "$NEW_VERSION" >> "$NOTES_TMP"
+  printf '\n**Full changelog:** %s/compare/v%s...v%s\n' "$REPO_URL" "$PREV_VERSION" "$NEW_VERSION" >> "$NOTES_TMP"
   gh release create "$TAG" --title "$TAG" --notes-file "$NOTES_TMP"
   rm -f "$NOTES_TMP"
 fi
