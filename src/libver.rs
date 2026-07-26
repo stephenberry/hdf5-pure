@@ -16,7 +16,12 @@
 /// Variants are ordered oldest to newest; a later variant understands strictly
 /// more of the format than an earlier one. `LibVer` derives `Ord` on that
 /// ordering, so bounds can be compared directly.
+///
+/// Non-exhaustive: the reference library keeps adding boundaries as the format
+/// grows, so match with a `_` arm and read the newest this crate knows about
+/// from [`LATEST`](Self::LATEST).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum LibVer {
     /// The earliest format (HDF5 1.0+): version 0/1 superblock, v1
     /// symbol-table groups. Readable by every released HDF5 library.

@@ -354,7 +354,7 @@ fn userblock_add_reference_dataset_roundtrip() {
             vec![1.0, 2.0, 3.0, 4.0],
             "reference should resolve to `alpha`'s original contents"
         ),
-        Object::Group(_) => panic!("expected a dataset reference"),
+        other => panic!("expected a dataset reference, got {other:?}"),
     }
     assert_eq!(&std::fs::read(&path).unwrap()[..UB], &userblock[..]);
 

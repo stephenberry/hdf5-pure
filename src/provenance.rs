@@ -79,7 +79,10 @@ impl Provenance {
 /// Returned by [`Dataset::verify_provenance`](crate::Dataset::verify_provenance).
 /// `NoHash` is kept distinct from `Mismatch` so a dataset that was simply never
 /// written with provenance is not reported as corrupt.
+/// Non-exhaustive: a future check can report an outcome that is neither a match,
+/// a mismatch, nor a missing hash, so match with a `_` arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum VerifyResult {
     /// The recomputed hash matches the stored `_provenance_sha256` attribute.
     Ok,

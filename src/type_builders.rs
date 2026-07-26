@@ -914,7 +914,12 @@ pub(crate) fn simple_1d(n: u64) -> Dataspace {
 // ---- Attribute values ----
 
 /// Convenient attribute values for the write API.
+///
+/// Non-exhaustive: variants are added as this crate supports more attribute
+/// datatypes, so match a read-back value with a `_` arm. Constructing the
+/// variants below is unaffected.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum AttrValue {
     F64(f64),
     F64Array(Vec<f64>),

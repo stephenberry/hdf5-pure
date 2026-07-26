@@ -34,14 +34,24 @@ pub enum CharacterSet {
 }
 
 /// Reference type.
+///
+/// Non-exhaustive: the format has gained reference kinds since (HDF5 1.12 added
+/// attribute references), so match with a `_` arm.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum ReferenceType {
     Object,
     DatasetRegion,
 }
 
 /// A member of a compound datatype.
+///
+/// Non-exhaustive: parsed from a datatype message, and
+/// [`CompoundTypeBuilder`](crate::CompoundTypeBuilder) builds one over an
+/// arbitrary offset and member datatype, so nothing needs to construct this
+/// directly.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct CompoundMember {
     /// Member name.
     pub name: String,
@@ -52,6 +62,11 @@ pub struct CompoundMember {
 }
 
 /// A member of an enumeration datatype.
+///
+/// Deliberately *not* sealed, unlike [`CompoundMember`]:
+/// [`EnumTypeBuilder`](crate::EnumTypeBuilder) covers only `i32`- and `u8`-based
+/// enumerations, so a hand-built literal is the only way to describe one over
+/// another base type. Sealing this would remove that with nothing to replace it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnumMember {
     /// Member name.
@@ -61,7 +76,15 @@ pub struct EnumMember {
 }
 
 /// Parsed HDF5 datatype.
+///
+/// Non-exhaustive: the format's class set is not closed (HDF5 1.14.6 added a
+/// complex-number class), so match with a `_` arm. Only the *class* set is
+/// sealed — the variants stay open, so an exotic type this crate has no
+/// constructor for can still be built as a literal, and surfacing a format field
+/// this crate currently discards (a fixed-point type's padding bits, say) would
+/// still be a breaking change.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Datatype {
     /// Class 0: Fixed-point (integer) types.
     FixedPoint {
@@ -212,7 +235,10 @@ impl Datatype {
     /// Parse a datatype message from raw bytes.
     ///
     /// Returns `(Datatype, bytes_consumed)` for recursive parsing.
-    pub fn parse(data: &[u8]) -> Result<(Datatype, usize), FormatError> {
+    ///
+    /// Crate-internal: no public API hands out datatype-message bytes to feed it.
+    /// Read a dataset's type with [`Dataset::datatype`](crate::Dataset::datatype).
+    pub(crate) fn parse(data: &[u8]) -> Result<(Datatype, usize), FormatError> {
         // Minimum header: 4 bytes (class_and_version + 3 bytes bit field) + 4 bytes size = 8
         ensure_len(data, 0, 8)?;
 
@@ -565,7 +591,12 @@ impl Datatype {
     }
 
     /// Serialize datatype to HDF5 message bytes.
-    pub fn serialize(&self) -> Vec<u8> {
+    ///
+    /// Crate-internal: hand a `Datatype` to
+    /// [`DatasetBuilder::with_dtype`](crate::DatasetBuilder::with_dtype) and the
+    /// writer encodes it. Widening this again is additive if a caller ever needs
+    /// the raw encoding.
+    pub(crate) fn serialize(&self) -> Vec<u8> {
         match self {
             Datatype::FixedPoint {
                 size,

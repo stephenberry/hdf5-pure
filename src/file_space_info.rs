@@ -83,7 +83,13 @@ impl FileSpaceStrategy {
 }
 
 /// A parsed (or to-be-written) File Space Info message.
+///
+/// Non-exhaustive: read through [`File::file_space_info`](crate::File::file_space_info),
+/// never constructed by a caller — set a file's strategy with
+/// [`FileBuilder::with_file_space_strategy`](crate::FileBuilder::with_file_space_strategy).
+/// Fields may be added as the format message grows.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FileSpaceInfo {
     /// The file-space management strategy.
     pub strategy: FileSpaceStrategy,

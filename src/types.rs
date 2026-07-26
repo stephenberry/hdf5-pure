@@ -9,7 +9,11 @@ pub use crate::file_writer::AttrValue;
 ///
 /// Maps from the detailed `crate::datatype::Datatype` to a
 /// user-friendly representation.
+///
+/// Non-exhaustive: variants are added as this crate supports more datatypes, so
+/// match with a `_` arm.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum DType {
     F32,
     F64,
