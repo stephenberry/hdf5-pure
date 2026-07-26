@@ -4,7 +4,8 @@
 #
 # Automates the mechanical, easy-to-botch parts of a release so they come out
 # identical every time:
-#   * bump the version in Cargo.toml and Cargo.lock
+#   * bump the version in Cargo.toml and Cargo.lock, or accept one a breaking
+#     PR already bumped (see "Versioning" in CLAUDE.md)
 #   * promote the CHANGELOG's [Unreleased] section into a dated `## [X.Y.Z]`
 #     section and refresh the two compare links at the bottom
 #   * verify the crate still packages (`cargo publish --dry-run`)
@@ -30,6 +31,11 @@
 #
 set -euo pipefail
 
+# Every mktemp lands here so an abort part-way through leaves nothing behind.
+TMP_FILES=""
+cleanup() { [ -z "$TMP_FILES" ] || rm -f $TMP_FILES; }
+trap cleanup EXIT
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
@@ -45,7 +51,9 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 note() { printf '\033[1m==>\033[0m %s\n' "$*"; }
 
 usage() {
-  sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'
+  # The leading comment block, minus the shebang and the `#` markers. Ends at
+  # the first line that is not a comment, so it stays correct as the block grows.
+  awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"
   exit "${1:-0}"
 }
 
@@ -89,14 +97,63 @@ REPO_URL="$(awk -F'"' '/^repository = /{print $2; exit}' "$CARGO_TOML")"
 [ -n "$CUR_VERSION" ] || die "could not read current version from $CARGO_TOML"
 [ -n "$REPO_URL" ] || die "could not read repository URL from $CARGO_TOML"
 
+# The version this release follows comes from the latest version tag, not from
+# Cargo.toml. Under this repo's convention (see "Versioning" in CLAUDE.md) the
+# manifest carries the version being *developed*, so once a breaking PR has
+# merged it already reads $NEW_VERSION and is no longer the previous release.
+#
+# Exact `vX.Y.Z` only: the shell glob's `*` matches dots, so a looser pattern
+# would admit `v0.24.0.1`, and `--sort=-v:refname` ranks `v0.25.0-rc1` above
+# `v0.25.0` unless `versionsort.suffix` is configured. `sort -V | tail -1` reads
+# its whole input, where `head -1` would SIGPIPE (silently, under `set -o
+# pipefail`) on a repo with enough tags to fill the pipe buffer.
+# `|| true`: with no matching tag `grep` exits 1, and under `set -o pipefail`
+# that would abort the script here — before the check below can say why.
+PREV_VERSION="$(git tag --list 'v*' \
+  | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+  | sed 's/^v//' \
+  | sort -V \
+  | tail -1 || true)"
+
+# Compare dotted versions. `sort -V` orders them; equal values sort to the same
+# line, so `_ge` is "not strictly less".
+version_ge() {
+  [ "$1" = "$2" ] || [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]
+}
+
 # ---------------------------------------------------------------------------
 # Preflight
 # ---------------------------------------------------------------------------
-note "Releasing ${CUR_VERSION} -> ${NEW_VERSION}"
-
 printf '%s\n' "$NEW_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' \
   || die "version must be X.Y.Z (got '$NEW_VERSION')"
-[ "$NEW_VERSION" != "$CUR_VERSION" ] || die "version is already $NEW_VERSION"
+
+# No tag means no compare base. Falling back to Cargo.toml would be wrong under
+# this repo's convention — the manifest is the version being developed, not the
+# previous release — and would silently emit a `vX...vX` self-comparison link.
+# A shallow or tag-pruned clone lands here; fetch the tags rather than guess.
+[ -n "$PREV_VERSION" ] || die "no vX.Y.Z tag found; run \`git fetch --tags\` (a shallow clone has none)"
+
+note "Releasing ${PREV_VERSION} -> ${NEW_VERSION}"
+
+# Releases move forward. Without this a typo like `0.2.5` for `0.25.0` passes
+# every other check and, with --publish, is permanent: crates.io versions can be
+# yanked but never deleted or reused.
+version_ge "$NEW_VERSION" "$PREV_VERSION" && [ "$NEW_VERSION" != "$PREV_VERSION" ] \
+  || die "$NEW_VERSION does not come after the last release ($PREV_VERSION)"
+
+# Cargo.toml may legitimately read the last release (nothing breaking has merged
+# this cycle) or anything up to the version being cut (something has, possibly in
+# a smaller step than this release). Outside that range the manifest and the
+# requested version disagree about what is being cut, which is worth stopping on
+# rather than overwriting.
+version_ge "$CUR_VERSION" "$PREV_VERSION" && version_ge "$NEW_VERSION" "$CUR_VERSION" \
+  || die "$CARGO_TOML reads $CUR_VERSION, outside the last release ($PREV_VERSION) .. $NEW_VERSION"
+
+# A `## [X.Y.Z]` section for this version means a previous run already promoted
+# the changelog. Re-running would emit a second one; the local tag check below
+# misses this when the tag was deleted to retry a failed publish.
+grep -q "^## \[${NEW_VERSION}\]" "$CHANGELOG" \
+  && die "$CHANGELOG already has a [$NEW_VERSION] section; a previous run promoted it"
 
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 [ "$BRANCH" = "main" ] || die "not on main (on '$BRANCH'); release from main"
@@ -137,15 +194,24 @@ TODAY="$(date +%Y-%m-%d)"
 # ([[package]] hdf5-pure).
 bump_version() {
   local file="$1" tmp
-  tmp="$(mktemp)"
+  tmp="$(mktemp)"; TMP_FILES="$TMP_FILES $tmp"
   awk -v new="$NEW_VERSION" '
     /^name = "hdf5-pure"/ { pkg=1 }
     pkg && /^version = / { sub(/"[^"]*"/, "\"" new "\""); pkg=0 }
     { print }
   ' "$file" > "$tmp"
-  mv "$tmp" "$file"
+  # Copy through the existing file rather than renaming the temp over it, so the
+  # original inode and its 0644 mode survive (mktemp creates 0600).
+  cat "$tmp" > "$file"
 }
-note "Bumping version in $CARGO_TOML and $CARGO_LOCK"
+# Idempotent, and applied to each file independently: skipping both because
+# Cargo.toml already reads $NEW_VERSION would leave a Cargo.lock still declaring
+# the previous version in the release commit and tag.
+if [ "$CUR_VERSION" = "$NEW_VERSION" ]; then
+  note "Version already reads $NEW_VERSION (bumped by the PR that required it)"
+else
+  note "Bumping version in $CARGO_TOML and $CARGO_LOCK"
+fi
 bump_version "$CARGO_TOML"
 bump_version "$CARGO_LOCK"
 
@@ -153,9 +219,9 @@ bump_version "$CARGO_LOCK"
 # 2. Promote [Unreleased] into a dated section and refresh the compare links
 # ---------------------------------------------------------------------------
 note "Updating $CHANGELOG"
-CL_TMP="$(mktemp)"
+CL_TMP="$(mktemp)"; TMP_FILES="$TMP_FILES $CL_TMP"
 SUMMARY="$SUMMARY" awk \
-  -v new="$NEW_VERSION" -v prev="$CUR_VERSION" -v date="$TODAY" -v repo="$REPO_URL" '
+  -v new="$NEW_VERSION" -v prev="$PREV_VERSION" -v date="$TODAY" -v repo="$REPO_URL" '
   # Insert the new version header + summary as the first content under
   # [Unreleased] (i.e. before the first non-blank line that follows it).
   /^## \[Unreleased\]/ { print; seen=1; next }
@@ -174,16 +240,44 @@ SUMMARY="$SUMMARY" awk \
   }
   { print }
 ' "$CHANGELOG" > "$CL_TMP"
-mv "$CL_TMP" "$CHANGELOG"
+cat "$CL_TMP" > "$CHANGELOG"
+
+# The `[X.Y.Z]:` compare link is emitted only as a side effect of matching the
+# `[Unreleased]:` line, so a missing or renamed anchor would drop both links
+# silently and still produce a plausible-looking release.
+grep -q "^\[${NEW_VERSION}\]: " "$CHANGELOG" \
+  || die "$CHANGELOG has no [Unreleased]: link line to anchor the compare links to"
+grep -q "^## \[${NEW_VERSION}\] - ${TODAY}\$" "$CHANGELOG" \
+  || die "failed to promote [Unreleased] into a [$NEW_VERSION] section"
 
 # ---------------------------------------------------------------------------
-# 3. Verify the crate still packages cleanly with the new version
+# 3. Report the cycle's public-API delta
+# ---------------------------------------------------------------------------
+# CI's semver-checks job derives what to check from the version already in the
+# manifest, so once a breaking PR has bumped it the job reports "no semver update
+# required" and skips every check for the rest of the cycle. `--release-type
+# minor` overrides that derivation and forces the full run, which is worth having
+# exactly once, here, where the accumulated delta can be read against the
+# [Unreleased] section about to be promoted.
+#
+# Informational: a listed break is expected under a 0.x minor bump, and an empty
+# report on a cycle whose changelog claims a breaking change is the real signal.
+if command -v cargo-semver-checks >/dev/null 2>&1; then
+  note "Public API delta since ${PREV_VERSION} (informational)"
+  cargo semver-checks --baseline-version "$PREV_VERSION" --release-type minor \
+    --default-features --features serde,zfp,provenance,parallel,ndarray || true
+else
+  note "Skipping the API delta report (cargo-semver-checks not installed)"
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Verify the crate still packages cleanly with the new version
 # ---------------------------------------------------------------------------
 note "Verifying with cargo publish --dry-run"
 cargo publish --dry-run --allow-dirty
 
 # ---------------------------------------------------------------------------
-# 4. Commit + tag (opt-in)
+# 5. Commit + tag (opt-in)
 # ---------------------------------------------------------------------------
 if [ "$DO_COMMIT" -eq 0 ]; then
   note "Prepared release files (not committed)."
@@ -213,7 +307,7 @@ git commit -m "Release $TAG"
 git tag -a "$TAG" -m "Release $TAG"
 
 # ---------------------------------------------------------------------------
-# 5. Push (opt-in)
+# 6. Push (opt-in)
 # ---------------------------------------------------------------------------
 if [ "$DO_PUSH" -eq 1 ]; then
   note "Pushing main and $TAG"
@@ -222,23 +316,23 @@ if [ "$DO_PUSH" -eq 1 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 6. GitHub release (opt-in) — notes are the changelog section for this version
+# 7. GitHub release (opt-in) — notes are the changelog section for this version
 # ---------------------------------------------------------------------------
 if [ "$DO_GH" -eq 1 ]; then
   note "Creating GitHub release $TAG"
-  NOTES_TMP="$(mktemp)"
+  NOTES_TMP="$(mktemp)"; TMP_FILES="$TMP_FILES $NOTES_TMP"
   awk -v ver="$NEW_VERSION" '
     index($0, "## [" ver "]") == 1 { grab=1; next }  # start after this version header
     grab && /^## \[/ { exit }                        # stop at the next version header
     grab { print }
   ' "$CHANGELOG" > "$NOTES_TMP"
-  printf '\n**Full changelog:** %s/compare/v%s...v%s\n' "$REPO_URL" "$CUR_VERSION" "$NEW_VERSION" >> "$NOTES_TMP"
+  printf '\n**Full changelog:** %s/compare/v%s...v%s\n' "$REPO_URL" "$PREV_VERSION" "$NEW_VERSION" >> "$NOTES_TMP"
   gh release create "$TAG" --title "$TAG" --notes-file "$NOTES_TMP"
   rm -f "$NOTES_TMP"
 fi
 
 # ---------------------------------------------------------------------------
-# 7. crates.io publish (opt-in)
+# 8. crates.io publish (opt-in)
 # ---------------------------------------------------------------------------
 if [ "$DO_PUBLISH" -eq 1 ]; then
   note "Publishing to crates.io"
