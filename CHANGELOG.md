@@ -9,14 +9,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - `Dataset::write_staged` overwrites a dataset through its full `DatasetBuilder`, the builder-level counterpart of `Dataset::write` for element kinds that are not `H5Element` ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)).
+- `Group::create_group_with` stages a new group configured through a `StagedGroup` closure, so a group's attributes and children land with its creation (`set_attr` cannot reach it, since it needs a group that already resolves). `create_group(name)` is unchanged ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)).
 
 ### Changed
 
-- **Breaking:** `Group::create_group` now takes a builder closure, matching `create_dataset`, so a new group's attributes can be staged with its creation (`set_attr` cannot, since it needs a group that already resolves). Pass `|_| {}` for a plain empty group ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)).
+- **Breaking:** three refusals on the owned write path now report a more specific error: an unaligned SWMR append gives `SwmrAppendUnsupported` instead of a `ChunkedReadError`, an ineligible immediate append gives `AppendInPlaceUnsupported` instead of `AppendUnsupported`, and a missing edit target gives `PathNotFound` when the handle is resolved instead of `AppendUnsupported`/`EditUnsupported` at commit ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)).
 
 ### Removed
 
-- **Breaking:** `AppendWriter`, `SwmrWriter`, and `EditSession`, deprecated since 0.22.0, are gone. Use `File::open_rw` (or `File::open_swmr_writer`) with owned `Dataset` and `Group` handles; `File::open_rw_with_locking` replaces `AppendWriter::open_with_locking` and `File::clear_swmr_flag` replaces `SwmrWriter::clear_swmr_flag` ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)).
+- **Breaking:** `AppendWriter`, `SwmrWriter`, and `EditSession`, deprecated since 0.22.0, are gone. Use `File::open_rw` (or `File::open_swmr_writer`) with owned `Dataset` and `Group` handles; `File::open_rw_with_locking` replaces `AppendWriter::open_with_locking` and `File::clear_swmr_flag` replaces `SwmrWriter::clear_swmr_flag`. The former `EditSession` methods map to `Dataset::append`/`append_staged`/`write`/`write_staged`/`set_attr`/`remove_attr`, `Group::create_group`/`create_dataset`/`delete`/`set_attr`, and `File::copy`/`copy_from`/`space_accounting`, with an object staged in an uncommitted batch reachable only through `create_group_with` ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)).
 
 ## [0.24.0] - 2026-07-24
 

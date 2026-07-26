@@ -107,9 +107,7 @@ lossless read. For N-dimensional arrays see the `ndarray` feature below.
 
 ### Editing in place
 
-`File::open_rw` opens an existing file and adds, deletes, or copies objects, appends to chunked unlimited datasets in place (including filtered/compressed ones, via `append_dataset`), or edits compact group attributes without rewriting the file from scratch. New data and the rebuilt object headers are appended at the end of the file and the superblock is repointed last, so the cost is proportional to what changes and a failed commit leaves the file valid. For many repeated appends to a single 1-D unlimited dataset, opening with `File::open_rw` and appending through a `Dataset` handle grows the index in place at amortized `O(1)` cost instead of re-reading and rebuilding it on every `append_dataset` commit; unfiltered appends may be any length, while filtered appends this way must be chunk-aligned.
-
-> **Deprecated:** the path-based `File::open_rw` API is superseded by the owned-handle API shown here — open with `File::open_rw` and edit through owned `Dataset`/`Group` handles that also read back by name — and will be removed in a later release.
+`File::open_rw` opens an existing file and adds, deletes, or copies objects, appends to chunked unlimited datasets in place (including filtered/compressed ones, via `Dataset::append_staged`), or edits compact group attributes without rewriting the file from scratch. New data and the rebuilt object headers are appended at the end of the file and the superblock is repointed last, so the cost is proportional to what changes and a failed commit leaves the file valid. For many repeated appends to a single 1-D unlimited dataset, opening with `File::open_rw` and appending through a `Dataset` handle grows the index in place at amortized `O(1)` cost instead of re-reading and rebuilding it on every `append_staged` commit; unfiltered appends may be any length, while filtered appends this way must be chunk-aligned.
 
 ```rust,no_run
 use hdf5_pure::File;
@@ -117,7 +115,7 @@ use hdf5_pure::File;
 let file = File::open_rw("output.h5").unwrap();
 let root = file.root();
 
-root.create_group("run2", |_| {}).unwrap();
+root.create_group("run2").unwrap();
 root.create_dataset("run2/signal", |b| { b.with_f64_data(&[1.0, 2.0, 3.0]); }).unwrap();
 file.copy("temperature", "temperature_backup").unwrap();  // H5Ocopy
 root.delete("sensors/pressure").unwrap();                 // H5Ldelete
@@ -131,7 +129,7 @@ Contiguous and chunked datasets — the latter with any supported filter (deflat
 
 ### Reclaiming space (`repack`)
 
-Deleting an object inside an `File::open_rw` reuses the freed space within the session, but a single delete-then-close cannot shrink a file whose freed region is not at the very end — the same reason the HDF5 C library ships `h5repack`. `repack` is the guaranteed-shrink answer: it reads every surviving object and rewrites the whole file compact, optionally dropping objects.
+Deleting an object inside a `File::open_rw` session reuses the freed space within the session, but a single delete-then-close cannot shrink a file whose freed region is not at the very end — the same reason the HDF5 C library ships `h5repack`. `repack` is the guaranteed-shrink answer: it reads every surviving object and rewrites the whole file compact, optionally dropping objects.
 
 ```rust,no_run
 use hdf5_pure::{repack, RepackOptions};
@@ -284,8 +282,6 @@ builder.write("stream.h5").unwrap();
 ```
 
 Append in place (each call flushes durably; the file stays valid for concurrent readers throughout):
-
-> **Deprecated:** the `File::open_swmr_writer` type is superseded by the owned-handle API shown here — open with `File::open_swmr_writer` and append through a `Dataset` handle — and will be removed in a later release.
 
 ```rust,no_run
 use hdf5_pure::File;

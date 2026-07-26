@@ -72,7 +72,7 @@ fn synthetic_userblock_file_roundtrip() {
             .unwrap();
         // Create a new group and set a compact attribute on it, in one batch.
         s.root()
-            .create_group("newgrp", |g| {
+            .create_group_with("newgrp", |g| {
                 g.set_attr("tag", AttrValue::AsciiString("v104".into()));
             })
             .unwrap();
@@ -264,7 +264,7 @@ fn userblock_add_provenance_dataset_roundtrip() {
 }
 
 /// A dataset with a variable-length attribute, added on a userblock file,
-/// must round-trip correctly: `File::open_rw::place_vl_collection`'s
+/// must round-trip correctly: the engine's `place_vl_collection`
 /// `addr - base_address` arithmetic is only actually exercised (as opposed to
 /// a no-op at `base == 0`) once `base` is non-zero.
 #[test]

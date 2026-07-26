@@ -1914,11 +1914,17 @@ impl std::fmt::Debug for Object {
 // ---------------------------------------------------------------------------
 
 /// A group that exists only as a staged edit, handed to
-/// [`Group::create_group`]'s closure so attributes can be set on a group
+/// [`Group::create_group_with`]'s closure so attributes can be set on a group
 /// that is not yet committed (and so has no resolvable header to hang a
 /// [`Group`] handle off).
 ///
-/// Every method stages; nothing is written until [`File::commit`].
+/// Every method stages; nothing is written until [`File::commit`], and a staged
+/// object is not resolvable by name until then.
+///
+/// The closure holding this runs while the file's writable session is locked, so
+/// it must not call back into the same [`File`] (including through a [`Group`] or
+/// [`Dataset`] handle) — that would deadlock. Everything a staged group needs is
+/// on this type.
 pub struct StagedGroup<'a> {
     session: &'a mut WriteEngine,
     path: String,
@@ -1932,8 +1938,16 @@ impl StagedGroup<'_> {
         self
     }
 
+    /// Stage an empty subgroup of this group.
+    ///
+    /// To configure it in the same commit, use
+    /// [`create_group_with`](Self::create_group_with).
+    pub fn create_group(&mut self, name: &str) -> &mut Self {
+        self.create_group_with(name, |_| {})
+    }
+
     /// Stage a subgroup of this group, configured through `build`.
-    pub fn create_group(
+    pub fn create_group_with(
         &mut self,
         name: &str,
         build: impl FnOnce(&mut StagedGroup<'_>),
@@ -2081,14 +2095,39 @@ impl Group {
         })
     }
 
+    /// Create an empty subgroup `name` within this group, staged until
+    /// [`File::commit`].
+    ///
+    /// To give the new group attributes or children in the same commit, use
+    /// [`create_group_with`](Self::create_group_with).
+    ///
+    /// Requires a read-write file ([`File::open_rw`]), else
+    /// [`Error::ReadOnly`](crate::Error::ReadOnly).
+    ///
+    /// ```no_run
+    /// # use hdf5_pure::File;
+    /// # fn main() -> Result<(), hdf5_pure::Error> {
+    /// let file = File::open_rw("runs.h5")?;
+    /// file.root().create_group("run2")?;
+    /// file.commit()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn create_group(&self, name: &str) -> Result<(), Error> {
+        self.create_group_with(name, |_| {})
+    }
+
     /// Create a subgroup `name` within this group, configuring it through
     /// `build` (attributes, nested groups and datasets), staged until
     /// [`File::commit`].
     ///
-    /// Pass `|_| {}` for a plain empty group. The closure exists because
-    /// [`set_attr`](Self::set_attr) needs a group that already *resolves*, so it
-    /// cannot reach a group that is itself still staged; this can, and the
-    /// creation and its attributes land in one commit.
+    /// The closure exists because [`set_attr`](Self::set_attr) needs a group
+    /// that already *resolves*, so it cannot reach a group that is itself still
+    /// staged; this can, and the creation and its attributes land in one commit.
+    /// For a plain empty group use [`create_group`](Self::create_group).
+    ///
+    /// The closure runs while this file's writable session is locked, so it must
+    /// not call back into the same [`File`] (see [`StagedGroup`]).
     ///
     /// Requires a read-write file ([`File::open_rw`]), else
     /// [`Error::ReadOnly`](crate::Error::ReadOnly).
@@ -2097,16 +2136,15 @@ impl Group {
     /// # use hdf5_pure::{AttrValue, File};
     /// # fn main() -> Result<(), hdf5_pure::Error> {
     /// let file = File::open_rw("runs.h5")?;
-    /// file.root().create_group("run2", |g| {
+    /// file.root().create_group_with("run2", |g| {
     ///     g.set_attr("count", AttrValue::I64(7));
     ///     g.set_attr("label", AttrValue::String("second".into()));
     /// })?;
-    /// file.root().create_group("empty", |_| {})?;
     /// file.commit()?;
     /// # Ok(())
     /// # }
     /// ```
-    pub fn create_group(
+    pub fn create_group_with(
         &self,
         name: &str,
         build: impl FnOnce(&mut StagedGroup<'_>),
@@ -2271,7 +2309,8 @@ impl Dataset {
     /// be a chunked, rank-1, unlimited, Extensible-Array-indexed dataset — the
     /// same contract as [`Dataset::append`](crate::Dataset::append), including filtered
     /// whole-chunk / unfiltered any-length rules — otherwise
-    /// [`Error::AppendUnsupported`](crate::Error::AppendUnsupported) is returned.
+    /// [`Error::AppendInPlaceUnsupported`](crate::Error::AppendInPlaceUnsupported)
+    /// is returned.
     /// The append is immediate and crash-atomic (no `commit` needed).
     pub fn append<T: H5Element>(&mut self, data: &[T]) -> Result<(), Error> {
         if matches!(self.file.backend, Backend::Bounded(_)) {

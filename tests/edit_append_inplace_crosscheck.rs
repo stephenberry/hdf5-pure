@@ -292,7 +292,7 @@ fn combined_mixed_edits_c_readable() {
     {
         let s = File::open_rw(&path).unwrap();
         s.dataset("log").unwrap().append(&[4, 5, 6, 7]).unwrap(); // immediate -> 0..8
-        s.root().create_group("run", |_| {}).unwrap(); // staged
+        s.root().create_group("run").unwrap(); // staged
         s.dataset("keep")
             .unwrap()
             .set_attr("checked", AttrValue::I64(1))

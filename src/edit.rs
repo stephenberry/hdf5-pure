@@ -1,6 +1,6 @@
 //! In-place editing of an existing HDF5 file (issue #32, Group C).
 //!
-//! [the in-place edit engine] opens an existing file and adds objects, overwrites dataset
+//! The in-place edit engine opens an existing file and adds objects, overwrites dataset
 //! values, or edits compact group attributes **in place**:
 //! new data and object headers are written at the end of the file, and the
 //! object headers of the touched groups (and their ancestors up to the root)
@@ -341,15 +341,12 @@ append_typed! {
 }
 
 /// The in-place write engine behind the owned read-write [`File`](crate::File)
-/// (its `Backend::Mirror`) and the public [the in-place edit engine] wrapper.
+/// (its `Backend::Mirror`).
 ///
 /// Mirrors the file in memory and keeps a writable handle; every mutation is
-/// applied to both so the on-disk file stays consistent. It carries the two
-/// commit models documented on [the in-place edit engine]: staged tree edits applied by
-/// [`commit`](Self::commit), and immediate crash-atomic in-place appends
-/// ([`append_inplace`](Self::append_inplace)). The public [the in-place edit engine] is a
-/// wrapper that forwards to this type; `Backend::Mirror` drives it directly, so
-/// the engine itself stays free of the wrapper's deprecation.
+/// applied to both so the on-disk file stays consistent. It carries two commit
+/// models: staged tree edits applied by [`commit`](Self::commit), and immediate
+/// crash-atomic in-place appends ([`append_inplace`](Self::append_inplace)).
 pub(crate) struct WriteEngine {
     handle: fs::File,
     /// In-memory mirror of the file, kept byte-for-byte in sync with `handle`.
@@ -468,7 +465,7 @@ struct PersistState {
     old_blocks: Vec<(u64, u64)>,
 }
 
-/// A snapshot of an [the in-place edit engine]'s live space usage (issue #150).
+/// A snapshot of a writable file's live space usage (issue #150).
 ///
 /// This is the mutating-session counterpart of the read-only accounting on
 /// [`File`](crate::File) ([`file_size`](crate::File::file_size) and
@@ -877,7 +874,7 @@ impl WriteEngine {
     /// not rewritten and the file does not grow by the whole dataset per append.
     ///
     /// This does **not** use SWMR and sets no consistency flag. Like every other
-    /// [the in-place edit engine] edit it commits by appending the new chunks and a rebuilt
+    /// staged edit it commits by appending the new chunks and a rebuilt
     /// index at end-of-file and repointing the superblock last (under the
     /// session's exclusive lock), so a crash leaves either the original dataset or
     /// the fully-grown one, never a torn state.
@@ -904,7 +901,7 @@ impl WriteEngine {
     /// — the throughput-oriented, self-committing counterpart to the staged
     /// [`append_dataset`](Self::append_dataset).
     ///
-    /// Unlike every other [the in-place edit engine] edit, an in-place append is **not**
+    /// Unlike every other edit, an in-place append is **not**
     /// staged: it is applied and made durable before it returns (writes ordered
     /// child-before-parent with `fsync` barriers, the dataspace dimension
     /// published last as the single commit point), exactly like
@@ -945,7 +942,7 @@ impl WriteEngine {
     /// let file = File::open_rw("log.h5")?;
     /// let mut samples = file.dataset("samples")?;
     /// samples.append(&[8i32, 9, 10, 11])?; // immediate + durable
-    /// file.root().create_group("run2", |_| {})?; // staged
+    /// file.root().create_group("run2")?; // staged
     /// samples.append(&[12i32, 13])?;
     /// file.commit()?; // applies the staged group; appends already durable
     /// # Ok::<(), hdf5_pure::Error>(())
@@ -1324,7 +1321,7 @@ impl WriteEngine {
     /// bytes rather than risk freeing a region that is still in use. Freed space is
     /// reused within the open session; for a file created with
     /// `H5Pset_file_space_strategy(persist = true)` it is also recorded on disk so
-    /// it survives reopen (see [the in-place edit engine]), otherwise it is forgotten
+    /// it survives reopen, otherwise it is forgotten
     /// on close. After reuse, an object reference to a deleted object may resolve
     /// to an unrelated object (deleting a referenced object is undefined in HDF5).
     ///
@@ -5088,7 +5085,7 @@ struct FlatDataset {
 }
 
 /// A borrow adapter that drives the shared Extensible-Array append engine
-/// ([`crate::chunk_index_inplace`]) against an [the in-place edit engine]'s *own* mirror,
+/// ([`crate::chunk_index_inplace`]) against the engine's *own* mirror,
 /// handle, and superblock, so a session runs an immediate O(1) in-place append
 /// without constructing a second writable handle (which would take a second exclusive
 /// lock and keep a divergent mirror). It borrows only the mirror-carrying fields,

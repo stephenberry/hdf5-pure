@@ -151,7 +151,7 @@ fn staged_surface_returns_typed_error() {
         Err(Error::BoundedStagedUnsupported)
     ));
     assert!(matches!(
-        root.create_group("g", |_| {}),
+        root.create_group("g"),
         Err(Error::BoundedStagedUnsupported)
     ));
     assert!(matches!(

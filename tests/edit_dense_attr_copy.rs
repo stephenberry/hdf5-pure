@@ -5,7 +5,7 @@
 //! Object copy reproduces dense (fractal-heap) attribute storage (issue #87,
 //! follow-up to PR #78).
 //!
-//! Before this, `File::open_rw::copy` / `copy_from` refused any object whose
+//! Before this, `File::copy` / `copy_from` refused any object whose
 //! attributes were stored densely (a *defined* fractal-heap address in its
 //! Attribute Info message). Now the copy reads the source attributes out of the
 //! heap, rebuilds a fresh single-direct-block heap + B-tree v2 name index at the

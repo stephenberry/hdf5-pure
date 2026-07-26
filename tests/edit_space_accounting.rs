@@ -1,6 +1,6 @@
 //! Live space accounting on [`File::open_rw`] (issue #150).
 //!
-//! [`File::open_rw::space_accounting`] reports the file *as the session currently
+//! [`File::space_accounting`] reports the file *as the session currently
 //! holds it*: its live logical size and the free space it can reuse. These tests
 //! pin the semantics the docs promise — the size tracks immediate in-place
 //! appends, reusable free reflects only committed frees (not staged edits nor a

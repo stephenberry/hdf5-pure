@@ -1,4 +1,4 @@
-//! Pure-Rust tests for `File::open_rw::set_dataset_attr` / `remove_dataset_attr`
+//! Pure-Rust tests for `Dataset::set_attr` / `remove_attr`
 //! (issue #146): compact dataset-attribute add / update / remove, staged and
 //! applied on commit by relocating the dataset's object header while preserving its
 //! data and chunk index. C-library interop — undefined-`AttributeInfo` acceptance

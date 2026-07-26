@@ -76,7 +76,7 @@ criterion = { version = "0.5", default-features = false }
 # 32-bit host cannot allocate the multi-GiB fixtures these tests build). Gate it
 # to 64-bit-pointer targets so `cross test --target i686-...` can run the
 # pure-Rust suite on a 32-bit pointer width without building any C code. The
-# crosscheck test files (and the metno-backed unit tests in `swmr_writer`) carry
+# crosscheck test files carry
 # the matching `#![cfg(not(target_pointer_width = "32"))]` gate.
 [target.'cfg(not(target_pointer_width = "32"))'.dev-dependencies]
 hdf5 = { package = "hdf5-metno", version = "0.12", features = ["static", "zlib"] }

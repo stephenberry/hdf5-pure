@@ -97,7 +97,7 @@ fn swmr_refuses_the_staged_surface() {
 
     let root = file.root();
     assert!(matches!(
-        root.create_group("g", |_| {}),
+        root.create_group("g"),
         Err(Error::SwmrStagedUnsupported)
     ));
     assert!(matches!(

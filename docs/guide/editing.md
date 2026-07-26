@@ -20,7 +20,7 @@ Two open modes edit an existing file in place. `File::open_rw` reads the file in
 | `Dataset::write` — whole-value overwrite | Yes, on `commit` | No |
 | `Dataset::append_staged` — index-rebuilding append | Yes, on `commit` | No |
 | `set_attr` / `remove_attr` on datasets and groups | Yes, on `commit` | No |
-| `Group::create_dataset` / `create_group` | Yes, on `commit` | No |
+| `Group::create_dataset` / `create_group` / `create_group_with` | Yes, on `commit` | No |
 | `Group::delete` — frees space for reuse | Yes, on `commit` | No |
 | `File::copy` / `copy_from` | Yes, on `commit` | No |
 | `File::commit` / `space_accounting` | Yes | No |
@@ -52,7 +52,7 @@ use hdf5_pure::{AttrValue, File};
 let file = File::open_rw("output.h5").unwrap();
 let root = file.root();
 
-root.create_group("run2", |g| {
+root.create_group_with("run2", |g| {
     g.set_attr("kind", AttrValue::AsciiString("trial".into()));
 })
 .unwrap();
@@ -73,7 +73,8 @@ After a successful `commit()`, the staged set is cleared and the open file can b
 | Method | Effect | HDF5 analog |
 | --- | --- | --- |
 | `File::open_rw(path)` | Open an existing file for reading and writing | — |
-| `Group::create_group(name, build)` | Stage a new group, configured through `build` (attributes, nested objects); pass `\|_\| {}` for a plain empty group | — |
+| `Group::create_group(name)` | Stage a new empty group | — |
+| `Group::create_group_with(name, build)` | Stage a new group, configured through `build` (attributes, nested objects) | — |
 | `Group::create_dataset(name, build)` | Stage a new dataset, configured through a `DatasetBuilder` | — |
 | `Dataset::append_staged(build)` | Stage appending elements along axis 0 of an existing chunked, unlimited dataset, via an `AppendBuilder` | `H5Dset_extent` + write |
 | `Dataset::append(data)` | Append immediately and durably, no `commit` needed | `H5Dset_extent` + write |
@@ -94,7 +95,9 @@ root.create_dataset("run2/signal", |b| {
 .unwrap();
 ```
 
-`set_attr` needs a group that already resolves, so a group staged in this same batch is not reachable through it — pass those attributes to `create_group`'s closure instead.
+`set_attr` needs a group that already resolves, so a group staged in this same batch is not reachable through it — stage those attributes with `create_group_with` instead. A staged object is not resolvable by name until `commit`, so `File::group`/`File::dataset` will not find it before then.
+
+The `create_group_with`/`create_dataset`/`write_staged` closures run while the file's writable session is locked, so a closure must not call back into the same `File`.
 
 `set_attr` takes an `AttrValue`, fixed-size or variable-length (`AttrValue::VarLenAsciiArray`). `File::root()` names the root group. Attributes are stored compactly in the rebuilt group header; an edit that would exceed the compact-attribute limit, or a group using dense (fractal-heap) attribute storage, is refused before any file bytes change.
 
@@ -159,11 +162,9 @@ file.close().unwrap();
 
 One open file reaches every dataset by name, takes an exclusive file lock for its lifetime, and sets no SWMR flag. **Every `append` is crash-atomic**: writes are ordered child-before-parent with `fsync` barriers and the dataspace dimension is published last as the single commit point, so a crash between appends leaves either the previous length or the new one — never a torn or lost view.
 
-That atomicity is why filtered and unfiltered datasets have different length rules. An **unfiltered** append may be **any length**: when the current length is not chunk-aligned, the trailing partial chunk is rewritten and its index element — a single chunk address — is repointed with one atomic write. A **filtered** append must be **chunk-aligned** (the current length and the appended length both whole multiples of the chunk length), because a filtered index element is a multi-field record whose in-place repoint is not power-loss atomic; a filtered append therefore only ever inserts new chunks. For a non-chunk-aligned filtered append, use `append_dataset`, which rebuilds the index and repoints the superblock last (fully atomic).
+That atomicity is why filtered and unfiltered datasets have different length rules. An **unfiltered** append may be **any length**: when the current length is not chunk-aligned, the trailing partial chunk is rewritten and its index element — a single chunk address — is repointed with one atomic write. A **filtered** append must be **chunk-aligned** (the current length and the appended length both whole multiples of the chunk length), because a filtered index element is a multi-field record whose in-place repoint is not power-loss atomic; a filtered append therefore only ever inserts new chunks. For a non-chunk-aligned filtered append, use `Dataset::append_staged`, which rebuilds the index and repoints the superblock last (fully atomic).
 
-The remaining eligibility rules match `append_dataset` (chunked, unlimited axis 0, Extensible-Array index, rank 1, a re-encodable filter pipeline), plus the file-level gates in [the tables above](#choosing-a-write-path), with one difference: because it grows the index in place rather than rebuilding it, the index must already be allocated. This crate allocates it eagerly, so an empty dataset it wrote can be grown from the first append; an empty dataset the C library created without any initial data defers its index and is refused — make that first append with `append_dataset` (which materializes the index), or create the dataset with initial data. The dead bytes left when an unfiltered partial chunk is relocated are reclaimed by [repack](repack.md) rather than reused within the session in this release. This is the throughput-oriented counterpart to `append_dataset` and the filter-capable counterpart to the [SWMR writer](swmr.md).
-
-!!! note "Deprecated: `Dataset::append`"
+The remaining eligibility rules match `Dataset::append_staged` (chunked, unlimited axis 0, Extensible-Array index, rank 1, a re-encodable filter pipeline), plus the file-level gates in [the tables above](#choosing-a-write-path), with one difference: because it grows the index in place rather than rebuilding it, the index must already be allocated. This crate allocates it eagerly, so an empty dataset it wrote can be grown from the first append; an empty dataset the C library created without any initial data defers its index and is refused — make that first append with `Dataset::append_staged` (which materializes the index), or create the dataset with initial data. The dead bytes left when an unfiltered partial chunk is relocated are reclaimed by [repack](repack.md) rather than reused within the session in this release. This is the throughput-oriented counterpart to `Dataset::append_staged` and the filter-capable counterpart to the [SWMR writer](swmr.md).
 
 !!! tip "Runnable example"
     This section mirrors [`examples/append_streaming.rs`](https://github.com/stephenberry/hdf5-pure/blob/main/examples/append_streaming.rs). Run it with `cargo run --example append_streaming`.

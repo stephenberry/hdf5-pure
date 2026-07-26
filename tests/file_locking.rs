@@ -39,7 +39,7 @@ fn editor_lock_blocks_a_second_editor() {
     // A second editor cannot open the file while the first is alive.
     assert!(
         matches!(File::open_rw(&path), Err(Error::FileLocked(_))),
-        "second File::open_rw::open should be FileLocked"
+        "second File::open_rw should be FileLocked"
     );
 
     drop(session); // releases the lock
