@@ -708,3 +708,338 @@ fn c_sparse_chunked_lossy_repack_refused() {
     }
     assert!(!dst.exists(), "dst must not be created when repack refuses");
 }
+
+/// A compound whose members include a variable-length string stores a 16-byte
+/// global-heap reference *inside* each element. Copying those element bytes
+/// verbatim leaves the reference pointing at a collection in the source file's
+/// address space, which the destination never allocates (issue #201). Repack has
+/// to re-stage the payloads through the destination's own heap and rewrite the
+/// embedded references, exactly as it does for a top-level VL dataset.
+///
+/// The C library is the load-bearing reader here: this crate's own reader
+/// resolves the heap lazily and reads `read_raw` bytes without validating the
+/// embedded addresses, so a self-round-trip alone would not catch a stale one.
+#[test]
+fn repack_roundtrips_c_compound_with_vlen_string_member() {
+    use hdf5::types::VarLenUnicode;
+    use std::str::FromStr;
+
+    #[derive(hdf5::H5Type, Clone, Debug, PartialEq)]
+    #[repr(C)]
+    struct Labelled {
+        id: i32,
+        label: VarLenUnicode,
+    }
+
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("c_compound_vlen.h5");
+    let dst = dir.path().join("compound_vlen_repacked.h5");
+
+    let rows = [
+        "alpha",
+        "",
+        "gamma",
+        "δelta",
+        "a longer label than the rest",
+    ];
+    {
+        let file = hdf5::File::create(&src).unwrap();
+        let vals: Vec<Labelled> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, s)| Labelled {
+                id: i as i32 * 10,
+                label: VarLenUnicode::from_str(s).unwrap(),
+            })
+            .collect();
+        file.new_dataset::<Labelled>()
+            .shape((rows.len(),))
+            .create("rows")
+            .unwrap()
+            .write(&vals)
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    // The datatype must stay a compound carrying a variable-length member, not
+    // be flattened or converted.
+    let f = File::open(&dst).unwrap();
+    let ds = f.dataset("rows").unwrap();
+    match ds.datatype().unwrap() {
+        hdf5_pure::Datatype::Compound { members, .. } => {
+            assert_eq!(members.len(), 2);
+            assert!(
+                matches!(
+                    members[1].datatype,
+                    hdf5_pure::Datatype::VariableLength { .. }
+                ),
+                "the label member must stay variable-length"
+            );
+        }
+        other => panic!("expected a compound datatype, got {other:?}"),
+    }
+
+    // The reference C library reads every row back — the interop proof that the
+    // embedded heap references name collections in the *destination*.
+    let c = hdf5::File::open(&dst).unwrap();
+    let cvals = c.dataset("rows").unwrap().read_raw::<Labelled>().unwrap();
+    assert_eq!(cvals.len(), rows.len());
+    for (i, row) in rows.iter().enumerate() {
+        assert_eq!(cvals[i].id, i as i32 * 10, "row {i} id differs");
+        assert_eq!(cvals[i].label.as_str(), *row, "row {i} label differs");
+    }
+}
+
+/// A compound can carry several variable-length members of different kinds, and
+/// each one's reference stores a *count* in the units of its own base type — bytes
+/// for a string, elements for a sequence. Re-staging has to keep those units
+/// straight per member, not per dataset.
+#[test]
+fn repack_roundtrips_c_compound_with_two_vlen_members() {
+    use hdf5::types::{VarLenArray, VarLenUnicode};
+    use std::str::FromStr;
+
+    #[derive(hdf5::H5Type, Clone, Debug)]
+    #[repr(C)]
+    struct Row {
+        label: VarLenUnicode,
+        id: i64,
+        samples: VarLenArray<i32>,
+    }
+
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("c_compound_two_vlen.h5");
+    let dst = dir.path().join("compound_two_vlen_repacked.h5");
+
+    let labels = ["first", "", "third"];
+    let samples: Vec<Vec<i32>> = vec![vec![1, 2, 3], vec![], vec![-9, 400_000]];
+    {
+        let file = hdf5::File::create(&src).unwrap();
+        let vals: Vec<Row> = labels
+            .iter()
+            .zip(&samples)
+            .enumerate()
+            .map(|(i, (l, s))| Row {
+                label: VarLenUnicode::from_str(l).unwrap(),
+                id: i as i64 - 1,
+                samples: VarLenArray::from_slice(s.as_slice()),
+            })
+            .collect();
+        file.new_dataset::<Row>()
+            .shape((labels.len(),))
+            .create("rows")
+            .unwrap()
+            .write(&vals)
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    let c = hdf5::File::open(&dst).unwrap();
+    let cvals = c.dataset("rows").unwrap().read_raw::<Row>().unwrap();
+    assert_eq!(cvals.len(), labels.len());
+    for i in 0..labels.len() {
+        assert_eq!(cvals[i].label.as_str(), labels[i], "row {i} label differs");
+        assert_eq!(cvals[i].id, i as i64 - 1, "row {i} id differs");
+        assert_eq!(
+            cvals[i].samples.as_slice(),
+            samples[i].as_slice(),
+            "row {i} samples differ"
+        );
+    }
+}
+
+/// A chunked compound with a variable-length member has to reach the re-staging
+/// path rather than the verbatim chunk copy: copying compressed chunks would
+/// carry the source's heap addresses through untouched, and the destination's own
+/// collections have to be placed before the chunks are encoded (issue #109).
+#[test]
+fn repack_roundtrips_c_chunked_compound_with_vlen_member() {
+    use hdf5::types::VarLenUnicode;
+    use std::str::FromStr;
+
+    #[derive(hdf5::H5Type, Clone, Debug)]
+    #[repr(C)]
+    struct Row {
+        id: i32,
+        label: VarLenUnicode,
+    }
+
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("c_chunked_compound_vlen.h5");
+    let dst = dir.path().join("chunked_compound_vlen_repacked.h5");
+
+    let n = 40usize;
+    let labels: Vec<String> = (0..n).map(|i| format!("row-{i}")).collect();
+    {
+        let file = hdf5::File::create(&src).unwrap();
+        let vals: Vec<Row> = labels
+            .iter()
+            .enumerate()
+            .map(|(i, l)| Row {
+                id: i as i32,
+                label: VarLenUnicode::from_str(l).unwrap(),
+            })
+            .collect();
+        file.new_dataset::<Row>()
+            .shape((n,))
+            .chunk((8,))
+            .create("rows")
+            .unwrap()
+            .write(&vals)
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    // Chunking must survive the rebuild, not be flattened to contiguous.
+    let f = File::open(&dst).unwrap();
+    assert!(
+        matches!(
+            f.dataset("rows").unwrap().layout().unwrap(),
+            hdf5_pure::Layout::Chunked { .. }
+        ),
+        "repacked dataset must stay chunked"
+    );
+
+    let c = hdf5::File::open(&dst).unwrap();
+    let cvals = c.dataset("rows").unwrap().read_raw::<Row>().unwrap();
+    assert_eq!(cvals.len(), n);
+    for i in 0..n {
+        assert_eq!(cvals[i].id, i as i32, "row {i} id differs");
+        assert_eq!(cvals[i].label.as_str(), labels[i], "row {i} label differs");
+    }
+}
+
+/// An object-header address embedded in a compound member goes stale on rewrite
+/// for the same reason a top-level one does: the destination puts the target
+/// object somewhere else. Copying the element bytes verbatim leaves a file whose
+/// fixed-size members read back correctly and whose references dereference into
+/// whatever now occupies that address — which is why this test dereferences
+/// rather than merely reading the rows.
+#[test]
+fn repack_roundtrips_c_compound_with_object_reference_member() {
+    use hdf5::{ObjectReference, ObjectReference1, ReferencedObject};
+
+    #[derive(hdf5::H5Type, Clone, Debug)]
+    #[repr(C)]
+    struct Row {
+        id: i32,
+        target: ObjectReference1,
+    }
+
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("c_compound_ref.h5");
+    let dst = dir.path().join("compound_ref_repacked.h5");
+
+    {
+        let file = hdf5::File::create(&src).unwrap();
+        file.new_dataset::<i32>()
+            .shape((3,))
+            .create("alpha")
+            .unwrap()
+            .write(&[1i32, 2, 3])
+            .unwrap();
+        let grp = file.create_group("grp").unwrap();
+        grp.new_dataset::<i32>()
+            .shape((2,))
+            .create("beta")
+            .unwrap()
+            .write(&[40i32, 50])
+            .unwrap();
+        let vals = vec![
+            Row {
+                id: 7,
+                target: ObjectReference1::create(&file, "alpha").unwrap(),
+            },
+            Row {
+                id: 8,
+                target: ObjectReference1::create(&file, "grp/beta").unwrap(),
+            },
+        ];
+        file.new_dataset::<Row>()
+            .shape((vals.len(),))
+            .create("rows")
+            .unwrap()
+            .write(&vals)
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    let c = hdf5::File::open(&dst).unwrap();
+    let cvals = c.dataset("rows").unwrap().read_raw::<Row>().unwrap();
+    assert_eq!(cvals.len(), 2);
+    assert_eq!(cvals[0].id, 7);
+    assert_eq!(cvals[1].id, 8);
+
+    // Each embedded reference must resolve to its own target's *new* address, and
+    // that target must still hold the right data.
+    let expected: [&[i32]; 2] = [&[1, 2, 3], &[40, 50]];
+    for (i, row) in cvals.iter().enumerate() {
+        match row.target.dereference(&c).unwrap() {
+            ReferencedObject::Dataset(ds) => assert_eq!(
+                ds.read_raw::<i32>().unwrap(),
+                expected[i],
+                "row {i} reference resolves to the wrong dataset"
+            ),
+            other => panic!("row {i}: expected a dataset, got {other:?}"),
+        }
+    }
+}
+
+/// The refusals that guard the top-level object-reference path have to guard the
+/// embedded one too: a reference into a dropped subtree cannot be rewritten to
+/// anything meaningful, so the repack must fail by name rather than emit a
+/// dangling address.
+#[test]
+fn repack_refuses_compound_reference_to_dropped_object() {
+    use hdf5::{ObjectReference, ObjectReference1};
+
+    #[derive(hdf5::H5Type, Clone, Debug)]
+    #[repr(C)]
+    struct Row {
+        id: i32,
+        target: ObjectReference1,
+    }
+
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("c_compound_ref_dropped.h5");
+    let dst = dir.path().join("compound_ref_dropped_repacked.h5");
+
+    {
+        let file = hdf5::File::create(&src).unwrap();
+        file.new_dataset::<i32>()
+            .shape((2,))
+            .create("doomed")
+            .unwrap()
+            .write(&[1i32, 2])
+            .unwrap();
+        let vals = vec![Row {
+            id: 1,
+            target: ObjectReference1::create(&file, "doomed").unwrap(),
+        }];
+        file.new_dataset::<Row>()
+            .shape((1,))
+            .create("rows")
+            .unwrap()
+            .write(&vals)
+            .unwrap();
+        file.close().unwrap();
+    }
+
+    let err = repack(&src, &dst, &RepackOptions::new().drop_path("doomed")).unwrap_err();
+    match err {
+        hdf5_pure::Error::RepackUnsupported(msg) => assert!(
+            msg.contains("rows") && msg.contains("doomed"),
+            "error should name the dataset and its dropped target: {msg}"
+        ),
+        other => panic!("expected RepackUnsupported, got {other:?}"),
+    }
+    assert!(!dst.exists(), "dst must not be created when repack refuses");
+}

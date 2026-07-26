@@ -194,10 +194,10 @@ use crate::object_header::ObjectHeader;
 use crate::signature;
 use crate::superblock::Superblock;
 use crate::type_builders::{
-    AttrValue, DatasetBuilder, ObjectRefTarget, VlStringStaging, build_attr_message,
-    build_global_heap_collections, make_f32_type, make_f64_type, make_i8_type, make_i16_type,
-    make_i32_type, make_i64_type, make_u8_type, make_u16_type, make_u32_type, make_u64_type,
-    patch_vl_refs, patch_vl_refs_masked,
+    AttrValue, DatasetBuilder, ObjectRefPatch, ObjectRefTarget, VlStringStaging,
+    build_attr_message, build_global_heap_collections, make_f32_type, make_f64_type, make_i8_type,
+    make_i16_type, make_i32_type, make_i64_type, make_u8_type, make_u16_type, make_u32_type,
+    make_u64_type, patch_vl_refs, patch_vl_refs_masked, write_reference_address,
 };
 
 /// An undefined on-disk address (all bits set), HDF5's "no address" sentinel.
@@ -2157,11 +2157,10 @@ impl WriteEngine {
                 // that every earlier-placed object in this commit is in
                 // `path_addr` (chunked datasets never carry these —
                 // `flatten_dataset` refuses that combination).
-                if let Some(targets) = fd.reference_targets.take() {
-                    let mut patched = Vec::with_capacity(targets.len() * 8);
-                    for target in &targets {
+                if let Some(patches) = fd.reference_targets.take() {
+                    for patch in &patches {
                         let addr = Self::resolve_reference_target(
-                            target,
+                            &patch.target,
                             &path_addr,
                             &nodes,
                             &add_targets,
@@ -2170,9 +2169,8 @@ impl WriteEngine {
                             &self.data,
                             &self.superblock,
                         )?;
-                        patched.extend_from_slice(&addr.to_le_bytes());
+                        write_reference_address(&mut fd.raw, patch.byte_offset, addr);
                     }
-                    fd.raw = patched;
                 }
                 let oh = if fd.chunk_options.is_chunked() || fd.maxshape.is_some() {
                     self.build_chunked_dataset(&fd)?
@@ -2184,7 +2182,7 @@ impl WriteEngine {
                     if let Some(staging) = fd.vl_string_staging.take() {
                         if !staging.collections.is_empty() {
                             let addrs = self.place_vl_collections(&staging.collections)?;
-                            patch_vl_refs_masked(&mut fd.raw, &staging.patch_mask, &addrs);
+                            patch_vl_refs_masked(&mut fd.raw, &staging.patch_offsets, &addrs);
                         }
                     }
                     // A zero-element dataset has no data block to allocate; its
@@ -4353,10 +4351,10 @@ impl WriteEngine {
                 let mut ordered: Vec<&FlatDataset> = datasets.iter().collect();
                 ordered.sort_by_key(|fd| fd.reference_targets.is_some());
                 for fd in ordered {
-                    if let Some(targets) = &fd.reference_targets {
-                        for target in targets {
+                    if let Some(patches) = &fd.reference_targets {
+                        for patch in patches {
                             Self::resolve_reference_target(
-                                target,
+                                &patch.target,
                                 &sim_addr,
                                 nodes,
                                 add_targets,
@@ -5077,7 +5075,7 @@ struct FlatDataset {
     /// Resolved (see [`WriteEngine::resolve_reference_target`]) and patched
     /// into `raw` in the apply loop, once every object this commit places has
     /// a known address. `None` for an ordinary dataset.
-    reference_targets: Option<Vec<ObjectRefTarget>>,
+    reference_targets: Option<Vec<ObjectRefPatch>>,
     /// A user-defined fill value, encoded in the dataset's datatype, or `None`
     /// for the library default. Validated against the datatype element size in
     /// [`flatten_dataset`].
@@ -6946,7 +6944,7 @@ mod tests {
         // without ever writing its global heap collection or patching its
         // placeholder references, so the dataset failed to read back. A null
         // element (no heap object at all, distinct from an empty string) must
-        // stay untouched by the patch — only `patch_mask`-flagged elements'
+        // stay untouched by the patch — only heap-backed elements'
         // placeholder addresses are resolved; exercising both keeps the mask
         // itself, not just the common all-`Bytes` case, under test.
         use crate::type_builders::VlStringElement;

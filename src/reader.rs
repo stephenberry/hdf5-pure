@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use crate::bounded::BoundedEngine;
 use crate::edit::{AppendBuilder, SpaceAccounting, WriteEngine};
 use crate::element::H5Element;
-use crate::type_builders::DatasetBuilder;
+use crate::type_builders::{DatasetBuilder, VL_REF_SIZE};
 
 use crate::attribute::{extract_attributes_full, extract_attributes_full_from_source};
 use crate::chunk_cache::{ChunkCache, ChunkCacheConfig, ChunkCacheStats};
@@ -3070,6 +3070,84 @@ impl Dataset {
             )
         })?;
         Ok((objects, element_size))
+    }
+
+    /// Read a dataset whose datatype *contains* variable-length references
+    /// without being variable-length itself — a compound with a VL member, or an
+    /// array of them (issue #201).
+    ///
+    /// Returns everything a rewrite needs: the element bytes, where each embedded
+    /// reference sits within them, and the heap payload each one names. That lets
+    /// the writer re-stage the payloads into a new file's global heap and rewrite
+    /// the references in place, which is what keeps a rewrite from carrying the
+    /// source file's heap addresses into the destination.
+    ///
+    /// The references are resolved one slot at a time, so `options`' limits apply
+    /// per slot rather than across the whole dataset.
+    pub(crate) fn read_embedded_vlen_bytes(
+        &self,
+        slots: &[vl_data::EmbeddedVlSlot],
+        options: VlenStringReadOptions,
+    ) -> Result<vl_data::EmbeddedVlData, Error> {
+        let stride = self.datatype()?.type_size() as usize;
+        let dataspace = self.dataspace()?;
+        let n = dataspace.num_elements();
+        if let Some(limit) = options.max_elements()
+            && n > limit as u64
+        {
+            return Err(
+                FormatError::VariableLengthElementLimitExceeded { limit, actual: n }.into(),
+            );
+        }
+
+        let raw = self.read_raw()?;
+        let n_usize = n.to_usize()?;
+        let needed = n_usize
+            .checked_mul(stride)
+            .ok_or(FormatError::OffsetOverflow {
+                offset: n,
+                length: stride as u64,
+            })?;
+        if raw.len() < needed {
+            return Err(FormatError::UnexpectedEof {
+                expected: needed,
+                available: raw.len(),
+            }
+            .into());
+        }
+
+        let mut offsets = Vec::with_capacity(n_usize * slots.len());
+        let mut objects = Vec::with_capacity(n_usize * slots.len());
+        for slot in slots {
+            // Gather this slot's reference from every element into a dense buffer,
+            // which is the shape the shared VL reader consumes. Each slot has its
+            // own base-type width, so they are resolved a slot at a time rather
+            // than in one pass.
+            let mut dense = Vec::with_capacity(n_usize * VL_REF_SIZE);
+            for e in 0..n_usize {
+                let at = e * stride + slot.byte_offset;
+                dense.extend_from_slice(&raw[at..at + VL_REF_SIZE]);
+                offsets.push(at);
+            }
+            let resolved = self.file.with_source(|source| {
+                vl_data::read_vl_byte_objects_from_source(
+                    source,
+                    &dense,
+                    n,
+                    self.file.offset_size(),
+                    self.file.length_size(),
+                    self.file.addr_offset,
+                    slot.element_size,
+                    options,
+                )
+            })?;
+            objects.extend(resolved);
+        }
+        Ok(vl_data::EmbeddedVlData {
+            raw,
+            offsets,
+            objects,
+        })
     }
 
     /// Read all attributes of this dataset.

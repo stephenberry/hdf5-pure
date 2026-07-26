@@ -170,6 +170,123 @@ pub(crate) fn is_vlen_string_datatype(datatype: &Datatype) -> bool {
     }
 }
 
+/// A variable-length reference reached *inside* a larger element rather than
+/// being the element itself: a member of a compound, or an entry of an array of
+/// them. Repack needs both coordinates to re-stage the payload and rewrite the
+/// reference in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EmbeddedVlSlot {
+    /// Byte offset of the 16-byte reference within one element of the dataset.
+    pub byte_offset: usize,
+    /// Byte width of the variable-length base type. The reference's stored
+    /// `length` counts base-type elements, so the heap object holds
+    /// `length * element_size` bytes.
+    pub element_size: usize,
+}
+
+/// A dataset with embedded variable-length references, read for rewriting: the
+/// element bytes as they stand, plus each reference's position within them and
+/// the heap payload it names.
+pub(crate) struct EmbeddedVlData {
+    /// The dataset's element bytes, references still carrying source addresses.
+    pub raw: Vec<u8>,
+    /// Byte offset within `raw` of each embedded reference.
+    pub offsets: Vec<usize>,
+    /// The heap payload each reference names, paired in order with `offsets`.
+    pub objects: Vec<VlByteObject>,
+}
+
+/// Every variable-length reference `datatype` reaches through a compound member
+/// or array entry, in declaration order.
+///
+/// A datatype that *is* variable-length yields the single slot at offset 0, so
+/// callers that handle the top-level case separately should test for that first.
+/// Returns `None` if the datatype's declared size cannot hold the slots found,
+/// which means either a malformed datatype or dimensions that overflowed — in
+/// both cases the element bytes cannot be walked safely.
+pub(crate) fn embedded_vlen_slots(datatype: &Datatype) -> Option<Vec<EmbeddedVlSlot>> {
+    // A reference is 16 bytes, so an element can hold no more than this many.
+    // Bounding the walk keeps a datatype declaring absurd array dimensions from
+    // driving an unbounded allocation here.
+    let element_size = datatype.type_size() as usize;
+    let capacity = element_size / VL_REF_BYTES;
+    let mut slots = Vec::new();
+    collect_vlen_slots(datatype, 0, capacity, &mut slots);
+    if slots.len() > capacity
+        || slots
+            .iter()
+            .any(|s| s.byte_offset + VL_REF_BYTES > element_size)
+    {
+        return None;
+    }
+    Some(slots)
+}
+
+/// On-disk width of a variable-length reference with 8-byte offsets, which is
+/// the only offset size the write path emits and the only one repack re-stages.
+const VL_REF_BYTES: usize = 16;
+
+fn collect_vlen_slots(
+    datatype: &Datatype,
+    base: usize,
+    capacity: usize,
+    out: &mut Vec<EmbeddedVlSlot>,
+) {
+    // Stop one past the bound so the caller can still tell "too many" from "fits".
+    if out.len() > capacity {
+        return;
+    }
+    match datatype {
+        Datatype::VariableLength { base_type, .. } => {
+            // A VL string's reference counts bytes (its base type is one byte
+            // wide); a sequence's counts base-type elements.
+            let element_size = if is_vlen_string_datatype(datatype) {
+                1
+            } else {
+                (base_type.type_size() as usize).max(1)
+            };
+            out.push(EmbeddedVlSlot {
+                byte_offset: base,
+                element_size,
+            });
+        }
+        Datatype::Compound { members, .. } => {
+            for m in members {
+                collect_vlen_slots(&m.datatype, base + m.byte_offset as usize, capacity, out);
+            }
+        }
+        Datatype::Array {
+            base_type,
+            dimensions,
+        } => {
+            // If the entry type reaches no reference then no repetition of it
+            // does either. Checking once keeps a datatype declaring huge
+            // dimensions from spinning through entries that can never contribute,
+            // and makes every iteration below push at least one slot — so the
+            // `capacity` bound terminates the loop.
+            let mut probe = Vec::new();
+            collect_vlen_slots(base_type, 0, capacity, &mut probe);
+            if probe.is_empty() {
+                return;
+            }
+            let count = dimensions
+                .iter()
+                .copied()
+                .fold(1u64, |a, b| a.saturating_mul(u64::from(b)));
+            let stride = base_type.type_size() as usize;
+            for i in 0..count {
+                collect_vlen_slots(base_type, base + (i as usize) * stride, capacity, out);
+                if out.len() > capacity {
+                    return;
+                }
+            }
+        }
+        // An enumeration's base is an integer, and no other class can reach a
+        // variable-length reference.
+        _ => {}
+    }
+}
+
 fn check_element_limit(
     num_elements: u64,
     options: VlenStringReadOptions,
@@ -641,5 +758,170 @@ mod tests {
         let raw = vec![0u8; 10]; // too short for 1 element with offset_size=8
         let err = parse_vl_references(&raw, 1, 8).unwrap_err();
         assert!(matches!(err, FormatError::UnexpectedEof { .. }));
+    }
+}
+
+#[cfg(test)]
+mod embedded_slot_tests {
+    use super::*;
+    use crate::datatype::{CompoundMember, StringPadding};
+
+    fn vlen_string() -> Datatype {
+        Datatype::VariableLength {
+            is_string: true,
+            base_type: Box::new(Datatype::String {
+                size: 1,
+                charset: CharacterSet::Utf8,
+                padding: StringPadding::NullTerminate,
+            }),
+            padding: Some(StringPadding::NullTerminate),
+            charset: Some(CharacterSet::Utf8),
+        }
+    }
+
+    fn vlen_i32_sequence() -> Datatype {
+        Datatype::VariableLength {
+            is_string: false,
+            base_type: Box::new(Datatype::FixedPoint {
+                size: 4,
+                signed: true,
+                byte_order: crate::datatype::DatatypeByteOrder::LittleEndian,
+                bit_offset: 0,
+                bit_precision: 32,
+            }),
+            padding: None,
+            charset: None,
+        }
+    }
+
+    fn i32_type() -> Datatype {
+        Datatype::FixedPoint {
+            size: 4,
+            signed: true,
+            byte_order: crate::datatype::DatatypeByteOrder::LittleEndian,
+            bit_offset: 0,
+            bit_precision: 32,
+        }
+    }
+
+    fn member(name: &str, byte_offset: u64, datatype: Datatype) -> CompoundMember {
+        CompoundMember {
+            name: name.to_string(),
+            byte_offset,
+            datatype,
+        }
+    }
+
+    #[test]
+    fn a_plain_datatype_reaches_no_reference() {
+        assert_eq!(embedded_vlen_slots(&i32_type()), Some(Vec::new()));
+    }
+
+    #[test]
+    fn a_top_level_vlen_is_its_own_slot() {
+        assert_eq!(
+            embedded_vlen_slots(&vlen_string()),
+            Some(vec![EmbeddedVlSlot {
+                byte_offset: 0,
+                element_size: 1
+            }])
+        );
+    }
+
+    /// Each member keeps its own base-type width: a string reference counts
+    /// bytes, a sequence reference counts base-type elements. Collapsing the two
+    /// would read the wrong number of heap bytes back.
+    #[test]
+    fn compound_members_keep_their_own_element_size() {
+        let dt = Datatype::Compound {
+            size: 40,
+            members: vec![
+                member("label", 0, vlen_string()),
+                member("id", 16, i32_type()),
+                member("samples", 24, vlen_i32_sequence()),
+            ],
+        };
+        assert_eq!(
+            embedded_vlen_slots(&dt),
+            Some(vec![
+                EmbeddedVlSlot {
+                    byte_offset: 0,
+                    element_size: 1
+                },
+                EmbeddedVlSlot {
+                    byte_offset: 24,
+                    element_size: 4
+                },
+            ])
+        );
+    }
+
+    /// A compound nested inside a compound, and an array of compounds, both reach
+    /// references that a single-level walk would miss.
+    #[test]
+    fn nested_compounds_and_arrays_are_walked() {
+        let inner = Datatype::Compound {
+            size: 20,
+            members: vec![member("id", 0, i32_type()), member("s", 4, vlen_string())],
+        };
+        let nested = Datatype::Compound {
+            size: 24,
+            members: vec![
+                member("n", 0, i32_type()),
+                member("inner", 4, inner.clone()),
+            ],
+        };
+        assert_eq!(
+            embedded_vlen_slots(&nested),
+            Some(vec![EmbeddedVlSlot {
+                byte_offset: 8,
+                element_size: 1
+            }])
+        );
+
+        let array = Datatype::Array {
+            base_type: Box::new(inner),
+            dimensions: vec![3],
+        };
+        assert_eq!(
+            embedded_vlen_slots(&array),
+            Some(vec![
+                EmbeddedVlSlot {
+                    byte_offset: 4,
+                    element_size: 1
+                },
+                EmbeddedVlSlot {
+                    byte_offset: 24,
+                    element_size: 1
+                },
+                EmbeddedVlSlot {
+                    byte_offset: 44,
+                    element_size: 1
+                },
+            ])
+        );
+    }
+
+    /// A datatype whose declared size cannot hold the references it declares is
+    /// rejected rather than walked: the element bytes and the datatype disagree,
+    /// so any offset derived from the latter would index the wrong place.
+    #[test]
+    fn a_datatype_too_small_for_its_own_references_is_rejected() {
+        let dt = Datatype::Compound {
+            size: 8, // one VL reference needs 16
+            members: vec![member("s", 0, vlen_string())],
+        };
+        assert_eq!(embedded_vlen_slots(&dt), None);
+    }
+
+    /// An array declaring dimensions whose product overflows must not drive an
+    /// unbounded walk; the capacity bound stops it and the result is rejected.
+    #[test]
+    fn an_array_declaring_absurd_dimensions_is_rejected_not_walked() {
+        let dt = Datatype::Array {
+            base_type: Box::new(vlen_string()),
+            dimensions: vec![u32::MAX, u32::MAX],
+        };
+        assert_eq!(embedded_vlen_slots(&dt), None);
     }
 }
