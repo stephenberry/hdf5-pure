@@ -6705,6 +6705,231 @@ mod tests {
         }
     }
 
+    /// Build a one-element-per-chunk unlimited `d` holding `0..n`, the shape the
+    /// crash-consistency harnesses below grow.
+    fn build_unit_chunked(path: &std::path::Path, n: i32) {
+        use crate::writer::FileBuilder;
+        let data: Vec<i32> = (0..n).collect();
+        let mut b = FileBuilder::new();
+        b.create_dataset("d")
+            .with_i32_data(&data)
+            .with_shape(&[n as u64])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[1]);
+        b.write(path).unwrap();
+    }
+
+    /// Stop an append after `max_phase` durability phases and hand back the
+    /// resulting file. Dropping the engine inside is the simulated crash: no
+    /// further phases run and no close barrier is written.
+    fn append_stopped_at(
+        base: &std::path::Path,
+        out: &std::path::Path,
+        values: std::ops::Range<i32>,
+        max_phase: u8,
+    ) {
+        std::fs::copy(base, out).unwrap();
+        let mut s = WriteEngine::open(out).unwrap();
+        s.append_inplace_i32_phased("d", &values.collect::<Vec<_>>(), max_phase)
+            .unwrap();
+    }
+
+    /// Growing an Extensible-Array index across its inline -> direct-block ->
+    /// super-block boundaries touches far more index structure than the
+    /// partial-tail case above. Stopping at any phase boundary must still read
+    /// back as a consistent prefix.
+    ///
+    /// Restores coverage lost with the deprecated `SwmrWriter` (issue #202); the
+    /// owned path drives the same `apply_ea_append` engine.
+    #[test]
+    fn append_inplace_crash_consistency_across_ea_boundaries() {
+        use crate::reader::File as PureFile;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("base.h5");
+        let (n, target) = (50i32, 250i32);
+        build_unit_chunked(&base, n);
+
+        for max_phase in 1u8..=4 {
+            let p = dir.path().join(format!("crash_ea_{max_phase}.h5"));
+            append_stopped_at(&base, &p, n..target, max_phase);
+            let expected_len = if max_phase == 4 { target } else { n };
+            let f = PureFile::from_bytes(std::fs::read(&p).unwrap()).unwrap();
+            assert_eq!(
+                f.dataset("d").unwrap().read_i32().unwrap(),
+                (0..expected_len).collect::<Vec<_>>(),
+                "inconsistent view after crash at phase {max_phase}"
+            );
+        }
+    }
+
+    /// The same guarantee for an append that crosses the paged-data-block
+    /// boundary (~131,060 chunks), where phase 1 allocates a paged super block,
+    /// paged data blocks, the per-page checksums, and the page-init bitmap. This
+    /// is the most intricate in-place growth the engine performs, and truncating
+    /// it partway is exactly what a power loss does.
+    ///
+    /// Restores coverage lost with the deprecated `SwmrWriter` (issue #202).
+    #[test]
+    fn append_inplace_crash_consistency_paged_prefix() {
+        use crate::reader::File as PureFile;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("base.h5");
+        let (start, target) = (131_000i32, 132_000i32);
+        build_unit_chunked(&base, start);
+
+        for max_phase in 1u8..=4 {
+            let p = dir.path().join(format!("crash_paged_{max_phase}.h5"));
+            append_stopped_at(&base, &p, start..target, max_phase);
+            let expected_len = if max_phase == 4 { target } else { start };
+            let f = PureFile::from_bytes(std::fs::read(&p).unwrap()).unwrap();
+            assert_eq!(
+                f.dataset("d").unwrap().read_i32().unwrap(),
+                (0..expected_len).collect::<Vec<_>>(),
+                "inconsistent paged view after crash at phase {max_phase}"
+            );
+        }
+    }
+
+    /// The consistent-prefix guarantee must hold for the *reference C library*,
+    /// not only this crate's reader — and this crate's reader is the more lenient
+    /// of the two, so it cannot stand in for it.
+    ///
+    /// The pure reader bounds chunk reads by `min(EA count, dimension)`, which
+    /// makes it tolerate a phase-3 state where the element count has advanced
+    /// past the dimension. The C library instead walks strictly by the dataspace
+    /// dimension and re-validates block checksums, so a stale end-of-file, a
+    /// half-grown index, or a mis-checksummed block could satisfy the reader here
+    /// and still break C or h5py. That gap is the whole point of the test:
+    /// crash-safety for the append path is an interop guarantee.
+    ///
+    /// Both starting layouts are covered — a partial trailing chunk and the
+    /// EA-boundary growth above — since they exercise different index writes.
+    ///
+    /// Restores coverage lost with the deprecated `SwmrWriter` and `AppendWriter`
+    /// (issue #202).
+    #[test]
+    // Reads back with the reference HDF5 C library (`hdf5-metno`), a
+    // 64-bit-only dev-dependency; skip on 32-bit so the lib tests run there.
+    #[cfg(not(target_pointer_width = "32"))]
+    fn append_inplace_crash_consistency_c_library_reads_prefix() {
+        use tempfile::tempdir;
+
+        // (initial length, chunk length, appended length): a partial trailing
+        // chunk, a chunk-aligned start, and the EA-boundary crossing.
+        for (n, chunk, add) in [(6i32, 4u64, 5i32), (8, 2, 6), (50, 1, 200)] {
+            let dir = tempdir().unwrap();
+            let base = dir.path().join("base.h5");
+            {
+                use crate::writer::FileBuilder;
+                let mut b = FileBuilder::new();
+                b.create_dataset("d")
+                    .with_i32_data(&(0..n).collect::<Vec<i32>>())
+                    .with_shape(&[n as u64])
+                    .with_maxshape(&[u64::MAX])
+                    .with_chunks(&[chunk]);
+                b.write(&base).unwrap();
+            }
+
+            for max_phase in 1u8..=4 {
+                let p = dir
+                    .path()
+                    .join(format!("crash_c_{n}_{chunk}_{max_phase}.h5"));
+                append_stopped_at(&base, &p, n..n + add, max_phase);
+                let expected_len = if max_phase == 4 { n + add } else { n };
+                let f = hdf5::File::open(&p).unwrap();
+                assert_eq!(
+                    f.dataset("d").unwrap().read_raw::<i32>().unwrap(),
+                    (0..expected_len).collect::<Vec<_>>(),
+                    "C library saw an inconsistent view after crash at phase {max_phase} \
+                     (n={n}, chunk={chunk})"
+                );
+                f.close().unwrap();
+            }
+        }
+    }
+
+    /// Crash recovery across the phase-3/phase-4 gap.
+    ///
+    /// A writer that crashes after publishing the Extensible-Array element count
+    /// (phase 3) but before publishing the dataspace dimension (phase 4) leaves
+    /// the on-disk count ahead of the committed dimension. A fresh writer must
+    /// roll forward from the *committed dimension*, overwriting the uncommitted
+    /// slots, rather than appending past them and leaving a gap.
+    ///
+    /// The crashed and recovering appends deliberately write different values at
+    /// the overlapping positions, so a regression that seeds the chunk count from
+    /// the stale EA header surfaces the crashed writer's values rather than
+    /// merely producing plausible-looking data.
+    ///
+    /// Restores coverage lost with the deprecated `SwmrWriter` (issue #202); the
+    /// surviving `recover_and_reappend_after_clean_phase4` covers only the clean
+    /// case.
+    #[test]
+    // Reads back with the reference HDF5 C library (`hdf5-metno`), a
+    // 64-bit-only dev-dependency; skip on 32-bit so the lib tests run there.
+    #[cfg(not(target_pointer_width = "32"))]
+    fn append_inplace_recover_and_reappend_after_phase3_crash() {
+        use crate::reader::File as PureFile;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("phase3_recover.h5");
+        let n = 50i32;
+        build_unit_chunked(&path, n);
+
+        // Writer 1 crashes after phase 3: the element count advances but the
+        // dimension stays at `n`. Its values are far from the correct
+        // continuation, so a leak is unmistakable.
+        {
+            let mut s = WriteEngine::open(&path).unwrap();
+            s.append_inplace_i32_phased("d", &(1000..1200).collect::<Vec<_>>(), 3)
+                .unwrap();
+        }
+        let committed: Vec<i32> = (0..n).collect();
+        let pf = PureFile::from_bytes(std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            pf.dataset("d").unwrap().read_i32().unwrap(),
+            committed,
+            "phase-3 crash exposed uncommitted data to the pure reader"
+        );
+        {
+            let f = hdf5::File::open(&path).unwrap();
+            assert_eq!(
+                f.dataset("d").unwrap().read_raw::<i32>().unwrap(),
+                committed,
+                "phase-3 crash exposed uncommitted data to the C library"
+            );
+            f.close().unwrap();
+        }
+
+        // Writer 2 recovers: roll forward from the committed dimension,
+        // overwriting the uncommitted slots with the real continuation.
+        {
+            let mut s = WriteEngine::open(&path).unwrap();
+            s.append_inplace_i32_phased("d", &(n..150).collect::<Vec<_>>(), 4)
+                .unwrap();
+        }
+
+        let expected: Vec<i32> = (0..150).collect();
+        let pf = PureFile::from_bytes(std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            pf.dataset("d").unwrap().read_i32().unwrap(),
+            expected,
+            "recovery did not roll forward correctly (pure reader)"
+        );
+        let f = hdf5::File::open(&path).unwrap();
+        assert_eq!(
+            f.dataset("d").unwrap().read_raw::<i32>().unwrap(),
+            expected,
+            "recovery did not roll forward correctly (C library)"
+        );
+        f.close().unwrap();
+    }
+
     #[test]
     fn raw_appendable_recurses_into_aggregates() {
         use crate::datatype::{CompoundMember, DatatypeByteOrder};
