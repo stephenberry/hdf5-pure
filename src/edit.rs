@@ -792,12 +792,19 @@ impl WriteEngine {
         FileSpaceInfo::parse(&msg.data, os, ls).ok()
     }
 
-    /// Stage a new dataset, added on the next [`commit`](Self::commit). The
-    /// argument is the full path of the dataset; everything before the last
-    /// component names the parent group, which must exist (or be created in this
-    /// session). Returns the [`DatasetBuilder`] — the same builder used by
-    /// [`FileBuilder`](crate::FileBuilder) — to configure data, shape, and
-    /// attributes.
+    /// Stage a new dataset, added on the next [`commit`](Self::commit).
+    ///
+    /// `path` is the dataset's full path; everything before the last component
+    /// names the parent group, which must exist (or be created in this session).
+    /// `builder` is the same [`DatasetBuilder`] [`FileBuilder`](crate::FileBuilder)
+    /// uses, configured by the caller; its name is taken from `path`, so the two
+    /// cannot disagree.
+    ///
+    /// The builder is passed in finished rather than handed out as a `&mut` into
+    /// this engine. That is deliberate: a borrow into the engine forces the
+    /// caller to hold it — and, above this layer, its lock — for as long as the
+    /// builder is being configured, which is what let a user closure deadlock
+    /// against the same file it was reading (issue #200).
     ///
     /// The dataset may be contiguous or chunked, and chunked datasets may be
     /// filtered (`with_deflate`, `with_shuffle`, `with_fletcher32`,
@@ -808,19 +815,19 @@ impl WriteEngine {
     /// variable-length-string payload (`with_vlen_strings`), or path-resolved
     /// object-reference elements (`with_path_references`; chunking any of
     /// these is not supported, and dense attributes remain unsupported).
-    pub fn create_dataset(&mut self, path: &str) -> &mut DatasetBuilder {
+    pub(crate) fn stage_created_dataset(&mut self, path: &str, mut builder: DatasetBuilder) {
         let mut comps = split_path(path);
-        let leaf = comps.pop().unwrap_or_default();
-        self.pending_datasets
-            .push((comps, DatasetBuilder::new(&leaf)));
-        &mut self.pending_datasets.last_mut().unwrap().1
+        builder.name = comps.pop().unwrap_or_default();
+        self.pending_datasets.push((comps, builder));
     }
 
     /// Stage an in-place overwrite of an **existing** dataset's values (the HDF5
     /// `H5Dwrite` whole-dataset write), applied on the next
-    /// [`commit`](Self::commit). `path` is the full path of a dataset that must
-    /// already exist; the returned [`DatasetBuilder`] — the same builder used by
-    /// [`create_dataset`](Self::create_dataset) — supplies the replacement data.
+    /// [`commit`](Self::commit).
+    ///
+    /// `path` is the full path of a dataset that must already exist; `builder`
+    /// supplies the replacement data and is named from `path`, as in
+    /// [`stage_created_dataset`](Self::stage_created_dataset).
     ///
     /// This is a *value* overwrite, not a reshape or retype: the new data's
     /// datatype and shape must match the on-disk dataset's exactly (byte-for-byte
@@ -848,25 +855,24 @@ impl WriteEngine {
     /// patched — exactly like an addition relocates the path up to the root. A
     /// relocating overwrite moves the object header, so it is refused unless the
     /// dataset has a single hard link.
-    pub fn write_dataset(&mut self, path: &str) -> &mut DatasetBuilder {
+    pub(crate) fn stage_dataset_write(&mut self, path: &str, mut builder: DatasetBuilder) {
         let comps = split_path(path);
-        let leaf = comps.last().cloned().unwrap_or_default();
-        self.pending_writes
-            .push((comps, DatasetBuilder::new(&leaf)));
-        &mut self.pending_writes.last_mut().unwrap().1
+        builder.name = comps.last().cloned().unwrap_or_default();
+        self.pending_writes.push((comps, builder));
     }
 
     /// Stage an append of new elements to an **existing** chunked, unlimited
-    /// dataset, applied on the next [`commit`](Self::commit). `path` names a
-    /// dataset that must already exist; the returned [`AppendBuilder`] supplies
-    /// the elements to add via its typed / generic / raw `append_*` methods.
+    /// dataset, applied on the next [`commit`](Self::commit).
     ///
-    /// Unlike [`write_dataset`](Self::write_dataset) (a value overwrite that
-    /// forbids any shape change) this **grows** the dataset along its first
-    /// (axis-0) dimension. It works on **filtered** datasets: the appended chunks
-    /// are compressed through the dataset's own on-disk filter pipeline
-    /// (deflate / shuffle / fletcher32 / scale-offset, and ZFP with the `zfp`
-    /// feature), and the pipeline, datatype, fill value, and attributes are
+    /// `path` names a dataset that must already exist; `builder` supplies the
+    /// elements to add via its typed / generic / raw `append_*` methods.
+    ///
+    /// Unlike [`stage_dataset_write`](Self::stage_dataset_write) (a value
+    /// overwrite that forbids any shape change) this **grows** the dataset along
+    /// its first (axis-0) dimension. It works on **filtered** datasets: the
+    /// appended chunks are compressed through the dataset's own on-disk filter
+    /// pipeline (deflate / shuffle / fletcher32 / scale-offset, and ZFP with the
+    /// `zfp` feature), and the pipeline, datatype, fill value, and attributes are
     /// preserved verbatim. Appends of any length are supported — when the
     /// dataset's current length is not a whole multiple of the chunk length, the
     /// single trailing partial chunk is read, extended, and re-encoded; every
@@ -890,10 +896,8 @@ impl WriteEngine {
     /// [`Error::AppendUnsupported`]. Use [`Dataset::is_chunked`](crate::Dataset::is_chunked),
     /// [`maxshape`](crate::Dataset::maxshape), and [`filters`](crate::Dataset::filters)
     /// to check eligibility up front.
-    pub fn append_dataset(&mut self, path: &str) -> &mut AppendBuilder {
-        self.pending_appends
-            .push((split_path(path), AppendBuilder::new()));
-        &mut self.pending_appends.last_mut().unwrap().1
+    pub(crate) fn stage_dataset_append(&mut self, path: &str, builder: AppendBuilder) {
+        self.pending_appends.push((split_path(path), builder));
     }
 
     /// Immediately append rows to an **existing** chunked, unlimited,
@@ -6924,7 +6928,9 @@ mod tests {
         // A clean edit-and-commit cycle heals it.
         {
             let mut s = WriteEngine::open(&path).unwrap();
-            s.create_dataset("e").with_i32_data(&[4, 5]);
+            let mut b = DatasetBuilder::new("e");
+            b.with_i32_data(&[4, 5]);
+            s.stage_created_dataset("e", b);
             s.commit().unwrap();
         }
 
@@ -6967,9 +6973,9 @@ mod tests {
 
         {
             let mut s = WriteEngine::open(&path).unwrap();
-            s.create_dataset("labels")
-                .with_vlen_string_elements(datatype, &elements)
-                .unwrap();
+            let mut b = DatasetBuilder::new("labels");
+            b.with_vlen_string_elements(datatype, &elements).unwrap();
+            s.stage_created_dataset("labels", b);
             s.commit().unwrap();
         }
 
