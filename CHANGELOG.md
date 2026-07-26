@@ -8,7 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- An attribute of any size is written rather than refused: one too large for an object-header message now selects fractal-heap storage on its own (previously only attribute *count* did), and one too large for a managed heap object becomes a *huge* object. Variable-length attributes are unchanged, and a name, datatype, or dataspace past the 2-byte field describing it is refused as the new `FormatError::AttributeFieldTooLong` (joined by `FormatError::TooManyHugeDenseAttributes`) ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
+- An attribute of any size is written rather than refused: one too large for an object-header message now selects fractal-heap storage on its own (previously only attribute *count* did), and one too large for a managed heap object becomes a *huge* object. A name, datatype, or dataspace past the 2-byte field describing it is still refused, as the new `FormatError::AttributeFieldTooLong` (joined by `FormatError::TooManyHugeDenseAttributes`) ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
+
+### Fixed
+
+- A variable-length attribute stored in a fractal heap keeps its values. An object with more than eight attributes, one of them variable-length, wrote that attribute's global-heap references before they had addresses, so this crate's reader silently dropped it from a file the reference C library still listed it in ([#214](https://github.com/stephenberry/hdf5-pure/pull/214)).
 
 ### Removed
 

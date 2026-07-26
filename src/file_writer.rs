@@ -214,27 +214,16 @@ const DENSE_ATTR_DEFAULT_MAX_DIRECT_BLOCK: usize = 65536;
 /// goes dense there. Both are readable; this keeps the existing boundary where it
 /// was rather than moving every such file's layout.
 ///
-/// Size never selects dense storage for a set containing variable-length data.
-/// Those attributes' global-heap references are patched with real addresses well
-/// after the dense blob has been built from a snapshot of their bytes, so the
-/// heap would embed unpatched ones — a file this crate's reader silently drops
-/// the attribute from. That defect predates this rule and still reaches a set of
-/// more than [`DENSE_ATTR_THRESHOLD`] attributes; withholding size-based
-/// selection keeps this from being a *new* way in, where the alternative is
-/// turning a loud refusal into a silent loss.
+/// Variable-length attributes are selected on the same terms as any other. They
+/// were briefly excluded from the size half of the rule, because a heap built
+/// before their global-heap references were patched embedded the placeholders and
+/// this crate's reader then dropped the attribute; the writer now builds each
+/// heap after that patching, so there is nothing to exclude.
 fn needs_dense_attrs(attrs: &[AttributeMessage]) -> bool {
-    if attrs.len() > DENSE_ATTR_THRESHOLD {
-        return true;
-    }
-    if attrs
-        .iter()
-        .any(|a| crate::vl_data::is_vlen_string_datatype(&a.datatype))
-    {
-        return false;
-    }
-    attrs
-        .iter()
-        .any(|a| a.serialize(LENGTH_SIZE).len() > OBJECT_HEADER_MESSAGE_MAX)
+    attrs.len() > DENSE_ATTR_THRESHOLD
+        || attrs
+            .iter()
+            .any(|a| a.serialize(LENGTH_SIZE).len() > OBJECT_HEADER_MESSAGE_MAX)
 }
 
 /// The largest attribute [`build_dense_attrs`] stores as a managed object.
@@ -1571,28 +1560,93 @@ impl FileWriter {
             })
             .collect::<Result<_, FormatError>>()?;
 
-        // Pass 1: compute OH sizes with dummy addresses
-        let group_oh_sizes: Vec<usize> = groups
-            .iter()
-            .enumerate()
-            .map(|(gi, g)| {
-                let mut dummy_links: Vec<LinkMessage> = g
-                    .ds_indices
-                    .iter()
-                    .map(|&i| make_link(&all_ds[i].name, 0))
-                    .collect();
-                for &sgi in &g.sub_group_indices {
-                    dummy_links.push(make_link(&groups[sgi].name, 0));
+        /// Where each object's dense-attribute heap will be written and how many
+        /// bytes it occupies, for the objects that have one.
+        struct DenseSpans {
+            root: Option<(u64, usize)>,
+            groups: Vec<Option<(u64, usize)>>,
+            datasets: Vec<Option<(u64, usize)>>,
+        }
+
+        /// The heaps themselves, in the same order as the spans reserved for them.
+        struct DenseBlobs {
+            root: Option<DenseAttrBlob>,
+            groups: Vec<Option<DenseAttrBlob>>,
+            datasets: Vec<Option<DenseAttrBlob>>,
+        }
+
+        impl DenseSpans {
+            /// Build every reserved heap, at the address reserved for it.
+            ///
+            /// Call once the attributes are final: after the global-heap
+            /// collections have addresses and the variable-length attributes'
+            /// references have been patched with them. A heap's *length* follows
+            /// its attributes' serialized sizes, which patching leaves alone, so
+            /// each blob fills its reserved span exactly.
+            fn build(
+                &self,
+                root_attrs: &[AttributeMessage],
+                groups: &[GrpFlat],
+                datasets: &[DsFlat],
+            ) -> DenseBlobs {
+                fn one(
+                    attrs: &[AttributeMessage],
+                    span: Option<(u64, usize)>,
+                ) -> Option<DenseAttrBlob> {
+                    let (address, reserved) = span?;
+                    let blob = build_dense_attrs(attrs, address);
+                    debug_assert_eq!(
+                        blob.blob.len(),
+                        reserved,
+                        "a dense attribute heap must fill the span reserved for it, or every \
+                         address after it is wrong"
+                    );
+                    Some(blob)
                 }
-                let oh = if group_dense[gi] {
-                    let dummy_blob = build_dense_attrs(&g.attrs, 0);
-                    build_group_oh(&dummy_links, &g.attrs, Some(&dummy_blob))?
-                } else {
-                    build_group_oh(&dummy_links, &g.attrs, None)?
-                };
-                Ok(oh.len())
-            })
-            .collect::<Result<_, FormatError>>()?;
+                DenseBlobs {
+                    root: one(root_attrs, self.root),
+                    groups: groups
+                        .iter()
+                        .zip(&self.groups)
+                        .map(|(g, &span)| one(&g.attrs, span))
+                        .collect(),
+                    datasets: datasets
+                        .iter()
+                        .zip(&self.datasets)
+                        .map(|(d, &span)| one(&d.attrs, span))
+                        .collect(),
+                }
+            }
+        }
+
+        // Pass 1: compute OH sizes with dummy addresses. Each object needing
+        // dense attributes also records its heap's byte length here, so pass 2
+        // can reserve the span without yet building the bytes that go in it —
+        // see `DenseSpans`.
+        let mut group_oh_sizes: Vec<usize> = Vec::with_capacity(groups.len());
+        let mut group_dense_lens: Vec<Option<usize>> = Vec::with_capacity(groups.len());
+        for (gi, g) in groups.iter().enumerate() {
+            let mut dummy_links: Vec<LinkMessage> = g
+                .ds_indices
+                .iter()
+                .map(|&i| make_link(&all_ds[i].name, 0))
+                .collect();
+            for &sgi in &g.sub_group_indices {
+                dummy_links.push(make_link(&groups[sgi].name, 0));
+            }
+            let (oh, dense_len) = if group_dense[gi] {
+                let dummy_blob = build_dense_attrs(&g.attrs, 0);
+                let len = dummy_blob.blob.len();
+                (
+                    build_group_oh(&dummy_links, &g.attrs, Some(&dummy_blob))?,
+                    Some(len),
+                )
+            } else {
+                (build_group_oh(&dummy_links, &g.attrs, None)?, None)
+            };
+            group_oh_sizes.push(oh.len());
+            group_dense_lens.push(dense_len);
+        }
 
         let root_dummy_links: Vec<LinkMessage> = {
             let mut links = Vec::new();
@@ -1604,11 +1658,18 @@ impl FileWriter {
             }
             links
         };
-        let root_oh_size = if root_dense {
+        let (root_oh_size, root_dense_len) = if root_dense {
             let dummy_blob = build_dense_attrs(&root_attrs, 0);
-            build_group_oh(&root_dummy_links, &root_attrs, Some(&dummy_blob))?.len()
+            let len = dummy_blob.blob.len();
+            (
+                build_group_oh(&root_dummy_links, &root_attrs, Some(&dummy_blob))?.len(),
+                Some(len),
+            )
         } else {
-            build_group_oh(&root_dummy_links, &root_attrs, None)?.len()
+            (
+                build_group_oh(&root_dummy_links, &root_attrs, None)?.len(),
+                None,
+            )
         };
 
         // Pass 1: compute dataset object-header sizes from a dummy layout. No
@@ -1623,6 +1684,7 @@ impl FileWriter {
         // without a second build. A chunked data length is base-address
         // independent, so the dummy-base build gives the true length.
         let mut ds_data_lens: Vec<u64> = Vec::with_capacity(all_ds.len());
+        let mut ds_dense_lens: Vec<Option<usize>> = Vec::with_capacity(all_ds.len());
         let mut dummy_cursor = 0u64;
         for (i, d) in all_ds.iter().enumerate() {
             let dense_blob = if ds_dense[i] {
@@ -1630,6 +1692,7 @@ impl FileWriter {
             } else {
                 None
             };
+            ds_dense_lens.push(dense_blob.as_ref().map(|b| b.blob.len()));
             let oh = if is_chunked[i] {
                 let built = build_chunked(d, dummy_cursor, chunk_sets[i].as_ref())?;
                 dummy_cursor += built.data.len();
@@ -1674,49 +1737,53 @@ impl FileWriter {
         let root_group_addr = (SUPERBLOCK_SIZE + early_gcol_size) as u64;
         let mut cursor2 = SUPERBLOCK_SIZE + early_gcol_size + root_oh_size;
 
-        let root_dense_blob = if root_dense {
-            let blob = build_dense_attrs(&root_attrs, cursor2 as u64);
-            cursor2 += blob.blob.len();
-            Some(blob)
-        } else {
-            None
+        // Space set aside for a dense-attribute heap, and the heaps themselves
+        // once the attribute bytes they copy are final. The two are separate
+        // steps on purpose: a heap embeds a *copy* of each attribute's serialized
+        // bytes, and a variable-length attribute's bytes hold global-heap
+        // references that only get real addresses after every heap's span is
+        // fixed — the collections sit past the heaps in the layout. Building the
+        // bytes here would freeze the placeholder references into the heap, and a
+        // reader that cannot resolve them drops the attribute entirely.
+        let reserve = |cursor2: &mut usize, len: Option<usize>| {
+            len.map(|len| {
+                let addr = *cursor2 as u64;
+                *cursor2 += len;
+                (addr, len)
+            })
         };
 
-        let mut group_dense_blobs: Vec<Option<DenseAttrBlob>> = Vec::new();
+        let root_dense_span = reserve(&mut cursor2, root_dense_len);
+
+        let mut group_dense_spans: Vec<Option<(u64, usize)>> = Vec::with_capacity(groups.len());
         let group_addrs2: Vec<u64> = group_oh_sizes
             .iter()
             .enumerate()
             .map(|(gi, &sz)| {
                 let addr = cursor2 as u64;
                 cursor2 += sz;
-                if group_dense[gi] {
-                    let blob = build_dense_attrs(&groups[gi].attrs, cursor2 as u64);
-                    cursor2 += blob.blob.len();
-                    group_dense_blobs.push(Some(blob));
-                } else {
-                    group_dense_blobs.push(None);
-                }
+                group_dense_spans.push(reserve(&mut cursor2, group_dense_lens[gi]));
                 addr
             })
             .collect();
 
-        let mut ds_dense_blobs: Vec<Option<DenseAttrBlob>> = Vec::new();
+        let mut ds_dense_spans: Vec<Option<(u64, usize)>> = Vec::with_capacity(all_ds.len());
         let ds_oh_addrs2: Vec<u64> = actual_ds_oh_sizes
             .iter()
             .enumerate()
             .map(|(i, &sz)| {
                 let addr = cursor2 as u64;
                 cursor2 += sz;
-                if ds_dense[i] {
-                    let blob = build_dense_attrs(&all_ds[i].attrs, cursor2 as u64);
-                    cursor2 += blob.blob.len();
-                    ds_dense_blobs.push(Some(blob));
-                } else {
-                    ds_dense_blobs.push(None);
-                }
+                ds_dense_spans.push(reserve(&mut cursor2, ds_dense_lens[i]));
                 addr
             })
             .collect();
+
+        let dense_spans = DenseSpans {
+            root: root_dense_span,
+            groups: group_dense_spans,
+            datasets: ds_dense_spans,
+        };
 
         // Resolve path-based references now that all addresses are known.
         // Build a map of (group_name, child_name) -> address for resolution.
@@ -1849,6 +1916,14 @@ impl FileWriter {
             }
             let gcol_total_size = gcol_cursor - gcol_start;
             meta += gcol_total_size;
+
+            // The attributes are final now, so the dense heaps that copy them can
+            // be built into the spans reserved above.
+            let DenseBlobs {
+                root: root_dense_blob,
+                groups: group_dense_blobs,
+                datasets: ds_dense_blobs,
+            } = dense_spans.build(&root_attrs, &groups, &all_ds);
 
             // (b) Superblock extension (File Space Info) in the metadata region.
             let ext_addr = meta;
@@ -2372,6 +2447,14 @@ impl FileWriter {
                 gcol_total_size = (gcol_cursor - cursor2 as u64) as usize;
             }
         }
+
+        // The attributes are final now, so the dense heaps that copy them can be
+        // built into the spans reserved for them.
+        let DenseBlobs {
+            root: root_dense_blob,
+            groups: group_dense_blobs,
+            datasets: ds_dense_blobs,
+        } = dense_spans.build(&root_attrs, &groups, &all_ds);
 
         // Build dataset OHs now that attrs are patched. Only the header bytes
         // are kept here; each dataset's data is emitted directly from

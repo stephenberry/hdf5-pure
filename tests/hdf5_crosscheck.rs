@@ -910,6 +910,34 @@ fn crosscheck_varlen_ascii_array_attr() {
     assert_eq!(values, vec![1.0]);
 }
 
+/// A variable-length attribute in *dense* storage, which the compact case above
+/// does not reach. The heap embeds a copy of the attribute's element bytes, and
+/// those bytes are global-heap references: a heap built before they were patched
+/// left the reference C library resolving addresses that were never assigned.
+#[test]
+fn crosscheck_varlen_ascii_array_attr_in_dense_storage() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vl_ascii_dense.h5");
+
+    let expected = ["x", "y", "velocity"];
+    let mut builder = FileBuilder::new();
+    builder.set_attr(
+        "MATLAB_fields",
+        AttrValue::VarLenAsciiArray(expected.iter().map(|s| (*s).to_string()).collect()),
+    );
+    // Past the eight-attribute threshold, so the set is stored in a fractal heap.
+    for i in 0..12 {
+        builder.set_attr(&format!("filler_{i}"), AttrValue::I64(i));
+    }
+    builder.create_dataset("x").with_f64_data(&[1.0]);
+    builder.write(&path).unwrap();
+
+    let file = hdf5::File::open(&path).unwrap();
+    assert_eq!(file.attr_names().unwrap().len(), 13);
+    let attr = file.attr("MATLAB_fields").unwrap();
+    assert_eq!(read_vl_ascii_attr(&attr), expected);
+}
+
 #[test]
 fn crosscheck_dense_attributes() {
     let dir = tempdir().unwrap();

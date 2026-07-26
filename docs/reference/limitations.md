@@ -51,18 +51,16 @@ Adding an **object-reference dataset** (`Group::create_dataset` with `with_path_
 
 A version 2 object header describes each message's length in a 2-byte field, so no message it carries may exceed `OBJECT_HEADER_MESSAGE_MAX` (65,535 bytes). The whole-file writer refuses rather than truncating:
 
-- A **compact attribute** past the limit is refused with `FormatError::AttributeMessageTooLarge`, naming the attribute. The limit is on the *message* — name, datatype, dataspace, and data — not on the element count. Root, group, and dataset attributes are all checked, on the writer's own path and through `repack`. Attributes are metadata; store a payload that large as a dataset instead.
+- A **compact attribute** past the limit would be refused with `FormatError::AttributeMessageTooLarge`, naming the attribute. The limit is on the *message* — name, datatype, dataspace, and data — not on the element count.
 - Any **other** oversized message — most reachably a Link message from a very long dataset or group name — is refused with `FormatError::ObjectHeaderMessageTooLarge`, carrying the message type.
 
-An attribute that would exceed the limit is not refused, though: it selects fractal-heap storage instead, where no such field bounds it. See [dense attribute storage](#dense-attribute-storage) below. `AttributeMessageTooLarge` therefore reports an attribute the *header* cannot hold and dense storage could not rescue — reachable through `repack` and the in-place editor, which do not choose storage the way the whole-file writer does.
+An attribute that would exceed the limit is not refused, though: it selects fractal-heap storage instead, where no such field bounds it. See [dense attribute storage](#dense-attribute-storage) below. `AttributeMessageTooLarge` is therefore a backstop no input reaches today — the writer sends exactly those attributes to a heap — kept because the limit it describes is a real property of the object header. Only `ObjectHeaderMessageTooLarge`, which covers messages with no heap alternative, is reachable on size.
 
 The [in-place editor](../guide/editing.md) enforces the same limit separately, reporting `Error::EditUnsupported`.
 
 ### Dense attribute storage
 
 An object stores its attributes in a fractal heap when it has more than eight of them, **or** when any one of them is too large for an object-header message — the same disjunction the reference C library uses, and the reason a single large attribute is written rather than refused.
-
-The size half of that rule is withheld from any attribute set containing **variable-length** data. Those attributes' global-heap references are assigned real addresses after the heap has already been built from a snapshot of their bytes, so the heap would embed unpatched ones and this crate's reader would drop the attribute. An oversized variable-length attribute is therefore still refused with `FormatError::AttributeMessageTooLarge` rather than written. The same defect is reachable — and not guarded — when more than eight attributes select dense storage by count and one of them is variable-length.
 
 The writer emits a single root direct block indexed by a single-leaf B-tree. An attribute serializing past **65,514 bytes** does not fit a heap *managed* object, so it is written as a **huge** object instead: its bytes go outside the managed blocks and a huge-objects B-tree maps a generated ID to them. There is no limit on an individual attribute's size. What is still refused:
 
