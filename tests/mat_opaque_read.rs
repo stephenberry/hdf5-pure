@@ -184,7 +184,7 @@ fn build_mat(
 ) -> Vec<u8> {
     let mut fb = FileBuilder::new();
 
-    let mut refs = fb.create_group("#refs#", |_| {});
+    let mut refs = fb.create_group("#refs#");
     let mut mcos_paths = Vec::new();
     for (name, cell) in heap {
         let d = refs.create_dataset(name);
@@ -197,7 +197,7 @@ fn build_mat(
     }
     fb.add_group(refs.finish());
 
-    let mut sub = fb.create_group("#subsystem#", |_| {});
+    let mut sub = fb.create_group("#subsystem#");
     {
         let path_refs: Vec<&str> = mcos_paths.iter().map(String::as_str).collect();
         let d = sub.create_dataset("MCOS");
