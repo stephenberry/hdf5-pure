@@ -78,6 +78,15 @@ criterion = { version = "0.5", default-features = false }
 # pure-Rust suite on a 32-bit pointer width without building any C code. The
 # crosscheck test files carry
 # the matching `#![cfg(not(target_pointer_width = "32"))]` gate.
+#
+# The suite validates against the current *released* libhdf5, not a development
+# snapshot. Which one that is comes from the `hdf5-metno-src` pin in
+# `Cargo.lock`, since every CI job runs `--locked`; read `H5_VERS_MAJOR/MINOR/
+# RELEASE` in that crate's `ext/hdf5/src/H5public.h` to see it. Judge a bump by
+# the crosschecks rather than by release notes: several of them assert constants
+# derived from libhdf5 internals that a version change could move, and
+# `tests/c_absence_predicate.rs` guards the assertion most sensitive to one by
+# re-measuring the C library's error codes against deliberately damaged files.
 [target.'cfg(not(target_pointer_width = "32"))'.dev-dependencies]
 hdf5 = { package = "hdf5-metno", version = "0.14", features = ["static", "zlib"] }
 
