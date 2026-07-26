@@ -28,7 +28,7 @@ Runnable, self-checking examples live in [`examples/`](examples). Run any with `
 | `compression` | Deflate, shuffle, and scale-offset filters |
 | `compound_types` | Compound (struct-like) records and complex numbers |
 | `ndarray_io` | N-dimensional array I/O (needs `--features ndarray`) |
-| `edit_in_place` | Add, copy, and delete objects with `EditSession` |
+| `edit_in_place` | Add, copy, and delete objects with `File::open_rw` |
 | `repack` | Shrink a file and drop objects with `repack` |
 | `swmr` | Single-writer / multiple-reader append and refresh |
 | `file_space` | File-space strategy and persistent free-space reuse across sessions |
@@ -107,9 +107,7 @@ lossless read. For N-dimensional arrays see the `ndarray` feature below.
 
 ### Editing in place
 
-`EditSession` opens an existing file and adds, deletes, or copies objects, appends to chunked unlimited datasets in place (including filtered/compressed ones, via `append_dataset`), or edits compact group attributes without rewriting the file from scratch. New data and the rebuilt object headers are appended at the end of the file and the superblock is repointed last, so the cost is proportional to what changes and a failed commit leaves the file valid. For many repeated appends to a single 1-D unlimited dataset, opening with `File::open_rw` and appending through a `Dataset` handle grows the index in place at amortized `O(1)` cost instead of re-reading and rebuilding it on every `append_dataset` commit; unfiltered appends may be any length, while filtered appends this way must be chunk-aligned.
-
-> **Deprecated:** the path-based `EditSession` API is superseded by the owned-handle API shown here — open with `File::open_rw` and edit through owned `Dataset`/`Group` handles that also read back by name — and will be removed in a later release.
+`File::open_rw` opens an existing file and adds, deletes, or copies objects, appends to chunked unlimited datasets in place (including filtered/compressed ones, via `Dataset::append_staged`), or edits compact group attributes without rewriting the file from scratch. New data and the rebuilt object headers are appended at the end of the file and the superblock is repointed last, so the cost is proportional to what changes and a failed commit leaves the file valid. For many repeated appends to a single 1-D unlimited dataset, opening with `File::open_rw` and appending through a `Dataset` handle grows the index in place at amortized `O(1)` cost instead of re-reading and rebuilding it on every `append_staged` commit; unfiltered appends may be any length, while filtered appends this way must be chunk-aligned.
 
 ```rust,no_run
 use hdf5_pure::File;
@@ -127,11 +125,11 @@ file.commit().unwrap();  // apply staged edits in place
 
 Contiguous and chunked datasets — the latter with any supported filter (deflate, shuffle, fletcher32, scale-offset) and optionally extensible (unlimited) dimensions — and compact-link groups are supported, and the editor edits files across every on-disk format the reference C library and h5py produce — version 0/1/2/3 superblocks, single- and multi-chunk object headers (a multi-chunk header is collapsed into one chunk on rewrite, and a version 0/1 symbol-table group on the edited path is converted to the latest compact-link format). It refuses, rather than silently degrade the file, anything it cannot reproduce faithfully — a chunked or extensible variable-length addition, dense-storage headers on the edited path, or copying a version-1 object. Within a session the space a deletion frees — for contiguous and chunked datasets alike, including the chunk index — is reused for later writes and the file is truncated when the freed bytes reach the end, so add/delete churn stays bounded instead of only ever growing; for guaranteed compaction across a reopen, see `repack` below.
 
-`EditSession::open` takes an exclusive OS advisory lock (the analogue of `H5Pset_file_locking`), so a second editor or any concurrent writer gets `Error::FileLocked` rather than racing on the file. The kernel releases the lock on any process exit, including a crash, so a crashed editor never leaves a stale lock behind. Override the policy with `EditSession::open_with_locking` and the `FileLocking` enum, or set `HDF5_USE_FILE_LOCKING=FALSE` for filesystems (such as some network mounts) where locking is unavailable. `SwmrWriter` and the readers intentionally take no lock: SWMR is single-writer by contract and built for concurrent reads.
+`File::open_rw` takes an exclusive OS advisory lock (the analogue of `H5Pset_file_locking`), so a second editor or any concurrent writer gets `Error::FileLocked` rather than racing on the file. The kernel releases the lock on any process exit, including a crash, so a crashed editor never leaves a stale lock behind. Override the policy with `File::open_rw_with_locking` and the `FileLocking` enum, or set `HDF5_USE_FILE_LOCKING=FALSE` for filesystems (such as some network mounts) where locking is unavailable. `File::open_swmr_writer` and the readers intentionally take no lock: SWMR is single-writer by contract and built for concurrent reads.
 
 ### Reclaiming space (`repack`)
 
-Deleting an object inside an `EditSession` reuses the freed space within the session, but a single delete-then-close cannot shrink a file whose freed region is not at the very end — the same reason the HDF5 C library ships `h5repack`. `repack` is the guaranteed-shrink answer: it reads every surviving object and rewrites the whole file compact, optionally dropping objects.
+Deleting an object inside a `File::open_rw` session reuses the freed space within the session, but a single delete-then-close cannot shrink a file whose freed region is not at the very end — the same reason the HDF5 C library ships `h5repack`. `repack` is the guaranteed-shrink answer: it reads every surviving object and rewrites the whole file compact, optionally dropping objects.
 
 ```rust,no_run
 use hdf5_pure::{repack, RepackOptions};
@@ -284,8 +282,6 @@ builder.write("stream.h5").unwrap();
 ```
 
 Append in place (each call flushes durably; the file stays valid for concurrent readers throughout):
-
-> **Deprecated:** the `SwmrWriter` type is superseded by the owned-handle API shown here — open with `File::open_swmr_writer` and append through a `Dataset` handle — and will be removed in a later release.
 
 ```rust,no_run
 use hdf5_pure::File;

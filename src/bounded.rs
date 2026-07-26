@@ -1206,7 +1206,7 @@ mod tests {
             .unwrap()
     }
 
-    /// Crash consistency, mirroring the `WriteEngine` and `AppendWriter`
+    /// Crash consistency, mirroring the `WriteEngine` and `Dataset::append`
     /// harnesses: stop the append after only the first `max_phase` durability
     /// phases (simulating a crash at that boundary) and assert the reopened
     /// file reads either the old length (phases 1-3) or the new one (phase 4),

@@ -814,7 +814,7 @@ pub enum Error {
     /// Extensible-Array indexed). The payload is a human-readable reason.
     SwmrAppendUnsupported(&'static str),
     /// The dataset is not a supported target for
-    /// [`EditSession::append_dataset`](crate::EditSession::append_dataset) — for
+    /// [`Dataset::append_staged`](crate::Dataset::append_staged) — for
     /// example a dataset that is not chunked, not extensible along its first
     /// dimension, not indexed by an Extensible Array, higher than rank 1, uses a
     /// filter this engine cannot re-encode, has a big-endian on-disk element
@@ -823,18 +823,18 @@ pub enum Error {
     AppendUnsupported(&'static str),
     /// The dataset or file is not a supported target for the fast, immediate
     /// in-place append
-    /// ([`EditSession::append_inplace`](crate::EditSession::append_inplace)) — for
+    /// ([`Dataset::append`](crate::Dataset::append)) — for
     /// example a userblock or non-latest-format file, a dataset whose
     /// Extensible-Array index is not yet allocated, one that is not rank-1 /
     /// unlimited / Extensible-Array indexed, one reachable through more than one
     /// hard link, or a path an uncommitted staged edit in the same session will
     /// relocate or delete. Distinct from [`AppendUnsupported`](Self::AppendUnsupported)
     /// so a caller can catch this fast-path refusal and fall back to the staged
-    /// [`EditSession::append_dataset`](crate::EditSession::append_dataset). The
+    /// [`Dataset::append_staged`](crate::Dataset::append_staged). The
     /// payload is a human-readable reason.
     AppendInPlaceUnsupported(&'static str),
     /// The file or the requested object is not a supported target for the
-    /// in-place editor ([`crate::EditSession`]) — for example a userblock or
+    /// in-place editor ([`crate::File::open_rw`]) — for example a userblock or
     /// non-latest-format file, a group whose links are densely stored, or a
     /// dataset shape/datatype/filter combination the in-place writer cannot
     /// emit yet. The payload is a human-readable reason.
@@ -846,8 +846,8 @@ pub enum Error {
     /// filter, or an object reference. The payload names the object and reason.
     RepackUnsupported(String),
     /// The file could not be opened because another process holds a conflicting
-    /// OS advisory lock — for a writer ([`crate::SwmrWriter`],
-    /// [`crate::EditSession`]) this means another writer or reader is active;
+    /// OS advisory lock — for a writer ([`crate::File::open_swmr_writer`],
+    /// [`crate::File::open_rw`]) this means another writer or reader is active;
     /// for a plain reader it means a writer is active. The lock is released
     /// automatically when the holder's process exits, so a crashed writer does
     /// not leave a stale lock. Locking can be disabled per open with

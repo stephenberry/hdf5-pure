@@ -7,10 +7,9 @@
 //! reference C library. Appends cross the inline -> direct-block -> super-block
 //! boundaries so the in-place index growth is exercised.
 
-#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5::Extent;
 use hdf5::file::LibraryVersion;
-use hdf5_pure::{Error, File, FileBuilder, FormatError, SwmrWriter};
+use hdf5_pure::{Error, File, FileBuilder};
 use tempfile::tempdir;
 
 fn pure_create(path: &std::path::Path, n: usize) {
@@ -59,13 +58,22 @@ fn append_to_pure_file() {
     pure_create(&path, 10);
 
     {
-        let mut w = SwmrWriter::open(&path).unwrap();
+        let w = File::open_swmr_writer(&path).unwrap();
         // 10 -> 100 (fills direct data blocks)
-        w.append_i32("d", &(10..100).collect::<Vec<_>>()).unwrap();
+        w.dataset("d")
+            .unwrap()
+            .append(&(10..100).collect::<Vec<_>>())
+            .unwrap();
         // 100 -> 300 (crosses into the first super block)
-        w.append_i32("d", &(100..300).collect::<Vec<_>>()).unwrap();
+        w.dataset("d")
+            .unwrap()
+            .append(&(100..300).collect::<Vec<_>>())
+            .unwrap();
         // 300 -> 5000 (deeper super-block nesting)
-        w.append_i32("d", &(300..5000).collect::<Vec<_>>()).unwrap();
+        w.dataset("d")
+            .unwrap()
+            .append(&(300..5000).collect::<Vec<_>>())
+            .unwrap();
     }
 
     let expected: Vec<i32> = (0..5000).collect();
@@ -81,8 +89,11 @@ fn append_to_c_file() {
     c_create(&path, 10);
 
     {
-        let mut w = SwmrWriter::open(&path).unwrap();
-        w.append_i32("d", &(10..1000).collect::<Vec<_>>()).unwrap();
+        let w = File::open_swmr_writer(&path).unwrap();
+        w.dataset("d")
+            .unwrap()
+            .append(&(10..1000).collect::<Vec<_>>())
+            .unwrap();
     }
 
     let expected: Vec<i32> = (0..1000).collect();
@@ -104,8 +115,11 @@ fn refreshing_reader_follows_pure_appends() {
         (0..10).collect::<Vec<_>>()
     );
 
-    let mut w = SwmrWriter::open(&path).unwrap();
-    w.append_i32("d", &(10..300).collect::<Vec<_>>()).unwrap();
+    let w = File::open_swmr_writer(&path).unwrap();
+    w.dataset("d")
+        .unwrap()
+        .append(&(10..300).collect::<Vec<_>>())
+        .unwrap();
 
     reader.refresh().unwrap();
     {
@@ -115,7 +129,10 @@ fn refreshing_reader_follows_pure_appends() {
     }
 
     // Another round of appends, then refresh again.
-    w.append_i32("d", &(300..900).collect::<Vec<_>>()).unwrap();
+    w.dataset("d")
+        .unwrap()
+        .append(&(300..900).collect::<Vec<_>>())
+        .unwrap();
     reader.refresh().unwrap();
     assert_eq!(
         reader.dataset("d").unwrap().read_i32().unwrap(),
@@ -143,8 +160,10 @@ fn append_crosses_paging_boundary() {
         b.write(&path).unwrap();
     }
     {
-        let mut w = SwmrWriter::open(&path).unwrap();
-        w.append_i32("d", &(start as i32..end as i32).collect::<Vec<_>>())
+        let w = File::open_swmr_writer(&path).unwrap();
+        w.dataset("d")
+            .unwrap()
+            .append(&(start as i32..end as i32).collect::<Vec<_>>())
             .unwrap();
     }
     let expected: Vec<i32> = (0..end as i32).collect();
@@ -184,7 +203,7 @@ fn rejects_and_preserves_non_latest_format_file() {
         before[off + 8]
     );
 
-    let err = match SwmrWriter::open(&path) {
+    let err = match File::open_swmr_writer(&path) {
         Ok(_) => panic!("expected open() to reject a v0/v1 superblock file"),
         Err(e) => e,
     };
@@ -214,9 +233,9 @@ fn append_f64_pure_file() {
         b.write(&path).unwrap();
     }
     {
-        let mut w = SwmrWriter::open(&path).unwrap();
+        let w = File::open_swmr_writer(&path).unwrap();
         let more: Vec<f64> = (5..400).map(|i| i as f64).collect();
-        w.append_f64("d", &more).unwrap();
+        w.dataset("d").unwrap().append(&more).unwrap();
     }
     let f = hdf5::File::open(&path).unwrap();
     let v = f.dataset("d").unwrap().read_raw::<f64>().unwrap();
@@ -244,19 +263,25 @@ fn append_chunk_size_greater_than_one() {
     b.write(&path).unwrap();
 
     {
-        let mut w = SwmrWriter::open(&path).unwrap();
+        let w = File::open_swmr_writer(&path).unwrap();
         // Aligned (multiples of the chunk length), crossing inline -> direct -> super.
-        w.append_i32("d", &(16..240).collect::<Vec<_>>()).unwrap();
-        w.append_i32("d", &(240..400).collect::<Vec<_>>()).unwrap();
+        w.dataset("d")
+            .unwrap()
+            .append(&(16..240).collect::<Vec<_>>())
+            .unwrap();
+        w.dataset("d")
+            .unwrap()
+            .append(&(240..400).collect::<Vec<_>>())
+            .unwrap();
 
         // Unaligned append (2 elements, 2 % 4 != 0) is rejected before any write.
-        let err = match w.append_i32("d", &[400, 401]) {
+        let err = match w.dataset("d").unwrap().append(&[400, 401]) {
             Ok(()) => panic!("expected an unaligned append to be rejected"),
             Err(e) => e,
         };
         assert!(
-            matches!(err, Error::Format(FormatError::ChunkedReadError(_))),
-            "expected ChunkedReadError for an unaligned append, got {err:?}"
+            matches!(err, Error::SwmrAppendUnsupported(_)),
+            "expected SwmrAppendUnsupported for an unaligned append, got {err:?}"
         );
     }
 
@@ -303,8 +328,11 @@ fn append_to_one_of_multiple_datasets_leaves_others_intact() {
 
     // Append into "a", crossing into the super blocks; "b" must be untouched.
     {
-        let mut w = SwmrWriter::open(&path).unwrap();
-        w.append_i32("a", &(10..300).collect::<Vec<_>>()).unwrap();
+        let w = File::open_swmr_writer(&path).unwrap();
+        w.dataset("a")
+            .unwrap()
+            .append(&(10..300).collect::<Vec<_>>())
+            .unwrap();
     }
     assert_eq!(read_pure_named("a"), (0..300).collect::<Vec<_>>());
     assert_eq!(
@@ -320,8 +348,11 @@ fn append_to_one_of_multiple_datasets_leaves_others_intact() {
 
     // Now append into "b"; "a" must be untouched.
     {
-        let mut w = SwmrWriter::open(&path).unwrap();
-        w.append_i32("b", &(110..400).collect::<Vec<_>>()).unwrap();
+        let w = File::open_swmr_writer(&path).unwrap();
+        w.dataset("b")
+            .unwrap()
+            .append(&(110..400).collect::<Vec<_>>())
+            .unwrap();
     }
     assert_eq!(
         read_pure_named("a"),
@@ -350,14 +381,20 @@ fn recover_and_reappend_after_clean_phase4() {
 
     // Writer 1: append across inline -> direct -> super, clean close.
     {
-        let mut w = SwmrWriter::open(&path).unwrap();
-        w.append_i32("d", &(10..300).collect::<Vec<_>>()).unwrap();
+        let w = File::open_swmr_writer(&path).unwrap();
+        w.dataset("d")
+            .unwrap()
+            .append(&(10..300).collect::<Vec<_>>())
+            .unwrap();
         w.close().unwrap();
     }
     // Writer 2: re-derive committed state from disk, continue appending.
     {
-        let mut w = SwmrWriter::open(&path).unwrap();
-        w.append_i32("d", &(300..900).collect::<Vec<_>>()).unwrap();
+        let w = File::open_swmr_writer(&path).unwrap();
+        w.dataset("d")
+            .unwrap()
+            .append(&(300..900).collect::<Vec<_>>())
+            .unwrap();
         w.close().unwrap();
     }
 
@@ -396,8 +433,12 @@ fn rejects_filtered_pure_dataset() {
 
     {
         // open() only validates the superblock; the filter is caught at append.
-        let mut w = SwmrWriter::open(&path).unwrap();
-        let err = match w.append_i32("d", &(100..110).collect::<Vec<_>>()) {
+        let w = File::open_swmr_writer(&path).unwrap();
+        let err = match w
+            .dataset("d")
+            .unwrap()
+            .append(&(100..110).collect::<Vec<_>>())
+        {
             Ok(()) => panic!("expected a filtered dataset to be rejected"),
             Err(e) => e,
         };

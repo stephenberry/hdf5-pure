@@ -13,8 +13,7 @@
 //! cargo run --example swmr
 //! ```
 
-#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
-use hdf5_pure::{File, FileBuilder, SwmrWriter};
+use hdf5_pure::{File, FileBuilder};
 
 fn main() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -38,9 +37,9 @@ fn main() {
 
     // The writer appends in place. Each call flushes durably, leaving the file
     // valid for the concurrent reader throughout.
-    let mut writer = SwmrWriter::open(&path).expect("open writer");
-    writer.append_i32("log", &[3, 4, 5]).unwrap();
-    writer.append_i32("log", &[6, 7]).unwrap();
+    let writer = File::open_swmr_writer(&path).expect("open writer");
+    writer.dataset("log").unwrap().append(&[3, 4, 5]).unwrap();
+    writer.dataset("log").unwrap().append(&[6, 7]).unwrap();
     writer.close().unwrap(); // clears the SWMR flag; dropping the writer also works
 
     // The reader refreshes to observe the appended data.

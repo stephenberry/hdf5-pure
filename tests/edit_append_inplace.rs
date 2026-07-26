@@ -1,13 +1,12 @@
-//! Pure-Rust tests for [`EditSession::append_inplace`] (issue #146): immediate,
+//! Pure-Rust tests for [`Dataset::append`] (issue #146): immediate,
 //! crash-atomic O(1) in-place appends driven from the same long-lived
-//! `EditSession` that stages group/dataset/attribute/delete edits — interleaved
+//! `File::open_rw` that stages group/dataset/attribute/delete edits — interleaved
 //! with those staged edits, without reopening the file. Crash-consistency phasing
 //! lives in the in-crate `edit::tests` module; C-library interop (including
 //! hard-link aliasing and a combined mixed-edit file) lives in
 //! `edit_crosscheck.rs`.
 
-#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
-use hdf5_pure::{AttrValue, EditSession, Error, File, FileBuilder, FileSpaceStrategy};
+use hdf5_pure::{AttrValue, Error, File, FileBuilder, FileSpaceStrategy, FormatError};
 use tempfile::tempdir;
 
 /// Build a rank-1, unlimited i32 dataset at `name` with the given chunk length and
@@ -41,10 +40,10 @@ fn unfiltered_any_length_across_calls() {
     build(&p, "d", 6, 4, false); // partial tail (6 % 4 != 0)
 
     {
-        let mut s = EditSession::open(&p).unwrap();
-        s.append_inplace_i32("d", &[6, 7]).unwrap(); // grows the partial chunk
-        s.append_inplace_i32("d", &[8, 9, 10, 11, 12]).unwrap(); // any length
-        s.append_inplace("d", &[13i32]).unwrap(); // generic entry point
+        let s = File::open_rw(&p).unwrap();
+        s.dataset("d").unwrap().append(&[6, 7]).unwrap(); // grows the partial chunk
+        s.dataset("d").unwrap().append(&[8, 9, 10, 11, 12]).unwrap(); // any length
+        s.dataset("d").unwrap().append(&[13i32]).unwrap(); // generic entry point
     }
 
     assert_eq!(read_i32(&p, "d"), (0..14).collect::<Vec<_>>());
@@ -57,9 +56,9 @@ fn unfiltered_raw_append() {
     build(&p, "d", 4, 4, false);
 
     {
-        let mut s = EditSession::open(&p).unwrap();
+        let s = File::open_rw(&p).unwrap();
         let bytes: Vec<u8> = [4i32, 5, 6].iter().flat_map(|v| v.to_le_bytes()).collect();
-        s.append_inplace_raw("d", &bytes).unwrap();
+        s.dataset("d").unwrap().append_raw(&bytes).unwrap();
     }
 
     assert_eq!(read_i32(&p, "d"), (0..7).collect::<Vec<_>>());
@@ -72,8 +71,8 @@ fn filtered_whole_chunk() {
     build(&p, "d", 8, 4, true); // 2 full chunks, deflate
 
     {
-        let mut s = EditSession::open(&p).unwrap();
-        s.append_inplace_i32("d", &[8, 9, 10, 11]).unwrap(); // one whole chunk
+        let s = File::open_rw(&p).unwrap();
+        s.dataset("d").unwrap().append(&[8, 9, 10, 11]).unwrap(); // one whole chunk
     }
 
     assert_eq!(read_i32(&p, "d"), (0..12).collect::<Vec<_>>());
@@ -85,9 +84,9 @@ fn filtered_unaligned_refused() {
     let p = dir.path().join("d.h5");
     build(&p, "d", 8, 4, true);
 
-    let mut s = EditSession::open(&p).unwrap();
+    let s = File::open_rw(&p).unwrap();
     // Not a whole chunk (2 of 4): a filtered element cannot be repointed atomically.
-    let err = s.append_inplace_i32("d", &[8, 9]).unwrap_err();
+    let err = s.dataset("d").unwrap().append(&[8, 9]).unwrap_err();
     assert!(matches!(err, Error::AppendInPlaceUnsupported(_)));
 }
 
@@ -110,29 +109,35 @@ fn interleave_append_stage_commit_append() {
     }
 
     {
-        let mut s = EditSession::open(&p).unwrap();
+        let s = File::open_rw(&p).unwrap();
         // Immediate append.
-        s.append_inplace_i32("d", &[6, 7, 8]).unwrap(); // d -> 0..9
+        s.dataset("d").unwrap().append(&[6, 7, 8]).unwrap(); // d -> 0..9
         assert!(!s.has_staged_edits());
 
         // Stage a batch of tree edits.
-        s.create_group("run2");
-        s.set_group_attr("run2", "count", AttrValue::I64(7));
-        s.create_dataset("created")
-            .with_i32_data(&(0..4).collect::<Vec<_>>())
-            .with_shape(&[4])
-            .with_maxshape(&[u64::MAX])
-            .with_chunks(&[4]);
-        s.delete("doomed");
+        s.root()
+            .create_group_with("run2", |g| {
+                g.set_attr("count", AttrValue::I64(7));
+            })
+            .unwrap();
+        s.root()
+            .create_dataset("created", |b| {
+                b.with_i32_data(&(0..4).collect::<Vec<_>>())
+                    .with_shape(&[4])
+                    .with_maxshape(&[u64::MAX])
+                    .with_chunks(&[4]);
+            })
+            .unwrap();
+        s.root().delete("doomed").unwrap();
         assert!(s.has_staged_edits());
         s.commit().unwrap();
         assert!(!s.has_staged_edits());
 
         // Append again after the header-relocating + deleting commit: the cache was
         // invalidated at commit entry, so this re-locates against the fresh mirror.
-        s.append_inplace_i32("d", &[9, 10]).unwrap(); // d -> 0..11
+        s.dataset("d").unwrap().append(&[9, 10]).unwrap(); // d -> 0..11
         // And append to the dataset created by the staged commit.
-        s.append_inplace_i32("created", &[4, 5, 6, 7]).unwrap(); // created -> 0..8
+        s.dataset("created").unwrap().append(&[4, 5, 6, 7]).unwrap(); // created -> 0..8
     }
 
     assert_eq!(read_i32(&p, "d"), (0..11).collect::<Vec<_>>());
@@ -152,9 +157,9 @@ fn guard_refuses_pending_delete() {
     let p = dir.path().join("d.h5");
     build(&p, "d", 4, 4, false);
 
-    let mut s = EditSession::open(&p).unwrap();
-    s.delete("d");
-    let err = s.append_inplace_i32("d", &[4]).unwrap_err();
+    let s = File::open_rw(&p).unwrap();
+    s.root().delete("d").unwrap();
+    let err = s.dataset("d").unwrap().append(&[4]).unwrap_err();
     assert!(matches!(err, Error::AppendInPlaceUnsupported(_)));
 }
 
@@ -164,15 +169,19 @@ fn guard_refuses_append_after_staged_write() {
     let p = dir.path().join("d.h5");
     build(&p, "d", 4, 4, false);
 
-    let mut s = EditSession::open(&p).unwrap();
+    let s = File::open_rw(&p).unwrap();
     // First append is fine (nothing staged yet).
-    s.append_inplace_i32("d", &[4, 5]).unwrap();
+    s.dataset("d").unwrap().append(&[4, 5]).unwrap();
     // Now stage an overwrite of the same dataset; a second in-place append must be
     // refused (commit would relocate the header the append planned against).
-    s.write_dataset("d")
-        .with_i32_data(&(0..6).collect::<Vec<_>>())
-        .with_shape(&[6]);
-    let err = s.append_inplace_i32("d", &[6]).unwrap_err();
+    s.dataset("d")
+        .unwrap()
+        .write_staged(|b| {
+            b.with_i32_data(&(0..6).collect::<Vec<_>>())
+                .with_shape(&[6]);
+        })
+        .unwrap();
+    let err = s.dataset("d").unwrap().append(&[6]).unwrap_err();
     assert!(matches!(err, Error::AppendInPlaceUnsupported(_)));
 }
 
@@ -190,10 +199,22 @@ fn guard_refuses_ancestor_delete() {
         b.write(&p).unwrap();
     }
 
-    let mut s = EditSession::open(&p).unwrap();
-    s.delete("grp"); // deletes the ancestor group of grp/d
-    let err = s.append_inplace_i32("grp/d", &[4]).unwrap_err();
-    assert!(matches!(err, Error::AppendInPlaceUnsupported(_)));
+    let s = File::open_rw(&p).unwrap();
+    s.root().delete("grp").unwrap(); // deletes the ancestor group of grp/d
+    // The staged delete takes the subtree out of reach: the dataset no longer
+    // resolves, so there is no handle to append through. Either way the append
+    // cannot land — which is the guarantee this pins.
+    let err = match s.dataset("grp/d") {
+        Ok(mut ds) => ds.append(&[4]).unwrap_err(),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(
+            err,
+            Error::AppendInPlaceUnsupported(_) | Error::Format(FormatError::PathNotFound(_))
+        ),
+        "expected the append to be unreachable, got {err:?}"
+    );
 }
 
 // ---- fast-path refusals + fallback ------------------------------------------
@@ -210,8 +231,8 @@ fn fallback_non_extensible_array_refused() {
         b.write(&p).unwrap();
     }
 
-    let mut s = EditSession::open(&p).unwrap();
-    let err = s.append_inplace_i32("d", &[5]).unwrap_err();
+    let s = File::open_rw(&p).unwrap();
+    let err = s.dataset("d").unwrap().append(&[5]).unwrap_err();
     assert!(matches!(err, Error::AppendInPlaceUnsupported(_)));
 }
 
@@ -231,13 +252,18 @@ fn userblock_refuses_inplace_but_staged_append_dataset_works() {
     }
 
     {
-        let mut s = EditSession::open(&p).unwrap();
+        let s = File::open_rw(&p).unwrap();
         // Fast path refuses a userblock (base address != 0), with the distinct,
         // catchable error.
-        let err = s.append_inplace_i32("d", &[8, 9, 10, 11]).unwrap_err();
+        let err = s.dataset("d").unwrap().append(&[8, 9, 10, 11]).unwrap_err();
         assert!(matches!(err, Error::AppendInPlaceUnsupported(_)));
         // The staged fallback handles it: rebuild the index, repoint last.
-        s.append_dataset("d").append_i32(&[8, 9, 10, 11]);
+        s.dataset("d")
+            .unwrap()
+            .append_staged(|b| {
+                b.append_i32(&[8, 9, 10, 11]);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
 
@@ -251,12 +277,12 @@ fn refusal_leaves_session_usable() {
     build(&p, "d", 4, 4, false);
 
     {
-        let mut s = EditSession::open(&p).unwrap();
+        let s = File::open_rw(&p).unwrap();
         // A datatype mismatch is refused...
-        let err = s.append_inplace_f64("d", &[1.0]).unwrap_err();
+        let err = s.dataset("d").unwrap().append(&[1.0]).unwrap_err();
         assert!(matches!(err, Error::AppendInPlaceUnsupported(_)));
         // ...and the session keeps working for a correct append afterward.
-        s.append_inplace_i32("d", &[4, 5, 6]).unwrap();
+        s.dataset("d").unwrap().append(&[4, 5, 6]).unwrap();
     }
 
     assert_eq!(read_i32(&p, "d"), (0..7).collect::<Vec<_>>());
@@ -278,13 +304,18 @@ fn persisting_file_refuses_inplace_but_staged_append_dataset_works() {
     }
 
     {
-        let mut s = EditSession::open(&p).unwrap();
+        let s = File::open_rw(&p).unwrap();
         // The fast path refuses a persistent-free-space file; only a staged commit
         // rewrites its managers consistently.
-        let err = s.append_inplace_i32("d", &[8, 9, 10, 11]).unwrap_err();
+        let err = s.dataset("d").unwrap().append(&[8, 9, 10, 11]).unwrap_err();
         assert!(matches!(err, Error::AppendInPlaceUnsupported(_)));
         // The staged fallback works.
-        s.append_dataset("d").append_i32(&[8, 9, 10, 11]);
+        s.dataset("d")
+            .unwrap()
+            .append_staged(|b| {
+                b.append_i32(&[8, 9, 10, 11]);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
 
@@ -298,9 +329,9 @@ fn many_small_appends_one_session() {
     build(&p, "d", 0, 8, false); // start empty (but index allocated by the writer)
 
     {
-        let mut s = EditSession::open(&p).unwrap();
+        let s = File::open_rw(&p).unwrap();
         for i in 0..100i32 {
-            s.append_inplace_i32("d", &[i]).unwrap();
+            s.dataset("d").unwrap().append(&[i]).unwrap();
         }
     }
 

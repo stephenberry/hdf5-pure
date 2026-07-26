@@ -1,5 +1,5 @@
 //! Appending to a filtered, unlimited dataset in place with
-//! `EditSession::append_dataset` — no SWMR, and without rewriting existing
+//! `Dataset::append_staged` — no SWMR, and without rewriting existing
 //! chunks.
 //!
 //! A rank-1 dataset created with an unlimited dimension and a filter pipeline
@@ -16,8 +16,7 @@
 //! cargo run --example append_dataset
 //! ```
 
-#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
-use hdf5_pure::{EditSession, File, FileBuilder};
+use hdf5_pure::{File, FileBuilder};
 
 fn main() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -61,10 +60,14 @@ fn main() {
     // ---- Append in place ------------------------------------------------
     // Aligned append: 8 -> 16 (two whole chunks of 4).
     {
-        let mut session = EditSession::open(&path).expect("open for editing");
+        let session = File::open_rw(&path).expect("open for editing");
         session
-            .append_dataset("samples")
-            .append_i32(&[8, 9, 10, 11, 12, 13, 14, 15]);
+            .dataset("samples")
+            .unwrap()
+            .append_staged(|b| {
+                b.append_i32(&[8, 9, 10, 11, 12, 13, 14, 15]);
+            })
+            .unwrap();
         session.commit().expect("commit aligned append");
     } // drop the session to release its exclusive lock before reopening
 
@@ -73,10 +76,14 @@ fn main() {
     // every earlier chunk is carried by metadata alone, so existing data is not
     // rewritten and the file does not grow by the whole dataset per append.
     {
-        let mut session = EditSession::open(&path).expect("open for editing");
+        let session = File::open_rw(&path).expect("open for editing");
         session
-            .append_dataset("samples")
-            .append_i32(&[16, 17, 18, 19, 20]);
+            .dataset("samples")
+            .unwrap()
+            .append_staged(|b| {
+                b.append_i32(&[16, 17, 18, 19, 20]);
+            })
+            .unwrap();
         session.commit().expect("commit unaligned append");
     }
 

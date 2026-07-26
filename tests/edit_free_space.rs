@@ -1,13 +1,12 @@
 //! Free-space reuse and truncation during in-place editing (issue #21).
 //!
-//! `EditSession` records the regions a commit vacates — deleted objects' blocks
+//! `File::open_rw` records the regions a commit vacates — deleted objects' blocks
 //! and superseded group headers — and, within the same session, reuses them for
 //! later writes instead of growing the file, truncating the file when a freed
 //! run reaches end-of-file. These tests pin down both the size behavior and that
 //! survivors stay byte-exact and the file stays valid.
 
-#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
-use hdf5_pure::{EditSession, File, FileBuilder, FileSpaceStrategy};
+use hdf5_pure::{File, FileBuilder, FileSpaceStrategy};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(name)
@@ -38,13 +37,17 @@ fn delete_then_truncate_shrinks_within_session() {
     // and the superseded root header form a run reaching end-of-file, so the
     // file is truncated back down rather than left bloated.
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.create_dataset("big").with_f64_data(&vec![7.0; 1024]);
+        let s = File::open_rw(&path).unwrap();
+        s.root()
+            .create_dataset("big", |b| {
+                b.with_f64_data(&vec![7.0; 1024]);
+            })
+            .unwrap();
         s.commit().unwrap();
         let size_after_add = std::fs::metadata(&path).unwrap().len();
         assert!(size_after_add > size_start, "adding should grow the file");
 
-        s.delete("big");
+        s.root().delete("big").unwrap();
         s.commit().unwrap();
         let size_after_delete = std::fs::metadata(&path).unwrap().len();
         assert!(
@@ -73,15 +76,18 @@ fn churn_within_session_stays_bounded() {
 
     let mut high_water = 0u64;
     {
-        let mut s = EditSession::open(&path).unwrap();
+        let s = File::open_rw(&path).unwrap();
         // Repeatedly add then delete a sizable dataset in the same session. With
         // reuse + truncation the file must not grow without bound across cycles.
         for i in 0..8 {
-            s.create_dataset("scratch")
-                .with_f64_data(&vec![i as f64; 512]);
+            s.root()
+                .create_dataset("scratch", |b| {
+                    b.with_f64_data(&vec![i as f64; 512]);
+                })
+                .unwrap();
             s.commit().unwrap();
             high_water = high_water.max(std::fs::metadata(&path).unwrap().len());
-            s.delete("scratch");
+            s.root().delete("scratch").unwrap();
             s.commit().unwrap();
         }
     }
@@ -114,12 +120,16 @@ fn reuse_keeps_survivors_byte_exact() {
     b.write(&path).unwrap();
 
     {
-        let mut s = EditSession::open(&path).unwrap();
+        let s = File::open_rw(&path).unwrap();
         // Delete b, then add c in a later commit: c's bytes should land in the
         // region b vacated. a and the newly written c must both read back exact.
-        s.delete("b");
+        s.root().delete("b").unwrap();
         s.commit().unwrap();
-        s.create_dataset("c").with_i32_data(&[7, 8, 9, 10]);
+        s.root()
+            .create_dataset("c", |b| {
+                b.with_i32_data(&[7, 8, 9, 10]);
+            })
+            .unwrap();
         s.commit().unwrap();
     }
 
@@ -148,14 +158,22 @@ fn delete_subtree_reclaims_all_members() {
     b.write(&path).unwrap();
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.create_group("grp");
-        s.create_dataset("grp/x").with_f64_data(&vec![1.0; 256]);
-        s.create_dataset("grp/y").with_f64_data(&vec![2.0; 256]);
+        let s = File::open_rw(&path).unwrap();
+        s.root().create_group("grp").unwrap();
+        s.root()
+            .create_dataset("grp/x", |b| {
+                b.with_f64_data(&vec![1.0; 256]);
+            })
+            .unwrap();
+        s.root()
+            .create_dataset("grp/y", |b| {
+                b.with_f64_data(&vec![2.0; 256]);
+            })
+            .unwrap();
         s.commit().unwrap();
         let with_group = std::fs::metadata(&path).unwrap().len();
 
-        s.delete("grp");
+        s.root().delete("grp").unwrap();
         s.commit().unwrap();
         let after = std::fs::metadata(&path).unwrap().len();
         // The whole subtree (group header + both datasets' headers and data) is
@@ -184,7 +202,7 @@ fn trailing_slack_past_recorded_eof_stays_readable() {
     // bytes to a cleanly committed file and confirms the file still reads exactly.
     // (It exercises the *outcome* of the ordering, not the ordering itself —
     // fault-injecting between the superblock sync and `set_len` would need a seam
-    // EditSession does not yet expose, and remains future work.)
+    // File::open_rw does not yet expose, and remains future work.)
     let path = tmp("hdf5_pure_fs_trailing_slack.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("keep").with_i32_data(&[11, 22, 33]);
@@ -193,10 +211,14 @@ fn trailing_slack_past_recorded_eof_stays_readable() {
     // Add then delete a large dataset so the second commit truncates the file
     // back down, leaving the recorded end-of-file equal to the physical size.
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.create_dataset("scratch").with_f64_data(&vec![5.0; 2048]);
+        let s = File::open_rw(&path).unwrap();
+        s.root()
+            .create_dataset("scratch", |b| {
+                b.with_f64_data(&vec![5.0; 2048]);
+            })
+            .unwrap();
         s.commit().unwrap();
-        s.delete("scratch");
+        s.root().delete("scratch").unwrap();
         s.commit().unwrap();
     }
 
@@ -259,11 +281,14 @@ fn deleting_filtered_chunked_dataset_reclaims_storage() {
     let size_keep_only = std::fs::metadata(&path).unwrap().len();
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.create_dataset("comp")
-            .with_f64_data(&vec![3.0; 4096])
-            .with_chunks(&[512])
-            .with_deflate(6);
+        let s = File::open_rw(&path).unwrap();
+        s.root()
+            .create_dataset("comp", |b| {
+                b.with_f64_data(&vec![3.0; 4096])
+                    .with_chunks(&[512])
+                    .with_deflate(6);
+            })
+            .unwrap();
         s.commit().unwrap();
         let size_with_comp = std::fs::metadata(&path).unwrap().len();
         assert!(
@@ -271,7 +296,7 @@ fn deleting_filtered_chunked_dataset_reclaims_storage() {
             "adding a chunked dataset should grow the file"
         );
 
-        s.delete("comp");
+        s.root().delete("comp").unwrap();
         s.commit().unwrap();
         let size_after_delete = std::fs::metadata(&path).unwrap().len();
         assert!(
@@ -306,16 +331,18 @@ fn deleting_unfiltered_chunked_dataset_truncates_fully() {
     let size_start = std::fs::metadata(&path).unwrap().len();
 
     {
-        let mut s = EditSession::open(&path).unwrap();
+        let s = File::open_rw(&path).unwrap();
         // 8 chunks of 512 f64 = 4096 bytes each (a multiple of the cache line).
-        s.create_dataset("big")
-            .with_f64_data(&vec![7.0; 4096])
-            .with_chunks(&[512]);
+        s.root()
+            .create_dataset("big", |b| {
+                b.with_f64_data(&vec![7.0; 4096]).with_chunks(&[512]);
+            })
+            .unwrap();
         s.commit().unwrap();
         let size_with_big = std::fs::metadata(&path).unwrap().len();
         assert!(size_with_big > size_start + 4096 * 8);
 
-        s.delete("big");
+        s.root().delete("big").unwrap();
         s.commit().unwrap();
         let size_after_delete = std::fs::metadata(&path).unwrap().len();
         // The reclaimed blob formed a trailing run, so the file is truncated back
@@ -352,14 +379,16 @@ fn deleting_paged_fixed_array_dataset_reclaims_storage() {
     let size_start = std::fs::metadata(&path).unwrap().len();
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.create_dataset("paged")
-            .with_f64_data(&vec![1.0; 1100 * 16])
-            .with_chunks(&[16]); // 1100 chunks > 1024 page size
+        let s = File::open_rw(&path).unwrap();
+        s.root()
+            .create_dataset("paged", |b| {
+                b.with_f64_data(&vec![1.0; 1100 * 16]).with_chunks(&[16]);
+            })
+            .unwrap(); // 1100 chunks > 1024 page size
         s.commit().unwrap();
         let size_with_paged = std::fs::metadata(&path).unwrap().len();
 
-        s.delete("paged");
+        s.root().delete("paged").unwrap();
         s.commit().unwrap();
         let size_after_delete = std::fs::metadata(&path).unwrap().len();
         assert!(
@@ -392,18 +421,21 @@ fn deleting_extensible_dataset_reclaims_storage() {
     let size_start = std::fs::metadata(&path).unwrap().len();
 
     {
-        let mut s = EditSession::open(&path).unwrap();
+        let s = File::open_rw(&path).unwrap();
         // 64 chunks of 64 f64 — enough to spill past the index block's inline
         // slots into separate data blocks, exercising the data-block walk.
-        s.create_dataset("ext")
-            .with_f64_data(&vec![2.5; 4096])
-            .with_chunks(&[64])
-            .with_maxshape(&[u64::MAX]);
+        s.root()
+            .create_dataset("ext", |b| {
+                b.with_f64_data(&vec![2.5; 4096])
+                    .with_chunks(&[64])
+                    .with_maxshape(&[u64::MAX]);
+            })
+            .unwrap();
         s.commit().unwrap();
         let size_with_ext = std::fs::metadata(&path).unwrap().len();
         assert!(size_with_ext > size_start);
 
-        s.delete("ext");
+        s.root().delete("ext").unwrap();
         s.commit().unwrap();
         let size_after_delete = std::fs::metadata(&path).unwrap().len();
         assert!(
@@ -433,17 +465,19 @@ fn deleting_single_chunk_dataset_reclaims_storage() {
     let size_start = std::fs::metadata(&path).unwrap().len();
 
     {
-        let mut s = EditSession::open(&path).unwrap();
+        let s = File::open_rw(&path).unwrap();
         // 1024 f64 = 8192 bytes (a cache-line multiple), so the single chunk's
         // blob carries no trailing padding and reclaims as one trailing run.
-        s.create_dataset("one")
-            .with_f64_data(&vec![1.25; 1024])
-            .with_chunks(&[1024]); // one chunk covers the whole dataset
+        s.root()
+            .create_dataset("one", |b| {
+                b.with_f64_data(&vec![1.25; 1024]).with_chunks(&[1024]);
+            })
+            .unwrap(); // one chunk covers the whole dataset
         s.commit().unwrap();
         let size_with_one = std::fs::metadata(&path).unwrap().len();
         assert!(size_with_one > size_start + 8192);
 
-        s.delete("one");
+        s.root().delete("one").unwrap();
         s.commit().unwrap();
         let size_after_delete = std::fs::metadata(&path).unwrap().len();
         assert!(
@@ -478,15 +512,18 @@ fn chunked_churn_within_session_stays_bounded() {
 
     let mut high_water = 0u64;
     {
-        let mut s = EditSession::open(&path).unwrap();
+        let s = File::open_rw(&path).unwrap();
         for i in 0..8 {
-            s.create_dataset("scratch")
-                .with_f64_data(&vec![i as f64; 2048])
-                .with_chunks(&[256])
-                .with_deflate(4);
+            s.root()
+                .create_dataset("scratch", |b| {
+                    b.with_f64_data(&vec![i as f64; 2048])
+                        .with_chunks(&[256])
+                        .with_deflate(4);
+                })
+                .unwrap();
             s.commit().unwrap();
             high_water = high_water.max(std::fs::metadata(&path).unwrap().len());
-            s.delete("scratch");
+            s.root().delete("scratch").unwrap();
             s.commit().unwrap();
         }
     }
@@ -517,19 +554,24 @@ fn deleting_subtree_with_chunked_members_reclaims() {
     b.write(&path).unwrap();
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.create_group("grp");
-        s.create_dataset("grp/a")
-            .with_f64_data(&vec![1.0; 4096])
-            .with_chunks(&[512]);
-        s.create_dataset("grp/b")
-            .with_f64_data(&vec![2.0; 2048])
-            .with_chunks(&[256])
-            .with_deflate(6);
+        let s = File::open_rw(&path).unwrap();
+        s.root().create_group("grp").unwrap();
+        s.root()
+            .create_dataset("grp/a", |b| {
+                b.with_f64_data(&vec![1.0; 4096]).with_chunks(&[512]);
+            })
+            .unwrap();
+        s.root()
+            .create_dataset("grp/b", |b| {
+                b.with_f64_data(&vec![2.0; 2048])
+                    .with_chunks(&[256])
+                    .with_deflate(6);
+            })
+            .unwrap();
         s.commit().unwrap();
         let with_group = std::fs::metadata(&path).unwrap().len();
 
-        s.delete("grp");
+        s.root().delete("grp").unwrap();
         s.commit().unwrap();
         let after = std::fs::metadata(&path).unwrap().len();
         assert!(
@@ -561,8 +603,8 @@ fn persisted_chunked_reclaim_is_disjoint_and_reusable() {
     b.write(&path).unwrap();
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.delete("comp");
+        let s = File::open_rw(&path).unwrap();
+        s.root().delete("comp").unwrap();
         s.commit().unwrap();
     }
     assert_eof_matches_file(&path);
@@ -598,8 +640,8 @@ fn persisted_free_space_survives_reopen_and_is_reused() {
 
     // Session 1: delete "big"; its storage is persisted as free space.
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.delete("big");
+        let s = File::open_rw(&path).unwrap();
+        s.root().delete("big").unwrap();
         s.commit().unwrap();
     }
     assert_eof_matches_file(&path);
@@ -624,8 +666,12 @@ fn persisted_free_space_survives_reopen_and_is_reused() {
     // new dataset reuses the freed hole rather than appending its data at EOF.
     let eof_before = std::fs::metadata(&path).unwrap().len();
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.create_dataset("d").with_i32_data(&[9; 300]); // 1200 bytes, fits the hole
+        let s = File::open_rw(&path).unwrap();
+        s.root()
+            .create_dataset("d", |b| {
+                b.with_i32_data(&[9; 300]);
+            })
+            .unwrap(); // 1200 bytes, fits the hole
         s.commit().unwrap();
     }
     assert_eof_matches_file(&path);
@@ -663,10 +709,13 @@ fn persisted_managers_stay_consistent_across_many_commits() {
     // Churn across multiple sessions: delete some, add some, each its own commit.
     for round in 0..4 {
         {
-            let mut s = EditSession::open(&path).unwrap();
-            s.delete(&format!("d{round}"));
-            s.create_dataset(&format!("n{round}"))
-                .with_i32_data(&vec![100 + round; 150]);
+            let s = File::open_rw(&path).unwrap();
+            s.root().delete(&format!("d{round}")).unwrap();
+            s.root()
+                .create_dataset(&format!("n{round}"), |b| {
+                    b.with_i32_data(&vec![100 + round; 150]);
+                })
+                .unwrap();
             s.commit().unwrap();
         } // release the editor's lock before reading the file back
         // Free regions never overlap and the file remains valid after each round.
@@ -714,8 +763,8 @@ fn corrupt_persisted_section_is_skipped_not_fatal() {
     b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1);
     b.write(&path).unwrap();
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.delete("victim"); // frees the largest tracked section
+        let s = File::open_rw(&path).unwrap();
+        s.root().delete("victim").unwrap(); // frees the largest tracked section
         s.commit().unwrap();
     }
 
@@ -753,8 +802,12 @@ fn corrupt_persisted_section_is_skipped_not_fatal() {
     // and `write_at` an out-of-bounds address, panicking. The guard skips it, so
     // the data is appended instead and the commit succeeds.
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.create_dataset("added").with_i32_data(&[9; 250]); // 1000 bytes
+        let s = File::open_rw(&path).unwrap();
+        s.root()
+            .create_dataset("added", |b| {
+                b.with_i32_data(&[9; 250]);
+            })
+            .unwrap(); // 1000 bytes
         s.commit().unwrap();
     }
     assert_eof_matches_file(&path);

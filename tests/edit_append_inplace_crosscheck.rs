@@ -4,7 +4,7 @@
 #![cfg(not(target_pointer_width = "32"))]
 //! Reference-C-library interop for issue #146: the unified append + edit session.
 //!
-//! Covers the fast, immediate `EditSession::append_inplace` and the staged
+//! Covers the fast, immediate `Dataset::append` and the staged
 //! `set_dataset_attr` / `remove_dataset_attr` against files the C library *wrote*,
 //! reading the result back with both the C library and this crate. The
 //! make-or-break case is `set_dataset_attr` / `set_group_attr` on a C-written
@@ -13,10 +13,9 @@
 //! compact-attribute walkers must accept it rather than mistake it for dense
 //! storage.
 
-#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5::Extent;
 use hdf5::file::LibraryVersion;
-use hdf5_pure::{AttrValue, EditSession, Error, File};
+use hdf5_pure::{AttrValue, Error, File};
 use tempfile::tempdir;
 
 /// Create a rank-1 unlimited (Extensible-Array indexed) i32 dataset `name` with the
@@ -61,8 +60,8 @@ fn append_inplace_to_c_dataset_both_read() {
     c_create_unlimited(&path, "d", 8, 4);
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.append_inplace_i32("d", &[8, 9, 10, 11, 12]).unwrap(); // any length (unfiltered)
+        let s = File::open_rw(&path).unwrap();
+        s.dataset("d").unwrap().append(&[8, 9, 10, 11, 12]).unwrap(); // any length (unfiltered)
     }
 
     let expected: Vec<i32> = (0..13).collect();
@@ -85,10 +84,10 @@ fn hard_link_aliasing_append_inplace_stays_coherent() {
     }
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.append_inplace_i32("d", &[4, 5]).unwrap(); // via "d"    -> 0..6
-        s.append_inplace_i32("alias", &[6, 7]).unwrap(); // via alias -> 0..8
-        s.append_inplace_i32("d", &[8]).unwrap(); // via "d"    -> 0..9
+        let s = File::open_rw(&path).unwrap();
+        s.dataset("d").unwrap().append(&[4, 5]).unwrap(); // via "d"    -> 0..6
+        s.dataset("alias").unwrap().append(&[6, 7]).unwrap(); // via alias -> 0..8
+        s.dataset("d").unwrap().append(&[8]).unwrap(); // via "d"    -> 0..9
     }
 
     let expected: Vec<i32> = (0..9).collect();
@@ -119,8 +118,11 @@ fn c_dataset_with_attribute_info_accepts_set_dataset_attr() {
     }
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.set_dataset_attr("d", "added", AttrValue::I64(3));
+        let s = File::open_rw(&path).unwrap();
+        s.dataset("d")
+            .unwrap()
+            .set_attr("added", AttrValue::I64(3))
+            .unwrap();
         s.commit().unwrap(); // must NOT be refused as "dense attribute storage"
     }
 
@@ -167,8 +169,11 @@ fn c_group_with_attribute_info_accepts_set_group_attr() {
     }
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.set_group_attr("grp", "added", AttrValue::I64(22));
+        let s = File::open_rw(&path).unwrap();
+        s.group("grp")
+            .unwrap()
+            .set_attr("added", AttrValue::I64(22))
+            .unwrap();
         s.commit().unwrap();
     }
 
@@ -191,10 +196,13 @@ fn set_dataset_attr_on_chunked_dataset_c_reads() {
     c_create_unlimited(&path, "d", 8, 4);
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.set_dataset_attr("d", "checked", AttrValue::I64(1));
+        let s = File::open_rw(&path).unwrap();
+        s.dataset("d")
+            .unwrap()
+            .set_attr("checked", AttrValue::I64(1))
+            .unwrap();
         s.commit().unwrap();
-        s.append_inplace_i32("d", &[8, 9, 10, 11]).unwrap(); // re-locates, then grows
+        s.dataset("d").unwrap().append(&[8, 9, 10, 11]).unwrap(); // re-locates, then grows
     }
 
     let expected: Vec<i32> = (0..12).collect();
@@ -224,8 +232,11 @@ fn set_dataset_attr_multi_hard_link_refused() {
     let before = std::fs::read(&path).unwrap();
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.set_dataset_attr("d", "x", AttrValue::I64(1));
+        let s = File::open_rw(&path).unwrap();
+        s.dataset("d")
+            .unwrap()
+            .set_attr("x", AttrValue::I64(1))
+            .unwrap();
         let err = s.commit().unwrap_err();
         assert!(
             matches!(err, Error::EditUnsupported(_))
@@ -279,13 +290,16 @@ fn combined_mixed_edits_c_readable() {
     }
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.append_inplace_i32("log", &[4, 5, 6, 7]).unwrap(); // immediate -> 0..8
-        s.create_group("run"); // staged
-        s.set_dataset_attr("keep", "checked", AttrValue::I64(1)); // staged
-        s.delete("old"); // staged recursive delete
+        let s = File::open_rw(&path).unwrap();
+        s.dataset("log").unwrap().append(&[4, 5, 6, 7]).unwrap(); // immediate -> 0..8
+        s.root().create_group("run").unwrap(); // staged
+        s.dataset("keep")
+            .unwrap()
+            .set_attr("checked", AttrValue::I64(1))
+            .unwrap(); // staged
+        s.root().delete("old").unwrap(); // staged recursive delete
         s.commit().unwrap();
-        s.append_inplace_i32("log", &[8, 9]).unwrap(); // immediate -> 0..10
+        s.dataset("log").unwrap().append(&[8, 9]).unwrap(); // immediate -> 0..10
     }
 
     // Reference C library.

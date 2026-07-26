@@ -58,7 +58,7 @@ The paged and persistent-free-space paths are exercised by C-library crosschecks
 
 Current limits worth knowing:
 
-- **Paged mutation goes through `File::open_rw_bounded` only.** The whole-file editor (`File::open_rw` / the deprecated `EditSession`) opens and reads a paged file but refuses to commit edits or append to it, and a paged file created **without** `persist = true` cannot be grown at all — recreate it with `persist = true`.
+- **Paged mutation goes through `File::open_rw_bounded` only.** The whole-file editor (`File::open_rw` / the whole-file mirror) opens and reads a paged file but refuses to commit edits or append to it, and a paged file created **without** `persist = true` cannot be grown at all — recreate it with `persist = true`.
 - **Free space is under-reported, never over-reported.** A final metadata-page tail and the old bytes of a relocated partial chunk are left untracked, so `H5Fget_freespace` can read slightly low. The file stays valid.
 - **`threshold` is advisory** and **the non-paged `userblock` size is not validated** (see the tables above).
 - Only **File Space Info message version 1** is emitted and read.

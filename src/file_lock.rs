@@ -3,7 +3,7 @@
 //! This is the crash-safe half of HDF5's concurrency model and the `hdf5-pure`
 //! analogue of `H5Pset_file_locking` / the `HDF5_USE_FILE_LOCKING` environment
 //! variable. It is deliberately distinct from the *superblock consistency flag*
-//! (the durable `status_flags` byte a SWMR writer sets; see [`crate::SwmrWriter`]):
+//! (the durable `status_flags` byte a SWMR writer sets; see [`crate::File::open_swmr_writer`]):
 //!
 //! - An **OS lock** is owned by the kernel and tied to the open file. It is
 //!   released automatically when the process exits *for any reason* — clean exit,
@@ -11,13 +11,13 @@
 //!   the authoritative signal for "a writer is alive *right now*".
 //! - The **on-disk flag** is just a byte; only userspace code at clean shutdown
 //!   can reset it, so a crash freezes it set. Recover it with
-//!   [`crate::SwmrWriter::clear_swmr_flag`] (the `h5clear -s` equivalent).
+//!   [`crate::File::clear_swmr_flag`] (the `h5clear -s` equivalent).
 //!
 //! ## Scope: the in-place editor only
 //!
-//! Only [`crate::EditSession`] (and the [`crate::SwmrWriter::clear_swmr_flag`]
+//! Only [`crate::File::open_rw`] (and the [`crate::File::clear_swmr_flag`]
 //! recovery rewrite) take a lock — an **exclusive** one — so a second editor or
-//! a concurrent writer cannot open the file. [`crate::SwmrWriter`] and the
+//! a concurrent writer cannot open the file. [`crate::File::open_swmr_writer`] and the
 //! readers ([`crate::File::open`] and friends) take **no** lock, on purpose:
 //!
 //! - SWMR is single-writer-*by-contract* and is designed for concurrent reads;
@@ -132,6 +132,52 @@ pub(crate) fn acquire_exclusive(
             _ => Err(Error::Io(e)),
         },
     }
+}
+
+/// Clear a stale SWMR-write flag left in `path` by a writer that exited without a
+/// clean close — the `h5clear -s` equivalent, behind
+/// [`File::clear_swmr_flag`](crate::File::clear_swmr_flag). Safe to call on a
+/// file whose flag is already clear.
+///
+/// This is the one recovery rewrite that takes the exclusive lock without going
+/// through the editor, which is why it lives beside the locking policy it
+/// depends on.
+pub(crate) fn clear_swmr_flag_at(path: &Path) -> Result<(), Error> {
+    use crate::signature;
+    use crate::superblock::Superblock;
+    use std::fs::OpenOptions;
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let mut w = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(Error::Io)?;
+    // Refuse to clear the flag out from under a live writer: an exclusive
+    // lock here fails with `FileLocked` if another writer still holds the
+    // file. A stale flag from a *crashed* writer has no live lock, so this
+    // succeeds and the recovery proceeds.
+    acquire_exclusive(&w, FileLocking::Enabled, path)?;
+    let mut data = Vec::new();
+    w.read_to_end(&mut data).map_err(Error::Io)?;
+    let sig = signature::find_signature(&data)?;
+    let mut sb = Superblock::parse(&data, sig)?;
+    if sb.version < 2 {
+        // `Superblock::serialize` emits the v2/v3 layout, so rewriting a
+        // v0/v1 superblock here would corrupt it. This crate never SWMR-flags
+        // a v0/v1 file, so there is nothing to clear; treat it as already
+        // clean rather than risk a destructive rewrite.
+        return Ok(());
+    }
+    if sb.consistency_flags == 0 {
+        return Ok(());
+    }
+    sb.consistency_flags = 0;
+    let bytes = sb.serialize();
+    w.seek(SeekFrom::Start(sig as u64)).map_err(Error::Io)?;
+    w.write_all(&bytes).map_err(Error::Io)?;
+    w.sync_data().map_err(Error::Io)?;
+    Ok(())
 }
 
 #[cfg(test)]

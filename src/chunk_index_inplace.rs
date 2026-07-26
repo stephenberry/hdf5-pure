@@ -22,10 +22,6 @@
 //! flag and refuses filters; the general writer takes an exclusive lock, accepts
 //! filters, and relocates a partial trailing chunk.
 
-use std::fs::OpenOptions;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
-
 use crate::checksum::jenkins_lookup3;
 use crate::chunked_write::{ea_compute_stats, split_into_chunks, write_ea_addr};
 use crate::convert::TryToUsize;
@@ -34,13 +30,10 @@ use crate::dataspace::Dataspace;
 use crate::datatype::Datatype;
 use crate::error::{Error, FormatError};
 use crate::extensible_array::{EaGeometry, ExtensibleArrayHeader};
-use crate::file_lock::{self, FileLocking};
 use crate::filter_pipeline::FilterPipeline;
 use crate::filters::{ChunkContext, compress_chunk, decompress_chunk};
 use crate::message_type::MessageType;
-use crate::signature;
-use crate::source::{BytesSource, Source};
-use crate::superblock::Superblock;
+use crate::source::Source;
 
 /// The undefined-address sentinel for a given offset size.
 pub(crate) fn undef_addr(offset_size: u8) -> u64 {
@@ -87,132 +80,14 @@ impl ElemRecord {
     }
 }
 
-/// A file opened for in-place appends: a read/write OS handle plus a full
-/// in-memory mirror of the file (`O(file size)` memory) kept in lock-step with
-/// on-disk writes, so existing structures are read and checksums recomputed
-/// without hitting the disk.
-pub(crate) struct InPlaceFile {
-    handle: std::fs::File,
-    /// Full in-memory mirror; every write updates this and the disk together.
-    data: Vec<u8>,
-    pub offset_size: u8,
-    pub length_size: u8,
-    /// Offset of the superblock signature within the file.
-    sb_sig_off: usize,
-    pub superblock: Superblock,
-}
-
-impl InPlaceFile {
-    /// Open an existing latest-format HDF5 file for in-place appends, reading it
-    /// into memory. When `lock` is `Some`, an exclusive OS byte-range lock is
-    /// taken and held by the retained handle for the session's life (the general
-    /// append writer); when `None`, no lock is taken (the SWMR writer, which is
-    /// single-writer by contract and must not block concurrent readers).
-    ///
-    /// Rejects a pre-v2 superblock (this crate only serializes the v2/v3 layout,
-    /// so patching a v0/v1 superblock in place would clobber it) and a non-zero
-    /// base address (userblock files store addresses relative to the base, which
-    /// the in-place slot math does not apply).
-    pub(crate) fn open<P: AsRef<Path>>(
-        path: P,
-        lock: Option<FileLocking>,
-        unsupported: fn(&'static str) -> Error,
-    ) -> Result<Self, Error> {
-        let path = path.as_ref();
-        let mut handle = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(Error::Io)?;
-        if let Some(locking) = lock {
-            file_lock::acquire_exclusive(&handle, locking, path)?;
-        }
-        let mut data = Vec::new();
-        handle.read_to_end(&mut data).map_err(Error::Io)?;
-
-        let sb_sig_off = signature::find_signature(&data)?;
-        let superblock = Superblock::parse(&data, sb_sig_off)?;
-        if superblock.version < 2 {
-            return Err(unsupported(
-                "in-place append requires a latest-format file (v2/v3 superblock)",
-            ));
-        }
-        if superblock.base_address != 0 {
-            return Err(unsupported(
-                "files with a userblock (non-zero base address) are not supported",
-            ));
-        }
-        let offset_size = superblock.offset_size;
-        let length_size = superblock.length_size;
-        Ok(Self {
-            handle,
-            data,
-            offset_size,
-            length_size,
-            sb_sig_off,
-            superblock,
-        })
-    }
-
-    pub(crate) fn data(&self) -> &[u8] {
-        &self.data
-    }
-
-    /// Append `bytes` at end-of-file (in memory and on disk), returning the
-    /// address at which they were written. The disk write happens now, not at the
-    /// next `sync`, so a later in-place patch of this region lands on top of bytes
-    /// that already exist on disk.
-    pub(crate) fn append_bytes(&mut self, bytes: &[u8]) -> Result<u64, Error> {
-        let addr = self.data.len() as u64;
-        self.data.extend_from_slice(bytes);
-        self.handle.seek(SeekFrom::Start(addr)).map_err(Error::Io)?;
-        self.handle.write_all(bytes).map_err(Error::Io)?;
-        Ok(addr)
-    }
-
-    pub(crate) fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), Error> {
-        self.data[offset..offset + bytes.len()].copy_from_slice(bytes);
-        self.handle
-            .seek(SeekFrom::Start(offset as u64))
-            .map_err(Error::Io)?;
-        self.handle.write_all(bytes).map_err(Error::Io)?;
-        Ok(())
-    }
-
-    /// Advance the superblock's recorded end-of-file to the current mirror length
-    /// and rewrite the superblock.
-    pub(crate) fn patch_superblock_eof(&mut self) -> Result<(), Error> {
-        let eof = self.data.len() as u64;
-        self.superblock.eof_address = eof;
-        let bytes = self.superblock.serialize();
-        self.write_at(self.sb_sig_off, &bytes)
-    }
-
-    /// Set the superblock consistency flags, rewrite the superblock, and flush.
-    /// Used by the SWMR writer to raise/clear the SWMR-write flag.
-    pub(crate) fn set_consistency_flags(&mut self, flags: u32) -> Result<(), Error> {
-        self.superblock.consistency_flags = flags;
-        let bytes = self.superblock.serialize();
-        self.write_at(self.sb_sig_off, &bytes)?;
-        self.sync()
-    }
-
-    /// Flush buffered writes to durable storage.
-    pub(crate) fn sync(&mut self) -> Result<(), Error> {
-        self.handle.flush().map_err(Error::Io)?;
-        self.handle.sync_data().map_err(Error::Io)?;
-        Ok(())
-    }
-}
-
 /// Writable byte-level I/O the Extensible-Array growth engine ([`Located`])
 /// depends on, extending the read-only [`Source`] seam with in-place mutation.
 /// Its owners today are [`InPlaceFile`] (the append/SWMR writers' own mirror +
-/// handle) and [`EditSession`](crate::EditSession)'s borrowed mirror; issue #147's
+/// handle) and [`File::open_rw`](crate::File::open_rw)'s borrowed mirror; issue #147's
 /// bounded backend adds a store with no mirror at all, which is why every engine
 /// *read* goes through [`Source`] (bounded, random-access) rather than a
 /// whole-file `&[u8]`. Genericizing the engine over this trait lets a long-lived
-/// `EditSession` drive an O(1) in-place append against its *own* single mirror and
+/// the in-place edit engine drive an O(1) in-place append against its *own* single mirror and
 /// exclusive lock rather than constructing a second `InPlaceFile` (which would
 /// take a second exclusive lock and keep a divergent mirror). Each owner keeps its
 /// own crash-safety discipline for the primitives — `InPlaceFile` mirrors before
@@ -293,36 +168,6 @@ pub(crate) trait Store: Source {
     }
 }
 
-impl Source for InPlaceFile {
-    fn len(&self) -> u64 {
-        self.data.len() as u64
-    }
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), crate::error::FormatError> {
-        BytesSource::new(&self.data).read_at(offset, buf)
-    }
-}
-
-impl Store for InPlaceFile {
-    fn offset_size(&self) -> u8 {
-        self.offset_size
-    }
-    fn length_size(&self) -> u8 {
-        self.length_size
-    }
-    fn append_bytes(&mut self, bytes: &[u8]) -> Result<u64, Error> {
-        InPlaceFile::append_bytes(self, bytes)
-    }
-    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Error> {
-        InPlaceFile::write_at(self, offset.to_usize()?, bytes)
-    }
-    fn patch_superblock_eof(&mut self) -> Result<(), Error> {
-        InPlaceFile::patch_superblock_eof(self)
-    }
-    fn sync(&mut self) -> Result<(), Error> {
-        InPlaceFile::sync(self)
-    }
-}
-
 /// Absolute file offsets of the object-header messages a caller may need to
 /// parse after locating a dataset.
 pub(crate) struct MessageSpans {
@@ -337,7 +182,6 @@ pub(crate) struct MessageSpans {
 pub(crate) struct LocateResult {
     pub located: Located,
     pub spans: MessageSpans,
-    pub has_filters: bool,
 }
 
 /// Metadata located once per dataset, then maintained across appends.
@@ -542,7 +386,6 @@ impl Located {
                 datatype: (datatype_msg.data_off, datatype_msg.size),
                 filter: filter_msg.map(|m| (m.data_off, m.size)),
             },
-            has_filters,
         })
     }
 
@@ -1038,12 +881,12 @@ pub(crate) struct AppendPlan {
 /// of `new_elems` elements (`raw` little-endian bytes) to the Extensible-Array
 /// dataset described by `loc`, together with the first element index they occupy
 /// and the new dimension / chunk count. Shared by the general append writer and
-/// `EditSession`'s in-place append so the read/plan logic lives in one place.
+/// the in-place edit engine's in-place append so the read/plan logic lives in one place.
 ///
 /// A *filtered* dataset can only be appended in whole chunks: a non-chunk-aligned
 /// filtered append is refused here rather than repointing a multi-field trailing
 /// element whose in-place overwrite is not power-loss atomic; use
-/// [`EditSession::append_dataset`](crate::EditSession::append_dataset) for that.
+/// [`Dataset::append_staged`](crate::Dataset::append_staged) for that.
 pub(crate) fn plan_ea_append<F: Store>(
     file: &F,
     loc: &Located,
@@ -1151,7 +994,7 @@ pub(crate) fn plan_ea_append<F: Store>(
 /// four durability phases (production callers pass 4; the crash-consistency tests
 /// stop at a boundary to simulate a crash). On a full (phase-4) apply, `loc`'s
 /// cached `current_dim` / `num_chunks` are advanced to match. Shared by the
-/// general append writer and `EditSession`'s in-place append so this ordered
+/// general append writer and the in-place edit engine's in-place append so this ordered
 /// write sequence — the crash-safety heart of the engine — lives in exactly one
 /// place and is never copy-pasted.
 pub(crate) fn apply_ea_append<F: Store>(
@@ -1479,6 +1322,9 @@ fn read_uint(data: &[u8], pos: usize, size: usize) -> Result<u64, Error> {
 mod tests {
     use super::*;
     use crate::group_v2;
+    use crate::signature;
+    use crate::source::BytesSource;
+    use crate::superblock::Superblock;
     use crate::writer::FileBuilder;
     use std::cell::{Cell, RefCell};
 

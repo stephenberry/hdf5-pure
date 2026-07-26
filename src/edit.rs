@@ -1,6 +1,6 @@
 //! In-place editing of an existing HDF5 file (issue #32, Group C).
 //!
-//! [`EditSession`] opens an existing file and adds objects, overwrites dataset
+//! The in-place edit engine opens an existing file and adds objects, overwrites dataset
 //! values, or edits compact group attributes **in place**:
 //! new data and object headers are written at the end of the file, and the
 //! object headers of the touched groups (and their ancestors up to the root)
@@ -18,25 +18,25 @@
 //! this same commit rewrites (the root through the superblock); absolute
 //! object-reference addresses to other objects stay valid.
 //!
-//! Deletion ([`EditSession::delete`], the HDF5 `H5Ldelete`) is the mirror image:
+//! Deletion ([`Group::delete`](crate::Group::delete), the HDF5 `H5Ldelete`) is the mirror image:
 //! the parent group's header is rebuilt without the removed link, relocated up
 //! the tree the same way, and the unlinked object (and its subtree) is freed —
 //! its blocks are returned to a session-local free list (see below).
-//! Object copy ([`EditSession::copy`], the HDF5 `H5Ocopy`) deep-copies
+//! Object copy ([`File::copy`](crate::File::copy), the HDF5 `H5Ocopy`) deep-copies
 //! a source subtree — appending fresh copies of every object, repointing internal
 //! links and the contiguous data address — and links the copy in like an
 //! addition; the headers are reproduced from their verbatim message bytes, so
 //! datatypes, dataspaces, and attributes stay byte-exact. A chunked (and filtered)
 //! dataset is copied with its chunk payloads and filter pipeline preserved
 //! byte-for-byte, its index rebuilt at the new location. The same machinery,
-//! [`EditSession::copy_from`], copies an object **across two open files** — the
+//! [`File::copy_from`](crate::File::copy_from), copies an object **across two open files** — the
 //! source being a separate [`File`](crate::File) reader rather than the file being
 //! edited. Because the copy is byte-for-byte, the cross-file path refuses anything
 //! that embeds a source-file absolute address (variable-length or reference data,
 //! a committed datatype), which an in-file copy keeps valid by sharing the source
 //! file's heaps and objects.
 //!
-//! Value overwrite ([`EditSession::write_dataset`], the HDF5 `H5Dwrite`) replaces
+//! Value overwrite ([`Dataset::write`](crate::Dataset::write), the HDF5 `H5Dwrite`) replaces
 //! an **existing** dataset's values. The replacement's datatype and shape must
 //! match the on-disk dataset (an overwrite, not a reshape or retype); contiguous,
 //! compact, and chunked (including filtered) datasets are all supported, the chunk
@@ -70,7 +70,7 @@
 //!   (with base-aware subtree reclaim), in-file copy, cross-file copy into a
 //!   userblock destination, group creation, compact attributes, and free-space
 //!   reuse. The one userblock-specific limitation left is cross-file copy *from* a
-//!   userblock source (the source must have base 0; see [`copy_from`](EditSession::copy_from)).
+//!   userblock source (the source must have base 0; see [`copy_from`](crate::File::copy_from)).
 //!   Any superblock version (0–3) is accepted: a version 0/1
 //!   (symbol-table) file is edited by converting each group on the edited path
 //!   to the latest format and repointing the superblock's root symbol-table
@@ -234,7 +234,7 @@ type PathKey = Vec<String>;
 type PendingVlAttrs = Vec<(crate::attribute::AttributeMessage, Vec<Vec<u8>>)>;
 
 /// Accumulates elements to append to an existing chunked, unlimited dataset via
-/// [`EditSession::append_dataset`], in call order along the dataset's first
+/// [`Dataset::append_staged`](crate::Dataset::append_staged), in call order along the dataset's first
 /// (axis-0) dimension.
 ///
 /// It mirrors [`DatasetBuilder`]'s typed/generic vocabulary. Repeated typed or
@@ -341,15 +341,12 @@ append_typed! {
 }
 
 /// The in-place write engine behind the owned read-write [`File`](crate::File)
-/// (its `Backend::Mirror`) and the public [`EditSession`] wrapper.
+/// (its `Backend::Mirror`).
 ///
 /// Mirrors the file in memory and keeps a writable handle; every mutation is
-/// applied to both so the on-disk file stays consistent. It carries the two
-/// commit models documented on [`EditSession`]: staged tree edits applied by
-/// [`commit`](Self::commit), and immediate crash-atomic in-place appends
-/// ([`append_inplace`](Self::append_inplace)). The public [`EditSession`] is a
-/// wrapper that forwards to this type; `Backend::Mirror` drives it directly, so
-/// the engine itself stays free of the wrapper's deprecation.
+/// applied to both so the on-disk file stays consistent. It carries two commit
+/// models: staged tree edits applied by [`commit`](Self::commit), and immediate
+/// crash-atomic in-place appends ([`append_inplace`](Self::append_inplace)).
 pub(crate) struct WriteEngine {
     handle: fs::File,
     /// In-memory mirror of the file, kept byte-for-byte in sync with `handle`.
@@ -435,10 +432,10 @@ pub(crate) struct WriteEngine {
 
 /// Superblock consistency-flag bits raised while a SWMR writer is active: bit 0
 /// (write access) | bit 2 (SWMR write access). Cleared on a clean close. Matches
-/// the reference C library, h5py, and [`crate::SwmrWriter`].
+/// the reference C library, h5py, and [`crate::File::open_swmr_writer`].
 const SWMR_WRITE_FLAGS: u32 = 0x05;
 
-/// A dataset located once for [`EditSession::append_inplace`] (or the bounded
+/// A dataset located once for [`Dataset::append`](crate::Dataset::append) (or the bounded
 /// backend's immediate append), then maintained across appends. Mirrors the
 /// append writer's per-dataset state.
 pub(crate) struct LocatedState {
@@ -468,20 +465,20 @@ struct PersistState {
     old_blocks: Vec<(u64, u64)>,
 }
 
-/// A snapshot of an [`EditSession`]'s live space usage (issue #150).
+/// A snapshot of a writable file's live space usage (issue #150).
 ///
 /// This is the mutating-session counterpart of the read-only accounting on
 /// [`File`](crate::File) ([`file_size`](crate::File::file_size) and
 /// [`persisted_free_space`](crate::File::persisted_free_space)): it describes the
 /// file *as the session currently holds it*, taken atomically at the moment of
-/// the [`space_accounting`](EditSession::space_accounting) call.
+/// the [`space_accounting`](crate::File::space_accounting) call.
 ///
 /// It reflects the committed file plus any immediate in-place appends
-/// ([`append_inplace`](EditSession::append_inplace)), but **not** edits still
-/// staged for the next [`commit`](EditSession::commit) — `create_group`,
+/// ([`append`](crate::Dataset::append)), but **not** edits still
+/// staged for the next [`commit`](crate::File::commit) — `create_group`,
 /// `create_dataset`, `write_dataset`, `append_dataset`, `delete`, `copy`,
 /// `copy_from`, and attribute edits change these figures only when they are
-/// applied at commit. Use [`has_staged_edits`](EditSession::has_staged_edits) to
+/// applied at commit. Use [`has_staged_edits`](crate::File::has_staged_edits) to
 /// tell whether such pending work exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -492,15 +489,15 @@ pub struct SpaceAccounting {
     /// right now (the HDF5 `H5Fget_filesize` value), because the session keeps its
     /// in-memory mirror byte-for-byte identical to the file — every committed
     /// write and every immediate in-place append
-    /// ([`append_inplace`](EditSession::append_inplace)) updates both together.
+    /// ([`append`](crate::Dataset::append)) updates both together.
     ///
-    /// It is not monotonic: [`commit`](EditSession::commit) can reclaim trailing
+    /// It is not monotonic: [`commit`](crate::File::commit) can reclaim trailing
     /// free space and *shrink* the file. It can also exceed the superblock's
     /// recorded end-of-file address when the file was opened carrying unaccounted
     /// trailing bytes (the same slack [`File::file_size`](crate::File::file_size)
     /// surfaces), since opening does not rewrite that address.
     pub logical_size: u64,
-    /// Total reusable free bytes the next allocation or [`commit`](EditSession::commit)
+    /// Total reusable free bytes the next allocation or [`commit`](crate::File::commit)
     /// can draw from before the file has to grow — the summed length of
     /// [`reusable_free_space`](Self::reusable_free_space).
     ///
@@ -877,7 +874,7 @@ impl WriteEngine {
     /// not rewritten and the file does not grow by the whole dataset per append.
     ///
     /// This does **not** use SWMR and sets no consistency flag. Like every other
-    /// [`EditSession`] edit it commits by appending the new chunks and a rebuilt
+    /// staged edit it commits by appending the new chunks and a rebuilt
     /// index at end-of-file and repointing the superblock last (under the
     /// session's exclusive lock), so a crash leaves either the original dataset or
     /// the fully-grown one, never a torn state.
@@ -904,11 +901,11 @@ impl WriteEngine {
     /// — the throughput-oriented, self-committing counterpart to the staged
     /// [`append_dataset`](Self::append_dataset).
     ///
-    /// Unlike every other [`EditSession`] edit, an in-place append is **not**
+    /// Unlike every other edit, an in-place append is **not**
     /// staged: it is applied and made durable before it returns (writes ordered
     /// child-before-parent with `fsync` barriers, the dataspace dimension
     /// published last as the single commit point), exactly like
-    /// [`AppendWriter`](crate::AppendWriter). It needs no [`commit`](Self::commit),
+    /// [`Dataset::append`](crate::Dataset::append). It needs no [`commit`](Self::commit),
     /// and it composes with staged tree edits on the same session: append rows,
     /// stage `create_group` / `create_dataset` / attribute / `delete` edits,
     /// `commit` them, and keep appending — all without reopening the file between
@@ -916,7 +913,7 @@ impl WriteEngine {
     ///
     /// # Length rules and crash safety
     ///
-    /// Identical to [`AppendWriter`](crate::AppendWriter): an **unfiltered** dataset
+    /// Identical to [`Dataset::append`](crate::Dataset::append): an **unfiltered** dataset
     /// accepts any-length appends (a partial trailing chunk is rewritten and its
     /// single-address index element repointed with one atomic write); a
     /// **filtered** dataset accepts whole-chunk appends only (its multi-field index
@@ -940,13 +937,14 @@ impl WriteEngine {
     /// # Example
     ///
     /// ```no_run
-    /// use hdf5_pure::EditSession;
+    /// use hdf5_pure::File;
     ///
-    /// let mut session = EditSession::open("log.h5")?;
-    /// session.append_inplace_i32("samples", &[8, 9, 10, 11])?; // immediate + durable
-    /// session.create_group("run2"); // staged
-    /// session.append_inplace_i32("samples", &[12, 13])?;
-    /// session.commit()?; // applies the staged group; appends already durable
+    /// let file = File::open_rw("log.h5")?;
+    /// let mut samples = file.dataset("samples")?;
+    /// samples.append(&[8i32, 9, 10, 11])?; // immediate + durable
+    /// file.root().create_group("run2")?; // staged
+    /// samples.append(&[12i32, 13])?;
+    /// file.commit()?; // applies the staged group; appends already durable
     /// # Ok::<(), hdf5_pure::Error>(())
     /// ```
     pub fn append_inplace<T: crate::element::H5Element>(
@@ -1010,10 +1008,10 @@ impl WriteEngine {
     /// for detecting pending work.
     ///
     /// ```no_run
-    /// use hdf5_pure::EditSession;
+    /// use hdf5_pure::File;
     ///
-    /// let session = EditSession::open("existing.h5")?;
-    /// let acct = session.space_accounting();
+    /// let file = File::open_rw("existing.h5")?;
+    /// let acct = file.space_accounting()?;
     /// println!(
     ///     "{} bytes on disk, {} reusable in {} free region(s)",
     ///     acct.logical_size,
@@ -1153,7 +1151,7 @@ impl WriteEngine {
         }
 
         // Read/plan phase (immutable borrows only, nothing published yet), then the
-        // ordered, fsync-barriered write phase — both shared with `AppendWriter`
+        // ordered, fsync-barriered write phase — both shared with `Dataset::append`
         // through the chunk-index engine. `EditMirror` borrows only the
         // mirror-carrying fields, so `self.located` stays independently borrowable.
         let plan_result = {
@@ -1190,7 +1188,7 @@ impl WriteEngine {
     }
 
     /// Test-only phased in-place append (stops after `max_phase` durability phases)
-    /// used by the crash-consistency tests, mirroring `AppendWriter`'s harness.
+    /// used by the crash-consistency tests, mirroring `Dataset::append`'s harness.
     #[cfg(test)]
     fn append_inplace_i32_phased(
         &mut self,
@@ -1323,7 +1321,7 @@ impl WriteEngine {
     /// bytes rather than risk freeing a region that is still in use. Freed space is
     /// reused within the open session; for a file created with
     /// `H5Pset_file_space_strategy(persist = true)` it is also recorded on disk so
-    /// it survives reopen (see [`EditSession`]), otherwise it is forgotten
+    /// it survives reopen, otherwise it is forgotten
     /// on close. After reuse, an object reference to a deleted object may resolve
     /// to an unrelated object (deleting a referenced object is undefined in HDF5).
     ///
@@ -4805,8 +4803,8 @@ struct Node {
     deletes: Vec<String>,
     /// Copies to add to this group: (new link name, the source subtree read out
     /// for writing). Built at staging time from either this file (an in-file
-    /// [`copy`](EditSession::copy)) or another open file (a cross-file
-    /// [`copy_from`](EditSession::copy_from)).
+    /// [`copy`](crate::File::copy)) or another open file (a cross-file
+    /// [`copy_from`](crate::File::copy_from)).
     copies: Vec<(String, CopyTree)>,
     /// Value overwrites whose dataset header relocates (a resize or compact
     /// rewrite by `write_dataset`), as (child link name, the relocation plan). On
@@ -4819,15 +4817,15 @@ struct Node {
     /// Variable-length group/root attributes staged by [`apply_group_attr_ops`],
     /// each still carrying a placeholder heap address: (the attribute message,
     /// its global heap collection bytes). Resolved in the apply loop right
-    /// before this node's header is built — [`EditSession::place_vl_collection`]
+    /// before this node's header is built — [`WriteEngine::place_vl_collection`]
     /// appends the collection, then the patched message is appended to
     /// `base_region`.
     pending_vl_attrs: PendingVlAttrs,
 }
 
 /// A staged compact attribute edit for a group or dataset (shared by
-/// [`EditSession::set_group_attr`]/`remove_group_attr` and
-/// [`EditSession::set_dataset_attr`]/`remove_dataset_attr`).
+/// [`Group::set_attr`](crate::Group::set_attr)/`remove_group_attr` and
+/// [`Dataset::set_attr`](crate::Dataset::set_attr)/`remove_dataset_attr`).
 enum AttrOp {
     Set { name: String, value: AttrValue },
     Remove { name: String },
@@ -4858,7 +4856,7 @@ enum ObjModel {
     },
     /// A chunked (and possibly filtered) dataset: the verbatim header `region`
     /// (datatype, dataspace, fill value, data layout, and filter pipeline kept as
-    /// written). The chunk data is not captured here — [`read_copy_subtree`](EditSession::read_copy_subtree)
+    /// written). The chunk data is not captured here — [`read_copy_subtree`](WriteEngine::read_copy_subtree)
     /// enumerates and reads the chunks (it holds the source buffer), repointing the
     /// rebuilt index on write. See [`DatasetVerbatim`](ObjModel::DatasetVerbatim)
     /// for `dense_attrs`.
@@ -4877,8 +4875,8 @@ enum ObjModel {
 }
 
 /// An object subtree fully read out of a source buffer and owning every byte it
-/// will write, the read result of [`EditSession::read_copy_subtree`] and the
-/// input to [`EditSession::write_copy_subtree`]. Unlike [`ObjModel`] (a single
+/// will write, the read result of [`WriteEngine::read_copy_subtree`] and the
+/// input to [`WriteEngine::write_copy_subtree`]. Unlike [`ObjModel`] (a single
 /// object still referencing source addresses) it is recursive and self-contained:
 /// a contiguous dataset owns its data bytes, and a group owns its children, so it
 /// can be written into the destination without the source buffer still in hand —
@@ -4940,7 +4938,7 @@ struct GroupInfo {
 }
 
 /// How a staged value overwrite (`write_dataset`) will be applied, decided by
-/// [`EditSession::prepare_write`] during the all-or-nothing preflight.
+/// [`WriteEngine::prepare_write`] during the all-or-nothing preflight.
 enum WritePlan {
     /// A contiguous dataset whose new data is the same length as its existing,
     /// defined data block: overwrite the bytes straight in place at `data_addr`.
@@ -5039,7 +5037,7 @@ enum MovingWrite {
     /// A compact dataset-attribute edit (`set_dataset_attr` / `remove_dataset_attr`).
     /// The verbatim header `region` already carries the fixed-size attribute change
     /// (applied by [`apply_group_attr_ops`] in the commit preflight); any
-    /// variable-length attribute is placed and patched in [`EditSession::write_moving`]
+    /// variable-length attribute is placed and patched in [`WriteEngine::write_moving`]
     /// via `pending_vl_attrs`. The rewritten header is relocated and the parent link
     /// repointed, exactly like the other relocating writes — but the data-layout
     /// message is preserved verbatim, so the dataset's chunk data and index stay in
@@ -5076,7 +5074,7 @@ struct FlatDataset {
     /// collections. Resolved in the apply loop right before `raw` is appended.
     vl_string_staging: Option<VlStringStaging>,
     /// An object-reference dataset's per-element targets, still unresolved.
-    /// Resolved (see [`EditSession::resolve_reference_target`]) and patched
+    /// Resolved (see [`WriteEngine::resolve_reference_target`]) and patched
     /// into `raw` in the apply loop, once every object this commit places has
     /// a known address. `None` for an ordinary dataset.
     reference_targets: Option<Vec<ObjectRefTarget>>,
@@ -5087,11 +5085,11 @@ struct FlatDataset {
 }
 
 /// A borrow adapter that drives the shared Extensible-Array append engine
-/// ([`crate::chunk_index_inplace`]) against an [`EditSession`]'s *own* mirror,
+/// ([`crate::chunk_index_inplace`]) against the engine's *own* mirror,
 /// handle, and superblock, so a session runs an immediate O(1) in-place append
-/// without constructing a second `InPlaceFile` (which would take a second exclusive
+/// without constructing a second writable handle (which would take a second exclusive
 /// lock and keep a divergent mirror). It borrows only the mirror-carrying fields,
-/// leaving [`EditSession::located`] independently borrowable. Its primitives write
+/// leaving [`WriteEngine::located`] independently borrowable. Its primitives write
 /// to disk *before* the mirror — the session's discipline, the opposite of the
 /// append/SWMR writers' mirror-before-disk order; the [`Store`] trait lets
 /// each owner keep its own failure-path discipline while sharing the checksummed
@@ -5121,7 +5119,7 @@ impl Store for EditMirror<'_> {
     }
     fn append_bytes(&mut self, bytes: &[u8]) -> Result<u64, Error> {
         // Disk before mirror, so a failed write never leaves the mirror ahead of
-        // the file (matching `EditSession::append`).
+        // the file (matching `WriteEngine::append`).
         let addr = self.data.len() as u64;
         self.handle.seek(SeekFrom::Start(addr)).map_err(Error::Io)?;
         self.handle.write_all(bytes).map_err(Error::Io)?;
@@ -5140,7 +5138,7 @@ impl Store for EditMirror<'_> {
     }
     fn patch_superblock_eof(&mut self) -> Result<(), Error> {
         // Advance only the recorded end-of-file and re-serialize the superblock in
-        // place. Unlike `EditSession::commit`, this deliberately does NOT clear the
+        // place. Unlike `WriteEngine::commit`, this deliberately does NOT clear the
         // consistency flags and does NOT repoint the root group: base_address is 0
         // for every in-place-append-eligible file, so the normalized-absolute root
         // address serializes back to the same stored value.
@@ -5163,7 +5161,7 @@ fn paths_overlap(a: &[String], b: &[String]) -> bool {
 
 /// Re-tag a refusal from the shared append engine (`AppendUnsupported`) as the
 /// fast-path [`Error::AppendInPlaceUnsupported`], so a caller can catch it and fall
-/// back to the staged [`append_dataset`](EditSession::append_dataset) — which
+/// back to the staged [`append_dataset`](WriteEngine::append_dataset) — which
 /// handles the non-chunk-aligned filtered case, index-geometry limits, and
 /// platform-width limits that the engine reports this way. Genuine I/O and format
 /// errors pass through unchanged.
@@ -5257,286 +5255,6 @@ pub(crate) fn locate_dataset_state<F: Store>(
     })
 }
 
-/// Generate the typed `append_inplace_*` methods, mirroring [`AppendBuilder`]'s
-/// vocabulary: each gathers into a builder and applies the append immediately.
-macro_rules! append_inplace_typed {
-    ($($method:ident, $builder:ident, $ty:ty;)*) => {
-        impl WriteEngine {
-            $(
-                #[doc = concat!("Append `", stringify!($ty), "` values to `dataset` in \
-                    place. See [`append_inplace`](Self::append_inplace) for the contract.")]
-                pub fn $method(&mut self, dataset: &str, data: &[$ty]) -> Result<(), Error> {
-                    let mut b = AppendBuilder::new();
-                    b.$builder(data);
-                    self.append_inplace_gathered(dataset, &b, 4)
-                }
-            )*
-        }
-    };
-}
-
-append_inplace_typed! {
-    append_inplace_f64, append_f64, f64;
-    append_inplace_f32, append_f32, f32;
-    append_inplace_i8, append_i8, i8;
-    append_inplace_i16, append_i16, i16;
-    append_inplace_i32, append_i32, i32;
-    append_inplace_i64, append_i64, i64;
-    append_inplace_u8, append_u8, u8;
-    append_inplace_u16, append_u16, u16;
-    append_inplace_u32, append_u32, u32;
-    append_inplace_u64, append_u64, u64;
-}
-
-/// An open HDF5 file being edited in place.
-///
-/// Mirror the file in memory and keep a writable handle; every mutation is
-/// applied to both so the on-disk file stays consistent.
-///
-/// The session has **two commit models** that compose on one open file:
-///
-/// - **Staged** edits are batched and applied together by [`commit`](Self::commit):
-///   additions ([`create_dataset`](Self::create_dataset) /
-///   [`create_group`](Self::create_group)), value overwrites
-///   ([`write_dataset`](Self::write_dataset)), staged appends
-///   ([`append_dataset`](Self::append_dataset)), group and dataset attribute edits
-///   ([`set_group_attr`](Self::set_group_attr) / [`set_dataset_attr`](Self::set_dataset_attr)
-///   and their `remove_*` counterparts), object [`copy`](Self::copy), and
-///   [`delete`](Self::delete). Dropping the session discards uncommitted staged
-///   edits ([`has_staged_edits`](Self::has_staged_edits) reports whether any remain).
-/// - **Immediate** in-place row appends ([`append_inplace`](Self::append_inplace))
-///   are applied and made durable the moment they are called — amortized O(1),
-///   crash-atomic, needing no `commit` — and can be freely interleaved with staged
-///   edits on the same session, so a high-frequency append loop and occasional tree
-///   edits share one open file with no reopening between them.
-///
-/// # Example
-///
-/// ```no_run
-/// # #![allow(deprecated)]
-/// use hdf5_pure::{AttrValue, EditSession};
-///
-/// let mut session = EditSession::open("existing.h5")?;
-/// session.create_group("run2");
-/// session.set_group_attr("run2", "kind", AttrValue::AsciiString("trial".into()));
-/// session
-///     .create_dataset("run2/signal")
-///     .with_f64_data(&[1.0, 2.0, 3.0]);
-/// session.commit()?;
-/// # Ok::<(), hdf5_pure::Error>(())
-/// ```
-///
-/// This type is the public face of the crate's in-place write engine: every
-/// method forwards to it, and the owned read-write [`File`](crate::File) drives
-/// the same engine directly behind its `Backend::Mirror`.
-///
-/// # Deprecated
-///
-/// Superseded by the owned-handle API. Open a file for reading **and** writing
-/// with [`File::open_rw`](crate::File::open_rw), then reach every object by name
-/// through owned [`Dataset`](crate::Dataset) and [`Group`](crate::Group) handles
-/// that both read and mutate in place — no separate, write-blind session type.
-/// The two commit models carry over unchanged: immediate
-/// [`Dataset::append`](crate::Dataset::append), and staged
-/// [`Group::create_dataset`](crate::Group::create_dataset) /
-/// [`Group::create_group`](crate::Group::create_group) /
-/// [`Dataset::write`](crate::Dataset::write) /
-/// [`Dataset::append_staged`](crate::Dataset::append_staged) / attribute edits /
-/// [`File::copy`](crate::File::copy) / [`Group::delete`](crate::Group::delete),
-/// applied by [`File::commit`](crate::File::commit).
-///
-/// ```no_run
-/// use hdf5_pure::File;
-///
-/// let file = File::open_rw("existing.h5")?;
-/// let root = file.root();
-/// root.create_group("run2")?; // staged
-/// root.create_dataset("run2/signal", |b| {
-///     b.with_f64_data(&[1.0, 2.0, 3.0]);
-/// })?; // staged
-/// file.commit()?; // apply staged edits
-/// let _values: Vec<f64> = file.dataset("run2/signal")?.read()?; // read back, one handle
-/// # Ok::<(), hdf5_pure::Error>(())
-/// ```
-///
-/// The type will be removed in a later release.
-#[deprecated(
-    since = "0.22.0",
-    note = "use File::open_rw and owned Dataset/Group handles; see the EditSession type docs for migration"
-)]
-pub struct EditSession {
-    engine: WriteEngine,
-}
-
-#[allow(deprecated)] // this wrapper's own impl legitimately names and builds the (deprecated) type
-impl EditSession {
-    /// Open an existing HDF5 file for in-place editing, taking an exclusive OS
-    /// advisory lock held for the session's life. Fails with
-    /// [`Error::EditUnsupported`] if the file is not a supported target (its
-    /// documentation enumerates the requirements) or [`Error::FileLocked`] if the
-    /// file is already locked. Use [`open_with_locking`](Self::open_with_locking)
-    /// or `HDF5_USE_FILE_LOCKING=FALSE` to control locking.
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
-        Ok(Self {
-            engine: WriteEngine::open(path)?,
-        })
-    }
-
-    /// Like [`open`](Self::open), but with an explicit [`FileLocking`] policy.
-    pub fn open_with_locking<P: AsRef<Path>>(path: P, locking: FileLocking) -> Result<Self, Error> {
-        Ok(Self {
-            engine: WriteEngine::open_with_locking(path, locking)?,
-        })
-    }
-
-    /// Stage a new dataset at `path` and return its builder; applied on the next
-    /// [`commit`](Self::commit).
-    pub fn create_dataset(&mut self, path: &str) -> &mut DatasetBuilder {
-        self.engine.create_dataset(path)
-    }
-
-    /// Stage an in-place value overwrite of the existing dataset at `path` and
-    /// return its builder; applied on the next [`commit`](Self::commit). The new
-    /// datatype and shape must match the on-disk ones exactly.
-    pub fn write_dataset(&mut self, path: &str) -> &mut DatasetBuilder {
-        self.engine.write_dataset(path)
-    }
-
-    /// Stage a rebuild-index append onto the existing chunked, unlimited dataset
-    /// at `path` and return its builder; applied on the next
-    /// [`commit`](Self::commit). Handles the filtered, non-chunk-aligned, and
-    /// unallocated cases the immediate [`append_inplace`](Self::append_inplace)
-    /// refuses.
-    pub fn append_dataset(&mut self, path: &str) -> &mut AppendBuilder {
-        self.engine.append_dataset(path)
-    }
-
-    /// Immediately append `data` to `dataset` in place — amortized O(1),
-    /// crash-atomic, and durable without a [`commit`](Self::commit). The typed
-    /// `append_inplace_*` methods are convenience wrappers over this.
-    pub fn append_inplace<T: crate::element::H5Element>(
-        &mut self,
-        dataset: &str,
-        data: &[T],
-    ) -> Result<(), Error> {
-        self.engine.append_inplace(dataset, data)
-    }
-
-    /// Append raw little-endian element bytes to `dataset` in place; see
-    /// [`append_inplace`](Self::append_inplace) for the contract.
-    pub fn append_inplace_raw(&mut self, dataset: &str, bytes: &[u8]) -> Result<(), Error> {
-        self.engine.append_inplace_raw(dataset, bytes)
-    }
-
-    /// Whether any staged tree edit is still uncommitted. Immediate in-place
-    /// appends never stage, so they never affect this.
-    pub fn has_staged_edits(&self) -> bool {
-        self.engine.has_staged_edits()
-    }
-
-    /// A snapshot of this session's live space usage as a [`SpaceAccounting`].
-    pub fn space_accounting(&self) -> SpaceAccounting {
-        self.engine.space_accounting()
-    }
-
-    /// Stage a new group at `path`, creating any missing ancestors; applied on the
-    /// next [`commit`](Self::commit).
-    pub fn create_group(&mut self, path: &str) {
-        self.engine.create_group(path)
-    }
-
-    /// Stage setting attribute `name` on the group at `path` (the root group via
-    /// `""`); applied on the next [`commit`](Self::commit).
-    pub fn set_group_attr(&mut self, path: &str, name: &str, value: AttrValue) -> &mut Self {
-        self.engine.set_group_attr(path, name, value);
-        self
-    }
-
-    /// Stage removing attribute `name` from the group at `path`; applied on the
-    /// next [`commit`](Self::commit).
-    pub fn remove_group_attr(&mut self, path: &str, name: &str) -> &mut Self {
-        self.engine.remove_group_attr(path, name);
-        self
-    }
-
-    /// Stage setting attribute `name` on the dataset at `path`; applied on the
-    /// next [`commit`](Self::commit).
-    pub fn set_dataset_attr(&mut self, path: &str, name: &str, value: AttrValue) -> &mut Self {
-        self.engine.set_dataset_attr(path, name, value);
-        self
-    }
-
-    /// Stage removing attribute `name` from the dataset at `path`; applied on the
-    /// next [`commit`](Self::commit).
-    pub fn remove_dataset_attr(&mut self, path: &str, name: &str) -> &mut Self {
-        self.engine.remove_dataset_attr(path, name);
-        self
-    }
-
-    /// Stage removal of the link at `path`; applied on the next
-    /// [`commit`](Self::commit).
-    pub fn delete(&mut self, path: &str) {
-        self.engine.delete(path)
-    }
-
-    /// Stage a within-file object copy from `src` to `dst`; applied on the next
-    /// [`commit`](Self::commit).
-    pub fn copy(&mut self, src: &str, dst: &str) {
-        self.engine.copy(src, dst)
-    }
-
-    /// Stage a cross-file object copy of `src` in `source` to `dst` in this file;
-    /// applied on the next [`commit`](Self::commit). `source` must be a buffered
-    /// read-only file ([`File::open`](crate::File::open) or
-    /// [`File::from_bytes`](crate::File::from_bytes)), not a streaming or
-    /// read-write one.
-    pub fn copy_from(
-        &mut self,
-        source: &crate::reader::File,
-        src: &str,
-        dst: &str,
-    ) -> Result<(), Error> {
-        self.engine.copy_from(source, src, dst)
-    }
-
-    /// Apply all staged additions, overwrites, appends, attribute edits, copies,
-    /// and deletions to the file in place and flush. See the crate's editing guide
-    /// for the all-or-nothing failure semantics.
-    pub fn commit(&mut self) -> Result<(), Error> {
-        self.engine.commit()
-    }
-}
-
-/// Generate the [`EditSession`] wrapper's typed `append_inplace_*` forwarders,
-/// each delegating to the [`WriteEngine`] method of the same name.
-macro_rules! forward_append_inplace_typed {
-    ($($method:ident, $ty:ty;)*) => {
-        #[allow(deprecated)] // forwarders on the deprecated wrapper
-        impl EditSession {
-            $(
-                #[doc = concat!("Append `", stringify!($ty), "` values to `dataset` in \
-                    place; see [`append_inplace`](Self::append_inplace).")]
-                pub fn $method(&mut self, dataset: &str, data: &[$ty]) -> Result<(), Error> {
-                    self.engine.$method(dataset, data)
-                }
-            )*
-        }
-    };
-}
-
-forward_append_inplace_typed! {
-    append_inplace_f64, f64;
-    append_inplace_f32, f32;
-    append_inplace_i8, i8;
-    append_inplace_i16, i16;
-    append_inplace_i32, i32;
-    append_inplace_i64, i64;
-    append_inplace_u8, u8;
-    append_inplace_u16, u16;
-    append_inplace_u32, u32;
-    append_inplace_u64, u64;
-}
-
 /// Split a path into non-empty components.
 fn split_path(path: &str) -> PathKey {
     path.split('/')
@@ -5607,7 +5325,7 @@ fn retain_disjoint_in_bounds(spans: &mut Vec<(u64, u64)>, eof: u64) {
 /// dataset's per-element targets (`db.reference_targets`) are likewise carried
 /// through unresolved — resolving a path target requires knowing every other
 /// object this commit places, which is only known well into the apply loop
-/// (see [`EditSession::resolve_reference_target`]). Rejects any remaining
+/// (see [`WriteEngine::resolve_reference_target`]). Rejects any remaining
 /// feature this engine cannot reproduce faithfully: dense attributes, a
 /// chunked/extensible variable-length-string or object-reference dataset, or a
 /// filter pipeline the build cannot construct.
@@ -6453,7 +6171,7 @@ fn remove_link_from_region(region: &[u8], name: &str) -> Result<Vec<u8>, Error> 
 /// instead collected into the returned `pending_vl_attrs` — its placeholder
 /// heap address is only patched, and the message appended to the group's
 /// header, by the apply loop once its global heap collection's real address
-/// is known (see [`EditSession::place_vl_collection`]). A later op for the
+/// is known (see [`WriteEngine::place_vl_collection`]). A later op for the
 /// same name (another `Set`, fixed-size or not, or a `Remove`) replaces or
 /// cancels an earlier still-pending variable-length entry, keeping the net
 /// effect the same regardless of op order within one commit. `region`'s
@@ -6786,7 +6504,7 @@ const MSG_FLAG_SHARED: u8 = 0x02;
 /// messages (the element type) and Attribute messages (their own datatype),
 /// recursing through compound members, array elements, and enumeration bases so a
 /// nested variable-length or reference occurrence is caught too. It is applied
-/// only on the cross-file path; the same-file [`copy`](EditSession::copy)
+/// only on the cross-file path; the same-file [`copy`](crate::File::copy)
 /// deliberately keeps these forms (their addresses stay valid in one file).
 fn reject_foreign_addresses(region: &[u8]) -> Result<(), Error> {
     let mut p = 0;
@@ -6938,8 +6656,8 @@ mod tests {
     /// leave the file readable as a consistent prefix — the old length until the
     /// phase-4 dimension commit, the new length after it — even though a
     /// partial-tail append repoints the visible trailing element in place. Mirrors
-    /// `AppendWriter`'s crash-consistency harness, but driven through
-    /// `EditSession`'s own mirror (disk-before-mirror ordering) to prove the shared
+    /// `Dataset::append`'s crash-consistency harness, but driven through
+    /// the in-place edit engine's own mirror (disk-before-mirror ordering) to prove the shared
     /// engine is crash-safe under both owners. Two starting layouts: the trailing
     /// element inline in the index block (chunk 4, n 6), and in a data block
     /// (chunk 2, n 9, slot 0).
@@ -7224,7 +6942,7 @@ mod tests {
     #[test]
     fn add_vlen_string_dataset_with_null_elements_via_edit_session() {
         // Regression test for a silent-corruption bug (issue #105): a
-        // VL-string dataset added via `EditSession` used to commit `Ok(())`
+        // VL-string dataset added via the in-place edit engine used to commit `Ok(())`
         // without ever writing its global heap collection or patching its
         // placeholder references, so the dataset failed to read back. A null
         // element (no heap object at all, distinct from an empty string) must

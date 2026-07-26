@@ -44,8 +44,8 @@ let file = File::from_bytes(bytes).unwrap();
 let values = file.dataset("x").unwrap().read_f64().unwrap();
 ```
 
-The path-based entry points (`File::open`, `FileBuilder::write`, `EditSession`,
-`SwmrWriter`, `AppendWriter`) still compile for WASM, but they cannot reach a
+The path-based entry points (`File::open`, `FileBuilder::write`, `File::open_rw`,
+`File::open_swmr_writer`) still compile for WASM, but they cannot reach a
 filesystem at runtime in the browser. Build your WASM code around `finish` and
 `from_bytes`.
 
@@ -64,7 +64,7 @@ It compiles for freestanding targets, and CI builds `thumbv7em-none-eabi` to
 keep that honest.
 
 There is an important limitation today. The high-level, path-and-image API —
-`File`, `FileBuilder`, `EditSession`, `SwmrWriter`, `AppendWriter`, `repack`, and
+`File`, `FileBuilder`, `repack`, and
 the `mat` module — is `std`-gated, so a pure-`no_std` build (`--no-default-features`)
 *compiles* but does not expose the whole-file reader and writer. What stays
 available without `std` is the lower-level surface: the datatype constructors
@@ -83,8 +83,8 @@ shown above, is available on `wasm32-unknown-unknown`.
 | Streaming read by path | `File::open_streaming` | yes |
 | SWMR follow read by path | `File::open_swmr` | yes |
 | Write a file to a path | `FileBuilder::write` | yes |
-| Edit a file in place | [`EditSession`](../guide/editing.md) | yes |
-| Append in SWMR mode | [`SwmrWriter`](../guide/swmr.md) | yes |
+| Edit a file in place | [`File::open_rw`](../guide/editing.md) | yes |
+| Append in SWMR mode | [`File::open_swmr_writer`](../guide/swmr.md) | yes |
 | Append in place (non-SWMR) | [`File::open_rw` + `Dataset::append`](../guide/editing.md#streaming-appends) | yes |
 | Compact a file | [`repack`](../guide/repack.md) | yes |
 | MATLAB `.mat` via serde | `mat` module | yes (`serde`) |

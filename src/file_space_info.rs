@@ -153,7 +153,7 @@ impl FileSpaceInfo {
     /// A persisting message whose first free-space manager is at `manager0_addr`
     /// (the others undefined), recording `eoa_pre_fsm` — the end-of-allocation
     /// before the on-disk free-space-manager blocks were appended. This is the
-    /// form [`EditSession`](crate::EditSession) writes when it persists a non-empty
+    /// form [`File::open_rw`](crate::File::open_rw) writes when it persists a non-empty
     /// free list: every tracked region lives in that one manager.
     pub(crate) fn persistent_single_manager(
         strategy: FileSpaceStrategy,

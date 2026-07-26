@@ -11,8 +11,7 @@
 //! create the never-written-contiguous and compact-layout fixtures those paths
 //! need.)
 
-#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
-use hdf5_pure::{AttrValue, EditSession, File, FileBuilder};
+use hdf5_pure::{AttrValue, File, FileBuilder};
 
 const UB: usize = 512;
 const MARKER: &[u8] = b"USERBLOCK-FOLLOWUP-104";
@@ -58,8 +57,8 @@ fn userblock_delete_dataset_roundtrip() {
     let userblock = build_userblock_file(&path);
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.delete("alpha");
+        let s = File::open_rw(&path).unwrap();
+        s.root().delete("alpha").unwrap();
         s.commit().unwrap();
     }
 
@@ -91,8 +90,8 @@ fn userblock_delete_group_subtree_roundtrip() {
     let userblock = build_userblock_file(&path);
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.delete("grp");
+        let s = File::open_rw(&path).unwrap();
+        s.root().delete("grp").unwrap();
         s.commit().unwrap();
     }
 
@@ -128,8 +127,8 @@ fn userblock_delete_chunked_dataset_roundtrip() {
     std::fs::write(&path, &bytes).unwrap();
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.delete("c");
+        let s = File::open_rw(&path).unwrap();
+        s.root().delete("c").unwrap();
         s.commit().unwrap();
     }
 
@@ -163,11 +162,15 @@ fn userblock_delete_then_reuse_freed_space() {
 
     let reuse: Vec<f64> = (0..64).map(|i| (i as f64) * -1.5).collect();
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.delete("big");
+        let s = File::open_rw(&path).unwrap();
+        s.root().delete("big").unwrap();
         s.commit().unwrap();
         let len_after_delete = std::fs::metadata(&path).unwrap().len();
-        s.create_dataset("reuse").with_f64_data(&reuse);
+        s.root()
+            .create_dataset("reuse", |b| {
+                b.with_f64_data(&reuse);
+            })
+            .unwrap();
         s.commit().unwrap();
         let len_after_reuse = std::fs::metadata(&path).unwrap().len();
         assert!(
@@ -206,8 +209,8 @@ fn userblock_delete_one_of_several_then_read_attr() {
     std::fs::write(&path, &bytes).unwrap();
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.delete("doomed");
+        let s = File::open_rw(&path).unwrap();
+        s.root().delete("doomed").unwrap();
         s.commit().unwrap();
     }
 
@@ -235,9 +238,9 @@ fn userblock_copy_dataset_roundtrip() {
     let userblock = build_userblock_file(&path);
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.copy("alpha", "alpha_copy");
-        s.copy("grp/inner", "grp/inner_copy");
+        let s = File::open_rw(&path).unwrap();
+        s.copy("alpha", "alpha_copy").unwrap();
+        s.copy("grp/inner", "grp/inner_copy").unwrap();
         s.commit().unwrap();
     }
 
@@ -268,8 +271,8 @@ fn userblock_copy_group_subtree_roundtrip() {
     let userblock = build_userblock_file(&path);
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.copy("grp", "grp_copy");
+        let s = File::open_rw(&path).unwrap();
+        s.copy("grp", "grp_copy").unwrap();
         s.commit().unwrap();
     }
 
@@ -309,8 +312,8 @@ fn userblock_copy_chunked_dataset_roundtrip() {
     std::fs::write(&path, &bytes).unwrap();
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.copy("c", "c_copy");
+        let s = File::open_rw(&path).unwrap();
+        s.copy("c", "c_copy").unwrap();
         s.commit().unwrap();
     }
 
@@ -344,7 +347,7 @@ fn userblock_cross_file_copy_into_userblock_dest() {
 
     {
         let source = File::open(&src_path).unwrap();
-        let mut s = EditSession::open(&dst_path).unwrap();
+        let s = File::open_rw(&dst_path).unwrap();
         s.copy_from(&source, "payload", "imported").unwrap();
         s.copy_from(&source, "sub", "imported_grp").unwrap();
         s.commit().unwrap();

@@ -9,10 +9,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - Chunked, filtered, and resizable variable-length datasets now write: `DatasetBuilder::with_vlen_strings` accepts `with_chunks`, `with_deflate`, and `with_maxshape`, and `repack` reproduces such a dataset with its chunk geometry, filters, and unlimited dimension intact. Adding one to an existing file through the in-place edit engine is still refused ([#109](https://github.com/stephenberry/hdf5-pure/issues/109)).
+- `Dataset::write_staged` overwrites a dataset through its full `DatasetBuilder`, the builder-level counterpart of `Dataset::write` for element kinds that are not `H5Element` ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)).
+- `Group::create_group_with` stages a new group configured through a `StagedGroup` closure, so a group's attributes and children land with its creation (`set_attr` cannot reach it, since it needs a group that already resolves). `create_group(name)` is unchanged ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)).
+
+### Changed
+
+- **Breaking:** three refusals on the owned write path now report a more specific error: an unaligned SWMR append gives `SwmrAppendUnsupported` instead of a `ChunkedReadError`, an ineligible immediate append gives `AppendInPlaceUnsupported` instead of `AppendUnsupported`, and a missing edit target gives `PathNotFound` when the handle is resolved instead of `AppendUnsupported`/`EditUnsupported` at commit ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)).
 
 ### Removed
 
 - **Breaking:** `FormatError::ChunkedVlenStringUnsupported` is gone, as nothing refuses those datasets any more ([#109](https://github.com/stephenberry/hdf5-pure/issues/109)).
+- **Breaking:** `AppendWriter`, `SwmrWriter`, and `EditSession`, deprecated since 0.22.0, are gone. Use `File::open_rw` (or `File::open_swmr_writer`) with owned `Dataset` and `Group` handles; `File::open_rw_with_locking` replaces `AppendWriter::open_with_locking` and `File::clear_swmr_flag` replaces `SwmrWriter::clear_swmr_flag`. The former `EditSession` methods map to `Dataset::append`/`append_staged`/`write`/`write_staged`/`set_attr`/`remove_attr`, `Group::create_group`/`create_dataset`/`delete`/`set_attr`, and `File::copy`/`copy_from`/`space_accounting`, with an object staged in an uncommitted batch reachable only through `create_group_with` ([#148](https://github.com/stephenberry/hdf5-pure/issues/148)).
 
 ## [0.24.0] - 2026-07-24
 

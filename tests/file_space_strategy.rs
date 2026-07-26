@@ -3,7 +3,6 @@
 //! issue #21): the writer records the chosen strategy in a superblock-extension
 //! File Space Info message, and the reader reads it back.
 
-#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5_pure::{File, FileBuilder, FileSpaceStrategy};
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -119,7 +118,6 @@ fn survives_in_place_edit() {
     // cut by truncation). Uses a non-paged strategy: a paged file cannot be edited
     // through the whole-file editor (issue #173 Phase 2), which is covered in
     // `tests/paged_mutation.rs`.
-    use hdf5_pure::EditSession;
     let path = tmp("hdf5_pure_fss_edit.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
@@ -127,10 +125,14 @@ fn survives_in_place_edit() {
     b.write(&path).unwrap();
 
     {
-        let mut s = EditSession::open(&path).unwrap();
-        s.create_dataset("added").with_f64_data(&vec![7.0; 512]);
+        let s = File::open_rw(&path).unwrap();
+        s.root()
+            .create_dataset("added", |b| {
+                b.with_f64_data(&vec![7.0; 512]);
+            })
+            .unwrap();
         s.commit().unwrap();
-        s.delete("added");
+        s.root().delete("added").unwrap();
         s.commit().unwrap();
     }
 
@@ -148,7 +150,7 @@ fn survives_in_place_edit() {
 fn persist_true_records_intent_on_a_fresh_file() {
     // A brand-new file has no free space, so persist = true records the persist
     // flag with no on-disk managers (matching the C library's brand-new persisted
-    // file). A later EditSession that frees space fills the managers in.
+    // file). A later File::open_rw that frees space fills the managers in.
     let path = tmp("hdf5_pure_fss_persist.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("d").with_i32_data(&[1, 2, 3]);

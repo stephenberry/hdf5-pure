@@ -1,6 +1,6 @@
-//! Live space accounting on [`EditSession`] (issue #150).
+//! Live space accounting on [`File::open_rw`] (issue #150).
 //!
-//! [`EditSession::space_accounting`] reports the file *as the session currently
+//! [`File::space_accounting`] reports the file *as the session currently
 //! holds it*: its live logical size and the free space it can reuse. These tests
 //! pin the semantics the docs promise — the size tracks immediate in-place
 //! appends, reusable free reflects only committed frees (not staged edits nor a
@@ -8,8 +8,7 @@
 //! its reusable free from disk on open, and the total always equals the summed
 //! region lengths.
 
-#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
-use hdf5_pure::{EditSession, File, FileBuilder, FileSpaceStrategy};
+use hdf5_pure::{File, FileBuilder, FileSpaceStrategy};
 use tempfile::tempdir;
 
 /// The scalar total must always equal the summed lengths of the reported regions,
@@ -61,8 +60,8 @@ fn fresh_session_reports_file_size_and_no_reusable_free() {
     b.write(&p).unwrap();
 
     let on_disk = std::fs::metadata(&p).unwrap().len();
-    let s = EditSession::open(&p).unwrap();
-    let acct = s.space_accounting();
+    let s = File::open_rw(&p).unwrap();
+    let acct = s.space_accounting().unwrap();
 
     assert_eq!(
         acct.logical_size, on_disk,
@@ -88,14 +87,16 @@ fn logical_size_grows_with_immediate_append() {
         .with_chunks(&[4]);
     b.write(&p).unwrap();
 
-    let mut s = EditSession::open(&p).unwrap();
-    let before = s.space_accounting().logical_size;
+    let s = File::open_rw(&p).unwrap();
+    let before = s.space_accounting().unwrap().logical_size;
 
     // An immediate, durable in-place append: the mirror grows and stays in lockstep
     // with the on-disk file, so logical_size reflects it at once.
-    s.append_inplace_i32("d", &[8, 9, 10, 11, 12, 13, 14, 15])
+    s.dataset("d")
+        .unwrap()
+        .append(&[8, 9, 10, 11, 12, 13, 14, 15])
         .unwrap();
-    let acct = s.space_accounting();
+    let acct = s.space_accounting().unwrap();
 
     assert!(
         acct.logical_size > before,
@@ -121,15 +122,15 @@ fn staged_delete_is_not_counted_until_commit() {
     let p = dir.path().join("staged.h5");
     build_a_big_c(&p, false);
 
-    let mut s = EditSession::open(&p).unwrap();
+    let s = File::open_rw(&p).unwrap();
     assert!(!s.has_staged_edits());
-    assert_eq!(s.space_accounting().reusable_free_bytes, 0);
+    assert_eq!(s.space_accounting().unwrap().reusable_free_bytes, 0);
 
     // Staging the delete must not change the accounting: bytes are freed at commit.
-    s.delete("big");
+    s.root().delete("big").unwrap();
     assert!(s.has_staged_edits());
     assert_eq!(
-        s.space_accounting().reusable_free_bytes,
+        s.space_accounting().unwrap().reusable_free_bytes,
         0,
         "a staged (uncommitted) delete frees nothing yet"
     );
@@ -137,7 +138,7 @@ fn staged_delete_is_not_counted_until_commit() {
     // Committing frees `big`'s interior storage, which becomes reusable.
     s.commit().unwrap();
     assert!(!s.has_staged_edits());
-    let acct = s.space_accounting();
+    let acct = s.space_accounting().unwrap();
     assert!(
         acct.reusable_free_bytes >= 1600,
         "committing the delete of an interior dataset makes its ~1600 bytes reusable \
@@ -154,17 +155,21 @@ fn reused_free_shrinks_the_reusable_total() {
     build_a_big_c(&p, false);
 
     {
-        let mut s = EditSession::open(&p).unwrap();
-        s.delete("big");
+        let s = File::open_rw(&p).unwrap();
+        s.root().delete("big").unwrap();
         s.commit().unwrap();
-        let free_before = s.space_accounting().reusable_free_bytes;
+        let free_before = s.space_accounting().unwrap().reusable_free_bytes;
         assert!(free_before >= 1600);
 
         // A new dataset that fits the freed hole reuses it rather than growing the
         // file, so the reusable total drops.
-        s.create_dataset("d").with_i32_data(&[9; 300]); // 1200 bytes, fits the hole
+        s.root()
+            .create_dataset("d", |b| {
+                b.with_i32_data(&[9; 300]);
+            })
+            .unwrap(); // 1200 bytes, fits the hole
         s.commit().unwrap();
-        let acct = s.space_accounting();
+        let acct = s.space_accounting().unwrap();
         assert!(
             acct.reusable_free_bytes < free_before,
             "reusing the hole must shrink the reusable total ({free_before} -> {})",
@@ -188,14 +193,14 @@ fn fresh_nonpersisting_session_ignores_existing_holes() {
 
     // Session 1 leaves an interior hole on disk (untracked, since not persisting).
     {
-        let mut s = EditSession::open(&p).unwrap();
-        s.delete("big");
+        let s = File::open_rw(&p).unwrap();
+        s.root().delete("big").unwrap();
         s.commit().unwrap();
     }
 
     // Session 2, freshly opened, does not scan for or track those holes.
-    let s = EditSession::open(&p).unwrap();
-    let acct = s.space_accounting();
+    let s = File::open_rw(&p).unwrap();
+    let acct = s.space_accounting().unwrap();
     assert_eq!(
         acct.reusable_free_bytes, 0,
         "a non-persisting reopen ignores holes left by a prior session"
@@ -213,8 +218,8 @@ fn persisting_session_seeds_reusable_free_on_open() {
 
     // Session 1: delete `big`; with persistence on, its storage is recorded on disk.
     {
-        let mut s = EditSession::open(&p).unwrap();
-        s.delete("big");
+        let s = File::open_rw(&p).unwrap();
+        s.root().delete("big").unwrap();
         s.commit().unwrap();
     }
 
@@ -232,8 +237,8 @@ fn persisting_session_seeds_reusable_free_on_open() {
 
     // Session 2: opening seeds the free list from those managers, so the accounting
     // reports the reusable space immediately, before any edit in this session.
-    let s = EditSession::open(&p).unwrap();
-    let acct = s.space_accounting();
+    let s = File::open_rw(&p).unwrap();
+    let acct = s.space_accounting().unwrap();
     assert_eq!(
         acct.reusable_free_bytes, persisted,
         "a persisting session seeds its reusable free from disk to match the reader"

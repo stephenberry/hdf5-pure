@@ -5,7 +5,7 @@
 //! Object copy reproduces dense (fractal-heap) attribute storage (issue #87,
 //! follow-up to PR #78).
 //!
-//! Before this, `EditSession::copy` / `copy_from` refused any object whose
+//! Before this, `File::copy` / `copy_from` refused any object whose
 //! attributes were stored densely (a *defined* fractal-heap address in its
 //! Attribute Info message). Now the copy reads the source attributes out of the
 //! heap, rebuilds a fresh single-direct-block heap + B-tree v2 name index at the
@@ -14,9 +14,8 @@
 //! sources, copy them, and verify every attribute (name + value) survives, in
 //! this crate's reader and the reference C library.
 
-#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
 use hdf5::file::LibraryVersion;
-use hdf5_pure::{AttrValue, EditSession, File, FileBuilder};
+use hdf5_pure::{AttrValue, File, FileBuilder};
 use std::collections::HashMap;
 use tempfile::tempdir;
 
@@ -86,9 +85,9 @@ fn same_file_copy_reproduces_dense_dataset_and_group_attrs() {
     assert_file_has_fractal_heap(&path);
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.copy("payload", "payload_copy");
-        session.copy("bundle", "bundle_copy");
+        let session = File::open_rw(&path).unwrap();
+        session.copy("payload", "payload_copy").unwrap();
+        session.copy("bundle", "bundle_copy").unwrap();
         session.commit().unwrap();
     }
 
@@ -137,7 +136,7 @@ fn cross_file_copy_reproduces_dense_attrs() {
 
     {
         let source = File::open(&src_path).unwrap();
-        let mut session = EditSession::open(&dst_path).unwrap();
+        let session = File::open_rw(&dst_path).unwrap();
         session.copy_from(&source, "payload", "payload").unwrap();
         session.copy_from(&source, "bundle", "bundle").unwrap();
         session.commit().unwrap();
@@ -206,8 +205,8 @@ fn c_written_dense_attr_dataset_copies_in_place() {
     assert_file_has_fractal_heap(&path);
 
     {
-        let mut session = EditSession::open(&path).unwrap();
-        session.copy("calibration", "calibration_copy");
+        let session = File::open_rw(&path).unwrap();
+        session.copy("calibration", "calibration_copy").unwrap();
         session.commit().unwrap();
     }
 
@@ -267,7 +266,7 @@ fn cross_file_copy_refuses_variable_length_dense_attrs() {
     }
 
     let source = File::open(&src_path).unwrap();
-    let mut session = EditSession::open(&dst_path).unwrap();
+    let session = File::open_rw(&dst_path).unwrap();
     let err = session
         .copy_from(&source, "vds", "vds")
         .expect_err("variable-length dense attrs must be refused cross-file");

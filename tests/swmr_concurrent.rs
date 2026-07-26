@@ -11,8 +11,7 @@
 //!
 //! `uv run` puts a pinned python3 + h5py on PATH for the duration of the test.
 
-#![allow(deprecated)] // exercises the deprecated EditSession/SwmrWriter shims (issue #148)
-use hdf5_pure::{FileBuilder, SwmrWriter};
+use hdf5_pure::{File, FileBuilder};
 use tempfile::tempdir;
 
 /// Open `path` with h5py and return `(len, first, last)` of dataset `d`, or
@@ -69,8 +68,11 @@ fn h5py_swmr_reads_pure_appends_concurrently() {
 
     // Open as a SWMR writer (sets the superblock SWMR flag) and keep it open
     // while h5py reads concurrently.
-    let mut w = SwmrWriter::open(&path).unwrap();
-    w.append_i32("d", &(5..50).collect::<Vec<_>>()).unwrap();
+    let w = File::open_swmr_writer(&path).unwrap();
+    w.dataset("d")
+        .unwrap()
+        .append(&(5..50).collect::<Vec<_>>())
+        .unwrap();
 
     let Some((n1, first1, last1)) = h5py_read(&path, "swmr") else {
         eprintln!("h5py unavailable; skipping");
@@ -83,7 +85,10 @@ fn h5py_swmr_reads_pure_appends_concurrently() {
     );
 
     // Append more while still open; a fresh h5py swmr reader sees it.
-    w.append_i32("d", &(50..200).collect::<Vec<_>>()).unwrap();
+    w.dataset("d")
+        .unwrap()
+        .append(&(50..200).collect::<Vec<_>>())
+        .unwrap();
     let (n2, first2, last2) = h5py_read(&path, "swmr").unwrap();
     assert_eq!(
         (n2, first2, last2),
@@ -131,9 +136,9 @@ fn swmr_flag_lifecycle() {
         "freshly created file is not SWMR-flagged"
     );
     {
-        let mut w = SwmrWriter::open(&path).unwrap();
+        let w = File::open_swmr_writer(&path).unwrap();
         assert_eq!(flag(&path), 0x05, "flag set while writer is open");
-        w.append_i32("d", &[5, 6, 7]).unwrap();
+        w.dataset("d").unwrap().append(&[5, 6, 7]).unwrap();
         assert_eq!(flag(&path), 0x05, "flag stays set across appends");
         w.close().unwrap();
     }
@@ -141,11 +146,11 @@ fn swmr_flag_lifecycle() {
 
     // Simulate a crashed writer (flag left set), then recover.
     {
-        let mut w = SwmrWriter::open(&path).unwrap();
-        w.append_i32("d", &[8]).unwrap();
+        let w = File::open_swmr_writer(&path).unwrap();
+        w.dataset("d").unwrap().append(&[8]).unwrap();
         std::mem::forget(w); // skip Drop -> flag stays set, as if crashed
     }
     assert_eq!(flag(&path), 0x05, "flag left set after simulated crash");
-    SwmrWriter::clear_swmr_flag(&path).unwrap();
+    File::clear_swmr_flag(&path).unwrap();
     assert_eq!(flag(&path), 0x00, "clear_swmr_flag recovers the file");
 }

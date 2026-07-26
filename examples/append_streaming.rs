@@ -3,10 +3,9 @@
 //!
 //! `File::open_rw` opens an existing file for reading and writing; each
 //! `Dataset::append` grows the dataset's Extensible-Array index *in place*, so it
-//! never re-reads the file or rebuilds the index the way `EditSession::append_dataset`
+//! never re-reads the file or rebuilds the index the way `Dataset::append_staged`
 //! does. Every append is crash-atomic (the dataspace dimension is published
-//! last), and the result reads back in the reference C library and h5py. This is
-//! the owned-handle replacement for the deprecated `AppendWriter`.
+//! last), and the result reads back in the reference C library and h5py.
 //!
 //! An unfiltered dataset (this example) accepts **any-length** appends; a
 //! filtered dataset must be appended in whole chunks (see the guide).

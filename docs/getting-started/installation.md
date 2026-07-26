@@ -63,7 +63,7 @@ cargo build --target wasm32-unknown-unknown
 In a WASM build you use the **in-memory** API: `FileBuilder::finish` returns the
 file as a `Vec<u8>` and `File::from_bytes` parses one, neither of which touches
 a filesystem. The path-based entry points (`File::open`, `FileBuilder::write`,
-`EditSession`, `SwmrWriter`) compile but cannot reach a filesystem at runtime in
+`File::open_rw`, `File::open_swmr_writer`) compile but cannot reach a filesystem at runtime in
 the browser.
 
 !!! note "Bare-metal `no_std`"

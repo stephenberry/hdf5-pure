@@ -118,7 +118,7 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 // In `no_std` builds the high-level entry points that consume the parsing and
-// serialization machinery — the `reader`, `writer`, and `swmr_writer` modules —
+// serialization machinery — the `reader`, `writer`, and `edit` modules —
 // are `std`-gated and therefore absent, leaving much of that machinery without
 // an in-crate consumer. It is deliberately kept available for future `no_std`
 // readers/writers rather than cfg-gating every module to `std`, so `dead_code`
@@ -195,8 +195,6 @@ pub(crate) mod nosync;
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "std")]
-pub(crate) mod append_writer;
-#[cfg(feature = "std")]
 pub(crate) mod bounded;
 #[cfg(feature = "std")]
 pub(crate) mod chunk_index_inplace;
@@ -210,8 +208,6 @@ pub(crate) mod free_space;
 pub(crate) mod reader;
 #[cfg(feature = "std")]
 pub(crate) mod repack;
-#[cfg(feature = "std")]
-pub(crate) mod swmr_writer;
 #[cfg(feature = "std")]
 pub(crate) mod types;
 #[cfg(feature = "std")]
@@ -236,7 +232,8 @@ pub use error::{FormatError, OBJECT_HEADER_MESSAGE_MAX};
 
 #[cfg(feature = "std")]
 pub use reader::{
-    Dataset, DatasetAccessOptions, File, FileAccessOptions, Group, Object, is_hdf5, is_hdf5_bytes,
+    Dataset, DatasetAccessOptions, File, FileAccessOptions, Group, Object, StagedGroup, is_hdf5,
+    is_hdf5_bytes,
 };
 
 // Curated layout / filter introspection (issue #149). Only the std-only reader
@@ -267,19 +264,7 @@ pub use types::{AttrValue, DType};
 pub use writer::FileBuilder;
 
 #[cfg(feature = "std")]
-#[allow(deprecated)] // re-exporting the deprecated shim; users still see the deprecation
-pub use swmr_writer::SwmrWriter;
-
-#[cfg(feature = "std")]
-#[allow(deprecated)] // re-exporting the deprecated shim; users still see the deprecation
-pub use append_writer::AppendWriter;
-
-#[cfg(feature = "std")]
 pub use edit::{AppendBuilder, SpaceAccounting};
-
-#[cfg(feature = "std")]
-#[allow(deprecated)] // re-exporting the deprecated shim; users still see the deprecation
-pub use edit::EditSession;
 
 #[cfg(feature = "std")]
 pub use repack::{RepackOptions, repack};
