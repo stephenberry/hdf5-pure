@@ -259,6 +259,56 @@ impl<S: Source + ?Sized> Source for std::boxed::Box<S> {
 }
 
 // ---------------------------------------------------------------------------
+// Base-relative view
+// ---------------------------------------------------------------------------
+
+/// A [`Source`] view shifted forward by a base address: every read at a
+/// base-relative `offset` is served from `inner` at `offset + base`.
+///
+/// Used wherever on-disk addresses are stored relative to the superblock's base
+/// address rather than absolutely — the data layout's contiguous-data, chunk-index,
+/// and chunk addresses on a file with a userblock, and the fractal-heap address in
+/// an Attribute Info message. Presenting this shifted view lets those relative
+/// addresses index it directly, exactly as an in-memory path slices the buffer at
+/// `base`. For a plain (base-0) file it is the identity.
+///
+/// `len`/`read_at` shift by the base; `read_metadata_at` forwards to the inner
+/// source at the *absolute* offset so the inner source's metadata cache is shared
+/// (a chunk-index walk on a streaming userblock file would otherwise re-read every
+/// node), while payload reads keep the default uncached `read_exact_at` so user
+/// data does not evict metadata.
+pub(crate) struct BaseOffsetSource<'a, S: Source + ?Sized> {
+    pub(crate) inner: &'a S,
+    pub(crate) base: u64,
+}
+
+impl<S: Source + ?Sized> Source for BaseOffsetSource<'_, S> {
+    fn len(&self) -> u64 {
+        self.inner.len().saturating_sub(self.base)
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
+        let abs = offset
+            .checked_add(self.base)
+            .ok_or(FormatError::OffsetOverflow {
+                offset,
+                length: buf.len() as u64,
+            })?;
+        self.inner.read_at(abs, buf)
+    }
+
+    fn read_metadata_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
+        let abs = offset
+            .checked_add(self.base)
+            .ok_or(FormatError::OffsetOverflow {
+                offset,
+                length: len as u64,
+            })?;
+        self.inner.read_metadata_at(abs, len)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // In-memory backend
 // ---------------------------------------------------------------------------
 

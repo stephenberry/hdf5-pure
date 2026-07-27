@@ -32,7 +32,8 @@ use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
 use crate::signature;
 use crate::source::{
-    BytesSource, MetadataCacheConfig, MetadataCachingSource, ReadSeekSource, Source,
+    BaseOffsetSource, BytesSource, MetadataCacheConfig, MetadataCachingSource, ReadSeekSource,
+    Source,
 };
 use crate::superblock::Superblock;
 use crate::vl_data::{self, VlenStringReadOptions};
@@ -91,50 +92,6 @@ impl Source for SourceView<'_> {
             SourceView::Mem(b) => BytesSource::new(*b).read_metadata_at(offset, len),
             SourceView::Stream(s) => s.read_metadata_at(offset, len),
         }
-    }
-}
-
-/// A `Source` view shifted forward by a base address: every read at a
-/// base-relative `offset` is served from `inner` at `offset + base`. Used by the
-/// dataset-payload read path on a file with a userblock, where the data-layout's
-/// on-disk addresses (contiguous data, chunk index, and chunk data) are stored
-/// relative to the base address — presenting the reader this shifted view lets
-/// those relative addresses index it directly, exactly as the in-memory path
-/// slices the buffer at `base`. `len`/`read_at` shift by the base; `read_metadata_at`
-/// forwards to the inner source (at the absolute offset) so its metadata cache is
-/// shared, while payload reads keep the default uncached `read_exact_at`.
-struct BaseOffsetSource<'a, S: Source + ?Sized> {
-    inner: &'a S,
-    base: u64,
-}
-
-impl<S: Source + ?Sized> Source for BaseOffsetSource<'_, S> {
-    fn len(&self) -> u64 {
-        self.inner.len().saturating_sub(self.base)
-    }
-
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
-        let abs = offset
-            .checked_add(self.base)
-            .ok_or(FormatError::OffsetOverflow {
-                offset,
-                length: buf.len() as u64,
-            })?;
-        self.inner.read_at(abs, buf)
-    }
-
-    /// Forward metadata reads to the inner source at the absolute offset so the
-    /// inner source's metadata cache is shared (chunk-index walks on a streaming
-    /// userblock file otherwise re-read every node). Payload reads keep the default
-    /// `read_exact_at`, which stays uncached so user data does not evict metadata.
-    fn read_metadata_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
-        let abs = offset
-            .checked_add(self.base)
-            .ok_or(FormatError::OffsetOverflow {
-                offset,
-                length: len as u64,
-            })?;
-        self.inner.read_metadata_at(abs, len)
     }
 }
 

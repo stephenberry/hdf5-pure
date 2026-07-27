@@ -297,26 +297,19 @@ const MAX_CHUNK_BTREE_DEPTH: u32 = 64;
 /// value [`collect_chunk_info`] takes. Errors (a malformed node, an out-of-bounds
 /// child, or a tree deeper than [`MAX_CHUNK_BTREE_DEPTH`]) propagate so the
 /// caller can leave the whole index unreclaimed.
-pub(crate) fn collect_chunk_btree_node_spans(
-    file_data: &[u8],
+pub(crate) fn collect_chunk_btree_node_spans<S: Source + ?Sized>(
+    source: &S,
     btree_address: u64,
     ndims: usize,
     offset_size: u8,
 ) -> Result<Vec<(u64, u64)>, FormatError> {
     let mut out = Vec::new();
-    collect_chunk_btree_node_spans_inner(
-        file_data,
-        btree_address,
-        ndims,
-        offset_size,
-        0,
-        &mut out,
-    )?;
+    collect_chunk_btree_node_spans_inner(source, btree_address, ndims, offset_size, 0, &mut out)?;
     Ok(out)
 }
 
-fn collect_chunk_btree_node_spans_inner(
-    file_data: &[u8],
+fn collect_chunk_btree_node_spans_inner<S: Source + ?Sized>(
+    source: &S,
     btree_address: u64,
     ndims: usize,
     offset_size: u8,
@@ -328,54 +321,54 @@ fn collect_chunk_btree_node_spans_inner(
             "chunk B-tree nested too deeply".into(),
         ));
     }
-    let offset = btree_address.to_usize()?;
     let os = offset_size as usize;
     let header_size = btree_v1_node_header_size(offset_size);
-    if header_size > file_data.len() || offset > file_data.len() - header_size {
-        return Err(FormatError::UnexpectedEof {
-            expected: offset.saturating_add(header_size),
-            available: file_data.len(),
-        });
-    }
-    if &file_data[offset..offset + 4] != b"TREE" {
+
+    // Node header: signature(4) + type(1) + level(1) + entries_used(2) + 2 siblings.
+    let header = source.read_metadata_at(btree_address, header_size)?;
+    if &header[0..4] != b"TREE" {
         return Err(FormatError::InvalidBTreeSignature);
     }
-    let node_type = file_data[offset + 4];
+    let node_type = header[4];
     if node_type != 1 {
         return Err(FormatError::InvalidBTreeNodeType(node_type));
     }
-    let node_level = file_data[offset + 5];
-    let entries_used = u16::from_le_bytes([file_data[offset + 6], file_data[offset + 7]]) as usize;
+    let node_level = header[5];
+    let entries_used = u16::from_le_bytes([header[6], header[7]]) as usize;
     let key_size = chunk_record_key_size(ndims, os);
 
     // The reader-consumed body: `entries_used` (key, child) pairs and a trailing
     // key. This is the conservative node extent (see the doc comment).
-    let body = entries_used
+    let body_len = entries_used
         .checked_mul(key_size + os)
         .and_then(|b| b.checked_add(key_size))
         .ok_or(FormatError::OffsetOverflow {
             offset: entries_used as u64,
             length: (key_size + os) as u64,
         })?;
-    let node_len = header_size + body;
-    if node_len > file_data.len() || offset > file_data.len() - node_len {
-        return Err(FormatError::UnexpectedEof {
-            expected: offset.saturating_add(node_len),
-            available: file_data.len(),
-        });
-    }
+    let node_len = header_size + body_len;
+    let body_addr =
+        btree_address
+            .checked_add(header_size as u64)
+            .ok_or(FormatError::OffsetOverflow {
+                offset: btree_address,
+                length: header_size as u64,
+            })?;
+    // Reading the body is also the bounds check: a node claiming to run past
+    // end-of-file fails here rather than being recorded as reclaimable.
+    let body = source.read_metadata_at(body_addr, body_len)?;
     out.push((btree_address, node_len as u64));
 
     // Internal nodes (level > 0) hold child node addresses, not chunk records;
     // recurse so their nodes are reclaimed too.
     if node_level != 0 {
-        let mut pos = offset + header_size;
+        let mut pos = 0usize;
         for _ in 0..entries_used {
             pos += key_size; // skip the key
-            let child_addr = read_offset(file_data, pos, offset_size)?;
+            let child_addr = read_offset(&body, pos, offset_size)?;
             pos += os;
             collect_chunk_btree_node_spans_inner(
-                file_data,
+                source,
                 child_addr,
                 ndims,
                 offset_size,
@@ -1357,8 +1350,8 @@ pub(crate) fn collect_chunks_for_layout_from_source<S: Source + ?Sized>(
 /// walkers — for a version-2 B-tree (index type 5) or any unknown index type,
 /// which have no walker.
 #[cfg(feature = "std")]
-pub(crate) fn enumerate_chunks_buffered(
-    file_data: &[u8],
+pub(crate) fn enumerate_chunks_from_source<S: Source + ?Sized>(
+    source: &S,
     layout: &DataLayout,
     dataspace: &Dataspace,
     offset_size: u8,
@@ -1374,7 +1367,7 @@ pub(crate) fn enumerate_chunks_buffered(
     } = layout
     else {
         return Err(FormatError::ChunkedReadError(
-            "enumerate_chunks_buffered called on a non-chunked layout".into(),
+            "enumerate_chunks_from_source called on a non-chunked layout".into(),
         ));
     };
     // An undefined index address means no storage is allocated yet.
@@ -1397,9 +1390,8 @@ pub(crate) fn enumerate_chunks_buffered(
             "chunked layout has a zero element size".into(),
         ));
     }
-    let source = crate::source::BytesSource::new(file_data);
     collect_chunks_for_layout_from_source(
-        &source,
+        source,
         *version,
         *chunk_index_type,
         index_addr,
@@ -1505,8 +1497,8 @@ pub(crate) fn plan_dense_grid(
 /// [`collect_chunk_index_spans`]. `offset_size`/`length_size` are the
 /// superblock's address and length widths.
 #[cfg(feature = "std")]
-pub(crate) fn collect_chunked_storage_spans(
-    file_data: &[u8],
+pub(crate) fn collect_chunked_storage_spans<S: Source + ?Sized>(
+    source: &S,
     layout: &DataLayout,
     dataspace: &Dataspace,
     offset_size: u8,
@@ -1549,12 +1541,11 @@ pub(crate) fn collect_chunked_storage_spans(
         ));
     }
 
-    let source = crate::source::BytesSource::new(file_data);
     let mut data: Vec<(u64, u64)> = Vec::new();
 
     // Chunk data blocks (the walkers omit unallocated chunks).
     for ci in collect_chunks_for_layout_from_source(
-        &source,
+        source,
         *version,
         *chunk_index_type,
         index_addr,
@@ -1573,7 +1564,7 @@ pub(crate) fn collect_chunked_storage_spans(
 
     // The chunk index's own structure blocks.
     let index = collect_chunk_index_spans(
-        file_data,
+        source,
         *version,
         *chunk_index_type,
         index_addr,
@@ -1611,8 +1602,8 @@ pub(crate) struct ChunkedStorageSpans {
 /// takes. Shared by [`collect_chunked_storage_spans`]; kept separate so the
 /// per-type dispatch lives next to the chunk-data dispatch it mirrors.
 #[cfg(feature = "std")]
-fn collect_chunk_index_spans(
-    file_data: &[u8],
+fn collect_chunk_index_spans<S: Source + ?Sized>(
+    source: &S,
     version: u8,
     chunk_index_type: Option<u8>,
     index_addr: u64,
@@ -1621,17 +1612,17 @@ fn collect_chunk_index_spans(
     length_size: u8,
 ) -> Result<Vec<(u64, u64)>, FormatError> {
     match (version, chunk_index_type) {
-        (3, _) => collect_chunk_btree_node_spans(file_data, index_addr, ndims, offset_size),
+        (3, _) => collect_chunk_btree_node_spans(source, index_addr, ndims, offset_size),
         // Single chunk and implicit indexes have no separate index structure.
         (4, Some(1)) | (4, Some(2)) => Ok(Vec::new()),
         (4, Some(3)) => crate::fixed_array::fixed_array_index_spans(
-            file_data,
+            source,
             index_addr,
             offset_size,
             length_size,
         ),
         (4, Some(4)) => crate::extensible_array::extensible_array_index_spans(
-            file_data,
+            source,
             index_addr,
             offset_size,
             length_size,
@@ -1650,8 +1641,8 @@ fn collect_chunk_index_spans(
 /// undefined index address or a single-chunk / implicit index (no separate
 /// structure); errors for an index type with no walker (a version-2 B-tree).
 #[cfg(feature = "std")]
-pub(crate) fn chunk_index_spans_buffered(
-    file_data: &[u8],
+pub(crate) fn chunk_index_spans_from_source<S: Source + ?Sized>(
+    source: &S,
     layout: &DataLayout,
     offset_size: u8,
     length_size: u8,
@@ -1665,14 +1656,14 @@ pub(crate) fn chunk_index_spans_buffered(
     } = layout
     else {
         return Err(FormatError::ChunkedReadError(
-            "chunk_index_spans_buffered called on a non-chunked layout".into(),
+            "chunk_index_spans_from_source called on a non-chunked layout".into(),
         ));
     };
     let Some(index_addr) = *btree_address else {
         return Ok(Vec::new());
     };
     collect_chunk_index_spans(
-        file_data,
+        source,
         *version,
         *chunk_index_type,
         index_addr,
@@ -2252,7 +2243,9 @@ mod tests {
         let mut file_data = vec![0u8; 0x3000];
         file_data[at..at + leaf.len()].copy_from_slice(&leaf);
 
-        let spans = collect_chunk_btree_node_spans(&file_data, at as u64, ndims, os).unwrap();
+        let spans =
+            collect_chunk_btree_node_spans(&BytesSource::new(&file_data), at as u64, ndims, os)
+                .unwrap();
         assert_eq!(spans, vec![(at as u64, leaf.len() as u64)]);
     }
 
@@ -2278,7 +2271,9 @@ mod tests {
         file[l1..l1 + leaf1.len()].copy_from_slice(&leaf1);
         file[root..root + internal.len()].copy_from_slice(&internal);
 
-        let mut spans = collect_chunk_btree_node_spans(&file, root as u64, ndims, os).unwrap();
+        let mut spans =
+            collect_chunk_btree_node_spans(&BytesSource::new(&file), root as u64, ndims, os)
+                .unwrap();
         spans.sort_unstable();
         assert_eq!(
             spans,

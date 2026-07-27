@@ -801,8 +801,8 @@ fn read_super_block(
 /// contributes exactly its allocated blocks. The caller validates the spans
 /// against the file bounds.
 #[cfg(feature = "std")]
-pub(crate) fn extensible_array_index_spans(
-    file_data: &[u8],
+pub(crate) fn extensible_array_index_spans<S: Source + ?Sized>(
+    source: &S,
     ea_base: u64,
     offset_size: u8,
     length_size: u8,
@@ -810,7 +810,7 @@ pub(crate) fn extensible_array_index_spans(
     use crate::chunked_write::{aesb_size, eadb_size};
 
     let header =
-        ExtensibleArrayHeader::parse(file_data, ea_base.to_usize()?, offset_size, length_size)?;
+        ExtensibleArrayHeader::parse_from_source(source, ea_base, offset_size, length_size)?;
     let os = offset_size as usize;
     let elem_size = ea_elem_stride(&header, offset_size);
     if header.max_dblk_nelmts_bits >= 64 {
@@ -840,14 +840,11 @@ pub(crate) fn extensible_array_index_spans(
     let aeib_size =
         crate::chunked_write::aeib_size(offset_size, inline, elem_size, ndblk_addrs, nsblk_addrs);
     let ib_addr = header.index_block_address;
-    let ib_off = ib_addr.to_usize()?;
-    if 4 > file_data.len() || ib_off > file_data.len() - 4 {
-        return Err(FormatError::UnexpectedEof {
-            expected: ib_off.saturating_add(4),
-            available: file_data.len(),
-        });
-    }
-    if &file_data[ib_off..ib_off + 4] != b"EAIB" {
+    // Read the index block as one bounded window; the read is also the bounds
+    // check, so a block claiming to run past end-of-file errors here rather than
+    // being recorded as reclaimable.
+    let ib = source.read_metadata_at(ib_addr, aeib_size)?;
+    if &ib[..4] != b"EAIB" {
         return Err(FormatError::ChunkedReadError(
             "invalid Extensible Array index block signature".into(),
         ));
@@ -856,9 +853,9 @@ pub(crate) fn extensible_array_index_spans(
 
     // Read the index block's direct data-block addresses, then its super-block
     // addresses, immediately following the inline element slots.
-    let mut pos = ib_off + ib_header + inline * elem_size;
+    let mut pos = ib_header + inline * elem_size;
     for &dblk_nelmts in &geom.direct_dblk_nelmts {
-        let addr = read_offset(file_data, pos, offset_size)?;
+        let addr = read_offset(&ib, pos, offset_size)?;
         pos += os;
         if is_undefined_addr(addr, offset_size) {
             continue;
@@ -875,7 +872,7 @@ pub(crate) fn extensible_array_index_spans(
         ));
     }
     for j in 0..nsblk_addrs {
-        let addr = read_offset(file_data, pos, offset_size)?;
+        let addr = read_offset(&ib, pos, offset_size)?;
         pos += os;
         if is_undefined_addr(addr, offset_size) {
             continue;
@@ -886,7 +883,7 @@ pub(crate) fn extensible_array_index_spans(
             aesb_size(ndblks, dblk_nelmts, page_nelmts, offset_size, blk_off_size),
         ));
         easb_data_block_spans(
-            file_data,
+            source,
             addr,
             ndblks,
             dblk_nelmts,
@@ -907,8 +904,8 @@ pub(crate) fn extensible_array_index_spans(
 /// addresses), emitting an extent for each defined address.
 #[cfg(feature = "std")]
 #[allow(clippy::too_many_arguments)]
-fn easb_data_block_spans(
-    file_data: &[u8],
+fn easb_data_block_spans<S: Source + ?Sized>(
+    source: &S,
     sb_addr: u64,
     ndblks: u64,
     dblk_nelmts: u64,
@@ -921,15 +918,9 @@ fn easb_data_block_spans(
     use crate::chunked_write::eadb_size;
 
     let os = offset_size as usize;
-    let sb_off = sb_addr.to_usize()?;
     let sb_header = 4 + 1 + 1 + os + blk_off_size; // sig + ver + client + hdr_addr + block_offset
-    if sb_header > file_data.len() || sb_off > file_data.len() - sb_header {
-        return Err(FormatError::UnexpectedEof {
-            expected: sb_off.saturating_add(sb_header),
-            available: file_data.len(),
-        });
-    }
-    if &file_data[sb_off..sb_off + 4] != b"EASB" {
+    let sb_sig = source.read_metadata_at(sb_addr, sb_header)?;
+    if &sb_sig[..4] != b"EASB" {
         return Err(FormatError::ChunkedReadError(
             "invalid Extensible Array super block signature".into(),
         ));
@@ -949,9 +940,24 @@ fn easb_data_block_spans(
     } else {
         0
     };
-    let mut pos = sb_off + sb_header + bitmap_size;
+    // Read the data-block address table that follows the header and bitmap.
+    let table_addr = sb_addr
+        .checked_add((sb_header + bitmap_size) as u64)
+        .ok_or(FormatError::OffsetOverflow {
+            offset: sb_addr,
+            length: (sb_header + bitmap_size) as u64,
+        })?;
+    let table_len = ndblks
+        .to_usize()?
+        .checked_mul(os)
+        .ok_or(FormatError::OffsetOverflow {
+            offset: ndblks,
+            length: os as u64,
+        })?;
+    let table = source.read_metadata_at(table_addr, table_len)?;
+    let mut pos = 0usize;
     for _ in 0..ndblks {
-        let addr = read_offset(file_data, pos, offset_size)?;
+        let addr = read_offset(&table, pos, offset_size)?;
         pos += os;
         if is_undefined_addr(addr, offset_size) {
             continue;
@@ -1833,7 +1839,9 @@ mod tests {
             let mut file = vec![0u8; base as usize + ea.len()];
             file[base as usize..].copy_from_slice(&ea);
 
-            let spans = extensible_array_index_spans(&file, base, os, ls).unwrap();
+            let spans =
+                extensible_array_index_spans(&crate::source::BytesSource::new(&file), base, os, ls)
+                    .unwrap();
 
             // Expected total = EAHD + EAIB + super_blk_size + data_blk_size, the
             // last two read straight from the statistics the builder wrote.
