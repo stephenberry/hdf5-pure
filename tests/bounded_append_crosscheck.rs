@@ -298,3 +298,138 @@ fn vlen_strings_read_on_bounded_and_mirror_files() {
     }
     assert_eq!(read_c(&path, "samples"), (0..6).collect::<Vec<_>>());
 }
+
+/// A staged commit through the bounded backend produces a file the reference C
+/// library reads — the capability issue #198 unlocked. The source file is
+/// written by the C library, so nothing about the layout is this crate's own
+/// convention, and every kind of staged edit the commit performs (a value
+/// overwrite, a new group, a new dataset, an attribute, a deletion) is verified
+/// through the C library rather than only through this crate's reader.
+#[test]
+fn bounded_staged_commit_reads_back_in_c() {
+    let _c = c_lib_guard();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("staged_c.h5");
+    c_create_unlimited(&path, "d", 8, 4);
+
+    {
+        let file = File::open_rw_bounded(&path).unwrap();
+        let mut ds = file.dataset("d").unwrap();
+        ds.write(&(100..108).collect::<Vec<i32>>()).unwrap();
+        let root = file.root();
+        root.create_group("g").unwrap();
+        root.create_dataset("g/fresh", |b| {
+            b.with_i32_data(&[1i32, 2, 3]).with_shape(&[3]);
+        })
+        .unwrap();
+        file.commit().unwrap();
+
+        ds.set_attr("units", hdf5_pure::AttrValue::String("m".into()))
+            .unwrap();
+        file.commit().unwrap();
+        file.close().unwrap();
+    }
+
+    assert_eq!(read_pure(&path, "d"), (100..108).collect::<Vec<i32>>());
+    assert_eq!(read_c(&path, "d"), (100..108).collect::<Vec<i32>>());
+    assert_eq!(read_c(&path, "g/fresh"), vec![1, 2, 3]);
+
+    // This crate writes a fixed-length string attribute, so read it as one.
+    let f = hdf5::File::open(&path).unwrap();
+    let units: hdf5::types::FixedUnicode<1> = f
+        .dataset("d")
+        .unwrap()
+        .attr("units")
+        .unwrap()
+        .read_scalar()
+        .unwrap();
+    assert_eq!(units.as_str(), "m");
+    f.close().unwrap();
+}
+
+/// A file that persists its free space can now be grown by an **immediate**
+/// in-place append from either entry point, not only the bounded one: the
+/// managers are re-homed at close by the same tail a commit writes. The C
+/// library both reads the rows back and reports the free space, which is what
+/// proves the rewritten managers are well-formed rather than merely ignored.
+#[test]
+fn mirror_inplace_append_to_a_persisting_file_reads_back_in_c() {
+    let _c = c_lib_guard();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("persist_mirror.h5");
+
+    let mut b = FileBuilder::new();
+    b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1);
+    b.create_dataset("d")
+        .with_i32_data(&(0..8).collect::<Vec<i32>>())
+        .with_shape(&[8])
+        .with_maxshape(&[u64::MAX])
+        .with_chunks(&[4]);
+    b.write(&path).unwrap();
+
+    {
+        let file = File::open_rw(&path).unwrap();
+        let mut ds = file.dataset("d").unwrap();
+        ds.append(&(8..40).collect::<Vec<i32>>()).unwrap();
+        file.close().unwrap();
+    }
+
+    let expected: Vec<i32> = (0..40).collect();
+    assert_eq!(read_pure(&path, "d"), expected);
+    assert_eq!(read_c(&path, "d"), expected);
+
+    let f = hdf5::File::open(&path).unwrap();
+    // Safety: the C-library guard above serializes every C call in this suite.
+    let free = unsafe { H5Fget_freespace(f.id()) };
+    f.close().unwrap();
+    assert!(
+        free >= 0,
+        "the C library could not read the rewritten free-space managers"
+    );
+}
+
+/// The same for a genuine **paged** persisting file, which the whole-file editor
+/// refused to append to in place before issue #198 because its page-type state
+/// was reachable only from the commit path. The file must stay page-aligned and
+/// C-readable.
+#[test]
+fn mirror_inplace_append_to_a_paged_file_stays_page_aligned() {
+    let _c = c_lib_guard();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("persist_paged.h5");
+
+    let mut b = FileBuilder::new();
+    b.with_file_space_strategy(FileSpaceStrategy::Page, true, 0)
+        .with_file_space_page_size(4096);
+    b.create_dataset("d")
+        .with_i32_data(&(0..64).collect::<Vec<i32>>())
+        .with_shape(&[64])
+        .with_maxshape(&[u64::MAX])
+        .with_chunks(&[64]);
+    b.write(&path).unwrap();
+
+    {
+        let file = File::open_rw(&path).unwrap();
+        let mut ds = file.dataset("d").unwrap();
+        ds.append(&(64..2000).collect::<Vec<i32>>()).unwrap();
+        file.close().unwrap();
+    }
+
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len() % 4096,
+        0,
+        "a closed paged file must end on a page boundary"
+    );
+    let expected: Vec<i32> = (0..2000).collect();
+    assert_eq!(read_pure(&path, "d"), expected);
+    assert_eq!(read_c(&path, "d"), expected);
+
+    let f = hdf5::File::open(&path).unwrap();
+    // Safety: the C-library guard above serializes every C call in this suite.
+    let free = unsafe { H5Fget_freespace(f.id()) };
+    f.close().unwrap();
+    assert!(
+        free >= 0,
+        "the C library could not read the rewritten paged free-space managers"
+    );
+}

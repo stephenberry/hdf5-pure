@@ -17,11 +17,10 @@
 //! what edits are expressible, so it belongs behind this trait rather than in
 //! two engines.
 //!
-//! The trait abstracts residency and nothing else. The two backends still
-//! differ in ways this seam does not reach and does not claim to: which files
-//! they will open at all (the bounded backend refuses a v0/v1 superblock,
-//! 4-byte offsets, and any userblock), and when they rewrite persisted
-//! free-space managers. Those are separate reconciliations.
+//! The trait abstracts residency and nothing else. One difference it does not
+//! reach and does not claim to remains: which files each entry point will open
+//! at all, the bounded one still refusing a v0/v1 superblock, 4-byte offsets,
+//! and any userblock. That is a separate reconciliation.
 //!
 //! # Reads
 //!
@@ -46,11 +45,11 @@
 //! belongs in a layer above this one.
 
 use std::fs;
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::convert::TryToUsize;
 use crate::error::{Error, FormatError};
-use crate::source::{BytesSource, Source};
+use crate::source::{BytesSource, MetadataCacheConfig, MetadataReadCache, Source};
 
 /// The file bytes a mutating session works on.
 ///
@@ -201,6 +200,238 @@ impl FileImage for MirrorImage {
     }
 }
 
+/// Read exactly `buf.len()` bytes at `offset` from a shared file handle,
+/// bounds-checked against `len` (mirroring `ReadSeekSource`). Uses the
+/// `Read`/`Seek` impls on `&fs::File`, so it can serve a `&self` read: callers
+/// serialize access through the session's engine lock, and the shared cursor is
+/// never raced.
+pub(crate) fn read_at_handle(
+    handle: &fs::File,
+    len: u64,
+    offset: u64,
+    buf: &mut [u8],
+) -> Result<(), FormatError> {
+    let end = offset
+        .checked_add(buf.len() as u64)
+        .ok_or(FormatError::OffsetOverflow {
+            offset,
+            length: buf.len() as u64,
+        })?;
+    if end > len {
+        return Err(FormatError::UnexpectedEof {
+            expected: end.to_usize().unwrap_or(usize::MAX),
+            available: len.to_usize().unwrap_or(usize::MAX),
+        });
+    }
+    let mut h = handle;
+    h.seek(SeekFrom::Start(offset))
+        .map_err(|e| FormatError::Source(std::format!("{e}")))?;
+    h.read_exact(buf)
+        .map_err(|e| FormatError::Source(std::format!("{e}")))?;
+    Ok(())
+}
+
+/// A file-backed image that holds no whole-file mirror: reads are positioned I/O
+/// against the handle, served through a bounded metadata cache when one is
+/// configured. This is the backing behind [`File::open_rw_bounded`](crate::File::open_rw_bounded),
+/// and the reason [`FileImage`] exists — resident memory is the cache budget
+/// plus whatever the caller is parsing, independent of the file's size.
+///
+/// The end-of-file cursor is explicit ([`len`](Source::len)), seeded from the
+/// file's real length at open and advanced by [`append`](FileImage::append). It
+/// is not re-read from the filesystem, so it stays the authority even if the
+/// handle's own cursor moves.
+///
+/// Every mutation invalidates the cache entries it overlaps *before* the write
+/// reaches the disk, so a concurrent-looking read can miss a fresh byte but
+/// never return a stale one.
+pub(crate) struct HandleImage {
+    handle: fs::File,
+    /// Logical end-of-file: the real file length at open, moved by `append` and
+    /// `truncate` and by nothing else.
+    len: u64,
+    /// Bounded read cache for metadata-sized reads; `None` when disabled.
+    metadata_cache: Option<(MetadataCacheConfig, std::sync::Mutex<MetadataReadCache>)>,
+}
+
+impl HandleImage {
+    /// Wrap an open read/write `handle` whose current length is `len`, caching
+    /// metadata reads under `cache` (see [`MetadataCacheConfig::disabled`] to
+    /// opt out).
+    pub(crate) fn new(handle: fs::File, len: u64, cache: MetadataCacheConfig) -> Self {
+        Self {
+            handle,
+            len,
+            metadata_cache: cache
+                .is_enabled()
+                .then(|| (cache, std::sync::Mutex::new(MetadataReadCache::new()))),
+        }
+    }
+
+    /// Drop every cached read overlapping `[offset, offset + len)`. Called before
+    /// each mutation; a no-op when caching is off or the range is empty.
+    fn invalidate(&self, offset: u64, len: u64) {
+        let Some((_, cache)) = &self.metadata_cache else {
+            return;
+        };
+        cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .invalidate_overlapping(offset, len.to_usize().unwrap_or(usize::MAX));
+    }
+}
+
+impl Source for HandleImage {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
+        read_at_handle(&self.handle, self.len, offset, buf)
+    }
+
+    fn read_metadata_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
+        let Some((config, cache)) = &self.metadata_cache else {
+            return self.read_exact_at(offset, len);
+        };
+        if len == 0 || len > config.max_entry_bytes() || len > config.max_bytes() {
+            return self.read_exact_at(offset, len);
+        }
+        if let Some(bytes) = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(offset, len)
+        {
+            return Ok(bytes);
+        }
+        let bytes = self.read_exact_at(offset, len)?;
+        cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(offset, len, bytes.clone(), config.max_bytes());
+        Ok(bytes)
+    }
+}
+
+impl FileImage for HandleImage {
+    fn append(&mut self, bytes: &[u8]) -> Result<u64, Error> {
+        let addr = self.len;
+        // A preceding `truncate` can leave a cached entry covering bytes this
+        // append is about to replace, so the appended range is invalidated too
+        // (see the trait's contract).
+        self.invalidate(addr, bytes.len() as u64);
+        self.handle.seek(SeekFrom::Start(addr)).map_err(Error::Io)?;
+        self.handle.write_all(bytes).map_err(Error::Io)?;
+        self.len += bytes.len() as u64;
+        Ok(addr)
+    }
+
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Error> {
+        debug_assert!(
+            offset.saturating_add(bytes.len() as u64) <= self.len,
+            "write_at past end-of-file: {offset}+{} > {}",
+            bytes.len(),
+            self.len
+        );
+        self.invalidate(offset, bytes.len() as u64);
+        self.handle
+            .seek(SeekFrom::Start(offset))
+            .map_err(Error::Io)?;
+        self.handle.write_all(bytes).map_err(Error::Io)?;
+        Ok(())
+    }
+
+    fn truncate(&mut self, len: u64) -> Result<(), Error> {
+        debug_assert!(
+            len <= self.len,
+            "truncate would grow the image: {len} > {}",
+            self.len
+        );
+        self.invalidate(len, self.len.saturating_sub(len));
+        self.handle.set_len(len).map_err(Error::Io)?;
+        self.len = len;
+        Ok(())
+    }
+
+    fn sync_data(&mut self) -> Result<(), Error> {
+        self.handle.flush().map_err(Error::Io)?;
+        self.handle.sync_data().map_err(Error::Io)?;
+        Ok(())
+    }
+
+    fn sync_all(&mut self) -> Result<(), Error> {
+        self.handle.flush().map_err(Error::Io)?;
+        self.handle.sync_all().map_err(Error::Io)?;
+        Ok(())
+    }
+
+    // No `as_slice`: withholding the whole-file slice is what this image is for.
+}
+
+/// A [`FileImage`] that counts the bytes read through it, so a test can measure
+/// how much of a file an operation actually touches.
+///
+/// It deliberately does *not* forward `read_metadata_at`, taking [`Source`]'s
+/// default instead: every read then funnels through this one `read_at`, where it
+/// is counted, rather than being served from the inner image's cache. The count
+/// is therefore an upper bound on the real I/O, which is the safe direction for
+/// asserting that an operation stays small.
+#[cfg(test)]
+pub(crate) struct CountingImage {
+    inner: Box<dyn FileImage>,
+    read_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[cfg(test)]
+impl CountingImage {
+    pub(crate) fn new(
+        inner: Box<dyn FileImage>,
+        read_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        Self { inner, read_bytes }
+    }
+}
+
+#[cfg(test)]
+impl Source for CountingImage {
+    fn len(&self) -> u64 {
+        self.inner.len()
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
+        self.read_bytes
+            .fetch_add(buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        self.inner.read_at(offset, buf)
+    }
+}
+
+#[cfg(test)]
+impl FileImage for CountingImage {
+    fn append(&mut self, bytes: &[u8]) -> Result<u64, Error> {
+        self.inner.append(bytes)
+    }
+
+    fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Error> {
+        self.inner.write_at(offset, bytes)
+    }
+
+    fn truncate(&mut self, len: u64) -> Result<(), Error> {
+        self.inner.truncate(len)
+    }
+
+    fn sync_data(&mut self) -> Result<(), Error> {
+        self.inner.sync_data()
+    }
+
+    fn sync_all(&mut self) -> Result<(), Error> {
+        self.inner.sync_all()
+    }
+
+    fn as_slice(&self) -> Option<&[u8]> {
+        self.inner.as_slice()
+    }
+}
+
 /// A [`MirrorImage`] that withholds its slice, so every read routed through it
 /// takes the [`Source`] path instead of the whole-file fast path.
 ///
@@ -260,70 +491,124 @@ impl FileImage for SourceOnlyImage {
 mod tests {
     use super::*;
 
-    /// Open a fresh file holding `initial`, wrapped as a mirror image.
-    fn image(dir: &std::path::Path, initial: &[u8]) -> (std::path::PathBuf, MirrorImage) {
-        let path = dir.join("image.bin");
+    /// The two backings [`FileImage`] exists to make interchangeable. Every case
+    /// below runs against both, because a primitive that holds for one and not
+    /// the other is exactly the divergence this seam would otherwise hide.
+    #[derive(Clone, Copy, Debug)]
+    enum Backing {
+        Mirror,
+        Handle,
+    }
+
+    const BACKINGS: [Backing; 2] = [Backing::Mirror, Backing::Handle];
+
+    /// Open a fresh file holding `initial`, wrapped in the given backing. The
+    /// handle image caches metadata reads, so the cache is exercised rather
+    /// than configured away.
+    fn image(
+        dir: &std::path::Path,
+        initial: &[u8],
+        backing: Backing,
+    ) -> (std::path::PathBuf, Box<dyn FileImage>) {
+        let path = dir.join(std::format!("{backing:?}.bin"));
         std::fs::write(&path, initial).unwrap();
         let handle = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&path)
             .unwrap();
-        (path, MirrorImage::new(handle, initial.to_vec()))
+        let img: Box<dyn FileImage> = match backing {
+            Backing::Mirror => Box::new(MirrorImage::new(handle, initial.to_vec())),
+            Backing::Handle => Box::new(HandleImage::new(
+                handle,
+                initial.len() as u64,
+                MetadataCacheConfig::new(64 * 1024),
+            )),
+        };
+        (path, img)
     }
 
-    /// The invariant the whole type exists to hold: after any primitive, the
-    /// mirror and the bytes on disk agree. Every case below asserts it, because
-    /// a primitive that updates only one side is exactly the defect that would
-    /// otherwise surface as a corrupt file much later.
-    fn assert_in_sync(path: &std::path::Path, img: &MirrorImage) {
+    /// The whole image read back through [`Source`], which is the interface
+    /// every parser above this layer uses.
+    fn bytes(img: &dyn FileImage) -> Vec<u8> {
+        let mut buf = vec![0u8; img.len().to_usize().unwrap()];
+        img.read_at(0, &mut buf).unwrap();
+        buf
+    }
+
+    /// The invariant the layer exists to hold: after any primitive, what the
+    /// image reports and what is on disk agree. A primitive that updates only
+    /// one side is the defect that would otherwise surface as a corrupt file
+    /// much later.
+    fn assert_in_sync(path: &std::path::Path, img: &dyn FileImage, backing: Backing) {
         let on_disk = std::fs::read(path).unwrap();
         assert_eq!(
-            img.as_slice().unwrap(),
-            &on_disk[..],
-            "mirror and file disagree"
+            img.len(),
+            on_disk.len() as u64,
+            "{backing:?}: end-of-file disagrees with the file"
         );
-        assert_eq!(img.len(), on_disk.len() as u64, "len disagrees with file");
+        assert_eq!(
+            bytes(img),
+            on_disk,
+            "{backing:?}: reads disagree with the file"
+        );
+        if let Some(slice) = img.as_slice() {
+            assert_eq!(
+                slice,
+                &on_disk[..],
+                "{backing:?}: the slice disagrees with the file"
+            );
+        }
     }
 
     #[test]
     fn append_returns_the_pre_append_end_and_extends_by_exactly_the_length() {
         let dir = tempfile::tempdir().unwrap();
-        let (path, mut img) = image(dir.path(), b"abcd");
+        for backing in BACKINGS {
+            let (path, mut img) = image(dir.path(), b"abcd", backing);
 
-        let addr = img.append(b"XYZ").unwrap();
+            let addr = img.append(b"XYZ").unwrap();
 
-        assert_eq!(addr, 4, "append must report the address it wrote at");
-        assert_eq!(
-            img.len(),
-            7,
-            "append must extend len by exactly bytes.len()"
-        );
-        assert_in_sync(&path, &img);
+            assert_eq!(addr, 4, "{backing:?}: append must report where it wrote");
+            assert_eq!(
+                img.len(),
+                7,
+                "{backing:?}: append must extend len by exactly bytes.len()"
+            );
+            assert_in_sync(&path, img.as_ref(), backing);
+        }
     }
 
     #[test]
     fn write_at_overwrites_both_sides_in_place() {
         let dir = tempfile::tempdir().unwrap();
-        let (path, mut img) = image(dir.path(), b"abcdef");
+        for backing in BACKINGS {
+            let (path, mut img) = image(dir.path(), b"abcdef", backing);
 
-        img.write_at(2, b"ZZ").unwrap();
+            img.write_at(2, b"ZZ").unwrap();
 
-        assert_eq!(img.as_slice().unwrap(), b"abZZef");
-        assert_eq!(img.len(), 6, "an in-place write must not move end-of-file");
-        assert_in_sync(&path, &img);
+            assert_eq!(bytes(img.as_ref()), b"abZZef");
+            assert_eq!(
+                img.len(),
+                6,
+                "{backing:?}: an in-place write must not move end-of-file"
+            );
+            assert_in_sync(&path, img.as_ref(), backing);
+        }
     }
 
     #[test]
     fn truncate_shrinks_both_sides() {
         let dir = tempfile::tempdir().unwrap();
-        let (path, mut img) = image(dir.path(), b"abcdef");
+        for backing in BACKINGS {
+            let (path, mut img) = image(dir.path(), b"abcdef", backing);
 
-        img.truncate(2).unwrap();
+            img.truncate(2).unwrap();
 
-        assert_eq!(img.as_slice().unwrap(), b"ab");
-        assert_eq!(img.len(), 2);
-        assert_in_sync(&path, &img);
+            assert_eq!(bytes(img.as_ref()), b"ab");
+            assert_eq!(img.len(), 2, "{backing:?}");
+            assert_in_sync(&path, img.as_ref(), backing);
+        }
     }
 
     /// A write following a truncate must land at the shortened end-of-file, not
@@ -331,14 +616,16 @@ mod tests {
     #[test]
     fn append_after_truncate_lands_at_the_new_end() {
         let dir = tempfile::tempdir().unwrap();
-        let (path, mut img) = image(dir.path(), b"abcdef");
+        for backing in BACKINGS {
+            let (path, mut img) = image(dir.path(), b"abcdef", backing);
 
-        img.truncate(3).unwrap();
-        let addr = img.append(b"Z").unwrap();
+            img.truncate(3).unwrap();
+            let addr = img.append(b"Z").unwrap();
 
-        assert_eq!(addr, 3);
-        assert_eq!(img.as_slice().unwrap(), b"abcZ");
-        assert_in_sync(&path, &img);
+            assert_eq!(addr, 3, "{backing:?}");
+            assert_eq!(bytes(img.as_ref()), b"abcZ");
+            assert_in_sync(&path, img.as_ref(), backing);
+        }
     }
 
     /// Reads go through `Source`, so they must observe writes immediately —
@@ -346,32 +633,96 @@ mod tests {
     #[test]
     fn reads_observe_writes_immediately() {
         let dir = tempfile::tempdir().unwrap();
-        let (_path, mut img) = image(dir.path(), b"abcdef");
-        img.write_at(0, b"ZY").unwrap();
-        img.append(b"!").unwrap();
+        for backing in BACKINGS {
+            let (_path, mut img) = image(dir.path(), b"abcdef", backing);
+            img.write_at(0, b"ZY").unwrap();
+            img.append(b"!").unwrap();
 
-        let mut buf = [0u8; 3];
-        img.read_at(0, &mut buf).unwrap();
-        assert_eq!(&buf, b"ZYc");
-        img.read_at(6, &mut buf[..1]).unwrap();
-        assert_eq!(buf[0], b'!');
+            let mut buf = [0u8; 3];
+            img.read_at(0, &mut buf).unwrap();
+            assert_eq!(&buf, b"ZYc", "{backing:?}");
+            img.read_at(6, &mut buf[..1]).unwrap();
+            assert_eq!(buf[0], b'!', "{backing:?}");
+        }
+    }
+
+    /// The same, through the *cached* read path: a metadata read taken before a
+    /// write must not survive it. This is the handle image's own hazard — the
+    /// mirror has no cache to go stale — but it runs on both so the case is
+    /// stated once.
+    #[test]
+    fn cached_reads_observe_writes_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        for backing in BACKINGS {
+            let (_path, mut img) = image(dir.path(), b"abcdef", backing);
+
+            assert_eq!(img.read_metadata_at(0, 4).unwrap(), b"abcd", "{backing:?}");
+            img.write_at(1, b"ZZ").unwrap();
+
+            assert_eq!(
+                img.read_metadata_at(0, 4).unwrap(),
+                b"aZZd",
+                "{backing:?}: a cached read outlived the write that overwrote it"
+            );
+        }
+    }
+
+    /// The case the trait's `append` contract calls out: truncate makes a range
+    /// unreadable, a later append reuses those addresses, and a read cached
+    /// before the truncate must not resurface.
+    #[test]
+    fn a_cached_read_does_not_survive_being_truncated_and_appended_over() {
+        let dir = tempfile::tempdir().unwrap();
+        for backing in BACKINGS {
+            let (_path, mut img) = image(dir.path(), b"abcdef", backing);
+
+            assert_eq!(img.read_metadata_at(4, 2).unwrap(), b"ef", "{backing:?}");
+            img.truncate(4).unwrap();
+            img.append(b"ZZ").unwrap();
+
+            assert_eq!(
+                img.read_metadata_at(4, 2).unwrap(),
+                b"ZZ",
+                "{backing:?}: a read cached before the truncate survived the append"
+            );
+        }
     }
 
     #[test]
     fn reads_past_end_of_file_are_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let (_path, img) = image(dir.path(), b"abcd");
+        for backing in BACKINGS {
+            let (_path, img) = image(dir.path(), b"abcd", backing);
 
-        let mut buf = [0u8; 2];
-        assert!(img.read_at(3, &mut buf).is_err());
+            let mut buf = [0u8; 2];
+            assert!(img.read_at(3, &mut buf).is_err(), "{backing:?}");
+        }
+    }
+
+    /// Only the mirror lends its buffer out; the handle image withholds it, and
+    /// that difference is the one the read paths branch on.
+    #[test]
+    fn only_the_mirror_offers_a_whole_file_slice() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_p1, mirror) = image(dir.path(), b"abcdef", Backing::Mirror);
+        let (_p2, handle) = image(dir.path(), b"abcdef", Backing::Handle);
+
+        assert_eq!(mirror.as_slice(), Some(&b"abcdef"[..]));
+        assert!(handle.as_slice().is_none());
     }
 
     /// `SourceOnlyImage` must differ from the mirror in exactly one respect.
     #[test]
     fn source_only_withholds_the_slice_but_reads_the_same() {
         let dir = tempfile::tempdir().unwrap();
-        let (_path, mirror) = image(dir.path(), b"abcdef");
-        let mut only = SourceOnlyImage::new(mirror);
+        let path = dir.path().join("source_only.bin");
+        std::fs::write(&path, b"abcdef").unwrap();
+        let handle = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut only = SourceOnlyImage::new(MirrorImage::new(handle, b"abcdef".to_vec()));
 
         assert!(only.as_slice().is_none(), "the slice must be withheld");
 

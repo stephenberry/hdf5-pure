@@ -288,8 +288,12 @@ fn refusal_leaves_session_usable() {
     assert_eq!(read_i32(&p, "d"), (0..7).collect::<Vec<_>>());
 }
 
+/// A file that persists its free space accepts an immediate in-place append as
+/// well as a staged one (issue #198). The in-place path leaves the on-disk
+/// free-space managers mid-file until the session closes, which is what
+/// `File::close` re-homes; both paths must leave every row readable.
 #[test]
-fn persisting_file_refuses_inplace_but_staged_append_dataset_works() {
+fn persisting_file_takes_both_inplace_and_staged_appends() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("persist.h5");
     {
@@ -305,21 +309,47 @@ fn persisting_file_refuses_inplace_but_staged_append_dataset_works() {
 
     {
         let s = File::open_rw(&p).unwrap();
-        // The fast path refuses a persistent-free-space file; only a staged commit
-        // rewrites its managers consistently.
-        let err = s.dataset("d").unwrap().append(&[8, 9, 10, 11]).unwrap_err();
-        assert!(matches!(err, Error::AppendInPlaceUnsupported(_)));
-        // The staged fallback works.
+        s.dataset("d").unwrap().append(&[8, 9, 10, 11]).unwrap();
         s.dataset("d")
             .unwrap()
             .append_staged(|b| {
-                b.append_i32(&[8, 9, 10, 11]);
+                b.append_i32(&[12, 13, 14, 15]);
             })
             .unwrap();
         s.commit().unwrap();
+        s.close().unwrap();
     }
 
-    assert_eq!(read_i32(&p, "d"), (0..12).collect::<Vec<_>>());
+    assert_eq!(read_i32(&p, "d"), (0..16).collect::<Vec<_>>());
+    let before = File::open(&p).unwrap().persisted_free_space();
+
+    // A second session appends in place again and closes without staging
+    // anything, so the manager re-homing is `close`'s doing rather than a
+    // commit's. It re-homes the extension and manager blocks, freeing the ones
+    // it supersedes, so the recorded free space must differ afterwards — which
+    // is what distinguishes a real rewrite from a skipped one.
+    {
+        let s = File::open_rw(&p).unwrap();
+        s.dataset("d").unwrap().append(&[16, 17]).unwrap();
+        s.close().unwrap();
+    }
+    assert_eq!(read_i32(&p, "d"), (0..18).collect::<Vec<_>>());
+    assert_ne!(
+        File::open(&p).unwrap().persisted_free_space(),
+        before,
+        "closing the session did not rewrite the free-space managers"
+    );
+    // The re-homed managers must still parse: every region they describe has to
+    // lie inside the file, which is what a stale (mid-file) manager set would
+    // not survive.
+    let reopened = File::open(&p).unwrap();
+    let size = reopened.file_size();
+    for (addr, len) in reopened.persisted_free_space() {
+        assert!(
+            addr + len <= size,
+            "free region {addr}+{len} runs past the {size}-byte file"
+        );
+    }
 }
 
 #[test]

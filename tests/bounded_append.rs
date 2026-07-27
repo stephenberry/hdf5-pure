@@ -128,49 +128,65 @@ fn large_append_batches_internally() {
     assert!(got.iter().enumerate().all(|(i, &v)| v == i as i32));
 }
 
+/// The whole staged edit surface now runs on a bounded file: it is the same
+/// engine as `open_rw`, differing only in how it holds the file's bytes (issue
+/// #198). Each operation is exercised and its effect read back, so the test
+/// fails if any of them silently no-ops rather than merely returning `Ok`.
 #[test]
-fn staged_surface_returns_typed_error() {
+fn staged_surface_works_on_a_bounded_file() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("staged.h5");
     build(&p, 4, 4, false);
-    let file = File::open_rw_bounded(&p).unwrap();
-    let mut ds = file.dataset("d").unwrap();
-    let root = file.root();
+    {
+        let file = File::open_rw_bounded(&p).unwrap();
+        let mut ds = file.dataset("d").unwrap();
+        let root = file.root();
 
-    assert!(matches!(
-        ds.write(&[9i32, 9, 9, 9]),
-        Err(Error::BoundedStagedUnsupported)
-    ));
-    assert!(matches!(
-        ds.set_attr("units", AttrValue::String("m".into())),
-        Err(Error::BoundedStagedUnsupported)
-    ));
-    assert!(matches!(
-        ds.append_staged(|b| {
-            b.append_i32(&[1]);
-        }),
-        Err(Error::BoundedStagedUnsupported)
-    ));
-    assert!(matches!(
-        root.create_group("g"),
-        Err(Error::BoundedStagedUnsupported)
-    ));
-    assert!(matches!(
-        root.delete("d"),
-        Err(Error::BoundedStagedUnsupported)
-    ));
-    assert!(matches!(
-        file.commit(),
-        Err(Error::BoundedStagedUnsupported)
-    ));
-    assert!(matches!(
-        file.copy("d", "d2"),
-        Err(Error::BoundedStagedUnsupported)
-    ));
-    assert!(matches!(
-        file.space_accounting(),
-        Err(Error::BoundedStagedUnsupported)
-    ));
+        // Transaction 1: a value overwrite and a new group.
+        ds.write(&[9i32, 9, 9, 9]).unwrap();
+        root.create_group("g").unwrap();
+        // Space accounting reads the session's own free list, which a bounded
+        // session now keeps like any other.
+        let before = file.space_accounting().unwrap();
+        file.commit().unwrap();
+        assert!(
+            file.space_accounting().unwrap().logical_size >= before.logical_size,
+            "a commit cannot shrink the file below what it started at here"
+        );
+
+        // Transaction 2: copy the (now overwritten) dataset. On its own, so the
+        // copy reads the committed values rather than racing the overwrite.
+        file.copy("d", "d2").unwrap();
+        file.commit().unwrap();
+
+        // Transaction 3: an attribute edit, a staged append that rebuilds the
+        // chunk index rather than growing it in place, and a delete. The
+        // attribute edit relocates its dataset's header, which the engine will
+        // not combine with another edit to the same dataset, so it goes with
+        // edits to *other* objects.
+        ds.set_attr("units", AttrValue::String("m".into())).unwrap();
+        let mut d2 = file.dataset("d2").unwrap();
+        d2.append_staged(|b| {
+            b.append_i32(&[7]);
+        })
+        .unwrap();
+        file.root().delete("g").unwrap();
+        file.commit().unwrap();
+        file.close().unwrap();
+    }
+
+    let file = File::open(&p).unwrap();
+    let ds = file.dataset("d").unwrap();
+    assert_eq!(ds.read_i32().unwrap(), vec![9, 9, 9, 9]);
+    assert_eq!(
+        ds.attrs().unwrap().get("units").map(|v| format!("{v:?}")),
+        Some(format!("{:?}", AttrValue::String("m".into())))
+    );
+    assert_eq!(
+        file.dataset("d2").unwrap().read_i32().unwrap(),
+        vec![9, 9, 9, 9, 7]
+    );
+    assert!(file.group("g").is_err(), "the deleted group must be gone");
 }
 
 #[test]

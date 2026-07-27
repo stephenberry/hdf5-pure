@@ -5,8 +5,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::bounded::BoundedEngine;
-use crate::edit::{AppendBuilder, SpaceAccounting, WriteEngine};
+use crate::edit::{AppendBuilder, AppendGeometry, AppendTarget, SpaceAccounting, WriteEngine};
 use crate::element::H5Element;
 use crate::type_builders::{DatasetBuilder, VL_REF_SIZE};
 
@@ -49,21 +48,20 @@ use crate::types::{AttrValue, DType, attrs_to_map, classify_datatype};
 enum Backend {
     InMemory(Vec<u8>),
     Streaming(Box<dyn Source + Send + Sync>),
-    /// A read-write file opened with [`File::open_rw`]: a [`WriteEngine`] (a
-    /// whole-file mirror + exclusive OS lock + staged-edit queues) behind a lock,
-    /// so owned handles can both read and mutate in place. Reads slice the
-    /// engine's mirror; handle write methods route to the engine, and
-    /// `File::commit` applies staged structural edits. Boxed to keep the
-    /// `Backend` enum small (a `WriteEngine` is far larger than the other
-    /// variants).
-    Mirror(Box<Mutex<WriteEngine>>),
-    /// A read-write file opened with [`File::open_rw_bounded`]: no whole-file
-    /// mirror — a [`BoundedEngine`] holds the locked handle, an end-of-file
-    /// cursor, and the append geometry cache, and serves reads by positioned
-    /// I/O (like `Streaming`) and immediate [`Dataset::append`]s through the
-    /// same crash-atomic engine as `Mirror`. The staged edit surface is
-    /// refused with [`Error::BoundedStagedUnsupported`].
-    Bounded(Box<Mutex<BoundedEngine>>),
+    /// A read-write file opened with [`File::open_rw`] or
+    /// [`File::open_rw_bounded`]: a [`WriteEngine`] (exclusive OS lock + staged
+    /// edit queues + append geometry cache) behind a lock, so owned handles can
+    /// both read and mutate in place. Handle write methods route to the engine,
+    /// and `File::commit` applies staged structural edits.
+    ///
+    /// The two entry points differ only in how the engine holds the file's bytes
+    /// — a whole-file mirror, or positioned I/O against the handle — which is
+    /// the engine's own business rather than the backend's (issue #198). Reads
+    /// borrow the mirror's slice when there is one and go through the image's
+    /// `Source` otherwise; see [`with_engine`](FileInner::with_engine). Boxed to
+    /// keep the `Backend` enum small (a `WriteEngine` is far larger than the
+    /// other variants).
+    Edit(Box<Mutex<WriteEngine>>),
 }
 
 /// A borrowed `Source` view over a [`File`]'s backend, used by the
@@ -324,7 +322,7 @@ struct FileInner {
     /// Set by [`File::close`] to seal a read-write file: after it, a write
     /// through any surviving [`Dataset`]/[`Group`] handle or [`File`] clone
     /// returns [`Error::FileClosed`]. Reads still work. Only ever set on a
-    /// `Backend::Mirror` file.
+    /// `Backend::Edit` file.
     closed: AtomicBool,
     /// True for a file opened with [`File::open_swmr_writer`]: no OS lock is held,
     /// the superblock's SWMR-write flag is raised, only immediate
@@ -341,27 +339,29 @@ impl Drop for FileInner {
     ///
     /// - A SWMR writer clears the superblock's SWMR-write flag (mirroring
     ///   `File::close`).
-    /// - A bounded read-write file that persists its free space rewrites its
-    ///   on-disk free-space managers into canonical shape (issue #173), so a
+    /// - A read-write file that persists its free space rewrites its on-disk
+    ///   free-space managers into canonical shape (issue #173), so a
     ///   dropped-without-`close` handle leaves the same file a clean `close`
-    ///   would (a no-op unless an append grew the file). A true crash (`SIGKILL`,
-    ///   power loss) skips `drop` entirely; the appended data is still durable.
+    ///   would (a no-op unless an immediate append grew the file past them). A
+    ///   true crash (`SIGKILL`, power loss) skips `drop` entirely; the appended
+    ///   data is still durable.
+    ///
+    /// Staged edits are *not* committed here: dropping a handle discards them,
+    /// which is what `close` exists to distinguish.
     fn drop(&mut self) {
         if self.closed.load(Ordering::Acquire) {
             return;
         }
-        match &self.backend {
-            Backend::Mirror(m) if self.swmr_write => {
-                let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let _ = session.set_consistency_flags(0);
-            }
-            Backend::Bounded(m) => {
-                let mut engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let _ = engine.finalize_persist();
-                let _ = engine.sync();
-            }
-            _ => {}
+        let Backend::Edit(m) = &self.backend else {
+            return;
+        };
+        let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if self.swmr_write {
+            let _ = session.set_consistency_flags(0);
+            return;
         }
+        let _ = session.finalize_persist();
+        let _ = session.sync();
     }
 }
 
@@ -502,7 +502,7 @@ impl FileInner {
         )
     }
 
-    /// Wrap an opened [`WriteEngine`] as a read-write [`Backend::Mirror`] file.
+    /// Wrap an opened [`WriteEngine`] as a read-write [`Backend::Edit`] file.
     fn from_rw_session(
         session: WriteEngine,
         properties: FileAccessProperties,
@@ -512,7 +512,7 @@ impl FileInner {
         let superblock = session.superblock().clone();
         let addr_offset = superblock.base_address;
         Ok(Self::from_parts(
-            Backend::Mirror(Box::new(Mutex::new(session))),
+            Backend::Edit(Box::new(Mutex::new(session))),
             superblock,
             addr_offset,
             None,
@@ -536,22 +536,15 @@ impl FileInner {
         path: P,
         properties: FileAccessProperties,
     ) -> Result<Self, Error> {
-        let engine =
-            BoundedEngine::open(path.as_ref(), properties.metadata_cache, properties.locking)?;
-        // A bounded file's base address is validated to be 0 at open, so the
-        // store's as-parsed superblock is already in the reader's normalized
-        // (absolute-root) form.
-        let superblock = engine.store().superblock().clone();
-        Ok(Self::from_parts(
-            Backend::Bounded(Box::new(Mutex::new(engine))),
-            superblock,
-            0,
-            None,
-            properties,
-        ))
+        let session = WriteEngine::open_bounded(
+            path.as_ref(),
+            properties.metadata_cache,
+            properties.locking,
+        )?;
+        Self::from_rw_session(session, properties)
     }
 
-    /// After the caller has confirmed a [`Backend::Mirror`] backend, gate the
+    /// After the caller has confirmed a [`Backend::Edit`] backend, gate the
     /// mutation: refuse a sealed file with [`Error::FileClosed`], and in
     /// SWMR-writer mode refuse a staged edit (`staged = true`) with
     /// [`Error::SwmrStagedUnsupported`] — only immediate appends are allowed.
@@ -574,10 +567,7 @@ impl FileInner {
     /// to record the result (issue #200).
     fn check_staged_writable(&self) -> Result<(), Error> {
         match &self.backend {
-            Backend::Mirror(_) => self.check_mutable(true),
-            // A bounded file is writable but has no staged surface; everything
-            // else is read-only.
-            Backend::Bounded(_) => Err(Error::BoundedStagedUnsupported),
+            Backend::Edit(_) => self.check_mutable(true),
             _ => Err(Error::ReadOnly),
         }
     }
@@ -590,7 +580,7 @@ impl FileInner {
             // A mirror or bounded file's bytes live behind a lock and cannot be
             // lent out as a borrowed view; the read paths that reach every
             // backend go through [`with_source`](Self::with_source) instead.
-            Backend::Mirror(_) | Backend::Bounded(_) => SourceView::Mem(&[]),
+            Backend::Edit(_) => SourceView::Mem(&[]),
         }
     }
 
@@ -606,13 +596,9 @@ impl FileInner {
         match &self.backend {
             Backend::InMemory(v) => f(&BytesSource::new(v.as_slice())),
             Backend::Streaming(s) => f(s.as_ref()),
-            Backend::Mirror(m) => {
+            Backend::Edit(m) => {
                 let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 f(core.image())
-            }
-            Backend::Bounded(m) => {
-                let engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                f(engine.store())
             }
         }
     }
@@ -790,7 +776,7 @@ impl FileInner {
             // A staged commit can relocate the object tree's root, so this
             // file's cached superblock may name a stale one; resolve against the
             // session's own superblock, which the commit updates.
-            Backend::Mirror(m) => {
+            Backend::Edit(m) => {
                 let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let sb = core.superblock().clone();
                 match core.image_slice() {
@@ -798,21 +784,15 @@ impl FileInner {
                     None => group_v2::resolve_path_any_from_source(core.image(), &sb, path)?,
                 }
             }
-            Backend::Bounded(m) => {
-                // Bounded appends never relocate object headers, so the cached
-                // superblock's root stays valid for the file's whole life.
-                let engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                group_v2::resolve_path_any_from_source(engine.store(), &self.superblock, path)?
-            }
         })
     }
 
     /// The current root-group address (base-adjusted, absolute). For a read-write
-    /// [`Backend::Mirror`] file a prior relocating commit can have moved the
+    /// [`Backend::Edit`] file a prior relocating commit can have moved the
     /// root, so take the session's own superblock, which the commit updates;
     /// other backends use this file's cached one.
     fn mirror_root_address(&self) -> u64 {
-        if let Backend::Mirror(m) = &self.backend {
+        if let Backend::Edit(m) = &self.backend {
             let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             return core.superblock().root_group_address;
         }
@@ -826,7 +806,7 @@ impl FileInner {
             Backend::InMemory(v) => v,
             // A streaming, mirror, or bounded file has no borrowable whole-file
             // buffer.
-            Backend::Streaming(_) | Backend::Mirror(_) | Backend::Bounded(_) => &[],
+            Backend::Streaming(_) | Backend::Edit(_) => &[],
         }
     }
 
@@ -848,7 +828,7 @@ impl FileInner {
     pub(crate) fn in_memory_image(&self) -> Option<&[u8]> {
         match &self.backend {
             Backend::InMemory(data) => Some(data),
-            Backend::Streaming(_) | Backend::Mirror(_) | Backend::Bounded(_) => None,
+            Backend::Streaming(_) | Backend::Edit(_) => None,
         }
     }
 
@@ -913,13 +893,9 @@ impl FileInner {
     /// [`File::superblock`]) to detect appended or unaccounted tail bytes.
     pub fn file_size(&self) -> u64 {
         match &self.backend {
-            Backend::Mirror(m) => {
+            Backend::Edit(m) => {
                 let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 core.image().len()
-            }
-            Backend::Bounded(m) => {
-                let engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                engine.store().len()
             }
             _ => self.source().len(),
         }
@@ -944,15 +920,11 @@ impl FileInner {
             Backend::Streaming(s) => {
                 ObjectHeader::parse_from_source(s.as_ref(), address, os, ls, self.addr_offset)
             }
-            Backend::Mirror(m) => Self::with_engine(
+            Backend::Edit(m) => Self::with_engine(
                 m,
                 |d| ObjectHeader::parse_with_base(d, address.to_usize()?, os, ls, self.addr_offset),
                 |s| ObjectHeader::parse_from_source(s, address, os, ls, self.addr_offset),
             ),
-            Backend::Bounded(m) => {
-                let engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                ObjectHeader::parse_from_source(engine.store(), address, os, ls, self.addr_offset)
-            }
         }
     }
 
@@ -1012,15 +984,11 @@ impl FileInner {
             Backend::Streaming(s) => {
                 group_v2::resolve_group_entries_from_source(s.as_ref(), hdr, os, ls, base)
             }
-            Backend::Mirror(m) => Self::with_engine(
+            Backend::Edit(m) => Self::with_engine(
                 m,
                 |d| group_v2::resolve_group_entries(d, hdr, os, ls, base),
                 |s| group_v2::resolve_group_entries_from_source(s, hdr, os, ls, base),
             ),
-            Backend::Bounded(m) => {
-                let engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                group_v2::resolve_group_entries_from_source(engine.store(), hdr, os, ls, base)
-            }
         }
         .map_err(Error::Format)?;
         for entry in &mut entries {
@@ -1043,15 +1011,11 @@ impl FileInner {
         let (os, ls, base) = (self.offset_size(), self.length_size(), self.addr_offset);
         let attr_msgs = self.attr_messages_of(hdr)?;
         match &self.backend {
-            Backend::Mirror(m) => Ok(Self::with_engine(
+            Backend::Edit(m) => Ok(Self::with_engine(
                 m,
                 |d| attrs_to_map(&attr_msgs, &BytesSource::new(d), os, ls, base),
                 |s| attrs_to_map(&attr_msgs, s, os, ls, base),
             )),
-            Backend::Bounded(m) => {
-                let engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                Ok(attrs_to_map(&attr_msgs, engine.store(), os, ls, base))
-            }
             _ => Ok(attrs_to_map(&attr_msgs, &self.source(), os, ls, base)),
         }
     }
@@ -1098,7 +1062,7 @@ impl FileInner {
                 };
                 Ok(extract_attributes_full_from_source(&framed, hdr, os, ls)?)
             }
-            Backend::Mirror(m) => Self::with_engine(
+            Backend::Edit(m) => Self::with_engine(
                 m,
                 |d| Ok(extract_attributes_full(frame(d, base)?, hdr, os, ls)?),
                 |s| {
@@ -1110,16 +1074,6 @@ impl FileInner {
                     }
                 },
             ),
-            Backend::Bounded(m) => {
-                let engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let store = engine.store();
-                if base == 0 {
-                    Ok(extract_attributes_full_from_source(store, hdr, os, ls)?)
-                } else {
-                    let framed = BaseOffsetSource { inner: store, base };
-                    Ok(extract_attributes_full_from_source(&framed, hdr, os, ls)?)
-                }
-            }
         }
     }
 
@@ -1171,7 +1125,7 @@ impl FileInner {
                     &framed, dl, ds, dt, pipeline, os, ls, cache,
                 )
             }
-            Backend::Mirror(m) => Self::with_engine(
+            Backend::Edit(m) => Self::with_engine(
                 m,
                 |data| {
                     let frame = if base == 0 {
@@ -1192,23 +1146,6 @@ impl FileInner {
                     )
                 },
             ),
-            Backend::Bounded(m) => {
-                // A bounded file's base address is validated to 0 at open, so
-                // the store's absolute offsets serve base-relative addresses
-                // directly.
-                debug_assert_eq!(base, 0);
-                let engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                data_read::read_raw_data_cached_from_source(
-                    engine.store(),
-                    dl,
-                    ds,
-                    dt,
-                    pipeline,
-                    os,
-                    ls,
-                    cache,
-                )
-            }
         }
     }
 
@@ -1318,7 +1255,7 @@ impl FileInner {
                     &framed, dl, ds, dt, pipeline, os, ls, cache, start_row, num_rows, row_bytes,
                 )
             }
-            Backend::Mirror(m) => Self::with_engine(
+            Backend::Edit(m) => Self::with_engine(
                 m,
                 |data| {
                     let frame = if base == 0 {
@@ -1352,25 +1289,6 @@ impl FileInner {
                     )
                 },
             ),
-            Backend::Bounded(m) => {
-                // A bounded file's base address is validated to 0 at open, so the
-                // store's absolute offsets serve base-relative addresses directly.
-                debug_assert_eq!(base, 0);
-                let engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                read_rows_framed(
-                    engine.store(),
-                    dl,
-                    ds,
-                    dt,
-                    pipeline,
-                    os,
-                    ls,
-                    cache,
-                    start_row,
-                    num_rows,
-                    row_bytes,
-                )
-            }
         }
     }
 }
@@ -1669,7 +1587,7 @@ impl File {
         })
     }
 
-    /// Open an existing HDF5 file for reading and appending with **bounded
+    /// Open an existing HDF5 file for reading and editing with **bounded
     /// memory** (issue #147): no whole-file mirror is ever built, so peak
     /// memory stays at the metadata being parsed plus the configured caches
     /// plus a few chunks of append working set — independent of the file size
@@ -1687,10 +1605,16 @@ impl File {
     /// The staged edit surface ([`Dataset::write`]/`set_attr`/`append_staged`,
     /// [`Group::create_dataset`]/`create_group`/`delete`/`set_attr`,
     /// [`commit`](Self::commit)/[`copy`](Self::copy)/[`copy_from`](Self::copy_from),
-    /// and [`space_accounting`](Self::space_accounting)) needs the whole-file
-    /// mirror and returns
-    /// [`Error::BoundedStagedUnsupported`](crate::Error::BoundedStagedUnsupported);
-    /// open with [`open_rw`](Self::open_rw) for those.
+    /// and [`space_accounting`](Self::space_accounting)) is the same as
+    /// [`open_rw`](Self::open_rw)'s: both open the same engine, differing only in
+    /// how it holds the file's bytes (issue #198). What a commit *builds* still
+    /// scales with the objects it touches, so a commit is bounded by the edit
+    /// rather than by the file.
+    ///
+    /// What this entry point still requires beyond `open_rw` is a latest-format
+    /// file (v2/v3 superblock) with 8-byte offsets and lengths and no userblock;
+    /// anything else is refused at open with
+    /// [`Error::EditUnsupported`](crate::Error::EditUnsupported).
     ///
     /// A file that persists its free space
     /// (`H5Pset_file_space_strategy(persist = true)`, non-paged) is supported:
@@ -1826,7 +1750,7 @@ impl File {
     /// staged and do not count. Always `false` for a read-only file.
     pub fn has_staged_edits(&self) -> bool {
         match &self.inner.backend {
-            Backend::Mirror(m) => {
+            Backend::Edit(m) => {
                 let session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 session.has_staged_edits()
             }
@@ -1843,13 +1767,10 @@ impl File {
     /// [`Error::ReadOnly`](crate::Error::ReadOnly).
     pub fn space_accounting(&self) -> Result<SpaceAccounting, Error> {
         match &self.inner.backend {
-            Backend::Mirror(m) => {
+            Backend::Edit(m) => {
                 let session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 Ok(session.space_accounting())
             }
-            // Space accounting reports the mirror engine's free-list, which a
-            // bounded file does not track.
-            Backend::Bounded(_) => Err(Error::BoundedStagedUnsupported),
             _ => Err(Error::ReadOnly),
         }
     }
@@ -1861,31 +1782,24 @@ impl File {
     /// or [`File`] clone returns [`Error::FileClosed`](crate::Error::FileClosed);
     /// reads still work.
     pub fn close(self) -> Result<(), Error> {
-        if let Backend::Bounded(m) = &self.inner.backend {
-            // Every bounded append is already durable. For a file that persists
-            // its free space, rewrite the on-disk free-space managers into their
-            // canonical (manager-at-tail) shape here — the one place a bounded
-            // session has to do it, since it has no staged commit (issue #173).
-            // Then issue a final barrier and seal the file. The exclusive lock
-            // releases when the last derived handle drops, as for a mirror file.
-            let mut engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            engine.finalize_persist()?;
-            engine.sync()?;
-            drop(engine);
-            self.inner.closed.store(true, Ordering::Release);
-            return Ok(());
-        }
-        if matches!(self.inner.backend, Backend::Mirror(_)) {
+        if matches!(self.inner.backend, Backend::Edit(_)) {
             if self.inner.swmr_write {
                 // SWMR mode stages nothing (the staged surface is refused), so do
                 // not commit — clear the SWMR-write flag and flush, marking the
                 // file cleanly closed for any concurrent reader.
-                if let Backend::Mirror(m) = &self.inner.backend {
+                if let Backend::Edit(m) = &self.inner.backend {
                     let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     session.set_consistency_flags(0)?;
                 }
             } else {
                 self.commit()?;
+                // Immediate appends grow the file past any persisted free-space
+                // managers without running a commit tail, so re-home them here.
+                // A no-op unless this session left them stale.
+                self.with_mirror_session(false, |session| {
+                    session.finalize_persist()?;
+                    session.sync()
+                })?;
             }
             self.inner.closed.store(true, Ordering::Release);
         }
@@ -1904,12 +1818,7 @@ impl File {
         staged: bool,
         f: impl FnOnce(&mut WriteEngine) -> Result<R, Error>,
     ) -> Result<R, Error> {
-        let Backend::Mirror(m) = &self.inner.backend else {
-            // A bounded file is writable but has no staged surface; everything
-            // else reaching here is read-only.
-            if matches!(self.inner.backend, Backend::Bounded(_)) {
-                return Err(Error::BoundedStagedUnsupported);
-            }
+        let Backend::Edit(m) = &self.inner.backend else {
             return Err(Error::ReadOnly);
         };
         self.inner.check_mutable(staged)?;
@@ -2461,10 +2370,7 @@ impl Group {
         name: &str,
         f: impl FnOnce(&mut WriteEngine, &str) -> Result<R, Error>,
     ) -> Result<R, Error> {
-        let Backend::Mirror(m) = &self.file.backend else {
-            if matches!(self.file.backend, Backend::Bounded(_)) {
-                return Err(Error::BoundedStagedUnsupported);
-            }
+        let Backend::Edit(m) = &self.file.backend else {
             return Err(Error::ReadOnly);
         };
         self.file.check_mutable(true)?;
@@ -2493,7 +2399,7 @@ impl Group {
     /// sealed file would otherwise be silently accepted and then dropped.
     fn apply_staged(&self, ops: Vec<StagedOp>) -> Result<(), Error> {
         self.file.check_staged_writable()?;
-        let Backend::Mirror(m) = &self.file.backend else {
+        let Backend::Edit(m) = &self.file.backend else {
             // `check_staged_writable` accepts only a mirror backend, and a
             // file's backend is fixed for its lifetime.
             return Err(Error::ReadOnly);
@@ -2514,10 +2420,7 @@ impl Group {
         &self,
         f: impl FnOnce(&mut WriteEngine, &str) -> Result<R, Error>,
     ) -> Result<R, Error> {
-        let Backend::Mirror(m) = &self.file.backend else {
-            if matches!(self.file.backend, Backend::Bounded(_)) {
-                return Err(Error::BoundedStagedUnsupported);
-            }
+        let Backend::Edit(m) = &self.file.backend else {
             return Err(Error::ReadOnly);
         };
         self.file.check_mutable(true)?;
@@ -2588,68 +2491,75 @@ impl Dataset {
     /// is returned.
     /// The append is immediate and crash-atomic (no `commit` needed).
     pub fn append<T: H5Element>(&mut self, data: &[T]) -> Result<(), Error> {
-        if matches!(self.file.backend, Backend::Bounded(_)) {
-            let g = self.bounded_geometry()?;
-            return self.bounded_append_batches(g, data.len() as u64, |b, r| {
-                b.append(&data[r]);
-            });
-        }
-        self.with_session_mut(false, |session, path| session.append_inplace(path, data))
+        let g = self.append_geometry()?;
+        self.append_batches(g, data.len() as u64, |b, r| {
+            b.append(&data[r]);
+        })
     }
 
     /// Append raw little-endian element bytes to this dataset in place. Prefer
     /// [`append`](Self::append) when the element type is known; see it for the
     /// file-mode and eligibility rules.
     pub fn append_raw(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        if matches!(self.file.backend, Backend::Bounded(_)) {
-            let g = self.bounded_geometry()?;
-            let es = g.element_size.max(1);
-            // Whole-element length is checked before any batch applies, so the
-            // refusal is atomic (the per-batch validation would only reject the
-            // final, short batch after earlier ones had durably committed).
-            if bytes.len() % es != 0 {
-                return Err(Error::AppendInPlaceUnsupported(
-                    "appended byte length is not a whole number of elements",
-                ));
-            }
-            let total = (bytes.len() / es) as u64;
-            return self.bounded_append_batches(g, total, |b, r| {
-                b.append_raw(&bytes[r.start * es..r.end * es]);
-            });
+        let g = self.append_geometry()?;
+        let es = g.element_size.max(1);
+        // Whole-element length is checked before any batch applies, so the
+        // refusal is atomic (the per-batch validation would only reject the
+        // final, short batch after earlier ones had durably committed).
+        if bytes.len() % es != 0 {
+            return Err(Error::AppendInPlaceUnsupported(
+                "appended byte length is not a whole number of elements",
+            ));
         }
-        self.with_session_mut(false, |session, path| {
-            session.append_inplace_raw(path, bytes)
+        let total = (bytes.len() / es) as u64;
+        self.append_batches(g, total, |b, r| {
+            b.append_raw(&bytes[r.start * es..r.end * es]);
         })
     }
 
-    /// Fetch (locating on first use) this dataset's append geometry from a
-    /// bounded file's engine.
-    fn bounded_geometry(&self) -> Result<crate::bounded::AppendGeometry, Error> {
-        let Backend::Bounded(m) = &self.file.backend else {
+    /// How an append names this dataset to the session: by path when the handle
+    /// has one, so the session can check the target against its own staged
+    /// edits, and otherwise by the object-header address the handle was reached
+    /// through — which is what lets a handle obtained by object reference append
+    /// at all.
+    fn append_target(&self) -> AppendTarget<'_> {
+        match &self.path {
+            Some(path) => AppendTarget::Path(path),
+            None => AppendTarget::Header(self.address),
+        }
+    }
+
+    /// Fetch (locating on first use) this dataset's append geometry from the
+    /// write session, which also applies every refusal that does not depend on
+    /// the bytes being appended.
+    fn append_geometry(&self) -> Result<AppendGeometry, Error> {
+        let Backend::Edit(m) = &self.file.backend else {
             return Err(Error::ReadOnly);
         };
         self.file.check_mutable(false)?;
         let mut engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        engine.append_geometry(self.address)
+        engine.append_geometry(self.append_target())
     }
 
-    /// Immediate append on a bounded file, keyed by this handle's object-header
-    /// address (no path resolution — a handle reached by object reference can
-    /// append too). The call is split into aligned batches — the trailing
-    /// partial chunk is filled first, then whole-chunk batches under the
-    /// engine's byte budget — and `fill` builds each batch's bytes on demand,
-    /// so peak memory holds one batch rather than the whole call. Each batch is
-    /// its own crash-atomic apply; every predictable refusal (wrong datatype,
-    /// ineligible dataset, non-chunk-aligned filtered append) is raised before
-    /// the first batch is applied. The cached header and chunk cache are then
-    /// refreshed so later reads on this handle observe the new length.
-    fn bounded_append_batches(
+    /// Immediate in-place append, driven batch by batch. The call is split into
+    /// aligned batches — the trailing partial chunk is filled first, then
+    /// whole-chunk batches under the session's byte budget — and `fill` builds
+    /// each batch's bytes on demand, so a bounded session's peak memory holds
+    /// one batch rather than the whole call. A session that keeps the whole file
+    /// resident reports one unbounded batch, so the call stays a single
+    /// crash-atomic apply there.
+    ///
+    /// Every predictable refusal (wrong datatype, ineligible dataset,
+    /// non-chunk-aligned filtered append) is raised before the first batch is
+    /// applied. The cached header and chunk cache are then refreshed so later
+    /// reads on this handle observe the new length.
+    fn append_batches(
         &mut self,
-        g: crate::bounded::AppendGeometry,
+        g: AppendGeometry,
         total_elems: u64,
         fill: impl Fn(&mut AppendBuilder, std::ops::Range<usize>),
     ) -> Result<(), Error> {
-        let Backend::Bounded(m) = &self.file.backend else {
+        let Backend::Edit(m) = &self.file.backend else {
             return Err(Error::ReadOnly);
         };
         // Atomic refusal before any batch: a filtered append must be
@@ -2664,16 +2574,16 @@ impl Dataset {
         let mut dim = g.current_dim;
         let mut done = 0u64;
         loop {
-            // An empty append still runs one (empty) engine call so datatype
-            // validation matches the mirror path.
+            // An empty append still runs one (empty) engine call, so datatype
+            // validation happens whether or not there are elements.
             self.file.check_mutable(false)?;
             let to_boundary = (g.chunk_elems - dim % g.chunk_elems) % g.chunk_elems;
-            let take = (total_elems - done).min(to_boundary + g.full_batch_elems);
+            let take = (total_elems - done).min(to_boundary.saturating_add(g.full_batch_elems));
             let mut b = AppendBuilder::new();
             fill(&mut b, done.to_usize()?..(done + take).to_usize()?);
             {
                 let mut engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                engine.append_gathered(self.address, &b, 4)?;
+                engine.append_inplace_gathered(self.append_target(), &b, 4)?;
             }
             dim += take;
             done += take;
@@ -2821,13 +2731,7 @@ impl Dataset {
         staged: bool,
         f: impl FnOnce(&mut WriteEngine, &str) -> Result<R, Error>,
     ) -> Result<R, Error> {
-        let Backend::Mirror(m) = &self.file.backend else {
-            // Immediate appends on a bounded file dispatch to `bounded_append`
-            // before reaching here, so a bounded file reaching this point is a
-            // staged op.
-            if matches!(self.file.backend, Backend::Bounded(_)) {
-                return Err(Error::BoundedStagedUnsupported);
-            }
+        let Backend::Edit(m) = &self.file.backend else {
             return Err(Error::ReadOnly);
         };
         self.file.check_mutable(staged)?;
