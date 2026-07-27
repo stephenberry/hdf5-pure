@@ -275,9 +275,32 @@ fn deprecated_aliases_resolve_to_the_renamed_types() {
         DatasetAccessOptions::new().with_chunk_cache(ChunkCacheConfig::new());
     assert!(dapl.chunk_cache().is_some());
 
-    // The renamed builder method and its deprecated shim agree.
-    let mut old = FileBuilder::new();
-    old.with_create_options(create);
-    let mut new = FileBuilder::new();
-    new.with_create_properties(create);
+    // Both deprecated method shims forward to the renamed method rather than
+    // merely existing: compare what each spelling actually produces.
+    let build = |apply: &dyn Fn(&mut FileBuilder)| {
+        let mut b = FileBuilder::new();
+        apply(&mut b);
+        b.create_dataset("data").with_f64_data(&[1.0, 2.0]);
+        b.finish().unwrap()
+    };
+    let via_shim = build(&|b| {
+        b.with_create_options(create);
+    });
+    let via_renamed = build(&|b| {
+        b.with_create_properties(create);
+    });
+    assert_eq!(
+        via_shim, via_renamed,
+        "with_create_options must forward to with_create_properties"
+    );
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("aliases.h5");
+    std::fs::write(&path, &via_renamed).unwrap();
+    let file = File::open_with_options(&path, access).unwrap();
+    assert_eq!(
+        file.access_options(),
+        file.access_properties(),
+        "access_options must forward to access_properties"
+    );
 }
