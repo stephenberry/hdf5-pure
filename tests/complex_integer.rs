@@ -10,7 +10,7 @@
 //! the file self-describing, and the shapes and edge values the float complex
 //! path already handles.
 
-use hdf5_pure::mat::options::Compression;
+use hdf5_pure::mat::options::{Compression, OneDimensionalMode};
 use hdf5_pure::mat::{
     self, Complex32, Complex64, ComplexI8, ComplexI16, ComplexI32, ComplexI64, ComplexU8,
     ComplexU16, ComplexU32, ComplexU64, Matrix, Options,
@@ -407,6 +407,49 @@ fn compression_round_trips_and_leaves_the_empty_array_alone() {
     );
     let back: Both = mat::from_bytes(&deflated).unwrap();
     assert_eq!(back, v);
+}
+
+/// A complex vector is a vector, so it takes the configured orientation like
+/// every other one. It used to be written as a MATLAB row regardless, which
+/// made it the only kind of 1-D array whose shape contradicted both the option
+/// and the default write path.
+#[test]
+fn a_complex_vector_takes_the_configured_orientation_like_a_real_one() {
+    #[derive(Serialize)]
+    struct Both {
+        reals: Vec<i16>,
+        cplx: Vec<ComplexI16>,
+    }
+
+    let v = Both {
+        reals: vec![1, 2, 3],
+        cplx: vec![
+            ComplexI16::new(1, -1),
+            ComplexI16::new(2, -2),
+            ComplexI16::new(3, -3),
+        ],
+    };
+    let shapes = |opts: &Options| {
+        let file = File::from_bytes(mat::to_bytes_with_options(&v, opts).unwrap()).unwrap();
+        (
+            file.dataset("reals").unwrap().shape().unwrap(),
+            file.dataset("cplx").unwrap().shape().unwrap(),
+        )
+    };
+
+    let (reals, cplx) = shapes(&Options::default());
+    assert_eq!(reals, cplx, "column-vector default");
+
+    let mut row = Options::default();
+    row.one_dimensional_mode = OneDimensionalMode::RowVector;
+    let (reals_row, cplx_row) = shapes(&row);
+    assert_eq!(reals_row, cplx_row, "row-vector mode");
+    assert_ne!(reals, reals_row, "the option has to move the shape at all");
+
+    // And the default options path agrees with `to_bytes`, which has no
+    // options to consult.
+    let plain = File::from_bytes(mat::to_bytes(&v).unwrap()).unwrap();
+    assert_eq!(plain.dataset("cplx").unwrap().shape().unwrap(), cplx);
 }
 
 // ---------------------------------------------------------------------------

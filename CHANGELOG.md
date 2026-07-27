@@ -19,6 +19,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Dropping a read-write `File` without `close` now re-homes the on-disk free-space managers of a persisting file and flushes, matching what `close` does; previously only `File::open_rw_bounded` handles did this. Staged edits are still discarded on drop ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
 - **Breaking:** `Error::BoundedStagedUnsupported` is removed, along with the refusals that returned it ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
 
+### Fixed
+
+- A MAT complex vector now takes the configured `OneDimensionalMode` like every other 1-D array. Written through `to_bytes_with_options` it was always a MATLAB row vector, contradicting both the option and the shape the default `to_bytes` path gives it.
+- A one-element MAT complex array deserializes into a `Vec<Complex*>`, matching the allowance the real numeric path already makes for a one-element numeric array.
+- An empty MAT complex array of an integer class reads back as an empty complex array of that class rather than as an untyped empty vector.
+
 ## [0.26.0] - 2026-07-27
 
 Attributes lose their size ceiling: one too large for an object-header message selects fractal-heap storage on its own, and one too large even for a managed heap object becomes a *huge* object, so `FormatError::DenseAttributeTooLarge` is gone rather than refusing a shape the reference library writes ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)). Three defects on that path are fixed with it: a variable-length attribute stored in a fractal heap silently lost its values, dense attributes were unreadable in a file with a userblock, and reading many of them was quadratic in their number ([#214](https://github.com/stephenberry/hdf5-pure/pull/214), [#195](https://github.com/stephenberry/hdf5-pure/issues/195)). The property-list types are renamed to say what they stand in for — `FileAccessProperties`, `FileCreateProperties`, `DatasetAccessProperties` — and checking each one's settings against the official group pages caught two properties documented under the wrong class ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)). Breaking, but every break is a one-line call-site edit, and deprecated aliases keep 0.25.0 code compiling for this cycle.

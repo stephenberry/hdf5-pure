@@ -154,7 +154,8 @@ fn emit_cell_element(cw: &mut CellWriter, value: MatValue) -> Result<(), MatErro
             push_complex(cw, &[1, 1], ComplexVec::from_single(n))?;
         }
         MatValue::ComplexVec1D(pairs) => {
-            push_complex(cw, &[1, pairs.len()], pairs)?;
+            let dims = cw.vector_dims(pairs.len());
+            push_complex(cw, &dims, pairs)?;
         }
         MatValue::ComplexMatrix { rows, cols, pairs } => {
             let col_major = pairs.transposed(rows, cols);
@@ -315,7 +316,8 @@ fn emit_leaf_at_builder(mb: &mut MatBuilder, name: &str, value: MatValue) -> Res
             write_complex_at_builder(mb, name, &[1, 1], ComplexVec::from_single(n))
         }
         MatValue::ComplexVec1D(pairs) => {
-            write_complex_at_builder(mb, name, &[1, pairs.len()], pairs)
+            let dims = mb.vector_dims(pairs.len());
+            write_complex_at_builder(mb, name, &dims, pairs)
         }
         MatValue::ComplexMatrix { rows, cols, pairs } => {
             let col_major = pairs.transposed(rows, cols);
@@ -341,7 +343,8 @@ fn emit_leaf_at_struct(sw: &mut StructWriter, name: &str, value: MatValue) -> Re
             write_complex_at_struct(sw, name, &[1, 1], ComplexVec::from_single(n))
         }
         MatValue::ComplexVec1D(pairs) => {
-            write_complex_at_struct(sw, name, &[1, pairs.len()], pairs)
+            let dims = sw.vector_dims(pairs.len());
+            write_complex_at_struct(sw, name, &dims, pairs)
         }
         MatValue::ComplexMatrix { rows, cols, pairs } => {
             let col_major = pairs.transposed(rows, cols);
