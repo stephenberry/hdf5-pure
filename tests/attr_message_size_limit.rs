@@ -171,6 +171,7 @@ fn large_but_fitting_attrs_still_round_trip() {
     // 4,000 variable-length elements sit just under the limit; the issue reports
     // this exact count as the last one that worked.
     let labels: Vec<String> = (0..4_000).map(|i| format!("s{i}")).collect();
+    let expected = labels.clone();
 
     let mut builder = FileBuilder::new();
     builder.set_attr("labels", AttrValue::VarLenAsciiArray(labels.clone()));
@@ -184,7 +185,15 @@ fn large_but_fitting_attrs_still_round_trip() {
     builder.add_group(group.finish());
 
     let file = File::from_bytes(builder.finish().unwrap()).unwrap();
-    assert_eq!(file.root().attrs().unwrap().len(), 1);
-    assert_eq!(file.dataset("x").unwrap().attrs().unwrap().len(), 1);
-    assert_eq!(file.group("g").unwrap().attrs().unwrap().len(), 1);
+    // Values, not just the count: a variable-length attribute whose references
+    // were never resolved comes back *present* and empty in some readers, so a
+    // length check alone would pass on data that had been lost.
+    for attrs in [
+        file.root().attrs().unwrap(),
+        file.dataset("x").unwrap().attrs().unwrap(),
+        file.group("g").unwrap().attrs().unwrap(),
+    ] {
+        assert_eq!(attrs.len(), 1);
+        assert_eq!(strings(&attrs, "labels"), expected);
+    }
 }

@@ -153,6 +153,44 @@ fn several_variable_length_attributes_keep_their_own_values() {
     }
 }
 
+/// A *chunked* variable-length dataset places its global-heap collections early,
+/// before the object headers, rather than after the dataset data — a different
+/// placement path from the contiguous case below, and the one that most nearly
+/// collides with the reserved heap spans. Run in both layouts, since the paged one
+/// puts collections somewhere else again.
+#[test]
+fn chunked_variable_length_elements_coexist_with_dense_attributes() {
+    let expected = ["attr-a", "attr-b", "attr-c"];
+    let elements: Vec<String> = (0..7).map(|i| format!("elem{i}")).collect();
+
+    for paged in [false, true] {
+        let mut builder = root_with_vlen(12, &expected);
+        builder
+            .create_dataset("strings")
+            .with_vlen_strings(&elements.iter().map(String::as_str).collect::<Vec<_>>())
+            .with_chunks(&[3]);
+        if paged {
+            builder
+                .with_file_space_strategy(FileSpaceStrategy::Page, true, 1)
+                .with_file_space_page_size(4096);
+        }
+
+        let bytes = builder.finish().unwrap();
+        assert!(has_fractal_heap(&bytes), "paged={paged}");
+        let file = File::from_bytes(bytes).unwrap();
+        assert_eq!(
+            labels(&file.root().attrs().unwrap(), "labels"),
+            expected,
+            "paged={paged}"
+        );
+        assert_eq!(
+            file.dataset("strings").unwrap().read_string().unwrap(),
+            elements,
+            "paged={paged}"
+        );
+    }
+}
+
 /// A dataset whose *elements* are variable-length, alongside dense attributes on
 /// the same file. Element and attribute collections share one address cursor, so
 /// a heap built at the wrong point would take addresses meant for the elements.

@@ -209,10 +209,14 @@ const DENSE_ATTR_DEFAULT_MAX_DIRECT_BLOCK: usize = 65536;
 /// answer is [`FormatError::AttributeMessageTooLarge`] — even though dense
 /// storage can hold it, as a huge object if need be.
 ///
-/// The size comparison is `>` rather than the C library's `>=`, so an attribute
-/// serializing to exactly [`OBJECT_HEADER_MESSAGE_MAX`] stays compact here and
-/// goes dense there. Both are readable; this keeps the existing boundary where it
-/// was rather than moving every such file's layout.
+/// The comparison reads `>` against [`OBJECT_HEADER_MESSAGE_MAX`] (65,535) where
+/// the C library reads `>=` against `H5O_MESG_MAX_SIZE` (65,536): the same
+/// predicate, written from the widest value that fits rather than the first that
+/// does not. What each side measures does differ by a byte, since this writer's
+/// compact attribute messages are version 2 and the C library's latest-format
+/// ones are version 3, one character-set byte longer. An attribute landing in
+/// that single-byte window is therefore stored compactly here and densely there.
+/// Both are readable, and both stay within the header's field width.
 ///
 /// Variable-length attributes are selected on the same terms as any other. They
 /// were briefly excluded from the size half of the rule, because a heap built
@@ -1466,12 +1470,15 @@ impl FileWriter {
             }
             Ok(())
         }
-        // The dense emitter has bounds of its own — a per-attribute size and a
-        // B-tree record count — which it documents its callers must check. An
-        // attribute set past them was previously written anyway, producing a heap
-        // that reads back empty here and aborts an assertion-enabled reference C
-        // library (issue #191). Between this and the compact check above, every
-        // attribute is bounded on whichever path it takes.
+        // The dense emitter has bounds of its own — the attribute message's own
+        // 2-byte header fields, the size of the one direct block it builds, and
+        // the record counts of its single-leaf B-trees — which it documents its
+        // callers must check. An attribute set past them was previously written
+        // anyway, producing a heap that reads back empty here and aborts an
+        // assertion-enabled reference C library (issue #191). Between this and the
+        // compact check above, every attribute is bounded on whichever path it
+        // takes. No bound here is on an attribute's size: that is what selects
+        // dense storage, not what it refuses.
         if root_dense {
             dense_attrs_check(&root_attrs)?;
         } else {
@@ -1580,9 +1587,17 @@ impl FileWriter {
             ///
             /// Call once the attributes are final: after the global-heap
             /// collections have addresses and the variable-length attributes'
-            /// references have been patched with them. A heap's *length* follows
-            /// its attributes' serialized sizes, which patching leaves alone, so
-            /// each blob fills its reserved span exactly.
+            /// references have been patched with them.
+            ///
+            /// Each blob fills its reserved span exactly, and nothing here has to
+            /// arrange that. A heap's length is a function of its attributes'
+            /// serialized sizes, the fixed offset and length widths, and how many
+            /// of those attributes are huge — no term of it is the address it is
+            /// built at. Patching cannot move any of those terms either: it takes
+            /// the attribute bytes as `&mut [u8]` and overwrites references in
+            /// place, so the slice it returns is the length it was given. The
+            /// assertion below is therefore a guard on future edits rather than on
+            /// this call.
             fn build(
                 &self,
                 root_attrs: &[AttributeMessage],

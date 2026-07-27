@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use tempfile::tempdir;
 
 mod common;
-use common::heap::huge_object_count;
+use common::heap::{has_fractal_heap, huge_object_counts};
 
 /// Number of attributes that forces the whole-file writer into dense storage
 /// (its threshold is 8 compact attributes).
@@ -58,9 +58,8 @@ fn write_dense_source(path: &std::path::Path) {
 /// The file must actually contain a fractal heap (the dense-storage signature);
 /// otherwise the test would pass trivially against compact storage.
 fn assert_file_has_fractal_heap(path: &std::path::Path) {
-    let bytes = std::fs::read(path).unwrap();
     assert!(
-        bytes.windows(4).any(|w| w == b"FRHP"),
+        has_fractal_heap(&std::fs::read(path).unwrap()),
         "source file does not use dense (fractal-heap) storage",
     );
 }
@@ -143,7 +142,7 @@ fn copy_reproduces_huge_dense_attrs() {
         }
         b.write(&path).unwrap();
     }
-    assert_eq!(huge_object_count(&std::fs::read(&path).unwrap()), 1);
+    assert_eq!(huge_object_counts(&std::fs::read(&path).unwrap()), vec![1]);
 
     {
         let session = File::open_rw(&path).unwrap();
@@ -151,13 +150,13 @@ fn copy_reproduces_huge_dense_attrs() {
         session.commit().unwrap();
     }
 
-    // Two heaps now, and the copy's must be huge-storing too rather than having
-    // quietly fallen back to a managed object it cannot hold.
-    let bytes = std::fs::read(&path).unwrap();
+    // Two heaps now, and the copy's own header must declare a huge object too
+    // rather than having quietly fallen back to a managed object it cannot hold.
+    // Reading only the first heap would report the source's choice, not the copy's.
     assert_eq!(
-        bytes.windows(4).filter(|w| *w == b"FRHP").count(),
-        2,
-        "expected a second fractal heap for the copy"
+        huge_object_counts(&std::fs::read(&path).unwrap()),
+        vec![1, 1],
+        "expected a second fractal heap for the copy, huge-storing as the source does"
     );
 
     let f = File::open(&path).unwrap();

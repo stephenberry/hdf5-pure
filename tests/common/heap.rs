@@ -19,25 +19,40 @@ pub fn has_fractal_heap(bytes: &[u8]) -> bool {
     bytes.windows(4).any(|w| w == b"FRHP")
 }
 
-/// Offset of the fractal-heap header in `bytes`.
+/// Offsets of every fractal-heap header in `bytes`, in file order.
+pub fn frhp_offsets(bytes: &[u8]) -> Vec<usize> {
+    bytes
+        .windows(4)
+        .enumerate()
+        .filter(|(_, w)| *w == b"FRHP")
+        .map(|(at, _)| at)
+        .collect()
+}
+
+/// Offset of the first fractal-heap header in `bytes`.
 ///
 /// Panics if there is none, since a caller asking about heap storage has already
 /// decided the file should have one.
 #[track_caller]
 fn frhp(bytes: &[u8]) -> usize {
-    bytes
-        .windows(4)
-        .position(|w| w == b"FRHP")
+    *frhp_offsets(bytes)
+        .first()
         .expect("a dense attribute or link set has a fractal heap header")
 }
 
-/// Read a `u64` field from the fractal-heap header, `fields` 8-byte fields past
-/// the fixed prefix: signature(4) + version(1) + heap ID length(2) + I/O filter
-/// length(2) + flags(1) + maximum managed object size(4).
+/// Read a `u64` field from the fractal-heap header at `frhp`, `fields` 8-byte
+/// fields past the fixed prefix: signature(4) + version(1) + heap ID length(2) +
+/// I/O filter length(2) + flags(1) + maximum managed object size(4).
+#[track_caller]
+fn frhp_u64_at(bytes: &[u8], frhp: usize, fields: usize) -> u64 {
+    let at = frhp + 4 + 1 + 2 + 2 + 1 + 4 + fields * SIZE;
+    u64::from_le_bytes(bytes[at..at + SIZE].try_into().expect("8 bytes"))
+}
+
+/// Read a `u64` field from the first fractal-heap header in `bytes`.
 #[track_caller]
 fn frhp_u64(bytes: &[u8], fields: usize) -> u64 {
-    let at = frhp(bytes) + 4 + 1 + 2 + 2 + 1 + 4 + fields * SIZE;
-    u64::from_le_bytes(bytes[at..at + SIZE].try_into().expect("8 bytes"))
+    frhp_u64_at(bytes, frhp(bytes), fields)
 }
 
 /// How many objects the heap stores as fractal-heap *huge* objects — held outside
@@ -49,6 +64,16 @@ fn frhp_u64(bytes: &[u8], fields: usize) -> u64 {
 #[track_caller]
 pub fn huge_object_count(bytes: &[u8]) -> u64 {
     frhp_u64(bytes, 9)
+}
+
+/// [`huge_object_count`] for every heap in the file, in file order — for asserting
+/// what a *copy's* heap chose, which the first-heap reader cannot see.
+#[track_caller]
+pub fn huge_object_counts(bytes: &[u8]) -> Vec<u64> {
+    frhp_offsets(bytes)
+        .into_iter()
+        .map(|at| frhp_u64_at(bytes, at, 9))
+        .collect()
 }
 
 /// How many objects the heap stores as managed objects, inside its direct blocks.
