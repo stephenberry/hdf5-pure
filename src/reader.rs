@@ -161,6 +161,11 @@ fn frame(bytes: &[u8], base: u64) -> Result<&[u8], FormatError> {
 /// `H5Fopen`. Every `*_with_options` constructor on [`File`] accepts it, so a
 /// read path and a read-write path can share one configuration.
 ///
+/// It is named for what it is rather than after the C type: a plain `Copy`
+/// value, with no handle to create or close, no runtime property registry, and
+/// no setter that can fail. The C spellings are doc aliases instead, so a search
+/// for `fapl` or for an individual `H5Pset_*` still lands here.
+///
 /// - The metadata cache (`H5Pset_mdc_config`) applies to the streaming and
 ///   bounded backends; an in-memory open already holds the whole file in one
 ///   buffer.
@@ -175,7 +180,6 @@ fn frame(bytes: &[u8], base: u64) -> Result<&[u8], FormatError> {
 /// [property-support reference]: https://github.com/stephenberry/hdf5-pure/blob/main/docs/reference/property-support.md
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[doc(alias = "fapl")]
-#[doc(alias = "H5Pset_fapl")]
 pub struct FileAccessOptions {
     metadata_cache: MetadataCacheConfig,
     chunk_cache: ChunkCacheConfig,
