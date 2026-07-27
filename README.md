@@ -125,7 +125,7 @@ file.commit().unwrap();  // apply staged edits in place
 
 Contiguous and chunked datasets — the latter with any supported filter (deflate, shuffle, fletcher32, scale-offset) and optionally extensible (unlimited) dimensions — and compact-link groups are supported, and the editor edits files across every on-disk format the reference C library and h5py produce — version 0/1/2/3 superblocks, single- and multi-chunk object headers (a multi-chunk header is collapsed into one chunk on rewrite, and a version 0/1 symbol-table group on the edited path is converted to the latest compact-link format). It refuses, rather than silently degrade the file, anything it cannot reproduce faithfully — a chunked or extensible variable-length addition, dense-storage headers on the edited path, or copying a version-1 object. Within a session the space a deletion frees — for contiguous and chunked datasets alike, including the chunk index — is reused for later writes and the file is truncated when the freed bytes reach the end, so add/delete churn stays bounded instead of only ever growing; for guaranteed compaction across a reopen, see `repack` below.
 
-`File::open_rw` takes an exclusive OS advisory lock (the analogue of `H5Pset_file_locking`), so a second editor or any concurrent writer gets `Error::FileLocked` rather than racing on the file. The kernel releases the lock on any process exit, including a crash, so a crashed editor never leaves a stale lock behind. Override the policy with `FileAccessOptions::with_locking` and the `FileLocking` enum, passed to `File::open_rw_with_options` (or `open_rw_bounded_with_options`), or set `HDF5_USE_FILE_LOCKING=FALSE` for filesystems (such as some network mounts) where locking is unavailable. `File::open_swmr_writer` and the readers intentionally take no lock: SWMR is single-writer by contract and built for concurrent reads.
+`File::open_rw` takes an exclusive OS advisory lock (the analogue of `H5Pset_file_locking`), so a second editor or any concurrent writer gets `Error::FileLocked` rather than racing on the file. The kernel releases the lock on any process exit, including a crash, so a crashed editor never leaves a stale lock behind. Override the policy with `FileAccessProperties::with_locking` and the `FileLocking` enum, passed to `File::open_rw_with_options` (or `open_rw_bounded_with_options`), or set `HDF5_USE_FILE_LOCKING=FALSE` for filesystems (such as some network mounts) where locking is unavailable. `File::open_swmr_writer` and the readers intentionally take no lock: SWMR is single-writer by contract and built for concurrent reads.
 
 ### Reclaiming space (`repack`)
 
@@ -192,22 +192,22 @@ for start in (0..rows).step_by(1_000_000) {
 Use `File::open_streaming_with_options` to bound retained metadata and dataset chunk cache memory. `MetadataCacheConfig` mirrors the memory-budget role of `H5Pset_mdc_config`; `ChunkCacheConfig` mirrors the raw-data chunk-cache settings from `H5Pset_cache`, controlling decompressed chunk data and whether parsed chunk indexes are retained between repeated reads of the same dataset.
 
 ```rust
-use hdf5_pure::{ChunkCacheConfig, File, FileAccessOptions, MetadataCacheConfig};
+use hdf5_pure::{ChunkCacheConfig, File, FileAccessProperties, MetadataCacheConfig};
 
-let options = FileAccessOptions::new()
+let access = FileAccessProperties::new()
     .with_metadata_cache(MetadataCacheConfig::new(8 * 1024 * 1024).with_max_entry_bytes(64 * 1024))
     .with_chunk_cache(ChunkCacheConfig::from_h5p_cache(521, 256 * 1024));
-let file = File::open_streaming_with_options("huge.h5", options).unwrap();
+let file = File::open_streaming_with_options("huge.h5", access).unwrap();
 ```
 
 To override the chunk cache for a single dataset (HDF5's per-dataset access property list, `H5Pset_chunk_cache`), open it with `dataset_with_options`. The override replaces the file-wide default for that one dataset; other datasets keep the default. `Dataset::chunk_cache_config()` reports the effective setting (`H5Pget_chunk_cache`).
 
 ```rust
-use hdf5_pure::{ChunkCacheConfig, DatasetAccessOptions, File};
+use hdf5_pure::{ChunkCacheConfig, DatasetAccessProperties, File};
 
 let file = File::open("data.h5").unwrap();
 // This dataset is read once front-to-back: skip caching its decompressed chunks.
-let dapl = DatasetAccessOptions::new().with_chunk_cache(ChunkCacheConfig::disabled());
+let dapl = DatasetAccessProperties::new().with_chunk_cache(ChunkCacheConfig::disabled());
 let ds = file.dataset_with_options("scan", dapl).unwrap();
 let values = ds.read_f64().unwrap();
 ```

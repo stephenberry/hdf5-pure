@@ -19,7 +19,7 @@ use crate::data_read;
 use crate::dataspace::Dataspace;
 use crate::datatype::{Datatype, ReferenceType};
 use crate::error::{Error, FormatError};
-use crate::file_create_options::FileCreateOptions;
+use crate::file_create_properties::FileCreateProperties;
 use crate::file_lock::FileLocking;
 use crate::file_space_info::{FileSpaceInfo, FileSpaceStrategy};
 use crate::filter_pipeline::FilterPipeline;
@@ -153,7 +153,7 @@ fn frame(bytes: &[u8], base: u64) -> Result<&[u8], FormatError> {
     })
 }
 
-/// File-access options applied when opening an HDF5 file.
+/// File-access properties applied when opening an HDF5 file.
 ///
 /// This is the `hdf5-pure` analogue of an HDF5 **file access property list**
 /// (`fapl`): one value carrying every access-time setting, built once and passed
@@ -161,17 +161,18 @@ fn frame(bytes: &[u8], base: u64) -> Result<&[u8], FormatError> {
 /// `H5Fopen`. Every `*_with_options` constructor on [`File`] accepts it, so a
 /// read path and a read-write path can share one configuration.
 ///
-/// It is named for what it is rather than after the C type: a plain `Copy`
-/// value, with no handle to create or close, no runtime property registry, and
-/// no setter that can fail. The C spellings are doc aliases instead, so a search
-/// for `fapl` or for an individual `H5Pset_*` still lands here.
+/// The `Properties` suffix means the type stands in for one whole HDF5 property
+/// list, so every setting on it has a C counterpart to look up. It is a stand-in
+/// and not a port: a plain `Copy` value, with no handle to create or close, no
+/// runtime property registry, and no setter that can fail. `fapl` and each
+/// `H5Pset_*` it models are doc aliases, so a search for either lands here.
 ///
 /// - The metadata cache (`H5Pset_mdc_config`) applies to the streaming and
 ///   bounded backends; an in-memory open already holds the whole file in one
 ///   buffer.
 /// - The chunk cache (`H5Pset_cache`) is the file-wide default for datasets
 ///   opened from any backend, overridable per dataset with
-///   [`DatasetAccessOptions`].
+///   [`DatasetAccessProperties`].
 /// - The locking policy (`H5Pset_file_locking`) applies to the read-write opens.
 ///   Readers and the SWMR writer take no lock by design, so they ignore it.
 ///
@@ -180,14 +181,21 @@ fn frame(bytes: &[u8], base: u64) -> Result<&[u8], FormatError> {
 /// [property-support reference]: https://github.com/stephenberry/hdf5-pure/blob/main/docs/reference/property-support.md
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[doc(alias = "fapl")]
-pub struct FileAccessOptions {
+pub struct FileAccessProperties {
     metadata_cache: MetadataCacheConfig,
     chunk_cache: ChunkCacheConfig,
     locking: FileLocking,
 }
 
-impl FileAccessOptions {
-    /// Create options with the crate's default access behavior.
+/// Former name of [`FileAccessProperties`].
+#[deprecated(
+    since = "0.26.0",
+    note = "renamed to `FileAccessProperties`: a type standing in for a whole HDF5 property list now carries the `Properties` suffix"
+)]
+pub type FileAccessOptions = FileAccessProperties;
+
+impl FileAccessProperties {
+    /// A value carrying the crate's default access behavior.
     pub const fn new() -> Self {
         Self {
             metadata_cache: MetadataCacheConfig::disabled(),
@@ -243,15 +251,23 @@ impl FileAccessOptions {
     }
 }
 
-/// Dataset-access options applied when opening a single dataset.
+/// Dataset-access properties applied when opening a single dataset.
 ///
-/// This is the `hdf5-pure` analogue of an HDF5 Dataset Access Property List
-/// (DAPL). Its chunk cache corresponds to `H5Pset_chunk_cache`: it overrides,
+/// This is the `hdf5-pure` analogue of an HDF5 **dataset access property list**
+/// (`dapl`). Its chunk cache corresponds to `H5Pset_chunk_cache`: it overrides,
 /// for this one dataset, the file-wide chunk-cache default configured with
-/// [`FileAccessOptions::with_chunk_cache`] (the `H5Pset_cache` analogue). When
-/// left unset, the dataset inherits that file-wide default — matching the DAPL
+/// [`FileAccessProperties::with_chunk_cache`] (the `H5Pset_cache` analogue). When
+/// left unset, the dataset inherits that file-wide default — matching the `dapl`
 /// default sentinels (`H5D_CHUNK_CACHE_*_DEFAULT`), which also mean "use the
 /// file's setting".
+///
+/// The `Properties` suffix means the type stands in for one whole HDF5 property
+/// list, so every setting on it has a C counterpart to look up. It is a stand-in
+/// and not a port: a plain `Copy` value, with no handle to create or close, no
+/// runtime property registry, and no setter that can fail. `dapl` and each
+/// `H5Pset_*` it models are doc aliases, so a search for either lands here.
+/// The chunk cache is the one `dapl` property modeled; see the
+/// [property-support reference] for the rest.
 ///
 /// [`ChunkCacheConfig`] maps `H5Pset_chunk_cache`'s `rdcc_nslots` and
 /// `rdcc_nbytes`; its `rdcc_w0` preemption policy is not modeled, because this
@@ -259,19 +275,30 @@ impl FileAccessOptions {
 /// [`ChunkCacheConfig::from_h5p_cache`]).
 ///
 /// Pass it to [`File::dataset_with_options`] or [`Group::dataset_with_options`].
+///
+/// [property-support reference]: https://github.com/stephenberry/hdf5-pure/blob/main/docs/reference/property-support.md
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct DatasetAccessOptions {
+#[doc(alias = "dapl")]
+pub struct DatasetAccessProperties {
     chunk_cache: Option<ChunkCacheConfig>,
 }
 
-impl DatasetAccessOptions {
-    /// Create options that inherit every file-wide access default.
+/// Former name of [`DatasetAccessProperties`].
+#[deprecated(
+    since = "0.26.0",
+    note = "renamed to `DatasetAccessProperties`: a type standing in for a whole HDF5 property list now carries the `Properties` suffix"
+)]
+pub type DatasetAccessOptions = DatasetAccessProperties;
+
+impl DatasetAccessProperties {
+    /// A value that inherits every file-wide access default.
     pub const fn new() -> Self {
         Self { chunk_cache: None }
     }
 
     /// Override the raw chunk cache for this one dataset, ignoring the file-wide
     /// default. This is the `H5Pset_chunk_cache` analogue.
+    #[doc(alias = "H5Pset_chunk_cache")]
     pub const fn with_chunk_cache(mut self, chunk_cache: ChunkCacheConfig) -> Self {
         self.chunk_cache = Some(chunk_cache);
         self
@@ -336,7 +363,7 @@ struct FileInner {
     /// one. Best-effort: a malformed or unreadable extension leaves this `None`
     /// rather than failing the open.
     file_space_info: Option<FileSpaceInfo>,
-    access_options: FileAccessOptions,
+    access_properties: FileAccessProperties,
     /// Set by [`File::close`] to seal a read-write file: after it, a write
     /// through any surviving [`Dataset`]/[`Group`] handle or [`File`] clone
     /// returns [`Error::FileClosed`]. Reads still work. Only ever set on a
@@ -389,20 +416,20 @@ impl FileInner {
     /// To read a file larger than memory (e.g. on a 32-bit host) without
     /// buffering it, use [`File::open_streaming`].
     pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
-        Self::open_with_options(path, FileAccessOptions::new())
+        Self::open_with_options(path, FileAccessProperties::new())
     }
 
-    /// Open an HDF5 file from a filesystem path with explicit access options.
+    /// Open an HDF5 file from a filesystem path with explicit access properties.
     ///
     /// Like [`open`](Self::open), this buffers the whole file in memory. Use
     /// [`open_streaming_with_options`](Self::open_streaming_with_options) when
     /// the metadata cache budget should apply to lazy metadata reads.
     pub fn open_with_options<P: AsRef<std::path::Path>>(
         path: P,
-        options: FileAccessOptions,
+        properties: FileAccessProperties,
     ) -> Result<Self, Error> {
         let bytes = std::fs::read(path.as_ref()).map_err(Error::Io)?;
-        Self::from_bytes_with_options(bytes, options)
+        Self::from_bytes_with_options(bytes, properties)
     }
 
     /// Open an HDF5 file for **streaming** reads, fetching regions on demand from
@@ -422,18 +449,21 @@ impl FileInner {
     /// cross-file copy, and chunk decompression is sequential (the `parallel`
     /// feature accelerates only buffered reads).
     pub fn open_streaming<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
-        Self::open_streaming_with_options(path, FileAccessOptions::new())
+        Self::open_streaming_with_options(path, FileAccessProperties::new())
     }
 
-    /// Open an HDF5 file for streaming reads with explicit access options.
+    /// Open an HDF5 file for streaming reads with explicit access properties.
     pub fn open_streaming_with_options<P: AsRef<std::path::Path>>(
         path: P,
-        options: FileAccessOptions,
+        properties: FileAccessProperties,
     ) -> Result<Self, Error> {
         let handle = std::fs::File::open(path.as_ref()).map_err(Error::Io)?;
         let source = ReadSeekSource::new(handle).map_err(Error::Format)?;
-        let source: Box<dyn Source + Send + Sync> = if options.metadata_cache.is_enabled() {
-            Box::new(MetadataCachingSource::new(source, options.metadata_cache))
+        let source: Box<dyn Source + Send + Sync> = if properties.metadata_cache.is_enabled() {
+            Box::new(MetadataCachingSource::new(
+                source,
+                properties.metadata_cache,
+            ))
         } else {
             Box::new(source)
         };
@@ -443,7 +473,7 @@ impl FileInner {
             superblock,
             addr_offset,
             None,
-            options,
+            properties,
         ))
     }
 
@@ -458,16 +488,16 @@ impl FileInner {
     /// Only the `std` build supports this (it requires a live filesystem
     /// handle); the in-memory [`File::from_bytes`] path cannot refresh.
     pub fn open_swmr<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
-        Self::open_swmr_with_options(path, FileAccessOptions::new())
+        Self::open_swmr_with_options(path, FileAccessProperties::new())
     }
 
-    /// Open an HDF5 file for SWMR reading with explicit access options.
+    /// Open an HDF5 file for SWMR reading with explicit access properties.
     ///
     /// SWMR reads currently keep an in-memory mirror for refresh semantics, so
     /// only the per-dataset chunk-cache settings affect this backend.
     pub fn open_swmr_with_options<P: AsRef<std::path::Path>>(
         path: P,
-        options: FileAccessOptions,
+        properties: FileAccessProperties,
     ) -> Result<Self, Error> {
         let mut handle = std::fs::File::open(path.as_ref()).map_err(Error::Io)?;
         let mut data = Vec::new();
@@ -478,19 +508,19 @@ impl FileInner {
             superblock,
             addr_offset,
             Some(handle),
-            options,
+            properties,
         ))
     }
 
     /// Open an HDF5 file from an in-memory byte vector.
     pub fn from_bytes(data: Vec<u8>) -> Result<Self, Error> {
-        Self::from_bytes_with_options(data, FileAccessOptions::new())
+        Self::from_bytes_with_options(data, FileAccessProperties::new())
     }
 
-    /// Open an HDF5 file from an in-memory byte vector with explicit access options.
+    /// Open an HDF5 file from an in-memory byte vector with explicit access properties.
     pub fn from_bytes_with_options(
         data: Vec<u8>,
-        options: FileAccessOptions,
+        properties: FileAccessProperties,
     ) -> Result<Self, Error> {
         let (superblock, addr_offset) = Self::parse_superblock(&data)?;
         Ok(Self::from_parts(
@@ -498,41 +528,44 @@ impl FileInner {
             superblock,
             addr_offset,
             None,
-            options,
+            properties,
         ))
     }
 
     /// Open an existing HDF5 file for reading **and** in-place editing, applying
-    /// `options` (its [`FileLocking`] policy governs the OS file lock held for
+    /// `properties` (its [`FileLocking`] policy governs the OS file lock held for
     /// the file's life, and its chunk cache is the file-wide default).
     fn open_rw<P: AsRef<std::path::Path>>(
         path: P,
-        options: FileAccessOptions,
+        properties: FileAccessProperties,
     ) -> Result<Self, Error> {
         Self::from_rw_session(
-            WriteEngine::open_with_locking(path, options.locking)?,
-            options,
+            WriteEngine::open_with_locking(path, properties.locking)?,
+            properties,
         )
     }
 
     /// Wrap an opened [`WriteEngine`] as a read-write [`Backend::Mirror`] file.
-    fn from_rw_session(session: WriteEngine, options: FileAccessOptions) -> Result<Self, Error> {
+    fn from_rw_session(
+        session: WriteEngine,
+        properties: FileAccessProperties,
+    ) -> Result<Self, Error> {
         let (superblock, addr_offset) = Self::parse_superblock(session.mirror_bytes())?;
         Ok(Self::from_parts(
             Backend::Mirror(Box::new(Mutex::new(session))),
             superblock,
             addr_offset,
             None,
-            options,
+            properties,
         ))
     }
 
     /// Open for SWMR writing: no OS lock, superblock SWMR-write flag raised.
     fn open_swmr_writer<P: AsRef<std::path::Path>>(
         path: P,
-        options: FileAccessOptions,
+        properties: FileAccessProperties,
     ) -> Result<Self, Error> {
-        let mut inner = Self::from_rw_session(WriteEngine::open_swmr_writer(path)?, options)?;
+        let mut inner = Self::from_rw_session(WriteEngine::open_swmr_writer(path)?, properties)?;
         inner.swmr_write = true;
         Ok(inner)
     }
@@ -541,9 +574,10 @@ impl FileInner {
     /// whole-file mirror; see [`File::open_rw_bounded`].
     fn open_rw_bounded<P: AsRef<std::path::Path>>(
         path: P,
-        options: FileAccessOptions,
+        properties: FileAccessProperties,
     ) -> Result<Self, Error> {
-        let engine = BoundedEngine::open(path.as_ref(), options.metadata_cache, options.locking)?;
+        let engine =
+            BoundedEngine::open(path.as_ref(), properties.metadata_cache, properties.locking)?;
         // A bounded file's base address is validated to be 0 at open, so the
         // store's as-parsed superblock is already in the reader's normalized
         // (absolute-root) form.
@@ -553,7 +587,7 @@ impl FileInner {
             superblock,
             0,
             None,
-            options,
+            properties,
         ))
     }
 
@@ -666,7 +700,7 @@ impl FileInner {
         superblock: Superblock,
         addr_offset: u64,
         handle: Option<std::fs::File>,
-        access_options: FileAccessOptions,
+        access_properties: FileAccessProperties,
     ) -> Self {
         let mut file = FileInner {
             backend,
@@ -674,7 +708,7 @@ impl FileInner {
             addr_offset,
             handle,
             file_space_info: None,
-            access_options,
+            access_properties,
             closed: AtomicBool::new(false),
             swmr_write: false,
         };
@@ -815,9 +849,9 @@ impl FileInner {
         }
     }
 
-    /// Return the access options used when opening this file.
-    pub const fn access_options(&self) -> FileAccessOptions {
-        self.access_options
+    /// Return the access properties used when opening this file.
+    pub const fn access_properties(&self) -> FileAccessProperties {
+        self.access_properties
     }
 
     /// Returns a reference to the parsed superblock.
@@ -964,8 +998,8 @@ impl FileInner {
             .ok_or(FormatError::InvalidObjectReference(rel_addr))?;
         let hdr = file.parse_header(abs)?;
         if has_message(&hdr, MessageType::DataLayout) {
-            let chunk_cache =
-                DatasetAccessOptions::new().resolved_chunk_cache(file.access_options.chunk_cache);
+            let chunk_cache = DatasetAccessProperties::new()
+                .resolved_chunk_cache(file.access_properties.chunk_cache);
             Ok(Object::Dataset(Box::new(Dataset {
                 file: file.clone(),
                 address: abs,
@@ -1478,13 +1512,13 @@ impl File {
         })
     }
 
-    /// Open an HDF5 file from a filesystem path with explicit access options.
+    /// Open an HDF5 file from a filesystem path with explicit access properties.
     pub fn open_with_options<P: AsRef<std::path::Path>>(
         path: P,
-        options: FileAccessOptions,
+        properties: FileAccessProperties,
     ) -> Result<Self, Error> {
         Ok(File {
-            inner: Arc::new(FileInner::open_with_options(path, options)?),
+            inner: Arc::new(FileInner::open_with_options(path, properties)?),
         })
     }
 
@@ -1502,13 +1536,13 @@ impl File {
         })
     }
 
-    /// Open an HDF5 file for streaming reads with explicit access options.
+    /// Open an HDF5 file for streaming reads with explicit access properties.
     pub fn open_streaming_with_options<P: AsRef<std::path::Path>>(
         path: P,
-        options: FileAccessOptions,
+        properties: FileAccessProperties,
     ) -> Result<Self, Error> {
         Ok(File {
-            inner: Arc::new(FileInner::open_streaming_with_options(path, options)?),
+            inner: Arc::new(FileInner::open_streaming_with_options(path, properties)?),
         })
     }
 
@@ -1522,13 +1556,13 @@ impl File {
         })
     }
 
-    /// Open an HDF5 file for SWMR reading with explicit access options.
+    /// Open an HDF5 file for SWMR reading with explicit access properties.
     pub fn open_swmr_with_options<P: AsRef<std::path::Path>>(
         path: P,
-        options: FileAccessOptions,
+        properties: FileAccessProperties,
     ) -> Result<Self, Error> {
         Ok(File {
-            inner: Arc::new(FileInner::open_swmr_with_options(path, options)?),
+            inner: Arc::new(FileInner::open_swmr_with_options(path, properties)?),
         })
     }
 
@@ -1539,13 +1573,13 @@ impl File {
         })
     }
 
-    /// Open an HDF5 file from an in-memory byte vector with explicit access options.
+    /// Open an HDF5 file from an in-memory byte vector with explicit access properties.
     pub fn from_bytes_with_options(
         data: Vec<u8>,
-        options: FileAccessOptions,
+        properties: FileAccessProperties,
     ) -> Result<Self, Error> {
         Ok(File {
-            inner: Arc::new(FileInner::from_bytes_with_options(data, options)?),
+            inner: Arc::new(FileInner::from_bytes_with_options(data, properties)?),
         })
     }
 
@@ -1567,23 +1601,23 @@ impl File {
     /// general case.
     #[doc(alias = "H5Fopen")]
     pub fn open_rw<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
-        Self::open_rw_with_options(path, FileAccessOptions::new())
+        Self::open_rw_with_options(path, FileAccessProperties::new())
     }
 
     /// Open an existing file for reading and in-place editing with explicit
-    /// access options — see [`open_rw`](Self::open_rw).
+    /// access properties — see [`open_rw`](Self::open_rw).
     ///
-    /// The options carry the locking policy (the `H5Pset_file_locking` analogue,
-    /// [`FileAccessOptions::with_locking`]) and the file-wide chunk-cache default
+    /// The properties carry the locking policy (the `H5Pset_file_locking` analogue,
+    /// [`FileAccessProperties::with_locking`]) and the file-wide chunk-cache default
     /// applied to datasets opened from this file. Because one
-    /// [`FileAccessOptions`] value serves every open, the same configuration can
+    /// [`FileAccessProperties`] value serves every open, the same configuration can
     /// be shared with a read path.
     pub fn open_rw_with_options<P: AsRef<std::path::Path>>(
         path: P,
-        options: FileAccessOptions,
+        properties: FileAccessProperties,
     ) -> Result<Self, Error> {
         Ok(File {
-            inner: Arc::new(FileInner::open_rw(path, options)?),
+            inner: Arc::new(FileInner::open_rw(path, properties)?),
         })
     }
 
@@ -1609,21 +1643,21 @@ impl File {
     /// [`Error::SwmrAppendUnsupported`](crate::Error::SwmrAppendUnsupported).
     #[doc(alias = "H5F_ACC_SWMR_WRITE")]
     pub fn open_swmr_writer<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
-        Self::open_swmr_writer_with_options(path, FileAccessOptions::new())
+        Self::open_swmr_writer_with_options(path, FileAccessProperties::new())
     }
 
-    /// Open for SWMR appending with explicit access options — see
+    /// Open for SWMR appending with explicit access properties — see
     /// [`open_swmr_writer`](Self::open_swmr_writer).
     ///
-    /// The options' chunk cache is the file-wide default for datasets opened from
+    /// The properties' chunk cache is the file-wide default for datasets opened from
     /// this file. Its locking policy is ignored: SWMR takes no OS lock by design,
     /// so concurrent readers are never blocked.
     pub fn open_swmr_writer_with_options<P: AsRef<std::path::Path>>(
         path: P,
-        options: FileAccessOptions,
+        properties: FileAccessProperties,
     ) -> Result<Self, Error> {
         Ok(File {
-            inner: Arc::new(FileInner::open_swmr_writer(path, options)?),
+            inner: Arc::new(FileInner::open_swmr_writer(path, properties)?),
         })
     }
 
@@ -1668,11 +1702,11 @@ impl File {
     /// lengths and no userblock; other files are refused at open with
     /// [`Error::EditUnsupported`](crate::Error::EditUnsupported).
     pub fn open_rw_bounded<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
-        Self::open_rw_bounded_with_options(path, FileAccessOptions::new())
+        Self::open_rw_bounded_with_options(path, FileAccessProperties::new())
     }
 
     /// Open a file for bounded-memory reading and appending with explicit
-    /// access options — see [`open_rw_bounded`](Self::open_rw_bounded).
+    /// access properties — see [`open_rw_bounded`](Self::open_rw_bounded).
     ///
     /// Both configured caches apply to this backend: the metadata cache bounds
     /// bytes retained for metadata reads (entries touched by an in-place write
@@ -1680,10 +1714,10 @@ impl File {
     /// cache bounds decompressed chunks retained by each [`Dataset`] handle.
     pub fn open_rw_bounded_with_options<P: AsRef<std::path::Path>>(
         path: P,
-        options: FileAccessOptions,
+        properties: FileAccessProperties,
     ) -> Result<Self, Error> {
         Ok(File {
-            inner: Arc::new(FileInner::open_rw_bounded(path, options)?),
+            inner: Arc::new(FileInner::open_rw_bounded(path, properties)?),
         })
     }
 
@@ -1704,10 +1738,14 @@ impl File {
     /// [`FileBuilder`](crate::FileBuilder) instead.
     #[doc(alias = "H5Fcreate")]
     pub fn create<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
-        Self::create_with_options(path, FileCreateOptions::new(), FileAccessOptions::new())
+        Self::create_with_options(
+            path,
+            FileCreateProperties::new(),
+            FileAccessProperties::new(),
+        )
     }
 
-    /// Create a new, empty HDF5 file with explicit creation and access options,
+    /// Create a new, empty HDF5 file with explicit creation and access properties,
     /// then open it for reading and writing — see [`create`](Self::create).
     ///
     /// Mirrors `H5Fcreate(name, flags, fcpl_id, fapl_id)`: `create` carries the
@@ -1717,17 +1755,17 @@ impl File {
     /// layout defined once can be reused across every file an application writes.
     ///
     /// A creation property is validated as the file is written, so an invalid
-    /// userblock or page size surfaces here rather than when the options were
+    /// userblock or page size surfaces here rather than when the properties were
     /// built. Note that a file created with [`FileSpaceStrategy::Page`] must be
     /// grown through [`open_rw_bounded`](Self::open_rw_bounded): the staged-commit
     /// path does not yet allocate page-aligned (issue #198).
     pub fn create_with_options<P: AsRef<std::path::Path>>(
         path: P,
-        create: FileCreateOptions,
-        access: FileAccessOptions,
+        create: FileCreateProperties,
+        access: FileAccessProperties,
     ) -> Result<Self, Error> {
         let mut builder = crate::writer::FileBuilder::new();
-        builder.with_create_options(create);
+        builder.with_create_properties(create);
         let bytes = builder.finish()?;
         std::fs::write(path.as_ref(), bytes).map_err(Error::Io)?;
         Self::open_rw_with_options(path, access)
@@ -1885,30 +1923,30 @@ impl File {
     /// Resolve a path and return an owned [`Dataset`] handle.
     ///
     /// The dataset uses the file-wide chunk-cache default (configured with
-    /// [`FileAccessOptions::with_chunk_cache`]). To override the cache for this
+    /// [`FileAccessProperties::with_chunk_cache`]). To override the cache for this
     /// one dataset, use [`dataset_with_options`](Self::dataset_with_options).
     pub fn dataset(&self, path: &str) -> Result<Dataset, Error> {
-        self.dataset_with_options(path, DatasetAccessOptions::new())
+        self.dataset_with_options(path, DatasetAccessProperties::new())
     }
 
     /// Resolve a path and return an owned [`Dataset`] handle, applying per-dataset
-    /// [`DatasetAccessOptions`] that override file-wide access defaults.
+    /// [`DatasetAccessProperties`] that override file-wide access defaults.
     ///
-    /// This is the dataset-open-with-access-property-list path (HDF5's DAPL):
-    /// the options' chunk cache corresponds to `H5Pset_chunk_cache` and takes
+    /// This is the dataset-open-with-access-property-list path (HDF5's `dapl`):
+    /// the properties' chunk cache corresponds to `H5Pset_chunk_cache` and takes
     /// precedence, for this dataset only, over the `H5Pset_cache`-style
     /// file-wide default.
     pub fn dataset_with_options(
         &self,
         path: &str,
-        options: DatasetAccessOptions,
+        properties: DatasetAccessProperties,
     ) -> Result<Dataset, Error> {
         let addr = self.inner.resolve_path(path)?;
         let hdr = self.inner.parse_header(addr)?;
         if !has_message(&hdr, MessageType::DataLayout) {
             return Err(Error::NotADataset(path.to_string()));
         }
-        let chunk_cache = options.resolved_chunk_cache(self.inner.access_options.chunk_cache);
+        let chunk_cache = properties.resolved_chunk_cache(self.inner.access_properties.chunk_cache);
         Ok(Dataset {
             file: self.inner.clone(),
             address: addr,
@@ -1951,9 +1989,15 @@ impl File {
         self.inner.as_bytes()
     }
 
-    /// Return the access options used when opening this file.
-    pub fn access_options(&self) -> FileAccessOptions {
-        self.inner.access_options()
+    /// Return the access properties used when opening this file.
+    pub fn access_properties(&self) -> FileAccessProperties {
+        self.inner.access_properties()
+    }
+
+    /// Former name of [`access_properties`](Self::access_properties).
+    #[deprecated(since = "0.26.0", note = "renamed to `access_properties`")]
+    pub fn access_options(&self) -> FileAccessProperties {
+        self.access_properties()
     }
 
     /// Returns a reference to the parsed superblock.
@@ -2223,16 +2267,16 @@ impl Group {
     /// for this one dataset, use
     /// [`dataset_with_options`](Self::dataset_with_options).
     pub fn dataset(&self, name: &str) -> Result<Dataset, Error> {
-        self.dataset_with_options(name, DatasetAccessOptions::new())
+        self.dataset_with_options(name, DatasetAccessProperties::new())
     }
 
     /// Get a dataset within this group by name, applying per-dataset
-    /// [`DatasetAccessOptions`] that override file-wide access defaults (HDF5's
-    /// DAPL; see `H5Pset_chunk_cache`).
+    /// [`DatasetAccessProperties`] that override file-wide access defaults (HDF5's
+    /// `dapl`; see `H5Pset_chunk_cache`).
     pub fn dataset_with_options(
         &self,
         name: &str,
-        options: DatasetAccessOptions,
+        properties: DatasetAccessProperties,
     ) -> Result<Dataset, Error> {
         let entries = self.children()?;
         let entry = entries
@@ -2243,7 +2287,7 @@ impl Group {
         if !has_message(&hdr, MessageType::DataLayout) {
             return Err(Error::NotADataset(name.to_string()));
         }
-        let chunk_cache = options.resolved_chunk_cache(self.file.access_options.chunk_cache);
+        let chunk_cache = properties.resolved_chunk_cache(self.file.access_properties.chunk_cache);
         Ok(Dataset {
             file: self.file.clone(),
             address: entry.object_header_address,
@@ -2794,7 +2838,7 @@ impl Dataset {
 
     /// The effective raw chunk-cache configuration for this dataset.
     ///
-    /// This reflects the per-dataset [`DatasetAccessOptions`] override when one
+    /// This reflects the per-dataset [`DatasetAccessProperties`] override when one
     /// was supplied to [`File::dataset_with_options`] /
     /// [`Group::dataset_with_options`], otherwise the file-wide default. It is
     /// the read-side analogue of HDF5's `H5Pget_chunk_cache`.
@@ -2805,7 +2849,7 @@ impl Dataset {
     /// A point-in-time snapshot of this dataset handle's chunk-cache occupancy.
     ///
     /// Lets callers confirm a chunk-cache configuration (set with
-    /// [`FileAccessOptions::with_chunk_cache`]) is taking effect: after a
+    /// [`FileAccessProperties::with_chunk_cache`]) is taking effect: after a
     /// chunked read, an enabled cache reports a loaded index and retained
     /// chunks; a disabled one (or one over its budget) reports fewer or none.
     /// The cache is per-handle, so a freshly opened [`Dataset`] reports an empty
@@ -3888,14 +3932,14 @@ mod tests {
     fn enabled_override_populates_live_cache_over_disabled_file_default() {
         let file = File::from_bytes_with_options(
             chunked_file_bytes(),
-            FileAccessOptions::new().with_chunk_cache(ChunkCacheConfig::disabled()),
+            FileAccessProperties::new().with_chunk_cache(ChunkCacheConfig::disabled()),
         )
         .unwrap();
 
         let ds = file
             .dataset_with_options(
                 "chunked",
-                DatasetAccessOptions::new().with_chunk_cache(ChunkCacheConfig::new()),
+                DatasetAccessProperties::new().with_chunk_cache(ChunkCacheConfig::new()),
             )
             .unwrap();
         assert_eq!(ds.read_i32().unwrap(), (0..256).collect::<Vec<i32>>());
@@ -3910,14 +3954,14 @@ mod tests {
     fn disabled_override_suppresses_live_cache_over_enabled_file_default() {
         let file = File::from_bytes_with_options(
             chunked_file_bytes(),
-            FileAccessOptions::new().with_chunk_cache(ChunkCacheConfig::new()),
+            FileAccessProperties::new().with_chunk_cache(ChunkCacheConfig::new()),
         )
         .unwrap();
 
         let ds = file
             .dataset_with_options(
                 "chunked",
-                DatasetAccessOptions::new().with_chunk_cache(ChunkCacheConfig::disabled()),
+                DatasetAccessProperties::new().with_chunk_cache(ChunkCacheConfig::disabled()),
             )
             .unwrap();
         assert_eq!(ds.read_i32().unwrap(), (0..256).collect::<Vec<i32>>());

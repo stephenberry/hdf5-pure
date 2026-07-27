@@ -6,7 +6,7 @@
 //! per-open file-locking policy — now work through owned `File` / `Dataset` /
 //! `Group` handles. Plus the post-`close` seal (`Error::FileClosed`).
 
-use hdf5_pure::{AttrValue, Error, File, FileAccessOptions, FileBuilder, FileLocking};
+use hdf5_pure::{AttrValue, Error, File, FileAccessProperties, FileBuilder, FileLocking};
 use tempfile::tempdir;
 
 fn build_simple(path: &std::path::Path, data: &[i32]) {
@@ -159,7 +159,7 @@ fn open_rw_with_locking_disabled_edits() {
 
     let file = File::open_rw_with_options(
         &path,
-        FileAccessOptions::new().with_locking(FileLocking::Disabled),
+        FileAccessProperties::new().with_locking(FileLocking::Disabled),
     )
     .unwrap();
     file.root().create_group("g").unwrap();

@@ -40,7 +40,7 @@ Dataset reads are fully supported across every storage layout:
     - A streaming file cannot be the **source** of a cross-file [`copy_from`](editing.md) — that copy requires a buffered source.
     - Chunk decompression is sequential; the `parallel` feature accelerates only buffered reads.
 
-Streaming opens are read-only. To **append** to a file with the same bounded-memory discipline, open it with [`File::open_rw_bounded`](editing.md#bounded-memory-appends) — the read-write sibling of `open_streaming`, sharing this backend's read capabilities and the `FileAccessOptions` cache budgets below.
+Streaming opens are read-only. To **append** to a file with the same bounded-memory discipline, open it with [`File::open_rw_bounded`](editing.md#bounded-memory-appends) — the read-write sibling of `open_streaming`, sharing this backend's read capabilities and the `FileAccessProperties` cache budgets below.
 
 ## Reading a large dataset a window at a time
 
@@ -65,19 +65,19 @@ The window is clamped to the dataset, so the final short window needs no special
 
 ## Tuning retained memory
 
-`File::open_streaming_with_options(path, FileAccessOptions)` bounds the memory the streaming backend retains. `FileAccessOptions::new()` returns the crate's default access behavior; you layer on two independent caches with its builder methods.
+`File::open_streaming_with_options(path, FileAccessProperties)` bounds the memory the streaming backend retains. `FileAccessProperties::new()` returns the crate's default access behavior; you layer on two independent caches with its builder methods.
 
 `MetadataCacheConfig` mirrors the memory-budget role of HDF5's `H5Pset_mdc_config`: it caps the bytes retained for parsed metadata reads. `MetadataCacheConfig::new(max_bytes)` sets the total byte budget, and `.with_max_entry_bytes(...)` caps the size of any single cached metadata read so one large heap or index block cannot monopolize the cache.
 
 `ChunkCacheConfig` mirrors the raw-data chunk-cache settings from `H5Pset_cache`. `ChunkCacheConfig::from_h5p_cache(rdcc_nslots, rdcc_nbytes)` builds one directly from the familiar HDF5 slot count and byte budget. It controls decompressed chunk data and whether parsed chunk indexes are retained between repeated reads of the same dataset.
 
 ```rust
-use hdf5_pure::{ChunkCacheConfig, File, FileAccessOptions, MetadataCacheConfig};
+use hdf5_pure::{ChunkCacheConfig, File, FileAccessProperties, MetadataCacheConfig};
 
-let options = FileAccessOptions::new()
+let access = FileAccessProperties::new()
     .with_metadata_cache(MetadataCacheConfig::new(8 * 1024 * 1024).with_max_entry_bytes(64 * 1024))
     .with_chunk_cache(ChunkCacheConfig::from_h5p_cache(521, 256 * 1024));
-let file = File::open_streaming_with_options("huge.h5", options).unwrap();
+let file = File::open_streaming_with_options("huge.h5", access).unwrap();
 ```
 
 The chunk cache configured here is the file-wide default; it applies to every dataset opened from this file. The metadata cache only affects streaming opens, since an in-memory open already holds the whole file in one buffer.
@@ -90,14 +90,14 @@ The chunk cache configured here is the file-wide default; it applies to every da
 
 ### Per-dataset overrides
 
-To override the chunk cache for a single dataset, open it with `dataset_with_options(name, DatasetAccessOptions)`. This is the analogue of HDF5's per-dataset access property list (`H5Pset_chunk_cache`). The override replaces the file-wide default for that one dataset; other datasets keep the default. A dataset that is read once front-to-back, for instance, gains nothing from caching its decompressed chunks, so you can disable the cache with `ChunkCacheConfig::disabled()`:
+To override the chunk cache for a single dataset, open it with `dataset_with_options(name, DatasetAccessProperties)`. This is the analogue of HDF5's per-dataset access property list (`H5Pset_chunk_cache`). The override replaces the file-wide default for that one dataset; other datasets keep the default. A dataset that is read once front-to-back, for instance, gains nothing from caching its decompressed chunks, so you can disable the cache with `ChunkCacheConfig::disabled()`:
 
 ```rust
-use hdf5_pure::{ChunkCacheConfig, DatasetAccessOptions, File};
+use hdf5_pure::{ChunkCacheConfig, DatasetAccessProperties, File};
 
 let file = File::open("data.h5").unwrap();
 // This dataset is read once front-to-back: skip caching its decompressed chunks.
-let dapl = DatasetAccessOptions::new().with_chunk_cache(ChunkCacheConfig::disabled());
+let dapl = DatasetAccessProperties::new().with_chunk_cache(ChunkCacheConfig::disabled());
 let ds = file.dataset_with_options("scan", dapl).unwrap();
 let values = ds.read_f64().unwrap();
 ```
@@ -105,7 +105,7 @@ let values = ds.read_f64().unwrap();
 `dataset_with_options` is available on both `File` and `Group`. `Dataset::chunk_cache_config()` reports the effective `ChunkCacheConfig` for an opened dataset (the analogue of `H5Pget_chunk_cache`): the per-dataset override when one was supplied, otherwise the file-wide default.
 
 !!! tip
-    `DatasetAccessOptions::new()` inherits every file-wide access default, so you only set what you want to change.
+    `DatasetAccessProperties::new()` inherits every file-wide access default, so you only set what you want to change.
 
 ## Confirming cache behavior
 

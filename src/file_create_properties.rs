@@ -3,26 +3,33 @@
 use crate::file_space_info::FileSpaceStrategy;
 use crate::libver::LibVer;
 
-/// File-creation options applied when writing a new HDF5 file.
+/// File-creation properties applied when writing a new HDF5 file.
 ///
 /// This is the `hdf5-pure` analogue of an HDF5 **file creation property list**
 /// (`fcpl`): one value carrying every creation-time setting, so application code
 /// can define a file layout once and reuse it everywhere it writes, instead of
 /// repeating a builder call chain and keeping the copies in sync.
 ///
-/// It is named for what it is rather than after the C type: a plain `Copy`
-/// value, with no handle to create or close, no runtime property registry, and
-/// no setter that can fail. The C spellings are doc aliases instead, so a search
-/// for `fcpl` or for an individual `H5Pset_*` still lands here.
+/// The `Properties` suffix means the type stands in for one whole HDF5 property
+/// list, so every setting on it has a C counterpart to look up. It is a stand-in
+/// and not a port: a plain `Copy` value, with no handle to create or close, no
+/// runtime property registry, and no setter that can fail. `fcpl` and each
+/// `H5Pset_*` it models are doc aliases, so a search for either lands here.
 ///
-/// Pass it to [`FileBuilder::with_create_options`](crate::FileBuilder::with_create_options)
+/// One setting crosses the class line. `H5Pset_libver_bounds` is officially a
+/// *file access* property, but this crate checks the bound as the file is
+/// written, so [`with_libver_bounds`](Self::with_libver_bounds) lives here with
+/// the other write-time settings rather than on
+/// [`FileAccessProperties`](crate::FileAccessProperties).
+///
+/// Pass it to [`FileBuilder::with_create_properties`](crate::FileBuilder::with_create_properties)
 /// or [`File::create_with_options`](crate::File::create_with_options). The
 /// equivalent [`FileBuilder`](crate::FileBuilder) methods set the same fields one
 /// at a time and interoperate freely with this.
 ///
 /// Values are recorded as given and checked when the file is written, not when
-/// the options are built — an options value is inert data, so an illegal page
-/// size is reported by `finish`/`write` rather than here. Note that a non-paged
+/// the properties are built — the value is inert data, so an illegal page size
+/// is reported by `finish`/`write` rather than here. Note that a non-paged
 /// userblock size is currently **not** validated against HDF5's power-of-two
 /// rule; see the property-support reference for the exact coverage.
 ///
@@ -33,32 +40,39 @@ use crate::libver::LibVer;
 /// # Examples
 ///
 /// ```no_run
-/// use hdf5_pure::{FileCreateOptions, FileSpaceStrategy};
+/// use hdf5_pure::{FileCreateProperties, FileSpaceStrategy};
 ///
 /// // Define the layout once...
-/// fn paged_layout() -> FileCreateOptions {
-///     FileCreateOptions::new()
+/// fn paged_layout() -> FileCreateProperties {
+///     FileCreateProperties::new()
 ///         .with_file_space_strategy(FileSpaceStrategy::Page, true, 1)
 ///         .with_file_space_page_size(8192)
 /// }
 ///
 /// // ...and reuse it across every write path.
 /// let mut builder = hdf5_pure::FileBuilder::new();
-/// builder.with_create_options(paged_layout());
+/// builder.with_create_properties(paged_layout());
 /// builder.create_dataset("data").with_f64_data(&[1.0, 2.0]);
 /// builder.write("out.h5").unwrap();
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[doc(alias = "fcpl")]
-pub struct FileCreateOptions {
+pub struct FileCreateProperties {
     userblock: u64,
     libver_bounds: Option<(LibVer, LibVer)>,
     file_space_strategy: Option<(FileSpaceStrategy, bool, u64)>,
     file_space_page_size: Option<u64>,
 }
 
-impl FileCreateOptions {
-    /// Create options with the crate's default creation behavior: no userblock,
+/// Former name of [`FileCreateProperties`].
+#[deprecated(
+    since = "0.26.0",
+    note = "renamed to `FileCreateProperties`: a type standing in for a whole HDF5 property list now carries the `Properties` suffix"
+)]
+pub type FileCreateOptions = FileCreateProperties;
+
+impl FileCreateProperties {
+    /// A value carrying the crate's default creation behavior: no userblock,
     /// no library-version bounds, and the writer's default file-space handling.
     pub const fn new() -> Self {
         Self {
@@ -86,6 +100,9 @@ impl FileCreateOptions {
     /// This crate writes exactly one format, so the bound is a compatibility
     /// assertion rather than a format selector — see
     /// [`FileBuilder::with_libver_bounds`](crate::FileBuilder::with_libver_bounds).
+    ///
+    /// HDF5 classes `H5Pset_libver_bounds` as a *file access* property; it sits
+    /// here because this crate checks the bound at write time.
     #[doc(alias = "H5Pset_libver_bounds")]
     pub const fn with_libver_bounds(mut self, low: LibVer, high: LibVer) -> Self {
         self.libver_bounds = Some((low, high));
@@ -135,7 +152,7 @@ impl FileCreateOptions {
     }
 }
 
-impl Default for FileCreateOptions {
+impl Default for FileCreateProperties {
     fn default() -> Self {
         Self::new()
     }

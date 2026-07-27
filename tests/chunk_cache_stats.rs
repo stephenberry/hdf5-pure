@@ -2,7 +2,7 @@
 //! downstream caller confirm their chunk-cache tuning is taking effect, without
 //! reaching into crate internals.
 
-use hdf5_pure::{ChunkCacheConfig, File, FileAccessOptions, FileBuilder};
+use hdf5_pure::{ChunkCacheConfig, File, FileAccessProperties, FileBuilder};
 
 fn chunked_file_bytes() -> Vec<u8> {
     let data: Vec<i32> = (0..256).collect();
@@ -28,7 +28,7 @@ fn fresh_handle_reports_empty_stats_before_any_read() {
 fn enabled_cache_reports_retained_index_and_chunks_after_read() {
     let file = File::from_bytes_with_options(
         chunked_file_bytes(),
-        FileAccessOptions::new().with_chunk_cache(ChunkCacheConfig::new()),
+        FileAccessProperties::new().with_chunk_cache(ChunkCacheConfig::new()),
     )
     .unwrap();
     let ds = file.dataset("chunked").unwrap();
@@ -44,7 +44,7 @@ fn enabled_cache_reports_retained_index_and_chunks_after_read() {
 fn disabled_cache_reports_nothing_retained_after_read() {
     let file = File::from_bytes_with_options(
         chunked_file_bytes(),
-        FileAccessOptions::new().with_chunk_cache(ChunkCacheConfig::disabled()),
+        FileAccessProperties::new().with_chunk_cache(ChunkCacheConfig::disabled()),
     )
     .unwrap();
     let ds = file.dataset("chunked").unwrap();

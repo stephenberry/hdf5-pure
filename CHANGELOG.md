@@ -12,6 +12,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `FormatError::TooManyHugeDenseAttributes` names the one bound the new huge-object path adds, on how many such attributes a single object may carry ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
 - `FormatError::UnexpectedHugeObjectBTree` refuses a fractal heap whose huge-objects B-tree is not the record layout this reader decodes, instead of reading an object ID out of another field's bytes ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
 
+### Changed
+
+- **Breaking:** `FileAccessOptions`, `FileCreateOptions`, and `DatasetAccessOptions` are renamed `FileAccessProperties`, `FileCreateProperties`, and `DatasetAccessProperties`, so that a type standing in for a whole HDF5 property list says so in its name; `FileBuilder::with_create_options` and `File::access_options` follow suit. Deprecated aliases under the old names keep 0.25.0 code compiling for this cycle, and `H5Pset_libver_bounds` is now documented as the file-access property it is ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
+
 ### Fixed
 
 - Reading an object with many huge dense attributes now parses the heap's huge-object index once per walk instead of once per attribute, so the read is no longer quadratic in their number (1,600 such attributes drop from ~164 ms to ~75 ms) ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).

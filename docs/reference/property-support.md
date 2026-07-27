@@ -1,6 +1,16 @@
-# File Property Support (`fapl` / `fcpl`)
+# File Property Support (`fapl` / `fcpl` / `dapl`)
 
-HDF5 configures a file through two property lists: a **file-creation property list** (`fcpl`, passed to `H5Fcreate`) and a **file-access property list** (`fapl`, passed to `H5Fcreate`/`H5Fopen`). `hdf5-pure` does not expose property-list *handles*, but it does model both lists as plain reusable values: `FileCreateOptions` (the `fcpl`) and `FileAccessOptions` (the `fapl`). Build either once and pass it to `FileBuilder::with_create_options` / `File::create_with_options`, or to any `*_with_options` open. The equivalent `FileBuilder` methods set the same creation properties one at a time, and `DatasetAccessOptions` overrides access properties per dataset.
+HDF5 configures a file through property lists: a **file-creation property list** (`fcpl`, passed to `H5Fcreate`), a **file-access property list** (`fapl`, passed to `H5Fcreate`/`H5Fopen`), and a **dataset-access property list** (`dapl`, passed to `H5Dopen`). `hdf5-pure` does not expose property-list *handles*, but it does model all three as plain reusable values: `FileCreateProperties`, `FileAccessProperties`, and `DatasetAccessProperties`. Build one once and pass it to `FileBuilder::with_create_properties` / `File::create_with_options`, to any `*_with_options` open, or to `File::dataset_with_options`. The equivalent `FileBuilder` methods set the same creation properties one at a time.
+
+## How these types are named
+
+A `*Properties` type stands in for **one whole HDF5 property list**, so every setting on it has a C counterpart to look up on this page. Three types carry that suffix: `FileCreateProperties` (`fcpl`), `FileAccessProperties` (`fapl`), and `DatasetAccessProperties` (`dapl`). Where a setting belongs to a *different* HDF5 class than the table it appears in, that table labels it with its real class in parentheses.
+
+"Stands in for" is not "covers": each of the three models a **subset** of its list's properties, and the tables below give the whole picture by listing what is unsupported as well as what works.
+
+The suffix is a positive claim only. A `*Options` or `*Config` type makes **no** claim either way, and some of them do map to C properties: `ChunkCacheConfig` carries the `rdcc_*` values that both `H5Pset_cache` (an `fapl` property) and `H5Pset_chunk_cache` (a `dapl` property) take, so it belongs to no single list; `MetadataCacheConfig` is the analogue of the `H5AC_cache_config_t` *struct* that one `fapl` property accepts, not of a list; and `RepackOptions`, `VlenStringReadOptions`, and `mat::Options` have no HDF5 counterpart at all.
+
+The `*_with_options` constructors keep their names. That suffix marks the explicit-configuration variant of an open, in the ordinary Rust sense of [`OpenOptions`](https://doc.rust-lang.org/std/fs/struct.OpenOptions.html); it does not name a type, and the type is visible in the signature.
 
 This page is the consolidated map from each HDF5 property to what the crate supports. For the file-space details behind the first table, see [File-Space Strategy](../guide/file-space.md); for the read-write access modes, see [Editing in Place](../guide/editing.md) and [Streaming Large Files](../guide/streaming.md).
 
@@ -17,7 +27,7 @@ This page is the consolidated map from each HDF5 property to what the crate supp
 
 ## File-creation properties (`fcpl`)
 
-Set through [`FileBuilder`](../guide/writing.md) before `write` / `finish`, individually or all at once with `FileBuilder::with_create_options(FileCreateOptions)`. `File::create_with_options(path, fcpl, fapl)` applies them on the owned-handle path, mirroring `H5Fcreate(name, flags, fcpl_id, fapl_id)`.
+Set through [`FileBuilder`](../guide/writing.md) before `write` / `finish`, individually or all at once with `FileBuilder::with_create_properties(FileCreateProperties)`. `File::create_with_options(path, fcpl, fapl)` applies them on the owned-handle path, mirroring `H5Fcreate(name, flags, fcpl_id, fapl_id)`.
 
 | HDF5 property (C API) | `hdf5-pure` | Status | Behavior |
 |---|---|---|---|
@@ -27,7 +37,7 @@ Set through [`FileBuilder`](../guide/writing.md) before `write` / `finish`, indi
 | `threshold` | 3rd argument of `with_file_space_strategy` | **Recorded (advisory)** | Round-trips through the C library, but the crate currently tracks every page tail / freed section regardless of it. |
 | `H5Pset_file_space_page_size` | `with_file_space_page_size` | **Genuine** (paged) / **Recorded** (non-paged) | Under `Page` it is the alignment quantum (default 4096; must be a power of two `>= 512`). Under other strategies it is recorded but inert. |
 | `H5Pset_userblock` | `with_userblock` | **Genuine** | Reserves a zero-filled prefix; all addresses are base-relative. The HDF5 "power of two `>= 512`" rule is **not** validated on the non-paged path (a bad size is accepted); under `Page` the userblock must be a whole number of pages or the write is refused. |
-| `H5Pset_libver_bounds` | `with_libver_bounds` | **Assertion** | The writer always emits the v3 (HDF5 1.10) superblock; the bound is an accept/reject check, not a format selector. |
+| `H5Pset_libver_bounds` (fapl) | `with_libver_bounds` | **Assertion** | The writer always emits the v3 (HDF5 1.10) superblock; the bound is an accept/reject check, not a format selector. HDF5 classes this as a *file-access* property; it sits on `FileCreateProperties` because this crate checks the bound at write time. |
 | `H5Pset_fill_value` / `H5Pset_fill_time` (dcpl) | `DatasetBuilder::with_fill_value` | **Genuine** (per dataset) | Encodes the fill value in a v3 Fill Value message; `Dataset::fill_value` reads it back, from this crate's files and the C library's. |
 | `H5Pset_obj_track_times` (ocpl) | none | **Unsupported** | Objects are always written with times untracked (equivalent to `false`); there is no way to enable tracking. |
 | `H5Pset_sym_k` / `H5Pset_istore_k` | none | **N/A** | The v3 superblock omits these fields; groups are always new-style (link messages + v2 object headers). |
@@ -35,7 +45,7 @@ Set through [`FileBuilder`](../guide/writing.md) before `write` / `finish`, indi
 
 ## File-access properties (`fapl`)
 
-Selected through the `File` open-mode constructor, with memory budgets and locking set through `FileAccessOptions` / `DatasetAccessOptions` / `FileLocking`.
+Selected through the `File` open-mode constructor, with memory budgets and locking set through `FileAccessProperties` / `DatasetAccessProperties` / `FileLocking`.
 
 | HDF5 property / driver | `hdf5-pure` | Status | Behavior |
 |---|---|---|---|
@@ -45,12 +55,23 @@ Selected through the `File` open-mode constructor, with memory budgets and locki
 | `H5Fopen(RDWR)` | `File::open_rw` / `open_rw_with_options` | **Genuine (read-write, O(file))** | Whole-file in-memory mirror; reads, appends, and staged edits + `commit`. On a paged file, reads work but commits and appends refuse (grow it via `open_rw_bounded`). |
 | `H5Fopen(RDWR)`, bounded memory | `File::open_rw_bounded` | **Genuine (read-write, bounded)** | Bounded reads + immediate crash-atomic `Dataset::append`. The path for growing a file that persists its free space, **including a paged file**. The staged edit surface returns `Error::BoundedStagedUnsupported`. |
 | `H5F_ACC_SWMR_READ` / `H5F_ACC_SWMR_WRITE` | `File::open_swmr` / `open_swmr_writer` (`*_with_options`) | **Genuine** | No OS lock; the writer raises the superblock SWMR-write flag and appends only. |
-| `H5Pset_file_locking` + `HDF5_USE_FILE_LOCKING` | `FileAccessOptions::with_locking`, `FileLocking` | **Genuine** | Exclusive advisory lock on both read-write paths, mirror and bounded (non-blocking → `Error::FileLocked`); the env var override recognizes the same values as the C library. Readers and the SWMR writer take no lock by design and ignore the setting. |
+| `H5Pset_file_locking` + `HDF5_USE_FILE_LOCKING` | `FileAccessProperties::with_locking`, `FileLocking` | **Genuine** | Exclusive advisory lock on both read-write paths, mirror and bounded (non-blocking → `Error::FileLocked`); the env var override recognizes the same values as the C library. Readers and the SWMR writer take no lock by design and ignore the setting. |
 | `H5Fget_libver_bounds` (read) | `File::libver_bound` | **Read-only** | Reports the low library-version bound the superblock version implies. |
-| `H5Pset_cache` (rdcc) / `H5Pset_chunk_cache` | `FileAccessOptions::with_chunk_cache`, `DatasetAccessOptions::with_chunk_cache` | **Genuine (all backends)** | A decompressed-chunk + parsed-index LRU (default 1 MiB / 16 slots). No write coalescing (a mutation clears it) and no `rdcc_w0` preemption policy. |
-| `H5Pset_mdc_config` | `FileAccessOptions::with_metadata_cache` | **Read-only (partial)** | A byte budget for a metadata-read LRU on the streaming and bounded backends; default off. Only the memory-budget portion of `H5AC_cache_config_t`, none of the adaptive-resize/flush policy. |
+| `H5Pset_cache` (rdcc) / `H5Pset_chunk_cache` (dapl) | `FileAccessProperties::with_chunk_cache`, `DatasetAccessProperties::with_chunk_cache` | **Genuine (all backends)** | A decompressed-chunk + parsed-index LRU (default 1 MiB / 16 slots). No write coalescing (a mutation clears it) and no `rdcc_w0` preemption policy. |
+| `H5Pset_mdc_config` | `FileAccessProperties::with_metadata_cache` | **Read-only (partial)** | A byte budget for a metadata-read LRU on the streaming and bounded backends; default off. Only the memory-budget portion of `H5AC_cache_config_t`, none of the adaptive-resize/flush policy. |
 | `H5Pset_page_buffer_size` | none | **Unsupported** | There is no page buffer and no write buffering; paging is a layout-time concern only. |
 | `H5Pset_fapl_family` / `split` / `multi` / `mpio` / `direct` / `ros3` / `log` | none | **Unsupported** | Only two implicit drivers exist: an in-memory buffer and `Read + Seek` positioned I/O. A multi-file, parallel, or remote-object file is not opened. |
+
+## Dataset-access properties (`dapl`)
+
+Passed to `File::dataset_with_options` / `Group::dataset_with_options` as a `DatasetAccessProperties`, overriding the file-wide access defaults for one dataset.
+
+| HDF5 property (C API) | `hdf5-pure` | Status | Behavior |
+|---|---|---|---|
+| `H5Pset_chunk_cache` | `DatasetAccessProperties::with_chunk_cache` | **Genuine** | Overrides the file-wide chunk cache for this dataset only. Unset means inherit, matching the `H5D_CHUNK_CACHE_*_DEFAULT` sentinels. `rdcc_nslots` and `rdcc_nbytes` map directly; `rdcc_w0` is not modeled, as eviction is strict LRU. |
+| `H5Pset_efile_prefix` / `H5Pset_virtual_prefix` | none | **Unsupported** | External and virtual datasets are not resolved, so there is no prefix to set. |
+| `H5Pset_virtual_view` / `H5Pset_virtual_printf_gap` | none | **Unsupported** | Virtual datasets are not supported. |
+| `H5Pset_append_flush` | none | **Unsupported** | No append callback or per-boundary flush; `Dataset::append` flushes on its own schedule. |
 
 ## Compliance and known limits
 
