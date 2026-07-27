@@ -168,23 +168,76 @@ fn read_object_at_source<S: Source + ?Sized>(
     source.read_metadata_at(addr, len)
 }
 
+/// The v2 B-tree record type for indirectly accessed, non-filtered "huge"
+/// fractal-heap objects: `address(offset_size) + length(length_size) +
+/// id(length_size)`. The only layout [`HugeObjectIndex`] decodes.
+const HUGE_OBJECT_BTREE_TYPE: u8 = 1;
+
+/// Confirm a heap's huge-objects B-tree is the one [`HugeObjectIndex::decode`]
+/// knows how to read, before its records are read as that layout.
+///
+/// The other huge-object record types are unreachable by construction — the
+/// directly accessed ones (3 and 4) resolve out of the heap ID without
+/// consulting any tree, and the filtered ones (2 and 4) belong to heaps refused
+/// at [`HeapObjectReader::huge_reference`] — but that is a fact about the heap
+/// header, and this is the tree's own declaration. A file whose two disagree
+/// would otherwise have its records decoded as a layout they are not, reading
+/// an id out of another field's bytes.
+fn check_huge_object_btree(
+    header: &BTreeV2Header,
+    offset_size: u8,
+    length_size: u8,
+) -> Result<(), FormatError> {
+    let required = offset_size as usize + 2 * length_size as usize;
+    if header.tree_type != HUGE_OBJECT_BTREE_TYPE || (header.record_size as usize) < required {
+        return Err(FormatError::UnexpectedHugeObjectBTree {
+            tree_type: header.tree_type,
+            record_size: header.record_size as usize,
+            required,
+        });
+    }
+    Ok(())
+}
+
 /// Every huge object a heap holds, decoded from its huge-objects v2 B-tree.
 ///
 /// Resolving even one huge object costs the whole index: that B-tree is read by
 /// collecting its records rather than by descending to a key. So the records are
 /// decoded here once, and kept by the [`HeapObjectReader`] that asked for them.
 ///
-/// Only the type-1 record layout appears here — `address(offset_size) +
-/// length(length_size) + id(length_size)`, indirectly accessed and
-/// non-filtered. The directly accessed types carry no id and are never
-/// consulted, since their address and length are in the heap ID itself (see
-/// [`FractalHeapHeader::huge_ids_direct`]), and the filtered types belong to
-/// heaps this reader refuses before reaching any object.
+/// Only the type-1 record layout appears here, which
+/// [`check_huge_object_btree`] establishes before any record reaches this.
 struct HugeObjectIndex {
     /// `(id, address, length)`, ordered by id so a lookup is a binary search.
     /// The B-tree already stores them in that order; sorting again costs one
     /// pass and means correctness here does not rest on that.
     entries: Vec<(u64, u64, u64)>,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// How many huge-object indexes have been decoded on this thread.
+    ///
+    /// Parsing one index per object rather than one per walk returns exactly the
+    /// same objects while making the walk quadratic in their number, so the
+    /// count of decodes is the only thing a test can hold the invariant to. The
+    /// walks build their reader internally, so the count has to be reachable
+    /// from outside the reader that did the decoding; it is per-thread because
+    /// the test harness runs tests concurrently, and each test's walk runs on
+    /// its own thread.
+    static HUGE_INDEX_DECODES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Start counting huge-object index decodes on this thread from zero.
+#[cfg(test)]
+pub(crate) fn reset_huge_index_decodes() {
+    HUGE_INDEX_DECODES.with(|count| count.set(0));
+}
+
+/// How many huge-object indexes this thread has decoded since the last reset.
+#[cfg(test)]
+pub(crate) fn huge_index_decodes() -> usize {
+    HUGE_INDEX_DECODES.with(|count| count.get())
 }
 
 impl HugeObjectIndex {
@@ -193,6 +246,9 @@ impl HugeObjectIndex {
         offset_size: u8,
         length_size: u8,
     ) -> Result<Self, FormatError> {
+        #[cfg(test)]
+        HUGE_INDEX_DECODES.with(|count| count.set(count.get() + 1));
+
         let os = offset_size as usize;
         let ls = length_size as usize;
         let mut entries = Vec::with_capacity(records.len());
@@ -245,11 +301,18 @@ pub struct HeapObjectReader<'h> {
     length_size: u8,
     /// Parsed on demand, since most heaps hold no huge object at all.
     huge: Option<HugeObjectIndex>,
-    /// How many times that index has been parsed. The invariant this type
-    /// exists for is a cost, and a cost leaves no other trace in the objects it
-    /// returns, so the test that pins it counts the parses.
-    #[cfg(test)]
-    index_parses: usize,
+    /// Which backend the cached index was decoded from, once one has been.
+    huge_backend: Option<Backend>,
+}
+
+/// Which of the two ways of reading a file an object came through. Recorded
+/// only to hold a reader to one of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    /// An in-memory image of the whole file.
+    Buffered,
+    /// A [`Source`], read from on demand.
+    Streaming,
 }
 
 impl HeapObjectReader<'_> {
@@ -313,7 +376,18 @@ impl HeapObjectReader<'_> {
 
     /// The `(address, length)` of huge object `huge_id`, parsing the heap's
     /// huge-object index out of `records` the first time one is asked for.
-    fn locate_huge<F>(&mut self, huge_id: u64, records: F) -> Result<(u64, u64), FormatError>
+    ///
+    /// What the index caches are file addresses, resolved against the image
+    /// `backend` names. Every caller reads a whole heap through one backend, so
+    /// a reader that saw both would be a caller that had changed which file it
+    /// meant mid-walk — addresses applied to the wrong image read the wrong
+    /// bytes and report no error, which is worth an assertion where the two meet.
+    fn locate_huge<F>(
+        &mut self,
+        huge_id: u64,
+        backend: Backend,
+        records: F,
+    ) -> Result<(u64, u64), FormatError>
     where
         F: FnOnce() -> Result<Vec<BTreeV2Record>, FormatError>,
     {
@@ -323,11 +397,13 @@ impl HeapObjectReader<'_> {
                 self.offset_size,
                 self.length_size,
             )?);
-            #[cfg(test)]
-            {
-                self.index_parses += 1;
-            }
+            self.huge_backend = Some(backend);
         }
+        debug_assert_eq!(
+            self.huge_backend,
+            Some(backend),
+            "a heap's huge-object index holds addresses into the image it was decoded from",
+        );
         self.huge
             .as_ref()
             .expect("filled immediately above")
@@ -341,9 +417,10 @@ impl HeapObjectReader<'_> {
             HugeReference::Indexed(huge_id) => {
                 let (offset_size, length_size) = (self.offset_size, self.length_size);
                 let btree_addr = self.header.btree_huge_objects_address.to_usize()?;
-                self.locate_huge(huge_id, || {
+                self.locate_huge(huge_id, Backend::Buffered, || {
                     let header =
                         BTreeV2Header::parse(file_data, btree_addr, offset_size, length_size)?;
+                    check_huge_object_btree(&header, offset_size, length_size)?;
                     collect_btree_v2_records(file_data, &header, offset_size, length_size)
                 })?
             }
@@ -362,13 +439,14 @@ impl HeapObjectReader<'_> {
             HugeReference::Indexed(huge_id) => {
                 let (offset_size, length_size) = (self.offset_size, self.length_size);
                 let btree_addr = self.header.btree_huge_objects_address;
-                self.locate_huge(huge_id, || {
+                self.locate_huge(huge_id, Backend::Streaming, || {
                     let header = BTreeV2Header::parse_from_source(
                         source,
                         btree_addr,
                         offset_size,
                         length_size,
                     )?;
+                    check_huge_object_btree(&header, offset_size, length_size)?;
                     collect_btree_v2_records_from_source(source, &header, offset_size, length_size)
                 })?
             }
@@ -701,8 +779,7 @@ impl FractalHeapHeader {
             offset_size,
             length_size,
             huge: None,
-            #[cfg(test)]
-            index_parses: 0,
+            huge_backend: None,
         }
     }
 
@@ -1483,8 +1560,49 @@ mod tests {
         }
     }
 
+    /// A huge-objects B-tree that is not the type-1 layout is refused before its
+    /// records are read as that layout.
+    ///
+    /// Type 2 is the filtered counterpart, whose records are longer and put the
+    /// object ID somewhere else: decoding one as type 1 reads an ID out of the
+    /// filter mask and returns some other object, or none, without complaint.
+    #[test]
+    fn a_huge_object_btree_of_another_type_is_refused() {
+        let btree = |tree_type: u8, record_size: u16| BTreeV2Header {
+            tree_type,
+            node_size: 512,
+            record_size,
+            depth: 0,
+            root_node_address: 0x100,
+            num_records_in_root: 1,
+            total_records: 1,
+        };
+
+        assert_eq!(
+            check_huge_object_btree(&btree(2, 36), 8, 8),
+            Err(FormatError::UnexpectedHugeObjectBTree {
+                tree_type: 2,
+                record_size: 36,
+                required: 24,
+            }),
+            "a filtered huge-object tree is long enough to pass a length check alone"
+        );
+        assert_eq!(
+            check_huge_object_btree(&btree(1, 16), 8, 8),
+            Err(FormatError::UnexpectedHugeObjectBTree {
+                tree_type: 1,
+                record_size: 16,
+                required: 24,
+            }),
+            "records too short for the layout the type claims"
+        );
+        assert_eq!(check_huge_object_btree(&btree(1, 24), 8, 8), Ok(()));
+    }
+
     /// A record too short for the type-1 layout is a heap this reader has
-    /// misread, not one object to skip past.
+    /// misread, not one object to skip past. The backstop behind
+    /// [`check_huge_object_btree`], which refuses such a tree by its declared
+    /// record size before any record reaches the decode.
     #[test]
     fn huge_object_index_refuses_a_truncated_record() {
         let records = vec![BTreeV2Record {
@@ -1538,13 +1656,19 @@ mod tests {
         };
         let ids: Vec<Vec<u8>> = (1..=COUNT).map(heap_id).collect();
 
+        reset_huge_index_decodes();
         let mut reader = heap.object_reader(8, 8);
         let buffered: Vec<Vec<u8>> = ids
             .iter()
             .map(|id| reader.read(&bytes, id).unwrap())
             .collect();
-        assert_eq!(reader.index_parses, 1, "buffered reads re-parsed the index");
+        assert_eq!(
+            huge_index_decodes(),
+            1,
+            "buffered reads re-parsed the index"
+        );
 
+        reset_huge_index_decodes();
         let source = BytesSource::new(bytes.clone());
         let mut reader = heap.object_reader(8, 8);
         let streamed: Vec<Vec<u8>> = ids
@@ -1552,7 +1676,8 @@ mod tests {
             .map(|id| reader.read_from_source(&source, id).unwrap())
             .collect();
         assert_eq!(
-            reader.index_parses, 1,
+            huge_index_decodes(),
+            1,
             "streaming reads re-parsed the index"
         );
 

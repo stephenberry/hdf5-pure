@@ -10,6 +10,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - An attribute of any size is written rather than refused: one too large for an object-header message selects fractal-heap storage on its own, and one too large for a managed heap object becomes a *huge* object. A name, datatype, or dataspace longer than the 2-byte field describing it is still refused, as the new `FormatError::AttributeFieldTooLong` ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
 - `FormatError::TooManyHugeDenseAttributes` names the one bound the new huge-object path adds, on how many such attributes a single object may carry ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
+- `FormatError::UnexpectedHugeObjectBTree` refuses a fractal heap whose huge-objects B-tree is not the record layout this reader decodes, instead of reading an object ID out of another field's bytes ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
 
 ### Fixed
 

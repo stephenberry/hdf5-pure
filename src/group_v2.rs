@@ -564,3 +564,113 @@ mod tests {
         assert!(matches!(err, FormatError::PathNotFound(_)));
     }
 }
+
+/// The dense-link walks hold to the same one-parse-per-walk invariant as the
+/// dense-attribute ones. Gated to 64-bit targets with the reference C library,
+/// which is the only writer that produces a huge *link*: this crate's writer
+/// stores even a 60,000-byte link name as a managed heap object, so the huge
+/// path these tests cover is unreachable from a file it wrote.
+#[cfg(all(test, not(target_pointer_width = "32")))]
+mod huge_link_tests {
+    use super::*;
+    use crate::fractal_heap::{huge_index_decodes, reset_huge_index_decodes};
+    use crate::signature;
+    use crate::source::BytesSource;
+
+    /// A file with one group of `count` links, each name long enough that its
+    /// link message exceeds the heap's managed-object limit and is stored as a
+    /// huge object.
+    fn file_with_huge_links(count: usize) -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge_links.h5");
+        {
+            let file = hdf5::FileBuilder::new()
+                .with_fapl(|fapl| fapl.libver_latest())
+                .create(&path)
+                .unwrap();
+            let group = file.create_group("g").unwrap();
+            for i in 0..count {
+                let name = format!("d{i}_{}", "x".repeat(5000));
+                group
+                    .new_dataset::<i32>()
+                    .shape((1,))
+                    .create(name.as_str())
+                    .unwrap()
+                    .write(&[i as i32])
+                    .unwrap();
+            }
+            file.close().unwrap();
+        }
+        std::fs::read(&path).unwrap()
+    }
+
+    /// Group `g`'s dense-link storage: its info message, its heap address, and
+    /// the file's offset and length sizes.
+    fn dense_link_info(bytes: &[u8]) -> (LinkInfoMessage, u64, u8, u8) {
+        let sig = signature::find_signature(bytes).unwrap();
+        let superblock = Superblock::parse(bytes, sig).unwrap();
+        let (offset_size, length_size) = (superblock.offset_size, superblock.length_size);
+        let group_addr = resolve_path_any(bytes, &superblock, "g").unwrap();
+        let header = ObjectHeader::parse(
+            bytes,
+            group_addr.to_usize().unwrap(),
+            offset_size,
+            length_size,
+        )
+        .unwrap();
+        let link_info = find_link_info(&header, offset_size).unwrap();
+        let fh_addr = link_info
+            .fractal_heap_address
+            .expect("this many long-named links are stored densely");
+        (link_info, fh_addr, offset_size, length_size)
+    }
+
+    /// Both dense-link walks resolve every huge object against one parse of the
+    /// heap's huge-object index, not one parse per link.
+    ///
+    /// Costs, not answers, are what regress here: parsing the index per object
+    /// returns exactly the same links while making the walk quadratic in their
+    /// number, so the count of parses is the only thing that catches it.
+    #[test]
+    fn a_dense_link_walk_parses_its_huge_object_index_once() {
+        // Above the C library's max_compact of 8, so the links are stored densely.
+        const COUNT: usize = 12;
+        let bytes = file_with_huge_links(COUNT);
+        let (link_info, fh_addr, offset_size, length_size) = dense_link_info(&bytes);
+
+        reset_huge_index_decodes();
+        let buffered =
+            resolve_dense_entries(&bytes, &link_info, fh_addr, offset_size, length_size).unwrap();
+        assert_eq!(buffered.len(), COUNT, "the walk must still read every link");
+        assert_eq!(
+            huge_index_decodes(),
+            1,
+            "the buffered walk parsed the huge-object index per link rather than per walk"
+        );
+
+        reset_huge_index_decodes();
+        let source = BytesSource::new(bytes);
+        let streamed = resolve_dense_entries_from_source(
+            &source,
+            &link_info,
+            fh_addr,
+            offset_size,
+            length_size,
+        )
+        .unwrap();
+        assert_eq!(streamed.len(), COUNT);
+        assert_eq!(
+            huge_index_decodes(),
+            1,
+            "the streaming walk parsed the huge-object index per link rather than per walk"
+        );
+
+        let names: Vec<&str> = buffered.iter().map(|e| e.name.as_str()).collect();
+        for (i, entry) in streamed.iter().enumerate() {
+            assert!(
+                names.contains(&entry.name.as_str()),
+                "link {i} differs between the two backends"
+            );
+        }
+    }
+}

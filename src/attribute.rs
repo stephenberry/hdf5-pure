@@ -565,22 +565,25 @@ mod tests {
         builder.finish().unwrap()
     }
 
-    /// The dense walk resolves every huge object against one parse of the
-    /// heap's huge-object index, not one parse per object.
-    ///
-    /// Costs, not answers, are what regress here: reading the index per object
-    /// returns exactly the same attributes while making the walk quadratic in
-    /// their number, so the count of reads is the only thing that catches it.
-    #[test]
-    fn a_dense_walk_parses_its_huge_object_index_once() {
-        const COUNT: usize = 6;
-        let bytes = file_with_huge_attributes(COUNT);
+    /// A file whose root carries `count` attributes small enough to be managed
+    /// heap objects, so the heap holds no huge object at all.
+    fn file_with_managed_attributes(count: usize) -> Vec<u8> {
+        let mut builder = crate::FileBuilder::new();
+        for i in 0..count {
+            builder.set_attr(&format!("a{i}"), crate::AttrValue::I64(i as i64));
+        }
+        builder.create_dataset("x").with_f64_data(&[1.0]);
+        builder.finish().unwrap()
+    }
 
-        let sig = crate::signature::find_signature(&bytes).unwrap();
-        let superblock = crate::superblock::Superblock::parse(&bytes, sig).unwrap();
+    /// The root group's dense-attribute storage: its info message, its heap
+    /// address, and the file's offset and length sizes.
+    fn dense_attribute_info(bytes: &[u8]) -> (AttributeInfoMessage, u64, u8, u8) {
+        let sig = crate::signature::find_signature(bytes).unwrap();
+        let superblock = crate::superblock::Superblock::parse(bytes, sig).unwrap();
         let (offset_size, length_size) = (superblock.offset_size, superblock.length_size);
         let root = ObjectHeader::parse(
-            &bytes,
+            bytes,
             superblock.root_group_address.to_usize().unwrap(),
             offset_size,
             length_size,
@@ -588,10 +591,26 @@ mod tests {
         .unwrap();
         let info = find_attribute_info(&root, offset_size)
             .unwrap()
-            .expect("this many oversized attributes are stored densely");
+            .expect("this many attributes are stored densely");
         let fh_addr = info
             .fractal_heap_address
             .expect("dense storage names its heap");
+        (info, fh_addr, offset_size, length_size)
+    }
+
+    /// The streaming dense walk resolves every huge object against one parse of
+    /// the heap's huge-object index, not one parse per object.
+    ///
+    /// Costs, not answers, are what regress here: reading the index per object
+    /// returns exactly the same attributes while making the walk quadratic in
+    /// their number, so the count of reads is the only thing that catches it.
+    /// This one counts them end to end, at the B-tree's own address, rather than
+    /// on the reader.
+    #[test]
+    fn a_dense_walk_parses_its_huge_object_index_once() {
+        const COUNT: usize = 6;
+        let bytes = file_with_huge_attributes(COUNT);
+        let (info, fh_addr, offset_size, length_size) = dense_attribute_info(&bytes);
         let heap = FractalHeapHeader::parse(
             &bytes,
             fh_addr.to_usize().unwrap(),
@@ -615,6 +634,62 @@ mod tests {
             source.reads_at(btree_addr),
             1,
             "the huge-object B-tree header was re-read per object"
+        );
+    }
+
+    /// The buffered dense walk holds to the same invariant, on the path
+    /// `File::open` takes.
+    ///
+    /// The reader caching the index is only half of it; the other half is each
+    /// walk building one reader for the whole heap rather than one per object,
+    /// and that half is per call site.
+    #[test]
+    fn a_buffered_dense_walk_parses_its_huge_object_index_once() {
+        const COUNT: usize = 6;
+        let bytes = file_with_huge_attributes(COUNT);
+        let (info, fh_addr, offset_size, length_size) = dense_attribute_info(&bytes);
+
+        crate::fractal_heap::reset_huge_index_decodes();
+        let attrs =
+            extract_dense_attributes(&bytes, &info, fh_addr, offset_size, length_size).unwrap();
+
+        assert_eq!(
+            attrs.len(),
+            COUNT,
+            "the walk must still read every attribute"
+        );
+        assert_eq!(
+            crate::fractal_heap::huge_index_decodes(),
+            1,
+            "the huge-object index was parsed per object rather than per walk"
+        );
+    }
+
+    /// A heap holding no huge object never parses a huge-object index, on either
+    /// backend. The index is parsed on demand, and every dense walk that reads
+    /// only managed objects is a walk that must not pay for one.
+    #[test]
+    fn a_managed_dense_walk_never_parses_a_huge_object_index() {
+        // Enough attributes to force dense storage, none of them large enough to
+        // exceed the heap's managed-object limit.
+        const COUNT: usize = 40;
+        let bytes = file_with_managed_attributes(COUNT);
+        let (info, fh_addr, offset_size, length_size) = dense_attribute_info(&bytes);
+
+        crate::fractal_heap::reset_huge_index_decodes();
+        let buffered =
+            extract_dense_attributes(&bytes, &info, fh_addr, offset_size, length_size).unwrap();
+        let source = BytesSource::new(bytes);
+        let streamed =
+            extract_dense_attributes_from_source(&source, &info, fh_addr, offset_size, length_size)
+                .unwrap();
+
+        assert_eq!(buffered.len(), COUNT, "the walk must read every attribute");
+        assert_eq!(streamed.len(), COUNT);
+        assert_eq!(
+            crate::fractal_heap::huge_index_decodes(),
+            0,
+            "a heap with no huge object parsed an index it has no use for"
         );
     }
 

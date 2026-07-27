@@ -258,7 +258,7 @@ const DENSE_ATTR_BTREE_RECORD: usize = 8 + 1 + 4 + 4;
 
 /// One huge-objects B-tree v2 record (type 1, indirectly accessed and
 /// non-filtered): address + length + huge object ID. Matches what
-/// `fractal_heap::find_huge_record` decodes on the way back in.
+/// `fractal_heap::HugeObjectIndex::decode` reads on the way back in.
 const DENSE_ATTR_HUGE_BTREE_RECORD: usize =
     OFFSET_SIZE as usize + LENGTH_SIZE as usize + LENGTH_SIZE as usize;
 
