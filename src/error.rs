@@ -364,10 +364,21 @@ pub enum FormatError {
     /// Reported by the whole-file writer (including through `repack`), which
     /// sends any attribute too large for an object-header message to dense
     /// storage and so reaches this check.
+    ///
+    /// In practice `field` is always `"name"`. Every attribute this crate writes
+    /// is built from an [`AttrValue`](crate::AttrValue) — including the ones
+    /// `repack` carries over, which it refuses outright if it cannot represent
+    /// them — and no variant of it produces a datatype past 20 bytes or a
+    /// dataspace past 12, whatever the data. The other two are still checked,
+    /// because the message encodes all three lengths the same way, and named
+    /// rather than merged so that a datatype which does one day reach the limit
+    /// is diagnosable from the error rather than mistaken for a long name.
     AttributeFieldTooLong {
         /// The attribute's name.
         name: String,
-        /// Which field is too long: `"name"`, `"datatype"` or `"dataspace"`.
+        /// Which of the message's three 2-byte length fields overflowed:
+        /// `"name"`, `"datatype"` or `"dataspace"`. Diagnostic detail rather than
+        /// a discriminator to branch on, since only `"name"` is reachable today.
         field: &'static str,
         /// That field's encoded length in bytes.
         size: usize,
