@@ -10,9 +10,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - An attribute of any size is written rather than refused: one too large for an object-header message selects fractal-heap storage on its own, and one too large for a managed heap object becomes a *huge* object. A name, datatype, or dataspace longer than the 2-byte field describing it is still refused, as the new `FormatError::AttributeFieldTooLong` ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
 - `FormatError::TooManyHugeDenseAttributes` names the one bound the new huge-object path adds, on how many such attributes a single object may carry ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
+- `FormatError::UnexpectedHugeObjectBTree` refuses a fractal heap whose huge-objects B-tree is not the record layout this reader decodes, instead of reading an object ID out of another field's bytes ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
 
 ### Fixed
 
+- Reading an object with many huge dense attributes now parses the heap's huge-object index once per walk instead of once per attribute, so the read is no longer quadratic in their number (1,600 such attributes drop from ~164 ms to ~75 ms) ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
 - A variable-length attribute stored in a fractal heap keeps its values. Written into the heap before its global-heap references had addresses, it read back with its values lost, silently ([#214](https://github.com/stephenberry/hdf5-pure/pull/214)).
 - Dense (fractal-heap) attributes are readable in a file with a userblock, through `File::open`, `File::open_streaming`, `repack` and `copy` alike. The heap address was taken as an absolute file offset rather than one relative to the base address, so the read failed on a file the reference C library reads correctly ([#214](https://github.com/stephenberry/hdf5-pure/pull/214)).
 

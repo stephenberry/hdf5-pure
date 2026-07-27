@@ -156,6 +156,19 @@ pub enum FormatError {
     /// A fractal-heap "huge" object's heap ID referenced a B-tree key that is
     /// not present in the heap's huge-objects v2 B-tree.
     HugeObjectNotFound(u64),
+    /// A fractal heap's huge-objects v2 B-tree is not the indirectly accessed,
+    /// non-filtered layout (record type 1) this reader decodes: either the tree
+    /// declares a different record type, or its records are too short to hold
+    /// that one. Reading its records as that layout would decode an object ID
+    /// out of another field's bytes.
+    UnexpectedHugeObjectBTree {
+        /// The record type the B-tree declares.
+        tree_type: u8,
+        /// The record size the B-tree declares, in bytes.
+        record_size: usize,
+        /// The bytes a type-1 record needs: address + length + object ID.
+        required: usize,
+    },
     /// A fractal-heap object lives in an I/O-filter-encoded heap (filtered
     /// managed or huge storage), whose filtered bytes this reader does not
     /// decode. Link and attribute heaps are never filtered, so this does not
@@ -609,6 +622,17 @@ impl fmt::Display for FormatError {
             }
             FormatError::HugeObjectNotFound(id) => {
                 write!(f, "fractal-heap huge object {id} not found in B-tree")
+            }
+            FormatError::UnexpectedHugeObjectBTree {
+                tree_type,
+                record_size,
+                required,
+            } => {
+                write!(
+                    f,
+                    "fractal-heap huge-objects B-tree is not the expected record type 1: \
+                     type {tree_type}, records of {record_size} bytes (type 1 needs {required})"
+                )
             }
             FormatError::UnsupportedFilteredHeapObject => {
                 write!(f, "filtered fractal-heap objects are not supported")
