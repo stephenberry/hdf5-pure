@@ -13,13 +13,13 @@ A written HDF5 file can record how it manages free space: which allocation strat
 
 `FileBuilder::with_file_space_strategy(strategy, persist, threshold)` records the file-space management strategy, whether free space is persisted across closes, and the smallest free section the managers will track. `with_file_space_page_size(size)` sets the file-space page size used for paged allocation. Both are recorded in the file's superblock extension, so the reference HDF5 C library and a later reopen observe the choice.
 
-Both are also fields on `FileCreateOptions`, the reusable file-creation-property value (the `fcpl` analogue). Build one in a helper, then apply it with `FileBuilder::with_create_options` or `File::create_with_options` wherever a file is written, instead of repeating the call chain:
+Both are also fields on `FileCreateProperties`, the reusable file-creation-property value (the `fcpl` analogue). Build one in a helper, then apply it with `FileBuilder::with_create_properties` or `File::create_with_options` wherever a file is written, instead of repeating the call chain:
 
 ```rust
-use hdf5_pure::{FileCreateOptions, FileSpaceStrategy};
+use hdf5_pure::{FileCreateProperties, FileSpaceStrategy};
 
-fn paged_layout() -> FileCreateOptions {
-    FileCreateOptions::new()
+fn paged_layout() -> FileCreateProperties {
+    FileCreateProperties::new()
         .with_file_space_strategy(FileSpaceStrategy::Page, true, 1)
         .with_file_space_page_size(8192)
 }

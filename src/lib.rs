@@ -150,7 +150,7 @@ pub(crate) mod dataspace;
 pub(crate) mod datatype;
 pub(crate) mod error;
 pub(crate) mod extensible_array;
-pub(crate) mod file_create_options;
+pub(crate) mod file_create_properties;
 pub(crate) mod file_space_info;
 pub(crate) mod file_writer;
 pub(crate) mod fill_value;
@@ -233,9 +233,14 @@ pub use error::{FormatError, OBJECT_HEADER_MESSAGE_MAX};
 
 #[cfg(feature = "std")]
 pub use reader::{
-    Dataset, DatasetAccessOptions, File, FileAccessOptions, Group, Object, StagedGroup, is_hdf5,
-    is_hdf5_bytes,
+    Dataset, DatasetAccessProperties, File, FileAccessProperties, Group, Object, StagedGroup,
+    is_hdf5, is_hdf5_bytes,
 };
+
+// Renamed in 0.26.0; the aliases keep 0.25.0 call sites compiling for one cycle.
+#[cfg(feature = "std")]
+#[allow(deprecated)] // re-exporting the aliases; users still see the deprecation
+pub use reader::{DatasetAccessOptions, FileAccessOptions};
 
 // Curated layout / filter introspection (issue #149). Only the std-only reader
 // `Dataset` produces these, so gate the re-export to match the reader block
@@ -275,7 +280,9 @@ pub use element::H5Element;
 
 pub use scaleoffset::ScaleOffset;
 
-pub use file_create_options::FileCreateOptions;
+#[allow(deprecated)] // re-exporting the alias; users still see the deprecation
+pub use file_create_properties::FileCreateOptions;
+pub use file_create_properties::FileCreateProperties;
 pub use file_space_info::{FileSpaceInfo, FileSpaceStrategy};
 
 // The HDF5 datatype handle returned by the `make_*_type` constructors and

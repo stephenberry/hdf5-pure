@@ -3,7 +3,8 @@
 //! refusals for everything mirror-only.
 
 use hdf5_pure::{
-    AttrValue, Error, File, FileAccessOptions, FileBuilder, FileSpaceStrategy, MetadataCacheConfig,
+    AttrValue, Error, File, FileAccessProperties, FileBuilder, FileSpaceStrategy,
+    MetadataCacheConfig,
 };
 use tempfile::tempdir;
 
@@ -384,7 +385,7 @@ fn metadata_cache_stays_coherent_across_appends() {
     let p = dir.path().join("cache.h5");
     build(&p, 4, 4, false);
     let options =
-        FileAccessOptions::new().with_metadata_cache(MetadataCacheConfig::new(256 * 1024));
+        FileAccessProperties::new().with_metadata_cache(MetadataCacheConfig::new(256 * 1024));
     let file = File::open_rw_bounded_with_options(&p, options).unwrap();
     let mut ds = file.dataset("d").unwrap();
     // Prime the metadata cache with the object-header windows.

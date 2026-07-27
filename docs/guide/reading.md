@@ -46,7 +46,7 @@ let x = file.dataset("x").unwrap().read_f64().unwrap();
 ```
 
 !!! note "Tuning streaming reads"
-    `File::open_streaming_with_options`, `File::open_swmr_with_options`, `File::open_with_options`, and `File::from_bytes_with_options` accept a `FileAccessOptions` to bound retained metadata and chunk-cache memory. See [Streaming](streaming.md) for `MetadataCacheConfig` and `ChunkCacheConfig`.
+    `File::open_streaming_with_options`, `File::open_swmr_with_options`, `File::open_with_options`, and `File::from_bytes_with_options` accept a `FileAccessProperties` to bound retained metadata and chunk-cache memory. See [Streaming](streaming.md) for `MetadataCacheConfig` and `ChunkCacheConfig`.
 
 ## Opening datasets
 
@@ -59,7 +59,7 @@ let file = File::open("output.h5").unwrap();
 let accel = file.dataset("sensors/imu/accel").unwrap();
 ```
 
-A dataset can also be opened by name relative to its parent group via `Group::dataset(name)` (see [Navigating groups](#navigating-groups-and-attributes) below). To override the chunk cache for a single dataset, use `File::dataset_with_options(path, DatasetAccessOptions)`.
+A dataset can also be opened by name relative to its parent group via `Group::dataset(name)` (see [Navigating groups](#navigating-groups-and-attributes) below). To override the chunk cache for a single dataset, use `File::dataset_with_options(path, DatasetAccessProperties)`.
 
 ### Inspecting shape and datatype
 

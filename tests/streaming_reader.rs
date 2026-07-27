@@ -7,7 +7,7 @@
 //! Fixed-Array / Extensible-Array chunked data reads — all from a `Read + Seek`
 //! source that never buffers the whole file.
 
-use hdf5_pure::{ChunkCacheConfig, File, FileAccessOptions, FileBuilder, MetadataCacheConfig};
+use hdf5_pure::{ChunkCacheConfig, File, FileAccessProperties, FileBuilder, MetadataCacheConfig};
 
 #[test]
 fn open_streaming_matches_buffered() {
@@ -102,7 +102,7 @@ fn open_streaming_matches_buffered() {
 }
 
 #[test]
-fn open_streaming_with_access_options_reads_chunked_data() {
+fn open_streaming_with_access_properties_reads_chunked_data() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("streaming_options.h5");
     let data: Vec<i32> = (0..256).map(|i| i * 2).collect();
@@ -116,11 +116,11 @@ fn open_streaming_with_access_options_reads_chunked_data() {
         b.write(&path).unwrap();
     }
 
-    let options = FileAccessOptions::new()
+    let options = FileAccessProperties::new()
         .with_metadata_cache(MetadataCacheConfig::new(4096).with_max_entry_bytes(512))
         .with_chunk_cache(ChunkCacheConfig::disabled());
     let file = File::open_streaming_with_options(&path, options).unwrap();
-    assert_eq!(file.access_options(), options);
+    assert_eq!(file.access_properties(), options);
 
     let dataset = file.dataset("chunked").unwrap();
     assert_eq!(dataset.read_i32().unwrap(), data);

@@ -1,8 +1,8 @@
-//! One `FileAccessOptions` (`fapl`) for every open, and `FileCreateOptions`
+//! One `FileAccessProperties` (`fapl`) for every open, and `FileCreateProperties`
 //! (`fcpl`) as a reusable creation-property value (issues #204, #205).
 
 use hdf5_pure::{
-    ChunkCacheConfig, File, FileAccessOptions, FileBuilder, FileCreateOptions, FileLocking,
+    ChunkCacheConfig, File, FileAccessProperties, FileBuilder, FileCreateProperties, FileLocking,
     FileSpaceStrategy,
 };
 use tempfile::tempdir;
@@ -24,7 +24,7 @@ fn one_options_value_serves_read_and_read_write_opens() {
     let path = dir.path().join("shared.h5");
     write_chunked(&path);
 
-    let options = FileAccessOptions::new()
+    let options = FileAccessProperties::new()
         .with_chunk_cache(ChunkCacheConfig::new().with_max_bytes(1 << 20))
         .with_locking(FileLocking::Disabled);
 
@@ -65,7 +65,7 @@ fn open_rw_honors_the_configured_chunk_cache() {
 
     // Each handle holds an exclusive lock for its life, so scope them.
     {
-        let enabled = FileAccessOptions::new()
+        let enabled = FileAccessProperties::new()
             .with_chunk_cache(ChunkCacheConfig::new().with_max_bytes(1 << 20));
         let file = File::open_rw_with_options(&path, enabled).unwrap();
         let ds = file.dataset("data").unwrap();
@@ -77,7 +77,7 @@ fn open_rw_honors_the_configured_chunk_cache() {
         );
     }
     {
-        let disabled = FileAccessOptions::new().with_chunk_cache(ChunkCacheConfig::disabled());
+        let disabled = FileAccessProperties::new().with_chunk_cache(ChunkCacheConfig::disabled());
         let file = File::open_rw_with_options(&path, disabled).unwrap();
         let ds = file.dataset("data").unwrap();
         ds.read_f64().unwrap();
@@ -97,7 +97,7 @@ fn open_rw_bounded_honors_the_locking_policy() {
     let path = dir.path().join("bounded_lock.h5");
     write_chunked(&path);
 
-    let unlocked = FileAccessOptions::new().with_locking(FileLocking::Disabled);
+    let unlocked = FileAccessProperties::new().with_locking(FileLocking::Disabled);
     let _first = File::open_rw_bounded_with_options(&path, unlocked).unwrap();
     // Nothing is locked, so a second bounded open and a plain read both succeed.
     File::open_rw_bounded_with_options(&path, unlocked)
@@ -122,14 +122,14 @@ fn open_rw_bounded_still_locks_by_default() {
 /// produce the identical file.
 #[test]
 fn create_options_match_the_individual_setters() {
-    let options = FileCreateOptions::new()
+    let options = FileCreateProperties::new()
         .with_userblock(512)
         .with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 8)
         .with_file_space_page_size(4096);
 
     let from_value = {
         let mut b = FileBuilder::new();
-        b.with_create_options(options);
+        b.with_create_properties(options);
         b.create_dataset("d").with_f64_data(&[1.0, 2.0]);
         b.finish().unwrap()
     };
@@ -151,15 +151,15 @@ fn create_options_match_the_individual_setters() {
 /// exists to enable.
 #[test]
 fn create_options_are_reusable_across_files() {
-    fn shared_layout() -> FileCreateOptions {
-        FileCreateOptions::new().with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 4)
+    fn shared_layout() -> FileCreateProperties {
+        FileCreateProperties::new().with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 4)
     }
 
     let dir = tempdir().unwrap();
     for name in ["a.h5", "b.h5"] {
         let path = dir.path().join(name);
         let mut b = FileBuilder::new();
-        b.with_create_options(shared_layout());
+        b.with_create_properties(shared_layout());
         b.create_dataset("d").with_f64_data(&[1.0]);
         b.write(&path).unwrap();
 
@@ -182,8 +182,8 @@ fn create_with_options_records_creation_properties() {
 
     let file = File::create_with_options(
         &path,
-        FileCreateOptions::new().with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 16),
-        FileAccessOptions::new().with_locking(FileLocking::Disabled),
+        FileCreateProperties::new().with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 16),
+        FileAccessProperties::new().with_locking(FileLocking::Disabled),
     )
     .unwrap();
     file.root().create_group("g").unwrap();
@@ -204,7 +204,7 @@ fn create_with_default_options_matches_create() {
     let b = dir.path().join("b.h5");
 
     File::create(&a).unwrap().close().unwrap();
-    File::create_with_options(&b, FileCreateOptions::new(), FileAccessOptions::new())
+    File::create_with_options(&b, FileCreateProperties::new(), FileAccessProperties::new())
         .unwrap()
         .close()
         .unwrap();
@@ -221,7 +221,7 @@ fn create_with_default_options_matches_create() {
 #[test]
 fn invalid_creation_property_is_reported_at_write_time() {
     // A page size must be a power of two >= 512.
-    let options = FileCreateOptions::new()
+    let options = FileCreateProperties::new()
         .with_file_space_strategy(FileSpaceStrategy::Page, true, 1)
         .with_file_space_page_size(700);
     assert_eq!(
@@ -231,7 +231,7 @@ fn invalid_creation_property_is_reported_at_write_time() {
     );
 
     let mut b = FileBuilder::new();
-    b.with_create_options(options);
+    b.with_create_properties(options);
     b.create_dataset("d").with_f64_data(&[1.0]);
     assert!(
         b.finish().is_err(),
@@ -246,11 +246,38 @@ fn invalid_creation_property_is_reported_at_write_time() {
 #[test]
 fn non_paged_userblock_size_is_currently_unvalidated() {
     let mut b = FileBuilder::new();
-    b.with_create_options(FileCreateOptions::new().with_userblock(700));
+    b.with_create_properties(FileCreateProperties::new().with_userblock(700));
     b.create_dataset("d").with_f64_data(&[1.0]);
     assert!(
         b.finish().is_ok(),
         "700 is not a power of two; if this now fails, the writer gained the \
          validation and the property-support reference needs updating"
     );
+}
+
+/// The 0.25.0 spellings still resolve, to the very same types, for one
+/// deprecation cycle (#198). If an alias is dropped or repointed, this stops
+/// compiling — which is the whole guarantee the rename promised.
+#[test]
+#[allow(deprecated)]
+fn deprecated_aliases_resolve_to_the_renamed_types() {
+    use hdf5_pure::{DatasetAccessOptions, FileAccessOptions, FileCreateOptions};
+
+    // Same type, not merely a convertible one: assignment across the two
+    // spellings only compiles if the alias is that exact type.
+    let access: FileAccessProperties = FileAccessOptions::new().with_locking(FileLocking::Disabled);
+    assert_eq!(access.locking(), FileLocking::Disabled);
+
+    let create: FileCreateProperties = FileCreateOptions::new().with_userblock(512);
+    assert_eq!(create.userblock(), 512);
+
+    let dapl: hdf5_pure::DatasetAccessProperties =
+        DatasetAccessOptions::new().with_chunk_cache(ChunkCacheConfig::new());
+    assert!(dapl.chunk_cache().is_some());
+
+    // The renamed builder method and its deprecated shim agree.
+    let mut old = FileBuilder::new();
+    old.with_create_options(create);
+    let mut new = FileBuilder::new();
+    new.with_create_properties(create);
 }

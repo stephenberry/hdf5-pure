@@ -2,7 +2,9 @@
 //! overrides the file-wide `H5Pset_cache`-style chunk-cache default for a single
 //! dataset. See issue #48.
 
-use hdf5_pure::{ChunkCacheConfig, DatasetAccessOptions, File, FileAccessOptions, FileBuilder};
+use hdf5_pure::{
+    ChunkCacheConfig, DatasetAccessProperties, File, FileAccessProperties, FileBuilder,
+};
 
 /// Write a small chunked dataset, plus one nested in a group, and return the
 /// file path (kept alive by the returned `TempDir`).
@@ -33,7 +35,7 @@ fn dataset_without_options_inherits_file_wide_default() {
     let file_default = ChunkCacheConfig::from_h5p_cache(64, 128 * 1024);
     let file = File::open_with_options(
         &path,
-        FileAccessOptions::new().with_chunk_cache(file_default),
+        FileAccessProperties::new().with_chunk_cache(file_default),
     )
     .unwrap();
 
@@ -43,7 +45,7 @@ fn dataset_without_options_inherits_file_wide_default() {
         file_default
     );
     assert_eq!(
-        file.dataset_with_options("chunked", DatasetAccessOptions::new())
+        file.dataset_with_options("chunked", DatasetAccessProperties::new())
             .unwrap()
             .chunk_cache_config(),
         file_default
@@ -59,11 +61,11 @@ fn per_dataset_override_takes_precedence_over_file_default() {
 
     let file = File::open_with_options(
         &path,
-        FileAccessOptions::new().with_chunk_cache(file_default),
+        FileAccessProperties::new().with_chunk_cache(file_default),
     )
     .unwrap();
 
-    let options = DatasetAccessOptions::new().with_chunk_cache(override_cfg);
+    let options = DatasetAccessProperties::new().with_chunk_cache(override_cfg);
     assert_eq!(options.chunk_cache(), Some(override_cfg));
 
     let ds = file.dataset_with_options("chunked", options).unwrap();
@@ -84,7 +86,7 @@ fn override_with_disabled_cache_still_reads_correct_data() {
     let ds = file
         .dataset_with_options(
             "chunked",
-            DatasetAccessOptions::new().with_chunk_cache(ChunkCacheConfig::disabled()),
+            DatasetAccessProperties::new().with_chunk_cache(ChunkCacheConfig::disabled()),
         )
         .unwrap();
     assert_eq!(ds.chunk_cache_config(), ChunkCacheConfig::disabled());
@@ -105,13 +107,13 @@ fn group_dataset_with_options_overrides_chunk_cache() {
     let inherited = group.dataset("inner").unwrap();
     assert_eq!(
         inherited.chunk_cache_config(),
-        file.access_options().chunk_cache()
+        file.access_properties().chunk_cache()
     );
 
     let overridden = group
         .dataset_with_options(
             "inner",
-            DatasetAccessOptions::new().with_chunk_cache(override_cfg),
+            DatasetAccessProperties::new().with_chunk_cache(override_cfg),
         )
         .unwrap();
     assert_eq!(overridden.chunk_cache_config(), override_cfg);
@@ -128,7 +130,7 @@ fn streaming_backend_honors_per_dataset_override() {
     let ds = file
         .dataset_with_options(
             "chunked",
-            DatasetAccessOptions::new().with_chunk_cache(override_cfg),
+            DatasetAccessProperties::new().with_chunk_cache(override_cfg),
         )
         .unwrap();
     assert_eq!(ds.chunk_cache_config(), override_cfg);
@@ -138,6 +140,9 @@ fn streaming_backend_honors_per_dataset_override() {
 
 #[test]
 fn default_options_equal_new() {
-    assert_eq!(DatasetAccessOptions::default(), DatasetAccessOptions::new());
-    assert_eq!(DatasetAccessOptions::new().chunk_cache(), None);
+    assert_eq!(
+        DatasetAccessProperties::default(),
+        DatasetAccessProperties::new()
+    );
+    assert_eq!(DatasetAccessProperties::new().chunk_cache(), None);
 }
