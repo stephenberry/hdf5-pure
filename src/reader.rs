@@ -507,7 +507,10 @@ impl FileInner {
         session: WriteEngine,
         properties: FileAccessProperties,
     ) -> Result<Self, Error> {
-        let (superblock, addr_offset) = Self::parse_superblock(session.mirror_bytes())?;
+        // The engine parsed and normalized this at open; take it rather than
+        // re-parsing, so the image need not be able to hand out a slice.
+        let superblock = session.superblock().clone();
+        let addr_offset = superblock.base_address;
         Ok(Self::from_parts(
             Backend::Mirror(Box::new(Mutex::new(session))),
             superblock,
@@ -605,12 +608,34 @@ impl FileInner {
             Backend::Streaming(s) => f(s.as_ref()),
             Backend::Mirror(m) => {
                 let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                f(&BytesSource::new(core.mirror_bytes()))
+                f(core.image())
             }
             Backend::Bounded(m) => {
                 let engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 f(engine.store())
             }
+        }
+    }
+
+    /// Run a read against a read-write session's file image, choosing the form
+    /// its backing can serve: `on_slice` when the session holds the whole file
+    /// in memory, so a slice-walking parser borrows the bytes instead of copying
+    /// them, and `on_source` otherwise.
+    ///
+    /// Both closures must compute the same thing. The pair exists because a
+    /// mirror can hand out a whole-file slice and a file-backed image cannot,
+    /// not because the two backings answer differently (issue #198).
+    fn with_engine<R>(
+        engine: &Mutex<WriteEngine>,
+        on_slice: impl FnOnce(&[u8]) -> R,
+        on_source: impl FnOnce(&dyn Source) -> R,
+    ) -> R {
+        let core = engine
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match core.image_slice() {
+            Some(data) => on_slice(data),
+            None => on_source(core.image()),
         }
     }
 
@@ -762,15 +787,16 @@ impl FileInner {
             Backend::Streaming(s) => {
                 group_v2::resolve_path_any_from_source(s.as_ref(), &self.superblock, path)?
             }
+            // A staged commit can relocate the object tree's root, so this
+            // file's cached superblock may name a stale one; resolve against the
+            // session's own superblock, which the commit updates.
             Backend::Mirror(m) => {
                 let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let data = core.mirror_bytes();
-                // A staged commit can relocate the object tree's root, so the
-                // cached superblock's root address may be stale; re-parse the
-                // (small, fixed) superblock from the live mirror to resolve
-                // against the committed root.
-                let (sb, _base) = Self::parse_superblock(data)?;
-                group_v2::resolve_path_any(data, &sb, path)?
+                let sb = core.superblock().clone();
+                match core.image_slice() {
+                    Some(data) => group_v2::resolve_path_any(data, &sb, path)?,
+                    None => group_v2::resolve_path_any_from_source(core.image(), &sb, path)?,
+                }
             }
             Backend::Bounded(m) => {
                 // Bounded appends never relocate object headers, so the cached
@@ -783,14 +809,12 @@ impl FileInner {
 
     /// The current root-group address (base-adjusted, absolute). For a read-write
     /// [`Backend::Mirror`] file a prior relocating commit can have moved the
-    /// root, so re-parse the live mirror's superblock; other backends use the
-    /// cached superblock. Falls back to the cached address if the re-parse fails.
+    /// root, so take the session's own superblock, which the commit updates;
+    /// other backends use this file's cached one.
     fn mirror_root_address(&self) -> u64 {
         if let Backend::Mirror(m) = &self.backend {
             let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Ok((sb, _base)) = Self::parse_superblock(core.mirror_bytes()) {
-                return sb.root_group_address;
-            }
+            return core.superblock().root_group_address;
         }
         self.superblock.root_group_address
     }
@@ -891,7 +915,7 @@ impl FileInner {
         match &self.backend {
             Backend::Mirror(m) => {
                 let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                core.mirror_bytes().len() as u64
+                core.image().len()
             }
             Backend::Bounded(m) => {
                 let engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -920,16 +944,11 @@ impl FileInner {
             Backend::Streaming(s) => {
                 ObjectHeader::parse_from_source(s.as_ref(), address, os, ls, self.addr_offset)
             }
-            Backend::Mirror(m) => {
-                let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                ObjectHeader::parse_with_base(
-                    core.mirror_bytes(),
-                    address.to_usize()?,
-                    os,
-                    ls,
-                    self.addr_offset,
-                )
-            }
+            Backend::Mirror(m) => Self::with_engine(
+                m,
+                |d| ObjectHeader::parse_with_base(d, address.to_usize()?, os, ls, self.addr_offset),
+                |s| ObjectHeader::parse_from_source(s, address, os, ls, self.addr_offset),
+            ),
             Backend::Bounded(m) => {
                 let engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 ObjectHeader::parse_from_source(engine.store(), address, os, ls, self.addr_offset)
@@ -993,10 +1012,11 @@ impl FileInner {
             Backend::Streaming(s) => {
                 group_v2::resolve_group_entries_from_source(s.as_ref(), hdr, os, ls, base)
             }
-            Backend::Mirror(m) => {
-                let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                group_v2::resolve_group_entries(core.mirror_bytes(), hdr, os, ls, base)
-            }
+            Backend::Mirror(m) => Self::with_engine(
+                m,
+                |d| group_v2::resolve_group_entries(d, hdr, os, ls, base),
+                |s| group_v2::resolve_group_entries_from_source(s, hdr, os, ls, base),
+            ),
             Backend::Bounded(m) => {
                 let engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 group_v2::resolve_group_entries_from_source(engine.store(), hdr, os, ls, base)
@@ -1023,16 +1043,11 @@ impl FileInner {
         let (os, ls, base) = (self.offset_size(), self.length_size(), self.addr_offset);
         let attr_msgs = self.attr_messages_of(hdr)?;
         match &self.backend {
-            Backend::Mirror(m) => {
-                let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                Ok(attrs_to_map(
-                    &attr_msgs,
-                    &BytesSource::new(core.mirror_bytes()),
-                    os,
-                    ls,
-                    base,
-                ))
-            }
+            Backend::Mirror(m) => Ok(Self::with_engine(
+                m,
+                |d| attrs_to_map(&attr_msgs, &BytesSource::new(d), os, ls, base),
+                |s| attrs_to_map(&attr_msgs, s, os, ls, base),
+            )),
             Backend::Bounded(m) => {
                 let engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 Ok(attrs_to_map(&attr_msgs, engine.store(), os, ls, base))
@@ -1083,15 +1098,18 @@ impl FileInner {
                 };
                 Ok(extract_attributes_full_from_source(&framed, hdr, os, ls)?)
             }
-            Backend::Mirror(m) => {
-                let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                Ok(extract_attributes_full(
-                    frame(core.mirror_bytes(), base)?,
-                    hdr,
-                    os,
-                    ls,
-                )?)
-            }
+            Backend::Mirror(m) => Self::with_engine(
+                m,
+                |d| Ok(extract_attributes_full(frame(d, base)?, hdr, os, ls)?),
+                |s| {
+                    if base == 0 {
+                        Ok(extract_attributes_full_from_source(s, hdr, os, ls)?)
+                    } else {
+                        let framed = BaseOffsetSource { inner: s, base };
+                        Ok(extract_attributes_full_from_source(&framed, hdr, os, ls)?)
+                    }
+                },
+            ),
             Backend::Bounded(m) => {
                 let engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let store = engine.store();
@@ -1153,20 +1171,27 @@ impl FileInner {
                     &framed, dl, ds, dt, pipeline, os, ls, cache,
                 )
             }
-            Backend::Mirror(m) => {
-                let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let data = core.mirror_bytes();
-                let frame = if base == 0 {
-                    data
-                } else {
-                    let start = base.to_usize()?;
-                    data.get(start..).ok_or(FormatError::UnexpectedEof {
-                        expected: start,
-                        available: data.len(),
-                    })?
-                };
-                data_read::read_raw_data_cached(frame, dl, ds, dt, pipeline, os, ls, cache)
-            }
+            Backend::Mirror(m) => Self::with_engine(
+                m,
+                |data| {
+                    let frame = if base == 0 {
+                        data
+                    } else {
+                        let start = base.to_usize()?;
+                        data.get(start..).ok_or(FormatError::UnexpectedEof {
+                            expected: start,
+                            available: data.len(),
+                        })?
+                    };
+                    data_read::read_raw_data_cached(frame, dl, ds, dt, pipeline, os, ls, cache)
+                },
+                |s| {
+                    let framed = BaseOffsetSource { inner: s, base };
+                    data_read::read_raw_data_cached_from_source(
+                        &framed, dl, ds, dt, pipeline, os, ls, cache,
+                    )
+                },
+            ),
             Backend::Bounded(m) => {
                 // A bounded file's base address is validated to 0 at open, so
                 // the store's absolute offsets serve base-relative addresses
@@ -1293,32 +1318,40 @@ impl FileInner {
                     &framed, dl, ds, dt, pipeline, os, ls, cache, start_row, num_rows, row_bytes,
                 )
             }
-            Backend::Mirror(m) => {
-                let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                let data = core.mirror_bytes();
-                let frame = if base == 0 {
-                    data
-                } else {
-                    let start = base.to_usize()?;
-                    data.get(start..).ok_or(FormatError::UnexpectedEof {
-                        expected: start,
-                        available: data.len(),
-                    })?
-                };
-                read_rows_framed(
-                    &BytesSource::new(frame),
-                    dl,
-                    ds,
-                    dt,
-                    pipeline,
-                    os,
-                    ls,
-                    cache,
-                    start_row,
-                    num_rows,
-                    row_bytes,
-                )
-            }
+            Backend::Mirror(m) => Self::with_engine(
+                m,
+                |data| {
+                    let frame = if base == 0 {
+                        data
+                    } else {
+                        let start = base.to_usize()?;
+                        data.get(start..).ok_or(FormatError::UnexpectedEof {
+                            expected: start,
+                            available: data.len(),
+                        })?
+                    };
+                    read_rows_framed(
+                        &BytesSource::new(frame),
+                        dl,
+                        ds,
+                        dt,
+                        pipeline,
+                        os,
+                        ls,
+                        cache,
+                        start_row,
+                        num_rows,
+                        row_bytes,
+                    )
+                },
+                |s| {
+                    let framed = BaseOffsetSource { inner: s, base };
+                    read_rows_framed(
+                        &framed, dl, ds, dt, pipeline, os, ls, cache, start_row, num_rows,
+                        row_bytes,
+                    )
+                },
+            ),
             Backend::Bounded(m) => {
                 // A bounded file's base address is validated to 0 at open, so the
                 // store's absolute offsets serve base-relative addresses directly.

@@ -206,6 +206,8 @@ pub(crate) mod file_lock;
 #[cfg(feature = "std")]
 pub(crate) mod free_space;
 #[cfg(feature = "std")]
+pub(crate) mod image;
+#[cfg(feature = "std")]
 pub(crate) mod reader;
 #[cfg(feature = "std")]
 pub(crate) mod repack;

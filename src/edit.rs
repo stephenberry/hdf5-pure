@@ -157,7 +157,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Read;
 use std::path::Path;
 
 use crate::checksum::jenkins_lookup3;
@@ -191,6 +191,7 @@ use crate::free_space_manager::{
     plan_paged_managers, serialize_file_fsm,
 };
 use crate::group_v2::resolve_group_entries_from_source;
+use crate::image::{FileImage, MirrorImage};
 use crate::link_message::{LinkMessage, LinkTarget};
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
@@ -360,16 +361,16 @@ append_typed! {
 /// models: staged tree edits applied by [`commit`](Self::commit), and immediate
 /// crash-atomic in-place appends ([`append_inplace`](Self::append_inplace)).
 pub(crate) struct WriteEngine {
-    handle: fs::File,
-    /// In-memory mirror of the file, kept byte-for-byte in sync with `handle`.
+    /// The file bytes this session reads and edits, behind the [`FileImage`]
+    /// abstraction: reads go through its [`Source`] impl, and the write side —
+    /// the end-of-file cursor, `append`, `write_at`, `truncate`, and the
+    /// durability barriers — through its own primitives.
     ///
-    /// Every *read* the engine performs against the file image goes through
-    /// [`image`](Self::image), which lends this out as a [`Source`] — no parser
-    /// is handed the whole-file slice any more (issue #198). What still reaches
-    /// in directly is the write side: the end-of-file cursor, `append`,
-    /// `write_at`, and `truncate`, plus [`mirror_bytes`](Self::mirror_bytes) for
-    /// the owned read-write [`File`](crate::File)'s reads.
-    data: Vec<u8>,
+    /// Nothing in the engine assumes the whole file is resident, so one engine
+    /// serves both a whole-file mirror and a file-backed image that holds only
+    /// what it is reading (issue #198). [`image_slice`](Self::image_slice)
+    /// exposes the mirror's buffer where a caller can exploit it.
+    image: Box<dyn FileImage>,
     /// Absolute offset of the superblock signature in the file.
     sb_sig_off: usize,
     /// Parsed superblock. On-disk addresses are stored relative to `base_address`;
@@ -674,13 +675,8 @@ impl WriteEngine {
     pub(crate) fn set_consistency_flags(&mut self, flags: u32) -> Result<(), Error> {
         self.superblock.consistency_flags = flags;
         let bytes = self.superblock.serialize();
-        self.data[self.sb_sig_off..self.sb_sig_off + bytes.len()].copy_from_slice(&bytes);
-        self.handle
-            .seek(SeekFrom::Start(self.sb_sig_off as u64))
-            .map_err(Error::Io)?;
-        self.handle.write_all(&bytes).map_err(Error::Io)?;
-        self.handle.flush().map_err(Error::Io)?;
-        self.handle.sync_data().map_err(Error::Io)?;
+        self.write_at(self.sb_sig_off, &bytes)?;
+        self.image.sync_data()?;
         Ok(())
     }
 
@@ -740,8 +736,7 @@ impl WriteEngine {
             })?;
 
         let mut session = Self {
-            handle,
-            data,
+            image: Box::new(MirrorImage::new(handle, data)),
             sb_sig_off,
             superblock,
             pending_datasets: Vec::new(),
@@ -831,7 +826,7 @@ impl WriteEngine {
             return;
         }
         let os = self.superblock.offset_size;
-        let file_len = self.data.len() as u64;
+        let file_len = self.image.len();
 
         // Seed the free list(s) with every persisted section (addresses are stored
         // relative to the base address, which this editor requires to be 0).
@@ -1173,22 +1168,33 @@ impl WriteEngine {
             || !self.pending_cross_copies.is_empty()
     }
 
-    /// The session's whole-file in-memory mirror, reflecting committed state plus
-    /// immediate in-place appends (not edits still staged for `commit`). Used by
-    /// the owned read-write [`File`](crate::File) to serve reads on a mirror
-    /// backend.
-    pub(crate) fn mirror_bytes(&self) -> &[u8] {
-        &self.data
+    /// This session's file image as one slice, when its backing holds the whole
+    /// file in memory; `None` for a file-backed image.
+    ///
+    /// The slice reflects committed state plus immediate in-place appends, not
+    /// edits still staged for `commit`. The owned read-write
+    /// [`File`](crate::File) uses it to serve reads by borrowing rather than
+    /// copying, and falls back to [`image`](Self::image) when it is absent.
+    pub(crate) fn image_slice(&self) -> Option<&[u8]> {
+        self.image.as_slice()
     }
 
     /// A random-access [`Source`] view of this session's file image, for the
     /// parsers the edit engine drives.
     ///
     /// Every read the engine performs against the file goes through this, so the
-    /// image can become something other than a whole-file mirror without touching
-    /// the parsers themselves (issue #198).
-    fn image(&self) -> BytesSource<&[u8]> {
-        BytesSource::new(&self.data[..])
+    /// image needs to be no more than a source of bytes — whole-file mirror or
+    /// not — without the parsers knowing which (issue #198).
+    pub(crate) fn image(&self) -> &dyn Source {
+        self.image.as_ref()
+    }
+
+    /// This session's parsed superblock, with `root_group_address` normalized to
+    /// an absolute file offset (the open-time convention) and `base_address` the
+    /// userblock size. A relocating commit updates it, so a caller holding a
+    /// clone from an earlier moment may be reading a stale root.
+    pub(crate) fn superblock(&self) -> &Superblock {
+        &self.superblock
     }
 
     /// A snapshot of this session's live space usage — the current file size and
@@ -1232,7 +1238,7 @@ impl WriteEngine {
         };
         let reusable_free_bytes = reusable_free_space.iter().map(|(_, len)| len).sum();
         SpaceAccounting {
-            logical_size: self.data.len() as u64,
+            logical_size: self.image.len(),
             reusable_free_bytes,
             reusable_free_space,
         }
@@ -1319,9 +1325,8 @@ impl WriteEngine {
         // Locate the dataset on the first append (cache miss) against the session's
         // own borrowed mirror — no second lock, no second mirror, no re-read.
         if !self.located.contains_key(&oh_addr) {
-            let mirror = EditMirror {
-                handle: &mut self.handle,
-                data: &mut self.data,
+            let mirror = EditStore {
+                image: self.image.as_mut(),
                 superblock: &mut self.superblock,
                 sb_sig_off: self.sb_sig_off,
             };
@@ -1366,9 +1371,8 @@ impl WriteEngine {
         // mirror-carrying fields, so `self.located` stays independently borrowable.
         let plan_result = {
             let st = &self.located[&oh_addr];
-            let mirror = EditMirror {
-                handle: &mut self.handle,
-                data: &mut self.data,
+            let mirror = EditStore {
+                image: self.image.as_mut(),
                 superblock: &mut self.superblock,
                 sb_sig_off: self.sb_sig_off,
             };
@@ -1388,9 +1392,8 @@ impl WriteEngine {
             .located
             .get_mut(&oh_addr)
             .expect("dataset located above");
-        let mut mirror = EditMirror {
-            handle: &mut self.handle,
-            data: &mut self.data,
+        let mut mirror = EditStore {
+            image: self.image.as_mut(),
             superblock: &mut self.superblock,
             sb_sig_off: self.sb_sig_off,
         };
@@ -1934,7 +1937,7 @@ impl WriteEngine {
             for (data_addr, raw) in &inplace_writes {
                 self.write_at(*data_addr, raw)?;
             }
-            self.handle.sync_all().map_err(Error::Io)?;
+            self.image.sync_all()?;
             return Ok(());
         }
 
@@ -2319,7 +2322,7 @@ impl WriteEngine {
         // as a whole-commit invariant against the pre-commit end-of-file. Any
         // dropped span (which should not occur for a well-formed file) only
         // leaks, never corrupts.
-        retain_disjoint_in_bounds(&mut to_free, self.data.len() as u64);
+        retain_disjoint_in_bounds(&mut to_free, self.image.len());
 
         // --- Apply: process deepest groups first so each parent sees its
         // children's new addresses, then repoint the superblock last.
@@ -2521,11 +2524,11 @@ impl WriteEngine {
         for (a, l, _) in to_free.drain(..) {
             self.free.free(a, l);
         }
-        let cur_eof = self.data.len() as u64;
+        let cur_eof = self.image.len();
         let trunc_to = self.free.take_trailing(cur_eof);
         let new_eof = trunc_to.unwrap_or(cur_eof);
 
-        self.handle.sync_all().map_err(Error::Io)?;
+        self.image.sync_all()?;
         // The root address is stored relative to the base address; the end-of-file
         // address is absolute. After writing the relative root to disk, keep the
         // in-memory `root_group_address` absolute (the open-time convention).
@@ -2543,12 +2546,12 @@ impl WriteEngine {
             new_sb.consistency_flags = 0;
             let sb_bytes = new_sb.serialize();
             self.write_at(self.sb_sig_off, &sb_bytes)?;
-            self.handle.sync_all().map_err(Error::Io)?;
+            self.image.sync_all()?;
             new_sb.root_group_address = new_root;
             self.superblock = new_sb;
         } else {
             self.repoint_v0v1_root(new_root - base, new_eof)?;
-            self.handle.sync_all().map_err(Error::Io)?;
+            self.image.sync_all()?;
             self.superblock.root_group_address = new_root;
             self.superblock.eof_address = new_eof;
         }
@@ -2559,14 +2562,8 @@ impl WriteEngine {
         // mere unreferenced slack, which the next open ignores; the reverse order
         // could advertise an end-of-file past the actual file length.
         if let Some(cut) = trunc_to {
-            self.handle.set_len(cut).map_err(Error::Io)?;
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "cut is a shrink target <= the current file length, which equals \
-                          self.data.len() (a usize)"
-            )]
-            self.data.truncate(cut as usize);
-            self.handle.sync_all().map_err(Error::Io)?;
+            self.image.truncate(cut)?;
+            self.image.sync_all()?;
         }
         Ok(())
     }
@@ -2647,7 +2644,7 @@ impl WriteEngine {
             build_v2_object_header(&self.rewrite_extension_region(old_ext_addr, &placeholder)?)
                 .len() as u64;
 
-        let ext_addr = self.data.len() as u64;
+        let ext_addr = self.image.len();
         let fshd_addr = ext_addr + ext_len;
 
         // Build the real extension and the FSM blocks. With no free space to
@@ -2705,7 +2702,7 @@ impl WriteEngine {
 
         // Barrier, then repoint the superblock (root, eof, and the new extension)
         // — the linearization point — and sync it.
-        self.handle.sync_all().map_err(Error::Io)?;
+        self.image.sync_all()?;
         let mut new_sb = self.superblock.clone();
         new_sb.root_group_address = new_root;
         new_sb.eof_address = final_eof;
@@ -2715,7 +2712,7 @@ impl WriteEngine {
         new_sb.consistency_flags = 0;
         let sb_bytes = new_sb.serialize();
         self.write_at(self.sb_sig_off, &sb_bytes)?;
-        self.handle.sync_all().map_err(Error::Io)?;
+        self.image.sync_all()?;
         self.superblock = new_sb;
 
         // The repoint is durable: the prior free list plus this commit's vacated
@@ -2835,7 +2832,7 @@ impl WriteEngine {
             build_v2_object_header(&self.rewrite_extension_region(old_ext_addr, &placeholder)?)
                 .len() as u64;
 
-        let ext_addr = self.data.len() as u64;
+        let ext_addr = self.image.len();
         debug_assert_eq!(
             ext_addr % page_size,
             0,
@@ -2899,7 +2896,7 @@ impl WriteEngine {
 
         // Barrier, then repoint the superblock (root, eof, and the new extension)
         // — the linearization point — and sync it.
-        self.handle.sync_all().map_err(Error::Io)?;
+        self.image.sync_all()?;
         let mut new_sb = self.superblock.clone();
         new_sb.root_group_address = new_root;
         new_sb.eof_address = final_eof;
@@ -2907,7 +2904,7 @@ impl WriteEngine {
         new_sb.consistency_flags = 0;
         let sb_bytes = new_sb.serialize();
         self.write_at(self.sb_sig_off, &sb_bytes)?;
-        self.handle.sync_all().map_err(Error::Io)?;
+        self.image.sync_all()?;
         self.superblock = new_sb;
 
         // The repoint is durable. Only now are this commit's vacated regions
@@ -2936,7 +2933,7 @@ impl WriteEngine {
     /// recording the padding as free space of the tail page's type. A no-op on a
     /// non-paged file or an already-aligned one.
     fn pad_to_page(&mut self) -> Result<(), Error> {
-        let len = self.data.len() as u64;
+        let len = self.image.len();
         let pad = match &self.paged {
             Some(pg) if len % pg.page_size != 0 => {
                 Some((pg.last, pg.page_size - len % pg.page_size))
@@ -2964,12 +2961,12 @@ impl WriteEngine {
     /// Extend the file with zeros up to `target` (>= the current length), used by
     /// the paged tail to pad the final metadata page to its boundary.
     fn pad_zeros_to(&mut self, target: u64) -> Result<(), Error> {
-        let len = self.data.len() as u64;
+        let len = self.image.len();
         if target > len {
             let pad = (target - len).to_usize()?;
             self.append(&vec![0u8; pad])?;
         }
-        debug_assert_eq!(self.data.len() as u64, target);
+        debug_assert_eq!(self.image.len(), target);
         Ok(())
     }
 
@@ -4346,7 +4343,7 @@ impl WriteEngine {
         // The blob is raw data, and its embedded addresses are computed from the
         // end-of-file it lands at, so open a raw page *before* reading that offset.
         self.begin_page(PageType::Raw)?;
-        let eof = self.data.len() as u64;
+        let eof = self.image.len();
         // Build with the *stored* (base-relative) address the blob will occupy, so
         // its embedded addresses resolve to its real file offset once the reader adds
         // the userblock base back (see `build_chunked_dataset`). On a base-0 file this
@@ -4406,7 +4403,7 @@ impl WriteEngine {
         // computed from the end-of-file it lands at, so open a metadata page
         // *before* reading that offset.
         self.begin_page(PageType::Meta)?;
-        let eof = self.data.len() as u64;
+        let eof = self.image.len();
         // Build with the *stored* (base-relative) address the blob will occupy, so
         // every address it embeds resolves to its real file offset once the reader
         // adds the userblock base back (see `build_chunked_dataset`). On a base-0
@@ -4587,7 +4584,7 @@ impl WriteEngine {
         // the page before reading the offset keeps `begin_page`'s contract: no pad
         // may be inserted after an address the built bytes embed.
         self.begin_page(PageType::Raw)?;
-        let ea_base = self.data.len() as u64 - base;
+        let ea_base = self.image.len() - base;
         let ea_bytes =
             build_extensible_array_at(&combined, OFFSET_SIZE, LENGTH_SIZE, has_filters, ea_base)
                 .map_err(Error::Format)?;
@@ -4616,28 +4613,16 @@ impl WriteEngine {
         self.alloc_or_append_typed(&oh, PageType::Meta)
     }
 
-    /// Append `bytes` at end-of-file, updating both the mirror and the file.
-    /// Returns the absolute address the bytes were written at.
+    /// Append `bytes` at end-of-file, returning the absolute address they were
+    /// written at.
     fn append(&mut self, bytes: &[u8]) -> Result<u64, Error> {
-        // Write to disk before updating the in-memory mirror, so a failed write
-        // never leaves the mirror ahead of the file on disk.
-        let addr = self.data.len() as u64;
-        self.handle.seek(SeekFrom::Start(addr)).map_err(Error::Io)?;
-        self.handle.write_all(bytes).map_err(Error::Io)?;
-        self.data.extend_from_slice(bytes);
-        Ok(addr)
+        self.image.append(bytes)
     }
 
-    /// Overwrite bytes in place at `offset`, updating both the mirror and the
-    /// file. The caller guarantees the range already exists.
+    /// Overwrite bytes in place at `offset`. The caller guarantees the range
+    /// already exists.
     fn write_at(&mut self, offset: usize, bytes: &[u8]) -> Result<(), Error> {
-        // Write to disk before updating the in-memory mirror (see `append`).
-        self.handle
-            .seek(SeekFrom::Start(offset as u64))
-            .map_err(Error::Io)?;
-        self.handle.write_all(bytes).map_err(Error::Io)?;
-        self.data[offset..offset + bytes.len()].copy_from_slice(bytes);
-        Ok(())
+        self.image.write_at(offset as u64, bytes)
     }
 
     /// Ensure the next allocation begins in a page holding page type `ty`, on a
@@ -4658,7 +4643,7 @@ impl WriteEngine {
         // Decide the pad without holding a borrow of `self.paged` across the append.
         // `prev` is the outgoing page type to record the padding under, or `None`
         // for a crash-recovery pad whose tail-page type is unknown.
-        let len = self.data.len() as u64;
+        let len = self.image.len();
         let pad = match &self.paged {
             Some(pg) if len % pg.page_size != 0 => {
                 let pad_len = pg.page_size - len % pg.page_size;
@@ -4679,7 +4664,7 @@ impl WriteEngine {
             _ => None,
         };
         if let Some((prev, pad_len)) = pad {
-            let pad_at = self.data.len() as u64;
+            let pad_at = self.image.len();
             self.append(&vec![0u8; pad_len.to_usize()?])?;
             if let Some(pg) = self.paged.as_mut() {
                 match prev {
@@ -4922,7 +4907,7 @@ impl WriteEngine {
         // The blob is raw data whose embedded addresses are computed from the
         // end-of-file it lands at, so open a raw page *before* reading that offset.
         self.begin_page(PageType::Raw)?;
-        let eof = self.data.len() as u64;
+        let eof = self.image.len();
         // The blob embeds *stored* (base-relative) addresses, so the planner base is
         // the stored address the blob will occupy: its end-of-file offset minus the
         // userblock base. The reader recovers each as `stored + base_address`, which
@@ -5239,7 +5224,7 @@ impl WriteEngine {
             spans.push((addr.checked_add(base)?, len, PageType::Raw));
         }
         let mut plain: Vec<(u64, u64)> = spans.iter().map(|&(a, l, _)| (a, l)).collect();
-        if !spans_disjoint_in_bounds(&mut plain, self.data.len() as u64) {
+        if !spans_disjoint_in_bounds(&mut plain, self.image.len()) {
             return None;
         }
         Some(spans)
@@ -5290,7 +5275,7 @@ impl WriteEngine {
         for (a, _) in &mut spans {
             *a = a.checked_add(base)?;
         }
-        if !spans_disjoint_in_bounds(&mut spans, self.data.len() as u64) {
+        if !spans_disjoint_in_bounds(&mut spans, self.image.len()) {
             return None;
         }
         Some(spans)
@@ -5591,32 +5576,46 @@ struct FlatDataset {
 }
 
 /// A borrow adapter that drives the shared Extensible-Array append engine
-/// ([`crate::chunk_index_inplace`]) against the engine's *own* mirror,
-/// handle, and superblock, so a session runs an immediate O(1) in-place append
-/// without constructing a second writable handle (which would take a second exclusive
-/// lock and keep a divergent mirror). It borrows only the mirror-carrying fields,
-/// leaving [`WriteEngine::located`] independently borrowable. Its primitives write
-/// to disk *before* the mirror — the session's discipline, the opposite of the
-/// append/SWMR writers' mirror-before-disk order; the [`Store`] trait lets
-/// each owner keep its own failure-path discipline while sharing the checksummed
-/// slot/block mechanics.
-struct EditMirror<'a> {
-    handle: &'a mut fs::File,
-    data: &'a mut Vec<u8>,
+/// ([`crate::chunk_index_inplace`]) against the engine's *own* image and
+/// superblock, so a session runs an immediate O(1) in-place append without
+/// constructing a second writable handle (which would take a second exclusive
+/// lock and keep a divergent view of the file). It borrows only those two
+/// fields, leaving [`WriteEngine::located`] independently borrowable.
+///
+/// [`Store`] is the append engine's view of a file — an image *plus* the
+/// superblock, which the image itself knows nothing about. Pairing them here is
+/// all this adapter does; every primitive delegates, so the image's own
+/// write-ordering discipline is what applies.
+///
+/// It takes [`Store`]'s default `append_raw`/`append_meta` — plain end-of-file
+/// appends that do not keep a page homogeneous — because the immediate in-place
+/// append refuses every paged file before reaching here: a non-persisting one
+/// explicitly, and a persisting one through the persist guard that routes it to
+/// the staged commit. The paged-aware appends live on [`WriteEngine`] itself,
+/// which is where a paged file is grown.
+struct EditStore<'a> {
+    image: &'a mut dyn FileImage,
     superblock: &'a mut Superblock,
     sb_sig_off: usize,
 }
 
-impl crate::source::Source for EditMirror<'_> {
+impl crate::source::Source for EditStore<'_> {
     fn len(&self) -> u64 {
-        self.data.len() as u64
+        self.image.len()
     }
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), crate::error::FormatError> {
-        crate::source::BytesSource::new(&self.data[..]).read_at(offset, buf)
+        self.image.read_at(offset, buf)
+    }
+    fn read_metadata_at(
+        &self,
+        offset: u64,
+        len: usize,
+    ) -> Result<Vec<u8>, crate::error::FormatError> {
+        self.image.read_metadata_at(offset, len)
     }
 }
 
-impl Store for EditMirror<'_> {
+impl Store for EditStore<'_> {
     fn offset_size(&self) -> u8 {
         self.superblock.offset_size
     }
@@ -5624,23 +5623,10 @@ impl Store for EditMirror<'_> {
         self.superblock.length_size
     }
     fn append_bytes(&mut self, bytes: &[u8]) -> Result<u64, Error> {
-        // Disk before mirror, so a failed write never leaves the mirror ahead of
-        // the file (matching `WriteEngine::append`).
-        let addr = self.data.len() as u64;
-        self.handle.seek(SeekFrom::Start(addr)).map_err(Error::Io)?;
-        self.handle.write_all(bytes).map_err(Error::Io)?;
-        self.data.extend_from_slice(bytes);
-        Ok(addr)
+        self.image.append(bytes)
     }
     fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Error> {
-        // Disk before mirror (see `append_bytes`).
-        self.handle
-            .seek(SeekFrom::Start(offset))
-            .map_err(Error::Io)?;
-        self.handle.write_all(bytes).map_err(Error::Io)?;
-        let offset = offset.to_usize()?;
-        self.data[offset..offset + bytes.len()].copy_from_slice(bytes);
-        Ok(())
+        self.image.write_at(offset, bytes)
     }
     fn patch_superblock_eof(&mut self) -> Result<(), Error> {
         // Advance only the recorded end-of-file and re-serialize the superblock in
@@ -5648,15 +5634,13 @@ impl Store for EditMirror<'_> {
         // consistency flags and does NOT repoint the root group: base_address is 0
         // for every in-place-append-eligible file, so the normalized-absolute root
         // address serializes back to the same stored value.
-        let eof = self.data.len() as u64;
+        let eof = self.image.len();
         self.superblock.eof_address = eof;
         let bytes = self.superblock.serialize();
         self.write_at(self.sb_sig_off as u64, &bytes)
     }
     fn sync(&mut self) -> Result<(), Error> {
-        self.handle.flush().map_err(Error::Io)?;
-        self.handle.sync_data().map_err(Error::Io)?;
-        Ok(())
+        self.image.sync_data()
     }
 }
 
