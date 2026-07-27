@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `File::open_rw` commits staged edits to a genuine paged file (`H5F_FSPACE_STRATEGY_PAGE`), through a commit that keeps raw data and metadata in separate pages and rewrites the per-page-type free-space managers, so the full edit surface is no longer limited to `File::open_rw_bounded`'s appends. A paged file that does not persist its free space is still refused, by both editors ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
+
 ## [0.26.0] - 2026-07-27
 
 Attributes lose their size ceiling: one too large for an object-header message selects fractal-heap storage on its own, and one too large even for a managed heap object becomes a *huge* object, so `FormatError::DenseAttributeTooLarge` is gone rather than refusing a shape the reference library writes ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)). Three defects on that path are fixed with it: a variable-length attribute stored in a fractal heap silently lost its values, dense attributes were unreadable in a file with a userblock, and reading many of them was quadratic in their number ([#214](https://github.com/stephenberry/hdf5-pure/pull/214), [#195](https://github.com/stephenberry/hdf5-pure/issues/195)). The property-list types are renamed to say what they stand in for — `FileAccessProperties`, `FileCreateProperties`, `DatasetAccessProperties` — and checking each one's settings against the official group pages caught two properties documented under the wrong class ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)). Breaking, but every break is a one-line call-site edit, and deprecated aliases keep 0.25.0 code compiling for this cycle.

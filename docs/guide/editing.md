@@ -35,10 +35,12 @@ The file's [file-space strategy](file-space.md) gates the write paths further. T
 | --- | --- | --- | --- |
 | None recorded, or `FsmAggr` / `Aggr` / `None` with `persist = false` | Yes | Yes | Yes |
 | `FsmAggr` / `Aggr` / `None` with `persist = true` | Yes — freed space is recorded on disk | No — use `Dataset::append_staged` | Yes — managers rewritten at `close` |
-| `Page` with `persist = true` | No — appends via `open_rw_bounded` are the only in-place edit | No — use `open_rw_bounded` | Yes — appends stay page-homogeneous |
+| `Page` with `persist = true` | Yes — page-aware commit, per-page-type managers rewritten | No — use `Dataset::append_staged` | Yes — appends stay page-homogeneous |
 | `Page` with `persist = false` | No | No | No — refused at open; recreate the file with `persist = true` |
 
-The refusals are `Error::EditUnsupported` for a staged `commit` on a paged file and for the bounded open of a non-persisting paged file, and `Error::AppendInPlaceUnsupported` for an immediate `open_rw` append on a persisting or paged file. Each fires before any byte of the file changes. A `Page` / `persist = false` file stays fully readable through every read path and can be rewritten compactly by [repack](repack.md).
+The refusals are `Error::EditUnsupported` for any edit to a paged file that does not persist its free space (through either open), and `Error::AppendInPlaceUnsupported` for an immediate `open_rw` append on a persisting file. Each fires before any byte of the file changes. A `Page` / `persist = false` file stays fully readable through every read path and can be rewritten compactly by [repack](repack.md).
+
+A paged commit through `open_rw` keeps each page homogeneous — raw data and metadata never share a page — and page-aligns the end of allocation, so the reference C library reopens the result as a paged file and recovers its free space. Because a free hole belongs to one page type, such a commit appends rather than reusing holes within the commit; the space is recovered by the manager rewrite at the end of it.
 
 For a brand-new file, use [`FileBuilder`](writing.md); to append while readers are live, use the [SWMR writer](swmr.md); to compact a file or drop objects across a reopen, use [repack](repack.md). The [file properties reference](../reference/property-support.md) has the corresponding fcpl/fapl support matrix.
 

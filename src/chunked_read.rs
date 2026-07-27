@@ -1492,7 +1492,7 @@ pub(crate) fn plan_dense_grid(
 /// the in-place editor uses it to reclaim that space on delete (issue #77).
 ///
 /// `layout` must be a [`DataLayout::Chunked`] (anything else is an error).
-/// Returns an empty vector when the index address is undefined (an empty or
+/// Returns both halves empty when the index address is undefined (an empty or
 /// never-written dataset owns no storage). Errors — propagated from the index
 /// walkers — mean the layout could not be enumerated exhaustively (a version 2
 /// B-tree chunk index, or a malformed structure); the caller then leaves the
@@ -1511,7 +1511,7 @@ pub(crate) fn collect_chunked_storage_spans(
     dataspace: &Dataspace,
     offset_size: u8,
     length_size: u8,
-) -> Result<Vec<(u64, u64)>, FormatError> {
+) -> Result<ChunkedStorageSpans, FormatError> {
     let DataLayout::Chunked {
         chunk_dimensions,
         btree_address,
@@ -1527,7 +1527,10 @@ pub(crate) fn collect_chunked_storage_spans(
     };
     // An undefined index address means no storage is allocated yet.
     let Some(index_addr) = *btree_address else {
-        return Ok(Vec::new());
+        return Ok(ChunkedStorageSpans {
+            data: Vec::new(),
+            index: Vec::new(),
+        });
     };
     if chunk_dimensions.is_empty() {
         return Err(FormatError::ChunkedReadError(
@@ -1547,7 +1550,7 @@ pub(crate) fn collect_chunked_storage_spans(
     }
 
     let source = crate::source::BytesSource::new(file_data);
-    let mut spans: Vec<(u64, u64)> = Vec::new();
+    let mut data: Vec<(u64, u64)> = Vec::new();
 
     // Chunk data blocks (the walkers omit unallocated chunks).
     for ci in collect_chunks_for_layout_from_source(
@@ -1564,12 +1567,12 @@ pub(crate) fn collect_chunked_storage_spans(
         length_size,
     )? {
         if ci.chunk_size != 0 {
-            spans.push((ci.address, ci.chunk_size as u64));
+            data.push((ci.address, ci.chunk_size as u64));
         }
     }
 
     // The chunk index's own structure blocks.
-    spans.extend(collect_chunk_index_spans(
+    let index = collect_chunk_index_spans(
         file_data,
         *version,
         *chunk_index_type,
@@ -1577,8 +1580,23 @@ pub(crate) fn collect_chunked_storage_spans(
         chunk_dimensions.len(),
         offset_size,
         length_size,
-    )?);
-    Ok(spans)
+    )?;
+    Ok(ChunkedStorageSpans { data, index })
+}
+
+/// A chunked dataset's on-disk footprint, split by the two kinds of space it
+/// occupies: `data` holds the chunk data blocks (raw data) and `index` holds the
+/// chunk index's own structure blocks (file metadata).
+///
+/// The split matters to a paged file (`H5F_FSPACE_STRATEGY_PAGE`), which never
+/// mixes raw data and metadata within one page and so tracks the two in separate
+/// free-space managers; a caller reclaiming this dataset's space must route each
+/// kind to the right one. Callers that only need the whole footprint can
+/// concatenate the two.
+#[cfg(feature = "std")]
+pub(crate) struct ChunkedStorageSpans {
+    pub(crate) data: Vec<(u64, u64)>,
+    pub(crate) index: Vec<(u64, u64)>,
 }
 
 /// On-disk byte spans `(addr, len)` of a chunked dataset's index *structure*
