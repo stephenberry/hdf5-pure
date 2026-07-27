@@ -7299,6 +7299,16 @@ mod tests {
             .with_file_space_page_size(4096);
         b.write(&path).unwrap();
 
+        // Read the file's recorded free space *before* opening the session: the
+        // session holds an exclusive OS lock, and on Windows those locks are
+        // mandatory, so a concurrent `File::open` would fail outright.
+        let on_disk: u64 = crate::reader::File::open(&path)
+            .unwrap()
+            .persisted_free_space()
+            .iter()
+            .map(|&(_, l)| l)
+            .sum();
+
         let s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
         let pg = s.paged.as_ref().expect("a paged file installs paged state");
         assert_eq!(pg.page_size, 4096);
@@ -7319,12 +7329,6 @@ mod tests {
         // the free space the file records, and no two sections overlap.
         let mut all = pg.all_sections();
         let flat: u64 = all.iter().map(|&(_, l)| l).sum();
-        let on_disk: u64 = crate::reader::File::open(&path)
-            .unwrap()
-            .persisted_free_space()
-            .iter()
-            .map(|&(_, l)| l)
-            .sum();
         assert_eq!(
             flat, on_disk,
             "the split lists hold exactly the file's free space"
