@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- Reading an object with many huge dense attributes now parses the heap's huge-object index once per walk instead of once per attribute, so the read is no longer quadratic in their number (1,600 such attributes drop from ~164 ms to ~75 ms) ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
 - A variable-length attribute stored in a fractal heap keeps its values. Written into the heap before its global-heap references had addresses, it read back with its values lost, silently ([#214](https://github.com/stephenberry/hdf5-pure/pull/214)).
 - Dense (fractal-heap) attributes are readable in a file with a userblock, through `File::open`, `File::open_streaming`, `repack` and `copy` alike. The heap address was taken as an absolute file offset rather than one relative to the base address, so the read failed on a file the reference C library reads correctly ([#214](https://github.com/stephenberry/hdf5-pure/pull/214)).
 
