@@ -128,49 +128,81 @@ fn large_append_batches_internally() {
     assert!(got.iter().enumerate().all(|(i, &v)| v == i as i32));
 }
 
+/// The whole staged edit surface now runs on a bounded file: it is the same
+/// engine as `open_rw`, differing only in how it holds the file's bytes (issue
+/// #198). Each operation is exercised and its effect read back, so the test
+/// fails if any of them silently no-ops rather than merely returning `Ok`.
 #[test]
-fn staged_surface_returns_typed_error() {
+fn staged_surface_works_on_a_bounded_file() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("staged.h5");
     build(&p, 4, 4, false);
-    let file = File::open_rw_bounded(&p).unwrap();
-    let mut ds = file.dataset("d").unwrap();
-    let root = file.root();
+    {
+        let file = File::open_rw_bounded(&p).unwrap();
+        let mut ds = file.dataset("d").unwrap();
+        let root = file.root();
 
-    assert!(matches!(
-        ds.write(&[9i32, 9, 9, 9]),
-        Err(Error::BoundedStagedUnsupported)
-    ));
-    assert!(matches!(
-        ds.set_attr("units", AttrValue::String("m".into())),
-        Err(Error::BoundedStagedUnsupported)
-    ));
-    assert!(matches!(
-        ds.append_staged(|b| {
-            b.append_i32(&[1]);
-        }),
-        Err(Error::BoundedStagedUnsupported)
-    ));
-    assert!(matches!(
-        root.create_group("g"),
-        Err(Error::BoundedStagedUnsupported)
-    ));
-    assert!(matches!(
-        root.delete("d"),
-        Err(Error::BoundedStagedUnsupported)
-    ));
-    assert!(matches!(
-        file.commit(),
-        Err(Error::BoundedStagedUnsupported)
-    ));
-    assert!(matches!(
-        file.copy("d", "d2"),
-        Err(Error::BoundedStagedUnsupported)
-    ));
-    assert!(matches!(
-        file.space_accounting(),
-        Err(Error::BoundedStagedUnsupported)
-    ));
+        // Transaction 1: a value overwrite and a new group.
+        ds.write(&[9i32, 9, 9, 9]).unwrap();
+        root.create_group("g").unwrap();
+        let before = file.space_accounting().unwrap();
+        assert_eq!(
+            before.logical_size,
+            std::fs::metadata(&p).unwrap().len(),
+            "a bounded session must report the file's real size"
+        );
+        file.commit().unwrap();
+
+        // Transaction 2: copy the (now overwritten) dataset. On its own, so the
+        // copy reads the committed values rather than racing the overwrite.
+        file.copy("d", "d2").unwrap();
+        file.commit().unwrap();
+
+        // Transaction 3: an attribute edit, a staged append that rebuilds the
+        // chunk index rather than growing it in place, and a delete. The
+        // attribute edit relocates its dataset's header, which the engine will
+        // not combine with another edit to the same dataset, so it goes with
+        // edits to *other* objects.
+        ds.set_attr("units", AttrValue::String("m".into())).unwrap();
+        let mut d2 = file.dataset("d2").unwrap();
+        d2.append_staged(|b| {
+            b.append_i32(&[7]);
+        })
+        .unwrap();
+        file.root().delete("g").unwrap();
+        file.commit().unwrap();
+
+        // The delete freed the group's blocks into the session's own free list,
+        // which a bounded session keeps like any other. Reading it back is what
+        // distinguishes a working accounting from one that reports zeroes.
+        let acct = file.space_accounting().unwrap();
+        assert!(
+            acct.reusable_free_bytes > 0,
+            "a committed delete left nothing reusable: {acct:?}"
+        );
+        assert_eq!(
+            acct.reusable_free_bytes,
+            acct.reusable_free_space
+                .iter()
+                .map(|(_, len)| len)
+                .sum::<u64>(),
+            "the total must be the sum of the regions it describes"
+        );
+        file.close().unwrap();
+    }
+
+    let file = File::open(&p).unwrap();
+    let ds = file.dataset("d").unwrap();
+    assert_eq!(ds.read_i32().unwrap(), vec![9, 9, 9, 9]);
+    assert_eq!(
+        ds.attrs().unwrap().get("units").map(|v| format!("{v:?}")),
+        Some(format!("{:?}", AttrValue::String("m".into())))
+    );
+    assert_eq!(
+        file.dataset("d2").unwrap().read_i32().unwrap(),
+        vec![9, 9, 9, 9, 7]
+    );
+    assert!(file.group("g").is_err(), "the deleted group must be gone");
 }
 
 #[test]
@@ -490,4 +522,44 @@ fn chunk_introspection_works_on_bounded_files() {
     ds.append(&[8i32, 9]).unwrap();
     let chunks = file.dataset("d").unwrap().chunks().unwrap();
     assert_eq!(chunks.len(), 3);
+}
+
+/// A bounded commit that frees a run reaching end-of-file truncates the file,
+/// which is the one `FileImage` primitive the bounded backing never exercised
+/// before it shared the edit engine: the old bounded store had no `truncate` at
+/// all. The mirror side has a dozen tests for this; this is the bounded one.
+///
+/// Both commits run in one session, because that is what makes the freed run
+/// reach the end: reuse draws only on regions this session freed.
+#[test]
+fn a_bounded_commit_truncates_when_the_freed_run_reaches_the_end() {
+    let dir = tempdir().unwrap();
+    let p = dir.path().join("truncate.h5");
+    build(&p, 4, 4, false);
+
+    let (grown, shrunk) = {
+        let file = File::open_rw_bounded(&p).unwrap();
+        file.root()
+            .create_dataset("big", |b| {
+                b.with_i32_data(&(0..2000).collect::<Vec<i32>>())
+                    .with_shape(&[2000]);
+            })
+            .unwrap();
+        file.commit().unwrap();
+        let grown = std::fs::metadata(&p).unwrap().len();
+
+        file.root().delete("big").unwrap();
+        file.commit().unwrap();
+        let shrunk = std::fs::metadata(&p).unwrap().len();
+        file.close().unwrap();
+        (grown, shrunk)
+    };
+
+    assert!(
+        shrunk < grown,
+        "deleting the trailing dataset did not shrink the file: {grown} -> {shrunk}"
+    );
+    // The surviving dataset is intact, so the truncate cut slack rather than data.
+    assert_eq!(read_i32(&p), (0..4).collect::<Vec<_>>());
+    assert!(File::open(&p).unwrap().dataset("big").is_err());
 }

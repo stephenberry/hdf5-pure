@@ -9,6 +9,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - `File::open_rw` commits staged edits to a genuine paged file (`H5F_FSPACE_STRATEGY_PAGE`), through a commit that keeps each page homogeneous and rewrites the per-page-type free-space managers, so the full edit surface is no longer limited to `File::open_rw_bounded`'s appends. A paged file is still refused unless it persists its free space and has no userblock ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
+- `File::open_rw_bounded` offers the full staged edit surface — `Dataset::write`, attribute edits, `create_*`/`delete`, `copy`, `commit`, `space_accounting` — at bounded memory: a commit holds only what it is building rather than a whole-file mirror. It still requires a latest-format file with 8-byte offsets and no userblock ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
+- `Dataset::append` grows a file that persists its free space, including a paged one, from `File::open_rw` as well as `File::open_rw_bounded`; the on-disk free-space managers are re-homed when the file is closed ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
+- A `Dataset` reached by object reference can append on either read-write open, not only `File::open_rw_bounded`. It is refused once the session stages or commits an edit, because a commit can move the object header the handle names ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
+
+### Changed
+
+- Dropping a read-write `File` without `close` now re-homes the on-disk free-space managers of a persisting file and flushes, matching what `close` does; previously only `File::open_rw_bounded` handles did this. Staged edits are still discarded on drop ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
+- **Breaking:** `Error::BoundedStagedUnsupported` is removed, along with the refusals that returned it ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
 
 ## [0.26.0] - 2026-07-27
 

@@ -196,7 +196,6 @@ pub(crate) mod nosync;
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "std")]
-pub(crate) mod bounded;
 #[cfg(feature = "std")]
 pub(crate) mod chunk_index_inplace;
 #[cfg(feature = "std")]

@@ -1,9 +1,9 @@
-//! In-place Extensible-Array chunk-index growth, shared by the mirror-backed
-//! edit engine ([`crate::edit`]) and the bounded engine ([`crate::bounded`]) —
-//! the two owners behind [`Dataset::append`](crate::Dataset::append) and
+//! In-place Extensible-Array chunk-index growth, driven by the edit engine
+//! ([`crate::edit`]) over whichever image the session holds — the machinery
+//! behind [`Dataset::append`](crate::Dataset::append) and
 //! [`File::open_swmr_writer`](crate::File::open_swmr_writer).
 //!
-//! Both owners grow a one-dimensional, unlimited, Extensible-Array-indexed
+//! It grows a one-dimensional, unlimited, Extensible-Array-indexed
 //! dataset *in place*: an appended chunk is written at end-of-file, its record is
 //! stored into an element slot of the chunk index, the index grows by appending
 //! new blocks only when a block boundary is crossed (never relocating existing
@@ -105,19 +105,22 @@ pub(crate) trait Store: Source {
     /// later in-place patch of the region lands on bytes that already exist.
     fn append_bytes(&mut self, bytes: &[u8]) -> Result<u64, Error>;
 
-    /// Append `bytes` that are *raw dataset data* (chunk contents). Identical to
-    /// [`append_bytes`](Self::append_bytes) for every store except the paged
-    /// bounded store, which keeps a paged file's pages homogeneous by never letting
-    /// raw and metadata bytes share a page (issue #173): a raw append after a
-    /// metadata one first pads the current metadata page to a page boundary.
+    /// Append `bytes` into a *raw* page. Identical to
+    /// [`append_bytes`](Self::append_bytes) for a non-paged store; on a paged file
+    /// it keeps pages homogeneous by never letting raw and metadata bytes share a
+    /// page (issue #173), padding the tail page first when the page type changes.
+    ///
+    /// Everything this engine allocates goes through here, chunk data and the
+    /// extensible-array blocks indexing it alike. An index block is metadata by the
+    /// format's taxonomy, but on a paged file this crate places a chunked dataset's
+    /// index in raw pages beside its chunk data, and the reclaim path
+    /// (`WriteEngine::chunked_storage_spans`) frees both halves as raw on that
+    /// basis. Allocating an index block into a metadata page here would put a span
+    /// the reclaim reports as raw inside a metadata page, so a later delete would
+    /// advertise metadata-page bytes for raw reuse — the one thing the paged
+    /// strategy exists to prevent, and invisible to the reference library, which
+    /// reads a mixed-page file without complaint (issue #198).
     fn append_raw(&mut self, bytes: &[u8]) -> Result<u64, Error> {
-        self.append_bytes(bytes)
-    }
-
-    /// Append `bytes` that are *file metadata* (extensible-array data/super blocks,
-    /// object headers, free-space-manager blocks). The metadata counterpart of
-    /// [`append_raw`](Self::append_raw); see it for the paged-homogeneity contract.
-    fn append_meta(&mut self, bytes: &[u8]) -> Result<u64, Error> {
         self.append_bytes(bytes)
     }
     /// Overwrite `[offset, offset + bytes.len())` in place.
@@ -707,7 +710,7 @@ impl Located {
             self.blk_off_size,
             self.client_id,
         );
-        let new_addr = file.append_meta(&aesb)?;
+        let new_addr = file.append_raw(&aesb)?;
 
         let slot_off = self.index_block_addr
             + ib_prefix
@@ -738,7 +741,7 @@ impl Located {
         }
         let cks = jenkins_lookup3(&buf);
         buf.extend_from_slice(&cks.to_le_bytes());
-        file.append_meta(&buf)
+        file.append_raw(&buf)
     }
 
     /// Allocate a fresh *paged* data block (`EADB`) at EOF: a header carrying its
@@ -771,7 +774,7 @@ impl Located {
             page.extend_from_slice(&page_cks.to_le_bytes());
             buf.extend_from_slice(&page);
         }
-        file.append_meta(&buf)
+        file.append_raw(&buf)
     }
 
     /// Set page `global_page`'s bit in a super block's page-init bitmap

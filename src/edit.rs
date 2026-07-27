@@ -112,7 +112,7 @@
 //! - A new group's parent must already exist or be created in the same session
 //!   (each level created explicitly); intermediate groups are not auto-created.
 //! - Rows can be appended to an existing chunked, unlimited, Extensible-Array
-//!   dataset **immediately and in place** with `append_inplace` (amortized O(1),
+//!   dataset **immediately and in place** with an in-place append (amortized O(1),
 //!   crash-atomic, no `commit`), interleaved with the staged edits above. A
 //!   target the fast path cannot handle — a userblock or pre-v2 file, an
 //!   unallocated index, a non-Extensible-Array or multi-hard-link dataset, a
@@ -191,12 +191,12 @@ use crate::free_space_manager::{
     plan_paged_managers, serialize_file_fsm,
 };
 use crate::group_v2::resolve_group_entries_from_source;
-use crate::image::{FileImage, MirrorImage};
+use crate::image::{FileImage, HandleImage, MirrorImage};
 use crate::link_message::{LinkMessage, LinkTarget};
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
 use crate::signature;
-use crate::source::{BaseOffsetSource, BytesSource, Source};
+use crate::source::{BaseOffsetSource, BytesSource, MetadataCacheConfig, Source};
 use crate::superblock::Superblock;
 use crate::type_builders::{
     AttrValue, DatasetBuilder, ObjectRefPatch, ObjectRefTarget, VlStringStaging,
@@ -354,12 +354,12 @@ append_typed! {
 }
 
 /// The in-place write engine behind the owned read-write [`File`](crate::File)
-/// (its `Backend::Mirror`).
+/// (its `Backend::Edit`).
 ///
 /// Reads and edits the file through a [`FileImage`], which owns the writable
 /// handle and decides how much of the file is resident. It carries two commit
 /// models: staged tree edits applied by [`commit`](Self::commit), and immediate
-/// crash-atomic in-place appends ([`append_inplace`](Self::append_inplace)).
+/// crash-atomic in-place appends ([`append_inplace_gathered`](Self::append_inplace_gathered)).
 pub(crate) struct WriteEngine {
     /// The file bytes this session reads and edits, behind the [`FileImage`]
     /// abstraction: reads go through its [`Source`] impl, and the write side —
@@ -429,7 +429,7 @@ pub(crate) struct WriteEngine {
     /// free list survives close/reopen.
     persist: Option<PersistState>,
     /// Per-dataset geometry cache for the immediate O(1) in-place append
-    /// ([`append_inplace`](Self::append_inplace)), keyed by the dataset's resolved
+    /// ([`append_inplace_gathered`](Self::append_inplace_gathered)), keyed by the dataset's resolved
     /// **object-header address** (not its path, so two hard links to one dataset
     /// share one entry). Populated on the first append to a dataset and maintained
     /// across appends; cleared wholesale at the entry of every non-trivial
@@ -448,6 +448,37 @@ pub(crate) struct WriteEngine {
     /// (issue #198). A paged file that does not *persist* its free space is still
     /// refused: see [`PagedEdit`].
     paged: Option<PagedEdit>,
+    /// Set by the first [`commit`](Self::commit) that does any work. A commit can
+    /// relocate an object header, and nothing on disk distinguishes a relocated
+    /// header from the intact bytes it vacated — the old header still parses, and
+    /// its data-layout message still points at the live chunk index. An
+    /// [`AppendTarget::Header`] captured before that commit would therefore append
+    /// successfully *into the dead header*, growing its dataspace while the live
+    /// dataset stayed put, and report `Ok`. A path is re-resolved on every append
+    /// and so survives a commit; a raw address does not, so it is refused once one
+    /// has run.
+    committed: bool,
+    /// Object-header address for each path an in-place append has resolved in
+    /// this session. A single `Dataset::append` asks for the target's geometry
+    /// and then appends to it, and a loop of appends repeats that; without this
+    /// the path would be walked from the root on every one of those steps.
+    ///
+    /// An in-place append never moves an object header — that is why
+    /// [`located`](Self::located) can be keyed by address and survive appends —
+    /// so only a commit can stale an entry, and it clears both together.
+    resolved: HashMap<String, u64>,
+    /// Whether this session splits a large in-place append into batches, trading
+    /// whole-call crash atomicity for a peak memory that does not scale with the
+    /// call. Set by [`open_bounded`](Self::open_bounded); see
+    /// [`batch_elems`](Self::batch_elems).
+    batched_appends: bool,
+    /// The file length when the on-disk free-space managers were last written,
+    /// for a file that persists them. Every immediate in-place append grows the
+    /// file past those managers and leaves them mid-file, so a session that ends
+    /// with `image.len() != fsm_len` owes a rewrite; that is what
+    /// [`finalize_persist`](Self::finalize_persist) settles at close. Meaningless
+    /// (and untouched) when `persist` is `None`.
+    fsm_len: u64,
 }
 
 /// Paged-file bookkeeping for the whole-file editor (issue #198, step 1).
@@ -481,6 +512,57 @@ struct PagedEdit {
 }
 
 impl PagedEdit {
+    /// Ensure the next allocation on `image` begins in a page holding page type
+    /// `ty`: when the tail page holds the *other* type and is only partially
+    /// filled, pad it to a page boundary and record the padding as free space of
+    /// the outgoing type.
+    ///
+    /// This is the whole of the paged-append rule, and it lives here so the two
+    /// places that grow a paged file — the staged commit through
+    /// [`WriteEngine::begin_page`](WriteEngine::begin_page), and the shared
+    /// Extensible-Array append engine through [`EditStore`] — cannot drift. They
+    /// used to keep separate copies of this state, one per engine, which is what
+    /// made an in-place append to a paged file unsafe from the whole-file editor
+    /// (issue #198).
+    ///
+    /// Call it **before** reading the image's end-of-file to compute an address
+    /// that will be embedded in the bytes being built: several callers build
+    /// content whose interior addresses assume it lands at the current
+    /// end-of-file, and padding inserted after that read would shift the landing
+    /// address out from under them.
+    fn begin(&mut self, image: &mut dyn FileImage, ty: PageType) -> Result<(), Error> {
+        let len = image.len();
+        if len % self.page_size != 0 {
+            let pad_len = self.page_size - len % self.page_size;
+            // `prev` is the outgoing page type to record the padding under, or
+            // `None` for a crash-recovery pad whose tail-page type is unknown.
+            let pad = match self.last {
+                // Normal case: the tail page holds a known type; pad only on a
+                // type switch, recording the tail as free of the outgoing type.
+                Some(prev) if prev != ty => Some(Some(prev)),
+                Some(_) => None, // same type: keep packing the tail page
+                // A previous session grew this paged file and was killed before
+                // its tail was page-aligned, so the file opened non-page-aligned
+                // with no known tail type. Pad it up (extending whatever the tail
+                // page holds, so the page stays homogeneous) and leave the padding
+                // untracked, since recording it under the wrong page type could
+                // let a reader reuse it and mix the page.
+                None => Some(None),
+            };
+            if let Some(prev) = pad {
+                let pad_at = len;
+                image.append(&vec![0u8; pad_len.to_usize()?])?;
+                match prev {
+                    Some(PageType::Meta) => self.meta_pad.push((pad_at, pad_len)),
+                    Some(PageType::Raw) => self.raw_pad.push((pad_at, pad_len)),
+                    None => {} // crash-recovery pad: untracked (tail type unknown)
+                }
+            }
+        }
+        self.last = Some(ty);
+        Ok(())
+    }
+
     fn new(page_size: u64) -> Self {
         PagedEdit {
             page_size,
@@ -528,6 +610,41 @@ impl PagedEdit {
         out.sort_by_key(|&(addr, _)| addr);
         out
     }
+}
+
+/// What an in-place append names its target by.
+///
+/// A handle with a resolvable path uses it, which lets the session compare the
+/// target against its own staged edits. A handle reached by object reference has
+/// no path, so it names the dataset by the object-header address it was reached
+/// through — the same key the geometry cache uses.
+#[derive(Clone, Copy)]
+pub(crate) enum AppendTarget<'a> {
+    Path(&'a str),
+    Header(u64),
+}
+
+/// Byte budget for one append batch on a session that batches: a large append is
+/// split into whole-chunk batches of at most this many raw bytes (always at least
+/// one chunk), each applied as its own crash-atomic fsync-barriered sequence, so
+/// peak append memory never scales with the caller's slice.
+const APPEND_BATCH_BYTES: u64 = 1 << 20;
+
+/// One dataset's append geometry, handed to the public append path so it can
+/// slice a large call into aligned batches without materializing the whole
+/// call's bytes first.
+pub(crate) struct AppendGeometry {
+    /// Elements per chunk along axis 0 (>= 1).
+    pub(crate) chunk_elems: u64,
+    /// Bytes per on-disk element.
+    pub(crate) element_size: usize,
+    /// Current length along the unlimited dimension.
+    pub(crate) current_dim: u64,
+    /// Whether a filter pipeline applies (whole-chunk appends only).
+    pub(crate) filtered: bool,
+    /// Whole-chunk elements in one full batch (>= one chunk's worth), or
+    /// [`u64::MAX`] when the session does not batch.
+    pub(crate) full_batch_elems: u64,
 }
 
 /// Superblock consistency-flag bits raised while a SWMR writer is active: bit 0
@@ -646,14 +763,83 @@ impl WriteEngine {
     /// behind an image that withholds its whole-file slice, so every read takes
     /// the [`Source`] path rather than the slice fast path.
     ///
-    /// A test opening the same file both ways and comparing results is what
-    /// keeps the two forms of each read from drifting apart before a mirrorless
-    /// backing exists to exercise the second one (issue #198).
+    /// Distinct from [`open_bounded`](Self::open_bounded), which withholds the
+    /// slice *and* the residency: this one still mirrors the file, so a test can
+    /// compare the two read forms on a file the bounded open would refuse.
     #[cfg(test)]
     pub(crate) fn open_source_only(path: &Path) -> Result<Self, Error> {
-        Self::open_imaged(path, Some(FileLocking::Enabled), |mirror| {
-            Box::new(crate::image::SourceOnlyImage::new(mirror))
+        Self::open_imaged(path, Some(FileLocking::Enabled), |handle, _len| {
+            Ok(Box::new(crate::image::SourceOnlyImage::new(
+                Self::read_mirror(handle)?,
+            )))
         })
+    }
+
+    /// Open a bounded session whose image counts the bytes read through it, so a
+    /// test can assert that an operation touches only a small part of the file.
+    /// The counter is shared with the caller.
+    #[cfg(test)]
+    pub(crate) fn open_bounded_counting(
+        path: &Path,
+        read_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> Result<Self, Error> {
+        let mut session = Self::open_imaged(path, Some(FileLocking::Enabled), |handle, len| {
+            Ok(Box::new(crate::image::CountingImage::new(
+                Box::new(HandleImage::new(
+                    handle,
+                    len,
+                    crate::source::MetadataCacheConfig::disabled(),
+                )),
+                read_bytes,
+            )))
+        })?;
+        session.batched_appends = true;
+        Ok(session)
+    }
+
+    /// Open an existing file for bounded-memory editing: the same engine, over a
+    /// [`HandleImage`] that keeps no whole-file mirror, so resident memory is the
+    /// metadata-cache budget plus whatever is being parsed rather than the file's
+    /// size. Backs [`File::open_rw_bounded`](crate::File::open_rw_bounded).
+    ///
+    /// The eligibility rules are checked here rather than deferred, because a
+    /// caller who asked for bounded memory cannot be silently given the mirror
+    /// instead: a pre-v2 superblock, non-8-byte offsets or lengths, a userblock,
+    /// and a paged file without persisted free space are each refused up front.
+    /// Relaxing them is the next step of issue #198.
+    pub(crate) fn open_bounded(
+        path: &Path,
+        cache: MetadataCacheConfig,
+        locking: FileLocking,
+    ) -> Result<Self, Error> {
+        let mut session = Self::open_imaged(path, Some(locking), |handle, len| {
+            Ok(Box::new(HandleImage::new(handle, len, cache)))
+        })?;
+        session.batched_appends = true;
+        if session.superblock.version < 2 {
+            return Err(Error::EditUnsupported(
+                "bounded read-write access requires a latest-format file (v2/v3 superblock); \
+                 use File::open_rw",
+            ));
+        }
+        if session.superblock.base_address != 0 {
+            return Err(Error::EditUnsupported(
+                "bounded read-write access does not support a file with a userblock \
+                 (non-zero base address); use File::open_rw",
+            ));
+        }
+        // A paged file with no persisted managers has no on-disk record of which
+        // pages hold metadata and which hold raw data, so nothing can keep the
+        // pages segregated. The staged commit refuses it too; refusing at open
+        // reports it before any work is staged.
+        if session.paged.is_some() && session.persist.is_none() {
+            return Err(Error::EditUnsupported(
+                "bounded read-write of a paged file (H5F_FSPACE_STRATEGY_PAGE) requires \
+                 persisted free space; recreate the file with \
+                 with_file_space_strategy(FileSpaceStrategy::Page, true, ..) to grow it in place",
+            ));
+        }
+        Ok(session)
     }
 
     /// Open an existing file for SWMR (single-writer/multiple-reader) writing:
@@ -698,22 +884,37 @@ impl WriteEngine {
     /// that policy (the ordinary read-write session); `lock = None` takes no lock
     /// at all (the SWMR writer — see [`open_swmr_writer`](Self::open_swmr_writer)).
     fn open_inner(path: &Path, lock: Option<FileLocking>) -> Result<Self, Error> {
-        Self::open_imaged(path, lock, |mirror| Box::new(mirror))
+        Self::open_imaged(path, lock, |handle, _len| {
+            Ok(Box::new(Self::read_mirror(handle)?))
+        })
     }
 
-    /// Open a session, letting the caller choose how the mirror is presented to
-    /// the engine.
+    /// Read `handle` whole into a [`MirrorImage`]. The one place the engine
+    /// still assumes it can hold the file, kept behind a named constructor so
+    /// the mirrorless opens visibly do not call it.
+    fn read_mirror(mut handle: fs::File) -> Result<MirrorImage, Error> {
+        let mut data = Vec::new();
+        handle.read_to_end(&mut data).map_err(Error::Io)?;
+        Ok(MirrorImage::new(handle, data))
+    }
+
+    /// Shared open path over any backing: acquire the handle (and, when asked,
+    /// the exclusive lock), let `build` decide how the bytes are held, then
+    /// parse and validate the superblock through the image's [`Source`] impl.
     ///
-    /// `wrap` exists so a test can substitute an image that withholds its slice
-    /// (`SourceOnlyImage`) and drive the engine's mirrorless read paths, which
-    /// no production backing selects yet (issue #198). The production path
-    /// passes the identity.
+    /// `build` receives the file's length as well as the handle because a
+    /// mirrorless image has to be told its end-of-file — it has no buffer whose
+    /// length implies it.
+    ///
+    /// Nothing below this point reads the file as a slice, which is what lets
+    /// one engine open a whole-file mirror, a mirrorless handle, and (in tests)
+    /// a mirror that withholds its slice.
     fn open_imaged(
         path: &Path,
         lock: Option<FileLocking>,
-        wrap: impl FnOnce(MirrorImage) -> Box<dyn FileImage>,
+        build: impl FnOnce(fs::File, u64) -> Result<Box<dyn FileImage>, Error>,
     ) -> Result<Self, Error> {
-        let mut handle = fs::OpenOptions::new()
+        let handle = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(path)
@@ -724,11 +925,11 @@ impl WriteEngine {
         if let Some(policy) = lock {
             file_lock::acquire_exclusive(&handle, policy, path)?;
         }
-        let mut data = Vec::new();
-        handle.read_to_end(&mut data).map_err(Error::Io)?;
+        let len = handle.metadata().map_err(Error::Io)?.len();
+        let image = build(handle, len)?;
 
-        let sb_sig_off = signature::find_signature(&data)?;
-        let mut superblock = Superblock::parse(&data, sb_sig_off)?;
+        let sb_sig_off = signature::find_signature_in(image.as_ref())?.to_usize()?;
+        let mut superblock = Superblock::parse_from_source(image.as_ref(), sb_sig_off as u64)?;
 
         if superblock.version > 3 {
             return Err(Error::EditUnsupported("unsupported superblock version"));
@@ -765,7 +966,7 @@ impl WriteEngine {
             })?;
 
         let mut session = Self {
-            image: wrap(MirrorImage::new(handle, data)),
+            image,
             sb_sig_off,
             superblock,
             pending_datasets: Vec::new(),
@@ -782,6 +983,10 @@ impl WriteEngine {
             located: HashMap::new(),
             swmr_mode: false,
             paged: None,
+            committed: false,
+            resolved: HashMap::new(),
+            batched_appends: false,
+            fsm_len: len,
         };
         // If the file persists its free space, seed the free list from the
         // on-disk managers and arm persistence for future commits. Best-effort:
@@ -1106,80 +1311,8 @@ impl WriteEngine {
         self.pending_appends.push((split_path(path), builder));
     }
 
-    /// Immediately append rows to an **existing** chunked, unlimited,
-    /// Extensible-Array-indexed dataset **in place**, at amortized O(1) index cost
-    /// — the throughput-oriented, self-committing counterpart to the staged
-    /// [`append_dataset`](Self::append_dataset).
-    ///
-    /// Unlike every other edit, an in-place append is **not**
-    /// staged: it is applied and made durable before it returns (writes ordered
-    /// child-before-parent with `fsync` barriers, the dataspace dimension
-    /// published last as the single commit point), exactly like
-    /// [`Dataset::append`](crate::Dataset::append). It needs no [`commit`](Self::commit),
-    /// and it composes with staged tree edits on the same session: append rows,
-    /// stage `create_group` / `create_dataset` / attribute / `delete` edits,
-    /// `commit` them, and keep appending — all without reopening the file between
-    /// the fast appends and the tree edits.
-    ///
-    /// # Length rules and crash safety
-    ///
-    /// Identical to [`Dataset::append`](crate::Dataset::append): an **unfiltered** dataset
-    /// accepts any-length appends (a partial trailing chunk is rewritten and its
-    /// single-address index element repointed with one atomic write); a
-    /// **filtered** dataset accepts whole-chunk appends only (its multi-field index
-    /// element cannot be repointed power-loss-atomically). Every append is
-    /// crash-atomic — a crash between appends leaves the previous length or the new
-    /// one, never a torn view.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::AppendInPlaceUnsupported`] — deliberately distinct from
-    /// [`Error::AppendUnsupported`] so a caller can catch it and fall back to the
-    /// staged [`append_dataset`](Self::append_dataset) — when the file has a
-    /// userblock or a pre-v2 superblock, the dataset's Extensible-Array index is
-    /// not yet allocated, the dataset is not rank-1 / unlimited / Extensible-Array
-    /// indexed, a filtered append is not chunk-aligned, the append datatype does
-    /// not match the dataset, or the target path (or an ancestor) has a staged edit
-    /// still pending in this session (commit those first). A dataset reachable
-    /// through more than one hard link is handled through the staged
-    /// [`append_dataset`](Self::append_dataset), not here.
-    ///
-    /// # Example
-    ///
-    /// ```no_run
-    /// use hdf5_pure::File;
-    ///
-    /// let file = File::open_rw("log.h5")?;
-    /// let mut samples = file.dataset("samples")?;
-    /// samples.append(&[8i32, 9, 10, 11])?; // immediate + durable
-    /// file.root().create_group("run2")?; // staged
-    /// samples.append(&[12i32, 13])?;
-    /// file.commit()?; // applies the staged group; appends already durable
-    /// # Ok::<(), hdf5_pure::Error>(())
-    /// ```
-    pub fn append_inplace<T: crate::element::H5Element>(
-        &mut self,
-        dataset: &str,
-        data: &[T],
-    ) -> Result<(), Error> {
-        let mut b = AppendBuilder::new();
-        b.append(data);
-        self.append_inplace_gathered(dataset, &b, 4)
-    }
-
-    /// Append raw little-endian element bytes to `dataset` in place. See
-    /// [`append_inplace`](Self::append_inplace) for the full contract; the byte
-    /// length must be a whole multiple of the dataset's on-disk element size and
-    /// the element datatype must be little-endian (and neither variable-length nor
-    /// a reference). Prefer the typed methods when the element type is known.
-    pub fn append_inplace_raw(&mut self, dataset: &str, bytes: &[u8]) -> Result<(), Error> {
-        let mut b = AppendBuilder::new();
-        b.append_raw(bytes);
-        self.append_inplace_gathered(dataset, &b, 4)
-    }
-
     /// Whether any staged tree edit is still uncommitted. In-place appends
-    /// ([`append_inplace`](Self::append_inplace)) are applied immediately and are
+    /// ([`append_inplace_gathered`](Self::append_inplace_gathered)) are applied immediately and are
     /// never staged, so they never affect this; it reflects only edits awaiting
     /// [`commit`](Self::commit) — `create_group`, `create_dataset`,
     /// `write_dataset`, `append_dataset`, group and dataset attribute edits,
@@ -1233,7 +1366,7 @@ impl WriteEngine {
     /// [`File`](crate::File): it answers "how big is the file right now, and how
     /// much space can be reused before it must grow?" from the session's own live
     /// state. The snapshot reflects the committed file plus any immediate in-place
-    /// appends ([`append_inplace`](Self::append_inplace)) but excludes edits still
+    /// appends ([`append_inplace_gathered`](Self::append_inplace_gathered)) but excludes edits still
     /// staged for the next [`commit`](Self::commit); see [`SpaceAccounting`] for
     /// the field-by-field semantics and [`has_staged_edits`](Self::has_staged_edits)
     /// for detecting pending work.
@@ -1273,22 +1406,68 @@ impl WriteEngine {
         }
     }
 
-    /// Apply a gathered in-place append (typed / generic / raw bytes) to `dataset`,
-    /// immediately and crash-atomically, driving the shared Extensible-Array engine
-    /// against the session's own image through an [`EditStore`] adapter. Runs only
-    /// the first `max_phase` durability phases; production callers pass 4, the
-    /// crash-consistency tests stop at a boundary to simulate a crash.
-    fn append_inplace_gathered(
-        &mut self,
-        dataset: &str,
-        b: &AppendBuilder,
-        max_phase: u8,
-    ) -> Result<(), Error> {
-        if b.dt_conflict() {
-            return Err(Error::AppendInPlaceUnsupported(
-                "append mixes element types in one call; use one element type per append",
-            ));
+    /// The shared Extensible-Array append engine's view of this session: the
+    /// image, the superblock, and the paged-file state, paired as [`EditStore`].
+    ///
+    /// Takes `&mut self`, so a caller that also needs [`located`](Self::located)
+    /// borrowed at the same time must destructure the fields itself rather than
+    /// call this.
+    fn store(&mut self) -> EditStore<'_> {
+        EditStore {
+            image: self.image.as_mut(),
+            superblock: &mut self.superblock,
+            sb_sig_off: self.sb_sig_off,
+            paged: self.paged.as_mut(),
         }
+    }
+
+    /// Flush this session's writes durably, data and metadata both: the final
+    /// barrier [`File::close`](crate::File::close) issues before sealing the
+    /// file. Each immediate append is already durable on its own; this covers
+    /// the file length a preceding truncate or manager rewrite changed.
+    pub(crate) fn sync(&mut self) -> Result<(), Error> {
+        self.image.sync_all()
+    }
+
+    /// Rewrite the on-disk free-space managers into canonical (manager-at-tail)
+    /// shape for a file that persists them, if this session left them stale.
+    ///
+    /// Immediate in-place appends grow the file at end-of-file, which pushes the
+    /// managers into the middle of it with live data after them. A staged
+    /// [`commit`](Self::commit) re-homes them as part of its tail, but a session
+    /// that only appends never runs one, so [`File::close`](crate::File::close)
+    /// and `FileInner::drop` call this instead. It is the same tail the commit
+    /// writes — appended past everything live, with the superblock repoint as the
+    /// crash-atomic linearization point — with nothing to free and the root
+    /// unchanged.
+    ///
+    /// A no-op for a non-persisting file, and skipped when the file has not grown
+    /// past the managers since they were last written, so an unchanged session
+    /// never grows the file.
+    ///
+    /// If a session that grew the file ends without `close` or `drop` running (a
+    /// true crash — `SIGKILL`, power loss), the managers are left mid-file. Every
+    /// append was durable and crash-atomic, so no data is lost, and both this
+    /// crate and the reference C library reopen the file and read it correctly;
+    /// the managers are simply non-canonical until a clean rewrite.
+    pub(crate) fn finalize_persist(&mut self) -> Result<(), Error> {
+        if self.persist.is_none() || self.image.len() == self.fsm_len {
+            return Ok(());
+        }
+        self.commit_persisting(self.superblock.root_group_address, Vec::new())
+    }
+
+    /// Resolve and locate an in-place append target, applying every rule that
+    /// does not depend on the bytes being appended: the file-level eligibility
+    /// guards, the staged-edit conflict check, and the geometry lookup that
+    /// populates [`located`](Self::located). Returns the dataset's object-header
+    /// address, which is that cache's key.
+    ///
+    /// Split out from the append itself so [`append_geometry`](Self::append_geometry)
+    /// can report a dataset's batching geometry under exactly the same rules the
+    /// append will apply — a caller slicing a large append into batches must be
+    /// refused before the first batch, not part-way through.
+    fn append_prepare(&mut self, target: AppendTarget<'_>) -> Result<u64, Error> {
         // The fast in-place append is only sound on a base-0 latest-format file:
         // the slot math assumes absolute addresses and the superblock is patched in
         // place per call. A userblock or pre-v2 file falls back to the staged
@@ -1309,9 +1488,10 @@ impl WriteEngine {
         // A paged file (`H5F_FSPACE_STRATEGY_PAGE`) that does not persist its free
         // space has no on-disk record of which pages hold metadata and which hold
         // raw data, so neither this immediate append nor the staged commit can keep
-        // the two segregated; refuse it outright, as the bounded backend does. A
-        // paged *persisting* file falls through to the persist guard below, which
-        // routes it to the staged path that now grows it (issue #198).
+        // the two segregated; refuse it outright. A paged *persisting* file appends
+        // through the page-aware `EditStore`, which pads a tail page whenever the
+        // page type changes, and has its managers rewritten at the next commit or
+        // at close (issue #198).
         if self.paged.is_some() && self.persist.is_none() {
             return Err(Error::AppendInPlaceUnsupported(
                 "in-place append is not supported on a paged file \
@@ -1319,49 +1499,131 @@ impl WriteEngine {
                  file with with_file_space_strategy(FileSpaceStrategy::Page, true, ..)",
             ));
         }
-        // A file that persists its free space keeps on-disk free-space managers that
-        // only a staged `commit` rewrites consistently. An immediate EOF append
-        // bypasses that rewrite, so fall back to the staged path, which rebuilds the
-        // managers and repoints the superblock last.
-        if self.persist.is_some() {
-            return Err(Error::AppendInPlaceUnsupported(
-                "in-place append is not supported on a file that persists its free space \
-                 (H5Pset_file_space_strategy persist=true); use Dataset::append_staged",
-            ));
-        }
 
         // Refuse an append against a dataset (or a subtree) that a still-staged edit
         // in this same session will relocate, replace, or delete — which would
         // strand the durably-appended rows or plan against a header the commit
         // moves. The caller must commit those edits first.
-        let target = split_path(dataset);
-        if self.append_conflicts_with_pending(&target) {
-            return Err(Error::AppendInPlaceUnsupported(
-                "the dataset or an ancestor has a staged edit pending in this session; commit \
-                 the staged edits before appending in place, or use Dataset::append_staged",
-            ));
+        //
+        // A target named by object-header address cannot be compared against the
+        // staged paths, so any staged edit at all disqualifies it. That is a
+        // superset of the path check, and the remedy is the same one.
+        match target {
+            AppendTarget::Path(dataset) => {
+                if self.append_conflicts_with_pending(&split_path(dataset)) {
+                    return Err(Error::AppendInPlaceUnsupported(
+                        "the dataset or an ancestor has a staged edit pending in this session; \
+                         commit the staged edits before appending in place, or use \
+                         Dataset::append_staged",
+                    ));
+                }
+            }
+            AppendTarget::Header(_) if self.has_staged_edits() || self.committed => {
+                return Err(Error::AppendInPlaceUnsupported(
+                    "this append target was reached by object reference, so it names a dataset \
+                     by object-header address, and this session has staged or committed edits \
+                     that can move that header; re-open the dataset by path to append to it",
+                ));
+            }
+            AppendTarget::Header(_) => {}
         }
 
         // Resolve the dataset's object-header address — the geometry cache key.
-        // base == 0 here, so the resolved address is absolute; two hard links to
+        // base == 0 here, so a resolved address is absolute; two hard links to
         // one dataset share the one entry.
-        let oh_addr =
-            crate::group_v2::resolve_path_any_from_source(&self.image(), &self.superblock, dataset)
-                .map_err(|_| {
-                    Error::AppendInPlaceUnsupported("nothing to append to at the given path")
-                })?;
+        let oh_addr = match target {
+            AppendTarget::Path(dataset) => match self.resolved.get(dataset) {
+                Some(&addr) => addr,
+                None => {
+                    let addr = crate::group_v2::resolve_path_any_from_source(
+                        &self.image(),
+                        &self.superblock,
+                        dataset,
+                    )
+                    .map_err(|_| {
+                        Error::AppendInPlaceUnsupported("nothing to append to at the given path")
+                    })?;
+                    self.resolved.insert(dataset.to_string(), addr);
+                    addr
+                }
+            },
+            AppendTarget::Header(addr) => addr,
+        };
 
         // Locate the dataset on the first append (cache miss) against the session's
-        // own borrowed mirror — no second lock, no second mirror, no re-read.
+        // own image — no second lock, no second view of the file, no re-read.
         if !self.located.contains_key(&oh_addr) {
-            let mirror = EditStore {
-                image: self.image.as_mut(),
-                superblock: &mut self.superblock,
-                sb_sig_off: self.sb_sig_off,
-            };
-            let state = locate_dataset_state(&mirror, oh_addr)?;
+            let store = self.store();
+            let state = locate_dataset_state(&store, oh_addr)?;
             self.located.insert(oh_addr, state);
         }
+        Ok(oh_addr)
+    }
+
+    /// The append geometry of the dataset `target` names, so a caller can slice a
+    /// large append into aligned batches *before* materializing each batch's
+    /// bytes — which is what keeps a bounded session's peak memory at one batch
+    /// rather than the whole call.
+    pub(crate) fn append_geometry(
+        &mut self,
+        target: AppendTarget<'_>,
+    ) -> Result<AppendGeometry, Error> {
+        let oh_addr = self.append_prepare(target)?;
+        let st = &self.located[&oh_addr];
+        let chunk_elems = st.loc.chunk_elems.max(1);
+        Ok(AppendGeometry {
+            chunk_elems,
+            element_size: st.element_size,
+            current_dim: st.loc.current_dim,
+            filtered: st.pipeline.is_some(),
+            full_batch_elems: self.batch_elems(st.loc.chunk_bytes, chunk_elems),
+        })
+    }
+
+    /// Whole-chunk elements in one append batch.
+    ///
+    /// A bounded session caps a batch at [`APPEND_BATCH_BYTES`] of raw data (at
+    /// least one chunk) so peak memory is independent of the call size, at the
+    /// cost of splitting one crash-atomic append into several: a crash between
+    /// batches leaves a valid shorter dataset, exactly as if the caller had
+    /// looped. A mirror session already holds the whole file, so bounding the
+    /// call buys nothing there and would trade that atomicity away for free;
+    /// it takes the whole append as one batch.
+    fn batch_elems(&self, chunk_bytes: usize, chunk_elems: u64) -> u64 {
+        if !self.batched_appends {
+            return u64::MAX;
+        }
+        (APPEND_BATCH_BYTES / (chunk_bytes.max(1) as u64)).max(1) * chunk_elems
+    }
+
+    /// Apply a gathered in-place append (typed / generic / raw bytes) to the
+    /// dataset `target` names, immediately and crash-atomically, driving the
+    /// shared Extensible-Array engine against the session's own image through an
+    /// [`EditStore`] adapter. Runs only the first `max_phase` durability phases;
+    /// production callers pass 4, the crash-consistency tests stop at a boundary
+    /// to simulate a crash.
+    ///
+    /// A bounded session splits the call into whole-chunk batches (see
+    /// [`batch_elems`](Self::batch_elems)), each its own crash-atomic apply.
+    /// Every predictable refusal is raised before the first batch, so a rejected
+    /// append leaves the file untouched rather than partly grown.
+    ///
+    /// `Dataset::append` slices its own call the same way before it reaches here,
+    /// so through the public API this loop runs once per call; it batches for the
+    /// benefit of a caller that hands the engine one large builder directly, whose
+    /// bytes are already materialized but whose plan need not be.
+    pub(crate) fn append_inplace_gathered(
+        &mut self,
+        target: AppendTarget<'_>,
+        b: &AppendBuilder,
+        max_phase: u8,
+    ) -> Result<(), Error> {
+        if b.dt_conflict() {
+            return Err(Error::AppendInPlaceUnsupported(
+                "append mixes element types in one call; use one element type per append",
+            ));
+        }
+        let oh_addr = self.append_prepare(target)?;
 
         // Validate the appended bytes against the on-disk datatype.
         let raw = b.raw();
@@ -1394,39 +1656,100 @@ impl WriteEngine {
             }
         }
 
-        // Read/plan phase (immutable borrows only, nothing published yet), then the
-        // ordered, fsync-barriered write phase — both shared with `Dataset::append`
-        // through the chunk-index engine. `EditStore` borrows only the
-        // image-carrying fields, so `self.located` stays independently borrowable.
-        let plan_result = {
+        let (chunk_elems, elem_bytes, full_batch_elems, filtered, current_dim) = {
             let st = &self.located[&oh_addr];
-            let mirror = EditStore {
-                image: self.image.as_mut(),
-                superblock: &mut self.superblock,
-                sb_sig_off: self.sb_sig_off,
-            };
-            plan_ea_append(
-                &mirror,
-                &st.loc,
-                &st.datatype,
-                &st.spatial,
-                st.element_size,
-                st.pipeline.as_ref(),
-                raw,
-                new_elems,
+            (
+                st.loc.chunk_elems.max(1),
+                st.element_size as u64,
+                self.batch_elems(st.loc.chunk_bytes, st.loc.chunk_elems.max(1)),
+                st.pipeline.is_some(),
+                st.loc.current_dim,
             )
         };
-        let plan = plan_result.map_err(as_inplace_error)?;
-        let st = self
-            .located
-            .get_mut(&oh_addr)
-            .expect("dataset located above");
-        let mut mirror = EditStore {
-            image: self.image.as_mut(),
-            superblock: &mut self.superblock,
-            sb_sig_off: self.sb_sig_off,
-        };
-        apply_ea_append(&mut mirror, &mut st.loc, &plan, max_phase).map_err(as_inplace_error)
+        // Refuse a non-chunk-aligned filtered append before ANY batch applies, so
+        // the refusal is as atomic as an unbatched one. Left to `plan_ea_append`
+        // it would surface only when the final (unaligned) batch was reached,
+        // after earlier batches had durably committed.
+        if filtered && (current_dim % chunk_elems != 0 || new_elems % chunk_elems != 0) {
+            return Err(Error::AppendInPlaceUnsupported(
+                "a filtered dataset can only be appended in place in whole chunks (the current \
+                 length and the appended length must both be multiples of the chunk length); \
+                 use Dataset::append_staged for a non-chunk-aligned filtered append",
+            ));
+        }
+
+        let mut done = 0u64;
+        while done < new_elems {
+            // Fill the trailing partial chunk first (so later batches start
+            // chunk-aligned and never rewrite it again), then whole-chunk batches.
+            // Filtered datasets are chunk-aligned by contract, so every batch stays
+            // chunk-aligned there too.
+            let current_dim = self.located[&oh_addr].loc.current_dim;
+            let to_boundary = (chunk_elems - current_dim % chunk_elems) % chunk_elems;
+            let take = (new_elems - done).min(to_boundary.saturating_add(full_batch_elems));
+            let batch =
+                &raw[(done * elem_bytes).to_usize()?..((done + take) * elem_bytes).to_usize()?];
+
+            // Read/plan phase (immutable borrows only, nothing published yet), then
+            // the ordered, fsync-barriered write phase — both shared with
+            // `Dataset::append` through the chunk-index engine. `EditStore` borrows
+            // only the image-carrying fields, so `self.located` stays independently
+            // borrowable.
+            let plan_result = {
+                let Self {
+                    image,
+                    superblock,
+                    sb_sig_off,
+                    paged,
+                    located,
+                    ..
+                } = self;
+                let st = &located[&oh_addr];
+                let store = EditStore {
+                    image: image.as_mut(),
+                    superblock,
+                    sb_sig_off: *sb_sig_off,
+                    paged: paged.as_mut(),
+                };
+                plan_ea_append(
+                    &store,
+                    &st.loc,
+                    &st.datatype,
+                    &st.spatial,
+                    st.element_size,
+                    st.pipeline.as_ref(),
+                    batch,
+                    take,
+                )
+            };
+            let plan = plan_result.map_err(as_inplace_error)?;
+            {
+                let Self {
+                    image,
+                    superblock,
+                    sb_sig_off,
+                    paged,
+                    located,
+                    ..
+                } = self;
+                let st = located.get_mut(&oh_addr).expect("dataset located above");
+                let mut store = EditStore {
+                    image: image.as_mut(),
+                    superblock,
+                    sb_sig_off: *sb_sig_off,
+                    paged: paged.as_mut(),
+                };
+                apply_ea_append(&mut store, &mut st.loc, &plan, max_phase)
+                    .map_err(as_inplace_error)?;
+            }
+            if max_phase < 4 {
+                // Crash-consistency hook: the caller asked to stop inside the first
+                // batch's durability sequence, so there is no next batch.
+                return Ok(());
+            }
+            done += take;
+        }
+        Ok(())
     }
 
     /// Test-only phased in-place append (stops after `max_phase` durability phases)
@@ -1440,10 +1763,10 @@ impl WriteEngine {
     ) -> Result<(), Error> {
         let mut b = AppendBuilder::new();
         b.append_i32(values);
-        self.append_inplace_gathered(dataset, &b, max_phase)
+        self.append_inplace_gathered(AppendTarget::Path(dataset), &b, max_phase)
     }
 
-    /// Whether `target` (an [`append_inplace`](Self::append_inplace) dataset path)
+    /// Whether `target` (an [`append_inplace_gathered`](Self::append_inplace_gathered) dataset path)
     /// or any of its ancestors is named by a staged edit that a later
     /// [`commit`](Self::commit) would relocate, replace, or delete. `create_group`
     /// and group-attribute edits are excluded: they rewrite a group header without
@@ -1723,8 +2046,12 @@ impl WriteEngine {
         // tail) means a later failure — including one after the durable root flip,
         // which leaves the session reusable — never strands a stale cache. The
         // no-op fast return above does no such work, so it keeps the cache. The
-        // next `append_inplace` re-locates against the fresh mirror.
+        // The next in-place append re-locates against the fresh file.
         self.located.clear();
+        self.resolved.clear();
+        // Past this point the commit may relocate object headers, so every address
+        // a caller captured earlier is suspect; see `committed`.
+        self.committed = true;
 
         // On a file with a userblock, stored addresses are relative to this base
         // and the editor converts at every disk boundary (read `stored + base`,
@@ -2754,6 +3081,9 @@ impl WriteEngine {
             page_size,
             old_blocks: new_old_blocks,
         });
+        // The managers now sit at the tail, so nothing is owed until the file
+        // grows past them again.
+        self.fsm_len = self.image.len();
         Ok(())
     }
 
@@ -2955,6 +3285,9 @@ impl WriteEngine {
             page_size,
             old_blocks: new_old_blocks,
         });
+        // The managers now sit at the tail, so nothing is owed until the file
+        // grows past them again.
+        self.fsm_len = self.image.len();
         Ok(())
     }
 
@@ -4669,44 +5002,13 @@ impl WriteEngine {
     /// end-of-file, and padding inserted after that read would shift the landing
     /// address out from under them.
     fn begin_page(&mut self, ty: PageType) -> Result<(), Error> {
-        // Decide the pad without holding a borrow of `self.paged` across the append.
-        // `prev` is the outgoing page type to record the padding under, or `None`
-        // for a crash-recovery pad whose tail-page type is unknown.
-        let len = self.image.len();
-        let pad = match &self.paged {
-            Some(pg) if len % pg.page_size != 0 => {
-                let pad_len = pg.page_size - len % pg.page_size;
-                match pg.last {
-                    // Normal case: the tail page holds a known type; pad only on a
-                    // type switch, recording the tail as free of the outgoing type.
-                    Some(prev) if prev != ty => Some((Some(prev), pad_len)),
-                    Some(_) => None, // same type: keep packing the tail page
-                    // A previous session grew this paged file and was killed before
-                    // its tail was page-aligned, so the file opened non-page-aligned
-                    // with no known tail type. Pad it up (extending whatever the
-                    // tail page holds, so the page stays homogeneous) and leave the
-                    // padding untracked, since recording it under the wrong page
-                    // type could let a reader reuse it and mix the page.
-                    None => Some((None, pad_len)),
-                }
-            }
-            _ => None,
-        };
-        if let Some((prev, pad_len)) = pad {
-            let pad_at = self.image.len();
-            self.append(&vec![0u8; pad_len.to_usize()?])?;
-            if let Some(pg) = self.paged.as_mut() {
-                match prev {
-                    Some(PageType::Meta) => pg.meta_pad.push((pad_at, pad_len)),
-                    Some(PageType::Raw) => pg.raw_pad.push((pad_at, pad_len)),
-                    None => {} // crash-recovery pad: untracked (tail type unknown)
-                }
-            }
+        // Destructure so the page state and the image are borrowed as the
+        // separate fields they are.
+        let Self { image, paged, .. } = self;
+        match paged.as_mut() {
+            Some(pg) => pg.begin(image.as_mut(), ty),
+            None => Ok(()),
         }
-        if let Some(pg) = self.paged.as_mut() {
-            pg.last = Some(ty);
-        }
-        Ok(())
     }
 
     /// Append `bytes` at end-of-file as page type `ty`: [`begin_page`](Self::begin_page)
@@ -5616,16 +5918,34 @@ struct FlatDataset {
 /// all this adapter does; every primitive delegates, so the image's own
 /// write-ordering discipline is what applies.
 ///
-/// It takes [`Store`]'s default `append_raw`/`append_meta` — plain end-of-file
-/// appends that do not keep a page homogeneous — because the immediate in-place
-/// append refuses every paged file before reaching here: a non-persisting one
-/// explicitly, and a persisting one through the persist guard that routes it to
-/// the staged commit. The paged-aware appends live on [`WriteEngine`] itself,
-/// which is where a paged file is grown.
+/// It carries the session's paged-file state too, so `append_raw` keeps a paged
+/// file's pages homogeneous through exactly the rule the staged commit uses
+/// ([`PagedEdit::begin`]). Before issue #198 there were two copies of that state —
+/// one per engine — and the whole-file editor's copy was reachable only from the
+/// commit path, so it had to refuse an in-place append to a paged file outright.
 struct EditStore<'a> {
     image: &'a mut dyn FileImage,
     superblock: &'a mut Superblock,
     sb_sig_off: usize,
+    /// The session's paged state when the file is paged, `None` otherwise. A
+    /// borrow rather than a copy: padding recorded here has to reach the manager
+    /// rewrite at the next commit or at close.
+    paged: Option<&'a mut PagedEdit>,
+}
+
+impl EditStore<'_> {
+    /// Append `bytes` into a raw page, padding the tail page first when a paged
+    /// file's tail holds metadata. A plain append on the common non-paged file.
+    ///
+    /// Raw is the only page type this adapter allocates: see
+    /// [`Store::append_raw`](crate::chunk_index_inplace::Store::append_raw) for why
+    /// an extensible-array index block belongs in a raw page here.
+    fn append_into_raw_page(&mut self, bytes: &[u8]) -> Result<u64, Error> {
+        if let Some(pg) = self.paged.as_deref_mut() {
+            pg.begin(self.image, PageType::Raw)?;
+        }
+        self.image.append(bytes)
+    }
 }
 
 impl crate::source::Source for EditStore<'_> {
@@ -5653,6 +5973,9 @@ impl Store for EditStore<'_> {
     }
     fn append_bytes(&mut self, bytes: &[u8]) -> Result<u64, Error> {
         self.image.append(bytes)
+    }
+    fn append_raw(&mut self, bytes: &[u8]) -> Result<u64, Error> {
+        self.append_into_raw_page(bytes)
     }
     fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Error> {
         self.image.write_at(offset, bytes)
@@ -5695,7 +6018,7 @@ pub(crate) fn as_inplace_error(e: Error) -> Error {
 /// length must be a whole number of elements, and the element datatype must
 /// match the on-disk datatype (or, for a raw append, be raw-appendable).
 /// Returns the appended element count (`0` = nothing to do). Shared by
-/// [`WriteEngine::append_inplace`]'s path and the bounded backend's immediate
+/// [`WriteEngine::append_inplace_gathered`]'s path and the bounded backend's immediate
 /// append so the acceptance rules stay identical.
 pub(crate) fn validate_gathered_append(st: &LocatedState, b: &AppendBuilder) -> Result<u64, Error> {
     let raw = b.raw();
@@ -6907,7 +7230,7 @@ fn is_prefix(a: &[String], b: &[String]) -> bool {
 /// remain (a clean end of the region), and `Err` if a record's declared body
 /// runs past the region. Centralizes the bounds check shared by every walker.
 /// Rebuild a superblock-extension object header's message region (as collapsed by
-/// [`WriteEngine::gather_oh_messages`] or [`read_single_chunk_ext_region`]) with
+/// [`WriteEngine::gather_oh_messages`]) with
 /// its File Space Info message replaced by `info`, preserving every other message
 /// verbatim. The persisting message is fixed-size, so the region length is stable.
 /// Shared by the whole-file mirror commit and the bounded finalize so both write
@@ -6946,48 +7269,6 @@ pub(crate) fn rewrite_extension_region_bytes(
         ));
     }
     Ok(out)
-}
-
-/// Read and collapse a **single-chunk** superblock-extension object header's
-/// message region from a random-access [`Source`], for the bounded backend which
-/// has no whole-file mirror to hand [`WriteEngine::gather_oh_messages`] a `&[u8]`.
-/// The extension every writer (this crate's and the C library's) emits for a
-/// persisting file is a single OHDR chunk; a multi-chunk extension (a
-/// `Continuation` message) is refused so the caller falls back to `File::open_rw`.
-/// Returns the collapsed message region and the full byte length of the
-/// single-chunk object header at `ext_addr` (`OHDR` prefix + region + 4-byte
-/// checksum), so the caller can both rewrite the extension and record its extent
-/// as reclaimable free space.
-pub(crate) fn read_single_chunk_ext_region<S: crate::source::Source>(
-    src: &S,
-    ext_addr: u64,
-) -> Result<(Vec<u8>, u64), Error> {
-    // The extension is tiny (a File Space Info message plus at most a few small
-    // messages), and `read_oh_chunk0` reads exactly its chunk 0 — prefix window
-    // first, then the message region the prefix sizes.
-    let chunk = read_oh_chunk0(src, ext_addr).map_err(|e| match e {
-        // A read failure is a real I/O/format problem and propagates as itself;
-        // only a parse failure means "not the shape the bounded backend reads".
-        Error::EditUnsupported(_) => Error::EditUnsupported(
-            "bounded read-write cannot read the superblock extension (not a single-chunk \
-             version 2 object header); use File::open_rw",
-        ),
-        other => other,
-    })?;
-    // Refuse a continuation: the bounded reader only understands a single chunk.
-    let (region, mut p) = chunk.message_region();
-    while let Some((msg_type, _body, body_end)) = next_message(region, p)? {
-        if msg_type == MessageType::ObjectHeaderContinuation {
-            return Err(Error::EditUnsupported(
-                "bounded read-write does not support a multi-chunk superblock extension; \
-                 use File::open_rw",
-            ));
-        }
-        p = body_end;
-    }
-    // `span.1` is the whole on-disk object header, message region plus the
-    // `OHDR` prefix and the trailing checksum.
-    Ok((region[chunk.messages_start..].to_vec(), chunk.span.1))
 }
 
 /// Parse and validate a version 2 object header's prefix, returning the absolute
@@ -8161,5 +8442,439 @@ mod tests {
             }
             other => panic!("expected root-group address overflow, got {other:?}"),
         }
+    }
+
+    use tempfile::tempdir;
+
+    // -----------------------------------------------------------------------
+    // Bounded sessions: the same engine over a `HandleImage`, which holds no
+    // whole-file mirror. These came across from the standalone bounded engine
+    // deleted in issue #198; what they cover is unchanged, but they now exercise
+    // the shared code the mirror sessions use.
+    // -----------------------------------------------------------------------
+
+    /// Build a rank-1 unlimited chunked i32 dataset `d` seeded with `0..n`.
+    fn build_appendable(path: &Path, n: i32, chunk: u64) {
+        let data: Vec<i32> = (0..n).collect();
+        let mut b = crate::writer::FileBuilder::new();
+        b.create_dataset("d")
+            .with_i32_data(&data)
+            .with_shape(&[n as u64])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[chunk]);
+        b.write(path).unwrap();
+    }
+
+    fn open_bounded_session(path: &Path) -> WriteEngine {
+        WriteEngine::open_bounded(
+            path,
+            crate::source::MetadataCacheConfig::disabled(),
+            FileLocking::Enabled,
+        )
+        .unwrap()
+    }
+
+    fn dataset_addr(engine: &WriteEngine) -> u64 {
+        crate::group_v2::resolve_path_any_from_source(&engine.image(), engine.superblock(), "d")
+            .unwrap()
+    }
+
+    /// Crash consistency on a bounded session: stop the append after only the
+    /// first `max_phase` durability phases (simulating a crash at that boundary)
+    /// and assert the reopened file reads either the old length (phases 1-3) or
+    /// the new one (phase 4), never a torn view. Layouts cover a partial trailing
+    /// chunk (relocated tail) and a chunk-aligned start.
+    #[test]
+    fn bounded_append_crash_consistency_partial_tail_prefix() {
+        let dir = tempdir().unwrap();
+        for (case, (n, chunk, add)) in [(0usize, (6i32, 4u64, 5i32)), (1, (8, 2, 6))] {
+            let base = dir.path().join(std::format!("base_{case}.h5"));
+            build_appendable(&base, n, chunk);
+            for max_phase in 1u8..=4 {
+                let p = dir.path().join(std::format!("crash_{case}_{max_phase}.h5"));
+                std::fs::copy(&base, &p).unwrap();
+                {
+                    let mut engine = open_bounded_session(&p);
+                    let addr = dataset_addr(&engine);
+                    let mut b = AppendBuilder::new();
+                    b.append_i32(&(n..n + add).collect::<Vec<_>>());
+                    engine
+                        .append_inplace_gathered(AppendTarget::Header(addr), &b, max_phase)
+                        .unwrap();
+                    // Dropping the engine simulates the crash: no further phases,
+                    // no close barrier.
+                }
+                let expected_len = if max_phase == 4 { n + add } else { n };
+                let got = crate::File::open(&p)
+                    .unwrap()
+                    .dataset("d")
+                    .unwrap()
+                    .read_i32()
+                    .unwrap();
+                assert_eq!(
+                    got,
+                    (0..expected_len).collect::<Vec<_>>(),
+                    "case {case} phase {max_phase}"
+                );
+            }
+        }
+    }
+
+    /// The batching loop only honors `max_phase < 4` on its first batch, and a
+    /// full multi-batch append leaves every batch fully committed: after a large
+    /// append the file reads the complete sequence.
+    #[test]
+    fn bounded_multi_batch_append_commits_every_batch() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("multibatch.h5");
+        build_appendable(&p, 5, 512);
+        let total = 700_000i32;
+        {
+            let mut engine = open_bounded_session(&p);
+            let addr = dataset_addr(&engine);
+            let mut b = AppendBuilder::new();
+            b.append_i32(&(5..total).collect::<Vec<_>>());
+            engine
+                .append_inplace_gathered(AppendTarget::Header(addr), &b, 4)
+                .unwrap();
+        }
+        let got = crate::File::open(&p)
+            .unwrap()
+            .dataset("d")
+            .unwrap()
+            .read_i32()
+            .unwrap();
+        assert_eq!(got.len(), total as usize);
+        assert!(got.iter().enumerate().all(|(i, &v)| v == i as i32));
+    }
+
+    /// A bounded session batches; a mirror session does not. The distinction is
+    /// a deliberate trade — bounded peak memory against whole-call crash
+    /// atomicity — so it is asserted rather than left to the batching code's
+    /// arithmetic.
+    #[test]
+    fn only_a_bounded_session_batches_a_large_append() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("batching.h5");
+        build_appendable(&p, 8, 4);
+
+        let bounded_batch = {
+            let mut engine = open_bounded_session(&p);
+            engine
+                .append_geometry(AppendTarget::Path("d"))
+                .unwrap()
+                .full_batch_elems
+        };
+        let mirror_batch = {
+            let mut engine = WriteEngine::open_with_locking(&p, FileLocking::Enabled).unwrap();
+            engine
+                .append_geometry(AppendTarget::Path("d"))
+                .unwrap()
+                .full_batch_elems
+        };
+
+        assert_eq!(
+            mirror_batch,
+            u64::MAX,
+            "a mirror session must take the whole append as one crash-atomic batch"
+        );
+        assert!(
+            bounded_batch < u64::MAX,
+            "a bounded session must cap a batch, got {bounded_batch}"
+        );
+        assert_eq!(
+            bounded_batch % 4,
+            0,
+            "a batch must be a whole number of chunks"
+        );
+    }
+
+    /// A persisting file appended through a bounded session and dropped WITHOUT
+    /// `finalize_persist` (the true-crash case) still reads back every durable
+    /// append. Dropping the engine releases the exclusive lock, so the reopen is
+    /// portable (no leaked lock). The finalize-at-close path is covered by the
+    /// `tests/bounded_append.rs` integration tests.
+    #[test]
+    fn bounded_persist_append_without_finalize_is_readable() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("persist_crash.h5");
+        let mut b = crate::writer::FileBuilder::new();
+        b.with_file_space_strategy(crate::FileSpaceStrategy::FsmAggr, true, 1);
+        b.create_dataset("d")
+            .with_i32_data(&(0..6).collect::<Vec<i32>>())
+            .with_shape(&[6])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[4]);
+        b.write(&p).unwrap();
+        {
+            let mut engine = open_bounded_session(&p);
+            assert!(engine.persist.is_some(), "persist state is armed at open");
+            let addr = dataset_addr(&engine);
+            let mut ab = AppendBuilder::new();
+            ab.append_i32(&(6..20).collect::<Vec<_>>());
+            engine
+                .append_inplace_gathered(AppendTarget::Header(addr), &ab, 4)
+                .unwrap();
+            // Drop without finalizing: models a true crash and releases the lock.
+        }
+        let got = crate::File::open(&p)
+            .unwrap()
+            .dataset("d")
+            .unwrap()
+            .read_i32()
+            .unwrap();
+        assert_eq!(got, (0..20).collect::<Vec<_>>());
+    }
+
+    /// A bounded session grows a PAGED persisting file and is killed before
+    /// finalize (models a crash), leaving the file non-page-aligned. Reopening it
+    /// must not panic, and the next append must re-align the crashed tail page
+    /// before writing raw data (so no page mixes metadata and raw); a clean close
+    /// then re-page-aligns the file and every row reads back.
+    #[test]
+    fn bounded_paged_reopen_after_crash_realigns_and_stays_readable() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("paged_crash.h5");
+        let mut b = crate::writer::FileBuilder::new();
+        b.with_file_space_strategy(crate::FileSpaceStrategy::Page, true, 0)
+            .with_file_space_page_size(4096);
+        b.create_dataset("d")
+            .with_i32_data(&(0..64).collect::<Vec<i32>>())
+            .with_shape(&[64])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[64]);
+        b.write(&p).unwrap();
+
+        // Grow enough to force extensible-array index growth, so the last write of
+        // the session is metadata and the tail page is a partial metadata page.
+        {
+            let mut engine = open_bounded_session(&p);
+            let addr = dataset_addr(&engine);
+            let mut ab = AppendBuilder::new();
+            ab.append_i32(&(64..2000).collect::<Vec<_>>());
+            engine
+                .append_inplace_gathered(AppendTarget::Header(addr), &ab, 4)
+                .unwrap();
+            // Drop without finalize: models a crash and releases the OS lock.
+        }
+        assert_ne!(
+            std::fs::metadata(&p).unwrap().len() % 4096,
+            0,
+            "a crashed (un-finalized) paged session leaves the file non-page-aligned"
+        );
+
+        // Reopen must not panic on the non-aligned file; the next append re-aligns
+        // the crashed tail page, and finalize re-page-aligns the whole file.
+        {
+            let mut engine = open_bounded_session(&p);
+            let addr = dataset_addr(&engine);
+            let mut ab = AppendBuilder::new();
+            ab.append_i32(&(2000..2500).collect::<Vec<_>>());
+            engine
+                .append_inplace_gathered(AppendTarget::Header(addr), &ab, 4)
+                .unwrap();
+            engine.finalize_persist().unwrap();
+            engine.sync().unwrap();
+        }
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().len() % 4096,
+            0,
+            "reopen + append + finalize re-aligns the paged file"
+        );
+        let got = crate::File::open(&p)
+            .unwrap()
+            .dataset("d")
+            .unwrap()
+            .read_i32()
+            .unwrap();
+        assert_eq!(got, (0..2500).collect::<Vec<_>>());
+    }
+
+    /// A staged commit on a bounded session must stay bounded: it may read the
+    /// metadata it edits, but never the file's bulk. Measured rather than
+    /// asserted from the design — the engine is shared with the mirror sessions
+    /// now, and a single slice-taking read added anywhere on the commit path
+    /// would silently make `open_rw_bounded` cost as much as `open_rw`.
+    #[test]
+    fn a_bounded_commit_reads_far_less_than_the_file() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("bulk.h5");
+        // ~8 MiB of chunked data, so "reads the whole file" and "reads only the
+        // metadata" differ by orders of magnitude rather than by a margin.
+        let rows = 2_000_000i32;
+        build_appendable(&p, rows, 8192);
+        let file_len = std::fs::metadata(&p).unwrap().len();
+        assert!(file_len > 4 << 20, "file is only {file_len} bytes");
+
+        let read_bytes = Arc::new(AtomicU64::new(0));
+        {
+            let mut engine =
+                WriteEngine::open_bounded_counting(&p, Arc::clone(&read_bytes)).unwrap();
+            engine.create_group("g");
+            engine.commit().unwrap();
+        }
+        let read = read_bytes.load(Ordering::Relaxed);
+
+        assert!(
+            read > 0,
+            "the commit read nothing, so the test proves nothing"
+        );
+        // Measured at 310 bytes here. The bound is loose enough to survive a
+        // changed header layout and still orders of magnitude below the file.
+        assert!(
+            read < 64 << 10,
+            "a bounded commit read {read} bytes of a {file_len}-byte file"
+        );
+    }
+
+    /// An in-place append leaves a partially-filled **raw** page, so the next
+    /// commit's metadata must pad it rather than pack into it.
+    ///
+    /// This is what keeps [`PagedEdit::begin`] reachable from [`EditStore`] now
+    /// that an append allocates raw pages only: the append's job is to record that
+    /// the tail page turned raw, and the commit's job is to act on it. It is also
+    /// the interleaving that a single session-level page tracker makes possible —
+    /// with a tracker per engine, the commit path could not see what the append
+    /// path had done, which is why the whole-file editor refused an in-place append
+    /// to a paged file at all (issue #198).
+    #[test]
+    fn a_commit_after_an_append_pads_the_raw_page_the_append_left() {
+        const PAGE: u64 = 4096;
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("paged_interleave.h5");
+        let mut b = crate::writer::FileBuilder::new();
+        b.with_file_space_strategy(crate::FileSpaceStrategy::Page, true, 0)
+            .with_file_space_page_size(PAGE);
+        b.create_dataset("d")
+            .with_i32_data(&(0..64).collect::<Vec<i32>>())
+            .with_shape(&[64])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[64]);
+        b.write(&p).unwrap();
+
+        let mut engine = WriteEngine::open_with_locking(&p, FileLocking::Enabled).unwrap();
+        let mut ab = AppendBuilder::new();
+        ab.append_i32(&(64..2000).collect::<Vec<_>>());
+        engine
+            .append_inplace_gathered(AppendTarget::Path("d"), &ab, 4)
+            .unwrap();
+
+        assert_eq!(
+            engine.paged.as_ref().unwrap().last,
+            Some(PageType::Raw),
+            "the append must record that the tail page now holds raw data"
+        );
+        assert_ne!(
+            engine.image.len() % PAGE,
+            0,
+            "the append must leave a partially-filled page for the commit to pad"
+        );
+
+        engine.create_group("g");
+        engine.commit().unwrap();
+
+        // The commit padded the raw tail before laying down metadata, and folded
+        // that padding into the small-raw manager (`meta_pad`/`raw_pad` are cleared
+        // into the free lists as part of the paged tail).
+        let pg = engine.paged.as_ref().expect("the file is paged");
+        let raw_free = pg.raw_small.sections();
+        assert!(
+            !raw_free.is_empty(),
+            "the commit packed metadata into the raw page the append left open"
+        );
+        for (addr, len) in raw_free {
+            assert_eq!(
+                (addr + len) % PAGE,
+                0,
+                "padding {addr}+{len} does not reach a page boundary"
+            );
+        }
+
+        drop(engine);
+        assert_eq!(
+            crate::File::open(&p)
+                .unwrap()
+                .dataset("d")
+                .unwrap()
+                .read_i32()
+                .unwrap(),
+            (0..2000).collect::<Vec<_>>()
+        );
+    }
+
+    /// An in-place append to a paged file must allocate **only raw pages** — the
+    /// chunk data and the extensible-array blocks indexing it alike.
+    ///
+    /// The reclaim path (`chunked_storage_spans`) reports both halves of a chunked
+    /// dataset as raw free space, because that is where this crate places them. An
+    /// append that put its index blocks in a metadata page instead would make the
+    /// reclaim advertise metadata-page bytes for raw reuse, mixing the page a paged
+    /// file exists to keep homogeneous. Measured here rather than through the
+    /// reference C library, which reads a mixed-page file without complaint: an
+    /// interop test proves interop and says nothing about segregation.
+    #[test]
+    fn an_inplace_append_to_a_paged_file_allocates_only_raw_pages() {
+        const PAGE: u64 = 4096;
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("paged_raw.h5");
+        let mut b = crate::writer::FileBuilder::new();
+        b.with_file_space_strategy(crate::FileSpaceStrategy::Page, true, 0)
+            .with_file_space_page_size(PAGE);
+        b.create_dataset("d")
+            .with_i32_data(&(0..64).collect::<Vec<i32>>())
+            .with_shape(&[64])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[64]);
+        b.write(&p).unwrap();
+
+        let mut engine = WriteEngine::open_with_locking(&p, FileLocking::Enabled).unwrap();
+        let before = engine.image().len();
+        // Two appends, each large enough to grow the extensible-array index, so the
+        // run allocates index blocks as well as chunk data.
+        for range in [64..2000, 2000..4000] {
+            let mut ab = AppendBuilder::new();
+            ab.append_i32(&range.collect::<Vec<_>>());
+            engine
+                .append_inplace_gathered(AppendTarget::Path("d"), &ab, 4)
+                .unwrap();
+        }
+
+        let pg = engine.paged.as_ref().expect("the file is paged");
+        assert_eq!(
+            pg.last,
+            Some(PageType::Raw),
+            "the append left the tail page holding something other than raw data"
+        );
+        assert!(
+            pg.meta_pad.is_empty() && pg.raw_pad.is_empty(),
+            "an in-place append switched page type: meta_pad={:?} raw_pad={:?}",
+            pg.meta_pad,
+            pg.raw_pad
+        );
+
+        // Not vacuous: the append really did allocate index structure above the
+        // pre-append end-of-file, which is what would have opened a metadata page.
+        let addr = crate::group_v2::resolve_path_any_from_source(
+            &engine.image(),
+            engine.superblock(),
+            "d",
+        )
+        .unwrap();
+        let spans = engine
+            .chunked_storage_spans(addr.to_usize().unwrap())
+            .expect("a chunked dataset has reclaimable spans");
+        let fresh = spans.iter().filter(|&&(a, _, _)| a >= before).count();
+        assert!(
+            fresh > 0,
+            "the append allocated nothing above {before}, so the assertion above proves nothing"
+        );
+        assert!(
+            spans.iter().all(|&(_, _, ty)| ty == PageType::Raw),
+            "the reclaim tags every chunked span raw; a metadata tag here would need \
+             the placement rule above to change with it"
+        );
     }
 }
