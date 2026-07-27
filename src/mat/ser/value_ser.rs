@@ -9,12 +9,14 @@ use serde::ser::{
     SerializeTupleStruct, Serializer,
 };
 
-use crate::mat::complex::{COMPLEX32_SENTINEL, COMPLEX64_SENTINEL};
+use crate::mat::complex::complex_tag_for_sentinel;
 use crate::mat::error::MatError;
-use crate::mat::matrix::{MATRIX_COMPLEX32_SENTINEL, MATRIX_COMPLEX64_SENTINEL, MATRIX_SENTINEL};
+use crate::mat::matrix::{MATRIX_SENTINEL, complex_tag_for_matrix_sentinel};
 use crate::mat::utf16;
 
-use crate::mat::value::{MatValue, NumVec, ScalarNum, ScalarTag};
+use crate::mat::value::{
+    ComplexNum, ComplexTag, ComplexVec, MatValue, NumVec, ScalarNum, ScalarTag,
+};
 
 // ---------------------------------------------------------------------------
 // Public entry: serialize a value into a MatValue
@@ -178,16 +180,17 @@ impl Serializer for ValueSerializer {
     }
 
     fn serialize_struct(self, name: &'static str, len: usize) -> Result<StructSer, MatError> {
+        if let Some(tag) = complex_tag_for_sentinel(name) {
+            return Ok(StructSer::Complex(tag, ComplexFields::default()));
+        }
+        if let Some(tag) = complex_tag_for_matrix_sentinel(name) {
+            return Ok(StructSer::Matrix(
+                MatrixFields::default(),
+                MatrixKind::Complex(tag),
+            ));
+        }
         Ok(match name {
             MATRIX_SENTINEL => StructSer::Matrix(MatrixFields::default(), MatrixKind::Numeric),
-            MATRIX_COMPLEX64_SENTINEL => {
-                StructSer::Matrix(MatrixFields::default(), MatrixKind::Complex64)
-            }
-            MATRIX_COMPLEX32_SENTINEL => {
-                StructSer::Matrix(MatrixFields::default(), MatrixKind::Complex32)
-            }
-            COMPLEX64_SENTINEL => StructSer::Complex64(ComplexFields::default()),
-            COMPLEX32_SENTINEL => StructSer::Complex32(ComplexFields::default()),
             // serde supplies the exact field count, so the field Vec can be
             // sized once instead of growing by reallocation.
             _ => StructSer::Plain(PlainStructFields::with_capacity(len)),
@@ -341,72 +344,40 @@ fn try_unify_homogeneous(elements: Vec<MatValue>) -> Result<MatValue, Vec<MatVal
         }
     }
 
-    // ----- all complex scalars of one width → ComplexVec (f64 case) -----
-    if elements
-        .iter()
-        .all(|e| matches!(e, MatValue::ComplexScalar64 { .. }))
-    {
-        let pairs: Vec<(f64, f64)> = elements
-            .into_iter()
-            .map(|e| match e {
-                MatValue::ComplexScalar64 { re, im } => (re, im),
-                _ => unreachable!(),
-            })
-            .collect();
-        return Ok(MatValue::ComplexVec64(pairs));
-    }
-    // ----- f32 complex-scalar variant of the above -----
-    if elements
-        .iter()
-        .all(|e| matches!(e, MatValue::ComplexScalar32 { .. }))
-    {
-        let pairs: Vec<(f32, f32)> = elements
-            .into_iter()
-            .map(|e| match e {
-                MatValue::ComplexScalar32 { re, im } => (re, im),
-                _ => unreachable!(),
-            })
-            .collect();
-        return Ok(MatValue::ComplexVec32(pairs));
-    }
-
-    // ----- all elements are ComplexVec of same length → ComplexMatrix -----
-    if let Some(MatValue::ComplexVec64(first)) = elements.first() {
-        let first_len = first.len();
+    // ----- all complex scalars of one class → ComplexVec1D -----
+    if let Some(MatValue::ComplexScalar(first)) = elements.first() {
+        let first_tag = first.tag();
         if elements
             .iter()
-            .all(|e| matches!(e, MatValue::ComplexVec64(v) if v.len() == first_len))
+            .all(|e| matches!(e, MatValue::ComplexScalar(n) if n.tag() == first_tag))
         {
-            let rows = elements.len();
-            let mut pairs: Vec<(f64, f64)> = Vec::with_capacity(rows * first_len);
+            let mut pairs = ComplexVec::with_capacity_for_tag(first_tag, elements.len());
             for e in elements {
-                let MatValue::ComplexVec64(v) = e else {
+                let MatValue::ComplexScalar(n) = e else {
                     unreachable!()
                 };
-                pairs.extend(v);
+                pairs.push(n).expect("tag check held");
             }
-            return Ok(MatValue::ComplexMatrix64 {
-                rows,
-                cols: first_len,
-                pairs,
-            });
+            return Ok(MatValue::ComplexVec1D(pairs));
         }
     }
-    if let Some(MatValue::ComplexVec32(first)) = elements.first() {
+
+    // ----- all elements are ComplexVec1D of one class & length → ComplexMatrix -----
+    if let Some(MatValue::ComplexVec1D(first)) = elements.first() {
+        let first_tag = first.tag();
         let first_len = first.len();
-        if elements
-            .iter()
-            .all(|e| matches!(e, MatValue::ComplexVec32(v) if v.len() == first_len))
-        {
+        if elements.iter().all(
+            |e| matches!(e, MatValue::ComplexVec1D(v) if v.tag() == first_tag && v.len() == first_len),
+        ) {
             let rows = elements.len();
-            let mut pairs: Vec<(f32, f32)> = Vec::with_capacity(rows * first_len);
+            let mut pairs = ComplexVec::with_capacity_for_tag(first_tag, rows * first_len);
             for e in elements {
-                let MatValue::ComplexVec32(v) = e else {
+                let MatValue::ComplexVec1D(v) = e else {
                     unreachable!()
                 };
-                pairs.extend(v);
+                pairs.extend(v).expect("tag check held");
             }
-            return Ok(MatValue::ComplexMatrix32 {
+            return Ok(MatValue::ComplexMatrix {
                 rows,
                 cols: first_len,
                 pairs,
@@ -477,20 +448,18 @@ impl SerializeMap for MapSer {
 
 pub(crate) enum StructSer {
     Matrix(MatrixFields, MatrixKind),
-    Complex64(ComplexFields<f64>),
-    Complex32(ComplexFields<f32>),
+    Complex(ComplexTag, ComplexFields),
     Plain(PlainStructFields),
 }
 
 /// Element class hint for a `Matrix<T>` sentinel. Carried through from the
-/// chosen sentinel name (see `matrix::matrix_sentinel_for`) so that empty
-/// matrices, where the inner `Vec<T>` cannot reveal `T`, still emit with the
-/// right MATLAB class.
+/// chosen sentinel name (see `matrix::MatElement`) so that empty matrices,
+/// where the inner `Vec<T>` cannot reveal `T`, still emit with the right
+/// MATLAB class.
 #[derive(Clone, Copy)]
 pub(crate) enum MatrixKind {
     Numeric,
-    Complex64,
-    Complex32,
+    Complex(ComplexTag),
 }
 
 #[derive(Default)]
@@ -500,10 +469,12 @@ pub(crate) struct MatrixFields {
     data: Option<MatValue>,
 }
 
+/// The two fields of a complex sentinel, held as tagged scalars: the component
+/// class comes from the sentinel, and `end` checks the fields against it.
 #[derive(Default)]
-pub(crate) struct ComplexFields<T> {
-    real: Option<T>,
-    imag: Option<T>,
+pub(crate) struct ComplexFields {
+    real: Option<ScalarNum>,
+    imag: Option<ScalarNum>,
 }
 
 #[derive(Default)]
@@ -548,21 +519,13 @@ impl SerializeStruct for StructSer {
                     )));
                 }
             },
-            StructSer::Complex64(fields) => match key {
-                "real" => fields.real = Some(expect_f64(value.serialize(ValueSerializer)?)?),
-                "imag" => fields.imag = Some(expect_f64(value.serialize(ValueSerializer)?)?),
+            StructSer::Complex(tag, fields) => match key {
+                "real" => fields.real = Some(expect_component(value.serialize(ValueSerializer)?)?),
+                "imag" => fields.imag = Some(expect_component(value.serialize(ValueSerializer)?)?),
                 other => {
                     return Err(MatError::Custom(format!(
-                        "unexpected field {other:?} on Complex64 sentinel"
-                    )));
-                }
-            },
-            StructSer::Complex32(fields) => match key {
-                "real" => fields.real = Some(expect_f32(value.serialize(ValueSerializer)?)?),
-                "imag" => fields.imag = Some(expect_f32(value.serialize(ValueSerializer)?)?),
-                other => {
-                    return Err(MatError::Custom(format!(
-                        "unexpected field {other:?} on Complex32 sentinel"
+                        "unexpected field {other:?} on the complex {} sentinel",
+                        tag.class().as_str()
                     )));
                 }
             },
@@ -578,22 +541,22 @@ impl SerializeStruct for StructSer {
         match self {
             StructSer::Plain(ps) => Ok(MatValue::Struct(ps.fields)),
             StructSer::Matrix(fields, kind) => matrix_from_fields(fields, kind),
-            StructSer::Complex64(fields) => Ok(MatValue::ComplexScalar64 {
-                re: fields
+            StructSer::Complex(tag, fields) => {
+                let re = fields
                     .real
-                    .ok_or_else(|| MatError::MissingField("real".into()))?,
-                im: fields
+                    .ok_or_else(|| MatError::MissingField("real".into()))?;
+                let im = fields
                     .imag
-                    .ok_or_else(|| MatError::MissingField("imag".into()))?,
-            }),
-            StructSer::Complex32(fields) => Ok(MatValue::ComplexScalar32 {
-                re: fields
-                    .real
-                    .ok_or_else(|| MatError::MissingField("real".into()))?,
-                im: fields
-                    .imag
-                    .ok_or_else(|| MatError::MissingField("imag".into()))?,
-            }),
+                    .ok_or_else(|| MatError::MissingField("imag".into()))?;
+                let n = ComplexNum::from_components(tag, re, im).ok_or_else(|| {
+                    MatError::Custom(format!(
+                        "complex {} fields must both be {}",
+                        tag.class().as_str(),
+                        tag.class().as_str()
+                    ))
+                })?;
+                Ok(MatValue::ComplexScalar(n))
+            }
         }
     }
 }
@@ -626,33 +589,21 @@ fn matrix_from_fields(fields: MatrixFields, kind: MatrixKind) -> Result<MatValue
             length_check(vec.len())?;
             Ok(MatValue::Matrix { rows, cols, vec })
         }
-        // Matrix<Complex64>: ComplexVec64 in the data slot, OR an empty
-        // Vec1D (the f64-default that an empty `Vec<Complex64>` collapses
-        // to in the seq path: with no elements observed, the seq
-        // unification can't recover T). The dedicated sentinel here lets
-        // us recover the class.
-        (MatrixKind::Complex64, MatValue::ComplexVec64(pairs)) => {
+        // Matrix<Complex*>: a ComplexVec1D of the sentinel's class in the data
+        // slot, OR an empty Vec1D (the f64-default that an empty
+        // `Vec<Complex*>` collapses to in the seq path: with no elements
+        // observed, the seq unification can't recover T). The dedicated
+        // sentinel here lets us recover the class.
+        (MatrixKind::Complex(tag), MatValue::ComplexVec1D(pairs)) if pairs.tag() == tag => {
             length_check(pairs.len())?;
-            Ok(MatValue::ComplexMatrix64 { rows, cols, pairs })
+            Ok(MatValue::ComplexMatrix { rows, cols, pairs })
         }
-        (MatrixKind::Complex64, MatValue::Vec1D(vec)) if vec.is_empty() => {
+        (MatrixKind::Complex(tag), MatValue::Vec1D(vec)) if vec.is_empty() => {
             length_check(0)?;
-            Ok(MatValue::ComplexMatrix64 {
+            Ok(MatValue::ComplexMatrix {
                 rows,
                 cols,
-                pairs: Vec::new(),
-            })
-        }
-        (MatrixKind::Complex32, MatValue::ComplexVec32(pairs)) => {
-            length_check(pairs.len())?;
-            Ok(MatValue::ComplexMatrix32 { rows, cols, pairs })
-        }
-        (MatrixKind::Complex32, MatValue::Vec1D(vec)) if vec.is_empty() => {
-            length_check(0)?;
-            Ok(MatValue::ComplexMatrix32 {
-                rows,
-                cols,
-                pairs: Vec::new(),
+                pairs: ComplexVec::empty_with_tag(tag),
             })
         }
         (_, other) => Err(MatError::Custom(format!(
@@ -685,27 +636,13 @@ fn expect_usize(v: MatValue, field: &str) -> Result<usize, MatError> {
     }
 }
 
-fn expect_f64(v: MatValue) -> Result<f64, MatError> {
+/// A complex sentinel's `real`/`imag` field, kept at the width it was
+/// serialized at. `end` checks it against the sentinel's class.
+fn expect_component(v: MatValue) -> Result<ScalarNum, MatError> {
     match v {
-        MatValue::Scalar(ScalarNum::F64(x)) => Ok(x),
-        MatValue::Scalar(ScalarNum::F32(x)) => Ok(x as f64),
+        MatValue::Scalar(s) => Ok(s),
         other => Err(MatError::Custom(format!(
-            "Complex field must be f64, got {}",
-            other.kind()
-        ))),
-    }
-}
-
-fn expect_f32(v: MatValue) -> Result<f32, MatError> {
-    match v {
-        MatValue::Scalar(ScalarNum::F32(x)) => Ok(x),
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "coercing a user-supplied F64 complex field to the requested f32; lossy float narrowing is the intended conversion"
-        )]
-        MatValue::Scalar(ScalarNum::F64(x)) => Ok(x as f32),
-        other => Err(MatError::Custom(format!(
-            "Complex field must be f32, got {}",
+            "a complex field must be a numeric scalar, got {}",
             other.kind()
         ))),
     }

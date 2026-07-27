@@ -12,9 +12,9 @@ use crate::type_builders::{
 };
 use crate::writer::FileBuilder;
 
-use crate::mat::value::{MatValue, NumVec, ScalarNum, ScalarTag};
+use crate::mat::value::{ComplexVec, MatValue, NumVec, ScalarNum, ScalarTag};
 
-use super::transpose::{transpose_pairs, transpose_scalars};
+use crate::mat::transpose::transpose_scalars;
 
 /// Hidden MATLAB conventional group that holds the targets of object
 /// references. Cell-array elements live here, addressed by absolute path.
@@ -177,40 +177,18 @@ fn apply_value_to_dataset(
             apply_char_string(ds, &s);
             Ok(())
         }
-        MatValue::ComplexScalar64 { re, im } => {
-            ds.with_complex64_data(&[(re, im)]).with_shape(&[1, 1]);
-            set_class(ds, MatClass::Double);
+        MatValue::ComplexScalar(n) => {
+            apply_complex(ds, ComplexVec::from_single(n), &[1, 1]);
             Ok(())
         }
-        MatValue::ComplexScalar32 { re, im } => {
-            ds.with_complex32_data(&[(re, im)]).with_shape(&[1, 1]);
-            set_class(ds, MatClass::Single);
-            Ok(())
-        }
-        MatValue::ComplexVec64(pairs) => {
+        MatValue::ComplexVec1D(pairs) => {
             let n = pairs.len() as u64;
-            ds.with_complex64_data(&pairs).with_shape(&[1, n]);
-            set_class(ds, MatClass::Double);
+            apply_complex(ds, pairs, &[1, n]);
             Ok(())
         }
-        MatValue::ComplexVec32(pairs) => {
-            let n = pairs.len() as u64;
-            ds.with_complex32_data(&pairs).with_shape(&[1, n]);
-            set_class(ds, MatClass::Single);
-            Ok(())
-        }
-        MatValue::ComplexMatrix64 { rows, cols, pairs } => {
-            let col_major = transpose_pairs(rows, cols, &pairs);
-            ds.with_complex64_data(&col_major)
-                .with_shape(&[cols as u64, rows as u64]);
-            set_class(ds, MatClass::Double);
-            Ok(())
-        }
-        MatValue::ComplexMatrix32 { rows, cols, pairs } => {
-            let col_major = transpose_pairs(rows, cols, &pairs);
-            ds.with_complex32_data(&col_major)
-                .with_shape(&[cols as u64, rows as u64]);
-            set_class(ds, MatClass::Single);
+        MatValue::ComplexMatrix { rows, cols, pairs } => {
+            let col_major = pairs.transposed(rows, cols);
+            apply_complex(ds, col_major, &[cols as u64, rows as u64]);
             Ok(())
         }
         MatValue::Cell(elements) => apply_cell(ds, elements, refs),
@@ -258,6 +236,27 @@ fn apply_empty_struct_array(ds: &mut DatasetBuilder) {
     ds.with_u64_data(&[]).with_shape(&[0u64, 0]);
     set_class(ds, MatClass::Struct);
     ds.set_attr("MATLAB_empty", AttrValue::U32(1));
+}
+
+/// Write `pairs` as a `{real, imag}` compound dataset of the given HDF5 shape,
+/// tagged with the component's MATLAB class.
+///
+/// The `match` is the one place the component width becomes a concrete Rust
+/// type; a class added to [`ComplexVec`] fails to compile here until it is
+/// listed, which is the point.
+fn apply_complex(ds: &mut DatasetBuilder, pairs: ComplexVec, shape: &[u64]) {
+    let class = pairs.tag().class();
+    macro_rules! arms {
+        ($($variant:ident),* $(,)?) => {
+            match pairs {
+                $(ComplexVec::$variant(v) => {
+                    ds.with_complex_data(&v).with_shape(shape);
+                })*
+            }
+        };
+    }
+    arms!(F64, F32, I64, I32, I16, I8, U64, U32, U16, U8);
+    set_class(ds, class);
 }
 
 fn apply_scalar(ds: &mut DatasetBuilder, n: ScalarNum) -> Result<(), MatError> {

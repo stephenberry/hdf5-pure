@@ -534,7 +534,7 @@ becomes a MATLAB variable. Mapping:
 | `String` / `&str` | `uint16` `[1, N]` UTF-16LE, `MATLAB_class = "char"` |
 | `Vec<T>` of numeric `T` | `[1, N]` row vector |
 | `Matrix<T>` or `Vec<Vec<T>>` of same length | column-major 2-D dataset, HDF5 shape `[cols, rows]` |
-| `Complex32` / `Complex64` | compound `{real, imag}` dataset |
+| `Complex64` / `Complex32` / `ComplexI16` / … | compound `{real, imag}` dataset, `MATLAB_class` = the *component* class |
 | nested struct | HDF5 group with `MATLAB_class = "struct"`, `MATLAB_fields` |
 | `Option<T>` (struct field) | omitted if `None` |
 | unit enum variant | UTF-16 char dataset holding the variant name |

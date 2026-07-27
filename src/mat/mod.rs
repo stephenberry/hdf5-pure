@@ -58,6 +58,8 @@ pub mod dims;
 pub mod identifier;
 pub mod options;
 pub mod string_object;
+#[cfg(feature = "serde")]
+pub(crate) mod transpose;
 
 // Complex/Matrix types and the serde-driven (de)serializer. Only meaningful
 // when serde is in scope.
@@ -88,7 +90,10 @@ pub use options::{
 };
 
 #[cfg(feature = "serde")]
-pub use complex::{Complex32, Complex64};
+pub use complex::{
+    Complex32, Complex64, ComplexI8, ComplexI16, ComplexI32, ComplexI64, ComplexU8, ComplexU16,
+    ComplexU32, ComplexU64,
+};
 #[cfg(feature = "serde")]
 pub use matrix::{MatElement, Matrix};
 #[cfg(feature = "serde")]

@@ -1,10 +1,10 @@
 //! Row-major to column-major transpose shared by both write paths.
 //!
 //! MATLAB stores 2-D arrays column-major; the serializer holds them row-major.
-//! Both the default (`emit`) and options (`emit_with_builder`) write paths need
-//! the same transpose, so it lives here once. The implementation is cache-tiled
-//! (32x32 blocks) to keep both the strided source reads and the destination
-//! writes cache-resident on large matrices.
+//! Both write paths (`ser::emit` and `ser::emit_with_builder`) and the complex
+//! value model need the same transpose, so it lives here once. The
+//! implementation is cache-tiled (32x32 blocks) to keep both the strided source
+//! reads and the destination writes cache-resident on large matrices.
 
 /// Transpose a row-major matrix of shape `[rows, cols]` into column-major.
 ///
@@ -46,13 +46,13 @@ fn transpose_2d<T: Copy>(rows: usize, cols: usize, row_major: &[T]) -> Vec<T> {
 
 /// Transpose a row-major matrix of scalars into column-major order.
 #[inline]
-pub(super) fn transpose_scalars<T: Copy>(rows: usize, cols: usize, row_major: &[T]) -> Vec<T> {
+pub(crate) fn transpose_scalars<T: Copy>(rows: usize, cols: usize, row_major: &[T]) -> Vec<T> {
     transpose_2d(rows, cols, row_major)
 }
 
 /// Transpose a row-major matrix of `(re, im)` pairs into column-major order.
 #[inline]
-pub(super) fn transpose_pairs<T: Copy>(
+pub(crate) fn transpose_pairs<T: Copy>(
     rows: usize,
     cols: usize,
     row_major: &[(T, T)],

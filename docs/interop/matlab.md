@@ -11,7 +11,7 @@ A MATLAB v7.3 `.mat` file is an HDF5 file dressed in MATLAB conventions: a 512-b
 
 ## Requires the `serde` feature
 
-The high-level `.mat` API is gated on the `serde` feature, which is off by default. The `mat::Matrix`, `mat::Complex32`, `mat::Complex64`, and `mat::MatElement` items, along with `mat::to_file` / `mat::from_file`, are only available when it is enabled. See the [features reference](../reference/features.md) for the full list.
+The high-level `.mat` API is gated on the `serde` feature, which is off by default. The `mat::Matrix`, the `mat::Complex*` types, and `mat::MatElement`, along with `mat::to_file` / `mat::from_file`, are only available when it is enabled. See the [features reference](../reference/features.md) for the full list.
 
 ```toml
 [dependencies]
@@ -66,7 +66,7 @@ The serializer maps Rust types to HDF5 datasets and the MATLAB classes MATLAB ex
 | `String` / `&str` | `uint16` `[1, N]` UTF-16LE, `MATLAB_class = "char"` |
 | `Vec<T>` of numeric `T` | `[1, N]` row vector |
 | `Matrix<T>` or `Vec<Vec<T>>` of same length | column-major 2-D dataset, HDF5 shape `[cols, rows]` |
-| `Complex32` / `Complex64` | compound `{real, imag}` dataset |
+| `Complex64` / `Complex32` / `ComplexI16` / … | compound `{real, imag}` dataset, `MATLAB_class` = the *component* class |
 | nested struct | HDF5 group with `MATLAB_class = "struct"`, `MATLAB_fields` |
 | `Option<T>` (struct field) | omitted if `None` |
 | unit `()` / unit struct / `serde_json::Value::Null` (struct field) | omitted, same as `None` (see caveat below) |
@@ -93,11 +93,30 @@ let v = Frame {
 mat::to_file(&v, "matrix.mat").unwrap();
 ```
 
-A bare `Vec<Vec<T>>` whose rows all share a length is also recognized as a 2-D matrix, but `Matrix` is the unambiguous API. The element type `T` is bounded by the sealed `mat::MatElement` trait, which is implemented for `f32`/`f64`, the 8/16/32/64-bit signed and unsigned integers, `bool`, `Complex32`, and `Complex64`. The trait is sealed because MAT v7.3 admits only this fixed set of numeric classes; you cannot implement it for other types.
+A bare `Vec<Vec<T>>` whose rows all share a length is also recognized as a 2-D matrix, but `Matrix` is the unambiguous API. The element type `T` is bounded by the sealed `mat::MatElement` trait, which is implemented for `f32`/`f64`, the 8/16/32/64-bit signed and unsigned integers, `bool`, and every complex type. The trait is sealed because MAT v7.3 admits only this fixed set of numeric classes; you cannot implement it for other types.
 
 ### Complex numbers
 
-`Complex32` and `Complex64` are compound `{real, imag}` newtypes constructed with `Complex64::new(re, im)` (or the `re` / `im` fields directly). A bare value becomes a compound scalar `[1, 1]`; a `Vec<Complex64>` becomes a compound dataset `[1, N]`. The on-disk layout is the same `{real, imag}` compound MATLAB uses for complex arrays. For a deeper treatment of HDF5 compound datasets see the [compound types guide](../guide/compound-types.md).
+There is one complex newtype per component class — `Complex64` and `Complex32` for the float classes, `ComplexI8` / `ComplexI16` / `ComplexI32` / `ComplexI64` and the `ComplexU*` counterparts for the integer ones — each constructed with `ComplexI16::new(re, im)` (or the `re` / `im` fields directly). A bare value becomes a compound scalar `[1, 1]`; a `Vec<ComplexI16>` becomes a compound dataset `[1, N]`. The on-disk layout is the same `{real, imag}` compound MATLAB uses for complex arrays. For a deeper treatment of HDF5 compound datasets see the [compound types guide](../guide/compound-types.md).
+
+`MATLAB_class` names the *component* class, not anything complex-specific, which is how MATLAB tells `complex(int16(re), int16(im))` from a complex `double`. Picking the component your data actually has is worth doing: a capture that samples as pairs of 16-bit integers takes four bytes per sample as `ComplexI16` and eight as `Complex32`, and the extra four carry nothing.
+
+```rust
+use hdf5_pure::mat::{self, ComplexI16};
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize)]
+struct Capture { samples: Vec<ComplexI16> }
+
+let v = Capture {
+    samples: vec![ComplexI16::new(-32768, 32767), ComplexI16::new(0, -1)],
+};
+mat::to_file(&v, "capture.mat").unwrap();
+```
+
+One consumer-side caveat worth knowing before choosing an integer component: MATLAB stores and loads complex integer arrays, but it refuses *arithmetic* on them — `a * b` on two complex `int16` values raises "Complex integer arithmetic is not supported", and the caller has to `double(...)` them first (or use Fixed-Point Designer's `fi` objects). That is a property of MATLAB, not of the file: the array arrives intact and `isa(x, 'int16')` and `iscomplex(x)` both hold. It costs nothing for a capture format that is stored compactly and widened once at the point of use, which is the case this exists for.
+
+Components are never converted between widths, in either direction. An `int16` complex dataset deserializes into `ComplexI16` and nothing else: reading it as `Complex64` would be lossless and is still refused, because the component width is part of what the file says it holds. Reading a `double` capture into `ComplexI16` is refused for the same reason, and would truncate. A caller holding float data that it knows to be exact integers is the one that can decide whether narrowing is meaningful, so do the conversion before serializing.
 
 ## Cell arrays
 

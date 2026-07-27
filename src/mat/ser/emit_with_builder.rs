@@ -8,9 +8,64 @@ use crate::mat::builder::{CellWriter, MatBuilder, StructWriter};
 use crate::mat::class::MatClass;
 use crate::mat::error::MatError;
 use crate::mat::options::{Options, StringClass};
-use crate::mat::value::{MatValue, NumVec, ScalarNum, ScalarTag};
+use crate::mat::value::{ComplexVec, MatValue, NumVec, ScalarNum, ScalarTag};
 
-use super::transpose::{transpose_pairs, transpose_scalars};
+use crate::mat::transpose::transpose_scalars;
+
+/// The complex dispatchers for the three write scopes, from one list.
+///
+/// Each expands to a `match` over every component class, which is where a
+/// class becomes a concrete Rust type; a class added to [`ComplexVec`] fails to
+/// compile here until it is listed, the same compile-time check `ser::emit`
+/// relies on.
+macro_rules! complex_dispatchers {
+    ($($variant:ident => $write:ident, $push:ident),* $(,)?) => {
+        fn write_complex_at_builder(
+            mb: &mut MatBuilder,
+            name: &str,
+            dims: &[usize],
+            pairs: ComplexVec,
+        ) -> Result<(), MatError> {
+            match pairs {
+                $(ComplexVec::$variant(v) => mb.$write(name, dims, &v).map(|_| ()),)*
+            }
+        }
+
+        fn write_complex_at_struct(
+            sw: &mut StructWriter,
+            name: &str,
+            dims: &[usize],
+            pairs: ComplexVec,
+        ) -> Result<(), MatError> {
+            match pairs {
+                $(ComplexVec::$variant(v) => sw.$write(name, dims, &v).map(|_| ()),)*
+            }
+        }
+
+        fn push_complex(
+            cw: &mut CellWriter,
+            dims: &[usize],
+            pairs: ComplexVec,
+        ) -> Result<(), MatError> {
+            match pairs {
+                $(ComplexVec::$variant(v) => cw.$push(dims, &v).map(|_| ()),)*
+            }
+        }
+    };
+}
+
+complex_dispatchers! {
+    F64 => write_complex_f64, push_complex_f64,
+    F32 => write_complex_f32, push_complex_f32,
+    I64 => write_complex_i64, push_complex_i64,
+    I32 => write_complex_i32, push_complex_i32,
+    I16 => write_complex_i16, push_complex_i16,
+    I8 => write_complex_i8, push_complex_i8,
+    U64 => write_complex_u64, push_complex_u64,
+    U32 => write_complex_u32, push_complex_u32,
+    U16 => write_complex_u16, push_complex_u16,
+    U8 => write_complex_u8, push_complex_u8,
+}
 
 /// Walk top-level fields and emit through a `MatBuilder`.
 pub(crate) fn emit_file_with_options(
@@ -95,25 +150,15 @@ fn emit_cell_element(cw: &mut CellWriter, value: MatValue) -> Result<(), MatErro
         MatValue::String(s) => {
             cw.push_char(&s)?;
         }
-        MatValue::ComplexScalar64 { re, im } => {
-            cw.push_complex_f64(&[1, 1], &[(re, im)])?;
+        MatValue::ComplexScalar(n) => {
+            push_complex(cw, &[1, 1], ComplexVec::from_single(n))?;
         }
-        MatValue::ComplexScalar32 { re, im } => {
-            cw.push_complex_f32(&[1, 1], &[(re, im)])?;
+        MatValue::ComplexVec1D(pairs) => {
+            push_complex(cw, &[1, pairs.len()], pairs)?;
         }
-        MatValue::ComplexVec64(pairs) => {
-            cw.push_complex_f64(&[1, pairs.len()], &pairs)?;
-        }
-        MatValue::ComplexVec32(pairs) => {
-            cw.push_complex_f32(&[1, pairs.len()], &pairs)?;
-        }
-        MatValue::ComplexMatrix64 { rows, cols, pairs } => {
-            let col_major = transpose_pairs(rows, cols, &pairs);
-            cw.push_complex_f64(&[rows, cols], &col_major)?;
-        }
-        MatValue::ComplexMatrix32 { rows, cols, pairs } => {
-            let col_major = transpose_pairs(rows, cols, &pairs);
-            cw.push_complex_f32(&[rows, cols], &col_major)?;
+        MatValue::ComplexMatrix { rows, cols, pairs } => {
+            let col_major = pairs.transposed(rows, cols);
+            push_complex(cw, &[rows, cols], col_major)?;
         }
         MatValue::EmptyStructArray => {
             cw.push_empty_struct_array()?;
@@ -266,27 +311,15 @@ fn emit_leaf_at_builder(mb: &mut MatBuilder, name: &str, value: MatValue) -> Res
         MatValue::Vec1D(v) => emit_vec_at_builder(mb, name, v),
         MatValue::Matrix { rows, cols, vec } => emit_matrix_at_builder(mb, name, rows, cols, vec),
         MatValue::String(s) => emit_string_at_builder(mb, name, &s),
-        MatValue::ComplexScalar64 { re, im } => {
-            mb.write_complex_f64(name, &[1, 1], &[(re, im)]).map(|_| ())
+        MatValue::ComplexScalar(n) => {
+            write_complex_at_builder(mb, name, &[1, 1], ComplexVec::from_single(n))
         }
-        MatValue::ComplexScalar32 { re, im } => {
-            mb.write_complex_f32(name, &[1, 1], &[(re, im)]).map(|_| ())
+        MatValue::ComplexVec1D(pairs) => {
+            write_complex_at_builder(mb, name, &[1, pairs.len()], pairs)
         }
-        MatValue::ComplexVec64(pairs) => mb
-            .write_complex_f64(name, &[1, pairs.len()], &pairs)
-            .map(|_| ()),
-        MatValue::ComplexVec32(pairs) => mb
-            .write_complex_f32(name, &[1, pairs.len()], &pairs)
-            .map(|_| ()),
-        MatValue::ComplexMatrix64 { rows, cols, pairs } => {
-            let col_major = transpose_pairs(rows, cols, &pairs);
-            mb.write_complex_f64(name, &[rows, cols], &col_major)
-                .map(|_| ())
-        }
-        MatValue::ComplexMatrix32 { rows, cols, pairs } => {
-            let col_major = transpose_pairs(rows, cols, &pairs);
-            mb.write_complex_f32(name, &[rows, cols], &col_major)
-                .map(|_| ())
+        MatValue::ComplexMatrix { rows, cols, pairs } => {
+            let col_major = pairs.transposed(rows, cols);
+            write_complex_at_builder(mb, name, &[rows, cols], col_major)
         }
         MatValue::EmptyStructArray => mb.write_empty_struct_array(name).map(|_| ()),
         MatValue::Opaque { .. } | MatValue::StructArray { .. } => {
@@ -304,27 +337,15 @@ fn emit_leaf_at_struct(sw: &mut StructWriter, name: &str, value: MatValue) -> Re
         MatValue::Vec1D(v) => emit_vec_at_struct(sw, name, v),
         MatValue::Matrix { rows, cols, vec } => emit_matrix_at_struct(sw, name, rows, cols, vec),
         MatValue::String(s) => emit_string_at_struct(sw, name, &s),
-        MatValue::ComplexScalar64 { re, im } => {
-            sw.write_complex_f64(name, &[1, 1], &[(re, im)]).map(|_| ())
+        MatValue::ComplexScalar(n) => {
+            write_complex_at_struct(sw, name, &[1, 1], ComplexVec::from_single(n))
         }
-        MatValue::ComplexScalar32 { re, im } => {
-            sw.write_complex_f32(name, &[1, 1], &[(re, im)]).map(|_| ())
+        MatValue::ComplexVec1D(pairs) => {
+            write_complex_at_struct(sw, name, &[1, pairs.len()], pairs)
         }
-        MatValue::ComplexVec64(pairs) => sw
-            .write_complex_f64(name, &[1, pairs.len()], &pairs)
-            .map(|_| ()),
-        MatValue::ComplexVec32(pairs) => sw
-            .write_complex_f32(name, &[1, pairs.len()], &pairs)
-            .map(|_| ()),
-        MatValue::ComplexMatrix64 { rows, cols, pairs } => {
-            let col_major = transpose_pairs(rows, cols, &pairs);
-            sw.write_complex_f64(name, &[rows, cols], &col_major)
-                .map(|_| ())
-        }
-        MatValue::ComplexMatrix32 { rows, cols, pairs } => {
-            let col_major = transpose_pairs(rows, cols, &pairs);
-            sw.write_complex_f32(name, &[rows, cols], &col_major)
-                .map(|_| ())
+        MatValue::ComplexMatrix { rows, cols, pairs } => {
+            let col_major = pairs.transposed(rows, cols);
+            write_complex_at_struct(sw, name, &[rows, cols], col_major)
         }
         MatValue::EmptyStructArray => sw.write_empty_struct_array(name).map(|_| ()),
         MatValue::Opaque { .. } | MatValue::StructArray { .. } => {

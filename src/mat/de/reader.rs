@@ -10,8 +10,9 @@ use crate::mat::de::mcos_reader::{self, Mcos, PropValue};
 use crate::mat::error::MatError;
 use crate::mat::string_object::MCOS_MAGIC_NUMBER;
 use crate::mat::utf16;
-use crate::mat::value::{MatValue, NumVec, ScalarNum};
+use crate::mat::value::{ComplexTag, ComplexVec, MatValue, NumVec, ScalarNum};
 use crate::reader::{Dataset, File, Group, Object};
+use crate::type_builders::ComplexComponent;
 use crate::types::DType;
 
 /// Maximum struct/cell nesting depth followed when reading. Real MATLAB data
@@ -450,8 +451,10 @@ fn read_dataset(
         // Complex compound types preserve their shape and class so a 0×0
         // `Matrix<Complex*>` round-trips back to a 0×0 complex matrix
         // rather than collapsing to a numeric empty vec.
-        if matches!(class, MatClass::Double | MatClass::Single) && is_complex_dtype(&dtype) {
-            return empty_complex_value(class, &shape);
+        if is_complex_dtype(&dtype)
+            && let Some(tag) = ComplexTag::from_class(class)
+        {
+            return empty_complex_value(tag, &shape);
         }
         // An empty struct-classed *dataset* (`MATLAB_empty=1`) is `struct([])`,
         // the marker the serializer writes for `Option::None` inside a
@@ -657,23 +660,15 @@ fn is_empty_attr(attrs: &HashMap<String, AttrValue>) -> bool {
     }
 }
 
-/// Build an empty `ComplexMatrix*` whose `(rows, cols)` matches the dataspace
+/// Build an empty `ComplexMatrix` whose `(rows, cols)` matches the dataspace
 /// shape, so deserializing into `Matrix<Complex*>` recovers the original
 /// shape (0×0, 0×N, N×0) instead of collapsing to 1×0.
-fn empty_complex_value(class: MatClass, shape: &[u64]) -> Result<MatValue, MatError> {
+fn empty_complex_value(tag: ComplexTag, shape: &[u64]) -> Result<MatValue, MatError> {
     let (rows, cols, _total) = shape_decomposition(shape)?;
-    Ok(match class {
-        MatClass::Double => MatValue::ComplexMatrix64 {
-            rows,
-            cols,
-            pairs: Vec::new(),
-        },
-        MatClass::Single => MatValue::ComplexMatrix32 {
-            rows,
-            cols,
-            pairs: Vec::new(),
-        },
-        _ => unreachable!("empty_complex_value called with non-float class"),
+    Ok(MatValue::ComplexMatrix {
+        rows,
+        cols,
+        pairs: ComplexVec::empty_with_tag(tag),
     })
 }
 
@@ -890,101 +885,85 @@ fn transpose_col_major_to_row_major(
 
 fn read_complex(ds: &Dataset, shape: &[u64], class: MatClass) -> Result<MatValue, MatError> {
     let (rows, cols, total) = shape_decomposition(shape)?;
+    let Some(tag) = ComplexTag::from_class(class) else {
+        return Err(MatError::Custom(format!(
+            "complex {{real, imag}} compound on class {}, which has no complex form",
+            class.as_str()
+        )));
+    };
     let bytes = ds.read_u8().map_err(MatError::Hdf5)?;
+    let pairs = parse_complex_vec(&bytes, total, tag)?;
 
-    match class {
-        MatClass::Double => {
-            let pairs = parse_complex64_pairs(&bytes, total)?;
-            if total == 1 {
-                let (re, im) = pairs[0];
-                return Ok(MatValue::ComplexScalar64 { re, im });
-            }
-            // Preserve the MATLAB [rows, cols] shape even when one dim is 1,
-            // so `Matrix<Complex64>` round-trips as a row vs column vector.
-            // The deserializer flattens to a plain sequence for
-            // `Vec<Complex64>` callers.
-            let row_major = if rows == 1 || cols == 1 {
-                pairs
-            } else {
-                transpose_pairs_col_to_row(pairs, rows, cols)
-            };
-            Ok(MatValue::ComplexMatrix64 {
-                rows,
-                cols,
-                pairs: row_major,
-            })
-        }
-        MatClass::Single => {
-            let pairs = parse_complex32_pairs(&bytes, total)?;
-            if total == 1 {
-                let (re, im) = pairs[0];
-                return Ok(MatValue::ComplexScalar32 { re, im });
-            }
-            let row_major = if rows == 1 || cols == 1 {
-                pairs
-            } else {
-                transpose_pairs_col_to_row(pairs, rows, cols)
-            };
-            Ok(MatValue::ComplexMatrix32 {
-                rows,
-                cols,
-                pairs: row_major,
-            })
-        }
-        _ => Err(MatError::Custom(
-            "complex compound on non-float class".into(),
-        )),
+    if total == 1 {
+        // `get` is in bounds: `parse_complex_vec` returned `total` pairs.
+        return Ok(MatValue::ComplexScalar(pairs.get(0).expect("one pair")));
     }
+    // Preserve the MATLAB [rows, cols] shape even when one dim is 1, so
+    // `Matrix<Complex*>` round-trips as a row vs column vector. The
+    // deserializer flattens to a plain sequence for `Vec<Complex*>` callers.
+    let row_major = if rows == 1 || cols == 1 {
+        pairs
+    } else {
+        // Stored column-major: transposing `[cols, rows]` yields row-major.
+        pairs.transposed(cols, rows)
+    };
+    Ok(MatValue::ComplexMatrix {
+        rows,
+        cols,
+        pairs: row_major,
+    })
 }
 
-fn parse_complex64_pairs(bytes: &[u8], count: usize) -> Result<Vec<(f64, f64)>, MatError> {
-    if bytes.len() < count * 16 {
+/// Decode `count` `{real, imag}` pairs of the component class `tag` from the
+/// dataset's raw element bytes.
+fn parse_complex_vec(bytes: &[u8], count: usize, tag: ComplexTag) -> Result<ComplexVec, MatError> {
+    macro_rules! arms {
+        ($($variant:ident => $ty:ty),* $(,)?) => {
+            match tag {
+                $(ComplexTag::$variant => {
+                    ComplexVec::$variant(parse_complex_pairs::<$ty>(bytes, count, tag)?)
+                })*
+            }
+        };
+    }
+    Ok(arms! {
+        F64 => f64,
+        F32 => f32,
+        I64 => i64,
+        I32 => i32,
+        I16 => i16,
+        I8 => i8,
+        U64 => u64,
+        U32 => u32,
+        U16 => u16,
+        U8 => u8,
+    })
+}
+
+fn parse_complex_pairs<T: ComplexComponent>(
+    bytes: &[u8],
+    count: usize,
+    tag: ComplexTag,
+) -> Result<Vec<(T, T)>, MatError> {
+    let component = size_of::<T>();
+    let element = component * 2;
+    if bytes.len() < count * element {
         return Err(MatError::Custom(format!(
-            "complex64 raw bytes too short: need {}, have {}",
-            count * 16,
+            "complex {} raw bytes too short: need {}, have {}",
+            tag.class().as_str(),
+            count * element,
             bytes.len()
         )));
     }
     let mut out = Vec::with_capacity(count);
     for i in 0..count {
-        let off = i * 16;
-        let re = f64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
-        let im = f64::from_le_bytes(bytes[off + 8..off + 16].try_into().unwrap());
-        out.push((re, im));
+        let off = i * element;
+        out.push((
+            T::decode_le(&bytes[off..off + component]),
+            T::decode_le(&bytes[off + component..off + element]),
+        ));
     }
     Ok(out)
-}
-
-fn parse_complex32_pairs(bytes: &[u8], count: usize) -> Result<Vec<(f32, f32)>, MatError> {
-    if bytes.len() < count * 8 {
-        return Err(MatError::Custom(format!(
-            "complex32 raw bytes too short: need {}, have {}",
-            count * 8,
-            bytes.len()
-        )));
-    }
-    let mut out = Vec::with_capacity(count);
-    for i in 0..count {
-        let off = i * 8;
-        let re = f32::from_le_bytes(bytes[off..off + 4].try_into().unwrap());
-        let im = f32::from_le_bytes(bytes[off + 4..off + 8].try_into().unwrap());
-        out.push((re, im));
-    }
-    Ok(out)
-}
-
-fn transpose_pairs_col_to_row<T: Copy>(
-    col_major: Vec<(T, T)>,
-    rows: usize,
-    cols: usize,
-) -> Vec<(T, T)> {
-    let mut out = Vec::with_capacity(rows * cols);
-    for r in 0..rows {
-        for c in 0..cols {
-            out.push(col_major[c * rows + r]);
-        }
-    }
-    out
 }
 
 #[cfg(test)]

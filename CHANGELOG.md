@@ -12,6 +12,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `File::open_rw_bounded` offers the full staged edit surface — `Dataset::write`, attribute edits, `create_*`/`delete`, `copy`, `commit`, `space_accounting` — at bounded memory: a commit holds only what it is building rather than a whole-file mirror. It still requires a latest-format file with 8-byte offsets and no userblock ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
 - `Dataset::append` grows a file that persists its free space, including a paged one, from `File::open_rw` as well as `File::open_rw_bounded`; the on-disk free-space managers are re-homed when the file is closed ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
 - A `Dataset` reached by object reference can append on either read-write open, not only `File::open_rw_bounded`. It is refused once the session stages or commits an edit, because a commit can move the object header the handle names ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
+- MAT v7.3 complex arrays with integer components: `mat::ComplexI8`/`I16`/`I32`/`I64` and the `ComplexU*` counterparts join `Complex64`/`Complex32` across the serde, `Matrix<T>`, and `MatBuilder::write_complex_*` surfaces, so a capture that samples as 16-bit integer pairs stores four bytes per sample instead of eight. Components are never converted between widths: an `int16` complex dataset deserializes into `ComplexI16` and nothing else, in either direction.
 
 ### Changed
 

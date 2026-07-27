@@ -1,7 +1,9 @@
 //! Intermediate value tree built by the serializer, later emitted to an
 //! HDF5 file with MATLAB conventions.
 
+use crate::mat::class::MatClass;
 use crate::mat::error::MatError;
+use crate::mat::transpose::transpose_pairs;
 
 /// A scalar numeric value tagged by its Rust type.
 #[derive(Debug, Clone, PartialEq)]
@@ -198,6 +200,198 @@ impl NumVec {
     }
 }
 
+/// The complex counterparts of [`ScalarNum`] / [`NumVec`], generated from one
+/// list so a component width is added in a single place.
+///
+/// MATLAB stores a complex array as a `{real, imag}` compound whose
+/// `MATLAB_class` names the *component* class, so the set of component classes
+/// is the numeric classes: every one that [`NumVec`] carries except `logical`,
+/// which has no complex form. Keeping the component class in a tag rather than
+/// in the variant name is what lets an empty complex array still know what it
+/// is — the pairs are gone, the tag is not.
+macro_rules! complex_kinds {
+    ($($variant:ident => $ty:ty, $class:ident),* $(,)?) => {
+        /// The component class of a complex value.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(crate) enum ComplexTag {
+            $($variant,)*
+        }
+
+        impl ComplexTag {
+            /// The MATLAB class a complex array of this component reports in
+            /// its `MATLAB_class` attribute.
+            pub(crate) fn class(self) -> MatClass {
+                match self {
+                    $(ComplexTag::$variant => MatClass::$class,)*
+                }
+            }
+
+            /// The component tag for `class`, or `None` for a class that has no
+            /// complex form (`char`, `logical`, `struct`, `cell`).
+            pub(crate) fn from_class(class: MatClass) -> Option<Self> {
+                match class {
+                    $(MatClass::$class => Some(ComplexTag::$variant),)*
+                    _ => None,
+                }
+            }
+        }
+
+        /// A complex scalar tagged by its component class.
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        pub(crate) enum ComplexNum {
+            $($variant($ty, $ty),)*
+        }
+
+        impl ComplexNum {
+            pub(crate) fn tag(&self) -> ComplexTag {
+                match self {
+                    $(ComplexNum::$variant(..) => ComplexTag::$variant,)*
+                }
+            }
+
+            /// The real and imaginary parts as tagged scalars, so a caller can
+            /// hand each to serde without naming the component type.
+            pub(crate) fn components(self) -> (ScalarNum, ScalarNum) {
+                match self {
+                    $(ComplexNum::$variant(re, im) => {
+                        (ScalarNum::$variant(re), ScalarNum::$variant(im))
+                    })*
+                }
+            }
+
+            /// Rebuild a complex value from its two components, requiring both
+            /// to carry `tag`'s class.
+            ///
+            /// Returns `None` on any mismatch rather than converting: a
+            /// component is stored at the width the caller asked for, so a
+            /// coercion here would be a silent change of what the file says it
+            /// holds.
+            pub(crate) fn from_components(
+                tag: ComplexTag,
+                re: ScalarNum,
+                im: ScalarNum,
+            ) -> Option<Self> {
+                match (tag, re, im) {
+                    $((ComplexTag::$variant, ScalarNum::$variant(re), ScalarNum::$variant(im)) => {
+                        Some(ComplexNum::$variant(re, im))
+                    })*
+                    _ => None,
+                }
+            }
+
+            /// Promote a real scalar to a complex value with a zero imaginary
+            /// part, when the scalar's class is `tag`'s. `None` for a class
+            /// mismatch, and for `logical`, which has no complex form.
+            pub(crate) fn from_real(tag: ComplexTag, re: ScalarNum) -> Option<Self> {
+                match (tag, re) {
+                    $((ComplexTag::$variant, ScalarNum::$variant(re)) => {
+                        Some(ComplexNum::$variant(re, <$ty>::default()))
+                    })*
+                    _ => None,
+                }
+            }
+        }
+
+        /// A typed 1-D array of complex pairs, laid out `[(re, im), ...]`.
+        #[derive(Debug, Clone, PartialEq)]
+        pub(crate) enum ComplexVec {
+            $($variant(Vec<($ty, $ty)>),)*
+        }
+
+        impl ComplexVec {
+            pub(crate) fn len(&self) -> usize {
+                match self {
+                    $(ComplexVec::$variant(v) => v.len(),)*
+                }
+            }
+
+            pub(crate) fn tag(&self) -> ComplexTag {
+                match self {
+                    $(ComplexVec::$variant(_) => ComplexTag::$variant,)*
+                }
+            }
+
+            pub(crate) fn empty_with_tag(tag: ComplexTag) -> Self {
+                match tag {
+                    $(ComplexTag::$variant => ComplexVec::$variant(Vec::new()),)*
+                }
+            }
+
+            pub(crate) fn with_capacity_for_tag(tag: ComplexTag, cap: usize) -> Self {
+                match tag {
+                    $(ComplexTag::$variant => ComplexVec::$variant(Vec::with_capacity(cap)),)*
+                }
+            }
+
+            pub(crate) fn from_single(n: ComplexNum) -> Self {
+                match n {
+                    $(ComplexNum::$variant(re, im) => ComplexVec::$variant(vec![(re, im)]),)*
+                }
+            }
+
+            /// The pair at `index`, or `None` if out of bounds.
+            pub(crate) fn get(&self, index: usize) -> Option<ComplexNum> {
+                match self {
+                    $(ComplexVec::$variant(v) => {
+                        v.get(index).map(|&(re, im)| ComplexNum::$variant(re, im))
+                    })*
+                }
+            }
+
+            /// Push a pair, requiring a matching tag.
+            pub(crate) fn push(&mut self, n: ComplexNum) -> Result<(), MatError> {
+                match (self, n) {
+                    $((ComplexVec::$variant(v), ComplexNum::$variant(re, im)) => v.push((re, im)),)*
+                    _ => return Err(MatError::MixedSequenceElementTypes),
+                }
+                Ok(())
+            }
+
+            /// Append another vec of the same tag.
+            pub(crate) fn extend(&mut self, other: ComplexVec) -> Result<(), MatError> {
+                match (self, other) {
+                    $((ComplexVec::$variant(a), ComplexVec::$variant(b)) => a.extend(b),)*
+                    _ => return Err(MatError::MixedSequenceElementTypes),
+                }
+                Ok(())
+            }
+
+            /// Split the first `n` pairs off the front, leaving the rest.
+            pub(crate) fn split_off_front(&mut self, n: usize) -> ComplexVec {
+                match self {
+                    $(ComplexVec::$variant(v) => {
+                        let tail = v.split_off(n);
+                        ComplexVec::$variant(core::mem::replace(v, tail))
+                    })*
+                }
+            }
+
+            /// Reinterpret `rows × cols` row-major pairs as column-major, the
+            /// order MATLAB stores a matrix in.
+            pub(crate) fn transposed(self, rows: usize, cols: usize) -> Self {
+                match self {
+                    $(ComplexVec::$variant(v) => {
+                        ComplexVec::$variant(transpose_pairs(rows, cols, &v))
+                    })*
+                }
+            }
+        }
+    };
+}
+
+complex_kinds! {
+    F64 => f64, Double,
+    F32 => f32, Single,
+    I64 => i64, Int64,
+    I32 => i32, Int32,
+    I16 => i16, Int16,
+    I8 => i8, Int8,
+    U64 => u64, UInt64,
+    U32 => u32, UInt32,
+    U16 => u16, UInt16,
+    U8 => u8, UInt8,
+}
+
 /// Intermediate tree node produced by the value serializer.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum MatValue {
@@ -216,25 +410,16 @@ pub(crate) enum MatValue {
     },
     /// UTF-16 `char` string → stored as `uint16 [1, N]`.
     String(String),
-    /// Complex scalar (`double` class).
-    ComplexScalar64 { re: f64, im: f64 },
-    /// Complex scalar (`single` class).
-    ComplexScalar32 { re: f32, im: f32 },
-    /// Complex 1-D array (`double`). Pairs laid out `[(re, im), ...]`.
-    ComplexVec64(Vec<(f64, f64)>),
-    /// Complex 1-D array (`single`).
-    ComplexVec32(Vec<(f32, f32)>),
-    /// Complex 2-D matrix (`double`), row-major pairs.
-    ComplexMatrix64 {
+    /// Complex scalar → stored as a `[1, 1]` `{real, imag}` compound.
+    ComplexScalar(ComplexNum),
+    /// Complex 1-D array → stored as `[1, N]`.
+    ComplexVec1D(ComplexVec),
+    /// Complex 2-D matrix in row-major order → stored column-major with shape
+    /// `[cols, rows]`, mirroring [`MatValue::Matrix`].
+    ComplexMatrix {
         rows: usize,
         cols: usize,
-        pairs: Vec<(f64, f64)>,
-    },
-    /// Complex 2-D matrix (`single`).
-    ComplexMatrix32 {
-        rows: usize,
-        cols: usize,
-        pairs: Vec<(f32, f32)>,
+        pairs: ComplexVec,
     },
     /// Ordered, named fields. Serialized as a MATLAB struct group.
     Struct(Vec<(String, MatValue)>),
@@ -305,9 +490,9 @@ impl MatValue {
             MatValue::Vec1D(_) => "1-D vector",
             MatValue::Matrix { .. } => "2-D matrix",
             MatValue::String(_) => "string",
-            MatValue::ComplexScalar64 { .. } | MatValue::ComplexScalar32 { .. } => "complex scalar",
-            MatValue::ComplexVec64(_) | MatValue::ComplexVec32(_) => "complex vector",
-            MatValue::ComplexMatrix64 { .. } | MatValue::ComplexMatrix32 { .. } => "complex matrix",
+            MatValue::ComplexScalar(_) => "complex scalar",
+            MatValue::ComplexVec1D(_) => "complex vector",
+            MatValue::ComplexMatrix { .. } => "complex matrix",
             MatValue::Struct(_) => "struct",
             MatValue::Cell(_) => "cell array",
             MatValue::EmptyStructArray => "empty struct array",

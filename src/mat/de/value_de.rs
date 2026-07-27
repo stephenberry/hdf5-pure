@@ -11,12 +11,12 @@ use serde::de::{
 };
 use serde::forward_to_deserialize_any;
 
-use crate::mat::complex::{COMPLEX32_SENTINEL, COMPLEX64_SENTINEL};
+use crate::mat::complex::complex_tag_for_sentinel;
 use crate::mat::de::mcos_reader::TABLE_META_KEY;
 use crate::mat::error::MatError;
-use crate::mat::matrix::{MATRIX_COMPLEX32_SENTINEL, MATRIX_COMPLEX64_SENTINEL, MATRIX_SENTINEL};
+use crate::mat::matrix::{MATRIX_SENTINEL, complex_tag_for_matrix_sentinel};
 use crate::mat::table::{MATCOLUMN_SENTINEL, MATTABLE_SENTINEL};
-use crate::mat::value::{MatValue, NumVec, ScalarNum};
+use crate::mat::value::{ComplexNum, ComplexVec, MatValue, NumVec, ScalarNum};
 
 // ---------------------------------------------------------------------------
 // Entry point
@@ -213,26 +213,15 @@ impl<'de> Deserializer<'de> for MatValueDeserializer {
             MatValue::Matrix { rows, cols, vec } => {
                 visitor.visit_seq(MatrixRowsSeq::new(rows, cols, vec))
             }
-            MatValue::ComplexVec64(pairs) => {
-                visitor.visit_seq(ComplexPairsSeq::Vec64(pairs.into_iter().collect()))
-            }
-            MatValue::ComplexVec32(pairs) => {
-                visitor.visit_seq(ComplexPairsSeq::Vec32(pairs.into_iter().collect()))
-            }
+            MatValue::ComplexVec1D(pairs) => visitor.visit_seq(ComplexPairsSeq::new(pairs)),
             // A degenerate 2-D complex matrix (1×N or N×1) flattens to a
             // sequence so `Vec<Complex*>` deserializes from either
             // orientation, matching the numeric `Matrix` flatten above.
-            MatValue::ComplexMatrix64 { rows, cols, pairs } if rows == 1 || cols == 1 => {
-                visitor.visit_seq(ComplexPairsSeq::Vec64(pairs.into_iter().collect()))
+            MatValue::ComplexMatrix { rows, cols, pairs } if rows == 1 || cols == 1 => {
+                visitor.visit_seq(ComplexPairsSeq::new(pairs))
             }
-            MatValue::ComplexMatrix32 { rows, cols, pairs } if rows == 1 || cols == 1 => {
-                visitor.visit_seq(ComplexPairsSeq::Vec32(pairs.into_iter().collect()))
-            }
-            MatValue::ComplexMatrix64 { rows, cols, pairs } => {
-                visitor.visit_seq(ComplexMatrixRowsSeq::new64(rows, cols, pairs))
-            }
-            MatValue::ComplexMatrix32 { rows, cols, pairs } => {
-                visitor.visit_seq(ComplexMatrixRowsSeq::new32(rows, cols, pairs))
+            MatValue::ComplexMatrix { rows, cols, pairs } => {
+                visitor.visit_seq(ComplexMatrixRowsSeq::new(rows, cols, pairs))
             }
             MatValue::Cell(elements) => visitor.visit_seq(CellSeq::new(elements)),
             // A struct array deserializes like `Matrix`: a `1×N`/`N×1` array
@@ -254,6 +243,11 @@ impl<'de> Deserializer<'de> for MatValueDeserializer {
             MatValue::Scalar(s) => {
                 let v = NumVec::from_single(s);
                 visitor.visit_seq(Vec1DSeq::new(v))
+            }
+            // …and so can a complex scalar, which is what a one-element
+            // complex array reads back as.
+            MatValue::ComplexScalar(n) => {
+                visitor.visit_seq(ComplexPairsSeq::new(ComplexVec::from_single(n)))
             }
             other => mismatch("sequence", other),
         }
@@ -297,12 +291,38 @@ impl<'de> Deserializer<'de> for MatValueDeserializer {
         fields: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, MatError> {
+        // A complex sentinel names one component class, and only a value of
+        // that class satisfies it. Reading an `int16` complex dataset into a
+        // `Complex64` (or the reverse) is refused rather than converted: the
+        // component width is what the file says it holds, so silently changing
+        // it would make the Rust type a poor witness of the file.
+        if let Some(tag) = complex_tag_for_sentinel(name) {
+            let got = self.value.kind();
+            let wanted = || {
+                MatError::Custom(format!(
+                    "expected a complex {} value, got {got}",
+                    tag.class().as_str()
+                ))
+            };
+            return match self.value {
+                MatValue::ComplexScalar(n) if n.tag() == tag => {
+                    visitor.visit_map(ComplexStructMap::new(n))
+                }
+                // A real value of the same class reads as complex with a zero
+                // imaginary part.
+                MatValue::Scalar(s) => match ComplexNum::from_real(tag, s) {
+                    Some(n) => visitor.visit_map(ComplexStructMap::new(n)),
+                    None => Err(wanted()),
+                },
+                _ => Err(wanted()),
+            };
+        }
         match name {
-            // The three Matrix sentinels (numeric and the two complex
-            // variants) all consume the same set of `MatValue` shapes; the
-            // sentinel name only matters at serialize time, where it
-            // preserves the element class for an empty Vec.
-            MATRIX_SENTINEL | MATRIX_COMPLEX64_SENTINEL | MATRIX_COMPLEX32_SENTINEL => {
+            // Every Matrix sentinel (numeric and the per-class complex ones)
+            // consumes the same set of `MatValue` shapes; the sentinel name
+            // only matters at serialize time, where it preserves the element
+            // class for an empty Vec.
+            _ if name == MATRIX_SENTINEL || complex_tag_for_matrix_sentinel(name).is_some() => {
                 match self.value {
                     MatValue::Matrix { rows, cols, vec } => {
                         visitor.visit_map(MatrixStructMap::numeric(rows, cols, vec))
@@ -317,47 +337,21 @@ impl<'de> Deserializer<'de> for MatValueDeserializer {
                         let v = NumVec::from_single(s);
                         visitor.visit_map(MatrixStructMap::numeric(1, 1, v))
                     }
-                    MatValue::ComplexMatrix64 { rows, cols, pairs } => {
-                        visitor.visit_map(MatrixStructMap::complex64(rows, cols, pairs))
+                    MatValue::ComplexMatrix { rows, cols, pairs } => {
+                        visitor.visit_map(MatrixStructMap::complex(rows, cols, pairs))
                     }
-                    MatValue::ComplexMatrix32 { rows, cols, pairs } => {
-                        visitor.visit_map(MatrixStructMap::complex32(rows, cols, pairs))
-                    }
-                    MatValue::ComplexVec64(pairs) => {
+                    MatValue::ComplexVec1D(pairs) => {
                         let len = pairs.len();
-                        visitor.visit_map(MatrixStructMap::complex64(1, len, pairs))
+                        visitor.visit_map(MatrixStructMap::complex(1, len, pairs))
                     }
-                    MatValue::ComplexVec32(pairs) => {
-                        let len = pairs.len();
-                        visitor.visit_map(MatrixStructMap::complex32(1, len, pairs))
-                    }
-                    MatValue::ComplexScalar64 { re, im } => {
-                        visitor.visit_map(MatrixStructMap::complex64(1, 1, vec![(re, im)]))
-                    }
-                    MatValue::ComplexScalar32 { re, im } => {
-                        visitor.visit_map(MatrixStructMap::complex32(1, 1, vec![(re, im)]))
-                    }
+                    MatValue::ComplexScalar(n) => visitor.visit_map(MatrixStructMap::complex(
+                        1,
+                        1,
+                        ComplexVec::from_single(n),
+                    )),
                     other => mismatch("Matrix", other),
                 }
             }
-            COMPLEX64_SENTINEL => match self.value {
-                MatValue::ComplexScalar64 { re, im } => {
-                    visitor.visit_map(ComplexStructMap64::new(re, im))
-                }
-                MatValue::Scalar(ScalarNum::F64(re)) => {
-                    visitor.visit_map(ComplexStructMap64::new(re, 0.0))
-                }
-                other => mismatch("Complex64", other),
-            },
-            COMPLEX32_SENTINEL => match self.value {
-                MatValue::ComplexScalar32 { re, im } => {
-                    visitor.visit_map(ComplexStructMap32::new(re, im))
-                }
-                MatValue::Scalar(ScalarNum::F32(re)) => {
-                    visitor.visit_map(ComplexStructMap32::new(re, 0.0))
-                }
-                other => mismatch("Complex32", other),
-            },
             // A `MatColumn` asks for the underlying table-column value tagged by
             // kind, so the right variant can be built with full type fidelity.
             MATCOLUMN_SENTINEL => {
@@ -444,25 +438,13 @@ fn dispatch_any<'de, V: Visitor<'de>>(value: MatValue, visitor: V) -> Result<V::
         MatValue::Matrix { rows, cols, vec } => {
             visitor.visit_seq(MatrixRowsSeq::new(rows, cols, vec))
         }
-        MatValue::ComplexScalar64 { re, im } => visitor.visit_map(ComplexStructMap64::new(re, im)),
-        MatValue::ComplexScalar32 { re, im } => visitor.visit_map(ComplexStructMap32::new(re, im)),
-        MatValue::ComplexVec64(pairs) => {
-            visitor.visit_seq(ComplexPairsSeq::Vec64(pairs.into_iter().collect()))
+        MatValue::ComplexScalar(n) => visitor.visit_map(ComplexStructMap::new(n)),
+        MatValue::ComplexVec1D(pairs) => visitor.visit_seq(ComplexPairsSeq::new(pairs)),
+        MatValue::ComplexMatrix { rows, cols, pairs } if rows == 1 || cols == 1 => {
+            visitor.visit_seq(ComplexPairsSeq::new(pairs))
         }
-        MatValue::ComplexVec32(pairs) => {
-            visitor.visit_seq(ComplexPairsSeq::Vec32(pairs.into_iter().collect()))
-        }
-        MatValue::ComplexMatrix64 { rows, cols, pairs } if rows == 1 || cols == 1 => {
-            visitor.visit_seq(ComplexPairsSeq::Vec64(pairs.into_iter().collect()))
-        }
-        MatValue::ComplexMatrix32 { rows, cols, pairs } if rows == 1 || cols == 1 => {
-            visitor.visit_seq(ComplexPairsSeq::Vec32(pairs.into_iter().collect()))
-        }
-        MatValue::ComplexMatrix64 { rows, cols, pairs } => {
-            visitor.visit_seq(ComplexMatrixRowsSeq::new64(rows, cols, pairs))
-        }
-        MatValue::ComplexMatrix32 { rows, cols, pairs } => {
-            visitor.visit_seq(ComplexMatrixRowsSeq::new32(rows, cols, pairs))
+        MatValue::ComplexMatrix { rows, cols, pairs } => {
+            visitor.visit_seq(ComplexMatrixRowsSeq::new(rows, cols, pairs))
         }
         MatValue::Struct(fields) => visitor.visit_map(StructMap::new(fields)),
         MatValue::Cell(elements) => visitor.visit_seq(CellSeq::new(elements)),
@@ -791,9 +773,17 @@ impl NumVecIter {
 // ComplexPairs SeqAccess
 // ---------------------------------------------------------------------------
 
-enum ComplexPairsSeq {
-    Vec64(VecDeque<(f64, f64)>),
-    Vec32(VecDeque<(f32, f32)>),
+/// Yields each pair of a complex vector as a complex scalar, so `Vec<T>`
+/// deserializes element by element without materializing per-element values.
+struct ComplexPairsSeq {
+    pairs: ComplexVec,
+    next: usize,
+}
+
+impl ComplexPairsSeq {
+    fn new(pairs: ComplexVec) -> Self {
+        Self { pairs, next: 0 }
+    }
 }
 
 impl<'de> SeqAccess<'de> for ComplexPairsSeq {
@@ -802,62 +792,34 @@ impl<'de> SeqAccess<'de> for ComplexPairsSeq {
         &mut self,
         seed: T,
     ) -> Result<Option<T::Value>, MatError> {
-        match self {
-            ComplexPairsSeq::Vec64(q) => match q.pop_front() {
-                Some((re, im)) => seed
-                    .deserialize(MatValueDeserializer::new(MatValue::ComplexScalar64 {
-                        re,
-                        im,
-                    }))
-                    .map(Some),
-                None => Ok(None),
-            },
-            ComplexPairsSeq::Vec32(q) => match q.pop_front() {
-                Some((re, im)) => seed
-                    .deserialize(MatValueDeserializer::new(MatValue::ComplexScalar32 {
-                        re,
-                        im,
-                    }))
-                    .map(Some),
-                None => Ok(None),
-            },
+        match self.pairs.get(self.next) {
+            Some(n) => {
+                self.next += 1;
+                seed.deserialize(MatValueDeserializer::new(MatValue::ComplexScalar(n)))
+                    .map(Some)
+            }
+            None => Ok(None),
         }
     }
     fn size_hint(&self) -> Option<usize> {
-        Some(match self {
-            ComplexPairsSeq::Vec64(q) => q.len(),
-            ComplexPairsSeq::Vec32(q) => q.len(),
-        })
+        Some(self.pairs.len() - self.next)
     }
 }
 
 // ---------------------------------------------------------------------------
-// ComplexMatrixRows SeqAccess: yields each row as ComplexVec*
+// ComplexMatrixRows SeqAccess: yields each row as a complex vector
 // ---------------------------------------------------------------------------
 
-enum ComplexMatrixRowsSeq {
-    Mat64 {
-        rows_remaining: usize,
-        cols: usize,
-        row_major: Vec<(f64, f64)>, // consumed front-to-back
-    },
-    Mat32 {
-        rows_remaining: usize,
-        cols: usize,
-        row_major: Vec<(f32, f32)>,
-    },
+struct ComplexMatrixRowsSeq {
+    rows_remaining: usize,
+    cols: usize,
+    /// Row-major, consumed front-to-back one row per element.
+    row_major: ComplexVec,
 }
 
 impl ComplexMatrixRowsSeq {
-    fn new64(rows: usize, cols: usize, row_major: Vec<(f64, f64)>) -> Self {
-        ComplexMatrixRowsSeq::Mat64 {
-            rows_remaining: rows,
-            cols,
-            row_major,
-        }
-    }
-    fn new32(rows: usize, cols: usize, row_major: Vec<(f32, f32)>) -> Self {
-        ComplexMatrixRowsSeq::Mat32 {
+    fn new(rows: usize, cols: usize, row_major: ComplexVec) -> Self {
+        Self {
             rows_remaining: rows,
             cols,
             row_major,
@@ -871,36 +833,13 @@ impl<'de> SeqAccess<'de> for ComplexMatrixRowsSeq {
         &mut self,
         seed: T,
     ) -> Result<Option<T::Value>, MatError> {
-        match self {
-            ComplexMatrixRowsSeq::Mat64 {
-                rows_remaining,
-                cols,
-                row_major,
-            } => {
-                if *rows_remaining == 0 {
-                    return Ok(None);
-                }
-                *rows_remaining -= 1;
-                let tail = row_major.split_off(*cols);
-                let head = std::mem::replace(row_major, tail);
-                seed.deserialize(MatValueDeserializer::new(MatValue::ComplexVec64(head)))
-                    .map(Some)
-            }
-            ComplexMatrixRowsSeq::Mat32 {
-                rows_remaining,
-                cols,
-                row_major,
-            } => {
-                if *rows_remaining == 0 {
-                    return Ok(None);
-                }
-                *rows_remaining -= 1;
-                let tail = row_major.split_off(*cols);
-                let head = std::mem::replace(row_major, tail);
-                seed.deserialize(MatValueDeserializer::new(MatValue::ComplexVec32(head)))
-                    .map(Some)
-            }
+        if self.rows_remaining == 0 {
+            return Ok(None);
         }
+        self.rows_remaining -= 1;
+        let head = self.row_major.split_off_front(self.cols);
+        seed.deserialize(MatValueDeserializer::new(MatValue::ComplexVec1D(head)))
+            .map(Some)
     }
 }
 
@@ -976,8 +915,7 @@ struct MatrixStructMap {
 
 enum MatrixData {
     Numeric(NumVec),
-    Complex64(Vec<(f64, f64)>),
-    Complex32(Vec<(f32, f32)>),
+    Complex(ComplexVec),
 }
 
 enum MatrixState {
@@ -1000,21 +938,12 @@ impl MatrixStructMap {
         }
     }
 
-    fn complex64(rows: usize, cols: usize, pairs: Vec<(f64, f64)>) -> Self {
+    fn complex(rows: usize, cols: usize, pairs: ComplexVec) -> Self {
         Self {
             state: MatrixState::NeedRowsKey,
             rows,
             cols,
-            data: Some(MatrixData::Complex64(pairs)),
-        }
-    }
-
-    fn complex32(rows: usize, cols: usize, pairs: Vec<(f32, f32)>) -> Self {
-        Self {
-            state: MatrixState::NeedRowsKey,
-            rows,
-            cols,
-            data: Some(MatrixData::Complex32(pairs)),
+            data: Some(MatrixData::Complex(pairs)),
         }
     }
 }
@@ -1051,8 +980,7 @@ impl<'de> MapAccess<'de> for MatrixStructMap {
                 self.state = MatrixState::Done;
                 let value = match self.data.take().unwrap() {
                     MatrixData::Numeric(v) => MatValue::Vec1D(v),
-                    MatrixData::Complex64(pairs) => MatValue::ComplexVec64(pairs),
-                    MatrixData::Complex32(pairs) => MatValue::ComplexVec32(pairs),
+                    MatrixData::Complex(pairs) => MatValue::ComplexVec1D(pairs),
                 };
                 seed.deserialize(MatValueDeserializer::new(value))
             }
@@ -1074,16 +1002,14 @@ impl<'de> MapAccess<'de> for MatrixStructMap {
 // Complex sentinel MapAccess
 // ---------------------------------------------------------------------------
 
-struct ComplexStructMap64 {
+/// Presents a complex scalar as the `{real, imag}` map the `Complex*`
+/// newtypes deserialize from. One type for every component class: each
+/// component goes back through the value deserializer as a tagged scalar, so
+/// the newtype's own field type decides how it is read.
+struct ComplexStructMap {
     state: ComplexState,
-    re: f64,
-    im: f64,
-}
-
-struct ComplexStructMap32 {
-    state: ComplexState,
-    re: f32,
-    im: f32,
+    re: ScalarNum,
+    im: ScalarNum,
 }
 
 enum ComplexState {
@@ -1094,17 +1020,9 @@ enum ComplexState {
     Done,
 }
 
-impl ComplexStructMap64 {
-    fn new(re: f64, im: f64) -> Self {
-        Self {
-            state: ComplexState::NeedRealKey,
-            re,
-            im,
-        }
-    }
-}
-impl ComplexStructMap32 {
-    fn new(re: f32, im: f32) -> Self {
+impl ComplexStructMap {
+    fn new(n: ComplexNum) -> Self {
+        let (re, im) = n.components();
         Self {
             state: ComplexState::NeedRealKey,
             re,
@@ -1113,57 +1031,46 @@ impl ComplexStructMap32 {
     }
 }
 
-macro_rules! impl_complex_map {
-    ($map:ty, $re:ty, $de:expr) => {
-        impl<'de> MapAccess<'de> for $map {
-            type Error = MatError;
+impl<'de> MapAccess<'de> for ComplexStructMap {
+    type Error = MatError;
 
-            fn next_key_seed<K: DeserializeSeed<'de>>(
-                &mut self,
-                seed: K,
-            ) -> Result<Option<K::Value>, MatError> {
-                let (key, next) = match self.state {
-                    ComplexState::NeedRealKey => ("real", ComplexState::NeedRealValue),
-                    ComplexState::NeedImagKey => ("imag", ComplexState::NeedImagValue),
-                    ComplexState::Done => return Ok(None),
-                    _ => return Err(MatError::Custom("complex map state desync".into())),
-                };
-                self.state = next;
-                seed.deserialize(StringRefDe(key.to_string())).map(Some)
+    fn next_key_seed<K: DeserializeSeed<'de>>(
+        &mut self,
+        seed: K,
+    ) -> Result<Option<K::Value>, MatError> {
+        let (key, next) = match self.state {
+            ComplexState::NeedRealKey => ("real", ComplexState::NeedRealValue),
+            ComplexState::NeedImagKey => ("imag", ComplexState::NeedImagValue),
+            ComplexState::Done => return Ok(None),
+            _ => return Err(MatError::Custom("complex map state desync".into())),
+        };
+        self.state = next;
+        seed.deserialize(StringRefDe(key.to_string())).map(Some)
+    }
+
+    fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, MatError> {
+        let component = match self.state {
+            ComplexState::NeedRealValue => {
+                self.state = ComplexState::NeedImagKey;
+                self.re.clone()
             }
-            fn next_value_seed<V: DeserializeSeed<'de>>(
-                &mut self,
-                seed: V,
-            ) -> Result<V::Value, MatError> {
-                match self.state {
-                    ComplexState::NeedRealValue => {
-                        self.state = ComplexState::NeedImagKey;
-                        seed.deserialize($de(self.re))
-                    }
-                    ComplexState::NeedImagValue => {
-                        self.state = ComplexState::Done;
-                        seed.deserialize($de(self.im))
-                    }
-                    _ => Err(MatError::Custom("complex map value before key".into())),
-                }
+            ComplexState::NeedImagValue => {
+                self.state = ComplexState::Done;
+                self.im.clone()
             }
-            fn size_hint(&self) -> Option<usize> {
-                Some(match self.state {
-                    ComplexState::NeedRealKey | ComplexState::NeedRealValue => 2,
-                    ComplexState::NeedImagKey | ComplexState::NeedImagValue => 1,
-                    ComplexState::Done => 0,
-                })
-            }
-        }
-        // Touch $re so the pattern arg is reachable for documentation of the
-        // type being produced; this is a no-op at runtime.
-        #[allow(dead_code)]
-        const _: fn($re) = |_| {};
-    };
+            _ => return Err(MatError::Custom("complex map value before key".into())),
+        };
+        seed.deserialize(MatValueDeserializer::new(MatValue::Scalar(component)))
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        Some(match self.state {
+            ComplexState::NeedRealKey | ComplexState::NeedRealValue => 2,
+            ComplexState::NeedImagKey | ComplexState::NeedImagValue => 1,
+            ComplexState::Done => 0,
+        })
+    }
 }
-
-impl_complex_map!(ComplexStructMap64, f64, |x: f64| x.into_deserializer());
-impl_complex_map!(ComplexStructMap32, f32, |x: f32| x.into_deserializer());
 
 // ---------------------------------------------------------------------------
 // Enum unit variant
