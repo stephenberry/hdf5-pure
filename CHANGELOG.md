@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - A variable-length attribute stored in a fractal heap keeps its values. Written into the heap before its global-heap references had addresses, it read back with its values lost, silently ([#214](https://github.com/stephenberry/hdf5-pure/pull/214)).
+- Dense (fractal-heap) attributes are readable in a file with a userblock, through `File::open`, `File::open_streaming`, `repack` and `copy` alike. The heap address was taken as an absolute file offset rather than one relative to the base address, so the read failed on a file the reference C library reads correctly ([#214](https://github.com/stephenberry/hdf5-pure/pull/214)).
 
 ### Removed
 

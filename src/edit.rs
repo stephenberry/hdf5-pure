@@ -3446,8 +3446,18 @@ impl WriteEngine {
                         "a source object header with dense attributes could not be parsed for copying",
                     )
                 })?;
+            // The heap address in the Attribute Info message is stored relative to
+            // the base address, so the walk gets the source framed past its
+            // userblock — the same view the reader uses. `base` is 0 for a plain
+            // file, where this is `d` itself.
+            let framed = usize::try_from(base)
+                .ok()
+                .and_then(|start| d.get(start..))
+                .ok_or(Error::EditUnsupported(
+                    "a source file's userblock is larger than the file itself",
+                ))?;
             let attrs = crate::attribute::extract_attributes_full(
-                d,
+                framed,
                 &header,
                 OFFSET_SIZE,
                 LENGTH_SIZE,

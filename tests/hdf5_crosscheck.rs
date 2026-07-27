@@ -938,6 +938,37 @@ fn crosscheck_varlen_ascii_array_attr_in_dense_storage() {
     assert_eq!(read_vl_ascii_attr(&attr), expected);
 }
 
+/// Dense attributes in a file with a userblock. This crate's reader rejected these
+/// files for a while, which made the C library the arbiter of whether the *writer*
+/// was also wrong: it was not, and this pins that. `hdf5-pure`'s own side of it is
+/// `tests/userblock_dense_attrs.rs`.
+#[test]
+fn crosscheck_dense_attributes_past_a_userblock() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("ub_dense_attrs.h5");
+
+    let mut builder = FileBuilder::new();
+    builder.with_userblock(512);
+    let ds = builder.create_dataset("data");
+    ds.with_f64_data(&[1.0, 2.0]);
+    for i in 0..12 {
+        ds.set_attr(&format!("attr_{i:02}"), AttrValue::I64(100 + i));
+    }
+    builder.write(&path).unwrap();
+
+    let file = hdf5::File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    assert_eq!(ds.attr_names().unwrap().len(), 12);
+    for i in 0..12i64 {
+        let got: i64 = ds
+            .attr(&format!("attr_{i:02}"))
+            .unwrap()
+            .read_scalar()
+            .unwrap();
+        assert_eq!(got, 100 + i);
+    }
+}
+
 #[test]
 fn crosscheck_dense_attributes() {
     let dir = tempdir().unwrap();
