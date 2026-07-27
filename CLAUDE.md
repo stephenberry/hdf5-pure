@@ -1,5 +1,13 @@
 # Project guidance
 
+## Build hygiene
+
+Run `cargo clean -p hdf5-pure` when builds start taking tens of seconds before any work appears to happen. Incremental compilation leaves one object file per codegen unit in `target/*/deps` on every rebuild — 256 per rebuild of the library alone — and cargo never reaps them. Cargo and rustc scan `deps/`, so once that directory holds hundreds of thousands of files the listing alone costs tens of seconds on every build. Measured here at 723k leftover objects: an incremental rebuild of the library plus one integration test took 18.3s, against 1.3s in a clean target directory.
+
+`cargo clean -p hdf5-pure` drops this package's artifacts across every profile and feature set, including all 91 integration binaries, and leaves dependencies (and the compiled libhdf5) alone. It costs one non-incremental rebuild of the crate, about five seconds. `CARGO_INCREMENTAL=0` stops the accumulation outright, but it makes every rebuild of the library non-incremental — 4.6s against 0.9s — so the periodic clean is the better trade.
+
+Prefer `cargo test --lib` for the fast loop: the ~580 library tests run in about two seconds, and the mutation checks that prove a new test is load-bearing belong there. `cargo test --all-features` builds 91 separate integration binaries and compiles libhdf5 from source through `hdf5-metno-src`, so treat it as a pre-push gate rather than an inner-loop command, and keep to one feature set locally — every distinct set is a full parallel copy of the build graph.
+
 ## Changelog
 
 Keep `CHANGELOG.md` entries concise and reader-facing. Each entry is one or two sentences: lead with the user-facing capability and the public API name, keep at most one short caveat clause naming what is still refused or limited, and end with the issue/PR link in `([#NN](url))` form. Use a **Breaking:** prefix for breaking changes.
