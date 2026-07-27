@@ -197,7 +197,40 @@ const DENSE_ATTR_DBLOCK_HEADER: usize =
 /// on-disk length field at the point it is written.
 const DENSE_ATTR_DEFAULT_MAX_DIRECT_BLOCK: usize = 65536;
 
-/// The largest attribute [`build_dense_attrs`] can store as a managed object.
+/// Whether `attrs` must go in a fractal heap rather than the object header.
+///
+/// Two independent reasons, matching the reference C library's own disjunction in
+/// `H5Oattribute.c` (`nattrs == max_compact || raw_size >= H5O_MESG_MAX_SIZE`):
+/// too many attributes to keep compact, *or* one attribute too large for an
+/// object-header message, whose size field is 2 bytes wide.
+///
+/// The second is what lets a single large attribute be written at all. Selecting
+/// on count alone would send it to the compact path, where the only available
+/// answer is [`FormatError::AttributeMessageTooLarge`] — even though dense
+/// storage can hold it, as a huge object if need be.
+///
+/// The comparison reads `>` against [`OBJECT_HEADER_MESSAGE_MAX`] (65,535) where
+/// the C library reads `>=` against `H5O_MESG_MAX_SIZE` (65,536): the same
+/// predicate, written from the widest value that fits rather than the first that
+/// does not. What each side measures does differ by a byte, since this writer's
+/// compact attribute messages are version 2 and the C library's latest-format
+/// ones are version 3, one character-set byte longer. An attribute landing in
+/// that single-byte window is therefore stored compactly here and densely there.
+/// Both are readable, and both stay within the header's field width.
+///
+/// Variable-length attributes are selected on the same terms as any other. They
+/// were briefly excluded from the size half of the rule, because a heap built
+/// before their global-heap references were patched embedded the placeholders and
+/// this crate's reader then dropped the attribute; the writer now builds each
+/// heap after that patching, so there is nothing to exclude.
+fn needs_dense_attrs(attrs: &[AttributeMessage]) -> bool {
+    attrs.len() > DENSE_ATTR_THRESHOLD
+        || attrs
+            .iter()
+            .any(|a| a.serialize(LENGTH_SIZE).len() > OBJECT_HEADER_MESSAGE_MAX)
+}
+
+/// The largest attribute [`build_dense_attrs`] stores as a managed object.
 ///
 /// The externally imposed limit is the heap ID: the 8-byte managed IDs this
 /// emitter writes spend one byte on flags and [`DENSE_ATTR_BLOCK_OFFSET_BYTES`]
@@ -208,40 +241,64 @@ const DENSE_ATTR_DEFAULT_MAX_DIRECT_BLOCK: usize = 65536;
 /// one that should have been standalone, and an assertion-enabled build goes on
 /// to abort while releasing the half-built attribute table.
 ///
-/// An object past this belongs in fractal-heap *huge* storage, which this
-/// emitter does not write, so it must be refused rather than stored as managed
-/// (see [`dense_attrs_check`]).
+/// An object past this belongs in fractal-heap *huge* storage, which
+/// [`build_dense_attrs`] writes: the bytes go outside the managed blocks and a
+/// huge-objects v2 B-tree maps a generated ID to their address and length. So
+/// this is where the emitter changes representation, not where it gives up.
+///
+/// The reference C library splits far earlier — it declares 4,096 for an
+/// attribute heap — but the threshold is the heap's own declaration, read back
+/// out of the header, so a higher one is equally readable.
 pub(crate) const DENSE_ATTR_MAX_MANAGED_OBJECT: usize =
     DENSE_ATTR_DEFAULT_MAX_DIRECT_BLOCK - DENSE_ATTR_DBLOCK_HEADER;
 
-/// One B-tree v2 record as [`build_dense_attrs`] writes it: heap ID(8) +
-/// message flags(1) + creation order(4) + name hash(4).
+/// One name-index B-tree v2 record as [`build_dense_attrs`] writes it: heap
+/// ID(8) + message flags(1) + creation order(4) + name hash(4).
 const DENSE_ATTR_BTREE_RECORD: usize = 8 + 1 + 4 + 4;
+
+/// One huge-objects B-tree v2 record (type 1, indirectly accessed and
+/// non-filtered): address + length + huge object ID. Matches what
+/// `fractal_heap::find_huge_record` decodes on the way back in.
+const DENSE_ATTR_HUGE_BTREE_RECORD: usize =
+    OFFSET_SIZE as usize + LENGTH_SIZE as usize + LENGTH_SIZE as usize;
 
 /// A B-tree v2 leaf node's fixed bytes around its records: signature(4) +
 /// version(1) + type(1) + checksum(4). The reference C library subtracts the
 /// same 10 when deriving a node's record capacity.
 const DENSE_ATTR_BTLF_OVERHEAD: usize = 4 + 1 + 1 + 4;
 
-/// The leaf node size [`build_dense_attrs`] declares for `count` records.
+/// The leaf node size [`build_dense_attrs`] declares for `count` records of
+/// `record_size` bytes.
 ///
-/// Shared with [`dense_attrs_check`] so the bound is computed from the node size
-/// actually written. The power-of-two rounding is what makes the bound
+/// Shared with [`dense_attrs_check`] so every bound is computed from the node
+/// size actually written. The power-of-two rounding is what makes those bounds
 /// non-obvious — see [`DENSE_ATTR_MAX_COUNT`].
-fn dense_attr_leaf_node_size(count: usize) -> usize {
-    (DENSE_ATTR_BTLF_OVERHEAD + count * DENSE_ATTR_BTREE_RECORD)
+fn leaf_node_size(count: usize, record_size: usize) -> usize {
+    (DENSE_ATTR_BTLF_OVERHEAD + count * record_size)
         .next_power_of_two()
         .max(512)
 }
 
-/// The largest leaf node whose implied record capacity the reference C library
-/// can still describe in the 2 bytes it allots: `H5B2__hdr_init` derives
-/// `max_nrec_size` from the node's *capacity*, and asserts it fits 2 bytes.
-const DENSE_ATTR_MAX_LEAF_NODE: usize = {
-    let ceiling = DENSE_ATTR_BTLF_OVERHEAD + (u16::MAX as usize) * DENSE_ATTR_BTREE_RECORD;
+/// The name-index leaf node size for `count` attributes.
+fn dense_attr_leaf_node_size(count: usize) -> usize {
+    leaf_node_size(count, DENSE_ATTR_BTREE_RECORD)
+}
+
+/// The largest leaf node of `record_size` records whose implied capacity the
+/// reference C library can still describe in the 2 bytes it allots:
+/// `H5B2__hdr_init` derives `max_nrec_size` from the node's *capacity*, and
+/// asserts it fits 2 bytes.
+const fn max_leaf_node_for(record_size: usize) -> usize {
+    let ceiling = DENSE_ATTR_BTLF_OVERHEAD + (u16::MAX as usize) * record_size;
     // Round *down* to a power of two: the emitter only ever declares one of those.
     1usize << (usize::BITS - 1 - ceiling.leading_zeros())
-};
+}
+
+/// The most `record_size` records one leaf node can hold without pushing that
+/// derived width to 3 bytes.
+const fn max_records_for(record_size: usize) -> usize {
+    (max_leaf_node_for(record_size) - DENSE_ATTR_BTLF_OVERHEAD) / record_size
+}
 
 /// The most attributes dense storage can index — 61,680, not the 65,535 the
 /// leaf's 2-byte record-count field would suggest.
@@ -250,13 +307,16 @@ const DENSE_ATTR_MAX_LEAF_NODE: usize = {
 /// library derives the byte width it needs for a record count from the leaf's
 /// *capacity*, and capacity follows the node size this emitter declares — which
 /// is rounded up to a power of two. Once that rounded node passes
-/// [`DENSE_ATTR_MAX_LEAF_NODE`] the implied capacity needs 3 bytes and an
+/// [`max_leaf_node_for`] the implied capacity needs 3 bytes and an
 /// assertion-enabled build aborts in `H5B2__hdr_init`, even though the count
-/// itself still fits the 2-byte field. Deriving the limit from
-/// [`dense_attr_leaf_node_size`] keeps it correct if the record size or the
-/// rounding ever changes.
-pub(crate) const DENSE_ATTR_MAX_COUNT: usize =
-    (DENSE_ATTR_MAX_LEAF_NODE - DENSE_ATTR_BTLF_OVERHEAD) / DENSE_ATTR_BTREE_RECORD;
+/// itself still fits the 2-byte field. Deriving the limit from the record size
+/// keeps it correct if that size or the rounding ever changes.
+pub(crate) const DENSE_ATTR_MAX_COUNT: usize = max_records_for(DENSE_ATTR_BTREE_RECORD);
+
+/// The most huge objects one dense attribute heap can index — 43,690, lower than
+/// [`DENSE_ATTR_MAX_COUNT`] only because a huge record is wider. Same
+/// single-leaf constraint, same derivation.
+pub(crate) const DENSE_ATTR_MAX_HUGE_COUNT: usize = max_records_for(DENSE_ATTR_HUGE_BTREE_RECORD);
 
 /// The largest direct block the reference C library will construct
 /// (`H5HF_MAX_DIRECT_SIZE_LIMIT`). It reads the heap's block sizes through
@@ -283,13 +343,19 @@ fn dense_attr_block_geometry(serialized_total: usize) -> (u64, u64) {
 /// Whether [`build_dense_attrs`] can faithfully represent `attrs` in its
 /// single-direct-block, single-leaf-B-tree layout.
 ///
-/// The bounds are the ones the emitter actually has to honour: each attribute
-/// must fit [`DENSE_ATTR_MAX_MANAGED_OBJECT`], the set must fit
-/// [`DENSE_ATTR_MAX_COUNT`], and the root direct block must stay inside
-/// [`DENSE_ATTR_MAX_DIRECT_BLOCK_LIMIT`]. Notably the *total* is not bounded at
-/// 64 KiB — the emitter sizes its root direct block to the content, and
-/// multi-megabyte heaps of individually small attributes are written and read
-/// back correctly, so refusing them would reject files that encode fine.
+/// The bounds are the ones the emitter actually has to honour: the set must fit
+/// [`DENSE_ATTR_MAX_COUNT`], the attributes large enough to need huge storage
+/// must fit [`DENSE_ATTR_MAX_HUGE_COUNT`], and the root direct block holding the
+/// rest must stay inside [`DENSE_ATTR_MAX_DIRECT_BLOCK_LIMIT`]. An individual
+/// attribute is *not* bounded: past [`DENSE_ATTR_MAX_MANAGED_OBJECT`] the
+/// emitter changes representation rather than refusing. Nor is the total bounded
+/// at 64 KiB — the emitter sizes its root direct block to the content, and
+/// multi-megabyte heaps of individually small attributes read back correctly.
+///
+/// What remains refused is what the attribute message itself cannot encode: its
+/// name, datatype and dataspace lengths live in 2-byte fields, and huge storage
+/// lifts the limit on an attribute's *data*, not on those. Without this check
+/// they would truncate silently rather than fail.
 ///
 /// Callers that cannot fall back to a larger layout must refuse rather than
 /// mis-encode (see [`build_dense_attrs`]).
@@ -302,19 +368,31 @@ pub(crate) fn dense_attrs_check(attrs: &[AttributeMessage]) -> Result<(), Format
             limit: DENSE_ATTR_MAX_COUNT,
         });
     }
-    let mut total = 0usize;
+    let mut managed_total = 0usize;
+    let mut huge_count = 0usize;
     for a in attrs {
-        let size = a.serialize_v3(LENGTH_SIZE).len();
-        if size > DENSE_ATTR_MAX_MANAGED_OBJECT {
-            return Err(FormatError::DenseAttributeTooLarge {
+        if let Some((field, size)) = a.v3_header_field_overflow(LENGTH_SIZE) {
+            return Err(FormatError::AttributeFieldTooLong {
                 name: a.name.clone(),
+                field,
                 size,
-                limit: DENSE_ATTR_MAX_MANAGED_OBJECT,
+                limit: u16::MAX as usize,
             });
         }
-        total += size;
+        let size = a.serialize_v3(LENGTH_SIZE).len();
+        if size > DENSE_ATTR_MAX_MANAGED_OBJECT {
+            huge_count += 1;
+        } else {
+            managed_total += size;
+        }
     }
-    dense_attrs_check_geometry(total)
+    if huge_count > DENSE_ATTR_MAX_HUGE_COUNT {
+        return Err(FormatError::TooManyHugeDenseAttributes {
+            count: huge_count,
+            limit: DENSE_ATTR_MAX_HUGE_COUNT,
+        });
+    }
+    dense_attrs_check_geometry(managed_total)
 }
 
 /// Bound the heap geometry that `total` bytes of serialized attributes imply.
@@ -334,10 +412,14 @@ fn dense_attrs_check_geometry(total: usize) -> Result<(), FormatError> {
 
 /// Build dense attribute storage for a set of attributes.
 ///
+/// Attributes that fit [`DENSE_ATTR_MAX_MANAGED_OBJECT`] are stored as managed
+/// objects in the heap's single root direct block; larger ones are stored as
+/// *huge* objects, whose bytes sit outside the managed blocks and whose address
+/// and length are indexed by a huge-objects v2 B-tree.
+///
 /// The caller must have checked [`dense_attrs_check`] first: this emitter builds
-/// a single direct block and a single-leaf B-tree, and stores every attribute as
-/// a managed object, so an attribute set outside those bounds would be
-/// mis-encoded.
+/// one direct block and one leaf per B-tree, so an attribute set outside those
+/// bounds would be mis-encoded.
 pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -> DenseAttrBlob {
     // Dense attrs use v3 attribute messages (adds character set encoding byte).
     let serialized: Vec<Vec<u8>> = attrs.iter().map(|a| a.serialize_v3(LENGTH_SIZE)).collect();
@@ -347,6 +429,27 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
         .map(|a| crate::checksum::jenkins_lookup3(a.name.as_bytes()))
         .collect();
 
+    // Huge object IDs are assigned in attribute order, starting at 1 — the
+    // reference C library's `H5HF__huge_insert` pre-increments, so 0 is never a
+    // valid ID and the header's `next_huge_object_id` ends up holding the last
+    // one assigned rather than the next one free.
+    // A count of attributes, so a `usize` — it is bounded by `attrs.len()` and
+    // widened only where it goes into one of the header's 8-byte fields.
+    let mut huge_id_of: Vec<Option<u64>> = vec![None; attrs.len()];
+    let mut huge_count: usize = 0;
+    for (slot, bytes) in huge_id_of.iter_mut().zip(&serialized) {
+        if bytes.len() > DENSE_ATTR_MAX_MANAGED_OBJECT {
+            huge_count += 1;
+            *slot = Some(huge_count as u64);
+        }
+    }
+    let huge_total: u64 = serialized
+        .iter()
+        .zip(&huge_id_of)
+        .filter(|(_, id)| id.is_some())
+        .map(|(s, _)| s.len() as u64)
+        .sum();
+
     let os = OFFSET_SIZE as usize;
     let ls = LENGTH_SIZE as usize;
     let max_heap_size: u16 = DENSE_ATTR_MAX_HEAP_SIZE_BITS;
@@ -355,8 +458,14 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
 
     // Direct block layout: sig(4) + ver(1) + heap_addr(os) + block_offset(bo_bytes)
     //   + checksum(4) [when flags bit 1 set] + data...
+    // Only managed objects occupy it, so only they size it.
     let dblock_header_size = DENSE_ATTR_DBLOCK_HEADER;
-    let total_data_size: usize = serialized.iter().map(|s| s.len()).sum();
+    let total_data_size: usize = serialized
+        .iter()
+        .zip(&huge_id_of)
+        .filter(|(_, id)| id.is_none())
+        .map(|(s, _)| s.len())
+        .sum();
     // Both sizes come from the shared geometry, so the maximum this header
     // declares always covers the block it goes on to emit.
     let (starting_block_size, max_direct_block_size) = dense_attr_block_geometry(total_data_size);
@@ -389,9 +498,23 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
         + 2
         + 4;
 
+    // Every v2 B-tree header this emitter writes has the same fixed layout, so
+    // one size covers both the name index and the huge-objects index.
+    let bthd_size = 4 + 1 + 1 + 4 + 2 + 2 + 1 + 1 + os + 2 + ls + 4;
+    let name_node_size = dense_attr_leaf_node_size(attrs.len());
+    let huge_node_size = leaf_node_size(huge_count, DENSE_ATTR_HUGE_BTREE_RECORD);
+
+    // Blob layout, all relative to `base_address` so the caller can size the blob
+    // with a throwaway build at address 0 and get the same bytes back at the real
+    // address: heap header, root direct block, name index (header + leaf), then —
+    // only when there are huge objects — the huge index (header + leaf) and the
+    // huge object bytes themselves.
     let frhp_addr = base_address;
     let dblock_addr = frhp_addr + frhp_size as u64;
     let btree_addr = dblock_addr + starting_block_size;
+    let huge_bthd_addr = btree_addr + bthd_size as u64 + name_node_size as u64;
+    let huge_btlf_addr = huge_bthd_addr + bthd_size as u64;
+    let huge_data_addr = huge_btlf_addr + huge_node_size as u64;
 
     #[expect(
         clippy::cast_possible_truncation,
@@ -432,16 +555,23 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     )]
     let max_managed = DENSE_ATTR_MAX_MANAGED_OBJECT as u32;
     frhp.extend_from_slice(&max_managed.to_le_bytes());
-    write_length(&mut frhp, 0, LENGTH_SIZE); // next_huge_object_id
-    write_undef_offset(&mut frhp, OFFSET_SIZE); // btree_huge_objects_address
+    write_length(&mut frhp, huge_count as u64, LENGTH_SIZE); // next_huge_object_id
+    if huge_count == 0 {
+        write_undef_offset(&mut frhp, OFFSET_SIZE); // btree_huge_objects_address
+    } else {
+        write_offset(&mut frhp, huge_bthd_addr, OFFSET_SIZE);
+    }
     write_length(&mut frhp, free_space as u64, LENGTH_SIZE); // free_space_managed_blocks
     write_undef_offset(&mut frhp, OFFSET_SIZE); // free_space_mgr_addr
     write_length(&mut frhp, starting_block_size, LENGTH_SIZE); // managed_space_in_heap
     write_length(&mut frhp, starting_block_size, LENGTH_SIZE); // allocated_managed_space
     write_length(&mut frhp, 0, LENGTH_SIZE); // dblock_alloc_iter
-    write_length(&mut frhp, attrs.len() as u64, LENGTH_SIZE); // managed_objects_count
-    write_length(&mut frhp, 0, LENGTH_SIZE); // huge_objects_size
-    write_length(&mut frhp, 0, LENGTH_SIZE); // huge_objects_count
+    // Managed and huge objects are counted separately; an attribute is in exactly
+    // one of the two.
+    let managed_count = (attrs.len() - huge_count) as u64;
+    write_length(&mut frhp, managed_count, LENGTH_SIZE); // managed_objects_count
+    write_length(&mut frhp, huge_total, LENGTH_SIZE); // huge_objects_size
+    write_length(&mut frhp, huge_count as u64, LENGTH_SIZE); // huge_objects_count
     write_length(&mut frhp, 0, LENGTH_SIZE); // tiny_objects_size
     write_length(&mut frhp, 0, LENGTH_SIZE); // tiny_objects_count
     frhp.extend_from_slice(&4u16.to_le_bytes()); // table_width
@@ -470,12 +600,31 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     dblock.extend_from_slice(&[0u8; 4]); // checksum placeholder
     debug_assert_eq!(dblock.len(), dblock_header_size);
 
-    // Data area starts after header
-    let mut attr_offsets: Vec<(u64, u64)> = Vec::with_capacity(attrs.len());
-    for s in &serialized {
-        let offset_in_heap = dblock.len() as u64;
-        attr_offsets.push((offset_in_heap, s.len() as u64));
-        dblock.extend_from_slice(s);
+    // Data area starts after the header. Only managed objects go in; a huge
+    // object's bytes are appended to the blob further down, and its heap ID
+    // carries a B-tree key instead of a block offset.
+    let mut heap_ids: Vec<Vec<u8>> = Vec::with_capacity(attrs.len());
+    // (huge object ID, address, length) for the huge-objects B-tree, in ID order.
+    let mut huge_records: Vec<(u64, u64, u64)> = Vec::with_capacity(huge_count);
+    let mut next_huge_addr = huge_data_addr;
+    for (s, huge_id) in serialized.iter().zip(&huge_id_of) {
+        match huge_id {
+            Some(id) => {
+                huge_records.push((*id, next_huge_addr, s.len() as u64));
+                next_huge_addr += s.len() as u64;
+                heap_ids.push(encode_huge_id(*id, heap_id_length));
+            }
+            None => {
+                let offset_in_heap = dblock.len() as u64;
+                heap_ids.push(encode_managed_id(
+                    offset_in_heap,
+                    s.len() as u64,
+                    max_heap_size,
+                    heap_id_length,
+                ));
+                dblock.extend_from_slice(s);
+            }
+        }
     }
 
     // Pad to full block size
@@ -489,12 +638,6 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     let dblock_checksum = crate::checksum::jenkins_lookup3(&dblock);
     dblock[cksum_pos..cksum_pos + 4].copy_from_slice(&dblock_checksum.to_le_bytes());
     debug_assert_eq!(dblock.len() as u64, starting_block_size);
-
-    // Build heap IDs
-    let heap_ids: Vec<Vec<u8>> = attr_offsets
-        .iter()
-        .map(|(off, len)| encode_managed_id(*off, *len, max_heap_size, heap_id_length))
-        .collect();
 
     // Build B-tree v2 type 8 records (17 bytes each)
     let record_size: u16 = heap_id_length + 1 + 4 + 4;
@@ -514,7 +657,6 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     }
     records.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 
-    let bthd_size = 4 + 1 + 1 + 4 + 2 + 2 + 1 + 1 + os + 2 + ls + 4;
     let num_records = attrs.len();
     let btlf_size = DENSE_ATTR_BTLF_OVERHEAD + num_records * record_size as usize;
     // Shared with `dense_attrs_check`, which bounds the record count by the
@@ -522,9 +664,9 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     #[expect(
         clippy::cast_possible_truncation,
         reason = "dense_attrs_check bounds the record count so this node size stays at or \
-                  below DENSE_ATTR_MAX_LEAF_NODE (2^20), well inside the 4-byte field"
+                  below max_leaf_node_for's 2^20, well inside the 4-byte field"
     )]
-    let node_size = dense_attr_leaf_node_size(num_records) as u32;
+    let node_size = name_node_size as u32;
     debug_assert!(node_size as usize >= btlf_size);
 
     let bthd_addr = btree_addr;
@@ -570,6 +712,65 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     blob.extend_from_slice(&bthd);
     blob.extend_from_slice(&btlf);
 
+    if huge_count > 0 {
+        // Records are already in ascending ID order, which is the order the
+        // B-tree is searched in.
+        let mut huge_bthd = Vec::with_capacity(bthd_size);
+        huge_bthd.extend_from_slice(b"BTHD");
+        huge_bthd.push(0); // version
+        huge_bthd.push(1); // type = huge objects, indirectly accessed, non-filtered
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "dense_attrs_check bounds the huge count so this node size stays at or \
+                      below max_leaf_node_for's 2^20, well inside the 4-byte field"
+        )]
+        let huge_node_size_u32 = huge_node_size as u32;
+        huge_bthd.extend_from_slice(&huge_node_size_u32.to_le_bytes());
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a huge record is 24 bytes, well inside the 2-byte record size field"
+        )]
+        let huge_record_size = DENSE_ATTR_HUGE_BTREE_RECORD as u16;
+        huge_bthd.extend_from_slice(&huge_record_size.to_le_bytes());
+        huge_bthd.extend_from_slice(&0u16.to_le_bytes()); // depth = 0
+        huge_bthd.push(100); // split_percent
+        huge_bthd.push(40); // merge_percent
+        write_offset(&mut huge_bthd, huge_btlf_addr, OFFSET_SIZE);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "dense_attrs_check bounds the huge count below the 2-byte field's range"
+        )]
+        let huge_nrec = huge_count as u16;
+        huge_bthd.extend_from_slice(&huge_nrec.to_le_bytes());
+        write_length(&mut huge_bthd, huge_count as u64, LENGTH_SIZE);
+        let huge_bthd_checksum = crate::checksum::jenkins_lookup3(&huge_bthd);
+        huge_bthd.extend_from_slice(&huge_bthd_checksum.to_le_bytes());
+        debug_assert_eq!(huge_bthd.len(), bthd_size);
+
+        let mut huge_btlf = Vec::with_capacity(huge_node_size);
+        huge_btlf.extend_from_slice(b"BTLF");
+        huge_btlf.push(0); // version
+        huge_btlf.push(1); // type
+        for (id, addr, len) in &huge_records {
+            write_offset(&mut huge_btlf, *addr, OFFSET_SIZE);
+            write_length(&mut huge_btlf, *len, LENGTH_SIZE);
+            write_length(&mut huge_btlf, *id, LENGTH_SIZE);
+        }
+        let huge_btlf_checksum = crate::checksum::jenkins_lookup3(&huge_btlf);
+        huge_btlf.extend_from_slice(&huge_btlf_checksum.to_le_bytes());
+        huge_btlf.resize(huge_node_size, 0);
+
+        debug_assert_eq!(blob.len() as u64, huge_bthd_addr - base_address);
+        blob.extend_from_slice(&huge_bthd);
+        blob.extend_from_slice(&huge_btlf);
+        debug_assert_eq!(blob.len() as u64, huge_data_addr - base_address);
+        for (s, huge_id) in serialized.iter().zip(&huge_id_of) {
+            if huge_id.is_some() {
+                blob.extend_from_slice(s);
+            }
+        }
+    }
+
     let attr_info = serialize_attribute_info(frhp_addr, bthd_addr);
 
     DenseAttrBlob {
@@ -582,6 +783,27 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
 /// (`H5VM_limit_enc_size`): the width of the smallest field that can hold it.
 fn encoded_size_width(value: u64) -> usize {
     (64 - value.leading_zeros() as usize).div_ceil(8).max(1)
+}
+
+/// A heap ID for a "huge" object: type 1 in bits 4-5 of the first byte, then the
+/// huge object ID little-endian across the rest.
+///
+/// The ID is a B-tree key rather than an address because this heap's IDs are too
+/// narrow to hold an address and a length inline — `huge_ids_direct` in
+/// `fractal_heap` recomputes that same choice on the way back in, so the two must
+/// agree on the ID width.
+fn encode_huge_id(huge_id: u64, id_length: u16) -> Vec<u8> {
+    let payload_len = (id_length as usize) - 1;
+    debug_assert!(
+        payload_len >= 8 || huge_id < (1u64 << (payload_len * 8)),
+        "huge object ID overflows the heap ID payload"
+    );
+    let mut id = vec![0u8; id_length as usize];
+    id[0] = 0x10; // type = 1 (huge)
+    for i in 0..payload_len.min(8) {
+        id[1 + i] = ((huge_id >> (i * 8)) & 0xFF) as u8;
+    }
+    id
 }
 
 fn encode_managed_id(offset: u64, length: u64, max_heap_size: u16, id_length: u16) -> Vec<u8> {
@@ -1216,15 +1438,9 @@ impl FileWriter {
             root_attrs.push(build_attr_message(n, v));
         }
 
-        let root_dense = root_attrs.len() > DENSE_ATTR_THRESHOLD;
-        let group_dense: Vec<bool> = groups
-            .iter()
-            .map(|g| g.attrs.len() > DENSE_ATTR_THRESHOLD)
-            .collect();
-        let ds_dense: Vec<bool> = all_ds
-            .iter()
-            .map(|d| d.attrs.len() > DENSE_ATTR_THRESHOLD)
-            .collect();
+        let root_dense = needs_dense_attrs(&root_attrs);
+        let group_dense: Vec<bool> = groups.iter().map(|g| needs_dense_attrs(&g.attrs)).collect();
+        let ds_dense: Vec<bool> = all_ds.iter().map(|d| needs_dense_attrs(&d.attrs)).collect();
 
         // A compact attribute is stored as an object-header message, whose size
         // field is 2 bytes wide. An oversized one would be written with a
@@ -1239,7 +1455,9 @@ impl FileWriter {
         //
         // Dense attributes are stored in a fractal heap rather than the header, so
         // this limit does not apply to them and the check skips them; the dense
-        // check just below bounds those instead.
+        // check just below bounds those instead. An attribute that would exceed it
+        // is *why* `needs_dense_attrs` picked the dense path, so what reaches here
+        // is only what a header can hold — this is a backstop, not the decision.
         fn check_compact_attrs(attrs: &[AttributeMessage]) -> Result<(), FormatError> {
             for a in attrs {
                 let size = a.serialize(LENGTH_SIZE).len();
@@ -1252,12 +1470,15 @@ impl FileWriter {
             }
             Ok(())
         }
-        // The dense emitter has bounds of its own — a per-attribute size and a
-        // B-tree record count — which it documents its callers must check. An
-        // attribute set past them was previously written anyway, producing a heap
-        // that reads back empty here and aborts an assertion-enabled reference C
-        // library (issue #191). Between this and the compact check above, every
-        // attribute is bounded on whichever path it takes.
+        // The dense emitter has bounds of its own — the attribute message's own
+        // 2-byte header fields, the size of the one direct block it builds, and
+        // the record counts of its single-leaf B-trees — which it documents its
+        // callers must check. An attribute set past them was previously written
+        // anyway, producing a heap that reads back empty here and aborts an
+        // assertion-enabled reference C library (issue #191). Between this and the
+        // compact check above, every attribute is bounded on whichever path it
+        // takes. No bound here is on an attribute's size: that is what selects
+        // dense storage, not what it refuses.
         if root_dense {
             dense_attrs_check(&root_attrs)?;
         } else {
@@ -1346,28 +1567,101 @@ impl FileWriter {
             })
             .collect::<Result<_, FormatError>>()?;
 
-        // Pass 1: compute OH sizes with dummy addresses
-        let group_oh_sizes: Vec<usize> = groups
-            .iter()
-            .enumerate()
-            .map(|(gi, g)| {
-                let mut dummy_links: Vec<LinkMessage> = g
-                    .ds_indices
-                    .iter()
-                    .map(|&i| make_link(&all_ds[i].name, 0))
-                    .collect();
-                for &sgi in &g.sub_group_indices {
-                    dummy_links.push(make_link(&groups[sgi].name, 0));
+        /// Where each object's dense-attribute heap will be written and how many
+        /// bytes it occupies, for the objects that have one.
+        struct DenseSpans {
+            root: Option<(u64, usize)>,
+            groups: Vec<Option<(u64, usize)>>,
+            datasets: Vec<Option<(u64, usize)>>,
+        }
+
+        /// The heaps themselves, in the same order as the spans reserved for them.
+        struct DenseBlobs {
+            root: Option<DenseAttrBlob>,
+            groups: Vec<Option<DenseAttrBlob>>,
+            datasets: Vec<Option<DenseAttrBlob>>,
+        }
+
+        impl DenseSpans {
+            /// Build every reserved heap, at the address reserved for it.
+            ///
+            /// Call once the attributes are final: after the global-heap
+            /// collections have addresses and the variable-length attributes'
+            /// references have been patched with them.
+            ///
+            /// Each blob fills its reserved span exactly, and nothing here has to
+            /// arrange that. A heap's length is a function of its attributes'
+            /// serialized sizes, the fixed offset and length widths, and how many
+            /// of those attributes are huge — no term of it is the address it is
+            /// built at. Patching cannot move any of those terms either: it takes
+            /// the attribute bytes as `&mut [u8]` and overwrites references in
+            /// place, so the slice it returns is the length it was given. The
+            /// assertion below is therefore a guard on future edits rather than on
+            /// this call.
+            fn build(
+                &self,
+                root_attrs: &[AttributeMessage],
+                groups: &[GrpFlat],
+                datasets: &[DsFlat],
+            ) -> DenseBlobs {
+                fn one(
+                    attrs: &[AttributeMessage],
+                    span: Option<(u64, usize)>,
+                ) -> Option<DenseAttrBlob> {
+                    let (address, reserved) = span?;
+                    let blob = build_dense_attrs(attrs, address);
+                    debug_assert_eq!(
+                        blob.blob.len(),
+                        reserved,
+                        "a dense attribute heap must fill the span reserved for it, or every \
+                         address after it is wrong"
+                    );
+                    Some(blob)
                 }
-                let oh = if group_dense[gi] {
-                    let dummy_blob = build_dense_attrs(&g.attrs, 0);
-                    build_group_oh(&dummy_links, &g.attrs, Some(&dummy_blob))?
-                } else {
-                    build_group_oh(&dummy_links, &g.attrs, None)?
-                };
-                Ok(oh.len())
-            })
-            .collect::<Result<_, FormatError>>()?;
+                DenseBlobs {
+                    root: one(root_attrs, self.root),
+                    groups: groups
+                        .iter()
+                        .zip(&self.groups)
+                        .map(|(g, &span)| one(&g.attrs, span))
+                        .collect(),
+                    datasets: datasets
+                        .iter()
+                        .zip(&self.datasets)
+                        .map(|(d, &span)| one(&d.attrs, span))
+                        .collect(),
+                }
+            }
+        }
+
+        // Pass 1: compute OH sizes with dummy addresses. Each object needing
+        // dense attributes also records its heap's byte length here, so pass 2
+        // can reserve the span without yet building the bytes that go in it —
+        // see `DenseSpans`.
+        let mut group_oh_sizes: Vec<usize> = Vec::with_capacity(groups.len());
+        let mut group_dense_lens: Vec<Option<usize>> = Vec::with_capacity(groups.len());
+        for (gi, g) in groups.iter().enumerate() {
+            let mut dummy_links: Vec<LinkMessage> = g
+                .ds_indices
+                .iter()
+                .map(|&i| make_link(&all_ds[i].name, 0))
+                .collect();
+            for &sgi in &g.sub_group_indices {
+                dummy_links.push(make_link(&groups[sgi].name, 0));
+            }
+            let (oh, dense_len) = if group_dense[gi] {
+                let dummy_blob = build_dense_attrs(&g.attrs, 0);
+                let len = dummy_blob.blob.len();
+                (
+                    build_group_oh(&dummy_links, &g.attrs, Some(&dummy_blob))?,
+                    Some(len),
+                )
+            } else {
+                (build_group_oh(&dummy_links, &g.attrs, None)?, None)
+            };
+            group_oh_sizes.push(oh.len());
+            group_dense_lens.push(dense_len);
+        }
 
         let root_dummy_links: Vec<LinkMessage> = {
             let mut links = Vec::new();
@@ -1379,11 +1673,18 @@ impl FileWriter {
             }
             links
         };
-        let root_oh_size = if root_dense {
+        let (root_oh_size, root_dense_len) = if root_dense {
             let dummy_blob = build_dense_attrs(&root_attrs, 0);
-            build_group_oh(&root_dummy_links, &root_attrs, Some(&dummy_blob))?.len()
+            let len = dummy_blob.blob.len();
+            (
+                build_group_oh(&root_dummy_links, &root_attrs, Some(&dummy_blob))?.len(),
+                Some(len),
+            )
         } else {
-            build_group_oh(&root_dummy_links, &root_attrs, None)?.len()
+            (
+                build_group_oh(&root_dummy_links, &root_attrs, None)?.len(),
+                None,
+            )
         };
 
         // Pass 1: compute dataset object-header sizes from a dummy layout. No
@@ -1398,6 +1699,7 @@ impl FileWriter {
         // without a second build. A chunked data length is base-address
         // independent, so the dummy-base build gives the true length.
         let mut ds_data_lens: Vec<u64> = Vec::with_capacity(all_ds.len());
+        let mut ds_dense_lens: Vec<Option<usize>> = Vec::with_capacity(all_ds.len());
         let mut dummy_cursor = 0u64;
         for (i, d) in all_ds.iter().enumerate() {
             let dense_blob = if ds_dense[i] {
@@ -1405,6 +1707,7 @@ impl FileWriter {
             } else {
                 None
             };
+            ds_dense_lens.push(dense_blob.as_ref().map(|b| b.blob.len()));
             let oh = if is_chunked[i] {
                 let built = build_chunked(d, dummy_cursor, chunk_sets[i].as_ref())?;
                 dummy_cursor += built.data.len();
@@ -1449,49 +1752,53 @@ impl FileWriter {
         let root_group_addr = (SUPERBLOCK_SIZE + early_gcol_size) as u64;
         let mut cursor2 = SUPERBLOCK_SIZE + early_gcol_size + root_oh_size;
 
-        let root_dense_blob = if root_dense {
-            let blob = build_dense_attrs(&root_attrs, cursor2 as u64);
-            cursor2 += blob.blob.len();
-            Some(blob)
-        } else {
-            None
+        // Space set aside for a dense-attribute heap, and the heaps themselves
+        // once the attribute bytes they copy are final. The two are separate
+        // steps on purpose: a heap embeds a *copy* of each attribute's serialized
+        // bytes, and a variable-length attribute's bytes hold global-heap
+        // references that only get real addresses after every heap's span is
+        // fixed — the collections sit past the heaps in the layout. Building the
+        // bytes here would freeze the placeholder references into the heap, and a
+        // reader that cannot resolve them drops the attribute entirely.
+        let reserve = |cursor2: &mut usize, len: Option<usize>| {
+            len.map(|len| {
+                let addr = *cursor2 as u64;
+                *cursor2 += len;
+                (addr, len)
+            })
         };
 
-        let mut group_dense_blobs: Vec<Option<DenseAttrBlob>> = Vec::new();
+        let root_dense_span = reserve(&mut cursor2, root_dense_len);
+
+        let mut group_dense_spans: Vec<Option<(u64, usize)>> = Vec::with_capacity(groups.len());
         let group_addrs2: Vec<u64> = group_oh_sizes
             .iter()
             .enumerate()
             .map(|(gi, &sz)| {
                 let addr = cursor2 as u64;
                 cursor2 += sz;
-                if group_dense[gi] {
-                    let blob = build_dense_attrs(&groups[gi].attrs, cursor2 as u64);
-                    cursor2 += blob.blob.len();
-                    group_dense_blobs.push(Some(blob));
-                } else {
-                    group_dense_blobs.push(None);
-                }
+                group_dense_spans.push(reserve(&mut cursor2, group_dense_lens[gi]));
                 addr
             })
             .collect();
 
-        let mut ds_dense_blobs: Vec<Option<DenseAttrBlob>> = Vec::new();
+        let mut ds_dense_spans: Vec<Option<(u64, usize)>> = Vec::with_capacity(all_ds.len());
         let ds_oh_addrs2: Vec<u64> = actual_ds_oh_sizes
             .iter()
             .enumerate()
             .map(|(i, &sz)| {
                 let addr = cursor2 as u64;
                 cursor2 += sz;
-                if ds_dense[i] {
-                    let blob = build_dense_attrs(&all_ds[i].attrs, cursor2 as u64);
-                    cursor2 += blob.blob.len();
-                    ds_dense_blobs.push(Some(blob));
-                } else {
-                    ds_dense_blobs.push(None);
-                }
+                ds_dense_spans.push(reserve(&mut cursor2, ds_dense_lens[i]));
                 addr
             })
             .collect();
+
+        let dense_spans = DenseSpans {
+            root: root_dense_span,
+            groups: group_dense_spans,
+            datasets: ds_dense_spans,
+        };
 
         // Resolve path-based references now that all addresses are known.
         // Build a map of (group_name, child_name) -> address for resolution.
@@ -1624,6 +1931,14 @@ impl FileWriter {
             }
             let gcol_total_size = gcol_cursor - gcol_start;
             meta += gcol_total_size;
+
+            // The attributes are final now, so the dense heaps that copy them can
+            // be built into the spans reserved above.
+            let DenseBlobs {
+                root: root_dense_blob,
+                groups: group_dense_blobs,
+                datasets: ds_dense_blobs,
+            } = dense_spans.build(&root_attrs, &groups, &all_ds);
 
             // (b) Superblock extension (File Space Info) in the metadata region.
             let ext_addr = meta;
@@ -2148,6 +2463,14 @@ impl FileWriter {
             }
         }
 
+        // The attributes are final now, so the dense heaps that copy them can be
+        // built into the spans reserved for them.
+        let DenseBlobs {
+            root: root_dense_blob,
+            groups: group_dense_blobs,
+            datasets: ds_dense_blobs,
+        } = dense_spans.build(&root_attrs, &groups, &all_ds);
+
         // Build dataset OHs now that attrs are patched. Only the header bytes
         // are kept here; each dataset's data is emitted directly from
         // `ds_layouts` in the assembly loop (a streamed dataset has no data
@@ -2660,20 +2983,30 @@ mod tests {
         let at_limit = vec![dense_attr_of_size("edge", DENSE_ATTR_MAX_MANAGED_OBJECT)];
         assert_eq!(dense_attrs_check(&at_limit), Ok(()));
 
-        // One byte past it needs fractal-heap huge storage, which the emitter
-        // does not write.
+        // One byte past it needs fractal-heap huge storage, which the emitter now
+        // writes — so it is accepted, and the attribute is no longer in the
+        // direct block.
         let past = vec![dense_attr_of_size(
             "edge",
             DENSE_ATTR_MAX_MANAGED_OBJECT + 1,
         )];
-        assert_eq!(
-            dense_attrs_check(&past),
-            Err(FormatError::DenseAttributeTooLarge {
-                name: "edge".to_string(),
-                size: DENSE_ATTR_MAX_MANAGED_OBJECT + 1,
-                limit: DENSE_ATTR_MAX_MANAGED_OBJECT,
-            })
-        );
+        assert_eq!(dense_attrs_check(&past), Ok(()));
+        assert_eq!(huge_object_count(&build_dense_attrs(&past, 0).blob), 1);
+        assert_eq!(huge_object_count(&build_dense_attrs(&at_limit, 0).blob), 0);
+    }
+
+    /// The `huge_objects_count` a built heap declares in its fractal-heap header.
+    fn huge_object_count(blob: &[u8]) -> u64 {
+        let ls = LENGTH_SIZE as usize;
+        let os = OFFSET_SIZE as usize;
+        assert_eq!(&blob[..4], b"FRHP");
+        // version(1) + heap ID length(2) + I/O filter length(2) + flags(1) +
+        // max managed object size(4) + next huge object ID + huge B-tree address +
+        // free space + free-space manager address + managed space + allocated
+        // managed space + allocation iterator + managed object count + huge
+        // objects size.
+        let at = 4 + 1 + 2 + 2 + 1 + 4 + ls + os + ls + os + ls + ls + ls + ls + ls;
+        u64::from_le_bytes(blob[at..at + 8].try_into().unwrap())
     }
 
     /// The attribute-count limit exists because the reference C library derives a
@@ -2692,6 +3025,59 @@ mod tests {
         assert_eq!(width_at(DENSE_ATTR_MAX_COUNT + 1), 3);
         // Guards the derivation against a silent change in the constants.
         assert_eq!(DENSE_ATTR_MAX_COUNT, 61_680);
+    }
+
+    /// The huge-object count has the same constraint and a lower limit, because a
+    /// huge record is 24 bytes rather than 17. Reaching it takes ~2.8 GiB of
+    /// attributes, so the derivation is pinned here rather than by building them —
+    /// the alternative is a bound nothing ever measures.
+    #[test]
+    fn the_huge_object_limit_is_where_its_own_capacity_width_grows() {
+        let width_at = |count: usize| {
+            let capacity = (leaf_node_size(count, DENSE_ATTR_HUGE_BTREE_RECORD)
+                - DENSE_ATTR_BTLF_OVERHEAD)
+                / DENSE_ATTR_HUGE_BTREE_RECORD;
+            encoded_size_width(capacity as u64)
+        };
+        assert_eq!(width_at(DENSE_ATTR_MAX_HUGE_COUNT), 2);
+        assert_eq!(width_at(DENSE_ATTR_MAX_HUGE_COUNT + 1), 3);
+        assert_eq!(DENSE_ATTR_MAX_HUGE_COUNT, 43_690);
+        // Reachable rather than theoretical: an attribute set can hold more
+        // attributes than this, so the check that enforces it is not dead.
+        const {
+            assert!(
+                DENSE_ATTR_MAX_HUGE_COUNT < DENSE_ATTR_MAX_COUNT,
+                "a huge-object limit at or above the attribute limit is unreachable, \
+                 which would leave TooManyHugeDenseAttributes dead"
+            );
+        }
+    }
+
+    /// Both classes are counted, and the split follows the declared managed-object
+    /// limit exactly.
+    #[test]
+    fn the_managed_object_limit_is_where_storage_changes_class() {
+        // Sized under their final names: the name is part of the serialized
+        // message, so renaming afterwards would move the attribute back across
+        // the very threshold this is testing.
+        let mixed = vec![
+            dense_attr_of_size("at", DENSE_ATTR_MAX_MANAGED_OBJECT),
+            dense_attr_of_size("past", DENSE_ATTR_MAX_MANAGED_OBJECT + 1),
+        ];
+        assert_eq!(dense_attrs_check(&mixed), Ok(()));
+        let blob = build_dense_attrs(&mixed, 0).blob;
+        assert_eq!(huge_object_count(&blob), 1);
+        assert_eq!(managed_object_count(&blob), 1);
+    }
+
+    /// The `managed_objects_count` a built heap declares in its fractal-heap
+    /// header.
+    fn managed_object_count(blob: &[u8]) -> u64 {
+        let ls = LENGTH_SIZE as usize;
+        let os = OFFSET_SIZE as usize;
+        assert_eq!(&blob[..4], b"FRHP");
+        let at = 4 + 1 + 2 + 2 + 1 + 4 + ls + os + ls + os + ls + ls + ls;
+        u64::from_le_bytes(blob[at..at + 8].try_into().unwrap())
     }
 
     /// Reaching the direct-block limit takes gigabytes of attributes, so the
@@ -2762,24 +3148,47 @@ mod tests {
         assert_eq!(attrs.len(), 1);
     }
 
+    /// One byte past the compact limit the attribute is not refused — it moves to
+    /// the fractal heap, which has no such field. This is the only way a lone
+    /// large attribute can be written, since an object with one attribute is far
+    /// below the count at which dense storage would otherwise be chosen.
     #[test]
-    fn compact_attr_past_the_message_size_limit_is_refused() {
+    fn an_attr_past_the_message_size_limit_moves_to_dense_storage() {
         let n = largest_fitting_i64_attr_elements() + 1;
-        let size = build_attr_message("boundary", &AttrValue::I64Array(vec![0i64; n]))
-            .serialize(LENGTH_SIZE)
-            .len();
-        assert!(size > OBJECT_HEADER_MESSAGE_MAX);
+        let attrs = vec![build_attr_message(
+            "boundary",
+            &AttrValue::I64Array(vec![0i64; n]),
+        )];
+        assert!(attrs[0].serialize(LENGTH_SIZE).len() > OBJECT_HEADER_MESSAGE_MAX);
+        assert!(
+            needs_dense_attrs(&attrs),
+            "one oversized attribute must select dense storage by itself"
+        );
 
         let mut fw = FileWriter::new();
         fw.set_root_attr("boundary", AttrValue::I64Array(vec![7i64; n]));
         fw.create_dataset("d").with_f64_data(&[1.0]);
-        assert_eq!(
-            fw.finish(),
-            Err(FormatError::AttributeMessageTooLarge {
-                name: "boundary".to_string(),
-                size,
-            })
-        );
+        let bytes = fw.finish().expect("written, not refused");
+
+        let file = crate::reader::File::from_bytes(bytes).unwrap();
+        let attrs = file.root().attrs().unwrap();
+        assert_eq!(attrs.len(), 1);
+        match attrs.get("boundary") {
+            Some(AttrValue::I64Array(v)) => assert_eq!(v.len(), n),
+            other => panic!("expected the attribute back, got {other:?}"),
+        }
+    }
+
+    /// And the compact path is still chosen for everything that fits, so the size
+    /// rule has not promoted every attribute to a heap.
+    #[test]
+    fn an_attr_at_the_message_size_limit_stays_compact() {
+        let n = largest_fitting_i64_attr_elements();
+        let attrs = vec![build_attr_message(
+            "boundary",
+            &AttrValue::I64Array(vec![0i64; n]),
+        )];
+        assert!(!needs_dense_attrs(&attrs));
     }
 
     /// Read a dataset's VL-string byte objects from a freshly-written file.

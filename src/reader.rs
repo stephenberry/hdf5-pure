@@ -138,6 +138,21 @@ impl<S: Source + ?Sized> Source for BaseOffsetSource<'_, S> {
     }
 }
 
+/// A base-relative view of an in-memory file: `bytes` with its first `base` bytes
+/// (the userblock) cut off, so every address stored relative to the base address
+/// indexes it directly. The in-memory counterpart of [`BaseOffsetSource`], and the
+/// identity for a plain file.
+fn frame(bytes: &[u8], base: u64) -> Result<&[u8], FormatError> {
+    if base == 0 {
+        return Ok(bytes);
+    }
+    let start = base.to_usize()?;
+    bytes.get(start..).ok_or(FormatError::UnexpectedEof {
+        expected: start,
+        available: bytes.len(),
+    })
+}
+
 /// File-access options applied when opening an HDF5 file.
 ///
 /// This is the `hdf5-pure` analogue of an HDF5 **file access property list**
@@ -1050,26 +1065,47 @@ impl FileInner {
         hdr: &ObjectHeader,
     ) -> Result<Vec<crate::attribute::AttributeMessage>, Error> {
         let (os, ls) = (self.offset_size(), self.length_size());
+        // Compact attributes come out of `hdr`, but the two addresses this walk
+        // follows are read from message bodies and so are stored relative to the
+        // base address: the Attribute Info message's fractal-heap address, and a
+        // shared attribute's message address. Frame the file at `base` exactly as
+        // [`Self::read_dataset_raw`] does, so both index it directly. For a plain
+        // file (`base == 0`) this is the identity; without it, a userblock file's
+        // dense attributes are looked for one userblock too early.
+        let base = self.addr_offset;
         match &self.backend {
-            Backend::InMemory(v) => Ok(extract_attributes_full(v, hdr, os, ls)?),
-            Backend::Streaming(s) => Ok(extract_attributes_full_from_source(
+            Backend::InMemory(v) => Ok(extract_attributes_full(frame(v, base)?, hdr, os, ls)?),
+            Backend::Streaming(s) if base == 0 => Ok(extract_attributes_full_from_source(
                 s.as_ref(),
                 hdr,
                 os,
                 ls,
             )?),
+            Backend::Streaming(s) => {
+                let framed = BaseOffsetSource {
+                    inner: s.as_ref(),
+                    base,
+                };
+                Ok(extract_attributes_full_from_source(&framed, hdr, os, ls)?)
+            }
             Backend::Mirror(m) => {
                 let core = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                Ok(extract_attributes_full(core.mirror_bytes(), hdr, os, ls)?)
-            }
-            Backend::Bounded(m) => {
-                let engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                Ok(extract_attributes_full_from_source(
-                    engine.store(),
+                Ok(extract_attributes_full(
+                    frame(core.mirror_bytes(), base)?,
                     hdr,
                     os,
                     ls,
                 )?)
+            }
+            Backend::Bounded(m) => {
+                let engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let store = engine.store();
+                if base == 0 {
+                    Ok(extract_attributes_full_from_source(store, hdr, os, ls)?)
+                } else {
+                    let framed = BaseOffsetSource { inner: store, base };
+                    Ok(extract_attributes_full_from_source(&framed, hdr, os, ls)?)
+                }
             }
         }
     }
@@ -1093,18 +1129,16 @@ impl FileInner {
         // read. For a plain file (`base == 0`) this is the identity.
         let base = self.addr_offset;
         match &self.backend {
-            Backend::InMemory(v) => {
-                let frame = if base == 0 {
-                    v.as_slice()
-                } else {
-                    let start = base.to_usize()?;
-                    v.get(start..).ok_or(FormatError::UnexpectedEof {
-                        expected: start,
-                        available: v.len(),
-                    })?
-                };
-                data_read::read_raw_data_cached(frame, dl, ds, dt, pipeline, os, ls, cache)
-            }
+            Backend::InMemory(v) => data_read::read_raw_data_cached(
+                frame(v, base)?,
+                dl,
+                ds,
+                dt,
+                pipeline,
+                os,
+                ls,
+                cache,
+            ),
             Backend::Streaming(s) if base == 0 => data_read::read_raw_data_cached_from_source(
                 s.as_ref(),
                 dl,

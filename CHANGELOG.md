@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- An attribute of any size is written rather than refused: one too large for an object-header message selects fractal-heap storage on its own, and one too large for a managed heap object becomes a *huge* object. A name, datatype, or dataspace longer than the 2-byte field describing it is still refused, as the new `FormatError::AttributeFieldTooLong` ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
+- `FormatError::TooManyHugeDenseAttributes` names the one bound the new huge-object path adds, on how many such attributes a single object may carry ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
+
+### Fixed
+
+- A variable-length attribute stored in a fractal heap keeps its values. Written into the heap before its global-heap references had addresses, it read back with its values lost, silently ([#214](https://github.com/stephenberry/hdf5-pure/pull/214)).
+- Dense (fractal-heap) attributes are readable in a file with a userblock, through `File::open`, `File::open_streaming`, `repack` and `copy` alike. The heap address was taken as an absolute file offset rather than one relative to the base address, so the read failed on a file the reference C library reads correctly ([#214](https://github.com/stephenberry/hdf5-pure/pull/214)).
+
+### Removed
+
+- **Breaking:** `FormatError::DenseAttributeTooLarge` is gone, as no attribute size is refused any more ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
+
 ## [0.25.0] - 2026-07-26
 
 An API-consolidation release. File properties are now reusable values rather than scattered function variants: one `FileAccessOptions` (the `fapl` analogue) carries cache budgets and the locking policy to every open, and the new `FileCreateOptions` (the `fcpl` analogue) lets a file layout be defined once and applied to any write, including through `File::create_with_options`. Two long-standing gaps fell out of that work — the read-write mirror backend was silently discarding access options, and the bounded backend always locked regardless of policy. Public types the HDF5 format will keep growing are now `#[non_exhaustive]`, so a future datatype class, reference kind, or MATLAB class is an additive change instead of a breaking one, and a test guards each seal against silent removal. Enumerations can finally be built over any integer base type. Two defects from 0.24.0 are fixed: `repack` corrupting a dataset whose datatype contains a variable-length or reference member, and a hang when reading a file from inside a builder closure. The release carries a number of breaking changes, all listed below; most are one-line call-site edits.

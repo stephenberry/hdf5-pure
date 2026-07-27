@@ -910,6 +910,65 @@ fn crosscheck_varlen_ascii_array_attr() {
     assert_eq!(values, vec![1.0]);
 }
 
+/// A variable-length attribute in *dense* storage, which the compact case above
+/// does not reach. The heap embeds a copy of the attribute's element bytes, and
+/// those bytes are global-heap references: a heap built before they were patched
+/// left the reference C library resolving addresses that were never assigned.
+#[test]
+fn crosscheck_varlen_ascii_array_attr_in_dense_storage() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("vl_ascii_dense.h5");
+
+    let expected = ["x", "y", "velocity"];
+    let mut builder = FileBuilder::new();
+    builder.set_attr(
+        "MATLAB_fields",
+        AttrValue::VarLenAsciiArray(expected.iter().map(|s| (*s).to_string()).collect()),
+    );
+    // Past the eight-attribute threshold, so the set is stored in a fractal heap.
+    for i in 0..12 {
+        builder.set_attr(&format!("filler_{i}"), AttrValue::I64(i));
+    }
+    builder.create_dataset("x").with_f64_data(&[1.0]);
+    builder.write(&path).unwrap();
+
+    let file = hdf5::File::open(&path).unwrap();
+    assert_eq!(file.attr_names().unwrap().len(), 13);
+    let attr = file.attr("MATLAB_fields").unwrap();
+    assert_eq!(read_vl_ascii_attr(&attr), expected);
+}
+
+/// Dense attributes in a file with a userblock. This crate's reader rejected these
+/// files for a while, which made the C library the arbiter of whether the *writer*
+/// was also wrong: it was not, and this pins that. `hdf5-pure`'s own side of it is
+/// `tests/userblock_dense_attrs.rs`.
+#[test]
+fn crosscheck_dense_attributes_past_a_userblock() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("ub_dense_attrs.h5");
+
+    let mut builder = FileBuilder::new();
+    builder.with_userblock(512);
+    let ds = builder.create_dataset("data");
+    ds.with_f64_data(&[1.0, 2.0]);
+    for i in 0..12 {
+        ds.set_attr(&format!("attr_{i:02}"), AttrValue::I64(100 + i));
+    }
+    builder.write(&path).unwrap();
+
+    let file = hdf5::File::open(&path).unwrap();
+    let ds = file.dataset("data").unwrap();
+    assert_eq!(ds.attr_names().unwrap().len(), 12);
+    for i in 0..12i64 {
+        let got: i64 = ds
+            .attr(&format!("attr_{i:02}"))
+            .unwrap()
+            .read_scalar()
+            .unwrap();
+        assert_eq!(got, 100 + i);
+    }
+}
+
 #[test]
 fn crosscheck_dense_attributes() {
     let dir = tempdir().unwrap();

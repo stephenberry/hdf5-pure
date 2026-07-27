@@ -19,6 +19,9 @@ use hdf5_pure::{AttrValue, File, FileBuilder};
 use std::collections::HashMap;
 use tempfile::tempdir;
 
+mod common;
+use common::heap::{has_fractal_heap, huge_object_counts};
+
 /// Number of attributes that forces the whole-file writer into dense storage
 /// (its threshold is 8 compact attributes).
 const DENSE_ATTR_COUNT: usize = 12;
@@ -55,9 +58,8 @@ fn write_dense_source(path: &std::path::Path) {
 /// The file must actually contain a fractal heap (the dense-storage signature);
 /// otherwise the test would pass trivially against compact storage.
 fn assert_file_has_fractal_heap(path: &std::path::Path) {
-    let bytes = std::fs::read(path).unwrap();
     assert!(
-        bytes.windows(4).any(|w| w == b"FRHP"),
+        has_fractal_heap(&std::fs::read(path).unwrap()),
         "source file does not use dense (fractal-heap) storage",
     );
 }
@@ -116,6 +118,61 @@ fn same_file_copy_reproduces_dense_dataset_and_group_attrs() {
     for (name, value) in dense_attr_set() {
         let got: i64 = g.attr(&name).unwrap().read_scalar().unwrap();
         assert_eq!(got, value, "group attr {name} mismatch (C library)");
+    }
+}
+
+/// Copy rebuilds the destination heap from the source attributes, so an
+/// attribute large enough to need fractal-heap *huge* storage has to be rebuilt
+/// as one — including the huge-objects B-tree and the header fields that point at
+/// it. The blob is placed at end-of-file rather than address zero, so this also
+/// exercises the relocation of every address inside it.
+#[test]
+fn copy_reproduces_huge_dense_attrs() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("dense_huge_copy.h5");
+
+    let big: Vec<i64> = (0..10_000).collect();
+    {
+        let mut b = FileBuilder::new();
+        let ds = b.create_dataset("payload");
+        ds.with_f64_data(&[1.5]);
+        ds.set_attr("big", AttrValue::I64Array(big.clone()));
+        for (name, value) in dense_attr_set() {
+            ds.set_attr(&name, AttrValue::I64(value));
+        }
+        b.write(&path).unwrap();
+    }
+    assert_eq!(huge_object_counts(&std::fs::read(&path).unwrap()), vec![1]);
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session.copy("payload", "payload_copy").unwrap();
+        session.commit().unwrap();
+    }
+
+    // Two heaps now, and the copy's own header must declare a huge object too
+    // rather than having quietly fallen back to a managed object it cannot hold.
+    // Reading only the first heap would report the source's choice, not the copy's.
+    assert_eq!(
+        huge_object_counts(&std::fs::read(&path).unwrap()),
+        vec![1, 1],
+        "expected a second fractal heap for the copy, huge-storing as the source does"
+    );
+
+    let f = File::open(&path).unwrap();
+    let copied = f.dataset("payload_copy").unwrap().attrs().unwrap();
+    assert_eq!(i64_attrs(&copied), expected_attr_map());
+    match copied.get("big") {
+        Some(AttrValue::I64Array(v)) => assert_eq!(*v, big),
+        other => panic!("huge attribute came back as {other:?}"),
+    }
+
+    let c = hdf5::File::open(&path).unwrap();
+    let ds = c.dataset("payload_copy").unwrap();
+    assert_eq!(ds.attr("big").unwrap().read_raw::<i64>().unwrap(), big);
+    for (name, value) in dense_attr_set() {
+        let got: i64 = ds.attr(&name).unwrap().read_scalar().unwrap();
+        assert_eq!(got, value, "copied attr {name} mismatch (C library)");
     }
 }
 

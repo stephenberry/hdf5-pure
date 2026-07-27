@@ -650,7 +650,7 @@ pub fn build_fixed_array_at(
     let checksum = jenkins_lookup3(&fahd);
     fahd.extend_from_slice(&checksum.to_le_bytes());
 
-    assert_eq!(fahd.len(), fahd_total_size);
+    debug_assert_eq!(fahd.len(), fahd_total_size);
 
     // Append one element record (chunk address, plus filtered size + mask).
     let write_element = |buf: &mut Vec<u8>, chunk: &WrittenChunk| {

@@ -176,6 +176,28 @@ impl AttributeMessage {
         self.serialize_version(3, length_size)
     }
 
+    /// The first of the message's three 2-byte header fields that this attribute
+    /// would overflow, as `(field name, encoded length)`.
+    ///
+    /// [`Self::serialize_version`] writes the name, datatype and dataspace
+    /// lengths into `u16` fields, so a value past 65,535 truncates and produces a
+    /// message that decodes as something else entirely. Callers that can refuse
+    /// must check this first; the attribute's *data* is not length-prefixed and
+    /// so is not bounded here.
+    pub(crate) fn v3_header_field_overflow(
+        &self,
+        length_size: u8,
+    ) -> Option<(&'static str, usize)> {
+        let limit = u16::MAX as usize;
+        let fields = [
+            // The null terminator the message carries counts toward the field.
+            ("name", self.name.len() + 1),
+            ("datatype", self.datatype.serialize().len()),
+            ("dataspace", self.dataspace.serialize(length_size).len()),
+        ];
+        fields.into_iter().find(|&(_, len)| len > limit)
+    }
+
     fn serialize_version(&self, version: u8, length_size: u8) -> Vec<u8> {
         let name_bytes = {
             let mut n = self.name.as_bytes().to_vec();
