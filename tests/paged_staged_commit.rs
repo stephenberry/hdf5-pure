@@ -87,15 +87,31 @@ fn paged_persist_staged_create_dataset() {
     assert_paged_ok(&path);
 }
 
+/// Signatures that must never appear in a page holding raw dataset bytes: object
+/// headers and their continuations, the global heap, the free-space managers, the
+/// fractal heap that backs dense attributes, and the v2 B-tree and v1
+/// symbol-table/local-heap structures. Each is something this crate's editor
+/// places through a *metadata* allocation, so finding one in a raw page means a
+/// metadata allocation landed there.
+///
+/// Chunk-index signatures (`FAHD`/`FADB`, `EAHD`/`EAIB`/`EASB`/`EADB`) are
+/// deliberately absent from this list. A chunk index is metadata by the format's
+/// taxonomy but every writer in this crate emits it in the same run as the chunk
+/// data it indexes, so it legitimately shares a raw page; the reclaim side tags it
+/// raw to match. `TREE` is excluded for the same reason — a version 1 chunk index
+/// uses it too, so its presence is ambiguous.
+const METADATA_SIGNATURES: &[&[u8; 4]] = &[
+    b"OHDR", b"OCHK", b"GCOL", b"FSHD", b"FSSE", b"FRHP", b"FHDB", b"FHIB", b"BTHD", b"BTIN",
+    b"BTLF", b"SNOD", b"HEAP",
+];
+
 /// Every page holding raw dataset bytes must hold *only* raw bytes.
 ///
 /// A paged file never mixes metadata and raw data within one page — that is the
 /// invariant the commit's page-typed allocation exists to maintain, and the one
 /// thing the C library cannot report on, since it reads such a file happily
 /// either way. Raw extents come from the public layout introspection; a page that
-/// overlaps one must contain no object-header signature (`OHDR`, or a
-/// continuation block's `OCHK`), which is what a metadata allocation landing in a
-/// raw page would leave behind.
+/// overlaps one must contain none of [`METADATA_SIGNATURES`].
 fn assert_pages_homogeneous(path: &std::path::Path, datasets: &[&str]) {
     let bytes = std::fs::read(path).unwrap();
     let f = File::open(path).unwrap();
@@ -138,21 +154,21 @@ fn assert_pages_homogeneous(path: &std::path::Path, datasets: &[&str]) {
         let start = (p * PAGE) as usize;
         let end = ((p + 1) * PAGE).min(bytes.len() as u64) as usize;
         let page = &bytes[start..end];
-        for sig in [b"OHDR", b"OCHK"] {
+        for sig in METADATA_SIGNATURES {
             assert!(
-                !page.windows(4).any(|w| w == sig),
+                !page.windows(4).any(|w| w == *sig),
                 "page {p} holds raw data and the {} signature: a metadata \
                  allocation landed in a raw page",
-                std::str::from_utf8(sig).unwrap()
+                std::str::from_utf8(*sig).unwrap()
             );
         }
     }
 }
 
 /// A staged commit that allocates both page types keeps them in separate pages.
-/// The append writes raw chunks and rebuilds the (metadata) chunk index, and the
-/// new dataset adds raw values and a metadata object header, so the commit has to
-/// switch page type several times.
+/// The append writes raw chunks and rebuilds the chunk index (raw, since an index
+/// travels with the data it indexes), and the new dataset adds raw values and a
+/// metadata object header, so the commit has to switch page type several times.
 #[test]
 fn paged_staged_commit_keeps_pages_homogeneous() {
     let path = tmp("pure_paged_staged_homogeneous.h5");
@@ -191,6 +207,51 @@ fn paged_staged_commit_keeps_pages_homogeneous() {
     drop(f);
     assert_paged_ok(&path);
     assert_pages_homogeneous(&path, &["d", "added"]);
+}
+
+/// A paged file with a userblock is refused rather than silently un-paged.
+///
+/// The session's free-space bookkeeping is not base-address aware, so it declines
+/// to seed persistence on a userblock file. Committing anyway would append without
+/// page awareness — mixing metadata and raw data in the file's pages and leaving
+/// the end of allocation unaligned — producing a file that still advertises the
+/// paged strategy but no longer satisfies it. The refusal is the same one a paged
+/// non-persisting file gets, since in both cases the page bookkeeping is missing.
+#[test]
+fn paged_with_userblock_is_refused() {
+    let path = tmp("pure_paged_staged_userblock.h5");
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("d")
+            .with_i32_data(&(0..64).collect::<Vec<i32>>())
+            .with_shape(&[64]);
+        // A paged file's userblock must be a whole number of pages, so page
+        // boundaries measured from the base coincide with absolute ones.
+        b.with_userblock(PAGE);
+        b.with_file_space_strategy(FileSpaceStrategy::Page, true, 0)
+            .with_file_space_page_size(PAGE);
+        b.write(&path).unwrap();
+    }
+
+    let s = File::open_rw(&path).unwrap();
+    s.root()
+        .create_dataset("added", |b| {
+            b.with_i32_data(&[1i32, 2, 3]);
+        })
+        .unwrap();
+    let err = s.commit().unwrap_err();
+    assert!(
+        matches!(&err, Error::EditUnsupported(m) if m.contains("persisted free space")),
+        "expected a paged refusal for a userblock file, got {err:?}"
+    );
+    drop(s);
+
+    // The refusal happened before any byte moved: the file still reads.
+    let f = File::open(&path).unwrap();
+    assert_eq!(
+        f.dataset("d").unwrap().read_i32().unwrap(),
+        (0..64).collect::<Vec<i32>>()
+    );
 }
 
 /// A paged file that does not persist its free space is still refused: without

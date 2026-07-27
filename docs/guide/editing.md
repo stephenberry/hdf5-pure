@@ -40,7 +40,7 @@ The file's [file-space strategy](file-space.md) gates the write paths further. T
 
 The refusals are `Error::EditUnsupported` for any edit to a paged file that does not persist its free space (through either open), and `Error::AppendInPlaceUnsupported` for an immediate `open_rw` append on a persisting file. Each fires before any byte of the file changes. A `Page` / `persist = false` file stays fully readable through every read path and can be rewritten compactly by [repack](repack.md).
 
-A paged commit through `open_rw` keeps each page homogeneous — raw data and metadata never share a page — and page-aligns the end of allocation, so the reference C library reopens the result as a paged file and recovers its free space. Because a free hole belongs to one page type, such a commit appends rather than reusing holes within the commit; the space is recovered by the manager rewrite at the end of it.
+A paged commit through `open_rw` keeps each page homogeneous — raw data and file metadata never share a page, apart from a chunked dataset's index, which travels with its chunk data (see [File-Space Strategy](file-space.md)) — and page-aligns the end of allocation, so the reference C library reopens the result as a paged file and recovers its free space. Because a free hole belongs to one page type, such a commit appends rather than reusing holes within the commit; the space is recovered by the manager rewrite at the end of it.
 
 For a brand-new file, use [`FileBuilder`](writing.md); to append while readers are live, use the [SWMR writer](swmr.md); to compact a file or drop objects across a reopen, use [repack](repack.md). The [file properties reference](../reference/property-support.md) has the corresponding fcpl/fapl support matrix.
 

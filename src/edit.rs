@@ -474,16 +474,28 @@ impl PagedEdit {
         }
     }
 
-    /// Record `(addr, size)` as free space of page type `ty`. A raw region at
-    /// least a page long is a large-raw fragment (the generic-large manager);
-    /// everything else is small enough to stay in its per-type SMALL manager.
-    /// [`plan_paged_managers`] re-splits and re-classes at serialization time, so
-    /// this only has to route to the right *kind* of list.
-    fn free_typed(&mut self, addr: u64, size: u64, ty: PageType) {
+    /// Record `(addr, size)` as free space of page type `ty` in the given lists.
+    /// A raw region at least a page long is a large-raw fragment (the
+    /// generic-large manager); everything else is small enough to stay in its
+    /// per-type SMALL manager. [`plan_paged_managers`] re-splits and re-classes at
+    /// serialization time, so this only has to route to the right *kind* of list.
+    ///
+    /// Takes the three lists rather than `&mut self` because a commit routes into
+    /// *copies* of them — nothing is free until the superblock repoint — and the
+    /// rule must not be restated at that call site.
+    fn route_free(
+        meta: &mut FreeList,
+        raw_small: &mut FreeList,
+        raw_large: &mut FreeList,
+        page_size: u64,
+        addr: u64,
+        size: u64,
+        ty: PageType,
+    ) {
         match ty {
-            PageType::Meta => self.meta.free(addr, size),
-            PageType::Raw if size >= self.page_size => self.raw_large.free(addr, size),
-            PageType::Raw => self.raw_small.free(addr, size),
+            PageType::Meta => meta.free(addr, size),
+            PageType::Raw if size >= page_size => raw_large.free(addr, size),
+            PageType::Raw => raw_small.free(addr, size),
         }
     }
 
@@ -746,31 +758,54 @@ impl WriteEngine {
         if self.superblock.version < 2 {
             return; // no superblock extension exists before v2
         }
-        // Free-space reuse and persistence are not yet base-address aware: the
-        // persisted section addresses (and the extension/manager block walk below)
-        // are read as absolute, so on a userblock file they would seed `self.free`
-        // with wrong regions that `alloc_or_append` could later hand out into live
-        // data. Leave persistence off for such a file — the on-disk managers stay
-        // untouched and valid, this session simply appends rather than reusing.
-        if self.superblock.base_address != 0 {
-            return;
-        }
         let Some(ext_rel) = self.superblock.superblock_extension_address else {
             return;
         };
         if ext_rel == UNDEF {
             return;
         }
-        let Ok(ext_addr) = usize::try_from(ext_rel) else {
+        // The extension address is stored relative to the base address, so it is
+        // shifted to an absolute file offset before the header is read. This is a
+        // no-op on the base-0 file every path below the userblock check sees, but
+        // that check itself needs the strategy of a *userblock* file.
+        let Ok(ext_addr) = ext_rel
+            .checked_add(self.superblock.base_address)
+            .ok_or(())
+            .and_then(|a| usize::try_from(a).map_err(|_| ()))
+        else {
             return;
         };
         let Some(info) = self.extension_fsinfo(ext_addr) else {
             return;
         };
+        // Free-space reuse and persistence are not yet base-address aware: the
+        // persisted section addresses (and the extension/manager block walk below)
+        // are read as absolute, so on a userblock file they would seed `self.free`
+        // with wrong regions that `alloc_or_append` could later hand out into live
+        // data. Leave persistence off for such a file — the on-disk managers stay
+        // untouched and valid, this session simply appends rather than reusing.
+        //
+        // A *paged* userblock file is a different matter: appending without page
+        // awareness would mix metadata and raw data in its pages and leave its end
+        // of allocation unaligned, quietly producing a file that still claims the
+        // paged strategy but no longer satisfies it. Install the paged marker
+        // without persistence so the commit refusal below catches it, which is the
+        // same rule a paged non-persisting file already takes.
+        if self.superblock.base_address != 0 {
+            if info.strategy == FileSpaceStrategy::Page && info.page_size > 0 {
+                self.paged = Some(PagedEdit::new(info.page_size));
+            }
+            return;
+        }
         // Record the paged strategy regardless of the persist flag: a paged commit
         // needs page-aware bookkeeping, and a paged file that does not persist its
         // free space is refused outright (see `PagedEdit` and the commit refusal).
-        let paged = info.strategy == FileSpaceStrategy::Page;
+        //
+        // A zero page size is refused rather than installed: every page calculation
+        // divides by it, so a corrupt or hostile file declaring `Page` with a page
+        // size of 0 would panic the editor. Leaving `paged` unset makes the file
+        // take the ordinary flat path, which needs no page geometry.
+        let paged = info.strategy == FileSpaceStrategy::Page && info.page_size > 0;
         if paged {
             self.paged = Some(PagedEdit::new(info.page_size));
         }
@@ -2197,8 +2232,12 @@ impl WriteEngine {
                     } => {
                         if let Ok(a) = usize::try_from(*old_addr) {
                             if let Some(spans) = self.chunked_index_spans(a) {
+                                // A chunk index lives in a raw page in this crate's
+                                // files; see `chunked_storage_spans` for why the tag
+                                // has to follow the placement rather than the
+                                // format's metadata/raw taxonomy.
                                 to_free
-                                    .extend(spans.into_iter().map(|(a, l)| (a, l, PageType::Meta)));
+                                    .extend(spans.into_iter().map(|(a, l)| (a, l, PageType::Raw)));
                             }
                         }
                         if let Some(ext) = old_tail_extent {
@@ -2685,26 +2724,43 @@ impl WriteEngine {
         // Fold this commit's vacated regions into their page-type managers, along
         // with the page-padding tails this commit's appends left behind and the
         // superseded extension/manager blocks (all metadata, dead once we repoint).
-        {
+        //
+        // Built in temporaries, exactly as the flat path builds `post`: every
+        // region gathered here is still *live* until the superblock repoint below,
+        // so the session's own lists must not learn about it until that repoint
+        // succeeds. Everything between here and there can fail (the extension
+        // rewrite, each append, each barrier), and a session that survived a failed
+        // commit while believing live extents were free would hand them out on the
+        // next commit — silently destroying the objects still occupying them.
+        let (post_meta, post_raw_small, post_raw_large) = {
             let pg = self
                 .paged
-                .as_mut()
+                .as_ref()
                 .expect("commit_persisting_paged is only called on a paged file");
-            let meta_pad = core::mem::take(&mut pg.meta_pad);
-            let raw_pad = core::mem::take(&mut pg.raw_pad);
-            for (a, l) in meta_pad {
-                pg.meta.free(a, l);
+            let (mut meta, mut raw_small, mut raw_large) =
+                (pg.meta.clone(), pg.raw_small.clone(), pg.raw_large.clone());
+            for &(a, l) in &pg.meta_pad {
+                meta.free(a, l);
             }
-            for (a, l) in raw_pad {
-                pg.raw_small.free(a, l);
+            for &(a, l) in &pg.raw_pad {
+                raw_small.free(a, l);
             }
             for &(a, l, ty) in &to_free {
-                pg.free_typed(a, l, ty);
+                PagedEdit::route_free(
+                    &mut meta,
+                    &mut raw_small,
+                    &mut raw_large,
+                    page_size,
+                    a,
+                    l,
+                    ty,
+                );
             }
             for &(a, l) in &old_blocks {
-                pg.meta.free(a, l);
+                meta.free(a, l);
             }
-        }
+            (meta, raw_small, raw_large)
+        };
 
         let old_ext_rel = self
             .superblock
@@ -2738,21 +2794,10 @@ impl WriteEngine {
 
         // Class the free space into its managers and place their blocks after the
         // extension. Shared with the bounded backend so both lay out identically.
-        let (meta_sections, raw_small_sections, raw_large_sections) = {
-            let pg = self
-                .paged
-                .as_ref()
-                .expect("commit_persisting_paged is only called on a paged file");
-            (
-                free_sections(&pg.meta),
-                free_sections(&pg.raw_small),
-                free_sections(&pg.raw_large),
-            )
-        };
         let plan = plan_paged_managers(
-            &meta_sections,
-            &raw_small_sections,
-            &raw_large_sections,
+            &free_sections(&post_meta),
+            &free_sections(&post_raw_small),
+            &free_sections(&post_raw_large),
             page_size,
             ext_addr + ext_len,
             os,
@@ -2815,10 +2860,17 @@ impl WriteEngine {
         self.handle.sync_all().map_err(Error::Io)?;
         self.superblock = new_sb;
 
-        // The repoint is durable. The blocks just written become the ones the next
+        // The repoint is durable. Only now are this commit's vacated regions
+        // genuinely free, so adopt the lists built above and drop the padding tails
+        // they already account for. The blocks just written become the ones the next
         // commit supersedes, and the tail page is fresh metadata: the managers sit
         // in it, so a following append of metadata may keep packing that page.
         if let Some(pg) = self.paged.as_mut() {
+            pg.meta = post_meta;
+            pg.raw_small = post_raw_small;
+            pg.raw_large = post_raw_large;
+            pg.meta_pad.clear();
+            pg.raw_pad.clear();
             pg.last = Some(PageType::Meta);
         }
         self.persist = Some(PersistState {
@@ -4547,9 +4599,16 @@ impl WriteEngine {
         // Build the fresh Extensible Array at the current end-of-file. Its embedded
         // block addresses are computed from `ea_base` (base-relative), so appending
         // the blob at the matching file offset makes them resolve correctly, on a
-        // userblock (`base != 0`) file too. The index is metadata, so open a
-        // metadata page before reading the offset it is built against.
-        self.begin_page(PageType::Meta)?;
+        // userblock (`base != 0`) file too.
+        //
+        // The index goes in a *raw* page, not a metadata one: every other writer in
+        // this crate places a chunk index in the same run as the chunk data, and
+        // `chunked_storage_spans` reclaims every index as raw on that basis. Placing
+        // this one in a metadata page would make it the single exception the reclaim
+        // side then mis-files, advertising a metadata hole inside a raw page. Opening
+        // the page before reading the offset keeps `begin_page`'s contract: no pad
+        // may be inserted after an address the built bytes embed.
+        self.begin_page(PageType::Raw)?;
         let ea_base = self.data.len() as u64 - base;
         let ea_bytes =
             build_extensible_array_at(&combined, OFFSET_SIZE, LENGTH_SIZE, has_filters, ea_base)
@@ -5226,15 +5285,24 @@ impl WriteEngine {
             LENGTH_SIZE,
         )
         .ok()?;
-        // Keep the two halves' page types: chunk data is raw, the index structure
-        // is metadata. A paged file records them in different managers, and the
-        // non-paged path simply ignores the tag.
+        // Both halves are tagged raw, because on a paged file both halves *live* in
+        // raw pages: every writer in this crate places a chunked dataset's index
+        // structure immediately after its chunk data in one run — the from-scratch
+        // paged writer builds the whole blob inside the raw region, and
+        // `build_chunked_dataset` / `write_chunked_relocatable` append it under a
+        // single `begin_page(PageType::Raw)`.
+        //
+        // A chunk index is metadata by the format's taxonomy, so tagging it that way
+        // is tempting; it is also wrong here. The tag decides which manager the
+        // freed region is recorded in, and recording an index that sits among live
+        // chunk data in the *metadata* manager would advertise space inside a raw
+        // page — letting the reference library place metadata there and mixing the
+        // page, which is the one thing a paged file must never do. The tag has to
+        // follow the placement, so `write_appended_chunks` places its rebuilt index
+        // in a raw page too, keeping every index in this crate's files raw.
         let mut spans: Vec<(u64, u64, PageType)> = Vec::new();
-        for (addr, len) in split.data {
+        for (addr, len) in split.data.into_iter().chain(split.index) {
             spans.push((addr.checked_add(base)?, len, PageType::Raw));
-        }
-        for (addr, len) in split.index {
-            spans.push((addr.checked_add(base)?, len, PageType::Meta));
         }
         let mut plain: Vec<(u64, u64)> = spans.iter().map(|&(a, l, _)| (a, l)).collect();
         if !spans_disjoint_in_bounds(&mut plain, self.data.len() as u64) {
@@ -7339,6 +7407,145 @@ mod tests {
             assert!(addr >= prev_end, "the per-type lists do not overlap");
             prev_end = addr + len;
         }
+    }
+
+    /// Deleting a chunked dataset from a paged file must not record its freed
+    /// chunk index in the *metadata* manager.
+    ///
+    /// Every writer in this crate emits a chunk index in the same run as the chunk
+    /// data it indexes, so the index sits in a raw page. Recording it as metadata
+    /// would advertise a metadata-sized hole inside a page that still holds another
+    /// dataset's live chunk data, and the reference library placing metadata there
+    /// would mix the page — the one thing a paged file forbids. Page homogeneity is
+    /// preserved on disk either way, so the mis-filing is invisible to a signature
+    /// scan of the file and to the C library; the manager a section lands in has to
+    /// be checked directly.
+    #[test]
+    fn deleted_chunk_index_is_freed_into_a_raw_manager() {
+        use crate::writer::FileBuilder;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("paged_chunk_index_free.h5");
+        let page = 4096u64;
+        let mut b = FileBuilder::new();
+        for name in ["drop", "keep"] {
+            b.create_dataset(name)
+                .with_i32_data(&(0..200).collect::<Vec<i32>>())
+                .with_shape(&[200])
+                .with_chunks(&[50]);
+        }
+        b.with_file_space_strategy(FileSpaceStrategy::Page, true, 0)
+            .with_file_space_page_size(page);
+        b.write(&path).unwrap();
+
+        {
+            let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+            s.delete("/drop");
+            s.commit().unwrap();
+        }
+
+        // Pages still occupied by the surviving dataset's chunk data. Read with the
+        // session closed: its lock is mandatory on Windows.
+        let live_raw_pages: Vec<u64> = {
+            let f = crate::reader::File::open(&path).unwrap();
+            let ds = f.dataset("keep").unwrap();
+            let mut pages: Vec<u64> = ds
+                .chunks()
+                .unwrap()
+                .iter()
+                .filter(|c| c.storage_size > 0)
+                .flat_map(|c| (c.address / page)..=((c.address + c.storage_size - 1) / page))
+                .collect();
+            pages.sort_unstable();
+            pages.dedup();
+            pages
+        };
+        assert!(!live_raw_pages.is_empty(), "expected live raw pages");
+
+        let s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+        let pg = s.paged.as_ref().expect("a paged file installs paged state");
+        for (addr, len) in pg.meta.sections() {
+            for p in (addr / page)..=((addr + len - 1) / page) {
+                assert!(
+                    !live_raw_pages.contains(&p),
+                    "metadata free section ({addr}, {len}) sits in page {p}, which still \
+                     holds live raw chunk data"
+                );
+            }
+        }
+        // The index really was reclaimed somewhere, so this is not vacuous.
+        let reclaimed: u64 = pg.all_sections().iter().map(|&(_, l)| l).sum();
+        assert!(reclaimed > 0, "the delete reclaimed nothing");
+    }
+
+    /// A paged commit that fails partway must leave the session's free lists
+    /// exactly as it found them.
+    ///
+    /// Everything the commit gathers to free is still *live* until the superblock
+    /// repoint: the objects occupying those regions are reachable from the old
+    /// root, which a failed commit never replaces. A session that recorded them as
+    /// free anyway would hand them out on the next commit, and the file would lose
+    /// data with no error anywhere — in a release build, where the free list's
+    /// double-free `debug_assert` is compiled out, silently.
+    ///
+    /// The failure is induced by pointing the superblock extension at a byte range
+    /// that is not an object header, which fails the extension rewrite immediately
+    /// after the regions are gathered.
+    #[test]
+    fn failed_paged_commit_leaves_the_free_lists_untouched() {
+        use crate::writer::FileBuilder;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("paged_failed_commit.h5");
+        let mut b = FileBuilder::new();
+        b.create_dataset("keep")
+            .with_i32_data(&(0..200).collect::<Vec<i32>>())
+            .with_shape(&[200]);
+        b.create_dataset("drop")
+            .with_i32_data(&(0..200).collect::<Vec<i32>>())
+            .with_shape(&[200]);
+        b.with_file_space_strategy(FileSpaceStrategy::Page, true, 0)
+            .with_file_space_page_size(4096);
+        b.write(&path).unwrap();
+
+        let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+        let before = s.space_accounting().reusable_free_space;
+
+        // Break the extension so the commit fails *after* it has gathered the
+        // regions `drop` vacates and *before* the superblock repoint.
+        let good_ext = s.superblock.superblock_extension_address;
+        s.superblock.superblock_extension_address = Some(0);
+        s.delete("/drop");
+        assert!(
+            s.commit().is_err(),
+            "a commit with an unreadable extension must fail"
+        );
+
+        assert_eq!(
+            s.space_accounting().reusable_free_space,
+            before,
+            "a failed commit must not record still-live regions as free"
+        );
+
+        // The session stays usable: repair the extension and commit for real. If
+        // the failed commit had folded its regions in, this second commit would
+        // double-free them (a debug assertion) and publish `keep`'s live extent.
+        s.superblock.superblock_extension_address = good_ext;
+        s.delete("/drop");
+        s.commit()
+            .expect("the session is usable after a failed commit");
+
+        let f = crate::reader::File::open(&path).unwrap();
+        let kept = f.dataset("keep").unwrap().read_i32().unwrap();
+        assert_eq!(kept, (0..200).collect::<Vec<i32>>(), "keep survives intact");
+        let freed: u64 = f.persisted_free_space().iter().map(|&(_, l)| l).sum();
+        let live_end = f.file_size();
+        assert!(
+            freed < live_end,
+            "the recorded free space cannot cover the whole file"
+        );
     }
 
     #[test]

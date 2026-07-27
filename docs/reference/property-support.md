@@ -79,7 +79,7 @@ The paged and persistent-free-space paths are exercised by C-library crosschecks
 
 Current limits worth knowing:
 
-- **A paged file must persist its free space to be mutated.** Both editors grow a paged `persist = true` file, keeping pages homogeneous and the end of allocation page-aligned; a paged file created **without** `persist = true` has no record of which pages hold metadata versus raw data and cannot be grown at all — recreate it with `persist = true`.
+- **A paged file must persist its free space to be mutated.** Both editors grow a paged `persist = true` file, keeping pages homogeneous and the end of allocation page-aligned; a paged file created **without** `persist = true`, or one carrying a userblock, has no usable record of which pages hold metadata versus raw data and cannot be grown at all — recreate it with `persist = true` and no userblock.
 - **Free space is under-reported, never over-reported.** A final metadata-page tail and the old bytes of a relocated partial chunk are left untracked, so `H5Fget_freespace` can read slightly low. The file stays valid.
 - **`threshold` is advisory** and **the non-paged `userblock` size is not validated** (see the tables above).
 - Only **File Space Info message version 1** is emitted and read.

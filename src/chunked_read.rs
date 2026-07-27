@@ -1584,15 +1584,16 @@ pub(crate) fn collect_chunked_storage_spans(
     Ok(ChunkedStorageSpans { data, index })
 }
 
-/// A chunked dataset's on-disk footprint, split by the two kinds of space it
-/// occupies: `data` holds the chunk data blocks (raw data) and `index` holds the
-/// chunk index's own structure blocks (file metadata).
-///
-/// The split matters to a paged file (`H5F_FSPACE_STRATEGY_PAGE`), which never
-/// mixes raw data and metadata within one page and so tracks the two in separate
-/// free-space managers; a caller reclaiming this dataset's space must route each
-/// kind to the right one. Callers that only need the whole footprint can
+/// A chunked dataset's on-disk footprint, split by the two kinds of structure it
+/// occupies: `data` holds the chunk data blocks and `index` holds the chunk
+/// index's own structure blocks. Callers that only need the whole footprint can
 /// concatenate the two.
+///
+/// The split is *structural*, not a page-type classification. On a paged file
+/// (`H5F_FSPACE_STRATEGY_PAGE`) both halves normally sit in raw pages, because
+/// every writer in this crate emits the index in the same run as the chunk data;
+/// a caller reclaiming this space must route by where the bytes actually are, not
+/// by which half they came from. See `WriteEngine::chunked_storage_spans`.
 #[cfg(feature = "std")]
 pub(crate) struct ChunkedStorageSpans {
     pub(crate) data: Vec<(u64, u64)>,
