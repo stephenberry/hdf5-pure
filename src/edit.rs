@@ -356,8 +356,8 @@ append_typed! {
 /// The in-place write engine behind the owned read-write [`File`](crate::File)
 /// (its `Backend::Mirror`).
 ///
-/// Mirrors the file in memory and keeps a writable handle; every mutation is
-/// applied to both so the on-disk file stays consistent. It carries two commit
+/// Reads and edits the file through a [`FileImage`], which owns the writable
+/// handle and decides how much of the file is resident. It carries two commit
 /// models: staged tree edits applied by [`commit`](Self::commit), and immediate
 /// crash-atomic in-place appends ([`append_inplace`](Self::append_inplace)).
 pub(crate) struct WriteEngine {
@@ -642,6 +642,20 @@ impl WriteEngine {
         Self::open_inner(path.as_ref(), Some(locking))
     }
 
+    /// Open exactly as [`open_with_locking`](Self::open_with_locking) does, but
+    /// behind an image that withholds its whole-file slice, so every read takes
+    /// the [`Source`] path rather than the slice fast path.
+    ///
+    /// A test opening the same file both ways and comparing results is what
+    /// keeps the two forms of each read from drifting apart before a mirrorless
+    /// backing exists to exercise the second one (issue #198).
+    #[cfg(test)]
+    pub(crate) fn open_source_only(path: &Path) -> Result<Self, Error> {
+        Self::open_imaged(path, Some(FileLocking::Enabled), |mirror| {
+            Box::new(crate::image::SourceOnlyImage::new(mirror))
+        })
+    }
+
     /// Open an existing file for SWMR (single-writer/multiple-reader) writing:
     /// take **no** OS lock at all and raise the superblock's SWMR-write
     /// consistency flag. Backs [`File::open_swmr_writer`](crate::File::open_swmr_writer).
@@ -684,6 +698,21 @@ impl WriteEngine {
     /// that policy (the ordinary read-write session); `lock = None` takes no lock
     /// at all (the SWMR writer — see [`open_swmr_writer`](Self::open_swmr_writer)).
     fn open_inner(path: &Path, lock: Option<FileLocking>) -> Result<Self, Error> {
+        Self::open_imaged(path, lock, |mirror| Box::new(mirror))
+    }
+
+    /// Open a session, letting the caller choose how the mirror is presented to
+    /// the engine.
+    ///
+    /// `wrap` exists so a test can substitute an image that withholds its slice
+    /// (`SourceOnlyImage`) and drive the engine's mirrorless read paths, which
+    /// no production backing selects yet (issue #198). The production path
+    /// passes the identity.
+    fn open_imaged(
+        path: &Path,
+        lock: Option<FileLocking>,
+        wrap: impl FnOnce(MirrorImage) -> Box<dyn FileImage>,
+    ) -> Result<Self, Error> {
         let mut handle = fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -724,7 +753,7 @@ impl WriteEngine {
         }
         // Normalize the root group address to an absolute file offset, exactly as
         // the reader does (`reader::parse_superblock`), so `resolve_path_any` and
-        // the link-graph walk index `self.data` correctly. It is converted back to a
+        // the link-graph walk index the image correctly. It is converted back to a
         // stored (base-relative) address only when the superblock is serialized on
         // commit.
         superblock.root_group_address = superblock
@@ -736,7 +765,7 @@ impl WriteEngine {
             })?;
 
         let mut session = Self {
-            image: Box::new(MirrorImage::new(handle, data)),
+            image: wrap(MirrorImage::new(handle, data)),
             sb_sig_off,
             superblock,
             pending_datasets: Vec::new(),
@@ -1246,7 +1275,7 @@ impl WriteEngine {
 
     /// Apply a gathered in-place append (typed / generic / raw bytes) to `dataset`,
     /// immediately and crash-atomically, driving the shared Extensible-Array engine
-    /// against the session's own mirror through an [`EditMirror`] adapter. Runs only
+    /// against the session's own image through an [`EditStore`] adapter. Runs only
     /// the first `max_phase` durability phases; production callers pass 4, the
     /// crash-consistency tests stop at a boundary to simulate a crash.
     fn append_inplace_gathered(
@@ -1367,8 +1396,8 @@ impl WriteEngine {
 
         // Read/plan phase (immutable borrows only, nothing published yet), then the
         // ordered, fsync-barriered write phase — both shared with `Dataset::append`
-        // through the chunk-index engine. `EditMirror` borrows only the
-        // mirror-carrying fields, so `self.located` stays independently borrowable.
+        // through the chunk-index engine. `EditStore` borrows only the
+        // image-carrying fields, so `self.located` stays independently borrowable.
         let plan_result = {
             let st = &self.located[&oh_addr];
             let mirror = EditStore {
@@ -4633,7 +4662,7 @@ impl WriteEngine {
     /// padded to a page boundary, the padding being recorded as free space of the
     /// outgoing type.
     ///
-    /// Call this **before** reading [`self.data.len()`](Self::data) to compute an
+    /// Call this **before** reading the image's end-of-file ([`Source::len`]) to compute an
     /// address that will be embedded in the bytes being built: several callers
     /// (the chunk blob, the extensible-array index, the dense-attribute blob)
     /// build content whose interior addresses assume it lands at the current

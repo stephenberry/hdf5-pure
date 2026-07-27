@@ -1611,6 +1611,24 @@ impl File {
         })
     }
 
+    /// Open exactly as [`open_rw`](Self::open_rw) does, but behind an image that
+    /// withholds its whole-file slice, so every read takes the `Source` path
+    /// rather than the slice fast path.
+    ///
+    /// Each read this file serves has two forms (see `with_engine`), and only
+    /// the slice form runs in production until a mirrorless backing lands
+    /// (issue #198). Opening the same file both ways and comparing is what
+    /// holds the other form to the same answers in the meantime.
+    #[cfg(test)]
+    pub(crate) fn open_rw_source_only(path: &std::path::Path) -> Result<Self, Error> {
+        Ok(File {
+            inner: Arc::new(FileInner::from_rw_session(
+                WriteEngine::open_source_only(path)?,
+                FileAccessProperties::new(),
+            )?),
+        })
+    }
+
     /// Open an existing file for **SWMR** (single-writer/multiple-reader)
     /// appending: take **no** OS lock (so concurrent readers, and Windows'
     /// mandatory locks, are never blocked) and raise the superblock's SWMR-write
@@ -3901,6 +3919,133 @@ fn is_group(header: &ObjectHeader) -> bool {
 mod tests {
     use super::*;
     use crate::FileBuilder;
+
+    /// Read everything a read-write file can serve through the paired read
+    /// paths, as comparable text.
+    ///
+    /// Each entry exercises a different `with_engine` call site: path
+    /// resolution, object-header parsing, group listing, attribute reads (both
+    /// the compact and the dense form), a whole-dataset read, and a row-range
+    /// read. Errors are formatted rather than unwrapped so that a *divergence in
+    /// which error* is reported also fails the comparison.
+    fn read_everything(file: &File) -> Vec<String> {
+        let mut out = Vec::new();
+        out.push(format!("root groups: {:?}", file.root().groups()));
+        out.push(format!("root datasets: {:?}", file.root().datasets()));
+        out.push(format!("root attrs: {:?}", sorted(file.root().attrs())));
+
+        for path in ["plain", "g/nested", "many_attrs", "missing", "g/missing"] {
+            match file.dataset(path) {
+                Ok(ds) => {
+                    out.push(format!("{path}: shape {:?}", ds.shape()));
+                    out.push(format!("{path}: attrs {:?}", sorted(ds.attrs())));
+                    out.push(format!("{path}: all {:?}", ds.read_i32()));
+                    out.push(format!("{path}: rows {:?}", ds.read_i32_rows(1, 2)));
+                    out.push(format!("{path}: raw rows {:?}", ds.read_raw_rows(0, 1)));
+                }
+                Err(e) => out.push(format!("{path}: error {e}")),
+            }
+        }
+        out
+    }
+
+    /// Attribute maps compare only after ordering; `HashMap`'s `Debug` is not
+    /// deterministic, and an ordering difference here would be noise rather
+    /// than the divergence this is looking for.
+    fn sorted(attrs: Result<HashMap<String, AttrValue>, Error>) -> Vec<String> {
+        match attrs {
+            Ok(map) => {
+                let mut v: Vec<String> =
+                    map.iter().map(|(k, val)| format!("{k}={val:?}")).collect();
+                v.sort();
+                v
+            }
+            Err(e) => vec![format!("error {e}")],
+        }
+    }
+
+    /// Drive `bytes` down both forms of every read a read-write file serves and
+    /// require identical answers.
+    ///
+    /// Every read has a slice form (walking the whole-file mirror) and a
+    /// `Source` form, and until a mirrorless backing lands (issue #198) only the
+    /// slice form ever runs. This makes the other form reachable now, so it
+    /// cannot quietly drift as its twin is edited.
+    fn assert_both_read_paths_agree(bytes: &[u8], what: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("both.h5");
+        std::fs::write(&path, bytes).unwrap();
+
+        // One session at a time: `open_rw` takes an exclusive lock, and holding
+        // two over one path fails outright where OS locks are mandatory.
+        let via_mirror = {
+            let f = File::open_rw(&path).unwrap();
+            read_everything(&f)
+        };
+        let via_source = {
+            let f = File::open_rw_source_only(&path).unwrap();
+            read_everything(&f)
+        };
+
+        assert_eq!(
+            via_mirror.len(),
+            via_source.len(),
+            "{what}: the two read paths produced different numbers of results"
+        );
+        for (m, s) in via_mirror.iter().zip(&via_source) {
+            assert_eq!(m, s, "{what}: slice and Source read paths disagree");
+        }
+        // Guard the guard: a helper that read nothing would make the comparison
+        // vacuous, and a file whose datasets all failed to open would too.
+        assert!(
+            via_mirror.iter().any(|r| r.contains("all Ok(")),
+            "{what}: no dataset read succeeded, so this compared nothing"
+        );
+    }
+
+    /// A file exercising each paired read: a plain dataset, a nested one behind
+    /// a group (path resolution), and one carrying enough attributes to force
+    /// the dense (fractal-heap) attribute layout rather than compact messages.
+    fn both_paths_file_bytes(userblock: Option<u64>) -> Vec<u8> {
+        let mut b = FileBuilder::new();
+        if let Some(ub) = userblock {
+            b.with_userblock(ub);
+        }
+        b.create_dataset("plain")
+            .with_i32_data(&(0..24).collect::<Vec<i32>>())
+            .with_shape(&[6, 4])
+            .set_attr("units", AttrValue::String("m".into()));
+        // Well past the eight-attribute compact limit, so the header converts to
+        // the dense layout and the dense extraction path is the one that runs.
+        {
+            let ds = b
+                .create_dataset("many_attrs")
+                .with_i32_data(&(0..8).collect::<Vec<i32>>());
+            for i in 0..24 {
+                ds.set_attr(&format!("attr_{i:02}"), AttrValue::I64(i));
+            }
+        }
+        let mut g = b.create_group("g");
+        g.create_dataset("nested")
+            .with_i32_data(&(100..112).collect::<Vec<i32>>())
+            .with_shape(&[3, 4]);
+        b.add_group(g.finish());
+        b.finish().unwrap()
+    }
+
+    #[test]
+    fn both_read_paths_agree() {
+        assert_both_read_paths_agree(&both_paths_file_bytes(None), "no userblock");
+    }
+
+    /// The userblock case is the one where the two forms are built differently:
+    /// the slice form reframes by slicing at the base address, the `Source` form
+    /// wraps in a `BaseOffsetSource`. A file with a nonzero base is the only way
+    /// to compare them.
+    #[test]
+    fn both_read_paths_agree_with_a_userblock() {
+        assert_both_read_paths_agree(&both_paths_file_bytes(Some(512)), "512-byte userblock");
+    }
 
     /// One 256-element i32 dataset, chunked into 32-element chunks, in memory.
     fn chunked_file_bytes() -> Vec<u8> {
