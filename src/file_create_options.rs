@@ -10,6 +10,11 @@ use crate::libver::LibVer;
 /// can define a file layout once and reuse it everywhere it writes, instead of
 /// repeating a builder call chain and keeping the copies in sync.
 ///
+/// It is named for what it is rather than after the C type: a plain `Copy`
+/// value, with no handle to create or close, no runtime property registry, and
+/// no setter that can fail. The C spellings are doc aliases instead, so a search
+/// for `fcpl` or for an individual `H5Pset_*` still lands here.
+///
 /// Pass it to [`FileBuilder::with_create_options`](crate::FileBuilder::with_create_options)
 /// or [`File::create_with_options`](crate::File::create_with_options). The
 /// equivalent [`FileBuilder`](crate::FileBuilder) methods set the same fields one
@@ -45,7 +50,6 @@ use crate::libver::LibVer;
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[doc(alias = "fcpl")]
-#[doc(alias = "H5Pcreate")]
 pub struct FileCreateOptions {
     userblock: u64,
     libver_bounds: Option<(LibVer, LibVer)>,
