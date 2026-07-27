@@ -139,13 +139,14 @@ fn paged_persist_large_append_multi_batch() {
     assert_eq!(got[0], 0);
 }
 
-/// The whole-file editor (`File::open_rw` + staged append + `commit`) refuses to
-/// commit an edit to a paged file: its persisting commit would write a single
-/// non-paged manager and degrade the paging. The refusal is atomic (no writes),
-/// so the original file still reads back. Bounded mutation is the paged path.
+/// The whole-file editor (`File::open_rw` + staged append + `commit`) grows a
+/// persisting paged file too (issue #198): the commit takes a page-aware tail
+/// that rewrites the per-page-type managers and keeps the allocation page-aligned,
+/// so the appended rows read back and every paged invariant still holds. It used
+/// to refuse such a file and send the caller to `File::open_rw_bounded`.
 #[test]
-fn paged_mirror_commit_is_refused() {
-    let path = tmp("pure_paged_mirror_refused.h5");
+fn paged_mirror_commit_appends() {
+    let path = tmp("pure_paged_mirror_commit.h5");
     build_paged(&path, 100, 32);
 
     {
@@ -155,20 +156,15 @@ fn paged_mirror_commit_is_refused() {
             b.append_i32(&[100, 101, 102]);
         })
         .unwrap();
-        let err = file.commit().unwrap_err();
-        assert!(
-            matches!(err, Error::EditUnsupported(_)),
-            "paged mirror commit should be refused, got: {err:?}"
-        );
+        file.commit().unwrap();
         // Drop `file` and its `ds` clone (holding the OS lock) before reading back.
     }
 
-    // Refused before any writes: the file is untouched and reads the original.
     assert_paged_ok(&path);
     let f = File::open(&path).unwrap();
     assert_eq!(
         f.dataset("d").unwrap().read_i32().unwrap(),
-        (0..100).collect::<Vec<i32>>()
+        (0..103).collect::<Vec<i32>>()
     );
 }
 

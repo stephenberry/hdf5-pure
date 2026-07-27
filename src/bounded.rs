@@ -31,8 +31,8 @@ use crate::file_lock::{self, FileLocking};
 use crate::file_space_info::{FileSpaceInfo, FileSpaceStrategy, NUM_FILE_FSM_MANAGERS};
 use crate::free_space::FreeList;
 use crate::free_space_manager::{
-    FreeSection, SECT_CLASS_LARGE, SECT_CLASS_SIMPLE, SECT_CLASS_SMALL, fshd_len, fsse_len,
-    read_persisted_sections_source, serialize_file_fsm,
+    FreeSection, PageType, SECT_CLASS_SIMPLE, align_up, free_sections, fshd_len,
+    plan_paged_managers, read_persisted_sections_source, serialize_file_fsm,
 };
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
@@ -127,16 +127,6 @@ pub(crate) struct BoundedStore {
     /// [`append_raw`](Store::append_raw) / [`append_meta`](Store::append_meta) are
     /// plain end-of-file appends. When `Some`, they keep pages homogeneous.
     paged: Option<PagedAppend>,
-}
-
-/// Page type of a paged allocation. A paged file never mixes metadata and raw
-/// data within one page, so appends of the two types are kept in separate pages.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum PageType {
-    /// File metadata (extensible-array blocks, headers, free-space blocks).
-    Meta,
-    /// Raw dataset data (chunk contents).
-    Raw,
 }
 
 /// Paged-append bookkeeping on a paged [`BoundedStore`] (issue #173 Phase 2). The
@@ -400,41 +390,19 @@ impl BoundedStore {
         )?)
         .len() as u64;
 
-        // Split every section at page boundaries, then class each fragment by size:
-        // an intra-page (< page) fragment stays in its SMALL-class per-type manager
-        // (SUPER=0 for metadata, DRAW=2 for small raw), while a whole free page
-        // (>= page, which only arises from freeing a page's worth of metadata below
-        // a page tail) goes to the single generic-large manager (slot 6), together
-        // with any pre-existing large-raw fragments. This keeps a SMALL section from
-        // ever spanning a page or reaching page_size, matching the reference library.
-        let mut slot0 = Vec::new();
-        let mut slot2 = Vec::new();
-        let mut slot6 = Vec::new();
-        for s in split_at_pages(meta, page_size) {
-            if s.size < page_size {
-                slot0.push(s)
-            } else {
-                slot6.push(s)
-            }
-        }
-        for s in split_at_pages(raw_small, page_size) {
-            if s.size < page_size {
-                slot2.push(s)
-            } else {
-                slot6.push(s)
-            }
-        }
-        for s in split_at_pages(raw_large, page_size) {
-            slot6.push(s);
-        }
-        slot6.sort_by_key(|s| s.addr);
-        let managers: [(usize, u8, &[FreeSection]); 3] = [
-            (0, SECT_CLASS_SMALL, &slot0),
-            (2, SECT_CLASS_SMALL, &slot2),
-            (6, SECT_CLASS_LARGE, &slot6),
-        ];
+        // Class every section into its per-page-type manager and place the blocks
+        // that follow the extension. Shared with the whole-file editor's paged tail
+        // so both engines lay out a paged file identically.
+        let plan = plan_paged_managers(
+            meta,
+            raw_small,
+            raw_large,
+            page_size,
+            ext_addr + ext_len,
+            os,
+        );
 
-        if managers.iter().all(|(_, _, s)| s.is_empty()) {
+        if plan.is_empty() {
             // No free space to track: an empty persist message, page-aligned.
             let info = FileSpaceInfo::persistent_empty(strategy, threshold, page_size);
             let ext_oh =
@@ -449,31 +417,18 @@ impl BoundedStore {
             return Ok(vec![(ext_addr, ext_oh.len() as u64)]);
         }
 
-        // Closed-form layout: the extension, then each active manager's FSHD/FSSE.
-        // FSSE byte length depends only on section count (fixed field widths), so a
-        // single forward pass fixes every address with no fixpoint iteration.
-        let mut slots = [u64::MAX; NUM_FILE_FSM_MANAGERS];
-        let mut blocks: Vec<(usize, u64, u64, u8, &[FreeSection])> = Vec::new(); // slot, fshd, fsse, class, sections
-        let mut cursor = ext_addr + ext_len;
-        for &(slot, class, sections) in &managers {
-            if sections.is_empty() {
-                continue;
-            }
-            let fshd_addr = cursor;
-            let fsse_addr = fshd_addr + fshd_len(os);
-            let section_sizes: Vec<u64> = sections.iter().map(|s| s.size).collect();
-            cursor = fsse_addr + fsse_len(&section_sizes, os);
-            slots[slot] = fshd_addr;
-            blocks.push((slot, fshd_addr, fsse_addr, class, sections));
-        }
-        let end_of_managers = cursor;
-        let final_eof = align_up(end_of_managers, page_size);
+        let final_eof = align_up(plan.end_of_managers, page_size);
         // Paged convention (matching the from-scratch writer): the managers are
         // ordinary metadata below a page-aligned end-of-allocation.
         let eoa_pre_fsm = final_eof;
 
-        let info =
-            FileSpaceInfo::persistent_managers(strategy, threshold, page_size, slots, eoa_pre_fsm);
+        let info = FileSpaceInfo::persistent_managers(
+            strategy,
+            threshold,
+            page_size,
+            plan.slots,
+            eoa_pre_fsm,
+        );
         let ext_oh =
             build_v2_object_header(&rewrite_extension_region_bytes(old_ext_region, &info)?);
         debug_assert_eq!(
@@ -487,16 +442,17 @@ impl BoundedStore {
         let written_ext = self.append_bytes(&ext_oh)?;
         debug_assert_eq!(written_ext, ext_addr);
         let mut new_old_blocks = vec![(ext_addr, ext_oh.len() as u64)];
-        for &(_slot, fshd_addr, fsse_addr, class, sections) in &blocks {
-            let (fshd, fsse) = serialize_file_fsm(sections, fshd_addr, fsse_addr, os, class);
+        for b in &plan.blocks {
+            let (fshd, fsse) =
+                serialize_file_fsm(&b.sections, b.fshd_addr, b.fsse_addr, os, b.class);
             let wf = self.append_bytes(&fshd)?;
-            debug_assert_eq!(wf, fshd_addr);
-            new_old_blocks.push((fshd_addr, fshd.len() as u64));
+            debug_assert_eq!(wf, b.fshd_addr);
+            new_old_blocks.push((b.fshd_addr, fshd.len() as u64));
             let ws = self.append_bytes(&fsse)?;
-            debug_assert_eq!(ws, fsse_addr);
+            debug_assert_eq!(ws, b.fsse_addr);
             new_old_blocks.push((ws, fsse.len() as u64));
         }
-        debug_assert_eq!(self.len, end_of_managers);
+        debug_assert_eq!(self.len, plan.end_of_managers);
         // Pad the final metadata page to its boundary. This trailing tail is left
         // untracked (a valid free-space under-report), keeping the manager layout
         // closed-form rather than self-referential.
@@ -1147,45 +1103,6 @@ fn load_bounded_persist(
     }))
 }
 
-/// The free `(addr, size)` runs a [`FreeList`] holds, as [`FreeSection`]s in the
-/// shape the manager serializer expects.
-fn free_sections(free: &FreeList) -> Vec<FreeSection> {
-    free.sections()
-        .into_iter()
-        .map(|(addr, size)| FreeSection { addr, size })
-        .collect()
-}
-
-/// Round `value` up to the next multiple of `page` (`page` is a power of two >=
-/// 512, validated at file creation).
-fn align_up(value: u64, page: u64) -> u64 {
-    value.div_ceil(page) * page
-}
-
-/// Split each free section at page boundaries so no section spans a page. The
-/// bounded finalize coalesces a page-tail free section with freed manager blocks
-/// below it, which can produce a run that crosses a page boundary or reaches
-/// `page`; splitting lets each intra-page fragment stay in its SMALL-class manager
-/// while a whole free page is routed to the generic-large manager, matching the
-/// reference library's small-vs-large section classes.
-fn split_at_pages(sections: &[FreeSection], page: u64) -> Vec<FreeSection> {
-    let mut out = Vec::new();
-    for s in sections {
-        let end = s.addr.saturating_add(s.size);
-        let mut start = s.addr;
-        while start < end {
-            let boundary = (start / page + 1) * page;
-            let piece_end = end.min(boundary);
-            out.push(FreeSection {
-                addr: start,
-                size: piece_end - start,
-            });
-            start = piece_end;
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1384,71 +1301,5 @@ mod tests {
             .read_i32()
             .unwrap();
         assert_eq!(got, (0..2500).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn split_at_pages_splits_on_boundaries_preserving_total() {
-        let page = 4096;
-        // A run that crosses one boundary splits into a sub-page head and a whole
-        // free page (the accounting fix routes the >= page piece to slot 6).
-        assert_eq!(
-            split_at_pages(
-                &[FreeSection {
-                    addr: 3740,
-                    size: 4452
-                }],
-                page
-            ),
-            vec![
-                FreeSection {
-                    addr: 3740,
-                    size: 356
-                }, // [3740, 4096)
-                FreeSection {
-                    addr: 4096,
-                    size: 4096
-                }, // [4096, 8192)
-            ]
-        );
-        // A sub-page section is returned unchanged (the common case is a no-op).
-        assert_eq!(
-            split_at_pages(
-                &[FreeSection {
-                    addr: 100,
-                    size: 200
-                }],
-                page
-            ),
-            vec![FreeSection {
-                addr: 100,
-                size: 200
-            }]
-        );
-        // A page-aligned multi-page run splits into whole pages.
-        let whole = split_at_pages(
-            &[FreeSection {
-                addr: 0,
-                size: 3 * 4096,
-            }],
-            page,
-        );
-        assert_eq!(whole.len(), 3);
-        assert!(whole.iter().all(|s| s.size == 4096));
-        // Splitting never loses or overlaps space: pieces are contiguous and sum
-        // to the original size.
-        let pieces = split_at_pages(
-            &[FreeSection {
-                addr: 5000,
-                size: 10000,
-            }],
-            page,
-        );
-        assert_eq!(pieces.iter().map(|s| s.size).sum::<u64>(), 10000);
-        let mut prev = pieces[0].addr;
-        for s in &pieces {
-            assert_eq!(s.addr, prev);
-            prev = s.addr + s.size;
-        }
-        assert_eq!(prev, 15000);
     }
 }

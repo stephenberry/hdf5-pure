@@ -547,6 +547,100 @@ fn c_library_reads_our_bounded_mutated_paged_file() {
 }
 
 #[test]
+fn c_library_reads_our_staged_mutated_paged_file() {
+    let _c = c_lib_guard();
+    // The whole-file editor's counterpart of the bounded crosscheck above (issue
+    // #198): hdf5-pure creates a genuine paged persisting file, then mutates it
+    // through `File::open_rw` + staged edits + `commit`, which allocates both raw
+    // data (a new dataset's values, appended chunks) and metadata (object headers,
+    // the rebuilt chunk index, the rewritten managers). The reference C library
+    // must then recover the paged strategy, read every dataset, load the
+    // per-page-type managers, and reopen the file read-write.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("ours_paged_staged.h5");
+
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("d")
+            .with_i32_data(&(0..64).collect::<Vec<i32>>())
+            .with_shape(&[64])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[64]);
+        b.with_file_space_strategy(FileSpaceStrategy::Page, true, 0)
+            .with_file_space_page_size(4096);
+        b.write(&path).unwrap();
+    }
+    {
+        let file = File::open_rw(&path).unwrap();
+        // A staged append (raw chunks + a rebuilt extensible-array index) and a
+        // fresh contiguous dataset (raw data + a new object header), so the commit
+        // allocates both page types and has to switch between them.
+        let mut ds = file.dataset("d").unwrap();
+        ds.append_staged(|b| {
+            b.append_i32(&(64..2000).collect::<Vec<i32>>());
+        })
+        .unwrap();
+        file.root()
+            .create_dataset("added", |b| {
+                b.with_f64_data(&vec![2.5f64; 512]);
+            })
+            .unwrap();
+        file.commit().unwrap();
+    }
+
+    let want: Vec<i32> = (0..2000).collect();
+    let ours = File::open(&path).unwrap();
+    assert_eq!(ours.dataset("d").unwrap().read_i32().unwrap(), want);
+    assert_eq!(
+        ours.dataset("added").unwrap().read_f64().unwrap(),
+        vec![2.5f64; 512]
+    );
+    let total_ours: u64 = ours.persisted_free_space().iter().map(|(_, l)| l).sum();
+    drop(ours);
+
+    // The C library recovers the paged strategy and reads both datasets.
+    let f = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        f.create_plist().unwrap().get_file_space_strategy().unwrap(),
+        CStrategy::FreeSpaceManager {
+            paged: true,
+            persist: true,
+            threshold: 0,
+        },
+        "C library recovers our paged strategy after a staged commit"
+    );
+    assert_eq!(f.dataset("d").unwrap().read_raw::<i32>().unwrap(), want);
+    assert_eq!(
+        f.dataset("added").unwrap().read_raw::<f64>().unwrap(),
+        vec![2.5f64; 512]
+    );
+    // Loading the managers parses the per-page-type FSHD/FSSE blocks the commit
+    // wrote; the C library's free-space total equals the sum of our sections.
+    let free_c = unsafe { H5Fget_freespace(f.id()) };
+    assert_eq!(
+        free_c as u64, total_ours,
+        "C free-space total matches our rewritten paged managers"
+    );
+    drop(f);
+
+    // The C library reopens the file read-write and appends: the paged layout the
+    // staged commit produced survives a C round-trip.
+    {
+        let f = hdf5::File::open_rw(&path).unwrap();
+        let ds = f.dataset("d").unwrap();
+        ds.resize((2100,)).unwrap();
+        ds.write_slice(&(2000..2100).collect::<Vec<i32>>(), 2000..2100)
+            .unwrap();
+        f.close().unwrap();
+    }
+    let f = hdf5::File::open(&path).unwrap();
+    let after = f.dataset("d").unwrap().read_raw::<i32>().unwrap();
+    assert_eq!(after.len(), 2100);
+    assert_eq!(after[..2000], want[..]);
+    assert_eq!(after[2099], 2099);
+}
+
+#[test]
 fn pure_bounded_mutates_c_created_paged_file() {
     let _c = c_lib_guard();
     // The reverse direction: the reference C library creates a genuine paged
