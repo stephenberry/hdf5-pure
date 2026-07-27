@@ -239,7 +239,7 @@ pub use reader::{
 
 // Renamed in 0.26.0; the aliases keep 0.25.0 call sites compiling for one cycle.
 #[cfg(feature = "std")]
-#[allow(deprecated)] // re-exporting the aliases; users still see the deprecation
+#[expect(deprecated)] // re-exporting the aliases; users still see the deprecation
 pub use reader::{DatasetAccessOptions, FileAccessOptions};
 
 // Curated layout / filter introspection (issue #149). Only the std-only reader
@@ -280,7 +280,7 @@ pub use element::H5Element;
 
 pub use scaleoffset::ScaleOffset;
 
-#[allow(deprecated)] // re-exporting the alias; users still see the deprecation
+#[expect(deprecated)] // re-exporting the alias; users still see the deprecation
 pub use file_create_properties::FileCreateOptions;
 pub use file_create_properties::FileCreateProperties;
 pub use file_space_info::{FileSpaceInfo, FileSpaceStrategy};

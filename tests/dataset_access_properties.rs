@@ -1,4 +1,4 @@
-//! Per-dataset access options (DAPL): the `H5Pset_chunk_cache` analogue, which
+//! Per-dataset access properties (DAPL): the `H5Pset_chunk_cache` analogue, which
 //! overrides the file-wide `H5Pset_cache`-style chunk-cache default for a single
 //! dataset. See issue #48.
 
@@ -65,10 +65,10 @@ fn per_dataset_override_takes_precedence_over_file_default() {
     )
     .unwrap();
 
-    let options = DatasetAccessProperties::new().with_chunk_cache(override_cfg);
-    assert_eq!(options.chunk_cache(), Some(override_cfg));
+    let properties = DatasetAccessProperties::new().with_chunk_cache(override_cfg);
+    assert_eq!(properties.chunk_cache(), Some(override_cfg));
 
-    let ds = file.dataset_with_options("chunked", options).unwrap();
+    let ds = file.dataset_with_options("chunked", properties).unwrap();
     assert_eq!(ds.chunk_cache_config(), override_cfg);
 
     // A sibling handle opened without the override still sees the file default,
@@ -139,7 +139,7 @@ fn streaming_backend_honors_per_dataset_override() {
 }
 
 #[test]
-fn default_options_equal_new() {
+fn default_properties_equal_new() {
     assert_eq!(
         DatasetAccessProperties::default(),
         DatasetAccessProperties::new()

@@ -257,9 +257,17 @@ impl FileAccessProperties {
 /// (`dapl`). Its chunk cache corresponds to `H5Pset_chunk_cache`: it overrides,
 /// for this one dataset, the file-wide chunk-cache default configured with
 /// [`FileAccessProperties::with_chunk_cache`] (the `H5Pset_cache` analogue). When
-/// left unset, the dataset inherits that file-wide default — matching the DAPL
+/// left unset, the dataset inherits that file-wide default — matching the `dapl`
 /// default sentinels (`H5D_CHUNK_CACHE_*_DEFAULT`), which also mean "use the
 /// file's setting".
+///
+/// The `Properties` suffix means the type stands in for one whole HDF5 property
+/// list, so every setting on it has a C counterpart to look up. It is a stand-in
+/// and not a port: a plain `Copy` value, with no handle to create or close, no
+/// runtime property registry, and no setter that can fail. `dapl` and each
+/// `H5Pset_*` it models are doc aliases, so a search for either lands here.
+/// The chunk cache is the one `dapl` property modeled; see the
+/// [property-support reference] for the rest.
 ///
 /// [`ChunkCacheConfig`] maps `H5Pset_chunk_cache`'s `rdcc_nslots` and
 /// `rdcc_nbytes`; its `rdcc_w0` preemption policy is not modeled, because this
@@ -267,6 +275,8 @@ impl FileAccessProperties {
 /// [`ChunkCacheConfig::from_h5p_cache`]).
 ///
 /// Pass it to [`File::dataset_with_options`] or [`Group::dataset_with_options`].
+///
+/// [property-support reference]: https://github.com/stephenberry/hdf5-pure/blob/main/docs/reference/property-support.md
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[doc(alias = "dapl")]
 pub struct DatasetAccessProperties {
@@ -1922,7 +1932,7 @@ impl File {
     /// Resolve a path and return an owned [`Dataset`] handle, applying per-dataset
     /// [`DatasetAccessProperties`] that override file-wide access defaults.
     ///
-    /// This is the dataset-open-with-access-property-list path (HDF5's DAPL):
+    /// This is the dataset-open-with-access-property-list path (HDF5's `dapl`):
     /// the properties' chunk cache corresponds to `H5Pset_chunk_cache` and takes
     /// precedence, for this dataset only, over the `H5Pset_cache`-style
     /// file-wide default.
@@ -2262,7 +2272,7 @@ impl Group {
 
     /// Get a dataset within this group by name, applying per-dataset
     /// [`DatasetAccessProperties`] that override file-wide access defaults (HDF5's
-    /// DAPL; see `H5Pset_chunk_cache`).
+    /// `dapl`; see `H5Pset_chunk_cache`).
     pub fn dataset_with_options(
         &self,
         name: &str,

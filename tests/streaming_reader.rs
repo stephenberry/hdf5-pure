@@ -116,11 +116,11 @@ fn open_streaming_with_access_properties_reads_chunked_data() {
         b.write(&path).unwrap();
     }
 
-    let options = FileAccessProperties::new()
+    let properties = FileAccessProperties::new()
         .with_metadata_cache(MetadataCacheConfig::new(4096).with_max_entry_bytes(512))
         .with_chunk_cache(ChunkCacheConfig::disabled());
-    let file = File::open_streaming_with_options(&path, options).unwrap();
-    assert_eq!(file.access_properties(), options);
+    let file = File::open_streaming_with_options(&path, properties).unwrap();
+    assert_eq!(file.access_properties(), properties);
 
     let dataset = file.dataset("chunked").unwrap();
     assert_eq!(dataset.read_i32().unwrap(), data);

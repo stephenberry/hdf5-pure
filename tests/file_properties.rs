@@ -3,7 +3,7 @@
 
 use hdf5_pure::{
     ChunkCacheConfig, File, FileAccessProperties, FileBuilder, FileCreateProperties, FileLocking,
-    FileSpaceStrategy,
+    FileSpaceStrategy, LibVer, MetadataCacheConfig,
 };
 use tempfile::tempdir;
 
@@ -16,21 +16,21 @@ fn write_chunked(path: &std::path::Path) {
     b.write(path).unwrap();
 }
 
-/// The whole point of #204: one options value configured once, then handed to
+/// The whole point of #204: one properties value configured once, then handed to
 /// both a read path and a read-write path.
 #[test]
-fn one_options_value_serves_read_and_read_write_opens() {
+fn one_properties_value_serves_read_and_read_write_opens() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("shared.h5");
     write_chunked(&path);
 
-    let options = FileAccessProperties::new()
+    let properties = FileAccessProperties::new()
         .with_chunk_cache(ChunkCacheConfig::new().with_max_bytes(1 << 20))
         .with_locking(FileLocking::Disabled);
 
     // Read path.
     {
-        let file = File::open_with_options(&path, options).unwrap();
+        let file = File::open_with_options(&path, properties).unwrap();
         assert_eq!(
             file.dataset("data").unwrap().read_f64().unwrap().len(),
             4096
@@ -38,7 +38,7 @@ fn one_options_value_serves_read_and_read_write_opens() {
     }
     // Read-write path — the same value, which had no spelling before #204.
     {
-        let file = File::open_rw_with_options(&path, options).unwrap();
+        let file = File::open_rw_with_options(&path, properties).unwrap();
         assert_eq!(
             file.dataset("data").unwrap().read_f64().unwrap().len(),
             4096
@@ -46,7 +46,7 @@ fn one_options_value_serves_read_and_read_write_opens() {
     }
     // Bounded read-write path.
     {
-        let file = File::open_rw_bounded_with_options(&path, options).unwrap();
+        let file = File::open_rw_bounded_with_options(&path, properties).unwrap();
         assert_eq!(
             file.dataset("data").unwrap().read_f64().unwrap().len(),
             4096
@@ -54,7 +54,7 @@ fn one_options_value_serves_read_and_read_write_opens() {
     }
 }
 
-/// The mirror backend previously discarded access options entirely
+/// The mirror backend previously discarded access properties entirely
 /// (`from_rw_session` hardcoded the defaults), so a chunk cache configured for
 /// `open_rw` did nothing. It now applies.
 #[test]
@@ -90,7 +90,7 @@ fn open_rw_honors_the_configured_chunk_cache() {
 }
 
 /// The bounded backend hardcoded `FileLocking::Enabled`, so it could not be used
-/// where OS locking is unavailable. The policy now comes from the options.
+/// where OS locking is unavailable. The policy now comes from the properties.
 #[test]
 fn open_rw_bounded_honors_the_locking_policy() {
     let dir = tempdir().unwrap();
@@ -121,15 +121,15 @@ fn open_rw_bounded_still_locks_by_default() {
 /// #205: the same creation properties, applied as a value or one at a time, must
 /// produce the identical file.
 #[test]
-fn create_options_match_the_individual_setters() {
-    let options = FileCreateProperties::new()
+fn create_properties_match_the_individual_setters() {
+    let properties = FileCreateProperties::new()
         .with_userblock(512)
         .with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 8)
         .with_file_space_page_size(4096);
 
     let from_value = {
         let mut b = FileBuilder::new();
-        b.with_create_properties(options);
+        b.with_create_properties(properties);
         b.create_dataset("d").with_f64_data(&[1.0, 2.0]);
         b.finish().unwrap()
     };
@@ -150,7 +150,7 @@ fn create_options_match_the_individual_setters() {
 /// A layout defined once in a helper and reused, which is the composition #205
 /// exists to enable.
 #[test]
-fn create_options_are_reusable_across_files() {
+fn create_properties_are_reusable_across_files() {
     fn shared_layout() -> FileCreateProperties {
         FileCreateProperties::new().with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 4)
     }
@@ -212,26 +212,26 @@ fn create_with_default_options_matches_create() {
     assert_eq!(
         std::fs::read(&a).unwrap(),
         std::fs::read(&b).unwrap(),
-        "default options must reproduce the plain `create` file"
+        "default properties must reproduce the plain `create` file"
     );
 }
 
 /// An invalid creation property is reported when the file is written, not when
-/// the options value is built — the value is inert data.
+/// the properties value is built — the value is inert data.
 #[test]
 fn invalid_creation_property_is_reported_at_write_time() {
     // A page size must be a power of two >= 512.
-    let options = FileCreateProperties::new()
+    let properties = FileCreateProperties::new()
         .with_file_space_strategy(FileSpaceStrategy::Page, true, 1)
         .with_file_space_page_size(700);
     assert_eq!(
-        options.file_space_page_size(),
+        properties.file_space_page_size(),
         Some(700),
         "the value records what it was given, without validating it"
     );
 
     let mut b = FileBuilder::new();
-    b.with_create_properties(options);
+    b.with_create_properties(properties);
     b.create_dataset("d").with_f64_data(&[1.0]);
     assert!(
         b.finish().is_err(),
@@ -265,15 +265,26 @@ fn deprecated_aliases_resolve_to_the_renamed_types() {
 
     // Same type, not merely a convertible one: assignment across the two
     // spellings only compiles if the alias is that exact type.
-    let access: FileAccessProperties = FileAccessOptions::new().with_locking(FileLocking::Disabled);
+    //
+    // Every field is set to a non-default value, so a shim that forwards only
+    // *some* of them is caught. Probing one field per type would let a
+    // three-quarters-gutted shim pass.
+    let access: FileAccessProperties = FileAccessOptions::new()
+        .with_locking(FileLocking::Disabled)
+        .with_chunk_cache(ChunkCacheConfig::disabled())
+        .with_metadata_cache(MetadataCacheConfig::new(64 * 1024));
     assert_eq!(access.locking(), FileLocking::Disabled);
 
-    let create: FileCreateProperties = FileCreateOptions::new().with_userblock(512);
+    let create: FileCreateProperties = FileCreateOptions::new()
+        .with_userblock(512)
+        .with_libver_bounds(LibVer::V110, LibVer::LATEST)
+        .with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 8)
+        .with_file_space_page_size(4096);
     assert_eq!(create.userblock(), 512);
 
     let dapl: hdf5_pure::DatasetAccessProperties =
-        DatasetAccessOptions::new().with_chunk_cache(ChunkCacheConfig::new());
-    assert!(dapl.chunk_cache().is_some());
+        DatasetAccessOptions::new().with_chunk_cache(ChunkCacheConfig::disabled());
+    assert_eq!(dapl.chunk_cache(), Some(ChunkCacheConfig::disabled()));
 
     // Both deprecated method shims forward to the renamed method rather than
     // merely existing: compare what each spelling actually produces.
@@ -283,11 +294,13 @@ fn deprecated_aliases_resolve_to_the_renamed_types() {
         b.create_dataset("data").with_f64_data(&[1.0, 2.0]);
         b.finish().unwrap()
     };
+    // Chained, not called as a statement: the shim must keep returning
+    // `&mut Self` or a 0.25.0 call site that chained off it stops compiling.
     let via_shim = build(&|b| {
-        b.with_create_options(create);
+        b.with_create_options(create).with_userblock(1024);
     });
     let via_renamed = build(&|b| {
-        b.with_create_properties(create);
+        b.with_create_properties(create).with_userblock(1024);
     });
     assert_eq!(
         via_shim, via_renamed,
@@ -303,4 +316,6 @@ fn deprecated_aliases_resolve_to_the_renamed_types() {
         file.access_properties(),
         "access_options must forward to access_properties"
     );
+    // …and the forwarded value is the one that was passed in, whole.
+    assert_eq!(file.access_options(), access);
 }
