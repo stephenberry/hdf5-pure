@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-07-27
+
+Attributes lose their size ceiling: one too large for an object-header message selects fractal-heap storage on its own, and one too large even for a managed heap object becomes a *huge* object, so `FormatError::DenseAttributeTooLarge` is gone rather than refusing a shape the reference library writes ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)). Three defects on that path are fixed with it: a variable-length attribute stored in a fractal heap silently lost its values, dense attributes were unreadable in a file with a userblock, and reading many of them was quadratic in their number ([#214](https://github.com/stephenberry/hdf5-pure/pull/214), [#195](https://github.com/stephenberry/hdf5-pure/issues/195)). The property-list types are renamed to say what they stand in for — `FileAccessProperties`, `FileCreateProperties`, `DatasetAccessProperties` — and checking each one's settings against the official group pages caught two properties documented under the wrong class ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)). Breaking, but every break is a one-line call-site edit, and deprecated aliases keep 0.25.0 code compiling for this cycle.
+
 ### Added
 
 - An attribute of any size is written rather than refused: one too large for an object-header message selects fractal-heap storage on its own, and one too large for a managed heap object becomes a *huge* object. A name, datatype, or dataspace longer than the 2-byte field describing it is still refused, as the new `FormatError::AttributeFieldTooLong` ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
@@ -439,7 +443,8 @@ Internal robustness and tests ([#26](https://github.com/stephenberry/hdf5-pure/i
 - The MAT deserializer flattens 1×N and N×1 values to a 1-D sequence in `deserialize_any` (matching `deserialize_seq`).
 - Numeric/complex readers preserve 1×N / N×1 shape at the value layer; any flattening happens at the serde level.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.25.0...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.26.0...HEAD
+[0.26.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.23.2...v0.24.0
 [0.23.2]: https://github.com/stephenberry/hdf5-pure/compare/v0.23.1...v0.23.2
