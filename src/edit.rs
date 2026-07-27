@@ -7537,6 +7537,11 @@ mod tests {
         s.commit()
             .expect("the session is usable after a failed commit");
 
+        // Release the session's exclusive OS lock before reading the file back.
+        // Those locks are mandatory on Windows, so a `File::open` overlapping the
+        // session fails outright there (advisory locks elsewhere would allow it).
+        drop(s);
+
         let f = crate::reader::File::open(&path).unwrap();
         let kept = f.dataset("keep").unwrap().read_i32().unwrap();
         assert_eq!(kept, (0..200).collect::<Vec<i32>>(), "keep survives intact");
