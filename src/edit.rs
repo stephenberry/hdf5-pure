@@ -162,7 +162,9 @@ use std::path::Path;
 
 use crate::checksum::jenkins_lookup3;
 use crate::chunk_index_inplace::{Located, Store, apply_ea_append, plan_ea_append};
-use crate::chunked_read::{chunk_index_spans_buffered, enumerate_chunks_buffered, plan_dense_grid};
+use crate::chunked_read::{
+    chunk_index_spans_from_source, enumerate_chunks_from_source, plan_dense_grid,
+};
 use crate::chunked_write::{
     ChunkMeta, ChunkOptions, ChunkProvider, WrittenChunk, build_chunked_data_at_ext,
     build_extensible_array_at, emit_chunked_data_verbatim, plan_chunked_data_verbatim,
@@ -188,11 +190,12 @@ use crate::free_space_manager::{
     self, FreeSection, FsmHeader, PageType, SECT_CLASS_SIMPLE, align_up, free_sections, fshd_len,
     plan_paged_managers, serialize_file_fsm,
 };
-use crate::group_v2::resolve_group_entries;
+use crate::group_v2::resolve_group_entries_from_source;
 use crate::link_message::{LinkMessage, LinkTarget};
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
 use crate::signature;
+use crate::source::{BaseOffsetSource, BytesSource, Source};
 use crate::superblock::Superblock;
 use crate::type_builders::{
     AttrValue, DatasetBuilder, ObjectRefPatch, ObjectRefTarget, VlStringStaging,
@@ -224,6 +227,14 @@ const MAX_LINK_GRAPH_NODES: u32 = 1 << 24;
 /// spans continuation blocks, guarding against a cyclic continuation chain.
 /// Matches the reader's continuation-depth cap.
 const MAX_OH_CHUNKS: usize = 256;
+
+/// Maximum length of a version 2 object header's fixed prefix: signature (4) +
+/// version (1) + flags (1) + optional access/modification/change/birth times
+/// (16) + optional attribute phase-change thresholds (4) + the chunk-0 size
+/// field (up to 8). Reading this many bytes always covers the prefix, so
+/// [`oh_region_at`] can be handed one bounded window instead of a whole-file
+/// image.
+const OH_PREFIX_MAX: usize = 34;
 
 /// A path identified by its components (no leading/trailing empties); the root
 /// group is the empty vector.
@@ -351,6 +362,13 @@ append_typed! {
 pub(crate) struct WriteEngine {
     handle: fs::File,
     /// In-memory mirror of the file, kept byte-for-byte in sync with `handle`.
+    ///
+    /// Every *read* the engine performs against the file image goes through
+    /// [`image`](Self::image), which lends this out as a [`Source`] — no parser
+    /// is handed the whole-file slice any more (issue #198). What still reaches
+    /// in directly is the write side: the end-of-file cursor, `append`,
+    /// `write_at`, and `truncate`, plus [`mirror_bytes`](Self::mirror_bytes) for
+    /// the owned read-write [`File`](crate::File)'s reads.
     data: Vec<u8>,
     /// Absolute offset of the superblock signature in the file.
     sb_sig_off: usize,
@@ -835,7 +853,8 @@ impl WriteEngine {
                     continue;
                 }
                 let Ok(sections) =
-                    free_space_manager::read_persisted_sections(&self.data, &[m], 0, os)
+                    free_space_manager::read_persisted_sections_source(&self.image(), &[m], 0, os)
+                        .map(|(sections, _)| sections)
                 else {
                     continue;
                 };
@@ -877,8 +896,13 @@ impl WriteEngine {
                     }
                 }
             }
-        } else if let Ok(mut sections) =
-            free_space_manager::read_persisted_sections(&self.data, &info.manager_addrs, 0, os)
+        } else if let Ok(mut sections) = free_space_manager::read_persisted_sections_source(
+            &self.image(),
+            &info.manager_addrs,
+            0,
+            os,
+        )
+        .map(|(sections, _)| sections)
         {
             sections.sort_by_key(|s| s.addr);
             let mut prev_end = 0u64;
@@ -905,13 +929,13 @@ impl WriteEngine {
             if m == UNDEF {
                 continue;
             }
-            let Ok(m_us) = usize::try_from(m) else {
+            let Ok(hdr_len) = fshd_len(os).to_usize() else {
                 continue;
             };
-            let Some(slice) = self.data.get(m_us..) else {
+            let Ok(fshd) = self.image().read_metadata_at(m, hdr_len) else {
                 continue;
             };
-            if let Ok(h) = FsmHeader::parse(slice, os) {
+            if let Ok(h) = FsmHeader::parse(&fshd, os) {
                 // `FsmHeader::parse` succeeding guarantees the header's own bytes
                 // are present, so the FSHD extent is in-bounds; validate the
                 // section-info extent before recording it, so a malformed
@@ -920,7 +944,7 @@ impl WriteEngine {
                 if h.fsse_addr != UNDEF
                     && h.fsse_addr
                         .checked_add(h.fsse_used)
-                        .is_some_and(|end| end <= self.data.len() as u64)
+                        .is_some_and(|end| end <= file_len)
                 {
                     old_blocks.push((h.fsse_addr, h.fsse_used));
                 }
@@ -941,7 +965,8 @@ impl WriteEngine {
         let os = self.superblock.offset_size;
         let ls = self.superblock.length_size;
         let base = self.superblock.base_address;
-        let oh = ObjectHeader::parse_with_base(&self.data, ext_addr, os, ls, base).ok()?;
+        let oh =
+            ObjectHeader::parse_from_source(&self.image(), ext_addr as u64, os, ls, base).ok()?;
         let msg = oh
             .messages
             .iter()
@@ -1156,6 +1181,16 @@ impl WriteEngine {
         &self.data
     }
 
+    /// A random-access [`Source`] view of this session's file image, for the
+    /// parsers the edit engine drives.
+    ///
+    /// Every read the engine performs against the file goes through this, so the
+    /// image can become something other than a whole-file mirror without touching
+    /// the parsers themselves (issue #198).
+    fn image(&self) -> BytesSource<&[u8]> {
+        BytesSource::new(&self.data[..])
+    }
+
     /// A snapshot of this session's live space usage — the current file size and
     /// the free space it can reuse — as a [`SpaceAccounting`].
     ///
@@ -1275,10 +1310,11 @@ impl WriteEngine {
         // Resolve the dataset's object-header address — the geometry cache key.
         // base == 0 here, so the resolved address is absolute; two hard links to
         // one dataset share the one entry.
-        let oh_addr = crate::group_v2::resolve_path_any(&self.data, &self.superblock, dataset)
-            .map_err(|_| {
-                Error::AppendInPlaceUnsupported("nothing to append to at the given path")
-            })?;
+        let oh_addr =
+            crate::group_v2::resolve_path_any_from_source(&self.image(), &self.superblock, dataset)
+                .map_err(|_| {
+                    Error::AppendInPlaceUnsupported("nothing to append to at the given path")
+                })?;
 
         // Locate the dataset on the first append (cache miss) against the session's
         // own borrowed mirror — no second lock, no second mirror, no re-read.
@@ -1597,12 +1633,10 @@ impl WriteEngine {
 
         let src_addr = crate::group_v2::resolve_path_any(src_data, src_sb, &src.join("/"))
             .map_err(|_| Error::EditUnsupported("copy source does not exist in the source file"))?;
-        let src_addr = usize::try_from(src_addr)
-            .map_err(|_| Error::EditUnsupported("source address exceeds this platform"))?;
         // Read (and foreign-address-screen) the whole subtree now, while `source`
         // is borrowed; the owned tree carries every byte the commit will write. The
         // source is gated to base 0 above, so its stored addresses are absolute.
-        let tree = Self::read_copy_subtree(src_data, src_addr, 0, true, 0)?;
+        let tree = Self::read_copy_subtree(&BytesSource::new(src_data), src_addr, 0, true, 0)?;
         self.pending_cross_copies.push((dst, tree));
         Ok(())
     }
@@ -1702,14 +1736,16 @@ impl WriteEngine {
                 ));
             }
             let path_str = full.join("/");
-            let addr = crate::group_v2::resolve_path_any(&self.data, &self.superblock, &path_str)
-                .map_err(|_| {
-                Error::EditUnsupported("nothing to overwrite at the given path")
-            })?;
+            let addr = crate::group_v2::resolve_path_any_from_source(
+                &self.image(),
+                &self.superblock,
+                &path_str,
+            )
+            .map_err(|_| Error::EditUnsupported("nothing to overwrite at the given path"))?;
             let addr = usize::try_from(addr)
                 .map_err(|_| Error::EditUnsupported("dataset address exceeds this platform"))?;
             let fd = flatten_dataset(db)?;
-            match Self::prepare_write(&self.data, addr, &fd, base)? {
+            match Self::prepare_write(&self.image(), addr as u64, &fd, base)? {
                 WritePlan::InPlace { data_addr, raw } => inplace_writes.push((data_addr, raw)),
                 WritePlan::InPlaceChunks { writes } => inplace_writes.extend(writes),
                 WritePlan::Moving(mw) => {
@@ -1768,13 +1804,15 @@ impl WriteEngine {
                 ));
             }
             let path_str = full.join("/");
-            let addr = crate::group_v2::resolve_path_any(&self.data, &self.superblock, &path_str)
-                .map_err(|_| {
-                Error::AppendUnsupported("nothing to append to at the given path")
-            })?;
+            let addr = crate::group_v2::resolve_path_any_from_source(
+                &self.image(),
+                &self.superblock,
+                &path_str,
+            )
+            .map_err(|_| Error::AppendUnsupported("nothing to append to at the given path"))?;
             let addr = usize::try_from(addr)
                 .map_err(|_| Error::AppendUnsupported("dataset address exceeds this platform"))?;
-            let mw = Self::prepare_append(&self.data, addr, &ab, base)?;
+            let mw = Self::prepare_append(&self.image(), addr as u64, &ab, base)?;
             // A relocating append moves the dataset's object header and patches only
             // the one parent link that names it, so it is safe only when this is the
             // dataset's sole hard link (same rule as a relocating overwrite).
@@ -1831,13 +1869,14 @@ impl WriteEngine {
                     ));
                 }
                 let path_str = full.join("/");
-                let addr =
-                    crate::group_v2::resolve_path_any(&self.data, &self.superblock, &path_str)
-                        .map_err(|_| {
-                            Error::EditUnsupported(
-                                "nothing to set an attribute on at the given path",
-                            )
-                        })?;
+                let addr = crate::group_v2::resolve_path_any_from_source(
+                    &self.image(),
+                    &self.superblock,
+                    &path_str,
+                )
+                .map_err(|_| {
+                    Error::EditUnsupported("nothing to set an attribute on at the given path")
+                })?;
                 let addr = usize::try_from(addr)
                     .map_err(|_| Error::EditUnsupported("dataset address exceeds this platform"))?;
                 // An attribute edit relocates the dataset's object header and patches
@@ -1855,7 +1894,7 @@ impl WriteEngine {
                         ));
                     }
                 }
-                let region = Self::gather_oh_messages(&self.data, addr, base)?;
+                let region = Self::gather_oh_messages(&self.image(), addr as u64, base)?;
                 let (region, pending_vl_attrs) = apply_group_attr_ops(&region, &ops)?;
                 let leaf = full.last().unwrap().clone();
                 let parent = full[..full.len() - 1].to_vec();
@@ -1959,16 +1998,19 @@ impl WriteEngine {
                 ));
             }
             let src_str = src.join("/");
-            let src_addr =
-                crate::group_v2::resolve_path_any(&self.data, &self.superblock, &src_str)
-                    .map_err(|_| Error::EditUnsupported("copy source does not exist"))?;
+            let src_addr = crate::group_v2::resolve_path_any_from_source(
+                &self.image(),
+                &self.superblock,
+                &src_str,
+            )
+            .map_err(|_| Error::EditUnsupported("copy source does not exist"))?;
             let src_addr = usize::try_from(src_addr)
                 .map_err(|_| Error::EditUnsupported("source address exceeds this platform"))?;
             // Read the source subtree from this file's own mirror (`cross_file`
             // false: same address space, so verbatim addresses stay valid). On a
             // userblock file the stored addresses are base-relative, so pass this
             // session's base for the read to absolutize them.
-            let tree = Self::read_copy_subtree(&self.data, src_addr, 0, false, base)?;
+            let tree = Self::read_copy_subtree(&self.image(), src_addr as u64, 0, false, base)?;
             add_targets.push(dst.clone());
             let leaf = dst.last().unwrap().clone();
             let parent = dst[..dst.len() - 1].to_vec();
@@ -2002,9 +2044,12 @@ impl WriteEngine {
                 return Err(Error::EditUnsupported("cannot delete the root group"));
             }
             let path_str = d.join("/");
-            let del_addr =
-                crate::group_v2::resolve_path_any(&self.data, &self.superblock, &path_str)
-                    .map_err(|_| Error::EditUnsupported("nothing to delete at the given path"))?;
+            let del_addr = crate::group_v2::resolve_path_any_from_source(
+                &self.image(),
+                &self.superblock,
+                &path_str,
+            )
+            .map_err(|_| Error::EditUnsupported("nothing to delete at the given path"))?;
             if let Ok(a) = usize::try_from(del_addr) {
                 deleted_addrs.push(a);
             }
@@ -2057,13 +2102,16 @@ impl WriteEngine {
                 nodes.get_mut(key).unwrap().base_region = fresh_group_region();
             } else {
                 let path_str = key.join("/");
-                let addr =
-                    crate::group_v2::resolve_path_any(&self.data, &self.superblock, &path_str)
-                        .map_err(|_| {
-                            Error::EditUnsupported(
-                                "a target group does not exist; create it first in this session",
-                            )
-                        })?;
+                let addr = crate::group_v2::resolve_path_any_from_source(
+                    &self.image(),
+                    &self.superblock,
+                    &path_str,
+                )
+                .map_err(|_| {
+                    Error::EditUnsupported(
+                        "a target group does not exist; create it first in this session",
+                    )
+                })?;
                 let addr = usize::try_from(addr)
                     .map_err(|_| Error::EditUnsupported("group address exceeds this platform"))?;
                 let info = self.inspect_group(addr)?;
@@ -2149,7 +2197,7 @@ impl WriteEngine {
             &add_targets,
             &write_targets,
             &delete_targets,
-            &self.data,
+            &self.image(),
             &self.superblock,
         )?;
 
@@ -2251,9 +2299,11 @@ impl WriteEngine {
                 let mut full = key.clone();
                 full.push(leaf.clone());
                 let path_str = full.join("/");
-                if let Ok(addr) =
-                    crate::group_v2::resolve_path_any(&self.data, &self.superblock, &path_str)
-                {
+                if let Ok(addr) = crate::group_v2::resolve_path_any_from_source(
+                    &self.image(),
+                    &self.superblock,
+                    &path_str,
+                ) {
                     if let Ok(a) = usize::try_from(addr) {
                         if let Ok(spans) = self.oh_chunk_spans(a) {
                             to_free.extend(spans.into_iter().map(|(a, l)| (a, l, PageType::Meta)));
@@ -2346,7 +2396,7 @@ impl WriteEngine {
                             &add_targets,
                             &write_targets,
                             &delete_targets,
-                            &self.data,
+                            &self.image(),
                             &self.superblock,
                         )?;
                         write_reference_address(&mut fd.raw, patch.byte_offset, addr);
@@ -2932,7 +2982,8 @@ impl WriteEngine {
         ext_addr: usize,
         info: &FileSpaceInfo,
     ) -> Result<Vec<u8>, Error> {
-        let region = Self::gather_oh_messages(&self.data, ext_addr, self.superblock.base_address)?;
+        let region =
+            Self::gather_oh_messages(&self.image(), ext_addr as u64, self.superblock.base_address)?;
         rewrite_extension_region_bytes(&region, info)
     }
 
@@ -2961,103 +3012,28 @@ impl WriteEngine {
         Ok(())
     }
 
-    /// Parse and validate the prefix of a single-chunk version 2 object header at
-    /// `addr`, returning the `[start, end)` byte range of its message region.
-    /// Rejects headers that are not OHDR v2 or that track message creation order
-    /// (whose 6-byte message records this engine does not emit).
-    pub(crate) fn oh_region(d: &[u8], addr: usize) -> Result<(usize, usize), Error> {
-        if d.len() < addr + 6 || &d[addr..addr + 4] != b"OHDR" || d[addr + 4] != 2 {
-            return Err(Error::EditUnsupported(
-                "an object does not use a version 2 object header",
-            ));
-        }
-        let flags = d[addr + 5];
-        if flags & 0x04 != 0 {
-            return Err(Error::EditUnsupported(
-                "an object tracks message creation order (not supported in place yet)",
-            ));
-        }
-        let mut pos = addr + 6;
-        if flags & 0x20 != 0 {
-            pos += 16; // optional timestamps
-        }
-        if flags & 0x10 != 0 {
-            pos += 4; // optional attribute phase-change thresholds
-        }
-        let size_width = match flags & 0x03 {
-            0 => 1usize,
-            1 => 2,
-            2 => 4,
-            _ => 8,
-        };
-        if d.len() < pos + size_width {
-            return Err(Error::EditUnsupported("truncated object header"));
-        }
-        let chunk0_size = read_le(&d[pos..pos + size_width]);
-        pos += size_width;
-        let region_start = pos;
-        let region_end = region_start
-            .checked_add(chunk0_size)
-            .filter(|&e| e + 4 <= d.len())
-            .ok_or(Error::EditUnsupported("truncated object header"))?;
-        Ok((region_start, region_end))
-    }
-
     /// Collect every message of the object header at `addr` into one contiguous
     /// region, following continuation blocks across chunks and dropping the
     /// `Continuation` messages themselves. Re-emitting the result through
     /// [`build_v2_object_header`] collapses a multi-chunk header (as the
     /// reference C library often writes) into a single chunk, which is how this
     /// editor rebuilds headers. The chunk-0 prefix is validated by
-    /// [`oh_region`]; each continuation block must be a well-formed `OCHK` block
-    /// within the file.
-    fn gather_oh_messages(d: &[u8], addr: usize, base: u64) -> Result<Vec<u8>, Error> {
-        let (rs, re) = Self::oh_region(d, addr)?;
+    /// [`oh_region_at`]; each continuation block must be a well-formed `OCHK`
+    /// block within the file.
+    ///
+    /// Reads each header chunk out of `src` as one bounded buffer rather than
+    /// indexing a whole-file image, so this serves a session whose file is not
+    /// mirrored in memory (issue #198).
+    fn gather_oh_messages<S: Source + ?Sized>(
+        src: &S,
+        addr: u64,
+        base: u64,
+    ) -> Result<Vec<u8>, Error> {
         let mut out = Vec::new();
-        // Worklist of (message-region start, end) per chunk, chunk 0 first.
-        let mut chunks: Vec<(usize, usize)> = vec![(rs, re)];
-        let mut i = 0;
-        while i < chunks.len() {
-            if chunks.len() > MAX_OH_CHUNKS {
-                return Err(Error::EditUnsupported(
-                    "object header has too many continuation chunks",
-                ));
-            }
-            let (cs, ce) = chunks[i];
-            i += 1;
-            let region = &d[..ce];
-            let mut p = cs;
-            while let Some((msg_type, body, body_end)) = next_message(region, p)? {
-                if msg_type == MessageType::ObjectHeaderContinuation {
-                    // Body: block offset (offset_size) + block length (length_size).
-                    if body_end - body < (OFFSET_SIZE + LENGTH_SIZE) as usize {
-                        return Err(Error::EditUnsupported("malformed continuation message"));
-                    }
-                    let off = u64::from_le_bytes(d[body..body + 8].try_into().unwrap());
-                    let len = u64::from_le_bytes(d[body + 8..body + 16].try_into().unwrap());
-                    // The continuation block address is stored relative to the base
-                    // address; convert to an absolute file offset to index `d`.
-                    let off = off
-                        .checked_add(base)
-                        .ok_or(Error::EditUnsupported("continuation address overflow"))?;
-                    let off = usize::try_from(off).map_err(|_| {
-                        Error::EditUnsupported("continuation address exceeds this platform")
-                    })?;
-                    let len = usize::try_from(len).map_err(|_| {
-                        Error::EditUnsupported("continuation length exceeds this platform")
-                    })?;
-                    // An OCHK block is signature(4) + messages + checksum(4).
-                    let blk_end = off
-                        .checked_add(len)
-                        .filter(|&e| e <= d.len() && len >= 8)
-                        .ok_or(Error::EditUnsupported("continuation block out of bounds"))?;
-                    if &d[off..off + 4] != b"OCHK" {
-                        return Err(Error::EditUnsupported(
-                            "invalid continuation block signature",
-                        ));
-                    }
-                    chunks.push((off + 4, blk_end - 4));
-                } else {
+        for chunk in read_oh_chunks(src, addr, base)? {
+            let (region, mut p) = chunk.message_region();
+            while let Some((msg_type, _body, body_end)) = next_message(region, p)? {
+                if msg_type != MessageType::ObjectHeaderContinuation {
                     out.extend_from_slice(&region[p..body_end]);
                 }
                 p = body_end;
@@ -3077,7 +3053,7 @@ impl WriteEngine {
         let os = self.superblock.offset_size;
         let ls = self.superblock.length_size;
         let base = self.superblock.base_address;
-        let oh = ObjectHeader::parse_with_base(&self.data, addr, os, ls, base)?;
+        let oh = ObjectHeader::parse_from_source(&self.image(), addr as u64, os, ls, base)?;
         if oh
             .messages
             .iter()
@@ -3087,7 +3063,7 @@ impl WriteEngine {
                 "a target path names a dataset, not a group",
             ));
         }
-        let entries = resolve_group_entries(&self.data, &oh, os, ls, base)?;
+        let entries = resolve_group_entries_from_source(&self.image(), &oh, os, ls, base)?;
 
         let mut region = fresh_group_region();
         let mut link_names = Vec::with_capacity(entries.len());
@@ -3136,10 +3112,12 @@ impl WriteEngine {
     /// (collapsing continuation chunks, preserving every message); a version 1
     /// symbol-table group is converted to v2 via [`reconstruct_v1_group`].
     fn inspect_group(&self, addr: usize) -> Result<GroupInfo, Error> {
-        if self.data.len() < addr + 4 || self.data[addr..addr + 4] != *b"OHDR" {
+        let sig = self.image().read_metadata_at(addr as u64, 4);
+        if sig.as_deref() != Ok(&b"OHDR"[..]) {
             return self.reconstruct_v1_group(addr);
         }
-        let mut region = Self::gather_oh_messages(&self.data, addr, self.superblock.base_address)?;
+        let mut region =
+            Self::gather_oh_messages(&self.image(), addr as u64, self.superblock.base_address)?;
         let mut p = 0;
         let mut has_link_info = false;
         let mut link_names = Vec::new();
@@ -3204,9 +3182,9 @@ impl WriteEngine {
     /// this engine cannot enumerate — a version-2 B-tree — is refused too). A
     /// datatype or shape that differs from the on-disk dataset's is likewise
     /// refused — this is a value overwrite, not a reshape or retype.
-    fn prepare_write(
-        d: &[u8],
-        addr: usize,
+    fn prepare_write<S: Source + ?Sized>(
+        src: &S,
+        addr: u64,
         fd: &FlatDataset,
         base: u64,
     ) -> Result<WritePlan, Error> {
@@ -3260,7 +3238,7 @@ impl WriteEngine {
             ));
         }
 
-        let region = Self::gather_oh_messages(d, addr, base)?;
+        let region = Self::gather_oh_messages(src, addr, base)?;
 
         // Locate the datatype, dataspace, and data-layout messages, and detect a
         // filter pipeline (filtered storage is always chunked, never contiguous).
@@ -3362,7 +3340,7 @@ impl WriteEngine {
                     {
                         if start
                             .checked_add(fd.raw.len())
-                            .is_some_and(|e| e <= d.len())
+                            .is_some_and(|e| e as u64 <= src.len())
                         {
                             return Ok(WritePlan::InPlace {
                                 data_addr: start,
@@ -3467,7 +3445,7 @@ impl WriteEngine {
                     Error::EditUnsupported("userblock base address exceeds this platform")
                 })?;
                 if let Some(writes) = try_inplace_chunk_writes(
-                    &d[base_off..],
+                    &BaseOffsetSource { inner: src, base },
                     &dl,
                     &disk_ds,
                     &spatial,
@@ -3501,7 +3479,7 @@ impl WriteEngine {
                     pipeline_message,
                     meta,
                     chunk_bytes: new_chunk_bytes,
-                    old_addr: addr as u64,
+                    old_addr: addr,
                 }))
             }
             _ => Err(Error::EditUnsupported(
@@ -3519,12 +3497,12 @@ impl WriteEngine {
     /// chunks and a rebuilt index and repoints the header (see
     /// [`write_appended_chunks`](Self::write_appended_chunks)).
     ///
-    /// Reads only `d` (the file mirror); no bytes are written here. `d` is the
-    /// whole file image and `base` its userblock base; the dataset's stored
-    /// (base-relative) structures are read through a `base`-shifted view.
-    fn prepare_append(
-        d: &[u8],
-        addr: usize,
+    /// Reads only; no bytes are written here. `src` is the file image and `base`
+    /// its userblock base; the dataset's stored (base-relative) structures are read
+    /// through a `base`-shifted view.
+    fn prepare_append<S: Source + ?Sized>(
+        src: &S,
+        addr: u64,
         ab: &AppendBuilder,
         base: u64,
     ) -> Result<MovingWrite, Error> {
@@ -3535,7 +3513,7 @@ impl WriteEngine {
             ));
         }
 
-        let region = Self::gather_oh_messages(d, addr, base)?;
+        let region = Self::gather_oh_messages(src, addr, base)?;
 
         // Locate the datatype, dataspace, data-layout, and filter-pipeline
         // messages, and detect a group (link) header.
@@ -3687,21 +3665,20 @@ impl WriteEngine {
             None => None,
         };
 
-        let base_off = usize::try_from(base).map_err(|_| {
-            Error::AppendUnsupported("userblock base address exceeds this platform")
-        })?;
-        let view = d.get(base_off..).ok_or(Error::AppendUnsupported(
-            "userblock base address past end-of-file",
-        ))?;
+        if base > src.len() {
+            return Err(Error::AppendUnsupported(
+                "userblock base address past end-of-file",
+            ));
+        }
+        let view = BaseOffsetSource { inner: src, base };
 
         // The rebuilt index's element format (bare address vs address+size+mask) is
         // chosen by `has_filters`; it must agree with the source index's client id,
         // or the kept chunks — carried by metadata into the new index — would be
         // re-encoded in the wrong element width.
         if let Some(idx_addr) = *btree_address {
-            let src = crate::source::BytesSource::new(view);
             let hdr =
-                ExtensibleArrayHeader::parse_from_source(&src, idx_addr, OFFSET_SIZE, LENGTH_SIZE)
+                ExtensibleArrayHeader::parse_from_source(&view, idx_addr, OFFSET_SIZE, LENGTH_SIZE)
                     .map_err(|_| {
                         Error::AppendUnsupported(
                             "dataset extensible-array header could not be parsed",
@@ -3718,7 +3695,7 @@ impl WriteEngine {
         // Enumerate the existing chunks (base-relative addresses) and require a
         // dense grid: `plan_dense_grid` returns the chunks in index order and
         // `None` on any hole, duplicate, or count mismatch against the dimension.
-        let infos = enumerate_chunks_buffered(view, &dl, &disk_ds, OFFSET_SIZE, LENGTH_SIZE)
+        let infos = enumerate_chunks_from_source(&view, &dl, &disk_ds, OFFSET_SIZE, LENGTH_SIZE)
             .map_err(|_| Error::AppendUnsupported("dataset chunk index could not be enumerated"))?;
         let grid = plan_dense_grid(infos, &disk_ds.dimensions, &spatial).ok_or(
             Error::AppendUnsupported(
@@ -3753,18 +3730,22 @@ impl WriteEngine {
         let mut old_tail_extent: Option<(u64, u64)> = None;
         if has_partial {
             let partial = &grid_order[n_full];
-            let start = usize::try_from(partial.address)
-                .map_err(|_| Error::AppendUnsupported("chunk address exceeds this platform"))?;
             let len = partial.chunk_size as usize;
-            let end = start.checked_add(len).filter(|&e| e <= view.len()).ok_or(
-                Error::AppendUnsupported("trailing chunk extends past end-of-file"),
-            )?;
-            let stored = &view[start..end];
+            partial
+                .address
+                .checked_add(len as u64)
+                .filter(|&e| e <= view.len())
+                .ok_or(Error::AppendUnsupported(
+                    "trailing chunk extends past end-of-file",
+                ))?;
+            let stored = view
+                .read_exact_at(partial.address, len)
+                .map_err(|_| Error::AppendUnsupported("trailing chunk could not be read"))?;
             let full = if let Some(pl) = &pipeline {
                 let ctx = ChunkContext::from_datatype(&spatial, &disk_dt);
-                decompress_chunk(stored, pl, ctx, partial.filter_mask).map_err(Error::Format)?
+                decompress_chunk(&stored, pl, ctx, partial.filter_mask).map_err(Error::Format)?
             } else {
-                stored.to_vec()
+                stored
             };
             let live_elems = usize::try_from(current_dim0 % chunk_elems)
                 .map_err(|_| Error::AppendUnsupported("chunk length exceeds this platform"))?;
@@ -3815,7 +3796,7 @@ impl WriteEngine {
             has_filters,
             kept_chunks,
             new_chunk_bytes,
-            old_addr: addr as u64,
+            old_addr: addr,
             old_tail_extent,
         })
     }
@@ -3830,8 +3811,8 @@ impl WriteEngine {
     /// managed object is re-emitted as a *huge* object. Rejects multi-chunk
     /// headers, dense or soft/external links, chunked/old-version data layouts, and
     /// headers that are neither a dataset nor a group.
-    fn read_object(d: &[u8], addr: usize, base: u64) -> Result<ObjModel, Error> {
-        let region = Self::gather_oh_messages(d, addr, base)?;
+    fn read_object<S: Source + ?Sized>(src: &S, addr: u64, base: u64) -> Result<ObjModel, Error> {
+        let region = Self::gather_oh_messages(src, addr, base)?;
 
         // First pass: detect whether attributes are stored densely (a defined
         // fractal-heap address in the Attribute Info message). A dense object is
@@ -3873,7 +3854,7 @@ impl WriteEngine {
         // Attribute messages, so it returns exactly the heap-resident set.
         let dense_attrs = if dense {
             let header =
-                ObjectHeader::parse_with_base(d, addr, OFFSET_SIZE, LENGTH_SIZE, base).map_err(|_| {
+                ObjectHeader::parse_from_source(src, addr, OFFSET_SIZE, LENGTH_SIZE, base).map_err(|_| {
                     Error::EditUnsupported(
                         "a source object header with dense attributes could not be parsed for copying",
                     )
@@ -3881,15 +3862,15 @@ impl WriteEngine {
             // The heap address in the Attribute Info message is stored relative to
             // the base address, so the walk gets the source framed past its
             // userblock — the same view the reader uses. `base` is 0 for a plain
-            // file, where this is `d` itself.
-            let framed = usize::try_from(base)
-                .ok()
-                .and_then(|start| d.get(start..))
-                .ok_or(Error::EditUnsupported(
+            // file, where this is `src` itself.
+            if base > src.len() {
+                return Err(Error::EditUnsupported(
                     "a source file's userblock is larger than the file itself",
-                ))?;
-            let attrs = crate::attribute::extract_attributes_full(
-                framed,
+                ));
+            }
+            let framed = BaseOffsetSource { inner: src, base };
+            let attrs = crate::attribute::extract_attributes_full_from_source(
+                &framed,
                 &header,
                 OFFSET_SIZE,
                 LENGTH_SIZE,
@@ -4046,20 +4027,20 @@ impl WriteEngine {
     /// captures the bytes the write half ([`write_copy_subtree`](Self::write_copy_subtree))
     /// later appends, so the source buffer need not outlive the read.
     ///
-    /// `d` is the buffer the source object lives in: this session's own mirror for
-    /// an in-file [`copy`](Self::copy), or another file's image for a cross-file
-    /// [`copy_from`](Self::copy_from). `base` is that buffer's userblock base (the
+    /// `src` is the image the source object lives in: this session's own file image
+    /// for an in-file [`copy`](Self::copy), or another file's image for a cross-file
+    /// [`copy_from`](Self::copy_from). `base` is that image's userblock base (the
     /// session's own base for an in-file copy, always 0 for a cross-file copy, whose
     /// source is gated to base 0): the stored, base-relative addresses read out of
-    /// the source headers are shifted by it to index `d`. When `cross_file` is set,
+    /// the source headers are shifted by it to index `src`. When `cross_file` is set,
     /// every copied object header is additionally screened by
     /// [`reject_foreign_addresses`] — verbatim bytes that embed a *source-file*
     /// absolute address (variable-length or reference data, a committed datatype)
     /// would dangle in another file and are refused, whereas an in-file copy keeps
     /// them valid by sharing the source file's heaps and objects.
-    fn read_copy_subtree(
-        d: &[u8],
-        addr: usize,
+    fn read_copy_subtree<S: Source + ?Sized>(
+        src: &S,
+        addr: u64,
         depth: u32,
         cross_file: bool,
         base: u64,
@@ -4069,15 +4050,13 @@ impl WriteEngine {
                 "copy source nests too deeply (possible hard-link cycle)",
             ));
         }
-        // `base` is the userblock base of the buffer `d`: this session's own base
+        // `base` is the userblock base of the image `src`: this session's own base
         // for an in-file copy, and always 0 for a cross-file copy (the source is
-        // gated to base 0 in `copy_from`). `addr` is an absolute offset into `d`;
+        // gated to base 0 in `copy_from`). `addr` is an absolute offset into `src`;
         // the stored (base-relative) addresses `read_object` returns for contiguous
         // data, chunk storage, and child links are converted to absolute offsets by
-        // adding `base` before `d` is indexed or a child is descended into.
-        let base_off = usize::try_from(base)
-            .map_err(|_| Error::EditUnsupported("userblock base address exceeds this platform"))?;
-        match Self::read_object(d, addr, base)? {
+        // adding `base` before `src` is read or a child is descended into.
+        match Self::read_object(src, addr, base)? {
             ObjModel::DatasetVerbatim {
                 region,
                 dense_attrs,
@@ -4103,21 +4082,22 @@ impl WriteEngine {
                     reject_foreign_dense_attrs(&dense_attrs)?;
                 }
                 // The stored data address is base-relative; shift it to an absolute
-                // offset into `d` before slicing out the data block.
+                // offset into `src` before reading the data block out.
                 let start = data_addr
                     .checked_add(base)
-                    .and_then(|a| usize::try_from(a).ok())
                     .ok_or(Error::EditUnsupported("data address exceeds this platform"))?;
                 let len = usize::try_from(data_size)
                     .map_err(|_| Error::EditUnsupported("data size exceeds this platform"))?;
-                let end = start
-                    .checked_add(len)
-                    .filter(|&e| e <= d.len())
+                start
+                    .checked_add(len as u64)
+                    .filter(|&e| e <= src.len())
                     .ok_or(Error::EditUnsupported("dataset data is out of bounds"))?;
                 Ok(CopyTree::DatasetContiguous {
                     region,
                     addr_off,
-                    data: d[start..end].to_vec(),
+                    data: src
+                        .read_exact_at(start, len)
+                        .map_err(|_| Error::EditUnsupported("dataset data is out of bounds"))?,
                     dense_attrs,
                 })
             }
@@ -4164,15 +4144,15 @@ impl WriteEngine {
 
                 // The layout's chunk-index address and every chunk address it leads
                 // to are stored base-relative, so enumerate and read on a
-                // base-relative view of the source buffer (a no-op slice on a base-0
+                // base-relative view of the source image (the identity on a base-0
                 // file). The returned addresses are then offsets into `dview`.
-                let dview = &d[base_off..];
+                let dview = BaseOffsetSource { inner: src, base };
 
                 // Enumerate the source chunks and map them onto a dense grid; a
                 // sparse (holed/unallocated) dataset cannot be reproduced by the
                 // verbatim layout path, which needs every grid slot filled.
                 let infos =
-                    enumerate_chunks_buffered(dview, &layout, &ds, OFFSET_SIZE, LENGTH_SIZE)?;
+                    enumerate_chunks_from_source(&dview, &layout, &ds, OFFSET_SIZE, LENGTH_SIZE)?;
                 let grid = plan_dense_grid(infos, &ds.dimensions, &chunk_dims).ok_or(
                     Error::EditUnsupported(
                         "a chunked dataset with unallocated (sparse) chunks cannot be copied in place yet",
@@ -4191,15 +4171,16 @@ impl WriteEngine {
                 let mut meta = Vec::with_capacity(grid.grid_order.len());
                 let mut chunk_bytes = Vec::with_capacity(grid.grid_order.len());
                 for ci in &grid.grid_order {
-                    let start = usize::try_from(ci.address).map_err(|_| {
-                        Error::EditUnsupported("chunk address exceeds this platform")
-                    })?;
                     let len = ci.chunk_size as usize;
-                    let end = start
-                        .checked_add(len)
+                    ci.address
+                        .checked_add(len as u64)
                         .filter(|&e| e <= dview.len())
                         .ok_or(Error::EditUnsupported("chunk data is out of bounds"))?;
-                    chunk_bytes.push(dview[start..end].to_vec());
+                    chunk_bytes.push(
+                        dview
+                            .read_exact_at(ci.address, len)
+                            .map_err(|_| Error::EditUnsupported("chunk data is out of bounds"))?,
+                    );
                     meta.push(ChunkMeta {
                         compressed_size: ci.chunk_size as u64,
                         filter_mask: ci.filter_mask,
@@ -4230,16 +4211,13 @@ impl WriteEngine {
                 let mut kids = Vec::with_capacity(children.len());
                 for (name, child) in children {
                     // Child link targets are stored base-relative; re-absolutize
-                    // before descending so `addr` stays an absolute offset into `d`.
-                    let child = child
-                        .checked_add(base)
-                        .and_then(|a| usize::try_from(a).ok())
-                        .ok_or(Error::EditUnsupported(
-                            "child address exceeds this platform",
-                        ))?;
+                    // before descending so `addr` stays an absolute offset into `src`.
+                    let child = child.checked_add(base).ok_or(Error::EditUnsupported(
+                        "child address exceeds this platform",
+                    ))?;
                     kids.push((
                         name,
-                        Self::read_copy_subtree(d, child, depth + 1, cross_file, base)?,
+                        Self::read_copy_subtree(src, child, depth + 1, cross_file, base)?,
                     ));
                 }
                 Ok(CopyTree::Group {
@@ -4832,7 +4810,7 @@ impl WriteEngine {
         add_targets: &[PathKey],
         write_targets: &[PathKey],
         pending_deletes: &[PathKey],
-        data: &[u8],
+        src: &(impl Source + ?Sized),
         superblock: &Superblock,
     ) -> Result<u64, Error> {
         let path = match target {
@@ -4854,7 +4832,7 @@ impl WriteEngine {
                  use separate commits",
             ));
         }
-        match crate::group_v2::resolve_path_any(data, superblock, path) {
+        match crate::group_v2::resolve_path_any_from_source(src, superblock, path) {
             Ok(addr) => Ok(addr - base),
             Err(_) => Ok(UNDEF),
         }
@@ -4881,7 +4859,7 @@ impl WriteEngine {
         add_targets: &[PathKey],
         write_targets: &[PathKey],
         pending_deletes: &[PathKey],
-        data: &[u8],
+        src: &(impl Source + ?Sized),
         superblock: &Superblock,
     ) -> Result<(), Error> {
         let mut by_depth = keys.to_vec();
@@ -4905,7 +4883,7 @@ impl WriteEngine {
                                 add_targets,
                                 write_targets,
                                 pending_deletes,
-                                data,
+                                src,
                                 superblock,
                             )?;
                         }
@@ -4980,67 +4958,17 @@ impl WriteEngine {
     /// On-disk byte spans `(addr, len)` of every chunk of the version 2 object
     /// header at `addr`: chunk 0 (signature, prefix, messages, checksum) plus
     /// each continuation (`OCHK`) block. Used to reclaim a header's storage when
-    /// its object is deleted. An error (propagated from [`oh_region`] or a
+    /// its object is deleted. An error (propagated from [`oh_region_at`] or a
     /// malformed continuation) means the header is not a plain v2 header this
     /// engine can fully account for, and the caller leaves it as dead bytes
     /// rather than guess its extent.
     fn oh_chunk_spans(&self, addr: usize) -> Result<Vec<(u64, u64)>, Error> {
-        let (rs, re) = Self::oh_region(&self.data, addr)?;
-        let d = &self.data;
-        // A continuation message records the OCHK block's address relative to the
-        // userblock base, so it is shifted to an absolute file offset before
-        // indexing the file or recording the span (a no-op on a base-0 file). Chunk
-        // 0 sits at the absolute header address itself, which is already absolute.
-        let base = self.superblock.base_address;
-        // Chunk 0 spans from the header start through its trailing checksum;
-        // `oh_region` guarantees `re + 4 <= d.len()`.
-        let mut spans: Vec<(u64, u64)> = vec![(addr as u64, (re + 4 - addr) as u64)];
-        // Walk continuation messages exactly as `gather_oh_messages` does, but
-        // record each OCHK block's extent instead of collecting its messages.
-        let mut chunks: Vec<(usize, usize)> = vec![(rs, re)];
-        let mut i = 0;
-        while i < chunks.len() {
-            if chunks.len() > MAX_OH_CHUNKS {
-                return Err(Error::EditUnsupported(
-                    "object header has too many continuation chunks",
-                ));
-            }
-            let (cs, ce) = chunks[i];
-            i += 1;
-            let region = &d[..ce];
-            let mut p = cs;
-            while let Some((msg_type, body, body_end)) = next_message(region, p)? {
-                if msg_type == MessageType::ObjectHeaderContinuation {
-                    if body_end - body < (OFFSET_SIZE + LENGTH_SIZE) as usize {
-                        return Err(Error::EditUnsupported("malformed continuation message"));
-                    }
-                    let off = u64::from_le_bytes(d[body..body + 8].try_into().unwrap());
-                    let len = u64::from_le_bytes(d[body + 8..body + 16].try_into().unwrap());
-                    let off_abs = off
-                        .checked_add(base)
-                        .ok_or(Error::EditUnsupported("continuation address overflow"))?;
-                    let off_us = usize::try_from(off_abs).map_err(|_| {
-                        Error::EditUnsupported("continuation address exceeds this platform")
-                    })?;
-                    let len_us = usize::try_from(len).map_err(|_| {
-                        Error::EditUnsupported("continuation length exceeds this platform")
-                    })?;
-                    let blk_end = off_us
-                        .checked_add(len_us)
-                        .filter(|&e| e <= d.len() && len_us >= 8)
-                        .ok_or(Error::EditUnsupported("continuation block out of bounds"))?;
-                    if d[off_us..off_us + 4] != *b"OCHK" {
-                        return Err(Error::EditUnsupported(
-                            "invalid continuation block signature",
-                        ));
-                    }
-                    spans.push((off_abs, len));
-                    chunks.push((off_us + 4, blk_end - 4));
-                }
-                p = body_end;
-            }
-        }
-        Ok(spans)
+        Ok(
+            read_oh_chunks(&self.image(), addr as u64, self.superblock.base_address)?
+                .into_iter()
+                .map(|chunk| chunk.span)
+                .collect(),
+        )
     }
 
     /// Count, for every object-header address reachable from the root, how many
@@ -5074,7 +5002,8 @@ impl WriteEngine {
             }
             budget -= 1;
             let off = usize::try_from(addr).ok()?;
-            let header = ObjectHeader::parse_with_base(&self.data, off, os, ls, base).ok()?;
+            let header =
+                ObjectHeader::parse_from_source(&self.image(), off as u64, os, ls, base).ok()?;
             // Datasets and other leaves are not groups and own no links.
             let is_group = header.messages.iter().any(|m| {
                 matches!(
@@ -5087,7 +5016,8 @@ impl WriteEngine {
             }
             // A group we cannot enumerate fully would undercount incoming links
             // and risk over-reclaim; bail to the safe-leak fallback instead.
-            let entries = resolve_group_entries(&self.data, &header, os, ls, base).ok()?;
+            let entries =
+                resolve_group_entries_from_source(&self.image(), &header, os, ls, base).ok()?;
             for e in entries {
                 let child = e.object_header_address.checked_add(base)?;
                 *counts.entry(child).or_insert(0) += 1;
@@ -5136,6 +5066,7 @@ impl WriteEngine {
         // to an absolute offset by adding `base` (a no-op on a base-0 file) before
         // it is bounds-checked, recorded, or descended into.
         let base = self.superblock.base_address;
+        let file_len = self.image().len();
         if depth >= MAX_COPY_DEPTH {
             return;
         }
@@ -5151,7 +5082,7 @@ impl WriteEngine {
             Ok(s) => s,
             Err(_) => return,
         };
-        match Self::read_object(&self.data, addr, self.superblock.base_address) {
+        match Self::read_object(&self.image(), addr as u64, self.superblock.base_address) {
             Ok(ObjModel::DatasetVerbatim { .. }) => out.extend(meta_spans(spans)),
             Ok(ObjModel::DatasetContiguous {
                 data_addr,
@@ -5168,7 +5099,7 @@ impl WriteEngine {
                         (data_addr.checked_add(base), usize::try_from(data_size))
                     {
                         if let Ok(start) = usize::try_from(abs) {
-                            if start.checked_add(len).is_some_and(|e| e <= self.data.len()) {
+                            if start.checked_add(len).is_some_and(|e| e as u64 <= file_len) {
                                 // A contiguous data block is raw data.
                                 out.push((abs, data_size, PageType::Raw));
                             }
@@ -5236,7 +5167,8 @@ impl WriteEngine {
     fn chunked_storage_spans(&self, addr: usize) -> Option<Vec<(u64, u64, PageType)>> {
         // Locate the data-layout and dataspace messages in the object header.
         let region =
-            Self::gather_oh_messages(&self.data, addr, self.superblock.base_address).ok()?;
+            Self::gather_oh_messages(&self.image(), addr as u64, self.superblock.base_address)
+                .ok()?;
         let mut layout_msg: Option<(usize, usize)> = None;
         let mut dataspace_msg: Option<(usize, usize)> = None;
         let mut p = 0;
@@ -5276,9 +5208,11 @@ impl WriteEngine {
         // (a no-op on a base-0 file). The free list and the bounds check below both
         // work in absolute file offsets.
         let base = self.superblock.base_address;
-        let base_off = usize::try_from(base).ok()?;
         let split = crate::chunked_read::collect_chunked_storage_spans(
-            &self.data[base_off..],
+            &BaseOffsetSource {
+                inner: &self.image(),
+                base,
+            },
             &layout,
             &dataspace,
             OFFSET_SIZE,
@@ -5321,7 +5255,8 @@ impl WriteEngine {
     /// `None` (leave unreclaimed) on any error or violation.
     fn chunked_index_spans(&self, addr: usize) -> Option<Vec<(u64, u64)>> {
         let region =
-            Self::gather_oh_messages(&self.data, addr, self.superblock.base_address).ok()?;
+            Self::gather_oh_messages(&self.image(), addr as u64, self.superblock.base_address)
+                .ok()?;
         let mut layout_msg: Option<(usize, usize)> = None;
         let mut p = 0;
         loop {
@@ -5342,10 +5277,16 @@ impl WriteEngine {
             return None;
         }
         let base = self.superblock.base_address;
-        let base_off = usize::try_from(base).ok()?;
-        let mut spans =
-            chunk_index_spans_buffered(&self.data[base_off..], &layout, OFFSET_SIZE, LENGTH_SIZE)
-                .ok()?;
+        let mut spans = chunk_index_spans_from_source(
+            &BaseOffsetSource {
+                inner: &self.image(),
+                base,
+            },
+            &layout,
+            OFFSET_SIZE,
+            LENGTH_SIZE,
+        )
+        .ok()?;
         for (a, _) in &mut spans {
             *a = a.checked_add(base)?;
         }
@@ -6374,15 +6315,15 @@ fn chunked_geometry(
 /// cannot be enumerated, the grid is sparse, a slot is masked, a new chunk does
 /// not fit, the index cannot be rebuilt in place, or any write would be out of
 /// bounds or overlap another.
-fn try_inplace_chunk_writes(
-    d: &[u8],
+fn try_inplace_chunk_writes<S: Source + ?Sized>(
+    src: &S,
     layout: &DataLayout,
     ds: &Dataspace,
     spatial: &[u64],
     raw_size: u64,
     new_bytes: &[Vec<u8>],
 ) -> Option<Vec<(usize, Vec<u8>)>> {
-    let infos = enumerate_chunks_buffered(d, layout, ds, OFFSET_SIZE, LENGTH_SIZE).ok()?;
+    let infos = enumerate_chunks_from_source(src, layout, ds, OFFSET_SIZE, LENGTH_SIZE).ok()?;
     let grid = plan_dense_grid(infos, &ds.dimensions, spatial)?;
     if grid.grid_order.len() != new_bytes.len() {
         return None;
@@ -6407,7 +6348,9 @@ fn try_inplace_chunk_writes(
             any_shrunk = true;
         }
         let start = usize::try_from(ci.address).ok()?;
-        start.checked_add(bytes.len()).filter(|&e| e <= d.len())?;
+        start
+            .checked_add(bytes.len())
+            .filter(|&e| e as u64 <= src.len())?;
         writes.push((start, bytes.clone()));
         spans.push((ci.address, new_len));
     }
@@ -6416,7 +6359,7 @@ fn try_inplace_chunk_writes(
     // must be rebuilt in place to match; an equal-size one leaves it untouched.
     if any_shrunk {
         let (index_addr, index_bytes) =
-            try_rebuild_index_in_place(d, layout, raw_size, &grid.grid_order, new_bytes)?;
+            try_rebuild_index_in_place(src, layout, raw_size, &grid.grid_order, new_bytes)?;
         spans.push((index_addr as u64, index_bytes.len() as u64));
         writes.push((index_addr, index_bytes));
     }
@@ -6424,7 +6367,7 @@ fn try_inplace_chunk_writes(
     // Refuse to perform overlapping in-place writes (a malformed source index, or
     // an index region that overlaps a chunk slot); relocate instead so two writes
     // never clobber each other.
-    if !spans_disjoint_in_bounds(&mut spans, d.len() as u64) {
+    if !spans_disjoint_in_bounds(&mut spans, src.len()) {
         return None;
     }
     Some(writes)
@@ -6449,8 +6392,8 @@ fn try_inplace_chunk_writes(
 /// atomic: a crash mid-write can tear the index and leave the dataset needing a
 /// rewrite. It is used only on the in-place path, whose linearization point is the
 /// synced data write.
-fn try_rebuild_index_in_place(
-    d: &[u8],
+fn try_rebuild_index_in_place<S: Source + ?Sized>(
+    src: &S,
     layout: &DataLayout,
     raw_size: u64,
     grid_order: &[crate::chunked_read::ChunkInfo],
@@ -6501,7 +6444,7 @@ fn try_rebuild_index_in_place(
     // an index this crate wrote). A scattered or different on-disk layout fails
     // the check and the caller relocates.
     let mut spans =
-        crate::chunked_read::chunk_index_spans_buffered(d, layout, OFFSET_SIZE, LENGTH_SIZE)
+        crate::chunked_read::chunk_index_spans_from_source(src, layout, OFFSET_SIZE, LENGTH_SIZE)
             .ok()?;
     if spans.is_empty() {
         return None;
@@ -6523,7 +6466,7 @@ fn try_rebuild_index_in_place(
     let start = usize::try_from(*index_addr).ok()?;
     start
         .checked_add(new_index.len())
-        .filter(|&e| e <= d.len())?;
+        .filter(|&e| e as u64 <= src.len())?;
     Some((start, new_index))
 }
 
@@ -7007,21 +6950,20 @@ pub(crate) fn read_single_chunk_ext_region<S: crate::source::Source>(
     ext_addr: u64,
 ) -> Result<(Vec<u8>, u64), Error> {
     // The extension is tiny (a File Space Info message plus at most a few small
-    // messages); a bounded window covers its whole chunk. Reading past end-of-file
-    // is clamped so a near-EOF extension still reads.
-    const WINDOW: u64 = 4096;
-    let avail = src.len().saturating_sub(ext_addr);
-    let want = WINDOW.min(avail).to_usize()?;
-    let buf = src.read_exact_at(ext_addr, want).map_err(Error::Format)?;
-    let (rs, re) = WriteEngine::oh_region(&buf, 0).map_err(|_| {
-        Error::EditUnsupported(
+    // messages), and `read_oh_chunk0` reads exactly its chunk 0 — prefix window
+    // first, then the message region the prefix sizes.
+    let chunk = read_oh_chunk0(src, ext_addr).map_err(|e| match e {
+        // A read failure is a real I/O/format problem and propagates as itself;
+        // only a parse failure means "not the shape the bounded backend reads".
+        Error::EditUnsupported(_) => Error::EditUnsupported(
             "bounded read-write cannot read the superblock extension (not a single-chunk \
              version 2 object header); use File::open_rw",
-        )
+        ),
+        other => other,
     })?;
     // Refuse a continuation: the bounded reader only understands a single chunk.
-    let mut p = rs;
-    while let Some((msg_type, _body, body_end)) = next_message(&buf[..re], p)? {
+    let (region, mut p) = chunk.message_region();
+    while let Some((msg_type, _body, body_end)) = next_message(region, p)? {
         if msg_type == MessageType::ObjectHeaderContinuation {
             return Err(Error::EditUnsupported(
                 "bounded read-write does not support a multi-chunk superblock extension; \
@@ -7030,9 +6972,181 @@ pub(crate) fn read_single_chunk_ext_region<S: crate::source::Source>(
         }
         p = body_end;
     }
-    // `oh_region` validated `re + 4 <= buf.len()`, so the checksum is present and
-    // the full object-header length is `re + 4`.
-    Ok((buf[rs..re].to_vec(), (re + 4) as u64))
+    // `span.1` is the whole on-disk object header, message region plus the
+    // `OHDR` prefix and the trailing checksum.
+    Ok((region[chunk.messages_start..].to_vec(), chunk.span.1))
+}
+
+/// Parse and validate a version 2 object header's prefix, returning the absolute
+/// `[start, end)` byte range of its chunk-0 message region.
+///
+/// `prefix` holds the bytes at `[addr, addr + prefix.len())` — up to
+/// [`OH_PREFIX_MAX`], fewer when the header sits near the end of the image — and
+/// `file_len` is the length of the image the header lives in, which bounds the
+/// region. Rejects headers that are not OHDR v2 and headers that track message
+/// creation order, whose 6-byte message records this engine does not emit.
+fn oh_region_at(prefix: &[u8], addr: u64, file_len: u64) -> Result<(u64, u64), Error> {
+    if prefix.len() < 6 || &prefix[..4] != b"OHDR" || prefix[4] != 2 {
+        return Err(Error::EditUnsupported(
+            "an object does not use a version 2 object header",
+        ));
+    }
+    let flags = prefix[5];
+    if flags & 0x04 != 0 {
+        return Err(Error::EditUnsupported(
+            "an object tracks message creation order (not supported in place yet)",
+        ));
+    }
+    let mut pos = 6usize;
+    if flags & 0x20 != 0 {
+        pos += 16; // optional timestamps
+    }
+    if flags & 0x10 != 0 {
+        pos += 4; // optional attribute phase-change thresholds
+    }
+    let size_width = match flags & 0x03 {
+        0 => 1usize,
+        1 => 2,
+        2 => 4,
+        _ => 8,
+    };
+    if prefix.len() < pos + size_width {
+        return Err(Error::EditUnsupported("truncated object header"));
+    }
+    let chunk0_size = read_le(&prefix[pos..pos + size_width]) as u64;
+    pos += size_width;
+    let region_start = addr
+        .checked_add(pos as u64)
+        .ok_or(Error::EditUnsupported("truncated object header"))?;
+    // The region is followed by a 4-byte checksum, which must also be present.
+    let region_end = region_start
+        .checked_add(chunk0_size)
+        .filter(|e| e.checked_add(4).is_some_and(|end| end <= file_len))
+        .ok_or(Error::EditUnsupported("truncated object header"))?;
+    Ok((region_start, region_end))
+}
+
+/// One chunk of a version 2 object header, read out of a file image.
+///
+/// The buffer stops at the end of the chunk's message region: the trailing
+/// checksum is never walked, and it has already been confirmed present. `span`
+/// covers the *whole* on-disk chunk including that checksum, so it can be handed
+/// to the free list when the header is reclaimed.
+struct OhChunk {
+    /// Absolute file address and full on-disk length of the chunk.
+    span: (u64, u64),
+    /// The chunk's bytes, from `span.0` through the end of its message region.
+    buf: Vec<u8>,
+    /// Offset of the first message within [`buf`](Self::buf).
+    messages_start: usize,
+}
+
+impl OhChunk {
+    /// The slice to walk messages in, and the offset to start at. The two are
+    /// returned together because [`next_message`] must not read past the end of
+    /// the message region into the checksum.
+    fn message_region(&self) -> (&[u8], usize) {
+        (&self.buf, self.messages_start)
+    }
+}
+
+/// Read chunk 0 of the version 2 object header at `addr` out of `src`.
+fn read_oh_chunk0<S: Source + ?Sized>(src: &S, addr: u64) -> Result<OhChunk, Error> {
+    let file_len = src.len();
+    let window = file_len
+        .saturating_sub(addr)
+        .min(OH_PREFIX_MAX as u64)
+        .to_usize()?;
+    let prefix = src.read_metadata_at(addr, window)?;
+    let (rs, re) = oh_region_at(&prefix, addr, file_len)?;
+    // `re >= rs > addr`, so both differences are non-negative, and `oh_region_at`
+    // has checked that the 4-byte checksum past `re` is present.
+    let len = (re - addr).to_usize()?;
+    Ok(OhChunk {
+        span: (addr, len as u64 + 4),
+        buf: src.read_metadata_at(addr, len)?,
+        messages_start: (rs - addr).to_usize()?,
+    })
+}
+
+/// Read every chunk of the version 2 object header at `addr`, chunk 0 first,
+/// following each `Continuation` message to its `OCHK` block.
+///
+/// This is the one traversal of a header's chunk chain: [`gather_oh_messages`]
+/// collects the messages out of the result and
+/// [`oh_chunk_spans`](WriteEngine::oh_chunk_spans) collects the extents, so the
+/// two cannot disagree about what a header occupies.
+fn read_oh_chunks<S: Source + ?Sized>(
+    src: &S,
+    addr: u64,
+    base: u64,
+) -> Result<Vec<OhChunk>, Error> {
+    let mut chunks = vec![read_oh_chunk0(src, addr)?];
+    let mut i = 0;
+    while i < chunks.len() {
+        if chunks.len() > MAX_OH_CHUNKS {
+            return Err(Error::EditUnsupported(
+                "object header has too many continuation chunks",
+            ));
+        }
+        // Collect this chunk's continuations before extending the worklist, so the
+        // borrow of `chunks[i]` ends first.
+        let mut found = Vec::new();
+        let (region, mut p) = chunks[i].message_region();
+        while let Some((msg_type, body, body_end)) = next_message(region, p)? {
+            if msg_type == MessageType::ObjectHeaderContinuation {
+                found.push(read_oh_continuation(src, region, body, body_end, base)?);
+            }
+            p = body_end;
+        }
+        i += 1;
+        chunks.extend(found);
+    }
+    Ok(chunks)
+}
+
+/// Read the `OCHK` continuation block a continuation message points at.
+///
+/// `region[body..body_end]` is the continuation message's body: the block's
+/// base-relative address followed by its length.
+fn read_oh_continuation<S: Source + ?Sized>(
+    src: &S,
+    region: &[u8],
+    body: usize,
+    body_end: usize,
+    base: u64,
+) -> Result<OhChunk, Error> {
+    if body_end - body < (OFFSET_SIZE + LENGTH_SIZE) as usize {
+        return Err(Error::EditUnsupported("malformed continuation message"));
+    }
+    let off = u64::from_le_bytes(region[body..body + 8].try_into().unwrap());
+    let len = u64::from_le_bytes(region[body + 8..body + 16].try_into().unwrap());
+    // The block address is stored relative to the base address; shift it to an
+    // absolute file offset before reading.
+    let off = off
+        .checked_add(base)
+        .ok_or(Error::EditUnsupported("continuation address overflow"))?;
+    // An OCHK block is signature(4) + messages + checksum(4).
+    let end = off
+        .checked_add(len)
+        .filter(|&e| e <= src.len() && len >= 8)
+        .ok_or(Error::EditUnsupported("continuation block out of bounds"))?;
+    let want = (end - off)
+        .to_usize()
+        .map_err(|_| Error::EditUnsupported("continuation length exceeds this platform"))?;
+    let mut buf = src.read_metadata_at(off, want)?;
+    if buf[..4] != *b"OCHK" {
+        return Err(Error::EditUnsupported(
+            "invalid continuation block signature",
+        ));
+    }
+    // Trim the trailing checksum so the message walk stops at the last message.
+    buf.truncate(want - 4);
+    Ok(OhChunk {
+        span: (off, len),
+        buf,
+        messages_start: 4,
+    })
 }
 
 pub(crate) fn next_message(

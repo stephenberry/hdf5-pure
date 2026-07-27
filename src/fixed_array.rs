@@ -129,13 +129,13 @@ impl FixedArrayHeader {
 /// `fa_base` is the Fixed Array header address taken from the data-layout
 /// message. The returned spans are exact (the writer allocates each block at the
 /// size computed here); the caller validates them against the file bounds.
-pub(crate) fn fixed_array_index_spans(
-    file_data: &[u8],
+pub(crate) fn fixed_array_index_spans<S: Source + ?Sized>(
+    source: &S,
     fa_base: u64,
     offset_size: u8,
     length_size: u8,
 ) -> Result<Vec<(u64, u64)>, FormatError> {
-    let header = FixedArrayHeader::parse(file_data, fa_base.to_usize()?, offset_size, length_size)?;
+    let header = FixedArrayHeader::parse_from_source(source, fa_base, offset_size, length_size)?;
     let os = offset_size as usize;
 
     // FAHD: sig(4)+ver(1)+client(1)+elem_size(1)+max_bits(1)+num_elements(ls)+dblk_addr(os)+checksum(4).
@@ -1013,7 +1013,9 @@ mod tests {
                 let mut file = vec![0u8; base as usize + fa.len()];
                 file[base as usize..].copy_from_slice(&fa);
 
-                let spans = fixed_array_index_spans(&file, base, os, ls).unwrap();
+                let spans =
+                    fixed_array_index_spans(&crate::source::BytesSource::new(&file), base, os, ls)
+                        .unwrap();
                 assert_eq!(
                     spans.len(),
                     2,
