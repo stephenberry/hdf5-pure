@@ -63,7 +63,11 @@ pub(crate) trait FileImage: Source + Send + Sync {
     ///
     /// An implementation that caches reads must invalidate any entry covering
     /// the appended range: a preceding [`truncate`](Self::truncate) can make an
-    /// address readable, then cached, then appended over.
+    /// address readable, then cached, then appended over. An implementation that
+    /// also refuses reads past end-of-file satisfies this through its `truncate`
+    /// alone, since nothing above the original end could have been cached; the
+    /// obligation is stated here because it belongs to the contract rather than
+    /// to that policy.
     fn append(&mut self, bytes: &[u8]) -> Result<u64, Error>;
 
     /// Overwrite `[offset, offset + bytes.len())` in place. The range must
@@ -316,9 +320,12 @@ impl Source for HandleImage {
 impl FileImage for HandleImage {
     fn append(&mut self, bytes: &[u8]) -> Result<u64, Error> {
         let addr = self.len;
-        // A preceding `truncate` can leave a cached entry covering bytes this
-        // append is about to replace, so the appended range is invalidated too
-        // (see the trait's contract).
+        // The trait requires this. It is belt-and-braces for *this* image, whose
+        // reads past end-of-file are refused: the only way a cached entry can
+        // cover an address an append reuses is a preceding `truncate`, and that
+        // already invalidated everything it discarded. It is kept because the
+        // obligation belongs to the contract, not to this implementation's
+        // read-bounds policy.
         self.invalidate(addr, bytes.len() as u64);
         self.handle.seek(SeekFrom::Start(addr)).map_err(Error::Io)?;
         self.handle.write_all(bytes).map_err(Error::Io)?;
@@ -327,12 +334,19 @@ impl FileImage for HandleImage {
     }
 
     fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Error> {
-        debug_assert!(
-            offset.saturating_add(bytes.len() as u64) <= self.len,
-            "write_at past end-of-file: {offset}+{} > {}",
-            bytes.len(),
-            self.len
-        );
+        // The mirror image fails loudly on this in every build — it indexes its
+        // buffer — so this one must too rather than extend the file behind the
+        // `len` cursor and leave a later `append` overwriting what was written.
+        // A caller bug that is a panic on one backing and silent corruption on the
+        // other is exactly what the two being interchangeable has to rule out.
+        let end = offset
+            .checked_add(bytes.len() as u64)
+            .filter(|&e| e <= self.len)
+            .ok_or(Error::Format(FormatError::UnexpectedEof {
+                expected: offset.to_usize().unwrap_or(usize::MAX),
+                available: self.len.to_usize().unwrap_or(usize::MAX),
+            }))?;
+        debug_assert!(end <= self.len);
         self.invalidate(offset, bytes.len() as u64);
         self.handle
             .seek(SeekFrom::Start(offset))
@@ -372,10 +386,9 @@ impl FileImage for HandleImage {
 /// how much of a file an operation actually touches.
 ///
 /// It deliberately does *not* forward `read_metadata_at`, taking [`Source`]'s
-/// default instead: every read then funnels through this one `read_at`, where it
-/// is counted, rather than being served from the inner image's cache. The count
-/// is therefore an upper bound on the real I/O, which is the safe direction for
-/// asserting that an operation stays small.
+/// default instead, so every read funnels through this one `read_at` and is
+/// counted. Callers build the inner image with the metadata cache disabled, so
+/// nothing is bypassed and the count is exact rather than an upper bound.
 #[cfg(test)]
 pub(crate) struct CountingImage {
     inner: Box<dyn FileImage>,
@@ -667,9 +680,13 @@ mod tests {
         }
     }
 
-    /// The case the trait's `append` contract calls out: truncate makes a range
-    /// unreadable, a later append reuses those addresses, and a read cached
-    /// before the truncate must not resurface.
+    /// Truncate makes a range unreadable, a later append reuses those addresses,
+    /// and a read cached before the truncate must not resurface.
+    ///
+    /// What this pins is `truncate`'s invalidation, not `append`'s: for an image
+    /// that refuses reads past end-of-file the two overlap, and deleting the call
+    /// in `append` leaves this green. See the trait's `append` contract for why
+    /// the call stays anyway.
     #[test]
     fn a_cached_read_does_not_survive_being_truncated_and_appended_over() {
         let dir = tempfile::tempdir().unwrap();

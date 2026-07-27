@@ -349,9 +349,13 @@ fn bounded_staged_commit_reads_back_in_c() {
 
 /// A file that persists its free space can now be grown by an **immediate**
 /// in-place append from either entry point, not only the bounded one: the
-/// managers are re-homed at close by the same tail a commit writes. The C
-/// library both reads the rows back and reports the free space, which is what
-/// proves the rewritten managers are well-formed rather than merely ignored.
+/// managers are re-homed at close by the same tail a commit writes.
+///
+/// What this pins is that the C library reads back rows this crate could not
+/// previously write. The `H5Fget_freespace` call below only shows the C library
+/// did not error, and it tolerates stale mid-file managers, so it does not prove
+/// the re-homing happened — `edit_append_inplace::persisting_file_takes_both_inplace_and_staged_appends`
+/// is what covers that, by comparing the recorded free space across the close.
 #[test]
 fn mirror_inplace_append_to_a_persisting_file_reads_back_in_c() {
     let _c = c_lib_guard();

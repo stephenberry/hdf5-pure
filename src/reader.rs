@@ -1607,14 +1607,15 @@ impl File {
     /// [`commit`](Self::commit)/[`copy`](Self::copy)/[`copy_from`](Self::copy_from),
     /// and [`space_accounting`](Self::space_accounting)) is the same as
     /// [`open_rw`](Self::open_rw)'s: both open the same engine, differing only in
-    /// how it holds the file's bytes (issue #198). What a commit *builds* still
-    /// scales with the objects it touches, so a commit is bounded by the edit
-    /// rather than by the file.
+    /// how it holds the file's bytes (issue #198). A commit here holds only what
+    /// it is building, so its resident memory is bounded by the edit rather than
+    /// by the file — with [`copy`](Self::copy) the exception, since copying an
+    /// object reads the whole of it into memory first.
     ///
     /// What this entry point still requires beyond `open_rw` is a latest-format
-    /// file (v2/v3 superblock) with 8-byte offsets and lengths and no userblock;
-    /// anything else is refused at open with
-    /// [`Error::EditUnsupported`](crate::Error::EditUnsupported).
+    /// file (v2/v3 superblock) with no userblock; anything else is refused at
+    /// open with [`Error::EditUnsupported`](crate::Error::EditUnsupported).
+    /// (8-byte offsets and lengths are required by both editors.)
     ///
     /// A file that persists its free space
     /// (`H5Pset_file_space_strategy(persist = true)`, non-paged) is supported:
@@ -1688,9 +1689,9 @@ impl File {
     ///
     /// A creation property is validated as the file is written, so an invalid
     /// userblock or page size surfaces here rather than when the properties were
-    /// built. Note that a file created with [`FileSpaceStrategy::Page`] must be
-    /// grown through [`open_rw_bounded`](Self::open_rw_bounded): the staged-commit
-    /// path does not yet allocate page-aligned (issue #198).
+    /// built. A file created with [`FileSpaceStrategy::Page`] can be grown
+    /// through either editor, by an immediate [`Dataset::append`] or a staged
+    /// commit, provided it also persists its free space (issue #198).
     pub fn create_with_options<P: AsRef<std::path::Path>>(
         path: P,
         create: FileCreateProperties,
@@ -2479,17 +2480,23 @@ impl Dataset {
     ///
     /// The file must have been opened for writing with [`File::open_rw`] or
     /// [`File::open_rw_bounded`]; a read-only file returns
-    /// [`Error::ReadOnly`](crate::Error::ReadOnly). On an `open_rw` file a
-    /// handle reached by object reference (which has no resolvable path) also
-    /// returns `ReadOnly`; on an `open_rw_bounded` file appends are keyed by
-    /// the handle's object-header address, so such a handle can append. The
-    /// target must
-    /// be a chunked, rank-1, unlimited, Extensible-Array-indexed dataset — the
-    /// same contract as [`Dataset::append`](crate::Dataset::append), including filtered
-    /// whole-chunk / unfiltered any-length rules — otherwise
-    /// [`Error::AppendInPlaceUnsupported`](crate::Error::AppendInPlaceUnsupported)
-    /// is returned.
+    /// [`Error::ReadOnly`](crate::Error::ReadOnly). The target must be a chunked,
+    /// rank-1, unlimited, Extensible-Array-indexed dataset, and filtered datasets
+    /// take whole chunks where unfiltered ones take any length; anything else
+    /// returns
+    /// [`Error::AppendInPlaceUnsupported`](crate::Error::AppendInPlaceUnsupported).
     /// The append is immediate and crash-atomic (no `commit` needed).
+    ///
+    /// A handle reached by object reference ([`dereference`](Self::dereference))
+    /// has no resolvable path, so it names its dataset by the object-header
+    /// address it was reached through and can append like any other — until the
+    /// session stages or commits an edit. A commit can move that header, and the
+    /// bytes it vacates still parse as the dataset they were, so an append
+    /// against the old address would land in a header nothing points at. Rather
+    /// than do that silently, such an append is refused once edits are staged or
+    /// a commit has run; re-open the dataset by path to keep appending. A
+    /// path-named handle is unaffected, because the path is resolved afresh every
+    /// time.
     pub fn append<T: H5Element>(&mut self, data: &[T]) -> Result<(), Error> {
         let g = self.append_geometry()?;
         self.append_batches(g, data.len() as u64, |b, r| {

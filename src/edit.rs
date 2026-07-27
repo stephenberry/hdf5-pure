@@ -354,7 +354,7 @@ append_typed! {
 }
 
 /// The in-place write engine behind the owned read-write [`File`](crate::File)
-/// (its `Backend::Mirror`).
+/// (its `Backend::Edit`).
 ///
 /// Reads and edits the file through a [`FileImage`], which owns the writable
 /// handle and decides how much of the file is resident. It carries two commit
@@ -448,6 +448,16 @@ pub(crate) struct WriteEngine {
     /// (issue #198). A paged file that does not *persist* its free space is still
     /// refused: see [`PagedEdit`].
     paged: Option<PagedEdit>,
+    /// Set by the first [`commit`](Self::commit) that does any work. A commit can
+    /// relocate an object header, and nothing on disk distinguishes a relocated
+    /// header from the intact bytes it vacated — the old header still parses, and
+    /// its data-layout message still points at the live chunk index. An
+    /// [`AppendTarget::Header`] captured before that commit would therefore append
+    /// successfully *into the dead header*, growing its dataspace while the live
+    /// dataset stayed put, and report `Ok`. A path is re-resolved on every append
+    /// and so survives a commit; a raw address does not, so it is refused once one
+    /// has run.
+    committed: bool,
     /// Object-header address for each path an in-place append has resolved in
     /// this session. A single `Dataset::append` asks for the target's geometry
     /// and then appends to it, and a loop of appends repeats that; without this
@@ -973,6 +983,7 @@ impl WriteEngine {
             located: HashMap::new(),
             swmr_mode: false,
             paged: None,
+            committed: false,
             resolved: HashMap::new(),
             batched_appends: false,
             fsm_len: len,
@@ -1507,11 +1518,11 @@ impl WriteEngine {
                     ));
                 }
             }
-            AppendTarget::Header(_) if self.has_staged_edits() => {
+            AppendTarget::Header(_) if self.has_staged_edits() || self.committed => {
                 return Err(Error::AppendInPlaceUnsupported(
-                    "this session has staged edits pending and the append target was reached by \
-                     object reference, which cannot be checked against them; commit the staged \
-                     edits before appending in place",
+                    "this append target was reached by object reference, so it names a dataset \
+                     by object-header address, and this session has staged or committed edits \
+                     that can move that header; re-open the dataset by path to append to it",
                 ));
             }
             AppendTarget::Header(_) => {}
@@ -1596,6 +1607,11 @@ impl WriteEngine {
     /// [`batch_elems`](Self::batch_elems)), each its own crash-atomic apply.
     /// Every predictable refusal is raised before the first batch, so a rejected
     /// append leaves the file untouched rather than partly grown.
+    ///
+    /// `Dataset::append` slices its own call the same way before it reaches here,
+    /// so through the public API this loop runs once per call; it batches for the
+    /// benefit of a caller that hands the engine one large builder directly, whose
+    /// bytes are already materialized but whose plan need not be.
     pub(crate) fn append_inplace_gathered(
         &mut self,
         target: AppendTarget<'_>,
@@ -2030,9 +2046,12 @@ impl WriteEngine {
         // tail) means a later failure — including one after the durable root flip,
         // which leaves the session reusable — never strands a stale cache. The
         // no-op fast return above does no such work, so it keeps the cache. The
-        // next the next in-place append re-locates against the fresh file.
+        // The next in-place append re-locates against the fresh file.
         self.located.clear();
         self.resolved.clear();
+        // Past this point the commit may relocate object headers, so every address
+        // a caller captured earlier is suspect; see `committed`.
+        self.committed = true;
 
         // On a file with a userblock, stored addresses are relative to this base
         // and the editor converts at every disk boundary (read `stored + base`,
@@ -5899,12 +5918,11 @@ struct FlatDataset {
 /// all this adapter does; every primitive delegates, so the image's own
 /// write-ordering discipline is what applies.
 ///
-/// It carries the session's paged-file state too, so `append_raw`/`append_meta`
-/// keep a paged file's pages homogeneous through exactly the rule the staged
-/// commit uses ([`PagedEdit::begin`]). Before issue #198 there were two copies of
-/// that state — one per engine — and the whole-file editor's copy was reachable
-/// only from the commit path, so it had to refuse an in-place append to a paged
-/// file outright.
+/// It carries the session's paged-file state too, so `append_raw` keeps a paged
+/// file's pages homogeneous through exactly the rule the staged commit uses
+/// ([`PagedEdit::begin`]). Before issue #198 there were two copies of that state —
+/// one per engine — and the whole-file editor's copy was reachable only from the
+/// commit path, so it had to refuse an in-place append to a paged file outright.
 struct EditStore<'a> {
     image: &'a mut dyn FileImage,
     superblock: &'a mut Superblock,
@@ -5916,12 +5934,15 @@ struct EditStore<'a> {
 }
 
 impl EditStore<'_> {
-    /// Append `bytes` at end-of-file as page type `ty`, padding the tail page
-    /// first when a paged file's page type changes. A plain append on the common
-    /// non-paged file.
-    fn append_typed(&mut self, bytes: &[u8], ty: PageType) -> Result<u64, Error> {
+    /// Append `bytes` into a raw page, padding the tail page first when a paged
+    /// file's tail holds metadata. A plain append on the common non-paged file.
+    ///
+    /// Raw is the only page type this adapter allocates: see
+    /// [`Store::append_raw`](crate::chunk_index_inplace::Store::append_raw) for why
+    /// an extensible-array index block belongs in a raw page here.
+    fn append_into_raw_page(&mut self, bytes: &[u8]) -> Result<u64, Error> {
         if let Some(pg) = self.paged.as_deref_mut() {
-            pg.begin(self.image, ty)?;
+            pg.begin(self.image, PageType::Raw)?;
         }
         self.image.append(bytes)
     }
@@ -5954,10 +5975,7 @@ impl Store for EditStore<'_> {
         self.image.append(bytes)
     }
     fn append_raw(&mut self, bytes: &[u8]) -> Result<u64, Error> {
-        self.append_typed(bytes, PageType::Raw)
-    }
-    fn append_meta(&mut self, bytes: &[u8]) -> Result<u64, Error> {
-        self.append_typed(bytes, PageType::Meta)
+        self.append_into_raw_page(bytes)
     }
     fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Error> {
         self.image.write_at(offset, bytes)
@@ -7212,7 +7230,7 @@ fn is_prefix(a: &[String], b: &[String]) -> bool {
 /// remain (a clean end of the region), and `Err` if a record's declared body
 /// runs past the region. Centralizes the bounds check shared by every walker.
 /// Rebuild a superblock-extension object header's message region (as collapsed by
-/// [`WriteEngine::gather_oh_messages`] or [`read_single_chunk_ext_region`]) with
+/// [`WriteEngine::gather_oh_messages`]) with
 /// its File Space Info message replaced by `info`, preserving every other message
 /// verbatim. The persisting message is fixed-size, so the region length is stable.
 /// Shared by the whole-file mirror commit and the bounded finalize so both write
@@ -8712,21 +8730,21 @@ mod tests {
         );
     }
 
-    /// An in-place append to a paged file must keep pages homogeneous: when it
-    /// switches between raw chunk data and metadata, the tail page is padded so
-    /// the two never share a page.
+    /// An in-place append leaves a partially-filled **raw** page, so the next
+    /// commit's metadata must pad it rather than pack into it.
     ///
-    /// Asserted on the padding the session records, not through the reference C
-    /// library. A file with mixed pages reads back correctly in libhdf5 and
-    /// passes every crosscheck in this repository, so an interop test proves
-    /// interop and says nothing about segregation. Deleting the padding call
-    /// from `EditStore::append_typed` leaves the whole suite green except for
-    /// this test.
+    /// This is what keeps [`PagedEdit::begin`] reachable from [`EditStore`] now
+    /// that an append allocates raw pages only: the append's job is to record that
+    /// the tail page turned raw, and the commit's job is to act on it. It is also
+    /// the interleaving that a single session-level page tracker makes possible —
+    /// with a tracker per engine, the commit path could not see what the append
+    /// path had done, which is why the whole-file editor refused an in-place append
+    /// to a paged file at all (issue #198).
     #[test]
-    fn an_inplace_append_to_a_paged_file_pads_on_every_page_type_switch() {
+    fn a_commit_after_an_append_pads_the_raw_page_the_append_left() {
         const PAGE: u64 = 4096;
         let dir = tempdir().unwrap();
-        let p = dir.path().join("paged_pad.h5");
+        let p = dir.path().join("paged_interleave.h5");
         let mut b = crate::writer::FileBuilder::new();
         b.with_file_space_strategy(crate::FileSpaceStrategy::Page, true, 0)
             .with_file_space_page_size(PAGE);
@@ -8738,10 +8756,84 @@ mod tests {
         b.write(&p).unwrap();
 
         let mut engine = WriteEngine::open_with_locking(&p, FileLocking::Enabled).unwrap();
-        // Two appends, because one apply writes its raw chunks first and its
-        // index metadata after: within a single call the type only switches
-        // raw -> metadata, and it takes a second call's chunk data to switch
-        // back. Each is large enough to grow the extensible-array index.
+        let mut ab = AppendBuilder::new();
+        ab.append_i32(&(64..2000).collect::<Vec<_>>());
+        engine
+            .append_inplace_gathered(AppendTarget::Path("d"), &ab, 4)
+            .unwrap();
+
+        assert_eq!(
+            engine.paged.as_ref().unwrap().last,
+            Some(PageType::Raw),
+            "the append must record that the tail page now holds raw data"
+        );
+        assert_ne!(
+            engine.image.len() % PAGE,
+            0,
+            "the append must leave a partially-filled page for the commit to pad"
+        );
+
+        engine.create_group("g");
+        engine.commit().unwrap();
+
+        // The commit padded the raw tail before laying down metadata, and folded
+        // that padding into the small-raw manager (`meta_pad`/`raw_pad` are cleared
+        // into the free lists as part of the paged tail).
+        let pg = engine.paged.as_ref().expect("the file is paged");
+        let raw_free = pg.raw_small.sections();
+        assert!(
+            !raw_free.is_empty(),
+            "the commit packed metadata into the raw page the append left open"
+        );
+        for (addr, len) in raw_free {
+            assert_eq!(
+                (addr + len) % PAGE,
+                0,
+                "padding {addr}+{len} does not reach a page boundary"
+            );
+        }
+
+        drop(engine);
+        assert_eq!(
+            crate::File::open(&p)
+                .unwrap()
+                .dataset("d")
+                .unwrap()
+                .read_i32()
+                .unwrap(),
+            (0..2000).collect::<Vec<_>>()
+        );
+    }
+
+    /// An in-place append to a paged file must allocate **only raw pages** — the
+    /// chunk data and the extensible-array blocks indexing it alike.
+    ///
+    /// The reclaim path (`chunked_storage_spans`) reports both halves of a chunked
+    /// dataset as raw free space, because that is where this crate places them. An
+    /// append that put its index blocks in a metadata page instead would make the
+    /// reclaim advertise metadata-page bytes for raw reuse, mixing the page a paged
+    /// file exists to keep homogeneous. Measured here rather than through the
+    /// reference C library, which reads a mixed-page file without complaint: an
+    /// interop test proves interop and says nothing about segregation.
+    #[test]
+    fn an_inplace_append_to_a_paged_file_allocates_only_raw_pages() {
+        const PAGE: u64 = 4096;
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("paged_raw.h5");
+        let mut b = crate::writer::FileBuilder::new();
+        b.with_file_space_strategy(crate::FileSpaceStrategy::Page, true, 0)
+            .with_file_space_page_size(PAGE);
+        b.create_dataset("d")
+            .with_i32_data(&(0..64).collect::<Vec<i32>>())
+            .with_shape(&[64])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[64]);
+        b.write(&p).unwrap();
+
+        let mut engine = WriteEngine::open_with_locking(&p, FileLocking::Enabled).unwrap();
+        let before = engine.image().len();
+        // Two appends, each large enough to grow the extensible-array index, so the
+        // run allocates index blocks as well as chunk data.
         for range in [64..2000, 2000..4000] {
             let mut ab = AppendBuilder::new();
             ab.append_i32(&range.collect::<Vec<_>>());
@@ -8751,21 +8843,38 @@ mod tests {
         }
 
         let pg = engine.paged.as_ref().expect("the file is paged");
-        assert!(
-            !pg.meta_pad.is_empty(),
-            "a metadata page was never padded before a raw append"
+        assert_eq!(
+            pg.last,
+            Some(PageType::Raw),
+            "the append left the tail page holding something other than raw data"
         );
         assert!(
-            !pg.raw_pad.is_empty(),
-            "a raw page was never padded before a metadata append"
+            pg.meta_pad.is_empty() && pg.raw_pad.is_empty(),
+            "an in-place append switched page type: meta_pad={:?} raw_pad={:?}",
+            pg.meta_pad,
+            pg.raw_pad
         );
-        for &(addr, len) in pg.meta_pad.iter().chain(pg.raw_pad.iter()) {
-            assert_eq!(
-                (addr + len) % PAGE,
-                0,
-                "padding {addr}+{len} does not reach a page boundary"
-            );
-            assert!(len < PAGE, "padding {len} is a whole page or more");
-        }
+
+        // Not vacuous: the append really did allocate index structure above the
+        // pre-append end-of-file, which is what would have opened a metadata page.
+        let addr = crate::group_v2::resolve_path_any_from_source(
+            &engine.image(),
+            engine.superblock(),
+            "d",
+        )
+        .unwrap();
+        let spans = engine
+            .chunked_storage_spans(addr.to_usize().unwrap())
+            .expect("a chunked dataset has reclaimable spans");
+        let fresh = spans.iter().filter(|&&(a, _, _)| a >= before).count();
+        assert!(
+            fresh > 0,
+            "the append allocated nothing above {before}, so the assertion above proves nothing"
+        );
+        assert!(
+            spans.iter().all(|&(_, _, ty)| ty == PageType::Raw),
+            "the reclaim tags every chunked span raw; a metadata tag here would need \
+             the placement rule above to change with it"
+        );
     }
 }

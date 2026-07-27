@@ -365,8 +365,8 @@ struct CachedMetadataRead {
 }
 
 /// The bounded LRU store behind [`MetadataCachingSource`], also embedded
-/// directly by the bounded read-write backend (`crate::bounded`), which must
-/// invalidate entries that overlap an in-place write.
+/// directly by the mirrorless write image (`crate::image::HandleImage`), which
+/// must invalidate entries that overlap an in-place write.
 #[cfg(feature = "std")]
 pub(crate) struct MetadataReadCache {
     entries: Vec<CachedMetadataRead>,
