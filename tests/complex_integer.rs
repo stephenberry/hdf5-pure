@@ -574,3 +574,164 @@ fn the_builder_writes_complex_integers_in_every_scope() {
         Some(&AttrValue::String("uint8".into()))
     );
 }
+
+// ---------------------------------------------------------------------------
+// Every arm shape, every integer class
+// ---------------------------------------------------------------------------
+
+/// A complex value reaches the writer through one of five distinct arms —
+/// scalar, 1-D vector, 2-D matrix, a matrix built from equal-length rows, and a
+/// cell element — and each one is a separate dispatch site. The per-class risk
+/// is small because the dispatch is macro-generated from one list, but the
+/// per-*arm* risk is not, so every arm is exercised for every integer class
+/// rather than for `int16` alone. The float classes take the same arms and are
+/// covered by the pre-existing `Complex64`/`Complex32` round trips.
+macro_rules! arm_shapes_for {
+    ($($name:ident: $ty:ident, $class:literal, $size:literal, $signed:literal;)*) => {
+        $(
+            #[test]
+            fn $name() {
+                #[derive(Serialize, Deserialize, Debug, PartialEq)]
+                struct Arms {
+                    scalar: $ty,
+                    vector: Vec<$ty>,
+                    matrix: Matrix<$ty>,
+                    rows: Vec<Vec<$ty>>,
+                    cells: Vec<Matrix<$ty>>,
+                    empty: Matrix<$ty>,
+                }
+
+                // Small non-negative values, so one table serves the signed and
+                // unsigned classes alike; ranges are pinned separately by
+                // `extreme_component_values_survive`.
+                let e = |re: i64, im: i64| $ty::new(re as _, im as _);
+                let v = Arms {
+                    scalar: e(7, 9),
+                    vector: vec![e(1, 2), e(3, 4), e(5, 6)],
+                    matrix: Matrix::from_row_major(
+                        2,
+                        3,
+                        vec![e(1, 1), e(2, 2), e(3, 3), e(4, 4), e(5, 5), e(6, 6)],
+                    ),
+                    rows: vec![vec![e(1, 2), e(3, 4)], vec![e(5, 6), e(7, 8)]],
+                    cells: vec![
+                        Matrix::from_row_major(2, 2, vec![e(1, 1), e(2, 2), e(3, 3), e(4, 4)]),
+                        Matrix::from_row_major(1, 2, vec![e(5, 5), e(6, 6)]),
+                    ],
+                    empty: Matrix::from_row_major(0, 0, Vec::new()),
+                };
+
+                // `to_bytes` and `to_bytes_with_options` are two separate emit
+                // paths with their own copy of every arm — the orientation
+                // defect this PR fixes lived in one and not the other — so
+                // each arm is exercised through both.
+                let written = [
+                    ("to_bytes", mat::to_bytes(&v).unwrap()),
+                    (
+                        "to_bytes_with_options",
+                        mat::to_bytes_with_options(&v, &Options::default()).unwrap(),
+                    ),
+                ];
+
+                for (path, bytes) in written {
+                    let back: Arms = mat::from_bytes(&bytes).unwrap();
+                    assert_eq!(back, v, "{path}");
+
+                    // The round trip alone would accept a compound this crate
+                    // is happy with and MATLAB refuses, so pin the stored
+                    // layout of every arm that writes one directly.
+                    let file = File::from_bytes(bytes).unwrap();
+                    for name in ["scalar", "vector", "matrix", "rows", "empty"] {
+                        let ds = file.dataset(name).unwrap();
+                        assert_compound_of(&ds.datatype().unwrap(), $size, $signed);
+                        assert_eq!(
+                            ds.attrs().unwrap().get("MATLAB_class"),
+                            Some(&AttrValue::String($class.into())),
+                            "{path}: {name} should carry the component class"
+                        );
+                    }
+
+                    // The cell's elements live under `#refs#`, and each is a
+                    // complex matrix — the one arm `push_complex` reaches that
+                    // no other field here exercises.
+                    let refs = file.group("#refs#").unwrap();
+                    let names = refs.datasets().unwrap();
+                    assert_eq!(names.len(), 2, "{path}: one dataset per cell element");
+                    for name in names {
+                        let ds = refs.dataset(&name).unwrap();
+                        assert_compound_of(&ds.datatype().unwrap(), $size, $signed);
+                        assert_eq!(
+                            ds.attrs().unwrap().get("MATLAB_class"),
+                            Some(&AttrValue::String($class.into())),
+                            "{path}: cell element"
+                        );
+                    }
+                }
+            }
+        )*
+    };
+}
+
+arm_shapes_for! {
+    every_arm_shape_survives_for_int8: ComplexI8, "int8", 1, true;
+    every_arm_shape_survives_for_int16: ComplexI16, "int16", 2, true;
+    every_arm_shape_survives_for_int32: ComplexI32, "int32", 4, true;
+    every_arm_shape_survives_for_int64: ComplexI64, "int64", 8, true;
+    every_arm_shape_survives_for_uint8: ComplexU8, "uint8", 1, false;
+    every_arm_shape_survives_for_uint16: ComplexU16, "uint16", 2, false;
+    every_arm_shape_survives_for_uint32: ComplexU32, "uint32", 4, false;
+    every_arm_shape_survives_for_uint64: ComplexU64, "uint64", 8, false;
+}
+
+// ---------------------------------------------------------------------------
+// Promoting a real value to complex
+// ---------------------------------------------------------------------------
+
+/// A real array of the component class reads as complex with a zero imaginary
+/// part — a file written by something that dropped an all-real capture's
+/// `imag` field still loads into a complex target. This generalized from the
+/// two float classes to all ten, so it is checked at a class that did not
+/// exist on the old path.
+#[test]
+fn a_real_scalar_of_the_same_class_reads_as_complex_with_zero_imag() {
+    #[derive(Serialize)]
+    struct Real {
+        a: i16,
+        b: u64,
+    }
+    #[derive(Deserialize, Debug, PartialEq)]
+    struct Cplx {
+        a: ComplexI16,
+        b: ComplexU64,
+    }
+
+    let bytes = mat::to_bytes(&Real { a: -42, b: 42 }).unwrap();
+    let back: Cplx = mat::from_bytes(&bytes).unwrap();
+    assert_eq!(back.a, ComplexI16::new(-42, 0));
+    assert_eq!(back.b, ComplexU64::new(42, 0));
+}
+
+/// The promotion is class-exact like every other complex read: a real `double`
+/// does not become a complex `int16` just because the imaginary part it is
+/// missing would have been zero.
+#[test]
+fn a_real_scalar_of_another_class_is_not_promoted() {
+    #[derive(Serialize)]
+    struct Real {
+        x: f64,
+    }
+    #[derive(Deserialize, Debug)]
+    struct Cplx {
+        // Never read: the point is that deserializing into it fails.
+        #[allow(dead_code)]
+        x: ComplexI16,
+    }
+
+    let bytes = mat::to_bytes(&Real { x: 42.0 }).unwrap();
+    let err = mat::from_bytes::<Cplx>(&bytes).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("complex int16"),
+        "error should name the class it wanted: {msg}"
+    );
+}
