@@ -12,7 +12,7 @@
 //! Separating it from the engine is what lets one engine drive two very
 //! different backings (issue #198). Historically `File::open_rw` held the whole
 //! file in a `Vec<u8>` mirror and carried the full staged-edit vocabulary,
-//! while `File::open_rw_bounded` held no mirror and could therefore only read
+//! while the bounded read-write open held no mirror and could therefore only read
 //! and append. *That* limitation is a property of where the bytes live, not of
 //! what edits are expressible, so it belongs behind this trait rather than in
 //! two engines.
@@ -237,7 +237,7 @@ pub(crate) fn read_at_handle(
 
 /// A file-backed image that holds no whole-file mirror: reads are positioned I/O
 /// against the handle, served through a bounded metadata cache when one is
-/// configured. This is the backing behind [`File::open_rw_bounded`](crate::File::open_rw_bounded),
+/// configured. This is the backing a bounded read-write open uses,
 /// and the reason [`FileImage`] exists — resident memory is the cache budget
 /// plus whatever the caller is parsing, independent of the file's size.
 ///
@@ -450,7 +450,7 @@ impl FileImage for CountingImage {
 ///
 /// This exists to make the mirrorless read paths reachable before a mirrorless
 /// backing does. Each read the engine serves has two forms — one walking a
-/// borrowed slice, one going through `Source` — and until `File::open_rw_bounded`
+/// borrowed slice, one going through `Source` — and until the bounded read-write open
 /// runs on this engine (issue #198), only the first would ever execute. Opening
 /// a file through this image runs the same tests down the other form and lets
 /// them be compared, which is the only thing that keeps the two from drifting.

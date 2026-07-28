@@ -1,12 +1,25 @@
-//! Bounded-memory read-write backend (`File::open_rw_bounded`, issue #147):
-//! reads, immediate appends, internal batching, cache coherence, and the typed
-//! refusals for everything mirror-only.
+//! Bounded-memory read-write backend (issue #147): reads, immediate appends,
+//! internal batching, cache coherence, and the typed refusals for everything
+//! mirror-only.
 
 use hdf5_pure::{
-    AttrValue, Error, File, FileAccessProperties, FileBuilder, FileSpaceStrategy,
+    AttrValue, Error, File, FileAccessProperties, FileBuilder, FileSpaceStrategy, MemoryStrategy,
     MetadataCacheConfig,
 };
 use tempfile::tempdir;
+
+/// Open with the bounded engine demanded rather than merely preferred.
+///
+/// `File::open_rw` would pick it for most of the files below anyway, but these
+/// tests are *about* the bounded engine: asking for it explicitly means a file
+/// that stops being bounded-editable fails here instead of quietly retargeting
+/// the whole file at the mirror.
+fn open_bounded(path: &std::path::Path) -> Result<File, Error> {
+    File::open_rw_with_options(
+        path,
+        FileAccessProperties::new().with_memory_strategy(MemoryStrategy::Bounded),
+    )
+}
 
 /// Build a rank-1 unlimited chunked i32 dataset `d` seeded with `0..n`, with
 /// optional deflate.
@@ -40,7 +53,7 @@ fn append_and_read_through_one_handle() {
     let p = dir.path().join("a.h5");
     build(&p, 6, 4, false);
     {
-        let file = File::open_rw_bounded(&p).unwrap();
+        let file = open_bounded(&p).unwrap();
         let mut ds = file.dataset("d").unwrap();
         ds.append(&[6i32, 7, 8]).unwrap();
         // The appending handle observes the new length immediately.
@@ -59,7 +72,7 @@ fn many_appends_across_calls_stay_o1() {
     let p = dir.path().join("many.h5");
     build(&p, 0, 8, false);
     {
-        let file = File::open_rw_bounded(&p).unwrap();
+        let file = open_bounded(&p).unwrap();
         let mut ds = file.dataset("d").unwrap();
         let mut next = 0i32;
         for _ in 0..200 {
@@ -77,7 +90,7 @@ fn refetched_handle_observes_appends() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("refetch.h5");
     build(&p, 4, 4, false);
-    let file = File::open_rw_bounded(&p).unwrap();
+    let file = open_bounded(&p).unwrap();
     let mut ds = file.dataset("d").unwrap();
     ds.append(&[4i32, 5, 6, 7]).unwrap();
     let fresh = file.dataset("d").unwrap();
@@ -91,7 +104,7 @@ fn filtered_appends_whole_chunks_only() {
     let p = dir.path().join("filtered.h5");
     build(&p, 8, 4, true);
     {
-        let file = File::open_rw_bounded(&p).unwrap();
+        let file = open_bounded(&p).unwrap();
         let mut ds = file.dataset("d").unwrap();
         // Chunk-aligned filtered append is accepted.
         ds.append(&[8i32, 9, 10, 11]).unwrap();
@@ -117,7 +130,7 @@ fn large_append_batches_internally() {
     // batches + a trailing remainder.
     let total = 655_360i32 + 7;
     {
-        let file = File::open_rw_bounded(&p).unwrap();
+        let file = open_bounded(&p).unwrap();
         let mut ds = file.dataset("d").unwrap();
         let batch: Vec<i32> = (3..total).collect();
         ds.append(&batch).unwrap();
@@ -138,7 +151,7 @@ fn staged_surface_works_on_a_bounded_file() {
     let p = dir.path().join("staged.h5");
     build(&p, 4, 4, false);
     {
-        let file = File::open_rw_bounded(&p).unwrap();
+        let file = open_bounded(&p).unwrap();
         let mut ds = file.dataset("d").unwrap();
         let root = file.root();
 
@@ -210,7 +223,7 @@ fn close_seals_writes_but_not_reads() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("close.h5");
     build(&p, 4, 4, false);
-    let file = File::open_rw_bounded(&p).unwrap();
+    let file = open_bounded(&p).unwrap();
     let mut ds = file.dataset("d").unwrap();
     ds.append(&[4i32]).unwrap();
     file.clone().close().unwrap();
@@ -224,7 +237,7 @@ fn bounded_open_takes_the_exclusive_lock() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("lock.h5");
     build(&p, 4, 4, false);
-    let bounded = File::open_rw_bounded(&p).unwrap();
+    let bounded = open_bounded(&p).unwrap();
     let err = File::open_rw(&p).unwrap_err();
     assert!(matches!(err, Error::FileLocked(_)), "got: {err:?}");
     drop(bounded);
@@ -243,7 +256,7 @@ fn userblock_file_is_refused_at_open() {
         .with_maxshape(&[u64::MAX])
         .with_chunks(&[2]);
     b.write(&p).unwrap();
-    let err = File::open_rw_bounded(&p).unwrap_err();
+    let err = open_bounded(&p).unwrap_err();
     assert!(matches!(err, Error::EditUnsupported(_)), "got: {err:?}");
 }
 
@@ -264,7 +277,7 @@ fn persisted_free_space_file_appends_and_finalizes() {
     b.write(&p).unwrap();
 
     {
-        let file = File::open_rw_bounded(&p).unwrap();
+        let file = open_bounded(&p).unwrap();
         let mut ds = file.dataset("d").unwrap();
         ds.append(&(10..25).collect::<Vec<i32>>()).unwrap();
         file.close().unwrap();
@@ -306,7 +319,7 @@ fn persisted_free_space_many_appends_one_finalize() {
     b.write(&p).unwrap();
 
     {
-        let file = File::open_rw_bounded(&p).unwrap();
+        let file = open_bounded(&p).unwrap();
         let mut ds = file.dataset("d").unwrap();
         for start in (1..200).step_by(20) {
             let end = (start + 20).min(200);
@@ -335,7 +348,7 @@ fn persisted_free_space_drop_finalizes() {
     b.write(&p).unwrap();
 
     {
-        let file = File::open_rw_bounded(&p).unwrap();
+        let file = open_bounded(&p).unwrap();
         let mut ds = file.dataset("d").unwrap();
         ds.append(&(8..16).collect::<Vec<i32>>()).unwrap();
         // Drop without close: the Drop guard runs the finalize best-effort.
@@ -367,7 +380,7 @@ fn persisted_free_space_noop_close_does_not_grow() {
     b.write(&p).unwrap();
     let before = std::fs::metadata(&p).unwrap().len();
 
-    File::open_rw_bounded(&p).unwrap().close().unwrap();
+    open_bounded(&p).unwrap().close().unwrap();
     assert_eq!(
         std::fs::metadata(&p).unwrap().len(),
         before,
@@ -375,7 +388,7 @@ fn persisted_free_space_noop_close_does_not_grow() {
     );
     // Repeated open/close cycles also leave the size fixed.
     for _ in 0..3 {
-        File::open_rw_bounded(&p).unwrap().close().unwrap();
+        open_bounded(&p).unwrap().close().unwrap();
     }
     assert_eq!(std::fs::metadata(&p).unwrap().len(), before);
 }
@@ -398,13 +411,15 @@ fn paged_non_persist_is_refused_at_open() {
         .with_maxshape(&[u64::MAX])
         .with_chunks(&[2]);
     b.write(&p).unwrap();
-    let err = File::open_rw_bounded(&p).unwrap_err();
+    let err = open_bounded(&p).unwrap_err();
     let Error::EditUnsupported(msg) = err else {
         panic!("paged non-persist should be refused with EditUnsupported, got: {err:?}");
     };
     // The guidance must be actionable: a paged file is grown in place only when it
-    // persists its free space, so the message points at recreating with persist=true,
-    // not at File::open_rw (which also refuses a paged file — issue #178).
+    // persists its free space, so the message points at recreating with persist=true
+    // rather than at another entry point. There is none to point at — the mirror
+    // cannot commit such a file either, which is why `MemoryStrategy::Auto` does not
+    // fall back for it.
     assert!(
         msg.contains("persist"),
         "refusal should guide toward persisted free space, got: {msg:?}"
@@ -416,9 +431,10 @@ fn metadata_cache_stays_coherent_across_appends() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("cache.h5");
     build(&p, 4, 4, false);
-    let properties =
-        FileAccessProperties::new().with_metadata_cache(MetadataCacheConfig::new(256 * 1024));
-    let file = File::open_rw_bounded_with_options(&p, properties).unwrap();
+    let properties = FileAccessProperties::new()
+        .with_memory_strategy(MemoryStrategy::Bounded)
+        .with_metadata_cache(MetadataCacheConfig::new(256 * 1024));
+    let file = File::open_rw_with_options(&p, properties).unwrap();
     let mut ds = file.dataset("d").unwrap();
     // Prime the metadata cache with the object-header windows.
     assert_eq!(ds.shape().unwrap(), vec![4]);
@@ -449,7 +465,7 @@ fn reads_match_streaming_capabilities() {
     b.add_group(grp.finish());
     b.write(&p).unwrap();
 
-    let file = File::open_rw_bounded(&p).unwrap();
+    let file = open_bounded(&p).unwrap();
     // Groups, nested paths, and non-append datasets all read.
     assert_eq!(
         file.dataset("grp/nested").unwrap().read_f64().unwrap(),
@@ -474,7 +490,7 @@ fn unaligned_filtered_multi_batch_append_is_refused_atomically() {
     build(&p, 256, 256, true);
     let before = std::fs::read(&p).unwrap();
     {
-        let file = File::open_rw_bounded(&p).unwrap();
+        let file = open_bounded(&p).unwrap();
         let mut ds = file.dataset("d").unwrap();
         // ~2 MiB of i32, one element past chunk alignment.
         let unaligned: Vec<i32> = (0..524_289).collect();
@@ -494,7 +510,7 @@ fn unaligned_filtered_multi_batch_append_is_refused_atomically() {
     // of elements.
     let before = std::fs::read(&p).unwrap();
     {
-        let file = File::open_rw_bounded(&p).unwrap();
+        let file = open_bounded(&p).unwrap();
         let mut ds = file.dataset("d").unwrap();
         let mut bytes = vec![0u8; 2 * 1024 * 1024];
         bytes.push(0); // not a whole i32
@@ -515,7 +531,7 @@ fn chunk_introspection_works_on_bounded_files() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("chunks.h5");
     build(&p, 8, 4, false);
-    let file = File::open_rw_bounded(&p).unwrap();
+    let file = open_bounded(&p).unwrap();
     let mut ds = file.dataset("d").unwrap();
     let chunks = ds.chunks().unwrap();
     assert_eq!(chunks.len(), 2);
@@ -538,7 +554,7 @@ fn a_bounded_commit_truncates_when_the_freed_run_reaches_the_end() {
     build(&p, 4, 4, false);
 
     let (grown, shrunk) = {
-        let file = File::open_rw_bounded(&p).unwrap();
+        let file = open_bounded(&p).unwrap();
         file.root()
             .create_dataset("big", |b| {
                 b.with_i32_data(&(0..2000).collect::<Vec<i32>>())

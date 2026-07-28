@@ -8,7 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- `FileAccessProperties::with_memory_strategy` and `MemoryStrategy` say how much memory a read-write open may spend holding the file. The default, `MemoryStrategy::Bounded`, keeps today's behavior of refusing a file the bounded engine cannot edit rather than silently mirroring it; `MemoryStrategy::Auto` opts in to the mirror fallback, and `File::memory_strategy` reports which one an open resolved to ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
+- `FileAccessProperties::with_memory_strategy` and `MemoryStrategy` say how much memory a read-write open may spend holding the file: `Bounded` refuses a file the bounded engine cannot edit rather than mirroring it, `Auto` falls back to the mirror, and `Mirrored` always mirrors. `File::memory_strategy` reports which one an open resolved to ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
+
+### Changed
+
+- `File::open_rw` now edits a latest-format file with no userblock in **bounded memory** instead of building a whole-file mirror, and falls back to the mirror only for a file the bounded engine cannot edit. Nothing about a file's space strategy decides which open a caller reaches for any more. A large `Dataset::append` is applied in whole-chunk batches on the bounded backing, so a crash mid-call leaves a valid shorter dataset; pass `MemoryStrategy::Mirrored` for the previous unconditional mirror ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
+- `File::open_rw` refuses a paged file without persisted free space at open rather than at commit, since neither backing can edit one ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
+
+### Deprecated
+
+- `File::open_rw_bounded` and `open_rw_bounded_with_options`: `File::open_rw` now picks the bounded engine on its own, so these survive only as the strict `MemoryStrategy::Bounded` default. Pass that strategy to `File::open_rw_with_options` to keep the refusal ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
 
 ## [0.27.0] - 2026-07-27
 

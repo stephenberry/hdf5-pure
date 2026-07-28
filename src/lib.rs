@@ -58,7 +58,9 @@
 //! changes rather than to the file size. It edits files written by this crate,
 //! the reference HDF5 C library, and h5py across all of their on-disk formats,
 //! and refuses — rather than silently degrade the file — anything it cannot
-//! reproduce faithfully.
+//! reproduce faithfully. Memory follows the file rather than the caller's choice
+//! of function: a latest-format file with no userblock is edited without ever
+//! building a whole-file copy of it (see [`MemoryStrategy`]).
 //!
 //! ```rust,no_run
 //! use hdf5_pure::File;

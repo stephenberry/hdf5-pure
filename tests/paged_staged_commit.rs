@@ -1,6 +1,6 @@
 //! Staged edits on genuine paged files through `File::open_rw` (issue #198,
 //! step 1). The whole-file editor used to refuse every paged file and send the
-//! caller to `File::open_rw_bounded`; it now commits a persisting paged file
+//! caller to the bounded engine; it now commits a persisting paged file
 //! through a page-aware tail that keeps the per-page-type managers intact.
 //! A paged file *without* persisted managers is still refused, because nothing
 //! on disk records which pages hold metadata and which hold raw data.

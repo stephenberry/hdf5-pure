@@ -40,7 +40,7 @@ Dataset reads are fully supported across every storage layout:
     - A streaming file cannot be the **source** of a cross-file [`copy_from`](editing.md) — that copy requires a buffered source.
     - Chunk decompression is sequential; the `parallel` feature accelerates only buffered reads.
 
-Streaming opens are read-only. To **append** to a file with the same bounded-memory discipline, open it with [`File::open_rw_bounded`](editing.md#bounded-memory-appends) — the read-write sibling of `open_streaming`, sharing this backend's read capabilities and the `FileAccessProperties` cache budgets below.
+Streaming opens are read-only. To **append** to a file with the same bounded-memory discipline, open it with [`File::open_rw`](editing.md#bounded-memory-appends), which edits a latest-format file bounded — the read-write sibling of `open_streaming`, sharing this backend's read capabilities and the `FileAccessProperties` cache budgets below.
 
 ## Reading a large dataset a window at a time
 

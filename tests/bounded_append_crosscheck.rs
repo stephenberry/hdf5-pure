@@ -3,14 +3,25 @@
 // suite can run under `cross test --target i686-...`.
 #![cfg(not(target_pointer_width = "32"))]
 //! Reference-C-library interop for the bounded read-write backend (issue #147):
-//! files grown through `File::open_rw_bounded` read back byte-correct in the
+//! files grown through the bounded engine read back byte-correct in the
 //! reference C library, both when the C library wrote the original file and
 //! when this crate did (unfiltered any-length and filtered whole-chunk).
 
 use hdf5::Extent;
 use hdf5::file::LibraryVersion;
 use hdf5::plist::file_create::FileSpaceStrategy as CStrategy;
-use hdf5_pure::{File, FileBuilder, FileSpaceStrategy};
+use hdf5_pure::{File, FileAccessProperties, FileBuilder, FileSpaceStrategy, MemoryStrategy};
+
+/// Open with the bounded engine demanded rather than merely preferred: these
+/// tests are about that engine, so a file it stops accepting must fail here
+/// rather than quietly retarget the whole file at the mirror.
+fn open_bounded(path: &std::path::Path) -> Result<File, hdf5_pure::Error> {
+    File::open_rw_with_options(
+        path,
+        FileAccessProperties::new().with_memory_strategy(MemoryStrategy::Bounded),
+    )
+}
+
 use std::sync::{Mutex, MutexGuard};
 use tempfile::tempdir;
 
@@ -93,7 +104,7 @@ fn bounded_append_to_c_dataset_both_read() {
     c_create_unlimited(&path, "d", 8, 4);
 
     {
-        let file = File::open_rw_bounded(&path).unwrap();
+        let file = open_bounded(&path).unwrap();
         let mut ds = file.dataset("d").unwrap();
         ds.append(&[8i32, 9, 10, 11, 12]).unwrap(); // any length (unfiltered)
         ds.append(&[13i32]).unwrap();
@@ -112,7 +123,7 @@ fn bounded_filtered_append_reads_back_in_c() {
     pure_create(&path, 8, 4, true);
 
     {
-        let file = File::open_rw_bounded(&path).unwrap();
+        let file = open_bounded(&path).unwrap();
         let mut ds = file.dataset("d").unwrap();
         ds.append(&[8i32, 9, 10, 11]).unwrap(); // whole chunks only when filtered
         ds.append(&[12i32, 13, 14, 15]).unwrap();
@@ -135,7 +146,7 @@ fn bounded_batched_large_append_reads_back_in_c() {
     // crash-atomic batches.
     let total = 400_000i32;
     {
-        let file = File::open_rw_bounded(&path).unwrap();
+        let file = open_bounded(&path).unwrap();
         let mut ds = file.dataset("d").unwrap();
         ds.append(&(3..total).collect::<Vec<i32>>()).unwrap();
     }
@@ -166,7 +177,7 @@ fn bounded_persist_finalize_reads_back_in_c() {
     b.write(&path).unwrap();
 
     {
-        let file = File::open_rw_bounded(&path).unwrap();
+        let file = open_bounded(&path).unwrap();
         let mut ds = file.dataset("d").unwrap();
         ds.append(&(10..30).collect::<Vec<i32>>()).unwrap();
         file.close().unwrap();
@@ -230,7 +241,7 @@ fn bounded_persist_on_c_created_file_reads_back() {
     }
 
     {
-        let file = File::open_rw_bounded(&path).unwrap();
+        let file = open_bounded(&path).unwrap();
         let mut ds = file.dataset("d").unwrap();
         ds.append(&(8..20).collect::<Vec<i32>>()).unwrap();
         file.close().unwrap();
@@ -281,7 +292,7 @@ fn vlen_strings_read_on_bounded_and_mirror_files() {
     let expected: Vec<String> = words.iter().map(|s| s.to_string()).collect();
 
     {
-        let file = File::open_rw_bounded(&path).unwrap();
+        let file = open_bounded(&path).unwrap();
         let labels = file.dataset("labels").unwrap();
         assert_eq!(labels.read_string().unwrap(), expected);
         // Interleave an append, then read the heap-backed strings again.
@@ -313,7 +324,7 @@ fn bounded_staged_commit_reads_back_in_c() {
     c_create_unlimited(&path, "d", 8, 4);
 
     {
-        let file = File::open_rw_bounded(&path).unwrap();
+        let file = open_bounded(&path).unwrap();
         let mut ds = file.dataset("d").unwrap();
         ds.write(&(100..108).collect::<Vec<i32>>()).unwrap();
         let root = file.root();
