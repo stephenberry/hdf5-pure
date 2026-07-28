@@ -551,6 +551,49 @@ impl MatBuilder {
     /// one is not knowable without compressing it. Refused at write time with
     /// [`MatError::BlockSizeMismatch`] if the producer writes the wrong number of
     /// bytes for a block, and a producer's own error is surfaced verbatim.
+    ///
+    /// # Example
+    ///
+    /// A ramp of one million `f64`, written without ever holding more than a
+    /// block of it. The producer computes its bytes from the block index; a real
+    /// one would read them from a capture buffer or a socket.
+    ///
+    /// ```
+    /// use hdf5_pure::mat::{Blocking, DataProducer, MatBuilder, MatError, Options};
+    ///
+    /// struct Ramp {
+    ///     blocking: Blocking,
+    /// }
+    ///
+    /// impl DataProducer for Ramp {
+    ///     fn block_bytes(&self, index: usize, out: &mut Vec<u8>) -> Result<(), MatError> {
+    ///         // Where this block starts in the dataset's linear element order.
+    ///         let first = index as u64 * self.blocking.block_elements;
+    ///         let count = self.blocking.block_len(index) as u64 / 8;
+    ///         for i in 0..count {
+    ///             out.extend_from_slice(&((first + i) as f64).to_le_bytes());
+    ///         }
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// // `[channels, samples]`: blocks then run forward through time.
+    /// let dims = [4, 250_000];
+    /// let blocking = Blocking::plan::<f64>(&dims).unwrap();
+    ///
+    /// let mut mb = MatBuilder::new(Options::default());
+    /// let reported = mb
+    ///     .write_blocks::<f64>("samples", &dims, Box::new(Ramp { blocking }))
+    ///     .unwrap();
+    ///
+    /// // `plan` predicted exactly what staging chose, so the producer above was
+    /// // built against the right blocking.
+    /// assert_eq!(reported, blocking);
+    /// assert_eq!(blocking.total_len(), 4 * 250_000 * 8);
+    ///
+    /// let mut sink: Vec<u8> = Vec::new();
+    /// mb.finish_to(&mut sink).unwrap();
+    /// ```
     pub fn write_blocks<T: BlockElement>(
         &mut self,
         name: &str,
@@ -963,6 +1006,24 @@ impl MatBuilder {
     /// all-or-nothing should write to a temporary path and rename on success —
     /// which is what [`write`](Self::write) does not do either, for the same
     /// reason.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use hdf5_pure::mat::{MatBuilder, Options};
+    ///
+    /// let build = || {
+    ///     let mut mb = MatBuilder::new(Options::default());
+    ///     mb.write_f64("v", &[1, 3], &[1.0, 2.0, 3.0]).unwrap();
+    ///     mb
+    /// };
+    ///
+    /// let mut streamed: Vec<u8> = Vec::new();
+    /// build().finish_to(&mut streamed).unwrap();
+    ///
+    /// assert_eq!(build().finish().unwrap(), streamed);
+    /// assert_eq!(&streamed[..6], b"MATLAB", "userblock leads the file");
+    /// ```
     pub fn finish_to<W: std::io::Write>(mut self, w: W) -> Result<(), MatError> {
         self.finalize("finish_to")?;
         let stash = Arc::clone(&self.producer_error);

@@ -229,6 +229,19 @@ Two constraints are worth knowing before designing around this.
 
 A producer that fails partway leaves a partial file on the sink. With a non-seekable sink there is nothing to roll back, so write to a temporary path and rename on success if you need all-or-nothing.
 
+### Errors
+
+| Condition | Error | When |
+|---|---|---|
+| Builder configured for deflate | `MatError::CompressionUnsupportedForBlocks` | At `write_blocks`, before anything is staged |
+| Producer wrote the wrong number of bytes | `MatError::BlockSizeMismatch { block, expected, actual }` | During the write |
+| Producer returned an error | that error, verbatim | During the write |
+
+A wrong block length is refused rather than written, because a short or long block shifts every address after it and the result would be a file that fails to open for reasons that no longer point back at the producer.
+
+!!! tip
+    The `mat_streaming` example is a complete working version of the above — an acquisition producer, a streamed write, a read-back, and a check that the bytes match the same content written the ordinary way. Run it with `cargo run --example mat_streaming` (no features needed: `MatBuilder` is not behind `serde`).
+
 ## Hand-built files (low-level conventions)
 
 If you are not using serde, you can apply the MATLAB conventions yourself on top of `FileBuilder`. Two pieces matter: the userblock header and the `MATLAB_class` / `MATLAB_fields` attributes.

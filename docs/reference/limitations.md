@@ -29,6 +29,12 @@ These guard against files outside the format-version range `hdf5-pure` models; t
 | A filter whose backend is not compiled in | `FormatError::UnsupportedFilter` | Enable the `deflate` (or `zfp`) Cargo feature — see [Cargo Features](features.md) |
 | ZFP outside fixed-rate, ranks 1–4, dtypes `f32`/`f64`/`i32`/`i64` | `FormatError::UnsupportedZfp` | The supported scope of the bundled ZFP codec — see [Compression](../guide/compression.md) |
 
+### Producer-backed datasets
+
+A dataset staged with [`MatBuilder::write_blocks`](../interop/matlab.md#writing-more-data-than-fits-in-memory) is always stored **uncompressed**, and requesting one on a builder configured for deflate is refused with `MatError::CompressionUnsupportedForBlocks` rather than silently stored unfiltered. The writer places every object before it emits a byte, so it needs the data region's exact size up front: unfiltered that is pure geometry, compressed it is not knowable without compressing — which would buffer the data the path exists to avoid. Supporting it would need either a two-pass producer contract (compress to measure, then compress again to emit, requiring the producer to be deterministic) or a spill file, so it is a separate design rather than a gap here.
+
+Relatedly, a producer that fails partway leaves a **partial file** on the sink. That is inherent to a non-seekable destination, not a defect: write to a temporary path and rename on success if you need all-or-nothing.
+
 ### Repack faithfulness
 
 `repack` rewrites a file and refuses **lossy filter re-encoding** (lossy float scale-offset, ZFP) rather than silently altering data: only *lossless* integer scale-offset with an undefined fill value can be re-encoded faithfully, since re-compressing lossy data would change the values. (Repack instead copies already-compressed chunks **verbatim** wherever it can, which preserves lossy filters byte-exact without re-encoding.)

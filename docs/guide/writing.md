@@ -142,6 +142,7 @@ When the file is fully assembled, choose how to materialize it:
 |---|---|---|
 | `finish()` | `Result<Vec<u8>, Error>` | You want the file image in memory (WASM-friendly, no filesystem) |
 | `write(path)` | `Result<(), Error>` | You want the file written to disk |
+| `finish_to(w)` | `Result<(), Error>` | You want the file on an arbitrary `io::Write` — a socket, a pipe, a compressing wrapper |
 
 ```rust
 use hdf5_pure::FileBuilder;
@@ -157,6 +158,8 @@ let bytes: Vec<u8> = builder.finish().unwrap();
 ```
 
 The in-memory `Vec<u8>` is exactly the bytes that `write` would put on disk, so it round-trips through `File::from_bytes`. This is what makes writing usable in environments without a filesystem.
+
+All three produce the same file. `finish` is the only one that holds it: `write` and `finish_to` assemble it front-to-back onto their destination, never seeking, so peak memory does not include the output. `write` is `finish_to` onto a `File`. See [writing without buffering](streaming.md#writing-without-buffering) for what that makes possible.
 
 !!! note
     `FileBuilder` is part of the high-level API gated behind the `std` feature (enabled by default), so both `finish` and `write` require `std`. The difference is the filesystem: `finish` returns the file image in memory and never touches disk, while `write` writes those same bytes to a path.

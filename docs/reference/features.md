@@ -41,10 +41,13 @@ Enables Deflate (zlib) compression and decompression through a pure-Rust backend
 
 ### `serde`
 
-Adds serde-based (de)serialization of MATLAB v7.3 `.mat` files through the `hdf5_pure::mat` module (`mat::to_file`, `mat::from_file`, `Matrix`, `Complex32`, `Complex64`). It pulls in the `serde` dependency and implies `std`. See [MATLAB v7.3 interop](../interop/matlab.md).
+Adds serde-based (de)serialization of MATLAB v7.3 `.mat` files through the `hdf5_pure::mat` module (`mat::to_file`, `mat::to_writer`, `mat::from_file`, `Matrix`, `Complex32`, `Complex64`). It pulls in the `serde` dependency and implies `std`. See [MATLAB v7.3 interop](../interop/matlab.md).
+
+!!! note
+    Only the serde-driven entry points are gated. The mid-level `mat::MatBuilder` — including `write_blocks`, `finish_to`, and `write` — needs `std` but not `serde`, so a writer that builds its `.mat` explicitly rather than through `Serialize` does not pay for the dependency.
 
 !!! tip
-    The `matlab_fixtures` example requires this feature and can be run with `cargo run --example matlab_fixtures --features serde`.
+    The `matlab_fixtures` example requires this feature and can be run with `cargo run --example matlab_fixtures --features serde`. The `mat_streaming` example needs only the defaults: `cargo run --example mat_streaming`.
 
 ### `fast-deflate`
 

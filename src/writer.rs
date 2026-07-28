@@ -108,6 +108,23 @@ impl FileBuilder {
     /// Because the userblock leads the file in address order, this is what lets a
     /// wrapper format's header — MATLAB v7.3's, for instance — be produced by the
     /// non-seekable [`finish_to`](Self::finish_to) with no second pass.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use hdf5_pure::FileBuilder;
+    ///
+    /// let mut builder = FileBuilder::new();
+    /// builder.with_userblock(512);
+    /// builder.with_userblock_content(b"my wrapper format's header");
+    /// builder.create_dataset("x").with_f64_data(&[1.0, 2.0]);
+    ///
+    /// let bytes = builder.finish().unwrap();
+    /// assert_eq!(&bytes[..26], b"my wrapper format's header");
+    /// // The rest of the region is zero-filled, and the HDF5 signature follows it.
+    /// assert!(bytes[26..512].iter().all(|&b| b == 0));
+    /// assert_eq!(&bytes[512..516], b"\x89HDF");
+    /// ```
     pub fn with_userblock_content(&mut self, content: &[u8]) -> &mut Self {
         self.writer.with_userblock_content(content);
         self
@@ -172,8 +189,32 @@ impl FileBuilder {
     /// dataset staged for verbatim chunk *streaming* (repack's out-of-core path)
     /// has its chunks pulled from the source and written one at a time, so peak
     /// memory stays bounded by a single chunk plus the file metadata rather than
-    /// the whole dataset. The sink is written front-to-back, so it need not be
-    /// seekable.
+    /// the whole dataset.
+    ///
+    /// The sink is written front-to-back and never seeked, so it can be a socket
+    /// or a pipe as readily as a file. That is possible because the writer
+    /// computes every object's address before it emits a byte, rather than
+    /// seeking back to patch addresses the way a backpatching writer would.
+    ///
+    /// A failure partway leaves whatever was already written on the sink. With a
+    /// non-seekable sink there is nothing to roll back, so a caller needing
+    /// all-or-nothing should write to a temporary path and rename on success.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use hdf5_pure::FileBuilder;
+    ///
+    /// let build = || {
+    ///     let mut b = FileBuilder::new();
+    ///     b.create_dataset("x").with_f64_data(&[1.0, 2.0, 3.0]);
+    ///     b
+    /// };
+    ///
+    /// let mut streamed: Vec<u8> = Vec::new();
+    /// build().finish_to(&mut streamed).unwrap();
+    /// assert_eq!(build().finish().unwrap(), streamed);
+    /// ```
     pub fn finish_to<W: Write>(self, w: W) -> Result<(), Error> {
         let mut sink = WriteSink::new(std::io::BufWriter::new(w));
         if let Err(fe) = self.writer.finish_to_sink(&mut sink) {

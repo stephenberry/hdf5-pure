@@ -1,6 +1,6 @@
 # Streaming Large Files
 
-This page covers reading HDF5 files that are too large to buffer in memory. `File::open` loads the whole file into RAM; `File::open_streaming` fetches metadata and dataset chunks from disk on demand, so peak memory tracks the data you actually read rather than the size of the file.
+This page covers working with HDF5 files that are too large to buffer in memory, in both directions. Reading comes first: `File::open` loads the whole file into RAM, while `File::open_streaming` fetches metadata and dataset chunks from disk on demand, so peak memory tracks the data you actually read rather than the size of the file. [Writing without buffering](#writing-without-buffering) covers the other direction.
 
 ## Why stream
 
@@ -125,8 +125,52 @@ assert!(stats.cached_chunks() > 0);
 
 The counts are a point-in-time view and change as further reads populate or evict chunks. A disabled cache, or one over its byte or slot budget, reports fewer or no retained chunks.
 
+## Writing without buffering
+
+`FileBuilder::finish()` returns the assembled file, so writing an N-byte file costs N bytes of output on top of whatever the data already cost. `FileBuilder::finish_to(w)` writes the same bytes onto any `io::Write` instead, and `FileBuilder::write(path)` is `finish_to` onto a file.
+
+```rust
+use hdf5_pure::FileBuilder;
+
+let mut builder = FileBuilder::new();
+builder.create_dataset("x").with_f64_data(&[1.0, 2.0, 3.0]);
+
+let mut sink: Vec<u8> = Vec::new();
+builder.finish_to(&mut sink).unwrap();
+```
+
+This works because the writer computes every object's address — object headers, data blocks, indexes — *before* it emits a byte, then writes the file in ascending-address order. It never seeks back to patch an address, which is what a backpatching writer would have to do. So the destination can be anything that accepts bytes forward-only: a socket, a pipe, a compressing wrapper, a hash. `finish` is implemented as `finish_to` against a `Vec<u8>`, so the two are byte-identical by construction rather than by agreement.
+
+!!! warning
+    A failure partway through leaves whatever was already written on the sink. With a non-seekable destination there is nothing to roll back, so if you need all-or-nothing, write to a temporary path and rename on success.
+
+### Userblock content
+
+A file with a userblock needs its header bytes to be part of what the writer emits, since a streaming write has nothing left to patch by the time it returns. `with_userblock_content` supplies them up front:
+
+```rust
+use hdf5_pure::FileBuilder;
+
+let mut builder = FileBuilder::new();
+builder.with_userblock(512);
+builder.with_userblock_content(b"my wrapper format's header");
+builder.create_dataset("x").with_f64_data(&[1.0]);
+builder.write("wrapped.h5").unwrap();
+```
+
+The rest of the region stays zero-filled, and content longer than the userblock is refused with `FormatError::UserblockContentTooLarge` rather than allowed to displace the superblock. This is how the MATLAB v7.3 writer emits its 512-byte header (see [MATLAB interop](../interop/matlab.md#userblock-header)).
+
+### Datasets that never become resident
+
+`finish_to` removes the assembled file from peak memory, but not the data: `with_f64_data(&values)` still copies the slice into the builder. Two paths avoid that too.
+
+**Repacking** an existing file streams each chunk from the source to the destination, verbatim and one at a time, without decoding or re-encoding it. See [Repacking](repack.md).
+
+**Producing** a dataset's bytes at write time is available on the MATLAB writer as `MatBuilder::write_blocks`, which takes a `DataProducer` the writer calls once per block during emission. Layout works from the shape alone, so the producer is never called before the write begins. Paired with `MatBuilder::finish_to`, a `.mat` of any size is written in about one block of memory. See [writing more data than fits in memory](../interop/matlab.md#writing-more-data-than-fits-in-memory) for the full API, including why it is uncompressed-only and which array shape an acquisition should ask for.
+
 ## Related topics
 
 - [Reading datasets](reading.md) for the dataset read API that is shared between in-memory and streaming opens.
+- [Writing files](writing.md) for the `FileBuilder` workflow these output paths finish.
 - [Variable-length strings](vlen-strings.md) for reading string datasets.
 - [Features](../reference/features.md) for the `std` feature requirement.
