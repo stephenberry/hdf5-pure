@@ -62,7 +62,7 @@ use crate::mat::string_object::{
     MATLAB_CLASS_STRING, MATLAB_OBJECT_DECODE_OPAQUE, MATLAB_STRING_SAVEOBJ_VERSION,
     MCOS_MAGIC_NUMBER,
 };
-use crate::mat::value::{MatValue, NumVec, ScalarNum};
+use crate::mat::value::{ComplexNum, ComplexVec, MatValue, NumVec, ScalarNum};
 use crate::reader::{Dataset, File, Object};
 use crate::types::DType;
 
@@ -1073,15 +1073,24 @@ fn numeric_f64_vec(value: MatValue, what: &str) -> Result<Vec<f64>, MatError> {
 /// Flatten a complex (or real) numeric property into `(re, im)` pairs.
 fn complex_pairs(value: MatValue, what: &str) -> Result<Vec<(f64, f64)>, MatError> {
     Ok(match value {
-        MatValue::ComplexScalar64 { re, im } => vec![(re, im)],
-        MatValue::ComplexScalar32 { re, im } => vec![(f64::from(re), f64::from(im))],
-        MatValue::ComplexVec64(pairs) => pairs,
-        MatValue::ComplexVec32(pairs) => pairs
-            .into_iter()
-            .map(|(r, i)| (f64::from(r), f64::from(i)))
-            .collect(),
-        MatValue::ComplexMatrix64 { pairs, .. } => pairs,
-        MatValue::ComplexMatrix32 { pairs, .. } => pairs
+        // Float components only: MATLAB stores these properties as `double`,
+        // and `single` widens to it losslessly. An integer-component complex
+        // property is not one of these classes and falls through to the error
+        // below rather than being converted into one.
+        MatValue::ComplexScalar(ComplexNum::F64(re, im)) => vec![(re, im)],
+        MatValue::ComplexScalar(ComplexNum::F32(re, im)) => {
+            vec![(f64::from(re), f64::from(im))]
+        }
+        MatValue::ComplexVec1D(ComplexVec::F64(pairs))
+        | MatValue::ComplexMatrix {
+            pairs: ComplexVec::F64(pairs),
+            ..
+        } => pairs,
+        MatValue::ComplexVec1D(ComplexVec::F32(pairs))
+        | MatValue::ComplexMatrix {
+            pairs: ComplexVec::F32(pairs),
+            ..
+        } => pairs
             .into_iter()
             .map(|(r, i)| (f64::from(r), f64::from(i)))
             .collect(),

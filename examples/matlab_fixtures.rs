@@ -14,7 +14,7 @@
 //! % Then run the commands printed by the example.
 //! ```
 
-use hdf5_pure::mat::{self, Complex32, Complex64, Matrix};
+use hdf5_pure::mat::{self, Complex32, Complex64, ComplexI16, Matrix};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -306,6 +306,9 @@ fn write_options(dir: &Path) {
 struct ComplexData {
     z: Complex64,
     signal: Vec<Complex64>,
+    /// A complex integer array: MATLAB reads the component class off
+    /// `MATLAB_class`, so this must arrive as `int16` and not as a double.
+    samples_i16: Vec<ComplexI16>,
 }
 
 fn write_complex(dir: &Path) {
@@ -315,6 +318,9 @@ fn write_complex(dir: &Path) {
             "assert(iscomplex(z), 'z is complex')",
             "assert(z == complex(1.0, -2.0), 'z value')",
             "assert(isequal(signal, [complex(1,0); complex(0,1); complex(-1,0); complex(0,-1)]), 'signal')",
+            "assert(isa(samples_i16, 'int16'), 'samples_i16 class')",
+            "assert(iscomplex(samples_i16), 'samples_i16 is complex')",
+            "assert(isequal(samples_i16, [complex(int16(-32768), int16(32767)); complex(int16(0), int16(-1)); complex(int16(1234), int16(-4321))]), 'samples_i16 values')",
             "disp('complex.mat OK')",
         ],
     );
@@ -325,6 +331,11 @@ fn write_complex(dir: &Path) {
             Complex64::new(0.0, 1.0),
             Complex64::new(-1.0, 0.0),
             Complex64::new(0.0, -1.0),
+        ],
+        samples_i16: vec![
+            ComplexI16::new(i16::MIN, i16::MAX),
+            ComplexI16::new(0, -1),
+            ComplexI16::new(1234, -4321),
         ],
     };
     mat::to_file(&v, dir.join("complex.mat")).unwrap();

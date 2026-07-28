@@ -12,26 +12,24 @@
 //! `Vec<Vec<T>>` is also recognized by the serializer as a 2-D matrix
 //! (checked for ragged rows). Use `Matrix` when you want an unambiguous API.
 //!
-//! # Why three sentinel constants
+//! # Why a sentinel per complex element class
 //!
-//! `MATRIX_SENTINEL`, `MATRIX_COMPLEX64_SENTINEL`, and
-//! `MATRIX_COMPLEX32_SENTINEL` are not redundant. The element class for a
-//! non-empty `Matrix<T>` can always be recovered from the serialized data
-//! (the inner `Vec<T>` carries enough type information through the seq
-//! unification path), so a single sentinel would suffice for the common
-//! case.
+//! `MATRIX_SENTINEL` and the per-class complex sentinels are not redundant.
+//! The element class for a non-empty `Matrix<T>` can always be recovered from
+//! the serialized data (the inner `Vec<T>` carries enough type information
+//! through the seq unification path), so a single sentinel would suffice for
+//! the common case.
 //!
 //! Empty matrices break that. A 0×0 / 0×N / N×0 `Matrix<Complex64>`
 //! produces a `Vec<Complex64>` of length zero; the seq unification observes
 //! no elements, defaults to an `f64`-empty `NumVec`, and the serializer
-//! would emit a numeric (non-complex) HDF5 dataset. The dedicated
-//! `Matrix<Complex64>` / `Matrix<Complex32>` sentinels carry the element
-//! class through the empty path so the on-disk dataset is the correct
-//! compound `{real, imag}` shape. The corresponding sealed
-//! [`MatElement`] trait makes the sentinel choice a compile-time property
-//! of `T`; missing dispatch surfaces as a compile error rather than a
-//! silent class loss. Do not collapse the three sentinels into one without
-//! re-solving the empty-shape problem.
+//! would emit a numeric (non-complex) HDF5 dataset. A dedicated sentinel per
+//! complex element type carries the class through the empty path so the
+//! on-disk dataset is the correct compound `{real, imag}` shape *of the right
+//! component width*. The corresponding sealed [`MatElement`] trait makes the
+//! sentinel choice a compile-time property of `T`; missing dispatch surfaces
+//! as a compile error rather than a silent class loss. Do not collapse the
+//! complex sentinels into one without re-solving the empty-shape problem.
 
 use core::fmt;
 
@@ -39,20 +37,54 @@ use serde::de::{self, MapAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::mat::complex::{Complex32, Complex64};
+use crate::mat::complex::{
+    Complex32, Complex64, ComplexI8, ComplexI16, ComplexI32, ComplexI64, ComplexU8, ComplexU16,
+    ComplexU32, ComplexU64,
+};
+use crate::mat::value::ComplexTag;
 
 /// Sentinel struct name recognized by the MAT serializer/deserializer for a
 /// numeric `Matrix<T>` whose element class is carried by the serialized data.
 pub(crate) const MATRIX_SENTINEL: &str = "__hdf5_pure_mat_Matrix__";
 
-/// Sentinel for `Matrix<Complex64>`. Distinct from `MATRIX_SENTINEL` so an
-/// empty 0×0 / 0×N / N×0 matrix still writes as a complex (compound)
-/// dataset on disk: with no elements, the inner `Vec<Complex64>` would
-/// otherwise collapse to a default `f64`-empty NumVec and lose the class.
-pub(crate) const MATRIX_COMPLEX64_SENTINEL: &str = "__hdf5_pure_mat_MatrixComplex64__";
+/// The complex `Matrix<T>` sentinels and the element-class lookup that reads
+/// them back, from one list.
+macro_rules! matrix_complex_sentinels {
+    ($($konst:ident => $elem:ty, $tag:ident, $suffix:literal),* $(,)?) => {
+        $(
+            #[doc = concat!(
+                "Sentinel for `Matrix<", stringify!($elem),
+                ">`. Distinct from `MATRIX_SENTINEL` so an empty 0×0 / 0×N / \
+                 N×0 matrix still writes as a complex (compound) dataset of \
+                 this component class."
+            )]
+            pub(crate) const $konst: &str =
+                concat!("__hdf5_pure_mat_MatrixComplex", $suffix, "__");
+        )*
 
-/// Sentinel for `Matrix<Complex32>`. See [`MATRIX_COMPLEX64_SENTINEL`].
-pub(crate) const MATRIX_COMPLEX32_SENTINEL: &str = "__hdf5_pure_mat_MatrixComplex32__";
+        /// The complex element class a `Matrix<T>` sentinel names, or `None`
+        /// for the plain numeric sentinel and any other struct name.
+        pub(crate) fn complex_tag_for_matrix_sentinel(name: &str) -> Option<ComplexTag> {
+            match name {
+                $($konst => Some(ComplexTag::$tag),)*
+                _ => None,
+            }
+        }
+    };
+}
+
+matrix_complex_sentinels! {
+    MATRIX_COMPLEX64_SENTINEL => Complex64, F64, "64",
+    MATRIX_COMPLEX32_SENTINEL => Complex32, F32, "32",
+    MATRIX_COMPLEX_I64_SENTINEL => ComplexI64, I64, "I64",
+    MATRIX_COMPLEX_I32_SENTINEL => ComplexI32, I32, "I32",
+    MATRIX_COMPLEX_I16_SENTINEL => ComplexI16, I16, "I16",
+    MATRIX_COMPLEX_I8_SENTINEL => ComplexI8, I8, "I8",
+    MATRIX_COMPLEX_U64_SENTINEL => ComplexU64, U64, "U64",
+    MATRIX_COMPLEX_U32_SENTINEL => ComplexU32, U32, "U32",
+    MATRIX_COMPLEX_U16_SENTINEL => ComplexU16, U16, "U16",
+    MATRIX_COMPLEX_U8_SENTINEL => ComplexU8, U8, "U8",
+}
 
 mod sealed {
     pub trait Sealed {}
@@ -107,6 +139,14 @@ impl_mat_element! {
     bool => MATRIX_SENTINEL,
     Complex64 => MATRIX_COMPLEX64_SENTINEL,
     Complex32 => MATRIX_COMPLEX32_SENTINEL,
+    ComplexI64 => MATRIX_COMPLEX_I64_SENTINEL,
+    ComplexI32 => MATRIX_COMPLEX_I32_SENTINEL,
+    ComplexI16 => MATRIX_COMPLEX_I16_SENTINEL,
+    ComplexI8 => MATRIX_COMPLEX_I8_SENTINEL,
+    ComplexU64 => MATRIX_COMPLEX_U64_SENTINEL,
+    ComplexU32 => MATRIX_COMPLEX_U32_SENTINEL,
+    ComplexU16 => MATRIX_COMPLEX_U16_SENTINEL,
+    ComplexU8 => MATRIX_COMPLEX_U8_SENTINEL,
 }
 
 /// A dense 2-D matrix stored in row-major order (Rust convention).

@@ -7,7 +7,7 @@
 //! files we produce are valid HDF5 and follow MATLAB conventions that other
 //! tools (scipy, MATLAB itself) should also accept.
 
-use hdf5_pure::mat::{self, Complex64, Matrix};
+use hdf5_pure::mat::{self, Complex64, ComplexI16, Matrix};
 use serde::{Deserialize, Serialize};
 use tempfile::tempdir;
 
@@ -167,6 +167,56 @@ fn c_library_reads_complex_as_compound() {
         .read_scalar::<hdf5::types::FixedAscii<32>>()
         .unwrap();
     assert_eq!(cls.as_str(), "double");
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+struct Capture {
+    samples: Vec<ComplexI16>,
+}
+
+/// The C library resolves the compound and its component class independently
+/// of anything this crate believes, so it is the check that the `int16`
+/// complex layout is the one MATLAB will see: two 2-byte signed members at
+/// offsets 0 and 2, and four bytes per sample rather than eight.
+#[test]
+fn c_library_reads_complex_int16_as_a_four_byte_compound() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("capture.mat");
+
+    let c = Capture {
+        samples: vec![
+            ComplexI16::new(i16::MIN, i16::MAX),
+            ComplexI16::new(0, -1),
+            ComplexI16::new(1234, -4321),
+        ],
+    };
+    mat::to_file(&c, &path).unwrap();
+
+    let file = hdf5::File::open(&path).unwrap();
+    let ds = file.dataset("samples").unwrap();
+    assert_eq!(ds.shape(), vec![1, 3]);
+
+    #[repr(C)]
+    #[derive(hdf5::H5Type, Clone, Copy, Debug)]
+    struct Pair {
+        real: i16,
+        imag: i16,
+    }
+    assert_eq!(ds.dtype().unwrap().size(), 4);
+    assert_eq!(ds.storage_size(), 4 * 3);
+
+    let pairs: Vec<Pair> = ds.read_raw().unwrap();
+    assert_eq!(pairs.len(), 3);
+    assert_eq!((pairs[0].real, pairs[0].imag), (i16::MIN, i16::MAX));
+    assert_eq!((pairs[1].real, pairs[1].imag), (0, -1));
+    assert_eq!((pairs[2].real, pairs[2].imag), (1234, -4321));
+
+    // The class names the component, not anything complex-specific.
+    let class_attr = ds.attr("MATLAB_class").unwrap();
+    let cls = class_attr
+        .read_scalar::<hdf5::types::FixedAscii<32>>()
+        .unwrap();
+    assert_eq!(cls.as_str(), "int16");
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]

@@ -241,6 +241,75 @@ impl Default for CompoundTypeBuilder {
     }
 }
 
+mod complex_component {
+    pub trait Sealed {}
+}
+
+/// A scalar type that can be the component of a complex `{real, imag}` dataset.
+///
+/// A complex array is a two-field compound of one numeric class, so the only
+/// things the layout depends on are the component's datatype and its
+/// little-endian encoding — which is exactly what this trait supplies, and why
+/// [`DatasetBuilder::with_complex_data`] needs nothing per width beyond a new
+/// impl here.
+///
+/// Sealed: the impls below cover every class the crate can store, and a
+/// component type outside that set could only produce a malformed file.
+pub(crate) trait ComplexComponent: complex_component::Sealed + Copy {
+    /// The datatype of one component, identical to what the type's
+    /// `with_*_data` writer emits for a real dataset of the same class.
+    fn datatype() -> Datatype;
+
+    /// Append `self` to `out` in little-endian byte order.
+    fn encode_le(self, out: &mut Vec<u8>);
+
+    /// Decode one component from exactly `size_of::<Self>()` little-endian
+    /// bytes. Callers slice the element out of the raw buffer first, so a
+    /// wrong length is a bug here rather than bad input.
+    ///
+    /// Gated to match its only caller: the MAT reader is `serde`-only, while
+    /// the writer half of this trait compiles unconditionally.
+    #[cfg(feature = "serde")]
+    fn decode_le(bytes: &[u8]) -> Self;
+}
+
+macro_rules! impl_complex_component {
+    ($($ty:ty => $make:ident),* $(,)?) => {
+        $(
+            impl complex_component::Sealed for $ty {}
+            impl ComplexComponent for $ty {
+                fn datatype() -> Datatype {
+                    $make()
+                }
+                fn encode_le(self, out: &mut Vec<u8>) {
+                    out.extend_from_slice(&self.to_le_bytes());
+                }
+                #[cfg(feature = "serde")]
+                fn decode_le(bytes: &[u8]) -> Self {
+                    Self::from_le_bytes(
+                        bytes
+                            .try_into()
+                            .expect("caller slices exactly one component"),
+                    )
+                }
+            }
+        )*
+    };
+}
+
+impl_complex_component! {
+    f64 => make_f64_type,
+    f32 => make_f32_type,
+    i64 => make_i64_type,
+    i32 => make_i32_type,
+    i16 => make_i16_type,
+    i8 => make_i8_type,
+    u64 => make_u64_type,
+    u32 => make_u32_type,
+    u16 => make_u16_type,
+    u8 => make_u8_type,
+}
+
 /// Builder for an HDF5 compound datatype with explicit field offsets and size.
 ///
 /// This is the pure-Rust equivalent of creating an `H5T_COMPOUND` type and
@@ -1379,28 +1448,27 @@ impl DatasetBuilder {
 
     /// Write a complex32 (f32 real/imag pair) dataset.
     pub fn with_complex32_data(&mut self, data: &[(f32, f32)]) -> &mut Self {
-        let ct = CompoundTypeBuilder::new()
-            .f32_field("real")
-            .f32_field("imag")
-            .build();
-        let mut raw = Vec::with_capacity(data.len() * 8);
-        for &(r, i) in data {
-            raw.extend_from_slice(&r.to_le_bytes());
-            raw.extend_from_slice(&i.to_le_bytes());
-        }
-        self.with_compound_data(ct, raw, data.len() as u64)
+        self.with_complex_data(data)
     }
 
     /// Write a complex64 (f64 real/imag pair) dataset.
     pub fn with_complex64_data(&mut self, data: &[(f64, f64)]) -> &mut Self {
+        self.with_complex_data(data)
+    }
+
+    /// Write a complex dataset of any component width: a two-field `{real,
+    /// imag}` compound with `real` at offset 0 and `imag` at
+    /// `size_of::<T>()`, which is the layout MATLAB v7.3 uses for a complex
+    /// array of the component's class.
+    pub(crate) fn with_complex_data<T: ComplexComponent>(&mut self, data: &[(T, T)]) -> &mut Self {
         let ct = CompoundTypeBuilder::new()
-            .f64_field("real")
-            .f64_field("imag")
+            .field("real", T::datatype())
+            .field("imag", T::datatype())
             .build();
-        let mut raw = Vec::with_capacity(data.len() * 16);
-        for &(r, i) in data {
-            raw.extend_from_slice(&r.to_le_bytes());
-            raw.extend_from_slice(&i.to_le_bytes());
+        let mut raw = Vec::with_capacity(data.len() * 2 * size_of::<T>());
+        for &(re, im) in data {
+            re.encode_le(&mut raw);
+            im.encode_le(&mut raw);
         }
         self.with_compound_data(ct, raw, data.len() as u64)
     }

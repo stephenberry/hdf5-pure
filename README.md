@@ -532,9 +532,9 @@ becomes a MATLAB variable. Mapping:
 | `f64`, `f32`, `i*`, `u*` | scalar dataset `[1,1]`, `MATLAB_class = "double"` / `"single"` / `"int*"` / `"uint*"` |
 | `bool` | `uint8` scalar, `MATLAB_class = "logical"` |
 | `String` / `&str` | `uint16` `[1, N]` UTF-16LE, `MATLAB_class = "char"` |
-| `Vec<T>` of numeric `T` | `[1, N]` row vector |
+| `Vec<T>` of numeric `T` | MATLAB `[N, 1]` column vector (HDF5 shape `[1, N]`); `OneDimensionalMode::RowVector` makes it a MATLAB `[1, N]` row |
 | `Matrix<T>` or `Vec<Vec<T>>` of same length | column-major 2-D dataset, HDF5 shape `[cols, rows]` |
-| `Complex32` / `Complex64` | compound `{real, imag}` dataset |
+| `Complex64` / `Complex32` / `ComplexI16` / … | compound `{real, imag}` dataset, `MATLAB_class` = the *component* class |
 | nested struct | HDF5 group with `MATLAB_class = "struct"`, `MATLAB_fields` |
 | `Option<T>` (struct field) | omitted if `None` |
 | unit enum variant | UTF-16 char dataset holding the variant name |

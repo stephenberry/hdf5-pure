@@ -41,7 +41,7 @@ use crate::mat::options::{Compression, EmptyMarkerEncoding, InvalidNamePolicy, O
 use crate::mat::string_object;
 use crate::mat::userblock::{self, USERBLOCK_SIZE};
 use crate::mat::utf16;
-use crate::type_builders::{DatasetBuilder, GroupBuilder};
+use crate::type_builders::{ComplexComponent, DatasetBuilder, GroupBuilder};
 use crate::writer::FileBuilder;
 
 const REFS_GROUP: &str = "#refs#";
@@ -477,51 +477,29 @@ impl MatBuilder {
         Ok(self)
     }
 
-    /// Write a complex `f64` array.
+    /// Write a complex array of the given component type.
     ///
-    /// Empty inputs produce a zero-element compound dataset (no
-    /// `MATLAB_empty` marker): MATLAB reads this back as an empty complex
-    /// array of the right class. Non-empty inputs honor the configured
-    /// compression settings.
-    pub fn write_complex_f64(
+    /// The dataset is a `{real, imag}` compound of `T` and carries the
+    /// *component* class in `MATLAB_class` — `"int16"` for a complex `i16`
+    /// array — which is how MATLAB distinguishes `complex(int16(re),
+    /// int16(im))` from a complex `double`. No width is ever substituted for
+    /// another: the class the file reports is the one the caller asked for.
+    fn write_complex_of<T: ComplexComponent>(
         &mut self,
         name: &str,
+        class: MatClass,
         matlab_dims: &[usize],
-        data: &[(f64, f64)],
+        data: &[(T, T)],
     ) -> Result<&mut Self, MatError> {
         let mut storage_buf = [0u64; STORAGE_DIMS_BUF_LEN];
         let storage = storage_dims_u64_into(matlab_dims, &mut storage_buf);
         let compression = self.options.compression;
         let target = self.resolve_target(name)?;
         let ds = self.dataset_at_target(&target);
-        ds.with_complex64_data(data).with_shape(storage);
+        ds.with_complex_data(data).with_shape(storage);
         ds.set_attr(
             "MATLAB_class",
-            AttrValue::AsciiString(MatClass::Double.as_str().into()),
-        );
-        if !data.is_empty() {
-            apply_deflate(ds, compression);
-        }
-        Ok(self)
-    }
-
-    /// Write a complex `f32` array. See [`write_complex_f64`](Self::write_complex_f64) for empty-input
-    /// and compression semantics.
-    pub fn write_complex_f32(
-        &mut self,
-        name: &str,
-        matlab_dims: &[usize],
-        data: &[(f32, f32)],
-    ) -> Result<&mut Self, MatError> {
-        let mut storage_buf = [0u64; STORAGE_DIMS_BUF_LEN];
-        let storage = storage_dims_u64_into(matlab_dims, &mut storage_buf);
-        let compression = self.options.compression;
-        let target = self.resolve_target(name)?;
-        let ds = self.dataset_at_target(&target);
-        ds.with_complex32_data(data).with_shape(storage);
-        ds.set_attr(
-            "MATLAB_class",
-            AttrValue::AsciiString(MatClass::Single.as_str().into()),
+            AttrValue::AsciiString(class.as_str().into()),
         );
         if !data.is_empty() {
             apply_deflate(ds, compression);
@@ -1246,26 +1224,6 @@ impl<'a> StructWriter<'a> {
         Ok(self)
     }
     #[inline]
-    pub fn write_complex_f64(
-        &mut self,
-        name: &str,
-        dims: &[usize],
-        data: &[(f64, f64)],
-    ) -> Result<&mut Self, MatError> {
-        self.mb.write_complex_f64(name, dims, data)?;
-        Ok(self)
-    }
-    #[inline]
-    pub fn write_complex_f32(
-        &mut self,
-        name: &str,
-        dims: &[usize],
-        data: &[(f32, f32)],
-    ) -> Result<&mut Self, MatError> {
-        self.mb.write_complex_f32(name, dims, data)?;
-        Ok(self)
-    }
-    #[inline]
     pub fn write_string_object(
         &mut self,
         name: &str,
@@ -1497,26 +1455,6 @@ impl<'a> CellWriter<'a> {
         self.record(r);
         Ok(self)
     }
-    pub fn push_complex_f64(
-        &mut self,
-        dims: &[usize],
-        data: &[(f64, f64)],
-    ) -> Result<&mut Self, MatError> {
-        let r = self.arm();
-        self.mb.write_complex_f64(&r, dims, data)?;
-        self.record(r);
-        Ok(self)
-    }
-    pub fn push_complex_f32(
-        &mut self,
-        dims: &[usize],
-        data: &[(f32, f32)],
-    ) -> Result<&mut Self, MatError> {
-        let r = self.arm();
-        self.mb.write_complex_f32(&r, dims, data)?;
-        self.record(r);
-        Ok(self)
-    }
     pub fn push_string_object(
         &mut self,
         values: &[String],
@@ -1599,6 +1537,90 @@ impl<'a> CellWriter<'a> {
     pub fn matrix_dims(&self, extents: &[usize]) -> Vec<usize> {
         self.mb.matrix_dims(extents)
     }
+}
+
+/// The complex writers, one per component class, on all three write scopes.
+///
+/// Every one of them is [`MatBuilder::write_complex_of`] with the class filled
+/// in, so a new component width is a line in the invocation below rather than
+/// three hand-written methods that can drift apart.
+macro_rules! complex_writers {
+    ($($write:ident / $push:ident => $ty:ty, $class:ident, $matlab:literal),* $(,)?) => {
+        impl MatBuilder {
+            $(
+                #[doc = concat!(
+                    "Write a complex `", stringify!($ty), "` array (MATLAB class `",
+                    $matlab, "`)."
+                )]
+                ///
+                /// Empty inputs produce a zero-element compound dataset with no
+                /// `MATLAB_empty` marker, which MATLAB reads back as an empty
+                /// complex array of this class. Non-empty inputs honor the
+                /// configured compression settings.
+                pub fn $write(
+                    &mut self,
+                    name: &str,
+                    matlab_dims: &[usize],
+                    data: &[($ty, $ty)],
+                ) -> Result<&mut Self, MatError> {
+                    self.write_complex_of(name, MatClass::$class, matlab_dims, data)
+                }
+            )*
+        }
+
+        impl StructWriter<'_> {
+            $(
+                #[doc = concat!(
+                    "Write a complex `", stringify!($ty),
+                    "` array into the open struct. See [`MatBuilder::",
+                    stringify!($write), "`]."
+                )]
+                #[inline]
+                pub fn $write(
+                    &mut self,
+                    name: &str,
+                    dims: &[usize],
+                    data: &[($ty, $ty)],
+                ) -> Result<&mut Self, MatError> {
+                    self.mb.$write(name, dims, data)?;
+                    Ok(self)
+                }
+            )*
+        }
+
+        impl CellWriter<'_> {
+            $(
+                #[doc = concat!(
+                    "Push a complex `", stringify!($ty),
+                    "` array as the next cell element. See [`MatBuilder::",
+                    stringify!($write), "`]."
+                )]
+                pub fn $push(
+                    &mut self,
+                    dims: &[usize],
+                    data: &[($ty, $ty)],
+                ) -> Result<&mut Self, MatError> {
+                    let r = self.arm();
+                    self.mb.$write(&r, dims, data)?;
+                    self.record(r);
+                    Ok(self)
+                }
+            )*
+        }
+    };
+}
+
+complex_writers! {
+    write_complex_f64 / push_complex_f64 => f64, Double, "double",
+    write_complex_f32 / push_complex_f32 => f32, Single, "single",
+    write_complex_i64 / push_complex_i64 => i64, Int64, "int64",
+    write_complex_i32 / push_complex_i32 => i32, Int32, "int32",
+    write_complex_i16 / push_complex_i16 => i16, Int16, "int16",
+    write_complex_i8 / push_complex_i8 => i8, Int8, "int8",
+    write_complex_u64 / push_complex_u64 => u64, UInt64, "uint64",
+    write_complex_u32 / push_complex_u32 => u32, UInt32, "uint32",
+    write_complex_u16 / push_complex_u16 => u16, UInt16, "uint16",
+    write_complex_u8 / push_complex_u8 => u8, UInt8, "uint8",
 }
 
 #[cfg(test)]

@@ -46,6 +46,15 @@ mod ffi {
         pub internal: *mut c_void,
     }
 
+    /// A complex variable's data pointer: matio splits the real and imaginary
+    /// planes into two arrays, unlike the interleaved `{real, imag}` compound
+    /// the file stores.
+    #[repr(C)]
+    pub struct mat_complex_split_t {
+        pub Re: *mut c_void,
+        pub Im: *mut c_void,
+    }
+
     // File versions
     pub const MAT_FT_MAT73: c_uint = 0x0200;
 
@@ -80,6 +89,10 @@ mod ffi {
     pub const MAT_T_UINT64: c_int = 13;
 
     pub const MAT_COMPRESSION_NONE: c_int = 0;
+
+    /// `Mat_VarCreate` option flag marking the data as complex; the `data`
+    /// pointer is then a `mat_complex_split_t` rather than a flat array.
+    pub const MAT_F_COMPLEX: c_int = 0x0800;
 
     unsafe extern "C" {
         pub unsafe fn Mat_CreateVer(
@@ -242,6 +255,48 @@ impl MatVar {
             col_major,
         )
     }
+    /// Build a complex variable of `class_type` from split real/imaginary
+    /// planes, the form matio takes complex data in. `dims` are MATLAB dims.
+    fn create_complex<T: Copy>(
+        name: &str,
+        class_type: i32,
+        data_type: i32,
+        dims: &[usize],
+        re: &[T],
+        im: &[T],
+    ) -> Self {
+        assert_eq!(re.len(), im.len());
+        let c = CString::new(name).unwrap();
+        let split = ffi::mat_complex_split_t {
+            Re: re.as_ptr() as *mut c_void,
+            Im: im.as_ptr() as *mut c_void,
+        };
+        let ptr = unsafe {
+            ffi::Mat_VarCreate(
+                c.as_ptr(),
+                class_type,
+                data_type,
+                dims.len() as i32,
+                dims.as_ptr(),
+                std::ptr::from_ref(&split) as *const c_void,
+                ffi::MAT_F_COMPLEX,
+            )
+        };
+        assert!(!ptr.is_null(), "Mat_VarCreate({name}) failed");
+        Self { ptr, owned: true }
+    }
+
+    pub fn complex_i16_row_vec(name: &str, re: &[i16], im: &[i16]) -> Self {
+        Self::create_complex(
+            name,
+            ffi::MAT_C_INT16,
+            ffi::MAT_T_INT16,
+            &[1, re.len()],
+            re,
+            im,
+        )
+    }
+
     pub fn i32_scalar(name: &str, v: i32) -> Self {
         Self::create_numeric(name, ffi::MAT_C_INT32, ffi::MAT_T_INT32, &[1, 1], &[v])
     }
@@ -285,6 +340,17 @@ impl MatVar {
         let n = self.nelements();
         let p = unsafe { (*self.ptr).data } as *const T;
         unsafe { std::slice::from_raw_parts(p, n) }.to_vec()
+    }
+
+    /// Read a complex variable's split real and imaginary planes. `T` must
+    /// match the on-disk component class.
+    pub fn complex_data_as<T: Copy>(&self) -> (Vec<T>, Vec<T>) {
+        assert!(self.is_complex(), "variable is not complex");
+        let n = self.nelements();
+        let split = unsafe { &*((*self.ptr).data as *const ffi::mat_complex_split_t) };
+        let re = unsafe { std::slice::from_raw_parts(split.Re as *const T, n) }.to_vec();
+        let im = unsafe { std::slice::from_raw_parts(split.Im as *const T, n) }.to_vec();
+        (re, im)
     }
 
     pub fn scalar_f64(&self) -> f64 {
@@ -366,7 +432,7 @@ impl Drop for MatVar {
 // Tests
 // =======================================================================
 
-use hdf5_pure::mat::{self, Matrix};
+use hdf5_pure::mat::{self, ComplexI16, Matrix};
 use serde::{Deserialize, Serialize};
 use std::sync::{Mutex, MutexGuard};
 use tempfile::tempdir;
@@ -695,4 +761,124 @@ fn hdf5_pure_reads_row_vector_matrix_from_matio() {
     assert_eq!(parsed.m.rows(), 1);
     assert_eq!(parsed.m.cols(), 4);
     assert_eq!(parsed.m.data(), &[10.0, 20.0, 30.0, 40.0]);
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+struct Capture {
+    samples: Vec<ComplexI16>,
+}
+
+/// matio reports the complex flag and the element class as two independent
+/// facts, so this is the check that both agree: a complex `int16` array, not
+/// a complex double and not a two-field struct.
+#[test]
+fn matio_reads_complex_int16_from_hdf5_pure() {
+    let _g = matio_lock();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("capture.mat");
+
+    mat::to_file(
+        &Capture {
+            samples: vec![
+                ComplexI16::new(i16::MIN, i16::MAX),
+                ComplexI16::new(0, -1),
+                ComplexI16::new(1234, -4321),
+            ],
+        },
+        &path,
+    )
+    .unwrap();
+
+    let f = MatFile::open(&path);
+    let v = f.read("samples").unwrap();
+    assert!(v.is_complex(), "matio should see a complex array");
+    assert_eq!(v.class_type(), ffi::MAT_C_INT16);
+    assert_eq!(v.nelements(), 3);
+
+    let (re, im) = v.complex_data_as::<i16>();
+    assert_eq!(re, vec![i16::MIN, 0, 1234]);
+    assert_eq!(im, vec![i16::MAX, -1, -4321]);
+}
+
+/// The other direction, and the one that settles what the layout should be:
+/// `libmatio` — the reference C implementation of the MAT format — writes the
+/// complex `int16` array, and this crate reads it. Nothing about the encoding
+/// is this crate's choice here.
+#[test]
+fn hdf5_pure_reads_complex_int16_written_by_matio() {
+    let _g = matio_lock();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("matio_capture.mat");
+    {
+        let f = MatFile::create_v73(&path);
+        f.write(MatVar::complex_i16_row_vec(
+            "samples",
+            &[i16::MIN, 0, 1234],
+            &[i16::MAX, -1, -4321],
+        ));
+    }
+
+    // The datatype matio produced is the one this crate writes: a 4-byte
+    // compound, `real` at 0 and `imag` at 2, both 2-byte signed integers.
+    let file = hdf5_pure::File::open(&path).unwrap();
+    let ds = file.dataset("samples").unwrap();
+    match ds.datatype().unwrap() {
+        hdf5_pure::Datatype::Compound { size, members } => {
+            assert_eq!(size, 4);
+            assert_eq!(members[0].name, "real");
+            assert_eq!(members[0].byte_offset, 0);
+            assert_eq!(members[1].name, "imag");
+            assert_eq!(members[1].byte_offset, 2);
+            for m in &members {
+                match m.datatype {
+                    hdf5_pure::Datatype::FixedPoint { size, signed, .. } => {
+                        assert_eq!(size, 2);
+                        assert!(signed);
+                    }
+                    ref other => panic!("expected a fixed-point component, got {other:?}"),
+                }
+            }
+        }
+        other => panic!("expected a compound datatype, got {other:?}"),
+    }
+
+    // And so are the attribute conventions: the class names the component,
+    // and no `MATLAB_int_decode` accompanies a numeric class (matio writes
+    // that one only for `logical` and `char`).
+    let attrs = ds.attrs().unwrap();
+    assert_eq!(
+        attrs.get("MATLAB_class"),
+        Some(&hdf5_pure::AttrValue::String("int16".into()))
+    );
+    assert!(!attrs.contains_key("MATLAB_int_decode"));
+
+    let parsed: Capture = mat::from_file(&path).unwrap();
+    assert_eq!(
+        parsed,
+        Capture {
+            samples: vec![
+                ComplexI16::new(i16::MIN, i16::MAX),
+                ComplexI16::new(0, -1),
+                ComplexI16::new(1234, -4321),
+            ]
+        }
+    );
+
+    // Same MATLAB dims through this crate's builder: the stored shape and the
+    // payload bytes come out identical to matio's, interleaved `(re, im)`
+    // little-endian pairs.
+    let ours = dir.path().join("ours_capture.mat");
+    let mut mb = hdf5_pure::mat::MatBuilder::new(hdf5_pure::mat::Options::default());
+    mb.write_complex_i16(
+        "samples",
+        &[1, 3],
+        &[(i16::MIN, i16::MAX), (0, -1), (1234, -4321)],
+    )
+    .unwrap();
+    std::fs::write(&ours, mb.finish().unwrap()).unwrap();
+
+    let our_ds = hdf5_pure::File::open(&ours).unwrap();
+    let our_ds = our_ds.dataset("samples").unwrap();
+    assert_eq!(our_ds.shape().unwrap(), ds.shape().unwrap());
+    assert_eq!(our_ds.read_u8().unwrap(), ds.read_u8().unwrap());
 }

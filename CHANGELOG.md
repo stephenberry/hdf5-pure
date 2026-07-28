@@ -12,11 +12,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `File::open_rw_bounded` offers the full staged edit surface — `Dataset::write`, attribute edits, `create_*`/`delete`, `copy`, `commit`, `space_accounting` — at bounded memory: a commit holds only what it is building rather than a whole-file mirror. It still requires a latest-format file with 8-byte offsets and no userblock ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
 - `Dataset::append` grows a file that persists its free space, including a paged one, from `File::open_rw` as well as `File::open_rw_bounded`; the on-disk free-space managers are re-homed when the file is closed ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
 - A `Dataset` reached by object reference can append on either read-write open, not only `File::open_rw_bounded`. It is refused once the session stages or commits an edit, because a commit can move the object header the handle names ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
+- MAT v7.3 complex arrays with integer components: `mat::ComplexI8`/`I16`/`I32`/`I64` and the `ComplexU*` counterparts join `Complex64`/`Complex32` across the serde, `Matrix<T>`, and `MatBuilder::write_complex_*` surfaces, so a capture that samples as 16-bit integer pairs stores four bytes per sample instead of eight. Components are never converted between widths: an `int16` complex dataset deserializes into `ComplexI16` and nothing else, in either direction.
 
 ### Changed
 
 - Dropping a read-write `File` without `close` now re-homes the on-disk free-space managers of a persisting file and flushes, matching what `close` does; previously only `File::open_rw_bounded` handles did this. Staged edits are still discarded on drop ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
 - **Breaking:** `Error::BoundedStagedUnsupported` is removed, along with the refusals that returned it ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
+- A MAT complex vector written through `to_bytes_with_options` now takes the configured `OneDimensionalMode` like every other 1-D array; it was always a MATLAB row vector before, so existing callers of that path get columns under the default and their stored shape changes.
+- A MAT complex dataset whose `MATLAB_class` disagrees with its `{real, imag}` compound is refused instead of decoded. The integer classes previously errored here and briefly decoded as wrong values during this cycle's work.
+
+### Fixed
+- A one-element MAT complex array deserializes into a `Vec<Complex*>`, matching the allowance the real numeric path already makes for a one-element numeric array.
+- An empty MAT complex array of an integer class reads back as an empty complex array of that class rather than as an untyped empty vector.
 
 ## [0.26.0] - 2026-07-27
 
