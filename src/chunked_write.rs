@@ -7,7 +7,6 @@ extern crate alloc;
 use alloc::{vec, vec::Vec};
 
 use crate::checksum::jenkins_lookup3;
-use crate::chunk_cache::{CACHE_LINE_SIZE, align_to_cache_line};
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
 use crate::extensible_array::{EaGeometry, ExtensibleArrayHeader};
@@ -1500,10 +1499,10 @@ pub(crate) fn compress_chunks(
 }
 
 /// Lay an already-[`compress`ed](compress_chunks) chunk set out at `base_address`,
-/// producing the on-disk data region (chunk bytes + cache-line padding + chunk
-/// index) and the v4 data-layout message. Cheap: this only concatenates and
-/// builds the index, so it can be run more than once (different addresses)
-/// without repeating the dataset's compression.
+/// producing the on-disk data region (chunk bytes followed by the chunk index)
+/// and the v4 data-layout message. Cheap: this only concatenates and builds the
+/// index, so it can be run more than once (different addresses) without
+/// repeating the dataset's compression.
 pub(crate) fn assemble_chunked_at(
     set: &CompressedChunkSet,
     base_address: u64,
@@ -1521,18 +1520,13 @@ pub(crate) fn assemble_chunked_at(
     let has_filters = *has_filters;
     let num_chunks = compressed.len();
 
-    // Pre-size the data buffer: chunk bytes plus a cache-line slack per chunk.
+    // Pre-size the data buffer to hold every chunk; the index structure appended
+    // afterwards grows it the rest of the way.
     let chunk_bytes_total: usize = compressed.iter().map(Vec::len).sum();
-    let mut data_buf = Vec::with_capacity(chunk_bytes_total + (num_chunks + 1) * CACHE_LINE_SIZE);
+    let mut data_buf = Vec::with_capacity(chunk_bytes_total);
     let mut written_chunks = Vec::with_capacity(num_chunks);
 
     for (chunk, &raw_size) in compressed.iter().zip(raw_sizes.iter()) {
-        // Pad current position to cache-line boundary.
-        let aligned_offset = align_to_cache_line(data_buf.len());
-        if aligned_offset > data_buf.len() {
-            data_buf.resize(aligned_offset, 0u8);
-        }
-
         let address = base_address + data_buf.len() as u64;
         data_buf.extend_from_slice(chunk);
 
@@ -1546,12 +1540,6 @@ pub(crate) fn assemble_chunked_at(
 
     let offset_size: u8 = 8;
     let length_size: u8 = 8;
-
-    // Pad before index structures so they are also cache-line aligned.
-    let aligned_idx = align_to_cache_line(data_buf.len());
-    if aligned_idx > data_buf.len() {
-        data_buf.resize(aligned_idx, 0u8);
-    }
 
     #[expect(
         clippy::cast_possible_truncation,
@@ -1567,6 +1555,9 @@ pub(crate) fn assemble_chunked_at(
             has_filters,
             ea_address,
         )?;
+        // The chunk loop filled `data_buf` to exactly its reserved capacity, so
+        // extending would otherwise double the whole buffer and copy it.
+        data_buf.reserve_exact(ea_bytes.len());
         data_buf.extend_from_slice(&ea_bytes);
 
         serialize_v4_extensible_array(chunk_dims_u32, ea_address, offset_size, element_size as u32)
@@ -1596,6 +1587,8 @@ pub(crate) fn assemble_chunked_at(
             has_filters,
             fa_address,
         );
+        // As above: reserve the index exactly rather than let the buffer double.
+        data_buf.reserve_exact(fa_bytes.len());
         data_buf.extend_from_slice(&fa_bytes);
 
         serialize_v4_fixed_array(
@@ -1638,8 +1631,8 @@ pub fn build_chunked_data_at_ext(
 }
 
 /// Per-chunk metadata in dense row-major grid order — enough to compute the
-/// destination layout (chunk addresses, index structures, cache-line padding)
-/// *without* the chunk bytes. `compressed_size` is the exact byte count the
+/// destination layout (chunk addresses and index structures) *without* the
+/// chunk bytes. `compressed_size` is the exact byte count the
 /// matching [`ChunkProvider::chunk_bytes`] call must return.
 #[derive(Debug, Clone)]
 pub(crate) struct ChunkMeta {
@@ -1672,7 +1665,7 @@ pub(crate) trait ChunkProvider: Send + Sync {
 pub(crate) trait ByteSink {
     /// Append `bytes` to the output.
     fn put(&mut self, bytes: &[u8]) -> Result<(), FormatError>;
-    /// Append `n` zero bytes (cache-line padding).
+    /// Append `n` zero bytes.
     fn put_zeros(&mut self, n: usize) -> Result<(), FormatError>;
     /// Total bytes written so far (used to assert layout addresses on a
     /// non-seekable sink).
@@ -1701,10 +1694,10 @@ impl ByteSink for Vec<u8> {
     }
 }
 
-/// One grid slot's placement in the data region: the zero padding before it and
-/// the chunk's compressed byte count.
+/// One grid slot's placement in the data region. Slots are stored back to back,
+/// so a slot's own compressed byte count is its whole placement: the next slot
+/// begins where this one ends.
 pub(crate) struct ChunkSlotPlan {
-    pub(crate) pad_before: u64,
     pub(crate) compressed_size: u64,
 }
 
@@ -1715,13 +1708,11 @@ pub(crate) struct ChunkSlotPlan {
 pub(crate) struct VerbatimPlan {
     /// One entry per grid slot, in ascending address order.
     pub(crate) slots: Vec<ChunkSlotPlan>,
-    /// Zero padding before the index structure (cache-line alignment).
-    pub(crate) index_pad: u64,
     /// The serialized chunk-index structure (Fixed Array / Extensible Array),
     /// emitted after the chunk bytes. Empty for the single-chunk layout (whose
     /// address is embedded in the layout message instead).
     pub(crate) index_tail: Vec<u8>,
-    /// Total byte length of the data region (chunks + padding + index tail).
+    /// Total byte length of the data region (chunks + index tail).
     pub(crate) total_len: u64,
 }
 
@@ -1755,28 +1746,23 @@ pub(crate) fn plan_chunked_data_verbatim(
     let num_chunks = meta.len();
     let has_filters = pipeline_message.is_some();
 
-    // Walk a running cursor instead of pushing bytes; padding and addresses are a
-    // pure function of preceding chunk sizes, mirroring the buffered builder.
+    // Walk a running cursor instead of pushing bytes; each address is a pure
+    // function of the preceding chunk sizes, mirroring the buffered builder.
     let mut cursor: u64 = 0;
     let mut slots = Vec::with_capacity(num_chunks);
     let mut written_chunks = Vec::with_capacity(num_chunks);
 
     for m in meta {
-        let aligned_offset = align_to_cache_line(cursor.to_usize()?) as u64;
-        let pad_before = aligned_offset - cursor;
-        let address = base_address + aligned_offset;
+        let address = base_address + cursor;
         let compressed_size = m.compressed_size;
-        slots.push(ChunkSlotPlan {
-            pad_before,
-            compressed_size,
-        });
+        slots.push(ChunkSlotPlan { compressed_size });
         written_chunks.push(WrittenChunk {
             address,
             compressed_size,
             raw_size,
             filter_mask: m.filter_mask,
         });
-        cursor = aligned_offset + compressed_size;
+        cursor += compressed_size;
     }
 
     #[expect(
@@ -1788,11 +1774,6 @@ pub(crate) fn plan_chunked_data_verbatim(
     let length_size: u8 = 8;
 
     let use_extensible = maxshape.is_some_and(|ms| ms.contains(&u64::MAX));
-
-    // Pad before the index structure so it is also cache-line aligned.
-    let aligned_idx = align_to_cache_line(cursor.to_usize()?) as u64;
-    let index_pad = aligned_idx - cursor;
-    cursor = aligned_idx;
 
     let mut index_tail = Vec::new();
     #[expect(
@@ -1859,7 +1840,6 @@ pub(crate) fn plan_chunked_data_verbatim(
     Ok(VerbatimLayout {
         plan: VerbatimPlan {
             slots,
-            index_pad,
             index_tail,
             total_len: cursor,
         },
@@ -1882,7 +1862,6 @@ pub(crate) fn emit_chunked_data_verbatim<S: ByteSink>(
     // chunk count.
     let mut chunk = Vec::new();
     for (i, slot) in plan.slots.iter().enumerate() {
-        sink.put_zeros(slot.pad_before.to_usize()?)?;
         chunk.clear();
         provider.chunk_bytes(i, &mut chunk)?;
         if chunk.len() as u64 != slot.compressed_size {
@@ -1894,7 +1873,6 @@ pub(crate) fn emit_chunked_data_verbatim<S: ByteSink>(
         }
         sink.put(&chunk)?;
     }
-    sink.put_zeros(plan.index_pad.to_usize()?)?;
     sink.put(&plan.index_tail)?;
     Ok(())
 }
@@ -2098,41 +2076,77 @@ mod tests {
         assert_eq!(result, values);
     }
 
+    /// Chunks are stored back to back, and the index begins where the last
+    /// chunk ends. The chunk size here (7 f64 = 56 bytes) is deliberately not a
+    /// multiple of any cache line, so padding at *either* site — between chunks
+    /// or before the index — would move bytes this pins.
     #[test]
-    fn chunk_addresses_are_cache_aligned() {
-        use super::align_to_cache_line;
-        let values: Vec<f64> = (0..100).map(|i| i as f64).collect();
+    fn chunks_are_stored_back_to_back() {
+        let values: Vec<f64> = (0..21).map(|i| i as f64).collect();
         let raw = f64_to_bytes(&values);
-        let base_address = 0x1000u64;
-        // Ensure base is aligned for this test
-        let base_address = align_to_cache_line(base_address as usize) as u64;
         let options = ChunkOptions {
-            chunk_dims: Some(vec![20]),
+            chunk_dims: Some(vec![7]),
             ..Default::default()
         };
-        let dims = [20u64];
+        let dims = [7u64];
         let ctx = ChunkContext::basic(&dims, 8);
-        let result =
-            build_chunked_data_at_ext(&raw, &[100], ctx, &options, base_address, None).unwrap();
+        let result = build_chunked_data_at_ext(&raw, &[21], ctx, &options, 0x1000, None).unwrap();
 
-        // Parse layout to get chunk addresses (via roundtrip read)
-        let file_size = base_address as usize + result.data_bytes.len();
-        let mut file_data = vec![0u8; file_size];
-        file_data[base_address as usize..].copy_from_slice(&result.data_bytes);
+        // Unfiltered chunks are stored verbatim, so the data region opens with
+        // the raw bytes in order.
+        assert_eq!(
+            &result.data_bytes[..raw.len()],
+            &raw[..],
+            "the three chunks must concatenate with nothing between them"
+        );
+        // And the Fixed Array header starts in the very next byte. Asserting the
+        // signature's position, rather than only the chunk prefix, is what keeps
+        // padding from creeping back in ahead of the index.
+        assert_eq!(
+            &result.data_bytes[raw.len()..raw.len() + 4],
+            b"FAHD",
+            "the chunk index must begin where the last chunk ends"
+        );
+    }
 
-        let layout = DataLayout::parse(&result.layout_message, 8, 8).unwrap();
-        let dataspace = Dataspace {
-            space_type: DataspaceType::Simple,
-            rank: 1,
-            dimensions: vec![100],
-            max_dimensions: None,
-        };
-        let datatype = make_f64_type();
+    /// The same rule for the streaming path, stated where it is computed: the
+    /// data region is exactly the chunks plus the index, so a plan that inserted
+    /// padding would make `total_len` exceed the sum.
+    #[test]
+    fn a_verbatim_plan_reserves_only_the_chunks_and_the_index() {
+        let meta: Vec<ChunkMeta> = [37u64, 111, 5]
+            .into_iter()
+            .map(|compressed_size| ChunkMeta {
+                compressed_size,
+                filter_mask: 0,
+            })
+            .collect();
+        let layout =
+            plan_chunked_data_verbatim(&meta, &[7], 8, 56, Some(&[]), 0x1000, None).unwrap();
 
-        // Verify data roundtrips correctly
-        let output =
-            read_chunked_data(&file_data, &layout, &dataspace, &datatype, None, 8, 8).unwrap();
-        assert_eq!(bytes_to_f64(&output), values);
+        let chunk_bytes: u64 = meta.iter().map(|m| m.compressed_size).sum();
+        assert_eq!(
+            layout.plan.total_len,
+            chunk_bytes + layout.plan.index_tail.len() as u64
+        );
+        let planned: Vec<u64> = layout
+            .plan
+            .slots
+            .iter()
+            .map(|s| s.compressed_size)
+            .collect();
+        assert_eq!(planned, vec![37, 111, 5]);
+    }
+
+    /// A chunk-less plan has no first chunk to anchor the index against, so it
+    /// is refused rather than planned as an empty region.
+    #[test]
+    fn a_verbatim_plan_with_no_chunks_is_refused() {
+        let result = plan_chunked_data_verbatim(&[], &[7], 8, 56, None, 0x1000, None);
+        assert!(
+            matches!(result, Err(FormatError::ChunkedReadError(_))),
+            "a chunk-less plan must be refused"
+        );
     }
 
     #[test]

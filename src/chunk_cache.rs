@@ -23,30 +23,6 @@ use std::collections::HashMap;
 
 use crate::chunked_read::ChunkInfo;
 
-// ---------------------------------------------------------------------------
-// Cache-line alignment
-// ---------------------------------------------------------------------------
-
-/// Cache line size in bytes for the target architecture.
-///
-/// ARM64 uses 128-byte cache lines; x86_64 uses 64-byte. The writer aligns
-/// chunk data blocks to this boundary on disk so a chunk read lands on a
-/// cache-line-aligned file offset.
-#[cfg(target_arch = "aarch64")]
-pub const CACHE_LINE_SIZE: usize = 128;
-
-#[cfg(target_arch = "x86_64")]
-pub const CACHE_LINE_SIZE: usize = 64;
-
-#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-pub const CACHE_LINE_SIZE: usize = 64;
-
-/// Round `size` up to the next multiple of [`CACHE_LINE_SIZE`].
-#[inline]
-pub fn align_to_cache_line(size: usize) -> usize {
-    (size + CACHE_LINE_SIZE - 1) & !(CACHE_LINE_SIZE - 1)
-}
-
 /// Coordinate key for a chunk — the N-dimensional offset vector.
 pub type ChunkCoord = Vec<u64>;
 
@@ -571,16 +547,5 @@ mod tests {
         cache.put_decompressed(vec![0], vec![1, 2, 3]); // duplicate
         assert_eq!(cache.stats().cached_chunks(), 1);
         assert_eq!(cache.stats().cached_bytes(), 3);
-    }
-
-    #[test]
-    fn align_to_cache_line_values() {
-        assert_eq!(align_to_cache_line(0), 0);
-        assert_eq!(align_to_cache_line(1), CACHE_LINE_SIZE);
-        assert_eq!(align_to_cache_line(CACHE_LINE_SIZE), CACHE_LINE_SIZE);
-        assert_eq!(
-            align_to_cache_line(CACHE_LINE_SIZE + 1),
-            CACHE_LINE_SIZE * 2
-        );
     }
 }

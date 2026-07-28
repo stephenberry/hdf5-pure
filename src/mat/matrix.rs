@@ -163,16 +163,19 @@ pub struct Matrix<T> {
 impl<T> Matrix<T> {
     /// Build a `Matrix` from a row-major data vector.
     ///
-    /// Panics if `data.len() != rows * cols`.
+    /// Panics if `rows * cols` overflows `usize`, or if `data.len()` does not
+    /// equal it. The overflow is checked separately because a wrapping product
+    /// can equal a short `data.len()`, and the writer transposes this matrix
+    /// through a raw pointer sized from that product.
     pub fn from_row_major(rows: usize, cols: usize, data: Vec<T>) -> Self {
+        let total = rows
+            .checked_mul(cols)
+            .expect("Matrix::from_row_major: rows * cols overflows usize");
         assert_eq!(
             data.len(),
-            rows * cols,
-            "Matrix::from_row_major: data length {} does not match {}×{} = {}",
+            total,
+            "Matrix::from_row_major: data length {} does not match {rows}×{cols} = {total}",
             data.len(),
-            rows,
-            cols,
-            rows * cols
         );
         Self { rows, cols, data }
     }
@@ -200,11 +203,19 @@ impl<T> Matrix<T> {
 
 impl<T: Clone + Default> Matrix<T> {
     /// Build a zero-initialized matrix.
+    ///
+    /// Panics if `rows * cols` overflows `usize`, as [`Matrix::from_row_major`]
+    /// does: a wrapping product would allocate a short `data` vector while
+    /// `rows` and `cols` kept their true values, leaving the three fields
+    /// describing different matrices.
     pub fn zeros(rows: usize, cols: usize) -> Self {
+        let total = rows
+            .checked_mul(cols)
+            .expect("Matrix::zeros: rows * cols overflows usize");
         Self {
             rows,
             cols,
-            data: vec![T::default(); rows * cols],
+            data: vec![T::default(); total],
         }
     }
 }
@@ -255,13 +266,23 @@ impl<'de, T: MatElement + Deserialize<'de>> Deserialize<'de> for Matrix<T> {
                 let rows = rows.ok_or_else(|| de::Error::missing_field("rows"))?;
                 let cols = cols.ok_or_else(|| de::Error::missing_field("cols"))?;
                 let data = data.ok_or_else(|| de::Error::missing_field("data"))?;
-                if data.len() != rows * cols {
+                // `rows` and `cols` are payload fields, so the product is taken
+                // with `checked_mul` and reported as a deserializer error: a
+                // wrapping product can equal a short `data.len()`, and the
+                // length check below would then agree with itself and admit a
+                // matrix whose fields contradict each other.
+                let total = rows.checked_mul(cols).ok_or_else(|| {
+                    de::Error::custom(format!(
+                        "Matrix dimensions {rows}×{cols} overflow the address space"
+                    ))
+                })?;
+                if data.len() != total {
                     return Err(de::Error::custom(format!(
                         "Matrix data length {} does not match {}×{} = {}",
                         data.len(),
                         rows,
                         cols,
-                        rows * cols
+                        total
                     )));
                 }
                 Ok(Matrix { rows, cols, data })
@@ -284,5 +305,49 @@ mod tests {
     #[should_panic]
     fn from_row_major_length_mismatch_panics() {
         let _ = Matrix::from_row_major(2, 3, vec![1.0_f64]);
+    }
+
+    /// `rows` such that `rows * 4` wraps to exactly 4. Derived from `usize::MAX`
+    /// so it wraps at either word width rather than only on 64-bit, and equal to
+    /// the `data` length below so a check written against the wrapping product
+    /// would agree with itself.
+    const WRAPS_TO_FOUR: usize = usize::MAX / 4 + 2;
+
+    #[test]
+    fn the_wrapping_shape_really_does_wrap() {
+        // Pins the premise of the three tests below: if this stopped wrapping to
+        // 4 they would still pass, having stopped testing anything.
+        assert_eq!(WRAPS_TO_FOUR.wrapping_mul(4), 4);
+        assert!(WRAPS_TO_FOUR.checked_mul(4).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "overflows usize")]
+    fn zeros_refuses_a_shape_whose_product_wraps() {
+        // Without the check this allocates 4 elements and reports 2^62+1 rows.
+        let _ = Matrix::<f64>::zeros(WRAPS_TO_FOUR, 4);
+    }
+
+    #[test]
+    fn deserializing_a_shape_whose_product_wraps_is_an_error() {
+        // The dimensions are payload fields, so this must be an error rather
+        // than a panic out of a `Deserialize` impl.
+        let json = format!(r#"{{"rows":{WRAPS_TO_FOUR},"cols":4,"data":[1.0,2.0,3.0,4.0]}}"#);
+        let err = serde_json::from_str::<Matrix<f64>>(&json).unwrap_err();
+        assert!(
+            err.to_string().contains("overflow the address space"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn deserializing_an_honest_length_mismatch_is_still_an_error() {
+        // The overflow guard must not swallow the ordinary mismatch case.
+        let err =
+            serde_json::from_str::<Matrix<f64>>(r#"{"rows":2,"cols":3,"data":[1.0]}"#).unwrap_err();
+        assert!(
+            err.to_string().contains("does not match"),
+            "unexpected error: {err}"
+        );
     }
 }

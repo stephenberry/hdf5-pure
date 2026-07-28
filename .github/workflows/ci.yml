@@ -280,19 +280,23 @@ jobs:
   # ===========================================================================
   # Undefined-behavior sanitizing with Miri (issue #26).
   #
-  # The library is almost entirely safe Rust; the unsafe that exists is the
-  # cache-line-aligned chunk buffer in `chunk_cache` (manual global-allocator
-  # `alloc_zeroed`/`dealloc`, `slice::from_raw_parts[_mut]`, and `unsafe impl
-  # Send`/`Sync` for `CacheAlignedBuffer`). Miri interprets that allocation and
-  # the surrounding pointer arithmetic under Stacked Borrows + strict provenance,
-  # catching aliasing / out-of-bounds / leak UB that the normal test run cannot
-  # observe.
+  # The library is almost entirely safe Rust. The one piece of non-trivial
+  # unsafe reachable from a `std + serde` build is `mat::transpose`, which
+  # writes a tiled transpose through a raw pointer into uninitialized `Vec`
+  # capacity and then calls `set_len`. Miri interprets those writes under
+  # Stacked Borrows + strict provenance, catching the out-of-bounds or
+  # partially-initialized cases a normal test run cannot observe.
   #
-  # Scoped to the `chunk_cache` unit tests on purpose: most other tests touch the
+  # `serde` is not a default feature, so the default feature set compiles no
+  # non-trivial unsafe at all; `no_std` swaps this module out for `nosync`
+  # rather than adding to it. Both are why this job names its features
+  # explicitly instead of relying on the defaults.
+  #
+  # Scoped to that module's unit tests on purpose: most other tests touch the
   # filesystem and the crosscheck tests call into the libhdf5 C library, neither
-  # of which Miri can execute. Widen the `--lib` test filter as more
-  # pure-in-memory unsafe lands (the single-threaded `nosync::Mutex` is the next
-  # candidate, once the crate's no_std unit-test harness compiles).
+  # of which Miri can execute. Widen the `--lib` filter as more pure-in-memory
+  # unsafe lands (the single-threaded `nosync::Mutex` is the next candidate,
+  # once the crate's no_std unit-test harness compiles).
   miri:
     name: Miri (undefined behavior)
     runs-on: ubuntu-latest
@@ -302,11 +306,43 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: miri
-      - name: Miri test (chunk_cache unsafe)
-        # `--no-default-features --features std` keeps the interpreted build
-        # minimal: the `chunk_cache` tests are pure in-memory, so there is no
-        # need to compile the `deflate` (flate2/miniz_oxide) or `checksum` code
-        # that Miri never executes. Smaller, more deterministic surface.
-        run: cargo miri test --locked --no-default-features --features std --lib chunk_cache
+      - name: Miri test (mat::transpose unsafe)
+        # `--no-default-features --features std,serde` selects the smallest set
+        # that compiles the code under test: `std` gates the `mat` module and
+        # `serde` gates `transpose` within it. Dropping `deflate` also drops
+        # compiling flate2/miniz_oxide, which Miri would never execute.
+        #
+        # Three ways this gate can go hollow, each of which has to fail loudly.
+        # None is hypothetical: mode 2 is what actually happened here.
+        #
+        #   1. The filter stops matching. libtest exits 0 when a filter selects
+        #      nothing, so a rename would leave the job green having interpreted
+        #      nothing at all.
+        #   2. The unsafe leaves the module while the tests stay. #113 deleted
+        #      the unsafe from `chunk_cache`, the job kept running that module's
+        #      11 safe tests, and it stayed green and vacuous for many releases.
+        #      A count check alone would not have caught it, which is why the
+        #      guard below greps for unsafe in *code* position -- a bare word
+        #      match would also be satisfied by a leftover SAFETY comment.
+        #   3. The tests are selected but never run (`#[ignore]`, or a refactor
+        #      that stops them calling the transpose). "running 7 tests ...
+        #      7 ignored" passes both of the checks above, so the pass count
+        #      itself has to be asserted nonzero.
+        run: |
+          set -o pipefail
+          if ! grep -qE '^[^/]*\bunsafe[[:space:]]*(\{|fn |impl )' src/mat/transpose.rs; then
+            echo "::error::src/mat/transpose.rs holds no unsafe code; point this job at the code that does."
+            exit 1
+          fi
+          cargo miri test --locked --no-default-features --features std,serde \
+            --lib mat::transpose 2>&1 | tee miri.log
+          if grep -q "running 0 tests" miri.log; then
+            echo "::error::Miri ran no tests: the --lib filter matched nothing."
+            exit 1
+          fi
+          if ! grep -qE '[1-9][0-9]* passed' miri.log; then
+            echo "::error::Miri passed no tests: they were selected but ignored or skipped."
+            exit 1
+          fi
         env:
           MIRIFLAGS: -Zmiri-strict-provenance
