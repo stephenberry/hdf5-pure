@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::edit::{
-    AppendBuilder, AppendGeometry, AppendTarget, MemoryStrategy, SpaceAccounting, WriteEngine,
+    AppendBuilder, AppendGeometry, AppendTarget, EditBacking, MemoryStrategy, SpaceAccounting,
+    WriteEngine,
 };
 use crate::element::H5Element;
 use crate::type_builders::{DatasetBuilder, VL_REF_SIZE};
@@ -207,11 +208,13 @@ impl FileAccessProperties {
     /// the whole-file mirror unconditionally, as `open_rw` did before it learned
     /// to dispatch.
     ///
-    /// The read-only opens ignore this: they build no editing session at all.
-    /// [`File::open_swmr_writer`] ignores it too, but for a different reason — it
-    /// builds an editing session and always mirrors, so it reports
-    /// [`MemoryStrategy::Mirrored`] whatever was asked for. Ask a `File` what it
-    /// resolved to with [`File::memory_strategy`].
+    /// The read-only opens ignore this: they build no editing session at all, and
+    /// their own names say what memory they spend. [`File::open_swmr_writer`]
+    /// does build one, and always mirrors: it accepts
+    /// [`MemoryStrategy::Auto`] and [`MemoryStrategy::Mirrored`], both of which
+    /// the mirror satisfies, and refuses an explicit [`MemoryStrategy::Bounded`]
+    /// with [`Error::EditUnsupported`] rather than quietly not honoring it. Ask a
+    /// `File` which backend it resolved to with [`File::edit_backing`].
     pub const fn with_memory_strategy(mut self, memory_strategy: MemoryStrategy) -> Self {
         self.memory_strategy = Some(memory_strategy);
         self
@@ -234,7 +237,13 @@ impl FileAccessProperties {
 
     /// Return the configured memory strategy, or `None` when none was asked for
     /// and the entry point's own default applies. This is what was *requested*;
-    /// for what an open resolved to, see [`File::memory_strategy`].
+    /// for which backend an open resolved to, see [`File::edit_backing`].
+    ///
+    /// The `Option` exists so the deprecated [`File::open_rw_bounded`] can
+    /// default to [`MemoryStrategy::Bounded`] while [`File::open_rw`] defaults to
+    /// [`MemoryStrategy::Auto`]; when that pair is removed this should collapse to
+    /// a plain `MemoryStrategy` with `Auto` as the default, in that same release
+    /// rather than as a second break on this accessor.
     pub const fn memory_strategy(&self) -> Option<MemoryStrategy> {
         self.memory_strategy
     }
@@ -576,6 +585,20 @@ impl FileInner {
         path: P,
         properties: FileAccessProperties,
     ) -> Result<Self, Error> {
+        // The SWMR writer always mirrors. `Auto` and unset are *satisfied* by
+        // that — they ask for the bounded engine where it applies and accept the
+        // mirror where it does not — but `Bounded` is a guarantee, and honoring a
+        // guarantee by ignoring it is how a caller ends up spending `O(file size)`
+        // memory it asked not to. Refusing is also the permissive direction to be
+        // wrong in: if this writer ever runs bounded, the refusal stops firing,
+        // which breaks nobody.
+        if properties.memory_strategy == Some(MemoryStrategy::Bounded) {
+            return Err(Error::EditUnsupported(
+                "the SWMR writer always holds the file in a whole-file mirror; leave \
+                 MemoryStrategy unset, or pass MemoryStrategy::Auto or MemoryStrategy::Mirrored, \
+                 to open it",
+            ));
+        }
         let mut inner = Self::from_rw_session(WriteEngine::open_swmr_writer(path)?, properties)?;
         inner.swmr_write = true;
         Ok(inner)
@@ -861,17 +884,12 @@ impl FileInner {
         self.access_properties
     }
 
-    /// The memory strategy this file's editing session resolved to, or `None`
-    /// when there is no editing session to ask. Always
-    /// [`MemoryStrategy::Mirrored`] for the SWMR writer, which builds a session
-    /// but does not dispatch on the strategy.
-    fn memory_strategy(&self) -> Option<MemoryStrategy> {
+    /// The backend this file's editing session resolved to, or `None` when there
+    /// is no editing session to ask. Always [`EditBacking::Mirrored`] for the
+    /// SWMR writer, which builds a session but does not dispatch on the strategy.
+    fn edit_backing(&self) -> Option<EditBacking> {
         match &self.backend {
-            Backend::Edit(m) => Some(
-                m.lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .memory_strategy(),
-            ),
+            Backend::Edit(m) => Some(m.lock().unwrap_or_else(|e| e.into_inner()).edit_backing()),
             _ => None,
         }
     }
@@ -1582,7 +1600,7 @@ impl File {
     /// immediate append in whole-chunk batches, each crash-atomic on its own, so
     /// a crash mid-call leaves a valid shorter dataset rather than none of the
     /// append. Ask a file which it got with
-    /// [`memory_strategy`](Self::memory_strategy), and demand one with
+    /// [`edit_backing`](Self::edit_backing), and demand one with
     /// [`FileAccessProperties::with_memory_strategy`] —
     /// [`MemoryStrategy::Mirrored`] restores the unconditional mirror this
     /// entry point used before it learned to dispatch.
@@ -1656,9 +1674,14 @@ impl File {
     /// Open for SWMR appending with explicit access properties — see
     /// [`open_swmr_writer`](Self::open_swmr_writer).
     ///
-    /// The properties' chunk cache is the file-wide default for datasets opened from
-    /// this file. Its locking policy is ignored: SWMR takes no OS lock by design,
-    /// so concurrent readers are never blocked.
+    /// The properties' chunk cache is the file-wide default for datasets opened
+    /// from this file. Its locking policy is ignored, which costs the caller
+    /// nothing: SWMR takes no OS lock by design, which is stronger than any
+    /// locking a caller could ask for. Its memory strategy is *not* ignored the
+    /// same way — this writer always mirrors, so an explicit
+    /// [`MemoryStrategy::Bounded`] is a guarantee it cannot meet and is refused
+    /// with [`Error::EditUnsupported`]; [`MemoryStrategy::Auto`] and
+    /// [`MemoryStrategy::Mirrored`] are both satisfied by the mirror.
     pub fn open_swmr_writer_with_options<P: AsRef<std::path::Path>>(
         path: P,
         properties: FileAccessProperties,
@@ -1815,6 +1838,12 @@ impl File {
         create: FileCreateProperties,
         access: FileAccessProperties,
     ) -> Result<Self, Error> {
+        // Refuse a pair the reopen below would refuse, before anything is
+        // written: this call promises a file *and* an open handle, and half of
+        // that is worse than neither.
+        if let Some(reason) = crate::edit::create_would_refuse_reopen(&create, &access) {
+            return Err(Error::EditUnsupported(reason));
+        }
         let mut builder = crate::writer::FileBuilder::new();
         builder.with_create_properties(create);
         let bytes = builder.finish()?;
@@ -2036,17 +2065,21 @@ impl File {
         self.access_properties()
     }
 
-    /// What this file's read-write session resolved to: [`MemoryStrategy::Bounded`]
-    /// when it reads through a handle, or [`MemoryStrategy::Mirrored`] when it
-    /// holds a whole-file image. Never [`MemoryStrategy::Auto`], which is a
-    /// request rather than an outcome.
+    /// Which backend this file's read-write session resolved to:
+    /// [`EditBacking::Bounded`] when it reads through a handle, or
+    /// [`EditBacking::Mirrored`] when it holds a whole-file image.
     ///
     /// This is how a caller who opened with [`MemoryStrategy::Auto`] finds out
     /// whether the fallback was taken, and so whether memory scales with the
     /// file. A file with no editing session — a read-only open, a streaming open
     /// — reports `None`.
-    pub fn memory_strategy(&self) -> Option<MemoryStrategy> {
-        self.inner.memory_strategy()
+    ///
+    /// The answer is an [`EditBacking`] rather than the [`MemoryStrategy`] that
+    /// was asked for, because `Auto` is a preference between the two backends and
+    /// not an outcome either can report; `.into()` converts back when a later
+    /// reopen should be pinned to what this one got.
+    pub fn edit_backing(&self) -> Option<EditBacking> {
+        self.inner.edit_backing()
     }
 
     /// Returns a reference to the parsed superblock.

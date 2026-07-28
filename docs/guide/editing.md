@@ -13,7 +13,7 @@
 
 `File::open_rw` is the read-write open, and it picks how to hold the file's bytes from the file itself rather than making you pick a function. A latest-format file with no userblock is edited **bounded**: no whole-file copy is ever built, so memory stays at the [configured caches](streaming.md) plus whatever an edit is building. Anything else — a pre-v2 superblock, or a userblock — falls back to a whole-file **mirror**, `O(file size)`, which is what makes such a file editable at all. Either backing mutates the file the same way: new bytes are appended and a small, fixed set of locations is patched, never a rewrite on commit; see [write paths](../about/architecture.md#write-paths) for the mechanics.
 
-Ask a file which backing it got with `File::memory_strategy()`, and demand one with `FileAccessProperties::with_memory_strategy`:
+Ask a file which backing it got with `File::edit_backing()`, and demand one with `FileAccessProperties::with_memory_strategy`:
 
 | `MemoryStrategy` | Effect |
 | --- | --- |
@@ -21,7 +21,9 @@ Ask a file which backing it got with `File::memory_strategy()`, and demand one w
 | `Bounded` | Never build a mirror; refuse such a file with `Error::EditUnsupported` |
 | `Mirrored` | Always build the mirror, whatever the file looks like |
 
-`File::open_rw_bounded` is the deprecated spelling of `Bounded`.
+`File::open_rw_bounded` is the deprecated spelling of `Bounded`. The answer from `File::edit_backing()` is an `EditBacking` (`Bounded` or `Mirrored`) rather than the `MemoryStrategy` that was asked for, because `Auto` is a preference between the two backings and never an outcome; `.into()` converts an `EditBacking` back into the `MemoryStrategy` that pins a later reopen to it.
+
+`File::open_swmr_writer` always mirrors, so it accepts `Auto` and `Mirrored` — both satisfied by the mirror — and refuses an explicit `Bounded` rather than quietly not honoring it.
 
 The two backings are the same engine and the same edit vocabulary — reads, immediate `Dataset::append` / `append_raw`, `Dataset::write`, `append_staged`, `set_attr` / `remove_attr`, `Group::create_dataset` / `create_group` / `create_group_with` / `delete`, `File::copy` / `copy_from`, `commit`, and `space_accounting` — with one trade between them. A large `Dataset::append` is one crash-atomic apply on the mirror and several ~1 MiB whole-chunk batches when bounded, so a crash mid-call there leaves a valid shorter dataset. A commit's resident memory follows the backing too: bounded by the edit rather than by the file, with `File::copy` the exception, since copying an object reads the whole of it into memory first.
 
@@ -174,7 +176,7 @@ The remaining eligibility rules match `Dataset::append_staged` (chunked, unlimit
 Appending to a large file needs no special entry point: `File::open_rw` already edits a latest-format file bounded, the read-write sibling of [`open_streaming`](streaming.md). Reads are served by positioned I/O with the streaming backend's capabilities, and `Dataset::append` runs the same crash-atomic in-place engine as the mirror, reading and patching only bounded windows (the object header, the extensible-array blocks it touches, and the trailing chunk). A large append is applied in whole-chunk batches, each crash-atomic on its own, so peak memory stays at the configured caches plus a few chunks — independent of the file size and of how much one call appends.
 
 ```rust
-use hdf5_pure::{File, FileAccessProperties, MemoryStrategy};
+use hdf5_pure::{EditBacking, File, FileAccessProperties, MemoryStrategy};
 
 // Bounded because the file allows it; add the hint to make it a requirement
 // rather than a preference.
@@ -182,7 +184,7 @@ let file = File::open_rw_with_options(
     "huge-log.h5",
     FileAccessProperties::new().with_memory_strategy(MemoryStrategy::Bounded),
 ).unwrap();
-assert_eq!(file.memory_strategy(), Some(MemoryStrategy::Bounded));
+assert_eq!(file.edit_backing(), Some(EditBacking::Bounded));
 let mut samples = file.dataset("samples").unwrap();
 samples.append(&[8i32, 9, 10, 11]).unwrap();
 file.close().unwrap();

@@ -176,6 +176,7 @@ use crate::dataspace::{Dataspace, DataspaceType};
 use crate::datatype::{Datatype, DatatypeByteOrder};
 use crate::error::{Error, FormatError, OBJECT_HEADER_MESSAGE_MAX};
 use crate::extensible_array::ExtensibleArrayHeader;
+use crate::file_create_properties::FileCreateProperties;
 use crate::file_lock::{self, FileLocking};
 use crate::file_space_info::{FileSpaceInfo, FileSpaceStrategy, NUM_FILE_FSM_MANAGERS};
 use crate::file_writer::{
@@ -195,6 +196,7 @@ use crate::image::{FileImage, HandleImage, MirrorImage};
 use crate::link_message::{LinkMessage, LinkTarget};
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
+use crate::reader::FileAccessProperties;
 use crate::signature;
 use crate::source::{BaseOffsetSource, BytesSource, MetadataCacheConfig, Source};
 use crate::superblock::Superblock;
@@ -474,7 +476,7 @@ pub(crate) struct WriteEngine {
     batched_appends: bool,
     /// Whether this session reads through a handle rather than a whole-file
     /// mirror. Set by [`open_rw_with_strategy`](Self::open_rw_with_strategy), and reported by
-    /// [`File::memory_strategy`](crate::File::memory_strategy) so a caller who
+    /// [`File::edit_backing`](crate::File::edit_backing) so a caller who
     /// asked for [`MemoryStrategy::Auto`] can tell which one it got. Distinct
     /// from [`batched_appends`](Self::batched_appends), which is a crash-atomicity
     /// trade the bounded engine happens to make, not a statement about memory.
@@ -504,8 +506,9 @@ pub(crate) struct WriteEngine {
 /// while the deprecated [`File::open_rw_bounded`](crate::File::open_rw_bounded)
 /// refuses instead of falling back ([`Bounded`](Self::Bounded)).
 ///
-/// A [`File`](crate::File) reports what it actually got from
-/// [`File::memory_strategy`](crate::File::memory_strategy).
+/// This is a *request*, so it is deliberately not the type a file answers with:
+/// [`File::edit_backing`](crate::File::edit_backing) returns an [`EditBacking`],
+/// which cannot express [`Auto`](Self::Auto).
 ///
 /// Sealed: unlike [`FileLocking`] or [`FileSpaceStrategy`](crate::FileSpaceStrategy),
 /// whose variant sets mirror a closed C-library enum, this is a policy this crate
@@ -528,6 +531,40 @@ pub enum MemoryStrategy {
     Mirrored,
 }
 
+/// Which of the two read-write backends a file's editing session is actually
+/// using, from [`File::edit_backing`](crate::File::edit_backing).
+///
+/// Deliberately a different type from [`MemoryStrategy`]: that one is what a
+/// caller *asks* for and includes [`Auto`](MemoryStrategy::Auto), which is a
+/// preference between these two rather than a third thing a session can be. A
+/// single shared type would make `file.backing() == Auto` a comparison that
+/// compiles and is false forever.
+///
+/// The two also evolve at different rates. A future `MemoryStrategy` may name a
+/// new *policy* — a byte budget, a size threshold — without the set of backends
+/// changing at all. Sealed for the rarer case that a third backend does appear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EditBacking {
+    /// Reads through a file handle, holding only what a commit is building.
+    /// Memory does not scale with the file.
+    Bounded,
+    /// Holds the whole file in memory for the life of the session.
+    Mirrored,
+}
+
+impl From<EditBacking> for MemoryStrategy {
+    /// Turns an outcome back into the request that pins it, so a caller can
+    /// reopen a file onto the backing it got the first time:
+    /// `with_memory_strategy(file.edit_backing().unwrap().into())`.
+    fn from(backing: EditBacking) -> Self {
+        match backing {
+            EditBacking::Bounded => Self::Bounded,
+            EditBacking::Mirrored => Self::Mirrored,
+        }
+    }
+}
+
 /// Why the bounded engine cannot edit a file, when the whole-file mirror can.
 ///
 /// Kept separate from the refusals that apply to *both* engines: a fallback is
@@ -548,6 +585,44 @@ fn bounded_only_limitation(session: &WriteEngine) -> Option<&'static str> {
             "bounded read-write access does not support a file with a userblock \
              (non-zero base address); leave MemoryStrategy unset, or pass \
              MemoryStrategy::Auto, to fall back to the whole-file mirror here",
+        );
+    }
+    None
+}
+
+/// Whether a file built from `create` could not then be opened read-write under
+/// `access`, and why.
+///
+/// [`File::create_with_options`](crate::File::create_with_options) writes a file
+/// and hands back an open read-write handle, so a creation/access pair that
+/// cannot survive that second half must be caught *before* the write — otherwise
+/// the call leaves a file on disk and returns `Err`, which reads like a failed
+/// create but is not one.
+///
+/// This mirrors the open-time refusals above and must be kept in step with them:
+/// [`bounded_only_limitation`] for the userblock, and the shared paged check in
+/// [`open_rw_with_strategy`](WriteEngine::open_rw_with_strategy) for a paged file
+/// with no persisted free space. Both are stated here in terms of the properties
+/// that *cause* them, because the open-time wording tells the caller to recreate
+/// the file — advice that is circular when the caller is creating it.
+pub(crate) fn create_would_refuse_reopen(
+    create: &FileCreateProperties,
+    access: &FileAccessProperties,
+) -> Option<&'static str> {
+    if let Some((FileSpaceStrategy::Page, false, _)) = create.file_space_strategy() {
+        return Some(
+            "a paged file (FileSpaceStrategy::Page) with persist = false cannot be reopened \
+             read-write, so creating one this way would write the file and then fail to open \
+             it; pass persist = true to with_file_space_strategy, or build the file with \
+             FileBuilder if it is only ever going to be read",
+        );
+    }
+    if create.userblock() != 0 && access.memory_strategy() == Some(MemoryStrategy::Bounded) {
+        return Some(
+            "a userblock cannot be combined with MemoryStrategy::Bounded: the bounded engine \
+             cannot edit a file with a non-zero base address, so creating one this way would \
+             write the file and then refuse to open it; drop the userblock, or leave \
+             MemoryStrategy unset to mirror this file",
         );
     }
     None
@@ -1453,18 +1528,16 @@ impl WriteEngine {
         &self.superblock
     }
 
-    /// The memory strategy this session actually resolved to: [`Bounded`] when it
-    /// reads through a handle, [`Mirrored`] when it holds a whole-file image.
-    /// Never [`Auto`], which is a request rather than an outcome.
+    /// Which backend this session resolved to: [`Bounded`] when it reads through
+    /// a handle, [`Mirrored`] when it holds a whole-file image.
     ///
-    /// [`Bounded`]: MemoryStrategy::Bounded
-    /// [`Mirrored`]: MemoryStrategy::Mirrored
-    /// [`Auto`]: MemoryStrategy::Auto
-    pub(crate) fn memory_strategy(&self) -> MemoryStrategy {
+    /// [`Bounded`]: EditBacking::Bounded
+    /// [`Mirrored`]: EditBacking::Mirrored
+    pub(crate) fn edit_backing(&self) -> EditBacking {
         if self.bounded {
-            MemoryStrategy::Bounded
+            EditBacking::Bounded
         } else {
-            MemoryStrategy::Mirrored
+            EditBacking::Mirrored
         }
     }
 

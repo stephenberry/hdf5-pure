@@ -9,7 +9,10 @@
 //! says which one it is, because "bounded" is a memory guarantee and a caller who
 //! was quietly given the mirror instead has no other way to notice.
 
-use hdf5_pure::{File, FileAccessProperties, FileBuilder, FileSpaceStrategy, MemoryStrategy};
+use hdf5_pure::{
+    EditBacking, File, FileAccessProperties, FileBuilder, FileCreateProperties, FileSpaceStrategy,
+    MemoryStrategy,
+};
 
 fn with_strategy(strategy: MemoryStrategy) -> FileAccessProperties {
     FileAccessProperties::new().with_memory_strategy(strategy)
@@ -61,7 +64,7 @@ fn open_rw_edits_an_ordinary_file_bounded() {
     plain_file(&path);
 
     let file = File::open_rw(&path).unwrap();
-    assert_eq!(file.memory_strategy(), Some(MemoryStrategy::Bounded));
+    assert_eq!(file.edit_backing(), Some(EditBacking::Bounded));
     file.dataset("d").unwrap().append(&[4i32]).unwrap();
     file.close().unwrap();
 
@@ -88,7 +91,7 @@ fn open_rw_falls_back_to_the_mirror_and_says_so() {
 
     // The whole point of the observable: a caller learns the fallback was taken
     // and memory now scales with the file.
-    assert_eq!(file.memory_strategy(), Some(MemoryStrategy::Mirrored));
+    assert_eq!(file.edit_backing(), Some(EditBacking::Mirrored));
 
     // And it is a real editing session, not just an open that succeeded.
     //
@@ -154,7 +157,7 @@ fn mirrored_takes_the_mirror_even_on_a_bounded_capable_file() {
     plain_file(&path);
 
     let file = File::open_rw_with_options(&path, with_strategy(MemoryStrategy::Mirrored)).unwrap();
-    assert_eq!(file.memory_strategy(), Some(MemoryStrategy::Mirrored));
+    assert_eq!(file.edit_backing(), Some(EditBacking::Mirrored));
     file.dataset("d").unwrap().append(&[4i32]).unwrap();
     file.close().unwrap();
 }
@@ -180,7 +183,7 @@ fn an_explicit_strategy_overrides_either_entry_point() {
     #[allow(deprecated)]
     let file =
         File::open_rw_bounded_with_options(&path, with_strategy(MemoryStrategy::Auto)).unwrap();
-    assert_eq!(file.memory_strategy(), Some(MemoryStrategy::Mirrored));
+    assert_eq!(file.edit_backing(), Some(EditBacking::Mirrored));
 }
 
 /// A file neither engine can edit is refused whatever is preferred — falling back
@@ -249,9 +252,9 @@ fn a_file_with_no_editing_session_has_no_strategy_to_report() {
     let path = dir.path().join("ro.h5");
     plain_file(&path);
 
-    assert_eq!(File::open(&path).unwrap().memory_strategy(), None);
+    assert_eq!(File::open(&path).unwrap().edit_backing(), None);
     assert_eq!(
-        File::open_streaming(&path).unwrap().memory_strategy(),
+        File::open_streaming(&path).unwrap().edit_backing(),
         None,
         "a streaming open builds no editing session either"
     );
@@ -277,5 +280,113 @@ fn the_requested_strategy_survives_on_the_properties() {
         file.access_properties().memory_strategy(),
         Some(MemoryStrategy::Auto)
     );
-    assert_eq!(file.memory_strategy(), Some(MemoryStrategy::Mirrored));
+    assert_eq!(file.edit_backing(), Some(EditBacking::Mirrored));
+}
+
+/// The request type and the outcome type are deliberately distinct, so that
+/// `Auto` — a preference between the two backends, not a third backend — cannot
+/// be written into a comparison against what a file actually got. This is what
+/// the type buys over a rename: `edit_backing() == Some(Auto)` does not compile.
+#[test]
+fn an_outcome_converts_back_into_the_request_that_pins_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pin.h5");
+    plain_file(&path);
+
+    let got = File::open_rw(&path).unwrap().edit_backing().unwrap();
+    assert_eq!(got, EditBacking::Bounded);
+
+    // A caller that wants a later reopen to land on the same backing, whatever
+    // dispatch would have chosen, converts the outcome into the request.
+    let file = File::open_rw_with_options(&path, with_strategy(got.into())).unwrap();
+    assert_eq!(file.edit_backing(), Some(EditBacking::Bounded));
+    assert_eq!(
+        file.access_properties().memory_strategy(),
+        Some(MemoryStrategy::Bounded),
+        "the conversion must produce the strict request, not the permissive one"
+    );
+}
+
+/// The SWMR writer always mirrors. `Auto` and unset are *satisfied* by that, so
+/// they must keep opening; only `Bounded` is a guarantee it cannot meet, and
+/// meeting a guarantee by ignoring it is how a caller silently spends the memory
+/// it asked not to.
+#[test]
+fn the_swmr_writer_refuses_a_bounded_guarantee_it_cannot_meet() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("swmr.h5");
+    plain_file(&path);
+
+    let err = File::open_swmr_writer_with_options(&path, with_strategy(MemoryStrategy::Bounded))
+        .expect_err("the SWMR writer cannot honor a bounded guarantee");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("whole-file mirror") && msg.contains("MemoryStrategy::Auto"),
+        "the refusal must name the backing it uses and a strategy that works, got: {msg}"
+    );
+
+    for satisfied in [
+        None,
+        Some(MemoryStrategy::Auto),
+        Some(MemoryStrategy::Mirrored),
+    ] {
+        let props = satisfied.map_or_else(FileAccessProperties::new, with_strategy);
+        let file = File::open_swmr_writer_with_options(&path, props)
+            .unwrap_or_else(|e| panic!("{satisfied:?} is satisfied by the mirror, got: {e}"));
+        assert_eq!(file.edit_backing(), Some(EditBacking::Mirrored));
+        file.close().unwrap();
+    }
+}
+
+/// `create_with_options` promises a file *and* an open handle. A pair that the
+/// reopen would refuse has to fail before the write, or the call leaves a file on
+/// disk and returns `Err` — which reads like a failed create but is not one.
+#[test]
+fn create_refuses_a_pair_it_could_not_reopen_before_writing_anything() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Refused by every backing: a paged file with no persisted free space cannot
+    // be grown in place at all.
+    let paged = dir.path().join("paged.h5");
+    let err = File::create_with_options(
+        &paged,
+        FileCreateProperties::new().with_file_space_strategy(FileSpaceStrategy::Page, false, 1),
+        FileAccessProperties::new(),
+    )
+    .expect_err("a paged non-persisting file cannot be reopened read-write");
+    assert!(
+        err.to_string().contains("persist = true"),
+        "the refusal must name the property to change, not tell the caller to \
+         recreate the file it is creating: {err}"
+    );
+    assert!(
+        !paged.exists(),
+        "the file must not be written when the reopen is known to fail"
+    );
+
+    // Refused by the bounded backing only, which is a property *pair* rather than
+    // a property: the same fcpl is fine under any other strategy.
+    let ub = dir.path().join("ub.h5");
+    let err = File::create_with_options(
+        &ub,
+        FileCreateProperties::new().with_userblock(512),
+        FileAccessProperties::new().with_memory_strategy(MemoryStrategy::Bounded),
+    )
+    .expect_err("a userblock and a bounded guarantee cannot both hold");
+    assert!(
+        err.to_string().contains("userblock") && err.to_string().contains("Bounded"),
+        "the refusal must name both halves of the contradiction: {err}"
+    );
+    assert!(!ub.exists(), "nothing may be written for a refused pair");
+
+    // And the same userblock creates fine when nothing demands the bounded
+    // engine, so the check is on the pair and not on the userblock alone.
+    let ok = dir.path().join("ok.h5");
+    let file = File::create_with_options(
+        &ok,
+        FileCreateProperties::new().with_userblock(512),
+        FileAccessProperties::new(),
+    )
+    .unwrap();
+    assert_eq!(file.edit_backing(), Some(EditBacking::Mirrored));
 }

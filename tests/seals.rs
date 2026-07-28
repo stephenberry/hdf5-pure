@@ -31,8 +31,8 @@
 #![deny(unreachable_patterns)]
 
 use hdf5_pure::{
-    AttrValue, CompoundMember, DType, Datatype, FileSpaceInfo, LibVer, MemoryStrategy, Object,
-    ReferenceType, mat::MatClass,
+    AttrValue, CompoundMember, DType, Datatype, EditBacking, FileSpaceInfo, LibVer, MemoryStrategy,
+    Object, ReferenceType, mat::MatClass,
 };
 
 /// Every sealed enum, matched over its full variant set plus a `_` arm. This
@@ -66,6 +66,13 @@ fn sealed_enums_still_require_a_wildcard_arm() {
     fn memory_strategy(m: MemoryStrategy) {
         match m {
             MemoryStrategy::Bounded | MemoryStrategy::Auto | MemoryStrategy::Mirrored => {}
+            _ => {}
+        }
+    }
+
+    fn edit_backing(b: EditBacking) {
+        match b {
+            EditBacking::Bounded | EditBacking::Mirrored => {}
             _ => {}
         }
     }
@@ -148,6 +155,7 @@ fn sealed_enums_still_require_a_wildcard_arm() {
     // Referenced so a rename cannot leave the guards above silently unused.
     libver(LibVer::LATEST);
     memory_strategy(MemoryStrategy::Bounded);
+    edit_backing(EditBacking::Bounded);
     reference_type(&ReferenceType::Object);
     attr_value(&AttrValue::I32(1));
     dtype(&DType::F64);
