@@ -282,6 +282,19 @@ impl ManagedPlan {
     /// Refuses rather than lays out a set the heap or the host cannot address;
     /// see [`PlanRefusal`].
     pub(crate) fn new(sizes: &[u64], offset_size: u8) -> Result<ManagedPlan, PlanRefusal> {
+        // An object past the largest direct block fits no slot at all, and the
+        // walk below would look for one all the way to the top of the heap's
+        // address space — a billion iterations before it gives up. Callers split
+        // huge objects out before they get here, so this is a construction
+        // invariant rather than an input to validate, but a walk that has no
+        // cheap upper bound deserves to fail on the first line instead of
+        // spinning.
+        debug_assert!(
+            sizes
+                .iter()
+                .all(|&size| size <= max_managed_object(offset_size) as u64),
+            "an object too large for a managed block belongs in huge storage"
+        );
         let header = direct_block_header(offset_size) as u64;
         let mut directs: Vec<PlannedDirect> = Vec::new();
         let mut offsets: Vec<u64> = Vec::with_capacity(sizes.len());
