@@ -85,13 +85,23 @@ pub(crate) const fn header_size(offset_size: u8, length_size: u8) -> usize {
 /// Spread `total` items over `parts` groups as evenly as possible, largest
 /// first. The groups differ by at most one, so no group can exceed the capacity
 /// the caller sized `parts` against.
-fn distribute(total: u64, parts: u64) -> Vec<u64> {
+fn distribute(total: usize, parts: usize) -> Vec<usize> {
     debug_assert!(parts > 0, "a node always has at least one child");
     let base = total / parts;
     let remainder = total % parts;
     (0..parts)
         .map(|i| if i < remainder { base + 1 } else { base })
         .collect()
+}
+
+/// A per-level capacity as a count of records this host could actually hold.
+///
+/// Capacities are `u64` because the format's fields are, but a record count is
+/// bounded by the caller's slice and so by `usize`. On a 64-bit host these are
+/// the same number; on a 32-bit one a capacity past `usize::MAX` means "more
+/// than can exist here", and saturating says exactly that.
+fn capacity_as_usize(capacity: u64) -> usize {
+    usize::try_from(capacity).unwrap_or(usize::MAX)
 }
 
 impl BTreeV2Plan {
@@ -105,13 +115,13 @@ impl BTreeV2Plan {
     /// are nowhere near it.
     pub(crate) fn new(
         tree_type: u8,
-        record_count: u64,
+        record_count: usize,
         record_size: u16,
         node_size: u32,
         offset_size: u8,
     ) -> Option<BTreeV2Plan> {
         let (info, depth) =
-            NodeInfo::for_record_count(node_size, record_size, offset_size, record_count)?;
+            NodeInfo::for_record_count(node_size, record_size, offset_size, record_count as u64)?;
 
         let mut nodes = Vec::new();
         if record_count == 0 {
@@ -125,10 +135,7 @@ impl BTreeV2Plan {
         } else {
             let mut next_record = 0usize;
             plan_subtree(record_count, depth, &info, &mut next_record, &mut nodes)?;
-            debug_assert_eq!(
-                next_record as u64, record_count,
-                "every record is placed once"
-            );
+            debug_assert_eq!(next_record, record_count, "every record is placed once");
         }
 
         Some(BTreeV2Plan {
@@ -136,7 +143,7 @@ impl BTreeV2Plan {
             node_size,
             record_size,
             depth,
-            total_records: record_count,
+            total_records: record_count as u64,
             nodes,
             info,
         })
@@ -269,23 +276,23 @@ fn min_records(depth: u16) -> u64 {
 /// node. Reported rather than asserted because it is a property of the node and
 /// record sizes the caller chose, not of this function.
 fn plan_subtree(
-    count: u64,
+    count: usize,
     depth: u16,
     info: &NodeInfo,
     next_record: &mut usize,
     out: &mut Vec<PlannedNode>,
 ) -> Option<usize> {
     debug_assert!(
-        count <= info.cum_max_nrec(depth),
+        count as u64 <= info.cum_max_nrec(depth),
         "a subtree was handed more records than its depth can hold"
     );
-    if count < min_records(depth) {
+    if (count as u64) < min_records(depth) {
         return None;
     }
 
     if depth == 0 {
-        let records = (*next_record..*next_record + count as usize).collect();
-        *next_record += count as usize;
+        let records = (*next_record..*next_record + count).collect();
+        *next_record += count;
         out.push(PlannedNode {
             depth,
             records,
@@ -299,22 +306,22 @@ fn plan_subtree(
     // so `k` must satisfy `(k + 1) * child_capacity >= count - k`. Taking the
     // smallest such `k` fills the subtrees as full as possible, which keeps the
     // tree the same shape sequential insertion would reach.
-    let child_capacity = info.cum_max_nrec(depth - 1);
+    let child_capacity = capacity_as_usize(info.cum_max_nrec(depth - 1));
     let k = count
         .saturating_sub(child_capacity)
         .div_ceil(child_capacity + 1)
         .max(1);
     debug_assert!(
-        k <= info.max_nrec(depth),
+        k as u64 <= info.max_nrec(depth),
         "a node was given more records than its level can hold"
     );
 
     let group_sizes = distribute(count - k, k + 1);
-    let mut records = Vec::with_capacity(k as usize);
-    let mut children = Vec::with_capacity(k as usize + 1);
+    let mut records = Vec::with_capacity(k);
+    let mut children = Vec::with_capacity(k + 1);
     for (i, &size) in group_sizes.iter().enumerate() {
         children.push(plan_subtree(size, depth - 1, info, next_record, out)?);
-        if (i as u64) < k {
+        if i < k {
             records.push(*next_record);
             *next_record += 1;
         }
@@ -350,9 +357,9 @@ mod tests {
 
     /// Records that are just their own index, so a round trip proves both that
     /// every record survived and that the in-order traversal preserved order.
-    fn numbered_records(count: u64, record_size: u16) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(count as usize * record_size as usize);
-        for i in 0..count {
+    fn numbered_records(count: usize, record_size: u16) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(count * record_size as usize);
+        for i in 0..count as u64 {
             let mut rec = vec![0u8; record_size as usize];
             rec[..8].copy_from_slice(&i.to_le_bytes());
             buf.extend_from_slice(&rec);
@@ -362,7 +369,7 @@ mod tests {
 
     /// Build a tree, then read it back through the parser this crate ships,
     /// returning the record indices in traversal order alongside the depth.
-    fn round_trip(count: u64, record_size: u16) -> (u16, Vec<u64>) {
+    fn round_trip(count: usize, record_size: u16) -> (u16, Vec<u64>) {
         let plan =
             BTreeV2Plan::new(8, count, record_size, NODE_SIZE, OFFSET_SIZE).expect("plannable");
         let records = numbered_records(count, record_size);
@@ -376,7 +383,7 @@ mod tests {
 
         let header = BTreeV2Header::parse(&file, 0, OFFSET_SIZE, LENGTH_SIZE).expect("header");
         assert_eq!(header.node_size, NODE_SIZE);
-        assert_eq!(header.total_records, count);
+        assert_eq!(header.total_records, count as u64);
         let read =
             collect_btree_v2_records(&file, &header, OFFSET_SIZE, LENGTH_SIZE).expect("read");
         let ids = read
@@ -397,7 +404,7 @@ mod tests {
             let (_, ids) = round_trip(count, 17);
             assert_eq!(
                 ids,
-                (0..count).collect::<Vec<_>>(),
+                (0..count as u64).collect::<Vec<_>>(),
                 "round trip of {count} records"
             );
         }
@@ -422,7 +429,7 @@ mod tests {
     #[test]
     fn a_wider_record_reaches_depth_sooner() {
         let (depth, ids) = round_trip(1_000, 24);
-        assert_eq!(ids, (0..1_000).collect::<Vec<_>>());
+        assert_eq!(ids, (0..1_000u64).collect::<Vec<_>>());
         assert_eq!(depth, 2, "20 records per leaf, 380 per depth-1 subtree");
     }
 
@@ -431,7 +438,7 @@ mod tests {
     /// libhdf5 aborts on the first.
     #[test]
     fn no_node_exceeds_its_capacity_or_sits_empty() {
-        for count in [1u64, 30, 569, 570, 10_260, 40_000] {
+        for count in [1usize, 30, 569, 570, 10_260, 40_000] {
             let plan = BTreeV2Plan::new(8, count, 17, NODE_SIZE, OFFSET_SIZE).expect("plannable");
             for node in &plan.nodes {
                 assert!(

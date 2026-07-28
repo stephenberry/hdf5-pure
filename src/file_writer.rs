@@ -450,7 +450,7 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     // here cannot fail on anything a caller controls.
     let name_plan = BTreeV2Plan::new(
         DENSE_ATTR_NAME_BTREE_TYPE,
-        attrs.len() as u64,
+        attrs.len(),
         DENSE_ATTR_BTREE_RECORD,
         btree_v2_write::NODE_SIZE,
         OFFSET_SIZE,
@@ -459,7 +459,7 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     let huge_plan = (huge_count > 0).then(|| {
         BTreeV2Plan::new(
             DENSE_ATTR_HUGE_BTREE_TYPE,
-            huge_count as u64,
+            huge_count,
             DENSE_ATTR_HUGE_BTREE_RECORD,
             btree_v2_write::NODE_SIZE,
             OFFSET_SIZE,
