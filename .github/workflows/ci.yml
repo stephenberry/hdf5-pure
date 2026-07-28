@@ -280,19 +280,18 @@ jobs:
   # ===========================================================================
   # Undefined-behavior sanitizing with Miri (issue #26).
   #
-  # The library is almost entirely safe Rust; the unsafe that exists is the
-  # cache-line-aligned chunk buffer in `chunk_cache` (manual global-allocator
-  # `alloc_zeroed`/`dealloc`, `slice::from_raw_parts[_mut]`, and `unsafe impl
-  # Send`/`Sync` for `CacheAlignedBuffer`). Miri interprets that allocation and
-  # the surrounding pointer arithmetic under Stacked Borrows + strict provenance,
-  # catching aliasing / out-of-bounds / leak UB that the normal test run cannot
-  # observe.
+  # The library is almost entirely safe Rust. The one piece of non-trivial
+  # unsafe reachable from a `std` build is `mat::transpose`, which writes a
+  # tiled transpose through a raw pointer into uninitialized `Vec` capacity and
+  # then calls `set_len`. Miri interprets those writes under Stacked Borrows +
+  # strict provenance, catching the out-of-bounds or partially-initialized cases
+  # a normal test run cannot observe.
   #
-  # Scoped to the `chunk_cache` unit tests on purpose: most other tests touch the
+  # Scoped to that module's unit tests on purpose: most other tests touch the
   # filesystem and the crosscheck tests call into the libhdf5 C library, neither
-  # of which Miri can execute. Widen the `--lib` test filter as more
-  # pure-in-memory unsafe lands (the single-threaded `nosync::Mutex` is the next
-  # candidate, once the crate's no_std unit-test harness compiles).
+  # of which Miri can execute. Widen the `--lib` filter as more pure-in-memory
+  # unsafe lands (the single-threaded `nosync::Mutex` is the next candidate,
+  # once the crate's no_std unit-test harness compiles).
   miri:
     name: Miri (undefined behavior)
     runs-on: ubuntu-latest
@@ -302,11 +301,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: miri
-      - name: Miri test (chunk_cache unsafe)
-        # `--no-default-features --features std` keeps the interpreted build
-        # minimal: the `chunk_cache` tests are pure in-memory, so there is no
-        # need to compile the `deflate` (flate2/miniz_oxide) or `checksum` code
-        # that Miri never executes. Smaller, more deterministic surface.
-        run: cargo miri test --locked --no-default-features --features std --lib chunk_cache
+      - name: Miri test (mat::transpose unsafe)
+        # `--no-default-features --features std,serde` keeps the interpreted
+        # build minimal: `serde` is what gates the `mat` module, and the
+        # transpose tests are pure in-memory, so there is no need to compile the
+        # `deflate` (flate2/miniz_oxide) or `checksum` code that Miri never
+        # executes. Smaller, more deterministic surface.
+        #
+        # A filter that matches nothing makes libtest exit 0, which is how this
+        # job came to guard a module holding no unsafe at all. Fail loudly on an
+        # empty run so a rename cannot quietly hollow the gate out again.
+        run: |
+          set -o pipefail
+          cargo miri test --locked --no-default-features --features std,serde \
+            --lib mat::transpose 2>&1 | tee miri.log
+          if grep -q "running 0 tests" miri.log; then
+            echo "::error::Miri ran no tests: the --lib filter matched nothing."
+            exit 1
+          fi
         env:
           MIRIFLAGS: -Zmiri-strict-provenance

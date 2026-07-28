@@ -21,6 +21,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Breaking:** `FormatError::DenseAttributeHeapTooLarge` now carries only `limit`, and bounds the heap's 40-bit address space rather than a single 2 GiB direct block ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
 - Every dense attribute set has different bytes: its name index is a tree of 512-byte nodes, and its attributes sit in a doubling table whose blocks start at 1 KiB and grow by adding blocks rather than by rounding one up to a power of two. Files written by earlier versions still read ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
 - `mat::to_file` and `mat::to_file_with_options` stream to disk rather than building the whole file in memory first. Same bytes ([#226](https://github.com/stephenberry/hdf5-pure/pull/226)).
+- Chunks are written back to back instead of padded to the host's cache line, so a chunked dataset no longer occupies more space on `aarch64` than on `x86_64` and a given input produces the same bytes on every target. Files written by earlier versions still read ([#227](https://github.com/stephenberry/hdf5-pure/issues/227)).
 
 ## [0.28.0] - 2026-07-28
 

@@ -116,6 +116,16 @@ discipline backs the optional [ZFP filter](../guide/compression.md)
 `.mat` path. For the cross-tool story in depth, see the
 [MATLAB interop page](matlab.md).
 
+### Host-independent output
+
+The bytes a write produces are a function of the data and the options alone.
+Nothing about the machine doing the writing — its architecture, pointer width,
+or cache-line size — reaches the file, so the same input yields the same file on
+every target, and a file does not grow when written on one platform rather than
+another. Chunks in particular are stored back to back; if your workload wants
+cache-line-aligned buffers, align the destination memory you read into rather
+than looking for it in the file.
+
 ### 32-bit safety
 
 The same crosscheck discipline extends to 32-bit hosts. Every offset and length
@@ -128,6 +138,7 @@ with `File::open_streaming` (see [streaming](../guide/streaming.md)) instead of
 ### Memory safety
 
 The crate is almost entirely safe Rust. The only non-trivial `unsafe` is the
-cache-line-aligned chunk buffer in the chunk cache, and it is exercised under
-Miri with strict provenance in CI. The [architecture page](../about/architecture.md)
-covers the safety and robustness guarantees in more detail.
+tiled row-major/column-major transpose used by the MATLAB writer, and it is
+exercised under Miri with strict provenance in CI. The
+[architecture page](../about/architecture.md) covers the safety and robustness
+guarantees in more detail.

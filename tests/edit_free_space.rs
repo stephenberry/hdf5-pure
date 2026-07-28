@@ -319,11 +319,10 @@ fn deleting_filtered_chunked_dataset_reclaims_storage() {
 
 #[test]
 fn deleting_unfiltered_chunked_dataset_truncates_fully() {
-    // An unfiltered chunked dataset whose chunk size is a cache-line multiple is
-    // laid out as one contiguous blob (chunk data + Fixed Array index, no
-    // inter-chunk padding). Adding it at end-of-file then deleting it in the same
-    // session reclaims the whole blob as a trailing run, truncating the file back
-    // to essentially its prior size.
+    // An unfiltered chunked dataset is laid out as one contiguous blob (chunk
+    // data followed by the Fixed Array index, nothing between). Adding it at
+    // end-of-file then deleting it in the same session reclaims the whole blob as
+    // a trailing run, truncating the file back to essentially its prior size.
     let path = tmp("hdf5_pure_fs_chunked_unfiltered.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
@@ -332,7 +331,7 @@ fn deleting_unfiltered_chunked_dataset_truncates_fully() {
 
     {
         let s = File::open_rw(&path).unwrap();
-        // 8 chunks of 512 f64 = 4096 bytes each (a multiple of the cache line).
+        // 8 chunks of 512 f64 = 4096 bytes each.
         s.root()
             .create_dataset("big", |b| {
                 b.with_f64_data(&vec![7.0; 4096]).with_chunks(&[512]);
@@ -370,8 +369,8 @@ fn deleting_unfiltered_chunked_dataset_truncates_fully() {
 fn deleting_paged_fixed_array_dataset_reclaims_storage() {
     // More than 1024 chunks puts the Fixed Array data block into its *paged*
     // layout (a page-init bitmap and per-page checksums). 1100 chunks of 16 f64
-    // (128 bytes, a cache-line multiple) exercise that index-sizing path end to
-    // end: the whole index plus chunk data is reclaimed on delete.
+    // exercise that index-sizing path end to end: the whole index plus chunk
+    // data is reclaimed on delete.
     let path = tmp("hdf5_pure_fs_paged_fa.h5");
     let mut b = FileBuilder::new();
     b.create_dataset("keep").with_i32_data(&[7]);
@@ -466,8 +465,8 @@ fn deleting_single_chunk_dataset_reclaims_storage() {
 
     {
         let s = File::open_rw(&path).unwrap();
-        // 1024 f64 = 8192 bytes (a cache-line multiple), so the single chunk's
-        // blob carries no trailing padding and reclaims as one trailing run.
+        // 1024 f64 = 8192 bytes in a single chunk, whose blob reclaims as one
+        // trailing run.
         s.root()
             .create_dataset("one", |b| {
                 b.with_f64_data(&vec![1.25; 1024]).with_chunks(&[1024]);

@@ -93,9 +93,9 @@ that is correct down to the bytes, or it produces no file and tells you why.
 
 ## Safety and robustness
 
-- **Almost entirely safe Rust.** The only non-trivial `unsafe` is the
-  cache-line-aligned chunk buffer in the chunk cache, which is exercised under
-  [Miri](https://github.com/rust-lang/miri) with strict provenance in CI.
+- **Almost entirely safe Rust.** The only non-trivial `unsafe` is the tiled
+  row-major/column-major transpose used by the MATLAB writer, which is exercised
+  under [Miri](https://github.com/rust-lang/miri) with strict provenance in CI.
 - **32-bit safe.** Every file-derived offset and length is narrowed through
   checked conversions, so a 64-bit value that does not fit a 32-bit `usize`
   errors instead of truncating. CI runs the suite on `i686` under QEMU and
