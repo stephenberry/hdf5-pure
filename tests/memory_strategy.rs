@@ -88,6 +88,10 @@ fn auto_falls_back_to_the_mirror_and_says_so() {
         b.append_i32(&[4, 5]);
     })
     .unwrap();
+    // Drop the dataset handle before closing: it holds a clone of the same inner
+    // file, so the exclusive lock outlives `close` while it is alive, and the
+    // read below fails on Windows (os error 33) where OS locks are mandatory.
+    drop(ds);
     file.close().unwrap();
 
     let reopened = File::open(&path).unwrap();
