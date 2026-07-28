@@ -65,6 +65,20 @@ pub enum FormatError {
     /// base, so the two boundaries coincide only when the userblock divides by
     /// the page size: `(userblock bytes, page size)`.
     UserblockNotPageAligned(u64, u64),
+    /// A userblock size the format does not define: it must be zero, or a power
+    /// of two of at least 512 bytes. A reader looks for the superblock at 0, 512,
+    /// 1024, and so on doubling, so any other size produces a file nothing can
+    /// open.
+    InvalidUserblockSize(u64),
+    /// More userblock content was supplied than the userblock region holds. The
+    /// overflow would displace the superblock, so it is refused rather than
+    /// truncated.
+    UserblockContentTooLarge {
+        /// Bytes supplied.
+        content: u64,
+        /// Bytes the userblock region holds.
+        userblock: u64,
+    },
     /// A free-space manager block (`FSHD`/`FSSE`) is malformed.
     InvalidFreeSpaceManager,
     /// An enumeration datatype was built over a base type that is not an
@@ -492,6 +506,19 @@ impl fmt::Display for FormatError {
                     "userblock of {userblock} bytes is not a whole number of {page_size}-byte \
                      file-space pages: a paged file measures its pages from the file base, so \
                      the userblock must be a multiple of the page size (or zero)"
+                )
+            }
+            FormatError::InvalidUserblockSize(size) => {
+                write!(
+                    f,
+                    "invalid userblock size {size}: must be zero or a power of two >= 512"
+                )
+            }
+            FormatError::UserblockContentTooLarge { content, userblock } => {
+                write!(
+                    f,
+                    "{content} bytes of userblock content do not fit a userblock of {userblock} \
+                     bytes"
                 )
             }
             FormatError::InvalidFreeSpaceManager => {

@@ -53,6 +53,24 @@ pub enum MatError {
     UnsupportedMatlabClass(String),
     /// UTF-16 decoding of a `char` dataset failed.
     Utf16Decode(String),
+    /// A [`DataProducer`](crate::mat::DataProducer) wrote the wrong number of
+    /// bytes for a block. Refused rather than written: a block of the wrong size
+    /// displaces every address after it, and the result would be a file that
+    /// fails to open for reasons that no longer point back here.
+    BlockSizeMismatch {
+        /// Block index the producer was asked for.
+        block: usize,
+        /// Bytes it had to write, as
+        /// [`Blocking::block_len`](crate::mat::Blocking::block_len) reports.
+        expected: usize,
+        /// Bytes it actually wrote.
+        actual: usize,
+    },
+    /// A producer-backed dataset was asked for on a builder configured for
+    /// compression. The layout needs each block's exact on-disk size before it
+    /// writes anything, and a compressed block's size is not knowable without
+    /// compressing it — which would buffer the data the path exists to avoid.
+    CompressionUnsupportedForBlocks,
     /// A generic serde-originated error (from `Error::custom`).
     Custom(String),
 }
@@ -87,6 +105,20 @@ impl fmt::Display for MatError {
                  other MCOS opaque classes such as datetime/categorical/table are refused for now)"
             ),
             MatError::Utf16Decode(msg) => write!(f, "UTF-16 decode: {msg}"),
+            MatError::BlockSizeMismatch {
+                block,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "block producer wrote {actual} bytes for block {block}, which must carry exactly \
+                 {expected}"
+            ),
+            MatError::CompressionUnsupportedForBlocks => write!(
+                f,
+                "a producer-backed dataset cannot be compressed: its blocks' on-disk sizes must be \
+                 known before the file is laid out"
+            ),
             MatError::Custom(msg) => write!(f, "{msg}"),
         }
     }

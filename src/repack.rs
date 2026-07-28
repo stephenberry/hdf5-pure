@@ -864,16 +864,37 @@ struct DatasetChunkProvider {
 }
 
 impl ChunkProvider for DatasetChunkProvider {
-    fn chunk_bytes(&self, index: usize) -> Result<Vec<u8>, FormatError> {
+    fn chunk_bytes(&self, index: usize, out: &mut Vec<u8>) -> Result<(), FormatError> {
         // Read exactly the chunk's compressed bytes at its recorded address, with
         // no decode and no `addr_offset` adjustment — the same slice the chunked
-        // reader consumes. `read_exact_at` returns exactly `chunk_size` bytes or
-        // errors, and the emitter additionally checks the length against the
-        // planned size, so the layout cannot silently desync from the data.
+        // reader consumes. `read_at` fills the whole buffer or errors, and the
+        // emitter additionally checks the length against the planned size, so the
+        // layout cannot silently desync from the data. Reading straight into the
+        // emitter's reused buffer keeps repack at one chunk-sized allocation for
+        // the whole dataset.
         let info = &self.grid_order[index];
-        self.file
-            .source()
-            .read_exact_at(info.address, info.chunk_size as usize)
+        let source = self.file.source();
+        let len = info.chunk_size as usize;
+        // Bounds-check before growing the buffer, the way `Source::read_exact_at`
+        // does and for its reason: `chunk_size` comes from the source's chunk
+        // index, so a malformed file could name a 4 GiB chunk and have this zero
+        // that much memory only for the read to fail EOF anyway.
+        let end = info
+            .address
+            .checked_add(len as u64)
+            .ok_or(FormatError::OffsetOverflow {
+                offset: info.address,
+                length: len as u64,
+            })?;
+        if end > source.len() {
+            return Err(FormatError::UnexpectedEof {
+                expected: end.to_usize().unwrap_or(usize::MAX),
+                available: source.len().to_usize().unwrap_or(usize::MAX),
+            });
+        }
+        let start = out.len();
+        out.resize(start + len, 0);
+        source.read_at(info.address, &mut out[start..])
     }
 }
 

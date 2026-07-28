@@ -53,7 +53,7 @@ let back: Experiment = mat::from_file("experiment.mat").unwrap();
 assert_eq!(back, e);
 ```
 
-To work with bytes instead of the filesystem, use `mat::to_bytes` and `mat::from_bytes`, which take and return a `Vec<u8>` / `&[u8]`. Both are equally subject to the `serde` feature gate.
+To work with bytes instead of the filesystem, use `mat::to_bytes` and `mat::from_bytes`, which take and return a `Vec<u8>` / `&[u8]`. To write somewhere else entirely — a socket, a compressing wrapper — use `mat::to_writer` and `mat::to_writer_with_options`, which assemble the file straight onto any `io::Write` without holding it in memory. All are equally subject to the `serde` feature gate.
 
 ## Type mapping
 
@@ -188,26 +188,85 @@ Reading (`from_bytes`) decodes the MCOS opaque value classes `datetime`, `durati
 
 Writing (`to_bytes`) does not encode non-unit enum variants, MATLAB `classdef` objects, or `datetime` / `duration` / `categorical` types. Unit enum variants are supported and serialize to a UTF-16 char dataset holding the variant name.
 
+## Writing more data than fits in memory
+
+`MatBuilder::write_f64` and its siblings copy the slice they are given, and `finish` returns the assembled file, so writing a large array costs roughly three times its size at peak: the caller's copy, the builder's, and the file's. Two APIs remove those, independently.
+
+`MatBuilder::finish_to` (and `write`, which is `finish_to` onto a file) assembles the file straight onto an `io::Write` in ascending-address order, never seeking and never holding the result. It produces byte-for-byte what `finish` returns.
+
+`MatBuilder::write_blocks` stages a dataset whose bytes are produced during the write rather than handed over. It takes a `DataProducer`, which the writer calls once per block, in order, during emission — not during layout, which works from the shape alone. Together they write a `.mat` of any size in about one block of memory:
+
+```rust
+use hdf5_pure::mat::{Block, DataProducer, MatBuilder, MatError, Options};
+
+// Each request carries its own contract, so the producer holds no state.
+struct Samples;
+
+impl DataProducer for Samples {
+    fn block_bytes(&self, block: Block, out: &mut Vec<u8>) -> Result<(), MatError> {
+        for i in 0..block.elements {
+            let value = (block.first_element + i) as f64;
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        Ok(())
+    }
+}
+
+// [channels, samples]: see "element order" below for why this way round.
+let dims = [4, 10_000_000];
+let mut mb = MatBuilder::new(Options::default());
+mb.write_blocks::<f64>("samples", &dims, Box::new(Samples)).unwrap();
+mb.write("capture.mat").unwrap();
+```
+
+A `Block` carries its `index`, the `first_element` it starts at in MATLAB's linear order, and how many `elements` to write (`block.len()` in bytes). Handing that to the producer rather than making it fetch a copy of the split beforehand is deliberate: a producer built against one blocking and staged against a different dataset would otherwise fail only mid-write, with part of the file already on the sink.
+
+`write_blocks` returns `&mut Self` like the other writers, so it chains. `Blocking::plan::<T>(dims)` computes the same split from the shape alone if you want it in advance — to size a buffer, or report progress — but no producer needs it.
+
+The element type names the MATLAB class: `write_blocks::<i16>` writes an `int16` array, `write_blocks::<(i16, i16)>` a complex one, `write_blocks::<bool>` a `logical`. The dataset is byte-for-byte the one `write_f64` would have produced for the same content, so a file written this way is reviewable against fixtures built the ordinary way.
+
+Two constraints are worth knowing before designing around this.
+
+**Uncompressed only.** The writer places every object before it emits a byte, so it needs the data region's exact size up front — pure geometry when unfiltered, unknowable without compressing when not. A producer-backed dataset on a builder configured for deflate is refused rather than silently stored uncompressed.
+
+**Element order.** MATLAB is column-major, so a producer emits elements in MATLAB's linear order, first index varying fastest, and each block continues where the previous stopped. That fixes which shape an acquisition should ask for: `[channels, samples]` puts a timestep's channels next to each other, so blocks run forward through time. The transpose, `[samples, channels]`, stores channel 0's entire history before channel 1's, and no producer can emit that as an acquisition proceeds.
+
+A producer that fails partway leaves a partial file on the sink. With a non-seekable sink there is nothing to roll back, so write to a temporary path and rename on success if you need all-or-nothing.
+
+### Errors
+
+| Condition | Error | When |
+|---|---|---|
+| Builder configured for deflate | `MatError::CompressionUnsupportedForBlocks` | At `write_blocks`, before anything is staged |
+| Producer wrote the wrong number of bytes | `MatError::BlockSizeMismatch { block, expected, actual }` | During the write |
+| Producer returned an error | that error, verbatim | During the write |
+
+A wrong block length is refused rather than written, because a short or long block shifts every address after it and the result would be a file that fails to open for reasons that no longer point back at the producer.
+
+!!! tip
+    The `mat_streaming` example is a complete working version of the above — an acquisition producer, a streamed write, a read-back, and a check that the bytes match the same content written the ordinary way. Run it with `cargo run --example mat_streaming` (no features needed: `MatBuilder` is not behind `serde`).
+
 ## Hand-built files (low-level conventions)
 
 If you are not using serde, you can apply the MATLAB conventions yourself on top of `FileBuilder`. Two pieces matter: the userblock header and the `MATLAB_class` / `MATLAB_fields` attributes.
 
 ### Userblock header
 
-MATLAB expects a 512-byte userblock beginning with the `MATLAB 7.3 MAT-file` signature. Reserve the block with `with_userblock(512)` and write the header bytes into the leading region after finishing:
+MATLAB expects a 512-byte userblock beginning with the `MATLAB 7.3 MAT-file` signature. Reserve the block with `with_userblock(512)` and hand the header to `with_userblock_content`, which makes it part of the file the writer emits:
 
 ```rust
 use hdf5_pure::FileBuilder;
+use hdf5_pure::mat::userblock;
 
 let mut builder = FileBuilder::new();
 builder.with_userblock(512);
+builder.with_userblock_content(&userblock::header_block(userblock::DEFAULT_DESCRIPTION));
 builder.create_dataset("data").with_f64_data(&[1.0]);
 
-let mut bytes = builder.finish().unwrap();
-// Write MATLAB header into userblock
-bytes[126] = b'I';
-bytes[127] = b'M';
+builder.write("hand_built.mat").unwrap();
 ```
+
+Nothing in a v7.3 userblock depends on the file that follows it, so it can be emitted first rather than patched in afterwards. That is what lets `write` and `finish_to` produce a `.mat` without buffering it: patching the returned bytes only works with `finish`, since the streaming paths have already written the region by the time they return.
 
 ### Struct pattern
 

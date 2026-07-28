@@ -9,8 +9,8 @@ use serde::ser::{self, Impossible, Serialize, SerializeMap, SerializeStruct, Ser
 use crate::mat::error::MatError;
 use crate::mat::options::Options;
 
-use super::emit::emit_file;
-use super::emit_with_builder::emit_file_with_options;
+use super::emit::{emit_file, emit_file_to};
+use super::emit_with_builder::{emit_file_with_options, emit_file_with_options_to};
 use super::value_ser::{ValueSerializer, to_value};
 use crate::mat::value::MatValue;
 
@@ -28,6 +28,56 @@ pub fn to_bytes_with_options<T: Serialize + ?Sized>(
 ) -> Result<Vec<u8>, MatError> {
     let fields = value.serialize(RootSerializer)?;
     emit_file_with_options(fields, options)
+}
+
+/// Serialize `value` straight onto `w`, without assembling the file in memory.
+pub fn to_writer<T: Serialize + ?Sized, W: std::io::Write>(
+    value: &T,
+    w: W,
+) -> Result<(), MatError> {
+    let fields = value.serialize(RootSerializer)?;
+    emit_file_to(fields, w)
+}
+
+/// Like [`to_writer`] but with explicit options.
+pub fn to_writer_with_options<T: Serialize + ?Sized, W: std::io::Write>(
+    value: &T,
+    options: &Options,
+    w: W,
+) -> Result<(), MatError> {
+    let fields = value.serialize(RootSerializer)?;
+    emit_file_with_options_to(fields, options, w)
+}
+
+/// Serialize `value` to `path`, streaming the file rather than buffering it.
+///
+/// The value is lowered to its field tree *before* the destination is created,
+/// so a value this crate refuses — a non-string map key, an unsupported type, an
+/// invalid name under [`InvalidNamePolicy::Error`](crate::mat::InvalidNamePolicy)
+/// — leaves an existing file at `path` untouched. Only a failure during emission
+/// can leave a partial file, which is inherent to writing without buffering.
+pub fn to_path<T: Serialize + ?Sized, P: AsRef<std::path::Path>>(
+    value: &T,
+    path: P,
+) -> Result<(), MatError> {
+    let fields = value.serialize(RootSerializer)?;
+    emit_file_to(fields, create(path)?)
+}
+
+/// Like [`to_path`] but with explicit options.
+pub fn to_path_with_options<T: Serialize + ?Sized, P: AsRef<std::path::Path>>(
+    value: &T,
+    path: P,
+    options: &Options,
+) -> Result<(), MatError> {
+    let fields = value.serialize(RootSerializer)?;
+    emit_file_with_options_to(fields, options, create(path)?)
+}
+
+/// Create the destination. Called only once the value is known to be
+/// serializable, since creating it truncates whatever was there.
+fn create<P: AsRef<std::path::Path>>(path: P) -> Result<std::fs::File, MatError> {
+    std::fs::File::create(path).map_err(MatError::Io)
 }
 
 /// The root serializer. Produces `Vec<(field_name, MatValue)>`.

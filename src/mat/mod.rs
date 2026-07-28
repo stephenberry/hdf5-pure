@@ -57,6 +57,7 @@ pub mod builder;
 pub mod dims;
 pub mod identifier;
 pub mod options;
+pub mod producer;
 pub mod string_object;
 #[cfg(feature = "serde")]
 pub(crate) mod transpose;
@@ -88,6 +89,7 @@ pub use options::{
     Compression, EmptyMarkerEncoding, InvalidNamePolicy, NullPolicy, OneDimensionalMode, Options,
     RowMajorPolicy, StringClass, UnsupportedPolicy,
 };
+pub use producer::{Block, BlockElement, Blocking, DataProducer};
 
 #[cfg(feature = "serde")]
 pub use complex::{
@@ -121,13 +123,34 @@ pub fn to_bytes<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, MatError> {
 
 /// Serialize `value` to the given filesystem path as a MAT v7.3 file. See
 /// [`to_bytes`] for details on how heterogeneous sequences are encoded.
+///
+/// Streams the file to disk, so it produces the same bytes as [`to_bytes`]
+/// without ever holding them all at once.
+///
+/// A value this crate refuses is rejected before `path` is created, so it leaves
+/// an existing file there untouched. A failure once writing has begun can still
+/// leave a partial file, which is inherent to not buffering; write to a temporary
+/// path and rename on success if you need all-or-nothing.
 #[cfg(feature = "serde")]
 pub fn to_file<T: Serialize + ?Sized, P: AsRef<std::path::Path>>(
     value: &T,
     path: P,
 ) -> Result<(), MatError> {
-    let bytes = to_bytes(value)?;
-    std::fs::write(path, bytes).map_err(MatError::Io)
+    ser::to_path(value, path)
+}
+
+/// Serialize `value` as a MAT v7.3 file written straight onto `w`.
+///
+/// Produces byte-for-byte what [`to_bytes`] returns, but assembles the file in
+/// ascending-address order and never seeks, so `w` can be a socket. Peak memory
+/// is the staged data plus the file's metadata rather than that plus the whole
+/// file.
+#[cfg(feature = "serde")]
+pub fn to_writer<T: Serialize + ?Sized, W: std::io::Write>(
+    value: &T,
+    w: W,
+) -> Result<(), MatError> {
+    ser::to_writer(value, w)
 }
 
 /// Like [`to_bytes`] but with explicit options. Use for opting into the
@@ -147,8 +170,17 @@ pub fn to_file_with_options<T: Serialize + ?Sized, P: AsRef<std::path::Path>>(
     path: P,
     options: &Options,
 ) -> Result<(), MatError> {
-    let bytes = to_bytes_with_options(value, options)?;
-    std::fs::write(path, bytes).map_err(MatError::Io)
+    ser::to_path_with_options(value, path, options)
+}
+
+/// Like [`to_writer`] but with explicit options.
+#[cfg(feature = "serde")]
+pub fn to_writer_with_options<T: Serialize + ?Sized, W: std::io::Write>(
+    value: &T,
+    options: &Options,
+    w: W,
+) -> Result<(), MatError> {
+    ser::to_writer_with_options(value, options, w)
 }
 
 /// Deserialize a MAT v7.3 file from a byte slice.

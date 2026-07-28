@@ -72,6 +72,23 @@ pub(crate) fn emit_file_with_options(
     fields: Vec<(String, MatValue)>,
     options: &Options,
 ) -> Result<Vec<u8>, MatError> {
+    build_with_options(fields, options)?.finish()
+}
+
+/// Same file as [`emit_file_with_options`], streamed to `w` instead of returned.
+pub(crate) fn emit_file_with_options_to<W: std::io::Write>(
+    fields: Vec<(String, MatValue)>,
+    options: &Options,
+    w: W,
+) -> Result<(), MatError> {
+    build_with_options(fields, options)?.finish_to(w)
+}
+
+/// Stage every field into a `MatBuilder`, ready to be finished either way.
+fn build_with_options(
+    fields: Vec<(String, MatValue)>,
+    options: &Options,
+) -> Result<MatBuilder, MatError> {
     let mut mb = MatBuilder::new(options.clone());
     for (name, value) in fields {
         if matches!(value, MatValue::Omit) {
@@ -79,7 +96,7 @@ pub(crate) fn emit_file_with_options(
         }
         emit_at_root(&mut mb, &name, value)?;
     }
-    mb.finish()
+    Ok(mb)
 }
 
 fn emit_at_root(mb: &mut MatBuilder, name: &str, value: MatValue) -> Result<(), MatError> {
