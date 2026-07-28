@@ -853,7 +853,10 @@ fn shape_decomposition(shape: &[u64]) -> Result<(usize, usize, usize), MatError>
     // [rows, cols] matrix). For a 1-D variant like [1, N] or [N, 1], treat as
     // a vector of length N. The dimensions come from the file, so each is
     // narrowed to `usize` through the checked conversion that errors (rather
-    // than truncating) if a dimension exceeds the platform's pointer width.
+    // than truncating) if a dimension exceeds the platform's pointer width,
+    // and the product is taken with `checked_mul` for the same reason: a
+    // declared shape whose product wraps would otherwise yield an element
+    // count far below the largest index the transpose derives from `rows`.
     Ok(match shape.len() {
         0 => (1, 1, 1),
         1 => {
@@ -864,16 +867,25 @@ fn shape_decomposition(shape: &[u64]) -> Result<(usize, usize, usize), MatError>
             let cols_hdf5 = shape[0].to_usize()?;
             let rows_hdf5 = shape[1].to_usize()?;
             // MATLAB matrix has rows = rows_hdf5, cols = cols_hdf5.
-            let total = cols_hdf5 * rows_hdf5;
+            let total = checked_element_count(cols_hdf5, rows_hdf5, shape)?;
             (rows_hdf5, cols_hdf5, total)
         }
         _ => {
             let mut total: usize = 1;
             for &d in shape {
-                total *= d.to_usize()?;
+                total = checked_element_count(total, d.to_usize()?, shape)?;
             }
             (1, total, total)
         }
+    })
+}
+
+/// Multiply two file-derived extents, refusing a product that would wrap.
+fn checked_element_count(a: usize, b: usize, shape: &[u64]) -> Result<usize, MatError> {
+    a.checked_mul(b).ok_or_else(|| {
+        MatError::Custom(format!(
+            "shape {shape:?} declares more elements than the address space holds"
+        ))
     })
 }
 
@@ -1042,6 +1054,42 @@ fn parse_complex_pairs<T: ComplexComponent>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A declared 2-D shape whose product wraps to a plausible element count.
+    /// The dimensions come from the file, so this is reachable from
+    /// `mat::from_bytes` on a malformed input, not just from a Rust call site.
+    #[test]
+    fn shape_decomposition_refuses_a_wrapping_two_dimensional_shape() {
+        // Derived from `usize::MAX` rather than written out: each dimension has
+        // to fit in a `usize` (or the narrowing errors first, for a different
+        // reason) while the product wraps. A literal tuned to 64-bit would
+        // narrow-error on the 32-bit job and pass for the wrong reason.
+        let wraps_to_four = (usize::MAX / 4 + 2) as u64;
+        let err = shape_decomposition(&[wraps_to_four, 4]).unwrap_err();
+        assert!(
+            matches!(&err, MatError::Custom(m) if m.contains("address space")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// The same rule for rank >= 3, where the product accumulates across a loop.
+    #[test]
+    fn shape_decomposition_refuses_a_wrapping_high_rank_shape() {
+        let err = shape_decomposition(&[1 << 31, 1 << 31, 1 << 31, 4]).unwrap_err();
+        assert!(
+            matches!(&err, MatError::Custom(m) if m.contains("address space")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// The guard must not reject shapes that genuinely fit.
+    #[test]
+    fn shape_decomposition_accepts_ordinary_shapes() {
+        assert_eq!(shape_decomposition(&[]).unwrap(), (1, 1, 1));
+        assert_eq!(shape_decomposition(&[7]).unwrap(), (1, 7, 7));
+        assert_eq!(shape_decomposition(&[3, 5]).unwrap(), (5, 3, 15));
+        assert_eq!(shape_decomposition(&[2, 3, 4]).unwrap(), (1, 24, 24));
+    }
 
     #[test]
     fn enum_member_names_maps_indices_to_pool() {

@@ -125,12 +125,18 @@ platform that wrote it. Chunks in particular are stored back to back, with no
 alignment padding; a workload that needs cache-line-aligned data should align
 its own buffers, since the file carries no padding to inherit.
 
-This is a claim about the *host*, not a general determinism guarantee. Output
-still depends on the order the data is handed over: serializing a `.mat` from a
-`HashMap` writes its fields in that map's iteration order, which the standard
-library randomizes per map, so two equal `HashMap`s can produce different files
-on one machine in one run. Use a `BTreeMap`, or a struct, when the field order
-has to be stable.
+This is a claim about the *host*, and it holds at a fixed feature set. Two
+things sit outside it:
+
+- Output depends on the order the data is handed over. Serializing a `.mat`
+  from a `HashMap` writes its fields in that map's iteration order, which the
+  standard library randomizes per map, so two equal `HashMap`s can produce
+  different files on one machine in one run. Use a `BTreeMap`, or a struct,
+  when the field order has to be stable.
+- The `fast-deflate` feature swaps the Rust deflate backend for zlib-ng, which
+  dispatches on runtime CPU features. Compressed bytes are then a property of
+  the machine after all. The default `deflate` backend is pure Rust and does
+  not have this behavior.
 
 ### 32-bit safety
 
@@ -143,10 +149,17 @@ with `File::open_streaming` (see [streaming](../guide/streaming.md)) instead of
 
 ### Memory safety
 
-The crate is almost entirely safe Rust. In a `std` build the only non-trivial
-`unsafe` is the tiled row-major/column-major transpose used by the MATLAB
-writer, and it is exercised under Miri with strict provenance in CI. A
-`no_std` build adds one more: the single-threaded `Mutex` above, whose
-`Send`/`Sync` rest on the target being single-threaded rather than on a lock.
+The crate is almost entirely safe Rust, and the default feature set contains no
+non-trivial `unsafe` at all. Two features introduce some, and they are mutually
+exclusive rather than cumulative:
+
+- `std` + `serde` compiles the tiled row-major/column-major transpose used by
+  the MATLAB writer, which writes through a raw pointer into uninitialized
+  `Vec` capacity. It is exercised under Miri with strict provenance in CI.
+- A `no_std` build instead compiles a single-threaded `Mutex` replacement whose
+  `Send`/`Sync` rest on the target being single-threaded rather than on a lock.
+  Because `no_std` excludes the `mat` module entirely, this replaces the
+  transpose rather than adding to it.
+
 The [architecture page](../about/architecture.md) covers the safety and
 robustness guarantees in more detail.
