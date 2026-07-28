@@ -15,7 +15,9 @@ use hdf5_pure::mat::{
     self, Complex32, Complex64, ComplexI8, ComplexI16, ComplexI32, ComplexI64, ComplexU8,
     ComplexU16, ComplexU32, ComplexU64, Matrix, Options,
 };
-use hdf5_pure::{AttrValue, Datatype, DatatypeByteOrder, File};
+use hdf5_pure::{
+    AttrValue, CompoundTypeBuilder, Datatype, DatatypeByteOrder, File, FileBuilder, make_i64_type,
+};
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -130,8 +132,13 @@ fn an_empty_array_keeps_its_component_class() {
     );
     assert_compound_of(&ds.datatype().unwrap(), 2, true);
     assert!(ds.read_u8().unwrap().is_empty());
-    // No `MATLAB_empty` marker: a zero-element compound is already an empty
-    // complex array to MATLAB, and the marker would make it an empty double.
+    // A zero-element compound of the component class is what this writer emits
+    // for an empty complex array, and it round-trips. It is *not* what MATLAB
+    // itself emits: `Mat_VarWriteEmpty` writes the dims as data under
+    // `MATLAB_empty=1`, keeping the plain class name, and libmatio reads that
+    // form back as complex `int16` too. Pinning the shape we write here so the
+    // divergence is visible rather than assumed — see the empty-array note in
+    // `docs/interop/matlab.md`.
     assert!(!ds.attrs().unwrap().contains_key("MATLAB_empty"));
 }
 
@@ -366,6 +373,73 @@ fn a_float_capture_does_not_deserialize_as_integer_complex() {
     assert!(
         msg.contains("complex int16"),
         "error should name the class it wanted: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A file that disagrees with itself
+// ---------------------------------------------------------------------------
+
+/// Assemble a complex `double` array carrying a `MATLAB_class` attribute that
+/// names some other class, the way a malformed or third-party writer can.
+fn complex_f64_labelled(class: Option<&str>) -> Vec<u8> {
+    let mut fb = FileBuilder::new();
+    {
+        let d = fb.create_dataset("samples");
+        d.with_complex64_data(&[(1.0, -1.0), (2.0, -2.0), (3.0, -3.0)])
+            .with_shape(&[1, 3]);
+        if let Some(class) = class {
+            d.set_attr("MATLAB_class", AttrValue::AsciiString(class.to_owned()));
+        }
+    }
+    fb.finish().unwrap()
+}
+
+/// The component width is read from `MATLAB_class` while the bytes come from
+/// the compound, and nothing in the format forces the two to agree. A narrower
+/// claim over wider members passes every length check and decodes to the low
+/// halves of the real components, so it has to be refused on the datatype.
+#[test]
+fn a_class_attribute_that_contradicts_the_compound_is_refused() {
+    let bytes = complex_f64_labelled(Some("int16"));
+    let err = mat::from_bytes::<AsI16>(&bytes).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("int16") && msg.contains("f64"),
+        "error should name both the claimed class and the stored one: {msg}"
+    );
+}
+
+/// The same disagreement reached without a malicious attribute at all: with no
+/// `MATLAB_class`, the class is guessed from the datatype, and the guess for a
+/// compound is `double`. A complex `int64` array has the identical 16-byte
+/// element size, so the length check cannot tell the two apart.
+#[test]
+fn an_unlabelled_complex_integer_array_is_not_decoded_as_double() {
+    let ct = CompoundTypeBuilder::new()
+        .field("real", make_i64_type())
+        .field("imag", make_i64_type())
+        .build();
+    let mut raw = Vec::new();
+    for (re, im) in [(1i64, -1i64), (2, -2)] {
+        raw.extend_from_slice(&re.to_le_bytes());
+        raw.extend_from_slice(&im.to_le_bytes());
+    }
+
+    let mut fb = FileBuilder::new();
+    {
+        let d = fb.create_dataset("samples");
+        d.with_compound_data(ct, raw, 2).with_shape(&[1, 2]);
+    }
+    let bytes = fb.finish().unwrap();
+
+    // The bytes are i64 pairs; the absent attribute makes the reader guess
+    // `double`, which is the same element size and would decode as garbage.
+    let err = mat::from_bytes::<AsF64>(&bytes).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("double") && msg.contains("i64"),
+        "error should name the guessed class and the stored one: {msg}"
     );
 }
 

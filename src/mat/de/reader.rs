@@ -496,7 +496,7 @@ fn read_dataset(
         | MatClass::UInt32
         | MatClass::UInt64 => {
             if is_complex_dtype(&dtype) {
-                read_complex(ds, &shape, class)
+                read_complex(ds, &shape, class, &dtype)
             } else {
                 read_numeric(ds, &shape, class)
             }
@@ -723,6 +723,73 @@ fn is_complex_dtype(dtype: &DType) -> bool {
     }
 }
 
+/// The component tag a stored datatype decodes as, or `None` for anything that
+/// is not one of the ten numeric component classes.
+///
+/// Deliberately exhaustive with no fallback arm: [`class_from_dtype`] guesses
+/// `Double` for an unrecognized type, which is the right shape for naming a
+/// class but the wrong one for deciding how to slice raw bytes.
+fn complex_component_tag(dtype: &DType) -> Option<ComplexTag> {
+    Some(match dtype {
+        DType::F64 => ComplexTag::F64,
+        DType::F32 => ComplexTag::F32,
+        DType::I64 => ComplexTag::I64,
+        DType::I32 => ComplexTag::I32,
+        DType::I16 => ComplexTag::I16,
+        DType::I8 => ComplexTag::I8,
+        DType::U64 => ComplexTag::U64,
+        DType::U32 => ComplexTag::U32,
+        DType::U16 => ComplexTag::U16,
+        DType::U8 => ComplexTag::U8,
+        _ => return None,
+    })
+}
+
+/// Check that a complex compound is laid out the way `tag` says it is before
+/// any of its bytes are decoded.
+///
+/// The component width comes from the `MATLAB_class` attribute, but the bytes
+/// come from the compound, and nothing forces the two to agree: a file can
+/// claim `int16` over a pair of `f64` members, or carry no class attribute at
+/// all and fall back to `double` over a pair of `int64`s at the identical
+/// element size. Decoding either one succeeds and returns numbers that are
+/// entirely wrong, so the disagreement is refused here instead.
+fn validate_complex_dtype(dtype: &DType, tag: ComplexTag) -> Result<(), MatError> {
+    let DType::Compound(fields) = dtype else {
+        return Err(MatError::Custom(format!(
+            "complex {} dataset has a non-compound datatype {dtype}",
+            tag.class().as_str()
+        )));
+    };
+    // Real first, imaginary second: `parse_complex_pairs` reads the component
+    // at offset 0 as the real part, so the declared order is load-bearing and
+    // the reversed layout has to be refused rather than silently swapped.
+    let (Some((first, first_ty)), Some((second, second_ty))) = (fields.first(), fields.get(1))
+    else {
+        return Err(MatError::Custom(format!(
+            "complex {} compound has {} fields, expected 2",
+            tag.class().as_str(),
+            fields.len()
+        )));
+    };
+    if first != "real" || second != "imag" {
+        return Err(MatError::Custom(format!(
+            "complex {} compound is ordered {{{first}, {second}}}, expected {{real, imag}}",
+            tag.class().as_str()
+        )));
+    }
+    for (name, member) in [(first, first_ty), (second, second_ty)] {
+        if complex_component_tag(member) != Some(tag) {
+            return Err(MatError::Custom(format!(
+                "complex {} dataset stores its {name} component as {member}, \
+                 which is a different class than MATLAB_class claims",
+                tag.class().as_str()
+            )));
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Numeric reading
 // ---------------------------------------------------------------------------
@@ -883,7 +950,12 @@ fn transpose_col_major_to_row_major(
 // Complex reading
 // ---------------------------------------------------------------------------
 
-fn read_complex(ds: &Dataset, shape: &[u64], class: MatClass) -> Result<MatValue, MatError> {
+fn read_complex(
+    ds: &Dataset,
+    shape: &[u64],
+    class: MatClass,
+    dtype: &DType,
+) -> Result<MatValue, MatError> {
     let (rows, cols, total) = shape_decomposition(shape)?;
     let Some(tag) = ComplexTag::from_class(class) else {
         return Err(MatError::Custom(format!(
@@ -891,6 +963,7 @@ fn read_complex(ds: &Dataset, shape: &[u64], class: MatClass) -> Result<MatValue
             class.as_str()
         )));
     };
+    validate_complex_dtype(dtype, tag)?;
     let bytes = ds.read_u8().map_err(MatError::Hdf5)?;
     let pairs = parse_complex_vec(&bytes, total, tag)?;
 

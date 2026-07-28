@@ -18,10 +18,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - Dropping a read-write `File` without `close` now re-homes the on-disk free-space managers of a persisting file and flushes, matching what `close` does; previously only `File::open_rw_bounded` handles did this. Staged edits are still discarded on drop ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
 - **Breaking:** `Error::BoundedStagedUnsupported` is removed, along with the refusals that returned it ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
+- A MAT complex vector written through `to_bytes_with_options` now takes the configured `OneDimensionalMode` like every other 1-D array; it was always a MATLAB row vector before, so existing callers of that path get columns under the default and their stored shape changes.
+- A MAT complex dataset whose `MATLAB_class` disagrees with its `{real, imag}` compound is refused instead of decoded. The integer classes previously errored here and briefly decoded as wrong values during this cycle's work.
 
 ### Fixed
-
-- A MAT complex vector now takes the configured `OneDimensionalMode` like every other 1-D array. Written through `to_bytes_with_options` it was always a MATLAB row vector, contradicting both the option and the shape the default `to_bytes` path gives it.
 - A one-element MAT complex array deserializes into a `Vec<Complex*>`, matching the allowance the real numeric path already makes for a one-element numeric array.
 - An empty MAT complex array of an integer class reads back as an empty complex array of that class rather than as an untyped empty vector.
 
