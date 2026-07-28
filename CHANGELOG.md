@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `FileAccessProperties::with_memory_strategy` and `MemoryStrategy` say how much memory a read-write open may spend holding the file. The default, `MemoryStrategy::Bounded`, keeps today's behavior of refusing a file the bounded engine cannot edit rather than silently mirroring it; `MemoryStrategy::Auto` opts in to the mirror fallback, and `File::memory_strategy` reports which one an open resolved to ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
+
 ## [0.27.0] - 2026-07-27
 
 The two read-write engines converge. `File::open_rw` now commits staged edits to a genuine paged file, and `File::open_rw_bounded` offers the full staged edit surface — `Dataset::write`, attribute edits, `create_*`/`delete`, `copy`, `space_accounting` — while holding only what a commit is building rather than a whole-file mirror. Neither the file's internal space strategy nor the kind of edit being made decides which open a caller reaches for, and `Dataset::append` grows a free-space-persisting file from either one. `Error::BoundedStagedUnsupported` is gone along with the refusals that returned it, the single breaking change here. Separately, MAT v7.3 complex arrays gain integer components across the serde, `Matrix<T>`, and `MatBuilder` surfaces, so a capture that samples as 16-bit integer pairs stores four bytes per sample instead of eight; three defects on the complex path are fixed with it, one of which changes the stored shape of a 1-D complex array written through `to_bytes_with_options`.

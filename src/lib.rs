@@ -271,7 +271,7 @@ pub use types::{AttrValue, DType};
 pub use writer::FileBuilder;
 
 #[cfg(feature = "std")]
-pub use edit::{AppendBuilder, SpaceAccounting};
+pub use edit::{AppendBuilder, MemoryStrategy, SpaceAccounting};
 
 #[cfg(feature = "std")]
 pub use repack::{RepackOptions, repack};

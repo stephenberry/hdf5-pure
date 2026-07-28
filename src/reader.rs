@@ -5,7 +5,9 @@ use std::io::{Read, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::edit::{AppendBuilder, AppendGeometry, AppendTarget, SpaceAccounting, WriteEngine};
+use crate::edit::{
+    AppendBuilder, AppendGeometry, AppendTarget, MemoryStrategy, SpaceAccounting, WriteEngine,
+};
 use crate::element::H5Element;
 use crate::type_builders::{DatasetBuilder, VL_REF_SIZE};
 
@@ -140,6 +142,7 @@ pub struct FileAccessProperties {
     metadata_cache: MetadataCacheConfig,
     chunk_cache: ChunkCacheConfig,
     locking: FileLocking,
+    memory_strategy: MemoryStrategy,
 }
 
 /// Former name of [`FileAccessProperties`].
@@ -156,6 +159,7 @@ impl FileAccessProperties {
             metadata_cache: MetadataCacheConfig::disabled(),
             chunk_cache: ChunkCacheConfig::new(),
             locking: FileLocking::Enabled,
+            memory_strategy: MemoryStrategy::Bounded,
         }
     }
 
@@ -190,6 +194,23 @@ impl FileAccessProperties {
         self
     }
 
+    /// Set how much memory a read-write open may use to hold the file.
+    ///
+    /// Defaults to [`MemoryStrategy::Bounded`], under which
+    /// [`File::open_rw_bounded`] refuses a file the bounded engine cannot edit
+    /// rather than quietly spending `O(file size)` memory on a caller who asked
+    /// not to. [`MemoryStrategy::Auto`] opts in to that fallback, and
+    /// [`MemoryStrategy::Mirrored`] takes the whole-file mirror unconditionally.
+    ///
+    /// This applies to [`File::open_rw_bounded_with_options`].
+    /// [`File::open_rw`] always mirrors and ignores it, as do the read-only opens
+    /// and the SWMR writer, which build no editing session at all. Ask a `File`
+    /// what it resolved to with [`File::memory_strategy`].
+    pub const fn with_memory_strategy(mut self, memory_strategy: MemoryStrategy) -> Self {
+        self.memory_strategy = memory_strategy;
+        self
+    }
+
     /// Return the configured streaming metadata cache.
     pub const fn metadata_cache(&self) -> MetadataCacheConfig {
         self.metadata_cache
@@ -203,6 +224,12 @@ impl FileAccessProperties {
     /// Return the configured file-locking policy.
     pub const fn locking(&self) -> FileLocking {
         self.locking
+    }
+
+    /// Return the configured memory strategy. This is what was *requested*; for
+    /// what an open resolved to, see [`File::memory_strategy`].
+    pub const fn memory_strategy(&self) -> MemoryStrategy {
+        self.memory_strategy
     }
 }
 
@@ -540,6 +567,7 @@ impl FileInner {
             path.as_ref(),
             properties.metadata_cache,
             properties.locking,
+            properties.memory_strategy,
         )?;
         Self::from_rw_session(session, properties)
     }
@@ -813,6 +841,19 @@ impl FileInner {
     /// Return the access properties used when opening this file.
     pub const fn access_properties(&self) -> FileAccessProperties {
         self.access_properties
+    }
+
+    /// The memory strategy this file's editing session resolved to, or `None`
+    /// when there is no editing session to ask.
+    fn memory_strategy(&self) -> Option<MemoryStrategy> {
+        match &self.backend {
+            Backend::Edit(m) => Some(
+                m.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .memory_strategy(),
+            ),
+            _ => None,
+        }
     }
 
     /// Returns a reference to the parsed superblock.
@@ -1916,6 +1957,19 @@ impl File {
     #[deprecated(since = "0.26.0", note = "renamed to `access_properties`")]
     pub fn access_options(&self) -> FileAccessProperties {
         self.access_properties()
+    }
+
+    /// What this file's read-write session resolved to: [`MemoryStrategy::Bounded`]
+    /// when it reads through a handle, or [`MemoryStrategy::Mirrored`] when it
+    /// holds a whole-file image. Never [`MemoryStrategy::Auto`], which is a
+    /// request rather than an outcome.
+    ///
+    /// This is how a caller who opened with [`MemoryStrategy::Auto`] finds out
+    /// whether the fallback was taken, and so whether memory scales with the
+    /// file. A file with no editing session — a read-only open, a streaming open
+    /// — reports `None`.
+    pub fn memory_strategy(&self) -> Option<MemoryStrategy> {
+        self.inner.memory_strategy()
     }
 
     /// Returns a reference to the parsed superblock.
