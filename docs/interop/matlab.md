@@ -117,7 +117,7 @@ A bare `Vec<Vec<T>>` whose rows all share a length is also recognized as a 2-D m
 
 ### Complex numbers
 
-There is one complex newtype per component class — `Complex64` and `Complex32` for the float classes, `ComplexI8` / `ComplexI16` / `ComplexI32` / `ComplexI64` and the `ComplexU*` counterparts for the integer ones — each constructed with `ComplexI16::new(re, im)` (or the `re` / `im` fields directly). A bare value becomes a compound scalar `[1, 1]`; a `Vec<ComplexI16>` becomes a compound dataset `[1, N]`. The on-disk layout is the same `{real, imag}` compound MATLAB uses for complex arrays. For a deeper treatment of HDF5 compound datasets see the [compound types guide](../guide/compound-types.md).
+There is one complex newtype per component class — `Complex64` and `Complex32` for the float classes, `ComplexI8` / `ComplexI16` / `ComplexI32` / `ComplexI64` and the `ComplexU*` counterparts for the integer ones — each constructed with `ComplexI16::new(re, im)` (or the `re` / `im` fields directly). A bare value becomes a compound scalar of HDF5 shape `[1, 1]`; a `Vec<ComplexI16>` becomes a compound dataset of HDF5 shape `[1, N]`, which is a MATLAB column (see [1-D vector orientation](#1-d-vector-orientation)). The on-disk layout is the same `{real, imag}` compound MATLAB uses for complex arrays. For a deeper treatment of HDF5 compound datasets see the [compound types guide](../guide/compound-types.md).
 
 `MATLAB_class` names the *component* class, not anything complex-specific, which is how MATLAB tells `complex(int16(re), int16(im))` from a complex `double`. Picking the component your data actually has is worth doing: a capture that samples as pairs of 16-bit integers takes four bytes per sample as `ComplexI16` and eight as `Complex32`, and the extra four carry nothing.
 
@@ -137,6 +137,12 @@ mat::to_file(&v, "capture.mat").unwrap();
 One consumer-side caveat worth knowing before choosing an integer component: MATLAB stores and loads complex integer arrays, but it refuses *arithmetic* on them — `a * b` on two complex `int16` values raises "Complex integer arithmetic is not supported", and the caller has to `double(...)` them first (or use Fixed-Point Designer's `fi` objects). That is a property of MATLAB, not of the file: the array arrives intact and `isa(x, 'int16')` and `iscomplex(x)` both hold. It costs nothing for a capture format that is stored compactly and widened once at the point of use, which is the case this exists for.
 
 Components are never converted between widths, in either direction. An `int16` complex dataset deserializes into `ComplexI16` and nothing else: reading it as `Complex64` would be lossless and is still refused, because the component width is part of what the file says it holds. Reading a `double` capture into `ComplexI16` is refused for the same reason, and would truncate. A caller holding float data that it knows to be exact integers is the one that can decide whether narrowing is meaningful, so do the conversion before serializing.
+
+The same rule is enforced against the file itself: `MATLAB_class` names the component width, the `{real, imag}` compound carries the bytes, and a file where those two disagree is refused rather than decoded. This matters because the disagreement is not always visible — a complex `int64` array with no class attribute at all falls back to `double`, whose element size is identical, so the payload length alone cannot tell them apart.
+
+### Empty complex arrays
+
+An empty complex array is written here as a zero-element `{real, imag}` compound that keeps its component class, and it round-trips through this crate. MATLAB writes empties differently: `Mat_VarWriteEmpty` stores the dimensions *as data* under `MATLAB_empty = 1`, keeping the plain class name, and the `EmptyMarkerEncoding` option selects that form for real arrays. Complex arrays do not currently follow the option. libmatio reads both forms; if you need the MATLAB-native shape for an empty complex array specifically, write it as an empty real array of the component class instead.
 
 ## Cell arrays
 
