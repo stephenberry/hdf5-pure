@@ -35,7 +35,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::file_writer::AttrValue;
 use crate::mat::class::MatClass;
-use crate::mat::dims::{STORAGE_DIMS_BUF_LEN, matrix_dims, storage_dims_u64_into, vector_dims};
+use crate::mat::dims::{
+    STORAGE_DIMS_BUF_LEN, matrix_dims, storage_dims_u64, storage_dims_u64_into, vector_dims,
+};
 use crate::mat::error::MatError;
 use crate::mat::identifier::{dedupe_name, is_valid_name, sanitize_name};
 use crate::mat::options::{Compression, EmptyMarkerEncoding, InvalidNamePolicy, Options};
@@ -523,8 +525,8 @@ impl MatBuilder {
     /// `producer` is called once per block, in ascending index order, while the
     /// file is being emitted — not while it is being laid out, which works from
     /// the shape alone. Combined with [`finish_to`](Self::finish_to), which does
-    /// not hold the assembled file either, this writes a `.mat` of any size in
-    /// about one block of memory.
+    /// not hold the assembled file either, this writes a `.mat` in one block plus
+    /// the file's metadata, whatever its size.
     ///
     /// The returned [`Blocking`] says how many blocks will be asked for and how
     /// many bytes each must carry; [`Blocking::plan`] computes the same thing
@@ -610,8 +612,11 @@ impl MatBuilder {
             return Ok(blocking);
         }
 
-        let mut storage_buf = [0u64; STORAGE_DIMS_BUF_LEN];
-        let storage = storage_dims_u64_into(matlab_dims, &mut storage_buf).to_vec();
+        // `storage_dims_u64`, not the stack-buffer form the slice writers use:
+        // this one takes its shape from the caller with no accompanying slice to
+        // bound its rank, and the stack form panics past
+        // `STORAGE_DIMS_BUF_LEN` dimensions.
+        let storage = storage_dims_u64(matlab_dims);
         // Cloned before the builder is borrowed: the adapter needs the stash and
         // `dataset_at_target` holds `self` for the rest of the function.
         let error = Arc::clone(&self.producer_error);
@@ -628,13 +633,18 @@ impl MatBuilder {
                 error,
             }),
         );
+        // Decode flag before class, which is the order `write_array_inner` ends
+        // up in: it runs the per-type closure — where `write_logical` sets the
+        // flag — and only then sets the class. Attribute messages are emitted in
+        // insertion order, so the reverse would give a produced `logical` a
+        // different object header from a materialized one.
+        if let Some(decode) = T::INT_DECODE {
+            ds.set_attr("MATLAB_int_decode", AttrValue::I32(decode));
+        }
         ds.set_attr(
             "MATLAB_class",
             AttrValue::AsciiString(T::CLASS.as_str().into()),
         );
-        if let Some(decode) = T::INT_DECODE {
-            ds.set_attr("MATLAB_int_decode", AttrValue::I32(decode));
-        }
         Ok(blocking)
     }
 

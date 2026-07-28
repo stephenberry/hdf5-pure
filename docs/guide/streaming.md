@@ -139,7 +139,7 @@ let mut sink: Vec<u8> = Vec::new();
 builder.finish_to(&mut sink).unwrap();
 ```
 
-This works because the writer computes every object's address — object headers, data blocks, indexes — *before* it emits a byte, then writes the file in ascending-address order. It never seeks back to patch an address, which is what a backpatching writer would have to do. So the destination can be anything that accepts bytes forward-only: a socket, a pipe, a compressing wrapper, a hash. `finish` is implemented as `finish_to` against a `Vec<u8>`, so the two are byte-identical by construction rather than by agreement.
+This works because the writer computes every object's address — object headers, data blocks, indexes — *before* it emits a byte, then writes the file in ascending-address order. It never seeks back to patch an address, which is what a backpatching writer would have to do. So the destination can be anything that accepts bytes forward-only: a socket, a pipe, a compressing wrapper, a hash. Both are the same internal assembly pass against different sinks — a `Vec<u8>` for `finish`, the caller's writer for `finish_to` — so they are byte-identical by construction rather than by agreement.
 
 !!! warning
     A failure partway through leaves whatever was already written on the sink. With a non-seekable destination there is nothing to roll back, so if you need all-or-nothing, write to a temporary path and rename on success.

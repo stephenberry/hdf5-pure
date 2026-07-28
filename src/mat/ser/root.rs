@@ -49,6 +49,37 @@ pub fn to_writer_with_options<T: Serialize + ?Sized, W: std::io::Write>(
     emit_file_with_options_to(fields, options, w)
 }
 
+/// Serialize `value` to `path`, streaming the file rather than buffering it.
+///
+/// The value is lowered to its field tree *before* the destination is created,
+/// so a value this crate refuses — a non-string map key, an unsupported type, an
+/// invalid name under [`InvalidNamePolicy::Error`](crate::mat::InvalidNamePolicy)
+/// — leaves an existing file at `path` untouched. Only a failure during emission
+/// can leave a partial file, which is inherent to writing without buffering.
+pub fn to_path<T: Serialize + ?Sized, P: AsRef<std::path::Path>>(
+    value: &T,
+    path: P,
+) -> Result<(), MatError> {
+    let fields = value.serialize(RootSerializer)?;
+    emit_file_to(fields, create(path)?)
+}
+
+/// Like [`to_path`] but with explicit options.
+pub fn to_path_with_options<T: Serialize + ?Sized, P: AsRef<std::path::Path>>(
+    value: &T,
+    path: P,
+    options: &Options,
+) -> Result<(), MatError> {
+    let fields = value.serialize(RootSerializer)?;
+    emit_file_with_options_to(fields, options, create(path)?)
+}
+
+/// Create the destination. Called only once the value is known to be
+/// serializable, since creating it truncates whatever was there.
+fn create<P: AsRef<std::path::Path>>(path: P) -> Result<std::fs::File, MatError> {
+    std::fs::File::create(path).map_err(MatError::Io)
+}
+
 /// The root serializer. Produces `Vec<(field_name, MatValue)>`.
 pub(crate) struct RootSerializer;
 

@@ -5,8 +5,8 @@
 //! [`MatBuilder::write_blocks`](crate::mat::MatBuilder::write_blocks) is never
 //! fully resident. Paired with
 //! [`MatBuilder::finish_to`](crate::mat::MatBuilder::finish_to) — which does not
-//! hold the assembled file either — a `.mat` of any size can be written in
-//! roughly one block of memory.
+//! hold the assembled file either — a `.mat` is written in one block plus the
+//! file's metadata, whatever its size.
 //!
 //! The dataset that comes out is byte-for-byte the one the ordinary writers
 //! produce for the same content: contiguous storage, laid out from the shape
@@ -67,8 +67,8 @@ pub trait DataProducer: Send + Sync {
     /// Append block `index`'s raw little-endian element bytes to `out`, in
     /// MATLAB's linear element order (see the [module docs](self)).
     ///
-    /// `out` is handed over empty and is the same buffer on every call, so
-    /// appending costs one allocation for the whole dataset. Write exactly
+    /// `out` is handed over empty and is the same buffer on every call, so it
+    /// costs one buffer for the whole dataset rather than one per block. Write exactly
     /// [`Blocking::block_len`] bytes for this index; any other count is refused
     /// with [`MatError::BlockSizeMismatch`] rather than written, because a block
     /// of the wrong size shifts every address after it.
@@ -102,12 +102,14 @@ impl Blocking {
     /// Every block but the last is the same size; the last is whatever remains.
     /// Out-of-range indices report zero, since the writer never asks for them.
     pub fn block_len(&self, index: usize) -> usize {
-        let elements = if index + 1 == self.block_count {
-            self.last_block_elements
-        } else if index < self.block_count {
-            self.block_elements
-        } else {
+        // Ordered so an out-of-range index leaves before any arithmetic: `index`
+        // is caller-supplied, and `index + 1` overflows at `usize::MAX`.
+        let elements = if index >= self.block_count {
             0
+        } else if index == self.block_count - 1 {
+            self.last_block_elements
+        } else {
+            self.block_elements
         };
         // A planned block fits `usize` — that is checked when the blocking is
         // built. The fields are public, though, so a caller can hand back a
@@ -121,12 +123,18 @@ impl Blocking {
     }
 
     /// Total bytes the dataset's elements occupy.
+    ///
+    /// Saturating, for the same reason [`block_len`](Self::block_len) is careful:
+    /// the fields are public, so a caller can copy this and rewrite them into a
+    /// combination the planner would never produce.
     pub fn total_len(&self) -> u64 {
         if self.block_count == 0 {
             return 0;
         }
-        (self.block_elements * (self.block_count as u64 - 1) + self.last_block_elements)
-            * self.element_size as u64
+        self.block_elements
+            .saturating_mul(self.block_count as u64 - 1)
+            .saturating_add(self.last_block_elements)
+            .saturating_mul(self.element_size as u64)
     }
 
     /// The blocking [`write_blocks`](crate::mat::MatBuilder::write_blocks) will
@@ -167,13 +175,15 @@ pub(crate) fn plan_blocking(total: u64, element_size: usize) -> Result<Blocking,
             element_size,
         });
     }
-    // The data region's byte count is the first thing that has to be real: it
-    // goes into the object header as a `u64`, and every later size here is
-    // derived from it. A shape whose elements overflow that is refused before any
-    // of the arithmetic below can wrap.
+    // The data region's byte count is the first thing that has to be real. The
+    // writer accumulates it into a `usize` address cursor and must be able to
+    // emit it, so a shape whose bytes exceed this host's address space is refused
+    // here — before the count reaches arithmetic that would wrap, and before a
+    // producer is asked for the first of eighteen exabytes of blocks.
     let total_bytes = total
         .checked_mul(element_size as u64)
-        .ok_or_else(|| too_large(u64::MAX))?;
+        .filter(|&bytes| usize::try_from(bytes).is_ok())
+        .ok_or_else(|| too_large(total.saturating_mul(element_size as u64)))?;
 
     let per_block = (TARGET_BLOCK_BYTES / element_size as u64).clamp(1, total);
     let block_count = total.div_ceil(per_block);
@@ -222,9 +232,14 @@ impl ProducerChunks {
     /// Record `error` (the first one wins) and return the placeholder the writer
     /// will carry until the finalizer swaps the real one back in.
     fn fail(&self, error: MatError) -> FormatError {
-        if let Ok(mut slot) = self.error.lock() {
-            slot.get_or_insert(error);
-        }
+        // A poisoned lock still holds the slot, and dropping the producer's real
+        // error to report a placeholder instead is the one outcome worth avoiding
+        // here.
+        let mut slot = self
+            .error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        slot.get_or_insert(error);
         FormatError::SerializationError("a dataset's block producer failed".into())
     }
 }
@@ -406,6 +421,38 @@ mod tests {
         let b = Blocking::plan::<(i16, i16)>(&[2, 10]).unwrap();
         assert_eq!(b.element_size, 4);
         assert_eq!(b.total_len(), 2 * 10 * 4);
+    }
+
+    /// `MatBuilder` now transitively holds a boxed producer and an
+    /// `Arc<Mutex<..>>`, either of which could strip an auto-trait. Losing one is
+    /// a semver break, so pin all four the way `FileBuilder` does.
+    #[test]
+    fn mat_builder_keeps_its_auto_traits() {
+        fn assert_auto_traits<
+            T: Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe,
+        >() {
+        }
+        assert_auto_traits::<crate::mat::MatBuilder>();
+    }
+
+    /// The fields are public, so a caller can copy a `Blocking` and rewrite them.
+    /// Nothing they can write may panic these two: an out-of-range index is
+    /// documented to report zero, and a forged size reports a saturated total
+    /// rather than a wrapped one.
+    #[test]
+    fn a_forged_blocking_reports_rather_than_panics() {
+        let planned = plan_blocking(10, 8).unwrap();
+        assert_eq!(planned.block_len(usize::MAX), 0);
+        assert_eq!(planned.block_len(planned.block_count), 0);
+
+        let mut forged = planned;
+        forged.block_count = 3;
+        forged.block_elements = u64::MAX / 2;
+        forged.last_block_elements = u64::MAX;
+        assert_eq!(forged.total_len(), u64::MAX);
+        // And the per-block length saturates rather than wrapping into a small
+        // plausible number, so no producer can accidentally satisfy it.
+        assert_eq!(forged.block_len(0), usize::MAX);
     }
 
     /// `logical` is the one class that carries a decode flag, and it is stored

@@ -126,13 +126,17 @@ pub fn to_bytes<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, MatError> {
 ///
 /// Streams the file to disk, so it produces the same bytes as [`to_bytes`]
 /// without ever holding them all at once.
+///
+/// A value this crate refuses is rejected before `path` is created, so it leaves
+/// an existing file there untouched. A failure once writing has begun can still
+/// leave a partial file, which is inherent to not buffering; write to a temporary
+/// path and rename on success if you need all-or-nothing.
 #[cfg(feature = "serde")]
 pub fn to_file<T: Serialize + ?Sized, P: AsRef<std::path::Path>>(
     value: &T,
     path: P,
 ) -> Result<(), MatError> {
-    let file = std::fs::File::create(path).map_err(MatError::Io)?;
-    to_writer(value, file)
+    ser::to_path(value, path)
 }
 
 /// Serialize `value` as a MAT v7.3 file written straight onto `w`.
@@ -166,8 +170,7 @@ pub fn to_file_with_options<T: Serialize + ?Sized, P: AsRef<std::path::Path>>(
     path: P,
     options: &Options,
 ) -> Result<(), MatError> {
-    let file = std::fs::File::create(path).map_err(MatError::Io)?;
-    to_writer_with_options(value, options, file)
+    ser::to_path_with_options(value, path, options)
 }
 
 /// Like [`to_writer`] but with explicit options.

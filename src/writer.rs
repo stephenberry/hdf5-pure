@@ -101,8 +101,9 @@ impl FileBuilder {
     /// Set the bytes that occupy the head of the userblock region, so the writer
     /// emits them as part of the file. The remainder of the region stays
     /// zero-filled, and content longer than the userblock set by
-    /// [`with_userblock`](Self::with_userblock) is refused by
-    /// [`finish`](Self::finish) with
+    /// [`with_userblock`](Self::with_userblock) is refused by every output path —
+    /// [`finish`](Self::finish), [`finish_to`](Self::finish_to), and
+    /// [`write`](Self::write) — with
     /// [`FormatError::UserblockContentTooLarge`](crate::FormatError::UserblockContentTooLarge).
     ///
     /// Because the userblock leads the file in address order, this is what lets a
@@ -696,6 +697,10 @@ mod streaming_tests {
         total: usize,
         block: usize,
         calls: Calls,
+        /// Return one byte too few for this block, so a test can reach the
+        /// emitter's own size check. The MAT layer checks lengths before the
+        /// writer ever sees them, so without this knob that check is unreachable.
+        short_block: Option<usize>,
     }
 
     impl BlockProvider {
@@ -714,7 +719,10 @@ mod streaming_tests {
         fn chunk_bytes(&self, index: usize, out: &mut Vec<u8>) -> Result<(), FormatError> {
             self.calls.lock().unwrap().push(index);
             let start = index * self.block;
-            let end = (start + self.block).min(self.total);
+            let mut end = (start + self.block).min(self.total);
+            if self.short_block == Some(index) {
+                end -= 1;
+            }
             out.extend((start..end).map(Self::byte));
             Ok(())
         }
@@ -752,6 +760,7 @@ mod streaming_tests {
                     total: TOTAL,
                     block: BLOCK,
                     calls: Arc::clone(calls),
+                    short_block: None,
                 }),
             );
             b
@@ -803,6 +812,7 @@ mod streaming_tests {
                         total: TOTAL,
                         block: BLOCK,
                         calls: Calls::default(),
+                        short_block: None,
                     }),
                 );
             } else {
@@ -823,6 +833,43 @@ mod streaming_tests {
             "a paged file must place a produced region exactly where it places a materialized one"
         );
         assert_eq!(read_back_f64(&produced, "d").len(), 4096);
+    }
+
+    /// The emitter checks each produced block's length itself, rather than
+    /// trusting whatever staged the region.
+    ///
+    /// The MAT layer's adapter checks first and reports a typed error, so that
+    /// path never reaches this guard — which is exactly why it needs its own
+    /// test: it is the only thing protecting a producer staged any other way,
+    /// and a short block would slide every address after this dataset.
+    #[test]
+    fn a_produced_block_of_the_wrong_size_is_refused_by_the_emitter() {
+        const TOTAL: usize = 8 * 1000;
+        const BLOCK: usize = 8 * 256;
+        for short in [0usize, 2] {
+            let mut b = FileBuilder::new();
+            b.create_dataset("d").with_produced_data(
+                crate::type_builders::make_f64_type(),
+                &[1000],
+                TOTAL as u64,
+                BLOCK as u64,
+                Box::new(BlockProvider {
+                    total: TOTAL,
+                    block: BLOCK,
+                    calls: Calls::default(),
+                    short_block: Some(short),
+                }),
+            );
+            match b.finish() {
+                Err(Error::Format(FormatError::SerializationError(msg))) => {
+                    assert!(
+                        msg.contains("planned size"),
+                        "expected the block-size refusal, got {msg:?}"
+                    );
+                }
+                other => panic!("expected a refusal for a short block {short}, got {other:?}"),
+            }
+        }
     }
 
     /// Content past the end of the region would push the superblock down and

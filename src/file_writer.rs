@@ -2134,7 +2134,9 @@ impl FileWriter {
                 }) = layouts[*i].as_mut()
                 else {
                     unreachable!(
-                        "a staged VL-string dataset is non-chunked, so its data is in memory"
+                        "a staged VL-string dataset holds its element bytes in memory: the \
+                         chunked path patches before encoding, and a produced region refuses \
+                         to carry VL staging at all"
                     )
                 };
                 patch_vl_refs_masked(bytes, &staging.patch_offsets, gaddrs);
@@ -2438,11 +2440,13 @@ impl FileWriter {
                     continue;
                 }
                 if let Some(staging) = &d.vl_string_staging {
-                    // Every dataset still awaiting an address here is contiguous
-                    // or compact, so its element bytes are in memory and
-                    // patchable in place. A streamed (lazy) dataset never carries
-                    // VL staging, so this is unreachable for it — assert that
-                    // rather than risk silently corrupting one.
+                    // A dataset that carries VL staging always has its element
+                    // bytes in memory. Neither of the two data regions that do
+                    // not — a streamed (lazy) chunked one, or a produced
+                    // contiguous one — can carry VL staging: the chunked path
+                    // patches before encoding, and `with_produced_data` refuses
+                    // the combination. Assert that rather than risk silently
+                    // patching heap addresses into the wrong buffer.
                     let DsData::InMemory(ref mut bytes) = ds_layouts[i].data else {
                         unreachable!(
                             "a chunked VL-string dataset is patched before encoding, so a \

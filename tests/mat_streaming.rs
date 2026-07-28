@@ -112,13 +112,26 @@ impl std::io::Write for Discard {
     }
 }
 
+/// Open a file this crate wrote, checking first that it is a `.mat` and not
+/// merely a readable HDF5 file.
+///
+/// `File::open` skips the userblock without inspecting it, so a `.mat` that lost
+/// its MATLAB signature entirely still reads back here — and MATLAB would refuse
+/// it. Every test that reaches into a written file goes through this, so the
+/// signature is checked wherever the contents are.
+fn open_mat(path: &std::path::Path) -> File {
+    let bytes = std::fs::read(path).unwrap();
+    hdf5_pure::mat::userblock::verify_header(&bytes)
+        .expect("a file written as a .mat must carry the MATLAB v7.3 userblock");
+    File::open(path).unwrap()
+}
+
 fn read_f64(path: &std::path::Path, name: &str) -> Vec<f64> {
-    let file = File::open(path).unwrap();
-    file.dataset(name).unwrap().read_f64().unwrap()
+    open_mat(path).dataset(name).unwrap().read_f64().unwrap()
 }
 
 fn read_class(path: &std::path::Path, name: &str) -> String {
-    let file = File::open(path).unwrap();
+    let file = open_mat(path);
     let attrs = file.dataset(name).unwrap().attrs().unwrap();
     match &attrs["MATLAB_class"] {
         AttrValue::AsciiString(s) | AttrValue::String(s) => s.clone(),
@@ -172,6 +185,10 @@ fn a_streamed_file_is_byte_identical_to_a_buffered_one() {
 /// The serde entry points are a second assembly path — `to_bytes` builds a
 /// `FileBuilder` directly while `to_bytes_with_options` goes through
 /// `MatBuilder` — so each needs its own streaming check.
+///
+/// Gated because those four functions are: `MatBuilder` itself needs only
+/// `std`, so every other test in this file runs on the default feature set.
+#[cfg(feature = "serde")]
 #[test]
 fn both_serde_paths_stream_the_bytes_they_return() {
     #[derive(serde::Serialize)]
@@ -199,17 +216,62 @@ fn both_serde_paths_stream_the_bytes_they_return() {
     );
 }
 
+/// Streaming to a path must not truncate the destination before the value is
+/// known to be writable.
+///
+/// `to_file` used to serialize into a `Vec<u8>` and hand it to `fs::write`, so a
+/// refused value returned before touching the filesystem. Creating the file first
+/// and streaming into it would silently destroy whatever was already at that
+/// path, for an input the crate never even attempted to write.
+#[cfg(feature = "serde")]
+#[test]
+fn a_refused_value_leaves_the_destination_alone() {
+    use std::collections::HashMap;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("existing.mat");
+    std::fs::write(&path, b"an earlier file").unwrap();
+
+    // Map keys must be strings; this is refused by the serializer, before any
+    // part of the file could be assembled.
+    let mut refused: HashMap<i32, f64> = HashMap::new();
+    refused.insert(1, 2.0);
+
+    assert!(hdf5_pure::mat::to_file(&refused, &path).is_err());
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"an earlier file",
+        "a refused value must leave the destination untouched"
+    );
+
+    let options = Options::default();
+    assert!(hdf5_pure::mat::to_file_with_options(&refused, &path, &options).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"an earlier file");
+}
+
 /// The three finalizers share one path, so a file delivered by any of them is
-/// the same file. `write` is the one that hits the filesystem, which is where a
-/// stray difference would show up first.
+/// the same file — including one holding a produced dataset, which is the
+/// combination `write` is otherwise never checked on. (`producing_and_streaming_compose`
+/// covers `finish` against `finish_to`; the read-back tests use `write` but only
+/// read values.) `write` is the one that hits the filesystem, which is where a
+/// stray difference shows up first.
 #[test]
 fn every_finalizer_delivers_the_same_file() {
+    const DIMS: [usize; 2] = [4, 100_001];
     let dir = tempdir().unwrap();
     let path = dir.path().join("same.mat");
+    let blocking = Blocking::plan::<f64>(&DIMS).unwrap();
+    assert!(
+        blocking.block_count > 1 && blocking.last_block_elements < blocking.block_elements,
+        "the produced dataset must span blocks and leave a short tail"
+    );
 
     let build = || {
+        let (producer, _) = Ramp::new(blocking);
         let mut mb = MatBuilder::new(Options::default());
         mb.write_f64("v", &[1, 3], &[1.0, 2.0, 3.0]).unwrap();
+        mb.write_blocks::<f64>("produced", &DIMS, Box::new(producer))
+            .unwrap();
         mb.write_char("t", "abc").unwrap();
         mb
     };
@@ -218,9 +280,16 @@ fn every_finalizer_delivers_the_same_file() {
     build().finish_to(&mut streamed).unwrap();
     build().write(&path).unwrap();
 
-    assert_eq!(buffered, streamed);
-    assert_eq!(buffered, std::fs::read(&path).unwrap());
+    assert_eq!(buffered, streamed, "finish and finish_to must agree");
+    assert_eq!(
+        buffered,
+        std::fs::read(&path).unwrap(),
+        "and write must deliver that same file"
+    );
+    assert_eq!(read_f64(&path, "produced").len(), CHANNELS_TIMES_SAMPLES);
 }
+
+const CHANNELS_TIMES_SAMPLES: usize = 4 * 100_001;
 
 // ---------------------------------------------------------------------------
 // write_blocks
@@ -480,42 +549,72 @@ fn an_empty_shape_writes_a_marker_and_asks_for_nothing() {
     );
 }
 
-/// The element type carries the MATLAB class, so each family has to name the
-/// right one — a complex pair reports its *component* class, not a compound.
-#[test]
-fn element_types_name_their_matlab_class() {
-    /// Yields a fixed byte pattern, whatever the element type.
-    struct Bytes(Vec<u8>);
-    impl DataProducer for Bytes {
-        fn block_bytes(&self, _index: usize, out: &mut Vec<u8>) -> Result<(), MatError> {
-            out.extend_from_slice(&self.0);
-            Ok(())
-        }
-    }
+/// Yields a fixed byte pattern, whatever the element type. Used to write the
+/// same bytes through the produced and materialized paths.
+struct Bytes(Vec<u8>);
 
+impl DataProducer for Bytes {
+    fn block_bytes(&self, _index: usize, out: &mut Vec<u8>) -> Result<(), MatError> {
+        out.extend_from_slice(&self.0);
+        Ok(())
+    }
+}
+
+/// Every element type must produce the same file its materialized sibling
+/// produces — not merely the right `MATLAB_class` string.
+///
+/// The class attribute alone is far too weak. `BlockElement::datatype` builds
+/// each type independently of the `with_*_data` writer it has to match, so the
+/// two agree only by parallel construction in two files. A comparison of the
+/// *bytes* is what holds them together: it catches a complex pair whose `real`
+/// and `imag` members are swapped, and a `logical` built over `i8` instead of
+/// `u8`, neither of which changes a single class string.
+#[test]
+fn every_element_type_matches_its_materialized_sibling() {
+    let complex: Vec<(i16, i16)> = vec![(1, -2), (3, -4), (5, -6), (7, -8)];
+    let logical: Vec<u8> = vec![1, 0, 1, 1];
+    let counts: Vec<u32> = vec![7, 8, 9, 10];
+
+    let raw = |bytes: &[u8]| Box::new(Bytes(bytes.to_vec())) as Box<dyn DataProducer>;
+    let complex_bytes: Vec<u8> = complex
+        .iter()
+        .flat_map(|(re, im)| [re.to_le_bytes(), im.to_le_bytes()])
+        .flatten()
+        .collect();
+    let count_bytes: Vec<u8> = counts.iter().flat_map(|c| c.to_le_bytes()).collect();
+
+    let produced = {
+        let mut mb = MatBuilder::new(Options::default());
+        mb.write_blocks::<(i16, i16)>("iq", &[2, 2], raw(&complex_bytes))
+            .unwrap();
+        mb.write_blocks::<bool>("flags", &[2, 2], raw(&logical))
+            .unwrap();
+        mb.write_blocks::<u32>("counts", &[2, 2], raw(&count_bytes))
+            .unwrap();
+        mb.finish().unwrap()
+    };
+
+    let materialized = {
+        let mut mb = MatBuilder::new(Options::default());
+        mb.write_complex_i16("iq", &[2, 2], &complex).unwrap();
+        mb.write_logical("flags", &[2, 2], &logical).unwrap();
+        mb.write_u32("counts", &[2, 2], &counts).unwrap();
+        mb.finish().unwrap()
+    };
+
+    assert_eq!(
+        produced, materialized,
+        "a produced dataset must be byte-for-byte its materialized sibling, for every element type"
+    );
+
+    // And the classes are what MATLAB reads them as, which the byte comparison
+    // would also catch but says nothing about on its own.
     let dir = tempdir().unwrap();
     let path = dir.path().join("classes.mat");
-    let mut mb = MatBuilder::new(Options::default());
-
-    // 4 complex i16 = 4 * 4 bytes.
-    mb.write_blocks::<(i16, i16)>("iq", &[2, 2], Box::new(Bytes(vec![0u8; 16])))
-        .unwrap();
-    mb.write_blocks::<bool>("flags", &[2, 2], Box::new(Bytes(vec![1u8; 4])))
-        .unwrap();
-    mb.write_blocks::<u32>("counts", &[2, 2], Box::new(Bytes(vec![0u8; 16])))
-        .unwrap();
-    mb.write(&path).unwrap();
-
+    std::fs::write(&path, &produced).unwrap();
     assert_eq!(read_class(&path, "iq"), "int16");
     assert_eq!(read_class(&path, "flags"), "logical");
     assert_eq!(read_class(&path, "counts"), "uint32");
-
-    let file = File::open(&path).unwrap();
-    let attrs = file.dataset("flags").unwrap().attrs().unwrap();
-    assert!(
-        attrs.contains_key("MATLAB_int_decode"),
-        "a logical array carries its decode flag"
-    );
 }
 
 /// A produced dataset must be the same file whichever way it is delivered, so

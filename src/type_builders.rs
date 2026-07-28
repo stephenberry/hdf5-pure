@@ -1606,6 +1606,20 @@ impl DatasetBuilder {
         provider: Box<dyn ChunkProvider>,
     ) -> &mut Self {
         debug_assert!(block_bytes > 0, "a block must make progress");
+        // A produced region is contiguous and its bytes never exist in `data`, so
+        // it cannot take part in anything that patches or re-encodes them. Each of
+        // these would fail differently and quietly — chunking would encode the
+        // empty `data` and never call the producer, and the two patch passes would
+        // write into a buffer that is not the dataset. Callers construct these
+        // one way, so this pins the invariant rather than validating input.
+        debug_assert!(
+            self.vl_string_staging.is_none()
+                && self.reference_targets.is_none()
+                && self.maxshape.is_none()
+                && !self.chunk_options.is_chunked(),
+            "a produced dataset is plain contiguous storage: no VL staging, \
+             references, maxshape, or chunking"
+        );
         self.datatype = Some(datatype);
         if self.shape.is_none() {
             self.shape = Some(shape.to_vec());
