@@ -121,6 +121,57 @@ fn same_file_copy_reproduces_dense_dataset_and_group_attrs() {
     }
 }
 
+/// Copy rebuilds the destination heap from scratch, so it rebuilds the name
+/// index too. Twelve attributes fit one B-tree leaf and say nothing about that;
+/// 600 need a root and two levels below it, so this is where the copy path
+/// either carries the multi-level index or does not (issue #195).
+#[test]
+fn copy_reproduces_a_multi_level_dense_name_index() {
+    const COUNT: usize = 600;
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("dense_many.h5");
+
+    {
+        let mut b = FileBuilder::new();
+        {
+            let ds = b.create_dataset("payload");
+            ds.with_f64_data(&[1.5]);
+            for i in 0..COUNT {
+                ds.set_attr(&format!("attr_{i:04}"), AttrValue::I64(i as i64));
+            }
+        }
+        b.write(&path).unwrap();
+    }
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session.copy("payload", "payload_copy").unwrap();
+        session.commit().unwrap();
+    }
+
+    let f = File::open(&path).unwrap();
+    let attrs = f.dataset("payload_copy").unwrap().attrs().unwrap();
+    assert_eq!(attrs.len(), COUNT);
+    for i in 0..COUNT {
+        let name = format!("attr_{i:04}");
+        assert!(
+            matches!(attrs.get(&name), Some(AttrValue::I64(v)) if *v == i as i64),
+            "{name} missing from the copy"
+        );
+    }
+    drop(f);
+
+    // The C library, opening each by name: a copy whose records landed out of
+    // order still iterates cleanly and still fails to be searched.
+    let c = hdf5::File::open(&path).unwrap();
+    let ds = c.dataset("payload_copy").unwrap();
+    for i in [0, 1, COUNT / 2, COUNT - 1] {
+        let name = format!("attr_{i:04}");
+        let got: i64 = ds.attr(&name).unwrap().read_scalar().unwrap();
+        assert_eq!(got, i as i64, "{name} mismatch (C library)");
+    }
+}
+
 /// Copy rebuilds the destination heap from the source attributes, so an
 /// attribute large enough to need fractal-heap *huge* storage has to be rebuilt
 /// as one — including the huge-objects B-tree and the header fields that point at

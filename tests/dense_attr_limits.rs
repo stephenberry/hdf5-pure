@@ -14,7 +14,10 @@
 use hdf5_pure::{AttrValue, Error, File, FileBuilder, FormatError};
 
 mod common;
-use common::heap::{has_fractal_heap, huge_object_bytes, huge_object_count, managed_object_count};
+use common::heap::{
+    has_fractal_heap, huge_object_bytes, huge_object_count, indirect_block_count,
+    managed_object_count, name_index_leaf_records, root_indirect_rows,
+};
 
 /// Nine attributes, the first sized to `payload` bytes of text and the rest
 /// small, which is enough to select dense storage.
@@ -213,8 +216,8 @@ fn a_mixed_managed_and_huge_set_round_trips() {
     }
 }
 
-/// The emitter sizes its root direct block to the content, so a multi-megabyte
-/// set of individually small attributes stays entirely managed.
+/// The emitter grows a doubling table of direct blocks, so a multi-megabyte set
+/// of individually small attributes stays entirely managed.
 #[test]
 fn a_multi_megabyte_set_of_small_attributes_stays_managed() {
     let mut builder = FileBuilder::new();
@@ -231,13 +234,63 @@ fn a_multi_megabyte_set_of_small_attributes_stays_managed() {
     assert_eq!(file.root().attrs().unwrap().len(), 40);
 }
 
-/// The attribute *count* still has a bound, and it is not the 65,535 the B-tree
-/// leaf's 2-byte record-count field suggests: the reference C library derives the
-/// width it needs from the leaf's capacity, which follows the power-of-two node
-/// size this writer declares, so the real limit is 61,680. One more silently
-/// produced a file that aborted libhdf5.
+/// The managed attributes used to live in one direct block rounded up to a power
+/// of two, which capped the heap at the 2 GiB block the format allows and spent
+/// close to half its space on padding. They now go in a doubling table of blocks
+/// no larger than 64 KiB, reached through a root indirect block and, past the
+/// root's own row of those, through nested ones.
+///
+/// Both depths are worth reading back through this crate as well as through the
+/// C library: an attribute placed at the wrong heap offset still decodes, because
+/// its neighbour's bytes are a valid message too.
 #[test]
-fn the_attribute_count_boundary_is_enforced() {
+fn managed_attributes_span_as_many_blocks_as_they_need() {
+    // Small attributes spilling out of one block, and attributes each nearly
+    // filling the largest direct block, which is what forces the nesting.
+    for (name, payload, count, indirect) in [("shallow", 200, 60, 1), ("nested", 64_000, 12, 2)] {
+        let mut builder = FileBuilder::new();
+        for i in 0..count {
+            let text = char::from(b'a' + (i % 26) as u8)
+                .to_string()
+                .repeat(payload);
+            builder.set_attr(&format!("a{i:04}"), AttrValue::AsciiString(text));
+        }
+        builder.create_dataset("x").with_f64_data(&[1.0]);
+
+        let bytes = builder.finish().unwrap();
+        assert_eq!(
+            huge_object_count(&bytes),
+            0,
+            "{name}: these attributes must stay managed"
+        );
+        assert!(
+            root_indirect_rows(&bytes) > 0,
+            "{name}: the root should have grown into an indirect block"
+        );
+        assert!(
+            indirect_block_count(&bytes) >= indirect,
+            "{name}: expected at least {indirect} indirect blocks, found {}",
+            indirect_block_count(&bytes)
+        );
+
+        let file = File::from_bytes(bytes).unwrap();
+        let attrs = file.root().attrs().unwrap();
+        assert_eq!(attrs.len(), count);
+        for i in 0..count {
+            let expected = char::from(b'a' + (i % 26) as u8)
+                .to_string()
+                .repeat(payload);
+            assert_eq!(text(&attrs, &format!("a{i:04}")), expected, "{name}");
+        }
+    }
+}
+
+/// The attribute count used to stop at 61,680, where a single B-tree leaf grown
+/// to hold every record pushed the capacity width the reference C library derives
+/// past the 2 bytes it allots. A name index of fixed 512-byte nodes grows a level
+/// instead, so counts on both sides of that old bound are ordinary now.
+#[test]
+fn the_attribute_count_has_no_bound_at_the_old_single_leaf_limit() {
     let build = |n: usize| {
         let mut builder = FileBuilder::new();
         for i in 0..n {
@@ -247,18 +300,23 @@ fn the_attribute_count_boundary_is_enforced() {
         builder
     };
 
-    let bytes = build(61_680)
-        .finish()
-        .expect("the limit itself is writable");
-    let file = File::from_bytes(bytes).unwrap();
-    assert_eq!(file.root().attrs().unwrap().len(), 61_680);
-
-    match build(61_681).finish().unwrap_err() {
-        Error::Format(FormatError::TooManyDenseAttributes { count, limit }) => {
-            assert_eq!(count, 61_681);
-            assert_eq!(limit, 61_680);
+    // Just under, just over, and well past the count that used to be refused.
+    for count in [61_680, 61_681, 70_000] {
+        let bytes = build(count)
+            .finish()
+            .unwrap_or_else(|e| panic!("{count} attributes should be writable, got {e:?}"));
+        let file = File::from_bytes(bytes).unwrap();
+        let attrs = file.root().attrs().unwrap();
+        assert_eq!(attrs.len(), count);
+        // Reading every name back proves the tree's in-order traversal reached
+        // every leaf, not just that the count in the header was right.
+        for i in 0..count {
+            let name = format!("a{i:06}");
+            assert!(
+                matches!(attrs.get(&name), Some(AttrValue::I64(v)) if *v == i as i64),
+                "attribute {name} did not read back"
+            );
         }
-        other => panic!("expected TooManyDenseAttributes, got {other:?}"),
     }
 }
 
@@ -332,4 +390,65 @@ fn group_and_dataset_attributes_use_huge_storage_too() {
     assert_eq!(huge_object_count(&bytes), 1);
     let file = File::from_bytes(bytes).unwrap();
     assert_eq!(file.dataset("x").unwrap().attrs().unwrap().len(), 9);
+}
+
+/// Two attribute names whose hashes collide must be indexed in the order the
+/// names compare, not the order they were set.
+///
+/// The name index is searched by name hash and, on a tie, by the name pulled back
+/// out of the heap — `H5A__dense_fh_name_cmp` does a `strcmp` — so a colliding
+/// pair stored in insertion order sends a binary search down the wrong branch and
+/// one of the two becomes unfindable by name. Reading every attribute back walks
+/// the node start to finish and cannot see it, which is why this asserts on the
+/// record order itself. The C-library half is
+/// `c_finds_attributes_whose_names_hash_alike`.
+#[test]
+fn colliding_name_hashes_are_indexed_in_name_order() {
+    // Distinct names with the same jenkins_lookup3 hash, set in the order that
+    // is the reverse of how they compare: "k155448" sorts before "k69209".
+    const FIRST: &str = "k69209";
+    const SECOND: &str = "k155448";
+    assert!(SECOND < FIRST, "the fixture pair is not in reverse order");
+
+    let mut builder = FileBuilder::new();
+    builder.set_attr(FIRST, AttrValue::I64(11));
+    builder.set_attr(SECOND, AttrValue::I64(22));
+    for i in 0..8 {
+        builder.set_attr(&format!("f{i}"), AttrValue::I64(i));
+    }
+    builder.create_dataset("x").with_f64_data(&[1.0]);
+
+    let bytes = builder.finish().unwrap();
+    assert!(has_fractal_heap(&bytes), "ten attributes are dense");
+
+    let records = name_index_leaf_records(&bytes, 10);
+    let hash_of = |order: u32| {
+        records
+            .iter()
+            .find(|(o, _)| *o == order)
+            .expect("a record per attribute")
+            .1
+    };
+    assert_eq!(
+        hash_of(0),
+        hash_of(1),
+        "the fixture names no longer hash alike; pick a new colliding pair"
+    );
+
+    let colliding: Vec<u32> = records
+        .iter()
+        .map(|(order, _)| *order)
+        .filter(|order| *order < 2)
+        .collect();
+    assert_eq!(
+        colliding,
+        vec![1, 0],
+        "the colliding records are in insertion order, not name order"
+    );
+
+    let file = File::from_bytes(bytes).unwrap();
+    let attrs = file.root().attrs().unwrap();
+    assert_eq!(attrs.len(), 10);
+    assert_eq!(attrs.get(FIRST), Some(&AttrValue::I64(11)));
+    assert_eq!(attrs.get(SECOND), Some(&AttrValue::I64(22)));
 }

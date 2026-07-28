@@ -403,33 +403,16 @@ pub enum FormatError {
         /// The largest length the message can describe, in bytes.
         limit: usize,
     },
-    /// An object carries more attributes than dense (fractal-heap) storage can
-    /// index. The single B-tree v2 leaf this writer emits has a record capacity
-    /// that follows its declared node size, and past this count the reference C
-    /// library cannot describe that capacity in the bytes it allots for it.
-    TooManyDenseAttributes {
-        /// The number of attributes requested.
-        count: usize,
-        /// The largest number that can be indexed.
-        limit: usize,
-    },
-    /// An object carries more attributes needing fractal-heap *huge* storage than
-    /// one huge-objects B-tree leaf can index. Same single-leaf constraint as
-    /// [`FormatError::TooManyDenseAttributes`], reached sooner because a huge
-    /// record is wider than a name-index record.
-    TooManyHugeDenseAttributes {
-        /// The number of attributes large enough to need huge storage.
-        count: usize,
-        /// The largest number that can be indexed.
-        limit: usize,
-    },
-    /// An object's attributes need a larger fractal-heap direct block than the
-    /// format's own limit for one, so the heap could not be read back reliably.
-    /// Reaching this takes gigabytes of attributes on a single object.
+    /// An object's attributes need more space than a dense attribute heap can
+    /// address: its offsets are 40 bits wide, so the blocks holding the
+    /// attributes cannot span more than `limit` bytes between them. Reaching this
+    /// takes about a terabyte of attributes on a single object.
+    ///
+    /// A set that fits the heap but not the host reports
+    /// [`FormatError::ValueTooLargeForPlatform`] instead, so the limit named here
+    /// is always the one that actually applied.
     DenseAttributeHeapTooLarge {
-        /// The direct block size the attribute set would need, in bytes.
-        block_size: u64,
-        /// The largest direct block size, in bytes.
+        /// The heap address space, in bytes.
         limit: u64,
     },
 }
@@ -834,25 +817,11 @@ impl fmt::Display for FormatError {
                      the attribute message's {field} size field"
                 )
             }
-            FormatError::TooManyDenseAttributes { count, limit } => {
+            FormatError::DenseAttributeHeapTooLarge { limit } => {
                 write!(
                     f,
-                    "{count} attributes exceed the {limit} that dense (fractal-heap) storage \
-                     can index"
-                )
-            }
-            FormatError::TooManyHugeDenseAttributes { count, limit } => {
-                write!(
-                    f,
-                    "{count} attributes need fractal-heap huge storage, past the {limit} that one \
-                     huge-objects B-tree can index"
-                )
-            }
-            FormatError::DenseAttributeHeapTooLarge { block_size, limit } => {
-                write!(
-                    f,
-                    "these attributes need a {block_size}-byte fractal-heap direct block, past \
-                     the {limit}-byte maximum"
+                    "these attributes need more than the {limit}-byte address space of a dense \
+                     attribute heap"
                 )
             }
         }

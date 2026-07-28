@@ -17,11 +17,17 @@ use hdf5_pure::{AttrValue, FileBuilder};
 use tempfile::tempdir;
 
 mod common;
-use common::heap::{huge_object_count, managed_object_count};
+use common::heap::{
+    huge_object_count, indirect_block_count, managed_object_count, root_indirect_rows,
+};
 
 /// Set on the child process to make it open `$DENSE_XCHECK_FILE` with libhdf5
 /// and report what it found on stdout.
 const CHILD_ENV: &str = "DENSE_XCHECK_FILE";
+
+/// Comma-separated attribute names for the child to open individually, rather
+/// than by iterating everything the object carries.
+const CHILD_LOOKUP_ENV: &str = "DENSE_XCHECK_LOOKUP";
 
 /// What libhdf5 made of a file, as observed from the parent.
 #[derive(Debug, PartialEq, Eq)]
@@ -68,10 +74,17 @@ fn c_reads_in_detail(path: &std::path::Path) -> CDetail {
 
 /// Re-exec this binary to run `child` against `path`, and parse what it reported.
 fn c_child(path: &std::path::Path, child: &str) -> CDetail {
+    c_child_looking_up(path, child, "")
+}
+
+/// As [`c_child`], additionally handing the child a comma-separated list of
+/// attribute names to open individually.
+fn c_child_looking_up(path: &std::path::Path, child: &str, lookup: &str) -> CDetail {
     let exe = std::env::current_exe().expect("test binary path");
     let out = std::process::Command::new(exe)
         .args([child, "--exact", "--nocapture"])
         .env(CHILD_ENV, path)
+        .env(CHILD_LOOKUP_ENV, lookup)
         .output()
         .expect("re-exec the test binary");
 
@@ -135,7 +148,14 @@ fn child_reads_attribute_sizes() {
     let Ok(path) = std::env::var(CHILD_ENV) else {
         return;
     };
-    match hdf5::File::open(&path) {
+    child_report_attributes(&path);
+}
+
+/// Open `path` with libhdf5 and print every attribute's size, and its `i64` sum
+/// where the type allows. Shared by the children that read and the ones that
+/// write first, so the parent parses one format either way.
+fn child_report_attributes(path: &str) {
+    match hdf5::File::open(path) {
         Ok(f) => {
             let names = f.attr_names().expect("attribute names");
             println!("ATTRS={}", names.len());
@@ -159,6 +179,48 @@ fn child_reads_attribute_sizes() {
         }
         Err(_) => println!("OPEN_FAILED"),
     }
+}
+
+/// The child half of [`c_looks_up_by_name`]. Opens only the named attributes,
+/// so libhdf5 has to *search* the name index rather than walk it.
+///
+/// A search descends the B-tree comparing name hashes, which is the one thing
+/// iteration never checks: a tree whose records are in the wrong order still
+/// yields every record in an in-order walk, and still fails every lookup that
+/// takes a wrong branch.
+#[test]
+fn child_looks_up_attributes_by_name() {
+    let Ok(path) = std::env::var(CHILD_ENV) else {
+        return;
+    };
+    let wanted = std::env::var(CHILD_LOOKUP_ENV).unwrap_or_default();
+    match hdf5::File::open(&path) {
+        Ok(f) => {
+            let mut found = 0usize;
+            for name in wanted.split(',').filter(|n| !n.is_empty()) {
+                let Ok(attr) = f.attr(name) else {
+                    println!("MISSING={name}");
+                    continue;
+                };
+                found += 1;
+                let values = attr.read_raw::<i64>().expect("an i64 attribute");
+                let sum: i64 = values
+                    .iter()
+                    .copied()
+                    .reduce(i64::wrapping_add)
+                    .unwrap_or(0);
+                println!("SUM={name}={sum}");
+            }
+            println!("ATTRS={found}");
+            f.close().expect("close");
+        }
+        Err(_) => println!("OPEN_FAILED"),
+    }
+}
+
+/// Have libhdf5 open each of `names` by name and report the values it read.
+fn c_looks_up_by_name(path: &std::path::Path, names: &[String]) -> CDetail {
+    c_child_looking_up(path, "child_looks_up_attributes_by_name", &names.join(","))
 }
 
 /// The child half of [`c_inserts_then_reads`]. Opens the file read-write with
@@ -191,25 +253,52 @@ fn child_inserts_with_libhdf5() {
             .expect("write attribute");
         f.close().expect("close");
     }
-    match hdf5::File::open(&path) {
-        Ok(f) => {
-            let names = f.attr_names().expect("attribute names");
-            println!("ATTRS={}", names.len());
-            for name in names {
-                let attr = f.attr(&name).expect("open attribute");
-                let dtype = attr.dtype().expect("attribute datatype");
-                println!("SIZE={name}={}", dtype.size() * attr.size());
-            }
-            f.close().expect("close");
-        }
-        Err(_) => println!("OPEN_FAILED"),
-    }
+    child_report_attributes(&path);
 }
 
 /// Have libhdf5 add a huge attribute to a heap this crate wrote, then read the
 /// result back.
 fn c_inserts_then_reads(path: &std::path::Path) -> CDetail {
     c_child(path, "child_inserts_with_libhdf5")
+}
+
+/// The child half of [`c_inserts_managed_then_reads`]. Adds an attribute small
+/// enough to be a *managed* object, so libhdf5 has to place it in the doubling
+/// table rather than outside it.
+///
+/// That placement starts from the heap header's allocation iterator, the offset
+/// where the next direct block goes. A heap that declares the wrong one has the
+/// library allocate a block on top of one already holding attributes, which no
+/// amount of reading would reveal.
+#[test]
+fn child_inserts_managed_with_libhdf5() {
+    let Ok(path) = std::env::var(CHILD_ENV) else {
+        return;
+    };
+    let added: Vec<i64> = (0..16).collect();
+    {
+        let f = match hdf5::File::open_rw(&path) {
+            Ok(f) => f,
+            Err(_) => {
+                println!("OPEN_FAILED");
+                return;
+            }
+        };
+        f.new_attr::<i64>()
+            .shape([added.len()])
+            .create("inserted")
+            .expect("create attribute")
+            .write(&added)
+            .expect("write attribute");
+        f.close().expect("close");
+    }
+    child_report_attributes(&path);
+}
+
+/// Have libhdf5 add a managed attribute to a heap this crate wrote, then read
+/// every attribute back.
+fn c_inserts_managed_then_reads(path: &std::path::Path) -> CDetail {
+    c_child(path, "child_inserts_managed_with_libhdf5")
 }
 
 /// Nine attributes — enough to select dense storage — the first sized to
@@ -489,15 +578,17 @@ fn c_rejects_a_heap_whose_objects_exceed_its_declared_limit() {
     assert_eq!(managed_object_count(&past), 8);
 }
 
-/// The attribute-count boundary, against the library that defines it. The limit
-/// is 61,680 rather than the 65,535 the B-tree leaf's record-count field would
-/// suggest, because libhdf5 derives the width it needs from the leaf's capacity,
-/// which follows the power-of-two node size this writer declares. Getting this
-/// wrong is not a near-miss: at 61,681 the file it produced aborted libhdf5, so
-/// the accepted side has to be confirmed here and not just against our own
-/// reader.
+/// Attribute counts that need a multi-level name index, against the library
+/// that defines the shape. 61,680 was the ceiling while the index was a single
+/// leaf grown to fit — one more produced a file that *aborted* libhdf5 rather
+/// than being rejected by it, which is exactly why the accepted side has to be
+/// confirmed here and not just against our own reader.
+///
+/// Each count crosses a different level boundary of a 512-byte-node tree: 570
+/// is the first that needs depth 2, 10,260 the first that needs depth 3, and
+/// 70,000 is well past the old single-leaf limit.
 #[test]
-fn c_reads_the_largest_accepted_attribute_count() {
+fn c_reads_attribute_counts_that_need_a_multi_level_index() {
     let build = |n: usize| {
         let mut builder = FileBuilder::new();
         for i in 0..n {
@@ -508,17 +599,136 @@ fn c_reads_the_largest_accepted_attribute_count() {
     };
 
     let dir = tempdir().unwrap();
-    let path = dir.path().join("count_limit.h5");
-    build(61_680).write(&path).unwrap();
-    assert_eq!(c_reads(&path), CReads::Attrs(61_680));
+    for count in [570, 10_260, 61_681, 70_000] {
+        let path = dir.path().join(format!("count_{count}.h5"));
+        build(count).write(&path).unwrap();
+        assert_eq!(
+            c_reads(&path),
+            CReads::Attrs(count),
+            "libhdf5 could not read {count} attributes"
+        );
 
-    // And one past it never reaches a file at all.
-    assert!(build(61_681).finish().is_err());
+        // Iteration walks the tree in order and would be satisfied by a tree
+        // whose records sit in the wrong order; opening by name makes libhdf5
+        // descend it, comparing at each internal node. Sampled across the range
+        // so the descents take different paths.
+        let sampled: Vec<String> = [0, 1, count / 3, count / 2, count - 2, count - 1]
+            .iter()
+            .map(|i| format!("a{i:06}"))
+            .collect();
+        let detail = c_looks_up_by_name(&path, &sampled);
+        assert_eq!(
+            detail.verdict,
+            CReads::Attrs(sampled.len()),
+            "libhdf5 could not look up attributes by name among {count}"
+        );
+        for (i, name) in [0, 1, count / 3, count / 2, count - 2, count - 1]
+            .iter()
+            .zip(&sampled)
+        {
+            assert_eq!(
+                detail.sum_of(name),
+                Some(*i as i64),
+                "{name} read back the wrong value among {count} attributes"
+            );
+        }
+    }
+}
+
+/// Managed attributes whose bytes outgrow the root direct block, against the
+/// library that defines how a heap grows instead: a root indirect block over a
+/// doubling table of direct blocks, and — once the root's own row of indirect
+/// blocks is used up — nested indirect blocks below that.
+///
+/// Both shapes have to be crosschecked separately. A root indirect block is one
+/// level of navigation; a nested one is the recursion, and it is reached only by
+/// objects large enough to skip every row of smaller blocks, which is a different
+/// path through the emitter as well as through libhdf5.
+///
+/// Values are read back, not just counted: an attribute placed at the wrong heap
+/// offset still yields a well-formed message from a neighbouring block.
+#[test]
+fn c_reads_a_heap_whose_managed_blocks_need_indirect_blocks() {
+    let dir = tempdir().unwrap();
+
+    // (name, elements per attribute, attribute count, indirect blocks expected)
+    let shapes: [(&str, usize, usize, usize); 2] = [
+        // Small attributes, enough of them to spill out of one starting-size
+        // block into the table's lower rows.
+        ("shallow", 10, 60, 1),
+        // Each attribute nearly fills the table's largest direct block, so the
+        // root's four of those run out and the walk descends into a nested
+        // indirect block for the rest.
+        ("nested", 8_000, 12, 2),
+    ];
+
+    for (name, len, count, indirect) in shapes {
+        let path = dir.path().join(format!("{name}.h5"));
+        let mut builder = FileBuilder::new();
+        for i in 0..count {
+            builder.set_attr(
+                &format!("a{i:04}"),
+                counting_attr(i as i64 * 1_000_000, len),
+            );
+        }
+        builder.create_dataset("x").with_f64_data(&[1.0]);
+        builder.write(&path).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            huge_object_count(&bytes),
+            0,
+            "{name}: these attributes must stay managed, or this is not a test \
+             about the managed blocks"
+        );
+        assert_eq!(managed_object_count(&bytes), count as u64);
+        assert!(
+            root_indirect_rows(&bytes) > 0,
+            "{name}: the root should have grown into an indirect block"
+        );
+        assert!(
+            indirect_block_count(&bytes) >= indirect,
+            "{name}: expected at least {indirect} indirect blocks, found {}",
+            indirect_block_count(&bytes)
+        );
+
+        let detail = c_reads_in_detail(&path);
+        assert_eq!(detail.verdict, CReads::Attrs(count), "{name}");
+        for i in 0..count {
+            let attr = format!("a{i:04}");
+            assert_eq!(detail.size_of(&attr), Some(len * 8), "{name}: {attr}");
+            assert_eq!(
+                detail.sum_of(&attr),
+                Some(counting_sum(i as i64 * 1_000_000, len)),
+                "{name}: {attr} came back with the wrong contents"
+            );
+        }
+
+        // And libhdf5 can go on to place a managed attribute of its own in the
+        // table, which reading alone never checks: that placement starts from the
+        // heap header's allocation iterator, and a wrong one lands the new block
+        // on top of the attributes already stored.
+        let detail = c_inserts_managed_then_reads(&path);
+        assert_eq!(
+            detail.verdict,
+            CReads::Attrs(count + 1),
+            "{name}: libhdf5 could not add a managed attribute to this heap"
+        );
+        assert_eq!(detail.sum_of("inserted"), Some((0..16).sum::<i64>()));
+        for i in 0..count {
+            let attr = format!("a{i:04}");
+            assert_eq!(
+                detail.sum_of(&attr),
+                Some(counting_sum(i as i64 * 1_000_000, len)),
+                "{name}: {attr} was overwritten by the attribute libhdf5 added"
+            );
+        }
+    }
 }
 
 /// A multi-megabyte dense heap of individually small attributes is inside what
-/// the emitter can encode, and libhdf5 must accept it — including the maximum
-/// direct block size the header now declares to match its own root block.
+/// the emitter can encode, and libhdf5 must accept it — including the doubling
+/// table of direct blocks the emitter grows to hold it.
 #[test]
 fn c_reads_a_multi_megabyte_dense_heap() {
     let dir = tempdir().unwrap();
@@ -533,4 +743,42 @@ fn c_reads_a_multi_megabyte_dense_heap() {
 
     assert!(std::fs::metadata(&path).unwrap().len() > 2_000_000);
     assert_eq!(c_reads(&path), CReads::Attrs(40));
+}
+
+/// libhdf5 must find both halves of a name-hash collision.
+///
+/// Its search compares the 32-bit name hash and, on a tie, `strcmp`s the name it
+/// pulls back out of the heap. Two names that hash alike therefore have to be
+/// stored in `strcmp` order or the descent takes a wrong branch and one of them
+/// is unfindable — while iteration, which never compares anything, still reports
+/// both. The zero-padded names the other tests here use cannot expose this: their
+/// insertion order and their `strcmp` order are the same by construction.
+#[test]
+fn c_finds_attributes_whose_names_hash_alike() {
+    // Distinct names with the same jenkins_lookup3 hash, set in the reverse of
+    // the order they compare in.
+    const FIRST: &str = "k69209";
+    const SECOND: &str = "k155448";
+
+    let mut builder = FileBuilder::new();
+    builder.set_attr(FIRST, AttrValue::I64(11));
+    builder.set_attr(SECOND, AttrValue::I64(22));
+    for i in 0..8 {
+        builder.set_attr(&format!("f{i}"), AttrValue::I64(i));
+    }
+    builder.create_dataset("x").with_f64_data(&[1.0]);
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("colliding_names.h5");
+    builder.write(&path).unwrap();
+
+    let names = [FIRST.to_string(), SECOND.to_string()];
+    let detail = c_looks_up_by_name(&path, &names);
+    assert_eq!(
+        detail.verdict,
+        CReads::Attrs(names.len()),
+        "libhdf5 could not open both colliding names"
+    );
+    assert_eq!(detail.sum_of(FIRST), Some(11));
+    assert_eq!(detail.sum_of(SECOND), Some(22));
 }

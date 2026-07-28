@@ -87,3 +87,54 @@ pub fn managed_object_count(bytes: &[u8]) -> u64 {
 pub fn huge_object_bytes(bytes: &[u8]) -> u64 {
     frhp_u64(bytes, 8)
 }
+
+/// The heap's "current # of rows in root indirect block": 0 when the root is a
+/// single direct block, and otherwise how many doubling-table rows the root
+/// indirect block spans.
+///
+/// Past the twelve 8-byte fields [`frhp_u64_at`] indexes come the doubling-table
+/// fields — table width(2), starting block size(8), maximum direct block size(8),
+/// maximum heap size(2), starting root rows(2) — then the root block address(8)
+/// and this.
+#[track_caller]
+pub fn root_indirect_rows(bytes: &[u8]) -> u16 {
+    let at = frhp(bytes) + 4 + 1 + 2 + 2 + 1 + 4 + 12 * SIZE + 2 + SIZE + SIZE + 2 + 2 + SIZE;
+    u16::from_le_bytes(bytes[at..at + 2].try_into().expect("2 bytes"))
+}
+
+/// How many fractal-heap indirect blocks the file holds. More than one means the
+/// root's own row of them filled up and the table nested.
+pub fn indirect_block_count(bytes: &[u8]) -> usize {
+    bytes.windows(4).filter(|w| *w == b"FHIB").count()
+}
+
+/// The `(creation order, name hash)` of each record in the file's first v2
+/// B-tree leaf node, in the order the node stores them.
+///
+/// That order is the one a reader binary-searches, so it is the thing a test
+/// about record ordering has to look at: reading the attributes back walks the
+/// node start to finish and is satisfied by any order at all. Creation order is
+/// the attribute's index in the order it was set, which is what identifies
+/// *which* attribute a record belongs to without decoding the heap.
+///
+/// Only meaningful for an index small enough to be a single leaf, and for the
+/// 8-byte heap IDs a dense attribute name index uses (record layout: heap ID(8) +
+/// message flags(1) + creation order(4) + name hash(4)).
+pub fn name_index_leaf_records(bytes: &[u8], count: usize) -> Vec<(u32, u32)> {
+    const RECORD: usize = 8 + 1 + 4 + 4;
+    let leaf = bytes
+        .windows(4)
+        .position(|w| w == b"BTLF")
+        .expect("a dense attribute name index has a leaf node");
+    // signature(4) + version(1) + type(1), then the records.
+    let first = leaf + 6;
+    (0..count)
+        .map(|i| {
+            let at = first + i * RECORD;
+            let field = |off: usize| {
+                u32::from_le_bytes(bytes[at + off..at + off + 4].try_into().expect("4 bytes"))
+            };
+            (field(9), field(13))
+        })
+        .collect()
+}
