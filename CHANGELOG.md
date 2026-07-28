@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.29.0] - 2026-07-28
+
+Dense attributes take on the reference library's geometry: both indexes are multi-level B-trees of 512-byte nodes, and the heap is a doubling table of direct blocks reached through indirect blocks, so a large attribute set grows by adding blocks rather than rounding one up to a power of two. The two attribute-count ceilings go with it, along with the errors that reported them, and the remaining heap-size error now bounds the heap's address space rather than one direct block — the release's only breaking changes ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)). MAT v7.3 files no longer have to be held in memory to be written: `MatBuilder::finish_to` assembles onto any `io::Write`, `MatBuilder::write_blocks` stages a numeric array whose bytes a `DataProducer` supplies one block at a time, `mat::to_file` streams rather than buffering, and `FileBuilder::with_userblock_content` keeps a wrapper format's header reachable on those paths ([#226](https://github.com/stephenberry/hdf5-pure/pull/226)). Chunked datasets are written back to back instead of padded to the host's cache line, which aligned nothing measurable and made the same dataset larger on `aarch64` than on `x86_64` ([#227](https://github.com/stephenberry/hdf5-pure/issues/227)). One soundness fix: a MATLAB matrix shape whose `rows * cols` wraps `usize` is refused at every entry point, where the wrapped product could previously match a short data vector and the writer's transpose then wrote past its allocation ([#230](https://github.com/stephenberry/hdf5-pure/pull/230)). Files written by earlier versions still read.
+
 ### Added
 
 - An object carries any number of dense (fractal-heap) attributes: both the name index and the huge-object index are now multi-level B-trees of fixed 512-byte nodes, matching what the reference C library emits, instead of one leaf grown to fit ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
@@ -508,7 +512,8 @@ Internal robustness and tests ([#26](https://github.com/stephenberry/hdf5-pure/i
 - The MAT deserializer flattens 1×N and N×1 values to a 1-D sequence in `deserialize_any` (matching `deserialize_seq`).
 - Numeric/complex readers preserve 1×N / N×1 shape at the value layer; any flattening happens at the serde level.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.28.0...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.29.0...HEAD
+[0.29.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.25.0...v0.26.0
