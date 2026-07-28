@@ -176,6 +176,7 @@ use crate::dataspace::{Dataspace, DataspaceType};
 use crate::datatype::{Datatype, DatatypeByteOrder};
 use crate::error::{Error, FormatError, OBJECT_HEADER_MESSAGE_MAX};
 use crate::extensible_array::ExtensibleArrayHeader;
+use crate::file_create_properties::FileCreateProperties;
 use crate::file_lock::{self, FileLocking};
 use crate::file_space_info::{FileSpaceInfo, FileSpaceStrategy, NUM_FILE_FSM_MANAGERS};
 use crate::file_writer::{
@@ -195,6 +196,7 @@ use crate::image::{FileImage, HandleImage, MirrorImage};
 use crate::link_message::{LinkMessage, LinkTarget};
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
+use crate::reader::FileAccessProperties;
 use crate::signature;
 use crate::source::{BaseOffsetSource, BytesSource, MetadataCacheConfig, Source};
 use crate::superblock::Superblock;
@@ -469,9 +471,16 @@ pub(crate) struct WriteEngine {
     resolved: HashMap<String, u64>,
     /// Whether this session splits a large in-place append into batches, trading
     /// whole-call crash atomicity for a peak memory that does not scale with the
-    /// call. Set by [`open_bounded`](Self::open_bounded); see
+    /// call. Set by [`open_rw_with_strategy`](Self::open_rw_with_strategy); see
     /// [`batch_elems`](Self::batch_elems).
     batched_appends: bool,
+    /// Whether this session reads through a handle rather than a whole-file
+    /// mirror. Set by [`open_rw_with_strategy`](Self::open_rw_with_strategy), and reported by
+    /// [`File::edit_backing`](crate::File::edit_backing) so a caller who
+    /// asked for [`MemoryStrategy::Auto`] can tell which one it got. Distinct
+    /// from [`batched_appends`](Self::batched_appends), which is a crash-atomicity
+    /// trade the bounded engine happens to make, not a statement about memory.
+    bounded: bool,
     /// The file length when the on-disk free-space managers were last written,
     /// for a file that persists them. Every immediate in-place append grows the
     /// file past those managers and leaves them mid-file, so a session that ends
@@ -479,6 +488,144 @@ pub(crate) struct WriteEngine {
     /// [`finalize_persist`](Self::finalize_persist) settles at close. Meaningless
     /// (and untouched) when `persist` is `None`.
     fsm_len: u64,
+}
+
+/// How much memory a read-write open may use to hold the file being edited.
+///
+/// The two read-write backends differ in memory, not in what they can express: a
+/// *bounded* session reads through a handle and holds only what a commit is
+/// building, while a *mirrored* session materializes the whole file in memory.
+/// Bounded is the better default when it applies, but it cannot yet edit every
+/// file — a pre-v2 (non-latest-format) superblock or a userblock still needs the
+/// mirror.
+///
+/// This is what a caller says about that trade-off, on
+/// [`FileAccessProperties::with_memory_strategy`](crate::FileAccessProperties::with_memory_strategy).
+/// Leaving it unset lets the entry point decide: [`File::open_rw`](crate::File::open_rw)
+/// prefers the bounded engine and falls back to the mirror ([`Auto`](Self::Auto)),
+/// while the deprecated [`File::open_rw_bounded`](crate::File::open_rw_bounded)
+/// refuses instead of falling back ([`Bounded`](Self::Bounded)).
+///
+/// This is a *request*, so it is deliberately not the type a file answers with:
+/// [`File::edit_backing`](crate::File::edit_backing) returns an [`EditBacking`],
+/// which cannot express [`Auto`](Self::Auto).
+///
+/// Sealed: unlike [`FileLocking`] or [`FileSpaceStrategy`](crate::FileSpaceStrategy),
+/// whose variant sets mirror a closed C-library enum, this is a policy this crate
+/// invented, so a fourth strategy must not be a breaking change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MemoryStrategy {
+    /// Never build a whole-file mirror. A file the bounded engine cannot edit is
+    /// refused at open with [`Error::EditUnsupported`], before anything is
+    /// staged. This is what
+    /// [`File::open_rw_bounded`](crate::File::open_rw_bounded) has always done.
+    Bounded,
+    /// Prefer the bounded engine, but fall back to the whole-file mirror for a
+    /// file it cannot edit, rather than refusing. Memory then scales with the
+    /// file, which is the cost of the file opening at all. What
+    /// [`File::open_rw`](crate::File::open_rw) uses when nothing is asked for.
+    Auto,
+    /// Always build the whole-file mirror, whatever the file looks like. What
+    /// [`File::open_rw`](crate::File::open_rw) did before it learned to dispatch.
+    Mirrored,
+}
+
+/// Which of the two read-write backends a file's editing session is actually
+/// using, from [`File::edit_backing`](crate::File::edit_backing).
+///
+/// Deliberately a different type from [`MemoryStrategy`]: that one is what a
+/// caller *asks* for and includes [`Auto`](MemoryStrategy::Auto), which is a
+/// preference between these two rather than a third thing a session can be. A
+/// single shared type would make `file.backing() == Auto` a comparison that
+/// compiles and is false forever.
+///
+/// The two also evolve at different rates. A future `MemoryStrategy` may name a
+/// new *policy* — a byte budget, a size threshold — without the set of backends
+/// changing at all. Sealed for the rarer case that a third backend does appear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EditBacking {
+    /// Reads through a file handle, holding only what a commit is building.
+    /// Memory does not scale with the file.
+    Bounded,
+    /// Holds the whole file in memory for the life of the session.
+    Mirrored,
+}
+
+impl From<EditBacking> for MemoryStrategy {
+    /// Turns an outcome back into the request that pins it, so a caller can
+    /// reopen a file onto the backing it got the first time:
+    /// `with_memory_strategy(file.edit_backing().unwrap().into())`.
+    fn from(backing: EditBacking) -> Self {
+        match backing {
+            EditBacking::Bounded => Self::Bounded,
+            EditBacking::Mirrored => Self::Mirrored,
+        }
+    }
+}
+
+/// Why the bounded engine cannot edit a file, when the whole-file mirror can.
+///
+/// Kept separate from the refusals that apply to *both* engines: a fallback is
+/// only ever worth taking for a limitation the mirror does not share. A paged
+/// file with no persisted free-space managers, for instance, is refused by the
+/// staged commit as well, so mirroring it would trade a clear error at open for
+/// the same error later with work already staged.
+fn bounded_only_limitation(session: &WriteEngine) -> Option<&'static str> {
+    if session.superblock.version < 2 {
+        return Some(
+            "bounded read-write access requires a latest-format file (v2/v3 superblock); \
+             leave MemoryStrategy unset, or pass MemoryStrategy::Auto, to fall back to \
+             the whole-file mirror here",
+        );
+    }
+    if session.superblock.base_address != 0 {
+        return Some(
+            "bounded read-write access does not support a file with a userblock \
+             (non-zero base address); leave MemoryStrategy unset, or pass \
+             MemoryStrategy::Auto, to fall back to the whole-file mirror here",
+        );
+    }
+    None
+}
+
+/// Whether a file built from `create` could not then be opened read-write under
+/// `access`, and why.
+///
+/// [`File::create_with_options`](crate::File::create_with_options) writes a file
+/// and hands back an open read-write handle, so a creation/access pair that
+/// cannot survive that second half must be caught *before* the write — otherwise
+/// the call leaves a file on disk and returns `Err`, which reads like a failed
+/// create but is not one.
+///
+/// This mirrors the open-time refusals above and must be kept in step with them:
+/// [`bounded_only_limitation`] for the userblock, and the shared paged check in
+/// [`open_rw_with_strategy`](WriteEngine::open_rw_with_strategy) for a paged file
+/// with no persisted free space. Both are stated here in terms of the properties
+/// that *cause* them, because the open-time wording tells the caller to recreate
+/// the file — advice that is circular when the caller is creating it.
+pub(crate) fn create_would_refuse_reopen(
+    create: &FileCreateProperties,
+    access: &FileAccessProperties,
+) -> Option<&'static str> {
+    if let Some((FileSpaceStrategy::Page, false, _)) = create.file_space_strategy() {
+        return Some(
+            "a paged file (FileSpaceStrategy::Page) with persist = false cannot be reopened \
+             read-write, so creating one this way would write the file and then fail to open \
+             it; pass persist = true to with_file_space_strategy, or build the file with \
+             FileBuilder if it is only ever going to be read",
+        );
+    }
+    if create.userblock() != 0 && access.memory_strategy() == Some(MemoryStrategy::Bounded) {
+        return Some(
+            "a userblock cannot be combined with MemoryStrategy::Bounded: the bounded engine \
+             cannot edit a file with a non-zero base address, so creating one this way would \
+             write the file and then refuse to open it; drop the userblock, or leave \
+             MemoryStrategy unset to mirror this file",
+        );
+    }
+    None
 }
 
 /// Paged-file bookkeeping for the whole-file editor (issue #198, step 1).
@@ -763,7 +910,7 @@ impl WriteEngine {
     /// behind an image that withholds its whole-file slice, so every read takes
     /// the [`Source`] path rather than the slice fast path.
     ///
-    /// Distinct from [`open_bounded`](Self::open_bounded), which withholds the
+    /// Distinct from [`open_rw_with_strategy`](Self::open_rw_with_strategy), which withholds the
     /// slice *and* the residency: this one still mirrors the file, so a test can
     /// compare the two read forms on a file the bounded open would refuse.
     #[cfg(test)]
@@ -797,47 +944,68 @@ impl WriteEngine {
         Ok(session)
     }
 
-    /// Open an existing file for bounded-memory editing: the same engine, over a
-    /// [`HandleImage`] that keeps no whole-file mirror, so resident memory is the
-    /// metadata-cache budget plus whatever is being parsed rather than the file's
-    /// size. Backs [`File::open_rw_bounded`](crate::File::open_rw_bounded).
+    /// Open an existing file for read-write editing under `strategy`: the one
+    /// place that picks between the bounded backing (a [`HandleImage`] keeping no
+    /// whole-file mirror, so resident memory is the metadata-cache budget plus
+    /// whatever is being parsed) and the whole-file mirror. Backs
+    /// [`File::open_rw`](crate::File::open_rw) and the deprecated
+    /// [`File::open_rw_bounded`](crate::File::open_rw_bounded), which differ only
+    /// in the strategy they default to.
     ///
     /// The eligibility rules are checked here rather than deferred, because a
     /// caller who asked for bounded memory cannot be silently given the mirror
-    /// instead: a pre-v2 superblock, non-8-byte offsets or lengths, a userblock,
-    /// and a paged file without persisted free space are each refused up front.
-    /// Relaxing them is the next step of issue #198.
-    pub(crate) fn open_bounded(
+    /// instead. Under [`MemoryStrategy::Bounded`] a file the bounded engine
+    /// cannot edit is refused up front; [`MemoryStrategy::Auto`] opts in to
+    /// falling back to the mirror instead (issue #198, steps 3 and 4).
+    ///
+    /// Only a *bounded-only* limitation is worth falling back for — see
+    /// [`bounded_only_limitation`]. Non-8-byte offsets or lengths are refused by
+    /// [`open_imaged`](Self::open_imaged) for both engines, and so is an
+    /// unsupported superblock version; a paged file without persisted free space
+    /// is refused below for both.
+    pub(crate) fn open_rw_with_strategy(
         path: &Path,
         cache: MetadataCacheConfig,
         locking: FileLocking,
+        strategy: MemoryStrategy,
     ) -> Result<Self, Error> {
+        if strategy == MemoryStrategy::Mirrored {
+            return Self::open_with_locking(path, locking);
+        }
         let mut session = Self::open_imaged(path, Some(locking), |handle, len| {
             Ok(Box::new(HandleImage::new(handle, len, cache)))
         })?;
         session.batched_appends = true;
-        if session.superblock.version < 2 {
-            return Err(Error::EditUnsupported(
-                "bounded read-write access requires a latest-format file (v2/v3 superblock); \
-                 use File::open_rw",
-            ));
-        }
-        if session.superblock.base_address != 0 {
-            return Err(Error::EditUnsupported(
-                "bounded read-write access does not support a file with a userblock \
-                 (non-zero base address); use File::open_rw",
-            ));
-        }
-        // A paged file with no persisted managers has no on-disk record of which
-        // pages hold metadata and which hold raw data, so nothing can keep the
-        // pages segregated. The staged commit refuses it too; refusing at open
-        // reports it before any work is staged.
+        session.bounded = true;
+        // Refusals that apply to *both* backings come first, or falling back for a
+        // bounded-only limitation would skip them and hand back a session that
+        // cannot commit. A paged file with no persisted managers has no on-disk
+        // record of which pages hold metadata and which hold raw data, so nothing
+        // can keep the pages segregated; the staged commit refuses it too, so
+        // deferring would only trade this error for the same one later, with work
+        // already staged. A userblock is one way to reach this state without the
+        // file saying `persist = false`: persisted free space is declined for a
+        // non-zero base address, which leaves the managers unseeded all the same.
         if session.paged.is_some() && session.persist.is_none() {
             return Err(Error::EditUnsupported(
-                "bounded read-write of a paged file (H5F_FSPACE_STRATEGY_PAGE) requires \
+                "read-write access to a paged file (H5F_FSPACE_STRATEGY_PAGE) requires \
                  persisted free space; recreate the file with \
                  with_file_space_strategy(FileSpaceStrategy::Page, true, ..) to grow it in place",
             ));
+        }
+        if let Some(reason) = bounded_only_limitation(&session) {
+            if strategy == MemoryStrategy::Bounded {
+                return Err(Error::EditUnsupported(reason));
+            }
+            // Release the handle and its exclusive lock before reopening, or the
+            // mirrored open would contend with the probe we are discarding —
+            // fatally so on Windows, where the OS lock is mandatory. Dropping a
+            // bare `WriteEngine` writes nothing: the free-space finalize that a
+            // dropped writer owes lives on `FileInner`, which this is not yet.
+            // Another writer can take the lock in that window; the reopen then
+            // reports `Error::FileLocked`, which is the truthful answer.
+            drop(session);
+            return Self::open_with_locking(path, locking);
         }
         Ok(session)
     }
@@ -986,6 +1154,7 @@ impl WriteEngine {
             committed: false,
             resolved: HashMap::new(),
             batched_appends: false,
+            bounded: false,
             fsm_len: len,
         };
         // If the file persists its free space, seed the free list from the
@@ -1357,6 +1526,19 @@ impl WriteEngine {
     /// clone from an earlier moment may be reading a stale root.
     pub(crate) fn superblock(&self) -> &Superblock {
         &self.superblock
+    }
+
+    /// Which backend this session resolved to: [`Bounded`] when it reads through
+    /// a handle, [`Mirrored`] when it holds a whole-file image.
+    ///
+    /// [`Bounded`]: EditBacking::Bounded
+    /// [`Mirrored`]: EditBacking::Mirrored
+    pub(crate) fn edit_backing(&self) -> EditBacking {
+        if self.bounded {
+            EditBacking::Bounded
+        } else {
+            EditBacking::Mirrored
+        }
     }
 
     /// A snapshot of this session's live space usage — the current file size and
@@ -8466,10 +8648,11 @@ mod tests {
     }
 
     fn open_bounded_session(path: &Path) -> WriteEngine {
-        WriteEngine::open_bounded(
+        WriteEngine::open_rw_with_strategy(
             path,
             crate::source::MetadataCacheConfig::disabled(),
             FileLocking::Enabled,
+            MemoryStrategy::Bounded,
         )
         .unwrap()
     }
@@ -8694,7 +8877,7 @@ mod tests {
     /// metadata it edits, but never the file's bulk. Measured rather than
     /// asserted from the design — the engine is shared with the mirror sessions
     /// now, and a single slice-taking read added anywhere on the commit path
-    /// would silently make `open_rw_bounded` cost as much as `open_rw`.
+    /// would silently make a bounded open cost as much as a mirrored one.
     #[test]
     fn a_bounded_commit_reads_far_less_than_the_file() {
         use std::sync::Arc;

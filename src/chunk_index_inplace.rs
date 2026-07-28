@@ -84,8 +84,8 @@ impl ElemRecord {
 /// Writable byte-level I/O the Extensible-Array growth engine ([`Located`])
 /// depends on, extending the read-only [`Source`] seam with in-place mutation.
 /// Its owners today are [`InPlaceFile`] (the append/SWMR writers' own mirror +
-/// handle) and [`File::open_rw`](crate::File::open_rw)'s borrowed mirror; issue #147's
-/// bounded backend adds a store with no mirror at all, which is why every engine
+/// handle) and the read-write engine's borrowed mirror; the bounded backing adds
+/// a store with no mirror at all, which is why every engine
 /// *read* goes through [`Source`] (bounded, random-access) rather than a
 /// whole-file `&[u8]`. Genericizing the engine over this trait lets a long-lived
 /// edit engine drive an O(1) in-place append against its *own* single mirror and

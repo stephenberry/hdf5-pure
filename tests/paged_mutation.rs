@@ -1,9 +1,21 @@
 //! Bounded-memory mutation of genuine paged files (issue #173 Phase 2, B2):
-//! `File::open_rw_bounded` grows a persisting paged file, segregating raw and
+//! the bounded engine grows a persisting paged file, segregating raw and
 //! metadata into separate pages, and rewrites its per-page-type managers at
 //! close. libhdf5 interop lives in `tests/file_space_crosscheck.rs`.
 
-use hdf5_pure::{Error, File, FileBuilder, FileSpaceStrategy};
+use hdf5_pure::{
+    Error, File, FileAccessProperties, FileBuilder, FileSpaceStrategy, MemoryStrategy,
+};
+
+/// Open with the bounded engine demanded rather than merely preferred: these
+/// tests are about that engine, so a file it stops accepting must fail here
+/// rather than quietly retarget the whole file at the mirror.
+fn open_bounded(path: &std::path::Path) -> Result<File, hdf5_pure::Error> {
+    File::open_rw_with_options(
+        path,
+        FileAccessProperties::new().with_memory_strategy(MemoryStrategy::Bounded),
+    )
+}
 
 const PAGE: u64 = 4096;
 
@@ -57,7 +69,7 @@ fn assert_paged_ok(path: &std::path::Path) {
     }
 }
 
-/// A persisting paged file grows through `open_rw_bounded`: appending enough rows
+/// A persisting paged file grows through the bounded engine: appending enough rows
 /// to force extensible-array index growth allocates metadata (new EA blocks) as
 /// well as raw chunks, so the append exercises page segregation. Every row reads
 /// back and the paged invariants hold.
@@ -67,7 +79,7 @@ fn paged_persist_append_roundtrip() {
     build_paged(&path, 64, 64); // 1 chunk, ~one raw page
 
     {
-        let file = File::open_rw_bounded(&path).unwrap();
+        let file = open_bounded(&path).unwrap();
         let mut ds = file.dataset("d").unwrap();
         let extra: Vec<i32> = (64..5000).collect(); // 77 more chunks -> EA index grows, new pages
         ds.append(&extra).unwrap();
@@ -95,7 +107,7 @@ fn paged_persist_many_appends_one_finalize() {
 
     let mut next = 100i32;
     {
-        let file = File::open_rw_bounded(&path).unwrap();
+        let file = open_bounded(&path).unwrap();
         let mut ds = file.dataset("d").unwrap();
         for _ in 0..20 {
             let batch: Vec<i32> = (next..next + 250).collect();
@@ -122,7 +134,7 @@ fn paged_persist_large_append_multi_batch() {
     build_paged(&path, 256, 256);
 
     {
-        let file = File::open_rw_bounded(&path).unwrap();
+        let file = open_bounded(&path).unwrap();
         let mut ds = file.dataset("d").unwrap();
         // ~1.5 MiB of raw i32 -> more than one internal 1 MiB batch.
         let extra: Vec<i32> = (256..400_000).collect();
@@ -143,7 +155,7 @@ fn paged_persist_large_append_multi_batch() {
 /// persisting paged file too (issue #198): the commit takes a page-aware tail
 /// that rewrites the per-page-type managers and keeps the allocation page-aligned,
 /// so the appended rows read back and every paged invariant still holds. It used
-/// to refuse such a file and send the caller to `File::open_rw_bounded`.
+/// to refuse such a file and send the caller to the bounded engine.
 #[test]
 fn paged_mirror_commit_appends() {
     let path = tmp("pure_paged_mirror_commit.h5");
@@ -176,7 +188,7 @@ fn paged_persist_drop_finalizes() {
     let path = tmp("pure_paged_mut_drop.h5");
     build_paged(&path, 64, 64);
     {
-        let file = File::open_rw_bounded(&path).unwrap();
+        let file = open_bounded(&path).unwrap();
         let mut ds = file.dataset("d").unwrap();
         ds.append(&(64..3000).collect::<Vec<i32>>()).unwrap();
         // Drop without close: the Drop guard runs finalize_persist best-effort.
@@ -193,11 +205,10 @@ fn paged_persist_drop_finalizes() {
     );
 }
 
-/// A paged file without persisted free space cannot be mutated through the
-/// whole-file editor either: both the immediate in-place append and the staged
-/// append + commit are refused (they would break the page alignment), and the
-/// file is left untouched. The bounded backend also refuses it, so a paged file
-/// must persist its free space to be grown.
+/// A paged file without persisted free space cannot be mutated at all, so a paged
+/// file must persist its free space to be grown. `File::open_rw` says so at open;
+/// the refusals further in still exist and still leave the file untouched, and are
+/// reached here through `MemoryStrategy::Mirrored`.
 #[test]
 fn paged_non_persist_mirror_is_refused() {
     let path = tmp("pure_paged_nonpersist_mirror.h5");
@@ -211,8 +222,22 @@ fn paged_non_persist_mirror_is_refused() {
         .with_file_space_page_size(PAGE);
     b.write(&path).unwrap();
 
+    // `File::open_rw` refuses this file outright: neither backing can edit it, so
+    // there is nothing to gain by letting an edit be staged against it first.
+    assert!(
+        matches!(File::open_rw(&path), Err(Error::EditUnsupported(_))),
+        "open_rw must refuse a paged non-persisting file up front"
+    );
+
+    // Demanding the mirror still opens it — that asks for a backing rather than
+    // expressing a preference, and reading such a file is legitimate — which is
+    // the path that still reaches the commit-time refusal below.
     {
-        let file = File::open_rw(&path).unwrap();
+        let file = File::open_rw_with_options(
+            &path,
+            FileAccessProperties::new().with_memory_strategy(MemoryStrategy::Mirrored),
+        )
+        .unwrap();
         let mut ds = file.dataset("d").unwrap();
         // Immediate in-place append is refused (would break page alignment).
         assert!(
@@ -249,7 +274,7 @@ fn paged_persist_noop_close_does_not_grow() {
     let path = tmp("pure_paged_mut_noop.h5");
     build_paged(&path, 200, 50);
     let before = std::fs::metadata(&path).unwrap().len();
-    File::open_rw_bounded(&path).unwrap().close().unwrap();
+    open_bounded(&path).unwrap().close().unwrap();
     assert_eq!(
         std::fs::metadata(&path).unwrap().len(),
         before,

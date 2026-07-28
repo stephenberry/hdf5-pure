@@ -1049,7 +1049,10 @@ impl FileWriter {
                 // with absolute ones only when the userblock is a whole number of
                 // pages (zero trivially qualifies).
                 if self.userblock_size % ps != 0 {
-                    return Err(FormatError::InvalidFileSpacePageSize(ps));
+                    return Err(FormatError::UserblockNotPageAligned(
+                        self.userblock_size,
+                        ps,
+                    ));
                 }
                 (true, persist, ps, threshold)
             }

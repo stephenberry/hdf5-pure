@@ -1,11 +1,13 @@
 //! Staged edits on genuine paged files through `File::open_rw` (issue #198,
 //! step 1). The whole-file editor used to refuse every paged file and send the
-//! caller to `File::open_rw_bounded`; it now commits a persisting paged file
+//! caller to the bounded engine; it now commits a persisting paged file
 //! through a page-aware tail that keeps the per-page-type managers intact.
 //! A paged file *without* persisted managers is still refused, because nothing
 //! on disk records which pages hold metadata and which hold raw data.
 
-use hdf5_pure::{Error, File, FileBuilder, FileSpaceStrategy};
+use hdf5_pure::{
+    Error, File, FileAccessProperties, FileBuilder, FileSpaceStrategy, MemoryStrategy,
+};
 
 const PAGE: u64 = 4096;
 
@@ -217,6 +219,11 @@ fn paged_staged_commit_keeps_pages_homogeneous() {
 /// the end of allocation unaligned — producing a file that still advertises the
 /// paged strategy but no longer satisfies it. The refusal is the same one a paged
 /// non-persisting file gets, since in both cases the page bookkeeping is missing.
+///
+/// It is refused at *open*, and the ordering that makes it so is the point of this
+/// test: a userblock is a bounded-only limitation, so `MemoryStrategy::Auto` would
+/// fall back to the mirror for it — skipping this refusal on the way past — unless
+/// the refusals both backings share are checked first.
 #[test]
 fn paged_with_userblock_is_refused() {
     let path = tmp("pure_paged_staged_userblock.h5");
@@ -233,7 +240,19 @@ fn paged_with_userblock_is_refused() {
         b.write(&path).unwrap();
     }
 
-    let s = File::open_rw(&path).unwrap();
+    let err = File::open_rw(&path).unwrap_err();
+    assert!(
+        matches!(&err, Error::EditUnsupported(m) if m.contains("persisted free space")),
+        "expected a paged refusal for a userblock file, got {err:?}"
+    );
+
+    // Demanding the mirror still opens it, and the commit-time guard behind the
+    // open-time one still fires.
+    let s = File::open_rw_with_options(
+        &path,
+        FileAccessProperties::new().with_memory_strategy(MemoryStrategy::Mirrored),
+    )
+    .unwrap();
     s.root()
         .create_dataset("added", |b| {
             b.with_i32_data(&[1i32, 2, 3]);
@@ -257,12 +276,26 @@ fn paged_with_userblock_is_refused() {
 /// A paged file that does not persist its free space is still refused: without
 /// on-disk managers there is no record of which pages are metadata and which are
 /// raw, so a commit could not keep the two segregated.
+///
+/// `File::open_rw` now says so at open, since neither backing can edit such a
+/// file. The commit-time refusal behind it still exists and is reached here by
+/// demanding the mirror, which opens the file because reading it is legitimate.
 #[test]
 fn paged_without_persist_is_refused() {
     let path = tmp("pure_paged_staged_nopersist.h5");
     build_paged(&path, 64, false);
 
-    let s = File::open_rw(&path).unwrap();
+    let err = File::open_rw(&path).unwrap_err();
+    assert!(
+        matches!(&err, Error::EditUnsupported(m) if m.contains("persisted free space")),
+        "expected a persisted-free-space refusal at open, got {err:?}"
+    );
+
+    let s = File::open_rw_with_options(
+        &path,
+        FileAccessProperties::new().with_memory_strategy(MemoryStrategy::Mirrored),
+    )
+    .unwrap();
     s.root()
         .create_dataset("added", |b| {
             b.with_i32_data(&[1i32, 2, 3]);

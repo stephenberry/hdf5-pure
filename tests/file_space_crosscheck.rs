@@ -8,7 +8,18 @@
 //! message carries free-space-manager addresses.
 
 use hdf5::plist::file_create::FileSpaceStrategy as CStrategy;
-use hdf5_pure::{File, FileBuilder, FileSpaceStrategy};
+use hdf5_pure::{File, FileAccessProperties, FileBuilder, FileSpaceStrategy, MemoryStrategy};
+
+/// Open with the bounded engine demanded rather than merely preferred: these
+/// tests are about that engine, so a file it stops accepting must fail here
+/// rather than quietly retarget the whole file at the mirror.
+fn open_bounded(path: &std::path::Path) -> Result<File, hdf5_pure::Error> {
+    File::open_rw_with_options(
+        path,
+        FileAccessProperties::new().with_memory_strategy(MemoryStrategy::Bounded),
+    )
+}
+
 use std::sync::{Mutex, MutexGuard};
 use tempfile::tempdir;
 
@@ -474,7 +485,7 @@ fn c_library_reads_our_paged_chunked_file() {
 fn c_library_reads_our_bounded_mutated_paged_file() {
     let _c = c_lib_guard();
     // hdf5-pure creates a genuine paged persisting file, then grows it through the
-    // bounded backend (`File::open_rw_bounded`), appending enough rows to force
+    // bounded backend, appending enough rows to force
     // extensible-array index growth so the append allocates metadata as well as
     // raw chunks (exercising page segregation). The reference C library must then
     // recover the paged strategy, read every row, load the per-page-type managers
@@ -495,7 +506,7 @@ fn c_library_reads_our_bounded_mutated_paged_file() {
         b.write(&path).unwrap();
     }
     {
-        let file = File::open_rw_bounded(&path).unwrap();
+        let file = open_bounded(&path).unwrap();
         let mut ds = file.dataset("d").unwrap();
         ds.append(&(64..5000).collect::<Vec<i32>>()).unwrap();
         file.close().unwrap();
@@ -675,7 +686,7 @@ fn pure_bounded_mutates_c_created_paged_file() {
 
     // hdf5-pure grows the C-created paged file.
     {
-        let file = File::open_rw_bounded(&path).unwrap();
+        let file = open_bounded(&path).unwrap();
         let mut ds = file.dataset("d").unwrap();
         ds.append(&(64..4000).collect::<Vec<i32>>()).unwrap();
         file.close().unwrap();

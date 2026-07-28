@@ -60,6 +60,11 @@ pub enum FormatError {
     /// A paged file-space strategy was requested with a page size the writer
     /// cannot use: it must be a power of two of at least 512 bytes.
     InvalidFileSpacePageSize(u64),
+    /// A paged file-space strategy was requested alongside a userblock that is
+    /// not a whole number of pages. File-space pages are measured from the file
+    /// base, so the two boundaries coincide only when the userblock divides by
+    /// the page size: `(userblock bytes, page size)`.
+    UserblockNotPageAligned(u64, u64),
     /// A free-space manager block (`FSHD`/`FSSE`) is malformed.
     InvalidFreeSpaceManager,
     /// An enumeration datatype was built over a base type that is not an
@@ -496,6 +501,14 @@ impl fmt::Display for FormatError {
                 write!(
                     f,
                     "invalid file-space page size {p}: must be a power of two >= 512"
+                )
+            }
+            FormatError::UserblockNotPageAligned(userblock, page_size) => {
+                write!(
+                    f,
+                    "userblock of {userblock} bytes is not a whole number of {page_size}-byte \
+                     file-space pages: a paged file measures its pages from the file base, so \
+                     the userblock must be a multiple of the page size (or zero)"
                 )
             }
             FormatError::InvalidFreeSpaceManager => {

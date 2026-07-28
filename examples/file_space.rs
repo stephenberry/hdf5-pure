@@ -36,7 +36,7 @@ fn main() {
     builder.create_dataset("keep").with_i32_data(&[1, 2, 3]);
     // A free-space-manager strategy that persists across sessions. (The paged
     // strategy also persists, but a paged file is grown only through the
-    // append-only `File::open_rw_bounded`, which cannot reuse a freed hole the
+    // append-only bounded engine, which cannot reuse a freed hole the
     // way this delete-then-re-add demo does.)
     builder.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1); // strategy, persist, threshold
     builder.write(&persisting).expect("write file");

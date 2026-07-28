@@ -11,36 +11,36 @@
 
 ## Choosing a write path
 
-Two open modes edit an existing file in place, through the same engine and the same edit vocabulary. They differ in how the engine holds the file's bytes: `File::open_rw` reads it into a whole-file **mirror** — `O(file size)` memory — while `File::open_rw_bounded` never builds one, so memory stays at the [configured caches](streaming.md) plus whatever an edit is building. Both mutate the file the same way: new bytes are appended and a small, fixed set of locations is patched. Neither ever rewrites the file on commit; see [write paths](../about/architecture.md#write-paths) for the mechanics.
+`File::open_rw` is the read-write open, and it picks how to hold the file's bytes from the file itself rather than making you pick a function. A latest-format file with no userblock is edited **bounded**: no whole-file copy is ever built, so memory stays at the [configured caches](streaming.md) plus whatever an edit is building. Anything else — a pre-v2 superblock, or a userblock — falls back to a whole-file **mirror**, `O(file size)`, which is what makes such a file editable at all. Either backing mutates the file the same way: new bytes are appended and a small, fixed set of locations is patched, never a rewrite on commit; see [write paths](../about/architecture.md#write-paths) for the mechanics.
 
-| Operation | `File::open_rw` (mirror) | `File::open_rw_bounded` (bounded) |
+Ask a file which backing it got with `File::edit_backing()`, and demand one with `FileAccessProperties::with_memory_strategy`:
+
+| `MemoryStrategy` | Effect |
+| --- | --- |
+| unset (the default) | Prefer bounded; fall back to the mirror for a file the bounded engine cannot edit |
+| `Bounded` | Never build a mirror; refuse such a file with `Error::EditUnsupported` |
+| `Mirrored` | Always build the mirror, whatever the file looks like |
+
+`File::open_rw_bounded` is the deprecated spelling of `Bounded`. The answer from `File::edit_backing()` is an `EditBacking` (`Bounded` or `Mirrored`) rather than the `MemoryStrategy` that was asked for, because `Auto` is a preference between the two backings and never an outcome; `.into()` converts an `EditBacking` back into the `MemoryStrategy` that pins a later reopen to it.
+
+`File::open_swmr_writer` always mirrors, so it accepts `Auto` and `Mirrored` — both satisfied by the mirror — and refuses an explicit `Bounded` rather than quietly not honoring it.
+
+The two backings are the same engine and the same edit vocabulary — reads, immediate `Dataset::append` / `append_raw`, `Dataset::write`, `append_staged`, `set_attr` / `remove_attr`, `Group::create_dataset` / `create_group` / `create_group_with` / `delete`, `File::copy` / `copy_from`, `commit`, and `space_accounting` — with one trade between them. A large `Dataset::append` is one crash-atomic apply on the mirror and several ~1 MiB whole-chunk batches when bounded, so a crash mid-call there leaves a valid shorter dataset. A commit's resident memory follows the backing too: bounded by the edit rather than by the file, with `File::copy` the exception, since copying an object reads the whole of it into memory first.
+
+One caveat inside either backing: the immediate `Dataset::append` is stricter than the staged surface — it needs a latest-format (v2/v3-superblock) file with no userblock, and the refusal (`Error::AppendInPlaceUnsupported`) names `Dataset::append_staged` as the fallback.
+
+The file's [file-space strategy](file-space.md) gates what an edit can do at all, whichever backing holds it:
+
+| File-space strategy | Staged edits + `commit` | Immediate append |
 | --- | --- | --- |
-| Reads (datasets, attributes, groups, row windows) | Yes | Yes |
-| `Dataset::append` / `append_raw` — immediate, crash-atomic | Yes — see the strategy table below | Yes — see the strategy table below |
-| `Dataset::write` — whole-value overwrite | Yes, on `commit` | Yes, on `commit` |
-| `Dataset::append_staged` — index-rebuilding append | Yes, on `commit` | Yes, on `commit` |
-| `set_attr` / `remove_attr` on datasets and groups | Yes, on `commit` | Yes, on `commit` |
-| `Group::create_dataset` / `create_group` / `create_group_with` | Yes, on `commit` | Yes, on `commit` |
-| `Group::delete` — frees space for reuse | Yes, on `commit` | Yes, on `commit` |
-| `File::copy` / `copy_from` | Yes, on `commit` | Yes, on `commit` |
-| `File::commit` / `space_accounting` | Yes | Yes |
-| Memory | `O(file size)` | configured caches + the edit being built |
-| Accepted files | superblock v0–3, 8-byte offsets and lengths; a canonical userblock is fine | superblock v2/v3, 8-byte offsets and lengths, no userblock |
+| None recorded, or `FsmAggr` / `Aggr` / `None` with `persist = false` | Yes | Yes |
+| `FsmAggr` / `Aggr` / `None` with `persist = true` | Yes — freed space is recorded on disk | Yes — managers rewritten at `close` |
+| `Page` with `persist = true` | Yes — page-aware commit, per-page-type managers rewritten | Yes — appends stay page-homogeneous |
+| `Page` with `persist = false` | No — refused at open | No — refused at open |
 
-Two rows still differ. `open_rw_bounded` accepts a narrower set of files, and its memory is what the name says — it never builds the mirror, so a commit's resident memory is bounded by the edit rather than by the file. A third difference is not in the table: a large `Dataset::append` is one crash-atomic apply on `open_rw`, and several ~1 MiB whole-chunk batches on `open_rw_bounded`, so a crash mid-call there leaves a valid shorter dataset. One caveat inside both columns: the immediate `Dataset::append` is stricter than the staged surface — it needs a latest-format (v2/v3-superblock) file with no userblock, and the refusal (`Error::AppendInPlaceUnsupported`) names `Dataset::append_staged` as the fallback.
+The one refusal here is `Error::EditUnsupported` for a paged file that does not persist its free space: neither backing can keep such a file's pages segregated, so `open_rw` refuses it up front rather than letting an edit be staged against it. It fires before any byte of the file changes. (`MemoryStrategy::Mirrored` still opens the file, since that asks for a backing rather than expressing a preference, but a commit through it refuses.) A `Page` / `persist = false` file stays fully readable through every read path and can be rewritten compactly by [repack](repack.md).
 
-The file's [file-space strategy](file-space.md) gates the write paths further. This is the one place where the file's internal storage strategy, not just your memory budget, steers the choice of open:
-
-| File-space strategy | Staged edits + `commit` (`open_rw`) | Immediate append (`open_rw`) | Immediate append (`open_rw_bounded`) |
-| --- | --- | --- | --- |
-| None recorded, or `FsmAggr` / `Aggr` / `None` with `persist = false` | Yes | Yes | Yes |
-| `FsmAggr` / `Aggr` / `None` with `persist = true` | Yes — freed space is recorded on disk | Yes — managers rewritten at `close` | Yes — managers rewritten at `close` |
-| `Page` with `persist = true` | Yes — page-aware commit, per-page-type managers rewritten | Yes — appends stay page-homogeneous | Yes — appends stay page-homogeneous |
-| `Page` with `persist = false` | No | No | No — refused at open; recreate the file with `persist = true` |
-
-The one refusal here is `Error::EditUnsupported` for any edit to a paged file that does not persist its free space, through either open. It fires before any byte of the file changes. A `Page` / `persist = false` file stays fully readable through every read path and can be rewritten compactly by [repack](repack.md).
-
-A paged commit through `open_rw` keeps each page homogeneous — raw data and file metadata never share a page, apart from a chunked dataset's index, which travels with its chunk data (see [File-Space Strategy](file-space.md)) — and page-aligns the end of allocation, so the reference C library reopens the result as a paged file and recovers its free space. Because a free hole belongs to one page type, such a commit appends rather than reusing holes within the commit; the space is recovered by the manager rewrite at the end of it.
+A paged commit keeps each page homogeneous — raw data and file metadata never share a page, apart from a chunked dataset's index, which travels with its chunk data (see [File-Space Strategy](file-space.md)) — and page-aligns the end of allocation, so the reference C library reopens the result as a paged file and recovers its free space. Because a free hole belongs to one page type, such a commit appends rather than reusing holes within the commit; the space is recovered by the manager rewrite at the end of it.
 
 For a brand-new file, use [`FileBuilder`](writing.md); to append while readers are live, use the [SWMR writer](swmr.md); to compact a file or drop objects across a reopen, use [repack](repack.md). The [file properties reference](../reference/property-support.md) has the corresponding fcpl/fapl support matrix.
 
@@ -150,7 +150,7 @@ Element types are checked, never coerced: each typed `append_*` call records the
 
 ### Streaming appends
 
-`append_staged` rebuilds the dataset's chunk index and relocates its header on every `commit` (and each new `File::open_rw` re-reads the whole file at open), which is the right trade for a one-off append composed alongside other edits, but not for a high-frequency append loop. For that, open the file **once** with `File::open_rw` and append many times through a `Dataset` handle, growing the Extensible-Array index *in place* — so each append costs `O(appended bytes)` plus amortized `O(1)` index overhead, with no whole-file re-read and no index rebuild.
+`append_staged` rebuilds the dataset's chunk index and relocates its header on every `commit` (and each new `File::open_rw` re-reads the metadata it needs, or the whole file when it falls back to the mirror), which is the right trade for a one-off append composed alongside other edits, but not for a high-frequency append loop. For that, open the file **once** with `File::open_rw` and append many times through a `Dataset` handle, growing the Extensible-Array index *in place* — so each append costs `O(appended bytes)` plus amortized `O(1)` index overhead, with no whole-file re-read and no index rebuild.
 
 ```rust
 use hdf5_pure::File;
@@ -173,18 +173,24 @@ The remaining eligibility rules match `Dataset::append_staged` (chunked, unlimit
 
 ### Bounded-memory appends
 
-`File::open_rw` keeps a full in-memory mirror of the file, so its memory cost is `O(file size)`. When the file is large — or the host is small — open it with **`File::open_rw_bounded`** instead: the read-write sibling of [`open_streaming`](streaming.md), which never builds a mirror. Reads are served by positioned I/O with the streaming backend's capabilities, and `Dataset::append` runs the same crash-atomic in-place engine as `open_rw`, reading and patching only bounded windows (the object header, the extensible-array blocks it touches, and the trailing chunk). A large append is applied in whole-chunk batches, each crash-atomic on its own, so peak memory stays at the configured caches plus a few chunks — independent of the file size and of how much one call appends.
+Appending to a large file needs no special entry point: `File::open_rw` already edits a latest-format file bounded, the read-write sibling of [`open_streaming`](streaming.md). Reads are served by positioned I/O with the streaming backend's capabilities, and `Dataset::append` runs the same crash-atomic in-place engine as the mirror, reading and patching only bounded windows (the object header, the extensible-array blocks it touches, and the trailing chunk). A large append is applied in whole-chunk batches, each crash-atomic on its own, so peak memory stays at the configured caches plus a few chunks — independent of the file size and of how much one call appends.
 
 ```rust
-use hdf5_pure::File;
+use hdf5_pure::{EditBacking, File, FileAccessProperties, MemoryStrategy};
 
-let file = File::open_rw_bounded("huge-log.h5").unwrap();
+// Bounded because the file allows it; add the hint to make it a requirement
+// rather than a preference.
+let file = File::open_rw_with_options(
+    "huge-log.h5",
+    FileAccessProperties::new().with_memory_strategy(MemoryStrategy::Bounded),
+).unwrap();
+assert_eq!(file.edit_backing(), Some(EditBacking::Bounded));
 let mut samples = file.dataset("samples").unwrap();
-samples.append(&[8i32, 9, 10, 11]).unwrap(); // same rules as open_rw
+samples.append(&[8i32, 9, 10, 11]).unwrap();
 file.close().unwrap();
 ```
 
-The append rules (filtered whole-chunk / unfiltered any-length, Extensible-Array index required) are identical to `open_rw`, and so is the staged edit surface — `write`, attribute edits, `create_*`/`delete`, `copy`, `commit`, and `space_accounting` all work here. A commit holds only what it is building, not a copy of the file — `File::copy` is the exception, since copying an object reads the whole of it into memory first. What a bounded file does require is a latest-format file with 8-byte offsets and no userblock, and reads have the [streaming backend's capabilities](streaming.md). It **does** grow a file that persists its free space — including a genuine paged file (`H5F_FSPACE_STRATEGY_PAGE`) — seeding the on-disk free-space managers on open and rewriting them at `File::close`, with paged appends kept page-homogeneous (raw and metadata in separate pages); a paged file that does *not* persist its free space is the one file-space case it refuses (`Error::EditUnsupported` — recreate it with `persist = true` to grow it in place). See [File-Space Strategy](file-space.md) for the paged details. Memory budgets are set with the same `FileAccessProperties` as the streaming reader via `File::open_rw_bounded_with_options`; cached metadata windows touched by an append are invalidated automatically, so reads through the same file never observe stale bytes.
+Bounded editing **does** grow a file that persists its free space — including a genuine paged file (`H5F_FSPACE_STRATEGY_PAGE`) — seeding the on-disk free-space managers on open and rewriting them at `File::close`, with paged appends kept page-homogeneous (raw and metadata in separate pages). See [File-Space Strategy](file-space.md) for the paged details. Memory budgets are set with the same `FileAccessProperties` as the streaming reader; cached metadata windows touched by an append are invalidated automatically, so reads through the same file never observe stale bytes.
 
 ## How it works
 

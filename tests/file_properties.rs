@@ -3,7 +3,7 @@
 
 use hdf5_pure::{
     ChunkCacheConfig, File, FileAccessProperties, FileBuilder, FileCreateProperties, FileLocking,
-    FileSpaceStrategy, LibVer, MetadataCacheConfig,
+    FileSpaceStrategy, LibVer, MemoryStrategy, MetadataCacheConfig,
 };
 use tempfile::tempdir;
 
@@ -44,9 +44,11 @@ fn one_properties_value_serves_read_and_read_write_opens() {
             4096
         );
     }
-    // Bounded read-write path.
+    // Read-write path again, this time with the bounded engine demanded: the
+    // same value carries the memory strategy alongside everything else.
     {
-        let file = File::open_rw_bounded_with_options(&path, properties).unwrap();
+        let bounded = properties.with_memory_strategy(MemoryStrategy::Bounded);
+        let file = File::open_rw_with_options(&path, bounded).unwrap();
         assert_eq!(
             file.dataset("data").unwrap().read_f64().unwrap().len(),
             4096
@@ -90,30 +92,34 @@ fn open_rw_honors_the_configured_chunk_cache() {
 }
 
 /// The bounded backend hardcoded `FileLocking::Enabled`, so it could not be used
-/// where OS locking is unavailable. The policy now comes from the properties.
+/// where OS locking is unavailable. The policy now comes from the properties, and
+/// applies whichever engine the memory strategy selects.
 #[test]
-fn open_rw_bounded_honors_the_locking_policy() {
+fn the_bounded_engine_honors_the_locking_policy() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("bounded_lock.h5");
     write_chunked(&path);
 
-    let unlocked = FileAccessProperties::new().with_locking(FileLocking::Disabled);
-    let _first = File::open_rw_bounded_with_options(&path, unlocked).unwrap();
+    let unlocked = FileAccessProperties::new()
+        .with_locking(FileLocking::Disabled)
+        .with_memory_strategy(MemoryStrategy::Bounded);
+    let _first = File::open_rw_with_options(&path, unlocked).unwrap();
     // Nothing is locked, so a second bounded open and a plain read both succeed.
-    File::open_rw_bounded_with_options(&path, unlocked)
+    File::open_rw_with_options(&path, unlocked)
         .expect("a second Disabled bounded open should succeed: neither took a lock");
     File::open(&path).expect("a reader should succeed against a Disabled bounded writer");
 }
 
 #[test]
-fn open_rw_bounded_still_locks_by_default() {
+fn the_bounded_engine_still_locks_by_default() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("bounded_default.h5");
     write_chunked(&path);
 
-    let _held = File::open_rw_bounded(&path).unwrap();
+    let bounded = FileAccessProperties::new().with_memory_strategy(MemoryStrategy::Bounded);
+    let _held = File::open_rw_with_options(&path, bounded).unwrap();
     assert!(
-        File::open_rw_bounded(&path).is_err(),
+        File::open_rw_with_options(&path, bounded).is_err(),
         "the default policy must still take an exclusive lock"
     );
 }
