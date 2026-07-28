@@ -266,6 +266,10 @@ pub(crate) trait ComplexComponent: complex_component::Sealed + Copy {
     /// Decode one component from exactly `size_of::<Self>()` little-endian
     /// bytes. Callers slice the element out of the raw buffer first, so a
     /// wrong length is a bug here rather than bad input.
+    ///
+    /// Gated to match its only caller: the MAT reader is `serde`-only, while
+    /// the writer half of this trait compiles unconditionally.
+    #[cfg(feature = "serde")]
     fn decode_le(bytes: &[u8]) -> Self;
 }
 
@@ -280,6 +284,7 @@ macro_rules! impl_complex_component {
                 fn encode_le(self, out: &mut Vec<u8>) {
                     out.extend_from_slice(&self.to_le_bytes());
                 }
+                #[cfg(feature = "serde")]
                 fn decode_le(bytes: &[u8]) -> Self {
                     Self::from_le_bytes(
                         bytes
