@@ -97,9 +97,12 @@ fn open_rw_falls_back_to_the_mirror_and_says_so() {
     // here, not in-place append. `Dataset::append` still refuses, naming
     // `append_staged`.
     let mut ds = file.dataset("d").unwrap();
+    let err = ds
+        .append(&[4i32])
+        .expect_err("in-place append needs no userblock");
     assert!(
-        ds.append(&[4i32]).is_err(),
-        "in-place append needs no userblock"
+        matches!(&err, hdf5_pure::Error::AppendInPlaceUnsupported(m) if m.contains("append_staged")),
+        "the refusal should name append_staged as the fallback, got: {err:?}"
     );
     ds.append_staged(|b| {
         b.append_i32(&[4, 5]);
@@ -166,7 +169,12 @@ fn an_explicit_strategy_overrides_either_entry_point() {
     userblock_file(&path);
 
     // open_rw defaults to falling back; asking for Bounded refuses instead.
-    assert!(File::open_rw_with_options(&path, with_strategy(MemoryStrategy::Bounded)).is_err());
+    let err = File::open_rw_with_options(&path, with_strategy(MemoryStrategy::Bounded))
+        .expect_err("an explicit Bounded must override open_rw's fallback");
+    assert!(
+        err.to_string().contains("userblock"),
+        "the refusal should name what the bounded engine cannot edit, got: {err}"
+    );
 
     // open_rw_bounded defaults to refusing; asking for Auto falls back instead.
     #[allow(deprecated)]
@@ -204,6 +212,34 @@ fn a_paged_file_without_persisted_free_space_is_refused_unless_the_mirror_is_dem
     assert_eq!(
         file.dataset("d").unwrap().read_i32().unwrap(),
         vec![1, 2, 3]
+    );
+}
+
+/// The shared refusals must be checked *before* the bounded-only ones, or falling
+/// back for a userblock skips them and hands back a session that cannot commit.
+///
+/// A userblock is the case that makes the ordering observable: persisted free space
+/// is declined for a non-zero base address, so this file reaches the engine looking
+/// exactly like a paged non-persisting one, while also being bounded-ineligible. If
+/// the fallback ran first it would mirror the file, accept staged work, and only
+/// refuse at `commit` — the late refusal this dispatch exists to eliminate.
+#[test]
+fn a_shared_refusal_beats_a_fallback_the_same_file_qualifies_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ub_paged.h5");
+    let mut b = FileBuilder::new();
+    b.with_userblock(4096);
+    b.with_file_space_strategy(FileSpaceStrategy::Page, false, 0);
+    b.create_dataset("d")
+        .with_i32_data(&[1, 2, 3])
+        .with_shape(&[3]);
+    b.write(&path).unwrap();
+
+    let err = File::open_rw(&path).expect_err("neither backing can edit this file");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("persisted free space"),
+        "the shared paged refusal must win over the userblock fallback, got: {msg}"
     );
 }
 

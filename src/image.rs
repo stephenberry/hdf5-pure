@@ -17,10 +17,11 @@
 //! what edits are expressible, so it belongs behind this trait rather than in
 //! two engines.
 //!
-//! The trait abstracts residency and nothing else. One difference it does not
-//! reach and does not claim to remains: which files each entry point will open
-//! at all, the bounded one still refusing a v0/v1 superblock, 4-byte offsets,
-//! and any userblock. That is a separate reconciliation.
+//! The trait abstracts residency and nothing else. Which files each backing can
+//! open at all still differs, the bounded one refusing a v0/v1 superblock, 4-byte
+//! offsets, and any userblock, but that is no longer a difference between two
+//! entry points: `File::open_rw` picks a backing per file and mirrors what the
+//! bounded one turns down (issue #198, step 4).
 //!
 //! # Reads
 //!
@@ -110,9 +111,12 @@ pub(crate) trait FileImage: Source + Send + Sync {
 }
 
 /// A whole-file in-memory mirror plus the read/write handle it mirrors, kept
-/// byte-for-byte in sync. This is the backing behind [`File::open_rw`](crate::File::open_rw):
-/// reads are slice accesses and never touch the disk, at the cost of holding
-/// the entire file resident.
+/// byte-for-byte in sync. This is the backing
+/// [`File::open_rw`](crate::File::open_rw) falls back to for a file the bounded
+/// engine cannot edit, and the one
+/// [`MemoryStrategy::Mirrored`](crate::MemoryStrategy) always takes: reads are
+/// slice accesses and never touch the disk, at the cost of holding the entire
+/// file resident.
 ///
 /// Every mutation writes to disk *before* updating the mirror, so a failed
 /// write can leave the mirror behind the file but never ahead of it. That

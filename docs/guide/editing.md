@@ -148,7 +148,7 @@ Element types are checked, never coerced: each typed `append_*` call records the
 
 ### Streaming appends
 
-`append_staged` rebuilds the dataset's chunk index and relocates its header on every `commit` (and each new `File::open_rw` re-reads the whole file at open), which is the right trade for a one-off append composed alongside other edits, but not for a high-frequency append loop. For that, open the file **once** with `File::open_rw` and append many times through a `Dataset` handle, growing the Extensible-Array index *in place* — so each append costs `O(appended bytes)` plus amortized `O(1)` index overhead, with no whole-file re-read and no index rebuild.
+`append_staged` rebuilds the dataset's chunk index and relocates its header on every `commit` (and each new `File::open_rw` re-reads the metadata it needs, or the whole file when it falls back to the mirror), which is the right trade for a one-off append composed alongside other edits, but not for a high-frequency append loop. For that, open the file **once** with `File::open_rw` and append many times through a `Dataset` handle, growing the Extensible-Array index *in place* — so each append costs `O(appended bytes)` plus amortized `O(1)` index overhead, with no whole-file re-read and no index rebuild.
 
 ```rust
 use hdf5_pure::File;

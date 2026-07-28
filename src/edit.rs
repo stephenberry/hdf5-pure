@@ -506,7 +506,12 @@ pub(crate) struct WriteEngine {
 ///
 /// A [`File`](crate::File) reports what it actually got from
 /// [`File::memory_strategy`](crate::File::memory_strategy).
+///
+/// Sealed: unlike [`FileLocking`] or [`FileSpaceStrategy`](crate::FileSpaceStrategy),
+/// whose variant sets mirror a closed C-library enum, this is a policy this crate
+/// invented, so a fourth strategy must not be a breaking change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MemoryStrategy {
     /// Never build a whole-file mirror. A file the bounded engine cannot edit is
     /// refused at open with [`Error::EditUnsupported`], before anything is
@@ -534,14 +539,15 @@ fn bounded_only_limitation(session: &WriteEngine) -> Option<&'static str> {
     if session.superblock.version < 2 {
         return Some(
             "bounded read-write access requires a latest-format file (v2/v3 superblock); \
-             use File::open_rw, whose default falls back to the whole-file mirror here",
+             leave MemoryStrategy unset, or pass MemoryStrategy::Auto, to fall back to \
+             the whole-file mirror here",
         );
     }
     if session.superblock.base_address != 0 {
         return Some(
             "bounded read-write access does not support a file with a userblock \
-             (non-zero base address); use File::open_rw, whose default falls back to the \
-             whole-file mirror here",
+             (non-zero base address); leave MemoryStrategy unset, or pass \
+             MemoryStrategy::Auto, to fall back to the whole-file mirror here",
         );
     }
     None
@@ -896,6 +902,22 @@ impl WriteEngine {
         })?;
         session.batched_appends = true;
         session.bounded = true;
+        // Refusals that apply to *both* backings come first, or falling back for a
+        // bounded-only limitation would skip them and hand back a session that
+        // cannot commit. A paged file with no persisted managers has no on-disk
+        // record of which pages hold metadata and which hold raw data, so nothing
+        // can keep the pages segregated; the staged commit refuses it too, so
+        // deferring would only trade this error for the same one later, with work
+        // already staged. A userblock is one way to reach this state without the
+        // file saying `persist = false`: persisted free space is declined for a
+        // non-zero base address, which leaves the managers unseeded all the same.
+        if session.paged.is_some() && session.persist.is_none() {
+            return Err(Error::EditUnsupported(
+                "read-write access to a paged file (H5F_FSPACE_STRATEGY_PAGE) requires \
+                 persisted free space; recreate the file with \
+                 with_file_space_strategy(FileSpaceStrategy::Page, true, ..) to grow it in place",
+            ));
+        }
         if let Some(reason) = bounded_only_limitation(&session) {
             if strategy == MemoryStrategy::Bounded {
                 return Err(Error::EditUnsupported(reason));
@@ -909,18 +931,6 @@ impl WriteEngine {
             // reports `Error::FileLocked`, which is the truthful answer.
             drop(session);
             return Self::open_with_locking(path, locking);
-        }
-        // A paged file with no persisted managers has no on-disk record of which
-        // pages hold metadata and which hold raw data, so nothing can keep the
-        // pages segregated. The staged commit refuses it too, so falling back to
-        // the mirror would only trade this error for the same one later, with
-        // work already staged; refuse for either strategy.
-        if session.paged.is_some() && session.persist.is_none() {
-            return Err(Error::EditUnsupported(
-                "read-write access to a paged file (H5F_FSPACE_STRATEGY_PAGE) requires \
-                 persisted free space; recreate the file with \
-                 with_file_space_strategy(FileSpaceStrategy::Page, true, ..) to grow it in place",
-            ));
         }
         Ok(session)
     }

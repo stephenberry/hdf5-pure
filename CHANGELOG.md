@@ -13,7 +13,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Changed
 
 - `File::open_rw` now edits a latest-format file with no userblock in **bounded memory** instead of building a whole-file mirror, and falls back to the mirror only for a file the bounded engine cannot edit. Nothing about a file's space strategy decides which open a caller reaches for any more. A large `Dataset::append` is applied in whole-chunk batches on the bounded backing, so a crash mid-call leaves a valid shorter dataset; pass `MemoryStrategy::Mirrored` for the previous unconditional mirror ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
-- `File::open_rw` refuses a paged file without persisted free space at open rather than at commit, since neither backing can edit one ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
+- `File::open_rw` refuses a paged file without persisted free space at open rather than at commit, since neither backing can edit one. This includes a paged file with a userblock, whose free-space managers go unseeded for the same reason ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
+- `File::open_rw` now applies `FileAccessProperties::with_metadata_cache`, which the whole-file mirror ignored, and its reads are served from the file rather than from a snapshot taken at open — visible only to a session sharing a file with a lock-free writer ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
 
 ### Deprecated
 

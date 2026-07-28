@@ -219,6 +219,11 @@ fn paged_staged_commit_keeps_pages_homogeneous() {
 /// the end of allocation unaligned — producing a file that still advertises the
 /// paged strategy but no longer satisfies it. The refusal is the same one a paged
 /// non-persisting file gets, since in both cases the page bookkeeping is missing.
+///
+/// It is refused at *open*, and the ordering that makes it so is the point of this
+/// test: a userblock is a bounded-only limitation, so `MemoryStrategy::Auto` would
+/// fall back to the mirror for it — skipping this refusal on the way past — unless
+/// the refusals both backings share are checked first.
 #[test]
 fn paged_with_userblock_is_refused() {
     let path = tmp("pure_paged_staged_userblock.h5");
@@ -235,7 +240,19 @@ fn paged_with_userblock_is_refused() {
         b.write(&path).unwrap();
     }
 
-    let s = File::open_rw(&path).unwrap();
+    let err = File::open_rw(&path).unwrap_err();
+    assert!(
+        matches!(&err, Error::EditUnsupported(m) if m.contains("persisted free space")),
+        "expected a paged refusal for a userblock file, got {err:?}"
+    );
+
+    // Demanding the mirror still opens it, and the commit-time guard behind the
+    // open-time one still fires.
+    let s = File::open_rw_with_options(
+        &path,
+        FileAccessProperties::new().with_memory_strategy(MemoryStrategy::Mirrored),
+    )
+    .unwrap();
     s.root()
         .create_dataset("added", |b| {
             b.with_i32_data(&[1i32, 2, 3]);

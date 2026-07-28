@@ -56,9 +56,10 @@ enum Backend {
     /// both read and mutate in place. Handle write methods route to the engine,
     /// and `File::commit` applies staged structural edits.
     ///
-    /// The two entry points differ only in how the engine holds the file's bytes
-    /// — a whole-file mirror, or positioned I/O against the handle — which is
-    /// the engine's own business rather than the backend's (issue #198). Reads
+    /// Either backing — a whole-file mirror, or positioned I/O against the
+    /// handle — appears here as the same `WriteEngine`; which one an open
+    /// resolved to is the engine's own business rather than the backend's
+    /// (issue #198). Reads
     /// borrow the mirror's slice when there is one and go through the image's
     /// `Source` otherwise; see [`with_engine`](FileInner::with_engine). Boxed to
     /// keep the `Backend` enum small (a `WriteEngine` is far larger than the
@@ -206,9 +207,11 @@ impl FileAccessProperties {
     /// the whole-file mirror unconditionally, as `open_rw` did before it learned
     /// to dispatch.
     ///
-    /// The read-only opens and the SWMR writer ignore this: they build no
-    /// editing session at all. Ask a `File` what it resolved to with
-    /// [`File::memory_strategy`].
+    /// The read-only opens ignore this: they build no editing session at all.
+    /// [`File::open_swmr_writer`] ignores it too, but for a different reason — it
+    /// builds an editing session and always mirrors, so it reports
+    /// [`MemoryStrategy::Mirrored`] whatever was asked for. Ask a `File` what it
+    /// resolved to with [`File::memory_strategy`].
     pub const fn with_memory_strategy(mut self, memory_strategy: MemoryStrategy) -> Self {
         self.memory_strategy = Some(memory_strategy);
         self
@@ -859,7 +862,9 @@ impl FileInner {
     }
 
     /// The memory strategy this file's editing session resolved to, or `None`
-    /// when there is no editing session to ask.
+    /// when there is no editing session to ask. Always
+    /// [`MemoryStrategy::Mirrored`] for the SWMR writer, which builds a session
+    /// but does not dispatch on the strategy.
     fn memory_strategy(&self) -> Option<MemoryStrategy> {
         match &self.backend {
             Backend::Edit(m) => Some(
