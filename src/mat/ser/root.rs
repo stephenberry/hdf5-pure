@@ -9,8 +9,8 @@ use serde::ser::{self, Impossible, Serialize, SerializeMap, SerializeStruct, Ser
 use crate::mat::error::MatError;
 use crate::mat::options::Options;
 
-use super::emit::emit_file;
-use super::emit_with_builder::emit_file_with_options;
+use super::emit::{emit_file, emit_file_to};
+use super::emit_with_builder::{emit_file_with_options, emit_file_with_options_to};
 use super::value_ser::{ValueSerializer, to_value};
 use crate::mat::value::MatValue;
 
@@ -28,6 +28,25 @@ pub fn to_bytes_with_options<T: Serialize + ?Sized>(
 ) -> Result<Vec<u8>, MatError> {
     let fields = value.serialize(RootSerializer)?;
     emit_file_with_options(fields, options)
+}
+
+/// Serialize `value` straight onto `w`, without assembling the file in memory.
+pub fn to_writer<T: Serialize + ?Sized, W: std::io::Write>(
+    value: &T,
+    w: W,
+) -> Result<(), MatError> {
+    let fields = value.serialize(RootSerializer)?;
+    emit_file_to(fields, w)
+}
+
+/// Like [`to_writer`] but with explicit options.
+pub fn to_writer_with_options<T: Serialize + ?Sized, W: std::io::Write>(
+    value: &T,
+    options: &Options,
+    w: W,
+) -> Result<(), MatError> {
+    let fields = value.serialize(RootSerializer)?;
+    emit_file_with_options_to(fields, options, w)
 }
 
 /// The root serializer. Produces `Vec<(field_name, MatValue)>`.

@@ -17,8 +17,8 @@ use std::collections::HashMap;
 use crate::attribute::AttributeMessage;
 use crate::btree_v2_write::{self, BTreeV2Plan};
 use crate::chunked_write::{
-    ByteSink, ChunkOptions, CompressedChunkSet, VerbatimLayout, VerbatimPlan, assemble_chunked_at,
-    compress_chunks, emit_chunked_data_verbatim, plan_chunked_data_verbatim,
+    ByteSink, ChunkOptions, ChunkProvider, CompressedChunkSet, VerbatimLayout, VerbatimPlan,
+    assemble_chunked_at, compress_chunks, emit_chunked_data_verbatim, plan_chunked_data_verbatim,
 };
 use crate::convert::TryToUsize;
 use crate::dataspace::{Dataspace, DataspaceType};
@@ -704,6 +704,11 @@ pub struct FileWriter {
     root_attrs: Vec<(String, AttrValue)>,
     groups: Vec<FinishedGroup>,
     userblock_size: u64,
+    /// Bytes to emit at the head of the userblock region, from
+    /// [`with_userblock_content`](FileWriter::with_userblock_content). The rest
+    /// of the region is zero-filled. Empty by default, which reproduces the
+    /// all-zero userblock this writer emitted before.
+    userblock_content: Vec<u8>,
     /// Requested library-version bounds (low, high), validated in `finish`.
     /// `None` means no constraint (any output the writer produces is accepted).
     libver_bounds: Option<(LibVer, LibVer)>,
@@ -727,6 +732,7 @@ impl FileWriter {
             root_attrs: Vec::new(),
             groups: Vec::new(),
             userblock_size: 0,
+            userblock_content: Vec::new(),
             libver_bounds: None,
             file_space_strategy: None,
             file_space_page_size: None,
@@ -769,10 +775,38 @@ impl FileWriter {
 
     /// Set the userblock size in bytes. Must be a power of two >= 512 or 0 (no userblock).
     /// The userblock region will be filled with zeros; the caller can write into
-    /// the returned bytes at `[0..userblock_size]`.
+    /// the returned bytes at `[0..userblock_size]`, or supply them up front with
+    /// [`with_userblock_content`](Self::with_userblock_content).
     pub fn with_userblock(&mut self, size: u64) -> &mut Self {
         self.userblock_size = size;
         self
+    }
+
+    /// Set the bytes that occupy the head of the userblock region, so the writer
+    /// *emits* them rather than the caller patching them in afterwards. The rest
+    /// of the region is zero-filled, and `content` longer than the userblock is
+    /// refused by [`finish`](Self::finish).
+    ///
+    /// The userblock is the first thing written in address order, so this is what
+    /// lets a format that wraps HDF5 in a header — MATLAB v7.3, say — be produced
+    /// by the non-seekable streaming path without a second pass over the file.
+    pub fn with_userblock_content(&mut self, content: &[u8]) -> &mut Self {
+        self.userblock_content = content.to_vec();
+        self
+    }
+
+    /// Emit the userblock region: the caller's content, then zeros out to `ub`.
+    /// Callers have already checked that the content fits.
+    fn put_userblock<S: ByteSink>(
+        sink: &mut S,
+        ub: usize,
+        content: &[u8],
+    ) -> Result<(), FormatError> {
+        if ub == 0 {
+            return Ok(());
+        }
+        sink.put(content)?;
+        sink.put_zeros(ub - content.len())
     }
 
     /// Set the file-space management strategy, mirroring
@@ -873,6 +907,16 @@ impl FileWriter {
     pub(crate) fn finish_to_sink<S: ByteSink>(self, sink: &mut S) -> Result<(), FormatError> {
         self.check_libver_bounds()?;
 
+        // Checked before any layout work: content that overruns its region would
+        // otherwise displace the superblock, and the failure would surface as an
+        // unopenable file rather than as the caller's mistake.
+        if self.userblock_content.len() as u64 > self.userblock_size {
+            return Err(FormatError::UserblockContentTooLarge {
+                content: self.userblock_content.len() as u64,
+                userblock: self.userblock_size,
+            });
+        }
+
         // Genuine paged allocation: page-align every allocation and, when
         // persisting, emit per-page-type free-space managers. Gated entirely on
         // the Page strategy so every other strategy keeps its exact byte layout.
@@ -938,6 +982,35 @@ impl FileWriter {
             /// `None` for the library default. Validated against the datatype
             /// element size in `flatten_dataset`.
             fill: Option<Vec<u8>>,
+            /// When set, this contiguous dataset's element bytes are produced at
+            /// write time rather than held in `raw`, which stays empty.
+            produced: Option<crate::type_builders::ProducedPayload>,
+        }
+
+        impl DsFlat {
+            /// Bytes this dataset's contiguous data region occupies. Produced
+            /// data has none in hand, but its total is known from the geometry —
+            /// which is the whole reason it can be laid out without being read.
+            fn contiguous_len(&self) -> u64 {
+                match &self.produced {
+                    Some(p) => p.total_bytes,
+                    None => self.raw.len() as u64,
+                }
+            }
+
+            /// Move this dataset's contiguous data region out for the assembly
+            /// pass. A produced region leaves its provider behind in `self`, the
+            /// way a verbatim chunked one does: the emitter reaches for it there,
+            /// and the region is described twice (sizing, then placement).
+            fn take_contiguous(&mut self) -> DsData {
+                match &self.produced {
+                    Some(p) => DsData::Produced {
+                        total_bytes: p.total_bytes,
+                        block_bytes: p.block_bytes,
+                    },
+                    None => DsData::InMemory(core::mem::take(&mut self.raw)),
+                }
+            }
         }
 
         /// One dataset's data region for the assembly pass: either materialized
@@ -947,12 +1020,23 @@ impl FileWriter {
             /// A verbatim chunked dataset streamed one chunk at a time; the
             /// provider lives in the matching `DsFlat.raw_chunks` (`Lazy`).
             Streamed(VerbatimPlan),
+            /// A contiguous dataset whose element bytes are produced at write
+            /// time, block by block; the producer lives in the matching
+            /// `DsFlat.produced`. The region is a plain run of `total_bytes`, so
+            /// it is laid out exactly as if the bytes had been handed over.
+            Produced {
+                /// Bytes the whole region occupies.
+                total_bytes: u64,
+                /// Bytes per block, the last one excepted.
+                block_bytes: u64,
+            },
         }
         impl DsData {
             fn len(&self) -> u64 {
                 match self {
                     DsData::InMemory(v) => v.len() as u64,
                     DsData::Streamed(plan) => plan.total_len,
+                    DsData::Produced { total_bytes, .. } => *total_bytes,
                 }
             }
         }
@@ -964,6 +1048,7 @@ impl FileWriter {
             sink: &mut Sk,
             data: &DsData,
             raw_chunks: Option<&crate::type_builders::RawChunkPayload>,
+            produced: Option<&crate::type_builders::ProducedPayload>,
         ) -> Result<(), FormatError> {
             match data {
                 DsData::InMemory(bytes) => sink.put(bytes),
@@ -975,7 +1060,60 @@ impl FileWriter {
                         .as_ref();
                     emit_chunked_data_verbatim(sink, plan, provider)
                 }
+                DsData::Produced {
+                    total_bytes,
+                    block_bytes,
+                } => {
+                    let payload =
+                        produced.expect("a produced data region implies a produced payload");
+                    emit_produced_data(
+                        sink,
+                        payload.provider.0.as_ref(),
+                        *total_bytes,
+                        *block_bytes,
+                    )
+                }
             }
+        }
+
+        /// Emit a contiguous produced region: pull each block from `provider` and
+        /// write it straight through, so the region's bytes are never all
+        /// resident. The last block is whatever remains, and a block of any other
+        /// length is refused — it would shift every address after this dataset.
+        fn emit_produced_data<Sk: ByteSink>(
+            sink: &mut Sk,
+            provider: &dyn ChunkProvider,
+            total_bytes: u64,
+            block_bytes: u64,
+        ) -> Result<(), FormatError> {
+            // A zero-length block would never advance the cursor, and the loop
+            // below would ask for block 0 forever. Callers construct the payload
+            // from a checked block size, so this is a construction invariant —
+            // but a hang is a far worse failure than a wrong file, and it costs
+            // one comparison to make it an error instead.
+            if block_bytes == 0 && total_bytes > 0 {
+                return Err(FormatError::SerializationError(
+                    "a produced dataset declared a zero-length block".into(),
+                ));
+            }
+            // One buffer for the whole region, reused across blocks.
+            let mut block = Vec::new();
+            let mut written = 0u64;
+            let mut index = 0usize;
+            while written < total_bytes {
+                let expected = block_bytes.min(total_bytes - written);
+                block.clear();
+                provider.chunk_bytes(index, &mut block)?;
+                if block.len() as u64 != expected {
+                    return Err(FormatError::SerializationError(
+                        "a produced dataset's block does not match its planned size".into(),
+                    ));
+                }
+                sink.put(&block)?;
+                written += expected;
+                index += 1;
+            }
+            Ok(())
         }
 
         /// Emit one variable-length dataset's or attribute's global heap
@@ -1070,9 +1208,12 @@ impl FileWriter {
             // its storage is the pre-compressed chunks in `raw_chunks`. Skip the
             // flat-data requirement and the shape/data-length check for it.
             let raw_chunks = db.raw_chunks;
+            // A produced dataset owns no flat bytes either: its region is a run
+            // of `total_bytes` filled by its provider during emission.
+            let produced = db.produced;
             // Allow empty data for zero-element datasets (e.g. shape [0, 0]).
             let is_empty = shape.contains(&0);
-            let raw = if is_empty || raw_chunks.is_some() {
+            let raw = if is_empty || raw_chunks.is_some() || produced.is_some() {
                 db.data.unwrap_or_default()
             } else {
                 db.data.ok_or(FormatError::DatasetMissingData)?
@@ -1085,6 +1226,13 @@ impl FileWriter {
             // absurd shape from overflowing into a false match.
             let elem_size = dt.type_size() as u64;
             if !is_empty && raw_chunks.is_none() && elem_size > 0 {
+                // A produced region is checked against the same invariant as a
+                // materialized one — its size is declared rather than measured,
+                // and a declaration that disagrees with the shape would produce a
+                // file the reader refuses.
+                let declared = produced
+                    .as_ref()
+                    .map_or(raw.len() as u64, |p| p.total_bytes);
                 // Multiply with checked arithmetic, saturating on overflow: an
                 // absurd shape whose element count exceeds `u64` must not panic a
                 // debug build in `Iterator::product` (nor silently wrap a release
@@ -1097,14 +1245,14 @@ impl FileWriter {
                     .try_fold(1u64, |acc, d| acc.checked_mul(d))
                     .unwrap_or(u64::MAX);
                 let expected = num_elements.saturating_mul(elem_size);
-                if raw.len() as u64 != expected {
+                if declared != expected {
                     #[expect(
                         clippy::cast_possible_truncation,
                         reason = "byte counts reported in a shape-mismatch error; display-only"
                     )]
                     return Err(FormatError::ShapeDataMismatch {
                         expected: expected as usize,
-                        actual: raw.len(),
+                        actual: declared as usize,
                         element_size: elem_size as usize,
                     });
                 }
@@ -1178,6 +1326,7 @@ impl FileWriter {
                 chunk_options: db.chunk_options,
                 maxshape: db.maxshape,
                 raw_chunks,
+                produced,
                 reference_targets: db.reference_targets,
                 vl_string_staging: db.vl_string_staging,
                 fill: db.fill,
@@ -1564,12 +1713,12 @@ impl FileWriter {
                     d.fill.as_deref(),
                 )?
             } else {
-                ds_data_lens.push(d.raw.len() as u64);
+                ds_data_lens.push(d.contiguous_len());
                 build_dataset_oh(
                     &d.dt,
                     &d.ds,
                     0,
-                    d.raw.len() as u64,
+                    d.contiguous_len(),
                     &d.attrs,
                     dense_blob.as_ref(),
                     d.fill.as_deref(),
@@ -1909,10 +2058,10 @@ impl FileWriter {
                         chunked_msgs: Some((built.layout_message, built.pipeline_message)),
                     }
                 } else {
-                    let raw = core::mem::take(&mut all_ds[i].raw);
-                    c += raw.len() as u64;
+                    let data = all_ds[i].take_contiguous();
+                    c += data.len();
                     DsLayout {
-                        data: DsData::InMemory(raw),
+                        data,
                         data_addr: base_addr,
                         chunked_msgs: None,
                     }
@@ -1950,10 +2099,10 @@ impl FileWriter {
                         chunked_msgs: Some((built.layout_message, built.pipeline_message)),
                     }
                 } else {
-                    let raw = core::mem::take(&mut all_ds[i].raw);
-                    built_len = raw.len() as u64;
+                    let data = all_ds[i].take_contiguous();
+                    built_len = data.len();
                     DsLayout {
-                        data: DsData::InMemory(raw),
+                        data,
                         data_addr,
                         chunked_msgs: None,
                     }
@@ -2074,9 +2223,7 @@ impl FileWriter {
 
             // (k) Emit, address-ascending, zero-filling every alignment gap.
             sink.reserve(eof_addr2.to_usize()?);
-            if ub > 0 {
-                sink.put_zeros(ub)?;
-            }
+            Self::put_userblock(sink, ub, &self.userblock_content)?;
             let sb = Superblock {
                 version: 3,
                 offset_size: OFFSET_SIZE,
@@ -2189,7 +2336,12 @@ impl FileWriter {
             sink.put_zeros((raw_start - meta_end).to_usize()?)?;
             for &i in &small_indices {
                 debug_assert_eq!(sink.position(), base + ds_layouts[i].data_addr);
-                emit_ds_data(sink, &ds_layouts[i].data, all_ds[i].raw_chunks.as_ref())?;
+                emit_ds_data(
+                    sink,
+                    &ds_layouts[i].data,
+                    all_ds[i].raw_chunks.as_ref(),
+                    all_ds[i].produced.as_ref(),
+                )?;
             }
             if small_raw_total > 0 {
                 sink.put_zeros((align_up(small_raw_end, page_size) - small_raw_end).to_usize()?)?;
@@ -2198,7 +2350,12 @@ impl FileWriter {
                 let data_addr = ds_layouts[i].data_addr;
                 let gap = (base + data_addr) - sink.position();
                 sink.put_zeros(gap.to_usize()?)?;
-                emit_ds_data(sink, &ds_layouts[i].data, all_ds[i].raw_chunks.as_ref())?;
+                emit_ds_data(
+                    sink,
+                    &ds_layouts[i].data,
+                    all_ds[i].raw_chunks.as_ref(),
+                    all_ds[i].produced.as_ref(),
+                )?;
                 let end_rel = sink.position() - base;
                 sink.put_zeros((align_up(end_rel, page_size) - end_rel).to_usize()?)?;
             }
@@ -2222,16 +2379,17 @@ impl FileWriter {
             } else {
                 // `d.raw` is not read again for a contiguous/compact dataset, so
                 // move its element buffer into the layout rather than cloning it.
-                let data = core::mem::take(&mut d.raw);
-                let addr = if data.is_empty() {
+                // A produced region leaves its provider behind for the emitter.
+                let data = d.take_contiguous();
+                let addr = if data.len() == 0 {
                     u64::MAX
                 } else {
                     let a = cursor2 as u64;
-                    cursor2 += data.len();
+                    cursor2 += data.len().to_usize()?;
                     a
                 };
                 ds_layouts.push(DsLayout {
-                    data: DsData::InMemory(data),
+                    data,
                     data_addr: addr,
                     chunked_msgs: None,
                 });
@@ -2360,10 +2518,8 @@ impl FileWriter {
         // writer did before streaming; a streaming sink ignores this.
         sink.reserve(eof_addr2.to_usize()?);
 
-        // Userblock: prepend zeros
-        if ub > 0 {
-            sink.put_zeros(ub)?;
-        }
+        // Userblock: the caller's header bytes, then zeros.
+        Self::put_userblock(sink, ub, &self.userblock_content)?;
 
         let sb = Superblock {
             version: 3,
@@ -2452,7 +2608,12 @@ impl FileWriter {
         // in-memory bytes; a streamed (lazy) chunked dataset pulls each chunk
         // from its provider one at a time, so its bytes never all reside here.
         for (i, layout) in ds_layouts.iter().enumerate() {
-            emit_ds_data(sink, &layout.data, all_ds[i].raw_chunks.as_ref())?;
+            emit_ds_data(
+                sink,
+                &layout.data,
+                all_ds[i].raw_chunks.as_ref(),
+                all_ds[i].produced.as_ref(),
+            )?;
         }
 
         // Global heap collections

@@ -31,6 +31,7 @@
 //! on first use. No intermediate value tree is allocated.
 
 use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 use crate::file_writer::AttrValue;
 use crate::mat::class::MatClass;
@@ -38,6 +39,9 @@ use crate::mat::dims::{STORAGE_DIMS_BUF_LEN, matrix_dims, storage_dims_u64_into,
 use crate::mat::error::MatError;
 use crate::mat::identifier::{dedupe_name, is_valid_name, sanitize_name};
 use crate::mat::options::{Compression, EmptyMarkerEncoding, InvalidNamePolicy, Options};
+use crate::mat::producer::{
+    BlockElement, Blocking, DataProducer, ProducerChunks, plan_blocking, total_elements,
+};
 use crate::mat::string_object;
 use crate::mat::userblock::{self, USERBLOCK_SIZE};
 use crate::mat::utf16;
@@ -67,6 +71,11 @@ pub struct MatBuilder {
     /// Set by [`CellWriter`] before pushing a cell element; consumed by the
     /// next write to redirect the dataset/group into `#refs#`.
     next_target: Option<NextTarget>,
+    /// Where a [`DataProducer`]'s own error lands. The writer's provider seam
+    /// speaks `FormatError` and cannot carry a `MatError`, so a producer failing
+    /// mid-write stashes the real error here and the finalizers swap it back for
+    /// the placeholder the writer surfaced. Empty unless a producer failed.
+    producer_error: Arc<Mutex<Option<MatError>>>,
 }
 
 struct OpenStruct {
@@ -108,6 +117,7 @@ impl MatBuilder {
             root_used_names: HashSet::new(),
             open_structs: Vec::new(),
             next_target: None,
+            producer_error: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -507,6 +517,84 @@ impl MatBuilder {
         Ok(self)
     }
 
+    /// Stage a numeric array whose bytes are produced at write time, so the
+    /// dataset is never fully resident.
+    ///
+    /// `producer` is called once per block, in ascending index order, while the
+    /// file is being emitted — not while it is being laid out, which works from
+    /// the shape alone. Combined with [`finish_to`](Self::finish_to), which does
+    /// not hold the assembled file either, this writes a `.mat` of any size in
+    /// about one block of memory.
+    ///
+    /// The returned [`Blocking`] says how many blocks will be asked for and how
+    /// many bytes each must carry; [`Blocking::plan`] computes the same thing
+    /// ahead of time, from the shape alone, if the producer needs to be built
+    /// against it. Block `i` is a contiguous run of MATLAB's linear element
+    /// order, continuing where block `i - 1` stopped — see the
+    /// [module docs](crate::mat::producer) for what that means for a shape like
+    /// `[channels, samples]`.
+    ///
+    /// The dataset is byte-for-byte the one [`write_f64`](Self::write_f64) and its
+    /// siblings produce for the same content; only the peak memory differs.
+    ///
+    /// The element type names the MATLAB class: `write_blocks::<i16>` writes an
+    /// `int16` array, `write_blocks::<(i16, i16)>` a complex one, and
+    /// `write_blocks::<bool>` a `logical`.
+    ///
+    /// An empty shape writes the same MATLAB empty marker the other writers do
+    /// and never calls the producer.
+    ///
+    /// # Errors
+    ///
+    /// Refused up front if this builder is configured for compression: a block's
+    /// on-disk size has to be known before any byte is written, and a compressed
+    /// one is not knowable without compressing it. Refused at write time with
+    /// [`MatError::BlockSizeMismatch`] if the producer writes the wrong number of
+    /// bytes for a block, and a producer's own error is surfaced verbatim.
+    pub fn write_blocks<T: BlockElement>(
+        &mut self,
+        name: &str,
+        matlab_dims: &[usize],
+        producer: Box<dyn DataProducer>,
+    ) -> Result<Blocking, MatError> {
+        if self.options.compression != Compression::None {
+            return Err(MatError::CompressionUnsupportedForBlocks);
+        }
+
+        let blocking = plan_blocking(total_elements(matlab_dims), T::ELEMENT_SIZE)?;
+        if blocking.block_count == 0 {
+            self.write_empty_with_decode(name, T::CLASS, matlab_dims, T::INT_DECODE)?;
+            return Ok(blocking);
+        }
+
+        let mut storage_buf = [0u64; STORAGE_DIMS_BUF_LEN];
+        let storage = storage_dims_u64_into(matlab_dims, &mut storage_buf).to_vec();
+        // Cloned before the builder is borrowed: the adapter needs the stash and
+        // `dataset_at_target` holds `self` for the rest of the function.
+        let error = Arc::clone(&self.producer_error);
+        let target = self.resolve_target(name)?;
+        let ds = self.dataset_at_target(&target);
+        ds.with_produced_data(
+            T::datatype(),
+            &storage,
+            blocking.total_len(),
+            blocking.block_elements * T::ELEMENT_SIZE as u64,
+            Box::new(ProducerChunks {
+                producer,
+                blocking,
+                error,
+            }),
+        );
+        ds.set_attr(
+            "MATLAB_class",
+            AttrValue::AsciiString(T::CLASS.as_str().into()),
+        );
+        if let Some(decode) = T::INT_DECODE {
+            ds.set_attr("MATLAB_int_decode", AttrValue::I32(decode));
+        }
+        Ok(blocking)
+    }
+
     /// Write a MATLAB `string` object. Allocates a `#refs#` payload entry and
     /// registers the object in the MCOS subsystem.
     pub fn write_string_object(
@@ -807,20 +895,25 @@ impl MatBuilder {
 
     // -- finalize ----------------------------------------------------------
 
-    /// Finalize the file. Writes the `#subsystem#/MCOS` group if any string
-    /// objects were written, the `#refs#` group if any refs were created,
-    /// the userblock, and returns the bytes.
-    pub fn finish(mut self) -> Result<Vec<u8>, MatError> {
+    /// Bring the underlying [`FileBuilder`] to its final state: check nothing is
+    /// left open, emit the `#subsystem#/MCOS` group if any string objects were
+    /// written, attach the `#refs#` group if any refs were created, and stage the
+    /// userblock.
+    ///
+    /// Every exit from the builder goes through here, so the buffered and
+    /// streaming ones cannot come to describe different files. `entry_point` names
+    /// the caller in the error messages.
+    fn finalize(&mut self, entry_point: &str) -> Result<(), MatError> {
         if !self.open_structs.is_empty() {
             return Err(MatError::Custom(format!(
-                "MatBuilder::finish called with {} open structs",
+                "MatBuilder::{entry_point} called with {} open structs",
                 self.open_structs.len()
             )));
         }
         if self.next_target.is_some() {
-            return Err(MatError::Custom(
-                "MatBuilder::finish called with a pending cell-element target".into(),
-            ));
+            return Err(MatError::Custom(format!(
+                "MatBuilder::{entry_point} called with a pending cell-element target"
+            )));
         }
 
         if !self.string_object_payload_paths.is_empty() {
@@ -831,9 +924,61 @@ impl MatBuilder {
             self.file.add_group(refs.finish());
         }
 
-        let mut bytes = self.file.finish().map_err(MatError::Hdf5)?;
-        userblock::write_header(&mut bytes, userblock::DEFAULT_DESCRIPTION);
-        Ok(bytes)
+        self.file
+            .with_userblock_content(&userblock::header_block(userblock::DEFAULT_DESCRIPTION));
+        Ok(())
+    }
+
+    /// Replace a write failure with the producer error that actually caused it,
+    /// if a [`DataProducer`] stashed one. The writer's provider seam cannot carry
+    /// a `MatError`, so without this a producer's own failure would surface as
+    /// the placeholder the writer substituted.
+    fn attribute_failure(stash: &Arc<Mutex<Option<MatError>>>, fallback: crate::Error) -> MatError {
+        match stash.lock() {
+            Ok(mut slot) => slot.take().unwrap_or(MatError::Hdf5(fallback)),
+            Err(_) => MatError::Hdf5(fallback),
+        }
+    }
+
+    /// Finalize the file and return its bytes.
+    pub fn finish(mut self) -> Result<Vec<u8>, MatError> {
+        self.finalize("finish")?;
+        let stash = Arc::clone(&self.producer_error);
+        self.file
+            .finish()
+            .map_err(|e| Self::attribute_failure(&stash, e))
+    }
+
+    /// Finalize the file and write it to `w` front-to-back, without ever holding
+    /// the assembled file in memory.
+    ///
+    /// Produces byte-for-byte the same file as [`finish`](Self::finish). The sink
+    /// is written in ascending-address order and never seeks, so it can be a
+    /// socket as readily as a file. A dataset staged through
+    /// [`write_blocks`](Self::write_blocks) has its blocks pulled from the
+    /// producer here, one at a time.
+    ///
+    /// A failure partway leaves whatever was already written on the sink. With a
+    /// non-seekable sink there is nothing to roll back, so a caller that needs
+    /// all-or-nothing should write to a temporary path and rename on success —
+    /// which is what [`write`](Self::write) does not do either, for the same
+    /// reason.
+    pub fn finish_to<W: std::io::Write>(mut self, w: W) -> Result<(), MatError> {
+        self.finalize("finish_to")?;
+        let stash = Arc::clone(&self.producer_error);
+        self.file
+            .finish_to(w)
+            .map_err(|e| Self::attribute_failure(&stash, e))
+    }
+
+    /// Finalize the file and stream it to `path`. See
+    /// [`finish_to`](Self::finish_to).
+    pub fn write<P: AsRef<std::path::Path>>(mut self, path: P) -> Result<(), MatError> {
+        self.finalize("write")?;
+        let stash = Arc::clone(&self.producer_error);
+        self.file
+            .write(path)
+            .map_err(|e| Self::attribute_failure(&stash, e))
     }
 
     /// Build the MCOS subsystem. Lifts the layout from the beve writer

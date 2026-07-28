@@ -6997,10 +6997,12 @@ struct SliceChunkProvider<'a> {
 }
 
 impl ChunkProvider for SliceChunkProvider<'_> {
-    fn chunk_bytes(&self, index: usize) -> Result<Vec<u8>, FormatError> {
-        self.chunks.get(index).cloned().ok_or_else(|| {
+    fn chunk_bytes(&self, index: usize, out: &mut Vec<u8>) -> Result<(), FormatError> {
+        let chunk = self.chunks.get(index).ok_or_else(|| {
             FormatError::ChunkedReadError("chunk index out of range for in-memory provider".into())
-        })
+        })?;
+        out.extend_from_slice(chunk);
+        Ok(())
     }
 }
 

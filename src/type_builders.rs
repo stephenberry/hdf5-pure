@@ -1139,6 +1139,25 @@ pub(crate) struct RawChunkPayload {
     pub(crate) provider: core::panic::AssertUnwindSafe<Box<dyn ChunkProvider>>,
 }
 
+/// Everything [`DatasetBuilder::with_produced_data`] needs to emit a contiguous
+/// dataset whose element bytes are produced at write time: the region's total
+/// size (known from geometry, which is why the layout never has to read it), the
+/// block size the producer is called with, and the producer itself.
+///
+/// The region is a plain run of bytes, so it is laid out exactly as if the bytes
+/// had been handed over — a produced dataset and a materialized one are the same
+/// file.
+pub(crate) struct ProducedPayload {
+    /// Bytes the whole data region occupies.
+    pub(crate) total_bytes: u64,
+    /// Bytes per block. The final block carries whatever remains.
+    pub(crate) block_bytes: u64,
+    /// Yields each block's bytes on demand during the write. Wrapped in
+    /// [`AssertUnwindSafe`](core::panic::AssertUnwindSafe) for the same reason
+    /// [`RawChunkPayload::provider`] is, and soundly so for the same reason.
+    pub(crate) provider: core::panic::AssertUnwindSafe<Box<dyn ChunkProvider>>,
+}
+
 /// One element of an object-reference dataset written through the builder.
 ///
 /// A reference either names an object by path (resolved to that object's
@@ -1206,6 +1225,9 @@ pub struct DatasetBuilder {
     /// filter-pipeline message, and the geometry needed to lay them out. This
     /// takes precedence over `data` / `chunk_options` for chunked storage.
     pub(crate) raw_chunks: Option<RawChunkPayload>,
+    /// When set, this dataset is contiguous and its element bytes are produced
+    /// at write time rather than staged in `data`, which stays `None`.
+    pub(crate) produced: Option<ProducedPayload>,
     /// When set, this dataset is an object-reference dataset whose element
     /// addresses are resolved (per-element by path, or written raw) during file
     /// serialization once every object's destination address is known.
@@ -1235,6 +1257,7 @@ impl DatasetBuilder {
             attrs: Vec::new(),
             chunk_options: ChunkOptions::default(),
             raw_chunks: None,
+            produced: None,
             reference_targets: None,
             vl_string_staging: None,
             fill: None,
@@ -1557,6 +1580,39 @@ impl DatasetBuilder {
             raw_size,
             pipeline_message,
             meta,
+            provider: core::panic::AssertUnwindSafe(provider),
+        });
+        self
+    }
+
+    /// Stage a contiguous dataset whose element bytes are produced at write time,
+    /// one block at a time, rather than handed over as a slice.
+    ///
+    /// The data region is `total_bytes` long — pure geometry, so the layout pass
+    /// never touches the producer — and the emitter pulls `block_bytes` at a time
+    /// (the last block being whatever remains). The result is byte-for-byte the
+    /// dataset the same content staged through [`with_raw_data`](Self::with_raw_data)
+    /// would produce; only the peak memory differs.
+    ///
+    /// The caller owns the contract that `total_bytes` matches `shape` and the
+    /// datatype's element size; a block of the wrong length is refused at write
+    /// time rather than written.
+    pub(crate) fn with_produced_data(
+        &mut self,
+        datatype: Datatype,
+        shape: &[u64],
+        total_bytes: u64,
+        block_bytes: u64,
+        provider: Box<dyn ChunkProvider>,
+    ) -> &mut Self {
+        debug_assert!(block_bytes > 0, "a block must make progress");
+        self.datatype = Some(datatype);
+        if self.shape.is_none() {
+            self.shape = Some(shape.to_vec());
+        }
+        self.produced = Some(ProducedPayload {
+            total_bytes,
+            block_bytes,
             provider: core::panic::AssertUnwindSafe(provider),
         });
         self

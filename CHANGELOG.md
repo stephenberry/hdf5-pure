@@ -10,12 +10,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - An object carries any number of dense (fractal-heap) attributes: both the name index and the huge-object index are now multi-level B-trees of fixed 512-byte nodes, matching what the reference C library emits, instead of one leaf grown to fit ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
 - Dense attributes are held in a doubling table of direct blocks reached through indirect blocks, the same heap geometry the reference C library uses, so a large attribute set no longer rounds its storage up to a power of two ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
+- `MatBuilder::finish_to` and `MatBuilder::write` assemble a `.mat` straight onto an `io::Write` instead of returning its bytes, and `mat::to_writer` / `mat::to_writer_with_options` do the same for the serde entry points. Byte-for-byte what the buffered calls produce, and the sink need not be seekable (PR-LINK).
+- `MatBuilder::write_blocks` stages a numeric array whose bytes a `DataProducer` supplies one block at a time during the write, so a dataset larger than memory can be written; the element type names the MATLAB class, and `Blocking::plan` reports the split in advance. Uncompressed only, since the layout needs each region's exact size before it writes anything (PR-LINK).
+- `FileBuilder::with_userblock_content` makes the userblock part of the file the writer emits, so a wrapper format's header survives the streaming output paths that leave nothing to patch afterwards (PR-LINK).
 
 ### Changed
 
 - **Breaking:** `FormatError::TooManyDenseAttributes` and `FormatError::TooManyHugeDenseAttributes` are removed along with the 61,680- and 43,690-attribute limits that produced them ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
 - **Breaking:** `FormatError::DenseAttributeHeapTooLarge` now carries only `limit`, and bounds the heap's 40-bit address space rather than a single 2 GiB direct block ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
 - Every dense attribute set has different bytes: its name index is a tree of 512-byte nodes, and its attributes sit in a doubling table whose blocks start at 1 KiB and grow by adding blocks rather than by rounding one up to a power of two. Files written by earlier versions still read ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
+- `mat::to_file` and `mat::to_file_with_options` stream to disk rather than building the whole file in memory first. Same bytes (PR-LINK).
 
 ## [0.28.0] - 2026-07-28
 

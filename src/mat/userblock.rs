@@ -6,8 +6,13 @@
 //! - `[126..128]`: endian indicator `"IM"` (little-endian)
 //! - `[128..512]`: zero-filled padding; HDF5 superblock follows at `[512..]`
 
+/// MATLAB userblock length as a `usize`, for sizing the buffer that holds it.
+/// Declared here rather than cast from [`USERBLOCK_SIZE`] so no 32-bit target
+/// sees a narrowing conversion.
+const USERBLOCK_LEN: usize = 512;
+
 /// MATLAB userblock size (bytes). Always 512 for v7.3.
-pub const USERBLOCK_SIZE: u64 = 512;
+pub const USERBLOCK_SIZE: u64 = USERBLOCK_LEN as u64;
 
 /// Default description text written in the first 124 bytes.
 pub const DEFAULT_DESCRIPTION: &str = "MATLAB 7.3 MAT-file, Platform: hdf5-pure (Rust)";
@@ -47,6 +52,19 @@ pub fn write_header(file_bytes: &mut [u8], description: &str) {
     file_bytes[127] = b'M';
 
     // 128..512: leave as-is (zeros).
+}
+
+/// The whole 512-byte userblock, ready to be handed to
+/// [`FileBuilder::with_userblock_content`](crate::FileBuilder::with_userblock_content)
+/// so the writer emits it ahead of the HDF5 content.
+///
+/// Nothing in a v7.3 userblock depends on the file that follows it, which is why
+/// it can be produced up front instead of patched in afterwards — and that in turn
+/// is what lets a `.mat` be written to a sink that cannot seek.
+pub fn header_block(description: &str) -> [u8; USERBLOCK_LEN] {
+    let mut block = [0u8; USERBLOCK_LEN];
+    write_header(&mut block, description);
+    block
 }
 
 /// Verify the bytes look like a MATLAB v7.3 userblock. Returns `Ok(())` on

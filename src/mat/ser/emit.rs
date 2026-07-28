@@ -59,6 +59,22 @@ impl RefsAccumulator {
 
 /// Turn a list of top-level `(name, value)` pairs into a MAT 7.3 file.
 pub(crate) fn emit_file(fields: Vec<(String, MatValue)>) -> Result<Vec<u8>, MatError> {
+    build_file(fields)?.finish().map_err(MatError::Hdf5)
+}
+
+/// Same file as [`emit_file`], streamed to `w` instead of returned. Assembly is
+/// front-to-back, so the whole file is never resident.
+pub(crate) fn emit_file_to<W: std::io::Write>(
+    fields: Vec<(String, MatValue)>,
+    w: W,
+) -> Result<(), MatError> {
+    build_file(fields)?.finish_to(w).map_err(MatError::Hdf5)
+}
+
+/// Stage every field into a [`FileBuilder`] carrying the MAT userblock, ready to
+/// be finished either way. Shared so the buffered and streaming entry points
+/// cannot come to describe different files.
+fn build_file(fields: Vec<(String, MatValue)>) -> Result<FileBuilder, MatError> {
     let mut builder = FileBuilder::new();
     builder.with_userblock(USERBLOCK_SIZE);
     let mut refs = RefsAccumulator::new();
@@ -80,9 +96,8 @@ pub(crate) fn emit_file(fields: Vec<(String, MatValue)>) -> Result<Vec<u8>, MatE
         builder.add_group(refs_group.finish());
     }
 
-    let mut bytes = builder.finish().map_err(MatError::Hdf5)?;
-    userblock::write_header(&mut bytes, userblock::DEFAULT_DESCRIPTION);
-    Ok(bytes)
+    builder.with_userblock_content(&userblock::header_block(userblock::DEFAULT_DESCRIPTION));
+    Ok(builder)
 }
 
 /// Emit a single named value at the file root.

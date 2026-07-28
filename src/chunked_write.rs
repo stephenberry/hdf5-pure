@@ -1657,9 +1657,12 @@ pub(crate) struct ChunkMeta {
 /// holding a boxed provider — and thus the public `FileBuilder` — keeps its
 /// `Send`/`Sync` auto-traits. Real providers own an `Arc<File>`, which is both.
 pub(crate) trait ChunkProvider: Send + Sync {
-    /// Return grid slot `index`'s compressed bytes. The returned length must
-    /// equal the matching [`ChunkMeta::compressed_size`]; the emitter checks it.
-    fn chunk_bytes(&self, index: usize) -> Result<Vec<u8>, FormatError>;
+    /// Append grid slot `index`'s compressed bytes to `out`, which the emitter
+    /// hands over empty. It is the same buffer on every call, so an
+    /// implementation that appends costs one allocation for the whole dataset
+    /// rather than one per chunk. The resulting length must equal the matching
+    /// [`ChunkMeta::compressed_size`]; the emitter checks it.
+    fn chunk_bytes(&self, index: usize, out: &mut Vec<u8>) -> Result<(), FormatError>;
 }
 
 /// A minimal byte sink so the verbatim chunk emitter works against both an
@@ -1874,17 +1877,22 @@ pub(crate) fn emit_chunked_data_verbatim<S: ByteSink>(
     plan: &VerbatimPlan,
     provider: &dyn ChunkProvider,
 ) -> Result<(), FormatError> {
+    // One buffer for the whole dataset: it grows to the largest chunk and is
+    // reused, so the streaming path's allocation count does not scale with the
+    // chunk count.
+    let mut chunk = Vec::new();
     for (i, slot) in plan.slots.iter().enumerate() {
         sink.put_zeros(slot.pad_before.to_usize()?)?;
-        let bytes = provider.chunk_bytes(i)?;
-        if bytes.len() as u64 != slot.compressed_size {
+        chunk.clear();
+        provider.chunk_bytes(i, &mut chunk)?;
+        if chunk.len() as u64 != slot.compressed_size {
             return Err(FormatError::ChunkedReadError(
                 "verbatim chunk provider returned a chunk whose size differs from the \
                  planned size"
                     .into(),
             ));
         }
-        sink.put(&bytes)?;
+        sink.put(&chunk)?;
     }
     sink.put_zeros(plan.index_pad.to_usize()?)?;
     sink.put(&plan.index_tail)?;
