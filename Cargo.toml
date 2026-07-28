@@ -124,3 +124,31 @@ manual_is_multiple_of = "allow"
 unnecessary_map_or = "allow"
 # Approximate float constants in tests/fixtures are intentional.
 approx_constant = "allow"
+
+# Fewer, larger codegen units than rustc's default of 256.
+#
+# The default emits up to one object file per codegen unit per crate compilation,
+# and cargo never reaps them. With 97 integration-test binaries a full rebuild of
+# this package creates ~9,800 objects; once `deps/` reaches six figures the scan
+# cargo and rustc perform on it dominates every build. See CLAUDE.md.
+#
+# 4 comes from the measured curve — objects per rebuild, and the time to build
+# the library alone:
+#
+#   codegen-units    256      64      16       4       1
+#   objects        9,789   7,495   1,584     606     161
+#   library           8s      8s      9s     10s     13s
+#
+# The library is the serialization point (every test binary waits on it), so its
+# build time is the cost that matters. 4 buys 16x fewer objects for about a
+# second; 1 costs 63% for a reduction nothing needs. Whole-test-build time did
+# not vary measurably: cargo already parallelizes across 98 separate crates, so
+# intra-crate codegen parallelism is largely redundant here.
+#
+# `release` and `bench` keep their default of 16 — a throughput trade-off for
+# generated code rather than a build-artifact one.
+[profile.dev]
+codegen-units = 4
+
+[profile.test]
+codegen-units = 4
