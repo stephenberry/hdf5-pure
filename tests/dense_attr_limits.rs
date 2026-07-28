@@ -14,7 +14,10 @@
 use hdf5_pure::{AttrValue, Error, File, FileBuilder, FormatError};
 
 mod common;
-use common::heap::{has_fractal_heap, huge_object_bytes, huge_object_count, managed_object_count};
+use common::heap::{
+    has_fractal_heap, huge_object_bytes, huge_object_count, indirect_block_count,
+    managed_object_count, root_indirect_rows,
+};
 
 /// Nine attributes, the first sized to `payload` bytes of text and the rest
 /// small, which is enough to select dense storage.
@@ -213,8 +216,8 @@ fn a_mixed_managed_and_huge_set_round_trips() {
     }
 }
 
-/// The emitter sizes its root direct block to the content, so a multi-megabyte
-/// set of individually small attributes stays entirely managed.
+/// The emitter grows a doubling table of direct blocks, so a multi-megabyte set
+/// of individually small attributes stays entirely managed.
 #[test]
 fn a_multi_megabyte_set_of_small_attributes_stays_managed() {
     let mut builder = FileBuilder::new();
@@ -229,6 +232,57 @@ fn a_multi_megabyte_set_of_small_attributes_stays_managed() {
 
     let file = File::from_bytes(bytes).unwrap();
     assert_eq!(file.root().attrs().unwrap().len(), 40);
+}
+
+/// The managed attributes used to live in one direct block rounded up to a power
+/// of two, which capped the heap at the 2 GiB block the format allows and spent
+/// close to half its space on padding. They now go in a doubling table of blocks
+/// no larger than 64 KiB, reached through a root indirect block and, past the
+/// root's own row of those, through nested ones.
+///
+/// Both depths are worth reading back through this crate as well as through the
+/// C library: an attribute placed at the wrong heap offset still decodes, because
+/// its neighbour's bytes are a valid message too.
+#[test]
+fn managed_attributes_span_as_many_blocks_as_they_need() {
+    // Small attributes spilling out of one block, and attributes each nearly
+    // filling the largest direct block, which is what forces the nesting.
+    for (name, payload, count, indirect) in [("shallow", 200, 60, 1), ("nested", 64_000, 12, 2)] {
+        let mut builder = FileBuilder::new();
+        for i in 0..count {
+            let text = char::from(b'a' + (i % 26) as u8)
+                .to_string()
+                .repeat(payload);
+            builder.set_attr(&format!("a{i:04}"), AttrValue::AsciiString(text));
+        }
+        builder.create_dataset("x").with_f64_data(&[1.0]);
+
+        let bytes = builder.finish().unwrap();
+        assert_eq!(
+            huge_object_count(&bytes),
+            0,
+            "{name}: these attributes must stay managed"
+        );
+        assert!(
+            root_indirect_rows(&bytes) > 0,
+            "{name}: the root should have grown into an indirect block"
+        );
+        assert!(
+            indirect_block_count(&bytes) >= indirect,
+            "{name}: expected at least {indirect} indirect blocks, found {}",
+            indirect_block_count(&bytes)
+        );
+
+        let file = File::from_bytes(bytes).unwrap();
+        let attrs = file.root().attrs().unwrap();
+        assert_eq!(attrs.len(), count);
+        for i in 0..count {
+            let expected = char::from(b'a' + (i % 26) as u8)
+                .to_string()
+                .repeat(payload);
+            assert_eq!(text(&attrs, &format!("a{i:04}")), expected, "{name}");
+        }
+    }
 }
 
 /// The attribute count used to stop at 61,680, where a single B-tree leaf grown

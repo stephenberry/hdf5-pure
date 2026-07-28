@@ -26,6 +26,7 @@ use crate::error::{FormatError, OBJECT_HEADER_MESSAGE_MAX};
 use crate::file_space_info::{
     DEFAULT_PAGE_SIZE, DEFAULT_THRESHOLD, FileSpaceInfo, FileSpaceStrategy, NUM_FILE_FSM_MANAGERS,
 };
+use crate::fractal_heap_write::{self, ManagedPlan};
 use crate::free_space_manager::{
     FreeSection, SECT_CLASS_LARGE, SECT_CLASS_SMALL, fshd_len, fsse_len, serialize_file_fsm,
 };
@@ -179,24 +180,8 @@ pub(crate) struct DenseAttrBlob {
 
 /// Bits of heap offset the dense attribute heap declares (its "Maximum Heap
 /// Size"), and the byte width that implies for a block offset.
-const DENSE_ATTR_MAX_HEAP_SIZE_BITS: u16 = 40;
-const DENSE_ATTR_BLOCK_OFFSET_BYTES: usize = (DENSE_ATTR_MAX_HEAP_SIZE_BITS as usize).div_ceil(8);
-
-/// Direct-block header bytes ahead of the data area, mirroring what
-/// [`build_dense_attrs`] emits: signature(4) + version(1) + heap address +
-/// block offset + checksum(4).
-const DENSE_ATTR_DBLOCK_HEADER: usize =
-    4 + 1 + OFFSET_SIZE as usize + DENSE_ATTR_BLOCK_OFFSET_BYTES + 4;
-
-/// The maximum direct block size the heap declares when its own root block is
-/// no larger, matching what the reference C library writes for an attribute
-/// heap. A heap whose root block is bigger declares that larger size instead,
-/// so the header never claims a maximum its own block exceeds.
-///
-/// A byte size rather than an on-disk address, so it is a `usize`: it is compared
-/// and subtracted against in-memory buffer sizes, and only widened to the 8-byte
-/// on-disk length field at the point it is written.
-const DENSE_ATTR_DEFAULT_MAX_DIRECT_BLOCK: usize = 65536;
+const DENSE_ATTR_MAX_HEAP_SIZE_BITS: u16 = fractal_heap_write::MAX_HEAP_SIZE_BITS;
+const DENSE_ATTR_BLOCK_OFFSET_BYTES: usize = fractal_heap_write::BLOCK_OFFSET_BYTES;
 
 /// Whether `attrs` must go in a fractal heap rather than the object header.
 ///
@@ -231,7 +216,8 @@ fn needs_dense_attrs(attrs: &[AttributeMessage]) -> bool {
             .any(|a| a.serialize(LENGTH_SIZE).len() > OBJECT_HEADER_MESSAGE_MAX)
 }
 
-/// The largest attribute [`build_dense_attrs`] stores as a managed object.
+/// The largest attribute [`build_dense_attrs`] stores as a managed object: what
+/// is left of the heap's largest direct block once its header is accounted for.
 ///
 /// The externally imposed limit is the heap ID: the 8-byte managed IDs this
 /// emitter writes spend one byte on flags and [`DENSE_ATTR_BLOCK_OFFSET_BYTES`]
@@ -251,7 +237,7 @@ fn needs_dense_attrs(attrs: &[AttributeMessage]) -> bool {
 /// attribute heap — but the threshold is the heap's own declaration, read back
 /// out of the header, so a higher one is equally readable.
 pub(crate) const DENSE_ATTR_MAX_MANAGED_OBJECT: usize =
-    DENSE_ATTR_DEFAULT_MAX_DIRECT_BLOCK - DENSE_ATTR_DBLOCK_HEADER;
+    fractal_heap_write::max_managed_object(OFFSET_SIZE);
 
 /// One name-index B-tree v2 record as [`build_dense_attrs`] writes it: heap
 /// ID(8) + message flags(1) + creation order(4) + name hash(4).
@@ -270,39 +256,17 @@ const DENSE_ATTR_NAME_BTREE_TYPE: u8 = 8;
 /// not filtered.
 const DENSE_ATTR_HUGE_BTREE_TYPE: u8 = 1;
 
-/// The largest direct block the reference C library will construct
-/// (`H5HF_MAX_DIRECT_SIZE_LIMIT`). It reads the heap's block sizes through
-/// 32-bit helpers that assert on a power of two, so a larger block is a heap it
-/// would mis-read rather than reject.
-const DENSE_ATTR_MAX_DIRECT_BLOCK_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
-
-/// The root direct block size [`build_dense_attrs`] will emit for `attrs`, and
-/// the maximum direct block size the heap header should declare alongside it.
+/// Whether [`build_dense_attrs`] can faithfully represent `attrs`.
 ///
-/// Single source of truth for that geometry so [`dense_attrs_check`] validates
-/// exactly what [`build_dense_attrs`] emits, and so the declared maximum cannot
-/// drift below the block actually written.
-fn dense_attr_block_geometry(serialized_total: usize) -> (u64, u64) {
-    // Rounded up in `u64`, not `usize`: on a 32-bit host the power-of-two
-    // rounding of a large heap would otherwise overflow (and panic) before
-    // `dense_attrs_check` got the chance to refuse it.
-    let content = DENSE_ATTR_DBLOCK_HEADER as u64 + serialized_total as u64;
-    let starting_block_size = content.next_power_of_two().max(512);
-    let max_direct_block_size = starting_block_size.max(DENSE_ATTR_DEFAULT_MAX_DIRECT_BLOCK as u64);
-    (starting_block_size, max_direct_block_size)
-}
-
-/// Whether [`build_dense_attrs`] can faithfully represent `attrs` in its
-/// single-direct-block layout.
-///
-/// The one bound the emitter still has to honour is on the root direct block
-/// holding the managed attributes, which must stay inside
-/// [`DENSE_ATTR_MAX_DIRECT_BLOCK_LIMIT`]. Neither the attribute count nor the
-/// huge-object count is bounded any more: both indexes are multi-node v2
-/// B-trees that grow a level rather than overflow a leaf. An individual
-/// attribute is not bounded either — past [`DENSE_ATTR_MAX_MANAGED_OBJECT`] the
-/// emitter changes representation rather than refusing — and nor is the total
-/// bounded at 64 KiB, since the root direct block is sized to its content.
+/// The one bound the emitter still has to honour is the heap's own address
+/// space: its offsets are [`DENSE_ATTR_MAX_HEAP_SIZE_BITS`] wide, so the managed
+/// blocks cannot span more than that between them. Nothing else is bounded any
+/// more. The attribute and huge-object counts are not, since both indexes are
+/// multi-node v2 B-trees that grow a level rather than overflow a leaf; an
+/// individual attribute is not, since past [`DENSE_ATTR_MAX_MANAGED_OBJECT`] the
+/// emitter changes representation rather than refusing; and the managed total is
+/// not, since the blocks holding it are a doubling table rather than one block
+/// sized to the whole set.
 ///
 /// What remains refused is what the attribute message itself cannot encode: its
 /// name, datatype and dataspace lengths live in 2-byte fields, and huge storage
@@ -312,7 +276,7 @@ fn dense_attr_block_geometry(serialized_total: usize) -> (u64, u64) {
 /// Callers that cannot fall back to a larger layout must refuse rather than
 /// mis-encode (see [`build_dense_attrs`]).
 pub(crate) fn dense_attrs_check(attrs: &[AttributeMessage]) -> Result<(), FormatError> {
-    let mut managed_total = 0usize;
+    let mut managed = Vec::new();
     for a in attrs {
         if let Some((field, size)) = a.v3_header_field_overflow(LENGTH_SIZE) {
             return Err(FormatError::AttributeFieldTooLong {
@@ -324,27 +288,18 @@ pub(crate) fn dense_attrs_check(attrs: &[AttributeMessage]) -> Result<(), Format
         }
         let size = a.serialize_v3(LENGTH_SIZE).len();
         if size <= DENSE_ATTR_MAX_MANAGED_OBJECT {
-            // A managed attribute's bytes go in the root direct block; a huge
-            // one's sit outside it and are bounded only by the file. Saturating
-            // because the count is no longer bounded first: on a 32-bit host a
-            // total past `usize` would wrap to a small number and pass the
-            // block-size check below, where saturating fails it.
-            managed_total = managed_total.saturating_add(size);
+            // A managed attribute's bytes go in the heap's direct blocks; a huge
+            // one's sit outside them and are bounded only by the file.
+            managed.push(size as u64);
         }
     }
-    dense_attrs_check_geometry(managed_total)
-}
-
-/// Bound the heap geometry that `total` bytes of serialized attributes imply.
-///
-/// Split out from [`dense_attrs_check`] so the block-size limit can be tested
-/// without materializing gigabytes of attributes to reach it.
-fn dense_attrs_check_geometry(total: usize) -> Result<(), FormatError> {
-    let (_, max_direct_block_size) = dense_attr_block_geometry(total);
-    if max_direct_block_size > DENSE_ATTR_MAX_DIRECT_BLOCK_LIMIT {
+    // The bound is checked by planning the very layout `build_dense_attrs` goes
+    // on to emit, so the validated shape and the emitted shape cannot drift
+    // apart. Reaching the refusal takes about a terabyte of attributes on one
+    // object, which is why nothing exercises it directly.
+    if ManagedPlan::new(&managed, OFFSET_SIZE).is_none() {
         return Err(FormatError::DenseAttributeHeapTooLarge {
-            block_size: max_direct_block_size,
-            limit: DENSE_ATTR_MAX_DIRECT_BLOCK_LIMIT,
+            limit: fractal_heap_write::MAX_HEAP_SPACE,
         });
     }
     Ok(())
@@ -353,13 +308,13 @@ fn dense_attrs_check_geometry(total: usize) -> Result<(), FormatError> {
 /// Build dense attribute storage for a set of attributes.
 ///
 /// Attributes that fit [`DENSE_ATTR_MAX_MANAGED_OBJECT`] are stored as managed
-/// objects in the heap's single root direct block; larger ones are stored as
-/// *huge* objects, whose bytes sit outside the managed blocks and whose address
-/// and length are indexed by a huge-objects v2 B-tree.
+/// objects in the heap's direct blocks; larger ones are stored as *huge*
+/// objects, whose bytes sit outside the managed blocks and whose address and
+/// length are indexed by a huge-objects v2 B-tree.
 ///
-/// The caller must have checked [`dense_attrs_check`] first: this emitter builds
-/// one direct block and one leaf per B-tree, so an attribute set outside those
-/// bounds would be mis-encoded.
+/// The caller must have checked [`dense_attrs_check`] first: an attribute set
+/// past the heap's own address space cannot be laid out, and this emitter has
+/// nowhere left to put it.
 pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -> DenseAttrBlob {
     // Dense attrs use v3 attribute messages (adds character set encoding byte).
     let serialized: Vec<Vec<u8>> = attrs.iter().map(|a| a.serialize_v3(LENGTH_SIZE)).collect();
@@ -396,19 +351,18 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     let block_offset_bytes = DENSE_ATTR_BLOCK_OFFSET_BYTES; // 5
     let heap_id_length: u16 = 8;
 
-    // Direct block layout: sig(4) + ver(1) + heap_addr(os) + block_offset(bo_bytes)
-    //   + checksum(4) [when flags bit 1 set] + data...
-    // Only managed objects occupy it, so only they size it.
-    let dblock_header_size = DENSE_ATTR_DBLOCK_HEADER;
-    let total_data_size: usize = serialized
+    // Only managed objects occupy the doubling table, so only they are planned
+    // into it. `managed` holds their bytes in attribute order, and the plan's
+    // object indices are indices into it.
+    let managed: Vec<&[u8]> = serialized
         .iter()
         .zip(&huge_id_of)
         .filter(|(_, id)| id.is_none())
-        .map(|(s, _)| s.len())
-        .sum();
-    // Both sizes come from the shared geometry, so the maximum this header
-    // declares always covers the block it goes on to emit.
-    let (starting_block_size, max_direct_block_size) = dense_attr_block_geometry(total_data_size);
+        .map(|(s, _)| s.as_slice())
+        .collect();
+    let managed_sizes: Vec<u64> = managed.iter().map(|s| s.len() as u64).collect();
+    let managed_plan = ManagedPlan::new(&managed_sizes, OFFSET_SIZE)
+        .expect("dense_attrs_check, which every caller must run first, plans the same layout");
 
     // Fractal heap header size
     let frhp_size = 4
@@ -469,24 +423,16 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
 
     // Blob layout, all relative to `base_address` so the caller can size the blob
     // with a throwaway build at address 0 and get the same bytes back at the real
-    // address: heap header, root direct block, name index (header + nodes), then —
-    // only when there are huge objects — the huge index (header + nodes) and the
-    // huge object bytes themselves.
+    // address: heap header, the managed blocks, name index (header + nodes),
+    // then — only when there are huge objects — the huge index (header + nodes)
+    // and the huge object bytes themselves.
     let frhp_addr = base_address;
-    let dblock_addr = frhp_addr + frhp_size as u64;
-    let btree_addr = dblock_addr + starting_block_size;
+    let managed_addr = frhp_addr + frhp_size as u64;
+    let btree_addr = managed_addr + managed_plan.region_size();
     let name_nodes_addr = btree_addr + bthd_size as u64;
     let huge_bthd_addr = name_nodes_addr + name_plan.nodes_size();
     let huge_nodes_addr = huge_bthd_addr + bthd_size as u64;
     let huge_data_addr = huge_nodes_addr + huge_plan.as_ref().map_or(0, BTreeV2Plan::nodes_size);
-
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "dense_attrs_check, which every caller must run first, bounds this \
-                  direct-block size at 2 GiB, so it fits usize on every supported target"
-    )]
-    let data_space = starting_block_size as usize - dblock_header_size;
-    let free_space = data_space - total_data_size;
 
     // The reference C library does not read a heap ID's length field at a fixed
     // width: it derives that width from the heap's declared maximum managed
@@ -525,11 +471,11 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     } else {
         write_offset(&mut frhp, huge_bthd_addr, OFFSET_SIZE);
     }
-    write_length(&mut frhp, free_space as u64, LENGTH_SIZE); // free_space_managed_blocks
+    write_length(&mut frhp, managed_plan.free_space(), LENGTH_SIZE); // free_space_managed_blocks
     write_undef_offset(&mut frhp, OFFSET_SIZE); // free_space_mgr_addr
-    write_length(&mut frhp, starting_block_size, LENGTH_SIZE); // managed_space_in_heap
-    write_length(&mut frhp, starting_block_size, LENGTH_SIZE); // allocated_managed_space
-    write_length(&mut frhp, 0, LENGTH_SIZE); // dblock_alloc_iter
+    write_length(&mut frhp, managed_plan.managed_space(), LENGTH_SIZE); // managed_space_in_heap
+    write_length(&mut frhp, managed_plan.allocated_space(), LENGTH_SIZE); // allocated_managed_space
+    write_length(&mut frhp, managed_plan.allocation_iterator(), LENGTH_SIZE); // dblock_alloc_iter
     // Managed and huge objects are counted separately; an attribute is in exactly
     // one of the two.
     let managed_count = (attrs.len() - huge_count) as u64;
@@ -538,39 +484,39 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     write_length(&mut frhp, huge_count as u64, LENGTH_SIZE); // huge_objects_count
     write_length(&mut frhp, 0, LENGTH_SIZE); // tiny_objects_size
     write_length(&mut frhp, 0, LENGTH_SIZE); // tiny_objects_count
-    frhp.extend_from_slice(&4u16.to_le_bytes()); // table_width
-    write_length(&mut frhp, starting_block_size, LENGTH_SIZE);
-    write_length(&mut frhp, max_direct_block_size, LENGTH_SIZE); // max_direct_block_size
+    frhp.extend_from_slice(&fractal_heap_write::TABLE_WIDTH.to_le_bytes()); // table_width
+    write_length(
+        &mut frhp,
+        fractal_heap_write::STARTING_BLOCK_SIZE,
+        LENGTH_SIZE,
+    );
+    write_length(
+        &mut frhp,
+        fractal_heap_write::MAX_DIRECT_BLOCK_SIZE,
+        LENGTH_SIZE,
+    ); // max_direct_block_size
     frhp.extend_from_slice(&max_heap_size.to_le_bytes());
-    let sri: u16 = 1;
-    frhp.extend_from_slice(&sri.to_le_bytes()); // start_root_rows
-    write_offset(&mut frhp, dblock_addr, OFFSET_SIZE);
-    frhp.extend_from_slice(&0u16.to_le_bytes()); // root is direct block
+    frhp.extend_from_slice(&fractal_heap_write::START_ROOT_ROWS.to_le_bytes()); // start_root_rows
+    write_offset(
+        &mut frhp,
+        managed_plan.root_address(managed_addr),
+        OFFSET_SIZE,
+    );
+    // Zero when the root is a direct block, which is how a reader tells which of
+    // the two the address above points at.
+    frhp.extend_from_slice(&managed_plan.root_rows().to_le_bytes());
     let frhp_checksum = crate::checksum::jenkins_lookup3(&frhp);
     frhp.extend_from_slice(&frhp_checksum.to_le_bytes());
     debug_assert_eq!(frhp.len(), frhp_size);
 
-    // Build direct block: header (with checksum) + data + padding
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "starting_block_size is a KiB-scale heap direct-block size that fits usize"
-    )]
-    let mut dblock = Vec::with_capacity(starting_block_size as usize);
-    dblock.extend_from_slice(b"FHDB");
-    dblock.push(0); // version
-    write_offset(&mut dblock, frhp_addr, OFFSET_SIZE);
-    dblock.extend_from_slice(&vec![0u8; block_offset_bytes]); // block_offset = 0 for root
-    let cksum_pos = dblock.len();
-    dblock.extend_from_slice(&[0u8; 4]); // checksum placeholder
-    debug_assert_eq!(dblock.len(), dblock_header_size);
-
-    // Data area starts after the header. Only managed objects go in; a huge
-    // object's bytes are appended to the blob further down, and its heap ID
-    // carries a B-tree key instead of a block offset.
+    // Heap IDs. A managed object's carries the offset the plan gave it; a huge
+    // object's carries a B-tree key instead, since its bytes sit outside the
+    // managed blocks entirely.
     let mut heap_ids: Vec<Vec<u8>> = Vec::with_capacity(attrs.len());
     // (huge object ID, address, length) for the huge-objects B-tree, in ID order.
     let mut huge_records: Vec<(u64, u64, u64)> = Vec::with_capacity(huge_count);
     let mut next_huge_addr = huge_data_addr;
+    let mut next_managed = 0usize;
     for (s, huge_id) in serialized.iter().zip(&huge_id_of) {
         match huge_id {
             Some(id) => {
@@ -579,29 +525,20 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
                 heap_ids.push(encode_huge_id(*id, heap_id_length));
             }
             None => {
-                let offset_in_heap = dblock.len() as u64;
                 heap_ids.push(encode_managed_id(
-                    offset_in_heap,
+                    managed_plan.heap_offset(next_managed),
                     s.len() as u64,
                     max_heap_size,
                     heap_id_length,
                 ));
-                dblock.extend_from_slice(s);
+                next_managed += 1;
             }
         }
     }
+    debug_assert_eq!(next_managed, managed.len());
 
-    // Pad to full block size
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "starting_block_size is a KiB-scale heap direct-block size that fits usize"
-    )]
-    dblock.resize(starting_block_size as usize, 0);
-
-    // Checksum: computed over entire block with checksum field zeroed
-    let dblock_checksum = crate::checksum::jenkins_lookup3(&dblock);
-    dblock[cksum_pos..cksum_pos + 4].copy_from_slice(&dblock_checksum.to_le_bytes());
-    debug_assert_eq!(dblock.len() as u64, starting_block_size);
+    let managed_blocks = managed_plan.serialize(&managed, managed_addr, frhp_addr);
+    debug_assert_eq!(managed_blocks.len() as u64, managed_plan.region_size());
 
     // Build B-tree v2 type 8 records (17 bytes each), sorted into the order the
     // index is searched in: by name hash, and by creation order where two names
@@ -629,9 +566,9 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     let name_tree = name_plan.serialize(&name_records, name_nodes_addr, OFFSET_SIZE, LENGTH_SIZE);
 
     let mut blob =
-        Vec::with_capacity(frhp.len() + dblock.len() + bthd_size + name_tree.nodes.len());
+        Vec::with_capacity(frhp.len() + managed_blocks.len() + bthd_size + name_tree.nodes.len());
     blob.extend_from_slice(&frhp);
-    blob.extend_from_slice(&dblock);
+    blob.extend_from_slice(&managed_blocks);
     debug_assert_eq!(blob.len() as u64, bthd_addr - base_address);
     blob.extend_from_slice(&name_tree.header);
     blob.extend_from_slice(&name_tree.nodes);
@@ -723,7 +660,7 @@ fn serialize_attribute_info(fh_addr: u64, btree_name_addr: u64) -> Vec<u8> {
     data
 }
 
-fn write_offset(buf: &mut Vec<u8>, val: u64, offset_size: u8) {
+pub(crate) fn write_offset(buf: &mut Vec<u8>, val: u64, offset_size: u8) {
     #[expect(
         clippy::cast_possible_truncation,
         reason = "each arm narrows to offset_size, the on-disk address width chosen for this file"
@@ -740,7 +677,7 @@ fn write_length(buf: &mut Vec<u8>, val: u64, length_size: u8) {
     write_offset(buf, val, length_size);
 }
 
-fn write_undef_offset(buf: &mut Vec<u8>, offset_size: u8) {
+pub(crate) fn write_undef_offset(buf: &mut Vec<u8>, offset_size: u8) {
     for _ in 0..offset_size {
         buf.push(0xFF);
     }
@@ -2958,40 +2895,80 @@ mod tests {
         u64::from_le_bytes(blob[at..at + 8].try_into().unwrap())
     }
 
-    /// Reaching the direct-block limit takes gigabytes of attributes, so the
-    /// geometry check is exercised directly rather than by building them.
-    #[test]
-    fn dense_heap_past_the_direct_block_limit_is_refused() {
-        assert_eq!(dense_attrs_check_geometry(1_000_000), Ok(()));
-
-        let over = DENSE_ATTR_MAX_DIRECT_BLOCK_LIMIT as usize;
-        match dense_attrs_check_geometry(over) {
-            Err(FormatError::DenseAttributeHeapTooLarge { block_size, limit }) => {
-                assert!(block_size > limit);
-                assert_eq!(limit, DENSE_ATTR_MAX_DIRECT_BLOCK_LIMIT);
-            }
-            other => panic!("expected DenseAttributeHeapTooLarge, got {other:?}"),
-        }
+    /// The heap header's root-block address and its "current # of rows in root
+    /// indirect block", the field that says which kind of block that address
+    /// points at.
+    fn root_block(blob: &[u8]) -> (usize, u16) {
+        let ls = LENGTH_SIZE as usize;
+        let os = OFFSET_SIZE as usize;
+        assert_eq!(&blob[..4], b"FRHP");
+        // The fixed prefix, then next huge object ID, huge B-tree address, free
+        // space, free-space manager address, the eight 8-byte statistics, table
+        // width, starting block size, maximum direct block size, maximum heap
+        // size and starting root rows.
+        let at = 4 + 1 + 2 + 2 + 1 + 4 + ls + os + ls + os + 8 * ls + 2 + ls + ls + 2 + 2;
+        let address = u64::from_le_bytes(blob[at..at + os].try_into().unwrap());
+        let rows = u16::from_le_bytes(blob[at + os..at + os + 2].try_into().unwrap());
+        (address as usize, rows)
     }
 
-    /// The header must never declare a maximum direct block size its own root
-    /// block exceeds — the inconsistency the old fixed 65,536 produced for any
-    /// heap larger than that.
+    /// The root stays a single direct block only while the attributes fit one
+    /// starting-size block, which is where the reference C library also grows a
+    /// root indirect block instead of a bigger block.
     #[test]
-    fn declared_max_direct_block_covers_the_emitted_block() {
-        for total in [0usize, 100, 60_000, 65_600, 2_000_000] {
-            let (starting, max_direct) = dense_attr_block_geometry(total);
-            assert!(
-                max_direct >= starting,
-                "total {total}: declared max {max_direct} < emitted block {starting}"
-            );
+    fn the_root_grows_into_an_indirect_block_rather_than_a_bigger_direct_one() {
+        let fits = vec![dense_attr_of_size("a", 400)];
+        let blob = build_dense_attrs(&fits, 0).blob;
+        let (address, rows) = root_block(&blob);
+        assert_eq!(rows, 0, "one starting-size block still holds this heap");
+        assert_eq!(&blob[address..address + 4], b"FHDB");
+
+        let spills: Vec<AttributeMessage> = (0..8)
+            .map(|i| dense_attr_of_size(&format!("a{i}"), 400))
+            .collect();
+        let blob = build_dense_attrs(&spills, 0).blob;
+        let (address, rows) = root_block(&blob);
+        assert!(rows >= 1, "content past one block needs an indirect root");
+        assert_eq!(&blob[address..address + 4], b"FHIB");
+    }
+
+    /// An attribute close to the managed-object limit needs the table's largest
+    /// direct block, and those only recur inside *nested* indirect blocks once
+    /// the root's own row of them is used up. Reading every attribute back proves
+    /// the emitter and the reader agree about where the deeper blocks sit.
+    #[test]
+    fn attributes_survive_a_heap_with_nested_indirect_blocks() {
+        let mut fw = FileWriter::new();
+        let ds = fw.create_dataset("data");
+        ds.with_f64_data(&[1.0]);
+        // Past DENSE_ATTR_THRESHOLD so the set goes to the heap at all, and each
+        // one big enough that only the table's largest direct block will take it.
+        let count = DENSE_ATTR_THRESHOLD + 2;
+        let value = |i: usize| char::from(b'a' + i as u8).to_string().repeat(60_000);
+        for i in 0..count {
+            ds.set_attr(&format!("big{i}"), AttrValue::AsciiString(value(i)));
         }
-        // Small heaps keep the value the reference C library writes, so existing
-        // output is unchanged.
-        assert_eq!(
-            dense_attr_block_geometry(100).1,
-            DENSE_ATTR_DEFAULT_MAX_DIRECT_BLOCK as u64
+        let bytes = fw.finish().unwrap();
+
+        let nested = bytes.windows(4).filter(|w| *w == b"FHIB").count();
+        assert!(
+            nested >= 2,
+            "expected a nested indirect block, got {nested}"
         );
+
+        let sig = signature::find_signature(&bytes).unwrap();
+        let sb = Superblock::parse(&bytes, sig).unwrap();
+        let addr = resolve_path_any(&bytes, &sb, "data").unwrap();
+        let hdr =
+            ObjectHeader::parse(&bytes, addr as usize, sb.offset_size, sb.length_size).unwrap();
+        let attrs =
+            crate::attribute::extract_attributes_full(&bytes, &hdr, sb.offset_size, sb.length_size)
+                .unwrap();
+        assert_eq!(attrs.len(), count);
+        for i in 0..count {
+            let attr = attrs.iter().find(|a| a.name == format!("big{i}")).unwrap();
+            assert_eq!(attr.read_as_string().unwrap(), value(i));
+        }
     }
 
     /// The number of `i64` elements in the largest attribute whose serialized

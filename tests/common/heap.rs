@@ -87,3 +87,23 @@ pub fn managed_object_count(bytes: &[u8]) -> u64 {
 pub fn huge_object_bytes(bytes: &[u8]) -> u64 {
     frhp_u64(bytes, 8)
 }
+
+/// The heap's "current # of rows in root indirect block": 0 when the root is a
+/// single direct block, and otherwise how many doubling-table rows the root
+/// indirect block spans.
+///
+/// Past the twelve 8-byte fields [`frhp_u64_at`] indexes come the doubling-table
+/// fields — table width(2), starting block size(8), maximum direct block size(8),
+/// maximum heap size(2), starting root rows(2) — then the root block address(8)
+/// and this.
+#[track_caller]
+pub fn root_indirect_rows(bytes: &[u8]) -> u16 {
+    let at = frhp(bytes) + 4 + 1 + 2 + 2 + 1 + 4 + 12 * SIZE + 2 + SIZE + SIZE + 2 + 2 + SIZE;
+    u16::from_le_bytes(bytes[at..at + 2].try_into().expect("2 bytes"))
+}
+
+/// How many fractal-heap indirect blocks the file holds. More than one means the
+/// root's own row of them filled up and the table nested.
+pub fn indirect_block_count(bytes: &[u8]) -> usize {
+    bytes.windows(4).filter(|w| *w == b"FHIB").count()
+}

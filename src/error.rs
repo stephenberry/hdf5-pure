@@ -403,13 +403,12 @@ pub enum FormatError {
         /// The largest length the message can describe, in bytes.
         limit: usize,
     },
-    /// An object's attributes need a larger fractal-heap direct block than the
-    /// format's own limit for one, so the heap could not be read back reliably.
-    /// Reaching this takes gigabytes of attributes on a single object.
+    /// An object's attributes need more space than a dense attribute heap can
+    /// address: its offsets are 40 bits wide, so the blocks holding the
+    /// attributes cannot span more than `limit` bytes between them. Reaching this
+    /// takes about a terabyte of attributes on a single object.
     DenseAttributeHeapTooLarge {
-        /// The direct block size the attribute set would need, in bytes.
-        block_size: u64,
-        /// The largest direct block size, in bytes.
+        /// The heap address space, in bytes.
         limit: u64,
     },
 }
@@ -814,11 +813,11 @@ impl fmt::Display for FormatError {
                      the attribute message's {field} size field"
                 )
             }
-            FormatError::DenseAttributeHeapTooLarge { block_size, limit } => {
+            FormatError::DenseAttributeHeapTooLarge { limit } => {
                 write!(
                     f,
-                    "these attributes need a {block_size}-byte fractal-heap direct block, past \
-                     the {limit}-byte maximum"
+                    "these attributes need more than the {limit}-byte address space of a dense \
+                     attribute heap"
                 )
             }
         }

@@ -17,7 +17,9 @@ use hdf5_pure::{AttrValue, FileBuilder};
 use tempfile::tempdir;
 
 mod common;
-use common::heap::{huge_object_count, managed_object_count};
+use common::heap::{
+    huge_object_count, indirect_block_count, managed_object_count, root_indirect_rows,
+};
 
 /// Set on the child process to make it open `$DENSE_XCHECK_FILE` with libhdf5
 /// and report what it found on stdout.
@@ -146,7 +148,14 @@ fn child_reads_attribute_sizes() {
     let Ok(path) = std::env::var(CHILD_ENV) else {
         return;
     };
-    match hdf5::File::open(&path) {
+    child_report_attributes(&path);
+}
+
+/// Open `path` with libhdf5 and print every attribute's size, and its `i64` sum
+/// where the type allows. Shared by the children that read and the ones that
+/// write first, so the parent parses one format either way.
+fn child_report_attributes(path: &str) {
+    match hdf5::File::open(path) {
         Ok(f) => {
             let names = f.attr_names().expect("attribute names");
             println!("ATTRS={}", names.len());
@@ -244,25 +253,52 @@ fn child_inserts_with_libhdf5() {
             .expect("write attribute");
         f.close().expect("close");
     }
-    match hdf5::File::open(&path) {
-        Ok(f) => {
-            let names = f.attr_names().expect("attribute names");
-            println!("ATTRS={}", names.len());
-            for name in names {
-                let attr = f.attr(&name).expect("open attribute");
-                let dtype = attr.dtype().expect("attribute datatype");
-                println!("SIZE={name}={}", dtype.size() * attr.size());
-            }
-            f.close().expect("close");
-        }
-        Err(_) => println!("OPEN_FAILED"),
-    }
+    child_report_attributes(&path);
 }
 
 /// Have libhdf5 add a huge attribute to a heap this crate wrote, then read the
 /// result back.
 fn c_inserts_then_reads(path: &std::path::Path) -> CDetail {
     c_child(path, "child_inserts_with_libhdf5")
+}
+
+/// The child half of [`c_inserts_managed_then_reads`]. Adds an attribute small
+/// enough to be a *managed* object, so libhdf5 has to place it in the doubling
+/// table rather than outside it.
+///
+/// That placement starts from the heap header's allocation iterator, the offset
+/// where the next direct block goes. A heap that declares the wrong one has the
+/// library allocate a block on top of one already holding attributes, which no
+/// amount of reading would reveal.
+#[test]
+fn child_inserts_managed_with_libhdf5() {
+    let Ok(path) = std::env::var(CHILD_ENV) else {
+        return;
+    };
+    let added: Vec<i64> = (0..16).collect();
+    {
+        let f = match hdf5::File::open_rw(&path) {
+            Ok(f) => f,
+            Err(_) => {
+                println!("OPEN_FAILED");
+                return;
+            }
+        };
+        f.new_attr::<i64>()
+            .shape([added.len()])
+            .create("inserted")
+            .expect("create attribute")
+            .write(&added)
+            .expect("write attribute");
+        f.close().expect("close");
+    }
+    child_report_attributes(&path);
+}
+
+/// Have libhdf5 add a managed attribute to a heap this crate wrote, then read
+/// every attribute back.
+fn c_inserts_managed_then_reads(path: &std::path::Path) -> CDetail {
+    c_child(path, "child_inserts_managed_with_libhdf5")
 }
 
 /// Nine attributes — enough to select dense storage — the first sized to
@@ -599,9 +635,100 @@ fn c_reads_attribute_counts_that_need_a_multi_level_index() {
     }
 }
 
+/// Managed attributes whose bytes outgrow the root direct block, against the
+/// library that defines how a heap grows instead: a root indirect block over a
+/// doubling table of direct blocks, and — once the root's own row of indirect
+/// blocks is used up — nested indirect blocks below that.
+///
+/// Both shapes have to be crosschecked separately. A root indirect block is one
+/// level of navigation; a nested one is the recursion, and it is reached only by
+/// objects large enough to skip every row of smaller blocks, which is a different
+/// path through the emitter as well as through libhdf5.
+///
+/// Values are read back, not just counted: an attribute placed at the wrong heap
+/// offset still yields a well-formed message from a neighbouring block.
+#[test]
+fn c_reads_a_heap_whose_managed_blocks_need_indirect_blocks() {
+    let dir = tempdir().unwrap();
+
+    // (name, elements per attribute, attribute count, indirect blocks expected)
+    let shapes: [(&str, usize, usize, usize); 2] = [
+        // Small attributes, enough of them to spill out of one starting-size
+        // block into the table's lower rows.
+        ("shallow", 10, 60, 1),
+        // Each attribute nearly fills the table's largest direct block, so the
+        // root's four of those run out and the walk descends into a nested
+        // indirect block for the rest.
+        ("nested", 8_000, 12, 2),
+    ];
+
+    for (name, len, count, indirect) in shapes {
+        let path = dir.path().join(format!("{name}.h5"));
+        let mut builder = FileBuilder::new();
+        for i in 0..count {
+            builder.set_attr(
+                &format!("a{i:04}"),
+                counting_attr(i as i64 * 1_000_000, len),
+            );
+        }
+        builder.create_dataset("x").with_f64_data(&[1.0]);
+        builder.write(&path).unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            huge_object_count(&bytes),
+            0,
+            "{name}: these attributes must stay managed, or this is not a test \
+             about the managed blocks"
+        );
+        assert_eq!(managed_object_count(&bytes), count as u64);
+        assert!(
+            root_indirect_rows(&bytes) > 0,
+            "{name}: the root should have grown into an indirect block"
+        );
+        assert!(
+            indirect_block_count(&bytes) >= indirect,
+            "{name}: expected at least {indirect} indirect blocks, found {}",
+            indirect_block_count(&bytes)
+        );
+
+        let detail = c_reads_in_detail(&path);
+        assert_eq!(detail.verdict, CReads::Attrs(count), "{name}");
+        for i in 0..count {
+            let attr = format!("a{i:04}");
+            assert_eq!(detail.size_of(&attr), Some(len * 8), "{name}: {attr}");
+            assert_eq!(
+                detail.sum_of(&attr),
+                Some(counting_sum(i as i64 * 1_000_000, len)),
+                "{name}: {attr} came back with the wrong contents"
+            );
+        }
+
+        // And libhdf5 can go on to place a managed attribute of its own in the
+        // table, which reading alone never checks: that placement starts from the
+        // heap header's allocation iterator, and a wrong one lands the new block
+        // on top of the attributes already stored.
+        let detail = c_inserts_managed_then_reads(&path);
+        assert_eq!(
+            detail.verdict,
+            CReads::Attrs(count + 1),
+            "{name}: libhdf5 could not add a managed attribute to this heap"
+        );
+        assert_eq!(detail.sum_of("inserted"), Some((0..16).sum::<i64>()));
+        for i in 0..count {
+            let attr = format!("a{i:04}");
+            assert_eq!(
+                detail.sum_of(&attr),
+                Some(counting_sum(i as i64 * 1_000_000, len)),
+                "{name}: {attr} was overwritten by the attribute libhdf5 added"
+            );
+        }
+    }
+}
+
 /// A multi-megabyte dense heap of individually small attributes is inside what
-/// the emitter can encode, and libhdf5 must accept it — including the maximum
-/// direct block size the header now declares to match its own root block.
+/// the emitter can encode, and libhdf5 must accept it — including the doubling
+/// table of direct blocks the emitter grows to hold it.
 #[test]
 fn c_reads_a_multi_megabyte_dense_heap() {
     let dir = tempdir().unwrap();

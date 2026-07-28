@@ -62,12 +62,12 @@ The [in-place editor](../guide/editing.md) enforces the same limit separately, r
 
 An object stores its attributes in a fractal heap when it has more than eight of them, **or** when any one of them is too large for an object-header message — the same disjunction the reference C library uses, and the reason a single large attribute is written rather than refused.
 
-The writer emits a single root direct block, indexed by B-trees of fixed 512-byte nodes — the node size the reference C library uses for both indexes — which grow internal levels as the record count rises. An attribute serializing past **65,514 bytes** does not fit a heap *managed* object, so it is written as a **huge** object instead: its bytes go outside the managed blocks and a huge-objects B-tree maps a generated ID to them. There is no limit on an individual attribute's size, and none on how many attributes an object may carry. What is still refused:
+The writer emits the same heap geometry the reference C library uses for an attribute heap: a doubling table of direct blocks from 512 bytes up to 64 KiB, reached through a root indirect block once one block no longer holds everything, and indexed by B-trees of fixed 512-byte nodes that grow internal levels as the record count rises. An attribute serializing past **65,514 bytes** does not fit a heap *managed* object, so it is written as a **huge** object instead: its bytes go outside the managed blocks and a huge-objects B-tree maps a generated ID to them. There is no limit on an individual attribute's size, and none on how many attributes an object may carry. What is still refused:
 
 - An attribute whose **name, datatype, or dataspace** serializes past **65,535 bytes** is refused with `FormatError::AttributeFieldTooLong`, naming the attribute and the field. Each has a 2-byte length field in the attribute message, and huge storage lifts the limit on an attribute's data, not on the fields that describe it.
-- Gigabytes of *managed* attributes on one object are refused with `FormatError::DenseAttributeHeapTooLarge`, which needs a direct block past the format's 2 GiB maximum for one.
+- About a terabyte of *managed* attributes on one object is refused with `FormatError::DenseAttributeHeapTooLarge`: the heap's offsets are 40 bits wide, so its blocks cannot span more than that between them.
 
-The *total* is otherwise not limited — the root direct block is sized to the content, so multi-megabyte heaps of individually small attributes are written normally. Note that block is padded up to a power of two, so a large dense attribute set can occupy up to roughly twice its own size on disk.
+The *total* is otherwise not limited, and it no longer rounds the whole heap up to a power of two: the table adds blocks rather than growing one. What space is still lost is per-block — an attribute that does not fit the remainder of a block moves to the next one — so it is bounded by the 64 KiB largest block rather than by the size of the attribute set.
 
 ### Group creation property list (GCPL)
 
