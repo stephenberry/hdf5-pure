@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-07-27
+
+The two read-write engines converge. `File::open_rw` now commits staged edits to a genuine paged file, and `File::open_rw_bounded` offers the full staged edit surface — `Dataset::write`, attribute edits, `create_*`/`delete`, `copy`, `space_accounting` — while holding only what a commit is building rather than a whole-file mirror. Neither the file's internal space strategy nor the kind of edit being made decides which open a caller reaches for, and `Dataset::append` grows a free-space-persisting file from either one. `Error::BoundedStagedUnsupported` is gone along with the refusals that returned it, the single breaking change here. Separately, MAT v7.3 complex arrays gain integer components across the serde, `Matrix<T>`, and `MatBuilder` surfaces, so a capture that samples as 16-bit integer pairs stores four bytes per sample instead of eight; three defects on the complex path are fixed with it, one of which changes the stored shape of a 1-D complex array written through `to_bytes_with_options`.
+
 ### Added
 
 - `File::open_rw` commits staged edits to a genuine paged file (`H5F_FSPACE_STRATEGY_PAGE`), through a commit that keeps each page homogeneous and rewrites the per-page-type free-space managers, so the full edit surface is no longer limited to `File::open_rw_bounded`'s appends. A paged file is still refused unless it persists its free space and has no userblock ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
@@ -462,7 +466,8 @@ Internal robustness and tests ([#26](https://github.com/stephenberry/hdf5-pure/i
 - The MAT deserializer flattens 1×N and N×1 values to a 1-D sequence in `deserialize_any` (matching `deserialize_seq`).
 - Numeric/complex readers preserve 1×N / N×1 shape at the value layer; any flattening happens at the serde level.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.26.0...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.27.0...HEAD
+[0.27.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.24.0...v0.25.0
 [0.24.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.23.2...v0.24.0
