@@ -42,7 +42,7 @@ use crate::mat::error::MatError;
 use crate::mat::identifier::{dedupe_name, is_valid_name, sanitize_name};
 use crate::mat::options::{Compression, EmptyMarkerEncoding, InvalidNamePolicy, Options};
 use crate::mat::producer::{
-    BlockElement, Blocking, DataProducer, ProducerChunks, plan_blocking, total_elements,
+    BlockElement, DataProducer, ProducerChunks, plan_blocking, total_elements,
 };
 use crate::mat::string_object;
 use crate::mat::userblock::{self, USERBLOCK_SIZE};
@@ -528,13 +528,15 @@ impl MatBuilder {
     /// not hold the assembled file either, this writes a `.mat` in one block plus
     /// the file's metadata, whatever its size.
     ///
-    /// The returned [`Blocking`] says how many blocks will be asked for and how
-    /// many bytes each must carry; [`Blocking::plan`] computes the same thing
-    /// ahead of time, from the shape alone, if the producer needs to be built
-    /// against it. Block `i` is a contiguous run of MATLAB's linear element
-    /// order, continuing where block `i - 1` stopped — see the
-    /// [module docs](crate::mat::producer) for what that means for a shape like
-    /// `[channels, samples]`.
+    /// Each call hands the producer a [`Block`](crate::mat::Block) carrying its
+    /// index, its first element's position, and how many elements to write, so a
+    /// producer needs nothing from this call's return value. Block `i` is a
+    /// contiguous run of MATLAB's linear element order, continuing where block
+    /// `i - 1` stopped — see the [module docs](crate::mat::producer) for what
+    /// that means for a shape like `[channels, samples]`.
+    ///
+    /// [`Blocking::plan`](crate::mat::Blocking::plan) computes the same split from the shape alone, ahead of
+    /// staging, for a caller that wants to size a buffer or report progress.
     ///
     /// The dataset is byte-for-byte the one [`write_f64`](Self::write_f64) and its
     /// siblings produce for the same content; only the peak memory differs.
@@ -561,19 +563,17 @@ impl MatBuilder {
     /// one would read them from a capture buffer or a socket.
     ///
     /// ```
-    /// use hdf5_pure::mat::{Blocking, DataProducer, MatBuilder, MatError, Options};
+    /// use hdf5_pure::mat::{Block, DataProducer, MatBuilder, MatError, Options};
     ///
-    /// struct Ramp {
-    ///     blocking: Blocking,
-    /// }
+    /// // Nothing to configure: every block says how much to write and where it
+    /// // starts, so the producer holds no state at all.
+    /// struct Ramp;
     ///
     /// impl DataProducer for Ramp {
-    ///     fn block_bytes(&self, index: usize, out: &mut Vec<u8>) -> Result<(), MatError> {
-    ///         // Where this block starts in the dataset's linear element order.
-    ///         let first = index as u64 * self.blocking.block_elements;
-    ///         let count = self.blocking.block_len(index) as u64 / 8;
-    ///         for i in 0..count {
-    ///             out.extend_from_slice(&((first + i) as f64).to_le_bytes());
+    ///     fn block_bytes(&self, block: Block, out: &mut Vec<u8>) -> Result<(), MatError> {
+    ///         for i in 0..block.elements {
+    ///             let value = (block.first_element + i) as f64;
+    ///             out.extend_from_slice(&value.to_le_bytes());
     ///         }
     ///         Ok(())
     ///     }
@@ -581,17 +581,11 @@ impl MatBuilder {
     ///
     /// // `[channels, samples]`: blocks then run forward through time.
     /// let dims = [4, 250_000];
-    /// let blocking = Blocking::plan::<f64>(&dims).unwrap();
-    ///
     /// let mut mb = MatBuilder::new(Options::default());
-    /// let reported = mb
-    ///     .write_blocks::<f64>("samples", &dims, Box::new(Ramp { blocking }))
+    /// mb.write_blocks::<f64>("samples", &dims, Box::new(Ramp))
+    ///     .unwrap()
+    ///     .write_scalar_f64("sample_rate", 48_000.0)
     ///     .unwrap();
-    ///
-    /// // `plan` predicted exactly what staging chose, so the producer above was
-    /// // built against the right blocking.
-    /// assert_eq!(reported, blocking);
-    /// assert_eq!(blocking.total_len(), 4 * 250_000 * 8);
     ///
     /// let mut sink: Vec<u8> = Vec::new();
     /// mb.finish_to(&mut sink).unwrap();
@@ -601,15 +595,14 @@ impl MatBuilder {
         name: &str,
         matlab_dims: &[usize],
         producer: Box<dyn DataProducer>,
-    ) -> Result<Blocking, MatError> {
+    ) -> Result<&mut Self, MatError> {
         if self.options.compression != Compression::None {
             return Err(MatError::CompressionUnsupportedForBlocks);
         }
 
         let blocking = plan_blocking(total_elements(matlab_dims), T::ELEMENT_SIZE)?;
         if blocking.block_count == 0 {
-            self.write_empty_with_decode(name, T::CLASS, matlab_dims, T::INT_DECODE)?;
-            return Ok(blocking);
+            return self.write_empty_with_decode(name, T::CLASS, matlab_dims, T::INT_DECODE);
         }
 
         // `storage_dims_u64`, not the stack-buffer form the slice writers use:
@@ -645,7 +638,7 @@ impl MatBuilder {
             "MATLAB_class",
             AttrValue::AsciiString(T::CLASS.as_str().into()),
         );
-        Ok(blocking)
+        Ok(self)
     }
 
     /// Write a MATLAB `string` object. Allocates a `#refs#` payload entry and

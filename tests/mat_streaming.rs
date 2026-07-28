@@ -11,7 +11,7 @@
 //!   per block, into a buffer it shares with every other call. A refactor that
 //!   reintroduced buffering would leave every correctness test green.
 
-use hdf5_pure::mat::{Blocking, Compression, DataProducer, MatBuilder, MatError, Options};
+use hdf5_pure::mat::{Block, Blocking, Compression, DataProducer, MatBuilder, MatError, Options};
 use hdf5_pure::{AttrValue, File};
 use std::sync::{Arc, Mutex};
 use tempfile::tempdir;
@@ -32,7 +32,6 @@ struct Log {
 /// any size costs nothing to produce and the expected bytes are computable
 /// without holding them.
 struct Ramp {
-    blocking: Blocking,
     log: Arc<Mutex<Log>>,
     /// Deliberately break the contract on this block, to prove the emitter
     /// checks rather than trusts.
@@ -42,11 +41,12 @@ struct Ramp {
 }
 
 impl Ramp {
-    fn new(blocking: Blocking) -> (Self, Arc<Mutex<Log>>) {
+    /// Takes no blocking: every request carries its own contract, so a producer
+    /// cannot be built against a split that disagrees with the dataset.
+    fn new() -> (Self, Arc<Mutex<Log>>) {
         let log = Arc::new(Mutex::new(Log::default()));
         (
             Self {
-                blocking,
                 log: Arc::clone(&log),
                 corrupt: None,
                 fail_at: None,
@@ -62,17 +62,15 @@ impl Ramp {
 }
 
 impl DataProducer for Ramp {
-    fn block_bytes(&self, index: usize, out: &mut Vec<u8>) -> Result<(), MatError> {
-        if self.fail_at == Some(index) {
+    fn block_bytes(&self, block: Block, out: &mut Vec<u8>) -> Result<(), MatError> {
+        if self.fail_at == Some(block.index) {
             return Err(MatError::Custom("the source went away".into()));
         }
-        let first = index as u64 * self.blocking.block_elements;
-        let count = self.blocking.block_len(index) as u64 / 8;
-        for i in 0..count {
-            out.extend_from_slice(&Self::value(first + i).to_le_bytes());
+        for i in 0..block.elements {
+            out.extend_from_slice(&Self::value(block.first_element + i).to_le_bytes());
         }
         match self.corrupt {
-            Some((at, delta)) if at == index => {
+            Some((at, delta)) if at == block.index => {
                 if delta < 0 {
                     out.truncate(out.len() - (-delta) as usize);
                 } else {
@@ -82,7 +80,7 @@ impl DataProducer for Ramp {
             _ => {}
         }
         let mut log = self.log.lock().unwrap();
-        log.calls.push(index);
+        log.calls.push(block.index);
         log.buffers.push(out.as_ptr() as usize);
         log.high_water = log.high_water.max(out.len());
         Ok(())
@@ -267,7 +265,7 @@ fn every_finalizer_delivers_the_same_file() {
     );
 
     let build = || {
-        let (producer, _) = Ramp::new(blocking);
+        let (producer, _) = Ramp::new();
         let mut mb = MatBuilder::new(Options::default());
         mb.write_f64("v", &[1, 3], &[1.0, 2.0, 3.0]).unwrap();
         mb.write_blocks::<f64>("produced", &DIMS, Box::new(producer))
@@ -309,14 +307,12 @@ fn a_produced_dataset_is_byte_identical_to_a_materialized_one() {
     let materialized = mb.finish().unwrap();
 
     let blocking = Blocking::plan::<f64>(&DIMS).unwrap();
-    let (producer, log) = Ramp::new(blocking);
+    let (producer, log) = Ramp::new();
     let mut mb = MatBuilder::new(Options::default());
-    let reported = mb
-        .write_blocks::<f64>("samples", &DIMS, Box::new(producer))
+    mb.write_blocks::<f64>("samples", &DIMS, Box::new(producer))
         .unwrap();
     let produced = mb.finish().unwrap();
 
-    assert_eq!(reported, blocking, "plan must predict what staging chooses");
     assert!(
         blocking.block_count > 1,
         "the fixture must span more than one block, or it proves nothing about blocking"
@@ -335,7 +331,7 @@ fn a_produced_dataset_is_byte_identical_to_a_materialized_one() {
 fn blocks_are_pulled_once_each_in_order_during_the_write() {
     const DIMS: [usize; 2] = [8, 500_000]; // 32 MB of f64
     let blocking = Blocking::plan::<f64>(&DIMS).unwrap();
-    let (producer, log) = Ramp::new(blocking);
+    let (producer, log) = Ramp::new();
 
     let mut mb = MatBuilder::new(Options::default());
     mb.write_blocks::<f64>("samples", &DIMS, Box::new(producer))
@@ -383,8 +379,7 @@ fn produced_elements_read_back_in_order() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("ramp.mat");
 
-    let blocking = Blocking::plan::<f64>(&DIMS).unwrap();
-    let (producer, _) = Ramp::new(blocking);
+    let (producer, _) = Ramp::new();
     let mut mb = MatBuilder::new(Options::default());
     mb.write_blocks::<f64>("ramp", &DIMS, Box::new(producer))
         .unwrap();
@@ -412,7 +407,7 @@ fn a_short_last_block_is_written_short() {
         blocking.last_block_elements < blocking.block_elements,
         "the fixture must actually leave a short tail, or it proves nothing"
     );
-    let (producer, log) = Ramp::new(blocking);
+    let (producer, log) = Ramp::new();
     let mut mb = MatBuilder::new(Options::default());
     mb.write_blocks::<f64>("uneven", &DIMS, Box::new(producer))
         .unwrap();
@@ -435,8 +430,7 @@ fn a_produced_dataset_can_live_inside_a_struct() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("nested.mat");
 
-    let blocking = Blocking::plan::<f64>(&DIMS).unwrap();
-    let (producer, _) = Ramp::new(blocking);
+    let (producer, _) = Ramp::new();
     let mut mb = MatBuilder::new(Options::default());
     mb.struct_("outer", |s| {
         s.write_scalar_i32("tag", 1)?;
@@ -460,7 +454,7 @@ fn a_block_of_the_wrong_size_is_refused() {
     const DIMS: [usize; 2] = [4, 100_000];
     for delta in [-8i64, 8] {
         let blocking = Blocking::plan::<f64>(&DIMS).unwrap();
-        let (mut producer, _) = Ramp::new(blocking);
+        let (mut producer, _) = Ramp::new();
         producer.corrupt = Some((1, delta));
         let mut mb = MatBuilder::new(Options::default());
         mb.write_blocks::<f64>("samples", &DIMS, Box::new(producer))
@@ -487,8 +481,7 @@ fn a_block_of_the_wrong_size_is_refused() {
 #[test]
 fn a_producers_own_error_is_surfaced_verbatim() {
     const DIMS: [usize; 2] = [4, 100_000];
-    let blocking = Blocking::plan::<f64>(&DIMS).unwrap();
-    let (mut producer, _) = Ramp::new(blocking);
+    let (mut producer, _) = Ramp::new();
     producer.fail_at = Some(1);
 
     let mut mb = MatBuilder::new(Options::default());
@@ -510,10 +503,12 @@ fn compression_is_refused_rather_than_ignored() {
         level: 6,
         shuffle: false,
     };
-    let blocking = Blocking::plan::<f64>(&[2, 4]).unwrap();
-    let (producer, _) = Ramp::new(blocking);
+    let (producer, _) = Ramp::new();
     let mut mb = MatBuilder::new(options);
-    match mb.write_blocks::<f64>("x", &[2, 4], Box::new(producer)) {
+    match mb
+        .write_blocks::<f64>("x", &[2, 4], Box::new(producer))
+        .map(|_| ())
+    {
         Err(MatError::CompressionUnsupportedForBlocks) => {}
         other => panic!("expected CompressionUnsupportedForBlocks, got {other:?}"),
     }
@@ -532,15 +527,13 @@ fn an_empty_shape_writes_a_marker_and_asks_for_nothing() {
         mb.finish().unwrap()
     };
 
-    let blocking = Blocking::plan::<f64>(&[0, 0]).unwrap();
-    let (producer, log) = Ramp::new(blocking);
+    let (producer, log) = Ramp::new();
     let mut mb = MatBuilder::new(Options::default());
-    let reported = mb
-        .write_blocks::<f64>("nothing", &[0, 0], Box::new(producer))
+    mb.write_blocks::<f64>("nothing", &[0, 0], Box::new(producer))
         .unwrap();
     mb.write(&path).unwrap();
 
-    assert_eq!(reported.block_count, 0);
+    assert_eq!(Blocking::plan::<f64>(&[0, 0]).unwrap().block_count, 0);
     assert!(log.lock().unwrap().calls.is_empty());
     assert_eq!(
         std::fs::read(&path).unwrap(),
@@ -554,7 +547,7 @@ fn an_empty_shape_writes_a_marker_and_asks_for_nothing() {
 struct Bytes(Vec<u8>);
 
 impl DataProducer for Bytes {
-    fn block_bytes(&self, _index: usize, out: &mut Vec<u8>) -> Result<(), MatError> {
+    fn block_bytes(&self, _block: Block, out: &mut Vec<u8>) -> Result<(), MatError> {
         out.extend_from_slice(&self.0);
         Ok(())
     }
@@ -622,10 +615,9 @@ fn every_element_type_matches_its_materialized_sibling() {
 #[test]
 fn producing_and_streaming_compose() {
     const DIMS: [usize; 2] = [4, 50_000];
-    let blocking = Blocking::plan::<f64>(&DIMS).unwrap();
 
     let buffered = {
-        let (producer, _) = Ramp::new(blocking);
+        let (producer, _) = Ramp::new();
         let mut mb = MatBuilder::new(Options::default());
         mb.write_blocks::<f64>("s", &DIMS, Box::new(producer))
             .unwrap();
@@ -633,7 +625,7 @@ fn producing_and_streaming_compose() {
     };
     let mut streamed = Vec::new();
     {
-        let (producer, _) = Ramp::new(blocking);
+        let (producer, _) = Ramp::new();
         let mut mb = MatBuilder::new(Options::default());
         mb.write_blocks::<f64>("s", &DIMS, Box::new(producer))
             .unwrap();

@@ -773,9 +773,12 @@ impl FileWriter {
         Ok(())
     }
 
-    /// Set the userblock size in bytes. Must be a power of two >= 512 or 0 (no userblock).
-    /// The userblock region will be filled with zeros; the caller can write into
-    /// the returned bytes at `[0..userblock_size]`, or supply them up front with
+    /// Set the userblock size in bytes: zero (no userblock), or a power of two of
+    /// at least 512. Any other size is refused by [`finish`](Self::finish) with
+    /// [`FormatError::InvalidUserblockSize`].
+    ///
+    /// The region will be filled with zeros; the caller can write into the
+    /// returned bytes at `[0..userblock_size]`, or supply them up front with
     /// [`with_userblock_content`](Self::with_userblock_content).
     pub fn with_userblock(&mut self, size: u64) -> &mut Self {
         self.userblock_size = size;
@@ -906,6 +909,19 @@ impl FileWriter {
     /// from its provider one chunk at a time here, never all held at once.
     pub(crate) fn finish_to_sink<S: ByteSink>(self, sink: &mut S) -> Result<(), FormatError> {
         self.check_libver_bounds()?;
+
+        // The userblock's size is what the superblock's base address is, and the
+        // format defines it as zero or a power of two of at least 512 bytes. A
+        // reader scans for the signature at 0, 512, 1024, … doubling, so any
+        // other size hides the superblock somewhere it will never look: the
+        // writer would emit a file that nothing, including this crate, can open.
+        // Refused here rather than at `with_userblock` so a caller who overwrites
+        // an earlier size is judged on the one that actually applies.
+        if self.userblock_size != 0
+            && (self.userblock_size < 512 || !self.userblock_size.is_power_of_two())
+        {
+            return Err(FormatError::InvalidUserblockSize(self.userblock_size));
+        }
 
         // Checked before any layout work: content that overruns its region would
         // otherwise displace the superblock, and the failure would surface as an

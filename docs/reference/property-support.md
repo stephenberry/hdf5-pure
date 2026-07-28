@@ -36,7 +36,7 @@ Set through [`FileBuilder`](../guide/writing.md) before `write` / `finish`, indi
 | `persist` flag | 2nd argument of `with_file_space_strategy` | **Genuine** (paged) / **Recorded** (non-paged) | Paged: per-page-type managers are written from creation. Non-paged: records intent; managers appear after a later delete. |
 | `threshold` | 3rd argument of `with_file_space_strategy` | **Recorded (advisory)** | Round-trips through the C library, but the crate currently tracks every page tail / freed section regardless of it. |
 | `H5Pset_file_space_page_size` | `with_file_space_page_size` | **Genuine** (paged) / **Recorded** (non-paged) | Under `Page` it is the alignment quantum (default 4096; must be a power of two `>= 512`). Under other strategies it is recorded but inert. |
-| `H5Pset_userblock` | `with_userblock` | **Genuine** | Reserves a zero-filled prefix; all addresses are base-relative. The HDF5 "power of two `>= 512`" rule is **not** validated on the non-paged path (a bad size is accepted); under `Page` the userblock must be a whole number of pages or the write is refused. |
+| `H5Pset_userblock` | `with_userblock` | **Genuine** | Reserves a zero-filled prefix; all addresses are base-relative. The HDF5 "zero, or a power of two `>= 512`" rule is validated at write time (`FormatError::InvalidUserblockSize`), since the size *is* the superblock's base address and readers scan only the doubling sequence for the signature. Under `Page` the userblock must additionally be a whole number of pages. Contents come from `FileBuilder::with_userblock_content`, which every output path emits. |
 | `H5Pset_libver_bounds` (fapl) | `with_libver_bounds` | **Assertion** | The writer always emits the v3 (HDF5 1.10) superblock; the bound is an accept/reject check, not a format selector. HDF5 classes this as a *file-access* property; it sits on `FileCreateProperties` because this crate checks the bound at write time. |
 | `H5Pset_fill_value` / `H5Pset_fill_time` (dcpl) | `DatasetBuilder::with_fill_value` | **Genuine** (per dataset) | Encodes the fill value in a v3 Fill Value message; `Dataset::fill_value` reads it back, from this crate's files and the C library's. |
 | `H5Pset_obj_track_times` (ocpl) | none | **Unsupported** | Objects are always written with times untracked (equivalent to `false`); there is no way to enable tracking. |
@@ -82,7 +82,7 @@ Current limits worth knowing:
 
 - **A paged file must persist its free space to be mutated.** Both editors grow a paged `persist = true` file, keeping pages homogeneous and the end of allocation page-aligned; a paged file created **without** `persist = true`, or one carrying a userblock, has no usable record of which pages hold metadata versus raw data and cannot be grown at all — recreate it with `persist = true` and no userblock.
 - **Free space is under-reported, never over-reported.** A final metadata-page tail and the old bytes of a relocated partial chunk are left untracked, so `H5Fget_freespace` can read slightly low. The file stays valid.
-- **`threshold` is advisory** and **the non-paged `userblock` size is not validated** (see the tables above).
+- **`threshold` is advisory** (see the tables above).
 - Only **File Space Info message version 1** is emitted and read.
 
 See [Limitations](limitations.md) for the full catalog of deliberate refusals.

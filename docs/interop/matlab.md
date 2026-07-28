@@ -197,15 +197,16 @@ Writing (`to_bytes`) does not encode non-unit enum variants, MATLAB `classdef` o
 `MatBuilder::write_blocks` stages a dataset whose bytes are produced during the write rather than handed over. It takes a `DataProducer`, which the writer calls once per block, in order, during emission — not during layout, which works from the shape alone. Together they write a `.mat` of any size in about one block of memory:
 
 ```rust
-use hdf5_pure::mat::{Blocking, DataProducer, MatBuilder, MatError, Options};
+use hdf5_pure::mat::{Block, DataProducer, MatBuilder, MatError, Options};
 
-struct Samples { blocking: Blocking }
+// Each request carries its own contract, so the producer holds no state.
+struct Samples;
 
 impl DataProducer for Samples {
-    fn block_bytes(&self, index: usize, out: &mut Vec<u8>) -> Result<(), MatError> {
-        let first = index as u64 * self.blocking.block_elements;
-        for i in 0..self.blocking.block_len(index) as u64 / 8 {
-            out.extend_from_slice(&((first + i) as f64).to_le_bytes());
+    fn block_bytes(&self, block: Block, out: &mut Vec<u8>) -> Result<(), MatError> {
+        for i in 0..block.elements {
+            let value = (block.first_element + i) as f64;
+            out.extend_from_slice(&value.to_le_bytes());
         }
         Ok(())
     }
@@ -213,11 +214,14 @@ impl DataProducer for Samples {
 
 // [channels, samples]: see "element order" below for why this way round.
 let dims = [4, 10_000_000];
-let blocking = Blocking::plan::<f64>(&dims).unwrap();
 let mut mb = MatBuilder::new(Options::default());
-mb.write_blocks::<f64>("samples", &dims, Box::new(Samples { blocking })).unwrap();
+mb.write_blocks::<f64>("samples", &dims, Box::new(Samples)).unwrap();
 mb.write("capture.mat").unwrap();
 ```
+
+A `Block` carries its `index`, the `first_element` it starts at in MATLAB's linear order, and how many `elements` to write (`block.len()` in bytes). Handing that to the producer rather than making it fetch a copy of the split beforehand is deliberate: a producer built against one blocking and staged against a different dataset would otherwise fail only mid-write, with part of the file already on the sink.
+
+`write_blocks` returns `&mut Self` like the other writers, so it chains. `Blocking::plan::<T>(dims)` computes the same split from the shape alone if you want it in advance — to size a buffer, or report progress — but no producer needs it.
 
 The element type names the MATLAB class: `write_blocks::<i16>` writes an `int16` array, `write_blocks::<(i16, i16)>` a complex one, `write_blocks::<bool>` a `logical`. The dataset is byte-for-byte the one `write_f64` would have produced for the same content, so a file written this way is reviewable against fixtures built the ordinary way.
 

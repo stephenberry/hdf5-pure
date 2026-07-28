@@ -2,8 +2,8 @@
 //! (`fcpl`) as a reusable creation-property value (issues #204, #205).
 
 use hdf5_pure::{
-    ChunkCacheConfig, File, FileAccessProperties, FileBuilder, FileCreateProperties, FileLocking,
-    FileSpaceStrategy, LibVer, MemoryStrategy, MetadataCacheConfig,
+    ChunkCacheConfig, Error, File, FileAccessProperties, FileBuilder, FileCreateProperties,
+    FileLocking, FileSpaceStrategy, FormatError, LibVer, MemoryStrategy, MetadataCacheConfig,
 };
 use tempfile::tempdir;
 
@@ -245,20 +245,36 @@ fn invalid_creation_property_is_reported_at_write_time() {
     );
 }
 
-/// Pins the documented gap that a non-paged userblock size is **not** validated
-/// against HDF5's power-of-two rule (see `docs/reference/property-support.md`).
-/// Recorded so tightening it later is a deliberate change with a failing test,
-/// not a silent one.
+/// A userblock size HDF5 does not define is refused, on the non-paged path too.
+///
+/// This used to be a recorded gap: any size was accepted, and the writer emitted
+/// a file whose superblock nothing could find, because a reader scans only the
+/// doubling sequence 0, 512, 1024, … for the signature. The property is that the
+/// refusal happens through `FileCreateProperties`, not only through
+/// `FileBuilder::with_userblock` directly.
 #[test]
-fn non_paged_userblock_size_is_currently_unvalidated() {
+fn a_non_paged_userblock_size_must_be_a_power_of_two() {
     let mut b = FileBuilder::new();
     b.with_create_properties(FileCreateProperties::new().with_userblock(700));
     b.create_dataset("d").with_f64_data(&[1.0]);
-    assert!(
-        b.finish().is_ok(),
-        "700 is not a power of two; if this now fails, the writer gained the \
-         validation and the property-support reference needs updating"
+    match b.finish() {
+        Err(Error::Format(FormatError::InvalidUserblockSize(size))) => assert_eq!(size, 700),
+        other => panic!("700 is not a power of two and must be refused, got {other:?}"),
+    }
+
+    // The property list records what it was given; the refusal is the writer's,
+    // so a caller can still build and pass around a properties value.
+    assert_eq!(
+        FileCreateProperties::new().with_userblock(700).userblock(),
+        700
     );
+
+    // A legal size still writes, and still reopens.
+    let mut b = FileBuilder::new();
+    b.with_create_properties(FileCreateProperties::new().with_userblock(1024));
+    b.create_dataset("d").with_f64_data(&[1.0]);
+    let bytes = b.finish().expect("1024 is a power of two >= 512");
+    assert_eq!(&bytes[1024..1028], b"\x89HDF");
 }
 
 /// The 0.25.0 spellings still resolve, to the very same types, for one

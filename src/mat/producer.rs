@@ -53,6 +53,51 @@ use std::sync::{Arc, Mutex};
 /// rather than a split that would cut an element in half.
 const TARGET_BLOCK_BYTES: u64 = 1 << 20;
 
+/// One block the writer is asking for: everything a producer needs to fill it,
+/// handed over rather than looked up.
+///
+/// The contract travels with the request on purpose. A producer that had to
+/// fetch its own copy of the blocking beforehand could fetch one that disagrees
+/// with the dataset it is later staged against — a mismatch nothing would catch
+/// until the write was already partly on the sink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Block {
+    /// Which block this is. Blocks are requested in ascending order, once each,
+    /// starting at zero.
+    pub index: usize,
+    /// Index of this block's first element in MATLAB's linear element order, so
+    /// a producer computing values from position does not have to track how far
+    /// it has come.
+    pub first_element: u64,
+    /// Elements this block carries. The final block may carry fewer than the
+    /// others; every other block is the same size.
+    pub elements: u64,
+    /// Bytes one element occupies. A complex element counts both components.
+    pub element_size: usize,
+}
+
+impl Block {
+    /// Bytes the producer must write for this block: `elements * element_size`.
+    pub fn len(&self) -> usize {
+        // Every planned block fits `usize` — checked when the blocking is built.
+        // `Block` is `#[non_exhaustive]` with public fields, so a caller can still
+        // copy one and rewrite them; saturating means no producer can satisfy the
+        // result and the write fails as a size mismatch rather than on a number
+        // that quietly wrapped.
+        usize::try_from(self.elements)
+            .ok()
+            .and_then(|n| n.checked_mul(self.element_size))
+            .unwrap_or(usize::MAX)
+    }
+
+    /// Whether this block carries no elements at all. Only an empty dataset
+    /// produces one, and an empty dataset is never asked for a block.
+    pub fn is_empty(&self) -> bool {
+        self.elements == 0
+    }
+}
+
 /// Yields a dataset's raw, uncompressed element bytes on demand, one block at a
 /// time.
 ///
@@ -64,22 +109,23 @@ const TARGET_BLOCK_BYTES: u64 = 1 << 20;
 /// `Send + Sync` is required because a staged producer is owned by the builder,
 /// and the builder would otherwise lose those auto-traits.
 pub trait DataProducer: Send + Sync {
-    /// Append block `index`'s raw little-endian element bytes to `out`, in
-    /// MATLAB's linear element order (see the [module docs](self)).
+    /// Append `block`'s raw little-endian element bytes to `out`, in MATLAB's
+    /// linear element order (see the [module docs](self)).
     ///
     /// `out` is handed over empty and is the same buffer on every call, so it
-    /// costs one buffer for the whole dataset rather than one per block. Write exactly
-    /// [`Blocking::block_len`] bytes for this index; any other count is refused
-    /// with [`MatError::BlockSizeMismatch`] rather than written, because a block
-    /// of the wrong size shifts every address after it.
-    fn block_bytes(&self, index: usize, out: &mut Vec<u8>) -> Result<(), MatError>;
+    /// costs one buffer for the whole dataset rather than one per block. Write
+    /// exactly [`Block::len`] bytes; any other count is refused with
+    /// [`MatError::BlockSizeMismatch`] rather than written, because a block of
+    /// the wrong size shifts every address after it.
+    fn block_bytes(&self, block: Block, out: &mut Vec<u8>) -> Result<(), MatError>;
 }
 
 /// How a producer-backed dataset was split for the write pass.
 ///
-/// Returned by [`MatBuilder::write_blocks`](crate::mat::MatBuilder::write_blocks)
-/// and computable in advance with [`Blocking::plan`], so a producer can be built
-/// against the same blocking the writer will use.
+/// [`MatBuilder::write_blocks`](crate::mat::MatBuilder::write_blocks) chooses this
+/// and hands each [`Block`] to the producer, so a caller needs it only to size a
+/// buffer or report progress. [`Blocking::plan`] computes it from a shape alone,
+/// ahead of staging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Blocking {
@@ -97,11 +143,12 @@ pub struct Blocking {
 }
 
 impl Blocking {
-    /// Bytes the producer must write for block `index`.
+    /// The block at `index`, as the producer will be handed it.
     ///
     /// Every block but the last is the same size; the last is whatever remains.
-    /// Out-of-range indices report zero, since the writer never asks for them.
-    pub fn block_len(&self, index: usize) -> usize {
+    /// An out-of-range index reports an empty block, since the writer never asks
+    /// for one.
+    pub fn block(&self, index: usize) -> Block {
         // Ordered so an out-of-range index leaves before any arithmetic: `index`
         // is caller-supplied, and `index + 1` overflows at `usize::MAX`.
         let elements = if index >= self.block_count {
@@ -111,15 +158,17 @@ impl Blocking {
         } else {
             self.block_elements
         };
-        // A planned block fits `usize` — that is checked when the blocking is
-        // built. The fields are public, though, so a caller can hand back a
-        // modified copy; reporting `usize::MAX` for one no host could hold means
-        // no producer can satisfy it, and the write fails as a size mismatch
-        // rather than on a number that quietly wrapped.
-        usize::try_from(elements)
-            .ok()
-            .and_then(|n| n.checked_mul(self.element_size))
-            .unwrap_or(usize::MAX)
+        Block {
+            index,
+            first_element: self.block_elements.saturating_mul(index as u64),
+            elements,
+            element_size: self.element_size,
+        }
+    }
+
+    /// Bytes the producer must write for block `index`.
+    pub fn block_len(&self, index: usize) -> usize {
+        self.block(index).len()
     }
 
     /// Total bytes the dataset's elements occupy.
@@ -246,8 +295,9 @@ impl ProducerChunks {
 
 impl ChunkProvider for ProducerChunks {
     fn chunk_bytes(&self, index: usize, out: &mut Vec<u8>) -> Result<(), FormatError> {
-        let expected = self.blocking.block_len(index);
-        if let Err(e) = self.producer.block_bytes(index, out) {
+        let block = self.blocking.block(index);
+        let expected = block.len();
+        if let Err(e) = self.producer.block_bytes(block, out) {
             return Err(self.fail(e));
         }
         if out.len() != expected {
@@ -435,6 +485,36 @@ mod tests {
         assert_auto_traits::<crate::mat::MatBuilder>();
     }
 
+    /// Each block hands the producer a start and a length that together tile the
+    /// dataset exactly: block `i` begins where block `i - 1` ended, and the last
+    /// one ends at the final element. A producer relies on this to generate
+    /// values from position without tracking how far it has come.
+    #[test]
+    fn the_blocks_tile_the_dataset_without_gap_or_overlap() {
+        let b = plan_blocking(3_000_000, 8).unwrap();
+        let mut expected_start = 0u64;
+        for i in 0..b.block_count {
+            let block = b.block(i);
+            assert_eq!(block.index, i);
+            assert_eq!(
+                block.first_element,
+                expected_start,
+                "block {i} must start where block {} ended",
+                i.wrapping_sub(1)
+            );
+            assert!(!block.is_empty());
+            assert_eq!(block.len(), block.elements as usize * 8);
+            expected_start += block.elements;
+        }
+        assert_eq!(
+            expected_start, 3_000_000,
+            "the blocks together must be the whole dataset"
+        );
+        // Past the end there is nothing to write, and nowhere to write it.
+        assert!(b.block(b.block_count).is_empty());
+        assert_eq!(b.block(b.block_count).len(), 0);
+    }
+
     /// The fields are public, so a caller can copy a `Blocking` and rewrite them.
     /// Nothing they can write may panic these two: an out-of-range index is
     /// documented to report zero, and a forged size reports a saturated total
@@ -444,6 +524,8 @@ mod tests {
         let planned = plan_blocking(10, 8).unwrap();
         assert_eq!(planned.block_len(usize::MAX), 0);
         assert_eq!(planned.block_len(planned.block_count), 0);
+        // Including the `first_element` a wild index would imply.
+        assert!(planned.block(usize::MAX).is_empty());
 
         let mut forged = planned;
         forged.block_count = 3;

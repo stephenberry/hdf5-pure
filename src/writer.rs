@@ -84,8 +84,15 @@ impl FileBuilder {
         self.with_create_properties(properties)
     }
 
-    /// Set the userblock size in bytes. Must be a power of two >= 512 or 0 (no userblock).
-    /// The userblock region is filled with zeros.
+    /// Set the userblock size in bytes: zero (no userblock), or a power of two of
+    /// at least 512. The region is filled with zeros.
+    ///
+    /// Any other size is refused by [`finish`](Self::finish) /
+    /// [`finish_to`](Self::finish_to) / [`write`](Self::write) with
+    /// [`FormatError::InvalidUserblockSize`](crate::FormatError::InvalidUserblockSize).
+    /// The size *is* the superblock's base address, and a reader scans for the
+    /// signature at 0, 512, 1024, and so on doubling — so an unaligned size would
+    /// hide the superblock where nothing looks for it.
     ///
     /// To put something in it, prefer
     /// [`with_userblock_content`](Self::with_userblock_content), which works on
@@ -869,6 +876,48 @@ mod streaming_tests {
                 }
                 other => panic!("expected a refusal for a short block {short}, got {other:?}"),
             }
+        }
+    }
+
+    /// A userblock size the format does not define is refused rather than
+    /// written.
+    ///
+    /// The size is the superblock's base address, and readers scan the doubling
+    /// sequence 0, 512, 1024, … for the signature. An unaligned size therefore
+    /// produced a file that this crate itself could not reopen — silently, since
+    /// nothing checked. Sizing the region to a wrapper format's header, which is
+    /// exactly what `with_userblock_content` invites, is how a caller reaches it.
+    #[test]
+    fn a_userblock_size_the_format_does_not_define_is_refused() {
+        for size in [1u64, 511, 600, 1000, 1536] {
+            let mut b = FileBuilder::new();
+            b.with_userblock(size);
+            b.create_dataset("x").with_f64_data(&[1.0]);
+            match b.finish() {
+                Err(Error::Format(FormatError::InvalidUserblockSize(reported))) => {
+                    assert_eq!(reported, size);
+                }
+                other => panic!("expected {size} to be refused, got {other:?}"),
+            }
+        }
+
+        // The sizes the format does define still work, and the file reopens —
+        // which is the property the refusal above exists to protect.
+        for size in [0u64, 512, 1024, 2048, 4096] {
+            let mut b = FileBuilder::new();
+            b.with_userblock(size);
+            b.create_dataset("x").with_f64_data(&[1.0, 2.0]);
+            let bytes = b.finish().expect("a valid userblock size");
+            assert_eq!(
+                &bytes[size as usize..size as usize + 4],
+                b"\x89HDF",
+                "the superblock begins exactly where the userblock ends"
+            );
+            assert_eq!(
+                read_back_f64(&bytes, "x"),
+                vec![1.0, 2.0],
+                "a file with a {size}-byte userblock must reopen"
+            );
         }
     }
 

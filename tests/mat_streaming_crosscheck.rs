@@ -12,14 +12,12 @@
 //! Every call here goes through the safe `hdf5-metno` API, which serializes its
 //! own C calls through an internal lock, so these tests need no extra guard.
 
-use hdf5_pure::mat::{Blocking, DataProducer, MatBuilder, MatError, Options};
+use hdf5_pure::mat::{Block, Blocking, DataProducer, MatBuilder, MatError, Options};
 use tempfile::tempdir;
 
 /// Generates `f64` elements from their linear index, so a multi-block dataset
 /// costs nothing to produce and its expected values are computable.
-struct Ramp {
-    blocking: Blocking,
-}
+struct Ramp;
 
 impl Ramp {
     fn value(i: u64) -> f64 {
@@ -28,11 +26,9 @@ impl Ramp {
 }
 
 impl DataProducer for Ramp {
-    fn block_bytes(&self, index: usize, out: &mut Vec<u8>) -> Result<(), MatError> {
-        let first = index as u64 * self.blocking.block_elements;
-        let count = self.blocking.block_len(index) as u64 / 8;
-        for i in 0..count {
-            out.extend_from_slice(&Self::value(first + i).to_le_bytes());
+    fn block_bytes(&self, block: Block, out: &mut Vec<u8>) -> Result<(), MatError> {
+        for i in 0..block.elements {
+            out.extend_from_slice(&Self::value(block.first_element + i).to_le_bytes());
         }
         Ok(())
     }
@@ -53,7 +49,7 @@ fn c_reads_a_produced_dataset_streamed_to_disk() {
     assert!(blocking.last_block_elements < blocking.block_elements);
 
     let mut mb = MatBuilder::new(Options::default());
-    mb.write_blocks::<f64>("samples", &DIMS, Box::new(Ramp { blocking }))
+    mb.write_blocks::<f64>("samples", &DIMS, Box::new(Ramp))
         .unwrap();
     mb.write_f64("meta", &[1, 2], &[1.0, 2.0]).unwrap();
     mb.write(&path).unwrap();

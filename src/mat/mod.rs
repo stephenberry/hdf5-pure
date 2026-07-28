@@ -89,7 +89,7 @@ pub use options::{
     Compression, EmptyMarkerEncoding, InvalidNamePolicy, NullPolicy, OneDimensionalMode, Options,
     RowMajorPolicy, StringClass, UnsupportedPolicy,
 };
-pub use producer::{BlockElement, Blocking, DataProducer};
+pub use producer::{Block, BlockElement, Blocking, DataProducer};
 
 #[cfg(feature = "serde")]
 pub use complex::{

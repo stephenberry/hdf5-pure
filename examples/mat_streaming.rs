@@ -19,7 +19,7 @@
 //! ```
 
 use hdf5_pure::File;
-use hdf5_pure::mat::{Blocking, DataProducer, MatBuilder, MatError, Options};
+use hdf5_pure::mat::{Block, Blocking, DataProducer, MatBuilder, MatError, Options};
 use std::sync::{Arc, Mutex};
 
 /// Stands in for an acquisition: yields interleaved channel samples computed
@@ -29,7 +29,6 @@ use std::sync::{Arc, Mutex};
 /// The only contract is that block `i` continues where block `i - 1` stopped, and
 /// that it writes exactly [`Blocking::block_len`] bytes.
 struct Acquisition {
-    blocking: Blocking,
     channels: u64,
     /// Records what the writer asked for, so `main` can show the call pattern.
     calls: Arc<Mutex<Vec<usize>>>,
@@ -43,17 +42,15 @@ impl Acquisition {
 }
 
 impl DataProducer for Acquisition {
-    fn block_bytes(&self, index: usize, out: &mut Vec<u8>) -> Result<(), MatError> {
-        self.calls.lock().expect("not poisoned").push(index);
+    fn block_bytes(&self, block: Block, out: &mut Vec<u8>) -> Result<(), MatError> {
+        self.calls.lock().expect("not poisoned").push(block.index);
 
-        // Where this block starts in the dataset's linear element order. Because
-        // the shape is `[channels, samples]`, that order is channel-interleaved
-        // and runs forward through time.
-        let first = index as u64 * self.blocking.block_elements;
-        let count = self.blocking.block_len(index) as u64 / 8;
-
-        for i in 0..count {
-            let element = first + i;
+        // The block says where it starts and how much to write, so this producer
+        // holds no position of its own. Because the shape is
+        // `[channels, samples]`, that linear order is channel-interleaved and
+        // runs forward through time.
+        for i in 0..block.elements {
+            let element = block.first_element + i;
             let value = Self::sample(element % self.channels, element / self.channels);
             out.extend_from_slice(&value.to_le_bytes());
         }
@@ -89,21 +86,19 @@ fn main() {
     // ---- Stage the dataset, then stream the file to disk -----------------
     let calls = Arc::new(Mutex::new(Vec::new()));
     let mut mb = MatBuilder::new(Options::default());
-    let reported = mb
-        .write_blocks::<f64>(
-            "samples",
-            &dims,
-            Box::new(Acquisition {
-                blocking,
-                channels: CHANNELS as u64,
-                calls: Arc::clone(&calls),
-            }),
-        )
-        .expect("staging a produced dataset");
-    assert_eq!(reported, blocking, "plan predicts what staging chooses");
-
-    // Ordinary writers still work alongside it; only this one dataset is lazy.
-    mb.write_char("units", "volts").expect("a char array");
+    mb.write_blocks::<f64>(
+        "samples",
+        &dims,
+        Box::new(Acquisition {
+            channels: CHANNELS as u64,
+            calls: Arc::clone(&calls),
+        }),
+    )
+    .expect("staging a produced dataset")
+    // Ordinary writers still work alongside it, and chain with it; only this one
+    // dataset is lazy.
+    .write_char("units", "volts")
+    .expect("a char array");
 
     assert!(
         calls.lock().expect("not poisoned").is_empty(),
@@ -178,15 +173,16 @@ fn main() {
         shuffle: false,
     };
     let mut mb = MatBuilder::new(options);
-    let refused = mb.write_blocks::<f64>(
-        "x",
-        &[1, 4],
-        Box::new(Acquisition {
-            blocking: Blocking::plan::<f64>(&[1, 4]).expect("a plannable shape"),
-            channels: 1,
-            calls: Arc::new(Mutex::new(Vec::new())),
-        }),
-    );
+    let refused = mb
+        .write_blocks::<f64>(
+            "x",
+            &[1, 4],
+            Box::new(Acquisition {
+                channels: 1,
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }),
+        )
+        .map(|_| ());
     match refused {
         Err(MatError::CompressionUnsupportedForBlocks) => {
             println!("compression refused up front, as documented");
