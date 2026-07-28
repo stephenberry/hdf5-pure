@@ -395,8 +395,8 @@ fn deleting_paged_fixed_array_dataset_reclaims_storage() {
             "deleting a paged fixed-array dataset should reclaim its storage \
              (was {size_with_paged}, now {size_after_delete})"
         );
-        // Cache-line-aligned chunks + the index form a trailing run, so the file
-        // truncates back near its start.
+        // The chunks and the index form one trailing run, so the file truncates
+        // back near its start.
         assert!(size_after_delete < size_start + 4096);
     }
 

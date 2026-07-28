@@ -23,6 +23,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `mat::to_file` and `mat::to_file_with_options` stream to disk rather than building the whole file in memory first. Same bytes ([#226](https://github.com/stephenberry/hdf5-pure/pull/226)).
 - Chunks are written back to back instead of padded to the host's cache line, so a chunked dataset no longer occupies more space on `aarch64` than on `x86_64` and a given input produces the same bytes on every target. Files written by earlier versions still read ([#227](https://github.com/stephenberry/hdf5-pure/issues/227)).
 
+### Fixed
+
+- `Matrix::from_row_major` now panics when `rows * cols` overflows `usize` instead of accepting a shape whose wrapped product matched a short data vector, which let the MATLAB writer's transpose write past its allocation. The serde path refuses the same shape with an error ([#227](https://github.com/stephenberry/hdf5-pure/issues/227)).
+
 ## [0.28.0] - 2026-07-28
 
 `File::open_rw` picks its own backing. A latest-format file with no userblock is edited in bounded memory rather than through a whole-file mirror, and the mirror is now the fallback for the files the bounded engine cannot edit rather than the default for everything. Nothing about a file's space strategy decides which open a caller reaches for any more, so `File::open_rw_bounded` is deprecated: it survives only as the strict default, now expressible as `MemoryStrategy::Bounded` on `FileAccessProperties`, and `File::edit_backing` reports which backend an open actually resolved to. Two guarantees that used to be silently ignored are refused before any work happens: the SWMR writer will not accept a `Bounded` it cannot honor, and `File::create_with_options` checks a creation/access pair up front rather than leaving a file on disk and returning the reopen's error.

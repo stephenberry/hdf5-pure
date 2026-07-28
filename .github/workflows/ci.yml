@@ -303,16 +303,27 @@ jobs:
           key: miri
       - name: Miri test (mat::transpose unsafe)
         # `--no-default-features --features std,serde` keeps the interpreted
-        # build minimal: `serde` is what gates the `mat` module, and the
-        # transpose tests are pure in-memory, so there is no need to compile the
-        # `deflate` (flate2/miniz_oxide) or `checksum` code that Miri never
-        # executes. Smaller, more deterministic surface.
+        # build minimal: `std` gates the `mat` module and `serde` gates
+        # `transpose` within it, and the transpose tests are pure in-memory, so
+        # there is no need to compile the `deflate` (flate2/miniz_oxide) or
+        # `checksum` code that Miri never executes.
         #
-        # A filter that matches nothing makes libtest exit 0, which is how this
-        # job came to guard a module holding no unsafe at all. Fail loudly on an
-        # empty run so a rename cannot quietly hollow the gate out again.
+        # Two ways this gate can go hollow, both of which have to fail loudly:
+        #
+        #   1. The filter stops matching. libtest exits 0 when a filter selects
+        #      nothing, so a rename would leave the job green having interpreted
+        #      nothing at all.
+        #   2. The unsafe leaves the module while the tests stay. This is what
+        #      actually happened before: #113 deleted the unsafe from
+        #      `chunk_cache`, the job kept running that module's 11 safe tests,
+        #      and it stayed green and vacuous for many releases. A count check
+        #      alone would not have caught it.
         run: |
           set -o pipefail
+          if ! grep -q 'unsafe' src/mat/transpose.rs; then
+            echo "::error::src/mat/transpose.rs holds no unsafe; point this job at the code that does."
+            exit 1
+          fi
           cargo miri test --locked --no-default-features --features std,serde \
             --lib mat::transpose 2>&1 | tee miri.log
           if grep -q "running 0 tests" miri.log; then

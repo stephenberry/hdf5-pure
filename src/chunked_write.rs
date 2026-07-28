@@ -1555,6 +1555,9 @@ pub(crate) fn assemble_chunked_at(
             has_filters,
             ea_address,
         )?;
+        // The chunk loop filled `data_buf` to exactly its reserved capacity, so
+        // extending would otherwise double the whole buffer and copy it.
+        data_buf.reserve_exact(ea_bytes.len());
         data_buf.extend_from_slice(&ea_bytes);
 
         serialize_v4_extensible_array(chunk_dims_u32, ea_address, offset_size, element_size as u32)
@@ -1584,6 +1587,8 @@ pub(crate) fn assemble_chunked_at(
             has_filters,
             fa_address,
         );
+        // As above: reserve the index exactly rather than let the buffer double.
+        data_buf.reserve_exact(fa_bytes.len());
         data_buf.extend_from_slice(&fa_bytes);
 
         serialize_v4_fixed_array(
@@ -2071,10 +2076,10 @@ mod tests {
         assert_eq!(result, values);
     }
 
-    /// Chunks are stored back to back, with no padding between them. The chunk
-    /// size here (7 f64 = 56 bytes) is deliberately not a multiple of any cache
-    /// line, so any alignment padding would push the second and third chunks off
-    /// the concatenation this asserts.
+    /// Chunks are stored back to back, and the index begins where the last
+    /// chunk ends. The chunk size here (7 f64 = 56 bytes) is deliberately not a
+    /// multiple of any cache line, so padding at *either* site — between chunks
+    /// or before the index — would move bytes this pins.
     #[test]
     fn chunks_are_stored_back_to_back() {
         let values: Vec<f64> = (0..21).map(|i| i as f64).collect();
@@ -2088,11 +2093,19 @@ mod tests {
         let result = build_chunked_data_at_ext(&raw, &[21], ctx, &options, 0x1000, None).unwrap();
 
         // Unfiltered chunks are stored verbatim, so the data region opens with
-        // the raw bytes in order and the index follows immediately after.
+        // the raw bytes in order.
         assert_eq!(
             &result.data_bytes[..raw.len()],
             &raw[..],
             "the three chunks must concatenate with nothing between them"
+        );
+        // And the Fixed Array header starts in the very next byte. Asserting the
+        // signature's position, rather than only the chunk prefix, is what keeps
+        // padding from creeping back in ahead of the index.
+        assert_eq!(
+            &result.data_bytes[raw.len()..raw.len() + 4],
+            b"FAHD",
+            "the chunk index must begin where the last chunk ends"
         );
     }
 
@@ -2123,6 +2136,17 @@ mod tests {
             .map(|s| s.compressed_size)
             .collect();
         assert_eq!(planned, vec![37, 111, 5]);
+    }
+
+    /// A chunk-less plan has no first chunk to anchor the index against, so it
+    /// is refused rather than planned as an empty region.
+    #[test]
+    fn a_verbatim_plan_with_no_chunks_is_refused() {
+        let result = plan_chunked_data_verbatim(&[], &[7], 8, 56, None, 0x1000, None);
+        assert!(
+            matches!(result, Err(FormatError::ChunkedReadError(_))),
+            "a chunk-less plan must be refused"
+        );
     }
 
     #[test]

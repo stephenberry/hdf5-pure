@@ -163,16 +163,19 @@ pub struct Matrix<T> {
 impl<T> Matrix<T> {
     /// Build a `Matrix` from a row-major data vector.
     ///
-    /// Panics if `data.len() != rows * cols`.
+    /// Panics if `rows * cols` overflows `usize`, or if `data.len()` does not
+    /// equal it. The overflow is checked separately because a wrapping product
+    /// can equal a short `data.len()`, and the writer transposes this matrix
+    /// through a raw pointer sized from that product.
     pub fn from_row_major(rows: usize, cols: usize, data: Vec<T>) -> Self {
+        let total = rows
+            .checked_mul(cols)
+            .expect("Matrix::from_row_major: rows * cols overflows usize");
         assert_eq!(
             data.len(),
-            rows * cols,
-            "Matrix::from_row_major: data length {} does not match {}×{} = {}",
+            total,
+            "Matrix::from_row_major: data length {} does not match {rows}×{cols} = {total}",
             data.len(),
-            rows,
-            cols,
-            rows * cols
         );
         Self { rows, cols, data }
     }

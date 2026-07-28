@@ -571,7 +571,15 @@ fn matrix_from_fields(fields: MatrixFields, kind: MatrixKind) -> Result<MatValue
     let data = fields
         .data
         .ok_or_else(|| MatError::MissingField("data".into()))?;
-    let total = rows * cols;
+    // `rows` and `cols` arrive from the serialized input, so the product can
+    // overflow. Refuse it here: a wrapped total would agree with a short data
+    // vector and let the pair through to a writer that transposes through a raw
+    // pointer sized from that same product.
+    let total = rows.checked_mul(cols).ok_or_else(|| {
+        MatError::Custom(format!(
+            "Matrix dimensions {rows}x{cols} overflow the address space"
+        ))
+    })?;
     let length_check = |actual: usize| -> Result<(), MatError> {
         if actual != total {
             return Err(MatError::Custom(format!(

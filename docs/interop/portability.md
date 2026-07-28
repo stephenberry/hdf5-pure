@@ -118,13 +118,19 @@ discipline backs the optional [ZFP filter](../guide/compression.md)
 
 ### Host-independent output
 
-The bytes a write produces are a function of the data and the options alone.
-Nothing about the machine doing the writing — its architecture, pointer width,
-or cache-line size — reaches the file, so the same input yields the same file on
-every target, and a file does not grow when written on one platform rather than
-another. Chunks in particular are stored back to back; if your workload wants
-cache-line-aligned buffers, align the destination memory you read into rather
-than looking for it in the file.
+No property of the machine doing the writing — its architecture, pointer width,
+or cache-line size — reaches the file. The same input written on `aarch64` and
+on `x86_64` produces the same bytes, and a file does not grow because of the
+platform that wrote it. Chunks in particular are stored back to back, with no
+alignment padding; a workload that needs cache-line-aligned data should align
+its own buffers, since the file carries no padding to inherit.
+
+This is a claim about the *host*, not a general determinism guarantee. Output
+still depends on the order the data is handed over: serializing a `.mat` from a
+`HashMap` writes its fields in that map's iteration order, which the standard
+library randomizes per map, so two equal `HashMap`s can produce different files
+on one machine in one run. Use a `BTreeMap`, or a struct, when the field order
+has to be stable.
 
 ### 32-bit safety
 
@@ -137,8 +143,10 @@ with `File::open_streaming` (see [streaming](../guide/streaming.md)) instead of
 
 ### Memory safety
 
-The crate is almost entirely safe Rust. The only non-trivial `unsafe` is the
-tiled row-major/column-major transpose used by the MATLAB writer, and it is
-exercised under Miri with strict provenance in CI. The
-[architecture page](../about/architecture.md) covers the safety and robustness
-guarantees in more detail.
+The crate is almost entirely safe Rust. In a `std` build the only non-trivial
+`unsafe` is the tiled row-major/column-major transpose used by the MATLAB
+writer, and it is exercised under Miri with strict provenance in CI. A
+`no_std` build adds one more: the single-threaded `Mutex` above, whose
+`Send`/`Sync` rest on the target being single-threaded rather than on a lock.
+The [architecture page](../about/architecture.md) covers the safety and
+robustness guarantees in more detail.
