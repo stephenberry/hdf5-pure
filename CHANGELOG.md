@@ -15,7 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **Breaking:** `FormatError::TooManyDenseAttributes` and `FormatError::TooManyHugeDenseAttributes` are removed along with the 61,680- and 43,690-attribute limits that produced them ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
 - **Breaking:** `FormatError::DenseAttributeHeapTooLarge` now carries only `limit`, and bounds the heap's 40-bit address space rather than a single 2 GiB direct block ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
-- A dense attribute set of more than 29 attributes, or more than about 490 bytes in total, has different bytes: its name index is a tree of 512-byte nodes, and its attributes sit in a doubling table rather than one power-of-two-sized block ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
+- Every dense attribute set has different bytes: its name index is a tree of 512-byte nodes, and its attributes sit in a doubling table whose blocks start at 1 KiB and grow by adding blocks rather than by rounding one up to a power of two. Files written by earlier versions still read ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
 
 ## [0.28.0] - 2026-07-28
 

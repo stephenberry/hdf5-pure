@@ -26,7 +26,7 @@ use crate::error::{FormatError, OBJECT_HEADER_MESSAGE_MAX};
 use crate::file_space_info::{
     DEFAULT_PAGE_SIZE, DEFAULT_THRESHOLD, FileSpaceInfo, FileSpaceStrategy, NUM_FILE_FSM_MANAGERS,
 };
-use crate::fractal_heap_write::{self, ManagedPlan};
+use crate::fractal_heap_write::{self, ManagedPlan, PlanRefusal};
 use crate::free_space_manager::{
     FreeSection, SECT_CLASS_LARGE, SECT_CLASS_SMALL, fshd_len, fsse_len, serialize_file_fsm,
 };
@@ -295,14 +295,19 @@ pub(crate) fn dense_attrs_check(attrs: &[AttributeMessage]) -> Result<(), Format
     }
     // The bound is checked by planning the very layout `build_dense_attrs` goes
     // on to emit, so the validated shape and the emitted shape cannot drift
-    // apart. Reaching the refusal takes about a terabyte of attributes on one
-    // object, which is why nothing exercises it directly.
-    if ManagedPlan::new(&managed, OFFSET_SIZE).is_none() {
-        return Err(FormatError::DenseAttributeHeapTooLarge {
+    // apart. Reaching either refusal takes about a terabyte of attributes on one
+    // object, which is why nothing exercises them end to end; the boundary each
+    // draws is tested where it is computed.
+    match ManagedPlan::new(&managed, OFFSET_SIZE) {
+        Ok(_) => Ok(()),
+        Err(PlanRefusal::HeapSpace) => Err(FormatError::DenseAttributeHeapTooLarge {
             limit: fractal_heap_write::MAX_HEAP_SPACE,
-        });
+        }),
+        Err(PlanRefusal::Host { bytes }) => Err(FormatError::ValueTooLargeForPlatform {
+            value: bytes,
+            target: "usize",
+        }),
     }
-    Ok(())
 }
 
 /// Build dense attribute storage for a set of attributes.
@@ -541,8 +546,13 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     debug_assert_eq!(managed_blocks.len() as u64, managed_plan.region_size());
 
     // Build B-tree v2 type 8 records (17 bytes each), sorted into the order the
-    // index is searched in: by name hash, and by creation order where two names
-    // hash alike.
+    // index is searched in: by name hash, and by the name itself where two names
+    // hash alike. The tie-break has to be the name because that is what the
+    // reference C library compares on a hash collision — `H5A__dense_fh_name_cmp`
+    // does `strcmp` against the name pulled back out of the heap — and a binary
+    // search ordered any other way walks away from a colliding record. Rust's
+    // `str` ordering is byte-wise over unsigned bytes, which is what `strcmp`
+    // specifies, so the two agree for non-ASCII names as well.
     let record_size: u16 = heap_id_length + 1 + 4 + 4;
     debug_assert_eq!(record_size, DENSE_ATTR_BTREE_RECORD);
     #[expect(
@@ -552,7 +562,10 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     let mut order: Vec<(u32, u32)> = (0..attrs.len())
         .map(|i| (name_hashes[i], i as u32))
         .collect();
-    order.sort_unstable();
+    order.sort_unstable_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| attrs[a.1 as usize].name.cmp(&attrs[b.1 as usize].name))
+    });
 
     let mut name_records = Vec::with_capacity(attrs.len() * record_size as usize);
     for &(hash, i) in &order {

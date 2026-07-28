@@ -16,7 +16,7 @@ use hdf5_pure::{AttrValue, Error, File, FileBuilder, FormatError};
 mod common;
 use common::heap::{
     has_fractal_heap, huge_object_bytes, huge_object_count, indirect_block_count,
-    managed_object_count, root_indirect_rows,
+    managed_object_count, name_index_leaf_records, root_indirect_rows,
 };
 
 /// Nine attributes, the first sized to `payload` bytes of text and the rest
@@ -390,4 +390,65 @@ fn group_and_dataset_attributes_use_huge_storage_too() {
     assert_eq!(huge_object_count(&bytes), 1);
     let file = File::from_bytes(bytes).unwrap();
     assert_eq!(file.dataset("x").unwrap().attrs().unwrap().len(), 9);
+}
+
+/// Two attribute names whose hashes collide must be indexed in the order the
+/// names compare, not the order they were set.
+///
+/// The name index is searched by name hash and, on a tie, by the name pulled back
+/// out of the heap — `H5A__dense_fh_name_cmp` does a `strcmp` — so a colliding
+/// pair stored in insertion order sends a binary search down the wrong branch and
+/// one of the two becomes unfindable by name. Reading every attribute back walks
+/// the node start to finish and cannot see it, which is why this asserts on the
+/// record order itself. The C-library half is
+/// `c_finds_attributes_whose_names_hash_alike`.
+#[test]
+fn colliding_name_hashes_are_indexed_in_name_order() {
+    // Distinct names with the same jenkins_lookup3 hash, set in the order that
+    // is the reverse of how they compare: "k155448" sorts before "k69209".
+    const FIRST: &str = "k69209";
+    const SECOND: &str = "k155448";
+    assert!(SECOND < FIRST, "the fixture pair is not in reverse order");
+
+    let mut builder = FileBuilder::new();
+    builder.set_attr(FIRST, AttrValue::I64(11));
+    builder.set_attr(SECOND, AttrValue::I64(22));
+    for i in 0..8 {
+        builder.set_attr(&format!("f{i}"), AttrValue::I64(i));
+    }
+    builder.create_dataset("x").with_f64_data(&[1.0]);
+
+    let bytes = builder.finish().unwrap();
+    assert!(has_fractal_heap(&bytes), "ten attributes are dense");
+
+    let records = name_index_leaf_records(&bytes, 10);
+    let hash_of = |order: u32| {
+        records
+            .iter()
+            .find(|(o, _)| *o == order)
+            .expect("a record per attribute")
+            .1
+    };
+    assert_eq!(
+        hash_of(0),
+        hash_of(1),
+        "the fixture names no longer hash alike; pick a new colliding pair"
+    );
+
+    let colliding: Vec<u32> = records
+        .iter()
+        .map(|(order, _)| *order)
+        .filter(|order| *order < 2)
+        .collect();
+    assert_eq!(
+        colliding,
+        vec![1, 0],
+        "the colliding records are in insertion order, not name order"
+    );
+
+    let file = File::from_bytes(bytes).unwrap();
+    let attrs = file.root().attrs().unwrap();
+    assert_eq!(attrs.len(), 10);
+    assert_eq!(attrs.get(FIRST), Some(&AttrValue::I64(11)));
+    assert_eq!(attrs.get(SECOND), Some(&AttrValue::I64(22)));
 }

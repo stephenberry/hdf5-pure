@@ -407,6 +407,10 @@ pub enum FormatError {
     /// address: its offsets are 40 bits wide, so the blocks holding the
     /// attributes cannot span more than `limit` bytes between them. Reaching this
     /// takes about a terabyte of attributes on a single object.
+    ///
+    /// A set that fits the heap but not the host reports
+    /// [`FormatError::ValueTooLargeForPlatform`] instead, so the limit named here
+    /// is always the one that actually applied.
     DenseAttributeHeapTooLarge {
         /// The heap address space, in bytes.
         limit: u64,

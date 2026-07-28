@@ -744,3 +744,41 @@ fn c_reads_a_multi_megabyte_dense_heap() {
     assert!(std::fs::metadata(&path).unwrap().len() > 2_000_000);
     assert_eq!(c_reads(&path), CReads::Attrs(40));
 }
+
+/// libhdf5 must find both halves of a name-hash collision.
+///
+/// Its search compares the 32-bit name hash and, on a tie, `strcmp`s the name it
+/// pulls back out of the heap. Two names that hash alike therefore have to be
+/// stored in `strcmp` order or the descent takes a wrong branch and one of them
+/// is unfindable — while iteration, which never compares anything, still reports
+/// both. The zero-padded names the other tests here use cannot expose this: their
+/// insertion order and their `strcmp` order are the same by construction.
+#[test]
+fn c_finds_attributes_whose_names_hash_alike() {
+    // Distinct names with the same jenkins_lookup3 hash, set in the reverse of
+    // the order they compare in.
+    const FIRST: &str = "k69209";
+    const SECOND: &str = "k155448";
+
+    let mut builder = FileBuilder::new();
+    builder.set_attr(FIRST, AttrValue::I64(11));
+    builder.set_attr(SECOND, AttrValue::I64(22));
+    for i in 0..8 {
+        builder.set_attr(&format!("f{i}"), AttrValue::I64(i));
+    }
+    builder.create_dataset("x").with_f64_data(&[1.0]);
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("colliding_names.h5");
+    builder.write(&path).unwrap();
+
+    let names = [FIRST.to_string(), SECOND.to_string()];
+    let detail = c_looks_up_by_name(&path, &names);
+    assert_eq!(
+        detail.verdict,
+        CReads::Attrs(names.len()),
+        "libhdf5 could not open both colliding names"
+    );
+    assert_eq!(detail.sum_of(FIRST), Some(11));
+    assert_eq!(detail.sum_of(SECOND), Some(22));
+}
