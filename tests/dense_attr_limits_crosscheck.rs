@@ -23,6 +23,10 @@ use common::heap::{huge_object_count, managed_object_count};
 /// and report what it found on stdout.
 const CHILD_ENV: &str = "DENSE_XCHECK_FILE";
 
+/// Comma-separated attribute names for the child to open individually, rather
+/// than by iterating everything the object carries.
+const CHILD_LOOKUP_ENV: &str = "DENSE_XCHECK_LOOKUP";
+
 /// What libhdf5 made of a file, as observed from the parent.
 #[derive(Debug, PartialEq, Eq)]
 enum CReads {
@@ -68,10 +72,17 @@ fn c_reads_in_detail(path: &std::path::Path) -> CDetail {
 
 /// Re-exec this binary to run `child` against `path`, and parse what it reported.
 fn c_child(path: &std::path::Path, child: &str) -> CDetail {
+    c_child_looking_up(path, child, "")
+}
+
+/// As [`c_child`], additionally handing the child a comma-separated list of
+/// attribute names to open individually.
+fn c_child_looking_up(path: &std::path::Path, child: &str, lookup: &str) -> CDetail {
     let exe = std::env::current_exe().expect("test binary path");
     let out = std::process::Command::new(exe)
         .args([child, "--exact", "--nocapture"])
         .env(CHILD_ENV, path)
+        .env(CHILD_LOOKUP_ENV, lookup)
         .output()
         .expect("re-exec the test binary");
 
@@ -159,6 +170,48 @@ fn child_reads_attribute_sizes() {
         }
         Err(_) => println!("OPEN_FAILED"),
     }
+}
+
+/// The child half of [`c_looks_up_by_name`]. Opens only the named attributes,
+/// so libhdf5 has to *search* the name index rather than walk it.
+///
+/// A search descends the B-tree comparing name hashes, which is the one thing
+/// iteration never checks: a tree whose records are in the wrong order still
+/// yields every record in an in-order walk, and still fails every lookup that
+/// takes a wrong branch.
+#[test]
+fn child_looks_up_attributes_by_name() {
+    let Ok(path) = std::env::var(CHILD_ENV) else {
+        return;
+    };
+    let wanted = std::env::var(CHILD_LOOKUP_ENV).unwrap_or_default();
+    match hdf5::File::open(&path) {
+        Ok(f) => {
+            let mut found = 0usize;
+            for name in wanted.split(',').filter(|n| !n.is_empty()) {
+                let Ok(attr) = f.attr(name) else {
+                    println!("MISSING={name}");
+                    continue;
+                };
+                found += 1;
+                let values = attr.read_raw::<i64>().expect("an i64 attribute");
+                let sum: i64 = values
+                    .iter()
+                    .copied()
+                    .reduce(i64::wrapping_add)
+                    .unwrap_or(0);
+                println!("SUM={name}={sum}");
+            }
+            println!("ATTRS={found}");
+            f.close().expect("close");
+        }
+        Err(_) => println!("OPEN_FAILED"),
+    }
+}
+
+/// Have libhdf5 open each of `names` by name and report the values it read.
+fn c_looks_up_by_name(path: &std::path::Path, names: &[String]) -> CDetail {
+    c_child_looking_up(path, "child_looks_up_attributes_by_name", &names.join(","))
 }
 
 /// The child half of [`c_inserts_then_reads`]. Opens the file read-write with
@@ -518,6 +571,31 @@ fn c_reads_attribute_counts_that_need_a_multi_level_index() {
             CReads::Attrs(count),
             "libhdf5 could not read {count} attributes"
         );
+
+        // Iteration walks the tree in order and would be satisfied by a tree
+        // whose records sit in the wrong order; opening by name makes libhdf5
+        // descend it, comparing at each internal node. Sampled across the range
+        // so the descents take different paths.
+        let sampled: Vec<String> = [0, 1, count / 3, count / 2, count - 2, count - 1]
+            .iter()
+            .map(|i| format!("a{i:06}"))
+            .collect();
+        let detail = c_looks_up_by_name(&path, &sampled);
+        assert_eq!(
+            detail.verdict,
+            CReads::Attrs(sampled.len()),
+            "libhdf5 could not look up attributes by name among {count}"
+        );
+        for (i, name) in [0, 1, count / 3, count / 2, count - 2, count - 1]
+            .iter()
+            .zip(&sampled)
+        {
+            assert_eq!(
+                detail.sum_of(name),
+                Some(*i as i64),
+                "{name} read back the wrong value among {count} attributes"
+            );
+        }
     }
 }
 
