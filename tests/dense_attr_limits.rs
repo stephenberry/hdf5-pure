@@ -231,13 +231,12 @@ fn a_multi_megabyte_set_of_small_attributes_stays_managed() {
     assert_eq!(file.root().attrs().unwrap().len(), 40);
 }
 
-/// The attribute *count* still has a bound, and it is not the 65,535 the B-tree
-/// leaf's 2-byte record-count field suggests: the reference C library derives the
-/// width it needs from the leaf's capacity, which follows the power-of-two node
-/// size this writer declares, so the real limit is 61,680. One more silently
-/// produced a file that aborted libhdf5.
+/// The attribute count used to stop at 61,680, where a single B-tree leaf grown
+/// to hold every record pushed the capacity width the reference C library derives
+/// past the 2 bytes it allots. A name index of fixed 512-byte nodes grows a level
+/// instead, so counts on both sides of that old bound are ordinary now.
 #[test]
-fn the_attribute_count_boundary_is_enforced() {
+fn the_attribute_count_has_no_bound_at_the_old_single_leaf_limit() {
     let build = |n: usize| {
         let mut builder = FileBuilder::new();
         for i in 0..n {
@@ -247,18 +246,23 @@ fn the_attribute_count_boundary_is_enforced() {
         builder
     };
 
-    let bytes = build(61_680)
-        .finish()
-        .expect("the limit itself is writable");
-    let file = File::from_bytes(bytes).unwrap();
-    assert_eq!(file.root().attrs().unwrap().len(), 61_680);
-
-    match build(61_681).finish().unwrap_err() {
-        Error::Format(FormatError::TooManyDenseAttributes { count, limit }) => {
-            assert_eq!(count, 61_681);
-            assert_eq!(limit, 61_680);
+    // Just under, just over, and well past the count that used to be refused.
+    for count in [61_680, 61_681, 70_000] {
+        let bytes = build(count)
+            .finish()
+            .unwrap_or_else(|e| panic!("{count} attributes should be writable, got {e:?}"));
+        let file = File::from_bytes(bytes).unwrap();
+        let attrs = file.root().attrs().unwrap();
+        assert_eq!(attrs.len(), count);
+        // Reading every name back proves the tree's in-order traversal reached
+        // every leaf, not just that the count in the header was right.
+        for i in 0..count {
+            let name = format!("a{i:06}");
+            assert!(
+                matches!(attrs.get(&name), Some(AttrValue::I64(v)) if *v == i as i64),
+                "attribute {name} did not read back"
+            );
         }
-        other => panic!("expected TooManyDenseAttributes, got {other:?}"),
     }
 }
 

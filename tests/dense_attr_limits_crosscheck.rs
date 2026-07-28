@@ -489,15 +489,17 @@ fn c_rejects_a_heap_whose_objects_exceed_its_declared_limit() {
     assert_eq!(managed_object_count(&past), 8);
 }
 
-/// The attribute-count boundary, against the library that defines it. The limit
-/// is 61,680 rather than the 65,535 the B-tree leaf's record-count field would
-/// suggest, because libhdf5 derives the width it needs from the leaf's capacity,
-/// which follows the power-of-two node size this writer declares. Getting this
-/// wrong is not a near-miss: at 61,681 the file it produced aborted libhdf5, so
-/// the accepted side has to be confirmed here and not just against our own
-/// reader.
+/// Attribute counts that need a multi-level name index, against the library
+/// that defines the shape. 61,680 was the ceiling while the index was a single
+/// leaf grown to fit — one more produced a file that *aborted* libhdf5 rather
+/// than being rejected by it, which is exactly why the accepted side has to be
+/// confirmed here and not just against our own reader.
+///
+/// Each count crosses a different level boundary of a 512-byte-node tree: 570
+/// is the first that needs depth 2, 10,260 the first that needs depth 3, and
+/// 70,000 is well past the old single-leaf limit.
 #[test]
-fn c_reads_the_largest_accepted_attribute_count() {
+fn c_reads_attribute_counts_that_need_a_multi_level_index() {
     let build = |n: usize| {
         let mut builder = FileBuilder::new();
         for i in 0..n {
@@ -508,12 +510,15 @@ fn c_reads_the_largest_accepted_attribute_count() {
     };
 
     let dir = tempdir().unwrap();
-    let path = dir.path().join("count_limit.h5");
-    build(61_680).write(&path).unwrap();
-    assert_eq!(c_reads(&path), CReads::Attrs(61_680));
-
-    // And one past it never reaches a file at all.
-    assert!(build(61_681).finish().is_err());
+    for count in [570, 10_260, 61_681, 70_000] {
+        let path = dir.path().join(format!("count_{count}.h5"));
+        build(count).write(&path).unwrap();
+        assert_eq!(
+            c_reads(&path),
+            CReads::Attrs(count),
+            "libhdf5 could not read {count} attributes"
+        );
+    }
 }
 
 /// A multi-megabyte dense heap of individually small attributes is inside what

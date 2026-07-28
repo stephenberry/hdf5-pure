@@ -15,6 +15,7 @@ use alloc::collections::BTreeMap as HashMap;
 use std::collections::HashMap;
 
 use crate::attribute::AttributeMessage;
+use crate::btree_v2_write::{self, BTreeV2Plan};
 use crate::chunked_write::{
     ByteSink, ChunkOptions, CompressedChunkSet, VerbatimLayout, VerbatimPlan, assemble_chunked_at,
     compress_chunks, emit_chunked_data_verbatim, plan_chunked_data_verbatim,
@@ -254,69 +255,20 @@ pub(crate) const DENSE_ATTR_MAX_MANAGED_OBJECT: usize =
 
 /// One name-index B-tree v2 record as [`build_dense_attrs`] writes it: heap
 /// ID(8) + message flags(1) + creation order(4) + name hash(4).
-const DENSE_ATTR_BTREE_RECORD: usize = 8 + 1 + 4 + 4;
+const DENSE_ATTR_BTREE_RECORD: u16 = 8 + 1 + 4 + 4;
 
 /// One huge-objects B-tree v2 record (type 1, indirectly accessed and
 /// non-filtered): address + length + huge object ID. Matches what
 /// `fractal_heap::HugeObjectIndex::decode` reads on the way back in.
-const DENSE_ATTR_HUGE_BTREE_RECORD: usize =
-    OFFSET_SIZE as usize + LENGTH_SIZE as usize + LENGTH_SIZE as usize;
+const DENSE_ATTR_HUGE_BTREE_RECORD: u16 =
+    OFFSET_SIZE as u16 + LENGTH_SIZE as u16 + LENGTH_SIZE as u16;
 
-/// A B-tree v2 leaf node's fixed bytes around its records: signature(4) +
-/// version(1) + type(1) + checksum(4). The reference C library subtracts the
-/// same 10 when deriving a node's record capacity.
-const DENSE_ATTR_BTLF_OVERHEAD: usize = 4 + 1 + 1 + 4;
+/// B-tree v2 type for an attribute name index.
+const DENSE_ATTR_NAME_BTREE_TYPE: u8 = 8;
 
-/// The leaf node size [`build_dense_attrs`] declares for `count` records of
-/// `record_size` bytes.
-///
-/// Shared with [`dense_attrs_check`] so every bound is computed from the node
-/// size actually written. The power-of-two rounding is what makes those bounds
-/// non-obvious — see [`DENSE_ATTR_MAX_COUNT`].
-fn leaf_node_size(count: usize, record_size: usize) -> usize {
-    (DENSE_ATTR_BTLF_OVERHEAD + count * record_size)
-        .next_power_of_two()
-        .max(512)
-}
-
-/// The name-index leaf node size for `count` attributes.
-fn dense_attr_leaf_node_size(count: usize) -> usize {
-    leaf_node_size(count, DENSE_ATTR_BTREE_RECORD)
-}
-
-/// The largest leaf node of `record_size` records whose implied capacity the
-/// reference C library can still describe in the 2 bytes it allots:
-/// `H5B2__hdr_init` derives `max_nrec_size` from the node's *capacity*, and
-/// asserts it fits 2 bytes.
-const fn max_leaf_node_for(record_size: usize) -> usize {
-    let ceiling = DENSE_ATTR_BTLF_OVERHEAD + (u16::MAX as usize) * record_size;
-    // Round *down* to a power of two: the emitter only ever declares one of those.
-    1usize << (usize::BITS - 1 - ceiling.leading_zeros())
-}
-
-/// The most `record_size` records one leaf node can hold without pushing that
-/// derived width to 3 bytes.
-const fn max_records_for(record_size: usize) -> usize {
-    (max_leaf_node_for(record_size) - DENSE_ATTR_BTLF_OVERHEAD) / record_size
-}
-
-/// The most attributes dense storage can index — 61,680, not the 65,535 the
-/// leaf's 2-byte record-count field would suggest.
-///
-/// The binding constraint is one step removed from that field. The reference C
-/// library derives the byte width it needs for a record count from the leaf's
-/// *capacity*, and capacity follows the node size this emitter declares — which
-/// is rounded up to a power of two. Once that rounded node passes
-/// [`max_leaf_node_for`] the implied capacity needs 3 bytes and an
-/// assertion-enabled build aborts in `H5B2__hdr_init`, even though the count
-/// itself still fits the 2-byte field. Deriving the limit from the record size
-/// keeps it correct if that size or the rounding ever changes.
-pub(crate) const DENSE_ATTR_MAX_COUNT: usize = max_records_for(DENSE_ATTR_BTREE_RECORD);
-
-/// The most huge objects one dense attribute heap can index — 43,690, lower than
-/// [`DENSE_ATTR_MAX_COUNT`] only because a huge record is wider. Same
-/// single-leaf constraint, same derivation.
-pub(crate) const DENSE_ATTR_MAX_HUGE_COUNT: usize = max_records_for(DENSE_ATTR_HUGE_BTREE_RECORD);
+/// B-tree v2 type for a fractal heap's huge objects, indirectly accessed and
+/// not filtered.
+const DENSE_ATTR_HUGE_BTREE_TYPE: u8 = 1;
 
 /// The largest direct block the reference C library will construct
 /// (`H5HF_MAX_DIRECT_SIZE_LIMIT`). It reads the heap's block sizes through
@@ -341,16 +293,16 @@ fn dense_attr_block_geometry(serialized_total: usize) -> (u64, u64) {
 }
 
 /// Whether [`build_dense_attrs`] can faithfully represent `attrs` in its
-/// single-direct-block, single-leaf-B-tree layout.
+/// single-direct-block layout.
 ///
-/// The bounds are the ones the emitter actually has to honour: the set must fit
-/// [`DENSE_ATTR_MAX_COUNT`], the attributes large enough to need huge storage
-/// must fit [`DENSE_ATTR_MAX_HUGE_COUNT`], and the root direct block holding the
-/// rest must stay inside [`DENSE_ATTR_MAX_DIRECT_BLOCK_LIMIT`]. An individual
-/// attribute is *not* bounded: past [`DENSE_ATTR_MAX_MANAGED_OBJECT`] the
-/// emitter changes representation rather than refusing. Nor is the total bounded
-/// at 64 KiB — the emitter sizes its root direct block to the content, and
-/// multi-megabyte heaps of individually small attributes read back correctly.
+/// The one bound the emitter still has to honour is on the root direct block
+/// holding the managed attributes, which must stay inside
+/// [`DENSE_ATTR_MAX_DIRECT_BLOCK_LIMIT`]. Neither the attribute count nor the
+/// huge-object count is bounded any more: both indexes are multi-node v2
+/// B-trees that grow a level rather than overflow a leaf. An individual
+/// attribute is not bounded either — past [`DENSE_ATTR_MAX_MANAGED_OBJECT`] the
+/// emitter changes representation rather than refusing — and nor is the total
+/// bounded at 64 KiB, since the root direct block is sized to its content.
 ///
 /// What remains refused is what the attribute message itself cannot encode: its
 /// name, datatype and dataspace lengths live in 2-byte fields, and huge storage
@@ -360,16 +312,7 @@ fn dense_attr_block_geometry(serialized_total: usize) -> (u64, u64) {
 /// Callers that cannot fall back to a larger layout must refuse rather than
 /// mis-encode (see [`build_dense_attrs`]).
 pub(crate) fn dense_attrs_check(attrs: &[AttributeMessage]) -> Result<(), FormatError> {
-    // Counted first so the running total below cannot overflow a 32-bit `usize`
-    // before an absurd set is refused.
-    if attrs.len() > DENSE_ATTR_MAX_COUNT {
-        return Err(FormatError::TooManyDenseAttributes {
-            count: attrs.len(),
-            limit: DENSE_ATTR_MAX_COUNT,
-        });
-    }
     let mut managed_total = 0usize;
-    let mut huge_count = 0usize;
     for a in attrs {
         if let Some((field, size)) = a.v3_header_field_overflow(LENGTH_SIZE) {
             return Err(FormatError::AttributeFieldTooLong {
@@ -380,17 +323,14 @@ pub(crate) fn dense_attrs_check(attrs: &[AttributeMessage]) -> Result<(), Format
             });
         }
         let size = a.serialize_v3(LENGTH_SIZE).len();
-        if size > DENSE_ATTR_MAX_MANAGED_OBJECT {
-            huge_count += 1;
-        } else {
-            managed_total += size;
+        if size <= DENSE_ATTR_MAX_MANAGED_OBJECT {
+            // A managed attribute's bytes go in the root direct block; a huge
+            // one's sit outside it and are bounded only by the file. Saturating
+            // because the count is no longer bounded first: on a 32-bit host a
+            // total past `usize` would wrap to a small number and pass the
+            // block-size check below, where saturating fails it.
+            managed_total = managed_total.saturating_add(size);
         }
-    }
-    if huge_count > DENSE_ATTR_MAX_HUGE_COUNT {
-        return Err(FormatError::TooManyHugeDenseAttributes {
-            count: huge_count,
-            limit: DENSE_ATTR_MAX_HUGE_COUNT,
-        });
     }
     dense_attrs_check_geometry(managed_total)
 }
@@ -500,21 +440,45 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
 
     // Every v2 B-tree header this emitter writes has the same fixed layout, so
     // one size covers both the name index and the huge-objects index.
-    let bthd_size = 4 + 1 + 1 + 4 + 2 + 2 + 1 + 1 + os + 2 + ls + 4;
-    let name_node_size = dense_attr_leaf_node_size(attrs.len());
-    let huge_node_size = leaf_node_size(huge_count, DENSE_ATTR_HUGE_BTREE_RECORD);
+    let bthd_size = btree_v2_write::header_size(OFFSET_SIZE, LENGTH_SIZE);
+    debug_assert_eq!(bthd_size, 4 + 1 + 1 + 4 + 2 + 2 + 1 + 1 + os + 2 + ls + 4);
+
+    // Both indexes are planned before anything is placed, because their node
+    // counts decide where everything after them goes. The node and record sizes
+    // are this emitter's own constants, and every count is plannable at them —
+    // a tree grows a level long before it could need an empty node — so a plan
+    // here cannot fail on anything a caller controls.
+    let name_plan = BTreeV2Plan::new(
+        DENSE_ATTR_NAME_BTREE_TYPE,
+        attrs.len() as u64,
+        DENSE_ATTR_BTREE_RECORD,
+        btree_v2_write::NODE_SIZE,
+        OFFSET_SIZE,
+    )
+    .expect("a 512-byte node holds 29 name records, enough to plan any count");
+    let huge_plan = (huge_count > 0).then(|| {
+        BTreeV2Plan::new(
+            DENSE_ATTR_HUGE_BTREE_TYPE,
+            huge_count as u64,
+            DENSE_ATTR_HUGE_BTREE_RECORD,
+            btree_v2_write::NODE_SIZE,
+            OFFSET_SIZE,
+        )
+        .expect("a 512-byte node holds 20 huge records, enough to plan any count")
+    });
 
     // Blob layout, all relative to `base_address` so the caller can size the blob
     // with a throwaway build at address 0 and get the same bytes back at the real
-    // address: heap header, root direct block, name index (header + leaf), then —
-    // only when there are huge objects — the huge index (header + leaf) and the
+    // address: heap header, root direct block, name index (header + nodes), then —
+    // only when there are huge objects — the huge index (header + nodes) and the
     // huge object bytes themselves.
     let frhp_addr = base_address;
     let dblock_addr = frhp_addr + frhp_size as u64;
     let btree_addr = dblock_addr + starting_block_size;
-    let huge_bthd_addr = btree_addr + bthd_size as u64 + name_node_size as u64;
-    let huge_btlf_addr = huge_bthd_addr + bthd_size as u64;
-    let huge_data_addr = huge_btlf_addr + huge_node_size as u64;
+    let name_nodes_addr = btree_addr + bthd_size as u64;
+    let huge_bthd_addr = name_nodes_addr + name_plan.nodes_size();
+    let huge_nodes_addr = huge_bthd_addr + bthd_size as u64;
+    let huge_data_addr = huge_nodes_addr + huge_plan.as_ref().map_or(0, BTreeV2Plan::nodes_size);
 
     #[expect(
         clippy::cast_possible_truncation,
@@ -639,130 +603,54 @@ pub(crate) fn build_dense_attrs(attrs: &[AttributeMessage], base_address: u64) -
     dblock[cksum_pos..cksum_pos + 4].copy_from_slice(&dblock_checksum.to_le_bytes());
     debug_assert_eq!(dblock.len() as u64, starting_block_size);
 
-    // Build B-tree v2 type 8 records (17 bytes each)
+    // Build B-tree v2 type 8 records (17 bytes each), sorted into the order the
+    // index is searched in: by name hash, and by creation order where two names
+    // hash alike.
     let record_size: u16 = heap_id_length + 1 + 4 + 4;
-    debug_assert_eq!(record_size as usize, DENSE_ATTR_BTREE_RECORD);
-    let mut records: Vec<(u32, u32, Vec<u8>)> = Vec::with_capacity(attrs.len());
+    debug_assert_eq!(record_size, DENSE_ATTR_BTREE_RECORD);
     #[expect(
         clippy::cast_possible_truncation,
         reason = "i is an attribute index bounded by the attribute count, far below u32::MAX"
     )]
-    for (i, heap_id) in heap_ids.iter().enumerate() {
-        let mut rec = Vec::with_capacity(record_size as usize);
-        rec.extend_from_slice(heap_id);
-        rec.push(0); // msg_flags
-        rec.extend_from_slice(&(i as u32).to_le_bytes()); // creation_order
-        rec.extend_from_slice(&name_hashes[i].to_le_bytes()); // hash
-        records.push((name_hashes[i], i as u32, rec));
-    }
-    records.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut order: Vec<(u32, u32)> = (0..attrs.len())
+        .map(|i| (name_hashes[i], i as u32))
+        .collect();
+    order.sort_unstable();
 
-    let num_records = attrs.len();
-    let btlf_size = DENSE_ATTR_BTLF_OVERHEAD + num_records * record_size as usize;
-    // Shared with `dense_attrs_check`, which bounds the record count by the
-    // largest node size the reference C library can describe.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "dense_attrs_check bounds the record count so this node size stays at or \
-                  below max_leaf_node_for's 2^20, well inside the 4-byte field"
-    )]
-    let node_size = name_node_size as u32;
-    debug_assert!(node_size as usize >= btlf_size);
+    let mut name_records = Vec::with_capacity(attrs.len() * record_size as usize);
+    for &(hash, i) in &order {
+        name_records.extend_from_slice(&heap_ids[i as usize]);
+        name_records.push(0); // msg_flags
+        name_records.extend_from_slice(&i.to_le_bytes()); // creation_order
+        name_records.extend_from_slice(&hash.to_le_bytes()); // hash
+    }
 
     let bthd_addr = btree_addr;
-    let btlf_addr = bthd_addr + bthd_size as u64;
+    let name_tree = name_plan.serialize(&name_records, name_nodes_addr, OFFSET_SIZE, LENGTH_SIZE);
 
-    let mut bthd = Vec::with_capacity(bthd_size);
-    bthd.extend_from_slice(b"BTHD");
-    bthd.push(0); // version
-    bthd.push(8); // type = attribute name index
-    bthd.extend_from_slice(&node_size.to_le_bytes());
-    bthd.extend_from_slice(&record_size.to_le_bytes());
-    bthd.extend_from_slice(&0u16.to_le_bytes()); // depth = 0
-    bthd.push(100); // split_percent
-    bthd.push(40); // merge_percent
-    write_offset(&mut bthd, btlf_addr, OFFSET_SIZE);
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "record count is written into the 2-byte number-of-records field"
-    )]
-    bthd.extend_from_slice(&(num_records as u16).to_le_bytes());
-    write_length(&mut bthd, num_records as u64, LENGTH_SIZE);
-    let bthd_checksum = crate::checksum::jenkins_lookup3(&bthd);
-    bthd.extend_from_slice(&bthd_checksum.to_le_bytes());
-    debug_assert_eq!(bthd.len(), bthd_size);
-
-    let mut btlf = Vec::with_capacity(node_size as usize);
-    btlf.extend_from_slice(b"BTLF");
-    btlf.push(0); // version
-    btlf.push(8); // type
-    for (_, _, rec) in &records {
-        btlf.extend_from_slice(rec);
-    }
-    // Checksum goes immediately after records (NOT at end of node).
-    // HDF5 C library computes checksum over sig+ver+type+records only.
-    let btlf_checksum = crate::checksum::jenkins_lookup3(&btlf);
-    btlf.extend_from_slice(&btlf_checksum.to_le_bytes());
-    // Pad to node_size
-    btlf.resize(node_size as usize, 0);
-
-    let mut blob = Vec::with_capacity(frhp.len() + dblock.len() + bthd.len() + btlf.len());
+    let mut blob =
+        Vec::with_capacity(frhp.len() + dblock.len() + bthd_size + name_tree.nodes.len());
     blob.extend_from_slice(&frhp);
     blob.extend_from_slice(&dblock);
-    blob.extend_from_slice(&bthd);
-    blob.extend_from_slice(&btlf);
+    debug_assert_eq!(blob.len() as u64, bthd_addr - base_address);
+    blob.extend_from_slice(&name_tree.header);
+    blob.extend_from_slice(&name_tree.nodes);
 
-    if huge_count > 0 {
+    if let Some(huge_plan) = &huge_plan {
         // Records are already in ascending ID order, which is the order the
         // B-tree is searched in.
-        let mut huge_bthd = Vec::with_capacity(bthd_size);
-        huge_bthd.extend_from_slice(b"BTHD");
-        huge_bthd.push(0); // version
-        huge_bthd.push(1); // type = huge objects, indirectly accessed, non-filtered
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "dense_attrs_check bounds the huge count so this node size stays at or \
-                      below max_leaf_node_for's 2^20, well inside the 4-byte field"
-        )]
-        let huge_node_size_u32 = huge_node_size as u32;
-        huge_bthd.extend_from_slice(&huge_node_size_u32.to_le_bytes());
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "a huge record is 24 bytes, well inside the 2-byte record size field"
-        )]
-        let huge_record_size = DENSE_ATTR_HUGE_BTREE_RECORD as u16;
-        huge_bthd.extend_from_slice(&huge_record_size.to_le_bytes());
-        huge_bthd.extend_from_slice(&0u16.to_le_bytes()); // depth = 0
-        huge_bthd.push(100); // split_percent
-        huge_bthd.push(40); // merge_percent
-        write_offset(&mut huge_bthd, huge_btlf_addr, OFFSET_SIZE);
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "dense_attrs_check bounds the huge count below the 2-byte field's range"
-        )]
-        let huge_nrec = huge_count as u16;
-        huge_bthd.extend_from_slice(&huge_nrec.to_le_bytes());
-        write_length(&mut huge_bthd, huge_count as u64, LENGTH_SIZE);
-        let huge_bthd_checksum = crate::checksum::jenkins_lookup3(&huge_bthd);
-        huge_bthd.extend_from_slice(&huge_bthd_checksum.to_le_bytes());
-        debug_assert_eq!(huge_bthd.len(), bthd_size);
-
-        let mut huge_btlf = Vec::with_capacity(huge_node_size);
-        huge_btlf.extend_from_slice(b"BTLF");
-        huge_btlf.push(0); // version
-        huge_btlf.push(1); // type
+        let mut huge_bytes =
+            Vec::with_capacity(huge_records.len() * DENSE_ATTR_HUGE_BTREE_RECORD as usize);
         for (id, addr, len) in &huge_records {
-            write_offset(&mut huge_btlf, *addr, OFFSET_SIZE);
-            write_length(&mut huge_btlf, *len, LENGTH_SIZE);
-            write_length(&mut huge_btlf, *id, LENGTH_SIZE);
+            write_offset(&mut huge_bytes, *addr, OFFSET_SIZE);
+            write_length(&mut huge_bytes, *len, LENGTH_SIZE);
+            write_length(&mut huge_bytes, *id, LENGTH_SIZE);
         }
-        let huge_btlf_checksum = crate::checksum::jenkins_lookup3(&huge_btlf);
-        huge_btlf.extend_from_slice(&huge_btlf_checksum.to_le_bytes());
-        huge_btlf.resize(huge_node_size, 0);
+        let huge_tree = huge_plan.serialize(&huge_bytes, huge_nodes_addr, OFFSET_SIZE, LENGTH_SIZE);
 
         debug_assert_eq!(blob.len() as u64, huge_bthd_addr - base_address);
-        blob.extend_from_slice(&huge_bthd);
-        blob.extend_from_slice(&huge_btlf);
+        blob.extend_from_slice(&huge_tree.header);
+        blob.extend_from_slice(&huge_tree.nodes);
         debug_assert_eq!(blob.len() as u64, huge_data_addr - base_address);
         for (s, huge_id) in serialized.iter().zip(&huge_id_of) {
             if huge_id.is_some() {
@@ -3012,46 +2900,32 @@ mod tests {
         u64::from_le_bytes(blob[at..at + 8].try_into().unwrap())
     }
 
-    /// The attribute-count limit exists because the reference C library derives a
-    /// record-count width from the leaf's *capacity*, not from the count. Pin
-    /// that derivation directly: at the limit the capacity still fits 2 bytes,
-    /// and one attribute more pushes the rounded node size up a power of two and
-    /// takes it to 3 — which is the abort this bound prevents.
+    /// Both indexes used to carry a count limit, and it came from the reference C
+    /// library deriving a record-count width from a leaf's *capacity*: a node
+    /// grown large enough to hold every record in one leaf pushed that width past
+    /// the 2 bytes `H5B2__hdr_init` asserts on. A fixed node size takes the
+    /// derivation out of the record count's hands entirely — this is the property
+    /// that replaced the limits, so it is the one worth pinning.
     #[test]
-    fn the_attribute_count_limit_is_where_the_capacity_width_grows() {
-        let width_at = |count: usize| {
-            let capacity = (dense_attr_leaf_node_size(count) - DENSE_ATTR_BTLF_OVERHEAD)
-                / DENSE_ATTR_BTREE_RECORD;
-            encoded_size_width(capacity as u64)
-        };
-        assert_eq!(width_at(DENSE_ATTR_MAX_COUNT), 2);
-        assert_eq!(width_at(DENSE_ATTR_MAX_COUNT + 1), 3);
-        // Guards the derivation against a silent change in the constants.
-        assert_eq!(DENSE_ATTR_MAX_COUNT, 61_680);
-    }
-
-    /// The huge-object count has the same constraint and a lower limit, because a
-    /// huge record is 24 bytes rather than 17. Reaching it takes ~2.8 GiB of
-    /// attributes, so the derivation is pinned here rather than by building them —
-    /// the alternative is a bound nothing ever measures.
-    #[test]
-    fn the_huge_object_limit_is_where_its_own_capacity_width_grows() {
-        let width_at = |count: usize| {
-            let capacity = (leaf_node_size(count, DENSE_ATTR_HUGE_BTREE_RECORD)
-                - DENSE_ATTR_BTLF_OVERHEAD)
-                / DENSE_ATTR_HUGE_BTREE_RECORD;
-            encoded_size_width(capacity as u64)
-        };
-        assert_eq!(width_at(DENSE_ATTR_MAX_HUGE_COUNT), 2);
-        assert_eq!(width_at(DENSE_ATTR_MAX_HUGE_COUNT + 1), 3);
-        assert_eq!(DENSE_ATTR_MAX_HUGE_COUNT, 43_690);
-        // Reachable rather than theoretical: an attribute set can hold more
-        // attributes than this, so the check that enforces it is not dead.
-        const {
+    fn a_fixed_node_size_keeps_the_derived_count_width_at_one_byte() {
+        for record_size in [DENSE_ATTR_BTREE_RECORD, DENSE_ATTR_HUGE_BTREE_RECORD] {
+            let (info, depth) = crate::btree_v2::NodeInfo::for_record_count(
+                btree_v2_write::NODE_SIZE,
+                record_size,
+                OFFSET_SIZE,
+                0,
+            )
+            .expect("the emitted geometry is plannable");
+            assert_eq!(depth, 0);
+            let capacity = info.max_nrec(0);
             assert!(
-                DENSE_ATTR_MAX_HUGE_COUNT < DENSE_ATTR_MAX_COUNT,
-                "a huge-object limit at or above the attribute limit is unreachable, \
-                 which would leave TooManyHugeDenseAttributes dead"
+                capacity >= 20,
+                "a {record_size}-byte record should leave room for 20 per node, got {capacity}"
+            );
+            assert_eq!(
+                encoded_size_width(capacity),
+                1,
+                "a {record_size}-byte record's leaf capacity must stay inside one byte"
             );
         }
     }

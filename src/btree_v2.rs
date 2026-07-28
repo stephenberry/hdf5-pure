@@ -1,7 +1,7 @@
 //! HDF5 B-tree v2 parsing.
 
 #[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 
 #[cfg(feature = "checksum")]
 use byteorder::{ByteOrder, LittleEndian};
@@ -194,8 +194,8 @@ fn max_records_leaf(node_size: u32, record_size: u16) -> u64 {
     ((node_size - overhead) / record_size as u32) as u64
 }
 
-/// The per-level child-pointer field widths of a v2 B-tree's doubling table,
-/// computed exactly as the HDF5 C library does (`H5B2hdr.c`).
+/// The per-level capacities and child-pointer field widths of a v2 B-tree's
+/// doubling table, computed exactly as the HDF5 C library does (`H5B2hdr.c`).
 ///
 /// An internal node's child pointer is `address + records-in-child +
 /// total-records-in-subtree`. The last two are variable-width integers whose
@@ -207,7 +207,11 @@ fn max_records_leaf(node_size: u32, record_size: u16) -> u64 {
 /// and an earlier conservative estimate of it disagreed with the C library at
 /// depth 3 and beyond, leaving large groups (tens of thousands of links)
 /// unreadable.
-struct NodeInfo {
+///
+/// [`btree_v2_write`](crate::btree_v2_write) builds trees from this same table
+/// rather than a second copy of the recurrence, so an emitted tree and the
+/// widths this module decodes it with cannot drift apart.
+pub(crate) struct NodeInfo {
     /// Bytes encoding a child pointer's "number of records in the child node".
     /// HDF5 uses one width at every level, taken from the leaf maximum (the
     /// largest, since `max_nrec` shrinks with depth).
@@ -216,47 +220,100 @@ struct NodeInfo {
     /// indexed by the child node's depth. `[0]` is 0 (a leaf has no subtree
     /// total); `[u]` sizes the field for a child at depth `u`.
     cum_max_nrec_size: Vec<usize>,
+    /// Records one node at each depth holds when full. `[0]` is the leaf
+    /// capacity, and the sequence is non-increasing (the C library asserts as
+    /// much in `H5B2__hdr_init`).
+    max_nrec: Vec<u64>,
+    /// Records a whole subtree rooted at each depth holds when full.
+    cum_max_nrec: Vec<u64>,
 }
 
 impl NodeInfo {
-    /// Build the doubling-table widths for a tree of the given root `depth`.
-    fn compute(node_size: u32, record_size: u16, offset_size: u8, depth: u16) -> NodeInfo {
-        // Level 0: leaf.
+    /// The leaf level, before any internal level has been added.
+    fn leaf_only(node_size: u32, record_size: u16) -> NodeInfo {
         let max_nrec0 = max_records_leaf(node_size, record_size);
-        let max_nrec_size = bytes_for_max_records(max_nrec0);
-
-        let mut cum_max_nrec_size = Vec::with_capacity(depth as usize + 1);
-        cum_max_nrec_size.push(0); // a leaf's pointer carries no subtree total
-        let rs = record_size as usize;
-        let mut prev_cum = max_nrec0;
-        for u in 1..=depth as usize {
-            // Internal-pointer size at this level uses the *previous* level's
-            // subtree-total width (H5B2_INT_POINTER_SIZE).
-            let int_ptr = offset_size as usize + max_nrec_size + cum_max_nrec_size[u - 1];
-            // Records that fit an internal node at this level (H5B2_NUM_INT_REC).
-            let avail = (node_size as usize).saturating_sub(10 + int_ptr);
-            let denom = rs + int_ptr;
-            let max_nrec_u = avail.checked_div(denom).unwrap_or(0) as u64;
-            // cum_max_nrec[u] = (max_nrec[u] + 1) * cum_max_nrec[u-1] + max_nrec[u]
-            let cum = max_nrec_u
-                .saturating_add(1)
-                .saturating_mul(prev_cum)
-                .saturating_add(max_nrec_u);
-            cum_max_nrec_size.push(bytes_for_max_records(cum));
-            prev_cum = cum;
-        }
-
         NodeInfo {
-            max_nrec_size,
-            cum_max_nrec_size,
+            max_nrec_size: bytes_for_max_records(max_nrec0),
+            cum_max_nrec_size: vec![0], // a leaf's pointer carries no subtree total
+            max_nrec: vec![max_nrec0],
+            cum_max_nrec: vec![max_nrec0],
         }
+    }
+
+    /// Extend the table by one internal level above the current top.
+    fn push_level(&mut self, node_size: u32, record_size: u16, offset_size: u8) {
+        let u = self.max_nrec.len();
+        // Internal-pointer size at this level uses the *previous* level's
+        // subtree-total width (H5B2_INT_POINTER_SIZE).
+        let int_ptr = offset_size as usize + self.max_nrec_size + self.cum_max_nrec_size[u - 1];
+        // Records that fit an internal node at this level (H5B2_NUM_INT_REC).
+        let avail = (node_size as usize).saturating_sub(10 + int_ptr);
+        let denom = record_size as usize + int_ptr;
+        let max_nrec_u = avail.checked_div(denom).unwrap_or(0) as u64;
+        // cum_max_nrec[u] = (max_nrec[u] + 1) * cum_max_nrec[u-1] + max_nrec[u]
+        let cum = max_nrec_u
+            .saturating_add(1)
+            .saturating_mul(self.cum_max_nrec[u - 1])
+            .saturating_add(max_nrec_u);
+        self.cum_max_nrec_size.push(bytes_for_max_records(cum));
+        self.max_nrec.push(max_nrec_u);
+        self.cum_max_nrec.push(cum);
+    }
+
+    /// Build the doubling table for a tree of the given root `depth`.
+    fn compute(node_size: u32, record_size: u16, offset_size: u8, depth: u16) -> NodeInfo {
+        let mut info = NodeInfo::leaf_only(node_size, record_size);
+        for _ in 1..=depth {
+            info.push_level(node_size, record_size, offset_size);
+        }
+        info
+    }
+
+    /// Build the doubling table deep enough to hold `records`, returning it with
+    /// the depth a tree of that many records needs.
+    ///
+    /// `None` when no tree of this node and record size can hold them: an
+    /// internal level that fits no records at all cannot make the tree taller,
+    /// so growing further would loop forever.
+    pub(crate) fn for_record_count(
+        node_size: u32,
+        record_size: u16,
+        offset_size: u8,
+        records: u64,
+    ) -> Option<(NodeInfo, u16)> {
+        let mut info = NodeInfo::leaf_only(node_size, record_size);
+        let mut depth = 0u16;
+        while *info.cum_max_nrec.last().expect("table is never empty") < records {
+            info.push_level(node_size, record_size, offset_size);
+            depth += 1;
+            if *info.max_nrec.last().expect("just pushed") == 0 {
+                return None;
+            }
+        }
+        Some((info, depth))
+    }
+
+    /// Records one node at `depth` holds when full.
+    pub(crate) fn max_nrec(&self, depth: u16) -> u64 {
+        self.max_nrec[depth as usize]
+    }
+
+    /// Records a whole subtree rooted at `depth` holds when full.
+    pub(crate) fn cum_max_nrec(&self, depth: u16) -> u64 {
+        self.cum_max_nrec[depth as usize]
+    }
+
+    /// Width of a child pointer's "number of records in the child node" field,
+    /// one width at every level.
+    pub(crate) fn max_nrec_size(&self) -> usize {
+        self.max_nrec_size
     }
 
     /// Width of a child pointer's "total records in subtree" field for a node at
     /// `depth` (its children sit one level below, so the field has width
     /// `cum_max_nrec_size[depth - 1]`; for `depth == 1` the children are leaves
     /// and the field is absent).
-    fn total_nrec_size(&self, depth: u16) -> usize {
+    pub(crate) fn total_nrec_size(&self, depth: u16) -> usize {
         self.cum_max_nrec_size
             .get((depth - 1) as usize)
             .copied()

@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- An object carries any number of dense (fractal-heap) attributes: both the name index and the huge-object index are now multi-level B-trees of fixed 512-byte nodes, matching what the reference C library emits, instead of one leaf grown to fit ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
+
+### Changed
+
+- **Breaking:** `FormatError::TooManyDenseAttributes` and `FormatError::TooManyHugeDenseAttributes` are removed along with the 61,680- and 43,690-attribute limits that produced them ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
+- A dense attribute set of more than 29 attributes has different bytes: its name index is a tree of 512-byte nodes rather than a single power-of-two-sized leaf. Smaller sets are unchanged ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)).
+
 ## [0.28.0] - 2026-07-28
 
 `File::open_rw` picks its own backing. A latest-format file with no userblock is edited in bounded memory rather than through a whole-file mirror, and the mirror is now the fallback for the files the bounded engine cannot edit rather than the default for everything. Nothing about a file's space strategy decides which open a caller reaches for any more, so `File::open_rw_bounded` is deprecated: it survives only as the strict default, now expressible as `MemoryStrategy::Bounded` on `FileAccessProperties`, and `File::edit_backing` reports which backend an open actually resolved to. Two guarantees that used to be silently ignored are refused before any work happens: the SWMR writer will not accept a `Bounded` it cannot honor, and `File::create_with_options` checks a creation/access pair up front rather than leaving a file on disk and returning the reopen's error.

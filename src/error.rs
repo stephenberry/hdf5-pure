@@ -403,26 +403,6 @@ pub enum FormatError {
         /// The largest length the message can describe, in bytes.
         limit: usize,
     },
-    /// An object carries more attributes than dense (fractal-heap) storage can
-    /// index. The single B-tree v2 leaf this writer emits has a record capacity
-    /// that follows its declared node size, and past this count the reference C
-    /// library cannot describe that capacity in the bytes it allots for it.
-    TooManyDenseAttributes {
-        /// The number of attributes requested.
-        count: usize,
-        /// The largest number that can be indexed.
-        limit: usize,
-    },
-    /// An object carries more attributes needing fractal-heap *huge* storage than
-    /// one huge-objects B-tree leaf can index. Same single-leaf constraint as
-    /// [`FormatError::TooManyDenseAttributes`], reached sooner because a huge
-    /// record is wider than a name-index record.
-    TooManyHugeDenseAttributes {
-        /// The number of attributes large enough to need huge storage.
-        count: usize,
-        /// The largest number that can be indexed.
-        limit: usize,
-    },
     /// An object's attributes need a larger fractal-heap direct block than the
     /// format's own limit for one, so the heap could not be read back reliably.
     /// Reaching this takes gigabytes of attributes on a single object.
@@ -832,20 +812,6 @@ impl fmt::Display for FormatError {
                     f,
                     "attribute {name:?} has a {size}-byte {field}, past the {limit}-byte limit of \
                      the attribute message's {field} size field"
-                )
-            }
-            FormatError::TooManyDenseAttributes { count, limit } => {
-                write!(
-                    f,
-                    "{count} attributes exceed the {limit} that dense (fractal-heap) storage \
-                     can index"
-                )
-            }
-            FormatError::TooManyHugeDenseAttributes { count, limit } => {
-                write!(
-                    f,
-                    "{count} attributes need fractal-heap huge storage, past the {limit} that one \
-                     huge-objects B-tree can index"
                 )
             }
             FormatError::DenseAttributeHeapTooLarge { block_size, limit } => {
