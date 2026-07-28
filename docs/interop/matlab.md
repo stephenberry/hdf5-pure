@@ -64,7 +64,7 @@ The serializer maps Rust types to HDF5 datasets and the MATLAB classes MATLAB ex
 | `f64`, `f32`, `i*`, `u*` | scalar dataset `[1,1]`, `MATLAB_class = "double"` / `"single"` / `"int*"` / `"uint*"` |
 | `bool` | `uint8` scalar, `MATLAB_class = "logical"` |
 | `String` / `&str` | `uint16` `[1, N]` UTF-16LE, `MATLAB_class = "char"` |
-| `Vec<T>` of numeric `T` | `[1, N]` row vector |
+| `Vec<T>` of numeric `T` | MATLAB `[N, 1]` column vector (HDF5 shape `[1, N]`); see [1-D vector orientation](#1-d-vector-orientation) |
 | `Matrix<T>` or `Vec<Vec<T>>` of same length | column-major 2-D dataset, HDF5 shape `[cols, rows]` |
 | `Complex64` / `Complex32` / `ComplexI16` / … | compound `{real, imag}` dataset, `MATLAB_class` = the *component* class |
 | nested struct | HDF5 group with `MATLAB_class = "struct"`, `MATLAB_fields` |
@@ -75,6 +75,26 @@ The serializer maps Rust types to HDF5 datasets and the MATLAB classes MATLAB ex
 
 !!! note "Unit and `null` fields round-trip with `#[serde(default)]`"
     A struct field that serializes as a Rust unit `()` is dropped from the output, exactly like `Option::None`. The most common case is a `serde_json::Value::Null` field, since `serde_json` serializes `Value::Null` via `serialize_unit`. Because the field is absent on disk, reading it back needs `#[serde(default)]` on the field (or an `Option<T>` field, which serde defaults to `None` automatically); with a default, a `serde_json::Value` field reconstructs as `Value::Null`. A non-`Option` field that has no serde default fails to deserialize the dropped field with a missing-field error, so add `#[serde(default)]` (or use `Option<T>`) if the field can be absent.
+
+### 1-D vector orientation
+
+A `Vec<T>` becomes a MATLAB **column** vector — MATLAB `[N, 1]`, stored as HDF5 shape `[1, N]`, since HDF5 storage is the transpose of the MATLAB shape. Every 1-D array follows this rule, complex ones included.
+
+[`to_bytes`](https://docs.rs/hdf5-pure/latest/hdf5_pure/mat/fn.to_bytes.html) is fixed at that default. To get MATLAB `[1, N]` rows instead, write through `to_bytes_with_options` with `one_dimensional_mode: OneDimensionalMode::RowVector`:
+
+```rust
+use hdf5_pure::mat::{self, OneDimensionalMode, Options};
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct Capture { samples: Vec<f64> }
+
+let mut opts = Options::default();
+opts.one_dimensional_mode = OneDimensionalMode::RowVector;
+let bytes = mat::to_bytes_with_options(&Capture { samples: vec![1.0, 2.0, 3.0] }, &opts).unwrap();
+```
+
+This matters when the same data reaches MATLAB by more than one route. [BEVE](https://github.com/beve-org/beve)'s MATLAB loader (`matlab/load_beve.m`) reconstructs a complex array as `complex(raw(1,:), raw(2,:))`, a `1×N` **row**; a pipeline that writes the same captures as both BEVE and `.mat` should set `RowVector` here so the two agree in the MATLAB workspace rather than differing by a transpose.
 
 ### Matrices and the column-major convention
 
