@@ -447,19 +447,35 @@ mod tests {
     /// A shape nothing could hold is refused rather than wrapped into a small
     /// plausible one. `total_len` and the block arithmetic are all derived from
     /// the byte count, so it has to be the thing that is checked.
+    ///
+    /// The boundary is this host's address space, not a fixed number: the
+    /// emitter builds the region in memory, so what plans on a 64-bit target is
+    /// legitimately refused on a 32-bit one. Written in terms of `usize::MAX` so
+    /// it states that rule rather than one target's answer to it.
     #[test]
     fn a_shape_whose_bytes_overflow_is_refused() {
+        // Refused on any target: the byte count overflows `u64` itself.
         assert!(plan_blocking(u64::MAX, 8).is_err());
-        assert!(plan_blocking(u64::MAX / 8 + 1, 8).is_err());
-        // One element short of the overflow still plans, and reports a total
-        // that did not wrap.
-        let b = plan_blocking(u64::MAX / 8, 8).unwrap();
-        assert_eq!(b.total_len(), (u64::MAX / 8) * 8);
 
-        // Dimensions are multiplied the same way, so an absurd shape reaches the
-        // refusal rather than panicking a debug build on the way.
-        assert_eq!(total_elements(&[usize::MAX, usize::MAX]), u64::MAX);
-        assert!(Blocking::plan::<f64>(&[usize::MAX, usize::MAX]).is_err());
+        // The largest shape that plans is the one whose bytes still fit `usize`,
+        // and one element more is refused.
+        let max_elements = (usize::MAX as u64) / 8;
+        let b = plan_blocking(max_elements, 8).unwrap();
+        assert_eq!(b.total_len(), max_elements * 8);
+        assert!(
+            usize::try_from(b.total_len()).is_ok(),
+            "the largest plannable region must be one this host can address"
+        );
+        assert!(plan_blocking(max_elements + 1, 8).is_err());
+
+        // Dimensions are multiplied the same way. Three of `usize::MAX` exceed
+        // `u64` on every target, so this pins that they saturate rather than
+        // panicking a debug build on the way to the refusal.
+        assert_eq!(
+            total_elements(&[usize::MAX, usize::MAX, usize::MAX]),
+            u64::MAX
+        );
+        assert!(Blocking::plan::<f64>(&[usize::MAX, usize::MAX, usize::MAX]).is_err());
     }
 
     /// A complex pair is one element of two components, so it blocks exactly as
