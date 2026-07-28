@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-07-28
+
+`File::open_rw` picks its own backing. A latest-format file with no userblock is edited in bounded memory rather than through a whole-file mirror, and the mirror is now the fallback for the files the bounded engine cannot edit rather than the default for everything. Nothing about a file's space strategy decides which open a caller reaches for any more, so `File::open_rw_bounded` is deprecated: it survives only as the strict default, now expressible as `MemoryStrategy::Bounded` on `FileAccessProperties`, and `File::edit_backing` reports which backend an open actually resolved to. Two guarantees that used to be silently ignored are refused before any work happens: the SWMR writer will not accept a `Bounded` it cannot honor, and `File::create_with_options` checks a creation/access pair up front rather than leaving a file on disk and returning the reopen's error.
+
 ### Added
 
 - `FileAccessProperties::with_memory_strategy` and `MemoryStrategy` say how much memory a read-write open may spend holding the file: `Bounded` refuses a file the bounded engine cannot edit rather than mirroring it, `Auto` falls back to the mirror, and `Mirrored` always mirrors. `File::edit_backing` reports which backend an open resolved to, as an `EditBacking` ([#198](https://github.com/stephenberry/hdf5-pure/issues/198)).
@@ -483,7 +487,8 @@ Internal robustness and tests ([#26](https://github.com/stephenberry/hdf5-pure/i
 - The MAT deserializer flattens 1×N and N×1 values to a 1-D sequence in `deserialize_any` (matching `deserialize_seq`).
 - Numeric/complex readers preserve 1×N / N×1 shape at the value layer; any flattening happens at the serde level.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.27.0...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.28.0...HEAD
+[0.28.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.26.0...v0.27.0
 [0.26.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.25.0...v0.26.0
 [0.25.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.24.0...v0.25.0
