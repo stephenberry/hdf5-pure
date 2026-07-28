@@ -1362,14 +1362,15 @@ impl FileWriter {
             Ok(())
         }
         // The dense emitter has bounds of its own — the attribute message's own
-        // 2-byte header fields, the size of the one direct block it builds, and
-        // the record counts of its single-leaf B-trees — which it documents its
-        // callers must check. An attribute set past them was previously written
-        // anyway, producing a heap that reads back empty here and aborts an
-        // assertion-enabled reference C library (issue #191). Between this and the
-        // compact check above, every attribute is bounded on whichever path it
-        // takes. No bound here is on an attribute's size: that is what selects
-        // dense storage, not what it refuses.
+        // 2-byte header fields and the size of the one direct block it builds —
+        // which it documents its callers must check. An attribute set past them
+        // was previously written anyway, producing a heap that reads back empty
+        // here and aborts an assertion-enabled reference C library (issue #191).
+        // Between this and the compact check above, every attribute is bounded on
+        // whichever path it takes. No bound here is on an attribute's size or on
+        // how many there are: the first is what selects dense storage rather than
+        // what it refuses, and the second is unbounded now that both indexes are
+        // multi-level B-trees.
         if root_dense {
             dense_attrs_check(&root_attrs)?;
         } else {
