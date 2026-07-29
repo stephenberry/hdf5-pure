@@ -188,15 +188,83 @@ struct WithOption {
     maybe: Option<String>,
 }
 
+/// Assert `name` is present and carries MATLAB's empty-struct-array marker:
+/// struct-classed, flagged empty, and `[0, 0]`. Checking the class alone would
+/// pass for any struct at all, empty or not.
+fn assert_empty_struct_array(file: &File, name: &str) {
+    let ds = file
+        .dataset(name)
+        .unwrap_or_else(|e| panic!("`{name}` must be present, got: {e}"));
+    let attrs = ds.attrs().unwrap();
+    assert_eq!(
+        attrs.get("MATLAB_class"),
+        Some(&AttrValue::String("struct".into())),
+        "`{name}` must be a struct",
+    );
+    assert!(
+        matches!(attrs.get("MATLAB_empty"), Some(AttrValue::U64(1))),
+        "`{name}` must be flagged empty, got {:?}",
+        attrs.get("MATLAB_empty"),
+    );
+    assert_eq!(ds.shape().unwrap(), vec![0, 0], "`{name}` must be [0, 0]");
+}
+
 #[test]
-fn option_none_is_omitted() {
+fn option_none_becomes_an_empty_struct_array() {
+    // The default `NullPolicy::EmptyStructArray`: the field stays present, so
+    // MATLAB code can reference it unconditionally.
     let v = WithOption {
         required: 1.0,
         maybe: None,
     };
     let file = File::from_bytes(mat::to_bytes(&v).unwrap()).unwrap();
     assert!(file.dataset("required").is_ok());
+    assert_empty_struct_array(&file, "maybe");
+}
+
+/// The same value through the other emitter. `to_bytes` writes through
+/// `ser::emit` and `to_bytes_with_options` through `MatBuilder`, so a default
+/// `Options` has to reach the same file; the two carried different empty
+/// markers until 0.30, which nothing caught while `None` still dropped the
+/// field and never reached one.
+#[test]
+fn option_none_agrees_across_both_emitters() {
+    let v = WithOption {
+        required: 1.0,
+        maybe: None,
+    };
+    let no_options = mat::to_bytes(&v).unwrap();
+    let with_options = mat::to_bytes_with_options(&v, &mat::Options::default()).unwrap();
+    assert_eq!(no_options, with_options);
+
+    let file = File::from_bytes(with_options).unwrap();
+    assert!(file.dataset("required").is_ok());
+    assert_empty_struct_array(&file, "maybe");
+}
+
+#[test]
+fn option_none_is_omitted_under_the_omit_policy() {
+    // `NullPolicy::Omit` is the pre-0.30 serde behavior, now opt-in.
+    let v = WithOption {
+        required: 1.0,
+        maybe: None,
+    };
+    let mut options = mat::Options::default();
+    options.null_policy = mat::NullPolicy::Omit;
+    let file = File::from_bytes(mat::to_bytes_with_options(&v, &options).unwrap()).unwrap();
+    assert!(file.dataset("required").is_ok());
     assert!(file.dataset("maybe").is_err());
+}
+
+#[test]
+fn option_none_is_rejected_under_the_error_policy() {
+    let v = WithOption {
+        required: 1.0,
+        maybe: None,
+    };
+    let mut options = mat::Options::default();
+    options.null_policy = mat::NullPolicy::Error;
+    assert!(mat::to_bytes_with_options(&v, &options).is_err());
 }
 
 #[test]
@@ -210,10 +278,9 @@ fn option_some_serializes_underlying() {
     assert_eq!(ds.shape().unwrap(), vec![5, 1]);
 }
 
-// A Rust unit `()` — the shape `serde_json::Value::Null` serializes as — is
-// dropped from its parent struct exactly like `Option::None`, instead of
-// aborting the whole encode. See the `serialize_unit` handler in
-// `mat/ser/value_ser.rs`.
+// A Rust unit `()` — the shape `serde_json::Value::Null` serializes as — goes
+// through `null_policy` exactly like `Option::None`, instead of aborting the
+// whole encode. See the `serialize_unit` handler in `mat/ser/value_ser.rs`.
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 struct WithNullMeta {
     id: u32,
@@ -222,7 +289,7 @@ struct WithNullMeta {
 }
 
 #[test]
-fn null_field_is_omitted_like_none() {
+fn null_field_lowers_like_none() {
     let v = WithNullMeta {
         id: 7,
         meta: serde_json::Value::Null,
@@ -231,20 +298,20 @@ fn null_field_is_omitted_like_none() {
     // `UnsupportedType("() / unit")`.
     let bytes = mat::to_bytes(&v).expect("Null field must not abort the encode");
     let file = File::from_bytes(bytes.clone()).unwrap();
-    // `id` survives; the Null `meta` field is dropped, just like `None`.
     assert!(file.dataset("id").is_ok());
-    assert!(file.dataset("meta").is_err());
-    // The dropped field reads back to its serde default: `Value`'s default is
-    // `Value::Null`, so the whole record round-trips.
+    assert_empty_struct_array(&file, "meta");
+    // `struct([])` reads back as a unit, so `Value::Null` survives the trip.
     let back: WithNullMeta = mat::from_bytes(&bytes).unwrap();
     assert_eq!(back, v);
 }
 
 #[test]
-fn dropped_unit_field_without_default_fails_to_deserialize() {
-    // Documents the read-back contract the docs describe: a non-`Option` field
-    // that serialized away must carry `#[serde(default)]` to reconstruct. The
-    // encode still succeeds; only the deserialize of the absent field fails.
+fn omitted_unit_field_without_default_fails_to_deserialize() {
+    // Documents the read-back contract for `NullPolicy::Omit`: a non-`Option`
+    // field that serialized away must carry `#[serde(default)]` to
+    // reconstruct. The encode still succeeds; only the deserialize of the
+    // absent field fails. Under the default policy the field is present, so
+    // this hazard is specific to opting into `Omit`.
     #[derive(Serialize)]
     struct Writer {
         id: u32,
@@ -257,10 +324,15 @@ fn dropped_unit_field_without_default_fails_to_deserialize() {
         #[allow(dead_code)]
         meta: serde_json::Value, // no #[serde(default)]
     }
-    let bytes = mat::to_bytes(&Writer {
-        id: 1,
-        meta: serde_json::Value::Null,
-    })
+    let mut options = mat::Options::default();
+    options.null_policy = mat::NullPolicy::Omit;
+    let bytes = mat::to_bytes_with_options(
+        &Writer {
+            id: 1,
+            meta: serde_json::Value::Null,
+        },
+        &options,
+    )
     .unwrap();
     let err = mat::from_bytes::<ReaderNoDefault>(&bytes).unwrap_err();
     assert!(
@@ -270,10 +342,10 @@ fn dropped_unit_field_without_default_fails_to_deserialize() {
 }
 
 #[test]
-fn some_null_is_omitted_like_none() {
+fn some_null_lowers_like_none() {
     // `Some(Value::Null)` forwards through `serialize_some` to the inner
-    // `serialize_unit`, so it drops the field too — the pre-fix behavior made
-    // wrapping in `Option` an unreliable workaround.
+    // `serialize_unit`, so it takes the same path as a bare `None`; wrapping in
+    // `Option` is not a way to sidestep the policy.
     #[derive(Serialize)]
     struct S {
         id: u32,
@@ -285,11 +357,11 @@ fn some_null_is_omitted_like_none() {
     };
     let file = File::from_bytes(mat::to_bytes(&v).unwrap()).unwrap();
     assert!(file.dataset("id").is_ok());
-    assert!(file.dataset("meta").is_err());
+    assert_empty_struct_array(&file, "meta");
 }
 
 #[test]
-fn unit_struct_field_is_omitted() {
+fn unit_struct_field_lowers_like_none() {
     #[derive(Serialize)]
     struct Marker;
     #[derive(Serialize)]
@@ -306,7 +378,215 @@ fn unit_struct_field_is_omitted() {
     )
     .unwrap();
     assert!(file.dataset("id").is_ok());
-    assert!(file.dataset("marker").is_err());
+    assert_empty_struct_array(&file, "marker");
+}
+
+// A flat numeric or complex sequence is collected packed, one element wide,
+// rather than one 56-byte `MatValue` per element. These pin the point where it
+// stops being packed: an element that breaks the pattern must spill the run
+// collected so far back into individual values without losing or reordering
+// any of it.
+
+#[test]
+fn sequence_that_changes_scalar_type_midway_keeps_every_element() {
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    struct S {
+        items: Vec<serde_json::Value>,
+    }
+    let v = S {
+        items: vec![
+            serde_json::json!(1.0),
+            serde_json::json!(2.0),
+            serde_json::json!(3.0),
+            serde_json::json!("four"),
+            serde_json::json!(5.0),
+        ],
+    };
+    let bytes = mat::to_bytes(&v).unwrap();
+    let file = File::from_bytes(bytes.clone()).unwrap();
+    let ds = file.dataset("items").unwrap();
+    assert_eq!(
+        ds.attrs().unwrap().get("MATLAB_class"),
+        Some(&AttrValue::String("cell".into())),
+        "a run broken by a string lowers to a cell"
+    );
+    let back: S = mat::from_bytes(&bytes).unwrap();
+    assert_eq!(back, v, "the spilled run must survive element for element");
+}
+
+#[test]
+fn sequence_that_changes_numeric_width_midway_keeps_every_element() {
+    // Same spill, triggered by a tag change rather than a kind change: an
+    // integer after a run of floats cannot extend the packed vector.
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    struct S {
+        items: Vec<serde_json::Value>,
+    }
+    let v = S {
+        items: vec![
+            serde_json::json!(1.5),
+            serde_json::json!(2.5),
+            serde_json::json!(7u64),
+        ],
+    };
+    let bytes = mat::to_bytes(&v).unwrap();
+    let back: S = mat::from_bytes(&bytes).unwrap();
+    assert_eq!(back, v);
+}
+
+#[test]
+fn long_flat_numeric_sequence_still_lowers_to_one_array() {
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    struct S {
+        items: Vec<f64>,
+    }
+    let v = S {
+        items: (0..10_000).map(|i| i as f64).collect(),
+    };
+    let bytes = mat::to_bytes(&v).unwrap();
+    let file = File::from_bytes(bytes.clone()).unwrap();
+    let ds = file.dataset("items").unwrap();
+    assert_eq!(
+        ds.attrs().unwrap().get("MATLAB_class"),
+        Some(&AttrValue::String("double".into())),
+        "a flat numeric run stays one array, not a cell of scalars"
+    );
+    assert_eq!(ds.shape().unwrap(), vec![1, 10_000]);
+    let back: S = mat::from_bytes(&bytes).unwrap();
+    assert_eq!(back, v);
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+enum Width {
+    #[serde(rename = "i16")]
+    I16,
+    #[serde(rename = "complex_f32")]
+    ComplexF32,
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+struct WithWidth {
+    width: Width,
+}
+
+#[test]
+fn unit_variant_defaults_to_its_name() {
+    let file = File::from_bytes(
+        mat::to_bytes(&WithWidth {
+            width: Width::ComplexF32,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let ds = file.dataset("width").unwrap();
+    assert_eq!(
+        ds.attrs().unwrap().get("MATLAB_class"),
+        Some(&AttrValue::String("char".into()))
+    );
+    let s = String::from_utf16(&ds.read_u16().unwrap()).unwrap();
+    assert_eq!(s, "complex_f32");
+}
+
+fn index_options() -> mat::Options {
+    let mut options = mat::Options::default();
+    options.unit_variant_encoding = mat::UnitVariantEncoding::Index;
+    options
+}
+
+#[test]
+fn unit_variant_can_be_written_as_its_index() {
+    let bytes = mat::to_bytes_with_options(
+        &WithWidth {
+            width: Width::ComplexF32,
+        },
+        &index_options(),
+    )
+    .unwrap();
+    let file = File::from_bytes(bytes).unwrap();
+    let ds = file.dataset("width").unwrap();
+    assert_eq!(ds.shape().unwrap(), vec![1, 1]);
+    assert_eq!(
+        ds.attrs().unwrap().get("MATLAB_class"),
+        Some(&AttrValue::String("uint32".into()))
+    );
+    assert_eq!(ds.read_u32().unwrap(), vec![1]);
+}
+
+#[test]
+fn unit_variant_written_as_an_index_reads_back() {
+    let v = WithWidth {
+        width: Width::ComplexF32,
+    };
+    let bytes = mat::to_bytes_with_options(&v, &index_options()).unwrap();
+    let back: WithWidth = mat::from_bytes(&bytes).unwrap();
+    assert_eq!(back, v);
+}
+
+#[test]
+fn unit_variant_written_as_a_name_reads_back() {
+    let v = WithWidth { width: Width::I16 };
+    let back: WithWidth = mat::from_bytes(&mat::to_bytes(&v).unwrap()).unwrap();
+    assert_eq!(back, v);
+}
+
+/// The reader takes an index from whatever numeric class the file happens to
+/// carry, since a file edited in MATLAB brings `double` rather than `uint32`.
+#[test]
+fn unit_variant_index_reads_from_a_double() {
+    let mut mb = mat::MatBuilder::new(mat::Options::default());
+    mb.write_scalar_f64("width", 1.0).unwrap();
+    let back: WithWidth = mat::from_bytes(&mb.finish().unwrap()).unwrap();
+    assert_eq!(back.width, Width::ComplexF32);
+}
+
+/// An index the enum has no variant for is serde's error to report, not a
+/// silently wrong variant.
+#[test]
+fn unit_variant_index_out_of_range_is_an_error() {
+    let mut mb = mat::MatBuilder::new(mat::Options::default());
+    mb.write_scalar_u32("width", 99).unwrap();
+    let err = mat::from_bytes::<WithWidth>(&mb.finish().unwrap()).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("99"), "unexpected error: {msg}");
+}
+
+#[derive(Serialize)]
+struct WithEmptySeq {
+    items: Vec<Nested>,
+}
+
+#[derive(Serialize)]
+struct Nested {
+    #[allow(dead_code)]
+    a: u32,
+}
+
+#[test]
+fn empty_sequence_defaults_to_an_empty_double_array() {
+    let file =
+        File::from_bytes(mat::to_bytes(&WithEmptySeq { items: Vec::new() }).unwrap()).unwrap();
+    let ds = file.dataset("items").unwrap();
+    assert_eq!(
+        ds.attrs().unwrap().get("MATLAB_class"),
+        Some(&AttrValue::String("double".into()))
+    );
+}
+
+#[test]
+fn empty_sequence_can_be_written_as_an_empty_cell() {
+    // An empty `serialize_seq` carries no element type; `Cell` is the right
+    // answer when the sequence would have held structs.
+    let mut options = mat::Options::default();
+    options.empty_sequence_policy = mat::EmptySequencePolicy::Cell;
+    let file = File::from_bytes(
+        mat::to_bytes_with_options(&WithEmptySeq { items: Vec::new() }, &options).unwrap(),
+    )
+    .unwrap();
+    let ds = file.dataset("items").unwrap();
+    assert_eq!(
+        ds.attrs().unwrap().get("MATLAB_class"),
+        Some(&AttrValue::String("cell".into()))
+    );
 }
 
 #[test]

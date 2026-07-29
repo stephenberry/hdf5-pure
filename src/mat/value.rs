@@ -110,6 +110,29 @@ impl NumVec {
         }
     }
 
+    /// Consume the vector as a stream of scalars. For a caller that is
+    /// unpacking the whole thing, unlike [`get`](Self::get)'s cursor walk.
+    pub(crate) fn into_scalars(self) -> Box<dyn Iterator<Item = ScalarNum>> {
+        macro_rules! stream {
+            ($v:expr, $ctor:path) => {
+                Box::new($v.into_iter().map($ctor))
+            };
+        }
+        match self {
+            NumVec::Bool(v) => stream!(v, ScalarNum::Bool),
+            NumVec::F64(v) => stream!(v, ScalarNum::F64),
+            NumVec::F32(v) => stream!(v, ScalarNum::F32),
+            NumVec::I64(v) => stream!(v, ScalarNum::I64),
+            NumVec::I32(v) => stream!(v, ScalarNum::I32),
+            NumVec::I16(v) => stream!(v, ScalarNum::I16),
+            NumVec::I8(v) => stream!(v, ScalarNum::I8),
+            NumVec::U64(v) => stream!(v, ScalarNum::U64),
+            NumVec::U32(v) => stream!(v, ScalarNum::U32),
+            NumVec::U16(v) => stream!(v, ScalarNum::U16),
+            NumVec::U8(v) => stream!(v, ScalarNum::U8),
+        }
+    }
+
     pub(crate) fn tag(&self) -> ScalarTag {
         match self {
             NumVec::Bool(_) => ScalarTag::Bool,
@@ -329,6 +352,17 @@ macro_rules! complex_kinds {
                 }
             }
 
+            /// Consume the vector as a stream of pairs. For a caller that is
+            /// unpacking the whole thing, unlike [`get`](Self::get)'s cursor
+            /// walk.
+            pub(crate) fn into_pairs(self) -> Box<dyn Iterator<Item = ComplexNum>> {
+                match self {
+                    $(ComplexVec::$variant(v) => {
+                        Box::new(v.into_iter().map(|(re, im)| ComplexNum::$variant(re, im)))
+                    })*
+                }
+            }
+
             /// The pair at `index`, or `None` if out of bounds.
             pub(crate) fn get(&self, index: usize) -> Option<ComplexNum> {
                 match self {
@@ -395,7 +429,9 @@ complex_kinds! {
 /// Intermediate tree node produced by the value serializer.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum MatValue {
-    /// Placeholder for `Option::None` — the containing struct drops the field.
+    /// Instruction to write nothing: the containing struct drops the field.
+    /// Produced by `Option::None` and friends only under `NullPolicy::Omit`;
+    /// the default lowers them to an empty struct array instead.
     Omit,
     /// Numeric / logical scalar.
     Scalar(ScalarNum),

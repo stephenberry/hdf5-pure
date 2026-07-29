@@ -68,13 +68,16 @@ The serializer maps Rust types to HDF5 datasets and the MATLAB classes MATLAB ex
 | `Matrix<T>` or `Vec<Vec<T>>` of same length | column-major 2-D dataset, HDF5 shape `[cols, rows]` |
 | `Complex64` / `Complex32` / `ComplexI16` / … | compound `{real, imag}` dataset, `MATLAB_class` = the *component* class |
 | nested struct | HDF5 group with `MATLAB_class = "struct"`, `MATLAB_fields` |
-| `Option<T>` (struct field) | omitted if `None` |
-| unit `()` / unit struct / `serde_json::Value::Null` (struct field) | omitted, same as `None` (see caveat below) |
-| unit enum variant | UTF-16 char dataset holding the variant name |
+| `Option<T>` (struct field) | `struct([])` if `None`; `NullPolicy::Omit` drops the field instead, `NullPolicy::Error` refuses it |
+| unit `()` / unit struct / `serde_json::Value::Null` (struct field) | same as `None` (see note below) |
+| unit enum variant | UTF-16 char dataset holding the variant name; `UnitVariantEncoding::Index` writes the declaration index as `uint32` instead |
+| empty `Vec<T>` | empty `double` (`[]`); `EmptySequencePolicy::Cell` writes `{}` instead |
 | `Vec<Struct>` / `Vec<Option<T>>` / ragged `Vec<Vec<T>>` | cell array (`MATLAB_class = "cell"`, object references into `#refs#`); `None` slots become `struct([])` |
 
-!!! note "Unit and `null` fields round-trip with `#[serde(default)]`"
-    A struct field that serializes as a Rust unit `()` is dropped from the output, exactly like `Option::None`. The most common case is a `serde_json::Value::Null` field, since `serde_json` serializes `Value::Null` via `serialize_unit`. Because the field is absent on disk, reading it back needs `#[serde(default)]` on the field (or an `Option<T>` field, which serde defaults to `None` automatically); with a default, a `serde_json::Value` field reconstructs as `Value::Null`. A non-`Option` field that has no serde default fails to deserialize the dropped field with a missing-field error, so add `#[serde(default)]` (or use `Option<T>`) if the field can be absent.
+!!! note "Unit and `null` fields"
+    A struct field that serializes as a Rust unit `()` is written exactly like `Option::None`. The most common case is a `serde_json::Value::Null` field, since `serde_json` serializes `Value::Null` via `serialize_unit`.
+
+    Under the default `NullPolicy::EmptyStructArray` the field is present on disk as MATLAB `struct([])`, so `isfield` reports `true`, MATLAB code can reference it unconditionally and test it with `isempty`, and reading it back needs nothing special. Under `NullPolicy::Omit` (which is what this writer did unconditionally before 0.30) the field is absent instead, and reading it back needs `#[serde(default)]` on the field, or an `Option<T>` field, which serde defaults to `None` automatically. A non-`Option` field with no serde default fails to deserialize an omitted field with a missing-field error.
 
 ### 1-D vector orientation
 
