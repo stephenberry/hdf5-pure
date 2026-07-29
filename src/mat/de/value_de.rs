@@ -1140,6 +1140,11 @@ fn variant_index(s: &ScalarNum) -> Option<u64> {
     /// 2^64, exactly representable. One past the largest `u64`.
     const TWO_POW_64: f64 = 18_446_744_073_709_551_616.0;
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the guard admits only a non-negative whole f64 below 2^64, which \
+                  is exactly the range u64 represents, so the cast is lossless"
+    )]
     fn whole(x: f64) -> Option<u64> {
         // Strict `<`: `u64::MAX as f64` rounds *up* to 2^64, so `<=` would
         // admit exactly 2^64 and then saturate it to `u64::MAX` on the cast,
