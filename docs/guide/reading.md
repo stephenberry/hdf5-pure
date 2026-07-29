@@ -84,7 +84,7 @@ Four accessors describe a dataset's storage layout without reading any data. The
 | `Dataset::is_chunked()` | `bool` — `true` for chunked storage; filtered datasets are always chunked |
 | `Dataset::maxshape()` | `Option<Vec<u64>>` — maximum dimensions, an unlimited axis reported as `u64::MAX`; `None` for a fixed-shape dataset |
 | `Dataset::chunk_shape()` | `Option<Vec<u64>>` — chunk dimensions, one per rank; `None` when not chunked |
-| `Dataset::filters()` | `Vec<u16>` — HDF5 filter IDs in pipeline order (1 = deflate, 2 = shuffle, 3 = fletcher32, 6 = scale-offset); empty when unfiltered |
+| `Dataset::filters()` | `Vec<u16>` — HDF5 filter IDs in pipeline order (1 = deflate, 2 = shuffle, 3 = fletcher32, 6 = scale-offset, 32000 = LZF); empty when unfiltered |
 
 ```rust
 use hdf5_pure::File;

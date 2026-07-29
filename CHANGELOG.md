@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `DatasetBuilder::with_lzf` writes h5py's LZF filter (id 32000), a fast lossless compressor h5py reads without any plugin, and LZF datasets — including h5py-written ones — can be read, edited in place, and repacked; combining LZF with deflate is refused ([#231](https://github.com/stephenberry/hdf5-pure/pull/231)).
+
 ## [0.29.0] - 2026-07-28
 
 Dense attributes take on the reference library's geometry: both indexes are multi-level B-trees of 512-byte nodes, and the heap is a doubling table of direct blocks reached through indirect blocks, so a large attribute set grows by adding blocks rather than rounding one up to a power of two. The two attribute-count ceilings go with it, along with the errors that reported them, and the remaining heap-size error now bounds the heap's address space rather than one direct block — the release's only breaking changes ([#195](https://github.com/stephenberry/hdf5-pure/issues/195)). MAT v7.3 files no longer have to be held in memory to be written: `MatBuilder::finish_to` assembles onto any `io::Write`, `MatBuilder::write_blocks` stages a numeric array whose bytes a `DataProducer` supplies one block at a time, `mat::to_file` streams rather than buffering, and `FileBuilder::with_userblock_content` keeps a wrapper format's header reachable on those paths ([#226](https://github.com/stephenberry/hdf5-pure/pull/226)). Chunked datasets are written back to back instead of padded to the host's cache line, which aligned nothing measurable and made the same dataset larger on `aarch64` than on `x86_64` ([#227](https://github.com/stephenberry/hdf5-pure/issues/227)). One soundness fix: a MATLAB matrix shape whose `rows * cols` wraps `usize` is refused at every entry point, where the wrapped product could previously match a short data vector and the writer's transpose then wrote past its allocation ([#230](https://github.com/stephenberry/hdf5-pure/pull/230)). Files written by earlier versions still read.

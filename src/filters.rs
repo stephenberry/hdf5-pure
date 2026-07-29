@@ -15,7 +15,8 @@ use crate::error::FormatError;
 #[cfg(feature = "zfp")]
 use crate::filter_pipeline::FILTER_ZFP;
 use crate::filter_pipeline::{
-    FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SCALEOFFSET, FILTER_SHUFFLE, FilterPipeline,
+    FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_LZF, FILTER_SCALEOFFSET, FILTER_SHUFFLE,
+    FilterPipeline,
 };
 use crate::scaleoffset::ScaleOffsetType;
 #[cfg(feature = "zfp")]
@@ -141,10 +142,12 @@ pub fn decompress_chunk(
         let input: &[u8] = owned.as_deref().unwrap_or(compressed);
         let next = match filter.filter_id {
             FILTER_SHUFFLE => shuffle_decompress(input, ctx.element_size as usize)?,
-            FILTER_DEFLATE => deflate_decompress(
-                input,
-                deflate_output_cap(expected, pipeline, filter_mask, i),
-            )?,
+            FILTER_DEFLATE => {
+                deflate_decompress(input, inner_output_cap(expected, pipeline, filter_mask, i))?
+            }
+            FILTER_LZF => {
+                crate::lzf::decompress(input, inner_output_cap(expected, pipeline, filter_mask, i))?
+            }
             FILTER_FLETCHER32 => fletcher32_verify(input)?,
             FILTER_SCALEOFFSET => crate::scaleoffset::decompress(input, filter)?,
             #[cfg(feature = "zfp")]
@@ -194,6 +197,11 @@ fn filter_max_forward_output(filter_id: u16, in_size: usize) -> usize {
     match filter_id {
         // Fletcher32 appends a 4-byte checksum.
         FILTER_FLETCHER32 => in_size.saturating_add(4),
+        // A conforming LZF encoder may emit every byte as its own literal run
+        // (control byte + literal), so a stream is at most twice its decoded
+        // size; matches are denser. Efficient encoders stay near in_size/32
+        // overhead, but the bound must admit any conforming stream.
+        FILTER_LZF => in_size.saturating_mul(2),
         // Scale-offset prepends a fixed header and, when the data does not pack
         // smaller, stores it verbatim after that header.
         FILTER_SCALEOFFSET => in_size.saturating_add(crate::scaleoffset::HEADER_LEN),
@@ -207,18 +215,19 @@ fn filter_max_forward_output(filter_id: u16, in_size: usize) -> usize {
     }
 }
 
-/// Upper bound for a deflate stage's decoded output: the final chunk size
+/// Upper bound for a byte-compressor stage's decoded output: the final chunk size
 /// (`expected`) pushed forward through every surviving lower-forward-index
-/// filter. `None` (size unknown) leaves deflate uncapped. A masked filter did
-/// not run on the write path, so it does not change the intermediate size.
-fn deflate_output_cap(
+/// filter. `None` (size unknown) leaves the byte-compressor stage (deflate,
+/// LZF) uncapped. A masked filter did not run on the write path, so it does
+/// not change the intermediate size.
+fn inner_output_cap(
     expected: Option<usize>,
     pipeline: &FilterPipeline,
     filter_mask: u32,
-    deflate_index: usize,
+    filter_index: usize,
 ) -> Option<usize> {
     let mut size = expected?;
-    for (j, f) in pipeline.filters[..deflate_index].iter().enumerate() {
+    for (j, f) in pipeline.filters[..filter_index].iter().enumerate() {
         if j < 32 && (filter_mask >> j) & 1 == 1 {
             continue;
         }
@@ -243,6 +252,7 @@ pub fn compress_chunk(
                 let level = filter.client_data.first().copied().unwrap_or(6);
                 deflate_compress(input, level)?
             }
+            FILTER_LZF => crate::lzf::compress(input),
             FILTER_FLETCHER32 => fletcher32_append(input)?,
             FILTER_SCALEOFFSET => crate::scaleoffset::compress(input, filter)?,
             #[cfg(feature = "zfp")]

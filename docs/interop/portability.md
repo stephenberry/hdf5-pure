@@ -105,15 +105,16 @@ standard on-disk format. Files this crate writes are readable by the reference
 HDF5 C library, by `h5py`, and by MATLAB; files those tools produce are readable
 here. This holds for the format features the crate supports — multiple
 superblock versions, object header layouts, contiguous and chunked storage, and
-the built-in deflate, shuffle, and scale-offset filters.
+the built-in deflate, shuffle, and scale-offset filters, plus h5py's LZF.
 
 Interoperability is not asserted by hand. It is enforced by byte-level
 crosscheck tests that compare the bytes this crate emits against fixtures
 produced by the reference toolchain, so a regression in the on-disk layout fails
 the test suite rather than slipping out as a quietly incompatible file. The same
 discipline backs the optional [ZFP filter](../guide/compression.md)
-(`src/zfp_crosscheck.rs` compares against `h5py` + `hdf5plugin`) and the MATLAB
-`.mat` path. For the cross-tool story in depth, see the
+(`src/zfp_crosscheck.rs` compares against `h5py` + `hdf5plugin`), the
+[LZF filter](../guide/compression.md) (`src/lzf_crosscheck.rs` compares against
+h5py's built-in LZF), and the MATLAB `.mat` path. For the cross-tool story in depth, see the
 [MATLAB interop page](matlab.md).
 
 ### Host-independent output

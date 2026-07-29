@@ -183,7 +183,8 @@ use crate::file_writer::{
     LENGTH_SIZE, OFFSET_SIZE, build_chunked_dataset_oh, build_dataset_oh, make_link,
 };
 use crate::filter_pipeline::{
-    FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SCALEOFFSET, FILTER_SHUFFLE, FilterPipeline,
+    FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_LZF, FILTER_SCALEOFFSET, FILTER_SHUFFLE,
+    FilterPipeline,
 };
 use crate::filters::{ChunkContext, compress_chunk, decompress_chunk};
 use crate::free_space::FreeList;
@@ -6603,7 +6604,9 @@ fn chunk_index_enumerable(version: u8, chunk_index_type: Option<u8>) -> bool {
 /// rather than letting [`compress_chunk`] surface a raw `UnsupportedFilter`.
 pub(crate) fn pipeline_reencodable(pipeline: &FilterPipeline) -> bool {
     pipeline.filters.iter().all(|f| match f.filter_id {
-        FILTER_DEFLATE | FILTER_SHUFFLE | FILTER_FLETCHER32 | FILTER_SCALEOFFSET => true,
+        FILTER_DEFLATE | FILTER_SHUFFLE | FILTER_FLETCHER32 | FILTER_SCALEOFFSET | FILTER_LZF => {
+            true
+        }
         #[cfg(feature = "zfp")]
         crate::filter_pipeline::FILTER_ZFP => true,
         _ => false,

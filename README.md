@@ -123,7 +123,7 @@ root.delete("sensors/pressure").unwrap();                 // H5Ldelete
 file.commit().unwrap();  // apply staged edits in place
 ```
 
-Contiguous and chunked datasets — the latter with any supported filter (deflate, shuffle, fletcher32, scale-offset) and optionally extensible (unlimited) dimensions — and compact-link groups are supported, and the editor edits files across every on-disk format the reference C library and h5py produce — version 0/1/2/3 superblocks, single- and multi-chunk object headers (a multi-chunk header is collapsed into one chunk on rewrite, and a version 0/1 symbol-table group on the edited path is converted to the latest compact-link format). It refuses, rather than silently degrade the file, anything it cannot reproduce faithfully — a chunked or extensible variable-length addition, dense-storage headers on the edited path, or copying a version-1 object. Within a session the space a deletion frees — for contiguous and chunked datasets alike, including the chunk index — is reused for later writes and the file is truncated when the freed bytes reach the end, so add/delete churn stays bounded instead of only ever growing; for guaranteed compaction across a reopen, see `repack` below.
+Contiguous and chunked datasets — the latter with any supported filter (deflate, shuffle, fletcher32, scale-offset, lzf) and optionally extensible (unlimited) dimensions — and compact-link groups are supported, and the editor edits files across every on-disk format the reference C library and h5py produce — version 0/1/2/3 superblocks, single- and multi-chunk object headers (a multi-chunk header is collapsed into one chunk on rewrite, and a version 0/1 symbol-table group on the edited path is converted to the latest compact-link format). It refuses, rather than silently degrade the file, anything it cannot reproduce faithfully — a chunked or extensible variable-length addition, dense-storage headers on the edited path, or copying a version-1 object. Within a session the space a deletion frees — for contiguous and chunked datasets alike, including the chunk index — is reused for later writes and the file is truncated when the freed bytes reach the end, so add/delete churn stays bounded instead of only ever growing; for guaranteed compaction across a reopen, see `repack` below.
 
 `File::open_rw` takes an exclusive OS advisory lock (the analogue of `H5Pset_file_locking`), so a second editor or any concurrent writer gets `Error::FileLocked` rather than racing on the file. The kernel releases the lock on any process exit, including a crash, so a crashed editor never leaves a stale lock behind. Override the policy with `FileAccessProperties::with_locking` and the `FileLocking` enum, passed to `File::open_rw_with_options`, or set `HDF5_USE_FILE_LOCKING=FALSE` for filesystems (such as some network mounts) where locking is unavailable. `File::open_swmr_writer` and the readers intentionally take no lock: SWMR is single-writer by contract and built for concurrent reads.
 
@@ -431,6 +431,24 @@ builder.create_dataset("readings")
 |---|---|---|
 | `ScaleOffset::Integer(minbits)` | signed/unsigned integers | lossless |
 | `ScaleOffset::FloatDScale(decimals)` | `f32` / `f64` | lossy to `decimals` digits |
+
+### LZF (h5py filter id 32000)
+
+LZF is the fast lossless compressor h5py registers and ships with — the
+natural filter for files exchanged with h5py, which reads it with no plugin
+(the plain C library and MATLAB need h5py's filter plugin). Pairs with
+shuffle; combining it with deflate is refused.
+
+```rust
+builder.create_dataset("fast")
+    .with_f64_data(&data)
+    .with_chunks(&[1000])
+    .with_shuffle()
+    .with_lzf();
+```
+
+Interop is enforced by `src/lzf_crosscheck.rs` against fixtures produced by
+h5py's built-in LZF; see `tests/fixtures/lzf/regen.py`.
 
 ### ZFP (optional, `zfp` feature)
 

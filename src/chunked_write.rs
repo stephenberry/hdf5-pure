@@ -13,8 +13,8 @@ use crate::extensible_array::{EaGeometry, ExtensibleArrayHeader};
 #[cfg(feature = "zfp")]
 use crate::filter_pipeline::FILTER_ZFP;
 use crate::filter_pipeline::{
-    FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SCALEOFFSET, FILTER_SHUFFLE, FilterDescription,
-    FilterPipeline,
+    FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_LZF, FILTER_SCALEOFFSET, FILTER_SHUFFLE,
+    FilterDescription, FilterPipeline,
 };
 use crate::filters::{ChunkContext, ZfpElementTypeWhenEnabled, compress_chunk};
 use crate::scaleoffset::{ScaleOffset, ScaleOffsetType, build_cd_values};
@@ -39,6 +39,10 @@ pub struct ChunkOptions {
     pub deflate_level: Option<u32>,
     /// Whether to apply shuffle filter before compression.
     pub shuffle: bool,
+    /// Whether to apply the h5py LZF filter (id 32000). Mutually exclusive
+    /// with deflate; ignored when ZFP is active (ZFP replaces byte
+    /// compressors).
+    pub lzf: bool,
     /// Whether to apply fletcher32 checksum.
     pub fletcher32: bool,
     /// ZFP fixed-rate compression (bits per value), None = no ZFP.
@@ -57,6 +61,7 @@ impl ChunkOptions {
         self.chunk_dims.is_some()
             || self.deflate_level.is_some()
             || self.shuffle
+            || self.lzf
             || self.fletcher32
             || self.zfp_enabled()
             || self.scale_offset.is_some()
@@ -93,7 +98,7 @@ impl ChunkOptions {
         let mut filters = Vec::new();
         let _ = zfp_element_type; // used only under the `zfp` feature below
 
-        // ZFP is a standalone compressor — it replaces shuffle + deflate.
+        // ZFP is a standalone compressor — it replaces shuffle, deflate, and lzf.
         #[cfg(feature = "zfp")]
         let zfp_active = if let Some(rate) = self.zfp_rate {
             let elem_ty = zfp_element_type.ok_or_else(|| {
@@ -117,8 +122,8 @@ impl ChunkOptions {
         let zfp_active = false;
 
         // Scale-offset is also a primary transform: mutually exclusive with
-        // ZFP, replaces shuffle, but may be followed by deflate (pushed first
-        // so the pipeline order is [scaleoffset, deflate]).
+        // ZFP, replaces shuffle, but may be followed by a byte compressor
+        // (pushed first so the pipeline order is [scaleoffset, lzf|deflate]).
         let scaleoffset_active = if let Some(mode) = self.scale_offset {
             if zfp_active {
                 return Err(FormatError::FilterError(
@@ -152,6 +157,24 @@ impl ChunkOptions {
                 name: None,
                 flags: 0,
                 client_data: vec![element_size],
+            });
+        }
+
+        // LZF fills the same byte-compressor slot as deflate (h5py's convention
+        // is shuffle then lzf); stacking two byte compressors is never useful,
+        // so requesting both is refused like the scale-offset/ZFP clash.
+        if !zfp_active && self.lzf {
+            if self.deflate_level.is_some() {
+                return Err(FormatError::FilterError(
+                    "lzf and deflate cannot be combined on one dataset".into(),
+                ));
+            }
+            filters.push(FilterDescription {
+                filter_id: FILTER_LZF,
+                // Ids >= 256 serialize a name; "lzf" is h5py's registered name.
+                name: Some("lzf".into()),
+                flags: 0,
+                client_data: crate::lzf::h5py_cd_values(element_size, chunk_dims).to_vec(),
             });
         }
 

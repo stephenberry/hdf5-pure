@@ -1,0 +1,121 @@
+{
+  "generator": "h5py 3.16.0, numpy 2.4.4",
+  "fixtures": [
+    {
+      "name": "i32_ramp",
+      "dtype": "i32",
+      "shape": [
+        1024
+      ],
+      "chunk_shape": [
+        1024
+      ],
+      "filters": [
+        32000
+      ],
+      "lzf_flags": 1,
+      "cd_values_u32": [
+        4,
+        261,
+        4096
+      ],
+      "filter_mask": 0,
+      "raw_bytes_len": 4096,
+      "compressed_bytes_len": 4091,
+      "notes": "compressible monotonic ramp, lzf only"
+    },
+    {
+      "name": "u8_noise",
+      "dtype": "u8",
+      "shape": [
+        4096
+      ],
+      "chunk_shape": [
+        4096
+      ],
+      "filters": [
+        32000
+      ],
+      "lzf_flags": 1,
+      "cd_values_u32": [
+        4,
+        261,
+        4096
+      ],
+      "filter_mask": 1,
+      "raw_bytes_len": 4096,
+      "compressed_bytes_len": 4096,
+      "notes": "incompressible; h5py's optional LZF stores the chunk raw with the filter-mask bit set"
+    },
+    {
+      "name": "i16_rle",
+      "dtype": "i16",
+      "shape": [
+        2048
+      ],
+      "chunk_shape": [
+        2048
+      ],
+      "filters": [
+        32000
+      ],
+      "lzf_flags": 1,
+      "cd_values_u32": [
+        4,
+        261,
+        4096
+      ],
+      "filter_mask": 0,
+      "raw_bytes_len": 4096,
+      "compressed_bytes_len": 68,
+      "notes": "long constant runs (overlapping back-references)"
+    },
+    {
+      "name": "f64_shuffle_lzf",
+      "dtype": "f64",
+      "shape": [
+        512
+      ],
+      "chunk_shape": [
+        512
+      ],
+      "filters": [
+        2,
+        32000
+      ],
+      "lzf_flags": 1,
+      "cd_values_u32": [
+        4,
+        261,
+        4096
+      ],
+      "filter_mask": 0,
+      "raw_bytes_len": 4096,
+      "compressed_bytes_len": null,
+      "notes": "shuffle+lzf chain; end-to-end .h5 coverage only"
+    },
+    {
+      "name": "i64_multichunk",
+      "dtype": "i64",
+      "shape": [
+        300
+      ],
+      "chunk_shape": [
+        128
+      ],
+      "filters": [
+        32000
+      ],
+      "lzf_flags": 1,
+      "cd_values_u32": [
+        4,
+        261,
+        1024
+      ],
+      "filter_mask": null,
+      "raw_bytes_len": 2400,
+      "compressed_bytes_len": null,
+      "notes": "multi-chunk with partial edge chunk; end-to-end .h5 only"
+    }
+  ]
+}

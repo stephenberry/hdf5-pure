@@ -96,7 +96,8 @@ use crate::data_layout::DataLayout;
 use crate::datatype::{Datatype, ReferenceType};
 use crate::error::{Error, FormatError};
 use crate::filter_pipeline::{
-    FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_SCALEOFFSET, FILTER_SHUFFLE, FilterPipeline,
+    FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_LZF, FILTER_SCALEOFFSET, FILTER_SHUFFLE,
+    FilterPipeline,
 };
 use crate::reader::{Dataset, File, Group};
 use crate::scaleoffset::{self, ScaleOffset};
@@ -593,6 +594,9 @@ fn carry_shape_and_pipeline(
                 FILTER_DEFLATE => {
                     // Client-data[0] is the deflate level; default to 6 if absent.
                     db.with_deflate(f.client_data.first().copied().unwrap_or(6));
+                }
+                FILTER_LZF => {
+                    db.with_lzf();
                 }
                 FILTER_SCALEOFFSET => {
                     // `check_pipeline` guarantees integer (lossless) mode here.
@@ -1376,7 +1380,7 @@ fn check_layout(layout: &DataLayout, path: &str) -> Result<(), Error> {
 /// and re-apply its filters from scratch: a contiguous/compact filtered dataset,
 /// and the sparse-chunked fallback. A filter is safe there only when it is
 /// **lossless** — then the re-encoded chunks decompress to the exact same bytes.
-/// Deflate, shuffle, fletcher32, and integer scale-offset qualify. Float D-scale
+/// Deflate, shuffle, fletcher32, LZF, and integer scale-offset qualify. Float D-scale
 /// scale-offset and ZFP are lossy: re-encoding already-decompressed values is not
 /// guaranteed idempotent, so reproducing them could silently perturb the data,
 /// and they are refused. SZIP this crate cannot write at all.
@@ -1387,9 +1391,18 @@ fn check_pipeline(pipeline: Option<&FilterPipeline>, path: &str) -> Result<(), E
     let Some(p) = pipeline else {
         return Ok(());
     };
+    // Re-encoding replays filters through the builder, which emits its own
+    // fixed order and refuses lzf + deflate on one dataset, so a foreign
+    // pipeline carrying both cannot be reproduced faithfully.
+    let has = |id| p.filters.iter().any(|f| f.filter_id == id);
+    if has(FILTER_LZF) && has(FILTER_DEFLATE) {
+        return Err(Error::RepackUnsupported(format!(
+            "dataset {path}: an lzf + deflate pipeline cannot be re-encoded faithfully"
+        )));
+    }
     for f in &p.filters {
         match f.filter_id {
-            FILTER_DEFLATE | FILTER_SHUFFLE | FILTER_FLETCHER32 => {}
+            FILTER_DEFLATE | FILTER_SHUFFLE | FILTER_FLETCHER32 | FILTER_LZF => {}
             FILTER_SCALEOFFSET => match scaleoffset::scale_offset_mode(&f.client_data) {
                 Some(ScaleOffset::Integer(_)) => {}
                 _ => {
@@ -1438,6 +1451,39 @@ fn join(parent: &str, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A foreign pipeline carrying both lzf and deflate is refused with the
+    /// repack error, not the builder's combination error: the builder replays
+    /// filters in its own fixed order, so the stored order cannot be
+    /// reproduced. The builder cannot produce such a file, hence a synthetic
+    /// pipeline rather than a file-level test.
+    #[test]
+    fn lzf_plus_deflate_pipeline_is_refused() {
+        use crate::filter_pipeline::FilterDescription;
+
+        let pipeline = FilterPipeline {
+            version: 2,
+            filters: vec![
+                FilterDescription {
+                    filter_id: FILTER_LZF,
+                    name: Some("lzf".into()),
+                    flags: 0,
+                    client_data: vec![],
+                },
+                FilterDescription {
+                    filter_id: FILTER_DEFLATE,
+                    name: None,
+                    flags: 0,
+                    client_data: vec![6],
+                },
+            ],
+        };
+        let err = check_pipeline(Some(&pipeline), "d").unwrap_err();
+        assert!(
+            matches!(&err, Error::RepackUnsupported(msg) if msg.contains("lzf + deflate")),
+            "unexpected error: {err:?}"
+        );
+    }
 
     #[test]
     fn repack_preserves_big_endian_time_dataset() {
