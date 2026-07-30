@@ -51,11 +51,21 @@ pub enum OneDimensionalMode {
 #[non_exhaustive]
 pub enum NullPolicy {
     /// Map `None` to MATLAB `struct([])` (an empty struct array). The field
-    /// stays present, so MATLAB code can reference it unconditionally and
-    /// test it with `isempty`.
+    /// stays present, so MATLAB code can reference it unconditionally and test
+    /// it with `isempty(fieldnames(x))`, which is what this crate's MATLAB
+    /// fixture script checks. Prefer that over a bare `isempty(x)`: the two
+    /// differ for a struct with no fields, and only the `fieldnames` form has
+    /// been verified against MATLAB itself.
     ///
     /// Not expressible at the root, where `struct([])` would need a variable
     /// name to hang on; see the note on this enum.
+    ///
+    /// Reading such a field back is lenient but not universal. It deserializes
+    /// into `Option<T>` as `None`, `Vec<T>` as empty, `serde_json::Value` as
+    /// `Null`, and `()` as `()`. It does *not* deserialize into a bare scalar,
+    /// `String`, struct or map: those report a type error, and `#[serde(default)]`
+    /// does not help, because the field is present rather than missing. A reader
+    /// that wants a default for a null field needs an `Option<T>` field.
     EmptyStructArray,
     /// Drop the field from its parent struct entirely, so `isfield` reports
     /// `false` and `s.field` raises. This is what the serde writer did
@@ -198,6 +208,12 @@ pub enum EmptyMarkerEncoding {
 /// different type information, never as an oversight.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+// Applied to the struct, not to individual fields: this type gains fields, and a
+// persisted `Options` written by an older version must keep loading. Per-field
+// attributes would have to be remembered on every future addition, which is
+// exactly what was forgotten when `unit_variant_encoding` and
+// `empty_sequence_policy` were added.
+#[cfg_attr(feature = "serde", serde(default))]
 #[non_exhaustive]
 pub struct Options {
     /// MATLAB class for string values.

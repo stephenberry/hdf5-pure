@@ -651,7 +651,19 @@ impl SerializeStruct for StructSer<'_> {
                     fields.cols = Some(expect_usize(v, "Matrix::cols")?);
                 }
                 "data" => {
-                    let v = value.serialize(vs)?;
+                    // `Matrix::data` is the sentinel's own payload, not a
+                    // sequence the caller wrote, so `empty_sequence_policy` has
+                    // no business reaching it. Under `Cell` an empty matrix
+                    // lowered to a cell array, and `matrix_from_fields` then had
+                    // no `Vec1D` left to recover the element class from, which
+                    // made every empty `Matrix<T>` unserializable. Pin the policy
+                    // rather than teaching the sentinel handler to accept a shape
+                    // it should never receive.
+                    let pinned = Options {
+                        empty_sequence_policy: EmptySequencePolicy::DoubleArray,
+                        ..self.opts.clone()
+                    };
+                    let v = value.serialize(ValueSerializer::new(&pinned))?;
                     fields.data = Some(v);
                 }
                 other => {

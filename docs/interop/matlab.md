@@ -78,7 +78,11 @@ The serializer maps Rust types to HDF5 datasets and the MATLAB classes MATLAB ex
 !!! note "Unit and `null` fields"
     A struct field that serializes as a Rust unit `()` is written exactly like `Option::None`. The most common case is a `serde_json::Value::Null` field, since `serde_json` serializes `Value::Null` via `serialize_unit`.
 
-    Under the default `NullPolicy::EmptyStructArray` the field is present on disk as MATLAB `struct([])`, so `isfield` reports `true`, MATLAB code can reference it unconditionally and test it with `isempty`, and reading it back needs nothing special. Under `NullPolicy::Omit` (which is what this writer did unconditionally before 0.30) the field is absent instead, and reading it back needs `#[serde(default)]` on the field, or an `Option<T>` field, which serde defaults to `None` automatically. A non-`Option` field with no serde default fails to deserialize an omitted field with a missing-field error.
+    Under the default `NullPolicy::EmptyStructArray` the field is present on disk as MATLAB `struct([])`, so `isfield` reports `true` and MATLAB code can reference it unconditionally and test it with `isempty(fieldnames(x))`. Prefer that over a bare `isempty(x)`: the two differ for a struct with no fields, and only the `fieldnames` form is verified against MATLAB (see `matlab_fixtures/verify.m`).
+
+    Reading it back is lenient but not universal. `struct([])` deserializes into `Option<T>` as `None`, `Vec<T>` as empty, `serde_json::Value` as `Null`, and `()` as `()`. It does **not** deserialize into a bare scalar, `String`, struct or map: those report a type error. Note `#[serde(default)]` does not rescue them, because the field is *present* with a struct value rather than missing, so the default is never consulted. This is the one migration hazard in 0.30: a reader with `#[serde(default)] count: u32` against a writer whose `count` is `None` worked under the pre-0.30 behavior and now fails. Give such a field type `Option<u32>`, or write with `NullPolicy::Omit`.
+
+    Under `NullPolicy::Omit` (which is what this writer did unconditionally before 0.30) the field is absent instead, and reading it back needs `#[serde(default)]` on the field, or an `Option<T>` field, which serde defaults to `None` automatically. A non-`Option` field with no serde default fails to deserialize an omitted field with a missing-field error.
 
 ### 1-D vector orientation
 

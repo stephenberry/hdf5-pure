@@ -951,6 +951,26 @@ fn empty_struct_array_agrees_with_matio_and_across_both_emitters() {
     assert_eq!(var.class_type(), ffi::MAT_C_STRUCT);
     assert_eq!(mf.read("tail").unwrap().scalar_i32(), 7);
 
+    // Pin the geometry matio reports, which the class assertion above does not
+    // cover. Under the zero-element encoding the payload is empty rather than a
+    // dims vector, so matio recovers no dimensions and reports rank 0 with no
+    // elements. That is also what it reports for MATLAB's own empty variables
+    // (see `matlab_fixtures/empty_variants.mat`), so it is the encoding agreeing
+    // with MATLAB rather than a defect. It does mean MATLAB-side emptiness should
+    // be tested with `isempty(fieldnames(x))` rather than a bare `isempty(x)`,
+    // which is what `matlab_fixtures/verify.m` asserts.
+    // Under the zero-element encoding the payload is empty rather than a dims
+    // vector, so matio recovers no dimensions: rank 0, no dims, and therefore an
+    // element count of 1 (the empty product), not 0. It reports the same for
+    // MATLAB's own empty variables (see `matlab_fixtures/empty_variants.mat`), so
+    // this is the encoding agreeing with MATLAB rather than a defect.
+    //
+    // It is also precisely why MATLAB-side emptiness must be tested with
+    // `isempty(fieldnames(x))` and not a bare `isempty(x)`: a reader that trusts
+    // the element count sees one element here. `matlab_fixtures/verify.m` asserts
+    // the `fieldnames` form, and the docs promise only that.
+    assert_eq!((var.rank(), var.dims(), var.nelements()), (0, vec![], 1));
+
     // And the marker's element type is the one matio itself writes. matio uses
     // the data-as-dims encoding, where the payload is the dims vector, so the
     // shapes differ by construction; the element type is the shared part.

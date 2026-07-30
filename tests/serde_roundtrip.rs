@@ -339,6 +339,155 @@ fn a_root_null_writes_the_same_empty_workspace_every_legitimate_route_does() {
     assert!(mat::to_bytes_with_options(&Fieldless {}, &error).is_ok());
 }
 
+/// `Matrix::data` is the sentinel's own payload, not a sequence the caller
+/// wrote, so `empty_sequence_policy` must not reach it. It did, and an empty
+/// matrix then lowered to a cell array that the sentinel handler could not
+/// recover the element class from, making every empty `Matrix<T>` unserializable
+/// under a policy that has nothing to do with matrices.
+#[test]
+fn an_empty_matrix_serializes_under_every_empty_sequence_policy() {
+    #[derive(Serialize)]
+    struct WithMatrix {
+        m: mat::Matrix<f64>,
+    }
+    #[derive(Serialize)]
+    struct WithComplexMatrix {
+        m: mat::Matrix<mat::Complex64>,
+    }
+    #[derive(Serialize)]
+    struct WithVec {
+        v: Vec<f64>,
+    }
+
+    let mut cell = mat::Options::default();
+    cell.empty_sequence_policy = mat::EmptySequencePolicy::Cell;
+
+    for (rows, cols) in [(0usize, 0usize), (0, 5), (5, 0)] {
+        let under_cell = mat::to_bytes_with_options(
+            &WithMatrix {
+                m: mat::Matrix::from_row_major(rows, cols, vec![]),
+            },
+            &cell,
+        )
+        .unwrap_or_else(|e| panic!("empty {rows}x{cols} matrix under Cell: {e}"));
+        let under_default = mat::to_bytes_with_options(
+            &WithMatrix {
+                m: mat::Matrix::from_row_major(rows, cols, vec![]),
+            },
+            &mat::Options::default(),
+        )
+        .unwrap();
+        // The policy is pinned for this field, so it cannot change the output.
+        assert_eq!(
+            under_cell, under_default,
+            "empty {rows}x{cols} matrix must not vary with empty_sequence_policy"
+        );
+    }
+
+    // The complex sentinel recovers its class from the same field.
+    mat::to_bytes_with_options(
+        &WithComplexMatrix {
+            m: mat::Matrix::from_row_major(0, 0, vec![]),
+        },
+        &cell,
+    )
+    .expect("empty complex matrix under Cell");
+
+    // A sequence the caller actually wrote still honors the policy, which is the
+    // distinction the fix has to preserve.
+    let seq_cell = mat::to_bytes_with_options(&WithVec { v: vec![] }, &cell).unwrap();
+    let seq_default =
+        mat::to_bytes_with_options(&WithVec { v: vec![] }, &mat::Options::default()).unwrap();
+    assert_ne!(
+        seq_cell, seq_default,
+        "a user's empty Vec must still follow empty_sequence_policy"
+    );
+}
+
+/// `Options` gains fields, so one persisted by an older version has to keep
+/// loading. `#[serde(default)]` is on the struct rather than on the fields added
+/// in 0.30, so this holds for future additions too without anyone remembering.
+#[test]
+fn an_options_persisted_by_an_older_version_still_deserializes() {
+    // The exact field set 0.29 wrote: the two fields added in 0.30 are absent.
+    let json_0_29 = r#"{
+        "string_class": "Char",
+        "compression": "None",
+        "invalid_name_policy": "Error",
+        "null_policy": "EmptyStructArray",
+        "unsupported_policy": "Error",
+        "one_dimensional_mode": "ColumnVector",
+        "row_major_policy": "ReorderToColumnMajor",
+        "empty_marker_encoding": "ZeroElement"
+    }"#;
+    let opts: mat::Options = serde_json::from_str(json_0_29).expect("0.29 Options must still load");
+    assert_eq!(opts, mat::Options::default());
+
+    // An empty document is the degenerate case of the same property.
+    let all_defaulted: mat::Options = serde_json::from_str("{}").unwrap();
+    assert_eq!(all_defaulted, mat::Options::default());
+}
+
+/// What a `struct([])` field reads back into. This is the migration hazard in
+/// 0.30: the field is now *present*, so `#[serde(default)]` is never consulted
+/// and a non-`Option` target fails where it used to succeed. Pinned here so the
+/// documented leniency set and the real one cannot drift.
+#[test]
+fn an_empty_struct_array_field_reads_back_only_into_these_targets() {
+    #[derive(Serialize)]
+    struct Writer {
+        v: Option<f64>,
+    }
+    let bytes = mat::to_bytes(&Writer { v: None }).unwrap();
+
+    macro_rules! reads_as {
+        ($ty:ty, $expected:expr) => {{
+            #[derive(Deserialize, Debug, PartialEq)]
+            struct R {
+                v: $ty,
+            }
+            let r: R = mat::from_bytes(&bytes).expect("must deserialize");
+            assert_eq!(r.v, $expected);
+        }};
+    }
+    reads_as!(Option<f64>, None);
+    reads_as!(Vec<f64>, Vec::<f64>::new());
+    reads_as!(serde_json::Value, serde_json::Value::Null);
+    reads_as!((), ());
+
+    macro_rules! rejects {
+        ($ty:ty) => {{
+            #[derive(Deserialize, Debug)]
+            struct R {
+                #[allow(dead_code)]
+                v: $ty,
+            }
+            assert!(
+                mat::from_bytes::<R>(&bytes).is_err(),
+                "{} must not silently accept struct([])",
+                stringify!($ty)
+            );
+        }};
+    }
+    rejects!(f64);
+    rejects!(u32);
+    rejects!(bool);
+    rejects!(String);
+
+    // `#[serde(default)]` does not rescue a scalar: the field is present, not
+    // missing, so serde never reaches for the default. This is the hazard.
+    #[derive(Deserialize, Debug)]
+    struct WithDefault {
+        #[serde(default)]
+        #[allow(dead_code)]
+        v: u32,
+    }
+    assert!(
+        mat::from_bytes::<WithDefault>(&bytes).is_err(),
+        "#[serde(default)] must not appear to rescue a present null field"
+    );
+}
+
 #[test]
 fn option_some_serializes_underlying() {
     let v = WithOption {
