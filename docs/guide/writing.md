@@ -167,5 +167,5 @@ All three produce the same file. `finish` is the only one that holds it: `write`
 ## Next steps
 
 - [Reading files](reading.md) to load what you wrote back, including from the in-memory bytes.
-- [Compression](compression.md) for chunking, deflate, shuffle, and scale-offset filters.
+- [Compression](compression.md) for chunking, deflate, shuffle, LZF, and scale-offset filters.
 - [Portability](../interop/portability.md) for how these files interoperate with the reference HDF5 C library, h5py, and MATLAB.

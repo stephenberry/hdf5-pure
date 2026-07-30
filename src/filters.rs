@@ -1,4 +1,5 @@
-//! HDF5 filter implementations: deflate, shuffle, fletcher32.
+//! HDF5 filter implementations: deflate, shuffle, fletcher32, scale-offset,
+//! LZF, and ZFP (the last two behind their own modules).
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -989,6 +990,58 @@ mod tests {
         };
         let data: Vec<u8> = (0u32..200).map(|i| (i % 256) as u8).collect();
         let ctx = ChunkContext::basic(&[200], 1); // expected = 200
+        let compressed = compress_chunk(&data, &pipeline, ctx).unwrap();
+        let decoded = decompress_chunk(&compressed, &pipeline, ctx, 0).unwrap();
+        assert_eq!(decoded, data);
+    }
+
+    /// A file this crate did not write may declare `[lzf, deflate]`, and the
+    /// read path must decode it.
+    ///
+    /// `build_pipeline` refuses that combination on write and `repack`'s
+    /// `check_pipeline` refuses to re-encode it, but neither runs on read:
+    /// `decompress_chunk` honors whatever pipeline a file declares. LZF *grows*
+    /// incompressible input, so deflate here legitimately decodes to more than
+    /// the chunk size, and only the `FILTER_LZF` arm of
+    /// `filter_max_forward_output` raises the cap enough to admit it. Without
+    /// that arm the cap stays at the chunk size and a valid foreign chunk is
+    /// rejected as a decompression bomb — the arm is load-bearing, and this is
+    /// the only pipeline shape that reaches it.
+    #[test]
+    #[cfg(feature = "deflate")]
+    fn foreign_lzf_inner_deflate_outer_roundtrips() {
+        let pipeline = FilterPipeline {
+            version: 2,
+            filters: vec![
+                FilterDescription {
+                    filter_id: FILTER_LZF, // forward index 0 (inner)
+                    name: Some("lzf".into()),
+                    flags: 1,
+                    client_data: vec![4, 0x0105, 4096],
+                },
+                FilterDescription {
+                    filter_id: FILTER_DEFLATE, // forward index 1 (outer)
+                    name: None,
+                    flags: 0,
+                    client_data: vec![6],
+                },
+            ],
+        };
+
+        // Incompressible, so LZF expands rather than shrinks: the whole point
+        // of the case. Compressible data would leave deflate's output under
+        // the chunk size and the bound untested.
+        let mut x = 0x2545_F491_4F6C_DD1D_u64;
+        let data: Vec<u8> = (0..4096)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x & 0xff) as u8
+            })
+            .collect();
+
+        let ctx = ChunkContext::basic(&[4096], 1); // expected = 4096
         let compressed = compress_chunk(&data, &pipeline, ctx).unwrap();
         let decoded = decompress_chunk(&compressed, &pipeline, ctx, 0).unwrap();
         assert_eq!(decoded, data);

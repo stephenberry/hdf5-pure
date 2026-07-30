@@ -127,11 +127,16 @@ def build_cases() -> list[Case]:
             data=np.repeat(np.arange(8), 256),
             notes="long constant runs (overlapping back-references)",
         ),
+        # sqrt, not sin. np.sin is whatever the host libm computes: regenerating
+        # this case on a second machine, with these same pinned h5py and numpy
+        # versions, moved 29 of the 512 values by 1 ULP and rewrote the fixture.
+        # sqrt is correctly rounded by IEEE-754 mandate, so a regen produces the
+        # same bytes anywhere and a real change stands out in the diff.
         Case(
             name="f64_shuffle_lzf",
             dtype="f64",
             shape=(512,),
-            data=np.sin(np.arange(512) * 0.05),
+            data=np.sqrt(np.arange(512)),
             shuffle=True,
             notes="shuffle+lzf chain; end-to-end .h5 coverage only",
         ),
@@ -142,6 +147,37 @@ def build_cases() -> list[Case]:
             data=np.arange(300) * 7 - 500,
             chunks=(128,),
             notes="multi-chunk with partial edge chunk; end-to-end .h5 only",
+        ),
+        # Half noise, half zeros. The noise half forces liblzf to emit literal
+        # runs at the encoding's maximum (ctrl == 31, 32 literals), which no
+        # other fixture reaches — the longest literal run in the rest of the
+        # set is 5 bytes, so an off-by-one in MAX_LITERAL_RUN that shortens the
+        # run is invisible to them. The zero half keeps the chunk compressible
+        # overall, so h5py applies the filter instead of skipping it.
+        Case(
+            name="u8_literal_runs",
+            dtype="u8",
+            shape=(4096,),
+            data=np.concatenate(
+                [xorshift_noise(2048), np.zeros(2048, dtype=np.uint8)]
+            ),
+            notes="maximum-length literal runs (ctrl == 31) followed by a "
+            "compressible tail",
+        ),
+        # The only rank > 1 chunk in the set. cd_values[2] is a product over
+        # element size and every chunk dimension, so a writer that folded over
+        # just the first dimension — or confused the two factors — agrees with
+        # every 1-D fixture and disagrees here (4 * 16 * 10 = 640).
+        #
+        # Constant rows rather than a ramp: at this size an i32 ramp does not
+        # shrink, and h5py then stores the chunk raw, which would leave the
+        # rank-2 stream undecoded by the crosscheck.
+        Case(
+            name="i32_rank2",
+            dtype="i32",
+            shape=(16, 10),
+            data=np.repeat(np.arange(16), 10),
+            notes="rank-2 chunk; pins cd_values[2] as a product over all dims",
         ),
     ]
 

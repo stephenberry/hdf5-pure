@@ -84,7 +84,7 @@
 //!   dropped); an attribute it cannot reproduce is refused.
 //! - Added datasets may be contiguous *or* chunked, with any filter the
 //!   whole-file writer supports (deflate, shuffle, fletcher32, scale-offset,
-//!   ZFP), and may declare extensible (maximum, optionally unlimited)
+//!   LZF, ZFP), and may declare extensible (maximum, optionally unlimited)
 //!   dimensions. A chunked dataset's data and index — and any filtered chunks —
 //!   are produced by the same builder the whole-file writer uses and appended at
 //!   end-of-file, so its object header is byte-identical to a freshly written
@@ -1452,8 +1452,8 @@ impl WriteEngine {
     /// overwrite that forbids any shape change) this **grows** the dataset along
     /// its first (axis-0) dimension. It works on **filtered** datasets: the
     /// appended chunks are compressed through the dataset's own on-disk filter
-    /// pipeline (deflate / shuffle / fletcher32 / scale-offset, and ZFP with the
-    /// `zfp` feature), and the pipeline, datatype, fill value, and attributes are
+    /// pipeline (deflate / shuffle / fletcher32 / scale-offset / LZF, and ZFP
+    /// with the `zfp` feature), and the pipeline, datatype, fill value, and attributes are
     /// preserved verbatim. Appends of any length are supported — when the
     /// dataset's current length is not a whole multiple of the chunk length, the
     /// single trailing partial chunk is read, extended, and re-encoded; every

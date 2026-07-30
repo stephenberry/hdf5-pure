@@ -143,6 +143,14 @@ pub(crate) fn compress(input: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(input.len() + input.len() / MAX_LITERAL_RUN + 2);
     // Slots hold `position + 1`; 0 marks an empty slot, which is why the
     // candidate check below is `> 0`.
+    //
+    // The slot type must index the whole input, not the match distance. A
+    // narrower table has been proposed and measured: `u16` slots wrap on any
+    // chunk over 64 KiB and silently destroy compression there (1 MiB of RLE
+    // data went from 14,356 bytes out to 1,013,048, with no error), and the
+    // speed case does not hold either — `u16` wins 26% at 1 KiB, an absolute
+    // 0.6 us, and loses 6-78% across the 6-16 KiB band on incompressible
+    // input. Keep `usize`.
     let mut table = [0_usize; 1 << 13];
     let mut ip = 0;
     let mut literal_start = 0;
@@ -240,8 +248,10 @@ mod tests {
     #[test]
     fn worst_case_expansion_stream_decodes() {
         // A conforming encoder may emit every byte as its own literal run,
-        // doubling the stream relative to its decoded size. This pins the
-        // 2x bound `filter_max_forward_output` allows for foreign streams.
+        // doubling the stream relative to its decoded size. This checks only
+        // that the decoder accepts such a stream; the matching 2x cap in
+        // `filters::filter_max_forward_output`, which this test does not call,
+        // is pinned by `filters::tests::foreign_lzf_inner_deflate_outer_roundtrips`.
         let stream: Vec<u8> = (0..=255u8).flat_map(|b| [0, b]).collect();
         let expected: Vec<u8> = (0..=255).collect();
         assert_eq!(stream.len(), 2 * expected.len());

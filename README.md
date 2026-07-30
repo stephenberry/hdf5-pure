@@ -12,7 +12,7 @@ Pure-Rust HDF5 reader, writer, and in-place editor. No C dependencies, no build 
 - **SWMR** (single-writer / multiple-reader) append and refreshing read for 1-D unlimited datasets, interoperable with the reference C library and h5py
 - **No C dependencies** — pure Rust, so it compiles to `wasm32-unknown-unknown` and to bare-metal `no_std` (with `alloc`)
 - **MATLAB v7.3 compatible** — userblock support, fixed-length ASCII attributes, variable-length string arrays, object references
-- Deflate, shuffle, and scale-offset (lossless integer / lossy float) compression
+- Deflate, shuffle, LZF, and scale-offset (lossless integer / lossy float) compression
 - Compound types, enumerations, array types
 - Complex number datasets (as compound `{real, imag}`)
 
@@ -25,7 +25,7 @@ Runnable, self-checking examples live in [`examples/`](examples). Run any with `
 | `quickstart` | Build a file in memory and read it back |
 | `generic_io` | Read/write generically over the element type (`with_data` / `read::<T>`) |
 | `groups_and_attributes` | Nested groups and attributes of several types |
-| `compression` | Deflate, shuffle, and scale-offset filters |
+| `compression` | Deflate, shuffle, scale-offset, and LZF filters |
 | `compound_types` | Compound (struct-like) records and complex numbers |
 | `ndarray_io` | N-dimensional array I/O (needs `--features ndarray`) |
 | `edit_in_place` | Add, copy, and delete objects with `File::open_rw` |
@@ -141,7 +141,7 @@ let options = RepackOptions::new()
 repack("input.h5", "compact.h5", &options).unwrap();
 ```
 
-`repack` never silently degrades data: every surviving object is reproduced byte-for-byte — datatype, shape, chunking, supported filters, raw data, and attributes — or the whole operation fails with `Error::RepackUnsupported` naming the object, leaving no output file. It reproduces fixed-point, floating-point, string, time, bit-field, opaque, compound, enumeration, and array datatypes, contiguous or chunked, filtered with deflate, shuffle, fletcher32, and/or lossless integer scale-offset, plus variable-length strings and sequences (contiguous, chunked, filtered, or resizable) and 8-byte object references, whose addresses are rewritten to their targets' new locations. Anything it cannot reproduce exactly — chunked, filtered, or resizable reference datasets, region references, virtual layouts, lossy filters (float D-scale scale-offset, ZFP, SZIP), or an attribute the reader cannot decode — it refuses by name rather than write a file that quietly differs.
+`repack` never silently degrades data: every surviving object is reproduced byte-for-byte — datatype, shape, chunking, supported filters, raw data, and attributes — or the whole operation fails with `Error::RepackUnsupported` naming the object, leaving no output file. It reproduces fixed-point, floating-point, string, time, bit-field, opaque, compound, enumeration, and array datatypes, contiguous or chunked, filtered with deflate, shuffle, fletcher32, LZF, and/or lossless integer scale-offset, plus variable-length strings and sequences (contiguous, chunked, filtered, or resizable) and 8-byte object references, whose addresses are rewritten to their targets' new locations. Anything it cannot reproduce exactly — chunked, filtered, or resizable reference datasets, region references, virtual layouts, lossy filters (float D-scale scale-offset, ZFP, SZIP), or an attribute the reader cannot decode — it refuses by name rather than write a file that quietly differs.
 
 ### File-space strategy
 

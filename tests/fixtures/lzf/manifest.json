@@ -116,6 +116,54 @@
       "raw_bytes_len": 2400,
       "compressed_bytes_len": null,
       "notes": "multi-chunk with partial edge chunk; end-to-end .h5 only"
+    },
+    {
+      "name": "u8_literal_runs",
+      "dtype": "u8",
+      "shape": [
+        4096
+      ],
+      "chunk_shape": [
+        4096
+      ],
+      "filters": [
+        32000
+      ],
+      "lzf_flags": 1,
+      "cd_values_u32": [
+        4,
+        261,
+        4096
+      ],
+      "filter_mask": 0,
+      "raw_bytes_len": 4096,
+      "compressed_bytes_len": 2141,
+      "notes": "maximum-length literal runs (ctrl == 31) followed by a compressible tail"
+    },
+    {
+      "name": "i32_rank2",
+      "dtype": "i32",
+      "shape": [
+        16,
+        10
+      ],
+      "chunk_shape": [
+        16,
+        10
+      ],
+      "filters": [
+        32000
+      ],
+      "lzf_flags": 1,
+      "cd_values_u32": [
+        4,
+        261,
+        640
+      ],
+      "filter_mask": 0,
+      "raw_bytes_len": 640,
+      "compressed_bytes_len": 114,
+      "notes": "rank-2 chunk; pins cd_values[2] as a product over all dims"
     }
   ]
 }
