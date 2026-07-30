@@ -119,9 +119,16 @@ let class: Option<&str> = attrs.get("MATLAB_class").and_then(AttrValue::as_str);
 let fields: Option<Vec<&str>> = attrs.get("MATLAB_fields").and_then(AttrValue::as_strings);
 ```
 
-`as_i64`, `as_i64s`, `as_f64` and `as_f64s` do the same for numbers. `as_i64` widens the narrower integer variants, and reports `None` for a `U64` above `i64::MAX` rather than wrapping it. The float accessors do not convert integers, so a caller that accepts either asks for both.
+`as_i64`, `as_u64`, `as_f64`, `to_i64s`, `to_u64s` and `to_f64s` do the same for numbers. The prefix states the cost: `as_*` borrows or copies, `to_*` allocates. `as_i64` widens the narrower integer variants and reports `None` for a value above `i64::MAX` rather than wrapping it — per element, so the same holds for `to_i64s` at any length. The float accessors do not convert integers, so a caller that accepts either asks for both.
 
-Two things a read cannot recover. Integer and float widths widen to `i64`/`u64`/`f64`, since there are no narrower array variants; and a true variable-length string (`H5T_STRING` with `STRSIZE = VAR`, which this crate's writer never emits) has no variant of its own, so it reads as the fixed-width variant of the same charset and would be rewritten fixed-width.
+What a read cannot recover, because `AttrValue` has no way to express it. Each of these reads correctly but would be rewritten differently:
+
+- **Width.** Integers and floats widen to `i64`/`u64`/`f64`; there are no narrower array variants.
+- **Variable-length strings.** A true `H5T_STRING` with `STRSIZE = VAR` — what h5py writes, and what this crate's writer never emits — has no variant of its own and reads as the fixed-width variant of the same charset.
+- **Rank.** Every array variant is one-dimensional, so a rank-2 attribute reads as its elements flattened.
+- **Padding and declared width.** A fixed-width string reports its content, not its `STRSIZE` or which padding it used.
+
+The variant may become **more specific** in a future release as `AttrValue` grows narrower variants, so match with a `_` arm — which the `#[non_exhaustive]` enum requires anyway — or read through the accessors, which are unaffected by such a change.
 
 ### Addressing datasets
 

@@ -181,12 +181,26 @@ pub(crate) fn attrs_to_map<S: crate::source::Source + ?Sized>(
 /// dataspace kind — not the element count — decides scalar against array, so a
 /// one-element array stays an array. Charset selects the `Ascii*` variants.
 ///
-/// Two things are still not recoverable. Integer and float widths are widened
-/// to `i64`/`u64`/`f64`, since there are no narrower array variants; and a true
-/// variable-length string (`H5T_STRING` with `STRSIZE = VAR`, which this
-/// crate's writer never emits) has no variant of its own, so it reads as the
-/// fixed-width variant of the same charset and arity and would be rewritten
-/// fixed-width.
+/// What is still not recoverable, because [`AttrValue`] has no way to express
+/// it — each of these reads correctly but would be rewritten differently:
+///
+/// - **Width.** Integers and floats widen to `i64`/`u64`/`f64`; there are no
+///   narrower array variants.
+/// - **Variable-length strings.** A true `H5T_STRING` with `STRSIZE = VAR`,
+///   which this crate's writer never emits, has no variant of its own and reads
+///   as the fixed-width variant of the same charset and arity.
+/// - **Rank.** Every array variant is one-dimensional, so a rank-2 attribute
+///   reads as its elements flattened.
+/// - **Padding and declared width.** A fixed-width string reports its content,
+///   not its `STRSIZE` or whether it was null-terminated, null-padded or
+///   space-padded.
+/// - **Null dataspaces.** These read as an empty array variant.
+///
+/// A numeric attribute whose message holds fewer bytes than its dataspace
+/// promises is reported undecodable (`None`) rather than defaulted, since no
+/// value would be truthful. An empty *string* is different: its zero-size
+/// datatype legitimately decodes to no elements, and the empty string is the
+/// value, so it is kept.
 fn decode_attr_value<S: crate::source::Source + ?Sized>(
     attr: &crate::attribute::AttributeMessage,
     source: &S,
@@ -225,23 +239,20 @@ fn decode_attr_value<S: crate::source::Source + ?Sized>(
             if scalar {
                 Some(AttrValue::U64(*vals.first()?))
             } else {
-                // No U64Array variant, store as I64Array
-                #[expect(
-                    clippy::cast_possible_wrap,
-                    reason = "no U64Array AttrValue variant; values above i64::MAX are \
-                              reinterpreted as i64 by design (bit pattern preserved)"
-                )]
-                let i64_vals: Vec<i64> = vals.iter().map(|&v| v as i64).collect();
-                Some(AttrValue::I64Array(i64_vals))
+                Some(AttrValue::U64Array(vals))
             }
         }
         Datatype::String { charset, .. } => {
             let strings = attr.read_as_strings().ok()?;
             let ascii = *charset == CharacterSet::Ascii;
+            // A zero-size string datatype decodes to no elements at all, so a
+            // scalar takes the empty string rather than reporting the whole
+            // attribute undecodable — `attrs_to_map` drops what this returns
+            // `None` for, and an empty string attribute must not disappear.
             match (ascii, scalar) {
-                (true, true) => Some(AttrValue::AsciiString(strings.into_iter().next()?)),
+                (true, true) => Some(AttrValue::AsciiString(one_or_empty(strings))),
                 (true, false) => Some(AttrValue::AsciiStringArray(strings)),
-                (false, true) => Some(AttrValue::String(strings.into_iter().next()?)),
+                (false, true) => Some(AttrValue::String(one_or_empty(strings))),
                 (false, false) => Some(AttrValue::StringArray(strings)),
             }
         }
@@ -269,24 +280,77 @@ fn decode_attr_value<S: crate::source::Source + ?Sized>(
                 crate::vl_data::VlenStringReadOptions::default(),
             )
             .ok()?;
-            // The VLEN-of-1-byte-ASCII encoding is the one this crate writes,
-            // for `VarLenAsciiArray`, so it reads back as that variant. A true
-            // variable-length string has no variant of its own; keep its
-            // charset and arity and let it read as the fixed-width variant.
-            let ascii_char_vlen = is_ascii_char_vlen_base(base_type);
-            if ascii_char_vlen && !scalar {
-                return Some(AttrValue::VarLenAsciiArray(strings));
-            }
-            let ascii = ascii_char_vlen || *charset == Some(CharacterSet::Ascii);
-            match (ascii, scalar) {
-                (true, true) => Some(AttrValue::AsciiString(strings.into_iter().next()?)),
-                (true, false) => Some(AttrValue::AsciiStringArray(strings)),
-                (false, true) => Some(AttrValue::String(strings.into_iter().next()?)),
-                (false, false) => Some(AttrValue::StringArray(strings)),
+            match (
+                vlen_string_shape(*is_string, base_type, charset.as_ref()),
+                scalar,
+            ) {
+                (VlenStringShape::AsciiCharSequence, false) => {
+                    Some(AttrValue::VarLenAsciiArray(strings))
+                }
+                (VlenStringShape::AsciiCharSequence | VlenStringShape::Ascii, true) => {
+                    Some(AttrValue::AsciiString(one_or_empty(strings)))
+                }
+                (VlenStringShape::Ascii, false) => Some(AttrValue::AsciiStringArray(strings)),
+                (VlenStringShape::Utf8, true) => Some(AttrValue::String(one_or_empty(strings))),
+                (VlenStringShape::Utf8, false) => Some(AttrValue::StringArray(strings)),
             }
         }
         _ => None,
     }
+}
+
+/// Which family of `AttrValue` variants a variable-length string attribute
+/// belongs to, decided from its datatype alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VlenStringShape {
+    /// A VLEN *sequence* of 1-byte ASCII strings — the encoding MATLAB and matio
+    /// use, and the one this crate writes for
+    /// [`AttrValue::VarLenAsciiArray`]. Only this shape has a variant that
+    /// preserves it.
+    AsciiCharSequence,
+    /// A true variable-length ASCII string (`H5T_STRING`, `STRSIZE = VAR`).
+    Ascii,
+    /// A true variable-length UTF-8 string, or one whose charset is unstated.
+    Utf8,
+}
+
+/// Classify a variable-length string datatype.
+///
+/// `is_string` is what separates a true variable-length string from a sequence
+/// of 1-byte strings, and it has to be consulted: libhdf5 writes a VL string's
+/// base type as a 1-byte *integer*, so the base type alone happens to be enough
+/// for the files it produces — but nothing in the format stops a writer from
+/// giving a VL string a 1-byte *string* base, which is byte-identical to the
+/// MATLAB sequence's base. Trusting the base type alone would then report the
+/// MATLAB encoding for a value that is not in it, and rewrite it as a different
+/// datatype class.
+fn vlen_string_shape(
+    is_string: bool,
+    base_type: &crate::datatype::Datatype,
+    charset: Option<&crate::datatype::CharacterSet>,
+) -> VlenStringShape {
+    use crate::datatype::CharacterSet;
+    if !is_string && is_ascii_char_vlen_base(base_type) {
+        return VlenStringShape::AsciiCharSequence;
+    }
+    // A VL string states its own charset; a sequence of ASCII chars carries it
+    // on the base type instead.
+    if charset == Some(&CharacterSet::Ascii) || is_ascii_char_vlen_base(base_type) {
+        VlenStringShape::Ascii
+    } else {
+        VlenStringShape::Utf8
+    }
+}
+
+/// The single string a scalar attribute holds, or the empty string when the
+/// datatype decoded to no elements at all.
+///
+/// A zero-size string datatype yields no elements (`read_as_strings` returns an
+/// empty vec), which is how an empty string attribute is stored. Reporting the
+/// attribute undecodable there would drop it from `attrs()` entirely, since
+/// `attrs_to_map` keeps only what decodes.
+fn one_or_empty(strings: Vec<std::string::String>) -> std::string::String {
+    strings.into_iter().next().unwrap_or_default()
 }
 
 /// Recognize the MATLAB-style VLEN encoding where the base type is a 1-byte
@@ -408,10 +472,125 @@ mod tests {
             ("i64_one", AttrValue::I64Array(vec![-7])),
             ("i64_two", AttrValue::I64Array(vec![-7, 8])),
             ("u64_scalar", AttrValue::U64(7)),
+            ("u64_one", AttrValue::U64Array(vec![7])),
+            ("u64_two", AttrValue::U64Array(vec![7, 8])),
         ];
         let read = round_trip(&cases);
         for (name, written) in &cases {
             assert_eq!(read.get(*name), Some(written), "attribute {name}");
+        }
+    }
+
+    /// An unsigned value above `i64::MAX` reads back as itself. It used to be
+    /// reinterpreted into a negative `i64` for want of a `U64Array` variant, so
+    /// this is the case that variant exists for — and the accessors report the
+    /// value rather than a wrapped one at every length.
+    #[test]
+    fn a_full_range_unsigned_value_survives_at_every_length() {
+        let read = round_trip(&[
+            ("scalar", AttrValue::U64(u64::MAX)),
+            ("one", AttrValue::U64Array(vec![u64::MAX])),
+            ("two", AttrValue::U64Array(vec![u64::MAX, 1])),
+        ]);
+        assert_eq!(read.get("scalar"), Some(&AttrValue::U64(u64::MAX)));
+        assert_eq!(read.get("one"), Some(&AttrValue::U64Array(vec![u64::MAX])));
+        assert_eq!(
+            read.get("two"),
+            Some(&AttrValue::U64Array(vec![u64::MAX, 1]))
+        );
+        // Read through the accessors: the full-range value is reported as
+        // unsigned, and asking for it as `i64` refuses rather than wrapping.
+        for (name, expected) in [
+            ("scalar", vec![u64::MAX]),
+            ("one", vec![u64::MAX]),
+            ("two", vec![u64::MAX, 1]),
+        ] {
+            let value = read.get(name).expect("present");
+            assert_eq!(value.to_u64s(), Some(expected), "{name} must read unsigned");
+            assert_eq!(
+                value.to_i64s(),
+                None,
+                "{name} does not fit an i64 and must not wrap"
+            );
+        }
+        assert_eq!(read["scalar"].as_u64(), Some(u64::MAX));
+        assert_eq!(read["one"].as_u64(), Some(u64::MAX));
+        assert_eq!(
+            read["two"].as_u64(),
+            None,
+            "two elements are not a single value"
+        );
+    }
+
+    /// The MATLAB sequence-of-ASCII-chars encoding and a true variable-length
+    /// ASCII string have the same base type once a writer chooses a 1-byte
+    /// string base for the latter; `is_string` is the only thing separating
+    /// them. libhdf5 writes an integer base, so no file it produces reaches the
+    /// ambiguous case — which is exactly why this is asserted here rather than
+    /// left to the C crosscheck, where the branch cannot be reached.
+    #[test]
+    fn only_a_sequence_of_ascii_chars_claims_the_varlen_variant() {
+        use crate::datatype::{CharacterSet, Datatype, DatatypeByteOrder, StringPadding};
+
+        let char_base = Datatype::String {
+            size: 1,
+            padding: StringPadding::NullTerminate,
+            charset: CharacterSet::Ascii,
+        };
+        let int_base = Datatype::FixedPoint {
+            size: 1,
+            byte_order: DatatypeByteOrder::LittleEndian,
+            signed: false,
+            bit_offset: 0,
+            bit_precision: 8,
+        };
+
+        // What MATLAB and matio write, and what this crate writes.
+        assert_eq!(
+            vlen_string_shape(false, &char_base, None),
+            VlenStringShape::AsciiCharSequence
+        );
+        // The same base type, but flagged a string: a true variable-length
+        // string, which must not claim the sequence variant.
+        assert_eq!(
+            vlen_string_shape(true, &char_base, Some(&CharacterSet::Ascii)),
+            VlenStringShape::Ascii
+        );
+        // What libhdf5 actually writes for a variable-length string.
+        assert_eq!(
+            vlen_string_shape(true, &int_base, Some(&CharacterSet::Ascii)),
+            VlenStringShape::Ascii
+        );
+        assert_eq!(
+            vlen_string_shape(true, &int_base, Some(&CharacterSet::Utf8)),
+            VlenStringShape::Utf8
+        );
+        // An unstated charset reads as UTF-8, which is the lossless assumption:
+        // every ASCII string is valid UTF-8, so nothing is corrupted by it.
+        assert_eq!(
+            vlen_string_shape(true, &int_base, None),
+            VlenStringShape::Utf8
+        );
+    }
+
+    /// An empty string attribute stays present and stays empty.
+    ///
+    /// A zero-length string is stored with a zero-size datatype, which decodes
+    /// to no elements; treating that as undecodable dropped the attribute out of
+    /// `attrs()` entirely, because `attrs_to_map` keeps only what decodes.
+    #[test]
+    fn an_empty_string_attribute_is_not_dropped() {
+        let cases = vec![
+            ("utf8", AttrValue::String(std::string::String::new())),
+            ("ascii", AttrValue::AsciiString(std::string::String::new())),
+        ];
+        let read = round_trip(&cases);
+        for (name, written) in &cases {
+            assert_eq!(
+                read.get(*name),
+                Some(written),
+                "attribute {name} must survive with its empty value"
+            );
         }
     }
 

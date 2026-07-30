@@ -2330,6 +2330,21 @@ impl Group {
     }
 
     /// Read all attributes of this group.
+    ///
+    /// Each value takes the [`AttrValue`] variant that describes its on-disk
+    /// encoding, so the variant reflects the charset and dataspace its writer
+    /// chose rather than the shape of the data alone: a one-element array stays
+    /// an array, and an ASCII string does not arrive as a UTF-8
+    /// [`String`](AttrValue::String). Prefer the accessors — [`AttrValue::as_str`],
+    /// [`as_strings`](AttrValue::as_strings), [`as_i64`](AttrValue::as_i64) and
+    /// the rest — over matching on the variant, unless the encoding is the thing
+    /// you care about. **The variant may become more specific in a future
+    /// release** as `AttrValue` grows narrower ones (fixed widths, variable-length
+    /// strings), and a `_` arm is required regardless because the enum is
+    /// `#[non_exhaustive]`.
+    ///
+    /// An attribute whose datatype has no `AttrValue` representation is omitted
+    /// from the map rather than reported as an error.
     pub fn attrs(&self) -> Result<HashMap<String, AttrValue>, Error> {
         let hdr = self.file.parse_header(self.address)?;
         self.file.attrs_of(&hdr)
@@ -3538,6 +3553,10 @@ impl Dataset {
     }
 
     /// Read all attributes of this dataset.
+    ///
+    /// The variant of each value describes its on-disk encoding; see
+    /// [`Group::attrs`] for what that means for matching on it, and prefer the
+    /// [`AttrValue`] accessors.
     pub fn attrs(&self) -> Result<HashMap<String, AttrValue>, Error> {
         self.file.attrs_of(&self.header)
     }
