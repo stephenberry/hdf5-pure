@@ -103,6 +103,26 @@ println!("attributes:   {:?}", sensors.attrs().unwrap());
 
 `File::group(path)` resolves a group by path, and `Group::group(name)` resolves a child relative to that group. The names returned by `groups()` and `datasets()` are not sorted in any guaranteed order, so sort them yourself if you need a stable listing.
 
+### Reading an attribute value
+
+An attribute reads back as the variant it was written from: the dataspace kind distinguishes a scalar from a one-element array, and the datatype's charset selects the `Ascii` variants. A `VarLenAsciiArray` of one element stays a `VarLenAsciiArray`, and an `AsciiString` does not arrive as a `String`.
+
+That fidelity means several variants can carry the same logical value, so match on the variant only when the encoding is what you care about. Otherwise use the accessors, each of which spans every variant that can hold the shape it names:
+
+```rust
+let attrs = file.root().attrs().unwrap();
+
+// Any single string, either charset, scalar or one-element array.
+let class: Option<&str> = attrs.get("MATLAB_class").and_then(AttrValue::as_str);
+
+// Every element, with a scalar reading as one element.
+let fields: Option<Vec<&str>> = attrs.get("MATLAB_fields").and_then(AttrValue::as_strings);
+```
+
+`as_i64`, `as_i64s`, `as_f64` and `as_f64s` do the same for numbers. `as_i64` widens the narrower integer variants, and reports `None` for a `U64` above `i64::MAX` rather than wrapping it. The float accessors do not convert integers, so a caller that accepts either asks for both.
+
+Two things a read cannot recover. Integer and float widths widen to `i64`/`u64`/`f64`, since there are no narrower array variants; and a true variable-length string (`H5T_STRING` with `STRSIZE = VAR`, which this crate's writer never emits) has no variant of its own, so it reads as the fixed-width variant of the same charset and would be rewritten fixed-width.
+
 ### Addressing datasets
 
 Datasets are addressable two ways: by full path from the file, or by name from their parent group. Both resolve to the same dataset.
