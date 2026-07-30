@@ -1211,7 +1211,14 @@ fn apply_deflate(ds: &mut DatasetBuilder, compression: Compression) {
     }
 }
 
-fn emit_zero_element(ds: &mut DatasetBuilder, class: MatClass, shape: &[u64]) {
+/// Write the zero-element dataset that carries an empty marker under
+/// [`EmptyMarkerEncoding::ZeroElement`], with the element type the class
+/// implies.
+///
+/// This is the one place that decision is made. Both MAT serde emitters route
+/// their empty markers through it, so the no-options emitter and the builder
+/// cannot disagree about the same value.
+pub(crate) fn emit_zero_element(ds: &mut DatasetBuilder, class: MatClass, shape: &[u64]) {
     match class {
         MatClass::Double => {
             ds.with_f64_data(&[]).with_shape(shape);
@@ -1231,7 +1238,7 @@ fn emit_zero_element(ds: &mut DatasetBuilder, class: MatClass, shape: &[u64]) {
         MatClass::Int64 => {
             ds.with_i64_data(&[]).with_shape(shape);
         }
-        MatClass::UInt8 | MatClass::Logical | MatClass::Cell | MatClass::Struct => {
+        MatClass::UInt8 | MatClass::Logical => {
             ds.with_u8_data(&[]).with_shape(shape);
         }
         MatClass::UInt16 | MatClass::Char => {
@@ -1240,7 +1247,11 @@ fn emit_zero_element(ds: &mut DatasetBuilder, class: MatClass, shape: &[u64]) {
         MatClass::UInt32 => {
             ds.with_u32_data(&[]).with_shape(shape);
         }
-        MatClass::UInt64 => {
+        // A container class has no element type to inherit, so the width is a
+        // free choice. `uint64` is what the reference library writes for an
+        // empty marker under the other encoding, where the payload is the dims
+        // vector, which keeps one width across both encodings.
+        MatClass::UInt64 | MatClass::Cell | MatClass::Struct => {
             ds.with_u64_data(&[]).with_shape(shape);
         }
     }

@@ -385,7 +385,16 @@ impl<'de> Deserializer<'de> for MatValueDeserializer {
         visitor: V,
     ) -> Result<V::Value, MatError> {
         match self.value {
-            MatValue::String(s) => visitor.visit_enum(UnitVariantAccess(s)),
+            MatValue::String(s) => visitor.visit_enum(UnitVariantAccess::Name(s)),
+            // The variant's index, as written under
+            // `UnitVariantEncoding::Index`. Serde's derived `Deserialize`
+            // resolves an index to a variant itself.
+            MatValue::Scalar(s) => match variant_index(&s) {
+                Some(i) => visitor.visit_enum(UnitVariantAccess::Index(i)),
+                None => Err(MatError::UnsupportedType(
+                    "enum variant from a non-index scalar",
+                )),
+            },
             other => Err(MatError::UnsupportedType(match other.kind() {
                 "struct" => "struct enum variant (not supported in v1)",
                 _ => "non-unit enum variant",
@@ -396,6 +405,10 @@ impl<'de> Deserializer<'de> for MatValueDeserializer {
     fn deserialize_identifier<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, MatError> {
         match self.value {
             MatValue::String(s) => visitor.visit_string(s),
+            MatValue::Scalar(s) => match variant_index(&s) {
+                Some(i) => visitor.visit_u64(i),
+                None => mismatch("identifier", MatValue::Scalar(s)),
+            },
             other => mismatch("identifier", other),
         }
     }
@@ -1076,7 +1089,13 @@ impl<'de> MapAccess<'de> for ComplexStructMap {
 // Enum unit variant
 // ---------------------------------------------------------------------------
 
-struct UnitVariantAccess(String);
+/// A fieldless variant identified either by name or by index, since
+/// [`UnitVariantEncoding`](crate::mat::UnitVariantEncoding) writes one or the
+/// other. Serde's derived `Deserialize` resolves both.
+enum UnitVariantAccess {
+    Name(String),
+    Index(u64),
+}
 
 impl<'de> EnumAccess<'de> for UnitVariantAccess {
     type Error = MatError;
@@ -1085,8 +1104,65 @@ impl<'de> EnumAccess<'de> for UnitVariantAccess {
         self,
         seed: V,
     ) -> Result<(V::Value, UnitVariantOnly), MatError> {
-        let value = seed.deserialize(StringRefDe(self.0))?;
+        let value = match self {
+            UnitVariantAccess::Name(s) => seed.deserialize(StringRefDe(s))?,
+            UnitVariantAccess::Index(i) => seed.deserialize(VariantIndexDe(i))?,
+        };
         Ok((value, UnitVariantOnly))
+    }
+}
+
+/// Reads as a variant index and nothing else. The counterpart to
+/// [`StringRefDe`] for the numeric encoding.
+struct VariantIndexDe(u64);
+
+impl<'de> Deserializer<'de> for VariantIndexDe {
+    type Error = MatError;
+
+    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, MatError> {
+        visitor.visit_u64(self.0)
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 u8 u16 u32 u64 f32 f64 char str string bytes
+        byte_buf option unit unit_struct newtype_struct seq tuple
+        tuple_struct map struct enum identifier ignored_any
+    }
+}
+
+/// A scalar read as a fieldless variant's index.
+///
+/// Lenient on width and class, because the file may not have come from this
+/// crate: MATLAB's default numeric class is `double`, so an index typed by
+/// hand arrives as one. Anything that is not a non-negative whole number is
+/// refused rather than rounded.
+fn variant_index(s: &ScalarNum) -> Option<u64> {
+    /// 2^64, exactly representable. One past the largest `u64`.
+    const TWO_POW_64: f64 = 18_446_744_073_709_551_616.0;
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the guard admits only a non-negative whole f64 below 2^64, which \
+                  is exactly the range u64 represents, so the cast is lossless"
+    )]
+    fn whole(x: f64) -> Option<u64> {
+        // Strict `<`: `u64::MAX as f64` rounds *up* to 2^64, so `<=` would
+        // admit exactly 2^64 and then saturate it to `u64::MAX` on the cast,
+        // which is the rounding this refuses everywhere else.
+        (x >= 0.0 && x.fract() == 0.0 && x < TWO_POW_64).then_some(x as u64)
+    }
+    match *s {
+        ScalarNum::U64(x) => Some(x),
+        ScalarNum::U32(x) => Some(x as u64),
+        ScalarNum::U16(x) => Some(x as u64),
+        ScalarNum::U8(x) => Some(x as u64),
+        ScalarNum::I64(x) => u64::try_from(x).ok(),
+        ScalarNum::I32(x) => u64::try_from(x).ok(),
+        ScalarNum::I16(x) => u64::try_from(x).ok(),
+        ScalarNum::I8(x) => u64::try_from(x).ok(),
+        ScalarNum::F64(x) => whole(x),
+        ScalarNum::F32(x) => whole(x as f64),
+        ScalarNum::Bool(_) => None,
     }
 }
 

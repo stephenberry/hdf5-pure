@@ -545,8 +545,13 @@ fn emit_string_at_struct(sw: &mut StructWriter, name: &str, s: &str) -> Result<(
 }
 
 fn cell_dims(n: usize) -> [usize; 2] {
-    // Mirror the legacy emit.rs behavior: 1-D cell is `[n, 1]`.
-    if n == 0 { [0, 0] } else { [n, 1] }
+    // A 1-D cell is `[n, 1]`, and an empty one is the same rule at n = 0
+    // rather than a special `[0, 0]`: `isempty` holds either way, but `[0, 1]`
+    // keeps `size(x, 2)` stable as a list empties out, and is what a BEVE
+    // empty array converts to. This does differ from MATLAB's own `{}`, which
+    // is `0x0`. `n = 0` is reachable only under `EmptySequencePolicy::Cell`,
+    // since the default lowers an empty sequence to a `double` array instead.
+    [n, 1]
 }
 
 fn scalar_class(tag: ScalarTag) -> MatClass {

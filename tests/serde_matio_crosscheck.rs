@@ -407,6 +407,19 @@ impl MatVar {
         MatVar { ptr, owned: true }
     }
 
+    /// Build MATLAB `struct([])`: a struct array of zero elements and no
+    /// fields. The reference library's own encoding of the value the serde
+    /// writer produces for `None` under `NullPolicy::EmptyStructArray`.
+    pub fn empty_struct_array(name: &str) -> Self {
+        let c = CString::new(name).unwrap();
+        let dims = [0usize, 0];
+        let field_ptrs: [*const std::ffi::c_char; 1] = [std::ptr::null()];
+        let ptr =
+            unsafe { ffi::Mat_VarCreateStruct2(c.as_ptr(), 2, dims.as_ptr(), field_ptrs.as_ptr()) };
+        assert!(!ptr.is_null(), "Mat_VarCreateStruct2({name}) failed");
+        MatVar { ptr, owned: true }
+    }
+
     /// Attach `value` as the named field. Transfers ownership of `value`.
     pub fn set_field(&mut self, name: &str, value: MatVar) {
         let c = CString::new(name).unwrap();
@@ -881,4 +894,108 @@ fn hdf5_pure_reads_complex_int16_written_by_matio() {
     let our_ds = our_ds.dataset("samples").unwrap();
     assert_eq!(our_ds.shape().unwrap(), ds.shape().unwrap());
     assert_eq!(our_ds.read_u8().unwrap(), ds.read_u8().unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// Empty markers
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+struct MaybeHolder {
+    maybe: Option<u8>,
+    tail: i32,
+}
+
+/// `None` under the default `NullPolicy::EmptyStructArray` is MATLAB
+/// `struct([])`, and the reference library agrees it is one.
+///
+/// This also pins the two emitters together. `to_bytes` has no `Options` and
+/// writes through `ser::emit`, `to_bytes_with_options` writes through
+/// `MatBuilder`, and under default options they have to produce the same file:
+/// they previously disagreed about the empty marker's element type, which
+/// nothing noticed while `None` still dropped the field.
+#[test]
+fn empty_struct_array_agrees_with_matio_and_across_both_emitters() {
+    let _g = matio_lock();
+    let dir = tempdir().unwrap();
+    let v = MaybeHolder {
+        maybe: None,
+        tail: 7,
+    };
+
+    let no_options = mat::to_bytes(&v).unwrap();
+    let with_options = mat::to_bytes_with_options(&v, &mat::Options::default()).unwrap();
+    assert_eq!(
+        no_options, with_options,
+        "`to_bytes` and `to_bytes_with_options(&Options::default())` must agree byte for byte"
+    );
+
+    let path = dir.path().join("maybe.mat");
+    std::fs::write(&path, &no_options).unwrap();
+
+    // The empty marker itself: zero-element dataset, MATLAB `[0, 0]`, tagged.
+    let f = hdf5_pure::File::open(&path).unwrap();
+    let ds = f.dataset("maybe").unwrap();
+    assert_eq!(ds.shape().unwrap(), vec![0, 0]);
+    let attrs = ds.attrs().unwrap();
+    assert_eq!(
+        attrs.get("MATLAB_class"),
+        Some(&hdf5_pure::AttrValue::String("struct".into()))
+    );
+    assert!(attrs.contains_key("MATLAB_empty"));
+
+    // matio reads it as a struct, and the field after it still parses, so the
+    // marker doesn't derail the rest of the file.
+    let mf = MatFile::open(&path);
+    let var = mf.read("maybe").expect("matio reads the empty marker");
+    assert_eq!(var.class_type(), ffi::MAT_C_STRUCT);
+    assert_eq!(mf.read("tail").unwrap().scalar_i32(), 7);
+
+    // Pin the geometry matio reports, which the class assertion above does not
+    // cover. Under the zero-element encoding the payload is empty rather than a
+    // dims vector, so matio recovers no dimensions and reports rank 0 with no
+    // elements. That is also what it reports for MATLAB's own empty variables
+    // (see `matlab_fixtures/empty_variants.mat`), so it is the encoding agreeing
+    // with MATLAB rather than a defect. It does mean MATLAB-side emptiness should
+    // be tested with `isempty(fieldnames(x))` rather than a bare `isempty(x)`,
+    // which is what `matlab_fixtures/verify.m` asserts.
+    // Under the zero-element encoding the payload is empty rather than a dims
+    // vector, so matio recovers no dimensions: rank 0, no dims, and therefore an
+    // element count of 1 (the empty product), not 0. It reports the same for
+    // MATLAB's own empty variables (see `matlab_fixtures/empty_variants.mat`), so
+    // this is the encoding agreeing with MATLAB rather than a defect.
+    //
+    // It is also precisely why MATLAB-side emptiness must be tested with
+    // `isempty(fieldnames(x))` and not a bare `isempty(x)`: a reader that trusts
+    // the element count sees one element here. `matlab_fixtures/verify.m` asserts
+    // the `fieldnames` form, and the docs promise only that.
+    assert_eq!((var.rank(), var.dims(), var.nelements()), (0, vec![], 1));
+
+    // And the marker's element type is the one matio itself writes. matio uses
+    // the data-as-dims encoding, where the payload is the dims vector, so the
+    // shapes differ by construction; the element type is the shared part.
+    let theirs = dir.path().join("matio_empty.mat");
+    {
+        let g = MatFile::create_v73(&theirs);
+        g.write(MatVar::empty_struct_array("maybe"));
+    }
+    let tf = hdf5_pure::File::open(&theirs).unwrap();
+    let their_ds = tf.dataset("maybe").unwrap();
+    assert_eq!(their_ds.dtype().unwrap(), ds.dtype().unwrap());
+}
+
+/// Reading the same file back reconstructs the `None`, without the
+/// `#[serde(default)]` the dropped-field encoding used to require.
+#[test]
+fn empty_struct_array_reads_back_as_none() {
+    let _g = matio_lock();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("maybe_roundtrip.mat");
+    let v = MaybeHolder {
+        maybe: None,
+        tail: 7,
+    };
+    mat::to_file(&v, &path).unwrap();
+    let parsed: MaybeHolder = mat::from_file(&path).unwrap();
+    assert_eq!(parsed, v);
 }

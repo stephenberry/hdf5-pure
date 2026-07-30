@@ -229,14 +229,14 @@ fn apply_cell(
 ) -> Result<(), MatError> {
     let paths: Vec<String> = elements.into_iter().map(|el| refs.intern(el)).collect();
     if paths.is_empty() {
-        // Defensive: `unify_sequence` lowers an empty input to `Vec1D` (not a
-        // Cell), so this branch isn't reachable today. Kept so a future code
-        // path that hands an empty Cell to the emitter doesn't write a
-        // shape-mismatched dataset.
-        ds.with_u64_data(&[]).with_shape(&[0u64, 0]);
-        set_class(ds, MatClass::Cell);
-        ds.set_attr("MATLAB_empty", AttrValue::U32(1));
-        return Ok(());
+        // Construction-enforced: an empty `Cell` comes from one place
+        // (`unify_sequence` under `EmptySequencePolicy::Cell`), and this
+        // emitter has no `Options`, so it always runs under the default
+        // `DoubleArray` and never sees one. Assert rather than encode a second
+        // answer for the shape: `emit_with_builder` derives an empty cell's
+        // dims from `cell_dims`, and a guess here that disagreed with it would
+        // be untestable while it stays unreachable.
+        unreachable!("this emitter has no Options, so an empty Cell cannot reach it");
     }
     let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
     let n = path_refs.len() as u64;
@@ -245,10 +245,19 @@ fn apply_cell(
     Ok(())
 }
 
-/// Empty-struct-array marker (MATLAB `struct([])`). Placeholder for
-/// `Option::None` inside a sequence.
+/// Empty-struct-array marker (MATLAB `struct([])`). What `Option::None` lowers
+/// to under the default [`NullPolicy::EmptyStructArray`], both as a struct
+/// field and inside a sequence, and the only empty marker this emitter writes.
+///
+/// This emitter has no [`Options`] and so is fixed at
+/// [`EmptyMarkerEncoding::ZeroElement`], but the element type comes from
+/// [`emit_zero_element`](crate::mat::builder::emit_zero_element) rather than
+/// from a constant here, and the `[0, 0]` dims are what
+/// `MatBuilder::write_empty_struct_array` uses. That is the whole point: the
+/// same value written through `to_bytes` and through `to_bytes_with_options`
+/// under default options has to produce the same bytes.
 fn apply_empty_struct_array(ds: &mut DatasetBuilder) {
-    ds.with_u64_data(&[]).with_shape(&[0u64, 0]);
+    crate::mat::builder::emit_zero_element(ds, MatClass::Struct, &[0u64, 0]);
     set_class(ds, MatClass::Struct);
     ds.set_attr("MATLAB_empty", AttrValue::U32(1));
 }

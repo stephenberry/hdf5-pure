@@ -12,6 +12,7 @@ use serde::ser::{
 use crate::mat::complex::complex_tag_for_sentinel;
 use crate::mat::error::MatError;
 use crate::mat::matrix::{MATRIX_SENTINEL, complex_tag_for_matrix_sentinel};
+use crate::mat::options::{EmptySequencePolicy, NullPolicy, Options, UnitVariantEncoding};
 use crate::mat::utf16;
 
 use crate::mat::value::{
@@ -22,26 +23,57 @@ use crate::mat::value::{
 // Public entry: serialize a value into a MatValue
 // ---------------------------------------------------------------------------
 
-pub(crate) fn to_value<T: Serialize + ?Sized>(value: &T) -> Result<MatValue, MatError> {
-    value.serialize(ValueSerializer)
+pub(crate) fn to_value<T: Serialize + ?Sized>(
+    value: &T,
+    options: &Options,
+) -> Result<MatValue, MatError> {
+    value.serialize(ValueSerializer::new(options))
+}
+
+/// Lower a `None` / unit / unit-struct per [`Options::null_policy`].
+///
+/// The root serializer routes through this too, so `NullPolicy::Error` refuses a
+/// root null with the same message it uses everywhere else, rather than the root
+/// being the one slot the policy does not reach.
+pub(super) fn null_value(opts: &Options) -> Result<MatValue, MatError> {
+    match opts.null_policy {
+        NullPolicy::EmptyStructArray => Ok(MatValue::EmptyStructArray),
+        NullPolicy::Omit => Ok(MatValue::Omit),
+        NullPolicy::Error => Err(MatError::UnsupportedType(
+            "null value under NullPolicy::Error",
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
 // ValueSerializer
 // ---------------------------------------------------------------------------
 
-pub(crate) struct ValueSerializer;
+/// Borrows the caller's [`Options`] so that the handful of decisions with no
+/// single right answer (null lowering, unit-variant encoding, the class of an
+/// empty sequence) are made where the input is still in view, rather than
+/// being baked into the value tree and second-guessed by the emitter.
+#[derive(Clone, Copy)]
+pub(crate) struct ValueSerializer<'a> {
+    opts: &'a Options,
+}
 
-impl Serializer for ValueSerializer {
+impl<'a> ValueSerializer<'a> {
+    pub(crate) fn new(opts: &'a Options) -> Self {
+        Self { opts }
+    }
+}
+
+impl<'a> Serializer for ValueSerializer<'a> {
     type Ok = MatValue;
     type Error = MatError;
 
-    type SerializeSeq = SeqSer;
-    type SerializeTuple = SeqSer;
-    type SerializeTupleStruct = SeqSer;
+    type SerializeSeq = SeqSer<'a>;
+    type SerializeTuple = SeqSer<'a>;
+    type SerializeTupleStruct = SeqSer<'a>;
     type SerializeTupleVariant = Impossible<MatValue, MatError>;
-    type SerializeMap = MapSer;
-    type SerializeStruct = StructSer;
+    type SerializeMap = MapSer<'a>;
+    type SerializeStruct = StructSer<'a>;
     type SerializeStructVariant = Impossible<MatValue, MatError>;
 
     // ----- primitives -----
@@ -104,7 +136,7 @@ impl Serializer for ValueSerializer {
     // ----- option / unit / newtype -----
 
     fn serialize_none(self) -> Result<MatValue, MatError> {
-        Ok(MatValue::Omit)
+        null_value(self.opts)
     }
 
     fn serialize_some<T: Serialize + ?Sized>(self, value: &T) -> Result<MatValue, MatError> {
@@ -112,27 +144,27 @@ impl Serializer for ValueSerializer {
     }
 
     fn serialize_unit(self) -> Result<MatValue, MatError> {
-        // Unit maps to `Omit`, exactly like `serialize_none` above. This drops
-        // the field from its parent struct (see `emit::build_struct_group`) and
-        // keeps the nested serializer consistent with `RootSerializer`, which
-        // already treats a root-level `()`/`None`/unit-struct as an empty
-        // workspace. The common way to hit this is `serde_json::Value::Null`,
-        // which serializes via `serialize_unit`; without this it aborted the
-        // whole encode even though the equivalent `Option::None` encoded fine.
-        Ok(MatValue::Omit)
+        // Unit lowers exactly like `serialize_none` above. The common way to
+        // hit it is `serde_json::Value::Null`, which serializes via
+        // `serialize_unit`; routing both through `null_policy` means the two
+        // spellings of "no value" cannot come to disagree.
+        null_value(self.opts)
     }
 
     fn serialize_unit_struct(self, _name: &'static str) -> Result<MatValue, MatError> {
-        Ok(MatValue::Omit)
+        null_value(self.opts)
     }
 
     fn serialize_unit_variant(
         self,
         _name: &'static str,
-        _idx: u32,
+        idx: u32,
         variant: &'static str,
     ) -> Result<MatValue, MatError> {
-        Ok(MatValue::String(variant.to_owned()))
+        match self.opts.unit_variant_encoding {
+            UnitVariantEncoding::Name => Ok(MatValue::String(variant.to_owned())),
+            UnitVariantEncoding::Index => Ok(MatValue::Scalar(ScalarNum::U32(idx))),
+        }
     }
 
     fn serialize_newtype_struct<T: Serialize + ?Sized>(
@@ -156,14 +188,18 @@ impl Serializer for ValueSerializer {
 
     // ----- sequences -----
 
-    fn serialize_seq(self, len: Option<usize>) -> Result<SeqSer, MatError> {
-        Ok(SeqSer::new(len))
+    fn serialize_seq(self, len: Option<usize>) -> Result<SeqSer<'a>, MatError> {
+        Ok(SeqSer::new(len, self.opts))
     }
-    fn serialize_tuple(self, len: usize) -> Result<SeqSer, MatError> {
-        Ok(SeqSer::new(Some(len)))
+    fn serialize_tuple(self, len: usize) -> Result<SeqSer<'a>, MatError> {
+        Ok(SeqSer::new(Some(len), self.opts))
     }
-    fn serialize_tuple_struct(self, _name: &'static str, len: usize) -> Result<SeqSer, MatError> {
-        Ok(SeqSer::new(Some(len)))
+    fn serialize_tuple_struct(
+        self,
+        _name: &'static str,
+        len: usize,
+    ) -> Result<SeqSer<'a>, MatError> {
+        Ok(SeqSer::new(Some(len), self.opts))
     }
     fn serialize_tuple_variant(
         self,
@@ -175,25 +211,26 @@ impl Serializer for ValueSerializer {
         Err(MatError::UnsupportedType("tuple enum variant"))
     }
 
-    fn serialize_map(self, _len: Option<usize>) -> Result<MapSer, MatError> {
-        Ok(MapSer::new())
+    fn serialize_map(self, _len: Option<usize>) -> Result<MapSer<'a>, MatError> {
+        Ok(MapSer::new(self.opts))
     }
 
-    fn serialize_struct(self, name: &'static str, len: usize) -> Result<StructSer, MatError> {
-        if let Some(tag) = complex_tag_for_sentinel(name) {
-            return Ok(StructSer::Complex(tag, ComplexFields::default()));
-        }
-        if let Some(tag) = complex_tag_for_matrix_sentinel(name) {
-            return Ok(StructSer::Matrix(
-                MatrixFields::default(),
-                MatrixKind::Complex(tag),
-            ));
-        }
-        Ok(match name {
-            MATRIX_SENTINEL => StructSer::Matrix(MatrixFields::default(), MatrixKind::Numeric),
-            // serde supplies the exact field count, so the field Vec can be
-            // sized once instead of growing by reallocation.
-            _ => StructSer::Plain(PlainStructFields::with_capacity(len)),
+    fn serialize_struct(self, name: &'static str, len: usize) -> Result<StructSer<'a>, MatError> {
+        let kind = if let Some(tag) = complex_tag_for_sentinel(name) {
+            StructKind::Complex(tag, ComplexFields::default())
+        } else if let Some(tag) = complex_tag_for_matrix_sentinel(name) {
+            StructKind::Matrix(MatrixFields::default(), MatrixKind::Complex(tag))
+        } else {
+            match name {
+                MATRIX_SENTINEL => StructKind::Matrix(MatrixFields::default(), MatrixKind::Numeric),
+                // serde supplies the exact field count, so the field Vec can be
+                // sized once instead of growing by reallocation.
+                _ => StructKind::Plain(PlainStructFields::with_capacity(len)),
+            }
+        };
+        Ok(StructSer {
+            opts: self.opts,
+            kind,
         })
     }
 
@@ -212,29 +249,121 @@ impl Serializer for ValueSerializer {
 // Sequence serializer: handles Vec<T>, [T; N], tuples, tuple structs
 // ---------------------------------------------------------------------------
 
-pub(crate) struct SeqSer {
-    elements: Vec<MatValue>,
+pub(crate) struct SeqSer<'a> {
+    accum: SeqAccum,
+    opts: &'a Options,
 }
 
-impl SeqSer {
-    fn new(len: Option<usize>) -> Self {
+/// How a sequence's elements are held while it is being collected.
+///
+/// A flat numeric or complex array is the common large case, and holding it
+/// as one `MatValue` per element costs 56 bytes for what packs into 4. So the
+/// accumulator stays packed for as long as the elements agree, and only falls
+/// back to one-value-per-element when one of them breaks the pattern. That
+/// fallback is where the sequence was always going to end up anyway (a cell
+/// array, or a matrix built from equal-length rows), so nothing is lost by
+/// paying for it there instead of everywhere.
+enum SeqAccum {
+    /// Nothing pushed yet; the first element picks the representation.
+    Empty { cap: usize },
+    /// Every element so far is a numeric scalar of one tag.
+    Numeric(NumVec),
+    /// Every element so far is a complex scalar of one tag.
+    Complex(ComplexVec),
+    /// Anything else, held individually for `unify_sequence` to interpret.
+    Mixed(Vec<MatValue>),
+}
+
+impl SeqAccum {
+    fn push(&mut self, value: MatValue) -> Result<(), MatError> {
+        match self {
+            SeqAccum::Empty { cap } => {
+                let cap = *cap;
+                *self = match value {
+                    MatValue::Scalar(s) => {
+                        let mut v = NumVec::with_capacity_for_tag(s.tag(), cap);
+                        v.push(s)?;
+                        SeqAccum::Numeric(v)
+                    }
+                    MatValue::ComplexScalar(c) => {
+                        let mut v = ComplexVec::with_capacity_for_tag(c.tag(), cap);
+                        v.push(c)?;
+                        SeqAccum::Complex(v)
+                    }
+                    other => {
+                        let mut v = Vec::with_capacity(cap);
+                        v.push(other);
+                        SeqAccum::Mixed(v)
+                    }
+                };
+                Ok(())
+            }
+            SeqAccum::Numeric(v) => match value {
+                MatValue::Scalar(s) if s.tag() == v.tag() => v.push(s),
+                other => self.spill_and_push(other),
+            },
+            SeqAccum::Complex(v) => match value {
+                MatValue::ComplexScalar(c) if c.tag() == v.tag() => v.push(c),
+                other => self.spill_and_push(other),
+            },
+            SeqAccum::Mixed(v) => {
+                v.push(value);
+                Ok(())
+            }
+        }
+    }
+
+    /// Expand a packed accumulator back to one `MatValue` per element, then
+    /// push the element that broke the pattern.
+    fn spill_and_push(&mut self, value: MatValue) -> Result<(), MatError> {
+        let packed = std::mem::replace(self, SeqAccum::Empty { cap: 0 });
+        let (len, elements): (usize, Box<dyn Iterator<Item = MatValue>>) = match packed {
+            SeqAccum::Numeric(nums) => (
+                nums.len(),
+                Box::new(nums.into_scalars().map(MatValue::Scalar)),
+            ),
+            SeqAccum::Complex(pairs) => (
+                pairs.len(),
+                Box::new(pairs.into_pairs().map(MatValue::ComplexScalar)),
+            ),
+            SeqAccum::Empty { .. } | SeqAccum::Mixed(_) => {
+                unreachable!("only a packed accumulator spills")
+            }
+        };
+        let mut v = Vec::with_capacity(len + 1);
+        v.extend(elements);
+        v.push(value);
+        *self = SeqAccum::Mixed(v);
+        Ok(())
+    }
+}
+
+impl<'a> SeqSer<'a> {
+    fn new(len: Option<usize>, opts: &'a Options) -> Self {
         Self {
-            elements: Vec::with_capacity(len.unwrap_or(0)),
+            accum: SeqAccum::Empty {
+                cap: len.unwrap_or(0),
+            },
+            opts,
         }
     }
 
     fn push<T: Serialize + ?Sized>(&mut self, v: &T) -> Result<(), MatError> {
-        let value = v.serialize(ValueSerializer)?;
-        self.elements.push(value);
-        Ok(())
+        let value = v.serialize(ValueSerializer::new(self.opts))?;
+        self.accum.push(value)
     }
 
     fn finish(self) -> Result<MatValue, MatError> {
-        unify_sequence(self.elements)
+        match self.accum {
+            SeqAccum::Empty { .. } => unify_sequence(Vec::new(), self.opts),
+            SeqAccum::Numeric(v) => Ok(MatValue::Vec1D(v)),
+            SeqAccum::Complex(v) => Ok(MatValue::ComplexVec1D(v)),
+            SeqAccum::Mixed(v) => unify_sequence(v, self.opts),
+        }
     }
 }
 
-impl SerializeSeq for SeqSer {
+impl SerializeSeq for SeqSer<'_> {
     type Ok = MatValue;
     type Error = MatError;
     fn serialize_element<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), MatError> {
@@ -245,7 +374,7 @@ impl SerializeSeq for SeqSer {
     }
 }
 
-impl SerializeTuple for SeqSer {
+impl SerializeTuple for SeqSer<'_> {
     type Ok = MatValue;
     type Error = MatError;
     fn serialize_element<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), MatError> {
@@ -256,7 +385,7 @@ impl SerializeTuple for SeqSer {
     }
 }
 
-impl SerializeTupleStruct for SeqSer {
+impl SerializeTupleStruct for SeqSer<'_> {
     type Ok = MatValue;
     type Error = MatError;
     fn serialize_field<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), MatError> {
@@ -273,10 +402,14 @@ impl SerializeTupleStruct for SeqSer {
 /// or complex vec/matrix. Anything else (mixed tags, ragged inner vectors,
 /// sequences of structs, sequences containing `None`) lowers to a MATLAB cell
 /// array; the emitter interns each element under `#refs#`.
-fn unify_sequence(elements: Vec<MatValue>) -> Result<MatValue, MatError> {
+fn unify_sequence(elements: Vec<MatValue>, opts: &Options) -> Result<MatValue, MatError> {
     if elements.is_empty() {
-        // Unknown element type; default to an empty f64 array.
-        return Ok(MatValue::Vec1D(NumVec::F64(Vec::new())));
+        // No element revealed its type, so the MATLAB class is the caller's
+        // to pick; see `EmptySequencePolicy`.
+        return Ok(match opts.empty_sequence_policy {
+            EmptySequencePolicy::DoubleArray => MatValue::Vec1D(NumVec::F64(Vec::new())),
+            EmptySequencePolicy::Cell => MatValue::Cell(Vec::new()),
+        });
     }
 
     let elements = match try_unify_homogeneous(elements) {
@@ -392,26 +525,28 @@ fn try_unify_homogeneous(elements: Vec<MatValue>) -> Result<MatValue, Vec<MatVal
 // Map serializer: HashMap<String, T> → struct
 // ---------------------------------------------------------------------------
 
-pub(crate) struct MapSer {
+pub(crate) struct MapSer<'a> {
     fields: Vec<(String, MatValue)>,
     pending_key: Option<String>,
+    opts: &'a Options,
 }
 
-impl MapSer {
-    fn new() -> Self {
+impl<'a> MapSer<'a> {
+    fn new(opts: &'a Options) -> Self {
         Self {
             fields: Vec::new(),
             pending_key: None,
+            opts,
         }
     }
 }
 
-impl SerializeMap for MapSer {
+impl SerializeMap for MapSer<'_> {
     type Ok = MatValue;
     type Error = MatError;
 
     fn serialize_key<T: Serialize + ?Sized>(&mut self, key: &T) -> Result<(), MatError> {
-        let key_val = key.serialize(ValueSerializer)?;
+        let key_val = key.serialize(ValueSerializer::new(self.opts))?;
         let key_str = match key_val {
             MatValue::String(s) => s,
             other => {
@@ -429,7 +564,7 @@ impl SerializeMap for MapSer {
         let key = self.pending_key.take().ok_or_else(|| {
             MatError::Custom("serialize_value called before serialize_key".into())
         })?;
-        let val = value.serialize(ValueSerializer)?;
+        let val = value.serialize(ValueSerializer::new(self.opts))?;
         if !matches!(val, MatValue::Omit) {
             self.fields.push((key, val));
         }
@@ -446,7 +581,12 @@ impl SerializeMap for MapSer {
 // and a plain MATLAB-struct group.
 // ---------------------------------------------------------------------------
 
-pub(crate) enum StructSer {
+pub(crate) struct StructSer<'a> {
+    opts: &'a Options,
+    kind: StructKind,
+}
+
+pub(crate) enum StructKind {
     Matrix(MatrixFields, MatrixKind),
     Complex(ComplexTag, ComplexFields),
     Plain(PlainStructFields),
@@ -490,7 +630,7 @@ impl PlainStructFields {
     }
 }
 
-impl SerializeStruct for StructSer {
+impl SerializeStruct for StructSer<'_> {
     type Ok = MatValue;
     type Error = MatError;
 
@@ -499,18 +639,31 @@ impl SerializeStruct for StructSer {
         key: &'static str,
         value: &T,
     ) -> Result<(), MatError> {
-        match self {
-            StructSer::Matrix(fields, _) => match key {
+        let vs = ValueSerializer::new(self.opts);
+        match &mut self.kind {
+            StructKind::Matrix(fields, _) => match key {
                 "rows" => {
-                    let v = value.serialize(ValueSerializer)?;
+                    let v = value.serialize(vs)?;
                     fields.rows = Some(expect_usize(v, "Matrix::rows")?);
                 }
                 "cols" => {
-                    let v = value.serialize(ValueSerializer)?;
+                    let v = value.serialize(vs)?;
                     fields.cols = Some(expect_usize(v, "Matrix::cols")?);
                 }
                 "data" => {
-                    let v = value.serialize(ValueSerializer)?;
+                    // `Matrix::data` is the sentinel's own payload, not a
+                    // sequence the caller wrote, so `empty_sequence_policy` has
+                    // no business reaching it. Under `Cell` an empty matrix
+                    // lowered to a cell array, and `matrix_from_fields` then had
+                    // no `Vec1D` left to recover the element class from, which
+                    // made every empty `Matrix<T>` unserializable. Pin the policy
+                    // rather than teaching the sentinel handler to accept a shape
+                    // it should never receive.
+                    let pinned = Options {
+                        empty_sequence_policy: EmptySequencePolicy::DoubleArray,
+                        ..self.opts.clone()
+                    };
+                    let v = value.serialize(ValueSerializer::new(&pinned))?;
                     fields.data = Some(v);
                 }
                 other => {
@@ -519,9 +672,9 @@ impl SerializeStruct for StructSer {
                     )));
                 }
             },
-            StructSer::Complex(tag, fields) => match key {
-                "real" => fields.real = Some(expect_component(value.serialize(ValueSerializer)?)?),
-                "imag" => fields.imag = Some(expect_component(value.serialize(ValueSerializer)?)?),
+            StructKind::Complex(tag, fields) => match key {
+                "real" => fields.real = Some(expect_component(value.serialize(vs)?)?),
+                "imag" => fields.imag = Some(expect_component(value.serialize(vs)?)?),
                 other => {
                     return Err(MatError::Custom(format!(
                         "unexpected field {other:?} on the complex {} sentinel",
@@ -529,8 +682,8 @@ impl SerializeStruct for StructSer {
                     )));
                 }
             },
-            StructSer::Plain(ps) => {
-                let v = value.serialize(ValueSerializer)?;
+            StructKind::Plain(ps) => {
+                let v = value.serialize(vs)?;
                 ps.fields.push((key.to_owned(), v));
             }
         }
@@ -538,10 +691,10 @@ impl SerializeStruct for StructSer {
     }
 
     fn end(self) -> Result<MatValue, MatError> {
-        match self {
-            StructSer::Plain(ps) => Ok(MatValue::Struct(ps.fields)),
-            StructSer::Matrix(fields, kind) => matrix_from_fields(fields, kind),
-            StructSer::Complex(tag, fields) => {
+        match self.kind {
+            StructKind::Plain(ps) => Ok(MatValue::Struct(ps.fields)),
+            StructKind::Matrix(fields, kind) => matrix_from_fields(fields, kind),
+            StructKind::Complex(tag, fields) => {
                 let re = fields
                     .real
                     .ok_or_else(|| MatError::MissingField("real".into()))?;
