@@ -616,6 +616,18 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
                 raw_data: raw,
             }
         }
+        AttrValue::U64Array(arr) => {
+            let mut raw = Vec::with_capacity(arr.len() * 8);
+            for v in arr {
+                raw.extend_from_slice(&v.to_le_bytes());
+            }
+            AttributeMessage {
+                name: name.to_string(),
+                datatype: make_u64_type(),
+                dataspace: simple_1d(arr.len() as u64),
+                raw_data: raw,
+            }
+        }
         AttrValue::I32(v) => AttributeMessage {
             name: name.to_string(),
             datatype: make_i32_type(),
@@ -1083,6 +1095,10 @@ pub enum AttrValue {
     I64Array(Vec<i64>),
     U32(u32),
     U64(u64),
+    /// Unsigned 64-bit integer array. Distinct from
+    /// [`I64Array`](AttrValue::I64Array) because a value above [`i64::MAX`] has
+    /// no `i64` to be stored as.
+    U64Array(Vec<u64>),
     /// UTF-8 string attribute (null-padded).
     String(String),
     StringArray(Vec<String>),
@@ -1095,6 +1111,148 @@ pub enum AttrValue {
     /// Each element is a variable-length sequence of ASCII bytes.
     /// Requires a global heap collection in the file.
     VarLenAsciiArray(Vec<String>),
+}
+
+/// Accessors that read a value without matching on its variant.
+///
+/// One logical value has several representations here. A single string is a
+/// [`String`](AttrValue::String) or an [`AsciiString`](AttrValue::AsciiString)
+/// depending on charset, and a one-element array of either carries the same
+/// thing; an integer spans four widths. Code that only wants the value should
+/// not have to enumerate those, so each accessor spans every variant that can
+/// carry the shape it names and returns `None` for the rest.
+///
+/// The prefix states the cost. `as_*` borrows or copies; `to_*` allocates,
+/// which the numeric plurals must do because the narrower widths have no
+/// `&[i64]` or `&[f64]` view to hand out.
+///
+/// ```
+/// use hdf5_pure::AttrValue;
+///
+/// assert_eq!(AttrValue::AsciiString("double".into()).as_str(), Some("double"));
+/// assert_eq!(AttrValue::StringArray(vec!["double".into()]).as_str(), Some("double"));
+/// assert_eq!(AttrValue::F64(1.5).as_str(), None);
+///
+/// // A scalar reads as one element, without allocating.
+/// let one = AttrValue::String("m/s".into());
+/// assert_eq!(one.as_strings().unwrap(), ["m/s"]);
+///
+/// assert_eq!(AttrValue::I32(-7).to_i64s(), Some(vec![-7]));
+/// ```
+impl AttrValue {
+    /// The value as one string, when it holds exactly one.
+    ///
+    /// Spans both charsets and all three array kinds, scalar or one element.
+    /// Returns `None` for a non-string value, or for an array whose length is
+    /// not 1.
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(s) | Self::AsciiString(s) => Some(s),
+            Self::StringArray(v) | Self::AsciiStringArray(v) | Self::VarLenAsciiArray(v)
+                if v.len() == 1 =>
+            {
+                Some(&v[0])
+            }
+            _ => None,
+        }
+    }
+
+    /// Every string the value holds, with a scalar reading as one element.
+    ///
+    /// Borrows: a scalar is viewed as a one-element slice rather than copied.
+    /// Returns `None` for a non-string value. An empty array yields an empty
+    /// slice, which is distinct from `None`.
+    pub fn as_strings(&self) -> Option<&[String]> {
+        match self {
+            Self::String(s) | Self::AsciiString(s) => Some(core::slice::from_ref(s)),
+            Self::StringArray(v) | Self::AsciiStringArray(v) | Self::VarLenAsciiArray(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// The value as one `i64`, when it holds exactly one integer.
+    ///
+    /// Narrower signed and unsigned widths widen exactly. A value above
+    /// [`i64::MAX`] does not fit and yields `None` rather than a wrapped
+    /// negative; [`as_u64`](AttrValue::as_u64) reads it.
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            Self::I64(v) => Some(*v),
+            Self::I32(v) => Some(i64::from(*v)),
+            Self::U32(v) => Some(i64::from(*v)),
+            Self::U64(v) => i64::try_from(*v).ok(),
+            Self::I64Array(v) if v.len() == 1 => Some(v[0]),
+            Self::U64Array(v) if v.len() == 1 => i64::try_from(v[0]).ok(),
+            _ => None,
+        }
+    }
+
+    /// The value as one `u64`, when it holds exactly one integer.
+    ///
+    /// Unsigned widths widen exactly. A negative value has no `u64` and yields
+    /// `None`; [`as_i64`](AttrValue::as_i64) reads it.
+    pub fn as_u64(&self) -> Option<u64> {
+        match self {
+            Self::U64(v) => Some(*v),
+            Self::U32(v) => Some(u64::from(*v)),
+            Self::I64(v) => u64::try_from(*v).ok(),
+            Self::I32(v) => u64::try_from(*v).ok(),
+            Self::U64Array(v) if v.len() == 1 => Some(v[0]),
+            Self::I64Array(v) if v.len() == 1 => u64::try_from(v[0]).ok(),
+            _ => None,
+        }
+    }
+
+    /// Every integer the value holds as `i64`, with a scalar reading as one
+    /// element.
+    ///
+    /// Returns `None` for a non-integer value, and for an unsigned value with
+    /// **any** element above [`i64::MAX`] — the range rule is per element, not
+    /// per variant, so a wrapped negative is never handed back. Read those
+    /// through [`to_u64s`](AttrValue::to_u64s).
+    pub fn to_i64s(&self) -> Option<Vec<i64>> {
+        match self {
+            Self::I64Array(v) => Some(v.clone()),
+            Self::U64Array(v) => v.iter().map(|&e| i64::try_from(e).ok()).collect(),
+            _ => self.as_i64().map(|v| vec![v]),
+        }
+    }
+
+    /// Every integer the value holds as `u64`, with a scalar reading as one
+    /// element.
+    ///
+    /// Returns `None` for a non-integer value, and for a signed value with any
+    /// negative element.
+    pub fn to_u64s(&self) -> Option<Vec<u64>> {
+        match self {
+            Self::U64Array(v) => Some(v.clone()),
+            Self::I64Array(v) => v.iter().map(|&e| u64::try_from(e).ok()).collect(),
+            _ => self.as_u64().map(|v| vec![v]),
+        }
+    }
+
+    /// The value as one `f64`, when it holds exactly one float.
+    ///
+    /// Integer variants are not converted: this returns `None` for them, so a
+    /// caller that wants either shape asks for both.
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            Self::F64(v) => Some(*v),
+            Self::F64Array(v) if v.len() == 1 => Some(v[0]),
+            _ => None,
+        }
+    }
+
+    /// Every float the value holds, with a scalar reading as one element.
+    ///
+    /// Returns `None` for a non-float value.
+    pub fn to_f64s(&self) -> Option<Vec<f64>> {
+        match self {
+            Self::F64(v) => Some(vec![*v]),
+            Self::F64Array(v) => Some(v.clone()),
+            _ => None,
+        }
+    }
 }
 
 // ---- Dataset builder ----
@@ -2077,4 +2235,209 @@ pub struct FinishedGroup {
     pub(crate) datasets: Vec<DatasetBuilder>,
     pub(crate) sub_groups: Vec<FinishedGroup>,
     pub(crate) attrs: Vec<(String, AttrValue)>,
+}
+
+#[cfg(test)]
+mod attr_value_accessor_tests {
+    use super::AttrValue;
+
+    /// Every representation of a single string reaches `as_str`. The point of
+    /// the accessor is that a caller need not know which one a file yielded.
+    #[test]
+    fn as_str_spans_every_single_string_shape() {
+        for value in [
+            AttrValue::String("double".into()),
+            AttrValue::AsciiString("double".into()),
+            AttrValue::StringArray(vec!["double".into()]),
+            AttrValue::AsciiStringArray(vec!["double".into()]),
+            AttrValue::VarLenAsciiArray(vec!["double".into()]),
+        ] {
+            assert_eq!(value.as_str(), Some("double"), "{value:?}");
+        }
+    }
+
+    /// "Exactly one" is the contract: an array of two is not a single string,
+    /// and neither is a numeric value.
+    #[test]
+    fn as_str_rejects_non_single_strings() {
+        for value in [
+            AttrValue::StringArray(vec!["a".into(), "b".into()]),
+            AttrValue::AsciiStringArray(vec!["a".into(), "b".into()]),
+            AttrValue::VarLenAsciiArray(vec![]),
+            AttrValue::F64(1.5),
+            AttrValue::I64(3),
+        ] {
+            assert_eq!(value.as_str(), None, "{value:?}");
+        }
+    }
+
+    /// A scalar is viewed as a one-element slice, and the view borrows: no
+    /// element is copied to produce it.
+    #[test]
+    fn as_strings_reads_a_scalar_as_one_element() {
+        for value in [
+            AttrValue::String("m/s".into()),
+            AttrValue::AsciiString("m/s".into()),
+        ] {
+            let seen = value.as_strings().expect("a string value");
+            assert_eq!(seen, ["m/s"], "{value:?}");
+            assert_eq!(seen.len(), 1, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn as_strings_keeps_every_element_of_each_array_shape() {
+        let fields: Vec<String> = vec!["x".into(), "y".into(), "velocity".into()];
+        for value in [
+            AttrValue::StringArray(fields.clone()),
+            AttrValue::AsciiStringArray(fields.clone()),
+            AttrValue::VarLenAsciiArray(fields.clone()),
+        ] {
+            assert_eq!(
+                value.as_strings().expect("a string value"),
+                ["x", "y", "velocity"],
+                "{value:?}"
+            );
+        }
+    }
+
+    /// An empty string array is still a string array. An empty slice and `None`
+    /// mean different things — no elements against not a string at all — and a
+    /// caller distinguishing them depends on this.
+    #[test]
+    fn as_strings_separates_empty_from_absent() {
+        let empty = AttrValue::StringArray(vec![]);
+        assert_eq!(empty.as_strings(), Some(&[][..]));
+        assert_eq!(AttrValue::I64(1).as_strings(), None);
+    }
+
+    #[test]
+    fn as_i64_widens_every_integer_variant() {
+        assert_eq!(AttrValue::I64(-7).as_i64(), Some(-7));
+        assert_eq!(AttrValue::I32(-7).as_i64(), Some(-7));
+        assert_eq!(AttrValue::U32(7).as_i64(), Some(7));
+        assert_eq!(AttrValue::U64(7).as_i64(), Some(7));
+        assert_eq!(AttrValue::I64Array(vec![-7]).as_i64(), Some(-7));
+        assert_eq!(AttrValue::U64Array(vec![7]).as_i64(), Some(7));
+    }
+
+    #[test]
+    fn as_u64_widens_every_integer_variant() {
+        assert_eq!(AttrValue::U64(7).as_u64(), Some(7));
+        assert_eq!(AttrValue::U32(7).as_u64(), Some(7));
+        assert_eq!(AttrValue::I64(7).as_u64(), Some(7));
+        assert_eq!(AttrValue::I32(7).as_u64(), Some(7));
+        assert_eq!(AttrValue::U64Array(vec![7]).as_u64(), Some(7));
+        assert_eq!(AttrValue::I64Array(vec![7]).as_u64(), Some(7));
+    }
+
+    /// A `u64` past `i64::MAX` has no `i64` value, and a negative number has no
+    /// `u64`. Reporting `None` is the contract; a wrapping cast either way would
+    /// hand back a plausible wrong number instead.
+    #[test]
+    fn scalar_accessors_refuse_a_value_that_does_not_fit() {
+        let past_max = (i64::MAX as u64) + 1;
+        assert_eq!(AttrValue::U64(u64::MAX).as_i64(), None);
+        assert_eq!(AttrValue::U64(past_max).as_i64(), None);
+        assert_eq!(AttrValue::U64Array(vec![past_max]).as_i64(), None);
+        assert_eq!(
+            AttrValue::U64(i64::MAX as u64).as_i64(),
+            Some(i64::MAX),
+            "the largest value that does fit must still be readable"
+        );
+
+        assert_eq!(AttrValue::I64(-1).as_u64(), None);
+        assert_eq!(AttrValue::I32(-1).as_u64(), None);
+        assert_eq!(AttrValue::I64Array(vec![-1]).as_u64(), None);
+        assert_eq!(AttrValue::I64(0).as_u64(), Some(0));
+    }
+
+    #[test]
+    fn as_i64_rejects_multi_element_and_non_integer() {
+        assert_eq!(AttrValue::I64Array(vec![1, 2]).as_i64(), None);
+        assert_eq!(AttrValue::U64Array(vec![1, 2]).as_i64(), None);
+        assert_eq!(AttrValue::F64(1.0).as_i64(), None);
+        assert_eq!(AttrValue::String("1".into()).as_i64(), None);
+        assert_eq!(AttrValue::F64(1.0).as_u64(), None);
+    }
+
+    #[test]
+    fn to_i64s_reads_scalars_and_arrays_alike() {
+        assert_eq!(AttrValue::I64(4).to_i64s(), Some(vec![4]));
+        assert_eq!(AttrValue::I32(4).to_i64s(), Some(vec![4]));
+        assert_eq!(AttrValue::U32(4).to_i64s(), Some(vec![4]));
+        // The most common unsigned read shape: every scalar unsigned attribute
+        // arrives as `U64`, so this arm carries real traffic.
+        assert_eq!(AttrValue::U64(4).to_i64s(), Some(vec![4]));
+        assert_eq!(
+            AttrValue::I64Array(vec![1, 2, 3]).to_i64s(),
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(AttrValue::U64Array(vec![1, 2]).to_i64s(), Some(vec![1, 2]));
+        assert_eq!(AttrValue::I64Array(vec![]).to_i64s(), Some(vec![]));
+        assert_eq!(AttrValue::U64Array(vec![]).to_i64s(), Some(vec![]));
+        assert_eq!(AttrValue::F64Array(vec![1.0]).to_i64s(), None);
+    }
+
+    #[test]
+    fn to_u64s_reads_scalars_and_arrays_alike() {
+        assert_eq!(AttrValue::U64(4).to_u64s(), Some(vec![4]));
+        assert_eq!(AttrValue::U32(4).to_u64s(), Some(vec![4]));
+        assert_eq!(AttrValue::I64(4).to_u64s(), Some(vec![4]));
+        assert_eq!(
+            AttrValue::U64Array(vec![1, u64::MAX]).to_u64s(),
+            Some(vec![1, u64::MAX])
+        );
+        assert_eq!(AttrValue::I64Array(vec![1, 2]).to_u64s(), Some(vec![1, 2]));
+        assert_eq!(AttrValue::F64(1.0).to_u64s(), None);
+    }
+
+    /// The range rule is per element, not per variant. A single out-of-range
+    /// element rejects the whole read rather than wrapping that one silently —
+    /// the guarantee `as_i64` documents has to hold at every length, or it is
+    /// the shape-dependent behavior these accessors exist to remove.
+    #[test]
+    fn plural_accessors_apply_the_range_rule_to_every_element() {
+        let past_max = (i64::MAX as u64) + 1;
+        assert_eq!(AttrValue::U64Array(vec![1, past_max]).to_i64s(), None);
+        assert_eq!(AttrValue::U64Array(vec![past_max, 1]).to_i64s(), None);
+        assert_eq!(AttrValue::U64(u64::MAX).to_i64s(), None);
+        assert_eq!(
+            AttrValue::U64Array(vec![1, i64::MAX as u64]).to_i64s(),
+            Some(vec![1, i64::MAX]),
+            "every element fitting must still read"
+        );
+
+        assert_eq!(AttrValue::I64Array(vec![1, -1]).to_u64s(), None);
+        assert_eq!(AttrValue::I64Array(vec![-1, 1]).to_u64s(), None);
+        assert_eq!(AttrValue::I64(-1).to_u64s(), None);
+    }
+
+    #[test]
+    fn as_f64_reads_one_float_from_either_shape() {
+        assert_eq!(AttrValue::F64(1.5).as_f64(), Some(1.5));
+        assert_eq!(AttrValue::F64Array(vec![1.5]).as_f64(), Some(1.5));
+        assert_eq!(AttrValue::F64Array(vec![1.5, 2.5]).as_f64(), None);
+    }
+
+    /// The float accessors do not convert integers. A caller that accepts
+    /// either asks for both, rather than having a silent widening decided here.
+    #[test]
+    fn float_accessors_do_not_convert_integers() {
+        assert_eq!(AttrValue::I64(1).as_f64(), None);
+        assert_eq!(AttrValue::U32(1).as_f64(), None);
+        assert_eq!(AttrValue::I64Array(vec![1]).to_f64s(), None);
+        assert_eq!(AttrValue::U64Array(vec![1]).to_f64s(), None);
+    }
+
+    #[test]
+    fn to_f64s_reads_scalars_and_arrays_alike() {
+        assert_eq!(AttrValue::F64(1.5).to_f64s(), Some(vec![1.5]));
+        assert_eq!(
+            AttrValue::F64Array(vec![1.5, 2.5]).to_f64s(),
+            Some(vec![1.5, 2.5])
+        );
+        assert_eq!(AttrValue::F64Array(vec![]).to_f64s(), Some(vec![]));
+        assert_eq!(AttrValue::String("1.5".into()).to_f64s(), None);
+    }
 }
