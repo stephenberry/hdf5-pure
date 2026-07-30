@@ -3018,6 +3018,75 @@ mod tests {
         assert_eq!(huge_object_count(&build_dense_attrs(&at_limit, 0).blob), 0);
     }
 
+    /// The attribute names of a built heap's name-index records, in the order the
+    /// index stores them.
+    ///
+    /// A record carries the attribute's creation order — its index in `attrs` —
+    /// which names it without decoding the heap. Only valid for a set small enough
+    /// that the index is a single leaf.
+    fn name_index_order(attrs: &[AttributeMessage]) -> Vec<String> {
+        const RECORD: usize = 8 + 1 + 4 + 4;
+        let blob = build_dense_attrs(attrs, 0).blob;
+        let leaf = blob
+            .windows(4)
+            .position(|w| w == b"BTLF")
+            .expect("a name index has a leaf node");
+        // signature(4) + version(1) + type(1), then the records.
+        (0..attrs.len())
+            .map(|i| {
+                let at = leaf + 6 + i * RECORD + 9;
+                let order = u32::from_le_bytes(blob[at..at + 4].try_into().expect("4 bytes"));
+                attrs[order as usize].name.clone()
+            })
+            .collect()
+    }
+
+    /// The index order is a function of the names alone, never of the order the
+    /// attributes arrived in.
+    ///
+    /// This is the property that makes a file written by a version that ordered a
+    /// name-hash collision wrong (issue #225) repairable rather than lost: any
+    /// path that reads such a file's attributes and writes them out again —
+    /// `repack`, the editor's object copy, a plain read-and-rebuild — emits the
+    /// same correct index whatever order they came back in. Breaking the tie on
+    /// the hash alone would not give that, because the sort would carry through
+    /// whatever relative order the colliding pair was handed in.
+    #[test]
+    fn the_name_index_order_does_not_depend_on_insertion_order() {
+        // "k155448" sorts before "k69209" and hashes the same, so an order that is
+        // not fully determined by the names shows up as a difference here.
+        let names = [
+            "k69209", "k155448", "zeta", "alpha", "m", "beta", "gamma", "delta", "epsilon", "eta",
+        ];
+        let forward: Vec<AttributeMessage> = names
+            .iter()
+            .map(|n| build_attr_message(n, &AttrValue::I64(1)))
+            .collect();
+        let mut reversed = forward.clone();
+        reversed.reverse();
+
+        let order = name_index_order(&forward);
+        assert_eq!(
+            order,
+            name_index_order(&reversed),
+            "the index order changed with the insertion order"
+        );
+
+        // Non-vacuity: the pair this turns on really does collide, so its two
+        // records really are adjacent and really are ordered by name.
+        let at = |name: &str| {
+            order
+                .iter()
+                .position(|n| n == name)
+                .expect("every attribute is indexed")
+        };
+        assert_eq!(
+            at("k155448") + 1,
+            at("k69209"),
+            "the fixture names no longer hash alike; pick a new colliding pair"
+        );
+    }
+
     /// The `huge_objects_count` a built heap declares in its fractal-heap header.
     fn huge_object_count(blob: &[u8]) -> u64 {
         let ls = LENGTH_SIZE as usize;

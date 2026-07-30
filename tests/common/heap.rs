@@ -108,6 +108,33 @@ pub fn indirect_block_count(bytes: &[u8]) -> usize {
     bytes.windows(4).filter(|w| *w == b"FHIB").count()
 }
 
+/// Depth of the file's only v2 B-tree, from its header: 0 when the root is a
+/// leaf, and one more per level of internal nodes above it.
+///
+/// A test that means to exercise an internal node has to prove it built one,
+/// since the same assertions pass vacuously on a single-leaf tree. Panics unless
+/// the file holds exactly one B-tree header, so a caller cannot silently read the
+/// depth of a heap's huge-objects index when it meant the attribute name index.
+///
+/// Header layout: signature(4) + version(1) + type(1) + node size(4) + record
+/// size(2) + depth(2).
+pub fn sole_btree_depth(bytes: &[u8]) -> u16 {
+    let headers: Vec<usize> = bytes
+        .windows(4)
+        .enumerate()
+        .filter(|(_, w)| *w == b"BTHD")
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(
+        headers.len(),
+        1,
+        "expected one v2 B-tree in the file, found {}",
+        headers.len()
+    );
+    let at = headers[0] + 4 + 1 + 1 + 4 + 2;
+    u16::from_le_bytes(bytes[at..at + 2].try_into().expect("2 bytes"))
+}
+
 /// The `(creation order, name hash)` of each record in the file's first v2
 /// B-tree leaf node, in the order the node stores them.
 ///
@@ -131,6 +158,42 @@ pub fn name_index_leaf_records(bytes: &[u8], count: usize) -> Vec<(u32, u32)> {
     (0..count)
         .map(|i| {
             let at = first + i * RECORD;
+            let field = |off: usize| {
+                u32::from_le_bytes(bytes[at + off..at + off + 4].try_into().expect("4 bytes"))
+            };
+            (field(9), field(13))
+        })
+        .collect()
+}
+
+/// The `(creation order, name hash)` of each record the file's sole v2 B-tree
+/// keeps in its *root* node, in the order the node stores them.
+///
+/// A record in an internal node is one the tree promoted out of the level below:
+/// it lives only there, and a search compares against it while choosing which
+/// child to descend into. That makes it the record a wrong ordering hurts most,
+/// and the reason a test about ordering wants to know a colliding name reached
+/// one — on a single-leaf index there is nothing to descend and the same
+/// assertions pass without testing anything.
+///
+/// The root is the one internal node reachable without decoding a child pointer,
+/// whose width varies by depth: the header carries both its address and its own
+/// record count. Header layout past [`sole_btree_depth`]: split %(1) + merge %(1)
+/// + root address(8) + records in root(2).
+pub fn root_records(bytes: &[u8]) -> Vec<(u32, u32)> {
+    const RECORD: usize = 8 + 1 + 4 + 4;
+    let header = bytes
+        .windows(4)
+        .position(|w| w == b"BTHD")
+        .expect("a dense attribute name index has a v2 B-tree header");
+    let at = header + 4 + 1 + 1 + 4 + 2 + 2 + 1 + 1;
+    let root = u64::from_le_bytes(bytes[at..at + SIZE].try_into().expect("8 bytes")) as usize;
+    let count =
+        u16::from_le_bytes(bytes[at + SIZE..at + SIZE + 2].try_into().expect("2 bytes")) as usize;
+    // signature(4) + version(1) + type(1), then the records.
+    (0..count)
+        .map(|i| {
+            let at = root + 6 + i * RECORD;
             let field = |off: usize| {
                 u32::from_le_bytes(bytes[at + off..at + off + 4].try_into().expect("4 bytes"))
             };

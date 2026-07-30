@@ -53,6 +53,7 @@ Dense attributes take on the reference library's geometry: both indexes are mult
 ### Fixed
 
 - A MATLAB matrix shape whose `rows * cols` wraps `usize` is refused everywhere it can enter: `Matrix::from_row_major` and `Matrix::zeros` panic, while the serde and file-reading paths return an error. Previously the wrapped product could match a short data vector, and the writer's transpose then wrote past its allocation ([#230](https://github.com/stephenberry/hdf5-pure/pull/230)).
+- Two dense attributes whose names hash alike are indexed in name order rather than insertion order, so the reference C library can open both by name. Written the other way round, one of the pair was unfindable by name while iteration and this crate still reported both. Affects files written by 0.28.0 and earlier; rewriting one with `repack` corrects it ([#225](https://github.com/stephenberry/hdf5-pure/issues/225)).
 
 ## [0.28.0] - 2026-07-28
 
