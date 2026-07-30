@@ -260,10 +260,11 @@ pub enum FormatError {
     InvalidFilterPipelineVersion(u8),
     /// Unsupported filter ID.
     UnsupportedFilter(u16),
-    /// Filter processing error.
+    /// Filter processing error, including a stream that failed to decode. Every
+    /// filter in the pipeline — shuffle, scale-offset, LZF, deflate — reports a
+    /// bad chunk with this variant, so "this chunk did not decode" is one match
+    /// arm rather than one per compressor. The payload names the filter.
     FilterError(String),
-    /// Decompression error.
-    DecompressionError(String),
     /// Compression error.
     CompressionError(String),
     /// Fletcher32 checksum mismatch.
@@ -738,9 +739,6 @@ impl fmt::Display for FormatError {
             }
             FormatError::FilterError(msg) => {
                 write!(f, "filter error: {msg}")
-            }
-            FormatError::DecompressionError(msg) => {
-                write!(f, "decompression error: {msg}")
             }
             FormatError::CompressionError(msg) => {
                 write!(f, "compression error: {msg}")

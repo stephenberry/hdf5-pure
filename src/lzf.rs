@@ -30,6 +30,12 @@ const MAX_MATCH_LEN: usize = 264;
 /// Largest encodable back-reference distance (13 offset bits, plus one).
 const MAX_MATCH_DISTANCE: usize = 1 << 13;
 
+/// Largest number of bytes a conforming LZF stream can decode to per byte of
+/// input. The densest token is a three-byte extended back-reference emitting
+/// [`MAX_MATCH_LEN`]; every other token is denser in the input, so the ratio
+/// bounds the stream as a whole.
+pub(crate) const MAX_EXPANSION: usize = MAX_MATCH_LEN / 3;
+
 /// h5py's `H5PY_FILTER_LZF_VERSION` (lzf/lzf_filter.h), cd_values[0].
 const H5PY_FILTER_LZF_VERSION: u32 = 4;
 
@@ -58,9 +64,17 @@ fn corrupt(reason: &str) -> FormatError {
 /// `max_output` is the decoded size cap (the expected chunk size pushed through
 /// the surviving inner filters); exceeding it means a corrupt or hostile
 /// stream, and `None` (unknown chunk size) leaves the output uncapped.
+///
+/// The cap bounds the output but does not by itself size the allocation: see
+/// [`decode_reservation`](crate::filters::decode_reservation) for why a size the
+/// file merely claims is not enough to reserve on.
 pub(crate) fn decompress(input: &[u8], max_output: Option<usize>) -> Result<Vec<u8>, FormatError> {
     let cap = max_output.unwrap_or(usize::MAX);
-    let mut out = Vec::with_capacity(max_output.unwrap_or_default());
+    let mut out = Vec::with_capacity(crate::filters::decode_reservation(
+        max_output,
+        input.len(),
+        MAX_EXPANSION,
+    ));
     let mut ip = 0;
 
     while ip < input.len() {

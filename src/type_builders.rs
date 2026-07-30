@@ -1882,12 +1882,23 @@ impl DatasetBuilder {
     }
 
     /// Enable deflate compression (implies chunked if not already set).
+    ///
+    /// Mutually exclusive with [`with_lzf`](Self::with_lzf), which fills the
+    /// same byte-compressor slot, and with [`with_zfp`](Self::with_zfp), which
+    /// replaces it: requesting either combination makes the write fail with a
+    /// filter error. May follow [`with_shuffle`](Self::with_shuffle) or
+    /// [`with_scale_offset`](Self::with_scale_offset).
     pub fn with_deflate(&mut self, level: u32) -> &mut Self {
         self.chunk_options.deflate_level = Some(level);
         self
     }
 
-    /// Enable shuffle filter (usually combined with deflate).
+    /// Enable shuffle filter (usually combined with deflate or LZF).
+    ///
+    /// Mutually exclusive with the two filters that consume the raw elements
+    /// themselves, [`with_scale_offset`](Self::with_scale_offset) and
+    /// [`with_zfp`](Self::with_zfp): requesting shuffle alongside either makes
+    /// the write fail with a filter error rather than dropping it.
     pub fn with_shuffle(&mut self) -> &mut Self {
         self.chunk_options.shuffle = true;
         self
@@ -1899,8 +1910,10 @@ impl DatasetBuilder {
     /// lower compression ratio than deflate. h5py reads and writes it out of
     /// the box; the plain C library needs h5py's filter plugin. Usually
     /// combined with [`with_shuffle`](Self::with_shuffle); mutually exclusive
-    /// with [`with_deflate`](Self::with_deflate) — requesting both makes the
-    /// write fail with a filter error.
+    /// with [`with_deflate`](Self::with_deflate), which fills the same
+    /// byte-compressor slot, and with [`with_zfp`](Self::with_zfp), which
+    /// replaces it — requesting either combination makes the write fail with a
+    /// filter error.
     pub fn with_lzf(&mut self) -> &mut Self {
         self.chunk_options.lzf = true;
         self
@@ -1927,11 +1940,13 @@ impl DatasetBuilder {
     /// datatype when the file is written, so the mode must match the data
     /// (integer mode on `with_i*`/`with_u*` data, float mode on
     /// `with_f32`/`with_f64` data) or `finish()` / `write()` returns a
-    /// [`FormatError`](crate::FormatError). Scale-offset is mutually exclusive
-    /// with ZFP and replaces shuffle, but may be combined with
-    /// [`with_deflate`](Self::with_deflate) or [`with_lzf`](Self::with_lzf).
-    /// Files are readable by the
-    /// reference HDF5 library (filter id 6) and vice versa.
+    /// [`FormatError`](crate::FormatError). Scale-offset consumes the raw
+    /// elements itself, so it is mutually exclusive with
+    /// [`with_zfp`](Self::with_zfp) and [`with_shuffle`](Self::with_shuffle) —
+    /// requesting either alongside it makes the write fail with a filter error
+    /// — but it may be followed by [`with_deflate`](Self::with_deflate) or
+    /// [`with_lzf`](Self::with_lzf). Files are readable by the reference HDF5
+    /// library (filter id 6) and vice versa.
     pub fn with_scale_offset(&mut self, mode: ScaleOffset) -> &mut Self {
         self.chunk_options.scale_offset = Some(mode);
         self
@@ -1940,8 +1955,13 @@ impl DatasetBuilder {
     /// Enable ZFP fixed-rate compression (implies chunked if not already set).
     ///
     /// `rate` is the number of compressed bits per value. Supports f32, f64,
-    /// i32, and i64 datasets in 1D–4D. When ZFP is active it replaces shuffle,
-    /// deflate, and lzf on the same dataset.
+    /// i32, and i64 datasets in 1D–4D. ZFP is a standalone compressor that
+    /// consumes the raw elements itself, so it is mutually exclusive with
+    /// [`with_shuffle`](Self::with_shuffle),
+    /// [`with_scale_offset`](Self::with_scale_offset),
+    /// [`with_deflate`](Self::with_deflate) and [`with_lzf`](Self::with_lzf):
+    /// requesting any of them alongside it makes the write fail with a filter
+    /// error.
     ///
     /// The scalar type is derived from the dataset's datatype when the file
     /// is written, so any of `with_{f32,f64,i32,i64}_data` or an explicit

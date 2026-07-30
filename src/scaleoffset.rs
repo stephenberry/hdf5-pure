@@ -28,7 +28,7 @@
 extern crate alloc;
 
 #[cfg(not(feature = "std"))]
-use alloc::{string::ToString, vec, vec::Vec};
+use alloc::{format, string::ToString, vec, vec::Vec};
 
 use crate::convert::TryToUsize;
 use crate::datatype::{Datatype, DatatypeByteOrder};
@@ -278,7 +278,11 @@ impl Parms {
 
 /// Decompress one scale-offset chunk into raw element bytes (in the dataset's
 /// stored byte order).
-pub fn decompress(input: &[u8], filter: &FilterDescription) -> Result<Vec<u8>, FormatError> {
+pub fn decompress(
+    input: &[u8],
+    filter: &FilterDescription,
+    max_output: Option<usize>,
+) -> Result<Vec<u8>, FormatError> {
     let cd = &filter.client_data;
     let p = Parms::parse(cd)?;
 
@@ -298,6 +302,23 @@ pub fn decompress(input: &[u8], filter: &FilterDescription) -> Result<Vec<u8>, F
     // `nelmts` originates from a `u32` and `size` is 1..=8) and narrowed to
     // `usize`, which errors instead of truncating on a 32-bit host.
     let size_out = (p.nelmts as u64 * p.size as u64).to_usize()?;
+
+    // `size_out` sizes an allocation, and `nelmts` comes from the filter's own
+    // cd_values rather than from the chunk geometry, so nothing has yet tied it
+    // to a plausible size. Unlike the byte compressors this decoder cannot bound
+    // itself by the input length — the `minbits == 0` path below expands a
+    // header into `size_out` bytes with no payload at all — so the check is
+    // against the size the pipeline expects of this stage. Scale-offset decodes
+    // last, so that is the chunk size itself; a chunk claiming more than the
+    // whole chunk is refused here rather than after the memory is committed.
+    if let Some(cap) = max_output
+        && size_out > cap
+    {
+        return Err(FormatError::FilterError(format!(
+            "scaleoffset: chunk declares {size_out} decoded bytes, more than the \
+             {cap} the chunk can hold"
+        )));
+    }
 
     // No-op mode: integer (non-DSCALE) datasets created with scale_factor equal
     // to the full bit width store the chunk verbatim, with no header.
@@ -1085,7 +1106,7 @@ mod tests {
         }
         let f = int_filter(4, false, order, vals.len() as u32);
         let comp = compress(&raw, &f).unwrap();
-        let dec = decompress(&comp, &f).unwrap();
+        let dec = decompress(&comp, &f, None).unwrap();
         assert_eq!(dec, raw);
     }
 
@@ -1110,7 +1131,7 @@ mod tests {
             }
             let f = int_filter(2, true, order, vals.len() as u32);
             let comp = compress(&raw, &f).unwrap();
-            let dec = decompress(&comp, &f).unwrap();
+            let dec = decompress(&comp, &f, None).unwrap();
             assert_eq!(dec, raw, "order {order}");
         }
     }
@@ -1127,7 +1148,7 @@ mod tests {
         // minbits == 0 -> 21-byte header + 1 trailing byte.
         assert_eq!(comp.len(), HEADER_LEN + 1);
         assert_eq!(u32::from_le_bytes([comp[0], comp[1], comp[2], comp[3]]), 0);
-        let dec = decompress(&comp, &f).unwrap();
+        let dec = decompress(&comp, &f, None).unwrap();
         assert_eq!(dec, raw);
     }
 
@@ -1143,7 +1164,7 @@ mod tests {
         let comp = compress(&raw, &f).unwrap();
         assert_eq!(comp.len(), HEADER_LEN + raw.len());
         assert_eq!(u32::from_le_bytes([comp[0], comp[1], comp[2], comp[3]]), 32);
-        let dec = decompress(&comp, &f).unwrap();
+        let dec = decompress(&comp, &f, None).unwrap();
         assert_eq!(dec, raw);
     }
 
@@ -1152,7 +1173,7 @@ mod tests {
         let raw = vec![10u8, 11, 12, 250, 10, 200];
         let f = int_filter(1, false, ORDER_LE, raw.len() as u32);
         let comp = compress(&raw, &f).unwrap();
-        let dec = decompress(&comp, &f).unwrap();
+        let dec = decompress(&comp, &f, None).unwrap();
         assert_eq!(dec, raw);
     }
 
@@ -1165,7 +1186,7 @@ mod tests {
         }
         let f = int_filter(8, true, ORDER_LE, vals.len() as u32);
         let comp = compress(&raw, &f).unwrap();
-        let dec = decompress(&comp, &f).unwrap();
+        let dec = decompress(&comp, &f, None).unwrap();
         assert_eq!(dec, raw);
     }
 
@@ -1179,7 +1200,7 @@ mod tests {
         }
         let f = float_filter(8, decimals, ORDER_LE, vals.len() as u32);
         let comp = compress(&raw, &f).unwrap();
-        let dec = decompress(&comp, &f).unwrap();
+        let dec = decompress(&comp, &f, None).unwrap();
         let got: Vec<f64> = dec
             .chunks_exact(8)
             .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
@@ -1200,7 +1221,7 @@ mod tests {
         }
         let f = float_filter(4, decimals, ORDER_BE, vals.len() as u32);
         let comp = compress(&raw, &f).unwrap();
-        let dec = decompress(&comp, &f).unwrap();
+        let dec = decompress(&comp, &f, None).unwrap();
         let got: Vec<f32> = dec
             .chunks_exact(4)
             .map(|c| f32::from_be_bytes(c.try_into().unwrap()))
@@ -1222,7 +1243,7 @@ mod tests {
         bad.extend_from_slice(&0u64.to_le_bytes()); // minval (bytes 5..13)
         // Only 13 bytes total: shorter than the 21-byte header.
         assert!(matches!(
-            decompress(&bad, &f),
+            decompress(&bad, &f, None),
             Err(FormatError::FilterError(_))
         ));
     }
@@ -1242,6 +1263,36 @@ mod tests {
         let minval = u64::from_le_bytes(comp[5..13].try_into().unwrap());
         assert_eq!(minval, 5);
         assert_eq!(&comp[13..21], &[0u8; 8]); // padding
+    }
+
+    /// A chunk that claims more decoded bytes than the chunk can hold is
+    /// refused before the allocation, not after it (#233).
+    ///
+    /// Scale-offset is the one filter here that cannot bound itself by the
+    /// length of its input: `minbits == 0` means every value equals the
+    /// minimum, so a thirteen-byte header expands into the whole chunk with no
+    /// payload behind it. The size it claims comes from its own cd_values,
+    /// which nothing has yet tied to the chunk geometry, so the bound has to be
+    /// the size the pipeline expects of this stage.
+    #[test]
+    fn decompress_refuses_a_claim_larger_than_the_chunk() {
+        // Thirteen bytes claiming two gigabytes: 2^28 elements of 8 bytes.
+        let mut chunk = vec![0u8; HEADER_LEN];
+        chunk[4] = 8; // sizeof(minval); minbits stays 0
+
+        let huge = int_filter(8, true, ORDER_LE, 1 << 28);
+        let err = decompress(&chunk, &huge, Some(4096)).unwrap_err();
+        let FormatError::FilterError(msg) = &err else {
+            panic!("expected a filter error, got {err}");
+        };
+        assert!(msg.contains("scaleoffset"), "{msg}");
+
+        // The guard is the cap, not a new refusal of chunks in general: a claim
+        // the chunk can hold still decodes, and to exactly that many bytes.
+        let fits = int_filter(8, true, ORDER_LE, 512);
+        assert_eq!(decompress(&chunk, &fits, Some(4096)).unwrap().len(), 4096);
+        // And with no cap to check against, behavior is what it always was.
+        assert_eq!(decompress(&chunk, &fits, None).unwrap().len(), 4096);
     }
 
     #[test]
@@ -1324,7 +1375,7 @@ mod tests {
             }
             let f = int_filter(size, signed, order, nelmts as u32);
             let comp = compress(&raw, &f).unwrap();
-            let dec = decompress(&comp, &f).unwrap();
+            let dec = decompress(&comp, &f, None).unwrap();
             assert_eq!(
                 dec, raw,
                 "trial {trial}: size={size}, signed={signed}, order={order}"
@@ -1375,7 +1426,7 @@ mod tests {
             }
             let f = int_filter(4, true, ORDER_LE, nelmts as u32);
             let comp = compress(&raw, &f).unwrap();
-            let dec = decompress(&comp, &f).unwrap();
+            let dec = decompress(&comp, &f, None).unwrap();
             assert_eq!(dec, raw, "trial {trial}: narrow={narrow}");
         }
     }
@@ -1418,7 +1469,7 @@ mod tests {
             }
             let f = float_filter(8, decimals, ORDER_LE, nelmts as u32);
             let comp = compress(&raw, &f).unwrap();
-            let dec = decompress(&comp, &f).unwrap();
+            let dec = decompress(&comp, &f, None).unwrap();
             let got: Vec<f64> = dec
                 .chunks_exact(8)
                 .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
@@ -1468,7 +1519,7 @@ mod tests {
         chunk.extend_from_slice(&7u64.to_le_bytes());
         chunk.extend_from_slice(&[0u8; HEADER_LEN - 13]);
         chunk.push(0);
-        let out = decompress(&chunk, &f).unwrap();
+        let out = decompress(&chunk, &f, None).unwrap();
         let got: Vec<u32> = out
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
@@ -1513,7 +1564,7 @@ mod tests {
         chunk.extend_from_slice(&10u64.to_le_bytes());
         chunk.extend_from_slice(&[0u8; HEADER_LEN - 13]);
         chunk.extend_from_slice(&pack_offsets(&[0, 1, 7, 2], 3, 4).unwrap());
-        let out = decompress(&chunk, &f).unwrap();
+        let out = decompress(&chunk, &f, None).unwrap();
         let got: Vec<u32> = out
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
@@ -1568,7 +1619,7 @@ mod tests {
         };
         let chunk = vec![0u8; HEADER_LEN + 4];
         assert!(matches!(
-            decompress(&chunk, &f),
+            decompress(&chunk, &f, None),
             Err(FormatError::FilterError(_))
         ));
     }
@@ -1586,7 +1637,7 @@ mod tests {
         bad.extend_from_slice(&[0u8; HEADER_LEN - 13]);
         bad.extend_from_slice(&[0u8; 16]); // dummy payload
         assert!(matches!(
-            decompress(&bad, &f),
+            decompress(&bad, &f, None),
             Err(FormatError::FilterError(_))
         ));
     }
@@ -1599,7 +1650,7 @@ mod tests {
         let raw: Vec<u8> = vals.iter().map(|&v| v as u8).collect();
         let f = int_filter(1, true, ORDER_LE, vals.len() as u32);
         let comp = compress(&raw, &f).unwrap();
-        let dec = decompress(&comp, &f).unwrap();
+        let dec = decompress(&comp, &f, None).unwrap();
         assert_eq!(dec, raw);
     }
 
@@ -1612,13 +1663,13 @@ mod tests {
         let raw = 42u32.to_le_bytes().to_vec();
         let f = int_filter(4, false, ORDER_LE, 1);
         let comp = compress(&raw, &f).unwrap();
-        let dec = decompress(&comp, &f).unwrap();
+        let dec = decompress(&comp, &f, None).unwrap();
         assert_eq!(dec, raw);
 
         let raw = 3.14f64.to_le_bytes().to_vec();
         let f = float_filter(8, 3, ORDER_LE, 1);
         let comp = compress(&raw, &f).unwrap();
-        let dec = decompress(&comp, &f).unwrap();
+        let dec = decompress(&comp, &f, None).unwrap();
         let got = f64::from_le_bytes(dec.as_slice().try_into().unwrap());
         assert!((got - 3.14).abs() <= 0.5e-3);
     }
