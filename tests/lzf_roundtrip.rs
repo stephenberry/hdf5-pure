@@ -193,9 +193,17 @@ fn fixture(name: &str) -> std::path::PathBuf {
 /// of our own reader: a plain multi-chunk dataset, a shuffle+lzf chain, a
 /// partial edge chunk, and an incompressible one whose stream our compressor
 /// grows — the case that fails outright if the filter is not recorded optional.
+///
+/// Every value here must be bit-identical on every target, because
+/// [`pure_written_fixture_is_current`] compares the file byte for byte against
+/// a fixture generated on one machine. That rules out the transcendental
+/// functions: Rust makes no cross-platform guarantee about `f64::sin`, and one
+/// ULP of libm disagreement is enough to change the bytes. `sqrt` is safe where
+/// `sin` is not — IEEE-754 mandates it be correctly rounded — and it still
+/// gives the varied mantissas that make a shuffle+LZF chain worth writing.
 fn build_pure_written() -> Vec<u8> {
     let ramp: Vec<i32> = (0..1024).collect();
-    let waves: Vec<f64> = (0..512).map(|i| (f64::from(i) * 0.05).sin()).collect();
+    let waves: Vec<f64> = (0..512).map(|i| f64::from(i).sqrt()).collect();
     let edge: Vec<i64> = (0..1000).map(|i| i * 7 - 500).collect();
     let noise = std::fs::read(fixture("u8_noise.raw.bin")).unwrap();
 
@@ -247,7 +255,7 @@ fn pure_written_fixture_reads_back() {
     let ramp: Vec<i32> = (0..1024).collect();
     assert_eq!(file.dataset("plain_i32").unwrap().read_i32().unwrap(), ramp);
 
-    let waves: Vec<f64> = (0..512).map(|i| (f64::from(i) * 0.05).sin()).collect();
+    let waves: Vec<f64> = (0..512).map(|i| f64::from(i).sqrt()).collect();
     assert_eq!(
         file.dataset("shuffle_f64").unwrap().read_f64().unwrap(),
         waves

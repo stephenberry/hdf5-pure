@@ -200,7 +200,10 @@ PURE_WRITTEN = FIXTURE_DIR / "pure_written.h5"
 # contents, this table only says what h5py should find there.
 PURE_EXPECTED = {
     "plain_i32": lambda: np.arange(1024, dtype=np.int32),
-    "shuffle_f64": lambda: np.sin(np.arange(512, dtype=np.float64) * 0.05),
+    # sqrt, not sin: pure_written.h5 is compared byte for byte by a Rust test
+    # that runs on three platforms, and only correctly-rounded operations are
+    # bit-identical across libms. See `build_pure_written` in lzf_roundtrip.rs.
+    "shuffle_f64": lambda: np.sqrt(np.arange(512, dtype=np.float64)),
     "multichunk_i64": lambda: np.arange(1000, dtype=np.int64) * 7 - 500,
     "incompressible_u8": lambda: np.frombuffer(
         (FIXTURE_DIR / "u8_noise.raw.bin").read_bytes(), dtype=np.uint8
