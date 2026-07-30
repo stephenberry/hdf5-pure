@@ -107,7 +107,10 @@ fn set_vlstring_attr() {
     let attrs = f.dataset("d").unwrap().attrs().unwrap();
     assert_eq!(
         attrs.get("labels"),
-        Some(&AttrValue::StringArray(vec!["alpha".into(), "beta".into()]))
+        Some(&AttrValue::VarLenAsciiArray(vec![
+            "alpha".into(),
+            "beta".into()
+        ]))
     );
 }
 

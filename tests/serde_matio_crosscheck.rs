@@ -860,8 +860,10 @@ fn hdf5_pure_reads_complex_int16_written_by_matio() {
     // that one only for `logical` and `char`).
     let attrs = ds.attrs().unwrap();
     assert_eq!(
-        attrs.get("MATLAB_class"),
-        Some(&hdf5_pure::AttrValue::String("int16".into()))
+        attrs
+            .get("MATLAB_class")
+            .and_then(hdf5_pure::AttrValue::as_str),
+        Some("int16")
     );
     assert!(!attrs.contains_key("MATLAB_int_decode"));
 
@@ -939,8 +941,10 @@ fn empty_struct_array_agrees_with_matio_and_across_both_emitters() {
     assert_eq!(ds.shape().unwrap(), vec![0, 0]);
     let attrs = ds.attrs().unwrap();
     assert_eq!(
-        attrs.get("MATLAB_class"),
-        Some(&hdf5_pure::AttrValue::String("struct".into()))
+        attrs
+            .get("MATLAB_class")
+            .and_then(hdf5_pure::AttrValue::as_str),
+        Some("struct")
     );
     assert!(attrs.contains_key("MATLAB_empty"));
 

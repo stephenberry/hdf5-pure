@@ -708,7 +708,10 @@ fn create_group_with_attributes() {
 
     let file = File::open(&path).unwrap();
     let attrs = file.group("run").unwrap().attrs().unwrap();
-    assert_eq!(attrs.get("kind"), Some(&AttrValue::String("trial".into())));
+    assert_eq!(
+        attrs.get("kind"),
+        Some(&AttrValue::AsciiString("trial".into()))
+    );
     assert_eq!(attrs.get("count"), Some(&AttrValue::I64(2)));
     assert_eq!(
         file.dataset("original").unwrap().read_f64().unwrap(),
@@ -847,7 +850,7 @@ fn add_variable_length_root_attribute_via_edit_session() {
     let attrs = file.root().attrs().unwrap();
     assert_eq!(
         attrs.get("fields"),
-        Some(&AttrValue::StringArray(vec!["a".into(), "b".into()]))
+        Some(&AttrValue::VarLenAsciiArray(vec!["a".into(), "b".into()]))
     );
     // The rest of the file is untouched.
     assert_eq!(
@@ -899,7 +902,7 @@ fn add_variable_length_group_attribute_then_remove_then_reset_in_one_commit() {
     let attrs = file.root().group("grp").unwrap().attrs().unwrap();
     assert_eq!(
         attrs.get("fields"),
-        Some(&AttrValue::StringArray(vec![
+        Some(&AttrValue::VarLenAsciiArray(vec![
             "new1".into(),
             "new2".into(),
             "new3".into()
@@ -942,7 +945,10 @@ fn set_variable_length_group_attribute_over_existing_fixed_attribute_in_one_comm
     assert_eq!(attrs.len(), 1);
     assert_eq!(
         attrs.get("fields"),
-        Some(&AttrValue::StringArray(vec!["new1".into(), "new2".into()]))
+        Some(&AttrValue::VarLenAsciiArray(vec![
+            "new1".into(),
+            "new2".into()
+        ]))
     );
     std::fs::remove_file(&path).ok();
 }
@@ -965,10 +971,9 @@ fn add_variable_length_group_attributes_at_budget_boundary_in_one_commit() {
 
     {
         let session = File::open_rw(&path).unwrap();
-        // Two elements each: a single-element `VarLenAsciiArray` collapses to
-        // `AttrValue::String` on read (matching every other array `AttrValue`
-        // variant's len-1 collapse), which would make the read-back
-        // assertions below ambiguous with a fixed-size string attribute.
+        // Two elements each. A single element would read back distinctly now
+        // that the reader keeps the written shape, but this case is about the
+        // budget boundary, and two elements per attribute is what reaches it.
         session
             .group("grp")
             .unwrap()
@@ -996,11 +1001,11 @@ fn add_variable_length_group_attributes_at_budget_boundary_in_one_commit() {
     }
     assert_eq!(
         attrs.get("b0"),
-        Some(&AttrValue::StringArray(vec!["x0".into(), "x1".into()]))
+        Some(&AttrValue::VarLenAsciiArray(vec!["x0".into(), "x1".into()]))
     );
     assert_eq!(
         attrs.get("b1"),
-        Some(&AttrValue::StringArray(vec!["y0".into(), "y1".into()]))
+        Some(&AttrValue::VarLenAsciiArray(vec!["y0".into(), "y1".into()]))
     );
     std::fs::remove_file(&path).ok();
 }
@@ -3001,7 +3006,7 @@ fn add_dataset_with_variable_length_attribute_via_edit_session() {
     let attrs = ds.attrs().unwrap();
     assert_eq!(
         attrs.get("tags"),
-        Some(&AttrValue::StringArray(vec![
+        Some(&AttrValue::VarLenAsciiArray(vec![
             "one".into(),
             "two".into(),
             "three".into()
@@ -3045,7 +3050,10 @@ fn add_chunked_dataset_with_variable_length_attribute_via_edit_session() {
     assert_eq!(ds.read_f64().unwrap(), data);
     assert_eq!(
         ds.attrs().unwrap().get("tags"),
-        Some(&AttrValue::StringArray(vec!["one".into(), "two".into()]))
+        Some(&AttrValue::VarLenAsciiArray(vec![
+            "one".into(),
+            "two".into()
+        ]))
     );
     std::fs::remove_file(&path).ok();
 }

@@ -10,6 +10,45 @@ fn tmp(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(name)
 }
 
+/// A variable-length attribute survives a repack still variable-length.
+///
+/// Repack reads every attribute and writes it back, so it can only preserve
+/// what the reader reports. While a variable-length array read as a
+/// fixed-width one, repack kept the strings and silently re-encoded the
+/// layout — which is the encoding MATLAB and matio require for
+/// `MATLAB_fields`. Only the VLEN read path yields `VarLenAsciiArray`, so
+/// asserting the variant asserts the encoding, not just the values.
+#[test]
+fn carries_a_variable_length_attribute_without_re_encoding_it() {
+    let src = tmp("hdf5_pure_repack_vlen_attr_src.h5");
+    let dst = tmp("hdf5_pure_repack_vlen_attr_dst.h5");
+    let fields: Vec<String> = vec!["x".into(), "y".into(), "velocity".into()];
+    let mut b = FileBuilder::new();
+    b.create_dataset("x").with_f64_data(&[1.0]);
+    b.set_attr("fields", AttrValue::VarLenAsciiArray(fields.clone()));
+    let mut g = b.create_group("grp");
+    g.create_dataset("inner").with_f64_data(&[2.0]);
+    g.set_attr("fields", AttrValue::VarLenAsciiArray(fields.clone()));
+    b.add_group(g.finish());
+    b.write(&src).unwrap();
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    let f = hdf5_pure::File::open(&dst).unwrap();
+    assert_eq!(
+        f.root().attrs().unwrap().get("fields"),
+        Some(&AttrValue::VarLenAsciiArray(fields.clone())),
+        "root attribute must stay variable-length"
+    );
+    assert_eq!(
+        f.group("grp").unwrap().attrs().unwrap().get("fields"),
+        Some(&AttrValue::VarLenAsciiArray(fields)),
+        "group attribute must stay variable-length"
+    );
+    std::fs::remove_file(&src).ok();
+    std::fs::remove_file(&dst).ok();
+}
+
 #[test]
 fn drops_object_and_shrinks_file() {
     let src = tmp("hdf5_pure_repack_drop_src.h5");
@@ -75,13 +114,12 @@ fn pure_compaction_preserves_everything() {
         Some(&AttrValue::String("experiment".to_string()))
     );
     let grp_attrs = f.group("grp").unwrap().attrs().unwrap();
-    // The value survives. Note: the reader reports a fixed-width ASCII string as
-    // AttrValue::String (it does not preserve the ASCII-vs-UTF-8 charset
-    // distinction on read), so repack round-trips it as String — verified to be
-    // pre-existing reader behavior, independent of repack.
+    // The charset survives too: repack reads each attribute and writes it back,
+    // so a fixed-width ASCII string used to come out UTF-8 once the reader had
+    // dropped the distinction. It is written as ASCII here.
     assert_eq!(
         grp_attrs.get("units"),
-        Some(&AttrValue::String("m/s".to_string()))
+        Some(&AttrValue::AsciiString("m/s".to_string()))
     );
     std::fs::remove_file(&src).ok();
     std::fs::remove_file(&dst).ok();

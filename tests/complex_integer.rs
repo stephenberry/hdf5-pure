@@ -127,8 +127,11 @@ fn an_empty_array_keeps_its_component_class() {
     let ds = file.dataset("empty").unwrap();
 
     assert_eq!(
-        ds.attrs().unwrap().get("MATLAB_class"),
-        Some(&AttrValue::String("int16".into()))
+        ds.attrs()
+            .unwrap()
+            .get("MATLAB_class")
+            .and_then(AttrValue::as_str),
+        Some("int16")
     );
     assert_compound_of(&ds.datatype().unwrap(), 2, true);
     assert!(ds.read_u8().unwrap().is_empty());
@@ -200,8 +203,11 @@ fn the_datatype_is_a_four_byte_int16_compound() {
 
     assert_compound_of(&ds.datatype().unwrap(), 2, true);
     assert_eq!(
-        ds.attrs().unwrap().get("MATLAB_class"),
-        Some(&AttrValue::String("int16".into()))
+        ds.attrs()
+            .unwrap()
+            .get("MATLAB_class")
+            .and_then(AttrValue::as_str),
+        Some("int16")
     );
 }
 
@@ -316,8 +322,11 @@ fn each_width_reports_its_own_class_and_size() {
     ] {
         let ds = file.dataset(name).unwrap();
         assert_eq!(
-            ds.attrs().unwrap().get("MATLAB_class"),
-            Some(&AttrValue::String(class.into())),
+            ds.attrs()
+                .unwrap()
+                .get("MATLAB_class")
+                .and_then(AttrValue::as_str),
+            Some(class),
             "class of {name}"
         );
         assert_compound_of(&ds.datatype().unwrap(), size, signed);
@@ -561,8 +570,9 @@ fn the_builder_writes_complex_integers_in_every_scope() {
             .unwrap()
             .attrs()
             .unwrap()
-            .get("MATLAB_class"),
-        Some(&AttrValue::String("int32".into()))
+            .get("MATLAB_class")
+            .and_then(AttrValue::as_str),
+        Some("int32")
     );
     // The cell element lives under `#refs#`; the first (and only) one here.
     let refs = file.group("#refs#").unwrap();
@@ -570,8 +580,11 @@ fn the_builder_writes_complex_integers_in_every_scope() {
     let ds = refs.dataset(&name).unwrap();
     assert_compound_of(&ds.datatype().unwrap(), 1, false);
     assert_eq!(
-        ds.attrs().unwrap().get("MATLAB_class"),
-        Some(&AttrValue::String("uint8".into()))
+        ds.attrs()
+            .unwrap()
+            .get("MATLAB_class")
+            .and_then(AttrValue::as_str),
+        Some("uint8")
     );
 }
 
@@ -645,8 +658,11 @@ macro_rules! arm_shapes_for {
                         let ds = file.dataset(name).unwrap();
                         assert_compound_of(&ds.datatype().unwrap(), $size, $signed);
                         assert_eq!(
-                            ds.attrs().unwrap().get("MATLAB_class"),
-                            Some(&AttrValue::String($class.into())),
+                            ds.attrs()
+                                .unwrap()
+                                .get("MATLAB_class")
+                                .and_then(AttrValue::as_str),
+                            Some($class),
                             "{path}: {name} should carry the component class"
                         );
                     }
@@ -661,8 +677,11 @@ macro_rules! arm_shapes_for {
                         let ds = refs.dataset(&name).unwrap();
                         assert_compound_of(&ds.datatype().unwrap(), $size, $signed);
                         assert_eq!(
-                            ds.attrs().unwrap().get("MATLAB_class"),
-                            Some(&AttrValue::String($class.into())),
+                            ds.attrs()
+                                .unwrap()
+                                .get("MATLAB_class")
+                                .and_then(AttrValue::as_str),
+                            Some($class),
                             "{path}: cell element"
                         );
                     }

@@ -351,7 +351,7 @@ mod tests {
     fn round_trip(cases: &[(&str, AttrValue)]) -> HashMap<std::string::String, AttrValue> {
         let mut builder = crate::writer::FileBuilder::new();
         for (name, value) in cases {
-            builder.set_attr(*name, value.clone());
+            builder.set_attr(name, value.clone());
         }
         // A dataset gives the global heap a reason to exist for the
         // variable-length cases, matching how these files are really built.

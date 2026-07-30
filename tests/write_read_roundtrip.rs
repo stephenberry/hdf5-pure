@@ -540,8 +540,8 @@ fn roundtrip_ascii_string_attribute() {
     let attrs = file.root().attrs().unwrap();
     // ASCII strings are read as String
     assert_eq!(
-        attrs.get("MATLAB_class"),
-        Some(&AttrValue::String("double".into()))
+        attrs.get("MATLAB_class").and_then(AttrValue::as_str),
+        Some("double")
     );
 }
 
