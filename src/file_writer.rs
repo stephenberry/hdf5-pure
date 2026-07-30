@@ -3027,6 +3027,15 @@ mod tests {
     fn name_index_order(attrs: &[AttributeMessage]) -> Vec<String> {
         const RECORD: usize = 8 + 1 + 4 + 4;
         let blob = build_dense_attrs(attrs, 0).blob;
+        let header = blob
+            .windows(4)
+            .position(|w| w == b"BTHD")
+            .expect("a name index has a header");
+        // The single-leaf assumption above, enforced rather than assumed: the
+        // header's depth field sits past signature(4) + version(1) + type(1) +
+        // node size(4) + record size(2).
+        let depth = u16::from_le_bytes(blob[header + 12..header + 14].try_into().expect("2 bytes"));
+        assert_eq!(depth, 0, "the fixture outgrew a single leaf");
         let leaf = blob
             .windows(4)
             .position(|w| w == b"BTLF")
@@ -3072,8 +3081,14 @@ mod tests {
             "the index order changed with the insertion order"
         );
 
-        // Non-vacuity: the pair this turns on really does collide, so its two
-        // records really are adjacent and really are ordered by name.
+        // Non-vacuity, asserted on the hashes rather than on where the two
+        // records landed: names that stopped colliding could still come out
+        // adjacent and in this order by chance, leaving nothing under test.
+        assert_eq!(
+            crate::checksum::jenkins_lookup3(b"k69209"),
+            crate::checksum::jenkins_lookup3(b"k155448"),
+            "the fixture names no longer hash alike; pick a new colliding pair"
+        );
         let at = |name: &str| {
             order
                 .iter()
@@ -3083,7 +3098,7 @@ mod tests {
         assert_eq!(
             at("k155448") + 1,
             at("k69209"),
-            "the fixture names no longer hash alike; pick a new colliding pair"
+            "the colliding pair is not indexed in name order"
         );
     }
 

@@ -812,10 +812,12 @@ fn c_finds_each(path: &std::path::Path, names: &[String], values: &[i64], contex
 ///
 /// Whether a colliding pair straddles a node boundary is a property of where
 /// every name's hash falls, so it is a search, not a calculation. This count came
-/// out of running one: it is the smallest set of [`colliding_attrs`] whose root
-/// record is one half of a pair, with its twin in a subtree below. The tests
-/// assert that it still is, so a change in how the tree is planned reports itself
-/// rather than quietly reverting them to searching one flat leaf.
+/// out of running one over 20..=760: it is the smallest set of [`colliding_attrs`]
+/// that is *both* depth 2 and has a colliding name as its root record. Smaller
+/// sets straddle at depth 1 (30 is the first), and neighbouring counts do not
+/// straddle at all — 600 and 710 both promote a padding name. The tests assert
+/// the property still holds, so a change in how the tree is planned reports
+/// itself rather than quietly reverting them to searching one flat leaf.
 const STRADDLING_TOTAL: usize = 709;
 
 /// Assert the index in `bytes` is the deep tree with a promoted colliding record
@@ -845,8 +847,14 @@ fn assert_a_colliding_name_is_promoted(bytes: &[u8], colliding: usize, context: 
 /// bytes and libhdf5 never descends anything. Since #195 the index is a tree of
 /// 512-byte nodes, so a large set puts records in internal nodes too, and a
 /// colliding pair can straddle a split: one record promoted into a parent, its
-/// twin in a child below. libhdf5 then compares against the promoted record while
-/// choosing which child to descend into, and a pair ordered the wrong way sends
+/// twin in a child below.
+///
+/// What that buys is a call site, not a second way for the writer to be wrong.
+/// The order this crate emits comes from one flat sort before the tree is
+/// planned, so any error in it shows up in the single-leaf test too. The half
+/// that only a deep tree reaches is libhdf5's: resolving a record inside a `BTIN`
+/// node runs the same hash-then-`strcmp` compare from `H5B2__find`'s descent,
+/// against a record this crate promoted, and a pair ordered the wrong way sends
 /// it down the branch that cannot hold what it is looking for.
 #[test]
 fn c_finds_colliding_names_in_a_multi_level_index() {
@@ -876,7 +884,9 @@ fn c_finds_colliding_names_in_a_multi_level_index() {
 /// Be clear about what this test can and cannot catch. Its source file is one
 /// this crate just wrote, so the attributes come back already in index order and
 /// a sort that dropped its tie-break would still leave them right; the sort is
-/// not what this guards. What it guards is `repack` itself over an attribute set
+/// not what this guards, and neither is the repair — that is
+/// [`c_repairs_a_file_written_before_the_fix`], on a file an affected version
+/// actually wrote. What this guards is `repack` itself over an attribute set
 /// large enough to need a multi-level index: every name present, every value its
 /// own, and the tree deep enough that libhdf5 has to descend it.
 #[test]
@@ -892,6 +902,71 @@ fn c_finds_colliding_names_after_a_repack() {
     let bytes = std::fs::read(&dst).unwrap();
     assert_a_colliding_name_is_promoted(&bytes, names.len(), "repacked");
     c_finds_each(&dst, &names, &values, "repacked");
+}
+
+/// A file written before the fix is repaired by rewriting it, which is what the
+/// changelog tells anyone holding one to do.
+///
+/// The fixture is not synthesized: it was written by 0.28.0 itself, checked out
+/// at its release tag and handed [`COLLIDING_PAIRS`] in the order above. That
+/// version broke a name-hash tie by insertion index, so ten of its twenty
+/// attributes are indexed on the wrong side of their twin. Regenerate it the same
+/// way if it ever needs to change — a hand-patched file would only prove that a
+/// hand-patched file repairs.
+///
+/// All three halves of the claim are asserted, because each is a separate thing
+/// that could stop being true: libhdf5 really cannot find ten of the names, this
+/// crate really can read every one of them with its value intact (which is *why*
+/// the file is repairable rather than lost), and `repack` really does hand
+/// libhdf5 a file it can search. Without the first assertion the other two would
+/// pass just as well on a file that was never broken.
+///
+/// What this does *not* guard is the tie-break itself, and the reason is worth
+/// knowing: `repack` re-sets the attributes it read in name order (`sorted` in
+/// `repack.rs`), so the rebuild is handed a list on which a hash-only stable sort
+/// already produces name order within a hash group. Deleting the tie-break leaves
+/// this test green. The sort is guarded by
+/// [`c_finds_colliding_names_in_a_multi_level_index`] and its single-leaf sibling;
+/// what this guards is that the remedy the changelog names still works end to
+/// end, which no amount of reasoning about the sort establishes.
+#[test]
+fn c_repairs_a_file_written_before_the_fix() {
+    let affected = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/dense_attrs_colliding_v0_28_0.h5");
+    let names: Vec<String> = COLLIDING_PAIRS
+        .iter()
+        .flat_map(|(first, second)| [first.to_string(), second.to_string()])
+        .collect();
+    let values: Vec<i64> = (0..names.len() as i64).collect();
+
+    // Half of each pair is on the wrong side of its twin, so libhdf5's binary
+    // search walks away from it: it opens the ten that happen to sit where it
+    // looks and reports the rest missing.
+    let detail = c_looks_up_by_name(&affected, &names);
+    assert_eq!(
+        detail.verdict,
+        CReads::Attrs(names.len() / 2),
+        "the fixture is no longer the broken file this test needs"
+    );
+
+    // The bytes are all there and in the right place — only the index order is
+    // wrong — so a reader that walks the index start to finish sees everything.
+    let file = hdf5_pure::File::open(&affected).unwrap();
+    let attrs = file.root().attrs().unwrap();
+    assert_eq!(attrs.len(), names.len());
+    for (name, value) in names.iter().zip(&values) {
+        assert_eq!(
+            attrs.get(name),
+            Some(&AttrValue::I64(*value)),
+            "{name}: this crate misread the affected file"
+        );
+    }
+    drop(file);
+
+    let dir = tempdir().unwrap();
+    let repaired = dir.path().join("repaired.h5");
+    hdf5_pure::repack(&affected, &repaired, &hdf5_pure::RepackOptions::default()).unwrap();
+    c_finds_each(&repaired, &names, &values, "repaired");
 }
 
 /// libhdf5 must find both halves of a name-hash collision.
