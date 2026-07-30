@@ -150,7 +150,11 @@ pub fn decompress_chunk(
                 crate::lzf::decompress(input, inner_output_cap(expected, pipeline, filter_mask, i))?
             }
             FILTER_FLETCHER32 => fletcher32_verify(input)?,
-            FILTER_SCALEOFFSET => crate::scaleoffset::decompress(input, filter)?,
+            FILTER_SCALEOFFSET => crate::scaleoffset::decompress(
+                input,
+                filter,
+                inner_output_cap(expected, pipeline, filter_mask, i),
+            )?,
             #[cfg(feature = "zfp")]
             FILTER_ZFP => zfp_decompress(input, filter, &ctx)?,
             other => return Err(FormatError::UnsupportedFilter(other)),
@@ -214,6 +218,39 @@ fn filter_max_forward_output(filter_id: u16, in_size: usize) -> usize {
         // after deflate regardless, so leaving the size unchanged is fine.
         _ => in_size,
     }
+}
+
+/// Largest number of bytes a conforming deflate stream can decode to per byte of
+/// input. Deflate's densest encoding is a 258-byte length/distance match written
+/// as two Huffman symbols, and no Huffman symbol is shorter than one bit, so a
+/// match costs at least two bits: `258 / (2 / 8) = 1032`. Block headers only make
+/// a real stream less dense, so the ratio bounds the stream as a whole.
+const MAX_DEFLATE_EXPANSION: usize = 1032;
+
+/// How many bytes to reserve up front for one decode stage's output.
+///
+/// `cap` is that stage's output bound, derived from the chunk geometry the
+/// *file* declares — which an untrusted file controls. Reserving it outright
+/// turns a small file claiming an enormous chunk into an allocation abort,
+/// before a single byte of the stream has been looked at. The stream itself is
+/// the evidence that the claim is plausible: a conforming stream of `in_size`
+/// bytes decodes to at most `in_size * max_expansion`, so reserving no more than
+/// that bounds a hostile file by the bytes it actually had to put on disk.
+///
+/// It costs a legitimate chunk nothing. The true decoded size is under `cap`
+/// (the pipeline enforces that) and under the format's expansion bound, so it is
+/// under the smaller of the two as well: the reservation still holds the whole
+/// output without a reallocation.
+///
+/// This is a reservation hint, not a limit — the decoder grows past it if a
+/// stream needs it to, and `cap` remains the enforced bound. `None` (chunk size
+/// unknown) reserves nothing, there being no claim to be exact about.
+pub(crate) fn decode_reservation(
+    cap: Option<usize>,
+    in_size: usize,
+    max_expansion: usize,
+) -> usize {
+    cap.map_or(0, |cap| cap.min(in_size.saturating_mul(max_expansion)))
 }
 
 /// Upper bound for a byte-compressor stage's decoded output: the final chunk size
@@ -321,12 +358,23 @@ fn zfp_decompress(
     crate::zfp::decompress(data, &dims_buf[..rank], rate, elem_ty)
 }
 
+/// A deflate stream this decoder rejected, reported the way every other filter
+/// here reports one: `FilterError`, tagged with the filter's name.
+#[cfg(feature = "deflate")]
+fn deflate_corrupt(reason: &str) -> FormatError {
+    FormatError::FilterError(format!("deflate: {reason}"))
+}
+
 /// Decompress zlib-compressed data.
 ///
 /// `max_output`, when known, bounds the decompressed size: a deflate stage in a
 /// chunk pipeline never expands beyond the chunk's expected byte size, so a
 /// stream that inflates past it signals a decompression bomb and is rejected
 /// instead of being allowed to allocate unbounded memory (OOM).
+///
+/// A failure is a [`FormatError::FilterError`], the same variant every other
+/// filter in this pipeline reports a bad stream with, so a caller can match
+/// "this chunk did not decode" once rather than per compressor.
 #[cfg(feature = "deflate")]
 fn deflate_decompress(data: &[u8], max_output: Option<usize>) -> Result<Vec<u8>, FormatError> {
     use std::io::Read;
@@ -335,18 +383,24 @@ fn deflate_decompress(data: &[u8], max_output: Option<usize>) -> Result<Vec<u8>,
         Some(limit) => {
             // The decoded size is known a priori (the chunk's expected byte
             // size), so reserve it up front instead of letting `read_to_end`
-            // reallocate through ~log2(N) doublings.
-            let mut result = Vec::with_capacity(limit);
+            // reallocate through ~log2(N) doublings — but only as far as this
+            // stream could possibly justify, so a declared size no stream backs
+            // cannot drive the allocation on its own.
+            let mut result = Vec::with_capacity(decode_reservation(
+                max_output,
+                data.len(),
+                MAX_DEFLATE_EXPANSION,
+            ));
             // Read at most `limit + 1` bytes: anything beyond `limit` proves the
             // stream exceeds the expected chunk size, so reject rather than OOM.
             let cap = (limit as u64).saturating_add(1);
             decoder
                 .take(cap)
                 .read_to_end(&mut result)
-                .map_err(|e| FormatError::DecompressionError(e.to_string()))?;
+                .map_err(|e| deflate_corrupt(&e.to_string()))?;
             if result.len() > limit {
-                return Err(FormatError::DecompressionError(format!(
-                    "deflate output exceeds expected chunk size of {limit} bytes \
+                return Err(deflate_corrupt(&format!(
+                    "output exceeds expected chunk size of {limit} bytes \
                      (possible decompression bomb)"
                 )));
             }
@@ -357,7 +411,7 @@ fn deflate_decompress(data: &[u8], max_output: Option<usize>) -> Result<Vec<u8>,
             let mut result = Vec::new();
             decoder
                 .read_to_end(&mut result)
-                .map_err(|e| FormatError::DecompressionError(e.to_string()))?;
+                .map_err(|e| deflate_corrupt(&e.to_string()))?;
             Ok(result)
         }
     }
@@ -920,7 +974,7 @@ mod tests {
         let compressed = deflate_compress(&huge, 9).unwrap();
         assert!(compressed.len() < 1024);
         let err = deflate_decompress(&compressed, Some(1024)).unwrap_err();
-        assert!(matches!(err, FormatError::DecompressionError(_)));
+        assert!(matches!(err, FormatError::FilterError(_)), "{err}");
         // Without a cap it still works (used where the size is genuinely unknown).
         assert_eq!(
             deflate_decompress(&compressed, None).unwrap().len(),
@@ -1045,5 +1099,76 @@ mod tests {
         let compressed = compress_chunk(&data, &pipeline, ctx).unwrap();
         let decoded = decompress_chunk(&compressed, &pipeline, ctx, 0).unwrap();
         assert_eq!(decoded, data);
+    }
+
+    // --- Decode reservation (#233) ---
+
+    /// A cap the file merely declares does not size the allocation on its own.
+    #[test]
+    fn decode_reservation_is_bounded_by_what_the_stream_could_produce() {
+        // 4 GiB is what `ensure_chunk_bytes_representable` still admits, so it
+        // is a size a file can genuinely claim while carrying ten bytes.
+        const CLAIMED: usize = u32::MAX as usize;
+        assert_eq!(decode_reservation(Some(CLAIMED), 10, 1032), 10_320);
+
+        // Where the claim is the smaller of the two, it is exact: a legitimate
+        // chunk keeps its single up-front allocation.
+        assert_eq!(decode_reservation(Some(4096), 4096, 1032), 4096);
+
+        // No claim, nothing to be exact about.
+        assert_eq!(decode_reservation(None, 4096, 1032), 0);
+
+        // A stream long enough to overflow the product still yields a bound,
+        // not a panic or a wrapped-around small one.
+        assert_eq!(decode_reservation(Some(CLAIMED), usize::MAX, 1032), CLAIMED);
+    }
+
+    /// The bound is wired into the deflate decoder, not merely available to it.
+    ///
+    /// Observed through the returned vector's capacity, which is the
+    /// reservation itself whenever the decode never had to grow past it. A
+    /// reservation driven by the declared size instead would be four gigabytes
+    /// for the handful of bytes this stream actually contains.
+    #[test]
+    #[cfg(feature = "deflate")]
+    fn deflate_reserves_against_the_stream_not_the_declared_chunk_size() {
+        let stored = deflate_compress(&[], 6).unwrap();
+        let out = deflate_decompress(&stored, Some(u32::MAX as usize)).unwrap();
+        assert!(out.is_empty());
+        assert!(
+            out.capacity() <= stored.len() * MAX_DEFLATE_EXPANSION,
+            "reserved {} bytes for a {}-byte stream",
+            out.capacity(),
+            stored.len()
+        );
+    }
+
+    /// The same wiring for LZF. Its bound is 88:1 rather than deflate's 1032:1,
+    /// so the same declared size has to reserve less again.
+    #[test]
+    fn lzf_reserves_against_the_stream_not_the_declared_chunk_size() {
+        let stored = crate::lzf::compress(&[0u8; 64]);
+        let out = crate::lzf::decompress(&stored, Some(u32::MAX as usize)).unwrap();
+        assert_eq!(out, [0u8; 64]);
+        assert!(
+            out.capacity() <= stored.len() * crate::lzf::MAX_EXPANSION,
+            "reserved {} bytes for a {}-byte stream",
+            out.capacity(),
+            stored.len()
+        );
+    }
+
+    /// Every filter here reports a stream it could not decode with one error
+    /// variant, so a caller can match "this chunk did not decode" once.
+    #[test]
+    fn a_failed_decode_is_a_filter_error_whichever_compressor_failed() {
+        let lzf = crate::lzf::decompress(&[0x1f], None).unwrap_err();
+        assert!(matches!(lzf, FormatError::FilterError(_)), "{lzf}");
+
+        #[cfg(feature = "deflate")]
+        {
+            let deflate = deflate_decompress(&[0xff; 8], None).unwrap_err();
+            assert!(matches!(deflate, FormatError::FilterError(_)), "{deflate}");
+        }
     }
 }

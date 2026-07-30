@@ -106,7 +106,7 @@ builder
 ```
 
 !!! warning "Mode must match the datatype"
-    The datatype class, sign, and byte order are derived from the dataset's datatype when the file is written, so the mode must match the data: integer mode on `with_i*` / `with_u*` data, float mode on `with_f32` / `with_f64` data. A mismatch makes `finish()` / `write()` return a `FormatError`. Scale-offset is mutually exclusive with ZFP and replaces shuffle, but may be combined with `with_deflate` or `with_lzf`.
+    The datatype class, sign, and byte order are derived from the dataset's datatype when the file is written, so the mode must match the data: integer mode on `with_i*` / `with_u*` data, float mode on `with_f32` / `with_f64` data. A mismatch makes `finish()` / `write()` return a `FormatError`. Scale-offset is mutually exclusive with ZFP and with shuffle, but may be followed by `with_deflate` or `with_lzf`.
 
 ## Filter chaining
 
@@ -129,6 +129,18 @@ builder
     .with_scale_offset(ScaleOffset::FloatDScale(2))
     .with_deflate(6);
 ```
+
+### Combinations that are refused
+
+Scale-offset and ZFP each consume the raw elements and hand on something else, so anything they would sit on top of has nothing left to work with. Asking for both halves of such a pair is a contradiction, and `finish()` / `write()` returns a `FormatError::FilterError` naming the two rather than quietly dropping one:
+
+| Requested with | Refused |
+| --- | --- |
+| `with_zfp` | `with_shuffle`, `with_scale_offset`, `with_deflate`, `with_lzf` |
+| `with_scale_offset` | `with_shuffle`, `with_zfp` |
+| `with_lzf` | `with_deflate` |
+
+`with_lzf` + `with_deflate` is the same shape for a different reason: the two fill one byte-compressor slot, and stacking them is never useful.
 
 ## Reads are transparent
 
@@ -180,7 +192,7 @@ The supported slice is:
 - Ranks: 1D, 2D, 3D, 4D
 - Mode: fixed-rate (`rate` bits per value)
 
-The scalar type is derived from the dataset's datatype when the file is written, so any of `with_f32_data` / `with_f64_data` / `with_i32_data` / `with_i64_data` (or an explicit `with_dtype`) establishes it. `finish()` / `write()` returns `FormatError::UnsupportedZfp` if the dataset's datatype is not one of the four supported scalar types, or if the chunk rank is outside `1..=4`. When ZFP is active it replaces shuffle, deflate, and LZF on the same dataset.
+The scalar type is derived from the dataset's datatype when the file is written, so any of `with_f32_data` / `with_f64_data` / `with_i32_data` / `with_i64_data` (or an explicit `with_dtype`) establishes it. `finish()` / `write()` returns `FormatError::UnsupportedZfp` if the dataset's datatype is not one of the four supported scalar types, or if the chunk rank is outside `1..=4`. ZFP is a standalone compressor: requesting shuffle, scale-offset, deflate, or LZF on the same dataset is refused rather than dropped.
 
 ## `fast-deflate` backend
 

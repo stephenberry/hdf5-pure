@@ -4,7 +4,7 @@
 extern crate alloc;
 
 #[cfg(not(feature = "std"))]
-use alloc::{vec, vec::Vec};
+use alloc::{format, vec, vec::Vec};
 
 use crate::checksum::jenkins_lookup3;
 use crate::convert::TryToUsize;
@@ -79,6 +79,59 @@ impl ChunkOptions {
         false
     }
 
+    /// Refuse a combination of filters where honoring one means discarding
+    /// another.
+    ///
+    /// Two filters here are *primary transforms* that consume the raw elements
+    /// and hand on something else: ZFP, and scale-offset. Each displaces
+    /// whatever it sits on top of, so a request naming a displaced filter as
+    /// well is a contradiction — the caller asked for something the file cannot
+    /// end up containing.
+    ///
+    /// Every such contradiction is an error. Dropping the loser silently is the
+    /// one option a caller cannot detect: nothing in the resulting file records
+    /// that a filter was requested, so `with_shuffle().with_zfp(16.0)` produced
+    /// an unshuffled dataset and no way to tell that from `with_zfp(16.0)`
+    /// alone. Documented precedence is not a substitute, because a precedence
+    /// rule still has to be read to be obeyed and there is nothing to read it
+    /// against at the call site.
+    ///
+    /// Checked in one place, before any filter is built, so which contradiction
+    /// gets reported does not depend on the order the pipeline happens to be
+    /// assembled in, and so a filter added later inherits the rule rather than
+    /// having to restate it.
+    fn refuse_conflicting_filters(&self) -> Result<(), FormatError> {
+        let clash = |a: &str, b: &str| {
+            Err(FormatError::FilterError(format!(
+                "{a} and {b} cannot be combined on one dataset"
+            )))
+        };
+
+        if self.zfp_enabled() {
+            if self.scale_offset.is_some() {
+                return clash("scale-offset", "ZFP");
+            }
+            if self.shuffle {
+                return clash("shuffle", "ZFP");
+            }
+            if self.lzf {
+                return clash("lzf", "ZFP");
+            }
+            if self.deflate_level.is_some() {
+                return clash("deflate", "ZFP");
+            }
+        }
+        if self.scale_offset.is_some() && self.shuffle {
+            return clash("shuffle", "scale-offset");
+        }
+        // Not a primary transform, but the same shape: LZF and deflate fill one
+        // byte-compressor slot, and stacking two of them is never useful.
+        if self.lzf && self.deflate_level.is_some() {
+            return clash("lzf", "deflate");
+        }
+        Ok(())
+    }
+
     /// Build a FilterPipeline from the options.
     ///
     /// `chunk_dims` and `zfp_element_type` are only consulted when the ZFP
@@ -87,7 +140,11 @@ impl ChunkOptions {
     ///
     /// Returns [`FormatError::UnsupportedZfp`] when ZFP was requested but
     /// `zfp_element_type` is `None` (e.g. the dataset's datatype isn't one of
-    /// f32/f64/i32/i64), or the chunk rank is outside 1..=4.
+    /// f32/f64/i32/i64), or the chunk rank is outside 1..=4, and
+    /// [`FormatError::FilterError`] for a combination of filters where one
+    /// would displace another — see [`refuse_conflicting_filters`].
+    ///
+    /// [`refuse_conflicting_filters`]: Self::refuse_conflicting_filters
     pub fn build_pipeline(
         &self,
         element_size: u32,
@@ -95,12 +152,15 @@ impl ChunkOptions {
         zfp_element_type: Option<ZfpElementTypeWhenEnabled>,
         scale_offset_type: Option<ScaleOffsetType>,
     ) -> Result<Option<FilterPipeline>, FormatError> {
+        self.refuse_conflicting_filters()?;
+
         let mut filters = Vec::new();
         let _ = zfp_element_type; // used only under the `zfp` feature below
 
-        // ZFP is a standalone compressor — it replaces shuffle, deflate, and lzf.
+        // ZFP is a standalone compressor: `refuse_conflicting_filters` has
+        // already established that nothing it would displace was asked for.
         #[cfg(feature = "zfp")]
-        let zfp_active = if let Some(rate) = self.zfp_rate {
+        if let Some(rate) = self.zfp_rate {
             let elem_ty = zfp_element_type.ok_or_else(|| {
                 FormatError::UnsupportedZfp(
                     "ZFP compression requires the dataset's datatype to be one \
@@ -114,22 +174,12 @@ impl ChunkOptions {
                 flags: 0,
                 client_data: crate::zfp::zfp_cd_values_rate(rate, elem_ty, chunk_dims)?,
             });
-            true
-        } else {
-            false
-        };
-        #[cfg(not(feature = "zfp"))]
-        let zfp_active = false;
+        }
 
-        // Scale-offset is also a primary transform: mutually exclusive with
-        // ZFP, replaces shuffle, but may be followed by a byte compressor
-        // (pushed first so the pipeline order is [scaleoffset, lzf|deflate]).
-        let scaleoffset_active = if let Some(mode) = self.scale_offset {
-            if zfp_active {
-                return Err(FormatError::FilterError(
-                    "scale-offset and ZFP cannot be combined on one dataset".into(),
-                ));
-            }
+        // Scale-offset is also a primary transform: it displaces shuffle, but
+        // may be followed by a byte compressor (pushed first so the pipeline
+        // order is [scaleoffset, lzf|deflate]).
+        if let Some(mode) = self.scale_offset {
             let ty = scale_offset_type.ok_or_else(|| {
                 FormatError::FilterError(
                     "scale-offset requires an integer or floating-point scalar \
@@ -146,12 +196,9 @@ impl ChunkOptions {
                 flags: 0,
                 client_data: build_cd_values(mode, ty, element_size, nelmts)?,
             });
-            true
-        } else {
-            false
-        };
+        }
 
-        if !zfp_active && !scaleoffset_active && self.shuffle {
+        if self.shuffle {
             filters.push(FilterDescription {
                 filter_id: FILTER_SHUFFLE,
                 name: None,
@@ -160,15 +207,9 @@ impl ChunkOptions {
             });
         }
 
-        // LZF fills the same byte-compressor slot as deflate (h5py's convention
-        // is shuffle then lzf); stacking two byte compressors is never useful,
-        // so requesting both is refused like the scale-offset/ZFP clash.
-        if !zfp_active && self.lzf {
-            if self.deflate_level.is_some() {
-                return Err(FormatError::FilterError(
-                    "lzf and deflate cannot be combined on one dataset".into(),
-                ));
-            }
+        // LZF fills the same byte-compressor slot as deflate; h5py's convention
+        // is shuffle then lzf.
+        if self.lzf {
             filters.push(FilterDescription {
                 filter_id: FILTER_LZF,
                 // Ids >= 256 serialize a name; "lzf" is h5py's registered name.
@@ -187,7 +228,7 @@ impl ChunkOptions {
             });
         }
 
-        if !zfp_active && let Some(level) = self.deflate_level {
+        if let Some(level) = self.deflate_level {
             filters.push(FilterDescription {
                 filter_id: FILTER_DEFLATE,
                 name: None,
@@ -2218,6 +2259,167 @@ mod tests {
         assert_eq!(pl.filters[0].filter_id, FILTER_SHUFFLE);
         assert_eq!(pl.filters[1].filter_id, FILTER_DEFLATE);
         assert_eq!(pl.filters[2].filter_id, FILTER_FLETCHER32);
+    }
+
+    /// Every request naming two filters where one would displace the other is
+    /// refused, and the error names both (#233).
+    ///
+    /// The refusal is the observable part: a dropped filter leaves nothing in
+    /// the file to distinguish `with_shuffle().with_zfp(16.0)` from
+    /// `with_zfp(16.0)`, so a caller who wrote the first and got the second has
+    /// no way to find out. Asserting on the message rather than only on
+    /// `is_err()` is what keeps a refusal from being reported as some unrelated
+    /// failure that happens to also be an error.
+    #[test]
+    fn conflicting_filter_requests_are_refused() {
+        let so = ScaleOffset::FloatDScale(2);
+        let cases: &[(&str, &str, ChunkOptions)] = &[
+            (
+                "lzf",
+                "deflate",
+                ChunkOptions {
+                    lzf: true,
+                    deflate_level: Some(6),
+                    ..Default::default()
+                },
+            ),
+            (
+                "shuffle",
+                "scale-offset",
+                ChunkOptions {
+                    shuffle: true,
+                    scale_offset: Some(so),
+                    ..Default::default()
+                },
+            ),
+            #[cfg(feature = "zfp")]
+            (
+                "scale-offset",
+                "ZFP",
+                ChunkOptions {
+                    scale_offset: Some(so),
+                    zfp_rate: Some(16.0),
+                    ..Default::default()
+                },
+            ),
+            #[cfg(feature = "zfp")]
+            (
+                "shuffle",
+                "ZFP",
+                ChunkOptions {
+                    shuffle: true,
+                    zfp_rate: Some(16.0),
+                    ..Default::default()
+                },
+            ),
+            #[cfg(feature = "zfp")]
+            (
+                "lzf",
+                "ZFP",
+                ChunkOptions {
+                    lzf: true,
+                    zfp_rate: Some(16.0),
+                    ..Default::default()
+                },
+            ),
+            #[cfg(feature = "zfp")]
+            (
+                "deflate",
+                "ZFP",
+                ChunkOptions {
+                    deflate_level: Some(6),
+                    zfp_rate: Some(16.0),
+                    ..Default::default()
+                },
+            ),
+        ];
+
+        for (a, b, options) in cases {
+            // Arguments a valid ZFP or scale-offset request would need. The
+            // clash has to be reported whether or not they are satisfiable, so
+            // pass ones that are: an error raised only because the datatype was
+            // also wrong would pass an `is_err()` check while leaving the
+            // combination itself unrefused.
+            let err = options
+                .build_pipeline(
+                    8,
+                    &[64],
+                    zfp_f64_type(),
+                    Some(
+                        crate::scaleoffset::scale_offset_type_from_datatype(&make_f64_type())
+                            .expect("f64 is a scale-offset type"),
+                    ),
+                )
+                .expect_err("{a} + {b} was accepted");
+            let FormatError::FilterError(msg) = &err else {
+                panic!("{a} + {b}: expected a filter error, got {err}");
+            };
+            assert!(msg.contains(a) && msg.contains(b), "{a} + {b}: {msg}");
+        }
+    }
+
+    /// The type a ZFP request needs, when the feature is on.
+    #[cfg(feature = "zfp")]
+    fn zfp_f64_type() -> Option<ZfpElementTypeWhenEnabled> {
+        crate::filters::zfp_element_type_from_datatype(&make_f64_type())
+    }
+
+    #[cfg(not(feature = "zfp"))]
+    fn zfp_f64_type() -> Option<ZfpElementTypeWhenEnabled> {
+        None
+    }
+
+    /// Chaining a primary transform with a filter it does *not* displace still
+    /// builds, so the refusal above is a rule about conflicts rather than a
+    /// blanket ban on combining filters.
+    #[test]
+    fn compatible_filter_requests_still_build() {
+        let so = Some(ScaleOffset::FloatDScale(2));
+        let so_ty = crate::scaleoffset::scale_offset_type_from_datatype(&make_f64_type());
+        let cases: &[(ChunkOptions, &[u16])] = &[
+            (
+                ChunkOptions {
+                    shuffle: true,
+                    deflate_level: Some(6),
+                    ..Default::default()
+                },
+                &[FILTER_SHUFFLE, FILTER_DEFLATE],
+            ),
+            (
+                ChunkOptions {
+                    shuffle: true,
+                    lzf: true,
+                    ..Default::default()
+                },
+                &[FILTER_SHUFFLE, FILTER_LZF],
+            ),
+            (
+                ChunkOptions {
+                    scale_offset: so,
+                    deflate_level: Some(6),
+                    ..Default::default()
+                },
+                &[FILTER_SCALEOFFSET, FILTER_DEFLATE],
+            ),
+            (
+                ChunkOptions {
+                    scale_offset: so,
+                    lzf: true,
+                    fletcher32: true,
+                    ..Default::default()
+                },
+                &[FILTER_SCALEOFFSET, FILTER_LZF, FILTER_FLETCHER32],
+            ),
+        ];
+
+        for (options, expected) in cases {
+            let pl = options
+                .build_pipeline(8, &[64], zfp_f64_type(), so_ty)
+                .unwrap()
+                .unwrap();
+            let ids: Vec<u16> = pl.filters.iter().map(|f| f.filter_id).collect();
+            assert_eq!(&ids, expected);
+        }
     }
 
     #[test]
