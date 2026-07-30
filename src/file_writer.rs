@@ -2982,8 +2982,12 @@ mod tests {
     /// An `AsciiString` attribute named `name` whose serialized (v3) size is
     /// exactly `size` bytes, so a bound can be tested on the value it bounds.
     fn dense_attr_of_size(name: &str, size: usize) -> AttributeMessage {
-        let probe = build_attr_message(name, &AttrValue::AsciiString(String::new()));
-        let overhead = probe.serialize_v3(LENGTH_SIZE).len();
+        // Probe with one character and subtract it, rather than probing with an
+        // empty string: a fixed-width string datatype is at least one byte wide,
+        // so an empty value still carries a padding byte and would be measured
+        // as overhead.
+        let probe = build_attr_message(name, &AttrValue::AsciiString("y".to_string()));
+        let overhead = probe.serialize_v3(LENGTH_SIZE).len() - 1;
         let attr = build_attr_message(name, &AttrValue::AsciiString("y".repeat(size - overhead)));
         assert_eq!(attr.serialize_v3(LENGTH_SIZE).len(), size);
         attr

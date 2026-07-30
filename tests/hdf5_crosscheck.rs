@@ -1813,3 +1813,89 @@ fn crosscheck_vlen_strings_span_multiple_heap_collections() {
         assert_eq!(vals[i].as_str(), format!("s{i}"), "element {i} differs");
     }
 }
+
+/// An empty-string attribute must not make the object's *other* attributes
+/// unreadable to the C library.
+///
+/// A fixed-width string datatype has to be at least one byte wide. Writing
+/// `STRSIZE 0` for an empty string made libhdf5 fail with "invalid datatype
+/// size" — and it fails inside `H5Aiterate2`, so every attribute on that object
+/// became unreachable, not only the empty one. The healthy attribute here is
+/// what makes that blast radius visible: a test carrying only the empty string
+/// would pass the moment the empty one alone was fixed.
+#[test]
+fn an_empty_string_attribute_does_not_hide_its_neighbours() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("empty_string_attr.h5");
+
+    let mut builder = FileBuilder::new();
+    builder.set_attr("empty_utf8", AttrValue::String(String::new()));
+    builder.set_attr("empty_ascii", AttrValue::AsciiString(String::new()));
+    builder.set_attr("all_empty", AttrValue::StringArray(vec![String::new(); 2]));
+    builder.set_attr("healthy", AttrValue::AsciiString("v".into()));
+    builder.create_dataset("x").with_f64_data(&[1.0]);
+    builder.write(&path).unwrap();
+
+    let file = hdf5::File::open(&path).unwrap();
+
+    // Iteration is where the zero-size datatype used to fail.
+    let mut names = file.attr_names().unwrap();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "all_empty".to_string(),
+            "empty_ascii".to_string(),
+            "empty_utf8".to_string(),
+            "healthy".to_string(),
+        ]
+    );
+
+    // The neighbour opens and reads.
+    let healthy = file.attr("healthy").unwrap();
+    assert_eq!(
+        healthy
+            .read_scalar::<hdf5::types::FixedAscii<1>>()
+            .unwrap()
+            .as_str(),
+        "v"
+    );
+
+    // And each empty one is a one-byte-wide string holding nothing. The C
+    // library will not convert between charsets, so each is read as its own.
+    let utf8 = file.attr("empty_utf8").unwrap();
+    assert_eq!(utf8.size(), 1);
+    assert!(
+        utf8.read_scalar::<hdf5::types::FixedUnicode<1>>()
+            .unwrap()
+            .as_str()
+            .is_empty()
+    );
+    let ascii = file.attr("empty_ascii").unwrap();
+    assert_eq!(ascii.size(), 1);
+    assert!(
+        ascii
+            .read_scalar::<hdf5::types::FixedAscii<1>>()
+            .unwrap()
+            .as_str()
+            .is_empty()
+    );
+    let all_empty = file.attr("all_empty").unwrap();
+    assert_eq!(all_empty.size(), 2);
+
+    // hdf5-pure reads its own file back with the values intact.
+    let ours = File::open(&path).unwrap();
+    let attrs = ours.root().attrs().unwrap();
+    assert_eq!(
+        attrs.get("empty_utf8"),
+        Some(&AttrValue::String(String::new()))
+    );
+    assert_eq!(
+        attrs.get("empty_ascii"),
+        Some(&AttrValue::AsciiString(String::new()))
+    );
+    assert_eq!(
+        attrs.get("all_empty"),
+        Some(&AttrValue::StringArray(vec![String::new(); 2]))
+    );
+}
