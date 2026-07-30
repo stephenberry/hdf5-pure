@@ -16,7 +16,7 @@
 //! incompressible input produces.
 
 #[cfg(not(feature = "std"))]
-use alloc::{format, vec::Vec};
+use alloc::{format, vec, vec::Vec};
 
 use crate::error::FormatError;
 
@@ -29,6 +29,15 @@ const MAX_MATCH_LEN: usize = 264;
 
 /// Largest encodable back-reference distance (13 offset bits, plus one).
 const MAX_MATCH_DISTANCE: usize = 1 << 13;
+
+/// Slots in the compressor's match-hash table. Independent of
+/// [`MAX_MATCH_DISTANCE`], which the stream format fixes; this is only a
+/// speed/ratio choice, but the hash and the allocation must agree on it or a
+/// hashed slot indexes past the table.
+const HASH_TABLE_SLOTS: usize = 1 << 13;
+
+/// Top bits of the 32-bit multiplicative hash product that select a slot.
+const HASH_TABLE_BITS: u32 = HASH_TABLE_SLOTS.trailing_zeros();
 
 /// Largest number of bytes a conforming LZF stream can decode to per byte of
 /// input. The densest token is a three-byte extended back-reference emitting
@@ -136,10 +145,10 @@ pub(crate) fn decompress(input: &[u8], max_output: Option<usize>) -> Result<Vec<
 
 /// Compress `input` into an LZF stream (greedy, single-probe hash matching).
 pub(crate) fn compress(input: &[u8]) -> Vec<u8> {
-    /// Hash of a 3-byte window → slot in a 2^13-entry table of `position + 1`.
+    /// Hash of a 3-byte window → slot in the table of `position + 1`.
     fn hash(a: u8, b: u8, c: u8) -> usize {
         let v = (usize::from(a) << 16) | (usize::from(b) << 8) | usize::from(c);
-        (v.wrapping_mul(0x9E37_79B1) >> 19) & ((1 << 13) - 1)
+        (v.wrapping_mul(0x9E37_79B1) >> (32 - HASH_TABLE_BITS)) & (HASH_TABLE_SLOTS - 1)
     }
 
     /// Emit `input[from..to]` as literal runs.
@@ -158,6 +167,15 @@ pub(crate) fn compress(input: &[u8]) -> Vec<u8> {
     // Slots hold `position + 1`; 0 marks an empty slot, which is why the
     // candidate check below is `> 0`.
     //
+    // The table lives on the heap, not in a `[usize; HASH_TABLE_SLOTS]` local.
+    // As a local it is a 64 KiB stack frame (32 KiB where pointers are 32-bit),
+    // zeroed behind a stack probe on every call, and was the only frame over
+    // 8 KiB in the whole crate — more than a bare-metal `no_std` target, which
+    // this crate supports, is likely to have in total. `alloc` is unconditional
+    // here, so this costs no feature split. Measured with both forms in one
+    // process: within noise from 64 KiB chunks up, +4% at 8 KiB, +15% (an
+    // absolute 0.35 us) at 1 KiB ([#234]).
+    //
     // The slot type must index the whole input, not the match distance. A
     // narrower table has been proposed and measured: `u16` slots wrap on any
     // chunk over 64 KiB and silently destroy compression there (1 MiB of RLE
@@ -165,7 +183,9 @@ pub(crate) fn compress(input: &[u8]) -> Vec<u8> {
     // speed case does not hold either — `u16` wins 26% at 1 KiB, an absolute
     // 0.6 us, and loses 6-78% across the 6-16 KiB band on incompressible
     // input. Keep `usize`.
-    let mut table = [0_usize; 1 << 13];
+    //
+    // [#234]: https://github.com/stephenberry/hdf5-pure/issues/234
+    let mut table = vec![0_usize; HASH_TABLE_SLOTS];
     let mut ip = 0;
     let mut literal_start = 0;
 
@@ -270,6 +290,30 @@ mod tests {
         let expected: Vec<u8> = (0..=255).collect();
         assert_eq!(stream.len(), 2 * expected.len());
         assert_eq!(decompress(&stream, Some(expected.len())).unwrap(), expected);
+    }
+
+    /// The match-hash table is heap-allocated so that a caller on a small stack
+    /// — the bare-metal `no_std` target this crate advertises — can compress at
+    /// all. Stated as the rule rather than a fixed number: the thread gets less
+    /// stack than the table itself would occupy at this pointer width, so a
+    /// table that moved back into a local could not fit however wide `usize` is.
+    ///
+    /// A regression here overflows the thread's stack, which aborts the whole
+    /// test binary rather than failing this one test. That is the loudest form
+    /// the invariant has; there is no portable way to assert a frame size.
+    #[cfg(feature = "std")]
+    #[test]
+    fn compresses_on_a_stack_smaller_than_the_table() {
+        let stack = HASH_TABLE_SLOTS * size_of::<usize>() * 3 / 4;
+        let data: Vec<u8> = (0..=255).cycle().take(70_000).collect();
+        let expected = data.clone();
+        let out = std::thread::Builder::new()
+            .stack_size(stack)
+            .spawn(move || compress(&data))
+            .expect("spawn small-stack thread")
+            .join()
+            .expect("compress must not overflow a stack smaller than the table");
+        assert_eq!(decompress(&out, Some(expected.len())).unwrap(), expected);
     }
 
     #[test]
