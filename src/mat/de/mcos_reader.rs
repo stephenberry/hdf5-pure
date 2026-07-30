@@ -1311,23 +1311,16 @@ fn decode_string_saveobj(payload: &[u64]) -> Result<Vec<String>, MatError> {
 /// builtin [`MatClass`](crate::mat::class::MatClass) (opaque class names such as
 /// `string` are not builtin variants).
 pub(crate) fn raw_matlab_class(attrs: &HashMap<String, AttrValue>) -> Option<String> {
-    match attrs.get("MATLAB_class") {
-        Some(AttrValue::AsciiString(s)) | Some(AttrValue::String(s)) => Some(s.clone()),
-        Some(AttrValue::StringArray(v)) if v.len() == 1 => Some(v[0].clone()),
-        _ => None,
-    }
+    attrs
+        .get("MATLAB_class")
+        .and_then(AttrValue::as_str)
+        .map(ToString::to_string)
 }
 
 /// `MATLAB_object_decode` value for a dataset, if present, normalized to `i64`.
 /// A non-zero value marks an opaque object; `None`/`0` is an ordinary dataset.
 pub(crate) fn matlab_object_decode(attrs: &HashMap<String, AttrValue>) -> Option<i64> {
-    let v = match attrs.get("MATLAB_object_decode")? {
-        AttrValue::I64(v) => *v,
-        AttrValue::I32(v) => i64::from(*v),
-        AttrValue::U32(v) => i64::from(*v),
-        AttrValue::U64(v) => i64::try_from(*v).ok()?,
-        _ => return None,
-    };
+    let v = attrs.get("MATLAB_object_decode")?.as_i64()?;
     (v != 0).then_some(v)
 }
 

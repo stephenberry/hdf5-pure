@@ -635,14 +635,17 @@ fn matlab_class_from_attrs(
     attrs: &HashMap<String, AttrValue>,
 ) -> Result<Option<MatClass>, MatError> {
     let raw = match attrs.get("MATLAB_class") {
-        Some(AttrValue::AsciiString(s)) | Some(AttrValue::String(s)) => Some(s.clone()),
-        Some(AttrValue::StringArray(v)) if v.len() == 1 => Some(v[0].clone()),
         None => None,
-        other => {
-            return Err(MatError::Custom(format!(
-                "MATLAB_class attribute has unexpected type: {other:?}"
-            )));
-        }
+        Some(value) => Some(
+            value
+                .as_str()
+                .ok_or_else(|| {
+                    MatError::Custom(format!(
+                        "MATLAB_class attribute has unexpected type: {value:?}"
+                    ))
+                })?
+                .to_string(),
+        ),
     };
     match raw {
         Some(s) => Ok(Some(MatClass::parse(&s)?)),

@@ -3940,11 +3940,9 @@ impl Dataset {
         use crate::provenance::{ATTR_SHA256, VerifyResult, sha256_hex};
 
         let attrs = self.attrs()?;
-        let stored = match attrs.get(ATTR_SHA256) {
-            Some(AttrValue::String(s) | AttrValue::AsciiString(s)) => {
-                s.trim_end_matches('\0').to_string()
-            }
-            _ => return Ok(VerifyResult::NoHash),
+        let stored = match attrs.get(ATTR_SHA256).and_then(AttrValue::as_str) {
+            Some(s) => s.trim_end_matches('\0').to_string(),
+            None => return Ok(VerifyResult::NoHash),
         };
 
         let computed = sha256_hex(&self.read_raw()?);
