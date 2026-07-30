@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.31.0] - 2026-07-30
+
+An attribute now reads back as the `AttrValue` variant it was written from: the dataspace kind decides scalar against array, so a one-element array stays an array, and the charset selects the `Ascii` variants, so `MATLAB_class` reads as `AsciiString` and `MATLAB_fields` as `VarLenAsciiArray` ([#239](https://github.com/stephenberry/hdf5-pure/pull/239)). That fidelity means several variants can carry one logical value, so read through the new accessors — `AttrValue::as_str`, `as_strings`, `as_i64`, `as_u64`, `as_f64`, `to_i64s`, `to_u64s`, `to_f64s` — each of which spans every variant that can hold the shape it names and applies its range rule per element ([#238](https://github.com/stephenberry/hdf5-pure/pull/238)). Two data-correctness fixes come with it: an unsigned array reads as the new `AttrValue::U64Array` rather than an `I64Array` of reinterpreted bits, so a value above `i64::MAX` no longer reads back negative, and `repack` stops re-encoding the attributes it copies — a fixed-width ASCII string used to come out UTF-8 and a variable-length array fixed-width, which is the encoding MATLAB and matio require. Separately, an attribute holding an empty string is written with a one-byte-wide string datatype instead of a zero-size one, which libhdf5 rejects while iterating an object's attributes: a single empty-string attribute made every attribute on that object unreadable to the C library ([#240](https://github.com/stephenberry/hdf5-pure/pull/240)). Widths, true variable-length strings, dataspace rank and fixed-string padding are still not recovered on read, and are tracked in [#241](https://github.com/stephenberry/hdf5-pure/issues/241). Files written by earlier versions still read.
+
 ### Added
 
 - `AttrValue::as_str`, `as_strings`, `as_i64`, `as_u64`, `as_f64`, `to_i64s`, `to_u64s` and `to_f64s` read an attribute value without matching on its variant. Each spans every variant that can carry the shape asked for — both string charsets and all four integer widths, scalar or one-element array — and applies its range rule per element, so a value that does not fit reports `None` rather than a wrapped number. The prefix states the cost: `as_*` borrows or copies, `to_*` allocates ([#238](https://github.com/stephenberry/hdf5-pure/pull/238)).
@@ -559,7 +563,8 @@ Internal robustness and tests ([#26](https://github.com/stephenberry/hdf5-pure/i
 - The MAT deserializer flattens 1×N and N×1 values to a 1-D sequence in `deserialize_any` (matching `deserialize_seq`).
 - Numeric/complex readers preserve 1×N / N×1 shape at the value layer; any flattening happens at the serde level.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.30.0...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.31.0...HEAD
+[0.31.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.30.0...v0.31.0
 [0.30.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.29.0...v0.30.0
 [0.29.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.27.0...v0.28.0
