@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- An attribute holding an empty string is written with a one-byte-wide string datatype rather than a zero-size one, which libhdf5 rejects while iterating an object's attributes — a single empty-string attribute made every attribute on that object unreadable to the C library ([#240](https://github.com/stephenberry/hdf5-pure/pull/240)).
 - `repack` no longer re-encodes an attribute it copies: a variable-length ASCII array stays variable-length, and a fixed-width ASCII string keeps its charset, where both previously came out as UTF-8 fixed-width ([#239](https://github.com/stephenberry/hdf5-pure/pull/239)).
 - A MAT file honors `MATLAB_class` and `MATLAB_empty` whichever integer width, charset, or one-element shape its writer chose, rather than reporting an unexpected attribute type or reading the flag as absent ([#238](https://github.com/stephenberry/hdf5-pure/pull/238), [#239](https://github.com/stephenberry/hdf5-pure/pull/239)).
 
