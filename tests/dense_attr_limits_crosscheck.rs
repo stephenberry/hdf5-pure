@@ -745,6 +745,230 @@ fn c_reads_a_multi_megabyte_dense_heap() {
     assert_eq!(c_reads(&path), CReads::Attrs(40));
 }
 
+/// Attribute names that share a `jenkins_lookup3` hash with the name beside
+/// them, each pair listed in the order that is the *reverse* of how the two
+/// compare — the order a writer that breaks a hash tie by insertion index gets
+/// wrong.
+///
+/// Ten pairs rather than one because a colliding pair only exercises an internal
+/// node when the split happens to fall between its two records, and which pair
+/// that is depends on where every other name's hash lands.
+const COLLIDING_PAIRS: [(&str, &str); 10] = [
+    ("k69209", "k155448"),
+    ("k92415", "k257792"),
+    ("k76770", "k310249"),
+    ("k42661", "k327803"),
+    ("k5073", "k491506"),
+    ("k7843", "k559364"),
+    ("k62716", "k403994"),
+    ("k70075", "k405037"),
+    ("k59238", "k391908"),
+    ("k53867", "k394939"),
+];
+
+/// Set every name in [`COLLIDING_PAIRS`] on the root group, first of each pair
+/// first, and pad to `total` attributes. Each value is the attribute's index, so
+/// a lookup that lands on the wrong record reports the wrong sum rather than
+/// merely succeeding.
+fn colliding_attrs(total: usize) -> (FileBuilder, Vec<String>, Vec<i64>) {
+    let mut builder = FileBuilder::new();
+    let mut names = Vec::new();
+    let mut values = Vec::new();
+    for (first, second) in COLLIDING_PAIRS {
+        for name in [first, second] {
+            let value = names.len() as i64;
+            builder.set_attr(name, AttrValue::I64(value));
+            names.push(name.to_string());
+            values.push(value);
+        }
+    }
+    assert!(total >= names.len(), "no room for the colliding pairs");
+    for i in names.len()..total {
+        builder.set_attr(&format!("pad{i:06}"), AttrValue::I64(i as i64));
+    }
+    builder.create_dataset("x").with_f64_data(&[1.0]);
+    (builder, names, values)
+}
+
+/// Have libhdf5 open each colliding name and check it got that name's own value.
+#[track_caller]
+fn c_finds_each(path: &std::path::Path, names: &[String], values: &[i64], context: &str) {
+    let detail = c_looks_up_by_name(path, names);
+    assert_eq!(
+        detail.verdict,
+        CReads::Attrs(names.len()),
+        "{context}: libhdf5 could not open every colliding name"
+    );
+    for (name, value) in names.iter().zip(values) {
+        assert_eq!(
+            detail.sum_of(name),
+            Some(*value),
+            "{context}: {name} came back with another record's value"
+        );
+    }
+}
+
+/// How many attributes put a colliding name in the root of a depth-2 index.
+///
+/// Whether a colliding pair straddles a node boundary is a property of where
+/// every name's hash falls, so it is a search, not a calculation. This count came
+/// out of running one over 20..=760: it is the smallest set of [`colliding_attrs`]
+/// that is *both* depth 2 and has a colliding name as its root record. Smaller
+/// sets straddle at depth 1 (30 is the first), and neighbouring counts do not
+/// straddle at all — 600 and 710 both promote a padding name. The tests assert
+/// the property still holds, so a change in how the tree is planned reports
+/// itself rather than quietly reverting them to searching one flat leaf.
+const STRADDLING_TOTAL: usize = 709;
+
+/// Assert the index in `bytes` is the deep tree with a promoted colliding record
+/// that the multi-level tests mean to search, rather than something shallower
+/// that would satisfy their lookups without descending anything.
+#[track_caller]
+fn assert_a_colliding_name_is_promoted(bytes: &[u8], colliding: usize, context: &str) {
+    assert_eq!(
+        common::heap::sole_btree_depth(bytes),
+        2,
+        "{context}: the index is not the multi-level tree this test exists to search"
+    );
+    let root = common::heap::root_records(bytes);
+    // A record's creation order is the attribute's index in the order it was set,
+    // and `colliding_attrs` sets every colliding name before any padding.
+    assert!(
+        root.iter().any(|(order, _)| (*order as usize) < colliding),
+        "{context}: no colliding name reached the root, so nothing here descends \
+         past one; re-run the search behind STRADDLING_TOTAL"
+    );
+}
+
+/// The name index a hash collision has to survive is not always one leaf.
+///
+/// [`c_finds_attributes_whose_names_hash_alike`] covers a ten-attribute set,
+/// whose whole index is a single leaf node — every record sits in one flat run of
+/// bytes and libhdf5 never descends anything. Since #195 the index is a tree of
+/// 512-byte nodes, so a large set puts records in internal nodes too, and a
+/// colliding pair can straddle a split: one record promoted into a parent, its
+/// twin in a child below.
+///
+/// What that buys is a call site, not a second way for the writer to be wrong.
+/// The order this crate emits comes from one flat sort before the tree is
+/// planned, so any error in it shows up in the single-leaf test too. The half
+/// that only a deep tree reaches is libhdf5's: resolving a record inside a `BTIN`
+/// node runs the same hash-then-`strcmp` compare from `H5B2__find`'s descent,
+/// against a record this crate promoted, and a pair ordered the wrong way sends
+/// it down the branch that cannot hold what it is looking for.
+#[test]
+fn c_finds_colliding_names_in_a_multi_level_index() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("colliding_multi_level.h5");
+
+    let (builder, names, values) = colliding_attrs(STRADDLING_TOTAL);
+    let bytes = builder.finish().unwrap();
+    assert_a_colliding_name_is_promoted(&bytes, names.len(), "multi-level");
+    std::fs::write(&path, &bytes).unwrap();
+
+    c_finds_each(&path, &names, &values, "multi-level");
+}
+
+/// Repacking a colliding attribute set yields a file libhdf5 can still search by
+/// name.
+///
+/// [`hdf5_pure::repack`] is the remediation the issue points affected files at,
+/// and it reaches the index builder by a different route than `FileBuilder::write`
+/// does: it reads a parsed attribute set back out of a source heap and emits a
+/// fresh heap and index for it. What makes that a *repair* is that the order it
+/// emits is a function of the names alone, never of the order they arrived in —
+/// pinned by
+/// `file_writer::tests::the_name_index_order_does_not_depend_on_insertion_order`,
+/// which is where a change to the sort shows up.
+///
+/// Be clear about what this test can and cannot catch. Its source file is one
+/// this crate just wrote, so the attributes come back already in index order and
+/// a sort that dropped its tie-break would still leave them right; the sort is
+/// not what this guards, and neither is the repair — that is
+/// [`c_repairs_a_file_written_before_the_fix`], on a file an affected version
+/// actually wrote. What this guards is `repack` itself over an attribute set
+/// large enough to need a multi-level index: every name present, every value its
+/// own, and the tree deep enough that libhdf5 has to descend it.
+#[test]
+fn c_finds_colliding_names_after_a_repack() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("colliding_src.h5");
+    let dst = dir.path().join("colliding_repacked.h5");
+
+    let (builder, names, values) = colliding_attrs(STRADDLING_TOTAL);
+    builder.write(&src).unwrap();
+    hdf5_pure::repack(&src, &dst, &hdf5_pure::RepackOptions::default()).unwrap();
+
+    let bytes = std::fs::read(&dst).unwrap();
+    assert_a_colliding_name_is_promoted(&bytes, names.len(), "repacked");
+    c_finds_each(&dst, &names, &values, "repacked");
+}
+
+/// A file written before the fix is repaired by rewriting it, which is what the
+/// changelog tells anyone holding one to do.
+///
+/// The fixture is not synthesized: it was written by 0.28.0 itself, checked out
+/// at its release tag and handed [`COLLIDING_PAIRS`] in the order above. That
+/// version broke a name-hash tie by insertion index, so ten of its twenty
+/// attributes are indexed on the wrong side of their twin. Regenerate it the same
+/// way if it ever needs to change — a hand-patched file would only prove that a
+/// hand-patched file repairs.
+///
+/// All three halves of the claim are asserted, because each is a separate thing
+/// that could stop being true: libhdf5 really cannot find ten of the names, this
+/// crate really can read every one of them with its value intact (which is *why*
+/// the file is repairable rather than lost), and `repack` really does hand
+/// libhdf5 a file it can search. Without the first assertion the other two would
+/// pass just as well on a file that was never broken.
+///
+/// What this does *not* guard is the tie-break itself, and the reason is worth
+/// knowing: `repack` re-sets the attributes it read in name order (`sorted` in
+/// `repack.rs`), so the rebuild is handed a list on which a hash-only stable sort
+/// already produces name order within a hash group. Deleting the tie-break leaves
+/// this test green. The sort is guarded by
+/// [`c_finds_colliding_names_in_a_multi_level_index`] and its single-leaf sibling;
+/// what this guards is that the remedy the changelog names still works end to
+/// end, which no amount of reasoning about the sort establishes.
+#[test]
+fn c_repairs_a_file_written_before_the_fix() {
+    let affected = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/dense_attrs_colliding_v0_28_0.h5");
+    let names: Vec<String> = COLLIDING_PAIRS
+        .iter()
+        .flat_map(|(first, second)| [first.to_string(), second.to_string()])
+        .collect();
+    let values: Vec<i64> = (0..names.len() as i64).collect();
+
+    // Half of each pair is on the wrong side of its twin, so libhdf5's binary
+    // search walks away from it: it opens the ten that happen to sit where it
+    // looks and reports the rest missing.
+    let detail = c_looks_up_by_name(&affected, &names);
+    assert_eq!(
+        detail.verdict,
+        CReads::Attrs(names.len() / 2),
+        "the fixture is no longer the broken file this test needs"
+    );
+
+    // The bytes are all there and in the right place — only the index order is
+    // wrong — so a reader that walks the index start to finish sees everything.
+    let file = hdf5_pure::File::open(&affected).unwrap();
+    let attrs = file.root().attrs().unwrap();
+    assert_eq!(attrs.len(), names.len());
+    for (name, value) in names.iter().zip(&values) {
+        assert_eq!(
+            attrs.get(name),
+            Some(&AttrValue::I64(*value)),
+            "{name}: this crate misread the affected file"
+        );
+    }
+    drop(file);
+
+    let dir = tempdir().unwrap();
+    let repaired = dir.path().join("repaired.h5");
+    hdf5_pure::repack(&affected, &repaired, &hdf5_pure::RepackOptions::default()).unwrap();
+    c_finds_each(&repaired, &names, &values, "repaired");
+}
+
 /// libhdf5 must find both halves of a name-hash collision.
 ///
 /// Its search compares the 32-bit name hash and, on a tie, `strcmp`s the name it
