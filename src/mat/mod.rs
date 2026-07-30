@@ -86,8 +86,9 @@ pub use builder::{CellWriter, MatBuilder, StructWriter};
 pub use class::MatClass;
 pub use error::MatError;
 pub use options::{
-    Compression, EmptyMarkerEncoding, InvalidNamePolicy, NullPolicy, OneDimensionalMode, Options,
-    RowMajorPolicy, StringClass, UnsupportedPolicy,
+    Compression, EmptyMarkerEncoding, EmptySequencePolicy, InvalidNamePolicy, NullPolicy,
+    OneDimensionalMode, Options, RowMajorPolicy, StringClass, UnitVariantEncoding,
+    UnsupportedPolicy,
 };
 pub use producer::{Block, BlockElement, Blocking, DataProducer};
 

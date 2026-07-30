@@ -37,16 +37,98 @@ pub enum OneDimensionalMode {
     RowVector,
 }
 
-/// Behavior for `null` / `Option::None` values inside sequences and at the
-/// dataset root.
+/// Behavior for a `null` / `Option::None` in a struct field, a map value, or a
+/// sequence element.
+///
+/// The file root is not one of those: it names no slot, so it is the variable
+/// namespace rather than a value in one. A root `None` / `()` / unit struct
+/// writes a valid MAT file with no variables under every policy except
+/// [`Error`](Self::Error), which refuses it. That is the same file an empty root
+/// map or a fieldless struct produces, and the reference library both writes and
+/// reads one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[non_exhaustive]
 pub enum NullPolicy {
-    /// Map `None` to MATLAB `struct([])` (an empty struct array).
+    /// Map `None` to MATLAB `struct([])` (an empty struct array). The field
+    /// stays present, so MATLAB code can reference it unconditionally and test
+    /// it with `isempty(fieldnames(x))`, which is what this crate's MATLAB
+    /// fixture script checks. Prefer that over a bare `isempty(x)`: the two
+    /// differ for a struct with no fields, and only the `fieldnames` form has
+    /// been verified against MATLAB itself.
+    ///
+    /// Not expressible at the root, where `struct([])` would need a variable
+    /// name to hang on; see the note on this enum.
+    ///
+    /// Reading such a field back is lenient but not universal. It deserializes
+    /// into `Option<T>` as `None`, `Vec<T>` as empty, `serde_json::Value` as
+    /// `Null`, and `()` as `()`. It does *not* deserialize into a bare scalar,
+    /// `String`, struct or map: those report a type error, and `#[serde(default)]`
+    /// does not help, because the field is present rather than missing. A reader
+    /// that wants a default for a null field needs an `Option<T>` field.
     EmptyStructArray,
-    /// Reject `None` with an error.
+    /// Drop the field from its parent struct entirely, so `isfield` reports
+    /// `false` and `s.field` raises. This is what the serde writer did
+    /// unconditionally before 0.30.
+    ///
+    /// A sequence element is not droppable the way a field is: a cell array's
+    /// element count is fixed by its dims, so a null element takes the
+    /// `struct([])` marker instead.
+    ///
+    /// At the root this yields a valid file with zero variables. Note that it
+    /// does not read back as `None`: the deserializer presents the root as a
+    /// struct, so `from_bytes::<Option<T>>` on such a file fails, or yields
+    /// `Some` of an all-defaulted `T`. Round-trip a root-level `None` as a field
+    /// of a wrapper struct instead.
+    Omit,
+    /// Reject `None` with an error, including at the root.
     Error,
+}
+
+/// Encoding for a fieldless (unit) enum variant.
+///
+/// Only the serde *writer* consults this: serde hands the serializer both the
+/// variant's index and its name, so either encoding is reachable. The BEVE
+/// walker has no such choice, since BEVE records whichever one the producing
+/// encoder chose. Reading is not conditioned on it either — the deserializer
+/// resolves a variant from a name or from an index whichever way the file was
+/// written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
+pub enum UnitVariantEncoding {
+    /// Emit the variant's name, honoring `#[serde(rename)]`. Self-describing
+    /// in MATLAB, and stable across a reordering of the enum.
+    Name,
+    /// Emit the variant's zero-based declaration index as a `uint32`.
+    ///
+    /// This is the index serde reports, which counts variants from zero and
+    /// ignores any explicit discriminant: `enum E { A = 5 }` writes `0`.
+    ///
+    /// Prefer [`Name`](Self::Name) unless a reader already expects the
+    /// integer. An index means nothing without the schema that fixes the
+    /// ordering, so inserting or reordering a variant silently changes what
+    /// existing files decode to, and in MATLAB it reads as a magic number
+    /// rather than something `strcmp` can check. This exists for files whose
+    /// layout is already fixed, not as a default worth choosing.
+    Index,
+}
+
+/// Encoding for a sequence that turned out to have no elements.
+///
+/// Only the serde writer consults this. An empty `serialize_seq` carries no
+/// element type, so there is nothing to infer a MATLAB class from; the BEVE
+/// walker does not need the hint, because a BEVE typed array names its element
+/// type even when the array is empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[non_exhaustive]
+pub enum EmptySequencePolicy {
+    /// Emit an empty `double` array, MATLAB's universal `[]`.
+    DoubleArray,
+    /// Emit an empty cell array, `{}`. Right when the sequence would have held
+    /// structs or mixed types had it been populated.
+    Cell,
 }
 
 /// Behavior when a Rust struct field name or BEVE key is not a valid MATLAB
@@ -118,8 +200,20 @@ pub enum EmptyMarkerEncoding {
 }
 
 /// Aggregated options for MAT v7.3 writers.
+///
+/// Two writers consume this: the serde writer in this crate, and the BEVE
+/// walker that downstream crates build on [`MatBuilder`](crate::mat::MatBuilder).
+/// Most knobs apply to both. The ones that cannot are marked in their field
+/// docs, and they are asymmetric only because the two input formats carry
+/// different type information, never as an oversight.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+// Applied to the struct, not to individual fields: this type gains fields, and a
+// persisted `Options` written by an older version must keep loading. Per-field
+// attributes would have to be remembered on every future addition, which is
+// exactly what was forgotten when `unit_variant_encoding` and
+// `empty_sequence_policy` were added.
+#[cfg_attr(feature = "serde", serde(default))]
 #[non_exhaustive]
 pub struct Options {
     /// MATLAB class for string values.
@@ -128,8 +222,12 @@ pub struct Options {
     pub compression: Compression,
     /// Policy for invalid MATLAB names.
     pub invalid_name_policy: InvalidNamePolicy,
-    /// Policy for `null`.
+    /// Policy for `null` / `Option::None`.
     pub null_policy: NullPolicy,
+    /// Encoding for fieldless enum variants. Serde writer only.
+    pub unit_variant_encoding: UnitVariantEncoding,
+    /// Encoding for sequences that turned out to be empty. Serde writer only.
+    pub empty_sequence_policy: EmptySequencePolicy,
     /// Policy for unsupported numeric/BEVE types.
     pub unsupported_policy: UnsupportedPolicy,
     /// 1-D vector orientation.
@@ -147,6 +245,8 @@ impl Default for Options {
             compression: Compression::None,
             invalid_name_policy: InvalidNamePolicy::Error,
             null_policy: NullPolicy::EmptyStructArray,
+            unit_variant_encoding: UnitVariantEncoding::Name,
+            empty_sequence_policy: EmptySequencePolicy::DoubleArray,
             unsupported_policy: UnsupportedPolicy::Error,
             one_dimensional_mode: OneDimensionalMode::ColumnVector,
             row_major_policy: RowMajorPolicy::ReorderToColumnMajor,
@@ -160,6 +260,11 @@ impl Options {
     /// `mxOPAQUE_CLASS` and use the data-as-dims empty marker encoding.
     /// Matches what real MATLAB's `save -v7.3` produces (and what the BEVE
     /// → MAT walker has historically used).
+    ///
+    /// One shape is this crate's rather than MATLAB's, and only if you also
+    /// select [`EmptySequencePolicy::Cell`]: an empty cell array is written
+    /// `0x1`, following the `[n, 1]` rule for 1-D cells, where MATLAB's `{}`
+    /// is `0x0`. `isempty` holds for both.
     pub fn with_modern_strings() -> Self {
         Self {
             string_class: StringClass::String,
@@ -173,12 +278,24 @@ impl Options {
 mod tests {
     use super::*;
 
+    /// The encoding defaults have not moved since the serde writer was the
+    /// only consumer. `null_policy` has (see the 0.30 changelog), so this is
+    /// no longer a statement about the whole struct.
     #[test]
-    fn default_matches_legacy_serde_writer() {
+    fn encoding_defaults_match_the_legacy_serde_writer() {
         let o = Options::default();
         assert_eq!(o.string_class, StringClass::Char);
         assert_eq!(o.invalid_name_policy, InvalidNamePolicy::Error);
         assert_eq!(o.empty_marker_encoding, EmptyMarkerEncoding::ZeroElement);
+    }
+
+    /// The two knobs added in 0.30 default to what the writer did before them,
+    /// so only `null_policy` changes an existing caller's output.
+    #[test]
+    fn serde_only_knobs_default_to_previous_behavior() {
+        let o = Options::default();
+        assert_eq!(o.unit_variant_encoding, UnitVariantEncoding::Name);
+        assert_eq!(o.empty_sequence_policy, EmptySequencePolicy::DoubleArray);
     }
 
     #[test]

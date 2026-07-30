@@ -554,8 +554,11 @@ becomes a MATLAB variable. Mapping:
 | `Matrix<T>` or `Vec<Vec<T>>` of same length | column-major 2-D dataset, HDF5 shape `[cols, rows]` |
 | `Complex64` / `Complex32` / `ComplexI16` / … | compound `{real, imag}` dataset, `MATLAB_class` = the *component* class |
 | nested struct | HDF5 group with `MATLAB_class = "struct"`, `MATLAB_fields` |
-| `Option<T>` (struct field) | omitted if `None` |
-| unit enum variant | UTF-16 char dataset holding the variant name |
+| `Option<T>` (struct field) | `struct([])` if `None`; `NullPolicy::Omit` drops the field instead, `NullPolicy::Error` refuses it |
+| `()`, unit struct, `serde_json::Value::Null` | same as `None`, through `NullPolicy` |
+| `None` / `()` / `Null` at the **root** | a valid file with no variables, byte-identical to what an empty root map writes; only `NullPolicy::Error` refuses it |
+| unit enum variant | UTF-16 char dataset holding the variant name; `UnitVariantEncoding::Index` writes the declaration index as `uint32` instead |
+| empty `Vec<T>` | empty `double` (`[]`); `EmptySequencePolicy::Cell` writes `{}` instead |
 | `Vec<Struct>` / `Vec<Option<T>>` / ragged `Vec<Vec<T>>` | cell array (`MATLAB_class = "cell"`, object references into `#refs#`); `None` slots become `struct([])` |
 
 ### Cell array pattern
