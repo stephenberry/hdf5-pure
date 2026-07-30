@@ -188,3 +188,153 @@ fn c_library_converts_our_large_group_to_dense() {
         );
     }
 }
+
+/// The reference C library writes each string and integer attribute encoding,
+/// and hdf5-pure reports the `AttrValue` variant that matches it.
+///
+/// Every other attribute crosscheck in this suite goes the other way — we write,
+/// the C library reads — so nothing measured what our reader makes of a *foreign*
+/// file's attributes. That is the direction that matters for MATLAB, matio and
+/// h5py files, and the direction the read-side variant mapping is claimed on.
+#[test]
+fn pure_reads_every_attribute_encoding_the_c_library_writes() {
+    use hdf5::types::{FixedAscii, FixedUnicode, VarLenAscii, VarLenUnicode};
+    use hdf5_pure::AttrValue;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_attrs.h5");
+
+    {
+        let file = hdf5::File::create(&path).unwrap();
+        file.new_dataset::<f64>()
+            .shape([1])
+            .create("x")
+            .unwrap()
+            .write(&[1.0f64])
+            .unwrap();
+
+        // Fixed-width ASCII, the encoding MATLAB uses for MATLAB_class.
+        file.new_attr::<FixedAscii<8>>()
+            .shape(())
+            .create("fixed_ascii_scalar")
+            .unwrap()
+            .write_scalar(&FixedAscii::<8>::from_ascii("double").unwrap())
+            .unwrap();
+        file.new_attr::<FixedAscii<8>>()
+            .shape([1])
+            .create("fixed_ascii_one")
+            .unwrap()
+            .write(&[FixedAscii::<8>::from_ascii("double").unwrap()])
+            .unwrap();
+        file.new_attr::<FixedAscii<8>>()
+            .shape([2])
+            .create("fixed_ascii_two")
+            .unwrap()
+            .write(&[
+                FixedAscii::<8>::from_ascii("ab").unwrap(),
+                FixedAscii::<8>::from_ascii("cd").unwrap(),
+            ])
+            .unwrap();
+
+        // True variable-length strings — what h5py writes, and what this crate
+        // has no variant for.
+        file.new_attr::<VarLenAscii>()
+            .shape(())
+            .create("vlen_ascii_scalar")
+            .unwrap()
+            .write_scalar(&VarLenAscii::from_ascii("double").unwrap())
+            .unwrap();
+        file.new_attr::<VarLenAscii>()
+            .shape([2])
+            .create("vlen_ascii_two")
+            .unwrap()
+            .write(&[
+                VarLenAscii::from_ascii("x").unwrap(),
+                VarLenAscii::from_ascii("yy").unwrap(),
+            ])
+            .unwrap();
+
+        // UTF-8, fixed and variable.
+        file.new_attr::<FixedUnicode<8>>()
+            .shape(())
+            .create("fixed_utf8_scalar")
+            .unwrap()
+            .write_scalar(&"m/s".parse::<FixedUnicode<8>>().unwrap())
+            .unwrap();
+        file.new_attr::<VarLenUnicode>()
+            .shape(())
+            .create("vlen_utf8_scalar")
+            .unwrap()
+            .write_scalar(&"m/s".parse::<VarLenUnicode>().unwrap())
+            .unwrap();
+
+        // Integers: width, signedness, and the scalar/array distinction.
+        file.new_attr::<u64>()
+            .shape(())
+            .create("u64_scalar")
+            .unwrap()
+            .write_scalar(&u64::MAX)
+            .unwrap();
+        file.new_attr::<u64>()
+            .shape([2])
+            .create("u64_two")
+            .unwrap()
+            .write(&[u64::MAX, 1u64])
+            .unwrap();
+        file.new_attr::<i32>()
+            .shape(())
+            .create("i32_scalar")
+            .unwrap()
+            .write_scalar(&-7i32)
+            .unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let attrs = file.root().attrs().unwrap();
+
+    // Charset and arity both survive a foreign writer.
+    assert_eq!(
+        attrs.get("fixed_ascii_scalar"),
+        Some(&AttrValue::AsciiString("double".into()))
+    );
+    assert_eq!(
+        attrs.get("fixed_ascii_one"),
+        Some(&AttrValue::AsciiStringArray(vec!["double".into()])),
+        "a one-element array must not collapse to a scalar"
+    );
+    assert_eq!(
+        attrs.get("fixed_ascii_two"),
+        Some(&AttrValue::AsciiStringArray(vec!["ab".into(), "cd".into()]))
+    );
+
+    // A true variable-length string has no variant of its own, so it reads as
+    // the fixed-width variant of its charset and arity. This pins the documented
+    // limitation against what libhdf5 actually writes.
+    assert_eq!(
+        attrs.get("vlen_ascii_scalar"),
+        Some(&AttrValue::AsciiString("double".into()))
+    );
+    assert_eq!(
+        attrs.get("vlen_ascii_two"),
+        Some(&AttrValue::AsciiStringArray(vec!["x".into(), "yy".into()])),
+        "a variable-length string array is not MATLAB's VLEN-of-char encoding"
+    );
+
+    assert_eq!(
+        attrs.get("fixed_utf8_scalar"),
+        Some(&AttrValue::String("m/s".into()))
+    );
+    assert_eq!(
+        attrs.get("vlen_utf8_scalar"),
+        Some(&AttrValue::String("m/s".into()))
+    );
+
+    // The full-range unsigned value reads exactly, at either arity.
+    assert_eq!(attrs.get("u64_scalar"), Some(&AttrValue::U64(u64::MAX)));
+    assert_eq!(
+        attrs.get("u64_two"),
+        Some(&AttrValue::U64Array(vec![u64::MAX, 1]))
+    );
+    // Width is not recovered: a 32-bit signed attribute widens.
+    assert_eq!(attrs.get("i32_scalar"), Some(&AttrValue::I64(-7)));
+}

@@ -78,10 +78,9 @@ fn struct_with_fields() {
         other => panic!("unexpected: {other:?}"),
     };
     assert_eq!(class, "struct");
-    let fields: Vec<String> = match &attrs["MATLAB_fields"] {
-        AttrValue::AsciiStringArray(arr) | AttrValue::StringArray(arr) => arr.clone(),
-        other => panic!("unexpected: {other:?}"),
-    };
+    let fields = attrs["MATLAB_fields"]
+        .as_strings()
+        .expect("MATLAB_fields must hold strings");
     assert_eq!(fields, vec!["answer", "label"]);
     assert_eq!(read_class(&f, "payload/answer"), "uint32");
     assert_eq!(read_class(&f, "payload/label"), "char");

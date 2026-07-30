@@ -221,7 +221,10 @@ fn userblock_delete_one_of_several_then_read_attr() {
         vec![5, 6]
     );
     let attrs = file.group("grp").unwrap().attrs().unwrap();
-    assert_eq!(attrs.get("tag"), Some(&AttrValue::String("kept".into())));
+    assert_eq!(
+        attrs.get("tag"),
+        Some(&AttrValue::AsciiString("kept".into()))
+    );
     assert_userblock_unchanged(&path, &userblock);
 
     std::fs::remove_file(&path).ok();

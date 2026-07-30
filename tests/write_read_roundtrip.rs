@@ -538,10 +538,11 @@ fn roundtrip_ascii_string_attribute() {
 
     let file = File::from_bytes(bytes).unwrap();
     let attrs = file.root().attrs().unwrap();
-    // ASCII strings are read as String
+    // The charset is what this test is about, so it asserts the variant: an
+    // ASCII string reads back ASCII rather than as a UTF-8 `String`.
     assert_eq!(
         attrs.get("MATLAB_class"),
-        Some(&AttrValue::String("double".into()))
+        Some(&AttrValue::AsciiString("double".into()))
     );
 }
 

@@ -51,8 +51,8 @@ fn serialize_top_level_struct_produces_three_variables() {
     assert_eq!(trial.read_u32().unwrap(), vec![7]);
     let trial_attrs = trial.attrs().unwrap();
     assert_eq!(
-        trial_attrs.get("MATLAB_class"),
-        Some(&AttrValue::String("uint32".into()))
+        trial_attrs.get("MATLAB_class").and_then(AttrValue::as_str),
+        Some("uint32")
     );
 
     // temperature: double scalar
@@ -60,16 +60,22 @@ fn serialize_top_level_struct_produces_three_variables() {
     assert_eq!(temp.shape().unwrap(), vec![1, 1]);
     assert_eq!(temp.read_f64().unwrap(), vec![300.0]);
     assert_eq!(
-        temp.attrs().unwrap().get("MATLAB_class"),
-        Some(&AttrValue::String("double".into()))
+        temp.attrs()
+            .unwrap()
+            .get("MATLAB_class")
+            .and_then(AttrValue::as_str),
+        Some("double")
     );
 
     // name: char [4, 1] HDF5 → MATLAB row [1, 4] (UTF-16 code units of "beta")
     let name = file.dataset("name").unwrap();
     assert_eq!(name.shape().unwrap(), vec![4, 1]);
     assert_eq!(
-        name.attrs().unwrap().get("MATLAB_class"),
-        Some(&AttrValue::String("char".into()))
+        name.attrs()
+            .unwrap()
+            .get("MATLAB_class")
+            .and_then(AttrValue::as_str),
+        Some("char")
     );
     let units = name.read_u16().unwrap();
     let s = String::from_utf16(&units).unwrap();
@@ -162,16 +168,16 @@ fn nested_struct_becomes_group() {
     let inner = file.group("inner").unwrap();
     let attrs = inner.attrs().unwrap();
     assert_eq!(
-        attrs.get("MATLAB_class"),
-        Some(&AttrValue::String("struct".into()))
+        attrs.get("MATLAB_class").and_then(AttrValue::as_str),
+        Some("struct")
     );
-    // The reader decodes variable-length ASCII arrays as StringArray.
-    let fields = match attrs.get("MATLAB_fields") {
-        Some(AttrValue::StringArray(v)) => v.clone(),
-        Some(AttrValue::VarLenAsciiArray(v)) => v.clone(),
-        other => panic!("expected string array, got {other:?}"),
-    };
-    assert_eq!(fields, vec!["y".to_string(), "z".to_string()]);
+    // `MATLAB_fields` is written as a variable-length ASCII array and reads
+    // back as one; `as_strings` spans that and the fixed-width shapes.
+    let fields = attrs
+        .get("MATLAB_fields")
+        .and_then(AttrValue::as_strings)
+        .expect("MATLAB_fields must hold strings");
+    assert_eq!(fields, vec!["y", "z"]);
 
     // Nested datasets exist
     let y = file.dataset("inner/y").unwrap();
@@ -197,8 +203,8 @@ fn assert_empty_struct_array(file: &File, name: &str) {
         .unwrap_or_else(|e| panic!("`{name}` must be present, got: {e}"));
     let attrs = ds.attrs().unwrap();
     assert_eq!(
-        attrs.get("MATLAB_class"),
-        Some(&AttrValue::String("struct".into())),
+        attrs.get("MATLAB_class").and_then(AttrValue::as_str),
+        Some("struct"),
         "`{name}` must be a struct",
     );
     assert!(
@@ -627,8 +633,11 @@ fn sequence_that_changes_scalar_type_midway_keeps_every_element() {
     let file = File::from_bytes(bytes.clone()).unwrap();
     let ds = file.dataset("items").unwrap();
     assert_eq!(
-        ds.attrs().unwrap().get("MATLAB_class"),
-        Some(&AttrValue::String("cell".into())),
+        ds.attrs()
+            .unwrap()
+            .get("MATLAB_class")
+            .and_then(AttrValue::as_str),
+        Some("cell"),
         "a run broken by a string lowers to a cell"
     );
     let back: S = mat::from_bytes(&bytes).unwrap();
@@ -668,8 +677,11 @@ fn long_flat_numeric_sequence_still_lowers_to_one_array() {
     let file = File::from_bytes(bytes.clone()).unwrap();
     let ds = file.dataset("items").unwrap();
     assert_eq!(
-        ds.attrs().unwrap().get("MATLAB_class"),
-        Some(&AttrValue::String("double".into())),
+        ds.attrs()
+            .unwrap()
+            .get("MATLAB_class")
+            .and_then(AttrValue::as_str),
+        Some("double"),
         "a flat numeric run stays one array, not a cell of scalars"
     );
     assert_eq!(ds.shape().unwrap(), vec![1, 10_000]);
@@ -701,8 +713,11 @@ fn unit_variant_defaults_to_its_name() {
     .unwrap();
     let ds = file.dataset("width").unwrap();
     assert_eq!(
-        ds.attrs().unwrap().get("MATLAB_class"),
-        Some(&AttrValue::String("char".into()))
+        ds.attrs()
+            .unwrap()
+            .get("MATLAB_class")
+            .and_then(AttrValue::as_str),
+        Some("char")
     );
     let s = String::from_utf16(&ds.read_u16().unwrap()).unwrap();
     assert_eq!(s, "complex_f32");
@@ -727,8 +742,11 @@ fn unit_variant_can_be_written_as_its_index() {
     let ds = file.dataset("width").unwrap();
     assert_eq!(ds.shape().unwrap(), vec![1, 1]);
     assert_eq!(
-        ds.attrs().unwrap().get("MATLAB_class"),
-        Some(&AttrValue::String("uint32".into()))
+        ds.attrs()
+            .unwrap()
+            .get("MATLAB_class")
+            .and_then(AttrValue::as_str),
+        Some("uint32")
     );
     assert_eq!(ds.read_u32().unwrap(), vec![1]);
 }
@@ -788,8 +806,11 @@ fn empty_sequence_defaults_to_an_empty_double_array() {
         File::from_bytes(mat::to_bytes(&WithEmptySeq { items: Vec::new() }).unwrap()).unwrap();
     let ds = file.dataset("items").unwrap();
     assert_eq!(
-        ds.attrs().unwrap().get("MATLAB_class"),
-        Some(&AttrValue::String("double".into()))
+        ds.attrs()
+            .unwrap()
+            .get("MATLAB_class")
+            .and_then(AttrValue::as_str),
+        Some("double")
     );
 }
 
@@ -805,8 +826,11 @@ fn empty_sequence_can_be_written_as_an_empty_cell() {
     .unwrap();
     let ds = file.dataset("items").unwrap();
     assert_eq!(
-        ds.attrs().unwrap().get("MATLAB_class"),
-        Some(&AttrValue::String("cell".into()))
+        ds.attrs()
+            .unwrap()
+            .get("MATLAB_class")
+            .and_then(AttrValue::as_str),
+        Some("cell")
     );
 }
 
@@ -865,8 +889,11 @@ fn complex_scalar_and_vector() {
     assert_eq!(z.shape().unwrap(), vec![1, 1]);
     // The compound dataset is double class per MATLAB convention.
     assert_eq!(
-        z.attrs().unwrap().get("MATLAB_class"),
-        Some(&AttrValue::String("double".into()))
+        z.attrs()
+            .unwrap()
+            .get("MATLAB_class")
+            .and_then(AttrValue::as_str),
+        Some("double")
     );
 
     let zs = file.dataset("zs").unwrap();
@@ -912,8 +939,11 @@ fn bool_fields_are_logical_uint8() {
     let f = file.dataset("flag").unwrap();
     assert_eq!(f.shape().unwrap(), vec![1, 1]);
     assert_eq!(
-        f.attrs().unwrap().get("MATLAB_class"),
-        Some(&AttrValue::String("logical".into()))
+        f.attrs()
+            .unwrap()
+            .get("MATLAB_class")
+            .and_then(AttrValue::as_str),
+        Some("logical")
     );
     assert_eq!(f.read_u8().unwrap(), vec![1]);
 

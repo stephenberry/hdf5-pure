@@ -108,7 +108,10 @@ fn synthetic_userblock_file_roundtrip() {
     groups.sort();
     assert!(groups.contains(&"newgrp".to_string()));
     let attrs = file.group("newgrp").unwrap().attrs().unwrap();
-    assert_eq!(attrs.get("tag"), Some(&AttrValue::String("v104".into())));
+    assert_eq!(
+        attrs.get("tag"),
+        Some(&AttrValue::AsciiString("v104".into()))
+    );
 
     // The userblock bytes are preserved verbatim across the edit.
     let after = std::fs::read(&path).unwrap();
@@ -290,7 +293,10 @@ fn userblock_add_dataset_with_vlen_attribute_roundtrip() {
     assert_eq!(ds.read_i32().unwrap(), vec![1, 2, 3]);
     assert_eq!(
         ds.attrs().unwrap().get("tags"),
-        Some(&AttrValue::StringArray(vec!["one".into(), "two".into()]))
+        Some(&AttrValue::VarLenAsciiArray(vec![
+            "one".into(),
+            "two".into()
+        ]))
     );
     assert_eq!(&std::fs::read(&path).unwrap()[..UB], &userblock[..]);
 

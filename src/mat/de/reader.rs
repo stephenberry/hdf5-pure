@@ -654,13 +654,13 @@ fn matlab_class_from_attrs(
 }
 
 fn is_empty_attr(attrs: &HashMap<String, AttrValue>) -> bool {
-    match attrs.get("MATLAB_empty") {
-        Some(AttrValue::U32(v)) => *v != 0,
-        Some(AttrValue::U64(v)) => *v != 0,
-        Some(AttrValue::I64(v)) => *v != 0,
-        Some(AttrValue::I32(v)) => *v != 0,
-        _ => false,
-    }
+    // Through the accessor rather than per-variant arms: writers differ on the
+    // width and on whether the flag is a scalar or a one-element array, and
+    // the reader reports each of those faithfully.
+    attrs
+        .get("MATLAB_empty")
+        .and_then(AttrValue::as_i64)
+        .is_some_and(|v| v != 0)
 }
 
 /// Build an empty `ComplexMatrix` whose `(rows, cols)` matches the dataspace

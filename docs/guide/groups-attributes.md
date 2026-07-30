@@ -103,6 +103,33 @@ println!("attributes:   {:?}", sensors.attrs().unwrap());
 
 `File::group(path)` resolves a group by path, and `Group::group(name)` resolves a child relative to that group. The names returned by `groups()` and `datasets()` are not sorted in any guaranteed order, so sort them yourself if you need a stable listing.
 
+### Reading an attribute value
+
+An attribute reads back as the variant it was written from: the dataspace kind distinguishes a scalar from a one-element array, and the datatype's charset selects the `Ascii` variants. A `VarLenAsciiArray` of one element stays a `VarLenAsciiArray`, and an `AsciiString` does not arrive as a `String`.
+
+That fidelity means several variants can carry the same logical value, so match on the variant only when the encoding is what you care about. Otherwise use the accessors, each of which spans every variant that can hold the shape it names:
+
+```rust
+let attrs = file.root().attrs().unwrap();
+
+// Any single string, either charset, scalar or one-element array.
+let class: Option<&str> = attrs.get("MATLAB_class").and_then(AttrValue::as_str);
+
+// Every element, with a scalar reading as one element.
+let fields: Option<Vec<&str>> = attrs.get("MATLAB_fields").and_then(AttrValue::as_strings);
+```
+
+`as_i64`, `as_u64`, `as_f64`, `to_i64s`, `to_u64s` and `to_f64s` do the same for numbers. The prefix states the cost: `as_*` borrows or copies, `to_*` allocates. `as_i64` widens the narrower integer variants and reports `None` for a value above `i64::MAX` rather than wrapping it — per element, so the same holds for `to_i64s` at any length. The float accessors do not convert integers, so a caller that accepts either asks for both.
+
+What a read cannot recover, because `AttrValue` has no way to express it. Each of these reads correctly but would be rewritten differently:
+
+- **Width.** Integers and floats widen to `i64`/`u64`/`f64`; there are no narrower array variants.
+- **Variable-length strings.** A true `H5T_STRING` with `STRSIZE = VAR` — what h5py writes, and what this crate's writer never emits — has no variant of its own and reads as the fixed-width variant of the same charset.
+- **Rank.** Every array variant is one-dimensional, so a rank-2 attribute reads as its elements flattened.
+- **Padding and declared width.** A fixed-width string reports its content, not its `STRSIZE` or which padding it used.
+
+The variant may become **more specific** in a future release as `AttrValue` grows narrower variants, so match with a `_` arm — which the `#[non_exhaustive]` enum requires anyway — or read through the accessors, which are unaffected by such a change.
+
 ### Addressing datasets
 
 Datasets are addressable two ways: by full path from the file, or by name from their parent group. Both resolve to the same dataset.
