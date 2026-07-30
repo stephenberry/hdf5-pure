@@ -173,6 +173,20 @@ pub(crate) fn attrs_to_map<S: crate::source::Source + ?Sized>(
     map
 }
 
+/// Decode one attribute message into the [`AttrValue`] variant that describes
+/// what the file holds.
+///
+/// The datatype and the dataspace together determine the variant, so a value
+/// this crate wrote reads back as the variant it was written from. The
+/// dataspace kind — not the element count — decides scalar against array, so a
+/// one-element array stays an array. Charset selects the `Ascii*` variants.
+///
+/// Two things are still not recoverable. Integer and float widths are widened
+/// to `i64`/`u64`/`f64`, since there are no narrower array variants; and a true
+/// variable-length string (`H5T_STRING` with `STRSIZE = VAR`, which this
+/// crate's writer never emits) has no variant of its own, so it reads as the
+/// fixed-width variant of the same charset and arity and would be rewritten
+/// fixed-width.
 fn decode_attr_value<S: crate::source::Source + ?Sized>(
     attr: &crate::attribute::AttributeMessage,
     source: &S,
@@ -180,29 +194,36 @@ fn decode_attr_value<S: crate::source::Source + ?Sized>(
     length_size: u8,
     base_address: u64,
 ) -> Option<AttrValue> {
-    use crate::datatype::Datatype;
+    use crate::dataspace::DataspaceType;
+    use crate::datatype::{CharacterSet, Datatype};
+
+    // A scalar dataspace and a 1-element simple dataspace are different on
+    // disk (v1 carries rank 0, v2 a type byte), and the write side picks
+    // between them per variant, so this is what makes the round trip faithful
+    // at length one.
+    let scalar = attr.dataspace.space_type == DataspaceType::Scalar;
 
     match &attr.datatype {
         Datatype::FloatingPoint { .. } => {
             let vals = attr.read_as_f64().ok()?;
-            if vals.len() == 1 {
-                Some(AttrValue::F64(vals[0]))
+            if scalar {
+                Some(AttrValue::F64(*vals.first()?))
             } else {
                 Some(AttrValue::F64Array(vals))
             }
         }
         Datatype::FixedPoint { signed: true, .. } => {
             let vals = attr.read_as_i64().ok()?;
-            if vals.len() == 1 {
-                Some(AttrValue::I64(vals[0]))
+            if scalar {
+                Some(AttrValue::I64(*vals.first()?))
             } else {
                 Some(AttrValue::I64Array(vals))
             }
         }
         Datatype::FixedPoint { signed: false, .. } => {
             let vals = attr.read_as_u64().ok()?;
-            if vals.len() == 1 {
-                Some(AttrValue::U64(vals[0]))
+            if scalar {
+                Some(AttrValue::U64(*vals.first()?))
             } else {
                 // No U64Array variant, store as I64Array
                 #[expect(
@@ -214,17 +235,20 @@ fn decode_attr_value<S: crate::source::Source + ?Sized>(
                 Some(AttrValue::I64Array(i64_vals))
             }
         }
-        Datatype::String { .. } => {
+        Datatype::String { charset, .. } => {
             let strings = attr.read_as_strings().ok()?;
-            if strings.len() == 1 {
-                Some(AttrValue::String(strings[0].clone()))
-            } else {
-                Some(AttrValue::StringArray(strings))
+            let ascii = *charset == CharacterSet::Ascii;
+            match (ascii, scalar) {
+                (true, true) => Some(AttrValue::AsciiString(strings.into_iter().next()?)),
+                (true, false) => Some(AttrValue::AsciiStringArray(strings)),
+                (false, true) => Some(AttrValue::String(strings.into_iter().next()?)),
+                (false, false) => Some(AttrValue::StringArray(strings)),
             }
         }
         Datatype::VariableLength {
             is_string,
             base_type,
+            charset,
             ..
         } if *is_string || is_ascii_char_vlen_base(base_type) => {
             // Two MATLAB-relevant encodings share the same on-disk byte
@@ -245,10 +269,20 @@ fn decode_attr_value<S: crate::source::Source + ?Sized>(
                 crate::vl_data::VlenStringReadOptions::default(),
             )
             .ok()?;
-            if strings.len() == 1 {
-                Some(AttrValue::String(strings[0].clone()))
-            } else {
-                Some(AttrValue::StringArray(strings))
+            // The VLEN-of-1-byte-ASCII encoding is the one this crate writes,
+            // for `VarLenAsciiArray`, so it reads back as that variant. A true
+            // variable-length string has no variant of its own; keep its
+            // charset and arity and let it read as the fixed-width variant.
+            let ascii_char_vlen = is_ascii_char_vlen_base(base_type);
+            if ascii_char_vlen && !scalar {
+                return Some(AttrValue::VarLenAsciiArray(strings));
+            }
+            let ascii = ascii_char_vlen || *charset == Some(CharacterSet::Ascii);
+            match (ascii, scalar) {
+                (true, true) => Some(AttrValue::AsciiString(strings.into_iter().next()?)),
+                (true, false) => Some(AttrValue::AsciiStringArray(strings)),
+                (false, true) => Some(AttrValue::String(strings.into_iter().next()?)),
+                (false, false) => Some(AttrValue::StringArray(strings)),
             }
         }
         _ => None,
@@ -308,5 +342,106 @@ mod tests {
             classify_datatype(&float),
             DType::Other(format!("float{}", u64::from(u32::MAX) * 8))
         );
+    }
+
+    /// Write one attribute per case, read every attribute back, and return the
+    /// values keyed by name. Goes through the real writer and reader, in
+    /// memory, so what it measures is the file rather than a constructed
+    /// message.
+    fn round_trip(cases: &[(&str, AttrValue)]) -> HashMap<std::string::String, AttrValue> {
+        let mut builder = crate::writer::FileBuilder::new();
+        for (name, value) in cases {
+            builder.set_attr(*name, value.clone());
+        }
+        // A dataset gives the global heap a reason to exist for the
+        // variable-length cases, matching how these files are really built.
+        builder.create_dataset("x").with_f64_data(&[1.0]);
+        let bytes = builder.finish().unwrap();
+        crate::File::from_bytes(bytes)
+            .unwrap()
+            .root()
+            .attrs()
+            .unwrap()
+    }
+
+    /// The variant a string attribute was written from is the variant it reads
+    /// back as. The one-element arrays are the point: charset and dataspace
+    /// kind are both on disk, so neither collapses into the scalar form.
+    #[test]
+    fn every_string_variant_round_trips_to_itself() {
+        let cases = vec![
+            ("utf8_scalar", AttrValue::String("m/s".into())),
+            ("utf8_one", AttrValue::StringArray(vec!["m/s".into()])),
+            (
+                "utf8_two",
+                AttrValue::StringArray(vec!["m/s".into(), "kg".into()]),
+            ),
+            ("ascii_scalar", AttrValue::AsciiString("double".into())),
+            (
+                "ascii_one",
+                AttrValue::AsciiStringArray(vec!["double".into()]),
+            ),
+            (
+                "ascii_two",
+                AttrValue::AsciiStringArray(vec!["double".into(), "int16".into()]),
+            ),
+            ("vlen_one", AttrValue::VarLenAsciiArray(vec!["x".into()])),
+            (
+                "vlen_three",
+                AttrValue::VarLenAsciiArray(vec!["x".into(), "y".into(), "velocity".into()]),
+            ),
+        ];
+        let read = round_trip(&cases);
+        for (name, written) in &cases {
+            assert_eq!(read.get(*name), Some(written), "attribute {name}");
+        }
+    }
+
+    /// Array-ness survives at length one for numbers too.
+    #[test]
+    fn every_numeric_variant_round_trips_to_itself() {
+        let cases = vec![
+            ("f64_scalar", AttrValue::F64(1.5)),
+            ("f64_one", AttrValue::F64Array(vec![1.5])),
+            ("f64_two", AttrValue::F64Array(vec![1.5, 2.5])),
+            ("i64_scalar", AttrValue::I64(-7)),
+            ("i64_one", AttrValue::I64Array(vec![-7])),
+            ("i64_two", AttrValue::I64Array(vec![-7, 8])),
+            ("u64_scalar", AttrValue::U64(7)),
+        ];
+        let read = round_trip(&cases);
+        for (name, written) in &cases {
+            assert_eq!(read.get(*name), Some(written), "attribute {name}");
+        }
+    }
+
+    /// Width is the one thing the read side still cannot recover: there are no
+    /// narrower array variants, so a 32-bit attribute widens. This pins the
+    /// documented limitation rather than endorsing it — if narrower variants
+    /// are ever added, this test is the one that should fail.
+    #[test]
+    fn integer_width_is_not_recovered() {
+        let read = round_trip(&[("i32", AttrValue::I32(-7)), ("u32", AttrValue::U32(7))]);
+        assert_eq!(read.get("i32"), Some(&AttrValue::I64(-7)));
+        assert_eq!(read.get("u32"), Some(&AttrValue::U64(7)));
+    }
+
+    /// The accessors are what a consumer should use, and they read every shape
+    /// above as the same logical value — which is the reason the reader is free
+    /// to be faithful about the variant.
+    #[test]
+    fn accessors_span_the_shapes_the_reader_now_distinguishes() {
+        let read = round_trip(&[
+            ("scalar", AttrValue::AsciiString("double".into())),
+            ("one", AttrValue::StringArray(vec!["double".into()])),
+            ("vlen", AttrValue::VarLenAsciiArray(vec!["double".into()])),
+        ]);
+        for name in ["scalar", "one", "vlen"] {
+            assert_eq!(
+                read.get(name).and_then(AttrValue::as_str),
+                Some("double"),
+                "attribute {name}"
+            );
+        }
     }
 }
