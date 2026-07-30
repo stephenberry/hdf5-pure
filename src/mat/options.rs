@@ -37,8 +37,15 @@ pub enum OneDimensionalMode {
     RowVector,
 }
 
-/// Behavior for `null` / `Option::None` values inside sequences and at the
-/// dataset root.
+/// Behavior for a `null` / `Option::None` in a struct field, a map value, or a
+/// sequence element.
+///
+/// The file root is not one of those: it names no slot, so it is the variable
+/// namespace rather than a value in one. A root `None` / `()` / unit struct
+/// writes a valid MAT file with no variables under every policy except
+/// [`Error`](Self::Error), which refuses it. That is the same file an empty root
+/// map or a fieldless struct produces, and the reference library both writes and
+/// reads one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[non_exhaustive]
@@ -46,12 +53,25 @@ pub enum NullPolicy {
     /// Map `None` to MATLAB `struct([])` (an empty struct array). The field
     /// stays present, so MATLAB code can reference it unconditionally and
     /// test it with `isempty`.
+    ///
+    /// Not expressible at the root, where `struct([])` would need a variable
+    /// name to hang on; see the note on this enum.
     EmptyStructArray,
     /// Drop the field from its parent struct entirely, so `isfield` reports
     /// `false` and `s.field` raises. This is what the serde writer did
     /// unconditionally before 0.30.
+    ///
+    /// A sequence element is not droppable the way a field is: a cell array's
+    /// element count is fixed by its dims, so a null element takes the
+    /// `struct([])` marker instead.
+    ///
+    /// At the root this yields a valid file with zero variables. Note that it
+    /// does not read back as `None`: the deserializer presents the root as a
+    /// struct, so `from_bytes::<Option<T>>` on such a file fails, or yields
+    /// `Some` of an all-defaulted `T`. Round-trip a root-level `None` as a field
+    /// of a wrapper struct instead.
     Omit,
-    /// Reject `None` with an error.
+    /// Reject `None` with an error, including at the root.
     Error,
 }
 

@@ -31,7 +31,11 @@ pub(crate) fn to_value<T: Serialize + ?Sized>(
 }
 
 /// Lower a `None` / unit / unit-struct per [`Options::null_policy`].
-fn null_value(opts: &Options) -> Result<MatValue, MatError> {
+///
+/// The root serializer routes through this too, so `NullPolicy::Error` refuses a
+/// root null with the same message it uses everywhere else, rather than the root
+/// being the one slot the policy does not reach.
+pub(super) fn null_value(opts: &Options) -> Result<MatValue, MatError> {
     match opts.null_policy {
         NullPolicy::EmptyStructArray => Ok(MatValue::EmptyStructArray),
         NullPolicy::Omit => Ok(MatValue::Omit),

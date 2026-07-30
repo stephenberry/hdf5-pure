@@ -267,6 +267,78 @@ fn option_none_is_rejected_under_the_error_policy() {
     assert!(mat::to_bytes_with_options(&v, &options).is_err());
 }
 
+/// The root names no slot, so a null there is an empty variable namespace, not a
+/// null value in one. Every policy that can express that writes the same
+/// zero-variable file, and it is the same file three unambiguously legitimate
+/// requests already produce, so refusing it would fork the crate against itself.
+///
+/// Locks both halves: that the silence is deliberate, and that `Error` still
+/// fires here. `Error` reaching every other slot but this one made the policy
+/// fail at its only purpose.
+#[test]
+fn a_root_null_writes_the_same_empty_workspace_every_legitimate_route_does() {
+    use std::collections::BTreeMap;
+
+    #[derive(Serialize)]
+    struct Fieldless {}
+
+    let none: Option<f64> = None;
+    let mut omit = mat::Options::default();
+    omit.null_policy = mat::NullPolicy::Omit;
+
+    // The two policies that can express an empty namespace, over the three ways
+    // to spell a root null.
+    let baseline = mat::to_bytes_with_options(&none, &omit).unwrap();
+    for (label, bytes) in [
+        ("root () under Omit", mat::to_bytes_with_options(&(), &omit)),
+        (
+            "root Null under Omit",
+            mat::to_bytes_with_options(&serde_json::Value::Null, &omit),
+        ),
+        (
+            "root None under the default",
+            mat::to_bytes_with_options(&none, &mat::Options::default()),
+        ),
+        (
+            "root () under the default",
+            mat::to_bytes_with_options(&(), &mat::Options::default()),
+        ),
+        // The requests that make refusing indefensible: by the time the emitter
+        // sees an empty variable list it cannot tell these from a root null.
+        (
+            "empty root map",
+            mat::to_bytes_with_options(&BTreeMap::<String, f64>::new(), &mat::Options::default()),
+        ),
+        (
+            "fieldless struct",
+            mat::to_bytes_with_options(&Fieldless {}, &mat::Options::default()),
+        ),
+    ] {
+        assert_eq!(
+            bytes.unwrap(),
+            baseline,
+            "{label} must write the same empty workspace"
+        );
+    }
+
+    // It is a real file, not a degenerate blob: it opens and has no variables.
+    let file = File::from_bytes(baseline).unwrap();
+    assert!(
+        file.root().datasets().unwrap().is_empty(),
+        "the empty workspace must contain no variables"
+    );
+
+    // `Error` is the one policy expressible at the root, and it must fire.
+    let mut error = mat::Options::default();
+    error.null_policy = mat::NullPolicy::Error;
+    assert!(mat::to_bytes_with_options(&none, &error).is_err());
+    assert!(mat::to_bytes_with_options(&(), &error).is_err());
+    assert!(mat::to_bytes_with_options(&serde_json::Value::Null, &error).is_err());
+    // ...without catching the legitimate empty-workspace requests.
+    assert!(mat::to_bytes_with_options(&BTreeMap::<String, f64>::new(), &error).is_ok());
+    assert!(mat::to_bytes_with_options(&Fieldless {}, &error).is_ok());
+}
+
 #[test]
 fn option_some_serializes_underlying() {
     let v = WithOption {

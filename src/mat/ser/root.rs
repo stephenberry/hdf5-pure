@@ -92,6 +92,23 @@ impl<'a> RootSerializer<'a> {
     pub(crate) fn new(opts: &'a Options) -> Self {
         Self { opts }
     }
+
+    /// A `None` / `()` / unit struct at the root.
+    ///
+    /// The root names no slot, so it is the variable namespace rather than a
+    /// value in one. A null namespace is an empty namespace: both
+    /// [`NullPolicy::Omit`] and [`NullPolicy::EmptyStructArray`] write a valid
+    /// file with no variables, which is byte-identical to what an empty root map
+    /// or a fieldless struct writes. `EmptyStructArray` cannot do otherwise,
+    /// since `struct([])` needs a variable name to hang on.
+    ///
+    /// [`NullPolicy::Error`] is the one policy that *is* expressible here, and it
+    /// routes through the same lowering as every other slot so it refuses with the
+    /// same message. Skipping that was the policy failing at its only purpose.
+    fn root_null(self) -> Result<Vec<(String, MatValue)>, MatError> {
+        super::value_ser::null_value(self.opts)?;
+        Ok(Vec::new())
+    }
 }
 
 impl<'a> Serializer for RootSerializer<'a> {
@@ -156,8 +173,7 @@ impl<'a> Serializer for RootSerializer<'a> {
     }
 
     fn serialize_none(self) -> Result<Self::Ok, MatError> {
-        // `None` at root: produce an empty file (no variables).
-        Ok(Vec::new())
+        self.root_null()
     }
 
     fn serialize_some<T: Serialize + ?Sized>(self, value: &T) -> Result<Self::Ok, MatError> {
@@ -165,12 +181,11 @@ impl<'a> Serializer for RootSerializer<'a> {
     }
 
     fn serialize_unit(self) -> Result<Self::Ok, MatError> {
-        // Treat `()` at root as an empty workspace.
-        Ok(Vec::new())
+        self.root_null()
     }
 
     fn serialize_unit_struct(self, _name: &'static str) -> Result<Self::Ok, MatError> {
-        Ok(Vec::new())
+        self.root_null()
     }
 
     fn serialize_unit_variant(

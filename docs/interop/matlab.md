@@ -70,6 +70,7 @@ The serializer maps Rust types to HDF5 datasets and the MATLAB classes MATLAB ex
 | nested struct | HDF5 group with `MATLAB_class = "struct"`, `MATLAB_fields` |
 | `Option<T>` (struct field) | `struct([])` if `None`; `NullPolicy::Omit` drops the field instead, `NullPolicy::Error` refuses it |
 | unit `()` / unit struct / `serde_json::Value::Null` (struct field) | same as `None` (see note below) |
+| `None` / `()` / `Null` at the **root** | a valid file with no variables, byte-identical to what an empty root map or a fieldless struct writes; only `NullPolicy::Error` refuses it. It does not read back as `None`, since the deserializer presents the root as a struct |
 | unit enum variant | UTF-16 char dataset holding the variant name; `UnitVariantEncoding::Index` writes the declaration index as `uint32` instead |
 | empty `Vec<T>` | empty `double` (`[]`); `EmptySequencePolicy::Cell` writes `{}` instead |
 | `Vec<Struct>` / `Vec<Option<T>>` / ragged `Vec<Vec<T>>` | cell array (`MATLAB_class = "cell"`, object references into `#refs#`); `None` slots become `struct([])` |
