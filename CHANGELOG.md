@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-07-30
+
+`DatasetBuilder::with_lzf` writes h5py's LZF filter (id 32000), a fast lossless compressor h5py reads without any plugin installed, and LZF datasets — including h5py-written ones — can be read, edited in place, and repacked ([#231](https://github.com/stephenberry/hdf5-pure/pull/231)). The MAT serde writer honors `Options::null_policy`, which it previously ignored: `None`, `()`, a unit struct, and `Value::Null` now write MATLAB `struct([])` rather than dropping the field, so MATLAB code can reference it unconditionally — at the cost that a Rust reader relying on `#[serde(default)]` for a non-`Option` field now finds the field present. `NullPolicy::Omit` writes the previous output. Two new options join it: `Options::unit_variant_encoding` writes a fieldless enum variant as its name or as its declaration index, and `Options::empty_sequence_policy` picks `[]` or `{}` for a sequence that turned out to be empty ([#232](https://github.com/stephenberry/hdf5-pure/pull/232)). That writer also collects a flat numeric or complex sequence packed, one element wide, instead of one 56-byte value per element — serializing a `Vec<f64>` cost 7x its own size and a `Vec<ComplexI16>` 14x, both now about 1x, with the same bytes out — and the empty-value paths its two emitters take now agree with each other. On the filter side, requesting a filter that another would displace is refused instead of silently dropped, `FormatError::DecompressionError` is removed in favor of the `FilterError` that shuffle, scale-offset and LZF already reported, and decoding a chunk reserves memory against what its own stream could expand to rather than against a size the file merely declares ([#233](https://github.com/stephenberry/hdf5-pure/issues/233)). Files written by earlier versions still read.
+
 ### Added
 
 - `DatasetBuilder::with_lzf` writes h5py's LZF filter (id 32000), a fast lossless compressor h5py reads without any plugin, and LZF datasets — including h5py-written ones — can be read, edited in place, and repacked; combining LZF with deflate is refused ([#231](https://github.com/stephenberry/hdf5-pure/pull/231)).
@@ -539,7 +543,8 @@ Internal robustness and tests ([#26](https://github.com/stephenberry/hdf5-pure/i
 - The MAT deserializer flattens 1×N and N×1 values to a 1-D sequence in `deserialize_any` (matching `deserialize_seq`).
 - Numeric/complex readers preserve 1×N / N×1 shape at the value layer; any flattening happens at the serde level.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.29.0...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.30.0...HEAD
+[0.30.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.29.0...v0.30.0
 [0.29.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.28.0...v0.29.0
 [0.28.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.27.0...v0.28.0
 [0.27.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.26.0...v0.27.0
