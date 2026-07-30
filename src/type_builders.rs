@@ -651,34 +651,26 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
             AttributeMessage {
                 name: name.to_string(),
                 datatype: Datatype::String {
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "string byte length is stored in the 4-byte fixed-string datatype size field"
-                    )]
-                    size: bytes.len() as u32,
+                    size: fixed_string_size(bytes.len()),
                     padding: StringPadding::NullPad,
                     charset: CharacterSet::Utf8,
                 },
                 dataspace: scalar_ds(),
-                raw_data: bytes.to_vec(),
+                raw_data: pad_to_size(bytes),
             }
         }
         AttrValue::StringArray(arr) => {
-            let max_len = arr.iter().map(|s| s.len()).max().unwrap_or(0);
+            let elem_size = fixed_string_size(arr.iter().map(|s| s.len()).max().unwrap_or(0));
             let mut raw = Vec::new();
             for s in arr {
                 let mut b = s.as_bytes().to_vec();
-                b.resize(max_len, 0);
+                b.resize(elem_size as usize, 0);
                 raw.extend_from_slice(&b);
             }
             AttributeMessage {
                 name: name.to_string(),
                 datatype: Datatype::String {
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "max string byte length is stored in the 4-byte fixed-string datatype size field"
-                    )]
-                    size: max_len as u32,
+                    size: elem_size,
                     padding: StringPadding::NullPad,
                     charset: CharacterSet::Utf8,
                 },
@@ -691,34 +683,26 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
             AttributeMessage {
                 name: name.to_string(),
                 datatype: Datatype::String {
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "string byte length is stored in the 4-byte fixed-string datatype size field"
-                    )]
-                    size: bytes.len() as u32,
+                    size: fixed_string_size(bytes.len()),
                     padding: StringPadding::NullPad,
                     charset: CharacterSet::Ascii,
                 },
                 dataspace: scalar_ds(),
-                raw_data: bytes.to_vec(),
+                raw_data: pad_to_size(bytes),
             }
         }
         AttrValue::AsciiStringArray(arr) => {
-            let max_len = arr.iter().map(|s| s.len()).max().unwrap_or(0);
+            let elem_size = fixed_string_size(arr.iter().map(|s| s.len()).max().unwrap_or(0));
             let mut raw = Vec::new();
             for s in arr {
                 let mut b = s.as_bytes().to_vec();
-                b.resize(max_len, 0);
+                b.resize(elem_size as usize, 0);
                 raw.extend_from_slice(&b);
             }
             AttributeMessage {
                 name: name.to_string(),
                 datatype: Datatype::String {
-                    #[expect(
-                        clippy::cast_possible_truncation,
-                        reason = "max string byte length is stored in the 4-byte fixed-string datatype size field"
-                    )]
-                    size: max_len as u32,
+                    size: elem_size,
                     padding: StringPadding::NullPad,
                     charset: CharacterSet::Ascii,
                 },
@@ -1058,6 +1042,34 @@ pub(crate) fn patch_vl_refs_masked(
         let addr_offset = offset + 4; // skip sequence_length
         raw_data[addr_offset..addr_offset + 8].copy_from_slice(&address.to_le_bytes());
     }
+}
+
+/// `STRSIZE` for a fixed-width string datatype whose longest value is `len`
+/// bytes, which is never zero.
+///
+/// HDF5 requires a string datatype of at least one byte. libhdf5 rejects a
+/// zero-size one with "invalid datatype size" — and it fails while *iterating*
+/// the object's attributes, so a single empty-string attribute makes every
+/// attribute on that object unreadable to the C library, not just that one.
+///
+/// An empty string is therefore stored as one padding byte, which reads back as
+/// the empty string under any of the three padding rules. Storing it needs no
+/// refusal: the value is representable, it was only the datatype that was not.
+fn fixed_string_size(len: usize) -> u32 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "string byte length is stored in the 4-byte fixed-string datatype size field"
+    )]
+    let size = len.max(1) as u32;
+    size
+}
+
+/// A scalar fixed-width string's raw data: its bytes, never empty, so that the
+/// message matches the `STRSIZE` [`fixed_string_size`] declares.
+fn pad_to_size(bytes: &[u8]) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    out.resize(fixed_string_size(bytes.len()) as usize, 0);
+    out
 }
 
 pub(crate) fn scalar_ds() -> Dataspace {
