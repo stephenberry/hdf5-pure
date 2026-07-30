@@ -9,8 +9,11 @@
 //! The compressor is format-compatible with liblzf's decoder but makes no
 //! attempt to reproduce liblzf's exact byte output — any conforming stream is
 //! valid. h5py registers the filter as *optional*, so on read a chunk h5py
-//! stored raw (its filter-mask bit set) must be tolerated; this crate's writer
-//! applies LZF unconditionally as a mandatory filter, like its other filters.
+//! stored raw (its filter-mask bit set) must be tolerated. This crate's writer
+//! records the same optional flag — a later writer, h5py included, needs it to
+//! store an incompressible chunk raw rather than fail — but never exercises it
+//! itself: it applies LZF to every chunk and accepts the grown stream that
+//! incompressible input produces.
 
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec::Vec};

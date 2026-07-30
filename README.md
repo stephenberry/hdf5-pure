@@ -447,8 +447,11 @@ builder.create_dataset("fast")
     .with_lzf();
 ```
 
-Interop is enforced by `src/lzf_crosscheck.rs` against fixtures produced by
-h5py's built-in LZF; see `tests/fixtures/lzf/regen.py`.
+`src/lzf_crosscheck.rs` decodes h5py's own LZF streams and checks the filter
+pipeline this crate writes against the one h5py records. Our compressed stream
+is not byte-compared — LZF has many valid encodings of the same data — so that
+h5py can read what we write is verified by the read-back phase of
+`tests/fixtures/lzf/regen.py`, which needs a live h5py.
 
 ### ZFP (optional, `zfp` feature)
 

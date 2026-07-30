@@ -63,10 +63,10 @@ fn lzf_multi_chunk_partial_edge_roundtrip() {
 
 #[test]
 fn lzf_incompressible_roundtrip() {
-    // LZF is written as a mandatory filter, so incompressible chunks are
-    // stored compressed (slightly grown), not raw — they must still decode.
-    // The bytes are the u8_noise fixture, the same stream h5py's optional
-    // filter refused to compress.
+    // Our writer applies LZF to every chunk rather than taking the optional
+    // filter's skip, so an incompressible chunk is stored compressed (slightly
+    // grown), not raw — it must still decode. The bytes are the u8_noise
+    // fixture, the same stream h5py's optional filter refused to compress.
     let vals = std::fs::read(fixture("u8_noise.raw.bin")).unwrap();
     let mut builder = FileBuilder::new();
     builder
@@ -99,6 +99,10 @@ fn lzf_records_h5py_cd_values() {
     assert_eq!(pipeline[0].id, 32000);
     assert_eq!(pipeline[0].name.as_deref(), Some("lzf"));
     assert_eq!(pipeline[0].client_data, vec![4, 0x0105, 64 * 4]);
+    // Optional, as h5py records it. LZF is the one filter this crate writes
+    // whose compressor can decline a chunk; a later writer needs the flag to
+    // store that chunk raw instead of failing the write outright.
+    assert!(pipeline[0].is_optional, "LZF must be written as optional");
 }
 
 #[test]
@@ -180,6 +184,89 @@ fn fixture(name: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/lzf")
         .join(name)
+}
+
+/// Build `pure_written.h5`: the LZF file *this crate* emits, committed so that
+/// `regen.py`'s read-back phase can hand it to a real h5py.
+///
+/// Four datasets, chosen for what they make h5py do rather than for coverage
+/// of our own reader: a plain multi-chunk dataset, a shuffle+lzf chain, a
+/// partial edge chunk, and an incompressible one whose stream our compressor
+/// grows — the case that fails outright if the filter is not recorded optional.
+fn build_pure_written() -> Vec<u8> {
+    let ramp: Vec<i32> = (0..1024).collect();
+    let waves: Vec<f64> = (0..512).map(|i| (f64::from(i) * 0.05).sin()).collect();
+    let edge: Vec<i64> = (0..1000).map(|i| i * 7 - 500).collect();
+    let noise = std::fs::read(fixture("u8_noise.raw.bin")).unwrap();
+
+    let mut b = FileBuilder::new();
+    b.create_dataset("plain_i32")
+        .with_i32_data(&ramp)
+        .with_chunks(&[256])
+        .with_lzf();
+    b.create_dataset("shuffle_f64")
+        .with_f64_data(&waves)
+        .with_chunks(&[128])
+        .with_shuffle()
+        .with_lzf();
+    b.create_dataset("multichunk_i64")
+        .with_i64_data(&edge)
+        .with_chunks(&[128])
+        .with_lzf();
+    b.create_dataset("incompressible_u8")
+        .with_u8_data(&noise)
+        .with_chunks(&[1024])
+        .with_lzf();
+    b.finish().unwrap()
+}
+
+/// The committed `pure_written.h5` is still what our writer emits today.
+///
+/// The fixture is an input to a verification step that runs outside CI (h5py
+/// reads it in `regen.py`), so nothing else would notice it going stale. When
+/// this fails, the writer's output changed: rewrite the file from
+/// `build_pure_written` and re-run `regen.py` so the h5py read-back covers the
+/// new bytes rather than last release's.
+#[test]
+fn pure_written_fixture_is_current() {
+    let committed = std::fs::read(fixture("pure_written.h5")).unwrap();
+    assert_eq!(
+        build_pure_written(),
+        committed,
+        "tests/fixtures/lzf/pure_written.h5 is stale — see this test's doc comment"
+    );
+}
+
+/// Everything in `pure_written.h5` reads back through our own stack. h5py's
+/// half of this is `regen.py --verify-pure`; this half at least keeps the
+/// fixture from being self-inconsistent.
+#[test]
+fn pure_written_fixture_reads_back() {
+    let file = File::from_bytes(build_pure_written()).unwrap();
+
+    let ramp: Vec<i32> = (0..1024).collect();
+    assert_eq!(file.dataset("plain_i32").unwrap().read_i32().unwrap(), ramp);
+
+    let waves: Vec<f64> = (0..512).map(|i| (f64::from(i) * 0.05).sin()).collect();
+    assert_eq!(
+        file.dataset("shuffle_f64").unwrap().read_f64().unwrap(),
+        waves
+    );
+
+    let edge: Vec<i64> = (0..1000).map(|i| i * 7 - 500).collect();
+    assert_eq!(
+        file.dataset("multichunk_i64").unwrap().read_i64().unwrap(),
+        edge
+    );
+
+    let noise = std::fs::read(fixture("u8_noise.raw.bin")).unwrap();
+    assert_eq!(
+        file.dataset("incompressible_u8")
+            .unwrap()
+            .read_u8()
+            .unwrap(),
+        noise
+    );
 }
 
 /// h5py registers LZF as optional and stored this incompressible chunk raw

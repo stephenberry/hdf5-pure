@@ -173,7 +173,16 @@ impl ChunkOptions {
                 filter_id: FILTER_LZF,
                 // Ids >= 256 serialize a name; "lzf" is h5py's registered name.
                 name: Some("lzf".into()),
-                flags: 0,
+                // Optional (bit 0), which is what h5py records. Unlike every
+                // other filter here, LZF *can* fail: liblzf returns 0 for a
+                // chunk it cannot shrink, and h5py's filter relies on the
+                // optional flag to store that chunk raw with its filter-mask
+                // bit set. A mandatory LZF makes that a hard error, so h5py
+                // cannot write incompressible data back into a file we wrote.
+                // Our own writer still applies LZF unconditionally (a grown
+                // stream is a valid stream), so it never sets a mask bit; the
+                // flag exists for the writers that come after us.
+                flags: 1,
                 client_data: crate::lzf::h5py_cd_values(element_size, chunk_dims).to_vec(),
             });
         }
@@ -196,8 +205,10 @@ impl ChunkOptions {
             });
         }
 
-        // Note: h5py sets flags=0x0001 (optional) on filters, but this is not required
-        // for read compatibility.
+        // Note: h5py marks every filter optional (flags=0x0001); we match it
+        // only on LZF, the one filter here whose compressor can decline a
+        // chunk. For a filter that cannot fail the flag is unobservable, and
+        // leaving those at 0 keeps our bytes stable against existing fixtures.
 
         if filters.is_empty() {
             Ok(None)
