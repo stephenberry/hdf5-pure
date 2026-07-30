@@ -1893,6 +1893,19 @@ impl DatasetBuilder {
         self
     }
 
+    /// Enable LZF compression (implies chunked if not already set).
+    ///
+    /// LZF (h5py filter id 32000) is a fast, lossless byte compressor with a
+    /// lower compression ratio than deflate. h5py reads and writes it out of
+    /// the box; the plain C library needs h5py's filter plugin. Usually
+    /// combined with [`with_shuffle`](Self::with_shuffle); mutually exclusive
+    /// with [`with_deflate`](Self::with_deflate) — requesting both makes the
+    /// write fail with a filter error.
+    pub fn with_lzf(&mut self) -> &mut Self {
+        self.chunk_options.lzf = true;
+        self
+    }
+
     /// Enable fletcher32 checksum.
     pub fn with_fletcher32(&mut self) -> &mut Self {
         self.chunk_options.fletcher32 = true;
@@ -1916,7 +1929,8 @@ impl DatasetBuilder {
     /// `with_f32`/`with_f64` data) or `finish()` / `write()` returns a
     /// [`FormatError`](crate::FormatError). Scale-offset is mutually exclusive
     /// with ZFP and replaces shuffle, but may be combined with
-    /// [`with_deflate`](Self::with_deflate). Files are readable by the
+    /// [`with_deflate`](Self::with_deflate) or [`with_lzf`](Self::with_lzf).
+    /// Files are readable by the
     /// reference HDF5 library (filter id 6) and vice versa.
     pub fn with_scale_offset(&mut self, mode: ScaleOffset) -> &mut Self {
         self.chunk_options.scale_offset = Some(mode);
@@ -1926,8 +1940,8 @@ impl DatasetBuilder {
     /// Enable ZFP fixed-rate compression (implies chunked if not already set).
     ///
     /// `rate` is the number of compressed bits per value. Supports f32, f64,
-    /// i32, and i64 datasets in 1D–4D. When ZFP is active it replaces shuffle
-    /// and deflate on the same dataset.
+    /// i32, and i64 datasets in 1D–4D. When ZFP is active it replaces shuffle,
+    /// deflate, and lzf on the same dataset.
     ///
     /// The scalar type is derived from the dataset's datatype when the file
     /// is written, so any of `with_{f32,f64,i32,i64}_data` or an explicit

@@ -1,6 +1,6 @@
 # Compression & Filters
 
-This page covers the storage filters hdf5-pure can apply to a dataset: deflate, shuffle, scale-offset, and (behind a feature flag) ZFP. Filters shrink on-disk size while keeping the file readable by any standard HDF5 tool, because every filter here is either a built-in HDF5 filter or a registered third-party one.
+This page covers the storage filters hdf5-pure can apply to a dataset: deflate, shuffle, scale-offset, LZF, and (behind a feature flag) ZFP. Filters shrink on-disk size while keeping the file readable by any standard HDF5 tool, because every filter here is either a built-in HDF5 filter or a registered third-party one.
 
 !!! tip "Runnable example"
     A complete, runnable program lives at [`examples/compression.rs`](https://github.com/stephenberry/hdf5-pure/blob/main/examples/compression.rs). Run it with:
@@ -13,7 +13,7 @@ This page covers the storage filters hdf5-pure can apply to a dataset: deflate, 
 
 ## Filters require a chunked layout
 
-Filters apply per chunk, so a dataset must use chunked storage before it can be compressed. Enable chunking with `with_chunks` and pass the chunk dimensions. Each compression method (`with_deflate`, `with_scale_offset`, `with_zfp`) implies chunked storage if you have not already set it, but choosing the chunk shape explicitly is recommended since it determines the unit of compression and of partial reads.
+Filters apply per chunk, so a dataset must use chunked storage before it can be compressed. Enable chunking with `with_chunks` and pass the chunk dimensions. Each compression method (`with_deflate`, `with_lzf`, `with_scale_offset`, `with_zfp`) implies chunked storage if you have not already set it, but choosing the chunk shape explicitly is recommended since it determines the unit of compression and of partial reads.
 
 ```rust
 use hdf5_pure::FileBuilder;
@@ -58,6 +58,19 @@ builder
     .with_deflate(6);
 ```
 
+## LZF
+
+`with_lzf()` enables the LZF filter (id 32000), the fast lossless compressor h5py registers and ships with. It trades compression ratio for speed relative to deflate, and it is the natural choice for files exchanged with h5py, which reads and writes LZF out of the box (the plain C library needs h5py's filter plugin). Like deflate, it pairs well with shuffle; combining it with deflate on the same dataset is refused, since stacking two byte compressors is never useful.
+
+```rust
+builder
+    .create_dataset("fast")
+    .with_f64_data(&data)
+    .with_chunks(&[100])
+    .with_shuffle()
+    .with_lzf();
+```
+
 ## Scale-offset
 
 Scale-offset (HDF5 filter id 6) stores each chunk's values as offsets from that chunk's minimum, packed into the fewest bits the chunk's range needs. It has two modes, selected by the [`ScaleOffset`](../reference/data-types.md) enum passed to `with_scale_offset`:
@@ -93,7 +106,7 @@ builder
 ```
 
 !!! warning "Mode must match the datatype"
-    The datatype class, sign, and byte order are derived from the dataset's datatype when the file is written, so the mode must match the data: integer mode on `with_i*` / `with_u*` data, float mode on `with_f32` / `with_f64` data. A mismatch makes `finish()` / `write()` return a `FormatError`. Scale-offset is mutually exclusive with ZFP and replaces shuffle, but may be combined with `with_deflate`.
+    The datatype class, sign, and byte order are derived from the dataset's datatype when the file is written, so the mode must match the data: integer mode on `with_i*` / `with_u*` data, float mode on `with_f32` / `with_f64` data. A mismatch makes `finish()` / `write()` return a `FormatError`. Scale-offset is mutually exclusive with ZFP and replaces shuffle, but may be combined with `with_deflate` or `with_lzf`.
 
 ## Filter chaining
 
@@ -135,7 +148,7 @@ assert_eq!(back, data);
 
 ## Portability
 
-Deflate, shuffle, and scale-offset are all built-in HDF5 filters, so files hdf5-pure writes with them stay readable by the reference HDF5 C library, h5py, and MATLAB, and files those tools produce with the same filters are readable by hdf5-pure. See [Portability](../interop/portability.md) for the broader interoperability picture.
+Deflate, shuffle, and scale-offset are all built-in HDF5 filters, so files hdf5-pure writes with them stay readable by the reference HDF5 C library, h5py, and MATLAB, and files those tools produce with the same filters are readable by hdf5-pure. LZF is h5py's registered filter rather than a built-in: h5py reads it natively, while the plain C library and MATLAB need h5py's filter plugin. `src/lzf_crosscheck.rs` decodes h5py's own streams and checks the filter pipeline hdf5-pure writes against the one h5py records; the compressed stream itself is not byte-compared, since LZF has many valid encodings of the same data, so h5py's ability to read hdf5-pure's output is verified by the read-back phase of `tests/fixtures/lzf/regen.py`. See [Portability](../interop/portability.md) for the broader interoperability picture and what each direction covers.
 
 ## ZFP
 
@@ -167,7 +180,7 @@ The supported slice is:
 - Ranks: 1D, 2D, 3D, 4D
 - Mode: fixed-rate (`rate` bits per value)
 
-The scalar type is derived from the dataset's datatype when the file is written, so any of `with_f32_data` / `with_f64_data` / `with_i32_data` / `with_i64_data` (or an explicit `with_dtype`) establishes it. `finish()` / `write()` returns `FormatError::UnsupportedZfp` if the dataset's datatype is not one of the four supported scalar types, or if the chunk rank is outside `1..=4`. When ZFP is active it replaces shuffle and deflate on the same dataset.
+The scalar type is derived from the dataset's datatype when the file is written, so any of `with_f32_data` / `with_f64_data` / `with_i32_data` / `with_i64_data` (or an explicit `with_dtype`) establishes it. `finish()` / `write()` returns `FormatError::UnsupportedZfp` if the dataset's datatype is not one of the four supported scalar types, or if the chunk rank is outside `1..=4`. When ZFP is active it replaces shuffle, deflate, and LZF on the same dataset.
 
 ## `fast-deflate` backend
 

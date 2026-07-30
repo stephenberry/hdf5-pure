@@ -58,7 +58,7 @@ The operation is all-or-nothing: the entire source is validated and staged in me
 | Datatypes | fixed-point, floating-point, fixed-length string, time, bit-field, opaque, compound, enumeration, array; variable-length strings and sequences, and 8-byte object references (rewritten to their targets' new addresses) |
 | Embedded addresses | a compound with a variable-length member, an object-reference member, or both; an array of such compounds; and nesting of either. The embedded addresses are rewritten, the surrounding bytes carried through untouched |
 | Layout | contiguous / compact or chunked |
-| Filters | deflate, shuffle, fletcher32, and/or lossless integer scale-offset |
+| Filters | deflate, shuffle, fletcher32, LZF, and/or lossless integer scale-offset |
 | Structure | group hierarchy of arbitrary depth |
 | Attributes | numbers, fixed- and variable-length strings and their arrays, on datasets, groups, and root |
 | File-space strategy | the source's strategy, page size, and threshold (carried forward as non-persistent) |
@@ -66,7 +66,7 @@ The operation is all-or-nothing: the entire source is validated and staged in me
 A repacked file has no free space to persist, so even when the source recorded a persistent file-space strategy the compact output carries that strategy forward as non-persistent. See [File-space strategy](file-space.md) for what that controls.
 
 !!! note "Lossless filters only"
-    `repack` reads each dataset's *decompressed* bytes and re-applies its filters. It can therefore reproduce only **lossless** filters, where the re-encoded chunks decompress to the exact same bytes. This includes deflate, shuffle, fletcher32, and lossless integer scale-offset. See [Compression](compression.md) for the full filter list.
+    `repack` reads each dataset's *decompressed* bytes and re-applies its filters. It can therefore reproduce only **lossless** filters, where the re-encoded chunks decompress to the exact same bytes. This includes deflate, shuffle, fletcher32, LZF, and lossless integer scale-offset. See [Compression](compression.md) for the full filter list.
 
 ### What it refuses (by name)
 

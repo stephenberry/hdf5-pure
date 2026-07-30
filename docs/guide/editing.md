@@ -120,7 +120,7 @@ Unlike `copy`, the source subtree is read and validated **eagerly** (the `File` 
 
 ## Appending to an unlimited dataset
 
-`Dataset::append_staged` grows an existing **chunked, unlimited** dataset in place along its first (axis-0) dimension, **including filtered** datasets (deflate, shuffle, fletcher32, scale-offset, and ZFP with the `zfp` feature). It is the general, non-SWMR counterpart to the [SWMR writer](swmr.md), which appends only to *unfiltered*, chunk-aligned datasets. It returns an `AppendBuilder` whose typed and generic methods mirror the writer's; repeated calls concatenate in call order.
+`Dataset::append_staged` grows an existing **chunked, unlimited** dataset in place along its first (axis-0) dimension, **including filtered** datasets (deflate, shuffle, fletcher32, scale-offset, LZF, and ZFP with the `zfp` feature). It is the general, non-SWMR counterpart to the [SWMR writer](swmr.md), which appends only to *unfiltered*, chunk-aligned datasets. It returns an `AppendBuilder` whose typed and generic methods mirror the writer's; repeated calls concatenate in call order.
 
 ```rust
 use hdf5_pure::File;

@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `DatasetBuilder::with_lzf` writes h5py's LZF filter (id 32000), a fast lossless compressor h5py reads without any plugin, and LZF datasets — including h5py-written ones — can be read, edited in place, and repacked; combining LZF with deflate is refused ([#231](https://github.com/stephenberry/hdf5-pure/pull/231)).
 - `Options::unit_variant_encoding` picks whether a fieldless enum variant is written as its name (`UnitVariantEncoding::Name`, the default and previous behavior) or as its declaration index in a `uint32` (`UnitVariantEncoding::Index`). Serde hands the serializer both, so either is reachable; `Index` suits a reader that already expects the integer, but an index cannot be interpreted without the schema that fixes the ordering, so `Name` is the better default. The index is serde's, counted from zero, so an explicit discriminant (`enum E { A = 5 }`) is not the number that reaches the file.
 - `Options::empty_sequence_policy` picks the MATLAB class of a sequence that turned out to be empty: `EmptySequencePolicy::DoubleArray` (the default and previous behavior) writes `[]`, `Cell` writes `{}`. An empty `serialize_seq` carries no element type, so there is nothing to infer the class from; `Cell` is right when the sequence would have held structs.
 - `NullPolicy::Omit` selects the pre-0.30 serde behavior of dropping the field.

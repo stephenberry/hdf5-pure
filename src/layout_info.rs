@@ -169,8 +169,8 @@ pub struct Chunk {
 #[non_exhaustive]
 pub struct Filter {
     /// The registered HDF5 filter identifier — e.g. 1 = deflate, 2 = shuffle,
-    /// 3 = fletcher32, 6 = scale-offset, 32013 = zfp. The same numbering
-    /// returned by [`Dataset::filters`](crate::Dataset::filters).
+    /// 3 = fletcher32, 6 = scale-offset, 32000 = lzf, 32013 = zfp. The same
+    /// numbering returned by [`Dataset::filters`](crate::Dataset::filters).
     pub id: u16,
     /// The filter's recorded name, when the file stores one. Absent for most
     /// built-in filters, which are identified by [`id`](Self::id) alone.

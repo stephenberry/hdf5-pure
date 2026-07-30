@@ -1,9 +1,10 @@
-//! Compressing dataset storage with deflate, shuffle, and scale-offset.
+//! Compressing dataset storage with deflate, shuffle, scale-offset, and LZF.
 //!
-//! Every filter here is a built-in HDF5 filter, so the files stay readable by
-//! the reference C library, h5py, and MATLAB. Compression is transparent on
-//! read: the same `read_*` call returns the decoded data regardless of how it
-//! was stored.
+//! Deflate, shuffle, and scale-offset are built-in HDF5 filters, so those
+//! files stay readable by the reference C library, h5py, and MATLAB; LZF is
+//! h5py's registered filter (id 32000), which h5py reads with no plugin.
+//! Compression is transparent on read: the same `read_*` call returns the
+//! decoded data regardless of how it was stored.
 //!
 //! Run with:
 //!
@@ -44,6 +45,16 @@ fn main() {
             .with_deflate(6);
     });
 
+    // LZF trades compression ratio for speed; like deflate it benefits from a
+    // preceding shuffle pass.
+    let lzf = build(|b| {
+        b.create_dataset("signal")
+            .with_f64_data(&signal)
+            .with_chunks(chunk)
+            .with_shuffle()
+            .with_lzf();
+    });
+
     // Scale-offset in integer mode is lossless: each chunk's values are stored
     // as offsets from its minimum, packed into the fewest bits the range needs.
     let scale_offset_int = build(|b| {
@@ -57,6 +68,7 @@ fn main() {
     report("f64 uncompressed", uncompressed.len());
     report("f64 deflate(6)", deflated.len());
     report("f64 shuffle+deflate(6)", shuffled.len());
+    report("f64 shuffle+lzf (lossless)", lzf.len());
     report("i32 scale-offset (lossless)", scale_offset_int.len());
 
     // Reads are identical regardless of filtering, and the lossless paths
@@ -68,6 +80,14 @@ fn main() {
         .read_f64()
         .unwrap();
     assert_eq!(back, signal);
+
+    let back_lzf = File::from_bytes(lzf)
+        .unwrap()
+        .dataset("signal")
+        .unwrap()
+        .read_f64()
+        .unwrap();
+    assert_eq!(back_lzf, signal);
 
     let back_counts = File::from_bytes(scale_offset_int)
         .unwrap()

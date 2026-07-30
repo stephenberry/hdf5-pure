@@ -105,7 +105,7 @@ standard on-disk format. Files this crate writes are readable by the reference
 HDF5 C library, by `h5py`, and by MATLAB; files those tools produce are readable
 here. This holds for the format features the crate supports — multiple
 superblock versions, object header layouts, contiguous and chunked storage, and
-the built-in deflate, shuffle, and scale-offset filters.
+the built-in deflate, shuffle, and scale-offset filters, plus h5py's LZF.
 
 Interoperability is not asserted by hand. It is enforced by byte-level
 crosscheck tests that compare the bytes this crate emits against fixtures
@@ -115,6 +115,18 @@ discipline backs the optional [ZFP filter](../guide/compression.md)
 (`src/zfp_crosscheck.rs` compares against `h5py` + `hdf5plugin`) and the MATLAB
 `.mat` path. For the cross-tool story in depth, see the
 [MATLAB interop page](matlab.md).
+
+The [LZF filter](../guide/compression.md) is the one place where byte-comparison
+does not apply in both directions, so it is worth being precise about what is
+checked. On read, `src/lzf_crosscheck.rs` decodes h5py's own compressed streams
+and compares against the expected bytes. On write, it compares the filter
+pipeline this crate emits — ids, order, name, optional flag, `cd_values` —
+against what h5py recorded for the same dataset, but *not* the compressed
+stream: LZF has many valid encodings of the same data, so matching liblzf byte
+for byte is not a requirement and not a goal. That h5py decodes the streams this
+crate produces is verified separately, by the read-back phase of
+`tests/fixtures/lzf/regen.py`, which needs a live h5py and so runs when the
+fixtures are regenerated rather than in CI.
 
 ### Host-independent output
 

@@ -12,7 +12,7 @@ Pure-Rust HDF5 reader, writer, and in-place editor. No C dependencies, no build 
 - **SWMR** (single-writer / multiple-reader) append and refreshing read for 1-D unlimited datasets, interoperable with the reference C library and h5py
 - **No C dependencies** — pure Rust, so it compiles to `wasm32-unknown-unknown` and to bare-metal `no_std` (with `alloc`)
 - **MATLAB v7.3 compatible** — userblock support, fixed-length ASCII attributes, variable-length string arrays, object references
-- Deflate, shuffle, and scale-offset (lossless integer / lossy float) compression
+- Deflate, shuffle, LZF, and scale-offset (lossless integer / lossy float) compression
 - Compound types, enumerations, array types
 - Complex number datasets (as compound `{real, imag}`)
 
@@ -25,7 +25,7 @@ Runnable, self-checking examples live in [`examples/`](examples). Run any with `
 | `quickstart` | Build a file in memory and read it back |
 | `generic_io` | Read/write generically over the element type (`with_data` / `read::<T>`) |
 | `groups_and_attributes` | Nested groups and attributes of several types |
-| `compression` | Deflate, shuffle, and scale-offset filters |
+| `compression` | Deflate, shuffle, scale-offset, and LZF filters |
 | `compound_types` | Compound (struct-like) records and complex numbers |
 | `ndarray_io` | N-dimensional array I/O (needs `--features ndarray`) |
 | `edit_in_place` | Add, copy, and delete objects with `File::open_rw` |
@@ -123,7 +123,7 @@ root.delete("sensors/pressure").unwrap();                 // H5Ldelete
 file.commit().unwrap();  // apply staged edits in place
 ```
 
-Contiguous and chunked datasets — the latter with any supported filter (deflate, shuffle, fletcher32, scale-offset) and optionally extensible (unlimited) dimensions — and compact-link groups are supported, and the editor edits files across every on-disk format the reference C library and h5py produce — version 0/1/2/3 superblocks, single- and multi-chunk object headers (a multi-chunk header is collapsed into one chunk on rewrite, and a version 0/1 symbol-table group on the edited path is converted to the latest compact-link format). It refuses, rather than silently degrade the file, anything it cannot reproduce faithfully — a chunked or extensible variable-length addition, dense-storage headers on the edited path, or copying a version-1 object. Within a session the space a deletion frees — for contiguous and chunked datasets alike, including the chunk index — is reused for later writes and the file is truncated when the freed bytes reach the end, so add/delete churn stays bounded instead of only ever growing; for guaranteed compaction across a reopen, see `repack` below.
+Contiguous and chunked datasets — the latter with any supported filter (deflate, shuffle, fletcher32, scale-offset, lzf) and optionally extensible (unlimited) dimensions — and compact-link groups are supported, and the editor edits files across every on-disk format the reference C library and h5py produce — version 0/1/2/3 superblocks, single- and multi-chunk object headers (a multi-chunk header is collapsed into one chunk on rewrite, and a version 0/1 symbol-table group on the edited path is converted to the latest compact-link format). It refuses, rather than silently degrade the file, anything it cannot reproduce faithfully — a chunked or extensible variable-length addition, dense-storage headers on the edited path, or copying a version-1 object. Within a session the space a deletion frees — for contiguous and chunked datasets alike, including the chunk index — is reused for later writes and the file is truncated when the freed bytes reach the end, so add/delete churn stays bounded instead of only ever growing; for guaranteed compaction across a reopen, see `repack` below.
 
 `File::open_rw` takes an exclusive OS advisory lock (the analogue of `H5Pset_file_locking`), so a second editor or any concurrent writer gets `Error::FileLocked` rather than racing on the file. The kernel releases the lock on any process exit, including a crash, so a crashed editor never leaves a stale lock behind. Override the policy with `FileAccessProperties::with_locking` and the `FileLocking` enum, passed to `File::open_rw_with_options`, or set `HDF5_USE_FILE_LOCKING=FALSE` for filesystems (such as some network mounts) where locking is unavailable. `File::open_swmr_writer` and the readers intentionally take no lock: SWMR is single-writer by contract and built for concurrent reads.
 
@@ -141,7 +141,7 @@ let options = RepackOptions::new()
 repack("input.h5", "compact.h5", &options).unwrap();
 ```
 
-`repack` never silently degrades data: every surviving object is reproduced byte-for-byte — datatype, shape, chunking, supported filters, raw data, and attributes — or the whole operation fails with `Error::RepackUnsupported` naming the object, leaving no output file. It reproduces fixed-point, floating-point, string, time, bit-field, opaque, compound, enumeration, and array datatypes, contiguous or chunked, filtered with deflate, shuffle, fletcher32, and/or lossless integer scale-offset, plus variable-length strings and sequences (contiguous, chunked, filtered, or resizable) and 8-byte object references, whose addresses are rewritten to their targets' new locations. Anything it cannot reproduce exactly — chunked, filtered, or resizable reference datasets, region references, virtual layouts, lossy filters (float D-scale scale-offset, ZFP, SZIP), or an attribute the reader cannot decode — it refuses by name rather than write a file that quietly differs.
+`repack` never silently degrades data: every surviving object is reproduced byte-for-byte — datatype, shape, chunking, supported filters, raw data, and attributes — or the whole operation fails with `Error::RepackUnsupported` naming the object, leaving no output file. It reproduces fixed-point, floating-point, string, time, bit-field, opaque, compound, enumeration, and array datatypes, contiguous or chunked, filtered with deflate, shuffle, fletcher32, LZF, and/or lossless integer scale-offset, plus variable-length strings and sequences (contiguous, chunked, filtered, or resizable) and 8-byte object references, whose addresses are rewritten to their targets' new locations. Anything it cannot reproduce exactly — chunked, filtered, or resizable reference datasets, region references, virtual layouts, lossy filters (float D-scale scale-offset, ZFP, SZIP), or an attribute the reader cannot decode — it refuses by name rather than write a file that quietly differs.
 
 ### File-space strategy
 
@@ -431,6 +431,27 @@ builder.create_dataset("readings")
 |---|---|---|
 | `ScaleOffset::Integer(minbits)` | signed/unsigned integers | lossless |
 | `ScaleOffset::FloatDScale(decimals)` | `f32` / `f64` | lossy to `decimals` digits |
+
+### LZF (h5py filter id 32000)
+
+LZF is the fast lossless compressor h5py registers and ships with — the
+natural filter for files exchanged with h5py, which reads it with no plugin
+(the plain C library and MATLAB need h5py's filter plugin). Pairs with
+shuffle; combining it with deflate is refused.
+
+```rust
+builder.create_dataset("fast")
+    .with_f64_data(&data)
+    .with_chunks(&[1000])
+    .with_shuffle()
+    .with_lzf();
+```
+
+`src/lzf_crosscheck.rs` decodes h5py's own LZF streams and checks the filter
+pipeline this crate writes against the one h5py records. Our compressed stream
+is not byte-compared — LZF has many valid encodings of the same data — so that
+h5py can read what we write is verified by the read-back phase of
+`tests/fixtures/lzf/regen.py`, which needs a live h5py.
 
 ### ZFP (optional, `zfp` feature)
 

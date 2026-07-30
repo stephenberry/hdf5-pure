@@ -13,6 +13,8 @@ pub const FILTER_DEFLATE: u16 = 1;
 pub const FILTER_SHUFFLE: u16 = 2;
 pub const FILTER_FLETCHER32: u16 = 3;
 pub const FILTER_SCALEOFFSET: u16 = 6;
+/// LZF (h5py), <https://github.com/h5py/h5py/tree/master/lzf>.
+pub const FILTER_LZF: u16 = 32000;
 /// ZFP compression filter (registered HDF5 filter ID 32013).
 #[cfg(feature = "zfp")]
 pub const FILTER_ZFP: u16 = 32013;
