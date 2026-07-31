@@ -2035,6 +2035,16 @@ mod display_tests {
         );
     }
 
+    /// The leaf enums format through `Formatter::pad`, so a caller lining these
+    /// up in a column gets the width it asked for rather than having it
+    /// silently dropped.
+    #[test]
+    fn a_leaf_enum_honors_the_width_it_is_given() {
+        assert_eq!(format!("{:>8}", CharacterSet::Ascii), "   ascii");
+        assert_eq!(format!("{:<8}|", DatatypeByteOrder::BigEndian), "be      |");
+        assert_eq!(format!("{}", StringPadding::NullPad), "null-pad");
+    }
+
     #[test]
     fn a_string_carries_its_width_charset_and_padding() {
         let string = Datatype::String {
@@ -2085,28 +2095,42 @@ mod display_tests {
     }
 
     /// The member count is an on-disk `u16`, so the list a file can ask for is
-    /// far longer than a message can carry.
+    /// far longer than a message can carry. Both member-bearing variants elide,
+    /// so both are checked.
     #[test]
     fn a_long_member_list_is_elided_and_reports_the_remainder() {
-        let members: Vec<_> = (0..DISPLAY_MAX_MEMBERS + 3)
-            .map(|i| CompoundMember {
-                name: format!("m{i}"),
-                byte_offset: (i * 4) as u64,
-                datatype: u32_datatype(),
-            })
-            .collect();
-        let shown = Datatype::Compound {
-            size: (members.len() * 4) as u32,
-            members,
-        }
-        .to_string();
+        let over_cap = DISPLAY_MAX_MEMBERS + 3;
 
-        assert!(shown.ends_with(", … 3 more}"), "{shown}");
-        assert!(shown.contains("m0: u32"), "{shown}");
-        assert!(
-            !shown.contains(&format!("m{DISPLAY_MAX_MEMBERS}")),
-            "{shown}"
-        );
+        let compound = Datatype::Compound {
+            size: (over_cap * 4) as u32,
+            members: (0..over_cap)
+                .map(|i| CompoundMember {
+                    name: format!("m{i}"),
+                    byte_offset: (i * 4) as u64,
+                    datatype: u32_datatype(),
+                })
+                .collect(),
+        };
+        let enumeration = Datatype::Enumeration {
+            size: 4,
+            base_type: Box::new(u32_datatype()),
+            members: (0..over_cap)
+                .map(|i| EnumMember {
+                    name: format!("m{i}"),
+                    value: vec![0, 0, 0, 0],
+                })
+                .collect(),
+        };
+
+        for (datatype, close) in [(compound, "}"), (enumeration, "]")] {
+            let shown = datatype.to_string();
+            assert!(shown.ends_with(&format!(", … 3 more{close}")), "{shown}");
+            assert!(shown.contains("m0"), "{shown}");
+            assert!(
+                !shown.contains(&format!("m{DISPLAY_MAX_MEMBERS}")),
+                "{shown}"
+            );
+        }
     }
 
     /// The boundary: exactly the cap is written whole, with no "0 more".

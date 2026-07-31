@@ -17,7 +17,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **Breaking:** an unclassified datatype reads as a summary instead of the `Debug` record of the whole `Datatype`, so `DType::Other` now carries `opaque[3] "rgb"` where it carried `Opaque { size: 3, tag: [114, 103, 98] }` ([#242](https://github.com/stephenberry/hdf5-pure/pull/242)).
 - **Breaking:** `DType::Array` writes its shape as `array<f32, 2x3>` rather than `array<f32, [2, 3]>` ([#242](https://github.com/stephenberry/hdf5-pure/pull/242)).
-- **Breaking:** a name a file records — a compound member's, an enum label's, a filter's — is escaped wherever `DType` or `Datatype` writes it, so it cannot carry a newline or a terminal escape into a message, and a member list is elided past sixteen ([#242](https://github.com/stephenberry/hdf5-pure/pull/242)).
+- **Breaking:** a name a file records — a compound member's, an enum label's, a filter's — is escaped and truncated wherever it is written, and a member list is elided past sixteen ([#242](https://github.com/stephenberry/hdf5-pure/pull/242)).
 - **Breaking:** the `Error::MissingMessage` text names the message — `missing required message: data layout` — instead of its Rust variant, and the unrecognized-chunk-index error reports the index-type byte without a `Some`/`None` around it ([#242](https://github.com/stephenberry/hdf5-pure/pull/242)).
 
 ## [0.31.0] - 2026-07-30

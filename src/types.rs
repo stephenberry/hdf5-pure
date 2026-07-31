@@ -696,23 +696,42 @@ mod display_tests {
     }
 
     /// The curated view quotes the same file-recorded names as the detailed
-    /// one, so it escapes and elides them by the same rule.
+    /// one, so it escapes them by the same rule — in both member-bearing
+    /// variants, not just whichever one a test happened to reach for.
     #[test]
-    fn a_curated_member_list_is_escaped_and_elided_like_the_detailed_one() {
-        let hostile = DType::Compound(vec![("a\nb".into(), DType::I32)]);
-        let shown = hostile.to_string();
-        assert!(!shown.chars().any(char::is_control), "{shown}");
-        assert_eq!(shown, "compound{a\\nb: i32}");
+    fn a_curated_member_name_is_escaped_in_either_variant() {
+        let compound = DType::Compound(vec![("a\nb".into(), DType::I32)]).to_string();
+        assert!(!compound.chars().any(char::is_control), "{compound}");
+        assert_eq!(compound, "compound{a\\nb: i32}");
 
-        let long: Vec<String> = (0..DISPLAY_MAX_MEMBERS + 2)
-            .map(|i| format!("m{i}"))
-            .collect();
-        let shown = DType::Enum(long).to_string();
-        assert!(shown.ends_with(", … 2 more]"), "{shown}");
-        assert!(
-            !shown.contains(&format!("m{DISPLAY_MAX_MEMBERS}")),
-            "{shown}"
+        let enumeration = DType::Enum(vec!["a\u{1b}[31mb".into()]).to_string();
+        assert!(!enumeration.chars().any(char::is_control), "{enumeration}");
+        assert_eq!(enumeration, "enum[a\\u{1b}[31mb]");
+    }
+
+    /// Likewise for the cap: a file can declare far more members than a message
+    /// can carry, in either variant.
+    #[test]
+    fn a_curated_member_list_is_elided_in_either_variant() {
+        let over_cap = DISPLAY_MAX_MEMBERS + 2;
+        let names: Vec<String> = (0..over_cap).map(|i| format!("m{i}")).collect();
+
+        let compound = DType::Compound(
+            names
+                .iter()
+                .map(|name| (name.clone(), DType::I32))
+                .collect(),
         );
+        let enumeration = DType::Enum(names);
+
+        for (dtype, close) in [(compound, "}"), (enumeration, "]")] {
+            let shown = dtype.to_string();
+            assert!(shown.ends_with(&format!(", … 2 more{close}")), "{shown}");
+            assert!(
+                !shown.contains(&format!("m{DISPLAY_MAX_MEMBERS}")),
+                "{shown}"
+            );
+        }
     }
 
     /// The two views describe the same file, so a type that classifies to a

@@ -2,11 +2,15 @@
 //!
 //! A datatype, a layout and an attribute value each write a one-line summary
 //! for the messages they land in. The spellings they have in common live here
-//! so they cannot drift apart: a shape is always `2x3`, a truncated list always
-//! ends `… N more`, and text taken from the file is always escaped before it
-//! reaches a message.
+//! so they cannot drift apart: a shape is always `2x3`, and a truncated list
+//! always ends `… N more`.
+//!
+//! [`EscapedName`] is the one used where a name comes from the file. That is
+//! not yet true of every message this crate writes — `repack` interpolates a
+//! link path it read, and `MatError` a field name — so treat it as the rule
+//! these types follow, not as a guarantee the crate makes.
 
-use core::fmt;
+use core::fmt::{self, Write as _};
 
 /// How many members a compound or an enumeration writes before eliding the
 /// rest, in either type view.
@@ -17,6 +21,22 @@ use core::fmt;
 /// can declare 65,535 members, each recursing into a datatype of its own, and
 /// the whole of it would land in a single error message.
 pub(crate) const DISPLAY_MAX_MEMBERS: usize = 16;
+
+/// How many characters of one escaped name are written before it is truncated.
+///
+/// [`DISPLAY_MAX_MEMBERS`] bounds how many names a message carries; this bounds
+/// how long each one is. Without it the two are not a bound at all: a name has
+/// no length limit on disk either, so sixteen of them could still run to
+/// megabytes.
+const DISPLAY_MAX_NAME_CHARS: usize = 64;
+
+/// Both caps exist to keep a hostile file's message readable, so their values
+/// are held to that, not just the mechanism that applies them: a file can
+/// declare 65,535 members of unbounded length, and the product of these two is
+/// what a message is then worth. Raising either past what a person will read is
+/// a compile error, not a silent loss of the bound.
+const _: () = assert!(DISPLAY_MAX_MEMBERS <= 64);
+const _: () = assert!(DISPLAY_MAX_NAME_CHARS <= 256);
 
 /// A dimension list, as `4` or `2x3`.
 pub(crate) struct Dims<'a, T>(pub &'a [T]);
@@ -53,7 +73,7 @@ impl fmt::Display for QuotedBytes<'_> {
 }
 
 /// A name read from the file, escaped so it cannot carry control characters
-/// into a message.
+/// into a message, and truncated so it cannot flood one.
 ///
 /// A member name, an enum label and a filter name are all decoded with
 /// [`String::from_utf8_lossy`], which rejects nothing a file can hold: a
@@ -63,14 +83,21 @@ impl fmt::Display for QuotedBytes<'_> {
 /// hostile one arrives as Rust escapes.
 ///
 /// This bounds a name to one line of printable output. It does not make every
-/// name unambiguous — one holding `, ` still reads like two, and a
-/// bidirectional override still reorders the text around it — so a caller that
+/// name unambiguous — one holding `, ` still reads like two, and one written in
+/// a right-to-left script still reorders the text around it — so a caller that
 /// needs to tell two names apart wants `Debug`.
 pub(crate) struct EscapedName<'a>(pub &'a str);
 
 impl fmt::Display for EscapedName<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0.escape_debug())
+        let mut escaped = self.0.escape_debug();
+        for ch in escaped.by_ref().take(DISPLAY_MAX_NAME_CHARS) {
+            f.write_char(ch)?;
+        }
+        if escaped.next().is_some() {
+            f.write_str("…")?;
+        }
+        Ok(())
     }
 }
 
@@ -112,6 +139,20 @@ mod tests {
                 "{hostile:?} -> {shown}"
             );
         }
+    }
+
+    /// A name has no length limit on disk, so the escape alone does not bound
+    /// the message: it is truncated too.
+    #[test]
+    fn a_long_name_is_truncated() {
+        let long = "n".repeat(DISPLAY_MAX_NAME_CHARS * 4);
+        let shown = EscapedName(&long).to_string();
+
+        assert_eq!(shown.chars().count(), DISPLAY_MAX_NAME_CHARS + 1);
+        assert!(shown.ends_with('…'), "{shown}");
+
+        let at_cap = "n".repeat(DISPLAY_MAX_NAME_CHARS);
+        assert_eq!(EscapedName(&at_cap).to_string(), at_cap);
     }
 
     #[test]

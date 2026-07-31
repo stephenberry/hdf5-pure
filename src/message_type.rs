@@ -107,6 +107,9 @@ impl fmt::Display for MessageType {
             Self::FileSpaceInfo => "file space info",
             Self::Unknown(id) => return write!(f, "unknown message 0x{id:04x}"),
         };
+        // `write_str`, not `pad`: the arm above cannot honor a width without
+        // building the string first, and a type that pads on some values and
+        // not others is worse than one that never pads.
         f.write_str(name)
     }
 }
