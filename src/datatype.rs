@@ -160,8 +160,10 @@ pub enum Datatype {
 // ---- Display ----
 //
 // These types land in error messages, so `Display` is the short form: the width
-// and class, plus only the fields that depart from the ordinary. `Debug` keeps
-// the full record.
+// and class, plus the fields that depart from the ordinary — a big-endian order,
+// a bit span narrower than the type. A string always names its charset and
+// padding, ordinary or not, because they decide how its bytes read. `Debug`
+// keeps the full record.
 
 impl fmt::Display for DatatypeByteOrder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

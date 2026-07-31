@@ -232,25 +232,30 @@ impl fmt::Display for ChunkIndex {
 }
 
 impl fmt::Display for Filter {
-    /// The filter's name and its client data, as `deflate(6)`.
+    /// The filter's name and its client data, as `deflate(6)`. A filter this
+    /// crate does not name carries its identifier in the same parentheses —
+    /// `custom(id=40000)` — so the parentheses hold the filter's parameters and
+    /// nothing else.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match well_known_filter_name(self.id) {
-            Some(name) => f.write_str(name)?,
-            None => match &self.name {
-                Some(name) => write!(f, "{name} ({})", self.id)?,
-                None => write!(f, "filter {}", self.id)?,
-            },
-        }
-        if !self.client_data.is_empty() {
+        let well_known = well_known_filter_name(self.id);
+        f.write_str(well_known.or(self.name.as_deref()).unwrap_or("filter"))?;
+
+        // An unnamed identifier is a parameter of its own, and comes first.
+        let write_id = well_known.is_none();
+        if write_id || !self.client_data.is_empty() {
             f.write_str("(")?;
+            if write_id {
+                write!(f, "id={}", self.id)?;
+            }
             for (i, value) in self.client_data.iter().enumerate() {
-                if i > 0 {
+                if write_id || i > 0 {
                     f.write_str(", ")?;
                 }
                 write!(f, "{value}")?;
             }
             f.write_str(")")?;
         }
+
         if self.is_optional {
             f.write_str(" [optional]")?;
         }
@@ -403,7 +408,7 @@ mod display_tests {
             is_optional: true,
             client_data: vec![],
         };
-        assert_eq!(named.to_string(), "custom (40000) [optional]");
+        assert_eq!(named.to_string(), "custom(id=40000) [optional]");
 
         let anonymous = Filter {
             id: 40001,
@@ -411,7 +416,20 @@ mod display_tests {
             is_optional: false,
             client_data: vec![],
         };
-        assert_eq!(anonymous.to_string(), "filter 40001");
+        assert_eq!(anonymous.to_string(), "filter(id=40001)");
+    }
+
+    /// The identifier is labeled, so it cannot read as one of the client-data
+    /// values it sits beside.
+    #[test]
+    fn an_unregistered_filter_keeps_its_id_apart_from_its_client_data() {
+        let named = Filter {
+            id: 40000,
+            name: Some("custom".into()),
+            is_optional: false,
+            client_data: vec![7, 8],
+        };
+        assert_eq!(named.to_string(), "custom(id=40000, 7, 8)");
     }
 
     /// The message reports the index-type byte itself, not the `Option` that

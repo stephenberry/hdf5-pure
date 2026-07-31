@@ -6,7 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-`Display` now covers the types that describe what a file holds — `AttrValue`, `Datatype` and its component enums, `MessageType`, `Layout`, `ChunkIndex` and `Filter` — so a message quoting one reads as HDF5 rather than as a Rust value. `Display` is the short form and writes only what departs from the ordinary, such as a big-endian order or a bit span narrower than the type; `Debug` still carries the full record.
+`Display` now covers the types that describe what a file holds — `AttrValue`, `Datatype` and its component enums, `MessageType`, `Layout`, `ChunkIndex` and `Filter` — so a message quoting one reads as HDF5 rather than as a Rust value. `Display` is the short form and writes what departs from the ordinary, such as a big-endian order or a bit span narrower than the type, apart from a string's charset and padding, which are always named; `Debug` still carries the full record.
 
 ### Added
 
