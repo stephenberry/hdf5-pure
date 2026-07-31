@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use crate::display::{DISPLAY_MAX_MEMBERS, Dims, EscapedName, write_elided};
+
 pub use crate::file_writer::AttrValue;
 
 /// Simplified datatype enum for the high-level API.
@@ -53,18 +55,27 @@ impl fmt::Display for DType {
             DType::ObjectReference => write!(f, "object_ref"),
             DType::Compound(fields) => {
                 write!(f, "compound{{")?;
-                for (i, (name, dt)) in fields.iter().enumerate() {
+                for (i, (name, dt)) in fields.iter().take(DISPLAY_MAX_MEMBERS).enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{name}: {dt}")?;
+                    write!(f, "{}: {dt}", EscapedName(name))?;
                 }
+                write_elided(f, fields.len().saturating_sub(DISPLAY_MAX_MEMBERS))?;
                 write!(f, "}}")
             }
-            DType::Enum(names) => write!(f, "enum[{}]", names.join(", ")),
-            DType::Array(base, dims) => {
-                write!(f, "array<{base}, {}>", crate::datatype::Dims(dims))
+            DType::Enum(names) => {
+                write!(f, "enum[")?;
+                for (i, name) in names.iter().take(DISPLAY_MAX_MEMBERS).enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", EscapedName(name))?;
+                }
+                write_elided(f, names.len().saturating_sub(DISPLAY_MAX_MEMBERS))?;
+                write!(f, "]")
             }
+            DType::Array(base, dims) => write!(f, "array<{base}, {}>", Dims(dims)),
             DType::Other(desc) => write!(f, "other({desc})"),
         }
     }
@@ -684,33 +695,74 @@ mod display_tests {
         );
     }
 
-    /// The two type views describe the same file, so they spell a type the
-    /// same way.
+    /// The curated view quotes the same file-recorded names as the detailed
+    /// one, so it escapes and elides them by the same rule.
+    #[test]
+    fn a_curated_member_list_is_escaped_and_elided_like_the_detailed_one() {
+        let hostile = DType::Compound(vec![("a\nb".into(), DType::I32)]);
+        let shown = hostile.to_string();
+        assert!(!shown.chars().any(char::is_control), "{shown}");
+        assert_eq!(shown, "compound{a\\nb: i32}");
+
+        let long: Vec<String> = (0..DISPLAY_MAX_MEMBERS + 2)
+            .map(|i| format!("m{i}"))
+            .collect();
+        let shown = DType::Enum(long).to_string();
+        assert!(shown.ends_with(", … 2 more]"), "{shown}");
+        assert!(
+            !shown.contains(&format!("m{DISPLAY_MAX_MEMBERS}")),
+            "{shown}"
+        );
+    }
+
+    /// The two views describe the same file, so a type that classifies to a
+    /// named [`DType`] is spelled the same way by both. Where they differ, the
+    /// `Datatype` is the longer of the two, never a different word: it carries
+    /// the on-disk detail `DType` drops.
     #[test]
     fn dtype_and_datatype_agree_on_the_names_they_share() {
-        let cases = [
-            (
-                Datatype::FixedPoint {
-                    size: 4,
-                    byte_order: DatatypeByteOrder::LittleEndian,
-                    signed: true,
-                    bit_offset: 0,
-                    bit_precision: 32,
-                },
-                "i32",
-            ),
-            (
-                Datatype::String {
-                    size: 8,
-                    padding: StringPadding::NullPad,
-                    charset: CharacterSet::Ascii,
-                },
-                "string",
-            ),
+        let identical = [
+            Datatype::FixedPoint {
+                size: 4,
+                byte_order: DatatypeByteOrder::LittleEndian,
+                signed: true,
+                bit_offset: 0,
+                bit_precision: 32,
+            },
+            Datatype::FloatingPoint {
+                size: 4,
+                byte_order: DatatypeByteOrder::LittleEndian,
+                bit_offset: 0,
+                bit_precision: 32,
+                exponent_location: 23,
+                exponent_size: 8,
+                mantissa_location: 0,
+                mantissa_size: 23,
+                exponent_bias: 127,
+            },
         ];
-
-        for (datatype, expected) in cases {
-            assert_eq!(classify_datatype(&datatype).to_string(), expected);
+        for datatype in identical {
+            assert_eq!(
+                classify_datatype(&datatype).to_string(),
+                datatype.to_string()
+            );
         }
+
+        // A fixed-width string is the case where they differ: `DType` names the
+        // class, `Datatype` adds the width, charset and padding that decide how
+        // the bytes read.
+        let string = Datatype::String {
+            size: 8,
+            padding: StringPadding::NullPad,
+            charset: CharacterSet::Ascii,
+        };
+        assert_eq!(classify_datatype(&string).to_string(), "string");
+        assert_eq!(string.to_string(), "string[8] ascii null-pad");
+        assert!(
+            string
+                .to_string()
+                .starts_with(&classify_datatype(&string).to_string()),
+            "the longer spelling still opens with the shorter one"
+        );
     }
 }

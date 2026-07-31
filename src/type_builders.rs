@@ -15,6 +15,7 @@ use crate::dataspace::{Dataspace, DataspaceType};
 use crate::datatype::{
     CharacterSet, CompoundMember, Datatype, DatatypeByteOrder, EnumMember, StringPadding,
 };
+use crate::display::write_elided;
 use crate::error::FormatError;
 use crate::scaleoffset::ScaleOffset;
 
@@ -1339,10 +1340,7 @@ fn write_elements<T: fmt::Debug>(f: &mut fmt::Formatter<'_>, values: &[T]) -> fm
         }
         write!(f, "{value:?}")?;
     }
-    let elided = values.len().saturating_sub(ATTR_DISPLAY_MAX_ELEMENTS);
-    if elided > 0 {
-        write!(f, ", … {elided} more")?;
-    }
+    write_elided(f, values.len().saturating_sub(ATTR_DISPLAY_MAX_ELEMENTS))?;
     f.write_str("]")
 }
 

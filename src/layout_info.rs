@@ -19,8 +19,11 @@ use alloc::{format, string::String, vec::Vec};
 
 use core::fmt;
 
-use crate::datatype::Dims;
+use crate::display::{Dims, EscapedName};
 use crate::error::FormatError;
+use crate::filter_pipeline::{
+    FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_LZF, FILTER_SCALEOFFSET, FILTER_SHUFFLE,
+};
 
 /// How a dataset's raw data is arranged on disk.
 ///
@@ -220,7 +223,7 @@ impl fmt::Display for Layout {
 
 impl fmt::Display for ChunkIndex {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+        f.pad(match self {
             Self::BTreeV1 => "B-tree v1",
             Self::SingleChunk => "single chunk",
             Self::Implicit => "implicit",
@@ -238,7 +241,16 @@ impl fmt::Display for Filter {
     /// nothing else.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let well_known = well_known_filter_name(self.id);
-        f.write_str(well_known.or(self.name.as_deref()).unwrap_or("filter"))?;
+        match well_known {
+            Some(name) => f.write_str(name)?,
+            // Recorded by the file, so escaped for the same reason a compound's
+            // member name is.
+            None => write!(
+                f,
+                "{}",
+                EscapedName(self.name.as_deref().unwrap_or("filter"))
+            )?,
+        }
 
         // An unnamed identifier is a parameter of its own, and comes first.
         let write_id = well_known.is_none();
@@ -266,16 +278,23 @@ impl fmt::Display for Filter {
 /// The name of a filter this crate knows by identifier.
 ///
 /// Most built-in filters record no name of their own, which would otherwise
-/// leave a bare number in the output.
+/// leave a bare number in the output. Naming one is not a claim that this crate
+/// can run it: a message reporting a filter it cannot decode is exactly where
+/// the name earns its keep.
 fn well_known_filter_name(id: u16) -> Option<&'static str> {
     Some(match id {
-        1 => "deflate",
-        2 => "shuffle",
-        3 => "fletcher32",
+        // The filters this crate implements are matched through their
+        // constants, so the two lists cannot drift apart.
+        FILTER_DEFLATE => "deflate",
+        FILTER_SHUFFLE => "shuffle",
+        FILTER_FLETCHER32 => "fletcher32",
+        FILTER_SCALEOFFSET => "scaleoffset",
+        FILTER_LZF => "lzf",
+        // Registered identifiers with no constant here: szip and nbit have no
+        // implementation, and `FILTER_ZFP` is behind the `zfp` feature while
+        // the name is worth reporting whether or not the decoder is built.
         4 => "szip",
         5 => "nbit",
-        6 => "scaleoffset",
-        32000 => "lzf",
         32013 => "zfp",
         _ => return None,
     })
@@ -417,6 +436,31 @@ mod display_tests {
             client_data: vec![],
         };
         assert_eq!(anonymous.to_string(), "filter(id=40001)");
+    }
+
+    /// The file records this name, so it cannot reach a message unescaped.
+    #[test]
+    fn a_recorded_filter_name_cannot_carry_a_control_character() {
+        let hostile = Filter {
+            id: 40000,
+            name: Some("evil\u{1b}[31m\nname".into()),
+            is_optional: false,
+            client_data: vec![],
+        };
+        let shown = hostile.to_string();
+        assert!(!shown.chars().any(char::is_control), "{shown}");
+        assert_eq!(shown, "evil\\u{1b}[31m\\nname(id=40000)");
+    }
+
+    /// The `zfp` identifier is written as a literal, its constant being behind
+    /// a feature, so it is pinned to that constant here.
+    #[cfg(feature = "zfp")]
+    #[test]
+    fn the_zfp_name_is_reached_through_its_own_identifier() {
+        assert_eq!(
+            well_known_filter_name(crate::filter_pipeline::FILTER_ZFP),
+            Some("zfp")
+        );
     }
 
     /// The identifier is labeled, so it cannot read as one of the client-data

@@ -10,6 +10,7 @@ use core::fmt;
 
 use byteorder::{ByteOrder, LittleEndian};
 
+use crate::display::{DISPLAY_MAX_MEMBERS, Dims, EscapedName, QuotedBytes, write_elided};
 use crate::error::FormatError;
 
 /// Byte order of numeric data.
@@ -167,7 +168,7 @@ pub enum Datatype {
 
 impl fmt::Display for DatatypeByteOrder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+        f.pad(match self {
             Self::LittleEndian => "le",
             Self::BigEndian => "be",
             Self::Vax => "vax",
@@ -177,7 +178,7 @@ impl fmt::Display for DatatypeByteOrder {
 
 impl fmt::Display for StringPadding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+        f.pad(match self {
             Self::NullTerminate => "null-term",
             Self::NullPad => "null-pad",
             Self::SpacePad => "space-pad",
@@ -187,7 +188,7 @@ impl fmt::Display for StringPadding {
 
 impl fmt::Display for CharacterSet {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+        f.pad(match self {
             Self::Ascii => "ascii",
             Self::Utf8 => "utf8",
         })
@@ -196,27 +197,10 @@ impl fmt::Display for CharacterSet {
 
 impl fmt::Display for ReferenceType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+        f.pad(match self {
             Self::Object => "object_ref",
             Self::DatasetRegion => "region_ref",
         })
-    }
-}
-
-/// A dimension list, as `4` or `2x3`.
-///
-/// Shared, so every type spells a shape the same way.
-pub(crate) struct Dims<'a, T>(pub &'a [T]);
-
-impl<T: fmt::Display> fmt::Display for Dims<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (i, dim) in self.0.iter().enumerate() {
-            if i > 0 {
-                f.write_str("x")?;
-            }
-            write!(f, "{dim}")?;
-        }
-        Ok(())
     }
 }
 
@@ -309,12 +293,13 @@ impl fmt::Display for Datatype {
             }
             Self::Compound { members, .. } => {
                 f.write_str("compound{")?;
-                for (i, member) in members.iter().enumerate() {
+                for (i, member) in members.iter().take(DISPLAY_MAX_MEMBERS).enumerate() {
                     if i > 0 {
                         f.write_str(", ")?;
                     }
-                    write!(f, "{}: {}", member.name, member.datatype)?;
+                    write!(f, "{}: {}", EscapedName(&member.name), member.datatype)?;
                 }
+                write_elided(f, members.len().saturating_sub(DISPLAY_MAX_MEMBERS))?;
                 f.write_str("}")
             }
             Self::Reference { ref_type, .. } => write!(f, "{ref_type}"),
@@ -322,12 +307,13 @@ impl fmt::Display for Datatype {
                 base_type, members, ..
             } => {
                 write!(f, "enum<{base_type}>[")?;
-                for (i, member) in members.iter().enumerate() {
+                for (i, member) in members.iter().take(DISPLAY_MAX_MEMBERS).enumerate() {
                     if i > 0 {
                         f.write_str(", ")?;
                     }
-                    f.write_str(&member.name)?;
+                    write!(f, "{}", EscapedName(&member.name))?;
                 }
+                write_elided(f, members.len().saturating_sub(DISPLAY_MAX_MEMBERS))?;
                 f.write_str("]")
             }
             Self::VariableLength {
@@ -351,25 +337,6 @@ impl fmt::Display for Datatype {
                 dimensions,
             } => write!(f, "array<{base_type}, {}>", Dims(dimensions)),
         }
-    }
-}
-
-/// Arbitrary file bytes, quoted, with anything outside printable ASCII escaped.
-struct QuotedBytes<'a>(&'a [u8]);
-
-impl fmt::Display for QuotedBytes<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("\"")?;
-        for &byte in self.0 {
-            if byte == b'"' || byte == b'\\' {
-                write!(f, "\\{}", byte as char)?;
-            } else if byte.is_ascii_graphic() || byte == b' ' {
-                write!(f, "{}", byte as char)?;
-            } else {
-                write!(f, "\\x{byte:02x}")?;
-            }
-        }
-        f.write_str("\"")
     }
 }
 
@@ -2086,5 +2053,92 @@ mod display_tests {
             tag: b"a\"b\x00".to_vec(),
         };
         assert_eq!(opaque.to_string(), "opaque[4] \"a\\\"b\\x00\"");
+    }
+
+    /// A member name comes from the file by way of `from_utf8_lossy`, which
+    /// rejects nothing, so it is escaped for the same reason an opaque tag is.
+    #[test]
+    fn a_member_name_cannot_carry_a_control_character_into_a_message() {
+        let compound = Datatype::Compound {
+            size: 4,
+            members: vec![CompoundMember {
+                name: "a\nb\u{1b}[31m".into(),
+                byte_offset: 0,
+                datatype: u32_datatype(),
+            }],
+        };
+        let shown = compound.to_string();
+        assert!(!shown.chars().any(char::is_control), "{shown}");
+        assert_eq!(shown, "compound{a\\nb\\u{1b}[31m: u32}");
+
+        let enumeration = Datatype::Enumeration {
+            size: 4,
+            base_type: Box::new(u32_datatype()),
+            members: vec![EnumMember {
+                name: "red\u{0}".into(),
+                value: vec![0, 0, 0, 0],
+            }],
+        };
+        let shown = enumeration.to_string();
+        assert!(!shown.chars().any(char::is_control), "{shown}");
+        assert_eq!(shown, "enum<u32>[red\\0]");
+    }
+
+    /// The member count is an on-disk `u16`, so the list a file can ask for is
+    /// far longer than a message can carry.
+    #[test]
+    fn a_long_member_list_is_elided_and_reports_the_remainder() {
+        let members: Vec<_> = (0..DISPLAY_MAX_MEMBERS + 3)
+            .map(|i| CompoundMember {
+                name: format!("m{i}"),
+                byte_offset: (i * 4) as u64,
+                datatype: u32_datatype(),
+            })
+            .collect();
+        let shown = Datatype::Compound {
+            size: (members.len() * 4) as u32,
+            members,
+        }
+        .to_string();
+
+        assert!(shown.ends_with(", … 3 more}"), "{shown}");
+        assert!(shown.contains("m0: u32"), "{shown}");
+        assert!(
+            !shown.contains(&format!("m{DISPLAY_MAX_MEMBERS}")),
+            "{shown}"
+        );
+    }
+
+    /// The boundary: exactly the cap is written whole, with no "0 more".
+    #[test]
+    fn a_member_list_at_exactly_the_cap_is_not_elided() {
+        let members: Vec<_> = (0..DISPLAY_MAX_MEMBERS)
+            .map(|i| EnumMember {
+                name: format!("m{i}"),
+                value: vec![0, 0, 0, 0],
+            })
+            .collect();
+        let shown = Datatype::Enumeration {
+            size: 4,
+            base_type: Box::new(u32_datatype()),
+            members,
+        }
+        .to_string();
+
+        assert!(!shown.contains('…'), "{shown}");
+        assert!(
+            shown.ends_with(&format!("m{}]", DISPLAY_MAX_MEMBERS - 1)),
+            "{shown}"
+        );
+    }
+
+    fn u32_datatype() -> Datatype {
+        Datatype::FixedPoint {
+            size: 4,
+            byte_order: DatatypeByteOrder::LittleEndian,
+            signed: false,
+            bit_offset: 0,
+            bit_precision: 32,
+        }
     }
 }
