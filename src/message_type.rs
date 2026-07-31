@@ -1,5 +1,7 @@
 //! HDF5 object header message type identifiers.
 
+use core::fmt;
+
 /// Recognized HDF5 header message types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageType {
@@ -80,6 +82,38 @@ impl MessageType {
     }
 }
 
+impl fmt::Display for MessageType {
+    /// The message name as the format specification writes it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::Nil => "NIL",
+            Self::Dataspace => "dataspace",
+            Self::LinkInfo => "link info",
+            Self::Datatype => "datatype",
+            Self::FillValueOld => "fill value (old)",
+            Self::FillValue => "fill value",
+            Self::Link => "link",
+            Self::DataLayout => "data layout",
+            Self::GroupInfo => "group info",
+            Self::FilterPipeline => "filter pipeline",
+            Self::Attribute => "attribute",
+            Self::ObjectHeaderContinuation => "object header continuation",
+            Self::SymbolTable => "symbol table",
+            Self::ObjectModificationTime => "object modification time",
+            Self::BTreeKValues => "B-tree K values",
+            Self::SharedMessageTable => "shared message table",
+            Self::AttributeInfo => "attribute info",
+            Self::ObjectReferenceCount => "object reference count",
+            Self::FileSpaceInfo => "file space info",
+            Self::Unknown(id) => return write!(f, "unknown message 0x{id:04x}"),
+        };
+        // `write_str`, not `pad`: the arm above cannot honor a width without
+        // building the string first, and a type that pads on some values and
+        // not others is worse than one that never pads.
+        f.write_str(name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,5 +160,44 @@ mod tests {
         // 0x0007 is not a defined type
         let mt = MessageType::from_u16(0x0007);
         assert_eq!(mt, MessageType::Unknown(0x0007));
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod display_tests {
+    use super::*;
+
+    /// `Error::MissingMessage` quotes this, so it must read as prose rather
+    /// than as a Rust variant name.
+    #[test]
+    fn known_messages_read_as_prose() {
+        assert_eq!(MessageType::Dataspace.to_string(), "dataspace");
+        assert_eq!(MessageType::LinkInfo.to_string(), "link info");
+        assert_eq!(
+            MessageType::ObjectHeaderContinuation.to_string(),
+            "object header continuation"
+        );
+    }
+
+    #[test]
+    fn an_unknown_message_reports_its_raw_identifier() {
+        assert_eq!(
+            MessageType::Unknown(0x00ff).to_string(),
+            "unknown message 0x00ff"
+        );
+    }
+
+    /// A message this crate names must not fall through to the raw-identifier
+    /// wording, which would hide that the type is in fact recognized.
+    #[test]
+    fn every_known_message_has_a_name() {
+        for raw in 0x0000..=0x0017u16 {
+            let message = MessageType::from_u16(raw);
+            if message == MessageType::Unknown(raw) {
+                continue;
+            }
+            let shown = message.to_string();
+            assert!(!shown.starts_with("unknown message"), "{raw:#06x}: {shown}");
+        }
     }
 }

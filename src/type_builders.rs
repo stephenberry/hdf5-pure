@@ -5,6 +5,8 @@
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, string::String, string::ToString, vec, vec::Vec};
 
+use core::fmt;
+
 use crate::attribute::AttributeMessage;
 use crate::chunked_write::{ChunkMeta, ChunkOptions, ChunkProvider};
 use crate::compound::CompoundType;
@@ -13,6 +15,7 @@ use crate::dataspace::{Dataspace, DataspaceType};
 use crate::datatype::{
     CharacterSet, CompoundMember, Datatype, DatatypeByteOrder, EnumMember, StringPadding,
 };
+use crate::display::write_elided;
 use crate::error::FormatError;
 use crate::scaleoffset::ScaleOffset;
 
@@ -1265,6 +1268,80 @@ impl AttrValue {
             _ => None,
         }
     }
+
+    /// The name of the type this value holds, such as `f64` or `ascii_string[]`.
+    ///
+    /// This enum is `#[non_exhaustive]`, so a caller that reaches its own `_`
+    /// arm cannot name what it received. This names every value, including a
+    /// variant added later.
+    ///
+    /// ```
+    /// use hdf5_pure::AttrValue;
+    ///
+    /// assert_eq!(AttrValue::F64(1.5).type_name(), "f64");
+    /// assert_eq!(AttrValue::AsciiStringArray(vec![]).type_name(), "ascii_string[]");
+    /// ```
+    #[must_use]
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::F64(_) => "f64",
+            Self::F64Array(_) => "f64[]",
+            Self::I32(_) => "i32",
+            Self::I64(_) => "i64",
+            Self::I64Array(_) => "i64[]",
+            Self::U32(_) => "u32",
+            Self::U64(_) => "u64",
+            Self::U64Array(_) => "u64[]",
+            Self::String(_) => "string",
+            Self::StringArray(_) => "string[]",
+            Self::AsciiString(_) => "ascii_string",
+            Self::AsciiStringArray(_) => "ascii_string[]",
+            Self::VarLenAsciiArray(_) => "vlen_ascii_string[]",
+        }
+    }
+}
+
+/// How many array elements [`AttrValue`] writes before eliding the rest.
+///
+/// An attribute array can hold thousands of elements, and a message quoting one
+/// has to stay readable. A matter of taste.
+const ATTR_DISPLAY_MAX_ELEMENTS: usize = 8;
+
+impl fmt::Display for AttrValue {
+    /// The value, not its type: `1.5`, `"metres"`, `[1, 2, 3]`.
+    ///
+    /// Every element goes through `Debug`, which quotes a string and keeps the
+    /// point on a float, so `1.0` does not read as an integer. Long arrays are
+    /// elided; use `Debug` for the whole value.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::F64(v) => write!(f, "{v:?}"),
+            Self::I32(v) => write!(f, "{v}"),
+            Self::I64(v) => write!(f, "{v}"),
+            Self::U32(v) => write!(f, "{v}"),
+            Self::U64(v) => write!(f, "{v}"),
+            Self::String(v) | Self::AsciiString(v) => write!(f, "{v:?}"),
+            Self::F64Array(v) => write_elements(f, v),
+            Self::I64Array(v) => write_elements(f, v),
+            Self::U64Array(v) => write_elements(f, v),
+            Self::StringArray(v) | Self::AsciiStringArray(v) | Self::VarLenAsciiArray(v) => {
+                write_elements(f, v)
+            }
+        }
+    }
+}
+
+/// A bracketed element list, elided past [`ATTR_DISPLAY_MAX_ELEMENTS`].
+fn write_elements<T: fmt::Debug>(f: &mut fmt::Formatter<'_>, values: &[T]) -> fmt::Result {
+    f.write_str("[")?;
+    for (i, value) in values.iter().take(ATTR_DISPLAY_MAX_ELEMENTS).enumerate() {
+        if i > 0 {
+            f.write_str(", ")?;
+        }
+        write!(f, "{value:?}")?;
+    }
+    write_elided(f, values.len().saturating_sub(ATTR_DISPLAY_MAX_ELEMENTS))?;
+    f.write_str("]")
 }
 
 // ---- Dataset builder ----
@@ -2451,5 +2528,86 @@ mod attr_value_accessor_tests {
         );
         assert_eq!(AttrValue::F64Array(vec![]).to_f64s(), Some(vec![]));
         assert_eq!(AttrValue::String("1.5".into()).to_f64s(), None);
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod attr_value_display_tests {
+    use super::{ATTR_DISPLAY_MAX_ELEMENTS, AttrValue};
+
+    /// A caller that fell through its own `_` arm has only this name to report,
+    /// so no two variants may share one.
+    #[test]
+    fn type_name_is_distinct_for_every_variant() {
+        let values = [
+            AttrValue::F64(0.0),
+            AttrValue::F64Array(vec![]),
+            AttrValue::I32(0),
+            AttrValue::I64(0),
+            AttrValue::I64Array(vec![]),
+            AttrValue::U32(0),
+            AttrValue::U64(0),
+            AttrValue::U64Array(vec![]),
+            AttrValue::String(String::new()),
+            AttrValue::StringArray(vec![]),
+            AttrValue::AsciiString(String::new()),
+            AttrValue::AsciiStringArray(vec![]),
+            AttrValue::VarLenAsciiArray(vec![]),
+        ];
+
+        let mut names: Vec<&str> = values.iter().map(AttrValue::type_name).collect();
+        let count = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), count, "two variants share a type name");
+        assert!(!names.contains(&""));
+    }
+
+    #[test]
+    fn display_writes_the_value_not_the_variant() {
+        assert_eq!(AttrValue::F64(1.5).to_string(), "1.5");
+        assert_eq!(AttrValue::I32(-7).to_string(), "-7");
+        assert_eq!(AttrValue::U64(u64::MAX).to_string(), "18446744073709551615");
+        assert_eq!(AttrValue::String("metres".into()).to_string(), "\"metres\"");
+        assert_eq!(
+            AttrValue::I64Array(vec![1, 2, 3]).to_string(),
+            "[1, 2, 3]",
+            "no `I64Array(..)` wrapper, which is what `Debug` is for"
+        );
+        assert_eq!(
+            AttrValue::StringArray(vec!["a".into(), "b".into()]).to_string(),
+            "[\"a\", \"b\"]"
+        );
+        assert_eq!(AttrValue::F64Array(vec![]).to_string(), "[]");
+    }
+
+    /// A float keeps its point, scalar and array alike, so a whole number does
+    /// not read as an integer.
+    #[test]
+    fn display_keeps_the_point_on_a_whole_float() {
+        assert_eq!(AttrValue::F64(1.0).to_string(), "1.0");
+        assert_eq!(
+            AttrValue::F64Array(vec![1.0, 2.5]).to_string(),
+            "[1.0, 2.5]"
+        );
+    }
+
+    #[test]
+    fn display_elides_a_long_array_and_reports_the_remainder() {
+        let values: Vec<i64> = (0..ATTR_DISPLAY_MAX_ELEMENTS as i64 + 5).collect();
+        let shown = AttrValue::I64Array(values).to_string();
+
+        assert!(shown.ends_with(", … 5 more]"), "{shown}");
+        assert_eq!(shown.matches(", ").count(), ATTR_DISPLAY_MAX_ELEMENTS);
+    }
+
+    /// The boundary: exactly the cap is written whole, with no "0 more".
+    #[test]
+    fn display_does_not_elide_at_exactly_the_cap() {
+        let values: Vec<i64> = (0..ATTR_DISPLAY_MAX_ELEMENTS as i64).collect();
+        let shown = AttrValue::I64Array(values).to_string();
+
+        assert!(!shown.contains('…'), "{shown}");
+        assert!(shown.ends_with("7]"), "{shown}");
     }
 }

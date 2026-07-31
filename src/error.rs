@@ -958,7 +958,7 @@ impl fmt::Display for Error {
             Error::Io(e) => write!(f, "I/O error: {e}"),
             Error::Format(e) => write!(f, "HDF5 format error: {e}"),
             Error::NotADataset(path) => write!(f, "not a dataset: {path}"),
-            Error::MissingMessage(mt) => write!(f, "missing required message: {mt:?}"),
+            Error::MissingMessage(mt) => write!(f, "missing required message: {mt}"),
             Error::AlignmentError(msg) => write!(f, "alignment error: {msg}"),
             Error::Shape(msg) => write!(f, "array shape error: {msg}"),
             Error::SwmrUnsupported => write!(

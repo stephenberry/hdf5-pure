@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+`Display` now covers the types that describe what a file holds — `AttrValue`, `Datatype` and its component enums, `MessageType`, `Layout`, `ChunkIndex` and `Filter` — so a message quoting one reads as HDF5 rather than as a Rust value ([#242](https://github.com/stephenberry/hdf5-pure/pull/242)). `Display` is the short form and writes what departs from the ordinary, such as a big-endian order or a bit span narrower than the type, apart from a string's charset and padding, which are always named; `Debug` still carries the full record.
+
+### Added
+
+- `Display` for `AttrValue`, `Datatype`, `DatatypeByteOrder`, `StringPadding`, `CharacterSet`, `ReferenceType`, `MessageType`, `Layout`, `ChunkIndex` and `Filter`. `AttrValue` writes the value — `1.5`, `"metres"`, `[1, 2, 3]` — and elides an array past eight elements, reporting how many it dropped ([#242](https://github.com/stephenberry/hdf5-pure/pull/242)).
+- `AttrValue::type_name` gives the name of the type a value holds, such as `f64` or `ascii_string[]`. It names every variant, so a caller that matched on this `#[non_exhaustive]` enum and reached its `_` arm can still report what it received ([#242](https://github.com/stephenberry/hdf5-pure/pull/242)).
+
+### Changed
+
+- **Breaking:** an unclassified datatype reads as a summary instead of the `Debug` record of the whole `Datatype`, so `DType::Other` now carries `opaque[3] "rgb"` where it carried `Opaque { size: 3, tag: [114, 103, 98] }` ([#242](https://github.com/stephenberry/hdf5-pure/pull/242)).
+- **Breaking:** `DType::Array` writes its shape as `array<f32, 2x3>` rather than `array<f32, [2, 3]>` ([#242](https://github.com/stephenberry/hdf5-pure/pull/242)).
+- **Breaking:** a name a file records — a compound member's, an enum label's, a filter's — is escaped and truncated wherever it is written, and a member list is elided past sixteen ([#242](https://github.com/stephenberry/hdf5-pure/pull/242)).
+- **Breaking:** the `Error::MissingMessage` text names the message — `missing required message: data layout` — instead of its Rust variant, and the unrecognized-chunk-index error reports the index-type byte without a `Some`/`None` around it ([#242](https://github.com/stephenberry/hdf5-pure/pull/242)).
+
 ## [0.31.0] - 2026-07-30
 
 An attribute now reads back as the `AttrValue` variant it was written from: the dataspace kind decides scalar against array, so a one-element array stays an array, and the charset selects the `Ascii` variants, so `MATLAB_class` reads as `AsciiString` and `MATLAB_fields` as `VarLenAsciiArray` ([#239](https://github.com/stephenberry/hdf5-pure/pull/239)). That fidelity means several variants can carry one logical value, so read through the new accessors — `AttrValue::as_str`, `as_strings`, `as_i64`, `as_u64`, `as_f64`, `to_i64s`, `to_u64s`, `to_f64s` — each of which spans every variant that can hold the shape it names and applies its range rule per element ([#238](https://github.com/stephenberry/hdf5-pure/pull/238)). Two data-correctness fixes come with it: an unsigned array reads as the new `AttrValue::U64Array` rather than an `I64Array` of reinterpreted bits, so a value above `i64::MAX` no longer reads back negative, and `repack` stops re-encoding the attributes it copies — a fixed-width ASCII string used to come out UTF-8 and a variable-length array fixed-width, which is the encoding MATLAB and matio require. Separately, an attribute holding an empty string is written with a one-byte-wide string datatype instead of a zero-size one, which libhdf5 rejects while iterating an object's attributes: a single empty-string attribute made every attribute on that object unreadable to the C library ([#240](https://github.com/stephenberry/hdf5-pure/pull/240)). Widths, true variable-length strings, dataspace rank and fixed-string padding are still not recovered on read, and are tracked in [#241](https://github.com/stephenberry/hdf5-pure/issues/241). Files written by earlier versions still read.

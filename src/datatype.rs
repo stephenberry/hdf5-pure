@@ -6,8 +6,11 @@
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, string::String, vec, vec::Vec};
 
+use core::fmt;
+
 use byteorder::{ByteOrder, LittleEndian};
 
+use crate::display::{DISPLAY_MAX_MEMBERS, Dims, EscapedName, QuotedBytes, write_elided};
 use crate::error::FormatError;
 
 /// Byte order of numeric data.
@@ -153,6 +156,188 @@ pub enum Datatype {
         base_type: Box<Datatype>,
         dimensions: Vec<u32>,
     },
+}
+
+// ---- Display ----
+//
+// These types land in error messages, so `Display` is the short form: the width
+// and class, plus the fields that depart from the ordinary — a big-endian order,
+// a bit span narrower than the type. A string always names its charset and
+// padding, ordinary or not, because they decide how its bytes read. `Debug`
+// keeps the full record.
+
+impl fmt::Display for DatatypeByteOrder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(match self {
+            Self::LittleEndian => "le",
+            Self::BigEndian => "be",
+            Self::Vax => "vax",
+        })
+    }
+}
+
+impl fmt::Display for StringPadding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(match self {
+            Self::NullTerminate => "null-term",
+            Self::NullPad => "null-pad",
+            Self::SpacePad => "space-pad",
+        })
+    }
+}
+
+impl fmt::Display for CharacterSet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(match self {
+            Self::Ascii => "ascii",
+            Self::Utf8 => "utf8",
+        })
+    }
+}
+
+impl fmt::Display for ReferenceType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(match self {
+            Self::Object => "object_ref",
+            Self::DatasetRegion => "region_ref",
+        })
+    }
+}
+
+/// The width in bits of a `size`-byte type.
+///
+/// Widens first: `size` is an on-disk `u32`, so a crafted size near [`u32::MAX`]
+/// would overflow a `u32` multiply (issue #140).
+fn bit_width(size: u32) -> u64 {
+    u64::from(size) * 8
+}
+
+/// The bit span, written only when it is narrower than the whole type.
+fn write_bit_span(
+    f: &mut fmt::Formatter<'_>,
+    size: u32,
+    bit_offset: u16,
+    bit_precision: u16,
+) -> fmt::Result {
+    if bit_offset != 0 || u64::from(bit_precision) != bit_width(size) {
+        let end = u64::from(bit_offset) + u64::from(bit_precision);
+        write!(f, "(bits {bit_offset}..{end})")?;
+    }
+    Ok(())
+}
+
+/// The byte order, written only when it is not little-endian.
+fn write_byte_order(f: &mut fmt::Formatter<'_>, byte_order: &DatatypeByteOrder) -> fmt::Result {
+    if *byte_order != DatatypeByteOrder::LittleEndian {
+        write!(f, " {byte_order}")?;
+    }
+    Ok(())
+}
+
+impl fmt::Display for Datatype {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FixedPoint {
+                size,
+                byte_order,
+                signed,
+                bit_offset,
+                bit_precision,
+            } => {
+                let sign = if *signed { 'i' } else { 'u' };
+                write!(f, "{sign}{}", bit_width(*size))?;
+                write_bit_span(f, *size, *bit_offset, *bit_precision)?;
+                write_byte_order(f, byte_order)
+            }
+            Self::FloatingPoint {
+                size,
+                byte_order,
+                bit_offset,
+                bit_precision,
+                ..
+            } => {
+                write!(f, "f{}", bit_width(*size))?;
+                write_bit_span(f, *size, *bit_offset, *bit_precision)?;
+                write_byte_order(f, byte_order)
+            }
+            Self::Time {
+                size,
+                byte_order,
+                bit_precision,
+            } => {
+                write!(f, "time{}", bit_width(*size))?;
+                write_bit_span(f, *size, 0, *bit_precision)?;
+                write_byte_order(f, byte_order)
+            }
+            Self::String {
+                size,
+                padding,
+                charset,
+            } => write!(f, "string[{size}] {charset} {padding}"),
+            Self::BitField {
+                size,
+                byte_order,
+                bit_offset,
+                bit_precision,
+            } => {
+                write!(f, "bitfield{}", bit_width(*size))?;
+                write_bit_span(f, *size, *bit_offset, *bit_precision)?;
+                write_byte_order(f, byte_order)
+            }
+            Self::Opaque { size, tag } => {
+                write!(f, "opaque[{size}]")?;
+                if !tag.is_empty() {
+                    write!(f, " {}", QuotedBytes(tag))?;
+                }
+                Ok(())
+            }
+            Self::Compound { members, .. } => {
+                f.write_str("compound{")?;
+                for (i, member) in members.iter().take(DISPLAY_MAX_MEMBERS).enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}: {}", EscapedName(&member.name), member.datatype)?;
+                }
+                write_elided(f, members.len().saturating_sub(DISPLAY_MAX_MEMBERS))?;
+                f.write_str("}")
+            }
+            Self::Reference { ref_type, .. } => write!(f, "{ref_type}"),
+            Self::Enumeration {
+                base_type, members, ..
+            } => {
+                write!(f, "enum<{base_type}>[")?;
+                for (i, member) in members.iter().take(DISPLAY_MAX_MEMBERS).enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{}", EscapedName(&member.name))?;
+                }
+                write_elided(f, members.len().saturating_sub(DISPLAY_MAX_MEMBERS))?;
+                f.write_str("]")
+            }
+            Self::VariableLength {
+                is_string,
+                charset,
+                base_type,
+                ..
+            } => {
+                if *is_string {
+                    f.write_str("vlen_string")?;
+                    if let Some(charset) = charset {
+                        write!(f, " {charset}")?;
+                    }
+                    Ok(())
+                } else {
+                    write!(f, "vlen<{base_type}>")
+                }
+            }
+            Self::Array {
+                base_type,
+                dimensions,
+            } => write!(f, "array<{base_type}, {}>", Dims(dimensions)),
+        }
+    }
 }
 
 fn ensure_len(data: &[u8], offset: usize, needed: usize) -> Result<(), FormatError> {
@@ -1743,5 +1928,241 @@ mod tests {
             dimensions: vec![3, 4],
         };
         assert_eq!(dt.type_size(), 48);
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod display_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_numeric_types_read_as_their_rust_names() {
+        let int = Datatype::FixedPoint {
+            size: 4,
+            byte_order: DatatypeByteOrder::LittleEndian,
+            signed: true,
+            bit_offset: 0,
+            bit_precision: 32,
+        };
+        assert_eq!(int.to_string(), "i32");
+
+        let float = Datatype::FloatingPoint {
+            size: 8,
+            byte_order: DatatypeByteOrder::LittleEndian,
+            bit_offset: 0,
+            bit_precision: 64,
+            exponent_location: 52,
+            exponent_size: 11,
+            mantissa_location: 0,
+            mantissa_size: 52,
+            exponent_bias: 1023,
+        };
+        assert_eq!(float.to_string(), "f64");
+    }
+
+    /// Only what departs from the ordinary is written, since that is what the
+    /// reader of the message is looking for.
+    #[test]
+    fn unusual_fields_are_written_and_ordinary_ones_are_not() {
+        let big_endian = Datatype::FixedPoint {
+            size: 2,
+            byte_order: DatatypeByteOrder::BigEndian,
+            signed: false,
+            bit_offset: 0,
+            bit_precision: 16,
+        };
+        assert_eq!(big_endian.to_string(), "u16 be");
+
+        let narrow = Datatype::FixedPoint {
+            size: 4,
+            byte_order: DatatypeByteOrder::LittleEndian,
+            signed: true,
+            bit_offset: 0,
+            bit_precision: 24,
+        };
+        assert_eq!(narrow.to_string(), "i32(bits 0..24)");
+    }
+
+    #[test]
+    fn nested_types_recurse_through_their_members() {
+        let compound = Datatype::Compound {
+            size: 12,
+            members: vec![
+                CompoundMember {
+                    name: "x".into(),
+                    byte_offset: 0,
+                    datatype: Datatype::FloatingPoint {
+                        size: 4,
+                        byte_order: DatatypeByteOrder::LittleEndian,
+                        bit_offset: 0,
+                        bit_precision: 32,
+                        exponent_location: 23,
+                        exponent_size: 8,
+                        mantissa_location: 0,
+                        mantissa_size: 23,
+                        exponent_bias: 127,
+                    },
+                },
+                CompoundMember {
+                    name: "n".into(),
+                    byte_offset: 4,
+                    datatype: Datatype::FixedPoint {
+                        size: 8,
+                        byte_order: DatatypeByteOrder::LittleEndian,
+                        signed: true,
+                        bit_offset: 0,
+                        bit_precision: 64,
+                    },
+                },
+            ],
+        };
+        assert_eq!(compound.to_string(), "compound{x: f32, n: i64}");
+
+        let array = Datatype::Array {
+            base_type: Box::new(Datatype::FixedPoint {
+                size: 1,
+                byte_order: DatatypeByteOrder::LittleEndian,
+                signed: false,
+                bit_offset: 0,
+                bit_precision: 8,
+            }),
+            dimensions: vec![2, 3],
+        };
+        assert_eq!(
+            array.to_string(),
+            "array<u8, 2x3>",
+            "the shape is spelled `2x3`, never a `Debug` slice"
+        );
+    }
+
+    /// The leaf enums format through `Formatter::pad`, so a caller lining these
+    /// up in a column gets the width it asked for rather than having it
+    /// silently dropped.
+    #[test]
+    fn a_leaf_enum_honors_the_width_it_is_given() {
+        assert_eq!(format!("{:>8}", CharacterSet::Ascii), "   ascii");
+        assert_eq!(format!("{:<8}|", DatatypeByteOrder::BigEndian), "be      |");
+        assert_eq!(format!("{}", StringPadding::NullPad), "null-pad");
+    }
+
+    #[test]
+    fn a_string_carries_its_width_charset_and_padding() {
+        let string = Datatype::String {
+            size: 16,
+            padding: StringPadding::NullPad,
+            charset: CharacterSet::Utf8,
+        };
+        assert_eq!(string.to_string(), "string[16] utf8 null-pad");
+    }
+
+    /// The tag is arbitrary file bytes, so it cannot reach a message unescaped.
+    #[test]
+    fn an_opaque_tag_is_quoted_and_escaped() {
+        let opaque = Datatype::Opaque {
+            size: 4,
+            tag: b"a\"b\x00".to_vec(),
+        };
+        assert_eq!(opaque.to_string(), "opaque[4] \"a\\\"b\\x00\"");
+    }
+
+    /// A member name comes from the file by way of `from_utf8_lossy`, which
+    /// rejects nothing, so it is escaped for the same reason an opaque tag is.
+    #[test]
+    fn a_member_name_cannot_carry_a_control_character_into_a_message() {
+        let compound = Datatype::Compound {
+            size: 4,
+            members: vec![CompoundMember {
+                name: "a\nb\u{1b}[31m".into(),
+                byte_offset: 0,
+                datatype: u32_datatype(),
+            }],
+        };
+        let shown = compound.to_string();
+        assert!(!shown.chars().any(char::is_control), "{shown}");
+        assert_eq!(shown, "compound{a\\nb\\u{1b}[31m: u32}");
+
+        let enumeration = Datatype::Enumeration {
+            size: 4,
+            base_type: Box::new(u32_datatype()),
+            members: vec![EnumMember {
+                name: "red\u{0}".into(),
+                value: vec![0, 0, 0, 0],
+            }],
+        };
+        let shown = enumeration.to_string();
+        assert!(!shown.chars().any(char::is_control), "{shown}");
+        assert_eq!(shown, "enum<u32>[red\\0]");
+    }
+
+    /// The member count is an on-disk `u16`, so the list a file can ask for is
+    /// far longer than a message can carry. Both member-bearing variants elide,
+    /// so both are checked.
+    #[test]
+    fn a_long_member_list_is_elided_and_reports_the_remainder() {
+        let over_cap = DISPLAY_MAX_MEMBERS + 3;
+
+        let compound = Datatype::Compound {
+            size: (over_cap * 4) as u32,
+            members: (0..over_cap)
+                .map(|i| CompoundMember {
+                    name: format!("m{i}"),
+                    byte_offset: (i * 4) as u64,
+                    datatype: u32_datatype(),
+                })
+                .collect(),
+        };
+        let enumeration = Datatype::Enumeration {
+            size: 4,
+            base_type: Box::new(u32_datatype()),
+            members: (0..over_cap)
+                .map(|i| EnumMember {
+                    name: format!("m{i}"),
+                    value: vec![0, 0, 0, 0],
+                })
+                .collect(),
+        };
+
+        for (datatype, close) in [(compound, "}"), (enumeration, "]")] {
+            let shown = datatype.to_string();
+            assert!(shown.ends_with(&format!(", … 3 more{close}")), "{shown}");
+            assert!(shown.contains("m0"), "{shown}");
+            assert!(
+                !shown.contains(&format!("m{DISPLAY_MAX_MEMBERS}")),
+                "{shown}"
+            );
+        }
+    }
+
+    /// The boundary: exactly the cap is written whole, with no "0 more".
+    #[test]
+    fn a_member_list_at_exactly_the_cap_is_not_elided() {
+        let members: Vec<_> = (0..DISPLAY_MAX_MEMBERS)
+            .map(|i| EnumMember {
+                name: format!("m{i}"),
+                value: vec![0, 0, 0, 0],
+            })
+            .collect();
+        let shown = Datatype::Enumeration {
+            size: 4,
+            base_type: Box::new(u32_datatype()),
+            members,
+        }
+        .to_string();
+
+        assert!(!shown.contains('…'), "{shown}");
+        assert!(
+            shown.ends_with(&format!("m{}]", DISPLAY_MAX_MEMBERS - 1)),
+            "{shown}"
+        );
+    }
+
+    fn u32_datatype() -> Datatype {
+        Datatype::FixedPoint {
+            size: 4,
+            byte_order: DatatypeByteOrder::LittleEndian,
+            signed: false,
+            bit_offset: 0,
+            bit_precision: 32,
+        }
     }
 }

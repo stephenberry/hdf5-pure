@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 
 use crate::convert::TryToUsize;
+use crate::display::EscapedName;
 use crate::error::FormatError;
 use crate::file_writer::AttrValue;
 use crate::mat::class::MatClass;
@@ -776,17 +777,23 @@ fn validate_complex_dtype(dtype: &DType, tag: ComplexTag) -> Result<(), MatError
         )));
     };
     if first != "real" || second != "imag" {
+        // The file names these members, so they are escaped for the same reason
+        // `DType` escapes them: `{member}` on the next message already is, and
+        // a raw name beside it could carry a newline into the same string.
         return Err(MatError::Custom(format!(
-            "complex {} compound is ordered {{{first}, {second}}}, expected {{real, imag}}",
-            tag.class().as_str()
+            "complex {} compound is ordered {{{}, {}}}, expected {{real, imag}}",
+            tag.class().as_str(),
+            EscapedName(first),
+            EscapedName(second)
         )));
     }
     for (name, member) in [(first, first_ty), (second, second_ty)] {
         if complex_component_tag(member) != Some(tag) {
             return Err(MatError::Custom(format!(
-                "complex {} dataset stores its {name} component as {member}, \
+                "complex {} dataset stores its {} component as {member}, \
                  which is a different class than MATLAB_class claims",
-                tag.class().as_str()
+                tag.class().as_str(),
+                EscapedName(name)
             )));
         }
     }

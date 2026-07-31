@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use crate::display::{DISPLAY_MAX_MEMBERS, Dims, EscapedName, write_elided};
+
 pub use crate::file_writer::AttrValue;
 
 /// Simplified datatype enum for the high-level API.
@@ -53,16 +55,27 @@ impl fmt::Display for DType {
             DType::ObjectReference => write!(f, "object_ref"),
             DType::Compound(fields) => {
                 write!(f, "compound{{")?;
-                for (i, (name, dt)) in fields.iter().enumerate() {
+                for (i, (name, dt)) in fields.iter().take(DISPLAY_MAX_MEMBERS).enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{name}: {dt}")?;
+                    write!(f, "{}: {dt}", EscapedName(name))?;
                 }
+                write_elided(f, fields.len().saturating_sub(DISPLAY_MAX_MEMBERS))?;
                 write!(f, "}}")
             }
-            DType::Enum(names) => write!(f, "enum[{}]", names.join(", ")),
-            DType::Array(base, dims) => write!(f, "array<{base}, {dims:?}>"),
+            DType::Enum(names) => {
+                write!(f, "enum[")?;
+                for (i, name) in names.iter().take(DISPLAY_MAX_MEMBERS).enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{}", EscapedName(name))?;
+                }
+                write_elided(f, names.len().saturating_sub(DISPLAY_MAX_MEMBERS))?;
+                write!(f, "]")
+            }
+            DType::Array(base, dims) => write!(f, "array<{base}, {}>", Dims(dims)),
             DType::Other(desc) => write!(f, "other({desc})"),
         }
     }
@@ -147,7 +160,10 @@ pub(crate) fn classify_datatype(dt: &crate::datatype::Datatype) -> DType {
             ref_type: crate::datatype::ReferenceType::Object,
             ..
         } => DType::ObjectReference,
-        _ => DType::Other(format!("{dt:?}")),
+        // The `Datatype` summary, not its `Debug`: this string is what a caller
+        // sees for an unclassified type, and the full record is unreadable in a
+        // message.
+        _ => DType::Other(dt.to_string()),
     }
 }
 
@@ -622,5 +638,150 @@ mod tests {
                 "attribute {name}"
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod display_tests {
+    use super::*;
+    use crate::datatype::{CharacterSet, Datatype, DatatypeByteOrder, StringPadding};
+
+    #[test]
+    fn an_array_shape_is_not_a_debug_slice() {
+        let dtype = DType::Array(Box::new(DType::F32), vec![2, 3]);
+        assert_eq!(dtype.to_string(), "array<f32, 2x3>");
+        assert_eq!(
+            DType::Array(Box::new(DType::U8), vec![4]).to_string(),
+            "array<u8, 4>"
+        );
+    }
+
+    /// An unclassified datatype carries a summary. The whole `Debug` record of
+    /// the `Datatype` is unreadable in the message that quotes it.
+    #[test]
+    fn an_unclassified_type_carries_a_summary_not_a_debug_record() {
+        let vax = Datatype::FloatingPoint {
+            size: 4,
+            byte_order: DatatypeByteOrder::Vax,
+            bit_offset: 0,
+            bit_precision: 32,
+            exponent_location: 23,
+            exponent_size: 8,
+            mantissa_location: 0,
+            mantissa_size: 23,
+            exponent_bias: 127,
+        };
+        // Classification keys off size alone, so this stays `F32`; the point is
+        // the fallback below.
+        assert_eq!(classify_datatype(&vax), DType::F32);
+
+        let time = Datatype::Time {
+            size: 4,
+            byte_order: DatatypeByteOrder::LittleEndian,
+            bit_precision: 32,
+        };
+        let classified = classify_datatype(&time);
+        assert_eq!(classified, DType::Other("time32".into()));
+        assert_eq!(classified.to_string(), "other(time32)");
+
+        let opaque = Datatype::Opaque {
+            size: 3,
+            tag: b"rgb".to_vec(),
+        };
+        assert_eq!(
+            classify_datatype(&opaque).to_string(),
+            "other(opaque[3] \"rgb\")",
+            "not `other(Opaque {{ size: 3, tag: [114, 103, 98] }})`"
+        );
+    }
+
+    /// The curated view quotes the same file-recorded names as the detailed
+    /// one, so it escapes them by the same rule — in both member-bearing
+    /// variants, not just whichever one a test happened to reach for.
+    #[test]
+    fn a_curated_member_name_is_escaped_in_either_variant() {
+        let compound = DType::Compound(vec![("a\nb".into(), DType::I32)]).to_string();
+        assert!(!compound.chars().any(char::is_control), "{compound}");
+        assert_eq!(compound, "compound{a\\nb: i32}");
+
+        let enumeration = DType::Enum(vec!["a\u{1b}[31mb".into()]).to_string();
+        assert!(!enumeration.chars().any(char::is_control), "{enumeration}");
+        assert_eq!(enumeration, "enum[a\\u{1b}[31mb]");
+    }
+
+    /// Likewise for the cap: a file can declare far more members than a message
+    /// can carry, in either variant.
+    #[test]
+    fn a_curated_member_list_is_elided_in_either_variant() {
+        let over_cap = DISPLAY_MAX_MEMBERS + 2;
+        let names: Vec<String> = (0..over_cap).map(|i| format!("m{i}")).collect();
+
+        let compound = DType::Compound(
+            names
+                .iter()
+                .map(|name| (name.clone(), DType::I32))
+                .collect(),
+        );
+        let enumeration = DType::Enum(names);
+
+        for (dtype, close) in [(compound, "}"), (enumeration, "]")] {
+            let shown = dtype.to_string();
+            assert!(shown.ends_with(&format!(", … 2 more{close}")), "{shown}");
+            assert!(
+                !shown.contains(&format!("m{DISPLAY_MAX_MEMBERS}")),
+                "{shown}"
+            );
+        }
+    }
+
+    /// The two views describe the same file, so a type that classifies to a
+    /// named [`DType`] is spelled the same way by both. Where they differ, the
+    /// `Datatype` is the longer of the two, never a different word: it carries
+    /// the on-disk detail `DType` drops.
+    #[test]
+    fn dtype_and_datatype_agree_on_the_names_they_share() {
+        let identical = [
+            Datatype::FixedPoint {
+                size: 4,
+                byte_order: DatatypeByteOrder::LittleEndian,
+                signed: true,
+                bit_offset: 0,
+                bit_precision: 32,
+            },
+            Datatype::FloatingPoint {
+                size: 4,
+                byte_order: DatatypeByteOrder::LittleEndian,
+                bit_offset: 0,
+                bit_precision: 32,
+                exponent_location: 23,
+                exponent_size: 8,
+                mantissa_location: 0,
+                mantissa_size: 23,
+                exponent_bias: 127,
+            },
+        ];
+        for datatype in identical {
+            assert_eq!(
+                classify_datatype(&datatype).to_string(),
+                datatype.to_string()
+            );
+        }
+
+        // A fixed-width string is the case where they differ: `DType` names the
+        // class, `Datatype` adds the width, charset and padding that decide how
+        // the bytes read.
+        let string = Datatype::String {
+            size: 8,
+            padding: StringPadding::NullPad,
+            charset: CharacterSet::Ascii,
+        };
+        assert_eq!(classify_datatype(&string).to_string(), "string");
+        assert_eq!(string.to_string(), "string[8] ascii null-pad");
+        assert!(
+            string
+                .to_string()
+                .starts_with(&classify_datatype(&string).to_string()),
+            "the longer spelling still opens with the shorter one"
+        );
     }
 }
