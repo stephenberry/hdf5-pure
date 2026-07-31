@@ -352,7 +352,7 @@ fn read_enum_indices(group: &Group, depth: usize) -> Result<Vec<usize>, MatError
     let dtype = ds.dtype().map_err(MatError::Hdf5)?;
     if dtype != DType::U32 {
         return Err(MatError::Custom(format!(
-            "enum ValueIndices has datatype {dtype:?}; expected uint32"
+            "enum ValueIndices has datatype {dtype}; expected uint32"
         )));
     }
     // Reuse the numeric read path so the column-major HDF5 buffer is transposed

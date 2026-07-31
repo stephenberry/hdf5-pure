@@ -416,24 +416,27 @@ mod tests {
             let classified = classify_datatype(dt);
             assert_eq!(classified, DType::Other(Box::new(dt.clone())));
 
-            let shown = classified.to_string();
-            assert!(
-                shown.starts_with(&format!("other({prefix}{bits}")),
-                "{shown}"
+            // Exact, not a prefix: the right width is a prefix of every wider
+            // wrong one, so `starts_with` would pass a `size * 80`.
+            assert_eq!(
+                classified.to_string(),
+                format!("other({prefix}{bits}(bits 0..0))")
             );
         }
     }
 
-    /// Why `Other` carries the type rather than a rendering of it: a member
-    /// reached this way has no [`Dataset::datatype`](crate::Dataset::datatype)
+    /// Why `Other` carries the type rather than a rendering of it: a type
+    /// reached by recursion has no [`Dataset::datatype`](crate::Dataset::datatype)
     /// to fall back on, so what lands here is the caller's only view of it
-    /// (issue #243).
+    /// (issue #243). Both recursion sites, since either can nest one.
     #[test]
-    fn an_unclassified_member_reaches_the_caller_whole() {
+    fn an_unclassified_type_reaches_the_caller_whole_through_either_recursion() {
         let opaque = Datatype::Opaque {
             size: 3,
             tag: b"rgb".to_vec(),
         };
+        let carried = DType::Other(Box::new(opaque.clone()));
+
         let compound = Datatype::Compound {
             size: 3,
             members: vec![crate::datatype::CompoundMember {
@@ -442,13 +445,18 @@ mod tests {
                 datatype: opaque.clone(),
             }],
         };
-
         let DType::Compound(fields) = classify_datatype(&compound) else {
             panic!("a compound classifies as one");
         };
+        assert_eq!(fields, vec![("pixel".to_string(), carried.clone())]);
+
+        let array = Datatype::Array {
+            base_type: Box::new(opaque),
+            dimensions: vec![2, 3],
+        };
         assert_eq!(
-            fields,
-            vec![("pixel".to_string(), DType::Other(Box::new(opaque)))]
+            classify_datatype(&array),
+            DType::Array(Box::new(carried), vec![2, 3])
         );
     }
 
