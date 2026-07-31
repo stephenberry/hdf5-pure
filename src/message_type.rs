@@ -83,8 +83,7 @@ impl MessageType {
 }
 
 impl fmt::Display for MessageType {
-    /// The message name as the format specification writes it, and the raw
-    /// identifier for a type this crate does not recognize.
+    /// The message name as the format specification writes it.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
             Self::Nil => "NIL",

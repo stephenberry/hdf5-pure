@@ -159,11 +159,9 @@ pub enum Datatype {
 
 // ---- Display ----
 //
-// These types name what is in a file, so they land in error messages and in
-// whatever a caller prints about a dataset. `Display` is the short form a
-// reader of such a message wants: the width and class, plus only the fields
-// that depart from the ordinary — a big-endian order, a bit span narrower than
-// the type. `Debug` stays the full record.
+// These types land in error messages, so `Display` is the short form: the width
+// and class, plus only the fields that depart from the ordinary. `Debug` keeps
+// the full record.
 
 impl fmt::Display for DatatypeByteOrder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -205,7 +203,7 @@ impl fmt::Display for ReferenceType {
 
 /// A dimension list, as `4` or `2x3`.
 ///
-/// Shared by every type that writes a shape, so they all spell it the same way.
+/// Shared, so every type spells a shape the same way.
 pub(crate) struct Dims<'a, T>(pub &'a [T]);
 
 impl<T: fmt::Display> fmt::Display for Dims<'_, T> {
@@ -222,7 +220,7 @@ impl<T: fmt::Display> fmt::Display for Dims<'_, T> {
 
 /// The width in bits of a `size`-byte type.
 ///
-/// Widens first: `size` is an on-disk `u32`, so an odd size near [`u32::MAX`]
+/// Widens first: `size` is an on-disk `u32`, so a crafted size near [`u32::MAX`]
 /// would overflow a `u32` multiply (issue #140).
 fn bit_width(size: u32) -> u64 {
     u64::from(size) * 8
@@ -303,7 +301,7 @@ impl fmt::Display for Datatype {
             Self::Opaque { size, tag } => {
                 write!(f, "opaque[{size}]")?;
                 if !tag.is_empty() {
-                    write!(f, " {}", DisplayAscii(tag))?;
+                    write!(f, " {}", QuotedBytes(tag))?;
                 }
                 Ok(())
             }
@@ -354,12 +352,10 @@ impl fmt::Display for Datatype {
     }
 }
 
-/// A quoted opaque tag, with any byte outside printable ASCII escaped.
-///
-/// The tag is arbitrary file bytes, so it cannot go into a message unescaped.
-struct DisplayAscii<'a>(&'a [u8]);
+/// Arbitrary file bytes, quoted, with anything outside printable ASCII escaped.
+struct QuotedBytes<'a>(&'a [u8]);
 
-impl fmt::Display for DisplayAscii<'_> {
+impl fmt::Display for QuotedBytes<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("\"")?;
         for &byte in self.0 {
@@ -1995,9 +1991,8 @@ mod display_tests {
         assert_eq!(float.to_string(), "f64");
     }
 
-    /// Only what departs from the ordinary is written. A big-endian order or a
-    /// bit span narrower than the type is the reason someone is reading the
-    /// message at all.
+    /// Only what departs from the ordinary is written, since that is what the
+    /// reader of the message is looking for.
     #[test]
     fn unusual_fields_are_written_and_ordinary_ones_are_not() {
         let big_endian = Datatype::FixedPoint {

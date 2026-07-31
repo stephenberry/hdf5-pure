@@ -645,8 +645,8 @@ mod display_tests {
         );
     }
 
-    /// An unclassified datatype used to carry the whole `Debug` record of the
-    /// `Datatype`, which is unreadable in the message that quotes it.
+    /// An unclassified datatype carries a summary. The whole `Debug` record of
+    /// the `Datatype` is unreadable in the message that quotes it.
     #[test]
     fn an_unclassified_type_carries_a_summary_not_a_debug_record() {
         let vax = Datatype::FloatingPoint {

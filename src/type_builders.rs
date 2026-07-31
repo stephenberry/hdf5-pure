@@ -1270,13 +1270,9 @@ impl AttrValue {
 
     /// The name of the type this value holds, such as `f64` or `ascii_string[]`.
     ///
-    /// This enum is `#[non_exhaustive]`, so a caller that reaches its `_` arm
-    /// holds a value it has no variant to name. This names every value,
-    /// including one written by a later version of this crate, which is what a
-    /// message about an unhandled attribute needs.
-    ///
-    /// The charset and the scalar/array distinction are both kept, because they
-    /// are what separates the variants a caller had to fall through on.
+    /// This enum is `#[non_exhaustive]`, so a caller that reaches its own `_`
+    /// arm cannot name what it received. This names every value, including a
+    /// variant added later.
     ///
     /// ```
     /// use hdf5_pure::AttrValue;
@@ -1304,54 +1300,47 @@ impl AttrValue {
     }
 }
 
-/// The number of array elements [`AttrValue`]'s [`Display`](fmt::Display) writes
-/// before it elides the rest.
+/// How many array elements [`AttrValue`] writes before eliding the rest.
 ///
-/// An attribute array can hold thousands of elements. A message quoting one has
-/// to stay readable, and the count that follows the elision still reports the
-/// length.
+/// An attribute array can hold thousands of elements, and a message quoting one
+/// has to stay readable. A matter of taste.
 const ATTR_DISPLAY_MAX_ELEMENTS: usize = 8;
 
 impl fmt::Display for AttrValue {
     /// The value, not its type: `1.5`, `"metres"`, `[1, 2, 3]`.
     ///
-    /// Long arrays are cut off after [`ATTR_DISPLAY_MAX_ELEMENTS`] elements.
-    /// Use [`AttrValue::type_name`] for the type, and `Debug` for the whole
-    /// value.
+    /// Every element goes through `Debug`, which quotes a string and keeps the
+    /// point on a float, so `1.0` does not read as an integer. Long arrays are
+    /// elided; use `Debug` for the whole value.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::F64(v) => write!(f, "{v}"),
+            Self::F64(v) => write!(f, "{v:?}"),
             Self::I32(v) => write!(f, "{v}"),
             Self::I64(v) => write!(f, "{v}"),
             Self::U32(v) => write!(f, "{v}"),
             Self::U64(v) => write!(f, "{v}"),
             Self::String(v) | Self::AsciiString(v) => write!(f, "{v:?}"),
-            Self::F64Array(v) => write_elements(f, v, |f, v| write!(f, "{v}")),
-            Self::I64Array(v) => write_elements(f, v, |f, v| write!(f, "{v}")),
-            Self::U64Array(v) => write_elements(f, v, |f, v| write!(f, "{v}")),
+            Self::F64Array(v) => write_elements(f, v),
+            Self::I64Array(v) => write_elements(f, v),
+            Self::U64Array(v) => write_elements(f, v),
             Self::StringArray(v) | Self::AsciiStringArray(v) | Self::VarLenAsciiArray(v) => {
-                write_elements(f, v, |f, v| write!(f, "{v:?}"))
+                write_elements(f, v)
             }
         }
     }
 }
 
 /// A bracketed element list, elided past [`ATTR_DISPLAY_MAX_ELEMENTS`].
-fn write_elements<T>(
-    f: &mut fmt::Formatter<'_>,
-    values: &[T],
-    write_one: impl Fn(&mut fmt::Formatter<'_>, &T) -> fmt::Result,
-) -> fmt::Result {
+fn write_elements<T: fmt::Debug>(f: &mut fmt::Formatter<'_>, values: &[T]) -> fmt::Result {
     f.write_str("[")?;
     for (i, value) in values.iter().take(ATTR_DISPLAY_MAX_ELEMENTS).enumerate() {
         if i > 0 {
             f.write_str(", ")?;
         }
-        write_one(f, value)?;
+        write!(f, "{value:?}")?;
     }
-    if let Some(elided) = values.len().checked_sub(ATTR_DISPLAY_MAX_ELEMENTS)
-        && elided > 0
-    {
+    let elided = values.len().saturating_sub(ATTR_DISPLAY_MAX_ELEMENTS);
+    if elided > 0 {
         write!(f, ", … {elided} more")?;
     }
     f.write_str("]")
@@ -2548,9 +2537,8 @@ mod attr_value_accessor_tests {
 mod attr_value_display_tests {
     use super::{ATTR_DISPLAY_MAX_ELEMENTS, AttrValue};
 
-    /// Every variant names itself. A caller that fell through its own `_` arm
-    /// has only this to report, so a variant added later must not land on a
-    /// shared or empty name.
+    /// A caller that fell through its own `_` arm has only this name to report,
+    /// so no two variants may share one.
     #[test]
     fn type_name_is_distinct_for_every_variant() {
         let values = [
@@ -2595,8 +2583,17 @@ mod attr_value_display_tests {
         assert_eq!(AttrValue::F64Array(vec![]).to_string(), "[]");
     }
 
-    /// An attribute array can hold thousands of elements, and a message
-    /// quoting one has to stay readable.
+    /// A float keeps its point, scalar and array alike, so a whole number does
+    /// not read as an integer.
+    #[test]
+    fn display_keeps_the_point_on_a_whole_float() {
+        assert_eq!(AttrValue::F64(1.0).to_string(), "1.0");
+        assert_eq!(
+            AttrValue::F64Array(vec![1.0, 2.5]).to_string(),
+            "[1.0, 2.5]"
+        );
+    }
+
     #[test]
     fn display_elides_a_long_array_and_reports_the_remainder() {
         let values: Vec<i64> = (0..ATTR_DISPLAY_MAX_ELEMENTS as i64 + 5).collect();

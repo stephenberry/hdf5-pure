@@ -176,9 +176,9 @@ pub struct Chunk {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Filter {
-    /// The registered HDF5 filter identifier — e.g. 1 = deflate, 2 = shuffle,
-    /// 3 = fletcher32, 6 = scale-offset, 32000 = lzf, 32013 = zfp. The same
-    /// numbering returned by [`Dataset::filters`](crate::Dataset::filters).
+    /// The registered HDF5 filter identifier, the same numbering returned by
+    /// [`Dataset::filters`](crate::Dataset::filters). `Display` names the ones
+    /// this crate knows, such as 1 = deflate or 32000 = lzf.
     pub id: u16,
     /// The filter's recorded name, when the file stores one. Absent for most
     /// built-in filters, which are identified by [`id`](Self::id) alone.
@@ -195,8 +195,8 @@ pub struct Filter {
 
 // ---- Display ----
 //
-// This is the introspection surface a caller prints to describe a dataset, so
-// `Display` is the one-line form. `Debug` stays the full record.
+// A caller prints these to describe a dataset, so `Display` is the one-line
+// form. `Debug` keeps the full record.
 
 impl fmt::Display for Layout {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -232,8 +232,7 @@ impl fmt::Display for ChunkIndex {
 }
 
 impl fmt::Display for Filter {
-    /// The registered name of the filter, falling back to its identifier, and
-    /// the client data when the filter carries any.
+    /// The filter's name and its client data, as `deflate(6)`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match well_known_filter_name(self.id) {
             Some(name) => f.write_str(name)?,
@@ -261,8 +260,8 @@ impl fmt::Display for Filter {
 
 /// The name of a filter this crate knows by identifier.
 ///
-/// The file may record a name of its own, but most built-in filters store none,
-/// which would otherwise leave a bare number in the output.
+/// Most built-in filters record no name of their own, which would otherwise
+/// leave a bare number in the output.
 fn well_known_filter_name(id: u16) -> Option<&'static str> {
     Some(match id {
         1 => "deflate",
@@ -415,8 +414,8 @@ mod display_tests {
         assert_eq!(anonymous.to_string(), "filter 40001");
     }
 
-    /// The error used to print `Some(9)` and `None` from a `Debug` of the
-    /// index-type byte.
+    /// The message reports the index-type byte itself, not the `Option` that
+    /// carries it.
     #[test]
     fn an_unrecognized_index_error_has_no_rust_option_in_it() {
         let with_type = ChunkIndex::from_layout(4, Some(9)).unwrap_err().to_string();
