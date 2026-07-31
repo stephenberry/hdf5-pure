@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use crate::datatype::Datatype;
 use crate::display::{DISPLAY_MAX_MEMBERS, Dims, EscapedName, write_elided};
 
 pub use crate::file_writer::AttrValue;
@@ -34,7 +35,13 @@ pub enum DType {
     VariableLengthString,
     /// HDF5 object reference (8-byte address).
     ObjectReference,
-    Other(std::string::String),
+    /// A type this curated view has no name for, carrying the type itself.
+    ///
+    /// Reached through a compound field or an array base as well as at the top
+    /// level, where [`Dataset::datatype`](crate::Dataset::datatype) is not an
+    /// escape hatch, so what lands here has to be enough to work with on its
+    /// own.
+    Other(Box<Datatype>),
 }
 
 impl fmt::Display for DType {
@@ -76,23 +83,16 @@ impl fmt::Display for DType {
                 write!(f, "]")
             }
             DType::Array(base, dims) => write!(f, "array<{base}, {}>", Dims(dims)),
-            DType::Other(desc) => write!(f, "other({desc})"),
+            DType::Other(dt) => write!(f, "other({dt})"),
         }
     }
 }
 
 /// Convert a low-level `Datatype` to a simplified `DType`.
-pub(crate) fn classify_datatype(dt: &crate::datatype::Datatype) -> DType {
-    use crate::datatype::Datatype;
-
+pub(crate) fn classify_datatype(dt: &Datatype) -> DType {
     match dt {
         Datatype::FloatingPoint { size: 4, .. } => DType::F32,
         Datatype::FloatingPoint { size: 8, .. } => DType::F64,
-        // Widen before `* 8`: `size` is an on-disk `u32`, so a crafted odd size
-        // near `u32::MAX` would overflow a `u32` bit-width computation (issue #140).
-        Datatype::FloatingPoint { size, .. } => {
-            DType::Other(format!("float{}", u64::from(*size) * 8))
-        }
         Datatype::FixedPoint {
             size: 1,
             signed: true,
@@ -133,10 +133,6 @@ pub(crate) fn classify_datatype(dt: &crate::datatype::Datatype) -> DType {
             signed: false,
             ..
         } => DType::U64,
-        Datatype::FixedPoint { size, signed, .. } => {
-            let prefix = if *signed { "i" } else { "u" };
-            DType::Other(format!("{prefix}{}", u64::from(*size) * 8))
-        }
         Datatype::String { .. } => DType::String,
         Datatype::VariableLength {
             is_string: true, ..
@@ -160,10 +156,10 @@ pub(crate) fn classify_datatype(dt: &crate::datatype::Datatype) -> DType {
             ref_type: crate::datatype::ReferenceType::Object,
             ..
         } => DType::ObjectReference,
-        // The `Datatype` summary, not its `Debug`: this string is what a caller
-        // sees for an unclassified type, and the full record is unreadable in a
-        // message.
-        _ => DType::Other(dt.to_string()),
+        // The type itself, not a rendering of it: this is the only view a
+        // caller gets of a member or an array base that the curated set has no
+        // name for.
+        _ => DType::Other(Box::new(dt.clone())),
     }
 }
 
@@ -390,11 +386,12 @@ mod tests {
     use super::*;
     use crate::datatype::{Datatype, DatatypeByteOrder};
 
+    /// A width the curated set has no name for reaches the caller as the type
+    /// itself, and writing it must not overflow the `size * 8` bit-width
+    /// computation (issue #140) — `size` is an on-disk `u32`, so a crafted one
+    /// near [`u32::MAX`] is what a file can hold.
     #[test]
-    fn classify_unusual_size_does_not_overflow() {
-        // A crafted datatype `size` near `u32::MAX` must not overflow the
-        // `size * 8` bit-width computation used for the `Other(..)` label
-        // (issue #140); the value is widened to `u64` first.
+    fn an_unusual_size_arrives_whole_and_writes_its_width() {
         let int = Datatype::FixedPoint {
             size: u32::MAX,
             byte_order: DatatypeByteOrder::LittleEndian,
@@ -402,11 +399,6 @@ mod tests {
             bit_offset: 0,
             bit_precision: 0,
         };
-        assert_eq!(
-            classify_datatype(&int),
-            DType::Other(format!("i{}", u64::from(u32::MAX) * 8))
-        );
-
         let float = Datatype::FloatingPoint {
             size: u32::MAX,
             byte_order: DatatypeByteOrder::LittleEndian,
@@ -418,9 +410,45 @@ mod tests {
             mantissa_size: 0,
             exponent_bias: 0,
         };
+
+        let bits = u64::from(u32::MAX) * 8;
+        for (dt, prefix) in [(&int, 'i'), (&float, 'f')] {
+            let classified = classify_datatype(dt);
+            assert_eq!(classified, DType::Other(Box::new(dt.clone())));
+
+            let shown = classified.to_string();
+            assert!(
+                shown.starts_with(&format!("other({prefix}{bits}")),
+                "{shown}"
+            );
+        }
+    }
+
+    /// Why `Other` carries the type rather than a rendering of it: a member
+    /// reached this way has no [`Dataset::datatype`](crate::Dataset::datatype)
+    /// to fall back on, so what lands here is the caller's only view of it
+    /// (issue #243).
+    #[test]
+    fn an_unclassified_member_reaches_the_caller_whole() {
+        let opaque = Datatype::Opaque {
+            size: 3,
+            tag: b"rgb".to_vec(),
+        };
+        let compound = Datatype::Compound {
+            size: 3,
+            members: vec![crate::datatype::CompoundMember {
+                name: "pixel".into(),
+                byte_offset: 0,
+                datatype: opaque.clone(),
+            }],
+        };
+
+        let DType::Compound(fields) = classify_datatype(&compound) else {
+            panic!("a compound classifies as one");
+        };
         assert_eq!(
-            classify_datatype(&float),
-            DType::Other(format!("float{}", u64::from(u32::MAX) * 8))
+            fields,
+            vec![("pixel".to_string(), DType::Other(Box::new(opaque)))]
         );
     }
 
@@ -656,10 +684,10 @@ mod display_tests {
         );
     }
 
-    /// An unclassified datatype carries a summary. The whole `Debug` record of
-    /// the `Datatype` is unreadable in the message that quotes it.
+    /// An unclassified datatype carries the type, and writes as the summary of
+    /// it. The whole `Debug` record is unreadable in the message that quotes it.
     #[test]
-    fn an_unclassified_type_carries_a_summary_not_a_debug_record() {
+    fn an_unclassified_type_carries_the_type_and_writes_a_summary() {
         let vax = Datatype::FloatingPoint {
             size: 4,
             byte_order: DatatypeByteOrder::Vax,
@@ -681,7 +709,7 @@ mod display_tests {
             bit_precision: 32,
         };
         let classified = classify_datatype(&time);
-        assert_eq!(classified, DType::Other("time32".into()));
+        assert_eq!(classified, DType::Other(Box::new(time.clone())));
         assert_eq!(classified.to_string(), "other(time32)");
 
         let opaque = Datatype::Opaque {
