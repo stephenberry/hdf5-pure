@@ -1960,6 +1960,77 @@ mod display_tests {
         assert_eq!(float.to_string(), "f64");
     }
 
+    /// Every width a message writes is `size * 8` over an on-disk `u32`, so a
+    /// crafted size near [`u32::MAX`] overflows a `u32` multiply and panics a
+    /// debug build (issue #140). [`bit_width`] widens first; this holds each
+    /// class that calls it to that, rather than reaching one of them through
+    /// whatever `classify_datatype` happens to route here.
+    #[test]
+    fn a_crafted_size_writes_its_width_instead_of_overflowing() {
+        let bits = u64::from(u32::MAX) * 8;
+        let cases = [
+            (
+                Datatype::FixedPoint {
+                    size: u32::MAX,
+                    byte_order: DatatypeByteOrder::LittleEndian,
+                    signed: true,
+                    bit_offset: 0,
+                    bit_precision: 0,
+                },
+                format!("i{bits}(bits 0..0)"),
+            ),
+            (
+                Datatype::FloatingPoint {
+                    size: u32::MAX,
+                    byte_order: DatatypeByteOrder::LittleEndian,
+                    bit_offset: 0,
+                    bit_precision: 0,
+                    exponent_location: 0,
+                    exponent_size: 0,
+                    mantissa_location: 0,
+                    mantissa_size: 0,
+                    exponent_bias: 0,
+                },
+                format!("f{bits}(bits 0..0)"),
+            ),
+            (
+                Datatype::Time {
+                    size: u32::MAX,
+                    byte_order: DatatypeByteOrder::LittleEndian,
+                    bit_precision: 0,
+                },
+                format!("time{bits}(bits 0..0)"),
+            ),
+            (
+                Datatype::BitField {
+                    size: u32::MAX,
+                    byte_order: DatatypeByteOrder::LittleEndian,
+                    bit_offset: 0,
+                    bit_precision: 0,
+                },
+                format!("bitfield{bits}(bits 0..0)"),
+            ),
+        ];
+
+        for (dtype, expected) in cases {
+            assert_eq!(dtype.to_string(), expected);
+        }
+    }
+
+    /// The bit span adds two `u16`s, which is the other place a crafted field
+    /// could wrap. Both widen, so the end is 131,070 rather than 65,534.
+    #[test]
+    fn a_crafted_bit_span_does_not_wrap() {
+        let dtype = Datatype::FixedPoint {
+            size: 1,
+            byte_order: DatatypeByteOrder::LittleEndian,
+            signed: false,
+            bit_offset: u16::MAX,
+            bit_precision: u16::MAX,
+        };
+        assert_eq!(dtype.to_string(), "u8(bits 65535..131070)");
+    }
+
     /// Only what departs from the ordinary is written, since that is what the
     /// reader of the message is looking for.
     #[test]

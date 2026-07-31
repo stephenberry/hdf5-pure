@@ -236,7 +236,7 @@ fn load<T: H5Element>(file: &File, name: &str) -> Result<Vec<T>, Error> {
 | `Compound(Vec<(String, DType)>)` | compound with classified fields |
 | `Enum(Vec<String>)` | enumeration with member names |
 | `Array(Box<DType>, Vec<u32>)` | fixed-size array of a base type |
-| `Other(String)` | anything not classified above |
+| `Other(Box<Datatype>)` | anything not classified above, carrying the type itself |
 
 !!! tip
-    Use `DType` for a quick human-readable summary; use `Dataset::datatype()` when you need exact field offsets, bit precision, or byte order.
+    Use `DType` for a quick human-readable summary; use `Dataset::datatype()` when you need exact field offsets, bit precision, or byte order. A type nested in a compound field or an array base has no such fallback, which is why `Other` carries the `Datatype` rather than a description of it.

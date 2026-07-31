@@ -367,7 +367,7 @@ impl Mcos {
                 let dtype = d.dtype().map_err(MatError::Hdf5)?;
                 if dtype != DType::U64 {
                     return Err(MatError::Custom(format!(
-                        "MCOS saveobj cell {idx} has datatype {dtype:?}; expected uint64"
+                        "MCOS saveobj cell {idx} has datatype {dtype}; expected uint64"
                     )));
                 }
                 d.read_u64().map_err(MatError::Hdf5)
