@@ -6,8 +6,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-`Display` now covers the types that describe what a file holds — `AttrValue`, `Datatype` and its component enums, `MessageType`, `Layout`, `ChunkIndex` and `Filter` — so a message quoting one reads as HDF5 rather than as a Rust value ([#242](https://github.com/stephenberry/hdf5-pure/pull/242)). `Display` is the short form and writes what departs from the ordinary, such as a big-endian order or a bit span narrower than the type, apart from a string's charset and padding, which are always named; `Debug` still carries the full record.
-
 ### Added
 
 - `Display` for `AttrValue`, `Datatype`, `DatatypeByteOrder`, `StringPadding`, `CharacterSet`, `ReferenceType`, `MessageType`, `Layout`, `ChunkIndex` and `Filter`. `AttrValue` writes the value — `1.5`, `"metres"`, `[1, 2, 3]` — and elides an array past eight elements, reporting how many it dropped ([#242](https://github.com/stephenberry/hdf5-pure/pull/242)).
@@ -15,10 +13,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- **Breaking:** `DType::Other` carries the `Datatype` itself rather than a description of it, so a type the curated view has no name for can be matched on — including one nested in a compound field or an array base, where `Dataset::datatype` is no help. It writes as a summary of that type — `other(opaque[3] "rgb")` where it wrote `other(Opaque { size: 3, tag: [114, 103, 98] })` ([#244](https://github.com/stephenberry/hdf5-pure/pull/244)).
+- **Breaking:** `DType::Other` carries the `Datatype` rather than a string describing it, so a type nested in a compound field or an array base can be matched on. It writes as `other(opaque[3] "rgb")` ([#244](https://github.com/stephenberry/hdf5-pure/pull/244)).
 - **Breaking:** `DType::Array` writes its shape as `array<f32, 2x3>` rather than `array<f32, [2, 3]>` ([#242](https://github.com/stephenberry/hdf5-pure/pull/242)).
 - **Breaking:** a name a file records — a compound member's, an enum label's, a filter's — is escaped and truncated wherever it is written, and a member list is elided past sixteen ([#242](https://github.com/stephenberry/hdf5-pure/pull/242)).
-- **Breaking:** the `Error::MissingMessage` text names the message — `missing required message: data layout` — instead of its Rust variant, and the unrecognized-chunk-index error reports the index-type byte without a `Some`/`None` around it ([#242](https://github.com/stephenberry/hdf5-pure/pull/242)).
+- **Breaking:** `Error::MissingMessage` names the message — `missing required message: data layout` — instead of its Rust variant, and the unrecognized-chunk-index error reports the raw index-type byte ([#242](https://github.com/stephenberry/hdf5-pure/pull/242)).
 
 ## [0.31.0] - 2026-07-30
 
