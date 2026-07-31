@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.32.0] - 2026-07-31
+
+`Display` now covers the types that describe what a file holds — `AttrValue`, `Datatype` and its component enums, `MessageType`, `Layout`, `ChunkIndex` and `Filter` — so a message quoting one reads as HDF5 rather than as a Rust value ([#242](https://github.com/stephenberry/hdf5-pure/pull/242)). A name the file records is escaped and truncated wherever it is written, and a member list elided past sixteen. `DType::Other` carries the `Datatype` itself, which is the only view a caller gets of a type nested in a compound field or an array base ([#244](https://github.com/stephenberry/hdf5-pure/pull/244)).
+
 ### Added
 
 - `Display` for `AttrValue`, `Datatype`, `DatatypeByteOrder`, `StringPadding`, `CharacterSet`, `ReferenceType`, `MessageType`, `Layout`, `ChunkIndex` and `Filter`. `AttrValue` writes the value — `1.5`, `"metres"`, `[1, 2, 3]` — and elides an array past eight elements, reporting how many it dropped ([#242](https://github.com/stephenberry/hdf5-pure/pull/242)).
@@ -575,7 +579,8 @@ Internal robustness and tests ([#26](https://github.com/stephenberry/hdf5-pure/i
 - The MAT deserializer flattens 1×N and N×1 values to a 1-D sequence in `deserialize_any` (matching `deserialize_seq`).
 - Numeric/complex readers preserve 1×N / N×1 shape at the value layer; any flattening happens at the serde level.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.31.0...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.32.0...HEAD
+[0.32.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.31.0...v0.32.0
 [0.31.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.30.0...v0.31.0
 [0.30.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.29.0...v0.30.0
 [0.29.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.28.0...v0.29.0
