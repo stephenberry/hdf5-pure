@@ -15,7 +15,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- **Breaking:** `DType::Other` carries the `Datatype` itself rather than a description of it, so a type the curated view has no name for can be matched on — including one nested in a compound field or an array base, where `Dataset::datatype` is no help. It still writes as a summary, `other(opaque[3] "rgb")` ([#243](https://github.com/stephenberry/hdf5-pure/issues/243)).
+- **Breaking:** `DType::Other` carries the `Datatype` itself rather than a description of it, so a type the curated view has no name for can be matched on — including one nested in a compound field or an array base, where `Dataset::datatype` is no help. It still writes as a summary, `other(opaque[3] "rgb")` ([#244](https://github.com/stephenberry/hdf5-pure/pull/244)).
 - **Breaking:** `DType::Array` writes its shape as `array<f32, 2x3>` rather than `array<f32, [2, 3]>` ([#242](https://github.com/stephenberry/hdf5-pure/pull/242)).
 - **Breaking:** a name a file records — a compound member's, an enum label's, a filter's — is escaped and truncated wherever it is written, and a member list is elided past sixteen ([#242](https://github.com/stephenberry/hdf5-pure/pull/242)).
 - **Breaking:** the `Error::MissingMessage` text names the message — `missing required message: data layout` — instead of its Rust variant, and the unrecognized-chunk-index error reports the index-type byte without a `Some`/`None` around it ([#242](https://github.com/stephenberry/hdf5-pure/pull/242)).
