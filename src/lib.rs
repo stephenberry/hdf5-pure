@@ -193,6 +193,11 @@ pub(crate) mod zfp;
 #[cfg(feature = "provenance")]
 pub(crate) mod provenance;
 
+// A review aid for the `Display` impls, not part of the crate: it renders every
+// value they describe to `display_gallery.md`. Remove it once reviewed.
+#[cfg(all(test, feature = "std", feature = "deflate", feature = "checksum"))]
+mod display_gallery;
+
 #[cfg(not(feature = "std"))]
 pub(crate) mod nosync;
 
