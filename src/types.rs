@@ -62,7 +62,9 @@ impl fmt::Display for DType {
                 write!(f, "}}")
             }
             DType::Enum(names) => write!(f, "enum[{}]", names.join(", ")),
-            DType::Array(base, dims) => write!(f, "array<{base}, {dims:?}>"),
+            DType::Array(base, dims) => {
+                write!(f, "array<{base}, {}>", crate::datatype::Dims(dims))
+            }
             DType::Other(desc) => write!(f, "other({desc})"),
         }
     }
@@ -147,7 +149,10 @@ pub(crate) fn classify_datatype(dt: &crate::datatype::Datatype) -> DType {
             ref_type: crate::datatype::ReferenceType::Object,
             ..
         } => DType::ObjectReference,
-        _ => DType::Other(format!("{dt:?}")),
+        // The `Datatype` summary, not its `Debug`: this string is what a caller
+        // sees for an unclassified type, and the full record is unreadable in a
+        // message.
+        _ => DType::Other(dt.to_string()),
     }
 }
 
@@ -621,6 +626,91 @@ mod tests {
                 Some("double"),
                 "attribute {name}"
             );
+        }
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod display_tests {
+    use super::*;
+    use crate::datatype::{CharacterSet, Datatype, DatatypeByteOrder, StringPadding};
+
+    #[test]
+    fn an_array_shape_is_not_a_debug_slice() {
+        let dtype = DType::Array(Box::new(DType::F32), vec![2, 3]);
+        assert_eq!(dtype.to_string(), "array<f32, 2x3>");
+        assert_eq!(
+            DType::Array(Box::new(DType::U8), vec![4]).to_string(),
+            "array<u8, 4>"
+        );
+    }
+
+    /// An unclassified datatype used to carry the whole `Debug` record of the
+    /// `Datatype`, which is unreadable in the message that quotes it.
+    #[test]
+    fn an_unclassified_type_carries_a_summary_not_a_debug_record() {
+        let vax = Datatype::FloatingPoint {
+            size: 4,
+            byte_order: DatatypeByteOrder::Vax,
+            bit_offset: 0,
+            bit_precision: 32,
+            exponent_location: 23,
+            exponent_size: 8,
+            mantissa_location: 0,
+            mantissa_size: 23,
+            exponent_bias: 127,
+        };
+        // Classification keys off size alone, so this stays `F32`; the point is
+        // the fallback below.
+        assert_eq!(classify_datatype(&vax), DType::F32);
+
+        let time = Datatype::Time {
+            size: 4,
+            byte_order: DatatypeByteOrder::LittleEndian,
+            bit_precision: 32,
+        };
+        let classified = classify_datatype(&time);
+        assert_eq!(classified, DType::Other("time32".into()));
+        assert_eq!(classified.to_string(), "other(time32)");
+
+        let opaque = Datatype::Opaque {
+            size: 3,
+            tag: b"rgb".to_vec(),
+        };
+        assert_eq!(
+            classify_datatype(&opaque).to_string(),
+            "other(opaque[3] \"rgb\")",
+            "not `other(Opaque {{ size: 3, tag: [114, 103, 98] }})`"
+        );
+    }
+
+    /// The two type views describe the same file, so they spell a type the
+    /// same way.
+    #[test]
+    fn dtype_and_datatype_agree_on_the_names_they_share() {
+        let cases = [
+            (
+                Datatype::FixedPoint {
+                    size: 4,
+                    byte_order: DatatypeByteOrder::LittleEndian,
+                    signed: true,
+                    bit_offset: 0,
+                    bit_precision: 32,
+                },
+                "i32",
+            ),
+            (
+                Datatype::String {
+                    size: 8,
+                    padding: StringPadding::NullPad,
+                    charset: CharacterSet::Ascii,
+                },
+                "string",
+            ),
+        ];
+
+        for (datatype, expected) in cases {
+            assert_eq!(classify_datatype(&datatype).to_string(), expected);
         }
     }
 }

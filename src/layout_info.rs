@@ -17,6 +17,9 @@
 #[cfg(not(feature = "std"))]
 use alloc::{format, string::String, vec::Vec};
 
+use core::fmt;
+
+use crate::datatype::Dims;
 use crate::error::FormatError;
 
 /// How a dataset's raw data is arranged on disk.
@@ -122,9 +125,14 @@ impl ChunkIndex {
             (4, Some(3)) => ChunkIndex::FixedArray,
             (4, Some(4)) => ChunkIndex::ExtensibleArray,
             (4, Some(5)) => ChunkIndex::BTreeV2,
-            (v, idx) => {
+            (v, Some(idx)) => {
                 return Err(FormatError::ChunkedReadError(format!(
-                    "unrecognized chunk index (layout version={v}, index type={idx:?})"
+                    "unrecognized chunk index (layout version={v}, index type={idx})"
+                )));
+            }
+            (v, None) => {
+                return Err(FormatError::ChunkedReadError(format!(
+                    "unrecognized chunk index (layout version={v}, no index type)"
                 )));
             }
         })
@@ -185,6 +193,90 @@ pub struct Filter {
     pub client_data: Vec<u32>,
 }
 
+// ---- Display ----
+//
+// This is the introspection surface a caller prints to describe a dataset, so
+// `Display` is the one-line form. `Debug` stays the full record.
+
+impl fmt::Display for Layout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Compact { size } => write!(f, "compact ({size} bytes)"),
+            Self::Contiguous {
+                address: Some(address),
+                size,
+            } => write!(f, "contiguous ({size} bytes at 0x{address:x})"),
+            Self::Contiguous {
+                address: None,
+                size,
+            } => write!(f, "contiguous ({size} bytes, unallocated)"),
+            Self::Chunked { chunk_shape, index } => {
+                write!(f, "chunked ({}, {index} index)", Dims(chunk_shape))
+            }
+            Self::Virtual => f.write_str("virtual"),
+        }
+    }
+}
+
+impl fmt::Display for ChunkIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::BTreeV1 => "B-tree v1",
+            Self::SingleChunk => "single chunk",
+            Self::Implicit => "implicit",
+            Self::FixedArray => "fixed array",
+            Self::ExtensibleArray => "extensible array",
+            Self::BTreeV2 => "B-tree v2",
+        })
+    }
+}
+
+impl fmt::Display for Filter {
+    /// The registered name of the filter, falling back to its identifier, and
+    /// the client data when the filter carries any.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match well_known_filter_name(self.id) {
+            Some(name) => f.write_str(name)?,
+            None => match &self.name {
+                Some(name) => write!(f, "{name} ({})", self.id)?,
+                None => write!(f, "filter {}", self.id)?,
+            },
+        }
+        if !self.client_data.is_empty() {
+            f.write_str("(")?;
+            for (i, value) in self.client_data.iter().enumerate() {
+                if i > 0 {
+                    f.write_str(", ")?;
+                }
+                write!(f, "{value}")?;
+            }
+            f.write_str(")")?;
+        }
+        if self.is_optional {
+            f.write_str(" [optional]")?;
+        }
+        Ok(())
+    }
+}
+
+/// The name of a filter this crate knows by identifier.
+///
+/// The file may record a name of its own, but most built-in filters store none,
+/// which would otherwise leave a bare number in the output.
+fn well_known_filter_name(id: u16) -> Option<&'static str> {
+    Some(match id {
+        1 => "deflate",
+        2 => "shuffle",
+        3 => "fletcher32",
+        4 => "szip",
+        5 => "nbit",
+        6 => "scaleoffset",
+        32000 => "lzf",
+        32013 => "zfp",
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +333,98 @@ mod tests {
         ] {
             assert!(!idx.supports_inplace_append());
         }
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+mod display_tests {
+    use super::*;
+
+    #[test]
+    fn a_layout_reads_as_one_line() {
+        assert_eq!(
+            Layout::Compact { size: 40 }.to_string(),
+            "compact (40 bytes)"
+        );
+        assert_eq!(
+            Layout::Contiguous {
+                address: Some(0x2a0),
+                size: 128,
+            }
+            .to_string(),
+            "contiguous (128 bytes at 0x2a0)"
+        );
+        assert_eq!(
+            Layout::Chunked {
+                chunk_shape: vec![4, 8],
+                index: ChunkIndex::ExtensibleArray,
+            }
+            .to_string(),
+            "chunked (4x8, extensible array index)"
+        );
+    }
+
+    /// An unallocated dataset says so, rather than printing `None`.
+    #[test]
+    fn an_unallocated_contiguous_dataset_says_so() {
+        let layout = Layout::Contiguous {
+            address: None,
+            size: 64,
+        };
+        let shown = layout.to_string();
+        assert_eq!(shown, "contiguous (64 bytes, unallocated)");
+        assert!(!shown.contains("None"));
+    }
+
+    /// Most built-in filters record no name, which would leave a bare number.
+    #[test]
+    fn a_filter_is_named_by_its_identifier_when_the_file_records_none() {
+        let deflate = Filter {
+            id: 1,
+            name: None,
+            is_optional: false,
+            client_data: vec![6],
+        };
+        assert_eq!(deflate.to_string(), "deflate(6)");
+
+        let lzf = Filter {
+            id: 32000,
+            name: None,
+            is_optional: false,
+            client_data: vec![],
+        };
+        assert_eq!(lzf.to_string(), "lzf");
+    }
+
+    #[test]
+    fn an_unregistered_filter_falls_back_to_its_recorded_name_then_its_id() {
+        let named = Filter {
+            id: 40000,
+            name: Some("custom".into()),
+            is_optional: true,
+            client_data: vec![],
+        };
+        assert_eq!(named.to_string(), "custom (40000) [optional]");
+
+        let anonymous = Filter {
+            id: 40001,
+            name: None,
+            is_optional: false,
+            client_data: vec![],
+        };
+        assert_eq!(anonymous.to_string(), "filter 40001");
+    }
+
+    /// The error used to print `Some(9)` and `None` from a `Debug` of the
+    /// index-type byte.
+    #[test]
+    fn an_unrecognized_index_error_has_no_rust_option_in_it() {
+        let with_type = ChunkIndex::from_layout(4, Some(9)).unwrap_err().to_string();
+        assert!(with_type.contains("index type=9"), "{with_type}");
+        assert!(!with_type.contains("Some"), "{with_type}");
+
+        let without_type = ChunkIndex::from_layout(9, None).unwrap_err().to_string();
+        assert!(without_type.contains("no index type"), "{without_type}");
+        assert!(!without_type.contains("None"), "{without_type}");
     }
 }
