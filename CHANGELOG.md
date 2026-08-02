@@ -15,6 +15,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Breaking:** `File::open`, `File::open_streaming`, `File::open_rw`, `File::open_swmr_writer` and `repack` refuse a file whose superblock marks it as held by a writer, matching `H5Fopen`; a file left flagged by a crashed SWMR writer used to open, and `open_rw` used to edit it in place. `File::open_swmr` follows such a file as before, `File::from_bytes` does not check, and `File::clear_swmr_flag` recovers a stale flag ([#245](https://github.com/stephenberry/hdf5-pure/issues/245)).
 - **Breaking:** `File::open_swmr_writer` requires a version-3 superblock, as the C library does, rather than version 2 or 3 ([#245](https://github.com/stephenberry/hdf5-pure/issues/245)).
 
+- A read-write open that refuses a file no longer reads the file first: `File::open_rw` validates the superblock through the handle and builds its backing only once nothing can refuse it, so refusing a mirrored file costs a few bounded reads rather than a whole-file copy ([#245](https://github.com/stephenberry/hdf5-pure/issues/245)).
+
 ### Fixed
 
 - A version-1 superblock's status flags and chunk B-tree K are read from the offsets the C library writes them to; the two were swapped, so `File::superblock()` reported a v1 file's `indexed_storage_internal_node_k` as its `consistency_flags` and vice versa ([#245](https://github.com/stephenberry/hdf5-pure/issues/245)).

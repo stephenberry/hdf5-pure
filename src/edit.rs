@@ -157,7 +157,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::checksum::jenkins_lookup3;
@@ -1068,15 +1068,28 @@ impl WriteEngine {
     /// Read `handle` whole into a [`MirrorImage`]. The one place the engine
     /// still assumes it can hold the file, kept behind a named constructor so
     /// the mirrorless opens visibly do not call it.
+    ///
+    /// `read_to_end` reads from the handle's *current* cursor, and the open path
+    /// has already read the superblock through it, so this rewinds first. Reading
+    /// from wherever the last read landed would mirror a truncated file — with no
+    /// error to say so, since a short mirror is a valid `Vec<u8>`.
     fn read_mirror(mut handle: fs::File) -> Result<MirrorImage, Error> {
+        handle.seek(SeekFrom::Start(0)).map_err(Error::Io)?;
         let mut data = Vec::new();
         handle.read_to_end(&mut data).map_err(Error::Io)?;
         Ok(MirrorImage::new(handle, data))
     }
 
     /// Shared open path over any backing: acquire the handle (and, when asked,
-    /// the exclusive lock), let `build` decide how the bytes are held, then
-    /// parse and validate the superblock through the image's [`Source`] impl.
+    /// the exclusive lock), parse and validate the superblock through a borrowed
+    /// view of the handle, and only then let `build` decide how the bytes are
+    /// held.
+    ///
+    /// Every refusal comes before `build`, because `build` may read the whole
+    /// file: reaching a refusal after it would spend `O(file size)` on a file
+    /// that is then rejected — a 20 GB flagged file read into memory and thrown
+    /// away. The superblock reads themselves are a few bounded windows either
+    /// way, so nothing is read twice.
     ///
     /// `build` receives the file's length as well as the handle because a
     /// mirrorless image has to be told its end-of-file — it has no buffer whose
@@ -1102,10 +1115,13 @@ impl WriteEngine {
             file_lock::acquire_exclusive(&handle, policy, path)?;
         }
         let len = handle.metadata().map_err(Error::Io)?.len();
-        let image = build(handle, len)?;
-
-        let sb_sig_off = signature::find_signature_in(image.as_ref())?.to_usize()?;
-        let mut superblock = Superblock::parse_from_source(image.as_ref(), sb_sig_off as u64)?;
+        // Read the superblock through the handle itself, before any image owns
+        // it. `probe` borrows, so it is gone by the time `build` takes the
+        // handle; it leaves the handle's cursor wherever its last read ended,
+        // which is why the mirror positions the handle before reading it whole.
+        let probe = crate::image::BorrowedHandle::new(&handle, len);
+        let sb_sig_off = signature::find_signature_in(&probe)?.to_usize()?;
+        let mut superblock = Superblock::parse_from_source(&probe, sb_sig_off as u64)?;
 
         if superblock.version > 3 {
             return Err(Error::EditUnsupported("unsupported superblock version"));
@@ -1144,6 +1160,10 @@ impl WriteEngine {
                 offset: superblock.root_group_address,
                 length: superblock.base_address,
             })?;
+
+        // Everything that can refuse this file has run; only now is it worth
+        // holding the bytes.
+        let image = build(handle, len)?;
 
         let mut session = Self {
             image,
@@ -8501,6 +8521,57 @@ mod tests {
         region.extend_from_slice(&region_message(MessageType::Dataspace, &[0; 8]));
         let err = rebuild_compact_layout_region(&region, &[1, 2]).unwrap_err();
         assert!(err.to_string().contains("non-compact"), "got: {err}");
+    }
+
+    #[test]
+    fn a_refused_open_never_builds_the_image() {
+        // The image is what may cost `O(file size)` — the mirror reads the whole
+        // file — so every refusal has to come first. Asserting on the build
+        // closure states that directly; measuring memory or elapsed time would
+        // only correlate with it.
+        use crate::writer::FileBuilder;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // One refusal from each family: the superblock's status flags (issue
+        // #245), and an unsupported superblock version, which has always been
+        // refused after the read this reorders.
+        let flagged = dir.path().join("flagged.h5");
+        let mut b = FileBuilder::new();
+        b.create_dataset("d").with_i32_data(&[1, 2, 3]);
+        b.write(&flagged).unwrap();
+        let ancient = dir.path().join("ancient.h5");
+        std::fs::copy(&flagged, &ancient).unwrap();
+        for (path, version, flags) in [(&flagged, 3, SWMR_WRITE_FLAGS), (&ancient, 9, 0)] {
+            let mut data = std::fs::read(path).unwrap();
+            let off = signature::find_signature(&data).unwrap();
+            let mut sb = Superblock::parse(&data, off).unwrap();
+            sb.version = version;
+            sb.consistency_flags = flags;
+            let bytes = sb.serialize();
+            data[off..off + bytes.len()].copy_from_slice(&bytes);
+            std::fs::write(path, &data).unwrap();
+        }
+
+        for path in [&flagged, &ancient] {
+            let built = std::cell::Cell::new(false);
+            let err = match WriteEngine::open_imaged(path, Some(FileLocking::Enabled), |h, len| {
+                built.set(true);
+                Ok(Box::new(HandleImage::new(
+                    h,
+                    len,
+                    MetadataCacheConfig::disabled(),
+                )))
+            }) {
+                Err(e) => e,
+                Ok(_) => panic!("{} must be refused", path.display()),
+            };
+            assert!(
+                !built.get(),
+                "{} was refused with {err:?}, but the image was built first",
+                path.display()
+            );
+        }
     }
 
     #[test]
