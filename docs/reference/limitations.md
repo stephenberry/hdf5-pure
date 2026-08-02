@@ -41,7 +41,7 @@ Relatedly, a producer that fails partway leaves a **partial file** on the sink. 
 
 ### SWMR (single-writer / multiple-reader)
 
-SWMR append requires a **latest-format** file (v2/v3 superblock) and **no userblock**. This mirrors the HDF5 SWMR model, which is only defined for the latest format.
+SWMR append requires a **latest-format** file (v3 superblock) and **no userblock**. This mirrors the HDF5 SWMR model, which is only defined for the latest format; the C library refuses an older superblock for SWMR writing too, and neither library reads the SWMR-write flag back on one.
 
 ### In-place editing
 

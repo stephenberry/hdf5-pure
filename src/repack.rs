@@ -161,6 +161,13 @@ impl RepackOptions {
 ///
 /// See [`Error::RepackUnsupported`] for the objects that cannot be reproduced
 /// faithfully.
+///
+/// `src` is opened with [`File::open_streaming`], so a file whose superblock
+/// marks it as held by a writer is refused with
+/// [`Error::FileMarkedInUse`] — repacking a file a writer is still growing would
+/// capture a torn view. Clear a flag a crashed writer left with
+/// [`File::clear_swmr_flag`](crate::File::clear_swmr_flag) first, as `h5repack`
+/// needs `h5clear`.
 pub fn repack<P: AsRef<Path>, Q: AsRef<Path>>(
     src: P,
     dst: Q,

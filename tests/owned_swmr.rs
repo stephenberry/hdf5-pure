@@ -33,10 +33,15 @@ fn build_swmr_filtered(path: &std::path::Path, n: i32, chunk: u64) {
     b.write(path).unwrap();
 }
 
-/// Read the superblock's consistency flags from a fresh open (reflecting the
-/// current on-disk state, which a no-lock SWMR writer leaves readable).
+/// Read the superblock's consistency-flags byte straight from the file. It is
+/// read as bytes rather than through `File::open` because that open now *refuses*
+/// a flagged file (issue #245), and because the byte on disk is what these tests
+/// mean to assert.
 fn read_flags(path: &std::path::Path) -> u32 {
-    File::open(path).unwrap().superblock().consistency_flags
+    let bytes = std::fs::read(path).unwrap();
+    let sig = b"\x89HDF\r\n\x1a\n";
+    let off = bytes.windows(sig.len()).position(|w| w == sig).unwrap();
+    u32::from(bytes[off + 11]) // v2/v3 superblock consistency-flags byte
 }
 
 const SWMR_WRITE_FLAGS: u32 = 0x05;
@@ -184,9 +189,13 @@ fn clear_swmr_flag_recovers_a_stale_flag() {
     assert_eq!(read_flags(&path), 0);
 }
 
-/// The SWMR writer takes no OS lock, so an exclusive-locking open still succeeds
-/// while it is active (proving no lock is held). Advisory-lock behavior is
-/// predictable on Unix; on Windows OS-level file sharing complicates the check.
+/// The SWMR writer takes no OS lock, so an exclusive-locking open gets past the
+/// lock while it is active — and is then turned away by the superblock's
+/// SWMR-write flag instead (issue #245). Which of the two errors comes back is
+/// what distinguishes them: `open_rw` takes the lock *before* it reads the
+/// superblock, so a writer holding a lock would report `FileLocked` and never
+/// reach the flag. Advisory-lock behavior is predictable on Unix; on Windows
+/// OS-level file sharing complicates the check.
 #[test]
 #[cfg(unix)]
 fn swmr_holds_no_os_lock() {
@@ -195,11 +204,11 @@ fn swmr_holds_no_os_lock() {
     build_swmr(&path, 4, 4);
 
     let writer = File::open_swmr_writer(&path).unwrap();
-    let rw = File::open_rw(&path);
+    let err = File::open_rw(&path).expect_err("a live SWMR writer holds the file");
     assert!(
-        rw.is_ok(),
-        "a SWMR writer must not hold an exclusive OS lock"
+        matches!(err, Error::FileMarkedInUse(_)),
+        "a SWMR writer must not hold an exclusive OS lock, so the refusal must come \
+         from the superblock flag rather than the lock; got {err:?}"
     );
-    drop(rw);
     drop(writer);
 }

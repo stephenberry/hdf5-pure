@@ -797,8 +797,9 @@ pub(crate) struct AppendGeometry {
 
 /// Superblock consistency-flag bits raised while a SWMR writer is active: bit 0
 /// (write access) | bit 2 (SWMR write access). Cleared on a clean close. Matches
-/// the reference C library, h5py, and [`crate::File::open_swmr_writer`].
-const SWMR_WRITE_FLAGS: u32 = 0x05;
+/// the reference C library, h5py, and [`crate::File::open_swmr_writer`]. These
+/// are the bits every open path checks — see [`file_lock::check_status_flags`].
+const SWMR_WRITE_FLAGS: u32 = file_lock::WRITE_ACCESS | file_lock::SWMR_WRITE_ACCESS;
 
 /// A dataset located once for [`Dataset::append`](crate::Dataset::append) (or the bounded
 /// backend's immediate append), then maintained across appends. Mirrors the
@@ -1019,16 +1020,22 @@ impl WriteEngine {
     /// `acquire_exclusive`, so `HDF5_USE_FILE_LOCKING` cannot reintroduce a lock
     /// that would block the concurrent readers SWMR exists to permit (fatally so
     /// on Windows, where OS locks are mandatory). Requires a latest-format
-    /// (version-2/3 superblock) file with no userblock and no persisted
+    /// (version-3 superblock) file with no userblock and no persisted
     /// free-space, so the superblock can be rewritten in place.
+    ///
+    /// The version-3 requirement is the C library's (`H5F__super_read`: "superblock
+    /// version for SWMR is less than 3"), and it is what keeps the SWMR-write flag
+    /// meaningful: neither library reads the status-flags byte back on an older
+    /// superblock, so a flag raised there would announce a live writer to nobody.
+    /// This crate's writer emits version 3, so no file it produces is affected.
     pub(crate) fn open_swmr_writer<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
         let mut session = Self::open_inner(path.as_ref(), None)?;
-        if session.superblock.version < 2
+        if session.superblock.version < 3
             || session.superblock.base_address != 0
             || session.persist.is_some()
         {
             return Err(Error::SwmrAppendUnsupported(
-                "SWMR writing requires a latest-format file (v2/v3 superblock) with no userblock \
+                "SWMR writing requires a latest-format file (v3 superblock) with no userblock \
                  and no persisted free-space",
             ));
         }
@@ -1103,6 +1110,10 @@ impl WriteEngine {
         if superblock.version > 3 {
             return Err(Error::EditUnsupported("unsupported superblock version"));
         }
+        // Refuse a file a writer already holds, before anything is mutated. This
+        // is the one exclusion the OS lock above cannot make: a SWMR writer
+        // takes no lock, so its file is lock-free but flagged (issue #245).
+        file_lock::check_status_flags(&superblock, file_lock::OpenIntent::Write, path)?;
         if superblock.offset_size != OFFSET_SIZE || superblock.length_size != LENGTH_SIZE {
             return Err(Error::EditUnsupported(
                 "only 8-byte offsets and lengths are supported for in-place editing",
@@ -8493,10 +8504,13 @@ mod tests {
     }
 
     #[test]
-    fn commit_clears_a_stale_consistency_flag() {
-        // A clean in-place edit must leave the file properly closed for the C
-        // library: the write/SWMR consistency flag a crashed SWMR writer left
-        // behind is cleared rather than re-emitted (issue #73).
+    fn a_stale_consistency_flag_is_refused_then_cleared_by_a_commit() {
+        // A v3 file a crashed SWMR writer left flagged is refused by the editor
+        // (issue #245) rather than edited under a writer the file still records.
+        // On a v2 file, where the check is gated off to match the C library, the
+        // editor opens — and the commit clears the stale flag rather than
+        // re-emitting it, so the file stays properly closed for the C library
+        // (issue #73).
         use crate::writer::FileBuilder;
 
         let dir = tempfile::tempdir().unwrap();
@@ -8527,9 +8541,34 @@ mod tests {
             );
         }
 
+        // The editor refuses it while the flag stands.
+        match WriteEngine::open_with_locking(&path, FileLocking::Enabled) {
+            Err(Error::FileMarkedInUse(_)) => {}
+            Err(e) => panic!("expected the flag refusal, got {e:?}"),
+            Ok(_) => panic!("a flagged file must not be edited in place"),
+        }
+
+        // The flag survives a *version-2* superblock, where the check is gated
+        // off to match the C library — which is the one state that still carries
+        // a stale flag into a commit, and so the one that keeps the healing below
+        // load-bearing. (v2 and v3 superblocks share a byte layout, so restamping
+        // the version is the whole difference.) A crashed C writer leaves plain
+        // write access, without the SWMR bit.
+        {
+            let mut data = std::fs::read(&path).unwrap();
+            let off = signature::find_signature(&data).unwrap();
+            let mut sb = Superblock::parse(&data, off).unwrap();
+            sb.version = 2;
+            sb.consistency_flags = crate::file_lock::WRITE_ACCESS;
+            let bytes = sb.serialize();
+            data[off..off + bytes.len()].copy_from_slice(&bytes);
+            std::fs::write(&path, &data).unwrap();
+        }
+
         // A clean edit-and-commit cycle heals it.
         {
-            let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+            let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled)
+                .expect("the gate skips a v2 superblock, so this opens");
             let mut b = DatasetBuilder::new("e");
             b.with_i32_data(&[4, 5]);
             s.stage_created_dataset("e", b);
