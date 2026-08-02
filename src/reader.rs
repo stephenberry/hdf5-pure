@@ -22,7 +22,7 @@ use crate::dataspace::Dataspace;
 use crate::datatype::{Datatype, ReferenceType};
 use crate::error::{Error, FormatError};
 use crate::file_create_properties::FileCreateProperties;
-use crate::file_lock::FileLocking;
+use crate::file_lock::{self, FileLocking, OpenIntent};
 use crate::file_space_info::{FileSpaceInfo, FileSpaceStrategy};
 use crate::filter_pipeline::FilterPipeline;
 use crate::free_space_manager;
@@ -429,7 +429,16 @@ impl FileInner {
         properties: FileAccessProperties,
     ) -> Result<Self, Error> {
         let bytes = std::fs::read(path.as_ref()).map_err(Error::Io)?;
-        Self::from_bytes_with_options(bytes, properties)
+        let inner = Self::from_bytes_with_options(bytes, properties)?;
+        // The status-flag check belongs to the *path* opens, not to
+        // `from_bytes_with_options` (issue #245). A caller who already holds the
+        // bytes has taken its own snapshot: there is no live file to coordinate
+        // over, and the recovery this refusal would name — `clear_swmr_flag`,
+        // which needs write access to a path — is not available to it either.
+        // This is a deliberate divergence from the C library, which checks under
+        // its in-memory core driver too.
+        file_lock::check_status_flags(&inner.superblock, OpenIntent::Read, path.as_ref())?;
+        Ok(inner)
     }
 
     /// Open an HDF5 file for **streaming** reads, fetching regions on demand from
@@ -468,6 +477,7 @@ impl FileInner {
             Box::new(source)
         };
         let (superblock, addr_offset) = Self::parse_superblock_source(source.as_ref())?;
+        file_lock::check_status_flags(&superblock, OpenIntent::Read, path.as_ref())?;
         Ok(Self::from_parts(
             Backend::Streaming(source),
             superblock,
@@ -503,6 +513,7 @@ impl FileInner {
         let mut data = Vec::new();
         handle.read_to_end(&mut data).map_err(Error::Io)?;
         let (superblock, addr_offset) = Self::parse_superblock(&data)?;
+        file_lock::check_status_flags(&superblock, OpenIntent::SwmrRead, path.as_ref())?;
         Ok(Self::from_parts(
             Backend::InMemory(data),
             superblock,
@@ -1493,6 +1504,16 @@ impl File {
     /// single writer is appending to (SWMR), use [`File::open_swmr`] instead.
     /// To read a file larger than memory (e.g. on a 32-bit host) without
     /// buffering it, use [`File::open_streaming`].
+    ///
+    /// A file whose superblock marks it as held by a writer is refused with
+    /// [`Error::FileMarkedInUse`](crate::Error::FileMarkedInUse) — the check
+    /// `H5Fopen` makes of the same byte. That means a live writer or one that
+    /// exited without closing the file; clear a stale flag with
+    /// [`clear_swmr_flag`](Self::clear_swmr_flag), and follow a live SWMR writer
+    /// with [`open_swmr`](Self::open_swmr). [`from_bytes`](Self::from_bytes) does
+    /// not check, since its caller already holds the bytes — which is also the
+    /// way to read a flagged file on a read-only mount, where clearing the flag
+    /// would need write access.
     pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
         Ok(File {
             inner: Arc::new(FileInner::open(path)?),
@@ -1517,6 +1538,9 @@ impl File {
     /// close to one chunk plus the metadata being parsed. Attribute reading and
     /// v1 symbol-table groups on the resolved path are not yet supported on this
     /// backend.
+    ///
+    /// Like [`open`](Self::open), this refuses a file whose superblock marks it
+    /// as held by a writer.
     pub fn open_streaming<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
         Ok(File {
             inner: Arc::new(FileInner::open_streaming(path)?),
@@ -1537,6 +1561,16 @@ impl File {
     ///
     /// Like [`File::open`], but retains a live handle to the file so that
     /// [`File::refresh`] can re-read data appended by a concurrent writer.
+    ///
+    /// This is the open that *follows* a file marked as held by a SWMR writer,
+    /// where [`open`](Self::open) refuses one. Only a half-set mark is refused
+    /// here, with [`Error::FileMarkedInUse`](crate::Error::FileMarkedInUse):
+    /// either bit without the other. Write access alone is what a plain
+    /// (non-SWMR) writer leaves, and there is no protocol for following a writer
+    /// that is not publishing consistent prefixes; the SWMR bit alone is a state
+    /// no writer produces. Both bits is the live SWMR writer this exists to
+    /// follow, and neither is a quiescent file.
+    #[doc(alias = "H5F_ACC_SWMR_READ")]
     pub fn open_swmr<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
         Ok(File {
             inner: Arc::new(FileInner::open_swmr(path)?),
@@ -1586,6 +1620,15 @@ impl File {
     /// latest-format (version-2/3) file with no userblock and an
     /// Extensible-Array-indexed dataset; [`Dataset::append_staged`] covers the
     /// general case.
+    ///
+    /// Two things can turn this open away because another writer holds the file:
+    /// the exclusive OS lock, reported as
+    /// [`Error::FileLocked`](crate::Error::FileLocked), and the superblock's
+    /// status-flags byte, reported as
+    /// [`Error::FileMarkedInUse`](crate::Error::FileMarkedInUse). The second
+    /// covers what the first cannot — a SWMR writer takes no lock, and a writer
+    /// that exited without closing the file leaves the flag behind; recover a
+    /// stale one with [`clear_swmr_flag`](Self::clear_swmr_flag).
     ///
     /// # Memory
     ///
@@ -1661,11 +1704,18 @@ impl File {
     /// [`Error::SwmrStagedUnsupported`](crate::Error::SwmrStagedUnsupported).
     /// [`close`](Self::close) clears the SWMR-write flag; a writer that exits
     /// without a clean close leaves it set — recover with
-    /// [`clear_swmr_flag`](Self::clear_swmr_flag).
+    /// [`clear_swmr_flag`](Self::clear_swmr_flag). While the flag stands, this
+    /// open is refused with
+    /// [`Error::FileMarkedInUse`](crate::Error::FileMarkedInUse), which is what
+    /// keeps a second writer off a file SWMR gives only one (no OS lock is held
+    /// to do it).
     ///
-    /// Requires a latest-format (version-2/3 superblock) file with no userblock
+    /// Requires a latest-format (version-3 superblock) file with no userblock
     /// and no persisted free-space; other files are refused with
     /// [`Error::SwmrAppendUnsupported`](crate::Error::SwmrAppendUnsupported).
+    /// The version-3 requirement is the C library's: neither library reads the
+    /// SWMR-write flag back on an older superblock, so raising one there would
+    /// announce the writer to nobody.
     #[doc(alias = "H5F_ACC_SWMR_WRITE")]
     pub fn open_swmr_writer<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
         Self::open_swmr_writer_with_options(path, FileAccessProperties::new())
@@ -1797,8 +1847,14 @@ impl File {
 
     /// Clear a stale SWMR-write flag left in `path` by a writer that exited
     /// without a clean [`close`](Self::close) — the `h5clear -s` equivalent, for
-    /// recovering a file the reference C library then refuses to open. A no-op if
-    /// the flag is already clear.
+    /// recovering a file that both this crate and the reference C library
+    /// otherwise refuse to open ([`Error::FileMarkedInUse`](crate::Error::FileMarkedInUse)).
+    /// A no-op if the flag is already clear.
+    ///
+    /// It takes the exclusive OS lock first, so it cannot clear the flag out
+    /// from under a *live* [`open_rw`](Self::open_rw) writer. A live SWMR writer
+    /// holds no lock, so make sure it is really gone: clearing the flag under
+    /// one leaves its readers with no record that it is publishing.
     pub fn clear_swmr_flag<P: AsRef<std::path::Path>>(path: P) -> Result<(), Error> {
         crate::file_lock::clear_swmr_flag_at(path.as_ref())
     }

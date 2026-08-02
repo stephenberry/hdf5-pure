@@ -157,7 +157,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::checksum::jenkins_lookup3;
@@ -797,8 +797,9 @@ pub(crate) struct AppendGeometry {
 
 /// Superblock consistency-flag bits raised while a SWMR writer is active: bit 0
 /// (write access) | bit 2 (SWMR write access). Cleared on a clean close. Matches
-/// the reference C library, h5py, and [`crate::File::open_swmr_writer`].
-const SWMR_WRITE_FLAGS: u32 = 0x05;
+/// the reference C library, h5py, and [`crate::File::open_swmr_writer`]. These
+/// are the bits every open path checks — see [`file_lock::check_status_flags`].
+const SWMR_WRITE_FLAGS: u32 = file_lock::WRITE_ACCESS | file_lock::SWMR_WRITE_ACCESS;
 
 /// A dataset located once for [`Dataset::append`](crate::Dataset::append) (or the bounded
 /// backend's immediate append), then maintained across appends. Mirrors the
@@ -1019,16 +1020,22 @@ impl WriteEngine {
     /// `acquire_exclusive`, so `HDF5_USE_FILE_LOCKING` cannot reintroduce a lock
     /// that would block the concurrent readers SWMR exists to permit (fatally so
     /// on Windows, where OS locks are mandatory). Requires a latest-format
-    /// (version-2/3 superblock) file with no userblock and no persisted
+    /// (version-3 superblock) file with no userblock and no persisted
     /// free-space, so the superblock can be rewritten in place.
+    ///
+    /// The version-3 requirement is the C library's (`H5F__super_read`: "superblock
+    /// version for SWMR is less than 3"), and it is what keeps the SWMR-write flag
+    /// meaningful: neither library reads the status-flags byte back on an older
+    /// superblock, so a flag raised there would announce a live writer to nobody.
+    /// This crate's writer emits version 3, so no file it produces is affected.
     pub(crate) fn open_swmr_writer<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
         let mut session = Self::open_inner(path.as_ref(), None)?;
-        if session.superblock.version < 2
+        if session.superblock.version < 3
             || session.superblock.base_address != 0
             || session.persist.is_some()
         {
             return Err(Error::SwmrAppendUnsupported(
-                "SWMR writing requires a latest-format file (v2/v3 superblock) with no userblock \
+                "SWMR writing requires a latest-format file (v3 superblock) with no userblock \
                  and no persisted free-space",
             ));
         }
@@ -1061,15 +1068,28 @@ impl WriteEngine {
     /// Read `handle` whole into a [`MirrorImage`]. The one place the engine
     /// still assumes it can hold the file, kept behind a named constructor so
     /// the mirrorless opens visibly do not call it.
+    ///
+    /// `read_to_end` reads from the handle's *current* cursor, and the open path
+    /// has already read the superblock through it, so this rewinds first. Reading
+    /// from wherever the last read landed would mirror a truncated file — with no
+    /// error to say so, since a short mirror is a valid `Vec<u8>`.
     fn read_mirror(mut handle: fs::File) -> Result<MirrorImage, Error> {
+        handle.seek(SeekFrom::Start(0)).map_err(Error::Io)?;
         let mut data = Vec::new();
         handle.read_to_end(&mut data).map_err(Error::Io)?;
         Ok(MirrorImage::new(handle, data))
     }
 
     /// Shared open path over any backing: acquire the handle (and, when asked,
-    /// the exclusive lock), let `build` decide how the bytes are held, then
-    /// parse and validate the superblock through the image's [`Source`] impl.
+    /// the exclusive lock), parse and validate the superblock through a borrowed
+    /// view of the handle, and only then let `build` decide how the bytes are
+    /// held.
+    ///
+    /// Every refusal comes before `build`, because `build` may read the whole
+    /// file: reaching a refusal after it would spend `O(file size)` on a file
+    /// that is then rejected — a 20 GB flagged file read into memory and thrown
+    /// away. The superblock reads themselves are a few bounded windows either
+    /// way, so nothing is read twice.
     ///
     /// `build` receives the file's length as well as the handle because a
     /// mirrorless image has to be told its end-of-file — it has no buffer whose
@@ -1095,14 +1115,21 @@ impl WriteEngine {
             file_lock::acquire_exclusive(&handle, policy, path)?;
         }
         let len = handle.metadata().map_err(Error::Io)?.len();
-        let image = build(handle, len)?;
-
-        let sb_sig_off = signature::find_signature_in(image.as_ref())?.to_usize()?;
-        let mut superblock = Superblock::parse_from_source(image.as_ref(), sb_sig_off as u64)?;
+        // Read the superblock through the handle itself, before any image owns
+        // it. `probe` borrows, so it is gone by the time `build` takes the
+        // handle; it leaves the handle's cursor wherever its last read ended,
+        // which is why the mirror positions the handle before reading it whole.
+        let probe = crate::image::BorrowedHandle::new(&handle, len);
+        let sb_sig_off = signature::find_signature_in(&probe)?.to_usize()?;
+        let mut superblock = Superblock::parse_from_source(&probe, sb_sig_off as u64)?;
 
         if superblock.version > 3 {
             return Err(Error::EditUnsupported("unsupported superblock version"));
         }
+        // Refuse a file a writer already holds, before anything is mutated. This
+        // is the one exclusion the OS lock above cannot make: a SWMR writer
+        // takes no lock, so its file is lock-free but flagged (issue #245).
+        file_lock::check_status_flags(&superblock, file_lock::OpenIntent::Write, path)?;
         if superblock.offset_size != OFFSET_SIZE || superblock.length_size != LENGTH_SIZE {
             return Err(Error::EditUnsupported(
                 "only 8-byte offsets and lengths are supported for in-place editing",
@@ -1133,6 +1160,10 @@ impl WriteEngine {
                 offset: superblock.root_group_address,
                 length: superblock.base_address,
             })?;
+
+        // Everything that can refuse this file has run; only now is it worth
+        // holding the bytes.
+        let image = build(handle, len)?;
 
         let mut session = Self {
             image,
@@ -8493,10 +8524,64 @@ mod tests {
     }
 
     #[test]
-    fn commit_clears_a_stale_consistency_flag() {
-        // A clean in-place edit must leave the file properly closed for the C
-        // library: the write/SWMR consistency flag a crashed SWMR writer left
-        // behind is cleared rather than re-emitted (issue #73).
+    fn a_refused_open_never_builds_the_image() {
+        // The image is what may cost `O(file size)` — the mirror reads the whole
+        // file — so every refusal has to come first. Asserting on the build
+        // closure states that directly; measuring memory or elapsed time would
+        // only correlate with it.
+        use crate::writer::FileBuilder;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // One refusal from each family: the superblock's status flags (issue
+        // #245), and an unsupported superblock version, which has always been
+        // refused after the read this reorders.
+        let flagged = dir.path().join("flagged.h5");
+        let mut b = FileBuilder::new();
+        b.create_dataset("d").with_i32_data(&[1, 2, 3]);
+        b.write(&flagged).unwrap();
+        let ancient = dir.path().join("ancient.h5");
+        std::fs::copy(&flagged, &ancient).unwrap();
+        for (path, version, flags) in [(&flagged, 3, SWMR_WRITE_FLAGS), (&ancient, 9, 0)] {
+            let mut data = std::fs::read(path).unwrap();
+            let off = signature::find_signature(&data).unwrap();
+            let mut sb = Superblock::parse(&data, off).unwrap();
+            sb.version = version;
+            sb.consistency_flags = flags;
+            let bytes = sb.serialize();
+            data[off..off + bytes.len()].copy_from_slice(&bytes);
+            std::fs::write(path, &data).unwrap();
+        }
+
+        for path in [&flagged, &ancient] {
+            let built = std::cell::Cell::new(false);
+            let err = match WriteEngine::open_imaged(path, Some(FileLocking::Enabled), |h, len| {
+                built.set(true);
+                Ok(Box::new(HandleImage::new(
+                    h,
+                    len,
+                    MetadataCacheConfig::disabled(),
+                )))
+            }) {
+                Err(e) => e,
+                Ok(_) => panic!("{} must be refused", path.display()),
+            };
+            assert!(
+                !built.get(),
+                "{} was refused with {err:?}, but the image was built first",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn a_stale_consistency_flag_is_refused_then_cleared_by_a_commit() {
+        // A v3 file a crashed SWMR writer left flagged is refused by the editor
+        // (issue #245) rather than edited under a writer the file still records.
+        // On a v2 file, where the check is gated off to match the C library, the
+        // editor opens — and the commit clears the stale flag rather than
+        // re-emitting it, so the file stays properly closed for the C library
+        // (issue #73).
         use crate::writer::FileBuilder;
 
         let dir = tempfile::tempdir().unwrap();
@@ -8527,9 +8612,34 @@ mod tests {
             );
         }
 
+        // The editor refuses it while the flag stands.
+        match WriteEngine::open_with_locking(&path, FileLocking::Enabled) {
+            Err(Error::FileMarkedInUse(_)) => {}
+            Err(e) => panic!("expected the flag refusal, got {e:?}"),
+            Ok(_) => panic!("a flagged file must not be edited in place"),
+        }
+
+        // The flag survives a *version-2* superblock, where the check is gated
+        // off to match the C library — which is the one state that still carries
+        // a stale flag into a commit, and so the one that keeps the healing below
+        // load-bearing. (v2 and v3 superblocks share a byte layout, so restamping
+        // the version is the whole difference.) A crashed C writer leaves plain
+        // write access, without the SWMR bit.
+        {
+            let mut data = std::fs::read(&path).unwrap();
+            let off = signature::find_signature(&data).unwrap();
+            let mut sb = Superblock::parse(&data, off).unwrap();
+            sb.version = 2;
+            sb.consistency_flags = crate::file_lock::WRITE_ACCESS;
+            let bytes = sb.serialize();
+            data[off..off + bytes.len()].copy_from_slice(&bytes);
+            std::fs::write(&path, &data).unwrap();
+        }
+
         // A clean edit-and-commit cycle heals it.
         {
-            let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+            let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled)
+                .expect("the gate skips a v2 superblock, so this opens");
             let mut b = DatasetBuilder::new("e");
             b.with_i32_data(&[4, 5]);
             s.stage_created_dataset("e", b);

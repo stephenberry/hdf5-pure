@@ -85,7 +85,11 @@ println!("now {} rows", ds.shape().unwrap()[0]);
 
 ## Recovering a flagged file
 
-While a `File::open_swmr_writer` is open, the file's superblock carries an active-SWMR-writer flag (matching the reference C library and h5py) so concurrent readers may open it accordingly. `close()` or dropping the writer clears it. If a writer process exits without a clean close, the file is left flagged. Recover it with the h5clear equivalent:
+While a `File::open_swmr_writer` is open, the file's superblock carries an active-SWMR-writer flag (matching the reference C library and h5py) so concurrent readers may open it accordingly. `close()` or dropping the writer clears it. If a writer process exits without a clean close, the file is left flagged.
+
+That flag is durable, so it is what every other open consults: while it stands, `File::open`, `File::open_streaming`, `File::open_rw` and a second `File::open_swmr_writer` all fail with `Error::FileMarkedInUse`, exactly as `H5Fopen` fails with *"file is already open for write"*. `File::open_swmr` is the one open that follows it rather than refusing — that pairing is what the flag is for. `File::from_bytes` does not consult it, since its caller already holds a snapshot of the bytes.
+
+The flag cannot distinguish a live writer from a crashed one, so recover a file you know has no writer with the h5clear equivalent:
 
 ```rust
 use hdf5_pure::File;
@@ -93,7 +97,9 @@ use hdf5_pure::File;
 File::clear_swmr_flag("stream.h5").unwrap();
 ```
 
-`clear_swmr_flag` is safe to call on a file whose flag is already clear.
+`clear_swmr_flag` is safe to call on a file whose flag is already clear. It takes the exclusive OS lock first, so it cannot clear the flag out from under a live `File::open_rw` writer — but a SWMR writer holds no lock, so check that one is really gone before clearing.
+
+The check applies to version-3 superblocks, which is where the C library applies it and the only version this crate's SWMR writer accepts.
 
 ## Supported subset and requirements
 
@@ -105,7 +111,7 @@ SWMR append supports the following subset, distinct from the general [editing](e
 | Storage | chunked (Extensible Array index, latest format) |
 | Filters | unfiltered (no compression on the appended dataset) |
 | Append granularity | chunk-aligned appends |
-| File layout | no userblock (zero base address); latest-format v2/v3 superblock |
+| File layout | no userblock (zero base address); latest-format v3 superblock |
 | Growth | unbounded |
 | Build | requires `std` (the default); the in-memory/WASM path cannot refresh |
 

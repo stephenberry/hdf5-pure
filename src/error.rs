@@ -949,6 +949,16 @@ pub enum Error {
     /// [`crate::FileLocking::Disabled`] or globally with
     /// `HDF5_USE_FILE_LOCKING=FALSE`. The payload is a human-readable reason.
     FileLocked(String),
+    /// The file could not be opened because its superblock's status-flags byte
+    /// marks it as held by a writer — the durable flag
+    /// [`crate::File::open_swmr_writer`] raises, and the reference C library
+    /// raises for any writer. Unlike [`FileLocked`](Self::FileLocked) this
+    /// outlives the process that set it, so it means either that a writer is
+    /// active *or* that one exited without clearing it; the payload names
+    /// [`crate::File::clear_swmr_flag`] (the `h5clear -s` equivalent) as the
+    /// recovery for the latter. A live SWMR writer can still be followed with
+    /// [`crate::File::open_swmr`]. The payload is a human-readable reason.
+    FileMarkedInUse(String),
 }
 
 #[cfg(feature = "std")]
@@ -997,6 +1007,7 @@ impl fmt::Display for Error {
                 write!(f, "cannot repack faithfully: {reason}")
             }
             Error::FileLocked(reason) => write!(f, "file is locked: {reason}"),
+            Error::FileMarkedInUse(reason) => write!(f, "file is marked in use: {reason}"),
         }
     }
 }

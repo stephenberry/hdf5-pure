@@ -239,6 +239,36 @@ pub(crate) fn read_at_handle(
     Ok(())
 }
 
+/// A [`Source`] over a *borrowed* open handle, for the reads an open has to make
+/// before it decides which image will own that handle.
+///
+/// It exists so a read-write open can locate and validate the superblock — a few
+/// bounded windows — before building an image that might read the whole file.
+/// Refusing after that build costs `O(file size)` on a file that is then
+/// rejected. It moves the handle's shared cursor, as everything using
+/// [`read_at_handle`] does, so a caller that later reads sequentially from the
+/// same handle must position it itself ([`MirrorImage`] does).
+pub(crate) struct BorrowedHandle<'a> {
+    handle: &'a fs::File,
+    len: u64,
+}
+
+impl<'a> BorrowedHandle<'a> {
+    pub(crate) fn new(handle: &'a fs::File, len: u64) -> Self {
+        Self { handle, len }
+    }
+}
+
+impl Source for BorrowedHandle<'_> {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
+        read_at_handle(self.handle, self.len, offset, buf)
+    }
+}
+
 /// A file-backed image that holds no whole-file mirror: reads are positioned I/O
 /// against the handle, served through a bounded metadata cache when one is
 /// configured. This is the backing a bounded read-write open uses,

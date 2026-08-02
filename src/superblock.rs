@@ -227,11 +227,14 @@ impl Superblock {
     }
 
     fn parse_v1(d: &[u8]) -> Result<Superblock, FormatError> {
-        // Same as v0 but adds indexed_storage_internal_node_k(2) + reserved(2) after group_internal_k
+        // Same as v0 but adds indexed_storage_internal_node_k(2) + reserved(2)
+        // *after* the consistency flags, not before them — the order the C
+        // library decodes (`H5F__sblock_deserialize`: symbol-table leaf K,
+        // B-tree internal K, status flags, chunk B-tree K, reserved).
         // sig(8) + version(1) + free_space_ver(1) + root_grp_ver(1) + reserved(1)
         // + shared_hdr_ver(1) + offset_size(1) + length_size(1) + reserved(1)
-        // + group_leaf_k(2) + group_internal_k(2) + indexed_storage_k(2) + reserved(2)
-        // + consistency_flags(4) = 28
+        // + group_leaf_k(2) + group_internal_k(2) + consistency_flags(4)
+        // + indexed_storage_k(2) + reserved(2) = 28
         ensure_len(d, 28)?;
 
         let offset_size = d[13];
@@ -240,9 +243,9 @@ impl Superblock {
 
         let group_leaf_node_k = LittleEndian::read_u16(&d[16..18]);
         let group_internal_node_k = LittleEndian::read_u16(&d[18..20]);
-        let indexed_storage_internal_node_k = LittleEndian::read_u16(&d[20..22]);
-        // d[22..24] reserved
-        let consistency_flags = LittleEndian::read_u32(&d[24..28]);
+        let consistency_flags = LittleEndian::read_u32(&d[20..24]);
+        let indexed_storage_internal_node_k = LittleEndian::read_u16(&d[24..26]);
+        // d[26..28] reserved
 
         let os = offset_size as usize;
         let var_start = 28;
@@ -398,9 +401,12 @@ mod tests {
         buf.push(0); // reserved
         buf.extend_from_slice(&4u16.to_le_bytes()); // group_leaf_node_k
         buf.extend_from_slice(&16u16.to_le_bytes()); // group_internal_node_k
+        // The flags precede the chunk B-tree K in a v1 superblock. Distinct,
+        // non-zero values in both, so reading them in the wrong order (which
+        // this crate did until the fix for issue #245's review) is visible.
+        buf.extend_from_slice(&1u32.to_le_bytes()); // consistency_flags
         buf.extend_from_slice(&32u16.to_le_bytes()); // indexed_storage_internal_node_k
         buf.extend_from_slice(&0u16.to_le_bytes()); // reserved
-        buf.extend_from_slice(&0u32.to_le_bytes()); // consistency_flags
         write_offset(&mut buf, 0, offset_size); // base
         write_offset(&mut buf, 0xFFFFFFFFFFFFFFFF, offset_size); // free space
         write_offset(&mut buf, 8192, offset_size); // eof
@@ -469,6 +475,12 @@ mod tests {
         assert_eq!(sb.root_group_address, 200);
         assert_eq!(sb.indexed_storage_internal_node_k, Some(32));
         assert_eq!(sb.group_leaf_node_k, Some(4));
+        // The two fields either side of the v1 reserved bytes used to be read in
+        // the wrong order, which reported the chunk B-tree K as the status flags
+        // — the byte every open now consults. A real v1 file with the default
+        // K of 32 would have read as "open for write" (bit 0 of 33, the C
+        // library's other common value, likewise).
+        assert_eq!(sb.consistency_flags, 1);
     }
 
     #[test]
