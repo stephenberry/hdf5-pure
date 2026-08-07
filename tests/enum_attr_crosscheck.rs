@@ -2,7 +2,7 @@
 // gated to 64-bit-pointer targets.
 #![cfg(not(target_pointer_width = "32"))]
 //! An enumeration *attribute* written by the reference C library must reach the
-//! caller, decoded through the enum's integer base type.
+//! caller, decoded through the enum's integer base type (#248).
 //!
 //! This is the read direction of `enum_base_crosscheck.rs`, and it matters because
 //! the C library is what writes the files in the wild: `H5T_NATIVE_HBOOL` — what

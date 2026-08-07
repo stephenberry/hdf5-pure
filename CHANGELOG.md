@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- An enumeration attribute reaches the caller, decoded through its integer base type as enum dataset data already is; `attrs()` skipped it before, so every `np.bool_` attribute in an h5py-written file — stored as `enum[FALSE, TRUE]` — went missing without a trace. The member names have no `AttrValue` to live in, so the codes are what survives.
+- An enumeration attribute reaches the caller, decoded through its integer base type as enum dataset data already is; `attrs()` skipped it before, so every `np.bool_` attribute in an h5py-written file — stored as `enum[FALSE, TRUE]` — went missing without a trace. The member names have no `AttrValue` to live in, so the codes are what survives ([#248](https://github.com/stephenberry/hdf5-pure/pull/248)).
 
 ## [0.33.0] - 2026-08-02
 
