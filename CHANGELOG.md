@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `FileBuilder::with_libver_bounds` now selects the on-disk format instead of only validating it: an upper bound of `LibVer::V18` writes the HDF5 1.8 format — a version 2 superblock and version 3 data-layout messages — where anything reaching 1.10 writes the 1.10 one. MATLAB's MAT v7.3 loader is HDF5 1.8.12 and cannot open a version 3 superblock, which is what a `.mat` file needs this for.
+- `FormatError::LibverTooOldForContent` reports content the requested bound cannot express, rather than silently upgrading the file. A chunked, filtered, or resizable dataset needs the 1.10 chunk indices, and a file-space strategy needs the 1.10 File Space Info message.
+- `LibVer::WRITER_OLDEST` names the oldest format the writer produces (1.8). A version 0 or 1 superblock needs v1 symbol-table groups, which this crate reads but does not write.
+
+### Changed
+
+- **Breaking:** `LibVer::WRITER_OUTPUT` is now `LibVer::WRITER_DEFAULT`, since the writer no longer emits a single format. Its value is unchanged.
+- An edit session writes a contiguous dataset's data-layout message in the format of the file it opened, so a `.mat` file edited through `File::open_rw` stays readable by MATLAB rather than being upgraded on its first edit. Chunked additions still require 1.10, as they always have.
+
 ### Fixed
 
 - An object header holding compact attributes now declares how many it has, so `H5Oget_info().num_attrs` agrees with iteration instead of reporting zero. Tools that size their work by the count saw no attributes at all — an `h5repack` round trip stripped every `MATLAB_*` attribute from a `.mat` file without warning. Applies to the whole-file writer and to headers rewritten in place, which heal an older file's missing message.

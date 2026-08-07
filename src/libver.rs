@@ -21,6 +21,9 @@
 /// grows, so match with a `_` arm and read the newest this crate knows about
 /// from [`LATEST`](Self::LATEST).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+// `mat::Options` carries a `LibVer` and is itself serializable, so a persisted
+// set of MAT options can record which on-disk format it writes.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum LibVer {
     /// The earliest format (HDF5 1.0+): version 0/1 superblock, v1
@@ -44,8 +47,24 @@ impl LibVer {
     pub const LATEST: LibVer = LibVer::V114;
 
     /// The on-disk format this crate's [`FileBuilder`](crate::FileBuilder)
-    /// produces: the version 3 superblock introduced in HDF5 1.10.
-    pub const WRITER_OUTPUT: LibVer = LibVer::V110;
+    /// produces when nothing constrains it: the version 3 superblock introduced
+    /// in HDF5 1.10.
+    ///
+    /// It is a *default*, not the only output.
+    /// [`with_libver_bounds`](crate::FileBuilder::with_libver_bounds) selects a
+    /// format within the bounds it is given, and the oldest this crate can write
+    /// is [`WRITER_OLDEST`](Self::WRITER_OLDEST).
+    pub const WRITER_DEFAULT: LibVer = LibVer::V110;
+
+    /// The oldest on-disk format this crate's [`FileBuilder`](crate::FileBuilder)
+    /// can produce: the version 2 superblock and "new style" object headers
+    /// introduced in HDF5 1.8.
+    ///
+    /// Nothing older is reachable. A version 0 or 1 superblock pairs with v1
+    /// symbol-table groups and local heaps, which this crate reads but does not
+    /// write, so a bound whose upper end is [`Earliest`](Self::Earliest) is
+    /// refused rather than silently satisfied with something newer.
+    pub const WRITER_OLDEST: LibVer = LibVer::V18;
 
     /// The minimum library version required to read a file with the given
     /// superblock version — i.e. the *low bound* the on-disk format implies.

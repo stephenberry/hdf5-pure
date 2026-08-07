@@ -139,15 +139,41 @@ impl FileBuilder {
     }
 
     /// Constrain the on-disk format version of the file, mirroring HDF5's
-    /// `H5Pset_libver_bounds`. The produced file must fall within `[low, high]`,
-    /// or [`finish`](Self::finish) / [`write`](Self::write) fails with
+    /// `H5Pset_libver_bounds`. The file is written in the newest format the
+    /// bounds allow, between [`LibVer::WRITER_OLDEST`] and
+    /// [`LibVer::WRITER_DEFAULT`]; bounds that leave no such format fail with
     /// [`Error::Format`] wrapping
     /// [`FormatError::LibverBoundsUnsatisfiable`](crate::FormatError::LibverBoundsUnsatisfiable).
     ///
-    /// This crate writes exactly one format — the version 3 superblock from
-    /// HDF5 1.10 ([`LibVer::WRITER_OUTPUT`]) — so this is a compatibility
-    /// assertion, not a format selector: a bound that excludes 1.10 (an upper
-    /// bound older than it, or a lower bound newer than it) is rejected.
+    /// `high` selects the format. `Earliest..=V18` writes the HDF5 1.8 format —
+    /// a version 2 superblock and version 3 data-layout messages — and anything
+    /// reaching 1.10 writes the 1.10 one. That is what a file destined for an
+    /// older reader wants: MATLAB's MAT v7.3 loader, for instance, is HDF5
+    /// 1.8.12 and does not understand a version 3 superblock.
+    ///
+    /// Content the 1.8 format cannot express is refused rather than silently
+    /// upgraded, with
+    /// [`FormatError::LibverTooOldForContent`](crate::FormatError::LibverTooOldForContent):
+    /// a chunked, filtered, or resizable dataset needs the 1.10 chunk indices,
+    /// and a file-space strategy needs the 1.10 File Space Info message.
+    /// [`File::open_swmr_writer`](crate::File::open_swmr_writer) likewise needs
+    /// a version 3 superblock, so a file written to the 1.8 bound cannot host a
+    /// SWMR writer.
+    ///
+    /// ```
+    /// use hdf5_pure::{FileBuilder, LibVer};
+    ///
+    /// let mut builder = FileBuilder::new();
+    /// builder.with_libver_bounds(LibVer::Earliest, LibVer::V18);
+    /// builder.create_dataset("values").with_f64_data(&[1.0, 2.0, 3.0]);
+    /// let bytes = builder.finish().unwrap();
+    /// assert_eq!(bytes[8], 2); // version 2 superblock, readable by HDF5 1.8
+    /// ```
+    ///
+    /// This differs from the C library, which picks the *oldest* format the
+    /// content needs and reads `low` as a floor; on `Earliest..=Latest`
+    /// `H5Fcreate` writes a version 0 superblock where this writes a version 3
+    /// one. Leaving the bounds unset is the same as leaving `high` at `Latest`.
     pub fn with_libver_bounds(&mut self, low: LibVer, high: LibVer) -> &mut Self {
         self.writer.with_libver_bounds(low, high);
         self

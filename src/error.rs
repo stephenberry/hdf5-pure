@@ -320,18 +320,36 @@ pub enum FormatError {
     Source(String),
     /// The library-version bounds requested via
     /// [`FileBuilder::with_libver_bounds`](crate::FileBuilder::with_libver_bounds)
-    /// cannot be satisfied. This crate's writer emits exactly one on-disk format
-    /// (the version 3 / HDF5 1.10 superblock), so a bound that excludes it — an
-    /// upper bound older than 1.10, or a lower bound newer than 1.10 — is
-    /// unsatisfiable. The fields carry the format produced and the bounds asked
-    /// for, as [`LibVer::name`](crate::LibVer::name) labels.
+    /// admit no format this crate writes. It writes the 1.8 and 1.10 formats
+    /// ([`LibVer::WRITER_OLDEST`](crate::LibVer::WRITER_OLDEST) through
+    /// [`LibVer::WRITER_DEFAULT`](crate::LibVer::WRITER_DEFAULT)), so an upper
+    /// bound older than 1.8, or a lower bound newer than 1.10, is unsatisfiable.
+    /// The fields carry the default format and the bounds asked for, as
+    /// [`LibVer::name`](crate::LibVer::name) labels.
     LibverBoundsUnsatisfiable {
-        /// The library-version label of the format this crate writes.
+        /// The library-version label of the format this crate writes by default.
         writes: &'static str,
         /// The requested lower bound.
         requested_low: &'static str,
         /// The requested upper bound.
         requested_high: &'static str,
+    },
+    /// The file's content needs a newer on-disk format than the requested
+    /// library-version bounds allow, so writing it would silently produce a file
+    /// the caller asked not to receive.
+    ///
+    /// Reported rather than upgraded, because the bound exists to be relied on:
+    /// a MAT v7.3 file bounded to 1.8 so MATLAB can load it is worth less than
+    /// nothing if compressing it quietly restores the 1.10 format. `content`
+    /// names what forced the newer format and `needs` the format it forces, both
+    /// as [`LibVer::name`](crate::LibVer::name) labels.
+    LibverTooOldForContent {
+        /// What in the file requires a newer format, e.g. `"a chunked dataset"`.
+        content: &'static str,
+        /// The library-version label of the format that content requires.
+        needs: &'static str,
+        /// The library-version label of the format the bounds resolved to.
+        writing: &'static str,
     },
     /// An HDF5 object reference (`H5R_OBJECT`) could not be resolved to an
     /// object: the stored address is null or undefined (`HADDR_UNDEF`), or it
@@ -794,7 +812,18 @@ impl fmt::Display for FormatError {
                 write!(
                     f,
                     "requested library-version bounds [{requested_low}, {requested_high}] \
-                     cannot be satisfied: this crate writes the {writes} format"
+                     cannot be satisfied: this crate writes the v1.8 and {writes} formats"
+                )
+            }
+            FormatError::LibverTooOldForContent {
+                content,
+                needs,
+                writing,
+            } => {
+                write!(
+                    f,
+                    "{content} requires the {needs} format, but the requested \
+                     library-version bounds write {writing}"
                 )
             }
             FormatError::InvalidObjectReference(addr) => {

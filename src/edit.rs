@@ -194,6 +194,7 @@ use crate::free_space_manager::{
 };
 use crate::group_v2::resolve_group_entries_from_source;
 use crate::image::{FileImage, HandleImage, MirrorImage};
+use crate::libver::LibVer;
 use crate::link_message::{LinkMessage, LinkTarget};
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
@@ -1558,6 +1559,26 @@ impl WriteEngine {
     /// clone from an earlier moment may be reading a stale root.
     pub(crate) fn superblock(&self) -> &Superblock {
         &self.superblock
+    }
+
+    /// The on-disk format this session writes, read from the file it opened
+    /// rather than chosen fresh, since a commit preserves the superblock version
+    /// it found.
+    ///
+    /// This decides the *contiguous* data-layout message version, where the
+    /// older number costs nothing: versions 3 and 4 have identical bodies there,
+    /// so a dataset added to a 1.8 file stays readable by a 1.8 library.
+    ///
+    /// It does not gate chunked storage. A chunked dataset needs the version 4
+    /// layout and a 1.10 chunk index whatever the superblock says, so adding one
+    /// to an older file does make that file need 1.10 — deliberately, since the
+    /// alternative is a version 1 B-tree index this crate does not write, and
+    /// refusing instead would take away in-place editing of every file the C
+    /// library wrote with its own default bounds. `tests/edit_crosscheck.rs`
+    /// covers exactly that case (issue #101). A caller who needs a file to stay
+    /// loadable by an old reader should keep its datasets contiguous.
+    pub(crate) fn libver(&self) -> LibVer {
+        LibVer::from_superblock_version(self.superblock.version)
     }
 
     /// Which backend this session resolved to: [`Bounded`] when it reads through
@@ -3006,6 +3027,7 @@ impl WriteEngine {
                         &fd.attrs,
                         None,
                         fd.fill.as_deref(),
+                        self.libver(),
                     )?
                 };
                 let oh_addr = self.alloc_or_append_typed(&oh, PageType::Meta)?;
