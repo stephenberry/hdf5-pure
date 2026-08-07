@@ -483,6 +483,21 @@ pub(crate) struct WriteEngine {
     /// from [`batched_appends`](Self::batched_appends), which is a crash-atomicity
     /// trade the bounded engine happens to make, not a statement about memory.
     bounded: bool,
+    /// The on-disk format this session may write, resolved from the fapl's
+    /// [`FileAccessProperties::with_libver_bounds`]. `None` — the default —
+    /// means unconstrained: the session adds whatever the content needs, which
+    /// is what lets a file the C library wrote under its own bounds be edited at
+    /// all.
+    ///
+    /// Set below [`LibVer::V110`] it refuses content the older format cannot
+    /// carry, the way the whole-file writer does. The file's *own* superblock
+    /// version cannot stand in for this: a version 2 superblock says the file is
+    /// 1.8-readable today, not that the caller wants it to stay that way, and
+    /// deriving the ceiling from it would refuse the C-library-file edits of
+    /// issue #101.
+    ///
+    /// [`FileAccessProperties::with_libver_bounds`]: crate::FileAccessProperties::with_libver_bounds
+    libver_ceiling: Option<LibVer>,
     /// The file length when the on-disk free-space managers were last written,
     /// for a file that persists them. Every immediate in-place append grows the
     /// file past those managers and leaves them mid-file, so a session that ends
@@ -1188,6 +1203,7 @@ impl WriteEngine {
             resolved: HashMap::new(),
             batched_appends: false,
             bounded: false,
+            libver_ceiling: None,
             fsm_len: len,
         };
         // If the file persists its free space, seed the free list from the
@@ -1575,10 +1591,65 @@ impl WriteEngine {
     /// alternative is a version 1 B-tree index this crate does not write, and
     /// refusing instead would take away in-place editing of every file the C
     /// library wrote with its own default bounds. `tests/edit_crosscheck.rs`
-    /// covers exactly that case (issue #101). A caller who needs a file to stay
-    /// loadable by an old reader should keep its datasets contiguous.
+    /// covers exactly that case (issue #101).
+    ///
+    /// That is a default, not a verdict: a caller who needs the file to stay
+    /// loadable by an old reader asks for it with
+    /// [`FileAccessProperties::with_libver_bounds`], which sets
+    /// [`libver_ceiling`](Self::libver_ceiling) and turns the addition into a
+    /// refusal at commit rather than a silent format bump.
+    ///
+    /// [`FileAccessProperties::with_libver_bounds`]: crate::FileAccessProperties::with_libver_bounds
     pub(crate) fn libver(&self) -> LibVer {
         LibVer::from_superblock_version(self.superblock.version)
+    }
+
+    /// Constrain what this session may add, from the fapl's library-version
+    /// bounds. See [`libver_ceiling`](Self::libver_ceiling).
+    ///
+    /// Resolved through [`LibVer::resolve_writable`], the same rule the
+    /// whole-file writer applies, so bounds admitting no format this crate
+    /// writes are refused here as they are there rather than silently ignored on
+    /// the editing path.
+    pub(crate) fn set_libver_bounds(
+        &mut self,
+        bounds: Option<(LibVer, LibVer)>,
+    ) -> Result<(), Error> {
+        self.libver_ceiling = match bounds {
+            Some(_) => Some(LibVer::resolve_writable(bounds).map_err(Error::Format)?),
+            None => None,
+        };
+        Ok(())
+    }
+
+    /// Refuse staged content the session's [`libver_ceiling`](Self::libver_ceiling)
+    /// cannot express, before the commit writes anything.
+    ///
+    /// Only chunked storage is at stake: `build_chunked_dataset_oh` writes a
+    /// version 4 data-layout message and a 1.10 chunk index unconditionally,
+    /// while everything else this session adds is expressible in both formats
+    /// (`libver` already picks the contiguous layout version). A filter or an
+    /// unlimited dimension arrives as chunked storage, so they are covered here
+    /// too.
+    fn check_libver_admits(&self, flat: &BTreeMap<PathKey, Vec<FlatDataset>>) -> Result<(), Error> {
+        let Some(ceiling) = self.libver_ceiling else {
+            return Ok(());
+        };
+        if ceiling >= LibVer::V110 {
+            return Ok(());
+        }
+        let chunked = flat
+            .values()
+            .flatten()
+            .any(|fd| fd.chunk_options.is_chunked() || fd.maxshape.is_some());
+        if chunked {
+            return Err(Error::Format(FormatError::LibverTooOldForContent {
+                content: "a chunked, filtered, or resizable dataset",
+                needs: LibVer::V110.name(),
+                writing: ceiling.name(),
+            }));
+        }
+        Ok(())
     }
 
     /// Which backend this session resolved to: [`Bounded`] when it reads through
@@ -2779,6 +2850,11 @@ impl WriteEngine {
             flat.insert(key.clone(), v);
         }
 
+        // Content the caller's library-version bound cannot carry is refused
+        // here, beside the other flatten-time guards and before any write, so a
+        // rejected addition leaves the commit unapplied.
+        self.check_libver_admits(&flat)?;
+
         // Prove every object-reference target resolves before any write (see
         // `preflight_reference_targets`'s doc comment): otherwise a reference
         // resolution failure discovered mid-apply-loop would leave every
@@ -3073,7 +3149,7 @@ impl WriteEngine {
                 ));
             }
 
-            let oh = build_v2_object_header(&region);
+            let oh = build_v2_object_header(&region)?;
             let addr = self.alloc_or_append_typed(&oh, PageType::Meta)?;
             path_addr.insert(key.clone(), addr);
         }
@@ -3233,7 +3309,7 @@ impl WriteEngine {
         let placeholder =
             FileSpaceInfo::persistent_single_manager(strategy, threshold, page_size, 0, 0);
         let ext_len =
-            build_v2_object_header(&self.rewrite_extension_region(old_ext_addr, &placeholder)?)
+            build_v2_object_header(&self.rewrite_extension_region(old_ext_addr, &placeholder)?)?
                 .len() as u64;
 
         let ext_addr = self.image.len();
@@ -3244,7 +3320,7 @@ impl WriteEngine {
         let (ext_oh, fsm_blocks, final_eof) = if sections.is_empty() {
             let info = FileSpaceInfo::persistent_empty(strategy, threshold, page_size);
             let ext_oh =
-                build_v2_object_header(&self.rewrite_extension_region(old_ext_addr, &info)?);
+                build_v2_object_header(&self.rewrite_extension_region(old_ext_addr, &info)?)?;
             let final_eof = ext_addr + ext_oh.len() as u64;
             (ext_oh, None, final_eof)
         } else {
@@ -3267,7 +3343,7 @@ impl WriteEngine {
                 eoa_pre_fsm,
             );
             let ext_oh =
-                build_v2_object_header(&self.rewrite_extension_region(old_ext_addr, &info)?);
+                build_v2_object_header(&self.rewrite_extension_region(old_ext_addr, &info)?)?;
             debug_assert_eq!(
                 ext_oh.len() as u64,
                 ext_len,
@@ -3424,7 +3500,7 @@ impl WriteEngine {
             0,
         );
         let ext_len =
-            build_v2_object_header(&self.rewrite_extension_region(old_ext_addr, &placeholder)?)
+            build_v2_object_header(&self.rewrite_extension_region(old_ext_addr, &placeholder)?)?
                 .len() as u64;
 
         let ext_addr = self.image.len();
@@ -3449,7 +3525,7 @@ impl WriteEngine {
             // No free space to track: an empty persist message, page-aligned.
             let info = FileSpaceInfo::persistent_empty(strategy, threshold, page_size);
             let ext_oh =
-                build_v2_object_header(&self.rewrite_extension_region(old_ext_addr, &info)?);
+                build_v2_object_header(&self.rewrite_extension_region(old_ext_addr, &info)?)?;
             let final_eof = align_up(ext_addr + ext_oh.len() as u64, page_size);
             (ext_oh, final_eof)
         } else {
@@ -3460,7 +3536,7 @@ impl WriteEngine {
                 strategy, threshold, page_size, plan.slots, final_eof,
             );
             let ext_oh =
-                build_v2_object_header(&self.rewrite_extension_region(old_ext_addr, &info)?);
+                build_v2_object_header(&self.rewrite_extension_region(old_ext_addr, &info)?)?;
             debug_assert_eq!(
                 ext_oh.len() as u64,
                 ext_len,
@@ -4842,7 +4918,7 @@ impl WriteEngine {
             } => {
                 let mut region = region.clone();
                 self.append_dense_attrs(&mut region, dense_attrs)?;
-                let oh = build_v2_object_header(&region);
+                let oh = build_v2_object_header(&region)?;
                 self.alloc_or_append_typed(&oh, PageType::Meta)
             }
             CopyTree::DatasetContiguous {
@@ -4860,7 +4936,7 @@ impl WriteEngine {
                 // Append the dense heap *after* the data so the heap's base
                 // equals end-of-file (see `append_dense_attrs`).
                 self.append_dense_attrs(&mut region, dense_attrs)?;
-                let oh = build_v2_object_header(&region);
+                let oh = build_v2_object_header(&region)?;
                 self.alloc_or_append_typed(&oh, PageType::Meta)
             }
             CopyTree::DatasetChunked {
@@ -4898,7 +4974,7 @@ impl WriteEngine {
                 // Append the dense heap after the children's headers/data so its
                 // base equals end-of-file (see `append_dense_attrs`).
                 self.append_dense_attrs(&mut region, dense_attrs)?;
-                let oh = build_v2_object_header(&region);
+                let oh = build_v2_object_header(&region)?;
                 self.alloc_or_append_typed(&oh, PageType::Meta)
             }
         }
@@ -4972,7 +5048,7 @@ impl WriteEngine {
         // its base equals end-of-file (see `append_dense_attrs`).
         let mut new_region = replace_layout_message(region, &layout.layout_message)?;
         self.append_dense_attrs(&mut new_region, dense_attrs)?;
-        let oh = build_v2_object_header(&new_region);
+        let oh = build_v2_object_header(&new_region)?;
         self.alloc_or_append_typed(&oh, PageType::Meta)
     }
 
@@ -5046,12 +5122,12 @@ impl WriteEngine {
                 // layout body; keep it in sync with the new length.
                 let size_off = *addr_off + 8;
                 region[size_off..size_off + 8].copy_from_slice(&(raw.len() as u64).to_le_bytes());
-                let oh = build_v2_object_header(&region);
+                let oh = build_v2_object_header(&region)?;
                 self.alloc_or_append_typed(&oh, PageType::Meta)
             }
             MovingWrite::Compact { region, raw } => {
                 let region = rebuild_compact_layout_region(region, raw)?;
-                let oh = build_v2_object_header(&region);
+                let oh = build_v2_object_header(&region)?;
                 self.alloc_or_append_typed(&oh, PageType::Meta)
             }
             MovingWrite::Chunked {
@@ -5116,7 +5192,7 @@ impl WriteEngine {
                         &msg.serialize(LENGTH_SIZE),
                     ));
                 }
-                let oh = build_v2_object_header(&region);
+                let oh = build_v2_object_header(&region)?;
                 self.alloc_or_append_typed(&oh, PageType::Meta)
             }
         }
@@ -5207,7 +5283,7 @@ impl WriteEngine {
         );
         let region = replace_dataspace_message(region, new_dataspace_body)?;
         let region = replace_layout_message(&region, &layout_body)?;
-        let oh = build_v2_object_header(&region);
+        let oh = build_v2_object_header(&region)?;
         self.alloc_or_append_typed(&oh, PageType::Meta)
     }
 
@@ -7853,20 +7929,25 @@ fn datatype_copies_foreign_address(dt: &crate::datatype::Datatype) -> bool {
 /// attribute storage with [`ensure_attribute_info`]. Mirrors the encoding in
 /// [`crate::object_header_writer::ObjectHeaderWriter::serialize`].
 ///
-/// The normalization belongs here rather than at the thirteen call sites because
+/// The normalization belongs here rather than at the fifteen call sites because
 /// carrying an Attribute Info message is a property of a version 2 header holding
 /// inline attributes, not of any one edit operation — and a site that forgot it
-/// would reintroduce the zero-count defect silently. Every region reaching this
-/// point was either built by this crate or already walked message-by-message on
-/// the way in, so a region that cannot be walked is unreachable; it is wrapped
-/// unchanged, which is what this function did before the normalization existed.
-pub(crate) fn build_v2_object_header(region: &[u8]) -> Vec<u8> {
+/// would reintroduce the zero-count defect silently.
+///
+/// A region that cannot be walked is reported, not asserted away. Every region
+/// reaching here should have been built by this crate or already walked
+/// message-by-message on the way in, but "should" is a claim about a file this
+/// session did not write: a header whose message size field overruns the region
+/// is a malformed *file*, which is the caller's input and so takes an
+/// [`Error::EditUnsupported`], the way every other malformed-header path in this
+/// module does. The `debug_assert!(false)` this replaced made the two build
+/// profiles disagree about whether such a file was writable at all — a panic in
+/// a test build, and in a release build a header silently missing its Attribute
+/// Info message, which is the zero-count defect this function exists to prevent.
+pub(crate) fn build_v2_object_header(region: &[u8]) -> Result<Vec<u8>, Error> {
     let mut owned = region.to_vec();
-    match ensure_attribute_info(&mut owned) {
-        Ok(()) => return build_v2_object_header_verbatim(&owned),
-        Err(_) => debug_assert!(false, "an object header region must be walkable"),
-    }
-    build_v2_object_header_verbatim(region)
+    ensure_attribute_info(&mut owned)?;
+    Ok(build_v2_object_header_verbatim(&owned))
 }
 
 /// [`build_v2_object_header`] without the attribute-storage normalization, for
@@ -9251,6 +9332,52 @@ mod tests {
             spans.iter().all(|&(_, _, ty)| ty == PageType::Raw),
             "the reclaim tags every chunked span raw; a metadata tag here would need \
              the placement rule above to change with it"
+        );
+    }
+}
+
+#[cfg(test)]
+mod object_header_wrap_tests {
+    use super::*;
+
+    /// A region whose messages cannot be walked is reported, not asserted away.
+    ///
+    /// The `debug_assert!(false)` this replaced split the behavior by build
+    /// profile: a test build panicked, and a release build wrote the header with
+    /// no Attribute Info message — the zero-`num_attrs` defect the normalization
+    /// exists to prevent. Asserted as an `Err` because that is the one answer
+    /// both profiles can give.
+    #[test]
+    fn an_unwalkable_region_is_refused_rather_than_wrapped() {
+        // One version 2 header message — type byte, 2-byte size, flags byte —
+        // whose size field claims far more body than the region holds.
+        let mut region = vec![0x0Cu8]; // Attribute
+        region.extend_from_slice(&0xFFFFu16.to_le_bytes());
+        region.push(0); // flags
+        region.extend_from_slice(&[0u8; 4]); // a body far shorter than declared
+
+        let err = build_v2_object_header(&region).unwrap_err();
+        assert!(
+            matches!(err, Error::EditUnsupported(_)),
+            "an unwalkable region gave {err:?}"
+        );
+    }
+
+    /// The walkable case still normalizes: a header carrying inline attributes
+    /// comes back with the Attribute Info message that declares their count.
+    #[test]
+    fn a_walkable_region_still_gains_its_attribute_info() {
+        let body = [0u8; 8];
+        let mut region = vec![0x0Cu8]; // Attribute
+        region.extend_from_slice(&(body.len() as u16).to_le_bytes());
+        region.push(0); // flags
+        region.extend_from_slice(&body);
+
+        let oh = build_v2_object_header(&region).unwrap();
+        assert_eq!(&oh[..4], b"OHDR");
+        assert!(
+            oh.len() > 8 + region.len() + 4,
+            "the wrapped header did not grow by an Attribute Info message"
         );
     }
 }
