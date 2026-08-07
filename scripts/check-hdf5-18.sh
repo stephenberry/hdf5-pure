@@ -4,7 +4,7 @@
 #
 # Why this exists, and why it is not a CI job
 # -------------------------------------------
-# MATLAB reads MAT v7.3 files with HDF5 1.8.12 — a different, older library than
+# MATLAB linked HDF5 1.8.12 before R2021b — a different, older library than
 # the 1.10.7 behind its own `h5read`/`h5disp`/`h5info` family. A version 3
 # superblock is a 1.10 addition, so a file carrying one reads fine under
 # `h5disp` and fails under `load`. That is the whole reason `mat::Options`

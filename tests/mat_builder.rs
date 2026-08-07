@@ -238,7 +238,7 @@ fn empty_marker_data_as_dims_default() {
 }
 
 /// A `.mat` file's whole purpose is to be read by MATLAB, and MATLAB reads MAT
-/// v7.3 with HDF5 1.8.12 — a library that predates the version 3 superblock.
+/// v7.3 with HDF5 1.8.12 before R2021b — a library predating superblock 3.
 /// So the MAT default is the 1.8 format, which is checked here against the raw
 /// bytes rather than through a library that would read either version happily.
 #[test]

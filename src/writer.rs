@@ -149,7 +149,7 @@ impl FileBuilder {
     /// a version 2 superblock and version 3 data-layout messages — and anything
     /// reaching 1.10 writes the 1.10 one. That is what a file destined for an
     /// older reader wants: MATLAB's MAT v7.3 loader, for instance, is HDF5
-    /// 1.8.12 and does not understand a version 3 superblock.
+    /// 1.8.12 before R2021b, which does not understand a version 3 superblock.
     ///
     /// Content the 1.8 format cannot express is refused rather than silently
     /// upgraded, with

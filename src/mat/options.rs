@@ -247,13 +247,16 @@ pub struct Options {
     /// The newest HDF5 on-disk format the file may use — the upper bound handed
     /// to [`FileBuilder::with_libver_bounds`](crate::FileBuilder::with_libver_bounds).
     ///
-    /// Defaults to [`LibVer::V18`], because MATLAB reads MAT v7.3 files with a
-    /// *different, older* HDF5 library than the one behind its `h5read` family:
-    /// 1.8.12 rather than 1.10.7. A version 3 superblock is a 1.10 addition, so
-    /// a file carrying one reads fine under `h5disp` and `h5info` and fails to
-    /// `load`. Real MATLAB writes an older format still — a version 0
-    /// superblock with v1 symbol-table groups, which this crate does not
-    /// produce.
+    /// Defaults to [`LibVer::V18`], the newest format every MATLAB release can
+    /// open. A version 3 superblock is an HDF5 1.10 addition, and MATLAB linked
+    /// HDF5 1.8.12 before R2021b (1.10.7 in R2021b, 1.10.x through R2024a,
+    /// 1.14.4.3 since R2024b), so a file carrying one cannot be opened there at
+    /// all. Around R2021b MathWorks additionally kept 1.8.12 on the MAT v7.3
+    /// path while `h5read`/`h5disp` used 1.10.7, which is why such a file could
+    /// print under `h5disp` and still fail to `load`.
+    ///
+    /// Real MATLAB writes an older format still — a version 0 superblock with
+    /// v1 symbol-table groups, which this crate reads but does not produce.
     ///
     /// Raising this to [`LibVer::V110`] is what [`Compression`] needs, since
     /// compression requires chunked storage and the chunk indices this crate
@@ -320,7 +323,7 @@ mod tests {
     /// The defaults that describe the *file* rather than the values in it are
     /// the ones MATLAB itself writes: an empty array is a `uint64` dataset
     /// holding its own dimensions, and the format is old enough for the HDF5
-    /// 1.8.12 library MATLAB loads MAT v7.3 files with.
+    /// 1.8.12 that MATLAB linked before R2021b.
     #[test]
     fn file_defaults_match_what_matlab_writes() {
         let o = Options::default();

@@ -190,9 +190,22 @@ A struct array authored in MATLAB (`s(1).x = …; s(2).x = …`) is stored as a 
 
 ## The on-disk format MATLAB's `load` needs
 
-MATLAB does not read `.mat` files with the same HDF5 library it exposes through `h5read`, `h5disp`, and `h5info`. Those go through HDF5 1.10.7; `load` for a MAT v7.3 file goes through a separate HDF5 1.8.12 that MathWorks kept on the MAT path deliberately, to avoid 1.10 regressions. That split has an unusual and recognizable symptom: a file that `h5disp` prints happily and `load` refuses.
+MATLAB has not always read HDF5 with the same library, and which one it links decides whether it can open a file at all. [MathWorks documents the version per release](https://www.mathworks.com/help/matlab/hdf5-files.html):
 
-The version 3 superblock is an HDF5 1.10 addition, so a `.mat` file carrying one lands exactly in that gap. `mat::Options::libver` therefore defaults to `LibVer::V18`, and the writer emits a version 2 superblock with version 3 data-layout messages — the newest encoding HDF5 1.8 understands.
+| MATLAB release | HDF5 C library |
+| --- | --- |
+| R2024b and later | 1.14.4.3 |
+| R2024a | 1.10.11 |
+| R2023b | 1.10.10 |
+| before R2023b | 1.10.8 |
+| R2021b | 1.10.7 |
+| before R2021b | 1.8.12 |
+
+The version 3 superblock is an HDF5 1.10 addition, so a `.mat` file carrying one cannot be opened by MATLAB before R2021b — not partially, not with a warning, at all. `mat::Options::libver` therefore defaults to `LibVer::V18` and the writer emits a version 2 superblock with version 3 data-layout messages: the newest encoding HDF5 1.8 understands, and one every later MATLAB reads as well. Choosing it costs nothing. The message bodies are identical between the two, so the files differ in two version bytes and are the same size.
+
+There is a second reason to prefer it, less well documented. Around R2021b MathWorks shipped two libraries at once — 1.10.7 for the `h5read`/`h5disp`/`h5info` interface, with 1.8.12 kept on the MAT v7.3 path to avoid 1.10 regressions. That split produces an unusual and recognizable symptom: a file `h5disp` prints happily and `load` refuses. How long it lasted is not documented, so on releases where the table above would suggest a 1.10 file is safe, it may not be.
+
+`examples/octave/check_format.m` puts the question to whichever MATLAB you have, against a pair of files that differ only in this format. Run it there rather than in Octave, whose HDF5 is modern and reads both.
 
 The one thing that cannot be written that way is compression, which needs chunked storage, whose chunk indices arrived in 1.10. Asking for both is refused with `MatError::CompressionNeedsNewerFormat` rather than resolved in either direction, since dropping the compression loses what you asked for and raising the format produces a file MATLAB cannot load:
 

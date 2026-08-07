@@ -6,7 +6,7 @@
 //! (`FileBuilder::with_libver_bounds` with an upper bound of `LibVer::V18`).
 //!
 //! The 1.8 format exists because a reader older than 1.10 cannot open what this
-//! crate writes by default: MATLAB's MAT v7.3 loader is HDF5 1.8.12, and a
+//! crate writes by default: MATLAB linked HDF5 1.8.12 before R2021b, and a
 //! version 3 superblock is a 1.10 addition it does not understand. What this
 //! module checks is that the *older encoding is still a correct file* — the
 //! version 2 superblock and version 3 data-layout messages carry the same

@@ -8,14 +8,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- `FileBuilder::with_libver_bounds` now selects the on-disk format instead of only validating it: an upper bound of `LibVer::V18` writes the HDF5 1.8 format — a version 2 superblock and version 3 data-layout messages — where anything reaching 1.10 writes the 1.10 one. MATLAB's MAT v7.3 loader is HDF5 1.8.12 and cannot open a version 3 superblock, which is what a `.mat` file needs this for.
+- `FileBuilder::with_libver_bounds` now selects the on-disk format instead of only validating it: an upper bound of `LibVer::V18` writes the HDF5 1.8 format — a version 2 superblock and version 3 data-layout messages — where anything reaching 1.10 writes the 1.10 one. MATLAB used HDF5 1.8.12 before R2021b and cannot open a version 3 superblock there, which is what a `.mat` file needs this for.
 - `FormatError::LibverTooOldForContent` reports content the requested bound cannot express, rather than silently upgrading the file. A chunked, filtered, or resizable dataset needs the 1.10 chunk indices, and a file-space strategy needs the 1.10 File Space Info message.
 - `LibVer::WRITER_OLDEST` names the oldest format the writer produces (1.8). A version 0 or 1 superblock needs v1 symbol-table groups, which this crate reads but does not write.
 - `mat::Options::libver` sets the newest HDF5 format a `.mat` file may use, defaulting to `LibVer::V18`. `mat::MatError::CompressionNeedsNewerFormat` reports the one combination that cannot hold: compression needs chunked storage, which needs 1.10.
 
 ### Changed
 
-- **Breaking:** MAT files are written in the HDF5 1.8 format by default, so MATLAB can `load` them. MATLAB reads MAT v7.3 with HDF5 1.8.12 rather than the 1.10.7 behind its `h5read` family, and a version 3 superblock is a 1.10 addition — files this crate wrote read fine under `h5disp` and failed to `load`. Set `mat::Options::libver` to `LibVer::V110` for the previous format, which compression requires.
+- **Breaking:** MAT files are written in the HDF5 1.8 format by default, so MATLAB can `load` them. A version 3 superblock is an HDF5 1.10 addition, and MATLAB used HDF5 1.8.12 before R2021b, so files this crate wrote could not be opened there at all. Set `mat::Options::libver` to `LibVer::V110` for the previous format, which compression requires.
 - **Breaking:** `mat::Options::default` uses `EmptyMarkerEncoding::DataAsDims`, matching what MATLAB and the reference `matio` library both write: an empty array is a two-element `uint64` dataset holding its own dimensions, not a zero-element dataset of that shape. This is what makes an empty value read back as empty — `matio` recovers `0x0` with zero elements, where the old encoding left it no dimensions to recover and an element count of one, so `isempty` was unreliable and `isempty(fieldnames(x))` was needed instead.
 - **Breaking:** `LibVer::WRITER_OUTPUT` is now `LibVer::WRITER_DEFAULT`, since the writer no longer emits a single format. Its value is unchanged.
 - An edit session writes a contiguous dataset's data-layout message in the format of the file it opened, so a `.mat` file edited through `File::open_rw` stays readable by MATLAB rather than being upgraded on its first edit. Chunked additions still require 1.10, as they always have.

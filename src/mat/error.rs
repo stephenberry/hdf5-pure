@@ -77,7 +77,7 @@ pub enum MatError {
     ///
     /// Compression needs chunked storage, and the chunk indices this crate
     /// writes arrived in HDF5 1.10 — while the MAT default is the 1.8 format,
-    /// because MATLAB's MAT v7.3 loader is HDF5 1.8.12. Refused rather than
+    /// because MATLAB used HDF5 1.8.12 before R2021b. Refused rather than
     /// resolved either way: dropping the compression loses what the caller asked
     /// for, and raising the format produces a `.mat` file MATLAB cannot `load`.
     /// Set `libver` to [`LibVer::V110`](crate::LibVer::V110) to compress and

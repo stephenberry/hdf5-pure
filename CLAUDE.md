@@ -14,7 +14,7 @@ Prefer `cargo test --lib` for the fast loop: the ~580 library tests run in about
 
 `scripts/check-hdf5-18.sh` builds HDF5 1.8.23 and points its tools at both formats this crate writes. **Run it when changing anything about superblock or object-header message versions**, and read it before assuming the test suite covers that ground — it does not, and cannot.
 
-MATLAB reads MAT v7.3 with HDF5 **1.8.12**, a different and older library than the 1.10.7 behind its own `h5read`/`h5disp`/`h5info` family. A version 3 superblock is a 1.10 addition, so a file carrying one reads fine under `h5disp` and fails under `load`; that is why `mat::Options::libver` defaults to `LibVer::V18` and why `FileBuilder::with_libver_bounds` selects a format rather than merely validating one.
+Which HDF5 library MATLAB links has changed across releases, and MathWorks documents it: **1.8.12 before R2021b**, 1.10.7 in R2021b, 1.10.x through R2024a, 1.14.4.3 since R2024b. A version 3 superblock is a 1.10 addition, so a `.mat` carrying one cannot be opened at all before R2021b. That is why `mat::Options::libver` defaults to `LibVer::V18` and why `FileBuilder::with_libver_bounds` selects a format rather than merely validating one. Around R2021b MathWorks also shipped 1.8.12 on the MAT path while `h5read` used 1.10.7, which is the split behind the reported symptom of `h5disp` working where `load` fails; its duration is undocumented, so the 1.8 default is the safe choice on newer releases too.
 
 No test can catch a regression here. The `hdf5-metno` dev-dependency builds a current libhdf5, `h5py` links a current libhdf5, and every third-party MAT v7.3 reader (`mat73`, `hdf5storage`, `pymatreader`, MAT.jl, matio) delegates to whichever libhdf5 *it* links. All of them read a version 3 superblock without complaint. The failure is one byte below everything they parse, so only an old library can see it, and none is available as a dev-dependency. The script needs network access and a couple of minutes on its first run, which is why it is a command you run rather than a CI job.
 
@@ -27,7 +27,7 @@ What it measured when the 1.8 format landed in 0.34.0, against 1.8.23:
 
 1.8 does not degrade or warn on the newer superblock — it cannot open the file at all. The script also round-trips both fixtures through 1.8's `h5repack` and counts attributes, which is the other half of the same story: before the Attribute Info fix, `h5repack` copied every object with none of its attributes.
 
-One limit worth stating: this proves the 1.8 *format* boundary, not that MathWorks' particular 1.8.12 build accepts the file. 1.8.23 is nine patch releases newer and theirs may carry patches. `matlab_fixtures/verify.m` under real MATLAB is still the only thing that would settle that, and it has only ever been run under Octave, whose HDF5 is modern.
+One limit worth stating: this proves the 1.8 *format* boundary, not that a particular MathWorks build accepts the file. `examples/octave/check_format.m` asks MATLAB directly, against a pair of files differing only in that format, and reports which of the outcomes it got; run it under real MATLAB, since Octave's HDF5 is modern and reads both. `verify.m` covers content rather than format and passes under Octave.
 
 ## Changelog
 

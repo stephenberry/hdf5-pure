@@ -11,23 +11,36 @@
 % ---------------------------------------------------------------------------
 % What is being tested
 %
-% MATLAB does not read `.mat` files with the HDF5 library it exposes through
-% `h5read`/`h5disp`/`h5info`. Those go through HDF5 1.10.7; `load` for a MAT
-% v7.3 file goes through a separate HDF5 1.8.12. A version 3 superblock is a
-% 1.10 addition, so a file carrying one inspects fine under `h5disp` and fails
-% under `load`.
+% Which HDF5 library MATLAB links has changed across releases, and it decides
+% whether a file can be opened at all. MathWorks documents it:
 %
-% Every release of this crate through 0.33.0 wrote a version 3 superblock.
-% 0.34.0 writes the HDF5 1.8 format by default. The two files here hold
-% identical content and differ only in that format:
+%   before R2021b   1.8.12         R2023b   1.10.10
+%   R2021b          1.10.7         R2024a   1.10.11
+%   before R2023b   1.10.8         R2024b+  1.14.4.3
+%
+% A version 3 superblock is an HDF5 1.10 addition, so a file carrying one cannot
+% be opened by MATLAB before R2021b. Every release of this crate through 0.33.0
+% wrote one; 0.34.0 writes the HDF5 1.8 format by default. The two files here
+% hold identical content and differ only in that format:
 %
 %   format_v18.mat    version 2 superblock -- the new default, must load
-%   format_v110.mat   version 3 superblock -- what 0.33.0 wrote, expected to fail
+%   format_v110.mat   version 3 superblock -- what 0.33.0 wrote
 %
-% The second file is the control. A run where *both* load says the superblock
-% version was never what broke `load`, and the diagnosis behind the 0.34.0
-% change is wrong -- which is worth knowing, and is why the file is here rather
-% than only the one that should work.
+% What the outcome means depends on the release, which is why this reports the
+% library version alongside the result:
+%
+%   1.8.x   the v1.10 file must fail. If it loads, the diagnosis is wrong.
+%   1.10+   the v1.10 file is expected to load. That says nothing against the
+%           1.8 default -- it only means this release was never affected.
+%
+% Either way the v1.8 file must load and decode correctly. That is the claim the
+% default rests on, and it holds for every release in the table.
+%
+% There is one wrinkle the version number will not show. Around R2021b MathWorks
+% shipped two libraries at once, keeping 1.8.12 on the MAT v7.3 path while
+% `h5read`/`h5disp` used 1.10.7. On such a release `H5.get_libversion` reports
+% 1.10.7 while `load` still cannot open a v1.10 file -- so a 1.10 report with a
+% failing control is a meaningful result, not a contradiction.
 % ---------------------------------------------------------------------------
 
 fprintf('\n');
@@ -41,8 +54,18 @@ if is_octave
     fprintf('\n');
 else
     fprintf('MATLAB version: %s\n', version);
-    fprintf('\n');
 end
+hdf5_major = NaN;
+try
+    [hdf5_major, hdf5_minor, hdf5_patch] = H5.get_libversion();
+    fprintf('HDF5 library:   %d.%d.%d\n', hdf5_major, hdf5_minor, hdf5_patch);
+catch
+    fprintf('HDF5 library:   <H5.get_libversion unavailable>\n');
+end
+% Before R2021b MATLAB was wholly on 1.8.12, where a version 3 superblock cannot
+% be opened. From 1.10 on it can, so the control file loading is expected there.
+expects_v110_to_fail = ~isnan(hdf5_major) && hdf5_major == 1 && hdf5_minor < 10;
+fprintf('\n');
 
 % --- the file that must load ------------------------------------------------
 fprintf('--- format_v18.mat (version 2 superblock, the 0.34.0 default) ---\n');
@@ -102,13 +125,19 @@ if is_octave
     fprintf('MATLAB for the answer.\n');
 elseif good && ~v110_loaded
     fprintf('CONFIRMED. The 1.8-format file loads and the 1.10-format one does\n');
-    fprintf('not, so the superblock version was the cause and the 0.34.0 default\n');
-    fprintf('fixes it.\n');
+    fprintf('not, so the superblock version is exactly what broke `load` and the\n');
+    fprintf('0.34.0 default fixes it.\n');
+elseif good && v110_loaded && ~expects_v110_to_fail
+    fprintf('CONFIRMED for this release. The 1.8-format file loads and decodes\n');
+    fprintf('correctly, which is what the default rests on. The 1.10-format file\n');
+    fprintf('also loads, which is expected on HDF5 1.10 or newer -- it means this\n');
+    fprintf('release was never affected, not that the 1.8 default is unnecessary:\n');
+    fprintf('MATLAB before R2021b cannot open that file at all.\n');
 elseif good && v110_loaded
-    fprintf('PARTIAL. Both files load, so this MATLAB reads a version 3\n');
-    fprintf('superblock and the superblock was NOT what broke `load` here.\n');
-    fprintf('The 1.8 default is still harmless, but the diagnosis behind it does\n');
-    fprintf('not hold for this MATLAB version -- please report the version above.\n');
+    fprintf('UNEXPECTED. This MATLAB reports HDF5 1.8, which should not be able\n');
+    fprintf('to open a version 3 superblock, yet the 1.10-format file loaded.\n');
+    fprintf('The 1.8 default is still harmless, but the reasoning behind it does\n');
+    fprintf('not hold here -- please report both versions printed above.\n');
 elseif ~v18_loaded
     fprintf('FAILED. The 1.8-format file does not load, so something beyond the\n');
     fprintf('superblock version is wrong. Please report the error text above.\n');

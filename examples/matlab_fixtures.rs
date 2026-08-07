@@ -64,7 +64,7 @@ fn main() {
 
 /// The same content in both on-disk formats, for `check_format.m`.
 ///
-/// MATLAB reads MAT v7.3 with HDF5 1.8.12, which cannot open the version 3
+/// MATLAB linked HDF5 1.8.12 before R2021b, which cannot open the version 3
 /// superblock every release through 0.33.0 wrote. These two files hold
 /// identical content and differ only in that: `format_v18.mat` is the 0.34.0
 /// default and must load, `format_v110.mat` is the old format and is expected

@@ -109,7 +109,7 @@ fn deflate_compression_shrinks_repetitive_data() {
     };
     // Compression needs chunked storage, whose chunk indices need the HDF5 1.10
     // format, so both sides ask for it. The MAT default is the 1.8 format
-    // (MATLAB's `load` is HDF5 1.8.12) and refuses compression by name;
+    // (MATLAB linked HDF5 1.8.12 before R2021b) and refuses compression by name;
     // comparing a 1.10 file against a 1.8 one would also be measuring the
     // superblock rather than the deflate.
     let mut plain_opts = Options::default();
