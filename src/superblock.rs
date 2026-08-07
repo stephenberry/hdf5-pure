@@ -483,6 +483,44 @@ mod tests {
         assert_eq!(sb.consistency_flags, 1);
     }
 
+    /// The same fields, read from a version 1 superblock **the C library
+    /// wrote** rather than one this test built.
+    ///
+    /// [`build_v1_bytes`] and [`Superblock::parse_v1`] were written by the same
+    /// hand from the same reading of the specification, so they agree about the
+    /// field order whether or not that order is right — which is exactly the
+    /// defect the fix for issue #245's review corrected, and exactly the defect
+    /// a self-built fixture cannot see. This file settles it: HDF5 1.8.23 wrote
+    /// it with `H5Pset_sym_k(8, 16)` and `H5Pset_istore_k(64)`, so all three K
+    /// values are distinct from each other and from the library's defaults, and
+    /// any permutation of the three reads back wrong.
+    ///
+    /// See `tests/fixtures/c_1_8/NOTICE.md` for how it was produced.
+    #[test]
+    fn parse_v1_against_a_c_written_superblock() {
+        let data: &[u8] = include_bytes!("../tests/fixtures/c_1_8/v1_superblock.h5");
+        let sb = Superblock::parse(data, 0).unwrap();
+
+        assert_eq!(sb.version, 1);
+        assert_eq!(sb.offset_size, 8);
+        assert_eq!(sb.length_size, 8);
+
+        // `H5Pset_sym_k(fcpl, 8, 16)` is (internal, leaf) — the C library's
+        // argument order, which is the reverse of the on-disk order.
+        assert_eq!(sb.group_leaf_node_k, Some(16));
+        assert_eq!(sb.group_internal_node_k, Some(8));
+        assert_eq!(sb.indexed_storage_internal_node_k, Some(64));
+
+        // The file was closed cleanly, so no status bit is set. Worth asserting
+        // beside the K values: reading the chunk B-tree K here instead would
+        // report 64 and make every open of this file refuse it as held by a
+        // writer.
+        assert_eq!(sb.consistency_flags, 0);
+
+        assert_eq!(sb.base_address, 0);
+        assert_eq!(sb.eof_address as usize, data.len());
+    }
+
     #[test]
     fn parse_v1_4byte_offsets() {
         let data = build_v1_bytes(4);
