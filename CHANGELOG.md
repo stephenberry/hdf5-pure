@@ -30,6 +30,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A file with a userblock reads whole when it holds an object-header continuation block or dense link storage, which the C library writes and this crate does not; `File::open` used to fail outright on such a file ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
 - An empty MAT value carries `MATLAB_class` and `MATLAB_empty` and nothing else, matching MATLAB, and both emitters agree on its dimensions — including for an empty `Matrix`, which one of them wrote as a plain zero-element dataset ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
 - `repack` keeps each attribute's own datatype and shape instead of rebuilding it from an `AttrValue`, which widened every integer and float to 64 bits, turned a variable-length string into a fixed-width one, and flattened a rank-2 attribute to rank 1. Enumeration, compound, bit-field and opaque attributes are now carried across rather than refused; a reference attribute still is ([#241](https://github.com/stephenberry/hdf5-pure/issues/241)).
+- An enumeration attribute reaches the caller, decoded through its integer base type as enum dataset data already is; `attrs()` skipped it before, so every `np.bool_` attribute in an h5py-written file — stored as `enum[FALSE, TRUE]` — went missing without a trace. The member names have no `AttrValue` to live in, so the codes are what survives.
 
 ## [0.33.0] - 2026-08-02
 

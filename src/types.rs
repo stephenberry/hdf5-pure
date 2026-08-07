@@ -198,6 +198,9 @@ pub(crate) fn attrs_to_map<S: crate::source::Source + ?Sized>(
 ///
 /// - **Width.** Integers and floats widen to `i64`/`u64`/`f64`; there are no
 ///   narrower array variants.
+/// - **Enumeration members.** An enum attribute decodes through its integer base
+///   type, so its codes survive and the member names do not. This is how h5py's
+///   `np.bool_` attributes arrive, written as `enum[FALSE, TRUE]`: as `0`/`1`.
 /// - **Variable-length strings.** A true `H5T_STRING` with `STRSIZE = VAR`,
 ///   which this crate's writer never emits, has no variant of its own and reads
 ///   as the fixed-width variant of the same charset and arity.
@@ -229,7 +232,9 @@ fn decode_attr_value<S: crate::source::Source + ?Sized>(
     // at length one.
     let scalar = attr.dataspace.space_type == DataspaceType::Scalar;
 
-    match &attr.datatype {
+    // An enumeration is stored as values of its integer base type, so it decodes
+    // through that base — the same view the numeric readers take of an enum dataset.
+    match crate::data_read::effective_numeric(&attr.datatype) {
         Datatype::FloatingPoint { .. } => {
             let vals = attr.read_as_f64().ok()?;
             if scalar {
@@ -511,6 +516,75 @@ mod tests {
         for (name, written) in &cases {
             assert_eq!(read.get(*name), Some(written), "attribute {name}");
         }
+    }
+
+    /// Decode one attribute of an arbitrary datatype, which the writer cannot
+    /// stage because [`AttrValue`] has no variant to write it from.
+    fn decode_raw(
+        datatype: Datatype,
+        raw_data: Vec<u8>,
+        dimensions: Vec<u64>,
+    ) -> Option<AttrValue> {
+        use crate::dataspace::{Dataspace, DataspaceType};
+
+        let scalar = dimensions.is_empty();
+        let attr = crate::attribute::AttributeMessage {
+            name: "a".into(),
+            datatype,
+            dataspace: Dataspace {
+                space_type: if scalar {
+                    DataspaceType::Scalar
+                } else {
+                    DataspaceType::Simple
+                },
+                #[expect(clippy::cast_possible_truncation)]
+                rank: dimensions.len() as u8,
+                dimensions,
+                max_dimensions: None,
+            },
+            raw_data,
+        };
+        decode_attr_value(&attr, &crate::source::BytesSource::new(Vec::new()), 8, 8, 0)
+    }
+
+    /// An enum attribute decodes through its integer base type rather than being
+    /// dropped. h5py writes every `np.bool_` attribute this way, so before this the
+    /// booleans in an h5py-written file were missing from `attrs()` entirely.
+    #[test]
+    fn an_enum_attribute_decodes_as_its_base_type() {
+        let h5py_bool =
+            crate::type_builders::EnumTypeBuilder::with_base(crate::type_builders::make_i8_type())
+                .value("FALSE", 0)
+                .value("TRUE", 1)
+                .build()
+                .unwrap();
+
+        assert_eq!(
+            decode_raw(h5py_bool.clone(), vec![1], vec![]),
+            Some(AttrValue::I64(1))
+        );
+        // Array-ness comes from the dataspace here as it does for every other type.
+        assert_eq!(
+            decode_raw(h5py_bool, vec![1, 0, 1], vec![3]),
+            Some(AttrValue::I64Array(vec![1, 0, 1]))
+        );
+    }
+
+    /// The base type's signedness and width carry through, so an enum over an
+    /// unsigned base lands in the unsigned variant with its value intact.
+    #[test]
+    fn an_unsigned_enum_attribute_keeps_its_base_signedness() {
+        let mode =
+            crate::type_builders::EnumTypeBuilder::with_base(crate::type_builders::make_u16_type())
+                .value("low", 1)
+                .value("high", 40_000)
+                .build()
+                .unwrap();
+
+        assert_eq!(
+            decode_raw(mode, 40_000_u16.to_le_bytes().to_vec(), vec![]),
+            Some(AttrValue::U64(40_000))
+        );
     }
 
     /// Array-ness survives at length one for numbers too.
