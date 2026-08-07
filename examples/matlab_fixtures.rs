@@ -117,11 +117,22 @@ fn write_format_control(dir: &Path) {
     }
 }
 
-/// Copy `verify.m`, `ok.m`, and `check_format.m` from `examples/octave/` next to
-/// the fixture files. Users run `verify` in MATLAB/Octave after `cd`ing into the
-/// output directory — the helper scripts need to be on the path alongside.
+/// Copy the MATLAB/Octave scripts from `examples/octave/` next to the fixture
+/// files. Users run `verify` or `check_format` after `cd`ing into the output
+/// directory, so everything they call has to be on the path alongside.
+///
+/// Every predicate `verify.m` uses is a function file listed here rather than an
+/// anonymous function defined inside it, which is what lets the `clearvars`
+/// between fixtures be a bare one — it clears variables, and a function on the
+/// path is not one. The cost is that a helper missing from this list fails at
+/// the first fixture that calls it, on the user's machine, and long after the run
+/// that could have caught it — so this panics on a name it cannot find, and on
+/// any `.m` in the source directory the list forgot. CI runs every example,
+/// which makes both a build failure rather than a surprise on someone else's
+/// MATLAB.
 fn copy_octave_helpers(out: &Path) {
     let src = Path::new("examples/octave");
+    let mut copied = std::collections::BTreeSet::new();
     for name in [
         "verify.m",
         "ok.m",
@@ -129,14 +140,42 @@ fn copy_octave_helpers(out: &Path) {
         "mat_isempty.m",
         "mat_empty_dims.m",
         "mat_is_empty_struct.m",
+        "is_truey.m",
+        "is_falsy.m",
+        "as_codes.m",
+        "eq_text.m",
+        "has_sign_bit.m",
     ] {
         let from = src.join(name);
-        if from.exists() {
-            let _ = std::fs::copy(&from, out.join(name));
-        } else {
-            eprintln!("warning: {} not found; skipping", from.display());
-        }
+        assert!(
+            from.exists(),
+            "{name} is listed here but missing from {}",
+            src.display()
+        );
+        std::fs::copy(&from, out.join(name))
+            .unwrap_or_else(|e| panic!("copy {} to {}: {e}", from.display(), out.display()));
+        copied.insert(name);
     }
+
+    // The other direction: a helper added to `examples/octave/` and left off the
+    // list would be missing from every generated fixture directory, and the
+    // failure would land on whoever runs `verify` rather than on whoever added
+    // it. Checked rather than assumed, because that is the mistake this list
+    // invites.
+    let mut missed: Vec<String> = std::fs::read_dir(src)
+        .expect("the examples/octave directory")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".m") && !copied.contains(n.as_str()))
+        .collect();
+    missed.sort();
+    assert!(
+        missed.is_empty(),
+        "{} holds .m files this example does not copy: {}. Add them to the list \
+         above, or every generated fixture directory is missing them.",
+        src.display(),
+        missed.join(", ")
+    );
 }
 
 // ---------------------------------------------------------------------------
