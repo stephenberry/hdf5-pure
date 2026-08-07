@@ -36,7 +36,7 @@ load vectors.mat
 ok(isequal(xs, [1.0; 2.0; 3.0; 4.0; 5.0]), 'xs');
 ok(isequal(ns, int32([-1; 0; 1])), 'ns');
 ok(isequal(double(flags(:)), [1; 0; 1; 1; 0]), 'flags values');
-ok(isempty(empty), 'empty');
+ok(mat_isempty(empty), 'empty');
 clearvars -except is_truey is_falsy as_codes eq_text
 
 fprintf('=== matrix.mat ===\n');
@@ -50,7 +50,7 @@ fprintf('=== strings.mat ===\n');
 load strings.mat
 ok(numel(ascii) == 12 && eq_text(ascii, 'hello MATLAB'), 'ascii');
 ok(ischar(ascii) || isa(ascii, 'uint16'), 'ascii is char-like');
-ok(isempty(empty), 'empty string');
+ok(mat_isempty(empty), 'empty string');
 clearvars -except is_truey is_falsy as_codes eq_text
 
 fprintf('=== nested.mat ===\n');
@@ -71,7 +71,12 @@ load options.mat
 vars = who;
 ok(ismember('required', vars), 'required field present');
 ok(ismember('present', vars), 'present field present');
-ok(~ismember('absent', vars), 'absent field correctly missing');
+% Since 0.30 the default `NullPolicy::EmptyStructArray` writes a `None` field as
+% MATLAB `struct([])` rather than omitting it, so `isfield` reports true and
+% MATLAB code can reference it unconditionally. `NullPolicy::Omit` restores the
+% older behavior of leaving it out.
+ok(ismember('absent', vars), 'absent field present as struct([])');
+ok(mat_is_empty_struct(absent), 'absent is struct([])');
 ok(required == 1.5, 'required value');
 ok(eq_text(present, 'yes'), 'present value');
 clearvars -except is_truey is_falsy as_codes eq_text
@@ -101,7 +106,10 @@ ok(iscomplex(signal) && numel(signal) == 3, 'signal complex 3-vec');
 ok(eq_text(phase, 'Done'), 'phase');
 ok(isstruct(config) && eq_text(config.tag, 'ship_it'), 'config.tag');
 ok(eq_text(note, 'looks good'), 'note');
-ok(~exist('skipped', 'var'), 'skipped absent');
+% As in options.mat: since 0.30 a `None` field is present as struct([]) under
+% the default NullPolicy::EmptyStructArray rather than omitted.
+ok(exist('skipped', 'var') == 1, 'skipped present as struct([])');
+ok(mat_is_empty_struct(skipped), 'skipped is struct([])');
 clearvars -except is_truey is_falsy as_codes eq_text
 
 % ==========================================================================
@@ -262,12 +270,24 @@ clearvars -except is_truey is_falsy as_codes eq_text
 
 fprintf('=== empty_variants.mat ===\n');
 load empty_variants.mat
-ok(isempty(e_f64), 'e_f64 empty');
-ok(isempty(e_f32), 'e_f32 empty');
-ok(isempty(e_i32), 'e_i32 empty');
-ok(isempty(e_u8), 'e_u8 empty');
-ok(isempty(e_bool), 'e_bool empty');
-ok(isempty(e_str), 'e_str empty string');
+ok(mat_isempty(e_f64), 'e_f64 empty');
+ok(mat_isempty(e_f32), 'e_f32 empty');
+ok(mat_isempty(e_i32), 'e_i32 empty');
+ok(mat_isempty(e_u8), 'e_u8 empty');
+ok(mat_isempty(e_bool), 'e_bool empty');
+ok(mat_isempty(e_str), 'e_str empty string');
+% `isempty` alone cannot see the shape: 0x0 and 0x1 are both empty. Since 0.34
+% an empty Rust sequence is written as 0x0, MATLAB's `[]`, and `mat_empty_dims`
+% reads that shape under either interpreter (see its help for why Octave needs
+% one).
+ok(isequal(mat_empty_dims(e_f64), [0 0]), 'e_f64 is 0x0');
+ok(isequal(mat_empty_dims(e_i32), [0 0]), 'e_i32 is 0x0');
+ok(isequal(mat_empty_dims(e_bool), [0 0]), 'e_bool is 0x0');
+if exist('OCTAVE_VERSION', 'builtin') ~= 5
+  % Only meaningful once `load` has decoded the marker into a real empty: 0x0
+  % concatenates with anything, where a 0x1 raises a dimension mismatch.
+  ok(isequal([e_f64, 1], 1), 'e_f64 concatenates as MATLAB []');
+end
 clearvars -except is_truey is_falsy as_codes eq_text
 
 fprintf('=== large_matrix.mat ===\n');
@@ -303,15 +323,15 @@ else
   ok(iscell(optionals), 'optionals iscell');
   ok(numel(optionals) == 3, 'optionals has 3 cells');
   ok(optionals{1}.x == 10.0, 'optionals{1}.x');
-  ok(isstruct(optionals{2}) && isempty(fieldnames(optionals{2})), 'optionals{2} is struct([])');
+  ok(mat_is_empty_struct(optionals{2}), 'optionals{2} is struct([])');
   ok(optionals{3}.x == 30.0, 'optionals{3}.x');
 
   ok(iscell(grid), 'grid iscell');
   ok(numel(grid) == 2, 'grid outer length');
   ok(iscell(grid{1}) && numel(grid{1}) == 2, 'grid{1} is 2-cell');
   ok(grid{1}{1}.x == 100.0, 'grid{1}{1}.x');
-  ok(isstruct(grid{1}{2}) && isempty(fieldnames(grid{1}{2})), 'grid{1}{2} is struct([])');
-  ok(isstruct(grid{2}{1}) && isempty(fieldnames(grid{2}{1})), 'grid{2}{1} is struct([])');
+  ok(mat_is_empty_struct(grid{1}{2}), 'grid{1}{2} is struct([])');
+  ok(mat_is_empty_struct(grid{2}{1}), 'grid{2}{1} is struct([])');
   ok(grid{2}{2}.x == 200.0, 'grid{2}{2}.x');
 
   ok(iscell(ragged), 'ragged iscell');

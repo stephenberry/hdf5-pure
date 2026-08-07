@@ -46,6 +46,9 @@ fn main() {
     // Cell-array fixtures (Vec<Struct>, Vec<Option<T>> with None, nested).
     write_cells(&out);
 
+    // The on-disk format pair, for `check_format.m`.
+    write_format_control(&out);
+
     copy_octave_helpers(&out);
 
     println!();
@@ -59,12 +62,74 @@ fn main() {
     println!("  $ cd matlab_fixtures && octave --no-gui --eval verify");
 }
 
-/// Copy `verify.m` and `ok.m` from `examples/octave/` next to the fixture
-/// files. Users run `verify` in MATLAB/Octave after `cd`ing into the output
-/// directory — the helper scripts need to be on the path alongside.
+/// The same content in both on-disk formats, for `check_format.m`.
+///
+/// MATLAB reads MAT v7.3 with HDF5 1.8.12, which cannot open the version 3
+/// superblock every release through 0.33.0 wrote. These two files hold
+/// identical content and differ only in that: `format_v18.mat` is the 0.34.0
+/// default and must load, `format_v110.mat` is the old format and is expected
+/// to fail. The second is the control — if it loads too, the superblock version
+/// was not what broke `load`, and only a real MATLAB can tell us that.
+#[derive(Serialize)]
+struct FormatControl {
+    values: Vec<f64>,
+    label: String,
+    count: i32,
+    flag: bool,
+    empty: Vec<f64>,
+    nested: FormatControlInner,
+}
+
+#[derive(Serialize)]
+struct FormatControlInner {
+    a: i32,
+}
+
+fn write_format_control(dir: &Path) {
+    let value = || FormatControl {
+        values: vec![1.0, 2.0, 3.0],
+        label: "demo".to_string(),
+        count: 7,
+        flag: true,
+        empty: Vec::new(),
+        nested: FormatControlInner { a: 5 },
+    };
+
+    // The default since 0.34.0: the HDF5 1.8 format.
+    mat::to_file(&value(), dir.join("format_v18.mat")).unwrap();
+
+    // What every release through 0.33.0 wrote.
+    let mut opts = mat::Options::default();
+    opts.libver = hdf5_pure::LibVer::V110;
+    mat::to_file_with_options(&value(), dir.join("format_v110.mat"), &opts).unwrap();
+
+    // Read the superblock version straight out of the bytes, so the two files
+    // are known to differ before anyone carries them to a MATLAB machine.
+    for (name, expected) in [("format_v18.mat", 2u8), ("format_v110.mat", 3)] {
+        let bytes = std::fs::read(dir.join(name)).unwrap();
+        let sig = bytes
+            .windows(8)
+            .position(|w| w == b"\x89HDF\r\n\x1a\n")
+            .expect("HDF5 signature");
+        let got = bytes[sig + 8];
+        assert_eq!(got, expected, "{name} should carry superblock {expected}");
+        println!("wrote: {name} (superblock {got})");
+    }
+}
+
+/// Copy `verify.m`, `ok.m`, and `check_format.m` from `examples/octave/` next to
+/// the fixture files. Users run `verify` in MATLAB/Octave after `cd`ing into the
+/// output directory — the helper scripts need to be on the path alongside.
 fn copy_octave_helpers(out: &Path) {
     let src = Path::new("examples/octave");
-    for name in ["verify.m", "ok.m"] {
+    for name in [
+        "verify.m",
+        "ok.m",
+        "check_format.m",
+        "mat_isempty.m",
+        "mat_empty_dims.m",
+        "mat_is_empty_struct.m",
+    ] {
         let from = src.join(name);
         if from.exists() {
             let _ = std::fs::copy(&from, out.join(name));
@@ -281,11 +346,13 @@ fn write_options(dir: &Path) {
     announce(
         "options.mat",
         &[
-            "% `absent` is None in Rust → field is not written to the file.",
+            "% `absent` is None in Rust. Under the default NullPolicy::EmptyStructArray",
+            "% it is written as MATLAB struct([]) rather than omitted.",
             "vars = who;",
             "assert(ismember('required', vars), 'required present')",
             "assert(ismember('present', vars), 'present present')",
-            "assert(~ismember('absent', vars), 'absent should be missing')",
+            "assert(ismember('absent', vars), 'absent present as struct([])')",
+            "assert(isstruct(absent) && isempty(fieldnames(absent)), 'absent is struct([])')",
             "assert(required == 1.5, 'required')",
             "assert(strcmp(present, 'yes'), 'present')",
             "disp('options.mat OK')",
@@ -406,7 +473,8 @@ fn write_everything(dir: &Path) {
             "assert(isstruct(config), 'config is struct')",
             "assert(strcmp(config.tag, 'ship_it'), 'config.tag')",
             "assert(strcmp(note, 'looks good'), 'note')",
-            "assert(~exist('skipped', 'var'), 'skipped should be absent')",
+            "% Since 0.30 a None field is struct([]) under NullPolicy::EmptyStructArray.",
+            "assert(isstruct(skipped) && isempty(fieldnames(skipped)), 'skipped is struct([])')",
             "disp('experiment.mat OK')",
         ],
     );
