@@ -549,7 +549,7 @@ mod tests {
 
     /// An enum attribute decodes through its integer base type rather than being
     /// dropped. h5py writes every `np.bool_` attribute this way, so before this the
-    /// booleans in an h5py-written file were missing from `attrs()` entirely.
+    /// booleans in an h5py-written file were missing from `attrs()` entirely (#248).
     #[test]
     fn an_enum_attribute_decodes_as_its_base_type() {
         let h5py_bool =
