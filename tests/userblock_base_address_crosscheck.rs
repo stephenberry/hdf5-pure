@@ -29,6 +29,30 @@
 //! different code: [`File::open`] indexes one buffer, [`File::open_streaming`]
 //! reads windows through a `Source`, and [`File::from_bytes`] takes an image the
 //! caller owns.
+//!
+//! [`every_c_written_shape_reads_under_a_userblock`] is a different kind of test
+//! from the rest. It fixes no defect: every shape in it already read correctly.
+//! It exists because a missing base address has now been a bug three separate
+//! times — dense attributes in #214, then the two above — which makes it a
+//! *class* rather than three incidents, and a class is worth covering by its
+//! ground rather than by its instances.
+//!
+//! The read path applies the base in four independent places, and this file is
+//! sized to catch each. Measured by removing the base from one place at a time
+//! and recording which tests notice:
+//!
+//! | base removed from | tests that fail |
+//! | --- | --- |
+//! | raw data reads (contiguous, chunked, chunk indices, global heap) | all six |
+//! | dense attribute storage | `every_c_written_shape` only |
+//! | object header continuation | the two `c_modified`/`c_added_attribute` tests |
+//! | dense link storage | the three dense-link tests |
+//!
+//! Worth reading the second and third rows together. The class test is the only
+//! guard on dense attribute storage, and it is *not* a guard on continuations —
+//! its six-deep group nesting does not produce one, which the measurement showed
+//! and an unchecked assumption would not have. Continuations stay covered by the
+//! two tests that provoke them directly.
 
 use hdf5_pure::{File, FileBuilder};
 use tempfile::tempdir;
@@ -297,4 +321,237 @@ fn a_mat_file_repacked_by_the_c_library_still_reads() {
         f.dataset("var07").unwrap().read_f64().unwrap(),
         vec![7.0, 7.5]
     );
+}
+
+// ---------------------------------------------------------------------------
+// The defect class, rather than the two instances of it
+// ---------------------------------------------------------------------------
+
+/// Read `path` through every backend and check it with `read`.
+fn every_backend(path: &std::path::Path, what: &str, read: impl Fn(&File) -> String) {
+    let expected = read(&File::open(path).unwrap());
+    for (backend, file) in [
+        ("open", File::open(path).unwrap()),
+        ("open_streaming", File::open_streaming(path).unwrap()),
+        (
+            "from_bytes",
+            File::from_bytes(std::fs::read(path).unwrap()).unwrap(),
+        ),
+    ] {
+        assert_eq!(
+            read(&file),
+            expected,
+            "{what}: backend `{backend}` disagrees with `open`"
+        );
+    }
+}
+
+/// Every shape the C library writes that makes this crate resolve a stored
+/// address, read back from a file with a userblock and from one without.
+///
+/// A stored address is short of its real position by the base, so a reader that
+/// forgets to add it back lands inside the userblock — and each of these shapes
+/// is read by a *different* one. The `ub = 0` half is the control: it holds the
+/// content constant so a failure can only be the base address, not the shape.
+///
+/// The module documentation carries the measured coverage table for the whole
+/// file. What this test adds to it is the only guard on dense attribute storage,
+/// and the widest guard on raw data reads: every shape below stops reading when
+/// the base is removed from the data path, so a regression there cannot hide in
+/// whichever storage kind happens to be untested.
+///
+/// Some of these have userblock coverage elsewhere — dense attributes in
+/// `userblock_dense_attrs.rs`, chunked editing in `edit_userblock_chunked.rs` —
+/// and are kept anyway. The point is one place where the class is visible at
+/// once, so the next address-consuming reader added to this crate has an obvious
+/// home for its case.
+#[test]
+fn every_c_written_shape_reads_under_a_userblock() {
+    let dir = tempdir().unwrap();
+
+    for ub in [0, UB] {
+        // Chunked with a filter: the chunk addresses live in a chunk index, and
+        // the data must be found before it can be inflated.
+        let path = dir.path().join(format!("chunked_deflate_{ub}.h5"));
+        c_file(&path, ub, |f| {
+            f.new_dataset::<f64>()
+                .shape([64])
+                .chunk([8])
+                .deflate(4)
+                .create("c")
+                .unwrap()
+                .write(&(0..64).map(f64::from).collect::<Vec<_>>())
+                .unwrap();
+        });
+        every_backend(&path, "chunked+deflate", |f| {
+            format!("{:?}", f.dataset("c").unwrap().read_f64().unwrap())
+        });
+        assert_eq!(
+            File::open(&path)
+                .unwrap()
+                .dataset("c")
+                .unwrap()
+                .read_f64()
+                .unwrap(),
+            (0..64).map(f64::from).collect::<Vec<_>>(),
+            "chunked+deflate under userblock {ub}"
+        );
+
+        // Variable-length strings: the element data is a reference into the
+        // global heap, which is reached by its own stored address.
+        let path = dir.path().join(format!("vlen_{ub}.h5"));
+        c_file(&path, ub, |f| {
+            let words: Vec<hdf5::types::VarLenUnicode> = ["alpha", "beta", "gamma"]
+                .iter()
+                .map(|s| s.parse().unwrap())
+                .collect();
+            f.new_dataset::<hdf5::types::VarLenUnicode>()
+                .shape([3])
+                .create("s")
+                .unwrap()
+                .write(&words)
+                .unwrap();
+        });
+        every_backend(&path, "vlen strings", |f| {
+            format!("{:?}", f.dataset("s").unwrap().read_string().unwrap())
+        });
+        assert_eq!(
+            File::open(&path)
+                .unwrap()
+                .dataset("s")
+                .unwrap()
+                .read_string()
+                .unwrap(),
+            vec!["alpha", "beta", "gamma"],
+            "vlen strings under userblock {ub}"
+        );
+
+        // Enough attributes to force dense storage: a fractal heap and a version
+        // 2 B-tree, each named by a stored address in the Attribute Info message.
+        let path = dir.path().join(format!("dense_attrs_{ub}.h5"));
+        c_file(&path, ub, |f| {
+            let d = f.new_dataset::<i32>().shape([1]).create("d").unwrap();
+            d.write(&[1]).unwrap();
+            for i in 0..24 {
+                d.new_attr::<i32>()
+                    .shape([1])
+                    .create(format!("a{i:02}").as_str())
+                    .unwrap()
+                    .write(&[i])
+                    .unwrap();
+            }
+        });
+        every_backend(&path, "dense attributes", |f| {
+            let mut names: Vec<String> = f
+                .dataset("d")
+                .unwrap()
+                .attrs()
+                .unwrap()
+                .into_keys()
+                .collect();
+            names.sort();
+            names.join(",")
+        });
+        assert_eq!(
+            File::open(&path)
+                .unwrap()
+                .dataset("d")
+                .unwrap()
+                .attrs()
+                .unwrap()
+                .len(),
+            24,
+            "dense attributes under userblock {ub}"
+        );
+
+        // Six levels of nesting: the base applies at every hop, not only at the
+        // root, and a header this deep in a C-written file carries a
+        // continuation block.
+        let path = dir.path().join(format!("nested_{ub}.h5"));
+        c_file(&path, ub, |f| {
+            let mut g = f.create_group("l0").unwrap();
+            for i in 1..6 {
+                g = g.create_group(&format!("l{i}")).unwrap();
+            }
+            g.new_dataset::<i32>()
+                .shape([1])
+                .create("leaf")
+                .unwrap()
+                .write(&[42])
+                .unwrap();
+        });
+        every_backend(&path, "nested groups", |f| {
+            format!(
+                "{:?}",
+                f.dataset("l0/l1/l2/l3/l4/l5/leaf")
+                    .unwrap()
+                    .read_i32()
+                    .unwrap()
+            )
+        });
+        assert_eq!(
+            File::open(&path)
+                .unwrap()
+                .dataset("l0/l1/l2/l3/l4/l5/leaf")
+                .unwrap()
+                .read_i32()
+                .unwrap(),
+            vec![42],
+            "nested groups under userblock {ub}"
+        );
+
+        // Sixty-four chunks: enough that the index is a real structure with
+        // internal nodes rather than a single-chunk shortcut.
+        let path = dir.path().join(format!("many_chunks_{ub}.h5"));
+        c_file(&path, ub, |f| {
+            f.new_dataset::<i32>()
+                .shape([1024])
+                .chunk([16])
+                .create("b")
+                .unwrap()
+                .write(&(0..1024).collect::<Vec<i32>>())
+                .unwrap();
+        });
+        every_backend(&path, "64-chunk index", |f| {
+            let v = f.dataset("b").unwrap().read_i32().unwrap();
+            format!("{} {} {}", v.len(), v[0], v[v.len() - 1])
+        });
+        assert_eq!(
+            File::open(&path)
+                .unwrap()
+                .dataset("b")
+                .unwrap()
+                .read_i32()
+                .unwrap(),
+            (0..1024).collect::<Vec<i32>>(),
+            "64-chunk index under userblock {ub}"
+        );
+
+        // An unlimited dimension, which the C library indexes with an
+        // extensible array rather than the fixed-array form above.
+        let path = dir.path().join(format!("unlimited_{ub}.h5"));
+        c_file(&path, ub, |f| {
+            let d = f
+                .new_dataset::<i32>()
+                .shape((0..,))
+                .chunk([8])
+                .create("u")
+                .unwrap();
+            d.resize([32]).unwrap();
+            d.write(&(0..32).collect::<Vec<i32>>()).unwrap();
+        });
+        every_backend(&path, "extensible-array index", |f| {
+            format!("{:?}", f.dataset("u").unwrap().read_i32().unwrap())
+        });
+        assert_eq!(
+            File::open(&path)
+                .unwrap()
+                .dataset("u")
+                .unwrap()
+                .read_i32()
+                .unwrap(),
+            (0..32).collect::<Vec<i32>>(),
+            "extensible-array index under userblock {ub}"
+        );
+    }
 }
