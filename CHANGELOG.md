@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `FileBuilder::with_libver_bounds` selects the on-disk format rather than only validating it: an upper bound of `LibVer::V18` writes the HDF5 1.8 format, and anything reaching 1.10 writes the 1.10 one ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- `FormatError::LibverTooOldForContent` reports content the requested bound cannot express, rather than silently upgrading the file — a chunked, filtered, or resizable dataset, or any file-space setting ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- `FileAccessProperties::with_libver_bounds` holds an editing session to a format, so `File::open_rw` refuses an addition that would make the file need a newer library instead of making it silently ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- `RepackOptions::with_libver_bounds` makes a repack's output format a guarantee. Without it, `repack` now carries the source file's format forward, upgrading only where the content leaves no choice — it used to rewrite every file in the 1.10 format ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- `LibVer::WRITER_OLDEST` names the oldest format the writer produces ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- `mat::Options::libver` sets the newest HDF5 format a `.mat` file may use, defaulting to `LibVer::V18`. `mat::MatError::CompressionNeedsNewerFormat` reports the one combination that cannot hold ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+
+### Changed
+
+- **Breaking:** MAT files are written in the HDF5 1.8 format by default, so MATLAB can `load` them; MATLAB used HDF5 1.8.12 before R2021b and cannot open a version 3 superblock. Set `mat::Options::libver` to `LibVer::V110` for the previous format, which compression requires ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- **Breaking:** `mat::Options::default` uses `EmptyMarkerEncoding::DataAsDims`, matching what MATLAB and `matio` write, so an empty value reads back as empty under a plain `isempty` ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- **Breaking:** `LibVer::WRITER_OUTPUT` is now `LibVer::WRITER_DEFAULT`, since the writer no longer emits a single format. Its value is unchanged ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- `FileBuilder::with_create_properties` resets the properties its argument does not carry, so a bound set before the call no longer decides the format of a file whose property list names no version ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- `FileBuilder::write` creates the destination only once the writer has bytes for it, so a refused build leaves an existing file at that path untouched ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- An edit session writes a contiguous dataset's data-layout message in the format of the file it opened, so a `.mat` file edited through `File::open_rw` stays readable by MATLAB ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+
+### Fixed
+
+- An object header holding compact attributes declares how many it has, so `H5Oget_info().num_attrs` agrees with iteration instead of reporting zero — an `h5repack` round trip used to strip every `MATLAB_*` attribute from a `.mat` file without warning ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- A file with a userblock reads whole when it holds an object-header continuation block or dense link storage, which the C library writes and this crate does not; `File::open` used to fail outright on such a file ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- An empty MAT value carries `MATLAB_class` and `MATLAB_empty` and nothing else, matching MATLAB, and both emitters agree on its dimensions — including for an empty `Matrix`, which one of them wrote as a plain zero-element dataset ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+
 ## [0.33.0] - 2026-08-02
 
 A file whose superblock marks it as held by a writer is refused rather than opened: `File::open`, `open_streaming`, `open_rw`, `open_swmr_writer` and `repack` report the new `Error::FileMarkedInUse`, which is the check `H5Fopen` makes of the same byte — a file a crashed SWMR writer left flagged used to open, and `open_rw` used to edit it in place under a writer the file still recorded ([#245](https://github.com/stephenberry/hdf5-pure/issues/245)). `File::open_swmr` follows such a file instead of refusing it, since that pairing is what the flag exists for, and `File::from_bytes` does not consult the byte at all, so a caller holding the bytes can still read a flagged file on a read-only mount, where the `File::clear_swmr_flag` recovery (the `h5clear -s` equivalent) cannot get the write access it needs. The check applies to version-3 superblocks, which is where the C library applies it, and `open_swmr_writer` now requires one for the same reason libhdf5 does. Two smaller changes come with it: a read-write open validates the superblock before it builds its backing, so refusing a mirrored file no longer reads the whole file first, and a version-1 superblock's status flags and chunk B-tree K are read from the offsets the C library writes them to rather than swapped. Files written by earlier versions still read.

@@ -18,8 +18,26 @@ pub const STORAGE_DIMS_BUF_LEN: usize = 8;
 
 /// Return the MATLAB shape of a 1-D vector of length `len`, given the
 /// configured 1-D mode (column or row vector).
+///
+/// An empty vector is `0x0` under either mode, which is MATLAB's `[]`. The mode
+/// orients a vector, and an empty one has no orientation to preserve: what it
+/// does have is a value in MATLAB, and that value is the canonical empty. The
+/// difference is visible — `[[], 1]` is `1`, where `[zeros(0,1), 1]` is a
+/// dimension-mismatch error — and `0x0` is what MATLAB itself overwhelmingly
+/// writes. Counted across the MATLAB-authored fixtures in `tests/fixtures/mat_real`,
+/// `double` empties are `0x0` 47 times against `0x1` once, `char` 55 times, and
+/// `cell` 122 times; `matio` and h5py's `hdf5storage` both call `0x0` the
+/// canonical empty.
+///
+/// Stating the rule here rather than at each writer is what keeps the two MAT
+/// emitters from disagreeing: they had drifted to `0x0` and `0x1` for the same
+/// empty `Vec`, which no test compared because the parity check used no empty
+/// sequence.
 #[inline]
 pub fn vector_dims(len: usize, mode: OneDimensionalMode) -> [usize; 2] {
+    if len == 0 {
+        return [0, 0];
+    }
     match mode {
         OneDimensionalMode::ColumnVector => [len, 1],
         OneDimensionalMode::RowVector => [1, len],

@@ -17,25 +17,33 @@ use crate::link_info::LinkInfoMessage;
 use crate::link_message::{LinkMessage, LinkTarget};
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
-use crate::source::Source;
+use crate::source::{BaseOffsetSource, Source, frame};
 use crate::superblock::Superblock;
 use crate::symbol_table::SymbolTableMessage;
 
 /// Resolve v2 group entries from an object header.
 ///
 /// Handles both compact (Link messages) and dense (fractal heap + B-tree v2) storage.
+///
+/// `base_address` is the superblock base address. The fractal heap and B-tree
+/// addresses in a Link Info message are file addresses, so on a file with a
+/// userblock they are short of their real positions by the base; dense storage is
+/// read through a base-framed view of `file_data` so they index it directly. The
+/// entry addresses this returns stay relative, as the compact path's do.
 pub fn resolve_v2_group_entries(
     file_data: &[u8],
     object_header: &ObjectHeader,
     offset_size: u8,
     length_size: u8,
+    base_address: u64,
 ) -> Result<Vec<GroupEntry>, FormatError> {
     // Look for Link Info message to determine storage type
     let link_info = find_link_info(object_header, offset_size)?;
 
     if let Some(fh_addr) = link_info.fractal_heap_address {
         // Dense storage
-        resolve_dense_entries(file_data, &link_info, fh_addr, offset_size, length_size)
+        let framed = frame(file_data, base_address)?;
+        resolve_dense_entries(framed, &link_info, fh_addr, offset_size, length_size)
     } else {
         // Compact storage: links are stored directly as Link messages
         resolve_compact_entries(object_header, offset_size)
@@ -235,7 +243,13 @@ pub fn resolve_group_entries(
         let stm = SymbolTableMessage::parse(&sym_msg.data, offset_size)?;
         group_v1::resolve_v1_group_entries(file_data, &stm, offset_size, length_size, base_address)
     } else if is_v2_group(object_header) {
-        resolve_v2_group_entries(file_data, object_header, offset_size, length_size)
+        resolve_v2_group_entries(
+            file_data,
+            object_header,
+            offset_size,
+            length_size,
+            base_address,
+        )
     } else {
         Err(FormatError::PathNotFound(String::from(
             "object header is not a group",
@@ -317,7 +331,13 @@ pub fn resolve_group_entries_from_source<S: Source + ?Sized>(
             base_address,
         )
     } else if is_v2_group(object_header) {
-        resolve_v2_group_entries_from_source(source, object_header, offset_size, length_size)
+        resolve_v2_group_entries_from_source(
+            source,
+            object_header,
+            offset_size,
+            length_size,
+            base_address,
+        )
     } else {
         Err(FormatError::PathNotFound(String::from(
             "object header is not a group",
@@ -330,10 +350,15 @@ fn resolve_v2_group_entries_from_source<S: Source + ?Sized>(
     object_header: &ObjectHeader,
     offset_size: u8,
     length_size: u8,
+    base_address: u64,
 ) -> Result<Vec<GroupEntry>, FormatError> {
     let link_info = find_link_info(object_header, offset_size)?;
     if let Some(fh_addr) = link_info.fractal_heap_address {
-        resolve_dense_entries_from_source(source, &link_info, fh_addr, offset_size, length_size)
+        let framed = BaseOffsetSource {
+            inner: source,
+            base: base_address,
+        };
+        resolve_dense_entries_from_source(&framed, &link_info, fh_addr, offset_size, length_size)
     } else {
         // Compact storage: links live in the (already-parsed) object header.
         resolve_compact_entries(object_header, offset_size)
@@ -471,7 +496,7 @@ mod tests {
             birth_time: None,
         };
 
-        let entries = resolve_v2_group_entries(&[], &oh, 8, 8).unwrap();
+        let entries = resolve_v2_group_entries(&[], &oh, 8, 8, 0).unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "test");
         assert_eq!(entries[0].object_header_address, 0x1000);

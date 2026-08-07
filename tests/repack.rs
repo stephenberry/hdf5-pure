@@ -2,7 +2,7 @@
 //! survivors, and fail-loud refusal of features that cannot be reproduced.
 
 use hdf5_pure::{
-    AttrValue, Datatype, DatatypeByteOrder, FileBuilder, FileSpaceStrategy, RepackOptions,
+    AttrValue, Datatype, DatatypeByteOrder, FileBuilder, FileSpaceStrategy, LibVer, RepackOptions,
     ScaleOffset, repack,
 };
 
@@ -654,4 +654,145 @@ fn repacks_chunked_dataset_from_a_userblock_file() {
 
     std::fs::remove_file(&src).ok();
     std::fs::remove_file(&dst).ok();
+}
+
+/// A repack carries the source's on-disk format forward.
+///
+/// The format is the one property whose loss is invisible: the repacked file
+/// opens fine here, in `h5py`, and in every current-libhdf5 reader, and refuses
+/// to open only in the old library the bound was set for. So it is asserted at
+/// the byte the bound decides — the superblock version — rather than through a
+/// read that would pass either way.
+#[test]
+fn preserves_the_source_on_disk_format() {
+    let src = tmp("hdf5_pure_repack_libver_src.h5");
+    let dst = tmp("hdf5_pure_repack_libver_dst.h5");
+    let mut b = FileBuilder::new();
+    b.with_libver_bounds(LibVer::Earliest, LibVer::V18);
+    b.create_dataset("values").with_f64_data(&[1.0, 2.0, 3.0]);
+    b.write(&src).unwrap();
+    assert_eq!(superblock_version(&src), 2, "the source is the 1.8 format");
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    assert_eq!(superblock_version(&dst), 2, "repack rewrote the format");
+    assert_eq!(
+        hdf5_pure::File::open(&dst)
+            .unwrap()
+            .dataset("values")
+            .unwrap()
+            .read_f64()
+            .unwrap(),
+        vec![1.0, 2.0, 3.0]
+    );
+
+    std::fs::remove_file(&src).ok();
+    std::fs::remove_file(&dst).ok();
+}
+
+/// The carried-forward format yields where the content leaves no choice.
+///
+/// HDF5 1.8 and earlier indexed chunks with a version 1 B-tree, which this crate
+/// reads but does not write, so a pre-1.10 source holding a chunked dataset has
+/// no older encoding to be repacked back into. Upgrading it is forced; refusing
+/// would take repack away from most files the C library ever wrote, which are
+/// chunked under a version 0 or 2 superblock.
+///
+/// `chunked_deflate.h5` is such a file — superblock 0, one chunked and deflated
+/// dataset — so this is the forced case rather than a simulation of it. A source
+/// this crate wrote would not be: its own chunked files are already 1.10, so
+/// preserving and upgrading give the same answer and the test could not tell a
+/// strict rule from the right one.
+#[test]
+fn upgrades_only_where_the_source_format_cannot_hold_the_content() {
+    let dst = tmp("hdf5_pure_repack_libver_forced_dst.h5");
+
+    // Contiguous content under a version 0 superblock: floored at the oldest
+    // format this crate writes, and no further.
+    repack(
+        "tests/fixtures/simple_dataset.h5",
+        &dst,
+        &RepackOptions::new(),
+    )
+    .unwrap();
+    assert_eq!(
+        superblock_version(&dst),
+        2,
+        "a contiguous repack upgraded past the oldest writable format"
+    );
+
+    // Chunked content under a version 0 superblock: upgraded rather than
+    // refused, because there is no chunk index the older format can carry.
+    let expected = hdf5_pure::File::open("tests/fixtures/chunked_deflate.h5")
+        .unwrap()
+        .dataset("data")
+        .unwrap()
+        .read_f64()
+        .unwrap();
+    repack(
+        "tests/fixtures/chunked_deflate.h5",
+        &dst,
+        &RepackOptions::new(),
+    )
+    .unwrap();
+    assert_eq!(superblock_version(&dst), 3);
+    assert_eq!(
+        hdf5_pure::File::open(&dst)
+            .unwrap()
+            .dataset("data")
+            .unwrap()
+            .read_f64()
+            .unwrap(),
+        expected
+    );
+
+    std::fs::remove_file(&dst).ok();
+}
+
+/// An explicit bound is a guarantee, not a preference: content it cannot express
+/// is refused rather than upgraded past it, which is the difference between it
+/// and the carried-forward default above.
+#[test]
+fn an_explicit_bound_refuses_content_it_cannot_express() {
+    let src = tmp("hdf5_pure_repack_libver_chunked_src.h5");
+    let dst = tmp("hdf5_pure_repack_libver_chunked_dst.h5");
+    let data: Vec<f64> = (0..1000).map(|i| i as f64).collect();
+    let mut b = FileBuilder::new();
+    b.create_dataset("chk")
+        .with_f64_data(&data)
+        .with_shape(&[1000])
+        .with_deflate(6);
+    b.write(&src).unwrap();
+
+    // Re-target down to 1.8: the chunked dataset cannot be written there.
+    let to_v18 = RepackOptions::new().with_libver_bounds(LibVer::Earliest, LibVer::V18);
+    assert!(
+        matches!(
+            repack(&src, &dst, &to_v18),
+            Err(hdf5_pure::Error::Format(
+                hdf5_pure::FormatError::LibverTooOldForContent { .. }
+            ))
+        ),
+        "a chunked dataset must not be silently upgraded past the requested bound"
+    );
+
+    // And the same bound raised to 1.10 succeeds, so the refusal is about the
+    // content and not about the option being set at all.
+    let to_v110 = RepackOptions::new().with_libver_bounds(LibVer::Earliest, LibVer::V110);
+    repack(&src, &dst, &to_v110).unwrap();
+    assert_eq!(superblock_version(&dst), 3);
+
+    std::fs::remove_file(&src).ok();
+    std::fs::remove_file(&dst).ok();
+}
+
+/// The superblock version byte of the file at `path`, found by scanning for the
+/// signature so a userblock does not throw the offset off.
+fn superblock_version(path: &std::path::Path) -> u8 {
+    let bytes = std::fs::read(path).unwrap();
+    let sig = bytes
+        .windows(8)
+        .position(|w| w == b"\x89HDF\r\n\x1a\n")
+        .expect("the file carries an HDF5 signature");
+    bytes[sig + 8]
 }

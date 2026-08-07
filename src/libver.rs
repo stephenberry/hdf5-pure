@@ -21,16 +21,22 @@
 /// grows, so match with a `_` arm and read the newest this crate knows about
 /// from [`LATEST`](Self::LATEST).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+// `mat::Options` carries a `LibVer` and is itself serializable, so a persisted
+// set of MAT options can record which on-disk format it writes.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub enum LibVer {
     /// The earliest format (HDF5 1.0+): version 0/1 superblock, v1
     /// symbol-table groups. Readable by every released HDF5 library.
     Earliest,
     /// HDF5 1.8: version 2 superblock and the "new style" (version 2) object
-    /// headers, dense link/attribute storage, and the v2 B-tree indices.
+    /// headers, dense link/attribute storage, and the v2 B-tree indices. The
+    /// oldest format this crate's writer emits — see
+    /// [`WRITER_OLDEST`](Self::WRITER_OLDEST).
     V18,
     /// HDF5 1.10: version 3 superblock, plus SWMR and the extensible/fixed
-    /// array chunk indices. This is the format this crate's writer emits.
+    /// array chunk indices. The format this crate's writer emits unless bounds
+    /// say otherwise — see [`WRITER_DEFAULT`](Self::WRITER_DEFAULT).
     V110,
     /// HDF5 1.12.
     V112,
@@ -44,8 +50,24 @@ impl LibVer {
     pub const LATEST: LibVer = LibVer::V114;
 
     /// The on-disk format this crate's [`FileBuilder`](crate::FileBuilder)
-    /// produces: the version 3 superblock introduced in HDF5 1.10.
-    pub const WRITER_OUTPUT: LibVer = LibVer::V110;
+    /// produces when nothing constrains it: the version 3 superblock introduced
+    /// in HDF5 1.10.
+    ///
+    /// It is a *default*, not the only output.
+    /// [`with_libver_bounds`](crate::FileBuilder::with_libver_bounds) selects a
+    /// format within the bounds it is given, and the oldest this crate can write
+    /// is [`WRITER_OLDEST`](Self::WRITER_OLDEST).
+    pub const WRITER_DEFAULT: LibVer = LibVer::V110;
+
+    /// The oldest on-disk format this crate's [`FileBuilder`](crate::FileBuilder)
+    /// can produce: the version 2 superblock and "new style" object headers
+    /// introduced in HDF5 1.8.
+    ///
+    /// Nothing older is reachable. A version 0 or 1 superblock pairs with v1
+    /// symbol-table groups and local heaps, which this crate reads but does not
+    /// write, so a bound whose upper end is [`Earliest`](Self::Earliest) is
+    /// refused rather than silently satisfied with something newer.
+    pub const WRITER_OLDEST: LibVer = LibVer::V18;
 
     /// The minimum library version required to read a file with the given
     /// superblock version — i.e. the *low bound* the on-disk format implies.
@@ -58,6 +80,32 @@ impl LibVer {
             2 => LibVer::V18,
             _ => LibVer::V110,
         }
+    }
+
+    /// The format to write under `bounds`: the newest this crate produces that
+    /// they admit, or [`WRITER_DEFAULT`](Self::WRITER_DEFAULT) when they impose
+    /// nothing. Bounds admitting no such format give
+    /// [`FormatError::LibverBoundsUnsatisfiable`].
+    ///
+    /// One function so the whole-file writer and an editing session's fapl
+    /// answer the same bounds the same way; a second copy of this rule is how
+    /// the two would come to disagree about which format a caller asked for.
+    pub(crate) fn resolve_writable(
+        bounds: Option<(LibVer, LibVer)>,
+    ) -> Result<LibVer, crate::error::FormatError> {
+        let Some((low, high)) = bounds else {
+            return Ok(LibVer::WRITER_DEFAULT);
+        };
+        for candidate in [LibVer::WRITER_DEFAULT, LibVer::WRITER_OLDEST] {
+            if candidate >= low && candidate <= high {
+                return Ok(candidate);
+            }
+        }
+        Err(crate::error::FormatError::LibverBoundsUnsatisfiable {
+            writes: LibVer::WRITER_DEFAULT.name(),
+            requested_low: low.name(),
+            requested_high: high.name(),
+        })
     }
 
     /// A short, stable label for diagnostics (e.g. error messages).
