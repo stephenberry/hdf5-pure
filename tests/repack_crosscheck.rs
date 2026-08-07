@@ -549,10 +549,12 @@ fn repack_roundtrips_filtered_and_resizable_vlen_string_datasets() {
 
 #[test]
 fn repack_refuses_unrepresentable_attribute() {
-    // The C library writes a boolean attribute, which is an HDF5 enumeration —
-    // a datatype the reader cannot decode into an AttrValue and would silently
-    // drop. Repack must refuse by name rather than write a file missing the
-    // attribute, upholding the fail-loud fidelity contract.
+    // The C library writes a boolean attribute, which is an HDF5 enumeration.
+    // The reader decodes one — through its integer base, as it does enum dataset
+    // data — but `AttrValue` cannot carry the enum back, so a rewrite would turn
+    // `enum[FALSE, TRUE]` into a plain integer. Repack must refuse by name rather
+    // than quietly change the attribute's type, upholding the fail-loud fidelity
+    // contract.
     let dir = tempdir().unwrap();
     let src = dir.path().join("c_boolattr.h5");
     let dst = dir.path().join("boolattr_repacked.h5");
@@ -581,6 +583,12 @@ fn repack_refuses_unrepresentable_attribute() {
             assert!(
                 msg.contains("active") && msg.contains("data"),
                 "error should name the attribute and its dataset: {msg}"
+            );
+            // The reason matters as much as the refusal: it must be the rewrite
+            // that is refused, not a failure to read the attribute at all.
+            assert!(
+                msg.contains("enumeration"),
+                "error should name the enumeration as the reason: {msg}"
             );
         }
         other => panic!("expected RepackUnsupported, got {other:?}"),

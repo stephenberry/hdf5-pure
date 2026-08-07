@@ -1110,15 +1110,20 @@ impl FileInner {
         }
     }
 
-    /// Names of every attribute message on `hdr`, including ones whose datatype
-    /// [`attrs_of`](Self::attrs_of) cannot decode into an [`AttrValue`] (and so
-    /// silently omits from its map). Repack diffs this against the decoded map to
-    /// refuse rather than drop an attribute it cannot reproduce.
-    pub(crate) fn attr_message_names_of(&self, hdr: &ObjectHeader) -> Result<Vec<String>, Error> {
+    /// The name and datatype of every attribute message on `hdr`, including ones
+    /// whose datatype [`attrs_of`](Self::attrs_of) cannot decode into an
+    /// [`AttrValue`] (and so silently omits from its map). Repack weighs this
+    /// against the decoded map to refuse rather than drop or alter an attribute it
+    /// cannot reproduce — the datatype is what tells it an attribute decoded into
+    /// an `AttrValue` that would be written back as a different type.
+    pub(crate) fn attr_message_types_of(
+        &self,
+        hdr: &ObjectHeader,
+    ) -> Result<Vec<(String, Datatype)>, Error> {
         Ok(self
             .attr_messages_of(hdr)?
             .into_iter()
-            .map(|a| a.name)
+            .map(|a| (a.name, a.datatype))
             .collect())
     }
 
@@ -2406,12 +2411,12 @@ impl Group {
         self.file.attrs_of(&hdr)
     }
 
-    /// Names of every attribute on this group, including any whose datatype
-    /// [`attrs`](Self::attrs) cannot represent. Used by repack to detect an
-    /// attribute it would otherwise drop.
-    pub(crate) fn attr_names(&self) -> Result<Vec<String>, Error> {
+    /// The name and datatype of every attribute on this group, including any
+    /// whose datatype [`attrs`](Self::attrs) cannot represent. Used by repack to
+    /// detect an attribute it cannot reproduce.
+    pub(crate) fn attr_datatypes(&self) -> Result<Vec<(String, Datatype)>, Error> {
         let hdr = self.file.parse_header(self.address)?;
-        self.file.attr_message_names_of(&hdr)
+        self.file.attr_message_types_of(&hdr)
     }
 
     /// Get a dataset within this group by name.
@@ -3617,11 +3622,11 @@ impl Dataset {
         self.file.attrs_of(&self.header)
     }
 
-    /// Names of every attribute on this dataset, including any whose datatype
-    /// [`attrs`](Self::attrs) cannot represent. Used by repack to detect an
-    /// attribute it would otherwise drop.
-    pub(crate) fn attr_names(&self) -> Result<Vec<String>, Error> {
-        self.file.attr_message_names_of(&self.header)
+    /// The name and datatype of every attribute on this dataset, including any
+    /// whose datatype [`attrs`](Self::attrs) cannot represent. Used by repack to
+    /// detect an attribute it cannot reproduce.
+    pub(crate) fn attr_datatypes(&self) -> Result<Vec<(String, Datatype)>, Error> {
+        self.file.attr_message_types_of(&self.header)
     }
 
     /// Returns the exact HDF5 datatype, including compound field offsets and

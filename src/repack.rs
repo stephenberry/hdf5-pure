@@ -68,10 +68,12 @@
 //! target), and object references in a userblock file (non-zero base address); a
 //! non-string vlen sequence whose base type embeds an address (nested vlen or
 //! reference); virtual and external data layouts; a lossy filter on the
-//! contiguous re-encode or sparse-chunked fallback path; and any attribute whose
-//! datatype the reader cannot decode into an [`AttrValue`] (e.g. an enumeration,
-//! compound, reference, or boolean attribute). An object that cannot be
-//! reproduced fails the repack by name rather than being silently dropped.
+//! contiguous re-encode or sparse-chunked fallback path; any attribute whose
+//! datatype the reader cannot decode into an [`AttrValue`] (e.g. a compound or
+//! reference attribute); and any enumeration attribute, which decodes through its
+//! integer base and so would come back a plain integer rather than the enum (a
+//! boolean attribute is one of these). An object that cannot be reproduced fails
+//! the repack by name rather than being silently dropped.
 //!
 //! # Memory
 //!
@@ -274,7 +276,7 @@ fn populate<S: GroupSink>(
     } else {
         format!("group {path}")
     };
-    check_attr_completeness(&attrs, &src.attr_names()?, &owner)?;
+    check_attr_completeness(&attrs, &src.attr_datatypes()?, &owner)?;
     for (name, value) in sorted(attrs) {
         sink.sink_set_attr(&name, value);
     }
@@ -379,7 +381,7 @@ fn emit_dataset(
         emit_vlen_string_dataset(db, ds, path, &datatype, &dims, &layout, &pipeline)?;
         // VL-string datasets carry attributes the same way as any other.
         let attrs = ds.attrs()?;
-        check_attr_completeness(&attrs, &ds.attr_names()?, &format!("dataset {path}"))?;
+        check_attr_completeness(&attrs, &ds.attr_datatypes()?, &format!("dataset {path}"))?;
         for (name, value) in sorted(attrs) {
             db.set_attr(&name, value);
         }
@@ -394,7 +396,7 @@ fn emit_dataset(
     if is_nonstring_vlen(&datatype) {
         emit_vlen_sequence_dataset(db, ds, path, &datatype, &dims, &layout, &pipeline)?;
         let attrs = ds.attrs()?;
-        check_attr_completeness(&attrs, &ds.attr_names()?, &format!("dataset {path}"))?;
+        check_attr_completeness(&attrs, &ds.attr_datatypes()?, &format!("dataset {path}"))?;
         for (name, value) in sorted(attrs) {
             db.set_attr(&name, value);
         }
@@ -409,7 +411,7 @@ fn emit_dataset(
     if is_object_reference(&datatype) {
         emit_object_reference_dataset(db, ds, path, &dims, &layout, file, drop, addr_map)?;
         let attrs = ds.attrs()?;
-        check_attr_completeness(&attrs, &ds.attr_names()?, &format!("dataset {path}"))?;
+        check_attr_completeness(&attrs, &ds.attr_datatypes()?, &format!("dataset {path}"))?;
         for (name, value) in sorted(attrs) {
             db.set_attr(&name, value);
         }
@@ -443,7 +445,7 @@ fn emit_dataset(
             addr_map,
         )?;
         let attrs = ds.attrs()?;
-        check_attr_completeness(&attrs, &ds.attr_names()?, &format!("dataset {path}"))?;
+        check_attr_completeness(&attrs, &ds.attr_datatypes()?, &format!("dataset {path}"))?;
         for (name, value) in sorted(attrs) {
             db.set_attr(&name, value);
         }
@@ -505,7 +507,7 @@ fn emit_dataset(
             // Carry the dataset's attributes, refusing any that cannot be
             // represented.
             let attrs = ds.attrs()?;
-            check_attr_completeness(&attrs, &ds.attr_names()?, &format!("dataset {path}"))?;
+            check_attr_completeness(&attrs, &ds.attr_datatypes()?, &format!("dataset {path}"))?;
             for (name, value) in sorted(attrs) {
                 db.set_attr(&name, value);
             }
@@ -543,7 +545,7 @@ fn emit_dataset(
 
     // Carry the dataset's attributes, refusing if any cannot be represented.
     let attrs = ds.attrs()?;
-    check_attr_completeness(&attrs, &ds.attr_names()?, &format!("dataset {path}"))?;
+    check_attr_completeness(&attrs, &ds.attr_datatypes()?, &format!("dataset {path}"))?;
     for (name, value) in sorted(attrs) {
         db.set_attr(&name, value);
     }
@@ -949,21 +951,31 @@ fn try_plan_dense_chunks(
     Ok(Some(DenseChunkPlan { meta, grid_order }))
 }
 
-/// Refuse the repack if `owner` has an attribute the reader cannot represent as
-/// an [`AttrValue`] and would therefore drop. `names` is every attribute on the
-/// object; `decoded` is the subset that read back, keyed by name. Any name not
-/// in `decoded` is an attribute that would be silently lost.
+/// Refuse the repack if `owner` has an attribute this crate cannot write back as
+/// it found it. `attrs` is every attribute on the object with its datatype;
+/// `decoded` is the subset that read back, keyed by name.
+///
+/// An attribute is lost in one of two ways. It may not decode into an
+/// [`AttrValue`] at all, in which case the rewrite would simply omit it. Or it
+/// may decode into one that writes a *different* datatype than the disk holds:
+/// an enumeration decodes through its integer base, so rewriting it would turn
+/// `enum[FALSE, TRUE]` into a plain integer. Both are silent, so both refuse.
 fn check_attr_completeness(
     decoded: &std::collections::HashMap<String, AttrValue>,
-    names: &[String],
+    attrs: &[(String, Datatype)],
     owner: &str,
 ) -> Result<(), Error> {
-    for name in names {
-        if !decoded.contains_key(name) {
-            return Err(Error::RepackUnsupported(format!(
-                "{owner}: attribute {name:?} has a datatype that cannot be repacked faithfully yet"
-            )));
-        }
+    for (name, datatype) in attrs {
+        let fault = if !decoded.contains_key(name) {
+            "a datatype that cannot be repacked faithfully yet"
+        } else if matches!(datatype, Datatype::Enumeration { .. }) {
+            "an enumeration datatype, which would be rewritten as its integer base"
+        } else {
+            continue;
+        };
+        return Err(Error::RepackUnsupported(format!(
+            "{owner}: attribute {name:?} has {fault}"
+        )));
     }
     Ok(())
 }
