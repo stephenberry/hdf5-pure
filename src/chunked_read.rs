@@ -4,10 +4,13 @@
 extern crate alloc;
 
 #[cfg(not(feature = "std"))]
-use alloc::{format, vec, vec::Vec};
+use alloc::{borrow::Cow, format, vec, vec::Vec};
+#[cfg(feature = "std")]
+use std::borrow::Cow;
 
 use crate::btree_v1::btree_v1_node_header_size;
 use crate::chunk_cache::ChunkCache;
+use crate::chunk_span::ChunkSpanReader;
 use crate::convert::{TryToUsize, slice_range, u32_from};
 use crate::data_layout::DataLayout;
 use crate::dataspace::Dataspace;
@@ -82,13 +85,20 @@ fn decompress_all_chunks_from_source<S: Source + ?Sized>(
     ctx: ChunkContext<'_>,
 ) -> Result<Vec<Vec<u8>>, FormatError> {
     let mut result = Vec::with_capacity(chunks.len());
+    let mut spans = ChunkSpanReader::new(chunks);
     for chunk_info in chunks {
-        let raw_chunk =
-            source.read_exact_at(chunk_info.address, chunk_info.chunk_size.to_usize()?)?;
-        let decompressed = if let Some(pl) = pipeline {
-            decompress_chunk(&raw_chunk, pl, ctx, chunk_info.filter_mask)?
-        } else {
-            raw_chunk
+        let len = chunk_info.chunk_size.to_usize()?;
+        let decompressed = match (spans.as_mut(), pipeline) {
+            (Some(sp), Some(pl)) => {
+                let raw = sp.chunk_bytes(source, chunk_info.address, len)?;
+                decompress_chunk(raw, pl, ctx, chunk_info.filter_mask)?
+            }
+            (Some(sp), None) => sp.chunk_bytes(source, chunk_info.address, len)?.to_vec(),
+            (None, Some(pl)) => {
+                let raw = source.read_exact_at(chunk_info.address, len)?;
+                decompress_chunk(&raw, pl, ctx, chunk_info.filter_mask)?
+            }
+            (None, None) => source.read_exact_at(chunk_info.address, len)?,
         };
         result.push(decompressed);
     }
@@ -987,6 +997,19 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
     let row_hi = row_lo.saturating_add(out_rows); // exclusive; caller clamped to the dataset
     let cd0 = chunk_dims[0];
 
+    // Coalesce over the chunks this window overlaps, not the dataset's whole
+    // chunk list: a span built over all of them would bridge chunks outside the
+    // window and read bytes the window does not want.
+    let overlapping: Vec<ChunkInfo> = chunks
+        .iter()
+        .filter(|chunk| {
+            let c0 = chunk.offsets.first().copied().unwrap_or(0).to_usize();
+            c0.is_ok_and(|c0| c0 < row_hi && c0.saturating_add(cd0) > row_lo)
+        })
+        .cloned()
+        .collect();
+    let mut spans = ChunkSpanReader::new(&overlapping);
+
     for chunk in &chunks {
         let c0 = chunk.offsets.first().copied().unwrap_or(0).to_usize()?;
         // This chunk's exclusive leading-dim end. The saturating add/mul here and
@@ -1056,7 +1079,11 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
             continue;
         }
 
-        let raw = source.read_exact_at(chunk.address, chunk.chunk_size as usize)?;
+        let len = chunk.chunk_size as usize;
+        let raw = match spans.as_mut() {
+            Some(sp) => Cow::Borrowed(sp.chunk_bytes(source, chunk.address, len)?),
+            None => Cow::Owned(source.read_exact_at(chunk.address, len)?),
+        };
         match pipeline {
             Some(pl) => {
                 let dec = decompress_chunk(&raw, pl, ctx, chunk.filter_mask)?;
@@ -1204,6 +1231,8 @@ pub fn read_chunked_data_cached_from_source<S: Source + ?Sized>(
     let chunk_dims_u64: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
     let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype);
 
+    let mut spans = ChunkSpanReader::new(&chunks);
+
     for chunk_info in &chunks {
         let coord: Vec<u64> = chunk_info.offsets.iter().take(rank).copied().collect();
         let chunk_offsets: Vec<usize> = chunk_info
@@ -1231,13 +1260,22 @@ pub fn read_chunked_data_cached_from_source<S: Source + ?Sized>(
             continue;
         }
 
-        // Cache miss: fetch the chunk's bytes from the source (already owned).
-        let raw_chunk =
-            source.read_exact_at(chunk_info.address, chunk_info.chunk_size.to_usize()?)?;
-        let dec = if let Some(pl) = pipeline {
-            decompress_chunk(&raw_chunk, pl, ctx, chunk_info.filter_mask)?
-        } else {
-            raw_chunk
+        // Cache miss: fetch the chunk's bytes from the source.
+        let len = chunk_info.chunk_size.to_usize()?;
+        let raw_chunk = match spans.as_mut() {
+            Some(sp) => Cow::Borrowed(sp.chunk_bytes(source, chunk_info.address, len)?),
+            None => Cow::Owned(source.read_exact_at(chunk_info.address, len)?),
+        };
+        let dec = match pipeline {
+            Some(pl) => Cow::Owned(decompress_chunk(
+                &raw_chunk,
+                pl,
+                ctx,
+                chunk_info.filter_mask,
+            )?),
+            // Unfiltered: the chunk's stored bytes are its data, so they are
+            // copied out of the span only if the cache admits them.
+            None => raw_chunk,
         };
         place_chunk(
             &dec,
@@ -1250,7 +1288,10 @@ pub fn read_chunked_data_cached_from_source<S: Source + ?Sized>(
             elem_size,
             rank,
         );
-        cache.put_decompressed(coord, dec); // move; dropped if not admitted
+        match dec {
+            Cow::Owned(bytes) => cache.put_decompressed(coord, bytes), // move
+            Cow::Borrowed(bytes) => cache.put_decompressed_slice(coord, bytes),
+        } // dropped if not admitted
     }
 
     Ok(output)

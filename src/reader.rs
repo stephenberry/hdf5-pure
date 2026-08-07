@@ -447,7 +447,11 @@ impl FileInner {
     /// This lets a host read a file larger than its address space — the original
     /// motivation being 32-bit targets reading multi-gigabyte files (issue #27).
     /// Metadata and dataset chunks are read through a `ReadSeekSource`, so peak
-    /// memory stays close to one chunk plus the metadata being parsed.
+    /// memory stays close to one chunk plus the metadata being parsed. Chunks
+    /// that sit next to each other on disk are fetched in one read of at most
+    /// 256 KiB rather than one read each, which is what makes a file written a
+    /// row at a time — thousands of chunks of a few dozen bytes — read at a
+    /// sensible speed.
     ///
     /// Reads match the buffered [`File::open`]: every storage layout and chunk
     /// index type, both group forms (v2 and v1 symbol-table), and compact,
@@ -1535,7 +1539,8 @@ impl File {
     ///
     /// This lets a host read a file larger than its address space. Metadata and
     /// dataset chunks are read through a `ReadSeekSource`, so peak memory stays
-    /// close to one chunk plus the metadata being parsed. Attribute reading and
+    /// close to one chunk plus the metadata being parsed; chunks adjacent on
+    /// disk are fetched in one read of at most 256 KiB. Attribute reading and
     /// v1 symbol-table groups on the resolved path are not yet supported on this
     /// backend.
     ///
@@ -4067,6 +4072,7 @@ fn is_group(header: &ObjectHeader) -> bool {
 mod tests {
     use super::*;
     use crate::FileBuilder;
+    use std::sync::atomic::AtomicUsize;
 
     /// Read everything a read-write file can serve through the paired read
     /// paths, as comparable text.
@@ -4398,6 +4404,123 @@ mod tests {
         assert!(
             matches!(err, FormatError::UnsupportedVirtualLayout),
             "expected UnsupportedVirtualLayout, got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Coalesced chunk reads (see `crate::chunk_span`)
+    // -----------------------------------------------------------------------
+
+    /// A `Source` over a file image that counts the reads it serves, so a test
+    /// can assert what the streaming reader asks the file for.
+    struct CountingSource {
+        bytes: Vec<u8>,
+        reads: Arc<AtomicUsize>,
+        bytes_read: Arc<AtomicUsize>,
+    }
+
+    impl Source for CountingSource {
+        fn len(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.bytes_read.fetch_add(buf.len(), Ordering::Relaxed);
+            BytesSource::new(&self.bytes).read_at(offset, buf)
+        }
+    }
+
+    /// A streaming `File` over `bytes` whose reads are counted, as
+    /// `File::open_streaming` builds one over a file handle.
+    fn counting_streaming_file(
+        bytes: Vec<u8>,
+        reads: Arc<AtomicUsize>,
+        bytes_read: Arc<AtomicUsize>,
+    ) -> File {
+        let source: Box<dyn Source + Send + Sync> = Box::new(CountingSource {
+            bytes,
+            reads,
+            bytes_read,
+        });
+        let (superblock, addr_offset) =
+            FileInner::parse_superblock_source(source.as_ref()).expect("parse superblock");
+        File {
+            inner: Arc::new(FileInner::from_parts(
+                Backend::Streaming(source),
+                superblock,
+                addr_offset,
+                None,
+                FileAccessProperties::new(),
+            )),
+        }
+    }
+
+    /// One chunk per row is what a writer that appends as data arrives
+    /// produces; the rows land next to each other, so the streaming reader must
+    /// fetch them in a few spans rather than one read each.
+    #[test]
+    fn a_streaming_read_coalesces_a_run_of_small_chunks() {
+        let n = 1024usize;
+        let data: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let mut builder = FileBuilder::new();
+        builder
+            .create_dataset("d")
+            .with_f64_data(&data)
+            .with_shape(&[n as u64])
+            .with_chunks(&[1]);
+        let bytes = builder.finish().expect("write file");
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        let file = counting_streaming_file(bytes, Arc::clone(&reads), Arc::clone(&bytes_read));
+
+        let before = reads.load(Ordering::Relaxed);
+        let got = file.dataset("d").unwrap().read_f64().unwrap();
+        assert_eq!(got, data, "the coalesced read must return the same values");
+
+        // Reading each of the 1024 chunks on its own would cost at least that
+        // many reads; the whole run plus its metadata fits in far fewer.
+        let reads = reads.load(Ordering::Relaxed) - before;
+        assert!(
+            reads < n / 8,
+            "expected the {n} chunks to be coalesced into few reads, got {reads}"
+        );
+    }
+
+    /// A windowed read must coalesce only the chunks its window overlaps: a
+    /// span built over the dataset's whole chunk list would bridge the ones
+    /// outside it and read bytes the window never asked for.
+    #[test]
+    fn a_windowed_streaming_read_fetches_only_its_own_window() {
+        let rows = 4096usize;
+        let data: Vec<f64> = (0..rows).map(|i| i as f64).collect();
+        let mut builder = FileBuilder::new();
+        builder
+            .create_dataset("d")
+            .with_f64_data(&data)
+            .with_shape(&[rows as u64])
+            .with_chunks(&[4]);
+        let bytes = builder.finish().expect("write file");
+
+        let reads = Arc::new(AtomicUsize::new(0));
+        let bytes_read = Arc::new(AtomicUsize::new(0));
+        let file = counting_streaming_file(bytes, Arc::clone(&reads), Arc::clone(&bytes_read));
+        let ds = file.dataset("d").unwrap();
+
+        // The first window walks (and caches on this handle) the chunk index,
+        // so measure the second: what it reads is the window's own chunks.
+        assert_eq!(ds.read_f64_rows(0, 8).unwrap(), data[0..8]);
+        let before = bytes_read.load(Ordering::Relaxed);
+        assert_eq!(ds.read_f64_rows(2048, 8).unwrap(), data[2048..2056]);
+        let window_bytes = bytes_read.load(Ordering::Relaxed) - before;
+
+        // Eight rows are two 32-byte chunks. A span over the whole chunk list
+        // would pull kilobytes of neighbouring rows instead.
+        assert!(
+            window_bytes < 256,
+            "a {}-row window read {window_bytes} bytes; it needs 64",
+            8
         );
     }
 }

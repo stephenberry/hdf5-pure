@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- `File::open_streaming` reads a dataset's adjacent chunks in one call instead of one call per chunk, which nearly halves the time to read a file written a row at a time — 20,440 tiny chunks in a 2.7 MB file went from 19.9 ms to 11.4 ms. A read never fetches a byte outside the chunks it was asked for, and holds at most 256 KiB of span beyond its own buffers ([#250](https://github.com/stephenberry/hdf5-pure/pull/250)).
+
 ## [0.33.0] - 2026-08-02
 
 A file whose superblock marks it as held by a writer is refused rather than opened: `File::open`, `open_streaming`, `open_rw`, `open_swmr_writer` and `repack` report the new `Error::FileMarkedInUse`, which is the check `H5Fopen` makes of the same byte — a file a crashed SWMR writer left flagged used to open, and `open_rw` used to edit it in place under a writer the file still recorded ([#245](https://github.com/stephenberry/hdf5-pure/issues/245)). `File::open_swmr` follows such a file instead of refusing it, since that pairing is what the flag exists for, and `File::from_bytes` does not consult the byte at all, so a caller holding the bytes can still read a flagged file on a read-only mount, where the `File::clear_swmr_flag` recovery (the `h5clear -s` equivalent) cannot get the write access it needs. The check applies to version-3 superblocks, which is where the C library applies it, and `open_swmr_writer` now requires one for the same reason libhdf5 does. Two smaller changes come with it: a read-write open validates the superblock before it builds its backing, so refusing a mirrored file no longer reads the whole file first, and a version-1 superblock's status flags and chunk B-tree K are read from the offsets the C library writes them to rather than swapped. Files written by earlier versions still read.
