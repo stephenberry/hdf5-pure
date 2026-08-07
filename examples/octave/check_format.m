@@ -30,17 +30,23 @@
 % library version alongside the result:
 %
 %   1.8.x   the v1.10 file must fail. If it loads, the diagnosis is wrong.
-%   1.10+   the v1.10 file is expected to load. That says nothing against the
-%           1.8 default -- it only means this release was never affected.
+%   1.10+   the v1.10 file *may* load, and may not -- see the wrinkle below.
+%           Either outcome is informative; neither argues against the default.
 %
 % Either way the v1.8 file must load and decode correctly. That is the claim the
 % default rests on, and it holds for every release in the table.
 %
-% There is one wrinkle the version number will not show. Around R2021b MathWorks
-% shipped two libraries at once, keeping 1.8.12 on the MAT v7.3 path while
-% `h5read`/`h5disp` used 1.10.7. On such a release `H5.get_libversion` reports
-% 1.10.7 while `load` still cannot open a v1.10 file -- so a 1.10 report with a
-% failing control is a meaningful result, not a contradiction.
+% The wrinkle is that the library version does not decide what `load` accepts.
+% Around R2021b MathWorks shipped two libraries at once, keeping 1.8.12 on the
+% MAT v7.3 path while `h5read`/`h5disp` used 1.10.7. On such a release
+% `H5.get_libversion` reports 1.10 while `load` still cannot open a v1.10 file.
+%
+% That is not a historical footnote. Measured on R2023a Update 1, reporting HDF5
+% 1.10.8: the v1.8 file loads and decodes correctly, and the v1.10 file fails
+% with "Not a binary MAT-file". So a 1.10 report with a failing control is the
+% expected result on at least some releases, not a contradiction -- and it is
+% the outcome most worth recording, since nothing in MathWorks' published
+% version table predicts it.
 % ---------------------------------------------------------------------------
 
 fprintf('\n');
@@ -134,6 +140,20 @@ elseif good && ~v110_loaded
     fprintf('CONFIRMED. The 1.8-format file loads and the 1.10-format one does\n');
     fprintf('not, so the superblock version is exactly what broke `load` and the\n');
     fprintf('0.34.0 default fixes it.\n');
+    if hdf5_known && ~expects_v110_to_fail
+        % The library is new enough to read a version 3 superblock, and `load`
+        % refused one regardless. Called out rather than folded into the plain
+        % CONFIRMED above, because it is the case MathWorks' version table does
+        % not predict, and the reason the 1.8 default matters on a release the
+        % table would call safe.
+        fprintf('\n');
+        fprintf('Note: this release links HDF5 %d.%d, which reads a version 3\n', ...
+            hdf5_major, hdf5_minor);
+        fprintf('superblock perfectly well -- and `load` refused one anyway. The\n');
+        fprintf('MAT v7.3 path does not accept everything the linked library can\n');
+        fprintf('read, so the reported version does not tell you which formats\n');
+        fprintf('`load` takes. Worth reporting with the versions printed above.\n');
+    end
 elseif good && v110_loaded && ~hdf5_known
     fprintf('PARTIALLY CONFIRMED. The 1.8-format file loads and decodes\n');
     fprintf('correctly, which is what the default rests on, so the claim this\n');

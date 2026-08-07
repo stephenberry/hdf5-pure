@@ -255,6 +255,12 @@ pub struct Options {
     /// path while `h5read`/`h5disp` used 1.10.7, which is why such a file could
     /// print under `h5disp` and still fail to `load`.
     ///
+    /// Do not read the version table above as saying which formats `load`
+    /// accepts. R2023a reports HDF5 1.10.8 — a library that reads a version 3
+    /// superblock without difficulty — and its `load` refuses one anyway, with
+    /// "Not a binary MAT-file". The 1.8 default is what a release the table
+    /// would call safe still requires.
+    ///
     /// Real MATLAB writes an older format still — a version 0 superblock with
     /// v1 symbol-table groups, which this crate reads but does not produce.
     ///

@@ -118,7 +118,11 @@ writer therefore emits the HDF5 1.8 format by default
 file destined for an old reader. Around R2021b MathWorks also shipped two
 libraries at once, keeping 1.8.12 on the MAT v7.3 path while `h5read`/`h5disp`
 used 1.10.7 — the split behind the odd symptom of a file `h5disp` prints and
-`load` refuses. Real MATLAB writes an older format still: a version 0
+`load` refuses. That is not confined to R2021b: R2023a reports HDF5 1.10.8 and
+its `load` still refuses a version 3 superblock, so the linked library version
+does not tell you which formats `load` accepts (see
+[MATLAB v7.3 files](matlab.md#the-on-disk-format-matlabs-load-needs)). Real
+MATLAB writes an older format still: a version 0
 superblock with v1 symbol-table groups, which this crate reads but does not
 produce.
 
