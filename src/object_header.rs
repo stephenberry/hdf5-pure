@@ -16,6 +16,19 @@ const OHDR_SIGNATURE: [u8; 4] = *b"OHDR";
 /// OCHK signature for v2 continuation chunks.
 const OCHK_SIGNATURE: [u8; 4] = *b"OCHK";
 
+/// The absolute file position of a stored file address.
+///
+/// Addresses in an HDF5 file are relative to the superblock's base address, which
+/// is zero for a plain file and the userblock size for a file that has one.
+fn absolute(stored: u64, base_address: u64) -> Result<u64, FormatError> {
+    stored
+        .checked_add(base_address)
+        .ok_or(FormatError::OffsetOverflow {
+            offset: stored,
+            length: base_address,
+        })
+}
+
 /// A single parsed header message.
 ///
 /// `size` and `creation_order` are decoded from the on-disk message prefix for
@@ -99,11 +112,17 @@ impl ObjectHeader {
         Self::parse_with_base(data, offset, offset_size, length_size, 0)
     }
 
-    /// Parse an object header, applying `base_address` to v1 continuation offsets.
+    /// Parse an object header, applying `base_address` to continuation offsets.
     ///
-    /// For files with a non-zero superblock base_address (e.g., files with a userblock),
-    /// v1 object header continuation block addresses are stored relative to base_address.
-    /// This method adds `base_address` to those addresses before reading them.
+    /// A continuation message stores a *file address*, and the format specification
+    /// says of the superblock's base address that "unless otherwise noted, all
+    /// other file addresses are relative to this base address". So for a file with
+    /// a userblock (a `.mat` carries a 512-byte one) the stored offset is short of
+    /// the real position by exactly the base, and this method adds it back before
+    /// reading the block. Both header versions store the address the same way.
+    ///
+    /// `offset` itself is already absolute: every caller resolves an address to a
+    /// file position before parsing there.
     pub fn parse_with_base(
         data: &[u8],
         offset: usize,
@@ -113,7 +132,7 @@ impl ObjectHeader {
     ) -> Result<ObjectHeader, FormatError> {
         ensure_len(data, offset, 4)?;
         if data[offset..offset + 4] == OHDR_SIGNATURE {
-            Self::parse_v2(data, offset, offset_size, length_size)
+            Self::parse_v2(data, offset, offset_size, length_size, base_address)
         } else {
             Self::parse_v1(data, offset, offset_size, length_size, base_address)
         }
@@ -322,6 +341,7 @@ impl ObjectHeader {
         offset: usize,
         offset_size: u8,
         length_size: u8,
+        base_address: u64,
     ) -> Result<ObjectHeader, FormatError> {
         // signature(4) + version(1) + flags(1) = 6
         ensure_len(data, offset, 6)?;
@@ -406,14 +426,16 @@ impl ObjectHeader {
         )?;
 
         // Follow continuations (limit to prevent cycles in malformed data).
-        // Offsets are u64 file offsets; in this buffered path they index the
-        // in-memory image, so narrow (checked) to usize here.
+        // Offsets are u64 file addresses relative to the superblock base; in this
+        // buffered path the absolute position indexes the in-memory image, so add
+        // the base and narrow (checked) to usize here.
         let mut cont_remaining = 256u16;
         while let Some((cont_offset, cont_length)) = continuations.pop() {
             if cont_remaining == 0 {
                 return Err(FormatError::NestingDepthExceeded);
             }
             cont_remaining -= 1;
+            let cont_offset = absolute(cont_offset, base_address)?;
             Self::parse_v2_continuation(
                 data,
                 cont_offset.to_usize()?,
@@ -578,7 +600,7 @@ impl ObjectHeader {
         let mut sig = [0u8; 4];
         source.read_at(address, &mut sig)?;
         if sig == OHDR_SIGNATURE {
-            Self::parse_v2_from_source(source, address, offset_size, length_size)
+            Self::parse_v2_from_source(source, address, offset_size, length_size, base_address)
         } else {
             Self::parse_v1_from_source(source, address, offset_size, length_size, base_address)
         }
@@ -589,6 +611,7 @@ impl ObjectHeader {
         address: u64,
         offset_size: u8,
         length_size: u8,
+        base_address: u64,
     ) -> Result<ObjectHeader, FormatError> {
         // The v2 prefix is bounded: sig(4) + ver(1) + flags(1) + optional
         // timestamps(16) + optional attribute thresholds(4) + chunk0-size
@@ -692,7 +715,7 @@ impl ObjectHeader {
             }
             cont_remaining -= 1;
             let cont_len = cont_len.to_usize()?;
-            let region = source.read_metadata_at(cont_off, cont_len)?;
+            let region = source.read_metadata_at(absolute(cont_off, base_address)?, cont_len)?;
             Self::parse_v2_continuation(
                 &region,
                 0,

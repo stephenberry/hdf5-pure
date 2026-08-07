@@ -23,6 +23,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - An object header holding compact attributes now declares how many it has, so `H5Oget_info().num_attrs` agrees with iteration instead of reporting zero. Tools that size their work by the count saw no attributes at all — an `h5repack` round trip stripped every `MATLAB_*` attribute from a `.mat` file without warning. Applies to the whole-file writer and to headers rewritten in place, which heal an older file's missing message.
+- A file with a userblock now reads whole when it holds an object-header continuation block or dense link storage, both of which the C library writes and this crate does not. Their addresses are relative to the superblock base, which was not being added, so `File::open` on such a file failed outright with `FormatError::InvalidObjectHeaderSignature` — reached by any `.mat` file a C-based tool had touched, and by a C-written userblock file with more than eight links.
 
 ## [0.33.0] - 2026-08-02
 

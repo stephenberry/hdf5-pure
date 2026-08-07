@@ -35,7 +35,7 @@ use crate::object_header::ObjectHeader;
 use crate::signature;
 use crate::source::{
     BaseOffsetSource, BytesSource, MetadataCacheConfig, MetadataCachingSource, ReadSeekSource,
-    Source,
+    Source, frame,
 };
 use crate::superblock::Superblock;
 use crate::vl_data::{self, VlenStringReadOptions};
@@ -95,21 +95,6 @@ impl Source for SourceView<'_> {
             SourceView::Stream(s) => s.read_metadata_at(offset, len),
         }
     }
-}
-
-/// A base-relative view of an in-memory file: `bytes` with its first `base` bytes
-/// (the userblock) cut off, so every address stored relative to the base address
-/// indexes it directly. The in-memory counterpart of [`BaseOffsetSource`], and the
-/// identity for a plain file.
-fn frame(bytes: &[u8], base: u64) -> Result<&[u8], FormatError> {
-    if base == 0 {
-        return Ok(bytes);
-    }
-    let start = base.to_usize()?;
-    bytes.get(start..).ok_or(FormatError::UnexpectedEof {
-        expected: start,
-        available: bytes.len(),
-    })
 }
 
 /// File-access properties applied when opening an HDF5 file.
