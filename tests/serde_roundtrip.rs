@@ -1731,11 +1731,13 @@ fn vec_of_unit_enums_roundtrips() {
 /// only when libmatio is installed. This runs on the default feature set, over
 /// shapes that reach both emitters' interesting arms.
 ///
-/// Empty values are deliberately absent: the two emitters record different
-/// MATLAB dims for an empty `Vec`, `String`, and `Vec<bool>` — `[0, 0]` against
-/// `[0, 1]` — which predates this guard and predates the `DataAsDims` default
-/// (it reproduces with that flipped back). Adding an empty field here is how to
-/// reproduce it once that is fixed.
+/// Emptiness is where the two have come apart most: they recorded different
+/// MATLAB dims for an empty `Vec`, `String`, and `Vec<bool>` (`[0, 0]` against
+/// `[0, 1]`), and `apply_matrix` was left out of the `DataAsDims` default
+/// entirely, so an empty `Matrix` stayed a zero-element array on one side and
+/// became a dimension vector on the other. Every shape of emptiness the writers
+/// treat separately therefore belongs in `Every` below — a shape that is missing
+/// is a divergence this test cannot see.
 #[test]
 fn both_emit_paths_produce_the_same_bytes() {
     #[derive(Serialize)]
@@ -1749,13 +1751,18 @@ fn both_emit_paths_produce_the_same_bytes() {
         complex: Vec<Complex64>,
         // The empty cases carry their own history: the two emitters described an
         // empty `Vec` with different MATLAB dimensions (`0x0` against `0x1`) and
-        // nothing caught it, because this comparison held no empty value. Every
-        // shape of emptiness the writers treat separately belongs here.
+        // nothing caught it, because this comparison held no empty value.
         empty_vector: Vec<f64>,
         empty_ints: Vec<i32>,
         empty_flags: Vec<bool>,
         empty_text: String,
         empty_cells: Vec<Vec<i32>>,
+        // A `Matrix` reaches an emit arm of its own, and only one of the two was
+        // converted to the empty marker. The non-square case is the one that
+        // pins the dims: a `0x0` marker would still match if both sides
+        // collapsed every empty matrix to `0x0`.
+        empty_matrix: Matrix<f64>,
+        empty_matrix_cols: Matrix<f64>,
         absent: Option<f64>,
         nothing: (),
     }
@@ -1781,6 +1788,8 @@ fn both_emit_paths_produce_the_same_bytes() {
         empty_flags: Vec::new(),
         empty_text: String::new(),
         empty_cells: Vec::new(),
+        empty_matrix: Matrix::from_row_major(0, 0, Vec::new()),
+        empty_matrix_cols: Matrix::from_row_major(0, 3, Vec::new()),
         absent: None,
         nothing: (),
     };

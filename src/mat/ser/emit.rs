@@ -352,7 +352,7 @@ fn apply_scalar(ds: &mut DatasetBuilder, n: ScalarNum) -> Result<(), MatError> {
 fn apply_vec_1d(ds: &mut DatasetBuilder, v: NumVec) -> Result<(), MatError> {
     let n = v.len() as u64;
     if n == 0 {
-        emit_empty(ds, v.tag());
+        emit_empty(ds, v.tag(), &[0, 0]);
         return Ok(());
     }
     let shape = [1u64, n];
@@ -414,6 +414,15 @@ fn apply_matrix(
     vec: NumVec,
 ) -> Result<(), MatError> {
     debug_assert_eq!(vec.len(), rows * cols);
+    // An empty matrix is a marker, not a zero-element array of its class, and it
+    // keeps the MATLAB shape it was given — `Matrix::from_row_major(0, 3, [])`
+    // records `[0, 3]`, not `[0, 0]`. `MatBuilder::write_array_inner` routes the
+    // same value to `write_empty` with the same dims; the two emitters have to
+    // agree byte for byte under default options.
+    if rows * cols == 0 {
+        emit_empty(ds, vec.tag(), &[rows, cols]);
+        return Ok(());
+    }
     // HDF5 shape for a MATLAB [rows × cols] matrix is [cols, rows].
     let shape = [cols as u64, rows as u64];
     match vec {
@@ -513,7 +522,19 @@ fn apply_char_string(ds: &mut DatasetBuilder, s: &str) {
     set_char_decode(ds);
 }
 
-fn emit_empty(ds: &mut DatasetBuilder, tag: ScalarTag) {
+/// Write the empty marker for a numeric value of `tag` with MATLAB shape
+/// `matlab_dims`. The counterpart of [`MatBuilder::write_empty`], which the
+/// with-options emitter reaches for the same values.
+///
+/// No `MATLAB_int_decode`, for any class: it says how to read the stored
+/// integers back as `char` or `logical` values, and an empty marker's payload is
+/// a `uint64` dimension vector rather than data of the marked class. MATLAB
+/// agrees — of the 352 empty datasets in `tests/fixtures/mat_real`, not one
+/// carries it. `MatBuilder::write_empty` states the same rule; the two have to
+/// hold it identically or the emitters diverge for an empty logical.
+///
+/// [`MatBuilder::write_empty`]: crate::mat::MatBuilder::write_empty
+fn emit_empty(ds: &mut DatasetBuilder, tag: ScalarTag, matlab_dims: &[usize]) {
     let class = match tag {
         ScalarTag::Bool => MatClass::Logical,
         ScalarTag::F64 => MatClass::Double,
@@ -527,11 +548,8 @@ fn emit_empty(ds: &mut DatasetBuilder, tag: ScalarTag) {
         ScalarTag::U16 => MatClass::UInt16,
         ScalarTag::U8 => MatClass::UInt8,
     };
-    crate::mat::builder::emit_empty_storage(ds, default_empty_encoding(), class, &[0, 0]);
+    crate::mat::builder::emit_empty_storage(ds, default_empty_encoding(), class, matlab_dims);
     set_class(ds, class);
-    if class == MatClass::Logical {
-        set_logical_decode(ds);
-    }
     ds.set_attr("MATLAB_empty", AttrValue::U32(1));
 }
 
@@ -561,4 +579,76 @@ fn set_char_decode(ds: &mut DatasetBuilder) {
 fn _touch() {
     let _ = make_f64_type();
     let _ = make_f32_type();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rule [`MatBuilder::write_empty`] states — an empty marker carries
+    /// `MATLAB_class` and `MATLAB_empty` and nothing else — held for one emitter
+    /// and not the other: this one kept `MATLAB_int_decode` on the `logical`
+    /// class after the builder dropped it.
+    ///
+    /// Asserted here rather than through `to_bytes` because no serde value
+    /// reaches this arm today: `unify_sequence` lowers an empty `Vec<bool>` to
+    /// `NumVec::F64` under [`EmptySequencePolicy::DoubleArray`], so an
+    /// end-to-end test would pass with the defect in place. A change to that
+    /// policy is exactly what would deliver a typed empty logical here.
+    ///
+    /// [`MatBuilder::write_empty`]: crate::mat::MatBuilder::write_empty
+    /// [`EmptySequencePolicy::DoubleArray`]: crate::mat::EmptySequencePolicy::DoubleArray
+    #[test]
+    fn an_empty_marker_carries_only_class_and_empty() {
+        for tag in [
+            ScalarTag::Bool,
+            ScalarTag::F64,
+            ScalarTag::F32,
+            ScalarTag::I64,
+            ScalarTag::I32,
+            ScalarTag::I16,
+            ScalarTag::I8,
+            ScalarTag::U64,
+            ScalarTag::U32,
+            ScalarTag::U16,
+            ScalarTag::U8,
+        ] {
+            let mut ds = DatasetBuilder::new("x");
+            emit_empty(&mut ds, tag, &[0, 0]);
+            let mut names: Vec<&str> = ds.attrs.iter().map(|(n, _)| n.as_str()).collect();
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                ["MATLAB_class", "MATLAB_empty"],
+                "{tag:?} empty marker carries a non-MATLAB attribute set"
+            );
+        }
+    }
+
+    /// An empty matrix keeps the shape it was given. `MatBuilder`'s
+    /// `write_array_inner` forwards `matlab_dims` to `write_empty` unchanged, so
+    /// collapsing every empty to `0x0` here would make the two emitters disagree
+    /// for `Matrix::from_row_major(0, 3, vec![])`.
+    #[test]
+    fn an_empty_matrix_keeps_its_matlab_dims() {
+        for (rows, cols) in [(0, 0), (0, 3), (3, 0)] {
+            let mut ds = DatasetBuilder::new("m");
+            apply_matrix(&mut ds, rows, cols, NumVec::F64(Vec::new())).unwrap();
+            assert_eq!(
+                ds.data.as_deref(),
+                Some(
+                    [rows as u64, cols as u64]
+                        .iter()
+                        .flat_map(|d| d.to_le_bytes())
+                        .collect::<Vec<u8>>()
+                        .as_slice()
+                ),
+                "{rows}x{cols} empty matrix records the wrong dimension vector"
+            );
+            assert!(
+                ds.attrs.iter().any(|(n, _)| n == "MATLAB_empty"),
+                "{rows}x{cols} empty matrix is not marked empty"
+            );
+        }
+    }
 }
