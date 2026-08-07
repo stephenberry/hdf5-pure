@@ -82,13 +82,7 @@ pub(crate) fn build_chunked_dataset_oh(
     if let Some(pm) = pipeline_message {
         w.add_message(MessageType::FilterPipeline, pm.to_vec());
     }
-    if let Some(blob) = dense_blob {
-        w.add_message(MessageType::AttributeInfo, blob.attr_info_message.clone());
-    } else {
-        for attr in attrs {
-            w.add_message(MessageType::Attribute, attr.serialize(LENGTH_SIZE));
-        }
-    }
+    add_attributes(&mut w, attrs, dense_blob);
     w.serialize()
 }
 
@@ -115,13 +109,7 @@ pub(crate) fn build_dataset_oh(
     dl.extend_from_slice(&data_addr.to_le_bytes());
     dl.extend_from_slice(&data_size.to_le_bytes());
     w.add_message(MessageType::DataLayout, dl);
-    if let Some(blob) = dense_blob {
-        w.add_message(MessageType::AttributeInfo, blob.attr_info_message.clone());
-    } else {
-        for attr in attrs {
-            w.add_message(MessageType::Attribute, attr.serialize(LENGTH_SIZE));
-        }
-    }
+    add_attributes(&mut w, attrs, dense_blob);
     w.serialize()
 }
 
@@ -147,14 +135,29 @@ pub(crate) fn build_group_oh(
     for link in links {
         w.add_message(MessageType::Link, link.serialize(OFFSET_SIZE));
     }
+    add_attributes(&mut w, attrs, dense_blob);
+    w.serialize()
+}
+
+/// Add an object's attribute storage to its header: either the Attribute Info
+/// message naming a pre-built fractal heap, or the inline Attribute messages
+/// preceded by the compact-storage Attribute Info message that lets the
+/// reference library count them (see [`compact_attribute_info_message`]).
+fn add_attributes(
+    w: &mut ObjectHeaderWriter,
+    attrs: &[AttributeMessage],
+    dense_blob: Option<&DenseAttrBlob>,
+) {
     if let Some(blob) = dense_blob {
         w.add_message(MessageType::AttributeInfo, blob.attr_info_message.clone());
     } else {
+        if !attrs.is_empty() {
+            w.add_message(MessageType::AttributeInfo, compact_attribute_info_message());
+        }
         for attr in attrs {
             w.add_message(MessageType::Attribute, attr.serialize(LENGTH_SIZE));
         }
     }
-    w.serialize()
 }
 
 pub(crate) fn make_link(name: &str, addr: u64) -> LinkMessage {
@@ -662,6 +665,25 @@ fn encode_managed_id(offset: u64, length: u64, max_heap_size: u16, id_length: u1
         id[1 + i] = ((combined >> (i * 8)) & 0xFF) as u8;
     }
     id
+}
+
+/// The Attribute Info (0x0015) message a version 2 object header needs when its
+/// attributes are stored *compactly*, as inline Attribute messages.
+///
+/// On a version 2 header the reference C library does not count attribute
+/// messages to answer `H5Oget_info().num_attrs`; it reads the Attribute Info
+/// message and, finding an undefined fractal-heap address there, falls back to
+/// the header's own attribute-message tally (`H5A__get_ainfo`, `H5Aint.c`). With
+/// no Attribute Info message at all, `H5O__attr_count_real` reports zero — while
+/// `H5Aiterate` and `H5Aopen_by_name` still find every attribute. Tools that size
+/// their work by the count then skip the attributes silently: `h5repack` copies
+/// such an object with none of them.
+///
+/// So the message is emitted for a compactly-stored attribute set too, with both
+/// addresses undefined, which is what the C library and h5py write in the same
+/// position. An object with no attributes gets no message, again matching them.
+pub(crate) fn compact_attribute_info_message() -> Vec<u8> {
+    serialize_attribute_info(u64::MAX, u64::MAX)
 }
 
 fn serialize_attribute_info(fh_addr: u64, btree_name_addr: u64) -> Vec<u8> {
@@ -2948,11 +2970,19 @@ mod tests {
         let addr = resolve_path_any(&bytes, &sb, "data").unwrap();
         let hdr =
             ObjectHeader::parse(&bytes, addr as usize, sb.offset_size, sb.length_size).unwrap();
-        assert!(
-            !hdr.messages
-                .iter()
-                .any(|m| m.msg_type == MessageType::AttributeInfo)
-        );
+        // The Attribute Info message is present but names no fractal heap: that
+        // is what tells the reference library the attributes are the header's own
+        // inline messages, and how many there are.
+        let info = hdr
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::AttributeInfo)
+            .map(|m| {
+                crate::attribute_info::AttributeInfoMessage::parse(&m.data, sb.offset_size).unwrap()
+            })
+            .expect("a compact attribute set still carries an Attribute Info message");
+        assert_eq!(info.fractal_heap_address, None);
+        assert_eq!(info.btree_name_index_address, None);
         let attrs = crate::attribute::extract_attributes(&hdr, sb.length_size).unwrap();
         assert_eq!(attrs.len(), 5);
     }

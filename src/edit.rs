@@ -7092,6 +7092,42 @@ fn ensure_group_info(region: &mut Vec<u8>) -> Result<(), Error> {
     Ok(())
 }
 
+/// Ensure a chunk-0 message `region` that carries inline Attribute messages also
+/// carries an Attribute Info message, appending the compact-storage one when
+/// absent.
+///
+/// On a version 2 object header the reference C library never counts attribute
+/// messages: `H5O__attr_count_real` reads the count out of the Attribute Info
+/// message, and reports zero when there is none, even though `H5Aiterate` and
+/// `H5Aopen_by_name` still find every attribute. Tools that size their work by
+/// that count then skip the attributes silently — `h5repack` copies such an
+/// object with none of them. Releases through 0.33.0 wrote every compact
+/// attribute set that way, so heal any such header whenever we rewrite one, the
+/// same reason [`ensure_group_info`] exists.
+///
+/// A region already carrying an Attribute Info message is left alone, whichever
+/// storage it names: a defined heap address means dense storage, whose count the
+/// C library takes from the heap's B-tree instead.
+fn ensure_attribute_info(region: &mut Vec<u8>) -> Result<(), Error> {
+    let mut has_attrs = false;
+    let mut p = 0;
+    while let Some((msg_type, _body, body_end)) = next_message(region, p)? {
+        match msg_type {
+            MessageType::AttributeInfo => return Ok(()),
+            MessageType::Attribute => has_attrs = true,
+            _ => {}
+        }
+        p = body_end;
+    }
+    if has_attrs {
+        region.extend_from_slice(&region_message(
+            MessageType::AttributeInfo,
+            &crate::file_writer::compact_attribute_info_message(),
+        ));
+    }
+    Ok(())
+}
+
 /// Encode a complete object-header Link message (4-byte record header + body)
 /// for a hard link `name -> addr`. The caller must have validated that the body
 /// fits the u16 size field (see [`flatten_dataset`]); group names are short.
@@ -7791,9 +7827,29 @@ fn datatype_copies_foreign_address(dt: &crate::datatype::Datatype) -> bool {
 }
 
 /// Wrap a chunk-0 message region in a fresh single-chunk version 2 object header
-/// (`OHDR` prefix + region + Jenkins checksum). Mirrors the encoding in
+/// (`OHDR` prefix + region + Jenkins checksum), first normalizing the region's
+/// attribute storage with [`ensure_attribute_info`]. Mirrors the encoding in
 /// [`crate::object_header_writer::ObjectHeaderWriter::serialize`].
+///
+/// The normalization belongs here rather than at the thirteen call sites because
+/// carrying an Attribute Info message is a property of a version 2 header holding
+/// inline attributes, not of any one edit operation — and a site that forgot it
+/// would reintroduce the zero-count defect silently. Every region reaching this
+/// point was either built by this crate or already walked message-by-message on
+/// the way in, so a region that cannot be walked is unreachable; it is wrapped
+/// unchanged, which is what this function did before the normalization existed.
 pub(crate) fn build_v2_object_header(region: &[u8]) -> Vec<u8> {
+    let mut owned = region.to_vec();
+    match ensure_attribute_info(&mut owned) {
+        Ok(()) => return build_v2_object_header_verbatim(&owned),
+        Err(_) => debug_assert!(false, "an object header region must be walkable"),
+    }
+    build_v2_object_header_verbatim(region)
+}
+
+/// [`build_v2_object_header`] without the attribute-storage normalization, for
+/// the region that function has already normalized.
+fn build_v2_object_header_verbatim(region: &[u8]) -> Vec<u8> {
     let total = region.len();
     let (flags, width) = if total <= 255 {
         (0u8, 1usize)
