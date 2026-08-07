@@ -14,9 +14,9 @@
 % Which HDF5 library MATLAB links has changed across releases, and it decides
 % whether a file can be opened at all. MathWorks documents it:
 %
-%   before R2021b   1.8.12         R2023b   1.10.10
-%   R2021b          1.10.7         R2024a   1.10.11
-%   before R2023b   1.10.8         R2024b+  1.14.4.3
+%   R2021a and earlier  1.8.12     R2023b   1.10.10
+%   R2021b              1.10.7     R2024a   1.10.11
+%   R2022a - R2023a     1.10.8     R2024b+  1.14.4.3
 %
 % A version 3 superblock is an HDF5 1.10 addition, so a file carrying one cannot
 % be opened by MATLAB before R2021b. Every release of this crate through 0.33.0
@@ -64,7 +64,14 @@ catch
 end
 % Before R2021b MATLAB was wholly on 1.8.12, where a version 3 superblock cannot
 % be opened. From 1.10 on it can, so the control file loading is expected there.
-expects_v110_to_fail = ~isnan(hdf5_major) && hdf5_major == 1 && hdf5_minor < 10;
+%
+% `hdf5_known` is tracked separately from `expects_v110_to_fail` because "not
+% expected to fail" and "we never found out" are different answers, and only one
+% of them licenses a claim about which library this release links. Without it the
+% verdict below reported an unknown-version run as "expected on HDF5 1.10 or
+% newer" -- and, worse, reported the genuinely anomalous 1.8 outcome as expected.
+hdf5_known = ~isnan(hdf5_major);
+expects_v110_to_fail = hdf5_known && hdf5_major == 1 && hdf5_minor < 10;
 fprintf('\n');
 
 % --- the file that must load ------------------------------------------------
@@ -127,6 +134,13 @@ elseif good && ~v110_loaded
     fprintf('CONFIRMED. The 1.8-format file loads and the 1.10-format one does\n');
     fprintf('not, so the superblock version is exactly what broke `load` and the\n');
     fprintf('0.34.0 default fixes it.\n');
+elseif good && v110_loaded && ~hdf5_known
+    fprintf('PARTIALLY CONFIRMED. The 1.8-format file loads and decodes\n');
+    fprintf('correctly, which is what the default rests on, so the claim this\n');
+    fprintf('script exists to check holds. The 1.10-format file also loads, and\n');
+    fprintf('this run could not read the HDF5 library version, so it cannot say\n');
+    fprintf('whether that is the expected 1.10-or-newer outcome or the anomaly\n');
+    fprintf('the branch below describes. Please report the MATLAB version above.\n');
 elseif good && v110_loaded && ~expects_v110_to_fail
     fprintf('CONFIRMED for this release. The 1.8-format file loads and decodes\n');
     fprintf('correctly, which is what the default rests on. The 1.10-format file\n');

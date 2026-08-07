@@ -27,6 +27,8 @@ What it measured when the 1.8 format landed in 0.34.0, against 1.8.23:
 
 1.8 does not degrade or warn on the newer superblock — it cannot open the file at all. The script also round-trips both fixtures through 1.8's `h5repack` and counts attributes, which is the other half of the same story: before the Attribute Info fix, `h5repack` copied every object with none of its attributes.
 
+The "reads data" row is a claim the script now checks rather than one a reader has to take on trust: it compares dataset and attribute *values* against what `examples/libver_fixtures.rs` wrote, not just `h5dump`'s exit status. `h5dump -n` lists object names, so a file whose headers all decode while its data resolves to the wrong offset — the base-address defect class — opens cleanly and lists everything, and an exit-status check would call it passing.
+
 One limit worth stating: this proves the 1.8 *format* boundary, not that a particular MathWorks build accepts the file. `examples/octave/check_format.m` asks MATLAB directly, against a pair of files differing only in that format, and reports which of the outcomes it got; run it under real MATLAB, since Octave's HDF5 is modern and reads both. `verify.m` covers content rather than format and passes under Octave.
 
 ## Changelog

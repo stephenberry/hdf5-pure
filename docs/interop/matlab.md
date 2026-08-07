@@ -197,9 +197,9 @@ MATLAB has not always read HDF5 with the same library, and which one it links de
 | R2024b and later | 1.14.4.3 |
 | R2024a | 1.10.11 |
 | R2023b | 1.10.10 |
-| before R2023b | 1.10.8 |
+| R2022a – R2023a | 1.10.8 |
 | R2021b | 1.10.7 |
-| before R2021b | 1.8.12 |
+| R2021a and earlier | 1.8.12 |
 
 The version 3 superblock is an HDF5 1.10 addition, so a `.mat` file carrying one cannot be opened by MATLAB before R2021b — not partially, not with a warning, at all. `mat::Options::libver` therefore defaults to `LibVer::V18` and the writer emits a version 2 superblock with version 3 data-layout messages: the newest encoding HDF5 1.8 understands, and one every later MATLAB reads as well. Choosing it costs nothing. The message bodies are identical between the two, so the files differ in two version bytes and are the same size.
 

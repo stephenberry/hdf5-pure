@@ -8,23 +8,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- `FileBuilder::with_libver_bounds` now selects the on-disk format instead of only validating it: an upper bound of `LibVer::V18` writes the HDF5 1.8 format — a version 2 superblock and version 3 data-layout messages — where anything reaching 1.10 writes the 1.10 one. MATLAB used HDF5 1.8.12 before R2021b and cannot open a version 3 superblock there, which is what a `.mat` file needs this for.
-- `FormatError::LibverTooOldForContent` reports content the requested bound cannot express, rather than silently upgrading the file. A chunked, filtered, or resizable dataset needs the 1.10 chunk indices, and a file-space strategy needs the 1.10 File Space Info message.
-- `LibVer::WRITER_OLDEST` names the oldest format the writer produces (1.8). A version 0 or 1 superblock needs v1 symbol-table groups, which this crate reads but does not write.
-- `mat::Options::libver` sets the newest HDF5 format a `.mat` file may use, defaulting to `LibVer::V18`. `mat::MatError::CompressionNeedsNewerFormat` reports the one combination that cannot hold: compression needs chunked storage, which needs 1.10.
+- `FileBuilder::with_libver_bounds` selects the on-disk format rather than only validating it: an upper bound of `LibVer::V18` writes the HDF5 1.8 format, and anything reaching 1.10 writes the 1.10 one ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- `FormatError::LibverTooOldForContent` reports content the requested bound cannot express, rather than silently upgrading the file — a chunked, filtered, or resizable dataset, or any file-space setting ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- `FileAccessProperties::with_libver_bounds` holds an editing session to a format, so `File::open_rw` refuses an addition that would make the file need a newer library instead of making it silently ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- `RepackOptions::with_libver_bounds` makes a repack's output format a guarantee. Without it, `repack` now carries the source file's format forward, upgrading only where the content leaves no choice — it used to rewrite every file in the 1.10 format ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- `LibVer::WRITER_OLDEST` names the oldest format the writer produces ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- `mat::Options::libver` sets the newest HDF5 format a `.mat` file may use, defaulting to `LibVer::V18`. `mat::MatError::CompressionNeedsNewerFormat` reports the one combination that cannot hold ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
 
 ### Changed
 
-- **Breaking:** MAT files are written in the HDF5 1.8 format by default, so MATLAB can `load` them. A version 3 superblock is an HDF5 1.10 addition, and MATLAB used HDF5 1.8.12 before R2021b, so files this crate wrote could not be opened there at all. Set `mat::Options::libver` to `LibVer::V110` for the previous format, which compression requires.
-- **Breaking:** `mat::Options::default` uses `EmptyMarkerEncoding::DataAsDims`, matching what MATLAB and the reference `matio` library both write: an empty array is a two-element `uint64` dataset holding its own dimensions, not a zero-element dataset of that shape. This is what makes an empty value read back as empty — `matio` recovers `0x0` with zero elements, where the old encoding left it no dimensions to recover and an element count of one, so `isempty` was unreliable and `isempty(fieldnames(x))` was needed instead.
-- **Breaking:** `LibVer::WRITER_OUTPUT` is now `LibVer::WRITER_DEFAULT`, since the writer no longer emits a single format. Its value is unchanged.
-- An edit session writes a contiguous dataset's data-layout message in the format of the file it opened, so a `.mat` file edited through `File::open_rw` stays readable by MATLAB rather than being upgraded on its first edit. Chunked additions still require 1.10, as they always have.
+- **Breaking:** MAT files are written in the HDF5 1.8 format by default, so MATLAB can `load` them; MATLAB used HDF5 1.8.12 before R2021b and cannot open a version 3 superblock. Set `mat::Options::libver` to `LibVer::V110` for the previous format, which compression requires ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- **Breaking:** `mat::Options::default` uses `EmptyMarkerEncoding::DataAsDims`, matching what MATLAB and `matio` write, so an empty value reads back as empty under a plain `isempty` ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- **Breaking:** `LibVer::WRITER_OUTPUT` is now `LibVer::WRITER_DEFAULT`, since the writer no longer emits a single format. Its value is unchanged ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- `FileBuilder::with_create_properties` resets the properties its argument does not carry, so a bound set before the call no longer decides the format of a file whose property list names no version ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- `FileBuilder::write` creates the destination only once the writer has bytes for it, so a refused build leaves an existing file at that path untouched ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- An edit session writes a contiguous dataset's data-layout message in the format of the file it opened, so a `.mat` file edited through `File::open_rw` stays readable by MATLAB ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
 
 ### Fixed
 
-- An object header holding compact attributes now declares how many it has, so `H5Oget_info().num_attrs` agrees with iteration instead of reporting zero. Tools that size their work by the count saw no attributes at all — an `h5repack` round trip stripped every `MATLAB_*` attribute from a `.mat` file without warning. Applies to the whole-file writer and to headers rewritten in place, which heal an older file's missing message.
-- A file with a userblock now reads whole when it holds an object-header continuation block or dense link storage, both of which the C library writes and this crate does not. Their addresses are relative to the superblock base, which was not being added, so `File::open` on such a file failed outright with `FormatError::InvalidObjectHeaderSignature` — reached by any `.mat` file a C-based tool had touched, and by a C-written userblock file with more than eight links.
-- An empty MAT value carries `MATLAB_class` and `MATLAB_empty` and nothing else, matching MATLAB, which writes `MATLAB_int_decode` on no empty of any class. Empty values are also `0x0` under either `mat::OneDimensionalMode`, so the two emitters no longer describe the same empty `Vec` with different dimensions.
+- An object header holding compact attributes declares how many it has, so `H5Oget_info().num_attrs` agrees with iteration instead of reporting zero — an `h5repack` round trip used to strip every `MATLAB_*` attribute from a `.mat` file without warning ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- A file with a userblock reads whole when it holds an object-header continuation block or dense link storage, which the C library writes and this crate does not; `File::open` used to fail outright on such a file ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- An empty MAT value carries `MATLAB_class` and `MATLAB_empty` and nothing else, matching MATLAB, and both emitters agree on its dimensions — including for an empty `Matrix`, which one of them wrote as a plain zero-element dataset ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
 
 ## [0.33.0] - 2026-08-02
 
