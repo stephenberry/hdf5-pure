@@ -23,6 +23,7 @@ use crate::chunked_write::{
 use crate::convert::TryToUsize;
 use crate::dataspace::{Dataspace, DataspaceType};
 use crate::error::{FormatError, OBJECT_HEADER_MESSAGE_MAX};
+use crate::file_create_properties::FileCreateProperties;
 use crate::file_space_info::{
     DEFAULT_PAGE_SIZE, DEFAULT_THRESHOLD, FileSpaceInfo, FileSpaceStrategy, NUM_FILE_FSM_MANAGERS,
 };
@@ -802,12 +803,31 @@ impl FileWriter {
     /// Some content cannot be written in the 1.8 format at all, and asking for
     /// both is an error rather than a silent upgrade: a chunked (or resizable,
     /// or filtered) dataset needs the version 4 data-layout message and the
-    /// chunk indices that came with 1.10, and a file-space strategy needs the
-    /// File Space Info message. Both report
+    /// chunk indices that came with 1.10, and a file-space setting — a strategy
+    /// or a page size — needs the File Space Info message. Both report
     /// [`FormatError::LibverTooOldForContent`].
     pub fn with_libver_bounds(&mut self, low: LibVer, high: LibVer) -> &mut Self {
         self.libver_bounds = Some((low, high));
         self
+    }
+
+    /// Replace *every* file-creation property with what `properties` carries,
+    /// including the ones it leaves unset — handing over a property list is
+    /// asking for it to define the creation properties in full, which is what
+    /// [`FileBuilder::with_create_properties`] documents.
+    ///
+    /// Written as one assignment per field rather than as a run of `if let
+    /// Some(..)` calls to the individual setters, because those skip the fields
+    /// the list does not carry: a bound set before the call would survive it and
+    /// go on selecting the on-disk format for a list that names no version at
+    /// all.
+    ///
+    /// [`FileBuilder::with_create_properties`]: crate::FileBuilder::with_create_properties
+    pub(crate) fn apply_create_properties(&mut self, properties: &FileCreateProperties) {
+        self.userblock_size = properties.userblock();
+        self.libver_bounds = properties.libver_bounds();
+        self.file_space_strategy = properties.file_space_strategy();
+        self.file_space_page_size = properties.file_space_page_size();
     }
 
     /// The format to write, being the newest this crate produces that the
@@ -817,19 +837,7 @@ impl FileWriter {
     /// comes from one decision rather than from each emitter's own reading of the
     /// bounds.
     fn resolve_libver(&self) -> Result<LibVer, FormatError> {
-        let Some((low, high)) = self.libver_bounds else {
-            return Ok(LibVer::WRITER_DEFAULT);
-        };
-        for candidate in [LibVer::WRITER_DEFAULT, LibVer::WRITER_OLDEST] {
-            if candidate >= low && candidate <= high {
-                return Ok(candidate);
-            }
-        }
-        Err(FormatError::LibverBoundsUnsatisfiable {
-            writes: LibVer::WRITER_DEFAULT.name(),
-            requested_low: low.name(),
-            requested_high: high.name(),
-        })
+        LibVer::resolve_writable(self.libver_bounds)
     }
 
     /// Set the userblock size in bytes: zero (no userblock), or a power of two of
@@ -896,6 +904,31 @@ impl FileWriter {
     pub fn with_file_space_page_size(&mut self, page_size: u64) -> &mut Self {
         self.file_space_page_size = Some(page_size);
         self
+    }
+
+    /// Whether anything staged needs the 1.10 format, i.e. whether an
+    /// `Earliest..=V18` bound would be refused with
+    /// [`FormatError::LibverTooOldForContent`].
+    ///
+    /// This is the same predicate `finish_to_sink` refuses on — chunked storage,
+    /// which a filter and an unlimited dimension both imply — asked *before* the
+    /// bound is chosen. Repack is the caller: it carries the source file's format
+    /// forward, and needs to know whether the content it staged permits that
+    /// before committing to an answer, since a great many files the C library
+    /// wrote hold chunked datasets under a version 0 or 2 superblock and there is
+    /// no older chunk index this crate can write them back into.
+    pub(crate) fn needs_latest_format(&self) -> bool {
+        fn any_chunked(datasets: &[DatasetBuilder]) -> bool {
+            datasets.iter().any(|d| {
+                d.chunk_options.is_chunked() || d.maxshape.is_some() || d.raw_chunks.is_some()
+            })
+        }
+        fn group_needs(group: &FinishedGroup) -> bool {
+            any_chunked(&group.datasets) || group.sub_groups.iter().any(group_needs)
+        }
+        self.file_space_info().is_some()
+            || any_chunked(&self.root_datasets)
+            || self.groups.iter().any(group_needs)
     }
 
     /// Reject file-space settings this writer cannot reproduce yet.
@@ -969,13 +1002,18 @@ impl FileWriter {
     pub(crate) fn finish_to_sink<S: ByteSink>(self, sink: &mut S) -> Result<(), FormatError> {
         let libver = self.resolve_libver()?;
 
-        // A file-space strategy is recorded in a File Space Info message, which
+        // File-space settings are recorded in a File Space Info message, which
         // arrived with HDF5 1.10. Refused beside the bounds themselves rather
         // than where the message is emitted, so the answer does not depend on
         // how far into the layout the writer got.
-        if self.file_space_strategy.is_some() && libver < LibVer::V110 {
+        //
+        // Asked of `file_space_info` rather than of the strategy field, because
+        // that is the one function that decides whether the message is written:
+        // a page size with no strategy emits one too, and testing the strategy
+        // alone let exactly that case through.
+        if self.file_space_info().is_some() && libver < LibVer::V110 {
             return Err(FormatError::LibverTooOldForContent {
-                content: "a file-space strategy",
+                content: "a file-space setting",
                 needs: LibVer::V110.name(),
                 writing: libver.name(),
             });
@@ -3894,6 +3932,20 @@ mod tests {
         let mut fw = FileWriter::new();
         fw.with_libver_bounds(LibVer::Earliest, LibVer::V18);
         fw.with_file_space_strategy(FileSpaceStrategy::Page, true, 1);
+        fw.create_dataset("d").with_i32_data(&[1]);
+        assert!(matches!(
+            fw.finish().unwrap_err(),
+            FormatError::LibverTooOldForContent { .. }
+        ));
+
+        // A page size on its own emits the same 1.10-only File Space Info
+        // message — `file_space_info` fires on either field — so it takes the
+        // same refusal. The guard used to test the strategy alone and let this
+        // through, writing a version 2 superblock carrying a message that did
+        // not exist before 1.10.
+        let mut fw = FileWriter::new();
+        fw.with_libver_bounds(LibVer::Earliest, LibVer::V18);
+        fw.with_file_space_page_size(4096);
         fw.create_dataset("d").with_i32_data(&[1]);
         assert!(matches!(
             fw.finish().unwrap_err(),

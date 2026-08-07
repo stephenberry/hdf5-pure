@@ -99,6 +99,7 @@ use crate::filter_pipeline::{
     FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_LZF, FILTER_SCALEOFFSET, FILTER_SHUFFLE,
     FilterPipeline,
 };
+use crate::libver::LibVer;
 use crate::reader::{Dataset, File, Group};
 use crate::scaleoffset::{self, ScaleOffset};
 use crate::source::Source;
@@ -121,6 +122,10 @@ pub struct RepackOptions {
     /// Full paths of objects to omit from the output. See
     /// [`drop_path`](Self::drop_path).
     drop: Vec<String>,
+    /// Library-version bounds for the output, from
+    /// [`with_libver_bounds`](Self::with_libver_bounds). `None` carries the
+    /// source's own format forward.
+    libver_bounds: Option<(LibVer, LibVer)>,
 }
 
 impl RepackOptions {
@@ -142,6 +147,42 @@ impl RepackOptions {
     /// The paths this repack will omit, in the order they were added.
     pub fn drop_paths(&self) -> &[String] {
         &self.drop
+    }
+
+    /// Write the output in the format these bounds select, rather than in the
+    /// source's own format. Same meaning as
+    /// [`FileBuilder::with_libver_bounds`](crate::FileBuilder::with_libver_bounds):
+    /// `high` picks the format, and content it cannot express is refused with
+    /// [`FormatError::LibverTooOldForContent`] rather than written in a newer
+    /// one.
+    ///
+    /// A repack carries the source's format forward by default, because
+    /// compacting a file is not a request to re-target it — but it does upgrade
+    /// where the content leaves no choice, since a chunked dataset needs the 1.10
+    /// chunk indices and there is no older one this crate writes. Set this to make
+    /// the format a guarantee instead: an `Earliest..=V18` bound turns that
+    /// upgrade into an error, so a file that must stay loadable by an old reader
+    /// says so rather than finding out later.
+    ///
+    /// ```no_run
+    /// use hdf5_pure::{LibVer, RepackOptions, repack};
+    ///
+    /// // Fails rather than producing a file MATLAB before R2021b cannot open.
+    /// let options = RepackOptions::new().with_libver_bounds(LibVer::Earliest, LibVer::V18);
+    /// repack("data.mat", "compact.mat", &options)?;
+    /// # Ok::<(), hdf5_pure::Error>(())
+    /// ```
+    ///
+    /// Chainable.
+    pub fn with_libver_bounds(mut self, low: LibVer, high: LibVer) -> Self {
+        self.libver_bounds = Some((low, high));
+        self
+    }
+
+    /// The library-version bounds this repack will write to, or `None` when it
+    /// carries the source's format forward.
+    pub fn libver_bounds(&self) -> Option<(LibVer, LibVer)> {
+        self.libver_bounds
     }
 }
 
@@ -209,6 +250,43 @@ pub fn repack<P: AsRef<Path>, Q: AsRef<Path>>(
         &file,
         &addr_map,
     )?;
+
+    // Choose the output format now that the content is staged.
+    //
+    // A repack compacts a file; it is not a request to re-target it, and the
+    // format is the one property whose loss is invisible until an old reader
+    // refuses the output — a `.mat` written to the 1.8 bound so MATLAB can load
+    // it used to come back with a version 3 superblock MATLAB cannot open at
+    // all. So the source's format is carried forward.
+    //
+    // Except where the content will not fit in it. A chunked dataset needs the
+    // version 4 data-layout message and a 1.10 chunk index, and 1.8's version 1
+    // B-tree index is one this crate reads but does not write — so a great many
+    // files the C library wrote (chunked data under a version 0 or 2 superblock)
+    // have no older encoding to be repacked back into. Upgrading there is forced
+    // rather than gratuitous, and refusing instead would take repack away from
+    // most real HDF5 files. `h5repack` makes the same trade, writing whatever
+    // format the content needs unless `--low`/`--high` say otherwise.
+    //
+    // `RepackOptions::with_libver_bounds` is that "unless": set explicitly, the
+    // bound is a guarantee, and content it cannot express is refused by the
+    // writer rather than upgraded past it.
+    //
+    // The carried-forward ceiling is floored at `WRITER_OLDEST` because a
+    // version 0/1 superblock source is older than anything this crate writes:
+    // that format can be read but not produced, so the oldest writable one is as
+    // close as the output gets. `Earliest` as the low bound rather than the
+    // source's own version, since `high` is what selects the format and a floor
+    // equal to it would leave nothing satisfiable.
+    let (low, high) = match options.libver_bounds {
+        Some(explicit) => explicit,
+        None if builder.needs_latest_format() => (LibVer::Earliest, LibVer::WRITER_DEFAULT),
+        None => (
+            LibVer::Earliest,
+            file.libver_bound().max(LibVer::WRITER_OLDEST),
+        ),
+    };
+    builder.with_libver_bounds(low, high);
 
     // Every requested drop must have named a real object.
     if let Some(missing) = drop.iter().find(|d| !matched.contains(*d)) {

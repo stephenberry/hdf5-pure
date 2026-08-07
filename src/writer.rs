@@ -60,21 +60,32 @@ impl FileBuilder {
     /// analogue of handing a property list to `H5Fcreate`.
     ///
     /// Each property is applied exactly as the individual setter would, so this
-    /// **overwrites** any value set individually before the call. The two
-    /// spellings interoperate: apply a shared [`FileCreateProperties`] first,
-    /// then override one property for this file.
+    /// **overwrites** any value set individually before the call — including the
+    /// properties `properties` leaves unset, which are reset to their defaults
+    /// rather than left behind. The two spellings interoperate in the order that
+    /// says so: apply a shared [`FileCreateProperties`] first, then override one
+    /// property for this file.
+    ///
+    /// The reset matters most for the library-version bounds, which select the
+    /// on-disk format rather than merely validating it: a stale 1.8 bound
+    /// surviving a property list that names no version would decide the bytes
+    /// this file is written in.
+    ///
+    /// ```
+    /// use hdf5_pure::{FileBuilder, FileCreateProperties, LibVer};
+    ///
+    /// let mut builder = FileBuilder::new();
+    /// builder.with_libver_bounds(LibVer::Earliest, LibVer::V18);
+    /// // The list names no version, so the bound above is dropped with it.
+    /// builder.with_create_properties(FileCreateProperties::new().with_userblock(512));
+    /// builder.create_dataset("values").with_f64_data(&[1.0]);
+    ///
+    /// let bytes = builder.finish().unwrap();
+    /// assert_eq!(bytes[512 + 8], 3); // the default format, not the 1.8 one
+    /// ```
     #[doc(alias = "fcpl")]
     pub fn with_create_properties(&mut self, properties: FileCreateProperties) -> &mut Self {
-        self.with_userblock(properties.userblock());
-        if let Some((low, high)) = properties.libver_bounds() {
-            self.with_libver_bounds(low, high);
-        }
-        if let Some((strategy, persist, threshold)) = properties.file_space_strategy() {
-            self.with_file_space_strategy(strategy, persist, threshold);
-        }
-        if let Some(page_size) = properties.file_space_page_size() {
-            self.with_file_space_page_size(page_size);
-        }
+        self.writer.apply_create_properties(&properties);
         self
     }
 
@@ -155,7 +166,8 @@ impl FileBuilder {
     /// upgraded, with
     /// [`FormatError::LibverTooOldForContent`](crate::FormatError::LibverTooOldForContent):
     /// a chunked, filtered, or resizable dataset needs the 1.10 chunk indices,
-    /// and a file-space strategy needs the 1.10 File Space Info message.
+    /// and a file-space setting — a strategy or a page size — needs the 1.10
+    /// File Space Info message.
     /// [`File::open_swmr_writer`](crate::File::open_swmr_writer) likewise needs
     /// a version 3 superblock, so a file written to the 1.8 bound cannot host a
     /// SWMR writer.
@@ -209,6 +221,12 @@ impl FileBuilder {
     /// Set an attribute on the root group.
     pub fn set_attr(&mut self, name: &str, value: AttrValue) {
         self.writer.set_root_attr(name, value);
+    }
+
+    /// Whether the staged content needs the 1.10 format — see
+    /// [`FileWriter::needs_latest_format`](crate::file_writer::FileWriter::needs_latest_format).
+    pub(crate) fn needs_latest_format(&self) -> bool {
+        self.writer.needs_latest_format()
     }
 
     /// Serialize the file to bytes in memory.
@@ -266,9 +284,50 @@ impl FileBuilder {
     ///
     /// Streams the file to disk (see [`finish_to`](Self::finish_to)), so a repack
     /// staging streamed chunks does not hold the whole output in memory.
+    ///
+    /// The path is created when the first byte is ready, not when the call
+    /// starts, so a build refused before any byte is emitted — unsatisfiable or
+    /// too-old library-version bounds, an invalid userblock — leaves whatever was
+    /// at `path` untouched. A failure *after* that (an I/O error, or a refusal
+    /// the layout reaches) still leaves a partial file, as
+    /// [`finish_to`](Self::finish_to) describes.
     pub fn write<P: AsRef<std::path::Path>>(self, path: P) -> Result<(), Error> {
-        let file = std::fs::File::create(path).map_err(Error::Io)?;
-        self.finish_to(file)
+        self.finish_to(LazyFile {
+            path: path.as_ref().to_path_buf(),
+            file: None,
+        })
+    }
+}
+
+/// A [`Write`] that creates its file on the first byte written to it.
+///
+/// [`FileBuilder::write`] used `std::fs::File::create` up front, which
+/// truncates: a build the writer refuses before emitting anything — the
+/// library-version and userblock checks all run there, deliberately — returned
+/// its error having already emptied the file at the destination path. The whole
+/// point of refusing early is that nothing is destroyed, and that has to include
+/// the file the caller is overwriting.
+struct LazyFile {
+    path: std::path::PathBuf,
+    file: Option<std::fs::File>,
+}
+
+impl Write for LazyFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let file = match &mut self.file {
+            Some(f) => f,
+            slot => slot.insert(std::fs::File::create(&self.path)?),
+        };
+        file.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        // Nothing was written, so there is no file to flush and none to create:
+        // a refused build must not leave an empty one behind either.
+        match &mut self.file {
+            Some(f) => f.flush(),
+            None => Ok(()),
+        }
     }
 }
 
