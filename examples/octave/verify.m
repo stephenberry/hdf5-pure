@@ -26,6 +26,21 @@ is_falsy = @(x) (islogical(x) && ~logical(x)) || (isnumeric(x) && x == 0);
 as_codes = @(x) double(x(:))';
 % Compare two strings (possibly char or uint16) for equality.
 eq_text  = @(a, b) isequal(as_codes(a), as_codes(b));
+% Is `x` a float whose IEEE 754 sign bit is set? The way to tell -0.0 from 0.0,
+% which compare equal. `bitshift(uint64(1), 63)` rather than the more obvious
+% `hex2dec('8000000000000000')`, because hex2dec returns a *double* and 2^63 is
+% past flintmax: MATLAB warns on every such call that the value may not survive
+% the conversion. This one does survive, being a power of two, but the warning
+% is right about the technique and a check that cries wolf each run gets ignored.
+has_sign_bit = @(x) typecast(double(x), 'uint64') == bitshift(uint64(1), 63);
+
+% The helpers above have to survive the `clearvars` that separates each fixture
+% from the next. Named once here rather than repeated in all nineteen of those
+% calls: adding a helper and updating eighteen of the nineteen lists is a bug
+% that surfaces only at the fixture the missed one guards, which is exactly how
+% `has_sign_bit` came to be undefined at `extremes.mat`. The list names itself,
+% or the first `clearvars` would take it.
+helpers = {'helpers', 'is_truey', 'is_falsy', 'as_codes', 'eq_text', 'has_sign_bit'};
 
 fprintf('=== scalars.mat ===\n');
 load scalars.mat
@@ -37,7 +52,7 @@ ok(u_u32 == uint32(2147483648), 'u_u32');
 ok(v_u8 == uint8(255), 'v_u8');
 ok(is_truey(b_true), 'b_true == 1');
 ok(is_falsy(b_false), 'b_false == 0');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars('-except', helpers{:})
 
 fprintf('=== vectors.mat ===\n');
 load vectors.mat
@@ -45,21 +60,21 @@ ok(isequal(xs, [1.0; 2.0; 3.0; 4.0; 5.0]), 'xs');
 ok(isequal(ns, int32([-1; 0; 1])), 'ns');
 ok(isequal(double(flags(:)), [1; 0; 1; 1; 0]), 'flags values');
 ok(mat_isempty(empty), 'empty');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars('-except', helpers{:})
 
 fprintf('=== matrix.mat ===\n');
 load matrix.mat
 expected = [1 2 3 4; 5 6 7 8; 9 10 11 12];
 ok(isequal(a, expected), 'a is 3x4 with expected values');
 ok(isequal(id, eye(2)), 'id is 2x2 identity');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars('-except', helpers{:})
 
 fprintf('=== strings.mat ===\n');
 load strings.mat
 ok(numel(ascii) == 12 && eq_text(ascii, 'hello MATLAB'), 'ascii');
 ok(ischar(ascii) || isa(ascii, 'uint16'), 'ascii is char-like');
 ok(mat_isempty(empty), 'empty string');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars('-except', helpers{:})
 
 fprintf('=== nested.mat ===\n');
 load nested.mat
@@ -72,7 +87,7 @@ ok(eq_text(e.config.tag, 'prod'), 'e.config.tag');
 ok(e.config.threshold == 0.85, 'e.config.threshold');
 ok(e.config.max_iter == uint32(1000), 'e.config.max_iter');
 ok(isequal(e.samples, [10.0; 20.0; 30.0; 40.0]), 'e.samples');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars('-except', helpers{:})
 
 fprintf('=== options.mat ===\n');
 load options.mat
@@ -87,7 +102,7 @@ ok(ismember('absent', vars), 'absent field present as struct([])');
 ok(mat_is_empty_struct(absent), 'absent is struct([])');
 ok(required == 1.5, 'required value');
 ok(eq_text(present, 'yes'), 'present value');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars('-except', helpers{:})
 
 fprintf('=== complex.mat ===\n');
 load complex.mat
@@ -95,12 +110,12 @@ ok(~isreal(z), 'z is complex');
 ok(z == complex(1.0, -2.0), 'z value');
 expected_signal = [complex(1,0); complex(0,1); complex(-1,0); complex(0,-1)];
 ok(isequal(signal, expected_signal), 'signal');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars('-except', helpers{:})
 
 fprintf('=== enum.mat ===\n');
 load enum.mat
 ok(eq_text(phase, 'Running'), 'phase');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars('-except', helpers{:})
 
 fprintf('=== experiment.mat ===\n');
 load experiment.mat
@@ -118,7 +133,7 @@ ok(eq_text(note, 'looks good'), 'note');
 % the default NullPolicy::EmptyStructArray rather than omitted.
 ok(exist('skipped', 'var') == 1, 'skipped present as struct([])');
 ok(mat_is_empty_struct(skipped), 'skipped is struct([])');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars('-except', helpers{:})
 
 % ==========================================================================
 % Edge-case fixtures
@@ -130,7 +145,7 @@ ok(isnan(nan64), 'nan64 is NaN');
 ok(isinf(pos_inf) && pos_inf > 0, 'pos_inf');
 ok(isinf(neg_inf) && neg_inf < 0, 'neg_inf');
 % -0.0 compares equal to 0.0, so inspect the IEEE 754 bit pattern (sign bit set).
-ok(neg_zero == 0 && typecast(double(neg_zero), 'uint64') == uint64(hex2dec('8000000000000000')), 'neg_zero sign bit preserved');
+ok(neg_zero == 0 && has_sign_bit(neg_zero), 'neg_zero sign bit preserved');
 ok(subnormal > 0 && subnormal < 1e-300, 'subnormal > 0 and tiny');
 % Octave 11's v7.3 loader does not preserve the `single` class (loads as
 % double). MATLAB_class is correctly written as "single" in our file — real
@@ -151,11 +166,11 @@ ok(nan_vec(1) == 1.0, 'nan_vec(1) == 1');
 ok(isnan(nan_vec(2)), 'nan_vec(2) is NaN');
 ok(nan_vec(3) == Inf, 'nan_vec(3) is +Inf');
 ok(nan_vec(4) == -Inf, 'nan_vec(4) is -Inf');
-ok(nan_vec(5) == 0 && typecast(double(nan_vec(5)), 'uint64') == uint64(hex2dec('8000000000000000')), 'nan_vec(5) -0 sign bit');
+ok(nan_vec(5) == 0 && has_sign_bit(nan_vec(5)), 'nan_vec(5) -0 sign bit');
 ok(numel(i64_extremes) == 5, 'i64_extremes length');
 ok(i64_extremes(1) == intmin('int64'), 'i64_extremes(1) == i64min');
 ok(i64_extremes(5) == intmax('int64'), 'i64_extremes(5) == i64max');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars('-except', helpers{:})
 
 fprintf('=== shapes.mat ===\n');
 load shapes.mat
@@ -179,7 +194,7 @@ ok(isequal(size(m_3x3), [3 3]), 'm_3x3 size');
 ok(m_3x3(1,1) == 11 && m_3x3(1,2) == 12 && m_3x3(1,3) == 13, 'm_3x3 row 1');
 ok(m_3x3(2,1) == 21 && m_3x3(2,2) == 22 && m_3x3(2,3) == 23, 'm_3x3 row 2');
 ok(m_3x3(3,1) == 31 && m_3x3(3,2) == 32 && m_3x3(3,3) == 33, 'm_3x3 row 3');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars('-except', helpers{:})
 
 fprintf('=== int_matrices.mat ===\n');
 load int_matrices.mat
@@ -199,7 +214,7 @@ ok(isequal(double(m_bool), [1 0; 0 1]), 'm_bool values');
 ok(islogical(m_bool) || isa(m_bool, 'uint8'), 'm_bool class is logical-like');
 % f32 matrix (Octave 11 loads as double; check values only)
 ok(isequal(double(m_f32), [1.5 2.5; 3.5 4.5]), 'm_f32 values');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars('-except', helpers{:})
 
 fprintf('=== unicode.mat ===\n');
 load unicode.mat
@@ -228,7 +243,7 @@ ok(numel(long_ascii) == 5000, 'long_ascii length 5000');
 long_codes = as_codes(long_ascii);
 ok(long_codes(1) == 97, 'long_ascii first char (a=97)');
 ok(long_codes(5000) == 106, 'long_ascii last char (j=106)');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars('-except', helpers{:})
 
 fprintf('=== complex_edges.mat ===\n');
 load complex_edges.mat
@@ -247,7 +262,7 @@ ok(numel(z32_vec) == 3, 'z32_vec length');
 ok(~isreal(z32_vec), 'z32_vec is complex');
 ok(isequal(size(cmat), [2 2]), 'cmat size');
 ok(isequal(cmat, [1 2; 3 4]), 'cmat values');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars('-except', helpers{:})
 
 fprintf('=== deep_nested.mat ===\n');
 load deep_nested.mat
@@ -260,7 +275,7 @@ ok(eq_text(root.inner.sub.tag, 'middle'), 'root.inner.sub.tag');
 ok(isstruct(root.inner.sub.leaf), 'root.inner.sub.leaf is struct');
 ok(root.inner.sub.leaf.id == uint64(12345), 'leaf.id');
 ok(isequal(root.inner.sub.leaf.values, [1.5; 2.5; 3.5]), 'leaf.values');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars('-except', helpers{:})
 
 fprintf('=== bool_ext.mat ===\n');
 load bool_ext.mat
@@ -274,7 +289,7 @@ ok(islogical(mat) || isa(mat, 'uint8'), 'mat logical-like');
 % flags vector
 ok(numel(flags) == 7, 'flags length 7');
 ok(isequal(double(flags(:))', [1 1 0 1 0 0 1]), 'flags contents');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars('-except', helpers{:})
 
 fprintf('=== empty_variants.mat ===\n');
 load empty_variants.mat
@@ -296,7 +311,7 @@ if exist('OCTAVE_VERSION', 'builtin') ~= 5
   % concatenates with anything, where a 0x1 raises a dimension mismatch.
   ok(isequal([e_f64, 1], 1), 'e_f64 concatenates as MATLAB []');
 end
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars('-except', helpers{:})
 
 fprintf('=== large_matrix.mat ===\n');
 load large_matrix.mat
@@ -307,7 +322,7 @@ ok(m(100,1) == 99000, 'm(100,1) == 99000');
 ok(m(100,50) == 99000 + 49, 'm(100,50) == 99049');
 ok(m(7,13) == 6 * 1000 + 12, 'm(7,13) interior');
 ok(rows == uint32(100) && cols == uint32(50), 'rows/cols scalar fields');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars('-except', helpers{:})
 
 fprintf('=== cells.mat ===\n');
 % Octave 11's `load` for v7.3 does not follow object references and reports
@@ -347,6 +362,6 @@ else
   ok(isequal(double(ragged{1}(:))', [1 2 3]), 'ragged{1}');
   ok(isequal(double(ragged{2}(:))', [4 5]), 'ragged{2}');
 end
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars('-except', helpers{:})
 
 fprintf('\nAll fixtures verified.\n');
