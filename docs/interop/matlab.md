@@ -78,7 +78,7 @@ The serializer maps Rust types to HDF5 datasets and the MATLAB classes MATLAB ex
 !!! note "Unit and `null` fields"
     A struct field that serializes as a Rust unit `()` is written exactly like `Option::None`. The most common case is a `serde_json::Value::Null` field, since `serde_json` serializes `Value::Null` via `serialize_unit`.
 
-    Under the default `NullPolicy::EmptyStructArray` the field is present on disk as MATLAB `struct([])`, so `isfield` reports `true` and MATLAB code can reference it unconditionally and test it with `isempty(fieldnames(x))`. Prefer that over a bare `isempty(x)`: the two differ for a struct with no fields, and only the `fieldnames` form is verified against MATLAB (see `matlab_fixtures/verify.m`).
+    Under the default `NullPolicy::EmptyStructArray` the field is present on disk as MATLAB `struct([])`, so `isfield` reports `true` and MATLAB code can reference it unconditionally and test it with `isempty(fieldnames(x))`. The two forms still differ for a struct with no fields, and only the `fieldnames` form is verified against MATLAB (see `matlab_fixtures/verify.m`). Since 0.34 a bare `isempty(x)` is also reliable: the default `EmptyMarkerEncoding::DataAsDims` stores the marker's dimensions in its payload, so the reference library recovers `0x0` with zero elements where the previous encoding recovered no dimensions and an element count of one.
 
     Reading it back is lenient but not universal. `struct([])` deserializes into `Option<T>` as `None`, `Vec<T>` as empty, `serde_json::Value` as `Null`, and `()` as `()`. It does **not** deserialize into a bare scalar, `String`, struct or map: those report a type error. Note `#[serde(default)]` does not rescue them, because the field is *present* with a struct value rather than missing, so the default is never consulted. This is the one migration hazard in 0.30: a reader with `#[serde(default)] count: u32` against a writer whose `count` is `None` worked under the pre-0.30 behavior and now fails. Give such a field type `Option<u32>`, or write with `NullPolicy::Omit`.
 
@@ -187,6 +187,25 @@ A struct array authored in MATLAB (`s(1).x = …; s(2).x = …`) is stored as a 
 
 !!! note "Write/read asymmetry"
     This is a read-only path. Writing a `Vec<Struct>` from Rust produces a MATLAB **cell array** (see [Cell arrays](#cell-arrays)), not a native struct array, so a `.mat` you write and one MATLAB writes from the same Rust type differ on disk. Both read back into `Vec<Struct>`.
+
+## The on-disk format MATLAB's `load` needs
+
+MATLAB does not read `.mat` files with the same HDF5 library it exposes through `h5read`, `h5disp`, and `h5info`. Those go through HDF5 1.10.7; `load` for a MAT v7.3 file goes through a separate HDF5 1.8.12 that MathWorks kept on the MAT path deliberately, to avoid 1.10 regressions. That split has an unusual and recognizable symptom: a file that `h5disp` prints happily and `load` refuses.
+
+The version 3 superblock is an HDF5 1.10 addition, so a `.mat` file carrying one lands exactly in that gap. `mat::Options::libver` therefore defaults to `LibVer::V18`, and the writer emits a version 2 superblock with version 3 data-layout messages — the newest encoding HDF5 1.8 understands.
+
+The one thing that cannot be written that way is compression, which needs chunked storage, whose chunk indices arrived in 1.10. Asking for both is refused with `MatError::CompressionNeedsNewerFormat` rather than resolved in either direction, since dropping the compression loses what you asked for and raising the format produces a file MATLAB cannot load:
+
+```rust
+use hdf5_pure::mat::{Compression, Options};
+use hdf5_pure::LibVer;
+
+let mut options = Options::default();
+options.compression = Compression::Deflate { level: 6, shuffle: true };
+options.libver = LibVer::V110; // required for compression; MATLAB `load` cannot read it
+```
+
+Real MATLAB writes an older format still: a version 0 superblock with v1 symbol-table groups and v1 B-tree chunk indices, which is what `save -v7.3` produces. This crate reads that format but does not write it, so its `.mat` output is not byte-identical to MATLAB's own.
 
 ## Opaque value classes
 

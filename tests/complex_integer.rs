@@ -16,7 +16,8 @@ use hdf5_pure::mat::{
     ComplexU16, ComplexU32, ComplexU64, Matrix, Options,
 };
 use hdf5_pure::{
-    AttrValue, CompoundTypeBuilder, Datatype, DatatypeByteOrder, File, FileBuilder, make_i64_type,
+    AttrValue, CompoundTypeBuilder, Datatype, DatatypeByteOrder, File, FileBuilder, LibVer,
+    make_i64_type,
 };
 use serde::{Deserialize, Serialize};
 
@@ -474,8 +475,15 @@ fn compression_round_trips_and_leaves_the_empty_array_alone() {
         empty: Matrix::from_row_major(0, 0, Vec::new()),
     };
 
-    let plain = mat::to_bytes_with_options(&v, &Options::default()).unwrap();
-    let mut opts = Options::default();
+    // Compression needs chunked storage, whose chunk indices need the HDF5 1.10
+    // format, so both sides of the comparison ask for it. The MAT default is the
+    // 1.8 format (MATLAB's `load` is HDF5 1.8.12), which refuses compression by
+    // name — comparing a 1.10 file against a 1.8 one would also be measuring the
+    // superblock.
+    let mut plain_opts = Options::default();
+    plain_opts.libver = LibVer::V110;
+    let plain = mat::to_bytes_with_options(&v, &plain_opts).unwrap();
+    let mut opts = plain_opts.clone();
     opts.compression = Compression::Deflate {
         level: 6,
         shuffle: false,

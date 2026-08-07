@@ -110,6 +110,10 @@ impl MatBuilder {
     pub fn new(options: Options) -> Self {
         let mut file = FileBuilder::new();
         file.with_userblock(USERBLOCK_SIZE);
+        // The upper bound is the caller's; the lower one is always `Earliest`,
+        // since a MAT file has no reason to demand a *newer* reader than its
+        // content forces. See `Options::libver` for why the default is 1.8.
+        file.with_libver_bounds(crate::LibVer::Earliest, options.libver);
         Self {
             file,
             options,
@@ -719,28 +723,8 @@ impl MatBuilder {
     ) -> Result<&mut Self, MatError> {
         let target = self.resolve_target(name)?;
         let encoding = self.options.empty_marker_encoding;
-        let mut storage_buf = [0u64; STORAGE_DIMS_BUF_LEN];
-        let mut dim_buf = [0u64; STORAGE_DIMS_BUF_LEN];
         let ds = self.dataset_at_target(&target);
-        match encoding {
-            EmptyMarkerEncoding::ZeroElement => {
-                let shape = storage_dims_u64_into(matlab_dims, &mut storage_buf);
-                emit_zero_element(ds, class, shape);
-            }
-            EmptyMarkerEncoding::DataAsDims => {
-                if matlab_dims.len() > STORAGE_DIMS_BUF_LEN {
-                    let dim_data: Vec<u64> = matlab_dims.iter().map(|&d| d as u64).collect();
-                    ds.with_u64_data(&dim_data)
-                        .with_shape(&[dim_data.len() as u64]);
-                } else {
-                    let n = matlab_dims.len();
-                    for (slot, &d) in dim_buf[..n].iter_mut().zip(matlab_dims) {
-                        *slot = d as u64;
-                    }
-                    ds.with_u64_data(&dim_buf[..n]).with_shape(&[n as u64]);
-                }
-            }
-        }
+        emit_empty_storage(ds, encoding, class, matlab_dims);
         ds.set_attr(
             "MATLAB_class",
             AttrValue::AsciiString(class.as_str().into()),
@@ -950,6 +934,14 @@ impl MatBuilder {
     /// streaming ones cannot come to describe different files. `entry_point` names
     /// the caller in the error messages.
     fn finalize(&mut self, entry_point: &str) -> Result<(), MatError> {
+        // Compression implies chunked storage, whose chunk indices need the 1.10
+        // format. Named here rather than left to the writer's generic refusal,
+        // which knows about layouts and not about which MAT option to change.
+        if self.options.compression != Compression::None
+            && self.options.libver < crate::LibVer::V110
+        {
+            return Err(MatError::CompressionNeedsNewerFormat);
+        }
         if !self.open_structs.is_empty() {
             return Err(MatError::Custom(format!(
                 "MatBuilder::{entry_point} called with {} open structs",
@@ -1211,13 +1203,48 @@ fn apply_deflate(ds: &mut DatasetBuilder, compression: Compression) {
     }
 }
 
+/// Write the storage an empty value takes under `encoding` — the data and the
+/// shape only. The caller sets `MATLAB_class`, `MATLAB_empty`, and any decode
+/// flag, which do not vary with the encoding.
+///
+/// This is the one place the encoding is acted on, and both MAT serde emitters
+/// route through it. They are required to produce identical bytes for the same
+/// value under default options (`tests/serde_roundtrip.rs`), and this is exactly
+/// where they last came apart: the no-options emitter had `ZeroElement` written
+/// into it as a constant, so moving the default to `DataAsDims` changed one
+/// emitter and not the other.
+pub(crate) fn emit_empty_storage(
+    ds: &mut DatasetBuilder,
+    encoding: EmptyMarkerEncoding,
+    class: MatClass,
+    matlab_dims: &[usize],
+) {
+    match encoding {
+        EmptyMarkerEncoding::ZeroElement => {
+            let mut storage_buf = [0u64; STORAGE_DIMS_BUF_LEN];
+            let shape = storage_dims_u64_into(matlab_dims, &mut storage_buf);
+            emit_zero_element(ds, class, shape);
+        }
+        EmptyMarkerEncoding::DataAsDims => {
+            if matlab_dims.len() > STORAGE_DIMS_BUF_LEN {
+                let dim_data: Vec<u64> = matlab_dims.iter().map(|&d| d as u64).collect();
+                ds.with_u64_data(&dim_data)
+                    .with_shape(&[dim_data.len() as u64]);
+            } else {
+                let mut dim_buf = [0u64; STORAGE_DIMS_BUF_LEN];
+                let n = matlab_dims.len();
+                for (slot, &d) in dim_buf[..n].iter_mut().zip(matlab_dims) {
+                    *slot = d as u64;
+                }
+                ds.with_u64_data(&dim_buf[..n]).with_shape(&[n as u64]);
+            }
+        }
+    }
+}
+
 /// Write the zero-element dataset that carries an empty marker under
 /// [`EmptyMarkerEncoding::ZeroElement`], with the element type the class
-/// implies.
-///
-/// This is the one place that decision is made. Both MAT serde emitters route
-/// their empty markers through it, so the no-options emitter and the builder
-/// cannot disagree about the same value.
+/// implies. Reached through [`emit_empty_storage`], which picks the encoding.
 pub(crate) fn emit_zero_element(ds: &mut DatasetBuilder, class: MatClass, shape: &[u64]) {
     match class {
         MatClass::Double => {

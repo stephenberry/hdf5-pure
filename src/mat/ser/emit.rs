@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use crate::file_writer::AttrValue;
 use crate::mat::class::MatClass;
 use crate::mat::error::MatError;
+use crate::mat::options::Options;
 use crate::mat::userblock::{self, USERBLOCK_SIZE};
 use crate::mat::utf16;
 use crate::type_builders::{
@@ -77,6 +78,12 @@ pub(crate) fn emit_file_to<W: std::io::Write>(
 fn build_file(fields: Vec<(String, MatValue)>) -> Result<FileBuilder, MatError> {
     let mut builder = FileBuilder::new();
     builder.with_userblock(USERBLOCK_SIZE);
+    // This emitter serves the no-options entry points, which are defined to
+    // produce what `Options::default()` produces, so every file-level setting the
+    // options carry has to be applied here too — the two emitters are only
+    // byte-identical while both are configured the same way. See
+    // `Options::libver` for why the default is the HDF5 1.8 format.
+    builder.with_libver_bounds(crate::LibVer::Earliest, Options::default().libver);
     let mut refs = RefsAccumulator::new();
 
     for (name, value) in fields {
@@ -245,19 +252,27 @@ fn apply_cell(
     Ok(())
 }
 
+/// The empty-marker encoding this emitter writes.
+///
+/// It has no [`Options`] of its own, so it takes the default's — read from
+/// [`Options::default`] rather than written here as a constant, because the same
+/// value written through `to_bytes` and through
+/// `to_bytes_with_options(&Options::default())` has to produce the same bytes,
+/// and a constant is what let those two come apart when the default moved.
+fn default_empty_encoding() -> crate::mat::options::EmptyMarkerEncoding {
+    Options::default().empty_marker_encoding
+}
+
 /// Empty-struct-array marker (MATLAB `struct([])`). What `Option::None` lowers
 /// to under the default [`NullPolicy::EmptyStructArray`], both as a struct
-/// field and inside a sequence, and the only empty marker this emitter writes.
-///
-/// This emitter has no [`Options`] and so is fixed at
-/// [`EmptyMarkerEncoding::ZeroElement`], but the element type comes from
-/// [`emit_zero_element`](crate::mat::builder::emit_zero_element) rather than
-/// from a constant here, and the `[0, 0]` dims are what
-/// `MatBuilder::write_empty_struct_array` uses. That is the whole point: the
-/// same value written through `to_bytes` and through `to_bytes_with_options`
-/// under default options has to produce the same bytes.
+/// field and inside a sequence.
 fn apply_empty_struct_array(ds: &mut DatasetBuilder) {
-    crate::mat::builder::emit_zero_element(ds, MatClass::Struct, &[0u64, 0]);
+    crate::mat::builder::emit_empty_storage(
+        ds,
+        default_empty_encoding(),
+        MatClass::Struct,
+        &[0, 0],
+    );
     set_class(ds, MatClass::Struct);
     ds.set_attr("MATLAB_empty", AttrValue::U32(1));
 }
@@ -475,8 +490,12 @@ fn apply_char_string(ds: &mut DatasetBuilder, s: &str) {
     let units = utf16::encode_utf16(s);
     let n = units.len() as u64;
     if n == 0 {
-        // Empty char: use MATLAB_empty marker with [0, 0] shape.
-        ds.with_u16_data(&[]).with_shape(&[0u64, 0]);
+        crate::mat::builder::emit_empty_storage(
+            ds,
+            default_empty_encoding(),
+            MatClass::Char,
+            &[0, 0],
+        );
         set_class(ds, MatClass::Char);
         set_char_decode(ds);
         ds.set_attr("MATLAB_empty", AttrValue::U32(1));
@@ -491,53 +510,23 @@ fn apply_char_string(ds: &mut DatasetBuilder, s: &str) {
 }
 
 fn emit_empty(ds: &mut DatasetBuilder, tag: ScalarTag) {
-    // Empty numeric array: shape [0, 0], MATLAB_empty = 1.
-    match tag {
-        ScalarTag::Bool => {
-            ds.with_u8_data(&[]).with_shape(&[0u64, 0]);
-            set_class(ds, MatClass::Logical);
-            set_logical_decode(ds);
-        }
-        ScalarTag::F64 => {
-            ds.with_f64_data(&[]).with_shape(&[0u64, 0]);
-            set_class(ds, MatClass::Double);
-        }
-        ScalarTag::F32 => {
-            ds.with_f32_data(&[]).with_shape(&[0u64, 0]);
-            set_class(ds, MatClass::Single);
-        }
-        ScalarTag::I64 => {
-            ds.with_i64_data(&[]).with_shape(&[0u64, 0]);
-            set_class(ds, MatClass::Int64);
-        }
-        ScalarTag::I32 => {
-            ds.with_i32_data(&[]).with_shape(&[0u64, 0]);
-            set_class(ds, MatClass::Int32);
-        }
-        ScalarTag::I16 => {
-            ds.with_i16_data(&[]).with_shape(&[0u64, 0]);
-            set_class(ds, MatClass::Int16);
-        }
-        ScalarTag::I8 => {
-            ds.with_i8_data(&[]).with_shape(&[0u64, 0]);
-            set_class(ds, MatClass::Int8);
-        }
-        ScalarTag::U64 => {
-            ds.with_u64_data(&[]).with_shape(&[0u64, 0]);
-            set_class(ds, MatClass::UInt64);
-        }
-        ScalarTag::U32 => {
-            ds.with_u32_data(&[]).with_shape(&[0u64, 0]);
-            set_class(ds, MatClass::UInt32);
-        }
-        ScalarTag::U16 => {
-            ds.with_u16_data(&[]).with_shape(&[0u64, 0]);
-            set_class(ds, MatClass::UInt16);
-        }
-        ScalarTag::U8 => {
-            ds.with_u8_data(&[]).with_shape(&[0u64, 0]);
-            set_class(ds, MatClass::UInt8);
-        }
+    let class = match tag {
+        ScalarTag::Bool => MatClass::Logical,
+        ScalarTag::F64 => MatClass::Double,
+        ScalarTag::F32 => MatClass::Single,
+        ScalarTag::I64 => MatClass::Int64,
+        ScalarTag::I32 => MatClass::Int32,
+        ScalarTag::I16 => MatClass::Int16,
+        ScalarTag::I8 => MatClass::Int8,
+        ScalarTag::U64 => MatClass::UInt64,
+        ScalarTag::U32 => MatClass::UInt32,
+        ScalarTag::U16 => MatClass::UInt16,
+        ScalarTag::U8 => MatClass::UInt8,
+    };
+    crate::mat::builder::emit_empty_storage(ds, default_empty_encoding(), class, &[0, 0]);
+    set_class(ds, class);
+    if class == MatClass::Logical {
+        set_logical_decode(ds);
     }
     ds.set_attr("MATLAB_empty", AttrValue::U32(1));
 }

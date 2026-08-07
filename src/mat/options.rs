@@ -12,6 +12,8 @@
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+use crate::libver::LibVer;
+
 /// MATLAB class to use when emitting Rust `String` (or BEVE string) values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
@@ -53,9 +55,15 @@ pub enum NullPolicy {
     /// Map `None` to MATLAB `struct([])` (an empty struct array). The field
     /// stays present, so MATLAB code can reference it unconditionally and test
     /// it with `isempty(fieldnames(x))`, which is what this crate's MATLAB
-    /// fixture script checks. Prefer that over a bare `isempty(x)`: the two
-    /// differ for a struct with no fields, and only the `fieldnames` form has
-    /// been verified against MATLAB itself.
+    /// fixture script checks. The two forms still differ for a struct with no
+    /// fields, and only the `fieldnames` form has been verified against MATLAB
+    /// itself.
+    ///
+    /// A bare `isempty(x)` became reliable in 0.34, when
+    /// [`EmptyMarkerEncoding::DataAsDims`] became the default: the marker now
+    /// carries its own dimensions, so the reference library recovers `0x0` with
+    /// zero elements. Under the previous encoding there were no dimensions to
+    /// recover, and the element count came back as one.
     ///
     /// Not expressible at the root, where `struct([])` would need a variable
     /// name to hang on; see the note on this enum.
@@ -236,6 +244,23 @@ pub struct Options {
     pub row_major_policy: RowMajorPolicy,
     /// Empty marker encoding.
     pub empty_marker_encoding: EmptyMarkerEncoding,
+    /// The newest HDF5 on-disk format the file may use — the upper bound handed
+    /// to [`FileBuilder::with_libver_bounds`](crate::FileBuilder::with_libver_bounds).
+    ///
+    /// Defaults to [`LibVer::V18`], because MATLAB reads MAT v7.3 files with a
+    /// *different, older* HDF5 library than the one behind its `h5read` family:
+    /// 1.8.12 rather than 1.10.7. A version 3 superblock is a 1.10 addition, so
+    /// a file carrying one reads fine under `h5disp` and `h5info` and fails to
+    /// `load`. Real MATLAB writes an older format still — a version 0
+    /// superblock with v1 symbol-table groups, which this crate does not
+    /// produce.
+    ///
+    /// Raising this to [`LibVer::V110`] is what [`Compression`] needs, since
+    /// compression requires chunked storage and the chunk indices this crate
+    /// writes arrived in 1.10. The two are refused together rather than
+    /// silently resolved, so a file that cannot be loaded by MATLAB is never
+    /// produced by a default nobody chose.
+    pub libver: LibVer,
 }
 
 impl Default for Options {
@@ -250,16 +275,20 @@ impl Default for Options {
             unsupported_policy: UnsupportedPolicy::Error,
             one_dimensional_mode: OneDimensionalMode::ColumnVector,
             row_major_policy: RowMajorPolicy::ReorderToColumnMajor,
-            empty_marker_encoding: EmptyMarkerEncoding::ZeroElement,
+            empty_marker_encoding: EmptyMarkerEncoding::DataAsDims,
+            libver: LibVer::V18,
         }
     }
 }
 
 impl Options {
     /// Construct options that emit the modern MATLAB `string` class via
-    /// `mxOPAQUE_CLASS` and use the data-as-dims empty marker encoding.
-    /// Matches what real MATLAB's `save -v7.3` produces (and what the BEVE
-    /// → MAT walker has historically used).
+    /// `mxOPAQUE_CLASS`, which real MATLAB's `save -v7.3` produces (and which
+    /// the BEVE → MAT walker has historically used) where the default writes
+    /// `char`.
+    ///
+    /// That is now the only difference from [`Options::default`]: the empty
+    /// marker this used to override is the default encoding.
     ///
     /// One shape is this crate's rather than MATLAB's, and only if you also
     /// select [`EmptySequencePolicy::Cell`]: an empty cell array is written
@@ -268,7 +297,6 @@ impl Options {
     pub fn with_modern_strings() -> Self {
         Self {
             string_class: StringClass::String,
-            empty_marker_encoding: EmptyMarkerEncoding::DataAsDims,
             ..Self::default()
         }
     }
@@ -278,15 +306,26 @@ impl Options {
 mod tests {
     use super::*;
 
-    /// The encoding defaults have not moved since the serde writer was the
-    /// only consumer. `null_policy` has (see the 0.30 changelog), so this is
-    /// no longer a statement about the whole struct.
+    /// The encoding defaults that have not moved since the serde writer was the
+    /// only consumer. `null_policy` and `empty_marker_encoding` have (see the
+    /// 0.30 and 0.34 changelogs), so this is no longer a statement about the
+    /// whole struct.
     #[test]
     fn encoding_defaults_match_the_legacy_serde_writer() {
         let o = Options::default();
         assert_eq!(o.string_class, StringClass::Char);
         assert_eq!(o.invalid_name_policy, InvalidNamePolicy::Error);
-        assert_eq!(o.empty_marker_encoding, EmptyMarkerEncoding::ZeroElement);
+    }
+
+    /// The defaults that describe the *file* rather than the values in it are
+    /// the ones MATLAB itself writes: an empty array is a `uint64` dataset
+    /// holding its own dimensions, and the format is old enough for the HDF5
+    /// 1.8.12 library MATLAB loads MAT v7.3 files with.
+    #[test]
+    fn file_defaults_match_what_matlab_writes() {
+        let o = Options::default();
+        assert_eq!(o.empty_marker_encoding, EmptyMarkerEncoding::DataAsDims);
+        assert_eq!(o.libver, LibVer::V18);
     }
 
     /// The two knobs added in 0.30 default to what the writer did before them,

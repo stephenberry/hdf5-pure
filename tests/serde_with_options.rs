@@ -4,7 +4,7 @@
 use hdf5_pure::mat::{
     self, Compression, EmptyMarkerEncoding, InvalidNamePolicy, Options, StringClass,
 };
-use hdf5_pure::{AttrValue, File};
+use hdf5_pure::{AttrValue, File, LibVer};
 use serde::{Deserialize, Serialize};
 
 fn temp_path(name: &str) -> std::path::PathBuf {
@@ -106,8 +106,15 @@ fn deflate_compression_shrinks_repetitive_data() {
     let doc = Big {
         payload: vec![0.0; 128 * 1024],
     };
-    let plain = mat::to_bytes_with_options(&doc, &Options::default()).unwrap();
-    let mut opts = Options::default();
+    // Compression needs chunked storage, whose chunk indices need the HDF5 1.10
+    // format, so both sides ask for it. The MAT default is the 1.8 format
+    // (MATLAB's `load` is HDF5 1.8.12) and refuses compression by name;
+    // comparing a 1.10 file against a 1.8 one would also be measuring the
+    // superblock rather than the deflate.
+    let mut plain_opts = Options::default();
+    plain_opts.libver = LibVer::V110;
+    let plain = mat::to_bytes_with_options(&doc, &plain_opts).unwrap();
+    let mut opts = plain_opts.clone();
     opts.compression = Compression::Deflate {
         level: 6,
         shuffle: true,

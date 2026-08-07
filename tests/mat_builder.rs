@@ -1,7 +1,7 @@
 //! Direct tests for the public `mat::MatBuilder` API.
 
-use hdf5_pure::mat::{MatBuilder, MatClass, Options, StringClass};
-use hdf5_pure::{AttrValue, File};
+use hdf5_pure::mat::{Compression, MatBuilder, MatClass, MatError, Options, StringClass};
+use hdf5_pure::{AttrValue, File, LibVer};
 
 fn temp_path(name: &str) -> std::path::PathBuf {
     let nanos = std::time::SystemTime::now()
@@ -209,8 +209,13 @@ fn invalid_name_errors_by_default() {
     assert!(err.is_err());
 }
 
+/// The default empty marker is the one MATLAB itself writes: a two-element
+/// `uint64` dataset whose *payload* is the dimension vector, not a zero-element
+/// dataset of that shape. Every empty in `tests/fixtures/mat_real` takes this
+/// form, including the `[1 1]` and `[1 0]` ones that a zero-element encoding
+/// cannot express at all.
 #[test]
-fn empty_marker_zero_element_default() {
+fn empty_marker_data_as_dims_default() {
     let mut mb = MatBuilder::new(Options::default());
     mb.write_empty("empty", MatClass::Double, &[0, 0]).unwrap();
     let bytes = mb.finish().unwrap();
@@ -219,7 +224,8 @@ fn empty_marker_zero_element_default() {
     std::fs::write(&path, &bytes).unwrap();
     let f = File::open(&path).unwrap();
     let ds = f.dataset("empty").unwrap();
-    assert_eq!(ds.shape().unwrap(), vec![0, 0]);
+    assert_eq!(ds.shape().unwrap(), vec![2]);
+    assert_eq!(ds.read_u64().unwrap(), vec![0, 0]);
     let attrs = ds.attrs().unwrap();
     let empty = match &attrs["MATLAB_empty"] {
         AttrValue::U32(v) => *v as u64,
@@ -229,4 +235,65 @@ fn empty_marker_zero_element_default() {
     };
     assert_eq!(empty, 1);
     std::fs::remove_file(path).unwrap();
+}
+
+/// A `.mat` file's whole purpose is to be read by MATLAB, and MATLAB reads MAT
+/// v7.3 with HDF5 1.8.12 — a library that predates the version 3 superblock.
+/// So the MAT default is the 1.8 format, which is checked here against the raw
+/// bytes rather than through a library that would read either version happily.
+#[test]
+fn the_default_mat_file_is_in_the_1_8_format() {
+    let mut mb = MatBuilder::new(Options::default());
+    mb.write_f64("values", &[3, 1], &[1.0, 2.0, 3.0]).unwrap();
+    let bytes = mb.finish().unwrap();
+
+    let sig = bytes
+        .windows(8)
+        .position(|w| w == b"\x89HDF\r\n\x1a\n")
+        .expect("the file carries an HDF5 signature");
+    assert_eq!(sig, 512, "the MAT userblock precedes the superblock");
+    assert_eq!(
+        bytes[sig + 8],
+        2,
+        "a version 3 superblock is a 1.10 addition MATLAB's loader cannot read"
+    );
+
+    // Opting into 1.10 is what a caller does to get compression, and it must
+    // actually change the file.
+    let mut options = Options::default();
+    options.libver = LibVer::V110;
+    let mut mb = MatBuilder::new(options);
+    mb.write_f64("values", &[3, 1], &[1.0, 2.0, 3.0]).unwrap();
+    let bytes = mb.finish().unwrap();
+    assert_eq!(bytes[sig + 8], 3);
+}
+
+/// Compression needs chunked storage, whose chunk indices need 1.10, so it
+/// cannot be combined with the 1.8 default. Refused rather than resolved either
+/// way: silently dropping compression loses what was asked for, and silently
+/// raising the format produces a file MATLAB cannot load.
+#[test]
+fn compression_under_the_1_8_default_is_refused_by_name() {
+    let mut options = Options::default();
+    options.compression = Compression::Deflate {
+        level: 4,
+        shuffle: false,
+    };
+    let mut mb = MatBuilder::new(options);
+    mb.write_f64("values", &[3, 1], &[1.0, 2.0, 3.0]).unwrap();
+    assert!(matches!(
+        mb.finish().unwrap_err(),
+        MatError::CompressionNeedsNewerFormat
+    ));
+
+    // Raising the format is the documented way through, and it works.
+    let mut options = Options::default();
+    options.compression = Compression::Deflate {
+        level: 4,
+        shuffle: false,
+    };
+    options.libver = LibVer::V110;
+    let mut mb = MatBuilder::new(options);
+    mb.write_f64("values", &[3, 1], &[1.0, 2.0, 3.0]).unwrap();
+    assert!(mb.finish().is_ok());
 }

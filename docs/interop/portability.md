@@ -102,10 +102,21 @@ shown above, is available on `wasm32-unknown-unknown`.
 
 `hdf5-pure` does not define its own dialect of HDF5: it writes and reads the
 standard on-disk format. Files this crate writes are readable by the reference
-HDF5 C library, by `h5py`, and by MATLAB; files those tools produce are readable
-here. This holds for the format features the crate supports — multiple
-superblock versions, object header layouts, contiguous and chunked storage, and
-the built-in deflate, shuffle, and scale-offset filters, plus h5py's LZF.
+HDF5 C library and by `h5py`; files those tools produce are readable here. This
+holds for the format features the crate supports — multiple superblock versions,
+object header layouts, contiguous and chunked storage, and the built-in deflate,
+shuffle, and scale-offset filters, plus h5py's LZF.
+
+MATLAB needs one more thing said about it, because it is not one reader but two.
+Its `h5read`/`h5disp`/`h5info` family goes through HDF5 1.10.7, while `load` for
+a MAT v7.3 file goes through a separate HDF5 1.8.12 that MathWorks kept on that
+path deliberately. A file written in this crate's default format carries a
+version 3 superblock, which is a 1.10 addition, so it reads under `h5disp` and
+fails under `load`. The `mat` writer therefore emits the HDF5 1.8 format by
+default (`mat::Options::libver`), and `FileBuilder::with_libver_bounds` reaches
+the same format for a plain `.h5` file destined for an old reader. Real MATLAB
+writes an older format still — a version 0 superblock with v1 symbol-table
+groups — which this crate reads but does not produce.
 
 Interoperability is not asserted by hand. It is enforced by byte-level
 crosscheck tests that compare the bytes this crate emits against fixtures
@@ -115,6 +126,14 @@ discipline backs the optional [ZFP filter](../guide/compression.md)
 (`src/zfp_crosscheck.rs` compares against `h5py` + `hdf5plugin`) and the MATLAB
 `.mat` path. For the cross-tool story in depth, see the
 [MATLAB interop page](matlab.md).
+
+The 1.8 output format is the one claim those tests cannot make, because every
+library they link is 1.10 or newer and reads both formats happily.
+`scripts/check-hdf5-18.sh` covers it by building HDF5 1.8.23 and pointing its
+tools at both: the 1.10 format cannot be opened at all, the 1.8 format reads
+completely, and a 1.8 `h5repack` round trip preserves every attribute. That
+measures the format boundary rather than MathWorks' specific 1.8.12 build, which
+only MATLAB itself can confirm.
 
 The [LZF filter](../guide/compression.md) is the one place where byte-comparison
 does not apply in both directions, so it is worth being precise about what is

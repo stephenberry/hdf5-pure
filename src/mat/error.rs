@@ -71,6 +71,18 @@ pub enum MatError {
     /// writes anything, and a compressed block's size is not knowable without
     /// compressing it — which would buffer the data the path exists to avoid.
     CompressionUnsupportedForBlocks,
+    /// [`Options::compression`](crate::mat::Options::compression) was set
+    /// alongside an [`Options::libver`](crate::mat::Options::libver) too old to
+    /// carry it.
+    ///
+    /// Compression needs chunked storage, and the chunk indices this crate
+    /// writes arrived in HDF5 1.10 — while the MAT default is the 1.8 format,
+    /// because MATLAB's MAT v7.3 loader is HDF5 1.8.12. Refused rather than
+    /// resolved either way: dropping the compression loses what the caller asked
+    /// for, and raising the format produces a `.mat` file MATLAB cannot `load`.
+    /// Set `libver` to [`LibVer::V110`](crate::LibVer::V110) to compress and
+    /// accept the newer format.
+    CompressionNeedsNewerFormat,
     /// A generic serde-originated error (from `Error::custom`).
     Custom(String),
 }
@@ -118,6 +130,12 @@ impl fmt::Display for MatError {
                 f,
                 "a producer-backed dataset cannot be compressed: its blocks' on-disk sizes must be \
                  known before the file is laid out"
+            ),
+            MatError::CompressionNeedsNewerFormat => write!(
+                f,
+                "compression needs chunked storage, which needs the HDF5 1.10 format, but \
+                 Options::libver asks for 1.8 so MATLAB's MAT v7.3 loader can read the file; \
+                 set libver to LibVer::V110 to compress"
             ),
             MatError::Custom(msg) => write!(f, "{msg}"),
         }

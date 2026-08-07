@@ -10,6 +10,25 @@ Run `cargo clean -p hdf5-pure` when builds start taking tens of seconds before a
 
 Prefer `cargo test --lib` for the fast loop: the ~580 library tests run in about two seconds, and the mutation checks that prove a new test is load-bearing belong there. `cargo test --all-features` builds 97 separate integration binaries and compiles libhdf5 from source through `hdf5-metno-src`, so treat it as a pre-push gate rather than an inner-loop command, and keep to one feature set locally — every distinct set is a full parallel copy of the build graph.
 
+## The HDF5 1.8 output format
+
+`scripts/check-hdf5-18.sh` builds HDF5 1.8.23 and points its tools at both formats this crate writes. **Run it when changing anything about superblock or object-header message versions**, and read it before assuming the test suite covers that ground — it does not, and cannot.
+
+MATLAB reads MAT v7.3 with HDF5 **1.8.12**, a different and older library than the 1.10.7 behind its own `h5read`/`h5disp`/`h5info` family. A version 3 superblock is a 1.10 addition, so a file carrying one reads fine under `h5disp` and fails under `load`; that is why `mat::Options::libver` defaults to `LibVer::V18` and why `FileBuilder::with_libver_bounds` selects a format rather than merely validating one.
+
+No test can catch a regression here. The `hdf5-metno` dev-dependency builds a current libhdf5, `h5py` links a current libhdf5, and every third-party MAT v7.3 reader (`mat73`, `hdf5storage`, `pymatreader`, MAT.jl, matio) delegates to whichever libhdf5 *it* links. All of them read a version 3 superblock without complaint. The failure is one byte below everything they parse, so only an old library can see it, and none is available as a dev-dependency. The script needs network access and a couple of minutes on its first run, which is why it is a command you run rather than a CI job.
+
+What it measured when the 1.8 format landed in 0.34.0, against 1.8.23:
+
+| file | HDF5 1.8.23 `h5dump` |
+| --- | --- |
+| superblock 3 (the default through 0.33.0) | `unable to open file`, exit 1 |
+| superblock 2 (the 1.8 format) | reads data, groups, and every attribute |
+
+1.8 does not degrade or warn on the newer superblock — it cannot open the file at all. The script also round-trips both fixtures through 1.8's `h5repack` and counts attributes, which is the other half of the same story: before the Attribute Info fix, `h5repack` copied every object with none of its attributes.
+
+One limit worth stating: this proves the 1.8 *format* boundary, not that MathWorks' particular 1.8.12 build accepts the file. 1.8.23 is nine patch releases newer and theirs may carry patches. `matlab_fixtures/verify.m` under real MATLAB is still the only thing that would settle that, and it has only ever been run under Octave, whose HDF5 is modern.
+
 ## Changelog
 
 Keep `CHANGELOG.md` entries concise and reader-facing. Each entry is one or two sentences: lead with the user-facing capability and the public API name, keep at most one short caveat clause naming what is still refused or limited, and end with the issue/PR link in `([#NN](url))` form. Use a **Breaking:** prefix for breaking changes.
