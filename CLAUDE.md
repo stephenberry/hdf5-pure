@@ -10,6 +10,31 @@ Run `cargo clean -p hdf5-pure` when builds start taking tens of seconds before a
 
 Prefer `cargo test --lib` for the fast loop: the ~580 library tests run in about two seconds, and the mutation checks that prove a new test is load-bearing belong there. `cargo test --all-features` builds 97 separate integration binaries and compiles libhdf5 from source through `hdf5-metno-src`, so treat it as a pre-push gate rather than an inner-loop command, and keep to one feature set locally — every distinct set is a full parallel copy of the build graph.
 
+## The HDF5 1.8 output format
+
+`scripts/check-hdf5-18.sh` builds HDF5 1.8.23 and points its tools at both formats this crate writes. **Run it when changing anything about superblock or object-header message versions**, and read it before assuming the test suite covers that ground — it does not, and cannot.
+
+Which HDF5 library MATLAB links has changed across releases, and MathWorks documents it: **1.8.12 in R2021a and earlier**, 1.10.7 in R2021b, 1.10.8 through 1.10.11 across R2022a–R2024a, 1.14.4.3 since R2024b. A version 3 superblock is a 1.10 addition, so a `.mat` carrying one cannot be opened at all before R2021b. That is why `mat::Options::libver` defaults to `LibVer::V18` and why `FileBuilder::with_libver_bounds` selects a format rather than merely validating one.
+
+**The linked library version does not predict what `load` accepts, and the gap is not small.** Measured on **R2023a Update 1**, whose `H5.get_libversion` reports **1.10.8**: the version 2 superblock loads and decodes correctly, and the version 3 one fails outright with "Not a binary MAT-file" — from a library that reads a version 3 superblock without difficulty. The two files were byte-identical through the 512-byte userblock, differing in 35 bytes that are all version and checksum, so the format is the only variable. MathWorks documents the start of this (around R2021b it shipped 1.8.12 on the MAT path while `h5read` used 1.10.7, the split behind the symptom of `h5disp` working where `load` fails) but not its extent; the measurement puts it at R2023a, two years later. Whether the cause is the older library or a MAT reader that caps the superblock version is undetermined and does not change the conclusion: the 1.8 default is required on releases the version table would call safe, not merely prudent.
+
+`examples/octave/check_format.m` produced that measurement and prints its own inputs, so a run on another release extends the record. Its `CONFIRMED` verdict calls out the 1.10-reported-but-refused case specifically, since that is the one the published table does not predict.
+
+No test can catch a regression here. The `hdf5-metno` dev-dependency builds a current libhdf5, `h5py` links a current libhdf5, and every third-party MAT v7.3 reader (`mat73`, `hdf5storage`, `pymatreader`, MAT.jl, matio) delegates to whichever libhdf5 *it* links. All of them read a version 3 superblock without complaint. The failure is one byte below everything they parse, so only an old library can see it, and none is available as a dev-dependency. The script needs network access and a couple of minutes on its first run, which is why it is a command you run rather than a CI job.
+
+What it measured when the 1.8 format landed in 0.34.0, against 1.8.23:
+
+| file | HDF5 1.8.23 `h5dump` |
+| --- | --- |
+| superblock 3 (the default through 0.33.0) | `unable to open file`, exit 1 |
+| superblock 2 (the 1.8 format) | reads data, groups, and every attribute |
+
+1.8 does not degrade or warn on the newer superblock — it cannot open the file at all. The script also round-trips both fixtures through 1.8's `h5repack` and counts attributes, which is the other half of the same story: before the Attribute Info fix, `h5repack` copied every object with none of its attributes.
+
+The "reads data" row is a claim the script now checks rather than one a reader has to take on trust: it compares dataset and attribute *values* against what `examples/libver_fixtures.rs` wrote, not just `h5dump`'s exit status. `h5dump -n` lists object names, so a file whose headers all decode while its data resolves to the wrong offset — the base-address defect class — opens cleanly and lists everything, and an exit-status check would call it passing.
+
+One limit worth stating: this proves the 1.8 *format* boundary, not that a particular MathWorks build accepts the file. That second question is what `check_format.m` answers, and R2023a answered it above — but one release is one data point, so run it on whatever MATLAB is to hand. Octave cannot substitute: its HDF5 is modern and reads both formats, so it reports INCONCLUSIVE by design rather than guessing. `verify.m` covers content rather than format and does pass under Octave.
+
 ## Changelog
 
 Keep `CHANGELOG.md` entries concise and reader-facing. Each entry is one or two sentences: lead with the user-facing capability and the public API name, keep at most one short caveat clause naming what is still refused or limited, and end with the issue/PR link in `([#NN](url))` form. Use a **Breaking:** prefix for breaking changes.

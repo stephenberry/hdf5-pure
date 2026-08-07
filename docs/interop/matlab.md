@@ -78,7 +78,7 @@ The serializer maps Rust types to HDF5 datasets and the MATLAB classes MATLAB ex
 !!! note "Unit and `null` fields"
     A struct field that serializes as a Rust unit `()` is written exactly like `Option::None`. The most common case is a `serde_json::Value::Null` field, since `serde_json` serializes `Value::Null` via `serialize_unit`.
 
-    Under the default `NullPolicy::EmptyStructArray` the field is present on disk as MATLAB `struct([])`, so `isfield` reports `true` and MATLAB code can reference it unconditionally and test it with `isempty(fieldnames(x))`. Prefer that over a bare `isempty(x)`: the two differ for a struct with no fields, and only the `fieldnames` form is verified against MATLAB (see `matlab_fixtures/verify.m`).
+    Under the default `NullPolicy::EmptyStructArray` the field is present on disk as MATLAB `struct([])`, so `isfield` reports `true` and MATLAB code can reference it unconditionally and test it with `isempty(fieldnames(x))`. The two forms still differ for a struct with no fields, and only the `fieldnames` form is verified against MATLAB (see `matlab_fixtures/verify.m`). Since 0.34 a bare `isempty(x)` is also reliable: the default `EmptyMarkerEncoding::DataAsDims` stores the marker's dimensions in its payload, so the reference library recovers `0x0` with zero elements where the previous encoding recovered no dimensions and an element count of one.
 
     Reading it back is lenient but not universal. `struct([])` deserializes into `Option<T>` as `None`, `Vec<T>` as empty, `serde_json::Value` as `Null`, and `()` as `()`. It does **not** deserialize into a bare scalar, `String`, struct or map: those report a type error. Note `#[serde(default)]` does not rescue them, because the field is *present* with a struct value rather than missing, so the default is never consulted. This is the one migration hazard in 0.30: a reader with `#[serde(default)] count: u32` against a writer whose `count` is `None` worked under the pre-0.30 behavior and now fails. Give such a field type `Option<u32>`, or write with `NullPolicy::Omit`.
 
@@ -142,7 +142,7 @@ let v = Capture {
 mat::to_file(&v, "capture.mat").unwrap();
 ```
 
-One consumer-side caveat worth knowing before choosing an integer component: MATLAB stores and loads complex integer arrays, but it refuses *arithmetic* on them — `a * b` on two complex `int16` values raises "Complex integer arithmetic is not supported", and the caller has to `double(...)` them first (or use Fixed-Point Designer's `fi` objects). That is a property of MATLAB, not of the file: the array arrives intact and `isa(x, 'int16')` and `iscomplex(x)` both hold. It costs nothing for a capture format that is stored compactly and widened once at the point of use, which is the case this exists for.
+One consumer-side caveat worth knowing before choosing an integer component: MATLAB stores and loads complex integer arrays, but it refuses *arithmetic* on them — `a * b` on two complex `int16` values raises "Complex integer arithmetic is not supported", and the caller has to `double(...)` them first (or use Fixed-Point Designer's `fi` objects). That is a property of MATLAB, not of the file: the array arrives intact and `isa(x, 'int16')` and `~isreal(x)` both hold. It costs nothing for a capture format that is stored compactly and widened once at the point of use, which is the case this exists for.
 
 Components are never converted between widths, in either direction. An `int16` complex dataset deserializes into `ComplexI16` and nothing else: reading it as `Complex64` would be lossless and is still refused, because the component width is part of what the file says it holds. Reading a `double` capture into `ComplexI16` is refused for the same reason, and would truncate. A caller holding float data that it knows to be exact integers is the one that can decide whether narrowing is meaningful, so do the conversion before serializing.
 
@@ -187,6 +187,56 @@ A struct array authored in MATLAB (`s(1).x = …; s(2).x = …`) is stored as a 
 
 !!! note "Write/read asymmetry"
     This is a read-only path. Writing a `Vec<Struct>` from Rust produces a MATLAB **cell array** (see [Cell arrays](#cell-arrays)), not a native struct array, so a `.mat` you write and one MATLAB writes from the same Rust type differ on disk. Both read back into `Vec<Struct>`.
+
+## The on-disk format MATLAB's `load` needs
+
+MATLAB has not always read HDF5 with the same library. [MathWorks documents the version per release](https://www.mathworks.com/help/matlab/hdf5-files.html):
+
+| MATLAB release | HDF5 C library |
+| --- | --- |
+| R2024b and later | 1.14.4.3 |
+| R2024a | 1.10.11 |
+| R2023b | 1.10.10 |
+| R2022a – R2023a | 1.10.8 |
+| R2021b | 1.10.7 |
+| R2021a and earlier | 1.8.12 |
+
+**Read that table as which library the release links, not as which formats `load` accepts.** The two are not the same, and assuming they are is how a caller ships a file their own MATLAB cannot open.
+
+The version 3 superblock is an HDF5 1.10 addition, so a `.mat` file carrying one cannot be opened by MATLAB before R2021b — not partially, not with a warning, at all. `mat::Options::libver` therefore defaults to `LibVer::V18` and the writer emits a version 2 superblock with version 3 data-layout messages: the newest encoding HDF5 1.8 understands, and one every later MATLAB reads as well. Choosing it costs nothing. The message bodies are identical between the two, so the files differ in two version bytes and are the same size.
+
+That much follows from the table. What does not, and is the stronger reason to prefer the 1.8 format, is this measurement:
+
+| MATLAB | `H5.get_libversion` | superblock 2 `load` | superblock 3 `load` |
+| --- | --- | --- | --- |
+| R2023a Update 1 | 1.10.8 | loads, decodes correctly | *"Not a binary MAT-file"* |
+
+R2023a links HDF5 1.10.8, which reads a version 3 superblock perfectly well — and its `load` refuses one anyway. The two files behind that row are byte-identical through the 512-byte userblock and differ in 35 bytes, all of them the superblock version, the data-layout message versions, and the checksums that follow; so the format is the only variable, and it is decisive.
+
+MathWorks documents the beginning of this. Around R2021b it shipped two libraries at once — 1.10.7 for the `h5read`/`h5disp`/`h5info` interface, with 1.8.12 kept on the MAT v7.3 path to avoid 1.10 regressions — which produces an unusual and recognizable symptom: a file `h5disp` prints happily and `load` refuses. The measurement above says that split, or something with the same effect, is still in force in R2023a, two years on.
+
+What it does *not* say is why. An older library on the MAT path and a MAT reader that caps the superblock version it will accept are both consistent with this result, and telling them apart would take more than a `load`. The operational conclusion is the same either way: **write the 1.8 format, and do not infer from the reported library version that a 1.10 file is safe.**
+
+`examples/octave/check_format.m` is what produced that row, and it puts the same question to whichever MATLAB you have. It prints its own inputs — release and library version — alongside the outcome, so a run on another release extends the table above rather than replacing it. Run it in MATLAB rather than Octave, whose HDF5 is modern and reads both formats, so it cannot tell them apart.
+
+The one thing that cannot be written that way is compression, which needs chunked storage, whose chunk indices arrived in 1.10. Asking for both is refused with `MatError::CompressionNeedsNewerFormat` rather than resolved in either direction, since dropping the compression loses what you asked for and raising the format produces a file MATLAB cannot load:
+
+```rust
+use hdf5_pure::mat::{Compression, Options};
+use hdf5_pure::LibVer;
+
+let mut options = Options::default();
+options.compression = Compression::Deflate { level: 6, shuffle: true };
+options.libver = LibVer::V110; // required for compression; MATLAB `load` cannot read it
+```
+
+Real MATLAB writes an older format still: a version 0 superblock with v1 symbol-table groups and v1 B-tree chunk indices, which is what `save -v7.3` produces. This crate reads that format but does not write it, so its `.mat` output is not byte-identical to MATLAB's own.
+
+## How an empty value is stored
+
+MAT v7.3 is not publicly documented, so the particulars here are measured against the genuine MATLAB files vendored under `tests/fixtures/mat_real` rather than taken from a specification. An empty value is a two-element `uint64` dataset whose *payload* is the dimension vector, marked with `MATLAB_empty`, and it carries no other attribute — in particular no `MATLAB_int_decode`, which says how to read stored integers back as `char` or `logical` and has nothing to describe when the payload is a dimension vector. Not one of the 352 empty datasets in those fixtures carries it, for any class.
+
+An empty Rust sequence is written as `0x0`, MATLAB's `[]`, whichever `OneDimensionalMode` is set: the mode orients a vector, and an empty one has no orientation to preserve. The difference is visible in MATLAB, where `[[], 1]` is `1` while `[zeros(0,1), 1]` is a dimension-mismatch error, and `0x0` is what MATLAB itself overwhelmingly writes. `MatBuilder::write_empty` still stores whatever dimensions you hand it, so `zeros(0,1)` remains expressible.
 
 ## Opaque value classes
 

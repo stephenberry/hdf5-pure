@@ -100,14 +100,20 @@ fn fixed_width_attrs_past_the_limit_move_to_heap_storage() {
     }
 }
 
-/// `write` refuses on the same terms as `finish`, rather than only `finish`. It
-/// creates the destination before serializing, so a refusal leaves an empty file
-/// behind — no HDF5 content, but the path exists. Asserted so the behaviour is on
-/// the record. Uses the one shape still refused, since no attribute size is.
+/// `write` refuses on the same terms as `finish`, rather than only `finish`, and
+/// the refusal costs the destination path nothing.
+///
+/// It used to open the file with `std::fs::File::create` before serializing —
+/// which truncates — so a refusal left an empty file where the caller's own file
+/// had been. Now the path is created when the writer has bytes for it, and this
+/// refusal fires before any. Uses the one shape still refused, since no
+/// attribute size is.
 #[test]
-fn write_to_disk_refuses_and_leaves_an_empty_file() {
+fn write_to_disk_refuses_without_touching_the_destination() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("oversized.h5");
+    let previous = b"the caller's existing file";
+    std::fs::write(&path, previous).unwrap();
 
     let mut builder = FileBuilder::new();
     builder
@@ -118,7 +124,11 @@ fn write_to_disk_refuses_and_leaves_an_empty_file() {
         builder.write(&path).unwrap_err(),
         Error::Format(FormatError::ObjectHeaderMessageTooLarge { .. })
     ));
-    assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        previous,
+        "the refused build overwrote the destination"
+    );
 }
 
 /// A *small* variable-length attribute swept into heap storage by an oversized

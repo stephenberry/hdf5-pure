@@ -102,10 +102,29 @@ shown above, is available on `wasm32-unknown-unknown`.
 
 `hdf5-pure` does not define its own dialect of HDF5: it writes and reads the
 standard on-disk format. Files this crate writes are readable by the reference
-HDF5 C library, by `h5py`, and by MATLAB; files those tools produce are readable
-here. This holds for the format features the crate supports — multiple
-superblock versions, object header layouts, contiguous and chunked storage, and
-the built-in deflate, shuffle, and scale-offset filters, plus h5py's LZF.
+HDF5 C library and by `h5py`; files those tools produce are readable here. This
+holds for the format features the crate supports — multiple superblock versions,
+object header layouts, contiguous and chunked storage, and the built-in deflate,
+shuffle, and scale-offset filters, plus h5py's LZF.
+
+MATLAB needs one more thing said about it, because which HDF5 library it links
+has changed across releases and decides whether it can open a file at all. It
+was 1.8.12 before R2021b, 1.10.7 in R2021b, 1.10.x through R2024a, and 1.14.4.3
+since R2024b. A version 3 superblock is a 1.10 addition, so a file in this
+crate's older default could not be opened by MATLAB before R2021b. The `mat`
+writer therefore emits the HDF5 1.8 format by default
+(`mat::Options::libver`), which every one of those releases reads, and
+`FileBuilder::with_libver_bounds` reaches the same format for a plain `.h5`
+file destined for an old reader. Around R2021b MathWorks also shipped two
+libraries at once, keeping 1.8.12 on the MAT v7.3 path while `h5read`/`h5disp`
+used 1.10.7 — the split behind the odd symptom of a file `h5disp` prints and
+`load` refuses. That is not confined to R2021b: R2023a reports HDF5 1.10.8 and
+its `load` still refuses a version 3 superblock, so the linked library version
+does not tell you which formats `load` accepts (see
+[MATLAB v7.3 files](matlab.md#the-on-disk-format-matlabs-load-needs)). Real
+MATLAB writes an older format still: a version 0
+superblock with v1 symbol-table groups, which this crate reads but does not
+produce.
 
 Interoperability is not asserted by hand. It is enforced by byte-level
 crosscheck tests that compare the bytes this crate emits against fixtures
@@ -115,6 +134,15 @@ discipline backs the optional [ZFP filter](../guide/compression.md)
 (`src/zfp_crosscheck.rs` compares against `h5py` + `hdf5plugin`) and the MATLAB
 `.mat` path. For the cross-tool story in depth, see the
 [MATLAB interop page](matlab.md).
+
+The 1.8 output format is the one claim those tests cannot make, because every
+library they link is 1.10 or newer and reads both formats happily.
+`scripts/check-hdf5-18.sh` covers it by building HDF5 1.8.23 and pointing its
+tools at both: the 1.10 format cannot be opened at all, the 1.8 format reads
+completely, and a 1.8 `h5repack` round trip preserves every attribute. That
+measures the format boundary rather than any particular MathWorks build, which
+only MATLAB itself can confirm — `examples/octave/check_format.m` asks it
+directly.
 
 The [LZF filter](../guide/compression.md) is the one place where byte-comparison
 does not apply in both directions, so it is worth being precise about what is

@@ -341,3 +341,179 @@ fn deprecated_aliases_resolve_to_the_renamed_types() {
     // …and the forwarded value is the one that was passed in, whole.
     assert_eq!(file.access_options(), access);
 }
+
+/// `with_create_properties` documents that it overwrites any value set
+/// individually before the call. That has to include the properties the list
+/// leaves *unset*, or handing over a property list defines the file only
+/// partly — and for the library-version bounds, the leftover decides the on-disk
+/// format of a file whose property list names no version at all.
+#[test]
+fn create_properties_reset_the_properties_they_do_not_carry() {
+    let mut b = FileBuilder::new();
+    b.with_libver_bounds(LibVer::Earliest, LibVer::V18);
+    b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 8);
+    b.with_file_space_page_size(4096);
+    b.with_userblock(1024);
+    // Names none of the four above.
+    b.with_create_properties(FileCreateProperties::new());
+    b.create_dataset("d").with_f64_data(&[1.0]);
+    let overwritten = b.finish().unwrap();
+
+    let mut b = FileBuilder::new();
+    b.create_dataset("d").with_f64_data(&[1.0]);
+    let pristine = b.finish().unwrap();
+
+    assert_eq!(
+        overwritten, pristine,
+        "an empty property list must leave the builder at its defaults"
+    );
+    assert_eq!(
+        overwritten[8], 3,
+        "the stale 1.8 bound decided the format of a list that named no version"
+    );
+}
+
+/// A refusal must not be destructive. Every library-version and userblock check
+/// runs before the writer emits a byte, so `FileBuilder::write` has nothing to
+/// write and must leave the destination path exactly as it found it — the
+/// `File::create` it used to open up front truncates, so the caller lost the
+/// file they were overwriting *and* got an error.
+#[test]
+fn a_refused_build_does_not_touch_the_destination_file() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("existing.h5");
+    let previous = b"the caller's existing file";
+    std::fs::write(&path, previous).unwrap();
+
+    let mut b = FileBuilder::new();
+    b.with_libver_bounds(LibVer::Earliest, LibVer::V18);
+    b.create_dataset("d")
+        .with_i32_data(&(0..100).collect::<Vec<_>>())
+        .with_chunks(&[10]);
+    assert!(matches!(
+        b.write(&path),
+        Err(Error::Format(FormatError::LibverTooOldForContent { .. }))
+    ));
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        previous,
+        "the refused build overwrote the destination"
+    );
+
+    // And a build refused at a path that did not exist creates nothing, rather
+    // than leaving an empty file where a reader would then find a truncated one.
+    let fresh = dir.path().join("fresh.h5");
+    let mut b = FileBuilder::new();
+    b.with_libver_bounds(LibVer::Earliest, LibVer::V18);
+    b.create_dataset("d")
+        .with_i32_data(&(0..100).collect::<Vec<_>>())
+        .with_chunks(&[10]);
+    assert!(b.write(&fresh).is_err());
+    assert!(!fresh.exists(), "the refused build created an empty file");
+
+    // The same path still writes normally when the build is accepted.
+    let mut b = FileBuilder::new();
+    b.with_libver_bounds(LibVer::Earliest, LibVer::V18);
+    b.create_dataset("d").with_f64_data(&[1.0, 2.0]);
+    b.write(&path).unwrap();
+    assert_eq!(
+        File::open(&path)
+            .unwrap()
+            .dataset("d")
+            .unwrap()
+            .read_f64()
+            .unwrap(),
+        vec![1.0, 2.0]
+    );
+}
+
+/// An editing session adds whatever the content needs by default, which is what
+/// lets a file the C library wrote under its own bounds be edited at all — but
+/// adding a chunked dataset to an HDF5 1.8 file needs the version 4 layout and a
+/// 1.10 chunk index, so it makes that file need 1.10 while its superblock still
+/// says 1.8. Setting the fapl's library-version bound is how a caller says the
+/// file must stay loadable by the old reader it was written for.
+#[test]
+fn an_editing_session_honors_the_library_version_bound() {
+    fn stage_chunked(session: &File) {
+        session
+            .root()
+            .create_dataset("added", |b| {
+                b.with_i32_data(&(0..100).collect::<Vec<_>>())
+                    .with_chunks(&[10]);
+            })
+            .unwrap();
+    }
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("v18.h5");
+    let mut b = FileBuilder::new();
+    b.with_libver_bounds(LibVer::Earliest, LibVer::V18);
+    b.create_dataset("values").with_f64_data(&[1.0, 2.0, 3.0]);
+    b.write(&path).unwrap();
+
+    let bounded = FileAccessProperties::new().with_libver_bounds(LibVer::Earliest, LibVer::V18);
+    {
+        let session = File::open_rw_with_options(&path, bounded).unwrap();
+        stage_chunked(&session);
+        let err = session.commit().unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Format(FormatError::LibverTooOldForContent { .. })
+            ),
+            "a chunked addition under a 1.8 bound gave {err:?}"
+        );
+    }
+
+    // The commit is all-or-nothing: the refusal left the file as it was.
+    {
+        let file = File::open(&path).unwrap();
+        assert!(file.dataset("added").is_err(), "the refusal wrote anyway");
+        assert_eq!(
+            file.dataset("values").unwrap().read_f64().unwrap(),
+            vec![1.0, 2.0, 3.0]
+        );
+    }
+
+    // A contiguous addition is expressible in the 1.8 format and still lands, so
+    // the bound refuses the content rather than the session.
+    {
+        let session = File::open_rw_with_options(&path, bounded).unwrap();
+        session
+            .root()
+            .create_dataset("plain", |b| {
+                b.with_f64_data(&[4.0, 5.0]);
+            })
+            .unwrap();
+        session.commit().unwrap();
+    }
+    assert_eq!(
+        File::open(&path)
+            .unwrap()
+            .dataset("plain")
+            .unwrap()
+            .read_f64()
+            .unwrap(),
+        vec![4.0, 5.0]
+    );
+
+    // Unset, the same chunked edit is accepted — the refusal is the caller's
+    // choice, not a new blanket rule, so issue #101's C-library-file edits keep
+    // working.
+    {
+        let session = File::open_rw_with_options(&path, FileAccessProperties::new()).unwrap();
+        stage_chunked(&session);
+        session.commit().unwrap();
+    }
+    assert_eq!(
+        File::open(&path)
+            .unwrap()
+            .dataset("added")
+            .unwrap()
+            .read_i32()
+            .unwrap()
+            .len(),
+        100
+    );
+}

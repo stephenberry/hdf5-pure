@@ -195,8 +195,15 @@ struct WithOption {
 }
 
 /// Assert `name` is present and carries MATLAB's empty-struct-array marker:
-/// struct-classed, flagged empty, and `[0, 0]`. Checking the class alone would
-/// pass for any struct at all, empty or not.
+/// struct-classed, flagged empty, and holding the dimension vector `[0, 0]` as
+/// its *payload*. Checking the class alone would pass for any struct at all,
+/// empty or not.
+///
+/// The payload is where the dims live under the default
+/// `EmptyMarkerEncoding::DataAsDims`, which is what MATLAB itself writes: every
+/// empty in `tests/fixtures/mat_real` is a two-element `uint64` dataset holding
+/// its own dims, including the `[1 1]` and `[1 0]` ones a zero-element dataset
+/// could not express at all.
 fn assert_empty_struct_array(file: &File, name: &str) {
     let ds = file
         .dataset(name)
@@ -212,7 +219,16 @@ fn assert_empty_struct_array(file: &File, name: &str) {
         "`{name}` must be flagged empty, got {:?}",
         attrs.get("MATLAB_empty"),
     );
-    assert_eq!(ds.shape().unwrap(), vec![0, 0], "`{name}` must be [0, 0]");
+    assert_eq!(
+        ds.shape().unwrap(),
+        vec![2],
+        "`{name}` holds a two-element dimension vector",
+    );
+    assert_eq!(
+        ds.read_u64().unwrap(),
+        vec![0, 0],
+        "`{name}`'s payload must be the dims [0, 0]",
+    );
 }
 
 #[test]
@@ -427,9 +443,28 @@ fn an_options_persisted_by_an_older_version_still_deserializes() {
         "empty_marker_encoding": "ZeroElement"
     }"#;
     let opts: mat::Options = serde_json::from_str(json_0_29).expect("0.29 Options must still load");
-    assert_eq!(opts, mat::Options::default());
 
-    // An empty document is the degenerate case of the same property.
+    // What it recorded is what it gets back, including a value that has since
+    // stopped being the default — that is the whole point of persisting options.
+    assert_eq!(
+        opts.empty_marker_encoding,
+        mat::EmptyMarkerEncoding::ZeroElement
+    );
+    assert_ne!(
+        opts.empty_marker_encoding,
+        mat::Options::default().empty_marker_encoding,
+        "this assertion is only meaningful while the recorded value differs from \
+         the current default; pick another moved field if that changes"
+    );
+    // Fields it never heard of take the current default rather than failing.
+    assert_eq!(opts.libver, mat::Options::default().libver);
+    assert_eq!(
+        opts.unit_variant_encoding,
+        mat::Options::default().unit_variant_encoding
+    );
+
+    // An empty document is the degenerate case of the same property, and there
+    // every field defaults.
     let all_defaulted: mat::Options = serde_json::from_str("{}").unwrap();
     assert_eq!(all_defaulted, mat::Options::default());
 }
@@ -1678,4 +1713,124 @@ fn vec_of_unit_enums_roundtrips() {
     rt(FlagList {
         states: vec![Flag::On, Flag::Off, Flag::On],
     });
+}
+
+// ---------------------------------------------------------------------------
+// The two emit paths must not drift apart
+// ---------------------------------------------------------------------------
+
+/// `to_bytes` and `to_bytes_with_options(&Options::default())` run through
+/// *different emitters* — `ser::emit` and `ser::emit_with_builder` — and each
+/// carries its own copy of every file-level setting. So a new default applied to
+/// one silently leaves the other behind, which is what happened when the HDF5
+/// 1.8 format became the MAT default: `to_file` kept writing a version 3
+/// superblock, and `to_file` is the entry point a `.mat` file is usually
+/// produced by.
+///
+/// The `matio` crosscheck holds the same invariant, but only for one value and
+/// only when libmatio is installed. This runs on the default feature set, over
+/// shapes that reach both emitters' interesting arms.
+///
+/// Emptiness is where the two have come apart most: they recorded different
+/// MATLAB dims for an empty `Vec`, `String`, and `Vec<bool>` (`[0, 0]` against
+/// `[0, 1]`), and `apply_matrix` was left out of the `DataAsDims` default
+/// entirely, so an empty `Matrix` stayed a zero-element array on one side and
+/// became a dimension vector on the other. Every shape of emptiness the writers
+/// treat separately therefore belongs in `Every` below — a shape that is missing
+/// is a divergence this test cannot see.
+#[test]
+fn both_emit_paths_produce_the_same_bytes() {
+    #[derive(Serialize)]
+    struct Every {
+        scalar: f64,
+        vector: Vec<i32>,
+        text: String,
+        matrix: Matrix<f64>,
+        nested: Inner,
+        cells: Vec<Vec<i32>>,
+        complex: Vec<Complex64>,
+        // The empty cases carry their own history: the two emitters described an
+        // empty `Vec` with different MATLAB dimensions (`0x0` against `0x1`) and
+        // nothing caught it, because this comparison held no empty value.
+        empty_vector: Vec<f64>,
+        empty_ints: Vec<i32>,
+        empty_flags: Vec<bool>,
+        empty_text: String,
+        empty_cells: Vec<Vec<i32>>,
+        // A `Matrix` reaches an emit arm of its own, and only one of the two was
+        // converted to the empty marker. The non-square case is the one that
+        // pins the dims: a `0x0` marker would still match if both sides
+        // collapsed every empty matrix to `0x0`.
+        empty_matrix: Matrix<f64>,
+        empty_matrix_cols: Matrix<f64>,
+        absent: Option<f64>,
+        nothing: (),
+    }
+    #[derive(Serialize)]
+    struct Inner {
+        flag: bool,
+        count: u32,
+    }
+
+    let value = Every {
+        scalar: 1.5,
+        vector: vec![1, 2, 3],
+        text: "hello".to_string(),
+        matrix: Matrix::from_row_major(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
+        nested: Inner {
+            flag: true,
+            count: 7,
+        },
+        cells: vec![vec![1], vec![2, 3]],
+        complex: vec![Complex64::new(1.0, -1.0)],
+        empty_vector: Vec::new(),
+        empty_ints: Vec::new(),
+        empty_flags: Vec::new(),
+        empty_text: String::new(),
+        empty_cells: Vec::new(),
+        empty_matrix: Matrix::from_row_major(0, 0, Vec::new()),
+        empty_matrix_cols: Matrix::from_row_major(0, 3, Vec::new()),
+        absent: None,
+        nothing: (),
+    };
+
+    let plain = mat::to_bytes(&value).unwrap();
+    let explicit = mat::to_bytes_with_options(&value, &mat::Options::default()).unwrap();
+    assert_eq!(
+        plain, explicit,
+        "to_bytes and to_bytes_with_options(&Options::default()) must agree byte for byte"
+    );
+
+    // And the shared result is the format MATLAB's `load` can read.
+    let sig = plain
+        .windows(8)
+        .position(|w| w == b"\x89HDF\r\n\x1a\n")
+        .expect("the file carries an HDF5 signature");
+    assert_eq!(plain[sig + 8], 2, "version 2 superblock");
+}
+
+/// The streaming entry points are a third and fourth copy of the same decision.
+#[test]
+fn the_streaming_emit_paths_match_the_buffered_ones() {
+    #[derive(Serialize)]
+    struct Small {
+        values: Vec<f64>,
+        label: String,
+    }
+    let value = Small {
+        values: vec![1.0, 2.0, 3.0],
+        label: "demo".to_string(),
+    };
+
+    let buffered = mat::to_bytes(&value).unwrap();
+    let mut streamed = Vec::new();
+    mat::to_writer(&value, &mut streamed).unwrap();
+    assert_eq!(buffered, streamed, "to_bytes and to_writer must agree");
+
+    let mut streamed_opts = Vec::new();
+    mat::to_writer_with_options(&value, &mat::Options::default(), &mut streamed_opts).unwrap();
+    assert_eq!(
+        buffered, streamed_opts,
+        "to_writer_with_options(&Options::default()) must agree too"
+    );
 }

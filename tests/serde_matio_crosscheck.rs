@@ -938,7 +938,8 @@ fn empty_struct_array_agrees_with_matio_and_across_both_emitters() {
     // The empty marker itself: zero-element dataset, MATLAB `[0, 0]`, tagged.
     let f = hdf5_pure::File::open(&path).unwrap();
     let ds = f.dataset("maybe").unwrap();
-    assert_eq!(ds.shape().unwrap(), vec![0, 0]);
+    assert_eq!(ds.shape().unwrap(), vec![2]);
+    assert_eq!(ds.read_u64().unwrap(), vec![0, 0]);
     let attrs = ds.attrs().unwrap();
     assert_eq!(
         attrs
@@ -956,28 +957,23 @@ fn empty_struct_array_agrees_with_matio_and_across_both_emitters() {
     assert_eq!(mf.read("tail").unwrap().scalar_i32(), 7);
 
     // Pin the geometry matio reports, which the class assertion above does not
-    // cover. Under the zero-element encoding the payload is empty rather than a
-    // dims vector, so matio recovers no dimensions and reports rank 0 with no
-    // elements. That is also what it reports for MATLAB's own empty variables
-    // (see `matlab_fixtures/empty_variants.mat`), so it is the encoding agreeing
-    // with MATLAB rather than a defect. It does mean MATLAB-side emptiness should
-    // be tested with `isempty(fieldnames(x))` rather than a bare `isempty(x)`,
-    // which is what `matlab_fixtures/verify.m` asserts.
-    // Under the zero-element encoding the payload is empty rather than a dims
-    // vector, so matio recovers no dimensions: rank 0, no dims, and therefore an
-    // element count of 1 (the empty product), not 0. It reports the same for
-    // MATLAB's own empty variables (see `matlab_fixtures/empty_variants.mat`), so
-    // this is the encoding agreeing with MATLAB rather than a defect.
+    // cover — and which is the real reason the data-as-dims encoding is the
+    // default. Under it the payload *is* the dims vector, so the reference
+    // library recovers the shape and reports zero elements.
     //
-    // It is also precisely why MATLAB-side emptiness must be tested with
-    // `isempty(fieldnames(x))` and not a bare `isempty(x)`: a reader that trusts
-    // the element count sees one element here. `matlab_fixtures/verify.m` asserts
-    // the `fieldnames` form, and the docs promise only that.
-    assert_eq!((var.rank(), var.dims(), var.nelements()), (0, vec![], 1));
+    // The zero-element encoding this replaced left the payload empty, and matio
+    // then recovered nothing: rank 0, no dims, and an element count of 1 (the
+    // empty product) for a value that is empty. That is what forced MATLAB-side
+    // emptiness to be tested with `isempty(fieldnames(x))` rather than a bare
+    // `isempty(x)`, since a reader trusting the count saw one element.
+    assert_eq!(
+        (var.rank(), var.dims(), var.nelements()),
+        (2, vec![0, 0], 0)
+    );
 
-    // And the marker's element type is the one matio itself writes. matio uses
-    // the data-as-dims encoding, where the payload is the dims vector, so the
-    // shapes differ by construction; the element type is the shared part.
+    // And the marker matches what matio itself writes, in every part: matio uses
+    // the data-as-dims encoding too, so the shape and payload now agree rather
+    // than only the element type.
     let theirs = dir.path().join("matio_empty.mat");
     {
         let g = MatFile::create_v73(&theirs);
@@ -985,6 +981,8 @@ fn empty_struct_array_agrees_with_matio_and_across_both_emitters() {
     }
     let tf = hdf5_pure::File::open(&theirs).unwrap();
     let their_ds = tf.dataset("maybe").unwrap();
+    assert_eq!(their_ds.shape().unwrap(), ds.shape().unwrap());
+    assert_eq!(their_ds.read_u64().unwrap(), ds.read_u64().unwrap());
     assert_eq!(their_ds.dtype().unwrap(), ds.dtype().unwrap());
 }
 

@@ -515,6 +515,12 @@ builder.add_group(grp.finish());
 With the `serde` feature, Rust structs can be serialized directly to `.mat`
 v7.3 files and back:
 
+> These files are written in the HDF5 1.8 on-disk format, which every MATLAB
+> release can open. A version 3 superblock is an HDF5 1.10 addition, and MATLAB
+> used HDF5 1.8.12 before R2021b, so the newer format is unreadable there. Set
+> `mat::Options::libver` to `LibVer::V110` to opt into it, which compression
+> requires. See [MATLAB interop](docs/interop/matlab.md).
+
 ```rust
 use hdf5_pure::mat::{self, Complex64, Matrix};
 use serde::{Serialize, Deserialize};
