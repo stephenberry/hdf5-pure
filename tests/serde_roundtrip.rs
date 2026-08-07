@@ -1747,6 +1747,17 @@ fn both_emit_paths_produce_the_same_bytes() {
         nested: Inner,
         cells: Vec<Vec<i32>>,
         complex: Vec<Complex64>,
+        // The empty cases carry their own history: the two emitters described an
+        // empty `Vec` with different MATLAB dimensions (`0x0` against `0x1`) and
+        // nothing caught it, because this comparison held no empty value. Every
+        // shape of emptiness the writers treat separately belongs here.
+        empty_vector: Vec<f64>,
+        empty_ints: Vec<i32>,
+        empty_flags: Vec<bool>,
+        empty_text: String,
+        empty_cells: Vec<Vec<i32>>,
+        absent: Option<f64>,
+        nothing: (),
     }
     #[derive(Serialize)]
     struct Inner {
@@ -1765,6 +1776,13 @@ fn both_emit_paths_produce_the_same_bytes() {
         },
         cells: vec![vec![1], vec![2, 3]],
         complex: vec![Complex64::new(1.0, -1.0)],
+        empty_vector: Vec::new(),
+        empty_ints: Vec::new(),
+        empty_flags: Vec::new(),
+        empty_text: String::new(),
+        empty_cells: Vec::new(),
+        absent: None,
+        nothing: (),
     };
 
     let plain = mat::to_bytes(&value).unwrap();

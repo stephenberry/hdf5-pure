@@ -497,7 +497,11 @@ fn apply_char_string(ds: &mut DatasetBuilder, s: &str) {
             &[0, 0],
         );
         set_class(ds, MatClass::Char);
-        set_char_decode(ds);
+        // No `MATLAB_int_decode`: it says how to read the stored integers back as
+        // characters, and an empty marker's payload is a `uint64` dimension vector
+        // rather than character data. MATLAB writes the attribute on every
+        // non-empty `char` and on no empty one; the fixtures in
+        // `tests/fixtures/mat_real` carry 167 of the first and 55 of the second.
         ds.set_attr("MATLAB_empty", AttrValue::U32(1));
         return;
     }

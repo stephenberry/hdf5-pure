@@ -2,7 +2,8 @@
 //! Tests for the new `to_bytes_with_options` / `to_file_with_options` API.
 
 use hdf5_pure::mat::{
-    self, Compression, EmptyMarkerEncoding, InvalidNamePolicy, Options, StringClass,
+    self, Compression, EmptyMarkerEncoding, InvalidNamePolicy, OneDimensionalMode, Options,
+    StringClass,
 };
 use hdf5_pure::{AttrValue, File, LibVer};
 use serde::{Deserialize, Serialize};
@@ -150,10 +151,36 @@ fn data_as_dims_empty_marker_encoding() {
         other => panic!("unexpected: {other:?}"),
     };
     assert_eq!(empty, 1);
-    // data-as-dims encoding stores the dimension vector as the data. Under
-    // the default ColumnVector mode an empty `Vec<f64>` has MATLAB shape
-    // `[0, 1]`, so the data-as-dims payload is `[0, 1]`.
+    // The data-as-dims encoding stores the dimension vector as the data. An
+    // empty vector is `0x0` — MATLAB's `[]` — under either 1-D mode, because the
+    // mode orients a vector and an empty one has no orientation to preserve.
+    // Counted across the MATLAB-authored fixtures, `double` empties are `0x0`
+    // 47 times against `0x1` once.
     let data = ds.read_u64().unwrap();
-    assert_eq!(data, vec![0, 1]);
+    assert_eq!(data, vec![0, 0]);
     std::fs::remove_file(path).unwrap();
+}
+
+/// The 1-D mode does not change an empty value's shape, so asking for the other
+/// mode cannot resurrect the `0x1` this used to write.
+#[test]
+fn the_one_dimensional_mode_does_not_orient_an_empty_value() {
+    #[derive(Serialize)]
+    struct OnlyEmpty {
+        v: Vec<f64>,
+    }
+    for mode in [
+        OneDimensionalMode::ColumnVector,
+        OneDimensionalMode::RowVector,
+    ] {
+        let mut opts = Options::default();
+        opts.one_dimensional_mode = mode;
+        let bytes = mat::to_bytes_with_options(&OnlyEmpty { v: Vec::new() }, &opts).unwrap();
+        let f = File::from_bytes(bytes).unwrap();
+        assert_eq!(
+            f.dataset("v").unwrap().read_u64().unwrap(),
+            vec![0, 0],
+            "{mode:?} must still describe the empty value as 0x0"
+        );
+    }
 }

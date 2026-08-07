@@ -460,7 +460,7 @@ impl MatBuilder {
         data: &[u8],
     ) -> Result<&mut Self, MatError> {
         if data.is_empty() {
-            return self.write_empty_with_decode(name, MatClass::Logical, matlab_dims, Some(1));
+            return self.write_empty(name, MatClass::Logical, matlab_dims);
         }
         self.write_array_inner(
             name,
@@ -479,7 +479,7 @@ impl MatBuilder {
     pub fn write_char(&mut self, name: &str, value: &str) -> Result<&mut Self, MatError> {
         let units = utf16::encode_utf16(value);
         if units.is_empty() {
-            return self.write_empty_with_decode(name, MatClass::Char, &[0, 0], Some(2));
+            return self.write_empty(name, MatClass::Char, &[0, 0]);
         }
         let n = units.len() as u64;
         let target = self.resolve_target(name)?;
@@ -606,7 +606,7 @@ impl MatBuilder {
 
         let blocking = plan_blocking(total_elements(matlab_dims), T::ELEMENT_SIZE)?;
         if blocking.block_count == 0 {
-            return self.write_empty_with_decode(name, T::CLASS, matlab_dims, T::INT_DECODE);
+            return self.write_empty(name, T::CLASS, matlab_dims);
         }
 
         // `storage_dims_u64`, not the stack-buffer form the slice writers use:
@@ -695,31 +695,19 @@ impl MatBuilder {
 
     /// Write an empty marker for the given class. `matlab_dims` is the
     /// MATLAB-shape (e.g. `[0, 0]`).
+    ///
+    /// An empty marker carries `MATLAB_class` and `MATLAB_empty` and nothing
+    /// else. In particular it carries no `MATLAB_int_decode`, which says how to
+    /// read stored integers back as `char` or `logical` values and so has nothing
+    /// to describe here: the payload is a `uint64` dimension vector, not data of
+    /// the marked class. Of the 352 empty datasets in the MATLAB-authored
+    /// fixtures under `tests/fixtures/mat_real`, not one carries it, for any
+    /// class.
     pub fn write_empty(
         &mut self,
         name: &str,
         class: MatClass,
         matlab_dims: &[usize],
-    ) -> Result<&mut Self, MatError> {
-        let int_decode = match class {
-            MatClass::Logical => Some(1),
-            MatClass::Char => Some(2),
-            _ => None,
-        };
-        self.write_empty_with_decode(name, class, matlab_dims, int_decode)
-    }
-
-    /// Write a MATLAB `struct([])` empty marker.
-    pub fn write_empty_struct_array(&mut self, name: &str) -> Result<&mut Self, MatError> {
-        self.write_empty_with_decode(name, MatClass::Struct, &[0, 0], None)
-    }
-
-    fn write_empty_with_decode(
-        &mut self,
-        name: &str,
-        class: MatClass,
-        matlab_dims: &[usize],
-        int_decode: Option<i32>,
     ) -> Result<&mut Self, MatError> {
         let target = self.resolve_target(name)?;
         let encoding = self.options.empty_marker_encoding;
@@ -730,10 +718,12 @@ impl MatBuilder {
             AttrValue::AsciiString(class.as_str().into()),
         );
         ds.set_attr("MATLAB_empty", AttrValue::U32(1));
-        if let Some(d) = int_decode {
-            ds.set_attr("MATLAB_int_decode", AttrValue::I32(d));
-        }
         Ok(self)
+    }
+
+    /// Write a MATLAB `struct([])` empty marker.
+    pub fn write_empty_struct_array(&mut self, name: &str) -> Result<&mut Self, MatError> {
+        self.write_empty(name, MatClass::Struct, &[0, 0])
     }
 
     fn write_array_inner<F>(
@@ -748,7 +738,7 @@ impl MatBuilder {
         F: FnOnce(&mut DatasetBuilder, &[u64]),
     {
         if data_len == 0 {
-            return self.write_empty_with_decode(name, class, matlab_dims, None);
+            return self.write_empty(name, class, matlab_dims);
         }
         let mut storage_buf = [0u64; STORAGE_DIMS_BUF_LEN];
         let storage = storage_dims_u64_into(matlab_dims, &mut storage_buf);
