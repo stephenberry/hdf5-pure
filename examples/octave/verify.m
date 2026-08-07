@@ -11,6 +11,14 @@
 % Note on char: Octave 11's `load` keeps MATLAB_class="char" as `uint16`
 % (the underlying storage class). MATLAB itself returns `char`. The helper
 % `eq_text` normalizes both by flattening to double code units.
+%
+% Note on portability: this script must run under BOTH, and MATLAB is the one
+% that matters -- Octave is the fallback that cannot answer the format question
+% at all (see check_format.m). Octave accepting a line proves nothing about
+% MATLAB, because Octave's function set is a superset: `iscomplex` is Octave-only
+% and stopped this script dead at complex.mat the first time it was run under
+% real MATLAB, having "passed" under Octave since it was written. Use `~isreal`,
+% and prefer any spelling both accept.
 
 is_truey = @(x) (islogical(x) && logical(x)) || (isnumeric(x) && x == 1);
 is_falsy = @(x) (islogical(x) && ~logical(x)) || (isnumeric(x) && x == 0);
@@ -83,7 +91,7 @@ clearvars -except is_truey is_falsy as_codes eq_text
 
 fprintf('=== complex.mat ===\n');
 load complex.mat
-ok(iscomplex(z), 'z is complex');
+ok(~isreal(z), 'z is complex');
 ok(z == complex(1.0, -2.0), 'z value');
 expected_signal = [complex(1,0); complex(0,1); complex(-1,0); complex(0,-1)];
 ok(isequal(signal, expected_signal), 'signal');
@@ -102,7 +110,7 @@ ok(trial == uint32(42), 'trial');
 ok(is_truey(active), 'active == 1');
 ok(numel(samples) == 8, 'samples length');
 ok(isequal(size(result), [2 3]), 'result size 2x3');
-ok(iscomplex(signal) && numel(signal) == 3, 'signal complex 3-vec');
+ok(~isreal(signal) && numel(signal) == 3, 'signal complex 3-vec');
 ok(eq_text(phase, 'Done'), 'phase');
 ok(isstruct(config) && eq_text(config.tag, 'ship_it'), 'config.tag');
 ok(eq_text(note, 'looks good'), 'note');
@@ -224,19 +232,19 @@ clearvars -except is_truey is_falsy as_codes eq_text
 
 fprintf('=== complex_edges.mat ===\n');
 load complex_edges.mat
-ok(iscomplex(z_nan), 'z_nan is complex');
+ok(~isreal(z_nan), 'z_nan is complex');
 ok(isnan(real(z_nan)) && imag(z_nan) == 0, 'z_nan real is NaN');
-ok(iscomplex(z_inf), 'z_inf is complex');
+ok(~isreal(z_inf), 'z_inf is complex');
 ok(isinf(real(z_inf)) && real(z_inf) > 0, 'z_inf real is +Inf');
 ok(isinf(imag(z_inf)) && imag(z_inf) < 0, 'z_inf imag is -Inf');
 ok(z_zero == 0, 'z_zero == 0');
 ok(real(z_pure_imag) == 0 && imag(z_pure_imag) == 2.5, 'z_pure_imag');
 ok(real(z_pure_real) == 3.5 && imag(z_pure_real) == 0, 'z_pure_real');
 % Octave 11 v7.3 loader loses the single class (real MATLAB preserves it).
-ok(iscomplex(z32), 'z32 is complex');
+ok(~isreal(z32), 'z32 is complex');
 ok(double(real(z32)) == 1.25 && double(imag(z32)) == -0.5, 'z32 values');
 ok(numel(z32_vec) == 3, 'z32_vec length');
-ok(iscomplex(z32_vec), 'z32_vec is complex');
+ok(~isreal(z32_vec), 'z32_vec is complex');
 ok(isequal(size(cmat), [2 2]), 'cmat size');
 ok(isequal(cmat, [1 2; 3 4]), 'cmat values');
 clearvars -except is_truey is_falsy as_codes eq_text

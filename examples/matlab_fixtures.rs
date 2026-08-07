@@ -382,11 +382,11 @@ fn write_complex(dir: &Path) {
     announce(
         "complex.mat",
         &[
-            "assert(iscomplex(z), 'z is complex')",
+            "assert(~isreal(z), 'z is complex')",
             "assert(z == complex(1.0, -2.0), 'z value')",
             "assert(isequal(signal, [complex(1,0); complex(0,1); complex(-1,0); complex(0,-1)]), 'signal')",
             "assert(isa(samples_i16, 'int16'), 'samples_i16 class')",
-            "assert(iscomplex(samples_i16), 'samples_i16 is complex')",
+            "assert(~isreal(samples_i16), 'samples_i16 is complex')",
             "assert(isequal(samples_i16, [complex(int16(-32768), int16(32767)); complex(int16(0), int16(-1)); complex(int16(1234), int16(-4321))]), 'samples_i16 values')",
             "disp('complex.mat OK')",
         ],
@@ -468,7 +468,7 @@ fn write_everything(dir: &Path) {
             "assert(numel(samples) == 8, 'samples length')",
             "assert(isequal(size(result), [2 3]), 'result size')",
             "assert(numel(signal) == 3, 'signal length')",
-            "assert(iscomplex(signal), 'signal is complex')",
+            "assert(~isreal(signal), 'signal is complex')",
             "assert(strcmp(phase, 'Done'), 'phase')",
             "assert(isstruct(config), 'config is struct')",
             "assert(strcmp(config.tag, 'ship_it'), 'config.tag')",
