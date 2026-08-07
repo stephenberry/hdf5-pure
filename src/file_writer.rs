@@ -23,6 +23,7 @@ use crate::chunked_write::{
 use crate::convert::TryToUsize;
 use crate::dataspace::{Dataspace, DataspaceType};
 use crate::error::{FormatError, OBJECT_HEADER_MESSAGE_MAX};
+use crate::file_create_properties::FileCreateProperties;
 use crate::file_space_info::{
     DEFAULT_PAGE_SIZE, DEFAULT_THRESHOLD, FileSpaceInfo, FileSpaceStrategy, NUM_FILE_FSM_MANAGERS,
 };
@@ -82,14 +83,31 @@ pub(crate) fn build_chunked_dataset_oh(
     if let Some(pm) = pipeline_message {
         w.add_message(MessageType::FilterPipeline, pm.to_vec());
     }
-    if let Some(blob) = dense_blob {
-        w.add_message(MessageType::AttributeInfo, blob.attr_info_message.clone());
-    } else {
-        for attr in attrs {
-            w.add_message(MessageType::Attribute, attr.serialize(LENGTH_SIZE));
-        }
-    }
+    add_attributes(&mut w, attrs, dense_blob);
     w.serialize()
+}
+
+/// The superblock version the given on-disk format writes.
+///
+/// Version 3 arrived with HDF5 1.10. Its only difference from version 2 is the
+/// meaning of the file-consistency-flags byte, which 1.10 uses to mark a file
+/// held by a SWMR writer; the two encodings are otherwise identical, so the 1.8
+/// format writes the same fields under the version number a 1.8 library
+/// understands. That byte is why a SWMR writer needs the newer superblock, and
+/// why [`File::open_swmr_writer`](crate::File::open_swmr_writer) requires one.
+pub(crate) fn superblock_version(libver: LibVer) -> u8 {
+    if libver >= LibVer::V110 { 3 } else { 2 }
+}
+
+/// The data-layout message version the given on-disk format emits for a
+/// *contiguous* dataset.
+///
+/// Version 4 arrived with HDF5 1.10, alongside the chunk indices that are its
+/// only substantive addition; for a contiguous dataset the version 3 and version
+/// 4 bodies are byte-identical (address then size), so the 1.8 format writes the
+/// same bytes under the version number a 1.8 library understands.
+pub(crate) fn contiguous_layout_version(libver: LibVer) -> u8 {
+    if libver >= LibVer::V110 { 4 } else { 3 }
 }
 
 pub(crate) fn build_dataset_oh(
@@ -100,6 +118,7 @@ pub(crate) fn build_dataset_oh(
     attrs: &[AttributeMessage],
     dense_blob: Option<&DenseAttrBlob>,
     fill: Option<&[u8]>,
+    libver: LibVer,
 ) -> Result<Vec<u8>, FormatError> {
     let mut w = ObjectHeaderWriter::new();
     w.add_message_with_flags(MessageType::Datatype, dt.serialize(), 0x01);
@@ -110,18 +129,12 @@ pub(crate) fn build_dataset_oh(
         0x01,
     );
     let mut dl = Vec::new();
-    dl.push(4); // version
+    dl.push(contiguous_layout_version(libver));
     dl.push(1); // class = contiguous
     dl.extend_from_slice(&data_addr.to_le_bytes());
     dl.extend_from_slice(&data_size.to_le_bytes());
     w.add_message(MessageType::DataLayout, dl);
-    if let Some(blob) = dense_blob {
-        w.add_message(MessageType::AttributeInfo, blob.attr_info_message.clone());
-    } else {
-        for attr in attrs {
-            w.add_message(MessageType::Attribute, attr.serialize(LENGTH_SIZE));
-        }
-    }
+    add_attributes(&mut w, attrs, dense_blob);
     w.serialize()
 }
 
@@ -147,14 +160,29 @@ pub(crate) fn build_group_oh(
     for link in links {
         w.add_message(MessageType::Link, link.serialize(OFFSET_SIZE));
     }
+    add_attributes(&mut w, attrs, dense_blob);
+    w.serialize()
+}
+
+/// Add an object's attribute storage to its header: either the Attribute Info
+/// message naming a pre-built fractal heap, or the inline Attribute messages
+/// preceded by the compact-storage Attribute Info message that lets the
+/// reference library count them (see [`compact_attribute_info_message`]).
+fn add_attributes(
+    w: &mut ObjectHeaderWriter,
+    attrs: &[AttributeMessage],
+    dense_blob: Option<&DenseAttrBlob>,
+) {
     if let Some(blob) = dense_blob {
         w.add_message(MessageType::AttributeInfo, blob.attr_info_message.clone());
     } else {
+        if !attrs.is_empty() {
+            w.add_message(MessageType::AttributeInfo, compact_attribute_info_message());
+        }
         for attr in attrs {
             w.add_message(MessageType::Attribute, attr.serialize(LENGTH_SIZE));
         }
     }
-    w.serialize()
 }
 
 pub(crate) fn make_link(name: &str, addr: u64) -> LinkMessage {
@@ -664,6 +692,25 @@ fn encode_managed_id(offset: u64, length: u64, max_heap_size: u16, id_length: u1
     id
 }
 
+/// The Attribute Info (0x0015) message a version 2 object header needs when its
+/// attributes are stored *compactly*, as inline Attribute messages.
+///
+/// On a version 2 header the reference C library does not count attribute
+/// messages to answer `H5Oget_info().num_attrs`; it reads the Attribute Info
+/// message and, finding an undefined fractal-heap address there, falls back to
+/// the header's own attribute-message tally (`H5A__get_ainfo`, `H5Aint.c`). With
+/// no Attribute Info message at all, `H5O__attr_count_real` reports zero — while
+/// `H5Aiterate` and `H5Aopen_by_name` still find every attribute. Tools that size
+/// their work by the count then skip the attributes silently: `h5repack` copies
+/// such an object with none of them.
+///
+/// So the message is emitted for a compactly-stored attribute set too, with both
+/// addresses undefined, which is what the C library and h5py write in the same
+/// position. An object with no attributes gets no message, again matching them.
+pub(crate) fn compact_attribute_info_message() -> Vec<u8> {
+    serialize_attribute_info(u64::MAX, u64::MAX)
+}
+
 fn serialize_attribute_info(fh_addr: u64, btree_name_addr: u64) -> Vec<u8> {
     let mut data = Vec::new();
     data.push(0); // version
@@ -740,37 +787,57 @@ impl FileWriter {
     }
 
     /// Constrain the on-disk format version of the file, mirroring HDF5's
-    /// `H5Pset_libver_bounds`. The produced file must fall within `[low, high]`;
-    /// otherwise [`finish`](Self::finish) fails with
+    /// `H5Pset_libver_bounds`. The file is written in the newest format the
+    /// bounds allow, between [`LibVer::WRITER_OLDEST`] and
+    /// [`LibVer::WRITER_DEFAULT`]; bounds that leave no such format fail with
     /// [`FormatError::LibverBoundsUnsatisfiable`].
     ///
-    /// This crate's writer emits exactly one format — the version 3 superblock
-    /// introduced in HDF5 1.10 ([`LibVer::WRITER_OUTPUT`]) — so this is an
-    /// assertion guard rather than a format selector: it lets a caller demand
-    /// compatibility (and get a loud error if it cannot be met) instead of
-    /// discovering an incompatible file downstream. Leaving this unset places no
-    /// constraint. Bounds that straddle 1.10 (e.g. `Earliest..=Latest`) are
-    /// accepted; an upper bound older than 1.10, or a lower bound newer than it,
-    /// is rejected.
+    /// `high` is what selects the format, so `Earliest..=V18` writes the 1.8
+    /// format and anything reaching 1.10 or beyond writes the 1.10 one. This
+    /// differs from the C library, which picks the *oldest* format the content
+    /// needs and treats `low` as the floor; the difference shows on
+    /// `Earliest..=Latest`, where `H5Fcreate` writes a version 0 superblock and
+    /// this writes a version 3 one. Leaving the bounds unset is the same as
+    /// leaving `high` at `Latest`.
+    ///
+    /// Some content cannot be written in the 1.8 format at all, and asking for
+    /// both is an error rather than a silent upgrade: a chunked (or resizable,
+    /// or filtered) dataset needs the version 4 data-layout message and the
+    /// chunk indices that came with 1.10, and a file-space setting — a strategy
+    /// or a page size — needs the File Space Info message. Both report
+    /// [`FormatError::LibverTooOldForContent`].
     pub fn with_libver_bounds(&mut self, low: LibVer, high: LibVer) -> &mut Self {
         self.libver_bounds = Some((low, high));
         self
     }
 
-    /// Validate the requested [`libver_bounds`](Self::libver_bounds) against the
-    /// format this writer actually produces.
-    fn check_libver_bounds(&self) -> Result<(), FormatError> {
-        if let Some((low, high)) = self.libver_bounds {
-            let produced = LibVer::WRITER_OUTPUT;
-            if produced < low || produced > high {
-                return Err(FormatError::LibverBoundsUnsatisfiable {
-                    writes: produced.name(),
-                    requested_low: low.name(),
-                    requested_high: high.name(),
-                });
-            }
-        }
-        Ok(())
+    /// Replace *every* file-creation property with what `properties` carries,
+    /// including the ones it leaves unset — handing over a property list is
+    /// asking for it to define the creation properties in full, which is what
+    /// [`FileBuilder::with_create_properties`] documents.
+    ///
+    /// Written as one assignment per field rather than as a run of `if let
+    /// Some(..)` calls to the individual setters, because those skip the fields
+    /// the list does not carry: a bound set before the call would survive it and
+    /// go on selecting the on-disk format for a list that names no version at
+    /// all.
+    ///
+    /// [`FileBuilder::with_create_properties`]: crate::FileBuilder::with_create_properties
+    pub(crate) fn apply_create_properties(&mut self, properties: &FileCreateProperties) {
+        self.userblock_size = properties.userblock();
+        self.libver_bounds = properties.libver_bounds();
+        self.file_space_strategy = properties.file_space_strategy();
+        self.file_space_page_size = properties.file_space_page_size();
+    }
+
+    /// The format to write, being the newest this crate produces that the
+    /// requested [`libver_bounds`](Self::libver_bounds) admit.
+    ///
+    /// Resolved once, before any layout work, so every version field in the file
+    /// comes from one decision rather than from each emitter's own reading of the
+    /// bounds.
+    fn resolve_libver(&self) -> Result<LibVer, FormatError> {
+        LibVer::resolve_writable(self.libver_bounds)
     }
 
     /// Set the userblock size in bytes: zero (no userblock), or a power of two of
@@ -837,6 +904,31 @@ impl FileWriter {
     pub fn with_file_space_page_size(&mut self, page_size: u64) -> &mut Self {
         self.file_space_page_size = Some(page_size);
         self
+    }
+
+    /// Whether anything staged needs the 1.10 format, i.e. whether an
+    /// `Earliest..=V18` bound would be refused with
+    /// [`FormatError::LibverTooOldForContent`].
+    ///
+    /// This is the same predicate `finish_to_sink` refuses on — chunked storage,
+    /// which a filter and an unlimited dimension both imply — asked *before* the
+    /// bound is chosen. Repack is the caller: it carries the source file's format
+    /// forward, and needs to know whether the content it staged permits that
+    /// before committing to an answer, since a great many files the C library
+    /// wrote hold chunked datasets under a version 0 or 2 superblock and there is
+    /// no older chunk index this crate can write them back into.
+    pub(crate) fn needs_latest_format(&self) -> bool {
+        fn any_chunked(datasets: &[DatasetBuilder]) -> bool {
+            datasets.iter().any(|d| {
+                d.chunk_options.is_chunked() || d.maxshape.is_some() || d.raw_chunks.is_some()
+            })
+        }
+        fn group_needs(group: &FinishedGroup) -> bool {
+            any_chunked(&group.datasets) || group.sub_groups.iter().any(group_needs)
+        }
+        self.file_space_info().is_some()
+            || any_chunked(&self.root_datasets)
+            || self.groups.iter().any(group_needs)
     }
 
     /// Reject file-space settings this writer cannot reproduce yet.
@@ -908,7 +1000,24 @@ impl FileWriter {
     /// produce byte-identical files. A streamed dataset's chunk bytes are pulled
     /// from its provider one chunk at a time here, never all held at once.
     pub(crate) fn finish_to_sink<S: ByteSink>(self, sink: &mut S) -> Result<(), FormatError> {
-        self.check_libver_bounds()?;
+        let libver = self.resolve_libver()?;
+
+        // File-space settings are recorded in a File Space Info message, which
+        // arrived with HDF5 1.10. Refused beside the bounds themselves rather
+        // than where the message is emitted, so the answer does not depend on
+        // how far into the layout the writer got.
+        //
+        // Asked of `file_space_info` rather than of the strategy field, because
+        // that is the one function that decides whether the message is written:
+        // a page size with no strategy emits one too, and testing the strategy
+        // alone let exactly that case through.
+        if self.file_space_info().is_some() && libver < LibVer::V110 {
+            return Err(FormatError::LibverTooOldForContent {
+                content: "a file-space setting",
+                needs: LibVer::V110.name(),
+                writing: libver.name(),
+            });
+        }
 
         // The userblock's size is what the superblock's base address is, and the
         // format defines it as zero or a power of two of at least 512 bytes. A
@@ -1511,6 +1620,23 @@ impl FileWriter {
             .map(|d| d.chunk_options.is_chunked() || d.maxshape.is_some() || d.raw_chunks.is_some())
             .collect();
 
+        // Chunked storage here means a version 4 data-layout message and one of
+        // the chunk indices HDF5 1.10 introduced (extensible array, fixed array,
+        // single chunk, implicit). The 1.8 format indexes chunks with a version 1
+        // B-tree instead, which this crate reads but does not write, so there is
+        // no older encoding to fall back to. Refused as soon as the flattened
+        // datasets are known, which is still before any byte reaches the sink.
+        //
+        // A filter or an unlimited dimension arrives here too: both require
+        // chunked storage, so `is_chunked` already covers them.
+        if libver < LibVer::V110 && is_chunked.iter().any(|&c| c) {
+            return Err(FormatError::LibverTooOldForContent {
+                content: "a chunked, filtered, or resizable dataset",
+                needs: LibVer::V110.name(),
+                writing: libver.name(),
+            });
+        }
+
         // A chunked/filtered/resizable variable-length dataset's element
         // references are split into chunks (and compressed) below, before the
         // file layout that would normally fix its global-heap addresses. Placing
@@ -1738,6 +1864,7 @@ impl FileWriter {
                     &d.attrs,
                     dense_blob.as_ref(),
                     d.fill.as_deref(),
+                    libver,
                 )?
             };
             actual_ds_oh_sizes.push(oh.len());
@@ -2186,6 +2313,7 @@ impl FileWriter {
                         &d.attrs,
                         ds_dense_blobs[i].as_ref(),
                         d.fill.as_deref(),
+                        libver,
                     )?
                 };
                 ds_oh_bytes.push(oh);
@@ -2243,7 +2371,7 @@ impl FileWriter {
             sink.reserve(eof_addr2.to_usize()?);
             Self::put_userblock(sink, ub, &self.userblock_content)?;
             let sb = Superblock {
-                version: 3,
+                version: superblock_version(libver),
                 offset_size: OFFSET_SIZE,
                 length_size: LENGTH_SIZE,
                 base_address: base,
@@ -2517,6 +2645,7 @@ impl FileWriter {
                     &d.attrs,
                     ds_dense_blobs[i].as_ref(),
                     d.fill.as_deref(),
+                    libver,
                 )?
             };
             ds_oh_bytes2.push(oh);
@@ -2542,7 +2671,7 @@ impl FileWriter {
         Self::put_userblock(sink, ub, &self.userblock_content)?;
 
         let sb = Superblock {
-            version: 3,
+            version: superblock_version(libver),
             offset_size: OFFSET_SIZE,
             length_size: LENGTH_SIZE,
             base_address: ub as u64,
@@ -2948,11 +3077,19 @@ mod tests {
         let addr = resolve_path_any(&bytes, &sb, "data").unwrap();
         let hdr =
             ObjectHeader::parse(&bytes, addr as usize, sb.offset_size, sb.length_size).unwrap();
-        assert!(
-            !hdr.messages
-                .iter()
-                .any(|m| m.msg_type == MessageType::AttributeInfo)
-        );
+        // The Attribute Info message is present but names no fractal heap: that
+        // is what tells the reference library the attributes are the header's own
+        // inline messages, and how many there are.
+        let info = hdr
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::AttributeInfo)
+            .map(|m| {
+                crate::attribute_info::AttributeInfoMessage::parse(&m.data, sb.offset_size).unwrap()
+            })
+            .expect("a compact attribute set still carries an Attribute Info message");
+        assert_eq!(info.fractal_heap_address, None);
+        assert_eq!(info.btree_name_index_address, None);
         let attrs = crate::attribute::extract_attributes(&hdr, sb.length_size).unwrap();
         assert_eq!(attrs.len(), 5);
     }
@@ -3664,5 +3801,168 @@ mod tests {
             .create_dataset("x")
             .with_vlen_sequence_elements(dt, &[VlStringElement::Bytes(b"hi".to_vec())]);
         assert!(matches!(res, Err(FormatError::TypeMismatch { .. })));
+    }
+
+    // ---- library-version bounds select the on-disk format ----
+
+    /// A one-dataset file written under `bounds`.
+    fn write_bounded(bounds: Option<(LibVer, LibVer)>) -> Result<Vec<u8>, FormatError> {
+        let mut fw = FileWriter::new();
+        if let Some((low, high)) = bounds {
+            fw.with_libver_bounds(low, high);
+        }
+        fw.create_dataset("values").with_f64_data(&[1.0, 2.0, 3.0]);
+        fw.finish()
+    }
+
+    /// The version byte of `path`'s data-layout message.
+    ///
+    /// Read out of the object header rather than inferred from the superblock:
+    /// the two are set from one resolved format, and a test that derived one from
+    /// the other could not tell whether they had come apart.
+    fn layout_message_version(bytes: &[u8], path: &str) -> u8 {
+        let sig = signature::find_signature(bytes).unwrap();
+        let sb = Superblock::parse(bytes, sig).unwrap();
+        let addr = resolve_path_any(bytes, &sb, path).unwrap();
+        let oh = ObjectHeader::parse(bytes, addr as usize, sb.offset_size, sb.length_size).unwrap();
+        oh.messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::DataLayout)
+            .expect("a dataset carries a data-layout message")
+            .data[0]
+    }
+
+    /// `high` selects the format, and every version field in the file follows
+    /// that one decision.
+    #[test]
+    fn libver_bounds_select_the_superblock_and_layout_versions() {
+        for (bounds, superblock, layout) in [
+            (None, 3, 4),
+            (Some((LibVer::Earliest, LibVer::LATEST)), 3, 4),
+            (Some((LibVer::Earliest, LibVer::V110)), 3, 4),
+            (Some((LibVer::V110, LibVer::LATEST)), 3, 4),
+            (Some((LibVer::Earliest, LibVer::V18)), 2, 3),
+            (Some((LibVer::V18, LibVer::V18)), 2, 3),
+        ] {
+            let bytes = write_bounded(bounds).expect("these bounds are satisfiable");
+            let sig = signature::find_signature(&bytes).unwrap();
+            assert_eq!(
+                bytes[sig + 8],
+                superblock,
+                "superblock version under bounds {bounds:?}"
+            );
+            assert_eq!(
+                layout_message_version(&bytes, "values"),
+                layout,
+                "data-layout message version under bounds {bounds:?}"
+            );
+        }
+    }
+
+    /// A version 2 superblock and a version 3 contiguous layout message are the
+    /// only differences, so the 1.8 file is otherwise the 1.10 file byte for
+    /// byte. Stated as a test because it is what makes the older format cheap:
+    /// were the bodies to diverge, this would fail rather than quietly emit a
+    /// second layout to keep in sync.
+    #[test]
+    fn the_two_formats_differ_only_in_their_version_bytes() {
+        let newer = write_bounded(Some((LibVer::Earliest, LibVer::V110))).unwrap();
+        let older = write_bounded(Some((LibVer::Earliest, LibVer::V18))).unwrap();
+        assert_eq!(newer.len(), older.len(), "the two formats differ in size");
+
+        let differing: Vec<usize> = (0..newer.len()).filter(|&i| newer[i] != older[i]).collect();
+        let sig = signature::find_signature(&newer).unwrap();
+
+        // Ten bytes, and every one of them accounted for: the superblock's
+        // version byte and the four-byte checksum covering it, the layout
+        // message's version byte, and the four-byte checksum of the object header
+        // holding it. Any eleventh byte means a body diverged, which is the thing
+        // worth failing over.
+        assert_eq!(
+            differing.len(),
+            10,
+            "expected two version bytes and the two checksums over them, got {differing:?}"
+        );
+        assert_eq!(
+            &differing[..5],
+            &[sig + 8, sig + 44, sig + 45, sig + 46, sig + 47],
+            "the superblock version byte and its checksum must be the first to differ"
+        );
+        assert_eq!(
+            newer[differing[5]], 4,
+            "the sixth differing byte is the data-layout message version"
+        );
+        assert_eq!(older[differing[5]], 3);
+        let trailing = &differing[6..];
+        assert!(
+            trailing[0] > differing[5] && trailing.windows(2).all(|w| w[1] == w[0] + 1),
+            "the last four differing bytes must be the contiguous checksum trailing \
+             the object header that holds the layout message, got {differing:?}"
+        );
+    }
+
+    #[test]
+    fn bounds_admitting_no_format_this_crate_writes_are_refused() {
+        for (low, high) in [
+            (LibVer::Earliest, LibVer::Earliest),
+            (LibVer::V112, LibVer::LATEST),
+        ] {
+            let err = write_bounded(Some((low, high))).unwrap_err();
+            assert!(
+                matches!(err, FormatError::LibverBoundsUnsatisfiable { .. }),
+                "bounds [{}, {}] gave {err:?}",
+                low.name(),
+                high.name()
+            );
+        }
+    }
+
+    #[test]
+    fn content_the_older_format_cannot_carry_is_refused_not_upgraded() {
+        let mut fw = FileWriter::new();
+        fw.with_libver_bounds(LibVer::Earliest, LibVer::V18);
+        fw.create_dataset("d")
+            .with_i32_data(&(0..100).collect::<Vec<_>>())
+            .with_chunks(&[10]);
+        assert!(matches!(
+            fw.finish().unwrap_err(),
+            FormatError::LibverTooOldForContent { .. }
+        ));
+
+        let mut fw = FileWriter::new();
+        fw.with_libver_bounds(LibVer::Earliest, LibVer::V18);
+        fw.with_file_space_strategy(FileSpaceStrategy::Page, true, 1);
+        fw.create_dataset("d").with_i32_data(&[1]);
+        assert!(matches!(
+            fw.finish().unwrap_err(),
+            FormatError::LibverTooOldForContent { .. }
+        ));
+
+        // A page size on its own emits the same 1.10-only File Space Info
+        // message — `file_space_info` fires on either field — so it takes the
+        // same refusal. The guard used to test the strategy alone and let this
+        // through, writing a version 2 superblock carrying a message that did
+        // not exist before 1.10.
+        let mut fw = FileWriter::new();
+        fw.with_libver_bounds(LibVer::Earliest, LibVer::V18);
+        fw.with_file_space_page_size(4096);
+        fw.create_dataset("d").with_i32_data(&[1]);
+        assert!(matches!(
+            fw.finish().unwrap_err(),
+            FormatError::LibverTooOldForContent { .. }
+        ));
+
+        // An unlimited dimension implies chunked storage, so it takes the same
+        // refusal rather than reaching the chunk writer.
+        let mut fw = FileWriter::new();
+        fw.with_libver_bounds(LibVer::Earliest, LibVer::V18);
+        fw.create_dataset("d")
+            .with_i32_data(&[1, 2, 3])
+            .with_shape(&[3])
+            .with_maxshape(&[u64::MAX]);
+        assert!(matches!(
+            fw.finish().unwrap_err(),
+            FormatError::LibverTooOldForContent { .. }
+        ));
     }
 }

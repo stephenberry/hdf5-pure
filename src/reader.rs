@@ -35,7 +35,7 @@ use crate::object_header::ObjectHeader;
 use crate::signature;
 use crate::source::{
     BaseOffsetSource, BytesSource, MetadataCacheConfig, MetadataCachingSource, ReadSeekSource,
-    Source,
+    Source, frame,
 };
 use crate::superblock::Superblock;
 use crate::vl_data::{self, VlenStringReadOptions};
@@ -97,21 +97,6 @@ impl Source for SourceView<'_> {
     }
 }
 
-/// A base-relative view of an in-memory file: `bytes` with its first `base` bytes
-/// (the userblock) cut off, so every address stored relative to the base address
-/// indexes it directly. The in-memory counterpart of [`BaseOffsetSource`], and the
-/// identity for a plain file.
-fn frame(bytes: &[u8], base: u64) -> Result<&[u8], FormatError> {
-    if base == 0 {
-        return Ok(bytes);
-    }
-    let start = base.to_usize()?;
-    bytes.get(start..).ok_or(FormatError::UnexpectedEof {
-        expected: start,
-        available: bytes.len(),
-    })
-}
-
 /// File-access properties applied when opening an HDF5 file.
 ///
 /// This is the `hdf5-pure` analogue of an HDF5 **file access property list**
@@ -145,6 +130,7 @@ pub struct FileAccessProperties {
     chunk_cache: ChunkCacheConfig,
     locking: FileLocking,
     memory_strategy: Option<MemoryStrategy>,
+    libver_bounds: Option<(LibVer, LibVer)>,
 }
 
 /// Former name of [`FileAccessProperties`].
@@ -162,6 +148,7 @@ impl FileAccessProperties {
             chunk_cache: ChunkCacheConfig::new(),
             locking: FileLocking::Enabled,
             memory_strategy: None,
+            libver_bounds: None,
         }
     }
 
@@ -220,9 +207,45 @@ impl FileAccessProperties {
         self
     }
 
+    /// Constrain the on-disk format an editing session may write, mirroring
+    /// HDF5's `H5Pset_libver_bounds` — which the C library classes as a *file
+    /// access* property for exactly this reason: it governs what a later write
+    /// to an existing file is allowed to add.
+    ///
+    /// Unset by default, which keeps [`File::open_rw`] adding whatever the
+    /// content needs. That default is what lets a file the C library wrote under
+    /// its own bounds be edited at all, but it means a session can add content
+    /// only a newer library can read *without changing the superblock*, and the
+    /// caller has no way to see it happen: adding a chunked, filtered, or
+    /// resizable dataset to an HDF5 1.8 file needs the version 4 data-layout
+    /// message and a 1.10 chunk index, since this crate does not write the
+    /// version 1 B-tree index that 1.8 used.
+    ///
+    /// Setting a `high` below [`LibVer::V110`] refuses that addition with
+    /// [`FormatError::LibverTooOldForContent`](crate::FormatError::LibverTooOldForContent)
+    /// at [`File::commit`] instead — the same refusal
+    /// [`FileBuilder::with_libver_bounds`](crate::FileBuilder::with_libver_bounds)
+    /// gives when writing a whole file, so a `.mat` bounded to 1.8 for MATLAB
+    /// stays loadable by MATLAB after an edit.
+    ///
+    /// The read-only opens ignore this: they write nothing. [`File::open_swmr_writer`]
+    /// requires a version 3 superblock, so it refuses a `high` below
+    /// [`LibVer::V110`] up front rather than accepting a bound it cannot honor.
+    #[doc(alias = "H5Pset_libver_bounds")]
+    pub const fn with_libver_bounds(mut self, low: LibVer, high: LibVer) -> Self {
+        self.libver_bounds = Some((low, high));
+        self
+    }
+
     /// Return the configured streaming metadata cache.
     pub const fn metadata_cache(&self) -> MetadataCacheConfig {
         self.metadata_cache
+    }
+
+    /// Return the configured library-version bounds, or `None` when an editing
+    /// session may write whatever its content needs.
+    pub const fn libver_bounds(&self) -> Option<(LibVer, LibVer)> {
+        self.libver_bounds
     }
 
     /// Return the configured per-dataset chunk cache.
@@ -579,9 +602,12 @@ impl FileInner {
 
     /// Wrap an opened [`WriteEngine`] as a read-write [`Backend::Edit`] file.
     fn from_rw_session(
-        session: WriteEngine,
+        mut session: WriteEngine,
         properties: FileAccessProperties,
     ) -> Result<Self, Error> {
+        // The one funnel every read-write session passes through, so the fapl's
+        // format bound reaches the engine no matter which entry point opened it.
+        session.set_libver_bounds(properties.libver_bounds)?;
         // The engine parsed and normalized this at open; take it rather than
         // re-parsing, so the image need not be able to hand out a slice.
         let superblock = session.superblock().clone();
@@ -612,6 +638,18 @@ impl FileInner {
                 "the SWMR writer always holds the file in a whole-file mirror; leave \
                  MemoryStrategy unset, or pass MemoryStrategy::Auto or MemoryStrategy::Mirrored, \
                  to open it",
+            ));
+        }
+        // A library-version bound below 1.10 is the same shape of unhonorable
+        // guarantee. SWMR needs a version 3 superblock — neither library reads
+        // the SWMR-write flag back on an older one — so a caller asking for the
+        // 1.8 format here is asking for a file this writer cannot produce.
+        if let Some((low, high)) = properties.libver_bounds
+            && LibVer::resolve_writable(Some((low, high))).map_err(Error::Format)? < LibVer::V110
+        {
+            return Err(Error::EditUnsupported(
+                "the SWMR writer requires a version 3 superblock, which is the v1.10 format; \
+                 raise the FileAccessProperties library-version bound to open it",
             ));
         }
         let mut inner = Self::from_rw_session(WriteEngine::open_swmr_writer(path)?, properties)?;

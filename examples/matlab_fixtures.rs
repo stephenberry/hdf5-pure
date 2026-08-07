@@ -46,6 +46,9 @@ fn main() {
     // Cell-array fixtures (Vec<Struct>, Vec<Option<T>> with None, nested).
     write_cells(&out);
 
+    // The on-disk format pair, for `check_format.m`.
+    write_format_control(&out);
+
     copy_octave_helpers(&out);
 
     println!();
@@ -59,19 +62,120 @@ fn main() {
     println!("  $ cd matlab_fixtures && octave --no-gui --eval verify");
 }
 
-/// Copy `verify.m` and `ok.m` from `examples/octave/` next to the fixture
-/// files. Users run `verify` in MATLAB/Octave after `cd`ing into the output
-/// directory — the helper scripts need to be on the path alongside.
+/// The same content in both on-disk formats, for `check_format.m`.
+///
+/// MATLAB linked HDF5 1.8.12 before R2021b, which cannot open the version 3
+/// superblock every release through 0.33.0 wrote. These two files hold
+/// identical content and differ only in that: `format_v18.mat` is the 0.34.0
+/// default and must load, `format_v110.mat` is the old format and is expected
+/// to fail. The second is the control — if it loads too, the superblock version
+/// was not what broke `load`, and only a real MATLAB can tell us that.
+#[derive(Serialize)]
+struct FormatControl {
+    values: Vec<f64>,
+    label: String,
+    count: i32,
+    flag: bool,
+    empty: Vec<f64>,
+    nested: FormatControlInner,
+}
+
+#[derive(Serialize)]
+struct FormatControlInner {
+    a: i32,
+}
+
+fn write_format_control(dir: &Path) {
+    let value = || FormatControl {
+        values: vec![1.0, 2.0, 3.0],
+        label: "demo".to_string(),
+        count: 7,
+        flag: true,
+        empty: Vec::new(),
+        nested: FormatControlInner { a: 5 },
+    };
+
+    // The default since 0.34.0: the HDF5 1.8 format.
+    mat::to_file(&value(), dir.join("format_v18.mat")).unwrap();
+
+    // What every release through 0.33.0 wrote.
+    let mut opts = mat::Options::default();
+    opts.libver = hdf5_pure::LibVer::V110;
+    mat::to_file_with_options(&value(), dir.join("format_v110.mat"), &opts).unwrap();
+
+    // Read the superblock version straight out of the bytes, so the two files
+    // are known to differ before anyone carries them to a MATLAB machine.
+    for (name, expected) in [("format_v18.mat", 2u8), ("format_v110.mat", 3)] {
+        let bytes = std::fs::read(dir.join(name)).unwrap();
+        let sig = bytes
+            .windows(8)
+            .position(|w| w == b"\x89HDF\r\n\x1a\n")
+            .expect("HDF5 signature");
+        let got = bytes[sig + 8];
+        assert_eq!(got, expected, "{name} should carry superblock {expected}");
+        println!("wrote: {name} (superblock {got})");
+    }
+}
+
+/// Copy the MATLAB/Octave scripts from `examples/octave/` next to the fixture
+/// files. Users run `verify` or `check_format` after `cd`ing into the output
+/// directory, so everything they call has to be on the path alongside.
+///
+/// Every predicate `verify.m` uses is a function file listed here rather than an
+/// anonymous function defined inside it, which is what lets the `clearvars`
+/// between fixtures be a bare one — it clears variables, and a function on the
+/// path is not one. The cost is that a helper missing from this list fails at
+/// the first fixture that calls it, on the user's machine, and long after the run
+/// that could have caught it — so this panics on a name it cannot find, and on
+/// any `.m` in the source directory the list forgot. CI runs every example,
+/// which makes both a build failure rather than a surprise on someone else's
+/// MATLAB.
 fn copy_octave_helpers(out: &Path) {
     let src = Path::new("examples/octave");
-    for name in ["verify.m", "ok.m"] {
+    let mut copied = std::collections::BTreeSet::new();
+    for name in [
+        "verify.m",
+        "ok.m",
+        "check_format.m",
+        "mat_isempty.m",
+        "mat_empty_dims.m",
+        "mat_is_empty_struct.m",
+        "is_truey.m",
+        "is_falsy.m",
+        "as_codes.m",
+        "eq_text.m",
+        "has_sign_bit.m",
+    ] {
         let from = src.join(name);
-        if from.exists() {
-            let _ = std::fs::copy(&from, out.join(name));
-        } else {
-            eprintln!("warning: {} not found; skipping", from.display());
-        }
+        assert!(
+            from.exists(),
+            "{name} is listed here but missing from {}",
+            src.display()
+        );
+        std::fs::copy(&from, out.join(name))
+            .unwrap_or_else(|e| panic!("copy {} to {}: {e}", from.display(), out.display()));
+        copied.insert(name);
     }
+
+    // The other direction: a helper added to `examples/octave/` and left off the
+    // list would be missing from every generated fixture directory, and the
+    // failure would land on whoever runs `verify` rather than on whoever added
+    // it. Checked rather than assumed, because that is the mistake this list
+    // invites.
+    let mut missed: Vec<String> = std::fs::read_dir(src)
+        .expect("the examples/octave directory")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".m") && !copied.contains(n.as_str()))
+        .collect();
+    missed.sort();
+    assert!(
+        missed.is_empty(),
+        "{} holds .m files this example does not copy: {}. Add them to the list \
+         above, or every generated fixture directory is missing them.",
+        src.display(),
+        missed.join(", ")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -281,11 +385,13 @@ fn write_options(dir: &Path) {
     announce(
         "options.mat",
         &[
-            "% `absent` is None in Rust → field is not written to the file.",
+            "% `absent` is None in Rust. Under the default NullPolicy::EmptyStructArray",
+            "% it is written as MATLAB struct([]) rather than omitted.",
             "vars = who;",
             "assert(ismember('required', vars), 'required present')",
             "assert(ismember('present', vars), 'present present')",
-            "assert(~ismember('absent', vars), 'absent should be missing')",
+            "assert(ismember('absent', vars), 'absent present as struct([])')",
+            "assert(mat_is_empty_struct(absent), 'absent is struct([])')",
             "assert(required == 1.5, 'required')",
             "assert(strcmp(present, 'yes'), 'present')",
             "disp('options.mat OK')",
@@ -315,11 +421,11 @@ fn write_complex(dir: &Path) {
     announce(
         "complex.mat",
         &[
-            "assert(iscomplex(z), 'z is complex')",
+            "assert(~isreal(z), 'z is complex')",
             "assert(z == complex(1.0, -2.0), 'z value')",
             "assert(isequal(signal, [complex(1,0); complex(0,1); complex(-1,0); complex(0,-1)]), 'signal')",
             "assert(isa(samples_i16, 'int16'), 'samples_i16 class')",
-            "assert(iscomplex(samples_i16), 'samples_i16 is complex')",
+            "assert(~isreal(samples_i16), 'samples_i16 is complex')",
             "assert(isequal(samples_i16, [complex(int16(-32768), int16(32767)); complex(int16(0), int16(-1)); complex(int16(1234), int16(-4321))]), 'samples_i16 values')",
             "disp('complex.mat OK')",
         ],
@@ -401,12 +507,13 @@ fn write_everything(dir: &Path) {
             "assert(numel(samples) == 8, 'samples length')",
             "assert(isequal(size(result), [2 3]), 'result size')",
             "assert(numel(signal) == 3, 'signal length')",
-            "assert(iscomplex(signal), 'signal is complex')",
+            "assert(~isreal(signal), 'signal is complex')",
             "assert(strcmp(phase, 'Done'), 'phase')",
             "assert(isstruct(config), 'config is struct')",
             "assert(strcmp(config.tag, 'ship_it'), 'config.tag')",
             "assert(strcmp(note, 'looks good'), 'note')",
-            "assert(~exist('skipped', 'var'), 'skipped should be absent')",
+            "% Since 0.30 a None field is struct([]) under NullPolicy::EmptyStructArray.",
+            "assert(mat_is_empty_struct(skipped), 'skipped is struct([])')",
             "disp('experiment.mat OK')",
         ],
     );
@@ -771,7 +878,7 @@ fn write_cells(dir: &Path) {
             "assert(points{3}.x == 5.0 && points{3}.y == 6.0, 'points{3}')",
             "assert(iscell(optionals), 'optionals iscell')",
             "assert(numel(optionals) == 3, 'optionals length')",
-            "assert(isstruct(optionals{2}) && isempty(fieldnames(optionals{2})), 'optionals{2} is struct([])')",
+            "assert(mat_is_empty_struct(optionals{2}), 'optionals{2} is struct([])')",
             "assert(optionals{1}.x == 10.0, 'optionals{1}')",
             "assert(optionals{3}.x == 30.0, 'optionals{3}')",
             "assert(iscell(grid), 'grid iscell')",
@@ -779,8 +886,8 @@ fn write_cells(dir: &Path) {
             "assert(iscell(grid{1}), 'grid{1} iscell')",
             "assert(numel(grid{1}) == 2, 'grid{1} length')",
             "assert(grid{1}{1}.x == 100.0, 'grid{1}{1}.x')",
-            "assert(isstruct(grid{1}{2}) && isempty(fieldnames(grid{1}{2})), 'grid{1}{2} is struct([])')",
-            "assert(isstruct(grid{2}{1}) && isempty(fieldnames(grid{2}{1})), 'grid{2}{1} is struct([])')",
+            "assert(mat_is_empty_struct(grid{1}{2}), 'grid{1}{2} is struct([])')",
+            "assert(mat_is_empty_struct(grid{2}{1}), 'grid{2}{1} is struct([])')",
             "assert(grid{2}{2}.x == 200.0, 'grid{2}{2}.x')",
             "assert(iscell(ragged), 'ragged iscell')",
             "assert(numel(ragged) == 2, 'ragged length')",

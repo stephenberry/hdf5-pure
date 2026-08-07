@@ -6,9 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `FileBuilder::with_libver_bounds` selects the on-disk format rather than only validating it: an upper bound of `LibVer::V18` writes the HDF5 1.8 format, and anything reaching 1.10 writes the 1.10 one ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- `FormatError::LibverTooOldForContent` reports content the requested bound cannot express, rather than silently upgrading the file — a chunked, filtered, or resizable dataset, or any file-space setting ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- `FileAccessProperties::with_libver_bounds` holds an editing session to a format, so `File::open_rw` refuses an addition that would make the file need a newer library instead of making it silently ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- `RepackOptions::with_libver_bounds` makes a repack's output format a guarantee. Without it, `repack` now carries the source file's format forward, upgrading only where the content leaves no choice — it used to rewrite every file in the 1.10 format ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- `LibVer::WRITER_OLDEST` names the oldest format the writer produces ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- `mat::Options::libver` sets the newest HDF5 format a `.mat` file may use, defaulting to `LibVer::V18`. `mat::MatError::CompressionNeedsNewerFormat` reports the one combination that cannot hold ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+
 ### Changed
 
+- **Breaking:** MAT files are written in the HDF5 1.8 format by default, so MATLAB can `load` them; MATLAB used HDF5 1.8.12 before R2021b and cannot open a version 3 superblock. Set `mat::Options::libver` to `LibVer::V110` for the previous format, which compression requires ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- **Breaking:** `mat::Options::default` uses `EmptyMarkerEncoding::DataAsDims`, matching what MATLAB and `matio` write, so an empty value reads back as empty under a plain `isempty` ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- **Breaking:** `LibVer::WRITER_OUTPUT` is now `LibVer::WRITER_DEFAULT`, since the writer no longer emits a single format. Its value is unchanged ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- `FileBuilder::with_create_properties` resets the properties its argument does not carry, so a bound set before the call no longer decides the format of a file whose property list names no version ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- `FileBuilder::write` creates the destination only once the writer has bytes for it, so a refused build leaves an existing file at that path untouched ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- An edit session writes a contiguous dataset's data-layout message in the format of the file it opened, so a `.mat` file edited through `File::open_rw` stays readable by MATLAB ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
 - `File::open_streaming` reads a dataset's adjacent chunks in one call instead of one call per chunk, which nearly halves the time to read a file written a row at a time — 20,440 tiny chunks in a 2.7 MB file went from 19.9 ms to 11.4 ms. A read never fetches a byte outside the chunks it was asked for, and holds at most 256 KiB of span beyond its own buffers ([#250](https://github.com/stephenberry/hdf5-pure/pull/250)).
+
+### Fixed
+
+- An object header holding compact attributes declares how many it has, so `H5Oget_info().num_attrs` agrees with iteration instead of reporting zero — an `h5repack` round trip used to strip every `MATLAB_*` attribute from a `.mat` file without warning ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- A file with a userblock reads whole when it holds an object-header continuation block or dense link storage, which the C library writes and this crate does not; `File::open` used to fail outright on such a file ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- An empty MAT value carries `MATLAB_class` and `MATLAB_empty` and nothing else, matching MATLAB, and both emitters agree on its dimensions — including for an empty `Matrix`, which one of them wrote as a plain zero-element dataset ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
 
 ## [0.33.0] - 2026-08-02
 

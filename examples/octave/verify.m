@@ -11,13 +11,23 @@
 % Note on char: Octave 11's `load` keeps MATLAB_class="char" as `uint16`
 % (the underlying storage class). MATLAB itself returns `char`. The helper
 % `eq_text` normalizes both by flattening to double code units.
-
-is_truey = @(x) (islogical(x) && logical(x)) || (isnumeric(x) && x == 1);
-is_falsy = @(x) (islogical(x) && ~logical(x)) || (isnumeric(x) && x == 0);
-% Convert a char/uint16 MATLAB loaded value into a flat row of code-unit doubles.
-as_codes = @(x) double(x(:))';
-% Compare two strings (possibly char or uint16) for equality.
-eq_text  = @(a, b) isequal(as_codes(a), as_codes(b));
+%
+% Note on helpers: `ok`, `is_truey`, `is_falsy`, `as_codes`, `eq_text`,
+% `has_sign_bit`, and the three `mat_*` predicates are function files beside
+% this one, not anonymous functions defined here. That is what lets the bare
+% `clearvars` between fixtures be correct: it clears variables, and a function
+% on the path is not one. They used to be anonymous, which meant every one of
+% the nineteen `clearvars` calls carried a hand-copied list of names to spare —
+% so a new helper was in scope only where someone remembered to add it, and the
+% one added most recently was in scope nowhere.
+%
+% Note on portability: this script must run under BOTH, and MATLAB is the one
+% that matters -- Octave is the fallback that cannot answer the format question
+% at all (see check_format.m). Octave accepting a line proves nothing about
+% MATLAB, because Octave's function set is a superset: `iscomplex` is Octave-only
+% and stopped this script dead at complex.mat the first time it was run under
+% real MATLAB, having "passed" under Octave since it was written. Use `~isreal`,
+% and prefer any spelling both accept.
 
 fprintf('=== scalars.mat ===\n');
 load scalars.mat
@@ -29,29 +39,29 @@ ok(u_u32 == uint32(2147483648), 'u_u32');
 ok(v_u8 == uint8(255), 'v_u8');
 ok(is_truey(b_true), 'b_true == 1');
 ok(is_falsy(b_false), 'b_false == 0');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars
 
 fprintf('=== vectors.mat ===\n');
 load vectors.mat
 ok(isequal(xs, [1.0; 2.0; 3.0; 4.0; 5.0]), 'xs');
 ok(isequal(ns, int32([-1; 0; 1])), 'ns');
 ok(isequal(double(flags(:)), [1; 0; 1; 1; 0]), 'flags values');
-ok(isempty(empty), 'empty');
-clearvars -except is_truey is_falsy as_codes eq_text
+ok(mat_isempty(empty), 'empty');
+clearvars
 
 fprintf('=== matrix.mat ===\n');
 load matrix.mat
 expected = [1 2 3 4; 5 6 7 8; 9 10 11 12];
 ok(isequal(a, expected), 'a is 3x4 with expected values');
 ok(isequal(id, eye(2)), 'id is 2x2 identity');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars
 
 fprintf('=== strings.mat ===\n');
 load strings.mat
 ok(numel(ascii) == 12 && eq_text(ascii, 'hello MATLAB'), 'ascii');
 ok(ischar(ascii) || isa(ascii, 'uint16'), 'ascii is char-like');
-ok(isempty(empty), 'empty string');
-clearvars -except is_truey is_falsy as_codes eq_text
+ok(mat_isempty(empty), 'empty string');
+clearvars
 
 fprintf('=== nested.mat ===\n');
 load nested.mat
@@ -64,30 +74,35 @@ ok(eq_text(e.config.tag, 'prod'), 'e.config.tag');
 ok(e.config.threshold == 0.85, 'e.config.threshold');
 ok(e.config.max_iter == uint32(1000), 'e.config.max_iter');
 ok(isequal(e.samples, [10.0; 20.0; 30.0; 40.0]), 'e.samples');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars
 
 fprintf('=== options.mat ===\n');
 load options.mat
 vars = who;
 ok(ismember('required', vars), 'required field present');
 ok(ismember('present', vars), 'present field present');
-ok(~ismember('absent', vars), 'absent field correctly missing');
+% Since 0.30 the default `NullPolicy::EmptyStructArray` writes a `None` field as
+% MATLAB `struct([])` rather than omitting it, so `isfield` reports true and
+% MATLAB code can reference it unconditionally. `NullPolicy::Omit` restores the
+% older behavior of leaving it out.
+ok(ismember('absent', vars), 'absent field present as struct([])');
+ok(mat_is_empty_struct(absent), 'absent is struct([])');
 ok(required == 1.5, 'required value');
 ok(eq_text(present, 'yes'), 'present value');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars
 
 fprintf('=== complex.mat ===\n');
 load complex.mat
-ok(iscomplex(z), 'z is complex');
+ok(~isreal(z), 'z is complex');
 ok(z == complex(1.0, -2.0), 'z value');
 expected_signal = [complex(1,0); complex(0,1); complex(-1,0); complex(0,-1)];
 ok(isequal(signal, expected_signal), 'signal');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars
 
 fprintf('=== enum.mat ===\n');
 load enum.mat
 ok(eq_text(phase, 'Running'), 'phase');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars
 
 fprintf('=== experiment.mat ===\n');
 load experiment.mat
@@ -97,12 +112,15 @@ ok(trial == uint32(42), 'trial');
 ok(is_truey(active), 'active == 1');
 ok(numel(samples) == 8, 'samples length');
 ok(isequal(size(result), [2 3]), 'result size 2x3');
-ok(iscomplex(signal) && numel(signal) == 3, 'signal complex 3-vec');
+ok(~isreal(signal) && numel(signal) == 3, 'signal complex 3-vec');
 ok(eq_text(phase, 'Done'), 'phase');
 ok(isstruct(config) && eq_text(config.tag, 'ship_it'), 'config.tag');
 ok(eq_text(note, 'looks good'), 'note');
-ok(~exist('skipped', 'var'), 'skipped absent');
-clearvars -except is_truey is_falsy as_codes eq_text
+% As in options.mat: since 0.30 a `None` field is present as struct([]) under
+% the default NullPolicy::EmptyStructArray rather than omitted.
+ok(exist('skipped', 'var') == 1, 'skipped present as struct([])');
+ok(mat_is_empty_struct(skipped), 'skipped is struct([])');
+clearvars
 
 % ==========================================================================
 % Edge-case fixtures
@@ -114,7 +132,7 @@ ok(isnan(nan64), 'nan64 is NaN');
 ok(isinf(pos_inf) && pos_inf > 0, 'pos_inf');
 ok(isinf(neg_inf) && neg_inf < 0, 'neg_inf');
 % -0.0 compares equal to 0.0, so inspect the IEEE 754 bit pattern (sign bit set).
-ok(neg_zero == 0 && typecast(double(neg_zero), 'uint64') == uint64(hex2dec('8000000000000000')), 'neg_zero sign bit preserved');
+ok(neg_zero == 0 && has_sign_bit(neg_zero), 'neg_zero sign bit preserved');
 ok(subnormal > 0 && subnormal < 1e-300, 'subnormal > 0 and tiny');
 % Octave 11's v7.3 loader does not preserve the `single` class (loads as
 % double). MATLAB_class is correctly written as "single" in our file — real
@@ -135,11 +153,11 @@ ok(nan_vec(1) == 1.0, 'nan_vec(1) == 1');
 ok(isnan(nan_vec(2)), 'nan_vec(2) is NaN');
 ok(nan_vec(3) == Inf, 'nan_vec(3) is +Inf');
 ok(nan_vec(4) == -Inf, 'nan_vec(4) is -Inf');
-ok(nan_vec(5) == 0 && typecast(double(nan_vec(5)), 'uint64') == uint64(hex2dec('8000000000000000')), 'nan_vec(5) -0 sign bit');
+ok(nan_vec(5) == 0 && has_sign_bit(nan_vec(5)), 'nan_vec(5) -0 sign bit');
 ok(numel(i64_extremes) == 5, 'i64_extremes length');
 ok(i64_extremes(1) == intmin('int64'), 'i64_extremes(1) == i64min');
 ok(i64_extremes(5) == intmax('int64'), 'i64_extremes(5) == i64max');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars
 
 fprintf('=== shapes.mat ===\n');
 load shapes.mat
@@ -163,7 +181,7 @@ ok(isequal(size(m_3x3), [3 3]), 'm_3x3 size');
 ok(m_3x3(1,1) == 11 && m_3x3(1,2) == 12 && m_3x3(1,3) == 13, 'm_3x3 row 1');
 ok(m_3x3(2,1) == 21 && m_3x3(2,2) == 22 && m_3x3(2,3) == 23, 'm_3x3 row 2');
 ok(m_3x3(3,1) == 31 && m_3x3(3,2) == 32 && m_3x3(3,3) == 33, 'm_3x3 row 3');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars
 
 fprintf('=== int_matrices.mat ===\n');
 load int_matrices.mat
@@ -183,7 +201,7 @@ ok(isequal(double(m_bool), [1 0; 0 1]), 'm_bool values');
 ok(islogical(m_bool) || isa(m_bool, 'uint8'), 'm_bool class is logical-like');
 % f32 matrix (Octave 11 loads as double; check values only)
 ok(isequal(double(m_f32), [1.5 2.5; 3.5 4.5]), 'm_f32 values');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars
 
 fprintf('=== unicode.mat ===\n');
 load unicode.mat
@@ -212,26 +230,26 @@ ok(numel(long_ascii) == 5000, 'long_ascii length 5000');
 long_codes = as_codes(long_ascii);
 ok(long_codes(1) == 97, 'long_ascii first char (a=97)');
 ok(long_codes(5000) == 106, 'long_ascii last char (j=106)');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars
 
 fprintf('=== complex_edges.mat ===\n');
 load complex_edges.mat
-ok(iscomplex(z_nan), 'z_nan is complex');
+ok(~isreal(z_nan), 'z_nan is complex');
 ok(isnan(real(z_nan)) && imag(z_nan) == 0, 'z_nan real is NaN');
-ok(iscomplex(z_inf), 'z_inf is complex');
+ok(~isreal(z_inf), 'z_inf is complex');
 ok(isinf(real(z_inf)) && real(z_inf) > 0, 'z_inf real is +Inf');
 ok(isinf(imag(z_inf)) && imag(z_inf) < 0, 'z_inf imag is -Inf');
 ok(z_zero == 0, 'z_zero == 0');
 ok(real(z_pure_imag) == 0 && imag(z_pure_imag) == 2.5, 'z_pure_imag');
 ok(real(z_pure_real) == 3.5 && imag(z_pure_real) == 0, 'z_pure_real');
 % Octave 11 v7.3 loader loses the single class (real MATLAB preserves it).
-ok(iscomplex(z32), 'z32 is complex');
+ok(~isreal(z32), 'z32 is complex');
 ok(double(real(z32)) == 1.25 && double(imag(z32)) == -0.5, 'z32 values');
 ok(numel(z32_vec) == 3, 'z32_vec length');
-ok(iscomplex(z32_vec), 'z32_vec is complex');
+ok(~isreal(z32_vec), 'z32_vec is complex');
 ok(isequal(size(cmat), [2 2]), 'cmat size');
 ok(isequal(cmat, [1 2; 3 4]), 'cmat values');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars
 
 fprintf('=== deep_nested.mat ===\n');
 load deep_nested.mat
@@ -244,7 +262,7 @@ ok(eq_text(root.inner.sub.tag, 'middle'), 'root.inner.sub.tag');
 ok(isstruct(root.inner.sub.leaf), 'root.inner.sub.leaf is struct');
 ok(root.inner.sub.leaf.id == uint64(12345), 'leaf.id');
 ok(isequal(root.inner.sub.leaf.values, [1.5; 2.5; 3.5]), 'leaf.values');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars
 
 fprintf('=== bool_ext.mat ===\n');
 load bool_ext.mat
@@ -258,17 +276,29 @@ ok(islogical(mat) || isa(mat, 'uint8'), 'mat logical-like');
 % flags vector
 ok(numel(flags) == 7, 'flags length 7');
 ok(isequal(double(flags(:))', [1 1 0 1 0 0 1]), 'flags contents');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars
 
 fprintf('=== empty_variants.mat ===\n');
 load empty_variants.mat
-ok(isempty(e_f64), 'e_f64 empty');
-ok(isempty(e_f32), 'e_f32 empty');
-ok(isempty(e_i32), 'e_i32 empty');
-ok(isempty(e_u8), 'e_u8 empty');
-ok(isempty(e_bool), 'e_bool empty');
-ok(isempty(e_str), 'e_str empty string');
-clearvars -except is_truey is_falsy as_codes eq_text
+ok(mat_isempty(e_f64), 'e_f64 empty');
+ok(mat_isempty(e_f32), 'e_f32 empty');
+ok(mat_isempty(e_i32), 'e_i32 empty');
+ok(mat_isempty(e_u8), 'e_u8 empty');
+ok(mat_isempty(e_bool), 'e_bool empty');
+ok(mat_isempty(e_str), 'e_str empty string');
+% `isempty` alone cannot see the shape: 0x0 and 0x1 are both empty. Since 0.34
+% an empty Rust sequence is written as 0x0, MATLAB's `[]`, and `mat_empty_dims`
+% reads that shape under either interpreter (see its help for why Octave needs
+% one).
+ok(isequal(mat_empty_dims(e_f64), [0 0]), 'e_f64 is 0x0');
+ok(isequal(mat_empty_dims(e_i32), [0 0]), 'e_i32 is 0x0');
+ok(isequal(mat_empty_dims(e_bool), [0 0]), 'e_bool is 0x0');
+if exist('OCTAVE_VERSION', 'builtin') ~= 5
+  % Only meaningful once `load` has decoded the marker into a real empty: 0x0
+  % concatenates with anything, where a 0x1 raises a dimension mismatch.
+  ok(isequal([e_f64, 1], 1), 'e_f64 concatenates as MATLAB []');
+end
+clearvars
 
 fprintf('=== large_matrix.mat ===\n');
 load large_matrix.mat
@@ -279,7 +309,7 @@ ok(m(100,1) == 99000, 'm(100,1) == 99000');
 ok(m(100,50) == 99000 + 49, 'm(100,50) == 99049');
 ok(m(7,13) == 6 * 1000 + 12, 'm(7,13) interior');
 ok(rows == uint32(100) && cols == uint32(50), 'rows/cols scalar fields');
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars
 
 fprintf('=== cells.mat ===\n');
 % Octave 11's `load` for v7.3 does not follow object references and reports
@@ -303,15 +333,15 @@ else
   ok(iscell(optionals), 'optionals iscell');
   ok(numel(optionals) == 3, 'optionals has 3 cells');
   ok(optionals{1}.x == 10.0, 'optionals{1}.x');
-  ok(isstruct(optionals{2}) && isempty(fieldnames(optionals{2})), 'optionals{2} is struct([])');
+  ok(mat_is_empty_struct(optionals{2}), 'optionals{2} is struct([])');
   ok(optionals{3}.x == 30.0, 'optionals{3}.x');
 
   ok(iscell(grid), 'grid iscell');
   ok(numel(grid) == 2, 'grid outer length');
   ok(iscell(grid{1}) && numel(grid{1}) == 2, 'grid{1} is 2-cell');
   ok(grid{1}{1}.x == 100.0, 'grid{1}{1}.x');
-  ok(isstruct(grid{1}{2}) && isempty(fieldnames(grid{1}{2})), 'grid{1}{2} is struct([])');
-  ok(isstruct(grid{2}{1}) && isempty(fieldnames(grid{2}{1})), 'grid{2}{1} is struct([])');
+  ok(mat_is_empty_struct(grid{1}{2}), 'grid{1}{2} is struct([])');
+  ok(mat_is_empty_struct(grid{2}{1}), 'grid{2}{1} is struct([])');
   ok(grid{2}{2}.x == 200.0, 'grid{2}{2}.x');
 
   ok(iscell(ragged), 'ragged iscell');
@@ -319,6 +349,6 @@ else
   ok(isequal(double(ragged{1}(:))', [1 2 3]), 'ragged{1}');
   ok(isequal(double(ragged{2}(:))', [4 5]), 'ragged{2}');
 end
-clearvars -except is_truey is_falsy as_codes eq_text
+clearvars
 
 fprintf('\nAll fixtures verified.\n');

@@ -97,12 +97,17 @@ impl FileCreateProperties {
 
     /// Constrain the on-disk format version to `[low, high]`.
     ///
-    /// This crate writes exactly one format, so the bound is a compatibility
-    /// assertion rather than a format selector — see
-    /// [`FileBuilder::with_libver_bounds`](crate::FileBuilder::with_libver_bounds).
+    /// `high` **selects** the format: `Earliest..=V18` writes the HDF5 1.8 one
+    /// and anything reaching 1.10 writes the 1.10 one, so this changes the bytes
+    /// of every file the properties are applied to. Content the chosen format
+    /// cannot express is refused with
+    /// [`FormatError::LibverTooOldForContent`](crate::FormatError::LibverTooOldForContent)
+    /// rather than silently upgraded — see
+    /// [`FileBuilder::with_libver_bounds`](crate::FileBuilder::with_libver_bounds)
+    /// for which content that is.
     ///
     /// HDF5 classes `H5Pset_libver_bounds` as a *file access* property; it sits
-    /// here because this crate checks the bound at write time.
+    /// here because this crate resolves the bound at write time.
     #[doc(alias = "H5Pset_libver_bounds")]
     pub const fn with_libver_bounds(mut self, low: LibVer, high: LibVer) -> Self {
         self.libver_bounds = Some((low, high));

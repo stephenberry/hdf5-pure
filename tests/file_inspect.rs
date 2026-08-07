@@ -56,11 +56,11 @@ fn file_size_matches_buffer_and_metadata() {
 
 #[test]
 fn libver_bound_reports_writer_format() {
-    // This crate writes a version 3 superblock, i.e. the HDF5 1.10 format.
+    // Unbounded, this crate writes a version 3 superblock — the HDF5 1.10 format.
     let file = File::from_bytes(sample_file()).unwrap();
     assert_eq!(file.superblock().version, 3);
     assert_eq!(file.libver_bound(), LibVer::V110);
-    assert_eq!(file.libver_bound(), LibVer::WRITER_OUTPUT);
+    assert_eq!(file.libver_bound(), LibVer::WRITER_DEFAULT);
 }
 
 #[test]
@@ -75,13 +75,33 @@ fn libver_bounds_accept_straddling_range() {
 #[test]
 fn libver_bounds_reject_too_old_upper_bound() {
     let mut builder = FileBuilder::new();
-    builder.with_libver_bounds(LibVer::Earliest, LibVer::V18);
+    // An upper bound of `Earliest` asks for a version 0 or 1 superblock, which
+    // pairs with the v1 symbol-table groups this crate reads but does not write.
+    builder.with_libver_bounds(LibVer::Earliest, LibVer::Earliest);
     builder.create_dataset("data").with_i32_data(&[1, 2, 3]);
-    // Upper bound 1.8 cannot hold the 1.10 format this crate emits.
     let err = builder.finish().unwrap_err();
     assert!(
         err.to_string().contains("library-version bounds"),
         "unexpected error: {err}"
+    );
+}
+
+/// An upper bound of 1.8 is satisfiable — it selects the older format rather
+/// than failing, which is what a file destined for MATLAB's `load` needs.
+#[test]
+fn libver_bounds_of_1_8_select_the_older_format() {
+    let mut builder = FileBuilder::new();
+    builder.with_libver_bounds(LibVer::Earliest, LibVer::V18);
+    builder.create_dataset("data").with_i32_data(&[1, 2, 3]);
+    let bytes = builder.finish().expect("1.8 is a format this crate writes");
+    assert_eq!(bytes[8], 2, "version 2 superblock");
+
+    let file = File::from_bytes(bytes).unwrap();
+    assert_eq!(file.libver_bound(), LibVer::V18);
+    assert_eq!(file.libver_bound(), LibVer::WRITER_OLDEST);
+    assert_eq!(
+        file.dataset("data").unwrap().read_i32().unwrap(),
+        vec![1, 2, 3]
     );
 }
 

@@ -5,6 +5,7 @@ use std::collections::VecDeque;
 use crate::file_writer::AttrValue;
 use crate::mat::class::MatClass;
 use crate::mat::error::MatError;
+use crate::mat::options::Options;
 use crate::mat::userblock::{self, USERBLOCK_SIZE};
 use crate::mat::utf16;
 use crate::type_builders::{
@@ -77,6 +78,12 @@ pub(crate) fn emit_file_to<W: std::io::Write>(
 fn build_file(fields: Vec<(String, MatValue)>) -> Result<FileBuilder, MatError> {
     let mut builder = FileBuilder::new();
     builder.with_userblock(USERBLOCK_SIZE);
+    // This emitter serves the no-options entry points, which are defined to
+    // produce what `Options::default()` produces, so every file-level setting the
+    // options carry has to be applied here too — the two emitters are only
+    // byte-identical while both are configured the same way. See
+    // `Options::libver` for why the default is the HDF5 1.8 format.
+    builder.with_libver_bounds(crate::LibVer::Earliest, Options::default().libver);
     let mut refs = RefsAccumulator::new();
 
     for (name, value) in fields {
@@ -245,19 +252,27 @@ fn apply_cell(
     Ok(())
 }
 
+/// The empty-marker encoding this emitter writes.
+///
+/// It has no [`Options`] of its own, so it takes the default's — read from
+/// [`Options::default`] rather than written here as a constant, because the same
+/// value written through `to_bytes` and through
+/// `to_bytes_with_options(&Options::default())` has to produce the same bytes,
+/// and a constant is what let those two come apart when the default moved.
+fn default_empty_encoding() -> crate::mat::options::EmptyMarkerEncoding {
+    Options::default().empty_marker_encoding
+}
+
 /// Empty-struct-array marker (MATLAB `struct([])`). What `Option::None` lowers
 /// to under the default [`NullPolicy::EmptyStructArray`], both as a struct
-/// field and inside a sequence, and the only empty marker this emitter writes.
-///
-/// This emitter has no [`Options`] and so is fixed at
-/// [`EmptyMarkerEncoding::ZeroElement`], but the element type comes from
-/// [`emit_zero_element`](crate::mat::builder::emit_zero_element) rather than
-/// from a constant here, and the `[0, 0]` dims are what
-/// `MatBuilder::write_empty_struct_array` uses. That is the whole point: the
-/// same value written through `to_bytes` and through `to_bytes_with_options`
-/// under default options has to produce the same bytes.
+/// field and inside a sequence.
 fn apply_empty_struct_array(ds: &mut DatasetBuilder) {
-    crate::mat::builder::emit_zero_element(ds, MatClass::Struct, &[0u64, 0]);
+    crate::mat::builder::emit_empty_storage(
+        ds,
+        default_empty_encoding(),
+        MatClass::Struct,
+        &[0, 0],
+    );
     set_class(ds, MatClass::Struct);
     ds.set_attr("MATLAB_empty", AttrValue::U32(1));
 }
@@ -337,7 +352,7 @@ fn apply_scalar(ds: &mut DatasetBuilder, n: ScalarNum) -> Result<(), MatError> {
 fn apply_vec_1d(ds: &mut DatasetBuilder, v: NumVec) -> Result<(), MatError> {
     let n = v.len() as u64;
     if n == 0 {
-        emit_empty(ds, v.tag());
+        emit_empty(ds, v.tag(), &[0, 0]);
         return Ok(());
     }
     let shape = [1u64, n];
@@ -399,6 +414,15 @@ fn apply_matrix(
     vec: NumVec,
 ) -> Result<(), MatError> {
     debug_assert_eq!(vec.len(), rows * cols);
+    // An empty matrix is a marker, not a zero-element array of its class, and it
+    // keeps the MATLAB shape it was given — `Matrix::from_row_major(0, 3, [])`
+    // records `[0, 3]`, not `[0, 0]`. `MatBuilder::write_array_inner` routes the
+    // same value to `write_empty` with the same dims; the two emitters have to
+    // agree byte for byte under default options.
+    if rows * cols == 0 {
+        emit_empty(ds, vec.tag(), &[rows, cols]);
+        return Ok(());
+    }
     // HDF5 shape for a MATLAB [rows × cols] matrix is [cols, rows].
     let shape = [cols as u64, rows as u64];
     match vec {
@@ -475,10 +499,18 @@ fn apply_char_string(ds: &mut DatasetBuilder, s: &str) {
     let units = utf16::encode_utf16(s);
     let n = units.len() as u64;
     if n == 0 {
-        // Empty char: use MATLAB_empty marker with [0, 0] shape.
-        ds.with_u16_data(&[]).with_shape(&[0u64, 0]);
+        crate::mat::builder::emit_empty_storage(
+            ds,
+            default_empty_encoding(),
+            MatClass::Char,
+            &[0, 0],
+        );
         set_class(ds, MatClass::Char);
-        set_char_decode(ds);
+        // No `MATLAB_int_decode`: it says how to read the stored integers back as
+        // characters, and an empty marker's payload is a `uint64` dimension vector
+        // rather than character data. MATLAB writes the attribute on every
+        // non-empty `char` and on no empty one; the fixtures in
+        // `tests/fixtures/mat_real` carry 167 of the first and 55 of the second.
         ds.set_attr("MATLAB_empty", AttrValue::U32(1));
         return;
     }
@@ -490,55 +522,34 @@ fn apply_char_string(ds: &mut DatasetBuilder, s: &str) {
     set_char_decode(ds);
 }
 
-fn emit_empty(ds: &mut DatasetBuilder, tag: ScalarTag) {
-    // Empty numeric array: shape [0, 0], MATLAB_empty = 1.
-    match tag {
-        ScalarTag::Bool => {
-            ds.with_u8_data(&[]).with_shape(&[0u64, 0]);
-            set_class(ds, MatClass::Logical);
-            set_logical_decode(ds);
-        }
-        ScalarTag::F64 => {
-            ds.with_f64_data(&[]).with_shape(&[0u64, 0]);
-            set_class(ds, MatClass::Double);
-        }
-        ScalarTag::F32 => {
-            ds.with_f32_data(&[]).with_shape(&[0u64, 0]);
-            set_class(ds, MatClass::Single);
-        }
-        ScalarTag::I64 => {
-            ds.with_i64_data(&[]).with_shape(&[0u64, 0]);
-            set_class(ds, MatClass::Int64);
-        }
-        ScalarTag::I32 => {
-            ds.with_i32_data(&[]).with_shape(&[0u64, 0]);
-            set_class(ds, MatClass::Int32);
-        }
-        ScalarTag::I16 => {
-            ds.with_i16_data(&[]).with_shape(&[0u64, 0]);
-            set_class(ds, MatClass::Int16);
-        }
-        ScalarTag::I8 => {
-            ds.with_i8_data(&[]).with_shape(&[0u64, 0]);
-            set_class(ds, MatClass::Int8);
-        }
-        ScalarTag::U64 => {
-            ds.with_u64_data(&[]).with_shape(&[0u64, 0]);
-            set_class(ds, MatClass::UInt64);
-        }
-        ScalarTag::U32 => {
-            ds.with_u32_data(&[]).with_shape(&[0u64, 0]);
-            set_class(ds, MatClass::UInt32);
-        }
-        ScalarTag::U16 => {
-            ds.with_u16_data(&[]).with_shape(&[0u64, 0]);
-            set_class(ds, MatClass::UInt16);
-        }
-        ScalarTag::U8 => {
-            ds.with_u8_data(&[]).with_shape(&[0u64, 0]);
-            set_class(ds, MatClass::UInt8);
-        }
-    }
+/// Write the empty marker for a numeric value of `tag` with MATLAB shape
+/// `matlab_dims`. The counterpart of [`MatBuilder::write_empty`], which the
+/// with-options emitter reaches for the same values.
+///
+/// No `MATLAB_int_decode`, for any class: it says how to read the stored
+/// integers back as `char` or `logical` values, and an empty marker's payload is
+/// a `uint64` dimension vector rather than data of the marked class. MATLAB
+/// agrees — of the 352 empty datasets in `tests/fixtures/mat_real`, not one
+/// carries it. `MatBuilder::write_empty` states the same rule; the two have to
+/// hold it identically or the emitters diverge for an empty logical.
+///
+/// [`MatBuilder::write_empty`]: crate::mat::MatBuilder::write_empty
+fn emit_empty(ds: &mut DatasetBuilder, tag: ScalarTag, matlab_dims: &[usize]) {
+    let class = match tag {
+        ScalarTag::Bool => MatClass::Logical,
+        ScalarTag::F64 => MatClass::Double,
+        ScalarTag::F32 => MatClass::Single,
+        ScalarTag::I64 => MatClass::Int64,
+        ScalarTag::I32 => MatClass::Int32,
+        ScalarTag::I16 => MatClass::Int16,
+        ScalarTag::I8 => MatClass::Int8,
+        ScalarTag::U64 => MatClass::UInt64,
+        ScalarTag::U32 => MatClass::UInt32,
+        ScalarTag::U16 => MatClass::UInt16,
+        ScalarTag::U8 => MatClass::UInt8,
+    };
+    crate::mat::builder::emit_empty_storage(ds, default_empty_encoding(), class, matlab_dims);
+    set_class(ds, class);
     ds.set_attr("MATLAB_empty", AttrValue::U32(1));
 }
 
@@ -568,4 +579,76 @@ fn set_char_decode(ds: &mut DatasetBuilder) {
 fn _touch() {
     let _ = make_f64_type();
     let _ = make_f32_type();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rule [`MatBuilder::write_empty`] states — an empty marker carries
+    /// `MATLAB_class` and `MATLAB_empty` and nothing else — held for one emitter
+    /// and not the other: this one kept `MATLAB_int_decode` on the `logical`
+    /// class after the builder dropped it.
+    ///
+    /// Asserted here rather than through `to_bytes` because no serde value
+    /// reaches this arm today: `unify_sequence` lowers an empty `Vec<bool>` to
+    /// `NumVec::F64` under [`EmptySequencePolicy::DoubleArray`], so an
+    /// end-to-end test would pass with the defect in place. A change to that
+    /// policy is exactly what would deliver a typed empty logical here.
+    ///
+    /// [`MatBuilder::write_empty`]: crate::mat::MatBuilder::write_empty
+    /// [`EmptySequencePolicy::DoubleArray`]: crate::mat::EmptySequencePolicy::DoubleArray
+    #[test]
+    fn an_empty_marker_carries_only_class_and_empty() {
+        for tag in [
+            ScalarTag::Bool,
+            ScalarTag::F64,
+            ScalarTag::F32,
+            ScalarTag::I64,
+            ScalarTag::I32,
+            ScalarTag::I16,
+            ScalarTag::I8,
+            ScalarTag::U64,
+            ScalarTag::U32,
+            ScalarTag::U16,
+            ScalarTag::U8,
+        ] {
+            let mut ds = DatasetBuilder::new("x");
+            emit_empty(&mut ds, tag, &[0, 0]);
+            let mut names: Vec<&str> = ds.attrs.iter().map(|(n, _)| n.as_str()).collect();
+            names.sort_unstable();
+            assert_eq!(
+                names,
+                ["MATLAB_class", "MATLAB_empty"],
+                "{tag:?} empty marker carries a non-MATLAB attribute set"
+            );
+        }
+    }
+
+    /// An empty matrix keeps the shape it was given. `MatBuilder`'s
+    /// `write_array_inner` forwards `matlab_dims` to `write_empty` unchanged, so
+    /// collapsing every empty to `0x0` here would make the two emitters disagree
+    /// for `Matrix::from_row_major(0, 3, vec![])`.
+    #[test]
+    fn an_empty_matrix_keeps_its_matlab_dims() {
+        for (rows, cols) in [(0, 0), (0, 3), (3, 0)] {
+            let mut ds = DatasetBuilder::new("m");
+            apply_matrix(&mut ds, rows, cols, NumVec::F64(Vec::new())).unwrap();
+            assert_eq!(
+                ds.data.as_deref(),
+                Some(
+                    [rows as u64, cols as u64]
+                        .iter()
+                        .flat_map(|d| d.to_le_bytes())
+                        .collect::<Vec<u8>>()
+                        .as_slice()
+                ),
+                "{rows}x{cols} empty matrix records the wrong dimension vector"
+            );
+            assert!(
+                ds.attrs.iter().any(|(n, _)| n == "MATLAB_empty"),
+                "{rows}x{cols} empty matrix is not marked empty"
+            );
+        }
+    }
 }

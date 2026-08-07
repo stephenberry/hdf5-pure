@@ -282,6 +282,21 @@ pub(crate) struct BaseOffsetSource<'a, S: Source + ?Sized> {
     pub(crate) base: u64,
 }
 
+/// A base-relative view of an in-memory file: `bytes` with its first `base` bytes
+/// (the userblock) cut off, so every address stored relative to the base address
+/// indexes it directly. The in-memory counterpart of [`BaseOffsetSource`], and the
+/// identity for a plain file.
+pub(crate) fn frame(bytes: &[u8], base: u64) -> Result<&[u8], FormatError> {
+    if base == 0 {
+        return Ok(bytes);
+    }
+    let start = base.to_usize()?;
+    bytes.get(start..).ok_or(FormatError::UnexpectedEof {
+        expected: start,
+        available: bytes.len(),
+    })
+}
+
 impl<S: Source + ?Sized> Source for BaseOffsetSource<'_, S> {
     fn len(&self) -> u64 {
         self.inner.len().saturating_sub(self.base)
