@@ -9,6 +9,7 @@ use crate::type_builders::{
     GroupBuilder as FormatGroupBuilder,
 };
 
+use crate::datatype::Datatype;
 use crate::error::{Error, FormatError};
 use crate::file_create_properties::FileCreateProperties;
 use crate::file_space_info::FileSpaceStrategy;
@@ -54,6 +55,47 @@ impl FileBuilder {
     /// Add a finished group to the file.
     pub fn add_group(&mut self, group: FinishedGroup) {
         self.writer.add_group(group);
+    }
+
+    /// Commit `datatype` in the root group under `name`, the way `H5Tcommit`
+    /// does: the type is written as an object of its own, and datasets and
+    /// attributes reference it by path instead of encoding it again.
+    ///
+    /// A committed datatype is what a C-library reader reports by name — `h5dump`
+    /// prints `DATATYPE "/mytype"` for a dataset using one — and what netCDF-4
+    /// writes for every user-defined type. It is also the only way several
+    /// objects in a file can be said to share *one* type rather than to each
+    /// declare an identical one.
+    ///
+    /// Name it from a dataset with
+    /// [`DatasetBuilder::with_committed_datatype`](crate::DatasetBuilder::with_committed_datatype)
+    /// or from an attribute with
+    /// [`DatasetBuilder::set_attr_committed`](crate::DatasetBuilder::set_attr_committed)
+    /// and its group and root counterparts. A name that no committed datatype
+    /// matches, or one whose type disagrees with the naming object's, fails the
+    /// write rather than producing a file whose element bytes and declared type
+    /// do not match.
+    ///
+    /// ```
+    /// use hdf5_pure::{FileBuilder, make_i32_type};
+    ///
+    /// let mut b = FileBuilder::new();
+    /// b.commit_datatype("mytype", make_i32_type());
+    /// b.create_dataset("d")
+    ///     .with_i32_data(&[1, 2, 3])
+    ///     .with_committed_datatype("mytype");
+    /// let bytes = b.finish().unwrap();
+    /// # assert!(hdf5_pure::is_hdf5_bytes(&bytes));
+    /// ```
+    pub fn commit_datatype(&mut self, name: &str, datatype: Datatype) {
+        self.writer.commit_datatype(name, datatype);
+    }
+
+    /// Attach a root-group attribute whose datatype is the committed one at
+    /// `path`. See [`commit_datatype`](Self::commit_datatype) and
+    /// [`DatasetBuilder::set_attr_committed`](crate::DatasetBuilder::set_attr_committed).
+    pub fn set_attr_committed(&mut self, name: &str, value: AttrValue, path: &str) {
+        self.writer.set_root_attr_committed(name, value, path);
     }
 
     /// Apply every creation property in `properties` at once — the `fcpl`

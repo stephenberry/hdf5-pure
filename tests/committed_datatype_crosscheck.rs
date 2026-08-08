@@ -11,14 +11,18 @@
 //! separates a reference from an encoding is a flag bit, and reading the bytes
 //! without it returns the wrong type with no error anywhere.
 //!
-//! This crate's writer cannot emit a committed type, so the fixtures here are
-//! built through the C library's own `H5Tcommit2`, and the type each object
-//! *should* report is the one the C library reads back from the same file.
+//! The read-side fixtures here are built through the C library's own
+//! `H5Tcommit2`, so the type each object *should* report is the one the C library
+//! reads back from the same file. The write side runs the other way: this crate
+//! places the committed object and the C library is asked whether the type it
+//! finds is committed, which is the question no pure-Rust round trip can answer
+//! about itself.
 
 use std::ffi::{CString, c_char, c_int, c_void};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
+use hdf5::{ObjectReference1, ReferencedObject};
 use hdf5_pure::{AttrValue, Datatype, File, RepackOptions};
 use tempfile::tempdir;
 
@@ -64,6 +68,21 @@ unsafe extern "C" {
         buf: *const c_void,
     ) -> c_int;
     fn H5Dclose(dset_id: i64) -> c_int;
+    fn H5Gcreate2(
+        loc_id: i64,
+        name: *const c_char,
+        lcpl_id: i64,
+        gcpl_id: i64,
+        gapl_id: i64,
+    ) -> i64;
+    fn H5Gclose(group_id: i64) -> c_int;
+    /// Positive when the type is committed, zero when it is transient. This is
+    /// the C library's own answer to "is this a named type", and the one thing a
+    /// pure-Rust read of a file this crate wrote cannot independently confirm.
+    fn H5Tcommitted(type_id: i64) -> c_int;
+    fn H5Aopen(obj_id: i64, attr_name: *const c_char, aapl_id: i64) -> i64;
+    fn H5Aget_type(attr_id: i64) -> i64;
+    fn H5Tclose(type_id: i64) -> c_int;
 }
 
 /// `H5P_DEFAULT` and `H5S_ALL` are both the zero id.
@@ -554,52 +573,172 @@ fn the_streaming_backend_resolves_a_committed_datatype_too() {
     );
 }
 
-/// Repack every use of a committed type separately, and require each refusal to
-/// name what it refused.
+/// Whether the C library calls the datatype of `path`'s dataset a committed one,
+/// and the address of the object it names.
 ///
-/// Reproducing one would mean inlining the resolved type and dropping the named
-/// type object, so every reader that reports the type by name would stop — an
-/// approximation, and this module refuses those. Before the fix the same calls
-/// returned `Ok` and produced a file libhdf5 could not read *any* attributes
-/// from, which is why the assertion is on the message and not merely on `is_err`.
+/// `H5Tcommitted` is the crosscheck that matters: this crate reading back its own
+/// reference proves only that it agrees with itself, while the C library saying
+/// "committed" means the file really carries the shared-message encoding a named
+/// type is made of.
+fn dataset_type_is_committed(file: &hdf5::File, path: &str) -> bool {
+    let dataset = file
+        .dataset(path)
+        .unwrap_or_else(|e| panic!("open {path}: {e}"));
+    let dtype = dataset.dtype().expect("dataset datatype");
+    unsafe { H5Tcommitted(dtype.id()) > 0 }
+}
+
+/// The same question for an attribute, which stores its reference in the
+/// attribute message rather than in a header message record — a separate encoding
+/// with a separate flag.
+fn attr_type_is_committed(file: &hdf5::File, owner: &str, attr: &str) -> bool {
+    // `H5Aopen` wants an *object* identifier, which a file identifier is not, so
+    // the root group is opened as one rather than passed as `file.id()`. Both
+    // handles are bound rather than used inline: dropping one closes the id, and
+    // an `H5Aopen` on a closed id fails in a way that reads exactly like a missing
+    // attribute.
+    let root = file.group("/").expect("open root group");
+    let dataset = (!owner.is_empty()).then(|| file.dataset(owner).expect("open attribute owner"));
+    let owner_id = dataset.as_ref().map_or_else(|| root.id(), |d| d.id());
+    let cname = CString::new(attr).unwrap();
+    let attr_id = unsafe { H5Aopen(owner_id, cname.as_ptr(), DEFAULT) };
+    assert!(attr_id >= 0, "H5Aopen failed for {attr} on owner {owner:?}");
+    let type_id = unsafe { H5Aget_type(attr_id) };
+    assert!(type_id >= 0, "H5Aget_type failed for {attr}");
+    let committed = unsafe { H5Tcommitted(type_id) > 0 };
+    unsafe {
+        H5Tclose(type_id);
+        H5Aclose(attr_id);
+    }
+    committed
+}
+
+/// A repack carries every use of a committed type across as a use of the *same*
+/// committed type, rather than inlining a copy of the encoding.
 ///
-/// One fixture per use, because a file carrying two of them only proves that
-/// *some* refusal fired: drop the attribute check on a file that also has a
-/// committed dataset type and the dataset check catches it, with nothing to show
-/// that the attribute path stopped guarding anything. The `/mytype` object is in
-/// every fixture by construction — a committed type is an object — so the two
-/// referencing cases drop it explicitly to get its own refusal out of the way.
+/// Inlining would read back correctly and still lose what makes the type named:
+/// `h5dump` would stop printing `DATATYPE "/mytype"`, and objects that shared one
+/// type would each declare their own. So the assertions are about identity — the
+/// C library calling each type committed, and both users resolving to the one
+/// object — not about the values alone. Before #254 this same call returned `Ok`
+/// and produced a file libhdf5 could not read *any* attributes from.
 #[test]
-fn repack_refuses_each_use_of_a_committed_datatype() {
+fn repack_reproduces_a_committed_datatype() {
     let _c = c_lib_guard();
     let dir = tempdir().unwrap();
-    for (what, fixture, drop_type_object, expected) in [
-        (
-            "an attribute datatype",
-            Fixture {
-                committed_attrs: true,
-                ..Fixture::default()
-            },
-            true,
-            "attribute \"shared_attr\" has a committed",
-        ),
+    let src = dir.path().join("committed.h5");
+    let dst = dir.path().join("repacked.h5");
+    write_committed_fixture(&src, EVERYTHING);
+
+    hdf5_pure::repack(&src, &dst, &RepackOptions::new()).expect("repack a committed datatype");
+
+    // The C library's verdict on the output, taken before this crate's, because
+    // it is the one that cannot be satisfied by agreeing with the writer.
+    {
+        let file = hdf5::File::open(&dst).expect("C library opens the repacked file");
+        assert!(
+            dataset_type_is_committed(&file, "typed"),
+            "the repacked dataset must still name a committed type, not carry an inline copy"
+        );
+        assert!(
+            attr_type_is_committed(&file, "", "shared_attr"),
+            "the repacked root attribute must still name a committed type"
+        );
+        assert!(
+            attr_type_is_committed(&file, "data", "shared_attr"),
+            "the repacked dataset attribute must still name a committed type"
+        );
+        assert!(
+            !attr_type_is_committed(&file, "data", "plain"),
+            "an attribute that was inline in the source must not become committed"
+        );
+        assert_eq!(
+            file.dataset("typed")
+                .unwrap()
+                .read_1d::<i32>()
+                .unwrap()
+                .to_vec(),
+            DATASET_VALUES.to_vec()
+        );
+    }
+
+    // And the named object itself is back, holding the type it held.
+    let out = File::open(&dst).expect("hdf5-pure opens the repacked file");
+    assert_eq!(
+        out.dataset("typed").unwrap().datatype().unwrap(),
+        committed_i32()
+    );
+    let root_attr = out.root().attr_datatypes().unwrap();
+    assert_eq!(root_attr.get("shared_attr"), Some(&committed_i32()));
+    assert_eq!(
+        out.root().attrs().unwrap().get("shared_attr"),
+        Some(&AttrValue::I64Array(vec![ATTR_VALUE.into()]))
+    );
+}
+
+/// Two users of one committed type stay two users of *one* type across a repack.
+///
+/// This is the assertion an inline copy passes right up until it is asked: with
+/// the encoding written into each user, every value still reads and every type
+/// still compares equal, and the file has silently become one where the objects
+/// no longer share anything. Address identity is what distinguishes them.
+#[test]
+fn users_of_one_committed_type_still_share_one_object() {
+    let _c = c_lib_guard();
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("committed.h5");
+    let dst = dir.path().join("repacked.h5");
+    write_committed_fixture(&src, EVERYTHING);
+    hdf5_pure::repack(&src, &dst, &RepackOptions::new()).expect("repack");
+
+    let out = File::open(&dst).unwrap();
+    assert_eq!(
+        out.root().named_datatypes().unwrap(),
+        vec!["mytype".to_string()],
+        "the output must hold exactly one committed object"
+    );
+    // With one committed object in the file and the C library calling both users'
+    // types committed, the two name that object: a committed type has nowhere
+    // else to live.
+    let file = hdf5::File::open(&dst).unwrap();
+    assert!(dataset_type_is_committed(&file, "typed"));
+    assert!(attr_type_is_committed(&file, "data", "shared_attr"));
+    assert_eq!(
+        out.root().named_datatype("mytype").unwrap(),
+        committed_i32()
+    );
+}
+
+/// A committed type a repack *drops* is refused by name rather than left dangling.
+///
+/// Dropping the object while something still names it is the one way a repack can
+/// produce a reference to nothing, so it is refused where the naming object is
+/// still known. The unreferenced case is the control: with nothing naming it, the
+/// same drop is an ordinary one.
+#[test]
+fn repack_refuses_dropping_a_committed_type_still_in_use() {
+    let _c = c_lib_guard();
+    let dir = tempdir().unwrap();
+
+    for (what, fixture, expected) in [
         (
             "a dataset element type",
             Fixture {
                 committed_dataset: true,
                 ..Fixture::default()
             },
-            true,
-            "dataset typed: a committed",
+            Some("dataset typed: names the committed datatype"),
         ),
         (
-            // Nothing references the type, so neither check above sees it — and
-            // the object is linked into the root group all the same.
-            "an unreferenced named datatype object",
-            Fixture::default(),
-            false,
-            "mytype: a committed (named) datatype object",
+            "an attribute datatype",
+            Fixture {
+                committed_attrs: true,
+                ..Fixture::default()
+            },
+            Some("attribute \"shared_attr\": names the committed datatype"),
         ),
+        // Nothing names it, so dropping it is just a drop.
+        ("nothing", Fixture::default(), None),
     ] {
         let src = dir.path().join("committed.h5");
         let dst = dir.path().join("repacked.h5");
@@ -607,19 +746,362 @@ fn repack_refuses_each_use_of_a_committed_datatype() {
         let _ = std::fs::remove_file(&dst);
         write_committed_fixture(&src, fixture);
 
-        let mut options = RepackOptions::new();
-        if drop_type_object {
-            options = options.drop_path("mytype");
+        let options = RepackOptions::new().drop_path("mytype");
+        let result = hdf5_pure::repack(&src, &dst, &options);
+        match expected {
+            Some(expected) => {
+                let message = result
+                    .expect_err("dropping a type in use must fail")
+                    .to_string();
+                assert!(
+                    message.contains(expected),
+                    "dropping the type {what} names must say so; expected {expected:?}, \
+                     got: {message}"
+                );
+            }
+            None => {
+                result.expect("dropping an unreferenced committed type is an ordinary drop");
+                let out = File::open(&dst).unwrap();
+                assert!(out.root().named_datatypes().unwrap().is_empty());
+            }
         }
-        let err = hdf5_pure::repack(&src, &dst, &options).unwrap_err();
-        let message = err.to_string();
+    }
+}
+
+/// A file this crate writes with a committed datatype is one the C library calls
+/// committed.
+///
+/// This is the direction no self-consistency check can cover: reading back our own
+/// reference proves the two halves of this crate agree, not that the file carries
+/// what HDF5 calls a named type. `H5Tcommitted` is the C library's own answer, and
+/// it is false for an inline encoding no matter how correct the bytes are.
+#[test]
+fn a_committed_datatype_this_crate_writes_reads_back_as_committed() {
+    let _c = c_lib_guard();
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("written.h5");
+
+    let mut builder = hdf5_pure::FileBuilder::new();
+    builder.commit_datatype("mytype", committed_i32());
+    builder.set_attr_committed("root_attr", AttrValue::I32(ATTR_VALUE), "mytype");
+    builder
+        .create_dataset("typed")
+        .with_i32_data(&DATASET_VALUES)
+        .with_committed_datatype("/mytype")
+        .set_attr_committed("shared_attr", AttrValue::I32(ATTR_VALUE), "mytype");
+    builder.write(&path).expect("write a committed datatype");
+
+    let file = hdf5::File::open(&path).expect("C library opens the file");
+    assert!(
+        dataset_type_is_committed(&file, "typed"),
+        "the dataset's element type must be a named type, not an inline copy"
+    );
+    assert!(
+        attr_type_is_committed(&file, "typed", "shared_attr"),
+        "the dataset attribute's type must be a named type"
+    );
+    assert!(
+        attr_type_is_committed(&file, "", "root_attr"),
+        "the root attribute's type must be a named type"
+    );
+    assert_eq!(
+        file.dataset("typed")
+            .unwrap()
+            .read_1d::<i32>()
+            .unwrap()
+            .to_vec(),
+        DATASET_VALUES.to_vec(),
+        "naming the type must not disturb the element bytes"
+    );
+    // The type object is a real child of the root group, not a stranded header.
+    assert_eq!(
+        File::open(&path).unwrap().root().named_datatypes().unwrap(),
+        vec!["mytype".to_string()]
+    );
+}
+
+/// The reference count this crate writes for a committed type is the one the C
+/// library writes for the same file.
+///
+/// The count is hard links plus every message naming the type — `H5O_link`, once
+/// per link and once per dataset or attribute created against it. Nothing
+/// *reading* a file notices a wrong count; it decides what happens when the type
+/// is later unlinked, and a count of 1 means the first unlink destroys a type
+/// other objects are still using. So the C library's own number for an equivalent
+/// file is the only available ground truth, and this test takes it from a file
+/// `H5Tcommit2` wrote rather than from a constant.
+#[test]
+fn the_reference_count_matches_what_the_c_library_writes() {
+    let _c = c_lib_guard();
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("committed.h5");
+    write_committed_fixture(&src, EVERYTHING);
+
+    // One hard link, one dataset element type, two attribute datatypes.
+    let expected = File::open(&src)
+        .unwrap()
+        .root()
+        .named_datatype_references("mytype")
+        .unwrap();
+    assert_eq!(
+        expected, 4,
+        "the fixture links the type once and names it three times"
+    );
+
+    // A repack of that file.
+    let dst = dir.path().join("repacked.h5");
+    hdf5_pure::repack(&src, &dst, &RepackOptions::new()).expect("repack");
+    assert_eq!(
+        File::open(&dst)
+            .unwrap()
+            .root()
+            .named_datatype_references("mytype")
+            .unwrap(),
+        expected,
+        "a repack must carry the reference count, not reset it"
+    );
+
+    // And a file built from scratch with the same shape.
+    let written = dir.path().join("written.h5");
+    let mut builder = hdf5_pure::FileBuilder::new();
+    builder.commit_datatype("mytype", committed_i32());
+    builder.set_attr_committed("shared_attr", AttrValue::I32(ATTR_VALUE), "mytype");
+    builder
+        .create_dataset("typed")
+        .with_i32_data(&DATASET_VALUES)
+        .with_committed_datatype("mytype")
+        .set_attr_committed("shared_attr", AttrValue::I32(ATTR_VALUE), "mytype");
+    builder.write(&written).expect("write");
+    assert_eq!(
+        File::open(&written)
+            .unwrap()
+            .root()
+            .named_datatype_references("mytype")
+            .unwrap(),
+        expected,
+        "the writer must count the same uses the C library counts"
+    );
+}
+
+/// A dataset or attribute naming a type it does not match is refused, rather than
+/// written as a file whose element bytes and declared type disagree.
+///
+/// The committed encoding is the only one in the file, so a reader takes it: an
+/// i32 dataset that named an f64 type would have its bytes read as doubles, half
+/// as many of them, with nothing anywhere reporting a problem.
+#[test]
+fn a_dataset_naming_a_type_it_does_not_match_is_refused() {
+    let mut builder = hdf5_pure::FileBuilder::new();
+    builder.commit_datatype("mytype", hdf5_pure::make_f64_type());
+    builder
+        .create_dataset("typed")
+        .with_i32_data(&DATASET_VALUES)
+        .with_committed_datatype("mytype");
+    let message = builder.finish().unwrap_err().to_string();
+    assert!(
+        message.contains("names the committed datatype") && message.contains("mytype"),
+        "expected a mismatch refusal naming the type, got: {message}"
+    );
+}
+
+/// A path that commits no datatype is refused too, for the same reason: the
+/// reference would name nothing.
+#[test]
+fn a_dataset_naming_a_type_the_file_does_not_commit_is_refused() {
+    let mut builder = hdf5_pure::FileBuilder::new();
+    builder
+        .create_dataset("typed")
+        .with_i32_data(&DATASET_VALUES)
+        .with_committed_datatype("nosuchtype");
+    let message = builder.finish().unwrap_err().to_string();
+    assert!(
+        message.contains("no committed datatype is written at path \"nosuchtype\""),
+        "expected an unknown-path refusal, got: {message}"
+    );
+}
+
+/// Dropping the *group* a committed type lives in is refused where something
+/// outside that group still names the type.
+///
+/// The drop set names the group, not the type, so a membership test on the type's
+/// own path sees nothing dropped and lets the repack proceed to a dataset naming
+/// an object the output does not contain. The whole subtree goes with a dropped
+/// group, so the check has to look at ancestors too.
+#[test]
+fn repack_refuses_dropping_the_group_a_named_type_lives_in() {
+    let _c = c_lib_guard();
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("nested.h5");
+    let dst = dir.path().join("repacked.h5");
+
+    {
+        let file = hdf5::File::create(&src).expect("create fixture");
+        let dtype = hdf5::Datatype::from_type::<i32>().expect("transient i32 type");
+        let group_name = CString::new("types").unwrap();
+        let group =
+            unsafe { H5Gcreate2(file.id(), group_name.as_ptr(), DEFAULT, DEFAULT, DEFAULT) };
+        assert!(group >= 0, "H5Gcreate2 failed");
+        let type_name = CString::new("mytype").unwrap();
         assert!(
-            message.contains(expected),
-            "repack must refuse {what} naming it; expected {expected:?}, got: {message}"
+            unsafe {
+                H5Tcommit2(
+                    group,
+                    type_name.as_ptr(),
+                    dtype.id(),
+                    DEFAULT,
+                    DEFAULT,
+                    DEFAULT,
+                )
+            } >= 0,
+            "H5Tcommit2 failed"
         );
+
+        // The dataset is outside the group, so dropping the group leaves it
+        // naming a type the output has not got.
+        let three = [3u64];
+        let space = unsafe { H5Screate_simple(1, three.as_ptr(), std::ptr::null()) };
+        let dset_name = CString::new("typed").unwrap();
+        let dset = unsafe {
+            H5Dcreate2(
+                file.id(),
+                dset_name.as_ptr(),
+                dtype.id(),
+                space,
+                DEFAULT,
+                DEFAULT,
+                DEFAULT,
+            )
+        };
+        assert!(dset >= 0, "H5Dcreate2 failed");
         assert!(
-            !dst.exists() || std::fs::metadata(&dst).unwrap().len() == 0,
-            "a refused repack must not leave a readable output behind ({what})"
+            unsafe {
+                H5Dwrite(
+                    dset,
+                    dtype.id(),
+                    DEFAULT,
+                    DEFAULT,
+                    DEFAULT,
+                    DATASET_VALUES.as_ptr().cast::<c_void>(),
+                )
+            } >= 0,
+            "H5Dwrite failed"
+        );
+        unsafe {
+            H5Dclose(dset);
+            H5Sclose(space);
+            H5Gclose(group);
+        }
+    }
+
+    let options = RepackOptions::new().drop_path("types");
+    let message = hdf5_pure::repack(&src, &dst, &options)
+        .expect_err("dropping the group the type lives in must fail")
+        .to_string();
+    assert!(
+        message.contains("types/mytype") && message.contains("drops"),
+        "the refusal must name the type inside the dropped group, got: {message}"
+    );
+}
+
+/// An object reference *to* a committed datatype crosses a repack, pointing at
+/// the type's new address.
+///
+/// A committed datatype is an object, so `H5Rcreate` can address one, and repack
+/// resolves such a reference exactly as it resolves one to a dataset or group.
+/// Before the named type object was reproduced there was nothing on the other end
+/// to point at, and the reference was refused.
+#[test]
+fn an_object_reference_to_a_committed_type_survives_a_repack() {
+    let _c = c_lib_guard();
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("refs.h5");
+    let dst = dir.path().join("repacked.h5");
+    write_committed_fixture(&src, EVERYTHING);
+
+    // Add a reference dataset pointing at `/mytype`, through the safe API.
+    {
+        let file = hdf5::File::open_rw(&src).expect("reopen fixture");
+        let reference: ObjectReference1 = file
+            .reference("mytype")
+            .expect("reference the committed type");
+        file.new_dataset::<ObjectReference1>()
+            .shape([1])
+            .create("refs")
+            .expect("create /refs")
+            .write(&[reference])
+            .expect("write /refs");
+    }
+
+    hdf5_pure::repack(&src, &dst, &RepackOptions::new()).expect("repack a reference to a type");
+
+    let file = hdf5::File::open(&dst).expect("C library opens the output");
+    let refs = file
+        .dataset("refs")
+        .unwrap()
+        .read_1d::<ObjectReference1>()
+        .unwrap();
+    let target = file
+        .dereference(&refs[0])
+        .expect("the reference must resolve in the output");
+    assert!(
+        matches!(target, ReferencedObject::Datatype(_)),
+        "the reference must still point at the committed datatype, got {target:?}"
+    );
+}
+
+/// An in-place edit refuses to add a dataset or attribute naming a committed
+/// datatype, rather than quietly writing the type inline.
+///
+/// The edit engine appends into a file whose layout is already fixed, so there is
+/// nowhere to place the named type object and nothing to resolve the path
+/// against. Inlining would produce a dataset that reads back correctly while no
+/// longer sharing the named type — the silent degradation this crate refuses.
+#[test]
+fn an_in_place_edit_refuses_a_committed_datatype() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("edit.h5");
+
+    let mut builder = hdf5_pure::FileBuilder::new();
+    builder.commit_datatype("mytype", committed_i32());
+    builder
+        .create_dataset("seed")
+        .with_i32_data(&DATASET_VALUES);
+    builder.write(&path).expect("write the base file");
+
+    for (what, configure) in [
+        (
+            "a dataset element type",
+            Box::new(|db: &mut hdf5_pure::DatasetBuilder| {
+                db.with_i32_data(&DATASET_VALUES)
+                    .with_committed_datatype("mytype");
+            }) as Box<dyn Fn(&mut hdf5_pure::DatasetBuilder)>,
+        ),
+        (
+            "an attribute datatype",
+            Box::new(|db: &mut hdf5_pure::DatasetBuilder| {
+                db.with_i32_data(&DATASET_VALUES).set_attr_committed(
+                    "a",
+                    AttrValue::I32(ATTR_VALUE),
+                    "mytype",
+                );
+            }),
+        ),
+    ] {
+        let file = File::open_rw(&path).expect("open for editing");
+        file.root()
+            .create_dataset("added", |db| configure(db))
+            .expect("staging is where the builder is recorded, not where it is written");
+        let message = file
+            .commit()
+            .expect_err("naming a committed type in place must fail")
+            .to_string();
+        assert!(
+            message.contains("committed"),
+            "the refusal must name what it refused ({what}), got: {message}"
         );
     }
+
+    // The file is unchanged: a refused edit adds nothing.
+    let out = File::open(&path).unwrap();
+    assert_eq!(out.root().datasets().unwrap(), vec!["seed".to_string()]);
 }

@@ -19,7 +19,7 @@
 //! byte distinguishes the two destinations only from version 2 on.
 
 #[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
@@ -155,6 +155,80 @@ pub fn parse_shared_ref(
     }
 }
 
+/// The shared-reference version this crate writes.
+///
+/// Version 2 is what libhdf5 1.14 encodes for every committed datatype, and the
+/// only version whose body is just the address: version 1 buries it behind a
+/// symbol-table entry, and version 3 differs only in admitting a heap id this
+/// crate does not write.
+const WRITE_REF_VERSION: u8 = 2;
+
+/// Encode a reference to the committed datatype object at `address`.
+///
+/// The inverse of the version 2 arm of [`parse_shared_ref`], and the body a
+/// message record with the shared flag carries in place of its content.
+pub fn encode_committed_ref(address: u64, offset_size: u8) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(2 + offset_size as usize);
+    buf.push(WRITE_REF_VERSION);
+    buf.push(REF_TYPE_COMMITTED);
+    buf.extend_from_slice(&address.to_le_bytes()[..offset_size as usize]);
+    buf
+}
+
+/// Where a datatype is stored, for a message that could hold it either way.
+///
+/// A datatype is the one part of a dataset or attribute that can live outside
+/// the message describing it: `H5Tcommit` puts it in its own object header, and
+/// everything using it carries a reference in place of the encoding. Both forms
+/// decode to the same [`Datatype`](crate::datatype::Datatype), so this is what
+/// separates a message that *names* a type from one that spells it out — a
+/// distinction `h5dump` reports, and a rewrite has to preserve.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum DatatypeLocation {
+    /// Encoded in the message itself.
+    #[default]
+    Inline,
+    /// A reference to the committed datatype object at this address, in the file
+    /// the message belongs to. What a parse reads out of a file, and what a
+    /// writer emits once the object's address is fixed.
+    Committed(u64),
+    /// Staged for writing: a reference to the committed datatype object the file
+    /// under construction places at this path.
+    ///
+    /// Addresses are not known until the whole layout is, so the writer sizes
+    /// headers against this variant and resolves it to [`Self::Committed`] in the
+    /// same pass that assigns addresses. Serializing one writes the undefined
+    /// address, so a reference that misses that pass names nothing rather than
+    /// silently naming the superblock.
+    CommittedPath(String),
+}
+
+impl DatatypeLocation {
+    /// The reference body to write in place of the datatype encoding, or `None`
+    /// when the datatype is written inline.
+    pub fn reference_bytes(&self, offset_size: u8) -> Option<Vec<u8>> {
+        match self {
+            Self::Inline => None,
+            Self::Committed(addr) => Some(encode_committed_ref(*addr, offset_size)),
+            Self::CommittedPath(_) => Some(encode_committed_ref(u64::MAX, offset_size)),
+        }
+    }
+
+    /// The path this location still has to have resolved, if any.
+    pub fn unresolved_path(&self) -> Option<&str> {
+        match self {
+            Self::CommittedPath(path) => Some(path),
+            Self::Inline | Self::Committed(_) => None,
+        }
+    }
+
+    /// Whether the datatype lives in a committed object rather than in the
+    /// message.
+    pub fn is_committed(&self) -> bool {
+        !matches!(self, Self::Inline)
+    }
+}
+
 /// Reads the message a reference stands in for.
 ///
 /// A reference names an address in the file, which the body holding it does not
@@ -165,6 +239,14 @@ pub trait SharedResolver {
     /// Resolve `reference` — the body of a shared message — into the bytes of the
     /// `target`-typed message it names.
     fn resolve(&self, reference: &[u8], target: MessageType) -> Result<Vec<u8>, FormatError>;
+
+    /// The object-header address `reference` names, without reading it.
+    ///
+    /// A rewrite needs the address as well as the content: the content says what
+    /// the type *is*, and the address says which committed object every user of
+    /// it shares — which is what makes them one named type on the other side
+    /// rather than several copies.
+    fn committed_address(&self, reference: &[u8]) -> Result<u64, FormatError>;
 }
 
 /// Resolves references against a whole-file slice, already framed at the file's
@@ -196,6 +278,14 @@ impl SharedResolver for BufferedResolver<'_> {
             self.length_size,
         )?;
         select_shared_message(&header, target, addr)
+    }
+
+    fn committed_address(&self, reference: &[u8]) -> Result<u64, FormatError> {
+        object_header_address(&parse_shared_ref(
+            reference,
+            self.offset_size,
+            self.length_size,
+        )?)
     }
 }
 
@@ -232,6 +322,14 @@ impl<S: Source + ?Sized> SharedResolver for SourceResolver<'_, S> {
         )?;
         select_shared_message(&header, target, addr)
     }
+
+    fn committed_address(&self, reference: &[u8]) -> Result<u64, FormatError> {
+        object_header_address(&parse_shared_ref(
+            reference,
+            self.offset_size,
+            self.length_size,
+        )?)
+    }
 }
 
 /// Refuses every reference, for parses that hold a message body but not the file
@@ -242,6 +340,15 @@ pub struct Unresolvable;
 impl SharedResolver for Unresolvable {
     fn resolve(&self, _reference: &[u8], target: MessageType) -> Result<Vec<u8>, FormatError> {
         Err(FormatError::UnresolvedSharedMessage(target.to_u16()))
+    }
+
+    /// Refused for the same reason as [`Self::resolve`]: the address is stored in
+    /// the file's own offset width, which a parse without that file does not
+    /// know, so any answer here would be a guess at the field width.
+    fn committed_address(&self, _reference: &[u8]) -> Result<u64, FormatError> {
+        Err(FormatError::UnresolvedSharedMessage(
+            MessageType::Datatype.to_u16(),
+        ))
     }
 }
 

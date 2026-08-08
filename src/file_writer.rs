@@ -35,10 +35,12 @@ use crate::libver::LibVer;
 use crate::link_message::{LinkMessage, LinkTarget};
 use crate::message_type::MessageType;
 use crate::object_header_writer::ObjectHeaderWriter;
+use crate::shared_message::DatatypeLocation;
 use crate::superblock::Superblock;
 use crate::type_builders::{
-    AttrSpec, DatasetBuilder, FinishedGroup, GroupBuilder, VlStringStaging,
-    build_global_heap_collections, patch_vl_refs, patch_vl_refs_masked, write_reference_address,
+    AttrSpec, CommittedDatatype, DatasetBuilder, FinishedGroup, GroupBuilder, VlStringStaging,
+    build_attr_message, build_global_heap_collections, normalize_object_path, patch_vl_refs,
+    patch_vl_refs_masked, write_reference_address,
 };
 
 // `AttrValue` lives in `type_builders`; `types` and `mat` reference it through
@@ -50,6 +52,16 @@ use crate::datatype::{CharacterSet, Datatype};
 pub(crate) const OFFSET_SIZE: u8 = 8;
 pub(crate) const LENGTH_SIZE: u8 = 8;
 const SUPERBLOCK_SIZE: usize = 48;
+
+/// Object-header message record flags (`H5O_MSG_FLAG_*`).
+///
+/// The message's content cannot change once written (`H5O_MSG_FLAG_CONSTANT`).
+const MSG_CONSTANT: u8 = 0x01;
+/// The message body is a reference to the message rather than the message
+/// itself (`H5O_MSG_FLAG_SHARED`).
+const MSG_SHARED: u8 = 0x02;
+/// The message must not be moved into shared storage (`H5O_MSG_FLAG_DONTSHARE`).
+const MSG_DONTSHARE: u8 = 0x04;
 
 /// Threshold for switching from compact (inline) to dense attribute storage.
 const DENSE_ATTR_THRESHOLD: usize = 8;
@@ -64,6 +76,7 @@ fn align_up(value: u64, page: u64) -> u64 {
 
 pub(crate) fn build_chunked_dataset_oh(
     dt: &Datatype,
+    dt_location: &DatatypeLocation,
     ds: &Dataspace,
     layout_message: &[u8],
     pipeline_message: Option<&[u8]>,
@@ -72,7 +85,7 @@ pub(crate) fn build_chunked_dataset_oh(
     fill: Option<&[u8]>,
 ) -> Result<Vec<u8>, FormatError> {
     let mut w = ObjectHeaderWriter::new();
-    w.add_message_with_flags(MessageType::Datatype, dt.serialize(), 0x01);
+    add_datatype(&mut w, dt, dt_location);
     w.add_message(MessageType::Dataspace, ds.serialize(LENGTH_SIZE));
     w.add_message_with_flags(
         MessageType::FillValue,
@@ -112,6 +125,7 @@ pub(crate) fn contiguous_layout_version(libver: LibVer) -> u8 {
 
 pub(crate) fn build_dataset_oh(
     dt: &Datatype,
+    dt_location: &DatatypeLocation,
     ds: &Dataspace,
     data_addr: u64,
     data_size: u64,
@@ -121,7 +135,7 @@ pub(crate) fn build_dataset_oh(
     libver: LibVer,
 ) -> Result<Vec<u8>, FormatError> {
     let mut w = ObjectHeaderWriter::new();
-    w.add_message_with_flags(MessageType::Datatype, dt.serialize(), 0x01);
+    add_datatype(&mut w, dt, dt_location);
     w.add_message(MessageType::Dataspace, ds.serialize(LENGTH_SIZE));
     w.add_message_with_flags(
         MessageType::FillValue,
@@ -135,6 +149,62 @@ pub(crate) fn build_dataset_oh(
     dl.extend_from_slice(&data_size.to_le_bytes());
     w.add_message(MessageType::DataLayout, dl);
     add_attributes(&mut w, attrs, dense_blob);
+    w.serialize()
+}
+
+/// Add a dataset's Datatype message: the encoding itself, or — when the type is
+/// committed — the reference standing in for it, under a record whose shared flag
+/// says the body is one. Without that flag the ten reference bytes decode as a
+/// zero-width time datatype, which is the defect issue #254 was filed for.
+fn add_datatype(w: &mut ObjectHeaderWriter, dt: &Datatype, location: &DatatypeLocation) {
+    match location.reference_bytes(OFFSET_SIZE) {
+        Some(reference) => {
+            w.add_message_with_flags(MessageType::Datatype, reference, MSG_CONSTANT | MSG_SHARED);
+        }
+        None => w.add_message_with_flags(MessageType::Datatype, dt.serialize(), MSG_CONSTANT),
+    }
+}
+
+/// Build the object header of a committed (`H5Tcommit`) datatype object.
+///
+/// What makes the object a named datatype is the message set: the C library's
+/// `H5O__dtype_isa` calls any header holding a Datatype message and no dataspace
+/// or layout one a datatype, which is also how this crate's reader tells them
+/// apart.
+///
+/// `references` is the object's link count *plus* every message that names it
+/// through a shared reference, matching `H5O_link`, which the C library calls
+/// once per hard link and once more each time a dataset or attribute is created
+/// against the committed type. It goes in an Object Reference Count message,
+/// which the format only carries above one — a header without one reads as
+/// singly referenced.
+///
+/// Nothing *reading* the file notices a wrong count. It decides what a later
+/// unlink does: the C library decrements it and deletes the object at zero, so a
+/// count of 1 means unlinking the name takes the type away from every object
+/// still naming it. (Measured here, the datasets kept reading afterwards — the
+/// freed header had not been reused yet — which is what makes an undercount a
+/// latent fault rather than an immediate one.)
+///
+/// The message flags match what libhdf5 writes: constant, since a committed
+/// type's datatype never changes, and do-not-share, since this copy *is* the
+/// shared one and must not be moved into shared storage again.
+pub(crate) fn build_committed_datatype_oh(
+    dt: &Datatype,
+    references: u32,
+) -> Result<Vec<u8>, FormatError> {
+    let mut w = ObjectHeaderWriter::new();
+    w.add_message_with_flags(
+        MessageType::Datatype,
+        dt.serialize(),
+        MSG_CONSTANT | MSG_DONTSHARE,
+    );
+    if references > 1 {
+        let mut refcount = Vec::with_capacity(5);
+        refcount.push(0); // version
+        refcount.extend_from_slice(&references.to_le_bytes());
+        w.add_message_with_flags(MessageType::ObjectReferenceCount, refcount, MSG_DONTSHARE);
+    }
     w.serialize()
 }
 
@@ -749,6 +819,7 @@ pub(crate) fn write_undef_offset(buf: &mut Vec<u8>, offset_size: u8) {
 pub struct FileWriter {
     root_datasets: Vec<DatasetBuilder>,
     root_attrs: Vec<(String, AttrSpec)>,
+    root_committed: Vec<CommittedDatatype>,
     groups: Vec<FinishedGroup>,
     userblock_size: u64,
     /// Bytes to emit at the head of the userblock region, from
@@ -777,6 +848,7 @@ impl FileWriter {
         Self {
             root_datasets: Vec::new(),
             root_attrs: Vec::new(),
+            root_committed: Vec::new(),
             groups: Vec::new(),
             userblock_size: 0,
             userblock_content: Vec::new(),
@@ -984,6 +1056,24 @@ impl FileWriter {
         self.root_datasets.last_mut().unwrap()
     }
 
+    /// Commit `datatype` in the root group under `name`.
+    ///
+    /// See [`FileBuilder::commit_datatype`](crate::FileBuilder::commit_datatype).
+    pub fn commit_datatype(&mut self, name: &str, datatype: Datatype) {
+        self.root_committed.push(CommittedDatatype {
+            name: name.to_string(),
+            datatype,
+        });
+    }
+
+    /// Attach a root-group attribute whose datatype is the committed one at
+    /// `path`. See [`DatasetBuilder::set_attr_committed`].
+    pub fn set_root_attr_committed(&mut self, name: &str, value: AttrValue, path: &str) {
+        let mut message = build_attr_message(name, &value);
+        message.datatype_location = DatatypeLocation::CommittedPath(normalize_object_path(path));
+        self.set_root_attr_verbatim(message);
+    }
+
     pub fn set_root_attr(&mut self, name: &str, value: AttrValue) {
         self.root_attrs
             .push((name.to_string(), AttrSpec::Value(value)));
@@ -1116,6 +1206,9 @@ impl FileWriter {
         struct DsFlat {
             name: String,
             dt: Datatype,
+            /// Where `dt` is written: in this dataset's header, or in a committed
+            /// datatype object it names.
+            dt_location: DatatypeLocation,
             ds: Dataspace,
             raw: Vec<u8>,
             attrs: Vec<AttributeMessage>,
@@ -1341,10 +1434,23 @@ impl FileWriter {
             attrs: Vec<AttributeMessage>,
             ds_indices: Vec<usize>,
             sub_group_indices: Vec<usize>,
+            committed_indices: Vec<usize>,
+        }
+
+        /// One committed datatype object, flattened out of the group tree.
+        struct CtFlat {
+            /// Link name in the owning group.
+            name: String,
+            dt: Datatype,
+            /// Hard links plus shared references, completed once every dataset
+            /// and attribute in the file has been counted (see
+            /// `register_committed_use`).
+            references: u32,
         }
 
         let mut all_ds: Vec<DsFlat> = Vec::new();
         let mut groups: Vec<GrpFlat> = Vec::new();
+        let mut committed: Vec<CtFlat> = Vec::new();
         let mut root_ds_indices: Vec<usize> = Vec::new();
         let mut root_group_indices: Vec<usize> = Vec::new();
 
@@ -1471,6 +1577,7 @@ impl FileWriter {
             all_ds.push(DsFlat {
                 name: db.name,
                 dt,
+                dt_location: db.datatype_location,
                 ds: dspace,
                 raw,
                 attrs,
@@ -1486,10 +1593,32 @@ impl FileWriter {
             Ok(idx)
         }
 
+        /// Flatten one group's committed datatypes into the file-wide list,
+        /// returning their indices.
+        fn flatten_committed(
+            types: Vec<CommittedDatatype>,
+            committed: &mut Vec<CtFlat>,
+        ) -> Vec<usize> {
+            types
+                .into_iter()
+                .map(|ct| {
+                    committed.push(CtFlat {
+                        name: ct.name,
+                        dt: ct.datatype,
+                        // One hard link. Every shared reference to it adds one
+                        // more, counted once the whole file is flattened.
+                        references: 1,
+                    });
+                    committed.len() - 1
+                })
+                .collect()
+        }
+
         fn flatten_group(
             g: FinishedGroup,
             all_ds: &mut Vec<DsFlat>,
             groups: &mut Vec<GrpFlat>,
+            committed: &mut Vec<CtFlat>,
             grp_vl: &mut Vec<Vec<VlPatch>>,
             ds_vl: &mut Vec<Vec<VlPatch>>,
         ) -> Result<usize, FormatError> {
@@ -1498,13 +1627,14 @@ impl FileWriter {
             for (n, v) in &g.attrs {
                 gattrs.push(v.to_message(n));
             }
+            let committed_idx = flatten_committed(g.committed, committed);
             let mut ds_idx = Vec::new();
             for db in g.datasets {
                 ds_idx.push(flatten_dataset(db, all_ds, ds_vl)?);
             }
             let mut sub_grp_idx = Vec::new();
             for sg in g.sub_groups {
-                sub_grp_idx.push(flatten_group(sg, all_ds, groups, grp_vl, ds_vl)?);
+                sub_grp_idx.push(flatten_group(sg, all_ds, groups, committed, grp_vl, ds_vl)?);
             }
             let gi = groups.len();
             groups.push(GrpFlat {
@@ -1512,6 +1642,7 @@ impl FileWriter {
                 attrs: gattrs,
                 ds_indices: ds_idx,
                 sub_group_indices: sub_grp_idx,
+                committed_indices: committed_idx,
             });
             grp_vl.push(patches);
             Ok(gi)
@@ -1519,6 +1650,8 @@ impl FileWriter {
 
         let mut grp_vl: Vec<Vec<VlPatch>> = Vec::new();
         let mut ds_vl: Vec<Vec<VlPatch>> = Vec::new();
+
+        let root_committed_indices = flatten_committed(self.root_committed, &mut committed);
 
         for db in self.root_datasets {
             root_ds_indices.push(flatten_dataset(db, &mut all_ds, &mut ds_vl)?);
@@ -1529,6 +1662,7 @@ impl FileWriter {
                 g,
                 &mut all_ds,
                 &mut groups,
+                &mut committed,
                 &mut grp_vl,
                 &mut ds_vl,
             )?);
@@ -1578,6 +1712,169 @@ impl FileWriter {
         for (n, v) in &self.root_attrs {
             root_attrs.push(v.to_message(n));
         }
+
+        // ---- Committed datatypes: paths, reference counts, and agreement ----
+        //
+        // Done before any sizing, because a committed type's own header carries
+        // its reference count and so changes length with it, and because a
+        // dataset that names a type the file does not commit must be refused
+        // before the layout is half built.
+        let committed_paths: Vec<(String, usize)> = {
+            fn walk(
+                prefix: &str,
+                gi: usize,
+                groups: &[GrpFlat],
+                committed: &[CtFlat],
+                out: &mut Vec<(String, usize)>,
+            ) {
+                for &ci in &groups[gi].committed_indices {
+                    out.push((format!("{prefix}/{}", committed[ci].name), ci));
+                }
+                for &sgi in &groups[gi].sub_group_indices {
+                    walk(
+                        &format!("{prefix}/{}", groups[sgi].name),
+                        sgi,
+                        groups,
+                        committed,
+                        out,
+                    );
+                }
+            }
+            let mut out: Vec<(String, usize)> = root_committed_indices
+                .iter()
+                .map(|&ci| (committed[ci].name.clone(), ci))
+                .collect();
+            for &gi in &root_group_indices {
+                walk(&groups[gi].name, gi, &groups, &committed, &mut out);
+            }
+            out
+        };
+        let committed_by_path: HashMap<&str, usize> = committed_paths
+            .iter()
+            .map(|(path, ci)| (path.as_str(), *ci))
+            .collect();
+
+        /// Register one use of a committed datatype: resolve the path it names,
+        /// check that the user and the committed object describe the same type,
+        /// and add the use to the object's reference count.
+        ///
+        /// The agreement check is what keeps the two encodings from disagreeing.
+        /// A reader takes the committed one — it is the only one in the file — so
+        /// a dataset written with a mismatched inline declaration would have its
+        /// element bytes read under a type it was not encoded in, silently.
+        fn register_committed_use(
+            committed: &mut [CtFlat],
+            by_path: &HashMap<&str, usize>,
+            location: &DatatypeLocation,
+            dt: &Datatype,
+            user: &str,
+        ) -> Result<(), FormatError> {
+            let Some(path) = location.unresolved_path() else {
+                return Ok(());
+            };
+            let Some(&ci) = by_path.get(path) else {
+                return Err(FormatError::UnknownCommittedDatatype(path.to_string()));
+            };
+            if committed[ci].dt.serialize() != dt.serialize() {
+                return Err(FormatError::CommittedDatatypeMismatch {
+                    path: path.to_string(),
+                    user: user.to_string(),
+                });
+            }
+            committed[ci].references = committed[ci].references.saturating_add(1);
+            Ok(())
+        }
+
+        for attr in &root_attrs {
+            register_committed_use(
+                &mut committed,
+                &committed_by_path,
+                &attr.datatype_location,
+                &attr.datatype,
+                &format!("root attribute {:?}", attr.name),
+            )?;
+        }
+        for g in &groups {
+            for attr in &g.attrs {
+                register_committed_use(
+                    &mut committed,
+                    &committed_by_path,
+                    &attr.datatype_location,
+                    &attr.datatype,
+                    &format!("attribute {:?} of group {:?}", attr.name, g.name),
+                )?;
+            }
+        }
+        for d in &all_ds {
+            register_committed_use(
+                &mut committed,
+                &committed_by_path,
+                &d.dt_location,
+                &d.dt,
+                &format!("dataset {:?}", d.name),
+            )?;
+            for attr in &d.attrs {
+                register_committed_use(
+                    &mut committed,
+                    &committed_by_path,
+                    &attr.datatype_location,
+                    &attr.datatype,
+                    &format!("attribute {:?} of dataset {:?}", attr.name, d.name),
+                )?;
+            }
+        }
+
+        // Every committed type's header is now final: its content is a datatype
+        // and a reference count, neither of which depends on where anything in
+        // the file lands. So it is built once here and only placed below, unlike
+        // every other header, which is sized against dummy addresses and rebuilt.
+        let committed_oh: Vec<Vec<u8>> = committed
+            .iter()
+            .map(|ct| build_committed_datatype_oh(&ct.dt, ct.references))
+            .collect::<Result<_, _>>()?;
+
+        /// The links one group carries, in the order they are written: its
+        /// datasets, its committed datatypes, then its subgroups.
+        ///
+        /// Assembled in one place because the sizing pass and the two emission
+        /// paths have to agree exactly on what a group contains. A link the
+        /// sizing pass does not know about is a header longer than the span
+        /// reserved for it, which silently moves every object after it.
+        #[expect(
+            clippy::too_many_arguments,
+            reason = "three child kinds, each needing its flat list and its address vector"
+        )]
+        fn group_links(
+            ds_indices: &[usize],
+            committed_indices: &[usize],
+            sub_group_indices: &[usize],
+            all_ds: &[DsFlat],
+            committed: &[CtFlat],
+            groups: &[GrpFlat],
+            ds_addrs: &[u64],
+            committed_addrs: &[u64],
+            group_addrs: &[u64],
+        ) -> Vec<LinkMessage> {
+            let mut links = Vec::with_capacity(
+                ds_indices.len() + committed_indices.len() + sub_group_indices.len(),
+            );
+            for &i in ds_indices {
+                links.push(make_link(&all_ds[i].name, ds_addrs[i]));
+            }
+            for &ci in committed_indices {
+                links.push(make_link(&committed[ci].name, committed_addrs[ci]));
+            }
+            for &gi in sub_group_indices {
+                links.push(make_link(&groups[gi].name, group_addrs[gi]));
+            }
+            links
+        }
+
+        // Addresses the sizing pass uses. A link's byte length does not depend on
+        // the address it carries, so zeros give the real header size.
+        let dummy_ds_addrs = vec![0u64; all_ds.len()];
+        let dummy_ct_addrs = vec![0u64; committed.len()];
+        let dummy_grp_addrs = vec![0u64; groups.len()];
 
         let root_dense = needs_dense_attrs(&root_attrs);
         let group_dense: Vec<bool> = groups.iter().map(|g| needs_dense_attrs(&g.attrs)).collect();
@@ -1800,14 +2097,17 @@ impl FileWriter {
         let mut group_oh_sizes: Vec<usize> = Vec::with_capacity(groups.len());
         let mut group_dense_lens: Vec<Option<usize>> = Vec::with_capacity(groups.len());
         for (gi, g) in groups.iter().enumerate() {
-            let mut dummy_links: Vec<LinkMessage> = g
-                .ds_indices
-                .iter()
-                .map(|&i| make_link(&all_ds[i].name, 0))
-                .collect();
-            for &sgi in &g.sub_group_indices {
-                dummy_links.push(make_link(&groups[sgi].name, 0));
-            }
+            let dummy_links = group_links(
+                &g.ds_indices,
+                &g.committed_indices,
+                &g.sub_group_indices,
+                &all_ds,
+                &committed,
+                &groups,
+                &dummy_ds_addrs,
+                &dummy_ct_addrs,
+                &dummy_grp_addrs,
+            );
             let (oh, dense_len) = if group_dense[gi] {
                 let dummy_blob = build_dense_attrs(&g.attrs, 0);
                 let len = dummy_blob.blob.len();
@@ -1822,16 +2122,17 @@ impl FileWriter {
             group_dense_lens.push(dense_len);
         }
 
-        let root_dummy_links: Vec<LinkMessage> = {
-            let mut links = Vec::new();
-            for &i in &root_ds_indices {
-                links.push(make_link(&all_ds[i].name, 0));
-            }
-            for &gi in &root_group_indices {
-                links.push(make_link(&groups[gi].name, 0));
-            }
-            links
-        };
+        let root_dummy_links = group_links(
+            &root_ds_indices,
+            &root_committed_indices,
+            &root_group_indices,
+            &all_ds,
+            &committed,
+            &groups,
+            &dummy_ds_addrs,
+            &dummy_ct_addrs,
+            &dummy_grp_addrs,
+        );
         let (root_oh_size, root_dense_len) = if root_dense {
             let dummy_blob = build_dense_attrs(&root_attrs, 0);
             let len = dummy_blob.blob.len();
@@ -1873,6 +2174,7 @@ impl FileWriter {
                 ds_data_lens.push(built.data.len());
                 build_chunked_dataset_oh(
                     &d.dt,
+                    &d.dt_location,
                     &d.ds,
                     &built.layout_message,
                     built.pipeline_message.as_deref(),
@@ -1884,6 +2186,7 @@ impl FileWriter {
                 ds_data_lens.push(d.contiguous_len());
                 build_dataset_oh(
                     &d.dt,
+                    &d.dt_location,
                     &d.ds,
                     0,
                     d.contiguous_len(),
@@ -1942,6 +2245,19 @@ impl FileWriter {
             })
             .collect();
 
+        // Committed datatype headers. Placed with the other metadata so a paged
+        // file keeps them in its metadata region, and before the datasets that
+        // reference them only because the cursor has to run in some order —
+        // nothing here depends on the relative placement.
+        let committed_addrs: Vec<u64> = committed_oh
+            .iter()
+            .map(|oh| {
+                let addr = cursor2 as u64;
+                cursor2 += oh.len();
+                addr
+            })
+            .collect();
+
         let mut ds_dense_spans: Vec<Option<(u64, usize)>> = Vec::with_capacity(all_ds.len());
         let ds_oh_addrs2: Vec<u64> = actual_ds_oh_sizes
             .iter()
@@ -1973,6 +2289,11 @@ impl FileWriter {
             path_map.insert(String::new(), root_group_addr);
             for &i in &root_ds_indices {
                 path_map.insert(all_ds[i].name.clone(), ds_oh_addrs2[i]);
+            }
+            // A committed datatype is an object like any other, so an object
+            // reference can point at one. Its path was already computed, above.
+            for (path, ci) in &committed_paths {
+                path_map.insert(path.clone(), committed_addrs[*ci]);
             }
             for &gi in &root_group_indices {
                 fn register_group(
@@ -2026,6 +2347,37 @@ impl FileWriter {
                         crate::type_builders::ObjectRefTarget::Raw(addr) => *addr,
                     };
                     write_reference_address(&mut d.raw, patch.byte_offset, addr);
+                }
+            }
+        }
+
+        // Resolve every committed-datatype reference, now that the objects have
+        // addresses. From here on a `CommittedPath` cannot survive: the loops
+        // below cover every dataset and every attribute in the file, which is
+        // exactly the set `register_committed_use` walked to validate the paths.
+        {
+            let resolve = |location: &mut DatatypeLocation| {
+                let ci = match location.unresolved_path() {
+                    Some(path) => *committed_by_path.get(path).expect(
+                        "every committed-datatype path was resolved against this same map \
+                         before any header was sized",
+                    ),
+                    None => return,
+                };
+                *location = DatatypeLocation::Committed(committed_addrs[ci]);
+            };
+            for attr in &mut root_attrs {
+                resolve(&mut attr.datatype_location);
+            }
+            for g in &mut groups {
+                for attr in &mut g.attrs {
+                    resolve(&mut attr.datatype_location);
+                }
+            }
+            for d in &mut all_ds {
+                resolve(&mut d.dt_location);
+                for attr in &mut d.attrs {
+                    resolve(&mut attr.datatype_location);
                 }
             }
         }
@@ -2323,6 +2675,7 @@ impl FileWriter {
                 let oh = if let Some((ref lm, ref pm)) = layout.chunked_msgs {
                     build_chunked_dataset_oh(
                         &d.dt,
+                        &d.dt_location,
                         &d.ds,
                         lm,
                         pm.as_deref(),
@@ -2333,6 +2686,7 @@ impl FileWriter {
                 } else {
                     build_dataset_oh(
                         &d.dt,
+                        &d.dt_location,
                         &d.ds,
                         layout.data_addr,
                         layout.data.len(),
@@ -2425,42 +2779,46 @@ impl FileWriter {
             }
 
             // Root group OH + dense blob.
-            let root_links: Vec<LinkMessage> = {
-                let mut v = Vec::new();
-                for &i in &root_ds_indices {
-                    v.push(make_link(&all_ds[i].name, ds_oh_addrs2[i]));
-                }
-                for &gi in &root_group_indices {
-                    v.push(make_link(&groups[gi].name, group_addrs2[gi]));
-                }
-                v
-            };
-            sink.put(&build_group_oh(
-                &root_links,
-                &root_attrs,
-                root_dense_blob.as_ref(),
-            )?)?;
+            let root_links = group_links(
+                &root_ds_indices,
+                &root_committed_indices,
+                &root_group_indices,
+                &all_ds,
+                &committed,
+                &groups,
+                &ds_oh_addrs2,
+                &committed_addrs,
+                &group_addrs2,
+            );
+            let root_oh = build_group_oh(&root_links, &root_attrs, root_dense_blob.as_ref())?;
+            debug_assert_eq!(root_oh.len(), root_oh_size);
+            sink.put(&root_oh)?;
             if let Some(ref blob) = root_dense_blob {
                 sink.put(&blob.blob)?;
             }
             // Group OHs + dense blobs.
             for (gi, g) in groups.iter().enumerate() {
-                let mut links: Vec<LinkMessage> = g
-                    .ds_indices
-                    .iter()
-                    .map(|&i| make_link(&all_ds[i].name, ds_oh_addrs2[i]))
-                    .collect();
-                for &sgi in &g.sub_group_indices {
-                    links.push(make_link(&groups[sgi].name, group_addrs2[sgi]));
-                }
-                sink.put(&build_group_oh(
-                    &links,
-                    &g.attrs,
-                    group_dense_blobs[gi].as_ref(),
-                )?)?;
+                let links = group_links(
+                    &g.ds_indices,
+                    &g.committed_indices,
+                    &g.sub_group_indices,
+                    &all_ds,
+                    &committed,
+                    &groups,
+                    &ds_oh_addrs2,
+                    &committed_addrs,
+                    &group_addrs2,
+                );
+                let oh = build_group_oh(&links, &g.attrs, group_dense_blobs[gi].as_ref())?;
+                debug_assert_eq!(oh.len(), group_oh_sizes[gi]);
+                sink.put(&oh)?;
                 if let Some(ref blob) = group_dense_blobs[gi] {
                     sink.put(&blob.blob)?;
                 }
+            }
+            // Committed datatype OHs, at the addresses their references name.
+            for oh in &committed_oh {
+                sink.put(oh)?;
             }
             // Dataset OHs + dense blobs.
             for (i, oh) in ds_oh_bytes.iter().enumerate() {
@@ -2655,6 +3013,7 @@ impl FileWriter {
             let oh = if let Some((ref lm, ref pm)) = layout.chunked_msgs {
                 build_chunked_dataset_oh(
                     &d.dt,
+                    &d.dt_location,
                     &d.ds,
                     lm,
                     pm.as_deref(),
@@ -2665,6 +3024,7 @@ impl FileWriter {
             } else {
                 build_dataset_oh(
                     &d.dt,
+                    &d.dt_location,
                     &d.ds,
                     layout.data_addr,
                     layout.data.len(),
@@ -2732,43 +3092,48 @@ impl FileWriter {
         );
 
         // Root group OH
-        let root_links: Vec<LinkMessage> = {
-            let mut v = Vec::new();
-            for &i in &root_ds_indices {
-                v.push(make_link(&all_ds[i].name, ds_oh_addrs2[i]));
-            }
-            for &gi in &root_group_indices {
-                v.push(make_link(&groups[gi].name, group_addrs2[gi]));
-            }
-            v
-        };
-        sink.put(&build_group_oh(
-            &root_links,
-            &root_attrs,
-            root_dense_blob.as_ref(),
-        )?)?;
+        let root_links = group_links(
+            &root_ds_indices,
+            &root_committed_indices,
+            &root_group_indices,
+            &all_ds,
+            &committed,
+            &groups,
+            &ds_oh_addrs2,
+            &committed_addrs,
+            &group_addrs2,
+        );
+        let root_oh = build_group_oh(&root_links, &root_attrs, root_dense_blob.as_ref())?;
+        debug_assert_eq!(root_oh.len(), root_oh_size);
+        sink.put(&root_oh)?;
         if let Some(ref blob) = root_dense_blob {
             sink.put(&blob.blob)?;
         }
 
         // Group OHs + dense blobs
         for (gi, g) in groups.iter().enumerate() {
-            let mut links: Vec<LinkMessage> = g
-                .ds_indices
-                .iter()
-                .map(|&i| make_link(&all_ds[i].name, ds_oh_addrs2[i]))
-                .collect();
-            for &sgi in &g.sub_group_indices {
-                links.push(make_link(&groups[sgi].name, group_addrs2[sgi]));
-            }
-            sink.put(&build_group_oh(
-                &links,
-                &g.attrs,
-                group_dense_blobs[gi].as_ref(),
-            )?)?;
+            let links = group_links(
+                &g.ds_indices,
+                &g.committed_indices,
+                &g.sub_group_indices,
+                &all_ds,
+                &committed,
+                &groups,
+                &ds_oh_addrs2,
+                &committed_addrs,
+                &group_addrs2,
+            );
+            let oh = build_group_oh(&links, &g.attrs, group_dense_blobs[gi].as_ref())?;
+            debug_assert_eq!(oh.len(), group_oh_sizes[gi]);
+            sink.put(&oh)?;
             if let Some(ref blob) = group_dense_blobs[gi] {
                 sink.put(&blob.blob)?;
             }
+        }
+
+        // Committed datatype OHs, at the addresses their references name.
+        for oh in &committed_oh {
+            sink.put(oh)?;
         }
 
         // Dataset OHs + dense blobs
@@ -2857,7 +3222,135 @@ mod tests {
     use crate::link_info::LinkInfoMessage;
     use crate::object_header::ObjectHeader;
     use crate::signature;
-    use crate::type_builders::build_attr_message;
+    use crate::type_builders::{build_attr_message, make_i32_type};
+
+    /// A committed datatype object is a header holding the type and nothing else,
+    /// which is what makes the C library call it a named datatype rather than a
+    /// malformed dataset (`H5O__dtype_isa`: a datatype message, no dataspace, no
+    /// layout).
+    #[test]
+    fn a_committed_datatype_header_holds_only_its_type() {
+        let bytes = build_committed_datatype_oh(&make_i32_type(), 1).unwrap();
+        let hdr = ObjectHeader::parse(&bytes, 0, OFFSET_SIZE, LENGTH_SIZE).unwrap();
+
+        let types: Vec<MessageType> = hdr.messages.iter().map(|m| m.msg_type).collect();
+        assert_eq!(
+            types,
+            vec![MessageType::Datatype],
+            "a singly referenced committed type carries its datatype and nothing else"
+        );
+        assert_eq!(
+            Datatype::parse(&hdr.messages[0].data).unwrap().0,
+            make_i32_type()
+        );
+        assert_eq!(
+            hdr.messages[0].flags,
+            MSG_CONSTANT | MSG_DONTSHARE,
+            "the type of a committed object never changes and must not be shared onward"
+        );
+    }
+
+    /// Above one reference the count is stored, in the message the format defines
+    /// for it. A header without one reads as singly referenced, so the count is
+    /// the difference between unlinking the name and destroying the type.
+    #[test]
+    fn a_committed_datatype_header_records_a_count_above_one() {
+        let bytes = build_committed_datatype_oh(&make_i32_type(), 4).unwrap();
+        let hdr = ObjectHeader::parse(&bytes, 0, OFFSET_SIZE, LENGTH_SIZE).unwrap();
+
+        let refcount = hdr
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::ObjectReferenceCount)
+            .expect("a count above one is stored");
+        assert_eq!(
+            refcount.data,
+            vec![0, 4, 0, 0, 0],
+            "version 0 followed by the 4-byte count"
+        );
+    }
+
+    /// The count is the object's hard links plus every message naming it, which is
+    /// what the C library maintains: one `H5O_link` per link, and one more each
+    /// time a dataset or attribute is created against the type.
+    #[test]
+    fn the_reference_count_is_the_link_plus_every_user() {
+        let mut w = FileWriter::new();
+        w.commit_datatype("mytype", make_i32_type());
+        w.set_root_attr_committed("root_attr", AttrValue::I32(1), "mytype");
+        let ds = w.create_dataset("typed");
+        ds.with_i32_data(&[1, 2]);
+        ds.with_committed_datatype("mytype");
+        ds.set_attr_committed("shared_attr", AttrValue::I32(2), "mytype");
+        let bytes = w.finish().unwrap();
+
+        // 1 hard link + the dataset + two attributes.
+        assert_eq!(committed_reference_count(&bytes, "mytype"), Some(4));
+    }
+
+    /// A committed type nothing references stores no count at all: its single
+    /// hard link is what a header without the message already says.
+    #[test]
+    fn an_unreferenced_committed_type_stores_no_count() {
+        let mut w = FileWriter::new();
+        w.commit_datatype("mytype", make_i32_type());
+        let bytes = w.finish().unwrap();
+
+        assert_eq!(committed_reference_count(&bytes, "mytype"), None);
+    }
+
+    /// The reference count recorded in the committed datatype object at `path`, or
+    /// `None` when the header carries no Object Reference Count message.
+    fn committed_reference_count(bytes: &[u8], path: &str) -> Option<u32> {
+        let sig = signature::find_signature(bytes).unwrap();
+        let sb = Superblock::parse(bytes, sig).unwrap();
+        let addr = resolve_path_any(bytes, &sb, path).unwrap();
+        let hdr =
+            ObjectHeader::parse(bytes, addr as usize, sb.offset_size, sb.length_size).unwrap();
+        let msg = hdr
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::ObjectReferenceCount)?;
+        Some(u32::from_le_bytes(msg.data[1..5].try_into().unwrap()))
+    }
+
+    /// A dataset naming a committed type stores a *reference* in place of the
+    /// encoding, under a record whose shared flag says so — and the reference
+    /// names the object the link points at.
+    ///
+    /// Without the flag those same ten bytes decode as a zero-width time datatype,
+    /// with no error anywhere, which is the defect issue #254 was filed for.
+    #[test]
+    fn a_dataset_naming_a_committed_type_stores_a_reference_to_it() {
+        let mut w = FileWriter::new();
+        w.commit_datatype("mytype", make_i32_type());
+        let ds = w.create_dataset("typed");
+        ds.with_i32_data(&[1, 2]);
+        ds.with_committed_datatype("mytype");
+        let bytes = w.finish().unwrap();
+
+        let sig = signature::find_signature(&bytes).unwrap();
+        let sb = Superblock::parse(&bytes, sig).unwrap();
+        let type_addr = resolve_path_any(&bytes, &sb, "mytype").unwrap();
+        let ds_addr = resolve_path_any(&bytes, &sb, "typed").unwrap();
+        let hdr =
+            ObjectHeader::parse(&bytes, ds_addr as usize, sb.offset_size, sb.length_size).unwrap();
+        let msg = hdr
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::Datatype)
+            .expect("a dataset always has a datatype message");
+
+        assert!(
+            crate::shared_message::is_shared(msg.flags),
+            "the record must say its body is a reference, or the reference decodes as a type"
+        );
+        assert_eq!(
+            msg.data,
+            crate::shared_message::encode_committed_ref(type_addr, OFFSET_SIZE),
+            "the reference must name the object the link resolves to"
+        );
+    }
 
     fn parse_file(bytes: &[u8]) -> (Superblock, ObjectHeader) {
         let sig = signature::find_signature(bytes).unwrap();

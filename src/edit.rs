@@ -199,6 +199,7 @@ use crate::link_message::{LinkMessage, LinkTarget};
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
 use crate::reader::FileAccessProperties;
+use crate::shared_message::DatatypeLocation;
 use crate::signature;
 use crate::source::{BaseOffsetSource, BytesSource, MetadataCacheConfig, Source};
 use crate::superblock::Superblock;
@@ -3097,6 +3098,10 @@ impl WriteEngine {
                     };
                     build_dataset_oh(
                         &fd.dt,
+                        // Committed datatypes are refused when a dataset is
+                        // staged (`flatten_dataset`), so every type here is
+                        // written into the dataset's own header.
+                        &DatatypeLocation::Inline,
                         &fd.ds,
                         data_addr,
                         fd.raw.len() as u64,
@@ -5574,6 +5579,7 @@ impl WriteEngine {
         debug_assert_eq!(written, eof, "chunk blob must land at end-of-file",);
         Ok(build_chunked_dataset_oh(
             &fd.dt,
+            &DatatypeLocation::Inline,
             &fd.ds,
             &result.layout_message,
             result.pipeline_message.as_deref(),
@@ -6674,6 +6680,21 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
     if attrs.len() > MAX_COMPACT_ATTRS {
         return Err(Error::EditUnsupported(
             "datasets with dense (many) attributes cannot be added in place yet",
+        ));
+    }
+
+    // A committed datatype is an object of its own, which an in-place edit has no
+    // way to place: it appends into an existing file rather than laying one out,
+    // so there is nothing to resolve the named path against. Writing the type
+    // inline instead would produce a dataset that reads correctly but no longer
+    // shares the named type, so refuse by name. The whole-file writer places
+    // them; [`crate::repack`] is the route from an edited file to one.
+    if db.datatype_location.is_committed()
+        || attrs.iter().any(|a| a.datatype_location.is_committed())
+    {
+        return Err(Error::EditUnsupported(
+            "a dataset or attribute naming a committed (shared) datatype cannot be added in \
+             place; write the file with FileBuilder instead",
         ));
     }
 

@@ -1202,6 +1202,30 @@ impl FileInner {
         Ok(Cow::Owned(resolved))
     }
 
+    /// The object-header address a *shared* header message names, or `None` when
+    /// the record carries its own content.
+    ///
+    /// [`Self::message_body`] answers what the message says; this answers which
+    /// object says it. A rewrite needs both: the content to reproduce the type,
+    /// and the address to tell which users share one committed object rather than
+    /// each naming a type of their own.
+    pub(crate) fn shared_target_address(
+        &self,
+        msg: &crate::object_header::HeaderMessage,
+    ) -> Result<Option<u64>, Error> {
+        if !shared_message::is_shared(msg.flags) {
+            return Ok(None);
+        }
+        let reference =
+            shared_message::parse_shared_ref(&msg.data, self.offset_size(), self.length_size())?;
+        match reference.location {
+            shared_message::SharedLocation::ObjectHeader(addr) => Ok(Some(addr)),
+            shared_message::SharedLocation::SohmHeap(_) => {
+                Err(Error::Format(FormatError::UnsupportedSohmReference))
+            }
+        }
+    }
+
     /// Extract every attribute message attached to an object header (compact,
     /// shared, and dense storage), dispatching on the backend.
     pub(crate) fn attr_messages_of(
@@ -2457,10 +2481,9 @@ impl Group {
     ///
     /// Such an object is the third kind HDF5 links into a group, and it appears
     /// in neither [`datasets`](Self::datasets) nor [`groups`](Self::groups) — so a
-    /// walk that asks only for those two passes over it without noticing, and a
-    /// rewrite built from that walk loses the object and its link with no error.
-    /// Repack asks for these so it can refuse them by name instead.
-    pub(crate) fn named_datatypes(&self) -> Result<Vec<String>, Error> {
+    /// walk that asks only for those two passes over one without noticing. Read
+    /// the type itself with [`named_datatype`](Self::named_datatype).
+    pub fn named_datatypes(&self) -> Result<Vec<String>, Error> {
         let entries = self.children()?;
         let mut names = Vec::new();
         for entry in &entries {
@@ -2473,6 +2496,61 @@ impl Group {
             }
         }
         Ok(names)
+    }
+
+    /// The datatype a committed (`H5Tcommit`) child object holds.
+    ///
+    /// `name` must be one [`named_datatypes`](Self::named_datatypes) returned;
+    /// any other name fails with [`FormatError::PathNotFound`], and a child that
+    /// is not a datatype object fails for want of a datatype message.
+    pub fn named_datatype(&self, name: &str) -> Result<Datatype, Error> {
+        Ok(self.named_datatype_at(name)?.0)
+    }
+
+    /// How many things reference the committed (`H5Tcommit`) datatype `name`:
+    /// its hard links, plus every dataset and attribute that names it.
+    ///
+    /// This is HDF5's own object reference count (`H5Oget_info`'s `rc`), and what
+    /// says whether unlinking the name would destroy the type or merely stop it
+    /// being reachable by that name. A header that stores no count has exactly
+    /// one reference, which is what the format means by omitting the message.
+    pub fn named_datatype_references(&self, name: &str) -> Result<u32, Error> {
+        let entry = self.child_entry(name)?;
+        let hdr = self.file.parse_header(entry.object_header_address)?;
+        let Ok(msg) = find_message(&hdr, MessageType::ObjectReferenceCount) else {
+            return Ok(1);
+        };
+        // version(1) + count(4).
+        let body = self.file.message_body(msg)?;
+        if body.len() < 5 {
+            return Err(Error::Format(FormatError::UnexpectedEof {
+                expected: 5,
+                available: body.len(),
+            }));
+        }
+        Ok(u32::from_le_bytes([body[1], body[2], body[3], body[4]]))
+    }
+
+    /// The link entry for a child of this group, by name.
+    fn child_entry(&self, name: &str) -> Result<GroupEntry, Error> {
+        self.children()?
+            .into_iter()
+            .find(|e| e.name == name)
+            .ok_or_else(|| Error::Format(FormatError::PathNotFound(name.to_string())))
+    }
+
+    /// The datatype a committed child object holds, and the address of the object
+    /// header holding it.
+    ///
+    /// The address is the identity every user of the type shares: two datasets
+    /// naming the same address name one type, and reproducing that requires
+    /// matching them up by address rather than by what the type decodes to.
+    pub(crate) fn named_datatype_at(&self, name: &str) -> Result<(Datatype, u64), Error> {
+        let entry = self.child_entry(name)?;
+        let hdr = self.file.parse_header(entry.object_header_address)?;
+        let msg = find_message(&hdr, MessageType::Datatype)?;
+        let (dt, _) = Datatype::parse(&self.file.message_body(msg)?)?;
+        Ok((dt, entry.object_header_address))
     }
 
     /// List the names of subgroups in this group.
@@ -3799,15 +3877,16 @@ impl Dataset {
         Ok(dt)
     }
 
-    /// Whether this dataset's element type is a committed (shared) datatype
-    /// stored in its own object header rather than in this dataset's.
+    /// The object-header address of this dataset's committed (shared) element
+    /// type, or `None` when the type is written in the dataset's own header.
     ///
     /// [`datatype`](Self::datatype) resolves it either way, so this is for
     /// callers that must *reproduce* the dataset: writing the resolved type back
-    /// inline loses the link every C-library reader reports by name.
-    pub(crate) fn datatype_is_committed(&self) -> bool {
-        find_message(&self.header, MessageType::Datatype)
-            .is_ok_and(|msg| shared_message::is_shared(msg.flags))
+    /// inline loses the link every C-library reader reports by name, and the
+    /// address is what says which committed object to name instead.
+    pub(crate) fn committed_datatype_address(&self) -> Result<Option<u64>, Error> {
+        let msg = find_message(&self.header, MessageType::Datatype)?;
+        self.file.shared_target_address(msg)
     }
 
     pub(crate) fn dataspace(&self) -> Result<Dataspace, Error> {
@@ -4704,7 +4783,7 @@ mod tests {
                 max_dimensions: None,
             },
             raw_data: vec![1, 2, 3],
-            shared_fields: crate::attribute::SharedFields::NONE,
+            datatype_location: crate::shared_message::DatatypeLocation::Inline,
         };
 
         for c in attr_channels(&[("count", AttrValue::I32(1))], std::slice::from_ref(&raw)).owners {

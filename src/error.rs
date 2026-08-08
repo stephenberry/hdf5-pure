@@ -225,6 +225,18 @@ pub enum FormatError {
     /// met it had no access to the file the reference addresses. Carries the raw
     /// type ID of the referenced message.
     UnresolvedSharedMessage(u16),
+    /// A dataset or attribute names a committed datatype at a path where the file
+    /// being written places no such object.
+    UnknownCommittedDatatype(String),
+    /// A dataset or attribute names a committed datatype whose encoding differs
+    /// from its own. The two would disagree about how to read the element bytes,
+    /// and the committed one is what every reader would believe.
+    CommittedDatatypeMismatch {
+        /// Path of the committed datatype object that was named.
+        path: String,
+        /// Name of the dataset or attribute that named it.
+        user: String,
+    },
     /// Invalid global heap collection signature.
     InvalidGlobalHeapSignature,
     /// Invalid global heap version.
@@ -734,6 +746,15 @@ impl fmt::Display for FormatError {
                 write!(
                     f,
                     "a reference to a shared message of type {t:#06x} cannot be resolved without the file that holds it"
+                )
+            }
+            FormatError::UnknownCommittedDatatype(path) => {
+                write!(f, "no committed datatype is written at path {path:?}")
+            }
+            FormatError::CommittedDatatypeMismatch { path, user } => {
+                write!(
+                    f,
+                    "{user} names the committed datatype {path:?} but declares a different type"
                 )
             }
             FormatError::InvalidGlobalHeapSignature => {

@@ -15,7 +15,9 @@ use crate::error::FormatError;
 use crate::fractal_heap::FractalHeapHeader;
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
-use crate::shared_message::{self, BufferedResolver, SharedResolver, SourceResolver, Unresolvable};
+use crate::shared_message::{
+    self, BufferedResolver, DatatypeLocation, SharedResolver, SourceResolver, Unresolvable,
+};
 use crate::source::Source;
 
 /// Bit 0 of an attribute message's flags byte: the datatype field holds a
@@ -28,36 +30,6 @@ const FLAG_SHARED_DATASPACE: u8 = 0x02;
 
 /// Every flag bit the format defines (`H5O_ATTR_FLAG_ALL`).
 const FLAG_ALL: u8 = FLAG_SHARED_DATATYPE | FLAG_SHARED_DATASPACE;
-
-/// Which of an attribute message's fields were stored as a reference to a shared
-/// message rather than as the encoding itself.
-///
-/// [`AttributeMessage::datatype`] and [`AttributeMessage::dataspace`] hold the
-/// resolved encoding either way. This records where it came from, which matters
-/// to anything that rewrites the attribute: the reference addresses an object in
-/// the *source* file, and re-emitting the resolved encoding inline drops the link
-/// to the committed type that a reader such as `h5dump` reports by name.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SharedFields {
-    /// The datatype field was a reference to a committed datatype.
-    pub datatype: bool,
-    /// The dataspace field was a reference to a shared dataspace.
-    pub dataspace: bool,
-}
-
-impl SharedFields {
-    /// Neither field is a reference: the message carries its own encoding, which
-    /// is what every attribute this crate writes looks like.
-    pub const NONE: Self = Self {
-        datatype: false,
-        dataspace: false,
-    };
-
-    /// Whether either field was a reference.
-    pub fn any(self) -> bool {
-        self.datatype || self.dataspace
-    }
-}
 
 /// A parsed HDF5 attribute message.
 ///
@@ -74,9 +46,10 @@ pub struct AttributeMessage {
     pub dataspace: Dataspace,
     /// Raw attribute value data.
     pub raw_data: Vec<u8>,
-    /// Which fields above were read through a reference to a shared message
-    /// rather than from the message itself.
-    pub shared_fields: SharedFields,
+    /// Whether [`Self::datatype`] is encoded in this message or named through a
+    /// committed datatype object, which is a difference the field itself cannot
+    /// show: both forms decode to the same type.
+    pub datatype_location: DatatypeLocation,
 }
 
 fn ensure_len(data: &[u8], offset: usize, needed: usize) -> Result<(), FormatError> {
@@ -160,7 +133,7 @@ impl AttributeMessage {
             datatype,
             dataspace,
             raw_data,
-            shared_fields: SharedFields::NONE,
+            datatype_location: DatatypeLocation::Inline,
         })
     }
 
@@ -193,7 +166,7 @@ impl AttributeMessage {
         let ds_field = &data[pos..pos + dataspace_size];
         pos += dataspace_size;
 
-        let (datatype, dataspace, shared_fields) =
+        let (datatype, dataspace, datatype_location) =
             decode_type_and_space(dt_field, ds_field, flags, length_size, resolver)?;
         let raw_data = compute_raw_data(data, pos, &dataspace, &datatype)?;
 
@@ -202,7 +175,7 @@ impl AttributeMessage {
             datatype,
             dataspace,
             raw_data,
-            shared_fields,
+            datatype_location,
         })
     }
 
@@ -236,7 +209,7 @@ impl AttributeMessage {
         let ds_field = &data[pos..pos + dataspace_size];
         pos += dataspace_size;
 
-        let (datatype, dataspace, shared_fields) =
+        let (datatype, dataspace, datatype_location) =
             decode_type_and_space(dt_field, ds_field, flags, length_size, resolver)?;
         let raw_data = compute_raw_data(data, pos, &dataspace, &datatype)?;
 
@@ -245,7 +218,7 @@ impl AttributeMessage {
             datatype,
             dataspace,
             raw_data,
-            shared_fields,
+            datatype_location,
         })
     }
 
@@ -275,10 +248,28 @@ impl AttributeMessage {
         let fields = [
             // The null terminator the message carries counts toward the field.
             ("name", self.name.len() + 1),
-            ("datatype", self.datatype.serialize().len()),
+            ("datatype", self.datatype_field().len()),
             ("dataspace", self.dataspace.serialize(length_size).len()),
         ];
         fields.into_iter().find(|&(_, len)| len > limit)
+    }
+
+    /// The bytes of the message's datatype field: the encoding itself, or the
+    /// reference standing in for it when the type is committed.
+    ///
+    /// A reference is written in the *writer's* offset width rather than in the
+    /// width of whatever file the message was read from, because that is the file
+    /// the bytes are going into. Re-serializing a message parsed from a file with
+    /// a different width is therefore a re-encoding, not a copy — which is what
+    /// it already is for every other field.
+    fn datatype_field(&self) -> Vec<u8> {
+        match self
+            .datatype_location
+            .reference_bytes(crate::file_writer::OFFSET_SIZE)
+        {
+            Some(reference) => reference,
+            None => self.datatype.serialize(),
+        }
     }
 
     fn serialize_version(&self, version: u8, length_size: u8) -> Vec<u8> {
@@ -287,12 +278,20 @@ impl AttributeMessage {
             n.push(0); // null terminator
             n
         };
-        let dt_bytes = self.datatype.serialize();
+        let dt_bytes = self.datatype_field();
         let ds_bytes = self.dataspace.serialize(length_size);
 
         let mut buf = Vec::new();
         buf.push(version);
-        buf.push(0); // flags
+        // Version 1 has no flags byte, but nothing serializes one: both callers
+        // ask for version 2 or 3, whose second byte says which fields are
+        // references. Only the datatype is ever one here — this crate does not
+        // write a shared dataspace.
+        buf.push(if self.datatype_location.is_committed() {
+            FLAG_SHARED_DATATYPE
+        } else {
+            0
+        });
         #[expect(
             clippy::cast_possible_truncation,
             reason = "attribute name length is written into the 2-byte name-size field of the attribute message"
@@ -356,38 +355,43 @@ impl AttributeMessage {
 /// as a valid time datatype of size zero — so the flag is the only thing that
 /// tells them apart, and reading the field without it is how a committed datatype
 /// silently becomes the wrong type.
+///
+/// Only the datatype's origin is reported back. A shared *dataspace* is resolved
+/// and then indistinguishable from an inline one: a dataspace has no name, and no
+/// HDF5 call reports one as shared, so writing it back inline loses nothing. A
+/// committed datatype does have a name, which is why that one is tracked.
 fn decode_type_and_space(
     dt_field: &[u8],
     ds_field: &[u8],
     flags: u8,
     length_size: u8,
     resolver: &dyn SharedResolver,
-) -> Result<(Datatype, Dataspace, SharedFields), FormatError> {
+) -> Result<(Datatype, Dataspace, DatatypeLocation), FormatError> {
     // The C library refuses a flags byte with any other bit set, so a message
     // carrying one is not an attribute message this or any reader can trust.
     if flags & !FLAG_ALL != 0 {
         return Err(FormatError::InvalidAttributeFlags(flags));
     }
-    let shared_fields = SharedFields {
-        datatype: flags & FLAG_SHARED_DATATYPE != 0,
-        dataspace: flags & FLAG_SHARED_DATASPACE != 0,
-    };
 
-    let datatype = if shared_fields.datatype {
+    let (datatype, location) = if flags & FLAG_SHARED_DATATYPE != 0 {
+        let address = resolver.committed_address(dt_field)?;
         let body = resolver.resolve(dt_field, MessageType::Datatype)?;
-        Datatype::parse(&body)?.0
+        (
+            Datatype::parse(&body)?.0,
+            DatatypeLocation::Committed(address),
+        )
     } else {
-        Datatype::parse(dt_field)?.0
+        (Datatype::parse(dt_field)?.0, DatatypeLocation::Inline)
     };
 
-    let dataspace = if shared_fields.dataspace {
+    let dataspace = if flags & FLAG_SHARED_DATASPACE != 0 {
         let body = resolver.resolve(ds_field, MessageType::Dataspace)?;
         Dataspace::parse(&body, length_size)?
     } else {
         Dataspace::parse(ds_field, length_size)?
     };
 
-    Ok((datatype, dataspace, shared_fields))
+    Ok((datatype, dataspace, location))
 }
 
 /// The name of an attribute message, without decoding its datatype or dataspace.
@@ -1178,6 +1182,15 @@ mod tests {
         fn resolve(&self, _reference: &[u8], _target: MessageType) -> Result<Vec<u8>, FormatError> {
             Ok(self.0.clone())
         }
+
+        fn committed_address(&self, reference: &[u8]) -> Result<u64, FormatError> {
+            match shared_message::parse_shared_ref(reference, 8, 8)?.location {
+                shared_message::SharedLocation::ObjectHeader(addr) => Ok(addr),
+                shared_message::SharedLocation::SohmHeap(_) => {
+                    Err(FormatError::UnsupportedSohmReference)
+                }
+            }
+        }
     }
 
     /// The flags byte decides how the datatype field is read. Given a resolver,
@@ -1193,8 +1206,11 @@ mod tests {
             attr.datatype,
             Datatype::FloatingPoint { size: 8, .. }
         ));
-        assert!(attr.shared_fields.datatype);
-        assert!(attr.shared_fields.any());
+        assert_eq!(
+            attr.datatype_location,
+            DatatypeLocation::Committed(0x320),
+            "the attribute must record which committed object it named, not just that it named one"
+        );
     }
 
     /// The same bytes with the flag clear decode as an inline datatype. This is
@@ -1214,7 +1230,7 @@ mod tests {
             },
             "the reference bytes are supposed to look like a valid inline datatype"
         );
-        assert!(!attr.shared_fields.any());
+        assert_eq!(attr.datatype_location, DatatypeLocation::Inline);
     }
 
     /// Without the file the reference addresses, there is no honest answer, so
