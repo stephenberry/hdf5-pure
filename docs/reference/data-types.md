@@ -75,7 +75,7 @@ Two accessors describe an existing dataset's type:
 
 ## Attribute values
 
-`AttrValue` is the write-side attribute enum. Reading attributes yields the same enum (a `HashMap<String, AttrValue>` from `attrs()`), though the reader normalizes integer encodings: signed integers come back as `I64` / `I64Array` and unsigned integers as `U64` (scalar) or `I64Array` (array, since there is no `U64Array` variant), regardless of the stored width.
+`AttrValue` is the write-side attribute enum. Reading attributes yields the same enum (a `HashMap<String, AttrValue>` from `attrs()`), though the reader normalizes integer encodings: signed integers come back as `I64` / `I64Array` and unsigned integers as `U64` (scalar) or `I64Array` (array, since there is no `U64Array` variant), regardless of the stored width. An enumeration attribute decodes through its integer base type, the same view the numeric readers take of an enum dataset, so its codes arrive and its member names do not — this is how an h5py `np.bool_` attribute, stored as `enum[FALSE, TRUE]`, reads back as `0` or `1`. `repack` does not go through `AttrValue`, so an attribute keeps whatever encoding it had when copied.
 
 | Variant | HDF5 encoding |
 |---|---|
