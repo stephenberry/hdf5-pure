@@ -29,6 +29,18 @@
 #   superblock 2 (0.34.0 default) -> h5dump reads data, groups and attributes
 #   h5repack round trip           -> preserves every attribute (it dropped all
 #                                    of them before the Attribute Info fix)
+#   committed (H5Tcommit) type    -> listed as a named datatype, and the dataset
+#                                    and attribute typed through it both read
+#
+# One thing that measurement showed about this file's shape: 1.8's h5dump gives
+# up on the *whole file* when a committed datatype does not decode, so the plain
+# checks above fail alongside the committed ones. The committed fixture is what
+# makes any of them sensitive to it — before it there was no named type in the
+# file to get wrong — and the committed checks say which thing broke rather than
+# leaving "the file will not open" to be interpreted. The exception is a type
+# that is written and referenced but never linked: the file then reads correctly
+# end to end and 1.8 lists the type as `/#324`, its address standing in for the
+# name it lost. Only `check_named_type` sees that one.
 #
 # The checks below compare dataset and attribute *values*, not just exit status.
 # A file whose headers all decode while its data resolves to the wrong offset
@@ -119,8 +131,14 @@ check() {  # check <description> <expected: open|refuse> <file>
 # drops the dataset's own attributes, which `h5dump -d` prints after it. Done
 # this way rather than with `-A 0` because that spelling is a 1.10 addition:
 # 1.8's `-A` takes no argument, so passing one there dumps the wrong thing.
+#
+# A failing h5dump yields no values rather than killing the run: under `set -e`
+# and `pipefail` its exit status would abort the script at the first bad file,
+# and every check after it would go unanswered. This is run by hand and rarely,
+# so one run has to report every check, not just the ones before the first
+# failure.
 dump_values() {  # dump_values <h5dump args...>
-  "$H5DUMP" "$@" 2>/dev/null |
+  { "$H5DUMP" "$@" 2>/dev/null || true; } |
     awk '
       /^[[:space:]]*DATA[[:space:]]*[{]/ { blocks++; if (blocks > 1) exit; next }
       blocks == 1 && /^[[:space:]]*[(][0-9,]+[)]:/ {
@@ -148,6 +166,23 @@ check_data() {  # check_data <description> <expected values> <h5dump args...>
   fi
 }
 
+# `h5dump -n` lists each object with its kind first, so a committed datatype
+# appears as `datatype /reading_t`. It is listed as one only if the object header
+# decoded as a named type — which `H5O__dtype_isa` decides from the messages
+# present — so this sees a header that opens but is not what it claims.
+check_named_type() {  # check_named_type <description> <name> <file>
+  local desc="$1" name="$2" file="$3" out
+  # As in `dump_values`: a failing h5dump must fail this check, not the run.
+  out="$("$H5DUMP" -n "$file" 2>&1)" || true
+  if printf '%s\n' "$out" | grep -qE "datatype[[:space:]]+$name\$"; then
+    echo "  ok   $desc — 1.8 lists $name as a named datatype"
+  else
+    echo "  FAIL $desc — $name is not listed as a named datatype"
+    printf '%s\n' "$out" | sed 's/^/       /'
+    failures=$((failures + 1))
+  fi
+}
+
 echo "==> the 1.10 format must be unreadable by 1.8 (or the bound buys nothing)"
 check "mat_v110.mat"  refuse "$FIXTURES/mat_v110.mat"
 check "plain_v110.h5" refuse "$FIXTURES/plain_v110.h5"
@@ -169,6 +204,18 @@ echo "==> 1.8 must read attribute values on all three kinds of object"
 check_data "plain_v18.h5 /values units" '"m/s"' -a /values/units "$FIXTURES/plain_v18.h5"
 check_data "plain_v18.h5 / root_attr"   '"r"'   -a /root_attr    "$FIXTURES/plain_v18.h5"
 check_data "plain_v18.h5 /grp tag"      "7"     -a /grp/tag      "$FIXTURES/plain_v18.h5"
+
+# A committed (`H5Tcommit`) datatype is an object of its own, and everything
+# using it stores a reference to that object's header in place of an encoding.
+# An old library that cannot follow the reference does not fail loudly: it reads
+# the reference bytes as a datatype and reports the wrong element type, or drops
+# the attribute list the reference hangs off. So name the object, then read
+# through it — the dataset whose element type it is, and the attribute whose
+# datatype it is.
+echo "==> 1.8 must resolve a committed datatype, not merely list it"
+check_named_type "plain_v18.h5" /reading_t "$FIXTURES/plain_v18.h5"
+check_data "plain_v18.h5 /typed"          "3 1 4" -d /typed          "$FIXTURES/plain_v18.h5"
+check_data "plain_v18.h5 /typed baseline" "9"     -a /typed/baseline "$FIXTURES/plain_v18.h5"
 
 # The attribute-count fix, against the toolchain that lost the attributes: a
 # header that declares no attributes makes h5repack copy the object without
