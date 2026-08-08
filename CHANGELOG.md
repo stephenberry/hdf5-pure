@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.34.0] - 2026-08-08
+
+A `.mat` file this crate writes now opens under MATLAB's `load`. MATLAB's MAT reader refuses a version 3 superblock even on releases whose own libhdf5 reads one without difficulty, so `mat::Options` defaults to the HDF5 1.8 format; set `mat::Options::libver` to `LibVer::V110` for the previous one, which compression requires. Selecting the format is a general capability rather than a MAT one: `FileBuilder::with_libver_bounds`, `FileAccessProperties::with_libver_bounds` and `RepackOptions::with_libver_bounds` decide what a build, an edit session and a repack produce, `FormatError::LibverTooOldForContent` reports content a bound cannot express instead of silently upgrading the file, and a repack given no bound carries the source file's format forward rather than rewriting every file in the 1.10 format. Two smaller breaks come with it: `LibVer::WRITER_OUTPUT` is now `LibVer::WRITER_DEFAULT`, and an empty MAT value is written with `EmptyMarkerEncoding::DataAsDims`, matching MATLAB and matio, so it reads back empty under a plain `isempty` ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)). Committed (`H5Tcommit`) datatypes are read and written: `FileBuilder::commit_datatype` writes the named type object, `DatasetBuilder::with_committed_datatype` and the `set_attr_committed` methods name one, `Group::named_datatypes` lists them, and a dataset or attribute that uses one resolves to the type it names rather than to the zero-width time type it used to decode as, which is the shape netCDF-4 and h5py write for a user-defined type ([#254](https://github.com/stephenberry/hdf5-pure/issues/254)). Attributes keep more of what the file holds: `repack` carries each attribute's own datatype and shape across instead of rebuilding it from an `AttrValue` ([#241](https://github.com/stephenberry/hdf5-pure/issues/241)), an enumeration attribute reaches the caller instead of being dropped, which is where every h5py `np.bool_` attribute went ([#248](https://github.com/stephenberry/hdf5-pure/pull/248)), and `Group::attr_datatypes` and `Dataset::attr_datatypes` give the on-disk `Datatype` that `attrs()` normalizes away ([#253](https://github.com/stephenberry/hdf5-pure/pull/253)). `File::open_streaming` fetches a run of adjacent chunks in one read, which is what makes a file written a row at a time, one small chunk per row, read at a sensible speed ([#250](https://github.com/stephenberry/hdf5-pure/pull/250)). Files written by earlier versions still read.
+
 ### Added
 
 - `FileBuilder::with_libver_bounds` selects the on-disk format rather than only validating it: an upper bound of `LibVer::V18` writes the HDF5 1.8 format, and anything reaching 1.10 writes the 1.10 one ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
@@ -630,7 +634,8 @@ Internal robustness and tests ([#26](https://github.com/stephenberry/hdf5-pure/i
 - The MAT deserializer flattens 1×N and N×1 values to a 1-D sequence in `deserialize_any` (matching `deserialize_seq`).
 - Numeric/complex readers preserve 1×N / N×1 shape at the value layer; any flattening happens at the serde level.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.33.0...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.34.0...HEAD
+[0.34.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.33.0...v0.34.0
 [0.33.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.32.0...v0.33.0
 [0.32.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.31.0...v0.32.0
 [0.31.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.30.0...v0.31.0
