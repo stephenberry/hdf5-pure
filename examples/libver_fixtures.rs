@@ -15,7 +15,7 @@
 //! between them is the format and nothing else.
 
 use hdf5_pure::mat::{self, Options};
-use hdf5_pure::{AttrValue, FileBuilder, LibVer};
+use hdf5_pure::{AttrValue, FileBuilder, LibVer, make_i32_type};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -46,7 +46,8 @@ fn demo() -> Demo {
 }
 
 /// A plain `.h5` alongside the `.mat` pair: attributes on all three kinds of
-/// object, which is what the attribute-count fix touches.
+/// object, which is what the attribute-count fix touches, and a committed
+/// datatype, which is an object kind of its own.
 fn write_h5(path: &Path, libver: LibVer) {
     let mut b = FileBuilder::new();
     b.with_libver_bounds(LibVer::Earliest, libver);
@@ -54,6 +55,20 @@ fn write_h5(path: &Path, libver: LibVer) {
     b.create_dataset("values")
         .with_f64_data(&[1.0, 2.0, 3.0])
         .set_attr("units", AttrValue::AsciiString("m/s".into()));
+
+    // A committed (`H5Tcommit`) datatype, named by a dataset and by an
+    // attribute. Its users carry a reference to its object header in place of an
+    // encoding, and the object itself carries a reference count — a shape no
+    // other fixture here writes, and one an old library has to decode rather
+    // than merely skip. A reference it cannot follow costs more than the type's
+    // name: the C library abandons an object's whole attribute list when one
+    // attribute fails to decode, so the repack count below sees it too.
+    b.commit_datatype("reading_t", make_i32_type());
+    b.create_dataset("typed")
+        .with_i32_data(&[3, 1, 4])
+        .with_committed_datatype("reading_t")
+        .set_attr_committed("baseline", AttrValue::I32(9), "reading_t");
+
     let mut g = b.create_group("grp");
     g.set_attr("tag", AttrValue::I64(7));
     g.create_dataset("inner").with_i32_data(&[7, 8]);

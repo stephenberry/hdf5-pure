@@ -148,6 +148,22 @@ check_data() {  # check_data <description> <expected values> <h5dump args...>
   fi
 }
 
+# `h5dump -n` lists each object with its kind first, so a committed datatype
+# appears as `datatype /reading_t`. It is listed as one only if the object header
+# decoded as a named type — which `H5O__dtype_isa` decides from the messages
+# present — so this sees a header that opens but is not what it claims.
+check_named_type() {  # check_named_type <description> <name> <file>
+  local desc="$1" name="$2" file="$3" out
+  out="$("$H5DUMP" -n "$file" 2>&1)"
+  if printf '%s\n' "$out" | grep -qE "datatype[[:space:]]+$name\$"; then
+    echo "  ok   $desc — 1.8 lists $name as a named datatype"
+  else
+    echo "  FAIL $desc — $name is not listed as a named datatype"
+    printf '%s\n' "$out" | sed 's/^/       /'
+    failures=$((failures + 1))
+  fi
+}
+
 echo "==> the 1.10 format must be unreadable by 1.8 (or the bound buys nothing)"
 check "mat_v110.mat"  refuse "$FIXTURES/mat_v110.mat"
 check "plain_v110.h5" refuse "$FIXTURES/plain_v110.h5"
@@ -169,6 +185,18 @@ echo "==> 1.8 must read attribute values on all three kinds of object"
 check_data "plain_v18.h5 /values units" '"m/s"' -a /values/units "$FIXTURES/plain_v18.h5"
 check_data "plain_v18.h5 / root_attr"   '"r"'   -a /root_attr    "$FIXTURES/plain_v18.h5"
 check_data "plain_v18.h5 /grp tag"      "7"     -a /grp/tag      "$FIXTURES/plain_v18.h5"
+
+# A committed (`H5Tcommit`) datatype is an object of its own, and everything
+# using it stores a reference to that object's header in place of an encoding.
+# An old library that cannot follow the reference does not fail loudly: it reads
+# the reference bytes as a datatype and reports the wrong element type, or drops
+# the attribute list the reference hangs off. So name the object, then read
+# through it — the dataset whose element type it is, and the attribute whose
+# datatype it is.
+echo "==> 1.8 must resolve a committed datatype, not merely list it"
+check_named_type "plain_v18.h5" /reading_t "$FIXTURES/plain_v18.h5"
+check_data "plain_v18.h5 /typed"          "3 1 4" -d /typed          "$FIXTURES/plain_v18.h5"
+check_data "plain_v18.h5 /typed baseline" "9"     -a /typed/baseline "$FIXTURES/plain_v18.h5"
 
 # The attribute-count fix, against the toolchain that lost the attributes: a
 # header that declares no attributes makes h5repack copy the object without
