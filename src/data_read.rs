@@ -276,7 +276,7 @@ fn ensure_numeric(dt: &Datatype, expected: &'static str) -> Result<(), FormatErr
 /// enum's base is always a leaf integer in practice) and returns any non-enum
 /// datatype unchanged, so the value+name round-trip works: the readers surface
 /// the codes while [`crate::DType::Enum`] surfaces the member names.
-fn effective_numeric(dt: &Datatype) -> &Datatype {
+pub(crate) fn effective_numeric(dt: &Datatype) -> &Datatype {
     match dt {
         Datatype::Enumeration { base_type, .. } => effective_numeric(base_type),
         other => other,

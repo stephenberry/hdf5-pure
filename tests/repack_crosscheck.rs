@@ -547,18 +547,19 @@ fn repack_roundtrips_filtered_and_resizable_vlen_string_datasets() {
     }
 }
 
-/// A boolean attribute is an HDF5 enumeration, which [`AttrValue`] has no
-/// variant for. Repack used to refuse the whole file over one — the only honest
-/// answer while every attribute went through a decode, since the alternative was
-/// dropping it silently.
+/// A boolean attribute is an HDF5 enumeration, which [`AttrValue`] cannot carry
+/// faithfully: it decodes through the integer base type, so the codes reach the
+/// caller and `enum[FALSE, TRUE]` does not. Repack used to refuse the whole file
+/// over one — the only honest answer while every attribute went through a
+/// decode, since the alternative was writing the base type back in its place.
 ///
 /// Copying the message verbatim answers it properly instead: an enumeration
 /// carries no address, so its bytes mean the same thing in the destination and
-/// the attribute simply survives. This is the general form of the refusal that
-/// went away, not a special case for booleans — a compound or opaque attribute
-/// travels for the same reason (issue #241).
+/// the attribute survives with its members. This is the general form of the
+/// refusal that went away, not a special case for booleans — a compound or
+/// opaque attribute travels for the same reason (issue #241).
 #[test]
-fn repack_carries_an_attribute_no_attr_value_can_express() {
+fn repack_carries_an_attribute_attr_value_cannot_express_faithfully() {
     use hdf5::types::TypeDescriptor;
 
     let dir = tempdir().unwrap();
