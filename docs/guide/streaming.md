@@ -8,6 +8,8 @@ This page covers working with HDF5 files that are too large to buffer in memory,
 
 `File::open_streaming(path)` opens the same file with a lazy backing store. It fetches metadata and dataset chunks from the file as they are needed instead of buffering it whole, so it never holds the entire file in memory at once. Peak memory tracks what you actually read: one dataset, decompressed, with its chunks fetched on demand, plus the metadata being parsed.
 
+Chunks that lie next to each other on disk are fetched together, in reads of at most 256 KiB. This is what makes a file written a row at a time readable at a sensible speed: such a file carries one small chunk per row, so fetching them one at a time costs thousands of reads where a handful would do. A recording of 73 datasets over 280 rows holds 20,440 chunks of 32 bytes, which the streaming reader fetches in 73 reads. A read never fetches bytes outside the chunks it needs, so what this trades is read count, not read volume. A chunk larger than 256 KiB is read on its own, as it was before.
+
 ```rust
 use hdf5_pure::File;
 
@@ -67,7 +69,7 @@ The window is clamped to the dataset, so the final short window needs no special
 
 `File::open_streaming_with_options(path, FileAccessProperties)` bounds the memory the streaming backend retains. `FileAccessProperties::new()` returns the crate's default access behavior; you layer on two independent caches with its builder methods.
 
-`MetadataCacheConfig` mirrors the memory-budget role of HDF5's `H5Pset_mdc_config`: it caps the bytes retained for parsed metadata reads. `MetadataCacheConfig::new(max_bytes)` sets the total byte budget, and `.with_max_entry_bytes(...)` caps the size of any single cached metadata read so one large heap or index block cannot monopolize the cache.
+`MetadataCacheConfig` mirrors the memory-budget role of HDF5's `H5Pset_mdc_config`: it caps the bytes retained for parsed metadata reads. `MetadataCacheConfig::new(max_bytes)` sets the total byte budget, and `.with_max_entry_bytes(...)` caps the size of any single cached metadata read so one large heap or index block cannot monopolize the cache. It is disabled unless you ask for it, and worth asking for on a file holding many datasets: opening one walks the root group's link storage, and every dataset repeats that walk.
 
 `ChunkCacheConfig` mirrors the raw-data chunk-cache settings from `H5Pset_cache`. `ChunkCacheConfig::from_h5p_cache(rdcc_nslots, rdcc_nbytes)` builds one directly from the familiar HDF5 slot count and byte budget. It controls decompressed chunk data and whether parsed chunk indexes are retained between repeated reads of the same dataset.
 
