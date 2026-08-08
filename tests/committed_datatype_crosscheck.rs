@@ -117,6 +117,40 @@ fn committed_i32() -> Datatype {
     }
 }
 
+/// Commit `type_id` in `loc` under `name`, which is what makes it a named type
+/// rather than a transient one. There is no safe-API equivalent: `hdf5-metno`
+/// exposes no way to commit a datatype, which is why every fixture here reaches
+/// for the C entry point.
+fn commit_type(loc: i64, name: &str, type_id: i64) {
+    let cname = CString::new(name).unwrap();
+    let rc = unsafe { H5Tcommit2(loc, cname.as_ptr(), type_id, DEFAULT, DEFAULT, DEFAULT) };
+    assert!(rc >= 0, "H5Tcommit2 failed for {name:?}");
+}
+
+/// Create `name` in `loc` over `space` with element type `type_id`, write
+/// `values` into it, and close it.
+///
+/// `dcpl` is the only property a fixture here varies; pass `DEFAULT` for
+/// contiguous storage. The dataspace stays at the call site, since that is where
+/// the fixtures genuinely differ.
+fn write_i32_dataset(loc: i64, name: &str, type_id: i64, space: i64, dcpl: i64, values: &[i32]) {
+    let cname = CString::new(name).unwrap();
+    let dset = unsafe { H5Dcreate2(loc, cname.as_ptr(), type_id, space, DEFAULT, dcpl, DEFAULT) };
+    assert!(dset >= 0, "H5Dcreate2 failed for {name:?}");
+    let rc = unsafe {
+        H5Dwrite(
+            dset,
+            type_id,
+            DEFAULT,
+            DEFAULT,
+            DEFAULT,
+            values.as_ptr().cast::<c_void>(),
+        )
+    };
+    assert!(rc >= 0, "H5Dwrite failed for {name:?}");
+    unsafe { H5Dclose(dset) };
+}
+
 /// What a fixture puts the committed `/mytype` to use for.
 ///
 /// The two uses are separable on purpose. Repack refuses each of them in its own
@@ -153,18 +187,7 @@ fn write_committed_fixture(path: &Path, fixture: Fixture) {
     // before the file itself.
     let dtype = hdf5::Datatype::from_type::<i32>().expect("transient i32 type");
 
-    let name = CString::new("mytype").unwrap();
-    let rc = unsafe {
-        H5Tcommit2(
-            file.id(),
-            name.as_ptr(),
-            dtype.id(),
-            DEFAULT,
-            DEFAULT,
-            DEFAULT,
-        )
-    };
-    assert!(rc >= 0, "H5Tcommit2 failed");
+    commit_type(file.id(), "mytype", dtype.id());
 
     let one = [1u64];
     let scalar_space = unsafe { H5Screate_simple(1, one.as_ptr(), std::ptr::null()) };
@@ -210,34 +233,15 @@ fn write_committed_fixture(path: &Path, fixture: Fixture) {
         let three = [3u64];
         let vector_space = unsafe { H5Screate_simple(1, three.as_ptr(), std::ptr::null()) };
         assert!(vector_space >= 0, "H5Screate_simple failed");
-        let typed_name = CString::new("typed").unwrap();
-        let dset = unsafe {
-            H5Dcreate2(
-                file.id(),
-                typed_name.as_ptr(),
-                dtype.id(),
-                vector_space,
-                DEFAULT,
-                DEFAULT,
-                DEFAULT,
-            )
-        };
-        assert!(dset >= 0, "H5Dcreate2 failed");
-        let rc = unsafe {
-            H5Dwrite(
-                dset,
-                dtype.id(),
-                DEFAULT,
-                DEFAULT,
-                DEFAULT,
-                DATASET_VALUES.as_ptr().cast::<c_void>(),
-            )
-        };
-        assert!(rc >= 0, "H5Dwrite failed");
-        unsafe {
-            H5Dclose(dset);
-            H5Sclose(vector_space);
-        }
+        write_i32_dataset(
+            file.id(),
+            "typed",
+            dtype.id(),
+            vector_space,
+            DEFAULT,
+            &DATASET_VALUES,
+        );
+        unsafe { H5Sclose(vector_space) };
     }
 
     unsafe { H5Sclose(scalar_space) };
@@ -495,18 +499,7 @@ fn write_appendable_committed_fixture(path: &Path) {
     let file = fb.create(path).expect("create fixture");
     let dtype = hdf5::Datatype::from_type::<i32>().expect("transient i32 type");
 
-    let name = CString::new("mytype").unwrap();
-    let rc = unsafe {
-        H5Tcommit2(
-            file.id(),
-            name.as_ptr(),
-            dtype.id(),
-            DEFAULT,
-            DEFAULT,
-            DEFAULT,
-        )
-    };
-    assert!(rc >= 0, "H5Tcommit2 failed");
+    commit_type(file.id(), "mytype", dtype.id());
 
     let dims = [DATASET_VALUES.len() as u64];
     let maxdims = [u64::MAX]; // H5S_UNLIMITED
@@ -517,35 +510,16 @@ fn write_appendable_committed_fixture(path: &Path) {
         .chunk([4usize])
         .finish()
         .expect("chunked dcpl");
-    let typed_name = CString::new("typed").unwrap();
-    let dset = unsafe {
-        H5Dcreate2(
-            file.id(),
-            typed_name.as_ptr(),
-            dtype.id(),
-            space,
-            DEFAULT,
-            dcpl.id(),
-            DEFAULT,
-        )
-    };
-    assert!(dset >= 0, "H5Dcreate2 failed");
-    let rc = unsafe {
-        H5Dwrite(
-            dset,
-            dtype.id(),
-            DEFAULT,
-            DEFAULT,
-            DEFAULT,
-            DATASET_VALUES.as_ptr().cast::<c_void>(),
-        )
-    };
-    assert!(rc >= 0, "H5Dwrite failed");
+    write_i32_dataset(
+        file.id(),
+        "typed",
+        dtype.id(),
+        space,
+        dcpl.id(),
+        &DATASET_VALUES,
+    );
 
-    unsafe {
-        H5Dclose(dset);
-        H5Sclose(space);
-    }
+    unsafe { H5Sclose(space) };
 }
 
 /// The streaming backend reads a committed datatype through the same reference,
@@ -787,6 +761,9 @@ fn a_committed_datatype_this_crate_writes_reads_back_as_committed() {
     builder
         .create_dataset("typed")
         .with_i32_data(&DATASET_VALUES)
+        // Absolute, where every other test here names the type relatively. This
+        // is the only coverage of the leading slash `normalize_object_path`
+        // trims, so the two spellings must not be made uniform.
         .with_committed_datatype("/mytype")
         .set_attr_committed("shared_attr", AttrValue::I32(ATTR_VALUE), "mytype");
     builder.write(&path).expect("write a committed datatype");
@@ -941,53 +918,21 @@ fn repack_refuses_dropping_the_group_a_named_type_lives_in() {
         let group =
             unsafe { H5Gcreate2(file.id(), group_name.as_ptr(), DEFAULT, DEFAULT, DEFAULT) };
         assert!(group >= 0, "H5Gcreate2 failed");
-        let type_name = CString::new("mytype").unwrap();
-        assert!(
-            unsafe {
-                H5Tcommit2(
-                    group,
-                    type_name.as_ptr(),
-                    dtype.id(),
-                    DEFAULT,
-                    DEFAULT,
-                    DEFAULT,
-                )
-            } >= 0,
-            "H5Tcommit2 failed"
-        );
+        commit_type(group, "mytype", dtype.id());
 
         // The dataset is outside the group, so dropping the group leaves it
         // naming a type the output has not got.
         let three = [3u64];
         let space = unsafe { H5Screate_simple(1, three.as_ptr(), std::ptr::null()) };
-        let dset_name = CString::new("typed").unwrap();
-        let dset = unsafe {
-            H5Dcreate2(
-                file.id(),
-                dset_name.as_ptr(),
-                dtype.id(),
-                space,
-                DEFAULT,
-                DEFAULT,
-                DEFAULT,
-            )
-        };
-        assert!(dset >= 0, "H5Dcreate2 failed");
-        assert!(
-            unsafe {
-                H5Dwrite(
-                    dset,
-                    dtype.id(),
-                    DEFAULT,
-                    DEFAULT,
-                    DEFAULT,
-                    DATASET_VALUES.as_ptr().cast::<c_void>(),
-                )
-            } >= 0,
-            "H5Dwrite failed"
+        write_i32_dataset(
+            file.id(),
+            "typed",
+            dtype.id(),
+            space,
+            DEFAULT,
+            &DATASET_VALUES,
         );
         unsafe {
-            H5Dclose(dset);
             H5Sclose(space);
             H5Gclose(group);
         }

@@ -1184,12 +1184,7 @@ mod tests {
         }
 
         fn committed_address(&self, reference: &[u8]) -> Result<u64, FormatError> {
-            match shared_message::parse_shared_ref(reference, 8, 8)?.location {
-                shared_message::SharedLocation::ObjectHeader(addr) => Ok(addr),
-                shared_message::SharedLocation::SohmHeap(_) => {
-                    Err(FormatError::UnsupportedSohmReference)
-                }
-            }
+            shared_message::committed_address_in(reference, 8, 8)
         }
     }
 

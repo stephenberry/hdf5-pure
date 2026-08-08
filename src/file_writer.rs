@@ -39,8 +39,8 @@ use crate::shared_message::DatatypeLocation;
 use crate::superblock::Superblock;
 use crate::type_builders::{
     AttrSpec, CommittedDatatype, DatasetBuilder, FinishedGroup, GroupBuilder, VlStringStaging,
-    build_attr_message, build_global_heap_collections, normalize_object_path, patch_vl_refs,
-    patch_vl_refs_masked, write_reference_address,
+    build_global_heap_collections, committed_attr_message, patch_vl_refs, patch_vl_refs_masked,
+    write_reference_address,
 };
 
 // `AttrValue` lives in `type_builders`; `types` and `mat` reference it through
@@ -1069,9 +1069,7 @@ impl FileWriter {
     /// Attach a root-group attribute whose datatype is the committed one at
     /// `path`. See [`DatasetBuilder::set_attr_committed`].
     pub fn set_root_attr_committed(&mut self, name: &str, value: AttrValue, path: &str) {
-        let mut message = build_attr_message(name, &value);
-        message.datatype_location = DatatypeLocation::CommittedPath(normalize_object_path(path));
-        self.set_root_attr_verbatim(message);
+        self.set_root_attr_verbatim(committed_attr_message(name, &value, path));
     }
 
     pub fn set_root_attr(&mut self, name: &str, value: AttrValue) {
@@ -1719,16 +1717,16 @@ impl FileWriter {
         // its reference count and so changes length with it, and because a
         // dataset that names a type the file does not commit must be refused
         // before the layout is half built.
-        let committed_paths: Vec<(String, usize)> = {
+        let committed_by_path: HashMap<String, usize> = {
             fn walk(
                 prefix: &str,
                 gi: usize,
                 groups: &[GrpFlat],
                 committed: &[CtFlat],
-                out: &mut Vec<(String, usize)>,
+                out: &mut HashMap<String, usize>,
             ) {
                 for &ci in &groups[gi].committed_indices {
-                    out.push((format!("{prefix}/{}", committed[ci].name), ci));
+                    out.insert(format!("{prefix}/{}", committed[ci].name), ci);
                 }
                 for &sgi in &groups[gi].sub_group_indices {
                     walk(
@@ -1740,7 +1738,7 @@ impl FileWriter {
                     );
                 }
             }
-            let mut out: Vec<(String, usize)> = root_committed_indices
+            let mut out: HashMap<String, usize> = root_committed_indices
                 .iter()
                 .map(|&ci| (committed[ci].name.clone(), ci))
                 .collect();
@@ -1749,10 +1747,6 @@ impl FileWriter {
             }
             out
         };
-        let committed_by_path: HashMap<&str, usize> = committed_paths
-            .iter()
-            .map(|(path, ci)| (path.as_str(), *ci))
-            .collect();
 
         /// Register one use of a committed datatype: resolve the path it names,
         /// check that the user and the committed object describe the same type,
@@ -1762,12 +1756,16 @@ impl FileWriter {
         /// A reader takes the committed one — it is the only one in the file — so
         /// a dataset written with a mismatched inline declaration would have its
         /// element bytes read under a type it was not encoded in, silently.
+        ///
+        /// `user` names the object for that error and is built only on that
+        /// path: every dataset and every attribute in every file passes through
+        /// here, and almost none of them name a committed type at all.
         fn register_committed_use(
             committed: &mut [CtFlat],
-            by_path: &HashMap<&str, usize>,
+            by_path: &HashMap<String, usize>,
             location: &DatatypeLocation,
             dt: &Datatype,
-            user: &str,
+            user: impl FnOnce() -> String,
         ) -> Result<(), FormatError> {
             let Some(path) = location.unresolved_path() else {
                 return Ok(());
@@ -1778,7 +1776,7 @@ impl FileWriter {
             if committed[ci].dt.serialize() != dt.serialize() {
                 return Err(FormatError::CommittedDatatypeMismatch {
                     path: path.to_string(),
-                    user: user.to_string(),
+                    user: user(),
                 });
             }
             committed[ci].references = committed[ci].references.saturating_add(1);
@@ -1791,7 +1789,7 @@ impl FileWriter {
                 &committed_by_path,
                 &attr.datatype_location,
                 &attr.datatype,
-                &format!("root attribute {:?}", attr.name),
+                || format!("root attribute {:?}", attr.name),
             )?;
         }
         for g in &groups {
@@ -1801,7 +1799,7 @@ impl FileWriter {
                     &committed_by_path,
                     &attr.datatype_location,
                     &attr.datatype,
-                    &format!("attribute {:?} of group {:?}", attr.name, g.name),
+                    || format!("attribute {:?} of group {:?}", attr.name, g.name),
                 )?;
             }
         }
@@ -1811,7 +1809,7 @@ impl FileWriter {
                 &committed_by_path,
                 &d.dt_location,
                 &d.dt,
-                &format!("dataset {:?}", d.name),
+                || format!("dataset {:?}", d.name),
             )?;
             for attr in &d.attrs {
                 register_committed_use(
@@ -1819,7 +1817,7 @@ impl FileWriter {
                     &committed_by_path,
                     &attr.datatype_location,
                     &attr.datatype,
-                    &format!("attribute {:?} of dataset {:?}", attr.name, d.name),
+                    || format!("attribute {:?} of dataset {:?}", attr.name, d.name),
                 )?;
             }
         }
@@ -1833,41 +1831,53 @@ impl FileWriter {
             .map(|ct| build_committed_datatype_oh(&ct.dt, ct.references))
             .collect::<Result<_, _>>()?;
 
-        /// The links one group carries, in the order they are written: its
-        /// datasets, its committed datatypes, then its subgroups.
+        /// Everything a link can name, paired with the address assigned to it.
         ///
-        /// Assembled in one place because the sizing pass and the two emission
-        /// paths have to agree exactly on what a group contains. A link the
-        /// sizing pass does not know about is a header longer than the span
-        /// reserved for it, which silently moves every object after it.
-        #[expect(
-            clippy::too_many_arguments,
-            reason = "three child kinds, each needing its flat list and its address vector"
-        )]
-        fn group_links(
-            ds_indices: &[usize],
-            committed_indices: &[usize],
-            sub_group_indices: &[usize],
-            all_ds: &[DsFlat],
-            committed: &[CtFlat],
-            groups: &[GrpFlat],
-            ds_addrs: &[u64],
-            committed_addrs: &[u64],
-            group_addrs: &[u64],
-        ) -> Vec<LinkMessage> {
-            let mut links = Vec::with_capacity(
-                ds_indices.len() + committed_indices.len() + sub_group_indices.len(),
-            );
-            for &i in ds_indices {
-                links.push(make_link(&all_ds[i].name, ds_addrs[i]));
+        /// The sizing pass and the two emission paths differ only in which
+        /// addresses they hold — dummy zeros against real ones — so they build
+        /// this and ask it the same question rather than assembling links
+        /// apiece.
+        struct LinkTables<'a> {
+            all_ds: &'a [DsFlat],
+            committed: &'a [CtFlat],
+            groups: &'a [GrpFlat],
+            ds_addrs: &'a [u64],
+            committed_addrs: &'a [u64],
+            group_addrs: &'a [u64],
+        }
+
+        impl LinkTables<'_> {
+            /// The links one group carries, in the order they are written: its
+            /// datasets, its committed datatypes, then its subgroups.
+            ///
+            /// Assembled in one place because the sizing pass and the two
+            /// emission paths have to agree exactly on what a group contains. A
+            /// link the sizing pass does not know about is a header longer than
+            /// the span reserved for it, which silently moves every object after
+            /// it.
+            fn links(
+                &self,
+                ds_indices: &[usize],
+                committed_indices: &[usize],
+                sub_group_indices: &[usize],
+            ) -> Vec<LinkMessage> {
+                let mut links = Vec::with_capacity(
+                    ds_indices.len() + committed_indices.len() + sub_group_indices.len(),
+                );
+                for &i in ds_indices {
+                    links.push(make_link(&self.all_ds[i].name, self.ds_addrs[i]));
+                }
+                for &ci in committed_indices {
+                    links.push(make_link(
+                        &self.committed[ci].name,
+                        self.committed_addrs[ci],
+                    ));
+                }
+                for &gi in sub_group_indices {
+                    links.push(make_link(&self.groups[gi].name, self.group_addrs[gi]));
+                }
+                links
             }
-            for &ci in committed_indices {
-                links.push(make_link(&committed[ci].name, committed_addrs[ci]));
-            }
-            for &gi in sub_group_indices {
-                links.push(make_link(&groups[gi].name, group_addrs[gi]));
-            }
-            links
         }
 
         // Addresses the sizing pass uses. A link's byte length does not depend on
@@ -2094,20 +2104,22 @@ impl FileWriter {
         // dense attributes also records its heap's byte length here, so pass 2
         // can reserve the span without yet building the bytes that go in it —
         // see `DenseSpans`.
+        // Built here rather than beside the dummy addresses above because the
+        // passes between still mutate `all_ds` (VL staging, compression), and
+        // these tables borrow it.
+        let dummy_tables = LinkTables {
+            all_ds: &all_ds,
+            committed: &committed,
+            groups: &groups,
+            ds_addrs: &dummy_ds_addrs,
+            committed_addrs: &dummy_ct_addrs,
+            group_addrs: &dummy_grp_addrs,
+        };
         let mut group_oh_sizes: Vec<usize> = Vec::with_capacity(groups.len());
         let mut group_dense_lens: Vec<Option<usize>> = Vec::with_capacity(groups.len());
         for (gi, g) in groups.iter().enumerate() {
-            let dummy_links = group_links(
-                &g.ds_indices,
-                &g.committed_indices,
-                &g.sub_group_indices,
-                &all_ds,
-                &committed,
-                &groups,
-                &dummy_ds_addrs,
-                &dummy_ct_addrs,
-                &dummy_grp_addrs,
-            );
+            let dummy_links =
+                dummy_tables.links(&g.ds_indices, &g.committed_indices, &g.sub_group_indices);
             let (oh, dense_len) = if group_dense[gi] {
                 let dummy_blob = build_dense_attrs(&g.attrs, 0);
                 let len = dummy_blob.blob.len();
@@ -2122,16 +2134,10 @@ impl FileWriter {
             group_dense_lens.push(dense_len);
         }
 
-        let root_dummy_links = group_links(
+        let root_dummy_links = dummy_tables.links(
             &root_ds_indices,
             &root_committed_indices,
             &root_group_indices,
-            &all_ds,
-            &committed,
-            &groups,
-            &dummy_ds_addrs,
-            &dummy_ct_addrs,
-            &dummy_grp_addrs,
         );
         let (root_oh_size, root_dense_len) = if root_dense {
             let dummy_blob = build_dense_attrs(&root_attrs, 0);
@@ -2292,8 +2298,8 @@ impl FileWriter {
             }
             // A committed datatype is an object like any other, so an object
             // reference can point at one. Its path was already computed, above.
-            for (path, ci) in &committed_paths {
-                path_map.insert(path.clone(), committed_addrs[*ci]);
+            for (path, &ci) in &committed_by_path {
+                path_map.insert(path.clone(), committed_addrs[ci]);
             }
             for &gi in &root_group_indices {
                 fn register_group(
@@ -2388,6 +2394,51 @@ impl FileWriter {
             data: DsData,
             data_addr: u64,
             chunked_msgs: Option<(Vec<u8>, Option<Vec<u8>>)>,
+        }
+
+        /// Build every dataset's object header from its final layout.
+        ///
+        /// The paged and non-paged paths reach this point with different
+        /// addresses and the same datasets, so they share the build: a header
+        /// field added on one path and missed on the other would be a file that
+        /// changes shape with a property that is supposed to change only where
+        /// its bytes land.
+        fn build_ds_ohs(
+            all_ds: &[DsFlat],
+            ds_layouts: &[DsLayout],
+            ds_dense_blobs: &[Option<DenseAttrBlob>],
+            libver: LibVer,
+        ) -> Result<Vec<Vec<u8>>, FormatError> {
+            let mut oh_bytes: Vec<Vec<u8>> = Vec::with_capacity(all_ds.len());
+            for (i, d) in all_ds.iter().enumerate() {
+                let layout = &ds_layouts[i];
+                let oh = if let Some((ref lm, ref pm)) = layout.chunked_msgs {
+                    build_chunked_dataset_oh(
+                        &d.dt,
+                        &d.dt_location,
+                        &d.ds,
+                        lm,
+                        pm.as_deref(),
+                        &d.attrs,
+                        ds_dense_blobs[i].as_ref(),
+                        d.fill.as_deref(),
+                    )?
+                } else {
+                    build_dataset_oh(
+                        &d.dt,
+                        &d.dt_location,
+                        &d.ds,
+                        layout.data_addr,
+                        layout.data.len(),
+                        &d.attrs,
+                        ds_dense_blobs[i].as_ref(),
+                        d.fill.as_deref(),
+                        libver,
+                    )?
+                };
+                oh_bytes.push(oh);
+            }
+            Ok(oh_bytes)
         }
 
         // ---- Paged file-space layout + emission ----
@@ -2669,35 +2720,7 @@ impl FileWriter {
                 .collect();
 
             // (h) Build dataset OHs from the final data addresses.
-            let mut ds_oh_bytes: Vec<Vec<u8>> = Vec::with_capacity(all_ds.len());
-            for (i, d) in all_ds.iter().enumerate() {
-                let layout = &ds_layouts[i];
-                let oh = if let Some((ref lm, ref pm)) = layout.chunked_msgs {
-                    build_chunked_dataset_oh(
-                        &d.dt,
-                        &d.dt_location,
-                        &d.ds,
-                        lm,
-                        pm.as_deref(),
-                        &d.attrs,
-                        ds_dense_blobs[i].as_ref(),
-                        d.fill.as_deref(),
-                    )?
-                } else {
-                    build_dataset_oh(
-                        &d.dt,
-                        &d.dt_location,
-                        &d.ds,
-                        layout.data_addr,
-                        layout.data.len(),
-                        &d.attrs,
-                        ds_dense_blobs[i].as_ref(),
-                        d.fill.as_deref(),
-                        libver,
-                    )?
-                };
-                ds_oh_bytes.push(oh);
-            }
+            let ds_oh_bytes = build_ds_ohs(&all_ds, &ds_layouts, &ds_dense_blobs, libver)?;
             debug_assert_eq!(
                 ds_oh_bytes.iter().map(|b| b.len()).collect::<Vec<_>>(),
                 actual_ds_oh_sizes
@@ -2779,16 +2802,18 @@ impl FileWriter {
             }
 
             // Root group OH + dense blob.
-            let root_links = group_links(
+            let tables = LinkTables {
+                all_ds: &all_ds,
+                committed: &committed,
+                groups: &groups,
+                ds_addrs: &ds_oh_addrs2,
+                committed_addrs: &committed_addrs,
+                group_addrs: &group_addrs2,
+            };
+            let root_links = tables.links(
                 &root_ds_indices,
                 &root_committed_indices,
                 &root_group_indices,
-                &all_ds,
-                &committed,
-                &groups,
-                &ds_oh_addrs2,
-                &committed_addrs,
-                &group_addrs2,
             );
             let root_oh = build_group_oh(&root_links, &root_attrs, root_dense_blob.as_ref())?;
             debug_assert_eq!(root_oh.len(), root_oh_size);
@@ -2798,17 +2823,7 @@ impl FileWriter {
             }
             // Group OHs + dense blobs.
             for (gi, g) in groups.iter().enumerate() {
-                let links = group_links(
-                    &g.ds_indices,
-                    &g.committed_indices,
-                    &g.sub_group_indices,
-                    &all_ds,
-                    &committed,
-                    &groups,
-                    &ds_oh_addrs2,
-                    &committed_addrs,
-                    &group_addrs2,
-                );
+                let links = tables.links(&g.ds_indices, &g.committed_indices, &g.sub_group_indices);
                 let oh = build_group_oh(&links, &g.attrs, group_dense_blobs[gi].as_ref())?;
                 debug_assert_eq!(oh.len(), group_oh_sizes[gi]);
                 sink.put(&oh)?;
@@ -3007,35 +3022,7 @@ impl FileWriter {
         // are kept here; each dataset's data is emitted directly from
         // `ds_layouts` in the assembly loop (a streamed dataset has no data
         // bytes to keep at all).
-        let mut ds_oh_bytes2: Vec<Vec<u8>> = Vec::with_capacity(all_ds.len());
-        for (i, d) in all_ds.iter().enumerate() {
-            let layout = &ds_layouts[i];
-            let oh = if let Some((ref lm, ref pm)) = layout.chunked_msgs {
-                build_chunked_dataset_oh(
-                    &d.dt,
-                    &d.dt_location,
-                    &d.ds,
-                    lm,
-                    pm.as_deref(),
-                    &d.attrs,
-                    ds_dense_blobs[i].as_ref(),
-                    d.fill.as_deref(),
-                )?
-            } else {
-                build_dataset_oh(
-                    &d.dt,
-                    &d.dt_location,
-                    &d.ds,
-                    layout.data_addr,
-                    layout.data.len(),
-                    &d.attrs,
-                    ds_dense_blobs[i].as_ref(),
-                    d.fill.as_deref(),
-                    libver,
-                )?
-            };
-            ds_oh_bytes2.push(oh);
-        }
+        let ds_oh_bytes2 = build_ds_ohs(&all_ds, &ds_layouts, &ds_dense_blobs, libver)?;
 
         let actual_ds_oh_sizes2: Vec<usize> = ds_oh_bytes2.iter().map(|b| b.len()).collect();
         debug_assert_eq!(actual_ds_oh_sizes, actual_ds_oh_sizes2);
@@ -3092,16 +3079,18 @@ impl FileWriter {
         );
 
         // Root group OH
-        let root_links = group_links(
+        let tables = LinkTables {
+            all_ds: &all_ds,
+            committed: &committed,
+            groups: &groups,
+            ds_addrs: &ds_oh_addrs2,
+            committed_addrs: &committed_addrs,
+            group_addrs: &group_addrs2,
+        };
+        let root_links = tables.links(
             &root_ds_indices,
             &root_committed_indices,
             &root_group_indices,
-            &all_ds,
-            &committed,
-            &groups,
-            &ds_oh_addrs2,
-            &committed_addrs,
-            &group_addrs2,
         );
         let root_oh = build_group_oh(&root_links, &root_attrs, root_dense_blob.as_ref())?;
         debug_assert_eq!(root_oh.len(), root_oh_size);
@@ -3112,17 +3101,7 @@ impl FileWriter {
 
         // Group OHs + dense blobs
         for (gi, g) in groups.iter().enumerate() {
-            let links = group_links(
-                &g.ds_indices,
-                &g.committed_indices,
-                &g.sub_group_indices,
-                &all_ds,
-                &committed,
-                &groups,
-                &ds_oh_addrs2,
-                &committed_addrs,
-                &group_addrs2,
-            );
+            let links = tables.links(&g.ds_indices, &g.committed_indices, &g.sub_group_indices);
             let oh = build_group_oh(&links, &g.attrs, group_dense_blobs[gi].as_ref())?;
             debug_assert_eq!(oh.len(), group_oh_sizes[gi]);
             sink.put(&oh)?;

@@ -548,14 +548,7 @@ fn emit_dataset(
     if is_vlen_string_datatype(&datatype) {
         emit_vlen_string_dataset(db, ds, path, &datatype, &dims, &layout, &pipeline)?;
         // VL-string datasets carry attributes the same way as any other.
-        copy_attrs(
-            db,
-            ds.attr_messages()?,
-            || ds.attrs(),
-            &format!("dataset {path}"),
-            drop,
-            addr_map,
-        )?;
+        copy_dataset_attrs(db, ds, path, drop, addr_map)?;
         return Ok(());
     }
 
@@ -566,14 +559,7 @@ fn emit_dataset(
     // path so a chunked one is refused (not copied with stale references).
     if is_nonstring_vlen(&datatype) {
         emit_vlen_sequence_dataset(db, ds, path, &datatype, &dims, &layout, &pipeline)?;
-        copy_attrs(
-            db,
-            ds.attr_messages()?,
-            || ds.attrs(),
-            &format!("dataset {path}"),
-            drop,
-            addr_map,
-        )?;
+        copy_dataset_attrs(db, ds, path, drop, addr_map)?;
         return Ok(());
     }
 
@@ -584,14 +570,7 @@ fn emit_dataset(
     // chunked one is refused (not copied with stale addresses).
     if is_object_reference(&datatype) {
         emit_object_reference_dataset(db, ds, path, &dims, &layout, file, drop, addr_map)?;
-        copy_attrs(
-            db,
-            ds.attr_messages()?,
-            || ds.attrs(),
-            &format!("dataset {path}"),
-            drop,
-            addr_map,
-        )?;
+        copy_dataset_attrs(db, ds, path, drop, addr_map)?;
         return Ok(());
     }
 
@@ -621,14 +600,7 @@ fn emit_dataset(
             drop,
             addr_map,
         )?;
-        copy_attrs(
-            db,
-            ds.attr_messages()?,
-            || ds.attrs(),
-            &format!("dataset {path}"),
-            drop,
-            addr_map,
-        )?;
+        copy_dataset_attrs(db, ds, path, drop, addr_map)?;
         return Ok(());
     }
 
@@ -686,14 +658,7 @@ fn emit_dataset(
 
             // Carry the dataset's attributes, refusing any that cannot be
             // represented.
-            copy_attrs(
-                db,
-                ds.attr_messages()?,
-                || ds.attrs(),
-                &format!("dataset {path}"),
-                drop,
-                addr_map,
-            )?;
+            copy_dataset_attrs(db, ds, path, drop, addr_map)?;
             return Ok(());
         }
 
@@ -727,6 +692,23 @@ fn emit_dataset(
     );
 
     // Carry the dataset's attributes, refusing if any cannot be represented.
+    copy_dataset_attrs(db, ds, path, drop, addr_map)?;
+
+    Ok(())
+}
+
+/// Carry `ds`'s attributes onto `db`, refusing any that cannot be represented.
+///
+/// Every exit from [`emit_dataset`] ends here with the same arguments, and each
+/// one has to: a dataset that reaches the output without its attributes is a
+/// silent loss, not a refusal.
+fn copy_dataset_attrs(
+    db: &mut DatasetBuilder,
+    ds: &Dataset,
+    path: &str,
+    drop: &BTreeSet<String>,
+    addr_map: &HashMap<u64, String>,
+) -> Result<(), Error> {
     copy_attrs(
         db,
         ds.attr_messages()?,
@@ -734,9 +716,7 @@ fn emit_dataset(
         &format!("dataset {path}"),
         drop,
         addr_map,
-    )?;
-
-    Ok(())
+    )
 }
 
 /// Carry the source dataset's resizability, chunk geometry, and filter pipeline

@@ -1633,9 +1633,7 @@ impl DatasetBuilder {
     /// applies: `value` decides the attribute's type, and it must be the type
     /// committed at `path`.
     pub fn set_attr_committed(&mut self, name: &str, value: AttrValue, path: &str) -> &mut Self {
-        let mut message = build_attr_message(name, &value);
-        message.datatype_location = DatatypeLocation::CommittedPath(normalize_object_path(path));
-        self.set_attr_verbatim(message)
+        self.set_attr_verbatim(committed_attr_message(name, &value, path))
     }
 
     pub fn with_f64_data(&mut self, data: &[f64]) -> &mut Self {
@@ -2473,9 +2471,7 @@ impl GroupBuilder {
     ///
     /// See [`DatasetBuilder::set_attr_committed`].
     pub fn set_attr_committed(&mut self, name: &str, value: AttrValue, path: &str) {
-        let mut message = build_attr_message(name, &value);
-        message.datatype_location = DatatypeLocation::CommittedPath(normalize_object_path(path));
-        self.set_attr_verbatim(message);
+        self.set_attr_verbatim(committed_attr_message(name, &value, path));
     }
 
     /// Attach a variable-length string attribute with the given datatype and
@@ -2542,6 +2538,22 @@ pub(crate) struct CommittedDatatype {
 /// every lookup.
 pub(crate) fn normalize_object_path(path: &str) -> String {
     path.trim_matches('/').to_string()
+}
+
+/// An attribute message carrying `value`, named after the committed datatype at
+/// `path` instead of spelling its type out.
+///
+/// The value still decides the message's dataspace and raw bytes; only the
+/// datatype moves out of the message. The writer checks the two agree before it
+/// lays anything out.
+pub(crate) fn committed_attr_message(
+    name: &str,
+    value: &AttrValue,
+    path: &str,
+) -> AttributeMessage {
+    let mut message = build_attr_message(name, value);
+    message.datatype_location = DatatypeLocation::CommittedPath(normalize_object_path(path));
+    message
 }
 
 #[cfg(test)]

@@ -183,10 +183,13 @@ pub fn encode_committed_ref(address: u64, offset_size: u8) -> Vec<u8> {
 /// decode to the same [`Datatype`](crate::datatype::Datatype), so this is what
 /// separates a message that *names* a type from one that spells it out — a
 /// distinction `h5dump` reports, and a rewrite has to preserve.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// No `Default`: an omitted location silently means `Inline`, and a reference
+/// that decodes as an encoding is the whole defect this type exists to prevent.
+/// Every construction names its variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DatatypeLocation {
     /// Encoded in the message itself.
-    #[default]
     Inline,
     /// A reference to the committed datatype object at this address, in the file
     /// the message belongs to. What a parse reads out of a file, and what a
@@ -269,8 +272,9 @@ impl<'a> BufferedResolver<'a> {
 
 impl SharedResolver for BufferedResolver<'_> {
     fn resolve(&self, reference: &[u8], target: MessageType) -> Result<Vec<u8>, FormatError> {
-        let shared = parse_shared_ref(reference, self.offset_size, self.length_size)?;
-        let addr = object_header_address(&shared)?;
+        // Through committed_address, so the address a rewrite records cannot
+        // drift from the one the content was read at.
+        let addr = self.committed_address(reference)?;
         let header = ObjectHeader::parse(
             self.file_data,
             addr.to_usize()?,
@@ -281,11 +285,7 @@ impl SharedResolver for BufferedResolver<'_> {
     }
 
     fn committed_address(&self, reference: &[u8]) -> Result<u64, FormatError> {
-        object_header_address(&parse_shared_ref(
-            reference,
-            self.offset_size,
-            self.length_size,
-        )?)
+        committed_address_in(reference, self.offset_size, self.length_size)
     }
 }
 
@@ -309,8 +309,7 @@ impl<'a, S: Source + ?Sized> SourceResolver<'a, S> {
 
 impl<S: Source + ?Sized> SharedResolver for SourceResolver<'_, S> {
     fn resolve(&self, reference: &[u8], target: MessageType) -> Result<Vec<u8>, FormatError> {
-        let shared = parse_shared_ref(reference, self.offset_size, self.length_size)?;
-        let addr = object_header_address(&shared)?;
+        let addr = self.committed_address(reference)?;
         // base_address 0 matches the buffered path, whose slice is already framed
         // at the base address, so both treat the reference as absolute within it.
         let header = ObjectHeader::parse_from_source(
@@ -324,11 +323,7 @@ impl<S: Source + ?Sized> SharedResolver for SourceResolver<'_, S> {
     }
 
     fn committed_address(&self, reference: &[u8]) -> Result<u64, FormatError> {
-        object_header_address(&parse_shared_ref(
-            reference,
-            self.offset_size,
-            self.length_size,
-        )?)
+        committed_address_in(reference, self.offset_size, self.length_size)
     }
 }
 
@@ -359,6 +354,19 @@ fn object_header_address(shared: &SharedMessageRef) -> Result<u64, FormatError> 
         SharedLocation::ObjectHeader(addr) => Ok(addr),
         SharedLocation::SohmHeap(_) => Err(FormatError::UnsupportedSohmReference),
     }
+}
+
+/// The object-header address `reference` names, read with the given field widths.
+///
+/// Every resolver that can reach the file answers
+/// [`SharedResolver::committed_address`] this way; they differ only in how they
+/// read the object *at* the address, which is [`SharedResolver::resolve`]'s job.
+pub(crate) fn committed_address_in(
+    reference: &[u8],
+    offset_size: u8,
+    length_size: u8,
+) -> Result<u64, FormatError> {
+    object_header_address(&parse_shared_ref(reference, offset_size, length_size)?)
 }
 
 /// Pick the message of `target_msg_type` out of a resolved target object header.
