@@ -18,6 +18,7 @@ use crate::datatype::{
 use crate::display::write_elided;
 use crate::error::FormatError;
 use crate::scaleoffset::ScaleOffset;
+use crate::shared_message::DatatypeLocation;
 
 // ---- Datatype constructors ----
 
@@ -652,6 +653,7 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
             datatype: make_f64_type(),
             dataspace: scalar_ds(),
             raw_data: v.to_le_bytes().to_vec(),
+            datatype_location: DatatypeLocation::Inline,
         },
         AttrValue::F64Array(arr) => {
             let mut raw = Vec::with_capacity(arr.len() * 8);
@@ -663,6 +665,7 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
                 datatype: make_f64_type(),
                 dataspace: simple_1d(arr.len() as u64),
                 raw_data: raw,
+                datatype_location: DatatypeLocation::Inline,
             }
         }
         AttrValue::I64(v) => AttributeMessage {
@@ -670,6 +673,7 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
             datatype: make_i64_type(),
             dataspace: scalar_ds(),
             raw_data: v.to_le_bytes().to_vec(),
+            datatype_location: DatatypeLocation::Inline,
         },
         AttrValue::I64Array(arr) => {
             let mut raw = Vec::with_capacity(arr.len() * 8);
@@ -681,6 +685,7 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
                 datatype: make_i64_type(),
                 dataspace: simple_1d(arr.len() as u64),
                 raw_data: raw,
+                datatype_location: DatatypeLocation::Inline,
             }
         }
         AttrValue::U64Array(arr) => {
@@ -693,6 +698,7 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
                 datatype: make_u64_type(),
                 dataspace: simple_1d(arr.len() as u64),
                 raw_data: raw,
+                datatype_location: DatatypeLocation::Inline,
             }
         }
         AttrValue::I32(v) => AttributeMessage {
@@ -700,18 +706,21 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
             datatype: make_i32_type(),
             dataspace: scalar_ds(),
             raw_data: v.to_le_bytes().to_vec(),
+            datatype_location: DatatypeLocation::Inline,
         },
         AttrValue::U32(v) => AttributeMessage {
             name: name.to_string(),
             datatype: make_u32_type(),
             dataspace: scalar_ds(),
             raw_data: v.to_le_bytes().to_vec(),
+            datatype_location: DatatypeLocation::Inline,
         },
         AttrValue::U64(v) => AttributeMessage {
             name: name.to_string(),
             datatype: make_u64_type(),
             dataspace: scalar_ds(),
             raw_data: v.to_le_bytes().to_vec(),
+            datatype_location: DatatypeLocation::Inline,
         },
         AttrValue::String(s) => {
             let bytes = s.as_bytes();
@@ -724,6 +733,7 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
                 },
                 dataspace: scalar_ds(),
                 raw_data: pad_to_size(bytes),
+                datatype_location: DatatypeLocation::Inline,
             }
         }
         AttrValue::StringArray(arr) => {
@@ -743,6 +753,7 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
                 },
                 dataspace: simple_1d(arr.len() as u64),
                 raw_data: raw,
+                datatype_location: DatatypeLocation::Inline,
             }
         }
         AttrValue::AsciiString(s) => {
@@ -756,6 +767,7 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
                 },
                 dataspace: scalar_ds(),
                 raw_data: pad_to_size(bytes),
+                datatype_location: DatatypeLocation::Inline,
             }
         }
         AttrValue::AsciiStringArray(arr) => {
@@ -775,6 +787,7 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
                 },
                 dataspace: simple_1d(arr.len() as u64),
                 raw_data: raw,
+                datatype_location: DatatypeLocation::Inline,
             }
         }
         AttrValue::VarLenAsciiArray(strings) => {
@@ -800,6 +813,7 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
                     }),
                 },
                 dataspace: simple_1d(strings.len() as u64),
+                datatype_location: DatatypeLocation::Inline,
             }
         }
     }
@@ -1568,6 +1582,9 @@ pub struct DatasetBuilder {
     /// value message untouched. Its byte width is checked against the datatype's
     /// element size when the dataset is serialized.
     pub(crate) fill: Option<Vec<u8>>,
+    /// Where this dataset's element type is written: in its own header, or as a
+    /// reference to a committed datatype object named by path.
+    pub(crate) datatype_location: DatatypeLocation,
     #[cfg(feature = "provenance")]
     pub(crate) provenance: Option<ProvenanceConfig>,
 }
@@ -1587,9 +1604,36 @@ impl DatasetBuilder {
             reference_targets: None,
             vl_string_staging: None,
             fill: None,
+            datatype_location: DatatypeLocation::Inline,
             #[cfg(feature = "provenance")]
             provenance: None,
         }
+    }
+
+    /// Write this dataset's element type as a reference to the committed
+    /// datatype at `path` instead of encoding it in the dataset's own header.
+    ///
+    /// The dataset still declares its element type the usual way (through
+    /// `with_*_data` or [`with_dtype`](Self::with_dtype)); this says where that
+    /// type is *stored*. The two must agree — a dataset naming a committed type
+    /// it does not match is refused when the file is written, because every
+    /// reader would believe the committed one and read the element bytes wrong.
+    ///
+    /// `path` names a datatype committed with
+    /// [`FileBuilder::commit_datatype`](crate::FileBuilder::commit_datatype) or
+    /// [`GroupBuilder::commit_datatype`], with or without a leading `/`.
+    pub fn with_committed_datatype(&mut self, path: &str) -> &mut Self {
+        self.datatype_location = DatatypeLocation::CommittedPath(normalize_object_path(path));
+        self
+    }
+
+    /// Attach an attribute whose datatype is the committed one at `path`.
+    ///
+    /// The same agreement rule as [`with_committed_datatype`](Self::with_committed_datatype)
+    /// applies: `value` decides the attribute's type, and it must be the type
+    /// committed at `path`.
+    pub fn set_attr_committed(&mut self, name: &str, value: AttrValue, path: &str) -> &mut Self {
+        self.set_attr_verbatim(committed_attr_message(name, &value, path))
     }
 
     pub fn with_f64_data(&mut self, data: &[f64]) -> &mut Self {
@@ -2380,6 +2424,7 @@ pub struct GroupBuilder {
     pub(crate) datasets: Vec<DatasetBuilder>,
     pub(crate) sub_groups: Vec<FinishedGroup>,
     pub(crate) attrs: Vec<(String, AttrSpec)>,
+    pub(crate) committed: Vec<CommittedDatatype>,
 }
 
 impl GroupBuilder {
@@ -2389,6 +2434,7 @@ impl GroupBuilder {
             datasets: Vec::new(),
             sub_groups: Vec::new(),
             attrs: Vec::new(),
+            committed: Vec::new(),
         }
     }
 
@@ -2421,6 +2467,13 @@ impl GroupBuilder {
             .push((message.name.clone(), AttrSpec::Verbatim(message)));
     }
 
+    /// Attach an attribute whose datatype is the committed one at `path`.
+    ///
+    /// See [`DatasetBuilder::set_attr_committed`].
+    pub fn set_attr_committed(&mut self, name: &str, value: AttrValue, path: &str) {
+        self.set_attr_verbatim(committed_attr_message(name, &value, path));
+    }
+
     /// Attach a variable-length string attribute with the given datatype and
     /// dataspace, staging `strings` into a heap of this file's own.
     /// See [`AttrSpec::VerbatimVarLen`].
@@ -2436,6 +2489,18 @@ impl GroupBuilder {
         ));
     }
 
+    /// Commit `datatype` in this group under `name`, the way `H5Tcommit` does.
+    ///
+    /// See [`FileBuilder::commit_datatype`](crate::FileBuilder::commit_datatype)
+    /// for what a committed datatype is and how datasets and attributes name one.
+    /// The path they use is this group's path joined with `name`.
+    pub fn commit_datatype(&mut self, name: &str, datatype: Datatype) {
+        self.committed.push(CommittedDatatype {
+            name: name.to_string(),
+            datatype,
+        });
+    }
+
     /// Consume the builder, returning a FinishedGroup to add to FileWriter.
     pub fn finish(self) -> FinishedGroup {
         FinishedGroup {
@@ -2443,6 +2508,7 @@ impl GroupBuilder {
             datasets: self.datasets,
             sub_groups: self.sub_groups,
             attrs: self.attrs,
+            committed: self.committed,
         }
     }
 }
@@ -2453,6 +2519,41 @@ pub struct FinishedGroup {
     pub(crate) datasets: Vec<DatasetBuilder>,
     pub(crate) sub_groups: Vec<FinishedGroup>,
     pub(crate) attrs: Vec<(String, AttrSpec)>,
+    pub(crate) committed: Vec<CommittedDatatype>,
+}
+
+/// A datatype to be written as its own named object, which datasets and
+/// attributes then reference instead of encoding the type again.
+pub(crate) struct CommittedDatatype {
+    /// Link name within the owning group.
+    pub(crate) name: String,
+    pub(crate) datatype: Datatype,
+}
+
+/// Canonicalize a path naming an object in the file being written.
+///
+/// The writer's own path map is keyed without a leading slash (the root group is
+/// the empty path), while an HDF5 user writes `/mytype`. Both forms name the same
+/// object, so both are accepted and reduced to the map's form here rather than at
+/// every lookup.
+pub(crate) fn normalize_object_path(path: &str) -> String {
+    path.trim_matches('/').to_string()
+}
+
+/// An attribute message carrying `value`, named after the committed datatype at
+/// `path` instead of spelling its type out.
+///
+/// The value still decides the message's dataspace and raw bytes; only the
+/// datatype moves out of the message. The writer checks the two agree before it
+/// lays anything out.
+pub(crate) fn committed_attr_message(
+    name: &str,
+    value: &AttrValue,
+    path: &str,
+) -> AttributeMessage {
+    let mut message = build_attr_message(name, value);
+    message.datatype_location = DatatypeLocation::CommittedPath(normalize_object_path(path));
+    message
 }
 
 #[cfg(test)]

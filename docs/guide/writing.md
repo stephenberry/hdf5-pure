@@ -117,6 +117,31 @@ builder.add_group(grp.finish());
 
 `GroupBuilder::finish()` produces a `FinishedGroup`, which `add_group` inserts into the file. Nested hierarchies and group attributes are covered in detail on the [groups and attributes](groups-attributes.md) page.
 
+## Committed (named) datatypes
+
+`commit_datatype` writes a datatype as an object of its own, the way HDF5's `H5Tcommit` does. Datasets and attributes then *name* it instead of each encoding the type again:
+
+```rust
+use hdf5_pure::{AttrValue, FileBuilder, make_i32_type};
+
+let mut builder = FileBuilder::new();
+builder.commit_datatype("reading_t", make_i32_type());
+
+builder
+    .create_dataset("readings")
+    .with_i32_data(&[3, 1, 4])
+    .with_committed_datatype("reading_t")
+    .set_attr_committed("baseline", AttrValue::I32(0), "reading_t");
+```
+
+`h5dump` reports such a dataset as `DATATYPE "/reading_t"`, and every object naming the type shares one object rather than declaring an identical type of its own. This is what netCDF-4 writes for a user-defined type, and what `h5py` writes for `create_dataset(..., dtype=f["reading_t"])`.
+
+`GroupBuilder::commit_datatype` commits a type inside a group; name it by path, as in `with_committed_datatype("sensors/reading_t")`. A leading `/` is accepted.
+
+The naming object still declares its own element type, and the two must agree — `with_i32_data` above against a committed i32. A dataset naming a type it does not match, or a path the file commits nothing at, fails the write rather than producing a file whose element bytes and declared type disagree.
+
+Committed datatypes survive [`repack`](repack.md), but cannot be added to an existing file in place: the in-place engine appends into a fixed layout with nowhere to put the new object. Read them back with `Group::named_datatypes` and `Group::named_datatype`.
+
 ## Empty and zero-dimension datasets
 
 To create a dataset without supplying data, set the datatype and shape explicitly with `with_dtype` and `with_shape`. This is how you write an empty (zero-length) or zero-dimension (scalar-shaped) dataset:

@@ -1,18 +1,25 @@
 //! HDF5 Shared Object Header Message resolution.
 //!
-//! When a header message has its "shared" flag (bit 1 of msg_flags) set,
-//! the message data is not the actual message content but a reference
-//! to a shared copy stored elsewhere.
+//! A header message whose record has the shared flag (bit 1 of `msg_flags`) set
+//! does not hold its own content. Its body is a *reference* to the one copy of
+//! that message stored elsewhere, and the same reference encoding appears inside
+//! an attribute message whose datatype or dataspace field is shared.
 //!
-//! Shared message reference types:
-//! - Type 0: shared in the same object header (not typically used)
-//! - Type 1: shared in another object header (version 1-2)
-//! - Type 2: shared in the SOHM table (via fractal heap, version 3) — parsed
-//!   into a reference but not resolved (the SOHM table reader is not implemented)
-//! - Type 3: shared in another object header (version 3)
+//! Two things can be on the other end of a reference:
+//!
+//! - another **object header**, which is what `H5Tcommit` writes for a named
+//!   ("committed") datatype — resolved here;
+//! - the file's **shared object header message (SOHM) heap**, a fractal heap this
+//!   reader does not walk — refused by name rather than mis-read.
+//!
+//! The layouts and the type codes below follow `H5O__shared_decode` in the C
+//! library, which is the authority on what a file may contain: version 1 carries
+//! a symbol-table entry (so its object-header address sits past a local-heap
+//! address), version 2 and 3 carry the address or heap id directly, and the type
+//! byte distinguishes the two destinations only from version 2 on.
 
 #[cfg(not(feature = "std"))]
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
@@ -23,22 +30,39 @@ use crate::source::Source;
 /// Fractal heap ID length for SOHM entries (fixed at 8 bytes).
 const FHEAP_ID_LEN: usize = 8;
 
-/// A resolved shared message reference.
-///
-/// `version` and `heap_id` are decoded for on-disk-format completeness; the
-/// resolver only follows type 1/3 (object-header) references, so they are not
-/// currently read.
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
+/// Shared-message location type: the message lives in the SOHM heap
+/// (`H5O_SHARE_TYPE_SOHM`). Every other code names an object header, which is how
+/// the C library reads them: `H5O__shared_decode` branches on this one value and
+/// decodes an address for all the rest.
+const REF_TYPE_SOHM: u8 = 1;
+
+/// Shared-message location type: the message lives in another object header
+/// (`H5O_SHARE_TYPE_COMMITTED`) — a committed datatype. This is the only type the
+/// C library's encoder writes besides [`REF_TYPE_SOHM`], and the type a version 1
+/// reference is defined to have.
+const REF_TYPE_COMMITTED: u8 = 2;
+
+/// Where a shared message actually lives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SharedLocation {
+    /// In another object header, at this address. A committed (`H5Tcommit`)
+    /// datatype is stored this way, as is every version 1 reference.
+    ObjectHeader(u64),
+    /// In the file's shared object header message heap, under this fractal-heap
+    /// id. Written only when a file enables SOHM indexes (`H5Pset_shared_mesg_*`).
+    SohmHeap([u8; FHEAP_ID_LEN]),
+}
+
+/// A parsed shared message reference.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedMessageRef {
-    /// The type of shared message reference.
-    pub ref_type: u8,
-    /// Version of the shared message encoding.
+    /// Version of the shared message encoding (1, 2, or 3).
     pub version: u8,
-    /// Address of the object header containing the shared message (type 1, 3).
-    pub object_header_address: Option<u64>,
-    /// Fractal heap ID for type 2 (SOHM) references.
-    pub heap_id: Option<[u8; FHEAP_ID_LEN]>,
+    /// The raw location-type byte, as stored. Version 1 has no meaningful one and
+    /// reports [`REF_TYPE_COMMITTED`], matching how the C library decodes it.
+    pub ref_type: u8,
+    /// Where the referenced message lives.
+    pub location: SharedLocation,
 }
 
 fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
@@ -76,158 +100,323 @@ fn ensure_len(data: &[u8], pos: usize, needed: usize) -> Result<(), FormatError>
     }
 }
 
-/// Check whether a header message has its shared flag set.
+/// Check whether a header message record has its shared flag set.
 pub fn is_shared(msg_flags: u8) -> bool {
     msg_flags & 0x02 != 0
 }
 
-/// Parse a shared message reference from the message data.
+/// Parse a shared message reference from a message body.
 ///
-/// When the shared flag is set on a message, the data contains a reference
-/// instead of the actual message content.
-pub fn parse_shared_ref(data: &[u8], offset_size: u8) -> Result<SharedMessageRef, FormatError> {
+/// `length_size` is needed for version 1 only, whose reference is a symbol-table
+/// entry: the object-header address follows a local-heap address of that width.
+pub fn parse_shared_ref(
+    data: &[u8],
+    offset_size: u8,
+    length_size: u8,
+) -> Result<SharedMessageRef, FormatError> {
     ensure_len(data, 0, 2)?;
     let version = data[0];
-    let ref_type = data[1];
 
     match version {
-        1 | 2 => {
-            // v1/v2: reserved(6) + address(offset_size)
-            let pos = 2 + 6; // skip reserved bytes
-            ensure_len(data, pos, offset_size as usize)?;
+        1 => {
+            // version(1) + unused type byte(1) + reserved(6) + a symbol-table
+            // entry, whose local-heap address is skipped and whose object-header
+            // address follows. Version 1 predates the SOHM table, so the type
+            // byte carries nothing and the destination is always an object
+            // header.
+            let pos = 2 + 6 + length_size as usize;
             let addr = read_offset(data, pos, offset_size)?;
             Ok(SharedMessageRef {
-                ref_type,
                 version,
-                object_header_address: Some(addr),
-                heap_id: None,
+                ref_type: REF_TYPE_COMMITTED,
+                location: SharedLocation::ObjectHeader(addr),
             })
         }
-        3 => {
-            match ref_type {
-                1 | 3 => {
-                    // type 1/3: message in another object header
-                    // v3 layout: version(1) + type(1) + address(offset_size)
-                    ensure_len(data, 2, offset_size as usize)?;
-                    let addr = read_offset(data, 2, offset_size)?;
-                    Ok(SharedMessageRef {
-                        ref_type,
-                        version,
-                        object_header_address: Some(addr),
-                        heap_id: None,
-                    })
-                }
-                2 => {
-                    // type 2: SOHM table (fractal heap ID)
-                    ensure_len(data, 2, FHEAP_ID_LEN)?;
-                    let mut id = [0u8; FHEAP_ID_LEN];
-                    id.copy_from_slice(&data[2..2 + FHEAP_ID_LEN]);
-                    Ok(SharedMessageRef {
-                        ref_type,
-                        version,
-                        object_header_address: None,
-                        heap_id: Some(id),
-                    })
-                }
-                _ => Err(FormatError::InvalidSharedMessageVersion(ref_type)),
-            }
+        2 | 3 => {
+            // version(1) + type(1) + either an 8-byte fractal-heap id (SOHM) or
+            // an address. Version 2 has no reserved bytes: the C library skips
+            // those for version 1 alone.
+            let ref_type = data[1];
+            let location = if ref_type == REF_TYPE_SOHM {
+                ensure_len(data, 2, FHEAP_ID_LEN)?;
+                let mut id = [0u8; FHEAP_ID_LEN];
+                id.copy_from_slice(&data[2..2 + FHEAP_ID_LEN]);
+                SharedLocation::SohmHeap(id)
+            } else {
+                SharedLocation::ObjectHeader(read_offset(data, 2, offset_size)?)
+            };
+            Ok(SharedMessageRef {
+                version,
+                ref_type,
+                location,
+            })
         }
         _ => Err(FormatError::InvalidSharedMessageVersion(version)),
     }
 }
 
-/// Resolve a shared message to its actual message data.
+/// The shared-reference version this crate writes.
 ///
-/// For type 1/3 (shared in another object header), reads the target object
-/// header and finds the message of the specified type. Type 2 (SOHM table)
-/// references are not supported.
-pub fn resolve_shared_message(
-    file_data: &[u8],
-    shared_ref: &SharedMessageRef,
-    target_msg_type: MessageType,
-    offset_size: u8,
-    length_size: u8,
-) -> Result<Vec<u8>, FormatError> {
-    match shared_ref.ref_type {
-        1 | 3 => {
-            let addr = shared_object_header_address(shared_ref)?;
-            let target_header =
-                ObjectHeader::parse(file_data, addr.to_usize()?, offset_size, length_size)?;
-            select_shared_message(&target_header, target_msg_type)
+/// Version 2 is what libhdf5 1.14 encodes for every committed datatype, and the
+/// only version whose body is just the address: version 1 buries it behind a
+/// symbol-table entry, and version 3 differs only in admitting a heap id this
+/// crate does not write.
+const WRITE_REF_VERSION: u8 = 2;
+
+/// Encode a reference to the committed datatype object at `address`.
+///
+/// The inverse of the version 2 arm of [`parse_shared_ref`], and the body a
+/// message record with the shared flag carries in place of its content.
+pub fn encode_committed_ref(address: u64, offset_size: u8) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(2 + offset_size as usize);
+    buf.push(WRITE_REF_VERSION);
+    buf.push(REF_TYPE_COMMITTED);
+    buf.extend_from_slice(&address.to_le_bytes()[..offset_size as usize]);
+    buf
+}
+
+/// Where a datatype is stored, for a message that could hold it either way.
+///
+/// A datatype is the one part of a dataset or attribute that can live outside
+/// the message describing it: `H5Tcommit` puts it in its own object header, and
+/// everything using it carries a reference in place of the encoding. Both forms
+/// decode to the same [`Datatype`](crate::datatype::Datatype), so this is what
+/// separates a message that *names* a type from one that spells it out — a
+/// distinction `h5dump` reports, and a rewrite has to preserve.
+///
+/// No `Default`: an omitted location silently means `Inline`, and a reference
+/// that decodes as an encoding is the whole defect this type exists to prevent.
+/// Every construction names its variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DatatypeLocation {
+    /// Encoded in the message itself.
+    Inline,
+    /// A reference to the committed datatype object at this address, in the file
+    /// the message belongs to. What a parse reads out of a file, and what a
+    /// writer emits once the object's address is fixed.
+    Committed(u64),
+    /// Staged for writing: a reference to the committed datatype object the file
+    /// under construction places at this path.
+    ///
+    /// Addresses are not known until the whole layout is, so the writer sizes
+    /// headers against this variant and resolves it to [`Self::Committed`] in the
+    /// same pass that assigns addresses. Serializing one writes the undefined
+    /// address, so a reference that misses that pass names nothing rather than
+    /// silently naming the superblock.
+    CommittedPath(String),
+}
+
+impl DatatypeLocation {
+    /// The reference body to write in place of the datatype encoding, or `None`
+    /// when the datatype is written inline.
+    pub fn reference_bytes(&self, offset_size: u8) -> Option<Vec<u8>> {
+        match self {
+            Self::Inline => None,
+            Self::Committed(addr) => Some(encode_committed_ref(*addr, offset_size)),
+            Self::CommittedPath(_) => Some(encode_committed_ref(u64::MAX, offset_size)),
         }
-        _ => Err(FormatError::InvalidSharedMessageVersion(
-            shared_ref.ref_type,
-        )),
+    }
+
+    /// The path this location still has to have resolved, if any.
+    pub fn unresolved_path(&self) -> Option<&str> {
+        match self {
+            Self::CommittedPath(path) => Some(path),
+            Self::Inline | Self::Committed(_) => None,
+        }
+    }
+
+    /// Whether the datatype lives in a committed object rather than in the
+    /// message.
+    pub fn is_committed(&self) -> bool {
+        !matches!(self, Self::Inline)
     }
 }
 
-/// Streaming counterpart of [`resolve_shared_message`]: reads the target object
-/// header from a [`Source`] on demand instead of indexing a whole-file slice.
-pub fn resolve_shared_message_from_source<S: Source + ?Sized>(
-    source: &S,
-    shared_ref: &SharedMessageRef,
-    target_msg_type: MessageType,
+/// Reads the message a reference stands in for.
+///
+/// A reference names an address in the file, which the body holding it does not
+/// carry, and the two reader backends reach the file differently — one indexes a
+/// slice, the other reads a [`Source`]. Parsers that may meet a reference take
+/// one of these rather than either backend directly.
+pub trait SharedResolver {
+    /// Resolve `reference` — the body of a shared message — into the bytes of the
+    /// `target`-typed message it names.
+    fn resolve(&self, reference: &[u8], target: MessageType) -> Result<Vec<u8>, FormatError>;
+
+    /// The object-header address `reference` names, without reading it.
+    ///
+    /// A rewrite needs the address as well as the content: the content says what
+    /// the type *is*, and the address says which committed object every user of
+    /// it shares — which is what makes them one named type on the other side
+    /// rather than several copies.
+    fn committed_address(&self, reference: &[u8]) -> Result<u64, FormatError>;
+}
+
+/// Resolves references against a whole-file slice, already framed at the file's
+/// base address (shared-message addresses are stored relative to it).
+pub struct BufferedResolver<'a> {
+    file_data: &'a [u8],
     offset_size: u8,
     length_size: u8,
-) -> Result<Vec<u8>, FormatError> {
-    match shared_ref.ref_type {
-        1 | 3 => {
-            let addr = shared_object_header_address(shared_ref)?;
-            // base_address 0 matches the buffered path's `ObjectHeader::parse`,
-            // which treats the shared-message address as absolute.
-            let target_header =
-                ObjectHeader::parse_from_source(source, addr, offset_size, length_size, 0)?;
-            select_shared_message(&target_header, target_msg_type)
+}
+
+impl<'a> BufferedResolver<'a> {
+    pub fn new(file_data: &'a [u8], offset_size: u8, length_size: u8) -> Self {
+        Self {
+            file_data,
+            offset_size,
+            length_size,
         }
-        _ => Err(FormatError::InvalidSharedMessageVersion(
-            shared_ref.ref_type,
-        )),
     }
 }
 
-/// Address of the object header holding a type 1/3 shared message.
-fn shared_object_header_address(shared_ref: &SharedMessageRef) -> Result<u64, FormatError> {
-    shared_ref
-        .object_header_address
-        .ok_or(FormatError::UnexpectedEof {
-            expected: 1,
-            available: 0,
-        })
+impl SharedResolver for BufferedResolver<'_> {
+    fn resolve(&self, reference: &[u8], target: MessageType) -> Result<Vec<u8>, FormatError> {
+        // Through committed_address, so the address a rewrite records cannot
+        // drift from the one the content was read at.
+        let addr = self.committed_address(reference)?;
+        let header = ObjectHeader::parse(
+            self.file_data,
+            addr.to_usize()?,
+            self.offset_size,
+            self.length_size,
+        )?;
+        select_shared_message(&header, target, addr)
+    }
+
+    fn committed_address(&self, reference: &[u8]) -> Result<u64, FormatError> {
+        committed_address_in(reference, self.offset_size, self.length_size)
+    }
+}
+
+/// Resolves references by reading the target object header from a [`Source`] on
+/// demand instead of indexing a whole-file slice.
+pub struct SourceResolver<'a, S: Source + ?Sized> {
+    source: &'a S,
+    offset_size: u8,
+    length_size: u8,
+}
+
+impl<'a, S: Source + ?Sized> SourceResolver<'a, S> {
+    pub fn new(source: &'a S, offset_size: u8, length_size: u8) -> Self {
+        Self {
+            source,
+            offset_size,
+            length_size,
+        }
+    }
+}
+
+impl<S: Source + ?Sized> SharedResolver for SourceResolver<'_, S> {
+    fn resolve(&self, reference: &[u8], target: MessageType) -> Result<Vec<u8>, FormatError> {
+        let addr = self.committed_address(reference)?;
+        // base_address 0 matches the buffered path, whose slice is already framed
+        // at the base address, so both treat the reference as absolute within it.
+        let header = ObjectHeader::parse_from_source(
+            self.source,
+            addr,
+            self.offset_size,
+            self.length_size,
+            0,
+        )?;
+        select_shared_message(&header, target, addr)
+    }
+
+    fn committed_address(&self, reference: &[u8]) -> Result<u64, FormatError> {
+        committed_address_in(reference, self.offset_size, self.length_size)
+    }
+}
+
+/// Refuses every reference, for parses that hold a message body but not the file
+/// it came from. Returning the encoding stored *at* the reference would be a
+/// different message entirely, so the only honest answer is an error.
+pub struct Unresolvable;
+
+impl SharedResolver for Unresolvable {
+    fn resolve(&self, _reference: &[u8], target: MessageType) -> Result<Vec<u8>, FormatError> {
+        Err(FormatError::UnresolvedSharedMessage(target.to_u16()))
+    }
+
+    /// Refused for the same reason as [`Self::resolve`]: the address is stored in
+    /// the file's own offset width, which a parse without that file does not
+    /// know, so any answer here would be a guess at the field width.
+    fn committed_address(&self, _reference: &[u8]) -> Result<u64, FormatError> {
+        Err(FormatError::UnresolvedSharedMessage(
+            MessageType::Datatype.to_u16(),
+        ))
+    }
+}
+
+/// The address of the object header holding a referenced message, or an error
+/// naming the SOHM heap this reader does not walk.
+fn object_header_address(shared: &SharedMessageRef) -> Result<u64, FormatError> {
+    match shared.location {
+        SharedLocation::ObjectHeader(addr) => Ok(addr),
+        SharedLocation::SohmHeap(_) => Err(FormatError::UnsupportedSohmReference),
+    }
+}
+
+/// The object-header address `reference` names, read with the given field widths.
+///
+/// Every resolver that can reach the file answers
+/// [`SharedResolver::committed_address`] this way; they differ only in how they
+/// read the object *at* the address, which is [`SharedResolver::resolve`]'s job.
+pub(crate) fn committed_address_in(
+    reference: &[u8],
+    offset_size: u8,
+    length_size: u8,
+) -> Result<u64, FormatError> {
+    object_header_address(&parse_shared_ref(reference, offset_size, length_size)?)
 }
 
 /// Pick the message of `target_msg_type` out of a resolved target object header.
 ///
-/// Prefers a non-shared message of the requested type; falls back to a shared
-/// one of that type, then to the first non-Nil message (with type 1 references
-/// the whole target object header often *is* the shared message).
+/// Only a message that carries its own content will do: one that is itself a
+/// reference would hand back reference bytes for the caller to decode as content,
+/// which is the defect this module exists to prevent.
 fn select_shared_message(
     target_header: &ObjectHeader,
     target_msg_type: MessageType,
+    object_header_address: u64,
 ) -> Result<Vec<u8>, FormatError> {
-    for msg in &target_header.messages {
-        if msg.msg_type == target_msg_type && !is_shared(msg.flags) {
-            return Ok(msg.data.clone());
-        }
-    }
-    for msg in &target_header.messages {
-        if msg.msg_type == target_msg_type {
-            return Ok(msg.data.clone());
-        }
-    }
-    for msg in &target_header.messages {
-        if msg.msg_type != MessageType::Nil {
-            return Ok(msg.data.clone());
-        }
-    }
-    Err(FormatError::UnexpectedEof {
-        expected: 1,
-        available: 0,
-    })
+    target_header
+        .messages
+        .iter()
+        .find(|msg| msg.msg_type == target_msg_type && !is_shared(msg.flags))
+        .map(|msg| msg.data.clone())
+        .ok_or(FormatError::SharedMessageMissing {
+            object_header_address,
+            message_type: target_msg_type.to_u16(),
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::object_header::HeaderMessage;
+
+    fn header_with(messages: Vec<HeaderMessage>) -> ObjectHeader {
+        ObjectHeader {
+            version: 2,
+            messages,
+            reference_count: None,
+            flags: 0,
+            access_time: None,
+            modification_time: None,
+            change_time: None,
+            birth_time: None,
+        }
+    }
+
+    fn message(msg_type: MessageType, flags: u8, data: Vec<u8>) -> HeaderMessage {
+        HeaderMessage {
+            msg_type,
+            size: data.len(),
+            flags,
+            creation_order: None,
+            data,
+        }
+    }
 
     #[test]
     fn is_shared_flag() {
@@ -238,109 +427,162 @@ mod tests {
         assert!(is_shared(0x06));
     }
 
+    /// Version 2 is version + type + address, with no reserved bytes. This is the
+    /// encoding libhdf5 writes for every committed datatype, so reading the
+    /// address anywhere else lands in whatever follows the field.
     #[test]
-    fn parse_v3_type1_ref() {
-        let mut data = Vec::new();
-        data.push(3); // version
-        data.push(1); // type 1 = shared in another OH
-        data.extend_from_slice(&0x1234u64.to_le_bytes()); // address
+    fn parse_v2_committed_ref() {
+        let mut data = vec![2, REF_TYPE_COMMITTED];
+        data.extend_from_slice(&0x320u64.to_le_bytes());
 
-        let shared = parse_shared_ref(&data, 8).unwrap();
-        assert_eq!(shared.version, 3);
-        assert_eq!(shared.ref_type, 1);
-        assert_eq!(shared.object_header_address, Some(0x1234));
-        assert!(shared.heap_id.is_none());
+        let shared = parse_shared_ref(&data, 8, 8).unwrap();
+        assert_eq!(shared.version, 2);
+        assert_eq!(shared.ref_type, REF_TYPE_COMMITTED);
+        assert_eq!(shared.location, SharedLocation::ObjectHeader(0x320));
+    }
+
+    /// The exact 10-byte field h5py 3.14 / libhdf5 1.14.6 wrote for an attribute
+    /// whose datatype is `f["mytype"]`, address and all. A layout change that
+    /// still parses would move the address, so the value is the assertion.
+    #[test]
+    fn parse_v2_ref_as_libhdf5_writes_it() {
+        let data = [0x02, 0x02, 0x20, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let shared = parse_shared_ref(&data, 8, 8).unwrap();
+        assert_eq!(shared.location, SharedLocation::ObjectHeader(800));
+    }
+
+    /// Version 1 stores a symbol-table entry: the object-header address follows a
+    /// local-heap address of `length_size` bytes, not the reserved bytes alone.
+    #[test]
+    fn parse_v1_ref_skips_the_local_heap_address() {
+        let mut data = vec![1, 0];
+        data.extend_from_slice(&[0u8; 6]); // reserved
+        data.extend_from_slice(&0x1111u64.to_le_bytes()); // local heap address
+        data.extend_from_slice(&0x5678u64.to_le_bytes()); // object header address
+
+        let shared = parse_shared_ref(&data, 8, 8).unwrap();
+        assert_eq!(shared.version, 1);
+        assert_eq!(shared.location, SharedLocation::ObjectHeader(0x5678));
+    }
+
+    /// A version 1 reference in a file with 4-byte lengths puts the address four
+    /// bytes earlier, so the skip is the file's length size and not a constant.
+    #[test]
+    fn parse_v1_ref_uses_the_files_length_size() {
+        let mut data = vec![1, 0];
+        data.extend_from_slice(&[0u8; 6]);
+        data.extend_from_slice(&0x1111u32.to_le_bytes()); // local heap address
+        data.extend_from_slice(&0x5678u32.to_le_bytes()); // object header address
+
+        let shared = parse_shared_ref(&data, 4, 4).unwrap();
+        assert_eq!(shared.location, SharedLocation::ObjectHeader(0x5678));
     }
 
     #[test]
-    fn parse_v3_type3_ref() {
-        let mut data = Vec::new();
-        data.push(3); // version
-        data.push(3); // type 3 = shared in another OH (v3 encoding)
+    fn parse_v3_committed_ref() {
+        let mut data = vec![3, REF_TYPE_COMMITTED];
         data.extend_from_slice(&0xABCDu64.to_le_bytes());
 
-        let shared = parse_shared_ref(&data, 8).unwrap();
+        let shared = parse_shared_ref(&data, 8, 8).unwrap();
         assert_eq!(shared.version, 3);
-        assert_eq!(shared.ref_type, 3);
-        assert_eq!(shared.object_header_address, Some(0xABCD));
+        assert_eq!(shared.location, SharedLocation::ObjectHeader(0xABCD));
     }
 
+    /// Type 1 is the SOHM heap, not an object header. Reading its 8-byte heap id
+    /// as an address is how a fractal-heap id becomes a plausible file offset.
     #[test]
-    fn parse_v1_ref() {
-        let mut data = Vec::new();
-        data.push(1); // version
-        data.push(0); // type
-        data.extend_from_slice(&[0u8; 6]); // reserved
-        data.extend_from_slice(&0x5678u64.to_le_bytes());
-
-        let shared = parse_shared_ref(&data, 8).unwrap();
-        assert_eq!(shared.version, 1);
-        assert_eq!(shared.object_header_address, Some(0x5678));
-    }
-
-    #[test]
-    fn parse_v2_ref() {
-        let mut data = Vec::new();
-        data.push(2); // version
-        data.push(0); // type
-        data.extend_from_slice(&[0u8; 6]); // reserved
-        data.extend_from_slice(&0x9000u32.to_le_bytes());
-
-        let shared = parse_shared_ref(&data, 4).unwrap();
-        assert_eq!(shared.version, 2);
-        assert_eq!(shared.object_header_address, Some(0x9000));
-    }
-
-    #[test]
-    fn parse_v3_type2_sohm() {
-        let mut data = Vec::new();
-        data.push(3); // version
-        data.push(2); // type 2 = SOHM heap
+    fn parse_v3_sohm_ref() {
+        let mut data = vec![3, REF_TYPE_SOHM];
         data.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44]);
 
-        let shared = parse_shared_ref(&data, 8).unwrap();
-        assert_eq!(shared.version, 3);
-        assert_eq!(shared.ref_type, 2);
-        assert_eq!(shared.object_header_address, None);
+        let shared = parse_shared_ref(&data, 8, 8).unwrap();
+        assert_eq!(shared.ref_type, REF_TYPE_SOHM);
         assert_eq!(
-            shared.heap_id,
-            Some([0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44])
+            shared.location,
+            SharedLocation::SohmHeap([0xAA, 0xBB, 0xCC, 0xDD, 0x11, 0x22, 0x33, 0x44])
         );
     }
 
     #[test]
-    fn parse_v3_type2_too_short() {
-        let mut data = Vec::new();
-        data.push(3); // version
-        data.push(2); // type 2 = SOHM heap
-        data.extend_from_slice(&[0xAA, 0xBB]); // only 2 bytes, need 8
-
-        let err = parse_shared_ref(&data, 8).unwrap_err();
+    fn parse_v3_sohm_too_short() {
+        let data = vec![3, REF_TYPE_SOHM, 0xAA, 0xBB];
+        let err = parse_shared_ref(&data, 8, 8).unwrap_err();
         assert!(matches!(err, FormatError::UnexpectedEof { .. }));
     }
 
     #[test]
     fn invalid_version() {
         let data = vec![99, 0];
-        let err = parse_shared_ref(&data, 8).unwrap_err();
+        let err = parse_shared_ref(&data, 8, 8).unwrap_err();
         assert_eq!(err, FormatError::InvalidSharedMessageVersion(99));
     }
 
     #[test]
     fn truncated_data() {
         let data = vec![3u8]; // too short
-        let err = parse_shared_ref(&data, 8).unwrap_err();
+        let err = parse_shared_ref(&data, 8, 8).unwrap_err();
         assert!(matches!(err, FormatError::UnexpectedEof { .. }));
     }
 
     #[test]
     fn parse_four_byte_offsets() {
-        let mut data = Vec::new();
-        data.push(3); // version
-        data.push(1); // type 1
+        let mut data = vec![3, REF_TYPE_COMMITTED];
         data.extend_from_slice(&0x1000u32.to_le_bytes());
 
-        let shared = parse_shared_ref(&data, 4).unwrap();
-        assert_eq!(shared.object_header_address, Some(0x1000));
+        let shared = parse_shared_ref(&data, 4, 4).unwrap();
+        assert_eq!(shared.location, SharedLocation::ObjectHeader(0x1000));
+    }
+
+    /// A SOHM reference is refused by name. Its heap id is not an address, so the
+    /// alternative is an object-header parse at whatever those eight bytes spell.
+    #[test]
+    fn a_sohm_reference_is_refused_rather_than_followed() {
+        let mut reference = vec![3, REF_TYPE_SOHM];
+        reference.extend_from_slice(&[0xFF; 8]);
+        let resolver = BufferedResolver::new(&[], 8, 8);
+
+        let err = resolver
+            .resolve(&reference, MessageType::Datatype)
+            .unwrap_err();
+        assert_eq!(err, FormatError::UnsupportedSohmReference);
+    }
+
+    /// The target header must hold the message the reference stands in for.
+    #[test]
+    fn a_reference_to_a_header_without_that_message_is_an_error() {
+        let header = header_with(vec![message(MessageType::Dataspace, 0, vec![1, 2, 3])]);
+        let err = select_shared_message(&header, MessageType::Datatype, 0x320).unwrap_err();
+        assert_eq!(
+            err,
+            FormatError::SharedMessageMissing {
+                object_header_address: 0x320,
+                message_type: MessageType::Datatype.to_u16(),
+            }
+        );
+    }
+
+    /// A message that is itself a reference is not content, so it is not an
+    /// answer: handing its bytes back would re-create the mis-decode one level
+    /// down.
+    #[test]
+    fn a_shared_message_in_the_target_is_not_mistaken_for_content() {
+        let header = header_with(vec![message(MessageType::Datatype, 0x02, vec![2, 2, 0, 0])]);
+        let err = select_shared_message(&header, MessageType::Datatype, 0x320).unwrap_err();
+        assert!(matches!(err, FormatError::SharedMessageMissing { .. }));
+    }
+
+    /// Nothing resolves without the file the reference addresses.
+    #[test]
+    fn the_unresolvable_resolver_refuses() {
+        let err = Unresolvable
+            .resolve(
+                &[2, REF_TYPE_COMMITTED, 0, 0, 0, 0, 0, 0, 0, 0],
+                MessageType::Datatype,
+            )
+            .unwrap_err();
+        assert_eq!(
+            err,
+            FormatError::UnresolvedSharedMessage(MessageType::Datatype.to_u16())
+        );
     }
 }

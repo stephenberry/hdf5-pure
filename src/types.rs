@@ -543,6 +543,7 @@ mod tests {
                 max_dimensions: None,
             },
             raw_data,
+            datatype_location: crate::shared_message::DatatypeLocation::Inline,
         };
         decode_attr_value(&attr, &crate::source::BytesSource::new(Vec::new()), 8, 8, 0)
     }

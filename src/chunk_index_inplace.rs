@@ -269,6 +269,22 @@ impl Located {
             .iter()
             .find(|m| m.msg_type == MessageType::FilterPipeline);
 
+        // Each of these is parsed below as though its bytes were the message. A
+        // *shared* record's body is a reference to a message stored elsewhere —
+        // the shape `H5Tcommit` gives a dataset's element type — and decodes as a
+        // well-formed type of the wrong kind, so an append against it would size
+        // its elements from a type the dataset does not have. Refuse instead.
+        for msg in [Some(dataspace_msg), Some(datatype_msg), filter_msg]
+            .into_iter()
+            .flatten()
+        {
+            if crate::shared_message::is_shared(msg.flags) {
+                return Err(unsupported(
+                    "dataset has a committed (shared) datatype, dataspace, or filter pipeline",
+                ));
+            }
+        }
+
         // Parse the dataspace: must be rank 1 with one unlimited dimension.
         let ds_bytes = file.read_metadata_at(dataspace_msg.data_off, dataspace_msg.size)?;
         let dataspace = Dataspace::parse(&ds_bytes, ls)?;
@@ -1162,6 +1178,10 @@ fn locate_data_block(geom: &EaGeometry, idx_blk_elmts: u64, e: u64) -> DataBlock
 
 struct WalkedMessage {
     msg_type: MessageType,
+    /// The record's flags byte. Bit 1 marks the body as a *reference* to a shared
+    /// message rather than the message itself, which every parse below would
+    /// otherwise decode as content.
+    flags: u8,
     /// Absolute file offset of the message body.
     data_off: u64,
     size: usize,
@@ -1284,6 +1304,7 @@ fn walk_messages(
     while pos + msg_header_size <= end {
         let msg_type_raw = chunk[pos] as u16;
         let msg_data_size = u16::from_le_bytes([chunk[pos + 1], chunk[pos + 2]]) as usize;
+        let msg_flags = chunk[pos + 3];
         pos += msg_header_size;
         if pos + msg_data_size > end {
             break; // padding
@@ -1297,6 +1318,7 @@ fn walk_messages(
         } else {
             messages.push(WalkedMessage {
                 msg_type,
+                flags: msg_flags,
                 data_off: base + pos as u64,
                 size: msg_data_size,
                 chunk_start,

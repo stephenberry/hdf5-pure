@@ -15,8 +15,21 @@ use crate::error::FormatError;
 use crate::fractal_heap::FractalHeapHeader;
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
-use crate::shared_message;
+use crate::shared_message::{
+    self, BufferedResolver, DatatypeLocation, SharedResolver, SourceResolver, Unresolvable,
+};
 use crate::source::Source;
+
+/// Bit 0 of an attribute message's flags byte: the datatype field holds a
+/// reference to a committed (shared) datatype rather than the datatype itself
+/// (`H5O_ATTR_FLAG_TYPE_SHARED`).
+const FLAG_SHARED_DATATYPE: u8 = 0x01;
+
+/// Bit 1: the same for the dataspace field (`H5O_ATTR_FLAG_SPACE_SHARED`).
+const FLAG_SHARED_DATASPACE: u8 = 0x02;
+
+/// Every flag bit the format defines (`H5O_ATTR_FLAG_ALL`).
+const FLAG_ALL: u8 = FLAG_SHARED_DATATYPE | FLAG_SHARED_DATASPACE;
 
 /// A parsed HDF5 attribute message.
 ///
@@ -33,6 +46,10 @@ pub struct AttributeMessage {
     pub dataspace: Dataspace,
     /// Raw attribute value data.
     pub raw_data: Vec<u8>,
+    /// Whether [`Self::datatype`] is encoded in this message or named through a
+    /// committed datatype object, which is a difference the field itself cannot
+    /// show: both forms decode to the same type.
+    pub datatype_location: DatatypeLocation,
 }
 
 fn ensure_len(data: &[u8], offset: usize, needed: usize) -> Result<(), FormatError> {
@@ -51,17 +68,34 @@ fn pad8(x: usize) -> usize {
 }
 
 impl AttributeMessage {
-    /// Parse an attribute message from raw message bytes.
+    /// Parse an attribute message from raw message bytes, without the file the
+    /// message came from.
+    ///
+    /// An attribute whose datatype or dataspace field is a *reference* to a
+    /// committed (shared) message cannot be decoded this way and is refused with
+    /// [`FormatError::UnresolvedSharedMessage`]; use
+    /// [`parse_resolving`](Self::parse_resolving) where the file is reachable.
     ///
     /// `length_size` is needed for dataspace dimension parsing.
     pub fn parse(data: &[u8], length_size: u8) -> Result<AttributeMessage, FormatError> {
+        Self::parse_resolving(data, length_size, &Unresolvable)
+    }
+
+    /// Parse an attribute message, following a reference to a committed (shared)
+    /// datatype or dataspace through `resolver` where the flags byte says the
+    /// field holds one.
+    pub fn parse_resolving(
+        data: &[u8],
+        length_size: u8,
+        resolver: &dyn SharedResolver,
+    ) -> Result<AttributeMessage, FormatError> {
         ensure_len(data, 0, 2)?;
         let version = data[0];
 
         match version {
             1 => Self::parse_v1(data, length_size),
-            2 => Self::parse_v2(data, length_size),
-            3 => Self::parse_v3(data, length_size),
+            2 => Self::parse_v2(data, length_size, resolver),
+            3 => Self::parse_v3(data, length_size, resolver),
             _ => Err(FormatError::InvalidAttributeVersion(version)),
         }
     }
@@ -80,7 +114,8 @@ impl AttributeMessage {
         let name = extract_name(&data[pos..pos + name_size]);
         pos += pad8(name_size);
 
-        // Datatype (padded to 8-byte boundary)
+        // Datatype (padded to 8-byte boundary). Version 1 has no flags byte, so
+        // neither field can be a reference.
         ensure_len(data, pos, datatype_size)?;
         let (datatype, _) = Datatype::parse(&data[pos..pos + datatype_size])?;
         pos += pad8(datatype_size);
@@ -98,12 +133,18 @@ impl AttributeMessage {
             datatype,
             dataspace,
             raw_data,
+            datatype_location: DatatypeLocation::Inline,
         })
     }
 
-    fn parse_v2(data: &[u8], length_size: u8) -> Result<AttributeMessage, FormatError> {
+    fn parse_v2(
+        data: &[u8],
+        length_size: u8,
+        resolver: &dyn SharedResolver,
+    ) -> Result<AttributeMessage, FormatError> {
         // version(1) + flags(1) + name_size(2) + datatype_size(2) + dataspace_size(2) = 8
         ensure_len(data, 0, 8)?;
+        let flags = data[1];
         let name_size = u16::from_le_bytes([data[2], data[3]]) as usize;
         let datatype_size = u16::from_le_bytes([data[4], data[5]]) as usize;
         let dataspace_size = u16::from_le_bytes([data[6], data[7]]) as usize;
@@ -117,14 +158,16 @@ impl AttributeMessage {
 
         // Datatype (NO padding)
         ensure_len(data, pos, datatype_size)?;
-        let (datatype, _) = Datatype::parse(&data[pos..pos + datatype_size])?;
+        let dt_field = &data[pos..pos + datatype_size];
         pos += datatype_size;
 
         // Dataspace (NO padding)
         ensure_len(data, pos, dataspace_size)?;
-        let dataspace = Dataspace::parse(&data[pos..pos + dataspace_size], length_size)?;
+        let ds_field = &data[pos..pos + dataspace_size];
         pos += dataspace_size;
 
+        let (datatype, dataspace, datatype_location) =
+            decode_type_and_space(dt_field, ds_field, flags, length_size, resolver)?;
         let raw_data = compute_raw_data(data, pos, &dataspace, &datatype)?;
 
         Ok(AttributeMessage {
@@ -132,12 +175,18 @@ impl AttributeMessage {
             datatype,
             dataspace,
             raw_data,
+            datatype_location,
         })
     }
 
-    fn parse_v3(data: &[u8], length_size: u8) -> Result<AttributeMessage, FormatError> {
+    fn parse_v3(
+        data: &[u8],
+        length_size: u8,
+        resolver: &dyn SharedResolver,
+    ) -> Result<AttributeMessage, FormatError> {
         // version(1) + flags(1) + name_size(2) + datatype_size(2) + dataspace_size(2) + encoding(1) = 9
         ensure_len(data, 0, 9)?;
+        let flags = data[1];
         let name_size = u16::from_le_bytes([data[2], data[3]]) as usize;
         let datatype_size = u16::from_le_bytes([data[4], data[5]]) as usize;
         let dataspace_size = u16::from_le_bytes([data[6], data[7]]) as usize;
@@ -152,14 +201,16 @@ impl AttributeMessage {
 
         // Datatype (NO padding)
         ensure_len(data, pos, datatype_size)?;
-        let (datatype, _) = Datatype::parse(&data[pos..pos + datatype_size])?;
+        let dt_field = &data[pos..pos + datatype_size];
         pos += datatype_size;
 
         // Dataspace (NO padding)
         ensure_len(data, pos, dataspace_size)?;
-        let dataspace = Dataspace::parse(&data[pos..pos + dataspace_size], length_size)?;
+        let ds_field = &data[pos..pos + dataspace_size];
         pos += dataspace_size;
 
+        let (datatype, dataspace, datatype_location) =
+            decode_type_and_space(dt_field, ds_field, flags, length_size, resolver)?;
         let raw_data = compute_raw_data(data, pos, &dataspace, &datatype)?;
 
         Ok(AttributeMessage {
@@ -167,6 +218,7 @@ impl AttributeMessage {
             datatype,
             dataspace,
             raw_data,
+            datatype_location,
         })
     }
 
@@ -196,10 +248,28 @@ impl AttributeMessage {
         let fields = [
             // The null terminator the message carries counts toward the field.
             ("name", self.name.len() + 1),
-            ("datatype", self.datatype.serialize().len()),
+            ("datatype", self.datatype_field().len()),
             ("dataspace", self.dataspace.serialize(length_size).len()),
         ];
         fields.into_iter().find(|&(_, len)| len > limit)
+    }
+
+    /// The bytes of the message's datatype field: the encoding itself, or the
+    /// reference standing in for it when the type is committed.
+    ///
+    /// A reference is written in the *writer's* offset width rather than in the
+    /// width of whatever file the message was read from, because that is the file
+    /// the bytes are going into. Re-serializing a message parsed from a file with
+    /// a different width is therefore a re-encoding, not a copy — which is what
+    /// it already is for every other field.
+    fn datatype_field(&self) -> Vec<u8> {
+        match self
+            .datatype_location
+            .reference_bytes(crate::file_writer::OFFSET_SIZE)
+        {
+            Some(reference) => reference,
+            None => self.datatype.serialize(),
+        }
     }
 
     fn serialize_version(&self, version: u8, length_size: u8) -> Vec<u8> {
@@ -208,12 +278,20 @@ impl AttributeMessage {
             n.push(0); // null terminator
             n
         };
-        let dt_bytes = self.datatype.serialize();
+        let dt_bytes = self.datatype_field();
         let ds_bytes = self.dataspace.serialize(length_size);
 
         let mut buf = Vec::new();
         buf.push(version);
-        buf.push(0); // flags
+        // Version 1 has no flags byte, but nothing serializes one: both callers
+        // ask for version 2 or 3, whose second byte says which fields are
+        // references. Only the datatype is ever one here — this crate does not
+        // write a shared dataspace.
+        buf.push(if self.datatype_location.is_committed() {
+            FLAG_SHARED_DATATYPE
+        } else {
+            0
+        });
         #[expect(
             clippy::cast_possible_truncation,
             reason = "attribute name length is written into the 2-byte name-size field of the attribute message"
@@ -266,6 +344,89 @@ impl AttributeMessage {
     /// Read attribute value as a vector of fixed-length strings.
     pub fn read_as_strings(&self) -> Result<Vec<String>, FormatError> {
         data_read::read_as_strings(&self.raw_data, &self.datatype)
+    }
+}
+
+/// Decode an attribute's datatype and dataspace fields.
+///
+/// A message's flags byte says, per field, whether the bytes are the encoding or
+/// a *reference* to a committed (shared) message holding it. The two are not
+/// distinguishable by inspection — a version 2 reference to address `0x320` reads
+/// as a valid time datatype of size zero — so the flag is the only thing that
+/// tells them apart, and reading the field without it is how a committed datatype
+/// silently becomes the wrong type.
+///
+/// Only the datatype's origin is reported back. A shared *dataspace* is resolved
+/// and then indistinguishable from an inline one: a dataspace has no name, and no
+/// HDF5 call reports one as shared, so writing it back inline loses nothing. A
+/// committed datatype does have a name, which is why that one is tracked.
+fn decode_type_and_space(
+    dt_field: &[u8],
+    ds_field: &[u8],
+    flags: u8,
+    length_size: u8,
+    resolver: &dyn SharedResolver,
+) -> Result<(Datatype, Dataspace, DatatypeLocation), FormatError> {
+    // The C library refuses a flags byte with any other bit set, so a message
+    // carrying one is not an attribute message this or any reader can trust.
+    if flags & !FLAG_ALL != 0 {
+        return Err(FormatError::InvalidAttributeFlags(flags));
+    }
+
+    let (datatype, location) = if flags & FLAG_SHARED_DATATYPE != 0 {
+        let address = resolver.committed_address(dt_field)?;
+        let body = resolver.resolve(dt_field, MessageType::Datatype)?;
+        (
+            Datatype::parse(&body)?.0,
+            DatatypeLocation::Committed(address),
+        )
+    } else {
+        (Datatype::parse(dt_field)?.0, DatatypeLocation::Inline)
+    };
+
+    let dataspace = if flags & FLAG_SHARED_DATASPACE != 0 {
+        let body = resolver.resolve(ds_field, MessageType::Dataspace)?;
+        Dataspace::parse(&body, length_size)?
+    } else {
+        Dataspace::parse(ds_field, length_size)?
+    };
+
+    Ok((datatype, dataspace, location))
+}
+
+/// The name of an attribute message, without decoding its datatype or dataspace.
+///
+/// The in-place editor identifies attributes by name while walking an object
+/// header region it has no file context for, and a committed datatype is exactly
+/// what it cannot decode there. The name never depends on either field, so
+/// reading it alone lets an edit pass over such an attribute rather than refuse
+/// the whole object.
+pub fn message_name(data: &[u8]) -> Result<String, FormatError> {
+    ensure_len(data, 0, 8)?;
+    let version = data[0];
+    let name_size = u16::from_le_bytes([data[2], data[3]]) as usize;
+    let name_start = match version {
+        1 | 2 => 8,
+        3 => 9,
+        _ => return Err(FormatError::InvalidAttributeVersion(version)),
+    };
+    ensure_len(data, name_start, name_size)?;
+    Ok(extract_name(&data[name_start..name_start + name_size]))
+}
+
+/// Whether an attribute message stores its datatype or dataspace as a reference
+/// to a committed (shared) message, read from the flags byte alone.
+///
+/// A byte-level screen for callers that hold a message body and must decide
+/// whether it may be copied, without decoding it. A malformed or truncated
+/// message reports `true`, so a header this cannot read is refused rather than
+/// waved through.
+pub fn message_shares_a_field(data: &[u8]) -> bool {
+    match data.first().copied() {
+        // Version 1 has no flags byte; the field after the version is unused.
+        Some(1) => false,
+        Some(2 | 3) => data.get(1).is_none_or(|flags| flags & FLAG_ALL != 0),
+        _ => true,
     }
 }
 
@@ -337,27 +498,21 @@ pub fn extract_attributes_full(
     offset_size: u8,
     length_size: u8,
 ) -> Result<Vec<AttributeMessage>, FormatError> {
+    let resolver = BufferedResolver::new(file_data, offset_size, length_size);
     let mut attrs = Vec::new();
 
     // Collect compact attributes (inline in OH)
     for msg in &header.messages {
         if msg.msg_type == MessageType::Attribute {
-            if shared_message::is_shared(msg.flags) {
-                // Shared attribute: resolve the reference to get actual attribute data
-                let shared_ref = shared_message::parse_shared_ref(&msg.data, offset_size)?;
-                let resolved_data = shared_message::resolve_shared_message(
-                    file_data,
-                    &shared_ref,
-                    MessageType::Attribute,
-                    offset_size,
-                    length_size,
-                )?;
-                let attr = AttributeMessage::parse(&resolved_data, length_size)?;
-                attrs.push(attr);
+            let attr = if shared_message::is_shared(msg.flags) {
+                // The whole attribute message is shared: resolve the reference to
+                // get the message, which may itself name a committed datatype.
+                let resolved = resolver.resolve(&msg.data, MessageType::Attribute)?;
+                AttributeMessage::parse_resolving(&resolved, length_size, &resolver)?
             } else {
-                let attr = AttributeMessage::parse(&msg.data, length_size)?;
-                attrs.push(attr);
-            }
+                AttributeMessage::parse_resolving(&msg.data, length_size, &resolver)?
+            };
+            attrs.push(attr);
         }
     }
 
@@ -386,24 +541,19 @@ pub fn extract_attributes_full_from_source<S: Source + ?Sized>(
     offset_size: u8,
     length_size: u8,
 ) -> Result<Vec<AttributeMessage>, FormatError> {
+    let resolver = SourceResolver::new(source, offset_size, length_size);
     let mut attrs = Vec::new();
 
     // Collect compact attributes (inline in OH)
     for msg in &header.messages {
         if msg.msg_type == MessageType::Attribute {
-            if shared_message::is_shared(msg.flags) {
-                let shared_ref = shared_message::parse_shared_ref(&msg.data, offset_size)?;
-                let resolved_data = shared_message::resolve_shared_message_from_source(
-                    source,
-                    &shared_ref,
-                    MessageType::Attribute,
-                    offset_size,
-                    length_size,
-                )?;
-                attrs.push(AttributeMessage::parse(&resolved_data, length_size)?);
+            let attr = if shared_message::is_shared(msg.flags) {
+                let resolved = resolver.resolve(&msg.data, MessageType::Attribute)?;
+                AttributeMessage::parse_resolving(&resolved, length_size, &resolver)?
             } else {
-                attrs.push(AttributeMessage::parse(&msg.data, length_size)?);
-            }
+                AttributeMessage::parse_resolving(&msg.data, length_size, &resolver)?
+            };
+            attrs.push(attr);
         }
     }
 
@@ -456,6 +606,7 @@ fn extract_dense_attributes(
         BTreeV2Header::parse(file_data, btree_addr.to_usize()?, offset_size, length_size)?;
     let records = collect_btree_v2_records(file_data, &btree_hdr, offset_size, length_size)?;
 
+    let resolver = BufferedResolver::new(file_data, offset_size, length_size);
     let mut heap = fh.object_reader(offset_size, length_size);
     let mut attrs = Vec::new();
     for record in &records {
@@ -472,8 +623,9 @@ fn extract_dense_attributes(
         // Read the attribute message from the fractal heap (managed or huge object).
         let attr_data = heap.read(file_data, id_bytes)?;
 
-        // The data in the heap is a complete attribute message
-        let attr = AttributeMessage::parse(&attr_data, length_size)?;
+        // The data in the heap is a complete attribute message, and it names a
+        // committed datatype the same way a compact one does.
+        let attr = AttributeMessage::parse_resolving(&attr_data, length_size, &resolver)?;
         attrs.push(attr);
     }
 
@@ -501,6 +653,7 @@ fn extract_dense_attributes_from_source<S: Source + ?Sized>(
     let records =
         collect_btree_v2_records_from_source(source, &btree_hdr, offset_size, length_size)?;
 
+    let resolver = SourceResolver::new(source, offset_size, length_size);
     let mut heap = fh.object_reader(offset_size, length_size);
     let mut attrs = Vec::new();
     for record in &records {
@@ -511,7 +664,11 @@ fn extract_dense_attributes_from_source<S: Source + ?Sized>(
         }
         let id_bytes = &record.data[id_offset..id_offset + fh.heap_id_length as usize];
         let attr_data = heap.read_from_source(source, id_bytes)?;
-        attrs.push(AttributeMessage::parse(&attr_data, length_size)?);
+        attrs.push(AttributeMessage::parse_resolving(
+            &attr_data,
+            length_size,
+            &resolver,
+        )?);
     }
 
     Ok(attrs)
@@ -994,6 +1151,131 @@ mod tests {
         assert_eq!(attrs[0].name, "attr0");
         assert_eq!(attrs[1].name, "attr1");
         assert_eq!(attrs[2].name, "attr2");
+    }
+
+    /// A version 2 attribute message whose datatype field is a reference to a
+    /// committed type, laid out exactly as libhdf5 1.14.6 wrote one: a 10-byte
+    /// shared reference standing where an encoding usually is.
+    fn attr_with_shared_datatype(flags: u8) -> Vec<u8> {
+        let name = b"shared_attr\0";
+        // version 2 shared reference: version, type = committed, address.
+        let mut dt_field = vec![2u8, 2];
+        dt_field.extend_from_slice(&0x320u64.to_le_bytes());
+        let ds_bytes = build_simple_ds_v1(1);
+
+        let mut data = vec![2u8, flags];
+        data.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        data.extend_from_slice(&(dt_field.len() as u16).to_le_bytes());
+        data.extend_from_slice(&(ds_bytes.len() as u16).to_le_bytes());
+        data.extend_from_slice(name);
+        data.extend_from_slice(&dt_field);
+        data.extend_from_slice(&ds_bytes);
+        data.extend_from_slice(&7i32.to_le_bytes());
+        data
+    }
+
+    /// A resolver that answers with one fixed message body, standing in for the
+    /// object header a committed datatype lives in.
+    struct StubResolver(Vec<u8>);
+
+    impl SharedResolver for StubResolver {
+        fn resolve(&self, _reference: &[u8], _target: MessageType) -> Result<Vec<u8>, FormatError> {
+            Ok(self.0.clone())
+        }
+
+        fn committed_address(&self, reference: &[u8]) -> Result<u64, FormatError> {
+            shared_message::committed_address_in(reference, 8, 8)
+        }
+    }
+
+    /// The flags byte decides how the datatype field is read. Given a resolver,
+    /// the attribute reports the referenced type — and says so.
+    #[test]
+    fn a_shared_datatype_field_is_resolved_not_decoded() {
+        let data = attr_with_shared_datatype(FLAG_SHARED_DATATYPE);
+        let attr =
+            AttributeMessage::parse_resolving(&data, 8, &StubResolver(build_f64_dt())).unwrap();
+
+        assert_eq!(attr.name, "shared_attr");
+        assert!(matches!(
+            attr.datatype,
+            Datatype::FloatingPoint { size: 8, .. }
+        ));
+        assert_eq!(
+            attr.datatype_location,
+            DatatypeLocation::Committed(0x320),
+            "the attribute must record which committed object it named, not just that it named one"
+        );
+    }
+
+    /// The same bytes with the flag clear decode as an inline datatype. This is
+    /// what the reference used to be read as: a well-formed, zero-width time
+    /// type, returned with no error at all.
+    #[test]
+    fn the_same_bytes_without_the_flag_decode_as_a_zero_width_type() {
+        let data = attr_with_shared_datatype(0);
+        let attr = AttributeMessage::parse(&data, 8).unwrap();
+
+        assert_eq!(
+            attr.datatype,
+            Datatype::Time {
+                size: 0,
+                byte_order: crate::datatype::DatatypeByteOrder::LittleEndian,
+                bit_precision: 0,
+            },
+            "the reference bytes are supposed to look like a valid inline datatype"
+        );
+        assert_eq!(attr.datatype_location, DatatypeLocation::Inline);
+    }
+
+    /// Without the file the reference addresses, there is no honest answer, so
+    /// the parse refuses rather than decoding the reference as a type.
+    #[test]
+    fn a_shared_datatype_field_is_refused_without_a_resolver() {
+        let data = attr_with_shared_datatype(FLAG_SHARED_DATATYPE);
+        let err = AttributeMessage::parse(&data, 8).unwrap_err();
+        assert_eq!(
+            err,
+            FormatError::UnresolvedSharedMessage(MessageType::Datatype.to_u16())
+        );
+    }
+
+    /// Only two flag bits exist. The C library refuses a message that sets any
+    /// other, and a reader that shrugs at one is reading a message it cannot
+    /// claim to understand.
+    #[test]
+    fn an_undefined_attribute_flag_bit_is_refused() {
+        let data = attr_with_shared_datatype(0x04);
+        let err = AttributeMessage::parse(&data, 8).unwrap_err();
+        assert_eq!(err, FormatError::InvalidAttributeFlags(0x04));
+    }
+
+    /// The name never depends on either field, which is what lets an in-place
+    /// edit identify a committed attribute it cannot decode.
+    #[test]
+    fn a_name_reads_out_of_a_message_whose_datatype_is_a_reference() {
+        let data = attr_with_shared_datatype(FLAG_SHARED_DATATYPE);
+        assert_eq!(message_name(&data).unwrap(), "shared_attr");
+        assert!(AttributeMessage::parse(&data, 8).is_err());
+    }
+
+    /// The byte-level screen agrees with the parse, on every version and on
+    /// bytes too short to be a message at all.
+    #[test]
+    fn the_shared_field_screen_reads_the_flags_byte() {
+        assert!(message_shares_a_field(&attr_with_shared_datatype(
+            FLAG_SHARED_DATATYPE
+        )));
+        assert!(message_shares_a_field(&attr_with_shared_datatype(
+            FLAG_SHARED_DATASPACE
+        )));
+        assert!(!message_shares_a_field(&attr_with_shared_datatype(0)));
+        // Version 1 has no flags byte: the second byte is unused, whatever it says.
+        assert!(!message_shares_a_field(&[1u8, 0xFF, 0, 0]));
+        // A message this cannot read is refused, not waved through.
+        assert!(message_shares_a_field(&[2u8]));
+        assert!(message_shares_a_field(&[]));
+        assert!(message_shares_a_field(&[9u8, 0]));
     }
 
     #[test]

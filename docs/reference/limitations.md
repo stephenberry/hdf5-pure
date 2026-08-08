@@ -91,13 +91,14 @@ Refused today with a `... yet` message, intended to land. Each row links to its 
 | Editing across **soft / external links** | [#103](https://github.com/stephenberry/hdf5-pure/issues/103) |
 | Creation-order tracking, shared/SOHM messages, copying a **version-1** object | [#104](https://github.com/stephenberry/hdf5-pure/issues/104) |
 | Adding **chunked/extensible variable-length-string** datasets | [#105](https://github.com/stephenberry/hdf5-pure/issues/105) |
-| **Cross-file copy** of variable-length / reference / shared data | [#106](https://github.com/stephenberry/hdf5-pure/issues/106) |
+| **Cross-file copy** of variable-length / reference / shared data, including an attribute naming a committed datatype | [#106](https://github.com/stephenberry/hdf5-pure/issues/106) |
 
 ### Repack
 
 | Capability | Tracking |
 |---|---|
 | Repack of **region references**, non-8-byte object references, chunked/filtered/resizable **reference** datasets, and unrecognized filter pipelines (time, variable-length sequences, and 8-byte object references now repack faithfully; chunked, filtered, and resizable variable-length datasets repack as of [#109](https://github.com/stephenberry/hdf5-pure/issues/109)) | [#107](https://github.com/stephenberry/hdf5-pure/issues/107) |
+| Dropping a **committed** (`H5Tcommit`) datatype a surviving dataset or attribute still names, and a committed datatype no hard link reaches — refused rather than left pointing at nothing (a committed datatype otherwise repacks: the named object is recreated and its users still name it) | [#254](https://github.com/stephenberry/hdf5-pure/issues/254) |
 
 ### Reading
 
@@ -105,6 +106,7 @@ Refused today with a `... yet` message, intended to land. Each row links to its 
 |---|---|
 | **Filter-encoded fractal-heap** objects | [#108](https://github.com/stephenberry/hdf5-pure/issues/108) |
 | **Virtual (VDS)** datasets | [#111](https://github.com/stephenberry/hdf5-pure/issues/111) |
+| Messages stored in the **shared-message (SOHM) heap**, refused with `FormatError::UnsupportedSohmReference`. A **committed** (`H5Tcommit`) datatype is not one of these — it references its own object header and is resolved, so a named type reads as the type it names | [#254](https://github.com/stephenberry/hdf5-pure/issues/254) |
 
 Virtual datasets are also refused by `repack` (it cannot relocate data living outside the file); that lifts together with VDS read support ([#111](https://github.com/stephenberry/hdf5-pure/issues/111)).
 
@@ -114,6 +116,7 @@ Virtual datasets are also refused by `repack` (it cannot relocate data living ou
 |---|---|
 | **Append** to a variable-length dataset (writing one resizable is supported; growing it is not) | [#109](https://github.com/stephenberry/hdf5-pure/issues/109) |
 | Add a **chunked variable-length** dataset to an *existing* file in place | [#109](https://github.com/stephenberry/hdf5-pure/issues/109) |
+| Add a dataset or attribute naming a **committed** (`H5Tcommit`) datatype to an *existing* file in place — the in-place engine appends into a fixed layout and has nowhere to place the named type object. `FileBuilder::commit_datatype` writes one when the whole file is written, and `repack` carries them across | [#254](https://github.com/stephenberry/hdf5-pure/issues/254) |
 
 Chunked, filtered, and resizable variable-length datasets now write, so the entries that were here for those have gone ([#109](https://github.com/stephenberry/hdf5-pure/issues/109)). Two gaps remain. A resizable one can be created but not grown: `Dataset::append` is typed and `H5Element` covers only numeric scalars, and `append_raw` refuses a variable-length datatype because it cannot encode the heap references. And adding such a dataset to an existing file through the in-place edit engine is refused, since the engine appends into a fixed layout with nowhere to place the heap collections ahead of the chunks.
 

@@ -199,6 +199,7 @@ use crate::link_message::{LinkMessage, LinkTarget};
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
 use crate::reader::FileAccessProperties;
+use crate::shared_message::DatatypeLocation;
 use crate::signature;
 use crate::source::{BaseOffsetSource, BytesSource, MetadataCacheConfig, Source};
 use crate::superblock::Superblock;
@@ -3097,6 +3098,10 @@ impl WriteEngine {
                     };
                     build_dataset_oh(
                         &fd.dt,
+                        // Committed datatypes are refused when a dataset is
+                        // staged (`flatten_dataset`), so every type here is
+                        // written into the dataset's own header.
+                        &DatatypeLocation::Inline,
                         &fd.ds,
                         data_addr,
                         fd.raw.len() as u64,
@@ -5574,6 +5579,7 @@ impl WriteEngine {
         debug_assert_eq!(written, eof, "chunk blob must land at end-of-file",);
         Ok(build_chunked_dataset_oh(
             &fd.dt,
+            &DatatypeLocation::Inline,
             &fd.ds,
             &result.layout_message,
             result.pipeline_message.as_deref(),
@@ -6677,6 +6683,21 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
         ));
     }
 
+    // A committed datatype is an object of its own, which an in-place edit has no
+    // way to place: it appends into an existing file rather than laying one out,
+    // so there is nothing to resolve the named path against. Writing the type
+    // inline instead would produce a dataset that reads correctly but no longer
+    // shares the named type, so refuse by name. The whole-file writer places
+    // them; [`crate::repack`] is the route from an edited file to one.
+    if db.datatype_location.is_committed()
+        || attrs.iter().any(|a| a.datatype_location.is_committed())
+    {
+        return Err(Error::EditUnsupported(
+            "a dataset or attribute naming a committed (shared) datatype cannot be added in \
+             place; write the file with FileBuilder instead",
+        ));
+    }
+
     // A user-defined fill value is one element wide, so its byte length must
     // equal the datatype's element size (mirrors the whole-file writer's check).
     if let Some(fill) = &db.fill {
@@ -7548,8 +7569,12 @@ fn parse_compact_attr_name(
             "a target object has a shared attribute message (not editable in place yet)",
         ));
     }
-    crate::attribute::AttributeMessage::parse(&region[body..body_end], LENGTH_SIZE)
-        .map(|attr| attr.name)
+    // Only the name is wanted here, and it is the one field that never depends on
+    // the datatype or dataspace — either of which may be a reference to a
+    // committed message this walk has no file context to follow. Reading the name
+    // alone lets an edit pass over such an attribute instead of refusing the
+    // whole object because one of its neighbours is committed.
+    crate::attribute::message_name(&region[body..body_end])
         .map_err(|_| Error::EditUnsupported("a target object has an unreadable attribute message"))
 }
 
@@ -7868,6 +7893,17 @@ fn reject_foreign_addresses(region: &[u8]) -> Result<(), Error> {
                 }
             }
             MessageType::Attribute => {
+                // An attribute's *own* datatype or dataspace field can be a
+                // reference to a committed message, which the record's shared
+                // flag above does not report: that flag describes the attribute
+                // message, not the fields inside it. The reference addresses the
+                // source file, so it cannot travel any more than a shared record
+                // can — and the parse below cannot resolve it here in any case.
+                if crate::attribute::message_shares_a_field(&region[body..body_end]) {
+                    return Err(Error::EditUnsupported(
+                        "an attribute with a committed (shared) datatype cannot be copied to another file yet",
+                    ));
+                }
                 let attr =
                     crate::attribute::AttributeMessage::parse(&region[body..body_end], LENGTH_SIZE)
                         .map_err(|_| {

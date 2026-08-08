@@ -42,7 +42,14 @@
 //! - Contiguous/compact **object-reference** datasets, and contiguous/compact
 //!   datatypes containing an object-reference member: each stored address is
 //!   rewritten to its target object's new location in the compacted file (null
-//!   and undefined references are carried verbatim).
+//!   and undefined references are carried verbatim). A reference to a committed
+//!   datatype object is one of those targets, since it is an object like any
+//!   other.
+//! - **Committed (`H5Tcommit`) datatypes**: the named datatype object is
+//!   recreated at the same path, and every dataset and attribute that named it
+//!   names the *same* object in the output rather than getting an inline copy of
+//!   the encoding, so `h5dump` still reports `DATATYPE "/mytype"` and the
+//!   object's reference count still matches its users.
 //! - Group hierarchy of arbitrary depth.
 //! - Attributes, on datasets, groups, and root, carried across with the
 //!   encoding the source gave them rather than rebuilt from an [`AttrValue`],
@@ -66,14 +73,21 @@
 //! would need rewritten in place);
 //! region references and
 //! non-8-byte object references; an object reference to a dropped object or to a
-//! target outside the hard-link hierarchy (a dangling, named-datatype, or region
-//! target), and object references in a userblock file (non-zero base address); a
+//! target outside the hard-link hierarchy (a dangling or region target), and
+//! object references in a userblock file (non-zero base address); a
 //! non-string vlen sequence whose base type embeds an address (nested vlen or
 //! reference); virtual and external data layouts; a lossy filter on the
-//! contiguous re-encode or sparse-chunked fallback path; and an attribute whose
+//! contiguous re-encode or sparse-chunked fallback path; an attribute whose
 //! datatype is or contains a reference (its stored address is not rewritten yet,
-//! and no [`AttrValue`] can re-encode it). An object that cannot be reproduced
-//! fails the repack by name rather than being silently dropped.
+//! and no [`AttrValue`] can re-encode it); and a use of a committed datatype the
+//! repack drops or that no hard link reaches. An object that cannot be
+//! reproduced fails the repack by name rather than being silently dropped.
+//!
+//! One thing is resolved rather than reproduced: a *shared dataspace*, which
+//! only a file with a shared-message (SOHM) table has, is written back inline.
+//! Unlike a datatype, a dataspace has no name and no HDF5 call reports one as
+//! shared, so there is nothing an inline copy loses. (In practice such a file is
+//! refused earlier: reading a SOHM-stored message is not supported.)
 //!
 //! # Memory
 //!
@@ -105,6 +119,7 @@ use crate::filter_pipeline::{
 use crate::libver::LibVer;
 use crate::reader::{Dataset, File, Group};
 use crate::scaleoffset::{self, ScaleOffset};
+use crate::shared_message::DatatypeLocation;
 use crate::source::Source;
 use crate::type_builders::{
     AttrValue, DatasetBuilder, FinishedGroup, GroupBuilder, ObjectRefPatch, ObjectRefTarget,
@@ -308,6 +323,7 @@ pub fn repack<P: AsRef<Path>, Q: AsRef<Path>>(
 trait GroupSink: AttrSink {
     fn sink_dataset(&mut self, name: &str) -> &mut DatasetBuilder;
     fn sink_add_group(&mut self, group: FinishedGroup);
+    fn sink_commit_datatype(&mut self, name: &str, datatype: Datatype);
 }
 
 /// Anything a repacked attribute can be attached to: the root group, a subgroup,
@@ -362,6 +378,9 @@ impl GroupSink for FileBuilder {
     fn sink_add_group(&mut self, group: FinishedGroup) {
         self.add_group(group);
     }
+    fn sink_commit_datatype(&mut self, name: &str, datatype: Datatype) {
+        self.commit_datatype(name, datatype);
+    }
 }
 
 impl GroupSink for GroupBuilder {
@@ -370,6 +389,9 @@ impl GroupSink for GroupBuilder {
     }
     fn sink_add_group(&mut self, group: FinishedGroup) {
         self.add_group(group);
+    }
+    fn sink_commit_datatype(&mut self, name: &str, datatype: Datatype) {
+        self.commit_datatype(name, datatype);
     }
 }
 
@@ -392,7 +414,31 @@ fn populate<S: GroupSink>(
     } else {
         format!("group {path}")
     };
-    copy_attrs(sink, src.attr_messages()?, || src.attrs(), &owner)?;
+    copy_attrs(
+        sink,
+        src.attr_messages()?,
+        || src.attrs(),
+        &owner,
+        drop,
+        addr_map,
+    )?;
+
+    // Committed (`H5Tcommit`) datatype objects. Neither a group nor a dataset, so
+    // the two walks below never see one: without this loop the object and its
+    // link leave the output, and every dataset that named the type through it
+    // stops resolving. Placed before the datasets so the type exists in the
+    // output before anything references it (the writer resolves by path, so the
+    // order is not load-bearing, but it matches how the file reads).
+    for name in src.named_datatypes()? {
+        let child_path = join(path, &name);
+        if drop.contains(&child_path) {
+            matched.insert(child_path);
+            continue;
+        }
+        let (datatype, _) = src.named_datatype_at(&name)?;
+        check_datatype(&datatype, &format!("committed datatype {child_path}"))?;
+        sink.sink_commit_datatype(&name, datatype);
+    }
 
     // Datasets, sorted by name.
     let mut dataset_names = src.datasets()?;
@@ -441,12 +487,21 @@ fn emit_dataset(
     drop: &BTreeSet<String>,
     addr_map: &HashMap<u64, String>,
 ) -> Result<(), Error> {
+    // A committed (`H5Tcommit`) element type lives in its own object header. The
+    // dataset is reproduced naming the same type rather than inlining a copy of
+    // it, which would read back correctly and still lose the name every C-library
+    // reader reports.
+    if let Some(address) = ds.committed_datatype_address()? {
+        let type_path = committed_type_path(address, &format!("dataset {path}"), drop, addr_map)?;
+        db.with_committed_datatype(&type_path);
+    }
+
     let datatype = ds.datatype()?;
     let dataspace = ds.dataspace()?;
     let layout = ds.data_layout()?;
     let pipeline = ds.filter_pipeline_parsed();
 
-    check_datatype(&datatype, path)?;
+    check_datatype(&datatype, &format!("dataset {path}"))?;
     check_layout(&layout, path)?;
 
     let dims = dataspace.dimensions.clone();
@@ -493,12 +548,7 @@ fn emit_dataset(
     if is_vlen_string_datatype(&datatype) {
         emit_vlen_string_dataset(db, ds, path, &datatype, &dims, &layout, &pipeline)?;
         // VL-string datasets carry attributes the same way as any other.
-        copy_attrs(
-            db,
-            ds.attr_messages()?,
-            || ds.attrs(),
-            &format!("dataset {path}"),
-        )?;
+        copy_dataset_attrs(db, ds, path, drop, addr_map)?;
         return Ok(());
     }
 
@@ -509,12 +559,7 @@ fn emit_dataset(
     // path so a chunked one is refused (not copied with stale references).
     if is_nonstring_vlen(&datatype) {
         emit_vlen_sequence_dataset(db, ds, path, &datatype, &dims, &layout, &pipeline)?;
-        copy_attrs(
-            db,
-            ds.attr_messages()?,
-            || ds.attrs(),
-            &format!("dataset {path}"),
-        )?;
+        copy_dataset_attrs(db, ds, path, drop, addr_map)?;
         return Ok(());
     }
 
@@ -525,12 +570,7 @@ fn emit_dataset(
     // chunked one is refused (not copied with stale addresses).
     if is_object_reference(&datatype) {
         emit_object_reference_dataset(db, ds, path, &dims, &layout, file, drop, addr_map)?;
-        copy_attrs(
-            db,
-            ds.attr_messages()?,
-            || ds.attrs(),
-            &format!("dataset {path}"),
-        )?;
+        copy_dataset_attrs(db, ds, path, drop, addr_map)?;
         return Ok(());
     }
 
@@ -560,12 +600,7 @@ fn emit_dataset(
             drop,
             addr_map,
         )?;
-        copy_attrs(
-            db,
-            ds.attr_messages()?,
-            || ds.attrs(),
-            &format!("dataset {path}"),
-        )?;
+        copy_dataset_attrs(db, ds, path, drop, addr_map)?;
         return Ok(());
     }
 
@@ -623,12 +658,7 @@ fn emit_dataset(
 
             // Carry the dataset's attributes, refusing any that cannot be
             // represented.
-            copy_attrs(
-                db,
-                ds.attr_messages()?,
-                || ds.attrs(),
-                &format!("dataset {path}"),
-            )?;
+            copy_dataset_attrs(db, ds, path, drop, addr_map)?;
             return Ok(());
         }
 
@@ -662,14 +692,31 @@ fn emit_dataset(
     );
 
     // Carry the dataset's attributes, refusing if any cannot be represented.
+    copy_dataset_attrs(db, ds, path, drop, addr_map)?;
+
+    Ok(())
+}
+
+/// Carry `ds`'s attributes onto `db`, refusing any that cannot be represented.
+///
+/// Every exit from [`emit_dataset`] ends here with the same arguments, and each
+/// one has to: a dataset that reaches the output without its attributes is a
+/// silent loss, not a refusal.
+fn copy_dataset_attrs(
+    db: &mut DatasetBuilder,
+    ds: &Dataset,
+    path: &str,
+    drop: &BTreeSet<String>,
+    addr_map: &HashMap<u64, String>,
+) -> Result<(), Error> {
     copy_attrs(
         db,
         ds.attr_messages()?,
         || ds.attrs(),
         &format!("dataset {path}"),
-    )?;
-
-    Ok(())
+        drop,
+        addr_map,
+    )
 }
 
 /// Carry the source dataset's resizability, chunk geometry, and filter pipeline
@@ -1139,12 +1186,32 @@ fn copy_attrs<S, F>(
     mut messages: Vec<AttributeMessage>,
     decode: F,
     owner: &str,
+    drop: &BTreeSet<String>,
+    addr_map: &HashMap<u64, String>,
 ) -> Result<(), Error>
 where
     S: AttrSink + ?Sized,
     F: FnOnce() -> Result<std::collections::HashMap<String, AttrValue>, Error>,
 {
     messages.sort_by(|a, b| a.name.cmp(&b.name));
+    // An attribute naming a committed (`H5Tcommit`) datatype is re-pointed at the
+    // same type in the output, exactly as a dataset's committed element type is.
+    // The source address is what says *which* committed object, so two attributes
+    // sharing one type still share one in the output rather than each getting a
+    // copy of the encoding.
+    for message in &mut messages {
+        let DatatypeLocation::Committed(address) = message.datatype_location else {
+            continue;
+        };
+        let name = &message.name;
+        let type_path = committed_type_path(
+            address,
+            &format!("{owner} attribute {name:?}"),
+            drop,
+            addr_map,
+        )?;
+        message.datatype_location = DatatypeLocation::CommittedPath(type_path);
+    }
     let any_needs_decoding = messages
         .iter()
         .any(|m| !attr_bytes_are_position_independent(&m.datatype));
@@ -1184,10 +1251,10 @@ where
 /// a nested occurrence is caught too. Region and non-8-byte object references are
 /// the remaining refusals (their stored selections/addresses are not yet
 /// rewritten); 8-byte object references are handled by the reference rewrite path.
-fn check_datatype(dt: &Datatype, path: &str) -> Result<(), Error> {
+fn check_datatype(dt: &Datatype, owner: &str) -> Result<(), Error> {
     let bad = |what: &str| {
         Err(Error::RepackUnsupported(format!(
-            "dataset {path}: {what} datatype cannot be repacked faithfully yet"
+            "{owner}: {what} datatype cannot be repacked faithfully yet"
         )))
     };
     match dt {
@@ -1208,7 +1275,7 @@ fn check_datatype(dt: &Datatype, path: &str) -> Result<(), Error> {
         // Non-string VL (sequences of arbitrary base types) are re-staged the
         // same way, but only when the base type's bytes carry no embedded heap or
         // file addresses that a verbatim copy would leave stale.
-        Datatype::VariableLength { base_type, .. } => check_vlen_base_type(base_type, path),
+        Datatype::VariableLength { base_type, .. } => check_vlen_base_type(base_type, owner),
         // Object references (8-byte object-header addresses) are repacked by
         // rewriting each address to its target's new location. Region references
         // (which embed a dataspace selection in the global heap) and non-8-byte
@@ -1227,12 +1294,12 @@ fn check_datatype(dt: &Datatype, path: &str) -> Result<(), Error> {
         } => bad("dataset-region reference"),
         Datatype::Compound { members, .. } => {
             for m in members {
-                check_datatype(&m.datatype, path)?;
+                check_datatype(&m.datatype, owner)?;
             }
             Ok(())
         }
-        Datatype::Enumeration { base_type, .. } => check_datatype(base_type, path),
-        Datatype::Array { base_type, .. } => check_datatype(base_type, path),
+        Datatype::Enumeration { base_type, .. } => check_datatype(base_type, owner),
+        Datatype::Array { base_type, .. } => check_datatype(base_type, owner),
     }
 }
 
@@ -1249,10 +1316,10 @@ fn is_nonstring_vlen(dt: &Datatype) -> bool {
 /// elements are themselves global-heap references) and a reference (a stale file
 /// address) are refused, recursing through compound members, array elements, and
 /// enumeration bases so a nested occurrence is caught too.
-fn check_vlen_base_type(dt: &Datatype, path: &str) -> Result<(), Error> {
+fn check_vlen_base_type(dt: &Datatype, owner: &str) -> Result<(), Error> {
     let bad = |what: &str| {
         Err(Error::RepackUnsupported(format!(
-            "dataset {path}: variable-length sequence of {what} cannot be repacked faithfully yet"
+            "{owner}: variable-length sequence of {what} cannot be repacked faithfully yet"
         )))
     };
     match dt {
@@ -1266,12 +1333,12 @@ fn check_vlen_base_type(dt: &Datatype, path: &str) -> Result<(), Error> {
         Datatype::VariableLength { .. } => bad("variable-length elements"),
         Datatype::Compound { members, .. } => {
             for m in members {
-                check_vlen_base_type(&m.datatype, path)?;
+                check_vlen_base_type(&m.datatype, owner)?;
             }
             Ok(())
         }
-        Datatype::Enumeration { base_type, .. } => check_vlen_base_type(base_type, path),
-        Datatype::Array { base_type, .. } => check_vlen_base_type(base_type, path),
+        Datatype::Enumeration { base_type, .. } => check_vlen_base_type(base_type, owner),
+        Datatype::Array { base_type, .. } => check_vlen_base_type(base_type, owner),
     }
 }
 
@@ -1317,7 +1384,8 @@ fn build_object_address_map(file: &File) -> Result<HashMap<u64, String>, Error> 
     Ok(map)
 }
 
-/// Recursively record `(header address -> path)` for every dataset and subgroup.
+/// Recursively record `(header address -> path)` for every dataset, committed
+/// datatype, and subgroup.
 fn collect_addresses(
     group: &Group,
     prefix: &str,
@@ -1327,6 +1395,13 @@ fn collect_addresses(
         let ds = group.dataset(&name)?;
         map.insert(ds.header_address(), join(prefix, &name));
     }
+    // A committed datatype is an object with an address like any other: a dataset
+    // or attribute naming one is resolved through this map, and an object
+    // reference may point straight at it.
+    for name in group.named_datatypes()? {
+        let (_, address) = group.named_datatype_at(&name)?;
+        map.insert(address, join(prefix, &name));
+    }
     for name in group.groups()? {
         let child = group.group(&name)?;
         let child_path = join(prefix, &name);
@@ -1334,6 +1409,36 @@ fn collect_addresses(
         collect_addresses(&child, &child_path, map)?;
     }
     Ok(())
+}
+
+/// The destination path of the committed datatype at source `address`.
+///
+/// Refused by name, rather than resolved to something else, in the two cases
+/// where naming it would be wrong: the type was dropped from the output, or it
+/// sits outside the hard-link hierarchy this walk covers (so nothing in the
+/// output holds it). Both would otherwise surface as a dataset pointing at an
+/// object that is not there.
+fn committed_type_path(
+    address: u64,
+    user: &str,
+    drop: &BTreeSet<String>,
+    addr_map: &HashMap<u64, String>,
+) -> Result<String, Error> {
+    let path = addr_map.get(&address).ok_or_else(|| {
+        Error::RepackUnsupported(format!(
+            "{user}: names a committed datatype that is not reachable by a hard link in the \
+             source, so it has no place in the output"
+        ))
+    })?;
+    // `is_dropped` rather than a membership test: dropping a group drops its whole
+    // subtree, so a committed type inside one leaves the output without ever being
+    // named in the drop set.
+    if is_dropped(path, drop) {
+        return Err(Error::RepackUnsupported(format!(
+            "{user}: names the committed datatype {path:?}, which this repack drops"
+        )));
+    }
+    Ok(path.clone())
 }
 
 /// Re-emit an object-reference dataset faithfully: rewrite each stored address to
@@ -1469,7 +1574,7 @@ fn resolve_reference_address(
         Some(target_path) => Ok(ObjectRefTarget::Path(target_path.clone())),
         None => Err(Error::RepackUnsupported(format!(
             "dataset {path}: object reference to address {address:#x} resolves to no hard-linked \
-             object in the source (dangling, or a named-datatype / region target not supported yet)"
+             object in the source (dangling, or a region target not supported yet)"
         ))),
     }
 }
@@ -1906,6 +2011,7 @@ mod attribute_fidelity_tests {
                     v.resize(16, 0);
                     v
                 },
+                datatype_location: crate::shared_message::DatatypeLocation::Inline,
             },
             // Space-padded, to prove the padding field is carried rather than
             // normalized to whichever value happens to be first.
@@ -1923,6 +2029,7 @@ mod attribute_fidelity_tests {
                     max_dimensions: None,
                 },
                 raw_data: b"ab      ".to_vec(),
+                datatype_location: crate::shared_message::DatatypeLocation::Inline,
             },
             // A Null dataspace holds no elements at all, which is distinct from a
             // rank-1 dataspace of length zero — the shape a decode gives it.
@@ -1936,6 +2043,7 @@ mod attribute_fidelity_tests {
                     max_dimensions: None,
                 },
                 raw_data: vec![],
+                datatype_location: crate::shared_message::DatatypeLocation::Inline,
             },
             // Rank 2, which every `AttrValue` array variant flattens.
             AttributeMessage {
@@ -1948,6 +2056,7 @@ mod attribute_fidelity_tests {
                     max_dimensions: None,
                 },
                 raw_data: (1i32..=6).flat_map(i32::to_le_bytes).collect(),
+                datatype_location: crate::shared_message::DatatypeLocation::Inline,
             },
         ];
 
