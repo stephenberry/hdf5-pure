@@ -483,6 +483,60 @@ mod tests {
         assert_eq!(sb.consistency_flags, 1);
     }
 
+    /// The same fields, read from a version 1 superblock **the C library
+    /// wrote**, with no dev-dependency and no 64-bit requirement.
+    ///
+    /// [`build_v1_bytes`] and [`Superblock::parse_v1`] were written by the same
+    /// hand from the same reading of the specification, so they agree about the
+    /// field order whether or not that order is right — and it was not: the fix
+    /// for issue #245's review corrected the chunk B-tree K and the status flags
+    /// being read from each other's offsets. Reproducing that, by laying the
+    /// bytes out the wrong way in *both* the builder and the parser, leaves both
+    /// hand-built tests passing.
+    ///
+    /// `tests/owned_swmr_crosscheck.rs` already covers this against a real file,
+    /// and catches the same mutation. What it costs is the `hdf5-metno`
+    /// dev-dependency, which needs 64-bit pointers, so that whole file compiles
+    /// out on the i686 target — where address arithmetic is most likely to be
+    /// wrong. Reading committed bytes needs neither, so this runs there.
+    ///
+    /// HDF5 1.8.23 wrote the file with `H5Pset_sym_k(8, 16)` and
+    /// `H5Pset_istore_k(64)`: all three K values differ from one another and
+    /// from the library's defaults (4 leaf, 16 internal, 32 chunk), so any
+    /// permutation of the three reads back wrong. See
+    /// `tests/fixtures/c_1_8/NOTICE.md`.
+    #[test]
+    fn parse_v1_against_a_c_written_superblock() {
+        let data: &[u8] = include_bytes!("../tests/fixtures/c_1_8/v1_superblock.h5");
+        let sb = Superblock::parse(data, 0).unwrap();
+
+        assert_eq!(sb.version, 1);
+        assert_eq!(sb.offset_size, 8);
+        assert_eq!(sb.length_size, 8);
+
+        // `H5Pset_sym_k(fcpl, 8, 16)` is (internal, leaf) — the C library's
+        // argument order, which is the reverse of the on-disk order. Version 0
+        // already carries these two; the chunk B-tree K below is the one field
+        // the version 1 layout adds, and the only one whose non-default value
+        // makes the C library write a version 1 superblock at all.
+        assert_eq!(sb.group_leaf_node_k, Some(16));
+        assert_eq!(sb.group_internal_node_k, Some(8));
+        assert_eq!(sb.indexed_storage_internal_node_k, Some(64));
+
+        // The file was closed cleanly, so no status bit is set. Asserted beside
+        // the K values because the two sit either side of the v1 reserved bytes
+        // and were read from each other's offsets: this field is what every
+        // `File::open` consults on a version 3 superblock, so a parser that
+        // confuses the two carries a wrong answer into the open path. It cannot
+        // reach a refusal *here* — `file_lock::check_status_flags` returns early
+        // below version 3 — which is why this asserts what was parsed rather
+        // than that the file opens.
+        assert_eq!(sb.consistency_flags, 0);
+
+        assert_eq!(sb.base_address, 0);
+        assert_eq!(sb.eof_address, data.len() as u64);
+    }
+
     #[test]
     fn parse_v1_4byte_offsets() {
         let data = build_v1_bytes(4);
