@@ -88,6 +88,7 @@ Open the file and start from `File::root()`, which returns a `Group` for the roo
 - `groups()` returns the names of child groups (`Vec<String>`).
 - `datasets()` returns the names of child datasets (`Vec<String>`).
 - `attrs()` returns the attributes as a `HashMap<String, AttrValue>`.
+- `attr_datatypes()` returns their on-disk datatypes as a `HashMap<String, Datatype>`.
 
 ```rust
 let file = File::from_bytes(builder.finish().unwrap()).unwrap();
@@ -127,8 +128,34 @@ What a read cannot recover, because `AttrValue` has no way to express it. Each o
 - **Variable-length strings.** A true `H5T_STRING` with `STRSIZE = VAR` — what h5py writes, and what this crate's writer never emits — has no variant of its own and reads as the fixed-width variant of the same charset.
 - **Rank.** Every array variant is one-dimensional, so a rank-2 attribute reads as its elements flattened.
 - **Padding and declared width.** A fixed-width string reports its content, not its `STRSIZE` or which padding it used.
+- **Enumeration member names.** An enum attribute decodes through its integer base, so its codes arrive and its labels do not.
 
 The variant may become **more specific** in a future release as `AttrValue` grows narrower variants, so match with a `_` arm — which the `#[non_exhaustive]` enum requires anyway — or read through the accessors, which are unaffected by such a change.
+
+### Reading an attribute's datatype
+
+`attr_datatypes()` reports the on-disk [`Datatype`](../reference/data-types.md#the-datatype-model) of every attribute, keyed by name. It is the type channel to `attrs()`'s value channel, the pair a dataset already has in `datatype()` and its `read_*` methods, and it is where the *datatype* entries in the list above — width, padding and declared width, enumeration member names — can still be read.
+
+**Rank is not among them.** An attribute's rank lives in its dataspace, which nothing public exposes, so a rank-2 attribute reads as a flat array from `attrs()` with no way to recover its shape from either channel.
+
+It reports **every** attribute message, including the ones `attrs()` omits because no `AttrValue` can carry them, so a name missing from that map can be told from one the object does not have.
+
+One datatype is not reported faithfully: a **committed** (shared) type, created with `H5Tcommit`, is stored on the attribute as a reference to a shared message rather than as the type itself, and both this and `Dataset::datatype()` decode that reference as though it were an inline datatype. netCDF-4 user-defined types and h5py's `f["t"] = np.dtype(...)` reach a file this way.
+
+A boolean attribute needs both channels. The C library gives `H5T_NATIVE_HBOOL` — what h5py writes for every `np.bool_` — an `enum[FALSE, TRUE]` over an 8-bit base, so the value arrives as `0` or `1`, indistinguishable from an `i8`, and only the datatype records which it was:
+
+```rust
+use hdf5_pure::Datatype;
+
+let root = file.root();
+let is_bool = matches!(
+    root.attr_datatypes().unwrap().get("success"),
+    Some(Datatype::Enumeration { base_type, members, .. })
+        if matches!(**base_type, Datatype::FixedPoint { size: 1, .. })
+            && members.iter().any(|m| m.name == "TRUE")
+);
+let value = root.attrs().unwrap().get("success").and_then(AttrValue::as_i64);
+```
 
 ### Addressing datasets
 

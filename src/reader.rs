@@ -2426,10 +2426,47 @@ impl Group {
     /// `#[non_exhaustive]`.
     ///
     /// An attribute whose datatype has no `AttrValue` representation is omitted
-    /// from the map rather than reported as an error.
+    /// from the map rather than reported as an error. Read
+    /// [`attr_datatypes`](Self::attr_datatypes) to see it.
     pub fn attrs(&self) -> Result<HashMap<String, AttrValue>, Error> {
         let hdr = self.file.parse_header(self.address)?;
         self.file.attrs_of(&hdr)
+    }
+
+    /// The exact on-disk [`Datatype`] of every attribute on this group, keyed by
+    /// name — including compound field offsets, integer widths and enumeration
+    /// members.
+    ///
+    /// This is the type channel to [`attrs`](Self::attrs)'s value channel, the
+    /// pair a dataset already has in [`Dataset::datatype`] and its `read_*`
+    /// methods. An [`AttrValue`] is a deliberately lossy view of the value, so an
+    /// attribute's stored width, string padding and enumeration members are
+    /// recoverable only from here. Its *rank* is not: that lives in the
+    /// dataspace, which nothing public exposes, so a rank-2 attribute still
+    /// reads as a flat `AttrValue` array with no way to recover its shape.
+    ///
+    /// **Every attribute message is reported, including the ones `attrs` omits**
+    /// because no `AttrValue` can carry them, so a name missing from that map can
+    /// be told from one the object does not have.
+    ///
+    /// **A committed datatype is not resolved.** An attribute whose type was
+    /// created with `H5Tcommit` — what netCDF-4 writes for a user-defined type,
+    /// and what h5py writes for `f["t"] = np.dtype(...)` — stores a reference to
+    /// a shared message rather than the type itself. This reports that reference
+    /// decoded as though it were an inline datatype, which is not the attribute's
+    /// type. [`Dataset::datatype`] has the same gap.
+    ///
+    /// A boolean attribute is the case that needs both channels. The C library
+    /// gives `H5T_NATIVE_HBOOL` — what h5py writes for every `np.bool_` — a
+    /// [`Datatype::Enumeration`] of `FALSE` and `TRUE` over an 8-bit base, and
+    /// `attrs` decodes it through that base, so the value arrives as `0` or `1`
+    /// and only the datatype records that it was a bool.
+    pub fn attr_datatypes(&self) -> Result<HashMap<String, Datatype>, Error> {
+        Ok(self
+            .attr_messages()?
+            .into_iter()
+            .map(|a| (a.name, a.datatype))
+            .collect())
     }
 
     /// Every attribute message on this group as it is encoded on disk, in the
@@ -3647,6 +3684,21 @@ impl Dataset {
         self.file.attrs_of(&self.header)
     }
 
+    /// The exact on-disk [`Datatype`] of every attribute on this dataset, keyed
+    /// by name.
+    ///
+    /// See [`Group::attr_datatypes`] for what this channel carries that
+    /// [`attrs`](Self::attrs) cannot, including how a boolean attribute is
+    /// recognized. Note that this describes the *attributes*, not the dataset's
+    /// own element type — that is [`datatype`](Self::datatype).
+    pub fn attr_datatypes(&self) -> Result<HashMap<String, Datatype>, Error> {
+        Ok(self
+            .attr_messages()?
+            .into_iter()
+            .map(|a| (a.name, a.datatype))
+            .collect())
+    }
+
     /// Every attribute message on this dataset as it is encoded on disk, in the
     /// order the header holds them.
     ///
@@ -4431,5 +4483,211 @@ mod tests {
             matches!(err, FormatError::UnsupportedVirtualLayout),
             "expected UnsupportedVirtualLayout, got {err:?}"
         );
+    }
+
+    /// The two channels a caller has for one object's attributes.
+    struct AttrChannels {
+        owner: &'static str,
+        /// What `attrs` decoded — the values, lossily.
+        values: HashMap<String, AttrValue>,
+        /// What `attr_datatypes` reported — the encodings, exactly.
+        datatypes: HashMap<String, Datatype>,
+    }
+
+    /// One written file: its bytes, and both channels read back from each owner.
+    struct AttrFile {
+        /// The file as written, so a test can assert which storage form it got.
+        bytes: Vec<u8>,
+        owners: Vec<AttrChannels>,
+    }
+
+    /// Put the same attributes on the root group and on a dataset, write the
+    /// file, and read both channels back from each owner.
+    ///
+    /// Both owners, because `Group` and `Dataset` reach their attribute messages
+    /// by different routes: one parses an object header by address, the other
+    /// already holds one.
+    fn attr_channels(
+        values: &[(&str, AttrValue)],
+        verbatim: &[crate::attribute::AttributeMessage],
+    ) -> AttrFile {
+        let mut b = FileBuilder::new();
+        for (name, value) in values {
+            b.set_attr(name, value.clone());
+        }
+        for message in verbatim {
+            b.set_attr_verbatim(message.clone());
+        }
+        {
+            let ds = b.create_dataset("data").with_f64_data(&[1.0]);
+            for (name, value) in values {
+                ds.set_attr(name, value.clone());
+            }
+            for message in verbatim {
+                ds.set_attr_verbatim(message.clone());
+            }
+        }
+        let bytes = b.finish().unwrap();
+        let file = File::from_bytes(bytes.clone()).unwrap();
+        let root = file.root();
+        let dataset = file.dataset("data").unwrap();
+        AttrFile {
+            bytes,
+            owners: vec![
+                AttrChannels {
+                    owner: "root group",
+                    values: root.attrs().unwrap(),
+                    datatypes: root.attr_datatypes().unwrap(),
+                },
+                AttrChannels {
+                    owner: "dataset",
+                    values: dataset.attrs().unwrap(),
+                    datatypes: dataset.attr_datatypes().unwrap(),
+                },
+            ],
+        }
+    }
+
+    /// The datatype channel carries the width the value channel widens away: one
+    /// attribute, read as a 64-bit value and as the 4-byte type it is stored as.
+    ///
+    /// The pair is the point. `AttrValue` is documented as lossy, so a caller
+    /// that needs the encoding — to map it onto a typed column, say — needs
+    /// somewhere else to read it, and for an attribute there was nowhere (#248).
+    #[test]
+    fn attr_datatypes_reports_the_width_attrs_widens() {
+        for c in attr_channels(&[("count", AttrValue::I32(-7))], &[]).owners {
+            assert_eq!(
+                c.values.get("count"),
+                Some(&AttrValue::I64(-7)),
+                "{}: the value channel widens every integer to 64 bits",
+                c.owner
+            );
+            let Some(Datatype::FixedPoint { size, signed, .. }) = c.datatypes.get("count") else {
+                panic!(
+                    "{}: expected a fixed-point datatype, got {:?}",
+                    c.owner,
+                    c.datatypes.get("count")
+                );
+            };
+            assert_eq!(
+                (*size, *signed),
+                (4, true),
+                "{}: the datatype channel must report the width on disk",
+                c.owner
+            );
+        }
+    }
+
+    /// Every attribute message is reported, including one `attrs` drops because
+    /// no `AttrValue` can carry it.
+    ///
+    /// That is what lets a caller tell a dropped attribute from an absent one. An
+    /// omission with nothing to compare against is invisible, which is how every
+    /// `np.bool_` attribute in an h5py file went missing without a trace (#248).
+    #[test]
+    fn attr_datatypes_reports_an_attribute_attrs_omits() {
+        let opaque = Datatype::Opaque {
+            size: 3,
+            tag: b"rgb".to_vec(),
+        };
+        let raw = crate::attribute::AttributeMessage {
+            name: "raw".into(),
+            datatype: opaque.clone(),
+            dataspace: Dataspace {
+                space_type: crate::dataspace::DataspaceType::Scalar,
+                rank: 0,
+                dimensions: vec![],
+                max_dimensions: None,
+            },
+            raw_data: vec![1, 2, 3],
+        };
+
+        for c in attr_channels(&[("count", AttrValue::I32(1))], std::slice::from_ref(&raw)).owners {
+            assert!(
+                !c.values.contains_key("raw"),
+                "{}: an opaque attribute has no `AttrValue`, so `attrs` omits it — \
+                 if that changes, this test is measuring the wrong thing",
+                c.owner
+            );
+            assert_eq!(
+                c.datatypes.get("raw"),
+                Some(&opaque),
+                "{}: the datatype channel must report an attribute `attrs` omits",
+                c.owner
+            );
+            // Specific to the one attribute: a channel that reported only the
+            // undecodable one, or dropped its neighbour, would pass the above.
+            assert!(
+                c.values.contains_key("count") && c.datatypes.contains_key("count"),
+                "{}: the attribute beside it must appear in both channels",
+                c.owner
+            );
+        }
+    }
+
+    /// The channel must cover dense (fractal-heap) attribute storage, not only
+    /// the compact form that lives in the object header.
+    ///
+    /// The two tests above use three attributes, which is well inside the
+    /// writer's compact threshold, so on their own they leave every dense path
+    /// unpinned: an implementation that walked `hdr.messages` directly and never
+    /// touched the heap would pass both and report *nothing* for a real file with
+    /// many attributes. Twelve is past the threshold, and the heap signature is
+    /// asserted so the fixture cannot quietly revert to compact storage and take
+    /// the coverage with it.
+    #[test]
+    fn attr_datatypes_covers_dense_attribute_storage() {
+        let names: Vec<String> = (0..12).map(|i| format!("a{i:02}")).collect();
+        let values: Vec<(&str, AttrValue)> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                (
+                    n.as_str(),
+                    #[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                    AttrValue::I32(i as i32),
+                )
+            })
+            .collect();
+
+        let f = attr_channels(&values, &[]);
+        assert!(
+            f.bytes.windows(4).any(|w| w == b"FRHP"),
+            "the fixture must really use dense storage, or this test proves \
+             nothing beyond the compact path the other tests already cover"
+        );
+
+        for c in f.owners {
+            assert_eq!(
+                c.datatypes.len(),
+                names.len(),
+                "{}: every attribute in the heap must be reported, got {:?}",
+                c.owner,
+                c.datatypes.keys().collect::<Vec<_>>()
+            );
+            // The two channels must agree on which attributes exist: all of these
+            // decode, so neither one has anything to omit here.
+            let mut from_values: Vec<&String> = c.values.keys().collect();
+            let mut from_types: Vec<&String> = c.datatypes.keys().collect();
+            from_values.sort();
+            from_types.sort();
+            assert_eq!(
+                from_values, from_types,
+                "{}: the channels disagree",
+                c.owner
+            );
+            for name in &names {
+                assert!(
+                    matches!(
+                        c.datatypes.get(name),
+                        Some(Datatype::FixedPoint { size: 4, .. })
+                    ),
+                    "{}: {name} must keep its 4-byte width through the heap, got {:?}",
+                    c.owner,
+                    c.datatypes.get(name)
+                );
+            }
+        }
     }
 }
