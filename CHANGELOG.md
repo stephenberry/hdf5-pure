@@ -26,7 +26,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `FileBuilder::with_create_properties` resets the properties its argument does not carry, so a bound set before the call no longer decides the format of a file whose property list names no version ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
 - `FileBuilder::write` creates the destination only once the writer has bytes for it, so a refused build leaves an existing file at that path untouched ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
 - An edit session writes a contiguous dataset's data-layout message in the format of the file it opened, so a `.mat` file edited through `File::open_rw` stays readable by MATLAB ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
-- `File::open_streaming` fetches a dataset's adjacent chunks in one read instead of one read each, which is what makes a file written a row at a time — thousands of chunks of a few dozen bytes — read at a sensible speed. A read still fetches only the chunks it needs, and holds at most 256 KiB of them at a time ([#257](https://github.com/stephenberry/hdf5-pure/pull/257)).
+- `File::open_streaming` fetches a dataset's adjacent chunks in one read instead of one read each, which is what makes a file written a row at a time — thousands of chunks of a few dozen bytes — read at a sensible speed. A read still fetches only the chunks it needs, and holds at most 256 KiB of them at a time ([#250](https://github.com/stephenberry/hdf5-pure/pull/250)).
 
 ### Fixed
 
