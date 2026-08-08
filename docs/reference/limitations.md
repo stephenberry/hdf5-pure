@@ -98,6 +98,7 @@ Refused today with a `... yet` message, intended to land. Each row links to its 
 | Capability | Tracking |
 |---|---|
 | Repack of **region references**, non-8-byte object references, chunked/filtered/resizable **reference** datasets, and unrecognized filter pipelines (time, variable-length sequences, and 8-byte object references now repack faithfully; chunked, filtered, and resizable variable-length datasets repack as of [#109](https://github.com/stephenberry/hdf5-pure/issues/109)) | [#107](https://github.com/stephenberry/hdf5-pure/issues/107) |
+| Repack of a **committed** (`H5Tcommit`) datatype, on a dataset's element type or an attribute's — the writer cannot emit a named type object, and inlining the resolved encoding would drop the name every reader reports | [#254](https://github.com/stephenberry/hdf5-pure/issues/254) |
 
 ### Reading
 
@@ -105,6 +106,7 @@ Refused today with a `... yet` message, intended to land. Each row links to its 
 |---|---|
 | **Filter-encoded fractal-heap** objects | [#108](https://github.com/stephenberry/hdf5-pure/issues/108) |
 | **Virtual (VDS)** datasets | [#111](https://github.com/stephenberry/hdf5-pure/issues/111) |
+| Messages stored in the **shared-message (SOHM) heap**, refused with `FormatError::UnsupportedSohmReference`. A **committed** (`H5Tcommit`) datatype is not one of these — it references its own object header and is resolved, so a named type reads as the type it names | [#254](https://github.com/stephenberry/hdf5-pure/issues/254) |
 
 Virtual datasets are also refused by `repack` (it cannot relocate data living outside the file); that lifts together with VDS read support ([#111](https://github.com/stephenberry/hdf5-pure/issues/111)).
 

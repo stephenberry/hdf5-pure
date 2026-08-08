@@ -394,6 +394,21 @@ fn populate<S: GroupSink>(
     };
     copy_attrs(sink, src.attr_messages()?, || src.attrs(), &owner)?;
 
+    // A committed (`H5Tcommit`) datatype object is neither a group nor a dataset,
+    // so the two walks below never see it: it would leave the output along with
+    // its link, and every reader that named the type through it would stop. This
+    // writer cannot place one, so refuse it by name rather than drop it.
+    for name in src.named_datatypes()? {
+        let child_path = join(path, &name);
+        if drop.contains(&child_path) {
+            matched.insert(child_path);
+            continue;
+        }
+        return Err(Error::RepackUnsupported(format!(
+            "{child_path}: a committed (named) datatype object cannot be repacked yet"
+        )));
+    }
+
     // Datasets, sorted by name.
     let mut dataset_names = src.datasets()?;
     dataset_names.sort();
@@ -441,6 +456,17 @@ fn emit_dataset(
     drop: &BTreeSet<String>,
     addr_map: &HashMap<u64, String>,
 ) -> Result<(), Error> {
+    // A committed (`H5Tcommit`) element type lives in its own object header,
+    // which this writer has no way to emit. Reproducing the dataset would mean
+    // writing the resolved type inline and dropping the named type object, so
+    // every C-library reader would stop reporting the type by name — an
+    // approximation, and this module refuses those.
+    if ds.datatype_is_committed() {
+        return Err(Error::RepackUnsupported(format!(
+            "dataset {path}: a committed (shared) datatype cannot be repacked faithfully yet"
+        )));
+    }
+
     let datatype = ds.datatype()?;
     let dataspace = ds.dataspace()?;
     let layout = ds.data_layout()?;
@@ -1145,6 +1171,23 @@ where
     F: FnOnce() -> Result<std::collections::HashMap<String, AttrValue>, Error>,
 {
     messages.sort_by(|a, b| a.name.cmp(&b.name));
+    // An attribute whose datatype or dataspace is a reference to a committed
+    // (shared) message is refused for the same reason a committed dataset type
+    // is: the writer can only inline the resolved encoding, which silently drops
+    // the named type the source file shares. Refusing keeps the attribute out of
+    // an output that would read as something subtly different.
+    if let Some(message) = messages.iter().find(|m| m.shared_fields.any()) {
+        let name = &message.name;
+        let field = if message.shared_fields.datatype {
+            "datatype"
+        } else {
+            "dataspace"
+        };
+        return Err(Error::RepackUnsupported(format!(
+            "{owner}: attribute {name:?} has a committed (shared) {field} that cannot be \
+             repacked faithfully yet"
+        )));
+    }
     let any_needs_decoding = messages
         .iter()
         .any(|m| !attr_bytes_are_position_independent(&m.datatype));
@@ -1906,6 +1949,7 @@ mod attribute_fidelity_tests {
                     v.resize(16, 0);
                     v
                 },
+                shared_fields: crate::attribute::SharedFields::NONE,
             },
             // Space-padded, to prove the padding field is carried rather than
             // normalized to whichever value happens to be first.
@@ -1923,6 +1967,7 @@ mod attribute_fidelity_tests {
                     max_dimensions: None,
                 },
                 raw_data: b"ab      ".to_vec(),
+                shared_fields: crate::attribute::SharedFields::NONE,
             },
             // A Null dataspace holds no elements at all, which is distinct from a
             // rank-1 dataspace of length zero — the shape a decode gives it.
@@ -1936,6 +1981,7 @@ mod attribute_fidelity_tests {
                     max_dimensions: None,
                 },
                 raw_data: vec![],
+                shared_fields: crate::attribute::SharedFields::NONE,
             },
             // Rank 2, which every `AttrValue` array variant flattens.
             AttributeMessage {
@@ -1948,6 +1994,7 @@ mod attribute_fidelity_tests {
                     max_dimensions: None,
                 },
                 raw_data: (1i32..=6).flat_map(i32::to_le_bytes).collect(),
+                shared_fields: crate::attribute::SharedFields::NONE,
             },
         ];
 

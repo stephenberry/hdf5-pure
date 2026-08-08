@@ -7,7 +7,7 @@ use alloc::{boxed::Box, string::String, string::ToString, vec, vec::Vec};
 
 use core::fmt;
 
-use crate::attribute::AttributeMessage;
+use crate::attribute::{AttributeMessage, SharedFields};
 use crate::chunked_write::{ChunkMeta, ChunkOptions, ChunkProvider};
 use crate::compound::CompoundType;
 use crate::convert::TryToUsize;
@@ -652,6 +652,7 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
             datatype: make_f64_type(),
             dataspace: scalar_ds(),
             raw_data: v.to_le_bytes().to_vec(),
+            shared_fields: SharedFields::NONE,
         },
         AttrValue::F64Array(arr) => {
             let mut raw = Vec::with_capacity(arr.len() * 8);
@@ -663,6 +664,7 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
                 datatype: make_f64_type(),
                 dataspace: simple_1d(arr.len() as u64),
                 raw_data: raw,
+                shared_fields: SharedFields::NONE,
             }
         }
         AttrValue::I64(v) => AttributeMessage {
@@ -670,6 +672,7 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
             datatype: make_i64_type(),
             dataspace: scalar_ds(),
             raw_data: v.to_le_bytes().to_vec(),
+            shared_fields: SharedFields::NONE,
         },
         AttrValue::I64Array(arr) => {
             let mut raw = Vec::with_capacity(arr.len() * 8);
@@ -681,6 +684,7 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
                 datatype: make_i64_type(),
                 dataspace: simple_1d(arr.len() as u64),
                 raw_data: raw,
+                shared_fields: SharedFields::NONE,
             }
         }
         AttrValue::U64Array(arr) => {
@@ -693,6 +697,7 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
                 datatype: make_u64_type(),
                 dataspace: simple_1d(arr.len() as u64),
                 raw_data: raw,
+                shared_fields: SharedFields::NONE,
             }
         }
         AttrValue::I32(v) => AttributeMessage {
@@ -700,18 +705,21 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
             datatype: make_i32_type(),
             dataspace: scalar_ds(),
             raw_data: v.to_le_bytes().to_vec(),
+            shared_fields: SharedFields::NONE,
         },
         AttrValue::U32(v) => AttributeMessage {
             name: name.to_string(),
             datatype: make_u32_type(),
             dataspace: scalar_ds(),
             raw_data: v.to_le_bytes().to_vec(),
+            shared_fields: SharedFields::NONE,
         },
         AttrValue::U64(v) => AttributeMessage {
             name: name.to_string(),
             datatype: make_u64_type(),
             dataspace: scalar_ds(),
             raw_data: v.to_le_bytes().to_vec(),
+            shared_fields: SharedFields::NONE,
         },
         AttrValue::String(s) => {
             let bytes = s.as_bytes();
@@ -724,6 +732,7 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
                 },
                 dataspace: scalar_ds(),
                 raw_data: pad_to_size(bytes),
+                shared_fields: SharedFields::NONE,
             }
         }
         AttrValue::StringArray(arr) => {
@@ -743,6 +752,7 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
                 },
                 dataspace: simple_1d(arr.len() as u64),
                 raw_data: raw,
+                shared_fields: SharedFields::NONE,
             }
         }
         AttrValue::AsciiString(s) => {
@@ -756,6 +766,7 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
                 },
                 dataspace: scalar_ds(),
                 raw_data: pad_to_size(bytes),
+                shared_fields: SharedFields::NONE,
             }
         }
         AttrValue::AsciiStringArray(arr) => {
@@ -775,6 +786,7 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
                 },
                 dataspace: simple_1d(arr.len() as u64),
                 raw_data: raw,
+                shared_fields: SharedFields::NONE,
             }
         }
         AttrValue::VarLenAsciiArray(strings) => {
@@ -800,6 +812,7 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
                     }),
                 },
                 dataspace: simple_1d(strings.len() as u64),
+                shared_fields: SharedFields::NONE,
             }
         }
     }

@@ -7548,8 +7548,12 @@ fn parse_compact_attr_name(
             "a target object has a shared attribute message (not editable in place yet)",
         ));
     }
-    crate::attribute::AttributeMessage::parse(&region[body..body_end], LENGTH_SIZE)
-        .map(|attr| attr.name)
+    // Only the name is wanted here, and it is the one field that never depends on
+    // the datatype or dataspace — either of which may be a reference to a
+    // committed message this walk has no file context to follow. Reading the name
+    // alone lets an edit pass over such an attribute instead of refusing the
+    // whole object because one of its neighbours is committed.
+    crate::attribute::message_name(&region[body..body_end])
         .map_err(|_| Error::EditUnsupported("a target object has an unreadable attribute message"))
 }
 
@@ -7868,6 +7872,17 @@ fn reject_foreign_addresses(region: &[u8]) -> Result<(), Error> {
                 }
             }
             MessageType::Attribute => {
+                // An attribute's *own* datatype or dataspace field can be a
+                // reference to a committed message, which the record's shared
+                // flag above does not report: that flag describes the attribute
+                // message, not the fields inside it. The reference addresses the
+                // source file, so it cannot travel any more than a shared record
+                // can — and the parse below cannot resolve it here in any case.
+                if crate::attribute::message_shares_a_field(&region[body..body_end]) {
+                    return Err(Error::EditUnsupported(
+                        "an attribute with a committed (shared) datatype cannot be copied to another file yet",
+                    ));
+                }
                 let attr =
                     crate::attribute::AttributeMessage::parse(&region[body..body_end], LENGTH_SIZE)
                         .map_err(|_| {

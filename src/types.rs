@@ -543,6 +543,7 @@ mod tests {
                 max_dimensions: None,
             },
             raw_data,
+            shared_fields: crate::attribute::SharedFields::NONE,
         };
         decode_attr_value(&attr, &crate::source::BytesSource::new(Vec::new()), 8, 8, 0)
     }

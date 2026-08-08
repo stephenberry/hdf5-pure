@@ -204,6 +204,27 @@ pub enum FormatError {
     InvalidAttributeInfoVersion(u8),
     /// Invalid shared message version.
     InvalidSharedMessageVersion(u8),
+    /// An attribute message's flags byte set a bit the format does not define.
+    /// Only bit 0 (shared datatype) and bit 1 (shared dataspace) exist, so any
+    /// other bit means the message is not what it claims to be.
+    InvalidAttributeFlags(u8),
+    /// A message body is a reference to the file's shared object header message
+    /// (SOHM) heap, which this reader does not walk. A committed (`H5Tcommit`)
+    /// datatype is *not* stored there — it references another object header, and
+    /// is resolved.
+    UnsupportedSohmReference,
+    /// A shared message reference named an object header that holds no message of
+    /// the referenced type.
+    SharedMessageMissing {
+        /// Address of the object header the reference named.
+        object_header_address: u64,
+        /// Raw type ID of the message the reference stood in for.
+        message_type: u16,
+    },
+    /// A message body holds a reference to a shared message, and the parse that
+    /// met it had no access to the file the reference addresses. Carries the raw
+    /// type ID of the referenced message.
+    UnresolvedSharedMessage(u16),
     /// Invalid global heap collection signature.
     InvalidGlobalHeapSignature,
     /// Invalid global heap version.
@@ -690,6 +711,30 @@ impl fmt::Display for FormatError {
             }
             FormatError::InvalidSharedMessageVersion(v) => {
                 write!(f, "invalid shared message version: {v}")
+            }
+            FormatError::InvalidAttributeFlags(v) => {
+                write!(f, "undefined flag bits in attribute message: {v:#04x}")
+            }
+            FormatError::UnsupportedSohmReference => {
+                write!(
+                    f,
+                    "a message stored in the shared object header message (SOHM) heap is not supported"
+                )
+            }
+            FormatError::SharedMessageMissing {
+                object_header_address,
+                message_type,
+            } => {
+                write!(
+                    f,
+                    "object header at {object_header_address} holds no message of type {message_type:#06x} for a shared reference to it"
+                )
+            }
+            FormatError::UnresolvedSharedMessage(t) => {
+                write!(
+                    f,
+                    "a reference to a shared message of type {t:#06x} cannot be resolved without the file that holds it"
+                )
             }
             FormatError::InvalidGlobalHeapSignature => {
                 write!(f, "invalid global heap collection signature")
