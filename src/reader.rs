@@ -1148,21 +1148,9 @@ impl FileInner {
         }
     }
 
-    /// Names of every attribute message on `hdr`, including ones whose datatype
-    /// [`attrs_of`](Self::attrs_of) cannot decode into an [`AttrValue`] (and so
-    /// silently omits from its map). Repack diffs this against the decoded map to
-    /// refuse rather than drop an attribute it cannot reproduce.
-    pub(crate) fn attr_message_names_of(&self, hdr: &ObjectHeader) -> Result<Vec<String>, Error> {
-        Ok(self
-            .attr_messages_of(hdr)?
-            .into_iter()
-            .map(|a| a.name)
-            .collect())
-    }
-
     /// Extract every attribute message attached to an object header (compact,
     /// shared, and dense storage), dispatching on the backend.
-    fn attr_messages_of(
+    pub(crate) fn attr_messages_of(
         &self,
         hdr: &ObjectHeader,
     ) -> Result<Vec<crate::attribute::AttributeMessage>, Error> {
@@ -2444,12 +2432,16 @@ impl Group {
         self.file.attrs_of(&hdr)
     }
 
-    /// Names of every attribute on this group, including any whose datatype
-    /// [`attrs`](Self::attrs) cannot represent. Used by repack to detect an
-    /// attribute it would otherwise drop.
-    pub(crate) fn attr_names(&self) -> Result<Vec<String>, Error> {
+    /// Every attribute message on this group as it is encoded on disk, in the
+    /// order the header holds them.
+    ///
+    /// [`attrs`](Self::attrs) decodes each into an [`AttrValue`], which loses the
+    /// encoding; this keeps it. Repack copies from here so an attribute survives
+    /// a rewrite unchanged, and falls back to the decoded map only where the
+    /// bytes are not position-independent.
+    pub(crate) fn attr_messages(&self) -> Result<Vec<crate::attribute::AttributeMessage>, Error> {
         let hdr = self.file.parse_header(self.address)?;
-        self.file.attr_message_names_of(&hdr)
+        self.file.attr_messages_of(&hdr)
     }
 
     /// Get a dataset within this group by name.
@@ -3655,11 +3647,13 @@ impl Dataset {
         self.file.attrs_of(&self.header)
     }
 
-    /// Names of every attribute on this dataset, including any whose datatype
-    /// [`attrs`](Self::attrs) cannot represent. Used by repack to detect an
-    /// attribute it would otherwise drop.
-    pub(crate) fn attr_names(&self) -> Result<Vec<String>, Error> {
-        self.file.attr_message_names_of(&self.header)
+    /// Every attribute message on this dataset as it is encoded on disk, in the
+    /// order the header holds them.
+    ///
+    /// See [`Group::attr_messages`] for why repack reads these rather than the
+    /// decoded map.
+    pub(crate) fn attr_messages(&self) -> Result<Vec<crate::attribute::AttributeMessage>, Error> {
+        self.file.attr_messages_of(&self.header)
     }
 
     /// Returns the exact HDF5 datatype, including compound field offsets and

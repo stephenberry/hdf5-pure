@@ -223,6 +223,27 @@ impl FileBuilder {
         self.writer.set_root_attr(name, value);
     }
 
+    /// Attach an already-encoded attribute message to the root group, written
+    /// exactly as given.
+    ///
+    /// See [`AttrSpec::Verbatim`](crate::type_builders::AttrSpec::Verbatim) for
+    /// what this preserves that [`set_attr`](Self::set_attr) cannot, and for the
+    /// datatypes it must not be used with.
+    pub(crate) fn set_attr_verbatim(&mut self, message: crate::attribute::AttributeMessage) {
+        self.writer.set_root_attr_verbatim(message);
+    }
+
+    /// Attach a variable-length string attribute to the root group with the given
+    /// datatype and dataspace, staging `strings` into a heap of this file's own.
+    /// See [`AttrSpec::VerbatimVarLen`](crate::type_builders::AttrSpec::VerbatimVarLen).
+    pub(crate) fn set_attr_var_len_verbatim(
+        &mut self,
+        message: crate::attribute::AttributeMessage,
+        strings: Vec<String>,
+    ) {
+        self.writer.set_root_attr_var_len_verbatim(message, strings);
+    }
+
     /// Whether the staged content needs the 1.10 format — see
     /// [`FileWriter::needs_latest_format`](crate::file_writer::FileWriter::needs_latest_format).
     pub(crate) fn needs_latest_format(&self) -> bool {

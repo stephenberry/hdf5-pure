@@ -44,8 +44,10 @@
 //!   rewritten to its target object's new location in the compacted file (null
 //!   and undefined references are carried verbatim).
 //! - Group hierarchy of arbitrary depth.
-//! - Attributes representable as [`AttrValue`] (numbers, fixed and
-//!   variable-length strings and their arrays), on datasets, groups, and root.
+//! - Attributes, on datasets, groups, and root, carried across with the
+//!   encoding the source gave them rather than rebuilt from an [`AttrValue`],
+//!   which is a decoded view and cannot express a narrow width, a
+//!   variable-length string, or a rank above one.
 //! - The source file's file-space management strategy (with its page size and
 //!   threshold), carried into the compact output as non-persistent — a repacked
 //!   file has no free space to persist.
@@ -68,10 +70,10 @@
 //! target), and object references in a userblock file (non-zero base address); a
 //! non-string vlen sequence whose base type embeds an address (nested vlen or
 //! reference); virtual and external data layouts; a lossy filter on the
-//! contiguous re-encode or sparse-chunked fallback path; and any attribute whose
-//! datatype the reader cannot decode into an [`AttrValue`] (e.g. an enumeration,
-//! compound, reference, or boolean attribute). An object that cannot be
-//! reproduced fails the repack by name rather than being silently dropped.
+//! contiguous re-encode or sparse-chunked fallback path; and an attribute whose
+//! datatype is or contains a reference (its stored address is not rewritten yet,
+//! and no [`AttrValue`] can re-encode it). An object that cannot be reproduced
+//! fails the repack by name rather than being silently dropped.
 //!
 //! # Memory
 //!
@@ -85,10 +87,11 @@
 //!
 //! [#82]: https://github.com/stephenberry/hdf5-pure/issues/82
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::attribute::AttributeMessage;
 use crate::chunked_read::ChunkInfo;
 use crate::chunked_write::{ChunkMeta, ChunkProvider};
 use crate::convert::TryToUsize;
@@ -302,10 +305,54 @@ pub fn repack<P: AsRef<Path>, Q: AsRef<Path>>(
 /// A destination that group contents can be added to. Implemented for both the
 /// top-level [`FileBuilder`] (the root group) and [`GroupBuilder`] (subgroups)
 /// so one recursive walk handles every level.
-trait GroupSink {
+trait GroupSink: AttrSink {
     fn sink_dataset(&mut self, name: &str) -> &mut DatasetBuilder;
     fn sink_add_group(&mut self, group: FinishedGroup);
+}
+
+/// Anything a repacked attribute can be attached to: the root group, a subgroup,
+/// or a dataset. Split from [`GroupSink`] because a dataset takes attributes but
+/// holds no children, so one attribute-copying routine serves all three.
+trait AttrSink {
     fn sink_set_attr(&mut self, name: &str, value: AttrValue);
+    fn sink_set_attr_verbatim(&mut self, message: AttributeMessage);
+    fn sink_set_attr_var_len_verbatim(&mut self, message: AttributeMessage, strings: Vec<String>);
+}
+
+impl AttrSink for FileBuilder {
+    fn sink_set_attr(&mut self, name: &str, value: AttrValue) {
+        self.set_attr(name, value);
+    }
+    fn sink_set_attr_verbatim(&mut self, message: AttributeMessage) {
+        self.set_attr_verbatim(message);
+    }
+    fn sink_set_attr_var_len_verbatim(&mut self, message: AttributeMessage, strings: Vec<String>) {
+        self.set_attr_var_len_verbatim(message, strings);
+    }
+}
+
+impl AttrSink for GroupBuilder {
+    fn sink_set_attr(&mut self, name: &str, value: AttrValue) {
+        self.set_attr(name, value);
+    }
+    fn sink_set_attr_verbatim(&mut self, message: AttributeMessage) {
+        self.set_attr_verbatim(message);
+    }
+    fn sink_set_attr_var_len_verbatim(&mut self, message: AttributeMessage, strings: Vec<String>) {
+        self.set_attr_var_len_verbatim(message, strings);
+    }
+}
+
+impl AttrSink for DatasetBuilder {
+    fn sink_set_attr(&mut self, name: &str, value: AttrValue) {
+        self.set_attr(name, value);
+    }
+    fn sink_set_attr_verbatim(&mut self, message: AttributeMessage) {
+        self.set_attr_verbatim(message);
+    }
+    fn sink_set_attr_var_len_verbatim(&mut self, message: AttributeMessage, strings: Vec<String>) {
+        self.set_attr_var_len_verbatim(message, strings);
+    }
 }
 
 impl GroupSink for FileBuilder {
@@ -315,9 +362,6 @@ impl GroupSink for FileBuilder {
     fn sink_add_group(&mut self, group: FinishedGroup) {
         self.add_group(group);
     }
-    fn sink_set_attr(&mut self, name: &str, value: AttrValue) {
-        self.set_attr(name, value);
-    }
 }
 
 impl GroupSink for GroupBuilder {
@@ -326,9 +370,6 @@ impl GroupSink for GroupBuilder {
     }
     fn sink_add_group(&mut self, group: FinishedGroup) {
         self.add_group(group);
-    }
-    fn sink_set_attr(&mut self, name: &str, value: AttrValue) {
-        self.set_attr(name, value);
     }
 }
 
@@ -344,18 +385,14 @@ fn populate<S: GroupSink>(
     file: &Arc<File>,
     addr_map: &HashMap<u64, String>,
 ) -> Result<(), Error> {
-    // Attributes, in name order for a deterministic output. Refuse if any
-    // attribute on this group cannot be represented (and would be dropped).
-    let attrs = src.attrs()?;
+    // Attributes, copied verbatim where their bytes travel and re-encoded where
+    // they do not; refused rather than dropped if neither is possible.
     let owner = if path.is_empty() {
         "root group".to_string()
     } else {
         format!("group {path}")
     };
-    check_attr_completeness(&attrs, &src.attr_names()?, &owner)?;
-    for (name, value) in sorted(attrs) {
-        sink.sink_set_attr(&name, value);
-    }
+    copy_attrs(sink, src.attr_messages()?, || src.attrs(), &owner)?;
 
     // Datasets, sorted by name.
     let mut dataset_names = src.datasets()?;
@@ -456,11 +493,12 @@ fn emit_dataset(
     if is_vlen_string_datatype(&datatype) {
         emit_vlen_string_dataset(db, ds, path, &datatype, &dims, &layout, &pipeline)?;
         // VL-string datasets carry attributes the same way as any other.
-        let attrs = ds.attrs()?;
-        check_attr_completeness(&attrs, &ds.attr_names()?, &format!("dataset {path}"))?;
-        for (name, value) in sorted(attrs) {
-            db.set_attr(&name, value);
-        }
+        copy_attrs(
+            db,
+            ds.attr_messages()?,
+            || ds.attrs(),
+            &format!("dataset {path}"),
+        )?;
         return Ok(());
     }
 
@@ -471,11 +509,12 @@ fn emit_dataset(
     // path so a chunked one is refused (not copied with stale references).
     if is_nonstring_vlen(&datatype) {
         emit_vlen_sequence_dataset(db, ds, path, &datatype, &dims, &layout, &pipeline)?;
-        let attrs = ds.attrs()?;
-        check_attr_completeness(&attrs, &ds.attr_names()?, &format!("dataset {path}"))?;
-        for (name, value) in sorted(attrs) {
-            db.set_attr(&name, value);
-        }
+        copy_attrs(
+            db,
+            ds.attr_messages()?,
+            || ds.attrs(),
+            &format!("dataset {path}"),
+        )?;
         return Ok(());
     }
 
@@ -486,11 +525,12 @@ fn emit_dataset(
     // chunked one is refused (not copied with stale addresses).
     if is_object_reference(&datatype) {
         emit_object_reference_dataset(db, ds, path, &dims, &layout, file, drop, addr_map)?;
-        let attrs = ds.attrs()?;
-        check_attr_completeness(&attrs, &ds.attr_names()?, &format!("dataset {path}"))?;
-        for (name, value) in sorted(attrs) {
-            db.set_attr(&name, value);
-        }
+        copy_attrs(
+            db,
+            ds.attr_messages()?,
+            || ds.attrs(),
+            &format!("dataset {path}"),
+        )?;
         return Ok(());
     }
 
@@ -520,11 +560,12 @@ fn emit_dataset(
             drop,
             addr_map,
         )?;
-        let attrs = ds.attrs()?;
-        check_attr_completeness(&attrs, &ds.attr_names()?, &format!("dataset {path}"))?;
-        for (name, value) in sorted(attrs) {
-            db.set_attr(&name, value);
-        }
+        copy_attrs(
+            db,
+            ds.attr_messages()?,
+            || ds.attrs(),
+            &format!("dataset {path}"),
+        )?;
         return Ok(());
     }
 
@@ -582,11 +623,12 @@ fn emit_dataset(
 
             // Carry the dataset's attributes, refusing any that cannot be
             // represented.
-            let attrs = ds.attrs()?;
-            check_attr_completeness(&attrs, &ds.attr_names()?, &format!("dataset {path}"))?;
-            for (name, value) in sorted(attrs) {
-                db.set_attr(&name, value);
-            }
+            copy_attrs(
+                db,
+                ds.attr_messages()?,
+                || ds.attrs(),
+                &format!("dataset {path}"),
+            )?;
             return Ok(());
         }
 
@@ -620,11 +662,12 @@ fn emit_dataset(
     );
 
     // Carry the dataset's attributes, refusing if any cannot be represented.
-    let attrs = ds.attrs()?;
-    check_attr_completeness(&attrs, &ds.attr_names()?, &format!("dataset {path}"))?;
-    for (name, value) in sorted(attrs) {
-        db.set_attr(&name, value);
-    }
+    copy_attrs(
+        db,
+        ds.attr_messages()?,
+        || ds.attrs(),
+        &format!("dataset {path}"),
+    )?;
 
     Ok(())
 }
@@ -1027,17 +1070,107 @@ fn try_plan_dense_chunks(
     Ok(Some(DenseChunkPlan { meta, grid_order }))
 }
 
-/// Refuse the repack if `owner` has an attribute the reader cannot represent as
-/// an [`AttrValue`] and would therefore drop. `names` is every attribute on the
-/// object; `decoded` is the subset that read back, keyed by name. Any name not
-/// in `decoded` is an attribute that would be silently lost.
-fn check_attr_completeness(
-    decoded: &std::collections::HashMap<String, AttrValue>,
-    names: &[String],
+/// Whether an attribute's element bytes mean the same thing in another file.
+///
+/// An attribute message is otherwise self-contained — name, datatype, dataspace
+/// and data all travel together — so the only thing that stops a byte-for-byte
+/// copy is an element that stores a *location* rather than a value: a
+/// variable-length datum, whose bytes are a global-heap collection address plus
+/// an index, and a reference, whose bytes are an object-header address. Both
+/// point into the source file and would dangle in the destination.
+///
+/// Nested occurrences count: a compound with a variable-length member, or an
+/// array of references, embeds the same address inside each element.
+///
+/// Every class is named rather than defaulted through a `_` arm, so adding one to
+/// [`Datatype`] stops the build here and forces the question to be answered. A
+/// wrong answer in the permissive direction writes a dangling address into the
+/// copy and returns `Ok`, which is precisely the failure this function exists to
+/// prevent, so the compiler is the right place to catch a new class rather than
+/// a default that silently picks a side.
+fn attr_bytes_are_position_independent(dt: &Datatype) -> bool {
+    match dt {
+        Datatype::FixedPoint { .. }
+        | Datatype::FloatingPoint { .. }
+        | Datatype::Time { .. }
+        | Datatype::String { .. }
+        | Datatype::BitField { .. }
+        | Datatype::Opaque { .. } => true,
+        Datatype::Compound { members, .. } => members
+            .iter()
+            .all(|m| attr_bytes_are_position_independent(&m.datatype)),
+        Datatype::Enumeration { base_type, .. } | Datatype::Array { base_type, .. } => {
+            attr_bytes_are_position_independent(base_type)
+        }
+        Datatype::VariableLength { .. } | Datatype::Reference { .. } => false,
+    }
+}
+
+/// Copy every attribute of `owner` onto `sink`, in name order for a
+/// deterministic output.
+///
+/// An attribute whose bytes are position-independent is copied *verbatim*: the
+/// source's own datatype, dataspace and element bytes go straight into the
+/// destination message. That is what keeps a rewrite faithful, because
+/// [`AttrValue`] is a decoded view and cannot express an integer narrower than
+/// 64 bits, a variable-length string, a rank above one, or a string's padding —
+/// so anything routed through it comes out re-encoded as the widest variant of
+/// its class, flattened to rank 1 (issue #241).
+///
+/// The rest — variable-length data and references — hold source-file addresses,
+/// so their bytes cannot travel. Those fall back to `decode`, the decoded
+/// [`AttrValue`] map, which the writer re-encodes against a heap of the
+/// destination's own. An attribute that has no representation there either is
+/// refused rather than dropped.
+///
+/// A variable-length *string* takes a third path, because the two above each get
+/// half of it wrong: its element bytes address the source heap and cannot be
+/// copied, but its datatype and dataspace say "variable-length UTF-8" and
+/// "scalar", neither of which [`AttrValue`] can express — so a plain re-encode
+/// turns `str` into `bytes` for every consumer. Keeping the source's datatype and
+/// dataspace while restaging only the strings gets both halves. This is the
+/// common case in practice, not an exotic one: it is what `h5py` writes for
+/// every plain-string attribute.
+///
+/// `decode` is a closure so the decoding pass is paid for only when some
+/// attribute actually needs it, which for most objects is never.
+fn copy_attrs<S, F>(
+    sink: &mut S,
+    mut messages: Vec<AttributeMessage>,
+    decode: F,
     owner: &str,
-) -> Result<(), Error> {
-    for name in names {
-        if !decoded.contains_key(name) {
+) -> Result<(), Error>
+where
+    S: AttrSink + ?Sized,
+    F: FnOnce() -> Result<std::collections::HashMap<String, AttrValue>, Error>,
+{
+    messages.sort_by(|a, b| a.name.cmp(&b.name));
+    let any_needs_decoding = messages
+        .iter()
+        .any(|m| !attr_bytes_are_position_independent(&m.datatype));
+    let decoded = if any_needs_decoding {
+        decode()?
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    for message in messages {
+        if attr_bytes_are_position_independent(&message.datatype) {
+            sink.sink_set_attr_verbatim(message);
+        } else if let Some(value) = decoded.get(&message.name) {
+            // A variable-length datatype the decode resolved into strings is
+            // exactly the case that keeps its datatype and dataspace but restages
+            // its payload. Gating on what the decode *produced* rather than
+            // re-classifying the datatype here keeps the two from drifting apart.
+            match (&message.datatype, value.as_strings()) {
+                (Datatype::VariableLength { .. }, Some(strings)) => {
+                    let strings = strings.to_vec();
+                    sink.sink_set_attr_var_len_verbatim(message, strings);
+                }
+                _ => sink.sink_set_attr(&message.name, value.clone()),
+            }
+        } else {
+            let name = &message.name;
             return Err(Error::RepackUnsupported(format!(
                 "{owner}: attribute {name:?} has a datatype that cannot be repacked faithfully yet"
             )));
@@ -1506,15 +1639,6 @@ fn check_pipeline(pipeline: Option<&FilterPipeline>, path: &str) -> Result<(), E
     Ok(())
 }
 
-/// Sort a name→value attribute map into a deterministic, ordered list.
-fn sorted(attrs: std::collections::HashMap<String, AttrValue>) -> Vec<(String, AttrValue)> {
-    attrs
-        .into_iter()
-        .collect::<BTreeMap<_, _>>()
-        .into_iter()
-        .collect()
-}
-
 /// Canonicalize a path to slash-free form: split on `/`, drop empty components,
 /// rejoin. `"/a//b/"` and `"a/b"` both become `"a/b"`.
 fn normalize(path: &str) -> String {
@@ -1632,5 +1756,384 @@ mod tests {
         assert!(!is_dropped("g/older", &drop));
         assert!(!is_dropped("lonely", &drop));
         assert!(!is_dropped("other/old", &drop));
+    }
+}
+
+/// Repack must carry an attribute across *as it is encoded*, not as
+/// [`AttrValue`] renders it.
+///
+/// These sit at the library level rather than in `tests/` because the encoding
+/// is the thing under test and only [`Group::attr_messages`] exposes it; a
+/// public read decodes, and a decode is exactly what erases the difference
+/// (issue #241).
+#[cfg(test)]
+mod attribute_fidelity_tests {
+    use super::*;
+    use crate::dataspace::{Dataspace, DataspaceType};
+    use crate::datatype::{
+        CharacterSet, CompoundMember, DatatypeByteOrder, ReferenceType, StringPadding,
+    };
+    use crate::{File, FileBuilder, RepackOptions};
+    use std::collections::BTreeMap;
+
+    fn i32_type() -> Datatype {
+        Datatype::FixedPoint {
+            size: 4,
+            byte_order: DatatypeByteOrder::LittleEndian,
+            signed: true,
+            bit_offset: 0,
+            bit_precision: 32,
+        }
+    }
+
+    /// Attribute messages keyed by name, for an object reached by `path`
+    /// (`""` for the root group).
+    fn messages_at(path: &str, file: &Path) -> BTreeMap<String, AttributeMessage> {
+        let f = File::open(file).unwrap();
+        let messages = if path.is_empty() {
+            f.root().attr_messages().unwrap()
+        } else if let Ok(ds) = f.dataset(path) {
+            ds.attr_messages().unwrap()
+        } else {
+            f.group(path).unwrap().attr_messages().unwrap()
+        };
+        messages.into_iter().map(|m| (m.name.clone(), m)).collect()
+    }
+
+    /// The core claim, stated as an identity rather than as a list of properties:
+    /// every attribute whose bytes are position-independent comes out of a repack
+    /// as the very message that went in.
+    ///
+    /// Asserting the whole message covers width, charset, string padding,
+    /// dataspace kind and rank, and the element bytes together — including the
+    /// ones no accessor on this crate would notice, since a decode normalizes a
+    /// narrow integer to `i64` on *both* sides of the comparison and so cannot
+    /// see the widening at all. It also covers all three kinds of owner, because
+    /// the root group, a subgroup and a dataset each reach the writer by a
+    /// different path.
+    #[test]
+    fn a_position_independent_attribute_crosses_a_repack_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, dst) = (dir.path().join("src.h5"), dir.path().join("dst.h5"));
+
+        let attrs = || {
+            [
+                // The width cases: `AttrValue` has no narrow *array* variants and
+                // no narrow scalars past 32 bits, so each of these is a decode
+                // that would widen.
+                ("i32", AttrValue::I32(-7)),
+                ("u32", AttrValue::U32(4_294_967_295)),
+                // Charset and padding: an ASCII string and a UTF-8 one differ only
+                // in the datatype's charset bit.
+                ("ascii", AttrValue::AsciiString("m/s".into())),
+                ("utf8", AttrValue::String("µm".into())),
+                // A scalar and a one-element array are different dataspaces.
+                ("one_elem", AttrValue::I64Array(vec![9])),
+                ("scalar", AttrValue::I64(9)),
+                ("f64s", AttrValue::F64Array(vec![1.5, -2.5])),
+            ]
+        };
+
+        let mut b = FileBuilder::new();
+        for (name, value) in attrs() {
+            b.set_attr(name, value);
+        }
+        let ds = b.create_dataset("data").with_f64_data(&[1.0, 2.0]);
+        for (name, value) in attrs() {
+            ds.set_attr(name, value);
+        }
+        let mut g = b.create_group("grp");
+        for (name, value) in attrs() {
+            g.set_attr(name, value);
+        }
+        g.create_dataset("inner").with_i32_data(&[1]);
+        b.add_group(g.finish());
+        b.write(&src).unwrap();
+
+        repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+        for owner in ["", "data", "grp"] {
+            let before = messages_at(owner, &src);
+            let after = messages_at(owner, &dst);
+            assert_eq!(
+                before.keys().collect::<Vec<_>>(),
+                after.keys().collect::<Vec<_>>(),
+                "repack changed which attributes {owner:?} has"
+            );
+            for (name, source_message) in &before {
+                assert_eq!(
+                    after.get(name),
+                    Some(source_message),
+                    "attribute {name:?} on {owner:?} was re-encoded rather than copied"
+                );
+            }
+        }
+    }
+
+    /// The two rows of issue #241's table that the reference C library's own API
+    /// cannot express, so no crosscheck can state them: a fixed-width string's
+    /// *padding*, and a Null dataspace.
+    ///
+    /// The source here is built through the same verbatim seam the fix
+    /// introduced, which is the only way this crate can write these encodings —
+    /// but the file is written, closed and re-read, so what is compared is what
+    /// two independent parses of two real files made of them, not a struct
+    /// handed back to itself.
+    #[test]
+    fn an_encoding_this_crate_has_no_attr_value_for_still_crosses_a_repack() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, dst) = (dir.path().join("src.h5"), dir.path().join("dst.h5"));
+
+        let exotic = [
+            // Declared width 16 for three bytes of content, null-*terminated* —
+            // the writer's own fixed-width path hardcodes null-padding, so a
+            // rebuild from a value changes both.
+            AttributeMessage {
+                name: "units".into(),
+                datatype: Datatype::String {
+                    size: 16,
+                    padding: StringPadding::NullTerminate,
+                    charset: CharacterSet::Ascii,
+                },
+                dataspace: Dataspace {
+                    space_type: DataspaceType::Scalar,
+                    rank: 0,
+                    dimensions: vec![],
+                    max_dimensions: None,
+                },
+                raw_data: {
+                    let mut v = b"m/s".to_vec();
+                    v.resize(16, 0);
+                    v
+                },
+            },
+            // Space-padded, to prove the padding field is carried rather than
+            // normalized to whichever value happens to be first.
+            AttributeMessage {
+                name: "spaced".into(),
+                datatype: Datatype::String {
+                    size: 8,
+                    padding: StringPadding::SpacePad,
+                    charset: CharacterSet::Utf8,
+                },
+                dataspace: Dataspace {
+                    space_type: DataspaceType::Scalar,
+                    rank: 0,
+                    dimensions: vec![],
+                    max_dimensions: None,
+                },
+                raw_data: b"ab      ".to_vec(),
+            },
+            // A Null dataspace holds no elements at all, which is distinct from a
+            // rank-1 dataspace of length zero — the shape a decode gives it.
+            AttributeMessage {
+                name: "nothing".into(),
+                datatype: i32_type(),
+                dataspace: Dataspace {
+                    space_type: DataspaceType::Null,
+                    rank: 0,
+                    dimensions: vec![],
+                    max_dimensions: None,
+                },
+                raw_data: vec![],
+            },
+            // Rank 2, which every `AttrValue` array variant flattens.
+            AttributeMessage {
+                name: "grid".into(),
+                datatype: i32_type(),
+                dataspace: Dataspace {
+                    space_type: DataspaceType::Simple,
+                    rank: 2,
+                    dimensions: vec![2, 3],
+                    max_dimensions: None,
+                },
+                raw_data: (1i32..=6).flat_map(i32::to_le_bytes).collect(),
+            },
+        ];
+
+        let mut b = FileBuilder::new();
+        for message in &exotic {
+            b.set_attr_verbatim(message.clone());
+        }
+        let ds = b.create_dataset("data").with_f64_data(&[1.0]);
+        for message in &exotic {
+            ds.set_attr_verbatim(message.clone());
+        }
+        b.write(&src).unwrap();
+
+        repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+        for owner in ["", "data"] {
+            let before = messages_at(owner, &src);
+            let after = messages_at(owner, &dst);
+            for message in &exotic {
+                let name = &message.name;
+                // The source file must really hold what was asked for, or the
+                // comparison below would only prove repack is self-consistent.
+                assert_eq!(
+                    before.get(name),
+                    Some(message),
+                    "the source file did not record {name:?} as written"
+                );
+                assert_eq!(
+                    after.get(name),
+                    Some(message),
+                    "attribute {name:?} on {owner:?} changed across the repack"
+                );
+            }
+        }
+        c_library_reads_every_attribute(&dst, exotic.len());
+    }
+
+    /// The repacked file, read by the reference C library rather than by the
+    /// reader that wrote it.
+    ///
+    /// Without this the test above proves only that this crate agrees with
+    /// itself, which a message it encodes wrongly and parses back just as wrongly
+    /// would satisfy. These encodings reach the file through an internal seam
+    /// with no public spelling, so nothing else in the suite would catch that.
+    #[cfg(not(target_pointer_width = "32"))]
+    fn c_library_reads_every_attribute(file: &Path, expected: usize) {
+        let c = hdf5::File::open(file).expect("the C library must open the repacked file");
+        for names in [
+            c.attr_names().expect("root attribute names"),
+            c.dataset("data")
+                .expect("dataset")
+                .attr_names()
+                .expect("dataset attribute names"),
+        ] {
+            assert_eq!(
+                names.len(),
+                expected,
+                "the C library found {names:?}, not all {expected} attributes"
+            );
+            for name in names {
+                // Opening reads the datatype and dataspace, which is where a
+                // malformed one is caught.
+                c.attr(&name)
+                    .unwrap_or_else(|e| panic!("the C library could not open {name:?}: {e}"));
+            }
+        }
+    }
+
+    /// The C library is a 64-bit-only dev-dependency, so the check compiles out
+    /// on 32-bit and the pure-Rust half of the test still runs there.
+    #[cfg(target_pointer_width = "32")]
+    fn c_library_reads_every_attribute(_file: &Path, _expected: usize) {}
+
+    /// The other half of the rule: an attribute whose bytes are a *location* must
+    /// not be copied, because the location is in the source file.
+    ///
+    /// A variable-length string attribute stores a global-heap collection address,
+    /// so the repacked message is required to differ in exactly that way — same
+    /// datatype and dataspace, different raw bytes — while the value it resolves
+    /// to stays put. Asserting the raw bytes moved is what distinguishes a correct
+    /// re-encode from a verbatim copy that happens to still resolve because the
+    /// destination heap landed at the same address.
+    #[test]
+    fn an_attribute_addressing_the_heap_is_re_encoded_not_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let (src, dst) = (dir.path().join("src.h5"), dir.path().join("dst.h5"));
+        let fields: Vec<String> = vec!["x".into(), "y".into(), "velocity".into()];
+
+        let mut b = FileBuilder::new();
+        // Bulk that only the source carries, so the destination's heap cannot
+        // land at the source's address by coincidence.
+        b.create_dataset("bulk").with_f64_data(&vec![0.0; 4096]);
+        b.set_attr("fields", AttrValue::VarLenAsciiArray(fields.clone()));
+        b.write(&src).unwrap();
+
+        repack(&src, &dst, &RepackOptions::new().drop_path("bulk")).unwrap();
+
+        let before = &messages_at("", &src)["fields"];
+        let after = &messages_at("", &dst)["fields"];
+        assert_eq!(
+            after.datatype, before.datatype,
+            "the attribute must stay variable-length"
+        );
+        assert_eq!(after.dataspace, before.dataspace);
+        assert_ne!(
+            after.raw_data, before.raw_data,
+            "a heap reference copied verbatim would point into the source file"
+        );
+        assert_eq!(
+            File::open(&dst).unwrap().root().attrs().unwrap()["fields"],
+            AttrValue::VarLenAsciiArray(fields),
+            "and it must still resolve to its own strings"
+        );
+    }
+
+    /// A datatype that merely *contains* a heap reference or an address is
+    /// position-dependent too — the address sits inside each element rather than
+    /// being the whole of it, and copying the element copies the address.
+    #[test]
+    fn a_nested_address_makes_the_whole_datatype_position_dependent() {
+        let vlen = Datatype::VariableLength {
+            is_string: true,
+            padding: None,
+            charset: Some(CharacterSet::Ascii),
+            base_type: Box::new(i32_type()),
+        };
+        let reference = Datatype::Reference {
+            size: 8,
+            ref_type: ReferenceType::Object,
+        };
+        let compound_of = |member: Datatype| Datatype::Compound {
+            size: 24,
+            members: vec![
+                CompoundMember {
+                    name: "plain".into(),
+                    byte_offset: 0,
+                    datatype: i32_type(),
+                },
+                CompoundMember {
+                    name: "nested".into(),
+                    byte_offset: 8,
+                    datatype: member,
+                },
+            ],
+        };
+        let array_of = |base: Datatype| Datatype::Array {
+            base_type: Box::new(base),
+            dimensions: vec![2, 3],
+        };
+
+        for dependent in [
+            vlen.clone(),
+            reference.clone(),
+            compound_of(vlen.clone()),
+            compound_of(reference.clone()),
+            array_of(vlen.clone()),
+            array_of(reference.clone()),
+            // Two levels down, which a non-recursive check would let through.
+            array_of(compound_of(vlen)),
+            compound_of(array_of(reference)),
+        ] {
+            assert!(
+                !attr_bytes_are_position_independent(&dependent),
+                "{dependent:?} holds an address and must not be copied verbatim"
+            );
+        }
+
+        for independent in [
+            i32_type(),
+            Datatype::String {
+                size: 8,
+                padding: crate::datatype::StringPadding::NullPad,
+                charset: CharacterSet::Utf8,
+            },
+            compound_of(i32_type()),
+            array_of(i32_type()),
+            Datatype::Enumeration {
+                size: 4,
+                base_type: Box::new(i32_type()),
+                members: vec![],
+            },
+        ] {
+            assert!(
+                attr_bytes_are_position_independent(&independent),
+                "{independent:?} holds no address and can be copied verbatim"
+            );
+        }
     }
 }

@@ -19,7 +19,11 @@ use crate::shared_message;
 use crate::source::Source;
 
 /// A parsed HDF5 attribute message.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` compares every field, which is what makes "this attribute crossed
+/// a rewrite unchanged" a single assertion — the shape repack's fidelity tests
+/// take.
+#[derive(Debug, Clone, PartialEq)]
 pub struct AttributeMessage {
     /// Attribute name.
     pub name: String,

@@ -37,7 +37,7 @@ use crate::message_type::MessageType;
 use crate::object_header_writer::ObjectHeaderWriter;
 use crate::superblock::Superblock;
 use crate::type_builders::{
-    DatasetBuilder, FinishedGroup, GroupBuilder, VlStringStaging, build_attr_message,
+    AttrSpec, DatasetBuilder, FinishedGroup, GroupBuilder, VlStringStaging,
     build_global_heap_collections, patch_vl_refs, patch_vl_refs_masked, write_reference_address,
 };
 
@@ -748,7 +748,7 @@ pub(crate) fn write_undef_offset(buf: &mut Vec<u8>, offset_size: u8) {
 /// The main file creation API.
 pub struct FileWriter {
     root_datasets: Vec<DatasetBuilder>,
-    root_attrs: Vec<(String, AttrValue)>,
+    root_attrs: Vec<(String, AttrSpec)>,
     groups: Vec<FinishedGroup>,
     userblock_size: u64,
     /// Bytes to emit at the head of the userblock region, from
@@ -985,7 +985,33 @@ impl FileWriter {
     }
 
     pub fn set_root_attr(&mut self, name: &str, value: AttrValue) {
-        self.root_attrs.push((name.to_string(), value));
+        self.root_attrs
+            .push((name.to_string(), AttrSpec::Value(value)));
+    }
+
+    /// Attach an already-encoded attribute message to the root group, written
+    /// exactly as given.
+    ///
+    /// See [`AttrSpec::Verbatim`] for what this preserves that `set_root_attr`
+    /// cannot, and for the datatypes it must not be used with.
+    pub(crate) fn set_root_attr_verbatim(&mut self, message: crate::attribute::AttributeMessage) {
+        self.root_attrs
+            .push((message.name.clone(), AttrSpec::Verbatim(message)));
+    }
+
+    /// Attach a variable-length string attribute to the root group with the given
+    /// datatype and dataspace, staging `strings` into a heap of this file's own.
+    /// See [`AttrSpec::VerbatimVarLen`].
+    pub(crate) fn set_root_attr_var_len_verbatim(
+        &mut self,
+        mut message: crate::attribute::AttributeMessage,
+        strings: Vec<String>,
+    ) {
+        message.raw_data = crate::type_builders::vl_string_reference_bytes(&strings);
+        self.root_attrs.push((
+            message.name.clone(),
+            AttrSpec::VerbatimVarLen { message, strings },
+        ));
     }
 
     pub fn finish(self) -> Result<Vec<u8>, FormatError> {
@@ -1419,7 +1445,7 @@ impl FileWriter {
             let patches = collect_vl_patches(&db.attrs);
             let mut attrs = Vec::new();
             for (n, v) in &db.attrs {
-                attrs.push(build_attr_message(n, v));
+                attrs.push(v.to_message(n));
             }
             #[cfg(feature = "provenance")]
             if let Some(ref prov) = db.provenance {
@@ -1470,7 +1496,7 @@ impl FileWriter {
             let patches = collect_vl_patches(&g.attrs);
             let mut gattrs = Vec::new();
             for (n, v) in &g.attrs {
-                gattrs.push(build_attr_message(n, v));
+                gattrs.push(v.to_message(n));
             }
             let mut ds_idx = Vec::new();
             for db in g.datasets {
@@ -1532,10 +1558,10 @@ impl FileWriter {
                 .collect()
         }
 
-        fn collect_vl_patches(attrs_raw: &[(String, AttrValue)]) -> Vec<VlPatch> {
+        fn collect_vl_patches(attrs_raw: &[(String, AttrSpec)]) -> Vec<VlPatch> {
             let mut patches = Vec::new();
             for (i, (_n, v)) in attrs_raw.iter().enumerate() {
-                if let AttrValue::VarLenAsciiArray(strings) = v {
+                if let Some(strings) = v.var_len_strings() {
                     let str_refs: Vec<&str> = strings.iter().map(|s| s.as_str()).collect();
                     patches.push(VlPatch {
                         collections: build_global_heap_collections(&str_refs),
@@ -1550,7 +1576,7 @@ impl FileWriter {
 
         let mut root_attrs: Vec<AttributeMessage> = Vec::new();
         for (n, v) in &self.root_attrs {
-            root_attrs.push(build_attr_message(n, v));
+            root_attrs.push(v.to_message(n));
         }
 
         let root_dense = needs_dense_attrs(&root_attrs);
@@ -2831,6 +2857,7 @@ mod tests {
     use crate::link_info::LinkInfoMessage;
     use crate::object_header::ObjectHeader;
     use crate::signature;
+    use crate::type_builders::build_attr_message;
 
     fn parse_file(bytes: &[u8]) -> (Superblock, ObjectHeader) {
         let sig = signature::find_signature(bytes).unwrap();
