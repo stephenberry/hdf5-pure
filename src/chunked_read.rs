@@ -4,10 +4,13 @@
 extern crate alloc;
 
 #[cfg(not(feature = "std"))]
-use alloc::{format, vec, vec::Vec};
+use alloc::{borrow::Cow, format, vec, vec::Vec};
+#[cfg(feature = "std")]
+use std::borrow::Cow;
 
 use crate::btree_v1::btree_v1_node_header_size;
 use crate::chunk_cache::ChunkCache;
+use crate::chunk_span::ChunkSpanReader;
 use crate::convert::{TryToUsize, slice_range, u32_from};
 use crate::data_layout::DataLayout;
 use crate::dataspace::Dataspace;
@@ -850,6 +853,50 @@ pub fn read_chunked_data_from_source<S: Source + ?Sized>(
     ))
 }
 
+/// Put a dataset's chunks in address order, which is the order a coalescing
+/// reader has to be asked for them in (see [`crate::chunk_span`]).
+///
+/// Neither source of a chunk list supplies it: walking the index yields index
+/// order, and a cached index yields no order at all. A reader holds one span,
+/// so a walk that alternates between two of them re-reads a whole span at every
+/// alternation — the read stays correct and the read *volume* multiplies. The
+/// sort is free to do here because every chunk of a read scatters into a
+/// disjoint part of the output, so their order was never load-bearing.
+fn sort_chunks_by_address(chunks: &mut [ChunkInfo]) {
+    chunks.sort_unstable_by_key(|c| c.address);
+}
+
+/// Plan coalesced reads over the chunks a read will actually fetch, or `None`
+/// when the layout has nothing to coalesce.
+///
+/// `wanted` picks the chunks the caller will visit — all of them for a whole
+/// read, the overlapping ones for a row window. Chunks the cache already holds
+/// are dropped on top of that: the caller skips them, so a span covering one
+/// would fetch bytes this read has no use for, which is the guarantee
+/// [`ChunkSpanReader`] is built around.
+///
+/// Planning over a chunk the read then skips anyway is only a missed
+/// opportunity, never a wrong answer, so `wanted` may be approximate where the
+/// caller's own test is fallible.
+fn plan_chunk_spans(
+    chunks: &[ChunkInfo],
+    rank: usize,
+    cache: &ChunkCache,
+    wanted: impl Fn(&ChunkInfo) -> bool,
+) -> Option<ChunkSpanReader> {
+    let cached = cache.decompressed_coords();
+    ChunkSpanReader::new(
+        chunks
+            .iter()
+            .filter(|c| wanted(c))
+            .filter(|c| {
+                let coord = &c.offsets[..rank.min(c.offsets.len())];
+                !cached.iter().any(|held| held.as_slice() == coord)
+            })
+            .map(|c| (c.address, c.chunk_size)),
+    )
+}
+
 /// Read the raw element bytes of the row window `[row_start, row_start + num_rows)`
 /// — a range along the leading dimension — decoding only the chunks it overlaps.
 ///
@@ -960,7 +1007,7 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
     };
 
     // Walk the index once, then reuse it for later windows on this handle.
-    let chunks = if let Some(chunks) = cache.all_indexed_chunks() {
+    let mut chunks = if let Some(chunks) = cache.all_indexed_chunks() {
         chunks
     } else {
         let chunks = collect_chunks_for_layout_from_source(
@@ -979,6 +1026,7 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
         cache.populate_index(&chunks, rank);
         chunks
     };
+    sort_chunks_by_address(&mut chunks);
 
     let chunk_dims_u64: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
     let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype);
@@ -986,6 +1034,25 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
     let row_lo = row_start.to_usize()?;
     let row_hi = row_lo.saturating_add(out_rows); // exclusive; caller clamped to the dataset
     let cd0 = chunk_dims[0];
+
+    // A chunk contributes to the window when its rows meet `[row_lo, row_hi)`.
+    // The span plan and the walk below have to agree on which chunks those are,
+    // so the test is written once.
+    let overlaps = |c0: usize| c0 < row_hi && c0.saturating_add(cd0) > row_lo;
+
+    // Coalesce over the window's own chunks. A plan built over the dataset's
+    // whole chunk list would put the rows on either side of the window inside a
+    // span and read them for nothing — an eight-row window measured 32 KB where
+    // it needed 64 bytes.
+    let mut spans = plan_chunk_spans(&chunks, rank, cache, |chunk| {
+        chunk
+            .offsets
+            .first()
+            .copied()
+            .unwrap_or(0)
+            .to_usize()
+            .is_ok_and(&overlaps)
+    });
 
     for chunk in &chunks {
         let c0 = chunk.offsets.first().copied().unwrap_or(0).to_usize()?;
@@ -997,7 +1064,7 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
         // `band` need no guard — both are bounded by the already-checked
         // `total_bytes` allocation.
         let c_end = c0.saturating_add(cd0);
-        if c0 >= row_hi || c_end <= row_lo {
+        if !overlaps(c0) {
             continue; // no overlap with the window
         }
 
@@ -1056,16 +1123,20 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
             continue;
         }
 
-        let raw = source.read_exact_at(chunk.address, chunk.chunk_size as usize)?;
+        let len = chunk.chunk_size as usize;
+        let stored = match spans.as_mut() {
+            Some(sp) => Cow::Borrowed(sp.chunk_bytes(source, chunk.address, len)?),
+            None => Cow::Owned(source.read_exact_at(chunk.address, len)?),
+        };
         match pipeline {
             Some(pl) => {
-                let dec = decompress_chunk(&raw, pl, ctx, chunk.filter_mask)?;
+                let dec = decompress_chunk(&stored, pl, ctx, chunk.filter_mask)?;
                 copy(&mut output, &dec);
                 cache.put_decompressed(coord, dec);
             }
             None => {
-                copy(&mut output, &raw);
-                cache.put_decompressed_slice(coord, &raw);
+                copy(&mut output, &stored);
+                cache.put_decompressed_slice(coord, &stored);
             }
         }
     }
@@ -1162,7 +1233,7 @@ pub fn read_chunked_data_cached_from_source<S: Source + ?Sized>(
     let (rank, chunk_dims, ds_dims) = chunked_dims(chunk_dimensions, dataspace)?;
     ensure_chunk_bytes_representable(&chunk_dims, elem_size)?;
 
-    let chunks = if let Some(chunks) = cache.all_indexed_chunks() {
+    let mut chunks = if let Some(chunks) = cache.all_indexed_chunks() {
         chunks
     } else {
         let chunks = collect_chunks_for_layout_from_source(
@@ -1181,6 +1252,7 @@ pub fn read_chunked_data_cached_from_source<S: Source + ?Sized>(
         cache.populate_index(&chunks, rank);
         chunks
     };
+    sort_chunks_by_address(&mut chunks);
 
     let total_elements = dataspace.num_elements().to_usize()?;
     let total_bytes = total_elements
@@ -1203,6 +1275,10 @@ pub fn read_chunked_data_cached_from_source<S: Source + ?Sized>(
 
     let chunk_dims_u64: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
     let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype);
+
+    // Every chunk of the dataset is wanted here; what the plan leaves out is
+    // whatever the chunk cache already holds from an earlier read.
+    let mut spans = plan_chunk_spans(&chunks, rank, cache, |_| true);
 
     for chunk_info in &chunks {
         let coord: Vec<u64> = chunk_info.offsets.iter().take(rank).copied().collect();
@@ -1231,13 +1307,17 @@ pub fn read_chunked_data_cached_from_source<S: Source + ?Sized>(
             continue;
         }
 
-        // Cache miss: fetch the chunk's bytes from the source (already owned).
-        let raw_chunk =
-            source.read_exact_at(chunk_info.address, chunk_info.chunk_size.to_usize()?)?;
-        let dec = if let Some(pl) = pipeline {
-            decompress_chunk(&raw_chunk, pl, ctx, chunk_info.filter_mask)?
-        } else {
-            raw_chunk
+        // Cache miss: fetch the chunk's stored bytes from the source.
+        let len = chunk_info.chunk_size.to_usize()?;
+        let stored = match spans.as_mut() {
+            Some(sp) => Cow::Borrowed(sp.chunk_bytes(source, chunk_info.address, len)?),
+            None => Cow::Owned(source.read_exact_at(chunk_info.address, len)?),
+        };
+        let dec = match pipeline {
+            Some(pl) => Cow::Owned(decompress_chunk(&stored, pl, ctx, chunk_info.filter_mask)?),
+            // Unfiltered: a chunk's stored bytes are its data, so they are
+            // copied out of the span only if the cache admits them.
+            None => stored,
         };
         place_chunk(
             &dec,
@@ -1250,7 +1330,11 @@ pub fn read_chunked_data_cached_from_source<S: Source + ?Sized>(
             elem_size,
             rank,
         );
-        cache.put_decompressed(coord, dec); // move; dropped if not admitted
+        // Dropped either way if the cache does not admit it.
+        match dec {
+            Cow::Owned(bytes) => cache.put_decompressed(coord, bytes), // move
+            Cow::Borrowed(bytes) => cache.put_decompressed_slice(coord, bytes),
+        }
     }
 
     Ok(output)

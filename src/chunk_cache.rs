@@ -365,6 +365,24 @@ impl ChunkCache {
         });
     }
 
+    /// The coordinates of every chunk whose decompressed bytes this cache
+    /// currently holds, in no particular order.
+    ///
+    /// A reader planning coalesced reads (see [`crate::chunk_span`]) uses this
+    /// to leave the chunks it already has out of the plan: a span covering a
+    /// chunk the read will skip fetches those bytes for nothing. It answers in
+    /// one lock over at most [`ChunkCacheConfig::max_slots`] entries, where
+    /// probing per chunk would take a lock apiece.
+    ///
+    /// The answer is a snapshot. A chunk named here can be evicted before the
+    /// read reaches it — by this very read, admitting later chunks — which
+    /// costs the coalescing for that chunk and nothing else: a chunk in no span
+    /// is read directly.
+    pub fn decompressed_coords(&self) -> Vec<ChunkCoord> {
+        let inner = self.inner.lock().unwrap();
+        inner.slots.iter().map(|s| s.coord.clone()).collect()
+    }
+
     /// Insert a copy of `data` into the LRU cache, but only if it would actually
     /// be admitted. This lets the unfiltered read path scatter directly from the
     /// file buffer and copy into the cache only when caching is enabled and the

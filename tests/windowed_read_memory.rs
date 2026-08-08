@@ -177,3 +177,62 @@ fn vlen_string_window_read_is_memory_bounded() {
         .collect();
     assert_eq!(window, expected);
 }
+
+/// A dataset whose chunks lie end to end for its whole length is what the
+/// coalescing reader (`src/chunk_span.rs`) exists for, and the worst case for
+/// its memory bound: a coalescer with no budget would merge all 2,048 chunks
+/// into a single 8 MiB span and hold the dataset a second time to serve them.
+/// The 256 KiB budget is what keeps the span a constant beside the read rather
+/// than a second copy of it.
+///
+/// The read here is [`Dataset::read_raw`] rather than a typed one on purpose:
+/// a typed read allocates its own copy of the dataset, and a term that large
+/// hides the one being measured.
+#[test]
+fn whole_read_of_an_all_adjacent_chunk_layout_is_memory_bounded() {
+    let _guard = LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    // 8 MiB of f64 in 4 KiB chunks: 2,048 of them, unfiltered so a chunk's
+    // stored bytes are its data and a span holds no less than the file does.
+    const N0: usize = 1024 * 1024;
+    const DATASET_BYTES: usize = N0 * 8;
+
+    let data: Vec<f64> = (0..N0).map(|i| i as f64).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.h5");
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("t")
+        .with_f64_data(&data)
+        .with_shape(&[N0 as u64])
+        .with_chunks(&[512]);
+    builder.write(&path).unwrap();
+    drop(data);
+
+    let file = File::open_streaming(&path).unwrap();
+    let ds = file.dataset("t").unwrap();
+
+    let base = LIVE.load(Ordering::Relaxed);
+    PEAK.store(base, Ordering::Relaxed);
+
+    let all = ds.read_raw().unwrap();
+
+    let peak = PEAK.load(Ordering::Relaxed) - base;
+    eprintln!("peak allocation during the whole read: {peak} bytes (dataset: {DATASET_BYTES})");
+
+    // The read's own output is the dataset, and the parsed chunk index is most
+    // of what is left; an unbudgeted span would add the dataset again.
+    assert!(
+        peak < DATASET_BYTES + DATASET_BYTES / 2,
+        "peak allocation during the whole read must not grow with the run of \
+         adjacent chunks; measured {peak} bytes against a {DATASET_BYTES}-byte dataset"
+    );
+
+    assert_eq!(all.len(), DATASET_BYTES);
+    assert_eq!(
+        &all[DATASET_BYTES - 8..],
+        &((N0 - 1) as f64).to_le_bytes()[..]
+    );
+}
