@@ -134,9 +134,13 @@ The variant may become **more specific** in a future release as `AttrValue` grow
 
 ### Reading an attribute's datatype
 
-`attr_datatypes()` reports the exact on-disk [`Datatype`](../reference/data-types.md#the-datatype-model) of every attribute, keyed by name. It is the type channel to `attrs()`'s value channel, the pair a dataset already has in `datatype()` and its `read_*` methods, and it is where everything in the list above can still be read.
+`attr_datatypes()` reports the on-disk [`Datatype`](../reference/data-types.md#the-datatype-model) of every attribute, keyed by name. It is the type channel to `attrs()`'s value channel, the pair a dataset already has in `datatype()` and its `read_*` methods, and it is where the *datatype* entries in the list above — width, padding and declared width, enumeration member names — can still be read.
+
+**Rank is not among them.** An attribute's rank lives in its dataspace, which nothing public exposes, so a rank-2 attribute reads as a flat array from `attrs()` with no way to recover its shape from either channel.
 
 It reports **every** attribute message, including the ones `attrs()` omits because no `AttrValue` can carry them, so a name missing from that map can be told from one the object does not have.
+
+One datatype is not reported faithfully: a **committed** (shared) type, created with `H5Tcommit`, is stored on the attribute as a reference to a shared message rather than as the type itself, and both this and `Dataset::datatype()` decode that reference as though it were an inline datatype. netCDF-4 user-defined types and h5py's `f["t"] = np.dtype(...)` reach a file this way.
 
 A boolean attribute needs both channels. The C library gives `H5T_NATIVE_HBOOL` — what h5py writes for every `np.bool_` — an `enum[FALSE, TRUE]` over an 8-bit base, so the value arrives as `0` or `1`, indistinguishable from an `i8`, and only the datatype records which it was:
 

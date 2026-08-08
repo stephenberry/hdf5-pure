@@ -77,7 +77,7 @@ Two accessors describe an existing dataset's type:
 
 `AttrValue` is the write-side attribute enum. Reading attributes yields the same enum (a `HashMap<String, AttrValue>` from `attrs()`), though the reader normalizes integer encodings: signed integers come back as `I64` / `I64Array` and unsigned integers as `U64` / `U64Array`, regardless of the stored width. An enumeration attribute decodes through its integer base type, the same view the numeric readers take of an enum dataset, so its codes arrive and its member names do not — this is how an h5py `np.bool_` attribute, stored as `enum[FALSE, TRUE]`, reads back as `0` or `1`. `repack` does not go through `AttrValue`, so an attribute keeps whatever encoding it had when copied.
 
-`attr_datatypes()` reports what this normalization drops: the exact [`Datatype`](#the-datatype-model) of every attribute, including the ones `attrs()` omits for having no `AttrValue` at all. It is the attribute equivalent of `Dataset::datatype()`, and it is what identifies a `np.bool_` attribute as boolean rather than as an ordinary one-byte integer.
+`attr_datatypes()` reports what this normalization drops: the [`Datatype`](#the-datatype-model) of every attribute, including the ones `attrs()` omits for having no `AttrValue` at all. It is the attribute equivalent of `Dataset::datatype()`, and it is what identifies a `np.bool_` attribute as boolean rather than as an ordinary one-byte integer. Like `Dataset::datatype()` it does not resolve a committed (shared) datatype, and neither channel exposes an attribute's rank; see the [groups and attributes guide](../guide/groups-attributes.md#reading-an-attributes-datatype).
 
 | Variant | HDF5 encoding |
 |---|---|

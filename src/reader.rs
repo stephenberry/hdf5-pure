@@ -2440,12 +2440,21 @@ impl Group {
     /// This is the type channel to [`attrs`](Self::attrs)'s value channel, the
     /// pair a dataset already has in [`Dataset::datatype`] and its `read_*`
     /// methods. An [`AttrValue`] is a deliberately lossy view of the value, so an
-    /// attribute's width, rank and enumeration members are recoverable only from
-    /// here.
+    /// attribute's stored width, string padding and enumeration members are
+    /// recoverable only from here. Its *rank* is not: that lives in the
+    /// dataspace, which nothing public exposes, so a rank-2 attribute still
+    /// reads as a flat `AttrValue` array with no way to recover its shape.
     ///
     /// **Every attribute message is reported, including the ones `attrs` omits**
     /// because no `AttrValue` can carry them, so a name missing from that map can
     /// be told from one the object does not have.
+    ///
+    /// **A committed datatype is not resolved.** An attribute whose type was
+    /// created with `H5Tcommit` — what netCDF-4 writes for a user-defined type,
+    /// and what h5py writes for `f["t"] = np.dtype(...)` — stores a reference to
+    /// a shared message rather than the type itself. This reports that reference
+    /// decoded as though it were an inline datatype, which is not the attribute's
+    /// type. [`Dataset::datatype`] has the same gap.
     ///
     /// A boolean attribute is the case that needs both channels. The C library
     /// gives `H5T_NATIVE_HBOOL` — what h5py writes for every `np.bool_` — a
@@ -4485,6 +4494,13 @@ mod tests {
         datatypes: HashMap<String, Datatype>,
     }
 
+    /// One written file: its bytes, and both channels read back from each owner.
+    struct AttrFile {
+        /// The file as written, so a test can assert which storage form it got.
+        bytes: Vec<u8>,
+        owners: Vec<AttrChannels>,
+    }
+
     /// Put the same attributes on the root group and on a dataset, write the
     /// file, and read both channels back from each owner.
     ///
@@ -4494,7 +4510,7 @@ mod tests {
     fn attr_channels(
         values: &[(&str, AttrValue)],
         verbatim: &[crate::attribute::AttributeMessage],
-    ) -> Vec<AttrChannels> {
+    ) -> AttrFile {
         let mut b = FileBuilder::new();
         for (name, value) in values {
             b.set_attr(name, value.clone());
@@ -4511,21 +4527,25 @@ mod tests {
                 ds.set_attr_verbatim(message.clone());
             }
         }
-        let file = File::from_bytes(b.finish().unwrap()).unwrap();
+        let bytes = b.finish().unwrap();
+        let file = File::from_bytes(bytes.clone()).unwrap();
         let root = file.root();
         let dataset = file.dataset("data").unwrap();
-        vec![
-            AttrChannels {
-                owner: "root group",
-                values: root.attrs().unwrap(),
-                datatypes: root.attr_datatypes().unwrap(),
-            },
-            AttrChannels {
-                owner: "dataset",
-                values: dataset.attrs().unwrap(),
-                datatypes: dataset.attr_datatypes().unwrap(),
-            },
-        ]
+        AttrFile {
+            bytes,
+            owners: vec![
+                AttrChannels {
+                    owner: "root group",
+                    values: root.attrs().unwrap(),
+                    datatypes: root.attr_datatypes().unwrap(),
+                },
+                AttrChannels {
+                    owner: "dataset",
+                    values: dataset.attrs().unwrap(),
+                    datatypes: dataset.attr_datatypes().unwrap(),
+                },
+            ],
+        }
     }
 
     /// The datatype channel carries the width the value channel widens away: one
@@ -4536,7 +4556,7 @@ mod tests {
     /// somewhere else to read it, and for an attribute there was nowhere (#248).
     #[test]
     fn attr_datatypes_reports_the_width_attrs_widens() {
-        for c in attr_channels(&[("count", AttrValue::I32(-7))], &[]) {
+        for c in attr_channels(&[("count", AttrValue::I32(-7))], &[]).owners {
             assert_eq!(
                 c.values.get("count"),
                 Some(&AttrValue::I64(-7)),
@@ -4583,7 +4603,7 @@ mod tests {
             raw_data: vec![1, 2, 3],
         };
 
-        for c in attr_channels(&[("count", AttrValue::I32(1))], std::slice::from_ref(&raw)) {
+        for c in attr_channels(&[("count", AttrValue::I32(1))], std::slice::from_ref(&raw)).owners {
             assert!(
                 !c.values.contains_key("raw"),
                 "{}: an opaque attribute has no `AttrValue`, so `attrs` omits it — \
@@ -4603,6 +4623,71 @@ mod tests {
                 "{}: the attribute beside it must appear in both channels",
                 c.owner
             );
+        }
+    }
+
+    /// The channel must cover dense (fractal-heap) attribute storage, not only
+    /// the compact form that lives in the object header.
+    ///
+    /// The two tests above use three attributes, which is well inside the
+    /// writer's compact threshold, so on their own they leave every dense path
+    /// unpinned: an implementation that walked `hdr.messages` directly and never
+    /// touched the heap would pass both and report *nothing* for a real file with
+    /// many attributes. Twelve is past the threshold, and the heap signature is
+    /// asserted so the fixture cannot quietly revert to compact storage and take
+    /// the coverage with it.
+    #[test]
+    fn attr_datatypes_covers_dense_attribute_storage() {
+        let names: Vec<String> = (0..12).map(|i| format!("a{i:02}")).collect();
+        let values: Vec<(&str, AttrValue)> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                (
+                    n.as_str(),
+                    #[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+                    AttrValue::I32(i as i32),
+                )
+            })
+            .collect();
+
+        let f = attr_channels(&values, &[]);
+        assert!(
+            f.bytes.windows(4).any(|w| w == b"FRHP"),
+            "the fixture must really use dense storage, or this test proves \
+             nothing beyond the compact path the other tests already cover"
+        );
+
+        for c in f.owners {
+            assert_eq!(
+                c.datatypes.len(),
+                names.len(),
+                "{}: every attribute in the heap must be reported, got {:?}",
+                c.owner,
+                c.datatypes.keys().collect::<Vec<_>>()
+            );
+            // The two channels must agree on which attributes exist: all of these
+            // decode, so neither one has anything to omit here.
+            let mut from_values: Vec<&String> = c.values.keys().collect();
+            let mut from_types: Vec<&String> = c.datatypes.keys().collect();
+            from_values.sort();
+            from_types.sort();
+            assert_eq!(
+                from_values, from_types,
+                "{}: the channels disagree",
+                c.owner
+            );
+            for name in &names {
+                assert!(
+                    matches!(
+                        c.datatypes.get(name),
+                        Some(Datatype::FixedPoint { size: 4, .. })
+                    ),
+                    "{}: {name} must keep its 4-byte width through the heap, got {:?}",
+                    c.owner,
+                    c.datatypes.get(name)
+                );
+            }
         }
     }
 }
