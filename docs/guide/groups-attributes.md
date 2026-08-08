@@ -121,7 +121,7 @@ let fields: Option<Vec<&str>> = attrs.get("MATLAB_fields").and_then(AttrValue::a
 
 `as_i64`, `as_u64`, `as_f64`, `to_i64s`, `to_u64s` and `to_f64s` do the same for numbers. The prefix states the cost: `as_*` borrows or copies, `to_*` allocates. `as_i64` widens the narrower integer variants and reports `None` for a value above `i64::MAX` rather than wrapping it — per element, so the same holds for `to_i64s` at any length. The float accessors do not convert integers, so a caller that accepts either asks for both.
 
-What a read cannot recover, because `AttrValue` has no way to express it. Each of these reads correctly but would be rewritten differently:
+What a read cannot recover, because `AttrValue` has no way to express it. Each of these reads correctly, and each would come back differently if it were *rewritten from the value* — which is why [`repack`](repack.md) copies an attribute's encoding rather than rebuilding it from one:
 
 - **Width.** Integers and floats widen to `i64`/`u64`/`f64`; there are no narrower array variants.
 - **Variable-length strings.** A true `H5T_STRING` with `STRSIZE = VAR` — what h5py writes, and what this crate's writer never emits — has no variant of its own and reads as the fixed-width variant of the same charset.

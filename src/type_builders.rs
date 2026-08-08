@@ -581,6 +581,70 @@ fn int_fits(v: i64, width: usize, signed: bool) -> bool {
 
 // ---- Attribute helper ----
 
+/// How a builder holds one attribute until the writer turns it into bytes.
+///
+/// Most callers describe an attribute by *value* and let the writer choose an
+/// encoding for it — that is [`Value`](AttrSpec::Value), and the encoding it
+/// gets is whatever [`build_attr_message`] picks for the variant.
+///
+/// [`Verbatim`](AttrSpec::Verbatim) carries an already-encoded message instead,
+/// so the datatype, dataspace and element bytes reach the file exactly as
+/// given. Repack uses it to copy an attribute across without routing it through
+/// [`AttrValue`], which is a decoded view and cannot express a narrow width, a
+/// variable-length string, a rank above one, or a string's padding — every one
+/// of which the value path would therefore rewrite (see [`AttrValue`]'s docs on
+/// what a decode does not recover).
+///
+/// The element bytes are copied as-is, so a verbatim message is only correct for
+/// a datatype whose bytes mean the same thing in another file: anything holding
+/// a global-heap reference or an object address must not take this path, since
+/// those addresses point into the *source*. Repack decides that with
+/// `attr_bytes_are_position_independent`.
+pub(crate) enum AttrSpec {
+    /// A decoded value the writer encodes with [`build_attr_message`].
+    Value(AttrValue),
+    /// An already-encoded message, written as given.
+    Verbatim(AttributeMessage),
+    /// A message whose datatype and dataspace are given, but whose element bytes
+    /// are global-heap references the writer builds and patches from `strings`.
+    ///
+    /// This is the middle ground a variable-length string attribute needs. Its
+    /// datatype and dataspace *can* travel — they say "variable-length UTF-8",
+    /// or "scalar" — while its element bytes cannot, because they address the
+    /// source file's heap. `Verbatim` would carry a dangling address across and
+    /// `Value` would rewrite a variable-length string as a fixed-width one (and
+    /// a scalar as a one-element array), so neither alone is faithful.
+    ///
+    /// `message.raw_data` must already be [`vl_string_reference_bytes`] over the
+    /// same `strings`, so the placeholder count matches the heap objects the
+    /// writer will place.
+    VerbatimVarLen {
+        message: AttributeMessage,
+        strings: Vec<String>,
+    },
+}
+
+impl AttrSpec {
+    /// The message this attribute writes, encoding a [`Value`](AttrSpec::Value)
+    /// and handing back an already-encoded one unchanged.
+    pub(crate) fn to_message(&self, name: &str) -> AttributeMessage {
+        match self {
+            Self::Value(v) => build_attr_message(name, v),
+            Self::Verbatim(m) | Self::VerbatimVarLen { message: m, .. } => m.clone(),
+        }
+    }
+
+    /// The variable-length strings whose global-heap collections the writer must
+    /// build and patch, or `None` when the attribute needs no heap.
+    pub(crate) fn var_len_strings(&self) -> Option<&[String]> {
+        match self {
+            Self::Value(AttrValue::VarLenAsciiArray(strings))
+            | Self::VerbatimVarLen { strings, .. } => Some(strings),
+            _ => None,
+        }
+    }
+}
+
 pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMessage {
     match value {
         AttrValue::F64(v) => AttributeMessage {
@@ -722,26 +786,9 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
             // address + object index per element; heap object holds raw
             // bytes without null terminator), so only the datatype
             // descriptor changes.
-            let vl_ref_size = 16usize; // 4 + 8 + 4 for offset_size=8
-            let mut raw = Vec::with_capacity(strings.len() * vl_ref_size);
-            for (i, s) in strings.iter().enumerate() {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "VLEN string length is written into the 4-byte length prefix of the variable-length reference"
-                )]
-                raw.extend_from_slice(&(s.len() as u32).to_le_bytes());
-                raw.extend_from_slice(&0u64.to_le_bytes()); // patched later
-                // 1-based index within this element's own collection; the
-                // writer splits the strings across collections the same way
-                // (see `build_global_heap_collections`).
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "1-based heap object index is written into the 4-byte object-index field of the variable-length reference"
-                )]
-                raw.extend_from_slice(&((i % MAX_HEAP_OBJECTS + 1) as u32).to_le_bytes());
-            }
             AttributeMessage {
                 name: name.to_string(),
+                raw_data: vl_string_reference_bytes(strings),
                 datatype: Datatype::VariableLength {
                     is_string: false,
                     padding: None,
@@ -753,10 +800,42 @@ pub(crate) fn build_attr_message(name: &str, value: &AttrValue) -> AttributeMess
                     }),
                 },
                 dataspace: simple_1d(strings.len() as u64),
-                raw_data: raw,
             }
         }
     }
+}
+
+/// The element bytes of a variable-length string value: one 16-byte global-heap
+/// reference per string, with the collection address left as a placeholder for
+/// the writer to patch once it has placed the collections.
+///
+/// Both variable-length string encodings this crate handles share these bytes —
+/// a true `H5T_STRING` with `STRSIZE = VAR`, and the `H5T_VLEN` of 1-byte
+/// strings that MATLAB and matio emit — so only the datatype descriptor around
+/// them differs. That is what lets repack keep a source attribute's own datatype
+/// while rebuilding its payload against the destination's heap.
+///
+/// The object index is 1-based *within each collection*, and the split into
+/// collections must match [`build_global_heap_collections`] exactly: the two
+/// walk the same strings in the same order, and a divergence would point an
+/// element at the wrong heap object. Keeping one encoder for every caller is
+/// what holds that invariant to a single place.
+pub(crate) fn vl_string_reference_bytes(strings: &[String]) -> Vec<u8> {
+    let mut raw = Vec::with_capacity(strings.len() * VL_REF_SIZE);
+    for (i, s) in strings.iter().enumerate() {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "VLEN string length is written into the 4-byte length prefix of the variable-length reference"
+        )]
+        raw.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        raw.extend_from_slice(&0u64.to_le_bytes()); // patched later
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "1-based heap object index is written into the 4-byte object-index field of the variable-length reference"
+        )]
+        raw.extend_from_slice(&((i % MAX_HEAP_OBJECTS + 1) as u32).to_le_bytes());
+    }
+    raw
 }
 
 /// Maximum number of objects one global heap collection can index.
@@ -1465,7 +1544,7 @@ pub struct DatasetBuilder {
     pub(crate) shape: Option<Vec<u64>>,
     pub(crate) maxshape: Option<Vec<u64>>,
     pub(crate) data: Option<Vec<u8>>,
-    pub(crate) attrs: Vec<(String, AttrValue)>,
+    pub(crate) attrs: Vec<(String, AttrSpec)>,
     pub(crate) chunk_options: ChunkOptions,
     /// When set, this dataset's chunks are copied verbatim from a source file
     /// (repack's verbatim path): the already-compressed chunk bytes, the source
@@ -2118,7 +2197,33 @@ impl DatasetBuilder {
     }
 
     pub fn set_attr(&mut self, name: &str, value: AttrValue) -> &mut Self {
-        self.attrs.push((name.to_string(), value));
+        self.attrs.push((name.to_string(), AttrSpec::Value(value)));
+        self
+    }
+
+    /// Attach an already-encoded attribute message, written exactly as given.
+    ///
+    /// See [`AttrSpec::Verbatim`] for what this preserves that `set_attr` cannot,
+    /// and for the datatypes it must not be used with.
+    pub(crate) fn set_attr_verbatim(&mut self, message: AttributeMessage) -> &mut Self {
+        self.attrs
+            .push((message.name.clone(), AttrSpec::Verbatim(message)));
+        self
+    }
+
+    /// Attach a variable-length string attribute with the given datatype and
+    /// dataspace, staging `strings` into a heap of this file's own.
+    /// See [`AttrSpec::VerbatimVarLen`].
+    pub(crate) fn set_attr_var_len_verbatim(
+        &mut self,
+        mut message: AttributeMessage,
+        strings: Vec<String>,
+    ) -> &mut Self {
+        message.raw_data = vl_string_reference_bytes(&strings);
+        self.attrs.push((
+            message.name.clone(),
+            AttrSpec::VerbatimVarLen { message, strings },
+        ));
         self
     }
 
@@ -2274,7 +2379,7 @@ pub struct GroupBuilder {
     pub(crate) name: String,
     pub(crate) datasets: Vec<DatasetBuilder>,
     pub(crate) sub_groups: Vec<FinishedGroup>,
-    pub(crate) attrs: Vec<(String, AttrValue)>,
+    pub(crate) attrs: Vec<(String, AttrSpec)>,
 }
 
 impl GroupBuilder {
@@ -2304,7 +2409,31 @@ impl GroupBuilder {
     }
 
     pub fn set_attr(&mut self, name: &str, value: AttrValue) {
-        self.attrs.push((name.to_string(), value));
+        self.attrs.push((name.to_string(), AttrSpec::Value(value)));
+    }
+
+    /// Attach an already-encoded attribute message, written exactly as given.
+    ///
+    /// See [`AttrSpec::Verbatim`] for what this preserves that `set_attr` cannot,
+    /// and for the datatypes it must not be used with.
+    pub(crate) fn set_attr_verbatim(&mut self, message: AttributeMessage) {
+        self.attrs
+            .push((message.name.clone(), AttrSpec::Verbatim(message)));
+    }
+
+    /// Attach a variable-length string attribute with the given datatype and
+    /// dataspace, staging `strings` into a heap of this file's own.
+    /// See [`AttrSpec::VerbatimVarLen`].
+    pub(crate) fn set_attr_var_len_verbatim(
+        &mut self,
+        mut message: AttributeMessage,
+        strings: Vec<String>,
+    ) {
+        message.raw_data = vl_string_reference_bytes(&strings);
+        self.attrs.push((
+            message.name.clone(),
+            AttrSpec::VerbatimVarLen { message, strings },
+        ));
     }
 
     /// Consume the builder, returning a FinishedGroup to add to FileWriter.
@@ -2323,7 +2452,7 @@ pub struct FinishedGroup {
     pub(crate) name: String,
     pub(crate) datasets: Vec<DatasetBuilder>,
     pub(crate) sub_groups: Vec<FinishedGroup>,
-    pub(crate) attrs: Vec<(String, AttrValue)>,
+    pub(crate) attrs: Vec<(String, AttrSpec)>,
 }
 
 #[cfg(test)]

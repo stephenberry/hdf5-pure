@@ -547,12 +547,20 @@ fn repack_roundtrips_filtered_and_resizable_vlen_string_datasets() {
     }
 }
 
+/// A boolean attribute is an HDF5 enumeration, which [`AttrValue`] has no
+/// variant for. Repack used to refuse the whole file over one — the only honest
+/// answer while every attribute went through a decode, since the alternative was
+/// dropping it silently.
+///
+/// Copying the message verbatim answers it properly instead: an enumeration
+/// carries no address, so its bytes mean the same thing in the destination and
+/// the attribute simply survives. This is the general form of the refusal that
+/// went away, not a special case for booleans — a compound or opaque attribute
+/// travels for the same reason (issue #241).
 #[test]
-fn repack_refuses_unrepresentable_attribute() {
-    // The C library writes a boolean attribute, which is an HDF5 enumeration —
-    // a datatype the reader cannot decode into an AttrValue and would silently
-    // drop. Repack must refuse by name rather than write a file missing the
-    // attribute, upholding the fail-loud fidelity contract.
+fn repack_carries_an_attribute_no_attr_value_can_express() {
+    use hdf5::types::TypeDescriptor;
+
     let dir = tempdir().unwrap();
     let src = dir.path().join("c_boolattr.h5");
     let dst = dir.path().join("boolattr_repacked.h5");
@@ -565,7 +573,6 @@ fn repack_refuses_unrepresentable_attribute() {
             .create("data")
             .unwrap();
         ds.write(&[1.0f64, 2.0]).unwrap();
-        // A boolean (enum) attribute the pure reader cannot represent.
         ds.new_attr::<bool>()
             .shape(())
             .create("active")
@@ -575,11 +582,76 @@ fn repack_refuses_unrepresentable_attribute() {
         file.close().unwrap();
     }
 
+    let source_type = {
+        let c = hdf5::File::open(&src).unwrap();
+        c.dataset("data")
+            .unwrap()
+            .attr("active")
+            .unwrap()
+            .dtype()
+            .unwrap()
+            .to_descriptor()
+            .unwrap()
+    };
+    assert!(
+        matches!(source_type, TypeDescriptor::Boolean),
+        "the C library should have written an enumeration: {source_type:?}"
+    );
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    let c = hdf5::File::open(&dst).unwrap();
+    let attr = c.dataset("data").unwrap().attr("active").unwrap();
+    assert_eq!(
+        attr.dtype().unwrap().to_descriptor().unwrap(),
+        source_type,
+        "the enumeration must cross the repack as itself"
+    );
+    assert!(
+        attr.read_scalar::<bool>().unwrap(),
+        "and still hold its value"
+    );
+}
+
+/// What the fail-loud contract still covers once verbatim copying has taken the
+/// address-free datatypes off the refusal list.
+///
+/// An object-reference attribute stores an object-header address, so its bytes
+/// cannot be copied, and [`AttrValue`] has no variant to re-encode it from
+/// either. Repack must still name it and refuse rather than write a file the
+/// attribute is missing from — dropping it silently is the failure this test
+/// exists to catch, and the shrinking refusal list makes it the last one holding
+/// that line for attributes.
+#[test]
+fn repack_refuses_an_attribute_whose_address_it_cannot_rewrite() {
+    use hdf5::{ObjectReference, ObjectReference1};
+
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("c_refattr.h5");
+    let dst = dir.path().join("refattr_repacked.h5");
+
+    {
+        let file = hdf5::File::create(&src).unwrap();
+        let ds = file
+            .new_dataset::<f64>()
+            .shape((2,))
+            .create("data")
+            .unwrap();
+        ds.write(&[1.0f64, 2.0]).unwrap();
+        ds.new_attr::<ObjectReference1>()
+            .shape(())
+            .create("points_at")
+            .unwrap()
+            .write_scalar(&ObjectReference1::create(&file, "data").unwrap())
+            .unwrap();
+        file.close().unwrap();
+    }
+
     let err = repack(&src, &dst, &RepackOptions::new()).unwrap_err();
     match err {
         hdf5_pure::Error::RepackUnsupported(msg) => {
             assert!(
-                msg.contains("active") && msg.contains("data"),
+                msg.contains("points_at") && msg.contains("data"),
                 "error should name the attribute and its dataset: {msg}"
             );
         }
@@ -1218,5 +1290,206 @@ fn repack_refuses_chunked_compound_with_both_vlen_and_reference_members() {
             "error should name the dataset and the reason: {msg}"
         ),
         other => panic!("expected RepackUnsupported, got {other:?}"),
+    }
+}
+
+/// The attribute encodings the reference C library can write and this crate
+/// cannot, carried across a repack and read back by that same library
+/// (issue #241).
+///
+/// This is the half of the fidelity contract no pure-Rust test can reach.
+/// `AttrValue` has no narrow integer array, no variable-length string, and no
+/// rank above one, so a source this crate *writes* cannot exhibit those losses
+/// at all — only a C-written file can, which is exactly the file a user repacks.
+/// Every assertion is made through the C library's own type system, so it states
+/// what a consumer sees rather than what this crate's reader reports.
+#[test]
+fn c_written_attribute_encodings_survive_a_repack() {
+    use hdf5::types::{FixedAscii, FloatSize, IntSize, TypeDescriptor, VarLenUnicode};
+    use std::str::FromStr;
+
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("c_attr_src.h5");
+    let dst = dir.path().join("c_attr_dst.h5");
+
+    {
+        let file = hdf5::File::create(&src).unwrap();
+        let ds = file
+            .new_dataset::<f64>()
+            .shape((4,))
+            .create("data")
+            .unwrap();
+        ds.write(&[1.0f64, 2.0, 3.0, 4.0]).unwrap();
+
+        // One writer for both owners: an attribute on the root group takes a
+        // different path through the repack walk than one on a dataset, and the
+        // widening hit both.
+        let (ds_loc, root_loc): (&hdf5::Location, &hdf5::Location) = (&ds, &file);
+        for owner in [ds_loc, root_loc] {
+            owner
+                .new_attr::<i8>()
+                .create("i8")
+                .unwrap()
+                .write_scalar(&-3i8)
+                .unwrap();
+            owner
+                .new_attr::<i32>()
+                .create("i32")
+                .unwrap()
+                .write_scalar(&-7i32)
+                .unwrap();
+            owner
+                .new_attr::<u16>()
+                .create("u16")
+                .unwrap()
+                .write_scalar(&65535u16)
+                .unwrap();
+            owner
+                .new_attr::<f32>()
+                .create("f32")
+                .unwrap()
+                .write_scalar(&1.5f32)
+                .unwrap();
+            owner
+                .new_attr::<i16>()
+                .shape([3])
+                .create("i16arr")
+                .unwrap()
+                .write(&[1i16, 2, 3])
+                .unwrap();
+            // Rank 2: `AttrValue`'s array variants are all one-dimensional, so a
+            // decode flattens this to six elements.
+            owner
+                .new_attr::<i32>()
+                .shape([2, 3])
+                .create("rank2")
+                .unwrap()
+                .write_raw(&[1i32, 2, 3, 4, 5, 6])
+                .unwrap();
+            // A true variable-length string, which this crate's writer never
+            // emits and a decode turns into a fixed-width one.
+            owner
+                .new_attr::<VarLenUnicode>()
+                .create("vlstr")
+                .unwrap()
+                .write_scalar(&VarLenUnicode::from_str("hello").unwrap())
+                .unwrap();
+            // The same, as an array: a scalar and a one-element-per-entry array
+            // reach the writer by different paths.
+            owner
+                .new_attr::<VarLenUnicode>()
+                .shape([2])
+                .create("vlstrs")
+                .unwrap()
+                .write_raw(&[
+                    VarLenUnicode::from_str("alpha").unwrap(),
+                    VarLenUnicode::from_str("beta").unwrap(),
+                ])
+                .unwrap();
+            // A fixed-width string declared far wider than its content: the
+            // declared width is the part a decode drops, since it reports the
+            // content and nothing else.
+            owner
+                .new_attr::<FixedAscii<16>>()
+                .create("units")
+                .unwrap()
+                .write_scalar(&FixedAscii::<16>::from_ascii("m/s").unwrap())
+                .unwrap();
+            // Rank 2 over strings rather than numbers, which is the shape
+            // issue #241 measured being flattened.
+            owner
+                .new_attr::<FixedAscii<4>>()
+                .shape([2, 2])
+                .create("grid")
+                .unwrap()
+                .write_raw(&[
+                    FixedAscii::<4>::from_ascii("ab").unwrap(),
+                    FixedAscii::<4>::from_ascii("cd").unwrap(),
+                    FixedAscii::<4>::from_ascii("ef").unwrap(),
+                    FixedAscii::<4>::from_ascii("gh").unwrap(),
+                ])
+                .unwrap();
+        }
+        file.close().unwrap();
+    }
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    // One row per entry in issue #241's table of what a decode loses.
+    let expected: [(&str, TypeDescriptor, Vec<usize>); 10] = [
+        ("i8", TypeDescriptor::Integer(IntSize::U1), vec![]),
+        ("i32", TypeDescriptor::Integer(IntSize::U4), vec![]),
+        ("u16", TypeDescriptor::Unsigned(IntSize::U2), vec![]),
+        ("f32", TypeDescriptor::Float(FloatSize::U4), vec![]),
+        ("i16arr", TypeDescriptor::Integer(IntSize::U2), vec![3]),
+        ("rank2", TypeDescriptor::Integer(IntSize::U4), vec![2, 3]),
+        ("vlstr", TypeDescriptor::VarLenUnicode, vec![]),
+        ("vlstrs", TypeDescriptor::VarLenUnicode, vec![2]),
+        // 16, not 3: the declared width outlives the content.
+        ("units", TypeDescriptor::FixedAscii(16), vec![]),
+        ("grid", TypeDescriptor::FixedAscii(4), vec![2, 2]),
+    ];
+
+    let c = hdf5::File::open(&dst).unwrap();
+    let ds = c.dataset("data").unwrap();
+    let (ds_loc, root_loc): (&hdf5::Location, &hdf5::Location) = (&ds, &c);
+    for (owner_name, owner) in [("dataset data", ds_loc), ("root group", root_loc)] {
+        for (name, descriptor, shape) in &expected {
+            let attr = owner
+                .attr(name)
+                .unwrap_or_else(|e| panic!("{owner_name} lost attribute {name:?}: {e}"));
+            assert_eq!(
+                &attr.dtype().unwrap().to_descriptor().unwrap(),
+                descriptor,
+                "{owner_name}: attribute {name:?} changed datatype across the repack"
+            );
+            assert_eq!(
+                &attr.shape(),
+                shape,
+                "{owner_name}: attribute {name:?} changed shape across the repack"
+            );
+        }
+        // The variable-length string is the one whose bytes cannot be copied, so
+        // it proves the fallback re-encoded it against the destination's own heap
+        // rather than leaving an address pointing into the source.
+        assert_eq!(
+            owner
+                .attr("vlstr")
+                .unwrap()
+                .read_scalar::<VarLenUnicode>()
+                .unwrap()
+                .as_str(),
+            "hello",
+            "{owner_name}: the variable-length string must still resolve"
+        );
+        assert_eq!(
+            owner.attr("rank2").unwrap().read_raw::<i32>().unwrap(),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+        assert_eq!(
+            owner
+                .attr("units")
+                .unwrap()
+                .read_scalar::<FixedAscii<16>>()
+                .unwrap()
+                .as_str(),
+            "m/s"
+        );
+        assert_eq!(
+            owner
+                .attr("vlstrs")
+                .unwrap()
+                .read_raw::<VarLenUnicode>()
+                .unwrap()
+                .iter()
+                .map(|s| s.as_str().to_owned())
+                .collect::<Vec<_>>(),
+            ["alpha", "beta"]
+        );
+        assert_eq!(owner.attr("i8").unwrap().read_scalar::<i8>().unwrap(), -3);
+        assert_eq!(
+            owner.attr("f32").unwrap().read_scalar::<f32>().unwrap(),
+            1.5
+        );
     }
 }

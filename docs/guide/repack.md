@@ -60,10 +60,13 @@ The operation is all-or-nothing: the entire source is validated and staged in me
 | Layout | contiguous / compact or chunked |
 | Filters | deflate, shuffle, fletcher32, LZF, and/or lossless integer scale-offset |
 | Structure | group hierarchy of arbitrary depth |
-| Attributes | numbers, fixed- and variable-length strings and their arrays, on datasets, groups, and root |
+| Attributes | every datatype above, carried across with the source's own encoding — width, charset, string padding, and rank included — on datasets, groups, and root |
 | File-space strategy | the source's strategy, page size, and threshold (carried forward as non-persistent) |
 
 A repacked file has no free space to persist, so even when the source recorded a persistent file-space strategy the compact output carries that strategy forward as non-persistent. See [File-space strategy](file-space.md) for what that controls.
+
+!!! note "Attributes keep their own encoding"
+    An attribute is copied as the source encoded it, not as `AttrValue` renders it. That matters because `AttrValue` is a deliberately lossy convenience view: it has no integer narrower than 64 bits, no variable-length string, and no rank above one, so an attribute rebuilt from one would come back widened and flattened. Only an attribute whose element bytes hold a *location* — variable-length data, or a reference — cannot be copied as-is; a variable-length string keeps its datatype and dataspace while its strings are restaged into the new file's heap, and a reference attribute is refused. See [Attributes](groups-attributes.md#attributes) for what a *read* still normalizes.
 
 !!! note "Lossless filters only"
     `repack` reads each dataset's *decompressed* bytes and re-applies its filters. It can therefore reproduce only **lossless** filters, where the re-encoded chunks decompress to the exact same bytes. This includes deflate, shuffle, fletcher32, LZF, and lossless integer scale-offset. See [Compression](compression.md) for the full filter list.
@@ -81,7 +84,7 @@ These are reported as `Error::RepackUnsupported` naming the object, never silent
 | virtual and external data layouts | not reproducible by rewriting |
 | lossy filters: float D-scale scale-offset and ZFP | re-encoding is not guaranteed idempotent |
 | SZIP filter | this crate cannot write it |
-| an attribute the reader cannot decode | e.g. an enumeration, compound, or boolean attribute |
+| an attribute whose datatype is or contains a reference | its stored address is not rewritten yet, and no `AttrValue` can re-encode it |
 
 ## Verifying the result
 

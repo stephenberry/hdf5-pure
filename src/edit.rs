@@ -6637,15 +6637,15 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
     };
     let mut attrs: Vec<crate::attribute::AttributeMessage> = Vec::with_capacity(db.attrs.len());
     for (n, v) in &db.attrs {
-        attrs.push(build_attr_message(n, v));
+        attrs.push(v.to_message(n));
     }
-    // `build_attr_message` already writes a placeholder (heap address 0) for a
-    // `VarLenAsciiArray` attribute; stage its self-contained global heap
-    // collections here (no address of their own to resolve yet) and record which
-    // `attrs` slot they patch once the apply loop places them.
+    // The message above already carries a placeholder (heap address 0) for each
+    // element of a variable-length string attribute; stage its self-contained
+    // global heap collections here (no address of their own to resolve yet) and
+    // record which `attrs` slot they patch once the apply loop places them.
     let mut vl_attrs: Vec<(usize, Vec<Vec<u8>>)> = Vec::new();
     for (i, (_, v)) in db.attrs.iter().enumerate() {
-        if let AttrValue::VarLenAsciiArray(strings) = v {
+        if let Some(strings) = v.var_len_strings() {
             let str_refs: Vec<&str> = strings.iter().map(String::as_str).collect();
             vl_attrs.push((i, build_global_heap_collections(&str_refs)));
         }
