@@ -472,7 +472,11 @@ impl FileInner {
     /// This lets a host read a file larger than its address space — the original
     /// motivation being 32-bit targets reading multi-gigabyte files (issue #27).
     /// Metadata and dataset chunks are read through a `ReadSeekSource`, so peak
-    /// memory stays close to one chunk plus the metadata being parsed.
+    /// memory stays close to one chunk plus the metadata being parsed. Chunks
+    /// that sit next to each other on disk are fetched together, in reads of at
+    /// most 256 KiB (a larger chunk is read on its own), which is what makes a
+    /// file written a row at a time — thousands of chunks of a few dozen bytes
+    /// — read at a sensible speed. See [`crate::chunk_span`].
     ///
     /// Reads match the buffered [`File::open`]: every storage layout and chunk
     /// index type, both group forms (v2 and v1 symbol-table), and compact,
@@ -1639,8 +1643,10 @@ impl File {
     ///
     /// This lets a host read a file larger than its address space. Metadata and
     /// dataset chunks are read through a `ReadSeekSource`, so peak memory stays
-    /// close to one chunk plus the metadata being parsed. Attribute reading and
-    /// v1 symbol-table groups on the resolved path are not yet supported on this
+    /// close to one chunk plus the metadata being parsed; chunks adjacent on
+    /// disk are fetched together, in reads of at most 256 KiB, and a chunk
+    /// larger than that is read on its own. Attribute reading and v1
+    /// symbol-table groups on the resolved path are not yet supported on this
     /// backend.
     ///
     /// Like [`open`](Self::open), this refuses a file whose superblock marks it
@@ -4333,6 +4339,7 @@ fn is_group(header: &ObjectHeader) -> bool {
 mod tests {
     use super::*;
     use crate::FileBuilder;
+    use std::sync::atomic::AtomicUsize;
 
     /// Read everything a read-write file can serve through the paired read
     /// paths, as comparable text.
@@ -4872,5 +4879,235 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Coalesced chunk reads (see `crate::chunk_span`)
+    // -----------------------------------------------------------------------
+
+    /// A [`Source`] over a file image that counts what the reader asks the file
+    /// for, so a test can assert read *volume* and not only the values returned.
+    struct CountingSource {
+        bytes: Vec<u8>,
+        reads: Arc<AtomicUsize>,
+        bytes_read: Arc<AtomicUsize>,
+    }
+
+    impl Source for CountingSource {
+        fn len(&self) -> u64 {
+            self.bytes.len() as u64
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.bytes_read.fetch_add(buf.len(), Ordering::Relaxed);
+            BytesSource::new(&self.bytes).read_at(offset, buf)
+        }
+    }
+
+    /// Counters for one measured read.
+    #[derive(Default)]
+    struct ReadCounts {
+        reads: Arc<AtomicUsize>,
+        bytes: Arc<AtomicUsize>,
+    }
+
+    impl ReadCounts {
+        /// Run `f` and report `(reads, bytes)` it cost.
+        fn measure<R>(&self, f: impl FnOnce() -> R) -> (usize, usize) {
+            let r0 = self.reads.load(Ordering::Relaxed);
+            let b0 = self.bytes.load(Ordering::Relaxed);
+            f();
+            (
+                self.reads.load(Ordering::Relaxed) - r0,
+                self.bytes.load(Ordering::Relaxed) - b0,
+            )
+        }
+    }
+
+    /// A streaming [`File`] over `bytes` whose reads are counted, built the way
+    /// [`File::open_streaming_with_options`] builds one over a file handle.
+    fn counting_streaming_file(
+        bytes: Vec<u8>,
+        counts: &ReadCounts,
+        access: FileAccessProperties,
+    ) -> File {
+        let source: Box<dyn Source + Send + Sync> = Box::new(CountingSource {
+            bytes,
+            reads: Arc::clone(&counts.reads),
+            bytes_read: Arc::clone(&counts.bytes),
+        });
+        let (superblock, addr_offset) =
+            FileInner::parse_superblock_source(source.as_ref()).expect("parse superblock");
+        File {
+            inner: Arc::new(FileInner::from_parts(
+                Backend::Streaming(source),
+                superblock,
+                addr_offset,
+                None,
+                access,
+            )),
+        }
+    }
+
+    /// An `n`-element f64 dataset in chunks of `chunk` elements.
+    fn chunked_f64_file(n: usize, chunk: u64) -> (Vec<u8>, Vec<f64>) {
+        let data: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        let mut builder = FileBuilder::new();
+        builder
+            .create_dataset("d")
+            .with_f64_data(&data)
+            .with_shape(&[n as u64])
+            .with_chunks(&[chunk]);
+        (builder.finish().expect("write file"), data)
+    }
+
+    /// One chunk per row is what a writer that appends as data arrives
+    /// produces; the rows land next to each other, so the streaming reader must
+    /// fetch them in a few spans rather than one read each.
+    #[test]
+    fn a_streaming_read_coalesces_a_run_of_small_chunks() {
+        let n = 1024usize;
+        let (bytes, data) = chunked_f64_file(n, 1);
+        let counts = ReadCounts::default();
+        let file = counting_streaming_file(bytes, &counts, FileAccessProperties::new());
+
+        let mut got = Vec::new();
+        let (reads, _) = counts.measure(|| got = file.dataset("d").unwrap().read_f64().unwrap());
+        assert_eq!(got, data, "the coalesced read must return the same values");
+
+        // Reading each of the 1024 chunks on its own would cost at least that
+        // many reads; the whole run plus its metadata fits in far fewer.
+        assert!(
+            reads < n / 8,
+            "expected the {n} chunks to be coalesced into few reads, got {reads}"
+        );
+    }
+
+    /// A windowed read must coalesce only the chunks its window overlaps: a
+    /// plan built over the dataset's whole chunk list would put the rows on
+    /// either side of the window inside a span and read them for nothing.
+    #[test]
+    fn a_windowed_streaming_read_fetches_only_its_own_window() {
+        let rows = 4096usize;
+        let (bytes, data) = chunked_f64_file(rows, 4);
+        let counts = ReadCounts::default();
+        let file = counting_streaming_file(bytes, &counts, FileAccessProperties::new());
+        let ds = file.dataset("d").unwrap();
+
+        // The first window walks (and caches on this handle) the chunk index,
+        // so measure the second: what it reads is the window's own chunks.
+        assert_eq!(ds.read_f64_rows(0, 8).unwrap(), data[0..8]);
+        let (_, window_bytes) =
+            counts.measure(|| assert_eq!(ds.read_f64_rows(2048, 8).unwrap(), data[2048..2056]));
+
+        // Eight rows are two 32-byte chunks.
+        assert!(
+            window_bytes < 256,
+            "an 8-row window read {window_bytes} bytes; it needs 64"
+        );
+    }
+
+    /// The read volume of a whole-dataset read must not depend on which read it
+    /// is. The chunk list comes from the handle's cached index on every read
+    /// after the first, and that index is a map: it yields no address order at
+    /// all. A reader holding one coalesced span re-reads a whole span each time
+    /// an unordered walk crosses back, so the second read of a dataset spanning
+    /// more than one span cost two orders of magnitude more than the first.
+    ///
+    /// A regression here is probabilistic rather than certain — the map's order
+    /// is seeded per process, and a run that happened to be sorted would pass —
+    /// but with hundreds of chunks over two spans the chance of that is nil.
+    /// Correct code passes deterministically.
+    #[test]
+    fn a_second_whole_read_costs_what_the_first_did() {
+        // 512 KiB of f64 in 1 KiB chunks: more than one 256 KiB span, so an
+        // unordered walk has somewhere to thrash between.
+        let n = 64 * 1024usize;
+        let dataset_bytes = n * 8;
+        let (bytes, data) = chunked_f64_file(n, 128);
+        let counts = ReadCounts::default();
+        let file = counting_streaming_file(bytes, &counts, FileAccessProperties::new());
+        let ds = file.dataset("d").unwrap();
+
+        counts.measure(|| assert_eq!(ds.read_f64().unwrap(), data));
+        let (_, second) = counts.measure(|| assert_eq!(ds.read_f64().unwrap(), data));
+
+        assert!(
+            second <= dataset_bytes,
+            "the second read fetched {second} bytes of a {dataset_bytes}-byte dataset"
+        );
+    }
+
+    /// The same, for row windows: `docs/guide/streaming.md` walks a dataset in
+    /// windows on one handle, so every window but the first takes its chunk
+    /// list from the cached index.
+    ///
+    /// Each window here covers more than one span, which is what it takes to
+    /// see the defect: a window whose chunks all fit a single span is served
+    /// out of that one buffer whatever order it walks them in.
+    #[test]
+    fn a_window_loop_costs_the_dataset_once() {
+        // 2 MiB of f64 in 1 KiB chunks, read in 512 KiB windows — two spans
+        // each.
+        let rows = 256 * 1024usize;
+        let dataset_bytes = rows * 8;
+        let (bytes, data) = chunked_f64_file(rows, 128);
+        let counts = ReadCounts::default();
+        let file = counting_streaming_file(bytes, &counts, FileAccessProperties::new());
+        let ds = file.dataset("d").unwrap();
+
+        let window = 64 * 1024;
+        let (_, total) = counts.measure(|| {
+            for lo in (0..rows).step_by(window) {
+                let got = ds.read_f64_rows(lo as u64, window as u64).unwrap();
+                assert_eq!(got, data[lo..lo + window]);
+            }
+        });
+
+        assert!(
+            total <= 2 * dataset_bytes,
+            "a window loop over a {dataset_bytes}-byte dataset read {total} bytes"
+        );
+    }
+
+    /// A span must not cover a chunk the chunk cache already holds: the read
+    /// skips that chunk, so those bytes would be fetched for nothing.
+    ///
+    /// The cache here is given room for the whole dataset. At the default
+    /// sixteen slots a dataset this size evicts its own warm chunks as it
+    /// walks, so every chunk misses on the second read and the plan has nothing
+    /// to leave out — a config that cannot show the difference either way.
+    #[test]
+    fn a_warm_chunk_cache_is_not_re_fetched() {
+        // 32 KiB of f64 in 32 chunks of 1 KiB, laid end to end.
+        let n = 4096usize;
+        let chunk_bytes = 1024usize;
+        let (bytes, data) = chunked_f64_file(n, 128);
+        let counts = ReadCounts::default();
+        let file = counting_streaming_file(
+            bytes,
+            &counts,
+            FileAccessProperties::new()
+                .with_chunk_cache(ChunkCacheConfig::new().with_max_slots(64)),
+        );
+        let ds = file.dataset("d").unwrap();
+
+        // Warm the second half of the dataset: chunks 16..31.
+        assert_eq!(ds.read_f64_rows(2048, 2048).unwrap(), data[2048..]);
+        assert_eq!(
+            ds.chunk_cache_stats().cached_chunks(),
+            16,
+            "the window's own chunks stay cached"
+        );
+
+        let (_, second) = counts.measure(|| assert_eq!(ds.read_f64().unwrap(), data));
+        assert_eq!(
+            second,
+            16 * chunk_bytes,
+            "only the cold half was needed; a span over the whole dataset would \
+             have fetched {} bytes",
+            32 * chunk_bytes
+        );
     }
 }
