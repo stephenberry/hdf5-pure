@@ -14,6 +14,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `RepackOptions::with_libver_bounds` makes a repack's output format a guarantee. Without it, `repack` now carries the source file's format forward, upgrading only where the content leaves no choice — it used to rewrite every file in the 1.10 format ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
 - `LibVer::WRITER_OLDEST` names the oldest format the writer produces ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
 - `mat::Options::libver` sets the newest HDF5 format a `.mat` file may use, defaulting to `LibVer::V18`. `mat::MatError::CompressionNeedsNewerFormat` reports the one combination that cannot hold ([#247](https://github.com/stephenberry/hdf5-pure/pull/247)).
+- `Group::attr_datatypes` and `Dataset::attr_datatypes` give an attribute's exact on-disk `Datatype`, which `attrs()` normalizes away — the stored width, and the `enum[FALSE, TRUE]` that marks an h5py `np.bool_` as boolean rather than as a one-byte integer. Every attribute is reported, including the ones `attrs()` omits for having no `AttrValue` ([#248](https://github.com/stephenberry/hdf5-pure/pull/248)).
 
 ### Changed
 

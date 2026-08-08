@@ -2426,10 +2426,38 @@ impl Group {
     /// `#[non_exhaustive]`.
     ///
     /// An attribute whose datatype has no `AttrValue` representation is omitted
-    /// from the map rather than reported as an error.
+    /// from the map rather than reported as an error. Read
+    /// [`attr_datatypes`](Self::attr_datatypes) to see it.
     pub fn attrs(&self) -> Result<HashMap<String, AttrValue>, Error> {
         let hdr = self.file.parse_header(self.address)?;
         self.file.attrs_of(&hdr)
+    }
+
+    /// The exact on-disk [`Datatype`] of every attribute on this group, keyed by
+    /// name — including compound field offsets, integer widths and enumeration
+    /// members.
+    ///
+    /// This is the type channel to [`attrs`](Self::attrs)'s value channel, the
+    /// pair a dataset already has in [`Dataset::datatype`] and its `read_*`
+    /// methods. An [`AttrValue`] is a deliberately lossy view of the value, so an
+    /// attribute's width, rank and enumeration members are recoverable only from
+    /// here.
+    ///
+    /// **Every attribute message is reported, including the ones `attrs` omits**
+    /// because no `AttrValue` can carry them, so a name missing from that map can
+    /// be told from one the object does not have.
+    ///
+    /// A boolean attribute is the case that needs both channels. The C library
+    /// gives `H5T_NATIVE_HBOOL` — what h5py writes for every `np.bool_` — a
+    /// [`Datatype::Enumeration`] of `FALSE` and `TRUE` over an 8-bit base, and
+    /// `attrs` decodes it through that base, so the value arrives as `0` or `1`
+    /// and only the datatype records that it was a bool.
+    pub fn attr_datatypes(&self) -> Result<HashMap<String, Datatype>, Error> {
+        Ok(self
+            .attr_messages()?
+            .into_iter()
+            .map(|a| (a.name, a.datatype))
+            .collect())
     }
 
     /// Every attribute message on this group as it is encoded on disk, in the
@@ -3647,6 +3675,21 @@ impl Dataset {
         self.file.attrs_of(&self.header)
     }
 
+    /// The exact on-disk [`Datatype`] of every attribute on this dataset, keyed
+    /// by name.
+    ///
+    /// See [`Group::attr_datatypes`] for what this channel carries that
+    /// [`attrs`](Self::attrs) cannot, including how a boolean attribute is
+    /// recognized. Note that this describes the *attributes*, not the dataset's
+    /// own element type — that is [`datatype`](Self::datatype).
+    pub fn attr_datatypes(&self) -> Result<HashMap<String, Datatype>, Error> {
+        Ok(self
+            .attr_messages()?
+            .into_iter()
+            .map(|a| (a.name, a.datatype))
+            .collect())
+    }
+
     /// Every attribute message on this dataset as it is encoded on disk, in the
     /// order the header holds them.
     ///
@@ -4431,5 +4474,135 @@ mod tests {
             matches!(err, FormatError::UnsupportedVirtualLayout),
             "expected UnsupportedVirtualLayout, got {err:?}"
         );
+    }
+
+    /// The two channels a caller has for one object's attributes.
+    struct AttrChannels {
+        owner: &'static str,
+        /// What `attrs` decoded — the values, lossily.
+        values: HashMap<String, AttrValue>,
+        /// What `attr_datatypes` reported — the encodings, exactly.
+        datatypes: HashMap<String, Datatype>,
+    }
+
+    /// Put the same attributes on the root group and on a dataset, write the
+    /// file, and read both channels back from each owner.
+    ///
+    /// Both owners, because `Group` and `Dataset` reach their attribute messages
+    /// by different routes: one parses an object header by address, the other
+    /// already holds one.
+    fn attr_channels(
+        values: &[(&str, AttrValue)],
+        verbatim: &[crate::attribute::AttributeMessage],
+    ) -> Vec<AttrChannels> {
+        let mut b = FileBuilder::new();
+        for (name, value) in values {
+            b.set_attr(name, value.clone());
+        }
+        for message in verbatim {
+            b.set_attr_verbatim(message.clone());
+        }
+        {
+            let ds = b.create_dataset("data").with_f64_data(&[1.0]);
+            for (name, value) in values {
+                ds.set_attr(name, value.clone());
+            }
+            for message in verbatim {
+                ds.set_attr_verbatim(message.clone());
+            }
+        }
+        let file = File::from_bytes(b.finish().unwrap()).unwrap();
+        let root = file.root();
+        let dataset = file.dataset("data").unwrap();
+        vec![
+            AttrChannels {
+                owner: "root group",
+                values: root.attrs().unwrap(),
+                datatypes: root.attr_datatypes().unwrap(),
+            },
+            AttrChannels {
+                owner: "dataset",
+                values: dataset.attrs().unwrap(),
+                datatypes: dataset.attr_datatypes().unwrap(),
+            },
+        ]
+    }
+
+    /// The datatype channel carries the width the value channel widens away: one
+    /// attribute, read as a 64-bit value and as the 4-byte type it is stored as.
+    ///
+    /// The pair is the point. `AttrValue` is documented as lossy, so a caller
+    /// that needs the encoding — to map it onto a typed column, say — needs
+    /// somewhere else to read it, and for an attribute there was nowhere (#248).
+    #[test]
+    fn attr_datatypes_reports_the_width_attrs_widens() {
+        for c in attr_channels(&[("count", AttrValue::I32(-7))], &[]) {
+            assert_eq!(
+                c.values.get("count"),
+                Some(&AttrValue::I64(-7)),
+                "{}: the value channel widens every integer to 64 bits",
+                c.owner
+            );
+            let Some(Datatype::FixedPoint { size, signed, .. }) = c.datatypes.get("count") else {
+                panic!(
+                    "{}: expected a fixed-point datatype, got {:?}",
+                    c.owner,
+                    c.datatypes.get("count")
+                );
+            };
+            assert_eq!(
+                (*size, *signed),
+                (4, true),
+                "{}: the datatype channel must report the width on disk",
+                c.owner
+            );
+        }
+    }
+
+    /// Every attribute message is reported, including one `attrs` drops because
+    /// no `AttrValue` can carry it.
+    ///
+    /// That is what lets a caller tell a dropped attribute from an absent one. An
+    /// omission with nothing to compare against is invisible, which is how every
+    /// `np.bool_` attribute in an h5py file went missing without a trace (#248).
+    #[test]
+    fn attr_datatypes_reports_an_attribute_attrs_omits() {
+        let opaque = Datatype::Opaque {
+            size: 3,
+            tag: b"rgb".to_vec(),
+        };
+        let raw = crate::attribute::AttributeMessage {
+            name: "raw".into(),
+            datatype: opaque.clone(),
+            dataspace: Dataspace {
+                space_type: crate::dataspace::DataspaceType::Scalar,
+                rank: 0,
+                dimensions: vec![],
+                max_dimensions: None,
+            },
+            raw_data: vec![1, 2, 3],
+        };
+
+        for c in attr_channels(&[("count", AttrValue::I32(1))], std::slice::from_ref(&raw)) {
+            assert!(
+                !c.values.contains_key("raw"),
+                "{}: an opaque attribute has no `AttrValue`, so `attrs` omits it — \
+                 if that changes, this test is measuring the wrong thing",
+                c.owner
+            );
+            assert_eq!(
+                c.datatypes.get("raw"),
+                Some(&opaque),
+                "{}: the datatype channel must report an attribute `attrs` omits",
+                c.owner
+            );
+            // Specific to the one attribute: a channel that reported only the
+            // undecodable one, or dropped its neighbour, would pass the above.
+            assert!(
+                c.values.contains_key("count") && c.datatypes.contains_key("count"),
+                "{}: the attribute beside it must appear in both channels",
+                c.owner
+            );
+        }
     }
 }
