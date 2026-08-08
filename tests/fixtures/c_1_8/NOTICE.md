@@ -8,56 +8,83 @@ unit test in `src/superblock.rs`.
 They are produced by `regen.c` in this directory, built and run by `regen.sh`
 against the 1.8.23 install that `scripts/check-hdf5-18.sh` leaves under
 `tmp/hdf5-18-check/`. Nothing in `cargo test` invokes either: the fixtures are
-committed, so the tests that read them are ordinary tests with no external
-dependency and run wherever `cargo test` does, 32-bit targets included.
+committed, so the tests reading them are ordinary tests with no external
+dependency.
 
-## Why an old library, and why committed
+## Why committed bytes, given the crosschecks already exist
 
-The suite already reaches old formats two ways, and both miss what these cover.
+These are not the first coverage of either format, and are not meant to replace
+what is there:
 
-The `hdf5-metno` dev-dependency builds a *current* libhdf5, which can be asked
-for an older format with `H5Pset_libver_bounds`. That is not the same artifact
-as an old library writing it — the modern library's encoder is what produces the
-bytes either way — and every test using it is gated off 32-bit targets, because
-`hdf5-metno` requires 64-bit pointers. Address arithmetic is exactly what breaks
-on 32-bit, so the gate removes the coverage where it is most wanted.
+- `tests/owned_swmr_crosscheck.rs` asks libhdf5 for a version 1 superblock
+  (`istore_k(33)`) and checks the parsed chunk B-tree K and status flags.
+- `tests/edit_crosscheck.rs` does the same for a version 2 superblock.
 
-The committed fixtures in `tests/fixtures/` cover superblock 0 (13 files) and
-superblock 3 (10 files), and nothing between. These two fill that gap:
+What both cost is the `hdf5-metno` dev-dependency, which requires 64-bit
+pointers. Every file using it therefore opens with
+`#![cfg(not(target_pointer_width = "32"))]` and compiles out on the i686 target
+— which is where address arithmetic is most likely to be wrong, and the reason
+the crate has a 32-bit CI job at all. Reading committed bytes needs no
+dev-dependency, so `tests/c_1_8_read_compat.rs` is in that job's target list.
 
-| file | superblock | why it is hard to get elsewhere |
-| --- | --- | --- |
-| `v1_superblock.h5` | 1 | The C library writes version 1 **only** when a B-tree K value is non-default. Nothing else in the corpus is a version 1 superblock at all. |
-| `v2_superblock.h5` | 2 | 1.8's newest format, and what this crate now writes by default for `.mat` files. A `.mat` a C-based tool has touched comes back looking like this. |
+The committed corpus also had nothing at these versions. Of the 80 tracked
+`.h5`/`.mat` fixtures before these two, **69 were superblock 0 and 11 were
+superblock 3**.
 
-## What `v1_superblock.h5` settles
+And one thing here exists nowhere else: `v2_superblock.h5` is a **version 2
+superblock carrying a version 1 B-tree chunk index**. This crate's writer cannot
+produce that pairing — it refuses chunked storage under a 1.8 bound, because the
+only chunk indices it writes arrived in 1.10 — so no round trip through it can
+stand in for the file.
 
-The version 1 superblock adds three B-tree K values, and a defect fixed in
-0.33.0 read two of them from the wrong offsets — the chunk B-tree K where the
-status flags belong, so a file with the C library's default K of 32 read back as
-"held by a writer" and every open refused it.
+## What `v1_superblock.h5` pins
+
+The version 1 superblock adds **one** field to version 0: the chunk B-tree K.
+(Version 0 already carries the two group K values.) It sits beside the status
+flags, and a defect fixed in 0.33.0 read the two from each other's offsets.
+
+That mattered because the status flags are the field `File::open` consults to
+refuse a file another writer holds. It could not misfire on a version 1 file
+itself — `file_lock::check_status_flags` returns early below superblock version
+3 — so the defect was a wrong answer from `File::superblock()`, not a wrongly
+refused open. The parse is what these fixtures pin.
 
 `src/superblock.rs` tested `parse_v1` against `build_v1_bytes`, which the same
-hand wrote from the same reading of the specification. Those two agree about the
-field order whether or not that order is right, which is what let the defect
-exist. Reproducing it — laying the bytes out the wrong way in *both* the builder
-and the parser — leaves both hand-built tests passing and fails only the test
-that reads this file.
+hand wrote from the same reading of the specification; the two agree about the
+field order whether or not that order is right. Laying the bytes out the wrong
+way in *both* leaves both hand-built tests passing. It does not survive the
+crosscheck above, and it does not survive this fixture either — the difference
+being that this one still runs when `hdf5-metno` is unavailable.
 
 The file is written with `H5Pset_sym_k(8, 16)` and `H5Pset_istore_k(64)`, so all
-three K values are distinct from one another and from the library's defaults,
-and any permutation of the three reads back wrong.
+three K values differ from one another and from 1.8.23's defaults (4 leaf, 16
+internal, 32 chunk), and any permutation of the three reads back wrong.
 
 ## Contents
 
-Both files hold the same objects, so a difference between them is the format:
+Both files hold the same objects, so a failure in one and not the other names
+the format:
 
 - `/values` — contiguous `f64[4]`, with a `units` string attribute
-- `/chunked` — `i32[1000]` in 100-element chunks, deflate level 6. Under a
-  pre-1.10 superblock this is indexed by a version 1 B-tree, which this crate
-  reads and does not write, so nothing it produces can stand in for it.
-- `/grp` — a group with a `tag` attribute, holding `/grp/inner`
+- `/chunked` — `i32[1000]` in 100-element chunks, deflate level 6. Written under
+  1.8 bounds in both files, so both are indexed by a version 1 B-tree.
+- `/grp` — a group with a `tag` attribute, holding `/grp/inner`. A v1 symbol
+  table in `v1_superblock.h5`, a link-message group in `v2_superblock.h5` —
+  a consequence of the libver bound `regen.c` uses, not of the superblock
+  version.
 - `/` — a `root_attr` string attribute
+
+## Regenerating
+
+`regen.sh` refuses to run against anything but HDF5 1.8.x, and checks the
+superblock version of each file it wrote. Both matter: `H5F_LIBVER_LATEST` in
+`regen.c` means "the 1.8 format" only because it is compiled against 1.8, and
+against 1.10 or newer the same source writes a version 3 superblock into
+`v2_superblock.h5` and a version 2 one into `v1_superblock.h5`.
+
+Rerun it only to change what the fixtures contain. The committed files are the
+ground truth the tests read; regenerating them for no reason replaces measured
+bytes with freshly measured bytes and reviews as a diff nobody can check.
 
 ## Licensing
 

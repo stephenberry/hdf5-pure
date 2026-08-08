@@ -1,37 +1,35 @@
-//! Reading files written by an actual HDF5 1.8 library.
+//! Reading files written by an actual HDF5 1.8 library, from committed bytes.
 //!
-//! The rest of the suite reaches old formats two ways, and both have a blind
-//! spot this covers.
+//! This is not the crate's first coverage of these formats, and does not claim
+//! to be. `tests/owned_swmr_crosscheck.rs` already asks libhdf5 for a version 1
+//! superblock and checks the parsed K values and status flags against it, and
+//! `tests/edit_crosscheck.rs` does the same for a version 2 one. What both cost
+//! is the `hdf5-metno` dev-dependency, which requires 64-bit pointers — so every
+//! file using it opens with `#![cfg(not(target_pointer_width = "32"))]` and
+//! compiles out on the i686 target, which is where address arithmetic is most
+//! likely to be wrong. Reading committed bytes needs no dev-dependency, so this
+//! runs there; it is listed in the `cross test` target list in `ci.yml`.
 //!
-//! `hdf5-metno` builds a *current* libhdf5, so a crosscheck can ask it for an
-//! older format with `H5Pset_libver_bounds` — but a modern library writing an
-//! old format is not the same artifact as an old library writing it, and every
-//! such test is gated off 32-bit targets (`hdf5-metno` needs 64-bit pointers),
-//! which is where the address-arithmetic bugs live. The committed fixtures under
-//! `tests/fixtures/` cover superblock 0 and 3 and nothing between.
+//! The committed corpus also had nothing at these versions: of the 80 tracked
+//! `.h5`/`.mat` fixtures before these two, 69 were superblock 0 and 11 were
+//! superblock 3.
 //!
-//! These two files are written by HDF5 1.8.23 and committed, so they need no
-//! dev-dependency and run everywhere `cargo test` does. They fill the gap at
-//! superblock 1 and 2:
+//! What the pair uniquely holds is `v2_superblock.h5`: a **version 2 superblock
+//! carrying a version 1 B-tree chunk index**. This crate's writer cannot produce
+//! that combination — it refuses chunked storage under a 1.8 bound, because the
+//! only chunk indices it writes arrived in 1.10 — so no round trip through it
+//! can stand in for the file.
 //!
-//! - **`v1_superblock.h5`** — a version 1 superblock, which the C library writes
-//!   only when a B-tree K value is non-default. Those K values are the fields
-//!   the version 1 layout adds, and reading them from the wrong offsets was a
-//!   real defect (fixed in 0.33.0). `src/superblock.rs` asserts the parsed
-//!   fields; this asserts the file is *usable* through the public API.
-//! - **`v2_superblock.h5`** — 1.8's newest format, and the one this crate now
-//!   writes by default for `.mat` files. A `.mat` a C-based tool has touched
-//!   comes back looking like this.
-//!
-//! Both hold the same content, so a difference between them is the format.
-//! See `tests/fixtures/c_1_8/NOTICE.md` for how they were produced.
+//! Both files hold the same objects, written by the same `regen.c`, so a failure
+//! in one and not the other names the format rather than the reader. See
+//! `tests/fixtures/c_1_8/NOTICE.md`.
 
 use hdf5_pure::{AttrValue, File};
 
 const V1: &str = "tests/fixtures/c_1_8/v1_superblock.h5";
 const V2: &str = "tests/fixtures/c_1_8/v2_superblock.h5";
 
-/// The values `regen.c` wrote, asserted against every reader entry point.
+/// The values `regen.c` wrote, read back through the public API.
 fn assert_contents(path: &str) {
     let f = File::open(path).unwrap_or_else(|e| panic!("{path}: {e:?}"));
 
@@ -47,9 +45,8 @@ fn assert_contents(path: &str) {
         "{path}: /values units"
     );
 
-    // Chunked and deflated. Under a pre-1.10 superblock this is a version 1
-    // B-tree chunk index — the index this crate reads and does not write, so
-    // nothing it produces can stand in for this file.
+    // Chunked and deflated, indexed by a version 1 B-tree in both files —
+    // `regen.c` writes them under 1.8 bounds, and 1.8 had no other chunk index.
     let expected: Vec<i32> = (0..1000).map(|i| i % 97).collect();
     assert_eq!(
         f.dataset("chunked").unwrap().read_i32().unwrap(),
@@ -57,8 +54,10 @@ fn assert_contents(path: &str) {
         "{path}: /chunked"
     );
 
-    // A group, its attribute, and a dataset inside it. On the version 1
-    // superblock the group is a v1 symbol table; on the version 2 it is not.
+    // A group, its attribute, and a dataset inside it. The two files differ here
+    // in a way the superblock version does not cause: `regen.c` builds the
+    // version 2 file under `H5F_LIBVER_LATEST`, so its root is a link-message
+    // group, where the version 1 file's is a v1 symbol table.
     assert_eq!(
         f.group("grp").unwrap().attrs().unwrap().get("tag"),
         Some(&AttrValue::AsciiString("group".into())),
@@ -78,55 +77,28 @@ fn assert_contents(path: &str) {
     );
 }
 
+/// The superblock version byte. Both fixtures have base address 0, so the
+/// signature is at offset 0 and this needs no scan.
+fn superblock_version(path: &str) -> u8 {
+    let bytes = std::fs::read(path).unwrap();
+    assert_eq!(
+        &bytes[..8],
+        b"\x89HDF\r\n\x1a\n",
+        "{path}: no signature at offset 0; the fixture grew a userblock"
+    );
+    bytes[8]
+}
+
 #[test]
 fn reads_a_c_written_version_1_superblock() {
+    // Guarded before the content checks: a fixture that stopped being a version
+    // 1 superblock should say so, rather than surfacing as a content failure.
+    assert_eq!(superblock_version(V1), 1);
     assert_contents(V1);
-    assert_eq!(
-        superblock_version(V1),
-        1,
-        "the fixture stopped being a version 1 superblock"
-    );
 }
 
 #[test]
 fn reads_a_c_written_version_2_superblock() {
+    assert_eq!(superblock_version(V2), 2);
     assert_contents(V2);
-    assert_eq!(
-        superblock_version(V2),
-        2,
-        "the fixture stopped being a version 2 superblock"
-    );
-}
-
-/// The two formats carry the same content, so every value read from one must
-/// equal the value read from the other.
-///
-/// Asserted because the pair is what makes either file diagnostic: a failure in
-/// only one of them names the format, where a failure in both names the reader.
-#[test]
-fn the_two_formats_carry_the_same_content() {
-    let (a, b) = (File::open(V1).unwrap(), File::open(V2).unwrap());
-    for name in ["values", "grp/inner"] {
-        assert_eq!(
-            a.dataset(name).unwrap().read_f64().unwrap(),
-            b.dataset(name).unwrap().read_f64().unwrap(),
-            "{name} differs between the two superblock versions"
-        );
-    }
-    assert_eq!(
-        a.dataset("chunked").unwrap().read_i32().unwrap(),
-        b.dataset("chunked").unwrap().read_i32().unwrap()
-    );
-    assert_eq!(a.root().attrs().unwrap(), b.root().attrs().unwrap());
-}
-
-/// The superblock version byte, located by scanning for the signature so a
-/// userblock would not throw the offset off.
-fn superblock_version(path: &str) -> u8 {
-    let bytes = std::fs::read(path).unwrap();
-    let sig = bytes
-        .windows(8)
-        .position(|w| w == b"\x89HDF\r\n\x1a\n")
-        .expect("the fixture carries an HDF5 signature");
-    bytes[sig + 8]
 }
