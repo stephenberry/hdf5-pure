@@ -298,11 +298,6 @@ impl Options {
     ///
     /// That is now the only difference from [`Options::default`]: the empty
     /// marker this used to override is the default encoding.
-    ///
-    /// One shape is this crate's rather than MATLAB's, and only if you also
-    /// select [`EmptySequencePolicy::Cell`]: an empty cell array is written
-    /// `0x1`, following the `[n, 1]` rule for 1-D cells, where MATLAB's `{}`
-    /// is `0x0`. `isempty` holds for both.
     pub fn with_modern_strings() -> Self {
         Self {
             string_class: StringClass::String,
