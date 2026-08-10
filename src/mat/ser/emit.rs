@@ -3,6 +3,7 @@
 use std::collections::VecDeque;
 
 use crate::file_writer::AttrValue;
+use crate::mat::builder::{RefsH5Path, refs_h5path};
 use crate::mat::class::MatClass;
 use crate::mat::error::MatError;
 use crate::mat::options::Options;
@@ -98,7 +99,7 @@ fn build_file(fields: Vec<(String, MatValue)>) -> Result<FileBuilder, MatError> 
         // Drain in FIFO order; emitting one entry may itself queue more
         // (nested cells), which the loop will pick up on later iterations.
         while let Some((name, value)) = refs.pop_front() {
-            emit_into_group(&mut refs_group, &name, value, &mut refs)?;
+            emit_into_group(&mut refs_group, &name, value, &mut refs, RefsH5Path::Own)?;
         }
         builder.add_group(refs_group.finish());
     }
@@ -117,7 +118,7 @@ fn emit_at_root(
     match value {
         MatValue::Omit => Ok(()),
         MatValue::Struct(fields) => {
-            let group = build_struct_group(name, fields, refs)?;
+            let group = build_struct_group(name, fields, refs, RefsH5Path::Omit)?;
             builder.add_group(group);
             Ok(())
         }
@@ -134,16 +135,20 @@ fn emit_into_group(
     name: &str,
     value: MatValue,
     refs: &mut RefsAccumulator,
+    h5path: RefsH5Path,
 ) -> Result<(), MatError> {
     match value {
         MatValue::Omit => Ok(()),
         MatValue::Struct(fields) => {
-            let sub = build_struct_group(name, fields, refs)?;
+            let sub = build_struct_group(name, fields, refs, h5path)?;
             group.add_group(sub);
             Ok(())
         }
         other => {
             let ds = group.create_dataset(name);
+            if h5path == RefsH5Path::Own {
+                ds.set_attr("H5PATH", refs_h5path(name));
+            }
             apply_value_to_dataset(ds, other, refs)
         }
     }
@@ -154,15 +159,23 @@ fn build_struct_group(
     name: &str,
     fields: Vec<(String, MatValue)>,
     refs: &mut RefsAccumulator,
+    h5path: RefsH5Path,
 ) -> Result<FinishedGroup, MatError> {
     let mut group = new_group_builder(name);
+    if h5path == RefsH5Path::Own {
+        // Before the struct's own attributes: MATLAB's order on a `#refs#`
+        // struct group is H5PATH, then MATLAB_class, then MATLAB_fields.
+        group.set_attr("H5PATH", refs_h5path(name));
+    }
     // Filter out Omit fields and record the surviving order.
     let mut live_names: Vec<String> = Vec::with_capacity(fields.len());
     for (fname, value) in fields {
         if matches!(value, MatValue::Omit) {
             continue;
         }
-        emit_into_group(&mut group, &fname, value, refs)?;
+        // A field of a struct is not itself a `#refs#` member, whatever the
+        // struct is.
+        emit_into_group(&mut group, &fname, value, refs, RefsH5Path::Omit)?;
         // `emit_into_group` only borrows the name, so move it in afterward
         // rather than cloning.
         live_names.push(fname);
