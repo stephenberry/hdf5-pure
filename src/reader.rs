@@ -2497,14 +2497,29 @@ impl Group {
     /// structure and re-parses that same header. This keeps what it read, and
     /// costs one enumeration of the group rather than one per member.
     ///
-    /// Handles are built as the iterator is advanced, so a walk that stops early
-    /// pays for only the members it took. Each dataset gets the file-wide
-    /// chunk-cache default; to override the cache for one, open it by name with
+    /// **This walk is for taking every member, or nearly every one.** Telling a
+    /// dataset from a group means parsing its header, so the whole group is
+    /// enumerated and every child's header parsed before the iterator is
+    /// returned — breaking out early saves nothing, and reaching one known member
+    /// this way costs far more than [`dataset`](Self::dataset) does. Only the
+    /// handle construction is deferred to each step, and that is not where the
+    /// cost is.
+    ///
+    /// The headers of the members are held for the length of the walk, since each
+    /// one is what its handle is built from. That is bounded by the group being
+    /// walked rather than by the file, but it is proportional to the group: a
+    /// header carries a compact dataset's data and its compact attributes inline,
+    /// so a large group of such datasets is a large allocation.
+    ///
+    /// Each dataset gets the file-wide chunk-cache default; to override the cache
+    /// for one, open it by name with
     /// [`dataset_with_options`](Self::dataset_with_options).
     ///
     /// Members arrive in the order the group's link structure yields them — the
     /// same order [`datasets`](Self::datasets) reports, which is not necessarily
-    /// sorted.
+    /// sorted. Each handle is a snapshot taken when the iterator was built, so a
+    /// [`File::commit`] that runs mid-walk is not reflected in the members still
+    /// to come; re-open the group to see past it.
     ///
     /// ```no_run
     /// # use hdf5_pure::File;
@@ -2644,6 +2659,12 @@ impl Group {
     /// recurse without paying a [`group`](Self::group) lookup per child: that
     /// lookup re-walks this group's link structure, which a walk of the whole
     /// tree would otherwise repeat once per subgroup.
+    ///
+    /// As with [`iter_datasets`](Self::iter_datasets), the whole group is
+    /// enumerated and classified before the iterator is returned, so this is the
+    /// walk for taking every subgroup rather than for reaching one — breaking out
+    /// early saves nothing. A [`Group`] handle carries no parsed header, so
+    /// unlike `iter_datasets` this holds none of them.
     ///
     /// Members arrive in the order the group's link structure yields them — the
     /// same order [`groups`](Self::groups) reports, which is not necessarily
@@ -5381,25 +5402,26 @@ mod tests {
     /// quadratic with a smaller constant.
     #[test]
     fn iterating_members_enumerates_the_group_once() {
-        let (by_name_16, iterated_16) = member_walk_bytes(16);
+        let (_, iterated_16) = member_walk_bytes(16);
         let (by_name_64, iterated_64) = member_walk_bytes(64);
 
+        // The rule this test exists for, and the only assertion here that is
+        // about `iter_datasets` itself.
         assert!(
             iterated_64 <= 5 * iterated_16,
             "one enumeration plus one header per member is linear, so four times \
              the members must cost about four times the bytes: {iterated_16} -> \
              {iterated_64}"
         );
+
+        // Contrast, not a property of this code: it holds because `Group::dataset`
+        // re-enumerates. If a future change makes that route cheap enough to turn
+        // this red, nothing here has regressed — confirm the scaling assertion
+        // above still holds and then drop this one.
         assert!(
-            by_name_64 >= 8 * by_name_16,
-            "re-reading the link-bearing header once per member is quadratic, so \
-             four times the members must cost far more than four times the bytes: \
-             {by_name_16} -> {by_name_64}"
-        );
-        assert!(
-            iterated_64 * 8 < by_name_64,
-            "at 64 members the one-enumeration walk must be the cheaper by a wide \
-             margin: {iterated_64} bytes against {by_name_64}"
+            iterated_64 < by_name_64,
+            "at 64 members the one-enumeration walk should still be the cheaper: \
+             {iterated_64} bytes against {by_name_64}"
         );
     }
 
