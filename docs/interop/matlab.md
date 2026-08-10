@@ -86,7 +86,7 @@ The serializer maps Rust types to HDF5 datasets and the MATLAB classes MATLAB ex
 
 ### 1-D vector orientation
 
-A `Vec<T>` becomes a MATLAB **column** vector — MATLAB `[N, 1]`, stored as HDF5 shape `[1, N]`, since HDF5 storage is the transpose of the MATLAB shape. Every 1-D array follows this rule, complex ones included.
+A `Vec<T>` becomes a MATLAB **column** vector — MATLAB `[N, 1]`, stored as HDF5 shape `[1, N]`, since HDF5 storage is the transpose of the MATLAB shape. Every 1-D array follows this rule, complex ones and [cell arrays](#cell-arrays) included.
 
 [`to_bytes`](https://docs.rs/hdf5-pure/latest/hdf5_pure/mat/fn.to_bytes.html) is fixed at that default. To get MATLAB `[1, N]` rows instead, write through `to_bytes_with_options` with `one_dimensional_mode: OneDimensionalMode::RowVector`:
 

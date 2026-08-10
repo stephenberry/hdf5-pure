@@ -461,10 +461,12 @@ pub(crate) enum MatValue {
     Struct(Vec<(String, MatValue)>),
     /// Heterogeneous sequence (`MATLAB_class = "cell"`). Each element is
     /// interned under `#refs#` and the parent dataset stores object
-    /// references in element order. The IR carries no shape: the writer
-    /// always emits a column-vector layout (`[n, 1]` MATLAB shape, `[1, n]`
-    /// HDF5 shape), and the deserializer flattens to a 1-D sequence. If
-    /// multi-dim cells ever ship, add a `dims` field then.
+    /// references in element order. The IR carries no shape: it is a 1-D
+    /// sequence, so the writer orients it the way it orients any other 1-D
+    /// value — `[n, 1]` MATLAB shape under the default `ColumnVector` mode,
+    /// `[1, n]` under `RowVector`, and `[0, 0]` when empty. The deserializer
+    /// flattens back to a 1-D sequence. If multi-dim cells ever ship, add a
+    /// `dims` field then.
     Cell(Vec<MatValue>),
     /// Empty struct array placeholder for `None` inside a sequence. Renders
     /// as MATLAB's `struct([])` (a `[0, 0]` empty marker with
