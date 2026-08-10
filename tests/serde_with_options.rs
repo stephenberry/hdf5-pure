@@ -215,7 +215,11 @@ fn the_one_dimensional_mode_orients_a_cell_array() {
         let mut opts = Options::default();
         opts.one_dimensional_mode = mode;
         let f = File::from_bytes(mat::to_bytes_with_options(&doc, &opts).unwrap()).unwrap();
-        assert_eq!(read_class(&f, "cells"), "cell", "{mode:?}: not a cell array");
+        assert_eq!(
+            read_class(&f, "cells"),
+            "cell",
+            "{mode:?}: not a cell array"
+        );
         assert_eq!(
             f.dataset("nums").unwrap().shape().unwrap(),
             storage,
