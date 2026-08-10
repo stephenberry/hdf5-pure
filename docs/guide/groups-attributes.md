@@ -87,6 +87,7 @@ Open the file and start from `File::root()`, which returns a `Group` for the roo
 
 - `groups()` returns the names of child groups (`Vec<String>`).
 - `datasets()` returns the names of child datasets (`Vec<String>`).
+- `iter_groups()` and `iter_datasets()` return those same children as opened handles paired with their names, walking the group once where opening each name separately re-walks it per member. Use them when the members themselves are what you want; use the name lists when a listing is.
 - `attrs()` returns the attributes as a `HashMap<String, AttrValue>`.
 - `attr_datatypes()` returns their on-disk datatypes as a `HashMap<String, Datatype>`.
 
