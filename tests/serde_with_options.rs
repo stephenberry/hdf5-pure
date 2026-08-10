@@ -2,8 +2,8 @@
 //! Tests for the new `to_bytes_with_options` / `to_file_with_options` API.
 
 use hdf5_pure::mat::{
-    self, Compression, EmptyMarkerEncoding, InvalidNamePolicy, OneDimensionalMode, Options,
-    StringClass,
+    self, Compression, EmptyMarkerEncoding, EmptySequencePolicy, InvalidNamePolicy,
+    OneDimensionalMode, Options, StringClass,
 };
 use hdf5_pure::{AttrValue, File, LibVer};
 use serde::{Deserialize, Serialize};
@@ -181,6 +181,74 @@ fn the_one_dimensional_mode_does_not_orient_an_empty_value() {
             f.dataset("v").unwrap().read_u64().unwrap(),
             vec![0, 0],
             "{mode:?} must still describe the empty value as 0x0"
+        );
+    }
+}
+
+/// A cell array is a 1-D value, so the mode orients it exactly as it orients a
+/// numeric vector in the same file. It used to be `Nx1` under both modes, from a
+/// shape rule of its own that the mode never reached.
+#[test]
+fn the_one_dimensional_mode_orients_a_cell_array() {
+    #[derive(Serialize)]
+    struct Doc {
+        nums: Vec<f64>,
+        cells: Vec<Vec<i32>>,
+    }
+    // Ragged on purpose: equal-length inner vectors unify to a *matrix*, whose
+    // shape is 2-D and has no orientation to take, so a rectangular fixture
+    // would measure the numeric path twice and never reach a cell at all. The
+    // class assertion below is what holds that.
+    let doc = Doc {
+        nums: vec![1.0, 2.0, 3.0],
+        cells: vec![vec![1], vec![2, 3], vec![4, 5, 6]],
+    };
+
+    // HDF5 storage shape is the reverse of the MATLAB shape, so a MATLAB `3x1`
+    // column is stored `[1, 3]` and a `1x3` row is stored `[3, 1]`. Asserting
+    // both datasets rather than only their agreement is what keeps this from
+    // passing on two shapes that are equally wrong.
+    for (mode, storage) in [
+        (OneDimensionalMode::ColumnVector, vec![1u64, 3]),
+        (OneDimensionalMode::RowVector, vec![3u64, 1]),
+    ] {
+        let mut opts = Options::default();
+        opts.one_dimensional_mode = mode;
+        let f = File::from_bytes(mat::to_bytes_with_options(&doc, &opts).unwrap()).unwrap();
+        assert_eq!(read_class(&f, "cells"), "cell", "{mode:?}: not a cell array");
+        assert_eq!(
+            f.dataset("nums").unwrap().shape().unwrap(),
+            storage,
+            "{mode:?}: numeric vector"
+        );
+        assert_eq!(
+            f.dataset("cells").unwrap().shape().unwrap(),
+            storage,
+            "{mode:?}: cell array"
+        );
+    }
+
+    // And an empty cell has no orientation to take, under either mode, the same
+    // rule `vector_dims` applies to every other empty.
+    #[derive(Serialize)]
+    struct Empty {
+        cells: Vec<Vec<i32>>,
+    }
+    for mode in [
+        OneDimensionalMode::ColumnVector,
+        OneDimensionalMode::RowVector,
+    ] {
+        let mut opts = Options::default();
+        opts.one_dimensional_mode = mode;
+        opts.empty_sequence_policy = EmptySequencePolicy::Cell;
+        let f = File::from_bytes(
+            mat::to_bytes_with_options(&Empty { cells: Vec::new() }, &opts).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            f.dataset("cells").unwrap().read_u64().unwrap(),
+            vec![0, 0],
+            "{mode:?}: empty cell is 0x0"
         );
     }
 }

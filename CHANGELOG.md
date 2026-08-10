@@ -8,13 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- **Breaking:** an empty cell array is written `0x0` rather than `0x1`, matching MATLAB's own `{}` and every other empty this crate writes. Reachable only under `EmptySequencePolicy::Cell`, since the default lowers an empty sequence to a `double` array instead. `isempty` held under both, so a reader that only tested emptiness is unaffected; one that compared `size(x, 2)` sees it change ([#258](https://github.com/stephenberry/hdf5-pure/pull/258)).
-
-  This completes the unification 0.34 began. That release moved every empty value to `0x0` and centralized the rule in `mat::dims` so the two MAT emitters could not drift apart again, but an empty cell took its shape from a rule of its own and kept writing `0x1` — so a value serialized through the serde writer and the same value converted through the BEVE walker produced different files. They agree again.
-
-### Fixed
-
-- The serde emitters' empty-value conformance test covers `EmptySequencePolicy::Cell`. That policy is the only way an empty cell is reachable, and its absence is why the drift survived 0.34: the check ran under the default policy, where an empty sequence is a `double` and the cell path is never taken ([#258](https://github.com/stephenberry/hdf5-pure/pull/258)).
+- **Breaking:** an empty cell array is written `0x0` rather than `0x1`, matching MATLAB's own `{}` and every other empty this crate writes. Reachable only under `EmptySequencePolicy::Cell` ([#258](https://github.com/stephenberry/hdf5-pure/pull/258)).
+- **Breaking:** a cell array takes the orientation `mat::Options::one_dimensional_mode` asks for, as every other 1-D value already did, so `RowVector` writes `1xN` where it used to write `Nx1` ([#258](https://github.com/stephenberry/hdf5-pure/pull/258)).
 
 ## [0.34.0] - 2026-08-08
 

@@ -229,6 +229,10 @@ fn apply_value_to_dataset(
 /// Stash each element under `#refs#` and write the parent dataset as a vector
 /// of object references. Shape is `[1, n]` HDF5 storage of a MATLAB `[n, 1]`
 /// column vector, matching `apply_vec_1d`.
+///
+/// Fixed rather than taken from `one_dimensional_mode`, for the same reason the
+/// empty case below is unreachable: this emitter has no [`Options`], so it only
+/// ever runs under the default, and the default is `ColumnVector`.
 fn apply_cell(
     ds: &mut DatasetBuilder,
     elements: Vec<MatValue>,
