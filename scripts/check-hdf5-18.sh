@@ -32,6 +32,17 @@
 #   committed (H5Tcommit) type    -> listed as a named datatype, and the dataset
 #                                    and attribute typed through it both read
 #
+# And on 1.8.23 when the cell fixture was added in 0.35.0:
+#   cell array                    -> 1.8 follows both object references to their
+#                                    `#refs#` targets and reads each one's data
+#   H5PATH on an interned object  -> reads back as the object's own path
+#   empty value                   -> its dimension payload reads as `0 0`
+#
+# The cell is what puts object references and a `#refs#` group in front of an
+# old library at all; before it the fixture was scalars, vectors, a struct and
+# an empty, and nothing here could have seen a regression in the shape that
+# every MATLAB cell array depends on.
+#
 # One thing that measurement showed about this file's shape: 1.8's h5dump gives
 # up on the *whole file* when a committed datatype does not decode, so the plain
 # checks above fail alongside the committed ones. The committed fixture is what
@@ -183,6 +194,24 @@ check_named_type() {  # check_named_type <description> <name> <file>
   fi
 }
 
+# An object-reference dataset is the one shape whose data is a pointer. 1.8's
+# h5dump follows each reference and prints the target as `DATASET <addr> "<path>"`
+# before its values, so collecting those paths in order shows the references
+# *resolving* — a dataset that opens with references that dangle would still
+# dump, with no target lines.
+check_ref_targets() {  # check_ref_targets <description> <expected paths> <file> <dataset>
+  local desc="$1" want="$2" file="$3" ds="$4" got
+  got="$({ "$H5DUMP" -d "$ds" "$file" 2>/dev/null || true; } |
+    sed -n 's/^[[:space:]]*DATASET [0-9][0-9]* "\(.*\)".*$/\1/p' |
+    tr '\n' ' ' | sed -e 's/ $//')"
+  if [ "$got" = "$want" ]; then
+    echo "  ok   $desc — resolved [$got]"
+  else
+    echo "  FAIL $desc — resolved [$got], expected [$want]"
+    failures=$((failures + 1))
+  fi
+}
+
 echo "==> the 1.10 format must be unreadable by 1.8 (or the bound buys nothing)"
 check "mat_v110.mat"  refuse "$FIXTURES/mat_v110.mat"
 check "plain_v110.h5" refuse "$FIXTURES/plain_v110.h5"
@@ -198,6 +227,27 @@ check_data "plain_v18.h5 /values"     "1 2 3" -d /values     "$FIXTURES/plain_v1
 check_data "plain_v18.h5 /grp/inner"  "7 8"   -d /grp/inner  "$FIXTURES/plain_v18.h5"
 check_data "mat_v18.mat /values"      "1 2 3" -d /values     "$FIXTURES/mat_v18.mat"
 check_data "mat_v18.mat /nested/count" "7"    -d /nested/count "$FIXTURES/mat_v18.mat"
+# An empty value's payload *is* its dimension vector, so this reads the `0x0`
+# rule itself rather than a dataset that happens to be empty.
+check_data "mat_v18.mat /empty"       "0 0"   -d /empty       "$FIXTURES/mat_v18.mat"
+
+# A cell array is the only shape that interns objects under `#refs#`: the parent
+# dataset holds object references instead of data, and each interned object
+# carries an `H5PATH` attribute alongside its `MATLAB_class`. Neither had ever
+# been put in front of an old library — the fixture had no cell in it — so a
+# regression in either was invisible here.
+echo "==> 1.8 must resolve a cell array's interned objects"
+check_ref_targets "mat_v18.mat /ragged references" \
+  "/#refs#/ref_0000000000000000 /#refs#/ref_0000000000000001" \
+  "$FIXTURES/mat_v18.mat" /ragged
+for ref in 0 1; do
+  name="ref_$(printf '%016x' "$ref")"
+  check_data "mat_v18.mat /#refs#/$name" \
+    "$([ "$ref" = 0 ] && echo "1" || echo "2 3")" \
+    -d "/#refs#/$name" "$FIXTURES/mat_v18.mat"
+  check_data "mat_v18.mat /#refs#/$name H5PATH" "\"/#refs#/$name\"" \
+    -a "/#refs#/$name/H5PATH" "$FIXTURES/mat_v18.mat"
+done
 
 # And the attribute values, not just the count the repack loop below compares.
 echo "==> 1.8 must read attribute values on all three kinds of object"

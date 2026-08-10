@@ -25,6 +25,12 @@ struct Demo {
     label: String,
     nested: Inner,
     empty: Vec<f64>,
+    /// Ragged, so it lowers to a cell array rather than a matrix. This is the
+    /// only shape that interns objects under `#refs#`, where each one carries
+    /// an `H5PATH` attribute and the parent dataset holds object references
+    /// rather than data — two things no other fixture here puts in front of an
+    /// old library.
+    ragged: Vec<Vec<i32>>,
 }
 
 #[derive(Serialize)]
@@ -42,6 +48,7 @@ fn demo() -> Demo {
             flag: true,
         },
         empty: Vec::new(),
+        ragged: vec![vec![1], vec![2, 3]],
     }
 }
 
