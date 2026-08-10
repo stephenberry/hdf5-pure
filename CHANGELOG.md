@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `Group::iter_datasets` and `Group::iter_groups` yield a group's members as opened handles paired with their names, walking the group once where opening each name from `datasets()` re-walks it per member ([#259](https://github.com/stephenberry/hdf5-pure/pull/259)).
+
 ## [0.35.0] - 2026-08-10
 
 A MAT cell array takes its shape and its metadata from the same rules as every other value this crate writes. An empty cell array is `0x0`, MATLAB's own `{}`, where it was `0x1`, and a cell array follows `mat::Options::one_dimensional_mode` like every other 1-D value, so `RowVector` writes `1xN` where a cell used to be a column whatever the option asked for; both are reachable only under non-default options, and `isempty` held under either empty shape, so a reader that only tested emptiness is unaffected. Every object a MAT write interns under `#refs#` — cell elements, struct elements, the MCOS subsystem's helpers — now carries the `H5PATH` attribute MATLAB writes on all but one of its own, which this crate wrote on none ([#258](https://github.com/stephenberry/hdf5-pure/pull/258)). Files written by earlier versions still read.
