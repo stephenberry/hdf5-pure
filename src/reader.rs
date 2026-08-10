@@ -5403,6 +5403,106 @@ mod tests {
         );
     }
 
+    /// A yielded handle must carry the chunk-cache configuration the file was
+    /// opened with, the same one `dataset` resolves for it.
+    ///
+    /// Nothing about the values read would show a handle that quietly ignored
+    /// it: the cache decides how often the chunk index is re-parsed and how much
+    /// decompressed data is retained, not what comes back. So the configuration
+    /// has to be asserted directly, or dropping it here is a silent regression.
+    #[test]
+    fn a_member_handle_carries_the_files_chunk_cache_config() {
+        let configured = ChunkCacheConfig::new()
+            .with_max_slots(17)
+            .with_max_bytes(4096)
+            .with_index_cache(false);
+        let file = File::from_bytes_with_options(
+            mixed_member_file(3, 0),
+            FileAccessProperties::new().with_chunk_cache(configured),
+        )
+        .unwrap();
+        let root = file.root();
+
+        let members: Vec<(String, Dataset)> = root.iter_datasets().unwrap().collect();
+        assert_eq!(members.len(), 3);
+        for (name, ds) in &members {
+            assert_eq!(
+                ds.chunk_cache_config(),
+                root.dataset(name).unwrap().chunk_cache_config(),
+                "{name} must resolve its cache the way `dataset` does"
+            );
+            assert_eq!(
+                ds.chunk_cache_config(),
+                configured,
+                "{name} must carry the configuration the file was opened with"
+            );
+        }
+    }
+
+    /// A file whose root holds `inner` and `sub`, and a group `g0` holding
+    /// children of those same names, plus a `refs` dataset pointing at `g0`.
+    ///
+    /// The duplicated names are the trap: a member handle that wrongly took a
+    /// root-relative path would address a real object rather than fail, so the
+    /// mistake would look like a successful write.
+    fn dereferenced_group_file() -> Vec<u8> {
+        let mut b = FileBuilder::new();
+        b.create_dataset("inner").with_i32_data(&[0]);
+        let mut root_sub = b.create_group("sub");
+        root_sub.create_dataset("x").with_i32_data(&[0]);
+        b.add_group(root_sub.finish());
+
+        let mut g = b.create_group("g0");
+        g.create_dataset("inner").with_i32_data(&[1]);
+        let mut nested = g.create_group("sub");
+        nested.create_dataset("x").with_i32_data(&[1]);
+        g.add_group(nested.finish());
+        b.add_group(g.finish());
+
+        b.create_dataset("refs").with_path_references(&["g0"]);
+        b.finish().expect("write the fixture")
+    }
+
+    /// A group reached by object reference has no resolvable path, so neither can
+    /// its members: there is nothing for a write through one to address. The
+    /// iterators must carry that `None` across rather than fall back to a
+    /// root-relative path, which here would reach a different, real object.
+    #[test]
+    fn members_of_a_dereferenced_group_have_no_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("refs.h5");
+        std::fs::write(&path, dereferenced_group_file()).unwrap();
+
+        let file = File::open_rw(&path).unwrap();
+        let mut objects = file.dataset("refs").unwrap().dereference().unwrap();
+        let group = match objects.remove(0) {
+            Object::Group(g) => g,
+            other => panic!("expected a group, got {other:?}"),
+        };
+
+        // The file is writable and both names exist at the root, so a refusal
+        // here can only come from the handle having no path to address.
+        let (name, mut member) = group.iter_datasets().unwrap().next().unwrap();
+        assert_eq!(name, "inner");
+        assert!(
+            matches!(
+                member.set_attr("tag", AttrValue::I64(1)),
+                Err(Error::ReadOnly)
+            ),
+            "a member of a path-less group must refuse a write, not address `/inner`"
+        );
+
+        let (name, subgroup) = group.iter_groups().unwrap().next().unwrap();
+        assert_eq!(name, "sub");
+        assert!(
+            matches!(
+                subgroup.set_attr("tag", AttrValue::I64(1)),
+                Err(Error::ReadOnly)
+            ),
+            "and so must a subgroup of one, not address `/sub`"
+        );
+    }
+
     /// A yielded handle must carry the same root-relative path as one opened by
     /// name, or a write through it would address the wrong object — or no object
     /// at all. A member of a *subgroup* is the case that separates them, since
