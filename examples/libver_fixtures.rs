@@ -31,6 +31,15 @@ struct Demo {
     /// rather than data — two things no other fixture here puts in front of an
     /// old library.
     ragged: Vec<Vec<i32>>,
+    /// A sequence of structs interns a *group* per element, so `H5PATH` lands
+    /// on a group rather than a dataset, and `MATLAB_fields` — the only
+    /// variable-length string array this crate writes, and so the only
+    /// attribute of its kind an old library has to decode here — appears on an
+    /// object under `#refs#`.
+    records: Vec<Inner>,
+    /// The `None` slot interns a `struct([])` empty marker of its own, which is
+    /// an empty marker in a position no other fixture puts one.
+    optional: Vec<Option<f64>>,
 }
 
 #[derive(Serialize)]
@@ -49,6 +58,17 @@ fn demo() -> Demo {
         },
         empty: Vec::new(),
         ragged: vec![vec![1], vec![2, 3]],
+        records: vec![
+            Inner {
+                count: 11,
+                flag: false,
+            },
+            Inner {
+                count: 13,
+                flag: true,
+            },
+        ],
+        optional: vec![Some(1.5), None],
     }
 }
 
@@ -111,12 +131,25 @@ fn main() {
     opts.libver = LibVer::V110;
     mat::to_file_with_options(&demo(), &mat_v110, &opts).expect("write 1.10 mat");
 
+    // The `string` class, in the 1.8 format. Two things reach an old library
+    // only through this file: the MCOS subsystem — a `#subsystem#` group, a
+    // `FileWrapper__` metadata blob, reference-array templates, and the one
+    // `#refs#` object that carries no `H5PATH` — and the builder-backed
+    // emitter, since `to_file` above goes through the walker instead and the
+    // builder's only other output here is the 1.10 file, which 1.8 refuses by
+    // design and so never reads.
+    let mat_string_v18 = out.join("mat_string_v18.mat");
+    let mut string_opts = Options::default();
+    string_opts.string_class = mat::StringClass::String;
+    mat::to_file_with_options(&demo(), &mat_string_v18, &string_opts)
+        .expect("write 1.8 string-class mat");
+
     let h5_v18 = out.join("plain_v18.h5");
     write_h5(&h5_v18, LibVer::V18);
     let h5_v110 = out.join("plain_v110.h5");
     write_h5(&h5_v110, LibVer::V110);
 
-    for path in [&mat_v18, &mat_v110, &h5_v18, &h5_v110] {
+    for path in [&mat_v18, &mat_v110, &mat_string_v18, &h5_v18, &h5_v110] {
         println!("{} superblock {}", path.display(), superblock_version(path));
     }
 }

@@ -32,16 +32,25 @@
 #   committed (H5Tcommit) type    -> listed as a named datatype, and the dataset
 #                                    and attribute typed through it both read
 #
-# And on 1.8.23 when the cell fixture was added in 0.35.0:
-#   cell array                    -> 1.8 follows both object references to their
-#                                    `#refs#` targets and reads each one's data
-#   H5PATH on an interned object  -> reads back as the object's own path
-#   empty value                   -> its dimension payload reads as `0 0`
+# And on 1.8.23 when the cell and string-class fixtures were added in 0.35.0:
+#   cell of vectors, of structs,  -> 1.8 follows every object reference to its
+#   and of a `None`                  `#refs#` target — datasets and groups alike
+#                                    — and reads each one's data
+#   H5PATH on an interned object  -> reads back as the object's own path, on a
+#                                    group as well as a dataset
+#   the canonical empty           -> carries no H5PATH, as in MATLAB's own files
+#   MATLAB_fields                 -> the vlen string array decodes
+#   empty value, `struct([])`     -> the dimension payload reads as `0 0`
+#   MCOS subsystem                -> the opaque handle, the templates' reference
+#                                    arrays and the alias all read
 #
-# The cell is what puts object references and a `#refs#` group in front of an
-# old library at all; before it the fixture was scalars, vectors, a struct and
-# an empty, and nothing here could have seen a regression in the shape that
-# every MATLAB cell array depends on.
+# Those two fixtures are what put object references, a `#refs#` group, a vlen
+# attribute and an MCOS subsystem in front of an old library at all; before them
+# this was scalars, vectors, a struct, a string and an empty. Nor had 1.8 ever
+# read the builder-backed emitter's output: `to_file` goes through the walker,
+# and the builder's only other fixture is the 1.10 file, which 1.8 refuses by
+# design. `mat_string_v18.mat` is written through the builder for that reason as
+# much as for the subsystem.
 #
 # One thing that measurement showed about this file's shape: 1.8's h5dump gives
 # up on the *whole file* when a committed datatype does not decode, so the plain
@@ -201,8 +210,10 @@ check_named_type() {  # check_named_type <description> <name> <file>
 # dump, with no target lines.
 check_ref_targets() {  # check_ref_targets <description> <expected paths> <file> <dataset>
   local desc="$1" want="$2" file="$3" ds="$4" got
+  # `GROUP` as well as `DATASET`: a cell of structs interns a group per element,
+  # and h5dump labels a resolved reference by the kind of object it found.
   got="$({ "$H5DUMP" -d "$ds" "$file" 2>/dev/null || true; } |
-    sed -n 's/^[[:space:]]*DATASET [0-9][0-9]* "\(.*\)".*$/\1/p' |
+    sed -nE 's/^[[:space:]]*(DATASET|GROUP) [0-9]+ "(.*)".*$/\2/p' |
     tr '\n' ' ' | sed -e 's/ $//')"
   if [ "$got" = "$want" ]; then
     echo "  ok   $desc — resolved [$got]"
@@ -212,13 +223,28 @@ check_ref_targets() {  # check_ref_targets <description> <expected paths> <file>
   fi
 }
 
+# An attribute this crate deliberately does *not* write. h5dump exits 1 for a
+# missing attribute and for a missing object alike, so every use of this pairs
+# with a value check on the same object: absence has to mean the attribute is
+# gone, not that the walk went somewhere that does not exist.
+check_absent_attr() {  # check_absent_attr <description> <file> <object/attribute>
+  local desc="$1" file="$2" attr="$3"
+  if "$H5DUMP" -a "$attr" "$file" > /dev/null 2>&1; then
+    echo "  FAIL $desc — the attribute is present"
+    failures=$((failures + 1))
+  else
+    echo "  ok   $desc — absent"
+  fi
+}
+
 echo "==> the 1.10 format must be unreadable by 1.8 (or the bound buys nothing)"
 check "mat_v110.mat"  refuse "$FIXTURES/mat_v110.mat"
 check "plain_v110.h5" refuse "$FIXTURES/plain_v110.h5"
 
 echo "==> the 1.8 format must be readable by 1.8"
-check "mat_v18.mat"  open "$FIXTURES/mat_v18.mat"
-check "plain_v18.h5" open "$FIXTURES/plain_v18.h5"
+check "mat_v18.mat"        open "$FIXTURES/mat_v18.mat"
+check "mat_string_v18.mat" open "$FIXTURES/mat_string_v18.mat"
+check "plain_v18.h5"       open "$FIXTURES/plain_v18.h5"
 
 # Both fixtures are written by `examples/libver_fixtures.rs`; these are the
 # values it puts in them. Reading the *data* is the half `-n` cannot do.
@@ -237,17 +263,55 @@ check_data "mat_v18.mat /empty"       "0 0"   -d /empty       "$FIXTURES/mat_v18
 # been put in front of an old library — the fixture had no cell in it — so a
 # regression in either was invisible here.
 echo "==> 1.8 must resolve a cell array's interned objects"
-check_ref_targets "mat_v18.mat /ragged references" \
-  "/#refs#/ref_0000000000000000 /#refs#/ref_0000000000000001" \
-  "$FIXTURES/mat_v18.mat" /ragged
-for ref in 0 1; do
-  name="ref_$(printf '%016x' "$ref")"
-  check_data "mat_v18.mat /#refs#/$name" \
-    "$([ "$ref" = 0 ] && echo "1" || echo "2 3")" \
-    -d "/#refs#/$name" "$FIXTURES/mat_v18.mat"
-  check_data "mat_v18.mat /#refs#/$name H5PATH" "\"/#refs#/$name\"" \
-    -a "/#refs#/$name/H5PATH" "$FIXTURES/mat_v18.mat"
+MAT="$FIXTURES/mat_v18.mat"
+# `demo()` interns in field order: ragged's two vectors, records' two structs,
+# then optional's scalar and its `struct([])`.
+r() { printf '/#refs#/ref_%016x' "$1"; }
+check_ref_targets "mat_v18.mat /ragged references"   "$(r 0) $(r 1)" "$MAT" /ragged
+check_ref_targets "mat_v18.mat /records references"  "$(r 2) $(r 3)" "$MAT" /records
+check_ref_targets "mat_v18.mat /optional references" "$(r 4) $(r 5)" "$MAT" /optional
+
+# Each interned object's own data and the H5PATH it carries. A cell of vectors
+# interns datasets; a cell of structs interns groups, which is where the
+# attribute lands on a group rather than a dataset.
+check_data "mat_v18.mat $(r 0)"        "1"   -d "$(r 0)" "$MAT"
+check_data "mat_v18.mat $(r 1)"        "2 3" -d "$(r 1)" "$MAT"
+check_data "mat_v18.mat $(r 2)/count"  "11"  -d "$(r 2)/count" "$MAT"
+check_data "mat_v18.mat $(r 3)/count"  "13"  -d "$(r 3)/count" "$MAT"
+check_data "mat_v18.mat $(r 4)"        "1.5" -d "$(r 4)" "$MAT"
+# The `struct([])` a `None` slot lowers to: an empty marker under `#refs#`,
+# whose payload is its own dimension vector.
+check_data "mat_v18.mat $(r 5) struct([])" "0 0" -d "$(r 5)" "$MAT"
+for ref in 0 1 2 3 4 5; do
+  check_data "mat_v18.mat $(r "$ref") H5PATH" "\"$(r "$ref")\"" \
+    -a "$(r "$ref")/H5PATH" "$MAT"
 done
+
+# `MATLAB_fields` is the only variable-length string array this crate writes —
+# a vlen of one-character strings, held in the global heap rather than inline.
+# Nothing else here asks an old library to decode that shape.
+check_data "mat_v18.mat $(r 2) MATLAB_fields" \
+  '("c" "o" "u" "n" "t") ("f" "l" "a" "g")' \
+  -a "$(r 2)/MATLAB_fields" "$MAT"
+
+# The `string` class builds an MCOS subsystem: a `#subsystem#/MCOS` blob, a
+# FileWrapper metadata ref, two reference-array templates, an alias, and the
+# canonical empty. This is also the only 1.8 file here written by the
+# builder-backed emitter — `to_file` uses the walker, and the builder's other
+# output is the 1.10 file 1.8 refuses.
+echo "==> 1.8 must read the MCOS subsystem the string class builds"
+STR="$FIXTURES/mat_string_v18.mat"
+# The opaque handle MATLAB resolves through the subsystem: 0xDD000000, then the
+# class and object ids.
+check_data "mat_string_v18.mat /label" "3707764736 2 1 1 1 1" -d /label "$STR"
+check_data "mat_string_v18.mat MCOS alias"    "0 0" -d "$(r 12)" "$STR"
+check_ref_targets "mat_string_v18.mat template B" "$(r 13) $(r 14)" "$STR" "$(r 15)"
+# The canonical empty is the one object under `#refs#` MATLAB leaves without an
+# H5PATH, so it is the one we leave without one too. The class check is what
+# keeps the absence check honest: it names the object as the one intended.
+check_data "mat_string_v18.mat canonical empty" '"canonical empty"' \
+  -a "$(r 8)/MATLAB_class" "$STR"
+check_absent_attr "mat_string_v18.mat canonical empty H5PATH" "$STR" "$(r 8)/H5PATH"
 
 # And the attribute values, not just the count the repack loop below compares.
 echo "==> 1.8 must read attribute values on all three kinds of object"
@@ -271,7 +335,7 @@ check_data "plain_v18.h5 /typed baseline" "9"     -a /typed/baseline "$FIXTURES/
 # header that declares no attributes makes h5repack copy the object without
 # them, silently. Counting `ATTRIBUTE` blocks in the dump is enough to see it.
 echo "==> a 1.8 h5repack round trip must preserve every attribute"
-for f in mat_v18.mat plain_v18.h5; do
+for f in mat_v18.mat mat_string_v18.mat plain_v18.h5; do
   before=$("$H5DUMP" -A "$FIXTURES/$f" 2>/dev/null | grep -c 'ATTRIBUTE' || true)
   rm -f "$FIXTURES/repacked-$f"
   if ! "$H5REPACK" "$FIXTURES/$f" "$FIXTURES/repacked-$f" > /dev/null 2>&1; then
