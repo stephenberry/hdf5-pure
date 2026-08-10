@@ -156,6 +156,8 @@ An empty complex array is written here as a zero-element `{real, imag}` compound
 
 A sequence whose elements do not unify into a single numeric matrix lowers to a MATLAB cell array rather than erroring. Each element is interned under the conventional `#refs#` group, and the parent dataset stores HDF5 object references with `MATLAB_class = "cell"`. This covers `Vec<Struct>`, `Vec<Option<T>>` with interspersed `None`, nested cells of cells, and ragged `Vec<Vec<T>>`. An `Option::None` slot inside a sequence becomes `struct([])` so every cell slot has a defined MATLAB type.
 
+Each interned object also carries `H5PATH`, the absolute path of the object itself, which is what MATLAB writes on all but one of its own (the `canonical empty` placeholder in the MCOS subsystem carries none). Nothing here reads the attribute — an object reference resolves without it — and MATLAB stamps objects deeper than `#refs#`'s immediate children with a value that is *not* their path, which this crate does not reproduce.
+
 ```rust
 use hdf5_pure::mat;
 use serde::{Serialize, Deserialize};
