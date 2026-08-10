@@ -105,11 +105,14 @@ fn emit_at_root(mb: &mut MatBuilder, name: &str, value: MatValue) -> Result<(), 
         MatValue::Struct(fields) => mb
             .struct_(name, |sw| emit_struct_fields(sw, fields))
             .map(|_| ()),
-        MatValue::Cell(elements) => mb
-            .cell(name, &cell_dims(elements.len()), |cw| {
-                emit_cell_elements(cw, elements)
-            })
-            .map(|_| ()),
+        MatValue::Cell(elements) => {
+            // A cell built from a sequence is a 1-D value, so its shape is the
+            // one `dims::vector_dims` gives every other 1-D value: oriented by
+            // `one_dimensional_mode`, and `0x0` when empty.
+            let dims = mb.vector_dims(elements.len());
+            mb.cell(name, &dims, |cw| emit_cell_elements(cw, elements))
+                .map(|_| ())
+        }
         other => emit_leaf_at_builder(mb, name, other),
     }
 }
@@ -133,11 +136,11 @@ fn emit_at_struct(sw: &mut StructWriter, name: &str, value: MatValue) -> Result<
         MatValue::Struct(fields) => sw
             .struct_(name, |inner| emit_struct_fields(inner, fields))
             .map(|_| ()),
-        MatValue::Cell(elements) => sw
-            .cell(name, &cell_dims(elements.len()), |cw| {
-                emit_cell_elements(cw, elements)
-            })
-            .map(|_| ()),
+        MatValue::Cell(elements) => {
+            let dims = sw.vector_dims(elements.len());
+            sw.cell(name, &dims, |cw| emit_cell_elements(cw, elements))
+                .map(|_| ())
+        }
         other => emit_leaf_at_struct(sw, name, other),
     }
 }
@@ -158,7 +161,7 @@ fn emit_cell_element(cw: &mut CellWriter, value: MatValue) -> Result<(), MatErro
             cw.push_struct(|sw| emit_struct_fields(sw, fields))?;
         }
         MatValue::Cell(elements) => {
-            let dims = cell_dims(elements.len());
+            let dims = cw.vector_dims(elements.len());
             cw.push_cell(&dims, |inner| emit_cell_elements(inner, elements))?;
         }
         MatValue::Scalar(n) => emit_cell_scalar(cw, n)?,
@@ -542,16 +545,6 @@ fn emit_string_at_struct(sw: &mut StructWriter, name: &str, s: &str) -> Result<(
             .write_string_object(name, &[s.to_owned()], &[1, 1])
             .map(|_| ()),
     }
-}
-
-fn cell_dims(n: usize) -> [usize; 2] {
-    // A 1-D cell is `[n, 1]`, and an empty one is the same rule at n = 0
-    // rather than a special `[0, 0]`: `isempty` holds either way, but `[0, 1]`
-    // keeps `size(x, 2)` stable as a list empties out, and is what a BEVE
-    // empty array converts to. This does differ from MATLAB's own `{}`, which
-    // is `0x0`. `n = 0` is reachable only under `EmptySequencePolicy::Cell`,
-    // since the default lowers an empty sequence to a `double` array instead.
-    [n, 1]
 }
 
 fn scalar_class(tag: ScalarTag) -> MatClass {

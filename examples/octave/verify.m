@@ -351,4 +351,31 @@ else
 end
 clearvars
 
+fprintf('=== cell_shapes.mat / cell_shapes_rows.mat ===\n');
+% The shapes 0.35.0 changed: an empty cell is `0x0` rather than `0x1`, and a
+% cell takes the 1-D orientation the writer was asked for instead of always
+% being a column. The two files hold identical content and differ only in that
+% orientation. `check_cell_shapes.m` covers the same ground with its own
+% reporting; this is here so the standing suite carries it too.
+%
+% Same Octave limitation as cells.mat above, and the same skip.
+warning('off', 'load:unsupported');
+s = load('cell_shapes.mat');
+r = load('cell_shapes_rows.mat');
+if ~isfield(s, 'ragged')
+  fprintf('  skipped: this loader does not support v7.3 cell arrays\n');
+  fprintf('           (Octave 11 limitation; verify with MATLAB)\n');
+else
+  ok(iscell(s.empty_cell), 'empty_cell iscell');
+  ok(isequal(size(s.empty_cell), [0 0]), 'empty_cell is 0x0');
+  ok(isequal(size(s.ragged), [2 1]), 'ragged is a column when asked');
+  ok(isequal(size(r.ragged), [1 2]), 'ragged is a row when asked');
+  ok(isequal(size(r.empty_cell), [0 0]), 'empty_cell is 0x0 under either mode');
+  ok(isequal(double(s.ragged{1}(:))', [1 2 3]), 'ragged{1} contents');
+  ok(isequal(double(r.ragged{1}(:))', [1 2 3]), 'ragged{1} contents, row file');
+  ok(s.records{2}.x == 3.0, 'records{2}.x');
+  ok(mat_is_empty_struct(s.optionals{2}), 'optionals{2} is struct([])');
+end
+clearvars
+
 fprintf('\nAll fixtures verified.\n');

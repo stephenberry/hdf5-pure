@@ -22,7 +22,7 @@
 //! the measurement fails rather than silently disagreeing with the rule the
 //! writer follows.
 
-use hdf5_pure::mat::{self, MatBuilder, MatClass, Options};
+use hdf5_pure::mat::{self, EmptySequencePolicy, MatBuilder, MatClass, Options};
 use hdf5_pure::{AttrValue, File};
 use serde::Serialize;
 
@@ -169,6 +169,12 @@ fn our_empty_markers_carry_the_same_attributes_matlab_writes() {
 /// The serde path, through both emitters, for every kind of empty a Rust value
 /// can produce. `MATLAB_int_decode` reached this path through `String` and
 /// `Vec<bool>`, which are the char and logical cases.
+///
+/// `EmptySequencePolicy::Cell` is a case of its own because it is the only way
+/// an empty *cell* is reachable, and an empty cell took its shape from a rule
+/// of its own rather than from `dims`. That is how it kept writing `0x1` after
+/// every other empty moved to `0x0`, leaving the serde writer disagreeing with
+/// the BEVE walker for the same value.
 #[test]
 fn the_serde_emitters_write_matlab_conformant_empties() {
     #[derive(Serialize)]
@@ -187,11 +193,18 @@ fn the_serde_emitters_write_matlab_conformant_empties() {
         absent: None,
     };
 
+    let mut as_cells = Options::default();
+    as_cells.empty_sequence_policy = EmptySequencePolicy::Cell;
+
     for (label, bytes) in [
         ("to_bytes", mat::to_bytes(&doc).unwrap()),
         (
             "to_bytes_with_options",
             mat::to_bytes_with_options(&doc, &Options::default()).unwrap(),
+        ),
+        (
+            "to_bytes_with_options(Cell)",
+            mat::to_bytes_with_options(&doc, &as_cells).unwrap(),
         ),
     ] {
         let f = File::from_bytes(bytes).unwrap();

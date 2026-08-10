@@ -53,6 +53,35 @@ use crate::writer::FileBuilder;
 const REFS_GROUP: &str = "#refs#";
 const SUBSYSTEM_GROUP: &str = "#subsystem#";
 
+/// The `H5PATH` attribute MATLAB stamps on an object interned under `#refs#`:
+/// the object's own absolute path.
+///
+/// Measured across the MATLAB-authored fixtures in `tests/fixtures/mat_real`:
+/// every object directly under `#refs#` carries it — 519 of them — with two
+/// exceptions that hold in all eight files, the `canonical empty` placeholder
+/// and `#subsystem#/MCOS`. Set before the `MATLAB_*` attributes, which is the
+/// order MATLAB writes them in.
+///
+/// MATLAB also stamps objects *deeper* than that, with a value that is not
+/// their path: a field of the struct at `#refs#/j` gets `/#refs#/jj`, its
+/// parent's value with the parent's own name appended again, which names an
+/// object the file does not contain. That artifact is not reproduced — nothing
+/// below `#refs#`'s immediate children carries the attribute here.
+pub(crate) fn refs_h5path(ref_name: &str) -> AttrValue {
+    AttrValue::AsciiString(format!("/{REFS_GROUP}/{ref_name}"))
+}
+
+/// Whether an object being written carries [`refs_h5path`]. Shared by both MAT
+/// emitters, so the rule has one definition rather than one per writer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefsH5Path {
+    /// Stamp the object's own path. Every `#refs#` member but one.
+    Own,
+    /// Write no `H5PATH`: the object is not a `#refs#` member, or it is the
+    /// `canonical empty` placeholder, which MATLAB leaves unstamped.
+    Omit,
+}
+
 /// Top-level MAT v7.3 writer.
 pub struct MatBuilder {
     file: FileBuilder,
@@ -201,7 +230,11 @@ impl MatBuilder {
             TargetForName::Struct { name, index } => {
                 self.open_structs[*index].group.create_dataset(name)
             }
-            TargetForName::Ref(ref_name) => self.refs_mut().create_dataset(ref_name),
+            TargetForName::Ref(ref_name) => {
+                let ds = self.refs_mut().create_dataset(ref_name);
+                ds.set_attr("H5PATH", refs_h5path(ref_name));
+                ds
+            }
         }
     }
 
@@ -661,6 +694,7 @@ impl MatBuilder {
         {
             let refs = self.refs_mut();
             let ds = refs.create_dataset(&payload_ref);
+            ds.set_attr("H5PATH", refs_h5path(&payload_ref));
             ds.with_u64_data(&payload).with_shape(&payload_shape);
             ds.set_attr(
                 "MATLAB_class",
@@ -785,7 +819,13 @@ impl MatBuilder {
             }
         };
 
-        let group = GroupBuilder::new(&group_name);
+        let mut group = GroupBuilder::new(&group_name);
+        if matches!(parent, ParentKind::Refs) {
+            // Before the struct's own attributes, which `close_struct` sets:
+            // MATLAB's order on a `#refs#` struct group is H5PATH, then
+            // MATLAB_class, then MATLAB_fields.
+            group.set_attr("H5PATH", refs_h5path(&group_name));
+        }
         self.open_structs.push(OpenStruct {
             group,
             used_names: HashSet::new(),
@@ -1027,10 +1067,11 @@ impl MatBuilder {
             .map_err(|e| Self::attribute_failure(&stash, e))
     }
 
-    /// Build the MCOS subsystem. Lifts the layout from the beve writer
-    /// byte-for-byte: 5 helper refs (FileWrapper, canonical empty,
-    /// unknown-template-A, alias-int32, unknown-template-B) plus the
-    /// per-string saveobj payload paths.
+    /// Build the MCOS subsystem. Lifts the layout from the beve writer: 5
+    /// helper refs (FileWrapper, canonical empty, unknown-template-A,
+    /// alias-int32, unknown-template-B) plus the per-string saveobj payload
+    /// paths. Byte-for-byte apart from the [`refs_h5path`] attribute, which
+    /// MATLAB writes on all of these but the canonical empty.
     fn emit_subsystem(&mut self) -> Result<(), MatError> {
         // 1. FileWrapper__ metadata blob.
         let metadata = string_object::build_string_filewrapper_metadata(
@@ -1042,6 +1083,7 @@ impl MatBuilder {
         {
             let refs = self.refs_mut();
             let ds = refs.create_dataset(&metadata_ref);
+            ds.set_attr("H5PATH", refs_h5path(&metadata_ref));
             ds.with_u8_data(&metadata).with_shape(&metadata_shape);
             ds.set_attr(
                 "MATLAB_class",
@@ -1052,16 +1094,23 @@ impl MatBuilder {
         // 2. Canonical empty.
         let canonical_ref = self.alloc_ref_name();
         let canonical_path = format!("{REFS_GROUP}/{canonical_ref}");
-        self.write_subsystem_empty_marker(&canonical_ref, &[0, 0], "canonical empty", None);
+        // The one object under `#refs#` MATLAB leaves without an `H5PATH`.
+        self.write_subsystem_empty_marker(
+            &canonical_ref,
+            &[0, 0],
+            "canonical empty",
+            None,
+            RefsH5Path::Omit,
+        );
 
         // 3. Unknown template A: cell with two empty struct refs.
         let empty_a1 = self.alloc_ref_name();
         let empty_a1_path = format!("{REFS_GROUP}/{empty_a1}");
-        self.write_subsystem_empty_marker(&empty_a1, &[1, 0], "struct", None);
+        self.write_subsystem_empty_marker(&empty_a1, &[1, 0], "struct", None, RefsH5Path::Own);
 
         let empty_a2 = self.alloc_ref_name();
         let empty_a2_path = format!("{REFS_GROUP}/{empty_a2}");
-        self.write_subsystem_empty_marker(&empty_a2, &[1, 0], "struct", None);
+        self.write_subsystem_empty_marker(&empty_a2, &[1, 0], "struct", None, RefsH5Path::Own);
 
         let template_a = self.alloc_ref_name();
         let template_a_path = format!("{REFS_GROUP}/{template_a}");
@@ -1078,6 +1127,7 @@ impl MatBuilder {
         {
             let refs = self.refs_mut();
             let ds = refs.create_dataset(&alias_ref);
+            ds.set_attr("H5PATH", refs_h5path(&alias_ref));
             ds.with_i32_data(&[0i32, 0]).with_shape(&[1u64, 2]);
             ds.set_attr(
                 "MATLAB_class",
@@ -1088,11 +1138,11 @@ impl MatBuilder {
         // 5. Unknown template B: cell with two empty struct refs.
         let empty_b1 = self.alloc_ref_name();
         let empty_b1_path = format!("{REFS_GROUP}/{empty_b1}");
-        self.write_subsystem_empty_marker(&empty_b1, &[1, 0], "struct", None);
+        self.write_subsystem_empty_marker(&empty_b1, &[1, 0], "struct", None, RefsH5Path::Own);
 
         let empty_b2 = self.alloc_ref_name();
         let empty_b2_path = format!("{REFS_GROUP}/{empty_b2}");
-        self.write_subsystem_empty_marker(&empty_b2, &[1, 0], "struct", None);
+        self.write_subsystem_empty_marker(&empty_b2, &[1, 0], "struct", None, RefsH5Path::Own);
 
         let template_b = self.alloc_ref_name();
         let template_b_path = format!("{REFS_GROUP}/{template_b}");
@@ -1138,11 +1188,15 @@ impl MatBuilder {
         matlab_dims: &[usize],
         class: &str,
         int_decode: Option<i32>,
+        h5path: RefsH5Path,
     ) {
         let mut dim_buf = [0u64; STORAGE_DIMS_BUF_LEN];
         let n = matlab_dims.len();
         let refs = self.refs_mut();
         let ds = refs.create_dataset(ref_name);
+        if h5path == RefsH5Path::Own {
+            ds.set_attr("H5PATH", refs_h5path(ref_name));
+        }
         if n > STORAGE_DIMS_BUF_LEN {
             let dim_data: Vec<u64> = matlab_dims.iter().map(|&d| d as u64).collect();
             ds.with_u64_data(&dim_data).with_shape(&[n as u64]);
@@ -1170,6 +1224,7 @@ impl MatBuilder {
         let storage = storage_dims_u64_into(matlab_dims, &mut storage_buf);
         let refs = self.refs_mut();
         let ds = refs.create_dataset(ref_name);
+        ds.set_attr("H5PATH", refs_h5path(ref_name));
         ds.with_path_references(paths).with_shape(storage);
         ds.set_attr("MATLAB_class", AttrValue::AsciiString(class.into()));
     }

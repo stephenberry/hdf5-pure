@@ -32,6 +32,32 @@
 #   committed (H5Tcommit) type    -> listed as a named datatype, and the dataset
 #                                    and attribute typed through it both read
 #
+# And on 1.8.23 when the cell and string-class fixtures were added in 0.35.0:
+#   cell of vectors, of structs,  -> 1.8 follows every object reference to its
+#   and of a `None`                  `#refs#` target — datasets and groups alike
+#                                    — and reads each one's data
+#   H5PATH on an interned object  -> reads back as the object's own path, on a
+#                                    group as well as a dataset
+#   the canonical empty           -> carries no H5PATH, as in MATLAB's own files
+#   MATLAB_fields                 -> the vlen string array decodes
+#   empty value, `struct([])`     -> the dimension payload reads as `0 0`
+#   MCOS subsystem                -> the opaque handle, the templates' reference
+#                                    arrays and the alias all read
+#   dense attributes              -> 12 on one object move into a fractal heap
+#                                    and a v2 B-tree; 1.8 reads them all, and
+#                                    h5repack carries them across
+#   compound (complex) dataset    -> both members read, in order
+#   rank-3 dataspace              -> reads
+#   a group of 64 links           -> every member is listed and reads
+#
+# Those two fixtures are what put object references, a `#refs#` group, a vlen
+# attribute and an MCOS subsystem in front of an old library at all; before them
+# this was scalars, vectors, a struct, a string and an empty. Nor had 1.8 ever
+# read the builder-backed emitter's output: `to_file` goes through the walker,
+# and the builder's only other fixture is the 1.10 file, which 1.8 refuses by
+# design. `mat_string_v18.mat` is written through the builder for that reason as
+# much as for the subsystem.
+#
 # One thing that measurement showed about this file's shape: 1.8's h5dump gives
 # up on the *whole file* when a committed datatype does not decode, so the plain
 # checks above fail alongside the committed ones. The committed fixture is what
@@ -127,10 +153,18 @@ check() {  # check <description> <expected: open|refuse> <file>
 
 # The values in h5dump's first `DATA` block, as one space-separated line.
 #
-# Only data lines carry an `(index):` prefix, and taking just the first block
-# drops the dataset's own attributes, which `h5dump -d` prints after it. Done
-# this way rather than with `-A 0` because that spelling is a 1.10 addition:
-# 1.8's `-A` takes no argument, so passing one there dumps the wrong thing.
+# Taking only the first block drops the dataset's own attributes, which
+# `h5dump -d` prints after it. Done this way rather than with `-A 0` because
+# that spelling is a 1.10 addition: 1.8's `-A` takes no argument, so passing one
+# there dumps the wrong thing.
+#
+# The block ends where its braces balance rather than where the next `DATA`
+# begins, and every line inside it counts rather than only the ones carrying an
+# `(index):` prefix. A compound — which is how a complex array is stored — puts
+# each element in a brace group of its own across several lines, so an extractor
+# reading only the indexed lines sees `{` and nothing else. The index prefix,
+# braces and commas are dropped, which leaves the same text for every other
+# shape as taking the indexed lines did.
 #
 # A failing h5dump yields no values rather than killing the run: under `set -e`
 # and `pipefail` its exit status would abort the script at the first bad file,
@@ -140,11 +174,17 @@ check() {  # check <description> <expected: open|refuse> <file>
 dump_values() {  # dump_values <h5dump args...>
   { "$H5DUMP" "$@" 2>/dev/null || true; } |
     awk '
-      /^[[:space:]]*DATA[[:space:]]*[{]/ { blocks++; if (blocks > 1) exit; next }
-      blocks == 1 && /^[[:space:]]*[(][0-9,]+[)]:/ {
-        sub(/^[[:space:]]*[(][0-9,]*[)]:[[:space:]]*/, ""); print
+      /^[[:space:]]*DATA[[:space:]]*[{]/ && !started { started = 1; depth = 1; next }
+      started {
+        line = $0
+        sub(/^[[:space:]]*[(][0-9,]*[)]:[[:space:]]*/, "", line)
+        opened = gsub(/[{]/, "{", line); closed = gsub(/[}]/, "}", line)
+        depth += opened - closed
+        gsub(/[{},]/, " ", line)
+        print line
+        if (depth <= 0) exit
       }' |
-    tr ',' ' ' | tr -s '[:space:]' ' ' |
+    tr -s '[:space:]' ' ' |
     sed -e 's/^ //' -e 's/ $//'
 }
 
@@ -183,13 +223,78 @@ check_named_type() {  # check_named_type <description> <name> <file>
   fi
 }
 
+# An object-reference dataset is the one shape whose data is a pointer. 1.8's
+# h5dump follows each reference and prints the target as `DATASET <addr> "<path>"`
+# before its values, so collecting those paths in order shows the references
+# *resolving* — a dataset that opens with references that dangle would still
+# dump, with no target lines.
+check_ref_targets() {  # check_ref_targets <description> <expected paths> <file> <dataset>
+  local desc="$1" want="$2" file="$3" ds="$4" got
+  # `GROUP` as well as `DATASET`: a cell of structs interns a group per element,
+  # and h5dump labels a resolved reference by the kind of object it found.
+  got="$({ "$H5DUMP" -d "$ds" "$file" 2>/dev/null || true; } |
+    sed -nE 's/^[[:space:]]*(DATASET|GROUP) [0-9]+ "(.*)".*$/\2/p' |
+    tr '\n' ' ' | sed -e 's/ $//')"
+  if [ "$got" = "$want" ]; then
+    echo "  ok   $desc — resolved [$got]"
+  else
+    echo "  FAIL $desc — resolved [$got], expected [$want]"
+    failures=$((failures + 1))
+  fi
+}
+
+# An attribute this crate deliberately does *not* write. h5dump exits 1 for a
+# missing attribute and for a missing object alike, so every use of this pairs
+# with a value check on the same object: absence has to mean the attribute is
+# gone, not that the walk went somewhere that does not exist.
+check_absent_attr() {  # check_absent_attr <description> <file> <object/attribute>
+  local desc="$1" file="$2" attr="$3"
+  if "$H5DUMP" -a "$attr" "$file" > /dev/null 2>&1; then
+    echo "  FAIL $desc — the attribute is present"
+    failures=$((failures + 1))
+  else
+    echo "  ok   $desc — absent"
+  fi
+}
+
+# How many lines of a dump match a pattern — the count of objects or attributes
+# 1.8 found, where naming each one would say no more than the total does.
+check_count() {  # check_count <description> <expected> <pattern> <h5dump args...>
+  local desc="$1" want="$2" pattern="$3"; shift 3
+  local got
+  got="$({ "$H5DUMP" "$@" 2>/dev/null || true; } | grep -c "$pattern" || true)"
+  if [ "$got" = "$want" ]; then
+    echo "  ok   $desc — $got"
+  else
+    echo "  FAIL $desc — $got, expected $want"
+    failures=$((failures + 1))
+  fi
+}
+
+# An on-disk structure named by its four-byte signature, counted in the raw
+# file. This says the fixture *reaches* a structure before anything reads
+# through it: dense attribute storage is a threshold behavior, and a fixture
+# that drifted back under the threshold would still pass every check below
+# while testing the object header it was written to avoid.
+check_signature() {  # check_signature <description> <expected count> <signature> <file>
+  local desc="$1" want="$2" sig="$3" file="$4" got
+  got="$(LC_ALL=C grep -a -o "$sig" "$file" 2>/dev/null | wc -l | tr -d ' ' || true)"
+  if [ "$got" = "$want" ]; then
+    echo "  ok   $desc — $got $sig block(s)"
+  else
+    echo "  FAIL $desc — $got $sig block(s), expected $want"
+    failures=$((failures + 1))
+  fi
+}
+
 echo "==> the 1.10 format must be unreadable by 1.8 (or the bound buys nothing)"
 check "mat_v110.mat"  refuse "$FIXTURES/mat_v110.mat"
 check "plain_v110.h5" refuse "$FIXTURES/plain_v110.h5"
 
 echo "==> the 1.8 format must be readable by 1.8"
-check "mat_v18.mat"  open "$FIXTURES/mat_v18.mat"
-check "plain_v18.h5" open "$FIXTURES/plain_v18.h5"
+check "mat_v18.mat"        open "$FIXTURES/mat_v18.mat"
+check "mat_string_v18.mat" open "$FIXTURES/mat_string_v18.mat"
+check "plain_v18.h5"       open "$FIXTURES/plain_v18.h5"
 
 # Both fixtures are written by `examples/libver_fixtures.rs`; these are the
 # values it puts in them. Reading the *data* is the half `-n` cannot do.
@@ -198,6 +303,98 @@ check_data "plain_v18.h5 /values"     "1 2 3" -d /values     "$FIXTURES/plain_v1
 check_data "plain_v18.h5 /grp/inner"  "7 8"   -d /grp/inner  "$FIXTURES/plain_v18.h5"
 check_data "mat_v18.mat /values"      "1 2 3" -d /values     "$FIXTURES/mat_v18.mat"
 check_data "mat_v18.mat /nested/count" "7"    -d /nested/count "$FIXTURES/mat_v18.mat"
+# An empty value's payload *is* its dimension vector, so this reads the `0x0`
+# rule itself rather than a dataset that happens to be empty.
+check_data "mat_v18.mat /empty"       "0 0"   -d /empty       "$FIXTURES/mat_v18.mat"
+
+# A cell array is the only shape that interns objects under `#refs#`: the parent
+# dataset holds object references instead of data, and each interned object
+# carries an `H5PATH` attribute alongside its `MATLAB_class`. Neither had ever
+# been put in front of an old library — the fixture had no cell in it — so a
+# regression in either was invisible here.
+echo "==> 1.8 must resolve a cell array's interned objects"
+MAT="$FIXTURES/mat_v18.mat"
+# `demo()` interns in field order: ragged's two vectors, records' two structs,
+# then optional's scalar and its `struct([])`.
+r() { printf '/#refs#/ref_%016x' "$1"; }
+check_ref_targets "mat_v18.mat /ragged references"   "$(r 0) $(r 1)" "$MAT" /ragged
+check_ref_targets "mat_v18.mat /records references"  "$(r 2) $(r 3)" "$MAT" /records
+check_ref_targets "mat_v18.mat /optional references" "$(r 4) $(r 5)" "$MAT" /optional
+
+# Each interned object's own data and the H5PATH it carries. A cell of vectors
+# interns datasets; a cell of structs interns groups, which is where the
+# attribute lands on a group rather than a dataset.
+check_data "mat_v18.mat $(r 0)"        "1"   -d "$(r 0)" "$MAT"
+check_data "mat_v18.mat $(r 1)"        "2 3" -d "$(r 1)" "$MAT"
+check_data "mat_v18.mat $(r 2)/count"  "11"  -d "$(r 2)/count" "$MAT"
+check_data "mat_v18.mat $(r 3)/count"  "13"  -d "$(r 3)/count" "$MAT"
+check_data "mat_v18.mat $(r 4)"        "1.5" -d "$(r 4)" "$MAT"
+# The `struct([])` a `None` slot lowers to: an empty marker under `#refs#`,
+# whose payload is its own dimension vector.
+check_data "mat_v18.mat $(r 5) struct([])" "0 0" -d "$(r 5)" "$MAT"
+for ref in 0 1 2 3 4 5; do
+  check_data "mat_v18.mat $(r "$ref") H5PATH" "\"$(r "$ref")\"" \
+    -a "$(r "$ref")/H5PATH" "$MAT"
+done
+
+# `MATLAB_fields` is the only variable-length string array this crate writes —
+# a vlen of one-character strings, held in the global heap rather than inline.
+# Nothing else here asks an old library to decode that shape.
+check_data "mat_v18.mat $(r 2) MATLAB_fields" \
+  '("c" "o" "u" "n" "t") ("f" "l" "a" "g")' \
+  -a "$(r 2)/MATLAB_fields" "$MAT"
+
+# The `string` class builds an MCOS subsystem: a `#subsystem#/MCOS` blob, a
+# FileWrapper metadata ref, two reference-array templates, an alias, and the
+# canonical empty. This is also the only 1.8 file here written by the
+# builder-backed emitter — `to_file` uses the walker, and the builder's other
+# output is the 1.10 file 1.8 refuses.
+echo "==> 1.8 must read the MCOS subsystem the string class builds"
+STR="$FIXTURES/mat_string_v18.mat"
+# The opaque handle MATLAB resolves through the subsystem: 0xDD000000, then the
+# class and object ids.
+check_data "mat_string_v18.mat /label" "3707764736 2 1 1 1 1" -d /label "$STR"
+check_data "mat_string_v18.mat MCOS alias"    "0 0" -d "$(r 12)" "$STR"
+check_ref_targets "mat_string_v18.mat template B" "$(r 13) $(r 14)" "$STR" "$(r 15)"
+# The canonical empty is the one object under `#refs#` MATLAB leaves without an
+# H5PATH, so it is the one we leave without one too. The class check is what
+# keeps the absence check honest: it names the object as the one intended.
+check_data "mat_string_v18.mat canonical empty" '"canonical empty"' \
+  -a "$(r 8)/MATLAB_class" "$STR"
+check_absent_attr "mat_string_v18.mat canonical empty H5PATH" "$STR" "$(r 8)/H5PATH"
+
+# A complex array is a `{real, imag}` compound, the only compound datatype this
+# crate writes. MATLAB decides real from complex by this shape, so an old
+# library reading the members in the wrong order — or not at all — is a
+# difference that reaches the workspace.
+echo "==> 1.8 must read a compound (complex) dataset"
+check_data "mat_v18.mat /signal" "1 -2 0.5 0.25" -d /signal "$MAT"
+check_count "mat_v18.mat /signal members" 2 'H5T_IEEE_F64LE "' -H -d /signal "$MAT"
+
+# Nine or more attributes on one object move out of the object header into a
+# fractal heap indexed by a version-2 B-tree, reached through an Attribute Info
+# message — 1.8 additions all, and the storage this crate's own history has the
+# most defects in. The signature counts come first: below the threshold every
+# check under them would pass while reading the header instead.
+echo "==> 1.8 must read attributes out of a fractal heap, not just a header"
+check_signature "plain_v18.h5 dense attribute heap"  1 FRHP "$FIXTURES/plain_v18.h5"
+check_signature "plain_v18.h5 dense attribute index" 1 BTHD "$FIXTURES/plain_v18.h5"
+check_count "plain_v18.h5 /dense_attrs attributes" 12 'ATTRIBUTE' -A -d /dense_attrs "$FIXTURES/plain_v18.h5"
+check_data "plain_v18.h5 /dense_attrs"     "1 2" -d /dense_attrs     "$FIXTURES/plain_v18.h5"
+check_data "plain_v18.h5 /dense_attrs a00" "0"   -a /dense_attrs/a00 "$FIXTURES/plain_v18.h5"
+check_data "plain_v18.h5 /dense_attrs a11" "11"  -a /dense_attrs/a11 "$FIXTURES/plain_v18.h5"
+
+# Rank 3, and a group holding more links than one object header chunk. Where the
+# C library would switch the group to dense link storage this crate keeps
+# writing link messages, so the question an old library answers is whether the
+# header it grows is one that still walks.
+echo "==> 1.8 must read a rank-3 dataspace and a group of many links"
+check_data "plain_v18.h5 /cube" \
+  "0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23" \
+  -d /cube "$FIXTURES/plain_v18.h5"
+check_count "plain_v18.h5 /wide members" 64 '/wide/m' -n "$FIXTURES/plain_v18.h5"
+check_data "plain_v18.h5 /wide/m000" "0"  -d /wide/m000 "$FIXTURES/plain_v18.h5"
+check_data "plain_v18.h5 /wide/m063" "63" -d /wide/m063 "$FIXTURES/plain_v18.h5"
 
 # And the attribute values, not just the count the repack loop below compares.
 echo "==> 1.8 must read attribute values on all three kinds of object"
@@ -221,7 +418,7 @@ check_data "plain_v18.h5 /typed baseline" "9"     -a /typed/baseline "$FIXTURES/
 # header that declares no attributes makes h5repack copy the object without
 # them, silently. Counting `ATTRIBUTE` blocks in the dump is enough to see it.
 echo "==> a 1.8 h5repack round trip must preserve every attribute"
-for f in mat_v18.mat plain_v18.h5; do
+for f in mat_v18.mat mat_string_v18.mat plain_v18.h5; do
   before=$("$H5DUMP" -A "$FIXTURES/$f" 2>/dev/null | grep -c 'ATTRIBUTE' || true)
   rm -f "$FIXTURES/repacked-$f"
   if ! "$H5REPACK" "$FIXTURES/$f" "$FIXTURES/repacked-$f" > /dev/null 2>&1; then
