@@ -2470,6 +2470,11 @@ impl Group {
     }
 
     /// List the names of datasets in this group.
+    ///
+    /// To read from the datasets themselves, prefer
+    /// [`iter_datasets`](Self::iter_datasets): it hands back opened handles for
+    /// the cost of this call, where opening each name separately re-walks the
+    /// group once per member.
     pub fn datasets(&self) -> Result<Vec<String>, Error> {
         let entries = self.children()?;
         let mut names = Vec::new();
@@ -2480,6 +2485,63 @@ impl Group {
             }
         }
         Ok(names)
+    }
+
+    /// Open every dataset in this group, each paired with its name.
+    ///
+    /// This is the walk to reach for when the members themselves are what you
+    /// want — their attributes, shapes or data — rather than a list of names.
+    /// [`datasets`](Self::datasets) already parses every child's object header to
+    /// tell a dataset from a group, and then keeps only the name, so following it
+    /// with a [`dataset`](Self::dataset) call per entry re-walks the group's link
+    /// structure and re-parses that same header. This keeps what it read, and
+    /// costs one enumeration of the group rather than one per member.
+    ///
+    /// Handles are built as the iterator is advanced, so a walk that stops early
+    /// pays for only the members it took. Each dataset gets the file-wide
+    /// chunk-cache default; to override the cache for one, open it by name with
+    /// [`dataset_with_options`](Self::dataset_with_options).
+    ///
+    /// Members arrive in the order the group's link structure yields them — the
+    /// same order [`datasets`](Self::datasets) reports, which is not necessarily
+    /// sorted.
+    ///
+    /// ```no_run
+    /// # use hdf5_pure::File;
+    /// # fn main() -> Result<(), hdf5_pure::Error> {
+    /// let file = File::open("runs.h5")?;
+    /// for (name, dataset) in file.root().iter_datasets()? {
+    ///     println!("{name}: {:?}", dataset.shape());
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn iter_datasets(
+        &self,
+    ) -> Result<impl ExactSizeIterator<Item = (String, Dataset)> + use<>, Error> {
+        let mut members = Vec::new();
+        for entry in self.children()? {
+            let hdr = self.file.parse_header(entry.object_header_address)?;
+            if has_message(&hdr, MessageType::DataLayout) {
+                members.push((entry, hdr));
+            }
+        }
+        let file = Arc::clone(&self.file);
+        let parent = self.path.clone();
+        let chunk_cache = DatasetAccessProperties::new()
+            .resolved_chunk_cache(self.file.access_properties.chunk_cache);
+        Ok(members.into_iter().map(move |(entry, header)| {
+            let path = child_path_of(parent.as_deref(), &entry.name);
+            let dataset = Dataset {
+                file: Arc::clone(&file),
+                address: entry.object_header_address,
+                header,
+                chunk_cache: ChunkCache::with_config(chunk_cache),
+                chunk_cache_config: chunk_cache,
+                path,
+            };
+            (entry.name, dataset)
+        }))
     }
 
     /// The names of children that are committed (`H5Tcommit`) datatype objects:
@@ -2560,6 +2622,10 @@ impl Group {
     }
 
     /// List the names of subgroups in this group.
+    ///
+    /// To descend into the subgroups themselves, prefer
+    /// [`iter_groups`](Self::iter_groups), which hands back opened handles for
+    /// the cost of this call.
     pub fn groups(&self) -> Result<Vec<String>, Error> {
         let entries = self.children()?;
         let mut names = Vec::new();
@@ -2570,6 +2636,52 @@ impl Group {
             }
         }
         Ok(names)
+    }
+
+    /// Open every subgroup of this group, each paired with its name.
+    ///
+    /// The counterpart to [`iter_datasets`](Self::iter_datasets), and the way to
+    /// recurse without paying a [`group`](Self::group) lookup per child: that
+    /// lookup re-walks this group's link structure, which a walk of the whole
+    /// tree would otherwise repeat once per subgroup.
+    ///
+    /// Members arrive in the order the group's link structure yields them — the
+    /// same order [`groups`](Self::groups) reports, which is not necessarily
+    /// sorted.
+    ///
+    /// ```no_run
+    /// # use hdf5_pure::{Error, Group};
+    /// fn total_datasets(group: &Group) -> Result<usize, Error> {
+    ///     let mut n = group.datasets()?.len();
+    ///     for (_, child) in group.iter_groups()? {
+    ///         n += total_datasets(&child)?;
+    ///     }
+    ///     Ok(n)
+    /// }
+    /// ```
+    pub fn iter_groups(
+        &self,
+    ) -> Result<impl ExactSizeIterator<Item = (String, Group)> + use<>, Error> {
+        let mut members = Vec::new();
+        for entry in self.children()? {
+            // A `Group` handle carries no parsed header, so the header that
+            // classified this child is dropped here rather than held for the
+            // length of the walk.
+            if is_group(&self.file.parse_header(entry.object_header_address)?) {
+                members.push(entry);
+            }
+        }
+        let file = Arc::clone(&self.file);
+        let parent = self.path.clone();
+        Ok(members.into_iter().map(move |entry| {
+            let path = child_path_of(parent.as_deref(), &entry.name);
+            let group = Group {
+                file: Arc::clone(&file),
+                address: entry.object_header_address,
+                path,
+            };
+            (entry.name, group)
+        }))
     }
 
     /// Read all attributes of this group.
@@ -2696,13 +2808,7 @@ impl Group {
     /// The root-relative path of a child named `name`, or `None` if this group
     /// itself has no resolvable path (reached by object reference).
     fn child_path(&self, name: &str) -> Option<String> {
-        self.path.as_ref().map(|p| {
-            if p.is_empty() {
-                name.to_string()
-            } else {
-                format!("{p}/{name}")
-            }
-        })
+        child_path_of(self.path.as_deref(), name)
     }
 
     /// Create an empty subgroup `name` within this group, staged until
@@ -4335,6 +4441,22 @@ fn is_group(header: &ObjectHeader) -> bool {
     })
 }
 
+/// The root-relative path of a child named `name` under `parent`, or `None` if
+/// the parent has no resolvable path (reached by object reference).
+///
+/// Free-standing rather than a method on [`Group`] so the member iterators can
+/// build child paths from a closure that outlives the borrow of the group they
+/// came from.
+fn child_path_of(parent: Option<&str>, name: &str) -> Option<String> {
+    parent.map(|p| {
+        if p.is_empty() {
+            name.to_string()
+        } else {
+            format!("{p}/{name}")
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5108,6 +5230,223 @@ mod tests {
             "only the cold half was needed; a span over the whole dataset would \
              have fetched {} bytes",
             32 * chunk_bytes
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Group member iterators (`iter_datasets` / `iter_groups`)
+    // -----------------------------------------------------------------------
+
+    /// A root holding `datasets` datasets, `groups` subgroups (each with one
+    /// dataset of its own) and one committed datatype, so a member walk has all
+    /// three child kinds to sort apart.
+    ///
+    /// Names are not zero-padded, so lexical order and insertion order disagree
+    /// past the tenth member: a walk that silently sorted would show up here.
+    fn mixed_member_file(datasets: usize, groups: usize) -> Vec<u8> {
+        let mut b = FileBuilder::new();
+        b.commit_datatype("a_type", crate::make_i32_type());
+        for i in 0..datasets {
+            b.create_dataset(&format!("ds{i}"))
+                .with_i32_data(&[i as i32, -(i as i32)]);
+        }
+        for i in 0..groups {
+            let mut g = b.create_group(&format!("g{i}"));
+            g.create_dataset("inner").with_i32_data(&[i as i32]);
+            g.create_dataset("other").with_i32_data(&[-1]);
+            b.add_group(g.finish());
+        }
+        b.finish().expect("write the fixture")
+    }
+
+    /// The iterator must report exactly what opening each name reports: the same
+    /// members, in the same order, resolving to the same objects. Anything the
+    /// two disagree on is a member a caller would see differently for having
+    /// chosen the cheaper walk.
+    #[test]
+    fn iter_datasets_agrees_with_opening_each_name() {
+        let file = File::from_bytes(mixed_member_file(12, 3)).unwrap();
+
+        for group in [file.root(), file.group("g1").unwrap()] {
+            let names = group.datasets().unwrap();
+            assert!(
+                !names.is_empty(),
+                "the fixture must have members to compare"
+            );
+
+            let iterated: Vec<(String, Dataset)> = group.iter_datasets().unwrap().collect();
+            assert_eq!(
+                iterated.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+                names,
+                "the iterator must yield the members `datasets` lists, in that order"
+            );
+
+            for (name, ds) in &iterated {
+                let opened = group.dataset(name).unwrap();
+                assert_eq!(ds.header_address(), opened.header_address(), "{name}");
+                assert_eq!(ds.shape().unwrap(), opened.shape().unwrap(), "{name}");
+                assert_eq!(ds.read_i32().unwrap(), opened.read_i32().unwrap(), "{name}");
+            }
+        }
+    }
+
+    /// The subgroup counterpart, including that a handle it yields can be walked
+    /// again — recursion through `iter_groups` is the shape it exists for.
+    #[test]
+    fn iter_groups_agrees_with_opening_each_name() {
+        let file = File::from_bytes(mixed_member_file(4, 5)).unwrap();
+        let root = file.root();
+
+        let names = root.groups().unwrap();
+        let iterated: Vec<(String, Group)> = root.iter_groups().unwrap().collect();
+        assert_eq!(
+            iterated.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+            names,
+            "the iterator must yield the subgroups `groups` lists, in that order"
+        );
+        assert_eq!(names.len(), 5);
+
+        for (name, group) in &iterated {
+            assert_eq!(
+                group.header_address(),
+                root.group(name).unwrap().header_address(),
+                "{name}"
+            );
+            let mut inner = group
+                .iter_datasets()
+                .unwrap()
+                .map(|(n, _)| n)
+                .collect::<Vec<_>>();
+            inner.sort();
+            assert_eq!(inner, ["inner", "other"], "{name} must be walkable in turn");
+        }
+    }
+
+    /// Each iterator must claim only its own kind of child. A committed datatype
+    /// is the child that belongs to neither, and the one a walk asking only for
+    /// datasets and groups would otherwise be free to mis-sort into either.
+    #[test]
+    fn the_member_iterators_sort_the_child_kinds_apart() {
+        let file = File::from_bytes(mixed_member_file(3, 2)).unwrap();
+        let root = file.root();
+
+        let datasets: Vec<String> = root.iter_datasets().unwrap().map(|(n, _)| n).collect();
+        let groups: Vec<String> = root.iter_groups().unwrap().map(|(n, _)| n).collect();
+
+        assert_eq!(datasets, ["ds0", "ds1", "ds2"]);
+        assert_eq!(groups, ["g0", "g1"]);
+        assert_eq!(root.named_datatypes().unwrap(), ["a_type"]);
+        assert!(
+            !datasets.contains(&"a_type".to_string()) && !groups.contains(&"a_type".to_string()),
+            "a committed datatype is neither a dataset nor a group"
+        );
+    }
+
+    /// The bytes a walk of `n` members reads, by each route: opening every name,
+    /// and iterating handles.
+    fn member_walk_bytes(n: usize) -> (usize, usize) {
+        let mut b = FileBuilder::new();
+        for i in 0..n {
+            b.create_dataset(&format!("ds{i}"))
+                .with_i32_data(&[i as i32]);
+        }
+        let bytes = b.finish().expect("write the fixture");
+
+        let counts = ReadCounts::default();
+        let file = counting_streaming_file(bytes.clone(), &counts, FileAccessProperties::new());
+        let (_, by_name) = counts.measure(|| {
+            let root = file.root();
+            for name in root.datasets().unwrap() {
+                root.dataset(&name).unwrap();
+            }
+        });
+
+        let counts = ReadCounts::default();
+        let file = counting_streaming_file(bytes, &counts, FileAccessProperties::new());
+        let (_, iterated) =
+            counts.measure(|| for (_, _ds) in file.root().iter_datasets().unwrap() {});
+
+        (by_name, iterated)
+    }
+
+    /// Opening members by name re-walks the group's link structure once per
+    /// member; iterating handles walks it once. Bytes is the metric that
+    /// separates them: a group this size keeps its links inline in the object
+    /// header, so that header grows with the member count and re-reading it per
+    /// member is quadratic, while the *number* of reads stays linear either way
+    /// and would show almost nothing.
+    ///
+    /// Asserted as how the cost scales rather than as one fixture's byte count,
+    /// since a fixed number would pass just as well on a walk that stayed
+    /// quadratic with a smaller constant.
+    #[test]
+    fn iterating_members_enumerates_the_group_once() {
+        let (by_name_16, iterated_16) = member_walk_bytes(16);
+        let (by_name_64, iterated_64) = member_walk_bytes(64);
+
+        assert!(
+            iterated_64 <= 5 * iterated_16,
+            "one enumeration plus one header per member is linear, so four times \
+             the members must cost about four times the bytes: {iterated_16} -> \
+             {iterated_64}"
+        );
+        assert!(
+            by_name_64 >= 8 * by_name_16,
+            "re-reading the link-bearing header once per member is quadratic, so \
+             four times the members must cost far more than four times the bytes: \
+             {by_name_16} -> {by_name_64}"
+        );
+        assert!(
+            iterated_64 * 8 < by_name_64,
+            "at 64 members the one-enumeration walk must be the cheaper by a wide \
+             margin: {iterated_64} bytes against {by_name_64}"
+        );
+    }
+
+    /// A yielded handle must carry the same root-relative path as one opened by
+    /// name, or a write through it would address the wrong object — or no object
+    /// at all. A member of a *subgroup* is the case that separates them, since
+    /// its path has a prefix to get right.
+    #[test]
+    fn a_member_handle_resolves_to_its_own_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("members.h5");
+        std::fs::write(&path, mixed_member_file(2, 2)).unwrap();
+
+        let file = File::open_rw(&path).unwrap();
+        let group = file.group("g1").unwrap();
+        let (name, mut ds) = group
+            .iter_datasets()
+            .unwrap()
+            .find(|(n, _)| n == "inner")
+            .expect("g1/inner");
+        assert_eq!(name, "inner");
+        ds.set_attr("tag", AttrValue::I64(7)).unwrap();
+        file.commit().unwrap();
+        // Windows holds the write lock until the session is dropped.
+        drop(ds);
+        drop(group);
+        drop(file);
+
+        let file = File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("g1/inner")
+                .unwrap()
+                .attrs()
+                .unwrap()
+                .get("tag")
+                .and_then(AttrValue::as_i64),
+            Some(7),
+            "the attribute must land on the member the handle came from"
+        );
+        assert!(
+            !file
+                .dataset("g0/inner")
+                .unwrap()
+                .attrs()
+                .unwrap()
+                .contains_key("tag"),
+            "and on no other group's member of the same name"
         );
     }
 }
