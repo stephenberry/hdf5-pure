@@ -43,6 +43,12 @@
 #   empty value, `struct([])`     -> the dimension payload reads as `0 0`
 #   MCOS subsystem                -> the opaque handle, the templates' reference
 #                                    arrays and the alias all read
+#   dense attributes              -> 12 on one object move into a fractal heap
+#                                    and a v2 B-tree; 1.8 reads them all, and
+#                                    h5repack carries them across
+#   compound (complex) dataset    -> both members read, in order
+#   rank-3 dataspace              -> reads
+#   a group of 64 links           -> every member is listed and reads
 #
 # Those two fixtures are what put object references, a `#refs#` group, a vlen
 # attribute and an MCOS subsystem in front of an old library at all; before them
@@ -147,10 +153,18 @@ check() {  # check <description> <expected: open|refuse> <file>
 
 # The values in h5dump's first `DATA` block, as one space-separated line.
 #
-# Only data lines carry an `(index):` prefix, and taking just the first block
-# drops the dataset's own attributes, which `h5dump -d` prints after it. Done
-# this way rather than with `-A 0` because that spelling is a 1.10 addition:
-# 1.8's `-A` takes no argument, so passing one there dumps the wrong thing.
+# Taking only the first block drops the dataset's own attributes, which
+# `h5dump -d` prints after it. Done this way rather than with `-A 0` because
+# that spelling is a 1.10 addition: 1.8's `-A` takes no argument, so passing one
+# there dumps the wrong thing.
+#
+# The block ends where its braces balance rather than where the next `DATA`
+# begins, and every line inside it counts rather than only the ones carrying an
+# `(index):` prefix. A compound — which is how a complex array is stored — puts
+# each element in a brace group of its own across several lines, so an extractor
+# reading only the indexed lines sees `{` and nothing else. The index prefix,
+# braces and commas are dropped, which leaves the same text for every other
+# shape as taking the indexed lines did.
 #
 # A failing h5dump yields no values rather than killing the run: under `set -e`
 # and `pipefail` its exit status would abort the script at the first bad file,
@@ -160,11 +174,17 @@ check() {  # check <description> <expected: open|refuse> <file>
 dump_values() {  # dump_values <h5dump args...>
   { "$H5DUMP" "$@" 2>/dev/null || true; } |
     awk '
-      /^[[:space:]]*DATA[[:space:]]*[{]/ { blocks++; if (blocks > 1) exit; next }
-      blocks == 1 && /^[[:space:]]*[(][0-9,]+[)]:/ {
-        sub(/^[[:space:]]*[(][0-9,]*[)]:[[:space:]]*/, ""); print
+      /^[[:space:]]*DATA[[:space:]]*[{]/ && !started { started = 1; depth = 1; next }
+      started {
+        line = $0
+        sub(/^[[:space:]]*[(][0-9,]*[)]:[[:space:]]*/, "", line)
+        opened = gsub(/[{]/, "{", line); closed = gsub(/[}]/, "}", line)
+        depth += opened - closed
+        gsub(/[{},]/, " ", line)
+        print line
+        if (depth <= 0) exit
       }' |
-    tr ',' ' ' | tr -s '[:space:]' ' ' |
+    tr -s '[:space:]' ' ' |
     sed -e 's/^ //' -e 's/ $//'
 }
 
@@ -234,6 +254,36 @@ check_absent_attr() {  # check_absent_attr <description> <file> <object/attribut
     failures=$((failures + 1))
   else
     echo "  ok   $desc — absent"
+  fi
+}
+
+# How many lines of a dump match a pattern — the count of objects or attributes
+# 1.8 found, where naming each one would say no more than the total does.
+check_count() {  # check_count <description> <expected> <pattern> <h5dump args...>
+  local desc="$1" want="$2" pattern="$3"; shift 3
+  local got
+  got="$({ "$H5DUMP" "$@" 2>/dev/null || true; } | grep -c "$pattern" || true)"
+  if [ "$got" = "$want" ]; then
+    echo "  ok   $desc — $got"
+  else
+    echo "  FAIL $desc — $got, expected $want"
+    failures=$((failures + 1))
+  fi
+}
+
+# An on-disk structure named by its four-byte signature, counted in the raw
+# file. This says the fixture *reaches* a structure before anything reads
+# through it: dense attribute storage is a threshold behavior, and a fixture
+# that drifted back under the threshold would still pass every check below
+# while testing the object header it was written to avoid.
+check_signature() {  # check_signature <description> <expected count> <signature> <file>
+  local desc="$1" want="$2" sig="$3" file="$4" got
+  got="$(LC_ALL=C grep -a -o "$sig" "$file" 2>/dev/null | wc -l | tr -d ' ' || true)"
+  if [ "$got" = "$want" ]; then
+    echo "  ok   $desc — $got $sig block(s)"
+  else
+    echo "  FAIL $desc — $got $sig block(s), expected $want"
+    failures=$((failures + 1))
   fi
 }
 
@@ -312,6 +362,39 @@ check_ref_targets "mat_string_v18.mat template B" "$(r 13) $(r 14)" "$STR" "$(r 
 check_data "mat_string_v18.mat canonical empty" '"canonical empty"' \
   -a "$(r 8)/MATLAB_class" "$STR"
 check_absent_attr "mat_string_v18.mat canonical empty H5PATH" "$STR" "$(r 8)/H5PATH"
+
+# A complex array is a `{real, imag}` compound, the only compound datatype this
+# crate writes. MATLAB decides real from complex by this shape, so an old
+# library reading the members in the wrong order — or not at all — is a
+# difference that reaches the workspace.
+echo "==> 1.8 must read a compound (complex) dataset"
+check_data "mat_v18.mat /signal" "1 -2 0.5 0.25" -d /signal "$MAT"
+check_count "mat_v18.mat /signal members" 2 'H5T_IEEE_F64LE "' -H -d /signal "$MAT"
+
+# Nine or more attributes on one object move out of the object header into a
+# fractal heap indexed by a version-2 B-tree, reached through an Attribute Info
+# message — 1.8 additions all, and the storage this crate's own history has the
+# most defects in. The signature counts come first: below the threshold every
+# check under them would pass while reading the header instead.
+echo "==> 1.8 must read attributes out of a fractal heap, not just a header"
+check_signature "plain_v18.h5 dense attribute heap"  1 FRHP "$FIXTURES/plain_v18.h5"
+check_signature "plain_v18.h5 dense attribute index" 1 BTHD "$FIXTURES/plain_v18.h5"
+check_count "plain_v18.h5 /dense_attrs attributes" 12 'ATTRIBUTE' -A -d /dense_attrs "$FIXTURES/plain_v18.h5"
+check_data "plain_v18.h5 /dense_attrs"     "1 2" -d /dense_attrs     "$FIXTURES/plain_v18.h5"
+check_data "plain_v18.h5 /dense_attrs a00" "0"   -a /dense_attrs/a00 "$FIXTURES/plain_v18.h5"
+check_data "plain_v18.h5 /dense_attrs a11" "11"  -a /dense_attrs/a11 "$FIXTURES/plain_v18.h5"
+
+# Rank 3, and a group holding more links than one object header chunk. Where the
+# C library would switch the group to dense link storage this crate keeps
+# writing link messages, so the question an old library answers is whether the
+# header it grows is one that still walks.
+echo "==> 1.8 must read a rank-3 dataspace and a group of many links"
+check_data "plain_v18.h5 /cube" \
+  "0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23" \
+  -d /cube "$FIXTURES/plain_v18.h5"
+check_count "plain_v18.h5 /wide members" 64 '/wide/m' -n "$FIXTURES/plain_v18.h5"
+check_data "plain_v18.h5 /wide/m000" "0"  -d /wide/m000 "$FIXTURES/plain_v18.h5"
+check_data "plain_v18.h5 /wide/m063" "63" -d /wide/m063 "$FIXTURES/plain_v18.h5"
 
 # And the attribute values, not just the count the repack loop below compares.
 echo "==> 1.8 must read attribute values on all three kinds of object"
