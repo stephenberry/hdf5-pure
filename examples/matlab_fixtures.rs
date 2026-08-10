@@ -14,7 +14,10 @@
 //! % Then run the commands printed by the example.
 //! ```
 
-use hdf5_pure::mat::{self, Complex32, Complex64, ComplexI16, Matrix};
+use hdf5_pure::mat::{
+    self, Complex32, Complex64, ComplexI16, EmptySequencePolicy, Matrix, OneDimensionalMode,
+    Options, StringClass,
+};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -46,6 +49,9 @@ fn main() {
     // Cell-array fixtures (Vec<Struct>, Vec<Option<T>> with None, nested).
     write_cells(&out);
 
+    // The shapes 0.35.0 changed, for `check_cell_shapes.m`.
+    write_cell_shapes(&out);
+
     // The on-disk format pair, for `check_format.m`.
     write_format_control(&out);
 
@@ -57,6 +63,8 @@ fn main() {
     println!("Quick check in MATLAB:");
     println!("  >> cd('matlab_fixtures')");
     println!("  >> verify                     % runs all assertions");
+    println!("  >> check_format               % does `load` accept the format?");
+    println!("  >> check_cell_shapes          % the shapes 0.35.0 changed");
     println!();
     println!("Or from a shell (GNU Octave):");
     println!("  $ cd matlab_fixtures && octave --no-gui --eval verify");
@@ -137,6 +145,7 @@ fn copy_octave_helpers(out: &Path) {
         "verify.m",
         "ok.m",
         "check_format.m",
+        "check_cell_shapes.m",
         "mat_isempty.m",
         "mat_empty_dims.m",
         "mat_is_empty_struct.m",
@@ -915,4 +924,70 @@ fn write_cells(dir: &Path) {
     };
     mat::to_file(&v, dir.join("cells.mat")).unwrap();
     println!("wrote: cells.mat");
+}
+
+// ---------------------------------------------------------------------------
+
+/// The shapes 0.35.0 changed, for `check_cell_shapes.m`.
+///
+/// Three things are only answerable by a real MATLAB: whether an empty cell
+/// written as `0x0` loads as MATLAB's own `{}`, whether a cell honors the 1-D
+/// orientation the options ask for, and whether the `H5PATH` attribute this
+/// release stamps on every interned object leaves `load` able to follow the
+/// references it annotates. The last one has no assertion of its own — it is
+/// established by these files loading at all, and by every other fixture in
+/// this directory carrying the attribute too.
+#[derive(Serialize)]
+struct CellShapes {
+    /// Empty under `EmptySequencePolicy::Cell`, which is the only way to write
+    /// an empty cell. `0x0` since 0.35.0, `0x1` before it.
+    empty_cell: Vec<Vec<f64>>,
+    /// A cell array's orientation follows `one_dimensional_mode` since 0.35.0;
+    /// before it a cell was a column whatever the option said.
+    ragged: Vec<Vec<f64>>,
+    /// Interned as a group per element, which is where `H5PATH` lands on a
+    /// group rather than a dataset.
+    records: Vec<Point>,
+    /// The `None` slot lowers to `struct([])`, interned under `#refs#`.
+    optionals: Vec<Option<f64>>,
+    /// The modern `string` class builds the MCOS subsystem, whose helper
+    /// objects are stamped too — all but the canonical empty, which MATLAB
+    /// leaves bare and so do we.
+    name: String,
+}
+
+fn write_cell_shapes(dir: &Path) {
+    announce(
+        "cell_shapes.mat",
+        &[
+            "% Written with EmptySequencePolicy::Cell and the modern string class.",
+            "assert(iscell(empty_cell), 'empty_cell iscell')",
+            "assert(isequal(size(empty_cell), [0 0]), 'empty_cell is 0x0')",
+            "assert(isequal(size(ragged), [2 1]), 'ragged is a column')",
+            "assert(isequal(ragged{1}(:), [1; 2; 3]), 'ragged{1}')",
+            "assert(records{2}.x == 3.0, 'records{2}.x')",
+            "assert(mat_is_empty_struct(optionals{2}), 'optionals{2} is struct([])')",
+            "disp('cell_shapes.mat OK')",
+        ],
+    );
+    let value = || CellShapes {
+        empty_cell: Vec::new(),
+        ragged: vec![vec![1.0, 2.0, 3.0], vec![4.0, 5.0]],
+        records: vec![Point { x: 1.0, y: 2.0 }, Point { x: 3.0, y: 4.0 }],
+        optionals: vec![Some(10.0), None],
+        name: "sensor-1".to_string(),
+    };
+
+    let mut opts = Options::default();
+    opts.empty_sequence_policy = EmptySequencePolicy::Cell;
+    opts.string_class = StringClass::String;
+    mat::to_file_with_options(&value(), dir.join("cell_shapes.mat"), &opts).unwrap();
+    println!("wrote: cell_shapes.mat");
+
+    // The same content asking for row vectors. Every 1-D value in it should
+    // come back transposed against the file above — cells included, which is
+    // what changed.
+    opts.one_dimensional_mode = OneDimensionalMode::RowVector;
+    mat::to_file_with_options(&value(), dir.join("cell_shapes_rows.mat"), &opts).unwrap();
+    println!("wrote: cell_shapes_rows.mat");
 }
