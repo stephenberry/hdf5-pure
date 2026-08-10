@@ -40,6 +40,18 @@
 % carry it too, and every other fixture in this directory that `verify` reads
 % carries it as well. If `H5PATH` broke MATLAB's reference following, nothing
 % in this directory would load.
+%
+% Measured on R2023a Update 1 (9.14.0.2239454), HDF5 1.10.8: CONFIRMED. The
+% empty cell loads as `0x0`, both files come back in the orientation asked for
+% with the row file the transpose of the column one, `name` arrives as a
+% `string` object through the MCOS subsystem, and `struct([])` still reads as
+% an empty struct. `verify` passed on the same release with every fixture
+% carrying `H5PATH`, which is the whole of the evidence for change 3.
+%
+% One release is one data point. Run this on whatever MATLAB is to hand and
+% extend the record — the same release answers `check_format.m`, and what that
+% script measured is the reason the published library-version table cannot be
+% read as a list of what `load` accepts.
 % ---------------------------------------------------------------------------
 
 fprintf('=== check_cell_shapes ===\n');
@@ -49,9 +61,12 @@ if is_octave
   fprintf('Host: GNU Octave %s\n', OCTAVE_VERSION);
 else
   fprintf('Host: MATLAB %s\n', version);
+  % Three separate outputs, not a vector. Asking for one and indexing it gets
+  % the major version and then an error, which lands in the catch and reports
+  % the library as unavailable on a release that would have told you.
   try
-    v = H5.get_libversion();
-    fprintf('HDF5 library: %d.%d.%d\n', v(1), v(2), v(3));
+    [hdf5_major, hdf5_minor, hdf5_patch] = H5.get_libversion();
+    fprintf('HDF5 library: %d.%d.%d\n', hdf5_major, hdf5_minor, hdf5_patch);
   catch
     fprintf('HDF5 library: (H5.get_libversion unavailable)\n');
   end
