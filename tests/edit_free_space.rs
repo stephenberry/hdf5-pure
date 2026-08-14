@@ -6,7 +6,10 @@
 //! run reaches end-of-file. These tests pin down both the size behavior and that
 //! survivors stay byte-exact and the file stays valid.
 
-use hdf5_pure::{File, FileBuilder, FileSpaceStrategy};
+use hdf5_pure::{
+    AttrValue, EditBacking, File, FileAccessProperties, FileBuilder, FileSpaceStrategy,
+    MemoryStrategy,
+};
 
 fn tmp(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(name)
@@ -746,6 +749,442 @@ fn persisted_managers_stay_consistent_across_many_commits() {
         );
     }
     assert!(f.dataset("d0").is_err());
+    std::fs::remove_file(&path).ok();
+}
+
+/// The bytes a chunked dataset of `elems` `f64` elements occupies, near enough:
+/// the chunk data itself, which dominates its index and header.
+fn f64_data_bytes(elems: usize) -> u64 {
+    (elems * 8) as u64
+}
+
+#[test]
+fn chunked_dataset_reuses_the_hole_a_chunked_delete_left() {
+    // The headline of issue #261. A chunked dataset's data region — chunk bytes
+    // plus the index that addresses them — used to be *appended* unconditionally,
+    // because its embedded addresses were computed from the end-of-file it was
+    // about to land at. Sizing it before placing it lets it go into a freed region
+    // instead, so delete-then-write of the same shape costs the file nothing.
+    //
+    // The hole is interior on purpose: `tail` sits above the deleted dataset, so
+    // truncation cannot be what keeps the file small.
+    let path = tmp("hdf5_pure_fs_chunked_reuse.h5");
+    const ELEMS: usize = 32768; // 256 KiB of raw data
+    let mut b = FileBuilder::new();
+    b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
+    b.create_dataset("big")
+        .with_f64_data(&vec![1.0; ELEMS])
+        .with_chunks(&[4096]);
+    b.create_dataset("tail").with_i32_data(&[9; 16]);
+    b.write(&path).unwrap();
+    let start = std::fs::metadata(&path).unwrap().len();
+
+    {
+        let s = File::open_rw(&path).unwrap();
+        s.root().delete("big").unwrap();
+        s.commit().unwrap();
+        s.root()
+            .create_dataset("big2", |b| {
+                b.with_f64_data(&vec![2.0; ELEMS]).with_chunks(&[4096]);
+            })
+            .unwrap();
+        s.commit().unwrap();
+    }
+
+    let end = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        end < start + f64_data_bytes(ELEMS) / 10,
+        "the replacement dataset should land in the hole the deleted one left, \
+         not past it (start={start}, end={end})"
+    );
+
+    assert_eof_matches_file(&path);
+    let f = File::open(&path).unwrap();
+    assert_eq!(
+        f.dataset("big2").unwrap().read_f64().unwrap(),
+        vec![2.0; ELEMS]
+    );
+    assert_eq!(
+        f.dataset("keep").unwrap().read_i32().unwrap(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(f.dataset("tail").unwrap().read_i32().unwrap(), vec![9; 16]);
+    assert!(f.dataset("big").is_err());
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn filtered_chunked_dataset_reuses_freed_space() {
+    // Same as above for a *filtered* dataset, whose compressed size is not known
+    // until the pipeline has run: the placement is chosen from the compressed
+    // set's size, so the filter pass still happens exactly once.
+    let path = tmp("hdf5_pure_fs_chunked_reuse_filtered.h5");
+    const ELEMS: usize = 32768;
+    let mut b = FileBuilder::new();
+    b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
+    b.create_dataset("big")
+        .with_f64_data(&(0..ELEMS).map(|i| i as f64).collect::<Vec<f64>>())
+        .with_chunks(&[4096])
+        .with_deflate(4);
+    b.create_dataset("tail").with_i32_data(&[9; 16]);
+    b.write(&path).unwrap();
+    let start = std::fs::metadata(&path).unwrap().len();
+    let hole = start; // an upper bound on what the deleted dataset can free
+
+    {
+        let s = File::open_rw(&path).unwrap();
+        s.root().delete("big").unwrap();
+        s.commit().unwrap();
+        let after_delete = std::fs::metadata(&path).unwrap().len();
+        s.root()
+            .create_dataset("big2", |b| {
+                b.with_f64_data(&(0..ELEMS).map(|i| i as f64).collect::<Vec<f64>>())
+                    .with_chunks(&[4096])
+                    .with_deflate(4);
+            })
+            .unwrap();
+        s.commit().unwrap();
+        let end = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            end < after_delete + hole / 10,
+            "an identically filtered replacement should reuse the freed region \
+             (after_delete={after_delete}, end={end})"
+        );
+    }
+
+    assert_eof_matches_file(&path);
+    let f = File::open(&path).unwrap();
+    assert_eq!(
+        f.dataset("big2").unwrap().read_f64().unwrap(),
+        (0..ELEMS).map(|i| i as f64).collect::<Vec<f64>>()
+    );
+    assert_eq!(f.dataset("tail").unwrap().read_i32().unwrap(), vec![9; 16]);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn reusing_a_chunked_hole_keeps_its_neighbors_byte_exact() {
+    // Reuse writes over a dead interior region, so the test that matters is what
+    // happens to the *live* bytes on either side of it. Both neighbors — one
+    // below the hole, one above — must read back exactly, and every chunk of the
+    // dataset written into the hole must too.
+    let path = tmp("hdf5_pure_fs_chunked_reuse_neighbors.h5");
+    const ELEMS: usize = 16384;
+    let below: Vec<f64> = (0..2048).map(|i| i as f64 * 0.5).collect();
+    let above: Vec<i32> = (0..2048).map(|i| i * 3).collect();
+    let mut b = FileBuilder::new();
+    b.create_dataset("below").with_f64_data(&below);
+    b.create_dataset("victim")
+        .with_f64_data(&vec![7.0; ELEMS])
+        .with_chunks(&[2048]);
+    b.create_dataset("above").with_i32_data(&above);
+    b.write(&path).unwrap();
+
+    let replacement: Vec<f64> = (0..ELEMS).map(|i| (i % 97) as f64).collect();
+    {
+        let s = File::open_rw(&path).unwrap();
+        s.root().delete("victim").unwrap();
+        s.commit().unwrap();
+        s.root()
+            .create_dataset("fresh", |b| {
+                b.with_f64_data(&replacement).with_chunks(&[2048]);
+            })
+            .unwrap();
+        s.commit().unwrap();
+    }
+
+    assert_eof_matches_file(&path);
+    let f = File::open(&path).unwrap();
+    assert_eq!(f.dataset("below").unwrap().read_f64().unwrap(), below);
+    assert_eq!(f.dataset("above").unwrap().read_i32().unwrap(), above);
+    assert_eq!(f.dataset("fresh").unwrap().read_f64().unwrap(), replacement);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn paged_commit_reuses_freed_space_within_its_page_type() {
+    // A paged file segregates metadata and raw data by page, so it tracks free
+    // space per page type and a commit may only draw from the list matching what
+    // it is placing. It used to draw from none of them and always append.
+    //
+    // The file stays valid and every page stays homogeneous — the crosscheck
+    // suite reads these files with the reference C library, which is where a
+    // mixed page would show up.
+    let path = tmp("hdf5_pure_fs_paged_reuse.h5");
+    const ELEMS: usize = 32768;
+    let mut b = FileBuilder::new();
+    b.with_file_space_strategy(FileSpaceStrategy::Page, true, 1);
+    b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
+    b.create_dataset("big")
+        .with_f64_data(&vec![1.0; ELEMS])
+        .with_chunks(&[4096]);
+    b.create_dataset("tail").with_i32_data(&[9; 16]);
+    b.write(&path).unwrap();
+    let start = std::fs::metadata(&path).unwrap().len();
+
+    {
+        let s = File::open_rw(&path).unwrap();
+        s.root().delete("big").unwrap();
+        s.commit().unwrap();
+        s.root()
+            .create_dataset("big2", |b| {
+                b.with_f64_data(&vec![2.0; ELEMS]).with_chunks(&[4096]);
+            })
+            .unwrap();
+        s.commit().unwrap();
+    }
+
+    let end = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        end < start + f64_data_bytes(ELEMS) / 4,
+        "a paged file should reuse its freed raw pages rather than append past \
+         them (start={start}, end={end})"
+    );
+
+    assert_eof_matches_file(&path);
+    let f = File::open(&path).unwrap();
+    assert_eq!(
+        f.dataset("big2").unwrap().read_f64().unwrap(),
+        vec![2.0; ELEMS]
+    );
+    assert_eq!(
+        f.dataset("keep").unwrap().read_i32().unwrap(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(f.dataset("tail").unwrap().read_i32().unwrap(), vec![9; 16]);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn persisted_chunked_free_space_is_reused_after_a_reopen() {
+    // The cross-session case: one session deletes a chunked dataset, a *later*
+    // one writes a fresh one. The second session only knows about the hole from
+    // the on-disk managers it seeds its free list from, so this pins the seeding
+    // and the chunked placement together.
+    let path = tmp("hdf5_pure_fs_chunked_persist_reuse.h5");
+    const ELEMS: usize = 32768;
+    let mut b = FileBuilder::new();
+    b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1);
+    b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
+    b.create_dataset("big")
+        .with_f64_data(&vec![1.0; ELEMS])
+        .with_chunks(&[4096]);
+    b.create_dataset("tail").with_i32_data(&[9; 16]);
+    b.write(&path).unwrap();
+    let start = std::fs::metadata(&path).unwrap().len();
+
+    {
+        let s = File::open_rw(&path).unwrap();
+        s.root().delete("big").unwrap();
+        s.commit().unwrap();
+    }
+    {
+        let s = File::open_rw(&path).unwrap();
+        s.root()
+            .create_dataset("big2", |b| {
+                b.with_f64_data(&vec![2.0; ELEMS]).with_chunks(&[4096]);
+            })
+            .unwrap();
+        s.commit().unwrap();
+    }
+
+    let end = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        end < start + f64_data_bytes(ELEMS) / 10,
+        "the second session should reuse the hole the first one persisted \
+         (start={start}, end={end})"
+    );
+
+    assert_eof_matches_file(&path);
+    let f = File::open(&path).unwrap();
+    assert_eq!(
+        f.dataset("big2").unwrap().read_f64().unwrap(),
+        vec![2.0; ELEMS]
+    );
+    assert_eq!(
+        f.dataset("keep").unwrap().read_i32().unwrap(),
+        vec![1, 2, 3]
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn both_read_write_backings_reuse_a_freed_hole_alike() {
+    // One engine drives two backings (issue #198): the bounded one writes through
+    // a handle, the mirrored one through a whole-file buffer. `File::open_rw`
+    // prefers bounded, so every test above exercises that half; this one pins the
+    // other, since a hole is reused by writing into the middle of the image and
+    // that is precisely where the two backings differ.
+    const ELEMS: usize = 16384;
+    for (name, strategy) in [
+        ("hdf5_pure_fs_backing_bounded.h5", MemoryStrategy::Bounded),
+        ("hdf5_pure_fs_backing_mirrored.h5", MemoryStrategy::Mirrored),
+    ] {
+        let path = tmp(name);
+        let mut b = FileBuilder::new();
+        b.create_dataset("big")
+            .with_f64_data(&vec![1.0; ELEMS])
+            .with_chunks(&[2048]);
+        b.create_dataset("tail").with_i32_data(&[9; 16]);
+        b.write(&path).unwrap();
+        let start = std::fs::metadata(&path).unwrap().len();
+
+        {
+            let s = File::open_rw_with_options(
+                &path,
+                FileAccessProperties::new().with_memory_strategy(strategy),
+            )
+            .unwrap();
+            assert_eq!(
+                s.edit_backing(),
+                Some(match strategy {
+                    MemoryStrategy::Bounded => EditBacking::Bounded,
+                    _ => EditBacking::Mirrored,
+                }),
+                "{name}: the requested backing is the one under test"
+            );
+            s.root().delete("big").unwrap();
+            s.commit().unwrap();
+            s.root()
+                .create_dataset("big2", |b| {
+                    b.with_f64_data(&vec![2.0; ELEMS]).with_chunks(&[2048]);
+                })
+                .unwrap();
+            s.commit().unwrap();
+        }
+
+        let end = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            end < start + f64_data_bytes(ELEMS) / 10,
+            "{name}: the replacement should reuse the freed hole \
+             (start={start}, end={end})"
+        );
+        assert_eof_matches_file(&path);
+        let f = File::open(&path).unwrap();
+        assert_eq!(
+            f.dataset("big2").unwrap().read_f64().unwrap(),
+            vec![2.0; ELEMS]
+        );
+        assert_eq!(f.dataset("tail").unwrap().read_i32().unwrap(), vec![9; 16]);
+        std::fs::remove_file(&path).ok();
+    }
+}
+
+#[test]
+fn churn_of_groups_attributes_and_datasets_stays_bounded() {
+    // The whole free-space story on one file: groups carrying attributes, plain
+    // and filtered chunked datasets, deleted by subtree and rewritten identically,
+    // round after round. Every round frees exactly what the next one needs, so a
+    // file that reuses its free space returns to the same size each time while one
+    // that appends grows by a full round's worth per cycle.
+    //
+    // A "ceiling" dataset written above the first round is what makes this a test
+    // of *reuse*. Without it every freed round would reach end-of-file and be
+    // truncated away, which keeps the file just as small while reusing nothing.
+    let path = tmp("hdf5_pure_fs_full_churn.h5");
+    const ROUNDS: usize = 5;
+    const GROUPS: usize = 4;
+    const ELEMS: usize = 8192; // 64 KiB per dataset
+
+    let write_round = |s: &File, round: usize| {
+        for g in 0..GROUPS {
+            let name = format!("g{g}");
+            s.root()
+                .create_group_with(&name, |grp| {
+                    for a in 0..8 {
+                        grp.set_attr(
+                            &format!("attr{a}"),
+                            AttrValue::F64Array(vec![round as f64; 32]),
+                        );
+                    }
+                })
+                .unwrap();
+            s.root()
+                .create_dataset(&format!("{name}/plain"), |b| {
+                    b.with_f64_data(&vec![round as f64; ELEMS])
+                        .with_chunks(&[1024]);
+                })
+                .unwrap();
+            s.root()
+                .create_dataset(&format!("{name}/filtered"), |b| {
+                    b.with_f64_data(&(0..ELEMS).map(|i| (i + round) as f64).collect::<Vec<f64>>())
+                        .with_chunks(&[1024])
+                        .with_deflate(4);
+                })
+                .unwrap();
+        }
+    };
+
+    let mut b = FileBuilder::new();
+    b.create_dataset("anchor").with_i32_data(&[7; 64]);
+    b.write(&path).unwrap();
+
+    let baseline;
+    let mut peak;
+    {
+        let s = File::open_rw(&path).unwrap();
+        write_round(&s, 0);
+        s.commit().unwrap();
+        // Everything churned from here on sits *below* this dataset, so a freed
+        // round is an interior hole rather than a trailing run.
+        s.root()
+            .create_dataset("ceiling", |b| {
+                b.with_f64_data(&vec![1.25; ELEMS]);
+            })
+            .unwrap();
+        s.commit().unwrap();
+        baseline = std::fs::metadata(&path).unwrap().len();
+        peak = baseline;
+
+        for round in 1..=ROUNDS {
+            for g in 0..GROUPS {
+                s.root().delete(&format!("g{g}")).unwrap();
+            }
+            s.commit().unwrap();
+            write_round(&s, round);
+            s.commit().unwrap();
+            peak = peak.max(std::fs::metadata(&path).unwrap().len());
+        }
+    }
+
+    let end = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        end < baseline + baseline / 4,
+        "churning {ROUNDS} identical rounds should reuse the space each round \
+         frees, not accumulate it (baseline={baseline}, peak={peak}, final={end})"
+    );
+
+    assert_eof_matches_file(&path);
+    let f = File::open(&path).unwrap();
+    assert_eq!(
+        f.dataset("anchor").unwrap().read_i32().unwrap(),
+        vec![7; 64]
+    );
+    for g in 0..GROUPS {
+        assert_eq!(
+            f.dataset(&format!("g{g}/plain"))
+                .unwrap()
+                .read_f64()
+                .unwrap(),
+            vec![ROUNDS as f64; ELEMS]
+        );
+        assert_eq!(
+            f.dataset(&format!("g{g}/filtered"))
+                .unwrap()
+                .read_f64()
+                .unwrap(),
+            (0..ELEMS)
+                .map(|i| (i + ROUNDS) as f64)
+                .collect::<Vec<f64>>()
+        );
+        let attrs = f.group(&format!("g{g}")).unwrap().attrs().unwrap();
+        for a in 0..8 {
+            assert_eq!(
+                attrs.get(&format!("attr{a}")),
+                Some(&AttrValue::F64Array(vec![ROUNDS as f64; 32])),
+            );
+        }
+    }
     std::fs::remove_file(&path).ok();
 }
 

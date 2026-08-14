@@ -489,11 +489,21 @@ impl PagedManagerPlan {
 ///
 /// Each section is first split at page boundaries, then classed by size: an
 /// intra-page (`< page_size`) fragment stays in its SMALL-class per-type manager
-/// — SUPER (slot 0) for metadata, DRAW (slot 2) for small raw — while a whole
-/// free page (which only arises from freeing a page's worth of space below a page
-/// tail) goes to the single generic-large manager (slot 6), together with any
-/// pre-existing large-raw fragments. This keeps a SMALL section from ever
-/// spanning a page or reaching `page_size`, matching the reference library.
+/// — SUPER (slot 0) for metadata, DRAW (slot 2) for raw — while a whole free page
+/// goes to the single generic-large manager (slot 6). This keeps a SMALL section
+/// from ever spanning a page or reaching `page_size`, matching the reference
+/// library.
+///
+/// Size is the only thing that decides between a SMALL manager and the large one,
+/// which is why the caller tracks placeable free space by page *type* alone: the
+/// split is recomputed here on every commit, so nothing upstream has to maintain
+/// it (and maintaining it upstream would keep neighboring holes of different
+/// classes from coalescing — issue #261).
+///
+/// `unclassified` is free space the caller could not assign a page type to,
+/// because the generic-large manager it came from holds both kinds. It is written
+/// back to that manager exactly as it was found: splitting or re-classing it would
+/// state a page type the caller deliberately did not claim to know.
 ///
 /// `FSSE` byte length depends only on section count and sizes (fixed field
 /// widths), never on the addresses, so a single forward pass fixes every address
@@ -501,8 +511,8 @@ impl PagedManagerPlan {
 /// backend's persist tails so the two produce identical layouts.
 pub(crate) fn plan_paged_managers(
     meta: &[FreeSection],
-    raw_small: &[FreeSection],
-    raw_large: &[FreeSection],
+    raw: &[FreeSection],
+    unclassified: &[FreeSection],
     page_size: u64,
     start: u64,
     offset_size: u8,
@@ -517,16 +527,14 @@ pub(crate) fn plan_paged_managers(
             slot6.push(s);
         }
     }
-    for s in split_at_pages(raw_small, page_size) {
+    for s in split_at_pages(raw, page_size) {
         if s.size < page_size {
             slot2.push(s);
         } else {
             slot6.push(s);
         }
     }
-    for s in split_at_pages(raw_large, page_size) {
-        slot6.push(s);
-    }
+    slot6.extend(unclassified.iter().copied());
     slot6.sort_by_key(|s| s.addr);
 
     let mut slots = [u64::MAX; NUM_FILE_FSM_MANAGERS];

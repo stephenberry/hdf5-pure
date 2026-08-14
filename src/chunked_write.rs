@@ -1573,6 +1573,109 @@ pub(crate) fn compress_chunks(
     })
 }
 
+/// Where each of a chunk set's chunks lands when the set is laid out at
+/// `base_address` — they are stored back to back from there — and the address the
+/// chunk index follows them at.
+fn plan_chunk_slots(set: &CompressedChunkSet, base_address: u64) -> (Vec<WrittenChunk>, u64) {
+    let mut cursor = base_address;
+    let mut written_chunks = Vec::with_capacity(set.compressed.len());
+    for (chunk, &raw_size) in set.compressed.iter().zip(set.raw_sizes.iter()) {
+        written_chunks.push(WrittenChunk {
+            address: cursor,
+            compressed_size: chunk.len() as u64,
+            raw_size,
+            filter_mask: 0,
+        });
+        cursor += chunk.len() as u64;
+    }
+    (written_chunks, cursor)
+}
+
+/// Build the chunk index that follows a chunk set's data at `index_address`,
+/// returning the index bytes — empty for the single-chunk layout, whose chunk
+/// address lives in the layout message instead — and the v4 data-layout message
+/// naming it.
+///
+/// Every address either one embeds sits in a fixed-width field, so the returned
+/// bytes have the same *length* for every `index_address`. That is what lets
+/// [`chunked_data_len`] size a dataset before its address has been chosen, and
+/// what lets the writer size an object header in one pass and emit it in a later
+/// one.
+fn chunk_index_bytes(
+    set: &CompressedChunkSet,
+    written_chunks: &[WrittenChunk],
+    index_address: u64,
+) -> Result<(Vec<u8>, Vec<u8>), FormatError> {
+    let offset_size: u8 = 8;
+    let length_size: u8 = 8;
+    let has_filters = set.has_filters;
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "element size written into the on-disk u32 dimension field selected for this file"
+    )]
+    let (index, layout_message) = if set.use_extensible {
+        let ea_bytes = build_extensible_array_at(
+            written_chunks,
+            offset_size,
+            length_size,
+            has_filters,
+            index_address,
+        )?;
+        let layout = serialize_v4_extensible_array(
+            &set.chunk_dims_u32,
+            index_address,
+            offset_size,
+            set.element_size as u32,
+        );
+        (ea_bytes, layout)
+    } else if written_chunks.len() == 1 {
+        let chunk = &written_chunks[0];
+        let filtered_size = has_filters.then_some(chunk.compressed_size);
+        let filter_mask = has_filters.then_some(0u32);
+        let layout = serialize_v4_single_chunk(
+            &set.chunk_dims_u32,
+            chunk.address,
+            filtered_size,
+            filter_mask,
+            offset_size,
+            set.element_size as u32,
+        );
+        (Vec::new(), layout)
+    } else {
+        let fa_bytes = build_fixed_array_at(
+            written_chunks,
+            offset_size,
+            length_size,
+            has_filters,
+            index_address,
+        );
+        let layout = serialize_v4_fixed_array(
+            &set.chunk_dims_u32,
+            index_address,
+            offset_size,
+            set.element_size as u32,
+            FIXED_ARRAY_PAGE_BITS,
+        );
+        (fa_bytes, layout)
+    };
+    Ok((index, layout_message))
+}
+
+/// The exact byte length [`assemble_chunked_at`] produces for `set` — the same
+/// at every base address, since the layout depends on the chunk sizes and the
+/// index shape alone.
+///
+/// Sizing without assembling is what lets a caller pick the dataset's address
+/// *first*: the in-place editor asks its free-space list for a region this long
+/// and, if it gets one, assembles the set straight into it rather than growing
+/// the file (issue #261).
+pub(crate) fn chunked_data_len(set: &CompressedChunkSet) -> Result<u64, FormatError> {
+    let (written_chunks, index_address) = plan_chunk_slots(set, 0);
+    let (index, _layout) = chunk_index_bytes(set, &written_chunks, index_address)?;
+    Ok(index_address + index.len() as u64)
+}
+
 /// Lay an already-[`compress`ed](compress_chunks) chunk set out at `base_address`,
 /// producing the on-disk data region (chunk bytes followed by the chunk index)
 /// and the v4 data-layout message. Cheap: this only concatenates and builds the
@@ -1582,117 +1685,38 @@ pub(crate) fn assemble_chunked_at(
     set: &CompressedChunkSet,
     base_address: u64,
 ) -> Result<ChunkedDataResult, FormatError> {
-    let CompressedChunkSet {
-        compressed,
-        raw_sizes,
-        chunk_dims_u32,
-        element_size,
-        has_filters,
-        use_extensible,
-        pipeline_message,
-    } = set;
-    let element_size = *element_size;
-    let has_filters = *has_filters;
-    let num_chunks = compressed.len();
+    let (written_chunks, index_address) = plan_chunk_slots(set, base_address);
+    let (index, layout_message) = chunk_index_bytes(set, &written_chunks, index_address)?;
 
-    // Pre-size the data buffer to hold every chunk; the index structure appended
-    // afterwards grows it the rest of the way.
-    let chunk_bytes_total: usize = compressed.iter().map(Vec::len).sum();
-    let mut data_buf = Vec::with_capacity(chunk_bytes_total);
-    let mut written_chunks = Vec::with_capacity(num_chunks);
-
-    for (chunk, &raw_size) in compressed.iter().zip(raw_sizes.iter()) {
-        let address = base_address + data_buf.len() as u64;
+    // One exact allocation for chunks plus index: the buffer is filled to its
+    // capacity, never doubled and copied.
+    let chunk_bytes_total: usize = set.compressed.iter().map(Vec::len).sum();
+    let mut data_buf = Vec::with_capacity(chunk_bytes_total + index.len());
+    for chunk in &set.compressed {
         data_buf.extend_from_slice(chunk);
-
-        written_chunks.push(WrittenChunk {
-            address,
-            compressed_size: chunk.len() as u64,
-            raw_size,
-            filter_mask: 0,
-        });
     }
-
-    let offset_size: u8 = 8;
-    let length_size: u8 = 8;
-
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "element size written into the on-disk u32 dimension field selected for this file"
-    )]
-    let layout_message = if *use_extensible {
-        let ea_address = base_address + data_buf.len() as u64;
-
-        let ea_bytes = build_extensible_array_at(
-            &written_chunks,
-            offset_size,
-            length_size,
-            has_filters,
-            ea_address,
-        )?;
-        // The chunk loop filled `data_buf` to exactly its reserved capacity, so
-        // extending would otherwise double the whole buffer and copy it.
-        data_buf.reserve_exact(ea_bytes.len());
-        data_buf.extend_from_slice(&ea_bytes);
-
-        serialize_v4_extensible_array(chunk_dims_u32, ea_address, offset_size, element_size as u32)
-    } else if num_chunks == 1 {
-        let chunk_addr = written_chunks[0].address;
-        let filtered_size = if has_filters {
-            Some(written_chunks[0].compressed_size)
-        } else {
-            None
-        };
-        let filter_mask = if has_filters { Some(0u32) } else { None };
-        serialize_v4_single_chunk(
-            chunk_dims_u32,
-            chunk_addr,
-            filtered_size,
-            filter_mask,
-            offset_size,
-            element_size as u32,
-        )
-    } else {
-        let fa_address = base_address + data_buf.len() as u64;
-
-        let fa_bytes = build_fixed_array_at(
-            &written_chunks,
-            offset_size,
-            length_size,
-            has_filters,
-            fa_address,
-        );
-        // As above: reserve the index exactly rather than let the buffer double.
-        data_buf.reserve_exact(fa_bytes.len());
-        data_buf.extend_from_slice(&fa_bytes);
-
-        serialize_v4_fixed_array(
-            chunk_dims_u32,
-            fa_address,
-            offset_size,
-            element_size as u32,
-            FIXED_ARRAY_PAGE_BITS,
-        )
-    };
+    data_buf.extend_from_slice(&index);
 
     Ok(ChunkedDataResult {
         data_bytes: data_buf,
         layout_message,
-        pipeline_message: pipeline_message.clone(),
+        pipeline_message: set.pipeline_message.clone(),
     })
 }
 
 /// Build chunked data with absolute addresses and optional maxshape.
 ///
 /// Convenience composition of [`compress_chunks`] + [`assemble_chunked_at`] for
-/// callers (the in-place editor, tests) that build a single chunked dataset at a
-/// known address in one shot. The file writer instead keeps the
-/// [`CompressedChunkSet`] between its sizing and emit passes so it compresses
-/// each dataset only once.
+/// tests that build a single chunked dataset at a known address in one shot.
+/// Production callers keep the [`CompressedChunkSet`] between passes instead, so
+/// they compress each dataset only once: the file writer sizes an object header
+/// before it emits the data, and the in-place editor sizes the dataset
+/// ([`chunked_data_len`]) before it chooses the address to assemble it at.
 ///
 /// `ctx` carries chunk_dims, element_size, and (for type-aware filters like
 /// ZFP) the scalar element type. Build it via [`ChunkContext::from_datatype`]
 /// when a `Datatype` is in scope.
+#[cfg(test)]
 pub fn build_chunked_data_at_ext(
     raw_data: &[u8],
     shape: &[u64],

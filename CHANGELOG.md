@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- A `File::open_rw` commit reuses freed space for a chunked dataset's chunk data and index, and for a dense attribute heap, where both were always appended at the end of the file; a replacement needs one free region large enough to hold it whole ([#261](https://github.com/stephenberry/hdf5-pure/issues/261)).
+- A paged file (`FileSpaceStrategy::Page`) reuses its freed space too, drawing only from the page type being written so metadata and raw data cannot come to share a page; it previously appended for every allocation. Free space another writer recorded whose page type cannot be established is kept but never reused ([#261](https://github.com/stephenberry/hdf5-pure/issues/261)).
+- A commit that fails before its superblock repoint returns the free regions it had drawn from, instead of leaking them for the rest of the session ([#261](https://github.com/stephenberry/hdf5-pure/issues/261)).
+
 ## [0.36.0] - 2026-08-13
 
 Writing complex data to a `.mat` file gets substantially faster. `mat::complex::i16_array`, and one helper per component class, write a large complex array in bulk from a `#[serde(serialize_with = ...)]` field — roughly twenty-five times faster than the per-element path for the same bytes — and an ordinary complex write, `MatBuilder`'s writers included, is about five times faster than before ([#260](https://github.com/stephenberry/hdf5-pure/pull/260)). The bulk helpers accept anything implementing `mat::ComplexElement`, a new unsafe layout trait implemented for this crate's `Complex*` types and, under the new `num-complex` feature, for `num_complex::Complex<T>`. Reading a group's members now costs one walk rather than one per member: `Group::iter_datasets` and `Group::iter_groups` yield opened handles paired with their names, where opening each name from `datasets()` re-walks the group every time ([#259](https://github.com/stephenberry/hdf5-pure/pull/259)). Additive minor bump.

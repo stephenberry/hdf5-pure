@@ -464,6 +464,79 @@ fn free_space_reuse_and_truncation_stay_c_readable() {
 }
 
 #[test]
+fn a_chunked_dataset_written_into_a_freed_hole_stays_c_readable() {
+    // Issue #261: a chunked dataset's data region is sized before it is placed, so
+    // it can land in a region an earlier commit freed instead of at end-of-file.
+    // Every address it carries — each chunk's, the index's, the one in the
+    // data-layout message — is then computed from that interior address rather
+    // than from the end of the file, which is exactly the class of mistake a
+    // reader catches and a size assertion does not. So make the reference C
+    // library resolve them: it reads the relocated dataset, and the survivors
+    // above and below the hole, from a file it wrote itself.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_chunked_hole.h5");
+    write_c_starter(&path, LibraryVersion::V110, LibraryVersion::latest());
+
+    let filtered: Vec<f64> = (0..4096).map(|i| (i % 37) as f64).collect();
+    let size_before;
+    {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("victim", |b| {
+                b.with_f64_data(&vec![9.0; 4096]).with_chunks(&[512]);
+            })
+            .unwrap();
+        session.commit().unwrap();
+        // A dataset *above* the victim, so deleting it leaves an interior hole
+        // rather than a trailing run the commit would simply truncate away.
+        session
+            .root()
+            .create_dataset("ceiling", |b| {
+                b.with_i32_data(&[4; 256]);
+            })
+            .unwrap();
+        session.commit().unwrap();
+        size_before = std::fs::metadata(&path).unwrap().len();
+
+        session.root().delete("victim").unwrap();
+        session.commit().unwrap();
+        session
+            .root()
+            .create_dataset("replacement", |b| {
+                b.with_f64_data(&filtered)
+                    .with_chunks(&[512])
+                    .with_deflate(4);
+            })
+            .unwrap();
+        session.commit().unwrap();
+    }
+
+    let size_after = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        size_after <= size_before,
+        "the replacement fits the freed hole, so the file must not grow \
+         (was {size_before}, now {size_after})"
+    );
+
+    let c = hdf5::File::open(&path).unwrap();
+    assert_c_absent(&c.dataset("victim").unwrap_err(), "victim");
+    assert_eq!(
+        c.dataset("replacement").unwrap().read_raw::<f64>().unwrap(),
+        filtered,
+        "the C library resolves the chunk index of a dataset placed mid-file"
+    );
+    assert_eq!(
+        c.dataset("ceiling").unwrap().read_raw::<i32>().unwrap(),
+        vec![4; 256]
+    );
+    assert_eq!(
+        c.dataset("alpha").unwrap().read_raw::<f64>().unwrap(),
+        vec![1.0, 2.0, 3.0]
+    );
+}
+
+#[test]
 fn chunked_and_filtered_datasets_added_in_place_are_c_readable() {
     // Issue #76: chunked / filtered / extensible datasets added in place to a
     // file the editor did not write must be read back faithfully by the
