@@ -1,7 +1,7 @@
 // Crosschecks link the reference HDF5 C library (the `hdf5-metno` dev-dependency),
-// which is gated to 64-bit-pointer targets; skip them on 32-bit so the pure-Rust
+// which is gated to 64-bit little-endian targets; skip them elsewhere so the pure-Rust
 // suite can run under `cross test --target i686-...`.
-#![cfg(not(target_pointer_width = "32"))]
+#![cfg(all(not(target_pointer_width = "32"), target_endian = "little"))]
 //! Cross-validation for editing files with a userblock (the userblock slice of
 //! issue #104) against the reference C library. A single off-by-base address in
 //! an edited file makes the C library error or read garbage, so reading the

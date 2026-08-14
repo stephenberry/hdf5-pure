@@ -263,6 +263,33 @@ jobs:
           --test attr_message_size_limit --test userblock_dense_attrs
           --test c_1_8_read_compat
 
+  # Real big-endian execution under QEMU. Every integer this crate writes is
+  # little-endian on disk, so on a big-endian host every read and write has to
+  # swap; nothing else in CI can tell a missing swap from a present one, because
+  # every other target is little-endian and `from_ne_bytes` and `from_le_bytes`
+  # are the same function there. The C-crosscheck dev-dependency is excluded on
+  # this target (see `Cargo.toml`), so this is the pure-Rust suite only.
+  test-big-endian:
+    name: Test (s390x, QEMU via cross)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cross-s390x
+      - name: cross test (pure-Rust library + byte-order suite on s390x)
+        run: >
+          cross test --locked --target s390x-unknown-linux-gnu
+          --no-default-features
+          --features "std checksum deflate zfp serde ndarray provenance"
+          --lib --test write_read_roundtrip --test serde_roundtrip
+          --test complex_bulk_array --test complex_integer
+          --test streaming_reader --test vlen_strings
+
   # Bare-metal no_std build: proves the crate links without `std` on a genuine
   # `none` target (the existing no-std-check only runs on the std-capable host).
   no-std-bare-metal:
@@ -307,7 +334,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: miri
-      - name: Miri test (mat::transpose unsafe)
+      - name: Miri test (unsafe in mat::transpose and mat::complex)
         # `--no-default-features --features std,serde` selects the smallest set
         # that compiles the code under test: `std` gates the `mat` module and
         # `serde` gates `transpose` within it. Dropping `deflate` also drops
@@ -331,19 +358,28 @@ jobs:
         #      itself has to be asserted nonzero.
         run: |
           set -o pipefail
-          if ! grep -qE '^[^/]*\bunsafe[[:space:]]*(\{|fn |impl )' src/mat/transpose.rs; then
-            echo "::error::src/mat/transpose.rs holds no unsafe code; point this job at the code that does."
-            exit 1
-          fi
-          cargo miri test --locked --no-default-features --features std,serde \
-            --lib mat::transpose 2>&1 | tee miri.log
-          if grep -q "running 0 tests" miri.log; then
-            echo "::error::Miri ran no tests: the --lib filter matched nothing."
-            exit 1
-          fi
-          if ! grep -qE '[1-9][0-9]* passed' miri.log; then
-            echo "::error::Miri passed no tests: they were selected but ignored or skipped."
-            exit 1
-          fi
+          # One entry per module holding unsafe that Miri can reach. Each is
+          # checked for still holding unsafe and for actually running tests, so
+          # the three hollowing modes above are caught per module rather than
+          # masked by whichever sibling still passes.
+          set -- "src/mat/transpose.rs:mat::transpose" "src/mat/complex.rs:mat::complex"
+          for entry in "$@"; do
+            file="${entry%%:*}"
+            filter="${entry##*:}"
+            if ! grep -qE '^[^/]*\bunsafe[[:space:]]*(\{|fn |impl )' "$file"; then
+              echo "::error::$file holds no unsafe code; point this job at the code that does."
+              exit 1
+            fi
+            cargo miri test --locked --no-default-features --features std,serde \
+              --lib "$filter" 2>&1 | tee miri.log
+            if grep -q "running 0 tests" miri.log; then
+              echo "::error::Miri ran no tests for $filter: the --lib filter matched nothing."
+              exit 1
+            fi
+            if ! grep -qE '[1-9][0-9]* passed' miri.log; then
+              echo "::error::Miri passed no tests for $filter: they were selected but ignored or skipped."
+              exit 1
+            fi
+          done
         env:
           MIRIFLAGS: -Zmiri-strict-provenance

@@ -4,7 +4,7 @@
 //! to be. `tests/owned_swmr_crosscheck.rs` already asks libhdf5 for a version 1
 //! superblock and checks the parsed K values and status flags against it, and
 //! `tests/edit_crosscheck.rs` does the same for a version 2 one. What both cost
-//! is the `hdf5-metno` dev-dependency, which requires 64-bit pointers — so every
+//! is the `hdf5-metno` dev-dependency, which requires 64-bit little-endian — so every
 //! file using it opens with `#![cfg(not(target_pointer_width = "32"))]` and
 //! compiles out on the i686 target, which is where address arithmetic is most
 //! likely to be wrong. Reading committed bytes needs no dev-dependency, so this

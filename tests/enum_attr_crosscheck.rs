@@ -1,6 +1,6 @@
 // Crosschecks link the reference HDF5 C library (the `hdf5-metno` dev-dependency),
-// gated to 64-bit-pointer targets.
-#![cfg(not(target_pointer_width = "32"))]
+// gated to 64-bit little-endian targets.
+#![cfg(all(not(target_pointer_width = "32"), target_endian = "little"))]
 //! An enumeration *attribute* written by the reference C library must reach the
 //! caller, decoded through the enum's integer base type (#248).
 //!

@@ -1,6 +1,6 @@
 // Crosschecks link the reference HDF5 C library (the `hdf5-metno` dev-dependency),
-// gated to 64-bit-pointer targets.
-#![cfg(not(target_pointer_width = "32"))]
+// gated to 64-bit little-endian targets.
+#![cfg(all(not(target_pointer_width = "32"), target_endian = "little"))]
 //! Committed (`H5Tcommit`) datatypes, written by the reference C library and read
 //! back by hdf5-pure (issue #254).
 //!

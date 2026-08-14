@@ -1,7 +1,7 @@
 // Crosschecks link the reference HDF5 C library (the `hdf5-metno` dev-dependency),
-// gated to 64-bit-pointer targets; skip on 32-bit so the pure-Rust suite still
+// gated to 64-bit little-endian targets; skip elsewhere so the pure-Rust suite still
 // runs under `cross test --target i686-...`.
-#![cfg(not(target_pointer_width = "32"))]
+#![cfg(all(not(target_pointer_width = "32"), target_endian = "little"))]
 //! Interop for the owned SWMR writer (issue #148, PR B): after a clean
 //! `File::close`, the SWMR-write flag is cleared and the reference C library
 //! reads the streamed appends back exactly.
