@@ -1,7 +1,7 @@
 // Crosschecks link the reference HDF5 C library (the `hdf5-metno` dev-dependency),
-// gated to 64-bit-pointer targets; skip on 32-bit so the pure-Rust suite still
+// gated to 64-bit little-endian targets; skip elsewhere so the pure-Rust suite still
 // runs under `cross test --target i686-...`.
-#![cfg(not(target_pointer_width = "32"))]
+#![cfg(all(not(target_pointer_width = "32"), target_endian = "little"))]
 //! Interop tests for `Dataset::append_staged`: append to a filtered,
 //! unlimited, Extensible-Array-indexed dataset and confirm the reference C
 //! library (`hdf5-metno`) reads the grown dataset back exactly — including

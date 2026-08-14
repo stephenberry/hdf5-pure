@@ -94,8 +94,8 @@ pub use producer::{Block, BlockElement, Blocking, DataProducer};
 
 #[cfg(feature = "serde")]
 pub use complex::{
-    Complex32, Complex64, ComplexI8, ComplexI16, ComplexI32, ComplexI64, ComplexU8, ComplexU16,
-    ComplexU32, ComplexU64,
+    Complex32, Complex64, ComplexElement, ComplexI8, ComplexI16, ComplexI32, ComplexI64, ComplexU8,
+    ComplexU16, ComplexU32, ComplexU64,
 };
 #[cfg(feature = "serde")]
 pub use matrix::{MatElement, Matrix};

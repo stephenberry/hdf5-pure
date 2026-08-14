@@ -352,6 +352,45 @@ macro_rules! complex_kinds {
                 }
             }
 
+            /// Rebuild a vector of `tag`'s class from interleaved `(re, im)`
+            /// components in **native**-endian order.
+            ///
+            /// Native, not little-endian, because the bytes are a live Rust
+            /// slice the caller handed over whole (see `mat::complex`'s array
+            /// helpers) rather than anything read from a file. The writer
+            /// re-encodes to little-endian on the way out, so a big-endian
+            /// host produces the same file a little-endian one does.
+            pub(crate) fn from_native_bytes(
+                tag: ComplexTag,
+                bytes: &[u8],
+            ) -> Result<Self, MatError> {
+                match tag {
+                    $(ComplexTag::$variant => {
+                        const W: usize = core::mem::size_of::<$ty>();
+                        if bytes.len() % (2 * W) != 0 {
+                            return Err(MatError::Custom(format!(
+                                "complex {} array payload of {} bytes is not a whole \
+                                 number of {}-byte pairs",
+                                ComplexTag::$variant.class().as_str(),
+                                bytes.len(),
+                                2 * W,
+                            )));
+                        }
+                        let v: Vec<($ty, $ty)> = bytes
+                            .chunks_exact(2 * W)
+                            .map(|pair| {
+                                let (re, im) = pair.split_at(W);
+                                (
+                                    <$ty>::from_ne_bytes(re.try_into().expect("half of a pair")),
+                                    <$ty>::from_ne_bytes(im.try_into().expect("half of a pair")),
+                                )
+                            })
+                            .collect();
+                        Ok(ComplexVec::$variant(v))
+                    })*
+                }
+            }
+
             /// Consume the vector as a stream of pairs. For a caller that is
             /// unpacking the whole thing, unlike [`get`](Self::get)'s cursor
             /// walk.
@@ -537,5 +576,48 @@ impl MatValue {
             MatValue::StructArray { .. } => "struct array",
             MatValue::Opaque { .. } => "opaque object",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Native rather than little-endian is the whole reason a big-endian host
+    /// writes the same file: the components come out of live memory, and the
+    /// writer swaps them on the way to disk.
+    ///
+    /// Written with `to_ne_bytes` on both sides, so it holds either way — but
+    /// that also means it cannot catch `from_ne_bytes` being changed to
+    /// `from_le_bytes`, and no CI target is big-endian. Reason about this one
+    /// rather than trusting it to fail.
+    #[test]
+    fn native_bytes_decode_at_the_host_order() {
+        let pair = [1i16.to_ne_bytes(), (-2i16).to_ne_bytes()].concat();
+        assert_eq!(
+            ComplexVec::from_native_bytes(ComplexTag::I16, &pair).unwrap(),
+            ComplexVec::I16(vec![(1, -2)]),
+        );
+    }
+
+    /// A payload that does not divide into whole pairs would otherwise lose
+    /// its tail silently, since `chunks_exact` ignores a short remainder.
+    #[test]
+    fn a_partial_pair_is_refused_rather_than_truncated() {
+        let err = ComplexVec::from_native_bytes(ComplexTag::I16, &[0, 1, 2, 3, 4]).unwrap_err();
+        assert!(
+            format!("{err}").contains("whole number of 4-byte pairs"),
+            "unexpected message: {err}"
+        );
+    }
+
+    /// The tag is the only thing an empty payload carries, and losing it is
+    /// what makes an empty array write as an untyped `double`.
+    #[test]
+    fn an_empty_payload_keeps_its_class() {
+        assert_eq!(
+            ComplexVec::from_native_bytes(ComplexTag::U8, &[]).unwrap(),
+            ComplexVec::U8(Vec::new()),
+        );
     }
 }

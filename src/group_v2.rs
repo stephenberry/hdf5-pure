@@ -595,7 +595,7 @@ mod tests {
 /// which is the only writer that produces a huge *link*: this crate's writer
 /// stores even a 60,000-byte link name as a managed heap object, so the huge
 /// path these tests cover is unreachable from a file it wrote.
-#[cfg(all(test, not(target_pointer_width = "32")))]
+#[cfg(all(test, not(target_pointer_width = "32"), target_endian = "little"))]
 mod huge_link_tests {
     use super::*;
     use crate::fractal_heap::{huge_index_decodes, reset_huge_index_decodes};

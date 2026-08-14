@@ -14,6 +14,7 @@ For how to declare these in `Cargo.toml`, see [Installation](../getting-started/
 | `serde` | no | `serde` | `std` | Serialize/deserialize MATLAB v7.3 `.mat` files via serde |
 | `fast-deflate` | no | `flate2/zlib-ng` | — | zlib-ng backend for deflate |
 | `ndarray` | no | `ndarray` crate | `std` | N-dimensional array I/O via the [`ndarray`](https://docs.rs/ndarray) crate |
+| `num-complex` | no | `num-complex` | `serde` | `mat::ComplexElement` for `num_complex::Complex<T>`, for the bulk complex-array helpers |
 | `parallel` | no | `rayon` | — | Parallel chunk processing via `rayon` |
 | `provenance` | no | `sha2` | — | SHA-256 data provenance tracking |
 | `zfp` | no | — | — | ZFP fixed-rate compression (HDF5 filter 32013), `f32`/`f64`/`i32`/`i64` x 1D-4D |
@@ -59,6 +60,13 @@ Adds ergonomic N-dimensional array I/O via the [`ndarray`](https://docs.rs/ndarr
 
 !!! tip
     The `ndarray_io` example requires this feature and can be run with `cargo run --example ndarray_io --features ndarray`.
+
+### `num-complex`
+
+Implements `mat::ComplexElement` for `num_complex::Complex<T>`, so a slice of the de-facto standard Rust complex type can be handed to the bulk array helpers (`mat::complex::i16_array` and friends) without a conversion pass. It implies `serde`. See [large complex arrays](../interop/matlab.md#large-complex-arrays).
+
+!!! note
+    The impls have to ship here rather than in your crate: `ComplexElement` is `unsafe` and asserts a memory layout, and the orphan rule allows the impl only from a crate that owns one of the two types. Your *own* complex type needs no feature — implement the trait for it directly.
 
 ### `parallel`
 

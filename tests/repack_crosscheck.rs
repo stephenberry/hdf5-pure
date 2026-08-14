@@ -1,7 +1,7 @@
 // Crosschecks link the reference HDF5 C library (the `hdf5-metno` dev-dependency),
-// which is gated to 64-bit-pointer targets; skip them on 32-bit so the pure-Rust
+// which is gated to 64-bit little-endian targets; skip them elsewhere so the pure-Rust
 // suite can run under `cross test --target i686-...`.
-#![cfg(not(target_pointer_width = "32"))]
+#![cfg(all(not(target_pointer_width = "32"), target_endian = "little"))]
 //! Cross-validation for whole-file repack (issue #21) against the reference
 //! HDF5 C library: a file the C library *writes* is repacked by `hdf5_pure`,
 //! and the result is read back by both readers. Also proves the fail-loud

@@ -9,7 +9,7 @@ use serde::ser::{
     SerializeTupleStruct, Serializer,
 };
 
-use crate::mat::complex::complex_tag_for_sentinel;
+use crate::mat::complex::{complex_tag_for_array_sentinel, complex_tag_for_sentinel};
 use crate::mat::error::MatError;
 use crate::mat::matrix::{MATRIX_SENTINEL, complex_tag_for_matrix_sentinel};
 use crate::mat::options::{EmptySequencePolicy, NullPolicy, Options, UnitVariantEncoding};
@@ -169,9 +169,16 @@ impl<'a> Serializer for ValueSerializer<'a> {
 
     fn serialize_newtype_struct<T: Serialize + ?Sized>(
         self,
-        _name: &'static str,
+        name: &'static str,
         value: &T,
     ) -> Result<MatValue, MatError> {
+        // A bulk complex array: `mat::complex`'s array helpers hand the whole
+        // slice over as one byte payload rather than paying a serializer
+        // dispatch per sample. The result is the value the element-wise path
+        // would have built, so the file is unchanged either way.
+        if let Some(tag) = complex_tag_for_array_sentinel(name) {
+            return value.serialize(ComplexArraySer { tag });
+        }
         // Transparent newtype — pass through.
         value.serialize(self)
     }
@@ -242,6 +249,138 @@ impl<'a> Serializer for ValueSerializer<'a> {
         _len: usize,
     ) -> Result<Self::SerializeStructVariant, MatError> {
         Err(MatError::UnsupportedType("struct enum variant"))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bulk complex array: the payload of a `mat::complex` array sentinel
+// ---------------------------------------------------------------------------
+
+/// Turns one borrowed byte payload into a whole [`MatValue::ComplexVec1D`].
+///
+/// Only `serialize_bytes` is reachable. The array sentinels are `pub(crate)`
+/// and `mat::complex`'s helpers are their only writer, so every other method
+/// here is a bug in this crate rather than something a caller can provoke —
+/// hence one shared message instead of a tailored one per type.
+struct ComplexArraySer {
+    tag: ComplexTag,
+}
+
+impl ComplexArraySer {
+    fn wrong_payload() -> MatError {
+        MatError::Custom("a complex array sentinel must carry its samples as bytes".to_owned())
+    }
+}
+
+/// The scalar entry points, all of them refusals.
+macro_rules! reject_payload {
+    ($($method:ident($ty:ty)),* $(,)?) => {
+        $(fn $method(self, _v: $ty) -> Result<MatValue, MatError> {
+            Err(Self::wrong_payload())
+        })*
+    };
+}
+
+impl Serializer for ComplexArraySer {
+    type Ok = MatValue;
+    type Error = MatError;
+
+    type SerializeSeq = Impossible<MatValue, MatError>;
+    type SerializeTuple = Impossible<MatValue, MatError>;
+    type SerializeTupleStruct = Impossible<MatValue, MatError>;
+    type SerializeTupleVariant = Impossible<MatValue, MatError>;
+    type SerializeMap = Impossible<MatValue, MatError>;
+    type SerializeStruct = Impossible<MatValue, MatError>;
+    type SerializeStructVariant = Impossible<MatValue, MatError>;
+
+    fn serialize_bytes(self, v: &[u8]) -> Result<MatValue, MatError> {
+        Ok(MatValue::ComplexVec1D(ComplexVec::from_native_bytes(
+            self.tag, v,
+        )?))
+    }
+
+    reject_payload! {
+        serialize_bool(bool),
+        serialize_i8(i8), serialize_i16(i16), serialize_i32(i32), serialize_i64(i64),
+        serialize_u8(u8), serialize_u16(u16), serialize_u32(u32), serialize_u64(u64),
+        serialize_f32(f32), serialize_f64(f64),
+        serialize_char(char), serialize_str(&str),
+        serialize_unit_struct(&'static str),
+    }
+
+    fn serialize_none(self) -> Result<MatValue, MatError> {
+        Err(Self::wrong_payload())
+    }
+    fn serialize_some<T: Serialize + ?Sized>(self, _v: &T) -> Result<MatValue, MatError> {
+        Err(Self::wrong_payload())
+    }
+    fn serialize_unit(self) -> Result<MatValue, MatError> {
+        Err(Self::wrong_payload())
+    }
+    fn serialize_unit_variant(
+        self,
+        _name: &'static str,
+        _idx: u32,
+        _variant: &'static str,
+    ) -> Result<MatValue, MatError> {
+        Err(Self::wrong_payload())
+    }
+    fn serialize_newtype_struct<T: Serialize + ?Sized>(
+        self,
+        _name: &'static str,
+        _v: &T,
+    ) -> Result<MatValue, MatError> {
+        Err(Self::wrong_payload())
+    }
+    fn serialize_newtype_variant<T: Serialize + ?Sized>(
+        self,
+        _name: &'static str,
+        _idx: u32,
+        _variant: &'static str,
+        _v: &T,
+    ) -> Result<MatValue, MatError> {
+        Err(Self::wrong_payload())
+    }
+    fn serialize_seq(self, _len: Option<usize>) -> Result<Self::SerializeSeq, MatError> {
+        Err(Self::wrong_payload())
+    }
+    fn serialize_tuple(self, _len: usize) -> Result<Self::SerializeTuple, MatError> {
+        Err(Self::wrong_payload())
+    }
+    fn serialize_tuple_struct(
+        self,
+        _name: &'static str,
+        _len: usize,
+    ) -> Result<Self::SerializeTupleStruct, MatError> {
+        Err(Self::wrong_payload())
+    }
+    fn serialize_tuple_variant(
+        self,
+        _name: &'static str,
+        _idx: u32,
+        _variant: &'static str,
+        _len: usize,
+    ) -> Result<Self::SerializeTupleVariant, MatError> {
+        Err(Self::wrong_payload())
+    }
+    fn serialize_map(self, _len: Option<usize>) -> Result<Self::SerializeMap, MatError> {
+        Err(Self::wrong_payload())
+    }
+    fn serialize_struct(
+        self,
+        _name: &'static str,
+        _len: usize,
+    ) -> Result<Self::SerializeStruct, MatError> {
+        Err(Self::wrong_payload())
+    }
+    fn serialize_struct_variant(
+        self,
+        _name: &'static str,
+        _idx: u32,
+        _variant: &'static str,
+        _len: usize,
+    ) -> Result<Self::SerializeStructVariant, MatError> {
+        Err(Self::wrong_payload())
     }
 }
 
