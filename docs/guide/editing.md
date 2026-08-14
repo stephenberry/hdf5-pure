@@ -163,7 +163,7 @@ samples.append(&[12i32, 13]).unwrap(); // unfiltered: any length
 file.close().unwrap();
 ```
 
-One open file reaches every dataset by name, takes an exclusive file lock for its lifetime, and sets no SWMR flag. **Every `append` is crash-atomic**: writes are ordered child-before-parent with `fsync` barriers and the dataspace dimension is published last as the single commit point, so a crash between appends leaves either the previous length or the new one — never a torn or lost view.
+One open file reaches every dataset by name, takes an exclusive file lock for its lifetime, and sets no SWMR flag. **Every `append` is crash-atomic**: writes are ordered child-before-parent with `fsync` barriers and the dataspace dimension is published last as the single commit point, so a crash between appends leaves either the previous length or the new one — never a torn or lost view. Throughout this page, "crash-atomic" means that ordering holds against a process crash under either [`SyncPolicy`](#choosing-the-fsync-cadence), and against power loss under the default one.
 
 That atomicity is why filtered and unfiltered datasets have different rules about *where* an append may start. An **unfiltered** append may start anywhere: when the current length is not chunk-aligned, the trailing partial chunk is rewritten and its index element — a single chunk address — is repointed with one atomic write. A **filtered** append must start on a **chunk boundary**, because a filtered index element is a multi-field record whose in-place repoint is not power-loss atomic, and the trailing chunk's element is one a reader can already see. To grow a filtered dataset that is sitting on a partial trailing chunk, use `Dataset::append_staged`, which rebuilds the index and repoints the superblock last (fully atomic), or a [`BufferedAppender`](#buffered-appends), which keeps the on-disk length chunk-aligned for you.
 
@@ -176,7 +176,7 @@ The remaining eligibility rules match `Dataset::append_staged` (chunked, unlimit
 
 ### Buffered appends
 
-`Dataset::append` writes on every call: it encodes the appended elements, places their chunks, extends the index, and fsyncs five times. That is the right trade for a caller appending a chunk at a time, and the wrong one for a caller appending a hundred elements at a time into a chunk that holds a thousand — which pays the whole sequence ten times over to write one chunk, and cannot pay it at all once the dataset is filtered and sitting on a partial trailing chunk.
+`Dataset::append` writes on every call: it encodes the appended elements, places their chunks, extends the index, and fsyncs five times (per batch, and under the default [`SyncPolicy`](#choosing-the-fsync-cadence)). That is the right trade for a caller appending a chunk at a time, and the wrong one for a caller appending a hundred elements at a time into a chunk that holds a thousand — which pays the whole sequence ten times over to write one chunk, and cannot pay it at all once the dataset is filtered and sitting on a partial trailing chunk.
 
 `Dataset::buffered_appender` returns a `BufferedAppender` that holds appended elements in memory and writes them only when they complete a chunk. It is this crate's equivalent of the reference C library's raw-data chunk cache, and it carries the same bargain: buffered elements are not in the file until the appender flushes.
 
@@ -232,10 +232,51 @@ Bounded editing **does** grow a file that persists its free space — including 
 
 `commit()` appends each new dataset (its data blob and object header) and each new group, then appends rewritten object headers for every touched group and its ancestors up to the root (omitting any deleted links), and finally repoints the superblock at the new root.
 
-The appended data is `fsync`ed before the root is repointed, so the "repoint last" guarantee is real: if the process or machine fails during a commit, the original file is still intact and readable, because the superblock still points at the old root. The cost of a commit scales with the size of the edit, not the size of the file.
+The appended data is `fsync`ed before the root is repointed, so the "repoint last" guarantee is real: if the process or machine fails during a commit, the original file is still intact and readable, because the superblock still points at the old root. (Under `SyncPolicy::OnClose` the repoint is still last, but during the session only a *process* failure is ordered against — see [Choosing the fsync cadence](#choosing-the-fsync-cadence).) The cost of a commit scales with the size of the edit, not the size of the file.
 
 !!! warning "All-or-nothing safety"
     Every check runs before the first byte is written. On any `Error::EditUnsupported`, the file on disk is left untouched. This makes editing safe to attempt: an unsupported edit fails cleanly rather than producing a partially modified or corrupt file.
+
+## Choosing the fsync cadence
+
+Those barriers are `fsync`s, and by default there is one at every durability point: five per append *batch* (a `Dataset::append` larger than about a megabyte is applied in several), two or three per commit, one at `close`. That is a strong guarantee and a real cost, and an application that wants durability at its own cadence instead sets `SyncPolicy` on the fapl.
+
+```rust
+use hdf5_pure::{File, FileAccessProperties, SyncPolicy};
+
+let file = File::open_rw_with_options(
+    "log.h5",
+    FileAccessProperties::new().with_sync_policy(SyncPolicy::OnClose),
+).unwrap();
+
+let mut samples = file.dataset("samples").unwrap();
+for batch in 0..1000 {
+    samples.append(&[batch as f64; 64]).unwrap();  // no fsync
+}
+file.close().unwrap();   // applies staged edits, then one fsync
+```
+
+`SyncPolicy::OnClose` is close to what the reference C library does: its default `sec2` driver installs no flush callback at all, so `H5Fflush` drains libhdf5's caches with `write` and stops there, leaving power-loss durability to the application. It is not a write-back cache — this crate buffers nothing in user space, so every write reaches the operating system as it is made. A file written under `OnClose` is byte-identical to the same file written under `Always`, is visible to other processes on the machine as it is written, and survives *this process* crashing.
+
+Three things are given up, and they are worth separating:
+
+- **Power-loss ordering.** With the barriers gone, a machine that loses power mid-commit can have the superblock repoint on disk without the data it points at.
+- **Deferred write errors.** On a filesystem that allocates late, a write that will fail at writeback still returns success, and the `fsync` is where the `ENOSPC` or `EIO` surfaces. Skip it and a commit the filesystem cannot complete returns `Ok`, with nothing left to report it.
+- **Cross-host visibility.** "Another process sees it" is the page cache, so it holds on a local filesystem. Under NFS's close-to-open semantics a client may hold writes until a flush, so a reader on another host — including a [SWMR](swmr.md) reader — may not see them.
+
+### Why the last one is not optional
+
+`File::sync()` is the checkpoint the application issues itself, wherever it wants one. It writes nothing: staged edits still need a `commit()`, and elements held by a `BufferedAppender` need a `flush()`. It only forces what is already written.
+
+The barrier at the end is a different thing, and it is the reason this policy is `OnClose` rather than a literal "never". `close()` is not a passive call — it applies any staged edits, re-homes the free-space managers of a file that persists them, and clears a SWMR writer's flag — and it *consumes the handle*, so those writes land past the last point a caller could have ordered them. Dropping the last handle does the same, with no return value to report an error through. A policy that skipped the barrier there would not be handing you a cadence; it would be taking one away, since no `sync()` you could write reaches those bytes. So `close` and `drop` each issue exactly one `fsync`, under every policy.
+
+The arithmetic makes this a cheap promise to keep: one barrier per session, against the five per append batch and two or three per commit that `OnClose` removes. A thousand-append session goes from about five thousand `fsync`s to one.
+
+A file left flagged by a SWMR writer is the sharpest case. That flag is cleared at teardown, and a lost clear means every later open is refused with `Error::FileMarkedInUse` until `File::clear_swmr_flag` runs — a failure that costs availability rather than freshness, on a write the caller never sees.
+
+The whole-file paths are outside all of this: `FileBuilder::write` and [`repack`](repack.md) never `fsync` under either policy, since each writes a file and hands it over rather than holding an editing session.
+
+The default is `SyncPolicy::Always`, which is every guarantee described above this section.
 
 ## Supported targets and formats
 

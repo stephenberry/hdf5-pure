@@ -87,6 +87,15 @@ pub(crate) trait FileImage: Source + Send + Sync {
     fn truncate(&mut self, len: u64) -> Result<(), Error>;
 
     /// Flush buffered writes and force the file's *data* to durable storage.
+    ///
+    /// An implementation must make its writes visible to the operating system as
+    /// it makes them, rather than relying on this to push them out.
+    /// [`SyncPolicy::OnClose`](crate::SyncPolicy) skips every in-session call to
+    /// this and to [`sync_all`](Self::sync_all), and it promises the writes still
+    /// reach the operating system — a user-space buffer drained only here would silently
+    /// break that, holding a "committed" edit in this process's memory. Both
+    /// images write straight through, so this costs nothing to honor; it is
+    /// stated because the next one has no other way to learn it.
     fn sync_data(&mut self) -> Result<(), Error>;
 
     /// Flush buffered writes and force the file's data **and metadata** to
@@ -416,17 +425,26 @@ impl FileImage for HandleImage {
     // No `as_slice`: withholding the whole-file slice is what this image is for.
 }
 
-/// A [`FileImage`] that counts the bytes read through it, so a test can measure
-/// how much of a file an operation actually touches.
+/// A [`FileImage`] that counts what passes through it — bytes read, and
+/// durability barriers issued — so a test can measure how much of a file an
+/// operation touches and how many `fsync`s it costs. A caller that cares about
+/// only one counter passes a throwaway `Arc` for the other.
 ///
 /// It deliberately does *not* forward `read_metadata_at`, taking [`Source`]'s
 /// default instead, so every read funnels through this one `read_at` and is
 /// counted. Callers build the inner image with the metadata cache disabled, so
 /// nothing is bypassed and the count is exact rather than an upper bound.
+///
+/// Both barriers feed one counter. What a [`SyncPolicy`](crate::SyncPolicy)
+/// governs is whether a barrier is issued at all, and a test that also pinned
+/// *which* of the two each site chose would fail on any later re-weighing of
+/// that choice — which the trait above documents as an inspection-time decision,
+/// not a tested one.
 #[cfg(test)]
 pub(crate) struct CountingImage {
     inner: Box<dyn FileImage>,
     read_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    syncs: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[cfg(test)]
@@ -434,8 +452,18 @@ impl CountingImage {
     pub(crate) fn new(
         inner: Box<dyn FileImage>,
         read_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
+        syncs: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
-        Self { inner, read_bytes }
+        Self {
+            inner,
+            read_bytes,
+            syncs,
+        }
+    }
+
+    fn count_sync(&self) {
+        self.syncs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -467,10 +495,12 @@ impl FileImage for CountingImage {
     }
 
     fn sync_data(&mut self) -> Result<(), Error> {
+        self.count_sync();
         self.inner.sync_data()
     }
 
     fn sync_all(&mut self) -> Result<(), Error> {
+        self.count_sync();
         self.inner.sync_all()
     }
 

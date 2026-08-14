@@ -50,7 +50,9 @@ use crate::reader::Dataset;
 ///
 /// Buffered elements are not in the file. Each write the appender does make is
 /// itself crash-atomic, so a crash loses the buffered tail and never the file:
-/// the dataset reads back as the prefix that was written. [`flush`](Self::flush)
+/// the dataset reads back as the prefix that was written. That holds against
+/// power loss under the default [`SyncPolicy`](crate::SyncPolicy) and against a
+/// process crash under either — see [`SyncPolicy::OnClose`](crate::SyncPolicy::OnClose). [`flush`](Self::flush)
 /// writes the buffered tail immediately, and [`finish`](Self::finish) flushes
 /// and consumes the appender.
 ///
