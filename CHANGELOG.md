@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Added
 
 - `Dataset::buffered_appender` returns a `BufferedAppender` that holds appended elements in memory and writes them a whole chunk at a time, so a filtered dataset takes any append length; buffered elements reach the file only on `flush`, `finish`, or `discard`, and a SWMR session is refused ([#262](https://github.com/stephenberry/hdf5-pure/issues/262)).
+- `FileAccessProperties::with_sync_policy(SyncPolicy::OnClose)` drops the `fsync` from every commit and append, leaving one at `close`, with the new `File::sync` for checkpoints in between; writes still reach the operating system as they are made, so what moves to the caller is power-loss durability within the session ([#263](https://github.com/stephenberry/hdf5-pure/issues/263)).
 - A staged edit that would stop a live `BufferedAppender` from flushing — one naming its dataset or an ancestor, any edit at all while it still owes a realignment, or a second appender on the same dataset — is refused with `Error::EditUnsupported` at the call that makes it, rather than losing the buffered elements when the appender drops ([#262](https://github.com/stephenberry/hdf5-pure/issues/262)).
 
 ### Changed

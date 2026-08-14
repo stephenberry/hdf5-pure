@@ -8,9 +8,12 @@
 //! stored into an element slot of the chunk index, the index grows by appending
 //! new blocks only when a block boundary is crossed (never relocating existing
 //! data), and the dataspace dimension and array-header counts are patched. Writes
-//! land child-before-parent with `fsync` barriers so a crash (and, for SWMR, a
-//! concurrent reader) only ever observes a consistent prefix, with the dataspace
-//! dimension published last as the single commit point.
+//! land child-before-parent so a crash (and, for SWMR, a concurrent reader) only
+//! ever observes a consistent prefix, with the dataspace dimension published last
+//! as the single commit point. The *order* is what a concurrent reader depends
+//! on; the `fsync` barriers between the steps carry that order across power loss,
+//! and a session under [`SyncPolicy::OnClose`](crate::SyncPolicy) skips them
+//! without changing it, taking one barrier at teardown instead.
 //!
 //! This module owns the byte-level mechanics that do not depend on *why* the
 //! append is happening: the in-memory-mirror file cursor ([`InPlaceFile`]), the
@@ -128,7 +131,11 @@ pub(crate) trait Store: Source {
     /// Advance the superblock's recorded end-of-file to the store's current
     /// logical length and rewrite the superblock.
     fn patch_superblock_eof(&mut self) -> Result<(), Error>;
-    /// Flush buffered writes to durable storage (an `fsync` barrier).
+    /// Flush buffered writes to durable storage (an `fsync` barrier). A store
+    /// whose session defers durability to the application
+    /// ([`SyncPolicy::OnClose`](crate::SyncPolicy)) does nothing here; the ordered
+    /// writes below still happen in the order they are written, which is what a
+    /// concurrent *reader* observes, and only power-loss ordering is given up.
     fn sync(&mut self) -> Result<(), Error>;
 
     /// Write an offset-sized address at `offset`.

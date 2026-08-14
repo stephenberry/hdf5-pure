@@ -17,6 +17,8 @@ The writer appends chunks and flushes them in dependency order, child structures
 
 Because the on-disk format is standard HDF5, a reader opened by this crate can follow a file being written by the reference C library or h5py in SWMR mode, and vice versa.
 
+A SWMR writer honors [`SyncPolicy`](editing.md#choosing-the-fsync-cadence) like any other read-write session. A reader **on the same machine** is unaffected: what it sees is the operating system's view of the file, which every write reaches as it is made, in the order it was made — the `fsync` barriers carry that order across power loss, not across processes. `SyncPolicy::OnClose` therefore drops the per-append barriers, as the reference library's SWMR path does, while keeping the one at teardown that clears the flag below. One caveat comes with it: a reader on *another host* over NFS may not see writes a client is holding until a flush.
+
 ## Laying out the dataset
 
 A SWMR-capable dataset must have one unlimited dimension and be chunked. The latest format indexes such a dataset with an Extensible Array, which is selected automatically. Create it with the usual [writing](writing.md) builder: set the initial extent with `with_shape`, mark the dimension unlimited with `with_maxshape(&[u64::MAX])`, and pick a chunk shape with `with_chunks`.
@@ -87,7 +89,7 @@ println!("now {} rows", ds.shape().unwrap()[0]);
 
 While a `File::open_swmr_writer` is open, the file's superblock carries an active-SWMR-writer flag (matching the reference C library and h5py) so concurrent readers may open it accordingly. `close()` or dropping the writer clears it. If a writer process exits without a clean close, the file is left flagged.
 
-That flag is durable, so it is what every other open consults: while it stands, `File::open`, `File::open_streaming`, `File::open_rw` and a second `File::open_swmr_writer` all fail with `Error::FileMarkedInUse`, exactly as `H5Fopen` fails with *"file is already open for write"*. `File::open_swmr` is the one open that follows it rather than refusing — that pairing is what the flag is for. `File::from_bytes` does not consult it, since its caller already holds a snapshot of the bytes.
+That flag is durable under every `SyncPolicy` — clearing it is one of the writes `close` and `drop` force a barrier for, since a lost clear would refuse every subsequent open until `File::clear_swmr_flag` ran. It is what every other open consults: while it stands, `File::open`, `File::open_streaming`, `File::open_rw` and a second `File::open_swmr_writer` all fail with `Error::FileMarkedInUse`, exactly as `H5Fopen` fails with *"file is already open for write"*. `File::open_swmr` is the one open that follows it rather than refusing — that pairing is what the flag is for. `File::from_bytes` does not consult it, since its caller already holds a snapshot of the bytes.
 
 The flag cannot distinguish a live writer from a crashed one, so recover a file you know has no writer with the h5clear equivalent:
 

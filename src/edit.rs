@@ -604,6 +604,15 @@ pub(crate) struct WriteEngine {
     /// It is a property of one commit, not of the session, so `commit` clears it
     /// on entry rather than trusting the previous run to have left it false.
     repointed: bool,
+    /// Who owns this session's `fsync` cadence, from the fapl's
+    /// [`FileAccessProperties::with_sync_policy`]. Consulted by
+    /// [`barrier`](Self::barrier) and [`barrier_data`](Self::barrier_data) —
+    /// every durability point the write paths define — and by nothing else, so
+    /// [`sync_now`](Self::sync_now) can serve an explicit
+    /// [`File::sync`](crate::File::sync) whatever it says.
+    ///
+    /// [`FileAccessProperties::with_sync_policy`]: crate::FileAccessProperties::with_sync_policy
+    sync_policy: SyncPolicy,
 }
 
 /// The free lists as they stood before a commit's apply loop drew from them.
@@ -697,6 +706,73 @@ impl From<EditBacking> for MemoryStrategy {
             EditBacking::Mirrored => Self::Mirrored,
         }
     }
+}
+
+/// When a read-write session forces its writes to durable storage — who owns the
+/// `fsync` cadence, this crate or the application.
+///
+/// This is *not* about whether a write reaches the file. Every write goes to the
+/// operating system as it is made: the session issues plain positioned writes
+/// against the handle and buffers nothing in user space, so a committed edit is
+/// visible to any other process on the same machine, and survives this process
+/// crashing, whatever this policy says. What it governs is the `fsync` on top of that, which is what
+/// makes those bytes survive the *machine* losing power.
+///
+/// The reference C library does not `fsync` on its normal path either: the
+/// default `sec2` driver installs no flush callback at all, so `H5Fflush` drains
+/// libhdf5's own caches with `write` and stops there, leaving power-loss
+/// durability to the application. [`OnClose`](Self::OnClose) is that behavior;
+/// [`Always`](Self::Always), the default here, is the stronger one.
+///
+/// The whole-file writer ([`FileBuilder`](crate::FileBuilder)) and
+/// [`repack`](crate::repack) are outside this: they never `fsync` under either
+/// policy, since each writes a file and hands it over rather than holding an
+/// editing session.
+///
+/// Sealed: a future policy (syncing on a timer, or once per N bytes) must not be
+/// a breaking change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum SyncPolicy {
+    /// Force durability at every point the write paths define one: after each
+    /// immediate [`Dataset::append`](crate::Dataset::append) batch, at each
+    /// ordering barrier inside a [`File::commit`](crate::File::commit), and when
+    /// the file is closed or dropped.
+    ///
+    /// This is what makes an append crash-atomic and a commit all-or-nothing
+    /// against power loss: the barriers order the appended data before the
+    /// superblock repoint that publishes it, so an interrupted write leaves the
+    /// previous state rather than a torn one.
+    #[default]
+    Always,
+    /// No `fsync` during the session; one when the file is finished. Nothing an
+    /// append or a commit does is forced to durable storage — writes still reach
+    /// the operating system immediately, so another process on the same machine
+    /// sees them and a crash of *this* process loses nothing — and
+    /// [`File::close`](crate::File::close), or dropping the last handle, issues
+    /// a single barrier at the end. [`File::sync`](crate::File::sync) adds a
+    /// checkpoint wherever the application wants one.
+    ///
+    /// The terminal barrier is not an exception grafted onto "never sync": it is
+    /// the point past which the application *cannot* act. `close` and `drop`
+    /// both write — they apply staged edits, re-home the free-space managers of
+    /// a file that persists them, and clear a SWMR writer's flag — and they
+    /// destroy the handle that would have ordered those writes. A policy that
+    /// skipped the barrier there would not hand the caller a cadence; it would
+    /// take one away. The cost is one `fsync` per session against the five per
+    /// append batch and two or three per commit that this policy removes.
+    ///
+    /// Three things are given up in exchange. **Power-loss ordering** during the
+    /// session: with the barriers gone, a machine that loses power mid-commit
+    /// can have the superblock repoint on disk without the data it points at.
+    /// **Deferred write errors**: on a filesystem that allocates late, a write
+    /// that will fail at writeback still returns success, and `fsync` is where
+    /// the `ENOSPC`/`EIO` surfaces, so a commit the filesystem cannot complete
+    /// returns `Ok` until the terminal barrier reports it. **Cross-host
+    /// visibility**: "another process sees it" is the page cache, so under NFS's
+    /// close-to-open semantics a reader on another host — a SWMR reader
+    /// included — may not see writes a client is holding.
+    OnClose,
 }
 
 /// Why the bounded engine cannot edit a file, when the whole-file mirror can.
@@ -1140,9 +1216,41 @@ impl WriteEngine {
                     crate::source::MetadataCacheConfig::disabled(),
                 )),
                 read_bytes,
+                std::sync::Arc::default(),
             )))
         })?;
         session.batched_appends = true;
+        Ok(session)
+    }
+
+    /// Open a session under `policy` whose image counts the `fsync`s issued
+    /// through it, so a test can assert what a write path actually costs. The
+    /// counter is shared with the caller.
+    ///
+    /// It takes the bounded backing and its flags, so the session matches what
+    /// [`File::open_rw`](crate::File::open_rw) builds for a latest-format file;
+    /// the barrier sites live on the engine, above the choice of image, so one
+    /// backing exercises them all.
+    #[cfg(test)]
+    pub(crate) fn open_sync_counting(
+        path: &Path,
+        policy: SyncPolicy,
+        syncs: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> Result<Self, Error> {
+        let mut session = Self::open_imaged(path, Some(FileLocking::Enabled), |handle, len| {
+            Ok(Box::new(crate::image::CountingImage::new(
+                Box::new(HandleImage::new(
+                    handle,
+                    len,
+                    crate::source::MetadataCacheConfig::disabled(),
+                )),
+                std::sync::Arc::default(),
+                syncs,
+            )))
+        })?;
+        session.batched_appends = true;
+        session.bounded = true;
+        session.set_sync_policy(policy);
         Ok(session)
     }
 
@@ -1228,8 +1336,15 @@ impl WriteEngine {
     /// meaningful: neither library reads the status-flags byte back on an older
     /// superblock, so a flag raised there would announce a live writer to nobody.
     /// This crate's writer emits version 3, so no file it produces is affected.
-    pub(crate) fn open_swmr_writer<P: AsRef<Path>>(path: P) -> Result<Self, Error> {
+    pub(crate) fn open_swmr_writer<P: AsRef<Path>>(
+        path: P,
+        sync_policy: SyncPolicy,
+    ) -> Result<Self, Error> {
         let mut session = Self::open_inner(path.as_ref(), None)?;
+        // Before the flag write below, which is a durability point like any
+        // other: a caller who asked for no `fsync` gets none, and the flag still
+        // reaches every other process, which reads it from the operating system.
+        session.set_sync_policy(sync_policy);
         if session.superblock.version < 3
             || session.superblock.base_address != 0
             || session.persist.is_some()
@@ -1252,7 +1367,7 @@ impl WriteEngine {
         self.superblock.consistency_flags = flags;
         let bytes = self.superblock.serialize();
         self.write_at(self.sb_sig_off, &bytes)?;
-        self.image.sync_data()?;
+        self.barrier_data()?;
         Ok(())
     }
 
@@ -1393,6 +1508,7 @@ impl WriteEngine {
             libver_ceiling: None,
             fsm_len: len,
             repointed: false,
+            sync_policy: SyncPolicy::Always,
         };
         // If the file persists its free space, seed the free list from the
         // on-disk managers and arm persistence for future commits. Best-effort:
@@ -2028,14 +2144,68 @@ impl WriteEngine {
             superblock: &mut self.superblock,
             sb_sig_off: self.sb_sig_off,
             paged: self.paged.as_mut(),
+            sync_policy: self.sync_policy,
         }
     }
 
-    /// Flush this session's writes durably, data and metadata both: the final
-    /// barrier [`File::close`](crate::File::close) issues before sealing the
-    /// file. Each immediate append is already durable on its own; this covers
-    /// the file length a preceding truncate or manager rewrite changed.
-    pub(crate) fn sync(&mut self) -> Result<(), Error> {
+    /// Adopt the fapl's `fsync` cadence. Called once, on the funnel every
+    /// read-write open passes through, before the session is handed out.
+    pub(crate) fn set_sync_policy(&mut self, policy: SyncPolicy) {
+        self.sync_policy = policy;
+    }
+
+    /// The cadence this session adopted. Nothing in the crate branches on this —
+    /// [`barrier`](Self::barrier) does that — but the fapl reaching the engine is
+    /// otherwise invisible from outside, and an entry point that forgot to pass
+    /// it on would look exactly like one that did.
+    #[cfg(test)]
+    pub(crate) fn sync_policy(&self) -> SyncPolicy {
+        self.sync_policy
+    }
+
+    /// The durability barrier a write path calls for, data and metadata both —
+    /// issued unless this session's [`SyncPolicy`] leaves the `fsync` cadence to
+    /// the application.
+    ///
+    /// Every such point routes through here rather than touching the image, so
+    /// the policy is honored by construction at sites yet to be written. The
+    /// bytes have already reached the operating system either way (the image
+    /// writes them as it goes); what a skipped barrier gives up is the ordering
+    /// that survives power loss.
+    ///
+    /// The teardown barrier is deliberately *not* one of these points:
+    /// [`File::close`](crate::File::close) and `FileInner::drop` write after the
+    /// last barrier a caller could have asked for, so they take
+    /// [`force_sync`](Self::force_sync) instead.
+    fn barrier(&mut self) -> Result<(), Error> {
+        // Exhaustive on purpose, here and at the two sites below: `SyncPolicy` is
+        // sealed to the outside but not to this crate, so a policy added later
+        // fails to compile at every durability point until someone decides what
+        // it means there.
+        match self.sync_policy {
+            SyncPolicy::Always => self.image.sync_all(),
+            SyncPolicy::OnClose => Ok(()),
+        }
+    }
+
+    /// The data-only counterpart to [`barrier`](Self::barrier), for a write that
+    /// does not move end-of-file and so needs no metadata flush.
+    fn barrier_data(&mut self) -> Result<(), Error> {
+        match self.sync_policy {
+            SyncPolicy::Always => self.image.sync_data(),
+            SyncPolicy::OnClose => Ok(()),
+        }
+    }
+
+    /// Force this session's writes to durable storage *whatever* the policy
+    /// says. The counterpart to [`barrier`](Self::barrier), which the policy may
+    /// skip.
+    ///
+    /// Two callers: [`File::sync`](crate::File::sync), the application naming
+    /// its own cadence, and the teardown path — `File::close` and
+    /// `FileInner::drop` — whose own writes no caller can order, because both
+    /// destroy the handle that would have done it.
+    pub(crate) fn force_sync(&mut self) -> Result<(), Error> {
         self.image.sync_all()
     }
 
@@ -2315,6 +2485,7 @@ impl WriteEngine {
                     sb_sig_off,
                     paged,
                     located,
+                    sync_policy,
                     ..
                 } = self;
                 let st = &located[&oh_addr];
@@ -2323,6 +2494,7 @@ impl WriteEngine {
                     superblock,
                     sb_sig_off: *sb_sig_off,
                     paged: paged.as_mut(),
+                    sync_policy: *sync_policy,
                 };
                 plan_ea_append(
                     &store,
@@ -2343,6 +2515,7 @@ impl WriteEngine {
                     sb_sig_off,
                     paged,
                     located,
+                    sync_policy,
                     ..
                 } = self;
                 let st = located.get_mut(&oh_addr).expect("dataset located above");
@@ -2351,6 +2524,7 @@ impl WriteEngine {
                     superblock,
                     sb_sig_off: *sb_sig_off,
                     paged: paged.as_mut(),
+                    sync_policy: *sync_policy,
                 };
                 apply_ea_append(&mut store, &mut st.loc, &plan, max_phase)
                     .map_err(as_inplace_error)?;
@@ -2974,7 +3148,7 @@ impl WriteEngine {
             for (data_addr, raw) in &inplace_writes {
                 self.write_at(*data_addr, raw)?;
             }
-            self.image.sync_all()?;
+            self.barrier()?;
             return Ok(());
         }
 
@@ -3589,7 +3763,7 @@ impl WriteEngine {
         let trunc_to = self.free.take_trailing(cur_eof);
         let new_eof = trunc_to.unwrap_or(cur_eof);
 
-        self.image.sync_all()?;
+        self.barrier()?;
         // The root address is stored relative to the base address; the end-of-file
         // address is absolute. After writing the relative root to disk, keep the
         // in-memory `root_group_address` absolute (the open-time convention).
@@ -3608,13 +3782,13 @@ impl WriteEngine {
             let sb_bytes = new_sb.serialize();
             self.write_at(self.sb_sig_off, &sb_bytes)?;
             self.repointed = true;
-            self.image.sync_all()?;
+            self.barrier()?;
             new_sb.root_group_address = new_root;
             self.superblock = new_sb;
         } else {
             self.repoint_v0v1_root(new_root - base, new_eof)?;
             self.repointed = true;
-            self.image.sync_all()?;
+            self.barrier()?;
             self.superblock.root_group_address = new_root;
             self.superblock.eof_address = new_eof;
         }
@@ -3626,7 +3800,7 @@ impl WriteEngine {
         // could advertise an end-of-file past the actual file length.
         if let Some(cut) = trunc_to {
             self.image.truncate(cut)?;
-            self.image.sync_all()?;
+            self.barrier()?;
         }
         Ok(())
     }
@@ -3765,7 +3939,7 @@ impl WriteEngine {
 
         // Barrier, then repoint the superblock (root, eof, and the new extension)
         // — the linearization point — and sync it.
-        self.image.sync_all()?;
+        self.barrier()?;
         let mut new_sb = self.superblock.clone();
         new_sb.root_group_address = new_root;
         new_sb.eof_address = final_eof;
@@ -3776,7 +3950,7 @@ impl WriteEngine {
         let sb_bytes = new_sb.serialize();
         self.write_at(self.sb_sig_off, &sb_bytes)?;
         self.repointed = true;
-        self.image.sync_all()?;
+        self.barrier()?;
         self.superblock = new_sb;
 
         // The repoint is durable: the prior free list plus this commit's vacated
@@ -3957,7 +4131,7 @@ impl WriteEngine {
 
         // Barrier, then repoint the superblock (root, eof, and the new extension)
         // — the linearization point — and sync it.
-        self.image.sync_all()?;
+        self.barrier()?;
         let mut new_sb = self.superblock.clone();
         new_sb.root_group_address = new_root;
         new_sb.eof_address = final_eof;
@@ -3966,7 +4140,7 @@ impl WriteEngine {
         let sb_bytes = new_sb.serialize();
         self.write_at(self.sb_sig_off, &sb_bytes)?;
         self.repointed = true;
-        self.image.sync_all()?;
+        self.barrier()?;
         self.superblock = new_sb;
 
         // The repoint is durable. Only now are this commit's vacated regions
@@ -6747,6 +6921,10 @@ struct EditStore<'a> {
     /// borrow rather than a copy: padding recorded here has to reach the manager
     /// rewrite at the next commit or at close.
     paged: Option<&'a mut PagedEdit>,
+    /// The session's `fsync` cadence, carried by value: the append engine's own
+    /// ordered barriers ([`apply_ea_append`]) are durability points like the
+    /// commit's, and answer to the same policy.
+    sync_policy: SyncPolicy,
 }
 
 impl EditStore<'_> {
@@ -6808,7 +6986,10 @@ impl Store for EditStore<'_> {
         self.write_at(self.sb_sig_off as u64, &bytes)
     }
     fn sync(&mut self) -> Result<(), Error> {
-        self.image.sync_data()
+        match self.sync_policy {
+            SyncPolicy::Always => self.image.sync_data(),
+            SyncPolicy::OnClose => Ok(()),
+        }
     }
 }
 
@@ -10205,7 +10386,7 @@ mod tests {
                 .append_inplace_gathered(AppendTarget::Header(addr), &ab, 4)
                 .unwrap();
             engine.finalize_persist().unwrap();
-            engine.sync().unwrap();
+            engine.barrier().unwrap();
         }
         assert_eq!(
             std::fs::metadata(&p).unwrap().len() % 4096,
@@ -10407,6 +10588,250 @@ mod tests {
             "the reclaim tags every chunked span raw; a metadata tag here would need \
              the placement rule above to change with it"
         );
+    }
+
+    /// The `fsync` cadence belongs to whoever the fapl says: every durability
+    /// point in the engine — an immediate append's ordered barriers, a commit's
+    /// barrier and repoint, the barrier a commit issues after truncating, the
+    /// same-length-overwrite fast path, and the barrier `close` issues — answers
+    /// to the session's [`SyncPolicy`], while `force_sync` (the explicit
+    /// `File::sync`) answers to nobody (issue #263).
+    ///
+    /// The counts are compared as a table across the two policies rather than
+    /// pinned to literals: how many `fsync`s a commit costs is an implementation
+    /// detail that may fall, but that `OnClose` costs *none* and `Always` costs
+    /// some at each of those points is the contract. The file is read back
+    /// under both, since a skipped barrier must cost durability and nothing else
+    /// — the bytes have already reached the operating system.
+    ///
+    /// Every stage here is a *distinct* barrier site. A commit tail that syncs
+    /// twice does not stand in for the fast path that syncs once, nor for the
+    /// post-truncate barrier that only a shrinking commit reaches: each is its
+    /// own `self.barrier()` call that a later edit could regress to a bare
+    /// `self.image.sync_all()` on its own — verified by mutating each site
+    /// separately and watching this fail. The persisting tails and the
+    /// consistency-flag write are covered by the test below.
+    ///
+    /// One site is left uncovered: the version 0/1 repoint branch of the
+    /// non-persisting tail. A pre-v2 file cannot be produced by this crate's own
+    /// writer — the crosscheck tests get one from the C library — and the
+    /// counting image is a bounded one, which such a file needs the mirror
+    /// instead of. Covering it needs a checked-in fixture and a second counting
+    /// opener; it is named here so the gap is a known one rather than an
+    /// assumed-covered one.
+    #[test]
+    fn sync_policy_governs_every_barrier() {
+        use crate::writer::FileBuilder;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        // [after an immediate append, after a staged commit, after a same-length
+        // overwrite, after a commit that truncates, after the close barrier,
+        // after an explicit sync].
+        let run = |name: &str, policy: SyncPolicy| -> [u64; 5] {
+            let path = dir.path().join(name);
+            let mut b = FileBuilder::new();
+            b.create_dataset("d")
+                .with_i32_data(&(0..8).collect::<Vec<_>>())
+                .with_shape(&[8])
+                .with_maxshape(&[u64::MAX])
+                .with_chunks(&[4]);
+            b.write(&path).unwrap();
+
+            let syncs = Arc::new(AtomicU64::new(0));
+            let mut s = WriteEngine::open_sync_counting(&path, policy, Arc::clone(&syncs)).unwrap();
+            s.append_inplace_i32_phased("d", &[8, 9, 10, 11], 4)
+                .unwrap();
+            let after_append = syncs.load(Ordering::Relaxed);
+            let mut db = crate::type_builders::DatasetBuilder::new("added");
+            db.with_f64_data(&[2.5f64; 8]).with_shape(&[8]);
+            s.stage_created_dataset("/added", db).unwrap();
+            s.commit().unwrap();
+            let after_commit = syncs.load(Ordering::Relaxed);
+
+            // Same-length value overwrite: the commit fast path, which patches
+            // the bytes where they lie and syncs without repointing anything.
+            let mut ow = crate::type_builders::DatasetBuilder::new("added");
+            ow.with_f64_data(&[4.5f64; 8]).with_shape(&[8]);
+            s.stage_dataset_write("/added", ow).unwrap();
+            s.commit().unwrap();
+            let after_overwrite = syncs.load(Ordering::Relaxed);
+
+            // A delete whose freed run reaches end-of-file, so the commit
+            // truncates and takes the barrier that only a shrinking commit does.
+            s.delete("/added").unwrap();
+            s.commit().unwrap();
+            let after_truncate = syncs.load(Ordering::Relaxed);
+
+            s.force_sync().unwrap();
+            let after_forced = syncs.load(Ordering::Relaxed);
+
+            // Release the exclusive OS lock before reading the file back; those
+            // locks are mandatory on Windows.
+            drop(s);
+            let f = crate::reader::File::open(&path).unwrap();
+            assert_eq!(
+                f.dataset("d").unwrap().read_i32().unwrap(),
+                (0..12).collect::<Vec<_>>(),
+                "the append must land under {policy:?}"
+            );
+            assert!(
+                f.dataset("added").is_err(),
+                "the deleting commit must land under {policy:?}"
+            );
+            [
+                after_append,
+                after_commit,
+                after_overwrite,
+                after_truncate,
+                after_forced,
+            ]
+        };
+
+        let always = run("always.h5", SyncPolicy::Always);
+        assert!(always[0] > 0, "an immediate append syncs under Always");
+        assert!(always[1] > always[0], "so does a commit");
+        assert!(
+            always[2] > always[1],
+            "so does the same-length-overwrite fast path"
+        );
+        assert!(
+            always[3] > always[2],
+            "so does a commit that truncates the file"
+        );
+        assert_eq!(
+            always[4],
+            always[3] + 1,
+            "and a forced sync is exactly one more"
+        );
+
+        let deferred = run("on_close.h5", SyncPolicy::OnClose);
+        assert_eq!(
+            &deferred[..4],
+            &[0, 0, 0, 0],
+            "OnClose must leave every one of those in-session barriers unissued"
+        );
+        assert_eq!(
+            deferred[4], 1,
+            "a forced sync is issued whatever the policy says — it is what the \
+             teardown path and File::sync both take"
+        );
+    }
+
+    /// The two barrier sites the table above cannot reach: the commit tail of a
+    /// file that *persists* its free space (a different tail, with its own
+    /// barrier and repoint, plus the manager re-homing `close` owes), and the
+    /// superblock consistency-flag write a SWMR session makes on open and close.
+    ///
+    /// Both are `self.barrier()`/`self.barrier_data()` calls on paths the
+    /// ordinary non-persisting session never executes, so without this a
+    /// regression at either would pass the whole suite (issue #263).
+    #[test]
+    fn sync_policy_governs_the_persisting_and_flag_barriers() {
+        use crate::writer::FileBuilder;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        // [after a commit on a persisting file, after the flag write, after the
+        // close barrier and its manager re-homing].
+        let run = |name: &str, strategy: FileSpaceStrategy, policy: SyncPolicy| -> [u64; 3] {
+            let path = dir.path().join(name);
+            let mut b = FileBuilder::new();
+            b.create_dataset("d")
+                .with_i32_data(&(0..8).collect::<Vec<_>>())
+                .with_shape(&[8])
+                .with_maxshape(&[u64::MAX])
+                .with_chunks(&[4]);
+            b.create_dataset("victim")
+                .with_f64_data(&[1.5f64; 64])
+                .with_shape(&[64]);
+            // A paged file takes the page-aware tail, a different pair of barrier
+            // calls from the plain persisting one; `0` asks for the default page
+            // size, which the plain strategy ignores.
+            b.with_file_space_strategy(
+                strategy,
+                true,
+                if strategy == FileSpaceStrategy::Page {
+                    0
+                } else {
+                    1
+                },
+            );
+            b.write(&path).unwrap();
+
+            let syncs = Arc::new(AtomicU64::new(0));
+            let mut s = WriteEngine::open_sync_counting(&path, policy, Arc::clone(&syncs)).unwrap();
+            assert!(
+                s.persist.is_some(),
+                "the fixture must persist its free space, or this tests the wrong tail"
+            );
+            // A delete on a persisting file takes `commit_persisting`: the free
+            // space is recorded on disk rather than truncated away.
+            s.delete("/victim").unwrap();
+            s.commit().unwrap();
+            let after_commit = syncs.load(Ordering::Relaxed);
+
+            s.set_consistency_flags(0).unwrap();
+            let after_flags = syncs.load(Ordering::Relaxed);
+
+            // An immediate append leaves the on-disk managers mid-file, which is
+            // the debt `finalize_persist` settles with a second commit tail at
+            // close — the writes no earlier `sync` can have covered.
+            s.append_inplace_i32_phased("d", &[8, 9, 10, 11], 4)
+                .unwrap();
+            let before_close = syncs.load(Ordering::Relaxed);
+            s.finalize_persist().unwrap();
+            let after_close = syncs.load(Ordering::Relaxed) - before_close;
+
+            drop(s);
+            let f = crate::reader::File::open(&path).unwrap();
+            assert!(
+                f.dataset("victim").is_err(),
+                "the delete must land under {policy:?}"
+            );
+            assert_eq!(
+                f.dataset("d").unwrap().read_i32().unwrap(),
+                (0..12).collect::<Vec<_>>(),
+                "and so must the append under {policy:?}"
+            );
+            [after_commit, after_flags, after_close]
+        };
+
+        // Both persisting tails: the plain one and the page-aware one, which is a
+        // separate pair of barrier calls reached only by a paged file.
+        for (label, strategy) in [
+            ("fsmaggr", FileSpaceStrategy::FsmAggr),
+            ("paged", FileSpaceStrategy::Page),
+        ] {
+            let always = run(&format!("{label}_always.h5"), strategy, SyncPolicy::Always);
+            assert!(
+                always[0] > 0,
+                "the {label} persisting commit tail syncs under Always"
+            );
+            assert!(
+                always[1] > always[0],
+                "so does the consistency-flag write a SWMR session makes ({label})"
+            );
+            assert!(
+                always[2] > 0,
+                "so does the manager re-homing close owes ({label})"
+            );
+
+            assert_eq!(
+                run(
+                    &format!("{label}_on_close.h5"),
+                    strategy,
+                    SyncPolicy::OnClose
+                ),
+                [0, 0, 0],
+                "OnClose must leave the {label} persisting tail, the flag write, and the \
+                 close-time manager re-homing with no fsync at all"
+            );
+        }
     }
 }
 

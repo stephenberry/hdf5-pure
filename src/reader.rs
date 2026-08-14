@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::edit::{
     AppendBuilder, AppendGeometry, AppendTarget, EditBacking, MemoryStrategy, SpaceAccounting,
-    WriteEngine,
+    SyncPolicy, WriteEngine,
 };
 use crate::element::H5Element;
 use crate::type_builders::{DatasetBuilder, VL_REF_SIZE};
@@ -134,6 +134,7 @@ pub struct FileAccessProperties {
     locking: FileLocking,
     memory_strategy: Option<MemoryStrategy>,
     libver_bounds: Option<(LibVer, LibVer)>,
+    sync_policy: SyncPolicy,
 }
 
 /// Former name of [`FileAccessProperties`].
@@ -152,6 +153,7 @@ impl FileAccessProperties {
             locking: FileLocking::Enabled,
             memory_strategy: None,
             libver_bounds: None,
+            sync_policy: SyncPolicy::Always,
         }
     }
 
@@ -240,6 +242,22 @@ impl FileAccessProperties {
         self
     }
 
+    /// Choose who owns this session's `fsync` cadence — this crate, or the
+    /// application through [`File::sync`].
+    ///
+    /// Defaults to [`SyncPolicy::Always`]: every commit and every immediate
+    /// [`Dataset::append`](crate::Dataset::append) forces its writes to durable
+    /// storage before returning. [`SyncPolicy::OnClose`] issues no `fsync` at all,
+    /// which is what the reference C library does; the writes still reach the
+    /// operating system as they are made, so only power-loss durability moves to
+    /// the caller.
+    ///
+    /// The read-only opens ignore this: they write nothing.
+    pub const fn with_sync_policy(mut self, sync_policy: SyncPolicy) -> Self {
+        self.sync_policy = sync_policy;
+        self
+    }
+
     /// Return the configured streaming metadata cache.
     pub const fn metadata_cache(&self) -> MetadataCacheConfig {
         self.metadata_cache
@@ -272,6 +290,11 @@ impl FileAccessProperties {
     /// rather than as a second break on this accessor.
     pub const fn memory_strategy(&self) -> Option<MemoryStrategy> {
         self.memory_strategy
+    }
+
+    /// Return the configured `fsync` policy.
+    pub const fn sync_policy(&self) -> SyncPolicy {
+        self.sync_policy
     }
 }
 
@@ -413,7 +436,8 @@ impl Drop for FileInner {
     ///   dropped-without-`close` handle leaves the same file a clean `close`
     ///   would (a no-op unless an immediate append grew the file past them). A
     ///   true crash (`SIGKILL`, power loss) skips `drop` entirely; the appended
-    ///   data is still durable.
+    ///   data is still durable, under the default
+    ///   [`SyncPolicy::Always`](crate::SyncPolicy).
     ///
     /// Staged edits are *not* committed here: dropping a handle discards them,
     /// which is what `close` exists to distinguish.
@@ -425,12 +449,18 @@ impl Drop for FileInner {
             return;
         };
         let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Both branches write, and this is the last moment anything can order
+        // those writes: the handle is gone once this returns, so `File::sync` is
+        // not an option the caller still has. The barrier is therefore forced
+        // rather than left to the session's `SyncPolicy` — see
+        // [`SyncPolicy::OnClose`](crate::SyncPolicy::OnClose).
         if self.swmr_write {
             let _ = session.set_consistency_flags(0);
+            let _ = session.force_sync();
             return;
         }
         let _ = session.finalize_persist();
-        let _ = session.sync();
+        let _ = session.force_sync();
     }
 }
 
@@ -609,8 +639,11 @@ impl FileInner {
         properties: FileAccessProperties,
     ) -> Result<Self, Error> {
         // The one funnel every read-write session passes through, so the fapl's
-        // format bound reaches the engine no matter which entry point opened it.
+        // format bound and `fsync` cadence reach the engine no matter which entry
+        // point opened it — the SWMR writer included, which
+        // `WriteEngine::open_swmr_writer` says why.
         session.set_libver_bounds(properties.libver_bounds)?;
+        session.set_sync_policy(properties.sync_policy);
         // The engine parsed and normalized this at open; take it rather than
         // re-parsing, so the image need not be able to hand out a slice.
         let superblock = session.superblock().clone();
@@ -655,7 +688,8 @@ impl FileInner {
                  raise the FileAccessProperties library-version bound to open it",
             ));
         }
-        let mut inner = Self::from_rw_session(WriteEngine::open_swmr_writer(path)?, properties)?;
+        let session = WriteEngine::open_swmr_writer(path, properties.sync_policy)?;
+        let mut inner = Self::from_rw_session(session, properties)?;
         inner.swmr_write = true;
         Ok(inner)
     }
@@ -1769,8 +1803,9 @@ impl File {
     /// The properties carry the locking policy (the `H5Pset_file_locking` analogue,
     /// [`FileAccessProperties::with_locking`]), the memory strategy
     /// ([`FileAccessProperties::with_memory_strategy`], which overrides the
-    /// dispatch described on [`open_rw`](Self::open_rw)), the metadata cache used
-    /// by the bounded backing, and the file-wide chunk-cache default applied to
+    /// dispatch described on [`open_rw`](Self::open_rw)), the `fsync` cadence
+    /// ([`FileAccessProperties::with_sync_policy`]), the metadata cache used by
+    /// the bounded backing, and the file-wide chunk-cache default applied to
     /// datasets opened from this file. Because one [`FileAccessProperties`] value
     /// serves every open, the same configuration can be shared with a read path.
     pub fn open_rw_with_options<P: AsRef<std::path::Path>>(
@@ -1843,6 +1878,11 @@ impl File {
     /// [`MemoryStrategy::Bounded`] is a guarantee it cannot meet and is refused
     /// with [`Error::EditUnsupported`]; [`MemoryStrategy::Auto`] and
     /// [`MemoryStrategy::Mirrored`] are both satisfied by the mirror.
+    ///
+    /// Its [`SyncPolicy`](crate::SyncPolicy) applies here as to any other
+    /// read-write session, the SWMR-write flag included; a reader on this
+    /// machine is unaffected either way, since the barriers carry the write
+    /// order across power loss rather than across processes.
     pub fn open_swmr_writer_with_options<P: AsRef<std::path::Path>>(
         path: P,
         properties: FileAccessProperties,
@@ -1905,8 +1945,9 @@ impl File {
     /// canonical shape when the file is closed — by an explicit
     /// [`close`](Self::close) or, best-effort, when the last handle drops (issue
     /// #173). Only a true crash (`SIGKILL`, power loss) skips that rewrite; the
-    /// appended data is still durable and reopens correctly, the managers merely
-    /// stay non-canonical until the next clean rewrite. A genuine **paged** file
+    /// appended data is still durable — under the default
+    /// [`SyncPolicy::Always`](crate::SyncPolicy) — and reopens correctly, the
+    /// managers merely staying non-canonical until the next clean rewrite. A genuine **paged** file
     /// (`H5F_FSPACE_STRATEGY_PAGE` with `persist = true`) is also supported:
     /// appends stay page-homogeneous (raw and metadata in separate pages) and
     /// the per-page-type managers are rewritten at close. A paged file that
@@ -1993,7 +2034,7 @@ impl File {
     /// Mirrors `H5Fcreate(name, flags, fcpl_id, fapl_id)`: `create` carries the
     /// creation properties recorded in the new file (userblock, file-space
     /// strategy, library-version bounds), and `access` the properties governing
-    /// the handle returned (locking policy, chunk cache). Both are values, so a
+    /// the handle returned (locking policy, `fsync` cadence, chunk cache). Both are values, so a
     /// layout defined once can be reused across every file an application writes.
     ///
     /// A creation property is validated as the file is written, so an invalid
@@ -2027,6 +2068,11 @@ impl File {
     /// Requires a read-write file ([`File::open_rw`]); a read-only file returns
     /// [`Error::ReadOnly`](crate::Error::ReadOnly). A commit that relocates
     /// objects invalidates outstanding handles — re-fetch any you keep using.
+    ///
+    /// The commit is durable when it returns, under the default
+    /// [`SyncPolicy::Always`]; under
+    /// [`SyncPolicy::OnClose`](crate::SyncPolicy::OnClose) it has reached the
+    /// operating system and waits for a [`sync`](Self::sync).
     pub fn commit(&self) -> Result<(), Error> {
         self.with_mirror_session(true, |session| session.commit())
     }
@@ -2090,6 +2136,31 @@ impl File {
         }
     }
 
+    /// Force everything written to this file so far to durable storage — the
+    /// `fsync` the application issues at its own cadence under
+    /// [`SyncPolicy::OnClose`], and a redundant one under the default
+    /// [`SyncPolicy::Always`]. A SWMR-writer file syncs the same way.
+    ///
+    /// This is a durability barrier, not a flush: it writes nothing itself.
+    /// Staged edits are not applied ([`commit`](Self::commit) does that, and a
+    /// `sync` before one makes only the *previous* state durable), and elements
+    /// held by a live [`BufferedAppender`](crate::BufferedAppender) have not
+    /// reached the file at all — flush it first.
+    ///
+    /// There is no need to call it before [`close`](Self::close): `close` — and
+    /// dropping the last handle — issues its own barrier under every policy,
+    /// because both write and both destroy the handle that would have ordered
+    /// those writes. This is the mid-session checkpoint, not the closing one.
+    ///
+    /// Requires a read-write file ([`File::open_rw`]); a read-only file returns
+    /// [`Error::ReadOnly`](crate::Error::ReadOnly), and a sealed one
+    /// [`Error::FileClosed`](crate::Error::FileClosed) — a closed file has
+    /// already been synced.
+    #[doc(alias = "fsync")]
+    pub fn sync(&self) -> Result<(), Error> {
+        self.with_mirror_session(false, |session| session.force_sync())
+    }
+
     /// Commit any staged edits and seal this file. The exclusive OS lock is
     /// released once the last handle derived from this file is also dropped.
     ///
@@ -2105,15 +2176,25 @@ impl File {
                 if let Backend::Edit(m) = &self.inner.backend {
                     let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     session.set_consistency_flags(0)?;
+                    // Forced, not left to the policy: this call consumes the
+                    // handle, so nothing the caller still holds could order the
+                    // flag write. A file left flagged is refused by every later
+                    // open until `clear_swmr_flag`, which makes it the write
+                    // here whose loss costs availability rather than freshness.
+                    session.force_sync()?;
                 }
             } else {
                 self.commit()?;
                 // Immediate appends grow the file past any persisted free-space
                 // managers without running a commit tail, so re-home them here.
                 // A no-op unless this session left them stale.
+                // The barrier covering both: the commit above, and the file
+                // length that finalize's manager rewrite changed. Forced under
+                // every policy — `close` consumes the handle, so this is the last
+                // point at which either write can be ordered at all.
                 self.with_mirror_session(false, |session| {
                     session.finalize_persist()?;
-                    session.sync()
+                    session.force_sync()
                 })?;
             }
             self.inner.closed.store(true, Ordering::Release);
@@ -3069,7 +3150,13 @@ impl Dataset {
     /// may be any length. The *appended* length is unconstrained either way;
     /// anything else returns
     /// [`Error::AppendInPlaceUnsupported`](crate::Error::AppendInPlaceUnsupported).
-    /// The append is immediate and crash-atomic (no `commit` needed).
+    /// The append is immediate and crash-atomic (no `commit` needed) — under the
+    /// default [`SyncPolicy::Always`]. Under
+    /// [`SyncPolicy::OnClose`](crate::SyncPolicy::OnClose) the same writes are made
+    /// in the same order without the `fsync` barriers between them, so the
+    /// append is still immediate and still crash-atomic against *this process*
+    /// failing, but ordering it against power loss is the caller's, through
+    /// [`File::sync`].
     ///
     /// A handle reached by object reference ([`dereference`](Self::dereference))
     /// has no resolvable path, so it names its dataset by the object-header
@@ -5691,5 +5778,152 @@ mod tests {
                 .contains_key("tag"),
             "and on no other group's member of the same name"
         );
+    }
+
+    /// Every read-write entry point has to hand the fapl's `fsync` cadence to
+    /// the session it opens, and none of them can be checked from outside: a
+    /// skipped barrier writes the same bytes as an issued one (issue #263).
+    ///
+    /// One entry point missing the funnel is the whole failure mode, so this
+    /// asserts the property at each of them rather than at the funnel.
+    #[test]
+    fn every_read_write_open_carries_the_fapl_sync_policy() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let fixture = |name: &str| {
+            let path = dir.path().join(name);
+            let mut b = FileBuilder::new();
+            b.create_dataset("d")
+                .with_i32_data(&[1, 2, 3, 4])
+                .with_shape(&[4])
+                .with_maxshape(&[u64::MAX])
+                .with_chunks(&[2]);
+            b.write(&path).unwrap();
+            path
+        };
+        let props = || FileAccessProperties::new().with_sync_policy(SyncPolicy::OnClose);
+        let policy_of = |file: &File| match &file.inner.backend {
+            Backend::Edit(m) => m
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .sync_policy(),
+            _ => panic!("a read-write open must build an editing session"),
+        };
+
+        let opened = File::open_rw_with_options(fixture("open_rw.h5"), props()).unwrap();
+        assert_eq!(policy_of(&opened), SyncPolicy::OnClose, "File::open_rw");
+        // Windows OS locks are mandatory: release each session before the next
+        // open touches the same directory's files.
+        drop(opened);
+
+        let created = File::create_with_options(
+            dir.path().join("created.h5"),
+            crate::FileCreateProperties::new(),
+            props(),
+        )
+        .unwrap();
+        assert_eq!(policy_of(&created), SyncPolicy::OnClose, "File::create");
+        drop(created);
+
+        let swmr = File::open_swmr_writer_with_options(fixture("swmr.h5"), props()).unwrap();
+        assert_eq!(
+            policy_of(&swmr),
+            SyncPolicy::OnClose,
+            "File::open_swmr_writer"
+        );
+        drop(swmr);
+
+        #[expect(
+            deprecated,
+            reason = "the deprecated bounded open is still an entry point, and still has to carry the policy"
+        )]
+        let bounded = File::open_rw_bounded_with_options(fixture("bounded.h5"), props()).unwrap();
+        assert_eq!(
+            policy_of(&bounded),
+            SyncPolicy::OnClose,
+            "File::open_rw_bounded"
+        );
+    }
+
+    /// `close` and `drop` issue their barrier under *every* policy, on both the
+    /// ordinary and the SWMR branch — the four sites where this crate writes
+    /// after the last point a caller could have ordered anything (issue #263).
+    ///
+    /// This is the half of the contract `SyncPolicy` cannot express: the two
+    /// `drop` sites are unreachable by any caller discipline at all, since the
+    /// handle that would have issued `File::sync` is gone by the time they run.
+    /// Asserted through a counting image, because the difference between a
+    /// forced barrier and a skipped one is invisible in the bytes.
+    #[test]
+    fn close_and_drop_force_their_barrier_under_every_policy() {
+        use crate::edit::WriteEngine;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        // `swmr` picks the teardown branch; `explicit` picks `close` over `drop`.
+        let teardown = |name: &str, swmr: bool, explicit: bool| -> u64 {
+            let path = dir.path().join(name);
+            let mut b = FileBuilder::new();
+            b.create_dataset("d")
+                .with_i32_data(&(0..8).collect::<Vec<_>>())
+                .with_shape(&[8])
+                .with_maxshape(&[u64::MAX])
+                .with_chunks(&[4]);
+            // Persisting, so the ordinary branch has manager re-homing to do:
+            // an immediate append below leaves the on-disk managers mid-file,
+            // and settling them is the write no earlier sync could cover.
+            b.with_file_space_strategy(crate::FileSpaceStrategy::FsmAggr, true, 1);
+            b.write(&path).unwrap();
+
+            let syncs = Arc::new(AtomicU64::new(0));
+            let session =
+                WriteEngine::open_sync_counting(&path, SyncPolicy::OnClose, Arc::clone(&syncs))
+                    .unwrap();
+            let mut inner = FileInner::from_rw_session(
+                session,
+                FileAccessProperties::new().with_sync_policy(SyncPolicy::OnClose),
+            )
+            .unwrap();
+            inner.swmr_write = swmr;
+            let file = File {
+                inner: Arc::new(inner),
+            };
+            if !swmr {
+                // The SWMR branch stages nothing and appends through its own
+                // path; give the ordinary branch real work to settle.
+                file.dataset("d")
+                    .unwrap()
+                    .append(&[8i32, 9, 10, 11])
+                    .unwrap();
+            }
+            assert_eq!(
+                syncs.load(AtomicOrdering::Relaxed),
+                0,
+                "nothing before teardown may sync under OnClose ({name})"
+            );
+
+            if explicit {
+                file.close().unwrap();
+            } else {
+                drop(file);
+            }
+            syncs.load(AtomicOrdering::Relaxed)
+        };
+
+        for (name, swmr, explicit) in [
+            ("close_plain.h5", false, true),
+            ("close_swmr.h5", true, true),
+            ("drop_plain.h5", false, false),
+            ("drop_swmr.h5", true, false),
+        ] {
+            assert!(
+                teardown(name, swmr, explicit) > 0,
+                "{name} must force its barrier: the writes it makes are past the \
+                 last point a caller could have ordered them"
+            );
+        }
     }
 }

@@ -282,7 +282,7 @@ pub use writer::FileBuilder;
 pub use appender::BufferedAppender;
 
 #[cfg(feature = "std")]
-pub use edit::{AppendBuilder, EditBacking, MemoryStrategy, SpaceAccounting};
+pub use edit::{AppendBuilder, EditBacking, MemoryStrategy, SpaceAccounting, SyncPolicy};
 
 #[cfg(feature = "std")]
 pub use repack::{RepackOptions, repack};
