@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `mat::complex::i16_array`, and one helper per component class, write a large complex array in bulk from a `#[serde(serialize_with = ...)]` field, roughly twenty-five times faster than the per-element path for the same bytes; an empty slice keeps its component class, where a plain `Vec` writes an empty `double`.
+- `mat::ComplexElement`, the unsafe layout trait those helpers accept, is implemented for the `Complex*` types and — under the new `num-complex` feature — for `num_complex::Complex<T>`.
+
+### Changed
+
+- Writing a complex array is about five times faster, `MatBuilder`'s writers included.
+
 ## [0.35.0] - 2026-08-10
 
 A MAT cell array takes its shape and its metadata from the same rules as every other value this crate writes. An empty cell array is `0x0`, MATLAB's own `{}`, where it was `0x1`, and a cell array follows `mat::Options::one_dimensional_mode` like every other 1-D value, so `RowVector` writes `1xN` where a cell used to be a column whatever the option asked for; both are reachable only under non-default options, and `isempty` held under either empty shape, so a reader that only tested emptiness is unaffected. Every object a MAT write interns under `#refs#` — cell elements, struct elements, the MCOS subsystem's helpers — now carries the `H5PATH` attribute MATLAB writes on all but one of its own, which this crate wrote on none ([#258](https://github.com/stephenberry/hdf5-pure/pull/258)). Files written by earlier versions still read.

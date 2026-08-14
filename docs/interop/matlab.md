@@ -148,9 +148,38 @@ Components are never converted between widths, in either direction. An `int16` c
 
 The same rule is enforced against the file itself: `MATLAB_class` names the component width, the `{real, imag}` compound carries the bytes, and a file where those two disagree is refused rather than decoded. This matters because the disagreement is not always visible — a complex `int64` array with no class attribute at all falls back to `double`, whose element size is identical, so the payload length alone cannot tell them apart.
 
+### Large complex arrays
+
+Serde has no bulk channel for a sequence, so a `Vec<ComplexI16>` costs one serializer dispatch per sample — around 26 ns, which for a capture-sized array is essentially the whole cost of writing the file. `mat::complex` carries a `serialize_with` helper per component class that hands the slice over whole instead:
+
+```rust
+use hdf5_pure::mat::{self, ComplexI16};
+use serde::Serialize;
+
+#[derive(Serialize)]
+struct Capture {
+    #[serde(serialize_with = "mat::complex::i16_array")]
+    samples: Vec<ComplexI16>,
+}
+```
+
+Measured on 64 Mi samples (256 MiB), one write per process: 1.78 s element-wise against 0.06 s. Repeat writes in a warm process reach 0.03 s, so quote the cold figure for a capture tool that writes once and exits. The bytes are identical either way — this changes how long a write takes, not what it produces.
+
+The element type is any `mat::ComplexElement`: this module's `Complex*` types, `num_complex::Complex<T>` with the `num-complex` feature enabled, or your own. Implementing it is `unsafe` and asserts a layout — `#[repr(C)]`, two components, real first, every byte initialized data — because the helpers read the slice as raw bytes. The component type is part of the bound, so a same-width class cannot slip through: `i32` parts will not compile as `f32_array`.
+
+Three things to know before annotating an existing field:
+
+- **The output is MAT-specific.** The slice crosses serde as a byte string, so the same struct serialized to JSON or another format emits raw bytes rather than a sequence, and its own `Deserialize` will not read that back. Annotate a field only on a type written to `.mat` alone.
+- **An empty slice keeps its component class.** See [empty complex arrays](#empty-complex-arrays) below; it is the only case where the annotation changes the file.
+- **One-dimensional only.** A `Matrix<ComplexI16>` or `Vec<Vec<ComplexI16>>` has no bulk path and still pays per element.
+
+Reading is untouched, which after this change makes it the slower half of a round trip: a `.mat` deserializes through the same per-element path it always did. If peak memory rather than speed is the constraint, [`write_blocks`](#writing-more-data-than-fits-in-memory) is the tool — these helpers still build the array in full.
+
 ### Empty complex arrays
 
 An empty complex array is written here as a zero-element `{real, imag}` compound that keeps its component class, and it round-trips through this crate. MATLAB writes empties differently: `Mat_VarWriteEmpty` stores the dimensions *as data* under `MATLAB_empty = 1`, keeping the plain class name, and the `EmptyMarkerEncoding` option selects that form for real arrays. Complex arrays do not currently follow the option. libmatio reads both forms; if you need the MATLAB-native shape for an empty complex array specifically, write it as an empty real array of the component class instead.
+
+An empty `Vec<ComplexI16>` is the one case where the plain and [bulk](#large-complex-arrays) paths differ. An empty sequence reveals no element, so the plain path cannot recover the component class and falls back on `empty_sequence_policy` — an empty `double` by default, an empty cell under `EmptySequencePolicy::Cell`. The helper was told the class by name and keeps it, matching `MatBuilder::write_complex_i16` and the `Matrix<Complex*>` sentinels. Both read back as an empty array; the shape is `0x0` either way.
 
 ## Cell arrays
 

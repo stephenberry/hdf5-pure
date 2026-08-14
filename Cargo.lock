@@ -464,6 +464,7 @@ dependencies = [
  "flate2",
  "hdf5-metno",
  "ndarray",
+ "num-complex",
  "proptest",
  "rayon",
  "serde",

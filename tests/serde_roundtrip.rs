@@ -1763,6 +1763,13 @@ fn both_emit_paths_produce_the_same_bytes() {
         // collapsed every empty matrix to `0x0`.
         empty_matrix: Matrix<f64>,
         empty_matrix_cols: Matrix<f64>,
+        // An empty complex array reaches its own emit arm, and only the
+        // options emitter routed it through `vector_dims`; the other described
+        // it `0x1`. Unreachable until `mat::complex`'s array helpers made an
+        // empty `ComplexVec1D` constructible, which is exactly the shape this
+        // test warns about above.
+        #[serde(serialize_with = "mat::complex::f64_array")]
+        empty_complex: Vec<Complex64>,
         absent: Option<f64>,
         nothing: (),
     }
@@ -1790,6 +1797,7 @@ fn both_emit_paths_produce_the_same_bytes() {
         empty_cells: Vec::new(),
         empty_matrix: Matrix::from_row_major(0, 0, Vec::new()),
         empty_matrix_cols: Matrix::from_row_major(0, 3, Vec::new()),
+        empty_complex: Vec::new(),
         absent: None,
         nothing: (),
     };
