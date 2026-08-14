@@ -652,6 +652,109 @@ fn c_library_reads_our_staged_mutated_paged_file() {
 }
 
 #[test]
+fn c_library_reads_our_paged_file_after_free_space_reuse() {
+    let _c = c_lib_guard();
+    // Issue #261: a paged file now draws on its own free space, so a delete
+    // followed by a write of the same shape reuses the pages the delete released
+    // instead of appending past them. Reuse is confined to the page type being
+    // placed, which keeps every page holding one kind of byte — an invariant the
+    // C library depends on for page buffering and cannot report on directly. What
+    // it *can* do is prove the result is a well-formed paged file: recover the
+    // strategy, read every dataset back, and re-parse the rewritten per-page-type
+    // managers into the same free-space total we record.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("ours_paged_reused.h5");
+
+    let kept: Vec<f64> = (0..4096).map(|i| (i % 17) as f64).collect();
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("victim")
+            .with_f64_data(&vec![1.0; 8192])
+            .with_chunks(&[1024]);
+        b.create_dataset("ceiling").with_f64_data(&kept);
+        b.with_file_space_strategy(FileSpaceStrategy::Page, true, 0)
+            .with_file_space_page_size(4096);
+        b.write(&path).unwrap();
+    }
+    let size_before = std::fs::metadata(&path).unwrap().len();
+
+    let replacement: Vec<f64> = (0..8192).map(|i| (i % 29) as f64).collect();
+    {
+        let file = File::open_rw(&path).unwrap();
+        file.root().delete("victim").unwrap();
+        file.commit().unwrap();
+        file.root()
+            .create_dataset("replacement", |b| {
+                b.with_f64_data(&replacement).with_chunks(&[1024]);
+            })
+            .unwrap();
+        file.commit().unwrap();
+    }
+
+    let size_after = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        size_after < size_before + 8192 * 8 / 4,
+        "the replacement should reuse the freed raw pages (was {size_before}, \
+         now {size_after})"
+    );
+
+    let ours = File::open(&path).unwrap();
+    assert_eq!(
+        ours.dataset("replacement").unwrap().read_f64().unwrap(),
+        replacement
+    );
+    let total_ours: u64 = ours.persisted_free_space().iter().map(|(_, l)| l).sum();
+    drop(ours);
+
+    let f = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        f.create_plist().unwrap().get_file_space_strategy().unwrap(),
+        CStrategy::FreeSpaceManager {
+            paged: true,
+            persist: true,
+            threshold: 0,
+        },
+        "C library recovers our paged strategy after a commit that reused free space"
+    );
+    assert_eq!(
+        f.dataset("replacement").unwrap().read_raw::<f64>().unwrap(),
+        replacement,
+        "the C library resolves a chunk index placed in reused pages"
+    );
+    assert_eq!(
+        f.dataset("ceiling").unwrap().read_raw::<f64>().unwrap(),
+        kept
+    );
+    let free_c = unsafe { H5Fget_freespace(f.id()) };
+    assert_eq!(
+        free_c as u64, total_ours,
+        "C free-space total matches the managers the reusing commit rewrote"
+    );
+    drop(f);
+
+    // And the file is still writable by the C library afterwards.
+    {
+        let f = hdf5::File::open_rw(&path).unwrap();
+        f.new_dataset::<i32>()
+            .shape([4])
+            .create("c_added")
+            .unwrap()
+            .write_raw(&[1i32, 2, 3, 4])
+            .unwrap();
+        f.close().unwrap();
+    }
+    let ours = File::open(&path).unwrap();
+    assert_eq!(
+        ours.dataset("c_added").unwrap().read_i32().unwrap(),
+        vec![1, 2, 3, 4]
+    );
+    assert_eq!(
+        ours.dataset("replacement").unwrap().read_f64().unwrap(),
+        replacement
+    );
+}
+
+#[test]
 fn pure_bounded_mutates_c_created_paged_file() {
     let _c = c_lib_guard();
     // The reverse direction: the reference C library creates a genuine paged

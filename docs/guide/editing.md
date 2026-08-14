@@ -220,9 +220,15 @@ See [`Error::EditUnsupported`](../reference/data-types.md) for the full set of r
 
 ## Space reuse and truncation
 
-Within a session, the space a deletion frees is reused for later writes in the same commit, so add/delete churn stays bounded instead of only ever growing the file. If a freed run reaches the end of the file, the file is truncated.
+Within a session, the space a deletion frees is reused for later writes, so add/delete churn stays bounded instead of only ever growing the file. If a freed run reaches the end of the file, the file is truncated.
+
+Everything a commit writes can go into freed space: object headers, contiguous data, a chunked dataset's chunk data and index, and a dense attribute heap. Each needs a region large enough to hold it whole — a dataset larger than every free region is written past the end of the file, not split across two holes.
 
 Contiguous and chunked datasets (chunk index plus chunk data) and whole group subtrees are reclaimed. Reclaim is best-effort: an object whose blocks cannot be enumerated exhaustively (variable-length global-heap storage, dense attribute or link heaps, a version 2 B-tree chunk index) is left as dead bytes rather than risk freeing a region still in use.
+
+On a paged file (`FileSpaceStrategy::Page`) an allocation is only ever served from free space of the page type it is writing, so reuse cannot make metadata and raw data share a page. Freed space whose page type cannot be established — a whole-file-generic free section recorded by another writer, or a chunk index that writer placed among its metadata — is recorded but never handed out, which costs some space rather than the page separation.
+
+An immediate `Dataset::append` always writes at the end of the file; only staged edits applied by `commit()` draw on free space. One consequence of reuse is worth knowing for read-heavy workloads: a dataset written into a fragmented file may have its chunks placed in several holes rather than in one run, so a sequential read of it fetches each chunk separately instead of coalescing adjacent ones. [Repacking](repack.md) restores a single run.
 
 !!! note "Cross-session reuse and guaranteed compaction"
     By default, freed space is reused only within the open session and forgotten on close. For a file created with `H5Pset_file_space_strategy(persist = true)`, freed space is recorded on disk and survives reopen; see [File-space strategy](file-space.md). For a guaranteed shrink that rewrites the whole file compact across a reopen, see [Reclaiming space with repack](repack.md).

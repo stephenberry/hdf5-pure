@@ -6,7 +6,7 @@
 //! userblock file and confirm the userblock bytes survive byte-for-byte:
 //!
 //!   * adding a chunked / filtered dataset (the relocatable blob is built with
-//!     stored addresses and appended at end-of-file),
+//!     stored addresses, at end-of-file or in a freed region that fits it),
 //!   * overwriting a chunked dataset in place (the index is walked on a
 //!     base-relative view and the write offsets shifted back), and
 //!   * overwriting a chunked dataset with a relocation (a fresh blob is built and
@@ -391,15 +391,77 @@ fn userblock_chunked_relocating_overwrite_roundtrip() {
 }
 
 #[test]
+fn userblock_chunked_add_reuses_a_freed_chunk_hole() {
+    // A chunked dataset's data region is placed into a freed hole when one fits
+    // (issue #261), and on a userblock file the address it is *built* for is the
+    // stored (base-relative) one while the address it is *written* at is absolute.
+    // Confusing the two is a 512-byte error that no size assertion would notice:
+    // the file stays exactly as small, and only reading the data back through the
+    // index catches it. So delete a chunked dataset, write another into the hole
+    // it left, and read every chunk of it.
+    let path = std::env::temp_dir().join("hdf5_pure_ub_chunk_hole.h5");
+    let victim: Vec<f64> = (0..2048).map(|i| (i % 11) as f64).collect();
+    let mut b = FileBuilder::new();
+    b.with_userblock(UB as u64);
+    b.create_dataset("victim")
+        .with_f64_data(&victim)
+        .with_shape(&[2048])
+        .with_chunks(&[256]);
+    // Above the victim, so the delete leaves an interior hole rather than a
+    // trailing run the commit would truncate away.
+    b.create_dataset("ceiling").with_i32_data(&[11, 22, 33]);
+    let mut bytes = b.finish().unwrap();
+    let userblock = stamp_userblock(&mut bytes);
+    std::fs::write(&path, &bytes).unwrap();
+    let len_start = std::fs::metadata(&path).unwrap().len();
+
+    let replacement: Vec<f64> = (0..2048).map(|i| (i as f64) * 0.25 - 3.0).collect();
+    {
+        let s = File::open_rw(&path).unwrap();
+        s.root().delete("victim").unwrap();
+        s.commit().unwrap();
+        s.root()
+            .create_dataset("fresh", |b| {
+                b.with_f64_data(&replacement)
+                    .with_shape(&[2048])
+                    .with_chunks(&[256]);
+            })
+            .unwrap();
+        s.commit().unwrap();
+    }
+    let len_end = std::fs::metadata(&path).unwrap().len();
+    assert!(
+        len_end < len_start + (replacement.len() * 8) as u64 / 10,
+        "the fresh chunk blob should land in the freed hole \
+         (start={len_start}, end={len_end})"
+    );
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("fresh").unwrap().read_f64().unwrap(),
+        replacement
+    );
+    assert_eq!(
+        file.dataset("ceiling").unwrap().read_i32().unwrap(),
+        vec![11, 22, 33]
+    );
+    assert!(file.dataset("victim").is_err());
+    assert_userblock_unchanged(&path, &userblock);
+
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn userblock_chunked_overwrite_reuses_reclaimed_space() {
     // Reclaim-correctness check (the over-reclaim tripwire). A relocating chunked
     // overwrite frees the old chunk storage into the session free list; a later
     // commit in the same session then allocates a small *contiguous* dataset into
-    // that freed region. (A new chunk blob always appends — its addresses are built
-    // for end-of-file — so the freed hole is reused by contiguous data / headers,
-    // not by another chunk blob.) If reclaim had freed a live span (a base-address
+    // that freed region. If reclaim had freed a live span (a base-address
     // mistake), the reuse would write over it; every dataset is read back here and
     // the C-library crosscheck confirms it independently.
+    // `userblock_chunked_add_reuses_a_freed_chunk_hole` covers the same ground for
+    // a chunk blob placed into the hole, where the base arithmetic runs on the
+    // addresses the blob itself embeds.
     let path = std::env::temp_dir().join("hdf5_pure_ub_chunk_reclaim.h5");
     // A moderately-compressible original lays down a sizeable contiguous chunk blob
     // (the hole that will be reclaimed). The high-entropy replacement re-encodes to

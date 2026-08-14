@@ -129,7 +129,18 @@
 //! physically truncated. The reuse is crash-safe: it only ever overwrites space
 //! freed by an *earlier*, already-durable commit (never space the current commit
 //! is mid-way through freeing), and truncation happens only after the superblock
-//! recording the smaller end-of-file is itself durable.
+//! recording the smaller end-of-file is itself durable. A commit that fails
+//! before its repoint gives back what it drew, so a failed attempt costs the
+//! session nothing.
+//!
+//! Everything a commit places goes through one allocator
+//! ([`WriteEngine::reserve`] and [`WriteEngine::place`]), including a chunked
+//! dataset's data region and a dense attribute heap. Those carry addresses of
+//! their own, so they are sized before they are placed and then built for the
+//! address they got — which is why they can land in a freed region at all
+//! (issue #261). A paged file (`H5F_FSPACE_STRATEGY_PAGE`) draws only from free
+//! space of the page type it is placing, so reuse cannot make metadata and raw
+//! data share a page.
 //!
 //! Reclaim is best-effort and conservative. Contiguous and chunked datasets
 //! (chunk index plus chunk data) and whole group subtrees are reclaimed; a
@@ -138,6 +149,16 @@
 //! non–version-2 header, a version 2 B-tree chunk index — is left as dead bytes
 //! rather than risk freeing a region that is still in use; under-reclaiming only
 //! wastes space, while over-reclaiming would corrupt.
+//!
+//! On a paged file that conservatism extends to anything whose *page type* is not
+//! established. A file another writer produced records free space this one cannot
+//! place — the reference library's generic-large manager holds metadata and raw
+//! alike, and it puts a chunk index among its metadata where this crate puts one
+//! beside the chunk data. Such space is kept and written back where it was found,
+//! but never handed to an allocation
+//! ([`PagedEdit::unclassified`], [`WriteEngine::index_is_provably_raw`]), because
+//! placing a byte of the wrong kind in a page is the one thing paging exists to
+//! prevent and no reader would report it.
 //!
 //! Whether the free list outlives the session depends on how the file was
 //! created. For the default (non-persisting) file it is **not** persisted: it is
@@ -166,9 +187,9 @@ use crate::chunked_read::{
     chunk_index_spans_from_source, enumerate_chunks_from_source, plan_dense_grid,
 };
 use crate::chunked_write::{
-    ChunkMeta, ChunkOptions, ChunkProvider, WrittenChunk, build_chunked_data_at_ext,
-    build_extensible_array_at, emit_chunked_data_verbatim, plan_chunked_data_verbatim,
-    serialize_v4_extensible_array, split_into_chunks,
+    ChunkMeta, ChunkOptions, ChunkProvider, WrittenChunk, assemble_chunked_at,
+    build_extensible_array_at, chunked_data_len, compress_chunks, emit_chunked_data_verbatim,
+    plan_chunked_data_verbatim, serialize_v4_extensible_array, split_into_chunks,
 };
 use crate::convert::TryToUsize;
 use crate::data_layout::DataLayout;
@@ -506,6 +527,32 @@ pub(crate) struct WriteEngine {
     /// [`finalize_persist`](Self::finalize_persist) settles at close. Meaningless
     /// (and untouched) when `persist` is `None`.
     fsm_len: u64,
+    /// Whether the commit currently running has repointed the superblock at its
+    /// new root. Set by whichever tail performs that write, read only by
+    /// [`commit`](Self::commit) to decide whether a failure may hand this
+    /// commit's allocations back to the free lists (see [`FreeSnapshot`]).
+    ///
+    /// It is a property of one commit, not of the session, so `commit` clears it
+    /// on entry rather than trusting the previous run to have left it false.
+    repointed: bool,
+}
+
+/// The free lists as they stood before a commit's apply loop drew from them.
+///
+/// A commit allocates as it goes — a free region it hands to an object header or
+/// a chunk blob leaves the list immediately, so no two objects in the same commit
+/// can be handed the same region. If the commit then fails, those regions are as
+/// dead as they were before it started: nothing the commit wrote is reachable,
+/// because the superblock still names the old root. Restoring this snapshot gives
+/// them back instead of leaking them for the rest of the session.
+///
+/// The restore is sound only *before* the repoint. After it, the objects written
+/// into those regions are live, and handing the same addresses out again would
+/// overwrite the tree the commit just published — which is why
+/// [`WriteEngine::repointed`] gates it.
+struct FreeSnapshot {
+    free: FreeList,
+    paged: Option<(FreeList, FreeList)>,
 }
 
 /// How much memory a read-write open may use to hold the file being edited.
@@ -649,9 +696,18 @@ pub(crate) fn create_would_refuse_reopen(
 /// Paged-file bookkeeping for the whole-file editor (issue #198, step 1).
 ///
 /// A paged file never mixes metadata and raw data within one page, so this tracks
-/// free space per page type — matching the three managers such a file records —
-/// and keeps the commit's appends homogeneous by padding a tail page whenever the
-/// page type changes.
+/// free space per page *type* — the one distinction that governs where a byte may
+/// be placed — and keeps the commit's appends homogeneous by padding a tail page
+/// whenever the page type changes.
+///
+/// One list per type, not one per on-disk manager. A paged file records its free
+/// space in three managers (metadata-small, raw-small, and a generic-large one for
+/// whole free pages), but for space this session can place, that split is a size
+/// classification of the same raw or metadata space, and [`plan_paged_managers`]
+/// recomputes it from scratch at every commit. Tracking it here as well would only
+/// stop a freed chunk-data run and the freed index that abuts it from coalescing —
+/// leaving two neighboring holes neither of which fits the dataset that just
+/// vacated both (issue #261).
 ///
 /// The free lists are seeded only when the file *persists* its free space. A paged
 /// non-persisting file has no on-disk record of which pages hold metadata and
@@ -660,12 +716,27 @@ pub(crate) fn create_would_refuse_reopen(
 /// backend does.
 struct PagedEdit {
     page_size: u64,
-    /// Metadata free space: the SUPER manager, slot 0.
+    /// Free space inside metadata pages.
     meta: FreeList,
-    /// Small-raw free space: the DRAW manager, slot 2.
-    raw_small: FreeList,
-    /// Large-raw fragments: the generic-large manager, slot 6.
-    raw_large: FreeList,
+    /// Free space inside raw-data pages, plus whole free pages (which belong to
+    /// no type until something is written into them).
+    raw: FreeList,
+    /// Free space this session may record but must never hand out, because the
+    /// page it sits in is of unknown type. Seeded at open and constant
+    /// thereafter — nothing this engine frees is ever of unknown type — and
+    /// written back to the generic-large manager verbatim, so the space stays
+    /// available to the writer that recorded it.
+    ///
+    /// It exists because the reference C library's generic-large manager is
+    /// exactly that: `H5F_MEM_PAGE_GENERIC` is *"large-sized generic: meta and
+    /// raw"*, and under paged aggregation on a contiguous-address driver every
+    /// allocation of a page or more lands there whatever its type. Its
+    /// page-alignment tail (`H5MF__alloc_pagefs`) is then recorded as a free
+    /// section in the same manager — a sub-page fragment sitting in a page whose
+    /// earlier bytes are live. Handing such a fragment to raw data would put raw
+    /// bytes in a metadata page, so a section that is not a whole run of aligned
+    /// pages is kept here rather than guessed at.
+    unclassified: FreeList,
     /// Page type of the current tail page. `None` until this session's first
     /// typed append; the file is page-aligned at open, so the first append never
     /// needs to pad regardless of this.
@@ -732,48 +803,90 @@ impl PagedEdit {
         PagedEdit {
             page_size,
             meta: FreeList::new(),
-            raw_small: FreeList::new(),
-            raw_large: FreeList::new(),
+            raw: FreeList::new(),
+            unclassified: FreeList::new(),
             last: None,
             meta_pad: Vec::new(),
             raw_pad: Vec::new(),
         }
     }
 
-    /// Record `(addr, size)` as free space of page type `ty` in the given lists.
-    /// A raw region at least a page long is a large-raw fragment (the
-    /// generic-large manager); everything else is small enough to stay in its
-    /// per-type SMALL manager. [`plan_paged_managers`] re-splits and re-classes at
-    /// serialization time, so this only has to route to the right *kind* of list.
+    /// Which list a persisted section from File Space Info `slot` belongs in.
     ///
-    /// Takes the three lists rather than `&mut self` because a commit routes into
-    /// *copies* of them — nothing is free until the superblock repoint — and the
-    /// rule must not be restated at that call site.
-    fn route_free(
-        meta: &mut FreeList,
-        raw_small: &mut FreeList,
-        raw_large: &mut FreeList,
-        page_size: u64,
-        addr: u64,
-        size: u64,
-        ty: PageType,
-    ) {
-        match ty {
-            PageType::Meta => meta.free(addr, size),
-            PageType::Raw if size >= page_size => raw_large.free(addr, size),
-            PageType::Raw => raw_small.free(addr, size),
+    /// Slot 0 (SUPER) is small metadata and slot 2 (DRAW) is small raw: both name
+    /// a page type outright. Slot 6 is the generic-large manager, which holds
+    /// space of *either* type (see [`unclassified`](Self::unclassified)), so a
+    /// section is only safe to reuse when it covers whole aligned pages — a free
+    /// page belongs to no type until something is written into it. Everything
+    /// else, including the per-type large managers a multi/split driver would
+    /// populate, is left unclassified rather than guessed at.
+    fn slot_list(slot: usize, addr: u64, size: u64, page_size: u64) -> Option<PageType> {
+        match slot {
+            0 => Some(PageType::Meta),
+            2 => Some(PageType::Raw),
+            6 if addr % page_size == 0 && size % page_size == 0 => Some(PageType::Raw),
+            _ => None,
         }
     }
 
-    /// Every tracked free region across the three managers, ascending by address.
+    /// Record `(addr, size)` as free space of page type `ty` in the given lists.
+    /// [`plan_paged_managers`] splits and classes into the on-disk managers at
+    /// serialization time, so this only has to route by page type.
+    ///
+    /// Takes the lists rather than `&mut self` because a commit routes into
+    /// *copies* of them — nothing is free until the superblock repoint — and the
+    /// rule must not be restated at that call site.
+    fn route_free(meta: &mut FreeList, raw: &mut FreeList, addr: u64, size: u64, ty: PageType) {
+        match ty {
+            PageType::Meta => meta.free(addr, size),
+            PageType::Raw => raw.free(addr, size),
+        }
+    }
+
+    /// Every free region this session could still hand out, ascending by address.
     /// Used for space accounting, where the caller wants one total rather than a
     /// per-page-type breakdown.
-    fn all_sections(&self) -> Vec<(u64, u64)> {
+    ///
+    /// [`unclassified`](Self::unclassified) is excluded: it is free space, and
+    /// [`File::persisted_free_space`](crate::File::persisted_free_space) reports
+    /// it as such, but this session will never place anything in it, which is
+    /// what the accounting field it feeds is about.
+    fn reusable_sections(&self) -> Vec<(u64, u64)> {
         let mut out = self.meta.sections();
-        out.extend(self.raw_small.sections());
-        out.extend(self.raw_large.sections());
+        out.extend(self.raw.sections());
         out.sort_by_key(|&(addr, _)| addr);
         out
+    }
+}
+
+/// Where a commit has decided to put one allocation's bytes, handed out by
+/// [`WriteEngine::reserve`] and consumed by [`WriteEngine::place`].
+///
+/// The two arms differ in how the bytes are written — over a dead interior region
+/// or past the end of the file — and in nothing else the caller sees, so a caller
+/// that needs the address before the bytes (a relocatable blob) never has to know
+/// which it got.
+#[derive(Clone, Copy, Debug)]
+enum Placement {
+    /// A region an earlier commit freed, already removed from its free list.
+    Reused { addr: u64, len: u64 },
+    /// The end-of-file, with the page for the requested type already open.
+    Appended { addr: u64, len: u64 },
+}
+
+impl Placement {
+    /// The absolute file address the bytes will occupy.
+    fn address(self) -> u64 {
+        match self {
+            Placement::Reused { addr, .. } | Placement::Appended { addr, .. } => addr,
+        }
+    }
+
+    /// The reserved byte count, which the placed bytes must match exactly.
+    fn len(self) -> u64 {
+        match self {
+            Placement::Reused { len, .. } | Placement::Appended { len, .. } => len,
+        }
     }
 }
 
@@ -1206,6 +1319,7 @@ impl WriteEngine {
             bounded: false,
             libver_ceiling: None,
             fsm_len: len,
+            repointed: false,
         };
         // If the file persists its free space, seed the free list from the
         // on-disk managers and arm persistence for future commits. Best-effort:
@@ -1247,7 +1361,7 @@ impl WriteEngine {
         // Free-space reuse and persistence are not yet base-address aware: the
         // persisted section addresses (and the extension/manager block walk below)
         // are read as absolute, so on a userblock file they would seed `self.free`
-        // with wrong regions that `alloc_or_append` could later hand out into live
+        // with wrong regions that a later allocation could hand out into live
         // data. Leave persistence off for such a file — the on-disk managers stay
         // untouched and valid, this session simply appends rather than reusing.
         //
@@ -1291,11 +1405,12 @@ impl WriteEngine {
         if paged {
             // A paged file's free space is segregated across per-page-type
             // managers, so read each slot on its own and keep the page type its
-            // slot implies: SUPER (slot 0) is metadata, DRAW (slot 2) is small raw,
-            // and the generic-large manager (slot 6) holds large-raw fragments.
-            // Flattening them (as the non-paged path below does) would lose exactly
-            // the distinction the commit has to preserve.
-            let mut tagged: Vec<(FreeSection, PageType, bool)> = Vec::new();
+            // slot implies ([`PagedEdit::slot_list`]). Flattening them (as the
+            // non-paged path below does) would lose exactly the distinction the
+            // commit has to preserve. A section whose slot does not settle its page
+            // type is recorded but never handed out.
+            let page_size = info.page_size;
+            let mut tagged: Vec<(FreeSection, Option<PageType>)> = Vec::new();
             for (slot, &m) in info.manager_addrs.iter().enumerate() {
                 if m == UNDEF {
                     continue;
@@ -1306,20 +1421,14 @@ impl WriteEngine {
                 else {
                     continue;
                 };
-                // slot 6 is the generic-large manager; slot 2 is small raw; every
-                // other slot a genuine paged file uses is metadata.
-                let (ty, large) = match slot {
-                    2 => (PageType::Raw, false),
-                    6 => (PageType::Raw, true),
-                    _ => (PageType::Meta, false),
-                };
                 for s in sections {
-                    tagged.push((s, ty, large));
+                    let ty = PagedEdit::slot_list(slot, s.addr, s.size, page_size);
+                    tagged.push((s, ty));
                 }
             }
-            tagged.sort_by_key(|(s, _, _)| s.addr);
+            tagged.sort_by_key(|(s, _)| s.addr);
             let mut prev_end = 0u64;
-            for (s, ty, large) in tagged {
+            for (s, ty) in tagged {
                 let Some(end) = s.addr.checked_add(s.size) else {
                     continue;
                 };
@@ -1331,17 +1440,11 @@ impl WriteEngine {
                     .paged
                     .as_mut()
                     .expect("the paged state was just installed");
-                // Keep a section in the manager it came from rather than
-                // re-deriving its class from its size: a large-raw fragment is
-                // smaller than a page, so size alone cannot tell it from a DRAW
-                // section.
-                if large {
-                    pg.raw_large.free(s.addr, s.size);
-                } else {
-                    match ty {
-                        PageType::Meta => pg.meta.free(s.addr, s.size),
-                        PageType::Raw => pg.raw_small.free(s.addr, s.size),
+                match ty {
+                    Some(ty) => {
+                        PagedEdit::route_free(&mut pg.meta, &mut pg.raw, s.addr, s.size, ty)
                     }
+                    None => pg.unclassified.free(s.addr, s.size),
                 }
             }
         } else if let Ok(mut sections) = free_space_manager::read_persisted_sections_source(
@@ -1702,7 +1805,7 @@ impl WriteEngine {
         // A paged file tracks its free space per page type; report the union, since
         // the caller wants one total rather than a per-manager breakdown.
         let reusable_free_space = match &self.paged {
-            Some(pg) => pg.all_sections(),
+            Some(pg) => pg.reusable_sections(),
             None => self.free.sections(),
         };
         let reusable_free_bytes = reusable_free_space.iter().map(|(_, len)| len).sum();
@@ -2317,7 +2420,44 @@ impl WriteEngine {
     /// I/O error, or a residual build error), the superblock — repointed last —
     /// still names the prior root, so the file stays valid and the appended bytes
     /// are unreferenced slack.
+    ///
+    /// A failure before the repoint also gives back the free regions the apply
+    /// loop had drawn from, so an attempt that never became visible costs the
+    /// session no reusable space (see [`FreeSnapshot`]).
     pub fn commit(&mut self) -> Result<(), Error> {
+        let snapshot = self.snapshot_free();
+        self.repointed = false;
+        let result = self.commit_inner();
+        if result.is_err() && !self.repointed {
+            self.restore_free(snapshot);
+        }
+        result
+    }
+
+    /// The free lists as they stand now, for [`commit`](Self::commit) to restore
+    /// if its apply loop draws from them and then fails.
+    fn snapshot_free(&self) -> FreeSnapshot {
+        FreeSnapshot {
+            free: self.free.clone(),
+            paged: self
+                .paged
+                .as_ref()
+                .map(|pg| (pg.meta.clone(), pg.raw.clone())),
+        }
+    }
+
+    /// Put the free lists back as [`snapshot_free`](Self::snapshot_free) found
+    /// them. Called only for a commit that failed before publishing anything, so
+    /// every region it restores is dead again.
+    fn restore_free(&mut self, snapshot: FreeSnapshot) {
+        self.free = snapshot.free;
+        if let (Some(pg), Some((meta, raw))) = (self.paged.as_mut(), snapshot.paged) {
+            pg.meta = meta;
+            pg.raw = raw;
+        }
+    }
+
+    fn commit_inner(&mut self) -> Result<(), Error> {
         if self.pending_datasets.is_empty()
             && self.pending_writes.is_empty()
             && self.pending_appends.is_empty()
@@ -2947,16 +3087,30 @@ impl WriteEngine {
                     MovingWrite::AppendedChunks {
                         old_addr,
                         old_tail_extent,
+                        kept_chunks,
                         ..
                     } => {
                         if let Ok(a) = usize::try_from(*old_addr) {
                             if let Some(spans) = self.chunked_index_spans(a) {
-                                // A chunk index lives in a raw page in this crate's
-                                // files; see `chunked_storage_spans` for why the tag
-                                // has to follow the placement rather than the
-                                // format's metadata/raw taxonomy.
-                                to_free
-                                    .extend(spans.into_iter().map(|(a, l)| (a, l, PageType::Raw)));
+                                // The old index is reclaimed as raw only where it
+                                // provably sits in a raw page; see
+                                // `index_is_provably_raw`. The dataset's old chunk
+                                // data is the kept chunks (base-relative) plus the
+                                // trailing partial chunk this append relocated —
+                                // both already in hand, so the proof needs no second
+                                // walk of the index.
+                                let data_end = kept_chunks
+                                    .iter()
+                                    .filter_map(|c| {
+                                        c.address.checked_add(base)?.checked_add(c.compressed_size)
+                                    })
+                                    .chain(old_tail_extent.and_then(|(a, l)| a.checked_add(l)))
+                                    .max();
+                                if self.index_is_provably_raw(data_end, &spans) {
+                                    to_free.extend(
+                                        spans.into_iter().map(|(a, l)| (a, l, PageType::Raw)),
+                                    );
+                                }
                             }
                         }
                         if let Some(ext) = old_tail_extent {
@@ -3219,11 +3373,13 @@ impl WriteEngine {
             new_sb.consistency_flags = 0;
             let sb_bytes = new_sb.serialize();
             self.write_at(self.sb_sig_off, &sb_bytes)?;
+            self.repointed = true;
             self.image.sync_all()?;
             new_sb.root_group_address = new_root;
             self.superblock = new_sb;
         } else {
             self.repoint_v0v1_root(new_root - base, new_eof)?;
+            self.repointed = true;
             self.image.sync_all()?;
             self.superblock.root_group_address = new_root;
             self.superblock.eof_address = new_eof;
@@ -3385,6 +3541,7 @@ impl WriteEngine {
         new_sb.consistency_flags = 0;
         let sb_bytes = new_sb.serialize();
         self.write_at(self.sb_sig_off, &sb_bytes)?;
+        self.repointed = true;
         self.image.sync_all()?;
         self.superblock = new_sb;
 
@@ -3455,34 +3612,28 @@ impl WriteEngine {
         // rewrite, each append, each barrier), and a session that survived a failed
         // commit while believing live extents were free would hand them out on the
         // next commit — silently destroying the objects still occupying them.
-        let (post_meta, post_raw_small, post_raw_large) = {
+        let (post_meta, post_raw, unclassified) = {
             let pg = self
                 .paged
                 .as_ref()
                 .expect("commit_persisting_paged is only called on a paged file");
-            let (mut meta, mut raw_small, mut raw_large) =
-                (pg.meta.clone(), pg.raw_small.clone(), pg.raw_large.clone());
+            let (mut meta, mut raw) = (pg.meta.clone(), pg.raw.clone());
+            // Carried through untouched: nothing this engine frees is of unknown
+            // page type, and nothing it places comes out of that list.
+            let unclassified = free_sections(&pg.unclassified);
             for &(a, l) in &pg.meta_pad {
                 meta.free(a, l);
             }
             for &(a, l) in &pg.raw_pad {
-                raw_small.free(a, l);
+                raw.free(a, l);
             }
             for &(a, l, ty) in &to_free {
-                PagedEdit::route_free(
-                    &mut meta,
-                    &mut raw_small,
-                    &mut raw_large,
-                    page_size,
-                    a,
-                    l,
-                    ty,
-                );
+                PagedEdit::route_free(&mut meta, &mut raw, a, l, ty);
             }
             for &(a, l) in &old_blocks {
                 meta.free(a, l);
             }
-            (meta, raw_small, raw_large)
+            (meta, raw, unclassified)
         };
 
         let old_ext_rel = self
@@ -3519,8 +3670,8 @@ impl WriteEngine {
         // extension. Shared with the bounded backend so both lay out identically.
         let plan = plan_paged_managers(
             &free_sections(&post_meta),
-            &free_sections(&post_raw_small),
-            &free_sections(&post_raw_large),
+            &free_sections(&post_raw),
+            &unclassified,
             page_size,
             ext_addr + ext_len,
             os,
@@ -3580,6 +3731,7 @@ impl WriteEngine {
         new_sb.consistency_flags = 0;
         let sb_bytes = new_sb.serialize();
         self.write_at(self.sb_sig_off, &sb_bytes)?;
+        self.repointed = true;
         self.image.sync_all()?;
         self.superblock = new_sb;
 
@@ -3590,8 +3742,7 @@ impl WriteEngine {
         // in it, so a following append of metadata may keep packing that page.
         if let Some(pg) = self.paged.as_mut() {
             pg.meta = post_meta;
-            pg.raw_small = post_raw_small;
-            pg.raw_large = post_raw_large;
+            pg.raw = post_raw;
             pg.meta_pad.clear();
             pg.raw_pad.clear();
             pg.last = Some(PageType::Meta);
@@ -3624,13 +3775,20 @@ impl WriteEngine {
             self.append(&vec![0u8; pad_len.to_usize()?])?;
             if let Some(pg) = self.paged.as_mut() {
                 match last {
-                    // A partially-filled tail page at commit time is a raw page (the
-                    // last thing the apply loop writes for a dataset is its header,
-                    // but a commit that only wrote raw data ends on one); default an
-                    // unknown tail (no typed append this commit) to raw, matching the
-                    // bounded backend.
+                    // A partially-filled tail page at commit time is a raw page:
+                    // the last thing the apply loop writes for a dataset is its
+                    // header, but a commit that only wrote raw data ends on one.
                     Some(PageType::Meta) => pg.meta_pad.push((pad_at, pad_len)),
-                    _ => pg.raw_pad.push((pad_at, pad_len)),
+                    Some(PageType::Raw) => pg.raw_pad.push((pad_at, pad_len)),
+                    // No typed append this commit, so the tail page is one a
+                    // previous session left non-aligned — a crash, since a clean
+                    // close pads. Its type is unknown, and recording the padding
+                    // under a guess would advertise it for reuse of that type and
+                    // mix the page, so leave it untracked (see `PagedEdit::begin`,
+                    // which makes the same call for the same reason). Reuse made
+                    // this reachable: before it, every commit appended at least the
+                    // root group header, so `last` was always known here.
+                    None => {}
                 }
             }
         }
@@ -4934,12 +5092,13 @@ impl WriteEngine {
             } => {
                 let new_data_addr = self.alloc_or_append_typed(data, PageType::Raw)?;
                 let mut region = region.clone();
-                // `alloc_or_append` returns an absolute offset; the data-layout
+                // The placement is an absolute offset; the data-layout
                 // address field stores it relative to the userblock base.
                 region[*addr_off..*addr_off + 8]
                     .copy_from_slice(&(new_data_addr - base).to_le_bytes());
-                // Append the dense heap *after* the data so the heap's base
-                // equals end-of-file (see `append_dense_attrs`).
+                // The dense heap is placed independently of the data — it is
+                // built for whatever address it gets (see `append_dense_attrs`),
+                // so no ordering between the two is owed.
                 self.append_dense_attrs(&mut region, dense_attrs)?;
                 let oh = build_v2_object_header(&region)?;
                 self.alloc_or_append_typed(&oh, PageType::Meta)
@@ -4976,8 +5135,9 @@ impl WriteEngine {
                     // The link target is stored relative to the userblock base.
                     region.extend_from_slice(&encode_link_message(name, new_child - base));
                 }
-                // Append the dense heap after the children's headers/data so its
-                // base equals end-of-file (see `append_dense_attrs`).
+                // The dense heap is built for whatever address it is placed at
+                // (see `append_dense_attrs`), so it needs no ordering against the
+                // children's headers and data.
                 self.append_dense_attrs(&mut region, dense_attrs)?;
                 let oh = build_v2_object_header(&region)?;
                 self.alloc_or_append_typed(&oh, PageType::Meta)
@@ -4985,23 +5145,22 @@ impl WriteEngine {
         }
     }
 
-    /// Write a chunked dataset's storage at end-of-file and return its new
-    /// object-header address — the shared write half of a chunked copy
-    /// ([`CopyTree::DatasetChunked`]) and a relocating chunked overwrite
-    /// ([`MovingWrite::Chunked`]).
+    /// Write a chunked dataset's storage and return its new object-header address
+    /// — the shared write half of a chunked copy ([`CopyTree::DatasetChunked`])
+    /// and a relocating chunked overwrite ([`MovingWrite::Chunked`]).
     ///
-    /// A fresh chunk-data blob and index are laid out relocatably at the current
-    /// end-of-file via [`plan_chunked_data_verbatim`] / [`emit_chunked_data_verbatim`],
-    /// pulling each chunk's already-compressed bytes from `chunk_bytes` (in dense
+    /// A fresh chunk-data blob and index are laid out relocatably via
+    /// [`plan_chunked_data_verbatim`] / [`emit_chunked_data_verbatim`], pulling
+    /// each chunk's already-compressed bytes from `chunk_bytes` (in dense
     /// row-major grid order) and carrying `meta`'s sizes and filter masks and the
     /// source `pipeline_message` verbatim — no recompression, no filter-parameter
-    /// reconstruction. The blob is *appended* (not placed via [`alloc_or_append`])
-    /// because its embedded addresses assume `base == end-of-file`, exactly like
-    /// [`build_chunked_dataset`](Self::build_chunked_dataset). The verbatim header
+    /// reconstruction. Like [`build_chunked_dataset`](Self::build_chunked_dataset)
+    /// the blob is sized from its plan before it is placed, so it can go into a
+    /// freed region that fits it as readily as at end-of-file. The verbatim header
     /// `region`'s data-layout message is then swapped for the one the planner
     /// produced (every other message preserved), any dense attribute heap is
-    /// appended after the blob, and the header is written into reusable freed space
-    /// or at end-of-file.
+    /// placed, and the header is written into reusable freed space or at
+    /// end-of-file.
     #[expect(
         clippy::too_many_arguments,
         reason = "the chunked rebuild needs the full geometry, \
@@ -5019,57 +5178,67 @@ impl WriteEngine {
         chunk_bytes: &[Vec<u8>],
         dense_attrs: &[crate::attribute::AttributeMessage],
     ) -> Result<u64, Error> {
-        // The blob is raw data, and its embedded addresses are computed from the
-        // end-of-file it lands at, so open a raw page *before* reading that offset.
-        self.begin_page(PageType::Raw)?;
-        let eof = self.image.len();
-        // Build with the *stored* (base-relative) address the blob will occupy, so
-        // its embedded addresses resolve to its real file offset once the reader adds
-        // the userblock base back (see `build_chunked_dataset`). On a base-0 file this
-        // equals `eof`.
-        let stored_base = eof - self.superblock.base_address;
-        let layout = plan_chunked_data_verbatim(
+        // Plan once at a provisional base purely to size the data region: the plan
+        // walks chunk *sizes*, and every address it embeds sits in a fixed-width
+        // field, so its total length is the same wherever the blob lands. That is
+        // what lets the address be chosen — a freed region or end-of-file — before
+        // the bytes exist.
+        let sizing = plan_chunked_data_verbatim(
             meta,
             chunk_dims,
             element_size,
             raw_size,
             pipeline_message,
-            stored_base,
+            0,
             maxshape,
         )?;
-        let mut buf = Vec::with_capacity(usize::try_from(layout.plan.total_len).unwrap_or(0));
-        emit_chunked_data_verbatim(
-            &mut buf,
-            &layout.plan,
-            &SliceChunkProvider {
-                chunks: chunk_bytes,
-            },
-        )?;
-        let written = self.append(&buf)?;
-        debug_assert_eq!(written, eof, "chunk blob must land at end-of-file",);
+        let (_addr, layout_message) =
+            self.place_relocatable(sizing.plan.total_len, PageType::Raw, |stored_base| {
+                // Re-plan at the address the blob really occupies, so its embedded
+                // addresses resolve to their real file offsets once the reader adds
+                // the userblock base back (see `build_chunked_dataset`).
+                let layout = plan_chunked_data_verbatim(
+                    meta,
+                    chunk_dims,
+                    element_size,
+                    raw_size,
+                    pipeline_message,
+                    stored_base,
+                    maxshape,
+                )?;
+                let mut buf =
+                    Vec::with_capacity(usize::try_from(layout.plan.total_len).unwrap_or(0));
+                emit_chunked_data_verbatim(
+                    &mut buf,
+                    &layout.plan,
+                    &SliceChunkProvider {
+                        chunks: chunk_bytes,
+                    },
+                )?;
+                Ok((buf, layout.layout_message))
+            })?;
         // Swap the data-layout message for the rebuilt one; keep every other header
         // message (datatype, dataspace, fill value, filter pipeline, attributes)
-        // verbatim. A dense attribute heap, if any, is appended after the blob so
-        // its base equals end-of-file (see `append_dense_attrs`).
-        let mut new_region = replace_layout_message(region, &layout.layout_message)?;
+        // verbatim.
+        let mut new_region = replace_layout_message(region, &layout_message)?;
         self.append_dense_attrs(&mut new_region, dense_attrs)?;
         let oh = build_v2_object_header(&new_region)?;
         self.alloc_or_append_typed(&oh, PageType::Meta)
     }
 
     /// When `attrs` is non-empty, build a fresh dense (fractal-heap) attribute
-    /// blob for it, append it at end-of-file, and splice the matching Attribute
-    /// Info message onto `region`. A no-op for an empty set.
+    /// blob for it, place it, and splice the matching Attribute Info message onto
+    /// `region`. A no-op for an empty set.
     ///
     /// The blob produced by [`file_writer::build_dense_attrs`] is fully
-    /// relocatable: every address it embeds is `base + fixed offset`, so passing
-    /// the current end-of-file as the base makes those addresses land exactly
-    /// where the bytes are written. Like [`build_chunked_dataset`](Self::build_chunked_dataset)
-    /// the blob is therefore *appended* (never placed into an interior freed
-    /// region), and the caller must append it before any later append in the same
-    /// node so `base == end-of-file` still holds. The freshly built heap is
-    /// always same-file, so it never aliases the source heap even for an in-file
-    /// copy. The caller has already validated [`file_writer::dense_attrs_check`].
+    /// relocatable: every address it embeds is `base + fixed offset`, and its
+    /// length is the same for every base, so it can go into a freed metadata
+    /// region as readily as at end-of-file — the base it is built for is whichever
+    /// address it gets. Sizing it costs a throwaway build at a provisional
+    /// address, which is bounded by the attribute set's own size. The freshly
+    /// built heap is always same-file, so it never aliases the source heap even
+    /// for an in-file copy. The caller has already validated
+    /// [`file_writer::dense_attrs_check`].
     fn append_dense_attrs(
         &mut self,
         region: &mut Vec<u8>,
@@ -5078,25 +5247,15 @@ impl WriteEngine {
         if attrs.is_empty() {
             return Ok(());
         }
-        // A fractal-heap attribute blob is metadata, and its embedded addresses are
-        // computed from the end-of-file it lands at, so open a metadata page
-        // *before* reading that offset.
-        self.begin_page(PageType::Meta)?;
-        let eof = self.image.len();
-        // Build with the *stored* (base-relative) address the blob will occupy, so
-        // every address it embeds resolves to its real file offset once the reader
-        // adds the userblock base back (see `build_chunked_dataset`). On a base-0
-        // file this equals `eof`.
-        let stored_base = eof - self.superblock.base_address;
-        let blob = crate::file_writer::build_dense_attrs(attrs, stored_base);
-        let written = self.append(&blob.blob)?;
-        debug_assert_eq!(
-            written, eof,
-            "dense attribute blob must land at end-of-file",
-        );
+        let len = crate::file_writer::build_dense_attrs(attrs, 0).blob.len() as u64;
+        let (_addr, attr_info_message) =
+            self.place_relocatable(len, PageType::Meta, |stored_base| {
+                let blob = crate::file_writer::build_dense_attrs(attrs, stored_base);
+                Ok((blob.blob, blob.attr_info_message))
+            })?;
         region.extend_from_slice(&region_message(
             MessageType::AttributeInfo,
-            &blob.attr_info_message,
+            &attr_info_message,
         ));
         Ok(())
     }
@@ -5118,7 +5277,7 @@ impl WriteEngine {
             } => {
                 let new_data_addr = self.alloc_or_append_typed(raw, PageType::Raw)?;
                 let mut region = region.clone();
-                // `alloc_or_append` returns an absolute file offset; the contiguous
+                // The placement is an absolute file offset; the contiguous
                 // data-layout field stores it relative to the userblock base (`-
                 // base`, a no-op on a base-0 file).
                 region[*addr_off..*addr_off + 8]
@@ -5203,8 +5362,8 @@ impl WriteEngine {
         }
     }
 
-    /// Apply a relocating append ([`MovingWrite::AppendedChunks`]): append the new
-    /// (and any rewritten trailing) chunk bytes at end-of-file, rebuild a fresh
+    /// Apply a relocating append ([`MovingWrite::AppendedChunks`]): place the new
+    /// (and any rewritten trailing) chunk bytes, rebuild a fresh
     /// Extensible Array over the kept plus appended chunks, grow the dataspace and
     /// repoint the data layout in the verbatim header `region`, and write the
     /// relocated header. Returns the new header address; the caller patches the
@@ -5228,17 +5387,13 @@ impl WriteEngine {
         new_chunk_bytes: &[Vec<u8>],
     ) -> Result<u64, Error> {
         let base = self.superblock.base_address;
-        // Append each new chunk at true end-of-file (never `alloc_or_append`: the
-        // rebuilt index below records base-relative addresses computed from the
-        // end-of-file the appends land at). Existing chunks keep their in-place
-        // addresses and are carried by metadata alone.
+        // Place each new chunk, reusing freed raw space where it fits. A chunk
+        // embeds no addresses of its own, so it can go anywhere and the rebuilt
+        // index below simply records where it went. Existing chunks keep their
+        // in-place addresses and are carried by metadata alone.
         let mut combined: Vec<WrittenChunk> = kept_chunks.to_vec();
-        if !new_chunk_bytes.is_empty() {
-            // Chunk contents are raw data; one page switch covers the whole run.
-            self.begin_page(PageType::Raw)?;
-        }
         for cb in new_chunk_bytes {
-            let abs = self.append(cb)?;
+            let abs = self.alloc_or_append_typed(cb, PageType::Raw)?;
             combined.push(WrittenChunk {
                 address: abs - base,
                 compressed_size: cb.len() as u64,
@@ -5250,29 +5405,31 @@ impl WriteEngine {
             });
         }
 
-        // Build the fresh Extensible Array at the current end-of-file. Its embedded
-        // block addresses are computed from `ea_base` (base-relative), so appending
-        // the blob at the matching file offset makes them resolve correctly, on a
-        // userblock (`base != 0`) file too.
+        // Build the fresh Extensible Array for wherever it is placed: its embedded
+        // block addresses are computed from `ea_base` (base-relative), so they
+        // resolve correctly on a userblock (`base != 0`) file too. Its length does
+        // not depend on that base, so a throwaway build at 0 sizes it.
         //
         // The index goes in a *raw* page, not a metadata one: every other writer in
         // this crate places a chunk index in the same run as the chunk data, and
         // `chunked_storage_spans` reclaims every index as raw on that basis. Placing
         // this one in a metadata page would make it the single exception the reclaim
-        // side then mis-files, advertising a metadata hole inside a raw page. Opening
-        // the page before reading the offset keeps `begin_page`'s contract: no pad
-        // may be inserted after an address the built bytes embed.
-        self.begin_page(PageType::Raw)?;
-        let ea_base = self.image.len() - base;
-        let ea_bytes =
-            build_extensible_array_at(&combined, OFFSET_SIZE, LENGTH_SIZE, has_filters, ea_base)
-                .map_err(Error::Format)?;
-        let written = self.append(&ea_bytes)?;
-        debug_assert_eq!(
-            written,
-            ea_base + base,
-            "extensible-array index must land at end-of-file",
-        );
+        // side then mis-files, advertising a metadata hole inside a raw page.
+        let ea_len = build_extensible_array_at(&combined, OFFSET_SIZE, LENGTH_SIZE, has_filters, 0)
+            .map_err(Error::Format)?
+            .len() as u64;
+        let (ea_addr, ()) = self.place_relocatable(ea_len, PageType::Raw, |ea_base| {
+            let bytes = build_extensible_array_at(
+                &combined,
+                OFFSET_SIZE,
+                LENGTH_SIZE,
+                has_filters,
+                ea_base,
+            )
+            .map_err(Error::Format)?;
+            Ok((bytes, ()))
+        })?;
+        let ea_base = ea_addr - base;
 
         // Swap the dataspace (grown) and data-layout (repointed at the new index)
         // messages; every other header message is preserved verbatim.
@@ -5328,56 +5485,125 @@ impl WriteEngine {
         }
     }
 
-    /// Append `bytes` at end-of-file as page type `ty`: [`begin_page`](Self::begin_page)
-    /// followed by [`append`](Self::append).
-    fn append_typed(&mut self, bytes: &[u8], ty: PageType) -> Result<u64, Error> {
-        self.begin_page(ty)?;
-        self.append(bytes)
-    }
-
-    /// Place `bytes` as page type `ty`, reusing a free region where that is safe.
-    ///
-    /// On a paged file this never reuses: a hole belongs to one page type, and
-    /// handing it to an allocation of the other type would re-mix the page it sits
-    /// in. Such a file appends into a page of the right type instead, exactly as
-    /// the bounded backend does, and recovers the space at the next commit's
-    /// manager rewrite rather than within the commit.
+    /// Place `bytes` as page type `ty`, reusing a free region where one fits.
+    /// Equivalent to [`reserve`](Self::reserve) followed by [`place`](Self::place),
+    /// for the callers whose bytes are already built.
     fn alloc_or_append_typed(&mut self, bytes: &[u8], ty: PageType) -> Result<u64, Error> {
-        if self.paged.is_some() {
-            return self.append_typed(bytes, ty);
-        }
-        self.alloc_or_append(bytes)
+        let at = self.reserve(bytes.len() as u64, ty)?;
+        self.place(at, bytes)
     }
 
-    /// Place `bytes` either in a reusable free region left by a prior commit
-    /// (overwriting it in place) or, failing that, by appending at end-of-file.
-    /// Returns the address written to.
+    /// Choose where `len` bytes of page type `ty` will go: a reusable free region
+    /// left by a prior commit, or the current end-of-file. The returned
+    /// [`Placement`] must be handed to [`place`](Self::place) with exactly `len`
+    /// bytes.
     ///
-    /// Reuse only ever draws from [`self.free`](Self::free), which holds regions
-    /// vacated by *earlier* commits in this session — never space the current
-    /// commit is about to free — so the bytes it overwrites are already
-    /// unreachable from the on-disk root and a mid-commit crash cannot corrupt
-    /// the live tree (the superblock still points at the prior, intact root).
+    /// Splitting the choice from the write is what lets a *relocatable* blob — one
+    /// whose interior addresses are all `base + fixed offset`, like a chunked
+    /// dataset's data region or a dense attribute heap — be built for a freed
+    /// region rather than only for end-of-file: its size is known from its plan
+    /// before its bytes exist, so the address can be settled first
+    /// ([`place_relocatable`](Self::place_relocatable) is that sequence).
     ///
-    /// Callers on the commit path go through [`alloc_or_append_typed`](Self::alloc_or_append_typed)
-    /// so a paged file stays page-segregated; this is the non-paged primitive it
-    /// delegates to.
-    fn alloc_or_append(&mut self, bytes: &[u8]) -> Result<u64, Error> {
-        debug_assert!(
-            self.paged.is_none(),
-            "a paged file must allocate through alloc_or_append_typed"
-        );
-        if let Some(addr) = self.free.alloc(bytes.len() as u64) {
-            self.write_at(
-                usize::try_from(addr).map_err(|_| {
-                    Error::EditUnsupported("free-region address exceeds this platform")
-                })?,
-                bytes,
-            )?;
-            Ok(addr)
-        } else {
-            self.append(bytes)
+    /// Reuse only ever draws from free space vacated by *earlier* commits in this
+    /// session (or seeded from the on-disk managers at open) — never space the
+    /// current commit is about to free, which stays in its `to_free` list until
+    /// after the superblock repoint. The bytes it overwrites are therefore already
+    /// unreachable from the on-disk root, so a mid-commit crash cannot corrupt the
+    /// live tree: the superblock still points at the prior, intact root.
+    ///
+    /// A paged file reuses only within the matching page type, keeping every page
+    /// homogeneous, and never opens a page for a reused region — the tail page is
+    /// untouched by a write into the middle of the file.
+    fn reserve(&mut self, len: u64, ty: PageType) -> Result<Placement, Error> {
+        if let Some(addr) = self.alloc_free(len, ty) {
+            return Ok(Placement::Reused { addr, len });
         }
+        self.begin_page(ty)?;
+        Ok(Placement::Appended {
+            addr: self.image.len(),
+            len,
+        })
+    }
+
+    /// Draw `len` bytes from the free space of page type `ty`, or `None` when no
+    /// single region is large enough.
+    ///
+    /// A non-paged file keeps one list for the whole file. A paged file keeps one
+    /// per page type and must be served from the list matching `ty`: handing a
+    /// metadata hole to raw data (or the reverse) would mix the two within a page,
+    /// which is the single invariant the paged strategy exists to hold.
+    fn alloc_free(&mut self, len: u64, ty: PageType) -> Option<u64> {
+        let Some(pg) = self.paged.as_mut() else {
+            return self.free.alloc(len);
+        };
+        match ty {
+            PageType::Meta => pg.meta.alloc(len),
+            PageType::Raw => pg.raw.alloc(len),
+        }
+    }
+
+    /// Write `bytes` at the address [`reserve`](Self::reserve) handed out,
+    /// returning that address.
+    ///
+    /// The length is checked rather than asserted: a reused region is sized to the
+    /// reservation and is followed by live bytes, so writing more than was reserved
+    /// would silently destroy a neighboring object. That makes it the one internal
+    /// miscount worth paying a comparison to catch in every build.
+    fn place(&mut self, at: Placement, bytes: &[u8]) -> Result<u64, Error> {
+        if bytes.len() as u64 != at.len() {
+            return Err(Error::Format(FormatError::SerializationError(format!(
+                "a placement reserved {} bytes but built {}",
+                at.len(),
+                bytes.len()
+            ))));
+        }
+        match at {
+            Placement::Reused { addr, .. } => {
+                self.write_at(
+                    usize::try_from(addr).map_err(|_| {
+                        Error::EditUnsupported("free-region address exceeds this platform")
+                    })?,
+                    bytes,
+                )?;
+                Ok(addr)
+            }
+            Placement::Appended { addr, .. } => {
+                let written = self.append(bytes)?;
+                debug_assert_eq!(
+                    written, addr,
+                    "an appended placement must land at end-of-file"
+                );
+                Ok(written)
+            }
+        }
+    }
+
+    /// Place a *relocatable* blob of `len` bytes as page type `ty`: pick its
+    /// address first, then build it for that address with `build`, then write it
+    /// there. Returns the address and whatever else `build` produced (typically the
+    /// object-header message naming the blob, which embeds the same address).
+    ///
+    /// `build` receives the *stored* (base-relative) address the blob will occupy,
+    /// since every address a blob embeds is stored base-relative and the reader
+    /// recovers it as `stored + base_address`. On a file without a userblock the
+    /// two are equal.
+    ///
+    /// `len` must be the length `build` will produce; [`place`](Self::place)
+    /// rejects a mismatch. For every blob placed this way the length is a function
+    /// of the content alone — the addresses sit in fixed-width fields — so it can
+    /// be planned (or measured from a build at a provisional address) before the
+    /// real one is known.
+    fn place_relocatable<T>(
+        &mut self,
+        len: u64,
+        ty: PageType,
+        build: impl FnOnce(u64) -> Result<(Vec<u8>, T), Error>,
+    ) -> Result<(u64, T), Error> {
+        let at = self.reserve(len, ty)?;
+        let (bytes, extra) = build(at.address() - self.superblock.base_address)?;
+        let addr = self.place(at, &bytes)?;
+        Ok((addr, extra))
     }
 
     /// Place one variable-length dataset's or attribute's already-built,
@@ -5484,7 +5710,7 @@ impl WriteEngine {
     /// `resolve_reference_target` calls can fail, so a reference-resolution
     /// error can no longer leave earlier-processed groups' real writes
     /// orphaned in the file (the failure surfaces here instead, before the
-    /// apply loop's first `alloc_or_append`/`write_at`).
+    /// apply loop's first `place`/`write_at`).
     fn preflight_reference_targets(
         keys: &[PathKey],
         flat: &BTreeMap<PathKey, Vec<FlatDataset>>,
@@ -5534,55 +5760,48 @@ impl WriteEngine {
     /// Lay out a chunked / filtered / extensible dataset and return its object
     /// header bytes (which the caller links into the parent group).
     ///
-    /// The chunk data and index (B-tree v1 / fixed-array / extensible-array, with
-    /// any filter pipeline applied) are produced as one relocatable blob by
-    /// [`build_chunked_data_at_ext`], whose internal layout — and therefore total
-    /// size — is independent of the base address it is given. The blob is
-    /// appended at end-of-file, so passing the current end-of-file as the base
-    /// makes every absolute address it embeds (chunk addresses, index-structure
-    /// addresses, the addresses in the data-layout message) land exactly where
-    /// the bytes are written. The header is then built with
-    /// [`build_chunked_dataset_oh`] — the same function the whole-file writer
-    /// uses — so the header is byte-identical to one written fresh.
+    /// The chunk data and index (fixed-array / extensible-array, with any filter
+    /// pipeline applied) are produced as one relocatable blob, whose internal
+    /// layout — and therefore total size — is independent of the base address it
+    /// is given. That is what lets the dataset be *sized before it is placed*
+    /// ([`chunked_data_len`]): the blob goes into a freed region big enough to
+    /// hold it, or at end-of-file when there is none, and is then assembled for
+    /// whichever address it got, so every absolute address it embeds (chunk
+    /// addresses, index-structure addresses, the addresses in the data-layout
+    /// message) lands exactly where the bytes are written. The header is then
+    /// built with [`build_chunked_dataset_oh`] — the same function the whole-file
+    /// writer uses — so the header is byte-identical to one written fresh.
     ///
-    /// Unlike the contiguous path the blob is always *appended* rather than
-    /// placed via [`alloc_or_append`]: reusing an interior freed region would
-    /// require knowing the blob's size before building it at that region's
-    /// address, and appending keeps the address known up front. Freed space is
-    /// still reused for the object header and for every other object in the
-    /// commit.
+    /// The dataset's single pass of the filter pipeline happens in
+    /// [`compress_chunks`], before either decision; sizing and assembly work from
+    /// the compressed set, so choosing an address never costs a recompression
+    /// (issue #261).
     fn build_chunked_dataset(&mut self, fd: &FlatDataset) -> Result<Vec<u8>, Error> {
-        // The blob is raw data whose embedded addresses are computed from the
-        // end-of-file it lands at, so open a raw page *before* reading that offset.
-        self.begin_page(PageType::Raw)?;
-        let eof = self.image.len();
-        // The blob embeds *stored* (base-relative) addresses, so the planner base is
-        // the stored address the blob will occupy: its end-of-file offset minus the
-        // userblock base. The reader recovers each as `stored + base_address`, which
-        // resolves back to the blob's real file offset. On a base-0 file this is just
-        // `eof`.
-        let stored_base = eof - self.superblock.base_address;
         let chunk_dims = fd.chunk_options.resolve_chunk_dims(&fd.ds.dimensions);
         let ctx = ChunkContext::from_datatype(&chunk_dims, &fd.dt);
-        let result = build_chunked_data_at_ext(
+        let set = compress_chunks(
             &fd.raw,
             &fd.ds.dimensions,
             ctx,
             &fd.chunk_options,
-            stored_base,
             fd.maxshape.as_deref(),
         )?;
-        // `append` writes at the current end-of-file, which equals `eof`: the blob
-        // lands exactly where its embedded (stored) addresses expect once the reader
-        // adds the base back.
-        let written = self.append(&result.data_bytes)?;
-        debug_assert_eq!(written, eof, "chunk blob must land at end-of-file",);
+        // Chunk data and the index beside it are raw (see `chunked_storage_spans`,
+        // which reclaims both as raw).
+        let (_addr, (layout_message, pipeline_message)) =
+            self.place_relocatable(chunked_data_len(&set)?, PageType::Raw, |stored_base| {
+                let result = assemble_chunked_at(&set, stored_base)?;
+                Ok((
+                    result.data_bytes,
+                    (result.layout_message, result.pipeline_message),
+                ))
+            })?;
         Ok(build_chunked_dataset_oh(
             &fd.dt,
             &DatatypeLocation::Inline,
             &fd.ds,
-            &result.layout_message,
-            result.pipeline_message.as_deref(),
+            &layout_message,
+            pipeline_message.as_deref(),
             &fd.attrs,
             None,
             fd.fill.as_deref(),
@@ -5853,30 +6072,73 @@ impl WriteEngine {
             LENGTH_SIZE,
         )
         .ok()?;
-        // Both halves are tagged raw, because on a paged file both halves *live* in
-        // raw pages: every writer in this crate places a chunked dataset's index
-        // structure immediately after its chunk data in one run — the from-scratch
-        // paged writer builds the whole blob inside the raw region, and
-        // `build_chunked_dataset` / `write_chunked_relocatable` append it under a
-        // single `begin_page(PageType::Raw)`.
-        //
-        // A chunk index is metadata by the format's taxonomy, so tagging it that way
-        // is tempting; it is also wrong here. The tag decides which manager the
-        // freed region is recorded in, and recording an index that sits among live
-        // chunk data in the *metadata* manager would advertise space inside a raw
-        // page — letting the reference library place metadata there and mixing the
-        // page, which is the one thing a paged file must never do. The tag has to
-        // follow the placement, so `write_appended_chunks` places its rebuilt index
-        // in a raw page too, keeping every index in this crate's files raw.
-        let mut spans: Vec<(u64, u64, PageType)> = Vec::new();
-        for (addr, len) in split.data.into_iter().chain(split.index) {
-            spans.push((addr.checked_add(base)?, len, PageType::Raw));
+        // Chunk data is raw under every writer, so its spans are raw outright. The
+        // index is only raw where this crate placed it — see
+        // [`index_is_provably_raw`](Self::index_is_provably_raw) — and is left
+        // unreclaimed otherwise.
+        let mut data: Vec<(u64, u64)> = Vec::with_capacity(split.data.len());
+        for (addr, len) in split.data {
+            data.push((addr.checked_add(base)?, len));
         }
-        let mut plain: Vec<(u64, u64)> = spans.iter().map(|&(a, l, _)| (a, l)).collect();
+        let mut index: Vec<(u64, u64)> = Vec::with_capacity(split.index.len());
+        for (addr, len) in split.index {
+            index.push((addr.checked_add(base)?, len));
+        }
+        // Validate both halves together — they must be disjoint from each other as
+        // well as internally — before either is trusted, including by the proof.
+        let mut plain: Vec<(u64, u64)> = data.iter().chain(index.iter()).copied().collect();
         if !spans_disjoint_in_bounds(&mut plain, self.image.len()) {
             return None;
         }
+        let data_end = data.iter().filter_map(|&(a, l)| a.checked_add(l)).max();
+        let mut spans: Vec<(u64, u64, PageType)> =
+            data.iter().map(|&(a, l)| (a, l, PageType::Raw)).collect();
+        if self.index_is_provably_raw(data_end, &index) {
+            spans.extend(index.into_iter().map(|(a, l)| (a, l, PageType::Raw)));
+        }
         Some(spans)
+    }
+
+    /// Whether a chunked dataset's `index` provably occupies raw pages, given the
+    /// `data` spans it accompanies. Both are absolute file offsets.
+    ///
+    /// A chunk index is *metadata* by the format's taxonomy, and the reference C
+    /// library allocates one as such — out of metadata pages, nowhere near the
+    /// chunk data. This crate instead lays a dataset's index down in the same run
+    /// as its chunk data, inside raw pages, so that a reader following the layout
+    /// message walks one contiguous blob. Both are valid; what matters on a paged
+    /// file is that freeing an index records it under the page type it actually
+    /// sits in, since that decides what a later allocation may overwrite there.
+    ///
+    /// Nothing in the file says which writer produced it, so the index is placed
+    /// from the layout itself: it must begin exactly where the chunk data ends,
+    /// which is this crate's single blob and is not a layout the reference library
+    /// produces. A chunk index is metadata to that library, allocated out of
+    /// metadata pages — and those are allocated from the bottom of the file, while
+    /// large raw data goes above, so its index lands far below the chunk data it
+    /// indexes rather than against it. Measured across seven files it wrote
+    /// (Extensible and Fixed Array indexes, page sizes 512/4096/8192, 8 to 16
+    /// chunks): the index began in page 0 every time, with the chunk data starting
+    /// at page 9 or higher, so the join address was never within reach of it.
+    ///
+    /// An index the test does not place is left unreclaimed by the caller, wasting
+    /// its bytes rather than risking advertising space inside a metadata page for
+    /// raw reuse (issue #261) — the same trade the reclaim walk already makes for
+    /// storage it cannot enumerate exhaustively.
+    ///
+    /// A non-paged file has no page types to keep apart, so everything is
+    /// reclaimable there; the tag is ignored by its commit tail entirely.
+    ///
+    /// `data_end` is one past the last chunk-data byte, absolute.
+    fn index_is_provably_raw(&self, data_end: Option<u64>, index: &[(u64, u64)]) -> bool {
+        if self.paged.is_none() || index.is_empty() {
+            return true;
+        }
+        let (Some(data_end), Some(index_start)) = (data_end, index.iter().map(|&(a, _)| a).min())
+        else {
+            return false;
+        };
+        index_start == data_end
     }
 
     /// Every on-disk byte span of a chunked dataset's *index structure only* (not
@@ -6117,7 +6379,8 @@ enum MovingWrite {
     Compact { region: Vec<u8>, raw: Vec<u8> },
     /// A chunked dataset whose new (re-encoded) chunks do not all fit their
     /// existing slots, so its whole storage is rebuilt and relocated. A fresh
-    /// chunk-data blob and index are appended at end-of-file (via the verbatim
+    /// chunk-data blob and index are placed — in a freed region that fits, else at
+    /// end-of-file (via the verbatim
     /// layout path, carrying `chunk_bytes` and the source filter `pipeline_message`
     /// unchanged — no recompression and no filter-parameter reconstruction), the
     /// data-layout message in the verbatim header `region` is swapped for the new
@@ -6140,7 +6403,8 @@ enum MovingWrite {
     /// dataset (`append_dataset`). The dataset's existing chunk *data* stays in
     /// place; only the newly-appended chunks and any rewritten trailing partial
     /// chunk (`new_chunk_bytes`, already compressed through the on-disk pipeline)
-    /// are appended at end-of-file, a fresh Extensible Array is rebuilt over
+    /// are placed (reusing freed raw space where it fits), a fresh Extensible
+    /// Array is rebuilt over
     /// `kept_chunks ++ new_chunk_bytes`, the verbatim header `region`'s dataspace
     /// message is grown (`new_dataspace_body`) and its data-layout message
     /// repointed at the new index (every other message — datatype, filter
@@ -6198,7 +6462,7 @@ struct FlatDataset {
     /// Chunked/filtered storage options. When [`ChunkOptions::is_chunked`] is
     /// false and `maxshape` is `None`, the dataset is written as contiguous,
     /// unfiltered storage; otherwise its chunk data and index are built by
-    /// [`build_chunked_data_at_ext`] and appended at end-of-file.
+    /// [`WriteEngine::build_chunked_dataset`].
     chunk_options: ChunkOptions,
     /// Maximum dimensions for an extensible dataset (an unlimited dimension is
     /// `u64::MAX`), mirrored into `ds.max_dimensions`. `None` for a fixed-shape
@@ -6478,7 +6742,8 @@ fn meta_spans(spans: Vec<(u64, u64)>) -> impl Iterator<Item = (u64, u64, PageTyp
 /// Validate a staged dataset and reduce it to a [`FlatDataset`]. Contiguous,
 /// unfiltered datasets are emitted as such; chunked, filtered, or extensible
 /// datasets carry their [`ChunkOptions`] and maxshape through to the commit,
-/// where [`build_chunked_data_at_ext`] lays out their chunk data and index. An
+/// where [`WriteEngine::build_chunked_dataset`] lays out their chunk data and
+/// index. An
 /// empty (zero-element) shape is allowed for contiguous storage (mirroring the
 /// whole-file writer, its data address is `HADDR_UNDEF` — see the apply loop),
 /// but chunking one stays refused via the geometry validation below. A
@@ -6596,7 +6861,8 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
         // disabled compression feature is refused up front; the chunk data
         // itself is laid out in the commit's apply phase. Chunked/filtered
         // storage flows through the very builder the normal writer uses
-        // ([`build_chunked_data_at_ext`] + [`build_chunked_dataset_oh`]), so the
+        // ([`compress_chunks`] + [`assemble_chunked_at`] + [`build_chunked_dataset_oh`]),
+        // so the
         // resulting object header is byte-identical to a freshly written one.
         let chunk_dims = db.chunk_options.resolve_chunk_dims(&shape);
         let ctx = ChunkContext::from_datatype(&chunk_dims, &dt);
@@ -8162,17 +8428,15 @@ mod tests {
     /// it partway is exactly what a power loss does.
     ///
     /// Restores coverage lost with the deprecated `SwmrWriter` (issue #202).
-    /// Opening a paged persisting file must seed each free section into the
-    /// manager its *slot* names, not one derived from its size.
+    /// Opening a paged persisting file must seed each free section into the list
+    /// for the page type its *slot* names, not one derived from its size.
     ///
-    /// The three managers a paged file uses mean different things — SUPER (slot 0)
-    /// is metadata, DRAW (slot 2) is small raw, and the generic-large manager
-    /// (slot 6) holds large-raw fragments — and a large-raw fragment is itself
-    /// smaller than a page, so size alone cannot recover the distinction. Getting
-    /// this wrong is invisible from the outside: the total free space is
-    /// unchanged, the reference library still opens the file, and only a later
-    /// allocation drawn from the wrong manager would mix a page. So assert the
-    /// routing directly.
+    /// The managers a paged file uses mean different things — SUPER (slot 0) is
+    /// metadata, DRAW (slot 2) is raw — and a freed section's size says nothing
+    /// about which it came from. Getting this wrong is invisible from the outside:
+    /// the total free space is unchanged, the reference library still opens the
+    /// file, and only a later allocation drawn from the wrong list would mix a
+    /// page. So assert the routing directly.
     #[test]
     fn paged_open_seeds_each_manager_by_slot() {
         use crate::writer::FileBuilder;
@@ -8210,13 +8474,21 @@ mod tests {
             "SUPER (slot 0) sections seed the metadata list"
         );
         assert!(
-            !pg.raw_small.sections().is_empty(),
-            "DRAW (slot 2) sections seed the small-raw list, not the metadata list"
+            !pg.raw.sections().is_empty(),
+            "DRAW (slot 2) sections seed the raw list, not the metadata list"
         );
 
-        // Nothing is double-counted or dropped: the three lists partition exactly
-        // the free space the file records, and no two sections overlap.
-        let mut all = pg.all_sections();
+        // Nothing is double-counted or dropped: the lists partition exactly the
+        // free space the file records, and no two sections overlap. A file this
+        // crate wrote has nothing unclassified — it only ever files a whole
+        // aligned page under the generic-large manager — so summing it in is a
+        // statement about that too.
+        let mut all = pg.reusable_sections();
+        all.extend(pg.unclassified.sections());
+        assert!(
+            pg.unclassified.sections().is_empty(),
+            "our own paged writer files nothing whose page type is unknown"
+        );
         let flat: u64 = all.iter().map(|&(_, l)| l).sum();
         assert_eq!(
             flat, on_disk,
@@ -8228,6 +8500,386 @@ mod tests {
             assert!(addr >= prev_end, "the per-type lists do not overlap");
             prev_end = addr + len;
         }
+    }
+
+    /// Deleting a chunked dataset from a paged file the *reference library* wrote
+    /// must not offer its chunk index for raw reuse.
+    ///
+    /// A chunk index is metadata by the format's taxonomy, and the C library
+    /// allocates one accordingly — out of metadata pages, which on a small file
+    /// means page 0, alongside the superblock, the root group, and every other
+    /// object's header. This crate places its own indexes in raw pages beside the
+    /// chunk data instead, and the reclaim path used to assume that of every file.
+    /// Freeing a C-written index under that assumption puts its bytes on the raw
+    /// list, and the next commit writes a dataset's values into the middle of a
+    /// live metadata page.
+    ///
+    /// Both libraries still read such a file — every address in it is still
+    /// correct — so nothing downstream reports the damage. The assertion has to be
+    /// about placement itself: no byte this commit writes may land in a page that
+    /// held live metadata beforehand.
+    #[test]
+    // Builds the fixture with the reference HDF5 C library (`hdf5-metno`), a
+    // 64-bit little-endian-only dev-dependency; skip elsewhere so the lib tests
+    // still run there.
+    #[cfg(all(not(target_pointer_width = "32"), target_endian = "little"))]
+    fn a_c_written_chunk_index_is_not_reclaimed_as_raw() {
+        use hdf5::plist::file_create::FileSpaceStrategy as CStrategy;
+        use tempfile::tempdir;
+
+        const PAGE: u64 = 4096;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("c_paged_index.h5");
+        {
+            let f = hdf5::FileBuilder::new()
+                .with_fapl(|fapl| fapl.libver_v110())
+                .with_fcpl(|fcpl| {
+                    fcpl.file_space_strategy(CStrategy::FreeSpaceManager {
+                        paged: true,
+                        persist: true,
+                        threshold: 1,
+                    })
+                    .file_space_page_size(PAGE)
+                })
+                .create(&path)
+                .unwrap();
+            let ds = f
+                .new_dataset::<i32>()
+                .shape(hdf5::SimpleExtents::resizable(vec![8192]))
+                .chunk((512,))
+                .create("victim")
+                .unwrap();
+            ds.write_raw(&(0..8192i32).collect::<Vec<i32>>()).unwrap();
+            f.new_dataset::<i32>()
+                .shape((4,))
+                .create("keep")
+                .unwrap()
+                .write_raw(&[1i32, 2, 3, 4])
+                .unwrap();
+            f.close().unwrap();
+        }
+
+        let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+        let page_size = s.paged.as_ref().expect("a paged file").page_size;
+        assert_eq!(page_size, PAGE);
+        // Where the C library put the index: every page it touches is a metadata
+        // page, since the C library allocates an index as metadata.
+        let victim_addr =
+            crate::group_v2::resolve_path_any(s.image.as_slice().unwrap(), &s.superblock, "victim")
+                .unwrap();
+        let index_spans = s
+            .chunked_index_spans(usize::try_from(victim_addr).unwrap())
+            .expect("the C library's extensible-array index is enumerable");
+        assert!(!index_spans.is_empty());
+        // Page 0 always holds the superblock and the root group header; the index
+        // pages are what this test is really about.
+        let mut meta_pages: Vec<u64> = vec![0];
+        for (addr, len) in &index_spans {
+            for p in (addr / PAGE)..=((addr + len - 1) / PAGE) {
+                meta_pages.push(p);
+            }
+        }
+        meta_pages.sort_unstable();
+        meta_pages.dedup();
+
+        // Delete the dataset, then write a small dataset that would fit in the
+        // index's freed bytes.
+        s.delete("/victim");
+        s.commit().unwrap();
+        let mut db = crate::type_builders::DatasetBuilder::new("added");
+        db.with_f64_data(&[2.5f64; 8]).with_shape(&[8]);
+        s.stage_created_dataset("/added", db);
+        s.commit().unwrap();
+
+        // Release the session's exclusive OS lock before reading the file back;
+        // those locks are mandatory on Windows.
+        drop(s);
+
+        // Every raw byte of the new dataset must be outside those pages.
+        let f = crate::reader::File::open(&path).unwrap();
+        let added = f.dataset("added").unwrap();
+        let crate::Layout::Contiguous {
+            address: Some(addr),
+            size,
+        } = added.layout().unwrap()
+        else {
+            panic!("a small f64 dataset is stored contiguously");
+        };
+        for p in (addr / PAGE)..=((addr + size - 1) / PAGE) {
+            assert!(
+                !meta_pages.contains(&p),
+                "the new dataset's raw data landed at ({addr}, {size}), in page {p}, \
+                 which held live metadata before the edit: {meta_pages:?}"
+            );
+        }
+
+        assert_eq!(added.read_f64().unwrap(), vec![2.5f64; 8]);
+        assert_eq!(
+            f.dataset("keep").unwrap().read_i32().unwrap(),
+            vec![1, 2, 3, 4]
+        );
+    }
+
+    /// Padding a tail page whose type is unknown must leave the padding
+    /// untracked, not guess a type for it.
+    ///
+    /// A commit pads the file to a page boundary before laying down its manager
+    /// blocks. When this session has made no typed allocation, the tail page is
+    /// one a previous session left non-aligned — only a crash does that, since a
+    /// clean close pads — and nothing says what it holds. Recording the padding
+    /// under a guess would advertise those bytes for reuse of that type, and half
+    /// the time they sit in a page of the other one. Under-reporting is the safe
+    /// direction, and it is the call [`PagedEdit::begin`] already makes for the
+    /// same situation.
+    ///
+    /// Reuse is what made this reachable: before it, every commit appended at
+    /// least the root group's header, so the tail type was always known by the
+    /// time the padding ran.
+    #[test]
+    fn padding_a_tail_page_of_unknown_type_records_nothing() {
+        use crate::writer::FileBuilder;
+        use tempfile::tempdir;
+
+        const PAGE: u64 = 4096;
+        let dir = tempdir().unwrap();
+
+        let build = |path: &std::path::Path| {
+            let mut b = FileBuilder::new();
+            b.create_dataset("d")
+                .with_i32_data(&(0..1000).collect::<Vec<i32>>())
+                .with_shape(&[1000]);
+            b.with_file_space_strategy(FileSpaceStrategy::Page, true, 0)
+                .with_file_space_page_size(PAGE);
+            b.write(path).unwrap();
+        };
+
+        // Unknown tail type: pad, but record nothing.
+        let unknown = dir.path().join("unknown_tail.h5");
+        build(&unknown);
+        let mut s = WriteEngine::open_with_locking(&unknown, FileLocking::Enabled).unwrap();
+        s.append(&[0u8; 100]).unwrap(); // leaves the image non-page-aligned
+        assert!(s.paged.as_ref().unwrap().last.is_none());
+        s.pad_to_page().unwrap();
+        let pg = s.paged.as_ref().unwrap();
+        assert_eq!(s.image.len() % PAGE, 0, "the file is padded to a page");
+        assert!(
+            pg.meta_pad.is_empty() && pg.raw_pad.is_empty(),
+            "padding a tail page of unknown type must claim no page type"
+        );
+        drop(s);
+
+        // The control: a known tail type is recorded, so the test above is about
+        // the unknown case and not about padding never being tracked at all.
+        let known = dir.path().join("known_tail.h5");
+        build(&known);
+        let mut s = WriteEngine::open_with_locking(&known, FileLocking::Enabled).unwrap();
+        s.begin_page(PageType::Meta).unwrap();
+        s.append(&[0u8; 100]).unwrap();
+        s.pad_to_page().unwrap();
+        let pg = s.paged.as_ref().unwrap();
+        assert_eq!(
+            pg.meta_pad.len(),
+            1,
+            "a known metadata tail records its padding as metadata free space"
+        );
+        assert!(pg.raw_pad.is_empty());
+    }
+
+    /// The reference C library's generic-large manager holds free space of *both*
+    /// page types, so a section from it is only reusable when it covers whole
+    /// aligned pages.
+    ///
+    /// `H5F_MEM_PAGE_GENERIC` is aliased to `H5F_MEM_PAGE_LARGE_SUPER` and
+    /// commented in the C library's own header as *"large-sized generic: meta and
+    /// raw"*. Under paged aggregation on a contiguous-address driver — the default
+    /// — `H5MF__alloc_to_fs_type` sends **every** allocation of a page or more
+    /// there whatever its type, and `H5MF__alloc_pagefs` then records that
+    /// allocation's page-alignment tail as a free section in the same manager. The
+    /// tail is smaller than a page and sits in a page whose earlier bytes are the
+    /// live object, so filing it as raw and handing it to chunk data would put raw
+    /// bytes inside a metadata page.
+    ///
+    /// This measures that the C library really does write such a section — the
+    /// assertion is worthless if it does not — and then pins that this engine
+    /// keeps it out of reach: it is recorded, so a rewrite gives it back to the
+    /// manager it came from, but never offered to an allocation.
+    #[test]
+    // Builds the fixture with the reference HDF5 C library (`hdf5-metno`), a
+    // 64-bit little-endian-only dev-dependency; skip elsewhere so the lib tests
+    // still run there.
+    #[cfg(all(not(target_pointer_width = "32"), target_endian = "little"))]
+    fn a_generic_large_section_is_only_reusable_as_whole_pages() {
+        use hdf5::plist::file_create::FileSpaceStrategy as CStrategy;
+        use tempfile::tempdir;
+
+        const PAGE: u64 = 512;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("c_generic_large.h5");
+        {
+            let f = hdf5::FileBuilder::new()
+                .with_fapl(|fapl| fapl.libver_v110())
+                .with_fcpl(|fcpl| {
+                    fcpl.file_space_strategy(CStrategy::FreeSpaceManager {
+                        paged: true,
+                        persist: true,
+                        threshold: 1,
+                    })
+                    .file_space_page_size(PAGE)
+                })
+                .create(&path)
+                .unwrap();
+            let ds = f.new_dataset::<f64>().shape((64,)).create("d").unwrap();
+            ds.write_raw(&vec![1.0f64; 64]).unwrap();
+            // One attribute far larger than a page, so the object-header chunk
+            // holding it is a "large" *metadata* allocation.
+            let a = ds
+                .new_attr::<i64>()
+                .shape((512,))
+                .create("big_attr")
+                .unwrap();
+            a.write_raw(&vec![7i64; 512]).unwrap();
+            f.close().unwrap();
+        }
+
+        // The premise: at least one section in the generic-large manager (slot 6)
+        // is a sub-page fragment. Read the managers slot by slot, since the
+        // flattened public view cannot say which manager a section came from.
+        let opened = crate::reader::File::open(&path).unwrap();
+        let info = opened.file_space_info().expect("a persisting file").clone();
+        drop(opened);
+        assert_eq!(info.page_size, PAGE);
+        let bytes = std::fs::read(&path).unwrap();
+        let src = crate::source::BytesSource::new(bytes.as_slice());
+        let slot6 = info.manager_addrs[6];
+        assert_ne!(slot6, UNDEF, "the C library populated the large manager");
+        let (sections, _) =
+            free_space_manager::read_persisted_sections_source(&src, &[slot6], 0, 8).unwrap();
+        let fragments: Vec<&FreeSection> = sections
+            .iter()
+            .filter(|s| s.addr % PAGE != 0 || s.size % PAGE != 0)
+            .collect();
+        assert!(
+            !fragments.is_empty(),
+            "the premise of this test: the C library files sub-page fragments in \
+             its generic-large manager, but this file has none ({sections:?})"
+        );
+
+        // The behavior: every such fragment is recorded but unreachable, and only
+        // whole aligned pages from that manager are placeable.
+        let s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+        let pg = s.paged.as_ref().expect("a paged file installs paged state");
+        let unclassified = pg.unclassified.sections();
+        let reusable = pg.reusable_sections();
+        for f in &fragments {
+            assert!(
+                unclassified.contains(&(f.addr, f.size)),
+                "fragment ({}, {}) must be recorded as unclassified, not lost",
+                f.addr,
+                f.size
+            );
+            assert!(
+                !reusable
+                    .iter()
+                    .any(|&(a, l)| a < f.addr + f.size && f.addr < a + l),
+                "fragment ({}, {}) must not be offered to any allocation: {reusable:?}",
+                f.addr,
+                f.size
+            );
+        }
+    }
+
+    /// A paged allocation may only be served from the free list of its own page
+    /// type.
+    ///
+    /// This is the allocation-side half of the rule
+    /// [`paged_open_seeds_each_manager_by_slot`] pins on the seeding side, and it
+    /// is just as invisible from the outside: handing a raw allocation a metadata
+    /// hole puts chunk bytes inside a metadata page, which every reader — this
+    /// crate's and the reference library's — resolves correctly, since the file's
+    /// addresses all still point where they should. Only the paging degrades. So
+    /// assert the choice directly, in both directions, with a same-type control
+    /// proving the free region really was big enough to be taken.
+    #[test]
+    fn a_paged_allocation_never_draws_from_the_other_page_type() {
+        use crate::writer::FileBuilder;
+        use tempfile::tempdir;
+
+        const PAGE: u64 = 4096;
+
+        /// A paged session whose free lists hold exactly one region each, of the
+        /// page types named. Both regions are interior, so an allocation that
+        /// takes one is distinguishable from one that appends.
+        fn session(
+            path: &std::path::Path,
+            meta: Option<(u64, u64)>,
+            raw: Option<(u64, u64)>,
+        ) -> WriteEngine {
+            let mut b = FileBuilder::new();
+            b.create_dataset("d")
+                .with_i32_data(&(0..4000).collect::<Vec<i32>>())
+                .with_shape(&[4000]);
+            b.with_file_space_strategy(FileSpaceStrategy::Page, true, 0)
+                .with_file_space_page_size(PAGE);
+            b.write(path).unwrap();
+            let mut s = WriteEngine::open_with_locking(path, FileLocking::Enabled).unwrap();
+            let pg = s.paged.as_mut().expect("a paged file installs paged state");
+            pg.meta = FreeList::new();
+            pg.raw = FreeList::new();
+            if let Some((addr, len)) = meta {
+                pg.meta.free(addr, len);
+            }
+            if let Some((addr, len)) = raw {
+                pg.raw.free(addr, len);
+            }
+            s
+        }
+
+        let dir = tempdir().unwrap();
+        // Two interior page-aligned regions, well inside the file the builder
+        // wrote (16 KiB of raw data alone), so either could physically hold the
+        // request and only the page-type rule decides.
+        let hole_a = (PAGE, PAGE);
+        let hole_b = (2 * PAGE, PAGE);
+
+        // Raw request, only metadata free: appends rather than mixing the page.
+        let mut s = session(&dir.path().join("a.h5"), Some(hole_a), None);
+        assert!(
+            matches!(
+                s.reserve(1024, PageType::Raw).unwrap(),
+                Placement::Appended { .. }
+            ),
+            "a raw allocation must not be served out of the metadata free list"
+        );
+        drop(s);
+
+        // Metadata request, only raw free: likewise.
+        let mut s = session(&dir.path().join("b.h5"), None, Some(hole_b));
+        assert!(
+            matches!(
+                s.reserve(1024, PageType::Meta).unwrap(),
+                Placement::Appended { .. }
+            ),
+            "a metadata allocation must not be served out of the raw free list"
+        );
+        drop(s);
+
+        // The control: with the matching type free, the same request is reused —
+        // so the two refusals above are the page-type rule, not a size failure.
+        let mut s = session(&dir.path().join("c.h5"), Some(hole_a), Some(hole_b));
+        assert!(
+            matches!(
+                s.reserve(1024, PageType::Raw).unwrap(),
+                Placement::Reused { addr, .. } if addr == hole_b.0
+            ),
+            "a raw allocation takes the raw hole"
+        );
+        assert!(
+            matches!(
+                s.reserve(1024, PageType::Meta).unwrap(),
+                Placement::Reused { addr, .. } if addr == hole_a.0
+            ),
+            "a metadata allocation takes the metadata hole"
+        );
     }
 
     /// Deleting a chunked dataset from a paged file must not record its freed
@@ -8296,7 +8948,7 @@ mod tests {
             }
         }
         // The index really was reclaimed somewhere, so this is not vacuous.
-        let reclaimed: u64 = pg.all_sections().iter().map(|&(_, l)| l).sum();
+        let reclaimed: u64 = pg.reusable_sections().iter().map(|&(_, l)| l).sum();
         assert!(reclaimed > 0, "the delete reclaimed nothing");
     }
 
@@ -8372,6 +9024,89 @@ mod tests {
             freed < live_end,
             "the recorded free space cannot cover the whole file"
         );
+    }
+
+    /// A commit that writes into reused free space and then dies must leave the
+    /// file exactly as it found it.
+    ///
+    /// This is the safety argument for reuse, stated as a test: a commit may
+    /// overwrite a freed region *before* the superblock repoint precisely because
+    /// nothing reachable from the on-disk root lives there any more, so an attempt
+    /// that never reaches the repoint is invisible. A chunked dataset is the case
+    /// worth pinning — it is the largest thing a commit places, so it overwrites
+    /// the most, and it is the one that used only to append.
+    ///
+    /// The failure is induced the same way as
+    /// [`failed_paged_commit_leaves_the_free_lists_untouched`]: an unreadable
+    /// superblock extension, which the persisting tail hits *after* the apply loop
+    /// has written every object.
+    #[test]
+    fn a_failed_commit_that_reused_free_space_leaves_the_file_intact() {
+        use crate::writer::FileBuilder;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("reuse_failed_commit.h5");
+        let victim: Vec<f64> = (0..4096).map(|i| (i % 13) as f64).collect();
+        let ceiling: Vec<i32> = (0..500).collect();
+        let mut b = FileBuilder::new();
+        b.create_dataset("keep").with_i32_data(&[1, 2, 3]);
+        b.create_dataset("victim")
+            .with_f64_data(&victim)
+            .with_shape(&[4096])
+            .with_chunks(&[512]);
+        // Above the victim, so the delete leaves an interior hole and the reuse
+        // has live bytes on both sides of what it overwrites.
+        b.create_dataset("ceiling")
+            .with_i32_data(&ceiling)
+            .with_shape(&[500]);
+        b.with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 1);
+        b.write(&path).unwrap();
+
+        let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+        s.delete("/victim");
+        s.commit().unwrap();
+        let free_before = s.space_accounting().reusable_free_space;
+        let len_before = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            free_before.iter().any(|&(_, l)| l > 4096 * 8 / 2),
+            "the deleted chunked dataset left a hole worth reusing: {free_before:?}"
+        );
+
+        // Break the extension so the commit fails in its persisting tail, after
+        // the apply loop has written the new dataset into that hole.
+        s.superblock.superblock_extension_address = Some(0);
+        let mut db = crate::type_builders::DatasetBuilder::new("fresh");
+        db.with_f64_data(&vec![7.5f64; 4096])
+            .with_shape(&[4096])
+            .with_chunks(&[512]);
+        s.stage_created_dataset("/fresh", db);
+        assert!(
+            s.commit().is_err(),
+            "a commit with an unreadable extension must fail"
+        );
+        assert_eq!(
+            s.space_accounting().reusable_free_space,
+            free_before,
+            "the failed commit gives back the region it drew from"
+        );
+        // Release the session's exclusive OS lock before reading the file back;
+        // those locks are mandatory on Windows.
+        drop(s);
+
+        // The file still describes the tree the last *successful* commit left: the
+        // survivors read exactly, the half-written dataset is not linked, and the
+        // superblock's end-of-file still matches the file.
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), len_before);
+        let f = crate::reader::File::open(&path).unwrap();
+        assert_eq!(f.file_size(), len_before);
+        assert_eq!(
+            f.dataset("keep").unwrap().read_i32().unwrap(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(f.dataset("ceiling").unwrap().read_i32().unwrap(), ceiling);
+        assert!(f.dataset("victim").is_err());
+        assert!(f.dataset("fresh").is_err());
     }
 
     #[test]
@@ -9272,10 +10007,10 @@ mod tests {
         engine.commit().unwrap();
 
         // The commit padded the raw tail before laying down metadata, and folded
-        // that padding into the small-raw manager (`meta_pad`/`raw_pad` are cleared
-        // into the free lists as part of the paged tail).
+        // that padding into the raw list (`meta_pad`/`raw_pad` are cleared into the
+        // free lists as part of the paged tail).
         let pg = engine.paged.as_ref().expect("the file is paged");
-        let raw_free = pg.raw_small.sections();
+        let raw_free = pg.raw.sections();
         assert!(
             !raw_free.is_empty(),
             "the commit packed metadata into the raw page the append left open"
