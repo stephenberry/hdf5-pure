@@ -170,6 +170,8 @@ Combined with a [streaming open](streaming.md#reading-a-large-dataset-a-window-a
 
 `File::root()` returns the root `Group`, and `File::group(path)` resolves a subgroup by path. A `Group` lists its children with `groups()` and `datasets()` (each returning `Vec<String>` of names), opens a child dataset with `dataset(name)`, and opens a child subgroup with `group(name)`.
 
+To walk the members rather than list them, `iter_groups()` and `iter_datasets()` yield `(String, Group)` and `(String, Dataset)` pairs, enumerating the group once instead of once per member. They are for taking every member: reaching one you can already name stays cheaper through `dataset(name)`.
+
 ```rust
 use hdf5_pure::File;
 

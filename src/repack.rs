@@ -1391,8 +1391,7 @@ fn collect_addresses(
     prefix: &str,
     map: &mut HashMap<u64, String>,
 ) -> Result<(), Error> {
-    for name in group.datasets()? {
-        let ds = group.dataset(&name)?;
+    for (name, ds) in group.iter_datasets()? {
         map.insert(ds.header_address(), join(prefix, &name));
     }
     // A committed datatype is an object with an address like any other: a dataset
@@ -1402,8 +1401,7 @@ fn collect_addresses(
         let (_, address) = group.named_datatype_at(&name)?;
         map.insert(address, join(prefix, &name));
     }
-    for name in group.groups()? {
-        let child = group.group(&name)?;
+    for (name, child) in group.iter_groups()? {
         let child_path = join(prefix, &name);
         map.insert(child.header_address(), child_path.clone());
         collect_addresses(&child, &child_path, map)?;
