@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- `Dataset::buffered_appender` returns a `BufferedAppender` that holds appended elements in memory and writes them a whole chunk at a time, so a filtered dataset takes any append length; buffered elements reach the file only on `flush`, `finish`, or `discard`, and a SWMR session is refused ([#262](https://github.com/stephenberry/hdf5-pure/issues/262)).
+- A staged edit that would stop a live `BufferedAppender` from flushing — one naming its dataset or an ancestor, any edit at all while it still owes a realignment, or a second appender on the same dataset — is refused with `Error::EditUnsupported` at the call that makes it, rather than losing the buffered elements when the appender drops ([#262](https://github.com/stephenberry/hdf5-pure/issues/262)).
+
+### Changed
+
+- `Dataset::append` accepts a filtered append of any length, where it required a whole number of chunks; the dataset's own length must still be chunk-aligned ([#262](https://github.com/stephenberry/hdf5-pure/issues/262)).
+
 ### Fixed
 
 - A `File::open_rw` commit reuses freed space for a chunked dataset's chunk data and index, and for a dense attribute heap, where both were always appended at the end of the file; a replacement needs one free region large enough to hold it whole ([#261](https://github.com/stephenberry/hdf5-pure/issues/261)).

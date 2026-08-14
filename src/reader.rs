@@ -13,6 +13,7 @@ use crate::edit::{
 use crate::element::H5Element;
 use crate::type_builders::{DatasetBuilder, VL_REF_SIZE};
 
+use crate::appender::BufferedAppender;
 use crate::attribute::{extract_attributes_full, extract_attributes_full_from_source};
 use crate::chunk_cache::{ChunkCache, ChunkCacheConfig, ChunkCacheStats};
 use crate::compound::CompoundType;
@@ -1881,8 +1882,9 @@ impl File {
     /// This is the read-write sibling of [`open_streaming`](Self::open_streaming):
     /// reads are served by positioned I/O with the same capabilities as the
     /// streaming backend, while immediate [`Dataset::append`] runs the same
-    /// crash-atomic engine as [`open_rw`](Self::open_rw) — filtered whole-chunk
-    /// / unfiltered any-length, durable before it returns, no `commit` needed.
+    /// crash-atomic engine as [`open_rw`](Self::open_rw) — a filtered dataset
+    /// must start chunk-aligned, an unfiltered one need not — durable before it
+    /// returns, no `commit` needed.
     /// A large append is applied in whole-chunk batches, each crash-atomic, so
     /// a crash mid-call leaves a valid shorter dataset. An exclusive OS file
     /// lock is held for the file's life.
@@ -2036,8 +2038,7 @@ impl File {
     /// [`Error::ReadOnly`](crate::Error::ReadOnly).
     pub fn copy(&self, src: &str, dst: &str) -> Result<(), Error> {
         self.with_mirror_session(true, |session| {
-            session.copy(&normalize_path(src), &normalize_path(dst));
-            Ok(())
+            session.copy(&normalize_path(src), &normalize_path(dst))
         })
     }
 
@@ -2438,14 +2439,14 @@ impl StagedOp {
     /// Record this edit on the session. Applied in the order the closure made
     /// the calls, so a group is always staged before its own attributes and
     /// children.
-    fn apply(self, session: &mut WriteEngine) {
+    fn apply(self, session: &mut WriteEngine) -> Result<(), Error> {
         match self {
             StagedOp::CreateGroup(path) => session.create_group(&path),
             StagedOp::SetGroupAttr { path, name, value } => {
-                session.set_group_attr(&path, &name, value);
+                session.set_group_attr(&path, &name, value)
             }
             StagedOp::CreateDataset { path, builder } => {
-                session.stage_created_dataset(&path, *builder);
+                session.stage_created_dataset(&path, *builder)
             }
         }
     }
@@ -2923,10 +2924,7 @@ impl Group {
     /// [`File::commit`]. See [`create_group`](Self::create_group) for the
     /// file-mode rules.
     pub fn delete(&self, name: &str) -> Result<(), Error> {
-        self.with_child_session(name, |session, child| {
-            session.delete(child);
-            Ok(())
-        })
+        self.with_child_session(name, |session, child| session.delete(child))
     }
 
     /// Add or update a compact attribute on this group, staged until
@@ -2938,19 +2936,13 @@ impl Group {
     /// for compact storage, or a group using dense (fractal-heap) attribute
     /// storage, is refused on [`File::commit`].
     pub fn set_attr(&self, name: &str, value: AttrValue) -> Result<(), Error> {
-        self.with_own_session(|session, path| {
-            session.set_group_attr(path, name, value);
-            Ok(())
-        })
+        self.with_own_session(|session, path| session.set_group_attr(path, name, value))
     }
 
     /// Remove a compact attribute from this group, staged until [`File::commit`].
     /// See [`set_attr`](Self::set_attr) for the file-mode rules.
     pub fn remove_attr(&self, name: &str) -> Result<(), Error> {
-        self.with_own_session(|session, path| {
-            session.remove_group_attr(path, name);
-            Ok(())
-        })
+        self.with_own_session(|session, path| session.remove_group_attr(path, name))
     }
 
     /// Run `f` with the writable session and the root-relative path of child
@@ -2997,7 +2989,7 @@ impl Group {
         };
         let mut session = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for op in ops {
-            op.apply(&mut session);
+            op.apply(&mut session)?;
         }
         Ok(())
     }
@@ -3071,9 +3063,11 @@ impl Dataset {
     /// The file must have been opened for writing with [`File::open_rw`] or
     /// [`File::open_rw_bounded`]; a read-only file returns
     /// [`Error::ReadOnly`](crate::Error::ReadOnly). The target must be a chunked,
-    /// rank-1, unlimited, Extensible-Array-indexed dataset, and filtered datasets
-    /// take whole chunks where unfiltered ones take any length; anything else
-    /// returns
+    /// rank-1, unlimited, Extensible-Array-indexed dataset, and a filtered one
+    /// must already be a whole number of chunks long — growing a trailing chunk
+    /// a reader can see is not power-loss atomic, where an unfiltered dataset
+    /// may be any length. The *appended* length is unconstrained either way;
+    /// anything else returns
     /// [`Error::AppendInPlaceUnsupported`](crate::Error::AppendInPlaceUnsupported).
     /// The append is immediate and crash-atomic (no `commit` needed).
     ///
@@ -3126,10 +3120,138 @@ impl Dataset {
         }
     }
 
+    /// A [`BufferedAppender`] over this dataset: appended elements are held in
+    /// memory and written a whole chunk at a time, so a caller appending less
+    /// than a chunk per call writes to the file once per chunk instead of once
+    /// per call — and can append to a *filtered* dataset by any length, which
+    /// [`append`](Self::append) refuses.
+    ///
+    /// Every eligibility rule [`append`](Self::append) applies is applied here,
+    /// so an ineligible dataset is reported now rather than on the first write.
+    /// Buffered elements are not in the file until the appender flushes; see
+    /// [`BufferedAppender`] for the full bargain.
+    pub fn buffered_appender(&mut self) -> Result<BufferedAppender<'_>, Error> {
+        BufferedAppender::new(self)
+    }
+
+    /// Register a live `BufferedAppender` on this dataset with the session, so a
+    /// staged edit that would stop it from flushing is refused at the call that
+    /// creates the conflict rather than in the appender's `Drop`.
+    pub(crate) fn claim_for_appender(&self, needs_commit: bool) -> Result<u64, Error> {
+        let Backend::Edit(m) = &self.file.backend else {
+            return Err(Error::ReadOnly);
+        };
+        m.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .claim_for_appender(self.path.as_deref(), needs_commit)
+    }
+
+    /// Record whether the live appender still owes a staged realignment.
+    pub(crate) fn set_appender_needs_commit(&self, token: u64, needs_commit: bool) {
+        if let Backend::Edit(m) = &self.file.backend {
+            m.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .set_appender_needs_commit(token, needs_commit);
+        }
+    }
+
+    /// Release the claim taken by [`claim_for_appender`](Self::claim_for_appender).
+    pub(crate) fn release_appender_claim(&self, token: u64) {
+        if let Backend::Edit(m) = &self.file.backend {
+            m.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .release_appender_claim(token);
+        }
+    }
+
+    /// Whether this dataset's session is the SWMR writer, whose append rules are
+    /// a strict subset of the ordinary ones. `false` for a read-only file, which
+    /// has no session to ask.
+    pub(crate) fn session_is_swmr(&self) -> bool {
+        match &self.file.backend {
+            Backend::Edit(m) => m
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_swmr(),
+            _ => false,
+        }
+    }
+
+    /// Immediate in-place append of an already-gathered builder, used by
+    /// [`BufferedAppender`], whose bytes are materialized in its buffer before
+    /// it decides how many of them to write. `append_batches` exists for the
+    /// opposite case — a caller whose bytes are cheaper to build per batch — so
+    /// this hands the engine one builder and lets it batch the plan.
+    pub(crate) fn append_prebuilt(&mut self, b: &AppendBuilder) -> Result<(), Error> {
+        let Backend::Edit(m) = &self.file.backend else {
+            return Err(Error::ReadOnly);
+        };
+        self.file.check_mutable(false)?;
+        {
+            let mut engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            engine.append_inplace_gathered(self.append_target(), b, 4)?;
+        }
+        self.header = self.file.parse_header(self.address)?;
+        // Same staleness rule as `append_batches`: the append extended the chunk
+        // index this handle may have cached.
+        self.chunk_cache.clear();
+        Ok(())
+    }
+
+    /// Stage an append and commit it in the same lock, used by
+    /// [`BufferedAppender`] for the one case in-place growth cannot serve: a
+    /// filtered dataset whose trailing chunk is partial. Refused while the
+    /// session holds unrelated staged edits, which this commit would otherwise
+    /// publish as a side effect of an append.
+    pub(crate) fn append_staged_committed(&mut self, b: AppendBuilder) -> Result<(), Error> {
+        // A path-less handle (reached by object reference) cannot be named to the
+        // staging surface at all. Say that, rather than the `ReadOnly` that
+        // `check_staged_edit` reports for the same condition — the file is not
+        // read-only, and telling the caller to reopen it read-write is advice
+        // they have already taken.
+        let path = self.path.clone().ok_or(Error::AppendInPlaceUnsupported(
+            "this dataset handle was reached by object reference and has no path, so the \
+                 staged rewrite that grows a filtered dataset's partial trailing chunk cannot \
+                 name it; re-open the dataset by path",
+        ))?;
+        self.check_staged_edit()?;
+        let Backend::Edit(m) = &self.file.backend else {
+            return Err(Error::ReadOnly);
+        };
+        self.file.check_mutable(true)?;
+        {
+            let mut engine = m.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if engine.has_staged_edits() {
+                // The same variant the engine's own two staged-conflict refusals
+                // use (`append_prepare`), so a caller catching that one to fall
+                // back on `append_staged` catches this one too.
+                return Err(Error::AppendInPlaceUnsupported(
+                    "a buffered append onto a filtered dataset with a partial trailing chunk \
+                     must commit, and this session holds other staged edits; commit the staged \
+                     edits before appending, or use Dataset::append_staged",
+                ));
+            }
+            // Suspend this appender's own claim: it is the reason no other
+            // edit may be staged, and it must not refuse its own realignment.
+            engine.within_appender_commit(|e| {
+                e.stage_dataset_append(&path, b)?;
+                e.commit()
+            })?;
+        }
+        // A commit rewrites and *relocates* object headers, so unlike every other
+        // `with_session_mut` caller this handle's cached address is stale as well
+        // as its header. Re-resolve by path before touching either; parsing the
+        // vacated address would read whatever the commit left there.
+        self.address = self.file.resolve_path(&path)?;
+        self.header = self.file.parse_header(self.address)?;
+        self.chunk_cache.clear();
+        Ok(())
+    }
+
     /// Fetch (locating on first use) this dataset's append geometry from the
     /// write session, which also applies every refusal that does not depend on
     /// the bytes being appended.
-    fn append_geometry(&self) -> Result<AppendGeometry, Error> {
+    pub(crate) fn append_geometry(&self) -> Result<AppendGeometry, Error> {
         let Backend::Edit(m) = &self.file.backend else {
             return Err(Error::ReadOnly);
         };
@@ -3159,13 +3281,16 @@ impl Dataset {
         let Backend::Edit(m) = &self.file.backend else {
             return Err(Error::ReadOnly);
         };
-        // Atomic refusal before any batch: a filtered append must be
-        // whole-chunk (the engine re-checks per batch as a backstop).
-        if g.filtered && (g.current_dim % g.chunk_elems != 0 || total_elems % g.chunk_elems != 0) {
+        // Atomic refusal before any batch: a filtered append must start
+        // chunk-aligned (the engine re-checks per batch as a backstop). The
+        // appended length is unconstrained — an unaligned remainder is always the
+        // last batch, and its chunk is a fresh element no reader can see yet.
+        if g.filtered && g.current_dim % g.chunk_elems != 0 {
             return Err(Error::AppendInPlaceUnsupported(
-                "a filtered dataset can only be appended in place in whole chunks (the current \
-                 length and the appended length must both be multiples of the chunk length); \
-                 use Dataset::append_staged for a non-chunk-aligned filtered append",
+                "a filtered dataset whose length is not a whole multiple of the chunk length \
+                 cannot be appended in place: growing its trailing partial chunk would repoint \
+                 an index element a reader can already see. Use Dataset::append_staged, or a \
+                 BufferedAppender, which keeps the on-disk length chunk-aligned",
             ));
         }
         let mut dim = g.current_dim;
@@ -3208,8 +3333,7 @@ impl Dataset {
         let mut builder = DatasetBuilder::new("");
         T::write_into(&mut builder, data);
         self.with_session_mut(true, |session, path| {
-            session.stage_dataset_write(path, builder);
-            Ok(())
+            session.stage_dataset_write(path, builder)
         })
     }
 
@@ -3246,8 +3370,7 @@ impl Dataset {
         let mut builder = DatasetBuilder::new("");
         build(&mut builder);
         self.with_session_mut(true, |session, path| {
-            session.stage_dataset_write(path, builder);
-            Ok(())
+            session.stage_dataset_write(path, builder)
         })
     }
 
@@ -3255,9 +3378,10 @@ impl Dataset {
     /// index-rebuilding counterpart of the immediate [`append`](Self::append).
     ///
     /// Unlike [`append`](Self::append) (immediate, amortized `O(1)`,
-    /// Extensible-Array only, unfiltered any-length / filtered whole-chunk), this
-    /// rebuilds the chunk index on commit and so also grows **filtered** datasets
-    /// by any length (a trailing partial chunk is rewritten) and datasets whose
+    /// Extensible-Array only, and refused on a filtered dataset whose length is
+    /// not already a whole number of chunks), this rebuilds the chunk index on
+    /// commit and so also grows **filtered** datasets from any length (the
+    /// trailing partial chunk is rewritten) and datasets whose
     /// Extensible-Array index is not yet allocated. Configure the appended
     /// elements through `build` on the [`AppendBuilder`]; repeated calls within
     /// the builder concatenate in order. The dataset must be chunked, unlimited
@@ -3275,8 +3399,7 @@ impl Dataset {
         let mut builder = AppendBuilder::new();
         build(&mut builder);
         self.with_session_mut(true, |session, path| {
-            session.stage_dataset_append(path, builder);
-            Ok(())
+            session.stage_dataset_append(path, builder)
         })
     }
 
@@ -3287,8 +3410,7 @@ impl Dataset {
     /// [`Error::ReadOnly`](crate::Error::ReadOnly).
     pub fn set_attr(&mut self, name: &str, value: AttrValue) -> Result<(), Error> {
         self.with_session_mut(true, |session, path| {
-            session.set_dataset_attr(path, name, value);
-            Ok(())
+            session.set_dataset_attr(path, name, value)
         })
     }
 
@@ -3296,8 +3418,7 @@ impl Dataset {
     /// [`File::commit`]. See [`set_attr`](Self::set_attr) for the file-mode rules.
     pub fn remove_attr(&mut self, name: &str) -> Result<(), Error> {
         self.with_session_mut(true, |session, path| {
-            session.remove_dataset_attr(path, name);
-            Ok(())
+            session.remove_dataset_attr(path, name)
         })
     }
 

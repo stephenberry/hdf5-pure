@@ -903,10 +903,12 @@ pub(crate) struct AppendPlan {
 /// and the new dimension / chunk count. Shared by the general append writer and
 /// the in-place edit engine's in-place append so the read/plan logic lives in one place.
 ///
-/// A *filtered* dataset can only be appended in whole chunks: a non-chunk-aligned
-/// filtered append is refused here rather than repointing a multi-field trailing
-/// element whose in-place overwrite is not power-loss atomic; use
-/// [`Dataset::append_staged`](crate::Dataset::append_staged) for that.
+/// A *filtered* dataset must already be a whole number of chunks long: growing
+/// its trailing partial chunk is refused here rather than repointing a
+/// multi-field element a reader can already see, whose in-place overwrite is not
+/// power-loss atomic. The appended length is unconstrained — see the refusal
+/// itself for why. Use [`Dataset::append_staged`](crate::Dataset::append_staged)
+/// or a [`BufferedAppender`](crate::BufferedAppender) for the refused case.
 pub(crate) fn plan_ea_append<F: Store>(
     file: &F,
     loc: &Located,
@@ -927,19 +929,27 @@ pub(crate) fn plan_ea_append<F: Store>(
     let n_full = current_dim / chunk_elems;
     let has_partial = current_dim % chunk_elems != 0;
 
-    // Filtered appends must be chunk-aligned. Growing a *filtered* partial trailing
-    // chunk would repoint that chunk's existing index element in place, and a
-    // filtered element is a multi-field record (address + compressed_size +
+    // A filtered append must start chunk-aligned. Growing a *filtered* partial
+    // trailing chunk would repoint that chunk's existing index element in place,
+    // and a filtered element is a multi-field record (address + compressed_size +
     // filter_mask) that is visible at the old dimension before the commit — so a
     // power-loss crash tearing that record across a disk sector could leave the
     // committed view unreadable. The trailing element of an *unfiltered* dataset is
-    // a single address whose overwrite is atomic, so any-length unfiltered appends
-    // are allowed.
-    if pipeline.is_some() && (has_partial || new_elems % chunk_elems != 0) {
+    // a single address whose overwrite is atomic, so an unfiltered append may start
+    // anywhere.
+    //
+    // The appended *length* need not be a chunk multiple either way. An unaligned
+    // length only makes the last chunk this append writes a partial one, and that
+    // chunk's index element is a fresh insert past the old dimension — invisible
+    // until phase 4 publishes the new dimension, exactly like every whole chunk
+    // beside it. It is the rewrite of an already-visible element that is refused,
+    // not the partial chunk itself.
+    if pipeline.is_some() && has_partial {
         return Err(Error::AppendUnsupported(
-            "a filtered dataset can only be appended in place in whole chunks (the current \
-             length and the appended length must both be multiples of the chunk length); \
-             use Dataset::append_staged for a non-chunk-aligned filtered append",
+            "a filtered dataset whose length is not a whole multiple of the chunk length \
+             cannot be appended in place: growing its trailing partial chunk would repoint \
+             an index element a reader can already see. Use Dataset::append_staged, or a \
+             BufferedAppender, which keeps the on-disk length chunk-aligned",
         ));
     }
 
