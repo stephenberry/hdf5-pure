@@ -79,15 +79,21 @@ fn filtered_whole_chunk() {
 }
 
 #[test]
-fn filtered_unaligned_refused() {
+fn filtered_onto_a_partial_trailing_chunk_refused() {
     let dir = tempdir().unwrap();
     let p = dir.path().join("d.h5");
     build(&p, "d", 8, 4, true);
 
     let s = File::open_rw(&p).unwrap();
-    // Not a whole chunk (2 of 4): a filtered element cannot be repointed atomically.
-    let err = s.dataset("d").unwrap().append(&[8, 9]).unwrap_err();
+    // Not a whole chunk (2 of 4), but the dataset starts on a boundary, so this
+    // only inserts a new partial chunk no reader can see yet: allowed.
+    s.dataset("d").unwrap().append(&[8, 9]).unwrap();
+    // Now the trailing chunk is partial and visible, and growing it would
+    // repoint a filtered index element, which is not power-loss atomic.
+    let err = s.dataset("d").unwrap().append(&[10, 11]).unwrap_err();
     assert!(matches!(err, Error::AppendInPlaceUnsupported(_)));
+    drop(s);
+    assert_eq!(read_i32(&p, "d"), (0..10).collect::<Vec<_>>());
 }
 
 // ---- interleave with staged tree edits --------------------------------------

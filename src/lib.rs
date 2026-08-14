@@ -203,6 +203,7 @@ pub(crate) mod nosync;
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "std")]
+pub(crate) mod appender;
 #[cfg(feature = "std")]
 pub(crate) mod chunk_index_inplace;
 #[cfg(feature = "std")]
@@ -276,6 +277,9 @@ pub use types::{AttrValue, DType};
 
 #[cfg(feature = "std")]
 pub use writer::FileBuilder;
+
+#[cfg(feature = "std")]
+pub use appender::BufferedAppender;
 
 #[cfg(feature = "std")]
 pub use edit::{AppendBuilder, EditBacking, MemoryStrategy, SpaceAccounting};

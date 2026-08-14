@@ -116,7 +116,7 @@
 //!   crash-atomic, no `commit`), interleaved with the staged edits above. A
 //!   target the fast path cannot handle — a userblock or pre-v2 file, an
 //!   unallocated index, a non-Extensible-Array or multi-hard-link dataset, a
-//!   non-chunk-aligned filtered append — is refused with
+//!   a filtered dataset sitting on a partial trailing chunk — is refused with
 //!   [`Error::AppendInPlaceUnsupported`]; use the staged `append_dataset` instead.
 //!
 //! # Free-space reuse (issue #21)
@@ -267,6 +267,27 @@ const OH_PREFIX_MAX: usize = 34;
 /// group is the empty vector.
 type PathKey = Vec<String>;
 
+/// A live [`BufferedAppender`](crate::BufferedAppender)'s hold on a dataset.
+///
+/// The appender accepts elements into memory and is the only thing that can
+/// write them, so any staged edit that would make its flush refuse turns
+/// accepted data into lost data at drop time. The claim lets the engine refuse
+/// that edit up front instead.
+struct AppenderClaim {
+    /// Identifies this claim for release; ids are never reused within a session.
+    token: u64,
+    /// The appender's dataset path, or `None` for a handle reached by object
+    /// reference. Such a handle is named by object-header address, which *any*
+    /// staged edit may move, so a path-less claim conflicts with everything —
+    /// exactly the rule `append_prepare` already applies to that target.
+    path: Option<PathKey>,
+    /// Whether this appender still owes a staged, index-rebuilding realignment
+    /// (a filtered dataset sitting on a partial trailing chunk). That write
+    /// commits, and a commit refuses to run beside unrelated staged edits, so
+    /// while it is outstanding the claim conflicts with everything.
+    needs_commit: bool,
+}
+
 /// Variable-length group/root attributes staged by [`apply_group_attr_ops`],
 /// each an (attribute message still carrying a placeholder heap address, its
 /// global heap collections) pair, resolved in the apply loop.
@@ -318,6 +339,41 @@ impl AppendBuilder {
     /// Whether two typed appends implied conflicting element datatypes.
     pub(crate) fn dt_conflict(&self) -> bool {
         self.dt_conflict
+    }
+
+    /// A builder holding a copy of this one's first `byte_len` bytes, carrying
+    /// the same element datatype so the prefix is type-checked exactly as the
+    /// whole would have been. Used by [`BufferedAppender`](crate::BufferedAppender)
+    /// to write out the chunk-aligned prefix of its buffer; it copies rather
+    /// than splits so a failed write leaves the buffer intact and the appender
+    /// can report precisely which elements did not land.
+    pub(crate) fn head(&self, byte_len: usize) -> Self {
+        Self {
+            raw: self.raw[..byte_len.min(self.raw.len())].to_vec(),
+            elem_dt: self.elem_dt.clone(),
+            dt_conflict: self.dt_conflict,
+        }
+    }
+
+    /// Discard the first `byte_len` buffered bytes (a prefix that reached the
+    /// file), keeping the element datatype.
+    pub(crate) fn drop_front(&mut self, byte_len: usize) {
+        self.raw.drain(..byte_len.min(self.raw.len()));
+    }
+
+    /// Consume the builder, yielding its accumulated element bytes. Used by
+    /// [`BufferedAppender::discard`](crate::BufferedAppender::discard) to hand
+    /// abandoned elements back to the caller.
+    pub(crate) fn into_raw(self) -> Vec<u8> {
+        self.raw
+    }
+
+    /// Cut the buffer back to `byte_len` bytes, keeping the element datatype.
+    /// [`BufferedAppender`](crate::BufferedAppender) uses this to undo a call
+    /// whose write was refused before it touched the file, so the refusal leaves
+    /// nothing buffered and a retry cannot append the same elements twice.
+    pub(crate) fn truncate(&mut self, byte_len: usize) {
+        self.raw.truncate(byte_len);
     }
 
     /// Record the datatype a typed append implies, flagging a conflict if an
@@ -434,6 +490,19 @@ pub(crate) struct WriteEngine {
     pending_deletes: Vec<PathKey>,
     /// Object copies staged by `copy`, as (source path, destination full path).
     pending_copies: Vec<(PathKey, PathKey)>,
+    /// Datasets with a live [`BufferedAppender`](crate::BufferedAppender), which
+    /// holds accepted elements only it can write. A staged edit that would stop
+    /// that appender from flushing is refused while the claim stands, rather
+    /// than left to fail in the appender's `Drop`, where there is no caller to
+    /// report it to and the buffer is simply lost. See `refuse_if_claimed`.
+    appender_claims: Vec<AppenderClaim>,
+    /// Monotonic id for the next claim, so releasing one is exact even when two
+    /// appenders on different datasets are live at once.
+    next_appender_token: u64,
+    /// Set while an appender is driving its own staged realignment through
+    /// `stage_dataset_append` + `commit`, so its claim does not refuse its own
+    /// write. Re-entrancy only; never observable outside that call.
+    appender_commit_in_progress: bool,
     /// Cross-file object copies staged by `copy_from`, as (destination full path,
     /// the source subtree already read out of the other file). The subtree is read
     /// — and foreign-address-screened — eagerly in `copy_from` (the source file is
@@ -918,7 +987,8 @@ pub(crate) struct AppendGeometry {
     pub(crate) element_size: usize,
     /// Current length along the unlimited dimension.
     pub(crate) current_dim: u64,
-    /// Whether a filter pipeline applies (whole-chunk appends only).
+    /// Whether a filter pipeline applies (an in-place append then requires a
+    /// chunk-aligned starting length).
     pub(crate) filtered: bool,
     /// Whole-chunk elements in one full batch (>= one chunk's worth), or
     /// [`u64::MAX`] when the session does not batch.
@@ -1308,6 +1378,9 @@ impl WriteEngine {
             pending_deletes: Vec::new(),
             pending_copies: Vec::new(),
             pending_cross_copies: Vec::new(),
+            appender_claims: Vec::new(),
+            next_appender_token: 0,
+            appender_commit_in_progress: false,
             free: FreeList::new(),
             persist: None,
             located: HashMap::new(),
@@ -1548,10 +1621,16 @@ impl WriteEngine {
     /// variable-length-string payload (`with_vlen_strings`), or path-resolved
     /// object-reference elements (`with_path_references`; chunking any of
     /// these is not supported, and dense attributes remain unsupported).
-    pub(crate) fn stage_created_dataset(&mut self, path: &str, mut builder: DatasetBuilder) {
+    pub(crate) fn stage_created_dataset(
+        &mut self,
+        path: &str,
+        mut builder: DatasetBuilder,
+    ) -> Result<(), Error> {
+        self.refuse_if_claimed(&split_path(path))?;
         let mut comps = split_path(path);
         builder.name = comps.pop().unwrap_or_default();
         self.pending_datasets.push((comps, builder));
+        Ok(())
     }
 
     /// Stage an in-place overwrite of an **existing** dataset's values (the HDF5
@@ -1588,10 +1667,16 @@ impl WriteEngine {
     /// patched — exactly like an addition relocates the path up to the root. A
     /// relocating overwrite moves the object header, so it is refused unless the
     /// dataset has a single hard link.
-    pub(crate) fn stage_dataset_write(&mut self, path: &str, mut builder: DatasetBuilder) {
+    pub(crate) fn stage_dataset_write(
+        &mut self,
+        path: &str,
+        mut builder: DatasetBuilder,
+    ) -> Result<(), Error> {
+        self.refuse_if_claimed(&split_path(path))?;
         let comps = split_path(path);
         builder.name = comps.last().cloned().unwrap_or_default();
         self.pending_writes.push((comps, builder));
+        Ok(())
     }
 
     /// Stage an append of new elements to an **existing** chunked, unlimited
@@ -1629,8 +1714,123 @@ impl WriteEngine {
     /// [`Error::AppendUnsupported`]. Use [`Dataset::is_chunked`](crate::Dataset::is_chunked),
     /// [`maxshape`](crate::Dataset::maxshape), and [`filters`](crate::Dataset::filters)
     /// to check eligibility up front.
-    pub(crate) fn stage_dataset_append(&mut self, path: &str, builder: AppendBuilder) {
-        self.pending_appends.push((split_path(path), builder));
+    pub(crate) fn stage_dataset_append(
+        &mut self,
+        path: &str,
+        builder: AppendBuilder,
+    ) -> Result<(), Error> {
+        let comps = split_path(path);
+        self.refuse_if_claimed(&comps)?;
+        self.pending_appends.push((comps, builder));
+        Ok(())
+    }
+
+    /// Register a live [`BufferedAppender`](crate::BufferedAppender) on `path`
+    /// (`None` for a handle reached by object reference), returning the token
+    /// that releases it.
+    ///
+    /// Refused when the claim could not be honored: a second appender on the
+    /// same dataset would interleave the two buffers a chunk at a time, and a
+    /// staged edit already pending on that path — or any staged edit at all, when
+    /// the appender still owes a realignment — is one the appender's own flush
+    /// would later refuse.
+    pub(crate) fn claim_for_appender(
+        &mut self,
+        path: Option<&str>,
+        needs_commit: bool,
+    ) -> Result<u64, Error> {
+        let path = path.map(split_path);
+        if self
+            .appender_claims
+            .iter()
+            .any(|c| claims_conflict(c.path.as_deref(), path.as_deref()))
+        {
+            return Err(Error::EditUnsupported(
+                "this dataset already has a live buffered appender; two of them would interleave \
+                 their buffers a chunk at a time",
+            ));
+        }
+        let blocked = if needs_commit {
+            self.has_staged_edits()
+        } else {
+            match path.as_deref() {
+                Some(p) => self.append_conflicts_with_pending(p),
+                None => self.has_staged_edits() || self.committed,
+            }
+        };
+        if blocked {
+            return Err(Error::EditUnsupported(
+                "this session holds staged edits that would stop a buffered appender from \
+                 flushing; commit or discard them before opening one",
+            ));
+        }
+        let token = self.next_appender_token;
+        self.next_appender_token += 1;
+        self.appender_claims.push(AppenderClaim {
+            token,
+            path,
+            needs_commit,
+        });
+        Ok(token)
+    }
+
+    /// Record whether the claim still owes a staged realignment. The appender
+    /// calls this after every write, since flushing a partial trailing chunk on
+    /// a filtered dataset puts the debt back.
+    pub(crate) fn set_appender_needs_commit(&mut self, token: u64, needs_commit: bool) {
+        if let Some(c) = self.appender_claims.iter_mut().find(|c| c.token == token) {
+            c.needs_commit = needs_commit;
+        }
+    }
+
+    /// Drop a claim. Called from the appender's `Drop`, after its final flush.
+    pub(crate) fn release_appender_claim(&mut self, token: u64) {
+        self.appender_claims.retain(|c| c.token != token);
+    }
+
+    /// Run `f` with this session's claims suspended, so an appender's own staged
+    /// realignment is not refused by its own claim.
+    pub(crate) fn within_appender_commit<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        let prev = self.appender_commit_in_progress;
+        self.appender_commit_in_progress = true;
+        let out = f(self);
+        self.appender_commit_in_progress = prev;
+        out
+    }
+
+    /// Refuse a staged edit at `path` that a live appender could not survive.
+    ///
+    /// An appender holds elements a caller has already been told were accepted,
+    /// and only its own flush can write them; that flush goes through the
+    /// immediate append path, which refuses a dataset with a staged edit on it or
+    /// an ancestor. Left unchecked, staging such an edit turns accepted data into
+    /// data lost silently in `Drop`. Refusing here moves the failure to the call
+    /// that creates the conflict, where there is someone to report it to.
+    fn refuse_if_claimed(&self, path: &[String]) -> Result<(), Error> {
+        if self.appender_commit_in_progress {
+            return Ok(());
+        }
+        let conflicts = self.appender_claims.iter().any(|c| match &c.path {
+            // A claim owing a realignment needs a commit, and a commit refuses to
+            // run beside unrelated staged edits, so it conflicts with every path.
+            _ if c.needs_commit => true,
+            Some(p) => paths_overlap(p, path),
+            None => true,
+        });
+        if conflicts {
+            return Err(Error::EditUnsupported(
+                "this dataset has a live buffered appender holding elements only its own flush \
+                 can write, and this edit would stop that flush; finish or discard the appender \
+                 first",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether this session is the SWMR writer, whose append rules are a strict
+    /// subset of the ordinary ones (see `append_inplace_gathered`).
+    pub(crate) fn is_swmr(&self) -> bool {
+        self.swmr_mode
     }
 
     /// Whether any staged tree edit is still uncommitted. In-place appends
@@ -2076,15 +2276,18 @@ impl WriteEngine {
                 st.loc.current_dim,
             )
         };
-        // Refuse a non-chunk-aligned filtered append before ANY batch applies, so
-        // the refusal is as atomic as an unbatched one. Left to `plan_ea_append`
-        // it would surface only when the final (unaligned) batch was reached,
-        // after earlier batches had durably committed.
-        if filtered && (current_dim % chunk_elems != 0 || new_elems % chunk_elems != 0) {
+        // Refuse a filtered append onto an unaligned length before ANY batch
+        // applies, so the refusal is as atomic as an unbatched one. Left to
+        // `plan_ea_append` it would surface only when the first batch was reached.
+        // The appended length is unconstrained: `batch_elems` is a whole-chunk
+        // multiple, so an unaligned remainder can only ever be the *last* batch,
+        // by which point every earlier batch has left the length chunk-aligned.
+        if filtered && current_dim % chunk_elems != 0 {
             return Err(Error::AppendInPlaceUnsupported(
-                "a filtered dataset can only be appended in place in whole chunks (the current \
-                 length and the appended length must both be multiples of the chunk length); \
-                 use Dataset::append_staged for a non-chunk-aligned filtered append",
+                "a filtered dataset whose length is not a whole multiple of the chunk length \
+                 cannot be appended in place: growing its trailing partial chunk would repoint \
+                 an index element a reader can already see. Use Dataset::append_staged, or a \
+                 BufferedAppender, which keeps the on-disk length chunk-aligned",
             ));
         }
 
@@ -2201,8 +2404,11 @@ impl WriteEngine {
     /// [`commit`](Self::commit). The parent must already exist or be created in
     /// the same session; populate the group with datasets via
     /// [`create_dataset`](Self::create_dataset) using a path under it.
-    pub fn create_group(&mut self, path: &str) {
-        self.pending_groups.push(split_path(path));
+    pub fn create_group(&mut self, path: &str) -> Result<(), Error> {
+        let comps = split_path(path);
+        self.refuse_if_claimed(&comps)?;
+        self.pending_groups.push(comps);
+        Ok(())
     }
 
     /// Stage an attribute add or replacement on a group, applied on the next
@@ -2215,15 +2421,22 @@ impl WriteEngine {
     /// the rebuilt group header; an edit that would exceed the compact-attribute
     /// limit, or a group using dense (fractal-heap) attribute storage, is
     /// refused before any file bytes are changed.
-    pub fn set_group_attr(&mut self, path: &str, name: &str, value: AttrValue) -> &mut Self {
+    pub fn set_group_attr(
+        &mut self,
+        path: &str,
+        name: &str,
+        value: AttrValue,
+    ) -> Result<(), Error> {
+        let comps = split_path(path);
+        self.refuse_if_claimed(&comps)?;
         self.pending_group_attrs.push((
-            split_path(path),
+            comps,
             AttrOp::Set {
                 name: name.to_string(),
                 value,
             },
         ));
-        self
+        Ok(())
     }
 
     /// Stage removal of a compact attribute from a group, applied on the next
@@ -2232,14 +2445,16 @@ impl WriteEngine {
     /// `path` names the group to edit; `""` or `"/"` names the root group. The
     /// named attribute must exist in the committed group state after any earlier
     /// staged attribute operations for the same group have been applied.
-    pub fn remove_group_attr(&mut self, path: &str, name: &str) -> &mut Self {
+    pub fn remove_group_attr(&mut self, path: &str, name: &str) -> Result<(), Error> {
+        let comps = split_path(path);
+        self.refuse_if_claimed(&comps)?;
         self.pending_group_attrs.push((
-            split_path(path),
+            comps,
             AttrOp::Remove {
                 name: name.to_string(),
             },
         ));
-        self
+        Ok(())
     }
 
     /// Stage an attribute add or replacement on an **existing dataset**, applied on
@@ -2255,15 +2470,22 @@ impl WriteEngine {
     /// file bytes change. To set attributes on a dataset being *created* in this
     /// session, use the builder's [`set_attr`](crate::DatasetBuilder::set_attr)
     /// instead.
-    pub fn set_dataset_attr(&mut self, path: &str, name: &str, value: AttrValue) -> &mut Self {
+    pub fn set_dataset_attr(
+        &mut self,
+        path: &str,
+        name: &str,
+        value: AttrValue,
+    ) -> Result<(), Error> {
+        let comps = split_path(path);
+        self.refuse_if_claimed(&comps)?;
         self.pending_dataset_attrs.push((
-            split_path(path),
+            comps,
             AttrOp::Set {
                 name: name.to_string(),
                 value,
             },
         ));
-        self
+        Ok(())
     }
 
     /// Stage removal of a compact attribute from an **existing dataset**, applied on
@@ -2273,14 +2495,16 @@ impl WriteEngine {
     /// committed dataset state after any earlier staged attribute operations for the
     /// same dataset have been applied. Like [`set_dataset_attr`](Self::set_dataset_attr)
     /// it relocates the dataset header and requires a single hard link.
-    pub fn remove_dataset_attr(&mut self, path: &str, name: &str) -> &mut Self {
+    pub fn remove_dataset_attr(&mut self, path: &str, name: &str) -> Result<(), Error> {
+        let comps = split_path(path);
+        self.refuse_if_claimed(&comps)?;
         self.pending_dataset_attrs.push((
-            split_path(path),
+            comps,
             AttrOp::Remove {
                 name: name.to_string(),
             },
         ));
-        self
+        Ok(())
     }
 
     /// Stage removal of the link at `path` (the HDF5 `H5Ldelete`), applied on the
@@ -2305,8 +2529,11 @@ impl WriteEngine {
     /// edits into separate commits. The link's parent group must itself be
     /// editable in place (compact links, single-chunk header); the target being
     /// removed has no such restriction.
-    pub fn delete(&mut self, path: &str) {
-        self.pending_deletes.push(split_path(path));
+    pub fn delete(&mut self, path: &str) -> Result<(), Error> {
+        let comps = split_path(path);
+        self.refuse_if_claimed(&comps)?;
+        self.pending_deletes.push(comps);
+        Ok(())
     }
 
     /// Stage a deep copy of the object at `src` to a new link at `dst` (the HDF5
@@ -2325,8 +2552,14 @@ impl WriteEngine {
     /// links and attributes, single-chunk headers, and a chunk index this engine
     /// can enumerate (a version-2 B-tree, or a sparse/unallocated chunk grid, is
     /// refused) — otherwise `commit` reports [`Error::EditUnsupported`].
-    pub fn copy(&mut self, src: &str, dst: &str) {
-        self.pending_copies.push((split_path(src), split_path(dst)));
+    pub fn copy(&mut self, src: &str, dst: &str) -> Result<(), Error> {
+        let (s, d) = (split_path(src), split_path(dst));
+        // Both ends matter: the source is read and the destination is written,
+        // and a commit relocates headers along either path.
+        self.refuse_if_claimed(&s)?;
+        self.refuse_if_claimed(&d)?;
+        self.pending_copies.push((s, d));
+        Ok(())
     }
 
     /// Stage a deep copy of the object at `src` in another open file `source` to a
@@ -2402,6 +2635,7 @@ impl WriteEngine {
         // is borrowed; the owned tree carries every byte the commit will write. The
         // source is gated to base 0 above, so its stored addresses are absolute.
         let tree = Self::read_copy_subtree(&BytesSource::new(src_data), src_addr, 0, true, 0)?;
+        self.refuse_if_claimed(&dst)?;
         self.pending_cross_copies.push((dst, tree));
         Ok(())
     }
@@ -6583,10 +6817,20 @@ fn paths_overlap(a: &[String], b: &[String]) -> bool {
     a.starts_with(b) || b.starts_with(a)
 }
 
+/// Whether two appender claims cover the same dataset. A path-less claim (a
+/// handle reached by object reference) names its dataset by an address nothing
+/// else can compare against, so it conflicts with every other claim.
+fn claims_conflict(a: Option<&[String]>, b: Option<&[String]>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => x == y,
+        _ => true,
+    }
+}
+
 /// Re-tag a refusal from the shared append engine (`AppendUnsupported`) as the
 /// fast-path [`Error::AppendInPlaceUnsupported`], so a caller can catch it and fall
 /// back to the staged [`append_dataset`](WriteEngine::append_dataset) — which
-/// handles the non-chunk-aligned filtered case, index-geometry limits, and
+/// handles the filtered partial-trailing-chunk case, index-geometry limits, and
 /// platform-width limits that the engine reports this way. Genuine I/O and format
 /// errors pass through unchanged.
 pub(crate) fn as_inplace_error(e: Error) -> Error {
@@ -8362,6 +8606,63 @@ mod tests {
         }
     }
 
+    /// A *filtered* append whose length is not a whole number of chunks writes a
+    /// partial last chunk. That chunk's index element is a fresh insert past the
+    /// old dimension — the same position every whole chunk beside it occupies —
+    /// so stopping anywhere in the durability sequence must still read back as
+    /// the old prefix, exactly as an aligned filtered append does. This is the
+    /// case the in-place refusal used to cover and no longer does; without the
+    /// phase sweep, "it reads back fine" would only be testing phase 4.
+    #[test]
+    fn append_inplace_crash_consistency_filtered_partial_last_chunk() {
+        use crate::reader::File as PureFile;
+        use crate::writer::FileBuilder;
+        use tempfile::tempdir;
+
+        let build = |path: &std::path::Path, n: i32, chunk: u64| {
+            let data: Vec<i32> = (0..n).collect();
+            let mut b = FileBuilder::new();
+            b.create_dataset("d")
+                .with_i32_data(&data)
+                .with_shape(&[n as u64])
+                .with_maxshape(&[u64::MAX])
+                .with_chunks(&[chunk])
+                .with_shuffle()
+                .with_deflate(4);
+            b.write(path).unwrap();
+        };
+
+        // Aligned starts (a filtered append requires one), unaligned lengths:
+        // one that stays inside a single new chunk, and one that spans several
+        // and ends partway through the last.
+        for (n, chunk, add) in [(8i32, 4u64, 2i32), (8, 4, 9), (0, 4, 3)] {
+            let dir = tempdir().unwrap();
+            let base = dir.path().join("base.h5");
+            build(&base, n, chunk);
+
+            for max_phase in 1u8..=4 {
+                let p = dir
+                    .path()
+                    .join(format!("crash_f_{n}_{chunk}_{max_phase}.h5"));
+                std::fs::copy(&base, &p).unwrap();
+                {
+                    let mut s = WriteEngine::open_with_locking(&p, FileLocking::Enabled).unwrap();
+                    s.append_inplace_i32_phased("d", &(n..n + add).collect::<Vec<_>>(), max_phase)
+                        .unwrap();
+                    // session dropped here, simulating a crash after `max_phase`
+                }
+                let expected_len = if max_phase == 4 { n + add } else { n };
+                let f = PureFile::from_bytes(std::fs::read(&p).unwrap()).unwrap();
+                assert_eq!(
+                    f.dataset("d").unwrap().read_i32().unwrap(),
+                    (0..expected_len).collect::<Vec<_>>(),
+                    "inconsistent view after crash at phase {max_phase} (n={n}, chunk={chunk}, \
+                     add={add})"
+                );
+            }
+        }
+    }
+
     /// Build a one-element-per-chunk unlimited `d` holding `0..n`, the shape the
     /// crash-consistency harnesses below grow.
     fn build_unit_chunked(path: &std::path::Path, n: i32) {
@@ -8584,11 +8885,11 @@ mod tests {
 
         // Delete the dataset, then write a small dataset that would fit in the
         // index's freed bytes.
-        s.delete("/victim");
+        s.delete("/victim").unwrap();
         s.commit().unwrap();
         let mut db = crate::type_builders::DatasetBuilder::new("added");
         db.with_f64_data(&[2.5f64; 8]).with_shape(&[8]);
-        s.stage_created_dataset("/added", db);
+        s.stage_created_dataset("/added", db).unwrap();
         s.commit().unwrap();
 
         // Release the session's exclusive OS lock before reading the file back;
@@ -8914,7 +9215,7 @@ mod tests {
 
         {
             let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
-            s.delete("/drop");
+            s.delete("/drop").unwrap();
             s.commit().unwrap();
         }
 
@@ -8990,7 +9291,7 @@ mod tests {
         // regions `drop` vacates and *before* the superblock repoint.
         let good_ext = s.superblock.superblock_extension_address;
         s.superblock.superblock_extension_address = Some(0);
-        s.delete("/drop");
+        s.delete("/drop").unwrap();
         assert!(
             s.commit().is_err(),
             "a commit with an unreadable extension must fail"
@@ -9006,7 +9307,7 @@ mod tests {
         // the failed commit had folded its regions in, this second commit would
         // double-free them (a debug assertion) and publish `keep`'s live extent.
         s.superblock.superblock_extension_address = good_ext;
-        s.delete("/drop");
+        s.delete("/drop").unwrap();
         s.commit()
             .expect("the session is usable after a failed commit");
 
@@ -9064,7 +9365,7 @@ mod tests {
         b.write(&path).unwrap();
 
         let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
-        s.delete("/victim");
+        s.delete("/victim").unwrap();
         s.commit().unwrap();
         let free_before = s.space_accounting().reusable_free_space;
         let len_before = std::fs::metadata(&path).unwrap().len();
@@ -9080,7 +9381,7 @@ mod tests {
         db.with_f64_data(&vec![7.5f64; 4096])
             .with_shape(&[4096])
             .with_chunks(&[512]);
-        s.stage_created_dataset("/fresh", db);
+        s.stage_created_dataset("/fresh", db).unwrap();
         assert!(
             s.commit().is_err(),
             "a commit with an unreadable extension must fail"
@@ -9574,7 +9875,7 @@ mod tests {
                 .expect("the gate skips a v2 superblock, so this opens");
             let mut b = DatasetBuilder::new("e");
             b.with_i32_data(&[4, 5]);
-            s.stage_created_dataset("e", b);
+            s.stage_created_dataset("e", b).unwrap();
             s.commit().unwrap();
         }
 
@@ -9619,7 +9920,7 @@ mod tests {
             let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
             let mut b = DatasetBuilder::new("labels");
             b.with_vlen_string_elements(datatype, &elements).unwrap();
-            s.stage_created_dataset("labels", b);
+            s.stage_created_dataset("labels", b).unwrap();
             s.commit().unwrap();
         }
 
@@ -9943,7 +10244,7 @@ mod tests {
         {
             let mut engine =
                 WriteEngine::open_bounded_counting(&p, Arc::clone(&read_bytes)).unwrap();
-            engine.create_group("g");
+            engine.create_group("g").unwrap();
             engine.commit().unwrap();
         }
         let read = read_bytes.load(Ordering::Relaxed);
@@ -10003,7 +10304,7 @@ mod tests {
             "the append must leave a partially-filled page for the commit to pad"
         );
 
-        engine.create_group("g");
+        engine.create_group("g").unwrap();
         engine.commit().unwrap();
 
         // The commit padded the raw tail before laying down metadata, and folded

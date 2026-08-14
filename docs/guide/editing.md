@@ -25,7 +25,7 @@ Ask a file which backing it got with `File::edit_backing()`, and demand one with
 
 `File::open_swmr_writer` always mirrors, so it accepts `Auto` and `Mirrored` — both satisfied by the mirror — and refuses an explicit `Bounded` rather than quietly not honoring it.
 
-The two backings are the same engine and the same edit vocabulary — reads, immediate `Dataset::append` / `append_raw`, `Dataset::write`, `append_staged`, `set_attr` / `remove_attr`, `Group::create_dataset` / `create_group` / `create_group_with` / `delete`, `File::copy` / `copy_from`, `commit`, and `space_accounting` — with one trade between them. A large `Dataset::append` is one crash-atomic apply on the mirror and several ~1 MiB whole-chunk batches when bounded, so a crash mid-call there leaves a valid shorter dataset. A commit's resident memory follows the backing too: bounded by the edit rather than by the file, with `File::copy` the exception, since copying an object reads the whole of it into memory first.
+The two backings are the same engine and the same edit vocabulary — reads, immediate `Dataset::append` / `append_raw`, buffered `Dataset::buffered_appender`, `Dataset::write`, `append_staged`, `set_attr` / `remove_attr`, `Group::create_dataset` / `create_group` / `create_group_with` / `delete`, `File::copy` / `copy_from`, `commit`, and `space_accounting` — with one trade between them. A large `Dataset::append` is one crash-atomic apply on the mirror and several ~1 MiB whole-chunk batches when bounded, so a crash mid-call there leaves a valid shorter dataset. A commit's resident memory follows the backing too: bounded by the edit rather than by the file, with `File::copy` the exception, since copying an object reads the whole of it into memory first.
 
 One caveat inside either backing: the immediate `Dataset::append` is stricter than the staged surface — it needs a latest-format (v2/v3-superblock) file with no userblock, and the refusal (`Error::AppendInPlaceUnsupported`) names `Dataset::append_staged` as the fallback.
 
@@ -80,6 +80,7 @@ After a successful `commit()`, the staged set is cleared and the open file can b
 | `Group::create_dataset(name, build)` | Stage a new dataset, configured through a `DatasetBuilder` | — |
 | `Dataset::append_staged(build)` | Stage appending elements along axis 0 of an existing chunked, unlimited dataset, via an `AppendBuilder` | `H5Dset_extent` + write |
 | `Dataset::append(data)` | Append immediately and durably, no `commit` needed | `H5Dset_extent` + write |
+| `Dataset::buffered_appender()` | Buffer appended elements and write them a whole chunk at a time | `H5Pset_chunk_cache` (write side) |
 | `Dataset::write(data)` / `write_staged(build)` | Stage a value overwrite of the same datatype and shape | `H5Dwrite` |
 | `Group::set_attr(name, value)` / `Dataset::set_attr` | Stage adding or replacing a compact attribute | — |
 | `Group::remove_attr(name)` / `Dataset::remove_attr` | Stage removing a compact attribute | — |
@@ -164,12 +165,47 @@ file.close().unwrap();
 
 One open file reaches every dataset by name, takes an exclusive file lock for its lifetime, and sets no SWMR flag. **Every `append` is crash-atomic**: writes are ordered child-before-parent with `fsync` barriers and the dataspace dimension is published last as the single commit point, so a crash between appends leaves either the previous length or the new one — never a torn or lost view.
 
-That atomicity is why filtered and unfiltered datasets have different length rules. An **unfiltered** append may be **any length**: when the current length is not chunk-aligned, the trailing partial chunk is rewritten and its index element — a single chunk address — is repointed with one atomic write. A **filtered** append must be **chunk-aligned** (the current length and the appended length both whole multiples of the chunk length), because a filtered index element is a multi-field record whose in-place repoint is not power-loss atomic; a filtered append therefore only ever inserts new chunks. For a non-chunk-aligned filtered append, use `Dataset::append_staged`, which rebuilds the index and repoints the superblock last (fully atomic).
+That atomicity is why filtered and unfiltered datasets have different rules about *where* an append may start. An **unfiltered** append may start anywhere: when the current length is not chunk-aligned, the trailing partial chunk is rewritten and its index element — a single chunk address — is repointed with one atomic write. A **filtered** append must start on a **chunk boundary**, because a filtered index element is a multi-field record whose in-place repoint is not power-loss atomic, and the trailing chunk's element is one a reader can already see. To grow a filtered dataset that is sitting on a partial trailing chunk, use `Dataset::append_staged`, which rebuilds the index and repoints the superblock last (fully atomic), or a [`BufferedAppender`](#buffered-appends), which keeps the on-disk length chunk-aligned for you.
+
+The appended **length** is unconstrained either way. An unaligned length only makes the last chunk the append writes a partial one, and that chunk's index element is a fresh insert past the old dimension — invisible until the dimension is published, exactly like every whole chunk beside it. It does leave the dataset on a partial trailing chunk, which is what the rule above then catches.
 
 The remaining eligibility rules match `Dataset::append_staged` (chunked, unlimited axis 0, Extensible-Array index, rank 1, a re-encodable filter pipeline), plus the file-level gates in [the tables above](#choosing-a-write-path), with one difference: because it grows the index in place rather than rebuilding it, the index must already be allocated. This crate allocates it eagerly, so an empty dataset it wrote can be grown from the first append; an empty dataset the C library created without any initial data defers its index and is refused — make that first append with `Dataset::append_staged` (which materializes the index), or create the dataset with initial data. The dead bytes left when an unfiltered partial chunk is relocated are reclaimed by [repack](repack.md) rather than reused within the session in this release. This is the throughput-oriented counterpart to `Dataset::append_staged` and the filter-capable counterpart to the [SWMR writer](swmr.md).
 
 !!! tip "Runnable example"
     This section mirrors [`examples/append_streaming.rs`](https://github.com/stephenberry/hdf5-pure/blob/main/examples/append_streaming.rs). Run it with `cargo run --example append_streaming`.
+
+### Buffered appends
+
+`Dataset::append` writes on every call: it encodes the appended elements, places their chunks, extends the index, and fsyncs five times. That is the right trade for a caller appending a chunk at a time, and the wrong one for a caller appending a hundred elements at a time into a chunk that holds a thousand — which pays the whole sequence ten times over to write one chunk, and cannot pay it at all once the dataset is filtered and sitting on a partial trailing chunk.
+
+`Dataset::buffered_appender` returns a `BufferedAppender` that holds appended elements in memory and writes them only when they complete a chunk. It is this crate's equivalent of the reference C library's raw-data chunk cache, and it carries the same bargain: buffered elements are not in the file until the appender flushes.
+
+```rust
+use hdf5_pure::File;
+
+let file = File::open_rw("telemetry.h5").unwrap();
+let mut samples = file.dataset("samples").unwrap();
+let mut appender = samples.buffered_appender().unwrap();
+for batch in 0..1000 {
+    appender.append(&[batch as f64; 100]).unwrap(); // buffered; writes once a chunk fills
+}
+appender.finish().unwrap();                         // the partial tail reaches the file here
+```
+
+Every call that does not complete a chunk is a memory copy and nothing else. When one or more chunks are complete, exactly those chunks go through the immediate, crash-atomic in-place path and the remainder stays buffered — so a filtered dataset is appended by **any length**, and a caller appending `k` elements at a time into a chunk of `n` writes once per `n/k` calls instead of once per call.
+
+Each write the appender makes is itself crash-atomic, so a crash loses the buffered tail and never the file: the dataset reads back as the prefix that was written. `flush` publishes the buffered tail without consuming the appender, `finish` flushes and consumes it, and dropping without either still flushes — but a failure there cannot be reported, so prefer `finish` where the error matters. Eligibility is the same as `Dataset::append`'s and is reported when the appender is constructed, not on the first write.
+
+One case costs more. A filtered dataset whose on-disk length is not a whole multiple of its chunk length — a log resumed across sessions, typically — has a partial trailing chunk the appender cannot grow in place. It lands such a dataset back on a chunk boundary with one staged, index-rebuilding commit, and every write after that is the cheap in-place one; so the cost is paid once when the log is opened, not once per append. Because that recovery commits, it is refused while the session holds unrelated staged edits. Flushing a partial chunk mid-stream leaves the length unaligned again, so an appender that flushes after every batch pays that commit on every batch but the first — let the appender batch where the last few elements can wait.
+
+An appender holds elements the caller was already told were accepted, and only its own flush can write them — and the immediate append path refuses a dataset with a staged edit on it or an ancestor. So while an appender is live the session **refuses that edit at the call that makes it**, with `Error::EditUnsupported`, rather than letting the flush fail later where a `Drop` could not report it: any edit naming the dataset or an ancestor, every staged edit at all while the realignment above is still owed, and a second appender on the same dataset. Prefer `finish` (or `flush`) over dropping anyway, since a drop cannot return an error; what stays outside the guarantee is `File::close`, which does not flush live appenders.
+
+A **SWMR** writer requires the appended length to be chunk-aligned as well, so it can never write a partial trailing chunk; `buffered_appender` refuses such a session outright rather than accepting elements it could not flush.
+
+Memory follows the buffer rather than the file: an appender holds the unwritten elements plus a copy of the prefix it is writing, so peak is about twice the chunk size above whatever one call hands it. That is a different bound from the one [`Dataset::append`](#bounded-memory-appends) gives, which is independent of how much a single call appends.
+
+!!! tip "Runnable example"
+    This section mirrors [`examples/append_buffered.rs`](https://github.com/stephenberry/hdf5-pure/blob/main/examples/append_buffered.rs). Run it with `cargo run --example append_buffered`.
 
 ### Bounded-memory appends
 
