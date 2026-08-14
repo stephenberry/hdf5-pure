@@ -8416,8 +8416,9 @@ mod tests {
     /// (issue #202).
     #[test]
     // Reads back with the reference HDF5 C library (`hdf5-metno`), a
-    // 64-bit-only dev-dependency; skip on 32-bit so the lib tests run there.
-    #[cfg(not(target_pointer_width = "32"))]
+    // 64-bit little-endian-only dev-dependency; skip elsewhere so the lib
+    // tests still run there.
+    #[cfg(all(not(target_pointer_width = "32"), target_endian = "little"))]
     fn append_inplace_crash_consistency_c_library_reads_prefix() {
         use tempfile::tempdir;
 
@@ -8473,8 +8474,9 @@ mod tests {
     /// case.
     #[test]
     // Reads back with the reference HDF5 C library (`hdf5-metno`), a
-    // 64-bit-only dev-dependency; skip on 32-bit so the lib tests run there.
-    #[cfg(not(target_pointer_width = "32"))]
+    // 64-bit little-endian-only dev-dependency; skip elsewhere so the lib
+    // tests still run there.
+    #[cfg(all(not(target_pointer_width = "32"), target_endian = "little"))]
     fn append_inplace_recover_and_reappend_after_phase3_crash() {
         use crate::reader::File as PureFile;
         use tempfile::tempdir;

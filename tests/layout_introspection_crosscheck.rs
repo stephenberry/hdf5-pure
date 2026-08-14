@@ -1,7 +1,7 @@
 // Crosschecks link the reference HDF5 C library (the `hdf5-metno` dev-dependency),
-// which is gated to 64-bit-pointer targets; skip them on 32-bit so the pure-Rust
+// which is gated to 64-bit little-endian targets; skip them elsewhere so the pure-Rust
 // suite can run under `cross test --target i686-...`.
-#![cfg(not(target_pointer_width = "32"))]
+#![cfg(all(not(target_pointer_width = "32"), target_endian = "little"))]
 //! Reference-C-library interop for the layout / filter introspection API
 //! (issue #149). The reference library *writes* datasets in every storage class
 //! and chunk-index kind; this crate must classify them identically and — the

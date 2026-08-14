@@ -217,8 +217,16 @@ fn apply_value_to_dataset(
             Ok(())
         }
         MatValue::ComplexVec1D(pairs) => {
-            let n = pairs.len() as u64;
-            apply_complex(ds, pairs, &[1, n]);
+            // `[0, 0]` when empty, the answer `dims::vector_dims` gives the
+            // options emitter — read the note there on why the two must not
+            // drift. An empty complex vector only became reachable with the
+            // `mat::complex` array helpers: before them no input produced this
+            // arm with no pairs, so the hardcoded `[1, n]` was never wrong.
+            let shape = match pairs.len() as u64 {
+                0 => [0, 0],
+                n => [1, n],
+            };
+            apply_complex(ds, pairs, &shape);
             Ok(())
         }
         MatValue::ComplexMatrix { rows, cols, pairs } => {

@@ -1,6 +1,6 @@
-// Links the reference HDF5 C library (`hdf5-metno`), gated to 64-bit-pointer
+// Links the reference HDF5 C library (`hdf5-metno`), gated to 64-bit little-endian
 // targets; skip on 32-bit so `cross test --target i686-...` stays pure-Rust.
-#![cfg(not(target_pointer_width = "32"))]
+#![cfg(all(not(target_pointer_width = "32"), target_endian = "little"))]
 //! Cross-validation for Extensible-Array-indexed chunked datasets (one unlimited
 //! dimension), in both directions against the reference C HDF5 library.
 //!

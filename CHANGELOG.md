@@ -8,7 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- `mat::complex::i16_array`, and one helper per component class, write a large complex array in bulk from a `#[serde(serialize_with = ...)]` field, roughly twenty-five times faster than the per-element path for the same bytes; an empty slice keeps its component class, where a plain `Vec` writes an empty `double` ([#260](https://github.com/stephenberry/hdf5-pure/pull/260)).
+- `mat::ComplexElement`, the unsafe layout trait those helpers accept, is implemented for the `Complex*` types and — under the new `num-complex` feature — for `num_complex::Complex<T>` ([#260](https://github.com/stephenberry/hdf5-pure/pull/260)).
 - `Group::iter_datasets` and `Group::iter_groups` yield a group's members as opened handles paired with their names, walking the group once where opening each name from `datasets()` re-walks it per member ([#259](https://github.com/stephenberry/hdf5-pure/pull/259)).
+
+### Changed
+
+- Writing a complex array is about five times faster, `MatBuilder`'s writers included ([#260](https://github.com/stephenberry/hdf5-pure/pull/260)).
 
 ## [0.35.0] - 2026-08-10
 

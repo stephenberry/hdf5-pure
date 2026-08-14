@@ -20,7 +20,7 @@ exclude = ["tests/fixtures/**", "fuzz/**"]
 # leaves their cross-references as dead links); `matio-crosscheck` is a
 # test-only feature and is deliberately excluded.
 [package.metadata.docs.rs]
-features = ["provenance", "parallel", "zfp", "ndarray", "serde"]
+features = ["provenance", "parallel", "zfp", "ndarray", "serde", "num-complex"]
 
 [features]
 default = ["std", "checksum", "deflate"]
@@ -40,6 +40,12 @@ ndarray = ["dep:ndarray", "std"]
 # Serde-based (de)serialization of MATLAB v7.3 .mat files.
 # Requires `std` (uses File/Group/Dataset reader APIs).
 serde = ["dep:serde", "std"]
+# `mat::ComplexElement` impls for `num_complex::Complex<T>`, so the bulk array
+# helpers in `mat::complex` take the de-facto standard Rust complex type
+# directly. The trait is `unsafe` and asserts a memory layout, so the orphan
+# rule puts these impls on whichever crate owns one of the two types — us, not
+# the caller.
+num-complex = ["dep:num-complex", "serde"]
 # Test-only: enable a crosscheck test that links against the system libmatio
 # (reference MATLAB MAT file library). Requires libmatio to be installed:
 # `brew install libmatio` (macOS) or `apt install libmatio-dev` (Debian).
@@ -57,6 +63,9 @@ serde = { version = "1", optional = true, default-features = false, features = [
 # user's existing `ndarray` unifies with ours instead of compiling a second
 # copy. Only APIs stable across 0.16/0.17 are used.
 ndarray = { version = ">=0.16, <0.18", optional = true }
+# Carries only `ComplexElement` impls. No API of ours names a `Complex<T>`, so
+# nothing here appears in a public signature.
+num-complex = { version = "0.4", optional = true, default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
@@ -72,12 +81,14 @@ criterion = { version = "0.5", default-features = false }
 
 # The reference HDF5 C library, used only by the byte-level crosscheck tests.
 # Its `static` feature compiles libhdf5 from source via CMake, which does not
-# cross-compile to 32-bit targets cleanly and is unnecessary there anyway (a
-# 32-bit host cannot allocate the multi-GiB fixtures these tests build). Gate it
-# to 64-bit-pointer targets so `cross test --target i686-...` can run the
-# pure-Rust suite on a 32-bit pointer width without building any C code. The
-# crosscheck test files carry
-# the matching `#![cfg(not(target_pointer_width = "32"))]` gate.
+# cross-compile cleanly and is unnecessary on the targets excluded here anyway.
+# Gate it to 64-bit little-endian so `cross test` can run the pure-Rust suite on
+# a 32-bit pointer width (`i686`) and on a big-endian host (`s390x`) without
+# building any C code: a 32-bit host cannot allocate the multi-GiB fixtures
+# these tests build, and the point of the big-endian run is this crate's own
+# byte-order handling, not the C library's. The crosscheck test files carry the
+# matching `#![cfg(all(not(target_pointer_width = "32"), target_endian =
+# "little"))]` gate.
 #
 # The suite validates against the current *released* libhdf5, not a development
 # snapshot. Which one that is comes from the `hdf5-metno-src` pin in
@@ -87,7 +98,7 @@ criterion = { version = "0.5", default-features = false }
 # derived from libhdf5 internals that a version change could move, and
 # `tests/c_absence_predicate.rs` guards the assertion most sensitive to one by
 # re-measuring the C library's error codes against deliberately damaged files.
-[target.'cfg(not(target_pointer_width = "32"))'.dev-dependencies]
+[target.'cfg(all(not(target_pointer_width = "32"), target_endian = "little"))'.dev-dependencies]
 hdf5 = { package = "hdf5-metno", version = "0.14", features = ["static", "zlib"] }
 
 [[example]]

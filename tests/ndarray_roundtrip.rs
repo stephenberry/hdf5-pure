@@ -2,9 +2,13 @@
 //! and byte-level cross-validation against the reference HDF5 library
 //! (`hdf5-metno`). Only built with the `ndarray` feature.
 // Byte-level crosscheck links the reference HDF5 C library (`hdf5-metno`), gated
-// to 64-bit-pointer targets; skip on 32-bit so `cross test --target i686-...`
-// stays pure-Rust.
-#![cfg(all(feature = "ndarray", not(target_pointer_width = "32")))]
+// to 64-bit little-endian targets; skip elsewhere so `cross test` on `i686` and
+// `s390x` stays pure-Rust.
+#![cfg(all(
+    feature = "ndarray",
+    not(target_pointer_width = "32"),
+    target_endian = "little"
+))]
 
 use hdf5_pure::{Error, File, FileBuilder};
 use ndarray::{Array1, Array2, Array3, ArrayD, ShapeBuilder, array};

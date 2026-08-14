@@ -1,7 +1,11 @@
 // Crosschecks against the reference HDF5 C library (`hdf5-metno`), gated to
-// 64-bit-pointer targets; skip on 32-bit so `cross test --target i686-...`
-// stays pure-Rust.
-#![cfg(all(feature = "serde", not(target_pointer_width = "32")))]
+// 64-bit little-endian targets; skip elsewhere so `cross test` on `i686` and
+// `s390x` stays pure-Rust.
+#![cfg(all(
+    feature = "serde",
+    not(target_pointer_width = "32"),
+    target_endian = "little"
+))]
 //! Crosscheck: files produced by our serde layer are readable by the C HDF5
 //! library (via `hdf5-metno`). This gives us confidence that the `.mat` v7.3
 //! files we produce are valid HDF5 and follow MATLAB conventions that other

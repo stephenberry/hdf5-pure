@@ -2099,7 +2099,7 @@ mod attribute_fidelity_tests {
     /// itself, which a message it encodes wrongly and parses back just as wrongly
     /// would satisfy. These encodings reach the file through an internal seam
     /// with no public spelling, so nothing else in the suite would catch that.
-    #[cfg(not(target_pointer_width = "32"))]
+    #[cfg(all(not(target_pointer_width = "32"), target_endian = "little"))]
     fn c_library_reads_every_attribute(file: &Path, expected: usize) {
         let c = hdf5::File::open(file).expect("the C library must open the repacked file");
         for names in [
@@ -2123,9 +2123,10 @@ mod attribute_fidelity_tests {
         }
     }
 
-    /// The C library is a 64-bit-only dev-dependency, so the check compiles out
-    /// on 32-bit and the pure-Rust half of the test still runs there.
-    #[cfg(target_pointer_width = "32")]
+    /// The C library is a 64-bit little-endian-only dev-dependency, so the
+    /// check compiles out elsewhere and the pure-Rust half of the test still
+    /// runs there.
+    #[cfg(not(all(not(target_pointer_width = "32"), target_endian = "little")))]
     fn c_library_reads_every_attribute(_file: &Path, _expected: usize) {}
 
     /// The other half of the rule: an attribute whose bytes are a *location* must
