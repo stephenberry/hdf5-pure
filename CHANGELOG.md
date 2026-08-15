@@ -14,10 +14,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- **Breaking:** `CompoundTypeBuilder::build` returns `Result<Datatype, FormatError>`, refusing a compound of no fields and one whose fields pack to zero bytes, the way `ExplicitCompoundTypeBuilder::build` already did ([#268](https://github.com/stephenberry/hdf5-pure/issues/268)).
 - `Dataset::append` accepts a filtered append of any length, where it required a whole number of chunks; the dataset's own length must still be chunk-aligned ([#262](https://github.com/stephenberry/hdf5-pure/issues/262)).
 
 ### Fixed
 
+- A datatype declaring a zero-byte element size is refused with the new `FormatError::ZeroSizedDatatype` when its message is parsed; reading such a dataset previously panicked on a division by that size ([#268](https://github.com/stephenberry/hdf5-pure/issues/268)).
+- Writing a dataset or committed datatype whose element size is zero is refused with the same error, on both the whole-file and `File::open_rw` paths; a chunked write of one previously panicked, and a contiguous one produced a file this crate refuses to read ([#268](https://github.com/stephenberry/hdf5-pure/issues/268)).
 - A `File::open_rw` commit reuses freed space for a chunked dataset's chunk data and index, and for a dense attribute heap, where both were always appended at the end of the file; a replacement needs one free region large enough to hold it whole ([#261](https://github.com/stephenberry/hdf5-pure/issues/261)).
 - A paged file (`FileSpaceStrategy::Page`) reuses its freed space too, drawing only from the page type being written so metadata and raw data cannot come to share a page; it previously appended for every allocation. Free space another writer recorded whose page type cannot be established is kept but never reused ([#261](https://github.com/stephenberry/hdf5-pure/issues/261)).
 - A commit that fails before its superblock repoint returns the free regions it had drawn from, instead of leaking them for the rest of the session ([#261](https://github.com/stephenberry/hdf5-pure/issues/261)).

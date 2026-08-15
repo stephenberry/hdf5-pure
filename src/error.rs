@@ -45,6 +45,13 @@ pub enum FormatError {
         /// The version found.
         version: u8,
     },
+    /// A datatype message in a file declares an element size of zero, which no
+    /// HDF5 type has. Raised when the message is parsed, so the size every reader
+    /// divides raw bytes by is never zero.
+    ZeroSizedDatatype {
+        /// The type class that declared it.
+        class: u8,
+    },
     /// Invalid string padding type.
     InvalidStringPadding(u8),
     /// Invalid character set.
@@ -527,6 +534,12 @@ impl fmt::Display for FormatError {
             }
             FormatError::InvalidDatatypeVersion { class, version } => {
                 write!(f, "invalid datatype version {version} for class {class}")
+            }
+            FormatError::ZeroSizedDatatype { class } => {
+                write!(
+                    f,
+                    "datatype class {class} declares a zero-byte element size"
+                )
             }
             FormatError::InvalidStringPadding(p) => {
                 write!(f, "invalid string padding type: {p}")

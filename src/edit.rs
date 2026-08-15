@@ -7234,31 +7234,34 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
             .ok_or(Error::EditUnsupported("dataset has no data"))?
     };
 
+    // Refused for the same reason the whole-file writer refuses it: nothing
+    // occupies zero bytes per element, the writers divide by the element size,
+    // and a caller-built `Datatype` never passes through `Datatype::parse`.
+    dt.ensure_nonzero_size()?;
+
     let elem = dt.type_size() as u64;
-    if elem > 0 {
-        // Multiply with checked arithmetic: an absurd shape whose element count
-        // (or byte size) overflows `u64` is refused rather than panicking in a
-        // debug build or silently wrapping in release (which could let a wrapped
-        // product spuriously match `raw.len()`). For a zero-element shape this
-        // expected length is always 0 (a `0` dimension makes every checked
-        // multiplication `Some(0)` regardless of the other dimensions), so this
-        // also catches data mistakenly supplied for a shape that holds nothing.
-        let expected = shape
-            .iter()
-            .try_fold(1u64, |acc, &d| acc.checked_mul(d))
-            .and_then(|n| n.checked_mul(elem));
-        match expected {
-            Some(expected) if raw.len() as u64 == expected => {}
-            Some(_) => {
-                return Err(Error::EditUnsupported(
-                    "dataset data length does not match its shape",
-                ));
-            }
-            None => {
-                return Err(Error::EditUnsupported(
-                    "dataset shape is too large to address on this platform",
-                ));
-            }
+    // Multiply with checked arithmetic: an absurd shape whose element count
+    // (or byte size) overflows `u64` is refused rather than panicking in a
+    // debug build or silently wrapping in release (which could let a wrapped
+    // product spuriously match `raw.len()`). For a zero-element shape this
+    // expected length is always 0 (a `0` dimension makes every checked
+    // multiplication `Some(0)` regardless of the other dimensions), so this
+    // also catches data mistakenly supplied for a shape that holds nothing.
+    let expected = shape
+        .iter()
+        .try_fold(1u64, |acc, &d| acc.checked_mul(d))
+        .and_then(|n| n.checked_mul(elem));
+    match expected {
+        Some(expected) if raw.len() as u64 == expected => {}
+        Some(_) => {
+            return Err(Error::EditUnsupported(
+                "dataset data length does not match its shape",
+            ));
+        }
+        None => {
+            return Err(Error::EditUnsupported(
+                "dataset shape is too large to address on this platform",
+            ));
         }
     }
 

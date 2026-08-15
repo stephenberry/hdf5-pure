@@ -429,7 +429,8 @@ fn an_unlabelled_complex_integer_array_is_not_decoded_as_double() {
     let ct = CompoundTypeBuilder::new()
         .field("real", make_i64_type())
         .field("imag", make_i64_type())
-        .build();
+        .build()
+        .unwrap();
     let mut raw = Vec::new();
     for (re, im) in [(1i64, -1i64), (2, -2)] {
         raw.extend_from_slice(&re.to_le_bytes());

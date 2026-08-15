@@ -1473,6 +1473,14 @@ impl FileWriter {
             } else {
                 db.data.ok_or(FormatError::DatasetMissingData)?
             };
+            // A zero-byte element type is refused before it reaches a layout
+            // decision: the chunk splitter clamps a row copy to an element
+            // boundary with `% element_size` and would divide by zero, and a
+            // contiguous write of one produces a file this crate's own reader
+            // refuses. A caller-built `Datatype` reaches the writer without
+            // passing through `Datatype::parse`, which refuses the file-sourced
+            // ones, so this is where the same invariant is held on the way out.
+            dt.ensure_nonzero_size()?;
             // Guard against a shape that disagrees with the supplied data. The
             // reader enforces the same `num_elements * element_size` invariant
             // (see `data_read::read_raw_data_full`), so without this check a
@@ -1480,7 +1488,7 @@ impl FileWriter {
             // produce a file that fails to read back. `saturating_mul` keeps an
             // absurd shape from overflowing into a false match.
             let elem_size = dt.type_size() as u64;
-            if !is_empty && raw_chunks.is_none() && elem_size > 0 {
+            if !is_empty && raw_chunks.is_none() {
                 // A produced region is checked against the same invariant as a
                 // materialized one — its size is declared rather than measured,
                 // and a declaration that disagrees with the shape would produce a
@@ -1593,13 +1601,19 @@ impl FileWriter {
 
         /// Flatten one group's committed datatypes into the file-wide list,
         /// returning their indices.
+        ///
+        /// A committed type is written as an object of its own and named by
+        /// datasets and attributes, so a zero-byte element type is refused here
+        /// for the same reason `flatten_dataset` refuses one: it reaches the
+        /// writer without passing through `Datatype::parse`.
         fn flatten_committed(
             types: Vec<CommittedDatatype>,
             committed: &mut Vec<CtFlat>,
-        ) -> Vec<usize> {
+        ) -> Result<Vec<usize>, FormatError> {
             types
                 .into_iter()
                 .map(|ct| {
+                    ct.datatype.ensure_nonzero_size()?;
                     committed.push(CtFlat {
                         name: ct.name,
                         dt: ct.datatype,
@@ -1607,7 +1621,7 @@ impl FileWriter {
                         // more, counted once the whole file is flattened.
                         references: 1,
                     });
-                    committed.len() - 1
+                    Ok(committed.len() - 1)
                 })
                 .collect()
         }
@@ -1625,7 +1639,7 @@ impl FileWriter {
             for (n, v) in &g.attrs {
                 gattrs.push(v.to_message(n));
             }
-            let committed_idx = flatten_committed(g.committed, committed);
+            let committed_idx = flatten_committed(g.committed, committed)?;
             let mut ds_idx = Vec::new();
             for db in g.datasets {
                 ds_idx.push(flatten_dataset(db, all_ds, ds_vl)?);
@@ -1649,7 +1663,7 @@ impl FileWriter {
         let mut grp_vl: Vec<Vec<VlPatch>> = Vec::new();
         let mut ds_vl: Vec<Vec<VlPatch>> = Vec::new();
 
-        let root_committed_indices = flatten_committed(self.root_committed, &mut committed);
+        let root_committed_indices = flatten_committed(self.root_committed, &mut committed)?;
 
         for db in self.root_datasets {
             root_ds_indices.push(flatten_dataset(db, &mut all_ds, &mut ds_vl)?);

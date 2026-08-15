@@ -1156,6 +1156,10 @@ fn row_band_copy(
     band: usize,
     elem_size: usize,
 ) {
+    debug_assert!(
+        elem_size > 0,
+        "a zero-width element type is refused at parse"
+    );
     let mut len = band
         .min(chunk.len().saturating_sub(src))
         .min(output.len().saturating_sub(dst));
@@ -2091,6 +2095,13 @@ fn copy_chunk_to_output(
     rank: usize,
 ) {
     debug_assert!(rank >= 1, "rank == 0 is handled by the callers");
+    // The element-boundary clamp below divides by `elem_size`; a zero-width
+    // element type is refused when the datatype message is parsed, so one cannot
+    // reach here from a file.
+    debug_assert!(
+        elem_size > 0,
+        "a zero-width element type is refused at parse"
+    );
     // Row contiguity (the whole optimization) relies on a unit innermost stride
     // in both layouts, which the row-major stride construction guarantees.
     debug_assert_eq!(chunk_strides[rank - 1], 1);

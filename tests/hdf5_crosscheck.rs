@@ -701,7 +701,8 @@ fn crosscheck_compound_f64_pairs() {
     let ct = CompoundTypeBuilder::new()
         .f64_field("real")
         .f64_field("imag")
-        .build();
+        .build()
+        .unwrap();
     let pairs = [(1.0f64, 2.0f64), (3.0, 4.0), (5.0, 6.0)];
     let mut raw = Vec::new();
     for (r, i) in &pairs {
