@@ -6009,8 +6009,7 @@ impl WriteEngine {
     /// base and discarding it — `chunked_data_len` and the sizing call to
     /// `plan_chunked_data_verbatim`. Neither materializes the chunk data, which
     /// is the bulk of the region, but both build the index twice; finishing that
-    /// needs a length for the Fixed Array as well (issue #265 covered the other
-    /// two).
+    /// needs a length for the Fixed Array as well, tracked in issue #275.
     fn place_relocatable<T>(
         &mut self,
         len: u64,
