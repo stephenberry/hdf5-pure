@@ -191,7 +191,8 @@ use crate::chunked_read::{
 use crate::chunked_write::{
     ChunkMeta, ChunkOptions, ChunkProvider, WrittenChunk, assemble_chunked_at,
     build_extensible_array_at, chunked_data_len, compress_chunks, emit_chunked_data_verbatim,
-    plan_chunked_data_verbatim, serialize_v4_extensible_array, split_into_chunks,
+    extensible_array_len, plan_chunked_data_verbatim, serialize_v4_extensible_array,
+    split_into_chunks,
 };
 use crate::convert::TryToUsize;
 use crate::data_layout::DataLayout;
@@ -5640,15 +5641,14 @@ impl WriteEngine {
     /// blob for it, place it, and splice the matching Attribute Info message onto
     /// `region`. A no-op for an empty set.
     ///
-    /// The blob produced by [`file_writer::build_dense_attrs`] is fully
+    /// The blob produced by [`file_writer::DenseAttrPlan::build`] is fully
     /// relocatable: every address it embeds is `base + fixed offset`, and its
     /// length is the same for every base, so it can go into a freed metadata
     /// region as readily as at end-of-file — the base it is built for is whichever
-    /// address it gets. Sizing it costs a throwaway build at a provisional
-    /// address, which is bounded by the attribute set's own size. The freshly
-    /// built heap is always same-file, so it never aliases the source heap even
-    /// for an in-file copy. The caller has already validated
-    /// [`file_writer::dense_attrs_check`].
+    /// address it gets. The reservation comes from the plan the blob is then
+    /// built from, so sizing it costs no bytes. The freshly built heap is always
+    /// same-file, so it never aliases the source heap even for an in-file copy.
+    /// The caller has already validated [`file_writer::dense_attrs_check`].
     fn append_dense_attrs(
         &mut self,
         region: &mut Vec<u8>,
@@ -5657,10 +5657,10 @@ impl WriteEngine {
         if attrs.is_empty() {
             return Ok(());
         }
-        let len = crate::file_writer::build_dense_attrs(attrs, 0).blob.len() as u64;
+        let plan = crate::file_writer::dense_attrs_plan(attrs);
         let (_addr, attr_info_message) =
-            self.place_relocatable(len, PageType::Meta, |stored_base| {
-                let blob = crate::file_writer::build_dense_attrs(attrs, stored_base);
+            self.place_relocatable(plan.blob_len(), PageType::Meta, |stored_base| {
+                let blob = plan.build(stored_base);
                 Ok((blob.blob, blob.attr_info_message))
             })?;
         region.extend_from_slice(&region_message(
@@ -5818,16 +5818,15 @@ impl WriteEngine {
         // Build the fresh Extensible Array for wherever it is placed: its embedded
         // block addresses are computed from `ea_base` (base-relative), so they
         // resolve correctly on a userblock (`base != 0`) file too. Its length does
-        // not depend on that base, so a throwaway build at 0 sizes it.
+        // not depend on that base, so `extensible_array_len` gives the reservation
+        // from the array's layout without emitting a byte of it.
         //
         // The index goes in a *raw* page, not a metadata one: every other writer in
         // this crate places a chunk index in the same run as the chunk data, and
         // `chunked_storage_spans` reclaims every index as raw on that basis. Placing
         // this one in a metadata page would make it the single exception the reclaim
         // side then mis-files, advertising a metadata hole inside a raw page.
-        let ea_len = build_extensible_array_at(&combined, OFFSET_SIZE, LENGTH_SIZE, has_filters, 0)
-            .map_err(Error::Format)?
-            .len() as u64;
+        let ea_len = extensible_array_len(&combined, OFFSET_SIZE, LENGTH_SIZE, has_filters);
         let (ea_addr, ()) = self.place_relocatable(ea_len, PageType::Raw, |ea_base| {
             let bytes = build_extensible_array_at(
                 &combined,
@@ -6002,8 +6001,15 @@ impl WriteEngine {
     /// `len` must be the length `build` will produce; [`place`](Self::place)
     /// rejects a mismatch. For every blob placed this way the length is a function
     /// of the content alone — the addresses sit in fixed-width fields — so it can
-    /// be planned (or measured from a build at a provisional address) before the
-    /// real one is known.
+    /// be derived before the real address is known.
+    ///
+    /// Two callers derive it ([`DenseAttrPlan::blob_len`](crate::file_writer::DenseAttrPlan::blob_len)
+    /// and [`extensible_array_len`]). The two that lay out a whole chunked data
+    /// region still measure it by building the chunk *index* at a provisional
+    /// base and discarding it — `chunked_data_len` and the sizing call to
+    /// `plan_chunked_data_verbatim`. Neither materializes the chunk data, which
+    /// is the bulk of the region, but both build the index twice; finishing that
+    /// needs a length for the Fixed Array as well, tracked in issue #275.
     fn place_relocatable<T>(
         &mut self,
         len: u64,
