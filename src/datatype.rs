@@ -424,6 +424,17 @@ impl Datatype {
     ///
     /// Crate-internal: no public API hands out datatype-message bytes to feed it.
     /// Read a dataset's type with [`Dataset::datatype`](crate::Dataset::datatype).
+    ///
+    /// A parsed type always has a non-zero [`type_size`](Self::type_size): no HDF5
+    /// type occupies zero bytes per element, and every reader divides raw bytes by
+    /// that size to recover an element count. Refusing it here — the one place an
+    /// untrusted datatype message becomes a `Datatype` — holds that invariant for
+    /// every reader of a file instead of asking each one to re-check it.
+    ///
+    /// It says nothing about a `Datatype` a caller builds and hands to the writer,
+    /// which never passes through here. `CompoundTypeBuilder::build` over no fields
+    /// yields a zero-size compound today, and the write path divides by the element
+    /// size just as the read path does.
     pub(crate) fn parse(data: &[u8]) -> Result<(Datatype, usize), FormatError> {
         // Minimum header: 4 bytes (class_and_version + 3 bytes bit field) + 4 bytes size = 8
         ensure_len(data, 0, 8)?;
@@ -441,7 +452,7 @@ impl Datatype {
         let size = LittleEndian::read_u32(&data[4..8]);
         let mut pos = 8;
 
-        match class_id {
+        let parsed = match class_id {
             0 => {
                 // Fixed-Point
                 ensure_len(data, pos, 4)?;
@@ -773,7 +784,17 @@ impl Datatype {
                 Ok((Datatype::Compound { size, members }, pos))
             }
             _ => Err(FormatError::InvalidDatatypeClass(class_id)),
+        };
+
+        // The declared size is checked through `type_size` rather than the header
+        // field, because the two differ: an array type derives its size from its
+        // base type and dimensions, so a zero dimension yields a zero-byte element
+        // from a non-zero header field.
+        let (datatype, consumed) = parsed?;
+        if datatype.type_size() == 0 {
+            return Err(FormatError::ZeroSizedDatatype { class: class_id });
         }
+        Ok((datatype, consumed))
     }
 
     /// Serialize datatype to HDF5 message bytes.
@@ -1494,6 +1515,53 @@ mod tests {
             }
             _ => panic!("expected Array"),
         }
+    }
+
+    /// Nothing in HDF5 occupies zero bytes per element, and the readers divide by
+    /// the element size, so a declared zero is refused where an untrusted message
+    /// becomes a `Datatype` rather than at each division (issue #268).
+    #[test]
+    fn a_zero_width_element_type_is_refused() {
+        let buf = build_dt_header(3, 1, [0x01, 0, 0], 0); // fixed-length string of 0 bytes
+        assert_eq!(
+            Datatype::parse(&buf).unwrap_err(),
+            FormatError::ZeroSizedDatatype { class: 3 }
+        );
+    }
+
+    /// An array's element size is its base type across its dimensions, not the
+    /// size the header declares, and the two disagree: a zero dimension is a
+    /// zero-width element behind a header that claims 48 bytes. Reading the
+    /// declared field instead of the computed one lets this one through.
+    #[test]
+    fn an_array_with_a_zero_dimension_is_refused_despite_its_header_size() {
+        let mut buf = build_dt_header(10, 3, [0, 0, 0], 48);
+        buf.push(2); // ndims=2
+        buf.extend_from_slice(&0u32.to_le_bytes()); // dim 0 — no elements
+        buf.extend_from_slice(&4u32.to_le_bytes()); // dim 1
+        buf.extend_from_slice(&build_fixed_point(4, false, true, 0, 32));
+
+        assert_eq!(
+            Datatype::parse(&buf).unwrap_err(),
+            FormatError::ZeroSizedDatatype { class: 10 }
+        );
+    }
+
+    /// The refusal reaches a nested type too: a compound member is parsed through
+    /// the same entry, so a zero-width member is caught where it is decoded rather
+    /// than becoming a member whose size no reader can use.
+    #[test]
+    fn a_zero_width_compound_member_is_refused() {
+        let member = build_dt_header(3, 1, [0x01, 0, 0], 0);
+        let mut buf = build_dt_header(6, 3, [1, 0, 0], 8); // one member
+        buf.extend_from_slice(b"s\0");
+        buf.push(0); // byte offset, one byte for a size-8 compound
+        buf.extend_from_slice(&member);
+
+        assert_eq!(
+            Datatype::parse(&buf).unwrap_err(),
+            FormatError::ZeroSizedDatatype { class: 3 }
+        );
     }
 
     #[test]

@@ -18,6 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- A datatype declaring a zero-byte element size is refused with the new `FormatError::ZeroSizedDatatype` when its message is parsed; reading such a dataset previously panicked on a division by that size ([#268](https://github.com/stephenberry/hdf5-pure/issues/268)).
 - A `File::open_rw` commit reuses freed space for a chunked dataset's chunk data and index, and for a dense attribute heap, where both were always appended at the end of the file; a replacement needs one free region large enough to hold it whole ([#261](https://github.com/stephenberry/hdf5-pure/issues/261)).
 - A paged file (`FileSpaceStrategy::Page`) reuses its freed space too, drawing only from the page type being written so metadata and raw data cannot come to share a page; it previously appended for every allocation. Free space another writer recorded whose page type cannot be established is kept but never reused ([#261](https://github.com/stephenberry/hdf5-pure/issues/261)).
 - A commit that fails before its superblock repoint returns the free regions it had drawn from, instead of leaking them for the rest of the session ([#261](https://github.com/stephenberry/hdf5-pure/issues/261)).

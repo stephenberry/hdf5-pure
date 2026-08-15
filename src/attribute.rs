@@ -1208,23 +1208,48 @@ mod tests {
         );
     }
 
-    /// The same bytes with the flag clear decode as an inline datatype. This is
-    /// what the reference used to be read as: a well-formed, zero-width time
-    /// type, returned with no error at all.
+    /// With the flag clear the same bytes are decoded inline, which is how the
+    /// reference used to be read: they form a syntactically well-formed time type
+    /// of zero width. Nothing occupies zero bytes per element, so that decode is
+    /// refused rather than returned, and the flag is left as the only thing that
+    /// makes these bytes name a type at all.
     #[test]
-    fn the_same_bytes_without_the_flag_decode_as_a_zero_width_type() {
+    fn the_same_bytes_without_the_flag_are_refused_as_a_zero_width_type() {
         let data = attr_with_shared_datatype(0);
-        let attr = AttributeMessage::parse(&data, 8).unwrap();
+        let err = AttributeMessage::parse(&data, 8).unwrap_err();
 
         assert_eq!(
-            attr.datatype,
-            Datatype::Time {
-                size: 0,
-                byte_order: crate::datatype::DatatypeByteOrder::LittleEndian,
-                bit_precision: 0,
-            },
-            "the reference bytes are supposed to look like a valid inline datatype"
+            err,
+            FormatError::ZeroSizedDatatype { class: 2 },
+            "the reference bytes decode as a class 2 (time) type of zero width"
         );
+    }
+
+    /// The other half of the flag's effect: with it clear over bytes that really
+    /// are a datatype, the attribute carries the type it decoded and records
+    /// that the type is its own, not a reference to a committed one.
+    #[test]
+    fn a_datatype_field_without_the_flag_is_recorded_as_inline() {
+        let name = b"inline_attr\0";
+        let dt_bytes = build_f64_dt();
+        let ds_bytes = build_simple_ds_v1(1);
+
+        let mut data = vec![2u8, 0];
+        data.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        data.extend_from_slice(&(dt_bytes.len() as u16).to_le_bytes());
+        data.extend_from_slice(&(ds_bytes.len() as u16).to_le_bytes());
+        data.extend_from_slice(name);
+        data.extend_from_slice(&dt_bytes);
+        data.extend_from_slice(&ds_bytes);
+        data.extend_from_slice(&1.5f64.to_le_bytes());
+
+        let attr = AttributeMessage::parse(&data, 8).unwrap();
+
+        assert_eq!(attr.name, "inline_attr");
+        assert!(matches!(
+            attr.datatype,
+            Datatype::FloatingPoint { size: 8, .. }
+        ));
         assert_eq!(attr.datatype_location, DatatypeLocation::Inline);
     }
 
