@@ -207,7 +207,8 @@ fn roundtrip_compound_complex64() {
     let complex_type = CompoundTypeBuilder::new()
         .f64_field("real")
         .f64_field("imag")
-        .build();
+        .build()
+        .unwrap();
 
     let values: Vec<(f64, f64)> = vec![(1.0, 2.0), (3.0, 4.0)];
     let mut raw = Vec::new();
@@ -375,6 +376,84 @@ fn chunked_builder_accepts_empty_extensible_dataset() {
     let ds = file.dataset("stream").unwrap();
     assert_eq!(ds.shape().unwrap(), vec![0]);
     assert_eq!(ds.read_i32().unwrap(), Vec::<i32>::new());
+}
+
+/// A fixed-length string type of zero width — the shape of the datatype message
+/// that panicked the chunked reader in issue #268, here built by a caller rather
+/// than read from a file.
+fn zero_width_type() -> Datatype {
+    Datatype::String {
+        size: 0,
+        padding: hdf5_pure::StringPadding::NullPad,
+        charset: hdf5_pure::CharacterSet::Ascii,
+    }
+}
+
+/// The packed builder validates what its explicit sibling always validated: a
+/// compound of no fields, and one whose fields pack to no bytes, are the two
+/// cases `H5Tcreate(H5T_COMPOUND, ..)` refuses. It used to return them, and
+/// `CompoundTypeBuilder::new().build()` was the shortest route to a datatype
+/// that panicked the writer.
+#[test]
+fn packed_compound_builder_rejects_a_type_with_no_bytes() {
+    assert!(matches!(
+        CompoundTypeBuilder::new().build().unwrap_err(),
+        FormatError::EmptyCompoundType
+    ));
+
+    // Not empty, but every field is zero-width, so the type still packs to
+    // nothing. This is the second guard, and only this case reaches it.
+    assert!(matches!(
+        CompoundTypeBuilder::new()
+            .field("a", zero_width_type())
+            .build()
+            .unwrap_err(),
+        FormatError::InvalidCompoundSize
+    ));
+}
+
+/// Nothing occupies zero bytes per element, and the writers divide by the
+/// element size exactly as the readers do — the chunked splitter clamps a row
+/// copy to an element boundary with `% element_size`, which panicked outright.
+/// A caller-built `Datatype` never passes through the parse-side refusal, so
+/// every door into the writer refuses one itself (issue #268).
+#[test]
+fn a_zero_width_element_type_is_refused_by_every_write_path() {
+    // Chunked: the path that panicked. The element bytes are empty on purpose —
+    // four elements of zero width *is* zero bytes, so this satisfies the
+    // shape-versus-data check and reaches the chunk splitter, which is where the
+    // division by the element size lives. Supplying non-empty data instead would
+    // be refused earlier as a shape mismatch and never exercise it.
+    let mut chunked = FileBuilder::new();
+    chunked
+        .create_dataset("d")
+        .with_raw_data(zero_width_type(), Vec::new(), 4)
+        .with_chunks(&[2]);
+
+    // Contiguous: no panic, but it wrote a file this crate's own reader refuses.
+    let mut contiguous = FileBuilder::new();
+    contiguous
+        .create_dataset("d")
+        .with_raw_data(zero_width_type(), Vec::new(), 4);
+
+    // Committed: written as an object of its own, for datasets to name.
+    let mut committed = FileBuilder::new();
+    committed.commit_datatype("t", zero_width_type());
+    committed.create_dataset("d").with_i32_data(&[1]);
+
+    for (path, result) in [
+        ("chunked", chunked.finish()),
+        ("contiguous", contiguous.finish()),
+        ("committed", committed.finish()),
+    ] {
+        match result {
+            Err(Error::Format(FormatError::ZeroSizedDatatype { class: 3 })) => {}
+            other => panic!(
+                "{path}: expected ZeroSizedDatatype for class 3, got {:?}",
+                other.map(|b| b.len())
+            ),
+        }
+    }
 }
 
 #[test]

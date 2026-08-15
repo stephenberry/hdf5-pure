@@ -356,6 +356,7 @@ macro_rules! block_elements {
                         .field("real", $make())
                         .field("imag", $make())
                         .build()
+                        .expect("two fields of a nonzero-width component")
                 }
             }
         )*

@@ -1,7 +1,10 @@
 //! Tests for in-place editing via `File::open_rw` (issue #32, Group C):
 //! add, delete, and copy datasets and groups at any path.
 
-use hdf5_pure::{AttrValue, DType, Error, File, FileBuilder, FormatError, Object, ScaleOffset};
+use hdf5_pure::{
+    AttrValue, CharacterSet, DType, Datatype, Error, File, FileBuilder, FormatError, Object,
+    ScaleOffset, StringPadding,
+};
 
 /// Write a starter file with one dataset, returning its path.
 fn write_starter(path: &std::path::Path) {
@@ -3643,5 +3646,55 @@ fn write_dataset_rejects_vlen_strings_without_writing() {
         file.dataset("labels").unwrap().read_string().unwrap(),
         vec!["a".to_string(), "b".to_string()]
     );
+    std::fs::remove_file(&path).ok();
+}
+
+/// A staged dataset whose datatype occupies zero bytes per element is refused at
+/// `commit`, alongside the other dataset guards, rather than reaching the write.
+/// The whole-file writer refuses the same type; this is the second door into a
+/// file, and a caller-built `Datatype` reaches it without passing through the
+/// parse-side refusal (issue #268).
+#[test]
+fn a_zero_width_element_type_is_refused_by_a_staged_write() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_zero_width.h5");
+    write_starter(&path);
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("zero_width", |b| {
+                // Empty element bytes on purpose: four elements of zero width
+                // *is* zero bytes, so this satisfies the shape-versus-data check
+                // and reaches the chunk splitter, where the division by the
+                // element size lives. Non-empty data would be refused earlier as
+                // a shape mismatch and never exercise it.
+                b.with_raw_data(
+                    Datatype::String {
+                        size: 0,
+                        padding: StringPadding::NullPad,
+                        charset: CharacterSet::Ascii,
+                    },
+                    Vec::new(),
+                    4,
+                )
+                .with_chunks(&[2]);
+            })
+            .unwrap();
+        match session.commit() {
+            Err(Error::Format(FormatError::ZeroSizedDatatype { class: 3 })) => {}
+            other => panic!("expected ZeroSizedDatatype for class 3, got {other:?}"),
+        }
+    }
+
+    // A refused commit leaves the file exactly as it was.
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("original").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    drop(file);
     std::fs::remove_file(&path).ok();
 }

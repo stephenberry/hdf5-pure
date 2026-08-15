@@ -1066,6 +1066,43 @@ impl Datatype {
             }
         }
     }
+
+    /// The class code this type encodes as, the low nibble of a datatype
+    /// message's first byte.
+    ///
+    /// Kept beside [`type_size`](Self::type_size) rather than read back out of
+    /// [`serialize`](Self::serialize), so naming the class in an error costs no
+    /// encoding.
+    pub(crate) fn class_code(&self) -> u8 {
+        match self {
+            Datatype::FixedPoint { .. } => 0,
+            Datatype::FloatingPoint { .. } => 1,
+            Datatype::Time { .. } => 2,
+            Datatype::String { .. } => 3,
+            Datatype::BitField { .. } => 4,
+            Datatype::Opaque { .. } => 5,
+            Datatype::Compound { .. } => 6,
+            Datatype::Reference { .. } => 7,
+            Datatype::Enumeration { .. } => 8,
+            Datatype::VariableLength { .. } => 9,
+            Datatype::Array { .. } => 10,
+        }
+    }
+
+    /// Refuse a type that occupies zero bytes per element.
+    ///
+    /// The writers divide by the element size exactly as the readers do, and a
+    /// `Datatype` a caller constructs never passes through
+    /// [`parse`](Self::parse), where a file-sourced one is refused. This is the
+    /// same refusal for the other direction.
+    pub(crate) fn ensure_nonzero_size(&self) -> Result<(), FormatError> {
+        if self.type_size() == 0 {
+            return Err(FormatError::ZeroSizedDatatype {
+                class: self.class_code(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Build a datatype header (8 bytes) for testing.

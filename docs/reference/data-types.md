@@ -165,7 +165,7 @@ These are the building blocks for compound, enum, and array datatypes.
 
 ### `CompoundTypeBuilder`
 
-Builds a compound datatype with fields laid out contiguously in insertion order (offsets are computed automatically). `new()` starts an empty builder; `field(name, datatype)` adds an arbitrary field, and the typed helpers `f64_field`, `f32_field`, `i8_field`, `i16_field`, `i32_field`, `i64_field`, `u8_field`, `u16_field`, `u32_field`, `u64_field` add a named scalar field. `build()` returns the `Datatype`.
+Builds a compound datatype with fields laid out contiguously in insertion order (offsets are computed automatically). `new()` starts an empty builder; `field(name, datatype)` adds an arbitrary field, and the typed helpers `f64_field`, `f32_field`, `i8_field`, `i16_field`, `i32_field`, `i64_field`, `u8_field`, `u16_field`, `u32_field`, `u64_field` add a named scalar field. `build()` returns `Result<Datatype, FormatError>`, refusing a builder with no fields and one whose fields pack to zero bytes.
 
 ```rust
 use hdf5_pure::CompoundTypeBuilder;
@@ -173,7 +173,8 @@ use hdf5_pure::CompoundTypeBuilder;
 let dt = CompoundTypeBuilder::new()
     .i32_field("id")
     .f64_field("value")
-    .build();
+    .build()
+    .unwrap();
 ```
 
 ### `ExplicitCompoundTypeBuilder`
@@ -201,7 +202,8 @@ let dt = EnumTypeBuilder::i32_based()
     .value("Red", 0)
     .value("Green", 1)
     .value("Blue", 2)
-    .build();
+    .build()
+    .unwrap();
 ```
 
 ## `CompoundType` and `CompoundField`

@@ -215,8 +215,18 @@ impl CompoundTypeBuilder {
         self.field(name, make_u64_type())
     }
 
-    /// Build the compound datatype.
-    pub fn build(self) -> Datatype {
+    /// Build the compound datatype, packing the fields in the order they were
+    /// added.
+    ///
+    /// Fails with [`FormatError::EmptyCompoundType`] over no fields, and with
+    /// [`FormatError::InvalidCompoundSize`] when the fields pack to zero bytes —
+    /// the two things `H5Tcreate(H5T_COMPOUND, ..)` also refuses, and the two
+    /// that make a datatype nothing downstream can use: every writer and reader
+    /// divides raw bytes by the element size to recover an element count.
+    pub fn build(self) -> Result<Datatype, FormatError> {
+        if self.fields.is_empty() {
+            return Err(FormatError::EmptyCompoundType);
+        }
         let mut offset = 0u64;
         let mut members = Vec::with_capacity(self.fields.len());
         for (name, dt) in self.fields {
@@ -228,14 +238,17 @@ impl CompoundTypeBuilder {
             });
             offset += sz as u64;
         }
-        Datatype::Compound {
+        if offset == 0 {
+            return Err(FormatError::InvalidCompoundSize);
+        }
+        Ok(Datatype::Compound {
             #[expect(
                 clippy::cast_possible_truncation,
                 reason = "accumulated compound size is stored in the 4-byte datatype size field"
             )]
             size: offset as u32,
             members,
-        }
+        })
     }
 }
 
@@ -1861,7 +1874,8 @@ impl DatasetBuilder {
         let ct = CompoundTypeBuilder::new()
             .field("real", T::datatype())
             .field("imag", T::datatype())
-            .build();
+            .build()
+            .expect("two fields of a nonzero-width component");
         let width = size_of::<T>();
         let mut raw = vec![0u8; data.len() * 2 * width];
         for (slot, &(re, im)) in raw.chunks_exact_mut(2 * width).zip(data) {
