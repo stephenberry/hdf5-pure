@@ -1939,64 +1939,73 @@ fn chunk_index_bytes(
     written_chunks: &[WrittenChunk],
     index_address: u64,
 ) -> Result<(Vec<u8>, Vec<u8>), FormatError> {
-    let offset_size = INDEX_OFFSET_SIZE;
-    let length_size = INDEX_LENGTH_SIZE;
+    let index = match chunk_index_kind(set.use_extensible, written_chunks.len()) {
+        ChunkIndexKind::ExtensibleArray => build_extensible_array_at(
+            written_chunks,
+            INDEX_OFFSET_SIZE,
+            INDEX_LENGTH_SIZE,
+            set.has_filters,
+            index_address,
+        )?,
+        ChunkIndexKind::SingleChunk => Vec::new(),
+        ChunkIndexKind::FixedArray => build_fixed_array_at(
+            written_chunks,
+            INDEX_OFFSET_SIZE,
+            INDEX_LENGTH_SIZE,
+            set.has_filters,
+            index_address,
+        ),
+    };
+    Ok((
+        index,
+        chunk_index_layout(set, written_chunks, index_address),
+    ))
+}
+
+/// The data-layout message for `set`'s index at `index_address`.
+///
+/// Split out of [`chunk_index_bytes`] because sizing an object header needs the
+/// message and not the index: the message names the index's address, which is
+/// known before a byte of it is built. Building one to size the other is the
+/// defect issues #265 and #275 removed a level up, and this is the same one a
+/// level down.
+fn chunk_index_layout(
+    set: &CompressedChunkSet,
+    written_chunks: &[WrittenChunk],
+    index_address: u64,
+) -> Vec<u8> {
     let has_filters = set.has_filters;
 
     #[expect(
         clippy::cast_possible_truncation,
         reason = "element size written into the on-disk u32 dimension field selected for this file"
     )]
-    let (index, layout_message) = match chunk_index_kind(set.use_extensible, written_chunks.len()) {
-        ChunkIndexKind::ExtensibleArray => {
-            let ea_bytes = build_extensible_array_at(
-                written_chunks,
-                offset_size,
-                length_size,
-                has_filters,
-                index_address,
-            )?;
-            let layout = serialize_v4_extensible_array(
-                &set.chunk_dims_u32,
-                index_address,
-                offset_size,
-                set.element_size.get() as u32,
-            );
-            (ea_bytes, layout)
-        }
+    match chunk_index_kind(set.use_extensible, written_chunks.len()) {
+        ChunkIndexKind::ExtensibleArray => serialize_v4_extensible_array(
+            &set.chunk_dims_u32,
+            index_address,
+            INDEX_OFFSET_SIZE,
+            set.element_size.get() as u32,
+        ),
         ChunkIndexKind::SingleChunk => {
             let chunk = &written_chunks[0];
-            let filtered_size = has_filters.then_some(chunk.compressed_size);
-            let filter_mask = has_filters.then_some(0u32);
-            let layout = serialize_v4_single_chunk(
+            serialize_v4_single_chunk(
                 &set.chunk_dims_u32,
                 chunk.address,
-                filtered_size,
-                filter_mask,
-                offset_size,
+                has_filters.then_some(chunk.compressed_size),
+                has_filters.then_some(0u32),
+                INDEX_OFFSET_SIZE,
                 set.element_size.get() as u32,
-            );
-            (Vec::new(), layout)
+            )
         }
-        ChunkIndexKind::FixedArray => {
-            let fa_bytes = build_fixed_array_at(
-                written_chunks,
-                offset_size,
-                length_size,
-                has_filters,
-                index_address,
-            );
-            let layout = serialize_v4_fixed_array(
-                &set.chunk_dims_u32,
-                index_address,
-                offset_size,
-                set.element_size.get() as u32,
-                FIXED_ARRAY_PAGE_BITS,
-            );
-            (fa_bytes, layout)
-        }
-    };
-    Ok((index, layout_message))
+        ChunkIndexKind::FixedArray => serialize_v4_fixed_array(
+            &set.chunk_dims_u32,
+            index_address,
+            INDEX_OFFSET_SIZE,
+            set.element_size.get() as u32,
+            FIXED_ARRAY_PAGE_BITS,
+        ),
+    }
 }
 
 /// The exact byte length [`assemble_chunked_at`] produces for `set` — the same
@@ -2053,10 +2062,31 @@ pub(crate) fn measure_chunked_at(
     set: &CompressedChunkSet,
     base_address: u64,
 ) -> Result<ChunkedMeasure, FormatError> {
-    let (chunk_bytes_total, index, layout_message) = plan_chunked_at(set, base_address)?;
+    let (written_chunks, index_address) = plan_chunk_slots(set, base_address);
+    // Derived from the plan already in hand rather than by building the index —
+    // and from *this* plan rather than by calling `chunked_data_len`, which
+    // would lay the chunks out a second time to reach the same answer.
+    let index_len = chunk_index_kind(set.use_extensible, written_chunks.len())
+        .array_kind()
+        .map_or(0, |array| {
+            chunk_index_len(
+                array,
+                &written_chunks,
+                INDEX_OFFSET_SIZE,
+                INDEX_LENGTH_SIZE,
+                set.has_filters,
+            )
+        });
+    let data_len = (index_address - base_address) + index_len;
+    // Not building the index also stops it from *refusing*, and the only way it
+    // can is a length that does not fit this platform's `usize`. Every such
+    // check inside the build is on a part of this region, so the whole region
+    // fitting means all of them do: the refusal survives the build's removal,
+    // and stays where it was — before the writer has emitted a byte.
+    data_len.to_usize()?;
     Ok(ChunkedMeasure {
-        data_len: (chunk_bytes_total + index.len()) as u64,
-        layout_message,
+        data_len,
+        layout_message: chunk_index_layout(set, &written_chunks, index_address),
         pipeline_message: set.pipeline_message.clone(),
     })
 }
@@ -2455,6 +2485,60 @@ mod tests {
         data.chunks(8)
             .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
             .collect()
+    }
+
+    /// Measuring a chunked region and assembling it must agree on its length and
+    /// its layout message, at any address.
+    ///
+    /// This is the invariant the object-header sizing pass rests on: it asks
+    /// `measure_chunked_at` how long the region will be, writes a header sized
+    /// to that answer, and only then asks `assemble_chunked_at` for the bytes.
+    /// A disagreement is not a failed write — it is a file whose header points
+    /// somewhere the data is not, which every reader accepts and misreads.
+    ///
+    /// Measuring no longer builds the index to find its length (issue #228), so
+    /// the two answers now come from different code. Checked across all three
+    /// index kinds, since each has its own length rule, and at more than one
+    /// address, since only the layout message depends on the address.
+    #[test]
+    fn measuring_a_chunked_region_agrees_with_assembling_it() {
+        /// Dataset shape, chunk shape, and maxshape: the three inputs that
+        /// decide which index kind a set gets.
+        type Case = (&'static [u64], &'static [u64], Option<&'static [u64]>);
+
+        // Chunk counts chosen for the kind each selects: one chunk is
+        // `SingleChunk`, a fixed shape with many is `FixedArray`, and an
+        // unlimited maxshape is `ExtensibleArray`.
+        let cases: [Case; 4] = [
+            (&[512], &[512], None),
+            (&[4096], &[512], None),
+            (&[4096], &[64], None),
+            (&[4096], &[512], Some(&[u64::MAX])),
+        ];
+
+        for (shape, chunk_dims, maxshape) in cases {
+            let elems: usize = shape.iter().product::<u64>().to_usize().unwrap();
+            let raw = f64_to_bytes(&(0..elems).map(|i| i as f64).collect::<Vec<f64>>());
+            let ctx = ChunkContext::basic(chunk_dims, 8);
+            let set =
+                compress_chunks(&raw, shape, ctx, &ChunkOptions::default(), maxshape).unwrap();
+
+            for base in [0u64, 0x1000, 0x1234_5678] {
+                let measured = measure_chunked_at(&set, base).unwrap();
+                let assembled = assemble_chunked_at(&set, base).unwrap();
+                assert_eq!(
+                    measured.data_len,
+                    assembled.data_bytes.len() as u64,
+                    "measured and assembled lengths differ for shape {shape:?} in \
+                     chunks {chunk_dims:?} at {base:#x}"
+                );
+                assert_eq!(
+                    measured.layout_message, assembled.layout_message,
+                    "measured and assembled layout messages differ for shape \
+                     {shape:?} in chunks {chunk_dims:?} at {base:#x}"
+                );
+            }
+        }
     }
 
     /// Helper: build a chunked file blob and read it back using read_chunked_data

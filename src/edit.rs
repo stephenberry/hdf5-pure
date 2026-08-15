@@ -7458,7 +7458,7 @@ fn chunk_index_enumerable(version: u8, chunk_index_type: Option<u8>) -> bool {
 /// Whether every filter in `pipeline` is one this crate can *apply* (re-encode a
 /// chunk through) — not merely decode. A pipeline with any other filter cannot be
 /// re-encoded for an in-place overwrite, so the caller refuses with a typed error
-/// rather than letting [`compress_chunk`] surface a raw `UnsupportedFilter`.
+/// rather than letting `compress_chunk` surface a raw `UnsupportedFilter`.
 pub(crate) fn pipeline_reencodable(pipeline: &FilterPipeline) -> bool {
     pipeline.filters.iter().all(|f| match f.filter_id {
         FILTER_DEFLATE | FILTER_SHUFFLE | FILTER_FLETCHER32 | FILTER_SCALEOFFSET | FILTER_LZF => {

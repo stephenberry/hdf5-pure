@@ -1556,9 +1556,16 @@ impl FileWriter {
         /// Build the chunked data + layout/pipeline messages for one chunked
         /// dataset at `base_address`, dispatching to the verbatim path when the
         /// dataset carries a raw-chunk payload, else the normal encode path. The
-        /// single dispatch point keeps the dummy-sizing and real-address passes
-        /// from diverging. The layout is computed from chunk *sizes* alone, so
-        /// it is identical whether the chunks are in memory or streamed.
+        /// layout is computed from chunk *sizes* alone, so it is identical
+        /// whether the chunks are in memory or streamed.
+        ///
+        /// [`measure_chunked`] dispatches the same two ways and must reach the
+        /// same length and the same layout message, since the sizing pass uses
+        /// it and this produces what that pass sized. They were one function
+        /// until sizing stopped building a region to measure it (issue #228);
+        /// what holds them together now is
+        /// `measuring_a_chunked_region_agrees_with_assembling_it` on the encode
+        /// side and `plan_chunked_data_verbatim` being shared on the other.
         fn build_chunked(
             d: &DsFlat,
             base_address: u64,

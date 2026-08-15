@@ -70,6 +70,16 @@ fn windowed_row_read_allocates_on_the_order_of_the_window() {
          not the {DATASET_BYTES}-byte dataset; measured {measured}"
     );
 
+    // The read's own output is in this measurement, so its size is a floor a
+    // measurement of nothing cannot reach. Without it the ceiling above passes
+    // on a read whose work moved to a thread this region does not see.
+    const WINDOW_BYTES: usize = 64 * ROW_ELEMS * 8;
+    assert!(
+        measured.live_bytes >= WINDOW_BYTES as u64,
+        "the window this read returned is not in its own measurement, so the \
+         ceiling above is bounding something other than the read: {measured}"
+    );
+
     // The window must still be the right bytes.
     let expected: Vec<f64> = (992 * ROW_ELEMS..(992 + 64) * ROW_ELEMS)
         .map(|i| i as f64)
@@ -132,6 +142,29 @@ fn windowed_vlen_string_read_allocates_on_the_order_of_the_window() {
         measured.blocks < (N0 / 8) as u64,
         "a windowed vlen read must not allocate per object of the collection it \
          walks: measured {measured} over a {N0}-object collection"
+    );
+
+    // The third axis, and the one this test was blind to: bytes *moved*. The
+    // peak cannot see it, because each directory window replaces the last rather
+    // than accumulating, and the block count *falls* when refills get larger —
+    // so a change that reads a megabyte per refill instead of a page passes both
+    // bounds above while reading thirty times the file. What holds is that the
+    // walk crosses the collection about once: it must pass every object before
+    // the window, since the format chains each object's position in the previous
+    // one, but it has no reason to pass any of them twice.
+    assert!(
+        measured.bytes < (PAYLOAD_BYTES * 2) as u64,
+        "a windowed vlen read must cross its collection about once, not \
+         repeatedly: measured {measured} against a {PAYLOAD_BYTES}-byte payload"
+    );
+
+    // The strings this read returned are in the measurement, so their size is a
+    // floor a measurement of nothing cannot reach.
+    const WINDOW_TEXT_BYTES: usize = 256 * STR_LEN;
+    assert!(
+        measured.live_bytes >= WINDOW_TEXT_BYTES as u64,
+        "the strings this read returned are not in its own measurement, so the \
+         bounds above are bounding something other than the read: {measured}"
     );
 
     // The window must still be the right strings.
@@ -213,6 +246,15 @@ fn whole_read_of_adjacent_chunks_costs_a_constant_per_chunk() {
          {BLOCKS_PER_CHUNK} per chunk this bound allows"
     );
 
+    // The read's own output is the dataset, so its size is a floor a measurement
+    // of nothing cannot reach — which is what all three ceilings above become if
+    // the per-chunk work moves to a thread this region does not see.
+    assert!(
+        measured.live_bytes >= DATASET_BYTES as u64,
+        "the dataset this read returned is not in its own measurement, so the \
+         three bounds above are bounding something other than the read: {measured}"
+    );
+
     assert_eq!(all.len(), DATASET_BYTES);
     assert_eq!(
         &all[DATASET_BYTES - 8..],
@@ -267,12 +309,16 @@ fn chunked_write_costs_a_constant_per_chunk() {
          one more: measured {measured} against a {DATASET_BYTES}-byte dataset"
     );
 
-    const BLOCKS_PER_CHUNK: u64 = 2;
+    // Measured at 1.06 allocations per chunk, and allowed half again. Two per
+    // chunk — what this allowed first — is exactly what *one* restored scratch
+    // `Vec` in the splitter loop costs, so a bound there absorbs the defect it
+    // names: the splitter kept three, and only restoring all three failed it.
+    const BLOCKS_PER_TWO_CHUNKS: u64 = 3;
     assert!(
-        measured.blocks <= BLOCKS_PER_CHUNK * CHUNKS + 256,
+        measured.blocks <= BLOCKS_PER_TWO_CHUNKS * CHUNKS / 2 + 256,
         "a chunked write must cost a small constant number of allocations per \
          chunk: measured {measured} over {CHUNKS} chunks, above the \
-         {BLOCKS_PER_CHUNK} per chunk this bound allows"
+         {BLOCKS_PER_TWO_CHUNKS} per two chunks this bound allows"
     );
 
     // The file must still be the right file.

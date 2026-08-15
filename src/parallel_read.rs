@@ -11,7 +11,7 @@ use crate::chunked_read::ChunkInfo;
 use crate::convert::slice_range;
 use crate::error::FormatError;
 use crate::filter_pipeline::FilterPipeline;
-use crate::filters::{ChunkContext, decompress_chunk};
+use crate::filters::{ChunkContext, FilterScratch, decompress_chunk_with};
 use crate::lane_partition::{self, LaneStats, PartitionStats};
 
 /// Threshold: only use parallel decompression when chunk count exceeds this.
@@ -67,6 +67,10 @@ pub fn decompress_chunks_lane_partitioned(
         .map(|indices| {
             let mut results = Vec::with_capacity(indices.len());
             let mut stats = LaneStats::default();
+            // One decoder per lane rather than per chunk. It cannot be shared
+            // across lanes — each runs on its own thread — but a lane decodes
+            // many chunks, which is where the per-chunk cost was (issue #228).
+            let mut scratch = FilterScratch::new();
 
             for &index in &indices {
                 let chunk_info = &chunks[index];
@@ -80,8 +84,13 @@ pub fn decompress_chunks_lane_partitioned(
                 }
                 let raw_chunk = &file_data[r];
 
-                let decompressed =
-                    decompress_chunk(raw_chunk, pipeline, ctx, chunk_info.filter_mask)?;
+                let decompressed = decompress_chunk_with(
+                    &mut scratch,
+                    raw_chunk,
+                    pipeline,
+                    ctx,
+                    chunk_info.filter_mask,
+                )?;
 
                 stats.chunks_processed += 1;
                 stats.compressed_bytes += u64::from(chunk_info.chunk_size);
@@ -120,6 +129,7 @@ pub fn decompress_chunks_lane_partitioned(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::filters::decompress_chunk;
 
     /// Build a file buffer holding `n` chunks of `chunk_len` bytes each, laid
     /// out back to back, where chunk `i` is filled with the byte `i as u8`.

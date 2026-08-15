@@ -119,6 +119,11 @@ pub fn measure<R>(name: &'static str, work: impl FnOnce() -> R) -> (R, Measured)
         "the live-block table filled up, so every figure for {name:?} is missing \
          however many allocations it turned away"
     );
+    assert_eq!(
+        snapshot.rows_dropped, 0,
+        "the profiler turned away attribution rows, and a region is one, so \
+         {name:?}'s row may be short of what it should hold"
+    );
 
     let stats = snapshot
         .regions

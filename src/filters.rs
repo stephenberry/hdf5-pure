@@ -149,7 +149,7 @@ pub fn zfp_element_type_from_datatype(
 /// and it dominated both: 615 MiB of allocation to write an 8 MiB deflated
 /// dataset and 85 MiB to read it back, against 8 MiB of data (issue #228). So a
 /// caller with a loop keeps one of these across it and calls the `*_with` entry
-/// points; a caller with a single chunk uses [`compress_chunk`] or
+/// points; a caller with a single chunk uses `compress_chunk` or
 /// [`decompress_chunk`], which make one for the call.
 ///
 /// Each half is built on first use, so a pipeline with no deflate stage — or a
@@ -188,8 +188,10 @@ impl FilterScratch {
 
     /// The reusable decoder, reset to the start of a zlib stream.
     ///
-    /// Resetting on the way *out* rather than the way in is what makes a decode
-    /// that failed halfway leave nothing behind for the next chunk.
+    /// Resetting on the way *in* rather than the way out is what makes a decode
+    /// that failed halfway leave nothing behind for the next chunk: the failing
+    /// call returns early by definition, so any cleanup it was supposed to do on
+    /// the way out is the cleanup that does not happen.
     #[cfg(feature = "deflate")]
     fn zlib_decoder(&mut self) -> &mut flate2::Decompress {
         match &mut self.decoder {
@@ -387,9 +389,14 @@ fn inner_output_cap(
 /// Apply a filter pipeline to compress a chunk, making the working state for the
 /// call.
 ///
+/// Test-only: every place this crate compresses a chunk does so in a loop, and
+/// each of those keeps one [`FilterScratch`] across it. Kept because a test that
+/// wants one chunk should not have to say so in three lines.
+///
 /// A caller compressing chunk after chunk should keep a [`FilterScratch`] and use
 /// [`compress_chunk_with`] instead: this one builds and drops a zlib encoder per
 /// call, which is ~300 KiB of hash tables per chunk.
+#[cfg(test)]
 pub fn compress_chunk(
     data: &[u8],
     pipeline: &FilterPipeline,
@@ -514,9 +521,19 @@ const DEFLATE_GROWTH_FLOOR: usize = 4096;
 /// allocation per chunk is what this exists to stop paying (issue #228).
 ///
 /// The bomb guard the `Read` path wrote as `take(limit + 1)` is an explicit
-/// ceiling on the output buffer here: it never grows past `limit + 1`, so a
-/// stream that would inflate further is refused on the same evidence, having
-/// allocated no more than one byte beyond what a legitimate chunk needs.
+/// ceiling on the output buffer here: the buffer's *length* never passes
+/// `limit + 1`, so a stream that would inflate further is refused on the same
+/// evidence. Its *capacity* can reach twice that, since the growth below is
+/// `Vec::reserve` and amortized — which is what `read_to_end` did too, so the
+/// memory a bomb can command is unchanged.
+///
+/// This path is stricter than the one it replaced in one respect. `read_to_end`
+/// stops at the first `Ok(0)`, and `flate2::read::ZlibDecoder` returns `Ok(0)`
+/// when its input runs out mid-stream, so a chunk that carried all its data but
+/// never reached `StreamEnd` used to decode and pass with its adler32 never
+/// checked. Here that is a `truncated` refusal and the chunk does not decode.
+/// `an_unterminated_stream_is_refused_where_the_read_path_accepted_it` pins both
+/// halves.
 #[cfg(feature = "deflate")]
 fn deflate_decompress(
     scratch: &mut FilterScratch,
@@ -615,14 +632,24 @@ fn deflate_compress(
 ) -> Result<Vec<u8>, FormatError> {
     use std::io::Write;
     let encoder = scratch.zlib_encoder(level);
-    encoder
+    // Finishes the stream into the buffer the encoder is holding and hands that
+    // buffer back, leaving a reset encoder wrapped around the empty one.
+    let finished = encoder
         .write_all(data)
-        .map_err(|e| FormatError::CompressionError(e.to_string()))?;
-    // Finishes the stream into the buffer it is holding and hands that buffer
-    // back, leaving a reset encoder wrapped around the empty one.
-    encoder
-        .reset(Vec::new())
-        .map_err(|e| FormatError::CompressionError(e.to_string()))
+        .and_then(|()| encoder.reset(Vec::new()))
+        .map_err(|e| FormatError::CompressionError(e.to_string()));
+    if finished.is_err() {
+        // Either step failing leaves the encoder mid-stream, and the next chunk
+        // would append to this one's unfinished output. The decoder avoids the
+        // same trap by resetting on acquisition; the encoder cannot, since its
+        // reset is what produces the bytes, so it is discarded instead.
+        //
+        // Unreachable while the sink is a `Vec`, whose writes do not fail. It is
+        // handled rather than asserted because what makes it unreachable is the
+        // sink type, which is not this function's to guarantee.
+        scratch.encoder = None;
+    }
+    finished
 }
 
 #[cfg(not(feature = "deflate"))]
@@ -1319,6 +1346,47 @@ mod tests {
         assert_eq!(
             deflate_decompress(&mut scratch, &good, Some(2048)).unwrap(),
             vec![9u8; 2048]
+        );
+    }
+
+    /// A zlib stream that carries every byte of its chunk but never reaches
+    /// `StreamEnd` is refused, where the `Read`-based decoder this replaced
+    /// accepted it.
+    ///
+    /// `read_to_end` stops at the first `Ok(0)`, and `flate2::read::ZlibDecoder`
+    /// returns `Ok(0)` when its input runs out mid-stream — so a chunk whose
+    /// adler32 trailer was never written decoded to exactly the expected length
+    /// and passed, with its checksum unverified. This asserts both halves, so
+    /// the change of behaviour is pinned rather than incidental.
+    #[test]
+    #[cfg(feature = "deflate")]
+    fn an_unterminated_stream_is_refused_where_the_read_path_accepted_it() {
+        use std::io::Read;
+
+        let data = vec![7u8; 500];
+        let complete = deflate_compress(&mut FilterScratch::new(), &data, 6).unwrap();
+        // Every byte of compressed data, minus the 4-byte adler32 trailer.
+        let unterminated = &complete[..complete.len() - 4];
+
+        // The path this replaced: all 500 bytes, no error, checksum unchecked.
+        let mut accepted = Vec::new();
+        flate2::read::ZlibDecoder::new(unterminated)
+            .read_to_end(&mut accepted)
+            .unwrap();
+        assert_eq!(accepted, data, "fixture is not a full-length truncation");
+
+        let err = deflate_decompress(&mut FilterScratch::new(), unterminated, Some(500))
+            .expect_err("an unterminated stream must not decode");
+        assert!(
+            format!("{err}").contains("stream ended before the chunk was complete"),
+            "expected the truncation refusal, got {err}"
+        );
+
+        // The complete stream still decodes, so the refusal is about termination
+        // and not about the data.
+        assert_eq!(
+            deflate_decompress(&mut FilterScratch::new(), &complete, Some(500)).unwrap(),
+            data
         );
     }
 

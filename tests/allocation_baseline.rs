@@ -92,6 +92,14 @@ static ALLOC: heapscope::Alloc = heapscope::Alloc::system();
 /// where all but a constant of the allocations in either path live.
 #[test]
 fn writing_and_reading_a_chunked_dataset_matches_its_recorded_figures() {
+    // The fixture's location is built *before* the profiler starts, so nothing
+    // it costs is in the baseline. A temporary directory's path length follows
+    // `TMPDIR`, and the figures here are exact: measured inside, a longer
+    // `TMPDIR` moved `currBytes` from 177 to 672 and reported it as "some path
+    // started allocating more", which is the wrong diagnosis for a machine.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("baseline.h5");
+
     let _profiler = heapscope::Profiler::builder()
         .no_output()
         .build()
@@ -108,8 +116,6 @@ fn writing_and_reading_a_chunked_dataset_matches_its_recorded_figures() {
     const CHUNK_ELEMS: u64 = 512;
 
     let data: Vec<f64> = (0..N0).map(|i| i as f64).collect();
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("baseline.h5");
 
     let mut builder = FileBuilder::new();
     builder

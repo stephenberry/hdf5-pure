@@ -79,6 +79,17 @@ fn pad8_u64(x: u64) -> Result<u64, FormatError> {
 /// too far apart for a window to span two headers.
 const DIRECTORY_WINDOW: usize = 4096;
 
+/// How many recent strides decide a refill's span. One object larger than a
+/// window silences the read-ahead for this many objects, which is what keeps a
+/// collection of mixed sizes at one header-sized read per object instead of one
+/// window per object.
+const DIRECTORY_STRIDE_HISTORY: usize = 8;
+
+/// How many headers a refill reaches for, at the widest recent spacing. Bounds
+/// what a wrong guess costs: a refill reads this many strides, not a flat
+/// [`DIRECTORY_WINDOW`] regardless of how far apart the headers are.
+const DIRECTORY_LOOKAHEAD: u64 = 32;
+
 /// A bounded sliding view of one collection's bytes.
 ///
 /// The directory walk has to pass *every* object in a collection — each object's
@@ -98,6 +109,10 @@ struct DirectoryWindow {
     /// Where the previous request was, so the next refill can tell how far apart
     /// this collection's object headers are. `None` until the first one.
     last: Option<u64>,
+    /// The last [`DIRECTORY_STRIDE_HISTORY`] gaps between requested positions,
+    /// most recent last. Zero means "not yet observed", which a real stride
+    /// never is, since the walk's position strictly increases.
+    strides: [u64; DIRECTORY_STRIDE_HISTORY],
 }
 
 impl DirectoryWindow {
@@ -106,6 +121,7 @@ impl DirectoryWindow {
             start: 0,
             bytes: Vec::new(),
             last: None,
+            strides: [0; DIRECTORY_STRIDE_HISTORY],
         }
     }
 
@@ -122,11 +138,24 @@ impl DirectoryWindow {
     /// than its collection one of its own, so a dataset of large variable-length
     /// values is exactly this shape.
     ///
-    /// So the span is decided by how far apart the last two requests were. The
-    /// first refill reads `need` alone, because nothing is known yet; after that a
-    /// window is read only while a window would hold the next header too. Both
-    /// answers are self-correcting — a collection that changes shape halfway
-    /// through adapts within one object.
+    /// So the span is decided by how far apart recent headers have been. Two
+    /// things matter about *which* recent headers, and the first version of this
+    /// got both wrong by looking only at the last stride:
+    ///
+    /// * The widest of the last [`DIRECTORY_STRIDE_HISTORY`] strides decides,
+    ///   not the most recent one. A stride predicts the *next* gap, and one
+    ///   object's size says nothing about the next object's; in a collection
+    ///   whose sizes alternate, the stride into a header is smallest exactly
+    ///   when the stride out of it is largest, so reading on that signal reads a
+    ///   whole window and discards it at every transition. Taking the widest
+    ///   recent stride reads ahead only where objects have been *consistently*
+    ///   close, which is the only shape read-ahead pays on.
+    /// * The span is [`DIRECTORY_LOOKAHEAD`] strides, not a flat window, so what
+    ///   a wrong guess costs stays proportional to the spacing that justified it
+    ///   rather than being 4 KiB regardless.
+    ///
+    /// With no stride recorded yet the widest is zero and the span is `need`, so
+    /// the first refill reads nothing extra.
     ///
     /// # Bounds
     ///
@@ -153,22 +182,32 @@ impl DirectoryWindow {
                     .is_some_and(|end| end <= self.bytes.len())
             });
 
-        let stride = self.last.map(|last| pos.saturating_sub(last));
+        if let Some(last) = self.last {
+            self.strides.rotate_left(1);
+            self.strides[DIRECTORY_STRIDE_HISTORY - 1] = pos.saturating_sub(last);
+        }
         self.last = Some(pos);
 
         let at = match held {
             Some(at) => at,
             None => {
-                // A window is worth reading only if the header after this one
-                // would fall inside it. `None` is the first refill, which knows
-                // nothing and so reads nothing extra.
-                let ahead = match stride {
-                    Some(stride)
-                        if stride.saturating_add(need as u64) <= DIRECTORY_WINDOW as u64 =>
-                    {
-                        DIRECTORY_WINDOW
-                    }
-                    _ => need,
+                // The widest recent gap, so that one large object among small
+                // ones stops the read-ahead rather than being averaged away.
+                let widest = self.strides.iter().copied().max().unwrap_or(0);
+                let ahead = if widest.saturating_add(need as u64) > DIRECTORY_WINDOW as u64 {
+                    // Headers are further apart than a window, so a window could
+                    // not hold a second one: read this header and nothing else.
+                    need
+                } else {
+                    // Cover the next `DIRECTORY_LOOKAHEAD` headers at the widest
+                    // spacing seen. Zero (nothing observed yet) lands on `need`.
+                    widest
+                        .saturating_mul(DIRECTORY_LOOKAHEAD)
+                        .saturating_add(need as u64)
+                        .min(DIRECTORY_WINDOW as u64)
+                        .to_usize()
+                        .unwrap_or(need)
+                        .max(need)
                 };
                 // Clamped to one window before the narrowing, so the conversion
                 // cannot lose anything on a 32-bit target and the fallback is
@@ -513,13 +552,15 @@ mod tests {
         let coll = GlobalHeapIndex::parse(&source, 0, 8).unwrap();
         assert_eq!(coll.objects.len(), OBJECTS as usize);
 
-        // The collection's directory spans four windows at most, plus the
-        // collection header's own read. A walk that reads per object takes 512 of
-        // them or twice that; the point of the bound is the gap between the two,
-        // not its exact value.
+        // One read must serve many objects. The exact ratio follows
+        // `DIRECTORY_LOOKAHEAD` and the object size — these are 8-byte objects,
+        // the smallest a collection holds, so their stride buys the least
+        // read-ahead of any shape. A walk that reads per object takes 512 reads
+        // or twice that; the point of the bound is the gap between the two, not
+        // its exact value.
         let reads = source.reads.get();
         assert!(
-            reads <= 8,
+            reads <= OBJECTS as usize / 16,
             "walking {OBJECTS} objects took {reads} reads, which scales with the \
              object count rather than the {} bytes of collection it covers",
             source.data.len()
@@ -581,6 +622,78 @@ mod tests {
             "walking {OBJECTS} objects of 5,000 bytes read {read} bytes of a \
              {}-byte collection; a window per object rather than a header per \
              object is the failure this bounds",
+            source.data.len()
+        );
+    }
+
+    /// The shape that defeats a read-ahead judged by the *last* stride: object
+    /// sizes that alternate, so the gap into each header is smallest exactly
+    /// when the gap out of it is largest.
+    ///
+    /// A rule that read a window whenever the previous object was small read
+    /// 4 KiB and used 16 bytes of it at every transition — 8.3 MB of a 10 MB
+    /// file to resolve a 16-row window, 54x what the per-object reads it
+    /// replaced cost. Deciding on the *widest* recent stride instead reads
+    /// ahead only where objects have been consistently close, so this shape
+    /// costs a header apiece.
+    ///
+    /// Bounded against the per-object read it must not lose to, rather than
+    /// against a measured figure, so the rule is what holds and not one
+    /// fixture's answer.
+    #[test]
+    fn the_directory_walk_does_not_read_a_window_per_alternating_object() {
+        use core::cell::Cell;
+
+        struct VolumeSource {
+            data: Vec<u8>,
+            bytes_read: Cell<usize>,
+        }
+
+        impl Source for VolumeSource {
+            fn len(&self) -> u64 {
+                self.data.len() as u64
+            }
+
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
+                BytesSource::new(&self.data).read_at(offset, buf)
+            }
+
+            fn read_metadata_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
+                self.bytes_read.set(self.bytes_read.get() + len);
+                BytesSource::new(&self.data).read_exact_at(offset, len)
+            }
+        }
+
+        // Alternating 8-byte and 5,000-byte objects: half the strides fit in a
+        // window and half do not, and they interleave, so no single previous
+        // stride predicts the next.
+        const OBJECTS: u16 = 256;
+        let small = [0u8; 8];
+        let large = vec![0u8; 5000];
+        let objects: Vec<(u16, u16, &[u8])> = (1..=OBJECTS)
+            .map(|i| {
+                let payload: &[u8] = if i % 2 == 0 { &large[..] } else { &small[..] };
+                (i, 1, payload)
+            })
+            .collect();
+        let source = VolumeSource {
+            data: build_collection(&objects, 8),
+            bytes_read: Cell::new(0),
+        };
+
+        let coll = GlobalHeapIndex::parse(&source, 0, 8).unwrap();
+        assert_eq!(coll.objects.len(), OBJECTS as usize);
+
+        // The same allowance the uniform large-object case gets: a header
+        // apiece, the collection header, and one window of slack for the first
+        // refill, which has no stride to judge by. A window per transition is
+        // roughly 128 * 4096 and fails this by two orders of magnitude.
+        let read = source.bytes_read.get();
+        let ceiling = DIRECTORY_WINDOW + (OBJECTS as usize + 2) * 32;
+        assert!(
+            read <= ceiling,
+            "walking {OBJECTS} alternating objects read {read} bytes of a \
+             {}-byte collection, above the {ceiling} a header apiece costs",
             source.data.len()
         );
     }
