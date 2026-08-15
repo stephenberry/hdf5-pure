@@ -162,8 +162,38 @@ approx_constant = "allow"
 #
 # `release` and `bench` keep their default of 16 — a throughput trade-off for
 # generated code rather than a build-artifact one.
+# Line tables instead of full DWARF (issue #269).
+#
+# Nothing in this repository's workflow inspects locals in a debugger; what it
+# reads is panic backtraces, and `line-tables-only` keeps those complete —
+# function names, files, and line numbers. What it drops is the type and
+# variable description of every symbol, which for ~110 test binaries that each
+# link this crate is a large share of the debug info emitted per build.
+#
+# Measured at `--all-features` from `cargo clean -p hdf5-pure` with the
+# dependency graph already built, on a 10-core macOS host:
+#
+#                              full debug   line-tables-only
+#   build this crate + tests    25.0/28.9s        16.6/16.8s
+#   object files (1,357)            590 MiB           476 MiB
+#   test binaries (130)            1.35 GiB          1.31 GiB
+#   target/debug                   4.19 GiB          3.96 GiB
+#
+# The win is the ~40% off the build, not the disk. Emitting less debug info is
+# less work by construction; the modest size figures are a macOS artifact and
+# do not carry to Linux — Mach-O leaves DWARF in the object files and links a
+# debug *map* into the executable, so a test binary here barely shrinks even as
+# the objects behind it lose 19%. The statically linked libhdf5 inside every
+# crosscheck binary is a further fixed weight this setting cannot touch.
+#
+# `[profile.test]` inherits `debug` from `[profile.dev]` — verified, not
+# assumed: `cargo test -v` passes `-C debuginfo=line-tables-only` to all 130
+# test targets. `codegen-units` is repeated below only because it already was.
+# `release` and `bench` are untouched, so a backtrace from a release build is
+# unaffected either way.
 [profile.dev]
 codegen-units = 4
+debug = "line-tables-only"
 
 [profile.test]
 codegen-units = 4
