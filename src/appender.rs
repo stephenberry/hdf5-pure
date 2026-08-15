@@ -16,6 +16,8 @@
 //! elements are not in the file until [`flush`](BufferedAppender::flush) or
 //! [`finish`](BufferedAppender::finish) puts them there.
 
+use core::num::NonZeroUsize;
+
 use crate::convert::TryToUsize;
 use crate::edit::AppendBuilder;
 use crate::element::H5Element;
@@ -122,7 +124,7 @@ pub struct BufferedAppender<'a> {
     /// whenever a write is actually due, so an append through another handle
     /// cannot leave this appender writing against a stale length.
     chunk_elems: u64,
-    element_size: usize,
+    element_size: NonZeroUsize,
     filtered: bool,
     /// Elements appended but not yet written, as little-endian bytes.
     pending: AppendBuilder,
@@ -177,7 +179,7 @@ impl<'a> BufferedAppender<'a> {
         Ok(Self {
             dataset,
             chunk_elems,
-            element_size: g.element_size.max(1),
+            element_size: g.element_size,
             filtered: g.filtered,
             pending: AppendBuilder::new(),
             poisoned: false,
@@ -362,9 +364,11 @@ impl<'a> BufferedAppender<'a> {
         // Copy the prefix rather than split it out: a failed write must leave
         // the buffer holding exactly the elements that did not land, and how
         // many those are is only known afterwards.
-        let head = self
-            .pending
-            .head(take_elems.to_usize()?.saturating_mul(self.element_size));
+        let head = self.pending.head(
+            take_elems
+                .to_usize()?
+                .saturating_mul(self.element_size.get()),
+        );
 
         let result = if staged {
             self.dataset.append_staged_committed(head)
@@ -385,7 +389,7 @@ impl<'a> BufferedAppender<'a> {
             landed
                 .to_usize()
                 .unwrap_or(usize::MAX)
-                .saturating_mul(self.element_size),
+                .saturating_mul(self.element_size.get()),
         );
         // Flushing a partial tail on a filtered dataset leaves it unaligned
         // again, so the realignment debt comes back and the claim has to widen

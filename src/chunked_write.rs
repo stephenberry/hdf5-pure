@@ -7,7 +7,9 @@ extern crate alloc;
 use alloc::{format, vec, vec::Vec};
 
 use crate::checksum::jenkins_lookup3;
-use crate::convert::TryToUsize;
+use core::num::NonZeroUsize;
+
+use crate::convert::{TryToUsize, nonzero_usize_from};
 use crate::error::FormatError;
 use crate::extensible_array::{EaGeometry, ExtensibleArrayHeader};
 #[cfg(feature = "zfp")]
@@ -345,7 +347,7 @@ pub fn split_into_chunks(
     raw_data: &[u8],
     shape: &[u64],
     chunk_dims: &[u64],
-    element_size: usize,
+    element_size: NonZeroUsize,
 ) -> Vec<(Vec<u64>, Vec<u8>)> {
     let rank = shape.len();
     if rank == 0 {
@@ -422,13 +424,13 @@ pub fn split_into_chunks(
         )]
         let offsets_us: Vec<usize> = offsets.iter().map(|&o| o as usize).collect();
 
-        let mut chunk_bytes = vec![0u8; chunk_total_elements * element_size];
+        let mut chunk_bytes = vec![0u8; chunk_total_elements * element_size.get()];
 
         // In-bounds run length along the contiguous innermost dimension.
         let inner_row_len =
             chunk_dims_us[inner].min(shape_us[inner].saturating_sub(offsets_us[inner]));
         if inner_row_len > 0 {
-            let row_bytes = inner_row_len * element_size;
+            let row_bytes = inner_row_len * element_size.get();
             let inner_src = offsets_us[inner] * ds_strides[inner];
             let outer_total: usize = chunk_dims_us[..inner].iter().product();
             for c in coord.iter_mut() {
@@ -449,8 +451,8 @@ pub fn split_into_chunks(
                 }
 
                 if in_bounds {
-                    let src = src_base * element_size;
-                    let dst = dst_base * element_size;
+                    let src = src_base * element_size.get();
+                    let dst = dst_base * element_size.get();
                     let mut avail = row_bytes.min(raw_data.len().saturating_sub(src));
                     avail -= avail % element_size;
                     if avail > 0 {
@@ -1512,7 +1514,7 @@ pub(crate) struct CompressedChunkSet {
     /// overhang zero-filled, so these are all equal in practice).
     raw_sizes: Vec<u64>,
     chunk_dims_u32: Vec<u32>,
-    element_size: usize,
+    element_size: NonZeroUsize,
     has_filters: bool,
     use_extensible: bool,
     pipeline_message: Option<Vec<u8>>,
@@ -1530,9 +1532,9 @@ pub(crate) fn compress_chunks(
     maxshape: Option<&[u64]>,
 ) -> Result<CompressedChunkSet, FormatError> {
     let chunk_dims = ctx.chunk_dims;
-    let element_size = ctx.element_size as usize;
+    let element_size = nonzero_usize_from(ctx.element_size)?;
     let pipeline = options.build_pipeline(
-        ctx.element_size,
+        ctx.element_size.get(),
         chunk_dims,
         ctx.element_type,
         ctx.scale_offset_type,
@@ -1626,7 +1628,7 @@ fn chunk_index_bytes(
             &set.chunk_dims_u32,
             index_address,
             offset_size,
-            set.element_size as u32,
+            set.element_size.get() as u32,
         );
         (ea_bytes, layout)
     } else if written_chunks.len() == 1 {
@@ -1639,7 +1641,7 @@ fn chunk_index_bytes(
             filtered_size,
             filter_mask,
             offset_size,
-            set.element_size as u32,
+            set.element_size.get() as u32,
         );
         (Vec::new(), layout)
     } else {
@@ -1654,7 +1656,7 @@ fn chunk_index_bytes(
             &set.chunk_dims_u32,
             index_address,
             offset_size,
-            set.element_size as u32,
+            set.element_size.get() as u32,
             FIXED_ARRAY_PAGE_BITS,
         );
         (fa_bytes, layout)
@@ -1831,7 +1833,7 @@ pub(crate) struct VerbatimLayout {
 pub(crate) fn plan_chunked_data_verbatim(
     meta: &[ChunkMeta],
     chunk_dims: &[u64],
-    element_size: usize,
+    element_size: NonZeroUsize,
     raw_size: u64,
     pipeline_message: Option<&[u8]>,
     base_address: u64,
@@ -1894,7 +1896,7 @@ pub(crate) fn plan_chunked_data_verbatim(
             &chunk_dims_u32,
             ea_address,
             offset_size,
-            element_size as u32,
+            element_size.get() as u32,
         )
     } else if num_chunks == 1 {
         let chunk_addr = written_chunks[0].address;
@@ -1914,7 +1916,7 @@ pub(crate) fn plan_chunked_data_verbatim(
             filtered_size,
             filter_mask,
             offset_size,
-            element_size as u32,
+            element_size.get() as u32,
         )
     } else {
         let fa_address = base_address + cursor;
@@ -1931,7 +1933,7 @@ pub(crate) fn plan_chunked_data_verbatim(
             &chunk_dims_u32,
             fa_address,
             offset_size,
-            element_size as u32,
+            element_size.get() as u32,
             FIXED_ARRAY_PAGE_BITS,
         )
     };
@@ -1980,6 +1982,7 @@ pub(crate) fn emit_chunked_data_verbatim<S: ByteSink>(
 mod tests {
     use super::*;
     use crate::chunked_read::read_chunked_data;
+    use crate::convert::nz;
     use crate::data_layout::DataLayout;
     use crate::dataspace::{Dataspace, DataspaceType};
     use crate::datatype::{Datatype, DatatypeByteOrder};
@@ -2063,7 +2066,7 @@ mod tests {
     #[test]
     fn split_1d_single_chunk() {
         let data = f64_to_bytes(&[1.0, 2.0, 3.0]);
-        let result = split_into_chunks(&data, &[3], &[3], 8);
+        let result = split_into_chunks(&data, &[3], &[3], nz(8));
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].0, vec![0]);
         assert_eq!(bytes_to_f64(&result[0].1), vec![1.0, 2.0, 3.0]);
@@ -2073,7 +2076,7 @@ mod tests {
     fn split_1d_multiple_chunks() {
         let values: Vec<f64> = (0..10).map(|i| i as f64).collect();
         let data = f64_to_bytes(&values);
-        let result = split_into_chunks(&data, &[10], &[4], 8);
+        let result = split_into_chunks(&data, &[10], &[4], nz(8));
         assert_eq!(result.len(), 3); // ceil(10/4) = 3
         assert_eq!(result[0].0, vec![0]);
         assert_eq!(result[1].0, vec![4]);
@@ -2089,7 +2092,7 @@ mod tests {
         // 4x4 dataset, 2x2 chunks -> 4 chunks
         let values: Vec<f64> = (0..16).map(|i| i as f64).collect();
         let data = f64_to_bytes(&values);
-        let result = split_into_chunks(&data, &[4, 4], &[2, 2], 8);
+        let result = split_into_chunks(&data, &[4, 4], &[2, 2], nz(8));
         assert_eq!(result.len(), 4);
         assert_eq!(result[0].0, vec![0, 0]);
         assert_eq!(result[1].0, vec![0, 2]);
@@ -2221,7 +2224,7 @@ mod tests {
             })
             .collect();
         let layout =
-            plan_chunked_data_verbatim(&meta, &[7], 8, 56, Some(&[]), 0x1000, None).unwrap();
+            plan_chunked_data_verbatim(&meta, &[7], nz(8), 56, Some(&[]), 0x1000, None).unwrap();
 
         let chunk_bytes: u64 = meta.iter().map(|m| m.compressed_size).sum();
         assert_eq!(
@@ -2241,7 +2244,7 @@ mod tests {
     /// is refused rather than planned as an empty region.
     #[test]
     fn a_verbatim_plan_with_no_chunks_is_refused() {
-        let result = plan_chunked_data_verbatim(&[], &[7], 8, 56, None, 0x1000, None);
+        let result = plan_chunked_data_verbatim(&[], &[7], nz(8), 56, None, 0x1000, None);
         assert!(
             matches!(result, Err(FormatError::ChunkedReadError(_))),
             "a chunk-less plan must be refused"

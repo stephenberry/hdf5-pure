@@ -3,6 +3,8 @@
 #[cfg(not(feature = "std"))]
 use alloc::{string::String, vec::Vec};
 
+use core::num::NonZeroUsize;
+
 use crate::chunk_cache::ChunkCache;
 use crate::chunked_read::{
     read_chunked_data, read_chunked_data_cached, read_chunked_data_cached_from_source,
@@ -291,8 +293,8 @@ fn get_byte_order(dt: &Datatype) -> DatatypeByteOrder {
     }
 }
 
-fn get_size(dt: &Datatype) -> usize {
-    dt.type_size() as usize
+fn get_size(dt: &Datatype) -> Result<NonZeroUsize, FormatError> {
+    dt.element_size_usize()
 }
 
 /// True when a numeric element is stored in the "standard" full-width layout —
@@ -364,8 +366,8 @@ macro_rules! bulk_decode {
 pub fn read_as_f64(raw: &[u8], datatype: &Datatype) -> Result<Vec<f64>, FormatError> {
     let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FloatingPoint or FixedPoint")?;
-    let elem_size = get_size(datatype);
-    if elem_size == 0 || !raw.len().is_multiple_of(elem_size) {
+    let elem_size = get_size(datatype)?;
+    if !raw.len().is_multiple_of(elem_size.get()) {
         return Err(FormatError::DataSizeMismatch {
             expected: 0,
             actual: raw.len(),
@@ -376,7 +378,7 @@ pub fn read_as_f64(raw: &[u8], datatype: &Datatype) -> Result<Vec<f64>, FormatEr
     let (bit_offset, bit_precision) = int_bits(datatype);
 
     // Fast path: standard full-width layout, bulk-decoded with `from_*_bytes`.
-    if is_standard_layout(elem_size, &order, bit_offset, bit_precision) {
+    if is_standard_layout(elem_size.get(), &order, bit_offset, bit_precision) {
         match datatype {
             Datatype::FloatingPoint { size: 4, .. } => {
                 return Ok(bulk_decode!(raw, count, order, f32, f64));
@@ -385,7 +387,7 @@ pub fn read_as_f64(raw: &[u8], datatype: &Datatype) -> Result<Vec<f64>, FormatEr
                 return Ok(bulk_decode!(raw, count, order, f64, f64));
             }
             Datatype::FixedPoint { signed: true, .. } => {
-                return Ok(match elem_size {
+                return Ok(match elem_size.get() {
                     1 => bulk_decode!(raw, count, order, i8, f64),
                     2 => bulk_decode!(raw, count, order, i16, f64),
                     4 => bulk_decode!(raw, count, order, i32, f64),
@@ -394,7 +396,7 @@ pub fn read_as_f64(raw: &[u8], datatype: &Datatype) -> Result<Vec<f64>, FormatEr
                 });
             }
             Datatype::FixedPoint { signed: false, .. } => {
-                return Ok(match elem_size {
+                return Ok(match elem_size.get() {
                     1 => bulk_decode!(raw, count, order, u8, f64),
                     2 => bulk_decode!(raw, count, order, u16, f64),
                     4 => bulk_decode!(raw, count, order, u32, f64),
@@ -410,7 +412,7 @@ pub fn read_as_f64(raw: &[u8], datatype: &Datatype) -> Result<Vec<f64>, FormatEr
 
     let mut result = Vec::with_capacity(count);
     for i in 0..count {
-        let chunk = &raw[i * elem_size..(i + 1) * elem_size];
+        let chunk = &raw[i * elem_size.get()..(i + 1) * elem_size.get()];
         let val = convert_to_f64(chunk, datatype, &order)?;
         result.push(val);
     }
@@ -461,8 +463,8 @@ fn convert_to_f64(
 pub fn read_as_i64(raw: &[u8], datatype: &Datatype) -> Result<Vec<i64>, FormatError> {
     let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FixedPoint (signed)")?;
-    let elem_size = get_size(datatype);
-    if elem_size == 0 || !raw.len().is_multiple_of(elem_size) {
+    let elem_size = get_size(datatype)?;
+    if !raw.len().is_multiple_of(elem_size.get()) {
         return Err(FormatError::DataSizeMismatch {
             expected: 0,
             actual: raw.len(),
@@ -475,8 +477,8 @@ pub fn read_as_i64(raw: &[u8], datatype: &Datatype) -> Result<Vec<i64>, FormatEr
     // Fast path: standard full-width layout, bulk-decoded then sign-extended.
     // Signed storage types reproduce `read_signed_int`'s sign-extension for the
     // full-width case (and a float read as i64 bit-reinterprets identically).
-    if is_standard_layout(elem_size, &order, bit_offset, bit_precision) {
-        return Ok(match elem_size {
+    if is_standard_layout(elem_size.get(), &order, bit_offset, bit_precision) {
+        return Ok(match elem_size.get() {
             1 => bulk_decode!(raw, count, order, i8, i64),
             2 => bulk_decode!(raw, count, order, i16, i64),
             4 => bulk_decode!(raw, count, order, i32, i64),
@@ -487,8 +489,8 @@ pub fn read_as_i64(raw: &[u8], datatype: &Datatype) -> Result<Vec<i64>, FormatEr
 
     let mut result = Vec::with_capacity(count);
     for i in 0..count {
-        let chunk = &raw[i * elem_size..(i + 1) * elem_size];
-        let v = read_signed_int(chunk, elem_size, &order, bit_offset, bit_precision);
+        let chunk = &raw[i * elem_size.get()..(i + 1) * elem_size.get()];
+        let v = read_signed_int(chunk, elem_size.get(), &order, bit_offset, bit_precision);
         result.push(v);
     }
     Ok(result)
@@ -498,8 +500,8 @@ pub fn read_as_i64(raw: &[u8], datatype: &Datatype) -> Result<Vec<i64>, FormatEr
 pub fn read_as_u64(raw: &[u8], datatype: &Datatype) -> Result<Vec<u64>, FormatError> {
     let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FixedPoint (unsigned)")?;
-    let elem_size = get_size(datatype);
-    if elem_size == 0 || !raw.len().is_multiple_of(elem_size) {
+    let elem_size = get_size(datatype)?;
+    if !raw.len().is_multiple_of(elem_size.get()) {
         return Err(FormatError::DataSizeMismatch {
             expected: 0,
             actual: raw.len(),
@@ -511,8 +513,8 @@ pub fn read_as_u64(raw: &[u8], datatype: &Datatype) -> Result<Vec<u64>, FormatEr
 
     // Fast path: standard full-width layout, bulk-decoded with zero-extension
     // (unsigned storage types reproduce `read_unsigned_int`'s magnitude).
-    if is_standard_layout(elem_size, &order, bit_offset, bit_precision) {
-        return Ok(match elem_size {
+    if is_standard_layout(elem_size.get(), &order, bit_offset, bit_precision) {
+        return Ok(match elem_size.get() {
             1 => bulk_decode!(raw, count, order, u8, u64),
             2 => bulk_decode!(raw, count, order, u16, u64),
             4 => bulk_decode!(raw, count, order, u32, u64),
@@ -523,8 +525,8 @@ pub fn read_as_u64(raw: &[u8], datatype: &Datatype) -> Result<Vec<u64>, FormatEr
 
     let mut result = Vec::with_capacity(count);
     for i in 0..count {
-        let chunk = &raw[i * elem_size..(i + 1) * elem_size];
-        let v = read_unsigned_int(chunk, elem_size, &order, bit_offset, bit_precision);
+        let chunk = &raw[i * elem_size.get()..(i + 1) * elem_size.get()];
+        let v = read_unsigned_int(chunk, elem_size.get(), &order, bit_offset, bit_precision);
         result.push(v);
     }
     Ok(result)
@@ -534,8 +536,8 @@ pub fn read_as_u64(raw: &[u8], datatype: &Datatype) -> Result<Vec<u64>, FormatEr
 pub fn read_as_f32(raw: &[u8], datatype: &Datatype) -> Result<Vec<f32>, FormatError> {
     let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FloatingPoint")?;
-    let elem_size = get_size(datatype);
-    if elem_size == 0 || !raw.len().is_multiple_of(elem_size) {
+    let elem_size = get_size(datatype)?;
+    if !raw.len().is_multiple_of(elem_size.get()) {
         return Err(FormatError::DataSizeMismatch {
             expected: 0,
             actual: raw.len(),
@@ -546,7 +548,7 @@ pub fn read_as_f32(raw: &[u8], datatype: &Datatype) -> Result<Vec<f32>, FormatEr
     let (bit_offset, bit_precision) = int_bits(datatype);
 
     // Fast path: standard full-width layout, bulk-decoded with `from_*_bytes`.
-    if is_standard_layout(elem_size, &order, bit_offset, bit_precision) {
+    if is_standard_layout(elem_size.get(), &order, bit_offset, bit_precision) {
         match datatype {
             Datatype::FloatingPoint { size: 4, .. } => {
                 return Ok(bulk_decode!(raw, count, order, f32, f32));
@@ -555,7 +557,7 @@ pub fn read_as_f32(raw: &[u8], datatype: &Datatype) -> Result<Vec<f32>, FormatEr
                 return Ok(bulk_decode!(raw, count, order, f64, f32));
             }
             Datatype::FixedPoint { signed: true, .. } => {
-                return Ok(match elem_size {
+                return Ok(match elem_size.get() {
                     1 => bulk_decode!(raw, count, order, i8, f32),
                     2 => bulk_decode!(raw, count, order, i16, f32),
                     4 => bulk_decode!(raw, count, order, i32, f32),
@@ -564,7 +566,7 @@ pub fn read_as_f32(raw: &[u8], datatype: &Datatype) -> Result<Vec<f32>, FormatEr
                 });
             }
             Datatype::FixedPoint { signed: false, .. } => {
-                return Ok(match elem_size {
+                return Ok(match elem_size.get() {
                     1 => bulk_decode!(raw, count, order, u8, f32),
                     2 => bulk_decode!(raw, count, order, u16, f32),
                     4 => bulk_decode!(raw, count, order, u32, f32),
@@ -578,7 +580,7 @@ pub fn read_as_f32(raw: &[u8], datatype: &Datatype) -> Result<Vec<f32>, FormatEr
 
     let mut result = Vec::with_capacity(count);
     for i in 0..count {
-        let chunk = &raw[i * elem_size..(i + 1) * elem_size];
+        let chunk = &raw[i * elem_size.get()..(i + 1) * elem_size.get()];
         match datatype {
             Datatype::FloatingPoint { size: 4, .. } => {
                 result.push(read_f32_bytes(chunk, &order));
@@ -635,8 +637,8 @@ pub fn read_as_f32(raw: &[u8], datatype: &Datatype) -> Result<Vec<f32>, FormatEr
 pub fn read_as_i32(raw: &[u8], datatype: &Datatype) -> Result<Vec<i32>, FormatError> {
     let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FixedPoint")?;
-    let elem_size = get_size(datatype);
-    if elem_size == 0 || !raw.len().is_multiple_of(elem_size) {
+    let elem_size = get_size(datatype)?;
+    if !raw.len().is_multiple_of(elem_size.get()) {
         return Err(FormatError::DataSizeMismatch {
             expected: 0,
             actual: raw.len(),
@@ -648,8 +650,8 @@ pub fn read_as_i32(raw: &[u8], datatype: &Datatype) -> Result<Vec<i32>, FormatEr
 
     // Fast path: standard full-width layout, bulk-decoded then narrowed to i32
     // (matches `read_signed_int(..) as i32` for the full-width case).
-    if is_standard_layout(elem_size, &order, bit_offset, bit_precision) {
-        return Ok(match elem_size {
+    if is_standard_layout(elem_size.get(), &order, bit_offset, bit_precision) {
+        return Ok(match elem_size.get() {
             1 => bulk_decode!(raw, count, order, i8, i32),
             2 => bulk_decode!(raw, count, order, i16, i32),
             4 => bulk_decode!(raw, count, order, i32, i32),
@@ -660,8 +662,8 @@ pub fn read_as_i32(raw: &[u8], datatype: &Datatype) -> Result<Vec<i32>, FormatEr
 
     let mut result = Vec::with_capacity(count);
     for i in 0..count {
-        let chunk = &raw[i * elem_size..(i + 1) * elem_size];
-        let v = read_signed_int(chunk, elem_size, &order, bit_offset, bit_precision);
+        let chunk = &raw[i * elem_size.get()..(i + 1) * elem_size.get()];
+        let v = read_signed_int(chunk, elem_size.get(), &order, bit_offset, bit_precision);
         #[expect(
             clippy::cast_possible_truncation,
             reason = "read_as_i32 narrows each stored signed value to the requested i32"
@@ -676,8 +678,8 @@ pub fn read_as_i32(raw: &[u8], datatype: &Datatype) -> Result<Vec<i32>, FormatEr
 pub fn read_as_i16(raw: &[u8], datatype: &Datatype) -> Result<Vec<i16>, FormatError> {
     let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FixedPoint")?;
-    let elem_size = get_size(datatype);
-    if elem_size == 0 || !raw.len().is_multiple_of(elem_size) {
+    let elem_size = get_size(datatype)?;
+    if !raw.len().is_multiple_of(elem_size.get()) {
         return Err(FormatError::DataSizeMismatch {
             expected: 0,
             actual: raw.len(),
@@ -687,8 +689,8 @@ pub fn read_as_i16(raw: &[u8], datatype: &Datatype) -> Result<Vec<i16>, FormatEr
     let order = get_byte_order(datatype);
     let (bit_offset, bit_precision) = int_bits(datatype);
 
-    if is_standard_layout(elem_size, &order, bit_offset, bit_precision) {
-        return Ok(match elem_size {
+    if is_standard_layout(elem_size.get(), &order, bit_offset, bit_precision) {
+        return Ok(match elem_size.get() {
             1 => bulk_decode!(raw, count, order, i8, i16),
             2 => bulk_decode!(raw, count, order, i16, i16),
             4 => bulk_decode!(raw, count, order, i32, i16),
@@ -714,8 +716,8 @@ pub fn read_as_i16(raw: &[u8], datatype: &Datatype) -> Result<Vec<i16>, FormatEr
 pub fn read_as_u32(raw: &[u8], datatype: &Datatype) -> Result<Vec<u32>, FormatError> {
     let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FixedPoint (unsigned)")?;
-    let elem_size = get_size(datatype);
-    if elem_size == 0 || !raw.len().is_multiple_of(elem_size) {
+    let elem_size = get_size(datatype)?;
+    if !raw.len().is_multiple_of(elem_size.get()) {
         return Err(FormatError::DataSizeMismatch {
             expected: 0,
             actual: raw.len(),
@@ -725,8 +727,8 @@ pub fn read_as_u32(raw: &[u8], datatype: &Datatype) -> Result<Vec<u32>, FormatEr
     let order = get_byte_order(datatype);
     let (bit_offset, bit_precision) = int_bits(datatype);
 
-    if is_standard_layout(elem_size, &order, bit_offset, bit_precision) {
-        return Ok(match elem_size {
+    if is_standard_layout(elem_size.get(), &order, bit_offset, bit_precision) {
+        return Ok(match elem_size.get() {
             1 => bulk_decode!(raw, count, order, u8, u32),
             2 => bulk_decode!(raw, count, order, u16, u32),
             4 => bulk_decode!(raw, count, order, u32, u32),
@@ -750,8 +752,8 @@ pub fn read_as_u32(raw: &[u8], datatype: &Datatype) -> Result<Vec<u32>, FormatEr
 pub fn read_as_u16(raw: &[u8], datatype: &Datatype) -> Result<Vec<u16>, FormatError> {
     let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FixedPoint (unsigned)")?;
-    let elem_size = get_size(datatype);
-    if elem_size == 0 || !raw.len().is_multiple_of(elem_size) {
+    let elem_size = get_size(datatype)?;
+    if !raw.len().is_multiple_of(elem_size.get()) {
         return Err(FormatError::DataSizeMismatch {
             expected: 0,
             actual: raw.len(),
@@ -761,8 +763,8 @@ pub fn read_as_u16(raw: &[u8], datatype: &Datatype) -> Result<Vec<u16>, FormatEr
     let order = get_byte_order(datatype);
     let (bit_offset, bit_precision) = int_bits(datatype);
 
-    if is_standard_layout(elem_size, &order, bit_offset, bit_precision) {
-        return Ok(match elem_size {
+    if is_standard_layout(elem_size.get(), &order, bit_offset, bit_precision) {
+        return Ok(match elem_size.get() {
             1 => bulk_decode!(raw, count, order, u8, u16),
             2 => bulk_decode!(raw, count, order, u16, u16),
             4 => bulk_decode!(raw, count, order, u32, u16),
@@ -785,11 +787,10 @@ pub fn read_as_u16(raw: &[u8], datatype: &Datatype) -> Result<Vec<u16>, FormatEr
 pub fn read_as_strings(raw: &[u8], datatype: &Datatype) -> Result<Vec<String>, FormatError> {
     match datatype {
         Datatype::String { size, padding, .. } => {
-            let elem_size = *size as usize;
-            if elem_size == 0 {
+            let Some(elem_size) = NonZeroUsize::new(*size as usize) else {
                 return Ok(Vec::new());
-            }
-            if !raw.len().is_multiple_of(elem_size) {
+            };
+            if !raw.len().is_multiple_of(elem_size.get()) {
                 return Err(FormatError::DataSizeMismatch {
                     expected: 0,
                     actual: raw.len(),
@@ -798,7 +799,7 @@ pub fn read_as_strings(raw: &[u8], datatype: &Datatype) -> Result<Vec<String>, F
             let count = raw.len() / elem_size;
             let mut result = Vec::with_capacity(count);
             for i in 0..count {
-                let chunk = &raw[i * elem_size..(i + 1) * elem_size];
+                let chunk = &raw[i * elem_size.get()..(i + 1) * elem_size.get()];
                 let s = match padding {
                     crate::datatype::StringPadding::NullTerminate => {
                         let end = chunk.iter().position(|&b| b == 0).unwrap_or(chunk.len());
@@ -877,7 +878,7 @@ fn int_bits(dt: &Datatype) -> (u16, u16) {
         _ => {
             // Full-width standard layout. `try_from` clamps the (always small,
             // <= 64) bit width without a narrowing cast.
-            let bits = u16::try_from(get_size(dt) * 8).unwrap_or(u16::MAX);
+            let bits = u16::try_from(u64::from(dt.type_size()) * 8).unwrap_or(u16::MAX);
             (0, bits)
         }
     }

@@ -181,6 +181,8 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+use core::num::NonZeroUsize;
+
 use crate::checksum::jenkins_lookup3;
 use crate::chunk_index_inplace::{Located, Store, apply_ea_append, plan_ea_append};
 use crate::chunked_read::{
@@ -1059,8 +1061,8 @@ const APPEND_BATCH_BYTES: u64 = 1 << 20;
 pub(crate) struct AppendGeometry {
     /// Elements per chunk along axis 0 (>= 1).
     pub(crate) chunk_elems: u64,
-    /// Bytes per on-disk element.
-    pub(crate) element_size: usize,
+    /// Bytes per on-disk element, proven non-zero.
+    pub(crate) element_size: NonZeroUsize,
     /// Current length along the unlimited dimension.
     pub(crate) current_dim: u64,
     /// Whether a filter pipeline applies (an in-place append then requires a
@@ -1087,8 +1089,8 @@ pub(crate) struct LocatedState {
     pub(crate) datatype: Datatype,
     /// Spatial (rank-length) chunk dimensions in elements: `[chunk_elems]`.
     pub(crate) spatial: Vec<u64>,
-    /// Bytes per element (datatype size).
-    pub(crate) element_size: usize,
+    /// Bytes per element (datatype size), proven non-zero.
+    pub(crate) element_size: NonZeroUsize,
     /// The re-encodable filter pipeline, when the dataset is filtered.
     pub(crate) pipeline: Option<FilterPipeline>,
 }
@@ -2440,7 +2442,7 @@ impl WriteEngine {
             let st = &self.located[&oh_addr];
             (
                 st.loc.chunk_elems.max(1),
-                st.element_size as u64,
+                st.element_size.get() as u64,
                 self.batch_elems(st.loc.chunk_bytes, st.loc.chunk_elems.max(1)),
                 st.pipeline.is_some(),
                 st.loc.current_dim,
@@ -4665,7 +4667,7 @@ impl WriteEngine {
                              cannot be overwritten in place yet",
                         ));
                     }
-                    let ctx = ChunkContext::from_datatype(&spatial, &fd.dt);
+                    let ctx = ChunkContext::from_datatype(&spatial, &fd.dt)?;
                     let mut encoded = Vec::with_capacity(split.len());
                     for (_, buf) in &split {
                         encoded.push(compress_chunk(buf, &pipeline, ctx)?);
@@ -4984,14 +4986,14 @@ impl WriteEngine {
                 .read_exact_at(partial.address, len)
                 .map_err(|_| Error::AppendUnsupported("trailing chunk could not be read"))?;
             let full = if let Some(pl) = &pipeline {
-                let ctx = ChunkContext::from_datatype(&spatial, &disk_dt);
+                let ctx = ChunkContext::from_datatype(&spatial, &disk_dt)?;
                 decompress_chunk(&stored, pl, ctx, partial.filter_mask).map_err(Error::Format)?
             } else {
                 stored
             };
             let live_elems = usize::try_from(current_dim0 % chunk_elems)
                 .map_err(|_| Error::AppendUnsupported("chunk length exceeds this platform"))?;
-            let live_bytes = live_elems * element_size;
+            let live_bytes = live_elems * element_size.get();
             if full.len() < live_bytes {
                 return Err(Error::AppendUnsupported(
                     "trailing chunk decoded shorter than its live element count",
@@ -5008,7 +5010,7 @@ impl WriteEngine {
         let tail_len_elems = new_dim0 - (n_full as u64) * chunk_elems;
         let split = split_into_chunks(&tail_raw, &[tail_len_elems], &spatial, element_size);
         let new_chunk_bytes: Vec<Vec<u8>> = if let Some(pl) = &pipeline {
-            let ctx = ChunkContext::from_datatype(&spatial, &disk_dt);
+            let ctx = ChunkContext::from_datatype(&spatial, &disk_dt)?;
             let mut out = Vec::with_capacity(split.len());
             for (_, buf) in &split {
                 out.push(compress_chunk(buf, pl, ctx).map_err(Error::Format)?);
@@ -5578,7 +5580,7 @@ impl WriteEngine {
         &mut self,
         region: &[u8],
         chunk_dims: &[u64],
-        element_size: usize,
+        element_size: NonZeroUsize,
         raw_size: u64,
         maxshape: Option<&[u64]>,
         pipeline_message: Option<&[u8]>,
@@ -5788,7 +5790,7 @@ impl WriteEngine {
         region: &[u8],
         new_dataspace_body: &[u8],
         chunk_dims_u32: &[u32],
-        element_size: usize,
+        element_size: NonZeroUsize,
         raw_size: u64,
         has_filters: bool,
         kept_chunks: &[WrittenChunk],
@@ -5849,7 +5851,7 @@ impl WriteEngine {
             chunk_dims_u32,
             ea_base,
             OFFSET_SIZE,
-            element_size as u32,
+            element_size.get() as u32,
         );
         let region = replace_dataspace_message(region, new_dataspace_body)?;
         let region = replace_layout_message(&region, &layout_body)?;
@@ -6186,7 +6188,7 @@ impl WriteEngine {
     /// (issue #261).
     fn build_chunked_dataset(&mut self, fd: &FlatDataset) -> Result<Vec<u8>, Error> {
         let chunk_dims = fd.chunk_options.resolve_chunk_dims(&fd.ds.dimensions);
-        let ctx = ChunkContext::from_datatype(&chunk_dims, &fd.dt);
+        let ctx = ChunkContext::from_datatype(&chunk_dims, &fd.dt)?;
         let set = compress_chunks(
             &fd.raw,
             &fd.ds.dimensions,
@@ -6722,7 +6724,7 @@ enum CopyTree {
     DatasetChunked {
         region: Vec<u8>,
         chunk_dims: Vec<u64>,
-        element_size: usize,
+        element_size: NonZeroUsize,
         raw_size: u64,
         maxshape: Option<Vec<u64>>,
         pipeline_message: Option<Vec<u8>>,
@@ -6799,7 +6801,7 @@ enum MovingWrite {
     Chunked {
         region: Vec<u8>,
         chunk_dims: Vec<u64>,
-        element_size: usize,
+        element_size: NonZeroUsize,
         raw_size: u64,
         maxshape: Option<Vec<u64>>,
         pipeline_message: Option<Vec<u8>>,
@@ -6828,7 +6830,7 @@ enum MovingWrite {
         new_dataspace_body: Vec<u8>,
         /// Rank-only spatial chunk dimensions, for the rebuilt v4 layout message.
         chunk_dims_u32: Vec<u32>,
-        element_size: usize,
+        element_size: NonZeroUsize,
         /// Full (uncompressed) chunk byte size = product(spatial) * element_size.
         raw_size: u64,
         has_filters: bool,
@@ -7237,9 +7239,11 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
     // Refused for the same reason the whole-file writer refuses it: nothing
     // occupies zero bytes per element, the writers divide by the element size,
     // and a caller-built `Datatype` never passes through `Datatype::parse`.
-    dt.ensure_nonzero_size()?;
+    // Taking it as a `NonZeroUsize` hands the proof to the staging below rather
+    // than leaving each step to re-derive it.
+    let elem_size = dt.element_size_usize()?;
 
-    let elem = dt.type_size() as u64;
+    let elem = elem_size.get() as u64;
     // Multiply with checked arithmetic: an absurd shape whose element count
     // (or byte size) overflows `u64` is refused rather than panicking in a
     // debug build or silently wrapping in release (which could let a wrapped
@@ -7293,10 +7297,10 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
         // so the
         // resulting object header is byte-identical to a freshly written one.
         let chunk_dims = db.chunk_options.resolve_chunk_dims(&shape);
-        let ctx = ChunkContext::from_datatype(&chunk_dims, &dt);
+        let ctx = ChunkContext::from_datatype(&chunk_dims, &dt)?;
         db.chunk_options
             .build_pipeline(
-                ctx.element_size,
+                ctx.element_size.get(),
                 &chunk_dims,
                 ctx.element_type,
                 ctx.scale_offset_type,
@@ -7604,8 +7608,9 @@ fn parse_chunked_header(region: &[u8]) -> Result<ChunkedHeaderParts, Error> {
 struct ChunkedGeometry {
     /// Rank-only spatial chunk dimensions.
     spatial: Vec<u64>,
-    /// Element size in bytes.
-    element_size: usize,
+    /// Element size in bytes, proven non-zero: the chunk splitter divides by
+    /// it, and so does the append path's element-count arithmetic.
+    element_size: NonZeroUsize,
     /// Full (uncompressed) chunk byte size, `product(spatial) * element_size`.
     raw_size: u64,
     /// The on-disk maximum dimensions when they differ from the current shape; an
@@ -7637,17 +7642,12 @@ fn chunked_geometry(
         .iter()
         .map(|&c| u64::from(c))
         .collect();
-    let element_size = dt.type_size() as usize;
-    if element_size == 0 {
-        return Err(Error::EditUnsupported(
-            "chunked dataset has a zero element size",
-        ));
-    }
+    let element_size = dt.element_size_usize()?;
     let raw_size = spatial
         .iter()
         .copied()
         .product::<u64>()
-        .saturating_mul(element_size as u64);
+        .saturating_mul(element_size.get() as u64);
     let maxshape = ds
         .max_dimensions
         .as_ref()

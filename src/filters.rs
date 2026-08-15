@@ -6,6 +6,8 @@ extern crate alloc;
 
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
+
+use core::num::NonZeroU32;
 // `format!` is only reached by the zfp-gated code paths below.
 #[cfg(all(not(feature = "std"), feature = "zfp"))]
 use alloc::format;
@@ -32,8 +34,12 @@ use crate::zfp::ZfpElementType;
 pub struct ChunkContext<'a> {
     /// Chunk dimensions in elements (one per dataset rank).
     pub chunk_dims: &'a [u64],
-    /// Size of one element in bytes (for shuffle's interleave width).
-    pub element_size: u32,
+    /// Size of one element in bytes (for shuffle's interleave width), proven
+    /// non-zero: the chunk splitter clamps a row copy to an element boundary
+    /// with `% element_size`, and the byte-oriented filters divide a buffer
+    /// length by it. Carrying the proof here is what lets those sites skip a
+    /// check of their own.
+    pub element_size: NonZeroU32,
     /// Scalar type, required for type-aware filters like ZFP. `None` means
     /// the caller does not know or does not need it; type-aware filters
     /// will return an error.
@@ -58,28 +64,45 @@ impl<'a> ChunkContext<'a> {
     ///
     /// Currently only used by tests (read/write paths build the context via
     /// [`ChunkContext::from_datatype`]); gated so it is not shipped as dead code.
+    ///
+    /// # Panics
+    ///
+    /// If `element_size` is zero. Every caller passes a literal width, and this
+    /// is test-only; the production constructor
+    /// [`from_datatype`](Self::from_datatype) returns an error instead.
     #[cfg(test)]
     pub fn basic(chunk_dims: &'a [u64], element_size: u32) -> Self {
         Self {
             chunk_dims,
-            element_size,
+            element_size: NonZeroU32::new(element_size).expect("a test's element size is non-zero"),
             element_type: None,
             scale_offset_type: None,
         }
     }
 
     /// Build a full context from a dataset's `Datatype`: derives
-    /// `element_size` from `dt.type_size()` and `element_type` from
+    /// `element_size` from [`Datatype::element_size`] and `element_type` from
     /// [`zfp_element_type_from_datatype`]. This is the preferred
     /// constructor for read/write paths where a `Datatype` is in scope,
     /// so the two fields can't drift out of sync.
-    pub fn from_datatype(chunk_dims: &'a [u64], dt: &crate::datatype::Datatype) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// [`FormatError::ZeroSizedDatatype`] if the type occupies zero bytes per
+    /// element. Refusing here is what makes the field's guarantee true; every
+    /// consumer of the context then takes the size without re-checking it.
+    ///
+    /// [`Datatype::element_size`]: crate::datatype::Datatype::element_size
+    pub fn from_datatype(
+        chunk_dims: &'a [u64],
+        dt: &crate::datatype::Datatype,
+    ) -> Result<Self, FormatError> {
+        Ok(Self {
             chunk_dims,
-            element_size: dt.type_size(),
+            element_size: dt.element_size()?,
             element_type: zfp_element_type_from_datatype(dt),
             scale_offset_type: crate::scaleoffset::scale_offset_type_from_datatype(dt),
-        }
+        })
     }
 }
 
@@ -142,7 +165,7 @@ pub fn decompress_chunk(
         }
         let input: &[u8] = owned.as_deref().unwrap_or(compressed);
         let next = match filter.filter_id {
-            FILTER_SHUFFLE => shuffle_decompress(input, ctx.element_size as usize)?,
+            FILTER_SHUFFLE => shuffle_decompress(input, ctx.element_size.get() as usize)?,
             FILTER_DEFLATE => {
                 deflate_decompress(input, inner_output_cap(expected, pipeline, filter_mask, i))?
             }
@@ -187,7 +210,7 @@ fn expected_chunk_len(ctx: &ChunkContext<'_>) -> Option<usize> {
         .chunk_dims
         .iter()
         .try_fold(1u64, |acc, &d| acc.checked_mul(d))?;
-    let bytes = elems.checked_mul(u64::from(ctx.element_size))?;
+    let bytes = elems.checked_mul(u64::from(ctx.element_size.get()))?;
     usize::try_from(bytes).ok().filter(|&n| n != 0)
 }
 
@@ -285,7 +308,7 @@ pub fn compress_chunk(
     for filter in &pipeline.filters {
         let input: &[u8] = owned.as_deref().unwrap_or(data);
         let next = match filter.filter_id {
-            FILTER_SHUFFLE => shuffle_compress(input, ctx.element_size as usize)?,
+            FILTER_SHUFFLE => shuffle_compress(input, ctx.element_size.get() as usize)?,
             FILTER_DEFLATE => {
                 let level = filter.client_data.first().copied().unwrap_or(6);
                 deflate_compress(input, level)?
@@ -615,6 +638,38 @@ fn fletcher32_append(data: &[u8]) -> Result<Vec<u8>, FormatError> {
 mod tests {
     use super::*;
     use crate::filter_pipeline::FilterDescription;
+
+    /// The context is the single place a `Datatype` becomes an element width for
+    /// the chunk splitter and the byte-oriented filters, so it is where a
+    /// degenerate type has to be turned away. Everything downstream then takes
+    /// the width without a check of its own.
+    #[test]
+    fn a_context_cannot_be_built_from_a_zero_width_datatype() {
+        let degenerate = crate::datatype::Datatype::Array {
+            base_type: Box::new(crate::datatype::Datatype::FixedPoint {
+                size: 4,
+                byte_order: crate::datatype::DatatypeByteOrder::LittleEndian,
+                signed: true,
+                bit_offset: 0,
+                bit_precision: 32,
+            }),
+            dimensions: vec![0],
+        };
+        assert_eq!(
+            ChunkContext::from_datatype(&[4], &degenerate).unwrap_err(),
+            FormatError::ZeroSizedDatatype { class: 10 }
+        );
+
+        let ordinary = crate::datatype::Datatype::FixedPoint {
+            size: 4,
+            byte_order: crate::datatype::DatatypeByteOrder::LittleEndian,
+            signed: true,
+            bit_offset: 0,
+            bit_precision: 32,
+        };
+        let ctx = ChunkContext::from_datatype(&[4], &ordinary).unwrap();
+        assert_eq!(ctx.element_size.get(), 4);
+    }
 
     // --- Deflate tests ---
 

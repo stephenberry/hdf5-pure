@@ -10,6 +10,7 @@ use alloc::string::String;
 use std::string::String;
 
 use core::fmt;
+use core::num::NonZeroUsize;
 
 /// Errors that can occur when parsing HDF5 binary format structures.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,9 +285,10 @@ pub enum FormatError {
         expected: usize,
         /// Number of data bytes actually supplied.
         actual: usize,
-        /// Size in bytes of one element (the dataset's datatype size). Always
-        /// non-zero; used to report the mismatch in elements as well as bytes.
-        element_size: usize,
+        /// Size in bytes of one element (the dataset's datatype size), used to
+        /// report the mismatch in elements as well as bytes. Non-zero by type,
+        /// so the division in the message is well defined.
+        element_size: NonZeroUsize,
     },
     /// A chunked/filtered/extensible dataset's chunk geometry is invalid — for
     /// example chunk dimensions whose rank disagrees with the shape, a zero chunk
@@ -815,14 +817,12 @@ impl fmt::Display for FormatError {
                 actual,
                 element_size,
             } => {
-                // `element_size` is guaranteed non-zero at construction, so the
-                // element counts below are well defined.
                 write!(
                     f,
                     "shape/data mismatch: shape requires {} elements ({expected} bytes), \
                      but {} elements ({actual} bytes) were supplied",
-                    expected / element_size,
-                    actual / element_size,
+                    expected / element_size.get(),
+                    actual / element_size.get(),
                 )
             }
             FormatError::InvalidChunkGeometry(reason) => {

@@ -36,6 +36,8 @@
 //! explicitly accounted for this way; a leftover `#[expect]` whose cast was
 //! later removed fails the gate too, keeping the annotations honest.
 
+use core::num::{NonZeroU32, NonZeroUsize};
+
 #[cfg(not(feature = "std"))]
 use core::ops::Range;
 #[cfg(feature = "std")]
@@ -92,6 +94,33 @@ pub fn u32_from(value: u64) -> Result<u32, FormatError> {
     })
 }
 
+/// Narrow a non-zero `u32` to a non-zero `usize`, carrying the proof across.
+///
+/// The counterpart to [`TryToUsize::to_usize`] for a value whose non-zero-ness
+/// has already been established — an element size, in practice — so the code it
+/// is handed to keeps the guarantee instead of re-deriving it. The `u32` fits
+/// `usize` on every target this crate supports, and routing through the checked
+/// conversion keeps that assumption from becoming a silent truncation on a
+/// narrower one.
+#[inline]
+pub(crate) fn nonzero_usize_from(value: NonZeroU32) -> Result<NonZeroUsize, FormatError> {
+    NonZeroUsize::try_from(value).map_err(|_| FormatError::ValueTooLargeForPlatform {
+        value: u64::from(value.get()),
+        target: "usize",
+    })
+}
+
+/// Test-only shorthand for a non-zero size literal, so a fixture can pass an
+/// element width without restating the (statically obvious) proof each time.
+///
+/// # Panics
+///
+/// If `value` is zero.
+#[cfg(test)]
+pub(crate) fn nz(value: usize) -> NonZeroUsize {
+    NonZeroUsize::new(value).expect("a test's element size is non-zero")
+}
+
 /// Compute `offset .. offset + len` as a `usize` range, checking both the
 /// 64-bit addition and the narrowing of each bound to `usize`.
 ///
@@ -135,6 +164,17 @@ mod tests {
         assert_eq!(1234u64.to_usize().unwrap(), 1234);
         assert_eq!(42u32.to_usize().unwrap(), 42);
         assert_eq!(u32_from(1000).unwrap(), 1000);
+    }
+
+    /// The whole point of the conversion is that the proof survives it: what
+    /// goes in non-zero comes out non-zero, at the platform's width.
+    #[test]
+    fn a_nonzero_width_survives_the_narrowing() {
+        let width = NonZeroU32::new(8).unwrap();
+        assert_eq!(nonzero_usize_from(width).unwrap().get(), 8);
+
+        let widest = NonZeroU32::new(u32::MAX).unwrap();
+        assert_eq!(nonzero_usize_from(widest).unwrap().get(), u32::MAX as usize);
     }
 
     #[test]

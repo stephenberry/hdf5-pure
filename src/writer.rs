@@ -464,6 +464,7 @@ impl Default for FileBuilder {
 mod streaming_tests {
     use super::*;
     use crate::chunked_write::{ChunkMeta, ChunkProvider};
+    use crate::convert::nz;
     use std::sync::{Arc, Mutex};
 
     type Calls = Arc<Mutex<Vec<usize>>>;
@@ -537,7 +538,7 @@ mod streaming_tests {
             dims,
             maxshape,
             chunk_dims,
-            8,
+            nz(8),
             None,
             meta,
             Box::new(provider),
@@ -784,7 +785,7 @@ mod streaming_tests {
                     &[4],
                     None,
                     &[2],
-                    8,
+                    nz(8),
                     None,
                     meta,
                     Box::new(provider),

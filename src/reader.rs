@@ -1399,7 +1399,7 @@ impl FileInner {
         num_rows: u64,
     ) -> Result<Vec<u8>, FormatError> {
         let (os, ls) = (self.offset_size(), self.length_size());
-        let elem_size = dt.type_size() as usize;
+        let elem_size = dt.element_size_usize()?;
         // Elements per row (product of inner dims; 1 when 0-D or 1-D). Checked so
         // a crafted dataspace whose inner dims overflow `usize` errors instead of
         // panicking (debug) or wrapping (release).
@@ -1410,12 +1410,13 @@ impl FileInner {
                     length: d,
                 })
         })?;
-        let row_bytes = row_elems
-            .checked_mul(elem_size)
-            .ok_or(FormatError::OffsetOverflow {
-                offset: row_elems as u64,
-                length: elem_size as u64,
-            })?;
+        let row_bytes =
+            row_elems
+                .checked_mul(elem_size.get())
+                .ok_or(FormatError::OffsetOverflow {
+                    offset: row_elems as u64,
+                    length: elem_size.get() as u64,
+                })?;
 
         // Compact data is inline in the layout message — no I/O, no framing.
         if let DataLayout::Compact { data } = dl {
@@ -3180,7 +3181,7 @@ impl Dataset {
     /// file-mode and eligibility rules.
     pub fn append_raw(&mut self, bytes: &[u8]) -> Result<(), Error> {
         let g = self.append_geometry()?;
-        let es = g.element_size.max(1);
+        let es = g.element_size;
         // Whole-element length is checked before any batch applies, so the
         // refusal is atomic (the per-batch validation would only reject the
         // final, short batch after earlier ones had durably committed).
@@ -3191,7 +3192,7 @@ impl Dataset {
         }
         let total = (bytes.len() / es) as u64;
         self.append_batches(g, total, |b, r| {
-            b.append_raw(&bytes[r.start * es..r.end * es]);
+            b.append_raw(&bytes[r.start * es.get()..r.end * es.get()]);
         })
     }
 
@@ -4286,7 +4287,7 @@ impl Dataset {
             return Ok(Vec::new());
         };
         let dataspace = self.dataspace()?;
-        let elem_size = self.datatype()?.type_size() as usize;
+        let elem_size = self.datatype()?.element_size_usize()?;
         let base = self.file.addr_offset;
         // The chunk index — its root at `addr` and every internal node — stores
         // addresses relative to the base address. Walk it through a base-relative
@@ -4588,7 +4589,7 @@ impl Dataset {
     /// memory layout, so padded compound records are supported safely.
     pub fn read_compound<T: CompoundType>(&self) -> Result<Vec<T>, Error> {
         let datatype = self.datatype()?;
-        let element_size = datatype.type_size().to_usize()?;
+        let element_size = datatype.element_size_usize()?;
         if !matches!(datatype, Datatype::Compound { .. }) {
             return Err(FormatError::TypeMismatch {
                 expected: "Compound",
@@ -4597,14 +4598,14 @@ impl Dataset {
             .into());
         }
         let raw = self.read_raw()?;
-        if element_size == 0 || !raw.len().is_multiple_of(element_size) {
+        if !raw.len().is_multiple_of(element_size.get()) {
             return Err(FormatError::DataSizeMismatch {
-                expected: element_size,
+                expected: element_size.get(),
                 actual: raw.len(),
             }
             .into());
         }
-        raw.chunks_exact(element_size)
+        raw.chunks_exact(element_size.get())
             .map(|bytes| T::decode(&datatype, bytes).map_err(Error::from))
             .collect()
     }

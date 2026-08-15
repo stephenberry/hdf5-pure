@@ -7,6 +7,7 @@
 use alloc::{boxed::Box, string::String, vec, vec::Vec};
 
 use core::fmt;
+use core::num::{NonZeroU32, NonZeroUsize};
 
 use byteorder::{ByteOrder, LittleEndian};
 
@@ -1089,19 +1090,46 @@ impl Datatype {
         }
     }
 
-    /// Refuse a type that occupies zero bytes per element.
+    /// The element size in bytes, proven non-zero.
     ///
-    /// The writers divide by the element size exactly as the readers do, and a
-    /// `Datatype` a caller constructs never passes through
-    /// [`parse`](Self::parse), where a file-sourced one is refused. This is the
-    /// same refusal for the other direction.
-    pub(crate) fn ensure_nonzero_size(&self) -> Result<(), FormatError> {
-        if self.type_size() == 0 {
-            return Err(FormatError::ZeroSizedDatatype {
-                class: self.class_code(),
-            });
-        }
-        Ok(())
+    /// Prefer this to [`type_size`](Self::type_size) for any element size that
+    /// is about to be divided or divided *by*: it returns the size as a
+    /// [`NonZeroU32`], so the value carries its own proof and the code it is
+    /// handed to cannot divide by zero. Every such site in this crate takes a
+    /// non-zero size rather than re-checking one.
+    ///
+    /// The refusal has to live here rather than in the type because
+    /// `type_size()` is *computed*: an [`Array`](Self::Array) reports its base
+    /// type times its dimensions, so a zero dimension yields a zero-width
+    /// element behind a header that claims otherwise, and the variants are
+    /// deliberately open for a caller to build as a literal. A type read out of
+    /// a file is already refused when its message is decoded; this is the same
+    /// refusal for a constructed one, on the way into a writer.
+    ///
+    /// # Errors
+    ///
+    /// [`FormatError::ZeroSizedDatatype`] if the type occupies zero bytes per
+    /// element.
+    pub fn element_size(&self) -> Result<NonZeroU32, FormatError> {
+        NonZeroU32::new(self.type_size()).ok_or(FormatError::ZeroSizedDatatype {
+            class: self.class_code(),
+        })
+    }
+
+    /// The element size in bytes as a non-zero `usize`, for the byte arithmetic
+    /// that indexes an in-memory buffer.
+    ///
+    /// The narrowing is the one [`convert`](crate::convert) describes: a `u32`
+    /// fits `usize` on every target this crate supports, and the conversion is
+    /// routed through a checked one anyway.
+    ///
+    /// # Errors
+    ///
+    /// [`FormatError::ZeroSizedDatatype`] if the type occupies zero bytes per
+    /// element, or [`FormatError::ValueTooLargeForPlatform`] if the size does
+    /// not fit this target's `usize`.
+    pub(crate) fn element_size_usize(&self) -> Result<NonZeroUsize, FormatError> {
+        crate::convert::nonzero_usize_from(self.element_size()?)
     }
 }
 
@@ -1598,6 +1626,62 @@ mod tests {
         assert_eq!(
             Datatype::parse(&buf).unwrap_err(),
             FormatError::ZeroSizedDatatype { class: 3 }
+        );
+    }
+
+    /// The accessor the rest of the crate uses agrees with `type_size` for an
+    /// ordinary type. The point of the pair is that one of them carries a proof
+    /// and the other does not — not that they report different widths.
+    #[test]
+    fn element_size_matches_type_size_for_a_type_that_has_one() {
+        let dt = Datatype::FixedPoint {
+            size: 4,
+            byte_order: DatatypeByteOrder::LittleEndian,
+            signed: true,
+            bit_offset: 0,
+            bit_precision: 32,
+        };
+        assert_eq!(dt.element_size().unwrap().get(), dt.type_size());
+    }
+
+    /// A caller-built literal never passes through `parse`, so `element_size` is
+    /// the only thing standing between a degenerate type and the writers. The
+    /// `Array` case is the one that matters: its width is *computed* from its
+    /// dimensions, so this cannot be caught by inspecting a stored size field.
+    #[test]
+    fn element_size_refuses_a_constructed_array_with_a_zero_dimension() {
+        let dt = Datatype::Array {
+            base_type: Box::new(Datatype::FixedPoint {
+                size: 4,
+                byte_order: DatatypeByteOrder::LittleEndian,
+                signed: true,
+                bit_offset: 0,
+                bit_precision: 32,
+            }),
+            dimensions: vec![0, 4],
+        };
+        assert_eq!(dt.type_size(), 0);
+        assert_eq!(
+            dt.element_size().unwrap_err(),
+            FormatError::ZeroSizedDatatype { class: 10 }
+        );
+        assert_eq!(
+            dt.element_size_usize().unwrap_err(),
+            FormatError::ZeroSizedDatatype { class: 10 }
+        );
+    }
+
+    /// The class in the error names the type that was refused, not the base type
+    /// underneath it, so a report points at the message the writer was handed.
+    #[test]
+    fn element_size_reports_the_refused_types_own_class() {
+        let dt = Datatype::Compound {
+            size: 0,
+            members: vec![],
+        };
+        assert_eq!(
+            dt.element_size().unwrap_err(),
+            FormatError::ZeroSizedDatatype { class: 6 }
         );
     }
 
