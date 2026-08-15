@@ -1,6 +1,8 @@
 /target
 .DS_Store
 matlab_fixtures/
+# `examples/libver_fixtures.rs` writes here when run (the CI examples job runs
+# every example), and the fixtures it produces are regenerated rather than kept.
 libver_fixtures/
 .claude/
 # Fixture-regen venv (developer tool; committed fixtures are self-contained)
@@ -11,8 +13,9 @@ tests/fixtures/lzf/.venv/
 # Throwaway scratch probe tests (zz_ prefix), never committed
 tests/zz_*
 
-# A failing heapscope budget writes a profile beside the test binary's cwd, so
-# the failure can be read rather than only counted (tests/allocation_bounds.rs).
+# A failing heapscope baseline check writes a DHAT profile into the process's
+# cwd -- the package root under `cargo test` -- so the failure can be read
+# rather than only counted (tests/allocation_baseline.rs).
 heapscope-assert-*.json
 
 # Stray build artifacts

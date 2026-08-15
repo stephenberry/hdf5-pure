@@ -1058,7 +1058,11 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
             .is_ok_and(&overlaps)
     });
 
-    let pass = cache.begin_pass();
+    // Plain LRU rather than a fill-once pass, so the chunks this window finishes
+    // on are the ones retained. That is the reuse the doc above promises: the
+    // next window straddles this one's *last* chunk, and a window wide enough to
+    // fill the cache would otherwise drop exactly it. See [`CachePass`].
+    let pass = crate::chunk_cache::CachePass::LRU;
 
     for chunk in &chunks {
         let c0 = chunk.offsets.first().copied().unwrap_or(0).to_usize()?;

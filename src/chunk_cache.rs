@@ -172,19 +172,48 @@ struct CachedChunk {
 ///
 /// Every read path in this crate visits each of its chunks exactly once. Within
 /// one such pass, evicting a chunk to make room for another is work with no
-/// upside: the evicted chunk has already been placed and will not be asked for
-/// again, and neither will the one that displaced it. A whole read of a dataset
-/// larger than the cache did exactly that — 2,048 chunks copied into 16 slots,
-/// 2,032 of them evicted by the same read that stored them, which is a copy and
-/// an allocator round trip per chunk to retain nothing (issue #228).
+/// upside *to that pass*: the evicted chunk has already been placed and will not
+/// be asked for again, and neither will the one that displaced it. A whole read
+/// of a dataset larger than the cache did exactly that — 2,048 chunks offered to
+/// 16 slots, 2,032 of them evicted by the same read that stored them, an
+/// allocator round trip each and, on the unfiltered path, a copy of the chunk as
+/// well (issue #228).
 ///
-/// So a pass fills the cache and then stops offering. What it leaves behind is
-/// the *first* chunks of the read rather than the last, which is also the better
-/// half to keep: a caller who reads a dataset again starts at the beginning.
-/// Across passes nothing changes — a later read still evicts what an earlier one
-/// left, so the cache goes on tracking the most recent access pattern.
+/// So a pass fills the cache and then stops offering, and what it leaves behind
+/// is the chunks it reached first rather than the ones it reached last.
+///
+/// # Which half is worth keeping is the caller's question, not this type's
+///
+/// That last sentence is the whole trade, and it does not go the same way for
+/// every read. Keeping the *tail* is only possible by offering every chunk and
+/// evicting, which is the cost this exists to remove — so a read that wants the
+/// tail asks for [`CachePass::LRU`] and pays for it.
+///
+/// A read of a whole dataset does not want it: a caller who reads it again
+/// starts at the beginning, so a retained prefix is worth at least as much as a
+/// retained suffix, and it costs a fraction as much to keep. A *row window* does
+/// want it, because its successor is the adjacent window and the chunk they share
+/// is the one this read finished on — which is why
+/// [`read_chunked_rows_from_source`](crate::chunked_read::read_chunked_rows_from_source)
+/// passes `LRU` and the two whole-dataset loops pass a real pass.
+///
+/// Across passes nothing changes either way: a later read still evicts what an
+/// earlier one left, so the cache goes on tracking the most recent access
+/// pattern.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CachePass(u64);
+
+impl CachePass {
+    /// Admission by the plain LRU rule this cache had before passes existed:
+    /// every slot is evictable, including one this same identity stored.
+    ///
+    /// It is recognized by *being* this value rather than by its number. Zero is
+    /// outside the range [`ChunkCache::begin_pass`] hands out, which keeps a real
+    /// pass from ever being mistaken for it — but that alone would not be enough
+    /// in the other direction, since every `LRU` insert records the same
+    /// `stored_by` and would then look like its own pass's work.
+    pub const LRU: CachePass = CachePass(0);
+}
 
 // ---------------------------------------------------------------------------
 // ChunkCache
@@ -369,10 +398,46 @@ impl ChunkCache {
             }
         }
 
-        // Evict until there is room, never taking back a chunk this same pass
-        // stored: that trades a chunk nobody will ask for again for another one
-        // nobody will ask for again. When only such chunks are left, the cache is
-        // full as far as this pass is concerned and the chunk is not stored.
+        // A chunk this same pass stored is not taken back: that trades a chunk
+        // nobody will ask for again for another one nobody will ask for again.
+        //
+        // Unless this is [`CachePass::LRU`], which asks for the plain rule and
+        // must therefore be allowed to evict what it stored itself. Testing that
+        // by identity rather than leaning on `LRU`'s number is the whole of it:
+        // every `LRU` insert records the same `stored_by`, so an identity
+        // comparison alone would make the second one see the first as its own and
+        // refuse — turning the plain rule into fill-once for the life of the
+        // cache. `a_pass_marked_lru_evicts_its_own_chunks` is that bug's test.
+        let evicts_its_own = pass == CachePass::LRU;
+        let reclaimable = |slot: &&CachedChunk| evicts_its_own || slot.stored_by != pass.0;
+
+        // Whether the reclaimable slots can make room *at all*, decided before
+        // anything is removed. Evicting some and then finding the rest untouchable
+        // would leave the cache holding less and storing nothing — a chunk given
+        // up for no one. Removing every reclaimable slot is the most room there is
+        // to be had, so the test is the loop's own exit condition evaluated
+        // against that state.
+        let (freed_slots, freed_bytes) = inner
+            .slots
+            .iter()
+            .filter(reclaimable)
+            .fold((0usize, 0usize), |(n, b), slot| {
+                (n + 1, b + slot.data.len())
+            });
+        let (least_slots, least_bytes) = (
+            inner.slots.len() - freed_slots,
+            inner.current_bytes - freed_bytes,
+        );
+        if least_slots >= inner.max_slots
+            || (least_bytes + data_len > inner.max_bytes && least_slots > 0)
+        {
+            return false;
+        }
+
+        // Evict in LRU order until there is room. The check above proves a
+        // reclaimable slot exists for as long as this condition holds, so the
+        // `else` below cannot be reached; it returns rather than storing over
+        // budget in case that reasoning is ever made false.
         while inner.slots.len() >= inner.max_slots
             || (inner.current_bytes + data_len > inner.max_bytes && !inner.slots.is_empty())
         {
@@ -381,10 +446,14 @@ impl ChunkCache {
                 .slots
                 .iter()
                 .enumerate()
-                .filter(|(_, s)| s.stored_by != pass.0)
+                .filter(|(_, s)| reclaimable(s))
                 .min_by_key(|(_, s)| s.last_access)
                 .map(|(i, _)| i);
             let Some(lru_idx) = lru_idx else {
+                debug_assert!(
+                    false,
+                    "the feasibility check above admitted a chunk this pass cannot make room for"
+                );
                 return false;
             };
             let removed = inner.slots.swap_remove(lru_idx);
@@ -606,6 +675,53 @@ mod tests {
         assert_eq!(cache.stats().cached_chunks(), 2);
         assert!(get_decompressed(&cache, &[9]).is_some());
         assert!(get_decompressed(&cache, &[8]).is_some());
+    }
+
+    /// [`CachePass::LRU`] is a sentinel: it works only because a real pass is
+    /// never numbered zero. A `begin_pass` that started counting at zero would
+    /// silently turn the windowed reader's plain-LRU admission into fill-once and
+    /// lose it the boundary chunk its successor window needs.
+    #[test]
+    fn a_pass_marked_lru_evicts_its_own_chunks() {
+        let cache = ChunkCache::with_capacity(1024 * 1024, 2);
+
+        for c in 0..4u64 {
+            cache.put_decompressed(CachePass::LRU, &[c], vec![c as u8; 10]);
+        }
+
+        // The last two, where a fill-once pass would have kept the first two.
+        assert_eq!(cache.stats().cached_chunks(), 2);
+        assert!(get_decompressed(&cache, &[2]).is_some());
+        assert!(get_decompressed(&cache, &[3]).is_some());
+        assert!(get_decompressed(&cache, &[0]).is_none());
+
+        // The property that makes the sentinel sound, asserted rather than
+        // assumed: no real pass can collide with it.
+        assert_ne!(cache.begin_pass(), CachePass::LRU);
+    }
+
+    /// A pass that gives up must not have taken anything with it. Reclaiming some
+    /// slots and then finding the rest untouchable would leave the cache holding
+    /// less and storing nothing — a chunk dropped for no one.
+    #[test]
+    fn a_pass_that_cannot_make_room_evicts_nothing() {
+        // 100 bytes, plenty of slots: only the byte budget can bite.
+        let cache = ChunkCache::with_capacity(100, 16);
+
+        let first = cache.begin_pass();
+        cache.put_decompressed(first, &[0], vec![0; 10]);
+
+        let second = cache.begin_pass();
+        cache.put_decompressed(second, &[1], vec![1; 80]);
+        assert_eq!(cache.stats().cached_chunks(), 2);
+
+        // 80 bytes more will not fit even with the 10-byte chunk from `first`
+        // reclaimed, and the 80-byte one belongs to this pass. The old code
+        // evicted the reclaimable chunk first and gave up afterwards.
+        cache.put_decompressed(second, &[2], vec![2; 80]);
+        assert_eq!(cache.stats().cached_chunks(), 2);
+        assert_eq!(cache.stats().cached_bytes(), 90);
+        assert!(get_decompressed(&cache, &[0]).is_some());
     }
 
     /// The same rule on the borrowed entry point, where it also decides whether

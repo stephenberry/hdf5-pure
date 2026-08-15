@@ -26,6 +26,14 @@ use std::sync::OnceLock;
 /// this one outside the measured call, are not in it. That is what lets several
 /// measured tests share a process — which they must, since the profiler is
 /// process-wide and `cargo test` runs a binary's tests concurrently.
+///
+/// **It is also the way a test built on this goes quietly hollow.** Work that
+/// moves to a worker thread stops being measured, and every figure here collapses
+/// toward zero while an upper bound on it goes on passing. This is not
+/// hypothetical for this crate: the read path has a parallel variant waiting to
+/// be written. So a test that asserts a ceiling must assert a floor beside it —
+/// the read's own output is in these figures, so its size is a floor that costs
+/// one line and cannot be satisfied by a measurement of nothing.
 #[derive(Clone, Copy, Debug)]
 pub struct Measured {
     /// Allocations made, counting a reallocation as one.
@@ -76,6 +84,16 @@ fn start_profiling() {
 ///
 /// `name` must be unique within the binary: heapscope interns region names, so
 /// two measurements sharing one would be added together.
+///
+/// # Every reading that would be a guess panics instead
+///
+/// heapscope's own [`HeapStats::get`] refuses rather than returning zeros when
+/// the run cannot be trusted, and its documentation is explicit about why: a
+/// getter that answered zero would turn every budget built on it into an
+/// assertion that cannot fail. Reading a region goes through `Snapshot` instead,
+/// which reports those conditions rather than refusing on them, so this is where
+/// they have to be checked — otherwise this helper would be exactly the
+/// zero-returning getter that design exists to prevent.
 #[track_caller]
 pub fn measure<R>(name: &'static str, work: impl FnOnce() -> R) -> (R, Measured) {
     start_profiling();
@@ -85,12 +103,32 @@ pub fn measure<R>(name: &'static str, work: impl FnOnce() -> R) -> (R, Measured)
         work()
     };
 
-    let stats = heapscope::Snapshot::capture()
+    let snapshot = heapscope::Snapshot::capture();
+    assert!(
+        !snapshot.poisoned,
+        "the profiler reported an internal failure during this run, so {name:?}'s \
+         figures may be missing allocations"
+    );
+    assert!(
+        snapshot.exact,
+        "the profiler could not reach a quiet point, so {name:?}'s figures are not \
+         consistent with each other"
+    );
+    assert_eq!(
+        snapshot.stats.dropped_blocks, 0,
+        "the live-block table filled up, so every figure for {name:?} is missing \
+         however many allocations it turned away"
+    );
+
+    let stats = snapshot
         .regions
         .into_iter()
         .find(|r| r.name.as_deref() == Some(name))
         .unwrap_or_else(|| {
-            panic!("no region named {name:?} in the profile: did `work` allocate nothing at all?")
+            // Not the "it allocated nothing" case: a region is interned when it
+            // is entered, so an empty one still has a row. This is a profiler
+            // that recorded nothing at all.
+            panic!("no region named {name:?} in the profile: the profiler is not recording")
         });
 
     let measured = Measured {

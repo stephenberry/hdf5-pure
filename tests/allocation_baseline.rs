@@ -20,20 +20,29 @@
 //! runs the rules instead. Widening this to a second platform is a matter of
 //! measuring it there, not of loosening anything.
 //!
-//! Hence the `not(any(...))` below: this compiles only under the crate's default
-//! features, which is the set the figures were recorded under and the set a
-//! dependent's build most resembles. Under `--all-features` — the pre-push gate —
-//! it compiles to nothing rather than failing against numbers from another
-//! configuration. A feature added to the crate and not to that list will make the
-//! `--all-features` gate start running this and fail; the fix is the one-line
-//! addition, and the loud failure is the point.
+//! Hence the cfg below, which names the default set from both sides: the three
+//! default features must be on and every other one off. That is the set the
+//! figures were recorded under and the set a dependent's build most resembles.
+//! Under `--all-features` — the pre-push gate — it compiles to nothing rather
+//! than failing against numbers from another configuration.
+//!
+//! **The list is maintained by hand and nothing will tell you when it is stale.**
+//! A feature added to the crate and not added here simply widens the set this
+//! accepts, silently, because `--all-features` turns on `fast-deflate` and so
+//! compiles this out whatever else is added. There is no version of this cfg that
+//! self-corrects; adding a feature to the crate means adding it here.
 //!
 //! # When it fails
 //!
-//! Read the named figures. A number that went *up* is the point of the gate: some
-//! path started allocating more. A number that went *down* is usually good news
-//! that still has to be recorded, because the file says what today's behaviour is
-//! and a stale one gates nothing.
+//! Read the named figures: some path started allocating more, and the message
+//! says which figure and by how much.
+//!
+//! The comparison is one-sided — heapscope reports only figures that *grew* — so
+//! a number that went **down** never fails and never appears. That is worth
+//! knowing because it is how the gate goes slack: an improvement leaves the file
+//! recording the worse old number, and the difference becomes headroom a later
+//! regression can spend for free. Re-record after an improvement too; nothing
+//! will remind you.
 //!
 //! Re-record with:
 //!
@@ -54,6 +63,13 @@
 //! pinned here too, and it allocates more than the read does.
 #![cfg(all(
     feature = "heap-baseline",
+    // The default set, required to be present: `--no-default-features` with
+    // `heap-baseline` alone would otherwise check a different build's figures
+    // against this file.
+    feature = "std",
+    feature = "checksum",
+    feature = "deflate",
+    // And required to be the whole of it.
     not(any(
         feature = "fast-deflate",
         feature = "provenance",

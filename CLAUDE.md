@@ -26,7 +26,9 @@ nextest rather than `cargo test` because `cargo test` runs the ~110 integration 
 
 Two test binaries install [`heapscope`](https://crates.io/crates/heapscope) as their `#[global_allocator]` and measure what the read and write paths allocate (issue #228). They answer different questions and fail for different reasons.
 
-`tests/allocation_bounds.rs` states **rules**: a windowed read allocates on the order of its window, a chunked read costs a small constant number of allocations per chunk, a windowed variable-length read does not allocate per object of the heap collection it walks. Every one is a claim about how the work scales, so it holds on every platform and survives a toolchain that changes a `Vec`'s growth by a step. This runs in the ordinary suite, everywhere.
+`tests/allocation_bounds.rs` states **rules**: a windowed read allocates on the order of its window, a chunked read costs a small constant number of allocations per chunk, a windowed variable-length read does not allocate per object of the heap collection it walks. Every one is a claim about how the work scales, which is what lets it hold across platforms where an exact count would not. It runs in every `test`-matrix job on all three operating systems (not in the `cross` i686/s390x jobs, which name their test targets explicitly).
+
+Each bound is paired with a **floor** — usually "the read's own output is in this measurement". Regions are per thread, so work that moves onto a worker leaves every figure near zero and every ceiling passing; the floor is what makes that fail instead. The one bound deliberately close to its measurement is `BLOCKS_PER_CHUNK`, about 3% above a rate that converges to 3.00 per chunk: one extra allocation in the per-chunk loop is the defect it exists to catch, so it is tight on purpose.
 
 `tests/allocation_baseline.rs` pins the **numbers**, in `tests/baselines/`, so a 5% creep that passes every rule still arrives in a pull request as a line a reviewer reads. An exact count is a property of one target, one toolchain *and* one feature set — `--all-features` measured 416 bytes above the default set on the same commit — so it compiles only under the crate's default features plus `heap-baseline`, and runs in one CI job on aarch64 macOS, the host the numbers were measured on. The `--all-features` pre-push gate therefore does not run it; this does:
 
@@ -34,7 +36,7 @@ Two test binaries install [`heapscope`](https://crates.io/crates/heapscope) as t
 cargo nextest run --features heap-baseline --test allocation_baseline
 ```
 
-Re-record with `HEAPSCOPE_UPDATE_BASELINE=1 cargo test --features heap-baseline --test allocation_baseline` and commit the diff with the change that moved it. A figure that went *down* still has to be recorded: a stale baseline gates nothing.
+Re-record with `HEAPSCOPE_UPDATE_BASELINE=1 cargo test --features heap-baseline --test allocation_baseline` and commit the diff with the change that moved it, and pin the job's toolchain deliberately — a `std` release that moves a figure would otherwise redden every open PR at once. The comparison is one-sided (only figures that *grew* are reported), so an improvement never fails and never appears: re-record after one too, or the old worse number stays as headroom a later regression spends for free.
 
 `examples/heap_profile.rs` is the third piece and the one to reach for first when a bound fails: `cargo run --release --example heap_profile` writes `target/heap-profile.html` and prints the heaviest call sites, broken down by phase (write chunked, read whole, read window, ...). Run it in release — a debug build's counts are the same but its stacks are full of the inlining that did not happen.
 

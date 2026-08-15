@@ -71,11 +71,12 @@ fn pad8_u64(x: u64) -> Result<u64, FormatError> {
         })
 }
 
-/// How much of a collection the directory walk holds at a time.
+/// The most of a collection the directory walk holds at a time.
 ///
-/// One page. Large enough that a collection of many small objects pays one read
-/// per few hundred of them, small enough that a collection of few large ones
-/// reads little more than the object headers it came for.
+/// One page: enough that a collection of many small objects pays one read per few
+/// hundred of them. It is a ceiling and not the size of every read — see
+/// [`DirectoryWindow::get`], which reads only what it needs once the objects are
+/// too far apart for a window to span two headers.
 const DIRECTORY_WINDOW: usize = 4096;
 
 /// A bounded sliding view of one collection's bytes.
@@ -94,6 +95,9 @@ struct DirectoryWindow {
     /// Absolute offset the buffer begins at.
     start: u64,
     bytes: Vec<u8>,
+    /// Where the previous request was, so the next refill can tell how far apart
+    /// this collection's object headers are. `None` until the first one.
+    last: Option<u64>,
 }
 
 impl DirectoryWindow {
@@ -101,17 +105,39 @@ impl DirectoryWindow {
         Self {
             start: 0,
             bytes: Vec::new(),
+            last: None,
         }
     }
 
     /// The `need` bytes at `pos`, refilling from `source` when this window does
     /// not already hold them.
     ///
-    /// Never reads past `limit`, the end of the collection being walked, so a
-    /// window stays inside the structure it is a view of. Callers check that the
-    /// `need` bytes are inside the collection before asking; `need` is taken as a
-    /// floor on the refill anyway, so a caller that did not would read short
-    /// rather than index out of bounds.
+    /// # How much a refill reads
+    ///
+    /// Reading a whole window ahead pays only when the next header lands inside
+    /// it. A collection of objects larger than a page has one header per window,
+    /// and reading 4 KiB to take 16 bytes out of it is *worse* than the two small
+    /// reads this replaced — measured at 225x the bytes for 100 objects of 5 KB,
+    /// which is not a corner case: the reference C library gives an object larger
+    /// than its collection one of its own, so a dataset of large variable-length
+    /// values is exactly this shape.
+    ///
+    /// So the span is decided by how far apart the last two requests were. The
+    /// first refill reads `need` alone, because nothing is known yet; after that a
+    /// window is read only while a window would hold the next header too. Both
+    /// answers are self-correcting — a collection that changes shape halfway
+    /// through adapts within one object.
+    ///
+    /// # Bounds
+    ///
+    /// A refill reads no more than `limit`, the end of the collection being
+    /// walked, leaves — so a window stays inside the structure it views, and
+    /// cannot reach past the end of the source either, since the caller has
+    /// already established that `limit` is within it. `need` is a floor on the
+    /// span, so a caller asking for more bytes than the collection holds reads
+    /// past `limit` rather than indexing out of bounds; both call sites below
+    /// establish that `need` fits before asking, which is what keeps that
+    /// unreachable.
     fn get<'a, S: Source + ?Sized>(
         &'a mut self,
         source: &S,
@@ -127,18 +153,32 @@ impl DirectoryWindow {
                     .is_some_and(|end| end <= self.bytes.len())
             });
 
+        let stride = self.last.map(|last| pos.saturating_sub(last));
+        self.last = Some(pos);
+
         let at = match held {
             Some(at) => at,
             None => {
+                // A window is worth reading only if the header after this one
+                // would fall inside it. `None` is the first refill, which knows
+                // nothing and so reads nothing extra.
+                let ahead = match stride {
+                    Some(stride)
+                        if stride.saturating_add(need as u64) <= DIRECTORY_WINDOW as u64 =>
+                    {
+                        DIRECTORY_WINDOW
+                    }
+                    _ => need,
+                };
                 // Clamped to one window before the narrowing, so the conversion
                 // cannot lose anything on a 32-bit target and the fallback is
                 // unreachable — it is spelled out rather than asserted because
                 // the clamp above is what makes it so.
                 let span = limit
                     .saturating_sub(pos)
-                    .min(DIRECTORY_WINDOW as u64)
+                    .min(ahead as u64)
                     .to_usize()
-                    .unwrap_or(DIRECTORY_WINDOW)
+                    .unwrap_or(ahead)
                     .max(need);
                 self.bytes = source.read_metadata_at(pos, span)?;
                 self.start = pos;
@@ -220,12 +260,29 @@ impl GlobalHeapIndex {
             .checked_add(2)
             .is_some_and(|index_end| index_end <= collection_end)
         {
-            let index_bytes = window.get(source, pos, 2, collection_end)?;
-            let object_index = u16::from_le_bytes([index_bytes[0], index_bytes[1]]);
+            // One request per object. The index is the first two bytes of the
+            // object header, so the header is read whole wherever the collection
+            // has room for one, and the two-byte terminator probe is what is left
+            // for a tail too short to hold another header. Asking twice at the
+            // same position would refill twice on the narrow path above.
+            let room_for_header = pos
+                .checked_add(object_header_size as u64)
+                .is_some_and(|end| end <= collection_end);
+            let need = if room_for_header {
+                object_header_size
+            } else {
+                2
+            };
+            let bytes = window.get(source, pos, need, collection_end)?;
+            let object_index = u16::from_le_bytes([bytes[0], bytes[1]]);
             if object_index == 0 {
                 break;
             }
 
+            // A short tail could legally hold nothing but that terminator. These
+            // are the two checks the walk always made, in the order it made them,
+            // so a malformed collection fails with the error it always failed
+            // with — and reaching them at all means `bytes` is a whole header.
             let object_header_end =
                 pos.checked_add(object_header_size as u64)
                     .ok_or(FormatError::OffsetOverflow {
@@ -238,8 +295,7 @@ impl GlobalHeapIndex {
                     available: collection_end.to_usize().unwrap_or(usize::MAX),
                 });
             }
-            let object_header = window.get(source, pos, object_header_size, collection_end)?;
-            let object_size = read_length(object_header, 8, length_size)?;
+            let object_size = read_length(bytes, 8, length_size)?;
             let data_address = object_header_end;
             let data_end =
                 data_address
@@ -466,6 +522,65 @@ mod tests {
             reads <= 8,
             "walking {OBJECTS} objects took {reads} reads, which scales with the \
              object count rather than the {} bytes of collection it covers",
+            source.data.len()
+        );
+    }
+
+    /// The other side of the window's bargain, and the one it got wrong first.
+    ///
+    /// Reading a window ahead pays only when the next header lands inside it. A
+    /// collection of objects larger than a page has one header per window, and a
+    /// fixed-size window read 4 KiB to take 16 bytes out of it — 225x the bytes
+    /// the two small reads it replaced took, on a shape the reference C library
+    /// produces routinely (an object larger than a collection gets one of its
+    /// own). So the walk must read *no more than the old one did* here, even as
+    /// it reads far less often for small objects.
+    #[test]
+    fn the_directory_walk_does_not_read_a_window_per_large_object() {
+        use core::cell::Cell;
+
+        struct VolumeSource {
+            data: Vec<u8>,
+            bytes_read: Cell<usize>,
+        }
+
+        impl Source for VolumeSource {
+            fn len(&self) -> u64 {
+                self.data.len() as u64
+            }
+
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
+                BytesSource::new(&self.data).read_at(offset, buf)
+            }
+
+            fn read_metadata_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
+                self.bytes_read.set(self.bytes_read.get() + len);
+                BytesSource::new(&self.data).read_exact_at(offset, len)
+            }
+        }
+
+        // 64 objects of 5,000 bytes: every stride is wider than a window, so
+        // every header is a miss.
+        const OBJECTS: u16 = 64;
+        let payload = vec![0u8; 5000];
+        let objects: Vec<(u16, u16, &[u8])> = (1..=OBJECTS).map(|i| (i, 1, &payload[..])).collect();
+        let source = VolumeSource {
+            data: build_collection(&objects, 8),
+            bytes_read: Cell::new(0),
+        };
+
+        let coll = GlobalHeapIndex::parse(&source, 0, 8).unwrap();
+        assert_eq!(coll.objects.len(), OBJECTS as usize);
+
+        // One 16-byte header apiece, the collection header, and one window's
+        // worth of slack for the first refill, which has no stride to judge by.
+        let read = source.bytes_read.get();
+        let ceiling = DIRECTORY_WINDOW + (OBJECTS as usize + 2) * 32;
+        assert!(
+            read <= ceiling,
+            "walking {OBJECTS} objects of 5,000 bytes read {read} bytes of a \
+             {}-byte collection; a window per object rather than a header per \
+             object is the failure this bounds",
             source.data.len()
         );
     }

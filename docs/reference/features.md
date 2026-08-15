@@ -18,6 +18,7 @@ For how to declare these in `Cargo.toml`, see [Installation](../getting-started/
 | `parallel` | no | `rayon` | — | Parallel chunk processing via `rayon` |
 | `provenance` | no | `sha2` | — | SHA-256 data provenance tracking |
 | `zfp` | no | — | — | ZFP fixed-rate compression (HDF5 filter 32013), `f32`/`f64`/`i32`/`i64` x 1D-4D |
+| `heap-baseline` | no | — | — | Maintainer-only: check the recorded allocation figures (see below) |
 
 The default feature set is `std`, `checksum`, and `deflate`.
 
@@ -107,6 +108,12 @@ builder.create_dataset("temperature")
 ```
 
 ## Maintainer-only features
+
+### `heap-baseline`
+
+`heap-baseline` is a test-only / maintainer feature. It enables `tests/allocation_baseline.rs`, which checks the crate's exact allocation counts and byte totals for one write-then-read cycle against the figures committed under `tests/baselines/`. It pulls in nothing (the heap profiler it uses, [`heapscope`](https://crates.io/crates/heapscope), is an unconditional dev-dependency), it is not a run-time dependency, and end users do not need it.
+
+The figures it checks belong to one target, one toolchain and one feature set, so the test compiles only under the crate's *default* features and CI runs it in a single pinned job. The bounds that hold everywhere — a windowed read allocates on the order of its window, a chunked read costs a constant per chunk — are in `tests/allocation_bounds.rs` and need no feature at all. On x86_64, both need the frame pointers `.cargo/config.toml` sets.
 
 ### `matio-crosscheck`
 

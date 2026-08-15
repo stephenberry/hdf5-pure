@@ -3,14 +3,22 @@
 //!
 //! Every bound here is a statement about how the work *scales* — a windowed read
 //! allocates on the order of its window, a chunked read allocates a fixed number
-//! of blocks per chunk — so it holds on every platform and survives a toolchain
-//! that changes a `Vec`'s growth by one step. The exact figures are pinned
-//! separately, on one platform, in `tests/allocation_baseline.rs`.
+//! of blocks per chunk — so it holds on every platform, where an exact count does
+//! not. Those are pinned separately, on one platform, in
+//! `tests/allocation_baseline.rs`.
+//!
+//! Scaling is not the same as unbreakable, and the margins differ: the byte and
+//! peak bounds have several times' headroom and will not notice a `Vec` growth
+//! step anywhere, while `BLOCKS_PER_CHUNK` sits about 3% above a measured
+//! 3.00-per-chunk rate on purpose — one more allocation *inside the per-chunk
+//! loop* is exactly what it exists to catch, and a growth step there would fail
+//! it too. That is the trade it is meant to make.
 //!
 //! Measurement is per region and per thread (`tests/common/allocation.rs`), so
 //! these tests share a process without serializing against each other: what a
 //! region records is what the calling thread allocated inside it, and nothing
-//! else.
+//! else. That last part is also how a test here could go quiet, which is why each
+//! one asserts a floor as well as a ceiling — see [`allocation::Measured`].
 
 use hdf5_pure::{File, FileBuilder};
 

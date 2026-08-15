@@ -80,12 +80,19 @@ jobs:
   # "0 tests run", which is the way this job would otherwise go hollow: the test
   # is behind `heap-baseline`, and a feature name that stopped matching would
   # leave an empty binary passing silently.
+  #
+  # The toolchain is pinned, as `cast-deny-32bit` pins its own and for the same
+  # reason: the recorded figures include `std`'s own allocations, so a `Vec`
+  # growth policy that moves in a six-week release would turn this red on every
+  # open pull request at once, for a reason no one's change caused — and a check
+  # that is expected to be red stops being read. Bump it deliberately and
+  # re-record in the same commit.
   heap-baseline:
     name: Allocation baseline (macOS aarch64)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.0
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
