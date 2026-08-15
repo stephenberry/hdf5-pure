@@ -219,3 +219,153 @@ fn whole_read_of_adjacent_chunks_costs_a_constant_per_chunk() {
         &((N0 - 1) as f64).to_le_bytes()[..]
     );
 }
+
+/// Writing a chunked dataset costs a constant per chunk, and about one copy of
+/// the data beyond the one the caller handed over.
+///
+/// The two bounds catch different things. The count catches a scratch `Vec` in
+/// the per-chunk loop — the splitter kept three of them, one of which was a
+/// coordinate vector no caller ever read. The byte bound catches a whole second
+/// copy of the dataset, which is what the object-header sizing pass was making:
+/// it built the entire data region to learn how long it would be, then dropped it
+/// and built it again at the real address (issue #228).
+#[test]
+fn chunked_write_costs_a_constant_per_chunk() {
+    const N0: usize = 1024 * 1024;
+    const DATASET_BYTES: usize = N0 * 8;
+    const CHUNK_ELEMS: u64 = 512;
+    const CHUNKS: u64 = (N0 as u64) / CHUNK_ELEMS;
+
+    let data: Vec<f64> = (0..N0).map(|i| i as f64).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("write.h5");
+
+    let (_, measured) = measure("chunked_write", || {
+        let mut builder = FileBuilder::new();
+        builder
+            .create_dataset("t")
+            .with_f64_data(&data)
+            .with_shape(&[N0 as u64])
+            .with_chunks(&[CHUNK_ELEMS]);
+        builder.write(&path).unwrap();
+    });
+
+    // The writer's own copy of the caller's data is in this measurement, so the
+    // dataset's size is a floor a measurement of nothing cannot reach.
+    assert!(
+        measured.bytes >= DATASET_BYTES as u64,
+        "the write's own copy of the data is not in this measurement, so the \
+         bounds below are measuring something other than the write: {measured}"
+    );
+
+    // Measured at 3.05 copies: the caller's bytes staged in the builder, the
+    // split into chunk buffers, and the assembled data region. A fourth is a
+    // regression; anything that removes one of these three lowers it.
+    assert!(
+        measured.bytes < (DATASET_BYTES * 7 / 2) as u64,
+        "a chunked write may hold the dataset a small number of times over, not \
+         one more: measured {measured} against a {DATASET_BYTES}-byte dataset"
+    );
+
+    const BLOCKS_PER_CHUNK: u64 = 2;
+    assert!(
+        measured.blocks <= BLOCKS_PER_CHUNK * CHUNKS + 256,
+        "a chunked write must cost a small constant number of allocations per \
+         chunk: measured {measured} over {CHUNKS} chunks, above the \
+         {BLOCKS_PER_CHUNK} per chunk this bound allows"
+    );
+
+    // The file must still be the right file.
+    let file = File::open(&path).unwrap();
+    let back = file.dataset("t").unwrap().read_f64().unwrap();
+    assert_eq!(back.len(), N0);
+    assert_eq!(back[N0 - 1], (N0 - 1) as f64);
+}
+
+/// A filtered write builds one compressor, not one per chunk.
+///
+/// A zlib compressor holds ~300 KiB of hash tables, so building one per chunk
+/// made writing this 8 MiB dataset allocate 743 MB — ninety times the data, and
+/// by a wide margin the most expensive thing this crate did (issue #228). The
+/// bound is on bytes because that is the axis a per-chunk codec moves; a count
+/// bound alone would miss it, since the codec is a handful of allocations that
+/// happen to be enormous.
+#[test]
+fn filtered_write_does_not_build_a_compressor_per_chunk() {
+    const N0: usize = 1024 * 1024;
+    const DATASET_BYTES: usize = N0 * 8;
+    const CHUNK_ELEMS: u64 = 512;
+    const CHUNKS: u64 = (N0 as u64) / CHUNK_ELEMS;
+
+    let data: Vec<f64> = (0..N0).map(|i| i as f64).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("deflate.h5");
+
+    let (_, measured) = measure("filtered_write", || {
+        let mut builder = FileBuilder::new();
+        builder
+            .create_dataset("t")
+            .with_f64_data(&data)
+            .with_shape(&[N0 as u64])
+            .with_chunks(&[CHUNK_ELEMS])
+            .with_deflate(3);
+        builder.write(&path).unwrap();
+    });
+
+    assert!(
+        measured.bytes >= DATASET_BYTES as u64,
+        "the write's own copy of the data is not in this measurement: {measured}"
+    );
+
+    // One compressor per chunk would be ~615 MiB here, seventy times this bound.
+    assert!(
+        measured.bytes < (DATASET_BYTES * 4) as u64,
+        "a filtered write must build its compressor once, not per chunk: measured \
+         {measured} against a {DATASET_BYTES}-byte dataset over {CHUNKS} chunks"
+    );
+
+    let file = File::open(&path).unwrap();
+    let back = file.dataset("t").unwrap().read_f64().unwrap();
+    assert_eq!(back.len(), N0);
+    assert_eq!(back[N0 - 1], (N0 - 1) as f64);
+}
+
+/// The same for the read side, where a decoder per chunk cost 174 MB to read the
+/// 8 MiB back (issue #228).
+#[test]
+fn filtered_read_does_not_build_a_decompressor_per_chunk() {
+    const N0: usize = 1024 * 1024;
+    const DATASET_BYTES: usize = N0 * 8;
+
+    let data: Vec<f64> = (0..N0).map(|i| i as f64).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("deflate_read.h5");
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("t")
+        .with_f64_data(&data)
+        .with_shape(&[N0 as u64])
+        .with_chunks(&[512])
+        .with_deflate(3);
+    builder.write(&path).unwrap();
+    drop(data);
+
+    let file = File::open_streaming(&path).unwrap();
+    let ds = file.dataset("t").unwrap();
+    let (all, measured) = measure("filtered_read", || ds.read_raw().unwrap());
+
+    assert!(
+        measured.bytes >= DATASET_BYTES as u64,
+        "the read's own output is not in this measurement: {measured}"
+    );
+
+    // One decoder per chunk would be ~85 MiB of Huffman state on top of the
+    // decoded data, ten times this bound.
+    assert!(
+        measured.bytes < (DATASET_BYTES * 4) as u64,
+        "a filtered read must build its decoder once, not per chunk: measured \
+         {measured} against a {DATASET_BYTES}-byte dataset"
+    );
+
+    assert_eq!(all.len(), DATASET_BYTES);
+}

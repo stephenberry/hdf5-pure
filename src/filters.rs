@@ -137,9 +137,94 @@ pub fn zfp_element_type_from_datatype(
     None
 }
 
+/// Reusable working state for the filters that carry any.
+///
+/// Every filter here is a pure function of its input except deflate, whose
+/// compressor holds ~300 KiB of hash tables and dictionary and whose decompressor
+/// holds ~42 KiB of Huffman state. All of it is *scratch*: a reset returns either
+/// to exactly its initial condition, so one of each serves a whole chunk loop and
+/// produces byte-identical output to a fresh one.
+///
+/// Building them per chunk is what a chunked write and a chunked read used to do,
+/// and it dominated both: 615 MiB of allocation to write an 8 MiB deflated
+/// dataset and 85 MiB to read it back, against 8 MiB of data (issue #228). So a
+/// caller with a loop keeps one of these across it and calls the `*_with` entry
+/// points; a caller with a single chunk uses [`compress_chunk`] or
+/// [`decompress_chunk`], which make one for the call.
+///
+/// Each half is built on first use, so a pipeline with no deflate stage — or a
+/// build without the feature — carries nothing.
+#[derive(Default)]
+pub struct FilterScratch {
+    #[cfg(feature = "deflate")]
+    encoder: Option<(u32, flate2::write::ZlibEncoder<Vec<u8>>)>,
+    #[cfg(feature = "deflate")]
+    decoder: Option<flate2::Decompress>,
+}
+
+impl FilterScratch {
+    /// An empty scratch. Nothing is allocated until a filter needs it.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The reusable encoder, built or re-levelled as needed.
+    ///
+    /// A level change rebuilds rather than resets: `flate2::Compress` can change
+    /// level in place, but only by flushing a stream that is mid-chunk here, and a
+    /// pipeline does not change level between its own chunks anyway — this is for
+    /// a scratch that outlives one dataset and meets another.
+    #[cfg(feature = "deflate")]
+    fn zlib_encoder(&mut self, level: u32) -> &mut flate2::write::ZlibEncoder<Vec<u8>> {
+        let stale = self.encoder.as_ref().is_none_or(|(have, _)| *have != level);
+        if stale {
+            self.encoder = Some((
+                level,
+                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(level)),
+            ));
+        }
+        &mut self.encoder.as_mut().expect("built directly above").1
+    }
+
+    /// The reusable decoder, reset to the start of a zlib stream.
+    ///
+    /// Resetting on the way *out* rather than the way in is what makes a decode
+    /// that failed halfway leave nothing behind for the next chunk.
+    #[cfg(feature = "deflate")]
+    fn zlib_decoder(&mut self) -> &mut flate2::Decompress {
+        match &mut self.decoder {
+            Some(d) => d.reset(true),
+            slot => *slot = Some(flate2::Decompress::new(true)),
+        }
+        self.decoder.as_mut().expect("built directly above")
+    }
+}
+
+/// Apply a filter pipeline to decompress a chunk, making the working state for
+/// the call.
+///
+/// A caller decoding chunk after chunk should keep a [`FilterScratch`] and use
+/// [`decompress_chunk_with`] instead: this one builds and drops a zlib decoder
+/// per call.
+pub fn decompress_chunk(
+    compressed: &[u8],
+    pipeline: &FilterPipeline,
+    ctx: ChunkContext<'_>,
+    filter_mask: u32,
+) -> Result<Vec<u8>, FormatError> {
+    decompress_chunk_with(
+        &mut FilterScratch::new(),
+        compressed,
+        pipeline,
+        ctx,
+        filter_mask,
+    )
+}
+
 /// Apply a filter pipeline to decompress a chunk.
 /// Filters are applied in REVERSE order for decompression.
-pub fn decompress_chunk(
+pub fn decompress_chunk_with(
+    scratch: &mut FilterScratch,
     compressed: &[u8],
     pipeline: &FilterPipeline,
     ctx: ChunkContext<'_>,
@@ -166,9 +251,11 @@ pub fn decompress_chunk(
         let input: &[u8] = owned.as_deref().unwrap_or(compressed);
         let next = match filter.filter_id {
             FILTER_SHUFFLE => shuffle_decompress(input, ctx.element_size.get() as usize)?,
-            FILTER_DEFLATE => {
-                deflate_decompress(input, inner_output_cap(expected, pipeline, filter_mask, i))?
-            }
+            FILTER_DEFLATE => deflate_decompress(
+                scratch,
+                input,
+                inner_output_cap(expected, pipeline, filter_mask, i),
+            )?,
             FILTER_LZF => {
                 crate::lzf::decompress(input, inner_output_cap(expected, pipeline, filter_mask, i))?
             }
@@ -297,9 +384,24 @@ fn inner_output_cap(
     Some(size)
 }
 
+/// Apply a filter pipeline to compress a chunk, making the working state for the
+/// call.
+///
+/// A caller compressing chunk after chunk should keep a [`FilterScratch`] and use
+/// [`compress_chunk_with`] instead: this one builds and drops a zlib encoder per
+/// call, which is ~300 KiB of hash tables per chunk.
+pub fn compress_chunk(
+    data: &[u8],
+    pipeline: &FilterPipeline,
+    ctx: ChunkContext<'_>,
+) -> Result<Vec<u8>, FormatError> {
+    compress_chunk_with(&mut FilterScratch::new(), data, pipeline, ctx)
+}
+
 /// Apply a filter pipeline to compress a chunk.
 /// Filters are applied in FORWARD order for compression.
-pub fn compress_chunk(
+pub fn compress_chunk_with(
+    scratch: &mut FilterScratch,
     data: &[u8],
     pipeline: &FilterPipeline,
     ctx: ChunkContext<'_>,
@@ -311,7 +413,7 @@ pub fn compress_chunk(
             FILTER_SHUFFLE => shuffle_compress(input, ctx.element_size.get() as usize)?,
             FILTER_DEFLATE => {
                 let level = filter.client_data.first().copied().unwrap_or(6);
-                deflate_compress(input, level)?
+                deflate_compress(scratch, input, level)?
             }
             FILTER_LZF => crate::lzf::compress(input),
             FILTER_FLETCHER32 => fletcher32_append(input)?,
@@ -398,68 +500,137 @@ fn deflate_corrupt(reason: &str) -> FormatError {
 /// A failure is a [`FormatError::FilterError`], the same variant every other
 /// filter in this pipeline reports a bad stream with, so a caller can match
 /// "this chunk did not decode" once rather than per compressor.
+/// How much room to add when a decode fills its buffer and no decoded size was
+/// declared. One page: large enough that an unbounded decode does not crawl,
+/// small enough that overshooting the final block wastes little.
 #[cfg(feature = "deflate")]
-fn deflate_decompress(data: &[u8], max_output: Option<usize>) -> Result<Vec<u8>, FormatError> {
-    use std::io::Read;
-    let decoder = flate2::read::ZlibDecoder::new(data);
-    match max_output {
-        Some(limit) => {
-            // The decoded size is known a priori (the chunk's expected byte
-            // size), so reserve it up front instead of letting `read_to_end`
-            // reallocate through ~log2(N) doublings — but only as far as this
-            // stream could possibly justify, so a declared size no stream backs
-            // cannot drive the allocation on its own.
-            let mut result = Vec::with_capacity(decode_reservation(
-                max_output,
-                data.len(),
-                MAX_DEFLATE_EXPANSION,
-            ));
-            // Read at most `limit + 1` bytes: anything beyond `limit` proves the
-            // stream exceeds the expected chunk size, so reject rather than OOM.
-            let cap = (limit as u64).saturating_add(1);
-            decoder
-                .take(cap)
-                .read_to_end(&mut result)
-                .map_err(|e| deflate_corrupt(&e.to_string()))?;
-            if result.len() > limit {
-                return Err(deflate_corrupt(&format!(
-                    "output exceeds expected chunk size of {limit} bytes \
-                     (possible decompression bomb)"
-                )));
-            }
-            Ok(result)
+const DEFLATE_GROWTH_FLOOR: usize = 4096;
+
+/// Decompress zlib data, reusing `scratch`'s decoder.
+///
+/// Driven through [`flate2::Decompress`] rather than a `ZlibDecoder` because
+/// `Decompress::reset` is the only reset in flate2 that reuses the inflate state
+/// — every `ZlibDecoder::reset` replaces it with a fresh one, and that
+/// allocation per chunk is what this exists to stop paying (issue #228).
+///
+/// The bomb guard the `Read` path wrote as `take(limit + 1)` is an explicit
+/// ceiling on the output buffer here: it never grows past `limit + 1`, so a
+/// stream that would inflate further is refused on the same evidence, having
+/// allocated no more than one byte beyond what a legitimate chunk needs.
+#[cfg(feature = "deflate")]
+fn deflate_decompress(
+    scratch: &mut FilterScratch,
+    data: &[u8],
+    max_output: Option<usize>,
+) -> Result<Vec<u8>, FormatError> {
+    use flate2::{FlushDecompress, Status};
+
+    let bomb = || {
+        deflate_corrupt(&format!(
+            "output exceeds expected chunk size of {} bytes (possible decompression bomb)",
+            max_output.unwrap_or(0)
+        ))
+    };
+    let truncated = || deflate_corrupt("stream ended before the chunk was complete");
+
+    // The decoded size is known a priori (the chunk's expected byte size), so
+    // reserve it up front instead of growing through ~log2(N) doublings — but
+    // only as far as this stream could possibly justify, so a declared size no
+    // stream backs cannot drive the allocation on its own.
+    let reservation = decode_reservation(max_output, data.len(), MAX_DEFLATE_EXPANSION);
+    // One past the limit, so an over-long stream is *detected* rather than
+    // silently truncated into a plausible-looking chunk.
+    let ceiling = max_output.map(|limit| limit.saturating_add(1));
+
+    let decoder = scratch.zlib_decoder();
+    let mut out = Vec::with_capacity(match ceiling {
+        Some(cap) => reservation.min(cap),
+        None => reservation,
+    });
+
+    loop {
+        let consumed = usize::try_from(decoder.total_in()).unwrap_or(usize::MAX);
+        let input = data.get(consumed..).unwrap_or(&[]);
+        let before_in = decoder.total_in();
+        let before_out = out.len();
+
+        // Writes into the spare capacity between `len` and `capacity` and never
+        // reallocates: growing the buffer is this loop's job.
+        let status = decoder
+            .decompress_vec(input, &mut out, FlushDecompress::None)
+            .map_err(|e| deflate_corrupt(&e.to_string()))?;
+
+        if status == Status::StreamEnd {
+            break;
         }
-        None => {
-            let mut decoder = decoder;
-            let mut result = Vec::new();
-            decoder
-                .read_to_end(&mut result)
-                .map_err(|e| deflate_corrupt(&e.to_string()))?;
-            Ok(result)
+
+        if out.len() == out.capacity() {
+            // Out of room. Either the chunk is bigger than it declared, or the
+            // buffer simply needs to grow.
+            if ceiling.is_some_and(|cap| out.len() >= cap) {
+                return Err(bomb());
+            }
+            let want = out.capacity().max(DEFLATE_GROWTH_FLOOR);
+            out.reserve(match ceiling {
+                Some(cap) => want.min(cap - out.len()),
+                None => want,
+            });
+        } else if decoder.total_in() == before_in && out.len() == before_out {
+            // Room to write, nothing written, and no input consumed: the stream
+            // cannot finish. `Status::Ok` here means it ran out of input.
+            return Err(truncated());
         }
     }
+
+    if max_output.is_some_and(|limit| out.len() > limit) {
+        return Err(bomb());
+    }
+    Ok(out)
 }
 
 #[cfg(not(feature = "deflate"))]
-fn deflate_decompress(_data: &[u8], _max_output: Option<usize>) -> Result<Vec<u8>, FormatError> {
+fn deflate_decompress(
+    _scratch: &mut FilterScratch,
+    _data: &[u8],
+    _max_output: Option<usize>,
+) -> Result<Vec<u8>, FormatError> {
     Err(FormatError::UnsupportedFilter(FILTER_DEFLATE))
 }
 
-/// Compress data with zlib.
+/// Compress data with zlib, reusing `scratch`'s encoder.
+///
+/// The reuse is the point: a zlib encoder holds ~300 KiB of hash tables and
+/// dictionary, all of it scratch that `flate2::Compress::reset` returns to its
+/// initial state, and building one per chunk cost 615 MiB of allocation to write
+/// an 8 MiB dataset (issue #228).
+///
+/// That reset is also what keeps the output identical to a fresh encoder's, byte
+/// for byte — which this crate needs rather than merely likes, since the files it
+/// writes are compared against the reference C library's.
 #[cfg(feature = "deflate")]
-fn deflate_compress(data: &[u8], level: u32) -> Result<Vec<u8>, FormatError> {
+fn deflate_compress(
+    scratch: &mut FilterScratch,
+    data: &[u8],
+    level: u32,
+) -> Result<Vec<u8>, FormatError> {
     use std::io::Write;
-    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(level));
+    let encoder = scratch.zlib_encoder(level);
     encoder
         .write_all(data)
         .map_err(|e| FormatError::CompressionError(e.to_string()))?;
+    // Finishes the stream into the buffer it is holding and hands that buffer
+    // back, leaving a reset encoder wrapped around the empty one.
     encoder
-        .finish()
+        .reset(Vec::new())
         .map_err(|e| FormatError::CompressionError(e.to_string()))
 }
 
 #[cfg(not(feature = "deflate"))]
-fn deflate_compress(_data: &[u8], _level: u32) -> Result<Vec<u8>, FormatError> {
+fn deflate_compress(
+    _scratch: &mut FilterScratch,
+    _data: &[u8],
+    _level: u32,
+) -> Result<Vec<u8>, FormatError> {
     Err(FormatError::UnsupportedFilter(FILTER_DEFLATE))
 }
 
@@ -677,8 +848,9 @@ mod tests {
     #[cfg(feature = "deflate")]
     fn deflate_compress_decompress_roundtrip() {
         let data: Vec<u8> = (0..256).map(|i| (i % 256) as u8).collect();
-        let compressed = deflate_compress(&data, 6).unwrap();
-        let decompressed = deflate_decompress(&compressed, None).unwrap();
+        let compressed = deflate_compress(&mut FilterScratch::new(), &data, 6).unwrap();
+        let decompressed =
+            deflate_decompress(&mut FilterScratch::new(), &compressed, None).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -691,7 +863,8 @@ mod tests {
         let compressed: Vec<u8> = vec![
             120, 156, 99, 96, 100, 98, 102, 97, 101, 99, 231, 224, 4, 0, 0, 175, 0, 46,
         ];
-        let decompressed = deflate_decompress(&compressed, None).unwrap();
+        let decompressed =
+            deflate_decompress(&mut FilterScratch::new(), &compressed, None).unwrap();
         assert_eq!(decompressed, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
     }
 
@@ -700,9 +873,10 @@ mod tests {
     fn deflate_compress_verifiable() {
         // Compress data and verify it decompresses correctly
         let data = vec![0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9];
-        let compressed = deflate_compress(&data, 6).unwrap();
+        let compressed = deflate_compress(&mut FilterScratch::new(), &data, 6).unwrap();
         assert!(!compressed.is_empty());
-        let decompressed = deflate_decompress(&compressed, None).unwrap();
+        let decompressed =
+            deflate_decompress(&mut FilterScratch::new(), &compressed, None).unwrap();
         assert_eq!(decompressed, data);
     }
 
@@ -1012,7 +1186,7 @@ mod tests {
         let ctx = ChunkContext::basic(&dims, 8);
 
         // Shuffle skipped: stored = deflate(data) directly.
-        let stored = deflate_compress(&data, 6).unwrap();
+        let stored = deflate_compress(&mut FilterScratch::new(), &data, 6).unwrap();
         let mask = 1u32 << 0; // bit 0 => shuffle (index 0) skipped
         let decoded = decompress_chunk(&stored, &pipeline, ctx, mask).unwrap();
         assert_eq!(decoded, data);
@@ -1026,13 +1200,16 @@ mod tests {
         // A few bytes that inflate to 100 KB; with a 1 KB cap this is rejected
         // rather than allowed to allocate unbounded memory.
         let huge = vec![0u8; 100_000];
-        let compressed = deflate_compress(&huge, 9).unwrap();
+        let compressed = deflate_compress(&mut FilterScratch::new(), &huge, 9).unwrap();
         assert!(compressed.len() < 1024);
-        let err = deflate_decompress(&compressed, Some(1024)).unwrap_err();
+        let err =
+            deflate_decompress(&mut FilterScratch::new(), &compressed, Some(1024)).unwrap_err();
         assert!(matches!(err, FormatError::FilterError(_)), "{err}");
         // Without a cap it still works (used where the size is genuinely unknown).
         assert_eq!(
-            deflate_decompress(&compressed, None).unwrap().len(),
+            deflate_decompress(&mut FilterScratch::new(), &compressed, None)
+                .unwrap()
+                .len(),
             100_000
         );
     }
@@ -1041,9 +1218,131 @@ mod tests {
     #[cfg(feature = "deflate")]
     fn deflate_decompress_within_cap_ok() {
         let data = vec![7u8; 500];
-        let compressed = deflate_compress(&data, 6).unwrap();
+        let compressed = deflate_compress(&mut FilterScratch::new(), &data, 6).unwrap();
         // Cap equal to the exact output length must pass.
-        assert_eq!(deflate_decompress(&compressed, Some(500)).unwrap(), data);
+        assert_eq!(
+            deflate_decompress(&mut FilterScratch::new(), &compressed, Some(500)).unwrap(),
+            data
+        );
+    }
+
+    /// The property the whole scratch rests on: a reused encoder writes exactly
+    /// what a fresh one writes.
+    ///
+    /// Not "decodes to the same thing" — *the same bytes*. This crate's output is
+    /// compared against the reference C library's byte for byte, and an encoder
+    /// that carried anything across a reset (a dictionary, an adaptive Huffman
+    /// table, a block-splitting decision) would round-trip perfectly while
+    /// quietly changing every file this crate writes.
+    #[test]
+    #[cfg(feature = "deflate")]
+    fn a_reused_encoder_writes_the_same_bytes_as_a_fresh_one() {
+        // Deliberately varied: a compressible run, incompressible noise, an empty
+        // chunk, a repeat of an earlier chunk (which a stale dictionary would
+        // compress *better* than a fresh encoder can), and two odd sizes.
+        let chunks: Vec<Vec<u8>> = vec![
+            vec![7u8; 4096],
+            (0..4096u32)
+                .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+                .collect(),
+            Vec::new(),
+            vec![7u8; 4096],
+            (0..1000).map(|i| (i % 251) as u8).collect(),
+            vec![0u8; 1],
+        ];
+
+        for level in [1u32, 6, 9] {
+            let fresh: Vec<Vec<u8>> = chunks
+                .iter()
+                .map(|c| deflate_compress(&mut FilterScratch::new(), c, level).unwrap())
+                .collect();
+
+            let mut scratch = FilterScratch::new();
+            let reused: Vec<Vec<u8>> = chunks
+                .iter()
+                .map(|c| deflate_compress(&mut scratch, c, level).unwrap())
+                .collect();
+
+            assert_eq!(
+                reused, fresh,
+                "a reused encoder at level {level} wrote different bytes from a fresh one"
+            );
+
+            // A fixture that cannot fail proves nothing, and this one could be:
+            // were every chunk the same content, *any* carry-over would still
+            // produce equal vectors. Chunks 0 and 3 are equal on purpose, to give
+            // a stale dictionary something to find; the rest must differ.
+            assert_eq!(
+                fresh[0], fresh[3],
+                "chunks 0 and 3 are the same bytes, so their encodings must be too"
+            );
+            let distinct: std::collections::BTreeSet<_> = fresh.iter().collect();
+            assert!(
+                distinct.len() >= chunks.len() - 1,
+                "this fixture compresses to {} distinct outputs, too few to tell a \
+                 reused encoder from a fresh one",
+                distinct.len()
+            );
+        }
+    }
+
+    /// The decoder's counterpart, covering the two states a reused one can be
+    /// left in that a fresh one never is: after a stream that ended early, and
+    /// after one this crate refused as a bomb. Either way the next chunk must
+    /// decode exactly.
+    #[test]
+    #[cfg(feature = "deflate")]
+    fn a_reused_decoder_recovers_from_a_stream_it_refused() {
+        let good = deflate_compress(&mut FilterScratch::new(), &vec![9u8; 2048], 6).unwrap();
+        let mut scratch = FilterScratch::new();
+
+        // A clean decode first, so the decoder is known good before it is upset.
+        assert_eq!(
+            deflate_decompress(&mut scratch, &good, Some(2048)).unwrap(),
+            vec![9u8; 2048]
+        );
+
+        // Truncated: the stream ends before the chunk does.
+        assert!(deflate_decompress(&mut scratch, &good[..good.len() / 2], Some(2048)).is_err());
+        assert_eq!(
+            deflate_decompress(&mut scratch, &good, Some(2048)).unwrap(),
+            vec![9u8; 2048]
+        );
+
+        // Refused as too large for its chunk, which stops the decode mid-stream
+        // and leaves the decoder holding a partly-consumed zlib state.
+        let err = deflate_decompress(&mut scratch, &good, Some(16)).unwrap_err();
+        assert!(
+            format!("{err}").contains("decompression bomb"),
+            "expected the bomb guard, got {err}"
+        );
+        assert_eq!(
+            deflate_decompress(&mut scratch, &good, Some(2048)).unwrap(),
+            vec![9u8; 2048]
+        );
+    }
+
+    /// A scratch that outlives one dataset and meets another at a different level
+    /// must re-level, not go on emitting the first one's.
+    #[test]
+    #[cfg(feature = "deflate")]
+    fn a_reused_encoder_follows_a_level_change() {
+        let data: Vec<u8> = (0..8192).map(|i| (i % 97) as u8).collect();
+        let mut scratch = FilterScratch::new();
+
+        let at_nine = deflate_compress(&mut scratch, &data, 9).unwrap();
+        let at_one = deflate_compress(&mut scratch, &data, 1).unwrap();
+
+        assert_eq!(
+            at_one,
+            deflate_compress(&mut FilterScratch::new(), &data, 1).unwrap(),
+            "after a level change the encoder did not write what level 1 writes"
+        );
+        assert_ne!(
+            at_nine, at_one,
+            "levels 9 and 1 produced identical bytes, so this fixture cannot see a \
+             level change at all"
+        );
     }
 
     #[test]
@@ -1187,8 +1486,9 @@ mod tests {
     #[test]
     #[cfg(feature = "deflate")]
     fn deflate_reserves_against_the_stream_not_the_declared_chunk_size() {
-        let stored = deflate_compress(&[], 6).unwrap();
-        let out = deflate_decompress(&stored, Some(u32::MAX as usize)).unwrap();
+        let stored = deflate_compress(&mut FilterScratch::new(), &[], 6).unwrap();
+        let out = deflate_decompress(&mut FilterScratch::new(), &stored, Some(u32::MAX as usize))
+            .unwrap();
         assert!(out.is_empty());
         assert!(
             out.capacity() <= stored.len() * MAX_DEFLATE_EXPANSION,
@@ -1222,7 +1522,8 @@ mod tests {
 
         #[cfg(feature = "deflate")]
         {
-            let deflate = deflate_decompress(&[0xff; 8], None).unwrap_err();
+            let deflate =
+                deflate_decompress(&mut FilterScratch::new(), &[0xff; 8], None).unwrap_err();
             assert!(matches!(deflate, FormatError::FilterError(_)), "{deflate}");
         }
     }

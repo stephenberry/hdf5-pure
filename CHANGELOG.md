@@ -22,6 +22,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Writing a chunked dataset, appending to one, and writing a dense attribute heap no longer build a structure twice to measure it, so high chunk counts and large attribute sets cost less to write ([#265](https://github.com/stephenberry/hdf5-pure/issues/265), [#275](https://github.com/stephenberry/hdf5-pure/issues/275)).
 - `Dataset::read_raw` and the typed whole-dataset reads allocate about half as much on a chunked dataset. A whole read now fills the chunk cache and stops rather than evicting its own chunks, so it retains the chunks it reached first where it used to retain the last ([#228](https://github.com/stephenberry/hdf5-pure/issues/228)).
 - `Dataset::read_string_rows` and the other variable-length reads are roughly an order of magnitude faster on a large heap collection, and allocate about forty times less often; a windowed read moves more transient bytes in exchange ([#228](https://github.com/stephenberry/hdf5-pure/issues/228)).
+- `FileBuilder::write` allocates about thirty-five times less on a deflated dataset, and `Dataset::read_raw` about ten times less reading one back: the zlib codec is built once per call rather than once per chunk. Output is byte-identical ([#228](https://github.com/stephenberry/hdf5-pure/issues/228)).
+- Writing a chunked dataset allocates a quarter as often and about 25% fewer bytes: sizing a dataset's object header no longer builds the whole data region only to discard it, and the chunk splitter keeps its scratch across chunks ([#228](https://github.com/stephenberry/hdf5-pure/issues/228)).
 
 ### Fixed
 

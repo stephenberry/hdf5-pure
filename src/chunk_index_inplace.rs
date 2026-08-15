@@ -1010,12 +1010,12 @@ pub(crate) fn plan_ea_append<F: Store>(
     let new_chunk_bytes: Vec<Vec<u8>> = if let Some(pl) = pipeline {
         let ctx = ChunkContext::from_datatype(spatial, datatype)?;
         let mut out = Vec::with_capacity(split.len());
-        for (_, buf) in &split {
+        for buf in &split {
             out.push(compress_chunk(buf, pl, ctx).map_err(Error::Format)?);
         }
         out
     } else {
-        split.into_iter().map(|(_, buf)| buf).collect()
+        split
     };
 
     let new_num_chunks = n_full + new_chunk_bytes.len() as u64;

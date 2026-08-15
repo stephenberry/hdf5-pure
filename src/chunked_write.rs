@@ -18,7 +18,7 @@ use crate::filter_pipeline::{
     FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_LZF, FILTER_SCALEOFFSET, FILTER_SHUFFLE,
     FilterDescription, FilterPipeline,
 };
-use crate::filters::{ChunkContext, ZfpElementTypeWhenEnabled, compress_chunk};
+use crate::filters::{ChunkContext, ZfpElementTypeWhenEnabled, compress_chunk_with};
 use crate::scaleoffset::{ScaleOffset, ScaleOffsetType, build_cd_values};
 
 /// Log2 of the Fixed Array data-block page size (`2^10 = 1024` elements).
@@ -360,10 +360,10 @@ pub fn split_into_chunks(
     shape: &[u64],
     chunk_dims: &[u64],
     element_size: NonZeroUsize,
-) -> Vec<(Vec<u64>, Vec<u8>)> {
+) -> Vec<Vec<u8>> {
     let rank = shape.len();
     if rank == 0 {
-        return vec![(vec![], raw_data.to_vec())];
+        return vec![raw_data.to_vec()];
     }
 
     // Compute number of chunks per dimension
@@ -409,7 +409,7 @@ pub fn split_into_chunks(
         clippy::cast_possible_truncation,
         reason = "total_chunks derived from the in-memory write request; bounded by addressable memory"
     )]
-    let mut result = Vec::with_capacity(total_chunks as usize);
+    let mut buffers = Vec::with_capacity(total_chunks as usize);
 
     // Innermost dimension is contiguous in both the dataset (`raw_data`) and the
     // chunk buffer, so each in-bounds row is gathered with a single
@@ -417,24 +417,30 @@ pub fn split_into_chunks(
     // matching the read-side `copy_chunk_to_output` kernel.
     let inner = rank - 1;
     let mut coord = vec![0usize; inner];
+    // Both refilled per chunk rather than allocated per chunk. Together with the
+    // dataset-space offsets this loop used to return and no caller ever read,
+    // that was three allocator round trips for every chunk of every dataset this
+    // crate writes (issue #228). The order the offsets encoded is still a
+    // correctness property -- the emitter writes chunks in it -- and the split
+    // tests pin it by asserting each chunk's contents, which says the same thing.
+    let mut offsets_us = vec![0usize; rank];
+    let mut offsets = vec![0u64; rank];
 
     for linear_idx in 0..total_chunks {
         // Convert linear index to chunk grid coordinates and the chunk's
-        // dataset-space offset.
-        let mut chunk_grid_coords = vec![0u64; rank];
+        // dataset-space offset, straight into this chunk's slice of `coords`.
         let mut remaining = linear_idx;
         for d in (0..rank).rev() {
-            chunk_grid_coords[d] = remaining % num_chunks_per_dim[d];
+            offsets[d] = (remaining % num_chunks_per_dim[d]) * chunk_dims[d];
             remaining /= num_chunks_per_dim[d];
         }
-        let offsets: Vec<u64> = (0..rank)
-            .map(|d| chunk_grid_coords[d] * chunk_dims[d])
-            .collect();
         #[expect(
             clippy::cast_possible_truncation,
             reason = "chunk offset derived from the in-memory write request; bounded by addressable memory"
         )]
-        let offsets_us: Vec<usize> = offsets.iter().map(|&o| o as usize).collect();
+        for (slot, &o) in offsets_us.iter_mut().zip(offsets.iter()) {
+            *slot = o as usize;
+        }
 
         let mut chunk_bytes = vec![0u8; chunk_total_elements * element_size.get()];
 
@@ -482,10 +488,10 @@ pub fn split_into_chunks(
             }
         }
 
-        result.push((offsets, chunk_bytes));
+        buffers.push(chunk_bytes);
     }
 
-    result
+    buffers
 }
 
 /// Serialize a v4 single chunk layout message.
@@ -1866,10 +1872,14 @@ pub(crate) fn compress_chunks(
 
     let mut compressed = Vec::with_capacity(num_chunks);
     let mut raw_sizes = Vec::with_capacity(num_chunks);
-    for (_offsets, chunk_bytes) in chunks {
+    // One encoder for every chunk of the dataset. Building one per chunk is the
+    // dominant cost of a filtered write -- ~300 KiB of hash tables apiece, 615
+    // MiB over an 8 MiB dataset (issue #228).
+    let mut scratch = crate::filters::FilterScratch::new();
+    for chunk_bytes in chunks {
         raw_sizes.push(chunk_bytes.len() as u64);
         let c = if let Some(ref pl) = pipeline {
-            compress_chunk(&chunk_bytes, pl, ctx)?
+            compress_chunk_with(&mut scratch, &chunk_bytes, pl, ctx)?
         } else {
             // No pipeline: the split already produced an owned chunk buffer;
             // move it into the set instead of cloning.
@@ -2012,6 +2022,56 @@ pub(crate) fn chunked_data_len(set: &CompressedChunkSet) -> u64 {
         })
 }
 
+/// The chunk-index bytes and data-layout message for `set` at `base_address`,
+/// with the total size of its chunk payload.
+///
+/// Everything [`assemble_chunked_at`] produces except the data region itself, so
+/// that [`measure_chunked_at`] can answer "how long, and what does the layout
+/// message say" without building an entire copy of the dataset.
+fn plan_chunked_at(
+    set: &CompressedChunkSet,
+    base_address: u64,
+) -> Result<(usize, Vec<u8>, Vec<u8>), FormatError> {
+    let (written_chunks, index_address) = plan_chunk_slots(set, base_address);
+    let (index, layout_message) = chunk_index_bytes(set, &written_chunks, index_address)?;
+    let chunk_bytes_total: usize = set.compressed.iter().map(Vec::len).sum();
+    Ok((chunk_bytes_total, index, layout_message))
+}
+
+/// The byte length and data-layout message [`assemble_chunked_at`] would produce
+/// at `base_address`, without producing the data region.
+///
+/// The file writer sizes every object header before it emits a byte, and for a
+/// chunked dataset that needs the layout message and the length of the region —
+/// not the region. Calling `assemble_chunked_at` for it meant building a second
+/// copy of every chunk in the dataset and dropping it: 8 MiB of allocation to
+/// learn one integer, on every chunked write (issue #228).
+///
+/// Shares [`plan_chunked_at`] with the real assembly, so the length reported here
+/// and the length produced there cannot drift.
+pub(crate) fn measure_chunked_at(
+    set: &CompressedChunkSet,
+    base_address: u64,
+) -> Result<ChunkedMeasure, FormatError> {
+    let (chunk_bytes_total, index, layout_message) = plan_chunked_at(set, base_address)?;
+    Ok(ChunkedMeasure {
+        data_len: (chunk_bytes_total + index.len()) as u64,
+        layout_message,
+        pipeline_message: set.pipeline_message.clone(),
+    })
+}
+
+/// Everything [`ChunkedDataResult`] carries except the data region: what a caller
+/// sizing an object header needs, and no more.
+pub(crate) struct ChunkedMeasure {
+    /// Bytes the data region will occupy.
+    pub data_len: u64,
+    /// The v4 data-layout message for the object header.
+    pub layout_message: Vec<u8>,
+    /// The filter-pipeline message, if the dataset has one.
+    pub pipeline_message: Option<Vec<u8>>,
+}
+
 /// Lay an already-[`compress`ed](compress_chunks) chunk set out at `base_address`,
 /// producing the on-disk data region (chunk bytes followed by the chunk index)
 /// and the v4 data-layout message. Cheap: this only concatenates and builds the
@@ -2021,12 +2081,10 @@ pub(crate) fn assemble_chunked_at(
     set: &CompressedChunkSet,
     base_address: u64,
 ) -> Result<ChunkedDataResult, FormatError> {
-    let (written_chunks, index_address) = plan_chunk_slots(set, base_address);
-    let (index, layout_message) = chunk_index_bytes(set, &written_chunks, index_address)?;
+    let (chunk_bytes_total, index, layout_message) = plan_chunked_at(set, base_address)?;
 
     // One exact allocation for chunks plus index: the buffer is filled to its
     // capacity, never doubled and copied.
-    let chunk_bytes_total: usize = set.compressed.iter().map(Vec::len).sum();
     let mut data_buf = Vec::with_capacity(chunk_bytes_total + index.len());
     for chunk in &set.compressed {
         data_buf.extend_from_slice(chunk);
@@ -2452,8 +2510,7 @@ mod tests {
         let data = f64_to_bytes(&[1.0, 2.0, 3.0]);
         let result = split_into_chunks(&data, &[3], &[3], nz(8));
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, vec![0]);
-        assert_eq!(bytes_to_f64(&result[0].1), vec![1.0, 2.0, 3.0]);
+        assert_eq!(bytes_to_f64(&result[0]), vec![1.0, 2.0, 3.0]);
     }
 
     #[test]
@@ -2462,13 +2519,12 @@ mod tests {
         let data = f64_to_bytes(&values);
         let result = split_into_chunks(&data, &[10], &[4], nz(8));
         assert_eq!(result.len(), 3); // ceil(10/4) = 3
-        assert_eq!(result[0].0, vec![0]);
-        assert_eq!(result[1].0, vec![4]);
-        assert_eq!(result[2].0, vec![8]);
-        assert_eq!(bytes_to_f64(&result[0].1), vec![0.0, 1.0, 2.0, 3.0]);
-        assert_eq!(bytes_to_f64(&result[1].1), vec![4.0, 5.0, 6.0, 7.0]);
+        // Contents in chunk order, which is what the offsets this used to return
+        // encoded: chunk `i` starts at element `4 * i`.
+        assert_eq!(bytes_to_f64(&result[0]), vec![0.0, 1.0, 2.0, 3.0]);
+        assert_eq!(bytes_to_f64(&result[1]), vec![4.0, 5.0, 6.0, 7.0]);
         // Last chunk: 2 valid + 2 padding zeros
-        assert_eq!(bytes_to_f64(&result[2].1), vec![8.0, 9.0, 0.0, 0.0]);
+        assert_eq!(bytes_to_f64(&result[2]), vec![8.0, 9.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -2478,14 +2534,17 @@ mod tests {
         let data = f64_to_bytes(&values);
         let result = split_into_chunks(&data, &[4, 4], &[2, 2], nz(8));
         assert_eq!(result.len(), 4);
-        assert_eq!(result[0].0, vec![0, 0]);
-        assert_eq!(result[1].0, vec![0, 2]);
-        assert_eq!(result[2].0, vec![2, 0]);
-        assert_eq!(result[3].0, vec![2, 2]);
+        // Row-major chunk order, asserted by content rather than by the offsets
+        // this used to return: every chunk, so the ordering is pinned end to end
+        // and not just at its head.
         // chunk (0,0): elements [0,1,4,5]
-        assert_eq!(bytes_to_f64(&result[0].1), vec![0.0, 1.0, 4.0, 5.0]);
+        assert_eq!(bytes_to_f64(&result[0]), vec![0.0, 1.0, 4.0, 5.0]);
         // chunk (0,2): elements [2,3,6,7]
-        assert_eq!(bytes_to_f64(&result[1].1), vec![2.0, 3.0, 6.0, 7.0]);
+        assert_eq!(bytes_to_f64(&result[1]), vec![2.0, 3.0, 6.0, 7.0]);
+        // chunk (2,0): elements [8,9,12,13]
+        assert_eq!(bytes_to_f64(&result[2]), vec![8.0, 9.0, 12.0, 13.0]);
+        // chunk (2,2): elements [10,11,14,15]
+        assert_eq!(bytes_to_f64(&result[3]), vec![10.0, 11.0, 14.0, 15.0]);
     }
 
     #[test]
