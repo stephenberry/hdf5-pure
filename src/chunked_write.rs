@@ -32,9 +32,15 @@ use crate::scaleoffset::{ScaleOffset, ScaleOffsetType, build_cd_values};
 /// it honors whatever page size a file declares in its FAHD.
 pub(crate) const FIXED_ARRAY_PAGE_BITS: u8 = 10;
 
-/// The on-disk address and length widths every chunk index this crate writes
+/// The on-disk address and length widths every chunk index *this module* writes
 /// uses. Named so the path that sizes an index and the path that emits it cannot
 /// read different values.
+///
+/// Not the only such pair: the in-place Extensible Array rebuild in `edit`
+/// reads `file_writer::OFFSET_SIZE` / `LENGTH_SIZE`, which carry the same
+/// meaning and the same values. Both are what this crate's superblock declares,
+/// and `edit` refuses a file whose superblock disagrees, so the two cannot drift
+/// apart within one file.
 const INDEX_OFFSET_SIZE: u8 = 8;
 const INDEX_LENGTH_SIZE: u8 = 8;
 
@@ -667,7 +673,10 @@ struct ChunkElementEncoding {
     /// Byte size of one element record: an address, plus the compressed size and
     /// filter mask when the dataset is filtered.
     elem_size: usize,
-    /// The index's client ID: filtered (1) or not (0).
+    /// The index's client ID: filtered (1) or not (0). The Fixed and Extensible
+    /// Arrays reach that numbering through two different class tables in the
+    /// reference C library (`H5FA_CLS_*` and `H5EA_CLS_*`) which happen to agree,
+    /// so one field serves both only for as long as they do.
     client_id: u8,
 }
 
@@ -707,14 +716,20 @@ fn chunk_element_encoding(
 }
 
 /// Everything about a Fixed Array that does not depend on where it is placed:
-/// the element encoding, the paging, and every byte count.
+/// the element encoding, the paging, the header size and the total length.
 ///
 /// The same split as [`EaLayout`], and for the same reason: a caller that has to
 /// reserve the array's span before its bytes exist takes the length from here
 /// ([`fixed_array_len`]) rather than from a build it throws away.
 struct FaLayout {
     encoding: ChunkElementEncoding,
-    /// Elements per page. The array is paged only past this many elements.
+    /// The page exponent the header declares, and `1 << page_bits`, the element
+    /// count past which the data block is paged. Both are carried so the byte
+    /// written into the header and the threshold the emitter pages at stay one
+    /// value: the reader honours whatever exponent a file declares, so a writer
+    /// that ever varied this must vary both together or every reader pages the
+    /// block wrong.
+    page_bits: u8,
     page_size: usize,
     fahd_size: usize,
     /// Header plus data block: the whole array.
@@ -728,6 +743,14 @@ fn fa_layout(
     length_size: u8,
     has_filters: bool,
 ) -> FaLayout {
+    // Both widths go into fixed-width header fields below, and the emitter
+    // writes 8 bytes for anything that is not 4 — so a third width would make
+    // this length disagree with the bytes. Every caller passes
+    // `INDEX_OFFSET_SIZE` / `INDEX_LENGTH_SIZE`.
+    debug_assert!(
+        matches!(offset_size, 4 | 8) && matches!(length_size, 4 | 8),
+        "a fixed array is written at a 4- or 8-byte address and length width"
+    );
     let os = offset_size as usize;
     let num_elements = chunks.len();
     let encoding = chunk_element_encoding(chunks, offset_size, has_filters);
@@ -739,7 +762,8 @@ fn fa_layout(
     // pages that each carry their own. Every element is written in exactly one
     // page, so the element bytes total the same either way.
     let fadb_prefix = 4 + 1 + 1 + os;
-    let page_size = 1usize << FIXED_ARRAY_PAGE_BITS;
+    let page_bits = FIXED_ARRAY_PAGE_BITS;
+    let page_size = 1usize << page_bits;
     let elements = num_elements * encoding.elem_size;
     let fadb_size = if num_elements <= page_size {
         fadb_prefix + elements + 4
@@ -750,6 +774,7 @@ fn fa_layout(
 
     FaLayout {
         encoding,
+        page_bits,
         page_size,
         fahd_size,
         total_len: (fahd_size + fadb_size) as u64,
@@ -758,6 +783,9 @@ fn fa_layout(
 
 /// The byte length [`build_fixed_array_at`] would produce for `chunks`, without
 /// building it. See [`extensible_array_len`] for why this exists.
+///
+/// `offset_size` and `length_size` must be 4 or 8, which is what the emitter
+/// writes; every caller passes [`INDEX_OFFSET_SIZE`] / [`INDEX_LENGTH_SIZE`].
 pub(crate) fn fixed_array_len(
     chunks: &[WrittenChunk],
     offset_size: u8,
@@ -773,25 +801,50 @@ pub(crate) fn fixed_array_len(
 /// the index, and [`chunk_index_len`], which sizes it without emitting. Two
 /// copies of this `if` chain is how a length ends up describing a different
 /// structure from the one written.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The variant names match [`layout_info::ChunkIndex`](crate::layout_info::ChunkIndex),
+/// which classifies the same three shapes on the read side.
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum ChunkIndexKind {
-    /// An Extensible Array, for a dataset with an unlimited dimension.
-    Extensible,
-    /// No index at all: the single chunk's address rides in the layout message.
+    /// No index structure at all: the single chunk's address rides in the
+    /// layout message.
     SingleChunk,
     /// A Fixed Array, for a fixed-shape dataset of more than one chunk.
-    Fixed,
+    FixedArray,
+    /// An Extensible Array, for a dataset with an unlimited dimension.
+    ExtensibleArray,
+}
+
+/// The two kinds that are an actual on-disk structure, and so have a length and
+/// bytes. [`ChunkIndexKind::SingleChunk`] is not one of them, and this type is
+/// how that is said once rather than re-checked at every use.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ChunkArrayKind {
+    FixedArray,
+    ExtensibleArray,
+}
+
+impl ChunkIndexKind {
+    /// The on-disk array this kind writes, or `None` for the single-chunk
+    /// layout, which writes nothing after the chunk bytes.
+    pub(crate) fn array_kind(self) -> Option<ChunkArrayKind> {
+        match self {
+            Self::SingleChunk => None,
+            Self::FixedArray => Some(ChunkArrayKind::FixedArray),
+            Self::ExtensibleArray => Some(ChunkArrayKind::ExtensibleArray),
+        }
+    }
 }
 
 /// Decide which index a chunk set gets. `use_extensible` is whether the dataset
 /// has an unlimited dimension.
 pub(crate) fn chunk_index_kind(use_extensible: bool, num_chunks: usize) -> ChunkIndexKind {
     if use_extensible {
-        ChunkIndexKind::Extensible
+        ChunkIndexKind::ExtensibleArray
     } else if num_chunks == 1 {
         ChunkIndexKind::SingleChunk
     } else {
-        ChunkIndexKind::Fixed
+        ChunkIndexKind::FixedArray
     }
 }
 
@@ -802,18 +855,19 @@ pub(crate) fn chunk_index_kind(use_extensible: bool, num_chunks: usize) -> Chunk
 /// ([`extensible_array_len`], [`fixed_array_len`]), so a caller reserving the
 /// data region's span takes it from the same layout the emission works from.
 pub(crate) fn chunk_index_len(
-    kind: ChunkIndexKind,
+    kind: ChunkArrayKind,
     chunks: &[WrittenChunk],
     offset_size: u8,
     length_size: u8,
     has_filters: bool,
 ) -> u64 {
     match kind {
-        ChunkIndexKind::Extensible => {
+        ChunkArrayKind::ExtensibleArray => {
             extensible_array_len(chunks, offset_size, length_size, has_filters)
         }
-        ChunkIndexKind::SingleChunk => 0,
-        ChunkIndexKind::Fixed => fixed_array_len(chunks, offset_size, length_size, has_filters),
+        ChunkArrayKind::FixedArray => {
+            fixed_array_len(chunks, offset_size, length_size, has_filters)
+        }
     }
 }
 
@@ -847,8 +901,7 @@ pub fn build_fixed_array_at(
     )]
     fahd.push(elem_size as u8);
 
-    let max_bits = FIXED_ARRAY_PAGE_BITS;
-    fahd.push(max_bits);
+    fahd.push(layout.page_bits);
 
     #[expect(
         clippy::cast_possible_truncation,
@@ -1360,11 +1413,12 @@ fn ea_layout(
     length_size: u8,
     has_filters: bool,
 ) -> EaLayout {
+    let encoding = chunk_element_encoding(chunks, offset_size, has_filters);
     let ChunkElementEncoding {
-        chunk_size_bytes,
         elem_size,
         client_id,
-    } = chunk_element_encoding(chunks, offset_size, has_filters);
+        ..
+    } = encoding;
 
     // EA creation parameters — must match the HDF5 C library defaults exactly.
     let max_nelmts_bits: u8 = 32;
@@ -1418,11 +1472,7 @@ fn ea_layout(
     let total_len = (aehd_size + aeib_size) as u64 + stats.data_blk_size + stats.super_blk_size;
 
     EaLayout {
-        encoding: ChunkElementEncoding {
-            chunk_size_bytes,
-            elem_size,
-            client_id,
-        },
+        encoding,
         max_nelmts_bits,
         idx_blk_elmts,
         min_dblk_nelmts,
@@ -1869,10 +1919,11 @@ fn plan_chunk_slots(set: &CompressedChunkSet, base_address: u64) -> (Vec<Written
 /// naming it.
 ///
 /// Every address either one embeds sits in a fixed-width field, so the returned
-/// bytes have the same *length* for every `index_address`. That is what lets
-/// [`chunked_data_len`] size a dataset before its address has been chosen, and
-/// what lets the writer size an object header in one pass and emit it in a later
-/// one.
+/// bytes have the same *length* for every `index_address` — which is what lets
+/// the writer size an object header in one pass and emit it in a later one, and
+/// what makes the length [`chunk_index_len`] derives valid at any address.
+/// [`chunked_data_len`] takes that derived length rather than calling this, so a
+/// caller sizing a dataset before its address is chosen builds nothing.
 fn chunk_index_bytes(
     set: &CompressedChunkSet,
     written_chunks: &[WrittenChunk],
@@ -1887,7 +1938,7 @@ fn chunk_index_bytes(
         reason = "element size written into the on-disk u32 dimension field selected for this file"
     )]
     let (index, layout_message) = match chunk_index_kind(set.use_extensible, written_chunks.len()) {
-        ChunkIndexKind::Extensible => {
+        ChunkIndexKind::ExtensibleArray => {
             let ea_bytes = build_extensible_array_at(
                 written_chunks,
                 offset_size,
@@ -1917,7 +1968,7 @@ fn chunk_index_bytes(
             );
             (Vec::new(), layout)
         }
-        ChunkIndexKind::Fixed => {
+        ChunkIndexKind::FixedArray => {
             let fa_bytes = build_fixed_array_at(
                 written_chunks,
                 offset_size,
@@ -1950,13 +2001,15 @@ pub(crate) fn chunked_data_len(set: &CompressedChunkSet) -> u64 {
     let (written_chunks, index_address) = plan_chunk_slots(set, 0);
     let kind = chunk_index_kind(set.use_extensible, written_chunks.len());
     index_address
-        + chunk_index_len(
-            kind,
-            &written_chunks,
-            INDEX_OFFSET_SIZE,
-            INDEX_LENGTH_SIZE,
-            set.has_filters,
-        )
+        + kind.array_kind().map_or(0, |array| {
+            chunk_index_len(
+                array,
+                &written_chunks,
+                INDEX_OFFSET_SIZE,
+                INDEX_LENGTH_SIZE,
+                set.has_filters,
+            )
+        })
 }
 
 /// Lay an already-[`compress`ed](compress_chunks) chunk set out at `base_address`,
@@ -2083,10 +2136,15 @@ impl ByteSink for Vec<u8> {
 /// caller reserve the data region's span from a plan made at a provisional base
 /// and then discard that plan: nothing was built to arrive at the number.
 struct VerbatimIndexPlan {
-    kind: ChunkIndexKind,
+    /// Which array to build. `ChunkIndexKind::SingleChunk` cannot appear here:
+    /// the layout that writes no index is the `None` case of the field holding
+    /// this, not a third variant of it.
+    kind: ChunkArrayKind,
     address: u64,
-    offset_size: u8,
-    length_size: u8,
+    /// Whether the element records carry a compressed size and filter mask. The
+    /// address and length widths are not fields: every chunk index this module
+    /// writes uses `INDEX_OFFSET_SIZE` / `INDEX_LENGTH_SIZE`, and reading them
+    /// at the emit is one fewer value that could be set wrong here.
     has_filters: bool,
     len: u64,
 }
@@ -2104,7 +2162,7 @@ pub(crate) struct VerbatimPlan {
     /// The chunk index emitted after the chunk bytes. `None` for the
     /// single-chunk layout, whose address rides in the layout message instead.
     index: Option<VerbatimIndexPlan>,
-    /// Total byte length of the data region (chunks + index tail).
+    /// Total byte length of the data region: the chunk bytes, then the index.
     pub(crate) total_len: u64,
 }
 
@@ -2171,15 +2229,26 @@ pub(crate) fn plan_chunked_data_verbatim(
     // plan at a provisional base purely to size the region.
     let kind = chunk_index_kind(use_extensible, num_chunks);
     let index_address = base_address + cursor;
-    let index_len = chunk_index_len(kind, &written_chunks, offset_size, length_size, has_filters);
-    cursor += index_len;
+    let index = kind.array_kind().map(|array| VerbatimIndexPlan {
+        kind: array,
+        address: index_address,
+        has_filters,
+        len: chunk_index_len(
+            array,
+            &written_chunks,
+            offset_size,
+            length_size,
+            has_filters,
+        ),
+    });
+    cursor += index.as_ref().map_or(0, |i| i.len);
 
     #[expect(
         clippy::cast_possible_truncation,
         reason = "element size written into the on-disk u32 dimension field selected for this file"
     )]
     let layout_message = match kind {
-        ChunkIndexKind::Extensible => serialize_v4_extensible_array(
+        ChunkIndexKind::ExtensibleArray => serialize_v4_extensible_array(
             &chunk_dims_u32,
             index_address,
             offset_size,
@@ -2206,7 +2275,7 @@ pub(crate) fn plan_chunked_data_verbatim(
                 element_size.get() as u32,
             )
         }
-        ChunkIndexKind::Fixed => serialize_v4_fixed_array(
+        ChunkIndexKind::FixedArray => serialize_v4_fixed_array(
             &chunk_dims_u32,
             index_address,
             offset_size,
@@ -2218,14 +2287,7 @@ pub(crate) fn plan_chunked_data_verbatim(
     Ok(VerbatimLayout {
         plan: VerbatimPlan {
             chunks: written_chunks,
-            index: (kind != ChunkIndexKind::SingleChunk).then_some(VerbatimIndexPlan {
-                kind,
-                address: index_address,
-                offset_size,
-                length_size,
-                has_filters,
-                len: index_len,
-            }),
+            index,
             total_len: cursor,
         },
         layout_message,
@@ -2237,6 +2299,14 @@ pub(crate) fn plan_chunked_data_verbatim(
 /// chunk's bytes from `provider` one at a time. The emitted bytes are identical
 /// to the concatenation [`plan_chunked_data_verbatim`] describes, so a streamed
 /// file and a buffered file are byte-for-byte equal.
+///
+/// The chunk index is built here rather than by the planner, so a failure to
+/// build one now arrives mid-stream where it used to arrive at plan time. For a
+/// caller that buffers (the in-place editor fills a `Vec` inside its placement
+/// closure) that is invisible; for `FileBuilder::finish_to`, which writes
+/// straight through, it means the chunk bytes are already on the sink. The only
+/// such failure is a 32-bit `usize` overflow inside the Extensible Array
+/// builder, which needs more chunks than that address space can hold.
 pub(crate) fn emit_chunked_data_verbatim<S: ByteSink>(
     sink: &mut S,
     plan: &VerbatimPlan,
@@ -2264,23 +2334,20 @@ pub(crate) fn emit_chunked_data_verbatim<S: ByteSink>(
     // at the real one), and only this call writes it.
     if let Some(index) = &plan.index {
         let bytes = match index.kind {
-            ChunkIndexKind::Extensible => build_extensible_array_at(
+            ChunkArrayKind::ExtensibleArray => build_extensible_array_at(
                 &plan.chunks,
-                index.offset_size,
-                index.length_size,
+                INDEX_OFFSET_SIZE,
+                INDEX_LENGTH_SIZE,
                 index.has_filters,
                 index.address,
             )?,
-            ChunkIndexKind::Fixed => build_fixed_array_at(
+            ChunkArrayKind::FixedArray => build_fixed_array_at(
                 &plan.chunks,
-                index.offset_size,
-                index.length_size,
+                INDEX_OFFSET_SIZE,
+                INDEX_LENGTH_SIZE,
                 index.has_filters,
                 index.address,
             ),
-            // `plan.index` is `None` for the single-chunk layout, which has no
-            // index to emit.
-            ChunkIndexKind::SingleChunk => Vec::new(),
         };
         if bytes.len() as u64 != index.len {
             return Err(FormatError::SerializationError(format!(
@@ -2570,6 +2637,62 @@ mod tests {
             layout.plan.total_len > chunk_bytes,
             "three chunks take a fixed array, so the region is longer than its chunk bytes"
         );
+
+        // The index is built by the emit rather than by the plan, so each index
+        // kind has to be emitted to be covered. Assert the signature at the
+        // planned offset, not just the total: a plan that reserved the right
+        // number of bytes for the wrong structure would pass a length check.
+        for (label, maxshape, chunk_sizes, signature) in [
+            (
+                "fixed array",
+                None,
+                &[37u64, 111, 5][..],
+                Some(&b"FAHD"[..]),
+            ),
+            (
+                "extensible array",
+                Some(&[u64::MAX][..]),
+                &[37u64, 111, 5][..],
+                Some(&b"EAHD"[..]),
+            ),
+            // One chunk and no unlimited dimension is the single-chunk layout:
+            // its address rides in the layout message and nothing follows the
+            // chunk bytes at all.
+            ("single chunk", None, &[37u64][..], None),
+        ] {
+            let meta: Vec<ChunkMeta> = chunk_sizes
+                .iter()
+                .map(|&compressed_size| ChunkMeta {
+                    compressed_size,
+                    filter_mask: 0,
+                })
+                .collect();
+            let layout =
+                plan_chunked_data_verbatim(&meta, &[7], nz(8), 56, Some(&[]), 0x1000, maxshape)
+                    .unwrap();
+            let mut emitted: Vec<u8> = Vec::new();
+            emit_chunked_data_verbatim(&mut emitted, &layout.plan, &SizedChunks(chunk_sizes))
+                .unwrap();
+
+            let chunk_bytes: usize = chunk_sizes.iter().sum::<u64>() as usize;
+            assert_eq!(
+                emitted.len() as u64,
+                layout.plan.total_len,
+                "{label}: the emit must fill the planned region"
+            );
+            match signature {
+                Some(sig) => assert_eq!(
+                    &emitted[chunk_bytes..chunk_bytes + 4],
+                    sig,
+                    "{label}: the index must begin where the last chunk ends"
+                ),
+                None => assert_eq!(
+                    emitted.len(),
+                    chunk_bytes,
+                    "{label}: nothing may follow the chunk bytes"
+                ),
+            }
+        }
     }
 
     /// A chunk-less plan has no first chunk to anchor the index against, so it
@@ -3103,6 +3226,15 @@ mod tests {
         }
     }
 
+    /// Raw chunk sizes that select four *different* compressed-size field widths
+    /// in a filtered element record, so a sweep over them varies the element,
+    /// page and index-block sizes rather than repeating one shape. Shared by the
+    /// Fixed and Extensible Array length tests, which since
+    /// `chunk_element_encoding` was unified exercise the same derivation;
+    /// `extensible_array_len_matches_what_it_builds` asserts the four widths
+    /// really are distinct.
+    const RAW_SIZES: [u64; 4] = [8, 300, 100_000, 1 << 32];
+
     /// `fixed_array_len` is the span a caller reserves for a Fixed Array before a
     /// byte of it exists, so it has to equal the length `build_fixed_array_at`
     /// goes on to emit.
@@ -3150,7 +3282,7 @@ mod tests {
 
         // The filtered element record's compressed-size field is sized to the
         // largest raw chunk, and every element and page is sized from it.
-        for &raw_size in &[8u64, 300, 100_000, 1 << 32] {
+        for &raw_size in &RAW_SIZES {
             for &n in &[1u64, 1_024, 1_025, 5_000] {
                 check(n, raw_size, 8, 8, true);
             }
@@ -3217,7 +3349,6 @@ mod tests {
         // A filtered element record carries the chunk's compressed size in a field
         // sized to the largest *raw* chunk, so the record width — and with it the
         // index block and every data block — changes with that size.
-        const RAW_SIZES: [u64; 4] = [8, 300, 100_000, 1 << 32];
         for &raw_size in &RAW_SIZES {
             for &n in &[1u64, 5, 244, 300, 2_000] {
                 check(n, raw_size, 8, 8, true);

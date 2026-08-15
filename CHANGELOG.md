@@ -18,7 +18,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Breaking:** `CompoundTypeBuilder::build` returns `Result<Datatype, FormatError>`, refusing a compound of no fields and one whose fields pack to zero bytes, the way `ExplicitCompoundTypeBuilder::build` already did ([#268](https://github.com/stephenberry/hdf5-pure/issues/268)).
 - **Breaking:** `FormatError::ShapeDataMismatch`'s `element_size` field is a `NonZeroUsize`, so the element counts its message reports are well defined by type rather than by convention ([#272](https://github.com/stephenberry/hdf5-pure/pull/272)).
 - `Dataset::append` accepts a filtered append of any length, where it required a whole number of chunks; the dataset's own length must still be chunk-aligned ([#262](https://github.com/stephenberry/hdf5-pure/issues/262)).
-- Writing a dense attribute heap, a chunked dataset's index, or a whole chunked data region no longer builds the structure a second time purely to measure it, so large attribute sets and high chunk counts cost less to write ([#265](https://github.com/stephenberry/hdf5-pure/issues/265), [#275](https://github.com/stephenberry/hdf5-pure/issues/275)).
+- Writing a chunked dataset, appending to one, and writing a dense attribute heap no longer build a structure twice to measure it, so high chunk counts and large attribute sets cost less to write ([#265](https://github.com/stephenberry/hdf5-pure/issues/265), [#275](https://github.com/stephenberry/hdf5-pure/issues/275)).
 
 ### Fixed
 
