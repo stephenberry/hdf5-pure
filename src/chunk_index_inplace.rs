@@ -26,6 +26,8 @@
 //! flag and refuses filters; the general writer takes an exclusive lock, accepts
 //! filters, and relocates a partial trailing chunk.
 
+use core::num::NonZeroUsize;
+
 use crate::checksum::jenkins_lookup3;
 use crate::chunked_write::{ea_compute_stats, split_into_chunks, write_ea_addr};
 use crate::convert::TryToUsize;
@@ -210,7 +212,7 @@ pub(crate) struct Located {
     /// Elements per chunk along axis 0 (the only varying axis for rank 1).
     pub chunk_elems: u64,
     /// Bytes per dataset element (datatype size).
-    pub elem_bytes: usize,
+    pub elem_bytes: NonZeroUsize,
     /// Bytes per chunk (uncompressed).
     pub chunk_bytes: usize,
 
@@ -349,13 +351,13 @@ impl Located {
             ));
         }
         let chunk_elems = chunk_dims[0] as u64;
-        let elem_bytes = chunk_dims[1] as usize;
-        if elem_bytes == 0 {
-            // A zero element-size pseudo-dimension is a malformed layout; refuse
-            // rather than divide by it when validating an append length.
+        // A zero element-size pseudo-dimension is a malformed layout; refuse
+        // rather than divide by it when validating an append length. The binding
+        // carries that refusal forward, so no later step re-checks it.
+        let Some(elem_bytes) = NonZeroUsize::new(chunk_dims[1] as usize) else {
             return Err(unsupported("dataset has a zero-sized element"));
-        }
-        let chunk_bytes = chunk_elems.to_usize()? * elem_bytes;
+        };
+        let chunk_bytes = chunk_elems.to_usize()? * elem_bytes.get();
 
         let ea_header = ExtensibleArrayHeader::parse_from_source(file, ea_addr, os, ls)?;
         let has_filters = filter_msg.is_some();
@@ -921,7 +923,7 @@ pub(crate) fn plan_ea_append<F: Store>(
     loc: &Located,
     datatype: &Datatype,
     spatial: &[u64],
-    element_size: usize,
+    element_size: NonZeroUsize,
     pipeline: Option<&FilterPipeline>,
     raw: &[u8],
     new_elems: u64,
@@ -973,7 +975,7 @@ pub(crate) fn plan_ea_append<F: Store>(
             usize::try_from(rec.stored_size)
                 .map_err(|_| Error::AppendUnsupported("chunk size exceeds this platform"))?
         } else {
-            chunk_elems.to_usize()? * element_size
+            chunk_elems.to_usize()? * element_size.get()
         };
         rec.addr
             .checked_add(stored_len as u64)
@@ -984,14 +986,14 @@ pub(crate) fn plan_ea_append<F: Store>(
         // One bounded read of the single trailing chunk.
         let stored = file.read_exact_at(rec.addr, stored_len)?;
         let full = if let Some(pl) = pipeline {
-            let ctx = ChunkContext::from_datatype(spatial, datatype);
+            let ctx = ChunkContext::from_datatype(spatial, datatype)?;
             decompress_chunk(&stored, pl, ctx, rec.filter_mask).map_err(Error::Format)?
         } else {
             stored
         };
         let live_elems = usize::try_from(current_dim % chunk_elems)
             .map_err(|_| Error::AppendUnsupported("chunk length exceeds this platform"))?;
-        let live_bytes = live_elems * element_size;
+        let live_bytes = live_elems * element_size.get();
         if full.len() < live_bytes {
             return Err(Error::AppendUnsupported(
                 "trailing chunk decoded shorter than its live element count",
@@ -1006,7 +1008,7 @@ pub(crate) fn plan_ea_append<F: Store>(
     let tail_len_elems = new_dim - n_full * chunk_elems;
     let split = split_into_chunks(&tail_raw, &[tail_len_elems], spatial, element_size);
     let new_chunk_bytes: Vec<Vec<u8>> = if let Some(pl) = pipeline {
-        let ctx = ChunkContext::from_datatype(spatial, datatype);
+        let ctx = ChunkContext::from_datatype(spatial, datatype)?;
         let mut out = Vec::with_capacity(split.len());
         for (_, buf) in &split {
             out.push(compress_chunk(buf, pl, ctx).map_err(Error::Format)?);

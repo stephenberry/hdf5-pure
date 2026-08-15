@@ -179,7 +179,7 @@ fn enum_i32_data_into_u8_enum_type_is_rejected() {
             actual,
             element_size,
         })) => {
-            assert_eq!(element_size, 1);
+            assert_eq!(element_size.get(), 1);
             assert_eq!(expected, 2); // 2 elements * 1 byte
             assert_eq!(actual, 8); // 2 values * 4 bytes each
         }

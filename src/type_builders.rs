@@ -7,6 +7,8 @@ use alloc::{boxed::Box, string::String, string::ToString, vec, vec::Vec};
 
 use core::fmt;
 
+use core::num::NonZeroUsize;
+
 use crate::attribute::AttributeMessage;
 use crate::chunked_write::{ChunkMeta, ChunkOptions, ChunkProvider};
 use crate::compound::CompoundType;
@@ -1036,9 +1038,8 @@ pub(crate) struct VlStringStaging {
 /// while the heap object still holds the exact bytes.
 pub(crate) fn stage_vl_elements(
     elements: &[VlStringElement],
-    element_size: usize,
+    element_size: NonZeroUsize,
 ) -> VlStringStaging {
-    let element_size = element_size.max(1);
     // Collect the non-null payloads in order; their positions become the heap
     // object indices, 1-based within each collection.
     let mut objects: Vec<&[u8]> = Vec::new();
@@ -1474,8 +1475,8 @@ pub struct ProvenanceConfig {
 pub(crate) struct RawChunkPayload {
     /// Logical chunk dimensions (rank entries, not the trailing element size).
     pub(crate) chunk_dims: Vec<u64>,
-    /// Datatype element size in bytes.
-    pub(crate) element_size: usize,
+    /// Datatype element size in bytes, proven non-zero.
+    pub(crate) element_size: NonZeroUsize,
     /// Full uncompressed byte size of one chunk
     /// (`product(chunk_dims) * element_size`), identical for every chunk.
     pub(crate) raw_size: u64,
@@ -1942,7 +1943,7 @@ impl DatasetBuilder {
         dims: &[u64],
         maxshape: Option<&[u64]>,
         chunk_dims: &[u64],
-        element_size: usize,
+        element_size: NonZeroUsize,
         pipeline_message: Option<Vec<u8>>,
         meta: Vec<ChunkMeta>,
         provider: Box<dyn ChunkProvider>,
@@ -1955,7 +1956,7 @@ impl DatasetBuilder {
             .iter()
             .copied()
             .product::<u64>()
-            .saturating_mul(element_size as u64);
+            .saturating_mul(element_size.get() as u64);
         self.datatype = Some(datatype);
         if self.shape.is_none() {
             self.shape = Some(dims.to_vec());
@@ -2133,7 +2134,7 @@ impl DatasetBuilder {
     fn stage_vlen_strings(&mut self, datatype: Datatype, elements: &[VlStringElement]) {
         // A VL string's base type is one byte, so the reference length is the
         // byte count (element_size = 1).
-        self.stage_vlen_elements(datatype, elements, 1);
+        self.stage_vlen_elements(datatype, elements, NonZeroUsize::MIN);
     }
 
     /// Write a *non-string* variable-length (sequence) dataset from an explicit
@@ -2165,12 +2166,11 @@ impl DatasetBuilder {
                 actual: "VariableLength string",
             });
         }
-        let element_size = base_type.type_size() as usize;
-        if element_size == 0 {
+        let Some(element_size) = NonZeroUsize::new(base_type.type_size() as usize) else {
             return Err(crate::error::FormatError::VlDataError(
                 "non-string VL base type has zero size".into(),
             ));
-        }
+        };
         self.stage_vlen_elements(datatype, elements, element_size);
         Ok(self)
     }
@@ -2210,7 +2210,7 @@ impl DatasetBuilder {
         &mut self,
         datatype: Datatype,
         elements: &[VlStringElement],
-        element_size: usize,
+        element_size: NonZeroUsize,
     ) {
         let n = elements.len() as u64;
         let staging = stage_vl_elements(elements, element_size);

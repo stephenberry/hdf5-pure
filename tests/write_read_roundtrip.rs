@@ -1178,7 +1178,7 @@ fn shape_data_mismatch_is_rejected() {
         }) => {
             assert_eq!(expected, 4 * 8); // shape needs 4 f64 = 32 bytes
             assert_eq!(actual, 3 * 8); // only 3 f64 = 24 bytes supplied
-            assert_eq!(element_size, 8); // f64
+            assert_eq!(element_size.get(), 8); // f64
         }
         other => panic!("expected ShapeDataMismatch, got {other:?}"),
     }

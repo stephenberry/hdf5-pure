@@ -1480,14 +1480,18 @@ impl FileWriter {
             // refuses. A caller-built `Datatype` reaches the writer without
             // passing through `Datatype::parse`, which refuses the file-sourced
             // ones, so this is where the same invariant is held on the way out.
-            dt.ensure_nonzero_size()?;
+            //
+            // Taking the size as a `NonZeroU32` here is what holds that for the
+            // rest of the write: every later stage receives the proof rather
+            // than the bare number, so none of them re-checks it.
+            let elem_size = dt.element_size_usize()?;
             // Guard against a shape that disagrees with the supplied data. The
             // reader enforces the same `num_elements * element_size` invariant
             // (see `data_read::read_raw_data_full`), so without this check a
             // mismatch (e.g. data for 3 elements with shape `[2, 2]`) would
             // produce a file that fails to read back. `saturating_mul` keeps an
             // absurd shape from overflowing into a false match.
-            let elem_size = dt.type_size() as u64;
+            let elem_bytes = elem_size.get() as u64;
             if !is_empty && raw_chunks.is_none() {
                 // A produced region is checked against the same invariant as a
                 // materialized one — its size is declared rather than measured,
@@ -1507,7 +1511,7 @@ impl FileWriter {
                     .copied()
                     .try_fold(1u64, |acc, d| acc.checked_mul(d))
                     .unwrap_or(u64::MAX);
-                let expected = num_elements.saturating_mul(elem_size);
+                let expected = num_elements.saturating_mul(elem_bytes);
                 if declared != expected {
                     #[expect(
                         clippy::cast_possible_truncation,
@@ -1516,7 +1520,7 @@ impl FileWriter {
                     return Err(FormatError::ShapeDataMismatch {
                         expected: expected as usize,
                         actual: declared as usize,
-                        element_size: elem_size as usize,
+                        element_size: elem_size,
                     });
                 }
             }
@@ -1571,10 +1575,9 @@ impl FileWriter {
             // A user-defined fill value is one element wide, so its byte length
             // must equal the datatype's element size.
             if let Some(fill) = &db.fill {
-                let expected = elem_size.to_usize()?;
-                if fill.len() != expected {
+                if fill.len() != elem_size.get() {
                     return Err(FormatError::FillValueSizeMismatch {
-                        expected,
+                        expected: elem_size.get(),
                         actual: fill.len(),
                     });
                 }
@@ -1613,7 +1616,7 @@ impl FileWriter {
             types
                 .into_iter()
                 .map(|ct| {
-                    ct.datatype.ensure_nonzero_size()?;
+                    ct.datatype.element_size()?;
                     committed.push(CtFlat {
                         name: ct.name,
                         dt: ct.datatype,
@@ -2033,7 +2036,7 @@ impl FileWriter {
             .map(|(i, d)| {
                 if is_chunked[i] && d.raw_chunks.is_none() {
                     let chunk_dims = d.chunk_options.resolve_chunk_dims(&d.ds.dimensions);
-                    let ctx = crate::filters::ChunkContext::from_datatype(&chunk_dims, &d.dt);
+                    let ctx = crate::filters::ChunkContext::from_datatype(&chunk_dims, &d.dt)?;
                     Ok(Some(compress_chunks(
                         &d.raw,
                         &d.ds.dimensions,

@@ -637,7 +637,7 @@ fn emit_dataset(
                 .as_ref()
                 .filter(|ms| *ms != &dims)
                 .map(|ms| ms.as_slice());
-            let elem_size = datatype.type_size() as usize;
+            let elem_size = datatype.element_size_usize()?;
             // Stream the chunks from the source at write time rather than reading
             // them all now: the provider holds an `Arc<File>` and fetches one
             // chunk at a time, so a huge dataset never sits in memory.

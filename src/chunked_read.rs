@@ -8,10 +8,12 @@ use alloc::{borrow::Cow, format, vec, vec::Vec};
 #[cfg(feature = "std")]
 use std::borrow::Cow;
 
+use core::num::NonZeroUsize;
+
 use crate::btree_v1::btree_v1_node_header_size;
 use crate::chunk_cache::ChunkCache;
 use crate::chunk_span::ChunkSpanReader;
-use crate::convert::{TryToUsize, slice_range, u32_from};
+use crate::convert::{TryToUsize, nonzero_usize_from, slice_range, u32_from};
 use crate::data_layout::DataLayout;
 use crate::dataspace::Dataspace;
 use crate::datatype::Datatype;
@@ -599,11 +601,11 @@ const MAX_CHUNK_LOGICAL_BYTES: u64 = u32::MAX as u64;
 /// normally-sized chunks, entirely readable.
 fn ensure_chunk_bytes_representable(
     chunk_dims: &[usize],
-    elem_size: usize,
+    elem_size: NonZeroUsize,
 ) -> Result<(), FormatError> {
     let logical = chunk_dims
         .iter()
-        .try_fold(elem_size as u64, |acc, &d| acc.checked_mul(d as u64));
+        .try_fold(elem_size.get() as u64, |acc, &d| acc.checked_mul(d as u64));
     match logical {
         Some(bytes) if bytes <= MAX_CHUNK_LOGICAL_BYTES => Ok(()),
         _ => Err(FormatError::InvalidChunkGeometry(
@@ -655,7 +657,11 @@ pub fn read_chunked_data(
     let addr = addr_opt
         .ok_or_else(|| FormatError::ChunkedReadError("no address for chunked layout".into()))?;
 
-    let elem_size = datatype.type_size() as usize;
+    // The element width, taken once as a proven-non-zero value. Everything below
+    // that divides or divides by it receives that proof rather than the bare
+    // number, so no later step re-checks it.
+    let elem_width = datatype.element_size()?;
+    let elem_size = nonzero_usize_from(elem_width)?;
 
     let (rank, chunk_dims, ds_dims) = chunked_dims(chunk_dimensions, dataspace)?;
     ensure_chunk_bytes_representable(&chunk_dims, elem_size)?;
@@ -663,8 +669,8 @@ pub fn read_chunked_data(
     // Collect chunks based on version and index type
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "chunk byte sizes and the datatype element size are encoded into 32-bit \
-                  chunk-info fields; both stay well below u32::MAX (HDF5 caps a chunk at 4 GiB)"
+        reason = "chunk byte sizes are encoded into 32-bit chunk-info fields; they stay \
+                  well below u32::MAX (HDF5 caps a chunk at 4 GiB)"
     )]
     let chunks = match (version, chunk_index_type) {
         (3, _) => {
@@ -673,7 +679,7 @@ pub fn read_chunked_data(
         }
         (4, Some(1)) => {
             // Single chunk — one chunk covering the entire dataset
-            let chunk_byte_size: usize = chunk_dims.iter().product::<usize>() * elem_size;
+            let chunk_byte_size: usize = chunk_dims.iter().product::<usize>() * elem_size.get();
             let (csize, fmask) = if let Some(fs) = single_filtered_size {
                 (fs as u32, single_filter_mask.unwrap_or(0))
             } else {
@@ -693,7 +699,7 @@ pub fn read_chunked_data(
                 addr,
                 &dataspace.dimensions,
                 &spatial_chunk_dims,
-                elem_size as u32,
+                elem_width.get(),
             )
         }
         (4, Some(3)) => {
@@ -706,7 +712,7 @@ pub fn read_chunked_data(
                 &header,
                 &dataspace.dimensions,
                 &spatial_chunk_dims,
-                elem_size as u32,
+                elem_width.get(),
                 offset_size,
                 length_size,
             )?
@@ -725,7 +731,7 @@ pub fn read_chunked_data(
                 &header,
                 &dataspace.dimensions,
                 &spatial_chunk_dims,
-                elem_size as u32,
+                elem_width.get(),
                 offset_size,
                 length_size,
             )?
@@ -739,18 +745,17 @@ pub fn read_chunked_data(
 
     // Decompress all chunks (parallel when beneficial, sequential otherwise)
     let chunk_dims_u64: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
-    let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype);
+    let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype)?;
     let decompressed_chunks = decompress_all_chunks(file_data, &chunks, pipeline, ctx)?;
 
     let num_elements = dataspace.num_elements();
-    let total_bytes =
-        num_elements
-            .to_usize()?
-            .checked_mul(elem_size)
-            .ok_or(FormatError::OffsetOverflow {
-                offset: num_elements,
-                length: elem_size as u64,
-            })?;
+    let total_bytes = num_elements
+        .to_usize()?
+        .checked_mul(elem_size.get())
+        .ok_or(FormatError::OffsetOverflow {
+            offset: num_elements,
+            length: elem_size.get() as u64,
+        })?;
     Ok(assemble_chunks(
         &chunks,
         &decompressed_chunks,
@@ -812,7 +817,7 @@ pub fn read_chunked_data_from_source<S: Source + ?Sized>(
     let addr = addr_opt
         .ok_or_else(|| FormatError::ChunkedReadError("no address for chunked layout".into()))?;
 
-    let elem_size = datatype.type_size() as usize;
+    let elem_size = datatype.element_size_usize()?;
     let (rank, chunk_dims, ds_dims) = chunked_dims(chunk_dimensions, dataspace)?;
     ensure_chunk_bytes_representable(&chunk_dims, elem_size)?;
 
@@ -831,17 +836,16 @@ pub fn read_chunked_data_from_source<S: Source + ?Sized>(
     )?;
 
     let chunk_dims_u64: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
-    let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype);
+    let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype)?;
     let decompressed_chunks = decompress_all_chunks_from_source(source, &chunks, pipeline, ctx)?;
     let num_elements = dataspace.num_elements();
-    let total_bytes =
-        num_elements
-            .to_usize()?
-            .checked_mul(elem_size)
-            .ok_or(FormatError::OffsetOverflow {
-                offset: num_elements,
-                length: elem_size as u64,
-            })?;
+    let total_bytes = num_elements
+        .to_usize()?
+        .checked_mul(elem_size.get())
+        .ok_or(FormatError::OffsetOverflow {
+            offset: num_elements,
+            length: elem_size.get() as u64,
+        })?;
     Ok(assemble_chunks(
         &chunks,
         &decompressed_chunks,
@@ -941,7 +945,7 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
         ));
     };
 
-    let elem_size = datatype.type_size() as usize;
+    let elem_size = datatype.element_size_usize()?;
     let (rank, chunk_dims, ds_dims) = chunked_dims(chunk_dimensions, dataspace)?;
     ensure_chunk_bytes_representable(&chunk_dims, elem_size)?;
 
@@ -968,10 +972,10 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
         })
     })?;
     let row_bytes = row_elems
-        .checked_mul(elem_size)
+        .checked_mul(elem_size.get())
         .ok_or(FormatError::OffsetOverflow {
             offset: row_elems as u64,
-            length: elem_size as u64,
+            length: elem_size.get() as u64,
         })?;
 
     let out_rows = num_rows.to_usize()?;
@@ -1029,7 +1033,7 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
     sort_chunks_by_address(&mut chunks);
 
     let chunk_dims_u64: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
-    let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype);
+    let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype)?;
 
     let row_lo = row_start.to_usize()?;
     let row_hi = row_lo.saturating_add(out_rows); // exclusive; caller clamped to the dataset
@@ -1093,7 +1097,7 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
             dims[0] = hi - lo;
             let advance = skip
                 .saturating_mul(chunk_strides[0])
-                .saturating_mul(elem_size);
+                .saturating_mul(elem_size.get());
             Some((offsets, dims, advance))
         };
 
@@ -1154,12 +1158,8 @@ fn row_band_copy(
     chunk: &[u8],
     src: usize,
     band: usize,
-    elem_size: usize,
+    elem_size: NonZeroUsize,
 ) {
-    debug_assert!(
-        elem_size > 0,
-        "a zero-width element type is refused at parse"
-    );
     let mut len = band
         .min(chunk.len().saturating_sub(src))
         .min(output.len().saturating_sub(dst));
@@ -1233,7 +1233,7 @@ pub fn read_chunked_data_cached_from_source<S: Source + ?Sized>(
     let addr = addr_opt
         .ok_or_else(|| FormatError::ChunkedReadError("no address for chunked layout".into()))?;
 
-    let elem_size = datatype.type_size() as usize;
+    let elem_size = datatype.element_size_usize()?;
     let (rank, chunk_dims, ds_dims) = chunked_dims(chunk_dimensions, dataspace)?;
     ensure_chunk_bytes_representable(&chunk_dims, elem_size)?;
 
@@ -1259,12 +1259,13 @@ pub fn read_chunked_data_cached_from_source<S: Source + ?Sized>(
     sort_chunks_by_address(&mut chunks);
 
     let total_elements = dataspace.num_elements().to_usize()?;
-    let total_bytes = total_elements
-        .checked_mul(elem_size)
-        .ok_or(FormatError::OffsetOverflow {
-            offset: total_elements as u64,
-            length: elem_size as u64,
-        })?;
+    let total_bytes =
+        total_elements
+            .checked_mul(elem_size.get())
+            .ok_or(FormatError::OffsetOverflow {
+                offset: total_elements as u64,
+                length: elem_size.get() as u64,
+            })?;
     let mut output = vec![0u8; total_bytes];
 
     let mut ds_strides = vec![1usize; rank];
@@ -1278,7 +1279,7 @@ pub fn read_chunked_data_cached_from_source<S: Source + ?Sized>(
     }
 
     let chunk_dims_u64: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
-    let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype);
+    let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype)?;
 
     // Every chunk of the dataset is wanted here; what the plan leaves out is
     // whatever the chunk cache already holds from an earlier read.
@@ -1354,7 +1355,7 @@ pub(crate) fn collect_chunks_for_layout_from_source<S: Source + ?Sized>(
     single_filter_mask: Option<u32>,
     chunk_dimensions: &[u32],
     dataspace: &Dataspace,
-    elem_size: usize,
+    elem_size: NonZeroUsize,
     offset_size: u8,
     length_size: u8,
 ) -> Result<Vec<ChunkInfo>, FormatError> {
@@ -1369,7 +1370,7 @@ pub(crate) fn collect_chunks_for_layout_from_source<S: Source + ?Sized>(
                 .iter()
                 .map(|&d| d as usize)
                 .product::<usize>()
-                * elem_size;
+                * elem_size.get();
             let (csize, fmask) = if let Some(fs) = single_filtered_size {
                 (u32_from(fs)?, single_filter_mask.unwrap_or(0))
             } else {
@@ -1388,7 +1389,7 @@ pub(crate) fn collect_chunks_for_layout_from_source<S: Source + ?Sized>(
                 addr,
                 &dataspace.dimensions,
                 &spatial_chunk_dims,
-                u32_from(elem_size as u64)?,
+                u32_from(elem_size.get() as u64)?,
             ))
         }
         (4, Some(3)) => {
@@ -1400,7 +1401,7 @@ pub(crate) fn collect_chunks_for_layout_from_source<S: Source + ?Sized>(
                 &header,
                 &dataspace.dimensions,
                 &spatial_chunk_dims,
-                u32_from(elem_size as u64)?,
+                u32_from(elem_size.get() as u64)?,
                 offset_size,
                 length_size,
             )
@@ -1414,7 +1415,7 @@ pub(crate) fn collect_chunks_for_layout_from_source<S: Source + ?Sized>(
                 &header,
                 &dataspace.dimensions,
                 &spatial_chunk_dims,
-                u32_from(elem_size as u64)?,
+                u32_from(elem_size.get() as u64)?,
                 offset_size,
                 length_size,
             )
@@ -1472,12 +1473,9 @@ pub(crate) fn enumerate_chunks_from_source<S: Source + ?Sized>(
         .len()
         .checked_sub(1)
         .ok_or_else(|| FormatError::ChunkedReadError("chunked layout has no dimensions".into()))?;
-    let elem_size = chunk_dimensions[rank] as usize;
-    if elem_size == 0 {
-        return Err(FormatError::ChunkedReadError(
-            "chunked layout has a zero element size".into(),
-        ));
-    }
+    let elem_size = NonZeroUsize::new(chunk_dimensions[rank] as usize).ok_or_else(|| {
+        FormatError::ChunkedReadError("chunked layout has a zero element size".into())
+    })?;
     collect_chunks_for_layout_from_source(
         source,
         *version,
@@ -1622,12 +1620,9 @@ pub(crate) fn collect_chunked_storage_spans<S: Source + ?Sized>(
         .len()
         .checked_sub(1)
         .ok_or_else(|| FormatError::ChunkedReadError("chunked layout has no dimensions".into()))?;
-    let elem_size = chunk_dimensions[rank] as usize;
-    if elem_size == 0 {
-        return Err(FormatError::ChunkedReadError(
-            "chunked layout has a zero element size".into(),
-        ));
-    }
+    let elem_size = NonZeroUsize::new(chunk_dimensions[rank] as usize).ok_or_else(|| {
+        FormatError::ChunkedReadError("chunked layout has a zero element size".into())
+    })?;
 
     let mut data: Vec<(u64, u64)> = Vec::new();
 
@@ -1769,7 +1764,7 @@ fn assemble_chunks(
     rank: usize,
     chunk_dims: &[usize],
     ds_dims: &[usize],
-    elem_size: usize,
+    elem_size: NonZeroUsize,
     total_bytes: usize,
 ) -> Vec<u8> {
     let mut output = vec![0u8; total_bytes];
@@ -1860,15 +1855,17 @@ pub fn read_chunked_data_cached(
     let addr = addr_opt
         .ok_or_else(|| FormatError::ChunkedReadError("no address for chunked layout".into()))?;
 
-    let elem_size = datatype.type_size() as usize;
+    // Taken once as a proven-non-zero width; see the buffered reader above.
+    let elem_width = datatype.element_size()?;
+    let elem_size = nonzero_usize_from(elem_width)?;
     let (rank, chunk_dims, ds_dims) = chunked_dims(chunk_dimensions, dataspace)?;
     ensure_chunk_bytes_representable(&chunk_dims, elem_size)?;
     let ndims = rank + 1; // rank + the trailing element-size dimension
 
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "chunk byte sizes and the datatype element size are encoded into 32-bit \
-                  chunk-info fields; both stay well below u32::MAX (HDF5 caps a chunk at 4 GiB)"
+        reason = "chunk byte sizes are encoded into 32-bit chunk-info fields; they stay \
+                  well below u32::MAX (HDF5 caps a chunk at 4 GiB)"
     )]
     let chunks = if let Some(chunks) = cache.all_indexed_chunks() {
         chunks
@@ -1876,7 +1873,7 @@ pub fn read_chunked_data_cached(
         let chunks = match (version, chunk_index_type) {
             (3, _) => collect_chunk_info(file_data, addr, ndims, offset_size, length_size)?,
             (4, Some(1)) => {
-                let chunk_byte_size: usize = chunk_dims.iter().product::<usize>() * elem_size;
+                let chunk_byte_size: usize = chunk_dims.iter().product::<usize>() * elem_size.get();
                 let (csize, fmask) = if let Some(fs) = single_filtered_size {
                     (fs as u32, single_filter_mask.unwrap_or(0))
                 } else {
@@ -1895,7 +1892,7 @@ pub fn read_chunked_data_cached(
                     addr,
                     &dataspace.dimensions,
                     &spatial_chunk_dims,
-                    elem_size as u32,
+                    elem_width.get(),
                 )
             }
             (4, Some(3)) => {
@@ -1907,7 +1904,7 @@ pub fn read_chunked_data_cached(
                     &header,
                     &dataspace.dimensions,
                     &spatial_chunk_dims,
-                    elem_size as u32,
+                    elem_width.get(),
                     offset_size,
                     length_size,
                 )?
@@ -1925,7 +1922,7 @@ pub fn read_chunked_data_cached(
                     &header,
                     &dataspace.dimensions,
                     &spatial_chunk_dims,
-                    elem_size as u32,
+                    elem_width.get(),
                     offset_size,
                     length_size,
                 )?
@@ -1942,7 +1939,7 @@ pub fn read_chunked_data_cached(
 
     // Assemble output
     let total_elements = dataspace.num_elements().to_usize()?;
-    let total_bytes = total_elements * elem_size;
+    let total_bytes = total_elements * elem_size.get();
     let mut output = vec![0u8; total_bytes];
 
     let mut ds_strides = vec![1usize; rank];
@@ -1956,7 +1953,7 @@ pub fn read_chunked_data_cached(
     }
 
     let chunk_dims_u64: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
-    let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype);
+    let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype)?;
 
     for chunk_info in &chunks {
         let coord: Vec<u64> = chunk_info.offsets.iter().take(rank).copied().collect();
@@ -2047,7 +2044,7 @@ fn place_chunk(
     ds_dims: &[usize],
     ds_strides: &[usize],
     chunk_strides: &[usize],
-    elem_size: usize,
+    elem_size: NonZeroUsize,
     rank: usize,
 ) {
     if rank == 0 {
@@ -2091,17 +2088,10 @@ fn copy_chunk_to_output(
     ds_dims: &[usize],
     ds_strides: &[usize],
     chunk_strides: &[usize],
-    elem_size: usize,
+    elem_size: NonZeroUsize,
     rank: usize,
 ) {
     debug_assert!(rank >= 1, "rank == 0 is handled by the callers");
-    // The element-boundary clamp below divides by `elem_size`; a zero-width
-    // element type is refused when the datatype message is parsed, so one cannot
-    // reach here from a file.
-    debug_assert!(
-        elem_size > 0,
-        "a zero-width element type is refused at parse"
-    );
     // Row contiguity (the whole optimization) relies on a unit innermost stride
     // in both layouts, which the row-major stride construction guarantees.
     debug_assert_eq!(chunk_strides[rank - 1], 1);
@@ -2115,7 +2105,7 @@ fn copy_chunk_to_output(
     if inner_row_len == 0 {
         return; // the chunk lies entirely past the inner edge
     }
-    let row_bytes = inner_row_len * elem_size;
+    let row_bytes = inner_row_len * elem_size.get();
     // Destination offset contributed by the innermost dimension (stride 1).
     let inner_dst = chunk_offsets[inner] * ds_strides[inner];
 
@@ -2139,8 +2129,8 @@ fn copy_chunk_to_output(
         }
 
         if in_bounds {
-            let src = chunk_base * elem_size;
-            let dst = ds_base * elem_size;
+            let src = chunk_base * elem_size.get();
+            let dst = ds_base * elem_size.get();
             // Clamp to the bytes available on each side, on an element boundary.
             let mut avail = row_bytes
                 .min(chunk_data.len().saturating_sub(src))
@@ -2165,24 +2155,27 @@ fn copy_chunk_to_output(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::convert::nz;
 
     #[test]
     fn chunk_bytes_within_limit_are_accepted() {
         // A realistic chunk: 256 KiB of f64 elements.
-        assert!(ensure_chunk_bytes_representable(&[128, 256], 8).is_ok());
+        assert!(ensure_chunk_bytes_representable(&[128, 256], nz(8)).is_ok());
         // A single chunk right at the 4 GiB limit is still representable.
-        assert!(ensure_chunk_bytes_representable(&[u32::MAX as usize], 1).is_ok());
+        assert!(ensure_chunk_bytes_representable(&[u32::MAX as usize], nz(1)).is_ok());
     }
 
     #[test]
     fn chunk_bytes_over_limit_are_refused() {
         // The issue #185 shape: 10 elements of a ~2.86 GB fixed-length string
         // (0xAAAAAAAA bytes) is ~28.6 GB per chunk — impossible for the format.
-        let err = ensure_chunk_bytes_representable(&[10], 0xAAAA_AAAA).unwrap_err();
+        let err = ensure_chunk_bytes_representable(&[10], nz(0xAAAA_AAAA)).unwrap_err();
         assert!(matches!(err, FormatError::InvalidChunkGeometry(_)));
 
         // A geometry whose product overflows u64 is refused, not wrapped.
-        assert!(ensure_chunk_bytes_representable(&[usize::MAX, usize::MAX], usize::MAX).is_err());
+        assert!(
+            ensure_chunk_bytes_representable(&[usize::MAX, usize::MAX], nz(usize::MAX)).is_err()
+        );
     }
 
     fn write_offset(buf: &mut Vec<u8>, val: u64, size: u8) {
