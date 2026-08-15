@@ -64,13 +64,13 @@ impl<'a> ChunkContext<'a> {
     ///
     /// Currently only used by tests (read/write paths build the context via
     /// [`ChunkContext::from_datatype`]); gated so it is not shipped as dead code.
-    #[cfg(test)]
     ///
     /// # Panics
     ///
-    /// If `element_size` is zero. Test-only, and every caller passes a literal
-    /// width; the production constructor
+    /// If `element_size` is zero. Every caller passes a literal width, and this
+    /// is test-only; the production constructor
     /// [`from_datatype`](Self::from_datatype) returns an error instead.
+    #[cfg(test)]
     pub fn basic(chunk_dims: &'a [u64], element_size: u32) -> Self {
         Self {
             chunk_dims,

@@ -11,10 +11,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `Dataset::buffered_appender` returns a `BufferedAppender` that holds appended elements in memory and writes them a whole chunk at a time, so a filtered dataset takes any append length; buffered elements reach the file only on `flush`, `finish`, or `discard`, and a SWMR session is refused ([#262](https://github.com/stephenberry/hdf5-pure/issues/262)).
 - `FileAccessProperties::with_sync_policy(SyncPolicy::OnClose)` drops the `fsync` from every commit and append, leaving one at `close`, with the new `File::sync` for checkpoints in between; writes still reach the operating system as they are made, so what moves to the caller is power-loss durability within the session ([#263](https://github.com/stephenberry/hdf5-pure/issues/263)).
 - A staged edit that would stop a live `BufferedAppender` from flushing — one naming its dataset or an ancestor, any edit at all while it still owes a realignment, or a second appender on the same dataset — is refused with `Error::EditUnsupported` at the call that makes it, rather than losing the buffered elements when the appender drops ([#262](https://github.com/stephenberry/hdf5-pure/issues/262)).
+- `Datatype::element_size` returns the element width as a `NonZeroU32`, refusing a zero-width type; prefer it to `type_size` wherever the width is about to be divided by ([#272](https://github.com/stephenberry/hdf5-pure/pull/272)).
 
 ### Changed
 
 - **Breaking:** `CompoundTypeBuilder::build` returns `Result<Datatype, FormatError>`, refusing a compound of no fields and one whose fields pack to zero bytes, the way `ExplicitCompoundTypeBuilder::build` already did ([#268](https://github.com/stephenberry/hdf5-pure/issues/268)).
+- **Breaking:** `FormatError::ShapeDataMismatch`'s `element_size` field is a `NonZeroUsize`, so the element counts its message reports are well defined by type rather than by convention ([#272](https://github.com/stephenberry/hdf5-pure/pull/272)).
 - `Dataset::append` accepts a filtered append of any length, where it required a whole number of chunks; the dataset's own length must still be chunk-aligned ([#262](https://github.com/stephenberry/hdf5-pure/issues/262)).
 
 ### Fixed
