@@ -1040,8 +1040,8 @@ pub(crate) fn aeib_size(
 }
 
 /// The six Extensible Array header statistics, in the C library's stored order.
-/// Used by the SWMR append writer (`std` only).
-#[cfg(feature = "std")]
+/// Read by the incremental append writer, and by [`ea_layout`], for which two of
+/// them add up to the array's body length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EaStats {
     pub nsuper_blks: u64,
@@ -1054,7 +1054,6 @@ pub(crate) struct EaStats {
 
 /// On-disk byte size of one non-paged Extensible Array data block (`EADB`)
 /// holding `dblk_nelmts` element slots.
-#[cfg(feature = "std")]
 pub(crate) fn eadb_size(
     dblk_nelmts: u64,
     elem_size: usize,
@@ -1079,7 +1078,6 @@ pub(crate) fn eadb_size(
 
 /// On-disk byte size of one Extensible Array super block (`EASB`) with `ndblks`
 /// data-block pointers and (when its data blocks are paged) a page-init bitmap.
-#[cfg(feature = "std")]
 pub(crate) fn aesb_size(
     ndblks: u64,
     dblk_nelmts: u64,
@@ -1110,7 +1108,10 @@ pub(crate) fn aesb_size(
 /// `num_elements` densely-filled elements. Mirrors the allocation performed by
 /// [`build_extensible_array_at`] so the bulk writer and the incremental append
 /// writer always agree (asserted by a unit test).
-#[cfg(feature = "std")]
+///
+/// The two size statistics are also what [`extensible_array_len`] reports, since
+/// the array's body is its allocated blocks and nothing else — so this walk
+/// decides a reservation as well as a set of header fields.
 pub(crate) fn ea_compute_stats(
     geom: &EaGeometry,
     idx_blk_elmts: u64,
@@ -1159,24 +1160,58 @@ pub(crate) fn ea_compute_stats(
     s
 }
 
-/// Build a complete Extensible Array at a known absolute address.
+/// Everything about an Extensible Array that does not depend on where it is
+/// placed: the element encoding, the block geometry, and every byte count.
 ///
-/// Lays out the header (`EAHD`), index block (`EAIB`), and — for datasets with
-/// more than `idx_blk_elmts + sum(direct data blocks)` chunks — the on-disk
-/// super blocks (`EASB`) and their data blocks (`EADB`, paged when large). The
-/// super-block / data-block size progression comes from the shared
-/// [`EaGeometry`], so the writer and reader cannot drift. Byte-for-byte
-/// compatible with the reference HDF5 C library across inline, direct, super
-/// block, and paged ranges (verified by crosscheck tests).
-pub fn build_extensible_array_at(
+/// [`build_extensible_array_at`] writes an array's bytes at a chosen base
+/// address, but no term of this layout is that address — each block's size, and
+/// so the array's total length, is the same for every base. That is what lets
+/// [`extensible_array_len`] answer the length without emitting the array.
+///
+/// The builder shares this layout's *geometry*, so no second derivation of the
+/// block sizes can drift from what is written. It does not share the walk that
+/// decides which of those blocks a given element count allocates: that is
+/// written once here (through [`ea_compute_stats`]) and once in the builder's
+/// own body. Those two are what the length assertion at the end of the builder,
+/// and `extensible_array_len_matches_what_it_builds`, hold together.
+struct EaLayout {
+    /// Byte size of one element record: an address, plus the compressed size and
+    /// filter mask when the dataset is filtered.
+    elem_size: usize,
+    /// Width of the compressed-size field inside a filtered element record, sized
+    /// to the largest raw chunk. Zero when the dataset is unfiltered.
+    chunk_size_bytes: usize,
+    client_id: u8,
+    /// EA creation parameters — these must match the HDF5 C library defaults
+    /// exactly, and are held here so the header writer and the size computation
+    /// read the same values.
+    max_nelmts_bits: u8,
+    idx_blk_elmts: u8,
+    min_dblk_nelmts: u8,
+    super_blk_min_nelmts: u8,
+    max_dblk_nelmts_bits: u8,
+    geom: EaGeometry,
+    page_nelmts: usize,
+    blk_off_size: usize,
+    /// Element slots held inline in the index block (`idx_blk_elmts`).
+    inline: usize,
+    aehd_size: usize,
+    aeib_size: usize,
+    /// The six header statistics, two of which (`data_blk_size` and
+    /// `super_blk_size`) are exactly the body's byte length.
+    stats: EaStats,
+    /// Header + index block + body: the whole array.
+    total_len: u64,
+}
+
+/// Lay out the Extensible Array that would hold `chunks`, without building it.
+fn ea_layout(
     chunks: &[WrittenChunk],
     offset_size: u8,
     length_size: u8,
     has_filters: bool,
-    ea_base_address: u64,
-) -> Result<Vec<u8>, FormatError> {
+) -> EaLayout {
     let os = offset_size as usize;
-    let num_elements = chunks.len();
 
     // Compute element encoding size (same logic as Fixed Array)
     let chunk_size_bytes: usize = if has_filters {
@@ -1230,11 +1265,101 @@ pub fn build_extensible_array_at(
     let inline = idx_blk_elmts as usize;
 
     let aehd_size = ExtensibleArrayHeader::serialized_size(offset_size, length_size);
-    let aeib_address = ea_base_address + aehd_size as u64;
+    let aeib_size = aeib_size(
+        offset_size,
+        inline,
+        elem_size,
+        geom.direct_dblk_nelmts.len(),
+        geom.nsblk_addrs,
+    );
 
-    let ndblk_addrs = geom.direct_dblk_nelmts.len();
-    let nsblk_addrs = geom.nsblk_addrs;
-    let aeib_size = aeib_size(offset_size, inline, elem_size, ndblk_addrs, nsblk_addrs);
+    // The body is the allocated data blocks and super blocks, concatenated with
+    // nothing between them, so the two size statistics are its byte length.
+    let stats = ea_compute_stats(
+        &geom,
+        idx_blk_elmts as u64,
+        elem_size,
+        page_nelmts as u64,
+        offset_size,
+        blk_off_size,
+        chunks.len() as u64,
+    );
+    let total_len = (aehd_size + aeib_size) as u64 + stats.data_blk_size + stats.super_blk_size;
+
+    EaLayout {
+        elem_size,
+        chunk_size_bytes,
+        client_id,
+        max_nelmts_bits,
+        idx_blk_elmts,
+        min_dblk_nelmts,
+        super_blk_min_nelmts,
+        max_dblk_nelmts_bits,
+        geom,
+        page_nelmts,
+        blk_off_size,
+        inline,
+        aehd_size,
+        aeib_size,
+        stats,
+        total_len,
+    }
+}
+
+/// The byte length [`build_extensible_array_at`] would produce for `chunks`,
+/// without building it.
+///
+/// A caller that has to reserve space for the array before it exists — the
+/// in-place editor placing one into freed space — needs the length first. It
+/// comes from the same [`EaLayout`] the builder emits from, so no second
+/// derivation of the block geometry can drift away from what is written.
+pub(crate) fn extensible_array_len(
+    chunks: &[WrittenChunk],
+    offset_size: u8,
+    length_size: u8,
+    has_filters: bool,
+) -> u64 {
+    ea_layout(chunks, offset_size, length_size, has_filters).total_len
+}
+
+/// Build a complete Extensible Array at a known absolute address.
+///
+/// Lays out the header (`EAHD`), index block (`EAIB`), and — for datasets with
+/// more than `idx_blk_elmts + sum(direct data blocks)` chunks — the on-disk
+/// super blocks (`EASB`) and their data blocks (`EADB`, paged when large). The
+/// super-block / data-block size progression comes from the shared
+/// [`EaGeometry`], so the writer and reader cannot drift. Byte-for-byte
+/// compatible with the reference HDF5 C library across inline, direct, super
+/// block, and paged ranges (verified by crosscheck tests).
+pub fn build_extensible_array_at(
+    chunks: &[WrittenChunk],
+    offset_size: u8,
+    length_size: u8,
+    has_filters: bool,
+    ea_base_address: u64,
+) -> Result<Vec<u8>, FormatError> {
+    let num_elements = chunks.len();
+
+    let layout = ea_layout(chunks, offset_size, length_size, has_filters);
+    let EaLayout {
+        elem_size,
+        chunk_size_bytes,
+        client_id,
+        max_nelmts_bits,
+        idx_blk_elmts,
+        min_dblk_nelmts,
+        super_blk_min_nelmts,
+        max_dblk_nelmts_bits,
+        ref geom,
+        page_nelmts,
+        blk_off_size,
+        inline,
+        aehd_size,
+        aeib_size,
+        ..
+    } = layout;
+
+    let aeib_address = ea_base_address + aehd_size as u64;
     let body_base = aeib_address + aeib_size as u64;
 
     let undef_addr: u64 = match offset_size {
@@ -1245,9 +1370,10 @@ pub fn build_extensible_array_at(
     // ---- Build the body (direct data blocks, then super blocks) -----------
     // Addresses are absolute, computed from `body_base`, so the body can be
     // built before the index block that references it.
-    let mut body: Vec<u8> = Vec::new();
-    let mut direct_addrs: Vec<u64> = Vec::with_capacity(ndblk_addrs);
-    let mut sblk_addrs: Vec<u64> = Vec::with_capacity(nsblk_addrs);
+    let mut body: Vec<u8> =
+        Vec::with_capacity((layout.stats.data_blk_size + layout.stats.super_blk_size).to_usize()?);
+    let mut direct_addrs: Vec<u64> = Vec::with_capacity(geom.direct_dblk_nelmts.len());
+    let mut sblk_addrs: Vec<u64> = Vec::with_capacity(geom.nsblk_addrs);
 
     // Stats (match the C library's EAHD fields exactly).
     let mut ndata_blks: u64 = 0;
@@ -1295,7 +1421,7 @@ pub fn build_extensible_array_at(
 
     // Super blocks: addresses stored in the index block; super-block pointer `j`
     // refers to super block `first_indirect_sblk + j`.
-    for j in 0..nsblk_addrs {
+    for j in 0..geom.nsblk_addrs {
         let sblk_idx = geom.first_indirect_sblk + j;
         // `ndblks` and `dblk_nelmts` are u64 element counts from the EA geometry.
         // Their product (this super block's element span) and the running cursor
@@ -1458,6 +1584,15 @@ pub fn build_extensible_array_at(
     let mut combined = aehd;
     combined.extend_from_slice(&aeib);
     combined.extend_from_slice(&body);
+    // The length `extensible_array_len` promises a caller reserving space for
+    // this array, checked against the bytes actually produced. A reservation
+    // that disagrees with the emission would place the next object on top of
+    // this one, so pin it where it is emitted as well as in a test.
+    debug_assert_eq!(
+        combined.len() as u64,
+        layout.total_len,
+        "an extensible array must fill the length its layout promised"
+    );
     Ok(combined)
 }
 
@@ -2719,6 +2854,98 @@ mod tests {
             let computed = super::ea_compute_stats(&geom, 4, 8, 1024, 8, 4, n);
             assert_eq!(computed, built, "stats mismatch at n={n}");
         }
+    }
+
+    /// `extensible_array_len` is the span the in-place editor reserves for an
+    /// array before a byte of it exists, so it has to equal the length
+    /// `build_extensible_array_at` goes on to emit. A reservation that came out
+    /// short would place the next object on top of the array.
+    ///
+    /// The small counts are swept *contiguously* rather than at hand-picked
+    /// boundaries: which blocks an element count allocates is decided twice over
+    /// — once by `ea_compute_stats`, which this length comes from, and once by
+    /// the builder's own body — and a contiguous sweep crosses every transition
+    /// between those two walks without anyone having to work out where the
+    /// transitions are. It covers the inline slots, all six direct data blocks,
+    /// and the first on-disk super block. The larger counts then reach the deeper
+    /// super blocks and, at 131,061, the first *paged* data block.
+    #[test]
+    fn extensible_array_len_matches_what_it_builds() {
+        fn check(n: u64, raw_size: u64, offset_size: u8, length_size: u8, has_filters: bool) {
+            let chunks: Vec<WrittenChunk> = (0..n)
+                .map(|i| WrittenChunk {
+                    address: 0x1000 + i * 8,
+                    compressed_size: 8,
+                    raw_size,
+                    filter_mask: 0,
+                })
+                .collect();
+            let planned = extensible_array_len(&chunks, offset_size, length_size, has_filters);
+            let built = build_extensible_array_at(
+                &chunks,
+                offset_size,
+                length_size,
+                has_filters,
+                0x10_0000,
+            )
+            .unwrap();
+            assert_eq!(
+                planned,
+                built.len() as u64,
+                "planned length must match the emitted array at n={n}, raw_size={raw_size}, \
+                 offset_size={offset_size}, has_filters={has_filters}"
+            );
+        }
+
+        for &(offset_size, length_size) in &[(8u8, 8u8), (4u8, 4u8)] {
+            for &has_filters in &[false, true] {
+                // Contiguous across the inline, direct-block and first
+                // super-block ranges.
+                for n in 0..=250u64 {
+                    check(n, 8, offset_size, length_size, has_filters);
+                }
+                // The deeper super blocks, and the paged boundary: 131,060 is the
+                // last element the unpaged super block 12 holds, 131,061 the first
+                // that allocates a paged data block.
+                for &n in &[300u64, 2_000, 50_000, 131_060, 131_061, 140_000] {
+                    check(n, 8, offset_size, length_size, has_filters);
+                }
+            }
+        }
+
+        // A filtered element record carries the chunk's compressed size in a field
+        // sized to the largest *raw* chunk, so the record width — and with it the
+        // index block and every data block — changes with that size.
+        const RAW_SIZES: [u64; 4] = [8, 300, 100_000, 1 << 32];
+        for &raw_size in &RAW_SIZES {
+            for &n in &[1u64, 5, 244, 300, 2_000] {
+                check(n, raw_size, 8, 8, true);
+            }
+        }
+        // Those four raw sizes have to select four *different* field widths, or
+        // the loop above is one fixture written four times. Asserted as
+        // distinctness rather than as four literals: the rule is that the width
+        // tracks the raw size, not that it takes any particular value.
+        let widths: Vec<usize> = RAW_SIZES
+            .iter()
+            .map(|&raw_size| {
+                let chunks = [WrittenChunk {
+                    address: 0,
+                    compressed_size: 8,
+                    raw_size,
+                    filter_mask: 0,
+                }];
+                super::ea_layout(&chunks, 8, 8, true).chunk_size_bytes
+            })
+            .collect();
+        let mut distinct = widths.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            RAW_SIZES.len(),
+            "each raw size must select a different compressed-size field width, got {widths:?}"
+        );
     }
 
     // ---- h5py round-trip tests for chunked writes ----
