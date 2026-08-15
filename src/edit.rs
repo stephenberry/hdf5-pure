@@ -5590,10 +5590,12 @@ impl WriteEngine {
         dense_attrs: &[crate::attribute::AttributeMessage],
     ) -> Result<u64, Error> {
         // Plan once at a provisional base purely to size the data region: the plan
-        // walks chunk *sizes*, and every address it embeds sits in a fixed-width
+        // walks chunk *sizes* and sizes the index from its layout, so it touches
+        // no bytes at all, and every address it embeds sits in a fixed-width
         // field, so its total length is the same wherever the blob lands. That is
         // what lets the address be chosen — a freed region or end-of-file — before
-        // the bytes exist.
+        // the bytes exist. This plan is discarded; the one built at the real base
+        // below is what the emit works from.
         let sizing = plan_chunked_data_verbatim(
             meta,
             chunk_dims,
@@ -6000,16 +6002,13 @@ impl WriteEngine {
     ///
     /// `len` must be the length `build` will produce; [`place`](Self::place)
     /// rejects a mismatch. For every blob placed this way the length is a function
-    /// of the content alone — the addresses sit in fixed-width fields — so it can
-    /// be derived before the real address is known.
-    ///
-    /// Two callers derive it ([`DenseAttrPlan::blob_len`](crate::file_writer::DenseAttrPlan::blob_len)
-    /// and [`extensible_array_len`]). The two that lay out a whole chunked data
-    /// region still measure it by building the chunk *index* at a provisional
-    /// base and discarding it — `chunked_data_len` and the sizing call to
-    /// `plan_chunked_data_verbatim`. Neither materializes the chunk data, which
-    /// is the bulk of the region, but both build the index twice; finishing that
-    /// needs a length for the Fixed Array as well, tracked in issue #275.
+    /// of the content alone — the addresses sit in fixed-width fields — so every
+    /// caller derives it, and none builds the blob to measure it:
+    /// [`DenseAttrPlan::blob_len`](crate::file_writer::DenseAttrPlan::blob_len)
+    /// for a dense attribute heap, [`extensible_array_len`] for an appended
+    /// chunk index, and [`chunked_data_len`] / [`plan_chunked_data_verbatim`]
+    /// for a whole chunked data region, both of which size their index through
+    /// [`chunk_index_len`](crate::chunked_write::chunk_index_len).
     fn place_relocatable<T>(
         &mut self,
         len: u64,
@@ -6205,7 +6204,7 @@ impl WriteEngine {
         // Chunk data and the index beside it are raw (see `chunked_storage_spans`,
         // which reclaims both as raw).
         let (_addr, (layout_message, pipeline_message)) =
-            self.place_relocatable(chunked_data_len(&set)?, PageType::Raw, |stored_base| {
+            self.place_relocatable(chunked_data_len(&set), PageType::Raw, |stored_base| {
                 let result = assemble_chunked_at(&set, stored_base)?;
                 Ok((
                     result.data_bytes,
