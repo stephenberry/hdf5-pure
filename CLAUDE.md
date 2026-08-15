@@ -6,9 +6,21 @@ Run `cargo clean -p hdf5-pure` when builds start taking tens of seconds before a
 
 `[profile.dev]` and `[profile.test]` set `codegen-units = 4` against rustc's default of 256, which cuts objects per full rebuild from ~9,800 to ~600 for about one second on a library build. That slows the accumulation; it does not stop it, so the periodic clean is still the remedy. The reasoning and the measured curve are in `Cargo.toml` beside the setting.
 
-`cargo clean -p hdf5-pure` drops this package's artifacts across every profile and feature set, including all 97 integration binaries, and leaves dependencies (and the compiled libhdf5) alone. It costs one non-incremental rebuild of the crate, about five seconds. `CARGO_INCREMENTAL=0` stops the accumulation outright, but it makes every rebuild of the library non-incremental — 4.6s against 0.9s — so the periodic clean is the better trade.
+`cargo clean -p hdf5-pure` drops this package's artifacts across every profile and feature set, including all ~110 integration binaries, and leaves dependencies (and the compiled libhdf5) alone. It costs one non-incremental rebuild of the crate, about five seconds. `CARGO_INCREMENTAL=0` stops the accumulation outright, but it makes every rebuild of the library non-incremental — 4.6s against 0.9s — so the periodic clean is the better trade.
 
-Prefer `cargo test --lib` for the fast loop: the ~580 library tests run in about two seconds, and the mutation checks that prove a new test is load-bearing belong there. `cargo test --all-features` builds 97 separate integration binaries and compiles libhdf5 from source through `hdf5-metno-src`, so treat it as a pre-push gate rather than an inner-loop command, and keep to one feature set locally — every distinct set is a full parallel copy of the build graph.
+Prefer `cargo test --lib` for the fast loop: the ~580 library tests run in about two seconds, and the mutation checks that prove a new test is load-bearing belong there. The full suite builds ~110 separate integration binaries and compiles libhdf5 from source through `hdf5-metno-src`, so treat it as a pre-push gate rather than an inner-loop command, and keep to one feature set locally — every distinct set is a full parallel copy of the build graph.
+
+## The pre-push gate
+
+```
+cargo nextest run --all-features && cargo test --all-features --doc
+```
+
+Both halves are needed. **nextest does not run doctests** and never will: `rustdoc` compiles those, not the test harness. Running only the first command leaves 46 doctests silently unexecuted.
+
+nextest rather than `cargo test` because `cargo test` runs the ~110 integration binaries one after another, so the suite spends most of its wall clock on a single core no matter how many the machine has. Measured on a 10-core host at `--all-features`: **46.1s under `cargo test` (115% CPU) against 17.9s under nextest (421% CPU)**, running the identical 2,034 tests. Install it with `cargo install cargo-nextest --locked`; CI runs the same two commands per matrix config.
+
+`.config/nextest.toml` fails the run on any test slower than 90s and prints a warning at 30s. That gate exists because a single test once spent 117s issuing one `fsync` per appended element — five times the rest of the suite combined — and nothing surfaced it, since `cargo test` reports no per-test timings at all. **A long-running test in this suite is a defect signal, not a cost of doing business**: the usual cause is a session left on the default `SyncPolicy::Always` while looping over appends, and the fix is `SyncPolicy::OnClose`, which writes byte-identical files (`tests/sync_policy.rs` asserts exactly that) and still barriers at `close`. Reach for a per-test override in that config only after ruling this out.
 
 ## The HDF5 1.8 output format
 
