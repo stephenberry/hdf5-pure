@@ -22,6 +22,26 @@ nextest rather than `cargo test` because `cargo test` runs the ~110 integration 
 
 `.config/nextest.toml` fails the run on any test slower than 90s and prints a warning at 30s. That gate exists because a single test once spent 117s issuing one `fsync` per appended element — five times the rest of the suite combined — and nothing surfaced it, since `cargo test` reports no per-test timings at all. **A long-running test in this suite is a defect signal, not a cost of doing business**: the usual cause is a session left on the default `SyncPolicy::Always` while looping over appends, and the fix is `SyncPolicy::OnClose`, which writes byte-identical files (`tests/sync_policy.rs` asserts exactly that) and still barriers at `close`. Reach for a per-test override in that config only after ruling this out.
 
+## Allocation gates
+
+Two test binaries install [`heapscope`](https://crates.io/crates/heapscope) as their `#[global_allocator]` and measure what the read and write paths allocate (issue #228). They answer different questions and fail for different reasons.
+
+`tests/allocation_bounds.rs` states **rules**: a windowed read allocates on the order of its window, a chunked read costs a small constant number of allocations per chunk, a windowed variable-length read does not allocate per object of the heap collection it walks. Every one is a claim about how the work scales, so it holds on every platform and survives a toolchain that changes a `Vec`'s growth by a step. This runs in the ordinary suite, everywhere.
+
+`tests/allocation_baseline.rs` pins the **numbers**, in `tests/baselines/`, so a 5% creep that passes every rule still arrives in a pull request as a line a reviewer reads. An exact count is a property of one target, one toolchain *and* one feature set — `--all-features` measured 416 bytes above the default set on the same commit — so it compiles only under the crate's default features plus `heap-baseline`, and runs in one CI job on aarch64 macOS, the host the numbers were measured on. The `--all-features` pre-push gate therefore does not run it; this does:
+
+```
+cargo nextest run --features heap-baseline --test allocation_baseline
+```
+
+Re-record with `HEAPSCOPE_UPDATE_BASELINE=1 cargo test --features heap-baseline --test allocation_baseline` and commit the diff with the change that moved it. A figure that went *down* still has to be recorded: a stale baseline gates nothing.
+
+`examples/heap_profile.rs` is the third piece and the one to reach for first when a bound fails: `cargo run --release --example heap_profile` writes `target/heap-profile.html` and prints the heaviest call sites, broken down by phase (write chunked, read whole, read window, ...). Run it in release — a debug build's counts are the same but its stacks are full of the inlining that did not happen.
+
+**On x86_64 this needs frame pointers**, which `.cargo/config.toml` sets for `x86_64-unknown-linux-gnu` and `x86_64-apple-darwin`. aarch64 and Windows need no flag. A shell that exports `RUSTFLAGS` replaces those flags rather than adding to them, and the two binaries then refuse to start with a message naming the file — deliberately, because a heap gate that cannot measure must not pass.
+
+Measurement is per region and per thread, so these tests share a process without a lock between them: what `allocation::measure` reports is what the calling thread allocated inside the call, and nothing else. One limit is worth knowing before adding a *baseline*: `heapscope::HeapStats` is `#[non_exhaustive]`, so a baseline can only be taken of a whole process, which is why that file holds exactly one `#[test]` and why its fixture is part of the measurement.
+
 ## The HDF5 1.8 output format
 
 `scripts/check-hdf5-18.sh` builds HDF5 1.8.23 and points its tools at both formats this crate writes. **Run it when changing anything about superblock or object-header message versions**, and read it before assuming the test suite covers that ground — it does not, and cannot.

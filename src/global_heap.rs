@@ -71,6 +71,85 @@ fn pad8_u64(x: u64) -> Result<u64, FormatError> {
         })
 }
 
+/// How much of a collection the directory walk holds at a time.
+///
+/// One page. Large enough that a collection of many small objects pays one read
+/// per few hundred of them, small enough that a collection of few large ones
+/// reads little more than the object headers it came for.
+const DIRECTORY_WINDOW: usize = 4096;
+
+/// A bounded sliding view of one collection's bytes.
+///
+/// The directory walk has to pass *every* object in a collection — each object's
+/// size chains the position of the next — so a read per object is a read per
+/// object of the whole collection however few of them the caller wanted. A
+/// 32,768-object collection cost 65,536 reads and as many allocations to resolve
+/// a 256-element window (issue #228); through this window it costs one per few
+/// hundred objects.
+///
+/// Refills go through [`Source::read_metadata_at`], so whatever metadata cache
+/// the source has still serves them and still holds the same bytes — what
+/// changes is how many times it is asked.
+struct DirectoryWindow {
+    /// Absolute offset the buffer begins at.
+    start: u64,
+    bytes: Vec<u8>,
+}
+
+impl DirectoryWindow {
+    const fn new() -> Self {
+        Self {
+            start: 0,
+            bytes: Vec::new(),
+        }
+    }
+
+    /// The `need` bytes at `pos`, refilling from `source` when this window does
+    /// not already hold them.
+    ///
+    /// Never reads past `limit`, the end of the collection being walked, so a
+    /// window stays inside the structure it is a view of. Callers check that the
+    /// `need` bytes are inside the collection before asking; `need` is taken as a
+    /// floor on the refill anyway, so a caller that did not would read short
+    /// rather than index out of bounds.
+    fn get<'a, S: Source + ?Sized>(
+        &'a mut self,
+        source: &S,
+        pos: u64,
+        need: usize,
+        limit: u64,
+    ) -> Result<&'a [u8], FormatError> {
+        let held = pos
+            .checked_sub(self.start)
+            .and_then(|d| usize::try_from(d).ok())
+            .filter(|at| {
+                at.checked_add(need)
+                    .is_some_and(|end| end <= self.bytes.len())
+            });
+
+        let at = match held {
+            Some(at) => at,
+            None => {
+                // Clamped to one window before the narrowing, so the conversion
+                // cannot lose anything on a 32-bit target and the fallback is
+                // unreachable — it is spelled out rather than asserted because
+                // the clamp above is what makes it so.
+                let span = limit
+                    .saturating_sub(pos)
+                    .min(DIRECTORY_WINDOW as u64)
+                    .to_usize()
+                    .unwrap_or(DIRECTORY_WINDOW)
+                    .max(need);
+                self.bytes = source.read_metadata_at(pos, span)?;
+                self.start = pos;
+                0
+            }
+        };
+
+        Ok(&self.bytes[at..at + need])
+    }
+}
+
 impl GlobalHeapIndex {
     /// Parse collection metadata from a random-access source without copying
     /// object payloads.
@@ -135,12 +214,13 @@ impl GlobalHeapIndex {
                     length: header_size as u64,
                 })?;
         let mut objects = Vec::new();
+        let mut window = DirectoryWindow::new();
 
         while pos
             .checked_add(2)
             .is_some_and(|index_end| index_end <= collection_end)
         {
-            let index_bytes = source.read_metadata_at(pos, 2)?;
+            let index_bytes = window.get(source, pos, 2, collection_end)?;
             let object_index = u16::from_le_bytes([index_bytes[0], index_bytes[1]]);
             if object_index == 0 {
                 break;
@@ -158,8 +238,8 @@ impl GlobalHeapIndex {
                     available: collection_end.to_usize().unwrap_or(usize::MAX),
                 });
             }
-            let object_header = source.read_metadata_at(pos, object_header_size)?;
-            let object_size = read_length(&object_header, 8, length_size)?;
+            let object_header = window.get(source, pos, object_header_size, collection_end)?;
+            let object_size = read_length(object_header, 8, length_size)?;
             let data_address = object_header_end;
             let data_end =
                 data_address
@@ -331,6 +411,63 @@ mod tests {
         assert_eq!(coll.objects.len(), 2);
         assert!(source.metadata_reads.get() > 0);
         assert_eq!(source.raw_reads.get(), 0);
+    }
+
+    /// The walk reads through a window, so what it costs follows the collection's
+    /// *size* and not its object count — the thing that made resolving a 256-row
+    /// window of a 32,768-object collection cost 65,536 reads (issue #228).
+    ///
+    /// Stated as a bound on reads rather than on time: every one of them is an
+    /// allocation, and on a source with a metadata cache it is also a lookup, an
+    /// insert and an eviction, none of which a timing test would name.
+    #[test]
+    fn the_directory_walk_reads_by_collection_size_not_by_object_count() {
+        use core::cell::Cell;
+
+        struct CountingSource {
+            data: Vec<u8>,
+            reads: Cell<usize>,
+        }
+
+        impl Source for CountingSource {
+            fn len(&self) -> u64 {
+                self.data.len() as u64
+            }
+
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
+                BytesSource::new(&self.data).read_at(offset, buf)
+            }
+
+            fn read_metadata_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
+                self.reads.set(self.reads.get() + 1);
+                BytesSource::new(&self.data).read_exact_at(offset, len)
+            }
+        }
+
+        // 512 objects of 8 bytes each: 512 * (16 + 8) = 12,288 bytes of
+        // directory, three windows' worth.
+        const OBJECTS: u16 = 512;
+        let payload = [0u8; 8];
+        let objects: Vec<(u16, u16, &[u8])> = (1..=OBJECTS).map(|i| (i, 1, &payload[..])).collect();
+        let source = CountingSource {
+            data: build_collection(&objects, 8),
+            reads: Cell::new(0),
+        };
+
+        let coll = GlobalHeapIndex::parse(&source, 0, 8).unwrap();
+        assert_eq!(coll.objects.len(), OBJECTS as usize);
+
+        // The collection's directory spans four windows at most, plus the
+        // collection header's own read. A walk that reads per object takes 512 of
+        // them or twice that; the point of the bound is the gap between the two,
+        // not its exact value.
+        let reads = source.reads.get();
+        assert!(
+            reads <= 8,
+            "walking {OBJECTS} objects took {reads} reads, which scales with the \
+             object count rather than the {} bytes of collection it covers",
+            source.data.len()
+        );
     }
 
     #[test]

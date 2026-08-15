@@ -1,71 +1,29 @@
-//! Peak-allocation regression tests for the windowed row-read API: a small row
-//! window of a large dataset must allocate on the order of the window (plus a
-//! few decompressed chunks or heap-collection directories), not the dataset. A
-//! whole-read fallback peaks above the full dataset size and fails the
-//! assertion.
+//! What the read paths are allowed to allocate, as rules rather than as numbers
+//! (issue #228).
 //!
-//! The counting allocator applies to this whole test binary, so every test
-//! serializes on [`LOCK`] and resets the peak inside the critical section — a
-//! test measuring outside the lock would attribute other tests' allocations to
-//! itself.
-
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+//! Every bound here is a statement about how the work *scales* — a windowed read
+//! allocates on the order of its window, a chunked read allocates a fixed number
+//! of blocks per chunk — so it holds on every platform and survives a toolchain
+//! that changes a `Vec`'s growth by one step. The exact figures are pinned
+//! separately, on one platform, in `tests/allocation_baseline.rs`.
+//!
+//! Measurement is per region and per thread (`tests/common/allocation.rs`), so
+//! these tests share a process without serializing against each other: what a
+//! region records is what the calling thread allocated inside it, and nothing
+//! else.
 
 use hdf5_pure::{File, FileBuilder};
 
-/// Bytes currently allocated and the high-water mark, maintained by the
-/// counting allocator below. Relaxed ordering is fine: the measured section is
-/// single-threaded (under [`LOCK`]), and the assertion bounds have a 4x margin
-/// — exactness is not required, only the order of magnitude.
-static LIVE: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
-
-/// Serializes the tests in this binary so [`PEAK`] measures one at a time.
-static LOCK: Mutex<()> = Mutex::new(());
-
-struct CountingAlloc;
-
-unsafe impl GlobalAlloc for CountingAlloc {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() {
-            let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
-            PEAK.fetch_max(live, Ordering::Relaxed);
-        }
-        ptr
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) };
-        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
-        if !new_ptr.is_null() {
-            if new_size >= layout.size() {
-                let grow = new_size - layout.size();
-                let live = LIVE.fetch_add(grow, Ordering::Relaxed) + grow;
-                PEAK.fetch_max(live, Ordering::Relaxed);
-            } else {
-                LIVE.fetch_sub(layout.size() - new_size, Ordering::Relaxed);
-            }
-        }
-        new_ptr
-    }
-}
-
 #[global_allocator]
-static ALLOC: CountingAlloc = CountingAlloc;
+static ALLOC: heapscope::Alloc = heapscope::Alloc::system();
+
+#[path = "common/allocation.rs"]
+mod allocation;
+
+use allocation::measure;
 
 #[test]
-fn inner_chunked_window_read_is_memory_bounded() {
-    let _guard = LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-
+fn windowed_row_read_allocates_on_the_order_of_the_window() {
     // 4 MiB of f64 rows with inner-split storage chunks: [2048, 32, 8] in
     // [64, 16, 4] chunks — a 2x2 inner chunk grid per 64-row band, deflated so
     // chunks really decode (32 KiB decompressed each).
@@ -91,23 +49,17 @@ fn inner_chunked_window_read_is_memory_bounded() {
     let file = File::open_streaming(&path).unwrap();
     let ds = file.dataset("t").unwrap();
 
-    // Measure only the windowed read: a 64-row window straddling a chunk-band
-    // boundary mid-file, so it decodes chunks from two leading bands.
-    let base = LIVE.load(Ordering::Relaxed);
-    PEAK.store(base, Ordering::Relaxed);
-
-    let window = ds.read_f64_rows(992, 64).unwrap();
-
-    let peak = PEAK.load(Ordering::Relaxed) - base;
-    eprintln!("peak allocation during the windowed read: {peak} bytes (dataset: {DATASET_BYTES})");
+    // A 64-row window straddling a chunk-band boundary mid-file, so it decodes
+    // chunks from two leading bands.
+    let (window, measured) = measure("windowed_row_read", || ds.read_f64_rows(992, 64).unwrap());
 
     // Window + raw/typed conversion + a few decompressed 32 KiB chunks lands
     // well under 1 MiB; a whole-read fallback peaks above the full dataset
     // (the assembled whole read plus cached chunks and the sliced window).
     assert!(
-        peak < DATASET_BYTES / 4,
+        measured.peak_bytes < (DATASET_BYTES / 4) as u64,
         "peak allocation during the windowed read must be bounded by the window, \
-         not the {DATASET_BYTES}-byte dataset; measured {peak} bytes"
+         not the {DATASET_BYTES}-byte dataset; measured {measured}"
     );
 
     // The window must still be the right bytes.
@@ -118,11 +70,7 @@ fn inner_chunked_window_read_is_memory_bounded() {
 }
 
 #[test]
-fn vlen_string_window_read_is_memory_bounded() {
-    let _guard = LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-
+fn windowed_vlen_string_read_allocates_on_the_order_of_the_window() {
     // ~4 MiB of variable-length string payload: 32k rows of 128-byte strings,
     // plus ~512 KiB of heap references in the dataset itself. The writer packs
     // the strings into one giant heap collection — the degenerate case for a
@@ -146,18 +94,11 @@ fn vlen_string_window_read_is_memory_bounded() {
     let file = File::open_streaming(&path).unwrap();
     let ds = file.dataset("labels").unwrap();
 
-    // Measure only the windowed read: 256 mid-file rows — ~32 KiB of text plus
-    // ~4 KiB of references, resolved against a window-filtered slice of the
-    // collection's directory.
-    let base = LIVE.load(Ordering::Relaxed);
-    PEAK.store(base, Ordering::Relaxed);
-
-    let window = ds.read_string_rows(15_000, 256).unwrap();
-
-    let peak = PEAK.load(Ordering::Relaxed) - base;
-    eprintln!(
-        "peak allocation during the windowed vlen read: {peak} bytes (payload: {PAYLOAD_BYTES})"
-    );
+    // 256 mid-file rows — ~32 KiB of text plus ~4 KiB of references, resolved
+    // against a window-filtered slice of the collection's directory.
+    let (window, measured) = measure("windowed_vlen_read", || {
+        ds.read_string_rows(15_000, 256).unwrap()
+    });
 
     // Window references + text + touched heap-collection directories land far
     // under 1 MiB; resolving every reference first peaks above the full payload
@@ -165,9 +106,24 @@ fn vlen_string_window_read_is_memory_bounded() {
     // collection parse that starts buffering whole collections instead of
     // walking their metadata.
     assert!(
-        peak < PAYLOAD_BYTES / 4,
+        measured.peak_bytes < (PAYLOAD_BYTES / 4) as u64,
         "peak allocation during the windowed vlen read must be bounded by the window, \
-         not the {PAYLOAD_BYTES}-byte payload; measured {peak} bytes"
+         not the {PAYLOAD_BYTES}-byte payload; measured {measured}"
+    );
+
+    // The other half of the same story, which the peak cannot see. A global heap
+    // collection chains each object's position in the previous object's header,
+    // so reaching the window's objects means passing every object before them —
+    // the traversal is the format's, not this crate's, and no bound here can
+    // remove it. What it must not cost is an *allocation* apiece: reading this
+    // window once took 65,536 of them, two per object of a collection it kept 256
+    // entries from (issue #228). One per eight objects is far above what a
+    // windowed walk needs and far below what a per-object one takes, which is the
+    // gap this bound is placed in.
+    assert!(
+        measured.blocks < (N0 / 8) as u64,
+        "a windowed vlen read must not allocate per object of the collection it \
+         walks: measured {measured} over a {N0}-object collection"
     );
 
     // The window must still be the right strings.
@@ -188,16 +144,18 @@ fn vlen_string_window_read_is_memory_bounded() {
 /// The read here is [`Dataset::read_raw`] rather than a typed one on purpose:
 /// a typed read allocates its own copy of the dataset, and a term that large
 /// hides the one being measured.
+///
+/// The three bounds are one story told three ways — peak, bytes, blocks — and
+/// each catches a defect the others do not: a second buffer of dataset size, a
+/// throwaway copy of every chunk, and a per-chunk `Vec` in the scatter loop.
 #[test]
-fn whole_read_of_an_all_adjacent_chunk_layout_is_memory_bounded() {
-    let _guard = LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-
+fn whole_read_of_adjacent_chunks_costs_a_constant_per_chunk() {
     // 8 MiB of f64 in 4 KiB chunks: 2,048 of them, unfiltered so a chunk's
     // stored bytes are its data and a span holds no less than the file does.
     const N0: usize = 1024 * 1024;
     const DATASET_BYTES: usize = N0 * 8;
+    const CHUNK_ELEMS: usize = 512;
+    const CHUNKS: u64 = (N0 / CHUNK_ELEMS) as u64;
 
     let data: Vec<f64> = (0..N0).map(|i| i as f64).collect();
     let dir = tempfile::tempdir().unwrap();
@@ -207,27 +165,44 @@ fn whole_read_of_an_all_adjacent_chunk_layout_is_memory_bounded() {
         .create_dataset("t")
         .with_f64_data(&data)
         .with_shape(&[N0 as u64])
-        .with_chunks(&[512]);
+        .with_chunks(&[CHUNK_ELEMS as u64]);
     builder.write(&path).unwrap();
     drop(data);
 
     let file = File::open_streaming(&path).unwrap();
     let ds = file.dataset("t").unwrap();
 
-    let base = LIVE.load(Ordering::Relaxed);
-    PEAK.store(base, Ordering::Relaxed);
-
-    let all = ds.read_raw().unwrap();
-
-    let peak = PEAK.load(Ordering::Relaxed) - base;
-    eprintln!("peak allocation during the whole read: {peak} bytes (dataset: {DATASET_BYTES})");
+    let (all, measured) = measure("whole_read", || ds.read_raw().unwrap());
 
     // The read's own output is the dataset, and the parsed chunk index is most
     // of what is left; an unbudgeted span would add the dataset again.
     assert!(
-        peak < DATASET_BYTES + DATASET_BYTES / 2,
+        measured.peak_bytes < (DATASET_BYTES + DATASET_BYTES / 2) as u64,
         "peak allocation during the whole read must not grow with the run of \
-         adjacent chunks; measured {peak} bytes against a {DATASET_BYTES}-byte dataset"
+         adjacent chunks; measured {measured} against a {DATASET_BYTES}-byte dataset"
+    );
+
+    // Bytes *ever* allocated, which the peak cannot see: a copy of each chunk
+    // that is made and dropped costs the dataset over again without moving the
+    // high-water mark at all. The read's own output is one dataset; the chunk
+    // cache is entitled to its configured budget on top, and nothing else here
+    // scales with the data.
+    assert!(
+        measured.bytes < (DATASET_BYTES + DATASET_BYTES / 4) as u64,
+        "a whole read must allocate the dataset about once — its output — not a \
+         second time in throwaway per-chunk copies; measured {measured} against a \
+         {DATASET_BYTES}-byte dataset"
+    );
+
+    // Per-chunk *count*, which neither byte figure can see: a `Vec` of the
+    // chunk's coordinates costs 32 bytes and is invisible next to 8 MiB, but it
+    // is an allocator round trip per chunk of every dataset this crate reads.
+    const BLOCKS_PER_CHUNK: u64 = 3;
+    assert!(
+        measured.blocks <= BLOCKS_PER_CHUNK * CHUNKS + 256,
+        "a whole read must cost a small constant number of allocations per chunk, \
+         not a growing one: measured {measured} over {CHUNKS} chunks, above the \
+         {BLOCKS_PER_CHUNK} per chunk this bound allows"
     );
 
     assert_eq!(all.len(), DATASET_BYTES);

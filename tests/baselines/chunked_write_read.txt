@@ -1,0 +1,9 @@
+heapscope-baseline 1
+# Written by heapscope 0.1.0. Rewrite with HEAPSCOPE_UPDATE_BASELINE=1.
+mode heap
+currBytes 177
+currBlocks 2
+maxBytes 33729702
+maxBlocks 2078
+totalBytes 51797790
+totalBlocks 14564

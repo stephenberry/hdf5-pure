@@ -1,6 +1,7 @@
 /target
 .DS_Store
 matlab_fixtures/
+libver_fixtures/
 .claude/
 # Fixture-regen venv (developer tool; committed fixtures are self-contained)
 tests/fixtures/zfp/.venv/
@@ -9,6 +10,10 @@ tests/fixtures/lzf/.venv/
 /tmp/
 # Throwaway scratch probe tests (zz_ prefix), never committed
 tests/zz_*
+
+# A failing heapscope budget writes a profile beside the test binary's cwd, so
+# the failure can be read rather than only counted (tests/allocation_bounds.rs).
+heapscope-assert-*.json
 
 # Stray build artifacts
 *.rlib

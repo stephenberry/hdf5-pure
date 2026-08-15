@@ -164,7 +164,27 @@ struct CachedChunk {
     data: Vec<u8>,
     /// Monotonically increasing access counter for LRU ordering.
     last_access: u64,
+    /// The read pass that stored it, so that pass cannot evict it again.
+    stored_by: u64,
 }
+
+/// One read's pass over a set of chunks, as far as cache admission is concerned.
+///
+/// Every read path in this crate visits each of its chunks exactly once. Within
+/// one such pass, evicting a chunk to make room for another is work with no
+/// upside: the evicted chunk has already been placed and will not be asked for
+/// again, and neither will the one that displaced it. A whole read of a dataset
+/// larger than the cache did exactly that — 2,048 chunks copied into 16 slots,
+/// 2,032 of them evicted by the same read that stored them, which is a copy and
+/// an allocator round trip per chunk to retain nothing (issue #228).
+///
+/// So a pass fills the cache and then stops offering. What it leaves behind is
+/// the *first* chunks of the read rather than the last, which is also the better
+/// half to keep: a caller who reads a dataset again starts at the beginning.
+/// Across passes nothing changes — a later read still evicts what an earlier one
+/// left, so the cache goes on tracking the most recent access pattern.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CachePass(u64);
 
 // ---------------------------------------------------------------------------
 // ChunkCache
@@ -208,6 +228,9 @@ struct CacheInner {
     /// Monotonic counter for LRU ordering.
     tick: u64,
 
+    /// Monotonic counter handing out [`CachePass`] identities.
+    pass: u64,
+
     /// Whether the parsed chunk index should be retained between reads.
     cache_index: bool,
 }
@@ -237,6 +260,7 @@ impl ChunkCache {
                 max_bytes: config.max_bytes,
                 max_slots: config.max_slots,
                 tick: 0,
+                pass: 0,
                 cache_index: config.cache_index,
             }),
         }
@@ -311,24 +335,28 @@ impl ChunkCache {
         None
     }
 
-    /// Whether a decompressed chunk of `data_len` bytes would be admitted to the
-    /// cache (cache enabled and the chunk within the per-chunk byte budget). Used
-    /// to skip copying a chunk into an owned buffer when it would be rejected.
-    fn accepts_decompressed_len(&self, data_len: usize) -> bool {
-        let inner = self.inner.lock().unwrap();
-        inner.max_bytes != 0 && inner.max_slots != 0 && data_len <= inner.max_bytes
+    /// Opens a read pass. See [`CachePass`] for what one is and why it exists.
+    pub fn begin_pass(&self) -> CachePass {
+        let mut inner = self.inner.lock().unwrap();
+        inner.pass += 1;
+        CachePass(inner.pass)
     }
 
-    /// Insert decompressed chunk data into the LRU cache, taking ownership of the
-    /// buffer (no copy). A chunk too large for the budget, or a disabled cache,
-    /// drops the buffer instead of storing it.
-    pub fn put_decompressed(&self, coord: ChunkCoord, data: Vec<u8>) {
-        let mut inner = self.inner.lock().unwrap();
-        let data_len = data.len();
-
+    /// Makes room for a `data_len`-byte chunk at `coord`, reporting whether the
+    /// caller should go on to store it.
+    ///
+    /// The single place the admission policy lives, so the owned and borrowed
+    /// entry points below cannot drift — and so the borrowed one learns it has
+    /// nowhere to put the chunk *before* copying it rather than after.
+    ///
+    /// **On `true` the caller must push a slot**: the byte total has already been
+    /// charged for it, and a caller that returned instead would leave the cache
+    /// believing it holds bytes nothing occupies. On `false` nothing was changed
+    /// beyond the LRU tick.
+    fn reserve(inner: &mut CacheInner, pass: CachePass, coord: &[u64], data_len: usize) -> bool {
         // Don't cache if disabled or if a single chunk exceeds the budget.
         if inner.max_bytes == 0 || inner.max_slots == 0 || data_len > inner.max_bytes {
-            return;
+            return false;
         }
 
         // Check if already present
@@ -337,31 +365,54 @@ impl ChunkCache {
         for slot in inner.slots.iter_mut() {
             if slot.coord == coord {
                 slot.last_access = tick;
-                return; // already cached
+                return false; // already cached
             }
         }
 
-        // Evict until we have room
+        // Evict until there is room, never taking back a chunk this same pass
+        // stored: that trades a chunk nobody will ask for again for another one
+        // nobody will ask for again. When only such chunks are left, the cache is
+        // full as far as this pass is concerned and the chunk is not stored.
         while inner.slots.len() >= inner.max_slots
             || (inner.current_bytes + data_len > inner.max_bytes && !inner.slots.is_empty())
         {
-            // Find LRU slot
+            // The LRU slot among those an earlier pass stored.
             let lru_idx = inner
                 .slots
                 .iter()
                 .enumerate()
+                .filter(|(_, s)| s.stored_by != pass.0)
                 .min_by_key(|(_, s)| s.last_access)
-                .map(|(i, _)| i)
-                .unwrap();
+                .map(|(i, _)| i);
+            let Some(lru_idx) = lru_idx else {
+                return false;
+            };
             let removed = inner.slots.swap_remove(lru_idx);
             inner.current_bytes -= removed.data.len();
         }
 
         inner.current_bytes += data_len;
+        true
+    }
+
+    /// Insert decompressed chunk data into the LRU cache, taking ownership of the
+    /// buffer (no copy). A chunk too large for the budget, a disabled cache, or a
+    /// pass that has already filled the cache drops the buffer instead of storing
+    /// it.
+    ///
+    /// `coord` is borrowed and copied only on the path that stores it, so a
+    /// caller in a loop needs no owned coordinate per chunk.
+    pub fn put_decompressed(&self, pass: CachePass, coord: &[u64], data: Vec<u8>) {
+        let mut inner = self.inner.lock().unwrap();
+        if !Self::reserve(&mut inner, pass, coord, data.len()) {
+            return;
+        }
+        let last_access = inner.tick;
         inner.slots.push(CachedChunk {
-            coord,
+            coord: coord.to_vec(),
             data,
-            last_access: tick,
+            last_access,
+            stored_by: pass.0,
         });
     }
 
@@ -383,15 +434,23 @@ impl ChunkCache {
         inner.slots.iter().map(|s| s.coord.clone()).collect()
     }
 
-    /// Insert a copy of `data` into the LRU cache, but only if it would actually
-    /// be admitted. This lets the unfiltered read path scatter directly from the
-    /// file buffer and copy into the cache only when caching is enabled and the
-    /// chunk fits the budget (avoiding a throwaway copy otherwise).
-    pub fn put_decompressed_slice(&self, coord: ChunkCoord, data: &[u8]) {
-        if !self.accepts_decompressed_len(data.len()) {
+    /// Insert a copy of `data` into the LRU cache, but only if it will actually
+    /// be kept. This lets the unfiltered read path scatter directly from the file
+    /// buffer and copy into the cache only when the chunk is going to stay there
+    /// — no copy at all when caching is off, when the chunk is over the budget,
+    /// or when this pass has already filled the cache.
+    pub fn put_decompressed_slice(&self, pass: CachePass, coord: &[u64], data: &[u8]) {
+        let mut inner = self.inner.lock().unwrap();
+        if !Self::reserve(&mut inner, pass, coord, data.len()) {
             return;
         }
-        self.put_decompressed(coord, data.to_vec());
+        let last_access = inner.tick;
+        inner.slots.push(CachedChunk {
+            coord: coord.to_vec(),
+            data: data.to_vec(),
+            last_access,
+            stored_by: pass.0,
+        });
     }
 
     /// Clear the entire cache (index + decompressed data).
@@ -461,7 +520,7 @@ mod tests {
     #[test]
     fn decompressed_cache_hit() {
         let cache = ChunkCache::new();
-        cache.put_decompressed(vec![0, 0], vec![1, 2, 3, 4]);
+        cache.put_decompressed(cache.begin_pass(), &[0, 0], vec![1, 2, 3, 4]);
         let got = get_decompressed(&cache, &[0, 0]).unwrap();
         assert_eq!(got, vec![1, 2, 3, 4]);
     }
@@ -470,15 +529,15 @@ mod tests {
     fn lru_eviction_by_slots() {
         let cache = ChunkCache::with_capacity(1024 * 1024, 2); // max 2 slots
 
-        cache.put_decompressed(vec![0], vec![1; 10]);
-        cache.put_decompressed(vec![1], vec![2; 10]);
+        cache.put_decompressed(cache.begin_pass(), &[0], vec![1; 10]);
+        cache.put_decompressed(cache.begin_pass(), &[1], vec![2; 10]);
         assert_eq!(cache.stats().cached_chunks(), 2);
 
         // Access slot 0 to make it more recent
         get_decompressed(&cache, &[0]);
 
         // Insert slot 2 — should evict slot 1 (LRU)
-        cache.put_decompressed(vec![2], vec![3; 10]);
+        cache.put_decompressed(cache.begin_pass(), &[2], vec![3; 10]);
         assert_eq!(cache.stats().cached_chunks(), 2);
 
         assert!(get_decompressed(&cache, &[0]).is_some());
@@ -490,12 +549,12 @@ mod tests {
     fn lru_eviction_by_bytes() {
         let cache = ChunkCache::with_capacity(50, 100); // 50 bytes max
 
-        cache.put_decompressed(vec![0], vec![0; 20]);
-        cache.put_decompressed(vec![1], vec![0; 20]);
+        cache.put_decompressed(cache.begin_pass(), &[0], vec![0; 20]);
+        cache.put_decompressed(cache.begin_pass(), &[1], vec![0; 20]);
         assert_eq!(cache.stats().cached_bytes(), 40);
 
         // This needs 20 bytes but only 10 free — evict LRU
-        cache.put_decompressed(vec![2], vec![0; 20]);
+        cache.put_decompressed(cache.begin_pass(), &[2], vec![0; 20]);
         assert!(cache.stats().cached_bytes() <= 50);
         assert!(get_decompressed(&cache, &[0]).is_none()); // evicted (LRU)
     }
@@ -504,24 +563,70 @@ mod tests {
     fn put_decompressed_slice_only_copies_when_admitted() {
         // Disabled cache: the slice is not copied or stored.
         let cache = ChunkCache::with_config(ChunkCacheConfig::disabled());
-        cache.put_decompressed_slice(vec![0], &[1, 2, 3]);
+        cache.put_decompressed_slice(cache.begin_pass(), &[0], &[1, 2, 3]);
         assert_eq!(cache.stats().cached_chunks(), 0);
 
         // Enabled cache within budget: stored.
         let cache = ChunkCache::with_capacity(1024, 16);
-        cache.put_decompressed_slice(vec![0], &[1, 2, 3, 4]);
+        cache.put_decompressed_slice(cache.begin_pass(), &[0], &[1, 2, 3, 4]);
         assert_eq!(get_decompressed(&cache, &[0]).unwrap(), vec![1, 2, 3, 4]);
 
         // Over the per-chunk budget: not stored.
         let cache = ChunkCache::with_capacity(2, 16);
-        cache.put_decompressed_slice(vec![0], &[1, 2, 3, 4]);
+        cache.put_decompressed_slice(cache.begin_pass(), &[0], &[1, 2, 3, 4]);
         assert_eq!(cache.stats().cached_chunks(), 0);
+    }
+
+    /// The rule [`CachePass`] exists for: one pass fills the cache and then
+    /// stops, rather than spending a copy per chunk to evict what it just
+    /// stored. A later pass is free to replace all of it.
+    #[test]
+    fn a_pass_fills_the_cache_and_then_stops_evicting_itself() {
+        let cache = ChunkCache::with_capacity(1024 * 1024, 2);
+
+        // One pass over four chunks, as a read of a four-chunk dataset makes.
+        let pass = cache.begin_pass();
+        for c in 0..4u64 {
+            cache.put_decompressed(pass, &[c], vec![c as u8; 10]);
+        }
+
+        // The two it reached first are the two it kept: chunks 2 and 3 were
+        // never copied, and chunks 0 and 1 were not evicted to make room for
+        // them.
+        assert_eq!(cache.stats().cached_chunks(), 2);
+        assert!(get_decompressed(&cache, &[0]).is_some());
+        assert!(get_decompressed(&cache, &[1]).is_some());
+        assert!(get_decompressed(&cache, &[2]).is_none());
+        assert!(get_decompressed(&cache, &[3]).is_none());
+
+        // A second read is a second pass, and it may take both slots back.
+        let next = cache.begin_pass();
+        cache.put_decompressed(next, &[9], vec![9; 10]);
+        cache.put_decompressed(next, &[8], vec![8; 10]);
+        assert_eq!(cache.stats().cached_chunks(), 2);
+        assert!(get_decompressed(&cache, &[9]).is_some());
+        assert!(get_decompressed(&cache, &[8]).is_some());
+    }
+
+    /// The same rule on the borrowed entry point, where it also decides whether
+    /// the chunk is copied at all.
+    #[test]
+    fn a_full_pass_does_not_copy_the_chunk_it_cannot_store() {
+        let cache = ChunkCache::with_capacity(1024 * 1024, 1);
+        let pass = cache.begin_pass();
+
+        cache.put_decompressed_slice(pass, &[0], &[1; 10]);
+        cache.put_decompressed_slice(pass, &[1], &[2; 10]);
+
+        assert_eq!(cache.stats().cached_chunks(), 1);
+        assert_eq!(cache.stats().cached_bytes(), 10);
+        assert!(get_decompressed(&cache, &[0]).is_some());
     }
 
     #[test]
     fn oversized_chunk_not_cached() {
         let cache = ChunkCache::with_capacity(10, 16);
-        cache.put_decompressed(vec![0], vec![0; 100]); // too big
+        cache.put_decompressed(cache.begin_pass(), &[0], vec![0; 100]); // too big
         assert_eq!(cache.stats().cached_chunks(), 0);
     }
 
@@ -532,7 +637,7 @@ mod tests {
         cache.populate_index(&chunks, 1);
         assert!(!cache.stats().index_loaded());
 
-        cache.put_decompressed(vec![0], vec![1, 2, 3]);
+        cache.put_decompressed(cache.begin_pass(), &[0], vec![1, 2, 3]);
         assert_eq!(cache.stats().cached_chunks(), 0);
         assert_eq!(cache.stats().cached_bytes(), 0);
     }
@@ -550,7 +655,7 @@ mod tests {
         let cache = ChunkCache::new();
         let chunks = vec![make_chunk(vec![0, 0], 0x1000, 80)];
         cache.populate_index(&chunks, 1);
-        cache.put_decompressed(vec![0], vec![1, 2, 3]);
+        cache.put_decompressed(cache.begin_pass(), &[0], vec![1, 2, 3]);
 
         cache.clear();
         assert!(!cache.stats().index_loaded());
@@ -561,8 +666,8 @@ mod tests {
     #[test]
     fn duplicate_insert_is_noop() {
         let cache = ChunkCache::new();
-        cache.put_decompressed(vec![0], vec![1, 2, 3]);
-        cache.put_decompressed(vec![0], vec![1, 2, 3]); // duplicate
+        cache.put_decompressed(cache.begin_pass(), &[0], vec![1, 2, 3]);
+        cache.put_decompressed(cache.begin_pass(), &[0], vec![1, 2, 3]); // duplicate
         assert_eq!(cache.stats().cached_chunks(), 1);
         assert_eq!(cache.stats().cached_bytes(), 3);
     }

@@ -63,6 +63,38 @@ jobs:
       - name: Doctests
         run: cargo test --locked --doc ${{ matrix.config.flags }}
 
+  # Exact allocation figures, checked against the numbers committed under
+  # `tests/baselines/` (issue #228).
+  #
+  # The scaling *rules* (`tests/allocation_bounds.rs`) run in the matrix above on
+  # every platform, because they hold everywhere. An exact count does not: a
+  # `Vec` growth policy, a new `std` release, or a different feature set moves it
+  # without this crate changing. So the figures are recorded for one target and
+  # one feature set and checked there — `macos-latest` because that is the aarch64
+  # host they were measured on, and the default features because the test refuses
+  # to compile under any other set. A failure here names the figures that moved;
+  # re-record with `HEAPSCOPE_UPDATE_BASELINE=1` and commit the diff alongside the
+  # change that caused it. `tests/allocation_baseline.rs` says all of this too.
+  #
+  # nextest is what runs it rather than `cargo test` because it exits non-zero on
+  # "0 tests run", which is the way this job would otherwise go hollow: the test
+  # is behind `heap-baseline`, and a feature name that stopped matching would
+  # leave an empty binary passing silently.
+  heap-baseline:
+    name: Allocation baseline (macOS aarch64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: heap-baseline
+      - name: Check the recorded allocation figures
+        run: cargo nextest run --locked --features heap-baseline --test allocation_baseline
+
   # Run every example end-to-end. The examples are self-checking (each ends in
   # `assert!`s and panics on mismatch), so a regression in the public API surfaces
   # here as a failed job. `cargo clippy --all-targets` in the `lint` job already

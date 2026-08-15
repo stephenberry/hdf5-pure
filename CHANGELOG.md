@@ -19,6 +19,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - **Breaking:** `FormatError::ShapeDataMismatch`'s `element_size` field is a `NonZeroUsize`, so the element counts its message reports are well defined by type rather than by convention ([#272](https://github.com/stephenberry/hdf5-pure/pull/272)).
 - `Dataset::append` accepts a filtered append of any length, where it required a whole number of chunks; the dataset's own length must still be chunk-aligned ([#262](https://github.com/stephenberry/hdf5-pure/issues/262)).
 - Writing a chunked dataset, appending to one, and writing a dense attribute heap no longer build a structure twice to measure it, so high chunk counts and large attribute sets cost less to write ([#265](https://github.com/stephenberry/hdf5-pure/issues/265), [#275](https://github.com/stephenberry/hdf5-pure/issues/275)).
+- Reading a chunked dataset whole allocates about half as much: a read no longer copies every chunk into a chunk cache too small to keep them, and no longer allocates a coordinate vector per chunk. A read fills the cache and then stops, so what it leaves behind is the chunks it reached first ([#228](https://github.com/stephenberry/hdf5-pure/issues/228)).
+- Resolving variable-length strings walks a global heap collection through a bounded window rather than a read per object, which for a 256-row window of a 32,768-object collection is 1,672 allocations against 65,536, and 1.7 ms against 48 ms on a streaming file ([#228](https://github.com/stephenberry/hdf5-pure/issues/228)).
 
 ### Fixed
 

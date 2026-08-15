@@ -1,0 +1,24 @@
+# Frame pointers on x86_64, for the allocation gates (issue #228).
+#
+# `tests/allocation_bounds.rs` and `tests/allocation_baseline.rs` install
+# heapscope as their `#[global_allocator]`, and it attributes each allocation to
+# a call site by walking the frame-pointer chain. x86_64 omits that chain by
+# default, and the profiler refuses to start rather than record a profile of
+# zeros, so those binaries would fail on every x86_64 host — which is every Linux
+# runner in CI. aarch64 (Apple and Linux) keeps frame pointers by default and
+# Windows carries its own unwind tables, so only these two targets need saying.
+#
+# The cost is one register on x86_64 and nothing anywhere else. It lives here
+# rather than in a CI step so that a contributor on an x86_64 host runs the same
+# suite CI does. An environment that exports RUSTFLAGS replaces this file's flags
+# wholesale rather than adding to them; the two test binaries then fail at
+# startup with a message naming this file, which is the intended failure — a
+# heap gate that cannot measure must not pass.
+#
+# The `cross` targets (i686, s390x) and the wasm/no_std checks are other triples
+# and are untouched.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "force-frame-pointers=yes"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "force-frame-pointers=yes"]
