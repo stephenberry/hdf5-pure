@@ -4,7 +4,7 @@
 //! unfiltered, chunk-aligned and not, across one or many calls and sessions —
 //! read back with this crate. C-library interop lives in
 //! `append_writer_crosscheck.rs`.
-use hdf5_pure::{Error, File, FileBuilder, ScaleOffset};
+use hdf5_pure::{Error, File, FileAccessProperties, FileBuilder, ScaleOffset, SyncPolicy};
 use tempfile::tempdir;
 
 /// Create a rank-1, unlimited i32 dataset with the given chunk length and
@@ -46,7 +46,16 @@ fn read_i32(path: &std::path::Path) -> Vec<i32> {
 /// before the closure returns to the caller (so a subsequent read can reopen the
 /// file — the lock is mandatory on Windows).
 fn with_writer<T>(path: &std::path::Path, f: impl FnOnce(&File) -> T) -> T {
-    let file = File::open_rw(path).unwrap();
+    // `SyncPolicy::OnClose`: every test here asserts what the file contains, not
+    // when it reached the platter, and the default costs one `fsync` per append
+    // — the dominant cost of the session loops below. The policies write
+    // byte-identical files (`tests/sync_policy.rs` asserts that directly), and
+    // dropping the handle still issues the closing barrier.
+    let file = File::open_rw_with_options(
+        path,
+        FileAccessProperties::new().with_sync_policy(SyncPolicy::OnClose),
+    )
+    .unwrap();
     let out = f(&file);
     drop(file);
     out

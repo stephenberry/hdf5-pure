@@ -13,7 +13,7 @@
 
 use hdf5::Extent;
 use hdf5::file::LibraryVersion;
-use hdf5_pure::{File, FileBuilder};
+use hdf5_pure::{File, FileAccessProperties, FileBuilder, SyncPolicy};
 use tempfile::tempdir;
 
 fn incompressible(seed: u32, n: usize) -> Vec<i32> {
@@ -79,8 +79,19 @@ fn writer_append(path: &std::path::Path, values: &[i32]) {
 }
 
 /// Append `values` one element per call in a single session.
+///
+/// `SyncPolicy::OnClose` because these tests assert what the file *contains*,
+/// not when it reached the platter, and the default `Always` costs one `fsync`
+/// per call — the dominant cost of a several-thousand-append loop, and nothing
+/// this test measures. The two policies write byte-identical files, which
+/// `tests/sync_policy.rs` asserts directly; `close` still issues the closing
+/// barrier, so the C library reads a fully published file either way.
 fn writer_append_each(path: &std::path::Path, values: &[i32]) {
-    let file = File::open_rw(path).unwrap();
+    let file = File::open_rw_with_options(
+        path,
+        FileAccessProperties::new().with_sync_policy(SyncPolicy::OnClose),
+    )
+    .unwrap();
     let mut ds = file.dataset("d").unwrap();
     for &v in values {
         ds.append(&[v]).unwrap();

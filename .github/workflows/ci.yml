@@ -43,10 +43,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.os }}-${{ matrix.config.name }}
-      - run: cargo test --locked ${{ matrix.config.flags }}
+      # nextest schedules every test across all ~110 integration binaries in one
+      # pool; `cargo test` runs the binaries one at a time and leaves most of the
+      # machine idle. Measured at `--all-features` on a 10-core host: 46.1s
+      # against 17.9s (issue #269). `.config/nextest.toml` also fails the run on
+      # a test that takes longer than 90s, which is the regression that issue
+      # was opened over.
+      - name: Test (nextest)
+        run: cargo nextest run --locked ${{ matrix.config.flags }}
+      # nextest cannot run doctests -- `rustdoc` compiles those, not the test
+      # harness -- so they need their own step. Without it this job would go on
+      # passing while 32 doctests (46 under `full`) stopped running.
+      - name: Doctests
+        run: cargo test --locked --doc ${{ matrix.config.flags }}
 
   # Run every example end-to-end. The examples are self-checking (each ends in
   # `assert!`s and panics on mismatch), so a regression in the public API surfaces

@@ -4,7 +4,7 @@
 
 use hdf5_pure::{
     AttrValue, Error, File, FileAccessProperties, FileBuilder, FileSpaceStrategy, MemoryStrategy,
-    MetadataCacheConfig,
+    MetadataCacheConfig, SyncPolicy,
 };
 use tempfile::tempdir;
 
@@ -14,10 +14,17 @@ use tempfile::tempdir;
 /// tests are *about* the bounded engine: asking for it explicitly means a file
 /// that stops being bounded-editable fails here instead of quietly retargeting
 /// the whole file at the mirror.
+///
+/// `SyncPolicy::OnClose` for the same reason the memory strategy is explicit:
+/// what these tests assert is content and batching behaviour, not durability,
+/// and the default `Always` costs one `fsync` per append. The policies write
+/// byte-identical files (`tests/sync_policy.rs`), and close still barriers.
 fn open_bounded(path: &std::path::Path) -> Result<File, Error> {
     File::open_rw_with_options(
         path,
-        FileAccessProperties::new().with_memory_strategy(MemoryStrategy::Bounded),
+        FileAccessProperties::new()
+            .with_memory_strategy(MemoryStrategy::Bounded)
+            .with_sync_policy(SyncPolicy::OnClose),
     )
 }
 
