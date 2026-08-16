@@ -3,7 +3,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-use crate::bytes::{is_undefined_at, read_offset};
+use crate::bytes::{read_offset, read_optional_offset};
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
 use crate::source::Source;
@@ -77,17 +77,9 @@ impl BTreeV1Node {
         let entries_used = u16::from_le_bytes([file_data[offset + 6], file_data[offset + 7]]);
 
         let mut pos = offset + BTREE_V1_NODE_PREFIX_LEN;
-        let left_sibling = if is_undefined_at(file_data, pos, offset_size) {
-            None
-        } else {
-            Some(read_offset(file_data, pos, offset_size)?)
-        };
+        let left_sibling = read_optional_offset(file_data, pos, offset_size)?;
         pos += os;
-        let right_sibling = if is_undefined_at(file_data, pos, offset_size) {
-            None
-        } else {
-            Some(read_offset(file_data, pos, offset_size)?)
-        };
+        let right_sibling = read_optional_offset(file_data, pos, offset_size)?;
         pos += os;
 
         // For type 0: keys are offset_size bytes, children are offset_size bytes

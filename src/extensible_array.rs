@@ -9,7 +9,7 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec, vec::Vec};
 
-use crate::bytes::{is_undefined_at, read_length, read_offset};
+use crate::bytes::{read_length, read_offset, read_optional_offset};
 use crate::chunked_read::ChunkInfo;
 use crate::convert::{TryToUsize, is_undefined_addr, u32_from};
 use crate::error::FormatError;
@@ -254,10 +254,9 @@ fn read_element(
                 available: data.len(),
             });
         }
-        if is_undefined_at(data, pos, offset_size) {
+        let Some(address) = read_optional_offset(data, pos, offset_size)? else {
             return Ok((None, os));
-        }
-        let address = read_offset(data, pos, offset_size)?;
+        };
         let offsets = index_to_chunk_offsets(linear_index, num_chunks_per_dim, chunk_dimensions);
         Ok((
             Some(ChunkInfo {
@@ -284,10 +283,9 @@ fn read_element(
                 available: data.len(),
             });
         }
-        if is_undefined_at(data, pos, offset_size) {
+        let Some(address) = read_optional_offset(data, pos, offset_size)? else {
             return Ok((None, elem_total));
-        }
-        let address = read_offset(data, pos, offset_size)?;
+        };
         let chunk_size = read_variable_length(&data[pos + os..], chunk_size_bytes)?;
         let fm_off = pos + os + chunk_size_bytes;
         let filter_mask = u32::from_le_bytes([
