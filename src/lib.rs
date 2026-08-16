@@ -141,6 +141,7 @@ pub(crate) mod attribute_info;
 pub(crate) mod btree_v1;
 pub(crate) mod btree_v2;
 pub(crate) mod btree_v2_write;
+pub(crate) mod bytes;
 pub(crate) mod checksum;
 pub(crate) mod chunk_cache;
 pub(crate) mod chunk_span;

@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 
 use byteorder::{ByteOrder, LittleEndian};
 
+use crate::bytes::{ensure_len, read_offset};
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
 use crate::signature::HDF5_SIGNATURE;
@@ -49,24 +50,6 @@ pub struct Superblock {
     pub checksum: Option<u32>,
 }
 
-/// Read an unsigned integer of `size` bytes (LE) from `data` at `pos`.
-fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
-    let s = size as usize;
-    if s > data.len() || pos > data.len() - s {
-        return Err(FormatError::UnexpectedEof {
-            expected: pos.saturating_add(s),
-            available: data.len(),
-        });
-    }
-    let slice = &data[pos..pos + s];
-    Ok(match size {
-        2 => LittleEndian::read_u16(slice) as u64,
-        4 => LittleEndian::read_u32(slice) as u64,
-        8 => LittleEndian::read_u64(slice),
-        _ => unreachable!(), // validated before calling
-    })
-}
-
 fn validate_sizes(offset_size: u8, length_size: u8) -> Result<(), FormatError> {
     if !matches!(offset_size, 2 | 4 | 8) {
         return Err(FormatError::InvalidOffsetSize(offset_size));
@@ -75,17 +58,6 @@ fn validate_sizes(offset_size: u8, length_size: u8) -> Result<(), FormatError> {
         return Err(FormatError::InvalidLengthSize(length_size));
     }
     Ok(())
-}
-
-fn ensure_len(data: &[u8], needed: usize) -> Result<(), FormatError> {
-    if data.len() < needed {
-        Err(FormatError::UnexpectedEof {
-            expected: needed,
-            available: data.len(),
-        })
-    } else {
-        Ok(())
-    }
 }
 
 impl Superblock {
@@ -155,7 +127,7 @@ impl Superblock {
     /// The signature must be present at the given offset.
     pub fn parse(data: &[u8], signature_offset: usize) -> Result<Superblock, FormatError> {
         let d = &data[signature_offset..];
-        ensure_len(d, 9)?; // signature(8) + version(1)
+        ensure_len(d, 0, 9)?; // signature(8) + version(1)
 
         // Verify signature
         if d[..8] != HDF5_SIGNATURE {
@@ -176,7 +148,7 @@ impl Superblock {
         // + shared_hdr_ver(1) + offset_size(1) + length_size(1) + reserved(1)
         // + group_leaf_k(2) + group_internal_k(2) + consistency_flags(4)
         // = 24 bytes before variable-sized fields
-        ensure_len(d, 24)?;
+        ensure_len(d, 0, 24)?;
 
         let offset_size = d[13];
         let length_size = d[14];
@@ -191,7 +163,7 @@ impl Superblock {
         let var_start = 24;
         let sym_entry_size = os + os + 4 + 4 + 16; // link_name_off, obj_hdr_addr, cache_type, reserved, scratch
         let total = var_start + 4 * os + sym_entry_size;
-        ensure_len(d, total)?;
+        ensure_len(d, 0, total)?;
 
         let mut pos = var_start;
         let base_address = read_offset(d, pos, offset_size)?;
@@ -235,7 +207,7 @@ impl Superblock {
         // + shared_hdr_ver(1) + offset_size(1) + length_size(1) + reserved(1)
         // + group_leaf_k(2) + group_internal_k(2) + consistency_flags(4)
         // + indexed_storage_k(2) + reserved(2) = 28
-        ensure_len(d, 28)?;
+        ensure_len(d, 0, 28)?;
 
         let offset_size = d[13];
         let length_size = d[14];
@@ -251,7 +223,7 @@ impl Superblock {
         let var_start = 28;
         let sym_entry_size = os + os + 4 + 4 + 16;
         let total = var_start + 4 * os + sym_entry_size;
-        ensure_len(d, total)?;
+        ensure_len(d, 0, total)?;
 
         let mut pos = var_start;
         let base_address = read_offset(d, pos, offset_size)?;
@@ -288,7 +260,7 @@ impl Superblock {
 
     fn parse_v2v3(d: &[u8], version: u8) -> Result<Superblock, FormatError> {
         // sig(8) + version(1) + offset_size(1) + length_size(1) + consistency_flags(1) = 12
-        ensure_len(d, 12)?;
+        ensure_len(d, 0, 12)?;
 
         let offset_size = d[9];
         let length_size = d[10];
@@ -298,7 +270,7 @@ impl Superblock {
         let os = offset_size as usize;
         // 4 addresses + checksum(4)
         let total = 12 + 4 * os + 4;
-        ensure_len(d, total)?;
+        ensure_len(d, 0, total)?;
 
         let mut pos = 12;
         let base_address = read_offset(d, pos, offset_size)?;

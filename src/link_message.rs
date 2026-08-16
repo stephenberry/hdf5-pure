@@ -3,6 +3,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::{string::String, vec::Vec};
 
+use crate::bytes::{ensure_len, read_offset, read_uint_width};
 use crate::convert::TryToUsize;
 use crate::datatype::CharacterSet;
 use crate::error::FormatError;
@@ -32,44 +33,6 @@ pub struct LinkMessage {
     pub creation_order: Option<u64>,
     /// Character set of the link name.
     pub charset: CharacterSet,
-}
-
-fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
-    let s = size as usize;
-    if s > data.len() || pos > data.len() - s {
-        return Err(FormatError::UnexpectedEof {
-            expected: pos.saturating_add(s),
-            available: data.len(),
-        });
-    }
-    Ok(match size {
-        1 => data[pos] as u64,
-        2 => u16::from_le_bytes([data[pos], data[pos + 1]]) as u64,
-        4 => u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as u64,
-        8 => u64::from_le_bytes([
-            data[pos],
-            data[pos + 1],
-            data[pos + 2],
-            data[pos + 3],
-            data[pos + 4],
-            data[pos + 5],
-            data[pos + 6],
-            data[pos + 7],
-        ]),
-        _ => {
-            return Err(FormatError::InvalidOffsetSize(size));
-        }
-    })
-}
-
-fn ensure_len(data: &[u8], pos: usize, needed: usize) -> Result<(), FormatError> {
-    match pos.checked_add(needed) {
-        Some(end) if end <= data.len() => Ok(()),
-        _ => Err(FormatError::UnexpectedEof {
-            expected: pos.saturating_add(needed),
-            available: data.len(),
-        }),
-    }
 }
 
 impl LinkMessage {
@@ -273,7 +236,7 @@ impl LinkMessage {
         };
 
         // Link name length
-        let name_len = read_offset(data, pos, name_size_field_width)?.to_usize()?;
+        let name_len = read_uint_width(data, pos, name_size_field_width)?.to_usize()?;
         pos += name_size_field_width as usize;
 
         // Link name

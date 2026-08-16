@@ -6,6 +6,7 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec, vec::Vec};
 
+use crate::bytes::{is_undefined_at, read_length, read_offset};
 use crate::chunked_read::ChunkInfo;
 use crate::convert::{TryToUsize, is_undefined_addr, u32_from};
 use crate::error::FormatError;
@@ -24,37 +25,6 @@ pub struct FixedArrayHeader {
     pub num_elements: u64,
     /// Address of the data block.
     pub data_block_address: u64,
-}
-
-fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
-    let s = size as usize;
-    if s > data.len() || pos > data.len() - s {
-        return Err(FormatError::UnexpectedEof {
-            expected: pos.saturating_add(s),
-            available: data.len(),
-        });
-    }
-    let slice = &data[pos..pos + s];
-    Ok(match size {
-        2 => u16::from_le_bytes([slice[0], slice[1]]) as u64,
-        4 => u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]) as u64,
-        8 => u64::from_le_bytes([
-            slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
-        ]),
-        _ => return Err(FormatError::InvalidOffsetSize(size)),
-    })
-}
-
-fn read_length(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
-    read_offset(data, pos, size)
-}
-
-fn is_undefined(data: &[u8], pos: usize, size: u8) -> bool {
-    let s = size as usize;
-    if s > data.len() || pos > data.len() - s {
-        return false;
-    }
-    data[pos..pos + s].iter().all(|&b| b == 0xFF)
 }
 
 impl FixedArrayHeader {
@@ -221,7 +191,7 @@ fn parse_fa_element(
             available: block.len(),
         });
     }
-    if is_undefined(block, elem_pos, offset_size) {
+    if is_undefined_at(block, elem_pos, offset_size) {
         return Ok(None);
     }
     let address = read_offset(block, elem_pos, offset_size)?;

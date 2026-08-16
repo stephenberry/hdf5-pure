@@ -7,6 +7,7 @@ use crate::attribute_info::AttributeInfoMessage;
 use crate::btree_v2::{
     BTreeV2Header, collect_btree_v2_records, collect_btree_v2_records_from_source,
 };
+use crate::bytes::ensure_len;
 use crate::convert::TryToUsize;
 use crate::data_read;
 use crate::dataspace::Dataspace;
@@ -50,16 +51,6 @@ pub struct AttributeMessage {
     /// committed datatype object, which is a difference the field itself cannot
     /// show: both forms decode to the same type.
     pub datatype_location: DatatypeLocation,
-}
-
-fn ensure_len(data: &[u8], offset: usize, needed: usize) -> Result<(), FormatError> {
-    match offset.checked_add(needed) {
-        Some(end) if end <= data.len() => Ok(()),
-        _ => Err(FormatError::UnexpectedEof {
-            expected: offset.saturating_add(needed),
-            available: data.len(),
-        }),
-    }
 }
 
 /// Round up to the next multiple of 8.

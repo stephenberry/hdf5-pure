@@ -44,38 +44,30 @@
 //! mmap (map/unmap sub-ranges) or plain `Read + Seek` works there. It is left
 //! out for now rather than adding a dependency speculatively.
 //!
-//! # Migration plan (this is the first increment)
+//! # How the reader uses this (issue #27)
 //!
-//! The reader is not yet ported onto `Source`; that is a staged effort
-//! tracked by issue #27. This module is the foundation the later stages build
-//! on. The intended path, smallest-risk first:
+//! The staged migration this module was built for has landed far enough to
+//! carry a streaming reader: the data readers fetch each chunk through
+//! [`Source::read_at`] rather than slicing a whole-file buffer, and
+//! [`crate::File::open_streaming`] constructs a file backed by a
+//! [`ReadSeekSource`], so opening one no longer implies buffering it.
 //!
-//! 1. **Foundation (this commit).** Land the trait + in-memory and `Read+Seek`
-//!    backends + tests. Nothing in the existing reader changes, so there is no
-//!    risk to the current in-memory path.
-//! 2. **A cursor.** Introduce a small `Cursor<'a>` over a `&'a dyn Source`
-//!    that offers the `read_offset` / `read_length` / "give me bytes at
-//!    `[off, off+len)`" idioms the parsers already use, with the checked
-//!    [`crate::convert`] conversions built in. The ~15 duplicated per-module
-//!    `read_offset` helpers collapse into it.
-//! 3. **Bulk path first.** Port the contiguous and chunked **data** readers
-//!    (`data_read`, `chunked_read`, `parallel_read`) to fetch each chunk via
-//!    [`Source::read_at`] instead of slicing the whole-file buffer. This is
-//!    self-contained (a chunk is already `{address, size}`) and captures most of
-//!    the memory win, since the data payload is what is actually large. The
-//!    zero-copy `&'a [u8]` return of `data_read::read_raw_data_zerocopy` becomes
-//!    an owned `Vec<u8>` / `Cow` here, since a window may be evicted.
-//! 4. **Metadata parsers.** Migrate the remaining ~56 functions that take a
-//!    whole-file `&[u8]` to borrow the cursor, reading each bounded structure
-//!    into a small buffer on demand.
-//! 5. **Entry point.** Add `File::open_streaming` / `File::from_source` that
-//!    construct a [`crate::File`] backed by a [`ReadSeekSource`], plus SWMR
-//!    `refresh` over a live streaming handle (the consistent-snapshot semantics
-//!    need care over a source that is being appended to).
+//! The metadata parsers are the part that is only half done. Each one that a
+//! streaming read reaches has a `*_from_source` twin that reads its bounded
+//! structure into a small buffer on demand, but the whole-file `&[u8]` form
+//! remains beside it for the buffered path — `ObjectHeader::parse` next to
+//! `parse_from_source`, and the same shape in `btree_v1` and `superblock`. The
+//! two are what the duplication survey counted as 47 twins; collapsing them is
+//! separate work from this module.
 //!
-//! Until step 5 lands, opening a file still buffers it; this module is the
-//! building block that makes the staged migration possible without a single
-//! risky rewrite.
+//! One piece of the original plan arrived in a different shape. It called for a
+//! `Cursor<'a>` over a `&'a dyn Source` to absorb the `read_offset` /
+//! `read_length` idioms and collapse the duplicated per-module copies of them.
+//! What those copies had in common turned out to be the *decoding*, not the
+//! fetching: a parser reads its structure into a buffer first, and then every
+//! module was reading little-endian fields out of that buffer the same way. So
+//! the collapse is [`crate::bytes`], which operates on the buffer, and a cursor
+//! over the source itself was not needed to get it.
 
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
