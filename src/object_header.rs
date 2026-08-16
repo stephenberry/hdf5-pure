@@ -535,21 +535,31 @@ impl ObjectHeader {
     /// 187 KiB doing it — on *every* path resolution, since each one parses the
     /// group header afresh (issue #228).
     ///
-    /// It is a reservation, so the count only has to be close: the Nil and
-    /// continuation messages counted here are the ones the parse does not keep,
-    /// and a chunk whose tail is padding rather than a message stops both loops
-    /// at the same place.
+    /// It counts only the messages the parse *keeps*, which matters for more than
+    /// accuracy: a `HeaderMessage` is an order of magnitude wider than the 4-byte
+    /// message prefix a chunk can be filled with, so counting the ones that are
+    /// skipped would let a chunk of nothing but Nil padding — which the parse
+    /// stores none of — reserve about twelve bytes for every byte of a file that
+    /// need not be well formed. A chunk whose tail is padding rather than a
+    /// message stops both loops at the same place.
+    ///
+    /// It is still a reservation, so being off by a few is harmless: what a
+    /// filter drops is not known here, which is why the caller only reserves when
+    /// the filter keeps everything.
     fn count_v2_messages(data: &[u8], start: usize, end: usize, msg_header_size: usize) -> usize {
         let mut pos = start;
         let mut count = 0;
         while pos + msg_header_size <= end {
+            let msg_type = MessageType::from_u16(data[pos] as u16);
             let msg_data_size = LittleEndian::read_u16(&data[pos + 1..pos + 3]) as usize;
             pos += msg_header_size;
             if pos + msg_data_size > end {
                 break;
             }
             pos += msg_data_size;
-            count += 1;
+            if msg_type != MessageType::Nil && msg_type != MessageType::ObjectHeaderContinuation {
+                count += 1;
+            }
         }
         count
     }
@@ -1108,6 +1118,27 @@ mod tests {
         let checksum = crate::checksum::jenkins_lookup3(&buf);
         buf.extend_from_slice(&checksum.to_le_bytes());
         buf
+    }
+
+    /// A chunk of nothing but Nil padding reserves nothing.
+    ///
+    /// The reservation is sized from a walk of the chunk, and a `HeaderMessage`
+    /// is an order of magnitude wider than the 4-byte prefix a chunk can be
+    /// filled with — so counting the messages the parse *skips* would let a file
+    /// of padding make the parser reserve about twelve bytes per byte of it.
+    #[test]
+    fn a_chunk_of_padding_reserves_no_messages() {
+        // 256 empty Nil messages: 1 KiB of chunk, none of it kept.
+        let nils: Vec<(u8, &[u8], u8)> = vec![(0u8, &[][..], 0u8); 256];
+        let data = build_v2_header(0x01, &nils, None);
+        let header = ObjectHeader::parse(&data, 0, 8, 8).unwrap();
+
+        assert!(header.messages.is_empty(), "Nil messages are not kept");
+        assert_eq!(
+            header.messages.capacity(),
+            0,
+            "a chunk the parse keeps nothing from must not reserve for it"
+        );
     }
 
     #[test]

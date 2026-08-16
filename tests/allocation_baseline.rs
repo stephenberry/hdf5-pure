@@ -86,11 +86,11 @@ use hdf5_pure::{File, FileBuilder};
 #[global_allocator]
 static ALLOC: heapscope::Alloc = heapscope::Alloc::system();
 
-/// Write an 8 MiB chunked dataset, read it back whole, then append sixteen
-/// chunks to it: 2,048 chunks through the writer's chunk assembly and the
-/// reader's coalescing span planner, where all but a constant of the allocations
-/// in either path live, and then the in-place append path, whose cost is a
-/// constant per call that no scaling rule can pin.
+/// Write an 8 MiB chunked dataset, read it back whole, and append sixteen chunks
+/// to an unlimited one beside it: 2,048 chunks through the writer's chunk
+/// assembly and the reader's coalescing span planner, where all but a constant
+/// of the allocations in either path live, and then the in-place append path,
+/// whose cost is a constant per call that no scaling rule can pin.
 #[test]
 fn writing_and_reading_a_chunked_dataset_matches_its_recorded_figures() {
     // The fixture's location is built *before* the profiler starts, so nothing
@@ -123,8 +123,17 @@ fn writing_and_reading_a_chunked_dataset_matches_its_recorded_figures() {
         .create_dataset("t")
         .with_f64_data(&data)
         .with_shape(&[N0 as u64])
-        // Unlimited so the appends below are eligible; it costs the write one
-        // maxshape field and changes nothing else about the fixture.
+        .with_chunks(&[CHUNK_ELEMS]);
+    // The appends below need an unlimited dimension, and it must be a *second*
+    // dataset: `with_maxshape(&[u64::MAX])` is what selects an Extensible Array
+    // chunk index over a Fixed Array one (`chunked_write::use_extensible`), so
+    // adding it to "t" would have moved the 2,048-chunk write off the index this
+    // file exists to pin and left the Fixed Array builder with no exact figures
+    // at all.
+    builder
+        .create_dataset("growing")
+        .with_f64_data(&data[..CHUNK_ELEMS as usize])
+        .with_shape(&[CHUNK_ELEMS])
         .with_maxshape(&[u64::MAX])
         .with_chunks(&[CHUNK_ELEMS]);
     builder.write(&path).unwrap();
@@ -148,7 +157,7 @@ fn writing_and_reading_a_chunked_dataset_matches_its_recorded_figures() {
             hdf5_pure::FileAccessProperties::new().with_sync_policy(hdf5_pure::SyncPolicy::OnClose),
         )
         .unwrap();
-        let mut ds = file.dataset("t").unwrap();
+        let mut ds = file.dataset("growing").unwrap();
         let batch: Vec<f64> = (0..CHUNK_ELEMS).map(|i| i as f64).collect();
         for _ in 0..16 {
             ds.append(&batch).unwrap();

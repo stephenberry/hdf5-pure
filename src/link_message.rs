@@ -159,9 +159,9 @@ fn name_matches(raw: &[u8], wanted: &str) -> bool {
 ///
 /// A message this cannot parse answers `true`: this exists to let an object-header
 /// parse drop the links a lookup will not read (see
-/// [`crate::object_header::MessageFilter`]), and a malformed link is one the
-/// parse that follows must still see, so that it reports the same error whether
-/// or not a lookup passed over it first.
+/// [`crate::object_header::MessageFilter`]), and a link whose name cannot even be
+/// read is one the scan that follows must still see, so that it refuses the group
+/// wherever the damage sits rather than only when it precedes the wanted link.
 pub(crate) fn link_is_named(data: &[u8], name: &str) -> bool {
     match parse_prefix(data) {
         Ok(prefix) => name_matches(prefix.name, name),
@@ -187,14 +187,21 @@ impl LinkMessage {
         name: &str,
     ) -> Result<Option<u64>, FormatError> {
         let prefix = parse_prefix(data)?;
-        if prefix.link_type_code != 0 || !name_matches(prefix.name, name) {
-            // A link type this crate does not know is still not the hard link
-            // asked for; `parse` is where an invalid one is reported, so that a
-            // lookup elsewhere in the group behaves the same whether or not it
-            // passed this message first.
+        if !name_matches(prefix.name, name) {
             return Ok(None);
         }
-        Ok(Some(read_offset(data, prefix.target_pos, offset_size)?))
+        match prefix.link_type_code {
+            0 => Ok(Some(read_offset(data, prefix.target_pos, offset_size)?)),
+            // A soft or external link names a path, not an object header here, so
+            // it is passed over exactly as `crate::group_v2` passes over it when
+            // resolving entries.
+            1 | 64 => Ok(None),
+            // A link type this crate does not know is refused rather than passed
+            // over, because [`Self::parse`] refuses it: a lookup that answered
+            // "no such link" would report a corrupt group as an ordinary missing
+            // name.
+            other => Err(FormatError::InvalidLinkType(other)),
+        }
     }
 
     /// Serialize link message to HDF5 message bytes.
@@ -585,6 +592,31 @@ mod tests {
 
     /// A message this cannot read is kept rather than filtered away, so the parse
     /// that follows reports it. Answering "not this one" would hide it.
+    /// A link type this crate does not know is a corrupt group, not a missing
+    /// name, and [`LinkMessage::parse`] says so — a lookup must not soften that
+    /// into "no such link".
+    #[test]
+    fn a_link_type_this_crate_does_not_know_is_refused_not_skipped() {
+        let mut data = Vec::new();
+        data.push(1); // version
+        data.push(0x08); // flags: link type present, 1-byte name length
+        data.push(99); // not a link type this crate knows
+        data.push(1); // name length
+        data.push(b'x');
+
+        assert_eq!(
+            LinkMessage::hard_link_address_if_named(&data, 8, "x").unwrap_err(),
+            FormatError::InvalidLinkType(99)
+        );
+        // ...but only for the link that was asked for: another name's lookup is
+        // not this message's business, and the filter drops it before the scan.
+        assert_eq!(
+            LinkMessage::hard_link_address_if_named(&data, 8, "y").unwrap(),
+            None
+        );
+        assert!(!link_is_named(&data, "y"));
+    }
+
     #[test]
     fn an_unreadable_link_is_kept_by_the_filter() {
         assert!(link_is_named(&[2, 0, 0, 0], "anything"), "bad version");

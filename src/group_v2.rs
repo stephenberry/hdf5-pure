@@ -186,12 +186,19 @@ fn wanted_link_only<'a>(
 /// reads what it needs and reports the last case as the error it is. None of the
 /// three stores links as Link messages, so that walk reads a header the filter
 /// took nothing from.
+///
+/// The symbol table is checked first because [`resolve_group_entries`] checks it
+/// first: a header carrying both a Symbol Table message and a Link Info message
+/// is not something any writer here produces, but the two paths must agree on
+/// what it is, or a child that the fallback finds through the symbol table would
+/// be reported as absent by the scan.
 fn holds_compact_links(
     header: &ObjectHeader,
     offset_size: u8,
     saw_link: bool,
 ) -> Result<bool, FormatError> {
-    Ok((saw_link || is_v2_group(header))
+    Ok(!is_v1_group(header)
+        && (saw_link || is_v2_group(header))
         && find_link_info(header, offset_size)?
             .fractal_heap_address
             .is_none())
@@ -202,20 +209,35 @@ fn holds_compact_links(
 ///
 /// Soft and external links are skipped, as [`resolve_compact_entries`] skips
 /// them: they name no object header in this file.
+///
+/// # What a lookup still refuses
+///
+/// Every Link message here is read, rather than stopping at the match, and the
+/// reason is that the ones this cannot read at all are refused: a lookup must
+/// not depend on whether the damaged link sits before or after the one asked
+/// for. That costs nothing, because the parse that produced this header was
+/// asked for the wanted link and kept only it and the messages it could not
+/// judge (see [`wanted_link_only`]).
+///
+/// What a lookup no longer refuses is a link whose *target* is malformed and
+/// whose name is not the one asked for — resolving one path used to parse every
+/// link's target, so any such link failed every lookup in the group. Listing the
+/// group ([`resolve_group_entries`]) still reports it; a lookup reads the link it
+/// was asked for.
 fn scan_compact_links(
     object_header: &ObjectHeader,
     offset_size: u8,
     name: &str,
 ) -> Result<Option<u64>, FormatError> {
+    let mut found = None;
     for msg in &object_header.messages {
         if msg.msg_type != MessageType::Link {
             continue;
         }
-        if let Some(addr) = LinkMessage::hard_link_address_if_named(&msg.data, offset_size, name)? {
-            return Ok(Some(addr));
-        }
+        let addr = LinkMessage::hard_link_address_if_named(&msg.data, offset_size, name)?;
+        found = found.or(addr);
     }
-    Ok(None)
+    Ok(found)
 }
 
 /// Resolve entries from dense storage (fractal heap + B-tree v2).

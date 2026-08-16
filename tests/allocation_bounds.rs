@@ -426,9 +426,11 @@ fn filtered_read_does_not_build_a_decompressor_per_chunk() {
 /// quadratic in its size, and this is the rule that keeps the walk linear
 /// (issue #228).
 ///
-/// Both entry points are measured because they reach the links by different
-/// routes — a path from the file, and a name within an opened group — and only a
-/// bound on each says the shared lookup is what they both use.
+/// Three measurements, because the lookup is reached by three routes that are
+/// separate code: a path from the file and a name within an opened group, and
+/// each of those over a streaming file and a buffered one — `File::open`, the
+/// default entry point, resolves through a different function than
+/// `File::open_streaming` does, and a bound on one says nothing about the other.
 #[test]
 fn opening_one_child_does_not_allocate_per_child_of_the_group() {
     const OBJECTS: usize = 1024;
@@ -448,11 +450,21 @@ fn opening_one_child_does_not_allocate_per_child_of_the_group() {
     // cost cannot hide behind an early hit.
     let last = format!("d{:05}", OBJECTS - 1);
     let file = File::open_streaming(&path).unwrap();
+    // Opened before the measurements: a buffered open reads the whole file, and
+    // what is being measured is the lookup inside it.
+    let buffered = File::open(&path).unwrap();
 
     let (by_path, path_measured) = measure("child_by_path", || file.dataset(&last).unwrap());
     let (by_name, name_measured) = measure("child_by_name", || file.root().dataset(&last).unwrap());
+    let (buffered_by_path, buffered_measured) = measure("child_by_path_buffered", || {
+        buffered.dataset(&last).unwrap()
+    });
 
-    for (what, measured) in [("by path", path_measured), ("in the group", name_measured)] {
+    for (what, measured) in [
+        ("by path", path_measured),
+        ("in the group", name_measured),
+        ("by path in a buffered file", buffered_measured),
+    ] {
         // Measured at 18 allocations: the group's header, the opened dataset's
         // header, and its handful of messages. One per link is 1,026, and the
         // bound sits between the two rather than near either.
@@ -482,9 +494,13 @@ fn opening_one_child_does_not_allocate_per_child_of_the_group() {
         );
     }
 
-    // Both handles must still be the right dataset.
+    // Every handle must still be the right dataset.
     assert_eq!(by_path.read_i32().unwrap(), vec![(OBJECTS - 1) as i32]);
     assert_eq!(by_name.read_i32().unwrap(), vec![(OBJECTS - 1) as i32]);
+    assert_eq!(
+        buffered_by_path.read_i32().unwrap(),
+        vec![(OBJECTS - 1) as i32]
+    );
 }
 
 /// Writing variable-length strings copies the text into the heap collections it
