@@ -41,6 +41,7 @@ pub struct FilterPipeline {
     /// Ordered list of filters.
     pub filters: Vec<FilterDescription>,
 }
+
 impl FilterPipeline {
     /// Parse a filter pipeline message from raw message bytes.
     pub fn parse(data: &[u8]) -> Result<FilterPipeline, FormatError> {

@@ -37,6 +37,7 @@ pub struct ExtensibleArrayHeader {
     /// Address of the index block.
     pub index_block_address: u64,
 }
+
 fn read_variable_length(data: &[u8], size: usize) -> Result<u64, FormatError> {
     if size > 8 || data.len() < size {
         return Err(FormatError::ChunkedReadError(

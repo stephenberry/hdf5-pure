@@ -19,6 +19,7 @@ pub struct AttributeInfoMessage {
     /// Address of B-tree v2 (type 9) for creation-order attribute index.
     pub btree_creation_order_address: Option<u64>,
 }
+
 impl AttributeInfoMessage {
     /// Parse an Attribute Info message from raw message data.
     ///

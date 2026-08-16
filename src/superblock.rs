@@ -49,6 +49,7 @@ pub struct Superblock {
     /// CRC32C checksum (v2/v3 only).
     pub checksum: Option<u32>,
 }
+
 fn validate_sizes(offset_size: u8, length_size: u8) -> Result<(), FormatError> {
     if !matches!(offset_size, 2 | 4 | 8) {
         return Err(FormatError::InvalidOffsetSize(offset_size));
@@ -58,6 +59,7 @@ fn validate_sizes(offset_size: u8, length_size: u8) -> Result<(), FormatError> {
     }
     Ok(())
 }
+
 impl Superblock {
     /// Serialize this superblock to bytes.
     ///

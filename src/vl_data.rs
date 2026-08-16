@@ -69,6 +69,7 @@ pub struct VlElement {
     /// Index of the object within the collection.
     pub object_index: u32,
 }
+
 /// Parse VL global heap references from raw attribute/dataset data.
 pub fn parse_vl_references(
     raw_data: &[u8],

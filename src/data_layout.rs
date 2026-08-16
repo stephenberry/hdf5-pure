@@ -42,6 +42,7 @@ pub enum DataLayout {
         version: u8,
     },
 }
+
 impl DataLayout {
     /// Parse a data layout message from raw message bytes.
     ///

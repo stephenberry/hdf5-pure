@@ -52,6 +52,7 @@ pub struct AttributeMessage {
     /// show: both forms decode to the same type.
     pub datatype_location: DatatypeLocation,
 }
+
 /// Round up to the next multiple of 8.
 fn pad8(x: usize) -> usize {
     (x + 7) & !7

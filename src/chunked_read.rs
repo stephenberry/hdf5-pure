@@ -67,6 +67,7 @@ pub struct ChunkInfo {
     /// File address of the chunk data.
     pub address: u64,
 }
+
 /// Size of a single key in a version 1 B-tree of type 1 (raw data chunks):
 /// `chunk_size(4) + filter_mask(4) + ndims * offset_size`. The `ndims` trailing
 /// offsets are the per-dimension scaled chunk coordinates (rank + 1 values, the

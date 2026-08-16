@@ -36,6 +36,7 @@ pub struct BTreeV2Record {
     /// Raw record bytes (record_size bytes).
     pub data: Vec<u8>,
 }
+
 /// Compute the number of bytes needed to represent a count, using variable-width encoding.
 /// B-tree v2 uses this for the number of records fields in internal nodes.
 fn bytes_for_max_records(max_nrec: u64) -> usize {

@@ -16,6 +16,7 @@ pub struct LinkInfoMessage {
     /// Address of B-tree v2 for creation-order link index.
     pub btree_creation_order_address: Option<u64>,
 }
+
 impl LinkInfoMessage {
     /// Parse a Link Info message from raw message data.
     pub fn parse(data: &[u8], offset_size: u8) -> Result<LinkInfoMessage, FormatError> {

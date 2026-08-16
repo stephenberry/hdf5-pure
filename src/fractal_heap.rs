@@ -82,6 +82,7 @@ pub struct FractalHeapHeader {
     /// Total number of managed objects.
     pub managed_objects_count: u64,
 }
+
 /// Floor of the base-2 logarithm of `v` (0 for `v == 0`). The doubling-table
 /// block sizes are powers of two, so this is their exact log2; it mirrors
 /// HDF5's `H5VM_log2_gen`.

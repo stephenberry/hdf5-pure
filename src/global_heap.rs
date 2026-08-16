@@ -32,6 +32,7 @@ pub struct GlobalHeapObjectInfo {
     /// Object payload size in bytes.
     pub size: u64,
 }
+
 /// Round up to next multiple of 8.
 #[cfg(test)]
 fn pad8(x: usize) -> usize {

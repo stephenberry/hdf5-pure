@@ -15,6 +15,7 @@ pub struct SymbolTableMessage {
     /// Address of the local heap for this group.
     pub local_heap_address: u64,
 }
+
 impl SymbolTableMessage {
     /// Parse a Symbol Table message from raw message data bytes.
     pub fn parse(data: &[u8], offset_size: u8) -> Result<SymbolTableMessage, FormatError> {

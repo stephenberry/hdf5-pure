@@ -65,6 +65,7 @@ pub struct SharedMessageRef {
     /// Where the referenced message lives.
     pub location: SharedLocation,
 }
+
 /// Check whether a header message record has its shared flag set.
 pub fn is_shared(msg_flags: u8) -> bool {
     msg_flags & 0x02 != 0

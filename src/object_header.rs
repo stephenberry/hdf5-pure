@@ -74,6 +74,7 @@ pub struct ObjectHeader {
     /// Birth time (v2, when flags bit 2 set).
     pub birth_time: Option<u32>,
 }
+
 impl ObjectHeader {
     /// Parse an object header at the given offset in the data buffer.
     ///

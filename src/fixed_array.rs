@@ -26,6 +26,7 @@ pub struct FixedArrayHeader {
     /// Address of the data block.
     pub data_block_address: u64,
 }
+
 impl FixedArrayHeader {
     /// Parse a Fixed Array header from file data at the given offset.
     pub fn parse(

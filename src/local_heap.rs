@@ -20,6 +20,7 @@ pub struct LocalHeap {
     /// File address of the data segment.
     pub data_segment_address: u64,
 }
+
 impl LocalHeap {
     /// Parse a local heap header at the given offset in the file data.
     pub fn parse(

@@ -341,6 +341,7 @@ impl fmt::Display for Datatype {
         }
     }
 }
+
 fn parse_string_padding(val: u8) -> Result<StringPadding, FormatError> {
     match val {
         0 => Ok(StringPadding::NullTerminate),

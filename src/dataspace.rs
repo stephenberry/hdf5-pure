@@ -29,6 +29,7 @@ pub struct Dataspace {
     /// Maximum dimension sizes, if present. `u64::MAX` means unlimited.
     pub max_dimensions: Option<Vec<u64>>,
 }
+
 impl Dataspace {
     /// Parse a dataspace message from raw message bytes.
     ///

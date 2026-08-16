@@ -46,6 +46,7 @@ pub struct BTreeV1Node {
     /// Child addresses (entries_used values).
     pub children: Vec<u64>,
 }
+
 impl BTreeV1Node {
     /// Parse a B-tree v1 node at the given offset in the file data.
     ///

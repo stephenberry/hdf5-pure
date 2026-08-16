@@ -34,6 +34,7 @@ pub struct LinkMessage {
     /// Character set of the link name.
     pub charset: CharacterSet,
 }
+
 impl LinkMessage {
     /// Serialize link message to HDF5 message bytes.
     pub fn serialize(&self, offset_size: u8) -> Vec<u8> {
