@@ -37,7 +37,7 @@ use crate::datatype::Datatype;
 use crate::error::{Error, FormatError};
 use crate::extensible_array::{EaGeometry, ExtensibleArrayHeader};
 use crate::filter_pipeline::FilterPipeline;
-use crate::filters::{ChunkContext, compress_chunk, decompress_chunk};
+use crate::filters::{ChunkContext, FilterScratch, compress_chunk_with, decompress_chunk};
 use crate::message_type::MessageType;
 use crate::source::Source;
 
@@ -1010,12 +1010,14 @@ pub(crate) fn plan_ea_append<F: Store>(
     let new_chunk_bytes: Vec<Vec<u8>> = if let Some(pl) = pipeline {
         let ctx = ChunkContext::from_datatype(spatial, datatype)?;
         let mut out = Vec::with_capacity(split.len());
-        for (_, buf) in &split {
-            out.push(compress_chunk(buf, pl, ctx).map_err(Error::Format)?);
+        // One encoder across the appended tail; see `FilterScratch`.
+        let mut scratch = FilterScratch::new();
+        for buf in &split {
+            out.push(compress_chunk_with(&mut scratch, buf, pl, ctx).map_err(Error::Format)?);
         }
         out
     } else {
-        split.into_iter().map(|(_, buf)| buf).collect()
+        split
     };
 
     let new_num_chunks = n_full + new_chunk_bytes.len() as u64;

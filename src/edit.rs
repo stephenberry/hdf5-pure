@@ -210,7 +210,7 @@ use crate::filter_pipeline::{
     FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_LZF, FILTER_SCALEOFFSET, FILTER_SHUFFLE,
     FilterPipeline,
 };
-use crate::filters::{ChunkContext, compress_chunk, decompress_chunk};
+use crate::filters::{ChunkContext, FilterScratch, compress_chunk_with, decompress_chunk};
 use crate::free_space::FreeList;
 use crate::free_space_manager::{
     self, FreeSection, FsmHeader, PageType, SECT_CLASS_SIMPLE, align_up, free_sections, fshd_len,
@@ -4670,12 +4670,14 @@ impl WriteEngine {
                     }
                     let ctx = ChunkContext::from_datatype(&spatial, &fd.dt)?;
                     let mut encoded = Vec::with_capacity(split.len());
-                    for (_, buf) in &split {
-                        encoded.push(compress_chunk(buf, &pipeline, ctx)?);
+                    // One encoder across the rewrite; see `FilterScratch`.
+                    let mut scratch = FilterScratch::new();
+                    for buf in &split {
+                        encoded.push(compress_chunk_with(&mut scratch, buf, &pipeline, ctx)?);
                     }
                     encoded
                 } else {
-                    split.into_iter().map(|(_, buf)| buf).collect()
+                    split
                 };
 
                 // Fast path: overwrite each chunk straight in its slot when every
@@ -5013,12 +5015,14 @@ impl WriteEngine {
         let new_chunk_bytes: Vec<Vec<u8>> = if let Some(pl) = &pipeline {
             let ctx = ChunkContext::from_datatype(&spatial, &disk_dt)?;
             let mut out = Vec::with_capacity(split.len());
-            for (_, buf) in &split {
-                out.push(compress_chunk(buf, pl, ctx).map_err(Error::Format)?);
+            // One encoder across the appended tail; see `FilterScratch`.
+            let mut scratch = FilterScratch::new();
+            for buf in &split {
+                out.push(compress_chunk_with(&mut scratch, buf, pl, ctx).map_err(Error::Format)?);
             }
             out
         } else {
-            split.into_iter().map(|(_, buf)| buf).collect()
+            split
         };
 
         // Grow the dataspace along axis 0, preserving the (unlimited) max-dims.
@@ -7454,7 +7458,7 @@ fn chunk_index_enumerable(version: u8, chunk_index_type: Option<u8>) -> bool {
 /// Whether every filter in `pipeline` is one this crate can *apply* (re-encode a
 /// chunk through) — not merely decode. A pipeline with any other filter cannot be
 /// re-encoded for an in-place overwrite, so the caller refuses with a typed error
-/// rather than letting [`compress_chunk`] surface a raw `UnsupportedFilter`.
+/// rather than letting `compress_chunk` surface a raw `UnsupportedFilter`.
 pub(crate) fn pipeline_reencodable(pipeline: &FilterPipeline) -> bool {
     pipeline.filters.iter().all(|f| match f.filter_id {
         FILTER_DEFLATE | FILTER_SHUFFLE | FILTER_FLETCHER32 | FILTER_SCALEOFFSET | FILTER_LZF => {

@@ -22,7 +22,7 @@ use crate::extensible_array::{
     ExtensibleArrayHeader, read_extensible_array_chunks, read_extensible_array_chunks_from_source,
 };
 use crate::filter_pipeline::FilterPipeline;
-use crate::filters::{ChunkContext, decompress_chunk};
+use crate::filters::{ChunkContext, FilterScratch, decompress_chunk_with};
 use crate::fixed_array::{
     FixedArrayHeader, read_fixed_array_chunks, read_fixed_array_chunks_from_source,
 };
@@ -54,6 +54,8 @@ fn decompress_all_chunks(
     }
 
     let mut result = Vec::with_capacity(chunks.len());
+    // One decoder for every chunk; see `FilterScratch`.
+    let mut scratch = FilterScratch::new();
     for chunk_info in chunks {
         let r = slice_range(chunk_info.address, u64::from(chunk_info.chunk_size))?;
         if r.end > file_data.len() {
@@ -65,7 +67,7 @@ fn decompress_all_chunks(
         let raw_chunk = &file_data[r];
 
         let decompressed = if let Some(pl) = pipeline {
-            decompress_chunk(raw_chunk, pl, ctx, chunk_info.filter_mask)?
+            decompress_chunk_with(&mut scratch, raw_chunk, pl, ctx, chunk_info.filter_mask)?
         } else {
             raw_chunk.to_vec()
         };
@@ -87,11 +89,13 @@ fn decompress_all_chunks_from_source<S: Source + ?Sized>(
     ctx: ChunkContext<'_>,
 ) -> Result<Vec<Vec<u8>>, FormatError> {
     let mut result = Vec::with_capacity(chunks.len());
+    // One decoder for every chunk; see `FilterScratch`.
+    let mut scratch = FilterScratch::new();
     for chunk_info in chunks {
         let raw_chunk =
             source.read_exact_at(chunk_info.address, chunk_info.chunk_size.to_usize()?)?;
         let decompressed = if let Some(pl) = pipeline {
-            decompress_chunk(&raw_chunk, pl, ctx, chunk_info.filter_mask)?
+            decompress_chunk_with(&mut scratch, &raw_chunk, pl, ctx, chunk_info.filter_mask)?
         } else {
             raw_chunk
         };
@@ -1058,6 +1062,14 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
             .is_ok_and(&overlaps)
     });
 
+    // Plain LRU rather than a fill-once pass, so the chunks this window finishes
+    // on are the ones retained. That is the reuse the doc above promises: the
+    // next window straddles this one's *last* chunk, and a window wide enough to
+    // fill the cache would otherwise drop exactly it. See [`CachePass`].
+    let pass = crate::chunk_cache::CachePass::LRU;
+    // One decoder for the whole window; see `FilterScratch`.
+    let mut scratch = FilterScratch::new();
+
     for chunk in &chunks {
         let c0 = chunk.offsets.first().copied().unwrap_or(0).to_usize()?;
         // This chunk's exclusive leading-dim end. The saturating add/mul here and
@@ -1121,8 +1133,8 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
             ),
         };
 
-        let coord: Vec<u64> = chunk.offsets.iter().take(rank).copied().collect();
-        let hit = cache.with_decompressed(&coord, |bytes| copy(&mut output, bytes));
+        let coord = spatial_coord(chunk, rank);
+        let hit = cache.with_decompressed(coord, |bytes| copy(&mut output, bytes));
         if hit.is_some() {
             continue;
         }
@@ -1134,13 +1146,13 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
         };
         match pipeline {
             Some(pl) => {
-                let dec = decompress_chunk(&stored, pl, ctx, chunk.filter_mask)?;
+                let dec = decompress_chunk_with(&mut scratch, &stored, pl, ctx, chunk.filter_mask)?;
                 copy(&mut output, &dec);
-                cache.put_decompressed(coord, dec);
+                cache.put_decompressed(pass, coord, dec);
             }
             None => {
                 copy(&mut output, &stored);
-                cache.put_decompressed_slice(coord, &stored);
+                cache.put_decompressed_slice(pass, coord, &stored);
             }
         }
     }
@@ -1285,17 +1297,24 @@ pub fn read_chunked_data_cached_from_source<S: Source + ?Sized>(
     // whatever the chunk cache already holds from an earlier read.
     let mut spans = plan_chunk_spans(&chunks, rank, cache, |_| true);
 
+    let pass = cache.begin_pass();
+    // One decoder for every chunk of the dataset; see `FilterScratch`.
+    let mut scratch = FilterScratch::new();
+    // Refilled per chunk rather than allocated per chunk. It holds `rank`
+    // integers — 8 bytes for a 1-D dataset, invisible beside the chunk it
+    // describes — but allocating it here is an allocator round trip for every
+    // chunk of every dataset this crate reads (issue #228).
+    let mut chunk_offsets: Vec<usize> = Vec::with_capacity(rank);
+
     for chunk_info in &chunks {
-        let coord: Vec<u64> = chunk_info.offsets.iter().take(rank).copied().collect();
-        let chunk_offsets: Vec<usize> = chunk_info
-            .offsets
-            .iter()
-            .take(rank)
-            .map(|&o| o.to_usize())
-            .collect::<Result<_, _>>()?;
+        let coord = spatial_coord(chunk_info, rank);
+        chunk_offsets.clear();
+        for &o in coord {
+            chunk_offsets.push(o.to_usize()?);
+        }
 
         // Scatter straight from the cached chunk under the lock (no copy out).
-        let hit = cache.with_decompressed(&coord, |bytes| {
+        let hit = cache.with_decompressed(coord, |bytes| {
             place_chunk(
                 bytes,
                 &mut output,
@@ -1319,7 +1338,13 @@ pub fn read_chunked_data_cached_from_source<S: Source + ?Sized>(
             None => Cow::Owned(source.read_exact_at(chunk_info.address, len)?),
         };
         let dec = match pipeline {
-            Some(pl) => Cow::Owned(decompress_chunk(&stored, pl, ctx, chunk_info.filter_mask)?),
+            Some(pl) => Cow::Owned(decompress_chunk_with(
+                &mut scratch,
+                &stored,
+                pl,
+                ctx,
+                chunk_info.filter_mask,
+            )?),
             // Unfiltered: a chunk's stored bytes are its data, so they are
             // copied out of the span only if the cache admits them.
             None => stored,
@@ -1337,12 +1362,25 @@ pub fn read_chunked_data_cached_from_source<S: Source + ?Sized>(
         );
         // Dropped either way if the cache does not admit it.
         match dec {
-            Cow::Owned(bytes) => cache.put_decompressed(coord, bytes), // move
-            Cow::Borrowed(bytes) => cache.put_decompressed_slice(coord, bytes),
+            Cow::Owned(bytes) => cache.put_decompressed(pass, coord, bytes), // move
+            Cow::Borrowed(bytes) => cache.put_decompressed_slice(pass, coord, bytes),
         }
     }
 
     Ok(output)
+}
+
+/// A chunk's spatial coordinate: its offset vector cut to the dataset's rank.
+///
+/// Borrowed from the [`ChunkInfo`] rather than copied, because the read loops
+/// need one per chunk and a dataset has as many chunks as it likes. The cut is
+/// `get(..rank)` rather than an index so a shorter offset vector yields what it
+/// has, which is what the `.take(rank)` this replaced did.
+fn spatial_coord(chunk_info: &ChunkInfo, rank: usize) -> &[u64] {
+    chunk_info
+        .offsets
+        .get(..rank)
+        .unwrap_or(&chunk_info.offsets)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1955,22 +1993,25 @@ pub fn read_chunked_data_cached(
     let chunk_dims_u64: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
     let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype)?;
 
-    for chunk_info in &chunks {
-        let coord: Vec<u64> = chunk_info.offsets.iter().take(rank).copied().collect();
+    let pass = cache.begin_pass();
+    // One decoder for every chunk of the dataset; see `FilterScratch`.
+    let mut scratch = FilterScratch::new();
+    // Refilled per chunk rather than allocated per chunk; see the counterpart in
+    // `read_chunked_data_cached_from_source`.
+    let mut chunk_offsets: Vec<usize> = Vec::with_capacity(rank);
 
+    for chunk_info in &chunks {
+        let coord = spatial_coord(chunk_info, rank);
+
+        chunk_offsets.clear();
         #[expect(
             clippy::cast_possible_truncation,
             reason = "chunk coordinate offsets are bounded by ds_dims, which already fit usize"
         )]
-        let chunk_offsets: Vec<usize> = chunk_info
-            .offsets
-            .iter()
-            .take(rank)
-            .map(|&o| o as usize)
-            .collect();
+        chunk_offsets.extend(coord.iter().map(|&o| o as usize));
 
         // Scatter straight from the cached chunk under the lock (no copy out).
-        let hit = cache.with_decompressed(&coord, |bytes| {
+        let hit = cache.with_decompressed(coord, |bytes| {
             place_chunk(
                 bytes,
                 &mut output,
@@ -1997,7 +2038,8 @@ pub fn read_chunked_data_cached(
         }
         let raw_chunk = &file_data[r];
         if let Some(pl) = pipeline {
-            let dec = decompress_chunk(raw_chunk, pl, ctx, chunk_info.filter_mask)?;
+            let dec =
+                decompress_chunk_with(&mut scratch, raw_chunk, pl, ctx, chunk_info.filter_mask)?;
             place_chunk(
                 &dec,
                 &mut output,
@@ -2009,7 +2051,7 @@ pub fn read_chunked_data_cached(
                 elem_size,
                 rank,
             );
-            cache.put_decompressed(coord, dec); // move; dropped if not admitted
+            cache.put_decompressed(pass, coord, dec); // move; dropped if not admitted
         } else {
             // No pipeline: scatter directly from the file buffer, and copy into
             // the cache only if it would actually be retained.
@@ -2024,7 +2066,7 @@ pub fn read_chunked_data_cached(
                 elem_size,
                 rank,
             );
-            cache.put_decompressed_slice(coord, raw_chunk);
+            cache.put_decompressed_slice(pass, coord, raw_chunk);
         }
     }
 

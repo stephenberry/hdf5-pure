@@ -17,8 +17,9 @@ use std::collections::HashMap;
 use crate::attribute::AttributeMessage;
 use crate::btree_v2_write::{self, BTreeV2Plan};
 use crate::chunked_write::{
-    ByteSink, ChunkOptions, ChunkProvider, CompressedChunkSet, VerbatimLayout, VerbatimPlan,
-    assemble_chunked_at, compress_chunks, emit_chunked_data_verbatim, plan_chunked_data_verbatim,
+    ByteSink, ChunkOptions, ChunkProvider, ChunkedMeasure, CompressedChunkSet, VerbatimLayout,
+    VerbatimPlan, assemble_chunked_at, compress_chunks, emit_chunked_data_verbatim,
+    measure_chunked_at, plan_chunked_data_verbatim,
 };
 use crate::convert::TryToUsize;
 use crate::dataspace::{Dataspace, DataspaceType};
@@ -1512,12 +1513,59 @@ impl FileWriter {
             data: DsData,
         }
 
+        /// What the object-header sizing pass needs from a chunked dataset: the
+        /// two messages that go in the header, and how long the data region will
+        /// be — but not the region.
+        ///
+        /// [`build_chunked`] materializes it, which for the sizing pass meant
+        /// allocating and dropping a whole second copy of every chunked dataset
+        /// in the file (issue #228). Both paths take their length from the same
+        /// place the emitter does, so the header sized here cannot disagree with
+        /// the bytes written later.
+        fn measure_chunked(
+            d: &DsFlat,
+            base_address: u64,
+            chunk_set: Option<&CompressedChunkSet>,
+        ) -> Result<ChunkedMeasure, FormatError> {
+            if let Some(rc) = &d.raw_chunks {
+                let VerbatimLayout {
+                    plan,
+                    layout_message,
+                    pipeline_message,
+                } = plan_chunked_data_verbatim(
+                    &rc.meta,
+                    &rc.chunk_dims,
+                    rc.element_size,
+                    rc.raw_size,
+                    rc.pipeline_message.as_deref(),
+                    base_address,
+                    d.maxshape.as_deref(),
+                )?;
+                Ok(ChunkedMeasure {
+                    data_len: plan.total_len,
+                    layout_message,
+                    pipeline_message,
+                })
+            } else {
+                let set = chunk_set
+                    .expect("an encode-path chunked dataset must have a precomputed chunk set");
+                measure_chunked_at(set, base_address)
+            }
+        }
+
         /// Build the chunked data + layout/pipeline messages for one chunked
         /// dataset at `base_address`, dispatching to the verbatim path when the
         /// dataset carries a raw-chunk payload, else the normal encode path. The
-        /// single dispatch point keeps the dummy-sizing and real-address passes
-        /// from diverging. The layout is computed from chunk *sizes* alone, so
-        /// it is identical whether the chunks are in memory or streamed.
+        /// layout is computed from chunk *sizes* alone, so it is identical
+        /// whether the chunks are in memory or streamed.
+        ///
+        /// [`measure_chunked`] dispatches the same two ways and must reach the
+        /// same length and the same layout message, since the sizing pass uses
+        /// it and this produces what that pass sized. They were one function
+        /// until sizing stopped building a region to measure it (issue #228);
+        /// what holds them together now is
+        /// `measuring_a_chunked_region_agrees_with_assembling_it` on the encode
+        /// side and `plan_chunked_data_verbatim` being shared on the other.
         fn build_chunked(
             d: &DsFlat,
             base_address: u64,
@@ -2359,15 +2407,15 @@ impl FileWriter {
                     .transpose()?,
             );
             let oh = if is_chunked[i] {
-                let built = build_chunked(d, dummy_cursor, chunk_sets[i].as_ref())?;
-                dummy_cursor += built.data.len();
-                ds_data_lens.push(built.data.len());
+                let measured = measure_chunked(d, dummy_cursor, chunk_sets[i].as_ref())?;
+                dummy_cursor += measured.data_len;
+                ds_data_lens.push(measured.data_len);
                 build_chunked_dataset_oh(
                     &d.dt,
                     &d.dt_location,
                     &d.ds,
-                    &built.layout_message,
-                    built.pipeline_message.as_deref(),
+                    &measured.layout_message,
+                    measured.pipeline_message.as_deref(),
                     &d.attrs,
                     dense_attr_info.as_deref(),
                     d.fill.as_deref(),

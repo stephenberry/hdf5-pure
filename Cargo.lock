@@ -463,6 +463,7 @@ dependencies = [
  "criterion",
  "flate2",
  "hdf5-metno",
+ "heapscope",
  "ndarray",
  "num-complex",
  "proptest",
@@ -472,6 +473,12 @@ dependencies = [
  "sha2",
  "tempfile",
 ]
+
+[[package]]
+name = "heapscope"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49bd4b269441601fbd26a03a742df8b0541f085f5862f7127d0794e15718f2b2"
 
 [[package]]
 name = "heck"

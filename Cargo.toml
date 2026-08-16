@@ -46,6 +46,13 @@ serde = ["dep:serde", "std"]
 # rule puts these impls on whichever crate owns one of the two types — us, not
 # the caller.
 num-complex = ["dep:num-complex", "serde"]
+# Test-only: check the exact allocation figures of `tests/allocation_baseline.rs`
+# against the numbers committed under `tests/baselines/`. Off by default because
+# those numbers are recorded on one platform: the scaling *rules* in
+# `tests/allocation_bounds.rs` hold everywhere and run in every configuration,
+# while an exact count is a property of one target and one toolchain. See the
+# `Allocation gates` section of CLAUDE.md.
+heap-baseline = []
 # Test-only: enable a crosscheck test that links against the system libmatio
 # (reference MATLAB MAT file library). Requires libmatio to be installed:
 # `brew install libmatio` (macOS) or `apt install libmatio-dev` (Debian).
@@ -68,6 +75,17 @@ ndarray = { version = ">=0.16, <0.18", optional = true }
 num-complex = { version = "0.4", optional = true, default-features = false }
 
 [dev-dependencies]
+# Heap profiler and test-time allocation budgets (issue #228). It is the
+# `#[global_allocator]` of `tests/allocation_bounds.rs`,
+# `tests/allocation_baseline.rs` and `examples/heap_profile.rs`, and nothing
+# else links it.
+#
+# Not optional, because cargo forbids optional dev-dependencies, so it compiles
+# on every `cargo test`. That costs about two seconds once — it has no
+# dependencies of its own — and raises the floor for *building the test suite*
+# to its own MSRV of 1.96. The `rust-version` this crate promises its users is
+# unaffected: a dependent never builds our dev-dependencies.
+heapscope = "0.1"
 tempfile = "3"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
