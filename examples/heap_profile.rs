@@ -33,6 +33,14 @@ const CHUNK_ELEMS: u64 = 512;
 /// that makes a windowed read walk far more than it keeps.
 const LABELS: usize = 32 * 1024;
 const LABEL_LEN: usize = 128;
+/// A metadata-heavy file: many small datasets in one group, each with an
+/// attribute. The phases above allocate in proportion to *data*; these allocate
+/// in proportion to the number of *objects*, which is a different path.
+const OBJECTS: usize = 1024;
+/// Appends of one chunk each onto an unlimited dataset, enough of them that a
+/// per-append cost that scales with the dataset stands out from one that does
+/// not.
+const APPENDS: u64 = 512;
 
 const PROFILE_PATH: &str = "target/heap-profile.html";
 
@@ -53,8 +61,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let labels = dir.path().join("labels.h5");
 
     {
-        let _region = heapscope::region("write chunked");
+        // Built outside the region, as for the strings below: the 8 MiB of input
+        // is the caller's, and counting it here would report the writer as
+        // holding one more copy than it does.
         let data: Vec<f64> = (0..ELEMENTS).map(|i| i as f64).collect();
+        let _region = heapscope::region("write chunked");
         let mut builder = FileBuilder::new();
         builder
             .create_dataset("t")
@@ -65,11 +76,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     {
-        let _region = heapscope::region("write vlen strings");
+        // The strings are built outside the region: this profile is of what the
+        // crate allocates, and 32k `format!` calls would otherwise be four fifths
+        // of this phase's blocks and read as the writer's.
         let strings: Vec<String> = (0..LABELS)
             .map(|i| format!("{i:0>width$}", width = LABEL_LEN))
             .collect();
         let refs: Vec<&str> = strings.iter().map(String::as_str).collect();
+        let _region = heapscope::region("write vlen strings");
         let mut builder = FileBuilder::new();
         builder.create_dataset("labels").with_vlen_strings(&refs);
         builder.write(&labels)?;
@@ -116,7 +130,110 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     drop(strings);
 
-    profiler.print_summary(10)?;
+    let typed = {
+        let _region = heapscope::region("read chunked whole typed");
+        numeric_ds.read_f64()?
+    };
+    assert_eq!(
+        typed.len(),
+        ELEMENTS,
+        "typed whole read returned wrong length"
+    );
+    drop(typed);
+
+    let all_strings = {
+        let _region = heapscope::region("read vlen whole");
+        labels_ds.read_string()?
+    };
+    assert_eq!(
+        all_strings.len(),
+        LABELS,
+        "whole string read returned wrong length"
+    );
+    drop(all_strings);
+
+    // --- the metadata paths -------------------------------------------------
+
+    let many = dir.path().join("many.h5");
+    {
+        let _region = heapscope::region("write many objects");
+        let mut builder = FileBuilder::new();
+        for i in 0..OBJECTS {
+            builder
+                .create_dataset(&format!("d{i:05}"))
+                .with_i32_data(&[i as i32])
+                .set_attr("units", hdf5_pure::AttrValue::I32(i as i32));
+        }
+        builder.write(&many)?;
+    }
+
+    let many_file = {
+        let _region = heapscope::region("open many objects");
+        File::open_streaming(&many)?
+    };
+
+    let names = {
+        let _region = heapscope::region("list many objects");
+        many_file.root().datasets()?
+    };
+    assert_eq!(names.len(), OBJECTS, "listing returned the wrong count");
+
+    {
+        let _region = heapscope::region("resolve many objects");
+        for name in &names {
+            let _ds = many_file.dataset(name)?;
+        }
+    }
+
+    {
+        let _region = heapscope::region("read many attributes");
+        for name in &names {
+            let ds = many_file.dataset(name)?;
+            let attrs = ds.attrs()?;
+            assert_eq!(attrs.len(), 1, "each dataset carries one attribute");
+        }
+    }
+
+    // --- editing an existing file ------------------------------------------
+
+    // Appending in place is the write path that runs many times over one file
+    // rather than once, so what it costs *per call* is what matters: a cost that
+    // scales with the dataset rather than the batch is the defect to look for.
+    let growing = dir.path().join("growing.h5");
+    {
+        let mut builder = FileBuilder::new();
+        builder
+            .create_dataset("t")
+            .with_f64_data(&[0.0f64; CHUNK_ELEMS as usize])
+            .with_shape(&[CHUNK_ELEMS])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[CHUNK_ELEMS]);
+        builder.write(&growing)?;
+    }
+
+    let batch: Vec<f64> = (0..CHUNK_ELEMS).map(|i| i as f64).collect();
+    {
+        // One `fsync` at close rather than one per append: the appends are what
+        // is being measured, and the barriers between them are not free.
+        let file = File::open_rw_with_options(
+            &growing,
+            hdf5_pure::FileAccessProperties::new().with_sync_policy(hdf5_pure::SyncPolicy::OnClose),
+        )?;
+        let mut ds = file.dataset("t")?;
+        let _region = heapscope::region("append in place");
+        for _ in 0..APPENDS {
+            ds.append(&batch)?;
+        }
+    }
+    let grown = File::open(&growing)?;
+    assert_eq!(
+        grown.dataset("t")?.shape()?,
+        vec![CHUNK_ELEMS * (APPENDS + 1)],
+        "the appends did not all land"
+    );
+    drop(grown);
+
+    profiler.print_summary(16)?;
     // Dropping the profiler is what writes the page, so the check below has to
     // come after it rather than at the end of `main`.
     drop(profiler);

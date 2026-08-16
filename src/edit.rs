@@ -415,6 +415,11 @@ macro_rules! append_typed {
                 #[doc = concat!("Append `", stringify!($ty), "` values to the dataset.")]
                 pub fn $method(&mut self, data: &[$ty]) -> &mut Self {
                     self.set_dt($make());
+                    // Reserved up front: serializing element by element into a
+                    // growing `Vec` re-allocated it ten times per call and copied
+                    // the batch twice over, which for an append loop is the whole
+                    // per-call cost (issue #228).
+                    self.raw.reserve(data.len() * core::mem::size_of::<$ty>());
                     for &v in data {
                         self.raw.extend_from_slice(&v.to_le_bytes());
                     }

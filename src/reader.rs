@@ -1149,6 +1149,43 @@ impl FileInner {
         Ok(entries)
     }
 
+    /// The base-adjusted object-header address of the child named `name`, or
+    /// `None` if the group has no such child.
+    ///
+    /// The by-name counterpart of [`group_children`](Self::group_children), and
+    /// the one to reach for when a single child is wanted: it stops at the match
+    /// rather than building an entry, and an owned name, for every other child
+    /// of the group (issue #228).
+    fn group_child(&self, group_address: u64, name: &str) -> Result<Option<u64>, Error> {
+        let (os, ls, base) = (self.offset_size(), self.length_size(), self.addr_offset);
+        let addr = group_address;
+        let stored = match &self.backend {
+            Backend::InMemory(v) => group_v2::find_child_address(v, addr, os, ls, base, name),
+            Backend::Streaming(s) => {
+                group_v2::find_child_address_from_source(s.as_ref(), addr, os, ls, base, name)
+            }
+            Backend::Edit(m) => Self::with_engine(
+                m,
+                |d| group_v2::find_child_address(d, addr, os, ls, base, name),
+                |s| group_v2::find_child_address_from_source(s, addr, os, ls, base, name),
+            ),
+        }
+        .map_err(Error::Format)?;
+        // The stored address is relative to the base address; normalize to an
+        // absolute file offset, refusing the wrap a crafted entry (e.g. the
+        // HADDR_UNDEF sentinel) would otherwise cause — as `group_children` does.
+        stored
+            .map(|addr| {
+                addr.checked_add(base)
+                    .ok_or(FormatError::OffsetOverflow {
+                        offset: addr,
+                        length: base,
+                    })
+                    .map_err(Error::Format)
+            })
+            .transpose()
+    }
+
     /// Read all attributes attached to an object header, dispatching on the
     /// backend.
     fn attrs_of(&self, hdr: &ObjectHeader) -> Result<HashMap<String, AttrValue>, Error> {
@@ -2738,19 +2775,17 @@ impl Group {
         name: &str,
         properties: DatasetAccessProperties,
     ) -> Result<Dataset, Error> {
-        let entries = self.children()?;
-        let entry = entries
-            .iter()
-            .find(|e| e.name == name)
+        let address = self
+            .child_address(name)?
             .ok_or_else(|| Error::Format(FormatError::PathNotFound(name.to_string())))?;
-        let hdr = self.file.parse_header(entry.object_header_address)?;
+        let hdr = self.file.parse_header(address)?;
         if !has_message(&hdr, MessageType::DataLayout) {
             return Err(Error::NotADataset(name.to_string()));
         }
         let chunk_cache = properties.resolved_chunk_cache(self.file.access_properties.chunk_cache);
         Ok(Dataset {
             file: self.file.clone(),
-            address: entry.object_header_address,
+            address,
             header: hdr,
             chunk_cache: ChunkCache::with_config(chunk_cache),
             chunk_cache_config: chunk_cache,
@@ -2760,16 +2795,24 @@ impl Group {
 
     /// Get a subgroup within this group by name.
     pub fn group(&self, name: &str) -> Result<Group, Error> {
-        let entries = self.children()?;
-        let entry = entries
-            .iter()
-            .find(|e| e.name == name)
+        let address = self
+            .child_address(name)?
             .ok_or_else(|| Error::Format(FormatError::PathNotFound(name.to_string())))?;
         Ok(Group {
             file: self.file.clone(),
-            address: entry.object_header_address,
+            address,
             path: self.child_path(name),
         })
+    }
+
+    /// The object-header address of this group's child named `name`.
+    ///
+    /// The by-name form of [`children`](Self::children): it reads the group's
+    /// links without building one entry per child, which is what makes opening
+    /// each member of a large group in turn cost the group once rather than once
+    /// per member (issue #228).
+    fn child_address(&self, name: &str) -> Result<Option<u64>, Error> {
+        self.file.group_child(self.address, name)
     }
 
     /// The root-relative path of a child named `name`, or `None` if this group

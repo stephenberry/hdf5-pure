@@ -415,3 +415,235 @@ fn filtered_read_does_not_build_a_decompressor_per_chunk() {
 
     assert_eq!(all.len(), DATASET_BYTES);
 }
+
+/// Opening one child of a group costs the group's header, not one allocation per
+/// child in it.
+///
+/// A group stores its children as one Link message each, and a lookup used to
+/// build an entry with an owned name for every one of them before returning the
+/// one it was asked for: 2,084 allocations and 310 KiB to open a single dataset
+/// out of 1,024, paid again on the next open. That is what makes walking a group
+/// quadratic in its size, and this is the rule that keeps the walk linear
+/// (issue #228).
+///
+/// Three measurements, because the lookup is reached by three routes that are
+/// separate code: a path from the file and a name within an opened group, and
+/// each of those over a streaming file and a buffered one — `File::open`, the
+/// default entry point, resolves through a different function than
+/// `File::open_streaming` does, and a bound on one says nothing about the other.
+#[test]
+fn opening_one_child_does_not_allocate_per_child_of_the_group() {
+    const OBJECTS: usize = 1024;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("many.h5");
+    let mut builder = FileBuilder::new();
+    for i in 0..OBJECTS {
+        builder
+            .create_dataset(&format!("d{i:05}"))
+            .with_i32_data(&[i as i32]);
+    }
+    builder.write(&path).unwrap();
+
+    // The last child written, so the scan passes every link before it: the worst
+    // case for a lookup that stops at its match, and the one where a per-child
+    // cost cannot hide behind an early hit.
+    let last = format!("d{:05}", OBJECTS - 1);
+    let file = File::open_streaming(&path).unwrap();
+    // Opened before the measurements: a buffered open reads the whole file, and
+    // what is being measured is the lookup inside it.
+    let buffered = File::open(&path).unwrap();
+
+    let (by_path, path_measured) = measure("child_by_path", || file.dataset(&last).unwrap());
+    let (by_name, name_measured) = measure("child_by_name", || file.root().dataset(&last).unwrap());
+    let (buffered_by_path, buffered_measured) = measure("child_by_path_buffered", || {
+        buffered.dataset(&last).unwrap()
+    });
+
+    for (what, measured) in [
+        ("by path", path_measured),
+        ("in the group", name_measured),
+        ("by path in a buffered file", buffered_measured),
+    ] {
+        // Measured at 18 allocations: the group's header, the opened dataset's
+        // header, and its handful of messages. One per link is 1,026, and the
+        // bound sits between the two rather than near either.
+        assert!(
+            measured.blocks < (OBJECTS / 8) as u64,
+            "opening one child {what} must not allocate per child of the group: \
+             measured {measured} in a {OBJECTS}-child group"
+        );
+
+        // The other axis, which the count cannot see: the group's header is read
+        // whole (about 30 stored bytes per child, so ~30 KiB here) because the
+        // links must be scanned, but nothing may allocate several times over it.
+        // The per-child entries this replaced cost ten times the header.
+        assert!(
+            measured.bytes < (OBJECTS * 128) as u64,
+            "opening one child {what} must allocate about its group's header, not \
+             a multiple of it: measured {measured} in a {OBJECTS}-child group"
+        );
+
+        // The handle each call returned — its parsed object header among it — is
+        // in this measurement, so its size is a floor a measurement of nothing
+        // cannot reach.
+        assert!(
+            measured.live_bytes >= 128,
+            "the handle this open returned is not in its own measurement, so the \
+             bounds above are bounding something other than the open: {measured}"
+        );
+    }
+
+    // Every handle must still be the right dataset.
+    assert_eq!(by_path.read_i32().unwrap(), vec![(OBJECTS - 1) as i32]);
+    assert_eq!(by_name.read_i32().unwrap(), vec![(OBJECTS - 1) as i32]);
+    assert_eq!(
+        buffered_by_path.read_i32().unwrap(),
+        vec![(OBJECTS - 1) as i32]
+    );
+}
+
+/// Writing variable-length strings copies the text into the heap collections it
+/// has to end up in, and not into a per-element buffer on the way.
+///
+/// The writer is handed `&[&str]` and used to own each one before staging it: a
+/// second copy of the whole payload, in one allocation per string — 4 MiB in
+/// 32,768 blocks to write 4 MiB of text (issue #228). The count is the axis that
+/// names that defect, since a copy made one string at a time is one allocation
+/// per string whatever it costs in bytes; the byte bound beside it is the one
+/// that would still catch the same copy made in a single buffer.
+#[test]
+fn vlen_string_write_does_not_own_each_string_before_staging_it() {
+    const N0: usize = 32 * 1024;
+    const STR_LEN: usize = 128;
+    const PAYLOAD_BYTES: usize = N0 * STR_LEN;
+
+    // Built before the measurement: these are the caller's strings, and the
+    // question is what the writer adds to them.
+    let strings: Vec<String> = (0..N0)
+        .map(|i| format!("{i:0>width$}", width = STR_LEN))
+        .collect();
+    let refs: Vec<&str> = strings.iter().map(String::as_str).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vlen.h5");
+
+    let (_, measured) = measure("vlen_string_write", || {
+        let mut builder = FileBuilder::new();
+        builder.create_dataset("labels").with_vlen_strings(&refs);
+        builder.write(&path).unwrap();
+    });
+
+    // The collections this write builds hold the payload, so its size is a floor
+    // a measurement of nothing cannot reach.
+    assert!(
+        measured.bytes >= PAYLOAD_BYTES as u64,
+        "the heap collections this write built are not in its own measurement, so \
+         the bounds below are measuring something other than the write: {measured}"
+    );
+
+    // Measured at 104 allocations for 32,768 strings: the collections, the
+    // reference vector, the file image and the object headers. One per string is
+    // the defect.
+    assert!(
+        measured.blocks < (N0 / 8) as u64,
+        "a variable-length string write must not allocate per string: measured \
+         {measured} over {N0} strings"
+    );
+
+    // Measured at 1.57 copies of the payload: the heap collections it is written
+    // into, and the file image assembled around them, with the 16-byte reference
+    // per element beside those. One more whole copy — the caller's strings owned
+    // before staging, however few allocations that took — is 2.8, and this bound
+    // sits below it.
+    assert!(
+        measured.bytes < (PAYLOAD_BYTES * 2) as u64,
+        "a variable-length string write may hold the payload about once, not one \
+         time more: measured {measured} against a {PAYLOAD_BYTES}-byte payload"
+    );
+
+    // The file must still be the right file.
+    let file = File::open(&path).unwrap();
+    let back = file.dataset("labels").unwrap().read_string().unwrap();
+    assert_eq!(back.len(), N0);
+    assert_eq!(back[N0 - 1], strings[N0 - 1]);
+}
+
+/// One in-place append allocates on the order of its own batch, not of the
+/// dataset it grows.
+///
+/// This is the write path that runs many times over one file, so a per-call cost
+/// that scales with what is already there is what turns a long append loop
+/// quadratic. The measurement is of the *last* append, onto a dataset already
+/// several hundred times the batch, so a term in the dataset's size cannot hide
+/// in a term in the batch's.
+#[test]
+fn one_append_costs_its_batch_not_the_dataset() {
+    const CHUNK_ELEMS: u64 = 512;
+    const BATCH_BYTES: usize = CHUNK_ELEMS as usize * 8;
+    const WARMUP_APPENDS: usize = 512;
+    const DATASET_BYTES: usize = (WARMUP_APPENDS + 1) * BATCH_BYTES;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("growing.h5");
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("t")
+        .with_f64_data(&[0.0f64; CHUNK_ELEMS as usize])
+        .with_shape(&[CHUNK_ELEMS])
+        .with_maxshape(&[u64::MAX])
+        .with_chunks(&[CHUNK_ELEMS]);
+    builder.write(&path).unwrap();
+
+    let batch: Vec<f64> = (0..CHUNK_ELEMS).map(|i| i as f64).collect();
+    {
+        // One barrier at close rather than one per append: an `fsync` apiece
+        // would make this test's runtime, not its allocations, the thing to look
+        // at (see the `Allocation gates` section of CLAUDE.md).
+        let file = hdf5_pure::File::open_rw_with_options(
+            &path,
+            hdf5_pure::FileAccessProperties::new().with_sync_policy(hdf5_pure::SyncPolicy::OnClose),
+        )
+        .unwrap();
+        let mut ds = file.dataset("t").unwrap();
+        for _ in 0..WARMUP_APPENDS {
+            ds.append(&batch).unwrap();
+        }
+
+        let (_, measured) = measure("append_in_place", || ds.append(&batch).unwrap());
+
+        // The batch's own bytes are staged inside this measurement, so their size
+        // is a floor a measurement of nothing cannot reach.
+        assert!(
+            measured.bytes >= BATCH_BYTES as u64,
+            "the appended batch is not in this append's own measurement, so the \
+             bounds below are measuring something other than the append: {measured}"
+        );
+
+        // Measured at 14 KiB and 28 allocations for a 4 KiB batch onto a 2 MiB
+        // dataset: the batch staged and written, and the chunk index and object
+        // header around it. The same append measured against datasets of 17,
+        // 513 and 4,097 chunks costs 13.4, 14.3 and 15.3 KiB and 28 allocations
+        // throughout — the growth is in the index's *depth*, not its size, so
+        // eight batches' worth is a ceiling with room in it, and anything
+        // proportional to the dataset (512 batches here) is far above it.
+        assert!(
+            measured.bytes < (BATCH_BYTES * 8) as u64,
+            "one append must allocate on the order of its {BATCH_BYTES}-byte batch, \
+             not of the {DATASET_BYTES}-byte dataset it grows: measured {measured}"
+        );
+        assert!(
+            measured.blocks < 128,
+            "one append must cost a bounded number of allocations, whatever the \
+             dataset's size: measured {measured}"
+        );
+    }
+
+    // The session is closed before reading: an open read-write file holds a lock
+    // that a second open refuses on Windows.
+    let file = File::open(&path).unwrap();
+    let back = file.dataset("t").unwrap().read_f64().unwrap();
+    // The dataset it was written with, plus the warmup appends and the measured
+    // one.
+    assert_eq!(back.len(), (WARMUP_APPENDS + 2) * CHUNK_ELEMS as usize);
+    assert_eq!(back[back.len() - 1], (CHUNK_ELEMS - 1) as f64);
+}
