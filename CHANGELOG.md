@@ -27,6 +27,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- An Extensible Array header naming a filtered element too narrow to hold the address and filter mask it must contain is refused; the size arithmetic previously underflowed, panicking under the overflow checks tests and fuzz targets build with.
+- A truncated Extensible Array index block is refused when the file is read whole, where the reader returned the chunks it had and reported success; reading the same file through `File::open_streaming` already refused it.
 - A deflated chunk whose zlib stream ends without reaching its checksum is refused rather than decoded. Such a chunk read as valid data whenever it happened to decode to the expected length, since the adler32 that would have caught it was never reached ([#228](https://github.com/stephenberry/hdf5-pure/issues/228)).
 - A datatype declaring a zero-byte element size is refused with the new `FormatError::ZeroSizedDatatype` when its message is parsed; reading such a dataset previously panicked on a division by that size ([#268](https://github.com/stephenberry/hdf5-pure/issues/268)).
 - Writing a dataset or committed datatype whose element size is zero is refused with the same error, on both the whole-file and `File::open_rw` paths; a chunked write of one previously panicked, and a contiguous one produced a file this crate refuses to read ([#268](https://github.com/stephenberry/hdf5-pure/issues/268)).
