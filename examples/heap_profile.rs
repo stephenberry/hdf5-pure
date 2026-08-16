@@ -57,8 +57,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let labels = dir.path().join("labels.h5");
 
     {
-        let _region = heapscope::region("write chunked");
+        // Built outside the region, as for the strings below: the 8 MiB of input
+        // is the caller's, and counting it here would report the writer as
+        // holding one more copy than it does.
         let data: Vec<f64> = (0..ELEMENTS).map(|i| i as f64).collect();
+        let _region = heapscope::region("write chunked");
         let mut builder = FileBuilder::new();
         builder
             .create_dataset("t")
@@ -69,11 +72,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     {
-        let _region = heapscope::region("write vlen strings");
+        // The strings are built outside the region: this profile is of what the
+        // crate allocates, and 32k `format!` calls would otherwise be four fifths
+        // of this phase's blocks and read as the writer's.
         let strings: Vec<String> = (0..LABELS)
             .map(|i| format!("{i:0>width$}", width = LABEL_LEN))
             .collect();
         let refs: Vec<&str> = strings.iter().map(String::as_str).collect();
+        let _region = heapscope::region("write vlen strings");
         let mut builder = FileBuilder::new();
         builder.create_dataset("labels").with_vlen_strings(&refs);
         builder.write(&labels)?;

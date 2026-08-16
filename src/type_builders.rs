@@ -1011,20 +1011,18 @@ pub(crate) const VL_REF_SIZE: usize = 16;
 /// object's 1-based index within its own collection — matching
 /// [`build_global_heap_collections_from_bytes`]. Null elements carry a zero
 /// address and object index 0, and are never patched so they read back as null.
+/// The element bytes this accompanies are returned beside it rather than held
+/// here: they are the dataset's data, and the builder's `data` field is where
+/// they live. Carrying them in both places cost a copy of every reference in the
+/// dataset for a field nothing read afterwards (issue #228).
 pub(crate) struct VlStringStaging {
-    /// The dataset/attribute element bytes. For a dataset whose datatype *is*
-    /// variable-length this is one 16-byte reference per element; for one that
-    /// merely *contains* variable-length members (a compound, or an array of
-    /// them) it is the full element bytes with the embedded references stamped
-    /// in place.
-    pub refs: Vec<u8>,
     /// The serialized global heap collections holding the non-null objects, in
     /// the order their objects appear. Empty when there are no such objects.
     pub collections: Vec<Vec<u8>>,
-    /// Byte offset within [`refs`](Self::refs) of each reference that names a
-    /// heap object and so needs its address patched once the collections are
-    /// placed, in the same order as those objects. Null references are absent:
-    /// their address must stay zero so they read back as null.
+    /// Byte offset within the element bytes of each reference that names a heap
+    /// object and so needs its address patched once the collections are placed,
+    /// in the same order as those objects. Null references are absent: their
+    /// address must stay zero so they read back as null.
     pub patch_offsets: Vec<usize>,
 }
 
@@ -1039,15 +1037,37 @@ pub(crate) struct VlStringStaging {
 pub(crate) fn stage_vl_elements(
     elements: &[VlStringElement],
     element_size: NonZeroUsize,
-) -> VlStringStaging {
+) -> (Vec<u8>, VlStringStaging) {
+    stage_vl_payloads(
+        elements.iter().map(|e| match e {
+            VlStringElement::Null => None,
+            VlStringElement::Bytes(bytes) => Some(bytes.as_slice()),
+        }),
+        element_size,
+    )
+}
+
+/// [`stage_vl_elements`] over payloads the caller has not had to own.
+///
+/// A writer that already holds its strings — `with_vlen_strings` is handed
+/// `&[&str]` — would otherwise copy every one of them into a
+/// [`VlStringElement::Bytes`] first, which is the whole payload again in one
+/// allocation per element: 4 MiB in 32,768 blocks to write 4 MiB of text
+/// (issue #228). The bytes are copied once, into the heap collections, which is
+/// where they have to end up.
+pub(crate) fn stage_vl_payloads<'a>(
+    payloads: impl ExactSizeIterator<Item = Option<&'a [u8]>>,
+    element_size: NonZeroUsize,
+) -> (Vec<u8>, VlStringStaging) {
     // Collect the non-null payloads in order; their positions become the heap
     // object indices, 1-based within each collection.
+    let count = payloads.len();
     let mut objects: Vec<&[u8]> = Vec::new();
-    let mut refs = Vec::with_capacity(elements.len() * VL_REF_SIZE);
-    let mut patch_offsets = Vec::with_capacity(elements.len());
-    for element in elements {
+    let mut refs = Vec::with_capacity(count * VL_REF_SIZE);
+    let mut patch_offsets = Vec::with_capacity(count);
+    for element in payloads {
         match element {
-            VlStringElement::Null => {
+            None => {
                 // A null VL reference: HDF5 marks "no heap object" with a zero
                 // heap address (`H5T__vlen_disk_isnull` tests addr == 0), not the
                 // all-ones "undefined address" sentinel — the reference C library
@@ -1056,7 +1076,7 @@ pub(crate) fn stage_vl_elements(
                 refs.extend_from_slice(&0u64.to_le_bytes()); // null heap address
                 refs.extend_from_slice(&0u32.to_le_bytes()); // object index 0
             }
-            VlStringElement::Bytes(bytes) => {
+            Some(bytes) => {
                 patch_offsets.push(refs.len());
                 #[expect(
                     clippy::cast_possible_truncation,
@@ -1080,11 +1100,13 @@ pub(crate) fn stage_vl_elements(
     // A dataset of only null elements (or an empty dataset) references no heap
     // object, so it gets no collection at all — there is nothing to patch and a
     // 4096-byte empty GCOL would be dead weight.
-    VlStringStaging {
+    (
         refs,
-        collections: build_global_heap_collections_from_bytes(&objects),
-        patch_offsets,
-    }
+        VlStringStaging {
+            collections: build_global_heap_collections_from_bytes(&objects),
+            patch_offsets,
+        },
+    )
 }
 
 /// Stage the global-heap collections for a dataset whose datatype merely
@@ -1102,7 +1124,7 @@ pub(crate) fn stage_embedded_vl_elements(
     mut raw: Vec<u8>,
     offsets: &[usize],
     elements: &[VlStringElement],
-) -> VlStringStaging {
+) -> (Vec<u8>, VlStringStaging) {
     debug_assert_eq!(
         offsets.len(),
         elements.len(),
@@ -1131,11 +1153,13 @@ pub(crate) fn stage_embedded_vl_elements(
             }
         }
     }
-    VlStringStaging {
-        collections: build_global_heap_collections_from_bytes(&objects),
-        refs: raw,
-        patch_offsets,
-    }
+    (
+        raw,
+        VlStringStaging {
+            collections: build_global_heap_collections_from_bytes(&objects),
+            patch_offsets,
+        },
+    )
 }
 
 /// Patch the heap address of each VL reference named by `patch_offsets`, leaving
@@ -2094,12 +2118,15 @@ impl DatasetBuilder {
     /// one, nor carry embedded NULs, non-UTF-8 payloads, or a specific
     /// charset/padding.
     pub fn with_vlen_strings(&mut self, values: &[&str]) -> &mut Self {
-        let datatype = make_vlen_string_type(CharacterSet::Utf8);
-        let elements: Vec<VlStringElement> = values
-            .iter()
-            .map(|s| VlStringElement::Bytes(s.as_bytes().to_vec()))
-            .collect();
-        self.stage_vlen_strings(datatype, &elements);
+        // Staged straight from the caller's strings: owning each one first would
+        // copy the whole payload for nothing (see [`stage_vl_payloads`]). A VL
+        // string's base type is one byte, so the reference length is the byte
+        // count.
+        self.stage_vlen(
+            make_vlen_string_type(CharacterSet::Utf8),
+            values.len() as u64,
+            stage_vl_payloads(values.iter().map(|s| Some(s.as_bytes())), NonZeroUsize::MIN),
+        );
         self
     }
 
@@ -2194,9 +2221,9 @@ impl DatasetBuilder {
         offsets: &[usize],
         elements: &[VlStringElement],
     ) -> &mut Self {
-        let staging = stage_embedded_vl_elements(raw, offsets, elements);
+        let (element_bytes, staging) = stage_embedded_vl_elements(raw, offsets, elements);
         self.datatype = Some(datatype);
-        self.data = Some(staging.refs.clone());
+        self.data = Some(element_bytes);
         self.vl_string_staging = Some(staging);
         if self.shape.is_none() {
             self.shape = Some(vec![num_elements]);
@@ -2213,12 +2240,22 @@ impl DatasetBuilder {
         element_size: NonZeroUsize,
     ) {
         let n = elements.len() as u64;
-        let staging = stage_vl_elements(elements, element_size);
+        self.stage_vlen(datatype, n, stage_vl_elements(elements, element_size));
+    }
+
+    /// Record staged variable-length element bytes and their heap collections on
+    /// the builder.
+    fn stage_vlen(
+        &mut self,
+        datatype: Datatype,
+        num_elements: u64,
+        (element_bytes, staging): (Vec<u8>, VlStringStaging),
+    ) {
         self.datatype = Some(datatype);
-        self.data = Some(staging.refs.clone());
+        self.data = Some(element_bytes);
         self.vl_string_staging = Some(staging);
         if self.shape.is_none() {
-            self.shape = Some(vec![n]);
+            self.shape = Some(vec![num_elements]);
         }
     }
 

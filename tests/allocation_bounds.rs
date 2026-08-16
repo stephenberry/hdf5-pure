@@ -486,3 +486,68 @@ fn opening_one_child_does_not_allocate_per_child_of_the_group() {
     assert_eq!(by_path.read_i32().unwrap(), vec![(OBJECTS - 1) as i32]);
     assert_eq!(by_name.read_i32().unwrap(), vec![(OBJECTS - 1) as i32]);
 }
+
+/// Writing variable-length strings copies the text into the heap collections it
+/// has to end up in, and not into a per-element buffer on the way.
+///
+/// The writer is handed `&[&str]` and used to own each one before staging it: a
+/// second copy of the whole payload, in one allocation per string — 4 MiB in
+/// 32,768 blocks to write 4 MiB of text (issue #228). The count is the axis that
+/// names that defect, since a copy made one string at a time is one allocation
+/// per string whatever it costs in bytes; the byte bound beside it is the one
+/// that would still catch the same copy made in a single buffer.
+#[test]
+fn vlen_string_write_does_not_own_each_string_before_staging_it() {
+    const N0: usize = 32 * 1024;
+    const STR_LEN: usize = 128;
+    const PAYLOAD_BYTES: usize = N0 * STR_LEN;
+
+    // Built before the measurement: these are the caller's strings, and the
+    // question is what the writer adds to them.
+    let strings: Vec<String> = (0..N0)
+        .map(|i| format!("{i:0>width$}", width = STR_LEN))
+        .collect();
+    let refs: Vec<&str> = strings.iter().map(String::as_str).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("vlen.h5");
+
+    let (_, measured) = measure("vlen_string_write", || {
+        let mut builder = FileBuilder::new();
+        builder.create_dataset("labels").with_vlen_strings(&refs);
+        builder.write(&path).unwrap();
+    });
+
+    // The collections this write builds hold the payload, so its size is a floor
+    // a measurement of nothing cannot reach.
+    assert!(
+        measured.bytes >= PAYLOAD_BYTES as u64,
+        "the heap collections this write built are not in its own measurement, so \
+         the bounds below are measuring something other than the write: {measured}"
+    );
+
+    // Measured at 104 allocations for 32,768 strings: the collections, the
+    // reference vector, the file image and the object headers. One per string is
+    // the defect.
+    assert!(
+        measured.blocks < (N0 / 8) as u64,
+        "a variable-length string write must not allocate per string: measured \
+         {measured} over {N0} strings"
+    );
+
+    // Measured at 1.57 copies of the payload: the heap collections it is written
+    // into, and the file image assembled around them, with the 16-byte reference
+    // per element beside those. One more whole copy — the caller's strings owned
+    // before staging, however few allocations that took — is 2.8, and this bound
+    // sits below it.
+    assert!(
+        measured.bytes < (PAYLOAD_BYTES * 2) as u64,
+        "a variable-length string write may hold the payload about once, not one \
+         time more: measured {measured} against a {PAYLOAD_BYTES}-byte payload"
+    );
+
+    // The file must still be the right file.
+    let file = File::open(&path).unwrap();
+    let back = file.dataset("labels").unwrap().read_string().unwrap();
+    assert_eq!(back.len(), N0);
+    assert_eq!(back[N0 - 1], strings[N0 - 1]);
+}
