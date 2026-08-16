@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.38.0] - 2026-08-16
+
+Reading and writing cost substantially less memory. A chunked read allocates about half as much, a variable-length read is roughly an order of magnitude faster over a large heap collection and allocates forty times less often, a deflated write allocates thirty-five times less, and writing a chunked dataset allocates a quarter as often for about 25% fewer bytes: the zlib codec is built once per call rather than once per chunk, sizing a structure no longer builds it once to measure and again to keep, and a whole read fills the chunk cache instead of evicting its own chunks ([#228](https://github.com/stephenberry/hdf5-pure/issues/228), [#265](https://github.com/stephenberry/hdf5-pure/issues/265), [#275](https://github.com/stephenberry/hdf5-pure/issues/275)). Two test binaries hold those figures in place: `tests/allocation_bounds.rs` states the scaling rules and runs in every configuration, and `tests/allocation_baseline.rs` pins the exact numbers on one platform behind the new `heap-baseline` feature. On the writing side, `Dataset::buffered_appender` holds appended elements in memory and writes them a whole chunk at a time, so a filtered dataset takes an append of any length ([#262](https://github.com/stephenberry/hdf5-pure/issues/262)); `FileAccessProperties::with_sync_policy(SyncPolicy::OnClose)` drops the `fsync` from every commit and append in favour of one at `close`, with the new `File::sync` for checkpoints in between ([#263](https://github.com/stephenberry/hdf5-pure/issues/263)); and a `File::open_rw` commit reuses freed space for chunk data, chunk indexes and dense attribute heaps where it always appended, paged files included ([#261](https://github.com/stephenberry/hdf5-pure/issues/261)). Four kinds of malformed file that used to panic or decode as valid are now refused: a datatype declaring a zero-byte element size ([#268](https://github.com/stephenberry/hdf5-pure/issues/268)), an Extensible Array element too narrow to hold the address it must contain, a truncated Extensible Array index block ([#278](https://github.com/stephenberry/hdf5-pure/pull/278)), and a deflated chunk whose zlib stream ends before its checksum, which read as valid data whenever it happened to decode to the expected length ([#228](https://github.com/stephenberry/hdf5-pure/issues/228)). **Breaking:** the `parallel` cargo feature and its `rayon` dependency are gone — the feature gated a chunked-read path no public entry point reached, so no read changes behavior — along with seven names deprecated in 0.26.0 and 0.28.0 and five error variants that were never constructed ([#280](https://github.com/stephenberry/hdf5-pure/pull/280)); `CompoundTypeBuilder::build` returns a `Result`, and `FormatError::ShapeDataMismatch` carries its element size as a `NonZeroUsize`. Files written by earlier versions still read.
+
 ### Added
 
 - The `heap-baseline` cargo feature enables a maintainer-only test that checks this crate's recorded allocation figures; it is not a run-time dependency ([#228](https://github.com/stephenberry/hdf5-pure/issues/228)).
@@ -698,7 +702,8 @@ Internal robustness and tests ([#26](https://github.com/stephenberry/hdf5-pure/i
 - The MAT deserializer flattens 1×N and N×1 values to a 1-D sequence in `deserialize_any` (matching `deserialize_seq`).
 - Numeric/complex readers preserve 1×N / N×1 shape at the value layer; any flattening happens at the serde level.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.36.0...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.38.0...HEAD
+[0.38.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.36.0...v0.38.0
 [0.36.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.35.0...v0.36.0
 [0.35.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.34.0...v0.35.0
 [0.34.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.33.0...v0.34.0
