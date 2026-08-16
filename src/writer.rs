@@ -131,12 +131,6 @@ impl FileBuilder {
         self
     }
 
-    /// Former name of [`with_create_properties`](Self::with_create_properties).
-    #[deprecated(since = "0.26.0", note = "renamed to `with_create_properties`")]
-    pub fn with_create_options(&mut self, properties: FileCreateProperties) -> &mut Self {
-        self.with_create_properties(properties)
-    }
-
     /// Set the userblock size in bytes: zero (no userblock), or a power of two of
     /// at least 512. The region is filled with zeros.
     ///

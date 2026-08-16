@@ -64,13 +64,6 @@ pub struct FileCreateProperties {
     file_space_page_size: Option<u64>,
 }
 
-/// Former name of [`FileCreateProperties`].
-#[deprecated(
-    since = "0.26.0",
-    note = "renamed to `FileCreateProperties`: a type standing in for a whole HDF5 property list now carries the `Properties` suffix"
-)]
-pub type FileCreateOptions = FileCreateProperties;
-
 impl FileCreateProperties {
     /// A value carrying the crate's default creation behavior: no userblock,
     /// no library-version bounds, and the writer's default file-space handling.

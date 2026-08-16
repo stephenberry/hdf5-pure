@@ -137,15 +137,6 @@ fn bounded_refuses_the_file_open_rw_would_mirror() {
         msg.contains("userblock"),
         "the refusal should name the userblock, got: {msg}"
     );
-
-    // The deprecated entry point is the same request spelled the old way.
-    #[allow(deprecated)]
-    let old = File::open_rw_bounded(&path);
-    assert_eq!(
-        old.unwrap_err().to_string(),
-        msg,
-        "open_rw_bounded must stay an alias for the strict strategy"
-    );
 }
 
 /// `Mirrored` is the escape hatch back to what `open_rw` did before it learned to
@@ -179,10 +170,8 @@ fn an_explicit_strategy_overrides_either_entry_point() {
         "the refusal should name what the bounded engine cannot edit, got: {err}"
     );
 
-    // open_rw_bounded defaults to refusing; asking for Auto falls back instead.
-    #[allow(deprecated)]
-    let file =
-        File::open_rw_bounded_with_options(&path, with_strategy(MemoryStrategy::Auto)).unwrap();
+    // ...and an explicit Auto falls back where Bounded refuses.
+    let file = File::open_rw_with_options(&path, with_strategy(MemoryStrategy::Auto)).unwrap();
     assert_eq!(file.edit_backing(), Some(EditBacking::Mirrored));
 }
 

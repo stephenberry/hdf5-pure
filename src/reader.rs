@@ -54,8 +54,7 @@ use crate::types::{AttrValue, DType, attrs_to_map, classify_datatype};
 enum Backend {
     InMemory(Vec<u8>),
     Streaming(Box<dyn Source + Send + Sync>),
-    /// A read-write file opened with [`File::open_rw`] or
-    /// [`File::open_rw_bounded`]: a [`WriteEngine`] (exclusive OS lock + staged
+    /// A read-write file opened with [`File::open_rw`]: a [`WriteEngine`] (exclusive OS lock + staged
     /// edit queues + append geometry cache) behind a lock, so owned handles can
     /// both read and mutate in place. Handle write methods route to the engine,
     /// and `File::commit` applies staged structural edits.
@@ -137,13 +136,6 @@ pub struct FileAccessProperties {
     sync_policy: SyncPolicy,
 }
 
-/// Former name of [`FileAccessProperties`].
-#[deprecated(
-    since = "0.26.0",
-    note = "renamed to `FileAccessProperties`: a type standing in for a whole HDF5 property list now carries the `Properties` suffix"
-)]
-pub type FileAccessOptions = FileAccessProperties;
-
 impl FileAccessProperties {
     /// A value carrying the crate's default access behavior.
     pub const fn new() -> Self {
@@ -193,10 +185,10 @@ impl FileAccessProperties {
     /// Unset by default, which lets the entry point choose:
     /// [`File::open_rw`] uses [`MemoryStrategy::Auto`], preferring the bounded
     /// engine and falling back to the whole-file mirror for a file it cannot
-    /// edit, while the deprecated [`File::open_rw_bounded`] uses
-    /// [`MemoryStrategy::Bounded`], refusing such a file rather than quietly
-    /// spending `O(file size)` memory on a caller who asked not to. Setting this
-    /// overrides both, in either direction; [`MemoryStrategy::Mirrored`] takes
+    /// edit. Setting this overrides that default, in either direction, so
+    /// [`MemoryStrategy::Bounded`] refuses such a file rather than quietly
+    /// spending `O(file size)` memory on a caller who asked not to;
+    /// [`MemoryStrategy::Mirrored`] takes
     /// the whole-file mirror unconditionally, as `open_rw` did before it learned
     /// to dispatch.
     ///
@@ -283,10 +275,10 @@ impl FileAccessProperties {
     /// and the entry point's own default applies. This is what was *requested*;
     /// for which backend an open resolved to, see [`File::edit_backing`].
     ///
-    /// The `Option` exists so the deprecated [`File::open_rw_bounded`] can
-    /// default to [`MemoryStrategy::Bounded`] while [`File::open_rw`] defaults to
-    /// [`MemoryStrategy::Auto`]; when that pair is removed this should collapse to
-    /// a plain `MemoryStrategy` with `Auto` as the default, in that same release
+    /// The `Option` distinguishes "no preference stated" from an explicit
+    /// [`MemoryStrategy::Auto`], which is what lets an entry point supply its own
+    /// default without overriding a caller who asked for one; `None` resolves to
+    /// [`MemoryStrategy::Auto`], the only default any entry point now supplies
     /// rather than as a second break on this accessor.
     pub const fn memory_strategy(&self) -> Option<MemoryStrategy> {
         self.memory_strategy
@@ -329,13 +321,6 @@ impl FileAccessProperties {
 pub struct DatasetAccessProperties {
     chunk_cache: Option<ChunkCacheConfig>,
 }
-
-/// Former name of [`DatasetAccessProperties`].
-#[deprecated(
-    since = "0.26.0",
-    note = "renamed to `DatasetAccessProperties`: a type standing in for a whole HDF5 property list now carries the `Properties` suffix"
-)]
-pub type DatasetAccessOptions = DatasetAccessProperties;
 
 impl DatasetAccessProperties {
     /// A value that inherits every file-wide access default.
@@ -615,10 +600,9 @@ impl FileInner {
 
     /// Open read-write under the properties' memory strategy, falling back to
     /// `default` when the caller expressed none. The two public read-write entry
-    /// points differ only in that default: [`File::open_rw`] prefers the bounded
-    /// engine but takes the mirror for a file the bounded engine cannot edit,
-    /// while [`File::open_rw_bounded`] refuses that file instead (issue #198,
-    /// step 4).
+    /// [`File::open_rw`] passes [`MemoryStrategy::Auto`]: prefer the bounded
+    /// engine, but take the mirror for a file the bounded engine cannot edit
+    /// (issue #198, step 4). A caller who states a strategy overrides it.
     fn open_rw_with_default<P: AsRef<std::path::Path>>(
         path: P,
         properties: FileAccessProperties,
@@ -692,15 +676,6 @@ impl FileInner {
         let mut inner = Self::from_rw_session(session, properties)?;
         inner.swmr_write = true;
         Ok(inner)
-    }
-
-    /// Open for bounded-memory reading and appending (issue #147): no
-    /// whole-file mirror, and no fallback to one; see [`File::open_rw_bounded`].
-    fn open_rw_bounded<P: AsRef<std::path::Path>>(
-        path: P,
-        properties: FileAccessProperties,
-    ) -> Result<Self, Error> {
-        Self::open_rw_with_default(path, properties, MemoryStrategy::Bounded)
     }
 
     /// After the caller has confirmed a [`Backend::Edit`] backend, gate the
@@ -1893,112 +1868,6 @@ impl File {
         })
     }
 
-    /// Open an existing HDF5 file for reading and editing with **bounded
-    /// memory** (issue #147): no whole-file mirror is ever built, so peak
-    /// memory stays at the metadata being parsed plus the configured caches
-    /// plus a few chunks of append working set — independent of the file size
-    /// and of the size of each append call.
-    ///
-    /// # Deprecated
-    ///
-    /// [`open_rw`](Self::open_rw) now edits such a file bounded on its own, so
-    /// this is no longer a different capability set — only a different default
-    /// for a file the bounded engine cannot edit (a pre-v2 superblock, or a
-    /// userblock). This refuses that file with
-    /// [`Error::EditUnsupported`](crate::Error::EditUnsupported); `open_rw`
-    /// mirrors it instead. To keep the refusal, say so:
-    ///
-    /// ```no_run
-    /// use hdf5_pure::{File, FileAccessProperties, MemoryStrategy};
-    /// # fn main() -> Result<(), hdf5_pure::Error> {
-    /// let file = File::open_rw_with_options(
-    ///     "data.h5",
-    ///     FileAccessProperties::new().with_memory_strategy(MemoryStrategy::Bounded),
-    /// )?;
-    /// # Ok(()) }
-    /// ```
-    ///
-    /// # Behavior
-    ///
-    /// This is the read-write sibling of [`open_streaming`](Self::open_streaming):
-    /// reads are served by positioned I/O with the same capabilities as the
-    /// streaming backend, while immediate [`Dataset::append`] runs the same
-    /// crash-atomic engine as [`open_rw`](Self::open_rw) — a filtered dataset
-    /// must start chunk-aligned, an unfiltered one need not — durable before it
-    /// returns, no `commit` needed.
-    /// A large append is applied in whole-chunk batches, each crash-atomic, so
-    /// a crash mid-call leaves a valid shorter dataset. An exclusive OS file
-    /// lock is held for the file's life.
-    ///
-    /// The staged edit surface ([`Dataset::write`]/`set_attr`/`append_staged`,
-    /// [`Group::create_dataset`]/`create_group`/`delete`/`set_attr`,
-    /// [`commit`](Self::commit)/[`copy`](Self::copy)/[`copy_from`](Self::copy_from),
-    /// and [`space_accounting`](Self::space_accounting)) is the same as
-    /// [`open_rw`](Self::open_rw)'s: both open the same engine, differing only in
-    /// how it holds the file's bytes (issue #198). A commit here holds only what
-    /// it is building, so its resident memory is bounded by the edit rather than
-    /// by the file — with [`copy`](Self::copy) the exception, since copying an
-    /// object reads the whole of it into memory first.
-    ///
-    /// A file that persists its free space
-    /// (`H5Pset_file_space_strategy(persist = true)`, non-paged) is supported:
-    /// its on-disk free-space managers are seeded at open and rewritten into
-    /// canonical shape when the file is closed — by an explicit
-    /// [`close`](Self::close) or, best-effort, when the last handle drops (issue
-    /// #173). Only a true crash (`SIGKILL`, power loss) skips that rewrite; the
-    /// appended data is still durable — under the default
-    /// [`SyncPolicy::Always`](crate::SyncPolicy) — and reopens correctly, the
-    /// managers merely staying non-canonical until the next clean rewrite. A genuine **paged** file
-    /// (`H5F_FSPACE_STRATEGY_PAGE` with `persist = true`) is also supported:
-    /// appends stay page-homogeneous (raw and metadata in separate pages) and
-    /// the per-page-type managers are rewritten at close. A paged file that
-    /// does *not* persist its free space is refused at open — recreate it with
-    /// `persist = true` to grow it in place. That refusal is shared with
-    /// `open_rw`, which cannot commit such a file either.
-    ///
-    /// Requires a latest-format (v2/v3 superblock) file with 8-byte offsets and
-    /// lengths and no userblock; other files are refused at open with
-    /// [`Error::EditUnsupported`](crate::Error::EditUnsupported).
-    #[deprecated(
-        since = "0.28.0",
-        note = "use `File::open_rw`, which now edits such a file bounded on its own; for the strict refusal, pass `FileAccessProperties::new().with_memory_strategy(MemoryStrategy::Bounded)` to `File::open_rw_with_options`"
-    )]
-    pub fn open_rw_bounded<P: AsRef<std::path::Path>>(path: P) -> Result<Self, Error> {
-        Self::open_rw_bounded_inner(path, FileAccessProperties::new())
-    }
-
-    /// Open a file for bounded-memory reading and appending with explicit
-    /// access properties — see [`open_rw_bounded`](Self::open_rw_bounded), which
-    /// this is deprecated alongside.
-    ///
-    /// Both configured caches apply to this backend: the metadata cache bounds
-    /// bytes retained for metadata reads (entries touched by an in-place write
-    /// are invalidated, so reads never observe stale bytes), and the chunk
-    /// cache bounds decompressed chunks retained by each [`Dataset`] handle. An
-    /// explicit [`FileAccessProperties::with_memory_strategy`] wins over this
-    /// entry point's bounded default, in either direction.
-    #[deprecated(
-        since = "0.28.0",
-        note = "use `File::open_rw_with_options`; it honors the same `with_memory_strategy`, and defaults to falling back to the mirror rather than refusing"
-    )]
-    pub fn open_rw_bounded_with_options<P: AsRef<std::path::Path>>(
-        path: P,
-        properties: FileAccessProperties,
-    ) -> Result<Self, Error> {
-        Self::open_rw_bounded_inner(path, properties)
-    }
-
-    /// The body both deprecated bounded entry points share, so that neither has
-    /// to call the other and trip its own deprecation warning.
-    fn open_rw_bounded_inner<P: AsRef<std::path::Path>>(
-        path: P,
-        properties: FileAccessProperties,
-    ) -> Result<Self, Error> {
-        Ok(File {
-            inner: Arc::new(FileInner::open_rw_bounded(path, properties)?),
-        })
-    }
-
     /// Clear a stale SWMR-write flag left in `path` by a writer that exited
     /// without a clean [`close`](Self::close) — the `h5clear -s` equivalent, for
     /// recovering a file that both this crate and the reference C library
@@ -2306,12 +2175,6 @@ impl File {
     /// Return the access properties used when opening this file.
     pub fn access_properties(&self) -> FileAccessProperties {
         self.inner.access_properties()
-    }
-
-    /// Former name of [`access_properties`](Self::access_properties).
-    #[deprecated(since = "0.26.0", note = "renamed to `access_properties`")]
-    pub fn access_options(&self) -> FileAccessProperties {
-        self.access_properties()
     }
 
     /// Which backend this file's read-write session resolved to:
@@ -3142,8 +3005,8 @@ impl Dataset {
     /// (unlimited) dimension, and refresh this handle so subsequent reads observe
     /// the new length.
     ///
-    /// The file must have been opened for writing with [`File::open_rw`] or
-    /// [`File::open_rw_bounded`]; a read-only file returns
+    /// The file must have been opened for writing with [`File::open_rw`];
+    /// a read-only file returns
     /// [`Error::ReadOnly`](crate::Error::ReadOnly). The target must be a chunked,
     /// rank-1, unlimited, Extensible-Array-indexed dataset, and a filtered one
     /// must already be a whole number of chunks long — growing a trailing chunk
@@ -3942,7 +3805,7 @@ impl Dataset {
     /// The string slice passed to `visitor` is valid only for the duration of
     /// that callback. This avoids retaining all decoded string payloads at once.
     ///
-    /// On a read-write file ([`File::open_rw`] / [`File::open_rw_bounded`]) the
+    /// On a read-write file ([`File::open_rw`]) the
     /// visitor runs while the file's engine lock is held, so it must not read
     /// or write through this file (or a clone / handle of it) — doing so
     /// deadlocks. Collect values and act on them after the call instead.
@@ -5835,15 +5698,15 @@ mod tests {
         );
         drop(swmr);
 
-        #[expect(
-            deprecated,
-            reason = "the deprecated bounded open is still an entry point, and still has to carry the policy"
-        )]
-        let bounded = File::open_rw_bounded_with_options(fixture("bounded.h5"), props()).unwrap();
+        let bounded = File::open_rw_with_options(
+            fixture("bounded.h5"),
+            props().with_memory_strategy(MemoryStrategy::Bounded),
+        )
+        .unwrap();
         assert_eq!(
             policy_of(&bounded),
             SyncPolicy::OnClose,
-            "File::open_rw_bounded"
+            "File::open_rw_with_options (bounded)"
         );
     }
 

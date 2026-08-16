@@ -116,7 +116,7 @@ use serde::de::DeserializeOwned;
 ///
 /// # Sequence handling
 ///
-/// Numeric sequences whose elements share a class collapse to row/column vectors or 2-D matrices as before. Any sequence that doesn't (e.g. `Vec<MyStruct>`, `Vec<Option<T>>` with `None` interspersed, ragged `Vec<Vec<f64>>`, or mixed numeric tags) lowers to a MATLAB cell array; each element is interned under the conventional `#refs#` group and the parent dataset stores object references with `MATLAB_class="cell"`. `Option::None` inside a sequence becomes `struct([])` so each cell slot has a defined MATLAB type. Cases that previously errored with `MatError::RaggedMatrix` or `MatError::MixedSequenceElementTypes` now succeed via this fallback.
+/// Numeric sequences whose elements share a class collapse to row/column vectors or 2-D matrices as before. Any sequence that doesn't (e.g. `Vec<MyStruct>`, `Vec<Option<T>>` with `None` interspersed, ragged `Vec<Vec<f64>>`, or mixed numeric tags) lowers to a MATLAB cell array; each element is interned under the conventional `#refs#` group and the parent dataset stores object references with `MATLAB_class="cell"`. `Option::None` inside a sequence becomes `struct([])` so each cell slot has a defined MATLAB type. Cases that previously errored on a ragged or mixed-type sequence now succeed via this fallback.
 #[cfg(feature = "serde")]
 pub fn to_bytes<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, MatError> {
     ser::to_bytes(value)

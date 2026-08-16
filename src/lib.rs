@@ -168,8 +168,6 @@ pub(crate) mod free_space_manager;
 pub(crate) mod global_heap;
 pub(crate) mod group_v1;
 pub(crate) mod group_v2;
-#[cfg(feature = "parallel")]
-pub(crate) mod lane_partition;
 pub(crate) mod layout_info;
 pub(crate) mod libver;
 pub(crate) mod link_info;
@@ -179,8 +177,6 @@ pub(crate) mod lzf;
 pub(crate) mod message_type;
 pub(crate) mod object_header;
 pub(crate) mod object_header_writer;
-#[cfg(feature = "parallel")]
-pub(crate) mod parallel_read;
 pub(crate) mod scaleoffset;
 pub(crate) mod shared_message;
 pub(crate) mod signature;
@@ -246,11 +242,6 @@ pub use reader::{
     is_hdf5, is_hdf5_bytes,
 };
 
-// Renamed in 0.26.0; the aliases keep 0.25.0 call sites compiling for one cycle.
-#[cfg(feature = "std")]
-#[expect(deprecated)] // re-exporting the aliases; users still see the deprecation
-pub use reader::{DatasetAccessOptions, FileAccessOptions};
-
 // Curated layout / filter introspection (issue #149). Only the std-only reader
 // `Dataset` produces these, so gate the re-export to match the reader block
 // above; the types themselves are `alloc`-clean.
@@ -292,8 +283,6 @@ pub use element::H5Element;
 
 pub use scaleoffset::ScaleOffset;
 
-#[expect(deprecated)] // re-exporting the alias; users still see the deprecation
-pub use file_create_properties::FileCreateOptions;
 pub use file_create_properties::FileCreateProperties;
 pub use file_space_info::{FileSpaceInfo, FileSpaceStrategy};
 

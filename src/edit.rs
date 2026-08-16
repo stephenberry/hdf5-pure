@@ -648,9 +648,8 @@ struct FreeSnapshot {
 /// This is what a caller says about that trade-off, on
 /// [`FileAccessProperties::with_memory_strategy`](crate::FileAccessProperties::with_memory_strategy).
 /// Leaving it unset lets the entry point decide: [`File::open_rw`](crate::File::open_rw)
-/// prefers the bounded engine and falls back to the mirror ([`Auto`](Self::Auto)),
-/// while the deprecated [`File::open_rw_bounded`](crate::File::open_rw_bounded)
-/// refuses instead of falling back ([`Bounded`](Self::Bounded)).
+/// prefers the bounded engine and falls back to the mirror ([`Auto`](Self::Auto)).
+/// Stating [`Bounded`](Self::Bounded) refuses instead of falling back.
 ///
 /// This is a *request*, so it is deliberately not the type a file answers with:
 /// [`File::edit_backing`](crate::File::edit_backing) returns an [`EditBacking`],
@@ -664,8 +663,7 @@ struct FreeSnapshot {
 pub enum MemoryStrategy {
     /// Never build a whole-file mirror. A file the bounded engine cannot edit is
     /// refused at open with [`Error::EditUnsupported`], before anything is
-    /// staged. This is what
-    /// [`File::open_rw_bounded`](crate::File::open_rw_bounded) has always done.
+    /// staged.
     Bounded,
     /// Prefer the bounded engine, but fall back to the whole-file mirror for a
     /// file it cannot edit, rather than refusing. Memory then scales with the
@@ -1261,9 +1259,8 @@ impl WriteEngine {
     /// place that picks between the bounded backing (a [`HandleImage`] keeping no
     /// whole-file mirror, so resident memory is the metadata-cache budget plus
     /// whatever is being parsed) and the whole-file mirror. Backs
-    /// [`File::open_rw`](crate::File::open_rw) and the deprecated
-    /// [`File::open_rw_bounded`](crate::File::open_rw_bounded), which differ only
-    /// in the strategy they default to.
+    /// [`File::open_rw`](crate::File::open_rw), which selects between them by
+    /// the strategy it is given.
     ///
     /// The eligibility rules are checked here rather than deferred, because a
     /// caller who asked for bounded memory cannot be silently given the mirror

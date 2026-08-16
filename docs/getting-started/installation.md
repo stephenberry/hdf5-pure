@@ -43,7 +43,6 @@ hdf5-pure = { version = "0.14", features = ["ndarray", "serde", "zfp"] }
 | `ndarray` | | N-dimensional array I/O via the `ndarray` crate |
 | `zfp` | | Pure-Rust ZFP fixed-rate compression (HDF5 filter 32013) |
 | `fast-deflate` | | zlib-ng deflate backend (faster, links C) |
-| `parallel` | | Parallel chunk processing via `rayon` |
 | `provenance` | | SHA-256 data provenance tracking |
 
 See the [Cargo Features reference](../reference/features.md) for the full table

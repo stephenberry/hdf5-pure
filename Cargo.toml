@@ -1,6 +1,6 @@
 [package]
 name = "hdf5-pure"
-version = "0.37.0"
+version = "0.38.0"
 edition = "2024"
 # `std::fs::File` advisory locking (used by the write/edit/read open paths for
 # concurrent-writer detection, issue #73) stabilized in Rust 1.89.
@@ -16,11 +16,11 @@ build = "build.rs"
 exclude = ["tests/fixtures/**", "fuzz/**"]
 
 # Publish the full public API on docs.rs. The default feature set hides the
-# `ndarray`, `serde` (`mat`), `zfp`, `provenance`, and `parallel` surfaces (and
+# `ndarray`, `serde` (`mat`), `zfp`, and `provenance` surfaces (and
 # leaves their cross-references as dead links); `matio-crosscheck` is a
 # test-only feature and is deliberately excluded.
 [package.metadata.docs.rs]
-features = ["provenance", "parallel", "zfp", "ndarray", "serde", "num-complex"]
+features = ["provenance", "zfp", "ndarray", "serde", "num-complex"]
 
 [features]
 default = ["std", "checksum", "deflate"]
@@ -29,7 +29,6 @@ checksum = []
 deflate = ["flate2"]
 fast-deflate = ["flate2/zlib-ng"]
 provenance = ["sha2"]
-parallel = ["rayon"]
 # Pure-Rust ZFP fixed-rate compression filter (HDF5 filter ID 32013).
 # Supports f32/f64/i32/i64 datasets in 1D–4D.
 zfp = []
@@ -64,7 +63,6 @@ matio-crosscheck = ["serde"]
 byteorder = { version = "1", default-features = false }
 flate2 = { version = "1", optional = true, default-features = false, features = ["rust_backend"] }
 sha2 = { version = "0.10", optional = true, default-features = false }
-rayon = { version = "1", optional = true }
 serde = { version = "1", optional = true, default-features = false, features = ["derive", "alloc"] }
 # A permissive range (like `hdf5-metno`'s own `ndarray` requirement) so the
 # user's existing `ndarray` unifies with ours instead of compiling a second

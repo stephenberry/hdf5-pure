@@ -1,6 +1,6 @@
 # Cargo Features
 
-`hdf5-pure` is split into Cargo features so you only compile the parts you use. The defaults cover the common case (filesystem I/O plus the high-level reader and writer), while the optional features add MATLAB `.mat` support, alternative compression backends, N-dimensional array I/O, parallelism, and data provenance. This page is the complete reference for every feature, what it pulls in, and which guide page exercises it.
+`hdf5-pure` is split into Cargo features so you only compile the parts you use. The defaults cover the common case (filesystem I/O plus the high-level reader and writer), while the optional features add MATLAB `.mat` support, alternative compression backends, N-dimensional array I/O, and data provenance. This page is the complete reference for every feature, what it pulls in, and which guide page exercises it.
 
 For how to declare these in `Cargo.toml`, see [Installation](../getting-started/installation.md).
 
@@ -15,7 +15,6 @@ For how to declare these in `Cargo.toml`, see [Installation](../getting-started/
 | `fast-deflate` | no | `flate2/zlib-ng` | — | zlib-ng backend for deflate |
 | `ndarray` | no | `ndarray` crate | `std` | N-dimensional array I/O via the [`ndarray`](https://docs.rs/ndarray) crate |
 | `num-complex` | no | `num-complex` | `serde` | `mat::ComplexElement` for `num_complex::Complex<T>`, for the bulk complex-array helpers |
-| `parallel` | no | `rayon` | — | Parallel chunk processing via `rayon` |
 | `provenance` | no | `sha2` | — | SHA-256 data provenance tracking |
 | `zfp` | no | — | — | ZFP fixed-rate compression (HDF5 filter 32013), `f32`/`f64`/`i32`/`i64` x 1D-4D |
 | `heap-baseline` | no | — | — | Maintainer-only: check the recorded allocation figures (see below) |
@@ -68,10 +67,6 @@ Implements `mat::ComplexElement` for `num_complex::Complex<T>`, so a slice of th
 
 !!! note
     The impls have to ship here rather than in your crate: `ComplexElement` is `unsafe` and asserts a memory layout, and the orphan rule allows the impl only from a crate that owns one of the two types. Your *own* complex type needs no feature — implement the trait for it directly.
-
-### `parallel`
-
-Enables parallel chunk processing via `rayon` for chunked dataset reads. The reading API is unchanged; the feature only affects how chunks are processed internally. See [Reading](../guide/reading.md) and [Streaming large files](../guide/streaming.md) for the chunked read paths.
 
 ### `provenance`
 

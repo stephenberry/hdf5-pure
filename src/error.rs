@@ -307,8 +307,6 @@ pub enum FormatError {
     /// bad chunk with this variant, so "this chunk did not decode" is one match
     /// arm rather than one per compressor. The payload names the filter.
     FilterError(String),
-    /// Compression error.
-    CompressionError(String),
     /// Fletcher32 checksum mismatch.
     Fletcher32Mismatch {
         /// Expected checksum.
@@ -318,8 +316,6 @@ pub enum FormatError {
     },
     /// Chunked dataset read error.
     ChunkedReadError(String),
-    /// Chunk assembly error.
-    ChunkAssemblyError(String),
     /// CRC32C checksum mismatch.
     ChecksumMismatch {
         /// The checksum stored in the file.
@@ -329,8 +325,6 @@ pub enum FormatError {
     },
     /// Maximum nesting/continuation depth exceeded (malformed data protection).
     NestingDepthExceeded,
-    /// Duplicate dataset name detected during parallel metadata merge.
-    DuplicateDatasetName(String),
     /// ZFP filter configuration is invalid (e.g. missing element type, rank out of range).
     UnsupportedZfp(String),
     /// A file-derived 64-bit value (an offset, length, size, or element count)
@@ -837,9 +831,6 @@ impl fmt::Display for FormatError {
             FormatError::FilterError(msg) => {
                 write!(f, "filter error: {msg}")
             }
-            FormatError::CompressionError(msg) => {
-                write!(f, "compression error: {msg}")
-            }
             FormatError::Fletcher32Mismatch { expected, computed } => {
                 write!(
                     f,
@@ -849,9 +840,6 @@ impl fmt::Display for FormatError {
             FormatError::ChunkedReadError(msg) => {
                 write!(f, "chunked read error: {msg}")
             }
-            FormatError::ChunkAssemblyError(msg) => {
-                write!(f, "chunk assembly error: {msg}")
-            }
             FormatError::ChecksumMismatch { expected, computed } => {
                 write!(
                     f,
@@ -860,9 +848,6 @@ impl fmt::Display for FormatError {
             }
             FormatError::NestingDepthExceeded => {
                 write!(f, "maximum nesting/continuation depth exceeded")
-            }
-            FormatError::DuplicateDatasetName(name) => {
-                write!(f, "duplicate dataset name during parallel merge: {name}")
             }
             FormatError::UnsupportedZfp(msg) => {
                 write!(f, "unsupported ZFP configuration: {msg}")
@@ -981,8 +966,6 @@ pub enum Error {
     NotADataset(String),
     /// A required header message was not found.
     MissingMessage(crate::message_type::MessageType),
-    /// Alignment or size error for zero-copy typed access.
-    AlignmentError(String),
     /// An array shape error from the `ndarray` integration: either the flat
     /// data could not be reshaped to the dataset's dimensions, or a requested
     /// static rank (e.g. `read_array::<_, Ix2>`) did not match the dataset's
@@ -1077,7 +1060,6 @@ impl fmt::Display for Error {
             Error::Format(e) => write!(f, "HDF5 format error: {e}"),
             Error::NotADataset(path) => write!(f, "not a dataset: {path}"),
             Error::MissingMessage(mt) => write!(f, "missing required message: {mt}"),
-            Error::AlignmentError(msg) => write!(f, "alignment error: {msg}"),
             Error::Shape(msg) => write!(f, "array shape error: {msg}"),
             Error::SwmrUnsupported => write!(
                 f,

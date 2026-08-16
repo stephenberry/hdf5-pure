@@ -3,7 +3,7 @@
 
 use hdf5_pure::{
     ChunkCacheConfig, Error, File, FileAccessProperties, FileBuilder, FileCreateProperties,
-    FileLocking, FileSpaceStrategy, FormatError, LibVer, MemoryStrategy, MetadataCacheConfig,
+    FileLocking, FileSpaceStrategy, FormatError, LibVer, MemoryStrategy,
 };
 use tempfile::tempdir;
 
@@ -275,71 +275,6 @@ fn a_non_paged_userblock_size_must_be_a_power_of_two() {
     b.create_dataset("d").with_f64_data(&[1.0]);
     let bytes = b.finish().expect("1024 is a power of two >= 512");
     assert_eq!(&bytes[1024..1028], b"\x89HDF");
-}
-
-/// The 0.25.0 spellings still resolve, to the very same types, for one
-/// deprecation cycle (#198). If an alias is dropped or repointed, this stops
-/// compiling — which is the whole guarantee the rename promised.
-#[test]
-#[allow(deprecated)]
-fn deprecated_aliases_resolve_to_the_renamed_types() {
-    use hdf5_pure::{DatasetAccessOptions, FileAccessOptions, FileCreateOptions};
-
-    // Same type, not merely a convertible one: assignment across the two
-    // spellings only compiles if the alias is that exact type.
-    //
-    // Every field is set to a non-default value, so a shim that forwards only
-    // *some* of them is caught. Probing one field per type would let a
-    // three-quarters-gutted shim pass.
-    let access: FileAccessProperties = FileAccessOptions::new()
-        .with_locking(FileLocking::Disabled)
-        .with_chunk_cache(ChunkCacheConfig::disabled())
-        .with_metadata_cache(MetadataCacheConfig::new(64 * 1024));
-    assert_eq!(access.locking(), FileLocking::Disabled);
-
-    let create: FileCreateProperties = FileCreateOptions::new()
-        .with_userblock(512)
-        .with_libver_bounds(LibVer::V110, LibVer::LATEST)
-        .with_file_space_strategy(FileSpaceStrategy::FsmAggr, true, 8)
-        .with_file_space_page_size(4096);
-    assert_eq!(create.userblock(), 512);
-
-    let dapl: hdf5_pure::DatasetAccessProperties =
-        DatasetAccessOptions::new().with_chunk_cache(ChunkCacheConfig::disabled());
-    assert_eq!(dapl.chunk_cache(), Some(ChunkCacheConfig::disabled()));
-
-    // Both deprecated method shims forward to the renamed method rather than
-    // merely existing: compare what each spelling actually produces.
-    let build = |apply: &dyn Fn(&mut FileBuilder)| {
-        let mut b = FileBuilder::new();
-        apply(&mut b);
-        b.create_dataset("data").with_f64_data(&[1.0, 2.0]);
-        b.finish().unwrap()
-    };
-    // Chained, not called as a statement: the shim must keep returning
-    // `&mut Self` or a 0.25.0 call site that chained off it stops compiling.
-    let via_shim = build(&|b| {
-        b.with_create_options(create).with_userblock(1024);
-    });
-    let via_renamed = build(&|b| {
-        b.with_create_properties(create).with_userblock(1024);
-    });
-    assert_eq!(
-        via_shim, via_renamed,
-        "with_create_options must forward to with_create_properties"
-    );
-
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("aliases.h5");
-    std::fs::write(&path, &via_renamed).unwrap();
-    let file = File::open_with_options(&path, access).unwrap();
-    assert_eq!(
-        file.access_options(),
-        file.access_properties(),
-        "access_options must forward to access_properties"
-    );
-    // …and the forwarded value is the one that was passed in, whole.
-    assert_eq!(file.access_options(), access);
 }
 
 /// `with_create_properties` documents that it overwrites any value set

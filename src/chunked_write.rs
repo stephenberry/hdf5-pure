@@ -2453,7 +2453,8 @@ pub(crate) fn emit_chunked_data_verbatim<S: ByteSink>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chunked_read::read_chunked_data;
+    use crate::chunk_cache::ChunkCache;
+    use crate::chunked_read::read_chunked_data_cached;
     use crate::convert::nz;
     use crate::data_layout::DataLayout;
     use crate::dataspace::{Dataspace, DataspaceType};
@@ -2575,7 +2576,7 @@ mod tests {
             .as_ref()
             .map(|pm| crate::filter_pipeline::FilterPipeline::parse(pm).unwrap());
 
-        let output = read_chunked_data(
+        let output = read_chunked_data_cached(
             &file_data,
             &layout,
             &dataspace,
@@ -2583,6 +2584,7 @@ mod tests {
             pipeline.as_ref(),
             8,
             8,
+            &ChunkCache::new(),
         )
         .unwrap();
 
@@ -3222,8 +3224,17 @@ mod tests {
         };
         let datatype = make_f64_type();
 
-        let output =
-            read_chunked_data(&file_data, &layout, &dataspace, &datatype, None, 8, 8).unwrap();
+        let output = read_chunked_data_cached(
+            &file_data,
+            &layout,
+            &dataspace,
+            &datatype,
+            None,
+            8,
+            8,
+            &ChunkCache::new(),
+        )
+        .unwrap();
 
         bytes_to_f64(&output)
     }
