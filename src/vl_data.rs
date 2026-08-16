@@ -7,6 +7,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::{format, string::String, vec::Vec};
 
+use crate::bytes::read_offset;
 use crate::convert::{TryToUsize, is_undefined_addr};
 use crate::datatype::{CharacterSet, Datatype};
 use crate::error::FormatError;
@@ -68,31 +69,6 @@ pub struct VlElement {
     /// Index of the object within the collection.
     pub object_index: u32,
 }
-
-fn ensure_len(data: &[u8], offset: usize, needed: usize) -> Result<(), FormatError> {
-    match offset.checked_add(needed) {
-        Some(end) if end <= data.len() => Ok(()),
-        _ => Err(FormatError::UnexpectedEof {
-            expected: offset.saturating_add(needed),
-            available: data.len(),
-        }),
-    }
-}
-
-fn read_offset(data: &[u8], pos: usize, offset_size: u8) -> Result<u64, FormatError> {
-    let s = offset_size as usize;
-    ensure_len(data, pos, s)?;
-    let slice = &data[pos..pos + s];
-    Ok(match offset_size {
-        2 => u16::from_le_bytes([slice[0], slice[1]]) as u64,
-        4 => u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]) as u64,
-        8 => u64::from_le_bytes([
-            slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
-        ]),
-        _ => return Err(FormatError::InvalidOffsetSize(offset_size)),
-    })
-}
-
 /// Parse VL global heap references from raw attribute/dataset data.
 pub fn parse_vl_references(
     raw_data: &[u8],

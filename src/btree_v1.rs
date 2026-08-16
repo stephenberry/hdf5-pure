@@ -3,6 +3,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+use crate::bytes::{is_undefined_at, read_offset};
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
 use crate::source::Source;
@@ -45,34 +46,6 @@ pub struct BTreeV1Node {
     /// Child addresses (entries_used values).
     pub children: Vec<u64>,
 }
-
-fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
-    let s = size as usize;
-    if s > data.len() || pos > data.len() - s {
-        return Err(FormatError::UnexpectedEof {
-            expected: pos.saturating_add(s),
-            available: data.len(),
-        });
-    }
-    let slice = &data[pos..pos + s];
-    Ok(match size {
-        2 => u16::from_le_bytes([slice[0], slice[1]]) as u64,
-        4 => u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]) as u64,
-        8 => u64::from_le_bytes([
-            slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
-        ]),
-        _ => return Err(FormatError::InvalidOffsetSize(size)),
-    })
-}
-
-fn is_undefined(data: &[u8], pos: usize, size: u8) -> bool {
-    let s = size as usize;
-    if s > data.len() || pos > data.len() - s {
-        return false;
-    }
-    data[pos..pos + s].iter().all(|&b| b == 0xFF)
-}
-
 impl BTreeV1Node {
     /// Parse a B-tree v1 node at the given offset in the file data.
     ///
@@ -103,13 +76,13 @@ impl BTreeV1Node {
         let entries_used = u16::from_le_bytes([file_data[offset + 6], file_data[offset + 7]]);
 
         let mut pos = offset + BTREE_V1_NODE_PREFIX_LEN;
-        let left_sibling = if is_undefined(file_data, pos, offset_size) {
+        let left_sibling = if is_undefined_at(file_data, pos, offset_size) {
             None
         } else {
             Some(read_offset(file_data, pos, offset_size)?)
         };
         pos += os;
-        let right_sibling = if is_undefined(file_data, pos, offset_size) {
+        let right_sibling = if is_undefined_at(file_data, pos, offset_size) {
             None
         } else {
             Some(read_offset(file_data, pos, offset_size)?)

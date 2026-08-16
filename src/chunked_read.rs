@@ -11,6 +11,7 @@ use std::borrow::Cow;
 use core::num::NonZeroUsize;
 
 use crate::btree_v1::btree_v1_node_header_size;
+use crate::bytes::read_offset;
 use crate::chunk_cache::ChunkCache;
 use crate::chunk_span::ChunkSpanReader;
 use crate::convert::{TryToUsize, nonzero_usize_from, slice_range, u32_from};
@@ -66,26 +67,6 @@ pub struct ChunkInfo {
     /// File address of the chunk data.
     pub address: u64,
 }
-
-fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
-    let s = size as usize;
-    if s > data.len() || pos > data.len() - s {
-        return Err(FormatError::UnexpectedEof {
-            expected: pos.saturating_add(s),
-            available: data.len(),
-        });
-    }
-    let slice = &data[pos..pos + s];
-    Ok(match size {
-        2 => u16::from_le_bytes([slice[0], slice[1]]) as u64,
-        4 => u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]) as u64,
-        8 => u64::from_le_bytes([
-            slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
-        ]),
-        _ => return Err(FormatError::InvalidOffsetSize(size)),
-    })
-}
-
 /// Size of a single key in a version 1 B-tree of type 1 (raw data chunks):
 /// `chunk_size(4) + filter_mask(4) + ndims * offset_size`. The `ndims` trailing
 /// offsets are the per-dimension scaled chunk coordinates (rank + 1 values, the

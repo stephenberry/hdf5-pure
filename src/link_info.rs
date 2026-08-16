@@ -1,5 +1,7 @@
 //! HDF5 Link Info message parsing (message type 0x0002).
 
+use crate::bytes::{ensure_len, read_offset};
+use crate::convert::is_undefined_addr;
 use crate::error::FormatError;
 
 /// Parsed Link Info message from a v2 group object header.
@@ -14,51 +16,6 @@ pub struct LinkInfoMessage {
     /// Address of B-tree v2 for creation-order link index.
     pub btree_creation_order_address: Option<u64>,
 }
-
-fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
-    let s = size as usize;
-    if s > data.len() || pos > data.len() - s {
-        return Err(FormatError::UnexpectedEof {
-            expected: pos.saturating_add(s),
-            available: data.len(),
-        });
-    }
-    Ok(match size {
-        2 => u16::from_le_bytes([data[pos], data[pos + 1]]) as u64,
-        4 => u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as u64,
-        8 => u64::from_le_bytes([
-            data[pos],
-            data[pos + 1],
-            data[pos + 2],
-            data[pos + 3],
-            data[pos + 4],
-            data[pos + 5],
-            data[pos + 6],
-            data[pos + 7],
-        ]),
-        _ => return Err(FormatError::InvalidOffsetSize(size)),
-    })
-}
-
-fn is_undefined(val: u64, offset_size: u8) -> bool {
-    match offset_size {
-        2 => val == 0xFFFF,
-        4 => val == 0xFFFF_FFFF,
-        8 => val == 0xFFFF_FFFF_FFFF_FFFF,
-        _ => false,
-    }
-}
-
-fn ensure_len(data: &[u8], pos: usize, needed: usize) -> Result<(), FormatError> {
-    match pos.checked_add(needed) {
-        Some(end) if end <= data.len() => Ok(()),
-        _ => Err(FormatError::UnexpectedEof {
-            expected: pos.saturating_add(needed),
-            available: data.len(),
-        }),
-    }
-}
-
 impl LinkInfoMessage {
     /// Parse a Link Info message from raw message data.
     pub fn parse(data: &[u8], offset_size: u8) -> Result<LinkInfoMessage, FormatError> {
@@ -95,7 +52,7 @@ impl LinkInfoMessage {
 
         let fh_addr = read_offset(data, pos, offset_size)?;
         pos += offset_size as usize;
-        let fractal_heap_address = if is_undefined(fh_addr, offset_size) {
+        let fractal_heap_address = if is_undefined_addr(fh_addr, offset_size) {
             None
         } else {
             Some(fh_addr)
@@ -103,7 +60,7 @@ impl LinkInfoMessage {
 
         let btree_addr = read_offset(data, pos, offset_size)?;
         pos += offset_size as usize;
-        let btree_name_index_address = if is_undefined(btree_addr, offset_size) {
+        let btree_name_index_address = if is_undefined_addr(btree_addr, offset_size) {
             None
         } else {
             Some(btree_addr)
@@ -111,7 +68,7 @@ impl LinkInfoMessage {
 
         let btree_creation_order_address = if has_creation_order_index {
             let addr = read_offset(data, pos, offset_size)?;
-            if is_undefined(addr, offset_size) {
+            if is_undefined_addr(addr, offset_size) {
                 None
             } else {
                 Some(addr)

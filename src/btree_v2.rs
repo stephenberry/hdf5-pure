@@ -6,6 +6,7 @@ use alloc::{vec, vec::Vec};
 #[cfg(feature = "checksum")]
 use byteorder::{ByteOrder, LittleEndian};
 
+use crate::bytes::{ensure_len, read_offset};
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
 use crate::source::Source;
@@ -35,42 +36,6 @@ pub struct BTreeV2Record {
     /// Raw record bytes (record_size bytes).
     pub data: Vec<u8>,
 }
-
-fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
-    let s = size as usize;
-    if s > data.len() || pos > data.len() - s {
-        return Err(FormatError::UnexpectedEof {
-            expected: pos.saturating_add(s),
-            available: data.len(),
-        });
-    }
-    Ok(match size {
-        2 => u16::from_le_bytes([data[pos], data[pos + 1]]) as u64,
-        4 => u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as u64,
-        8 => u64::from_le_bytes([
-            data[pos],
-            data[pos + 1],
-            data[pos + 2],
-            data[pos + 3],
-            data[pos + 4],
-            data[pos + 5],
-            data[pos + 6],
-            data[pos + 7],
-        ]),
-        _ => return Err(FormatError::InvalidOffsetSize(size)),
-    })
-}
-
-fn ensure_len(data: &[u8], pos: usize, needed: usize) -> Result<(), FormatError> {
-    match pos.checked_add(needed) {
-        Some(end) if end <= data.len() => Ok(()),
-        _ => Err(FormatError::UnexpectedEof {
-            expected: pos.saturating_add(needed),
-            available: data.len(),
-        }),
-    }
-}
-
 /// Compute the number of bytes needed to represent a count, using variable-width encoding.
 /// B-tree v2 uses this for the number of records fields in internal nodes.
 fn bytes_for_max_records(max_nrec: u64) -> usize {

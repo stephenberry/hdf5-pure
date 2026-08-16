@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 
 use byteorder::{ByteOrder, LittleEndian};
 
+use crate::bytes::{ensure_len, read_length, read_offset, read_uint_width};
 use crate::convert::{TryToUsize, slice_range};
 use crate::error::FormatError;
 use crate::message_type::MessageType;
@@ -73,32 +74,6 @@ pub struct ObjectHeader {
     /// Birth time (v2, when flags bit 2 set).
     pub birth_time: Option<u32>,
 }
-
-fn ensure_len(data: &[u8], offset: usize, needed: usize) -> Result<(), FormatError> {
-    match offset.checked_add(needed) {
-        Some(end) if end <= data.len() => Ok(()),
-        _ => Err(FormatError::UnexpectedEof {
-            expected: offset.saturating_add(needed),
-            available: data.len(),
-        }),
-    }
-}
-
-fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
-    let s = size as usize;
-    ensure_len(data, pos, s)?;
-    let slice = &data[pos..pos + s];
-    Ok(match size {
-        2 => LittleEndian::read_u16(slice) as u64,
-        4 => LittleEndian::read_u32(slice) as u64,
-        8 => LittleEndian::read_u64(slice),
-        1 => slice[0] as u64,
-        _ => {
-            return Err(FormatError::InvalidOffsetSize(size));
-        }
-    })
-}
-
 impl ObjectHeader {
     /// Parse an object header at the given offset in the data buffer.
     ///
@@ -231,7 +206,7 @@ impl ObjectHeader {
                     let cont_offset_raw = read_offset(cont_msg_data, 0, offset_size)?;
                     let cont_offset = slice_range(cont_offset_raw, base_address)?.end;
                     let cont_length =
-                        read_offset(cont_msg_data, offset_size as usize, length_size)?
+                        read_length(cont_msg_data, offset_size as usize, length_size)?
                             .to_usize()?;
                     // Parse continuation block (v1: just raw messages, no signature)
                     let cont_msgs = Self::parse_v1_continuation(
@@ -317,7 +292,7 @@ impl ObjectHeader {
                     let cont_offset_raw = read_offset(cont_msg_data, 0, offset_size)?;
                     let cont_offset = slice_range(cont_offset_raw, base_address)?.end;
                     let cont_length =
-                        read_offset(cont_msg_data, offset_size as usize, length_size)?
+                        read_length(cont_msg_data, offset_size as usize, length_size)?
                             .to_usize()?;
                     let cont_msgs = Self::parse_v1_continuation(
                         data,
@@ -383,7 +358,7 @@ impl ObjectHeader {
             _ => unreachable!(),
         };
         ensure_len(data, pos, chunk_size_width as usize)?;
-        let chunk0_size = read_offset(data, pos, chunk_size_width)?.to_usize()?;
+        let chunk0_size = read_uint_width(data, pos, chunk_size_width)?.to_usize()?;
         pos += chunk_size_width as usize;
 
         let chunk0_msg_start = pos;
@@ -507,7 +482,7 @@ impl ObjectHeader {
                 // past 4 GiB on a 32-bit host.
                 if msg_data.len() >= (offset_size as usize + length_size as usize) {
                     let cont_off = read_offset(&msg_data, 0, offset_size)?;
-                    let cont_len = read_offset(&msg_data, offset_size as usize, length_size)?;
+                    let cont_len = read_length(&msg_data, offset_size as usize, length_size)?;
                     continuations.push((cont_off, cont_len));
                 }
             } else if msg_type != MessageType::Nil {
@@ -659,7 +634,7 @@ impl ObjectHeader {
             _ => unreachable!(),
         };
         ensure_len(&head, pos, chunk_size_width as usize)?;
-        let chunk0_size = read_offset(&head, pos, chunk_size_width)?.to_usize()?;
+        let chunk0_size = read_uint_width(&head, pos, chunk_size_width)?.to_usize()?;
         pos += chunk_size_width as usize;
         let prefix_len = pos;
 
@@ -835,7 +810,7 @@ impl ObjectHeader {
                 && msg_data.len() >= (offset_size as usize + length_size as usize)
             {
                 let off_raw = read_offset(&msg_data, 0, offset_size)?;
-                let len = read_offset(&msg_data, offset_size as usize, length_size)?;
+                let len = read_length(&msg_data, offset_size as usize, length_size)?;
                 Some((off_raw, len))
             } else {
                 None

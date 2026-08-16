@@ -9,7 +9,9 @@ use byteorder::{ByteOrder, LittleEndian};
 use crate::btree_v2::{
     BTreeV2Header, BTreeV2Record, collect_btree_v2_records, collect_btree_v2_records_from_source,
 };
+use crate::bytes::{ensure_len, read_offset};
 use crate::convert::TryToUsize;
+use crate::convert::is_undefined_addr;
 use crate::error::FormatError;
 use crate::source::Source;
 
@@ -81,51 +83,6 @@ pub struct FractalHeapHeader {
     /// Total number of managed objects.
     pub managed_objects_count: u64,
 }
-
-fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
-    let s = size as usize;
-    if s > data.len() || pos > data.len() - s {
-        return Err(FormatError::UnexpectedEof {
-            expected: pos.saturating_add(s),
-            available: data.len(),
-        });
-    }
-    Ok(match size {
-        2 => u16::from_le_bytes([data[pos], data[pos + 1]]) as u64,
-        4 => u32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]) as u64,
-        8 => u64::from_le_bytes([
-            data[pos],
-            data[pos + 1],
-            data[pos + 2],
-            data[pos + 3],
-            data[pos + 4],
-            data[pos + 5],
-            data[pos + 6],
-            data[pos + 7],
-        ]),
-        _ => return Err(FormatError::InvalidOffsetSize(size)),
-    })
-}
-
-fn ensure_len(data: &[u8], pos: usize, needed: usize) -> Result<(), FormatError> {
-    match pos.checked_add(needed) {
-        Some(end) if end <= data.len() => Ok(()),
-        _ => Err(FormatError::UnexpectedEof {
-            expected: pos.saturating_add(needed),
-            available: data.len(),
-        }),
-    }
-}
-
-fn is_undefined(val: u64, offset_size: u8) -> bool {
-    match offset_size {
-        2 => val == 0xFFFF,
-        4 => val == 0xFFFF_FFFF,
-        8 => val == 0xFFFF_FFFF_FFFF_FFFF,
-        _ => false,
-    }
-}
-
 /// Floor of the base-2 logarithm of `v` (0 for `v == 0`). The doubling-table
 /// block sizes are powers of two, so this is their exact log2; it mirrors
 /// HDF5's `H5VM_log2_gen`.
@@ -368,7 +325,7 @@ impl HeapObjectReader<'_> {
         // Indirect: the heap ID holds a B-tree key (the huge object ID); the
         // huge-objects v2 B-tree maps it to (address, length).
         let huge_id = read_var_le(payload);
-        if is_undefined(self.header.btree_huge_objects_address, self.offset_size) {
+        if is_undefined_addr(self.header.btree_huge_objects_address, self.offset_size) {
             return Err(FormatError::HugeObjectNotFound(huge_id));
         }
         Ok(HugeReference::Indexed(huge_id))
@@ -706,7 +663,7 @@ impl FractalHeapHeader {
         }
         let (heap_offset, obj_len) = self.decode_managed_id(id_bytes)?;
 
-        if is_undefined(self.root_block_address, offset_size) {
+        if is_undefined_addr(self.root_block_address, offset_size) {
             return Err(FormatError::UnexpectedEof {
                 expected: 1,
                 available: 0,
@@ -859,7 +816,7 @@ impl FractalHeapHeader {
                 // up-front above, so here every entry is a bare child address.
                 let child_addr = read_offset(block, pos, offset_size)?;
                 pos += offset_size as usize;
-                if !is_undefined(child_addr, offset_size) {
+                if !is_undefined_addr(child_addr, offset_size) {
                     let block_end = current_heap_offset.saturating_add(block_size);
                     if target_offset >= current_heap_offset && target_offset < block_end {
                         return Ok(Some(HeapChild::Direct {
@@ -882,7 +839,7 @@ impl FractalHeapHeader {
             for _col in 0..tw {
                 let child_addr = read_offset(block, pos, offset_size)?;
                 pos += offset_size as usize;
-                if !is_undefined(child_addr, offset_size) {
+                if !is_undefined_addr(child_addr, offset_size) {
                     let block_end = current_heap_offset.saturating_add(total_child_space);
                     if target_offset >= current_heap_offset && target_offset < block_end {
                         #[expect(
@@ -1022,7 +979,7 @@ impl FractalHeapHeader {
             return Err(FormatError::UnsupportedFilteredHeapObject);
         }
         let (heap_offset, obj_len) = self.decode_managed_id(id_bytes)?;
-        if is_undefined(self.root_block_address, offset_size) {
+        if is_undefined_addr(self.root_block_address, offset_size) {
             return Err(FormatError::UnexpectedEof {
                 expected: 1,
                 available: 0,

@@ -3,6 +3,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+use crate::bytes::read_offset;
 use crate::error::FormatError;
 use crate::source::Source;
 
@@ -14,26 +15,6 @@ pub struct SymbolTableMessage {
     /// Address of the local heap for this group.
     pub local_heap_address: u64,
 }
-
-fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
-    let s = size as usize;
-    if s > data.len() || pos > data.len() - s {
-        return Err(FormatError::UnexpectedEof {
-            expected: pos.saturating_add(s),
-            available: data.len(),
-        });
-    }
-    let slice = &data[pos..pos + s];
-    Ok(match size {
-        2 => u16::from_le_bytes([slice[0], slice[1]]) as u64,
-        4 => u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]) as u64,
-        8 => u64::from_le_bytes([
-            slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
-        ]),
-        _ => return Err(FormatError::InvalidOffsetSize(size)),
-    })
-}
-
 impl SymbolTableMessage {
     /// Parse a Symbol Table message from raw message data bytes.
     pub fn parse(data: &[u8], offset_size: u8) -> Result<SymbolTableMessage, FormatError> {

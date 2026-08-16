@@ -11,6 +11,7 @@ use core::num::{NonZeroU32, NonZeroUsize};
 
 use byteorder::{ByteOrder, LittleEndian};
 
+use crate::bytes::ensure_len;
 use crate::display::{DISPLAY_MAX_MEMBERS, Dims, EscapedName, QuotedBytes, write_elided};
 use crate::error::FormatError;
 
@@ -340,17 +341,6 @@ impl fmt::Display for Datatype {
         }
     }
 }
-
-fn ensure_len(data: &[u8], offset: usize, needed: usize) -> Result<(), FormatError> {
-    match offset.checked_add(needed) {
-        Some(end) if end <= data.len() => Ok(()),
-        _ => Err(FormatError::UnexpectedEof {
-            expected: offset.saturating_add(needed),
-            available: data.len(),
-        }),
-    }
-}
-
 fn parse_string_padding(val: u8) -> Result<StringPadding, FormatError> {
     match val {
         0 => Ok(StringPadding::NullTerminate),

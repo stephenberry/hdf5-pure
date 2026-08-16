@@ -3,6 +3,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
+use crate::bytes::read_length;
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
 use crate::source::Source;
@@ -31,31 +32,6 @@ pub struct GlobalHeapObjectInfo {
     /// Object payload size in bytes.
     pub size: u64,
 }
-
-fn ensure_len(data: &[u8], offset: usize, needed: usize) -> Result<(), FormatError> {
-    match offset.checked_add(needed) {
-        Some(end) if end <= data.len() => Ok(()),
-        _ => Err(FormatError::UnexpectedEof {
-            expected: offset.saturating_add(needed),
-            available: data.len(),
-        }),
-    }
-}
-
-fn read_length(data: &[u8], offset: usize, length_size: u8) -> Result<u64, FormatError> {
-    let s = length_size as usize;
-    ensure_len(data, offset, s)?;
-    let slice = &data[offset..offset + s];
-    Ok(match length_size {
-        2 => u16::from_le_bytes([slice[0], slice[1]]) as u64,
-        4 => u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]) as u64,
-        8 => u64::from_le_bytes([
-            slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
-        ]),
-        _ => return Err(FormatError::InvalidLengthSize(length_size)),
-    })
-}
-
 /// Round up to next multiple of 8.
 #[cfg(test)]
 fn pad8(x: usize) -> usize {

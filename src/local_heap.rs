@@ -3,6 +3,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::string::String;
 
+use crate::bytes::read_offset;
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
 use crate::source::Source;
@@ -19,32 +20,6 @@ pub struct LocalHeap {
     /// File address of the data segment.
     pub data_segment_address: u64,
 }
-
-fn read_offset(data: &[u8], pos: usize, size: u8) -> Result<u64, FormatError> {
-    let s = size as usize;
-    // `pos` is derived from a crafted file address, so `pos + s` can overflow
-    // `usize`; check the bound without wrapping (issue #140).
-    let end = pos.checked_add(s).ok_or(FormatError::UnexpectedEof {
-        expected: usize::MAX,
-        available: data.len(),
-    })?;
-    if end > data.len() {
-        return Err(FormatError::UnexpectedEof {
-            expected: end,
-            available: data.len(),
-        });
-    }
-    let slice = &data[pos..end];
-    Ok(match size {
-        2 => u16::from_le_bytes([slice[0], slice[1]]) as u64,
-        4 => u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]) as u64,
-        8 => u64::from_le_bytes([
-            slice[0], slice[1], slice[2], slice[3], slice[4], slice[5], slice[6], slice[7],
-        ]),
-        _ => return Err(FormatError::InvalidOffsetSize(size)),
-    })
-}
-
 impl LocalHeap {
     /// Parse a local heap header at the given offset in the file data.
     pub fn parse(

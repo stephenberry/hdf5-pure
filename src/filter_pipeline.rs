@@ -6,6 +6,7 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::{string::String, string::ToString, vec, vec::Vec};
 
+use crate::bytes::ensure_len;
 use crate::error::FormatError;
 
 /// Well-known filter IDs.
@@ -40,17 +41,6 @@ pub struct FilterPipeline {
     /// Ordered list of filters.
     pub filters: Vec<FilterDescription>,
 }
-
-fn ensure_len(data: &[u8], offset: usize, needed: usize) -> Result<(), FormatError> {
-    match offset.checked_add(needed) {
-        Some(end) if end <= data.len() => Ok(()),
-        _ => Err(FormatError::UnexpectedEof {
-            expected: offset.saturating_add(needed),
-            available: data.len(),
-        }),
-    }
-}
-
 impl FilterPipeline {
     /// Parse a filter pipeline message from raw message bytes.
     pub fn parse(data: &[u8]) -> Result<FilterPipeline, FormatError> {
