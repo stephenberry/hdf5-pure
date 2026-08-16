@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- Opening a dataset or group by path (`File::dataset`, `File::group`) or by name (`Group::dataset`, `Group::group`) no longer reads every other child of the group on the way: one lookup in a 1,024-child group allocates 23 KiB in 16 blocks where it took 310 KiB in 2,084, so opening each member of a large group in turn costs the group once per open rather than once per member per open ([#228](https://github.com/stephenberry/hdf5-pure/issues/228)).
+- Opening a dataset or group by path (`File::dataset`, `File::group`) or by name (`Group::dataset`, `Group::group`) no longer reads every other child of the group on the way: one lookup in a 1,024-child group allocates 23 KiB in 16 blocks where it took 310 KiB in 2,084, so opening each member of a large group in turn costs the group once per open rather than once per member per open. A link whose *target* is malformed no longer fails a lookup of a different name, which parsing every link made it do; listing the group still reports it ([#228](https://github.com/stephenberry/hdf5-pure/issues/228)).
 - `DatasetBuilder::with_vlen_strings` stages the caller's strings without copying each one first, so writing 32,768 of them allocates 6.6 MiB in 104 blocks where it took 12.8 MiB in 32,876 ([#228](https://github.com/stephenberry/hdf5-pure/issues/228)).
 - `Dataset::append` reserves its batch instead of growing into it, so an append loop allocates about a quarter less: 512 appends of a 4 KiB chunk cost 6.7 MiB in 14,469 blocks where they took 8.7 MiB in 19,077 ([#228](https://github.com/stephenberry/hdf5-pure/issues/228)).
 
