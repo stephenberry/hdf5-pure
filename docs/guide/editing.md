@@ -21,7 +21,7 @@ Ask a file which backing it got with `File::edit_backing()`, and demand one with
 | `Bounded` | Never build a mirror; refuse such a file with `Error::EditUnsupported` |
 | `Mirrored` | Always build the mirror, whatever the file looks like |
 
-`File::open_rw_bounded` is the deprecated spelling of `Bounded`. The answer from `File::edit_backing()` is an `EditBacking` (`Bounded` or `Mirrored`) rather than the `MemoryStrategy` that was asked for, because `Auto` is a preference between the two backings and never an outcome; `.into()` converts an `EditBacking` back into the `MemoryStrategy` that pins a later reopen to it.
+The answer from `File::edit_backing()` is an `EditBacking` (`Bounded` or `Mirrored`) rather than the `MemoryStrategy` that was asked for, because `Auto` is a preference between the two backings and never an outcome; `.into()` converts an `EditBacking` back into the `MemoryStrategy` that pins a later reopen to it.
 
 `File::open_swmr_writer` always mirrors, so it accepts `Auto` and `Mirrored` — both satisfied by the mirror — and refuses an explicit `Bounded` rather than quietly not honoring it.
 

@@ -7,8 +7,7 @@ use core::num::NonZeroUsize;
 
 use crate::chunk_cache::ChunkCache;
 use crate::chunked_read::{
-    read_chunked_data, read_chunked_data_cached, read_chunked_data_cached_from_source,
-    read_chunked_data_from_source,
+    read_chunked_data_cached, read_chunked_data_cached_from_source, read_chunked_data_from_source,
 };
 use crate::convert::{TryToUsize, slice_range};
 use crate::data_layout::DataLayout;
@@ -85,7 +84,10 @@ pub fn read_raw_data_full(
             }
             Ok(file_data[r].to_vec())
         }
-        DataLayout::Chunked { .. } => read_chunked_data(
+        // The live reader routes chunked layouts through `read_raw_data_cached`
+        // and its own cache; this arm keeps the function total for the other
+        // callers, at the cost of a cache that lives only for the call.
+        DataLayout::Chunked { .. } => read_chunked_data_cached(
             file_data,
             layout,
             dataspace,
@@ -93,6 +95,7 @@ pub fn read_raw_data_full(
             pipeline,
             offset_size,
             length_size,
+            &ChunkCache::new(),
         ),
         DataLayout::Virtual { .. } => Err(FormatError::UnsupportedVirtualLayout),
     }

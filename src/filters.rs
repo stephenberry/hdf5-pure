@@ -637,7 +637,7 @@ fn deflate_compress(
     let finished = encoder
         .write_all(data)
         .and_then(|()| encoder.reset(Vec::new()))
-        .map_err(|e| FormatError::CompressionError(e.to_string()));
+        .map_err(|e| FormatError::FilterError(format!("deflate: {e}")));
     if finished.is_err() {
         // Either step failing leaves the encoder mid-stream, and the next chunk
         // would append to this one's unfinished output. The decoder avoids the

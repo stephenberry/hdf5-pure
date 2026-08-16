@@ -25,6 +25,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `FileBuilder::write` allocates about thirty-five times less on a deflated dataset, and `Dataset::read_raw` about ten times less reading one back: the zlib codec is built once per call rather than once per chunk. Output is byte-identical ([#228](https://github.com/stephenberry/hdf5-pure/issues/228)).
 - Writing a chunked dataset allocates a quarter as often and about 25% fewer bytes: sizing a dataset's object header no longer builds the whole data region only to discard it, and the chunk splitter keeps its scratch across chunks ([#228](https://github.com/stephenberry/hdf5-pure/issues/228)).
 
+### Removed
+
+- **Breaking:** The `parallel` cargo feature and its `rayon` dependency are gone. The feature gated a chunked-read path no public entry point reached, so no read changes behavior; the `parallel_read` and `lane_partition` modules go with it ([#280](https://github.com/stephenberry/hdf5-pure/pull/280)).
+- **Breaking:** `FileAccessOptions`, `DatasetAccessOptions`, `FileCreateOptions`, `FileBuilder::with_create_options`, and `File::access_options` are gone; use the `Properties` spellings they were deprecated for in 0.26.0 ([#280](https://github.com/stephenberry/hdf5-pure/pull/280)).
+- **Breaking:** `File::open_rw_bounded` and `File::open_rw_bounded_with_options` are gone; pass `MemoryStrategy::Bounded` to `File::open_rw_with_options` for the same strict refusal ([#280](https://github.com/stephenberry/hdf5-pure/pull/280)).
+- **Breaking:** `FormatError::CompressionError`, `FormatError::ChunkAssemblyError`, `FormatError::DuplicateDatasetName`, `Error::AlignmentError`, and `MatError::RaggedMatrix` are gone. The first was constructed at two sites that now report `FormatError::FilterError`, the variant every other filter already used; the rest were never constructed ([#280](https://github.com/stephenberry/hdf5-pure/pull/280)).
+
 ### Fixed
 
 - An Extensible Array header naming a filtered element too narrow to hold the address and filter mask it must contain is refused; the size arithmetic previously underflowed, panicking under the overflow checks tests and fuzz targets build with ([#278](https://github.com/stephenberry/hdf5-pure/pull/278)).

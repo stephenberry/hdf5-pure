@@ -24,7 +24,7 @@ jobs:
           # `matio-crosscheck` is intentionally excluded: it links against the
           # system libmatio and is meant for maintainer-local crosscheck runs.
           - name: full
-            flags: --features "serde zfp fast-deflate provenance parallel ndarray"
+            flags: --features "serde zfp fast-deflate provenance ndarray"
         # The single-feature isolation configs only need to run on one platform;
         # they are subsets of `full`, which already runs everywhere.
         include:
@@ -176,7 +176,7 @@ jobs:
       - name: Rustdoc (deny warnings)
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --locked --no-deps --features "provenance parallel zfp ndarray serde"
+        run: cargo doc --locked --no-deps --features "provenance zfp ndarray serde"
 
   shear:
     name: Unused dependencies (cargo-shear)
@@ -200,10 +200,9 @@ jobs:
   # CLAUDE.md). Red here means the break is either unintended or undeclared;
   # it is not the expected state of a breaking PR.
   #
-  # `parallel_read`/`lane_partition` are gated behind `parallel`, so the feature
-  # set below must enable the public-API-bearing features to see their surface.
-  # `fast-deflate` is omitted (a flate2 backend swap, no API delta) along with
-  # `matio-crosscheck` (test-only, links system libmatio).
+  # The feature set below enables every public-API-bearing feature so the whole
+  # surface is compared. `fast-deflate` is omitted (a flate2 backend swap, no
+  # API delta) along with `matio-crosscheck` (test-only, links system libmatio).
   semver-checks:
     name: SemVer (cargo-semver-checks)
     runs-on: ubuntu-latest
@@ -216,7 +215,7 @@ jobs:
       - uses: obi1kenobi/cargo-semver-checks-action@v2
         with:
           feature-group: default-features
-          features: serde,zfp,provenance,parallel,ndarray
+          features: serde,zfp,provenance,ndarray
 
   # ===========================================================================
   # 32-bit / no_std compatibility (issue #27).
@@ -249,7 +248,7 @@ jobs:
       - name: Clippy (lib, full features minus C-backed ones)
         run: >
           cargo clippy --locked --target i686-unknown-linux-gnu --lib
-          --features "serde zfp provenance parallel ndarray" -- -D warnings
+          --features "serde zfp provenance ndarray" -- -D warnings
 
   # 32-bit narrowing-cast gate (issue #72). On i686 clippy flags every potential
   # `u64 as usize`-style narrowing. Each such cast in the library is either
@@ -285,7 +284,7 @@ jobs:
           # a new cast slip through); dependencies stay cached. Target-scoped.
           cargo clean -p hdf5-pure --target i686-unknown-linux-gnu
           cargo clippy --locked --target i686-unknown-linux-gnu --lib \
-            --features "serde zfp provenance parallel ndarray" \
+            --features "serde zfp provenance ndarray" \
             -- -D clippy::cast_possible_truncation \
                -D clippy::cast_possible_wrap \
                -D unfulfilled_lint_expectations

@@ -612,7 +612,6 @@ Reading decodes the MATLAB opaque value classes `datetime`, `duration`, and `cat
 | `serde` | no | Serialize/deserialize MATLAB v7.3 `.mat` files via serde |
 | `fast-deflate` | no | zlib-ng backend for deflate via `flate2/zlib-ng` |
 | `ndarray` | no | N-dimensional array I/O via the [`ndarray`](https://docs.rs/ndarray) crate |
-| `parallel` | no | Parallel chunk processing via `rayon` |
 | `provenance` | no | SHA-256 data provenance tracking |
 | `zfp` | no | ZFP fixed-rate compression (HDF5 filter 32013), f32/f64/i32/i64 × 1D–4D |
 

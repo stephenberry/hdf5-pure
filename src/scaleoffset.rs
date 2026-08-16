@@ -432,7 +432,7 @@ pub fn compress(input: &[u8], filter: &FilterDescription) -> Result<Vec<u8>, For
     // equal `input.len()`.
     let expected = (p.nelmts as u64 * p.size as u64).to_usize()?;
     if input.len() != expected {
-        return Err(FormatError::CompressionError(
+        return Err(FormatError::FilterError(
             "scaleoffset: chunk size does not match nelmts * datatype size".to_string(),
         ));
     }

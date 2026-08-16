@@ -73,7 +73,6 @@
     not(any(
         feature = "fast-deflate",
         feature = "provenance",
-        feature = "parallel",
         feature = "zfp",
         feature = "ndarray",
         feature = "serde",

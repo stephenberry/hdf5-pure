@@ -27,13 +27,6 @@ pub enum MatError {
     UnsupportedType(&'static str),
     /// A sequence contained elements of different primitive types.
     MixedSequenceElementTypes,
-    /// A 2-D matrix had inconsistent row lengths.
-    RaggedMatrix {
-        /// Expected row length (first row).
-        expected: usize,
-        /// The row that differed.
-        got: usize,
-    },
     /// A dataset's on-disk shape didn't match the Rust type.
     ShapeMismatch {
         /// The Rust side's expectation.
@@ -101,10 +94,6 @@ impl fmt::Display for MatError {
             MatError::MixedSequenceElementTypes => write!(
                 f,
                 "sequence elements have mixed primitive types; all elements of a numeric array must share a type"
-            ),
-            MatError::RaggedMatrix { expected, got } => write!(
-                f,
-                "ragged 2-D matrix: expected row length {expected}, got {got}"
             ),
             MatError::ShapeMismatch { expected, actual } => {
                 write!(f, "shape mismatch: expected {expected}, got {actual}")
