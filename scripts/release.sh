@@ -262,10 +262,23 @@ grep -q "^## \[${NEW_VERSION}\] - ${TODAY}\$" "$CHANGELOG" \
 #
 # Informational: a listed break is expected under a 0.x minor bump, and an empty
 # report on a cycle whose changelog claims a breaking change is the real signal.
+#
+# The feature list is deliberate rather than derived — it names the features
+# whose public API is worth checking, not every feature that exists, so the
+# test-only ones stay out. That makes it drift when a feature is renamed or
+# removed, and `|| true` would then hide cargo's "feature does not exist" error
+# behind an empty report that reads exactly like a clean one. Check the names
+# against the manifest first, so the drift stops the release and says so.
+SEMVER_FEATURES="serde,zfp,provenance,ndarray,num-complex"
 if command -v cargo-semver-checks >/dev/null 2>&1; then
+  for feat in $(printf '%s' "$SEMVER_FEATURES" | tr ',' ' '); do
+    awk '/^\[features\]/{f=1;next} /^\[/{f=0} f && /^[a-zA-Z0-9_-]+ = /{print $1}' \
+      "$CARGO_TOML" | grep -qx -- "$feat" \
+      || die "release.sh checks feature '$feat', which $CARGO_TOML no longer defines; update SEMVER_FEATURES"
+  done
   note "Public API delta since ${PREV_VERSION} (informational)"
   cargo semver-checks --baseline-version "$PREV_VERSION" --release-type minor \
-    --default-features --features serde,zfp,provenance,parallel,ndarray || true
+    --default-features --features "$SEMVER_FEATURES" || true
 else
   note "Skipping the API delta report (cargo-semver-checks not installed)"
 fi
