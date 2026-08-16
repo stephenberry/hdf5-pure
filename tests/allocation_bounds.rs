@@ -603,10 +603,13 @@ fn one_append_costs_its_batch_not_the_dataset() {
              bounds below are measuring something other than the append: {measured}"
         );
 
-        // Measured at 13 KiB and 28 allocations for a 4 KiB batch onto a 2 MiB
+        // Measured at 14 KiB and 28 allocations for a 4 KiB batch onto a 2 MiB
         // dataset: the batch staged and written, and the chunk index and object
-        // header around it. Eight batches' worth is far below anything
-        // proportional to the dataset, which is 512 of them.
+        // header around it. The same append measured against datasets of 17,
+        // 513 and 4,097 chunks costs 13.4, 14.3 and 15.3 KiB and 28 allocations
+        // throughout — the growth is in the index's *depth*, not its size, so
+        // eight batches' worth is a ceiling with room in it, and anything
+        // proportional to the dataset (512 batches here) is far above it.
         assert!(
             measured.bytes < (BATCH_BYTES * 8) as u64,
             "one append must allocate on the order of its {BATCH_BYTES}-byte batch, \
