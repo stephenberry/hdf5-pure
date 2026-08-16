@@ -9,7 +9,7 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec, vec::Vec};
 
-use crate::bytes::{is_undefined_at, read_offset};
+use crate::bytes::{is_undefined_at, read_length, read_offset};
 use crate::chunked_read::ChunkInfo;
 use crate::convert::{TryToUsize, is_undefined_addr, u32_from};
 use crate::error::FormatError;
@@ -103,7 +103,7 @@ impl ExtensibleArrayHeader {
         // rounded-up-to-block-boundary slot count, which we do not need.
         let ls = length_size as usize;
         pos += 4 * ls; // skip [0]..[3]
-        let num_elements = read_offset(d, pos, length_size)?; // [4] max_idx_set
+        let num_elements = read_length(d, pos, length_size)?; // [4] max_idx_set
         pos += ls;
         pos += ls; // skip [5] nelmts
         let index_block_address = read_offset(d, pos, offset_size)?;

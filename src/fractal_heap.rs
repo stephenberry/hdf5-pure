@@ -9,9 +9,8 @@ use byteorder::{ByteOrder, LittleEndian};
 use crate::btree_v2::{
     BTreeV2Header, BTreeV2Record, collect_btree_v2_records, collect_btree_v2_records_from_source,
 };
-use crate::bytes::{ensure_len, read_offset};
-use crate::convert::TryToUsize;
-use crate::convert::is_undefined_addr;
+use crate::bytes::{ensure_len, read_length, read_offset};
+use crate::convert::{TryToUsize, is_undefined_addr};
 use crate::error::FormatError;
 use crate::source::Source;
 
@@ -212,8 +211,8 @@ impl HugeObjectIndex {
         for record in records {
             let data = &record.data;
             let addr = read_offset(data, 0, offset_size)?;
-            let len = read_offset(data, os, length_size)?;
-            let id = read_offset(data, os + ls, length_size)?;
+            let len = read_length(data, os, length_size)?;
+            let id = read_length(data, os + ls, length_size)?;
             entries.push((id, addr, len));
         }
         entries.sort_unstable();
@@ -318,7 +317,7 @@ impl HeapObjectReader<'_> {
         {
             // The address and length are stored inline in the heap ID.
             let addr = read_offset(payload, 0, self.offset_size)?;
-            let len = read_offset(payload, self.offset_size as usize, self.length_size)?;
+            let len = read_length(payload, self.offset_size as usize, self.length_size)?;
             return Ok(HugeReference::Inline { addr, len });
         }
 
@@ -506,7 +505,7 @@ impl FractalHeapHeader {
         pos += skip_size;
 
         // managed_objects_count (length_size)
-        let managed_objects_count = read_offset(file_data, pos, length_size)?;
+        let managed_objects_count = read_length(file_data, pos, length_size)?;
         pos += ls;
 
         // huge_objects_size (length_size)
@@ -524,11 +523,11 @@ impl FractalHeapHeader {
         pos += 2;
 
         // starting_block_size (length_size)
-        let starting_block_size = read_offset(file_data, pos, length_size)?;
+        let starting_block_size = read_length(file_data, pos, length_size)?;
         pos += ls;
 
         // max_direct_block_size (length_size)
-        let max_direct_block_size = read_offset(file_data, pos, length_size)?;
+        let max_direct_block_size = read_length(file_data, pos, length_size)?;
         pos += ls;
 
         // max_heap_size (2)

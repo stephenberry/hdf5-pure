@@ -6,7 +6,7 @@ use alloc::{vec, vec::Vec};
 #[cfg(feature = "checksum")]
 use byteorder::{ByteOrder, LittleEndian};
 
-use crate::bytes::{ensure_len, read_offset};
+use crate::bytes::{ensure_len, read_length, read_offset};
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
 use crate::source::Source;
@@ -95,7 +95,7 @@ impl BTreeV2Header {
         let num_records_in_root = u16::from_le_bytes([file_data[pos], file_data[pos + 1]]);
         pos += 2;
 
-        let total_records = read_offset(file_data, pos, length_size)?;
+        let total_records = read_length(file_data, pos, length_size)?;
         #[allow(unused_assignments)]
         {
             pos += length_size as usize;

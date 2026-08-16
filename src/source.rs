@@ -46,11 +46,19 @@
 //!
 //! # How the reader uses this (issue #27)
 //!
-//! The staged migration this module was built for has landed. The data readers
-//! fetch each chunk through [`Source::read_at`] rather than slicing a whole-file
-//! buffer; the metadata parsers read each bounded structure into a small buffer
-//! on demand; and [`crate::File::open_streaming`] constructs a file backed by a
+//! The staged migration this module was built for has landed far enough to
+//! carry a streaming reader: the data readers fetch each chunk through
+//! [`Source::read_at`] rather than slicing a whole-file buffer, and
+//! [`crate::File::open_streaming`] constructs a file backed by a
 //! [`ReadSeekSource`], so opening one no longer implies buffering it.
+//!
+//! The metadata parsers are the part that is only half done. Each one that a
+//! streaming read reaches has a `*_from_source` twin that reads its bounded
+//! structure into a small buffer on demand, but the whole-file `&[u8]` form
+//! remains beside it for the buffered path — `ObjectHeader::parse` next to
+//! `parse_from_source`, and the same shape in `btree_v1` and `superblock`. The
+//! two are what the duplication survey counted as 47 twins; collapsing them is
+//! separate work from this module.
 //!
 //! One piece of the original plan arrived in a different shape. It called for a
 //! `Cursor<'a>` over a `&'a dyn Source` to absorb the `read_offset` /

@@ -3,7 +3,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::string::String;
 
-use crate::bytes::read_offset;
+use crate::bytes::{read_length, read_offset};
 use crate::convert::TryToUsize;
 use crate::error::FormatError;
 use crate::source::Source;
@@ -57,9 +57,9 @@ impl LocalHeap {
         }
 
         let mut pos = offset + 8;
-        let data_segment_size = read_offset(file_data, pos, length_size)?;
+        let data_segment_size = read_length(file_data, pos, length_size)?;
         pos += ls;
-        let free_list_head_offset = read_offset(file_data, pos, length_size)?;
+        let free_list_head_offset = read_length(file_data, pos, length_size)?;
         pos += ls;
         let data_segment_address = read_offset(file_data, pos, offset_size)?;
 

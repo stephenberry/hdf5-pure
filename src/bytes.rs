@@ -50,17 +50,43 @@ pub(crate) fn ensure_len(data: &[u8], offset: usize, needed: usize) -> Result<()
 ///
 /// The width is assumed already validated; the caller-facing wrappers below own
 /// the "which widths are legal here" decision and the error that reports it.
+///
+/// Written as a match over fixed-size arrays rather than a loop over `width`
+/// bytes. A loop whose trip count is the runtime `width` keeps its per-byte
+/// bounds check and a live panic edge — LLVM cannot use the `ensure_len` that
+/// ran immediately above, because the index is not a constant — so an 8-byte
+/// address costs eight loads and eight branches. Each arm here hands
+/// `from_le_bytes` a constant-length array, which compiles to one load.
 #[inline]
 fn read_le(data: &[u8], pos: usize, width: u8) -> u64 {
-    debug_assert!(
-        matches!(width, 1 | 2 | 4 | 8),
-        "width validated by the caller"
-    );
-    let mut acc: u64 = 0;
-    for i in (0..width as usize).rev() {
-        acc = (acc << 8) | u64::from(data[pos + i]);
+    match width {
+        1 => u64::from(data[pos]),
+        2 => u64::from(u16::from_le_bytes([data[pos], data[pos + 1]])),
+        4 => u64::from(u32::from_le_bytes([
+            data[pos],
+            data[pos + 1],
+            data[pos + 2],
+            data[pos + 3],
+        ])),
+        8 => u64::from_le_bytes([
+            data[pos],
+            data[pos + 1],
+            data[pos + 2],
+            data[pos + 3],
+            data[pos + 4],
+            data[pos + 5],
+            data[pos + 6],
+            data[pos + 7],
+        ]),
+        // Unreachable: all three callers `matches!` the width against their own
+        // legal set before calling. Not `unreachable!()`, which would make a
+        // future fourth caller's omission a panic in a parser rather than an
+        // error; the `debug_assert` catches it in the tests instead.
+        _ => {
+            debug_assert!(false, "width validated by the caller");
+            0
+        }
     }
-    acc
 }
 
 /// Read a file address of `offset_size` bytes at `pos`.
@@ -69,6 +95,7 @@ fn read_le(data: &[u8], pos: usize, width: u8) -> u64 {
 /// anything else is [`FormatError::InvalidOffsetSize`]. For the 1/2/4/8 widths
 /// that object header and link messages encode in a flag field, use
 /// [`read_uint_width`] instead.
+#[inline]
 pub(crate) fn read_offset(data: &[u8], pos: usize, offset_size: u8) -> Result<u64, FormatError> {
     if !matches!(offset_size, 2 | 4 | 8) {
         return Err(FormatError::InvalidOffsetSize(offset_size));
@@ -81,6 +108,7 @@ pub(crate) fn read_offset(data: &[u8], pos: usize, offset_size: u8) -> Result<u6
 ///
 /// Identical to [`read_offset`] but reports [`FormatError::InvalidLengthSize`],
 /// naming the "size of lengths" superblock field the width came from.
+#[inline]
 pub(crate) fn read_length(data: &[u8], pos: usize, length_size: u8) -> Result<u64, FormatError> {
     if !matches!(length_size, 2 | 4 | 8) {
         return Err(FormatError::InvalidLengthSize(length_size));
@@ -95,6 +123,15 @@ pub(crate) fn read_length(data: &[u8], pos: usize, length_size: u8) -> Result<u6
 /// This is the width an object header or link message encodes in a two-bit flag
 /// field, for a value that is a size or an index rather than a file address —
 /// so 1 is legal here and malformed in [`read_offset`].
+///
+/// Its error is [`FormatError::InvalidOffsetSize`], whose message names a
+/// superblock field this width did not come from and a legal set that excludes
+/// the 1 this function accepts. That contradicts the naming principle in the
+/// module doc above, and it stands because the arm is unreachable: both callers
+/// derive the width as `1 << (flags & 3)`, which is 1, 2, 4, or 8 by
+/// construction. Adding a public error variant for a case no input can reach
+/// would cost more than it states.
+#[inline]
 pub(crate) fn read_uint_width(data: &[u8], pos: usize, width: u8) -> Result<u64, FormatError> {
     if !matches!(width, 1 | 2 | 4 | 8) {
         return Err(FormatError::InvalidOffsetSize(width));
@@ -110,6 +147,7 @@ pub(crate) fn read_uint_width(data: &[u8], pos: usize, width: u8) -> Result<u64,
 /// per-module copies this replaces: every caller treats a `false` here as "there
 /// is an address to follow", and the read that follows reports the truncation
 /// with the position it actually failed at.
+#[inline]
 pub(crate) fn is_undefined_at(data: &[u8], pos: usize, offset_size: u8) -> bool {
     match read_offset(data, pos, offset_size) {
         Ok(addr) => is_undefined_addr(addr, offset_size),
@@ -137,6 +175,67 @@ mod tests {
         let data = [0u8; 16];
         let err = ensure_len(&data, usize::MAX - 1, 8).unwrap_err();
         assert!(matches!(err, FormatError::UnexpectedEof { .. }));
+    }
+
+    #[test]
+    fn the_eof_payload_reports_what_was_wanted_and_what_was_there() {
+        // The payload, not just the variant. Three differently-written copies
+        // fed this collapse and all three reported `pos + needed` against
+        // `data.len()`; asserting only the variant leaves the numbers free to
+        // drift, and they are what a caller debugging a truncated file reads.
+        let data = [0u8; 8];
+        assert_eq!(
+            ensure_len(&data, 6, 4).unwrap_err(),
+            FormatError::UnexpectedEof {
+                expected: 10,
+                available: 8,
+            }
+        );
+        // On overflow the sum saturates rather than wrapping into a small,
+        // plausible-looking `expected`.
+        assert_eq!(
+            ensure_len(&data, usize::MAX - 1, 8).unwrap_err(),
+            FormatError::UnexpectedEof {
+                expected: usize::MAX,
+                available: 8,
+            }
+        );
+        // A read reports the same payload its own bound check produced.
+        assert_eq!(
+            read_offset(&data, 6, 4).unwrap_err(),
+            FormatError::UnexpectedEof {
+                expected: 10,
+                available: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn ensure_len_of_nothing_past_the_end_is_still_out_of_range() {
+        // `offset > len` with `needed == 0`. The two bound formulations this
+        // collapse merged reach this answer by different routes, so it is worth
+        // pinning: an empty read at an impossible offset is not "fits".
+        let data = [0u8; 4];
+        assert!(ensure_len(&data, 4, 0).is_ok());
+        assert!(ensure_len(&data, 5, 0).is_err());
+    }
+
+    #[test]
+    fn every_helper_reads_every_width_it_accepts() {
+        // Each helper's full accepted set, not just the one width its call
+        // sites happen to use most: `read_uint_width` is otherwise only
+        // exercised at 1, and `read_length` at 4.
+        let data = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        for (width, expected) in [
+            (2u8, 0x2211u64),
+            (4, 0x4433_2211),
+            (8, 0x8877_6655_4433_2211),
+        ] {
+            assert_eq!(read_offset(&data, 0, width).unwrap(), expected);
+            assert_eq!(read_length(&data, 0, width).unwrap(), expected);
+            assert_eq!(read_uint_width(&data, 0, width).unwrap(), expected);
+        }
+        assert_eq!(read_uint_width(&data, 0, 1).unwrap(), 0x11);
     }
 
     #[test]
