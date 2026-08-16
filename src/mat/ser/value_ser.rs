@@ -5,7 +5,7 @@
 //! tree, then the emitter walks the tree to build the HDF5 file.
 
 use serde::ser::{
-    self, Impossible, Serialize, SerializeMap, SerializeSeq, SerializeStruct, SerializeTuple,
+    Impossible, Serialize, SerializeMap, SerializeSeq, SerializeStruct, SerializeTuple,
     SerializeTupleStruct, Serializer,
 };
 
@@ -13,11 +13,8 @@ use crate::mat::complex::{complex_tag_for_array_sentinel, complex_tag_for_sentin
 use crate::mat::error::MatError;
 use crate::mat::matrix::{MATRIX_SENTINEL, complex_tag_for_matrix_sentinel};
 use crate::mat::options::{EmptySequencePolicy, NullPolicy, Options, UnitVariantEncoding};
-use crate::mat::utf16;
 
-use crate::mat::value::{
-    ComplexNum, ComplexTag, ComplexVec, MatValue, NumVec, ScalarNum, ScalarTag,
-};
+use crate::mat::value::{ComplexNum, ComplexTag, ComplexVec, MatValue, NumVec, ScalarNum};
 
 // ---------------------------------------------------------------------------
 // Public entry: serialize a value into a MatValue
@@ -946,19 +943,4 @@ fn expect_component(v: MatValue) -> Result<ScalarNum, MatError> {
             other.kind()
         ))),
     }
-}
-
-// Silence unused-import warnings for items only referenced in specific
-// serializer methods.
-#[allow(dead_code)]
-fn _touch_utf16() -> Vec<u16> {
-    utf16::encode_utf16("x")
-}
-
-#[allow(dead_code)]
-fn _touch_tag(_: ScalarTag) {}
-
-#[allow(dead_code)]
-fn _touch_ser_err<E: ser::Error>() -> E {
-    E::custom("x")
 }
