@@ -295,8 +295,14 @@ fn read_element(
             os,
         ))
     } else {
-        // Filtered: address + compressed_size + filter_mask
-        let chunk_size_bytes = element_size as usize - os - 4;
+        // Filtered: address + compressed_size + filter_mask. `element_size` is
+        // the EAHD's own byte (`d[6]`), so a crafted header can name a width
+        // that cannot hold the address and mask it must contain; subtract with
+        // a check rather than underflowing. This mirrors the Fixed Array twin
+        // in `fixed_array::read_fixed_array_chunks`.
+        let chunk_size_bytes = (element_size as usize).checked_sub(os + 4).ok_or_else(|| {
+            FormatError::ChunkedReadError("Extensible Array element size too small".into())
+        })?;
         let elem_total = os + chunk_size_bytes + 4;
         if elem_total > data.len() || pos > data.len() - elem_total {
             return Err(FormatError::UnexpectedEof {
@@ -628,9 +634,6 @@ pub fn read_extensible_array_chunks(
     //    refers to super block `first_indirect_sblk + j`.
     let mut sblk_addrs: Vec<u64> = Vec::with_capacity(geom.nsblk_addrs);
     for _ in 0..geom.nsblk_addrs {
-        if os > file_data.len() || pos > file_data.len() - os {
-            break;
-        }
         sblk_addrs.push(read_offset(file_data, pos, offset_size)?);
         pos += os;
     }
@@ -1808,6 +1811,152 @@ mod tests {
         assert_eq!(ci.filter_mask, 0);
         assert_eq!(ci.offsets, vec![20]);
         assert_eq!(consumed, elem_size);
+    }
+
+    /// A filtered element record holds an address, a chunk size, and a 4-byte
+    /// filter mask, so its width cannot be smaller than `offset_size + 4`. The
+    /// width comes from the EAHD's own `element_size` byte, which no parse
+    /// validates, so a crafted header can name a smaller one. That must be
+    /// refused: the size arithmetic used to underflow, which panics under the
+    /// overflow checks that `cargo test` and the fuzz targets build with.
+    #[test]
+    fn filtered_element_smaller_than_its_own_fields_is_refused() {
+        let os: u8 = 8;
+        let num_chunks = vec![5u64];
+        let chunk_dims = vec![10u32];
+        let data = vec![0u8; 64];
+
+        // `element_size` must be at least os + 4 = 12 to hold what it claims.
+        for element_size in 0..(os + 4) {
+            let err = read_element(
+                &data,
+                0,
+                1,
+                element_size,
+                os,
+                80,
+                0,
+                &num_chunks,
+                &chunk_dims,
+            )
+            .expect_err("a filtered element narrower than its own fields must be refused");
+            assert!(
+                matches!(err, FormatError::ChunkedReadError(_)),
+                "element_size {element_size} gave {err:?}, want a ChunkedReadError"
+            );
+        }
+
+        // The first width that can hold them is accepted.
+        read_element(&data, 0, 1, os + 4 + 1, os, 80, 0, &num_chunks, &chunk_dims)
+            .expect("a width that fits address + 1-byte size + mask must parse");
+    }
+
+    /// A truncated super-block address array must be refused by both backends.
+    ///
+    /// The buffered reader used to `break` out of the address loop on a short
+    /// read and return `Ok` with a silently shortened chunk list, while the
+    /// streaming reader returned `UnexpectedEof` for the identical bytes -- so
+    /// the same file decoded two different ways depending on whether it was
+    /// opened with `File::open` or `File::open_streaming`. The error is
+    /// asserted down to the offset it faults at, so this cannot pass on an
+    /// unrelated failure earlier in the walk.
+    #[cfg(feature = "std")]
+    #[test]
+    fn truncated_super_block_addresses_are_refused_by_both_backends() {
+        use crate::chunked_write::{WrittenChunk, build_extensible_array_at};
+        use crate::source::BytesSource;
+
+        let n = 100u64;
+        let chunks: Vec<WrittenChunk> = (0..n)
+            .map(|i| WrittenChunk {
+                address: 0x10 + i * 8,
+                compressed_size: 8,
+                raw_size: 8,
+                filter_mask: 0,
+            })
+            .collect();
+        let base = 0x1000u64;
+        let ea = build_extensible_array_at(&chunks, 8, 8, false, base).unwrap();
+        let mut file = vec![0u8; base as usize + ea.len()];
+        file[base as usize..].copy_from_slice(&ea);
+
+        let ds_dims = vec![n];
+        let chunk_dims = vec![1u32];
+        let built = ExtensibleArrayHeader::parse(&file, base as usize, 8, 8).unwrap();
+        let geom = EaGeometry::from_header(&built);
+        assert!(
+            geom.nsblk_addrs > 0,
+            "fixture must reach the super-block address array"
+        );
+
+        // This crate's writer lays the index block down *before* the data
+        // blocks it points at, so truncating into the block's address array
+        // also truncates those data blocks and the walk faults on one of them
+        // first. The format does not require that order, and a file whose
+        // index block trails its data blocks is what reaches the address loop
+        // with everything before it intact -- so move the index block to the
+        // end and repoint the header at it. Nothing else about the file
+        // changes; both header and index-block checksums go unvalidated on
+        // this path, so the copy needs no fixing up.
+        let old_ib = built.index_block_address.to_usize().unwrap();
+        let ib_len = 4 + 1 + 1 + 8                            // sig + ver + client + header addr
+            + built.idx_blk_elmts as usize * 8                // inline elements
+            + geom.direct_dblk_nelmts.len() * 8               // direct-block addresses
+            + geom.nsblk_addrs * 8                            // super-block addresses
+            + 4; // checksum
+        let block = file[old_ib..old_ib + ib_len].to_vec();
+        let new_ib = file.len();
+        file.extend_from_slice(&block);
+        // The header's index-block address sits after the 12-byte prefix and
+        // the six length-sized statistics fields.
+        let addr_field = base as usize + 12 + 6 * 8;
+        file[addr_field..addr_field + 8].copy_from_slice(&(new_ib as u64).to_le_bytes());
+
+        let header = ExtensibleArrayHeader::parse(&file, base as usize, 8, 8).unwrap();
+        assert_eq!(header.index_block_address as usize, new_ib);
+        // The relocated file must still read identically before it is cut.
+        let intact =
+            read_extensible_array_chunks(&file, &header, &ds_dims, &chunk_dims, 8, 8, 8).unwrap();
+        assert_eq!(intact.len() as u64, n, "relocation must preserve the read");
+
+        // Where the first super-block address begins: index block prefix,
+        // then the inline elements, then the direct-block addresses.
+        let sblk_start = new_ib
+            + 4
+            + 1
+            + 1
+            + 8
+            + header.idx_blk_elmts as usize * 8
+            + geom.direct_dblk_nelmts.len() * 8;
+
+        // Cut the file in the middle of that first address. Every data block
+        // now lies before the cut, so the address loop is what faults.
+        file.truncate(sblk_start + 4);
+
+        let buffered = read_extensible_array_chunks(&file, &header, &ds_dims, &chunk_dims, 8, 8, 8);
+        match buffered {
+            Err(FormatError::UnexpectedEof {
+                expected,
+                available,
+            }) => {
+                assert_eq!(
+                    expected,
+                    sblk_start + 8,
+                    "the buffered read must fault on the super-block address itself"
+                );
+                assert_eq!(available, file.len());
+            }
+            other => panic!("buffered read must refuse a truncated address array, got {other:?}"),
+        }
+
+        let mem = BytesSource::new(&file);
+        let hm = ExtensibleArrayHeader::parse_from_source(&mem, base, 8, 8).unwrap();
+        let streamed =
+            read_extensible_array_chunks_from_source(&mem, &hm, &ds_dims, &chunk_dims, 8, 8, 8);
+        assert!(
+            streamed.is_err(),
+            "streaming read must refuse the same file, got {streamed:?}"
+        );
     }
 
     /// `extensible_array_index_spans` must account for exactly the index
