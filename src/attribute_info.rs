@@ -3,8 +3,7 @@
 //! The Attribute Info message describes dense attribute storage: a fractal heap
 //! and B-tree v2 indexes for attribute lookup by name or creation order.
 
-use crate::bytes::{ensure_len, read_offset};
-use crate::convert::is_undefined_addr;
+use crate::bytes::{ensure_len, read_optional_offset};
 use crate::error::FormatError;
 
 /// Parsed Attribute Info message from an object header.
@@ -49,29 +48,14 @@ impl AttributeInfoMessage {
             None
         };
 
-        let fh_addr = read_offset(data, pos, offset_size)?;
+        let fractal_heap_address = read_optional_offset(data, pos, offset_size)?;
         pos += offset_size as usize;
-        let fractal_heap_address = if is_undefined_addr(fh_addr, offset_size) {
-            None
-        } else {
-            Some(fh_addr)
-        };
 
-        let btree_addr = read_offset(data, pos, offset_size)?;
+        let btree_name_index_address = read_optional_offset(data, pos, offset_size)?;
         pos += offset_size as usize;
-        let btree_name_index_address = if is_undefined_addr(btree_addr, offset_size) {
-            None
-        } else {
-            Some(btree_addr)
-        };
 
         let btree_creation_order_address = if has_creation_order_index {
-            let addr = read_offset(data, pos, offset_size)?;
-            if is_undefined_addr(addr, offset_size) {
-                None
-            } else {
-                Some(addr)
-            }
+            read_optional_offset(data, pos, offset_size)?
         } else {
             None
         };

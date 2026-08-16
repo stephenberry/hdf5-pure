@@ -3,7 +3,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::vec::Vec;
 
-use crate::bytes::{ensure_len, is_undefined_at, read_length, read_offset};
+use crate::bytes::{ensure_len, read_length, read_optional_offset};
 use crate::error::FormatError;
 
 /// Parsed HDF5 data layout message.
@@ -80,11 +80,7 @@ impl DataLayout {
                 let os = offset_size as usize;
                 let ls = length_size as usize;
                 ensure_len(data, pos, os + ls)?;
-                let address = if is_undefined_at(data, pos, offset_size) {
-                    None
-                } else {
-                    Some(read_offset(data, pos, offset_size)?)
-                };
+                let address = read_optional_offset(data, pos, offset_size)?;
                 let size = read_length(data, pos + os, length_size)?;
                 Ok(DataLayout::Contiguous { address, size })
             }
@@ -96,11 +92,7 @@ impl DataLayout {
                 // btree address first
                 let os = offset_size as usize;
                 ensure_len(data, p, os)?;
-                let btree_address = if is_undefined_at(data, p, offset_size) {
-                    None
-                } else {
-                    Some(read_offset(data, p, offset_size)?)
-                };
+                let btree_address = read_optional_offset(data, p, offset_size)?;
                 p += os;
                 // chunk dim sizes: dimensionality × 4 bytes each
                 ensure_len(data, p, dimensionality * 4)?;
@@ -144,11 +136,7 @@ impl DataLayout {
                 let os = offset_size as usize;
                 let ls = length_size as usize;
                 ensure_len(data, pos, os + ls)?;
-                let address = if is_undefined_at(data, pos, offset_size) {
-                    None
-                } else {
-                    Some(read_offset(data, pos, offset_size)?)
-                };
+                let address = read_optional_offset(data, pos, offset_size)?;
                 let size = read_length(data, pos + os, length_size)?;
                 Ok(DataLayout::Contiguous { address, size })
             }
@@ -210,68 +198,40 @@ impl DataLayout {
                                 data[p + 3],
                             ]));
                             p += 4;
-                            if is_undefined_at(data, p, offset_size) {
-                                None
-                            } else {
-                                Some(read_offset(data, p, offset_size)?)
-                            }
+                            read_optional_offset(data, p, offset_size)?
                         } else {
                             // just address(offset_size)
                             ensure_len(data, p, offset_size as usize)?;
-                            if is_undefined_at(data, p, offset_size) {
-                                None
-                            } else {
-                                Some(read_offset(data, p, offset_size)?)
-                            }
+                            read_optional_offset(data, p, offset_size)?
                         }
                     }
                     2 => {
                         // Implicit: just address
                         ensure_len(data, p, offset_size as usize)?;
-                        if is_undefined_at(data, p, offset_size) {
-                            None
-                        } else {
-                            Some(read_offset(data, p, offset_size)?)
-                        }
+                        read_optional_offset(data, p, offset_size)?
                     }
                     3 => {
                         // Fixed Array: max_dblk_page_nelmts_bits(1) + address(offset_size)
                         ensure_len(data, p, 1 + offset_size as usize)?;
                         p += 1; // skip max_dblk_page_nelmts_bits
-                        if is_undefined_at(data, p, offset_size) {
-                            None
-                        } else {
-                            Some(read_offset(data, p, offset_size)?)
-                        }
+                        read_optional_offset(data, p, offset_size)?
                     }
                     4 => {
                         // Extensible Array: 5 creation params + address(offset_size)
                         ensure_len(data, p, 5 + offset_size as usize)?;
                         p += 5; // skip EA creation parameters
-                        if is_undefined_at(data, p, offset_size) {
-                            None
-                        } else {
-                            Some(read_offset(data, p, offset_size)?)
-                        }
+                        read_optional_offset(data, p, offset_size)?
                     }
                     5 => {
                         // B-tree v2: node_size(4) + split_percent(1) + merge_percent(1) + address
                         ensure_len(data, p, 6 + offset_size as usize)?;
                         p += 6;
-                        if is_undefined_at(data, p, offset_size) {
-                            None
-                        } else {
-                            Some(read_offset(data, p, offset_size)?)
-                        }
+                        read_optional_offset(data, p, offset_size)?
                     }
                     _ => {
                         // Unknown index type: try just address
                         ensure_len(data, p, offset_size as usize)?;
-                        if is_undefined_at(data, p, offset_size) {
-                            None
-                        } else {
-                            Some(read_offset(data, p, offset_size)?)
-                        }
+                        read_optional_offset(data, p, offset_size)?
                     }
                 };
 

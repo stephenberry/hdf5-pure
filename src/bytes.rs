@@ -140,18 +140,26 @@ pub(crate) fn read_uint_width(data: &[u8], pos: usize, width: u8) -> Result<u64,
     Ok(read_le(data, pos, width))
 }
 
-/// True when the address stored at `pos` is the all-`0xFF` "undefined address"
-/// sentinel for a file whose size-of-offsets is `offset_size`.
+/// Read a file address of `offset_size` bytes at `pos`, as `None` when the file
+/// stored the all-`0xFF` "undefined address" sentinel there.
 ///
-/// Out-of-range or unsupported widths read as "not undefined", matching the
-/// per-module copies this replaces: every caller treats a `false` here as "there
-/// is an address to follow", and the read that follows reports the truncation
-/// with the position it actually failed at.
+/// The two outcomes a caller must not confuse are separated by the return type:
+/// `Ok(None)` is "the file says there is no address here", and an unreadable or
+/// mis-sized address is an `Err` naming the position it failed at. Every field
+/// this reads — a contiguous dataset's data address, a chunk index root, a
+/// B-tree v1 sibling, an array element — is optional in exactly that sense, and
+/// the sentinel is the format's way of writing the `None`.
 #[inline]
-pub(crate) fn is_undefined_at(data: &[u8], pos: usize, offset_size: u8) -> bool {
-    match read_offset(data, pos, offset_size) {
-        Ok(addr) => is_undefined_addr(addr, offset_size),
-        Err(_) => false,
+pub(crate) fn read_optional_offset(
+    data: &[u8],
+    pos: usize,
+    offset_size: u8,
+) -> Result<Option<u64>, FormatError> {
+    let addr = read_offset(data, pos, offset_size)?;
+    if is_undefined_addr(addr, offset_size) {
+        Ok(None)
+    } else {
+        Ok(Some(addr))
     }
 }
 
@@ -290,24 +298,47 @@ mod tests {
     }
 
     #[test]
-    fn the_all_ones_sentinel_is_undefined_at_each_width() {
+    fn the_all_ones_sentinel_reads_as_none_at_each_width() {
         let ones = [0xFFu8; 8];
-        assert!(is_undefined_at(&ones, 0, 2));
-        assert!(is_undefined_at(&ones, 0, 4));
-        assert!(is_undefined_at(&ones, 0, 8));
+        assert_eq!(read_optional_offset(&ones, 0, 2).unwrap(), None);
+        assert_eq!(read_optional_offset(&ones, 0, 4).unwrap(), None);
+        assert_eq!(read_optional_offset(&ones, 0, 8).unwrap(), None);
 
-        // One byte short of the sentinel is a real address.
+        // One byte short of the sentinel is a real address, and it is returned.
         let mut nearly = [0xFFu8; 8];
         nearly[0] = 0xFE;
-        assert!(!is_undefined_at(&nearly, 0, 8));
+        assert_eq!(
+            read_optional_offset(&nearly, 0, 8).unwrap(),
+            Some(0xFFFF_FFFF_FFFF_FFFE)
+        );
     }
 
     #[test]
-    fn an_unreadable_address_is_not_reported_as_undefined() {
-        // Past the end, and an unsupported width: both read as "there is an
-        // address here", leaving the error to the read that follows.
+    fn the_sentinel_is_the_width_the_caller_asked_for() {
+        // `0xFFFF` is the undefined address of a 2-byte file and an ordinary
+        // address in an 8-byte one. A check written against a fixed width would
+        // read the same bytes and disagree with the file it came from.
+        let mut data = [0u8; 8];
+        data[0] = 0xFF;
+        data[1] = 0xFF;
+        assert_eq!(read_optional_offset(&data, 0, 2).unwrap(), None);
+        assert_eq!(read_optional_offset(&data, 0, 8).unwrap(), Some(0xFFFF));
+    }
+
+    #[test]
+    fn an_unreadable_address_is_an_error_rather_than_a_none() {
+        // The distinction the return type exists to hold: `None` is what the
+        // file said, not what could not be read. Past the end and an
+        // unsupported width both report, so neither is silently a "no address
+        // here" that a caller would skip over.
         let ones = [0xFFu8; 8];
-        assert!(!is_undefined_at(&ones, 4, 8));
-        assert!(!is_undefined_at(&ones, 0, 3));
+        assert!(matches!(
+            read_optional_offset(&ones, 4, 8),
+            Err(FormatError::UnexpectedEof { .. })
+        ));
+        assert_eq!(
+            read_optional_offset(&ones, 0, 3).unwrap_err(),
+            FormatError::InvalidOffsetSize(3)
+        );
     }
 }
