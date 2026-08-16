@@ -115,12 +115,9 @@ impl Dataspace {
             None
         };
 
-        // v1 flags bit 1 = permutation indices present (skip them)
-        if version == 1 && flags & 0x02 != 0 {
-            // rank × length_size bytes of permutation indices — skip
-            let _skip = rank as usize * ls;
-            // pos += _skip; // not needed since we don't use pos after this
-        }
+        // A v1 dataspace with flags bit 1 set carries rank × length_size bytes
+        // of permutation indices here. Nothing below reads `pos`, so they need
+        // no skipping; this crate does not expose them.
 
         Ok(Dataspace {
             space_type,

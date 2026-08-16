@@ -4,7 +4,7 @@
 //! file. A flat `HashMap<String, T>` is also accepted, matching
 //! `scipy.io.savemat`'s dict-at-root convention.
 
-use serde::ser::{self, Impossible, Serialize, SerializeMap, SerializeStruct, Serializer};
+use serde::ser::{Impossible, Serialize, SerializeMap, SerializeStruct, Serializer};
 
 use crate::mat::error::MatError;
 use crate::mat::options::Options;
@@ -353,10 +353,4 @@ impl SerializeMap for RootMapSer<'_> {
     fn end(self) -> Result<Vec<(String, MatValue)>, MatError> {
         Ok(self.fields)
     }
-}
-
-// Silence unused-import warnings in some builds.
-#[allow(dead_code)]
-fn _touch<E: ser::Error>() -> E {
-    E::custom("x")
 }

@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 
 use serde::de::{
-    self, DeserializeSeed, Deserializer, EnumAccess, IntoDeserializer, MapAccess, SeqAccess,
+    DeserializeSeed, Deserializer, EnumAccess, IntoDeserializer, MapAccess, SeqAccess,
     VariantAccess, Visitor,
 };
 use serde::forward_to_deserialize_any;
@@ -1212,12 +1212,6 @@ impl NumVec {
             ScalarNum::U8(x) => NumVec::U8(vec![x]),
         }
     }
-}
-
-// Silence unused imports in some builds.
-#[allow(dead_code)]
-fn _touch<E: de::Error>() -> E {
-    E::custom("x")
 }
 
 #[cfg(test)]

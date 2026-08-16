@@ -9,9 +9,7 @@ use crate::mat::error::MatError;
 use crate::mat::options::Options;
 use crate::mat::userblock::{self, USERBLOCK_SIZE};
 use crate::mat::utf16;
-use crate::type_builders::{
-    DatasetBuilder, FinishedGroup, GroupBuilder, make_f32_type, make_f64_type,
-};
+use crate::type_builders::{DatasetBuilder, FinishedGroup, GroupBuilder};
 use crate::writer::FileBuilder;
 
 use crate::mat::value::{ComplexVec, MatValue, NumVec, ScalarNum, ScalarTag};
@@ -597,13 +595,6 @@ fn set_logical_decode(ds: &mut DatasetBuilder) {
 /// UTF-16 characters rather than a numeric array.
 fn set_char_decode(ds: &mut DatasetBuilder) {
     ds.set_attr("MATLAB_int_decode", AttrValue::I32(2));
-}
-
-// Silence the "unused import" on the no-test build.
-#[allow(dead_code)]
-fn _touch() {
-    let _ = make_f64_type();
-    let _ = make_f32_type();
 }
 
 #[cfg(test)]
