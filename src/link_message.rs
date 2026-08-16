@@ -35,7 +35,168 @@ pub struct LinkMessage {
     pub charset: CharacterSet,
 }
 
+/// Everything a Link message declares before its target data, with the name
+/// left where it lies in the message bytes.
+///
+/// Splitting the parse here is what lets a lookup by name read a group's links
+/// without allocating for the ones it rejects: [`LinkMessage::parse`] owns the
+/// name because its caller keeps it, while
+/// [`hard_link_address_if_named`](LinkMessage::hard_link_address_if_named)
+/// compares the borrowed bytes and stops.
+struct LinkPrefix<'a> {
+    /// The link name as stored, undecoded.
+    name: &'a [u8],
+    /// 0 for a hard link, 1 soft, 64 external.
+    link_type_code: u8,
+    creation_order: Option<u64>,
+    charset: CharacterSet,
+    /// Offset of the target data that follows the name.
+    target_pos: usize,
+}
+
+/// Parse a Link message up to (not including) its target data.
+fn parse_prefix(data: &[u8]) -> Result<LinkPrefix<'_>, FormatError> {
+    ensure_len(data, 0, 2)?;
+
+    let version = data[0];
+    if version != 1 {
+        return Err(FormatError::InvalidLinkVersion(version));
+    }
+
+    let flags = data[1];
+    // Bits 0-1: size of the name length field (1/2/4/8 bytes)
+    let name_size_field_width = match flags & 0x03 {
+        0 => 1u8,
+        1 => 2,
+        2 => 4,
+        3 => 8,
+        _ => unreachable!(),
+    };
+    // Bit 2: creation order field present
+    let has_creation_order = flags & 0x04 != 0;
+    // Bit 3: link type field present
+    let has_link_type = flags & 0x08 != 0;
+    // Bit 4: link name character set field present
+    let has_charset = flags & 0x10 != 0;
+
+    let mut pos = 2;
+
+    // Link type
+    let link_type_code = if has_link_type {
+        ensure_len(data, pos, 1)?;
+        let v = data[pos];
+        pos += 1;
+        v
+    } else {
+        0 // hard link
+    };
+
+    // Creation order
+    let creation_order = if has_creation_order {
+        ensure_len(data, pos, 8)?;
+        let co = u64::from_le_bytes([
+            data[pos],
+            data[pos + 1],
+            data[pos + 2],
+            data[pos + 3],
+            data[pos + 4],
+            data[pos + 5],
+            data[pos + 6],
+            data[pos + 7],
+        ]);
+        pos += 8;
+        Some(co)
+    } else {
+        None
+    };
+
+    // Character set
+    let charset = if has_charset {
+        ensure_len(data, pos, 1)?;
+        let cs = data[pos];
+        pos += 1;
+        match cs {
+            0 => CharacterSet::Ascii,
+            1 => CharacterSet::Utf8,
+            _ => return Err(FormatError::InvalidCharacterSet(cs)),
+        }
+    } else {
+        CharacterSet::Ascii
+    };
+
+    // Link name length
+    let name_len = read_uint_width(data, pos, name_size_field_width)?.to_usize()?;
+    pos += name_size_field_width as usize;
+
+    // Link name
+    ensure_len(data, pos, name_len)?;
+    let name = &data[pos..pos + name_len];
+    pos += name_len;
+
+    Ok(LinkPrefix {
+        name,
+        link_type_code,
+        creation_order,
+        charset,
+        target_pos: pos,
+    })
+}
+
+/// Whether the stored name bytes `raw` name the link `wanted`.
+///
+/// [`LinkMessage::parse`] decodes a name with `from_utf8_lossy`, so a name that
+/// is not valid UTF-8 is matched against the replacement characters a caller
+/// would have received from it — the only spelling such a link can be asked for.
+/// A valid name compares as bytes and allocates nothing.
+fn name_matches(raw: &[u8], wanted: &str) -> bool {
+    if raw == wanted.as_bytes() {
+        return true;
+    }
+    core::str::from_utf8(raw).is_err() && String::from_utf8_lossy(raw) == wanted
+}
+
+/// Whether the Link message `data` names the link `name`.
+///
+/// A message this cannot parse answers `true`: this exists to let an object-header
+/// parse drop the links a lookup will not read (see
+/// [`crate::object_header::MessageFilter`]), and a malformed link is one the
+/// parse that follows must still see, so that it reports the same error whether
+/// or not a lookup passed over it first.
+pub(crate) fn link_is_named(data: &[u8], name: &str) -> bool {
+    match parse_prefix(data) {
+        Ok(prefix) => name_matches(prefix.name, name),
+        Err(_) => true,
+    }
+}
+
 impl LinkMessage {
+    /// The object-header address this Link message points at, if it is a *hard*
+    /// link named `name`.
+    ///
+    /// `Ok(None)` means this link is not the one asked for — a different name, or
+    /// a soft/external link, which name no object header in this file and are
+    /// what [`crate::group_v2`] skips when resolving a path.
+    ///
+    /// This exists so resolving one path does not cost a `String` per link of
+    /// the group: a group of *n* children is *n* Link messages in its object
+    /// header, and building every name to find one made opening each child of a
+    /// group quadratic in the group's size (issue #228).
+    pub(crate) fn hard_link_address_if_named(
+        data: &[u8],
+        offset_size: u8,
+        name: &str,
+    ) -> Result<Option<u64>, FormatError> {
+        let prefix = parse_prefix(data)?;
+        if prefix.link_type_code != 0 || !name_matches(prefix.name, name) {
+            // A link type this crate does not know is still not the hard link
+            // asked for; `parse` is where an invalid one is reported, so that a
+            // lookup elsewhere in the group behaves the same whether or not it
+            // passed this message first.
+            return Ok(None);
+        }
+        Ok(Some(read_offset(data, prefix.target_pos, offset_size)?))
+    }
+
     /// Serialize link message to HDF5 message bytes.
     pub fn serialize(&self, offset_size: u8) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -167,82 +328,14 @@ impl LinkMessage {
     ///
     /// `offset_size` is needed for hard link target addresses.
     pub fn parse(data: &[u8], offset_size: u8) -> Result<LinkMessage, FormatError> {
-        ensure_len(data, 0, 2)?;
-
-        let version = data[0];
-        if version != 1 {
-            return Err(FormatError::InvalidLinkVersion(version));
-        }
-
-        let flags = data[1];
-        // Bits 0-1: size of the name length field (1/2/4/8 bytes)
-        let name_size_field_width = match flags & 0x03 {
-            0 => 1u8,
-            1 => 2,
-            2 => 4,
-            3 => 8,
-            _ => unreachable!(),
-        };
-        // Bit 2: creation order field present
-        let has_creation_order = flags & 0x04 != 0;
-        // Bit 3: link type field present
-        let has_link_type = flags & 0x08 != 0;
-        // Bit 4: link name character set field present
-        let has_charset = flags & 0x10 != 0;
-
-        let mut pos = 2;
-
-        // Link type
-        let link_type_code = if has_link_type {
-            ensure_len(data, pos, 1)?;
-            let v = data[pos];
-            pos += 1;
-            v
-        } else {
-            0 // hard link
-        };
-
-        // Creation order
-        let creation_order = if has_creation_order {
-            ensure_len(data, pos, 8)?;
-            let co = u64::from_le_bytes([
-                data[pos],
-                data[pos + 1],
-                data[pos + 2],
-                data[pos + 3],
-                data[pos + 4],
-                data[pos + 5],
-                data[pos + 6],
-                data[pos + 7],
-            ]);
-            pos += 8;
-            Some(co)
-        } else {
-            None
-        };
-
-        // Character set
-        let charset = if has_charset {
-            ensure_len(data, pos, 1)?;
-            let cs = data[pos];
-            pos += 1;
-            match cs {
-                0 => CharacterSet::Ascii,
-                1 => CharacterSet::Utf8,
-                _ => return Err(FormatError::InvalidCharacterSet(cs)),
-            }
-        } else {
-            CharacterSet::Ascii
-        };
-
-        // Link name length
-        let name_len = read_uint_width(data, pos, name_size_field_width)?.to_usize()?;
-        pos += name_size_field_width as usize;
-
-        // Link name
-        ensure_len(data, pos, name_len)?;
-        let name = String::from_utf8_lossy(&data[pos..pos + name_len]).into_owned();
-        pos += name_len;
+        let LinkPrefix {
+            name,
+            link_type_code,
+            creation_order,
+            charset,
+            target_pos: mut pos,
+        } = parse_prefix(data)?;
+        let name = String::from_utf8_lossy(name).into_owned();
 
         // Link target data
         let link_target = match link_type_code {
@@ -433,6 +526,69 @@ mod tests {
         let data = build_hard_link("abcd", 0x600, 8, None, None, 4);
         let msg = LinkMessage::parse(&data, 8).unwrap();
         assert_eq!(msg.name, "abcd");
+    }
+
+    #[test]
+    fn a_named_hard_link_answers_with_its_address() {
+        let data = build_hard_link("mydata", 0x1000, 8, None, None, 1);
+        assert_eq!(
+            LinkMessage::hard_link_address_if_named(&data, 8, "mydata").unwrap(),
+            Some(0x1000)
+        );
+        assert_eq!(
+            LinkMessage::hard_link_address_if_named(&data, 8, "other").unwrap(),
+            None
+        );
+    }
+
+    /// A soft link names a path, not an object header, so a lookup passes over it
+    /// however it is named — the same way [`crate::group_v2`] leaves soft and
+    /// external links out of the entries it resolves.
+    #[test]
+    fn a_soft_link_of_the_wanted_name_is_not_an_address() {
+        let target = "/group1/dataset";
+        let mut data = Vec::new();
+        data.push(1); // version
+        data.push(0x08); // flags: link type present, 1-byte name length
+        data.push(1); // link type = soft
+        data.push(4); // name length
+        data.extend_from_slice(b"link");
+        data.extend_from_slice(&(target.len() as u16).to_le_bytes());
+        data.extend_from_slice(target.as_bytes());
+
+        assert_eq!(
+            LinkMessage::hard_link_address_if_named(&data, 8, "link").unwrap(),
+            None
+        );
+    }
+
+    /// A name that is not valid UTF-8 reaches a caller as the replacement
+    /// characters [`LinkMessage::parse`] decodes it to, and that spelling is the
+    /// only one such a link can be asked for — so it is the one that matches.
+    #[test]
+    fn a_name_that_is_not_utf8_matches_the_spelling_a_reader_gets() {
+        let mut data = Vec::new();
+        data.push(1); // version
+        data.push(0x00); // flags: hard link, 1-byte name length
+        data.push(2); // name length
+        data.extend_from_slice(&[0xFF, 0xFE]); // not UTF-8
+        data.extend_from_slice(&0x2000u64.to_le_bytes());
+
+        let decoded = LinkMessage::parse(&data, 8).unwrap().name;
+        assert_eq!(
+            LinkMessage::hard_link_address_if_named(&data, 8, &decoded).unwrap(),
+            Some(0x2000),
+            "a link found by listing must be findable by the name the listing gave"
+        );
+        assert!(link_is_named(&data, &decoded));
+    }
+
+    /// A message this cannot read is kept rather than filtered away, so the parse
+    /// that follows reports it. Answering "not this one" would hide it.
+    #[test]
+    fn an_unreadable_link_is_kept_by_the_filter() {
+        assert!(link_is_named(&[2, 0, 0, 0], "anything"), "bad version");
+        assert!(link_is_named(&[], "anything"), "empty body");
     }
 
     #[test]

@@ -30,6 +30,45 @@ fn absolute(stored: u64, base_address: u64) -> Result<u64, FormatError> {
         })
 }
 
+/// Which of a header's messages a parse keeps.
+///
+/// A parse owns a copy of every message it keeps, so a caller looking for one
+/// message in a header that holds a thousand pays for a thousand. Path
+/// resolution is that caller: a group of *n* children is *n* Link messages in
+/// its object header, and it needs the one link it was asked for. Naming that
+/// up front costs the header walk (which reads the bytes either way) and one
+/// message body, instead of one allocation per child on every lookup — the
+/// difference between opening each child of a group being linear and quadratic
+/// in the group's size (issue #228).
+///
+/// A filter is an optimization, never a decision: dropping a message must not
+/// change what the parse *means*, so a filter that cannot tell keeps the
+/// message and lets the reader that understands it decide. Continuation
+/// messages are followed whatever the filter says.
+pub(crate) enum MessageFilter<'f> {
+    /// Keep every message — what every caller but a targeted lookup wants.
+    All,
+    /// Keep a message only if this says so, given its type and its body.
+    Only(&'f mut dyn FnMut(MessageType, &[u8]) -> bool),
+}
+
+impl MessageFilter<'_> {
+    /// Whether the message of type `msg_type` with body `data` is kept.
+    fn keeps(&mut self, msg_type: MessageType, data: &[u8]) -> bool {
+        match self {
+            MessageFilter::All => true,
+            MessageFilter::Only(f) => f(msg_type, data),
+        }
+    }
+
+    /// Whether this filter keeps everything, and so the message vector can be
+    /// sized from a count of the chunk. A filter that drops most of a header
+    /// would make that reservation the largest thing the parse allocates.
+    fn keeps_all(&self) -> bool {
+        matches!(self, MessageFilter::All)
+    }
+}
+
 /// A single parsed header message.
 ///
 /// `size` and `creation_order` are decoded from the on-disk message prefix for
@@ -106,11 +145,49 @@ impl ObjectHeader {
         length_size: u8,
         base_address: u64,
     ) -> Result<ObjectHeader, FormatError> {
+        Self::parse_filtered(
+            data,
+            offset,
+            offset_size,
+            length_size,
+            base_address,
+            MessageFilter::All,
+        )
+    }
+
+    /// Parse an object header, keeping only the messages `filter` names.
+    ///
+    /// The header is read and validated exactly as [`parse_with_base`](Self::parse_with_base)
+    /// reads it — same checksums, same refusals, same continuations followed —
+    /// and the result differs only in which messages it carries. See
+    /// [`MessageFilter`] for when that is worth asking for.
+    pub(crate) fn parse_filtered(
+        data: &[u8],
+        offset: usize,
+        offset_size: u8,
+        length_size: u8,
+        base_address: u64,
+        mut filter: MessageFilter<'_>,
+    ) -> Result<ObjectHeader, FormatError> {
         ensure_len(data, offset, 4)?;
         if data[offset..offset + 4] == OHDR_SIGNATURE {
-            Self::parse_v2(data, offset, offset_size, length_size, base_address)
+            Self::parse_v2(
+                data,
+                offset,
+                offset_size,
+                length_size,
+                base_address,
+                &mut filter,
+            )
         } else {
-            Self::parse_v1(data, offset, offset_size, length_size, base_address)
+            Self::parse_v1(
+                data,
+                offset,
+                offset_size,
+                length_size,
+                base_address,
+                &mut filter,
+            )
         }
     }
 
@@ -120,6 +197,7 @@ impl ObjectHeader {
         offset_size: u8,
         length_size: u8,
         base_address: u64,
+        filter: &mut MessageFilter<'_>,
     ) -> Result<ObjectHeader, FormatError> {
         // version(1) + reserved(1) + num_messages(2) + ref_count(4) + header_size(4) = 12
         // then pad to 8-byte alignment from start of header
@@ -145,7 +223,16 @@ impl ObjectHeader {
 
         ensure_len(data, msg_start, header_data_size)?;
 
-        let mut messages = Vec::new();
+        // The v1 header states its own message count, so the vector is sized
+        // once rather than grown — see [`count_v2_messages`] for why that is
+        // worth doing. The count comes from the file, so it is capped by what
+        // the chunk can physically hold: a message is a header (8 bytes) at
+        // minimum, so a claim beyond that is a malformed file's, not a size.
+        let mut messages = Vec::with_capacity(if filter.keeps_all() {
+            (num_messages as usize).min(header_data_size / 8)
+        } else {
+            0
+        });
         let mut pos = msg_start;
         let msg_end =
             msg_start
@@ -185,42 +272,42 @@ impl ObjectHeader {
                 return Err(FormatError::UnsupportedMessage(id));
             }
 
-            if msg_type != MessageType::Nil {
+            let msg_body = &data[pos..pos + msg_data_size];
+            if msg_type != MessageType::Nil && filter.keeps(msg_type, msg_body) {
                 messages.push(HeaderMessage {
                     msg_type,
                     size: msg_data_size,
                     flags: msg_flags,
                     creation_order: None,
-                    data: data[pos..pos + msg_data_size].to_vec(),
+                    data: msg_body.to_vec(),
                 });
             }
 
             pos += msg_data_size;
 
-            // Follow continuations
-            if msg_type == MessageType::ObjectHeaderContinuation {
-                let cont_msg_data = &messages
-                    .last()
-                    .ok_or(FormatError::InvalidObjectHeaderSignature)?
-                    .data;
-                if cont_msg_data.len() >= (offset_size as usize + length_size as usize) {
-                    let cont_offset_raw = read_offset(cont_msg_data, 0, offset_size)?;
-                    let cont_offset = slice_range(cont_offset_raw, base_address)?.end;
-                    let cont_length =
-                        read_length(cont_msg_data, offset_size as usize, length_size)?
-                            .to_usize()?;
-                    // Parse continuation block (v1: just raw messages, no signature)
-                    let cont_msgs = Self::parse_v1_continuation(
-                        data,
-                        cont_offset,
-                        cont_length,
-                        offset_size,
-                        length_size,
-                        base_address,
-                        32, // max continuation depth
-                    )?;
-                    messages.extend(cont_msgs);
-                }
+            // Follow continuations. The pointer is read from the message body
+            // where it lies rather than from the message just pushed: a filtered
+            // parse may not have kept it, and a continuation is followed whatever
+            // the filter says.
+            if msg_type == MessageType::ObjectHeaderContinuation
+                && msg_body.len() >= (offset_size as usize + length_size as usize)
+            {
+                let cont_offset_raw = read_offset(msg_body, 0, offset_size)?;
+                let cont_offset = slice_range(cont_offset_raw, base_address)?.end;
+                let cont_length =
+                    read_length(msg_body, offset_size as usize, length_size)?.to_usize()?;
+                // Parse continuation block (v1: just raw messages, no signature)
+                let cont_msgs = Self::parse_v1_continuation(
+                    data,
+                    cont_offset,
+                    cont_length,
+                    offset_size,
+                    length_size,
+                    base_address,
+                    32, // max continuation depth
+                    filter,
+                )?;
+                messages.extend(cont_msgs);
             }
         }
 
@@ -236,6 +323,7 @@ impl ObjectHeader {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn parse_v1_continuation(
         data: &[u8],
         offset: usize,
@@ -244,6 +332,7 @@ impl ObjectHeader {
         length_size: u8,
         base_address: u64,
         depth_remaining: u16,
+        filter: &mut MessageFilter<'_>,
     ) -> Result<Vec<HeaderMessage>, FormatError> {
         if depth_remaining == 0 {
             return Err(FormatError::NestingDepthExceeded);
@@ -271,41 +360,39 @@ impl ObjectHeader {
                 return Err(FormatError::UnsupportedMessage(id));
             }
 
-            if msg_type != MessageType::Nil {
+            let msg_body = &data[pos..pos + msg_data_size];
+            if msg_type != MessageType::Nil && filter.keeps(msg_type, msg_body) {
                 messages.push(HeaderMessage {
                     msg_type,
                     size: msg_data_size,
                     flags: msg_flags,
                     creation_order: None,
-                    data: data[pos..pos + msg_data_size].to_vec(),
+                    data: msg_body.to_vec(),
                 });
             }
 
             pos += msg_data_size;
 
-            // Recursive continuations
-            if msg_type == MessageType::ObjectHeaderContinuation {
-                let cont_msg_data = &messages
-                    .last()
-                    .ok_or(FormatError::InvalidObjectHeaderSignature)?
-                    .data;
-                if cont_msg_data.len() >= (offset_size as usize + length_size as usize) {
-                    let cont_offset_raw = read_offset(cont_msg_data, 0, offset_size)?;
-                    let cont_offset = slice_range(cont_offset_raw, base_address)?.end;
-                    let cont_length =
-                        read_length(cont_msg_data, offset_size as usize, length_size)?
-                            .to_usize()?;
-                    let cont_msgs = Self::parse_v1_continuation(
-                        data,
-                        cont_offset,
-                        cont_length,
-                        offset_size,
-                        length_size,
-                        base_address,
-                        depth_remaining - 1,
-                    )?;
-                    messages.extend(cont_msgs);
-                }
+            // Recursive continuations, read from the body where it lies for the
+            // reason [`parse_v1`] gives.
+            if msg_type == MessageType::ObjectHeaderContinuation
+                && msg_body.len() >= (offset_size as usize + length_size as usize)
+            {
+                let cont_offset_raw = read_offset(msg_body, 0, offset_size)?;
+                let cont_offset = slice_range(cont_offset_raw, base_address)?.end;
+                let cont_length =
+                    read_length(msg_body, offset_size as usize, length_size)?.to_usize()?;
+                let cont_msgs = Self::parse_v1_continuation(
+                    data,
+                    cont_offset,
+                    cont_length,
+                    offset_size,
+                    length_size,
+                    base_address,
+                    depth_remaining - 1,
+                    filter,
+                )?;
+                messages.extend(cont_msgs);
             }
         }
 
@@ -318,6 +405,7 @@ impl ObjectHeader {
         offset_size: u8,
         length_size: u8,
         base_address: u64,
+        filter: &mut MessageFilter<'_>,
     ) -> Result<ObjectHeader, FormatError> {
         // signature(4) + version(1) + flags(1) = 6
         ensure_len(data, offset, 6)?;
@@ -399,6 +487,7 @@ impl ObjectHeader {
             length_size,
             &mut messages,
             &mut continuations,
+            filter,
         )?;
 
         // Follow continuations (limit to prevent cycles in malformed data).
@@ -421,6 +510,7 @@ impl ObjectHeader {
                 length_size,
                 &mut messages,
                 &mut continuations,
+                filter,
             )?;
         }
 
@@ -436,6 +526,34 @@ impl ObjectHeader {
         })
     }
 
+    /// How many messages the chunk `[start, end)` holds, by the same stepping
+    /// [`parse_v2_messages`] does.
+    ///
+    /// Walking the chunk a second time buys the parse one allocation instead of
+    /// a doubling sequence: a group stores one Link message per child, so a
+    /// 1,024-child group's header grew that vector ten times over and copied
+    /// 187 KiB doing it — on *every* path resolution, since each one parses the
+    /// group header afresh (issue #228).
+    ///
+    /// It is a reservation, so the count only has to be close: the Nil and
+    /// continuation messages counted here are the ones the parse does not keep,
+    /// and a chunk whose tail is padding rather than a message stops both loops
+    /// at the same place.
+    fn count_v2_messages(data: &[u8], start: usize, end: usize, msg_header_size: usize) -> usize {
+        let mut pos = start;
+        let mut count = 0;
+        while pos + msg_header_size <= end {
+            let msg_data_size = LittleEndian::read_u16(&data[pos + 1..pos + 3]) as usize;
+            pos += msg_header_size;
+            if pos + msg_data_size > end {
+                break;
+            }
+            pos += msg_data_size;
+            count += 1;
+        }
+        count
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn parse_v2_messages(
         data: &[u8],
@@ -446,8 +564,12 @@ impl ObjectHeader {
         length_size: u8,
         messages: &mut Vec<HeaderMessage>,
         continuations: &mut Vec<(u64, u64)>,
+        filter: &mut MessageFilter<'_>,
     ) -> Result<(), FormatError> {
         let msg_header_size = if has_creation_order { 6 } else { 4 };
+        if filter.keeps_all() {
+            messages.reserve(Self::count_v2_messages(data, start, end, msg_header_size));
+        }
         let mut pos = start;
 
         while pos + msg_header_size <= end {
@@ -474,7 +596,7 @@ impl ObjectHeader {
                 return Err(FormatError::UnsupportedMessage(id));
             }
 
-            let msg_data = data[pos..pos + msg_data_size].to_vec();
+            let msg_data = &data[pos..pos + msg_data_size];
 
             if msg_type == MessageType::ObjectHeaderContinuation {
                 // The continuation offset/length are file offsets; keep them as
@@ -482,17 +604,17 @@ impl ObjectHeader {
                 // region — a streaming reader can then follow a continuation
                 // past 4 GiB on a 32-bit host.
                 if msg_data.len() >= (offset_size as usize + length_size as usize) {
-                    let cont_off = read_offset(&msg_data, 0, offset_size)?;
-                    let cont_len = read_length(&msg_data, offset_size as usize, length_size)?;
+                    let cont_off = read_offset(msg_data, 0, offset_size)?;
+                    let cont_len = read_length(msg_data, offset_size as usize, length_size)?;
                     continuations.push((cont_off, cont_len));
                 }
-            } else if msg_type != MessageType::Nil {
+            } else if msg_type != MessageType::Nil && filter.keeps(msg_type, msg_data) {
                 messages.push(HeaderMessage {
                     msg_type,
                     size: msg_data_size,
                     flags: msg_flags,
                     creation_order,
-                    data: msg_data,
+                    data: msg_data.to_vec(),
                 });
             }
 
@@ -512,6 +634,7 @@ impl ObjectHeader {
         length_size: u8,
         messages: &mut Vec<HeaderMessage>,
         continuations: &mut Vec<(u64, u64)>,
+        filter: &mut MessageFilter<'_>,
     ) -> Result<(), FormatError> {
         // OCHK signature(4) + messages + checksum(4)
         ensure_len(data, offset, length)?;
@@ -551,6 +674,7 @@ impl ObjectHeader {
             length_size,
             messages,
             continuations,
+            filter,
         )
     }
 
@@ -573,12 +697,45 @@ impl ObjectHeader {
         length_size: u8,
         base_address: u64,
     ) -> Result<ObjectHeader, FormatError> {
+        Self::parse_from_source_filtered(
+            source,
+            address,
+            offset_size,
+            length_size,
+            base_address,
+            MessageFilter::All,
+        )
+    }
+
+    /// Streaming counterpart of [`parse_filtered`](Self::parse_filtered).
+    pub(crate) fn parse_from_source_filtered<S: Source + ?Sized>(
+        source: &S,
+        address: u64,
+        offset_size: u8,
+        length_size: u8,
+        base_address: u64,
+        mut filter: MessageFilter<'_>,
+    ) -> Result<ObjectHeader, FormatError> {
         let mut sig = [0u8; 4];
         source.read_at(address, &mut sig)?;
         if sig == OHDR_SIGNATURE {
-            Self::parse_v2_from_source(source, address, offset_size, length_size, base_address)
+            Self::parse_v2_from_source(
+                source,
+                address,
+                offset_size,
+                length_size,
+                base_address,
+                &mut filter,
+            )
         } else {
-            Self::parse_v1_from_source(source, address, offset_size, length_size, base_address)
+            Self::parse_v1_from_source(
+                source,
+                address,
+                offset_size,
+                length_size,
+                base_address,
+                &mut filter,
+            )
         }
     }
 
@@ -588,6 +745,7 @@ impl ObjectHeader {
         offset_size: u8,
         length_size: u8,
         base_address: u64,
+        filter: &mut MessageFilter<'_>,
     ) -> Result<ObjectHeader, FormatError> {
         // The v2 prefix is bounded: sig(4) + ver(1) + flags(1) + optional
         // timestamps(16) + optional attribute thresholds(4) + chunk0-size
@@ -681,6 +839,7 @@ impl ObjectHeader {
             length_size,
             &mut messages,
             &mut continuations,
+            filter,
         )?;
 
         // Follow continuations by reading each (bounded) chunk from the source.
@@ -701,6 +860,7 @@ impl ObjectHeader {
                 length_size,
                 &mut messages,
                 &mut continuations,
+                filter,
             )?;
         }
 
@@ -722,6 +882,7 @@ impl ObjectHeader {
         offset_size: u8,
         length_size: u8,
         base_address: u64,
+        filter: &mut MessageFilter<'_>,
     ) -> Result<ObjectHeader, FormatError> {
         // version(1) + reserved(1) + num_messages(2) + ref_count(4) +
         // header_size(4) = 12, padded to 16 before the first message.
@@ -734,7 +895,13 @@ impl ObjectHeader {
         let reference_count = LittleEndian::read_u32(&prefix[4..8]);
         let header_data_size = u64::from(LittleEndian::read_u32(&prefix[8..12]));
 
-        let mut messages = Vec::new();
+        // Sized from the header's own message count, bounded by what the chunk
+        // can hold — see the same reservation in [`parse_v1`].
+        let mut messages = Vec::with_capacity(if filter.keeps_all() {
+            (num_messages as usize).min((header_data_size / 8).to_usize()?)
+        } else {
+            0
+        });
         Self::parse_v1_chunk_from_source(
             source,
             address + 16,
@@ -745,6 +912,7 @@ impl ObjectHeader {
             base_address,
             32,
             &mut messages,
+            filter,
         )?;
 
         Ok(ObjectHeader {
@@ -773,6 +941,7 @@ impl ObjectHeader {
         base_address: u64,
         depth_remaining: u16,
         messages: &mut Vec<HeaderMessage>,
+        filter: &mut MessageFilter<'_>,
     ) -> Result<(), FormatError> {
         if depth_remaining == 0 {
             return Err(FormatError::NestingDepthExceeded);
@@ -801,29 +970,28 @@ impl ObjectHeader {
                 return Err(FormatError::UnsupportedMessage(id));
             }
 
-            let msg_data = region[pos..pos + msg_data_size].to_vec();
+            let msg_data = &region[pos..pos + msg_data_size];
             pos += msg_data_size;
 
-            // Decode the continuation pointer (if any) before the message data is
-            // moved into the list; the message itself is kept, matching the
-            // buffered parser, and then followed depth-first.
+            // Decode the continuation pointer (if any) from the body where it
+            // lies: it is followed whatever the filter kept, as in [`parse_v1`].
             let cont = if msg_type == MessageType::ObjectHeaderContinuation
                 && msg_data.len() >= (offset_size as usize + length_size as usize)
             {
-                let off_raw = read_offset(&msg_data, 0, offset_size)?;
-                let len = read_length(&msg_data, offset_size as usize, length_size)?;
+                let off_raw = read_offset(msg_data, 0, offset_size)?;
+                let len = read_length(msg_data, offset_size as usize, length_size)?;
                 Some((off_raw, len))
             } else {
                 None
             };
 
-            if msg_type != MessageType::Nil {
+            if msg_type != MessageType::Nil && filter.keeps(msg_type, msg_data) {
                 messages.push(HeaderMessage {
                     msg_type,
                     size: msg_data_size,
                     flags: msg_flags,
                     creation_order: None,
-                    data: msg_data,
+                    data: msg_data.to_vec(),
                 });
             }
 
@@ -845,6 +1013,7 @@ impl ObjectHeader {
                     base_address,
                     depth_remaining - 1,
                     messages,
+                    filter,
                 )?;
             }
         }

@@ -5,5 +5,5 @@ currBytes 0
 currBlocks 0
 maxBytes 33663989
 maxBlocks 2075
-totalBytes 43203692
-totalBlocks 8402
+totalBytes 43203531
+totalBlocks 8400

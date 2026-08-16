@@ -415,3 +415,74 @@ fn filtered_read_does_not_build_a_decompressor_per_chunk() {
 
     assert_eq!(all.len(), DATASET_BYTES);
 }
+
+/// Opening one child of a group costs the group's header, not one allocation per
+/// child in it.
+///
+/// A group stores its children as one Link message each, and a lookup used to
+/// build an entry with an owned name for every one of them before returning the
+/// one it was asked for: 2,084 allocations and 310 KiB to open a single dataset
+/// out of 1,024, paid again on the next open. That is what makes walking a group
+/// quadratic in its size, and this is the rule that keeps the walk linear
+/// (issue #228).
+///
+/// Both entry points are measured because they reach the links by different
+/// routes — a path from the file, and a name within an opened group — and only a
+/// bound on each says the shared lookup is what they both use.
+#[test]
+fn opening_one_child_does_not_allocate_per_child_of_the_group() {
+    const OBJECTS: usize = 1024;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("many.h5");
+    let mut builder = FileBuilder::new();
+    for i in 0..OBJECTS {
+        builder
+            .create_dataset(&format!("d{i:05}"))
+            .with_i32_data(&[i as i32]);
+    }
+    builder.write(&path).unwrap();
+
+    // The last child written, so the scan passes every link before it: the worst
+    // case for a lookup that stops at its match, and the one where a per-child
+    // cost cannot hide behind an early hit.
+    let last = format!("d{:05}", OBJECTS - 1);
+    let file = File::open_streaming(&path).unwrap();
+
+    let (by_path, path_measured) = measure("child_by_path", || file.dataset(&last).unwrap());
+    let (by_name, name_measured) = measure("child_by_name", || file.root().dataset(&last).unwrap());
+
+    for (what, measured) in [("by path", path_measured), ("in the group", name_measured)] {
+        // Measured at 18 allocations: the group's header, the opened dataset's
+        // header, and its handful of messages. One per link is 1,026, and the
+        // bound sits between the two rather than near either.
+        assert!(
+            measured.blocks < (OBJECTS / 8) as u64,
+            "opening one child {what} must not allocate per child of the group: \
+             measured {measured} in a {OBJECTS}-child group"
+        );
+
+        // The other axis, which the count cannot see: the group's header is read
+        // whole (about 30 stored bytes per child, so ~30 KiB here) because the
+        // links must be scanned, but nothing may allocate several times over it.
+        // The per-child entries this replaced cost ten times the header.
+        assert!(
+            measured.bytes < (OBJECTS * 128) as u64,
+            "opening one child {what} must allocate about its group's header, not \
+             a multiple of it: measured {measured} in a {OBJECTS}-child group"
+        );
+
+        // The handle each call returned — its parsed object header among it — is
+        // in this measurement, so its size is a floor a measurement of nothing
+        // cannot reach.
+        assert!(
+            measured.live_bytes >= 128,
+            "the handle this open returned is not in its own measurement, so the \
+             bounds above are bounding something other than the open: {measured}"
+        );
+    }
+
+    // Both handles must still be the right dataset.
+    assert_eq!(by_path.read_i32().unwrap(), vec![(OBJECTS - 1) as i32]);
+    assert_eq!(by_name.read_i32().unwrap(), vec![(OBJECTS - 1) as i32]);
+}

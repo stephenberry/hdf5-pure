@@ -14,9 +14,9 @@ use crate::error::FormatError;
 use crate::fractal_heap::FractalHeapHeader;
 use crate::group_v1::{self, GroupEntry};
 use crate::link_info::LinkInfoMessage;
-use crate::link_message::{LinkMessage, LinkTarget};
+use crate::link_message::{LinkMessage, LinkTarget, link_is_named};
 use crate::message_type::MessageType;
-use crate::object_header::ObjectHeader;
+use crate::object_header::{MessageFilter, ObjectHeader};
 use crate::source::{BaseOffsetSource, Source, frame};
 use crate::superblock::Superblock;
 use crate::symbol_table::SymbolTableMessage;
@@ -73,6 +73,149 @@ fn resolve_compact_entries(
         }
     }
     Ok(entries)
+}
+
+/// The stored object-header address of the child named `name` in the group whose
+/// header is at `group_address`, found without reading every other child.
+///
+/// A group of *n* children is *n* Link messages in its object header, and
+/// [`resolve_group_entries`] turns each into a [`GroupEntry`] with an owned name.
+/// Resolving one path needs one of them, so a walk that opens each child of a
+/// group in turn paid for *n* names *n* times over — 310 KiB and two thousand
+/// allocations per lookup in a 1,024-child group, which is what made that walk
+/// quadratic in the group's size (issue #228).
+///
+/// So the header is parsed asking only for the link that was named. The filter
+/// drops nothing else, and only a *compact* v2 group stores its links as Link
+/// messages — a dense group keeps them in a fractal heap and a v1 group in a
+/// symbol table — so the fallback below reads a header that is whole as far as
+/// it is concerned.
+///
+/// The address returned is the stored one, relative to the superblock base
+/// address, exactly as [`GroupEntry::object_header_address`] carries it.
+pub(crate) fn find_child_address(
+    file_data: &[u8],
+    group_address: u64,
+    offset_size: u8,
+    length_size: u8,
+    base_address: u64,
+    name: &str,
+) -> Result<Option<u64>, FormatError> {
+    let mut saw_link = false;
+    let header = {
+        let mut wanted = wanted_link_only(name, &mut saw_link);
+        ObjectHeader::parse_filtered(
+            file_data,
+            group_address.to_usize()?,
+            offset_size,
+            length_size,
+            base_address,
+            MessageFilter::Only(&mut wanted),
+        )?
+    };
+    if holds_compact_links(&header, offset_size, saw_link)? {
+        return scan_compact_links(&header, offset_size, name);
+    }
+    Ok(
+        resolve_group_entries(file_data, &header, offset_size, length_size, base_address)?
+            .into_iter()
+            .find(|e| e.name == name)
+            .map(|e| e.object_header_address),
+    )
+}
+
+/// Streaming counterpart of [`find_child_address`].
+pub(crate) fn find_child_address_from_source<S: Source + ?Sized>(
+    source: &S,
+    group_address: u64,
+    offset_size: u8,
+    length_size: u8,
+    base_address: u64,
+    name: &str,
+) -> Result<Option<u64>, FormatError> {
+    let mut saw_link = false;
+    let header = {
+        let mut wanted = wanted_link_only(name, &mut saw_link);
+        ObjectHeader::parse_from_source_filtered(
+            source,
+            group_address,
+            offset_size,
+            length_size,
+            base_address,
+            MessageFilter::Only(&mut wanted),
+        )?
+    };
+    if holds_compact_links(&header, offset_size, saw_link)? {
+        return scan_compact_links(&header, offset_size, name);
+    }
+    Ok(
+        resolve_group_entries_from_source(source, &header, offset_size, length_size, base_address)?
+            .into_iter()
+            .find(|e| e.name == name)
+            .map(|e| e.object_header_address),
+    )
+}
+
+/// A message filter that keeps everything except the links this lookup did not
+/// ask for, recording in `saw_link` that the header held links at all.
+///
+/// That record is what keeps the filter honest: dropping the other links must
+/// not change what the header *is*, and a compact group is recognized partly by
+/// having Link messages ([`is_v2_group`]). So the ones dropped here are still
+/// counted, and [`holds_compact_links`] classifies the header the way an
+/// unfiltered parse would have.
+fn wanted_link_only<'a>(
+    name: &'a str,
+    saw_link: &'a mut bool,
+) -> impl FnMut(MessageType, &[u8]) -> bool + 'a {
+    move |ty, body| {
+        if ty != MessageType::Link {
+            return true;
+        }
+        *saw_link = true;
+        link_is_named(body, name)
+    }
+}
+
+/// Whether `header` is a v2 group holding its links compactly, as Link messages
+/// — the case [`scan_compact_links`] can answer from the header alone, now that
+/// [`wanted_link_only`] has narrowed it to the link asked for.
+///
+/// A v1 (symbol-table) group, a dense v2 group, and a header that is no group at
+/// all all answer `false`, and their callers fall back to the full walk, which
+/// reads what it needs and reports the last case as the error it is. None of the
+/// three stores links as Link messages, so that walk reads a header the filter
+/// took nothing from.
+fn holds_compact_links(
+    header: &ObjectHeader,
+    offset_size: u8,
+    saw_link: bool,
+) -> Result<bool, FormatError> {
+    Ok((saw_link || is_v2_group(header))
+        && find_link_info(header, offset_size)?
+            .fractal_heap_address
+            .is_none())
+}
+
+/// The stored address of the hard link named `name` among this header's compact
+/// Link messages.
+///
+/// Soft and external links are skipped, as [`resolve_compact_entries`] skips
+/// them: they name no object header in this file.
+fn scan_compact_links(
+    object_header: &ObjectHeader,
+    offset_size: u8,
+    name: &str,
+) -> Result<Option<u64>, FormatError> {
+    for msg in &object_header.messages {
+        if msg.msg_type != MessageType::Link {
+            continue;
+        }
+        if let Some(addr) = LinkMessage::hard_link_address_if_named(&msg.data, offset_size, name)? {
+            return Ok(Some(addr));
+        }
+    }
+    Ok(None)
 }
 
 /// Resolve entries from dense storage (fractal heap + B-tree v2).
@@ -182,36 +325,17 @@ pub fn resolve_path_any(
     let ls = superblock.length_size;
     let base = superblock.base_address;
 
-    let root_header = ObjectHeader::parse_with_base(
-        file_data,
-        superblock.root_group_address.to_usize()?,
-        os,
-        ls,
-        base,
-    )?;
-
     let mut current_addr = superblock.root_group_address;
-    let mut current_header = root_header;
 
     for (i, component) in components.iter().enumerate() {
-        let entries = resolve_group_entries(file_data, &current_header, os, ls, base)?;
-
-        let found = entries.iter().find(|e| e.name == *component);
-        match found {
-            Some(entry) => {
+        match find_child_address(file_data, current_addr, os, ls, base, component)? {
+            Some(stored_addr) => {
                 // Link addresses are relative to base_address; convert to absolute.
-                let abs_addr = entry.object_header_address + base;
+                let abs_addr = stored_addr + base;
                 if i == components.len() - 1 {
                     return Ok(abs_addr);
                 }
                 current_addr = abs_addr;
-                current_header = ObjectHeader::parse_with_base(
-                    file_data,
-                    current_addr.to_usize()?,
-                    os,
-                    ls,
-                    base,
-                )?;
             }
             None => {
                 return Err(FormatError::PathNotFound(String::from(*component)));
@@ -283,20 +407,15 @@ pub fn resolve_path_any_from_source<S: Source + ?Sized>(
     let base = superblock.base_address;
 
     let mut current_addr = superblock.root_group_address;
-    let mut current_header =
-        ObjectHeader::parse_from_source(source, superblock.root_group_address, os, ls, base)?;
 
     for (i, component) in components.iter().enumerate() {
-        let entries = resolve_group_entries_from_source(source, &current_header, os, ls, base)?;
-        match entries.iter().find(|e| e.name == *component) {
-            Some(entry) => {
-                let abs_addr = entry.object_header_address + base;
+        match find_child_address_from_source(source, current_addr, os, ls, base, component)? {
+            Some(stored_addr) => {
+                let abs_addr = stored_addr + base;
                 if i == components.len() - 1 {
                     return Ok(abs_addr);
                 }
                 current_addr = abs_addr;
-                current_header =
-                    ObjectHeader::parse_from_source(source, current_addr, os, ls, base)?;
             }
             None => return Err(FormatError::PathNotFound(String::from(*component))),
         }
@@ -500,6 +619,108 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "test");
         assert_eq!(entries[0].object_header_address, 0x1000);
+    }
+
+    /// Build an object header carrying the given messages, as a lookup's filtered
+    /// parse would leave it.
+    fn header_of(messages: Vec<(MessageType, Vec<u8>)>) -> ObjectHeader {
+        ObjectHeader {
+            version: 2,
+            messages: messages
+                .into_iter()
+                .map(|(msg_type, data)| crate::object_header::HeaderMessage {
+                    msg_type,
+                    size: data.len(),
+                    flags: 0,
+                    creation_order: None,
+                    data,
+                })
+                .collect(),
+            reference_count: None,
+            flags: 0,
+            access_time: None,
+            modification_time: None,
+            change_time: None,
+            birth_time: None,
+        }
+    }
+
+    /// A Link Info message naming no fractal heap: compact storage.
+    fn compact_link_info() -> (MessageType, Vec<u8>) {
+        let mut d = vec![0, 0]; // version, flags
+        d.extend_from_slice(&u64::MAX.to_le_bytes()); // fractal heap: undefined
+        d.extend_from_slice(&u64::MAX.to_le_bytes()); // name index: undefined
+        (MessageType::LinkInfo, d)
+    }
+
+    /// A Link Info message naming a fractal heap: dense storage.
+    fn dense_link_info_message() -> (MessageType, Vec<u8>) {
+        let mut d = vec![0, 0];
+        d.extend_from_slice(&0x1000u64.to_le_bytes()); // fractal heap address
+        d.extend_from_slice(&0x2000u64.to_le_bytes()); // name index address
+        (MessageType::LinkInfo, d)
+    }
+
+    /// A lookup asks the parse for one link, so by the time the header is
+    /// classified its other links are gone. The classification therefore takes the
+    /// parse's word for having seen them — otherwise a group that stores links as
+    /// messages *without* a Link Info message (which [`find_link_info`] accepts on
+    /// purpose) would stop looking like a group the moment its links were filtered
+    /// out, and a missing child would be reported as "not a group" instead.
+    #[test]
+    fn a_filtered_out_link_still_makes_the_header_a_compact_group() {
+        let no_link_info = header_of(vec![]);
+        assert!(
+            holds_compact_links(&no_link_info, 8, true).unwrap(),
+            "a header whose links the filter dropped is still a compact group"
+        );
+        assert!(
+            !holds_compact_links(&no_link_info, 8, false).unwrap(),
+            "a header that held no link and no link info is no group of ours"
+        );
+    }
+
+    /// Dense storage keeps its links in a fractal heap, so its header holds none
+    /// to scan whatever the filter saw.
+    #[test]
+    fn a_dense_group_is_never_scanned_for_compact_links() {
+        let dense = header_of(vec![dense_link_info_message()]);
+        assert!(!holds_compact_links(&dense, 8, false).unwrap());
+        assert!(
+            !holds_compact_links(&dense, 8, true).unwrap(),
+            "a fractal heap decides, not the presence of a link message"
+        );
+    }
+
+    /// Only hard links name an object header in this file, and only the link
+    /// asked for answers.
+    #[test]
+    fn scanning_compact_links_answers_for_hard_links_alone() {
+        let mut hard = vec![1u8, 0x00, 4];
+        hard.extend_from_slice(b"data");
+        hard.extend_from_slice(&0x4000u64.to_le_bytes());
+
+        let mut soft = vec![1u8, 0x08, 1, 4];
+        soft.extend_from_slice(b"soft");
+        soft.extend_from_slice(&4u16.to_le_bytes());
+        soft.extend_from_slice(b"/abc");
+
+        let header = header_of(vec![
+            compact_link_info(),
+            (MessageType::Link, soft),
+            (MessageType::Link, hard),
+        ]);
+
+        assert_eq!(
+            scan_compact_links(&header, 8, "data").unwrap(),
+            Some(0x4000)
+        );
+        assert_eq!(
+            scan_compact_links(&header, 8, "soft").unwrap(),
+            None,
+            "a soft link names a path, not an object header"
+        );
+        assert_eq!(scan_compact_links(&header, 8, "absent").unwrap(), None);
     }
 
     #[test]

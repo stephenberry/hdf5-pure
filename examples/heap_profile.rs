@@ -33,6 +33,10 @@ const CHUNK_ELEMS: u64 = 512;
 /// that makes a windowed read walk far more than it keeps.
 const LABELS: usize = 32 * 1024;
 const LABEL_LEN: usize = 128;
+/// A metadata-heavy file: many small datasets in one group, each with an
+/// attribute. The phases above allocate in proportion to *data*; these allocate
+/// in proportion to the number of *objects*, which is a different path.
+const OBJECTS: usize = 1024;
 
 const PROFILE_PATH: &str = "target/heap-profile.html";
 
@@ -116,7 +120,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     drop(strings);
 
-    profiler.print_summary(10)?;
+    let typed = {
+        let _region = heapscope::region("read chunked whole typed");
+        numeric_ds.read_f64()?
+    };
+    assert_eq!(
+        typed.len(),
+        ELEMENTS,
+        "typed whole read returned wrong length"
+    );
+    drop(typed);
+
+    let all_strings = {
+        let _region = heapscope::region("read vlen whole");
+        labels_ds.read_string()?
+    };
+    assert_eq!(
+        all_strings.len(),
+        LABELS,
+        "whole string read returned wrong length"
+    );
+    drop(all_strings);
+
+    // --- the metadata paths -------------------------------------------------
+
+    let many = dir.path().join("many.h5");
+    {
+        let _region = heapscope::region("write many objects");
+        let mut builder = FileBuilder::new();
+        for i in 0..OBJECTS {
+            builder
+                .create_dataset(&format!("d{i:05}"))
+                .with_i32_data(&[i as i32])
+                .set_attr("units", hdf5_pure::AttrValue::I32(i as i32));
+        }
+        builder.write(&many)?;
+    }
+
+    let many_file = {
+        let _region = heapscope::region("open many objects");
+        File::open_streaming(&many)?
+    };
+
+    let names = {
+        let _region = heapscope::region("list many objects");
+        many_file.root().datasets()?
+    };
+    assert_eq!(names.len(), OBJECTS, "listing returned the wrong count");
+
+    {
+        let _region = heapscope::region("resolve many objects");
+        for name in &names {
+            let _ds = many_file.dataset(name)?;
+        }
+    }
+
+    {
+        let _region = heapscope::region("read many attributes");
+        for name in &names {
+            let ds = many_file.dataset(name)?;
+            let attrs = ds.attrs()?;
+            assert_eq!(attrs.len(), 1, "each dataset carries one attribute");
+        }
+    }
+
+    profiler.print_summary(16)?;
     // Dropping the profiler is what writes the page, so the check below has to
     // come after it rather than at the end of `main`.
     drop(profiler);
