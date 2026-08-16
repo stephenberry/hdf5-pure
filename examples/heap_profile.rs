@@ -37,6 +37,10 @@ const LABEL_LEN: usize = 128;
 /// attribute. The phases above allocate in proportion to *data*; these allocate
 /// in proportion to the number of *objects*, which is a different path.
 const OBJECTS: usize = 1024;
+/// Appends of one chunk each onto an unlimited dataset, enough of them that a
+/// per-append cost that scales with the dataset stands out from one that does
+/// not.
+const APPENDS: u64 = 512;
 
 const PROFILE_PATH: &str = "target/heap-profile.html";
 
@@ -189,6 +193,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             assert_eq!(attrs.len(), 1, "each dataset carries one attribute");
         }
     }
+
+    // --- editing an existing file ------------------------------------------
+
+    // Appending in place is the write path that runs many times over one file
+    // rather than once, so what it costs *per call* is what matters: a cost that
+    // scales with the dataset rather than the batch is the defect to look for.
+    let growing = dir.path().join("growing.h5");
+    {
+        let mut builder = FileBuilder::new();
+        builder
+            .create_dataset("t")
+            .with_f64_data(&[0.0f64; CHUNK_ELEMS as usize])
+            .with_shape(&[CHUNK_ELEMS])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[CHUNK_ELEMS]);
+        builder.write(&growing)?;
+    }
+
+    let batch: Vec<f64> = (0..CHUNK_ELEMS).map(|i| i as f64).collect();
+    {
+        // One `fsync` at close rather than one per append: the appends are what
+        // is being measured, and the barriers between them are not free.
+        let file = File::open_rw_with_options(
+            &growing,
+            hdf5_pure::FileAccessProperties::new().with_sync_policy(hdf5_pure::SyncPolicy::OnClose),
+        )?;
+        let mut ds = file.dataset("t")?;
+        let _region = heapscope::region("append in place");
+        for _ in 0..APPENDS {
+            ds.append(&batch)?;
+        }
+    }
+    let grown = File::open(&growing)?;
+    assert_eq!(
+        grown.dataset("t")?.shape()?,
+        vec![CHUNK_ELEMS * (APPENDS + 1)],
+        "the appends did not all land"
+    );
+    drop(grown);
 
     profiler.print_summary(16)?;
     // Dropping the profiler is what writes the page, so the check below has to

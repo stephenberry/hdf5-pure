@@ -551,3 +551,80 @@ fn vlen_string_write_does_not_own_each_string_before_staging_it() {
     assert_eq!(back.len(), N0);
     assert_eq!(back[N0 - 1], strings[N0 - 1]);
 }
+
+/// One in-place append allocates on the order of its own batch, not of the
+/// dataset it grows.
+///
+/// This is the write path that runs many times over one file, so a per-call cost
+/// that scales with what is already there is what turns a long append loop
+/// quadratic. The measurement is of the *last* append, onto a dataset already
+/// several hundred times the batch, so a term in the dataset's size cannot hide
+/// in a term in the batch's.
+#[test]
+fn one_append_costs_its_batch_not_the_dataset() {
+    const CHUNK_ELEMS: u64 = 512;
+    const BATCH_BYTES: usize = CHUNK_ELEMS as usize * 8;
+    const WARMUP_APPENDS: usize = 512;
+    const DATASET_BYTES: usize = (WARMUP_APPENDS + 1) * BATCH_BYTES;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("growing.h5");
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("t")
+        .with_f64_data(&[0.0f64; CHUNK_ELEMS as usize])
+        .with_shape(&[CHUNK_ELEMS])
+        .with_maxshape(&[u64::MAX])
+        .with_chunks(&[CHUNK_ELEMS]);
+    builder.write(&path).unwrap();
+
+    let batch: Vec<f64> = (0..CHUNK_ELEMS).map(|i| i as f64).collect();
+    {
+        // One barrier at close rather than one per append: an `fsync` apiece
+        // would make this test's runtime, not its allocations, the thing to look
+        // at (see the `Allocation gates` section of CLAUDE.md).
+        let file = hdf5_pure::File::open_rw_with_options(
+            &path,
+            hdf5_pure::FileAccessProperties::new().with_sync_policy(hdf5_pure::SyncPolicy::OnClose),
+        )
+        .unwrap();
+        let mut ds = file.dataset("t").unwrap();
+        for _ in 0..WARMUP_APPENDS {
+            ds.append(&batch).unwrap();
+        }
+
+        let (_, measured) = measure("append_in_place", || ds.append(&batch).unwrap());
+
+        // The batch's own bytes are staged inside this measurement, so their size
+        // is a floor a measurement of nothing cannot reach.
+        assert!(
+            measured.bytes >= BATCH_BYTES as u64,
+            "the appended batch is not in this append's own measurement, so the \
+             bounds below are measuring something other than the append: {measured}"
+        );
+
+        // Measured at 13 KiB and 28 allocations for a 4 KiB batch onto a 2 MiB
+        // dataset: the batch staged and written, and the chunk index and object
+        // header around it. Eight batches' worth is far below anything
+        // proportional to the dataset, which is 512 of them.
+        assert!(
+            measured.bytes < (BATCH_BYTES * 8) as u64,
+            "one append must allocate on the order of its {BATCH_BYTES}-byte batch, \
+             not of the {DATASET_BYTES}-byte dataset it grows: measured {measured}"
+        );
+        assert!(
+            measured.blocks < 128,
+            "one append must cost a bounded number of allocations, whatever the \
+             dataset's size: measured {measured}"
+        );
+    }
+
+    // The session is closed before reading: an open read-write file holds a lock
+    // that a second open refuses on Windows.
+    let file = File::open(&path).unwrap();
+    let back = file.dataset("t").unwrap().read_f64().unwrap();
+    // The dataset it was written with, plus the warmup appends and the measured
+    // one.
+    assert_eq!(back.len(), (WARMUP_APPENDS + 2) * CHUNK_ELEMS as usize);
+    assert_eq!(back[back.len() - 1], (CHUNK_ELEMS - 1) as f64);
+}
