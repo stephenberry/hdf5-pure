@@ -37,7 +37,7 @@ Relatedly, a producer that fails partway leaves a **partial file** on the sink. 
 
 ### Repack faithfulness
 
-`repack` rewrites a file and refuses **lossy filter re-encoding** (lossy float scale-offset, ZFP) rather than silently altering data: only *lossless* integer scale-offset with an undefined fill value can be re-encoded faithfully, since re-compressing lossy data would change the values. (Repack instead copies already-compressed chunks **verbatim** wherever it can, which preserves lossy filters byte-exact without re-encoding.)
+`repack` rewrites a file and refuses **lossy filter re-encoding** (lossy float scale-offset, ZFP) rather than silently altering data: only *lossless* integer scale-offset with an undefined fill value can be re-encoded faithfully, since re-compressing lossy data would change the values. The fill-value clause is a wide one in practice: the reference C library records a defined fill value on every scale-offset dataset it writes, so re-encoding is refused for essentially all of them. (Appending to them is not — see [Compression](../guide/compression.md).) (Repack instead copies already-compressed chunks **verbatim** wherever it can, which preserves lossy filters byte-exact without re-encoding.)
 
 ### SWMR (single-writer / multiple-reader)
 

@@ -83,8 +83,16 @@ pub(crate) const HEADER_LEN: usize = 21;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScaleOffset {
     /// Integer scale-offset (lossless). `0` lets the encoder auto-compute the
-    /// minimum bit width from each chunk's value range (the usual choice); a
-    /// positive value would force a fixed minimum bit width.
+    /// minimum bit width from each chunk's value range, which is the usual
+    /// choice and the only one this encoder acts on.
+    ///
+    /// A value equal to the datatype's bit width selects the reference
+    /// library's pass-through mode, where the filter stores the chunk
+    /// unchanged. Anything in between is *recorded* in the filter's parameters
+    /// and read back by [`Dataset::filter_pipeline`](crate::Dataset::filter_pipeline),
+    /// but the encoder still picks each chunk's width from its own range — it
+    /// never packs narrower than the data needs, where the reference would and
+    /// would truncate values that did not fit.
     Integer(u32),
     /// Floating-point decimal scaling (lossy). The value is the number of
     /// decimal digits of precision retained (the "D" scale factor).
@@ -187,10 +195,14 @@ pub fn build_cd_values(
 ///
 /// Returns `None` if the parameter array is too short, names a scale type this
 /// crate never writes (the reference library's float *E*-scale), or carries a
-/// **defined fill value**: this crate's writer only ever emits the
-/// fill-undefined form, so re-emitting a fill-defined filter would silently drop
-/// its chunk-fill semantics. Refusing keeps repack faithful rather than
-/// approximate.
+/// **defined fill value**. [`compress`] encodes that last form, but the mode
+/// this returns is re-applied through
+/// [`DatasetBuilder::with_scale_offset`](crate::DatasetBuilder::with_scale_offset),
+/// which rebuilds `cd_values` via [`build_cd_values`] and has nowhere to put
+/// the fill value — so a repack would emit a fill-*undefined* filter and
+/// silently drop the source's chunk-fill semantics. Refusing keeps repack
+/// faithful rather than approximate; carrying the fill value through the
+/// builder is the remaining piece.
 pub(crate) fn scale_offset_mode(cd_values: &[u32]) -> Option<ScaleOffset> {
     let scale_type = *cd_values.get(PARM_SCALETYPE)?;
     let scale_factor = *cd_values.get(PARM_SCALEFACTOR)?;
@@ -276,6 +288,44 @@ impl Parms {
     }
 }
 
+/// The two `scale_factor` decisions the reference makes **before** it splits on
+/// compress versus decompress (`H5Zscaleoffset.c`, the `H5Z_FLAG_REVERSE` test),
+/// so they hold identically in both directions: a requested width wider than the
+/// datatype is an error, and a width *equal* to it makes the filter a
+/// pass-through that stores the chunk unchanged, with no header of its own.
+///
+/// Float D-scale is exempt, because there `scale_factor` is a decimal exponent
+/// rather than a bit width.
+///
+/// Returns `Ok(true)` when the caller should hand the chunk through untouched.
+///
+/// Both callers share this rather than testing it themselves: implementing one
+/// direction and not the other is exactly the defect the pass-through fixes —
+/// a chunk packed by a writer that ignores the mode and handed back verbatim by
+/// a reader that honours it decodes as garbage in both libraries.
+fn pass_through_or_refuse(p: &Parms) -> Result<bool, FormatError> {
+    if p.scale_type == SO_FLOAT_DSCALE {
+        return Ok(false);
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "p.size is validated to 1..=8, so p.size * 8 is 8..=64 and fits in u32"
+    )]
+    let type_bits = (p.size * 8) as u32;
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "type_bits is 8..=64, so it fits in a non-negative i32"
+    )]
+    let type_bits_i = type_bits as i32;
+    if p.scale_factor > type_bits_i {
+        return Err(FormatError::FilterError(format!(
+            "scaleoffset: requested minimum bit width {} exceeds the {type_bits}-bit datatype",
+            p.scale_factor
+        )));
+    }
+    Ok(p.scale_factor == type_bits_i)
+}
+
 /// Decompress one scale-offset chunk into raw element bytes (in the dataset's
 /// stored byte order).
 pub fn decompress(
@@ -320,13 +370,9 @@ pub fn decompress(
         )));
     }
 
-    // No-op mode: integer (non-DSCALE) datasets created with scale_factor equal
-    // to the full bit width store the chunk verbatim, with no header.
-    #[expect(
-        clippy::cast_possible_wrap,
-        reason = "full_bits is 8..=64 (p.size is 1..=8), so it fits in a non-negative i32"
-    )]
-    if p.scale_type != SO_FLOAT_DSCALE && p.scale_factor == full_bits as i32 {
+    // Pass-through mode, and the width refusal beside it; see
+    // [`pass_through_or_refuse`].
+    if pass_through_or_refuse(&p)? {
         return Ok(input.to_vec());
     }
 
@@ -363,16 +409,33 @@ pub fn decompress(
         return Ok(input[start..start + size_out].to_vec());
     }
 
-    // minbits == 0 means every element equals `minval`. Short-circuit so we
-    // never enter the sentinel-matching path, which would otherwise misread
-    // a `FILL_DEFINED` chunk's stored values as fill values (the all-ones
-    // sentinel collapses to 0 when minbits == 0, the same value every zero
-    // offset carries). The reference C decoder handles this identically.
+    // minbits == 0: there is no payload, so every element takes the same value.
+    // Which value is not the same in both fill modes, and the reference reaches
+    // the answer by not special-casing this at all — `H5Z__filter_scaleoffset`
+    // zeroes the output buffer and still runs its postdecompress, where the
+    // sentinel `(1 << 0) - 1` is zero and therefore matches every zeroed
+    // element. So a fill-*defined* chunk decodes entirely to the fill value,
+    // and only a fill-undefined one decodes to `minval`.
+    //
+    // No conforming encoder emits this pair — reserving the sentinel keeps
+    // `minbits` at 1 or more whenever a fill value is defined — so it is only
+    // reachable from a hand-built or damaged chunk. Measured against the C
+    // library rather than reasoned about, in
+    // `minbits_zero_with_fill_defined_reads_as_the_fill_value`.
     let mut out = Vec::with_capacity(size_out);
     if minbits == 0 {
         let mask = p.width_mask();
+        // `read_fill_bits` writes only `size` bytes into a zeroed buffer, so the
+        // recovered value never carries bits above the datatype width and needs
+        // no mask of its own — unlike `minval`, which comes off the chunk header
+        // as a full 8 bytes whatever the datatype is.
+        let bits = if p.filavail == FILL_DEFINED {
+            read_fill_bits(cd, p.size)?
+        } else {
+            minval & mask
+        };
         for _ in 0..p.nelmts {
-            write_value(&mut out, minval & mask, p.size, p.order);
+            write_value(&mut out, bits, p.size, p.order);
         }
         return Ok(out);
     }
@@ -405,17 +468,21 @@ pub fn decompress(
 /// Compress one full chunk of raw element bytes with scale-offset.
 ///
 /// `input` must be exactly `nelmts * size` bytes (the chunk writer always pads
-/// edge chunks to full size). Only the fill-value-undefined path is produced,
-/// which is what this crate's writer emits.
+/// edge chunks to full size).
+///
+/// Both fill-value modes are produced. When the filter records `FILL_DEFINED`
+/// — which is what the reference library writes for any dataset carrying a fill
+/// value, and so what h5py files routinely carry — elements equal to the fill
+/// value are excluded from the chunk's range and stored as the all-ones offset
+/// instead of as `value - min`. `minbits` is widened by one code point so that
+/// sentinel cannot also be a legitimate offset. See [`precompress_integer`].
 pub fn compress(input: &[u8], filter: &FilterDescription) -> Result<Vec<u8>, FormatError> {
     let cd = &filter.client_data;
     let p = Parms::parse(cd)?;
 
-    if p.filavail == FILL_DEFINED {
-        return Err(FormatError::FilterError(
-            "scaleoffset: encoding with a defined fill value is not supported".to_string(),
-        ));
-    }
+    // The class/scale-type agreement is checked first, matching the reference's
+    // order — the pass-through below is an early return, so anything it must not
+    // skip has to come above it.
     if p.class == CLS_INTEGER && p.scale_type != SO_INT {
         return Err(FormatError::FilterError(
             "scaleoffset: integer class requires integer scale type".to_string(),
@@ -425,6 +492,10 @@ pub fn compress(input: &[u8], filter: &FilterDescription) -> Result<Vec<u8>, For
         return Err(FormatError::FilterError(
             "scaleoffset: float class requires D-scale scale type".to_string(),
         ));
+    }
+
+    if pass_through_or_refuse(&p)? {
+        return Ok(input.to_vec());
     }
 
     // `nelmts * size` in `u64` (cannot overflow there) narrowed to `usize`,
@@ -447,10 +518,18 @@ pub fn compress(input: &[u8], filter: &FilterDescription) -> Result<Vec<u8>, For
     )]
     let full_bits = (p.size * 8) as u32;
 
-    let (minbits, minval, offsets) = if p.class == CLS_INTEGER {
-        precompress_integer(input, &p, signed)
+    // The fill value the filter parameters carry, or `None` when they record
+    // `FILL_UNDEFINED`. Read once here rather than per chunk-scan pass.
+    let filval = if p.filavail == FILL_DEFINED {
+        Some(read_fill_bits(cd, p.size)?)
     } else {
-        precompress_float(input, &p)
+        None
+    };
+
+    let (minbits, minval, offsets) = if p.class == CLS_INTEGER {
+        precompress_integer(input, &p, signed, filval)
+    } else {
+        precompress_float(input, &p, filval)
     };
 
     // Raw path: store the original element bytes after the header.
@@ -490,7 +569,24 @@ fn reconstruct_integer(
     Ok(())
 }
 
-fn precompress_integer(input: &[u8], p: &Parms, signed: bool) -> (u32, u64, Vec<u64>) {
+/// `filval` is the raw bit pattern of the dataset's fill value when the filter
+/// records `FILL_DEFINED`, and `None` otherwise. A defined fill value changes
+/// the encoding in three places, all mirroring `H5Z_scaleoffset_precompress_1`
+/// and `_2`:
+///
+/// * the chunk's range is taken over the **non-fill** elements only (a chunk
+///   that is nothing but fill values leaves `min == max == 0`, the reference's
+///   initializers);
+/// * `minbits` covers `span + 1` rather than `span`, reserving one code point
+///   so the all-ones sentinel can never also be a legitimate offset;
+/// * each fill-valued element is stored as that sentinel instead of as
+///   `value - min`.
+fn precompress_integer(
+    input: &[u8],
+    p: &Parms,
+    signed: bool,
+    filval: Option<u64>,
+) -> (u32, u64, Vec<u64>) {
     // Stream the input twice (min/max, then offsets) instead of materializing
     // a Vec<i128>. The intermediate dominated cache pressure on large chunks
     // (16 B/element vs the source's 1-8 B/element); two cache-warm passes
@@ -508,18 +604,57 @@ fn precompress_integer(input: &[u8], p: &Parms, signed: bool) -> (u32, u64, Vec<
             bits as i128
         }
     };
+    // Compare the fill value the way the elements are read, so the equality
+    // test is on values rather than on bit patterns of different widths.
+    let filval = filval.map(|bits| {
+        if signed {
+            sign_extend(bits, p.size) as i128
+        } else {
+            (bits & p.width_mask()) as i128
+        }
+    });
 
-    let first = read_as_i128(0);
-    let (mut min, mut max) = (first, first);
-    for i in 1..p.nelmts {
-        let v = read_as_i128(i);
-        if v < min {
-            min = v;
+    let (min, max) = match filval {
+        None => {
+            let first = read_as_i128(0);
+            let (mut min, mut max) = (first, first);
+            for i in 1..p.nelmts {
+                let v = read_as_i128(i);
+                if v < min {
+                    min = v;
+                }
+                if v > max {
+                    max = v;
+                }
+            }
+            (min, max)
         }
-        if v > max {
-            max = v;
+        Some(fv) => {
+            // `H5Z_scaleoffset_max_min_1`: skip fill values, and leave both
+            // bounds at zero when every element is one.
+            let (mut min, mut max) = (0i128, 0i128);
+            let mut seen = false;
+            for i in 0..p.nelmts {
+                let v = read_as_i128(i);
+                if v == fv {
+                    continue;
+                }
+                if !seen {
+                    min = v;
+                    max = v;
+                    seen = true;
+                    continue;
+                }
+                if v < min {
+                    min = v;
+                }
+                if v > max {
+                    max = v;
+                }
+            }
+            (min, max)
         }
-    }
+    };
 
     #[expect(
         clippy::cast_possible_truncation,
@@ -533,17 +668,47 @@ fn precompress_integer(input: &[u8], p: &Parms, signed: bool) -> (u32, u64, Vec<
 
     // Overflow guard mirrors `H5Z_scaleoffset_check_{1,2}`: a span within two
     // of the full range can't gain from packing, so store at full precision.
+    //
+    // The reference reaches this by an early `return` from the precompress
+    // function, which skips the `*minval = min` its packed paths end with — so
+    // the header carries the zero the caller initialized, not the chunk's
+    // minimum.
+    //
+    // With one exception, and it is an accident of the reference's own source
+    // rather than a rule: `signed char` is the one type `H5Z__scaleoffset_
+    // precompress_i` hand-expands instead of routing through the
+    // `H5Z_scaleoffset_check_2` macro, and the expansion assigns `*minval` in
+    // its fill-*undefined* early return and not in its fill-defined one. So a
+    // 1-byte signed chunk with no fill value carries the minimum here where
+    // every other combination carries zero.
+    //
+    // A decoder ignores `minval` once `minbits` is the full width, so none of
+    // this changes what any reader returns; it is what writing the same bytes
+    // as the reference costs.
     let width_max: u128 = p.width_mask() as u128;
     let spread = (max - min) as u128;
     if spread > width_max.saturating_sub(2) {
-        return (full_bits, minval, Vec::new());
+        let schar_quirk = signed && p.size == 1 && filval.is_none();
+        return (full_bits, if schar_quirk { minval } else { 0 }, Vec::new());
     }
 
+    // `span` is the reference's `max - min + 1`; a defined fill value costs one
+    // more code point for the sentinel. The guard above leaves room for both:
+    // `spread <= width_max - 2` makes `spread + 2 <= width_max`.
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "the guard above returns early unless spread <= width_max - 2, and width_max <= u64::MAX, so spread fits in u64"
+        reason = "the guard above returns early unless spread <= width_max - 2, and width_max <= u64::MAX, so spread + 2 fits in u64"
     )]
-    let minbits = ceil_log2((spread as u64) + 1);
+    let span = (spread as u64) + 1;
+    let minbits = ceil_log2(if filval.is_some() { span + 1 } else { span });
+    // Unlike the spread guard above, this return is reached with `min` computed,
+    // and the reference's trailing `*minval = min` does run here — the two
+    // full-precision returns carry different headers.
+    //
+    // The comparison is `>=` rather than `>` only to skip building offsets that
+    // `compress` would discard: it applies the same `minbits >= full_bits` test
+    // to the value returned here and emits the chunk raw either way, so
+    // loosening this one changes nothing but wasted work.
     if minbits >= full_bits {
         return (full_bits, minval, Vec::new());
     }
@@ -552,9 +717,20 @@ fn precompress_integer(input: &[u8], p: &Parms, signed: bool) -> (u32, u64, Vec<
         clippy::cast_possible_truncation,
         reason = "each offset (value - min) is at most spread <= width_max <= u64::MAX, so it fits in u64"
     )]
-    let offsets = (0..p.nelmts)
-        .map(|i| (read_as_i128(i) - min) as u64)
-        .collect();
+    let offsets = match filval {
+        None => (0..p.nelmts)
+            .map(|i| (read_as_i128(i) - min) as u64)
+            .collect(),
+        Some(fv) => {
+            let sentinel = sentinel(minbits);
+            (0..p.nelmts)
+                .map(|i| {
+                    let v = read_as_i128(i);
+                    if v == fv { sentinel } else { (v - min) as u64 }
+                })
+                .collect()
+        }
+    };
     (minbits, minval, offsets)
 }
 
@@ -618,7 +794,19 @@ fn reconstruct_float(
     Ok(())
 }
 
-fn precompress_float(input: &[u8], p: &Parms) -> (u32, u64, Vec<u64>) {
+/// The float counterpart of [`precompress_integer`]. A defined fill value
+/// widens `minbits` and diverts matching elements to the sentinel the same way,
+/// with one difference worth stating: the reference does **not** match a float
+/// element against the fill value by equality but by *proximity*, treating any
+/// element within one decimal quantum (`|v - fill| < 10^-D`) as a fill value.
+///
+/// It also applies that test at two different precisions for `f32` data —
+/// `H5Z_scaleoffset_max_min_3` hardcodes the `double` `fabs`/`pow` while
+/// `H5Z_scaleoffset_modify_1` uses the type's own `fabsf`/`powf` — so an `f32`
+/// element can sit inside one tolerance and outside the other. Both are
+/// mirrored as written rather than reconciled, since agreeing with the C
+/// encoder is the whole point.
+fn precompress_float(input: &[u8], p: &Parms, filval: Option<u64>) -> (u32, u64, Vec<u64>) {
     // Two streaming passes over the input bytes (min/max, then offsets),
     // no intermediate Vec<f32>/Vec<f64>. `min_scaled = min * pow` is hoisted
     // out of the per-element loop so we don't recompute the same product N
@@ -637,60 +825,153 @@ fn precompress_float(input: &[u8], p: &Parms) -> (u32, u64, Vec<u64>) {
         let read_f32 = |i: usize| -> f32 {
             f32::from_bits(read_value(&input[i * 4..i * 4 + 4], 4, p.order) as u32)
         };
-        let first = read_f32(0);
-        let (mut min, mut max) = (first, first);
-        for i in 1..p.nelmts {
-            let v = read_f32(i);
-            if v < min {
-                min = v;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the fill value of a 4-byte float occupies the low 32 bits of the recovered pattern"
+        )]
+        let fill = filval.map(|bits| f32::from_bits(bits as u32));
+        // `max_min_3`'s tolerance: the difference is taken in the element type,
+        // then widened to double and compared against a double `pow`.
+        let scan_tol = pow10_f64(-decimals);
+        let is_fill_in_scan = |v: f32| fill.is_some_and(|fv| f64::from(v - fv).abs() < scan_tol);
+
+        let (min, max) = match fill {
+            None => {
+                let first = read_f32(0);
+                let (mut min, mut max) = (first, first);
+                for i in 1..p.nelmts {
+                    let v = read_f32(i);
+                    if v < min {
+                        min = v;
+                    }
+                    if v > max {
+                        max = v;
+                    }
+                }
+                (min, max)
             }
-            if v > max {
-                max = v;
+            Some(_) => {
+                let (mut min, mut max) = (0f32, 0f32);
+                let mut seen = false;
+                for i in 0..p.nelmts {
+                    let v = read_f32(i);
+                    if is_fill_in_scan(v) {
+                        continue;
+                    }
+                    if !seen {
+                        min = v;
+                        max = v;
+                        seen = true;
+                        continue;
+                    }
+                    if v < min {
+                        min = v;
+                    }
+                    if v > max {
+                        max = v;
+                    }
+                }
+                (min, max)
             }
-        }
+        };
+
         let pow = pow10_f32(decimals);
         let min_scaled = min * pow;
         // check_3: residual span beyond signed 32-bit range → store raw.
         let residual = max * pow - min_scaled;
         let minval = min.to_bits() as u64;
+        // `check_3` jumps past the `save_min` at the end of the reference's
+        // precompress, so the header keeps the zero set on entry. Same as the
+        // integer guard above.
         if residual > (1u64 << 31) as f32 {
-            return (full_bits, minval, Vec::new());
+            return (full_bits, 0, Vec::new());
         }
-        let minbits = ceil_log2((round_half_away_f32(residual) as u64) + 1);
+        let span = (round_half_away_f32(residual) as u64) + 1;
+        let minbits = ceil_log2(if fill.is_some() { span + 1 } else { span });
         if minbits >= full_bits {
             return (full_bits, minval, Vec::new());
         }
+        // `modify_1`'s tolerance, unlike the scan's: computed entirely in the
+        // element type.
+        let modify_tol = pow10_f32(-decimals);
+        let sentinel = sentinel(minbits);
         let offsets = (0..p.nelmts)
-            .map(|i| round_half_away_f32(read_f32(i) * pow - min_scaled) as u64)
+            .map(|i| {
+                let v = read_f32(i);
+                match fill {
+                    Some(fv) if (v - fv).abs() < modify_tol => sentinel,
+                    _ => round_half_away_f32(v * pow - min_scaled) as u64,
+                }
+            })
             .collect();
         (minbits, minval, offsets)
     } else {
         let read_f64 =
             |i: usize| -> f64 { f64::from_bits(read_value(&input[i * 8..i * 8 + 8], 8, p.order)) };
-        let first = read_f64(0);
-        let (mut min, mut max) = (first, first);
-        for i in 1..p.nelmts {
-            let v = read_f64(i);
-            if v < min {
-                min = v;
+        let fill = filval.map(f64::from_bits);
+        let tol = pow10_f64(-decimals);
+
+        let (min, max) = match fill {
+            None => {
+                let first = read_f64(0);
+                let (mut min, mut max) = (first, first);
+                for i in 1..p.nelmts {
+                    let v = read_f64(i);
+                    if v < min {
+                        min = v;
+                    }
+                    if v > max {
+                        max = v;
+                    }
+                }
+                (min, max)
             }
-            if v > max {
-                max = v;
+            Some(fv) => {
+                let (mut min, mut max) = (0f64, 0f64);
+                let mut seen = false;
+                for i in 0..p.nelmts {
+                    let v = read_f64(i);
+                    if (v - fv).abs() < tol {
+                        continue;
+                    }
+                    if !seen {
+                        min = v;
+                        max = v;
+                        seen = true;
+                        continue;
+                    }
+                    if v < min {
+                        min = v;
+                    }
+                    if v > max {
+                        max = v;
+                    }
+                }
+                (min, max)
             }
-        }
+        };
+
         let pow = pow10_f64(decimals);
         let min_scaled = min * pow;
         let residual = max * pow - min_scaled;
         let minval = min.to_bits();
         if residual > (1u64 << 63) as f64 {
-            return (full_bits, minval, Vec::new());
+            return (full_bits, 0, Vec::new());
         }
-        let minbits = ceil_log2((round_half_away_f64(residual) as u64) + 1);
+        let span = (round_half_away_f64(residual) as u64) + 1;
+        let minbits = ceil_log2(if fill.is_some() { span + 1 } else { span });
         if minbits >= full_bits {
             return (full_bits, minval, Vec::new());
         }
+        let sentinel = sentinel(minbits);
         let offsets = (0..p.nelmts)
-            .map(|i| round_half_away_f64(read_f64(i) * pow - min_scaled) as u64)
+            .map(|i| {
+                let v = read_f64(i);
+                match fill {
+                    Some(fv) if (v - fv).abs() < tol => sentinel,
+                    _ => round_half_away_f64(v * pow - min_scaled) as u64,
+                }
+            })
             .collect();
         (minbits, minval, offsets)
     }
@@ -971,6 +1252,12 @@ fn pow10_f64(exp: i32) -> f64 {
 }
 
 /// `10^exp` as `f32` (computed in `f64` for accuracy, then narrowed).
+///
+/// Narrowing an `f64` result rounds twice where the reference's `powf` rounds
+/// once, so the two can land one ulp apart — measured, at `exp = -22` and
+/// nowhere else in `-45..=38`. This form is the more accurate one, and `powf`
+/// is platform libm rather than a correctly-rounded function, so agreeing with
+/// it bit-for-bit is not something a portable implementation can promise.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "narrowing 10^exp from f64 to f32 is the intended value conversion; out-of-range magnitudes saturate to +/-inf, matching the C reference"
@@ -979,8 +1266,14 @@ fn pow10_f32(exp: i32) -> f32 {
     pow10_f64(exp) as f32
 }
 
-/// Round half away from zero to the nearest integer, matching C `llround`.
+/// Round half away from zero to the nearest integer, approximating C `llround`.
 /// Float-to-int `as` casts saturate in Rust, so out-of-range inputs are safe.
+///
+/// Rounding `x + 0.5` is not the same function as rounding `x`: at
+/// `x = 0.49999999999999994` — the largest double below one half — the sum is
+/// exactly `0.5` and this yields 1 where `llround` yields 0. Deterministic, and
+/// it can shift a whole chunk's `minbits` through `span`, but it needs an input
+/// within one ulp of a half. Tracked with the other sub-ulp divergences.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "float-to-int `as` saturates in Rust, so rounding x +/- 0.5 to i64 is safe even for out-of-range inputs (matches C llround)"
@@ -1487,13 +1780,20 @@ mod tests {
 
     /// Build a synthetic chunk where `minbits == 0`, the compressed header
     /// declares `minval = 7`, but the filter's `cd_values` say
-    /// `filavail = FILL_DEFINED` with `filval = 99`. The reference C decoder
-    /// short-circuits the `minbits == 0` path to emit `minval` for every
-    /// element. The Rust port must match: every element should reconstruct
-    /// to 7, not 99. Catches the sentinel-collision divergence flagged in
-    /// the scale-offset review.
+    /// `filavail = FILL_DEFINED` with `filval = 99`.
+    ///
+    /// This test previously asserted the opposite, on the stated grounds that
+    /// the reference short-circuits `minbits == 0` to emit `minval`. It does
+    /// not short-circuit at all: it zeroes the buffer and runs its
+    /// postdecompress anyway, where the sentinel `(1 << 0) - 1` is zero and
+    /// matches every element. Measured — libhdf5 reads this exact chunk as
+    /// `[99; 5]` — rather than re-derived from the source a second time.
+    ///
+    /// No encoder emits this pair, so it is reachable only from a damaged or
+    /// hand-built chunk; the point is that a damaged chunk reads the same here
+    /// as it does through the C library.
     #[test]
-    fn minbits_zero_with_fill_defined_emits_minval_not_filval() {
+    fn minbits_zero_with_fill_defined_reads_as_the_fill_value() {
         let nelmts = 5u32;
         let size = 4u32;
         let mut cd = vec![0u32; TOTAL_NPARMS];
@@ -1526,8 +1826,8 @@ mod tests {
             .collect();
         assert_eq!(
             got,
-            vec![7u32; nelmts as usize],
-            "minbits==0 with FILL_DEFINED must emit minval, not filval"
+            vec![99u32; nelmts as usize],
+            "minbits==0 with FILL_DEFINED reads as the fill value, not minval"
         );
     }
 
@@ -1572,33 +1872,315 @@ mod tests {
         assert_eq!(got, vec![10u32, 11, 999, 12]);
     }
 
-    /// The writer doesn't support encoding with a defined fill value (the
-    /// builder doesn't expose one). If someone hands it a `FILL_DEFINED`
-    /// `cd_values` directly, it must error rather than silently miscompress.
+    /// An integer filter carrying a defined fill value, the shape the
+    /// reference library writes for any dataset with one.
+    fn int_filter_with_fill(
+        size: u32,
+        signed: bool,
+        order: u32,
+        nelmts: u32,
+        fill: u64,
+    ) -> FilterDescription {
+        let mut f = int_filter(size, signed, order, nelmts);
+        f.client_data[PARM_FILAVAIL] = FILL_DEFINED;
+        // The fill value occupies the least-significant 4 bytes of each entry
+        // from PARM_FILVAL on.
+        for (k, entry) in fill
+            .to_le_bytes()
+            .chunks(4)
+            .take((size as usize).div_ceil(4))
+            .enumerate()
+        {
+            let mut w = [0u8; 4];
+            w[..entry.len()].copy_from_slice(entry);
+            f.client_data[PARM_FILVAL + k] = u32::from_le_bytes(w);
+        }
+        f
+    }
+
+    /// Encode with a defined fill value and decode it back (issue #287).
+    ///
+    /// `tests/scaleoffset_fill_crosscheck.rs` proves the *bytes* match what the
+    /// reference encoder produces, but it links the C library and so is gated
+    /// to 64-bit little-endian. This states the round-trip property on every
+    /// target, and covers the two chunk shapes that have no interior range:
+    /// nothing but fill values, and no fill value at all.
     #[test]
-    fn compress_rejects_fill_defined() {
-        let nelmts = 4u32;
-        let size = 4u32;
-        let mut cd = vec![0u32; TOTAL_NPARMS];
-        cd[PARM_SCALETYPE] = SO_INT;
-        cd[PARM_NELMTS] = nelmts;
-        cd[PARM_CLASS] = CLS_INTEGER;
-        cd[PARM_SIZE] = size;
-        cd[PARM_SIGN] = SGN_NONE;
-        cd[PARM_ORDER] = ORDER_LE;
-        cd[PARM_FILAVAIL] = FILL_DEFINED;
-        cd[PARM_FILVAL] = 0;
-        let f = FilterDescription {
-            filter_id: crate::filter_pipeline::FILTER_SCALEOFFSET,
-            name: None,
-            flags: 0,
-            client_data: cd,
-        };
-        let raw = vec![0u8; nelmts as usize * size as usize];
+    fn compress_round_trips_with_a_defined_fill_value() {
+        let fill = 0xDEAD_u32;
+        for (label, values) in [
+            ("mixed", vec![10u32, fill, 11, 12, fill, 10]),
+            ("all fill", vec![fill; 6]),
+            ("no fill", vec![10u32, 11, 12, 13, 14, 15]),
+            // min = 10, max = 13: a span of 4 needs 2 bits, whose all-ones
+            // code is the offset 13 would otherwise take.
+            ("sentinel collision", vec![10u32, 11, 12, 13, fill, 13]),
+        ] {
+            for order in [ORDER_LE, ORDER_BE] {
+                let f = int_filter_with_fill(4, false, order, values.len() as u32, u64::from(fill));
+                let raw: Vec<u8> = values
+                    .iter()
+                    .flat_map(|v| {
+                        let le = v.to_le_bytes();
+                        if order == ORDER_LE {
+                            le.to_vec()
+                        } else {
+                            le.iter().rev().copied().collect()
+                        }
+                    })
+                    .collect();
+                let packed = compress(&raw, &f).unwrap();
+                let out = decompress(&packed, &f, None).unwrap();
+                assert_eq!(out, raw, "{label}, order {order}");
+            }
+        }
+    }
+
+    /// A float filter carrying a defined fill value.
+    fn float_filter_with_fill(
+        size: u32,
+        decimals: i32,
+        order: u32,
+        nelmts: u32,
+        fill: u64,
+    ) -> FilterDescription {
+        let mut f = float_filter(size, decimals, order, nelmts);
+        f.client_data[PARM_FILAVAIL] = FILL_DEFINED;
+        for (k, entry) in fill
+            .to_le_bytes()
+            .chunks(4)
+            .take((size as usize).div_ceil(4))
+            .enumerate()
+        {
+            let mut w = [0u8; 4];
+            w[..entry.len()].copy_from_slice(entry);
+            f.client_data[PARM_FILVAL + k] = u32::from_le_bytes(w);
+        }
+        f
+    }
+
+    /// The float counterpart of [`compress_round_trips_with_a_defined_fill_value`].
+    ///
+    /// Worth its own test rather than folding into the integer one: the
+    /// crosschecks that pin the float encoding link the C library and so are
+    /// gated to 64-bit little-endian, which leaves the `cross` i686 and s390x
+    /// jobs with no float fill-defined coverage at all — and big-endian is
+    /// where byte-order handling is most likely to be wrong.
+    #[test]
+    fn float_compress_round_trips_with_a_defined_fill_value() {
+        let decimals = 3;
+        for size in [4u32, 8] {
+            for order in [ORDER_LE, ORDER_BE] {
+                for (label, values) in [
+                    ("mixed", vec![1.5f64, -999.0, 2.25, -999.0, 3.125]),
+                    ("all fill", vec![-999.0f64; 5]),
+                    ("no fill", vec![1.5f64, 2.25, 3.125, 4.0, 5.5]),
+                    // Scaled by 10^3 this spans exactly 1024 values, so the
+                    // largest offset is the all-ones code of an unwidened
+                    // `minbits` and would decode as the fill value. The spans
+                    // above cannot distinguish a reserved code point from an
+                    // unreserved one; only a power-of-two span can.
+                    (
+                        "sentinel collision",
+                        vec![0.0f64, 1.023, 0.5, -999.0, 1.023],
+                    ),
+                ] {
+                    let fill_bits = if size == 4 {
+                        u64::from((-999.0f32).to_bits())
+                    } else {
+                        (-999.0f64).to_bits()
+                    };
+                    let n = values.len() as u32;
+                    let f = float_filter_with_fill(size, decimals, order, n, fill_bits);
+                    let raw: Vec<u8> = values
+                        .iter()
+                        .flat_map(|v| {
+                            let le = if size == 4 {
+                                (*v as f32).to_bits().to_le_bytes().to_vec()
+                            } else {
+                                v.to_bits().to_le_bytes().to_vec()
+                            };
+                            if order == ORDER_LE {
+                                le
+                            } else {
+                                le.iter().rev().copied().collect()
+                            }
+                        })
+                        .collect();
+                    let packed = compress(&raw, &f).unwrap();
+                    let out = decompress(&packed, &f, None).unwrap();
+
+                    let got: Vec<f64> = out
+                        .chunks_exact(size as usize)
+                        .map(|c| {
+                            let mut b = c.to_vec();
+                            if order == ORDER_BE {
+                                b.reverse();
+                            }
+                            if size == 4 {
+                                f64::from(f32::from_bits(u32::from_le_bytes(b.try_into().unwrap())))
+                            } else {
+                                f64::from_bits(u64::from_le_bytes(b.try_into().unwrap()))
+                            }
+                        })
+                        .collect();
+                    let tol = 0.501 * 10f64.powi(-decimals);
+                    assert_eq!(
+                        got.len(),
+                        values.len(),
+                        "{label}, size {size}, order {order}"
+                    );
+                    for (g, v) in got.iter().zip(values.iter()) {
+                        assert!(
+                            (g - v).abs() <= tol,
+                            "{label}, size {size}, order {order}: got {g}, want {v}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The pass-through mode and the width refusal beside it, on **both**
+    /// directions. The reference takes both before it splits on compress versus
+    /// decompress, so a reader that honours one and a writer that does not
+    /// disagree about the same file.
+    ///
+    /// This is the unit half of
+    /// `a_full_width_minbits_stores_the_chunk_unfiltered`, which needs the C
+    /// library and so does not run on the 32-bit or big-endian jobs.
+    #[test]
+    fn a_full_width_scale_factor_passes_the_chunk_through_both_ways() {
+        let raw: Vec<u8> = (0..40u8).collect();
+
+        for size in [1u32, 2, 4, 8] {
+            let bits = size * 8;
+            let nelmts = raw.len() as u32 / size;
+
+            let mut f = int_filter(size, false, ORDER_LE, nelmts);
+            f.client_data[PARM_SCALEFACTOR] = bits;
+            assert_eq!(compress(&raw, &f).unwrap(), raw, "size {size}: compress");
+            assert_eq!(
+                decompress(&raw, &f, None).unwrap(),
+                raw,
+                "size {size}: decompress"
+            );
+
+            // One bit past the datatype is not a width at all.
+            f.client_data[PARM_SCALEFACTOR] = bits + 1;
+            assert!(
+                matches!(compress(&raw, &f), Err(FormatError::FilterError(_))),
+                "size {size}: compress must refuse a width past the datatype"
+            );
+            assert!(
+                matches!(decompress(&raw, &f, None), Err(FormatError::FilterError(_))),
+                "size {size}: decompress must refuse it too"
+            );
+        }
+    }
+
+    /// The pass-through is an early return, so everything that must not be
+    /// skipped has to sit above it. A `cd_values` whose class and scale type
+    /// disagree is refused whatever the requested width — the reference
+    /// validates that first.
+    #[test]
+    fn a_pass_through_width_does_not_skip_the_class_check() {
+        let raw = vec![0u8; 32];
+        // Float class carrying the *integer* scale type, at the pass-through
+        // width. Reachable only from a malformed parameter array.
+        let mut f = float_filter(4, 0, ORDER_LE, 8);
+        f.client_data[PARM_SCALETYPE] = SO_INT;
+        f.client_data[PARM_SCALEFACTOR] = 32;
         assert!(matches!(
             compress(&raw, &f),
             Err(FormatError::FilterError(_))
         ));
+
+        // Integer class carrying float E-scale, likewise.
+        let mut f = int_filter(4, false, ORDER_LE, 8);
+        f.client_data[PARM_SCALETYPE] = SO_FLOAT_ESCALE;
+        f.client_data[PARM_SCALEFACTOR] = 32;
+        assert!(matches!(
+            compress(&raw, &f),
+            Err(FormatError::FilterError(_))
+        ));
+    }
+
+    /// `precompress_integer` has *two* full-precision returns and they carry
+    /// different `minval`s. The spread guard fires before the chunk's minimum is
+    /// known to be usable and leaves zero; the `minbits >= full_bits` return
+    /// below it is reached with the minimum computed, and the reference's
+    /// trailing `*minval = min` does run there.
+    ///
+    /// `the_full_precision_fallback_header_matches_the_c_library` reaches only
+    /// the first. This reaches the second: a spread wide enough that
+    /// `ceil_log2` saturates the datatype without exceeding `width_max - 2`.
+    #[test]
+    fn the_second_full_precision_return_carries_the_chunk_minimum() {
+        // u8, min = 1, max = 128: spread 127, inside the guard (<= 253), and
+        // with a fill value `ceil_log2(127 + 2) = 8` — the full width.
+        let values: Vec<u8> = vec![9, 1, 128, 9, 1, 128, 2, 3];
+        let f = int_filter_with_fill(1, false, ORDER_LE, values.len() as u32, 9);
+        let packed = compress(&values, &f).unwrap();
+        assert_eq!(
+            u32::from_le_bytes(packed[..4].try_into().unwrap()),
+            8,
+            "the fixture must reach the full width"
+        );
+        assert_eq!(
+            u64::from_le_bytes(packed[5..13].try_into().unwrap()),
+            1,
+            "the second full-precision return carries the chunk minimum, not zero"
+        );
+        // Stored raw after the header, never packed at the full width.
+        assert_eq!(&packed[HEADER_LEN..], &values[..]);
+    }
+
+    /// Reserving a code point for the sentinel is what makes the round trip
+    /// above possible, and it is visible in the encoded header: a chunk with a
+    /// defined fill value covers `span + 1` values where one without covers
+    /// `span`.
+    ///
+    /// Swept over every span rather than checked at a hand-picked one. The two
+    /// formulas agree at most spans — they differ only where `span + 1` crosses
+    /// a power of two — so a single fixture is as likely to be blind to the
+    /// reservation as to catch it, and equally blind to a *double* reservation.
+    #[test]
+    fn a_defined_fill_value_reserves_exactly_one_code_point() {
+        let fill = 0xDEAD_u32;
+        for span in 1..=40u32 {
+            // `span` distinct values, 0..span, plus one fill element.
+            let mut values: Vec<u32> = (0..span).collect();
+            values.push(fill);
+            let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let n = values.len() as u32;
+
+            let minbits_of = |f: &FilterDescription| {
+                let packed = compress(&raw, f).unwrap();
+                u32::from_le_bytes(packed[..4].try_into().unwrap())
+            };
+
+            // Without a fill value the lone `fill` element is just another
+            // value, so the span is the whole 0..=fill range; use a separate
+            // buffer for that half.
+            let plain: Vec<u8> = (0..span).flat_map(|v| v.to_le_bytes()).collect();
+            let packed = compress(&plain, &int_filter(4, false, ORDER_LE, span)).unwrap();
+            let plain_minbits = u32::from_le_bytes(packed[..4].try_into().unwrap());
+            assert_eq!(plain_minbits, ceil_log2(u64::from(span)), "span {span}");
+
+            assert_eq!(
+                minbits_of(&int_filter_with_fill(
+                    4,
+                    false,
+                    ORDER_LE,
+                    n,
+                    u64::from(fill)
+                )),
+                ceil_log2(u64::from(span) + 1),
+                "span {span}: a defined fill value must reserve one code point, \
+                 no more and no less"
+            );
+        }
     }
 
     /// Float E-scale is forbidden by the reference library too; we error
