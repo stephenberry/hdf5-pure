@@ -157,8 +157,12 @@ fn c_library_accepts(shape: &[u64], chunks: &[u64]) -> bool {
 }
 
 fn c_read(path: &std::path::Path) -> Vec<u32> {
+    c_read_named(path, "d")
+}
+
+fn c_read_named(path: &std::path::Path, name: &str) -> Vec<u32> {
     let file = hdf5::File::open(path).unwrap();
-    let v = file.dataset("d").unwrap().read_raw::<u32>().unwrap();
+    let v = file.dataset(name).unwrap().read_raw::<u32>().unwrap();
     file.close().unwrap();
     v
 }
@@ -290,6 +294,50 @@ fn two_unlimited_dimensions_are_refused() {
         .with_chunks(&[2, 2]);
     let err = b.write(&path).unwrap_err();
     assert!(format!("{err}").contains("at most one dimension"), "{err}");
+}
+
+/// The refusal covers the in-place session path too, not only the whole-file
+/// writer.
+///
+/// A session validates a dataset's geometry when it builds the dataset, which is
+/// at `commit` rather than at `create_dataset` — so the refusal arrives there,
+/// with the file left as it was.
+#[test]
+fn two_unlimited_dimensions_are_refused_in_a_session_too() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("session.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("seed").with_u32_data(&[1, 2, 3]);
+    b.write(&path).unwrap();
+
+    // Scoped, so the session's file lock is gone before either library reopens
+    // the file below.
+    {
+        let session = hdf5_pure::File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("d", |b| {
+                b.with_u32_data(&values(&[3, 3]))
+                    .with_shape(&[3, 3])
+                    .with_maxshape(&[U, U])
+                    .with_chunks(&[2, 2]);
+            })
+            .unwrap();
+        let err = session.commit().unwrap_err();
+        assert!(format!("{err}").contains("at most one dimension"), "{err}");
+    }
+
+    // The refused commit wrote nothing: the file still holds what it did, and
+    // not a half-written dataset the reference library would choke on.
+    assert_eq!(
+        c_read_named(&path, "seed"),
+        vec![1, 2, 3],
+        "a refused commit must leave the file as it was"
+    );
+    assert!(
+        hdf5_pure::File::open(&path).unwrap().dataset("d").is_err(),
+        "the refused dataset must not be present"
+    );
 }
 
 /// A maximum shape enormously wider than the shape is refused rather than

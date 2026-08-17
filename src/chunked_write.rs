@@ -2182,13 +2182,6 @@ pub(crate) fn plan_index_slots(
     let num_chunks = counts.iter().product::<u64>().to_usize()?;
     let kind = chunk_index_kind(&grid, num_chunks);
 
-    // A layout with no positional index numbers nothing: the single-chunk
-    // layout carries its address in the layout message, and an unallocated one
-    // has no chunk and no address at all.
-    if kind.array_kind().is_none() {
-        return Ok((kind, vec![0; num_chunks], 0));
-    }
-
     let mut slot_of_chunk = Vec::with_capacity(num_chunks);
     let mut coords = vec![0u64; shape.len()];
     for dense in 0..num_chunks {
@@ -2202,8 +2195,11 @@ pub(crate) fn plan_index_slots(
 
     // A Fixed Array declares a slot for every chunk the maximum shape allows;
     // an Extensible Array only has to reach the last one written, and grows from
-    // there as the dataset does.
+    // there as the dataset does. A layout with no positional index spans no
+    // slots at all: the single-chunk layout carries its address in the layout
+    // message, and an unallocated one has no address to carry.
     let index_slots = match kind {
+        ChunkIndexKind::Unallocated | ChunkIndexKind::SingleChunk => 0,
         ChunkIndexKind::FixedArray => grid.slots().ok_or_else(|| {
             FormatError::ChunkedReadError(
                 "a Fixed Array cannot index an unlimited dimension".into(),
