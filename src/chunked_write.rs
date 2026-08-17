@@ -1347,15 +1347,16 @@ pub(crate) fn write_ea_addr(buf: &mut Vec<u8>, val: u64, offset_size: u8) {
 }
 
 /// Build a single Extensible Array Data Block (`EADB`) holding the chunk
-/// elements for `[elem_start, elem_start + dblk_nelmts)`. Slots whose absolute
-/// element index reaches `num_elements` are written as undefined.
+/// elements for `[elem_start, elem_start + dblk_nelmts)`. A slot no chunk
+/// occupies is written as undefined, whether it falls past the last chunk or in a
+/// gap between them.
 ///
 /// When `dblk_nelmts` exceeds the page size the block is *paged*: the header
 /// carries its own checksum and the elements are split into contiguous pages of
-/// `page_nelmts` slots, each followed by a checksum. Returns the block bytes and
-/// the number of leading pages that contain at least one real element (used by
-/// the owning super block to build its page-init bitmap). For non-paged blocks
-/// the returned page count is 0.
+/// `page_nelmts` slots, each followed by a checksum. Every page is emitted; which
+/// of them the owning super block marks initialized is that block's business, and
+/// it asks `slots` the same question this does (see the page-init bitmap in
+/// [`build_extensible_array_at`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_eadb(
     slots: &IndexSlots<'_>,
@@ -1895,16 +1896,31 @@ pub fn build_extensible_array_at(
             body.extend_from_slice(&db_bytes);
             sb_dblk_addrs.push(addr);
             if is_paged {
-                // Every page of the block was just written, so every page is
-                // initialized. The bit describes the *page*, not the data in it:
-                // a page whose slots are all undefined is still a page the
-                // reader steps over, and clearing its bit makes the reader skip
-                // bytes rather than chunks. This marked the leading `n` pages
-                // for a block holding `n` pages' worth of chunks, which is the
-                // same thing only while the array has no gaps — true of every
-                // Extensible Array this crate wrote until it began numbering
-                // slots over the maximum grid (issue #299).
+                // A page is marked initialized when it holds a chunk — the page
+                // that holds it, not the n-th page for the n-th page's worth of
+                // chunks. Those are the same list only while the array has no
+                // gaps, which was true of every Extensible Array this crate
+                // wrote until it began numbering slots over the maximum grid: a
+                // gap then left chunks in pages nothing marked, and so in pages
+                // no reader visits (issue #299).
+                //
+                // Marking every allocated page instead reads correctly too,
+                // since every page is written and an unmarked one holds only
+                // undefined addresses. It is this list because it is the list the
+                // reference library writes: on a 140,000-chunk unlimited dataset
+                // the final super block's bitmap is `ff 80` here and in libhdf5,
+                // and `ff c0` if every page is marked. **No test asserts those
+                // bytes** — locating a super block's bitmap in a file needs the
+                // block's own geometry, so the tests pin the behaviour (a gapped
+                // array reads completely, in both libraries) and not the
+                // encoding. A change here that keeps files readable will not be
+                // caught.
+                let base = local_elem.to_usize()?;
                 for p in 0..npages.to_usize()? {
+                    let page_start = base + p * page_nelmts;
+                    if !(0..page_nelmts).any(|s| slots.at(page_start + s).is_some()) {
+                        continue;
+                    }
                     let global_page = (db_local * npages).to_usize()? + p;
                     page_bitmap[global_page / 8] |= 0x80 >> (global_page % 8);
                 }

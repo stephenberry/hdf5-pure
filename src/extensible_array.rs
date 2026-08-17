@@ -391,8 +391,13 @@ fn page_is_initialized(bitmap: &[u8], page_idx: usize) -> bool {
 /// `page_nelmts` element slots followed by a 4-byte checksum, and is written
 /// only when initialized. Whether page `p` of this data block is initialized is
 /// recorded in the owning super block's bitmap at global page index
-/// `db_local_idx * npages + p`. Pages are filled sequentially, so the first
-/// uninitialized page marks the end of populated data for this block.
+/// `db_local_idx * npages + p`.
+///
+/// Pages are *not* filled in order: a writer initializes the page a chunk lands
+/// in, and a dataset whose maximum shape is wider than its shape leaves gaps
+/// between them. An uninitialized page is therefore stepped over — it still
+/// occupies its full stride — rather than treated as the end of the block, which
+/// is what this walk used to do (issue #299).
 #[allow(clippy::too_many_arguments)]
 fn read_paged_data_block(
     file_data: &[u8],
