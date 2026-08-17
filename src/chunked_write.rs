@@ -237,7 +237,7 @@ impl ChunkOptions {
                     ty,
                     element_size,
                     nelmts,
-                    self.scale_offset_fill.with_value(fill.element()?),
+                    self.scale_offset_fill.with_value(fill)?,
                 )?,
             });
         }
@@ -3794,6 +3794,25 @@ mod tests {
             options.build_pipeline(&ctx, FillPattern::UNKNOWN),
             Err(FormatError::UnreadableFillValue)
         ));
+        // But only the setting that would record it refuses: a filter that
+        // records no fill value has nowhere to put one, so a value it could not
+        // read is not an obstacle to saying there is none.
+        let undefined = ChunkOptions {
+            scale_offset: Some(ScaleOffset::FloatDScale(2)),
+            scale_offset_fill: FillAvailability::Undefined,
+            ..Default::default()
+        };
+        assert!(undefined.build_pipeline(&ctx, FillPattern::UNKNOWN).is_ok());
+
+        // The default is the reference library's: every scale-offset dataset it
+        // writes records a fill value, including one whose fill value was never
+        // set. Asserted here as well as in the crosschecks because those are
+        // gated to little-endian 64-bit targets, where the `cross` jobs run
+        // nothing that would notice this flipping back.
+        assert_eq!(
+            ChunkOptions::default().scale_offset_fill,
+            FillAvailability::Defined
+        );
         // Every other pipeline is buildable from the same pattern: only the
         // filter that records the fill value needs to read it.
         let plain = ChunkOptions {

@@ -7407,8 +7407,9 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
             .map_err(|_| {
                 Error::EditUnsupported(
                     "this dataset's filter pipeline cannot be added in place \
-                     (an unsupported filter, an incompatible datatype, or a \
-                     compression feature that is not enabled)",
+                     (an unsupported filter, an incompatible datatype, a fill \
+                     value the filter cannot record, or a compression feature \
+                     that is not enabled)",
                 )
             })?;
     }

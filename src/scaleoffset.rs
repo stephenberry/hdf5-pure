@@ -33,6 +33,7 @@ use alloc::{format, string::ToString, vec, vec::Vec};
 use crate::convert::TryToUsize;
 use crate::datatype::{Datatype, DatatypeByteOrder};
 use crate::error::FormatError;
+use crate::fill_value::FillPattern;
 use crate::filter_pipeline::FilterDescription;
 
 // cd_values indices (H5Z_SCALEOFFSET_PARM_*).
@@ -177,14 +178,17 @@ pub enum FillAvailability {
 }
 
 impl FillAvailability {
-    /// The filter's fill parameters for a dataset whose fill value is `bytes`
-    /// (one element in the dataset's byte order, `None` for the library
-    /// default). The value is dropped for [`Undefined`](Self::Undefined), which
-    /// records no fill value to put one in.
-    pub fn with_value(self, bytes: Option<&[u8]>) -> ScaleOffsetFill<'_> {
+    /// The filter's fill parameters for a dataset whose fill value is `fill`.
+    ///
+    /// The pattern is read only by [`Defined`](Self::Defined), which is the
+    /// variant that records it: [`Undefined`](Self::Undefined) has nowhere to
+    /// put a value, so one it could not read
+    /// ([`FormatError::UnreadableFillValue`]) is not an obstacle to recording
+    /// that there is none.
+    pub fn with_value(self, fill: FillPattern<'_>) -> Result<ScaleOffsetFill<'_>, FormatError> {
         match self {
-            Self::Defined => ScaleOffsetFill::Defined(bytes),
-            Self::Undefined => ScaleOffsetFill::Undefined,
+            Self::Defined => Ok(ScaleOffsetFill::Defined(fill.element()?)),
+            Self::Undefined => Ok(ScaleOffsetFill::Undefined),
         }
     }
 }
@@ -214,8 +218,13 @@ pub enum ScaleOffsetFill<'a> {
 /// it: as the datatype's bit pattern in *value* order rather than in the
 /// dataset's byte order, packed four bytes to a `cd_values` entry from
 /// [`PARM_FILVAL`]. [`read_fill_bits`] is the inverse, and a big-endian dataset
-/// is converted in both directions — matching what the reference writes on a
-/// little-endian host, which is where its `need_convert` lands.
+/// is converted in both directions.
+///
+/// Storing the *value* rather than the dataset's bytes is what makes this
+/// independent of the host: the reference reaches the same entries by two
+/// different routes, walking the fill value forwards on a little-endian host
+/// and backwards from its last four bytes on a big-endian one, and its
+/// `need_convert` step brings a foreign-order fill value into that form first.
 pub fn build_cd_values(
     mode: ScaleOffset,
     ty: ScaleOffsetType,

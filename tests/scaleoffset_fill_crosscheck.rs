@@ -615,6 +615,17 @@ fn a_residual_just_below_one_half_rounds_the_way_the_c_library_rounds() {
     let values = [-999.0f64, 0.0, below_half, 3.0, -999.0];
     assert_one_byte_identical_chunk(CScaleOffset::FloatDScale(0), &values, pure_append_f64);
 
+    // The `f32` helper is a separate function with the same defect available to
+    // it, and the value it parts company with the reference on is its own: the
+    // largest float below one half, where the sum rounds to exactly 1.0.
+    let below_half_f32 = 0.499_999_97f32;
+    assert!(below_half_f32 < 0.5 && below_half_f32 + 0.5 == 1.0);
+    assert_one_byte_identical_chunk(
+        CScaleOffset::FloatDScale(0),
+        &[-999.0f32, 0.0, below_half_f32, 3.0, -999.0],
+        pure_append_f32,
+    );
+
     // The same divergence as a value, which is how a user meets it: this crate
     // stored 1.0 for an element the reference stores as 0.0.
     let dir = tempdir().unwrap();
