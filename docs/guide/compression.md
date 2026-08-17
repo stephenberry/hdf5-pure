@@ -106,7 +106,9 @@ builder
 ```
 
 !!! note "Fill values in a scale-offset filter"
-    The filter records whether the dataset has a fill value, and when it does, an element equal to it is stored as a reserved code rather than as an offset. The reference C library (and h5py) records one on *every* scale-offset dataset, since an untouched fill value still counts as defined. This crate reads and writes both forms — so appending to a C-written scale-offset dataset works — but its own writer always records the fill-undefined form, even alongside `with_fill_value`, which costs a little compression on chunks that are mostly fill. For the same reason `repack` refuses to re-encode the fill-defined form: re-applying the filter goes through `with_scale_offset`, which has nowhere to carry the fill value.
+    The filter records the dataset's fill value, and an element equal to it is stored as a reserved code rather than as an offset — so a chunk that is mostly fill packs to the width of what is left. The reference C library (and h5py) records one on *every* scale-offset dataset, since an untouched fill value still counts as defined, and this crate does the same: `with_fill_value` is carried into the filter's parameters, and a dataset without one records the library default of zero. Reserving that code costs one bit per element on a chunk whose values span an exact power of two, which is what the reference pays for it too.
+
+    Both forms are read and written, so appending to or repacking a dataset whose filter records no fill value keeps it that way.
 
 !!! warning "Mode must match the datatype"
     The datatype class, sign, and byte order are derived from the dataset's datatype when the file is written, so the mode must match the data: integer mode on `with_i*` / `with_u*` data, float mode on `with_f32` / `with_f64` data. A mismatch makes `finish()` / `write()` return a `FormatError`. Scale-offset is mutually exclusive with ZFP and with shuffle, but may be followed by `with_deflate` or `with_lzf`.

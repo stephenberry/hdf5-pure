@@ -765,7 +765,13 @@ fn c_sparse_chunked_scale_offset_repacks_with_its_fill_value() {
     // Copies of the fill value inside the written region, so the sentinel is
     // exercised where the data is rather than only where it is missing.
     let head: Vec<i32> = (0..written)
-        .map(|i| if i % 5 == 0 { fill } else { 100 + (i % 17) as i32 })
+        .map(|i| {
+            if i % 5 == 0 {
+                fill
+            } else {
+                100 + (i % 17) as i32
+            }
+        })
         .collect();
     {
         let file = hdf5::FileBuilder::new()
@@ -800,7 +806,15 @@ fn c_sparse_chunked_scale_offset_repacks_with_its_fill_value() {
 
     let mut want = head.clone();
     want.resize(n, fill);
-    assert_eq!(File::open(&dst).unwrap().dataset("data").unwrap().read_i32().unwrap(), want);
+    assert_eq!(
+        File::open(&dst)
+            .unwrap()
+            .dataset("data")
+            .unwrap()
+            .read_i32()
+            .unwrap(),
+        want
+    );
     assert_eq!(
         hdf5::File::open(&dst)
             .unwrap()
