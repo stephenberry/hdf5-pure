@@ -16,6 +16,7 @@ use core::num::NonZeroUsize;
 use crate::convert::{TryToUsize, nonzero_usize_from};
 use crate::error::FormatError;
 use crate::extensible_array::{EaGeometry, ExtensibleArrayHeader};
+use crate::fill_value::FillPattern;
 #[cfg(feature = "zfp")]
 use crate::filter_pipeline::FILTER_ZFP;
 use crate::filter_pipeline::{
@@ -378,16 +379,27 @@ pub struct ChunkedDataResult {
 }
 
 /// Split raw data into chunk-sized pieces based on shape and chunk dimensions.
-/// Returns a Vec of (chunk_offset_per_dim, chunk_raw_bytes).
+///
+/// Chunks are whole even where the dataset's edge falls inside one; the slots
+/// past that edge take `fill`. That is not cosmetic padding: an allocated chunk
+/// is expected to hold the dataset's fill value wherever nothing has been
+/// written, so those slots are what a reader returns once the dataset is
+/// extended into them. Passing [`FillPattern::ZERO`] where the dataset has no
+/// fill value keeps this on a plain zeroed allocation (issue #296).
+///
+/// `fill` is a parameter rather than a field on [`ChunkContext`] on purpose:
+/// every caller has to name it, so a new write path cannot inherit zeros by
+/// omission.
 pub fn split_into_chunks(
     raw_data: &[u8],
     shape: &[u64],
     chunk_dims: &[u64],
     element_size: NonZeroUsize,
-) -> Vec<Vec<u8>> {
+    fill: FillPattern<'_>,
+) -> Result<Vec<Vec<u8>>, FormatError> {
     let rank = shape.len();
     if rank == 0 {
-        return vec![raw_data.to_vec()];
+        return Ok(vec![raw_data.to_vec()]);
     }
 
     // Compute number of chunks per dimension
@@ -466,7 +478,22 @@ pub fn split_into_chunks(
             *slot = o as usize;
         }
 
+        // A chunk wholly inside the dataset has no slot the data will not reach,
+        // so it needs no fill: the row copies below overwrite every byte of it.
+        // For rank > 1 an "overhang" is not only a trailing run — a partial
+        // chunk has gaps between its in-bounds rows — which is why this asks
+        // whether the whole chunk is in bounds rather than trying to name the
+        // uncovered region.
+        let whole_chunk_in_bounds =
+            (0..rank).all(|d| offsets_us[d] + chunk_dims_us[d] <= shape_us[d]);
+
         let mut chunk_bytes = vec![0u8; chunk_total_elements * element_size.get()];
+        if !whole_chunk_in_bounds {
+            // Fill first, data over it: the rows copied below overwrite exactly
+            // the in-bounds region, leaving every uncovered slot holding the
+            // fill value.
+            fill.apply(&mut chunk_bytes)?;
+        }
 
         // In-bounds run length along the contiguous innermost dimension.
         let inner_row_len =
@@ -515,7 +542,7 @@ pub fn split_into_chunks(
         buffers.push(chunk_bytes);
     }
 
-    buffers
+    Ok(buffers)
 }
 
 /// Serialize a v4 single chunk layout message.
@@ -741,7 +768,7 @@ pub(crate) fn full_chunk_bytes(
 ///
 /// It is taken from the geometry rather than from the chunks that happen to have
 /// been written, because the two part company exactly where it matters. Every
-/// chunk [`split_into_chunks`] produces is zero-padded to the full chunk size,
+/// chunk [`split_into_chunks`] produces is padded to the full chunk size,
 /// so for one chunk or a thousand the largest `raw_size` *is* `chunk_bytes` and
 /// the two agree byte for byte. For **zero** chunks there is no `raw_size` to
 /// take a maximum of, and the fallback this used to apply — treat the largest
@@ -1941,6 +1968,7 @@ pub(crate) fn compress_chunks(
     ctx: ChunkContext<'_>,
     options: &ChunkOptions,
     maxshape: Option<&[u64]>,
+    fill: FillPattern<'_>,
 ) -> Result<CompressedChunkSet, FormatError> {
     let chunk_dims = ctx.chunk_dims;
     let element_size = nonzero_usize_from(ctx.element_size)?;
@@ -1951,7 +1979,7 @@ pub(crate) fn compress_chunks(
         ctx.scale_offset_type,
     )?;
 
-    let chunks = split_into_chunks(raw_data, shape, chunk_dims, element_size);
+    let chunks = split_into_chunks(raw_data, shape, chunk_dims, element_size, fill)?;
     let num_chunks = chunks.len();
     let has_filters = pipeline.is_some();
 
@@ -2243,8 +2271,9 @@ pub fn build_chunked_data_at_ext(
     options: &ChunkOptions,
     base_address: u64,
     maxshape: Option<&[u64]>,
+    fill: FillPattern<'_>,
 ) -> Result<ChunkedDataResult, FormatError> {
-    let set = compress_chunks(raw_data, shape, ctx, options, maxshape)?;
+    let set = compress_chunks(raw_data, shape, ctx, options, maxshape, fill)?;
     assemble_chunked_at(&set, base_address)
 }
 
@@ -2588,7 +2617,9 @@ mod tests {
     }
 
     /// Every chunk [`split_into_chunks`] produces is exactly one whole chunk of
-    /// bytes — edge overhang zero-filled, never truncated to the in-bounds part.
+    /// bytes — the edge overhang is padded, never truncated to the in-bounds
+    /// part. What it is padded *with* is the dataset's fill value and does not
+    /// matter here; the length is what this rests on.
     ///
     /// This is the equivalence that makes deriving the chunk-index element width
     /// from the geometry ([`full_chunk_bytes`]) the *same answer* the old
@@ -2600,6 +2631,51 @@ mod tests {
     /// Swept over shapes that divide evenly and shapes that overhang in the
     /// innermost dimension, an outer one, and both at once, since a truncated
     /// edge chunk is the only way this could fail.
+    /// An unreadable Fill Value message leaves what a chunk's uncovered slots
+    /// must hold *undetermined*, which is not the same answer as "zeros" — and
+    /// unlike a read of unallocated storage, writing the guess puts it on disk.
+    /// So the split refuses.
+    ///
+    /// It refuses only where the answer is needed. A dataset whose chunks all
+    /// fall wholly inside it has no uncovered slot, never consults the pattern,
+    /// and stays writable — the same scoping the read path uses, where a
+    /// fully-allocated dataset reads fine however unreadable its fill message.
+    #[test]
+    fn an_unknown_fill_refuses_only_the_chunks_that_need_padding() {
+        let elem = nz(4);
+        let data = vec![0u8; 8 * 4];
+
+        // 8 elements in chunks of 4: two whole chunks, nothing uncovered.
+        assert!(
+            split_into_chunks(&data, &[8], &[4], elem, FillPattern::UNKNOWN).is_ok(),
+            "a write that pads nothing must not consult the fill value"
+        );
+
+        // 5 elements in chunks of 4: the second chunk has three uncovered slots.
+        assert!(matches!(
+            split_into_chunks(&data[..5 * 4], &[5], &[4], elem, FillPattern::UNKNOWN),
+            Err(FormatError::UnreadableFillValue)
+        ));
+
+        // Rank > 1: whole along the inner dimension, short along the outer, so
+        // the uncovered region is whole rows rather than a trailing run.
+        assert!(matches!(
+            split_into_chunks(
+                &data[..3 * 2 * 4],
+                &[3, 2],
+                &[2, 2],
+                elem,
+                FillPattern::UNKNOWN
+            ),
+            Err(FormatError::UnreadableFillValue)
+        ));
+
+        // The known patterns are unaffected either way.
+        for pattern in [FillPattern::ZERO, FillPattern::new(Some(&[7u8; 4]), elem)] {
+            assert!(split_into_chunks(&data[..5 * 4], &[5], &[4], elem, pattern).is_ok());
+        }
+    }
+
     #[test]
     fn every_split_chunk_is_a_whole_chunk() {
         let cases: &[(&[u64], &[u64])] = &[
@@ -2617,7 +2693,9 @@ mod tests {
                 let n: u64 = shape.iter().product();
                 let raw = vec![0u8; (n as usize) * elem];
                 let expected = full_chunk_bytes(chunk_dims.iter().copied(), nz(elem));
-                let chunks = split_into_chunks(&raw, shape, chunk_dims, nz(elem));
+                let chunks =
+                    split_into_chunks(&raw, shape, chunk_dims, nz(elem), FillPattern::ZERO)
+                        .unwrap();
                 assert!(
                     !chunks.is_empty(),
                     "shape {shape:?} chunk {chunk_dims:?} must produce chunks"
@@ -2715,8 +2793,15 @@ mod tests {
             let elems: usize = shape.iter().product::<u64>().to_usize().unwrap();
             let raw = f64_to_bytes(&(0..elems).map(|i| i as f64).collect::<Vec<f64>>());
             let ctx = ChunkContext::basic(chunk_dims, 8);
-            let set =
-                compress_chunks(&raw, shape, ctx, &ChunkOptions::default(), maxshape).unwrap();
+            let set = compress_chunks(
+                &raw,
+                shape,
+                ctx,
+                &ChunkOptions::default(),
+                maxshape,
+                FillPattern::ZERO,
+            )
+            .unwrap();
 
             for base in [0u64, 0x1000, 0x1234_5678] {
                 let measured = measure_chunked_at(&set, base).unwrap();
@@ -2746,8 +2831,16 @@ mod tests {
         let raw = f64_to_bytes(values);
         let base_address = 0x1000u64;
         let ctx = ChunkContext::basic(chunk_dims, 8);
-        let result =
-            build_chunked_data_at_ext(&raw, shape, ctx, options, base_address, None).unwrap();
+        let result = build_chunked_data_at_ext(
+            &raw,
+            shape,
+            ctx,
+            options,
+            base_address,
+            None,
+            FillPattern::ZERO,
+        )
+        .unwrap();
 
         // Build a fake file buffer
         let file_size = base_address as usize + result.data_bytes.len();
@@ -2789,7 +2882,7 @@ mod tests {
     #[test]
     fn split_1d_single_chunk() {
         let data = f64_to_bytes(&[1.0, 2.0, 3.0]);
-        let result = split_into_chunks(&data, &[3], &[3], nz(8));
+        let result = split_into_chunks(&data, &[3], &[3], nz(8), FillPattern::ZERO).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(bytes_to_f64(&result[0]), vec![1.0, 2.0, 3.0]);
     }
@@ -2798,7 +2891,7 @@ mod tests {
     fn split_1d_multiple_chunks() {
         let values: Vec<f64> = (0..10).map(|i| i as f64).collect();
         let data = f64_to_bytes(&values);
-        let result = split_into_chunks(&data, &[10], &[4], nz(8));
+        let result = split_into_chunks(&data, &[10], &[4], nz(8), FillPattern::ZERO).unwrap();
         assert_eq!(result.len(), 3); // ceil(10/4) = 3
         // Contents in chunk order, which is what the offsets this used to return
         // encoded: chunk `i` starts at element `4 * i`.
@@ -2813,7 +2906,7 @@ mod tests {
         // 4x4 dataset, 2x2 chunks -> 4 chunks
         let values: Vec<f64> = (0..16).map(|i| i as f64).collect();
         let data = f64_to_bytes(&values);
-        let result = split_into_chunks(&data, &[4, 4], &[2, 2], nz(8));
+        let result = split_into_chunks(&data, &[4, 4], &[2, 2], nz(8), FillPattern::ZERO).unwrap();
         assert_eq!(result.len(), 4);
         // Row-major chunk order, asserted by content rather than by the offsets
         // this used to return: every chunk, so the ordering is pinned end to end
@@ -2916,7 +3009,9 @@ mod tests {
         };
         let dims = [7u64];
         let ctx = ChunkContext::basic(&dims, 8);
-        let result = build_chunked_data_at_ext(&raw, &[21], ctx, &options, 0x1000, None).unwrap();
+        let result =
+            build_chunked_data_at_ext(&raw, &[21], ctx, &options, 0x1000, None, FillPattern::ZERO)
+                .unwrap();
 
         // Unfiltered chunks are stored verbatim, so the data region opens with
         // the raw bytes in order.
@@ -3388,9 +3483,16 @@ mod tests {
             ..Default::default()
         };
         let ctx = ChunkContext::basic(chunk_dims, 8);
-        let result =
-            build_chunked_data_at_ext(&raw, shape, ctx, &options, base_address, Some(maxshape))
-                .unwrap();
+        let result = build_chunked_data_at_ext(
+            &raw,
+            shape,
+            ctx,
+            &options,
+            base_address,
+            Some(maxshape),
+            FillPattern::ZERO,
+        )
+        .unwrap();
 
         let file_size = base_address as usize + result.data_bytes.len();
         let mut file_data = vec![0u8; file_size];
@@ -3555,6 +3657,7 @@ mod tests {
                         ChunkContext::basic(&dims, 8),
                         &options,
                         maxshape.as_ref().map(<[u64; 1]>::as_slice),
+                        FillPattern::ZERO,
                     )
                     .unwrap();
 

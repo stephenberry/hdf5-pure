@@ -36,6 +36,7 @@ use crate::dataspace::Dataspace;
 use crate::datatype::Datatype;
 use crate::error::{Error, FormatError};
 use crate::extensible_array::{EaGeometry, ExtensibleArrayHeader};
+use crate::fill_value::FillPattern;
 use crate::filter_pipeline::FilterPipeline;
 use crate::filters::{ChunkContext, FilterScratch, compress_chunk_with, decompress_chunk};
 use crate::message_type::MessageType;
@@ -188,6 +189,11 @@ pub(crate) struct MessageSpans {
     pub datatype: (u64, usize),
     /// `(data_off, size)` of the Filter Pipeline message, when present.
     pub filter: Option<(u64, usize)>,
+    /// The Fill Value message, when present: its type (which distinguishes the
+    /// versioned form from the legacy one) and `(data_off, size)`. An append
+    /// needs it because the overhang of the chunk it completes must hold the
+    /// dataset's fill value rather than zeros (issue #296).
+    pub fill: Option<(MessageType, u64, usize)>,
 }
 
 /// Result of locating a dataset: its maintained geometry plus the message spans
@@ -277,6 +283,17 @@ impl Located {
             .messages
             .iter()
             .find(|m| m.msg_type == MessageType::FilterPipeline);
+        // The versioned message wins over the legacy one when a header carries
+        // both, matching how the read path picks.
+        let fill_msg = walk
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::FillValue)
+            .or_else(|| {
+                walk.messages
+                    .iter()
+                    .find(|m| m.msg_type == MessageType::FillValueOld)
+            });
 
         // Each of these is parsed below as though its bytes were the message. A
         // *shared* record's body is a reference to a message stored elsewhere —
@@ -414,6 +431,7 @@ impl Located {
             spans: MessageSpans {
                 datatype: (datatype_msg.data_off, datatype_msg.size),
                 filter: filter_msg.map(|m| (m.data_off, m.size)),
+                fill: fill_msg.map(|m| (m.msg_type, m.data_off, m.size)),
             },
         })
     }
@@ -927,6 +945,7 @@ pub(crate) fn plan_ea_append<F: Store>(
     pipeline: Option<&FilterPipeline>,
     raw: &[u8],
     new_elems: u64,
+    fill: FillPattern<'_>,
 ) -> Result<AppendPlan, Error> {
     let chunk_elems = loc.chunk_elems;
     let current_dim = loc.current_dim;
@@ -1003,10 +1022,12 @@ pub(crate) fn plan_ea_append<F: Store>(
     }
     tail_raw.extend_from_slice(raw);
 
-    // Split the tail into full chunk buffers (edge overhang zero-filled) and
-    // compress each through the pipeline when filtered.
+    // Split the tail into full chunk buffers and compress each through the
+    // pipeline when filtered. The final chunk's slots past the new dimension
+    // take the dataset's fill value (issue #296).
     let tail_len_elems = new_dim - n_full * chunk_elems;
-    let split = split_into_chunks(&tail_raw, &[tail_len_elems], spatial, element_size);
+    let split = split_into_chunks(&tail_raw, &[tail_len_elems], spatial, element_size, fill)
+        .map_err(Error::Format)?;
     let new_chunk_bytes: Vec<Vec<u8>> = if let Some(pl) = pipeline {
         let ctx = ChunkContext::from_datatype(spatial, datatype)?;
         let mut out = Vec::with_capacity(split.len());
@@ -1493,6 +1514,7 @@ mod tests {
             None,
             &raw,
             new_elems,
+            FillPattern::ZERO,
         )
         .unwrap();
         apply_ea_append(store, loc, &plan, 4).unwrap();
