@@ -79,6 +79,16 @@ pub(crate) struct ChunkGrid {
     /// in the constructor so that a count too large to represent is a refusal
     /// there rather than something an accessor has to report out of band.
     slots: Option<u64>,
+    /// Whether a dimension the numbering multiplies across holds no chunks at
+    /// all, which makes the multipliers below it zero and the decode's division
+    /// undefined.
+    ///
+    /// Not a refusal in the constructor, because such a grid is legal and
+    /// ordinary: a zero-element dataset of shape `[4, 0]` has no chunks, so it
+    /// has no slot to number and never asks for one. It is only a crafted file —
+    /// a zero maximum extent beside a non-zero current one — that reaches the
+    /// division, and that is refused where the division is.
+    unnumberable: bool,
 }
 
 impl ChunkGrid {
@@ -139,6 +149,7 @@ impl ChunkGrid {
             }
         };
 
+        let mut unnumberable = false;
         let mut down = vec![1u64; rank];
         for i in (0..rank.saturating_sub(1)).rev() {
             let next = counts[dim_at(i + 1, rotated)].ok_or_else(|| {
@@ -148,7 +159,11 @@ impl ChunkGrid {
                         .into(),
                 )
             })?;
-            down[i] = down[i + 1].checked_mul(next).ok_or_else(|| {
+            // A zero count makes this and every multiplier below it zero; see
+            // `unnumberable`. Multiply by one instead so the rest of the layout
+            // is still described, and let the decode refuse.
+            unnumberable |= next == 0;
+            down[i] = down[i + 1].checked_mul(next.max(1)).ok_or_else(|| {
                 FormatError::ChunkedReadError(
                     "maximum shape describes more chunks than can be numbered".into(),
                 )
@@ -176,6 +191,7 @@ impl ChunkGrid {
             rotated,
             down,
             slots,
+            unnumberable,
         })
     }
 
@@ -192,6 +208,7 @@ impl ChunkGrid {
     /// The element slot the chunk at `coords` (chunk coordinates, not element
     /// offsets) occupies.
     pub(crate) fn slot_of(&self, coords: &[u64]) -> Result<u64, FormatError> {
+        self.check_numberable()?;
         if coords.len() != self.chunk_dims.len() {
             return Err(FormatError::ChunkedReadError(
                 "chunk coordinates do not match the grid's rank".into(),
@@ -222,12 +239,26 @@ impl ChunkGrid {
     /// dataspace (an interrupted append), or a malformed file. Dropping it here
     /// is what keeps it from being scattered past the dataset's bounds.
     pub(crate) fn offsets_in_extent(&self, slot: u64) -> Result<Option<Vec<u64>>, FormatError> {
+        self.check_numberable()?;
         let offsets = self.offsets_at(slot)?;
         Ok(offsets
             .iter()
             .zip(&self.dims)
             .all(|(o, d)| o < d)
             .then_some(offsets))
+    }
+
+    /// Refuse a grid that cannot number a slot; see
+    /// [`unnumberable`](Self::unnumberable).
+    fn check_numberable(&self) -> Result<(), FormatError> {
+        if self.unnumberable {
+            return Err(FormatError::ChunkedReadError(
+                "this chunked dataset has a dimension of no chunks at all, so its chunk index \
+                 numbers nothing; a slot in it cannot be resolved"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     /// The logical offsets — the first element's coordinate in each dimension,
@@ -431,6 +462,27 @@ mod tests {
             format!("{err}").contains("only one unlimited dimension"),
             "{err}"
         );
+    }
+
+    /// A dimension of no chunks at all makes every multiplier below it zero, and
+    /// the decode divides by those. A crafted file can name a maximum extent of
+    /// zero beside a non-zero current one, and this used to reach the division:
+    /// before the maximum shape entered the numbering at all, the same file read
+    /// as ordinary data.
+    #[test]
+    fn a_zero_maximum_extent_is_refused_rather_than_divided_by() {
+        // Constructing it is fine: a zero-element dataset of shape [4, 0] builds
+        // exactly this grid, has no chunks, and never asks for a slot.
+        let g = ChunkGrid::new(&[2, 8], &[4, 0], None, GridOrder::RowMajor).unwrap();
+        // Asking for one is where the division would be, so that is refused.
+        let err = g.offsets_in_extent(0).unwrap_err();
+        assert!(format!("{err}").contains("numbers nothing"), "{err}");
+        assert!(format!("{}", g.slot_of(&[0, 0]).unwrap_err()).contains("numbers nothing"));
+
+        // The *leading* dimension is the one no multiplier crosses, so a zero
+        // count there divides nothing and stays numberable.
+        let g = ChunkGrid::new(&[2, 2], &[3, 4], Some(&[0, 4]), GridOrder::RowMajor).unwrap();
+        assert_eq!(g.offsets_in_extent(0).unwrap(), Some(vec![0, 0]));
     }
 
     /// A maximum shape can describe more chunks than a `u64` can number. The

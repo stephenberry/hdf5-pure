@@ -349,10 +349,9 @@ fn read_data_block_elements(
     // whose `dblk_nelmts` exceeds the page size) are handled separately by
     // `read_paged_data_block`, which is driven by the page-init bitmap stored
     // in the owning super block.
-    // Read only as many elements as the dataset count allows. A SWMR writer may
-    // have written element slots beyond the published count (it grows the block
-    // before bumping the count); those must be ignored, otherwise their linear
-    // indices wrap modulo the current chunk-grid and overwrite earlier chunks.
+    // Read only as many elements as the published count allows. A SWMR writer
+    // may have written element slots beyond it (it grows the block before
+    // bumping the count), and those slots hold whatever was there before.
     let limit = total_elements.saturating_sub(start_index).min(nelmts);
     let mut chunks = Vec::new();
     for i in 0..limit {
@@ -426,16 +425,28 @@ fn read_paged_data_block(
 
     let mut chunks = Vec::new();
     let mut pos = db_offset + db_header_size;
+    // Every page occupies its full stride whether or not it was initialized, so
+    // an uninitialized one is stepped over rather than treated as the end of the
+    // block. The reference library populates pages in whatever order chunks are
+    // written, and a dataset whose maximum shape is wider than its shape leaves
+    // gaps between them — so the first cleared bit is not the last page (issue
+    // #299). This is the same walk `fixed_array` does.
+    let page_stride = page_nelmts
+        .checked_mul(ea_elem_stride(header, offset_size))
+        .and_then(|bytes| bytes.checked_add(4))
+        .ok_or(FormatError::OffsetOverflow {
+            offset: page_nelmts as u64,
+            length: ea_elem_stride(header, offset_size) as u64,
+        })?;
     for page in 0..npages {
         let global_page = db_local_idx * npages + page;
         if !page_is_initialized(page_bitmap, global_page) {
-            // Pages are populated sequentially; nothing initialized after this.
-            break;
+            pos += page_stride;
+            continue;
         }
         let page_start = start_index + page * page_nelmts;
-        // Ignore element slots beyond the published count (a writer may have
-        // written ahead of bumping the count); their wrapped linear indices
-        // would otherwise overwrite earlier chunks.
+        // Ignore element slots beyond the published count; see the same bound
+        // in `read_data_block_elements`.
         let limit = total_elements.saturating_sub(page_start).min(page_nelmts);
         for i in 0..limit {
             let (info, consumed) = read_element(
@@ -1150,13 +1161,14 @@ fn read_paged_data_block_from_source<S: Source + ?Sized>(
             length: elem_stride as u64,
         })?;
 
-    // Pages are populated sequentially; read only the leading initialized pages.
+    // Read through the *last* initialized page rather than the first
+    // uninitialized one: pages are not populated in order once the chunk grid
+    // has gaps, and each occupies its full stride regardless (issue #299).
     let mut init_pages = 0usize;
     for page in 0..npages {
-        if !page_is_initialized(page_bitmap, db_local_idx * npages + page) {
-            break;
+        if page_is_initialized(page_bitmap, db_local_idx * npages + page) {
+            init_pages = page + 1;
         }
-        init_pages += 1;
     }
     // Clamp to the bytes actually available (the final partial page may omit its
     // trailing checksum).
@@ -1184,7 +1196,8 @@ fn read_paged_data_block_from_source<S: Source + ?Sized>(
     for page in 0..npages {
         let global_page = db_local_idx * npages + page;
         if !page_is_initialized(page_bitmap, global_page) {
-            break;
+            pos += page_stride;
+            continue;
         }
         let page_start = start_index + page * page_nelmts;
         let limit = total_elements.saturating_sub(page_start).min(page_nelmts);
@@ -1374,6 +1387,37 @@ mod tests {
         buf[4] = 1;
         let result = ExtensibleArrayHeader::parse(&buf, 0, 8, 8);
         assert!(result.is_err());
+    }
+
+    /// A grid with a dimension of no chunks reaches the reader as a refusal, not
+    /// as a division by zero.
+    ///
+    /// A crafted dataspace can name a maximum extent of zero beside a non-zero
+    /// current one. Before the maximum shape entered the numbering that file read
+    /// as ordinary data; it must now be refused rather than panic, since
+    /// `fuzz_targets/parse_file.rs` drives exactly this path.
+    #[test]
+    fn a_dimension_of_no_chunks_refuses_rather_than_dividing_by_zero() {
+        let chunks = [crate::chunked_write::WrittenChunk {
+            address: 0x1000,
+            compressed_size: 8,
+            filter_mask: 0,
+        }];
+        let slots = crate::chunked_write::IndexSlots::dense(&chunks);
+        let ea =
+            crate::chunked_write::build_extensible_array_at(&slots, 16, 8, 8, false, 0).unwrap();
+        let header = ExtensibleArrayHeader::parse(&ea, 0, 8, 8).unwrap();
+
+        // Maximum extent 0 in the trailing dimension, current extent 4.
+        let grid = ChunkGrid::new(
+            &[2, 2],
+            &[3, 4],
+            Some(&[u64::MAX, 0]),
+            crate::chunk_grid::GridOrder::UnlimitedFirst,
+        )
+        .unwrap();
+        let err = read_extensible_array_chunks(&ea, &header, &grid, &[2, 2], 4, 8, 8).unwrap_err();
+        assert!(format!("{err}").contains("numbers nothing"), "{err}");
     }
 
     /// The Extensible Array twin of

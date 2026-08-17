@@ -382,20 +382,23 @@ pub struct WrittenChunk {
     pub filter_mask: u32,
 }
 
-/// The most element slots this writer will span with one chunk index.
+/// The most *unused* element slots this writer will put in one chunk index.
 ///
-/// A Fixed Array declares a slot for every chunk the *maximum* shape allows —
-/// not for every chunk stored — and this writer emits the whole array in one
-/// pass rather than growing it a page at a time as the reference library does.
-/// A maximum shape far past the data therefore costs file space in proportion to
-/// the maximum: eight bytes a slot before filters, and the array is written
-/// whether or not a chunk ever lands in it.
+/// A Fixed Array declares a slot for every chunk the maximum shape allows — not
+/// for every chunk stored — and an Extensible Array reaches the highest slot
+/// used. This writer emits the whole structure in one pass rather than growing
+/// it a block at a time as the reference library does, so every slot between the
+/// chunks is written to the file too, at eight bytes apiece before filters.
 ///
-/// Past this bound that is a mistake worth naming rather than a file worth
-/// writing. A dimension meant to grow without a known limit should say so —
-/// `u64::MAX` in the maximum shape — which selects an Extensible Array and costs
-/// only the slots the data actually reaches.
-const MAX_INDEX_SLOTS: u64 = 1 << 22;
+/// The bound is on the unused slots rather than on all of them, because the
+/// slots that hold chunks are paid for by the chunks: a dataset of four million
+/// chunks needs a four-million-element index whatever its maximum shape says,
+/// and a bound on the total would refuse it even with no maximum shape at all.
+///
+/// Unused slots come from one place — a maximum shape wider than the shape in a
+/// dimension other than the one the dataset grows along — and past this bound
+/// that is a geometry worth naming rather than a file worth writing.
+const MAX_UNUSED_INDEX_SLOTS: u64 = 1 << 22;
 
 /// A chunk index's element slots: which chunk occupies each one, and how many
 /// slots the index spans.
@@ -424,7 +427,7 @@ impl<'a> IndexSlots<'a> {
     /// `slot_of[i]`.
     ///
     /// `len` comes from [`plan_index_slots`], which is where the span is
-    /// decided and where a span past [`MAX_INDEX_SLOTS`] is refused; what is
+    /// decided and where a span with too many unused slots is refused; what is
     /// left to refuse here is a span this platform's `usize` cannot address,
     /// which is what lets every caller below treat it as a plain `usize`.
     pub(crate) fn new(
@@ -1366,7 +1369,7 @@ pub(crate) fn build_eadb(
     client_id: u8,
     page_nelmts: usize,
     blk_off_size: usize,
-) -> (Vec<u8>, usize) {
+) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(b"EADB");
     buf.push(0); // version
@@ -1385,7 +1388,7 @@ pub(crate) fn build_eadb(
         }
         let cks = jenkins_lookup3(&buf);
         buf.extend_from_slice(&cks.to_le_bytes());
-        (buf, 0)
+        buf
     } else {
         // Paged: the header has its own checksum, then full pages follow. We
         // reserve every page (matching the C library's allocation) and report
@@ -1395,11 +1398,9 @@ pub(crate) fn build_eadb(
         buf.extend_from_slice(&header_cks.to_le_bytes());
 
         let npages = dblk_nelmts / page_nelmts;
-        let mut pages_init = 0usize;
         for page in 0..npages {
             let page_start = elem_start + page * page_nelmts;
             let mut page_buf = Vec::new();
-            let mut has_real = false;
             for slot in 0..page_nelmts {
                 if let Some(chunk) = slots.at(page_start + slot) {
                     write_chunk_element(
@@ -1409,7 +1410,6 @@ pub(crate) fn build_eadb(
                         has_filters,
                         chunk_size_bytes,
                     );
-                    has_real = true;
                 } else {
                     write_undefined_element(
                         &mut page_buf,
@@ -1422,11 +1422,8 @@ pub(crate) fn build_eadb(
             let page_cks = jenkins_lookup3(&page_buf);
             page_buf.extend_from_slice(&page_cks.to_le_bytes());
             buf.extend_from_slice(&page_buf);
-            if has_real {
-                pages_init += 1;
-            }
         }
-        (buf, pages_init)
+        buf
     }
 }
 
@@ -1817,7 +1814,7 @@ pub fn build_extensible_array_at(
             continue;
         }
         let addr = body_base + body.len() as u64;
-        let (db_bytes, _) = build_eadb(
+        let db_bytes = build_eadb(
             slots,
             elem_cursor.to_usize()?,
             dblk_nelmts.to_usize()?,
@@ -1879,7 +1876,7 @@ pub fn build_extensible_array_at(
                 continue;
             }
             let addr = body_base + body.len() as u64;
-            let (db_bytes, pages_init) = build_eadb(
+            let db_bytes = build_eadb(
                 slots,
                 local_elem.to_usize()?,
                 dblk_nelmts.to_usize()?,
@@ -1898,7 +1895,16 @@ pub fn build_extensible_array_at(
             body.extend_from_slice(&db_bytes);
             sb_dblk_addrs.push(addr);
             if is_paged {
-                for p in 0..pages_init {
+                // Every page of the block was just written, so every page is
+                // initialized. The bit describes the *page*, not the data in it:
+                // a page whose slots are all undefined is still a page the
+                // reader steps over, and clearing its bit makes the reader skip
+                // bytes rather than chunks. This marked the leading `n` pages
+                // for a block holding `n` pages' worth of chunks, which is the
+                // same thing only while the array has no gaps — true of every
+                // Extensible Array this crate wrote until it began numbering
+                // slots over the maximum grid (issue #299).
+                for p in 0..npages.to_usize()? {
                     let global_page = (db_local * npages).to_usize()? + p;
                     page_bitmap[global_page / 8] |= 0x80 >> (global_page % 8);
                 }
@@ -2207,12 +2213,15 @@ pub(crate) fn plan_index_slots(
         })?,
         _ => slot_of_chunk.iter().max().map_or(0, |s| s + 1),
     };
-    if index_slots > MAX_INDEX_SLOTS {
+    let unused = index_slots.saturating_sub(num_chunks as u64);
+    if unused > MAX_UNUSED_INDEX_SLOTS {
         return Err(FormatError::ChunkedReadError(format!(
-            "this maximum shape needs a chunk index of {index_slots} elements for {num_chunks} \
-             stored chunk(s), past the {MAX_INDEX_SLOTS} this writer emits in one pass; give the \
-             dimension that grows an unlimited maximum (u64::MAX) instead, which is indexed as \
-             it is reached"
+            "this shape and maximum shape need a chunk index of {index_slots} elements to hold \
+             {num_chunks} chunk(s), leaving {unused} of them unused; this writer emits the whole \
+             index in one pass, so those are written to the file as well. The unused elements \
+             come from the maximum shape exceeding the shape in a dimension other than the one \
+             the dataset grows along — chunk those dimensions more coarsely, or declare no \
+             maximum for them"
         )));
     }
     Ok((kind, slot_of_chunk, index_slots))
@@ -2673,7 +2682,8 @@ pub(crate) fn plan_chunked_data_verbatim(
     let (kind, slot_of_chunk, index_slots) = plan_index_slots(shape, chunk_dims, maxshape)?;
     if slot_of_chunk.len() != num_chunks {
         return Err(FormatError::ChunkedReadError(format!(
-            "a verbatim chunked dataset of shape {shape:?} holds {} chunks, not the {num_chunks}              it was given",
+            "a verbatim chunked dataset of shape {shape:?} holds {} chunks, not the \
+             {num_chunks} it was given",
             slot_of_chunk.len(),
         )));
     }
@@ -2954,6 +2964,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The index-size bound counts the slots that hold no chunk, not the slots.
+    ///
+    /// A dataset of four million chunks needs a four-million-element index
+    /// whatever its maximum shape says, so a bound on the total refuses a
+    /// perfectly ordinary dataset that names no maximum at all. Asserted here
+    /// rather than through a file because writing that dataset costs 50 MB and
+    /// the arithmetic is the whole claim.
+    #[test]
+    fn the_index_bound_counts_unused_slots_rather_than_all_of_them() {
+        let many = (MAX_UNUSED_INDEX_SLOTS + 1) as usize;
+
+        // No maximum shape, and one chunk per slot: nothing unused.
+        let (kind, slots, span) =
+            plan_index_slots(&[many as u64], &[1], None).expect("a dense index is not bounded");
+        assert!(matches!(kind, ChunkIndexKind::FixedArray));
+        assert_eq!(slots.len(), many);
+        assert_eq!(span, many as u64);
+
+        // The same span reached by a maximum shape instead, holding one chunk:
+        // every other slot is unused, and that is what the bound is for.
+        let err = plan_index_slots(&[1], &[1], Some(&[many as u64 + 1])).unwrap_err();
+        let text = format!("{err}");
+        assert!(text.contains("unused"), "{text}");
+
+        // And a maximum shape wider only along the dimension that grows costs no
+        // unused slots however far it reaches, so it stays accepted.
+        plan_index_slots(&[8, 8], &[4, 4], Some(&[u64::MAX, 8]))
+            .expect("growth along the indexed dimension leaves no gaps");
     }
 
     /// Auto-chunking resolves the chunk to the whole shape, so a zero-element

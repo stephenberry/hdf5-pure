@@ -340,14 +340,14 @@ fn two_unlimited_dimensions_are_refused_in_a_session_too() {
     );
 }
 
-/// A maximum shape enormously wider than the shape is refused rather than
-/// written.
+/// A maximum shape whose chunk index would be mostly empty is refused rather
+/// than written.
 ///
 /// A Fixed Array declares a slot for every chunk the maximum allows, so this
 /// dataset of four chunks would otherwise ask for an index of 10^12 elements.
-/// The refusal names the unlimited maximum as the thing to use instead.
+/// The refusal names where the unused elements come from.
 #[test]
-fn a_maximum_shape_needing_an_enormous_index_is_refused() {
+fn a_maximum_shape_needing_a_mostly_empty_index_is_refused() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("huge.h5");
     let mut b = FileBuilder::new();
@@ -359,15 +359,16 @@ fn a_maximum_shape_needing_an_enormous_index_is_refused() {
     let err = b.write(&path).unwrap_err();
     let text = format!("{err}");
     assert!(text.contains("chunk index"), "{text}");
-    assert!(text.contains("unlimited"), "{text}");
+    assert!(text.contains("unused"), "{text}");
 
-    // The same growth expressed as an unlimited dimension is accepted, and is
-    // what the refusal points the caller at.
+    // Room to grow along the dimension the dataset grows in costs no unused
+    // elements at all, however far it reaches — that is the shape the refusal
+    // points at, and it is accepted.
     let mut b = FileBuilder::new();
     b.create_dataset("d")
         .with_u32_data(&values(&[3, 3]))
         .with_shape(&[3, 3])
-        .with_maxshape(&[U, 2_000_000])
+        .with_maxshape(&[U, 3])
         .with_chunks(&[2, 2]);
     b.write(&path).unwrap();
     assert_eq!(c_read(&path), values(&[3, 3]));
@@ -480,6 +481,126 @@ fn a_shrinking_inplace_overwrite_keeps_each_chunk_in_its_slot() {
         "the overwrite must fit its slots, or it relocates and tests a different path"
     );
 
+    assert_eq!(pure_read(&path), tidy);
+    assert_eq!(c_read(&path), tidy);
+}
+
+/// A gap in an Extensible Array can leave a *paged* data block whose first page
+/// holds no chunk, and every page of a written block is an initialized page.
+///
+/// The page-init bitmap says which pages of a data block exist to be stepped
+/// over. Marking the leading `n` of them for a block holding `n` pages' worth of
+/// chunks says the same thing only while the array is gapless, which it stopped
+/// being when slots started being numbered over the maximum grid. The chunks in
+/// the pages after the gap then belong to no page any reader visits.
+///
+/// The geometry has to be this big: a data block is paged only past 1,024
+/// elements, so the array must span enough slots to reach one. The chunks are
+/// few; it is the span between them that costs, and about a megabyte of index is
+/// the cheapest this defect can be reproduced for.
+#[test]
+fn a_paged_data_block_with_an_empty_first_page_keeps_its_chunks() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("paged.h5");
+    let shape = [40u64, 40];
+    let data = values(&shape);
+    let mut b = FileBuilder::new();
+    b.create_dataset("d")
+        .with_u32_data(&data)
+        .with_shape(&shape)
+        .with_chunks(&[1, 1])
+        .with_maxshape(&[U, 3500]);
+    b.write(&path).unwrap();
+
+    assert_eq!(pure_read(&path), data, "pure read");
+    assert_eq!(c_read(&path), data, "C read");
+}
+
+/// The reading half of the same fact: the reference library populates the pages
+/// of a data block in whatever order chunks are written, so a cleared bit is a
+/// page to step over rather than the end of the block.
+///
+/// Both of this crate's readers are asserted, because the buffered one walks the
+/// pages from a byte slice and the streaming one sizes a read around them —
+/// different code, same rule.
+#[test]
+fn pure_reads_a_c_written_block_whose_pages_are_not_leading() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("c_paged.h5");
+    let shape = [40u64, 40];
+    let data = values(&shape);
+    c_write(&path, &shape, &[1, 1], &[U, 12_000]);
+
+    assert_eq!(
+        hdf5_pure::File::open(&path)
+            .unwrap()
+            .dataset("d")
+            .unwrap()
+            .read_u32()
+            .unwrap(),
+        data,
+        "buffered reader"
+    );
+    assert_eq!(
+        hdf5_pure::File::open_streaming(&path)
+            .unwrap()
+            .dataset("d")
+            .unwrap()
+            .read_u32()
+            .unwrap(),
+        data,
+        "streaming reader"
+    );
+}
+
+/// The Extensible Array arm of the in-place index rebuild, alongside the Fixed
+/// Array arm above. The two arms are separate match arms over separate builders,
+/// so one passing says nothing about the other.
+#[test]
+fn a_shrinking_inplace_overwrite_keeps_ea_chunks_in_their_slots() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("shrink_ea.h5");
+
+    let noisy: Vec<u32> = (0..64u32)
+        .map(|i| i.wrapping_mul(2_654_435_761) ^ (i << 7))
+        .collect();
+    let mut b = FileBuilder::new();
+    b.create_dataset("d")
+        .with_u32_data(&noisy)
+        .with_shape(&[8, 8])
+        .with_maxshape(&[U, 16])
+        .with_chunks(&[4, 4])
+        .with_deflate(6);
+    b.write(&path).unwrap();
+    assert_eq!(
+        hdf5_pure::File::open(&path)
+            .unwrap()
+            .dataset("d")
+            .unwrap()
+            .chunk_index()
+            .unwrap(),
+        Some(ChunkIndex::ExtensibleArray),
+        "this fixture exists to exercise the extensible arm"
+    );
+    let size_before = std::fs::metadata(&path).unwrap().len();
+
+    let tidy: Vec<u32> = (1..=64).collect();
+    {
+        let session = hdf5_pure::File::open_rw(&path).unwrap();
+        session
+            .dataset("d")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_u32_data(&tidy).with_shape(&[8, 8]);
+            })
+            .unwrap();
+        session.commit().unwrap();
+    }
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        size_before,
+        "the overwrite must fit its slots, or it relocates and tests a different path"
+    );
     assert_eq!(pure_read(&path), tidy);
     assert_eq!(c_read(&path), tidy);
 }
