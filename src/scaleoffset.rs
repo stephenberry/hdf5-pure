@@ -238,6 +238,17 @@ pub fn build_cd_values(
         }
     };
 
+    // The same 1..=8-byte scalars [`Parms::parse`] accepts on the way back in.
+    // Stated here rather than left to the datatype that produced `ty`, because
+    // the two arrive as separate arguments: a wider one would run the fill value
+    // off the end of the parameter array, which is what makes
+    // [`write_fill_bits`] safe to write without a bound of its own.
+    if size == 0 || size > 8 {
+        return Err(FormatError::FilterError(format!(
+            "scaleoffset: unsupported datatype size {size}"
+        )));
+    }
+
     let mut cd = vec![0u32; TOTAL_NPARMS];
     cd[PARM_SCALETYPE] = scale_type;
     cd[PARM_SCALEFACTOR] = scale_factor;
@@ -1654,6 +1665,22 @@ mod tests {
         .unwrap();
         assert_eq!(cd[PARM_FILAVAIL], FILL_DEFINED);
         assert_eq!(read_fill_bits(&cd, 4).unwrap(), 0);
+
+        // A datatype wider than the filter's own limit is refused rather than
+        // running the fill value off the end of the parameter array.
+        for width in [0u32, 9, 16] {
+            assert!(
+                build_cd_values(
+                    ScaleOffset::Integer(0),
+                    ty,
+                    width,
+                    4,
+                    ScaleOffsetFill::Defined(Some(&vec![0u8; width as usize]))
+                )
+                .is_err(),
+                "a {width}-byte datatype"
+            );
+        }
 
         // A fill value that is not one element wide is refused rather than
         // truncated or padded into a different value.

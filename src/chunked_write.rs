@@ -3736,9 +3736,9 @@ mod tests {
 
     /// The two fill-availability settings, through the pipeline builder.
     ///
-    /// The default records the dataset's fill value; [`FillAvailability::
-    /// Undefined`] records none *and drops the value*, which is what a repack of
-    /// a source that recorded none needs. A setting that carried the value
+    /// The default records the dataset's fill value; the `Undefined` setting
+    /// records none *and drops the value*, which is what a repack of a source
+    /// that recorded none needs. A setting that carried the value
     /// through anyway would leave a filter claiming no fill value with one
     /// sitting in the parameters after it.
     #[test]
