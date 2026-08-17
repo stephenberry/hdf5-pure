@@ -354,3 +354,84 @@ fn a_grown_multidimensional_dataset_reads_back_through_both_libraries() {
 
     assert_eq!(pure_read(&path), (1u32..=18).collect::<Vec<_>>());
 }
+
+/// `repack` rewrites a dataset's chunks verbatim and rebuilds its index from
+/// chunk sizes alone, through a second planner that has to number the slots the
+/// same way the encoding path does.
+///
+/// The sweep above never reaches that planner: it plans from a shape it is
+/// handed rather than from a dataset it encodes, and it was the one call site
+/// that had no shape to number over at all.
+#[test]
+fn repack_preserves_a_resizable_multidimensional_dataset() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("src.h5");
+    let dst = dir.path().join("dst.h5");
+
+    // Maximum shape wider in the *trailing* dimension, so the slot numbering
+    // differs from dense grid order: chunks land in slots 0, 1, 4 and 5.
+    let data: Vec<u32> = (1..=64).collect();
+    let mut b = FileBuilder::new();
+    b.create_dataset("d")
+        .with_u32_data(&data)
+        .with_shape(&[8, 8])
+        .with_maxshape(&[8, 16])
+        .with_chunks(&[4, 4])
+        .with_deflate(6);
+    b.write(&src).unwrap();
+
+    hdf5_pure::repack(&src, &dst, &hdf5_pure::RepackOptions::new()).unwrap();
+
+    assert_eq!(pure_read(&dst), data, "pure read of the repacked file");
+    assert_eq!(c_read(&dst), data, "C read of the repacked file");
+}
+
+/// An in-place overwrite whose re-encoded chunks shrink rebuilds the index where
+/// it sits, to record the new stored sizes. That rebuild has to put each chunk
+/// back in the slot it came from.
+///
+/// The chunks are enumerated in dense grid order, so a rebuild that numbered
+/// them densely would move every chunk past the first row — silently, since the
+/// rebuilt index is the same length either way.
+#[test]
+fn a_shrinking_inplace_overwrite_keeps_each_chunk_in_its_slot() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("shrink.h5");
+
+    // Incompressible first, so the chunk slots are large.
+    let noisy: Vec<u32> = (0..64u32)
+        .map(|i| i.wrapping_mul(2_654_435_761) ^ (i << 7))
+        .collect();
+    let mut b = FileBuilder::new();
+    b.create_dataset("d")
+        .with_u32_data(&noisy)
+        .with_shape(&[8, 8])
+        .with_maxshape(&[8, 16])
+        .with_chunks(&[4, 4])
+        .with_deflate(6);
+    b.write(&path).unwrap();
+    let size_before = std::fs::metadata(&path).unwrap().len();
+
+    // Distinct values that still deflate to less than the noise did, so every
+    // chunk fits its slot with room to spare and the index is rebuilt in place.
+    let tidy: Vec<u32> = (1..=64).collect();
+    {
+        let session = hdf5_pure::File::open_rw(&path).unwrap();
+        session
+            .dataset("d")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_u32_data(&tidy).with_shape(&[8, 8]);
+            })
+            .unwrap();
+        session.commit().unwrap();
+    }
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        size_before,
+        "the overwrite must fit its slots, or it relocates and tests a different path"
+    );
+
+    assert_eq!(pure_read(&path), tidy);
+    assert_eq!(c_read(&path), tidy);
+}
