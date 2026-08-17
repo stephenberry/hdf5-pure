@@ -6,8 +6,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-Unallocated storage now reads as the dataset's fill value, matching the reference C library: a dataset created and never written was unreadable here, and the never-written chunks of a partly written one read as zeros whatever its fill value said.
-
 ### Added
 
 - A `File::open_rw` session can create an empty (zero-element) chunked or extensible dataset, so a schema-first writer declares its resizable datasets up front and grows them with `Dataset::append_staged`; explicit `with_chunks` dimensions are required ([#284](https://github.com/stephenberry/hdf5-pure/issues/284)).

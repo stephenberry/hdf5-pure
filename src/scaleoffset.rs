@@ -1562,7 +1562,7 @@ mod tests {
     /// unit test rather than a crosscheck because nothing this crate *writes*
     /// records an undefined fill value any longer — the branch is reached by
     /// re-encoding a chunk of a file that already carries one, which is what an
-    /// append to a dataset written before 0.40, or a repack of one, does.
+    /// append to a dataset written before 0.39, or a repack of one, does.
     ///
     /// Every fixture's minimum is deliberately non-zero: a chunk whose minimum
     /// is zero writes the same header under either rule.
