@@ -7895,6 +7895,8 @@ fn try_rebuild_index_in_place<S: Source + ?Sized>(
         &ds.dimensions,
         spatial,
         ds.max_dimensions.as_deref(),
+        raw_size,
+        true,
     )
     .ok()?;
     let slots =

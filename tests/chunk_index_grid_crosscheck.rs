@@ -372,6 +372,52 @@ fn a_maximum_shape_needing_a_mostly_empty_index_is_refused() {
         .with_chunks(&[2, 2]);
     b.write(&path).unwrap();
     assert_eq!(c_read(&path), values(&[3, 3]));
+
+    // And an unlimited dimension paired with a wide fixed one is accepted, since
+    // an Extensible Array allocates only the blocks its chunks land in: the
+    // unused elements are the slack inside those, not the whole span. A bound on
+    // the span refused this.
+    let mut b = FileBuilder::new();
+    b.create_dataset("d")
+        .with_u32_data(&values(&[8, 8]))
+        .with_shape(&[8, 8])
+        .with_maxshape(&[U, 131_072])
+        .with_chunks(&[1, 1]);
+    b.write(&path).unwrap();
+    assert_eq!(c_read(&path), values(&[8, 8]));
+}
+
+/// `repack` of a sparse chunked dataset the reference library wrote produces a
+/// file of the same order, not one inflated by the gap between its chunks.
+///
+/// This is the user-visible face of the block allocation: reading such a file
+/// always worked, so a crate that inflated it on rewrite could read files it
+/// could not faithfully copy. At `maxshape [U, 65536]` the rewrite was 11x the
+/// source, and one step wider it was refused outright.
+#[test]
+fn repack_of_a_c_written_sparse_dataset_stays_the_same_order_of_size() {
+    let dir = tempdir().unwrap();
+    for wide in [65_536u64, 131_072, 1_000_000] {
+        let src = dir.path().join("c.h5");
+        let dst = dir.path().join("repacked.h5");
+        let shape = [8u64, 8];
+        c_write(&src, &shape, &[1, 1], &[U, wide]);
+        hdf5_pure::repack(&src, &dst, &hdf5_pure::RepackOptions::new()).unwrap();
+
+        let (src_len, dst_len) = (
+            std::fs::metadata(&src).unwrap().len(),
+            std::fs::metadata(&dst).unwrap().len(),
+        );
+        assert!(
+            dst_len <= src_len * 2,
+            "maxshape [U, {wide}]: repack wrote {dst_len} bytes for a {src_len}-byte source"
+        );
+        assert_eq!(pure_read(&dst), values(&shape));
+        assert_eq!(c_read(&dst), values(&shape));
+
+        std::fs::remove_file(&src).unwrap();
+        std::fs::remove_file(&dst).unwrap();
+    }
 }
 
 /// A resizable multi-dimensional dataset still reads correctly after it is
@@ -603,4 +649,59 @@ fn a_shrinking_inplace_overwrite_keeps_ea_chunks_in_their_slots() {
     );
     assert_eq!(pure_read(&path), tidy);
     assert_eq!(c_read(&path), tidy);
+}
+
+/// An Extensible Array allocates a data block when a chunk lands in it, so a
+/// sparse index costs what its chunks cost rather than what the gap between them
+/// does.
+///
+/// The oracle is the array's own six header statistics, compared against the
+/// reference library's for the same dataset. They are the strongest thing
+/// available here: a size comparison would pass on a file whose blocks are the
+/// right total size and the wrong shape, and the reference library recomputes
+/// these on open and rejects a file whose stored figures disagree with what it
+/// derives. Writing every block in the span instead put `ndata_blks` at 425
+/// against libhdf5's 8, and the file at 38x its size, while reading back
+/// perfectly through both libraries (issue #299).
+#[test]
+fn a_sparse_extensible_array_matches_the_c_librarys_own_block_statistics() {
+    /// The six `EAHD` statistics, in stored order.
+    fn stats_of(path: &std::path::Path) -> Vec<u64> {
+        let b = std::fs::read(path).unwrap();
+        let h = (0..b.len() - 4)
+            .find(|&i| &b[i..i + 4] == b"EAHD")
+            .expect("this dataset must be Extensible-Array indexed");
+        (0..6)
+            .map(|k| {
+                let p = h + 12 + k * 8;
+                u64::from_le_bytes(b[p..p + 8].try_into().unwrap())
+            })
+            .collect()
+    }
+
+    let dir = tempdir().unwrap();
+    for (shape, wide) in [
+        ([16u64, 16], 1024u64),
+        ([16, 16], 8192),
+        ([16, 16], 65536),
+        ([8, 8], 100_000),
+        ([8, 8], 1_000_000),
+    ] {
+        let maxshape = [U, wide];
+        let pure_path = dir.path().join("pure.h5");
+        let c_path = dir.path().join("c.h5");
+        pure_write(&pure_path, &shape, &[1, 1], &maxshape);
+        c_write(&c_path, &shape, &[1, 1], &maxshape);
+
+        assert_eq!(
+            stats_of(&pure_path),
+            stats_of(&c_path),
+            "EAHD statistics differ for shape {shape:?} maxshape {maxshape:?}"
+        );
+        assert_eq!(pure_read(&pure_path), values(&shape));
+        assert_eq!(c_read(&pure_path), values(&shape));
+
+        std::fs::remove_file(&pure_path).unwrap();
+        std::fs::remove_file(&c_path).unwrap();
+    }
 }
