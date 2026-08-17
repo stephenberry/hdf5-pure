@@ -7,6 +7,10 @@ extern crate alloc;
 use alloc::{format, vec, vec::Vec};
 
 use crate::checksum::jenkins_lookup3;
+/// The HDF5 "undefined address" sentinel (`HADDR_UNDEF`): all bits set, in
+/// whatever width the field is. A chunked layout message carrying it declares
+/// that the dataset has no storage allocated at all.
+const HADDR_UNDEF: u64 = u64::MAX;
 use core::num::NonZeroUsize;
 
 use crate::convert::{TryToUsize, nonzero_usize_from};
@@ -295,8 +299,15 @@ impl ChunkOptions {
     /// splitter ([`split_into_chunks`], which indexes `chunk_dims` by the shape's
     /// rank and divides by each chunk dimension) — or a silently corrupt,
     /// unreadable dataset — into an up-front, descriptive refusal. A
-    /// zero-element shape (e.g. `[0]` for an empty extensible dataset) is allowed:
-    /// it is not scalar and produces zero chunks, which is well-formed.
+    /// zero-element shape (e.g. `[0]` for an empty extensible dataset) is allowed
+    /// with explicit chunk dimensions: it is not scalar and produces zero chunks,
+    /// which is well-formed.
+    ///
+    /// The chunk dimensions checked are the *resolved* ones — what
+    /// [`resolve_chunk_dims`](Self::resolve_chunk_dims) will hand the splitter —
+    /// not only the ones the caller named. Auto-chunking derives them from the
+    /// shape, so a shape that is invalid to chunk by itself has to be caught
+    /// here rather than left to divide by zero one layer down.
     pub fn validate_geometry(
         &self,
         shape: &[u64],
@@ -315,6 +326,15 @@ impl ChunkOptions {
             if dims.contains(&0) {
                 return Err("chunk dimensions must all be non-zero");
             }
+        } else if shape.contains(&0) {
+            // Auto-chunking makes the whole shape one chunk, which for a
+            // zero-element shape is a zero chunk dimension — the case rejected
+            // just above, arrived at from the other direction. There is nothing
+            // in the shape to derive a size from, so the caller has to name one.
+            return Err(
+                "a zero-element dataset must be given explicit chunk dimensions \
+                 (its shape has none to derive)",
+            );
         }
         // A maximum shape must match the rank and bound the current shape in
         // every dimension (an unlimited dimension, `u64::MAX`, bounds anything).
@@ -336,9 +356,13 @@ pub struct WrittenChunk {
     /// Address within the file where chunk data starts.
     pub address: u64,
     /// Size of the (possibly compressed) chunk data in bytes.
+    ///
+    /// The chunk's *uncompressed* size is deliberately not a field here. It was
+    /// one, and the only thing that ever read it was the chunk-index element
+    /// width — which must come from the geometry ([`full_chunk_bytes`]), since a
+    /// set of zero chunks has no chunk to read it from and still has to declare
+    /// the width its first chunk will need.
     pub compressed_size: u64,
-    /// Original uncompressed size in bytes.
-    pub raw_size: u64,
     /// Filter mask (0 = all filters applied).
     pub filter_mask: u32,
 }
@@ -686,24 +710,58 @@ struct ChunkElementEncoding {
     client_id: u8,
 }
 
+/// The unfiltered byte size of one whole chunk: the product of the chunk
+/// dimensions and the element size.
+///
+/// One derivation, shared by everything that has to size a chunk-index element
+/// ([`chunk_element_encoding`]) — the buffered builder, the verbatim planner,
+/// and the in-place append's index rebuild. Each of those holds the geometry in
+/// a different shape (`u32` dimensions from a set, `u64` from a plan), and a
+/// second copy of this product is how one of them ends up declaring a width the
+/// others do not write.
+///
+/// `ensure_chunk_bytes_representable` caps a chunk at 4 GiB before any of them
+/// runs, so the product saturates here only so that a malformed geometry cannot
+/// wrap into a small, plausible width.
+pub(crate) fn full_chunk_bytes(
+    chunk_dims: impl IntoIterator<Item = u64>,
+    element_size: NonZeroUsize,
+) -> u64 {
+    chunk_dims
+        .into_iter()
+        .fold(element_size.get() as u64, |acc, d| acc.saturating_mul(d))
+}
+
 /// Derive the element encoding for a chunk set.
 ///
 /// `chunk_size_len = 1 + ((H5VM_log2_gen(chunk.size) + 8) / 8)`, where
-/// `chunk.size` is the *unfiltered* chunk size in bytes (the product of the
-/// chunk dimensions), so the field is sized to the largest raw chunk rather than
-/// to any compressed one.
+/// `chunk.size` is `chunk_bytes`: the *unfiltered* chunk size, the product of
+/// the chunk dimensions and the element size. The field is sized to a whole raw
+/// chunk rather than to any compressed one.
+///
+/// It is taken from the geometry rather than from the chunks that happen to have
+/// been written, because the two part company exactly where it matters. Every
+/// chunk [`split_into_chunks`] produces is zero-padded to the full chunk size,
+/// so for one chunk or a thousand the largest `raw_size` *is* `chunk_bytes` and
+/// the two agree byte for byte. For **zero** chunks there is no `raw_size` to
+/// take a maximum of, and the fallback this used to apply — treat the largest
+/// chunk as 1 byte — declared a 2-byte compressed-size field for a dataset whose
+/// chunks need up to 8. Nothing catches that later: the width is a header field
+/// every reader honours, so an empty filtered dataset handed to the reference C
+/// library came back with chunks encoded to a width our reader then decoded as
+/// truncated deflate streams, and our own append refused a chunk that no longer
+/// fit the width its own index had declared.
 fn chunk_element_encoding(
-    chunks: &[WrittenChunk],
+    chunk_bytes: u64,
     offset_size: u8,
     has_filters: bool,
 ) -> ChunkElementEncoding {
     let os = offset_size as usize;
     let chunk_size_bytes: usize = if has_filters {
-        let max_raw = chunks.iter().map(|c| c.raw_size).max().unwrap_or(1);
-        let log2_val = if max_raw <= 1 {
+        let log2_val = if chunk_bytes <= 1 {
             0
         } else {
-            63 - max_raw.leading_zeros()
+            63 - chunk_bytes.leading_zeros()
         };
         let len = 1 + ((log2_val + 8) / 8) as usize;
         len.min(8)
@@ -745,6 +803,7 @@ struct FaLayout {
 /// Lay out the Fixed Array that would hold `chunks`, without building it.
 fn fa_layout(
     chunks: &[WrittenChunk],
+    chunk_bytes: u64,
     offset_size: u8,
     length_size: u8,
     has_filters: bool,
@@ -759,7 +818,7 @@ fn fa_layout(
     );
     let os = offset_size as usize;
     let num_elements = chunks.len();
-    let encoding = chunk_element_encoding(chunks, offset_size, has_filters);
+    let encoding = chunk_element_encoding(chunk_bytes, offset_size, has_filters);
 
     let fahd_size = 4 + 1 + 1 + 1 + 1 + length_size as usize + os + 4;
 
@@ -794,11 +853,12 @@ fn fa_layout(
 /// writes; every caller passes [`INDEX_OFFSET_SIZE`] / [`INDEX_LENGTH_SIZE`].
 pub(crate) fn fixed_array_len(
     chunks: &[WrittenChunk],
+    chunk_bytes: u64,
     offset_size: u8,
     length_size: u8,
     has_filters: bool,
 ) -> u64 {
-    fa_layout(chunks, offset_size, length_size, has_filters).total_len
+    fa_layout(chunks, chunk_bytes, offset_size, length_size, has_filters).total_len
 }
 
 /// Which chunk index a chunk set gets.
@@ -812,6 +872,17 @@ pub(crate) fn fixed_array_len(
 /// which classifies the same three shapes on the read side.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum ChunkIndexKind {
+    /// No index structure and no chunk address: a fixed-shape dataset with no
+    /// chunks at all, whose layout message carries the undefined address.
+    ///
+    /// This is the reference C library's convention for a chunked dataset with
+    /// nothing stored, and for a fixed-shape one it is the only encoding it
+    /// accepts: a Fixed Array declaring zero entries makes `H5Dget_num_chunks`
+    /// fail on the dataset, where the undefined address reads back as zero
+    /// chunks. An *extensible* empty dataset is the opposite case and keeps its
+    /// (eagerly built) array — the C library reads and grows that happily, and
+    /// this crate's in-place append needs the index to already exist.
+    Unallocated,
     /// No index structure at all: the single chunk's address rides in the
     /// layout message.
     SingleChunk,
@@ -835,7 +906,7 @@ impl ChunkIndexKind {
     /// layout, which writes nothing after the chunk bytes.
     pub(crate) fn array_kind(self) -> Option<ChunkArrayKind> {
         match self {
-            Self::SingleChunk => None,
+            Self::Unallocated | Self::SingleChunk => None,
             Self::FixedArray => Some(ChunkArrayKind::FixedArray),
             Self::ExtensibleArray => Some(ChunkArrayKind::ExtensibleArray),
         }
@@ -847,6 +918,8 @@ impl ChunkIndexKind {
 pub(crate) fn chunk_index_kind(use_extensible: bool, num_chunks: usize) -> ChunkIndexKind {
     if use_extensible {
         ChunkIndexKind::ExtensibleArray
+    } else if num_chunks == 0 {
+        ChunkIndexKind::Unallocated
     } else if num_chunks == 1 {
         ChunkIndexKind::SingleChunk
     } else {
@@ -863,16 +936,17 @@ pub(crate) fn chunk_index_kind(use_extensible: bool, num_chunks: usize) -> Chunk
 pub(crate) fn chunk_index_len(
     kind: ChunkArrayKind,
     chunks: &[WrittenChunk],
+    chunk_bytes: u64,
     offset_size: u8,
     length_size: u8,
     has_filters: bool,
 ) -> u64 {
     match kind {
         ChunkArrayKind::ExtensibleArray => {
-            extensible_array_len(chunks, offset_size, length_size, has_filters)
+            extensible_array_len(chunks, chunk_bytes, offset_size, length_size, has_filters)
         }
         ChunkArrayKind::FixedArray => {
-            fixed_array_len(chunks, offset_size, length_size, has_filters)
+            fixed_array_len(chunks, chunk_bytes, offset_size, length_size, has_filters)
         }
     }
 }
@@ -880,6 +954,7 @@ pub(crate) fn chunk_index_len(
 /// Build a complete Fixed Array at a known absolute address.
 pub fn build_fixed_array_at(
     chunks: &[WrittenChunk],
+    chunk_bytes: u64,
     offset_size: u8,
     length_size: u8,
     has_filters: bool,
@@ -887,7 +962,7 @@ pub fn build_fixed_array_at(
 ) -> Vec<u8> {
     let num_elements = chunks.len();
 
-    let layout = fa_layout(chunks, offset_size, length_size, has_filters);
+    let layout = fa_layout(chunks, chunk_bytes, offset_size, length_size, has_filters);
     let ChunkElementEncoding {
         chunk_size_bytes,
         elem_size,
@@ -1415,11 +1490,12 @@ struct EaLayout {
 /// Lay out the Extensible Array that would hold `chunks`, without building it.
 fn ea_layout(
     chunks: &[WrittenChunk],
+    chunk_bytes: u64,
     offset_size: u8,
     length_size: u8,
     has_filters: bool,
 ) -> EaLayout {
-    let encoding = chunk_element_encoding(chunks, offset_size, has_filters);
+    let encoding = chunk_element_encoding(chunk_bytes, offset_size, has_filters);
     let ChunkElementEncoding {
         elem_size,
         client_id,
@@ -1504,11 +1580,12 @@ fn ea_layout(
 /// derivation of the block geometry can drift away from what is written.
 pub(crate) fn extensible_array_len(
     chunks: &[WrittenChunk],
+    chunk_bytes: u64,
     offset_size: u8,
     length_size: u8,
     has_filters: bool,
 ) -> u64 {
-    ea_layout(chunks, offset_size, length_size, has_filters).total_len
+    ea_layout(chunks, chunk_bytes, offset_size, length_size, has_filters).total_len
 }
 
 /// Build a complete Extensible Array at a known absolute address.
@@ -1522,6 +1599,7 @@ pub(crate) fn extensible_array_len(
 /// block, and paged ranges (verified by crosscheck tests).
 pub fn build_extensible_array_at(
     chunks: &[WrittenChunk],
+    chunk_bytes: u64,
     offset_size: u8,
     length_size: u8,
     has_filters: bool,
@@ -1529,7 +1607,7 @@ pub fn build_extensible_array_at(
 ) -> Result<Vec<u8>, FormatError> {
     let num_elements = chunks.len();
 
-    let layout = ea_layout(chunks, offset_size, length_size, has_filters);
+    let layout = ea_layout(chunks, chunk_bytes, offset_size, length_size, has_filters);
     let ChunkElementEncoding {
         chunk_size_bytes,
         elem_size,
@@ -1836,14 +1914,21 @@ fn write_undefined_element(
 pub(crate) struct CompressedChunkSet {
     /// Per-chunk compressed bytes, in dense row-major grid order.
     compressed: Vec<Vec<u8>>,
-    /// Per-chunk uncompressed size (a full chunk is stored at full size, edge
-    /// overhang zero-filled, so these are all equal in practice).
-    raw_sizes: Vec<u64>,
     chunk_dims_u32: Vec<u32>,
     element_size: NonZeroUsize,
     has_filters: bool,
     use_extensible: bool,
     pipeline_message: Option<Vec<u8>>,
+}
+
+impl CompressedChunkSet {
+    /// This set's whole-chunk byte size; see [`full_chunk_bytes`].
+    fn full_chunk_bytes(&self) -> u64 {
+        full_chunk_bytes(
+            self.chunk_dims_u32.iter().map(|&d| u64::from(d)),
+            self.element_size,
+        )
+    }
 }
 
 /// Split `raw_data` into chunks and compress each one, producing the
@@ -1871,13 +1956,11 @@ pub(crate) fn compress_chunks(
     let has_filters = pipeline.is_some();
 
     let mut compressed = Vec::with_capacity(num_chunks);
-    let mut raw_sizes = Vec::with_capacity(num_chunks);
     // One encoder for every chunk of the dataset. Building one per chunk is the
     // dominant cost of a filtered write -- ~300 KiB of hash tables apiece, 615
     // MiB over an 8 MiB dataset (issue #228).
     let mut scratch = crate::filters::FilterScratch::new();
     for chunk_bytes in chunks {
-        raw_sizes.push(chunk_bytes.len() as u64);
         let c = if let Some(ref pl) = pipeline {
             compress_chunk_with(&mut scratch, &chunk_bytes, pl, ctx)?
         } else {
@@ -1896,7 +1979,6 @@ pub(crate) fn compress_chunks(
 
     Ok(CompressedChunkSet {
         compressed,
-        raw_sizes,
         chunk_dims_u32,
         element_size,
         has_filters,
@@ -1911,11 +1993,10 @@ pub(crate) fn compress_chunks(
 fn plan_chunk_slots(set: &CompressedChunkSet, base_address: u64) -> (Vec<WrittenChunk>, u64) {
     let mut cursor = base_address;
     let mut written_chunks = Vec::with_capacity(set.compressed.len());
-    for (chunk, &raw_size) in set.compressed.iter().zip(set.raw_sizes.iter()) {
+    for chunk in &set.compressed {
         written_chunks.push(WrittenChunk {
             address: cursor,
             compressed_size: chunk.len() as u64,
-            raw_size,
             filter_mask: 0,
         });
         cursor += chunk.len() as u64;
@@ -1940,8 +2021,12 @@ fn chunk_index_bytes(
     index_address: u64,
 ) -> Result<(Vec<u8>, Vec<u8>), FormatError> {
     let index = match chunk_index_kind(set.use_extensible, written_chunks.len()) {
+        // Nothing stored, so nothing to index; the layout message below carries
+        // the undefined address in place of one.
+        ChunkIndexKind::Unallocated => Vec::new(),
         ChunkIndexKind::ExtensibleArray => build_extensible_array_at(
             written_chunks,
+            set.full_chunk_bytes(),
             INDEX_OFFSET_SIZE,
             INDEX_LENGTH_SIZE,
             set.has_filters,
@@ -1950,6 +2035,7 @@ fn chunk_index_bytes(
         ChunkIndexKind::SingleChunk => Vec::new(),
         ChunkIndexKind::FixedArray => build_fixed_array_at(
             written_chunks,
+            set.full_chunk_bytes(),
             INDEX_OFFSET_SIZE,
             INDEX_LENGTH_SIZE,
             set.has_filters,
@@ -1981,6 +2067,13 @@ fn chunk_index_layout(
         reason = "element size written into the on-disk u32 dimension field selected for this file"
     )]
     match chunk_index_kind(set.use_extensible, written_chunks.len()) {
+        ChunkIndexKind::Unallocated => serialize_v4_fixed_array(
+            &set.chunk_dims_u32,
+            HADDR_UNDEF,
+            INDEX_OFFSET_SIZE,
+            set.element_size.get() as u32,
+            FIXED_ARRAY_PAGE_BITS,
+        ),
         ChunkIndexKind::ExtensibleArray => serialize_v4_extensible_array(
             &set.chunk_dims_u32,
             index_address,
@@ -2024,6 +2117,7 @@ pub(crate) fn chunked_data_len(set: &CompressedChunkSet) -> u64 {
             chunk_index_len(
                 array,
                 &written_chunks,
+                set.full_chunk_bytes(),
                 INDEX_OFFSET_SIZE,
                 INDEX_LENGTH_SIZE,
                 set.has_filters,
@@ -2072,6 +2166,7 @@ pub(crate) fn measure_chunked_at(
             chunk_index_len(
                 array,
                 &written_chunks,
+                set.full_chunk_bytes(),
                 INDEX_OFFSET_SIZE,
                 INDEX_LENGTH_SIZE,
                 set.has_filters,
@@ -2234,6 +2329,11 @@ struct VerbatimIndexPlan {
     /// writes uses `INDEX_OFFSET_SIZE` / `INDEX_LENGTH_SIZE`, and reading them
     /// at the emit is one fewer value that could be set wrong here.
     has_filters: bool,
+    /// The unfiltered byte size of one whole chunk, which sizes the element's
+    /// compressed-size field. Carried on the plan for the same reason
+    /// `has_filters` is: the emit builds the index from this alone, and a second
+    /// derivation there could disagree with the length reserved here.
+    chunk_bytes: u64,
     len: u64,
 }
 
@@ -2271,7 +2371,6 @@ pub(crate) fn plan_chunked_data_verbatim(
     meta: &[ChunkMeta],
     chunk_dims: &[u64],
     element_size: NonZeroUsize,
-    raw_size: u64,
     pipeline_message: Option<&[u8]>,
     base_address: u64,
     maxshape: Option<&[u64]>,
@@ -2295,7 +2394,6 @@ pub(crate) fn plan_chunked_data_verbatim(
         written_chunks.push(WrittenChunk {
             address,
             compressed_size,
-            raw_size,
             filter_mask: m.filter_mask,
         });
         cursor += compressed_size;
@@ -2317,13 +2415,16 @@ pub(crate) fn plan_chunked_data_verbatim(
     // plan at a provisional base purely to size the region.
     let kind = chunk_index_kind(use_extensible, num_chunks);
     let index_address = base_address + cursor;
+    let chunk_bytes = full_chunk_bytes(chunk_dims.iter().copied(), element_size);
     let index = kind.array_kind().map(|array| VerbatimIndexPlan {
         kind: array,
         address: index_address,
         has_filters,
+        chunk_bytes,
         len: chunk_index_len(
             array,
             &written_chunks,
+            chunk_bytes,
             offset_size,
             length_size,
             has_filters,
@@ -2336,6 +2437,15 @@ pub(crate) fn plan_chunked_data_verbatim(
         reason = "element size written into the on-disk u32 dimension field selected for this file"
     )]
     let layout_message = match kind {
+        // Unreachable here: a verbatim plan is refused above unless it has at
+        // least one chunk, and only a chunk-less fixed-shape set is unallocated.
+        ChunkIndexKind::Unallocated => serialize_v4_fixed_array(
+            &chunk_dims_u32,
+            HADDR_UNDEF,
+            offset_size,
+            element_size.get() as u32,
+            FIXED_ARRAY_PAGE_BITS,
+        ),
         ChunkIndexKind::ExtensibleArray => serialize_v4_extensible_array(
             &chunk_dims_u32,
             index_address,
@@ -2424,6 +2534,7 @@ pub(crate) fn emit_chunked_data_verbatim<S: ByteSink>(
         let bytes = match index.kind {
             ChunkArrayKind::ExtensibleArray => build_extensible_array_at(
                 &plan.chunks,
+                index.chunk_bytes,
                 INDEX_OFFSET_SIZE,
                 INDEX_LENGTH_SIZE,
                 index.has_filters,
@@ -2431,6 +2542,7 @@ pub(crate) fn emit_chunked_data_verbatim<S: ByteSink>(
             )?,
             ChunkArrayKind::FixedArray => build_fixed_array_at(
                 &plan.chunks,
+                index.chunk_bytes,
                 INDEX_OFFSET_SIZE,
                 INDEX_LENGTH_SIZE,
                 index.has_filters,
@@ -2472,6 +2584,87 @@ mod tests {
             mantissa_size: 52,
             exponent_bias: 1023,
         }
+    }
+
+    /// Every chunk [`split_into_chunks`] produces is exactly one whole chunk of
+    /// bytes — edge overhang zero-filled, never truncated to the in-bounds part.
+    ///
+    /// This is the equivalence that makes deriving the chunk-index element width
+    /// from the geometry ([`full_chunk_bytes`]) the *same answer* the old
+    /// derivation gave — a maximum over the written chunks' raw sizes — for every
+    /// dataset that has at least one chunk, and therefore byte-identical output
+    /// for every file this crate had already written. The two part company only
+    /// at zero chunks, where there is no maximum to take.
+    ///
+    /// Swept over shapes that divide evenly and shapes that overhang in the
+    /// innermost dimension, an outer one, and both at once, since a truncated
+    /// edge chunk is the only way this could fail.
+    #[test]
+    fn every_split_chunk_is_a_whole_chunk() {
+        let cases: &[(&[u64], &[u64])] = &[
+            (&[8], &[4]),             // even
+            (&[7], &[4]),             // innermost overhang
+            (&[1], &[512]),           // a single, almost entirely empty chunk
+            (&[4, 6], &[2, 3]),       // even, 2-D
+            (&[5, 6], &[2, 3]),       // outer overhang
+            (&[4, 7], &[2, 3]),       // inner overhang
+            (&[5, 7], &[2, 3]),       // both
+            (&[3, 5, 7], &[2, 2, 4]), // both, 3-D
+        ];
+        for &(shape, chunk_dims) in cases {
+            for elem in [1usize, 4, 8] {
+                let n: u64 = shape.iter().product();
+                let raw = vec![0u8; (n as usize) * elem];
+                let expected = full_chunk_bytes(chunk_dims.iter().copied(), nz(elem));
+                let chunks = split_into_chunks(&raw, shape, chunk_dims, nz(elem));
+                assert!(
+                    !chunks.is_empty(),
+                    "shape {shape:?} chunk {chunk_dims:?} must produce chunks"
+                );
+                for (i, c) in chunks.iter().enumerate() {
+                    assert_eq!(
+                        c.len() as u64,
+                        expected,
+                        "chunk {i} of shape {shape:?} chunk {chunk_dims:?} elem {elem} \
+                         is not a whole chunk"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Auto-chunking resolves the chunk to the whole shape, so a zero-element
+    /// shape resolves to a zero chunk dimension — the same value
+    /// `validate_geometry` already rejected when a caller named it, reached
+    /// without one. It divided by zero in [`split_into_chunks`] until the guard
+    /// checked the resolved dimensions rather than only the explicit ones.
+    #[test]
+    fn auto_chunking_a_zero_element_shape_is_refused() {
+        let auto = ChunkOptions {
+            chunk_dims: None,
+            ..Default::default()
+        };
+        for shape in [vec![0u64], vec![4, 0], vec![0, 4]] {
+            let err = auto
+                .validate_geometry(&shape, Some(&vec![u64::MAX; shape.len()]))
+                .unwrap_err();
+            assert!(
+                err.contains("explicit chunk dimensions"),
+                "shape {shape:?}: {err}"
+            );
+            // The resolved dimensions are what the splitter would divide by, and
+            // this is the value the guard exists to keep away from it.
+            assert!(auto.resolve_chunk_dims(&shape).contains(&0));
+        }
+
+        // Named chunk dimensions make the same shape legal: it produces zero
+        // chunks, which is what an extensible dataset is created as.
+        let explicit = ChunkOptions {
+            chunk_dims: Some(vec![512]),
+            ..Default::default()
+        };
+        assert!(explicit.validate_geometry(&[0], Some(&[u64::MAX])).is_ok());
+        assert!(explicit.validate_geometry(&[0], None).is_ok());
     }
 
     fn f64_to_bytes(data: &[f64]) -> Vec<u8> {
@@ -2753,7 +2946,7 @@ mod tests {
             })
             .collect();
         let layout =
-            plan_chunked_data_verbatim(&meta, &[7], nz(8), 56, Some(&[]), 0x1000, None).unwrap();
+            plan_chunked_data_verbatim(&meta, &[7], nz(8), Some(&[]), 0x1000, None).unwrap();
 
         let planned: Vec<u64> = layout
             .plan
@@ -2813,7 +3006,7 @@ mod tests {
                 })
                 .collect();
             let layout =
-                plan_chunked_data_verbatim(&meta, &[7], nz(8), 56, Some(&[]), 0x1000, maxshape)
+                plan_chunked_data_verbatim(&meta, &[7], nz(8), Some(&[]), 0x1000, maxshape)
                     .unwrap();
             let mut emitted: Vec<u8> = Vec::new();
             emit_chunked_data_verbatim(&mut emitted, &layout.plan, &SizedChunks(chunk_sizes))
@@ -2844,7 +3037,7 @@ mod tests {
     /// is refused rather than planned as an empty region.
     #[test]
     fn a_verbatim_plan_with_no_chunks_is_refused() {
-        let result = plan_chunked_data_verbatim(&[], &[7], nz(8), 56, None, 0x1000, None);
+        let result = plan_chunked_data_verbatim(&[], &[7], nz(8), None, 0x1000, None);
         assert!(
             matches!(result, Err(FormatError::ChunkedReadError(_))),
             "a chunk-less plan must be refused"
@@ -3119,17 +3312,15 @@ mod tests {
             WrittenChunk {
                 address: 0x1000,
                 compressed_size: 160,
-                raw_size: 160,
                 filter_mask: 0,
             },
             WrittenChunk {
                 address: 0x10A0,
                 compressed_size: 160,
-                raw_size: 160,
                 filter_mask: 0,
             },
         ];
-        let fa = build_fixed_array_at(&chunks, 8, 8, false, 0x2000);
+        let fa = build_fixed_array_at(&chunks, 160, 8, 8, false, 0x2000);
         // Should start with FAHD
         assert_eq!(&fa[0..4], b"FAHD");
         // FAHD size = 4+1+1+1+1+8+8+4 = 28
@@ -3166,17 +3357,15 @@ mod tests {
             WrittenChunk {
                 address: 0x1000,
                 compressed_size: 80,
-                raw_size: 80,
                 filter_mask: 0,
             },
             WrittenChunk {
                 address: 0x1050,
                 compressed_size: 80,
-                raw_size: 80,
                 filter_mask: 0,
             },
         ];
-        let ea = build_extensible_array_at(&chunks, 8, 8, false, 0x2000).unwrap();
+        let ea = build_extensible_array_at(&chunks, 80, 8, 8, false, 0x2000).unwrap();
         assert_eq!(&ea[0..4], b"EAHD");
         // Find EAIB after EAHD: 12 fixed + 6*8 stats + 8 addr + 4 checksum = 72
         let aehd_size = 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 6 * 8 + 8 + 4;
@@ -3309,11 +3498,10 @@ mod tests {
                 .map(|i| WrittenChunk {
                     address: 0x1000 + i * 8,
                     compressed_size: 8,
-                    raw_size: 8,
                     filter_mask: 0,
                 })
                 .collect();
-            let ea = build_extensible_array_at(&chunks, 8, 8, false, 0x100000).unwrap();
+            let ea = build_extensible_array_at(&chunks, 8, 8, 8, false, 0x100000).unwrap();
             // Parse the 6 stats from the EAHD (12-byte fixed prefix, then 6 * ls).
             let stat =
                 |k: usize| u64::from_le_bytes(ea[12 + k * 8..12 + k * 8 + 8].try_into().unwrap());
@@ -3387,7 +3575,9 @@ mod tests {
     /// `chunk_element_encoding` was unified exercise the same derivation;
     /// `extensible_array_len_matches_what_it_builds` asserts the four widths
     /// really are distinct.
-    const RAW_SIZES: [u64; 4] = [8, 300, 100_000, 1 << 32];
+    /// Whole-chunk byte sizes that select four *different* compressed-size field
+    /// widths in a filtered element record; see `CHUNK_BYTES` at its use.
+    const CHUNK_BYTES: [u64; 4] = [8, 300, 100_000, 1 << 32];
 
     /// `fixed_array_len` is the span a caller reserves for a Fixed Array before a
     /// byte of it exists, so it has to equal the length `build_fixed_array_at`
@@ -3400,23 +3590,30 @@ mod tests {
     /// without walking the pages.
     #[test]
     fn fixed_array_len_matches_what_it_builds() {
-        fn check(n: u64, raw_size: u64, offset_size: u8, length_size: u8, has_filters: bool) {
+        fn check(n: u64, chunk_bytes: u64, offset_size: u8, length_size: u8, has_filters: bool) {
             let chunks: Vec<WrittenChunk> = (0..n)
                 .map(|i| WrittenChunk {
                     address: 0x1000 + i * 8,
                     compressed_size: 8,
-                    raw_size,
                     filter_mask: 0,
                 })
                 .collect();
-            let planned = fixed_array_len(&chunks, offset_size, length_size, has_filters);
-            let built =
-                build_fixed_array_at(&chunks, offset_size, length_size, has_filters, 0x10_0000);
+            let planned =
+                fixed_array_len(&chunks, chunk_bytes, offset_size, length_size, has_filters);
+            let built = build_fixed_array_at(
+                &chunks,
+                chunk_bytes,
+                offset_size,
+                length_size,
+                has_filters,
+                0x10_0000,
+            );
             assert_eq!(
                 planned,
                 built.len() as u64,
-                "planned length must match the emitted array at n={n}, raw_size={raw_size}, \
-                 offset_size={offset_size}, has_filters={has_filters}"
+                "planned length must match the emitted array at n={n}, \
+                 chunk_bytes={chunk_bytes}, offset_size={offset_size}, \
+                 has_filters={has_filters}"
             );
         }
 
@@ -3434,11 +3631,11 @@ mod tests {
             }
         }
 
-        // The filtered element record's compressed-size field is sized to the
-        // largest raw chunk, and every element and page is sized from it.
-        for &raw_size in &RAW_SIZES {
+        // The filtered element record's compressed-size field is sized to a whole
+        // raw chunk, and every element and page is sized from it.
+        for &chunk_bytes in &CHUNK_BYTES {
             for &n in &[1u64, 1_024, 1_025, 5_000] {
-                check(n, raw_size, 8, 8, true);
+                check(n, chunk_bytes, 8, 8, true);
             }
         }
     }
@@ -3458,18 +3655,19 @@ mod tests {
     /// super blocks and, at 131,061, the first *paged* data block.
     #[test]
     fn extensible_array_len_matches_what_it_builds() {
-        fn check(n: u64, raw_size: u64, offset_size: u8, length_size: u8, has_filters: bool) {
+        fn check(n: u64, chunk_bytes: u64, offset_size: u8, length_size: u8, has_filters: bool) {
             let chunks: Vec<WrittenChunk> = (0..n)
                 .map(|i| WrittenChunk {
                     address: 0x1000 + i * 8,
                     compressed_size: 8,
-                    raw_size,
                     filter_mask: 0,
                 })
                 .collect();
-            let planned = extensible_array_len(&chunks, offset_size, length_size, has_filters);
+            let planned =
+                extensible_array_len(&chunks, chunk_bytes, offset_size, length_size, has_filters);
             let built = build_extensible_array_at(
                 &chunks,
+                chunk_bytes,
                 offset_size,
                 length_size,
                 has_filters,
@@ -3479,8 +3677,9 @@ mod tests {
             assert_eq!(
                 planned,
                 built.len() as u64,
-                "planned length must match the emitted array at n={n}, raw_size={raw_size}, \
-                 offset_size={offset_size}, has_filters={has_filters}"
+                "planned length must match the emitted array at n={n}, \
+                 chunk_bytes={chunk_bytes}, offset_size={offset_size}, \
+                 has_filters={has_filters}"
             );
         }
 
@@ -3501,27 +3700,26 @@ mod tests {
         }
 
         // A filtered element record carries the chunk's compressed size in a field
-        // sized to the largest *raw* chunk, so the record width — and with it the
+        // sized to a whole *raw* chunk, so the record width — and with it the
         // index block and every data block — changes with that size.
-        for &raw_size in &RAW_SIZES {
+        for &chunk_bytes in &CHUNK_BYTES {
             for &n in &[1u64, 5, 244, 300, 2_000] {
-                check(n, raw_size, 8, 8, true);
+                check(n, chunk_bytes, 8, 8, true);
             }
         }
-        // Those four raw sizes have to select four *different* field widths, or
+        // Those four chunk sizes have to select four *different* field widths, or
         // the loop above is one fixture written four times. Asserted as
         // distinctness rather than as four literals: the rule is that the width
-        // tracks the raw size, not that it takes any particular value.
-        let widths: Vec<usize> = RAW_SIZES
+        // tracks the chunk size, not that it takes any particular value.
+        //
+        // Measured with **no chunks at all**, which is both the shape that used
+        // to fabricate a 1-byte chunk and the proof that the width now comes
+        // from the geometry: an empty array whose width still tracks
+        // `chunk_bytes` cannot be reading it off a written chunk.
+        let widths: Vec<usize> = CHUNK_BYTES
             .iter()
-            .map(|&raw_size| {
-                let chunks = [WrittenChunk {
-                    address: 0,
-                    compressed_size: 8,
-                    raw_size,
-                    filter_mask: 0,
-                }];
-                super::ea_layout(&chunks, 8, 8, true)
+            .map(|&chunk_bytes| {
+                super::ea_layout(&[], chunk_bytes, 8, 8, true)
                     .encoding
                     .chunk_size_bytes
             })
@@ -3531,8 +3729,8 @@ mod tests {
         distinct.dedup();
         assert_eq!(
             distinct.len(),
-            RAW_SIZES.len(),
-            "each raw size must select a different compressed-size field width, got {widths:?}"
+            CHUNK_BYTES.len(),
+            "each chunk size must select a different compressed-size field width, got {widths:?}"
         );
     }
 

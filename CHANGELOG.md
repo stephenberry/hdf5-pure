@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Fixed
+
+- An empty **filtered** chunked dataset declared a chunk-index element too narrow for its own chunks, so filling it through the reference C library produced a file this crate read as truncated compressed data, and filling it through `Dataset::append` was refused outright. Datasets with at least one chunk are byte-identical to before ([#284](https://github.com/stephenberry/hdf5-pure/issues/284)).
+- An empty **fixed-shape** chunked dataset is written with no chunk index, matching the C library, where the zero-entry Fixed Array it used to write made `H5Dget_num_chunks` fail on the dataset ([#284](https://github.com/stephenberry/hdf5-pure/issues/284)).
+- Requesting an extensible zero-element dataset without `with_chunks` is refused with `FormatError::InvalidChunkGeometry` instead of panicking ([#284](https://github.com/stephenberry/hdf5-pure/issues/284)).
+
 ### Changed
 
 - Opening a dataset or group by path (`File::dataset`, `File::group`) or by name (`Group::dataset`, `Group::group`) no longer reads every other child of the group on the way: one lookup in a 1,024-child group allocates 23 KiB in 16 blocks where it took 310 KiB in 2,084, so opening each member of a large group in turn costs the group once per open rather than once per member per open. A link whose *target* is malformed no longer fails a lookup of a different name, which parsing every link made it do; listing the group still reports it ([#228](https://github.com/stephenberry/hdf5-pure/issues/228)).

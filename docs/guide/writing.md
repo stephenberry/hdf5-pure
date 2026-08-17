@@ -159,6 +159,23 @@ builder
 
 `with_dtype` takes a `Datatype`, which the crate's `make_*_type` constructors produce (for example `make_f64_type()`).
 
+An empty dataset may also be **chunked and resizable**, which is how you declare a dataset up front and grow it later with [`Dataset::append_staged`](editing.md#appending-to-an-unlimited-dataset):
+
+```rust
+use hdf5_pure::{FileBuilder, make_f64_type};
+
+let mut builder = FileBuilder::new();
+
+builder
+    .create_dataset("stream")
+    .with_dtype(make_f64_type())
+    .with_shape(&[0])
+    .with_maxshape(&[u64::MAX])
+    .with_chunks(&[512]);
+```
+
+`with_chunks` is required here rather than optional: auto-chunking derives the chunk from the shape, and a zero-element shape has nothing to derive from. Leaving it out is refused with `FormatError::InvalidChunkGeometry`.
+
 ## Serializing: `finish()` vs `write(path)`
 
 When the file is fully assembled, choose how to materialize it:

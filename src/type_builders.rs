@@ -1501,9 +1501,6 @@ pub(crate) struct RawChunkPayload {
     pub(crate) chunk_dims: Vec<u64>,
     /// Datatype element size in bytes, proven non-zero.
     pub(crate) element_size: NonZeroUsize,
-    /// Full uncompressed byte size of one chunk
-    /// (`product(chunk_dims) * element_size`), identical for every chunk.
-    pub(crate) raw_size: u64,
     /// The verbatim source `FilterPipeline` message bytes, if the source had one.
     pub(crate) pipeline_message: Option<Vec<u8>>,
     /// Per-chunk sizes + filter masks in dense row-major grid order, one per slot.
@@ -1972,15 +1969,11 @@ impl DatasetBuilder {
         meta: Vec<ChunkMeta>,
         provider: Box<dyn ChunkProvider>,
     ) -> &mut Self {
-        // Full uncompressed bytes of one chunk (drives the fixed/extensible-array
-        // chunk-size encoding width). Saturating arithmetic matches the writer's
-        // overflow discipline; the values come from an already-validated source
-        // file, so this only guards against an absurd input rather than a real case.
-        let raw_size: u64 = chunk_dims
-            .iter()
-            .copied()
-            .product::<u64>()
-            .saturating_mul(element_size.get() as u64);
+        // The whole-chunk byte size that drives the fixed/extensible-array
+        // chunk-size encoding width is not carried here: `chunk_dims` and
+        // `element_size` are, and the width is derived from them where it is
+        // used (`chunked_write::full_chunk_bytes`), so this payload cannot
+        // disagree with the geometry it travels beside.
         self.datatype = Some(datatype);
         if self.shape.is_none() {
             self.shape = Some(dims.to_vec());
@@ -1992,7 +1985,6 @@ impl DatasetBuilder {
         self.raw_chunks = Some(RawChunkPayload {
             chunk_dims: chunk_dims.to_vec(),
             element_size,
-            raw_size,
             pipeline_message,
             meta,
             provider: core::panic::AssertUnwindSafe(provider),
