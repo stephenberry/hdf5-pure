@@ -1534,6 +1534,7 @@ impl FileWriter {
                     pipeline_message,
                 } = plan_chunked_data_verbatim(
                     &rc.meta,
+                    &d.ds.dimensions,
                     &rc.chunk_dims,
                     rc.element_size,
                     rc.pipeline_message.as_deref(),
@@ -1581,6 +1582,7 @@ impl FileWriter {
                     pipeline_message,
                 } = plan_chunked_data_verbatim(
                     &rc.meta,
+                    &d.ds.dimensions,
                     &rc.chunk_dims,
                     rc.element_size,
                     rc.pipeline_message.as_deref(),

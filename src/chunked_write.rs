@@ -13,6 +13,7 @@ use crate::checksum::jenkins_lookup3;
 const HADDR_UNDEF: u64 = u64::MAX;
 use core::num::NonZeroUsize;
 
+use crate::chunk_grid::{ChunkGrid, GridOrder};
 use crate::convert::{TryToUsize, nonzero_usize_from};
 use crate::error::FormatError;
 use crate::extensible_array::{EaGeometry, ExtensibleArrayHeader};
@@ -346,6 +347,19 @@ impl ChunkOptions {
             if ms.iter().zip(shape).any(|(&m, &d)| m != u64::MAX && m < d) {
                 return Err("maxshape must be at least the current shape in every dimension");
             }
+            // The reference library indexes a dataspace with two unlimited
+            // dimensions using a version-2 B-tree, which this crate does not
+            // write; an Extensible Array cannot number such a dataspace at all,
+            // since it has only one dimension it can grow along. Writing one
+            // anyway produced a dataset the reference library refuses to open
+            // ("already found unlimited dimension"), so this is a refusal rather
+            // than a file only this crate can read (issue #299).
+            if ms.iter().filter(|&&m| m == u64::MAX).count() > 1 {
+                return Err(
+                    "at most one dimension of a maxshape may be unlimited; the chunk index \
+                     for more than one is a version-2 B-tree, which this crate cannot write",
+                );
+            }
         }
         Ok(())
     }
@@ -366,6 +380,186 @@ pub struct WrittenChunk {
     pub compressed_size: u64,
     /// Filter mask (0 = all filters applied).
     pub filter_mask: u32,
+}
+
+/// The most index bytes this writer will emit for element slots that hold no
+/// chunk.
+///
+/// A chunk index is built as one in-memory buffer and copied into the file image,
+/// measured at about 2.2x the index bytes in peak memory and 4 ms per MiB, so a
+/// geometry refused at this budget was about to cost 0.13 s and 70 MB to produce
+/// a file whose index is mostly empty.
+///
+/// Stated in bytes rather than slots because an element is 8 bytes unfiltered and
+/// 15 to 20 filtered: the slot count this replaced allowed a filtered index two
+/// and a half times the bytes of an unfiltered one, which nobody chose. 32 MiB is
+/// the unfiltered value that bound already had (4,194,304 slots x 8 bytes).
+///
+/// A *Fixed* Array is dense by format — the reference library writes the same
+/// 80 MB for a 10-million-slot one — so for that index this is a bound on what
+/// this writer is willing to hold in memory, not a divergence from the reference.
+/// An Extensible Array allocates only the blocks its chunks land in, so its
+/// unused bytes are the slack inside those blocks.
+const MAX_UNUSED_INDEX_BYTES: u64 = 32 << 20;
+
+/// A chunk index's element slots: which chunk occupies each one, and how many
+/// slots the index spans.
+///
+/// Not the same thing as the list of chunks, and that is the whole point. A
+/// Fixed Array and an Extensible Array store their elements *positionally*, and
+/// the position is taken over the dataset's maximum chunk grid
+/// ([`crate::chunk_grid`]), so a dataset that can grow leaves gaps between its
+/// chunks and a Fixed Array declares slots it has no chunk for.
+///
+/// Borrows the chunks and records only where they sit, and records nothing at all
+/// when they sit at slots `0..n` — which is every dataset whose maximum shape is
+/// no wider than its shape past the first dimension, and so nearly every dataset
+/// written. A slot table proportional to the *maximum* shape would otherwise be
+/// paid for by writes that have no gaps to describe.
+pub(crate) struct IndexSlots<'a> {
+    chunks: &'a [WrittenChunk],
+    /// `(slot, index into `chunks`)`, ascending by slot. Empty means the chunks
+    /// fill slots `0..chunks.len()` in order, so the slot *is* the index.
+    scattered: Vec<(usize, usize)>,
+    len: usize,
+}
+
+impl<'a> IndexSlots<'a> {
+    /// The slots of an index spanning `len` slots, with `chunks[i]` occupying
+    /// `slot_of[i]`.
+    ///
+    /// `len` comes from [`plan_index_slots`], which is where the span is
+    /// decided and where a span with too many unused slots is refused; what is
+    /// left to refuse here is a span this platform's `usize` cannot address,
+    /// which is what lets every caller below treat it as a plain `usize`.
+    pub(crate) fn new(
+        chunks: &'a [WrittenChunk],
+        slot_of: &[u64],
+        len: u64,
+    ) -> Result<Self, FormatError> {
+        debug_assert_eq!(
+            chunks.len(),
+            slot_of.len(),
+            "every chunk has exactly one index slot"
+        );
+        let len = len.to_usize()?;
+        // The dense case is not an optimization of the general one, it is the
+        // overwhelming majority of writes; recognizing it here is what keeps
+        // them from allocating a table describing an order they are already in.
+        if len == chunks.len() && slot_of.iter().enumerate().all(|(i, &s)| s == i as u64) {
+            return Ok(Self {
+                chunks,
+                scattered: Vec::new(),
+                len,
+            });
+        }
+        let mut scattered = Vec::with_capacity(chunks.len());
+        for (i, &slot) in slot_of.iter().enumerate() {
+            scattered.push((slot.to_usize()?, i));
+        }
+        scattered.sort_unstable();
+        Ok(Self {
+            chunks,
+            scattered,
+            len,
+        })
+    }
+
+    /// The slots of an index whose chunks fill it densely from zero.
+    pub(crate) fn dense(chunks: &'a [WrittenChunk]) -> Self {
+        Self {
+            len: chunks.len(),
+            chunks,
+            scattered: Vec::new(),
+        }
+    }
+
+    /// How many slots the index spans, occupied or not.
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether any of the `count` slots from `start` holds a chunk.
+    ///
+    /// The question an Extensible Array asks of a block before allocating it:
+    /// a block none of whose slots is occupied is not written at all, so a
+    /// mostly-empty index costs what its chunks cost rather than what its span
+    /// does. Answered over the sparse list, so it is a binary search rather than
+    /// a walk of the span.
+    pub(crate) fn any_occupied(&self, start: u64, count: u64) -> bool {
+        // A slot index is a `usize`, so a span starting past that cannot hold
+        // one. The spans an Extensible Array walks reach 2^33 elements, which
+        // is past `usize` on a 32-bit target and reachable there.
+        let Ok(start) = usize::try_from(start) else {
+            return false;
+        };
+        let end = usize::try_from(count)
+            .ok()
+            .and_then(|c| start.checked_add(c))
+            .unwrap_or(usize::MAX);
+        if self.scattered.is_empty() {
+            return start < self.chunks.len().min(end);
+        }
+        let from = self.scattered.partition_point(|&(s, _)| s < start);
+        self.scattered.get(from).is_some_and(|&(s, _)| s < end)
+    }
+
+    /// The chunk at `slot`, or `None` for a slot no chunk occupies — either past
+    /// the last one or in a gap the maximum shape left.
+    pub(crate) fn at(&self, slot: usize) -> Option<&WrittenChunk> {
+        if self.scattered.is_empty() {
+            return self.chunks.get(slot);
+        }
+        self.scattered
+            .binary_search_by_key(&slot, |&(s, _)| s)
+            .ok()
+            .map(|i| &self.chunks[self.scattered[i].1])
+    }
+}
+
+/// Which element slots of an Extensible Array hold a chunk.
+///
+/// Two walks decide the array's shape: [`ea_compute_stats`], which says which
+/// blocks it allocates, and [`build_extensible_array_at`], which emits exactly
+/// those. The length one predicts and the length the other writes are asserted
+/// equal, so the two have to ask the same question — passing it as a value is
+/// what keeps that structural rather than a pair of predicates someone has to
+/// keep in step.
+#[derive(Clone, Copy)]
+pub(crate) enum SlotOccupancy<'a> {
+    /// Slots `0..len` are occupied and nothing past them: an array whose chunks
+    /// fill their slots in order, which is every rank-1 array and every array
+    /// with no maximum shape wider than its shape.
+    Dense(u64),
+    /// The occupied slots of a possibly sparse index.
+    Sparse(&'a IndexSlots<'a>),
+    /// The occupied slots as bare slot numbers, ascending — what the planner
+    /// holds before any chunk has an address, so that it can size the index it
+    /// is about to accept or refuse without laying the chunks out first.
+    Slots(&'a [u64]),
+}
+
+impl SlotOccupancy<'_> {
+    /// Whether a block spanning `count` slots from `start` holds any chunk, and
+    /// so needs to exist.
+    ///
+    /// The reference library allocates a data block when a chunk lands in it, so
+    /// a dataset whose maximum shape is far wider than its shape gets an index
+    /// proportional to its chunks rather than to the gap between them. Writing
+    /// every block in the span instead cost 21x the file libhdf5 writes for the
+    /// same 256-chunk dataset, and put figures in the array's own header
+    /// statistics that disagreed with it by a factor of 40 (issue #299).
+    fn any_occupied(&self, start: u64, count: u64) -> bool {
+        match self {
+            Self::Dense(len) => start < *len,
+            Self::Sparse(slots) => slots.any_occupied(start, count),
+            Self::Slots(sorted) => {
+                let end = start.saturating_add(count);
+                let from = sorted.partition_point(|&s| s < start);
+                sorted.get(from).is_some_and(|&s| s < end)
+            }
+        }
+    }
 }
 
 /// Result of building a chunked dataset.
@@ -827,9 +1021,9 @@ struct FaLayout {
     total_len: u64,
 }
 
-/// Lay out the Fixed Array that would hold `chunks`, without building it.
+/// Lay out the Fixed Array that would hold `slots`, without building it.
 fn fa_layout(
-    chunks: &[WrittenChunk],
+    slots: &IndexSlots<'_>,
     chunk_bytes: u64,
     offset_size: u8,
     length_size: u8,
@@ -844,7 +1038,7 @@ fn fa_layout(
         "a fixed array is written at a 4- or 8-byte address and length width"
     );
     let os = offset_size as usize;
-    let num_elements = chunks.len();
+    let num_elements = slots.len();
     let encoding = chunk_element_encoding(chunk_bytes, offset_size, has_filters);
 
     let fahd_size = 4 + 1 + 1 + 1 + 1 + length_size as usize + os + 4;
@@ -873,19 +1067,19 @@ fn fa_layout(
     }
 }
 
-/// The byte length [`build_fixed_array_at`] would produce for `chunks`, without
+/// The byte length [`build_fixed_array_at`] would produce for `slots`, without
 /// building it. See [`extensible_array_len`] for why this exists.
 ///
 /// `offset_size` and `length_size` must be 4 or 8, which is what the emitter
 /// writes; every caller passes [`INDEX_OFFSET_SIZE`] / [`INDEX_LENGTH_SIZE`].
 pub(crate) fn fixed_array_len(
-    chunks: &[WrittenChunk],
+    slots: &IndexSlots<'_>,
     chunk_bytes: u64,
     offset_size: u8,
     length_size: u8,
     has_filters: bool,
 ) -> u64 {
-    fa_layout(chunks, chunk_bytes, offset_size, length_size, has_filters).total_len
+    fa_layout(slots, chunk_bytes, offset_size, length_size, has_filters).total_len
 }
 
 /// Which chunk index a chunk set gets.
@@ -940,17 +1134,22 @@ impl ChunkIndexKind {
     }
 }
 
-/// Decide which index a chunk set gets. `use_extensible` is whether the dataset
-/// has an unlimited dimension.
-pub(crate) fn chunk_index_kind(use_extensible: bool, num_chunks: usize) -> ChunkIndexKind {
-    if use_extensible {
-        ChunkIndexKind::ExtensibleArray
-    } else if num_chunks == 0 {
-        ChunkIndexKind::Unallocated
-    } else if num_chunks == 1 {
-        ChunkIndexKind::SingleChunk
-    } else {
-        ChunkIndexKind::FixedArray
+/// Decide which index a chunk set gets, from the grid its slots are numbered
+/// over and the number of chunks stored.
+///
+/// The grid decides everything except the chunk-less case, and it has to: the
+/// reference library reads a single-chunk layout only where the *maximum* shape
+/// is one chunk, and asserts (`H5D__single_idx_get_addr`) on a file that names
+/// one where the dataset could hold more. A dataset of one chunk that is allowed
+/// to grow into a second therefore gets a Fixed Array, not the layout its one
+/// chunk would suggest.
+pub(crate) fn chunk_index_kind(grid: &ChunkGrid, num_chunks: usize) -> ChunkIndexKind {
+    match grid.slots() {
+        // An unlimited dimension: no fixed slot count, so the extensible index.
+        None => ChunkIndexKind::ExtensibleArray,
+        _ if num_chunks == 0 => ChunkIndexKind::Unallocated,
+        Some(1) => ChunkIndexKind::SingleChunk,
+        Some(_) => ChunkIndexKind::FixedArray,
     }
 }
 
@@ -962,7 +1161,7 @@ pub(crate) fn chunk_index_kind(use_extensible: bool, num_chunks: usize) -> Chunk
 /// data region's span takes it from the same layout the emission works from.
 pub(crate) fn chunk_index_len(
     kind: ChunkArrayKind,
-    chunks: &[WrittenChunk],
+    slots: &IndexSlots<'_>,
     chunk_bytes: u64,
     offset_size: u8,
     length_size: u8,
@@ -970,26 +1169,26 @@ pub(crate) fn chunk_index_len(
 ) -> u64 {
     match kind {
         ChunkArrayKind::ExtensibleArray => {
-            extensible_array_len(chunks, chunk_bytes, offset_size, length_size, has_filters)
+            extensible_array_len(slots, chunk_bytes, offset_size, length_size, has_filters)
         }
         ChunkArrayKind::FixedArray => {
-            fixed_array_len(chunks, chunk_bytes, offset_size, length_size, has_filters)
+            fixed_array_len(slots, chunk_bytes, offset_size, length_size, has_filters)
         }
     }
 }
 
 /// Build a complete Fixed Array at a known absolute address.
 pub fn build_fixed_array_at(
-    chunks: &[WrittenChunk],
+    slots: &IndexSlots<'_>,
     chunk_bytes: u64,
     offset_size: u8,
     length_size: u8,
     has_filters: bool,
     fa_base_address: u64,
 ) -> Vec<u8> {
-    let num_elements = chunks.len();
+    let num_elements = slots.len();
 
-    let layout = fa_layout(chunks, chunk_bytes, offset_size, length_size, has_filters);
+    let layout = fa_layout(slots, chunk_bytes, offset_size, length_size, has_filters);
     let ChunkElementEncoding {
         chunk_size_bytes,
         elem_size,
@@ -1037,8 +1236,15 @@ pub fn build_fixed_array_at(
 
     debug_assert_eq!(fahd.len(), fahd_total_size);
 
-    // Append one element record (chunk address, plus filtered size + mask).
-    let write_element = |buf: &mut Vec<u8>, chunk: &WrittenChunk| {
+    // Append one element record (chunk address, plus filtered size + mask), or
+    // the undefined address for a slot no chunk occupies — which is how a Fixed
+    // Array says "this chunk of the maximum grid has never been written", and
+    // what the reader tests before it decodes anything else about the element.
+    let write_element = |buf: &mut Vec<u8>, chunk: Option<&WrittenChunk>| {
+        let Some(chunk) = chunk else {
+            write_undefined_element(buf, offset_size, has_filters, chunk_size_bytes);
+            return;
+        };
         #[expect(
             clippy::cast_possible_truncation,
             reason = "chunk address written into the on-disk offset width selected for this file"
@@ -1072,15 +1278,17 @@ pub fn build_fixed_array_at(
     let page_size = layout.page_size;
     if num_elements <= page_size {
         // Non-paged: elements stored directly, then a single checksum.
-        for chunk in chunks {
-            write_element(&mut fadb, chunk);
+        for slot in 0..num_elements {
+            write_element(&mut fadb, slots.at(slot));
         }
         let fadb_checksum = jenkins_lookup3(&fadb);
         fadb.extend_from_slice(&fadb_checksum.to_le_bytes());
     } else {
         // Paged: a page-init bitmap and checksum follow the prefix, then each
-        // page stores its elements followed by its own checksum. We write every
-        // chunk densely, so all pages are initialized.
+        // page stores its elements followed by its own checksum. Every page is
+        // reserved (the reader addresses them at a fixed stride) and every page
+        // is marked initialized, including one whose slots are all empty: the
+        // undefined addresses it holds already say the chunks are unwritten.
         let npages = num_elements.div_ceil(page_size);
         let bitmap_size = npages.div_ceil(8);
         let mut bitmap = vec![0u8; bitmap_size];
@@ -1096,8 +1304,8 @@ pub fn build_fixed_array_at(
             let start = page * page_size;
             let end = core::cmp::min(start + page_size, num_elements);
             let mut page_buf = Vec::with_capacity((end - start) * elem_size);
-            for chunk in &chunks[start..end] {
-                write_element(&mut page_buf, chunk);
+            for slot in start..end {
+                write_element(&mut page_buf, slots.at(slot));
             }
             let page_checksum = jenkins_lookup3(&page_buf);
             page_buf.extend_from_slice(&page_checksum.to_le_bytes());
@@ -1211,19 +1419,19 @@ pub(crate) fn write_ea_addr(buf: &mut Vec<u8>, val: u64, offset_size: u8) {
 }
 
 /// Build a single Extensible Array Data Block (`EADB`) holding the chunk
-/// elements for `[elem_start, elem_start + dblk_nelmts)`. Slots whose absolute
-/// element index reaches `num_elements` are written as undefined.
+/// elements for `[elem_start, elem_start + dblk_nelmts)`. A slot no chunk
+/// occupies is written as undefined, whether it falls past the last chunk or in a
+/// gap between them.
 ///
 /// When `dblk_nelmts` exceeds the page size the block is *paged*: the header
 /// carries its own checksum and the elements are split into contiguous pages of
-/// `page_nelmts` slots, each followed by a checksum. Returns the block bytes and
-/// the number of leading pages that contain at least one real element (used by
-/// the owning super block to build its page-init bitmap). For non-paged blocks
-/// the returned page count is 0.
+/// `page_nelmts` slots, each followed by a checksum. Every page is emitted; which
+/// of them the owning super block marks initialized is that block's business, and
+/// it asks `slots` the same question this does (see the page-init bitmap in
+/// [`build_extensible_array_at`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_eadb(
-    chunks: &[WrittenChunk],
-    num_elements: usize,
+    slots: &IndexSlots<'_>,
     elem_start: usize,
     dblk_nelmts: usize,
     block_offset_rel: u64,
@@ -1234,7 +1442,7 @@ pub(crate) fn build_eadb(
     client_id: u8,
     page_nelmts: usize,
     blk_off_size: usize,
-) -> (Vec<u8>, usize) {
+) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(b"EADB");
     buf.push(0); // version
@@ -1245,22 +1453,15 @@ pub(crate) fn build_eadb(
     if dblk_nelmts <= page_nelmts {
         // Non-paged: elements inline, single checksum.
         for slot in 0..dblk_nelmts {
-            let idx = elem_start + slot;
-            if idx < num_elements {
-                write_chunk_element(
-                    &mut buf,
-                    &chunks[idx],
-                    offset_size,
-                    has_filters,
-                    chunk_size_bytes,
-                );
+            if let Some(chunk) = slots.at(elem_start + slot) {
+                write_chunk_element(&mut buf, chunk, offset_size, has_filters, chunk_size_bytes);
             } else {
                 write_undefined_element(&mut buf, offset_size, has_filters, chunk_size_bytes);
             }
         }
         let cks = jenkins_lookup3(&buf);
         buf.extend_from_slice(&cks.to_le_bytes());
-        (buf, 0)
+        buf
     } else {
         // Paged: the header has its own checksum, then full pages follow. We
         // reserve every page (matching the C library's allocation) and report
@@ -1270,22 +1471,18 @@ pub(crate) fn build_eadb(
         buf.extend_from_slice(&header_cks.to_le_bytes());
 
         let npages = dblk_nelmts / page_nelmts;
-        let mut pages_init = 0usize;
         for page in 0..npages {
             let page_start = elem_start + page * page_nelmts;
             let mut page_buf = Vec::new();
-            let mut has_real = false;
             for slot in 0..page_nelmts {
-                let idx = page_start + slot;
-                if idx < num_elements {
+                if let Some(chunk) = slots.at(page_start + slot) {
                     write_chunk_element(
                         &mut page_buf,
-                        &chunks[idx],
+                        chunk,
                         offset_size,
                         has_filters,
                         chunk_size_bytes,
                     );
-                    has_real = true;
                 } else {
                     write_undefined_element(
                         &mut page_buf,
@@ -1298,11 +1495,8 @@ pub(crate) fn build_eadb(
             let page_cks = jenkins_lookup3(&page_buf);
             page_buf.extend_from_slice(&page_cks.to_le_bytes());
             buf.extend_from_slice(&page_buf);
-            if has_real {
-                pages_init += 1;
-            }
         }
-        (buf, pages_init)
+        buf
     }
 }
 
@@ -1436,6 +1630,7 @@ pub(crate) fn ea_compute_stats(
     offset_size: u8,
     blk_off_size: usize,
     num_elements: u64,
+    occupancy: SlotOccupancy<'_>,
 ) -> EaStats {
     let mut s = EaStats {
         nsuper_blks: 0,
@@ -1447,7 +1642,7 @@ pub(crate) fn ea_compute_stats(
     };
     let mut elem = idx_blk_elmts;
     for &dn in &geom.direct_dblk_nelmts {
-        if elem < num_elements {
+        if occupancy.any_occupied(elem, dn) {
             s.ndata_blks += 1;
             s.data_blk_size += eadb_size(dn, elem_size, page_nelmts, offset_size, blk_off_size);
             s.nelmts += dn;
@@ -1457,12 +1652,12 @@ pub(crate) fn ea_compute_stats(
     for j in 0..geom.nsblk_addrs {
         let (ndblks, dn) = geom.sblks[geom.first_indirect_sblk + j];
         let span = ndblks * dn;
-        if elem < num_elements {
+        if occupancy.any_occupied(elem, span) {
             s.nsuper_blks += 1;
             s.super_blk_size += aesb_size(ndblks, dn, page_nelmts, offset_size, blk_off_size);
             let mut le = elem;
             for _ in 0..ndblks {
-                if le < num_elements {
+                if occupancy.any_occupied(le, dn) {
                     s.ndata_blks += 1;
                     s.data_blk_size +=
                         eadb_size(dn, elem_size, page_nelmts, offset_size, blk_off_size);
@@ -1514,9 +1709,11 @@ struct EaLayout {
     total_len: u64,
 }
 
-/// Lay out the Extensible Array that would hold `chunks`, without building it.
+/// Lay out the Extensible Array that would hold `num_slots` slots with
+/// `occupancy` filled, without building it.
 fn ea_layout(
-    chunks: &[WrittenChunk],
+    occupancy: SlotOccupancy<'_>,
+    num_slots: u64,
     chunk_bytes: u64,
     offset_size: u8,
     length_size: u8,
@@ -1529,12 +1726,19 @@ fn ea_layout(
         ..
     } = encoding;
 
-    // EA creation parameters — must match the HDF5 C library defaults exactly.
-    let max_nelmts_bits: u8 = 32;
-    let idx_blk_elmts: u8 = 4;
-    let min_dblk_nelmts: u8 = 16;
-    let super_blk_min_nelmts: u8 = 4;
-    let max_dblk_nelmts_bits: u8 = 10;
+    let (
+        max_nelmts_bits,
+        idx_blk_elmts,
+        min_dblk_nelmts,
+        super_blk_min_nelmts,
+        max_dblk_nelmts_bits,
+    ) = (
+        EA_MAX_NELMTS_BITS,
+        EA_IDX_BLK_ELMTS,
+        EA_MIN_DBLK_NELMTS,
+        EA_SUPER_BLK_MIN_NELMTS,
+        EA_MAX_DBLK_NELMTS_BITS,
+    );
 
     // Derive the block-size geometry from the shared helper (single source of
     // truth shared with the reader).
@@ -1576,7 +1780,8 @@ fn ea_layout(
         page_nelmts as u64,
         offset_size,
         blk_off_size,
-        chunks.len() as u64,
+        num_slots,
+        occupancy,
     );
     let total_len = (aehd_size + aeib_size) as u64 + stats.data_blk_size + stats.super_blk_size;
 
@@ -1606,13 +1811,21 @@ fn ea_layout(
 /// comes from the same [`EaLayout`] the builder emits from, so no second
 /// derivation of the block geometry can drift away from what is written.
 pub(crate) fn extensible_array_len(
-    chunks: &[WrittenChunk],
+    slots: &IndexSlots<'_>,
     chunk_bytes: u64,
     offset_size: u8,
     length_size: u8,
     has_filters: bool,
 ) -> u64 {
-    ea_layout(chunks, chunk_bytes, offset_size, length_size, has_filters).total_len
+    ea_layout(
+        SlotOccupancy::Sparse(slots),
+        slots.len() as u64,
+        chunk_bytes,
+        offset_size,
+        length_size,
+        has_filters,
+    )
+    .total_len
 }
 
 /// Build a complete Extensible Array at a known absolute address.
@@ -1625,16 +1838,23 @@ pub(crate) fn extensible_array_len(
 /// compatible with the reference HDF5 C library across inline, direct, super
 /// block, and paged ranges (verified by crosscheck tests).
 pub fn build_extensible_array_at(
-    chunks: &[WrittenChunk],
+    slots: &IndexSlots<'_>,
     chunk_bytes: u64,
     offset_size: u8,
     length_size: u8,
     has_filters: bool,
     ea_base_address: u64,
 ) -> Result<Vec<u8>, FormatError> {
-    let num_elements = chunks.len();
+    let num_elements = slots.len();
 
-    let layout = ea_layout(chunks, chunk_bytes, offset_size, length_size, has_filters);
+    let layout = ea_layout(
+        SlotOccupancy::Sparse(slots),
+        slots.len() as u64,
+        chunk_bytes,
+        offset_size,
+        length_size,
+        has_filters,
+    );
     let ChunkElementEncoding {
         chunk_size_bytes,
         elem_size,
@@ -1685,17 +1905,20 @@ pub fn build_extensible_array_at(
     // narrowed (checked) to `usize`.
     let mut elem_cursor: u64 = inline as u64;
 
-    // Direct data blocks: addresses stored directly in the index block.
+    // Direct data blocks: addresses stored directly in the index block. A block
+    // no chunk lands in is not written at all, which is the one question this
+    // walk and `ea_compute_stats` must answer identically -- see
+    // [`SlotOccupancy`].
+    let occupancy = SlotOccupancy::Sparse(slots);
     for &dblk_nelmts in &geom.direct_dblk_nelmts {
-        if elem_cursor >= num_elements as u64 {
+        if !occupancy.any_occupied(elem_cursor, dblk_nelmts) {
             direct_addrs.push(undef_addr);
             elem_cursor += dblk_nelmts;
             continue;
         }
         let addr = body_base + body.len() as u64;
-        let (db_bytes, _) = build_eadb(
-            chunks,
-            num_elements,
+        let db_bytes = build_eadb(
+            slots,
             elem_cursor.to_usize()?,
             dblk_nelmts.to_usize()?,
             elem_cursor - inline as u64,
@@ -1725,7 +1948,7 @@ pub fn build_extensible_array_at(
         // usize, so they stay in u64; only bounded, real-data counts are narrowed.
         let (ndblks, dblk_nelmts) = geom.sblks[sblk_idx];
         let sb_span = ndblks * dblk_nelmts;
-        if elem_cursor >= num_elements as u64 {
+        if !occupancy.any_occupied(elem_cursor, sb_span) {
             sblk_addrs.push(undef_addr);
             elem_cursor += sb_span;
             continue;
@@ -1750,15 +1973,14 @@ pub fn build_extensible_array_at(
         let mut sb_dblk_addrs: Vec<u64> = Vec::with_capacity(ndblks.to_usize()?);
         let mut local_elem = elem_cursor;
         for db_local in 0..ndblks {
-            if local_elem >= num_elements as u64 {
+            if !occupancy.any_occupied(local_elem, dblk_nelmts) {
                 sb_dblk_addrs.push(undef_addr);
                 local_elem += dblk_nelmts;
                 continue;
             }
             let addr = body_base + body.len() as u64;
-            let (db_bytes, pages_init) = build_eadb(
-                chunks,
-                num_elements,
+            let db_bytes = build_eadb(
+                slots,
                 local_elem.to_usize()?,
                 dblk_nelmts.to_usize()?,
                 local_elem - inline as u64,
@@ -1776,7 +1998,31 @@ pub fn build_extensible_array_at(
             body.extend_from_slice(&db_bytes);
             sb_dblk_addrs.push(addr);
             if is_paged {
-                for p in 0..pages_init {
+                // A page is marked initialized when it holds a chunk — the page
+                // that holds it, not the n-th page for the n-th page's worth of
+                // chunks. Those are the same list only while the array has no
+                // gaps, which was true of every Extensible Array this crate
+                // wrote until it began numbering slots over the maximum grid: a
+                // gap then left chunks in pages nothing marked, and so in pages
+                // no reader visits (issue #299).
+                //
+                // Marking every allocated page instead reads correctly too,
+                // since every page is written and an unmarked one holds only
+                // undefined addresses. It is this list because it is the list the
+                // reference library writes: on a 140,000-chunk unlimited dataset
+                // the final super block's bitmap is `ff 80` here and in libhdf5,
+                // and `ff c0` if every page is marked. **No test asserts those
+                // bytes** — locating a super block's bitmap in a file needs the
+                // block's own geometry, so the tests pin the behaviour (a gapped
+                // array reads completely, in both libraries) and not the
+                // encoding. A change here that keeps files readable will not be
+                // caught.
+                let base = local_elem.to_usize()?;
+                for p in 0..npages.to_usize()? {
+                    let page_start = base + p * page_nelmts;
+                    if !(0..page_nelmts).any(|s| slots.at(page_start + s).is_some()) {
+                        continue;
+                    }
                     let global_page = (db_local * npages).to_usize()? + p;
                     page_bitmap[global_page / 8] |= 0x80 >> (global_page % 8);
                 }
@@ -1853,14 +2099,8 @@ pub fn build_extensible_array_at(
     // Inline elements (always write idx_blk_elmts slots; fill unused as undefined).
     #[allow(clippy::needless_range_loop)]
     for i in 0..inline {
-        if i < num_elements {
-            write_chunk_element(
-                &mut aeib,
-                &chunks[i],
-                offset_size,
-                has_filters,
-                chunk_size_bytes,
-            );
+        if let Some(chunk) = slots.at(i) {
+            write_chunk_element(&mut aeib, chunk, offset_size, has_filters, chunk_size_bytes);
         } else {
             write_undefined_element(&mut aeib, offset_size, has_filters, chunk_size_bytes);
         }
@@ -1944,11 +2184,31 @@ pub(crate) struct CompressedChunkSet {
     chunk_dims_u32: Vec<u32>,
     element_size: NonZeroUsize,
     has_filters: bool,
-    use_extensible: bool,
+    /// Which index this set gets, decided once from the maximum chunk grid.
+    kind: ChunkIndexKind,
+    /// The element slot each chunk of `compressed` occupies, in the same order.
+    /// Identical to `0..compressed.len()` unless the maximum shape is wider than
+    /// the shape in some dimension past the first.
+    slot_of_chunk: Vec<u64>,
+    /// How many slots the index spans; see [`IndexSlots`].
+    index_slots: u64,
     pipeline_message: Option<Vec<u8>>,
 }
 
 impl CompressedChunkSet {
+    /// Where this set's chunks sit in its chunk index, given the addresses a
+    /// layout pass assigned them.
+    ///
+    /// Built at each use rather than stored, because the view borrows the
+    /// addresses and those change from pass to pass; it costs no allocation for
+    /// a set whose chunks fill their slots in order.
+    fn index_slots<'a>(
+        &self,
+        written_chunks: &'a [WrittenChunk],
+    ) -> Result<IndexSlots<'a>, FormatError> {
+        IndexSlots::new(written_chunks, &self.slot_of_chunk, self.index_slots)
+    }
+
     /// This set's whole-chunk byte size; see [`full_chunk_bytes`].
     fn full_chunk_bytes(&self) -> u64 {
         full_chunk_bytes(
@@ -1979,9 +2239,22 @@ pub(crate) fn compress_chunks(
         ctx.scale_offset_type,
     )?;
 
+    // Decided from the geometry alone, and decided first: it is the step that
+    // refuses a maximum shape needing an index this writer will not emit, and
+    // refusing after splitting and compressing the whole dataset would do all
+    // that work to reach the same answer.
+    let (kind, slot_of_chunk, index_slots) = plan_index_slots(
+        shape,
+        chunk_dims,
+        maxshape,
+        full_chunk_bytes(chunk_dims.iter().copied(), element_size),
+        pipeline.is_some(),
+    )?;
+
     let chunks = split_into_chunks(raw_data, shape, chunk_dims, element_size, fill)?;
     let num_chunks = chunks.len();
     let has_filters = pipeline.is_some();
+    debug_assert_eq!(slot_of_chunk.len(), num_chunks);
 
     let mut compressed = Vec::with_capacity(num_chunks);
     // One encoder for every chunk of the dataset. Building one per chunk is the
@@ -2010,9 +2283,191 @@ pub(crate) fn compress_chunks(
         chunk_dims_u32,
         element_size,
         has_filters,
-        use_extensible: maxshape.is_some_and(|ms| ms.contains(&u64::MAX)),
+        kind,
+        slot_of_chunk,
+        index_slots,
         pipeline_message: pipeline.as_ref().map(|pl| pl.serialize()),
     })
+}
+
+/// Decide a chunked dataset's index and where each of its chunks sits in it:
+/// the index kind, the element slot of each chunk in dense grid order, and how
+/// many slots the index spans.
+///
+/// One function because the three answers are one decision. The grid the slots
+/// are numbered over is the same grid whose size picks between a single-chunk
+/// layout and a Fixed Array, and a caller that derived them separately could
+/// number chunks for one index while declaring another.
+pub(crate) fn plan_index_slots(
+    shape: &[u64],
+    chunk_dims: &[u64],
+    maxshape: Option<&[u64]>,
+    chunk_bytes: u64,
+    has_filters: bool,
+) -> Result<(ChunkIndexKind, Vec<u64>, u64), FormatError> {
+    let grid = index_grid(shape, chunk_dims, maxshape)?;
+    let counts: Vec<u64> = shape
+        .iter()
+        .zip(chunk_dims)
+        .map(|(d, c)| d.div_ceil(*c))
+        .collect();
+    let num_chunks = counts.iter().product::<u64>().to_usize()?;
+    let kind = chunk_index_kind(&grid, num_chunks);
+
+    let mut slot_of_chunk = Vec::with_capacity(num_chunks);
+    let mut coords = vec![0u64; shape.len()];
+    for dense in 0..num_chunks {
+        let mut remaining = dense as u64;
+        for d in (0..shape.len()).rev() {
+            coords[d] = remaining % counts[d];
+            remaining /= counts[d];
+        }
+        slot_of_chunk.push(grid.slot_of(&coords)?);
+    }
+
+    // A Fixed Array declares a slot for every chunk the maximum shape allows;
+    // an Extensible Array only has to reach the last one written, and grows from
+    // there as the dataset does. A layout with no positional index spans no
+    // slots at all: the single-chunk layout carries its address in the layout
+    // message, and an unallocated one has no address to carry.
+    let index_slots = match kind {
+        ChunkIndexKind::Unallocated | ChunkIndexKind::SingleChunk => 0,
+        ChunkIndexKind::FixedArray => grid.slots().ok_or_else(|| {
+            FormatError::ChunkedReadError(
+                "a Fixed Array cannot index an unlimited dimension".into(),
+            )
+        })?,
+        _ => slot_of_chunk.iter().max().map_or(0, |s| s + 1),
+    };
+    // What the index will actually emit for slots that hold nothing. For a Fixed
+    // Array that is every slot but the chunks'; for an Extensible Array it is the
+    // slack inside the blocks the chunks land in, since the others are not
+    // written at all — so this has to come from the layout rather than from the
+    // span, which for a sparse array overstates it by orders of magnitude.
+    // Sorted already unless the rotation scattered them, which only an
+    // Extensible Array past its first dimension does — so the ordinary write
+    // borrows the plan instead of copying it.
+    let scratch: Vec<u64> = if slot_of_chunk.windows(2).all(|w| w[0] <= w[1]) {
+        Vec::new()
+    } else {
+        let mut v = slot_of_chunk.clone();
+        v.sort_unstable();
+        v
+    };
+    let sorted_slots: &[u64] = if scratch.is_empty() {
+        &slot_of_chunk
+    } else {
+        &scratch
+    };
+    let encoding = chunk_element_encoding(chunk_bytes, INDEX_OFFSET_SIZE, has_filters);
+    let allocated = match kind {
+        ChunkIndexKind::Unallocated | ChunkIndexKind::SingleChunk => 0,
+        ChunkIndexKind::FixedArray => index_slots,
+        ChunkIndexKind::ExtensibleArray => {
+            // An Extensible Array with this crate's creation parameters can
+            // address only so many slots; a chunk numbered past the last block
+            // lands in no block at all, and the writer would drop it silently
+            // while the reference library fails the read ("ring type mismatch
+            // occurred for cache entry"). Refused here rather than left to the
+            // byte budget, which no longer covers it now that an empty block
+            // costs nothing (issue #299).
+            let capacity = ea_addressable_slots();
+            if index_slots > capacity {
+                return Err(FormatError::ChunkedReadError(format!(
+                    "this shape and maximum shape number a chunk at element {} of the chunk \
+                     index, past the {capacity} an extensible array can address; the chunk would \
+                     be dropped. Chunk the dimensions the dataset does not grow along more \
+                     coarsely, or give them a smaller maximum",
+                    index_slots - 1,
+                )));
+            }
+            ea_layout(
+                SlotOccupancy::Slots(sorted_slots),
+                index_slots,
+                chunk_bytes,
+                INDEX_OFFSET_SIZE,
+                INDEX_LENGTH_SIZE,
+                has_filters,
+            )
+            .stats
+            .nelmts
+        }
+    };
+    let unused_bytes = allocated
+        .saturating_sub(num_chunks as u64)
+        .saturating_mul(encoding.elem_size as u64);
+    if unused_bytes > MAX_UNUSED_INDEX_BYTES {
+        return Err(FormatError::ChunkedReadError(format!(
+            "this shape and maximum shape need a chunk index holding {allocated} elements for \
+             {num_chunks} chunk(s), so {unused_bytes} bytes of it describe no chunk, past the \
+             {MAX_UNUSED_INDEX_BYTES} this writer will emit. The unused elements come from the \
+             maximum shape exceeding the shape in a dimension other than the one the dataset \
+             grows along — chunk those dimensions more coarsely, or declare no maximum for them"
+        )));
+    }
+    Ok((kind, slot_of_chunk, index_slots))
+}
+
+/// The Extensible Array creation parameters this crate writes, which are the
+/// reference C library's defaults.
+///
+/// Constants rather than locals because [`ea_addressable_slots`] derives the
+/// array's capacity from the same five numbers the layout is built from. Two
+/// copies of them is how a capacity comes to describe an array nobody writes.
+const EA_MAX_NELMTS_BITS: u8 = 32;
+const EA_IDX_BLK_ELMTS: u8 = 4;
+const EA_MIN_DBLK_NELMTS: u8 = 16;
+const EA_SUPER_BLK_MIN_NELMTS: u8 = 4;
+const EA_MAX_DBLK_NELMTS_BITS: u8 = 10;
+
+/// How many element slots an Extensible Array written with this crate's creation
+/// parameters can address: the index block's inline slots, plus every direct data
+/// block, plus every block of every super block the index block points at.
+///
+/// Derived from the geometry rather than written down, because it *is* the
+/// geometry: change `max_nelmts_bits` or `min_dblk_nelmts` and this changes with
+/// them. With the current parameters it comes to 8,589,934,580 — four inline
+/// slots, 240 across six direct blocks, and 8,589,934,336 across 25 super blocks.
+fn ea_addressable_slots() -> u64 {
+    let geom_header = ExtensibleArrayHeader {
+        client_id: 0,
+        element_size: 8,
+        max_nelmts_bits: EA_MAX_NELMTS_BITS,
+        idx_blk_elmts: EA_IDX_BLK_ELMTS,
+        min_dblk_nelmts: EA_MIN_DBLK_NELMTS,
+        super_blk_min_nelmts: EA_SUPER_BLK_MIN_NELMTS,
+        max_dblk_nelmts_bits: EA_MAX_DBLK_NELMTS_BITS,
+        num_elements: 0,
+        index_block_address: 0,
+    };
+    let geom = EaGeometry::from_header(&geom_header);
+    let direct: u64 = geom.direct_dblk_nelmts.iter().sum();
+    let indirect: u64 = (0..geom.nsblk_addrs)
+        .map(|j| {
+            let (ndblks, dn) = geom.sblks[geom.first_indirect_sblk + j];
+            ndblks * dn
+        })
+        .sum();
+    u64::from(EA_IDX_BLK_ELMTS) + direct + indirect
+}
+
+/// The chunk grid a written dataset's index numbers its slots over.
+///
+/// The read side builds the same grid from the dataspace it parsed
+/// (`chunked_read::index_grid`); this is the writer's half of the same rule, and
+/// the two pick the same [`GridOrder`] from the same fact — whether the maximum
+/// shape names an unlimited dimension.
+fn index_grid(
+    shape: &[u64],
+    chunk_dims: &[u64],
+    maxshape: Option<&[u64]>,
+) -> Result<ChunkGrid, FormatError> {
+    let order = if maxshape.is_some_and(|ms| ms.contains(&u64::MAX)) {
+        GridOrder::UnlimitedFirst
+    } else {
+        GridOrder::RowMajor
+    };
+    ChunkGrid::new(chunk_dims, shape, maxshape, order)
 }
 
 /// Where each of a chunk set's chunks lands when the set is laid out at
@@ -2046,14 +2501,15 @@ fn plan_chunk_slots(set: &CompressedChunkSet, base_address: u64) -> (Vec<Written
 fn chunk_index_bytes(
     set: &CompressedChunkSet,
     written_chunks: &[WrittenChunk],
+    slots: &IndexSlots<'_>,
     index_address: u64,
 ) -> Result<(Vec<u8>, Vec<u8>), FormatError> {
-    let index = match chunk_index_kind(set.use_extensible, written_chunks.len()) {
+    let index = match set.kind {
         // Nothing stored, so nothing to index; the layout message below carries
         // the undefined address in place of one.
         ChunkIndexKind::Unallocated => Vec::new(),
         ChunkIndexKind::ExtensibleArray => build_extensible_array_at(
-            written_chunks,
+            slots,
             set.full_chunk_bytes(),
             INDEX_OFFSET_SIZE,
             INDEX_LENGTH_SIZE,
@@ -2062,7 +2518,7 @@ fn chunk_index_bytes(
         )?,
         ChunkIndexKind::SingleChunk => Vec::new(),
         ChunkIndexKind::FixedArray => build_fixed_array_at(
-            written_chunks,
+            slots,
             set.full_chunk_bytes(),
             INDEX_OFFSET_SIZE,
             INDEX_LENGTH_SIZE,
@@ -2094,7 +2550,7 @@ fn chunk_index_layout(
         clippy::cast_possible_truncation,
         reason = "element size written into the on-disk u32 dimension field selected for this file"
     )]
-    match chunk_index_kind(set.use_extensible, written_chunks.len()) {
+    match set.kind {
         ChunkIndexKind::Unallocated => serialize_v4_fixed_array(
             &set.chunk_dims_u32,
             HADDR_UNDEF,
@@ -2137,20 +2593,21 @@ fn chunk_index_layout(
 /// *first*: the in-place editor asks its free-space list for a region this long
 /// and, if it gets one, assembles the set straight into it rather than growing
 /// the file (issue #261).
-pub(crate) fn chunked_data_len(set: &CompressedChunkSet) -> u64 {
+pub(crate) fn chunked_data_len(set: &CompressedChunkSet) -> Result<u64, FormatError> {
     let (written_chunks, index_address) = plan_chunk_slots(set, 0);
-    let kind = chunk_index_kind(set.use_extensible, written_chunks.len());
-    index_address
+    let slots = set.index_slots(&written_chunks)?;
+    let kind = set.kind;
+    Ok(index_address
         + kind.array_kind().map_or(0, |array| {
             chunk_index_len(
                 array,
-                &written_chunks,
+                &slots,
                 set.full_chunk_bytes(),
                 INDEX_OFFSET_SIZE,
                 INDEX_LENGTH_SIZE,
                 set.has_filters,
             )
-        })
+        }))
 }
 
 /// The chunk-index bytes and data-layout message for `set` at `base_address`,
@@ -2164,7 +2621,8 @@ fn plan_chunked_at(
     base_address: u64,
 ) -> Result<(usize, Vec<u8>, Vec<u8>), FormatError> {
     let (written_chunks, index_address) = plan_chunk_slots(set, base_address);
-    let (index, layout_message) = chunk_index_bytes(set, &written_chunks, index_address)?;
+    let slots = set.index_slots(&written_chunks)?;
+    let (index, layout_message) = chunk_index_bytes(set, &written_chunks, &slots, index_address)?;
     let chunk_bytes_total: usize = set.compressed.iter().map(Vec::len).sum();
     Ok((chunk_bytes_total, index, layout_message))
 }
@@ -2185,21 +2643,20 @@ pub(crate) fn measure_chunked_at(
     base_address: u64,
 ) -> Result<ChunkedMeasure, FormatError> {
     let (written_chunks, index_address) = plan_chunk_slots(set, base_address);
+    let slots = set.index_slots(&written_chunks)?;
     // Derived from the plan already in hand rather than by building the index —
     // and from *this* plan rather than by calling `chunked_data_len`, which
     // would lay the chunks out a second time to reach the same answer.
-    let index_len = chunk_index_kind(set.use_extensible, written_chunks.len())
-        .array_kind()
-        .map_or(0, |array| {
-            chunk_index_len(
-                array,
-                &written_chunks,
-                set.full_chunk_bytes(),
-                INDEX_OFFSET_SIZE,
-                INDEX_LENGTH_SIZE,
-                set.has_filters,
-            )
-        });
+    let index_len = set.kind.array_kind().map_or(0, |array| {
+        chunk_index_len(
+            array,
+            &slots,
+            set.full_chunk_bytes(),
+            INDEX_OFFSET_SIZE,
+            INDEX_LENGTH_SIZE,
+            set.has_filters,
+        )
+    });
     let data_len = (index_address - base_address) + index_len;
     // Not building the index also stops it from *refusing*, and the only way it
     // can is a length that does not fit this platform's `usize`. Every such
@@ -2379,6 +2836,12 @@ pub(crate) struct VerbatimPlan {
     /// The chunk index emitted after the chunk bytes. `None` for the
     /// single-chunk layout, whose address rides in the layout message instead.
     index: Option<VerbatimIndexPlan>,
+    /// The element slot each of `chunks` occupies, and how many slots the index
+    /// spans. `chunks` stays in dense grid order because that is the order the
+    /// bytes are emitted and the provider is asked in, so the index needs this
+    /// alongside it.
+    slot_of_chunk: Vec<u64>,
+    index_slots: u64,
     /// Total byte length of the data region: the chunk bytes, then the index.
     pub(crate) total_len: u64,
 }
@@ -2398,6 +2861,7 @@ pub(crate) struct VerbatimLayout {
 /// identical whether the chunks are later buffered or streamed.
 pub(crate) fn plan_chunked_data_verbatim(
     meta: &[ChunkMeta],
+    shape: &[u64],
     chunk_dims: &[u64],
     element_size: NonZeroUsize,
     pipeline_message: Option<&[u8]>,
@@ -2436,13 +2900,29 @@ pub(crate) fn plan_chunked_data_verbatim(
     let offset_size = INDEX_OFFSET_SIZE;
     let length_size = INDEX_LENGTH_SIZE;
 
-    let use_extensible = maxshape.is_some_and(|ms| ms.contains(&u64::MAX));
+    // The chunks arrived in dense grid order; where each one's index element
+    // sits is the maximum grid's business, and the same decision the encode path
+    // makes (`plan_index_slots`).
+    let (kind, slot_of_chunk, index_slots) = plan_index_slots(
+        shape,
+        chunk_dims,
+        maxshape,
+        full_chunk_bytes(chunk_dims.iter().copied(), element_size),
+        has_filters,
+    )?;
+    if slot_of_chunk.len() != num_chunks {
+        return Err(FormatError::ChunkedReadError(format!(
+            "a verbatim chunked dataset of shape {shape:?} holds {} chunks, not the \
+             {num_chunks} it was given",
+            slot_of_chunk.len(),
+        )));
+    }
+    let slots = IndexSlots::new(&written_chunks, &slot_of_chunk, index_slots)?;
 
     // The index sits immediately after the chunk bytes. Its length is taken from
     // the index's own layout rather than from a build of it, so this planner
     // touches no index bytes either — which is what lets `write_chunked_relocatable`
     // plan at a provisional base purely to size the region.
-    let kind = chunk_index_kind(use_extensible, num_chunks);
     let index_address = base_address + cursor;
     let chunk_bytes = full_chunk_bytes(chunk_dims.iter().copied(), element_size);
     let index = kind.array_kind().map(|array| VerbatimIndexPlan {
@@ -2452,7 +2932,7 @@ pub(crate) fn plan_chunked_data_verbatim(
         chunk_bytes,
         len: chunk_index_len(
             array,
-            &written_chunks,
+            &slots,
             chunk_bytes,
             offset_size,
             length_size,
@@ -2514,6 +2994,8 @@ pub(crate) fn plan_chunked_data_verbatim(
     Ok(VerbatimLayout {
         plan: VerbatimPlan {
             chunks: written_chunks,
+            slot_of_chunk,
+            index_slots,
             index,
             total_len: cursor,
         },
@@ -2560,9 +3042,10 @@ pub(crate) fn emit_chunked_data_verbatim<S: ByteSink>(
     // plan the same region more than once (at a provisional base to size it, then
     // at the real one), and only this call writes it.
     if let Some(index) = &plan.index {
+        let slots = IndexSlots::new(&plan.chunks, &plan.slot_of_chunk, plan.index_slots)?;
         let bytes = match index.kind {
             ChunkArrayKind::ExtensibleArray => build_extensible_array_at(
-                &plan.chunks,
+                &slots,
                 index.chunk_bytes,
                 INDEX_OFFSET_SIZE,
                 INDEX_LENGTH_SIZE,
@@ -2570,7 +3053,7 @@ pub(crate) fn emit_chunked_data_verbatim<S: ByteSink>(
                 index.address,
             )?,
             ChunkArrayKind::FixedArray => build_fixed_array_at(
-                &plan.chunks,
+                &slots,
                 index.chunk_bytes,
                 INDEX_OFFSET_SIZE,
                 INDEX_LENGTH_SIZE,
@@ -2595,6 +3078,7 @@ pub(crate) fn emit_chunked_data_verbatim<S: ByteSink>(
 mod tests {
     use super::*;
     use crate::chunk_cache::ChunkCache;
+
     use crate::chunked_read::read_chunked_data_cached;
     use crate::convert::nz;
     use crate::data_layout::DataLayout;
@@ -2710,6 +3194,81 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The index-size bound counts the bytes that describe no chunk.
+    ///
+    /// Two things follow, and neither did from the slot count this replaced. A
+    /// dataset of four million chunks needs a four-million-element index
+    /// whatever its maximum shape says, so a bound on the total refuses a
+    /// perfectly ordinary dataset that names no maximum at all. And a filtered
+    /// element is 15 to 20 bytes against an unfiltered 8, so the same slot count
+    /// allowed a filtered index two and a half times the bytes.
+    ///
+    /// Asserted here rather than through a file because writing the dense case
+    /// costs 50 MB and the arithmetic is the whole claim.
+    #[test]
+    fn the_index_bound_counts_unused_bytes_rather_than_slots() {
+        // A dense index is never bounded, however large: every slot holds a
+        // chunk, so none of its bytes describe nothing.
+        let many = (MAX_UNUSED_INDEX_BYTES / 8 + 1) as usize;
+        let (kind, slots, span) = plan_index_slots(&[many as u64], &[1], None, 8, false)
+            .expect("a dense index is not bounded");
+        assert!(matches!(kind, ChunkIndexKind::FixedArray));
+        assert_eq!(slots.len(), many);
+        assert_eq!(span, many as u64);
+
+        // The same span reached by a maximum shape instead, holding one chunk,
+        // is almost entirely unused — and lands at the same *byte* figure
+        // whether or not the dataset is filtered, which is the point of
+        // measuring in bytes. A filtered element is wider, so that is a smaller
+        // span.
+        let chunk_bytes = 4096;
+        for has_filters in [false, true] {
+            let elem = u64::from(
+                chunk_element_encoding(chunk_bytes, INDEX_OFFSET_SIZE, has_filters).elem_size
+                    as u32,
+            );
+            let widest = MAX_UNUSED_INDEX_BYTES / elem + 1;
+            plan_index_slots(&[1], &[1], Some(&[widest]), chunk_bytes, has_filters)
+                .expect("an index exactly at the budget is written");
+            let err = plan_index_slots(&[1], &[1], Some(&[widest + 1]), chunk_bytes, has_filters)
+                .unwrap_err();
+            assert!(
+                format!("{err}").contains("describe no chunk"),
+                "filtered={has_filters}: {err}"
+            );
+        }
+
+        // Room to grow along the dimension the dataset grows in costs no unused
+        // slots however far it reaches, so it stays accepted.
+        plan_index_slots(&[8, 8], &[4, 4], Some(&[u64::MAX, 8]), 64, false)
+            .expect("growth along the indexed dimension leaves no gaps");
+    }
+
+    /// An Extensible Array can address only as many slots as its blocks cover.
+    /// A chunk numbered past that lands in no block, and the writer used to drop
+    /// it — leaving a 580-byte file that this crate read as a zero and the
+    /// reference library refused with "ring type mismatch occurred for cache
+    /// entry" (issue #299).
+    ///
+    /// Unreachable while the size bound counted slots, since getting there took
+    /// billions of unused ones. Counting bytes instead lets a sparse array reach
+    /// it cheaply, so the capacity is now its own refusal.
+    #[test]
+    fn an_extensible_array_refuses_a_chunk_past_the_slots_it_can_address() {
+        let capacity = ea_addressable_slots();
+        assert_eq!(
+            capacity, 8_589_934_580,
+            "the C library's default creation parameters address this many slots"
+        );
+
+        // Two chunks a stride apart: the second sits at slot `stride`.
+        let at =
+            |stride: u64| plan_index_slots(&[2, 1], &[1, 1], Some(&[u64::MAX, stride]), 4, false);
+        at(capacity - 1).expect("the last addressable slot is written");
+        let err = at(capacity).unwrap_err();
+        assert!(format!("{err}").contains("can address"), "{err}");
     }
 
     /// Auto-chunking resolves the chunk to the whole shape, so a zero-element
@@ -3043,7 +3602,7 @@ mod tests {
             })
             .collect();
         let layout =
-            plan_chunked_data_verbatim(&meta, &[7], nz(8), Some(&[]), 0x1000, None).unwrap();
+            plan_chunked_data_verbatim(&meta, &[21], &[7], nz(8), Some(&[]), 0x1000, None).unwrap();
 
         let planned: Vec<u64> = layout
             .plan
@@ -3077,23 +3636,25 @@ mod tests {
         // kind has to be emitted to be covered. Assert the signature at the
         // planned offset, not just the total: a plan that reserved the right
         // number of bytes for the wrong structure would pass a length check.
-        for (label, maxshape, chunk_sizes, signature) in [
+        for (label, shape, maxshape, chunk_sizes, signature) in [
             (
                 "fixed array",
+                &[21u64][..],
                 None,
                 &[37u64, 111, 5][..],
                 Some(&b"FAHD"[..]),
             ),
             (
                 "extensible array",
+                &[21u64][..],
                 Some(&[u64::MAX][..]),
                 &[37u64, 111, 5][..],
                 Some(&b"EAHD"[..]),
             ),
-            // One chunk and no unlimited dimension is the single-chunk layout:
-            // its address rides in the layout message and nothing follows the
-            // chunk bytes at all.
-            ("single chunk", None, &[37u64][..], None),
+            // One chunk whose maximum shape is that one chunk is the
+            // single-chunk layout: its address rides in the layout message and
+            // nothing follows the chunk bytes at all.
+            ("single chunk", &[7u64][..], None, &[37u64][..], None),
         ] {
             let meta: Vec<ChunkMeta> = chunk_sizes
                 .iter()
@@ -3103,7 +3664,7 @@ mod tests {
                 })
                 .collect();
             let layout =
-                plan_chunked_data_verbatim(&meta, &[7], nz(8), Some(&[]), 0x1000, maxshape)
+                plan_chunked_data_verbatim(&meta, shape, &[7], nz(8), Some(&[]), 0x1000, maxshape)
                     .unwrap();
             let mut emitted: Vec<u8> = Vec::new();
             emit_chunked_data_verbatim(&mut emitted, &layout.plan, &SizedChunks(chunk_sizes))
@@ -3134,7 +3695,7 @@ mod tests {
     /// is refused rather than planned as an empty region.
     #[test]
     fn a_verbatim_plan_with_no_chunks_is_refused() {
-        let result = plan_chunked_data_verbatim(&[], &[7], nz(8), None, 0x1000, None);
+        let result = plan_chunked_data_verbatim(&[], &[21], &[7], nz(8), None, 0x1000, None);
         assert!(
             matches!(result, Err(FormatError::ChunkedReadError(_))),
             "a chunk-less plan must be refused"
@@ -3417,7 +3978,7 @@ mod tests {
                 filter_mask: 0,
             },
         ];
-        let fa = build_fixed_array_at(&chunks, 160, 8, 8, false, 0x2000);
+        let fa = build_fixed_array_at(&IndexSlots::dense(&chunks), 160, 8, 8, false, 0x2000);
         // Should start with FAHD
         assert_eq!(&fa[0..4], b"FAHD");
         // FAHD size = 4+1+1+1+1+8+8+4 = 28
@@ -3462,7 +4023,8 @@ mod tests {
                 filter_mask: 0,
             },
         ];
-        let ea = build_extensible_array_at(&chunks, 80, 8, 8, false, 0x2000).unwrap();
+        let ea = build_extensible_array_at(&IndexSlots::dense(&chunks), 80, 8, 8, false, 0x2000)
+            .unwrap();
         assert_eq!(&ea[0..4], b"EAHD");
         // Find EAIB after EAHD: 12 fixed + 6*8 stats + 8 addr + 4 checksum = 72
         let aehd_size = 4 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 6 * 8 + 8 + 4;
@@ -3606,7 +4168,9 @@ mod tests {
                     filter_mask: 0,
                 })
                 .collect();
-            let ea = build_extensible_array_at(&chunks, 8, 8, 8, false, 0x100000).unwrap();
+            let ea =
+                build_extensible_array_at(&IndexSlots::dense(&chunks), 8, 8, 8, false, 0x100000)
+                    .unwrap();
             // Parse the 6 stats from the EAHD (12-byte fixed prefix, then 6 * ls).
             let stat =
                 |k: usize| u64::from_le_bytes(ea[12 + k * 8..12 + k * 8 + 8].try_into().unwrap());
@@ -3618,7 +4182,8 @@ mod tests {
                 max_idx_set: stat(4),
                 nelmts: stat(5),
             };
-            let computed = super::ea_compute_stats(&geom, 4, 8, 1024, 8, 4, n);
+            let computed =
+                super::ea_compute_stats(&geom, 4, 8, 1024, 8, 4, n, SlotOccupancy::Dense(n));
             assert_eq!(computed, built, "stats mismatch at n={n}");
         }
     }
@@ -3661,7 +4226,7 @@ mod tests {
                     )
                     .unwrap();
 
-                    let planned = chunked_data_len(&set);
+                    let planned = chunked_data_len(&set).unwrap();
                     let assembled = assemble_chunked_at(&set, 0x10_0000).unwrap();
                     assert_eq!(
                         planned,
@@ -3704,10 +4269,15 @@ mod tests {
                     filter_mask: 0,
                 })
                 .collect();
-            let planned =
-                fixed_array_len(&chunks, chunk_bytes, offset_size, length_size, has_filters);
+            let planned = fixed_array_len(
+                &IndexSlots::dense(&chunks),
+                chunk_bytes,
+                offset_size,
+                length_size,
+                has_filters,
+            );
             let built = build_fixed_array_at(
-                &chunks,
+                &IndexSlots::dense(&chunks),
                 chunk_bytes,
                 offset_size,
                 length_size,
@@ -3769,10 +4339,15 @@ mod tests {
                     filter_mask: 0,
                 })
                 .collect();
-            let planned =
-                extensible_array_len(&chunks, chunk_bytes, offset_size, length_size, has_filters);
+            let planned = extensible_array_len(
+                &IndexSlots::dense(&chunks),
+                chunk_bytes,
+                offset_size,
+                length_size,
+                has_filters,
+            );
             let built = build_extensible_array_at(
-                &chunks,
+                &IndexSlots::dense(&chunks),
                 chunk_bytes,
                 offset_size,
                 length_size,
@@ -3825,7 +4400,7 @@ mod tests {
         let widths: Vec<usize> = CHUNK_BYTES
             .iter()
             .map(|&chunk_bytes| {
-                super::ea_layout(&[], chunk_bytes, 8, 8, true)
+                super::ea_layout(SlotOccupancy::Dense(0), 0, chunk_bytes, 8, 8, true)
                     .encoding
                     .chunk_size_bytes
             })

@@ -881,6 +881,11 @@ impl Located {
             file.offset_size(),
             self.blk_off_size,
             num_chunks,
+            // This engine grows a rank-1 unlimited dataset (the parse above
+            // refuses any other), and a rank-1 index numbers its chunks
+            // 0..n with no gap to skip, so the occupancy is dense by
+            // construction and this is the predicate the walk always had.
+            crate::chunked_write::SlotOccupancy::Dense(num_chunks),
         );
         let ls = file.length_size() as u64;
         let ea_addr = self.ea_addr;

@@ -13,6 +13,7 @@ use core::num::NonZeroUsize;
 use crate::btree_v1::btree_v1_node_header_size;
 use crate::bytes::read_offset;
 use crate::chunk_cache::ChunkCache;
+use crate::chunk_grid::{ChunkGrid, GridOrder};
 use crate::chunk_span::ChunkSpanReader;
 use crate::convert::{TryToUsize, nonzero_usize_from, slice_range, u32_from};
 use crate::data_layout::DataLayout;
@@ -1209,6 +1210,26 @@ fn spatial_coord(chunk_info: &ChunkInfo, rank: usize) -> &[u64] {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// The chunk grid a dataset's positional index numbers its slots over.
+///
+/// Built from the dataspace's *maximum* extent, falling back to its current
+/// one, because that is what the slot numbering is taken over; `order` says
+/// whether the index rotates an unlimited dimension to the front. See
+/// [`crate::chunk_grid`] for the rule itself.
+fn index_grid(
+    dataspace: &Dataspace,
+    spatial_chunk_dims: &[u32],
+    order: GridOrder,
+) -> Result<ChunkGrid, FormatError> {
+    let chunk_dims: Vec<u64> = spatial_chunk_dims.iter().map(|&d| u64::from(d)).collect();
+    ChunkGrid::new(
+        &chunk_dims,
+        &dataspace.dimensions,
+        dataspace.max_dimensions.as_deref(),
+        order,
+    )
+}
+
 pub(crate) fn collect_chunks_for_layout_from_source<S: Source + ?Sized>(
     source: &S,
     version: u8,
@@ -1262,7 +1283,7 @@ pub(crate) fn collect_chunks_for_layout_from_source<S: Source + ?Sized>(
             read_fixed_array_chunks_from_source(
                 source,
                 &header,
-                &dataspace.dimensions,
+                &index_grid(dataspace, &spatial_chunk_dims, GridOrder::RowMajor)?,
                 &spatial_chunk_dims,
                 u32_from(elem_size.get() as u64)?,
                 offset_size,
@@ -1276,7 +1297,7 @@ pub(crate) fn collect_chunks_for_layout_from_source<S: Source + ?Sized>(
             read_extensible_array_chunks_from_source(
                 source,
                 &header,
-                &dataspace.dimensions,
+                &index_grid(dataspace, &spatial_chunk_dims, GridOrder::UnlimitedFirst)?,
                 &spatial_chunk_dims,
                 u32_from(elem_size.get() as u64)?,
                 offset_size,
@@ -1773,7 +1794,7 @@ pub fn read_chunked_data_cached(
                 read_fixed_array_chunks(
                     file_data,
                     &header,
-                    &dataspace.dimensions,
+                    &index_grid(dataspace, &spatial_chunk_dims, GridOrder::RowMajor)?,
                     &spatial_chunk_dims,
                     elem_width.get(),
                     offset_size,
@@ -1791,7 +1812,7 @@ pub fn read_chunked_data_cached(
                 read_extensible_array_chunks(
                     file_data,
                     &header,
-                    &dataspace.dimensions,
+                    &index_grid(dataspace, &spatial_chunk_dims, GridOrder::UnlimitedFirst)?,
                     &spatial_chunk_dims,
                     elem_width.get(),
                     offset_size,

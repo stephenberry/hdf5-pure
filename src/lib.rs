@@ -144,6 +144,7 @@ pub(crate) mod btree_v2_write;
 pub(crate) mod bytes;
 pub(crate) mod checksum;
 pub(crate) mod chunk_cache;
+pub(crate) mod chunk_grid;
 pub(crate) mod chunk_span;
 pub(crate) mod chunked_read;
 pub(crate) mod chunked_write;
