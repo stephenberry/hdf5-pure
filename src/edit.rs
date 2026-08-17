@@ -4756,6 +4756,7 @@ impl WriteEngine {
                     .collect();
                 Ok(WritePlan::Moving(MovingWrite::Chunked {
                     region,
+                    shape: disk_ds.dimensions.clone(),
                     chunk_dims: spatial,
                     element_size,
                     maxshape,
@@ -5497,6 +5498,7 @@ impl WriteEngine {
 
                 Ok(CopyTree::DatasetChunked {
                     region,
+                    shape: ds.dimensions.clone(),
                     chunk_dims,
                     element_size,
                     maxshape,
@@ -5578,6 +5580,7 @@ impl WriteEngine {
             }
             CopyTree::DatasetChunked {
                 region,
+                shape,
                 chunk_dims,
                 element_size,
                 maxshape,
@@ -5587,6 +5590,7 @@ impl WriteEngine {
                 dense_attrs,
             } => self.write_chunked_relocatable(
                 region,
+                shape,
                 chunk_dims,
                 *element_size,
                 maxshape.as_deref(),
@@ -5640,6 +5644,7 @@ impl WriteEngine {
     fn write_chunked_relocatable(
         &mut self,
         region: &[u8],
+        shape: &[u64],
         chunk_dims: &[u64],
         element_size: NonZeroUsize,
         maxshape: Option<&[u64]>,
@@ -5657,6 +5662,7 @@ impl WriteEngine {
         // below is what the emit works from.
         let sizing = plan_chunked_data_verbatim(
             meta,
+            shape,
             chunk_dims,
             element_size,
             pipeline_message,
@@ -5670,6 +5676,7 @@ impl WriteEngine {
                 // the userblock base back (see `build_chunked_dataset`).
                 let layout = plan_chunked_data_verbatim(
                     meta,
+                    shape,
                     chunk_dims,
                     element_size,
                     pipeline_message,
@@ -5765,6 +5772,7 @@ impl WriteEngine {
             }
             MovingWrite::Chunked {
                 region,
+                shape,
                 chunk_dims,
                 element_size,
                 maxshape,
@@ -5774,6 +5782,7 @@ impl WriteEngine {
                 ..
             } => self.write_chunked_relocatable(
                 region,
+                shape,
                 chunk_dims,
                 *element_size,
                 maxshape.as_deref(),
@@ -5885,16 +5894,15 @@ impl WriteEngine {
         // did — including when the dataset it grows was created empty.
         let chunk_bytes =
             full_chunk_bytes(chunk_dims_u32.iter().map(|&d| u64::from(d)), element_size);
-        let ea_len = extensible_array_len(
-            &combined,
-            chunk_bytes,
-            OFFSET_SIZE,
-            LENGTH_SIZE,
-            has_filters,
-        );
+        // Rank 1 and unlimited along axis 0 (`prepare_append` refuses anything
+        // else), so every chunk's index slot is its position in the grid and the
+        // array is dense from zero.
+        let slots = crate::chunked_write::IndexSlots::dense(&combined);
+        let ea_len =
+            extensible_array_len(&slots, chunk_bytes, OFFSET_SIZE, LENGTH_SIZE, has_filters);
         let (ea_addr, ()) = self.place_relocatable(ea_len, PageType::Raw, |ea_base| {
             let bytes = build_extensible_array_at(
-                &combined,
+                &slots,
                 chunk_bytes,
                 OFFSET_SIZE,
                 LENGTH_SIZE,
@@ -6273,7 +6281,7 @@ impl WriteEngine {
         // Chunk data and the index beside it are raw (see `chunked_storage_spans`,
         // which reclaims both as raw).
         let (_addr, (layout_message, pipeline_message)) =
-            self.place_relocatable(chunked_data_len(&set), PageType::Raw, |stored_base| {
+            self.place_relocatable(chunked_data_len(&set)?, PageType::Raw, |stored_base| {
                 let result = assemble_chunked_at(&set, stored_base)?;
                 Ok((
                     result.data_bytes,
@@ -6797,6 +6805,10 @@ enum CopyTree {
     /// [`DatasetVerbatim`](CopyTree::DatasetVerbatim) for `dense_attrs`.
     DatasetChunked {
         region: Vec<u8>,
+        /// The dataset's current shape. Held because the index's element
+        /// numbering is taken over the *maximum* chunk grid, which needs both
+        /// extents (see [`crate::chunk_grid`]).
+        shape: Vec<u64>,
         chunk_dims: Vec<u64>,
         element_size: NonZeroUsize,
         maxshape: Option<Vec<u64>>,
@@ -6873,6 +6885,8 @@ enum MovingWrite {
     /// chunk storage at `old_addr` is freed after the commit lands.
     Chunked {
         region: Vec<u8>,
+        /// See [`CopyTree::DatasetChunked::shape`].
+        shape: Vec<u64>,
         chunk_dims: Vec<u64>,
         element_size: NonZeroUsize,
         maxshape: Option<Vec<u64>>,
@@ -7804,8 +7818,15 @@ fn try_inplace_chunk_writes<S: Source + ?Sized>(
     // A shrinking overwrite changes the index-recorded chunk sizes, so the index
     // must be rebuilt in place to match; an equal-size one leaves it untouched.
     if any_shrunk {
-        let (index_addr, index_bytes) =
-            try_rebuild_index_in_place(src, layout, raw_size, &grid.grid_order, new_bytes)?;
+        let (index_addr, index_bytes) = try_rebuild_index_in_place(
+            src,
+            layout,
+            ds,
+            spatial,
+            raw_size,
+            &grid.grid_order,
+            new_bytes,
+        )?;
         spans.push((index_addr as u64, index_bytes.len() as u64));
         writes.push((index_addr, index_bytes));
     }
@@ -7838,9 +7859,12 @@ fn try_inplace_chunk_writes<S: Source + ?Sized>(
 /// atomic: a crash mid-write can tear the index and leave the dataset needing a
 /// rewrite. It is used only on the in-place path, whose linearization point is the
 /// synced data write.
+#[allow(clippy::too_many_arguments)]
 fn try_rebuild_index_in_place<S: Source + ?Sized>(
     src: &S,
     layout: &DataLayout,
+    ds: &Dataspace,
+    spatial: &[u64],
     raw_size: u64,
     grid_order: &[crate::chunked_read::ChunkInfo],
     new_bytes: &[Vec<u8>],
@@ -7863,6 +7887,18 @@ fn try_rebuild_index_in_place<S: Source + ?Sized>(
             filter_mask: 0,
         })
         .collect();
+    // `grid_order` is dense row-major over the *current* shape; where each of
+    // those chunks sits in the index is the maximum grid's business, and the
+    // rebuild has to reproduce the numbering the original index was written
+    // with. Same rule, same function as the writer.
+    let (_, slot_of_chunk, index_slots) = crate::chunked_write::plan_index_slots(
+        &ds.dimensions,
+        spatial,
+        ds.max_dimensions.as_deref(),
+    )
+    .ok()?;
+    let slots =
+        crate::chunked_write::IndexSlots::new(&written, &slot_of_chunk, index_slots).ok()?;
     let new_index = match (version, chunk_index_type) {
         // `raw_size` is the whole-chunk byte size, which is what the element
         // width derives from — the same value the original index was built with,
@@ -7871,7 +7907,7 @@ fn try_rebuild_index_in_place<S: Source + ?Sized>(
         // disagree; the length check below then rejects it and the caller
         // relocates, which is the safe direction.)
         (4, Some(3)) => crate::chunked_write::build_fixed_array_at(
-            &written,
+            &slots,
             raw_size,
             OFFSET_SIZE,
             LENGTH_SIZE,
@@ -7879,7 +7915,7 @@ fn try_rebuild_index_in_place<S: Source + ?Sized>(
             *index_addr,
         ),
         (4, Some(4)) => crate::chunked_write::build_extensible_array_at(
-            &written,
+            &slots,
             raw_size,
             OFFSET_SIZE,
             LENGTH_SIZE,

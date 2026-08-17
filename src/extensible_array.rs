@@ -10,6 +10,7 @@ extern crate alloc;
 use alloc::{format, vec, vec::Vec};
 
 use crate::bytes::{read_length, read_offset, read_optional_offset};
+use crate::chunk_grid::ChunkGrid;
 use crate::chunked_read::ChunkInfo;
 use crate::convert::{TryToUsize, is_undefined_addr, u32_from};
 use crate::error::FormatError;
@@ -241,8 +242,7 @@ fn read_element(
     offset_size: u8,
     chunk_byte_size: u64,
     linear_index: usize,
-    num_chunks_per_dim: &[u64],
-    chunk_dimensions: &[u32],
+    grid: &ChunkGrid,
 ) -> Result<(Option<ChunkInfo>, usize), FormatError> {
     let os = offset_size as usize;
 
@@ -257,7 +257,7 @@ fn read_element(
         let Some(address) = read_optional_offset(data, pos, offset_size)? else {
             return Ok((None, os));
         };
-        let offsets = index_to_chunk_offsets(linear_index, num_chunks_per_dim, chunk_dimensions);
+        let offsets = grid.offsets_at(linear_index as u64)?;
         Ok((
             Some(ChunkInfo {
                 chunk_size: u32_from(chunk_byte_size)?,
@@ -294,7 +294,7 @@ fn read_element(
             data[fm_off + 2],
             data[fm_off + 3],
         ]);
-        let offsets = index_to_chunk_offsets(linear_index, num_chunks_per_dim, chunk_dimensions);
+        let offsets = grid.offsets_at(linear_index as u64)?;
         Ok((
             Some(ChunkInfo {
                 chunk_size: u32_from(chunk_size)?,
@@ -305,24 +305,6 @@ fn read_element(
             elem_total,
         ))
     }
-}
-
-/// Convert a linear chunk index to N-dimensional chunk offsets in dataset space.
-fn index_to_chunk_offsets(
-    index: usize,
-    num_chunks_per_dim: &[u64],
-    chunk_dimensions: &[u32],
-) -> Vec<u64> {
-    let rank = num_chunks_per_dim.len();
-    let mut offsets = vec![0u64; rank];
-    let mut remaining = index as u64;
-    for d in (0..rank).rev() {
-        let nchunks = num_chunks_per_dim[d];
-        let chunk_idx = remaining % nchunks;
-        remaining /= nchunks;
-        offsets[d] = chunk_idx * chunk_dimensions[d] as u64;
-    }
-    offsets
 }
 
 /// Collect elements from a data block at the given offset.
@@ -336,8 +318,7 @@ fn read_data_block_elements(
     chunk_byte_size: u64,
     start_index: usize,
     total_elements: usize,
-    num_chunks_per_dim: &[u64],
-    chunk_dimensions: &[u32],
+    grid: &ChunkGrid,
 ) -> Result<Vec<ChunkInfo>, FormatError> {
     // AEDB: signature(4) + version(1) + client_id(1) + header_address(offset_size)
     let db_header_size = 4 + 1 + 1 + offset_size as usize;
@@ -379,8 +360,7 @@ fn read_data_block_elements(
             offset_size,
             chunk_byte_size,
             start_index + i,
-            num_chunks_per_dim,
-            chunk_dimensions,
+            grid,
         )?;
         if let Some(ci) = info {
             chunks.push(ci);
@@ -423,8 +403,7 @@ fn read_paged_data_block(
     chunk_byte_size: u64,
     start_index: usize,
     total_elements: usize,
-    num_chunks_per_dim: &[u64],
-    chunk_dimensions: &[u32],
+    grid: &ChunkGrid,
 ) -> Result<Vec<ChunkInfo>, FormatError> {
     let blk_off_size = (header.max_nelmts_bits as usize).div_ceil(8);
     // Header includes its own checksum: sig(4)+ver(1)+cid(1)+hdr_addr+block_offset+checksum(4)
@@ -463,8 +442,7 @@ fn read_paged_data_block(
                 offset_size,
                 chunk_byte_size,
                 page_start + i,
-                num_chunks_per_dim,
-                chunk_dimensions,
+                grid,
             )?;
             if let Some(ci) = info {
                 chunks.push(ci);
@@ -488,21 +466,13 @@ fn read_paged_data_block(
 pub fn read_extensible_array_chunks(
     file_data: &[u8],
     header: &ExtensibleArrayHeader,
-    dataset_dims: &[u64],
+    grid: &ChunkGrid,
     chunk_dimensions: &[u32],
     element_size: u32,
     offset_size: u8,
     _length_size: u8,
 ) -> Result<Vec<ChunkInfo>, FormatError> {
-    let rank = chunk_dimensions.len();
     let os = offset_size as usize;
-
-    let mut num_chunks_per_dim = Vec::with_capacity(rank);
-    for d in 0..rank {
-        let ds_dim = dataset_dims[d];
-        let ch_dim = chunk_dimensions[d] as u64;
-        num_chunks_per_dim.push(ds_dim.div_ceil(ch_dim));
-    }
 
     let chunk_byte_size: u64 =
         chunk_dimensions.iter().map(|&d| d as u64).product::<u64>() * element_size as u64;
@@ -531,11 +501,12 @@ pub fn read_extensible_array_chunks(
     // Bound the traversal by the dataset's dimensions, not just the array's
     // stored element count. A SWMR writer publishes the grown chunk index
     // (header element count) before the grown dataspace dimension; reading only
-    // as many chunks as the current dimensions imply means an interrupted append
-    // (index ahead of dimensions) yields a consistent prefix rather than chunks
-    // beyond the dataset bounds.
-    let dims_chunks: usize = num_chunks_per_dim.iter().product::<u64>().to_usize()?;
-    let total_elements = (header.num_elements.to_usize()?).min(dims_chunks);
+    // as far as the current dimensions reach means an interrupted append (index
+    // ahead of dimensions) yields a consistent prefix rather than chunks beyond
+    // the dataset bounds. The bound is a slot number rather than a chunk count
+    // because a maximum shape wider than the shape leaves gaps between the
+    // occupied slots (see `ChunkGrid::slot_limit`).
+    let total_elements = (header.num_elements.to_usize()?).min(grid.slot_limit()?.to_usize()?);
 
     // 1. Read inline elements in index block
     let n_inline = header.idx_blk_elmts as usize;
@@ -551,8 +522,7 @@ pub fn read_extensible_array_chunks(
             offset_size,
             chunk_byte_size,
             global_index + i,
-            &num_chunks_per_dim,
-            chunk_dimensions,
+            grid,
         )?;
         if let Some(ci) = info {
             chunks.push(ci);
@@ -592,8 +562,7 @@ pub fn read_extensible_array_chunks(
                 chunk_byte_size,
                 global_index,
                 total_elements,
-                &num_chunks_per_dim,
-                chunk_dimensions,
+                grid,
             )?;
             chunks.extend(block_chunks);
         }
@@ -627,8 +596,7 @@ pub fn read_extensible_array_chunks(
                 chunk_byte_size,
                 global_index,
                 total_elements,
-                &num_chunks_per_dim,
-                chunk_dimensions,
+                grid,
             )?;
             chunks.extend(sb_chunks);
         }
@@ -650,8 +618,7 @@ fn read_super_block(
     chunk_byte_size: u64,
     start_index: usize,
     total_elements: usize,
-    num_chunks_per_dim: &[u64],
-    chunk_dimensions: &[u32],
+    grid: &ChunkGrid,
 ) -> Result<Vec<ChunkInfo>, FormatError> {
     let os = offset_size as usize;
 
@@ -735,8 +702,7 @@ fn read_super_block(
                     chunk_byte_size,
                     global_idx,
                     total_elements,
-                    num_chunks_per_dim,
-                    chunk_dimensions,
+                    grid,
                 )?
             } else {
                 read_data_block_elements(
@@ -748,8 +714,7 @@ fn read_super_block(
                     chunk_byte_size,
                     global_idx,
                     total_elements,
-                    num_chunks_per_dim,
-                    chunk_dimensions,
+                    grid,
                 )?
             };
             chunks.extend(block_chunks);
@@ -965,25 +930,23 @@ fn easb_data_block_spans<S: Source + ?Sized>(
 pub fn read_extensible_array_chunks_from_source<S: Source + ?Sized>(
     source: &S,
     header: &ExtensibleArrayHeader,
-    dataset_dims: &[u64],
+    grid: &ChunkGrid,
     chunk_dimensions: &[u32],
     element_size: u32,
     offset_size: u8,
     _length_size: u8,
 ) -> Result<Vec<ChunkInfo>, FormatError> {
-    let rank = chunk_dimensions.len();
     let os = offset_size as usize;
 
-    let mut num_chunks_per_dim = Vec::with_capacity(rank);
-    for d in 0..rank {
-        let ch_dim = chunk_dimensions[d] as u64;
-        num_chunks_per_dim.push(dataset_dims[d].div_ceil(ch_dim));
-    }
     let chunk_byte_size: u64 =
         chunk_dimensions.iter().map(|&d| d as u64).product::<u64>() * element_size as u64;
 
-    let dims_chunks: usize = num_chunks_per_dim.iter().product::<u64>().to_usize()?;
-    let total_elements = header.num_elements.to_usize()?.min(dims_chunks);
+    // See `read_extensible_array_chunks` for why the walk stops at a slot
+    // number rather than a chunk count.
+    let total_elements = header
+        .num_elements
+        .to_usize()?
+        .min(grid.slot_limit()?.to_usize()?);
 
     let geom = EaGeometry::from_header(header);
     let elem_stride = ea_elem_stride(header, offset_size);
@@ -1031,8 +994,7 @@ pub fn read_extensible_array_chunks_from_source<S: Source + ?Sized>(
             offset_size,
             chunk_byte_size,
             global_index + i,
-            &num_chunks_per_dim,
-            chunk_dimensions,
+            grid,
         )?;
         if let Some(ci) = info {
             chunks.push(ci);
@@ -1065,8 +1027,7 @@ pub fn read_extensible_array_chunks_from_source<S: Source + ?Sized>(
                 chunk_byte_size,
                 global_index,
                 total_elements,
-                &num_chunks_per_dim,
-                chunk_dimensions,
+                grid,
             )?);
         }
         global_index += nelmts;
@@ -1096,8 +1057,7 @@ pub fn read_extensible_array_chunks_from_source<S: Source + ?Sized>(
                 chunk_byte_size,
                 global_index,
                 total_elements,
-                &num_chunks_per_dim,
-                chunk_dimensions,
+                grid,
             )?);
         }
         global_index += total_in_sb;
@@ -1117,8 +1077,7 @@ fn read_data_block_elements_from_source<S: Source + ?Sized>(
     chunk_byte_size: u64,
     start_index: usize,
     total_elements: usize,
-    num_chunks_per_dim: &[u64],
-    chunk_dimensions: &[u32],
+    grid: &ChunkGrid,
 ) -> Result<Vec<ChunkInfo>, FormatError> {
     let os = offset_size as usize;
     let db_header_size = 4 + 1 + 1 + os;
@@ -1153,8 +1112,7 @@ fn read_data_block_elements_from_source<S: Source + ?Sized>(
             offset_size,
             chunk_byte_size,
             start_index + i,
-            num_chunks_per_dim,
-            chunk_dimensions,
+            grid,
         )?;
         if let Some(ci) = info {
             chunks.push(ci);
@@ -1178,8 +1136,7 @@ fn read_paged_data_block_from_source<S: Source + ?Sized>(
     chunk_byte_size: u64,
     start_index: usize,
     total_elements: usize,
-    num_chunks_per_dim: &[u64],
-    chunk_dimensions: &[u32],
+    grid: &ChunkGrid,
 ) -> Result<Vec<ChunkInfo>, FormatError> {
     let blk_off_size = (header.max_nelmts_bits as usize).div_ceil(8);
     let db_header_size = 4 + 1 + 1 + offset_size as usize + blk_off_size + 4;
@@ -1239,8 +1196,7 @@ fn read_paged_data_block_from_source<S: Source + ?Sized>(
                 offset_size,
                 chunk_byte_size,
                 page_start + i,
-                num_chunks_per_dim,
-                chunk_dimensions,
+                grid,
             )?;
             if let Some(ci) = info {
                 chunks.push(ci);
@@ -1267,8 +1223,7 @@ fn read_super_block_from_source<S: Source + ?Sized>(
     chunk_byte_size: u64,
     start_index: usize,
     total_elements: usize,
-    num_chunks_per_dim: &[u64],
-    chunk_dimensions: &[u32],
+    grid: &ChunkGrid,
 ) -> Result<Vec<ChunkInfo>, FormatError> {
     let os = offset_size as usize;
     let blk_off_size = (header.max_nelmts_bits as usize).div_ceil(8);
@@ -1337,8 +1292,7 @@ fn read_super_block_from_source<S: Source + ?Sized>(
                     chunk_byte_size,
                     global_idx,
                     total_elements,
-                    num_chunks_per_dim,
-                    chunk_dimensions,
+                    grid,
                 )?
             } else {
                 read_data_block_elements_from_source(
@@ -1350,8 +1304,7 @@ fn read_super_block_from_source<S: Source + ?Sized>(
                     chunk_byte_size,
                     global_idx,
                     total_elements,
-                    num_chunks_per_dim,
-                    chunk_dimensions,
+                    grid,
                 )?
             };
             chunks.extend(block_chunks);
@@ -1365,39 +1318,14 @@ fn read_super_block_from_source<S: Source + ?Sized>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn index_to_offsets_1d() {
-        let num_chunks = vec![5u64];
-        let chunk_dims = vec![20u32];
-        assert_eq!(index_to_chunk_offsets(0, &num_chunks, &chunk_dims), vec![0]);
-        assert_eq!(
-            index_to_chunk_offsets(1, &num_chunks, &chunk_dims),
-            vec![20]
-        );
-        assert_eq!(
-            index_to_chunk_offsets(4, &num_chunks, &chunk_dims),
-            vec![80]
-        );
-    }
 
-    #[test]
-    fn index_to_offsets_2d() {
-        let num_chunks = vec![3u64, 2];
-        let chunk_dims = vec![4u32, 3];
-        assert_eq!(
-            index_to_chunk_offsets(0, &num_chunks, &chunk_dims),
-            vec![0, 0]
-        );
-        assert_eq!(
-            index_to_chunk_offsets(1, &num_chunks, &chunk_dims),
-            vec![0, 3]
-        );
-        assert_eq!(
-            index_to_chunk_offsets(2, &num_chunks, &chunk_dims),
-            vec![4, 0]
-        );
+    /// The grid of a dataset with no maximum shape: dense row-major, which is
+    /// what these tests read. The numbering rule itself is tested in
+    /// [`crate::chunk_grid`]; these tests are about the array structures.
+    fn dense_grid(dims: &[u64], chunk_dims: &[u32]) -> ChunkGrid {
+        let cd: Vec<u64> = chunk_dims.iter().map(|&d| u64::from(d)).collect();
+        ChunkGrid::new(&cd, dims, None, crate::chunk_grid::GridOrder::RowMajor).unwrap()
     }
-
     #[test]
     fn parse_header_valid() {
         let os: u8 = 8;
@@ -1499,9 +1427,16 @@ mod tests {
         let header = ExtensibleArrayHeader::parse(&file_data, aehd_offset, os, ls).unwrap();
         let ds_dims = vec![40u64]; // 2 chunks × 20 elements
         let chunk_dims = vec![20u32];
-        let chunks =
-            read_extensible_array_chunks(&file_data, &header, &ds_dims, &chunk_dims, 8, os, ls)
-                .unwrap();
+        let chunks = read_extensible_array_chunks(
+            &file_data,
+            &header,
+            &dense_grid(&ds_dims, &chunk_dims),
+            &chunk_dims,
+            8,
+            os,
+            ls,
+        )
+        .unwrap();
 
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].address, base_addr);
@@ -1528,9 +1463,16 @@ mod tests {
     ) {
         use crate::source::{BytesSource, ReadSeekSource};
         let h = ExtensibleArrayHeader::parse(file_data, aehd_offset, os, ls).unwrap();
-        let buffered =
-            read_extensible_array_chunks(file_data, &h, ds_dims, chunk_dims, element_size, os, ls)
-                .unwrap();
+        let buffered = read_extensible_array_chunks(
+            file_data,
+            &h,
+            &dense_grid(ds_dims, chunk_dims),
+            chunk_dims,
+            element_size,
+            os,
+            ls,
+        )
+        .unwrap();
 
         let mem = BytesSource::new(file_data);
         let hm =
@@ -1538,7 +1480,7 @@ mod tests {
         let from_mem = read_extensible_array_chunks_from_source(
             &mem,
             &hm,
-            ds_dims,
+            &dense_grid(ds_dims, chunk_dims),
             chunk_dims,
             element_size,
             os,
@@ -1552,7 +1494,7 @@ mod tests {
         let from_seek = read_extensible_array_chunks_from_source(
             &seek,
             &hs,
-            ds_dims,
+            &dense_grid(ds_dims, chunk_dims),
             chunk_dims,
             element_size,
             os,
@@ -1655,9 +1597,16 @@ mod tests {
         let header = ExtensibleArrayHeader::parse(&file_data, aehd_offset, os, ls).unwrap();
         let ds_dims = vec![40u64];
         let chunk_dims = vec![10u32];
-        let chunks =
-            read_extensible_array_chunks(&file_data, &header, &ds_dims, &chunk_dims, 8, os, ls)
-                .unwrap();
+        let chunks = read_extensible_array_chunks(
+            &file_data,
+            &header,
+            &dense_grid(&ds_dims, &chunk_dims),
+            &chunk_dims,
+            8,
+            os,
+            ls,
+        )
+        .unwrap();
 
         assert_eq!(chunks.len(), 4);
         for (i, c) in chunks.iter().enumerate() {
@@ -1691,30 +1640,52 @@ mod tests {
                 })
                 .collect();
             let base = 0x1000u64;
-            let ea = build_extensible_array_at(&chunks, 8, 8, 8, false, base).unwrap();
+            let ea = build_extensible_array_at(
+                &crate::chunked_write::IndexSlots::dense(&chunks),
+                8,
+                8,
+                8,
+                false,
+                base,
+            )
+            .unwrap();
             let mut file = vec![0u8; base as usize + ea.len()];
             file[base as usize..].copy_from_slice(&ea);
 
             let ds_dims = vec![n];
             let chunk_dims = vec![1u32];
             let header = ExtensibleArrayHeader::parse(&file, base as usize, 8, 8).unwrap();
-            let buffered =
-                read_extensible_array_chunks(&file, &header, &ds_dims, &chunk_dims, 8, 8, 8)
-                    .unwrap();
+            let buffered = read_extensible_array_chunks(
+                &file,
+                &header,
+                &dense_grid(&ds_dims, &chunk_dims),
+                &chunk_dims,
+                8,
+                8,
+                8,
+            )
+            .unwrap();
             assert_eq!(buffered.len() as u64, n, "buffered chunk count at n={n}");
 
             let mem = BytesSource::new(&file);
             let hm = ExtensibleArrayHeader::parse_from_source(&mem, base, 8, 8).unwrap();
-            let from_mem =
-                read_extensible_array_chunks_from_source(&mem, &hm, &ds_dims, &chunk_dims, 8, 8, 8)
-                    .unwrap();
+            let from_mem = read_extensible_array_chunks_from_source(
+                &mem,
+                &hm,
+                &dense_grid(&ds_dims, &chunk_dims),
+                &chunk_dims,
+                8,
+                8,
+                8,
+            )
+            .unwrap();
 
             let seek = ReadSeekSource::new(std::io::Cursor::new(file)).unwrap();
             let hs = ExtensibleArrayHeader::parse_from_source(&seek, base, 8, 8).unwrap();
             let from_seek = read_extensible_array_chunks_from_source(
                 &seek,
                 &hs,
-                &ds_dims,
+                &dense_grid(&ds_dims, &chunk_dims),
                 &chunk_dims,
                 8,
                 8,
@@ -1742,8 +1713,17 @@ mod tests {
         let data = vec![0xFFu8; 16];
         let num_chunks = vec![5u64];
         let chunk_dims = vec![10u32];
-        let (info, consumed) =
-            read_element(&data, 0, 0, 8, 8, 80, 0, &num_chunks, &chunk_dims).unwrap();
+        let (info, consumed) = read_element(
+            &data,
+            0,
+            0,
+            8,
+            8,
+            80,
+            0,
+            &dense_grid(&num_chunks, &chunk_dims),
+        )
+        .unwrap();
         assert!(info.is_none());
         assert_eq!(consumed, 8);
     }
@@ -1772,8 +1752,7 @@ mod tests {
             os,
             80,
             2,
-            &num_chunks,
-            &chunk_dims,
+            &dense_grid(&num_chunks, &chunk_dims),
         )
         .unwrap();
         let ci = info.unwrap();
@@ -1807,8 +1786,7 @@ mod tests {
                 os,
                 80,
                 0,
-                &num_chunks,
-                &chunk_dims,
+                &dense_grid(&num_chunks, &chunk_dims),
             )
             .expect_err("a filtered element narrower than its own fields must be refused");
             assert!(
@@ -1818,8 +1796,17 @@ mod tests {
         }
 
         // The first width that can hold them is accepted.
-        read_element(&data, 0, 1, os + 4 + 1, os, 80, 0, &num_chunks, &chunk_dims)
-            .expect("a width that fits address + 1-byte size + mask must parse");
+        read_element(
+            &data,
+            0,
+            1,
+            os + 4 + 1,
+            os,
+            80,
+            0,
+            &dense_grid(&num_chunks, &chunk_dims),
+        )
+        .expect("a width that fits address + 1-byte size + mask must parse");
     }
 
     /// A truncated super-block address array must be refused by both backends.
@@ -1846,7 +1833,15 @@ mod tests {
             })
             .collect();
         let base = 0x1000u64;
-        let ea = build_extensible_array_at(&chunks, 8, 8, 8, false, base).unwrap();
+        let ea = build_extensible_array_at(
+            &crate::chunked_write::IndexSlots::dense(&chunks),
+            8,
+            8,
+            8,
+            false,
+            base,
+        )
+        .unwrap();
         let mut file = vec![0u8; base as usize + ea.len()];
         file[base as usize..].copy_from_slice(&ea);
 
@@ -1885,8 +1880,16 @@ mod tests {
         let header = ExtensibleArrayHeader::parse(&file, base as usize, 8, 8).unwrap();
         assert_eq!(header.index_block_address as usize, new_ib);
         // The relocated file must still read identically before it is cut.
-        let intact =
-            read_extensible_array_chunks(&file, &header, &ds_dims, &chunk_dims, 8, 8, 8).unwrap();
+        let intact = read_extensible_array_chunks(
+            &file,
+            &header,
+            &dense_grid(&ds_dims, &chunk_dims),
+            &chunk_dims,
+            8,
+            8,
+            8,
+        )
+        .unwrap();
         assert_eq!(intact.len() as u64, n, "relocation must preserve the read");
 
         // Where the first super-block address begins: index block prefix,
@@ -1903,7 +1906,15 @@ mod tests {
         // now lies before the cut, so the address loop is what faults.
         file.truncate(sblk_start + 4);
 
-        let buffered = read_extensible_array_chunks(&file, &header, &ds_dims, &chunk_dims, 8, 8, 8);
+        let buffered = read_extensible_array_chunks(
+            &file,
+            &header,
+            &dense_grid(&ds_dims, &chunk_dims),
+            &chunk_dims,
+            8,
+            8,
+            8,
+        );
         match buffered {
             Err(FormatError::UnexpectedEof {
                 expected,
@@ -1921,8 +1932,15 @@ mod tests {
 
         let mem = BytesSource::new(&file);
         let hm = ExtensibleArrayHeader::parse_from_source(&mem, base, 8, 8).unwrap();
-        let streamed =
-            read_extensible_array_chunks_from_source(&mem, &hm, &ds_dims, &chunk_dims, 8, 8, 8);
+        let streamed = read_extensible_array_chunks_from_source(
+            &mem,
+            &hm,
+            &dense_grid(&ds_dims, &chunk_dims),
+            &chunk_dims,
+            8,
+            8,
+            8,
+        );
         assert!(
             streamed.is_err(),
             "streaming read must refuse the same file, got {streamed:?}"
@@ -1953,7 +1971,15 @@ mod tests {
                     filter_mask: 0,
                 })
                 .collect();
-            let ea = build_extensible_array_at(&chunks, 8, os, ls, false, base).unwrap();
+            let ea = build_extensible_array_at(
+                &crate::chunked_write::IndexSlots::dense(&chunks),
+                8,
+                os,
+                ls,
+                false,
+                base,
+            )
+            .unwrap();
             let mut file = vec![0u8; base as usize + ea.len()];
             file[base as usize..].copy_from_slice(&ea);
 
