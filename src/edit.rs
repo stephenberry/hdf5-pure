@@ -1100,6 +1100,9 @@ pub(crate) struct LocatedState {
     pub(crate) element_size: NonZeroUsize,
     /// The re-encodable filter pipeline, when the dataset is filtered.
     pub(crate) pipeline: Option<FilterPipeline>,
+    /// What the slots past the new dimension must hold when an append completes
+    /// a partial chunk (issue #296).
+    pub(crate) fill: crate::fill_value::PaddingFill,
 }
 
 /// State for a file that persists its free space on disk. Carries the file's
@@ -2513,6 +2516,7 @@ impl WriteEngine {
                     st.pipeline.as_ref(),
                     batch,
                     take,
+                    st.fill.pattern(st.element_size),
                 )
             };
             let plan = plan_result.map_err(as_inplace_error)?;
@@ -4496,6 +4500,9 @@ impl WriteEngine {
         let mut dataspace: Option<(usize, usize)> = None;
         let mut layout: Option<(usize, usize)> = None;
         let mut filter: Option<(usize, usize)> = None;
+        // The dataset's own fill value, which the edge overhang of a partial
+        // chunk must hold (issue #296). Both message forms, newest wins.
+        let mut fill_msg: Option<(MessageType, usize, usize)> = None;
         let mut has_link = false;
         let mut p = 0;
         while let Some((msg_type, body, body_end)) = next_message(&region, p)? {
@@ -4504,6 +4511,17 @@ impl WriteEngine {
                 MessageType::Dataspace => dataspace = Some((body, body_end)),
                 MessageType::DataLayout => layout = Some((body, body_end)),
                 MessageType::FilterPipeline => filter = Some((body, body_end)),
+                // Versioned beats legacy, and within a type the first wins —
+                // the same rule `Dataset::fill_bytes` and `Located::from_walk`
+                // apply, so all three agree on a header carrying more than one.
+                MessageType::FillValue
+                    if !matches!(fill_msg, Some((MessageType::FillValue, ..))) =>
+                {
+                    fill_msg = Some((msg_type, body, body_end));
+                }
+                MessageType::FillValueOld if fill_msg.is_none() => {
+                    fill_msg = Some((msg_type, body, body_end));
+                }
                 MessageType::Link | MessageType::LinkInfo | MessageType::SymbolTable => {
                     has_link = true;
                 }
@@ -4656,10 +4674,24 @@ impl WriteEngine {
                 } = chunked_geometry(&fd.dt, &disk_ds, &dl)?;
 
                 // Split the new value into full-size chunk buffers in dense
-                // row-major grid order (edge overhang zero-filled, matching how
-                // unfiltered chunks are stored), then re-encode through the on-disk
+                // row-major grid order, then re-encode through the on-disk
                 // pipeline when the dataset is filtered.
-                let split = split_into_chunks(&fd.raw, &disk_ds.dimensions, &spatial, element_size);
+                // The overhang past the dataset's edge holds the dataset's own
+                // fill value, not zeros: an allocated chunk is expected to carry
+                // it wherever nothing was written, and those slots are what a
+                // reader returns once the dataset is extended into them (#296).
+                let padding = fill_msg
+                    .map_or(crate::fill_value::PaddingFill::Zero, |(mt, b, e)| {
+                        crate::fill_value::PaddingFill::from_message(mt, &region[b..e])
+                    });
+                let split = split_into_chunks(
+                    &fd.raw,
+                    &disk_ds.dimensions,
+                    &spatial,
+                    element_size,
+                    padding.pattern(element_size),
+                )
+                .map_err(Error::Format)?;
                 let pipeline_message: Option<Vec<u8>> =
                     filter.map(|(fb, fe)| region[fb..fe].to_vec());
 
@@ -4772,6 +4804,9 @@ impl WriteEngine {
         let mut dataspace: Option<(usize, usize)> = None;
         let mut layout: Option<(usize, usize)> = None;
         let mut filter: Option<(usize, usize)> = None;
+        // The dataset's own fill value, which the edge overhang of a partial
+        // chunk must hold (issue #296). Both message forms, newest wins.
+        let mut fill_msg: Option<(MessageType, usize, usize)> = None;
         let mut has_link = false;
         let mut p = 0;
         while let Some((msg_type, body, body_end)) = next_message(&region, p)? {
@@ -4780,6 +4815,17 @@ impl WriteEngine {
                 MessageType::Dataspace => dataspace = Some((body, body_end)),
                 MessageType::DataLayout => layout = Some((body, body_end)),
                 MessageType::FilterPipeline => filter = Some((body, body_end)),
+                // Versioned beats legacy, and within a type the first wins —
+                // the same rule `Dataset::fill_bytes` and `Located::from_walk`
+                // apply, so all three agree on a header carrying more than one.
+                MessageType::FillValue
+                    if !matches!(fill_msg, Some((MessageType::FillValue, ..))) =>
+                {
+                    fill_msg = Some((msg_type, body, body_end));
+                }
+                MessageType::FillValueOld if fill_msg.is_none() => {
+                    fill_msg = Some((msg_type, body, body_end));
+                }
                 MessageType::Link | MessageType::LinkInfo | MessageType::SymbolTable => {
                     has_link = true;
                 }
@@ -5010,10 +5056,22 @@ impl WriteEngine {
         }
         tail_raw.extend_from_slice(&ab.raw);
 
-        // Split the tail into full chunk buffers (edge overhang zero-filled) and
-        // compress each through the pipeline when filtered.
+        // Split the tail into full chunk buffers and compress each through the
+        // pipeline when filtered. The final chunk's overhang takes the dataset's
+        // fill value, which is what a reader returns from those slots once a
+        // later append or resize reaches them (#296).
         let tail_len_elems = new_dim0 - (n_full as u64) * chunk_elems;
-        let split = split_into_chunks(&tail_raw, &[tail_len_elems], &spatial, element_size);
+        let padding = fill_msg.map_or(crate::fill_value::PaddingFill::Zero, |(mt, b, e)| {
+            crate::fill_value::PaddingFill::from_message(mt, &region[b..e])
+        });
+        let split = split_into_chunks(
+            &tail_raw,
+            &[tail_len_elems],
+            &spatial,
+            element_size,
+            padding.pattern(element_size),
+        )
+        .map_err(Error::Format)?;
         let new_chunk_bytes: Vec<Vec<u8>> = if let Some(pl) = &pipeline {
             let ctx = ChunkContext::from_datatype(&spatial, &disk_dt)?;
             let mut out = Vec::with_capacity(split.len());
@@ -6200,12 +6258,17 @@ impl WriteEngine {
     fn build_chunked_dataset(&mut self, fd: &FlatDataset) -> Result<Vec<u8>, Error> {
         let chunk_dims = fd.chunk_options.resolve_chunk_dims(&fd.ds.dimensions);
         let ctx = ChunkContext::from_datatype(&chunk_dims, &fd.dt)?;
+        // The overhang of a partial edge chunk holds the staged fill value
+        // (issue #296).
+        let elem = crate::convert::nonzero_usize_from(ctx.element_size)?;
+        let fill = crate::fill_value::FillPattern::new(fd.fill.as_deref(), elem);
         let set = compress_chunks(
             &fd.raw,
             &fd.ds.dimensions,
             ctx,
             &fd.chunk_options,
             fd.maxshape.as_deref(),
+            fill,
         )?;
         // Chunk data and the index beside it are raw (see `chunked_storage_spans`,
         // which reclaims both as raw).
@@ -7105,12 +7168,23 @@ pub(crate) fn locate_dataset_state<F: Store>(
     };
     let element_size = result.located.elem_bytes;
     let spatial = vec![result.located.chunk_elems];
+    // A fill message that cannot be read leaves `PaddingFill::Unknown`, which
+    // fails only where a chunk actually needs padding — an append that lands on
+    // a chunk boundary asks nothing of it.
+    let fill = match result.spans.fill {
+        Some((msg_type, off, size)) => match file.read_metadata_at(off, size) {
+            Ok(body) => crate::fill_value::PaddingFill::from_message(msg_type, &body),
+            Err(_) => crate::fill_value::PaddingFill::Unknown,
+        },
+        None => crate::fill_value::PaddingFill::Zero,
+    };
     Ok(LocatedState {
         loc: result.located,
         datatype,
         spatial,
         element_size,
         pipeline,
+        fill,
     })
 }
 

@@ -2215,12 +2215,18 @@ impl FileWriter {
                 if is_chunked[i] && d.raw_chunks.is_none() {
                     let chunk_dims = d.chunk_options.resolve_chunk_dims(&d.ds.dimensions);
                     let ctx = crate::filters::ChunkContext::from_datatype(&chunk_dims, &d.dt)?;
+                    // An allocated chunk holds the dataset's fill value
+                    // wherever nothing was written, so the edge overhang of a
+                    // partial chunk is filled rather than zeroed (issue #296).
+                    let elem = crate::convert::nonzero_usize_from(ctx.element_size)?;
+                    let fill = crate::fill_value::FillPattern::new(d.fill.as_deref(), elem);
                     Ok(Some(compress_chunks(
                         &d.raw,
                         &d.ds.dimensions,
                         ctx,
                         &d.chunk_options,
                         d.maxshape.as_deref(),
+                        fill,
                     )?))
                 } else {
                     Ok(None)

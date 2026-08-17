@@ -106,20 +106,80 @@ impl<'a> FillPattern<'a> {
             return Err(FormatError::UnreadableFillValue);
         }
         let mut buf = vec![0u8; len];
-        self.apply(&mut buf);
+        self.apply(&mut buf)?;
         Ok(buf)
     }
 
     /// Tile the pattern across `buf`, which must begin on an element boundary.
     /// A no-op for the zero pattern, leaving an already-zeroed buffer untouched.
-    pub(crate) fn apply(self, buf: &mut [u8]) {
+    ///
+    /// # Errors
+    ///
+    /// [`FormatError::UnreadableFillValue`] for the unknown pattern. Zeros
+    /// would be a fabricated answer, and unlike a read of unallocated storage —
+    /// which at least fabricates it in memory — this one would write it to the
+    /// file. Callers apply the pattern only where the fill value is actually
+    /// needed, so a dataset whose Fill Value message this parser cannot read is
+    /// still writable wherever the answer does not arise.
+    pub(crate) fn apply(self, buf: &mut [u8]) -> Result<(), FormatError> {
+        if self.unknown {
+            return Err(FormatError::UnreadableFillValue);
+        }
         let Some(element) = self.element else {
-            return;
+            return Ok(());
         };
         // `chunks_mut` bounds each slot to what remains, so a trailing partial
         // element takes the pattern's prefix rather than needing a guard.
         for slot in buf.chunks_mut(element.len()) {
             slot.copy_from_slice(&element[..slot.len()]);
+        }
+        Ok(())
+    }
+}
+
+/// What the unwritten slots of an **allocated** chunk must hold, recovered from
+/// a dataset's Fill Value message and owning the bytes so a caller can hand out
+/// a borrowed [`FillPattern`].
+///
+/// The three cases are the ones the read path already distinguishes, and for
+/// the same reason: "write zeros" and "we do not know what to write" are
+/// different answers, and only one of them is safe to act on.
+pub(crate) enum PaddingFill {
+    /// Nothing is written to unwritten storage — no fill value, or a message
+    /// recording `H5D_FILL_TIME_NEVER`, which promises nothing about it.
+    Zero,
+    /// One element's fill bytes, to be tiled across the uncovered slots.
+    Value(Vec<u8>),
+    /// The message could not be read, so what those slots must hold is
+    /// undetermined. Writing zeros would put a guess on disk.
+    Unknown,
+}
+
+impl PaddingFill {
+    /// Decide from a Fill Value message body. `msg_type` distinguishes the
+    /// versioned message (`FillValue`) from the legacy one (`FillValueOld`).
+    ///
+    /// The same two steps, in the same order, as [`crate::Dataset::fill_value`]
+    /// takes for reads — with the write-time question asked first, since a
+    /// value the file says is never written is not written here either.
+    pub(crate) fn from_message(msg_type: MessageType, body: &[u8]) -> Self {
+        match fill_value_is_written(msg_type, body) {
+            Ok(false) => Self::Zero,
+            Ok(true) => match parse_defined_fill_value(msg_type, body) {
+                Ok(Some(bytes)) => Self::Value(bytes),
+                Ok(None) => Self::Zero,
+                Err(_) => Self::Unknown,
+            },
+            Err(_) => Self::Unknown,
+        }
+    }
+
+    /// The pattern to tile, over a datatype of `elem_size` bytes per element.
+    pub(crate) fn pattern(&self, elem_size: NonZeroUsize) -> FillPattern<'_> {
+        match self {
+            Self::Zero => FillPattern::ZERO,
+            Self::Value(bytes) => FillPattern::new(Some(bytes), elem_size),
+            Self::Unknown => FillPattern::UNKNOWN,
         }
     }
 }
@@ -302,6 +362,48 @@ pub(crate) fn parse_defined_fill_value(
 
 #[cfg(test)]
 mod fill_pattern_tests {
+
+    /// `PaddingFill::from_message` keeps the three answers apart. Folding the
+    /// unreadable case onto `Zero` would write a fabricated fill value into a
+    /// file whose fill semantics this parser has already refused to report.
+    #[test]
+    fn an_unreadable_message_is_unknown_not_zero() {
+        let elem = NonZeroUsize::new(4).unwrap();
+        // A v3 message with the *defined* bit set and a 4-byte value.
+        let mut defined = vec![3u8, V3_FLAGS_DEFAULT | 0x20, 4, 0, 0, 0];
+        defined.extend_from_slice(&[7u8, 0, 0, 0]);
+        assert!(matches!(
+            PaddingFill::from_message(MessageType::FillValue, &defined),
+            PaddingFill::Value(ref b) if b == &[7u8, 0, 0, 0]
+        ));
+
+        // The library default: nothing to write, and that is a decided answer.
+        let default = vec![3u8, V3_FLAGS_DEFAULT];
+        assert!(matches!(
+            PaddingFill::from_message(MessageType::FillValue, &default),
+            PaddingFill::Zero
+        ));
+
+        // A version this parser does not know: undetermined, not zero.
+        let mut unknown_version = defined.clone();
+        unknown_version[0] = 9;
+        assert!(matches!(
+            PaddingFill::from_message(MessageType::FillValue, &unknown_version),
+            PaddingFill::Unknown
+        ));
+        assert!(
+            PaddingFill::from_message(MessageType::FillValue, &unknown_version)
+                .pattern(elem)
+                .apply(&mut [0u8; 4])
+                .is_err()
+        );
+
+        // Truncated before the fields it declares: likewise undetermined.
+        assert!(matches!(
+            PaddingFill::from_message(MessageType::FillValue, &defined[..3]),
+            PaddingFill::Unknown
+        ));
+    }
     use super::*;
     use crate::convert::nz;
 
