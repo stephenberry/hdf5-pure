@@ -11,11 +11,11 @@ use crate::chunked_read::{
 };
 use crate::convert::{TryToUsize, slice_range};
 use crate::data_layout::DataLayout;
+#[cfg(test)]
 use crate::dataspace::Dataspace;
 use crate::datatype::{Datatype, DatatypeByteOrder};
 use crate::error::FormatError;
-use crate::fill_value::FillPattern;
-use crate::filter_pipeline::FilterPipeline;
+use crate::read_spec::RawReadSpec;
 use crate::source::Source;
 
 /// Read raw bytes for a dataset given its layout and the file data buffer,
@@ -32,11 +32,7 @@ pub fn read_raw_data(
 ) -> Result<Vec<u8>, FormatError> {
     read_raw_data_full(
         file_data,
-        layout,
-        dataspace,
-        datatype,
-        None,
-        FillPattern::ZERO,
+        RawReadSpec::plain(layout, dataspace, datatype),
         8,
         8,
     )
@@ -45,14 +41,17 @@ pub fn read_raw_data(
 /// Read raw bytes with full parameters including filter pipeline and sizes.
 pub fn read_raw_data_full(
     file_data: &[u8],
-    layout: &DataLayout,
-    dataspace: &Dataspace,
-    datatype: &Datatype,
-    pipeline: Option<&FilterPipeline>,
-    fill: FillPattern<'_>,
+    spec: RawReadSpec<'_>,
     offset_size: u8,
     length_size: u8,
 ) -> Result<Vec<u8>, FormatError> {
+    let RawReadSpec {
+        layout,
+        dataspace,
+        datatype,
+        fill,
+        ..
+    } = spec;
     let num_elements = dataspace.num_elements().to_usize()?;
     let elem_size = datatype.type_size() as usize;
     let expected_size = num_elements
@@ -105,11 +104,7 @@ pub fn read_raw_data_full(
         // callers, at the cost of a cache that lives only for the call.
         DataLayout::Chunked { .. } => read_chunked_data_cached(
             file_data,
-            layout,
-            dataspace,
-            datatype,
-            pipeline,
-            fill,
+            spec,
             offset_size,
             length_size,
             &ChunkCache::new(),
@@ -125,37 +120,16 @@ pub fn read_raw_data_full(
 /// contiguous layouts this behaves identically to [`read_raw_data_full`].
 pub fn read_raw_data_cached(
     file_data: &[u8],
-    layout: &DataLayout,
-    dataspace: &Dataspace,
-    datatype: &Datatype,
-    pipeline: Option<&FilterPipeline>,
-    fill: FillPattern<'_>,
+    spec: RawReadSpec<'_>,
     offset_size: u8,
     length_size: u8,
     cache: &ChunkCache,
 ) -> Result<Vec<u8>, FormatError> {
-    match layout {
-        DataLayout::Chunked { .. } => read_chunked_data_cached(
-            file_data,
-            layout,
-            dataspace,
-            datatype,
-            pipeline,
-            fill,
-            offset_size,
-            length_size,
-            cache,
-        ),
-        _ => read_raw_data_full(
-            file_data,
-            layout,
-            dataspace,
-            datatype,
-            pipeline,
-            fill,
-            offset_size,
-            length_size,
-        ),
+    match spec.layout {
+        DataLayout::Chunked { .. } => {
+            read_chunked_data_cached(file_data, spec, offset_size, length_size, cache)
+        }
+        _ => read_raw_data_full(file_data, spec, offset_size, length_size),
     }
 }
 
@@ -175,14 +149,17 @@ pub fn read_raw_data_cached(
 /// [`read_raw_data_full`]).
 pub fn read_raw_data_full_from_source<S: Source + ?Sized>(
     source: &S,
-    layout: &DataLayout,
-    dataspace: &Dataspace,
-    datatype: &Datatype,
-    pipeline: Option<&FilterPipeline>,
-    fill: FillPattern<'_>,
+    spec: RawReadSpec<'_>,
     offset_size: u8,
     length_size: u8,
 ) -> Result<Vec<u8>, FormatError> {
+    let RawReadSpec {
+        layout,
+        dataspace,
+        datatype,
+        fill,
+        ..
+    } = spec;
     let num_elements = dataspace.num_elements().to_usize()?;
     let elem_size = datatype.type_size() as usize;
     let expected_size = num_elements
@@ -223,55 +200,26 @@ pub fn read_raw_data_full_from_source<S: Source + ?Sized>(
             // source length (in u64) and errors instead of truncating.
             source.read_exact_at(addr, sz)
         }
-        DataLayout::Chunked { .. } => read_chunked_data_from_source(
-            source,
-            layout,
-            dataspace,
-            datatype,
-            pipeline,
-            fill,
-            offset_size,
-            length_size,
-        ),
+        DataLayout::Chunked { .. } => {
+            read_chunked_data_from_source(source, spec, offset_size, length_size)
+        }
         DataLayout::Virtual { .. } => Err(FormatError::UnsupportedVirtualLayout),
     }
 }
 
 /// Streaming counterpart of [`read_raw_data_cached`].
-#[allow(clippy::too_many_arguments)]
 pub fn read_raw_data_cached_from_source<S: Source + ?Sized>(
     source: &S,
-    layout: &DataLayout,
-    dataspace: &Dataspace,
-    datatype: &Datatype,
-    pipeline: Option<&FilterPipeline>,
-    fill: FillPattern<'_>,
+    spec: RawReadSpec<'_>,
     offset_size: u8,
     length_size: u8,
     cache: &ChunkCache,
 ) -> Result<Vec<u8>, FormatError> {
-    match layout {
-        DataLayout::Chunked { .. } => read_chunked_data_cached_from_source(
-            source,
-            layout,
-            dataspace,
-            datatype,
-            pipeline,
-            fill,
-            offset_size,
-            length_size,
-            cache,
-        ),
-        _ => read_raw_data_full_from_source(
-            source,
-            layout,
-            dataspace,
-            datatype,
-            pipeline,
-            fill,
-            offset_size,
-            length_size,
-        ),
+    match spec.layout {
+        DataLayout::Chunked { .. } => {
+            read_chunked_data_cached_from_source(source, spec, offset_size, length_size, cache)
+        }
+        _ => read_raw_data_full_from_source(source, spec, offset_size, length_size),
     }
 }
 
@@ -986,6 +934,7 @@ mod tests {
     use crate::convert::nz;
     use crate::dataspace::{Dataspace, DataspaceType};
     use crate::datatype::{CharacterSet, StringPadding};
+    use crate::fill_value::FillPattern;
     #[cfg(not(feature = "std"))]
     use alloc::vec;
 
@@ -1223,11 +1172,13 @@ mod tests {
         let seven = 7.0f64.to_le_bytes();
         let filled = read_raw_data_full(
             &[],
-            &layout,
-            &ds,
-            &dt,
-            None,
-            FillPattern::new(Some(&seven), nz(8)),
+            RawReadSpec {
+                layout: &layout,
+                dataspace: &ds,
+                datatype: &dt,
+                pipeline: None,
+                fill: FillPattern::new(Some(&seven), nz(8)),
+            },
             8,
             8,
         )
@@ -1294,27 +1245,13 @@ mod tests {
             size: 24,
         };
 
-        let buffered =
-            read_raw_data_full(&file_data, &layout, &ds, &dt, None, FillPattern::ZERO, 8, 8)
-                .unwrap();
-        let from_mem = read_raw_data_full_from_source(
-            &BytesSource::new(&file_data),
-            &layout,
-            &ds,
-            &dt,
-            None,
-            FillPattern::ZERO,
-            8,
-            8,
-        )
-        .unwrap();
+        let spec = RawReadSpec::plain(&layout, &ds, &dt);
+        let buffered = read_raw_data_full(&file_data, spec, 8, 8).unwrap();
+        let from_mem =
+            read_raw_data_full_from_source(&BytesSource::new(&file_data), spec, 8, 8).unwrap();
         let from_seek = read_raw_data_full_from_source(
             &ReadSeekSource::new(std::io::Cursor::new(file_data)).unwrap(),
-            &layout,
-            &ds,
-            &dt,
-            None,
-            FillPattern::ZERO,
+            spec,
             8,
             8,
         )
@@ -1336,19 +1273,10 @@ mod tests {
             data.extend_from_slice(&v.to_le_bytes());
         }
         let layout = DataLayout::Compact { data };
-        let buffered =
-            read_raw_data_full(&[], &layout, &ds, &dt, None, FillPattern::ZERO, 8, 8).unwrap();
-        let streamed = read_raw_data_full_from_source(
-            &BytesSource::new(Vec::new()),
-            &layout,
-            &ds,
-            &dt,
-            None,
-            FillPattern::ZERO,
-            8,
-            8,
-        )
-        .unwrap();
+        let spec = RawReadSpec::plain(&layout, &ds, &dt);
+        let buffered = read_raw_data_full(&[], spec, 8, 8).unwrap();
+        let streamed =
+            read_raw_data_full_from_source(&BytesSource::new(Vec::new()), spec, 8, 8).unwrap();
         assert_eq!(buffered, streamed);
     }
 
@@ -1368,18 +1296,16 @@ mod tests {
         };
         let seven = 7.0f64.to_le_bytes();
         for fill in [FillPattern::ZERO, FillPattern::new(Some(&seven), nz(8))] {
-            let buffered = read_raw_data_full(&[], &layout, &ds, &dt, None, fill, 8, 8).unwrap();
-            let streamed = read_raw_data_full_from_source(
-                &BytesSource::new(Vec::new()),
-                &layout,
-                &ds,
-                &dt,
-                None,
+            let spec = RawReadSpec {
+                layout: &layout,
+                dataspace: &ds,
+                datatype: &dt,
+                pipeline: None,
                 fill,
-                8,
-                8,
-            )
-            .unwrap();
+            };
+            let buffered = read_raw_data_full(&[], spec, 8, 8).unwrap();
+            let streamed =
+                read_raw_data_full_from_source(&BytesSource::new(Vec::new()), spec, 8, 8).unwrap();
             assert_eq!(buffered, streamed);
             assert_eq!(buffered.len(), 24);
         }

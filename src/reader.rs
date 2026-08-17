@@ -35,6 +35,7 @@ use crate::layout_info::{Chunk, ChunkIndex, Filter, Layout};
 use crate::libver::LibVer;
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
+use crate::read_spec::RawReadSpec;
 use crate::shared_message::{self, BufferedResolver, SharedResolver, SourceResolver};
 use crate::signature;
 use crate::source::{
@@ -1326,11 +1327,7 @@ impl FileInner {
     /// Read a dataset's raw bytes for the given layout, dispatching on the backend.
     fn read_dataset_raw(
         &self,
-        dl: &DataLayout,
-        ds: &Dataspace,
-        dt: &Datatype,
-        pipeline: Option<&FilterPipeline>,
-        fill: FillPattern<'_>,
+        spec: RawReadSpec<'_>,
         cache: &ChunkCache,
     ) -> Result<Vec<u8>, FormatError> {
         let (os, ls) = (self.offset_size(), self.length_size());
@@ -1343,36 +1340,18 @@ impl FileInner {
         // read. For a plain file (`base == 0`) this is the identity.
         let base = self.addr_offset;
         match &self.backend {
-            Backend::InMemory(v) => data_read::read_raw_data_cached(
-                frame(v, base)?,
-                dl,
-                ds,
-                dt,
-                pipeline,
-                fill,
-                os,
-                ls,
-                cache,
-            ),
-            Backend::Streaming(s) if base == 0 => data_read::read_raw_data_cached_from_source(
-                s.as_ref(),
-                dl,
-                ds,
-                dt,
-                pipeline,
-                fill,
-                os,
-                ls,
-                cache,
-            ),
+            Backend::InMemory(v) => {
+                data_read::read_raw_data_cached(frame(v, base)?, spec, os, ls, cache)
+            }
+            Backend::Streaming(s) if base == 0 => {
+                data_read::read_raw_data_cached_from_source(s.as_ref(), spec, os, ls, cache)
+            }
             Backend::Streaming(s) => {
                 let framed = BaseOffsetSource {
                     inner: s.as_ref(),
                     base,
                 };
-                data_read::read_raw_data_cached_from_source(
-                    &framed, dl, ds, dt, pipeline, fill, os, ls, cache,
-                )
+                data_read::read_raw_data_cached_from_source(&framed, spec, os, ls, cache)
             }
             Backend::Edit(m) => Self::with_engine(
                 m,
@@ -1386,15 +1365,11 @@ impl FileInner {
                             available: data.len(),
                         })?
                     };
-                    data_read::read_raw_data_cached(
-                        frame, dl, ds, dt, pipeline, fill, os, ls, cache,
-                    )
+                    data_read::read_raw_data_cached(frame, spec, os, ls, cache)
                 },
                 |s| {
                     let framed = BaseOffsetSource { inner: s, base };
-                    data_read::read_raw_data_cached_from_source(
-                        &framed, dl, ds, dt, pipeline, fill, os, ls, cache,
-                    )
+                    data_read::read_raw_data_cached_from_source(&framed, spec, os, ls, cache)
                 },
             ),
         }
@@ -1405,19 +1380,15 @@ impl FileInner {
     /// touching only the storage it overlaps. Reads through the same base-framed
     /// `Source`, so on-disk addresses resolve the same way. The caller clamps
     /// the window to the dataset.
-    #[allow(clippy::too_many_arguments)]
     fn read_dataset_raw_rows(
         &self,
-        dl: &DataLayout,
-        ds: &Dataspace,
-        dt: &Datatype,
-        pipeline: Option<&FilterPipeline>,
-        fill: FillPattern<'_>,
+        spec: RawReadSpec<'_>,
         cache: &ChunkCache,
         start_row: u64,
         num_rows: u64,
     ) -> Result<Vec<u8>, FormatError> {
         let (os, ls) = (self.offset_size(), self.length_size());
+        let (dl, ds, dt) = (spec.layout, spec.dataspace, spec.datatype);
         let elem_size = dt.element_size_usize()?;
         // Elements per row (product of inner dims; 1 when 0-D or 1-D). Checked so
         // a crafted dataspace whose inner dims overflow `usize` errors instead of
@@ -1474,11 +1445,7 @@ impl FileInner {
                 };
                 read_rows_framed(
                     &BytesSource::new(frame),
-                    dl,
-                    ds,
-                    dt,
-                    pipeline,
-                    fill,
+                    spec,
                     os,
                     ls,
                     cache,
@@ -1489,11 +1456,7 @@ impl FileInner {
             }
             Backend::Streaming(s) if base == 0 => read_rows_framed(
                 s.as_ref(),
-                dl,
-                ds,
-                dt,
-                pipeline,
-                fill,
+                spec,
                 os,
                 ls,
                 cache,
@@ -1506,10 +1469,7 @@ impl FileInner {
                     inner: s.as_ref(),
                     base,
                 };
-                read_rows_framed(
-                    &framed, dl, ds, dt, pipeline, fill, os, ls, cache, start_row, num_rows,
-                    row_bytes,
-                )
+                read_rows_framed(&framed, spec, os, ls, cache, start_row, num_rows, row_bytes)
             }
             Backend::Edit(m) => Self::with_engine(
                 m,
@@ -1525,11 +1485,7 @@ impl FileInner {
                     };
                     read_rows_framed(
                         &BytesSource::new(frame),
-                        dl,
-                        ds,
-                        dt,
-                        pipeline,
-                        fill,
+                        spec,
                         os,
                         ls,
                         cache,
@@ -1540,10 +1496,7 @@ impl FileInner {
                 },
                 |s| {
                     let framed = BaseOffsetSource { inner: s, base };
-                    read_rows_framed(
-                        &framed, dl, ds, dt, pipeline, fill, os, ls, cache, start_row, num_rows,
-                        row_bytes,
-                    )
+                    read_rows_framed(&framed, spec, os, ls, cache, start_row, num_rows, row_bytes)
                 },
             ),
         }
@@ -1554,14 +1507,9 @@ impl FileInner {
 /// layouts are one bounded sub-read; chunked layouts use the windowed chunk
 /// reader (only the rank-0 crafted-file corner falls back to a whole read
 /// plus slice).
-#[allow(clippy::too_many_arguments)]
 fn read_rows_framed<S: Source + ?Sized>(
     source: &S,
-    dl: &DataLayout,
-    ds: &Dataspace,
-    dt: &Datatype,
-    pipeline: Option<&FilterPipeline>,
-    fill: FillPattern<'_>,
+    spec: RawReadSpec<'_>,
     os: u8,
     ls: u8,
     cache: &ChunkCache,
@@ -1569,6 +1517,7 @@ fn read_rows_framed<S: Source + ?Sized>(
     num_rows: u64,
     row_bytes: usize,
 ) -> Result<Vec<u8>, FormatError> {
+    let (dl, fill) = (spec.layout, spec.fill);
     // A zero-row window reads nothing, uniformly across the *supported* layouts.
     // A `Virtual` layout is unsupported and must still error like `read_raw`
     // does, so it is excluded here and falls through to the match.
@@ -1614,15 +1563,14 @@ fn read_rows_framed<S: Source + ?Sized>(
         }
         DataLayout::Chunked { .. } => {
             match crate::chunked_read::read_chunked_rows_from_source(
-                source, dl, ds, dt, pipeline, fill, os, ls, cache, start_row, num_rows,
+                source, spec, os, ls, cache, start_row, num_rows,
             )? {
                 Some(bytes) => Ok(bytes),
                 // Rank-0 chunked (a crafted-file corner): fall back to a whole
                 // read, then slice.
                 None => {
-                    let full = data_read::read_raw_data_cached_from_source(
-                        source, dl, ds, dt, pipeline, fill, os, ls, cache,
-                    )?;
+                    let full =
+                        data_read::read_raw_data_cached_from_source(source, spec, os, ls, cache)?;
                     let start = start_row.to_usize()? * row_bytes;
                     let len = num_rows.to_usize()? * row_bytes;
                     full.get(start..start + len).map(<[u8]>::to_vec).ok_or(
@@ -4331,9 +4279,14 @@ impl Dataset {
             Ok(b) => FillPattern::new(b.as_deref(), dt.element_size_usize()?),
             Err(_) => FillPattern::UNKNOWN,
         };
-        Ok(self
-            .file
-            .read_dataset_raw(&dl, &ds, &dt, pipeline.as_ref(), fill, &self.chunk_cache)?)
+        let spec = RawReadSpec {
+            layout: &dl,
+            dataspace: &ds,
+            datatype: &dt,
+            pipeline: pipeline.as_ref(),
+            fill,
+        };
+        Ok(self.file.read_dataset_raw(spec, &self.chunk_cache)?)
     }
 
     /// Read the raw element bytes of the row window `[start_row, start_row + num_rows)`
@@ -4373,28 +4326,22 @@ impl Dataset {
             Err(_) => FillPattern::UNKNOWN,
         };
 
+        let pipeline = self.filter_pipeline_parsed();
+        let spec = RawReadSpec {
+            layout: &dl,
+            dataspace: &ds,
+            datatype: &dt,
+            pipeline: pipeline.as_ref(),
+            fill,
+        };
+
         if start == 0 && count == n0 {
-            let pipeline = self.filter_pipeline_parsed();
-            return Ok(self.file.read_dataset_raw(
-                &dl,
-                &ds,
-                &dt,
-                pipeline.as_ref(),
-                fill,
-                &self.chunk_cache,
-            )?);
+            return Ok(self.file.read_dataset_raw(spec, &self.chunk_cache)?);
         }
 
-        Ok(self.file.read_dataset_raw_rows(
-            &dl,
-            &ds,
-            &dt,
-            self.filter_pipeline_parsed().as_ref(),
-            fill,
-            &self.chunk_cache,
-            start,
-            count,
-        )?)
+        Ok(self
+            .file
+            .read_dataset_raw_rows(spec, &self.chunk_cache, start, count)?)
     }
 
     /// Windowed [`read_f64`](Self::read_f64) — decodes only the row window.
@@ -4961,11 +4908,7 @@ mod tests {
         let cache = ChunkCache::new();
         let out = read_rows_framed(
             &BytesSource::new(b""),
-            &dl,
-            &ds,
-            &dt,
-            None,
-            FillPattern::ZERO,
+            RawReadSpec::plain(&dl, &ds, &dt),
             8,
             8,
             &cache,
@@ -4982,11 +4925,7 @@ mod tests {
         let virtual_dl = DataLayout::Virtual { version: 4 };
         let err = read_rows_framed(
             &BytesSource::new(b""),
-            &virtual_dl,
-            &ds,
-            &dt,
-            None,
-            FillPattern::ZERO,
+            RawReadSpec::plain(&virtual_dl, &ds, &dt),
             8,
             8,
             &cache,
