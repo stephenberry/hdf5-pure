@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- A paged file (`FileSpaceStrategy::Page`) stops growing under delete-and-recreate churn. Every commit rewrote the superblock extension and free-space managers into a page of their own and left the rest of that page recorded nowhere, so a workload that deleted its oldest objects to stay within a budget still grew about a page per commit and reported a fraction of the freed space as reusable; the rewrite now goes into free metadata space where any fits. A wholly free page can also be reopened for the other page type, so space a delete released is no longer stranded for the kind of data that released it ([#286](https://github.com/stephenberry/hdf5-pure/issues/286)).
+- A paged file (`FileSpaceStrategy::Page`) stops growing under delete-and-recreate churn: the free-space managers a commit rewrites are placed in free space rather than in a fresh page whose remainder nothing recorded, which cost a page per commit. A wholly free page can also be reopened for the other page type, so space a delete released is no longer stranded for the kind of data that released it ([#286](https://github.com/stephenberry/hdf5-pure/issues/286)).
 
 ## [0.39.0] - 2026-08-17
 

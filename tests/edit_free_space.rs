@@ -1316,7 +1316,10 @@ fn paged_churn_reaches_a_steady_size() {
             f.commit().unwrap();
             // Every byte the file has spent and released is offered back, rather
             // than a fraction of it: the padding around the rewritten managers
-            // used to be recorded nowhere at all.
+            // used to be recorded nowhere at all. This also pins that the tail
+            // reused rather than appended this round — an appended tail leaves the
+            // remainder of the page it opened in the session's list only, where the
+            // managers on disk cannot yet name it.
             let acct = f.space_accounting().unwrap();
             drop(f);
             let persisted: u64 = File::open(&path)

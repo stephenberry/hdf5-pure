@@ -8,7 +8,9 @@
 //! message carries free-space-manager addresses.
 
 use hdf5::plist::file_create::FileSpaceStrategy as CStrategy;
-use hdf5_pure::{File, FileAccessProperties, FileBuilder, FileSpaceStrategy, MemoryStrategy};
+use hdf5_pure::{
+    AttrValue, File, FileAccessProperties, FileBuilder, FileSpaceStrategy, MemoryStrategy,
+};
 
 /// Open with the bounded engine demanded rather than merely preferred: these
 /// tests are about that engine, so a file it stops accepting must fail here
@@ -752,6 +754,102 @@ fn c_library_reads_our_paged_file_after_free_space_reuse() {
         ours.dataset("replacement").unwrap().read_f64().unwrap(),
         replacement
     );
+}
+
+#[test]
+fn c_library_reads_our_paged_file_after_a_cross_page_type_claim() {
+    let _c = c_lib_guard();
+    // Issue #286: a page holding nothing at all belongs to no page type, so either
+    // kind may open one — which is what lets metadata reuse the pages a deleted
+    // dataset's chunk data released, and how free space survives a close at all
+    // (whole free pages are recorded in the manager that names no type, so every
+    // one of them comes back as raw). It is also the mechanism most able to break
+    // page homogeneity, the invariant the C library depends on for page buffering
+    // and cannot report on directly. What it can do is prove the result is a
+    // well-formed paged file it reads, re-parses, and writes to.
+    //
+    // The shape below is what forces the claim: delete the chunked dataset to free
+    // whole raw pages, then commit metadata too large for any metadata hole that
+    // remains, so the allocator has to open one of those raw pages for it.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("ours_paged_crosstype.h5");
+
+    let kept: Vec<f64> = (0..512).map(|i| (i % 17) as f64).collect();
+    {
+        let mut b = FileBuilder::new();
+        b.create_dataset("victim")
+            .with_f64_data(&vec![1.0; 8192])
+            .with_chunks(&[1024]);
+        b.create_dataset("ceiling").with_f64_data(&kept);
+        b.with_file_space_strategy(FileSpaceStrategy::Page, true, 0)
+            .with_file_space_page_size(4096);
+        b.write(&path).unwrap();
+    }
+
+    let label = "x".repeat(3000);
+    {
+        let file = File::open_rw(&path).unwrap();
+        file.root().delete("victim").unwrap();
+        file.commit().unwrap();
+        for i in 0..8 {
+            file.root()
+                .create_group_with(&format!("g{i}"), |g| {
+                    g.set_attr("label", AttrValue::String(label.clone()));
+                })
+                .unwrap();
+        }
+        file.commit().unwrap();
+    }
+
+    let ours = File::open(&path).unwrap();
+    assert_eq!(ours.dataset("ceiling").unwrap().read_f64().unwrap(), kept);
+    let total_ours: u64 = ours.persisted_free_space().iter().map(|(_, l)| l).sum();
+    drop(ours);
+
+    let f = hdf5::File::open(&path).unwrap();
+    assert_eq!(
+        f.create_plist().unwrap().get_file_space_strategy().unwrap(),
+        CStrategy::FreeSpaceManager {
+            paged: true,
+            persist: true,
+            threshold: 0,
+        },
+        "C library recovers our paged strategy after metadata opened a freed raw page"
+    );
+    for i in 0..8 {
+        assert!(
+            f.group(&format!("g{i}")).is_ok(),
+            "the C library reads a group header placed in a page a delete released"
+        );
+    }
+    assert_eq!(
+        f.dataset("ceiling").unwrap().read_raw::<f64>().unwrap(),
+        kept
+    );
+    let free_c = unsafe { H5Fget_freespace(f.id()) };
+    assert_eq!(
+        free_c as u64, total_ours,
+        "C free-space total matches the managers the claiming commit rewrote"
+    );
+    drop(f);
+
+    // And the file is still writable by the C library afterwards.
+    {
+        let f = hdf5::File::open_rw(&path).unwrap();
+        f.new_dataset::<i32>()
+            .shape([4])
+            .create("c_added")
+            .unwrap()
+            .write_raw(&[5i32, 6, 7, 8])
+            .unwrap();
+        f.close().unwrap();
+    }
+    let ours = File::open(&path).unwrap();
+    assert_eq!(
+        ours.dataset("c_added").unwrap().read_i32().unwrap(),
+        vec![5, 6, 7, 8]
+    );
+    assert_eq!(ours.dataset("ceiling").unwrap().read_f64().unwrap(), kept);
 }
 
 #[test]

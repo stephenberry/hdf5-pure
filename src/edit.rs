@@ -146,8 +146,9 @@
 //! data share a page — except from pages that are *wholly* free, which hold
 //! nothing of either type to be mixed with and so may be opened for whichever
 //! type asks ([`PagedEdit::alloc_typed`]). Every free-space rewrite a paged
-//! commit performs is placed through that same allocator, which is what keeps a
-//! delete-and-recreate workload from growing a page per commit (issue #286).
+//! commit performs is placed through that same allocator where anything fits,
+//! rather than into a page of its own, which is what keeps a delete-and-recreate
+//! workload from growing a page per commit (issue #286).
 //!
 //! Reclaim is best-effort and conservative. Contiguous and chunked datasets
 //! (chunk index plus chunk data) and whole group subtrees are reclaimed; a
@@ -4176,12 +4177,13 @@ impl WriteEngine {
         // a crash here: an appended tail is past everything live, and a reused one
         // sits in space an earlier commit freed. Neither is referenced until the
         // repoint below.
-        self.write_tail_block(ext_addr, &ext_oh)?;
+        let region = (ext_addr, blocks_len);
+        self.write_tail_block(region, ext_addr, &ext_oh)?;
         for b in &plan.blocks {
             let (fshd, fsse) =
                 serialize_file_fsm(&b.sections, b.fshd_addr, b.fsse_addr, os, b.class);
-            self.write_tail_block(b.fshd_addr, &fshd)?;
-            self.write_tail_block(b.fsse_addr, &fsse)?;
+            self.write_tail_block(region, b.fshd_addr, &fshd)?;
+            self.write_tail_block(region, b.fsse_addr, &fsse)?;
         }
         // An appended tail ends mid-page; pad it out, so the end-of-allocation stays
         // a whole number of pages. A reused tail is already inside the file, and
@@ -4289,8 +4291,11 @@ impl WriteEngine {
     /// while believing live extents were free would hand them out on the next
     /// commit — silently destroying the objects still occupying them.
     ///
-    /// Called twice per commit: once to *size* the tail and once to record what
-    /// remains after the tail has drawn its own space from `pg.pages`.
+    /// Called once to *size* the tail and again for each round the tail's
+    /// placement takes to settle, since what remains depends on the space the tail
+    /// has drawn for itself ([`tail_layout`](Self::tail_layout)). Each call clones
+    /// both lists; they hold one region per hole, not per byte, so the copies are
+    /// small.
     fn paged_post_free(
         &self,
         to_free: &[(u64, u64, PageType)],
@@ -4316,9 +4321,9 @@ impl WriteEngine {
         for &(a, l, ty) in to_free {
             free(a, l, ty);
         }
-        // The superseded extension and manager blocks, and the rest of the span
-        // reserved for them: metadata, and a whole number of pages, so freeing it
-        // hands the page the last tail sat in straight back to `pages`.
+        // The superseded extension and manager blocks, which are metadata wherever
+        // they sat: the tail is placed as metadata, and a page it had to open for
+        // itself was opened as metadata too.
         for &(a, l) in old_blocks {
             free(a, l, PageType::Meta);
         }
@@ -4413,18 +4418,36 @@ impl WriteEngine {
 
     /// Write one block of a paged commit's tail at the address its plan gave it,
     /// which is either the current end-of-file (the tail is being appended) or
-    /// inside a region reserved from the metadata free list (the tail is being
-    /// reused into an earlier one's page).
-    fn write_tail_block(&mut self, addr: u64, bytes: &[u8]) -> Result<(), Error> {
+    /// inside `region` — the span reserved from the free lists — when the tail is
+    /// being reused into space an earlier commit left.
+    ///
+    /// The region is checked rather than asserted, for the reason
+    /// [`place`](Self::place) checks its own reservation: a reused span is followed
+    /// by live bytes, so a block running past it would silently destroy a
+    /// neighboring object, and this is the one write in a commit that lands in the
+    /// middle of a live file. `blocks_len` is derived from the same plan that
+    /// placed these blocks, so the two cannot disagree today; the comparison is
+    /// what keeps that true if the plan ever learns a length this sizing does not
+    /// model.
+    fn write_tail_block(
+        &mut self,
+        region: (u64, u64),
+        addr: u64,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
+        let (start, len) = region;
+        if addr < start || addr + bytes.len() as u64 > start + len {
+            return Err(Error::Format(FormatError::SerializationError(format!(
+                "a paged commit's tail reserved [{start}, {}) but placed {} bytes at {addr}",
+                start + len,
+                bytes.len()
+            ))));
+        }
         if addr == self.image.len() {
             let written = self.append(bytes)?;
             debug_assert_eq!(written, addr, "an appended block must land at end-of-file");
             return Ok(());
         }
-        debug_assert!(
-            addr + bytes.len() as u64 <= self.image.len(),
-            "a reused block must stay within the file it was reserved from"
-        );
         self.write_at(
             usize::try_from(addr)
                 .map_err(|_| Error::EditUnsupported("tail address exceeds this platform"))?,
@@ -6212,9 +6235,10 @@ impl WriteEngine {
     /// unreachable from the on-disk root, so a mid-commit crash cannot corrupt the
     /// live tree: the superblock still points at the prior, intact root.
     ///
-    /// A paged file reuses only within the matching page type, keeping every page
-    /// homogeneous, and never opens a page for a reused region — the tail page is
-    /// untouched by a write into the middle of the file.
+    /// A paged file reuses within the matching page type, or out of a page holding
+    /// nothing at all, which belongs to no type ([`PagedEdit::alloc_typed`]); every
+    /// page stays homogeneous either way. It never opens a page for a reused region
+    /// — the tail page is untouched by a write into the middle of the file.
     fn reserve(&mut self, len: u64, ty: PageType) -> Result<Placement, Error> {
         if let Some(addr) = self.alloc_free(len, ty) {
             return Ok(Placement::Reused { addr, len });
@@ -9753,7 +9777,7 @@ mod tests {
         let mut s = session(
             &dir.path().join("e.h5"),
             None,
-            Some((PAGE + 512, 2 * PAGE - 512)),
+            Some((PAGE + 512, 3 * PAGE - 512)),
         );
         assert!(
             matches!(
@@ -9761,6 +9785,107 @@ mod tests {
                 Placement::Reused { addr, .. } if addr == 2 * PAGE
             ),
             "the claim must begin at the empty page, not at the run's start"
+        );
+        // Both edges the claim leaves behind survive it: they are ordinary free
+        // space of the type that already held them, and dropping either is the same
+        // silent leak this change exists to remove.
+        let pg = s.paged.as_ref().expect("still paged");
+        assert_eq!(
+            pg.raw.sections(),
+            [(PAGE + 512, PAGE - 512), (3 * PAGE, PAGE)],
+            "the fragment below the claimed page and the page above it both stay free"
+        );
+        assert_eq!(
+            pg.meta.sections(),
+            [(2 * PAGE + 1024, PAGE - 1024)],
+            "the rest of the claimed page is free space of the claiming type"
+        );
+    }
+
+    /// Every byte a paged session could still hand out, across both page types.
+    fn free_total(s: &WriteEngine) -> u64 {
+        let pg = s.paged.as_ref().expect("a paged session");
+        pg.meta
+            .sections()
+            .into_iter()
+            .chain(pg.raw.sections())
+            .map(|(_, len)| len)
+            .sum()
+    }
+
+    /// A paged commit's tail removes from the free lists exactly the bytes it goes
+    /// on to write — no more, and nothing at all when it declines to place itself.
+    ///
+    /// This is the invariant the whole change rests on, and the one an integration
+    /// test cannot reach: the tail's length and the hole it lands in determine each
+    /// other, so which settlement the arithmetic reaches depends on the shape of
+    /// the free list, and a file the writer builds only ever produces some of them.
+    /// In particular, best fit prefers the *smallest* region that fits, so a hole
+    /// whose length is exactly the length the tail proposed is the one it will
+    /// choose — and consuming a region outright drops a section from the managers,
+    /// making the plan come out *shorter* than the space just reserved for it. A
+    /// tail that accepted that would retire the difference from the free list with
+    /// nothing recording it, which is issue #286 again, a few bytes at a time.
+    ///
+    /// Hence a contiguous sweep of hole sizes rather than a chosen one: the length
+    /// the tail proposes is a property of the file and its free list, not something
+    /// this test should have to know, and the sweep is certain to cross it.
+    #[test]
+    fn a_paged_tail_takes_exactly_the_space_it_fills() {
+        use crate::writer::FileBuilder;
+        use tempfile::tempdir;
+
+        const PAGE: u64 = 4096;
+        /// Any plausible extension length exercises the same arithmetic, and the
+        /// invariant holds for every one of them; the tail's real length is settled
+        /// by the commit, which is not what is under test here.
+        const EXT_LEN: u64 = 100;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("tail_exact.h5");
+        let mut b = FileBuilder::new();
+        b.create_dataset("d")
+            .with_i32_data(&(0..4000).collect::<Vec<i32>>())
+            .with_shape(&[4000]);
+        b.with_file_space_strategy(FileSpaceStrategy::Page, true, 0)
+            .with_file_space_page_size(PAGE);
+        b.write(&path).unwrap();
+        let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+        let os = s.superblock.offset_size;
+
+        let mut placed = 0usize;
+        for hole in 120..420u64 {
+            {
+                let pg = s.paged.as_mut().expect("a paged file installs paged state");
+                pg.meta = FreeList::new();
+                pg.raw = FreeList::new();
+                pg.unclassified = FreeList::new();
+                pg.meta.free(PAGE, hole);
+            }
+            let free_before = free_total(&s);
+            let layout = s.tail_layout(&[], &[], EXT_LEN, PAGE, os);
+            let free_after = free_total(&s);
+            match layout {
+                Some((_, _, at, blocks_len)) => {
+                    placed += 1;
+                    assert_eq!(
+                        free_before - free_after,
+                        blocks_len,
+                        "hole {hole}: the tail took {} bytes at {at} to write {blocks_len}",
+                        free_before - free_after
+                    );
+                }
+                None => assert_eq!(
+                    free_after, free_before,
+                    "hole {hole}: a tail that declines to place itself must hand back \
+                     everything it tried"
+                ),
+            }
+        }
+        assert!(
+            placed > 0,
+            "the sweep must reach holes the tail can actually use, or it asserts \
+             nothing about placement"
         );
     }
 

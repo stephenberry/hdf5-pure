@@ -148,6 +148,19 @@ impl FreeList {
         if len == 0 || align == 0 {
             return None;
         }
+        // Whole units in, whole units out: this is what makes *both* leftovers
+        // aligned, and so keeps each of them inside pages of the type that already
+        // held them. An unrounded `len` would hand the caller's type the front of a
+        // page and leave the back of that same page in the other type's list — page
+        // mixing, silently, which is the one thing paging exists to prevent. The
+        // caller does the rounding because only it knows the unit, and every caller
+        // is in this crate, so this is a construction-enforced invariant rather
+        // than a refusal.
+        debug_assert_eq!(
+            len % align,
+            0,
+            "alloc_whole_units takes a whole number of units"
+        );
         // Best-fit over the *aligned interior*, which is the part that can serve
         // the request, rather than over the region as a whole.
         let interior = |r: &FreeRegion| -> Option<(u64, u64)> {
