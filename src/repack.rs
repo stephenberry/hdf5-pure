@@ -777,10 +777,17 @@ fn carry_shape_and_pipeline(
                     // `check_pipeline` guarantees integer (lossless) mode here.
                     // Re-apply with the source's minbits parameter; integer
                     // scale-offset reconstructs the exact element bytes.
-                    if let Some(mode @ ScaleOffset::Integer(_)) =
+                    //
+                    // Its fill availability is re-applied too. The value it
+                    // records comes from the dataset's own fill value, carried
+                    // separately, so only the availability needs saying — and
+                    // saying it keeps a source that records none from gaining
+                    // one, which would re-encode every chunk a code point wider.
+                    if let Some((mode @ ScaleOffset::Integer(_), fill)) =
                         scaleoffset::scale_offset_mode(&f.client_data)
                     {
                         db.with_scale_offset(mode);
+                        db.chunk_options.scale_offset_fill = fill;
                     } else {
                         unreachable!("check_pipeline rejected non-integer scale-offset");
                     }
@@ -1725,10 +1732,10 @@ fn check_pipeline(pipeline: Option<&FilterPipeline>, path: &str) -> Result<(), E
         match f.filter_id {
             FILTER_DEFLATE | FILTER_SHUFFLE | FILTER_FLETCHER32 | FILTER_LZF => {}
             FILTER_SCALEOFFSET => match scaleoffset::scale_offset_mode(&f.client_data) {
-                Some(ScaleOffset::Integer(_)) => {}
+                Some((ScaleOffset::Integer(_), _)) => {}
                 _ => {
                     return Err(Error::RepackUnsupported(format!(
-                        "dataset {path}: only lossless integer scale-offset with an undefined fill value can be repacked faithfully"
+                        "dataset {path}: only lossless integer scale-offset can be repacked faithfully"
                     )));
                 }
             },

@@ -7389,15 +7389,15 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
         // ([`compress_chunks`] + [`assemble_chunked_at`] + [`build_chunked_dataset_oh`]),
         // so the
         // resulting object header is byte-identical to a freshly written one.
+        //
+        // The fill value goes in for the same reason the apply phase passes it:
+        // scale-offset records it in the filter's parameters, so a validation
+        // that left it out would be checking a pipeline the commit does not
+        // build — and would pass a fill value the encoder later refuses.
         let chunk_dims = db.chunk_options.resolve_chunk_dims(&shape);
         let ctx = ChunkContext::from_datatype(&chunk_dims, &dt)?;
         db.chunk_options
-            .build_pipeline(
-                ctx.element_size.get(),
-                &chunk_dims,
-                ctx.element_type,
-                ctx.scale_offset_type,
-            )
+            .build_pipeline(&ctx, db.fill.as_deref())
             .map_err(|_| {
                 Error::EditUnsupported(
                     "this dataset's filter pipeline cannot be added in place \

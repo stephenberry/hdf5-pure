@@ -24,8 +24,8 @@ use crate::filter_pipeline::{
     FILTER_DEFLATE, FILTER_FLETCHER32, FILTER_LZF, FILTER_SCALEOFFSET, FILTER_SHUFFLE,
     FilterDescription, FilterPipeline,
 };
-use crate::filters::{ChunkContext, ZfpElementTypeWhenEnabled, compress_chunk_with};
-use crate::scaleoffset::{ScaleOffset, ScaleOffsetType, build_cd_values};
+use crate::filters::{ChunkContext, compress_chunk_with};
+use crate::scaleoffset::{FillAvailability, ScaleOffset, build_cd_values};
 
 /// Log2 of the Fixed Array data-block page size (`2^10 = 1024` elements).
 ///
@@ -73,6 +73,12 @@ pub struct ChunkOptions {
     /// the primary transform (mutually exclusive with ZFP, replaces shuffle)
     /// and may be followed by deflate.
     pub scale_offset: Option<ScaleOffset>,
+    /// Whether the scale-offset filter records the dataset's fill value.
+    ///
+    /// The default records it, which is what the reference library does for
+    /// every dataset whose fill value is not explicitly undefined. See
+    /// [`FillAvailability`] for why the other setting exists and who sets it.
+    pub scale_offset_fill: FillAvailability,
 }
 
 impl ChunkOptions {
@@ -154,34 +160,44 @@ impl ChunkOptions {
 
     /// Build a FilterPipeline from the options.
     ///
-    /// `chunk_dims` and `zfp_element_type` are only consulted when the ZFP
-    /// filter is active — they're embedded into the ZFP cd_values so the
+    /// The context's chunk dimensions and element type are only consulted when
+    /// the ZFP filter is active — they're embedded into the ZFP cd_values so the
     /// resulting file is readable by the reference H5Z-ZFP plugin.
     ///
-    /// Returns [`FormatError::UnsupportedZfp`] when ZFP was requested but
-    /// `zfp_element_type` is `None` (e.g. the dataset's datatype isn't one of
-    /// f32/f64/i32/i64), or the chunk rank is outside 1..=4, and
+    /// `fill` is the dataset's fill value, one element in its own byte order,
+    /// and `None` the library default. Scale-offset records it in its
+    /// parameters, so it is part of the pipeline rather than of the data: the
+    /// same dataset written with and without a fill value carries two different
+    /// filters, and the encoder diverts elements equal to that value to a
+    /// reserved sentinel.
+    ///
+    /// Returns [`FormatError::UnsupportedZfp`] when ZFP was requested but the
+    /// context's element type is `None` (e.g. the dataset's datatype isn't one
+    /// of f32/f64/i32/i64), or the chunk rank is outside 1..=4, and
     /// [`FormatError::FilterError`] for a combination of filters where one
-    /// would displace another — see [`refuse_conflicting_filters`].
+    /// would displace another — see [`refuse_conflicting_filters`] — or for a
+    /// fill value whose length is not one element.
     ///
     /// [`refuse_conflicting_filters`]: Self::refuse_conflicting_filters
     pub fn build_pipeline(
         &self,
-        element_size: u32,
-        chunk_dims: &[u64],
-        zfp_element_type: Option<ZfpElementTypeWhenEnabled>,
-        scale_offset_type: Option<ScaleOffsetType>,
+        ctx: &ChunkContext<'_>,
+        fill: Option<&[u8]>,
     ) -> Result<Option<FilterPipeline>, FormatError> {
         self.refuse_conflicting_filters()?;
 
+        let element_size = ctx.element_size.get();
+        let chunk_dims = ctx.chunk_dims;
+        let scale_offset_type = ctx.scale_offset_type;
+
         let mut filters = Vec::new();
-        let _ = zfp_element_type; // used only under the `zfp` feature below
+        let _ = ctx.element_type; // used only under the `zfp` feature below
 
         // ZFP is a standalone compressor: `refuse_conflicting_filters` has
         // already established that nothing it would displace was asked for.
         #[cfg(feature = "zfp")]
         if let Some(rate) = self.zfp_rate {
-            let elem_ty = zfp_element_type.ok_or_else(|| {
+            let elem_ty = ctx.element_type.ok_or_else(|| {
                 FormatError::UnsupportedZfp(
                     "ZFP compression requires the dataset's datatype to be one \
                      of f32, f64, i32, or i64"
@@ -214,7 +230,13 @@ impl ChunkOptions {
                 filter_id: FILTER_SCALEOFFSET,
                 name: None,
                 flags: 0,
-                client_data: build_cd_values(mode, ty, element_size, nelmts)?,
+                client_data: build_cd_values(
+                    mode,
+                    ty,
+                    element_size,
+                    nelmts,
+                    self.scale_offset_fill.with_value(fill),
+                )?,
             });
         }
 
@@ -2232,12 +2254,10 @@ pub(crate) fn compress_chunks(
 ) -> Result<CompressedChunkSet, FormatError> {
     let chunk_dims = ctx.chunk_dims;
     let element_size = nonzero_usize_from(ctx.element_size)?;
-    let pipeline = options.build_pipeline(
-        ctx.element_size.get(),
-        chunk_dims,
-        ctx.element_type,
-        ctx.scale_offset_type,
-    )?;
+    // The fill value is part of the scale-offset filter's parameters, so the
+    // pipeline is built from the same pattern the unwritten slots are padded
+    // with. An unreadable one refuses here rather than being recorded as zero.
+    let pipeline = options.build_pipeline(&ctx, fill.element()?)?;
 
     // Decided from the geometry alone, and decided first: it is the step that
     // refuses a maximum shape needing an index this writer will not emit, and
@@ -3719,7 +3739,10 @@ mod tests {
             deflate_level: Some(6),
             ..Default::default()
         };
-        let pl = options.build_pipeline(8, &[], None, None).unwrap().unwrap();
+        let pl = options
+            .build_pipeline(&ChunkContext::basic(&[], 8), None)
+            .unwrap()
+            .unwrap();
         assert_eq!(pl.filters.len(), 1);
         assert_eq!(pl.filters[0].filter_id, FILTER_DEFLATE);
     }
@@ -3732,7 +3755,10 @@ mod tests {
             fletcher32: true,
             ..Default::default()
         };
-        let pl = options.build_pipeline(8, &[], None, None).unwrap().unwrap();
+        let pl = options
+            .build_pipeline(&ChunkContext::basic(&[], 8), None)
+            .unwrap()
+            .unwrap();
         assert_eq!(pl.filters.len(), 3);
         assert_eq!(pl.filters[0].filter_id, FILTER_SHUFFLE);
         assert_eq!(pl.filters[1].filter_id, FILTER_DEFLATE);
@@ -3819,15 +3845,7 @@ mod tests {
             // also wrong would pass an `is_err()` check while leaving the
             // combination itself unrefused.
             let err = options
-                .build_pipeline(
-                    8,
-                    &[64],
-                    zfp_f64_type(),
-                    Some(
-                        crate::scaleoffset::scale_offset_type_from_datatype(&make_f64_type())
-                            .expect("f64 is a scale-offset type"),
-                    ),
-                )
+                .build_pipeline(&f64_ctx(&[64]), None)
                 .expect_err("{a} + {b} was accepted");
             let FormatError::FilterError(msg) = &err else {
                 panic!("{a} + {b}: expected a filter error, got {err}");
@@ -3836,14 +3854,29 @@ mod tests {
         }
     }
 
+    /// A context over `f64` elements carrying both type-aware filters' facts.
+    ///
+    /// The clash fixtures need a request that a valid ZFP or scale-offset
+    /// pipeline could actually satisfy: an error raised only because the
+    /// datatype was wrong would pass an `is_err()` check while leaving the
+    /// combination itself unrefused.
+    fn f64_ctx(chunk_dims: &[u64]) -> ChunkContext<'_> {
+        ChunkContext {
+            chunk_dims,
+            element_size: core::num::NonZeroU32::new(8).expect("8 is non-zero"),
+            element_type: zfp_f64_type(),
+            scale_offset_type: crate::scaleoffset::scale_offset_type_from_datatype(&make_f64_type()),
+        }
+    }
+
     /// The type a ZFP request needs, when the feature is on.
     #[cfg(feature = "zfp")]
-    fn zfp_f64_type() -> Option<ZfpElementTypeWhenEnabled> {
+    fn zfp_f64_type() -> Option<crate::filters::ZfpElementTypeWhenEnabled> {
         crate::filters::zfp_element_type_from_datatype(&make_f64_type())
     }
 
     #[cfg(not(feature = "zfp"))]
-    fn zfp_f64_type() -> Option<ZfpElementTypeWhenEnabled> {
+    fn zfp_f64_type() -> Option<crate::filters::ZfpElementTypeWhenEnabled> {
         None
     }
 
@@ -3853,7 +3886,6 @@ mod tests {
     #[test]
     fn compatible_filter_requests_still_build() {
         let so = Some(ScaleOffset::FloatDScale(2));
-        let so_ty = crate::scaleoffset::scale_offset_type_from_datatype(&make_f64_type());
         let cases: &[(ChunkOptions, &[u16])] = &[
             (
                 ChunkOptions {
@@ -3892,7 +3924,7 @@ mod tests {
 
         for (options, expected) in cases {
             let pl = options
-                .build_pipeline(8, &[64], zfp_f64_type(), so_ty)
+                .build_pipeline(&f64_ctx(&[64]), None)
                 .unwrap()
                 .unwrap();
             let ids: Vec<u16> = pl.filters.iter().map(|f| f.filter_id).collect();
