@@ -194,12 +194,9 @@ fn parse_fa_element(
     let Some(address) = read_optional_offset(block, elem_pos, offset_size)? else {
         return Ok(None);
     };
-    let offsets = grid.offsets_at(index as u64)?;
-    if !grid.contains(&offsets) {
-        // A slot the maximum grid numbers but the current extent has not grown
-        // into. It holds no chunk of this dataset; see `ChunkGrid::contains`.
+    let Some(offsets) = grid.offsets_in_extent(index as u64)? else {
         return Ok(None);
-    }
+    };
     if client_id == 0 {
         Ok(Some(ChunkInfo {
             chunk_size: u32_from(chunk_byte_size)?,
@@ -550,6 +547,47 @@ mod tests {
             0x04030201
         );
         assert_eq!(read_variable_length(&[0xFF], 1).unwrap(), 0xFF);
+    }
+
+    /// An element holding a real address at a slot the dataset's own extent does
+    /// not reach is dropped rather than returned.
+    ///
+    /// The maximum grid numbers more slots than a dataset of the current shape
+    /// occupies, so such a slot decodes to coordinates outside the dataspace.
+    /// Returning it would scatter a chunk past the dataset's bounds. It takes an
+    /// index and a dataspace that disagree to produce one, which is a malformed
+    /// file — but a reader must not be the thing that trusts them.
+    #[test]
+    fn a_chunk_at_a_slot_outside_the_dataset_is_dropped() {
+        // Chunk [2] over shape [4] is two chunks; a maximum of [8] numbers four
+        // slots. Put a chunk in each of slots 0, 1 and 3.
+        let chunks: Vec<crate::chunked_write::WrittenChunk> = [0x1000u64, 0x2000, 0x3000]
+            .iter()
+            .map(|&address| crate::chunked_write::WrittenChunk {
+                address,
+                compressed_size: 8,
+                filter_mask: 0,
+            })
+            .collect();
+        let slots = crate::chunked_write::IndexSlots::new(&chunks, &[0, 1, 3], 4).unwrap();
+        let fa = crate::chunked_write::build_fixed_array_at(&slots, 8, 8, 8, false, 0);
+
+        let grid = ChunkGrid::new(
+            &[2],
+            &[4],
+            Some(&[8]),
+            crate::chunk_grid::GridOrder::RowMajor,
+        )
+        .unwrap();
+        let header = FixedArrayHeader::parse(&fa, 0, 8, 8).unwrap();
+        assert_eq!(header.num_elements, 4);
+        let read = read_fixed_array_chunks(&fa, &header, &grid, &[2], 4, 8, 8).unwrap();
+        assert_eq!(
+            read.iter().map(|c| c.address).collect::<Vec<_>>(),
+            vec![0x1000, 0x2000],
+            "the slot-3 chunk lies past the dataset's four elements"
+        );
+        assert_eq!(read[1].offsets, vec![2]);
     }
 
     #[test]

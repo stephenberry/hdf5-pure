@@ -257,7 +257,9 @@ fn read_element(
         let Some(address) = read_optional_offset(data, pos, offset_size)? else {
             return Ok((None, os));
         };
-        let offsets = grid.offsets_at(linear_index as u64)?;
+        let Some(offsets) = grid.offsets_in_extent(linear_index as u64)? else {
+            return Ok((None, os));
+        };
         Ok((
             Some(ChunkInfo {
                 chunk_size: u32_from(chunk_byte_size)?,
@@ -286,6 +288,9 @@ fn read_element(
         let Some(address) = read_optional_offset(data, pos, offset_size)? else {
             return Ok((None, elem_total));
         };
+        let Some(offsets) = grid.offsets_in_extent(linear_index as u64)? else {
+            return Ok((None, elem_total));
+        };
         let chunk_size = read_variable_length(&data[pos + os..], chunk_size_bytes)?;
         let fm_off = pos + os + chunk_size_bytes;
         let filter_mask = u32::from_le_bytes([
@@ -294,7 +299,6 @@ fn read_element(
             data[fm_off + 2],
             data[fm_off + 3],
         ]);
-        let offsets = grid.offsets_at(linear_index as u64)?;
         Ok((
             Some(ChunkInfo {
                 chunk_size: u32_from(chunk_size)?,
@@ -498,15 +502,15 @@ pub fn read_extensible_array_chunks(
 
     let mut chunks = Vec::new();
     let mut global_index = 0usize;
-    // Bound the traversal by the dataset's dimensions, not just the array's
-    // stored element count. A SWMR writer publishes the grown chunk index
-    // (header element count) before the grown dataspace dimension; reading only
-    // as far as the current dimensions reach means an interrupted append (index
-    // ahead of dimensions) yields a consistent prefix rather than chunks beyond
-    // the dataset bounds. The bound is a slot number rather than a chunk count
-    // because a maximum shape wider than the shape leaves gaps between the
-    // occupied slots (see `ChunkGrid::slot_limit`).
-    let total_elements = (header.num_elements.to_usize()?).min(grid.slot_limit()?.to_usize()?);
+    // A SWMR writer publishes the grown chunk index (header element count)
+    // before the grown dataspace dimension, so an interrupted append leaves
+    // elements the dataspace has not caught up with. Those are dropped one at a
+    // time by `ChunkGrid::offsets_in_extent`, which is what makes the read a
+    // consistent prefix; this count does not need to bound them as well. It
+    // used to, and the walk is no faster for it — the structure traversal is
+    // bounded by the array's own geometry, so a header naming ten billion
+    // elements over two allocated blocks reads in the same 200us either way.
+    let total_elements = header.num_elements.to_usize()?;
 
     // 1. Read inline elements in index block
     let n_inline = header.idx_blk_elmts as usize;
@@ -941,12 +945,9 @@ pub fn read_extensible_array_chunks_from_source<S: Source + ?Sized>(
     let chunk_byte_size: u64 =
         chunk_dimensions.iter().map(|&d| d as u64).product::<u64>() * element_size as u64;
 
-    // See `read_extensible_array_chunks` for why the walk stops at a slot
-    // number rather than a chunk count.
-    let total_elements = header
-        .num_elements
-        .to_usize()?
-        .min(grid.slot_limit()?.to_usize()?);
+    // See `read_extensible_array_chunks` on why the dataspace does not bound
+    // this count.
+    let total_elements = header.num_elements.to_usize()?;
 
     let geom = EaGeometry::from_header(header);
     let elem_stride = ea_elem_stride(header, offset_size);
@@ -1375,6 +1376,55 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// The Extensible Array twin of
+    /// `fixed_array::tests::a_chunk_at_a_slot_outside_the_dataset_is_dropped`.
+    ///
+    /// The slot has to be one the walk actually reaches, so it is an *interior*
+    /// slot rather than a trailing one: with the maximum shape wider than the
+    /// shape in the dimension the rotation leaves behind, slots between the
+    /// occupied ones decode to coordinates the dataset has not grown into.
+    /// A trailing slot would be cut by the walk's own bound instead, leaving
+    /// this check untested.
+    #[test]
+    fn a_chunk_at_an_interior_slot_outside_the_dataset_is_dropped() {
+        // Shape [3, 3] with [2, 2] chunks, maximum [8, unlimited]. The rotation
+        // puts the unlimited dimension first, so the multipliers are [4, 1] over
+        // (column, row): the dataset's own corner chunk is slot 5, and slot 2 in
+        // between decodes to chunk row 2 — offsets [4, 0], past a 3-row dataset.
+        let chunks: Vec<crate::chunked_write::WrittenChunk> = [0x1000u64, 0x2000, 0x3000]
+            .iter()
+            .map(|&address| crate::chunked_write::WrittenChunk {
+                address,
+                compressed_size: 8,
+                filter_mask: 0,
+            })
+            .collect();
+        let slots = crate::chunked_write::IndexSlots::new(&chunks, &[0, 1, 2], 3).unwrap();
+        let ea =
+            crate::chunked_write::build_extensible_array_at(&slots, 16, 8, 8, false, 0).unwrap();
+
+        let grid = ChunkGrid::new(
+            &[2, 2],
+            &[3, 3],
+            Some(&[8, u64::MAX]),
+            crate::chunk_grid::GridOrder::UnlimitedFirst,
+        )
+        .unwrap();
+        assert_eq!(
+            grid.offsets_in_extent(2).unwrap(),
+            None,
+            "slot 2 is the one"
+        );
+
+        let header = ExtensibleArrayHeader::parse(&ea, 0, 8, 8).unwrap();
+        let read = read_extensible_array_chunks(&ea, &header, &grid, &[2, 2], 4, 8, 8).unwrap();
+        assert_eq!(
+            read.iter().map(|c| c.address).collect::<Vec<_>>(),
+            vec![0x1000, 0x2000],
+            "the slot-2 chunk lies past the dataset's three rows"
+        );
+    }
+
     /// Build a synthetic Extensible Array with only inline elements (simplest case).
     /// All chunks fit in the index block.
     #[test]
@@ -1711,19 +1761,10 @@ mod tests {
     #[test]
     fn read_element_unallocated() {
         let data = vec![0xFFu8; 16];
-        let num_chunks = vec![5u64];
+        let ds_dims = vec![50u64];
         let chunk_dims = vec![10u32];
-        let (info, consumed) = read_element(
-            &data,
-            0,
-            0,
-            8,
-            8,
-            80,
-            0,
-            &dense_grid(&num_chunks, &chunk_dims),
-        )
-        .unwrap();
+        let (info, consumed) =
+            read_element(&data, 0, 0, 8, 8, 80, 0, &dense_grid(&ds_dims, &chunk_dims)).unwrap();
         assert!(info.is_none());
         assert_eq!(consumed, 8);
     }
@@ -1742,7 +1783,7 @@ mod tests {
         // Filter mask
         data[12..16].copy_from_slice(&0u32.to_le_bytes());
 
-        let num_chunks = vec![5u64];
+        let ds_dims = vec![50u64];
         let chunk_dims = vec![10u32];
         let (info, consumed) = read_element(
             &data,
@@ -1752,7 +1793,7 @@ mod tests {
             os,
             80,
             2,
-            &dense_grid(&num_chunks, &chunk_dims),
+            &dense_grid(&ds_dims, &chunk_dims),
         )
         .unwrap();
         let ci = info.unwrap();
@@ -1772,7 +1813,7 @@ mod tests {
     #[test]
     fn filtered_element_smaller_than_its_own_fields_is_refused() {
         let os: u8 = 8;
-        let num_chunks = vec![5u64];
+        let ds_dims = vec![50u64];
         let chunk_dims = vec![10u32];
         let data = vec![0u8; 64];
 
@@ -1786,7 +1827,7 @@ mod tests {
                 os,
                 80,
                 0,
-                &dense_grid(&num_chunks, &chunk_dims),
+                &dense_grid(&ds_dims, &chunk_dims),
             )
             .expect_err("a filtered element narrower than its own fields must be refused");
             assert!(
@@ -1804,7 +1845,7 @@ mod tests {
             os,
             80,
             0,
-            &dense_grid(&num_chunks, &chunk_dims),
+            &dense_grid(&ds_dims, &chunk_dims),
         )
         .expect("a width that fits address + 1-byte size + mask must parse");
     }

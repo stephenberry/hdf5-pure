@@ -211,51 +211,28 @@ impl ChunkGrid {
         Ok(slot)
     }
 
-    /// One past the highest slot the dataset's *current* extent reaches, or `0`
-    /// when it holds no chunks at all.
+    /// The logical offsets of the chunk stored at element `slot`, or `None` when
+    /// that slot lies outside the dataset's *current* extent.
     ///
-    /// A reader walks slots, not chunks, and a maximum shape wider than the
-    /// shape leaves gaps between the occupied ones — so the walk cannot stop
-    /// after the chunk count. It stops here instead, which also preserves the
-    /// property the count bound was there for: a chunk index published ahead of
-    /// the dataspace it belongs to (an interrupted SWMR append) yields a
-    /// consistent prefix rather than chunks past the dataset's bounds.
-    pub(crate) fn slot_limit(&self) -> Result<u64, FormatError> {
-        let mut slot = 0u64;
-        for (i, d) in self.down.iter().enumerate() {
-            let dim = dim_at(i, self.rotated);
-            let count = self.dims[dim].div_ceil(self.chunk_dims[dim]);
-            if count == 0 {
-                return Ok(0);
-            }
-            slot = (count - 1)
-                .checked_mul(*d)
-                .and_then(|term| slot.checked_add(term))
-                .ok_or_else(|| {
-                    FormatError::ChunkedReadError(
-                        "the dataset's own extent exceeds the numbering the maximum shape allows"
-                            .into(),
-                    )
-                })?;
-        }
-        Ok(slot + 1)
-    }
-
-    /// Whether `offsets` (as returned by [`offsets_at`](Self::offsets_at)) lies
-    /// inside the dataset's current extent.
-    ///
-    /// Slots between the occupied ones decode to coordinates the dataset has
-    /// not grown into yet. They hold no chunk, so the question only arises for a
-    /// file whose index disagrees with its dataspace; answering it here keeps
-    /// such a chunk out of the assembled result instead of scattering it past
-    /// the dataset's bounds.
-    pub(crate) fn contains(&self, offsets: &[u64]) -> bool {
-        offsets.iter().zip(&self.dims).all(|(o, d)| o < d)
+    /// Both readers go through this rather than through
+    /// [`offsets_at`](Self::offsets_at), so the two index types answer the
+    /// question the same way. The maximum grid numbers slots the dataset has not
+    /// grown into; those hold no chunk, so a defined address at one means the
+    /// index and the dataspace disagree — a chunk index published ahead of its
+    /// dataspace (an interrupted append), or a malformed file. Dropping it here
+    /// is what keeps it from being scattered past the dataset's bounds.
+    pub(crate) fn offsets_in_extent(&self, slot: u64) -> Result<Option<Vec<u64>>, FormatError> {
+        let offsets = self.offsets_at(slot)?;
+        Ok(offsets
+            .iter()
+            .zip(&self.dims)
+            .all(|(o, d)| o < d)
+            .then_some(offsets))
     }
 
     /// The logical offsets — the first element's coordinate in each dimension,
     /// in elements — of the chunk stored at element `slot`.
-    pub(crate) fn offsets_at(&self, slot: u64) -> Result<Vec<u64>, FormatError> {
+    fn offsets_at(&self, slot: u64) -> Result<Vec<u64>, FormatError> {
         let rank = self.chunk_dims.len();
         let mut offsets = vec![0u64; rank];
         let mut remaining = slot;
