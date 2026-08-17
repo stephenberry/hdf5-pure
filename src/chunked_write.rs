@@ -3733,6 +3733,45 @@ mod tests {
         assert_eq!(dims, vec![100, 50]);
     }
 
+    /// The two fill-availability settings, through the pipeline builder.
+    ///
+    /// The default records the dataset's fill value; [`FillAvailability::
+    /// Undefined`] records none *and drops the value*, which is what a repack of
+    /// a source that recorded none needs. A setting that carried the value
+    /// through anyway would leave a filter claiming no fill value with one
+    /// sitting in the parameters after it.
+    #[test]
+    fn the_scale_offset_fill_availability_reaches_the_filter_parameters() {
+        let ctx = f64_ctx(&[8]);
+        let fill = 2.5f64.to_le_bytes();
+        let parms = |fill_availability, fill: Option<&[u8]>| {
+            let options = ChunkOptions {
+                scale_offset: Some(ScaleOffset::FloatDScale(2)),
+                scale_offset_fill: fill_availability,
+                ..Default::default()
+            };
+            let pl = options.build_pipeline(&ctx, fill).unwrap().unwrap();
+            let f = pl
+                .filters
+                .iter()
+                .find(|f| f.filter_id == FILTER_SCALEOFFSET)
+                .expect("the scale-offset filter");
+            // FILAVAIL, then the two entries the value can occupy.
+            (f.client_data[7], f.client_data[8], f.client_data[9])
+        };
+
+        // 2.5 as an `f64` bit pattern, split across the two entries.
+        let bits = 2.5f64.to_bits();
+        assert_eq!(
+            parms(FillAvailability::Defined, Some(&fill)),
+            (1, bits as u32, (bits >> 32) as u32)
+        );
+        // The library default is a defined fill value of zero.
+        assert_eq!(parms(FillAvailability::Defined, None), (1, 0, 0));
+        // Undefined records neither, even when a fill value is available.
+        assert_eq!(parms(FillAvailability::Undefined, Some(&fill)), (0, 0, 0));
+    }
+
     #[test]
     fn chunk_options_pipeline_deflate() {
         let options = ChunkOptions {
