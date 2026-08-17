@@ -550,6 +550,31 @@ fn ensure_chunk_bytes_representable(
     }
 }
 
+/// Resolve a chunked layout's index address, distinguishing "no storage because
+/// there is nothing to store" from "no storage where data must be".
+///
+/// A chunked dataset's index is allocated lazily — the reference C library
+/// leaves the layout message's address undefined until the first chunk is
+/// written — so a zero-element dataset, which is the shape an extensible one is
+/// created at before anything is appended, legitimately names no index. It owns
+/// no elements, so its read is the empty buffer; `Ok(None)` says so, and each
+/// caller returns that buffer.
+///
+/// A dataset that *does* own elements and still names no index is a different
+/// thing, and stays an error here.
+fn chunk_index_address(
+    addr: Option<u64>,
+    dataspace: &Dataspace,
+) -> Result<Option<u64>, FormatError> {
+    match addr {
+        Some(a) => Ok(Some(a)),
+        None if dataspace.num_elements() == 0 => Ok(None),
+        None => Err(FormatError::ChunkedReadError(
+            "no address for chunked layout".into(),
+        )),
+    }
+}
+
 /// Read a chunked dataset from a [`Source`], reading the chunk index and
 /// each chunk's bytes on demand via `read_at`.
 ///
@@ -597,8 +622,9 @@ pub fn read_chunked_data_from_source<S: Source + ?Sized>(
         }
     };
 
-    let addr = addr_opt
-        .ok_or_else(|| FormatError::ChunkedReadError("no address for chunked layout".into()))?;
+    let Some(addr) = chunk_index_address(addr_opt, dataspace)? else {
+        return Ok(Vec::new());
+    };
 
     let elem_size = datatype.element_size_usize()?;
     let (rank, chunk_dims, ds_dims) = chunked_dims(chunk_dimensions, dataspace)?;
@@ -785,8 +811,14 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
 
     // Unallocated chunk index: a non-empty window has no storage to read. Match
     // the whole-dataset reader, which errors here, so `read_raw_rows` stays
-    // consistent with `read_raw` rather than fabricating a window of zeros. (An
-    // empty window has already returned above.)
+    // consistent with `read_raw` rather than fabricating a window of zeros.
+    //
+    // The zero-element case that `chunk_index_address` answers with an empty
+    // buffer does not reach this line, but note *why*: not because the shape
+    // makes `total_bytes` zero (for `[0]` or `[0, 4]` the inner product is
+    // non-zero, so a `num_rows > 0` call would fall straight through to here),
+    // but because the sole caller, `Dataset::read_raw_rows`, clamps the window
+    // to the leading dimension first.
     let Some(addr) = *btree_address else {
         return Err(FormatError::ChunkedReadError(
             "no address for chunked layout".into(),
@@ -1021,8 +1053,9 @@ pub fn read_chunked_data_cached_from_source<S: Source + ?Sized>(
         }
     };
 
-    let addr = addr_opt
-        .ok_or_else(|| FormatError::ChunkedReadError("no address for chunked layout".into()))?;
+    let Some(addr) = chunk_index_address(addr_opt, dataspace)? else {
+        return Ok(Vec::new());
+    };
 
     let elem_size = datatype.element_size_usize()?;
     let (rank, chunk_dims, ds_dims) = chunked_dims(chunk_dimensions, dataspace)?;
@@ -1669,8 +1702,9 @@ pub fn read_chunked_data_cached(
         }
     };
 
-    let addr = addr_opt
-        .ok_or_else(|| FormatError::ChunkedReadError("no address for chunked layout".into()))?;
+    let Some(addr) = chunk_index_address(addr_opt, dataspace)? else {
+        return Ok(Vec::new());
+    };
 
     // Taken once as a proven-non-zero width; see the buffered reader above.
     let elem_width = datatype.element_size()?;
@@ -1996,6 +2030,142 @@ mod tests {
         // A geometry whose product overflows u64 is refused, not wrapped.
         assert!(
             ensure_chunk_bytes_representable(&[usize::MAX, usize::MAX], nz(usize::MAX)).is_err()
+        );
+    }
+
+    /// A chunked layout naming no index means one of two things, and the reader
+    /// has to tell them apart. The reference C library allocates the index
+    /// lazily, so a zero-element dataset — the shape an extensible one is
+    /// created at — legitimately names none and reads as the empty buffer. A
+    /// dataset that owns elements and names none stays an error, since an empty
+    /// buffer for it would be a wrong answer rather than a missing one.
+    #[test]
+    fn a_missing_chunk_index_is_empty_only_when_the_dataset_is() {
+        fn simple(dims: Vec<u64>) -> Dataspace {
+            Dataspace {
+                space_type: DataspaceType::Simple,
+                rank: dims.len() as u8,
+                dimensions: dims,
+                max_dimensions: None,
+            }
+        }
+
+        for dims in [vec![0], vec![4, 0], vec![0, 4]] {
+            assert_eq!(
+                chunk_index_address(None, &simple(dims.clone())).unwrap(),
+                None
+            );
+        }
+        for dims in [vec![1], vec![10], vec![2, 3]] {
+            assert!(
+                chunk_index_address(None, &simple(dims.clone())).is_err(),
+                "{dims:?}"
+            );
+        }
+        assert_eq!(
+            chunk_index_address(Some(0x400), &simple(vec![0])).unwrap(),
+            Some(0x400)
+        );
+        assert_eq!(
+            chunk_index_address(Some(0x400), &simple(vec![10])).unwrap(),
+            Some(0x400)
+        );
+    }
+
+    /// All three whole-dataset readers answer a chunk-less, unallocated layout
+    /// the same way, which is what [`chunk_index_address`] claims of them.
+    ///
+    /// Exercised directly rather than through `Dataset::read_raw`, because the
+    /// buffered entry point short-circuits `num_elements == 0` in
+    /// `read_raw_data_full_from_source` before it dispatches on the layout at
+    /// all — so one of these three call sites is unreachable from there, and a
+    /// test that went in by the front door would leave it untested while looking
+    /// like coverage.
+    #[test]
+    fn every_whole_dataset_reader_returns_empty_for_an_unallocated_empty_dataset() {
+        let layout = DataLayout::Chunked {
+            chunk_dimensions: vec![4, 8],
+            btree_address: None,
+            version: 4,
+            chunk_index_type: Some(3),
+            single_chunk_filtered_size: None,
+            single_chunk_filter_mask: None,
+        };
+        let dataspace = Dataspace {
+            space_type: DataspaceType::Simple,
+            rank: 1,
+            dimensions: vec![0],
+            max_dimensions: None,
+        };
+        let datatype = Datatype::FixedPoint {
+            size: 8,
+            signed: true,
+            byte_order: crate::datatype::DatatypeByteOrder::LittleEndian,
+            bit_offset: 0,
+            bit_precision: 64,
+        };
+        let file_data: Vec<u8> = Vec::new();
+
+        assert!(
+            read_chunked_data_from_source(
+                &BytesSource::new(&file_data),
+                &layout,
+                &dataspace,
+                &datatype,
+                None,
+                8,
+                8,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            read_chunked_data_cached_from_source(
+                &BytesSource::new(&file_data),
+                &layout,
+                &dataspace,
+                &datatype,
+                None,
+                8,
+                8,
+                &ChunkCache::new(),
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            read_chunked_data_cached(
+                &file_data,
+                &layout,
+                &dataspace,
+                &datatype,
+                None,
+                8,
+                8,
+                &ChunkCache::new(),
+            )
+            .unwrap()
+            .is_empty()
+        );
+
+        let populated = Dataspace {
+            space_type: DataspaceType::Simple,
+            rank: 1,
+            dimensions: vec![10],
+            max_dimensions: None,
+        };
+        assert!(
+            read_chunked_data_cached(
+                &file_data,
+                &layout,
+                &populated,
+                &datatype,
+                None,
+                8,
+                8,
+                &ChunkCache::new(),
+            )
+            .is_err()
         );
     }
 

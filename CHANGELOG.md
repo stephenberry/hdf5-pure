@@ -6,7 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- A `File::open_rw` session can create an empty (zero-element) chunked or extensible dataset, so a schema-first writer declares its resizable datasets up front and grows them with `Dataset::append_staged`; explicit `with_chunks` dimensions are required ([#284](https://github.com/stephenberry/hdf5-pure/issues/284)).
+
 ### Fixed
+
+- Reading a chunked dataset the reference C library created but never wrote to returns an empty result instead of failing with `no address for chunked layout`, for the zero-element case ([#284](https://github.com/stephenberry/hdf5-pure/issues/284)).
 
 - An empty **filtered** chunked dataset declared a chunk-index element too narrow for its own chunks, so filling it through the reference C library produced a file this crate read as truncated compressed data, and filling it through `Dataset::append` was refused outright. Datasets with at least one chunk are byte-identical to before ([#284](https://github.com/stephenberry/hdf5-pure/issues/284)).
 - An empty **fixed-shape** chunked dataset is written with no chunk index, matching the C library, where the zero-entry Fixed Array it used to write made `H5Dget_num_chunks` fail on the dataset ([#284](https://github.com/stephenberry/hdf5-pure/issues/284)).
