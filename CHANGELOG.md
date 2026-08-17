@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.39.0] - 2026-08-17
+
+Unallocated storage now reads as the dataset's fill value, matching the reference C library: a dataset created and never written was unreadable here, and the never-written chunks of a partly written one read as zeros whatever its fill value said ([#284](https://github.com/stephenberry/hdf5-pure/issues/284)). A `File::open_rw` session can now create the empty chunked and extensible datasets that reading them required, so a schema-first writer declares its resizable datasets up front and grows them with `Dataset::append_staged`. Chunked writing is correct in more shapes: a dataset whose `maxshape` exceeds its shape in any dimension past the first is written with the chunk-index slot numbering the reference library expects, where it read the last rows as garbage in every rank above 1 — and this crate's own reader had the matching defect on files other libraries wrote — while an Extensible Array allocates only the data blocks its chunks land in, so a 256-chunk dataset with `maxshape [unlimited, 65536]` writes 376 KB rather than 7.9 MB ([#299](https://github.com/stephenberry/hdf5-pure/issues/299)). A chunk covering the dataset's edge pads with the fill value rather than zeros, so a dataset later extended into that tail no longer reads zeros in every reader ([#296](https://github.com/stephenberry/hdf5-pure/issues/296)). Scale-offset records the dataset's fill value in its filter parameters as the reference does: `DatasetBuilder::with_fill_value` reaches the encoder, `Dataset::append_staged` grows a scale-offset dataset written by libhdf5 or h5py where it was refused outright, and `repack` re-encodes one ([#287](https://github.com/stephenberry/hdf5-pure/issues/287), [#297](https://github.com/stephenberry/hdf5-pure/issues/297), [#300](https://github.com/stephenberry/hdf5-pure/issues/300)). Opening a dataset or group by path no longer reads every other child of the group on the way: one lookup in a 1,024-child group allocates 23 KiB in 16 blocks where it took 310 KiB in 2,084 ([#228](https://github.com/stephenberry/hdf5-pure/issues/228)). **Breaking:** `FormatError::NoDataAllocated` is gone, since unallocated storage is no longer an error.
+
 ### Added
 
 - A `File::open_rw` session can create an empty (zero-element) chunked or extensible dataset, so a schema-first writer declares its resizable datasets up front and grows them with `Dataset::append_staged`; explicit `with_chunks` dimensions are required ([#284](https://github.com/stephenberry/hdf5-pure/issues/284)).
@@ -741,7 +745,8 @@ Internal robustness and tests ([#26](https://github.com/stephenberry/hdf5-pure/i
 - The MAT deserializer flattens 1×N and N×1 values to a 1-D sequence in `deserialize_any` (matching `deserialize_seq`).
 - Numeric/complex readers preserve 1×N / N×1 shape at the value layer; any flattening happens at the serde level.
 
-[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.38.0...HEAD
+[Unreleased]: https://github.com/stephenberry/hdf5-pure/compare/v0.39.0...HEAD
+[0.39.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.38.0...v0.39.0
 [0.38.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.36.0...v0.38.0
 [0.36.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.35.0...v0.36.0
 [0.35.0]: https://github.com/stephenberry/hdf5-pure/compare/v0.34.0...v0.35.0
