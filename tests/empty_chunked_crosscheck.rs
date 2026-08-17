@@ -2,57 +2,107 @@
 // which is gated to 64-bit little-endian targets; skip them elsewhere so the pure-Rust
 // suite can run under `cross test --target i686-...`.
 #![cfg(all(not(target_pointer_width = "32"), target_endian = "little"))]
-//! An empty (zero-element) chunked dataset, checked against the reference C
-//! library.
+//! An empty (zero-element) chunked dataset, across both writers and both readers
+//! (issue #284). This is the shape an incremental writer declares its schema at —
+//! one resizable dataset per column, grown as batches arrive — so it has to be
+//! writable by the in-place edit engine, readable by the C library, and growable
+//! afterwards by either.
 //!
-//! This crate allocates a chunk index eagerly, where the C library allocates
-//! lazily and leaves the layout message's address undefined until the first
-//! chunk is written. Both are valid encodings of "nothing stored yet", and the
-//! two writer defects these tests pin are both cases where the eager encoding
-//! was built from information a chunk-less dataset does not have: an index
-//! element sized from a chunk that was never written, and a Fixed Array
-//! declaring zero entries where the C library writes no index at all.
-//!
-//! The in-place edit engine's empty chunked datasets are held to the same
-//! standard here: they have to be indistinguishable from the whole-file
-//! writer's, which means the C library reads, opens the index of, and grows
-//! them.
+//! The two libraries reach the same dataset from opposite directions, and the
+//! difference is what these tests pin. This crate allocates the chunk index
+//! eagerly, so its empty dataset names an index over zero chunks. The C library
+//! allocates lazily and leaves the layout message's address undefined until the
+//! first chunk is written, so *its* empty dataset names no index at all. Both are
+//! valid, and reading either has to yield an empty buffer rather than an error.
 
 use hdf5::Extent;
 use hdf5::file::LibraryVersion;
 use hdf5_pure::{File, FileBuilder};
 use tempfile::tempdir;
 
-/// The whole-file writer's empty chunked datasets, which the edit engine's are
-/// meant to be indistinguishable from. (Only the 1.10+ output is exercised:
-/// chunked storage needs the version 4 layout message, so the 1.8 format refuses
-/// it outright.)
-#[test]
-fn c_reads_the_whole_file_writers_empty_chunked_datasets() {
-    for unlimited in [false, true] {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("whole.h5");
-        let mut b = FileBuilder::new();
-        {
-            let ds = b
-                .create_dataset("col")
-                .with_i64_data(&[])
-                .with_shape(&[0])
-                .with_chunks(&[512]);
-            if unlimited {
-                ds.with_maxshape(&[u64::MAX]);
-            }
-        }
-        b.write(&path).unwrap();
+/// Write a starter file and add one empty chunked dataset to it through the
+/// in-place edit engine, the path issue #284 refused.
+fn edit_in_an_empty_chunked_dataset(path: &std::path::Path, unlimited: bool) {
+    let mut b = FileBuilder::new();
+    b.create_dataset("existing").with_f64_data(&[1.0, 2.0]);
+    b.write(path).unwrap();
 
-        let file = hdf5::File::open(&path).unwrap();
+    let session = File::open_rw(path).unwrap();
+    session
+        .root()
+        .create_dataset("col", |b| {
+            b.with_i64_data(&[]).with_shape(&[0]).with_chunks(&[512]);
+            if unlimited {
+                b.with_maxshape(&[u64::MAX]);
+            }
+        })
+        .unwrap();
+    session.commit().unwrap();
+}
+
+/// The issue's round trip: the edit engine declares the column empty, then the C
+/// library reads it, extends it, and writes into it — and this crate reads back
+/// what the C library wrote. An index built over zero chunks that the C library
+/// could read but not grow would pass a read-only check and fail here.
+#[test]
+fn c_grows_an_empty_chunked_dataset_added_in_place() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("edited.h5");
+    edit_in_an_empty_chunked_dataset(&path, true);
+
+    {
+        let file = hdf5::File::open_rw(&path).unwrap();
         let ds = file.dataset("col").unwrap();
-        assert_eq!(ds.shape(), vec![0], "unlimited={unlimited}");
-        assert!(
-            ds.read_raw::<i64>().unwrap().is_empty(),
-            "unlimited={unlimited}"
-        );
+        assert_eq!(ds.shape(), vec![0]);
+        assert!(ds.read_raw::<i64>().unwrap().is_empty());
+        ds.resize((4,)).unwrap();
+        ds.write(&[10i64, 20, 30, 40]).unwrap();
+        drop(ds);
+        file.close().unwrap();
     }
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("col").unwrap().read_i64().unwrap(),
+        vec![10, 20, 30, 40]
+    );
+    // The pre-existing dataset the edit appended past is untouched.
+    assert_eq!(
+        file.dataset("existing").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0]
+    );
+}
+
+/// The same dataset without `maxshape`: a fixed-shape empty chunked dataset,
+/// whose index is a fixed array over zero chunks rather than an extensible one.
+/// The C library has to accept that too, or the edit engine is emitting a
+/// structure only its own reader understands.
+#[test]
+fn c_reads_a_fixed_shape_empty_chunked_dataset_added_in_place() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("edited_fixed.h5");
+    edit_in_an_empty_chunked_dataset(&path, false);
+
+    let file = hdf5::File::open(&path).unwrap();
+    let ds = file.dataset("col").unwrap();
+    assert_eq!(ds.shape(), vec![0]);
+    assert!(ds.read_raw::<i64>().unwrap().is_empty());
+    // Shape and an empty read are equally true of a *contiguous* dataset, so
+    // they cannot tell whether the edit engine emitted chunked storage at all.
+    // These reach the C library's own view of the chunk index, which is the
+    // thing under test.
+    assert!(ds.is_chunked(), "the C library must see chunked storage");
+    assert_eq!(ds.chunk(), Some(vec![512]));
+    // `num_chunks` opens the index. A Fixed Array declaring zero entries — what
+    // this crate wrote before it adopted the C library's convention of leaving a
+    // chunk-less fixed-shape dataset unallocated — makes this call *fail*, while
+    // reads and `shape` keep working. It is the only assertion here that can see
+    // the difference.
+    assert_eq!(
+        ds.num_chunks(),
+        Some(0),
+        "the C library must be able to open the chunk index"
+    );
 }
 
 /// The same property for the whole-file writer, at every rank and both ways of
@@ -213,89 +263,36 @@ fn an_empty_filtered_dataset_accepts_an_append_that_fills_its_chunk() {
     );
 }
 
-/// Write a starter file and add one empty chunked dataset to it through the
-/// in-place edit engine, the path issue #284 refused.
-fn edit_in_an_empty_chunked_dataset(path: &std::path::Path, unlimited: bool) {
-    let mut b = FileBuilder::new();
-    b.create_dataset("existing").with_f64_data(&[1.0, 2.0]);
-    b.write(path).unwrap();
-
-    let session = File::open_rw(path).unwrap();
-    session
-        .root()
-        .create_dataset("col", |b| {
-            b.with_i64_data(&[]).with_shape(&[0]).with_chunks(&[512]);
+/// The whole-file writer's empty chunked datasets, which the edit engine's are
+/// meant to be indistinguishable from. (Only the 1.10+ output is exercised:
+/// chunked storage needs the version 4 layout message, so the 1.8 format refuses
+/// it outright.)
+#[test]
+fn c_reads_the_whole_file_writers_empty_chunked_datasets() {
+    for unlimited in [false, true] {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("whole.h5");
+        let mut b = FileBuilder::new();
+        {
+            let ds = b
+                .create_dataset("col")
+                .with_i64_data(&[])
+                .with_shape(&[0])
+                .with_chunks(&[512]);
             if unlimited {
-                b.with_maxshape(&[u64::MAX]);
+                ds.with_maxshape(&[u64::MAX]);
             }
-        })
-        .unwrap();
-    session.commit().unwrap();
-}
+        }
+        b.write(&path).unwrap();
 
-/// The issue's round trip: the edit engine declares the column empty, then the C
-/// library reads it, extends it, and writes into it — and this crate reads back
-/// what the C library wrote. An index built over zero chunks that the C library
-/// could read but not grow would pass a read-only check and fail here.
-#[test]
-fn c_grows_an_empty_chunked_dataset_added_in_place() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("edited.h5");
-    edit_in_an_empty_chunked_dataset(&path, true);
-
-    {
-        let file = hdf5::File::open_rw(&path).unwrap();
+        let file = hdf5::File::open(&path).unwrap();
         let ds = file.dataset("col").unwrap();
-        assert_eq!(ds.shape(), vec![0]);
-        assert!(ds.read_raw::<i64>().unwrap().is_empty());
-        ds.resize((4,)).unwrap();
-        ds.write(&[10i64, 20, 30, 40]).unwrap();
-        drop(ds);
-        file.close().unwrap();
+        assert_eq!(ds.shape(), vec![0], "unlimited={unlimited}");
+        assert!(
+            ds.read_raw::<i64>().unwrap().is_empty(),
+            "unlimited={unlimited}"
+        );
     }
-
-    let file = File::open(&path).unwrap();
-    assert_eq!(
-        file.dataset("col").unwrap().read_i64().unwrap(),
-        vec![10, 20, 30, 40]
-    );
-    // The pre-existing dataset the edit appended past is untouched.
-    assert_eq!(
-        file.dataset("existing").unwrap().read_f64().unwrap(),
-        vec![1.0, 2.0]
-    );
-}
-
-/// The same dataset without `maxshape`: a fixed-shape empty chunked dataset,
-/// whose index is a fixed array over zero chunks rather than an extensible one.
-/// The C library has to accept that too, or the edit engine is emitting a
-/// structure only its own reader understands.
-#[test]
-fn c_reads_a_fixed_shape_empty_chunked_dataset_added_in_place() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("edited_fixed.h5");
-    edit_in_an_empty_chunked_dataset(&path, false);
-
-    let file = hdf5::File::open(&path).unwrap();
-    let ds = file.dataset("col").unwrap();
-    assert_eq!(ds.shape(), vec![0]);
-    assert!(ds.read_raw::<i64>().unwrap().is_empty());
-    // Shape and an empty read are equally true of a *contiguous* dataset, so
-    // they cannot tell whether the edit engine emitted chunked storage at all.
-    // These reach the C library's own view of the chunk index, which is the
-    // thing under test.
-    assert!(ds.is_chunked(), "the C library must see chunked storage");
-    assert_eq!(ds.chunk(), Some(vec![512]));
-    // `num_chunks` opens the index. A Fixed Array declaring zero entries — what
-    // this crate wrote before it adopted the C library's convention of leaving a
-    // chunk-less fixed-shape dataset unallocated — makes this call *fail*, while
-    // reads and `shape` keep working. It is the only assertion here that can see
-    // the difference.
-    assert_eq!(
-        ds.num_chunks(),
-        Some(0),
-        "the C library must be able to open the chunk index"
-    );
 }
 
 /// The other direction, and the one this crate used to fail: the C library
@@ -350,6 +347,130 @@ fn pure_reads_the_c_librarys_unallocated_empty_chunked_datasets() {
                 ds.read_i64().unwrap(),
                 Vec::<i64>::new(),
                 "[{label}] streaming"
+            );
+        }
+    }
+}
+
+/// A chunked dataset that owns elements and has no allocated index is the other
+/// half of the same convention: the C library materializes its fill value for
+/// every element, and so does this crate. It used to be an error, which made a
+/// perfectly ordinary C-written file — one created and not yet written —
+/// unreadable here.
+///
+/// Both fill flavors, and both readers, checked against what the C library
+/// itself returns for the very same file rather than against a hard-coded
+/// expectation.
+#[test]
+fn pure_materializes_an_unallocated_dataset_that_owns_elements() {
+    for fill in [None, Some(7i32)] {
+        for chunked in [false, true] {
+            let label = format!("fill={fill:?} chunked={chunked}");
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("unwritten.h5");
+            {
+                let file = hdf5::File::create(&path).unwrap();
+                let mut builder = file.new_dataset::<i32>().shape((10,));
+                if chunked {
+                    builder = builder.chunk((4,));
+                }
+                if let Some(v) = fill {
+                    builder = builder.fill_value(v);
+                }
+                let ds = builder.create("col").unwrap();
+                drop(ds);
+                file.close().unwrap();
+            }
+
+            // Ground truth: whatever the C library reads from this file.
+            let expected = {
+                let file = hdf5::File::open(&path).unwrap();
+                file.dataset("col").unwrap().read_raw::<i32>().unwrap()
+            };
+            assert_eq!(
+                expected,
+                vec![fill.unwrap_or(0); 10],
+                "[{label}] C ground truth"
+            );
+
+            for streaming in [false, true] {
+                let file = if streaming {
+                    File::open_streaming(&path).unwrap()
+                } else {
+                    File::open(&path).unwrap()
+                };
+                let ds = file.dataset("col").unwrap();
+                assert_eq!(
+                    ds.read_i32().unwrap(),
+                    expected,
+                    "[{label} streaming={streaming}] whole read"
+                );
+                // A window over unallocated storage answers the same way.
+                assert_eq!(
+                    ds.read_i32_rows(2, 5).unwrap(),
+                    expected[2..7].to_vec(),
+                    "[{label} streaming={streaming}] window"
+                );
+            }
+        }
+    }
+}
+
+/// The partially-allocated case, which is where the old behavior was *silently
+/// wrong* rather than merely refusing: some chunks written, the rest never
+/// allocated. Those never-allocated chunks read as zeros regardless of the
+/// dataset's fill value, so a dataset filled with 7 came back with 0s in the
+/// gaps and no error.
+#[test]
+fn pure_fills_the_gaps_of_a_partially_written_chunked_dataset() {
+    for fill in [None, Some(7i32)] {
+        let label = format!("fill={fill:?}");
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("partial.h5");
+        {
+            let file = hdf5::File::create(&path).unwrap();
+            let mut builder = file.new_dataset::<i32>().shape((10,)).chunk((5,));
+            if let Some(v) = fill {
+                builder = builder.fill_value(v);
+            }
+            let ds = builder.create("col").unwrap();
+            // Only the first chunk; the second is never allocated.
+            ds.write_slice(&[1i32, 2, 3, 4, 5], 0..5).unwrap();
+            drop(ds);
+            file.close().unwrap();
+        }
+
+        let expected = {
+            let file = hdf5::File::open(&path).unwrap();
+            file.dataset("col").unwrap().read_raw::<i32>().unwrap()
+        };
+        let mut want = vec![1, 2, 3, 4, 5];
+        want.extend(std::iter::repeat_n(fill.unwrap_or(0), 5));
+        assert_eq!(expected, want, "[{label}] C ground truth");
+
+        for streaming in [false, true] {
+            let file = if streaming {
+                File::open_streaming(&path).unwrap()
+            } else {
+                File::open(&path).unwrap()
+            };
+            let ds = file.dataset("col").unwrap();
+            assert_eq!(
+                ds.read_i32().unwrap(),
+                expected,
+                "[{label} streaming={streaming}] whole read"
+            );
+            // A window landing entirely inside the unallocated chunk.
+            assert_eq!(
+                ds.read_i32_rows(5, 5).unwrap(),
+                expected[5..].to_vec(),
+                "[{label} streaming={streaming}] window over the gap"
+            );
+            // And one straddling the written chunk and the gap.
+            assert_eq!(
+                ds.read_i32_rows(3, 4).unwrap(),
+                expected[3..7].to_vec(),
+                "[{label} streaming={streaming}] straddling window"
             );
         }
     }

@@ -2571,6 +2571,7 @@ mod tests {
     use crate::data_layout::DataLayout;
     use crate::dataspace::{Dataspace, DataspaceType};
     use crate::datatype::{Datatype, DatatypeByteOrder};
+    use crate::fill_value::FillPattern;
 
     fn make_f64_type() -> Datatype {
         Datatype::FloatingPoint {
@@ -2775,6 +2776,7 @@ mod tests {
             &dataspace,
             &datatype,
             pipeline.as_ref(),
+            FillPattern::ZERO,
             8,
             8,
             &ChunkCache::new(),
@@ -3419,6 +3421,7 @@ mod tests {
             &dataspace,
             &datatype,
             None,
+            FillPattern::ZERO,
             8,
             8,
             &ChunkCache::new(),

@@ -22,6 +22,7 @@ use crate::error::FormatError;
 use crate::extensible_array::{
     ExtensibleArrayHeader, read_extensible_array_chunks, read_extensible_array_chunks_from_source,
 };
+use crate::fill_value::FillPattern;
 use crate::filter_pipeline::FilterPipeline;
 use crate::filters::{ChunkContext, FilterScratch, decompress_chunk_with};
 use crate::fixed_array::{
@@ -550,29 +551,39 @@ fn ensure_chunk_bytes_representable(
     }
 }
 
-/// Resolve a chunked layout's index address, distinguishing "no storage because
-/// there is nothing to store" from "no storage where data must be".
+/// Resolve a chunked layout's index address, or produce the buffer an
+/// unallocated dataset reads as.
 ///
 /// A chunked dataset's index is allocated lazily — the reference C library
 /// leaves the layout message's address undefined until the first chunk is
-/// written — so a zero-element dataset, which is the shape an extensible one is
-/// created at before anything is appended, legitimately names no index. It owns
-/// no elements, so its read is the empty buffer; `Ok(None)` says so, and each
-/// caller returns that buffer.
+/// written — so a dataset that has been created but never written names no
+/// index at all. That is not an error and not an empty answer: it reads as one
+/// `fill` element per element of its dataspace, which for a zero-element
+/// dataset is the empty buffer and for any other is a whole materialized
+/// dataset. Both fall out of the same expression.
 ///
-/// A dataset that *does* own elements and still names no index is a different
-/// thing, and stays an error here.
+/// `Ok(Err(buffer))` is the "nothing allocated, here is what it reads as" case
+/// and `Ok(Ok(addr))` the ordinary one; the outer `Result` carries a genuine
+/// failure (an element count that cannot be addressed on this target).
 fn chunk_index_address(
     addr: Option<u64>,
     dataspace: &Dataspace,
-) -> Result<Option<u64>, FormatError> {
-    match addr {
-        Some(a) => Ok(Some(a)),
-        None if dataspace.num_elements() == 0 => Ok(None),
-        None => Err(FormatError::ChunkedReadError(
-            "no address for chunked layout".into(),
-        )),
+    datatype: &Datatype,
+    fill: FillPattern<'_>,
+) -> Result<Result<u64, Vec<u8>>, FormatError> {
+    if let Some(a) = addr {
+        return Ok(Ok(a));
     }
+    let elem_size = datatype.element_size_usize()?;
+    let total = dataspace
+        .num_elements()
+        .to_usize()?
+        .checked_mul(elem_size.get())
+        .ok_or(FormatError::OffsetOverflow {
+            offset: dataspace.num_elements(),
+            length: elem_size.get() as u64,
+        })?;
+    Ok(Err(fill.buffer(total)))
 }
 
 /// Read a chunked dataset from a [`Source`], reading the chunk index and
@@ -589,6 +600,7 @@ pub fn read_chunked_data_from_source<S: Source + ?Sized>(
     dataspace: &Dataspace,
     datatype: &Datatype,
     pipeline: Option<&FilterPipeline>,
+    fill: FillPattern<'_>,
     offset_size: u8,
     length_size: u8,
 ) -> Result<Vec<u8>, FormatError> {
@@ -622,8 +634,9 @@ pub fn read_chunked_data_from_source<S: Source + ?Sized>(
         }
     };
 
-    let Some(addr) = chunk_index_address(addr_opt, dataspace)? else {
-        return Ok(Vec::new());
+    let addr = match chunk_index_address(addr_opt, dataspace, datatype, fill)? {
+        Ok(addr) => addr,
+        Err(unallocated) => return Ok(unallocated),
     };
 
     let elem_size = datatype.element_size_usize()?;
@@ -663,6 +676,7 @@ pub fn read_chunked_data_from_source<S: Source + ?Sized>(
         &ds_dims,
         elem_size,
         total_bytes,
+        fill,
     ))
 }
 
@@ -734,6 +748,7 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
     dataspace: &Dataspace,
     datatype: &Datatype,
     pipeline: Option<&FilterPipeline>,
+    fill: FillPattern<'_>,
     offset_size: u8,
     length_size: u8,
     cache: &ChunkCache,
@@ -794,7 +809,8 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
             offset: out_rows as u64,
             length: row_bytes as u64,
         })?;
-    let mut output = vec![0u8; total_bytes];
+    // Uncovered bytes are unallocated storage; see `assemble_chunks`.
+    let mut output = fill.buffer(total_bytes);
     if total_bytes == 0 {
         return Ok(Some(output));
     }
@@ -809,20 +825,14 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
     let win_strides = row_major_strides(&win_dims)?;
     let chunk_strides = row_major_strides(&chunk_dims)?;
 
-    // Unallocated chunk index: a non-empty window has no storage to read. Match
-    // the whole-dataset reader, which errors here, so `read_raw_rows` stays
-    // consistent with `read_raw` rather than fabricating a window of zeros.
-    //
-    // The zero-element case that `chunk_index_address` answers with an empty
-    // buffer does not reach this line, but note *why*: not because the shape
-    // makes `total_bytes` zero (for `[0]` or `[0, 4]` the inner product is
-    // non-zero, so a `num_rows > 0` call would fall straight through to here),
-    // but because the sole caller, `Dataset::read_raw_rows`, clamps the window
-    // to the leading dimension first.
+    // Unallocated chunk index: no storage exists, so every element of the window
+    // is fill. `output` already holds exactly that (it was built from the
+    // pattern), so the window is finished before any chunk is looked at — the
+    // same answer the whole-dataset readers give through `chunk_index_address`,
+    // which is what keeps `read_raw_rows` and `read_raw` agreeing over a dataset
+    // that was created and never written.
     let Some(addr) = *btree_address else {
-        return Err(FormatError::ChunkedReadError(
-            "no address for chunked layout".into(),
-        ));
+        return Ok(Some(output));
     };
 
     // Walk the index once, then reuse it for later windows on this handle.
@@ -1019,6 +1029,7 @@ pub fn read_chunked_data_cached_from_source<S: Source + ?Sized>(
     dataspace: &Dataspace,
     datatype: &Datatype,
     pipeline: Option<&FilterPipeline>,
+    fill: FillPattern<'_>,
     offset_size: u8,
     length_size: u8,
     cache: &ChunkCache,
@@ -1053,8 +1064,9 @@ pub fn read_chunked_data_cached_from_source<S: Source + ?Sized>(
         }
     };
 
-    let Some(addr) = chunk_index_address(addr_opt, dataspace)? else {
-        return Ok(Vec::new());
+    let addr = match chunk_index_address(addr_opt, dataspace, datatype, fill)? {
+        Ok(addr) => addr,
+        Err(unallocated) => return Ok(unallocated),
     };
 
     let elem_size = datatype.element_size_usize()?;
@@ -1090,7 +1102,8 @@ pub fn read_chunked_data_cached_from_source<S: Source + ?Sized>(
                 offset: total_elements as u64,
                 length: elem_size.get() as u64,
             })?;
-    let mut output = vec![0u8; total_bytes];
+    // Uncovered bytes are unallocated storage; see `assemble_chunks`.
+    let mut output = fill.buffer(total_bytes);
 
     let mut ds_strides = vec![1usize; rank];
     for i in (0..rank.saturating_sub(1)).rev() {
@@ -1616,8 +1629,13 @@ fn assemble_chunks(
     ds_dims: &[usize],
     elem_size: NonZeroUsize,
     total_bytes: usize,
+    fill: FillPattern<'_>,
 ) -> Vec<u8> {
-    let mut output = vec![0u8; total_bytes];
+    // Whatever no chunk writes over is storage that was never allocated, so the
+    // buffer starts as the fill pattern rather than as zeros. A sparse chunk
+    // grid — some chunks written, others never — is the case this covers that a
+    // zeroed buffer got silently wrong.
+    let mut output = fill.buffer(total_bytes);
 
     let mut ds_strides = vec![1usize; rank];
     for i in (0..rank.saturating_sub(1)).rev() {
@@ -1668,6 +1686,7 @@ pub fn read_chunked_data_cached(
     dataspace: &Dataspace,
     datatype: &Datatype,
     pipeline: Option<&FilterPipeline>,
+    fill: FillPattern<'_>,
     offset_size: u8,
     length_size: u8,
     cache: &ChunkCache,
@@ -1702,8 +1721,9 @@ pub fn read_chunked_data_cached(
         }
     };
 
-    let Some(addr) = chunk_index_address(addr_opt, dataspace)? else {
-        return Ok(Vec::new());
+    let addr = match chunk_index_address(addr_opt, dataspace, datatype, fill)? {
+        Ok(addr) => addr,
+        Err(unallocated) => return Ok(unallocated),
     };
 
     // Taken once as a proven-non-zero width; see the buffered reader above.
@@ -1791,7 +1811,8 @@ pub fn read_chunked_data_cached(
     // Assemble output
     let total_elements = dataspace.num_elements().to_usize()?;
     let total_bytes = total_elements * elem_size.get();
-    let mut output = vec![0u8; total_bytes];
+    // Uncovered bytes are unallocated storage; see `assemble_chunks`.
+    let mut output = fill.buffer(total_bytes);
 
     let mut ds_strides = vec![1usize; rank];
     for i in (0..rank.saturating_sub(1)).rev() {
@@ -2033,47 +2054,8 @@ mod tests {
         );
     }
 
-    /// A chunked layout naming no index means one of two things, and the reader
-    /// has to tell them apart. The reference C library allocates the index
-    /// lazily, so a zero-element dataset — the shape an extensible one is
-    /// created at — legitimately names none and reads as the empty buffer. A
-    /// dataset that owns elements and names none stays an error, since an empty
-    /// buffer for it would be a wrong answer rather than a missing one.
-    #[test]
-    fn a_missing_chunk_index_is_empty_only_when_the_dataset_is() {
-        fn simple(dims: Vec<u64>) -> Dataspace {
-            Dataspace {
-                space_type: DataspaceType::Simple,
-                rank: dims.len() as u8,
-                dimensions: dims,
-                max_dimensions: None,
-            }
-        }
-
-        for dims in [vec![0], vec![4, 0], vec![0, 4]] {
-            assert_eq!(
-                chunk_index_address(None, &simple(dims.clone())).unwrap(),
-                None
-            );
-        }
-        for dims in [vec![1], vec![10], vec![2, 3]] {
-            assert!(
-                chunk_index_address(None, &simple(dims.clone())).is_err(),
-                "{dims:?}"
-            );
-        }
-        assert_eq!(
-            chunk_index_address(Some(0x400), &simple(vec![0])).unwrap(),
-            Some(0x400)
-        );
-        assert_eq!(
-            chunk_index_address(Some(0x400), &simple(vec![10])).unwrap(),
-            Some(0x400)
-        );
-    }
-
-    /// All three whole-dataset readers answer a chunk-less, unallocated layout
-    /// the same way, which is what [`chunk_index_address`] claims of them.
+    /// All three whole-dataset readers materialize an unallocated layout the
+    /// same way, which is what [`chunk_index_address`] promises them.
     ///
     /// Exercised directly rather than through `Dataset::read_raw`, because the
     /// buffered entry point short-circuits `num_elements == 0` in
@@ -2082,7 +2064,7 @@ mod tests {
     /// test that went in by the front door would leave it untested while looking
     /// like coverage.
     #[test]
-    fn every_whole_dataset_reader_returns_empty_for_an_unallocated_empty_dataset() {
+    fn every_whole_dataset_reader_materializes_an_unallocated_dataset() {
         let layout = DataLayout::Chunked {
             chunk_dimensions: vec![4, 8],
             btree_address: None,
@@ -2091,12 +2073,6 @@ mod tests {
             single_chunk_filtered_size: None,
             single_chunk_filter_mask: None,
         };
-        let dataspace = Dataspace {
-            space_type: DataspaceType::Simple,
-            rank: 1,
-            dimensions: vec![0],
-            max_dimensions: None,
-        };
         let datatype = Datatype::FixedPoint {
             size: 8,
             signed: true,
@@ -2104,69 +2080,67 @@ mod tests {
             bit_offset: 0,
             bit_precision: 64,
         };
-        let file_data: Vec<u8> = Vec::new();
-
-        assert!(
-            read_chunked_data_from_source(
-                &BytesSource::new(&file_data),
-                &layout,
-                &dataspace,
-                &datatype,
-                None,
-                8,
-                8,
-            )
-            .unwrap()
-            .is_empty()
-        );
-        assert!(
-            read_chunked_data_cached_from_source(
-                &BytesSource::new(&file_data),
-                &layout,
-                &dataspace,
-                &datatype,
-                None,
-                8,
-                8,
-                &ChunkCache::new(),
-            )
-            .unwrap()
-            .is_empty()
-        );
-        assert!(
-            read_chunked_data_cached(
-                &file_data,
-                &layout,
-                &dataspace,
-                &datatype,
-                None,
-                8,
-                8,
-                &ChunkCache::new(),
-            )
-            .unwrap()
-            .is_empty()
-        );
-
-        let populated = Dataspace {
+        let simple = |dims: Vec<u64>| Dataspace {
             space_type: DataspaceType::Simple,
-            rank: 1,
-            dimensions: vec![10],
+            rank: dims.len() as u8,
+            dimensions: dims,
             max_dimensions: None,
         };
-        assert!(
-            read_chunked_data_cached(
-                &file_data,
+        let file_data: Vec<u8> = Vec::new();
+        let seven = 7i64.to_le_bytes();
+
+        // Every combination of "does it own elements" and "does it have a fill
+        // value", through all three readers.
+        for (dims, fill, expected) in [
+            (vec![0u64], FillPattern::ZERO, Vec::new()),
+            (vec![0], FillPattern::new(Some(&seven), nz(8)), Vec::new()),
+            (vec![3], FillPattern::ZERO, vec![0u8; 24]),
+            (
+                vec![3],
+                FillPattern::new(Some(&seven), nz(8)),
+                seven.repeat(3),
+            ),
+        ] {
+            let ds = simple(dims.clone());
+            let from_source = read_chunked_data_from_source(
+                &BytesSource::new(&file_data),
                 &layout,
-                &populated,
+                &ds,
                 &datatype,
                 None,
+                fill,
+                8,
+                8,
+            )
+            .unwrap();
+            let cached_from_source = read_chunked_data_cached_from_source(
+                &BytesSource::new(&file_data),
+                &layout,
+                &ds,
+                &datatype,
+                None,
+                fill,
                 8,
                 8,
                 &ChunkCache::new(),
             )
-            .is_err()
-        );
+            .unwrap();
+            let cached = read_chunked_data_cached(
+                &file_data,
+                &layout,
+                &ds,
+                &datatype,
+                None,
+                fill,
+                8,
+                8,
+                &ChunkCache::new(),
+            )
+            .unwrap();
+            assert_eq!(from_source, expected, "dims {dims:?}");
+            assert_eq!(cached_from_source, expected, "dims {dims:?}");
+            assert_eq!(cached, expected, "dims {dims:?}");
+        }
     }
 
     fn write_offset(buf: &mut Vec<u8>, val: u64, size: u8) {
@@ -2535,6 +2509,7 @@ mod tests {
             &dataspace,
             &datatype,
             None,
+            FillPattern::ZERO,
             8,
             8,
             &ChunkCache::new(),
@@ -2562,6 +2537,7 @@ mod tests {
             &dataspace,
             &datatype,
             None,
+            FillPattern::ZERO,
             8,
             8,
             &ChunkCache::new(),
@@ -2592,6 +2568,7 @@ mod tests {
             dataspace,
             datatype,
             pipeline,
+            FillPattern::ZERO,
             8,
             8,
             &ChunkCache::new(),
@@ -2603,6 +2580,7 @@ mod tests {
             dataspace,
             datatype,
             pipeline,
+            FillPattern::ZERO,
             8,
             8,
         )
@@ -2613,6 +2591,7 @@ mod tests {
             dataspace,
             datatype,
             pipeline,
+            FillPattern::ZERO,
             8,
             8,
         )
@@ -2704,6 +2683,7 @@ mod tests {
             &dataspace,
             &datatype,
             Some(&pipeline),
+            FillPattern::ZERO,
             8,
             8,
             &ChunkCache::new(),
@@ -2790,6 +2770,7 @@ mod tests {
             &dataspace,
             &datatype,
             None,
+            FillPattern::ZERO,
             8,
             8,
             &ChunkCache::new(),
@@ -2916,6 +2897,7 @@ mod tests {
             &dataspace,
             &datatype,
             None,
+            FillPattern::ZERO,
             8,
             8,
             &ChunkCache::new(),
@@ -2941,7 +2923,15 @@ mod tests {
 
         assert!(!cache.stats().index_loaded());
         let raw = read_chunked_data_cached(
-            &file_data, &layout, &dataspace, &datatype, None, 8, 8, &cache,
+            &file_data,
+            &layout,
+            &dataspace,
+            &datatype,
+            None,
+            FillPattern::ZERO,
+            8,
+            8,
+            &cache,
         )
         .unwrap();
         assert!(cache.stats().index_loaded());
@@ -2961,7 +2951,15 @@ mod tests {
 
         // First read — populates index + decompressed cache
         let raw1 = read_chunked_data_cached(
-            &file_data, &layout, &dataspace, &datatype, None, 8, 8, &cache,
+            &file_data,
+            &layout,
+            &dataspace,
+            &datatype,
+            None,
+            FillPattern::ZERO,
+            8,
+            8,
+            &cache,
         )
         .unwrap();
         assert!(cache.stats().index_loaded());
@@ -2969,7 +2967,15 @@ mod tests {
 
         // Second read — should hit the decompressed cache
         let raw2 = read_chunked_data_cached(
-            &file_data, &layout, &dataspace, &datatype, None, 8, 8, &cache,
+            &file_data,
+            &layout,
+            &dataspace,
+            &datatype,
+            None,
+            FillPattern::ZERO,
+            8,
+            8,
+            &cache,
         )
         .unwrap();
         assert_eq!(raw1, raw2);
@@ -2983,7 +2989,15 @@ mod tests {
         let cache = ChunkCache::new();
 
         let raw = read_chunked_data_cached(
-            &file_data, &layout, &dataspace, &datatype, None, 8, 8, &cache,
+            &file_data,
+            &layout,
+            &dataspace,
+            &datatype,
+            None,
+            FillPattern::ZERO,
+            8,
+            8,
+            &cache,
         )
         .unwrap();
         assert_eq!(raw.len(), 25 * 8);
@@ -3022,6 +3036,7 @@ mod tests {
             &dataspace,
             &make_f64_type(),
             None,
+            FillPattern::ZERO,
             8,
             8,
             &cache,
@@ -3064,6 +3079,7 @@ mod tests {
             &dataspace,
             &make_f64_type(),
             None,
+            FillPattern::ZERO,
             8,
             8,
             &cache,
@@ -3107,6 +3123,7 @@ mod tests {
             &dataspace,
             &make_f64_type(),
             None,
+            FillPattern::ZERO,
             8,
             8,
             &cache,
@@ -3121,9 +3138,14 @@ mod tests {
     }
 
     /// An unallocated chunk index (`btree_address == None`, e.g. a late-allocated
-    /// never-written dataset) must error for a non-empty window, matching the
-    /// whole-dataset reader, instead of fabricating a window of zeros; an empty
-    /// (zero-row) window still succeeds.
+    /// never-written dataset) reads as fill for a non-empty window, matching the
+    /// whole-dataset reader element for element, and as the empty buffer for a
+    /// zero-row one.
+    ///
+    /// The window and the whole read reach the fill by different routes — the
+    /// window returns the buffer it built up front, the whole read builds one in
+    /// `chunk_index_address` — so this compares them rather than asserting a
+    /// literal on either.
     #[test]
     fn windowed_rows_unallocated_index_matches_whole_read() {
         let layout = DataLayout::Chunked {
@@ -3140,37 +3162,55 @@ mod tests {
             dimensions: vec![10],
             max_dimensions: None,
         };
-        let cache = ChunkCache::new();
-        let err = read_chunked_rows_from_source(
-            &BytesSource::new(b""),
-            &layout,
-            &dataspace,
-            &make_f64_type(),
-            None,
-            8,
-            8,
-            &cache,
-            0,
-            4,
-        )
-        .expect_err("non-empty window over an unallocated index must error");
-        assert!(
-            matches!(err, FormatError::ChunkedReadError(_)),
-            "expected ChunkedReadError, got {err:?}"
-        );
-        let empty = read_chunked_rows_from_source(
-            &BytesSource::new(b""),
-            &layout,
-            &dataspace,
-            &make_f64_type(),
-            None,
-            8,
-            8,
-            &cache,
-            0,
-            0,
-        )
-        .expect("empty window must still be Ok");
-        assert_eq!(empty, Some(Vec::new()));
+        let seven = 7.0f64.to_le_bytes();
+        for fill in [FillPattern::ZERO, FillPattern::new(Some(&seven), nz(8))] {
+            let cache = ChunkCache::new();
+            let whole = read_chunked_data_cached_from_source(
+                &BytesSource::new(b""),
+                &layout,
+                &dataspace,
+                &make_f64_type(),
+                None,
+                fill,
+                8,
+                8,
+                &cache,
+            )
+            .expect("an unallocated dataset reads as fill");
+            assert_eq!(whole.len(), 80);
+
+            let window = read_chunked_rows_from_source(
+                &BytesSource::new(b""),
+                &layout,
+                &dataspace,
+                &make_f64_type(),
+                None,
+                fill,
+                8,
+                8,
+                &cache,
+                2,
+                4,
+            )
+            .expect("a window over an unallocated index reads as fill")
+            .expect("rank-1 windows are supported");
+            assert_eq!(window, whole[16..48], "the window must match those rows");
+
+            let empty = read_chunked_rows_from_source(
+                &BytesSource::new(b""),
+                &layout,
+                &dataspace,
+                &make_f64_type(),
+                None,
+                fill,
+                8,
+                8,
+                &cache,
+                0,
+                0,
+            )
+            .expect("empty window must still be Ok");
+            assert_eq!(empty, Some(Vec::new()));
+        }
     }
 }

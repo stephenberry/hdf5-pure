@@ -134,8 +134,6 @@ pub enum FormatError {
     InvalidLayoutVersion(u8),
     /// Invalid data layout class.
     InvalidLayoutClass(u8),
-    /// No data allocated for contiguous layout.
-    NoDataAllocated,
     /// Type mismatch when reading data.
     TypeMismatch {
         /// Expected type description.
@@ -646,9 +644,6 @@ impl fmt::Display for FormatError {
             }
             FormatError::InvalidLayoutClass(c) => {
                 write!(f, "invalid data layout class: {c}")
-            }
-            FormatError::NoDataAllocated => {
-                write!(f, "no data allocated for contiguous layout")
             }
             FormatError::TypeMismatch { expected, actual } => {
                 write!(f, "type mismatch: expected {expected}, got {actual}")

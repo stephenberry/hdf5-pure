@@ -14,6 +14,7 @@ use crate::data_layout::DataLayout;
 use crate::dataspace::Dataspace;
 use crate::datatype::{Datatype, DatatypeByteOrder};
 use crate::error::FormatError;
+use crate::fill_value::FillPattern;
 use crate::filter_pipeline::FilterPipeline;
 use crate::source::Source;
 
@@ -29,7 +30,16 @@ pub fn read_raw_data(
     dataspace: &Dataspace,
     datatype: &Datatype,
 ) -> Result<Vec<u8>, FormatError> {
-    read_raw_data_full(file_data, layout, dataspace, datatype, None, 8, 8)
+    read_raw_data_full(
+        file_data,
+        layout,
+        dataspace,
+        datatype,
+        None,
+        FillPattern::ZERO,
+        8,
+        8,
+    )
 }
 
 /// Read raw bytes with full parameters including filter pipeline and sizes.
@@ -39,6 +49,7 @@ pub fn read_raw_data_full(
     dataspace: &Dataspace,
     datatype: &Datatype,
     pipeline: Option<&FilterPipeline>,
+    fill: FillPattern<'_>,
     offset_size: u8,
     length_size: u8,
 ) -> Result<Vec<u8>, FormatError> {
@@ -67,7 +78,12 @@ pub fn read_raw_data_full(
             Ok(data.clone())
         }
         DataLayout::Contiguous { address, size } => {
-            let addr = address.ok_or(FormatError::NoDataAllocated)?;
+            // No address means the storage was never allocated — the same lazy
+            // allocation a chunked dataset gets, and the reference C library
+            // reads it as the fill value rather than refusing it.
+            let Some(addr) = *address else {
+                return Ok(fill.buffer(expected_size));
+            };
             let r = slice_range(addr, *size)?;
             let sz = r.end - r.start;
             if sz != expected_size {
@@ -93,6 +109,7 @@ pub fn read_raw_data_full(
             dataspace,
             datatype,
             pipeline,
+            fill,
             offset_size,
             length_size,
             &ChunkCache::new(),
@@ -112,6 +129,7 @@ pub fn read_raw_data_cached(
     dataspace: &Dataspace,
     datatype: &Datatype,
     pipeline: Option<&FilterPipeline>,
+    fill: FillPattern<'_>,
     offset_size: u8,
     length_size: u8,
     cache: &ChunkCache,
@@ -123,6 +141,7 @@ pub fn read_raw_data_cached(
             dataspace,
             datatype,
             pipeline,
+            fill,
             offset_size,
             length_size,
             cache,
@@ -133,6 +152,7 @@ pub fn read_raw_data_cached(
             dataspace,
             datatype,
             pipeline,
+            fill,
             offset_size,
             length_size,
         ),
@@ -159,6 +179,7 @@ pub fn read_raw_data_full_from_source<S: Source + ?Sized>(
     dataspace: &Dataspace,
     datatype: &Datatype,
     pipeline: Option<&FilterPipeline>,
+    fill: FillPattern<'_>,
     offset_size: u8,
     length_size: u8,
 ) -> Result<Vec<u8>, FormatError> {
@@ -186,7 +207,11 @@ pub fn read_raw_data_full_from_source<S: Source + ?Sized>(
             Ok(data.clone())
         }
         DataLayout::Contiguous { address, size } => {
-            let addr = address.ok_or(FormatError::NoDataAllocated)?;
+            // Unallocated contiguous storage reads as the fill value; see the
+            // buffered reader's matching arm.
+            let Some(addr) = *address else {
+                return Ok(fill.buffer(expected_size));
+            };
             let sz = (*size).to_usize()?;
             if sz != expected_size {
                 return Err(FormatError::DataSizeMismatch {
@@ -204,6 +229,7 @@ pub fn read_raw_data_full_from_source<S: Source + ?Sized>(
             dataspace,
             datatype,
             pipeline,
+            fill,
             offset_size,
             length_size,
         ),
@@ -219,6 +245,7 @@ pub fn read_raw_data_cached_from_source<S: Source + ?Sized>(
     dataspace: &Dataspace,
     datatype: &Datatype,
     pipeline: Option<&FilterPipeline>,
+    fill: FillPattern<'_>,
     offset_size: u8,
     length_size: u8,
     cache: &ChunkCache,
@@ -230,6 +257,7 @@ pub fn read_raw_data_cached_from_source<S: Source + ?Sized>(
             dataspace,
             datatype,
             pipeline,
+            fill,
             offset_size,
             length_size,
             cache,
@@ -240,6 +268,7 @@ pub fn read_raw_data_cached_from_source<S: Source + ?Sized>(
             dataspace,
             datatype,
             pipeline,
+            fill,
             offset_size,
             length_size,
         ),
@@ -954,6 +983,7 @@ fn read_signed_int(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::convert::nz;
     use crate::dataspace::{Dataspace, DataspaceType};
     use crate::datatype::{CharacterSet, StringPadding};
     #[cfg(not(feature = "std"))]
@@ -1172,16 +1202,37 @@ mod tests {
         assert!(matches!(err, FormatError::DataSizeMismatch { .. }));
     }
 
+    /// Contiguous storage that was never allocated reads as the fill value —
+    /// zeros when none is defined, the value itself when one is — rather than
+    /// failing. This is the reference C library's behavior for a dataset created
+    /// and not written, and the fill pattern is the *only* thing that decides
+    /// what comes back, since there are no file bytes to read.
     #[test]
-    fn no_data_allocated() {
+    fn unallocated_contiguous_reads_as_the_fill_value() {
         let dt = make_f64_le_type();
         let ds = make_simple_dataspace(&[3]);
         let layout = DataLayout::Contiguous {
             address: None,
             size: 24,
         };
-        let err = read_raw_data(&[], &layout, &ds, &dt).unwrap_err();
-        assert!(matches!(err, FormatError::NoDataAllocated));
+        assert_eq!(
+            read_raw_data(&[], &layout, &ds, &dt).unwrap(),
+            vec![0u8; 24]
+        );
+
+        let seven = 7.0f64.to_le_bytes();
+        let filled = read_raw_data_full(
+            &[],
+            &layout,
+            &ds,
+            &dt,
+            None,
+            FillPattern::new(Some(&seven), nz(8)),
+            8,
+            8,
+        )
+        .unwrap();
+        assert_eq!(read_as_f64(&filled, &dt).unwrap(), vec![7.0, 7.0, 7.0]);
     }
 
     #[test]
@@ -1243,13 +1294,16 @@ mod tests {
             size: 24,
         };
 
-        let buffered = read_raw_data_full(&file_data, &layout, &ds, &dt, None, 8, 8).unwrap();
+        let buffered =
+            read_raw_data_full(&file_data, &layout, &ds, &dt, None, FillPattern::ZERO, 8, 8)
+                .unwrap();
         let from_mem = read_raw_data_full_from_source(
             &BytesSource::new(&file_data),
             &layout,
             &ds,
             &dt,
             None,
+            FillPattern::ZERO,
             8,
             8,
         )
@@ -1260,6 +1314,7 @@ mod tests {
             &ds,
             &dt,
             None,
+            FillPattern::ZERO,
             8,
             8,
         )
@@ -1281,13 +1336,15 @@ mod tests {
             data.extend_from_slice(&v.to_le_bytes());
         }
         let layout = DataLayout::Compact { data };
-        let buffered = read_raw_data_full(&[], &layout, &ds, &dt, None, 8, 8).unwrap();
+        let buffered =
+            read_raw_data_full(&[], &layout, &ds, &dt, None, FillPattern::ZERO, 8, 8).unwrap();
         let streamed = read_raw_data_full_from_source(
             &BytesSource::new(Vec::new()),
             &layout,
             &ds,
             &dt,
             None,
+            FillPattern::ZERO,
             8,
             8,
         )
@@ -1295,9 +1352,13 @@ mod tests {
         assert_eq!(buffered, streamed);
     }
 
+    /// The buffered and streaming readers must agree over unallocated
+    /// contiguous storage — including on *what* it reads as, not merely that
+    /// both succeed. Both fill patterns, since a shared zeroed allocation would
+    /// make them agree for the wrong reason.
     #[cfg(feature = "std")]
     #[test]
-    fn streaming_contiguous_error_parity() {
+    fn streaming_contiguous_unallocated_parity() {
         use crate::source::BytesSource;
         let dt = make_f64_le_type();
         let ds = make_simple_dataspace(&[3]);
@@ -1305,18 +1366,23 @@ mod tests {
             address: None,
             size: 24,
         };
-        let buffered = read_raw_data_full(&[], &layout, &ds, &dt, None, 8, 8);
-        let streamed = read_raw_data_full_from_source(
-            &BytesSource::new(Vec::new()),
-            &layout,
-            &ds,
-            &dt,
-            None,
-            8,
-            8,
-        );
-        assert!(matches!(buffered, Err(FormatError::NoDataAllocated)));
-        assert!(matches!(streamed, Err(FormatError::NoDataAllocated)));
+        let seven = 7.0f64.to_le_bytes();
+        for fill in [FillPattern::ZERO, FillPattern::new(Some(&seven), nz(8))] {
+            let buffered = read_raw_data_full(&[], &layout, &ds, &dt, None, fill, 8, 8).unwrap();
+            let streamed = read_raw_data_full_from_source(
+                &BytesSource::new(Vec::new()),
+                &layout,
+                &ds,
+                &dt,
+                None,
+                fill,
+                8,
+                8,
+            )
+            .unwrap();
+            assert_eq!(buffered, streamed);
+            assert_eq!(buffered.len(), 24);
+        }
     }
 
     // --- Sub-byte precision / bit-offset integers (#6) ---

@@ -20,9 +20,79 @@
 
 #[cfg(not(feature = "std"))]
 use alloc::{vec, vec::Vec};
+use core::num::NonZeroUsize;
 
 use crate::error::FormatError;
 use crate::message_type::MessageType;
+
+/// What storage a dataset has never had written to it reads as.
+///
+/// HDF5 allocates a dataset's storage lazily, so a dataset can be *created* with
+/// a shape and then read before anything is written — as a whole, when no chunk
+/// index or contiguous block exists at all, or in parts, when some chunks of a
+/// chunked dataset exist and others do not. The reference C library answers
+/// those regions with the dataset's fill value, and this is the pattern that
+/// answers them here.
+///
+/// `None` means the library default, which is the type's implicit zero — the
+/// same thing [`parse_defined_fill_value`] returns `Ok(None)` for. Keeping that
+/// case as `None` rather than as a buffer of zero bytes is what lets the common
+/// path stay a plain zeroed allocation with nothing to tile.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct FillPattern<'a> {
+    /// Exactly one element's worth of fill bytes, or `None` for zeros.
+    element: Option<&'a [u8]>,
+}
+
+impl<'a> FillPattern<'a> {
+    /// The implicit zero: what a dataset with no user-defined fill value reads
+    /// as, and the conservative answer whenever a fill value cannot be used.
+    pub(crate) const ZERO: Self = Self { element: None };
+
+    /// The pattern for a dataset whose Fill Value message carried `bytes`, over
+    /// a datatype of `elem_size` bytes per element.
+    ///
+    /// A fill value is one element wide by definition — it is stored in the
+    /// dataset's own datatype — so a message declaring some other length is
+    /// malformed. Rather than tile it and shift every element after the first,
+    /// such a value is dropped and the region reads as zeros: the fill pattern
+    /// is consulted only where there is no data, so falling back there cannot
+    /// corrupt a value that was actually written, and it leaves a dataset whose
+    /// storage *is* allocated reading exactly as it did before.
+    pub(crate) fn new(bytes: Option<&'a [u8]>, elem_size: NonZeroUsize) -> Self {
+        match bytes {
+            Some(b) if b.len() == elem_size.get() && b.iter().any(|&x| x != 0) => {
+                Self { element: Some(b) }
+            }
+            // An all-zero fill value is the zero pattern; saying so here keeps
+            // every buffer that would tile zeros on the plain allocation path.
+            _ => Self::ZERO,
+        }
+    }
+
+    /// A `len`-byte buffer holding the pattern, repeated from the start.
+    ///
+    /// `len` is a whole number of elements at every call site; a trailing
+    /// partial element would simply be filled with the pattern's prefix rather
+    /// than misaligned or panicking.
+    pub(crate) fn buffer(self, len: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; len];
+        self.apply(&mut buf);
+        buf
+    }
+
+    /// Tile the pattern across `buf`, which must begin on an element boundary.
+    /// A no-op for the zero pattern, leaving an already-zeroed buffer untouched.
+    pub(crate) fn apply(self, buf: &mut [u8]) {
+        let Some(element) = self.element else {
+            return;
+        };
+        for slot in buf.chunks_mut(element.len()) {
+            let n = slot.len().min(element.len());
+            slot[..n].copy_from_slice(&element[..n]);
+        }
+    }
+}
 
 /// Version-3 Fill Value message flags for the crate's default (no user-defined
 /// value): Late space-allocation time (bits 0-1 = `0b10`) and IfSet fill-value

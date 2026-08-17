@@ -26,6 +26,7 @@ use crate::error::{Error, FormatError};
 use crate::file_create_properties::FileCreateProperties;
 use crate::file_lock::{self, FileLocking, OpenIntent};
 use crate::file_space_info::{FileSpaceInfo, FileSpaceStrategy};
+use crate::fill_value::FillPattern;
 use crate::filter_pipeline::FilterPipeline;
 use crate::free_space_manager;
 use crate::group_v1::GroupEntry;
@@ -1329,6 +1330,7 @@ impl FileInner {
         ds: &Dataspace,
         dt: &Datatype,
         pipeline: Option<&FilterPipeline>,
+        fill: FillPattern<'_>,
         cache: &ChunkCache,
     ) -> Result<Vec<u8>, FormatError> {
         let (os, ls) = (self.offset_size(), self.length_size());
@@ -1347,6 +1349,7 @@ impl FileInner {
                 ds,
                 dt,
                 pipeline,
+                fill,
                 os,
                 ls,
                 cache,
@@ -1357,6 +1360,7 @@ impl FileInner {
                 ds,
                 dt,
                 pipeline,
+                fill,
                 os,
                 ls,
                 cache,
@@ -1367,7 +1371,7 @@ impl FileInner {
                     base,
                 };
                 data_read::read_raw_data_cached_from_source(
-                    &framed, dl, ds, dt, pipeline, os, ls, cache,
+                    &framed, dl, ds, dt, pipeline, fill, os, ls, cache,
                 )
             }
             Backend::Edit(m) => Self::with_engine(
@@ -1382,12 +1386,14 @@ impl FileInner {
                             available: data.len(),
                         })?
                     };
-                    data_read::read_raw_data_cached(frame, dl, ds, dt, pipeline, os, ls, cache)
+                    data_read::read_raw_data_cached(
+                        frame, dl, ds, dt, pipeline, fill, os, ls, cache,
+                    )
                 },
                 |s| {
                     let framed = BaseOffsetSource { inner: s, base };
                     data_read::read_raw_data_cached_from_source(
-                        &framed, dl, ds, dt, pipeline, os, ls, cache,
+                        &framed, dl, ds, dt, pipeline, fill, os, ls, cache,
                     )
                 },
             ),
@@ -1406,6 +1412,7 @@ impl FileInner {
         ds: &Dataspace,
         dt: &Datatype,
         pipeline: Option<&FilterPipeline>,
+        fill: FillPattern<'_>,
         cache: &ChunkCache,
         start_row: u64,
         num_rows: u64,
@@ -1471,6 +1478,7 @@ impl FileInner {
                     ds,
                     dt,
                     pipeline,
+                    fill,
                     os,
                     ls,
                     cache,
@@ -1485,6 +1493,7 @@ impl FileInner {
                 ds,
                 dt,
                 pipeline,
+                fill,
                 os,
                 ls,
                 cache,
@@ -1498,7 +1507,8 @@ impl FileInner {
                     base,
                 };
                 read_rows_framed(
-                    &framed, dl, ds, dt, pipeline, os, ls, cache, start_row, num_rows, row_bytes,
+                    &framed, dl, ds, dt, pipeline, fill, os, ls, cache, start_row, num_rows,
+                    row_bytes,
                 )
             }
             Backend::Edit(m) => Self::with_engine(
@@ -1519,6 +1529,7 @@ impl FileInner {
                         ds,
                         dt,
                         pipeline,
+                        fill,
                         os,
                         ls,
                         cache,
@@ -1530,7 +1541,7 @@ impl FileInner {
                 |s| {
                     let framed = BaseOffsetSource { inner: s, base };
                     read_rows_framed(
-                        &framed, dl, ds, dt, pipeline, os, ls, cache, start_row, num_rows,
+                        &framed, dl, ds, dt, pipeline, fill, os, ls, cache, start_row, num_rows,
                         row_bytes,
                     )
                 },
@@ -1550,6 +1561,7 @@ fn read_rows_framed<S: Source + ?Sized>(
     ds: &Dataspace,
     dt: &Datatype,
     pipeline: Option<&FilterPipeline>,
+    fill: FillPattern<'_>,
     os: u8,
     ls: u8,
     cache: &ChunkCache,
@@ -1558,19 +1570,20 @@ fn read_rows_framed<S: Source + ?Sized>(
     row_bytes: usize,
 ) -> Result<Vec<u8>, FormatError> {
     // A zero-row window reads nothing, uniformly across the *supported* layouts.
-    // Return early so that over unallocated storage — where the whole-dataset
-    // readers differ (a contiguous None errors with `NoDataAllocated`, a chunked
-    // None errors with "no address") — the contiguous and chunked arms agree
-    // instead of one erroring and one succeeding. A `Virtual` layout is
-    // unsupported and must still error like `read_raw` does, so it is excluded
-    // here and falls through to the match.
+    // A `Virtual` layout is unsupported and must still error like `read_raw`
+    // does, so it is excluded here and falls through to the match.
     if num_rows == 0 && !matches!(dl, DataLayout::Virtual { .. }) {
         return Ok(Vec::new());
     }
     match dl {
         DataLayout::Compact { .. } => unreachable!("compact is handled before framing"),
         DataLayout::Contiguous { address, size } => {
-            let addr = address.ok_or(FormatError::NoDataAllocated)?;
+            // Unallocated storage: the window reads as the fill value, the same
+            // answer the whole-dataset readers give for it.
+            let Some(addr) = *address else {
+                let len = num_rows.to_usize()?.saturating_mul(row_bytes);
+                return Ok(fill.buffer(len));
+            };
             let start =
                 start_row
                     .checked_mul(row_bytes as u64)
@@ -1601,14 +1614,14 @@ fn read_rows_framed<S: Source + ?Sized>(
         }
         DataLayout::Chunked { .. } => {
             match crate::chunked_read::read_chunked_rows_from_source(
-                source, dl, ds, dt, pipeline, os, ls, cache, start_row, num_rows,
+                source, dl, ds, dt, pipeline, fill, os, ls, cache, start_row, num_rows,
             )? {
                 Some(bytes) => Ok(bytes),
                 // Rank-0 chunked (a crafted-file corner): fall back to a whole
                 // read, then slice.
                 None => {
                     let full = data_read::read_raw_data_cached_from_source(
-                        source, dl, ds, dt, pipeline, os, ls, cache,
+                        source, dl, ds, dt, pipeline, fill, os, ls, cache,
                     )?;
                     let start = start_row.to_usize()? * row_bytes;
                     let len = num_rows.to_usize()? * row_bytes;
@@ -3726,6 +3739,17 @@ impl Dataset {
         }
     }
 
+    /// The dataset's user-defined fill value bytes, as
+    /// [`defined_fill_bytes`](Self::defined_fill_bytes), for the read paths that
+    /// have to materialize unallocated storage.
+    ///
+    /// Named apart from the public `fill_value` accessor because it answers a
+    /// different question: `fill_value` decodes the value for a caller, this
+    /// hands the raw element bytes to [`FillPattern`].
+    fn fill_bytes(&self) -> Result<Option<Vec<u8>>, Error> {
+        self.defined_fill_bytes()
+    }
+
     /// Read all data as `f64` values.
     pub fn read_f64(&self) -> Result<Vec<f64>, Error> {
         let raw = self.read_raw()?;
@@ -4026,9 +4050,9 @@ impl Dataset {
             );
         }
 
-        // A zero-element dataset owns no element bytes, and the C library leaves
-        // such a dataset's storage unallocated — reading it would fail for a
-        // missing chunk address rather than yield an empty buffer.
+        // A zero-element dataset owns no element bytes, so there is no storage
+        // to visit: skip the read rather than open a dataset the C library
+        // left unallocated only to receive the same empty buffer back.
         let raw = if n == 0 { Vec::new() } else { self.read_raw()? };
         let n_usize = n.to_usize()?;
         let needed = n_usize
@@ -4274,9 +4298,15 @@ impl Dataset {
         // contiguous and chunked layouts) by reading from a base-relative view of
         // the file.
         let pipeline = self.filter_pipeline_parsed();
-        Ok(self
-            .file
-            .read_dataset_raw(&dl, &ds, &dt, pipeline.as_ref(), &self.chunk_cache)?)
+        let fill = self.fill_bytes()?;
+        Ok(self.file.read_dataset_raw(
+            &dl,
+            &ds,
+            &dt,
+            pipeline.as_ref(),
+            FillPattern::new(fill.as_deref(), dt.element_size_usize()?),
+            &self.chunk_cache,
+        )?)
     }
 
     /// Read the raw element bytes of the row window `[start_row, start_row + num_rows)`
@@ -4308,6 +4338,9 @@ impl Dataset {
 
         // A window covering every row is exactly a whole read: delegate, so it
         // never costs a window-shaped copy on top of one.
+        let fill_bytes = self.fill_bytes()?;
+        let fill = FillPattern::new(fill_bytes.as_deref(), dt.element_size_usize()?);
+
         if start == 0 && count == n0 {
             let pipeline = self.filter_pipeline_parsed();
             return Ok(self.file.read_dataset_raw(
@@ -4315,6 +4348,7 @@ impl Dataset {
                 &ds,
                 &dt,
                 pipeline.as_ref(),
+                fill,
                 &self.chunk_cache,
             )?);
         }
@@ -4324,6 +4358,7 @@ impl Dataset {
             &ds,
             &dt,
             self.filter_pipeline_parsed().as_ref(),
+            fill,
             &self.chunk_cache,
             start,
             count,
@@ -4866,12 +4901,12 @@ mod tests {
         }
     }
 
-    /// A zero-row window returns `Ok(empty)` uniformly, even over an unallocated
-    /// contiguous dataset where the whole-dataset reader errors with
-    /// `NoDataAllocated`. Without the early return in `read_rows_framed`, the
-    /// contiguous arm's `address.ok_or(NoDataAllocated)?` would error here, while
-    /// the chunked arm returns `Ok(empty)` — the cross-layout divergence this
-    /// guards against.
+    /// A zero-row window returns `Ok(empty)` uniformly across layouts, including
+    /// over unallocated storage. Unallocated storage now reads as the fill value
+    /// rather than erroring, so this no longer guards a cross-layout divergence
+    /// in the error; what it still pins is that a window of no rows is an *empty*
+    /// buffer and not a zero-length fill, which is what a caller iterating past
+    /// the end of a dataset sees.
     #[test]
     fn read_rows_framed_zero_row_window_is_ok_even_when_unallocated() {
         let dl = DataLayout::Contiguous {
@@ -4898,6 +4933,7 @@ mod tests {
             &ds,
             &dt,
             None,
+            FillPattern::ZERO,
             8,
             8,
             &cache,
@@ -4905,7 +4941,7 @@ mod tests {
             0,
             8,
         )
-        .expect("a zero-row window must be Ok(empty), not NoDataAllocated");
+        .expect("a zero-row window must be Ok(empty)");
         assert!(out.is_empty());
 
         // A Virtual layout is unsupported and must still error for a zero-row
@@ -4918,6 +4954,7 @@ mod tests {
             &ds,
             &dt,
             None,
+            FillPattern::ZERO,
             8,
             8,
             &cache,
