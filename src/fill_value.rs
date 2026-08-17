@@ -151,11 +151,18 @@ const FILL_TIME_NEVER: u8 = 1;
 /// Whether the fill value would ever be written into storage, for the read path
 /// that has to decide what unallocated storage looks like.
 ///
-/// Returns `false` for a message whose *Fill Value Write Time* is `Never`, which
-/// the reference C library honors over the value: with `H5Pset_fill_time` set to
-/// `H5D_FILL_TIME_NEVER` and a fill value of 7, an unwritten dataset reads back
-/// as zeros, and so does the unwritten tail of a partly written one. Reading the
-/// declared value there would fabricate data the file says was never put in it.
+/// Returns `false` for a message whose *Fill Value Write Time* is `Never`. Such
+/// a dataset's unallocated storage has **no defined contents at all**: the
+/// reference C library never writes the fill value into it and has nothing to
+/// read back, so `H5Dread` leaves the caller's buffer as it found it. That is
+/// observable — the same file read through `hdf5-metno` yields zeros on macOS
+/// and the fill bytes on Linux, from one uninitialized allocation to the next.
+///
+/// So this is not a case where the C library can be matched; it is a case where
+/// it has no answer to match. Zeros is the answer chosen here because it is
+/// deterministic and does not claim a specific value the file says was never
+/// written — reading back the declared fill would assert data that nothing put
+/// there.
 ///
 /// A malformed or unrecognized message errors rather than guessing; a legacy
 /// `0x0004` message carries no write time and is treated as written, which is

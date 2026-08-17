@@ -3744,12 +3744,11 @@ impl Dataset {
     ///
     /// A dataset may declare a fill value and also declare, through the Fill
     /// Value Write Time, that the library never writes it
-    /// (`H5D_FILL_TIME_NEVER`). The reference C library honors the write time
-    /// over the value: such a dataset reads back as zeros where nothing was
-    /// written, however the value is defined. `fill_value` still reports the
-    /// declared value, because it *is* declared; this returns `None` for it,
-    /// because materializing it would fabricate data the file says was never
-    /// put there.
+    /// (`H5D_FILL_TIME_NEVER`). Its unallocated storage then has no defined
+    /// contents — the C library leaves the read buffer untouched — so this
+    /// returns `None` and the region reads as deterministic zeros rather than as
+    /// a value nothing ever put there. `fill_value` still reports the declared
+    /// value, because it *is* declared; see [`fill_value_is_written`].
     fn fill_bytes(&self) -> Result<Option<Vec<u8>>, Error> {
         let msg = self
             .header

@@ -476,15 +476,18 @@ fn pure_fills_the_gaps_of_a_partially_written_chunked_dataset() {
 }
 
 /// `H5D_FILL_TIME_NEVER` says the library never writes the fill value into
-/// storage, and the C library honors that *over* the value: an unwritten
-/// dataset reads back as zeros however the fill is defined, and so does the
-/// unwritten tail of a partly written one.
+/// storage, so a dataset carrying it has no defined contents where nothing was
+/// written. This crate answers that with deterministic zeros rather than with
+/// the declared value, which would assert data nothing ever put there.
 ///
-/// Materializing the declared value there fabricates data the file says was
-/// never put in it — and for the partly-written case it is a regression, since
-/// zeros were the right answer before unallocated storage was materialized at
-/// all. The write time lives in bits 2-3 of the version-3 flags byte, beside
-/// the *defined* bit this used to read on its own.
+/// **The C library is deliberately not the oracle here**, unlike every other
+/// test in this file. It has nothing to read for such a dataset, so `H5Dread`
+/// leaves the caller's buffer as it found it: the identical file yields zeros on
+/// macOS and the fill bytes on Linux, purely from what the last allocation left
+/// behind. An earlier version of this test asserted the C library's answer and
+/// passed locally while failing on two of three CI platforms. What is pinned
+/// instead is this crate's own determinism, across both readers and both
+/// storage layouts.
 #[test]
 fn a_fill_value_the_file_says_is_never_written_reads_as_zeros() {
     for (label, chunked, partial) in [
@@ -512,14 +515,12 @@ fn a_fill_value_the_file_says_is_never_written_reads_as_zeros() {
             file.close().unwrap();
         }
 
-        let expected = {
-            let file = hdf5::File::open(&path).unwrap();
-            file.dataset("col").unwrap().read_raw::<i32>().unwrap()
-        };
-        assert!(
-            expected.iter().all(|&v| v != 7),
-            "[{label}] the C library must not write the fill value here"
-        );
+        // What was actually written is the only defined part; the rest is the
+        // region under test.
+        let mut expected = vec![0i32; 8];
+        if partial {
+            expected[..4].copy_from_slice(&[1, 2, 3, 4]);
+        }
 
         for streaming in [false, true] {
             let file = if streaming {
