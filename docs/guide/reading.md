@@ -122,6 +122,8 @@ let file = File::open("output.h5").unwrap();
 let values = file.dataset("temperature").unwrap().read_f64().unwrap();
 ```
 
+A typed read costs about what its result costs. The numeric readers decode the dataset a row window at a time, so what stands beside the returned `Vec<T>` is one window of stored bytes — roughly a mebibyte — rather than a second copy of the whole dataset. `read_u8` and `read_raw` hand back the stored bytes themselves and have nothing to decode.
+
 ### Generic reads
 
 `Dataset::read::<T>()` is the generic counterpart to the typed `read_*` methods, bounded by the sealed `H5Element` trait (implemented for `f32`/`f64` and the 8/16/32/64-bit signed and unsigned integers). It lets you write code generic over the element type. Like `read_f64`, it requests delivery as `T` and coerces, so pick `T` to match the stored type for a lossless read.

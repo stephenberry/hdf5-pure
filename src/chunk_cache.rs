@@ -191,11 +191,17 @@ struct CachedChunk {
 ///
 /// A read of a whole dataset does not want it: a caller who reads it again
 /// starts at the beginning, so a retained prefix is worth at least as much as a
-/// retained suffix, and it costs a fraction as much to keep. A *row window* does
-/// want it, because its successor is the adjacent window and the chunk they share
-/// is the one this read finished on — which is why
-/// [`read_chunked_rows_from_source`](crate::chunked_read::read_chunked_rows_from_source)
-/// passes `LRU` and the two whole-dataset loops pass a real pass.
+/// retained suffix, and it costs a fraction as much to keep. A *lone* row window
+/// does want it, because its successor is the adjacent window and the chunk they
+/// share is the one this read finished on — which is why
+/// [`Dataset::read_raw_rows`](crate::Dataset::read_raw_rows) asks for `LRU` while
+/// the two whole-dataset loops open a real pass.
+///
+/// The windowed reader itself takes the pass from its caller rather than
+/// choosing, because the same window means different things to different
+/// callers: a sweep of a whole dataset in windows opens one real pass for all of
+/// them, since it asks for each chunk exactly once and has no more use for the
+/// last window's chunks than for the first's.
 ///
 /// Across passes nothing changes either way: a later read still evicts what an
 /// earlier one left, so the cache goes on tracking the most recent access
@@ -338,8 +344,28 @@ impl ChunkCache {
 
     /// Return all indexed chunks as a `Vec<ChunkInfo>` (order unspecified).
     pub fn all_indexed_chunks(&self) -> Option<Vec<ChunkInfo>> {
+        self.indexed_chunks_matching(|_| true)
+    }
+
+    /// Return the indexed chunks `keep` accepts, as a `Vec<ChunkInfo>` (order
+    /// unspecified).
+    ///
+    /// A row window wants the chunks its rows overlap and nothing else, and the
+    /// difference is not a nicety: each [`ChunkInfo`] owns a coordinate `Vec`, so
+    /// taking the whole index and discarding most of it costs an allocation per
+    /// chunk *of the dataset* per window. A sweep of a dataset in windows paid
+    /// that as a product — 8 windows over 2,048 chunks, 16,384 allocations to
+    /// visit 2,048 chunks (issue #289). The filter runs while the lock is held,
+    /// over borrowed entries, so a rejected chunk costs no allocation at all.
+    pub fn indexed_chunks_matching(
+        &self,
+        keep: impl Fn(&ChunkInfo) -> bool,
+    ) -> Option<Vec<ChunkInfo>> {
         let inner = self.inner.lock().unwrap();
-        inner.index.as_ref().map(|m| m.values().cloned().collect())
+        inner
+            .index
+            .as_ref()
+            .map(|m| m.values().filter(|ci| keep(ci)).cloned().collect())
     }
 
     // ----- Decompressed data cache (LRU) -----

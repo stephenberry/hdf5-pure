@@ -16,9 +16,14 @@
 //! layer at once, and the sites that must decide what it is are the few that
 //! build the spec.
 
+#[cfg(not(feature = "std"))]
+use alloc::vec::Vec;
+
+use crate::convert::TryToUsize;
 use crate::data_layout::DataLayout;
 use crate::dataspace::Dataspace;
 use crate::datatype::Datatype;
+use crate::error::FormatError;
 use crate::fill_value::FillPattern;
 use crate::filter_pipeline::FilterPipeline;
 
@@ -46,6 +51,51 @@ pub struct RawReadSpec<'a> {
 }
 
 impl<'a> RawReadSpec<'a> {
+    /// The byte length this dataset's elements occupy, checked against what its
+    /// layout says it stores.
+    ///
+    /// A compact or contiguous layout names its own size, and a disagreement
+    /// with the dataspace is a corrupt or crafted file rather than a short read.
+    /// The check lives here because two kinds of read have to make it and make
+    /// it the same way: a whole read, and a read that takes the dataset a row
+    /// window at a time. A check only one of them made would fire or not
+    /// depending on the dataset's *size* — the windowed readers read a small
+    /// dataset whole — which is worse than no check at all (issue #289).
+    ///
+    /// A zero-element dataset is exempt, as it is in the readers: it has no
+    /// bytes to disagree about, and its layout may say anything.
+    ///
+    /// Chunked storage names no total size, and a chunk the file does not hold
+    /// reads as the fill value rather than as an error, so there is nothing here
+    /// to check for it.
+    pub fn stored_byte_len(&self) -> Result<usize, FormatError> {
+        let num_elements = self.dataspace.num_elements().to_usize()?;
+        let elem_size = self.datatype.type_size() as usize;
+        let expected = num_elements
+            .checked_mul(elem_size)
+            .ok_or(FormatError::OffsetOverflow {
+                offset: num_elements as u64,
+                length: elem_size as u64,
+            })?;
+        if num_elements == 0 {
+            return Ok(expected);
+        }
+        let actual = match self.layout {
+            DataLayout::Compact { data } => data.len(),
+            // No address means storage that was never allocated, which reads as
+            // the fill value and has no size to disagree with.
+            DataLayout::Contiguous {
+                address: Some(_),
+                size,
+            } => (*size).to_usize()?,
+            _ => return Ok(expected),
+        };
+        if actual != expected {
+            return Err(FormatError::DataSizeMismatch { expected, actual });
+        }
+        Ok(expected)
+    }
+
     /// A spec for an unfiltered dataset whose unallocated storage reads as
     /// zeros — the shape a test fixture wants, and never the shape a real read
     /// wants, which is why the live paths build the struct literally.

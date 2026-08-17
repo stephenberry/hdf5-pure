@@ -12,7 +12,7 @@ use core::num::NonZeroUsize;
 
 use crate::btree_v1::btree_v1_node_header_size;
 use crate::bytes::read_offset;
-use crate::chunk_cache::ChunkCache;
+use crate::chunk_cache::{CachePass, ChunkCache};
 use crate::chunk_grid::{ChunkGrid, GridOrder};
 use crate::chunk_span::ChunkSpanReader;
 use crate::convert::{TryToUsize, nonzero_usize_from, slice_range, u32_from};
@@ -749,12 +749,21 @@ fn plan_chunk_spans(
 /// are returned. Returns `Ok(None)` only for a rank-0 (scalar) chunked layout — a
 /// crafted-file corner with no leading dimension to window — so the caller falls
 /// back to a whole read. The caller clamps the window to the dataset.
+///
+/// `pass` decides which chunks the cache keeps, and the answer differs by caller.
+/// A lone window wants [`CachePass::LRU`], so that what it retains is the chunks
+/// it *finished* on: its successor is the adjacent window, and the chunk they
+/// share is that last one. A window that is one step of a sweep across the whole
+/// dataset wants a real pass, shared by every step — the sweep never asks for a
+/// chunk twice, so offering each one to a cache already full is a copy and an
+/// eviction with no reader on the other side. See [`CachePass`].
 pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
     source: &S,
     spec: RawReadSpec<'_>,
     offset_size: u8,
     length_size: u8,
     cache: &ChunkCache,
+    pass: CachePass,
     row_start: u64,
     num_rows: u64,
 ) -> Result<Option<Vec<u8>>, FormatError> {
@@ -845,8 +854,31 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
         return Ok(Some(output));
     };
 
-    // Walk the index once, then reuse it for later windows on this handle.
-    let mut chunks = if let Some(chunks) = cache.all_indexed_chunks() {
+    let row_lo = row_start.to_usize()?;
+    let row_hi = row_lo.saturating_add(out_rows); // exclusive; caller clamped to the dataset
+    let cd0 = chunk_dims[0];
+
+    // A chunk contributes to the window when its rows meet `[row_lo, row_hi)`.
+    // Every list this function builds and every walk over one applies this test,
+    // so it is written once.
+    let overlaps = |c0: usize| c0 < row_hi && c0.saturating_add(cd0) > row_lo;
+    let chunk_overlaps = |chunk: &ChunkInfo| {
+        match chunk.offsets.first().copied().unwrap_or(0).to_usize() {
+            Ok(c0) => overlaps(c0),
+            // A leading offset too large for `usize` — a 32-bit target reading a
+            // crafted file. Kept rather than dropped: the walk below converts it
+            // again and reports the failure, and a filter that swallowed it here
+            // would turn that error into silence.
+            Err(_) => true,
+        }
+    };
+
+    // Walk the index once, then reuse it for later windows on this handle —
+    // keeping only this window's chunks, since each `ChunkInfo` taken out of the
+    // index owns a coordinate `Vec` and the rest would be allocated and dropped
+    // unread. Sweeping a dataset window by window makes that a product rather
+    // than a sum (issue #289).
+    let mut chunks = if let Some(chunks) = cache.indexed_chunks_matching(chunk_overlaps) {
         chunks
     } else {
         let chunks = collect_chunks_for_layout_from_source(
@@ -863,41 +895,19 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
             length_size,
         )?;
         cache.populate_index(&chunks, rank);
-        chunks
+        chunks.into_iter().filter(chunk_overlaps).collect()
     };
     sort_chunks_by_address(&mut chunks);
 
     let chunk_dims_u64: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
     let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype)?;
 
-    let row_lo = row_start.to_usize()?;
-    let row_hi = row_lo.saturating_add(out_rows); // exclusive; caller clamped to the dataset
-    let cd0 = chunk_dims[0];
-
-    // A chunk contributes to the window when its rows meet `[row_lo, row_hi)`.
-    // The span plan and the walk below have to agree on which chunks those are,
-    // so the test is written once.
-    let overlaps = |c0: usize| c0 < row_hi && c0.saturating_add(cd0) > row_lo;
-
     // Coalesce over the window's own chunks. A plan built over the dataset's
     // whole chunk list would put the rows on either side of the window inside a
     // span and read them for nothing — an eight-row window measured 32 KB where
     // it needed 64 bytes.
-    let mut spans = plan_chunk_spans(&chunks, rank, cache, |chunk| {
-        chunk
-            .offsets
-            .first()
-            .copied()
-            .unwrap_or(0)
-            .to_usize()
-            .is_ok_and(&overlaps)
-    });
+    let mut spans = plan_chunk_spans(&chunks, rank, cache, chunk_overlaps);
 
-    // Plain LRU rather than a fill-once pass, so the chunks this window finishes
-    // on are the ones retained. That is the reuse the doc above promises: the
-    // next window straddles this one's *last* chunk, and a window wide enough to
-    // fill the cache would otherwise drop exactly it. See [`CachePass`].
-    let pass = crate::chunk_cache::CachePass::LRU;
     // One decoder for the whole window; see `FilterScratch`.
     let mut scratch = FilterScratch::new();
 
@@ -3089,6 +3099,7 @@ mod tests {
             8,
             8,
             &cache,
+            CachePass::LRU,
             0,
             1,
         )
@@ -3128,6 +3139,7 @@ mod tests {
             8,
             8,
             &cache,
+            CachePass::LRU,
             0,
             1,
         )
@@ -3168,6 +3180,7 @@ mod tests {
             8,
             8,
             &cache,
+            CachePass::LRU,
             0,
             1,
         )
@@ -3219,15 +3232,31 @@ mod tests {
                     .expect("an unallocated dataset reads as fill");
             assert_eq!(whole.len(), 80);
 
-            let window =
-                read_chunked_rows_from_source(&BytesSource::new(b""), spec, 8, 8, &cache, 2, 4)
-                    .expect("a window over an unallocated index reads as fill")
-                    .expect("rank-1 windows are supported");
+            let window = read_chunked_rows_from_source(
+                &BytesSource::new(b""),
+                spec,
+                8,
+                8,
+                &cache,
+                CachePass::LRU,
+                2,
+                4,
+            )
+            .expect("a window over an unallocated index reads as fill")
+            .expect("rank-1 windows are supported");
             assert_eq!(window, whole[16..48], "the window must match those rows");
 
-            let empty =
-                read_chunked_rows_from_source(&BytesSource::new(b""), spec, 8, 8, &cache, 0, 0)
-                    .expect("empty window must still be Ok");
+            let empty = read_chunked_rows_from_source(
+                &BytesSource::new(b""),
+                spec,
+                8,
+                8,
+                &cache,
+                CachePass::LRU,
+                0,
+                0,
+            )
+            .expect("empty window must still be Ok");
             assert_eq!(empty, Some(Vec::new()));
         }
     }

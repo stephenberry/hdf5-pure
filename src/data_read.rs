@@ -9,7 +9,7 @@ use crate::chunk_cache::ChunkCache;
 use crate::chunked_read::{
     read_chunked_data_cached, read_chunked_data_cached_from_source, read_chunked_data_from_source,
 };
-use crate::convert::{TryToUsize, slice_range};
+use crate::convert::slice_range;
 use crate::data_layout::DataLayout;
 #[cfg(test)]
 use crate::dataspace::Dataspace;
@@ -48,34 +48,20 @@ pub fn read_raw_data_full(
     let RawReadSpec {
         layout,
         dataspace,
-        datatype,
         fill,
         ..
     } = spec;
-    let num_elements = dataspace.num_elements().to_usize()?;
-    let elem_size = datatype.type_size() as usize;
-    let expected_size = num_elements
-        .checked_mul(elem_size)
-        .ok_or(FormatError::OffsetOverflow {
-            offset: num_elements as u64,
-            length: elem_size as u64,
-        })?;
+    // The one definition of "these bytes are the dataset the dataspace
+    // describes"; the windowed readers make the same check through it.
+    let expected_size = spec.stored_byte_len()?;
 
     // Zero-element datasets have no data to read.
-    if num_elements == 0 {
+    if dataspace.num_elements() == 0 {
         return Ok(Vec::new());
     }
 
     match layout {
-        DataLayout::Compact { data } => {
-            if data.len() != expected_size {
-                return Err(FormatError::DataSizeMismatch {
-                    expected: expected_size,
-                    actual: data.len(),
-                });
-            }
-            Ok(data.clone())
-        }
+        DataLayout::Compact { data } => Ok(data.clone()),
         DataLayout::Contiguous { address, size } => {
             // No address means the storage was never allocated — the same lazy
             // allocation a chunked dataset gets, and the reference C library
@@ -84,13 +70,6 @@ pub fn read_raw_data_full(
                 return fill.buffer(expected_size);
             };
             let r = slice_range(addr, *size)?;
-            let sz = r.end - r.start;
-            if sz != expected_size {
-                return Err(FormatError::DataSizeMismatch {
-                    expected: expected_size,
-                    actual: sz,
-                });
-            }
             if r.end > file_data.len() {
                 return Err(FormatError::UnexpectedEof {
                     expected: r.end,
@@ -156,49 +135,27 @@ pub fn read_raw_data_full_from_source<S: Source + ?Sized>(
     let RawReadSpec {
         layout,
         dataspace,
-        datatype,
         fill,
         ..
     } = spec;
-    let num_elements = dataspace.num_elements().to_usize()?;
-    let elem_size = datatype.type_size() as usize;
-    let expected_size = num_elements
-        .checked_mul(elem_size)
-        .ok_or(FormatError::OffsetOverflow {
-            offset: num_elements as u64,
-            length: elem_size as u64,
-        })?;
+    // See the buffered reader: one definition, shared with the windowed ones.
+    let expected_size = spec.stored_byte_len()?;
 
-    if num_elements == 0 {
+    if dataspace.num_elements() == 0 {
         return Ok(Vec::new());
     }
 
     match layout {
-        DataLayout::Compact { data } => {
-            if data.len() != expected_size {
-                return Err(FormatError::DataSizeMismatch {
-                    expected: expected_size,
-                    actual: data.len(),
-                });
-            }
-            Ok(data.clone())
-        }
-        DataLayout::Contiguous { address, size } => {
+        DataLayout::Compact { data } => Ok(data.clone()),
+        DataLayout::Contiguous { address, .. } => {
             // Unallocated contiguous storage reads as the fill value; see the
             // buffered reader's matching arm.
             let Some(addr) = *address else {
                 return fill.buffer(expected_size);
             };
-            let sz = (*size).to_usize()?;
-            if sz != expected_size {
-                return Err(FormatError::DataSizeMismatch {
-                    expected: expected_size,
-                    actual: sz,
-                });
-            }
             // The single point of I/O; `read_exact_at` bounds-checks against the
             // source length (in u64) and errors instead of truncating.
-            source.read_exact_at(addr, sz)
+            source.read_exact_at(addr, expected_size)
         }
         DataLayout::Chunked { .. } => {
             read_chunked_data_from_source(source, spec, offset_size, length_size)
@@ -300,19 +257,19 @@ fn is_standard_layout(
 }
 
 /// Bulk-decode `$raw` — already validated as a whole multiple of the storage
-/// width — into a `Vec<$out>` for a standard-layout numeric type. `$store` is the
-/// width-matched storage scalar (e.g. `i32` for a 4-byte signed integer, `f64`
-/// for an 8-byte float). Each element is decoded with the correct endianness via
-/// `from_le_bytes`/`from_be_bytes` and converted to the requested `$out` element
-/// type with `as`, which reproduces the per-element slow path exactly for the
-/// full-width case: integer storage is bit-reinterpreted then sign/zero-extended
-/// or narrowed; float storage is value-converted. `chunks_exact` yields
-/// guaranteed `$store`-sized slices, so `try_into` never fails and the bounds
-/// check is hoisted out of the loop.
+/// width — appending to `$dst`, a `Vec<$out>` the caller has already reserved
+/// room in. `$store` is the width-matched storage scalar (e.g. `i32` for a
+/// 4-byte signed integer, `f64` for an 8-byte float). Each element is decoded
+/// with the correct endianness via `from_le_bytes`/`from_be_bytes` and converted
+/// to the requested `$out` element type with `as`, which reproduces the
+/// per-element slow path exactly for the full-width case: integer storage is
+/// bit-reinterpreted then sign/zero-extended or narrowed; float storage is
+/// value-converted. `chunks_exact` yields guaranteed `$store`-sized slices, so
+/// `try_into` never fails and the bounds check is hoisted out of the loop.
 macro_rules! bulk_decode {
-    ($raw:expr, $count:expr, $order:expr, $store:ty, $out:ty) => {{
+    ($dst:expr, $raw:expr, $order:expr, $store:ty, $out:ty) => {{
         const W: usize = core::mem::size_of::<$store>();
-        let mut result: Vec<$out> = Vec::with_capacity($count);
+        let dst: &mut Vec<$out> = $dst;
         match $order {
             DatatypeByteOrder::BigEndian => {
                 for c in $raw.chunks_exact(W) {
@@ -322,7 +279,7 @@ macro_rules! bulk_decode {
                         clippy::cast_possible_wrap,
                         clippy::unnecessary_cast
                     )]
-                    result.push(<$store>::from_be_bytes(a) as $out);
+                    dst.push(<$store>::from_be_bytes(a) as $out);
                 }
             }
             // LittleEndian here (Vax is excluded by `is_standard_layout`).
@@ -334,16 +291,35 @@ macro_rules! bulk_decode {
                         clippy::cast_possible_wrap,
                         clippy::unnecessary_cast
                     )]
-                    result.push(<$store>::from_le_bytes(a) as $out);
+                    dst.push(<$store>::from_le_bytes(a) as $out);
                 }
             }
         }
-        result
     }};
 }
 
 /// Convert raw bytes to `f64` values.
 pub fn read_as_f64(raw: &[u8], datatype: &Datatype) -> Result<Vec<f64>, FormatError> {
+    let mut out = Vec::new();
+    read_as_f64_into(raw, datatype, &mut out)?;
+    Ok(out)
+}
+
+/// Decode `raw` and **append** the values to `out`, the appending form of
+/// [`read_as_f64`].
+///
+/// A whole-dataset typed read sweeps its dataset in row windows and decodes
+/// each window into one output buffer, so the decoders must add to a buffer
+/// rather than each produce one (issue #289).
+///
+/// On error `out` holds an unspecified prefix of this call's values: every
+/// caller abandons the buffer, and nothing else is worth the copy that
+/// avoiding it would cost.
+pub fn read_as_f64_into(
+    raw: &[u8],
+    datatype: &Datatype,
+    out: &mut Vec<f64>,
+) -> Result<(), FormatError> {
     let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FloatingPoint or FixedPoint")?;
     let elem_size = get_size(datatype)?;
@@ -356,33 +332,38 @@ pub fn read_as_f64(raw: &[u8], datatype: &Datatype) -> Result<Vec<f64>, FormatEr
     let count = raw.len() / elem_size;
     let order = get_byte_order(datatype);
     let (bit_offset, bit_precision) = int_bits(datatype);
+    out.reserve(count);
 
     // Fast path: standard full-width layout, bulk-decoded with `from_*_bytes`.
     if is_standard_layout(elem_size.get(), &order, bit_offset, bit_precision) {
         match datatype {
             Datatype::FloatingPoint { size: 4, .. } => {
-                return Ok(bulk_decode!(raw, count, order, f32, f64));
+                bulk_decode!(out, raw, order, f32, f64);
+                return Ok(());
             }
             Datatype::FloatingPoint { size: 8, .. } => {
-                return Ok(bulk_decode!(raw, count, order, f64, f64));
+                bulk_decode!(out, raw, order, f64, f64);
+                return Ok(());
             }
             Datatype::FixedPoint { signed: true, .. } => {
-                return Ok(match elem_size.get() {
-                    1 => bulk_decode!(raw, count, order, i8, f64),
-                    2 => bulk_decode!(raw, count, order, i16, f64),
-                    4 => bulk_decode!(raw, count, order, i32, f64),
-                    8 => bulk_decode!(raw, count, order, i64, f64),
+                match elem_size.get() {
+                    1 => bulk_decode!(out, raw, order, i8, f64),
+                    2 => bulk_decode!(out, raw, order, i16, f64),
+                    4 => bulk_decode!(out, raw, order, i32, f64),
+                    8 => bulk_decode!(out, raw, order, i64, f64),
                     _ => unreachable!(),
-                });
+                }
+                return Ok(());
             }
             Datatype::FixedPoint { signed: false, .. } => {
-                return Ok(match elem_size.get() {
-                    1 => bulk_decode!(raw, count, order, u8, f64),
-                    2 => bulk_decode!(raw, count, order, u16, f64),
-                    4 => bulk_decode!(raw, count, order, u32, f64),
-                    8 => bulk_decode!(raw, count, order, u64, f64),
+                match elem_size.get() {
+                    1 => bulk_decode!(out, raw, order, u8, f64),
+                    2 => bulk_decode!(out, raw, order, u16, f64),
+                    4 => bulk_decode!(out, raw, order, u32, f64),
+                    8 => bulk_decode!(out, raw, order, u64, f64),
                     _ => unreachable!(),
-                });
+                }
+                return Ok(());
             }
             // Other classes (e.g. a 2-byte float, with no `f16`) fall through to
             // the slow path, which errors exactly as before.
@@ -390,13 +371,12 @@ pub fn read_as_f64(raw: &[u8], datatype: &Datatype) -> Result<Vec<f64>, FormatEr
         }
     }
 
-    let mut result = Vec::with_capacity(count);
     for i in 0..count {
         let chunk = &raw[i * elem_size.get()..(i + 1) * elem_size.get()];
         let val = convert_to_f64(chunk, datatype, &order)?;
-        result.push(val);
+        out.push(val);
     }
-    Ok(result)
+    Ok(())
 }
 
 fn convert_to_f64(
@@ -441,6 +421,26 @@ fn convert_to_f64(
 
 /// Convert raw bytes to `i64` values.
 pub fn read_as_i64(raw: &[u8], datatype: &Datatype) -> Result<Vec<i64>, FormatError> {
+    let mut out = Vec::new();
+    read_as_i64_into(raw, datatype, &mut out)?;
+    Ok(out)
+}
+
+/// Decode `raw` and **append** the values to `out`, the appending form of
+/// [`read_as_i64`].
+///
+/// A whole-dataset typed read sweeps its dataset in row windows and decodes
+/// each window into one output buffer, so the decoders must add to a buffer
+/// rather than each produce one (issue #289).
+///
+/// On error `out` holds an unspecified prefix of this call's values: every
+/// caller abandons the buffer, and nothing else is worth the copy that
+/// avoiding it would cost.
+pub fn read_as_i64_into(
+    raw: &[u8],
+    datatype: &Datatype,
+    out: &mut Vec<i64>,
+) -> Result<(), FormatError> {
     let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FixedPoint (signed)")?;
     let elem_size = get_size(datatype)?;
@@ -453,31 +453,52 @@ pub fn read_as_i64(raw: &[u8], datatype: &Datatype) -> Result<Vec<i64>, FormatEr
     let count = raw.len() / elem_size;
     let order = get_byte_order(datatype);
     let (bit_offset, bit_precision) = int_bits(datatype);
+    out.reserve(count);
 
     // Fast path: standard full-width layout, bulk-decoded then sign-extended.
     // Signed storage types reproduce `read_signed_int`'s sign-extension for the
     // full-width case (and a float read as i64 bit-reinterprets identically).
     if is_standard_layout(elem_size.get(), &order, bit_offset, bit_precision) {
-        return Ok(match elem_size.get() {
-            1 => bulk_decode!(raw, count, order, i8, i64),
-            2 => bulk_decode!(raw, count, order, i16, i64),
-            4 => bulk_decode!(raw, count, order, i32, i64),
-            8 => bulk_decode!(raw, count, order, i64, i64),
+        match elem_size.get() {
+            1 => bulk_decode!(out, raw, order, i8, i64),
+            2 => bulk_decode!(out, raw, order, i16, i64),
+            4 => bulk_decode!(out, raw, order, i32, i64),
+            8 => bulk_decode!(out, raw, order, i64, i64),
             _ => unreachable!(),
-        });
+        }
+        return Ok(());
     }
 
-    let mut result = Vec::with_capacity(count);
     for i in 0..count {
         let chunk = &raw[i * elem_size.get()..(i + 1) * elem_size.get()];
         let v = read_signed_int(chunk, elem_size.get(), &order, bit_offset, bit_precision);
-        result.push(v);
+        out.push(v);
     }
-    Ok(result)
+    Ok(())
 }
 
 /// Convert raw bytes to `u64` values.
 pub fn read_as_u64(raw: &[u8], datatype: &Datatype) -> Result<Vec<u64>, FormatError> {
+    let mut out = Vec::new();
+    read_as_u64_into(raw, datatype, &mut out)?;
+    Ok(out)
+}
+
+/// Decode `raw` and **append** the values to `out`, the appending form of
+/// [`read_as_u64`].
+///
+/// A whole-dataset typed read sweeps its dataset in row windows and decodes
+/// each window into one output buffer, so the decoders must add to a buffer
+/// rather than each produce one (issue #289).
+///
+/// On error `out` holds an unspecified prefix of this call's values: every
+/// caller abandons the buffer, and nothing else is worth the copy that
+/// avoiding it would cost.
+pub fn read_as_u64_into(
+    raw: &[u8],
+    datatype: &Datatype,
+    out: &mut Vec<u64>,
+) -> Result<(), FormatError> {
     let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FixedPoint (unsigned)")?;
     let elem_size = get_size(datatype)?;
@@ -490,30 +511,51 @@ pub fn read_as_u64(raw: &[u8], datatype: &Datatype) -> Result<Vec<u64>, FormatEr
     let count = raw.len() / elem_size;
     let order = get_byte_order(datatype);
     let (bit_offset, bit_precision) = int_bits(datatype);
+    out.reserve(count);
 
     // Fast path: standard full-width layout, bulk-decoded with zero-extension
     // (unsigned storage types reproduce `read_unsigned_int`'s magnitude).
     if is_standard_layout(elem_size.get(), &order, bit_offset, bit_precision) {
-        return Ok(match elem_size.get() {
-            1 => bulk_decode!(raw, count, order, u8, u64),
-            2 => bulk_decode!(raw, count, order, u16, u64),
-            4 => bulk_decode!(raw, count, order, u32, u64),
-            8 => bulk_decode!(raw, count, order, u64, u64),
+        match elem_size.get() {
+            1 => bulk_decode!(out, raw, order, u8, u64),
+            2 => bulk_decode!(out, raw, order, u16, u64),
+            4 => bulk_decode!(out, raw, order, u32, u64),
+            8 => bulk_decode!(out, raw, order, u64, u64),
             _ => unreachable!(),
-        });
+        }
+        return Ok(());
     }
 
-    let mut result = Vec::with_capacity(count);
     for i in 0..count {
         let chunk = &raw[i * elem_size.get()..(i + 1) * elem_size.get()];
         let v = read_unsigned_int(chunk, elem_size.get(), &order, bit_offset, bit_precision);
-        result.push(v);
+        out.push(v);
     }
-    Ok(result)
+    Ok(())
 }
 
 /// Convert raw bytes to `f32` values.
 pub fn read_as_f32(raw: &[u8], datatype: &Datatype) -> Result<Vec<f32>, FormatError> {
+    let mut out = Vec::new();
+    read_as_f32_into(raw, datatype, &mut out)?;
+    Ok(out)
+}
+
+/// Decode `raw` and **append** the values to `out`, the appending form of
+/// [`read_as_f32`].
+///
+/// A whole-dataset typed read sweeps its dataset in row windows and decodes
+/// each window into one output buffer, so the decoders must add to a buffer
+/// rather than each produce one (issue #289).
+///
+/// On error `out` holds an unspecified prefix of this call's values: every
+/// caller abandons the buffer, and nothing else is worth the copy that
+/// avoiding it would cost.
+pub fn read_as_f32_into(
+    raw: &[u8],
+    datatype: &Datatype,
+    out: &mut Vec<f32>,
+) -> Result<(), FormatError> {
     let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FloatingPoint")?;
     let elem_size = get_size(datatype)?;
@@ -526,51 +568,55 @@ pub fn read_as_f32(raw: &[u8], datatype: &Datatype) -> Result<Vec<f32>, FormatEr
     let count = raw.len() / elem_size;
     let order = get_byte_order(datatype);
     let (bit_offset, bit_precision) = int_bits(datatype);
+    out.reserve(count);
 
     // Fast path: standard full-width layout, bulk-decoded with `from_*_bytes`.
     if is_standard_layout(elem_size.get(), &order, bit_offset, bit_precision) {
         match datatype {
             Datatype::FloatingPoint { size: 4, .. } => {
-                return Ok(bulk_decode!(raw, count, order, f32, f32));
+                bulk_decode!(out, raw, order, f32, f32);
+                return Ok(());
             }
             Datatype::FloatingPoint { size: 8, .. } => {
-                return Ok(bulk_decode!(raw, count, order, f64, f32));
+                bulk_decode!(out, raw, order, f64, f32);
+                return Ok(());
             }
             Datatype::FixedPoint { signed: true, .. } => {
-                return Ok(match elem_size.get() {
-                    1 => bulk_decode!(raw, count, order, i8, f32),
-                    2 => bulk_decode!(raw, count, order, i16, f32),
-                    4 => bulk_decode!(raw, count, order, i32, f32),
-                    8 => bulk_decode!(raw, count, order, i64, f32),
+                match elem_size.get() {
+                    1 => bulk_decode!(out, raw, order, i8, f32),
+                    2 => bulk_decode!(out, raw, order, i16, f32),
+                    4 => bulk_decode!(out, raw, order, i32, f32),
+                    8 => bulk_decode!(out, raw, order, i64, f32),
                     _ => unreachable!(),
-                });
+                }
+                return Ok(());
             }
             Datatype::FixedPoint { signed: false, .. } => {
-                return Ok(match elem_size.get() {
-                    1 => bulk_decode!(raw, count, order, u8, f32),
-                    2 => bulk_decode!(raw, count, order, u16, f32),
-                    4 => bulk_decode!(raw, count, order, u32, f32),
-                    8 => bulk_decode!(raw, count, order, u64, f32),
+                match elem_size.get() {
+                    1 => bulk_decode!(out, raw, order, u8, f32),
+                    2 => bulk_decode!(out, raw, order, u16, f32),
+                    4 => bulk_decode!(out, raw, order, u32, f32),
+                    8 => bulk_decode!(out, raw, order, u64, f32),
                     _ => unreachable!(),
-                });
+                }
+                return Ok(());
             }
             _ => {}
         }
     }
 
-    let mut result = Vec::with_capacity(count);
     for i in 0..count {
         let chunk = &raw[i * elem_size.get()..(i + 1) * elem_size.get()];
         match datatype {
             Datatype::FloatingPoint { size: 4, .. } => {
-                result.push(read_f32_bytes(chunk, &order));
+                out.push(read_f32_bytes(chunk, &order));
             }
             Datatype::FloatingPoint { size: 8, .. } => {
                 #[expect(
                     clippy::cast_possible_truncation,
                     reason = "read_as_f32 narrows stored f64 values to the requested f32"
                 )]
-                result.push(read_f64_bytes(chunk, &order) as f32);
+                out.push(read_f64_bytes(chunk, &order) as f32);
             }
             Datatype::FixedPoint {
                 signed: true,
@@ -579,13 +625,10 @@ pub fn read_as_f32(raw: &[u8], datatype: &Datatype) -> Result<Vec<f32>, FormatEr
                 bit_precision,
                 ..
             } => {
-                result.push(read_signed_int(
-                    chunk,
-                    *size as usize,
-                    &order,
-                    *bit_offset,
-                    *bit_precision,
-                ) as f32);
+                out.push(
+                    read_signed_int(chunk, *size as usize, &order, *bit_offset, *bit_precision)
+                        as f32,
+                );
             }
             Datatype::FixedPoint {
                 signed: false,
@@ -594,7 +637,7 @@ pub fn read_as_f32(raw: &[u8], datatype: &Datatype) -> Result<Vec<f32>, FormatEr
                 bit_precision,
                 ..
             } => {
-                result.push(read_unsigned_int(
+                out.push(read_unsigned_int(
                     chunk,
                     *size as usize,
                     &order,
@@ -610,11 +653,31 @@ pub fn read_as_f32(raw: &[u8], datatype: &Datatype) -> Result<Vec<f32>, FormatEr
             }
         }
     }
-    Ok(result)
+    Ok(())
 }
 
 /// Convert raw bytes to `i32` values.
 pub fn read_as_i32(raw: &[u8], datatype: &Datatype) -> Result<Vec<i32>, FormatError> {
+    let mut out = Vec::new();
+    read_as_i32_into(raw, datatype, &mut out)?;
+    Ok(out)
+}
+
+/// Decode `raw` and **append** the values to `out`, the appending form of
+/// [`read_as_i32`].
+///
+/// A whole-dataset typed read sweeps its dataset in row windows and decodes
+/// each window into one output buffer, so the decoders must add to a buffer
+/// rather than each produce one (issue #289).
+///
+/// On error `out` holds an unspecified prefix of this call's values: every
+/// caller abandons the buffer, and nothing else is worth the copy that
+/// avoiding it would cost.
+pub fn read_as_i32_into(
+    raw: &[u8],
+    datatype: &Datatype,
+    out: &mut Vec<i32>,
+) -> Result<(), FormatError> {
     let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FixedPoint")?;
     let elem_size = get_size(datatype)?;
@@ -627,20 +690,21 @@ pub fn read_as_i32(raw: &[u8], datatype: &Datatype) -> Result<Vec<i32>, FormatEr
     let count = raw.len() / elem_size;
     let order = get_byte_order(datatype);
     let (bit_offset, bit_precision) = int_bits(datatype);
+    out.reserve(count);
 
     // Fast path: standard full-width layout, bulk-decoded then narrowed to i32
     // (matches `read_signed_int(..) as i32` for the full-width case).
     if is_standard_layout(elem_size.get(), &order, bit_offset, bit_precision) {
-        return Ok(match elem_size.get() {
-            1 => bulk_decode!(raw, count, order, i8, i32),
-            2 => bulk_decode!(raw, count, order, i16, i32),
-            4 => bulk_decode!(raw, count, order, i32, i32),
-            8 => bulk_decode!(raw, count, order, i64, i32),
+        match elem_size.get() {
+            1 => bulk_decode!(out, raw, order, i8, i32),
+            2 => bulk_decode!(out, raw, order, i16, i32),
+            4 => bulk_decode!(out, raw, order, i32, i32),
+            8 => bulk_decode!(out, raw, order, i64, i32),
             _ => unreachable!(),
-        });
+        }
+        return Ok(());
     }
 
-    let mut result = Vec::with_capacity(count);
     for i in 0..count {
         let chunk = &raw[i * elem_size.get()..(i + 1) * elem_size.get()];
         let v = read_signed_int(chunk, elem_size.get(), &order, bit_offset, bit_precision);
@@ -648,14 +712,34 @@ pub fn read_as_i32(raw: &[u8], datatype: &Datatype) -> Result<Vec<i32>, FormatEr
             clippy::cast_possible_truncation,
             reason = "read_as_i32 narrows each stored signed value to the requested i32"
         )]
-        result.push(v as i32);
+        out.push(v as i32);
     }
-    Ok(result)
+    Ok(())
 }
 
 /// Convert raw bytes to `i16` values (counterpart of [`read_as_i32`] for the
 /// narrower element type, used by [`crate::Dataset::read_i16`]).
 pub fn read_as_i16(raw: &[u8], datatype: &Datatype) -> Result<Vec<i16>, FormatError> {
+    let mut out = Vec::new();
+    read_as_i16_into(raw, datatype, &mut out)?;
+    Ok(out)
+}
+
+/// Decode `raw` and **append** the values to `out`, the appending form of
+/// [`read_as_i16`].
+///
+/// A whole-dataset typed read sweeps its dataset in row windows and decodes
+/// each window into one output buffer, so the decoders must add to a buffer
+/// rather than each produce one (issue #289).
+///
+/// On error `out` holds an unspecified prefix of this call's values: every
+/// caller abandons the buffer, and nothing else is worth the copy that
+/// avoiding it would cost.
+pub fn read_as_i16_into(
+    raw: &[u8],
+    datatype: &Datatype,
+    out: &mut Vec<i16>,
+) -> Result<(), FormatError> {
     let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FixedPoint")?;
     let elem_size = get_size(datatype)?;
@@ -668,15 +752,17 @@ pub fn read_as_i16(raw: &[u8], datatype: &Datatype) -> Result<Vec<i16>, FormatEr
     let count = raw.len() / elem_size;
     let order = get_byte_order(datatype);
     let (bit_offset, bit_precision) = int_bits(datatype);
+    out.reserve(count);
 
     if is_standard_layout(elem_size.get(), &order, bit_offset, bit_precision) {
-        return Ok(match elem_size.get() {
-            1 => bulk_decode!(raw, count, order, i8, i16),
-            2 => bulk_decode!(raw, count, order, i16, i16),
-            4 => bulk_decode!(raw, count, order, i32, i16),
-            8 => bulk_decode!(raw, count, order, i64, i16),
+        match elem_size.get() {
+            1 => bulk_decode!(out, raw, order, i8, i16),
+            2 => bulk_decode!(out, raw, order, i16, i16),
+            4 => bulk_decode!(out, raw, order, i32, i16),
+            8 => bulk_decode!(out, raw, order, i64, i16),
             _ => unreachable!(),
-        });
+        }
+        return Ok(());
     }
 
     // Slow path: decode wide, then narrow (matches the prior `read_i16` route
@@ -685,15 +771,33 @@ pub fn read_as_i16(raw: &[u8], datatype: &Datatype) -> Result<Vec<i16>, FormatEr
         clippy::cast_possible_truncation,
         reason = "read_as_i16 narrows each stored value to the requested i16"
     )]
-    Ok(read_as_i32(raw, datatype)?
-        .into_iter()
-        .map(|v| v as i16)
-        .collect())
+    out.extend(read_as_i32(raw, datatype)?.into_iter().map(|v| v as i16));
+    Ok(())
 }
 
 /// Convert raw bytes to `u32` values (counterpart of [`read_as_u64`] for the
 /// narrower element type, used by [`crate::Dataset::read_u32`]).
 pub fn read_as_u32(raw: &[u8], datatype: &Datatype) -> Result<Vec<u32>, FormatError> {
+    let mut out = Vec::new();
+    read_as_u32_into(raw, datatype, &mut out)?;
+    Ok(out)
+}
+
+/// Decode `raw` and **append** the values to `out`, the appending form of
+/// [`read_as_u32`].
+///
+/// A whole-dataset typed read sweeps its dataset in row windows and decodes
+/// each window into one output buffer, so the decoders must add to a buffer
+/// rather than each produce one (issue #289).
+///
+/// On error `out` holds an unspecified prefix of this call's values: every
+/// caller abandons the buffer, and nothing else is worth the copy that
+/// avoiding it would cost.
+pub fn read_as_u32_into(
+    raw: &[u8],
+    datatype: &Datatype,
+    out: &mut Vec<u32>,
+) -> Result<(), FormatError> {
     let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FixedPoint (unsigned)")?;
     let elem_size = get_size(datatype)?;
@@ -706,30 +810,50 @@ pub fn read_as_u32(raw: &[u8], datatype: &Datatype) -> Result<Vec<u32>, FormatEr
     let count = raw.len() / elem_size;
     let order = get_byte_order(datatype);
     let (bit_offset, bit_precision) = int_bits(datatype);
+    out.reserve(count);
 
     if is_standard_layout(elem_size.get(), &order, bit_offset, bit_precision) {
-        return Ok(match elem_size.get() {
-            1 => bulk_decode!(raw, count, order, u8, u32),
-            2 => bulk_decode!(raw, count, order, u16, u32),
-            4 => bulk_decode!(raw, count, order, u32, u32),
-            8 => bulk_decode!(raw, count, order, u64, u32),
+        match elem_size.get() {
+            1 => bulk_decode!(out, raw, order, u8, u32),
+            2 => bulk_decode!(out, raw, order, u16, u32),
+            4 => bulk_decode!(out, raw, order, u32, u32),
+            8 => bulk_decode!(out, raw, order, u64, u32),
             _ => unreachable!(),
-        });
+        }
+        return Ok(());
     }
 
     #[expect(
         clippy::cast_possible_truncation,
         reason = "read_as_u32 narrows each stored value to the requested u32"
     )]
-    Ok(read_as_u64(raw, datatype)?
-        .into_iter()
-        .map(|v| v as u32)
-        .collect())
+    out.extend(read_as_u64(raw, datatype)?.into_iter().map(|v| v as u32));
+    Ok(())
 }
 
 /// Convert raw bytes to `u16` values (counterpart of [`read_as_u64`] for the
 /// narrower element type, used by [`crate::Dataset::read_u16`]).
 pub fn read_as_u16(raw: &[u8], datatype: &Datatype) -> Result<Vec<u16>, FormatError> {
+    let mut out = Vec::new();
+    read_as_u16_into(raw, datatype, &mut out)?;
+    Ok(out)
+}
+
+/// Decode `raw` and **append** the values to `out`, the appending form of
+/// [`read_as_u16`].
+///
+/// A whole-dataset typed read sweeps its dataset in row windows and decodes
+/// each window into one output buffer, so the decoders must add to a buffer
+/// rather than each produce one (issue #289).
+///
+/// On error `out` holds an unspecified prefix of this call's values: every
+/// caller abandons the buffer, and nothing else is worth the copy that
+/// avoiding it would cost.
+pub fn read_as_u16_into(
+    raw: &[u8],
+    datatype: &Datatype,
+    out: &mut Vec<u16>,
+) -> Result<(), FormatError> {
     let datatype = effective_numeric(datatype);
     ensure_numeric(datatype, "FixedPoint (unsigned)")?;
     let elem_size = get_size(datatype)?;
@@ -742,25 +866,25 @@ pub fn read_as_u16(raw: &[u8], datatype: &Datatype) -> Result<Vec<u16>, FormatEr
     let count = raw.len() / elem_size;
     let order = get_byte_order(datatype);
     let (bit_offset, bit_precision) = int_bits(datatype);
+    out.reserve(count);
 
     if is_standard_layout(elem_size.get(), &order, bit_offset, bit_precision) {
-        return Ok(match elem_size.get() {
-            1 => bulk_decode!(raw, count, order, u8, u16),
-            2 => bulk_decode!(raw, count, order, u16, u16),
-            4 => bulk_decode!(raw, count, order, u32, u16),
-            8 => bulk_decode!(raw, count, order, u64, u16),
+        match elem_size.get() {
+            1 => bulk_decode!(out, raw, order, u8, u16),
+            2 => bulk_decode!(out, raw, order, u16, u16),
+            4 => bulk_decode!(out, raw, order, u32, u16),
+            8 => bulk_decode!(out, raw, order, u64, u16),
             _ => unreachable!(),
-        });
+        }
+        return Ok(());
     }
 
     #[expect(
         clippy::cast_possible_truncation,
         reason = "read_as_u16 narrows each stored value to the requested u16"
     )]
-    Ok(read_as_u64(raw, datatype)?
-        .into_iter()
-        .map(|v| v as u16)
-        .collect())
+    out.extend(read_as_u64(raw, datatype)?.into_iter().map(|v| v as u16));
+    Ok(())
 }
 
 /// Read fixed-length strings from raw bytes.

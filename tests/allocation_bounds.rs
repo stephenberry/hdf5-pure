@@ -262,6 +262,100 @@ fn whole_read_of_adjacent_chunks_costs_a_constant_per_chunk() {
     );
 }
 
+/// A typed whole-dataset read costs its output, not its output *and* a whole
+/// copy of the stored bytes beside it.
+///
+/// Decoding used to be a `read_raw` followed by a conversion of the entire
+/// buffer, so both were live at once and the peak was twice the dataset: a
+/// caller reading a 4 GiB array needed 8 GiB (issue #289). What replaced it
+/// sweeps row windows, and both figures below say so — the peak because only one
+/// window of stored bytes stands beside the output, and the byte total because
+/// each window is decoded straight into that output rather than into a buffer
+/// that is then copied into it.
+///
+/// The fixture is the one [`whole_read_of_adjacent_chunks_costs_a_constant_per_chunk`]
+/// reads raw, at the same stored width as the requested type, so "the dataset"
+/// is one figure for both the stored bytes and the decoded values and the two
+/// tests are directly comparable. The margin is a quarter of the dataset against
+/// a window of one mebibyte — an eighth of it — so a window budget that grew
+/// with the dataset instead of staying constant would fail this, and so would a
+/// return to reading whole.
+#[test]
+fn typed_whole_read_costs_its_output_and_a_window() {
+    // 8 MiB of f64 in 4 KiB chunks, read as `f64`: output and stored bytes are
+    // the same size, so one constant names both.
+    const N0: usize = 1024 * 1024;
+    const DATASET_BYTES: usize = N0 * 8;
+    const CHUNK_ELEMS: usize = 512;
+
+    let data: Vec<f64> = (0..N0).map(|i| i as f64).collect();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.h5");
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("t")
+        .with_f64_data(&data)
+        .with_shape(&[N0 as u64])
+        .with_chunks(&[CHUNK_ELEMS as u64]);
+    builder.write(&path).unwrap();
+    drop(data);
+
+    let file = File::open_streaming(&path).unwrap();
+    let ds = file.dataset("t").unwrap();
+
+    let (values, measured) = measure("typed_whole_read", || ds.read_f64().unwrap());
+
+    assert!(
+        measured.peak_bytes < (DATASET_BYTES + DATASET_BYTES / 4) as u64,
+        "peak allocation during a typed whole read must be its output plus a \
+         window, not a second copy of the {DATASET_BYTES}-byte dataset; \
+         measured {measured}"
+    );
+
+    // Bytes *ever* allocated, which the peak cannot see: a window decoded into a
+    // fresh `Vec` and then appended to the output, or a chunk copied into a
+    // cache that has no room for it, costs the whole dataset over again without
+    // moving the high-water mark at all. Two copies are what this read is
+    // entitled to — its output, and the stored bytes it sweeps past one window
+    // at a time — plus the span buffer each window refills, so the bound is
+    // placed where a *third* would put it.
+    assert!(
+        measured.bytes < (3 * DATASET_BYTES) as u64,
+        "a typed whole read must allocate its output and one sweep of the \
+         stored bytes, not a third copy of either; measured {measured} against \
+         a {DATASET_BYTES}-byte dataset"
+    );
+
+    // Per-chunk *count*, which neither byte figure can see, and the axis a sweep
+    // is most easily made quadratic on: a window that takes the whole chunk
+    // index out of the cache to find the chunks it overlaps allocates per chunk
+    // of the *dataset* per window, and this read visits each chunk once through
+    // eight windows.
+    const BLOCKS_PER_CHUNK: u64 = 5;
+    const CHUNKS: u64 = (N0 / CHUNK_ELEMS) as u64;
+    assert!(
+        measured.blocks <= BLOCKS_PER_CHUNK * CHUNKS + 256,
+        "a typed whole read must cost a small constant number of allocations \
+         per chunk, not one per chunk per window: measured {measured} over \
+         {CHUNKS} chunks, above the {BLOCKS_PER_CHUNK} per chunk this bound allows"
+    );
+
+    // The values this read returned are in the measurement, so their size is a
+    // floor a measurement of nothing cannot reach.
+    assert!(
+        measured.live_bytes >= DATASET_BYTES as u64,
+        "the values this read returned are not in its own measurement, so the \
+         bounds above are bounding something other than the read: {measured}"
+    );
+
+    // The values must still be the right ones, in the right order — a sweep that
+    // lost or repeated a window would pass every bound above.
+    assert_eq!(values.len(), N0);
+    assert_eq!(values[0], 0.0);
+    assert_eq!(values[N0 / 2], (N0 / 2) as f64);
+    assert_eq!(values[N0 - 1], (N0 - 1) as f64);
+}
+
 /// Writing a chunked dataset costs a constant per chunk, and about one copy of
 /// the data beyond the one the caller handed over.
 ///
