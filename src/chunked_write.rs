@@ -164,12 +164,14 @@ impl ChunkOptions {
     /// the ZFP filter is active — they're embedded into the ZFP cd_values so the
     /// resulting file is readable by the reference H5Z-ZFP plugin.
     ///
-    /// `fill` is the dataset's fill value, one element in its own byte order,
-    /// and `None` the library default. Scale-offset records it in its
+    /// `fill` is the dataset's fill value. Scale-offset records it in its
     /// parameters, so it is part of the pipeline rather than of the data: the
     /// same dataset written with and without a fill value carries two different
     /// filters, and the encoder diverts elements equal to that value to a
-    /// reserved sentinel.
+    /// reserved sentinel. It is consulted only by the filter that records it,
+    /// so a pattern that could not be read
+    /// ([`FormatError::UnreadableFillValue`]) refuses a scale-offset pipeline
+    /// and leaves every other one buildable.
     ///
     /// Returns [`FormatError::UnsupportedZfp`] when ZFP was requested but the
     /// context's element type is `None` (e.g. the dataset's datatype isn't one
@@ -182,7 +184,7 @@ impl ChunkOptions {
     pub fn build_pipeline(
         &self,
         ctx: &ChunkContext<'_>,
-        fill: Option<&[u8]>,
+        fill: FillPattern<'_>,
     ) -> Result<Option<FilterPipeline>, FormatError> {
         self.refuse_conflicting_filters()?;
 
@@ -235,7 +237,7 @@ impl ChunkOptions {
                     ty,
                     element_size,
                     nelmts,
-                    self.scale_offset_fill.with_value(fill),
+                    self.scale_offset_fill.with_value(fill.element()?),
                 )?,
             });
         }
@@ -2254,10 +2256,9 @@ pub(crate) fn compress_chunks(
 ) -> Result<CompressedChunkSet, FormatError> {
     let chunk_dims = ctx.chunk_dims;
     let element_size = nonzero_usize_from(ctx.element_size)?;
-    // The fill value is part of the scale-offset filter's parameters, so the
-    // pipeline is built from the same pattern the unwritten slots are padded
-    // with. An unreadable one refuses here rather than being recorded as zero.
-    let pipeline = options.build_pipeline(&ctx, fill.element()?)?;
+    // The same pattern the unwritten slots are padded with: a filter that
+    // records the fill value has to record the one this write pads with.
+    let pipeline = options.build_pipeline(&ctx, fill)?;
 
     // Decided from the geometry alone, and decided first: it is the step that
     // refuses a maximum shape needing an index this writer will not emit, and
@@ -3743,8 +3744,9 @@ mod tests {
     #[test]
     fn the_scale_offset_fill_availability_reaches_the_filter_parameters() {
         let ctx = f64_ctx(&[8]);
+        let elem = NonZeroUsize::new(8).expect("8 is non-zero");
         let fill = 2.5f64.to_le_bytes();
-        let parms = |fill_availability, fill: Option<&[u8]>| {
+        let parms = |fill_availability, fill: FillPattern<'_>| {
             let options = ChunkOptions {
                 scale_offset: Some(ScaleOffset::FloatDScale(2)),
                 scale_offset_fill: fill_availability,
@@ -3763,13 +3765,42 @@ mod tests {
         // 2.5 as an `f64` bit pattern, split across the two entries.
         let bits = 2.5f64.to_bits();
         assert_eq!(
-            parms(FillAvailability::Defined, Some(&fill)),
+            parms(
+                FillAvailability::Defined,
+                FillPattern::new(Some(&fill), elem)
+            ),
             (1, bits as u32, (bits >> 32) as u32)
         );
         // The library default is a defined fill value of zero.
-        assert_eq!(parms(FillAvailability::Defined, None), (1, 0, 0));
+        assert_eq!(
+            parms(FillAvailability::Defined, FillPattern::ZERO),
+            (1, 0, 0)
+        );
         // Undefined records neither, even when a fill value is available.
-        assert_eq!(parms(FillAvailability::Undefined, Some(&fill)), (0, 0, 0));
+        assert_eq!(
+            parms(
+                FillAvailability::Undefined,
+                FillPattern::new(Some(&fill), elem)
+            ),
+            (0, 0, 0)
+        );
+        // And a fill value that could not be read refuses the pipeline rather
+        // than recording a zero the encoder would treat every real zero as.
+        let options = ChunkOptions {
+            scale_offset: Some(ScaleOffset::FloatDScale(2)),
+            ..Default::default()
+        };
+        assert!(matches!(
+            options.build_pipeline(&ctx, FillPattern::UNKNOWN),
+            Err(FormatError::UnreadableFillValue)
+        ));
+        // Every other pipeline is buildable from the same pattern: only the
+        // filter that records the fill value needs to read it.
+        let plain = ChunkOptions {
+            deflate_level: Some(6),
+            ..Default::default()
+        };
+        assert!(plain.build_pipeline(&ctx, FillPattern::UNKNOWN).is_ok());
     }
 
     #[test]
@@ -3779,7 +3810,7 @@ mod tests {
             ..Default::default()
         };
         let pl = options
-            .build_pipeline(&ChunkContext::basic(&[], 8), None)
+            .build_pipeline(&ChunkContext::basic(&[], 8), FillPattern::ZERO)
             .unwrap()
             .unwrap();
         assert_eq!(pl.filters.len(), 1);
@@ -3795,7 +3826,7 @@ mod tests {
             ..Default::default()
         };
         let pl = options
-            .build_pipeline(&ChunkContext::basic(&[], 8), None)
+            .build_pipeline(&ChunkContext::basic(&[], 8), FillPattern::ZERO)
             .unwrap()
             .unwrap();
         assert_eq!(pl.filters.len(), 3);
@@ -3884,7 +3915,7 @@ mod tests {
             // also wrong would pass an `is_err()` check while leaving the
             // combination itself unrefused.
             let err = options
-                .build_pipeline(&f64_ctx(&[64]), None)
+                .build_pipeline(&f64_ctx(&[64]), FillPattern::ZERO)
                 .expect_err("{a} + {b} was accepted");
             let FormatError::FilterError(msg) = &err else {
                 panic!("{a} + {b}: expected a filter error, got {err}");
@@ -3963,7 +3994,7 @@ mod tests {
 
         for (options, expected) in cases {
             let pl = options
-                .build_pipeline(&f64_ctx(&[64]), None)
+                .build_pipeline(&f64_ctx(&[64]), FillPattern::ZERO)
                 .unwrap()
                 .unwrap();
             let ids: Vec<u16> = pl.filters.iter().map(|f| f.filter_id).collect();

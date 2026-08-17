@@ -7397,7 +7397,13 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
         let chunk_dims = db.chunk_options.resolve_chunk_dims(&shape);
         let ctx = ChunkContext::from_datatype(&chunk_dims, &dt)?;
         db.chunk_options
-            .build_pipeline(&ctx, db.fill.as_deref())
+            .build_pipeline(
+                &ctx,
+                crate::fill_value::FillPattern::new(
+                    db.fill.as_deref(),
+                    crate::convert::nonzero_usize_from(ctx.element_size)?,
+                ),
+            )
             .map_err(|_| {
                 Error::EditUnsupported(
                     "this dataset's filter pipeline cannot be added in place \

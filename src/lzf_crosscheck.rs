@@ -121,7 +121,7 @@ fn writer_pipeline_matches_h5py() {
         let pipeline = options
             .build_pipeline(
                 &crate::filters::ChunkContext::basic(&fix.chunk_shape, fix.element_size()),
-                None,
+                crate::fill_value::FillPattern::ZERO,
             )
             .unwrap_or_else(|e| panic!("{}: build_pipeline: {e:?}", fix.name))
             .unwrap_or_else(|| panic!("{}: writer produced no pipeline", fix.name));
