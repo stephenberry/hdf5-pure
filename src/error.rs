@@ -134,8 +134,11 @@ pub enum FormatError {
     InvalidLayoutVersion(u8),
     /// Invalid data layout class.
     InvalidLayoutClass(u8),
-    /// No data allocated for contiguous layout.
-    NoDataAllocated,
+    /// The dataset's Fill Value message could not be parsed, and a read needed
+    /// it: part of the dataset's storage was never allocated, so what those
+    /// elements read as is undetermined. A dataset whose storage is fully
+    /// allocated reads normally regardless of this message.
+    UnreadableFillValue,
     /// Type mismatch when reading data.
     TypeMismatch {
         /// Expected type description.
@@ -647,9 +650,11 @@ impl fmt::Display for FormatError {
             FormatError::InvalidLayoutClass(c) => {
                 write!(f, "invalid data layout class: {c}")
             }
-            FormatError::NoDataAllocated => {
-                write!(f, "no data allocated for contiguous layout")
-            }
+            FormatError::UnreadableFillValue => write!(
+                f,
+                "the dataset's fill value message could not be parsed, and part of its \
+                 storage was never allocated, so those elements have no determined value"
+            ),
             FormatError::TypeMismatch { expected, actual } => {
                 write!(f, "type mismatch: expected {expected}, got {actual}")
             }

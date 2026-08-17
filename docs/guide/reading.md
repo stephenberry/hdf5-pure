@@ -166,6 +166,21 @@ Only the storage the window touches is read: a single bounded sub-read for compa
 
 Combined with a [streaming open](streaming.md#reading-a-large-dataset-a-window-at-a-time), this reads a dataset too large to hold in memory a fixed number of rows at a time.
 
+### Datasets with unwritten storage
+
+HDF5 allocates a dataset's storage lazily, so a dataset can exist with a shape and have nothing behind it — created and never written, or written in part, leaving some chunks of a chunked dataset allocated and others not. Those regions read as the dataset's **fill value**: the value `with_fill_value` set, or the type's zero when none was set. This matches the reference C library, and it means a dataset another tool created but has not filled in yet reads as a full-size array of its fill value rather than failing.
+
+`Dataset::fill_value::<T>()` reports the value itself, returning `None` when the dataset uses the library default.
+
+```rust
+use hdf5_pure::File;
+
+let file = File::open("schema.h5").unwrap();
+let ds = file.dataset("pending").unwrap();
+assert_eq!(ds.fill_value::<f64>().unwrap(), Some(-1.0));
+let values = ds.read_f64().unwrap(); // every element is -1.0 until something writes
+```
+
 ## Navigating groups and attributes
 
 `File::root()` returns the root `Group`, and `File::group(path)` resolves a subgroup by path. A `Group` lists its children with `groups()` and `datasets()` (each returning `Vec<String>` of names), opens a child dataset with `dataset(name)`, and opens a child subgroup with `group(name)`.
