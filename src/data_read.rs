@@ -82,7 +82,7 @@ pub fn read_raw_data_full(
             // allocation a chunked dataset gets, and the reference C library
             // reads it as the fill value rather than refusing it.
             let Some(addr) = *address else {
-                return Ok(fill.buffer(expected_size));
+                return fill.buffer(expected_size);
             };
             let r = slice_range(addr, *size)?;
             let sz = r.end - r.start;
@@ -210,7 +210,7 @@ pub fn read_raw_data_full_from_source<S: Source + ?Sized>(
             // Unallocated contiguous storage reads as the fill value; see the
             // buffered reader's matching arm.
             let Some(addr) = *address else {
-                return Ok(fill.buffer(expected_size));
+                return fill.buffer(expected_size);
             };
             let sz = (*size).to_usize()?;
             if sz != expected_size {

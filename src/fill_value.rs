@@ -42,12 +42,37 @@ use crate::message_type::MessageType;
 pub(crate) struct FillPattern<'a> {
     /// Exactly one element's worth of fill bytes, or `None` for zeros.
     element: Option<&'a [u8]>,
+    /// The Fill Value message could not be parsed, so what unallocated storage
+    /// reads as is unknown. Distinct from `element: None`, which is a *known*
+    /// zero: see [`FillPattern::UNKNOWN`].
+    unknown: bool,
 }
 
 impl<'a> FillPattern<'a> {
     /// The implicit zero: what a dataset with no user-defined fill value reads
     /// as, and the conservative answer whenever a fill value cannot be used.
-    pub(crate) const ZERO: Self = Self { element: None };
+    pub(crate) const ZERO: Self = Self {
+        element: None,
+        unknown: false,
+    };
+
+    /// The dataset's Fill Value message could not be parsed, so what its
+    /// unallocated storage reads as is unknown.
+    ///
+    /// This is deliberately *not* the zero pattern. Reading unallocated storage
+    /// through it fails, because zeros would be a fabricated answer — but a
+    /// dataset whose storage is fully allocated never consults the pattern, so
+    /// it keeps reading exactly as it did before the fill path existed. That
+    /// matters for forward compatibility: a future Fill Value message version
+    /// this parser does not know would otherwise make every dataset in the file
+    /// unreadable, including ones whose bytes are all present.
+    ///
+    /// [`crate::Dataset::fill_value`] still surfaces the underlying parse error
+    /// to a caller who asks about the value itself.
+    pub(crate) const UNKNOWN: Self = Self {
+        element: None,
+        unknown: true,
+    };
 
     /// The pattern for a dataset whose Fill Value message carried `bytes`, over
     /// a datatype of `elem_size` bytes per element.
@@ -61,9 +86,10 @@ impl<'a> FillPattern<'a> {
     /// storage *is* allocated reading exactly as it did before.
     pub(crate) fn new(bytes: Option<&'a [u8]>, elem_size: NonZeroUsize) -> Self {
         match bytes {
-            Some(b) if b.len() == elem_size.get() && b.iter().any(|&x| x != 0) => {
-                Self { element: Some(b) }
-            }
+            Some(b) if b.len() == elem_size.get() && b.iter().any(|&x| x != 0) => Self {
+                element: Some(b),
+                unknown: false,
+            },
             // An all-zero fill value is the zero pattern; saying so here keeps
             // every buffer that would tile zeros on the plain allocation path.
             _ => Self::ZERO,
@@ -75,10 +101,13 @@ impl<'a> FillPattern<'a> {
     /// `len` is a whole number of elements at every call site; a trailing
     /// partial element would simply be filled with the pattern's prefix rather
     /// than misaligned or panicking.
-    pub(crate) fn buffer(self, len: usize) -> Vec<u8> {
+    pub(crate) fn buffer(self, len: usize) -> Result<Vec<u8>, FormatError> {
+        if self.unknown {
+            return Err(FormatError::UnreadableFillValue);
+        }
         let mut buf = vec![0u8; len];
         self.apply(&mut buf);
-        buf
+        Ok(buf)
     }
 
     /// Tile the pattern across `buf`, which must begin on an element boundary.
@@ -87,9 +116,10 @@ impl<'a> FillPattern<'a> {
         let Some(element) = self.element else {
             return;
         };
+        // `chunks_mut` bounds each slot to what remains, so a trailing partial
+        // element takes the pattern's prefix rather than needing a guard.
         for slot in buf.chunks_mut(element.len()) {
-            let n = slot.len().min(element.len());
-            slot[..n].copy_from_slice(&element[..n]);
+            slot.copy_from_slice(&element[..slot.len()]);
         }
     }
 }
@@ -107,6 +137,51 @@ const V3_FLAGS_DEFAULT: u8 = 0x0a;
 /// library, which writes flags `0x2a` (`V3_FLAGS_DEFAULT | V3_FLAG_DEFINED`) for
 /// a contiguous dataset with a user-defined fill value.
 const V3_FLAG_DEFINED: u8 = 0x20;
+
+/// The *Fill Value Write Time* value meaning **Never** (`H5D_FILL_TIME_NEVER`):
+/// the library never writes the fill value into storage, so unallocated storage
+/// reads as zeros however the value itself is defined.
+///
+/// It lives in bits 2-3 of the version-3 flags byte and in byte 2 of the
+/// version-1/2 layout. `H5D_FILL_TIME_ALLOC` is 0 and `H5D_FILL_TIME_IFSET`
+/// (the default both this crate and the C library write) is 2; only *Never*
+/// changes what a read of unallocated storage sees, so it is the only one named.
+const FILL_TIME_NEVER: u8 = 1;
+
+/// Whether the fill value would ever be written into storage, for the read path
+/// that has to decide what unallocated storage looks like.
+///
+/// Returns `false` for a message whose *Fill Value Write Time* is `Never`, which
+/// the reference C library honors over the value: with `H5Pset_fill_time` set to
+/// `H5D_FILL_TIME_NEVER` and a fill value of 7, an unwritten dataset reads back
+/// as zeros, and so does the unwritten tail of a partly written one. Reading the
+/// declared value there would fabricate data the file says was never put in it.
+///
+/// A malformed or unrecognized message errors rather than guessing; a legacy
+/// `0x0004` message carries no write time and is treated as written, which is
+/// the only behavior that format can express.
+pub(crate) fn fill_value_is_written(
+    msg_type: MessageType,
+    data: &[u8],
+) -> Result<bool, FormatError> {
+    match msg_type {
+        MessageType::FillValueOld => Ok(true),
+        MessageType::FillValue => {
+            let version = *data.first().ok_or(eof(1, data.len()))?;
+            match version {
+                // Versions 1 and 2 give the write time a byte of its own.
+                1 | 2 => Ok(*data.get(2).ok_or(eof(3, data.len()))? != FILL_TIME_NEVER),
+                // Version 3 packs it into bits 2-3 of the flags byte.
+                3 => {
+                    let flags = *data.get(1).ok_or(eof(2, data.len()))?;
+                    Ok((flags >> 2) & 0b11 != FILL_TIME_NEVER)
+                }
+                other => Err(FormatError::UnsupportedFillValueVersion(other)),
+            }
+        }
+        _ => Ok(true),
+    }
+}
 
 /// Serialize the body of a version-3 Fill Value message ([`MessageType::FillValue`]).
 ///
@@ -215,6 +290,111 @@ pub(crate) fn parse_defined_fill_value(
         }
         // Not a fill value message; nothing to extract.
         _ => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod fill_pattern_tests {
+    use super::*;
+    use crate::convert::nz;
+
+    /// The pattern tiles one element's bytes across a buffer of whole elements.
+    #[test]
+    fn a_defined_fill_tiles_across_the_buffer() {
+        let seven = 7.0f64.to_le_bytes();
+        let p = FillPattern::new(Some(&seven), nz(8));
+        assert_eq!(p.buffer(24).unwrap(), seven.repeat(3));
+        // A pattern with interior zero bytes must not be mistaken for the zero
+        // pattern: only an *all*-zero value is.
+        assert!(seven.iter().filter(|&&b| b == 0).count() >= 6);
+    }
+
+    /// A fill value whose length is not the element size is malformed. It is
+    /// dropped rather than tiled, because tiling it would shift every element
+    /// after the first — a wrong answer instead of a missing one.
+    #[test]
+    fn a_fill_value_of_the_wrong_width_is_dropped() {
+        for bytes in [vec![1u8], vec![1, 2, 3], vec![1; 9], Vec::new()] {
+            let p = FillPattern::new(Some(&bytes), nz(8));
+            assert_eq!(
+                p.buffer(16).unwrap(),
+                vec![0u8; 16],
+                "a {}-byte fill over an 8-byte element must not tile",
+                bytes.len()
+            );
+        }
+    }
+
+    /// An all-zero fill value *is* the zero pattern, and says so, so every
+    /// buffer that would tile zeros stays on the plain allocation path.
+    #[test]
+    fn an_all_zero_fill_is_the_zero_pattern() {
+        assert_eq!(
+            FillPattern::new(Some(&[0u8; 8]), nz(8)).buffer(16).unwrap(),
+            vec![0u8; 16]
+        );
+        assert_eq!(
+            FillPattern::new(None, nz(8)).buffer(16).unwrap(),
+            vec![0u8; 16]
+        );
+        assert_eq!(FillPattern::ZERO.buffer(16).unwrap(), vec![0u8; 16]);
+    }
+
+    /// A single-byte element is the degenerate tiling case, and a zero-length
+    /// buffer must not panic.
+    #[test]
+    fn single_byte_elements_and_empty_buffers() {
+        let p = FillPattern::new(Some(&[0xAB]), nz(1));
+        assert_eq!(p.buffer(5).unwrap(), vec![0xAB; 5]);
+        assert_eq!(p.buffer(0).unwrap(), Vec::<u8>::new());
+    }
+
+    /// An unreadable fill value message is not the zero pattern: materializing
+    /// it fails rather than fabricating zeros. A dataset that never needs the
+    /// pattern — because all of its storage is allocated — never calls this, and
+    /// so reads normally.
+    #[test]
+    fn an_unknown_fill_refuses_to_materialize() {
+        assert!(matches!(
+            FillPattern::UNKNOWN.buffer(16),
+            Err(FormatError::UnreadableFillValue)
+        ));
+        // Length zero is still a refusal: the question is whether the value is
+        // known, not how much of it was asked for.
+        assert!(FillPattern::UNKNOWN.buffer(0).is_err());
+        assert!(FillPattern::ZERO.buffer(0).is_ok());
+    }
+
+    /// The Fill Value Write Time decides whether unallocated storage sees the
+    /// value at all, and it is read from a different field in each version.
+    #[test]
+    fn the_write_time_is_read_from_every_message_version() {
+        // Version 3: bits 2-3 of the flags byte. 0x26 is Late alloc + Never +
+        // Defined, which is what the C library writes for `H5D_FILL_TIME_NEVER`
+        // with a value set; 0x2a is the same but IfSet.
+        let v3 = |flags: u8| vec![3u8, flags, 4, 0, 0, 0, 7, 0, 0, 0];
+        assert!(!fill_value_is_written(MessageType::FillValue, &v3(0x26)).unwrap());
+        assert!(fill_value_is_written(MessageType::FillValue, &v3(0x2a)).unwrap());
+        assert!(fill_value_is_written(MessageType::FillValue, &v3(0x22)).unwrap());
+
+        // Versions 1 and 2: a byte of its own at index 2.
+        for version in [1u8, 2] {
+            let msg = |write_time: u8| vec![version, 2, write_time, 1, 4, 0, 0, 0, 7, 0, 0, 0];
+            assert!(!fill_value_is_written(MessageType::FillValue, &msg(1)).unwrap());
+            assert!(fill_value_is_written(MessageType::FillValue, &msg(0)).unwrap());
+            assert!(fill_value_is_written(MessageType::FillValue, &msg(2)).unwrap());
+        }
+
+        // The legacy message has no write time to read.
+        assert!(
+            fill_value_is_written(MessageType::FillValueOld, &[4, 0, 0, 0, 7, 0, 0, 0]).unwrap()
+        );
+
+        // Truncated and unrecognized messages error rather than guessing.
+        assert!(fill_value_is_written(MessageType::FillValue, &[]).is_err());
+        assert!(fill_value_is_written(MessageType::FillValue, &[3]).is_err());
+        assert!(fill_value_is_written(MessageType::FillValue, &[2, 0]).is_err());
+        assert!(fill_value_is_written(MessageType::FillValue, &[9, 0]).is_err());
     }
 }
 

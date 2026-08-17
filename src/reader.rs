@@ -1582,7 +1582,7 @@ fn read_rows_framed<S: Source + ?Sized>(
             // answer the whole-dataset readers give for it.
             let Some(addr) = *address else {
                 let len = num_rows.to_usize()?.saturating_mul(row_bytes);
-                return Ok(fill.buffer(len));
+                return fill.buffer(len);
             };
             let start =
                 start_row
@@ -3739,15 +3739,39 @@ impl Dataset {
         }
     }
 
-    /// The dataset's user-defined fill value bytes, as
-    /// [`defined_fill_bytes`](Self::defined_fill_bytes), for the read paths that
-    /// have to materialize unallocated storage.
+    /// The fill bytes that *unallocated storage reads as* — which is not the
+    /// same question [`defined_fill_bytes`](Self::defined_fill_bytes) answers.
     ///
-    /// Named apart from the public `fill_value` accessor because it answers a
-    /// different question: `fill_value` decodes the value for a caller, this
-    /// hands the raw element bytes to [`FillPattern`].
+    /// A dataset may declare a fill value and also declare, through the Fill
+    /// Value Write Time, that the library never writes it
+    /// (`H5D_FILL_TIME_NEVER`). The reference C library honors the write time
+    /// over the value: such a dataset reads back as zeros where nothing was
+    /// written, however the value is defined. `fill_value` still reports the
+    /// declared value, because it *is* declared; this returns `None` for it,
+    /// because materializing it would fabricate data the file says was never
+    /// put there.
     fn fill_bytes(&self) -> Result<Option<Vec<u8>>, Error> {
-        self.defined_fill_bytes()
+        let msg = self
+            .header
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::FillValue)
+            .or_else(|| {
+                self.header
+                    .messages
+                    .iter()
+                    .find(|m| m.msg_type == MessageType::FillValueOld)
+            });
+        let Some(m) = msg else {
+            return Ok(None);
+        };
+        let body = self.file.message_body(m)?;
+        if !crate::fill_value::fill_value_is_written(m.msg_type, &body)? {
+            return Ok(None);
+        }
+        Ok(crate::fill_value::parse_defined_fill_value(
+            m.msg_type, &body,
+        )?)
     }
 
     /// Read all data as `f64` values.
@@ -4298,15 +4322,19 @@ impl Dataset {
         // contiguous and chunked layouts) by reading from a base-relative view of
         // the file.
         let pipeline = self.filter_pipeline_parsed();
-        let fill = self.fill_bytes()?;
-        Ok(self.file.read_dataset_raw(
-            &dl,
-            &ds,
-            &dt,
-            pipeline.as_ref(),
-            FillPattern::new(fill.as_deref(), dt.element_size_usize()?),
-            &self.chunk_cache,
-        )?)
+        // A fill value message this parser cannot read does not, by itself,
+        // make the dataset unreadable: it only decides what *unallocated*
+        // storage looks like. Carry the uncertainty into the read and let it
+        // fail there, and only there. `Dataset::fill_value` still reports the
+        // parse error to a caller asking about the value.
+        let fill_bytes = self.fill_bytes();
+        let fill = match &fill_bytes {
+            Ok(b) => FillPattern::new(b.as_deref(), dt.element_size_usize()?),
+            Err(_) => FillPattern::UNKNOWN,
+        };
+        Ok(self
+            .file
+            .read_dataset_raw(&dl, &ds, &dt, pipeline.as_ref(), fill, &self.chunk_cache)?)
     }
 
     /// Read the raw element bytes of the row window `[start_row, start_row + num_rows)`
@@ -4338,8 +4366,13 @@ impl Dataset {
 
         // A window covering every row is exactly a whole read: delegate, so it
         // never costs a window-shaped copy on top of one.
-        let fill_bytes = self.fill_bytes()?;
-        let fill = FillPattern::new(fill_bytes.as_deref(), dt.element_size_usize()?);
+        // See `read_raw`: an unparseable fill value message is carried into the
+        // read rather than failing it up front.
+        let parsed_fill = self.fill_bytes();
+        let fill = match &parsed_fill {
+            Ok(b) => FillPattern::new(b.as_deref(), dt.element_size_usize()?),
+            Err(_) => FillPattern::UNKNOWN,
+        };
 
         if start == 0 && count == n0 {
             let pipeline = self.filter_pipeline_parsed();

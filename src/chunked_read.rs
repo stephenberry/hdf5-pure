@@ -583,7 +583,7 @@ fn chunk_index_address(
             offset: dataspace.num_elements(),
             length: elem_size.get() as u64,
         })?;
-    Ok(Err(fill.buffer(total)))
+    Ok(Err(fill.buffer(total)?))
 }
 
 /// Read a chunked dataset from a [`Source`], reading the chunk index and
@@ -668,7 +668,7 @@ pub fn read_chunked_data_from_source<S: Source + ?Sized>(
             offset: num_elements,
             length: elem_size.get() as u64,
         })?;
-    Ok(assemble_chunks(
+    assemble_chunks(
         &chunks,
         &decompressed_chunks,
         rank,
@@ -677,7 +677,7 @@ pub fn read_chunked_data_from_source<S: Source + ?Sized>(
         elem_size,
         total_bytes,
         fill,
-    ))
+    )
 }
 
 /// Put a dataset's chunks in address order, which is the order a coalescing
@@ -810,7 +810,7 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
             length: row_bytes as u64,
         })?;
     // Uncovered bytes are unallocated storage; see `assemble_chunks`.
-    let mut output = fill.buffer(total_bytes);
+    let mut output = fill.buffer(total_bytes)?;
     if total_bytes == 0 {
         return Ok(Some(output));
     }
@@ -1103,7 +1103,7 @@ pub fn read_chunked_data_cached_from_source<S: Source + ?Sized>(
                 length: elem_size.get() as u64,
             })?;
     // Uncovered bytes are unallocated storage; see `assemble_chunks`.
-    let mut output = fill.buffer(total_bytes);
+    let mut output = fill.buffer(total_bytes)?;
 
     let mut ds_strides = vec![1usize; rank];
     for i in (0..rank.saturating_sub(1)).rev() {
@@ -1630,12 +1630,12 @@ fn assemble_chunks(
     elem_size: NonZeroUsize,
     total_bytes: usize,
     fill: FillPattern<'_>,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, FormatError> {
     // Whatever no chunk writes over is storage that was never allocated, so the
     // buffer starts as the fill pattern rather than as zeros. A sparse chunk
     // grid — some chunks written, others never — is the case this covers that a
     // zeroed buffer got silently wrong.
-    let mut output = fill.buffer(total_bytes);
+    let mut output = fill.buffer(total_bytes)?;
 
     let mut ds_strides = vec![1usize; rank];
     for i in (0..rank.saturating_sub(1)).rev() {
@@ -1672,7 +1672,7 @@ fn assemble_chunks(
         );
     }
 
-    output
+    Ok(output)
 }
 
 /// Read a chunked dataset with caching support.
@@ -1812,7 +1812,7 @@ pub fn read_chunked_data_cached(
     let total_elements = dataspace.num_elements().to_usize()?;
     let total_bytes = total_elements * elem_size.get();
     // Uncovered bytes are unallocated storage; see `assemble_chunks`.
-    let mut output = fill.buffer(total_bytes);
+    let mut output = fill.buffer(total_bytes)?;
 
     let mut ds_strides = vec![1usize; rank];
     for i in (0..rank.saturating_sub(1)).rev() {
@@ -2051,6 +2051,85 @@ mod tests {
         // A geometry whose product overflows u64 is refused, not wrapped.
         assert!(
             ensure_chunk_bytes_representable(&[usize::MAX, usize::MAX], nz(usize::MAX)).is_err()
+        );
+    }
+
+    /// A chunk grid with a *hole* — some chunks allocated, others never — reads
+    /// the hole as the fill value.
+    ///
+    /// This is the case the change exists for, and the one that used to return
+    /// `Ok` with zeros regardless of the fill value. It goes through
+    /// `read_chunked_data_from_source` deliberately: that reader is the only one
+    /// reaching [`assemble_chunks`], and the unallocated-*index* test below
+    /// returns from `chunk_index_address` before ever getting there — so without
+    /// a sparse grid, `assemble_chunks`'s prefill has no coverage at all.
+    ///
+    /// The index holds the first and last of four chunk slots, so the hole is
+    /// interior rather than a tail.
+    #[test]
+    fn a_hole_in_the_chunk_grid_reads_as_fill() {
+        let elem = 8usize;
+        let chunk_elems = 2usize;
+        let mut file_data = vec![0u8; 0x10000];
+
+        let present: [(u64, [f64; 2]); 2] = [(0, [1.0, 2.0]), (6, [7.0, 8.0])];
+        let mut chunk_infos = Vec::new();
+        let mut data_offset = 0x2000usize;
+        for (start_elem, values) in present {
+            for (i, v) in values.iter().enumerate() {
+                let at = data_offset + i * elem;
+                file_data[at..at + 8].copy_from_slice(&v.to_le_bytes());
+            }
+            chunk_infos.push(ChunkInfo {
+                chunk_size: (chunk_elems * elem) as u32,
+                filter_mask: 0,
+                offsets: vec![start_elem, 0],
+                address: data_offset as u64,
+            });
+            data_offset += chunk_elems * elem;
+        }
+
+        let btree = build_chunk_btree_leaf(&chunk_infos, 2, 8);
+        let btree_addr = 0x100usize;
+        file_data[btree_addr..btree_addr + btree.len()].copy_from_slice(&btree);
+
+        let layout = DataLayout::Chunked {
+            chunk_dimensions: vec![chunk_elems as u32, elem as u32],
+            btree_address: Some(btree_addr as u64),
+            version: 3,
+            chunk_index_type: None,
+            single_chunk_filtered_size: None,
+            single_chunk_filter_mask: None,
+        };
+        let dataspace = Dataspace {
+            space_type: DataspaceType::Simple,
+            rank: 1,
+            dimensions: vec![8],
+            max_dimensions: None,
+        };
+
+        let fill = 5.5f64;
+        let fill_bytes = fill.to_le_bytes();
+        let out = read_chunked_data_from_source(
+            &BytesSource::new(&file_data),
+            &layout,
+            &dataspace,
+            &make_f64_type(),
+            None,
+            FillPattern::new(Some(&fill_bytes), nz(8)),
+            8,
+            8,
+        )
+        .unwrap();
+
+        let decoded: Vec<f64> = out
+            .chunks_exact(8)
+            .map(|b| f64::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        assert_eq!(
+            decoded,
+            vec![1.0, 2.0, fill, fill, fill, fill, 7.0, 8.0],
+            "the interior hole must read as the fill value"
         );
     }
 

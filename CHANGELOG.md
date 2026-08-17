@@ -11,6 +11,7 @@ Unallocated storage now reads as the dataset's fill value, matching the referenc
 ### Added
 
 - A `File::open_rw` session can create an empty (zero-element) chunked or extensible dataset, so a schema-first writer declares its resizable datasets up front and grows them with `Dataset::append_staged`; explicit `with_chunks` dimensions are required ([#284](https://github.com/stephenberry/hdf5-pure/issues/284)).
+- `FormatError::UnreadableFillValue` reports a Fill Value message this parser cannot read *on a dataset that needs it* — one with storage that was never allocated. A dataset whose storage is fully allocated reads normally regardless of that message ([#284](https://github.com/stephenberry/hdf5-pure/issues/284)).
 
 ### Changed
 
@@ -24,7 +25,7 @@ Unallocated storage now reads as the dataset's fill value, matching the referenc
 
 ### Fixed
 
-- Reading a dataset whose storage was never allocated returns its fill value instead of failing, for contiguous and chunked layouts alike, through whole reads and row windows. The never-allocated chunks of a partly written chunked dataset now read as the fill value too, where they read as zeros regardless of it ([#284](https://github.com/stephenberry/hdf5-pure/issues/284)).
+- Reading a dataset whose storage was never allocated returns its fill value instead of failing, for contiguous and chunked layouts alike, through whole reads and row windows. The never-allocated chunks of a partly written chunked dataset now read as the fill value too, where they read as zeros regardless of it. A dataset whose Fill Value message sets `H5D_FILL_TIME_NEVER` still reads as zeros, and `repack` of a never-written dataset writes the fill value out rather than preserving the unallocated storage ([#284](https://github.com/stephenberry/hdf5-pure/issues/284)).
 - An empty **filtered** chunked dataset declared a chunk-index element too narrow for its own chunks, so filling it through the reference C library produced a file this crate read as truncated compressed data, and filling it through `Dataset::append` was refused outright. Datasets with at least one chunk are byte-identical to before ([#284](https://github.com/stephenberry/hdf5-pure/issues/284)).
 - An empty **fixed-shape** chunked dataset is written with no chunk index, matching the C library, where the zero-entry Fixed Array it used to write made `H5Dget_num_chunks` fail on the dataset ([#284](https://github.com/stephenberry/hdf5-pure/issues/284)).
 - Requesting an extensible zero-element dataset without `with_chunks` is refused with `FormatError::InvalidChunkGeometry` instead of panicking ([#284](https://github.com/stephenberry/hdf5-pure/issues/284)).

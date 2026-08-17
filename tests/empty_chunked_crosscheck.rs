@@ -297,10 +297,9 @@ fn c_reads_the_whole_file_writers_empty_chunked_datasets() {
 
 /// The other direction, and the one this crate used to fail: the C library
 /// allocates a chunked dataset's index lazily, so an empty one carries the
-/// undefined address. Reading it is the empty buffer — `read_raw` errored with
-/// "no address for chunked layout" until the reader learned to tell "nothing
-/// stored because there is nothing to store" from "nothing stored where data
-/// must be".
+/// undefined address. Reading it is the empty buffer, and reading an unallocated
+/// dataset that *owns* elements is that many fill values — both fall out of the
+/// same expression, which is why a zero-element one needs no special case.
 #[test]
 fn pure_reads_the_c_librarys_unallocated_empty_chunked_datasets() {
     for unlimited in [false, true] {
@@ -474,4 +473,133 @@ fn pure_fills_the_gaps_of_a_partially_written_chunked_dataset() {
             );
         }
     }
+}
+
+/// `H5D_FILL_TIME_NEVER` says the library never writes the fill value into
+/// storage, and the C library honors that *over* the value: an unwritten
+/// dataset reads back as zeros however the fill is defined, and so does the
+/// unwritten tail of a partly written one.
+///
+/// Materializing the declared value there fabricates data the file says was
+/// never put in it — and for the partly-written case it is a regression, since
+/// zeros were the right answer before unallocated storage was materialized at
+/// all. The write time lives in bits 2-3 of the version-3 flags byte, beside
+/// the *defined* bit this used to read on its own.
+#[test]
+fn a_fill_value_the_file_says_is_never_written_reads_as_zeros() {
+    for (label, chunked, partial) in [
+        ("contiguous, unwritten", false, false),
+        ("chunked, unwritten", true, false),
+        ("chunked, partly written", true, true),
+    ] {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("never.h5");
+        {
+            let file = hdf5::File::create(&path).unwrap();
+            let mut builder = file
+                .new_dataset::<i32>()
+                .shape((8,))
+                .fill_value(7i32)
+                .fill_time(hdf5::dataset::FillTime::Never);
+            if chunked {
+                builder = builder.chunk((4,));
+            }
+            let ds = builder.create("col").unwrap();
+            if partial {
+                ds.write_slice(&[1i32, 2, 3, 4], 0..4).unwrap();
+            }
+            drop(ds);
+            file.close().unwrap();
+        }
+
+        let expected = {
+            let file = hdf5::File::open(&path).unwrap();
+            file.dataset("col").unwrap().read_raw::<i32>().unwrap()
+        };
+        assert!(
+            expected.iter().all(|&v| v != 7),
+            "[{label}] the C library must not write the fill value here"
+        );
+
+        for streaming in [false, true] {
+            let file = if streaming {
+                File::open_streaming(&path).unwrap()
+            } else {
+                File::open(&path).unwrap()
+            };
+            let ds = file.dataset("col").unwrap();
+            assert_eq!(
+                ds.read_i32().unwrap(),
+                expected,
+                "[{label} streaming={streaming}] whole read"
+            );
+            assert_eq!(
+                ds.read_i32_rows(4, 4).unwrap(),
+                expected[4..].to_vec(),
+                "[{label} streaming={streaming}] window over the unwritten tail"
+            );
+            // The value is still *declared*, and the accessor still reports it:
+            // what the write time changes is only what unallocated storage
+            // reads as.
+            assert_eq!(ds.fill_value::<i32>().unwrap(), Some(7));
+        }
+    }
+}
+
+/// `repack` of a dataset whose storage was never allocated **materializes** it:
+/// the destination holds one written chunk per grid slot, each full of the fill
+/// value, where the source held none.
+///
+/// Pinned rather than fixed. Values round-trip correctly and the fill value is
+/// carried across, so the result is right — but storage is not preserved, and a
+/// never-written dataset of any size becomes that size on disk. Preserving it
+/// needs the writer to be able to express "chunked, non-zero shape, no storage",
+/// which it cannot today; before unallocated storage was readable at all,
+/// repack refused such a dataset instead. This test exists so the change is
+/// visible and so a fix has something to invert.
+#[test]
+fn repack_materializes_a_never_written_dataset() {
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("src.h5");
+    let dst = dir.path().join("dst.h5");
+    {
+        let file = hdf5::File::create(&src).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape((1000,))
+            .chunk((100,))
+            .fill_value(7i32)
+            .create("col")
+            .unwrap();
+        drop(ds);
+        file.close().unwrap();
+    }
+    // The source holds no chunks at all.
+    let before = File::open(&src).unwrap();
+    assert_eq!(before.dataset("col").unwrap().chunks().unwrap().len(), 0);
+    drop(before);
+
+    hdf5_pure::repack(&src, &dst, &hdf5_pure::RepackOptions::default()).unwrap();
+
+    let after = File::open(&dst).unwrap();
+    let ds = after.dataset("col").unwrap();
+    assert_eq!(
+        ds.read_i32().unwrap(),
+        vec![7i32; 1000],
+        "values round-trip"
+    );
+    assert_eq!(
+        ds.fill_value::<i32>().unwrap(),
+        Some(7),
+        "fill carried across"
+    );
+    assert_eq!(
+        ds.chunks().unwrap().len(),
+        10,
+        "every grid slot is written out, which is the cost this pins"
+    );
+    assert!(
+        std::fs::metadata(&dst).unwrap().len() > std::fs::metadata(&src).unwrap().len(),
+        "the destination is larger than the source it came from"
+    );
 }
