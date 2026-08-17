@@ -777,10 +777,17 @@ fn carry_shape_and_pipeline(
                     // `check_pipeline` guarantees integer (lossless) mode here.
                     // Re-apply with the source's minbits parameter; integer
                     // scale-offset reconstructs the exact element bytes.
-                    if let Some(mode @ ScaleOffset::Integer(_)) =
+                    //
+                    // Its fill availability is re-applied too. The value it
+                    // records comes from the dataset's own fill value, carried
+                    // separately, so only the availability needs saying — and
+                    // saying it keeps a source that records none from gaining
+                    // one, which would re-encode every chunk a code point wider.
+                    if let Some((mode @ ScaleOffset::Integer(_), fill)) =
                         scaleoffset::scale_offset_mode(&f.client_data)
                     {
                         db.with_scale_offset(mode);
+                        db.chunk_options.scale_offset_fill = fill;
                     } else {
                         unreachable!("check_pipeline rejected non-integer scale-offset");
                     }
@@ -1725,10 +1732,10 @@ fn check_pipeline(pipeline: Option<&FilterPipeline>, path: &str) -> Result<(), E
         match f.filter_id {
             FILTER_DEFLATE | FILTER_SHUFFLE | FILTER_FLETCHER32 | FILTER_LZF => {}
             FILTER_SCALEOFFSET => match scaleoffset::scale_offset_mode(&f.client_data) {
-                Some(ScaleOffset::Integer(_)) => {}
+                Some((ScaleOffset::Integer(_), _)) => {}
                 _ => {
                     return Err(Error::RepackUnsupported(format!(
-                        "dataset {path}: only lossless integer scale-offset with an undefined fill value can be repacked faithfully"
+                        "dataset {path}: only lossless integer scale-offset can be repacked faithfully"
                     )));
                 }
             },
@@ -1763,6 +1770,67 @@ fn join(parent: &str, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A source's scale-offset fill availability is carried onto the rebuilt
+    /// dataset, in both directions.
+    ///
+    /// It has to be said explicitly, because the rebuilt dataset's fill value
+    /// says nothing about it: this crate records a defined fill value for every
+    /// scale-offset dataset it writes, so a source that recorded none would
+    /// otherwise gain one — re-encoding every chunk a code point wider, to
+    /// reserve a sentinel for a value the source never treated as fill.
+    ///
+    /// Synthetic pipelines rather than a file-level test, for the same reason
+    /// [`lzf_plus_deflate_pipeline_is_refused`] uses one: no writer left in this
+    /// crate produces a filter that records no fill value, so the only files
+    /// carrying one are those written before it and those a C caller set the
+    /// fill value undefined on.
+    #[test]
+    fn a_repacked_scale_offset_filter_keeps_the_sources_fill_availability() {
+        use crate::filter_pipeline::FilterDescription;
+        use crate::scaleoffset::{FillAvailability, ScaleOffsetFill, build_cd_values};
+
+        let ty = crate::scaleoffset::scale_offset_type_from_datatype(&crate::make_i32_type())
+            .expect("i32 is a scale-offset type");
+        let carried = |fill: ScaleOffsetFill<'_>| {
+            let pipeline = Some(FilterPipeline {
+                version: 2,
+                filters: vec![FilterDescription {
+                    filter_id: FILTER_SCALEOFFSET,
+                    name: None,
+                    flags: 0,
+                    client_data: build_cd_values(ScaleOffset::Integer(0), ty, 4, 16, fill).unwrap(),
+                }],
+            });
+            let mut db = DatasetBuilder::new("d");
+            carry_shape_and_pipeline(
+                &mut db,
+                &[16],
+                None,
+                &DataLayout::Chunked {
+                    // A v3 layout appends the element size, which is what the
+                    // caller trims back off.
+                    chunk_dimensions: vec![16, 4],
+                    btree_address: Some(0x1000),
+                    version: 3,
+                    chunk_index_type: None,
+                    single_chunk_filtered_size: None,
+                    single_chunk_filter_mask: None,
+                },
+                &pipeline,
+            );
+            db.chunk_options.scale_offset_fill
+        };
+
+        assert_eq!(
+            carried(ScaleOffsetFill::Undefined),
+            FillAvailability::Undefined
+        );
+        assert_eq!(
+            carried(ScaleOffsetFill::Defined(None)),
+            FillAvailability::Defined
+        );
+    }
 
     /// A foreign pipeline carrying both lzf and deflate is refused with the
     /// repack error, not the builder's combination error: the builder replays

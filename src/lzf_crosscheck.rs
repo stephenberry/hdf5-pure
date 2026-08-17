@@ -119,7 +119,10 @@ fn writer_pipeline_matches_h5py() {
             ..ChunkOptions::default()
         };
         let pipeline = options
-            .build_pipeline(fix.element_size(), &fix.chunk_shape, None, None)
+            .build_pipeline(
+                &crate::filters::ChunkContext::basic(&fix.chunk_shape, fix.element_size()),
+                crate::fill_value::FillPattern::ZERO,
+            )
             .unwrap_or_else(|e| panic!("{}: build_pipeline: {e:?}", fix.name))
             .unwrap_or_else(|| panic!("{}: writer produced no pipeline", fix.name));
 

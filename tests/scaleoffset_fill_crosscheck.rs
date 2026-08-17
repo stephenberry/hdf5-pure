@@ -105,6 +105,215 @@ fn the_c_library_records_a_defined_fill_value_even_without_one() {
     );
 }
 
+/// The `cd_values` of `col`, as the file records them.
+fn filter_parms(path: &std::path::Path) -> Vec<u32> {
+    hdf5_pure::File::open(path)
+        .unwrap()
+        .dataset("col")
+        .unwrap()
+        .filter_pipeline()
+        .into_iter()
+        .find(|f| f.id == 6)
+        .expect("a scale-offset filter")
+        .client_data
+}
+
+/// The other half of the premise above (issue #297): this crate writes the same
+/// parameters the reference does, for the same dataset. Every entry is compared,
+/// not only the two the fill value occupies — the array is what a decoder reads
+/// the chunk through, so one wrong entry anywhere is a chunk neither library
+/// decodes as written.
+///
+/// The widths matter: a `u64` fill value spans **two** `cd_values` entries and
+/// every narrower one a single entry with the rest zero, so a writer that
+/// packed one entry always, or eight bytes always, agrees with the reference on
+/// only part of this.
+#[test]
+fn a_dataset_this_crate_writes_carries_the_c_librarys_filter_parameters() {
+    let dir = tempdir().unwrap();
+
+    macro_rules! compare {
+        ($name:literal, $ty:ty, $with:ident, $data:expr, $fill:expr) => {
+            compare!(
+                $name,
+                $ty,
+                $with,
+                $data,
+                $fill,
+                CScaleOffset::Integer(0),
+                hdf5_pure::ScaleOffset::Integer(0)
+            )
+        };
+        ($name:literal, $ty:ty, $with:ident, $data:expr, $fill:expr, $c_mode:expr, $mode:expr) => {{
+            let data: Vec<$ty> = $data;
+            let fill: Option<$ty> = $fill;
+            let c_path = dir.path().join(concat!($name, "-c.h5"));
+            let pure_path = dir.path().join(concat!($name, "-pure.h5"));
+            c_create_typed(&c_path, &data, data.len(), $c_mode, fill);
+            let mut b = hdf5_pure::FileBuilder::new();
+            let ds = b
+                .create_dataset("col")
+                .$with(&data)
+                .with_shape(&[data.len() as u64])
+                .with_chunks(&[data.len() as u64])
+                .with_scale_offset($mode);
+            if let Some(f) = fill {
+                ds.with_fill_value(f);
+            }
+            b.write(&pure_path).unwrap();
+
+            assert_eq!(
+                filter_parms(&pure_path),
+                filter_parms(&c_path),
+                concat!($name, ": cd_values diverge from the C library")
+            );
+            // The parameters agreeing is not the chunk agreeing: the fill value
+            // they record is what the encoder diverts to the sentinel.
+            assert_eq!(
+                raw_chunks(&pure_path),
+                raw_chunks(&c_path),
+                concat!($name, ": compressed chunk bytes diverge")
+            );
+        }};
+    }
+
+    // A fill value the caller chose, at each width and signedness. Every fixture
+    // holds copies of its own fill value, so the sentinel is exercised too.
+    compare!("u8", u8, with_u8_data, vec![7, 1, 2, 7, 3], Some(7));
+    compare!("i8", i8, with_i8_data, vec![-9, 1, -2, -9, 3], Some(-9));
+    compare!(
+        "u16",
+        u16,
+        with_u16_data,
+        vec![700, 1, 2, 700, 3],
+        Some(700)
+    );
+    compare!(
+        "i16",
+        i16,
+        with_i16_data,
+        vec![-700, 1, -2, -700, 3],
+        Some(-700)
+    );
+    compare!(
+        "u32",
+        u32,
+        with_u32_data,
+        vec![70_000, 1, 2, 70_000, 3],
+        Some(70_000)
+    );
+    compare!(
+        "i32",
+        i32,
+        with_i32_data,
+        vec![-70_000, 1, -2, -70_000, 3],
+        Some(-70_000)
+    );
+    // Eight bytes: the fill value spans two `cd_values` entries.
+    compare!(
+        "u64",
+        u64,
+        with_u64_data,
+        vec![1 << 40, 1, 2, 1 << 40, 3],
+        Some(1 << 40)
+    );
+    compare!(
+        "i64",
+        i64,
+        with_i64_data,
+        vec![-(1i64 << 40), 1, -2, -(1i64 << 40), 3],
+        Some(-(1i64 << 40))
+    );
+
+    // And with no fill value at all, which the reference still records as a
+    // defined one, of zero. The zeros in the data are what that turns into a
+    // sentinel, so this fixture would pass with the filter parameters right and
+    // the encoding wrong if it held none.
+    compare!("default", i32, with_i32_data, vec![0, 5, 0, 7, 0], None);
+
+    // Float D-scale is the other emit path through the same parameters, and it
+    // matches an element against the fill value within one decimal quantum
+    // rather than by equality — so `0.0004` is a fill value for `D = 3` and
+    // `0.002` is not. A dataset with no fill value gets the defined zero here
+    // too, which is what makes that window apply at all.
+    compare!(
+        "f64",
+        f64,
+        with_f64_data,
+        vec![-999.0, 1.5, 2.25, -999.0004, 3.125],
+        Some(-999.0),
+        CScaleOffset::FloatDScale(3),
+        hdf5_pure::ScaleOffset::FloatDScale(3)
+    );
+    compare!(
+        "f64-default",
+        f64,
+        with_f64_data,
+        vec![0.0, 1.5, 0.0004, 2.25, -0.0002],
+        None,
+        CScaleOffset::FloatDScale(3),
+        hdf5_pure::ScaleOffset::FloatDScale(3)
+    );
+    compare!(
+        "f32-default",
+        f32,
+        with_f32_data,
+        vec![0.0, 1.5, 0.0004, 2.25, -0.0002],
+        None,
+        CScaleOffset::FloatDScale(3),
+        hdf5_pure::ScaleOffset::FloatDScale(3)
+    );
+}
+
+/// A fill value the encoder can collapse pays for itself: a chunk that is mostly
+/// fill values packs to the width of what is left, not to the width of a range
+/// stretched to reach the fill value.
+///
+/// That saving is the reason the reference records a fill value at all, and it
+/// is what this crate could not produce while its writer recorded none.
+#[test]
+fn a_recorded_fill_value_shrinks_a_mostly_fill_chunk() {
+    let dir = tempdir().unwrap();
+    // Values near zero, a fill value far from them: without the fill value the
+    // chunk's range spans all of it.
+    let data: Vec<i32> = (0..64)
+        .map(|i| if i % 4 == 0 { i % 3 } else { -1_000_000 })
+        .collect();
+
+    let sizes = ["with", "without"].map(|which| {
+        let path = dir.path().join(format!("{which}.h5"));
+        let mut b = hdf5_pure::FileBuilder::new();
+        let ds = b
+            .create_dataset("col")
+            .with_i32_data(&data)
+            .with_shape(&[data.len() as u64])
+            .with_chunks(&[data.len() as u64])
+            .with_scale_offset(hdf5_pure::ScaleOffset::Integer(0));
+        if which == "with" {
+            ds.with_fill_value(-1_000_000_i32);
+        }
+        b.write(&path).unwrap();
+        assert_eq!(
+            hdf5_pure::File::open(&path)
+                .unwrap()
+                .dataset("col")
+                .unwrap()
+                .read_i32()
+                .unwrap(),
+            data,
+            "{which}: the values must survive either way"
+        );
+        raw_chunks(&path)[0].len()
+    });
+
+    assert!(
+        sizes[0] * 2 < sizes[1],
+        "a recorded fill value should collapse this chunk: {} bytes with, {} without",
+        sizes[0],
+        sizes[1]
+    );
+}
+
 /// The issue as filed: append to a C-written scale-offset dataset that carries
 /// a defined fill value.
 #[test]
@@ -383,17 +592,83 @@ fn float_dscale_encoding_matches_the_c_library_byte_for_byte() {
             v.push(-999.0004);
             v
         },
-        |path, values| {
-            let f = hdf5_pure::File::open_rw(path).unwrap();
-            f.dataset("col")
-                .unwrap()
-                .append_staged(|b| {
-                    b.append_f64(values);
-                })
-                .unwrap();
-            f.commit().unwrap();
-        },
+        pure_append_f64,
     );
+}
+
+/// The reference rounds each scaled residual with `llround`, which rounds `x` —
+/// not the sum `x + 0.5`, a different function. They part company at the largest
+/// double below one half, where the exact sum sits halfway between two doubles
+/// and rounds *up*: `llround` answers 0 and the sum answers 1.
+///
+/// `D = 0` puts that value in front of the rounding unscaled, which is what
+/// makes the fixture reach the divergence at all. It costs a decoded value, not
+/// only the bytes it is stored as — and through `span` one such element can
+/// widen every element in the chunk (issue #300).
+#[test]
+fn a_residual_just_below_one_half_rounds_the_way_the_c_library_rounds() {
+    let below_half = 0.499_999_999_999_999_94f64;
+    assert!(
+        below_half < 0.5 && below_half + 0.5 == 1.0,
+        "the fixture must be a value the two roundings disagree on"
+    );
+    let values = [-999.0f64, 0.0, below_half, 3.0, -999.0];
+    assert_one_byte_identical_chunk(CScaleOffset::FloatDScale(0), &values, pure_append_f64);
+
+    // The `f32` helper is a separate function with the same defect available to
+    // it, and the value it parts company with the reference on is its own: the
+    // largest float below one half, where the sum rounds to exactly 1.0.
+    let below_half_f32 = 0.499_999_97f32;
+    assert!(below_half_f32 < 0.5 && below_half_f32 + 0.5 == 1.0);
+    assert_one_byte_identical_chunk(
+        CScaleOffset::FloatDScale(0),
+        &[-999.0f32, 0.0, below_half_f32, 3.0, -999.0],
+        pure_append_f32,
+    );
+
+    // The same divergence as a value, which is how a user meets it: this crate
+    // stored 1.0 for an element the reference stores as 0.0.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("value.h5");
+    c_create_typed(
+        &path,
+        &values[..1],
+        values.len(),
+        CScaleOffset::FloatDScale(0),
+        Some(values[0]),
+    );
+    pure_append_f64(&path, &values[1..]);
+    assert_eq!(
+        hdf5_pure::File::open(&path)
+            .unwrap()
+            .dataset("col")
+            .unwrap()
+            .read_f64()
+            .unwrap()[2],
+        0.0,
+        "a residual below one half must round down"
+    );
+    assert_eq!(
+        hdf5::File::open(&path)
+            .unwrap()
+            .dataset("col")
+            .unwrap()
+            .read_raw::<f64>()
+            .unwrap()[2],
+        0.0,
+        "and the C library must read back the same element"
+    );
+}
+
+fn pure_append_f64(path: &std::path::Path, values: &[f64]) {
+    let f = hdf5_pure::File::open_rw(path).unwrap();
+    f.dataset("col")
+        .unwrap()
+        .append_staged(|b| {
+            b.append_f64(values);
+        })
+        .unwrap();
+    f.commit().unwrap();
 }
 
 fn pure_append_f32(path: &std::path::Path, values: &[f32]) {
@@ -605,23 +880,31 @@ fn first_chunk_header(path: &std::path::Path) -> Vec<u8> {
     bytes[s..s + 21].to_vec()
 }
 
-/// `signed char` is the one type `H5Z__scaleoffset_precompress_i` hand-expands
-/// rather than routing through the `H5Z_scaleoffset_check_2` macro, and the
-/// expansion assigns `*minval` in its fill-undefined early return where the
-/// macro assigns nothing. So a 1-byte *signed* chunk that falls back to full
-/// precision carries the chunk minimum in its header, and every other width and
-/// signedness carries zero.
+/// The full-precision fallback header, at every integer width this crate
+/// writes and in both signednesses, against the C library re-encoding the same
+/// chunk through the same `cd_values`.
 ///
-/// Four cases, because the rule has two axes and one case pins neither: an
-/// encoder that applies the quirk to the whole family, or to none of it, must
-/// fail here. Every fixture's minimum is deliberately non-zero — a chunk whose
-/// minimum is zero writes the same header under either rule.
+/// The reference reaches that path by an early `return` that skips the
+/// `*minval = min` its packed paths end with, so every one of these carries a
+/// zero where the chunk's minimum would otherwise be — and every fixture's
+/// minimum is deliberately non-zero, so an encoder that wrote the minimum here
+/// fails rather than agreeing by luck.
+///
+/// One width is the exception, and only in the *other* fill mode: `signed char`
+/// is the one type `H5Z__scaleoffset_precompress_i` hand-expands rather than
+/// routing through the `H5Z_scaleoffset_check_2` macro, and the expansion
+/// assigns `*minval` in its fill-**undefined** early return. Nothing this crate
+/// writes records an undefined fill value any more — the reference records a
+/// defined one for every scale-offset dataset, and so does this crate — so that
+/// branch is reachable only by re-encoding a file that already carries one, and
+/// `the_fill_undefined_fallback_carries_the_signed_char_minimum` covers it
+/// against the encoder directly.
 ///
 /// `i32`/`i64` are left out on purpose. The reference's `max - min` overflows
 /// signed arithmetic at their extremes, and this build traps inside
 /// `H5Dwrite` rather than returning a comparison.
 #[test]
-fn the_one_byte_fallback_header_differs_by_signedness() {
+fn the_fallback_header_matches_the_c_library_at_every_width() {
     let dir = tempdir().unwrap();
 
     // Each fixture spreads past `width_max - 2` for its width, so the
@@ -670,16 +953,16 @@ fn the_one_byte_fallback_header_differs_by_signedness() {
         }};
     }
 
-    // Only the signed 1-byte case carries the minimum.
-    case!("i8", i8_data, with_i8_data, (-128i64) as u64);
+    // The fill value these are written with is the defined default, so all four
+    // take the macro-driven path and carry zero.
+    case!("i8", i8_data, with_i8_data, 0);
     case!("u8", u8_data, with_u8_data, 0);
     case!("i16", i16_data, with_i16_data, 0);
     case!("u16", u16_data, with_u16_data, 0);
 
-    // The other half of the hand-expanded branch: with a fill value *defined*
-    // the same signed 1-byte chunk assigns nothing and carries zero, so the
-    // quirk turns on signedness, width and fill mode together. Non-fill values
-    // spread -128..127, past the fallback threshold.
+    // The same holds for a fill value the caller chose, on the one width whose
+    // hand-expanded branch could have differed. Non-fill values spread
+    // -128..127, past the fallback threshold.
     assert_one_byte_identical_chunk(
         CScaleOffset::Integer(0),
         &[5i8, -128, 127, 5, -128, 127, 0, 1],

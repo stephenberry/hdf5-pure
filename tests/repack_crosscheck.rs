@@ -738,6 +738,100 @@ fn c_sparse_chunked_lossless_repacked_falls_back() {
     );
 }
 
+/// The same fixture in the lossless mode, which repack now reproduces rather
+/// than refusing (issue #297).
+///
+/// It was refused for the fill value, not for the mode: the reference records a
+/// defined fill value on **every** scale-offset dataset it writes, and the
+/// writer here had nowhere to put one, so re-encoding would have dropped the
+/// source's chunk-fill semantics. That covered essentially every C-written and
+/// h5py-written scale-offset dataset whose grid has a hole in it.
+///
+/// The filter parameters are compared entry for entry, because the values alone
+/// cannot see the difference: a chunk re-encoded with the fill value dropped
+/// decodes to exactly the same numbers, just packed a code point wider and no
+/// longer collapsing runs of the fill value.
+#[test]
+fn c_sparse_chunked_scale_offset_repacks_with_its_fill_value() {
+    use hdf5::filters::ScaleOffset as CScaleOffset;
+
+    let dir = tempdir().unwrap();
+    let src = dir.path().join("c_sparse_so.h5");
+    let dst = dir.path().join("c_sparse_so_repacked.h5");
+
+    let n = 2000usize;
+    let written = 1000usize;
+    let fill = 7i32;
+    // Copies of the fill value inside the written region, so the sentinel is
+    // exercised where the data is rather than only where it is missing.
+    let head: Vec<i32> = (0..written)
+        .map(|i| {
+            if i % 5 == 0 {
+                fill
+            } else {
+                100 + (i % 17) as i32
+            }
+        })
+        .collect();
+    {
+        let file = hdf5::FileBuilder::new()
+            .with_fapl(|fapl| fapl.libver_v110())
+            .create(&src)
+            .unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape([n])
+            .chunk([512])
+            .scale_offset(CScaleOffset::Integer(0))
+            .fill_value(fill)
+            .create("data")
+            .unwrap();
+        ds.write_slice(head.as_slice(), 0..written).unwrap();
+        file.close().unwrap();
+    }
+
+    let parms = |path: &std::path::Path| {
+        File::open(path)
+            .unwrap()
+            .dataset("data")
+            .unwrap()
+            .filter_pipeline()
+            .into_iter()
+            .find(|f| f.id == 6)
+            .expect("a scale-offset filter")
+            .client_data
+    };
+
+    repack(&src, &dst, &RepackOptions::new()).unwrap();
+
+    let mut want = head.clone();
+    want.resize(n, fill);
+    assert_eq!(
+        File::open(&dst)
+            .unwrap()
+            .dataset("data")
+            .unwrap()
+            .read_i32()
+            .unwrap(),
+        want
+    );
+    assert_eq!(
+        hdf5::File::open(&dst)
+            .unwrap()
+            .dataset("data")
+            .unwrap()
+            .read_raw::<i32>()
+            .unwrap(),
+        want,
+        "the C library must decode the re-encoded chunks"
+    );
+    assert_eq!(
+        parms(&dst),
+        parms(&src),
+        "the rebuilt filter must record the source's fill value"
+    );
+}
+
 #[test]
 fn c_sparse_chunked_lossy_repack_refused() {
     // The C library writes only the first chunks of a chunked dataset compressed

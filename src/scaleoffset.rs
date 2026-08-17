@@ -33,6 +33,7 @@ use alloc::{format, string::ToString, vec, vec::Vec};
 use crate::convert::TryToUsize;
 use crate::datatype::{Datatype, DatatypeByteOrder};
 use crate::error::FormatError;
+use crate::fill_value::FillPattern;
 use crate::filter_pipeline::FilterDescription;
 
 // cd_values indices (H5Z_SCALEOFFSET_PARM_*).
@@ -152,16 +153,84 @@ fn order_code(order: &DatatypeByteOrder) -> Option<u32> {
     }
 }
 
+/// Whether a scale-offset filter records a fill value
+/// (`H5Z_SCALEOFFSET_PARM_FILAVAIL`), without the value itself — the form that
+/// can be stored in a dataset's write options, which own no borrowed bytes.
+///
+/// The reference library derives this from the dataset's fill value and answers
+/// [`Defined`](Self::Defined) unless the caller set that value to *undefined*
+/// explicitly, so a dataset that never mentions a fill value still gets a
+/// defined one, of zero. This crate's writer cannot express an undefined fill
+/// value at all — `DatasetBuilder`'s fill is "a value or the library default" —
+/// so [`Defined`](Self::Defined) is what it writes and the other variant exists
+/// for one caller: [`repack`](crate::repack), reproducing a source file whose
+/// filter recorded `FILL_UNDEFINED`. The day the writer models an undefined
+/// fill value, this collapses back into the fill value itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FillAvailability {
+    /// `FILL_DEFINED`: the filter records the dataset's fill value, and encodes
+    /// elements equal to it as the reserved sentinel.
+    #[default]
+    Defined,
+    /// `FILL_UNDEFINED`: the filter records no fill value, and every element is
+    /// encoded as an ordinary offset.
+    Undefined,
+}
+
+impl FillAvailability {
+    /// The filter's fill parameters for a dataset whose fill value is `fill`.
+    ///
+    /// The pattern is read only by [`Defined`](Self::Defined), which is the
+    /// variant that records it: [`Undefined`](Self::Undefined) has nowhere to
+    /// put a value, so one it could not read
+    /// ([`FormatError::UnreadableFillValue`]) is not an obstacle to recording
+    /// that there is none.
+    pub fn with_value(self, fill: FillPattern<'_>) -> Result<ScaleOffsetFill<'_>, FormatError> {
+        match self {
+            Self::Defined => Ok(ScaleOffsetFill::Defined(fill.element()?)),
+            Self::Undefined => Ok(ScaleOffsetFill::Undefined),
+        }
+    }
+}
+
+/// The fill-value parameters a scale-offset filter records: availability
+/// (`H5Z_SCALEOFFSET_PARM_FILAVAIL`) together with the value
+/// (`H5Z_SCALEOFFSET_PARM_FILVAL`) when there is one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScaleOffsetFill<'a> {
+    /// Record `FILL_DEFINED` over one element of fill bytes in the dataset's
+    /// byte order, or over the library-default fill value — an all-zero element
+    /// — for `None`. The reference library records a defined *zero* for a
+    /// dataset whose fill value was never set, so the two are the same
+    /// parameters, not two cases.
+    Defined(Option<&'a [u8]>),
+    /// Record `FILL_UNDEFINED`, leaving the value parameters zero.
+    Undefined,
+}
+
 /// Build the 20-entry `cd_values` array for a scale-offset filter.
 ///
 /// `nelmts` is the number of elements in one chunk. Validates that the
 /// requested [`ScaleOffset`] mode matches the datatype class (integer mode on
 /// integer data, float D-scale on float data).
+///
+/// The fill value is stored the way `H5Z__scaleoffset_set_parms_fillval` stores
+/// it: as the datatype's bit pattern in *value* order rather than in the
+/// dataset's byte order, packed four bytes to a `cd_values` entry from
+/// [`PARM_FILVAL`]. [`read_fill_bits`] is the inverse, and a big-endian dataset
+/// is converted in both directions.
+///
+/// Storing the *value* rather than the dataset's bytes is what makes this
+/// independent of the host: the reference reaches the same entries by two
+/// different routes, walking the fill value forwards on a little-endian host
+/// and backwards from its last four bytes on a big-endian one, and its
+/// `need_convert` step brings a foreign-order fill value into that form first.
 pub fn build_cd_values(
     mode: ScaleOffset,
     ty: ScaleOffsetType,
     size: u32,
     nelmts: u32,
+    fill: ScaleOffsetFill<'_>,
 ) -> Result<Vec<u32>, FormatError> {
     let (scale_type, scale_factor) = match (mode, ty.class) {
         (ScaleOffset::Integer(minbits), CLS_INTEGER) => (SO_INT, minbits),
@@ -178,6 +247,17 @@ pub fn build_cd_values(
         }
     };
 
+    // The same 1..=8-byte scalars [`Parms::parse`] accepts on the way back in.
+    // Stated here rather than left to the datatype that produced `ty`, because
+    // the two arrive as separate arguments: a wider one would run the fill value
+    // off the end of the parameter array, which is what makes
+    // [`write_fill_bits`] safe to write without a bound of its own.
+    if size == 0 || size > 8 {
+        return Err(FormatError::FilterError(format!(
+            "scaleoffset: unsupported datatype size {size}"
+        )));
+    }
+
     let mut cd = vec![0u32; TOTAL_NPARMS];
     cd[PARM_SCALETYPE] = scale_type;
     cd[PARM_SCALEFACTOR] = scale_factor;
@@ -186,40 +266,64 @@ pub fn build_cd_values(
     cd[PARM_SIZE] = size;
     cd[PARM_SIGN] = ty.sign;
     cd[PARM_ORDER] = ty.order;
-    cd[PARM_FILAVAIL] = FILL_UNDEFINED;
+    match fill {
+        ScaleOffsetFill::Undefined => cd[PARM_FILAVAIL] = FILL_UNDEFINED,
+        ScaleOffsetFill::Defined(bytes) => {
+            let width = size.to_usize()?;
+            let bits = match bytes {
+                // The library default: a defined fill value of zero.
+                None => 0,
+                Some(b) if b.len() == width => read_value(b, width, ty.order),
+                Some(b) => {
+                    return Err(FormatError::FilterError(format!(
+                        "scaleoffset: fill value is {} bytes for a {width}-byte datatype",
+                        b.len()
+                    )));
+                }
+            };
+            cd[PARM_FILAVAIL] = FILL_DEFINED;
+            write_fill_bits(&mut cd, bits, width);
+        }
+    }
     Ok(cd)
 }
 
 /// Recover the [`ScaleOffset`] mode a parsed filter encodes from its
-/// `cd_values`, so a tool like [`repack`](crate::repack) can re-apply it.
+/// `cd_values`, along with whether it records a fill value, so a tool like
+/// [`repack`](crate::repack) can re-apply both.
 ///
 /// Returns `None` if the parameter array is too short, names a scale type this
-/// crate never writes (the reference library's float *E*-scale), or carries a
-/// **defined fill value**. [`compress`] encodes that last form, but the mode
-/// this returns is re-applied through
-/// [`DatasetBuilder::with_scale_offset`](crate::DatasetBuilder::with_scale_offset),
-/// which rebuilds `cd_values` via [`build_cd_values`] and has nowhere to put
-/// the fill value — so a repack would emit a fill-*undefined* filter and
-/// silently drop the source's chunk-fill semantics. Refusing keeps repack
-/// faithful rather than approximate; carrying the fill value through the
-/// builder is the remaining piece.
-pub(crate) fn scale_offset_mode(cd_values: &[u32]) -> Option<ScaleOffset> {
+/// crate never writes (the reference library's float *E*-scale), or records
+/// neither fill availability — a value the reference never writes and whose
+/// meaning is undefined.
+///
+/// The fill *value* is not returned with the availability, because re-applying
+/// it is not this parameter's job: the rebuilt filter takes its value from the
+/// dataset's own fill value, which the writer records the way the reference
+/// does. A source whose filter disagreed with its Fill Value message is
+/// therefore re-emitted agreeing with it — the two encodings hold the same
+/// elements, since each decodes its sentinel back to the value its own
+/// parameters name.
+pub(crate) fn scale_offset_mode(cd_values: &[u32]) -> Option<(ScaleOffset, FillAvailability)> {
     let scale_type = *cd_values.get(PARM_SCALETYPE)?;
     let scale_factor = *cd_values.get(PARM_SCALEFACTOR)?;
-    if cd_values.get(PARM_FILAVAIL).copied() != Some(FILL_UNDEFINED) {
-        return None;
-    }
-    match scale_type {
-        SO_INT => Some(ScaleOffset::Integer(scale_factor)),
+    let fill = match *cd_values.get(PARM_FILAVAIL)? {
+        FILL_UNDEFINED => FillAvailability::Undefined,
+        FILL_DEFINED => FillAvailability::Defined,
+        _ => return None,
+    };
+    let mode = match scale_type {
+        SO_INT => ScaleOffset::Integer(scale_factor),
         #[expect(
             clippy::cast_possible_wrap,
             reason = "scale_factor is a small decimal scale factor (D-scale parameter); the reference treats it as a signed int"
         )]
-        SO_FLOAT_DSCALE => Some(ScaleOffset::FloatDScale(scale_factor as i32)),
+        SO_FLOAT_DSCALE => ScaleOffset::FloatDScale(scale_factor as i32),
         // SO_FLOAT_ESCALE (and anything unrecognized) is never written by this
         // crate and cannot be reproduced.
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some((mode, fill))
 }
 
 /// Decoded scale-offset parameters shared by the compress and decompress paths.
@@ -1213,6 +1317,26 @@ fn sentinel(minbits: u32) -> u64 {
     (1u64 << minbits).wrapping_sub(1)
 }
 
+/// Store a `size`-byte fill value in `cd_values[8..]`, least-significant 4
+/// bytes per entry: the inverse of [`read_fill_bits`], and the layout
+/// `H5Z__scaleoffset_set_parms_fillval` writes.
+///
+/// `size` is at most 8 and `cd` is always [`TOTAL_NPARMS`] long, so the two
+/// entries this can reach are always present.
+fn write_fill_bits(cd: &mut [u32], bits: u64, size: usize) {
+    let le = bits.to_le_bytes();
+    let mut off = 0;
+    let mut idx = PARM_FILVAL;
+    while off < size {
+        let take = (size - off).min(4);
+        let mut entry = [0u8; 4];
+        entry[..take].copy_from_slice(&le[off..off + take]);
+        cd[idx] = u32::from_le_bytes(entry);
+        off += take;
+        idx += 1;
+    }
+}
+
 /// Reassemble a `size`-byte fill value from `cd_values[8..]` (stored
 /// least-significant 4 bytes per entry).
 fn read_fill_bits(cd: &[u32], size: usize) -> Result<u64, FormatError> {
@@ -1266,36 +1390,65 @@ fn pow10_f32(exp: i32) -> f32 {
     pow10_f64(exp) as f32
 }
 
-/// Round half away from zero to the nearest integer, approximating C `llround`.
+/// Round half away from zero to the nearest integer, matching C `llround`.
 /// Float-to-int `as` casts saturate in Rust, so out-of-range inputs are safe.
 ///
-/// Rounding `x + 0.5` is not the same function as rounding `x`: at
-/// `x = 0.49999999999999994` — the largest double below one half — the sum is
-/// exactly `0.5` and this yields 1 where `llround` yields 0. Deterministic, and
-/// it can shift a whole chunk's `minbits` through `span`, but it needs an input
-/// within one ulp of a half. Tracked with the other sub-ulp divergences.
+/// Rounding the *sum* `x + 0.5` is not the same function as rounding `x`, and
+/// the difference is observable: at `x = 0.49999999999999994` — the largest
+/// double below one half — the exact sum `1 - 2^-54` sits halfway between two
+/// doubles, so it rounds to `1.0` and the cast yields 1 where `llround(x)`
+/// yields 0. The fractional part is therefore compared against one half
+/// directly. `x - trunc(x)` is exact for every finite `x`, which is what makes
+/// that comparison exact rather than merely closer.
+///
+/// Every double of magnitude `2^52` or more is already an integer, so above that
+/// there is nothing to round and the cast — which saturates where C's `llround`
+/// is undefined — answers on its own. That also catches NaN, which fails both
+/// comparisons.
 #[expect(
     clippy::cast_possible_truncation,
-    reason = "float-to-int `as` saturates in Rust, so rounding x +/- 0.5 to i64 is safe even for out-of-range inputs (matches C llround)"
+    reason = "float-to-int `as` saturates in Rust, so rounding to i64 is safe even for out-of-range inputs (matches C llround)"
 )]
 fn round_half_away_f64(x: f64) -> i64 {
-    if x >= 0.0 {
-        (x + 0.5) as i64
+    /// The first `f64` magnitude at which consecutive doubles are 1 apart.
+    const INTEGRAL: f64 = (1u64 << 52) as f64;
+    if !(x > -INTEGRAL && x < INTEGRAL) {
+        return x as i64;
+    }
+    // Exact: |x| < 2^52 so the truncation round-trips through i64, and the
+    // subtraction of two nearby doubles is representable.
+    let trunc = x as i64;
+    let frac = x - trunc as f64;
+    if frac >= 0.5 {
+        trunc + 1
+    } else if frac <= -0.5 {
+        trunc - 1
     } else {
-        (x - 0.5) as i64
+        trunc
     }
 }
 
-/// `f32` counterpart of [`round_half_away_f64`] (matches C `lroundf`).
+/// `f32` counterpart of [`round_half_away_f64`] (matches C `lroundf`), rounding
+/// `x` itself for the same reason — the `f32` sum rounds to `1.0` at
+/// `x = 0.499_999_97`, the largest float below one half.
 #[expect(
     clippy::cast_possible_truncation,
-    reason = "float-to-int `as` saturates in Rust, so rounding x +/- 0.5 to i64 is safe even for out-of-range inputs (matches C lroundf)"
+    reason = "float-to-int `as` saturates in Rust, so rounding to i64 is safe even for out-of-range inputs (matches C lroundf)"
 )]
 fn round_half_away_f32(x: f32) -> i64 {
-    if x >= 0.0 {
-        (x + 0.5) as i64
+    /// The first `f32` magnitude at which consecutive floats are 1 apart.
+    const INTEGRAL: f32 = (1u32 << 23) as f32;
+    if !(x > -INTEGRAL && x < INTEGRAL) {
+        return x as i64;
+    }
+    let trunc = x as i64;
+    let frac = x - trunc as f32;
+    if frac >= 0.5 {
+        trunc + 1
+    } else if frac <= -0.5 {
+        trunc - 1
     } else {
-        (x - 0.5) as i64
+        trunc
     }
 }
 
@@ -1330,7 +1483,14 @@ mod tests {
             filter_id: crate::filter_pipeline::FILTER_SCALEOFFSET,
             name: None,
             flags: 0,
-            client_data: build_cd_values(ScaleOffset::Integer(0), ty, size, nelmts).unwrap(),
+            client_data: build_cd_values(
+                ScaleOffset::Integer(0),
+                ty,
+                size,
+                nelmts,
+                ScaleOffsetFill::Undefined,
+            )
+            .unwrap(),
         }
     }
 
@@ -1344,8 +1504,14 @@ mod tests {
             filter_id: crate::filter_pipeline::FILTER_SCALEOFFSET,
             name: None,
             flags: 0,
-            client_data: build_cd_values(ScaleOffset::FloatDScale(decimals), ty, size, nelmts)
-                .unwrap(),
+            client_data: build_cd_values(
+                ScaleOffset::FloatDScale(decimals),
+                ty,
+                size,
+                nelmts,
+                ScaleOffsetFill::Undefined,
+            )
+            .unwrap(),
         }
     }
 
@@ -1355,24 +1521,250 @@ mod tests {
         let f = int_filter(4, true, ORDER_LE, 16);
         assert_eq!(
             scale_offset_mode(&f.client_data),
-            Some(ScaleOffset::Integer(0))
+            Some((ScaleOffset::Integer(0), FillAvailability::Undefined))
         );
 
         // Lossy float D-scale is recognized as such; repack refuses it upstream.
         let f = float_filter(8, 3, ORDER_LE, 16);
         assert_eq!(
             scale_offset_mode(&f.client_data),
-            Some(ScaleOffset::FloatDScale(3))
+            Some((ScaleOffset::FloatDScale(3), FillAvailability::Undefined))
         );
 
-        // A defined fill value cannot be reproduced faithfully -> None.
+        // A defined fill value is recovered as one, so repack re-applies the
+        // availability the source recorded rather than refusing the dataset.
         let mut fill_defined = int_filter(4, true, ORDER_LE, 16);
         fill_defined.client_data[PARM_FILAVAIL] = FILL_DEFINED;
-        assert_eq!(scale_offset_mode(&fill_defined.client_data), None);
+        assert_eq!(
+            scale_offset_mode(&fill_defined.client_data),
+            Some((ScaleOffset::Integer(0), FillAvailability::Defined))
+        );
+
+        // Neither availability: a value the reference never writes, so what it
+        // would mean is undefined and re-applying it would be a guess.
+        let mut bad = int_filter(4, true, ORDER_LE, 16);
+        bad.client_data[PARM_FILAVAIL] = 2;
+        assert_eq!(scale_offset_mode(&bad.client_data), None);
 
         // Too-short parameter arrays -> None, never a panic.
         assert_eq!(scale_offset_mode(&[]), None);
         assert_eq!(scale_offset_mode(&[SO_INT, 0]), None);
+    }
+
+    /// `signed char` is the one type `H5Z__scaleoffset_precompress_i` hand-
+    /// expands rather than routing through the `H5Z_scaleoffset_check_2` macro,
+    /// and the expansion assigns `*minval` in its fill-**undefined** early
+    /// return where the macro assigns nothing. So a 1-byte signed chunk that
+    /// falls back to full precision carries the chunk's minimum in its header,
+    /// and every other width, signedness, and fill mode carries zero.
+    ///
+    /// Measured against the C library when this encoder was written. It stays a
+    /// unit test rather than a crosscheck because nothing this crate *writes*
+    /// records an undefined fill value any longer — the branch is reached by
+    /// re-encoding a chunk of a file that already carries one, which is what an
+    /// append to a dataset written before 0.40, or a repack of one, does.
+    ///
+    /// Every fixture's minimum is deliberately non-zero: a chunk whose minimum
+    /// is zero writes the same header under either rule.
+    #[test]
+    fn the_fill_undefined_fallback_carries_the_signed_char_minimum() {
+        let minval_of = |raw: &[u8], size: u32, signed: bool| {
+            let nelmts = raw.len() as u32 / size;
+            let f = int_filter(size, signed, ORDER_LE, nelmts);
+            let out = compress(raw, &f).unwrap();
+            // The fixtures all spread past the point where packing can pay, so
+            // each must have taken the full-precision fallback.
+            assert_eq!(
+                u32::from_le_bytes(out[..4].try_into().unwrap()),
+                size * 8,
+                "the fixture must reach the full-precision fallback"
+            );
+            u64::from_le_bytes(out[5..13].try_into().unwrap())
+        };
+
+        let i8_raw: Vec<u8> = [-128i8, 126, -128, 126, -1, -2, -3, -4]
+            .iter()
+            .map(|&v| v as u8)
+            .collect();
+        assert_eq!(minval_of(&i8_raw, 1, true), (-128i64) as u64);
+
+        // One byte wide but unsigned: the macro-driven path, so zero. Its own
+        // fixture, because the signed one read as unsigned spans only 126..255
+        // — inside the threshold, so it would reach the *other* full-precision
+        // return, the one that does carry the minimum in every mode.
+        let u8_raw: Vec<u8> = vec![1, 255, 1, 255, 2, 3, 4, 5];
+        assert_eq!(minval_of(&u8_raw, 1, false), 0);
+
+        let i16_raw: Vec<u8> = [-32768i16, 32766, -32768, 32766, -1, -2, -3, -4]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        assert_eq!(
+            minval_of(&i16_raw, 2, true),
+            0,
+            "signed, but two bytes wide"
+        );
+
+        // And the fill-defined half of the same 1-byte signed chunk, which the
+        // crosscheck pins against the C library: the hand-expanded branch
+        // assigns nothing there either.
+        let mut defined = int_filter(1, true, ORDER_LE, i8_raw.len() as u32);
+        defined.client_data[PARM_FILAVAIL] = FILL_DEFINED;
+        let out = compress(&i8_raw, &defined).unwrap();
+        assert_eq!(u64::from_le_bytes(out[5..13].try_into().unwrap()), 0);
+    }
+
+    /// The fill value's round trip through `cd_values`: written the way
+    /// `H5Z__scaleoffset_set_parms_fillval` writes it and read back by the same
+    /// [`read_fill_bits`] the decoder uses, at every width and in both byte
+    /// orders. A `u64` fill spans two entries, which is the case a single-entry
+    /// writer would silently truncate.
+    #[test]
+    fn a_fill_value_round_trips_through_the_filter_parameters() {
+        for (size, bits) in [
+            (1u32, 0xA5u64),
+            (2, 0xBEEF),
+            (4, 0xDEAD_BEEF),
+            (8, 0x0123_4567_89AB_CDEF),
+        ] {
+            for order in [ORDER_LE, ORDER_BE] {
+                let ty = ScaleOffsetType {
+                    class: CLS_INTEGER,
+                    sign: SGN_NONE,
+                    order,
+                };
+                // The fill value as the dataset stores it: `size` bytes in the
+                // dataset's own byte order.
+                let mut bytes = Vec::new();
+                write_value(&mut bytes, bits, size as usize, order);
+                let cd = build_cd_values(
+                    ScaleOffset::Integer(0),
+                    ty,
+                    size,
+                    4,
+                    ScaleOffsetFill::Defined(Some(&bytes)),
+                )
+                .unwrap();
+
+                assert_eq!(cd[PARM_FILAVAIL], FILL_DEFINED);
+                assert_eq!(
+                    read_fill_bits(&cd, size as usize).unwrap(),
+                    bits,
+                    "size {size}, order {order}"
+                );
+                // Entries past the value stay zero, as the reference leaves them.
+                let used = (size as usize).div_ceil(4);
+                assert!(cd[PARM_FILVAL + used..].iter().all(|&e| e == 0));
+            }
+        }
+
+        // The library default is a defined fill value of zero, not an absent one.
+        let ty = ScaleOffsetType {
+            class: CLS_INTEGER,
+            sign: SGN_NONE,
+            order: ORDER_LE,
+        };
+        let cd = build_cd_values(
+            ScaleOffset::Integer(0),
+            ty,
+            4,
+            4,
+            ScaleOffsetFill::Defined(None),
+        )
+        .unwrap();
+        assert_eq!(cd[PARM_FILAVAIL], FILL_DEFINED);
+        assert_eq!(read_fill_bits(&cd, 4).unwrap(), 0);
+
+        // A datatype wider than the filter's own limit is refused rather than
+        // running the fill value off the end of the parameter array.
+        for width in [0u32, 9, 16] {
+            assert!(
+                build_cd_values(
+                    ScaleOffset::Integer(0),
+                    ty,
+                    width,
+                    4,
+                    ScaleOffsetFill::Defined(Some(&vec![0u8; width as usize]))
+                )
+                .is_err(),
+                "a {width}-byte datatype"
+            );
+        }
+
+        // A fill value that is not one element wide is refused rather than
+        // truncated or padded into a different value.
+        for bad in [vec![1u8], vec![1u8; 8]] {
+            assert!(
+                build_cd_values(
+                    ScaleOffset::Integer(0),
+                    ty,
+                    4,
+                    4,
+                    ScaleOffsetFill::Defined(Some(&bad))
+                )
+                .is_err(),
+                "a {}-byte fill value for a 4-byte datatype",
+                bad.len()
+            );
+        }
+    }
+
+    /// The rounding these helpers do is C `llround`/`lroundf` — round `x` half
+    /// away from zero — and not "round `x + 0.5`", which is a different
+    /// function. The two disagree at exactly one input per sign and precision:
+    /// the largest float below one half, where the sum lands *on* the half and
+    /// rounds up.
+    ///
+    /// That input reaches the encoder as `value * 10^D - min_scaled`, so it is
+    /// data-dependent rather than exotic, and it changes a decoded value rather
+    /// than only the bytes it is stored as.
+    #[test]
+    fn rounding_is_llround_and_not_the_rounded_sum() {
+        // The half-way cases themselves round away from zero, in both signs and
+        // at every magnitude where a half is representable.
+        for (x, want) in [
+            (0.5f64, 1i64),
+            (-0.5, -1),
+            (1.5, 2),
+            (-1.5, -2),
+            (2.5, 3),
+            (-2.5, -3),
+            (0.0, 0),
+            (0.4, 0),
+            (-0.4, 0),
+            (7.0, 7),
+        ] {
+            assert_eq!(round_half_away_f64(x), want, "f64 round({x})");
+        }
+
+        // The largest double below one half: the sum `x + 0.5` rounds up to
+        // exactly 1.0, where rounding `x` itself gives 0.
+        let below_half = 0.499_999_999_999_999_94f64;
+        assert!(below_half < 0.5 && below_half + 0.5 == 1.0);
+        assert_eq!(round_half_away_f64(below_half), 0);
+        assert_eq!(round_half_away_f64(-below_half), 0);
+
+        // The `f32` counterpart, where the sum rounds to exactly 1.0.
+        let below_half_f32 = 0.499_999_97f32;
+        assert!(below_half_f32 < 0.5 && below_half_f32 + 0.5 == 1.0);
+        assert_eq!(round_half_away_f32(below_half_f32), 0);
+        assert_eq!(round_half_away_f32(-below_half_f32), 0);
+        assert_eq!(round_half_away_f32(0.5), 1);
+        assert_eq!(round_half_away_f32(-2.5), -3);
+
+        // Past the point where consecutive floats are more than 1 apart every
+        // value is already an integer, and beyond the integer range the cast
+        // saturates rather than wrapping (C leaves it undefined).
+        assert_eq!(round_half_away_f64(1e300), i64::MAX);
+        assert_eq!(round_half_away_f64(-1e300), i64::MIN);
+        assert_eq!(round_half_away_f32(1e30), i64::MAX);
+        assert_eq!(round_half_away_f64(f64::NAN), 0);
+        assert_eq!(round_half_away_f32(f32::NAN), 0);
+        // Either side of the constant that separates the two branches.
+        let integral = (1u64 << 52) as f64;
+        assert_eq!(round_half_away_f64(integral), 1 << 52);
+        assert_eq!(round_half_away_f64(integral - 1.0), (1 << 52) - 1);
+        assert_eq!(round_half_away_f64(-integral), -(1 << 52));
     }
 
     #[test]
@@ -1595,13 +1987,31 @@ mod tests {
             sign: SGN_2,
             order: ORDER_LE,
         };
-        assert!(build_cd_values(ScaleOffset::FloatDScale(2), int_ty, 4, 10).is_err());
+        assert!(
+            build_cd_values(
+                ScaleOffset::FloatDScale(2),
+                int_ty,
+                4,
+                10,
+                ScaleOffsetFill::Undefined
+            )
+            .is_err()
+        );
         let float_ty = ScaleOffsetType {
             class: CLS_FLOAT,
             sign: SGN_NONE,
             order: ORDER_LE,
         };
-        assert!(build_cd_values(ScaleOffset::Integer(0), float_ty, 8, 10).is_err());
+        assert!(
+            build_cd_values(
+                ScaleOffset::Integer(0),
+                float_ty,
+                8,
+                10,
+                ScaleOffsetFill::Undefined
+            )
+            .is_err()
+        );
     }
 
     /// Deterministic xorshift64 used to drive the property-style tests below.
@@ -1881,21 +2291,65 @@ mod tests {
         nelmts: u32,
         fill: u64,
     ) -> FilterDescription {
+        // Through the writer rather than by packing the parameters here: a test
+        // helper that laid them out itself would agree with a writer that laid
+        // them out wrongly.
+        let mut bytes = Vec::new();
+        write_value(&mut bytes, fill, size as usize, order);
         let mut f = int_filter(size, signed, order, nelmts);
-        f.client_data[PARM_FILAVAIL] = FILL_DEFINED;
-        // The fill value occupies the least-significant 4 bytes of each entry
-        // from PARM_FILVAL on.
-        for (k, entry) in fill
-            .to_le_bytes()
-            .chunks(4)
-            .take((size as usize).div_ceil(4))
-            .enumerate()
-        {
-            let mut w = [0u8; 4];
-            w[..entry.len()].copy_from_slice(entry);
-            f.client_data[PARM_FILVAL + k] = u32::from_le_bytes(w);
-        }
+        f.client_data = build_cd_values(
+            ScaleOffset::Integer(0),
+            ScaleOffsetType {
+                class: CLS_INTEGER,
+                sign: if signed { SGN_2 } else { SGN_NONE },
+                order,
+            },
+            size,
+            nelmts,
+            ScaleOffsetFill::Defined(Some(&bytes)),
+        )
+        .unwrap();
         f
+    }
+
+    /// A big-endian dataset's fill value is carried through `cd_values` as a
+    /// *value*, not as the dataset's bytes: the writer converts on the way in
+    /// and the decoder converts on the way out, matching what the reference does
+    /// on a little-endian host. Convert on only one side and a fill element
+    /// matches nothing — or, worse, something else does.
+    ///
+    /// `minbits` is what shows it. The non-fill values here span three code
+    /// points, so recognizing the fill value packs them into two bits; missing
+    /// it stretches the chunk's range across the whole distance to `0x0BAD`.
+    #[test]
+    fn a_big_endian_fill_value_is_recognized() {
+        let fill = 0x0BADu64;
+        let values: Vec<u16> = vec![0x0BAD, 3, 4, 0x0BAD, 5];
+        for order in [ORDER_LE, ORDER_BE] {
+            let raw: Vec<u8> = values
+                .iter()
+                .flat_map(|v| {
+                    if order == ORDER_LE {
+                        v.to_le_bytes()
+                    } else {
+                        v.to_be_bytes()
+                    }
+                })
+                .collect();
+            let f = int_filter_with_fill(2, false, order, values.len() as u32, fill);
+            let packed = compress(&raw, &f).unwrap();
+
+            assert_eq!(
+                u32::from_le_bytes(packed[..4].try_into().unwrap()),
+                2,
+                "order {order}: the fill value must be recognized, not packed"
+            );
+            assert_eq!(
+                decompress(&packed, &f, None).unwrap(),
+                raw,
+                "order {order}: round trip"
+            );
+        }
     }
 
     /// Encode with a defined fill value and decode it back (issue #287).

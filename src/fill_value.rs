@@ -96,6 +96,23 @@ impl<'a> FillPattern<'a> {
         }
     }
 
+    /// One element's fill bytes, or `None` for the implicit zero — for a caller
+    /// that must *record* the fill value rather than tile it, which is what the
+    /// scale-offset filter's parameters do.
+    ///
+    /// # Errors
+    ///
+    /// [`FormatError::UnreadableFillValue`] for the unknown pattern, for the
+    /// same reason [`apply`](Self::apply) refuses it: a value that could not be
+    /// read cannot be recorded as zero, since a decoder would then treat real
+    /// zeros as fill values.
+    pub(crate) fn element(self) -> Result<Option<&'a [u8]>, FormatError> {
+        if self.unknown {
+            return Err(FormatError::UnreadableFillValue);
+        }
+        Ok(self.element)
+    }
+
     /// A `len`-byte buffer holding the pattern, repeated from the start.
     ///
     /// `len` is a whole number of elements at every call site; a trailing
