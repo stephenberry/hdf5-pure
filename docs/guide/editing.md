@@ -98,6 +98,20 @@ root.create_dataset("run2/signal", |b| {
 .unwrap();
 ```
 
+A new dataset may be created **empty** — zero elements, chunked, with or without an unlimited maximum — which is how a schema-first writer declares its columns before any data has arrived and then grows each one with [`append_staged`](#appending-to-an-unlimited-dataset) as batches come in:
+
+```rust
+root.create_dataset("col", |b| {
+    b.with_f64_data(&[])
+        .with_shape(&[0])
+        .with_maxshape(&[u64::MAX])
+        .with_chunks(&[512]);
+})
+.unwrap();
+```
+
+The chunk dimensions have to be given: auto-chunking derives them from the shape, and a zero-element shape has none to derive from.
+
 `set_attr` needs a group that already resolves, so a group staged in this same batch is not reachable through it — stage those attributes with `create_group_with` instead. A staged object is not resolvable by name until `commit`, so `File::group`/`File::dataset` will not find it before then.
 
 The `create_group_with`/`create_dataset`/`write_staged`/`append_staged` closures configure a builder rather than the file itself, so a closure may read the same `File` — staging a dataset whose contents depend on one already there works. What it reads is the file as it was before the call, since nothing staged resolves until `commit`.

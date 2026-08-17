@@ -1956,45 +1956,79 @@ fn add_zfp_dataset() {
 }
 
 /// Malformed chunked-dataset requests are refused before any byte is written,
-/// rather than panicking or producing a silently-corrupt dataset: an empty
-/// (zero-element) shape, chunk dims whose rank disagrees with the shape, a zero
-/// chunk dimension, and a maxshape whose rank disagrees with the shape.
+/// rather than panicking or producing a silently-corrupt dataset: chunk dims
+/// whose rank disagrees with the shape, a zero chunk dimension, a maxshape whose
+/// rank disagrees with the shape or falls below it, a chunked scalar, and a
+/// zero-element shape left to auto-chunking (which would resolve to a zero
+/// chunk dimension and divide by zero in the splitter — an *explicitly* chunked
+/// zero-element shape is legal, see
+/// `add_empty_extensible_chunked_dataset_and_grow_it`).
+///
+/// Each case names the substring its own refusal must carry: without that, a
+/// case refused for some unrelated reason still passes, and the guard under test
+/// is never reached.
 #[test]
 fn malformed_chunked_requests_are_rejected_without_writing() {
     // A no-capture configurator per malformed case; `fn` pointers keep the case
     // table a simple type.
     type Configure = fn(&mut hdf5_pure::DatasetBuilder);
-    let bad: &[(&str, Configure)] = &[
-        ("empty shape", |b| {
-            b.with_f64_data(&[]).with_shape(&[0]).with_chunks(&[4]);
-        }),
-        ("chunk rank mismatch", |b| {
-            b.with_i32_data(&[1, 2, 3, 4, 5, 6])
-                .with_shape(&[2, 3])
-                .with_chunks(&[2]);
-        }),
-        ("zero chunk dim", |b| {
-            b.with_i32_data(&[1, 2, 3, 4])
-                .with_shape(&[4])
-                .with_chunks(&[0]);
-        }),
-        ("maxshape rank mismatch", |b| {
-            b.with_i32_data(&[1, 2, 3, 4])
-                .with_shape(&[4])
-                .with_maxshape(&[u64::MAX, u64::MAX])
-                .with_chunks(&[2]);
-        }),
-        ("scalar with chunks", |b| {
-            b.with_f64_data(&[1.0]).with_shape(&[]).with_chunks(&[1]);
-        }),
-        ("maxshape below shape", |b| {
-            b.with_i32_data(&[1, 2, 3, 4])
-                .with_shape(&[4])
-                .with_maxshape(&[2]);
-        }),
+    let bad: &[(&str, Configure, &str)] = &[
+        (
+            "auto-chunked empty shape",
+            |b| {
+                b.with_f64_data(&[])
+                    .with_shape(&[0])
+                    .with_maxshape(&[u64::MAX]);
+            },
+            "explicit chunk dimensions",
+        ),
+        (
+            "chunk rank mismatch",
+            |b| {
+                b.with_i32_data(&[1, 2, 3, 4, 5, 6])
+                    .with_shape(&[2, 3])
+                    .with_chunks(&[2]);
+            },
+            "chunk dimensions must have the same rank",
+        ),
+        (
+            "zero chunk dim",
+            |b| {
+                b.with_i32_data(&[1, 2, 3, 4])
+                    .with_shape(&[4])
+                    .with_chunks(&[0]);
+            },
+            "chunk dimensions must all be non-zero",
+        ),
+        (
+            "maxshape rank mismatch",
+            |b| {
+                b.with_i32_data(&[1, 2, 3, 4])
+                    .with_shape(&[4])
+                    .with_maxshape(&[u64::MAX, u64::MAX])
+                    .with_chunks(&[2]);
+            },
+            "maxshape must have the same rank",
+        ),
+        (
+            "scalar with chunks",
+            |b| {
+                b.with_f64_data(&[1.0]).with_shape(&[]).with_chunks(&[1]);
+            },
+            "a scalar dataset cannot be chunked",
+        ),
+        (
+            "maxshape below shape",
+            |b| {
+                b.with_i32_data(&[1, 2, 3, 4])
+                    .with_shape(&[4])
+                    .with_maxshape(&[2]);
+            },
+            "maxshape must be at least the current shape",
+        ),
     ];
 
-    for (label, configure) in bad {
+    for (label, configure, expected) in bad {
         let path = std::env::temp_dir().join(format!(
             "hdf5_pure_edit_reject_{}.h5",
             label.replace(' ', "_")
@@ -2005,9 +2039,14 @@ fn malformed_chunked_requests_are_rejected_without_writing() {
             let session = File::open_rw(&path).unwrap();
             session.root().create_dataset("bad", configure).unwrap();
             let err = session.commit().unwrap_err();
+            let text = err.to_string();
             assert!(
-                err.to_string().contains("in-place edit"),
+                text.contains("in-place edit"),
                 "[{label}] expected an EditUnsupported refusal, got: {err}"
+            );
+            assert!(
+                text.contains(expected),
+                "[{label}] refusal must name {expected:?}, got: {err}"
             );
         }
         // The guard runs before any write, so the file is untouched.
@@ -2755,36 +2794,6 @@ fn add_empty_dataset_via_edit_session() {
         file.dataset("original").unwrap().read_f64().unwrap(),
         vec![1.0, 2.0, 3.0, 4.0]
     );
-    std::fs::remove_file(&path).ok();
-}
-
-/// Chunking a zero-element shape stays refused in place (it's a distinct,
-/// separately-tracked capability from the plain contiguous empty dataset
-/// above): `malformed_chunked_requests_are_rejected_without_writing` already
-/// covers the whole-file-writer-equivalent geometry refusal; this confirms
-/// `File::open_rw` refuses it too, cleanly, without writing anything.
-#[test]
-fn add_chunked_empty_dataset_is_rejected_without_writing() {
-    let path = std::env::temp_dir().join("hdf5_pure_edit_add_chunked_empty.h5");
-    write_starter(&path);
-    let before = std::fs::read(&path).unwrap();
-
-    {
-        let session = File::open_rw(&path).unwrap();
-        session
-            .root()
-            .create_dataset("stream", |b| {
-                b.with_i32_data(&[])
-                    .with_shape(&[0])
-                    .with_maxshape(&[u64::MAX])
-                    .with_chunks(&[16]);
-            })
-            .unwrap();
-        let err = session.commit().unwrap_err();
-        assert!(err.to_string().contains("empty"), "got: {err}");
-    }
-
-    assert_eq!(std::fs::read(&path).unwrap(), before);
     std::fs::remove_file(&path).ok();
 }
 
@@ -3694,6 +3703,195 @@ fn a_zero_width_element_type_is_refused_by_a_staged_write() {
     assert_eq!(
         file.dataset("original").unwrap().read_f64().unwrap(),
         vec![1.0, 2.0, 3.0, 4.0]
+    );
+    drop(file);
+    std::fs::remove_file(&path).ok();
+}
+
+/// An empty (zero-element) chunked, unlimited dataset added in place: the shape
+/// an incremental writer declares its schema at before any data has arrived
+/// (issue #284). The edit engine used to refuse it outright, so a schema-first
+/// writer had to rewrite the whole file to declare one column.
+///
+/// The dataset that comes out has to be the same one the whole-file writer
+/// makes, which means growable: the append in the second session is what proves
+/// the index over zero chunks is a real Extensible Array and not a placeholder.
+#[test]
+fn add_empty_extensible_chunked_dataset_and_grow_it() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_empty_chunked.h5");
+    write_starter(&path);
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("col", |b| {
+                b.with_i64_data(&[])
+                    .with_shape(&[0])
+                    .with_maxshape(&[u64::MAX])
+                    .with_chunks(&[2]);
+            })
+            .unwrap();
+        session.commit().unwrap();
+    }
+
+    {
+        let file = File::open(&path).unwrap();
+        let ds = file.dataset("col").unwrap();
+        assert_eq!(ds.shape().unwrap(), vec![0]);
+        assert_eq!(ds.read_i64().unwrap(), Vec::<i64>::new());
+        // Chunked storage with the growable index, not a contiguous fallback.
+        assert!(
+            matches!(
+                ds.layout().unwrap(),
+                hdf5_pure::Layout::Chunked {
+                    index: hdf5_pure::ChunkIndex::ExtensibleArray,
+                    ..
+                }
+            ),
+            "expected an extensible-array chunked layout, got {:?}",
+            ds.layout().unwrap()
+        );
+    }
+
+    // Two appends of two whole chunks each (the chunk is 2 elements wide), so
+    // the second grows an index that already holds chunks rather than one built
+    // empty. A chunk wide enough to swallow both batches would exercise the
+    // first case twice and never the second.
+    for batch in [[1i64, 2, 3, 4].as_slice(), [5i64, 6, 7, 8].as_slice()] {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .dataset("col")
+            .unwrap()
+            .append_staged(|a| {
+                a.append_i64(batch);
+            })
+            .unwrap();
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let ds = file.dataset("col").unwrap();
+    assert_eq!(ds.shape().unwrap(), vec![8]);
+    assert_eq!(ds.read_i64().unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    // Four chunks of two, so the index really did grow past what it was built
+    // holding.
+    assert_eq!(ds.chunks().unwrap().len(), 4);
+    // The file the edits were appended into is untouched.
+    assert_eq!(
+        file.dataset("original").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    drop(file);
+    std::fs::remove_file(&path).ok();
+}
+
+/// The other empty-chunked shapes the same lifted refusal now admits: a
+/// fixed-shape (non-extensible) one, a multi-dimensional one, and a filtered
+/// one. Each has zero chunks, so each exercises a different index built over
+/// nothing — a fixed array, and the filtered pipeline that never runs.
+#[test]
+fn add_empty_chunked_datasets_of_every_flavor() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_empty_chunked_flavors.h5");
+    write_starter(&path);
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        let root = session.root();
+        root.create_dataset("fixed", |b| {
+            b.with_i32_data(&[]).with_shape(&[0]).with_chunks(&[8]);
+        })
+        .unwrap();
+        root.create_dataset("two_d", |b| {
+            b.with_f64_data(&[])
+                .with_shape(&[0, 3])
+                .with_maxshape(&[u64::MAX, 3])
+                .with_chunks(&[4, 3]);
+        })
+        .unwrap();
+        // The issue's own repro shape: a datatype and a shape, no data at all.
+        // `with_i64_data(&[])` reaches the same place by a different route, and
+        // only this one covers a builder whose `data` is `None`.
+        root.create_dataset("declared", |b| {
+            b.with_dtype(hdf5_pure::make_u64_type())
+                .with_shape(&[0])
+                .with_maxshape(&[u64::MAX])
+                .with_chunks(&[512]);
+        })
+        .unwrap();
+        root.create_dataset("filtered", |b| {
+            b.with_i32_data(&[])
+                .with_shape(&[0])
+                .with_maxshape(&[u64::MAX])
+                .with_chunks(&[16])
+                .with_deflate(6)
+                .with_shuffle();
+        })
+        .unwrap();
+        session.commit().unwrap();
+    }
+
+    // Every flavor asserts its chunk index, not just its shape and an empty
+    // read: a contiguous dataset satisfies those two just as well, so on their
+    // own they cannot tell whether chunked storage was emitted at all.
+    let index_of = |name: &str| match File::open(&path).unwrap().dataset(name).unwrap().layout() {
+        Ok(hdf5_pure::Layout::Chunked { index, .. }) => format!("{index:?}"),
+        other => panic!("[{name}] expected chunked storage, got {other:?}"),
+    };
+    assert_eq!(index_of("fixed"), "FixedArray");
+    assert_eq!(index_of("two_d"), "ExtensibleArray");
+    assert_eq!(index_of("declared"), "ExtensibleArray");
+    assert_eq!(index_of("filtered"), "ExtensibleArray");
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.dataset("fixed").unwrap().shape().unwrap(), vec![0]);
+    assert_eq!(
+        file.dataset("fixed").unwrap().read_i32().unwrap(),
+        Vec::<i32>::new()
+    );
+    assert_eq!(file.dataset("two_d").unwrap().shape().unwrap(), vec![0, 3]);
+    assert_eq!(
+        file.dataset("two_d").unwrap().read_f64().unwrap(),
+        Vec::<f64>::new()
+    );
+    assert_eq!(file.dataset("declared").unwrap().shape().unwrap(), vec![0]);
+    assert_eq!(
+        file.dataset("declared").unwrap().read_u64().unwrap(),
+        Vec::<u64>::new()
+    );
+    assert_eq!(file.dataset("filtered").unwrap().shape().unwrap(), vec![0]);
+    assert_eq!(
+        file.dataset("filtered").unwrap().read_i32().unwrap(),
+        Vec::<i32>::new()
+    );
+    // The filter pipeline is recorded even though no chunk was ever encoded, so
+    // the first append compresses rather than silently writing raw chunks.
+    assert!(
+        !file
+            .dataset("filtered")
+            .unwrap()
+            .filter_pipeline()
+            .is_empty(),
+        "the filter pipeline must survive a dataset with no chunks"
+    );
+
+    // Growing the filtered one is the case an incremental writer actually runs.
+    drop(file);
+    {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .dataset("filtered")
+            .unwrap()
+            .append_staged(|a| {
+                a.append_i32(&(0..40).collect::<Vec<_>>());
+            })
+            .unwrap();
+        session.commit().unwrap();
+    }
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("filtered").unwrap().read_i32().unwrap(),
+        (0..40).collect::<Vec<i32>>()
     );
     drop(file);
     std::fs::remove_file(&path).ok();

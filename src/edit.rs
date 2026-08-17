@@ -88,8 +88,11 @@
 //!   dimensions. A chunked dataset's data and index — and any filtered chunks —
 //!   are produced by the same builder the whole-file writer uses and appended at
 //!   end-of-file, so its object header is byte-identical to a freshly written
-//!   one. A contiguous dataset may be empty (zero-element); chunking an empty
-//!   shape is not supported. A provenance dataset (`with_provenance`) is
+//!   one. A dataset may be empty (zero-element) under either storage, which is
+//!   how an extensible dataset is created before the first
+//!   [`append_staged`](crate::Dataset::append_staged) fills it: a contiguous one
+//!   gets the undefined data address, a chunked one an index over zero chunks.
+//!   A provenance dataset (`with_provenance`) is
 //!   supported, its attributes computed the same way the whole-file writer
 //!   computes them. A contiguous dataset may carry a variable-length-string
 //!   payload (`with_vlen_strings`) or per-element object-reference targets
@@ -1736,8 +1739,8 @@ impl WriteEngine {
     /// The dataset may be contiguous or chunked, and chunked datasets may be
     /// filtered (`with_deflate`, `with_shuffle`, `with_fletcher32`,
     /// `with_scale_offset`, `with_zfp`) and/or extensible (`with_maxshape`). An
-    /// empty (zero-element) contiguous dataset is supported (chunking one is
-    /// not), a provenance dataset (`with_provenance`) is supported, and a
+    /// empty (zero-element) dataset is supported under either storage, a
+    /// provenance dataset (`with_provenance`) is supported, and a
     /// contiguous dataset may carry variable-length attributes, a
     /// variable-length-string payload (`with_vlen_strings`), or path-resolved
     /// object-reference elements (`with_path_references`; chunking any of
@@ -7175,10 +7178,12 @@ fn meta_spans(spans: Vec<(u64, u64)>) -> impl Iterator<Item = (u64, u64, PageTyp
 /// unfiltered datasets are emitted as such; chunked, filtered, or extensible
 /// datasets carry their [`ChunkOptions`] and maxshape through to the commit,
 /// where [`WriteEngine::build_chunked_dataset`] lays out their chunk data and
-/// index. An
-/// empty (zero-element) shape is allowed for contiguous storage (mirroring the
-/// whole-file writer, its data address is `HADDR_UNDEF` — see the apply loop),
-/// but chunking one stays refused via the geometry validation below. A
+/// index. An empty (zero-element) shape is allowed under either storage,
+/// mirroring the whole-file writer: a contiguous one takes the `HADDR_UNDEF`
+/// data address (see the apply loop) and a chunked one an index over zero
+/// chunks, which is what an extensible dataset is created as before the first
+/// append fills it. The geometry validation below still requires explicit chunk
+/// dimensions for it — auto-chunking has no shape to derive them from. A
 /// `provenance` dataset has its SHA-256/creator/timestamp/source attributes
 /// computed here from `raw`, exactly as the whole-file writer does. A
 /// variable-length attribute's global heap collection is built here (it is
@@ -7205,11 +7210,6 @@ fn flatten_dataset(db: DatasetBuilder) -> Result<FlatDataset, Error> {
         .ok_or(Error::EditUnsupported("dataset has no shape"))?;
     let is_empty = shape.contains(&0);
     let chunked = db.chunk_options.is_chunked() || db.maxshape.is_some();
-    if is_empty && chunked {
-        return Err(Error::EditUnsupported(
-            "chunked or extensible empty (zero-element) datasets cannot be added in place yet",
-        ));
-    }
     // Variable-length string element references live in the global heap, whose
     // address is only known once the apply loop places the collection. For
     // chunked/filtered/resizable storage the references sit inside chunks

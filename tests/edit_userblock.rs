@@ -227,6 +227,82 @@ fn userblock_add_empty_dataset_roundtrip() {
     std::fs::remove_file(&path).ok();
 }
 
+/// The chunked counterpart of the test above: an empty chunked dataset added on
+/// a userblock file, then grown.
+///
+/// A userblock file is the only backing that forces the *mirrored* engine, and
+/// it is the only one where a base-relative address arithmetic slip is visible —
+/// at `base_address == 0` a missing or spurious `- base` is numerically
+/// invisible. An empty chunked dataset places a chunk index and nothing else, so
+/// the index address is the whole of what the layout message has to get right,
+/// and the append that follows proves the C library and this crate agree on
+/// where it landed.
+#[test]
+fn userblock_add_empty_chunked_dataset_and_grow_it() {
+    let path = std::env::temp_dir().join("hdf5_pure_ub_add_empty_chunked.h5");
+    let userblock = build_userblock_file(&path);
+
+    {
+        let s = File::open_rw(&path).unwrap();
+        let root = s.root();
+        root.create_dataset("col", |b| {
+            b.with_i64_data(&[])
+                .with_shape(&[0])
+                .with_maxshape(&[u64::MAX])
+                .with_chunks(&[4]);
+        })
+        .unwrap();
+        // The fixed-shape flavor too: it is the one that carries no index at
+        // all, so its layout message names the undefined address rather than a
+        // base-relative one — the case a blanket `- base` would corrupt.
+        root.create_dataset("fixed", |b| {
+            b.with_i64_data(&[]).with_shape(&[0]).with_chunks(&[4]);
+        })
+        .unwrap();
+        s.commit().unwrap();
+    }
+
+    {
+        let file = File::open(&path).unwrap();
+        assert_eq!(file.dataset("col").unwrap().shape().unwrap(), vec![0]);
+        assert_eq!(
+            file.dataset("col").unwrap().read_i64().unwrap(),
+            Vec::<i64>::new()
+        );
+        assert_eq!(
+            file.dataset("fixed").unwrap().read_i64().unwrap(),
+            Vec::<i64>::new()
+        );
+    }
+
+    // Grow it across several chunks, so the index the empty dataset placed is
+    // read back at its base-relative address and extended.
+    {
+        let s = File::open_rw(&path).unwrap();
+        s.dataset("col")
+            .unwrap()
+            .append_staged(|a| {
+                a.append_i64(&(0..10).collect::<Vec<i64>>());
+            })
+            .unwrap();
+        s.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("col").unwrap().read_i64().unwrap(),
+        (0..10).collect::<Vec<i64>>()
+    );
+    // Untouched original still reads correctly, and the userblock is intact.
+    assert_eq!(
+        file.dataset("alpha").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
+    assert_eq!(&std::fs::read(&path).unwrap()[..UB], &userblock[..]);
+
+    std::fs::remove_file(&path).ok();
+}
+
 /// A provenance-tagged dataset added on a userblock file must round-trip
 /// correctly, exercising the same base-relative address arithmetic as the
 /// non-userblock case above but where a `- base` bug would actually be
