@@ -1257,3 +1257,231 @@ fn corrupt_persisted_section_is_skipped_not_fatal() {
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// A paged file under delete-and-recreate churn stops growing rather than
+/// spending a page per commit (issue #286).
+///
+/// Every commit on a persisting paged file rewrites the superblock extension and
+/// the free-space manager blocks. Those used to be appended at a fresh
+/// page-aligned end-of-file and padded out to a page boundary, with the padding
+/// recorded nowhere: a workload that stayed within a fixed budget by deleting its
+/// oldest objects still grew without bound, at roughly one page per commit, and
+/// `reusable_free_bytes` accounted for a fraction of what the file had spent.
+///
+/// The assertion is on the *shape* of the growth rather than a byte figure. The
+/// file is allowed to reach whatever size the live data and its own layout need
+/// over the first few rounds; what it may not do is keep climbing once the
+/// workload is in its steady state, which is what an unreclaimed page per commit
+/// looks like from the outside.
+#[test]
+fn paged_churn_reaches_a_steady_size() {
+    const PAGE: u64 = 16384;
+    const ROUNDS: usize = 12;
+    const LIVE: usize = 2;
+
+    let path = tmp("hdf5_pure_fs_paged_churn.h5");
+    let _ = std::fs::remove_file(&path);
+    let mut b = FileBuilder::new();
+    b.create_dataset("seed").with_i32_data(&[0i32; 4]);
+    b.with_file_space_strategy(FileSpaceStrategy::Page, true, 1)
+        .with_file_space_page_size(PAGE);
+    b.write(&path).unwrap();
+
+    let rows: Vec<i32> = (0..500).map(|i| i % 97).collect();
+    let mut sizes = Vec::new();
+    for round in 0..ROUNDS {
+        // A fresh session per round, since the defect's worst half only shows
+        // across a close: free space is handed back to disk in a manager that
+        // records no page type, and until this fix a reopened session could never
+        // spend it on metadata again.
+        {
+            let f = File::open_rw(&path).unwrap();
+            f.root().create_group(&format!("g{round}")).unwrap();
+            f.commit().unwrap();
+            let g = f.group(&format!("g{round}")).unwrap();
+            for name in ["a", "b"] {
+                g.create_dataset(name, |b| {
+                    b.with_i32_data(&rows)
+                        .with_shape(&[rows.len() as u64])
+                        .with_maxshape(&[u64::MAX])
+                        .with_chunks(&[128]);
+                })
+                .unwrap();
+            }
+            f.commit().unwrap();
+        }
+        if round >= LIVE {
+            let f = File::open_rw(&path).unwrap();
+            f.root().delete(&format!("g{}", round - LIVE)).unwrap();
+            f.commit().unwrap();
+            // Every byte the file has spent and released is offered back, rather
+            // than a fraction of it: the padding around the rewritten managers
+            // used to be recorded nowhere at all. This also pins that the tail
+            // reused rather than appended this round — an appended tail leaves the
+            // remainder of the page it opened in the session's list only, where the
+            // managers on disk cannot yet name it.
+            let acct = f.space_accounting().unwrap();
+            drop(f);
+            let persisted: u64 = File::open(&path)
+                .unwrap()
+                .persisted_free_space()
+                .iter()
+                .map(|(_, len)| len)
+                .sum();
+            assert_eq!(
+                acct.reusable_free_bytes, persisted,
+                "round {round}: free space the session can spend must be the free \
+                 space the file records"
+            );
+            sizes.push(std::fs::metadata(&path).unwrap().len());
+        }
+    }
+
+    // The steady state: the last third of the run adds nothing. Deleting one
+    // round's group makes room for the next round's, and the commit tail lands in
+    // the space the previous tail vacated.
+    let settled = sizes[sizes.len() * 2 / 3];
+    let last = *sizes.last().unwrap();
+    assert_eq!(
+        last, settled,
+        "a paged file under steady churn must stop growing (sizes by round: {sizes:?})"
+    );
+
+    let f = File::open(&path).unwrap();
+    for round in ROUNDS - LIVE..ROUNDS {
+        let g = f.group(&format!("g{round}")).unwrap();
+        for name in ["a", "b"] {
+            assert_eq!(g.dataset(name).unwrap().read_i32().unwrap(), rows);
+        }
+    }
+    drop(f);
+    assert_eof_matches_file(&path);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A paged commit's tail — the rewritten extension and manager blocks — is
+/// placed in space the file already had free, instead of opening a page for
+/// itself at end-of-file.
+///
+/// The size test above states the consequence; this states the mechanism, which a
+/// size assertion alone would not distinguish from the file simply having room to
+/// spare. The tail does not settle at one fixed address — best fit picks whatever
+/// hole suits as the free list shuffles — so what is asserted is that whatever
+/// address it takes was free *before* the commit that wrote it, which is exactly
+/// what it never was while the tail could only append.
+#[test]
+fn a_paged_commit_tail_is_placed_in_free_space() {
+    const PAGE: u64 = 16384;
+    let path = tmp("hdf5_pure_fs_paged_tail_reuse.h5");
+    let _ = std::fs::remove_file(&path);
+    let mut b = FileBuilder::new();
+    b.create_dataset("seed").with_i32_data(&[0i32; 4]);
+    b.with_file_space_strategy(FileSpaceStrategy::Page, true, 1)
+        .with_file_space_page_size(PAGE);
+    b.write(&path).unwrap();
+    let start_len = std::fs::metadata(&path).unwrap().len();
+
+    // Three commits that change nothing but one attribute and the tail the commit
+    // has to rewrite regardless.
+    for i in 0..3 {
+        let before: Vec<(u64, u64)> = File::open(&path).unwrap().persisted_free_space();
+        let f = File::open_rw(&path).unwrap();
+        f.root().set_attr("n", AttrValue::I64(i)).unwrap();
+        f.commit().unwrap();
+        drop(f);
+
+        let f = File::open(&path).unwrap();
+        let managers: Vec<u64> = f
+            .file_space_info()
+            .expect("a persisting file records its managers")
+            .manager_addrs
+            .iter()
+            .copied()
+            .filter(|&a| a != u64::MAX)
+            .collect();
+        assert!(
+            !managers.is_empty(),
+            "commit {i}: the file has free space, so it has managers to place"
+        );
+        for addr in managers {
+            assert!(
+                before.iter().any(|&(a, len)| addr >= a && addr < a + len),
+                "commit {i}: a manager block landed at {addr}, which was not free \
+                 before the commit ({before:?}) — the tail appended instead of \
+                 reusing"
+            );
+        }
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            start_len,
+            "commit {i}: rewriting the tail must not grow the file"
+        );
+        // Once the tail is reusing rather than appending, a commit that rewrites
+        // only the tail neither gains nor loses free space: the new tail takes
+        // exactly what the old one gives back. A commit that took more room than
+        // it filled would show up here as free space quietly draining away, which
+        // is the same leak in miniature.
+        if i > 0 {
+            let before_total: u64 = before.iter().map(|(_, len)| len).sum();
+            let after_total: u64 = f.persisted_free_space().iter().map(|(_, len)| len).sum();
+            assert_eq!(
+                after_total, before_total,
+                "commit {i}: rewriting the tail must conserve free space"
+            );
+        }
+    }
+    assert_eof_matches_file(&path);
+    std::fs::remove_file(&path).ok();
+}
+
+/// Across a sweep of layouts, a paged commit that rewrites only its tail
+/// conserves free space exactly.
+///
+/// The tail is sized against the free lists it then draws from, so its length and
+/// the hole it lands in determine each other, and the arithmetic settles
+/// differently depending on how the file happens to be laid out — whether the
+/// chosen hole is consumed whole or merely shrunk, whether the remainder changes
+/// which manager records it. A single fixture exercises one of those settlements.
+/// Sweeping the filler size walks the tail through many, and the invariant is the
+/// same in all of them: what the new tail takes is what the old one gave back,
+/// to the byte. A tail that reserved more room than it filled would leave the
+/// difference recorded by nobody, and the total would drop.
+#[test]
+fn a_paged_tail_conserves_free_space_across_layouts() {
+    const PAGE: u64 = 16384;
+    for filler in 0..64usize {
+        let path = tmp(&format!("hdf5_pure_fs_paged_sweep_{filler}.h5"));
+        let _ = std::fs::remove_file(&path);
+        let mut b = FileBuilder::new();
+        b.create_dataset("seed")
+            .with_i32_data(&(0..100 + filler as i32).collect::<Vec<i32>>());
+        b.with_file_space_strategy(FileSpaceStrategy::Page, true, 1)
+            .with_file_space_page_size(PAGE);
+        b.write(&path).unwrap();
+
+        // The first commit settles the tail into the file's own free space; from
+        // the second on, each tail replaces the previous one and nothing else
+        // moves.
+        let mut totals = Vec::new();
+        for i in 0..3 {
+            let f = File::open_rw(&path).unwrap();
+            f.root().set_attr("n", AttrValue::I64(i)).unwrap();
+            f.commit().unwrap();
+            drop(f);
+            totals.push(
+                File::open(&path)
+                    .unwrap()
+                    .persisted_free_space()
+                    .iter()
+                    .map(|(_, len)| len)
+                    .sum::<u64>(),
+            );
+        }
+        assert_eq!(
+            totals[1], totals[2],
+            "filler {filler}: rewriting the tail must conserve free space, not \
+             quietly retire some of it (totals {totals:?})"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+}

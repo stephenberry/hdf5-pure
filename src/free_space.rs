@@ -126,6 +126,78 @@ impl FreeList {
         Some(addr)
     }
 
+    /// Reserve `len` bytes from a run of whole `align`-sized units inside a free
+    /// region, returning that address, or `None` when no region contains one long
+    /// enough. `len` is rounded up to a whole number of units by the caller;
+    /// whatever lies either side of the taken run stays free.
+    ///
+    /// This is how one page type claims space from the other's list. A paged file
+    /// keeps free space per page type because a page may hold only one of them —
+    /// but a page holding *nothing* belongs to neither, so it may be reopened as
+    /// either. Only the whole, aligned interior of a free region is provably in
+    /// that state: the partial edges sit in pages whose other bytes are live, and
+    /// those keep their type.
+    ///
+    /// Kept as one list per type rather than promoting empty pages into a third
+    /// list, so a freed chunk-data run and the freed index abutting it still
+    /// coalesce into the single hole the dataset that vacated both needs
+    /// (issue #261).
+    ///
+    /// `len` or `align` of 0 returns `None`.
+    pub(crate) fn alloc_whole_units(&mut self, len: u64, align: u64) -> Option<u64> {
+        if len == 0 || align == 0 {
+            return None;
+        }
+        // Whole units in, whole units out: this is what makes *both* leftovers
+        // aligned, and so keeps each of them inside pages of the type that already
+        // held them. An unrounded `len` would hand the caller's type the front of a
+        // page and leave the back of that same page in the other type's list — page
+        // mixing, silently, which is the one thing paging exists to prevent. The
+        // caller does the rounding because only it knows the unit, and every caller
+        // is in this crate, so this is a construction-enforced invariant rather
+        // than a refusal.
+        debug_assert_eq!(
+            len % align,
+            0,
+            "alloc_whole_units takes a whole number of units"
+        );
+        // Best-fit over the *aligned interior*, which is the part that can serve
+        // the request, rather than over the region as a whole.
+        let interior = |r: &FreeRegion| -> Option<(u64, u64)> {
+            let start = r.addr.next_multiple_of(align);
+            let end = (r.end() / align) * align;
+            // `then`, not `then_some`: a region with no aligned interior at all
+            // has `end < start`, and `then_some`'s argument is evaluated whatever
+            // the condition says.
+            (end > start && end - start >= len).then(|| (start, end - start))
+        };
+        let mut best: Option<(usize, u64, u64)> = None;
+        for (i, r) in self.regions.iter().enumerate() {
+            if let Some((start, span)) = interior(r)
+                && best.is_none_or(|(_, _, b)| span < b)
+            {
+                best = Some((i, start, span));
+            }
+        }
+        let (i, addr, _) = best?;
+        let r = self.regions[i];
+        let mut replacement = Vec::with_capacity(2);
+        if addr > r.addr {
+            replacement.push(FreeRegion {
+                addr: r.addr,
+                len: addr - r.addr,
+            });
+        }
+        if r.end() > addr + len {
+            replacement.push(FreeRegion {
+                addr: addr + len,
+                len: r.end() - (addr + len),
+            });
+        }
+        self.regions.splice(i..=i, replacement);
+        Some(addr)
+    }
+
     /// The free regions as `(addr, len)` pairs, sorted ascending by address and
     /// fully coalesced. Used to persist the free list to disk (issue #21) and to
     /// report the session's live reusable free space (issue #150).
