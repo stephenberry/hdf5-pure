@@ -1687,12 +1687,11 @@ mod tests {
                 .map(|i| WrittenChunk {
                     address: 0x10 + i * 8,
                     compressed_size: 8,
-                    raw_size: 8,
                     filter_mask: 0,
                 })
                 .collect();
             let base = 0x1000u64;
-            let ea = build_extensible_array_at(&chunks, 8, 8, false, base).unwrap();
+            let ea = build_extensible_array_at(&chunks, 8, 8, 8, false, base).unwrap();
             let mut file = vec![0u8; base as usize + ea.len()];
             file[base as usize..].copy_from_slice(&ea);
 
@@ -1843,12 +1842,11 @@ mod tests {
             .map(|i| WrittenChunk {
                 address: 0x10 + i * 8,
                 compressed_size: 8,
-                raw_size: 8,
                 filter_mask: 0,
             })
             .collect();
         let base = 0x1000u64;
-        let ea = build_extensible_array_at(&chunks, 8, 8, false, base).unwrap();
+        let ea = build_extensible_array_at(&chunks, 8, 8, 8, false, base).unwrap();
         let mut file = vec![0u8; base as usize + ea.len()];
         file[base as usize..].copy_from_slice(&ea);
 
@@ -1952,11 +1950,10 @@ mod tests {
                 .map(|i| WrittenChunk {
                     address: 0x100000 + i * 8,
                     compressed_size: 8,
-                    raw_size: 8,
                     filter_mask: 0,
                 })
                 .collect();
-            let ea = build_extensible_array_at(&chunks, os, ls, false, base).unwrap();
+            let ea = build_extensible_array_at(&chunks, 8, os, ls, false, base).unwrap();
             let mut file = vec![0u8; base as usize + ea.len()];
             file[base as usize..].copy_from_slice(&ea);
 

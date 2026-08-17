@@ -191,8 +191,8 @@ use crate::chunked_read::{
 use crate::chunked_write::{
     ChunkMeta, ChunkOptions, ChunkProvider, WrittenChunk, assemble_chunked_at,
     build_extensible_array_at, chunked_data_len, compress_chunks, emit_chunked_data_verbatim,
-    extensible_array_len, plan_chunked_data_verbatim, serialize_v4_extensible_array,
-    split_into_chunks,
+    extensible_array_len, full_chunk_bytes, plan_chunked_data_verbatim,
+    serialize_v4_extensible_array, split_into_chunks,
 };
 use crate::convert::TryToUsize;
 use crate::data_layout::DataLayout;
@@ -4723,7 +4723,6 @@ impl WriteEngine {
                     region,
                     chunk_dims: spatial,
                     element_size,
-                    raw_size,
                     maxshape,
                     pipeline_message,
                     meta,
@@ -4844,7 +4843,6 @@ impl WriteEngine {
         let ChunkedGeometry {
             spatial,
             element_size,
-            raw_size,
             ..
         } = chunked_geometry(&disk_dt, &disk_ds, &dl)?;
         let chunk_elems = spatial[0];
@@ -4964,7 +4962,6 @@ impl WriteEngine {
             kept_chunks.push(WrittenChunk {
                 address: ci.address,
                 compressed_size: u64::from(ci.chunk_size),
-                raw_size,
                 // Preserve the source mask verbatim: a C/h5py file records a nonzero
                 // mask for a chunk whose filter was skipped (e.g. deflate on
                 // incompressible data), and forcing it to 0 would corrupt that chunk.
@@ -5043,7 +5040,6 @@ impl WriteEngine {
             new_dataspace_body,
             chunk_dims_u32,
             element_size,
-            raw_size,
             has_filters,
             kept_chunks,
             new_chunk_bytes,
@@ -5389,7 +5385,7 @@ impl WriteEngine {
                 let ChunkedGeometry {
                     spatial: chunk_dims,
                     element_size,
-                    raw_size,
+                    raw_size: _,
                     maxshape,
                 } = chunked_geometry(&dt, &ds, &layout)?;
 
@@ -5442,7 +5438,6 @@ impl WriteEngine {
                     region,
                     chunk_dims,
                     element_size,
-                    raw_size,
                     maxshape,
                     pipeline_message,
                     meta,
@@ -5524,7 +5519,6 @@ impl WriteEngine {
                 region,
                 chunk_dims,
                 element_size,
-                raw_size,
                 maxshape,
                 pipeline_message,
                 meta,
@@ -5534,7 +5528,6 @@ impl WriteEngine {
                 region,
                 chunk_dims,
                 *element_size,
-                *raw_size,
                 maxshape.as_deref(),
                 pipeline_message.as_deref(),
                 meta,
@@ -5588,7 +5581,6 @@ impl WriteEngine {
         region: &[u8],
         chunk_dims: &[u64],
         element_size: NonZeroUsize,
-        raw_size: u64,
         maxshape: Option<&[u64]>,
         pipeline_message: Option<&[u8]>,
         meta: &[ChunkMeta],
@@ -5606,7 +5598,6 @@ impl WriteEngine {
             meta,
             chunk_dims,
             element_size,
-            raw_size,
             pipeline_message,
             0,
             maxshape,
@@ -5620,7 +5611,6 @@ impl WriteEngine {
                     meta,
                     chunk_dims,
                     element_size,
-                    raw_size,
                     pipeline_message,
                     stored_base,
                     maxshape,
@@ -5716,7 +5706,6 @@ impl WriteEngine {
                 region,
                 chunk_dims,
                 element_size,
-                raw_size,
                 maxshape,
                 pipeline_message,
                 meta,
@@ -5726,7 +5715,6 @@ impl WriteEngine {
                 region,
                 chunk_dims,
                 *element_size,
-                *raw_size,
                 maxshape.as_deref(),
                 pipeline_message.as_deref(),
                 meta,
@@ -5738,7 +5726,6 @@ impl WriteEngine {
                 new_dataspace_body,
                 chunk_dims_u32,
                 element_size,
-                raw_size,
                 has_filters,
                 kept_chunks,
                 new_chunk_bytes,
@@ -5748,7 +5735,6 @@ impl WriteEngine {
                 new_dataspace_body,
                 chunk_dims_u32,
                 *element_size,
-                *raw_size,
                 *has_filters,
                 kept_chunks,
                 new_chunk_bytes,
@@ -5799,7 +5785,6 @@ impl WriteEngine {
         new_dataspace_body: &[u8],
         chunk_dims_u32: &[u32],
         element_size: NonZeroUsize,
-        raw_size: u64,
         has_filters: bool,
         kept_chunks: &[WrittenChunk],
         new_chunk_bytes: &[Vec<u8>],
@@ -5815,7 +5800,6 @@ impl WriteEngine {
             combined.push(WrittenChunk {
                 address: abs - base,
                 compressed_size: cb.len() as u64,
-                raw_size,
                 // This engine applies every filter to a new chunk (no per-chunk
                 // skipping), so an appended chunk's mask is always 0. Kept chunks
                 // carry their own (possibly nonzero) mask in `combined` already.
@@ -5834,10 +5818,23 @@ impl WriteEngine {
         // `chunked_storage_spans` reclaims every index as raw on that basis. Placing
         // this one in a metadata page would make it the single exception the reclaim
         // side then mis-files, advertising a metadata hole inside a raw page.
-        let ea_len = extensible_array_len(&combined, OFFSET_SIZE, LENGTH_SIZE, has_filters);
+        //
+        // The element width comes from the chunk geometry rather than from
+        // `combined`, so a rebuild declares the same width the original index
+        // did — including when the dataset it grows was created empty.
+        let chunk_bytes =
+            full_chunk_bytes(chunk_dims_u32.iter().map(|&d| u64::from(d)), element_size);
+        let ea_len = extensible_array_len(
+            &combined,
+            chunk_bytes,
+            OFFSET_SIZE,
+            LENGTH_SIZE,
+            has_filters,
+        );
         let (ea_addr, ()) = self.place_relocatable(ea_len, PageType::Raw, |ea_base| {
             let bytes = build_extensible_array_at(
                 &combined,
+                chunk_bytes,
                 OFFSET_SIZE,
                 LENGTH_SIZE,
                 has_filters,
@@ -6736,7 +6733,6 @@ enum CopyTree {
         region: Vec<u8>,
         chunk_dims: Vec<u64>,
         element_size: NonZeroUsize,
-        raw_size: u64,
         maxshape: Option<Vec<u64>>,
         pipeline_message: Option<Vec<u8>>,
         meta: Vec<ChunkMeta>,
@@ -6813,7 +6809,6 @@ enum MovingWrite {
         region: Vec<u8>,
         chunk_dims: Vec<u64>,
         element_size: NonZeroUsize,
-        raw_size: u64,
         maxshape: Option<Vec<u64>>,
         pipeline_message: Option<Vec<u8>>,
         meta: Vec<ChunkMeta>,
@@ -6843,7 +6838,6 @@ enum MovingWrite {
         chunk_dims_u32: Vec<u32>,
         element_size: NonZeroUsize,
         /// Full (uncompressed) chunk byte size = product(spatial) * element_size.
-        raw_size: u64,
         has_filters: bool,
         /// Existing complete chunks, in index order, carried by metadata alone —
         /// their base-relative addresses, on-disk stored sizes, and filter masks
@@ -7623,6 +7617,8 @@ struct ChunkedGeometry {
     /// it, and so does the append path's element-count arithmetic.
     element_size: NonZeroUsize,
     /// Full (uncompressed) chunk byte size, `product(spatial) * element_size`.
+    /// This is what the chunk index's element width is derived from, so it has
+    /// to be the geometry's product and not any written chunk's size.
     raw_size: u64,
     /// The on-disk maximum dimensions when they differ from the current shape; an
     /// unlimited dimension selects the extensible-array index, a finite one the
@@ -7790,13 +7786,19 @@ fn try_rebuild_index_in_place<S: Source + ?Sized>(
         .map(|(ci, b)| crate::chunked_write::WrittenChunk {
             address: ci.address,
             compressed_size: b.len() as u64,
-            raw_size,
             filter_mask: 0,
         })
         .collect();
     let new_index = match (version, chunk_index_type) {
+        // `raw_size` is the whole-chunk byte size, which is what the element
+        // width derives from — the same value the original index was built with,
+        // so the rebuilt structure matches its length. (An index written by a
+        // version that derived the width from the written chunks instead can
+        // disagree; the length check below then rejects it and the caller
+        // relocates, which is the safe direction.)
         (4, Some(3)) => crate::chunked_write::build_fixed_array_at(
             &written,
+            raw_size,
             OFFSET_SIZE,
             LENGTH_SIZE,
             true,
@@ -7804,6 +7806,7 @@ fn try_rebuild_index_in_place<S: Source + ?Sized>(
         ),
         (4, Some(4)) => crate::chunked_write::build_extensible_array_at(
             &written,
+            raw_size,
             OFFSET_SIZE,
             LENGTH_SIZE,
             true,

@@ -318,40 +318,88 @@ fn chunked_builder_rejects_invalid_geometry() {
     // `InvalidChunkGeometry` rather than panicking in the chunk splitter or
     // producing an unreadable dataset.
     type Configure = fn(&mut hdf5_pure::DatasetBuilder);
-    let bad: &[(&str, Configure)] = &[
-        ("chunk rank mismatch", |b| {
-            b.with_i32_data(&[1, 2, 3, 4, 5, 6])
-                .with_shape(&[2, 3])
-                .with_chunks(&[2]);
-        }),
-        ("zero chunk dim", |b| {
-            b.with_i32_data(&[1, 2, 3, 4])
-                .with_shape(&[4])
-                .with_chunks(&[0]);
-        }),
-        ("maxshape rank mismatch", |b| {
-            b.with_i32_data(&[1, 2, 3, 4])
-                .with_shape(&[4])
-                .with_maxshape(&[u64::MAX, u64::MAX])
-                .with_chunks(&[2]);
-        }),
-        ("maxshape below shape", |b| {
-            b.with_i32_data(&[1, 2, 3, 4])
-                .with_shape(&[4])
-                .with_maxshape(&[2]);
-        }),
-        ("scalar with chunks", |b| {
-            b.with_f64_data(&[1.0]).with_shape(&[]).with_chunks(&[1]);
-        }),
+    let bad: &[(&str, Configure, &str)] = &[
+        (
+            "chunk rank mismatch",
+            |b| {
+                b.with_i32_data(&[1, 2, 3, 4, 5, 6])
+                    .with_shape(&[2, 3])
+                    .with_chunks(&[2]);
+            },
+            "chunk dimensions must have the same rank",
+        ),
+        (
+            "zero chunk dim",
+            |b| {
+                b.with_i32_data(&[1, 2, 3, 4])
+                    .with_shape(&[4])
+                    .with_chunks(&[0]);
+            },
+            "chunk dimensions must all be non-zero",
+        ),
+        (
+            "maxshape rank mismatch",
+            |b| {
+                b.with_i32_data(&[1, 2, 3, 4])
+                    .with_shape(&[4])
+                    .with_maxshape(&[u64::MAX, u64::MAX])
+                    .with_chunks(&[2]);
+            },
+            "maxshape must have the same rank",
+        ),
+        (
+            "maxshape below shape",
+            |b| {
+                b.with_i32_data(&[1, 2, 3, 4])
+                    .with_shape(&[4])
+                    .with_maxshape(&[2]);
+            },
+            "maxshape must be at least the current shape",
+        ),
+        (
+            "scalar with chunks",
+            |b| {
+                b.with_f64_data(&[1.0]).with_shape(&[]).with_chunks(&[1]);
+            },
+            "a scalar dataset cannot be chunked",
+        ),
+        // Auto-chunking makes the shape one chunk, so a zero-element shape
+        // resolves to a zero chunk dimension — the "zero chunk dim" case above,
+        // reached without the caller naming one. It divided by zero in the
+        // splitter until the guard learned to check the *resolved* dimensions.
+        (
+            "auto-chunked empty shape",
+            |b| {
+                b.with_i32_data(&[])
+                    .with_shape(&[0])
+                    .with_maxshape(&[u64::MAX]);
+            },
+            "explicit chunk dimensions",
+        ),
+        (
+            "auto-chunked empty inner dim",
+            |b| {
+                b.with_i32_data(&[])
+                    .with_shape(&[4, 0])
+                    .with_maxshape(&[u64::MAX, u64::MAX]);
+            },
+            "explicit chunk dimensions",
+        ),
     ];
 
-    for (label, configure) in bad {
+    for (label, configure, expected) in bad {
         let mut builder = FileBuilder::new();
         configure(builder.create_dataset("bad"));
         let err = builder.finish().unwrap_err();
+        let Error::Format(FormatError::InvalidChunkGeometry(reason)) = &err else {
+            panic!("[{label}] expected InvalidChunkGeometry, got {err:?}");
+        };
+        // Each case names its own reason: a wildcard payload passes on a refusal
+        // from any *other* geometry guard, which makes the case under test
+        // unreachable without anything going red.
         assert!(
-            matches!(err, Error::Format(FormatError::InvalidChunkGeometry(_))),
-            "[{label}] expected InvalidChunkGeometry, got {err:?}"
+            reason.contains(expected),
+            "[{label}] refusal must name {expected:?}, got {reason:?}"
         );
     }
 }

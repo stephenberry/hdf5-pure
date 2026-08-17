@@ -974,11 +974,10 @@ mod tests {
                     .map(|i| WrittenChunk {
                         address: 0x100000 + i * 8,
                         compressed_size: if has_filters { 8 + (i % 7) } else { 8 },
-                        raw_size: 8,
                         filter_mask: 0,
                     })
                     .collect();
-                let fa = build_fixed_array_at(&chunks, os, ls, has_filters, base);
+                let fa = build_fixed_array_at(&chunks, 8, os, ls, has_filters, base);
                 let mut file = vec![0u8; base as usize + fa.len()];
                 file[base as usize..].copy_from_slice(&fa);
 
