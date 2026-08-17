@@ -133,19 +133,30 @@ fn a_dataset_this_crate_writes_carries_the_c_librarys_filter_parameters() {
     let dir = tempdir().unwrap();
 
     macro_rules! compare {
-        ($name:literal, $ty:ty, $with:ident, $data:expr, $fill:expr) => {{
+        ($name:literal, $ty:ty, $with:ident, $data:expr, $fill:expr) => {
+            compare!(
+                $name,
+                $ty,
+                $with,
+                $data,
+                $fill,
+                CScaleOffset::Integer(0),
+                hdf5_pure::ScaleOffset::Integer(0)
+            )
+        };
+        ($name:literal, $ty:ty, $with:ident, $data:expr, $fill:expr, $c_mode:expr, $mode:expr) => {{
             let data: Vec<$ty> = $data;
             let fill: Option<$ty> = $fill;
             let c_path = dir.path().join(concat!($name, "-c.h5"));
             let pure_path = dir.path().join(concat!($name, "-pure.h5"));
-            c_create_typed(&c_path, &data, data.len(), CScaleOffset::Integer(0), fill);
+            c_create_typed(&c_path, &data, data.len(), $c_mode, fill);
             let mut b = hdf5_pure::FileBuilder::new();
             let ds = b
                 .create_dataset("col")
                 .$with(&data)
                 .with_shape(&[data.len() as u64])
                 .with_chunks(&[data.len() as u64])
-                .with_scale_offset(hdf5_pure::ScaleOffset::Integer(0));
+                .with_scale_offset($mode);
             if let Some(f) = fill {
                 ds.with_fill_value(f);
             }
@@ -219,6 +230,39 @@ fn a_dataset_this_crate_writes_carries_the_c_librarys_filter_parameters() {
     // sentinel, so this fixture would pass with the filter parameters right and
     // the encoding wrong if it held none.
     compare!("default", i32, with_i32_data, vec![0, 5, 0, 7, 0], None);
+
+    // Float D-scale is the other emit path through the same parameters, and it
+    // matches an element against the fill value within one decimal quantum
+    // rather than by equality — so `0.0004` is a fill value for `D = 3` and
+    // `0.002` is not. A dataset with no fill value gets the defined zero here
+    // too, which is what makes that window apply at all.
+    compare!(
+        "f64",
+        f64,
+        with_f64_data,
+        vec![-999.0, 1.5, 2.25, -999.0004, 3.125],
+        Some(-999.0),
+        CScaleOffset::FloatDScale(3),
+        hdf5_pure::ScaleOffset::FloatDScale(3)
+    );
+    compare!(
+        "f64-default",
+        f64,
+        with_f64_data,
+        vec![0.0, 1.5, 0.0004, 2.25, -0.0002],
+        None,
+        CScaleOffset::FloatDScale(3),
+        hdf5_pure::ScaleOffset::FloatDScale(3)
+    );
+    compare!(
+        "f32-default",
+        f32,
+        with_f32_data,
+        vec![0.0, 1.5, 0.0004, 2.25, -0.0002],
+        None,
+        CScaleOffset::FloatDScale(3),
+        hdf5_pure::ScaleOffset::FloatDScale(3)
+    );
 }
 
 /// A fill value the encoder can collapse pays for itself: a chunk that is mostly

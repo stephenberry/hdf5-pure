@@ -2255,21 +2255,65 @@ mod tests {
         nelmts: u32,
         fill: u64,
     ) -> FilterDescription {
+        // Through the writer rather than by packing the parameters here: a test
+        // helper that laid them out itself would agree with a writer that laid
+        // them out wrongly.
+        let mut bytes = Vec::new();
+        write_value(&mut bytes, fill, size as usize, order);
         let mut f = int_filter(size, signed, order, nelmts);
-        f.client_data[PARM_FILAVAIL] = FILL_DEFINED;
-        // The fill value occupies the least-significant 4 bytes of each entry
-        // from PARM_FILVAL on.
-        for (k, entry) in fill
-            .to_le_bytes()
-            .chunks(4)
-            .take((size as usize).div_ceil(4))
-            .enumerate()
-        {
-            let mut w = [0u8; 4];
-            w[..entry.len()].copy_from_slice(entry);
-            f.client_data[PARM_FILVAL + k] = u32::from_le_bytes(w);
-        }
+        f.client_data = build_cd_values(
+            ScaleOffset::Integer(0),
+            ScaleOffsetType {
+                class: CLS_INTEGER,
+                sign: if signed { SGN_2 } else { SGN_NONE },
+                order,
+            },
+            size,
+            nelmts,
+            ScaleOffsetFill::Defined(Some(&bytes)),
+        )
+        .unwrap();
         f
+    }
+
+    /// A big-endian dataset's fill value is carried through `cd_values` as a
+    /// *value*, not as the dataset's bytes: the writer converts on the way in
+    /// and the decoder converts on the way out, matching what the reference does
+    /// on a little-endian host. Convert on only one side and a fill element
+    /// matches nothing — or, worse, something else does.
+    ///
+    /// `minbits` is what shows it. The non-fill values here span three code
+    /// points, so recognizing the fill value packs them into two bits; missing
+    /// it stretches the chunk's range across the whole distance to `0x0BAD`.
+    #[test]
+    fn a_big_endian_fill_value_is_recognized() {
+        let fill = 0x0BADu64;
+        let values: Vec<u16> = vec![0x0BAD, 3, 4, 0x0BAD, 5];
+        for order in [ORDER_LE, ORDER_BE] {
+            let raw: Vec<u8> = values
+                .iter()
+                .flat_map(|v| {
+                    if order == ORDER_LE {
+                        v.to_le_bytes()
+                    } else {
+                        v.to_be_bytes()
+                    }
+                })
+                .collect();
+            let f = int_filter_with_fill(2, false, order, values.len() as u32, fill);
+            let packed = compress(&raw, &f).unwrap();
+
+            assert_eq!(
+                u32::from_le_bytes(packed[..4].try_into().unwrap()),
+                2,
+                "order {order}: the fill value must be recognized, not packed"
+            );
+            assert_eq!(
+                decompress(&packed, &f, None).unwrap(),
+                raw,
+                "order {order}: round trip"
+            );
+        }
     }
 
     /// Encode with a defined fill value and decode it back (issue #287).
