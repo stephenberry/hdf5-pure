@@ -1266,36 +1266,65 @@ fn pow10_f32(exp: i32) -> f32 {
     pow10_f64(exp) as f32
 }
 
-/// Round half away from zero to the nearest integer, approximating C `llround`.
+/// Round half away from zero to the nearest integer, matching C `llround`.
 /// Float-to-int `as` casts saturate in Rust, so out-of-range inputs are safe.
 ///
-/// Rounding `x + 0.5` is not the same function as rounding `x`: at
-/// `x = 0.49999999999999994` — the largest double below one half — the sum is
-/// exactly `0.5` and this yields 1 where `llround` yields 0. Deterministic, and
-/// it can shift a whole chunk's `minbits` through `span`, but it needs an input
-/// within one ulp of a half. Tracked with the other sub-ulp divergences.
+/// Rounding the *sum* `x + 0.5` is not the same function as rounding `x`, and
+/// the difference is observable: at `x = 0.49999999999999994` — the largest
+/// double below one half — the exact sum `1 - 2^-54` sits halfway between two
+/// doubles, so it rounds to `1.0` and the cast yields 1 where `llround(x)`
+/// yields 0. The fractional part is therefore compared against one half
+/// directly. `x - trunc(x)` is exact for every finite `x`, which is what makes
+/// that comparison exact rather than merely closer.
+///
+/// Every double of magnitude `2^52` or more is already an integer, so above that
+/// there is nothing to round and the cast — which saturates where C's `llround`
+/// is undefined — answers on its own. That also catches NaN, which fails both
+/// comparisons.
 #[expect(
     clippy::cast_possible_truncation,
-    reason = "float-to-int `as` saturates in Rust, so rounding x +/- 0.5 to i64 is safe even for out-of-range inputs (matches C llround)"
+    reason = "float-to-int `as` saturates in Rust, so rounding to i64 is safe even for out-of-range inputs (matches C llround)"
 )]
 fn round_half_away_f64(x: f64) -> i64 {
-    if x >= 0.0 {
-        (x + 0.5) as i64
+    /// The first `f64` magnitude at which consecutive doubles are 1 apart.
+    const INTEGRAL: f64 = (1u64 << 52) as f64;
+    if !(x > -INTEGRAL && x < INTEGRAL) {
+        return x as i64;
+    }
+    // Exact: |x| < 2^52 so the truncation round-trips through i64, and the
+    // subtraction of two nearby doubles is representable.
+    let trunc = x as i64;
+    let frac = x - trunc as f64;
+    if frac >= 0.5 {
+        trunc + 1
+    } else if frac <= -0.5 {
+        trunc - 1
     } else {
-        (x - 0.5) as i64
+        trunc
     }
 }
 
-/// `f32` counterpart of [`round_half_away_f64`] (matches C `lroundf`).
+/// `f32` counterpart of [`round_half_away_f64`] (matches C `lroundf`), rounding
+/// `x` itself for the same reason — the `f32` sum rounds to `1.0` at
+/// `x = 0.499_999_97`, the largest float below one half.
 #[expect(
     clippy::cast_possible_truncation,
-    reason = "float-to-int `as` saturates in Rust, so rounding x +/- 0.5 to i64 is safe even for out-of-range inputs (matches C lroundf)"
+    reason = "float-to-int `as` saturates in Rust, so rounding to i64 is safe even for out-of-range inputs (matches C lroundf)"
 )]
 fn round_half_away_f32(x: f32) -> i64 {
-    if x >= 0.0 {
-        (x + 0.5) as i64
+    /// The first `f32` magnitude at which consecutive floats are 1 apart.
+    const INTEGRAL: f32 = (1u32 << 23) as f32;
+    if !(x > -INTEGRAL && x < INTEGRAL) {
+        return x as i64;
+    }
+    let trunc = x as i64;
+    let frac = x - trunc as f32;
+    if frac >= 0.5 {
+        trunc + 1
+    } else if frac <= -0.5 {
+        trunc - 1
     } else {
-        (x - 0.5) as i64
+        trunc
     }
 }
 
@@ -1373,6 +1402,64 @@ mod tests {
         // Too-short parameter arrays -> None, never a panic.
         assert_eq!(scale_offset_mode(&[]), None);
         assert_eq!(scale_offset_mode(&[SO_INT, 0]), None);
+    }
+
+    /// The rounding these helpers do is C `llround`/`lroundf` — round `x` half
+    /// away from zero — and not "round `x + 0.5`", which is a different
+    /// function. The two disagree at exactly one input per sign and precision:
+    /// the largest float below one half, where the sum lands *on* the half and
+    /// rounds up.
+    ///
+    /// That input reaches the encoder as `value * 10^D - min_scaled`, so it is
+    /// data-dependent rather than exotic, and it changes a decoded value rather
+    /// than only the bytes it is stored as.
+    #[test]
+    fn rounding_is_llround_and_not_the_rounded_sum() {
+        // The half-way cases themselves round away from zero, in both signs and
+        // at every magnitude where a half is representable.
+        for (x, want) in [
+            (0.5f64, 1i64),
+            (-0.5, -1),
+            (1.5, 2),
+            (-1.5, -2),
+            (2.5, 3),
+            (-2.5, -3),
+            (0.0, 0),
+            (0.4, 0),
+            (-0.4, 0),
+            (7.0, 7),
+        ] {
+            assert_eq!(round_half_away_f64(x), want, "f64 round({x})");
+        }
+
+        // The largest double below one half: the sum `x + 0.5` rounds up to
+        // exactly 1.0, where rounding `x` itself gives 0.
+        let below_half = 0.499_999_999_999_999_94f64;
+        assert!(below_half < 0.5 && below_half + 0.5 == 1.0);
+        assert_eq!(round_half_away_f64(below_half), 0);
+        assert_eq!(round_half_away_f64(-below_half), 0);
+
+        // The `f32` counterpart, where the sum rounds to exactly 1.0.
+        let below_half_f32 = 0.499_999_97f32;
+        assert!(below_half_f32 < 0.5 && below_half_f32 + 0.5 == 1.0);
+        assert_eq!(round_half_away_f32(below_half_f32), 0);
+        assert_eq!(round_half_away_f32(-below_half_f32), 0);
+        assert_eq!(round_half_away_f32(0.5), 1);
+        assert_eq!(round_half_away_f32(-2.5), -3);
+
+        // Past the point where consecutive floats are more than 1 apart every
+        // value is already an integer, and beyond the integer range the cast
+        // saturates rather than wrapping (C leaves it undefined).
+        assert_eq!(round_half_away_f64(1e300), i64::MAX);
+        assert_eq!(round_half_away_f64(-1e300), i64::MIN);
+        assert_eq!(round_half_away_f32(1e30), i64::MAX);
+        assert_eq!(round_half_away_f64(f64::NAN), 0);
+        assert_eq!(round_half_away_f32(f32::NAN), 0);
+        // Either side of the constant that separates the two branches.
+        let integral = (1u64 << 52) as f64;
+        assert_eq!(round_half_away_f64(integral), 1 << 52);
+        assert_eq!(round_half_away_f64(integral - 1.0), (1 << 52) - 1);
+        assert_eq!(round_half_away_f64(-integral), -(1 << 52));
     }
 
     #[test]

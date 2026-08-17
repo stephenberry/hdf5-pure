@@ -383,17 +383,72 @@ fn float_dscale_encoding_matches_the_c_library_byte_for_byte() {
             v.push(-999.0004);
             v
         },
-        |path, values| {
-            let f = hdf5_pure::File::open_rw(path).unwrap();
-            f.dataset("col")
-                .unwrap()
-                .append_staged(|b| {
-                    b.append_f64(values);
-                })
-                .unwrap();
-            f.commit().unwrap();
-        },
+        pure_append_f64,
     );
+}
+
+/// The reference rounds each scaled residual with `llround`, which rounds `x` —
+/// not the sum `x + 0.5`, a different function. They part company at the largest
+/// double below one half, where the exact sum sits halfway between two doubles
+/// and rounds *up*: `llround` answers 0 and the sum answers 1.
+///
+/// `D = 0` puts that value in front of the rounding unscaled, which is what
+/// makes the fixture reach the divergence at all. It costs a decoded value, not
+/// only the bytes it is stored as — and through `span` one such element can
+/// widen every element in the chunk (issue #300).
+#[test]
+fn a_residual_just_below_one_half_rounds_the_way_the_c_library_rounds() {
+    let below_half = 0.499_999_999_999_999_94f64;
+    assert!(
+        below_half < 0.5 && below_half + 0.5 == 1.0,
+        "the fixture must be a value the two roundings disagree on"
+    );
+    let values = [-999.0f64, 0.0, below_half, 3.0, -999.0];
+    assert_one_byte_identical_chunk(CScaleOffset::FloatDScale(0), &values, pure_append_f64);
+
+    // The same divergence as a value, which is how a user meets it: this crate
+    // stored 1.0 for an element the reference stores as 0.0.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("value.h5");
+    c_create_typed(
+        &path,
+        &values[..1],
+        values.len(),
+        CScaleOffset::FloatDScale(0),
+        Some(values[0]),
+    );
+    pure_append_f64(&path, &values[1..]);
+    assert_eq!(
+        hdf5_pure::File::open(&path)
+            .unwrap()
+            .dataset("col")
+            .unwrap()
+            .read_f64()
+            .unwrap()[2],
+        0.0,
+        "a residual below one half must round down"
+    );
+    assert_eq!(
+        hdf5::File::open(&path)
+            .unwrap()
+            .dataset("col")
+            .unwrap()
+            .read_raw::<f64>()
+            .unwrap()[2],
+        0.0,
+        "and the C library must read back the same element"
+    );
+}
+
+fn pure_append_f64(path: &std::path::Path, values: &[f64]) {
+    let f = hdf5_pure::File::open_rw(path).unwrap();
+    f.dataset("col")
+        .unwrap()
+        .append_staged(|b| {
+            b.append_f64(values);
+        })
+        .unwrap();
+    f.commit().unwrap();
 }
 
 fn pure_append_f32(path: &std::path::Path, values: &[f32]) {
