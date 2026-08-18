@@ -124,6 +124,72 @@ impl WriteBuffering {
     }
 }
 
+/// A recording of everything that reached the operating system, so a test can
+/// replay a prefix of it and see what a crash at that instant would have left.
+///
+/// The log is per thread and off by default, which is what lets it live under
+/// every write in the crate: an inactive thread pays one thread-local read per
+/// issued write, and the lib tests that are not recording are unaffected by the
+/// ones that are, however the harness schedules them.
+///
+/// It records only operations that *succeeded*. A write that returned an error
+/// may have put any prefix of its bytes on the disk, and this cannot know which,
+/// so a failed write is not a point this can replay. That is the boundary
+/// between this and a fault injector: this models the machine stopping between
+/// two completed operations, which is the case the crate's ordering barriers are
+/// written against.
+#[cfg(test)]
+pub(crate) mod disk_log {
+    use std::cell::RefCell;
+
+    /// One completed operation against the file, in the order it was issued.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub(crate) enum DiskOp {
+        /// `bytes` landed at `offset`. Positioned, so replaying it is exact
+        /// wherever the file's length happens to be.
+        Write { offset: u64, bytes: Vec<u8> },
+        /// The file was resized to this length, discarding anything past it.
+        SetLen(u64),
+    }
+
+    impl DiskOp {
+        /// A short label for a failure message: what it touched, not its bytes.
+        pub(crate) fn describe(&self) -> String {
+            match self {
+                DiskOp::Write { offset, bytes } => {
+                    std::format!("write {offset}..{}", offset + bytes.len() as u64)
+                }
+                DiskOp::SetLen(len) => std::format!("set_len {len}"),
+            }
+        }
+    }
+
+    thread_local! {
+        /// `None` when this thread is not recording, which is every thread that
+        /// has not asked to be.
+        static LOG: RefCell<Option<Vec<DiskOp>>> = const { RefCell::new(None) };
+    }
+
+    /// Begin recording on this thread, discarding any previous log.
+    pub(crate) fn start() {
+        LOG.with(|l| *l.borrow_mut() = Some(Vec::new()));
+    }
+
+    /// Stop recording and return what was recorded.
+    pub(crate) fn take() -> Vec<DiskOp> {
+        LOG.with(|l| l.borrow_mut().take()).unwrap_or_default()
+    }
+
+    /// Note one completed operation, if this thread is recording.
+    pub(crate) fn record(op: DiskOp) {
+        LOG.with(|l| {
+            if let Some(log) = l.borrow_mut().as_mut() {
+                log.push(op);
+            }
+        });
+    }
+}
+
 /// The file bytes a mutating session works on.
 ///
 /// Implementors keep the image and the file on disk consistent, and are free to
@@ -682,6 +748,11 @@ impl BufferedWrites {
         self.handle.write_all(bytes).map_err(Error::Io)?;
         #[cfg(test)]
         self.issued_order.push((offset, bytes.len() as u64));
+        #[cfg(test)]
+        disk_log::record(disk_log::DiskOp::Write {
+            offset,
+            bytes: bytes.to_vec(),
+        });
         self.on_disk_len = self.on_disk_len.max(offset + bytes.len() as u64);
         Ok(())
     }
@@ -704,6 +775,8 @@ impl BufferedWrites {
         // is an error path in both orders; this one is the half that cannot lose
         // a write.
         self.handle.set_len(len).map_err(Error::Io)?;
+        #[cfg(test)]
+        disk_log::record(disk_log::DiskOp::SetLen(len));
         self.discard_from(len);
         self.on_disk_len = len;
         self.flush()?;
