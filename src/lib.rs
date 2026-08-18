@@ -205,6 +205,8 @@ pub(crate) mod nosync;
 pub(crate) mod appender;
 #[cfg(feature = "std")]
 pub(crate) mod chunk_index_inplace;
+#[cfg(all(test, feature = "std"))]
+mod crash_replay;
 #[cfg(feature = "std")]
 pub(crate) mod edit;
 #[cfg(feature = "std")]
