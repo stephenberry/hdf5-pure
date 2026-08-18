@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- The typed whole-dataset readers (`Dataset::read_f64` and its eight siblings) decode a row window at a time instead of the whole dataset at once, so peak memory is the values they return plus about a mebibyte rather than twice the dataset: an 8 MiB `f64` dataset peaked at 16.8 MB and now peaks at 10.1 MB ([#289](https://github.com/stephenberry/hdf5-pure/issues/289)).
+- A row window takes only its own chunks out of the cached chunk index rather than the whole index, so reading a dataset window by window costs a constant per chunk instead of one allocation per chunk of the dataset per window ([#289](https://github.com/stephenberry/hdf5-pure/issues/289)).
+
 ### Fixed
 
 - A paged file (`FileSpaceStrategy::Page`) stops growing under delete-and-recreate churn: the free-space managers a commit rewrites are placed in free space rather than in a fresh page whose remainder nothing recorded, which cost a page per commit. A wholly free page can also be reopened for the other page type, so space a delete released is no longer stranded for the kind of data that released it ([#286](https://github.com/stephenberry/hdf5-pure/issues/286)).

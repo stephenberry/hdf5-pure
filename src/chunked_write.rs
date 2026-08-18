@@ -3106,6 +3106,7 @@ mod tests {
     use crate::dataspace::{Dataspace, DataspaceType};
     use crate::datatype::{Datatype, DatatypeByteOrder};
     use crate::fill_value::FillPattern;
+    use crate::read_spec::RawReadSpec;
 
     fn make_f64_type() -> Datatype {
         Datatype::FloatingPoint {
@@ -3445,11 +3446,13 @@ mod tests {
 
         let output = read_chunked_data_cached(
             &file_data,
-            &layout,
-            &dataspace,
-            &datatype,
-            pipeline.as_ref(),
-            FillPattern::ZERO,
+            RawReadSpec {
+                layout: &layout,
+                dataspace: &dataspace,
+                datatype: &datatype,
+                pipeline: pipeline.as_ref(),
+                fill: FillPattern::ZERO,
+            },
             8,
             8,
             &ChunkCache::new(),
@@ -4202,11 +4205,7 @@ mod tests {
 
         let output = read_chunked_data_cached(
             &file_data,
-            &layout,
-            &dataspace,
-            &datatype,
-            None,
-            FillPattern::ZERO,
+            RawReadSpec::plain(&layout, &dataspace, &datatype),
             8,
             8,
             &ChunkCache::new(),

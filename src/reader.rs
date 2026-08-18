@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -15,7 +16,7 @@ use crate::type_builders::{DatasetBuilder, VL_REF_SIZE};
 
 use crate::appender::BufferedAppender;
 use crate::attribute::{extract_attributes_full, extract_attributes_full_from_source};
-use crate::chunk_cache::{ChunkCache, ChunkCacheConfig, ChunkCacheStats};
+use crate::chunk_cache::{CachePass, ChunkCache, ChunkCacheConfig, ChunkCacheStats};
 use crate::compound::CompoundType;
 use crate::convert::TryToUsize;
 use crate::data_layout::DataLayout;
@@ -35,6 +36,7 @@ use crate::layout_info::{Chunk, ChunkIndex, Filter, Layout};
 use crate::libver::LibVer;
 use crate::message_type::MessageType;
 use crate::object_header::ObjectHeader;
+use crate::read_spec::RawReadSpec;
 use crate::shared_message::{self, BufferedResolver, SharedResolver, SourceResolver};
 use crate::signature;
 use crate::source::{
@@ -1326,11 +1328,7 @@ impl FileInner {
     /// Read a dataset's raw bytes for the given layout, dispatching on the backend.
     fn read_dataset_raw(
         &self,
-        dl: &DataLayout,
-        ds: &Dataspace,
-        dt: &Datatype,
-        pipeline: Option<&FilterPipeline>,
-        fill: FillPattern<'_>,
+        spec: RawReadSpec<'_>,
         cache: &ChunkCache,
     ) -> Result<Vec<u8>, FormatError> {
         let (os, ls) = (self.offset_size(), self.length_size());
@@ -1343,36 +1341,18 @@ impl FileInner {
         // read. For a plain file (`base == 0`) this is the identity.
         let base = self.addr_offset;
         match &self.backend {
-            Backend::InMemory(v) => data_read::read_raw_data_cached(
-                frame(v, base)?,
-                dl,
-                ds,
-                dt,
-                pipeline,
-                fill,
-                os,
-                ls,
-                cache,
-            ),
-            Backend::Streaming(s) if base == 0 => data_read::read_raw_data_cached_from_source(
-                s.as_ref(),
-                dl,
-                ds,
-                dt,
-                pipeline,
-                fill,
-                os,
-                ls,
-                cache,
-            ),
+            Backend::InMemory(v) => {
+                data_read::read_raw_data_cached(frame(v, base)?, spec, os, ls, cache)
+            }
+            Backend::Streaming(s) if base == 0 => {
+                data_read::read_raw_data_cached_from_source(s.as_ref(), spec, os, ls, cache)
+            }
             Backend::Streaming(s) => {
                 let framed = BaseOffsetSource {
                     inner: s.as_ref(),
                     base,
                 };
-                data_read::read_raw_data_cached_from_source(
-                    &framed, dl, ds, dt, pipeline, fill, os, ls, cache,
-                )
+                data_read::read_raw_data_cached_from_source(&framed, spec, os, ls, cache)
             }
             Backend::Edit(m) => Self::with_engine(
                 m,
@@ -1386,15 +1366,11 @@ impl FileInner {
                             available: data.len(),
                         })?
                     };
-                    data_read::read_raw_data_cached(
-                        frame, dl, ds, dt, pipeline, fill, os, ls, cache,
-                    )
+                    data_read::read_raw_data_cached(frame, spec, os, ls, cache)
                 },
                 |s| {
                     let framed = BaseOffsetSource { inner: s, base };
-                    data_read::read_raw_data_cached_from_source(
-                        &framed, dl, ds, dt, pipeline, fill, os, ls, cache,
-                    )
+                    data_read::read_raw_data_cached_from_source(&framed, spec, os, ls, cache)
                 },
             ),
         }
@@ -1405,19 +1381,16 @@ impl FileInner {
     /// touching only the storage it overlaps. Reads through the same base-framed
     /// `Source`, so on-disk addresses resolve the same way. The caller clamps
     /// the window to the dataset.
-    #[allow(clippy::too_many_arguments)]
     fn read_dataset_raw_rows(
         &self,
-        dl: &DataLayout,
-        ds: &Dataspace,
-        dt: &Datatype,
-        pipeline: Option<&FilterPipeline>,
-        fill: FillPattern<'_>,
+        spec: RawReadSpec<'_>,
         cache: &ChunkCache,
+        pass: CachePass,
         start_row: u64,
         num_rows: u64,
     ) -> Result<Vec<u8>, FormatError> {
         let (os, ls) = (self.offset_size(), self.length_size());
+        let (dl, ds, dt) = (spec.layout, spec.dataspace, spec.datatype);
         let elem_size = dt.element_size_usize()?;
         // Elements per row (product of inner dims; 1 when 0-D or 1-D). Checked so
         // a crafted dataspace whose inner dims overflow `usize` errors instead of
@@ -1474,14 +1447,11 @@ impl FileInner {
                 };
                 read_rows_framed(
                     &BytesSource::new(frame),
-                    dl,
-                    ds,
-                    dt,
-                    pipeline,
-                    fill,
+                    spec,
                     os,
                     ls,
                     cache,
+                    pass,
                     start_row,
                     num_rows,
                     row_bytes,
@@ -1489,14 +1459,11 @@ impl FileInner {
             }
             Backend::Streaming(s) if base == 0 => read_rows_framed(
                 s.as_ref(),
-                dl,
-                ds,
-                dt,
-                pipeline,
-                fill,
+                spec,
                 os,
                 ls,
                 cache,
+                pass,
                 start_row,
                 num_rows,
                 row_bytes,
@@ -1507,8 +1474,7 @@ impl FileInner {
                     base,
                 };
                 read_rows_framed(
-                    &framed, dl, ds, dt, pipeline, fill, os, ls, cache, start_row, num_rows,
-                    row_bytes,
+                    &framed, spec, os, ls, cache, pass, start_row, num_rows, row_bytes,
                 )
             }
             Backend::Edit(m) => Self::with_engine(
@@ -1525,14 +1491,11 @@ impl FileInner {
                     };
                     read_rows_framed(
                         &BytesSource::new(frame),
-                        dl,
-                        ds,
-                        dt,
-                        pipeline,
-                        fill,
+                        spec,
                         os,
                         ls,
                         cache,
+                        pass,
                         start_row,
                         num_rows,
                         row_bytes,
@@ -1541,8 +1504,7 @@ impl FileInner {
                 |s| {
                     let framed = BaseOffsetSource { inner: s, base };
                     read_rows_framed(
-                        &framed, dl, ds, dt, pipeline, fill, os, ls, cache, start_row, num_rows,
-                        row_bytes,
+                        &framed, spec, os, ls, cache, pass, start_row, num_rows, row_bytes,
                     )
                 },
             ),
@@ -1554,21 +1516,18 @@ impl FileInner {
 /// layouts are one bounded sub-read; chunked layouts use the windowed chunk
 /// reader (only the rank-0 crafted-file corner falls back to a whole read
 /// plus slice).
-#[allow(clippy::too_many_arguments)]
 fn read_rows_framed<S: Source + ?Sized>(
     source: &S,
-    dl: &DataLayout,
-    ds: &Dataspace,
-    dt: &Datatype,
-    pipeline: Option<&FilterPipeline>,
-    fill: FillPattern<'_>,
+    spec: RawReadSpec<'_>,
     os: u8,
     ls: u8,
     cache: &ChunkCache,
+    pass: CachePass,
     start_row: u64,
     num_rows: u64,
     row_bytes: usize,
 ) -> Result<Vec<u8>, FormatError> {
+    let (dl, fill) = (spec.layout, spec.fill);
     // A zero-row window reads nothing, uniformly across the *supported* layouts.
     // A `Virtual` layout is unsupported and must still error like `read_raw`
     // does, so it is excluded here and falls through to the match.
@@ -1614,15 +1573,14 @@ fn read_rows_framed<S: Source + ?Sized>(
         }
         DataLayout::Chunked { .. } => {
             match crate::chunked_read::read_chunked_rows_from_source(
-                source, dl, ds, dt, pipeline, fill, os, ls, cache, start_row, num_rows,
+                source, spec, os, ls, cache, pass, start_row, num_rows,
             )? {
                 Some(bytes) => Ok(bytes),
                 // Rank-0 chunked (a crafted-file corner): fall back to a whole
                 // read, then slice.
                 None => {
-                    let full = data_read::read_raw_data_cached_from_source(
-                        source, dl, ds, dt, pipeline, fill, os, ls, cache,
-                    )?;
+                    let full =
+                        data_read::read_raw_data_cached_from_source(source, spec, os, ls, cache)?;
                     let start = start_row.to_usize()? * row_bytes;
                     let len = num_rows.to_usize()? * row_bytes;
                     full.get(start..start + len).map(<[u8]>::to_vec).ok_or(
@@ -3050,6 +3008,87 @@ impl std::fmt::Debug for Dataset {
     }
 }
 
+/// How many stored bytes a typed whole-dataset read holds beside its output,
+/// before rounding the window up to whole chunk bands.
+///
+/// The decoded values are the caller's and there is no bound to put on them;
+/// what this bounds is the *stored* copy standing next to them, which used to be
+/// the whole dataset over again (issue #289). A mebibyte is small against any
+/// dataset large enough for that to matter, and large enough that a sweep costs
+/// reads in the tens rather than the thousands. A dataset that fits inside one
+/// window is read whole, exactly as before.
+const TYPED_READ_WINDOW_BYTES: u64 = 1 << 20;
+
+/// How many values of the requested type a whole-dataset read produces per
+/// stored element, which is what its output buffer is reserved at.
+#[derive(Clone, Copy)]
+enum OutputSize {
+    /// One value per stored element — every numeric decoder.
+    PerElement,
+    /// One value per stored *byte* — [`Dataset::read_i8`], which reinterprets
+    /// bytes rather than decoding elements, and so yields one per byte of a
+    /// dataset whose elements are wider than one.
+    PerByte,
+}
+
+/// How many leading-dimension rows a typed whole-dataset read decodes at a time.
+///
+/// [`TYPED_READ_WINDOW_BYTES`] of stored bytes, rounded *down* to whole chunk
+/// bands so that no chunk is ever decoded for two windows, and never fewer than
+/// one row — or one band, when a single band is already over budget, since a
+/// window narrower than that would decode the same chunks again.
+///
+/// A dataset whose rows have no bytes (a zero inner dimension) has no elements
+/// to read at all: it answers `NonZeroU64::MAX`, which the caller reads as "one
+/// window covers it".
+///
+/// The answer is a `NonZeroU64` because the sweep advances by it: a window of no
+/// rows would leave that loop running forever rather than returning something
+/// wrong, and a test cannot report the difference.
+fn typed_window_rows(
+    dl: &DataLayout,
+    ds: &Dataspace,
+    elem_size: NonZeroUsize,
+) -> Result<NonZeroU64, FormatError> {
+    let mut row_bytes = elem_size.get() as u64;
+    for &d in ds.dimensions.iter().skip(1) {
+        row_bytes = row_bytes
+            .checked_mul(d)
+            .ok_or(FormatError::OffsetOverflow {
+                offset: row_bytes,
+                length: d,
+            })?;
+    }
+    if row_bytes == 0 {
+        return Ok(NonZeroU64::MAX);
+    }
+
+    let mut rows = (TYPED_READ_WINDOW_BYTES / row_bytes).max(1);
+    if let DataLayout::Chunked {
+        chunk_dimensions, ..
+    } = dl
+    {
+        // A chunked layout message carries rank + 1 dimensions, the last being
+        // the element size, so the first is the leading dimension's chunk extent
+        // for every layout version this crate parses.
+        if let Some(band) = chunk_dimensions
+            .first()
+            .map(|&d| u64::from(d))
+            .filter(|&d| d > 0)
+        {
+            rows = if rows < band {
+                band
+            } else {
+                rows - rows % band
+            };
+        }
+    }
+    // At least one row always, and at least one whole band when a band applied:
+    // that arm runs only when `rows >= band`, so the remainder it subtracts
+    // leaves a band standing.
+    Ok(NonZeroU64::new(rows).unwrap_or(NonZeroU64::MIN))
+}
+
 impl Dataset {
     /// Address of this dataset's object header (base-adjusted, file-absolute).
     /// Used to resolve object references that point at this dataset.
@@ -3773,39 +3812,144 @@ impl Dataset {
         )?)
     }
 
-    /// Read all data as `f64` values.
-    pub fn read_f64(&self) -> Result<Vec<f64>, Error> {
-        let raw = self.read_raw()?;
+    /// Read the whole dataset with `decode`, sweeping it a row window at a time.
+    ///
+    /// A typed whole-dataset read used to be [`read_raw`](Self::read_raw)
+    /// followed by a decode of the entire buffer, which held the stored bytes
+    /// and the decoded values at the same time and so peaked at twice the
+    /// dataset — a caller reading a 4 GiB array needed 8 GiB (issue #289).
+    /// Decoding a window at a time leaves one window of stored bytes beside the
+    /// output instead of a whole second copy of it, and the bytes are identical
+    /// either way: a window returns exactly the rows [`read_raw`](Self::read_raw)
+    /// would have put there.
+    ///
+    /// The output buffer is reserved once, at the size the whole dataset decodes
+    /// to, so no window reallocates it — a growth step would put a second copy of
+    /// the output alongside the first and give back what the windowing saved.
+    ///
+    /// A dataset that fits in one window — including one with no rows at all — is
+    /// read whole. The empty case still runs `decode`, because a decoder is also
+    /// what reports a datatype it cannot read, and a zero-element string dataset
+    /// must go on failing a numeric read rather than answering with an empty
+    /// vector.
+    fn read_whole_typed<T, F>(&self, out_size: OutputSize, decode: F) -> Result<Vec<T>, Error>
+    where
+        F: Fn(&[u8], &Datatype, &mut Vec<T>) -> Result<(), FormatError>,
+    {
         let dt = self.datatype()?;
-        Ok(data_read::read_as_f64(&raw, &dt)?)
+        let ds = self.dataspace()?;
+        let dl = self.data_layout()?;
+        let pipeline = self.filter_pipeline_parsed();
+        // See `read_raw`: an unparseable fill value message is carried into the
+        // read rather than failing it up front.
+        let fill_bytes = self.fill_bytes();
+        let elem_size = dt.element_size_usize()?;
+        let fill = match &fill_bytes {
+            Ok(b) => FillPattern::new(b.as_deref(), elem_size),
+            Err(_) => FillPattern::UNKNOWN,
+        };
+        let spec = RawReadSpec {
+            layout: &dl,
+            dataspace: &ds,
+            datatype: &dt,
+            pipeline: pipeline.as_ref(),
+            fill,
+        };
+
+        // What a whole read checks before it reads a byte, and what a sweep would
+        // otherwise skip: a compact or contiguous layout whose declared size
+        // disagrees with the dataspace is refused. Reading in windows must not
+        // turn that into a check that fires only on datasets small enough to be
+        // read whole.
+        let stored = spec.stored_byte_len()?;
+
+        // A window is cut by the *stored* element width, while a decoder slices
+        // what it is handed by the width of the type it decodes — the base type,
+        // for an enumeration. Those are the same width for every valid file, an
+        // enumeration's size being its base's. A crafted file where they differ
+        // must not get one verdict from a sweep and another from a whole read, so
+        // it is read whole.
+        let decoded_width = data_read::effective_numeric(&dt).type_size();
+
+        let mut out = Vec::new();
+        let n0 = ds.dimensions.first().copied().unwrap_or(1);
+        let rows = typed_window_rows(&dl, &ds, elem_size)?.get();
+        if n0 <= rows || decoded_width != dt.type_size() {
+            // No reservation here: `decode` sizes the output from the bytes it
+            // was handed, which is exact.
+            let raw = self.file.read_dataset_raw(spec, &self.chunk_cache)?;
+            decode(&raw, &dt, &mut out)?;
+            return Ok(out);
+        }
+
+        let values = match out_size {
+            OutputSize::PerElement => ds.num_elements().to_usize()?,
+            OutputSize::PerByte => stored,
+        };
+
+        // One pass for the whole sweep, not one per window: the sweep visits each
+        // chunk exactly once, so a window that offered its chunks to a cache
+        // already full would copy and evict with no later reader for either. The
+        // cache ends up holding what a whole read would have left it — the
+        // chunks reached first. See [`CachePass`].
+        let pass = self.chunk_cache.begin_pass();
+        let mut start = 0;
+        while start < n0 {
+            let count = rows.min(n0 - start);
+            let raw =
+                self.file
+                    .read_dataset_raw_rows(spec, &self.chunk_cache, pass, start, count)?;
+            if start == 0 {
+                // Reserved once, and only after a window has come back. This size
+                // comes from the file: sizing an allocation from it before
+                // reading anything lets a dataspace claiming a terabyte ask for a
+                // terabyte over a file that cannot serve one row. `try_reserve`
+                // for the same reason — a file-derived capacity that cannot be
+                // had is an answer this reader owes its caller, not a panic.
+                out.try_reserve(values)
+                    .map_err(|_| FormatError::ValueTooLargeForPlatform {
+                        value: values as u64,
+                        target: "one allocation",
+                    })?;
+            }
+            decode(&raw, &dt, &mut out)?;
+            start += count;
+        }
+        Ok(out)
+    }
+
+    /// Read all data as `f64` values.
+    ///
+    /// This and the other typed whole-dataset readers decode a row window at a
+    /// time, so the memory standing beside the returned `Vec` is one window of
+    /// stored bytes — on the order of a mebibyte — rather than a second copy of
+    /// the dataset. Reading a 4 GiB array costs about 4 GiB, not 8.
+    ///
+    /// The values are what [`read_raw`](Self::read_raw) returns, decoded: a
+    /// dataset stored as a narrower or wider type is converted, so pick the
+    /// reader that matches the stored type for a lossless read.
+    pub fn read_f64(&self) -> Result<Vec<f64>, Error> {
+        self.read_whole_typed(OutputSize::PerElement, data_read::read_as_f64_into)
     }
 
     /// Read all data as `f32` values.
     pub fn read_f32(&self) -> Result<Vec<f32>, Error> {
-        let raw = self.read_raw()?;
-        let dt = self.datatype()?;
-        Ok(data_read::read_as_f32(&raw, &dt)?)
+        self.read_whole_typed(OutputSize::PerElement, data_read::read_as_f32_into)
     }
 
     /// Read all data as `i32` values.
     pub fn read_i32(&self) -> Result<Vec<i32>, Error> {
-        let raw = self.read_raw()?;
-        let dt = self.datatype()?;
-        Ok(data_read::read_as_i32(&raw, &dt)?)
+        self.read_whole_typed(OutputSize::PerElement, data_read::read_as_i32_into)
     }
 
     /// Read all data as `i64` values.
     pub fn read_i64(&self) -> Result<Vec<i64>, Error> {
-        let raw = self.read_raw()?;
-        let dt = self.datatype()?;
-        Ok(data_read::read_as_i64(&raw, &dt)?)
+        self.read_whole_typed(OutputSize::PerElement, data_read::read_as_i64_into)
     }
 
     /// Read all data as `u64` values.
     pub fn read_u64(&self) -> Result<Vec<u64>, Error> {
-        let raw = self.read_raw()?;
-        let dt = self.datatype()?;
-        Ok(data_read::read_as_u64(&raw, &dt)?)
+        self.read_whole_typed(OutputSize::PerElement, data_read::read_as_u64_into)
     }
 
     /// Read all data as `u8` values.
@@ -3814,34 +3958,30 @@ impl Dataset {
     }
 
     /// Read all data as `i8` values.
-    #[expect(
-        clippy::cast_possible_wrap,
-        reason = "read_i8 reinterprets each stored byte as the signed i8 the caller requested"
-    )]
     pub fn read_i8(&self) -> Result<Vec<i8>, Error> {
-        let raw = self.read_raw()?;
-        Ok(raw.iter().map(|&b| b as i8).collect())
+        self.read_whole_typed(OutputSize::PerByte, |raw, _dt, out| {
+            #[expect(
+                clippy::cast_possible_wrap,
+                reason = "read_i8 reinterprets each stored byte as the signed i8 the caller requested"
+            )]
+            out.extend(raw.iter().map(|&b| b as i8));
+            Ok(())
+        })
     }
 
     /// Read all data as `i16` values.
     pub fn read_i16(&self) -> Result<Vec<i16>, Error> {
-        let raw = self.read_raw()?;
-        let dt = self.datatype()?;
-        Ok(data_read::read_as_i16(&raw, &dt)?)
+        self.read_whole_typed(OutputSize::PerElement, data_read::read_as_i16_into)
     }
 
     /// Read all data as `u16` values.
     pub fn read_u16(&self) -> Result<Vec<u16>, Error> {
-        let raw = self.read_raw()?;
-        let dt = self.datatype()?;
-        Ok(data_read::read_as_u16(&raw, &dt)?)
+        self.read_whole_typed(OutputSize::PerElement, data_read::read_as_u16_into)
     }
 
     /// Read all data as `u32` values.
     pub fn read_u32(&self) -> Result<Vec<u32>, Error> {
-        let raw = self.read_raw()?;
-        let dt = self.datatype()?;
-        Ok(data_read::read_as_u32(&raw, &dt)?)
+        self.read_whole_typed(OutputSize::PerElement, data_read::read_as_u32_into)
     }
 
     /// Read all data as `String` values.
@@ -4331,9 +4471,14 @@ impl Dataset {
             Ok(b) => FillPattern::new(b.as_deref(), dt.element_size_usize()?),
             Err(_) => FillPattern::UNKNOWN,
         };
-        Ok(self
-            .file
-            .read_dataset_raw(&dl, &ds, &dt, pipeline.as_ref(), fill, &self.chunk_cache)?)
+        let spec = RawReadSpec {
+            layout: &dl,
+            dataspace: &ds,
+            datatype: &dt,
+            pipeline: pipeline.as_ref(),
+            fill,
+        };
+        Ok(self.file.read_dataset_raw(spec, &self.chunk_cache)?)
     }
 
     /// Read the raw element bytes of the row window `[start_row, start_row + num_rows)`
@@ -4373,25 +4518,25 @@ impl Dataset {
             Err(_) => FillPattern::UNKNOWN,
         };
 
+        let pipeline = self.filter_pipeline_parsed();
+        let spec = RawReadSpec {
+            layout: &dl,
+            dataspace: &ds,
+            datatype: &dt,
+            pipeline: pipeline.as_ref(),
+            fill,
+        };
+
         if start == 0 && count == n0 {
-            let pipeline = self.filter_pipeline_parsed();
-            return Ok(self.file.read_dataset_raw(
-                &dl,
-                &ds,
-                &dt,
-                pipeline.as_ref(),
-                fill,
-                &self.chunk_cache,
-            )?);
+            return Ok(self.file.read_dataset_raw(spec, &self.chunk_cache)?);
         }
 
+        // A lone window's successor is the adjacent one, and the chunk they share
+        // is the one this read finishes on; `CachePass::LRU` is what retains it.
         Ok(self.file.read_dataset_raw_rows(
-            &dl,
-            &ds,
-            &dt,
-            self.filter_pipeline_parsed().as_ref(),
-            fill,
+            spec,
             &self.chunk_cache,
+            CachePass::LRU,
             start,
             count,
         )?)
@@ -4933,6 +5078,112 @@ mod tests {
         }
     }
 
+    /// Recompute a version-2 object header's checksum over its chunk 0, after a
+    /// test has edited a message inside it.
+    ///
+    /// A crafted file a reader must survive carries a *valid* checksum — an
+    /// attacker recomputes it — so a test that edits a header and leaves the old
+    /// one measures the checksum rather than the thing it meant to.
+    #[cfg(feature = "checksum")]
+    fn refresh_v2_header_checksum(bytes: &mut [u8], header_addr: usize) -> std::ops::Range<usize> {
+        assert_eq!(&bytes[header_addr..header_addr + 4], b"OHDR");
+        let flags = bytes[header_addr + 5];
+        let mut pos = header_addr + 6;
+        if flags & 0x20 != 0 {
+            pos += 16;
+        }
+        if flags & 0x10 != 0 {
+            pos += 4;
+        }
+        let width = 1usize << (flags & 0x03);
+        let chunk0 = (0..width).fold(0usize, |acc, i| {
+            acc | ((bytes[pos + i] as usize) << (8 * i))
+        });
+        pos += width;
+        let chunk0_end = pos + chunk0;
+        let cs = crate::checksum::jenkins_lookup3(&bytes[header_addr..chunk0_end]);
+        bytes[chunk0_end..chunk0_end + 4].copy_from_slice(&cs.to_le_bytes());
+        header_addr..chunk0_end
+    }
+
+    /// A contiguous layout whose declared size disagrees with its dataspace is
+    /// refused, whatever the dataset's size and whichever read asks.
+    ///
+    /// The whole-dataset readers have always refused it. A typed read now takes a
+    /// large dataset a row window at a time, and a window only ever checks that
+    /// its *own* rows are inside the declared storage — so without the shared
+    /// check this refusal would have applied to small datasets, which are still
+    /// read whole, and not to large ones. A validation that fires depending on
+    /// the size of the input is the kind that surfaces years later as an
+    /// inconsistent bug report, which is why both sizes are here.
+    #[cfg(feature = "checksum")]
+    #[test]
+    fn a_layout_size_disagreeing_with_the_dataspace_is_refused_at_every_dataset_size() {
+        // One dataset below the typed read's window budget and read whole; one
+        // above it and swept.
+        for n in [1000usize, 200_000] {
+            let data: Vec<f64> = (0..n).map(|i| i as f64).collect();
+            let mut b = crate::writer::FileBuilder::new();
+            b.create_dataset("t")
+                .with_f64_data(&data)
+                .with_shape(&[n as u64]);
+            let mut bytes = b.finish().unwrap();
+            // Taken before the edit: an edited header fails its checksum, and the
+            // address is needed to recompute it.
+            let header_addr = {
+                let file = File::from_bytes(bytes.clone()).unwrap();
+                file.dataset("t").unwrap().header_address() as usize
+            };
+
+            // The layout message's size field: the dataset's byte length, which
+            // appears once in the file. The assertion is the fixture's own guard —
+            // patching some other field would test nothing in particular.
+            let declared = (n * 8) as u64;
+            let needle = declared.to_le_bytes();
+            let at: Vec<usize> = bytes
+                .windows(8)
+                .enumerate()
+                .filter(|(_, w)| *w == needle)
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(
+                at.len(),
+                1,
+                "the stored size {declared} was not uniquely locatable in a {n}-element file: {at:?}"
+            );
+            bytes[at[0]..at[0] + 8].copy_from_slice(&(declared * 2).to_le_bytes());
+
+            let chunk0 = refresh_v2_header_checksum(&mut bytes, header_addr);
+            assert!(
+                chunk0.contains(&at[0]),
+                "the patched size is outside the header chunk whose checksum was refreshed"
+            );
+
+            let file = File::from_bytes(bytes).unwrap();
+            let ds = file.dataset("t").unwrap();
+            let expected = FormatError::DataSizeMismatch {
+                expected: n * 8,
+                actual: n * 16,
+            };
+            for (what, err) in [
+                ("read_raw", ds.read_raw().unwrap_err()),
+                ("read_f64", ds.read_f64().unwrap_err()),
+                ("read_i32", ds.read_i32().unwrap_err()),
+            ] {
+                match err {
+                    Error::Format(got) => assert_eq!(
+                        format!("{got:?}"),
+                        format!("{expected:?}"),
+                        "{what} over {n} elements reported the wrong mismatch"
+                    ),
+                    other => {
+                        panic!("{what} over {n} elements: expected a format error, got {other:?}")
+                    }
+                }
+            }
+        }
+    }
+
     /// A zero-row window returns `Ok(empty)` uniformly across layouts, including
     /// over unallocated storage. Unallocated storage now reads as the fill value
     /// rather than erroring, so this no longer guards a cross-layout divergence
@@ -4961,14 +5212,11 @@ mod tests {
         let cache = ChunkCache::new();
         let out = read_rows_framed(
             &BytesSource::new(b""),
-            &dl,
-            &ds,
-            &dt,
-            None,
-            FillPattern::ZERO,
+            RawReadSpec::plain(&dl, &ds, &dt),
             8,
             8,
             &cache,
+            CachePass::LRU,
             0,
             0,
             8,
@@ -4982,14 +5230,11 @@ mod tests {
         let virtual_dl = DataLayout::Virtual { version: 4 };
         let err = read_rows_framed(
             &BytesSource::new(b""),
-            &virtual_dl,
-            &ds,
-            &dt,
-            None,
-            FillPattern::ZERO,
+            RawReadSpec::plain(&virtual_dl, &ds, &dt),
             8,
             8,
             &cache,
+            CachePass::LRU,
             0,
             0,
             8,
@@ -4998,6 +5243,108 @@ mod tests {
         assert!(
             matches!(err, FormatError::UnsupportedVirtualLayout),
             "expected UnsupportedVirtualLayout, got {err:?}"
+        );
+    }
+
+    /// The window a typed whole-dataset read sweeps in is a budget in *stored
+    /// bytes* resolved against the dataset's own geometry, and a chunked dataset
+    /// adds a second rule on top: whole chunk bands.
+    ///
+    /// A window that ended mid-band would make the next window decode the band
+    /// again — the cost windowing exists to avoid — so the budget is rounded down
+    /// to a multiple of the band, and *up* to one whole band when even one band
+    /// is over budget. The three ways a window can come out are one rule with
+    /// different inputs, which is why they are asserted together.
+    #[test]
+    fn a_typed_read_windows_in_whole_chunk_bands() {
+        const BUDGET: u64 = TYPED_READ_WINDOW_BYTES;
+        let ds1 = |dims: &[u64]| Dataspace {
+            space_type: crate::dataspace::DataspaceType::Simple,
+            rank: dims.len() as u8,
+            dimensions: dims.to_vec(),
+            max_dimensions: None,
+        };
+        let contiguous = DataLayout::Contiguous {
+            address: Some(0),
+            size: 0,
+        };
+        let chunked = |band: u32| DataLayout::Chunked {
+            chunk_dimensions: vec![band, 8],
+            btree_address: Some(0),
+            version: 3,
+            chunk_index_type: None,
+            single_chunk_filtered_size: None,
+            single_chunk_filter_mask: None,
+        };
+        let elem = NonZeroUsize::new(8).unwrap();
+
+        // Unchunked: the budget, divided by the row width, exactly.
+        assert_eq!(
+            typed_window_rows(&contiguous, &ds1(&[1 << 20]), elem)
+                .unwrap()
+                .get(),
+            BUDGET / 8
+        );
+
+        // A band that divides the budget takes it unchanged; one that does not
+        // is rounded down to a whole number of bands, never up.
+        assert_eq!(
+            typed_window_rows(&chunked(512), &ds1(&[1 << 20]), elem)
+                .unwrap()
+                .get(),
+            BUDGET / 8
+        );
+        let rows = typed_window_rows(&chunked(300), &ds1(&[1 << 20]), elem)
+            .unwrap()
+            .get();
+        assert_eq!(rows % 300, 0, "a window must end on a chunk band");
+        assert!(
+            rows <= BUDGET / 8 && rows > BUDGET / 8 - 300,
+            "a window must be the largest whole number of bands within the \
+             budget, not a smaller one: {rows} rows against {} in budget",
+            BUDGET / 8
+        );
+
+        // One band over budget: the window is that band, since a narrower one
+        // would decode it twice.
+        assert_eq!(
+            typed_window_rows(&chunked(1 << 20), &ds1(&[1 << 21]), elem)
+                .unwrap()
+                .get(),
+            1 << 20
+        );
+
+        // Rows wider than the whole budget: one row, which is the least a window
+        // can be and still make progress.
+        assert_eq!(
+            typed_window_rows(&contiguous, &ds1(&[4, 1 << 20]), elem)
+                .unwrap()
+                .get(),
+            1
+        );
+
+        // Rank 0. A chunked layout message carries rank + 1 dimensions, so a
+        // scalar's only entry is the element-size trailer and the "band" read
+        // out of it is not a band at all. Nothing rests on it: a scalar has one
+        // row, so `n0 <= rows` sends it to the whole read whatever this says.
+        // Asserted so that a later reading of `first()` as the leading extent
+        // has to account for this case rather than discover it.
+        let scalar = Dataspace {
+            space_type: crate::dataspace::DataspaceType::Scalar,
+            rank: 0,
+            dimensions: Vec::new(),
+            max_dimensions: None,
+        };
+        assert!(typed_window_rows(&chunked(8), &scalar, elem).unwrap().get() >= 1);
+
+        // A zero inner dimension makes a row zero bytes wide, and the dataset
+        // has no elements at all: one window covers it, and nothing divides by
+        // zero on the way there.
+        assert_eq!(
+            typed_window_rows(&contiguous, &ds1(&[4, 0]), elem)
+                .unwrap()
+                .get(),
+            u64::MAX
         );
     }
 

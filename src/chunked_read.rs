@@ -12,13 +12,12 @@ use core::num::NonZeroUsize;
 
 use crate::btree_v1::btree_v1_node_header_size;
 use crate::bytes::read_offset;
-use crate::chunk_cache::ChunkCache;
+use crate::chunk_cache::{CachePass, ChunkCache};
 use crate::chunk_grid::{ChunkGrid, GridOrder};
 use crate::chunk_span::ChunkSpanReader;
 use crate::convert::{TryToUsize, nonzero_usize_from, slice_range, u32_from};
 use crate::data_layout::DataLayout;
 use crate::dataspace::Dataspace;
-use crate::datatype::Datatype;
 use crate::error::FormatError;
 use crate::extensible_array::{
     ExtensibleArrayHeader, read_extensible_array_chunks, read_extensible_array_chunks_from_source,
@@ -29,6 +28,7 @@ use crate::filters::{ChunkContext, FilterScratch, decompress_chunk_with};
 use crate::fixed_array::{
     FixedArrayHeader, read_fixed_array_chunks, read_fixed_array_chunks_from_source,
 };
+use crate::read_spec::RawReadSpec;
 use crate::source::Source;
 
 /// Decompress all chunks, reading each chunk's bytes from a [`Source`].
@@ -568,13 +568,17 @@ fn ensure_chunk_bytes_representable(
 /// failure (an element count that cannot be addressed on this target).
 fn chunk_index_address(
     addr: Option<u64>,
-    dataspace: &Dataspace,
-    datatype: &Datatype,
-    fill: FillPattern<'_>,
+    spec: RawReadSpec<'_>,
 ) -> Result<Result<u64, Vec<u8>>, FormatError> {
     if let Some(a) = addr {
         return Ok(Ok(a));
     }
+    let RawReadSpec {
+        dataspace,
+        datatype,
+        fill,
+        ..
+    } = spec;
     let elem_size = datatype.element_size_usize()?;
     let total = dataspace
         .num_elements()
@@ -597,14 +601,17 @@ fn chunk_index_address(
 /// The decompression is sequential.
 pub fn read_chunked_data_from_source<S: Source + ?Sized>(
     source: &S,
-    layout: &DataLayout,
-    dataspace: &Dataspace,
-    datatype: &Datatype,
-    pipeline: Option<&FilterPipeline>,
-    fill: FillPattern<'_>,
+    spec: RawReadSpec<'_>,
     offset_size: u8,
     length_size: u8,
 ) -> Result<Vec<u8>, FormatError> {
+    let RawReadSpec {
+        layout,
+        dataspace,
+        datatype,
+        pipeline,
+        fill,
+    } = spec;
     let (
         chunk_dimensions,
         version,
@@ -635,7 +642,7 @@ pub fn read_chunked_data_from_source<S: Source + ?Sized>(
         }
     };
 
-    let addr = match chunk_index_address(addr_opt, dataspace, datatype, fill)? {
+    let addr = match chunk_index_address(addr_opt, spec)? {
         Ok(addr) => addr,
         Err(unallocated) => return Ok(unallocated),
     };
@@ -742,20 +749,31 @@ fn plan_chunk_spans(
 /// are returned. Returns `Ok(None)` only for a rank-0 (scalar) chunked layout — a
 /// crafted-file corner with no leading dimension to window — so the caller falls
 /// back to a whole read. The caller clamps the window to the dataset.
-#[allow(clippy::too_many_arguments)]
+///
+/// `pass` decides which chunks the cache keeps, and the answer differs by caller.
+/// A lone window wants [`CachePass::LRU`], so that what it retains is the chunks
+/// it *finished* on: its successor is the adjacent window, and the chunk they
+/// share is that last one. A window that is one step of a sweep across the whole
+/// dataset wants a real pass, shared by every step — the sweep never asks for a
+/// chunk twice, so offering each one to a cache already full is a copy and an
+/// eviction with no reader on the other side. See [`CachePass`].
 pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
     source: &S,
-    layout: &DataLayout,
-    dataspace: &Dataspace,
-    datatype: &Datatype,
-    pipeline: Option<&FilterPipeline>,
-    fill: FillPattern<'_>,
+    spec: RawReadSpec<'_>,
     offset_size: u8,
     length_size: u8,
     cache: &ChunkCache,
+    pass: CachePass,
     row_start: u64,
     num_rows: u64,
 ) -> Result<Option<Vec<u8>>, FormatError> {
+    let RawReadSpec {
+        layout,
+        dataspace,
+        datatype,
+        pipeline,
+        fill,
+    } = spec;
     let DataLayout::Chunked {
         chunk_dimensions,
         btree_address,
@@ -836,8 +854,31 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
         return Ok(Some(output));
     };
 
-    // Walk the index once, then reuse it for later windows on this handle.
-    let mut chunks = if let Some(chunks) = cache.all_indexed_chunks() {
+    let row_lo = row_start.to_usize()?;
+    let row_hi = row_lo.saturating_add(out_rows); // exclusive; caller clamped to the dataset
+    let cd0 = chunk_dims[0];
+
+    // A chunk contributes to the window when its rows meet `[row_lo, row_hi)`.
+    // Every list this function builds and every walk over one applies this test,
+    // so it is written once.
+    let overlaps = |c0: usize| c0 < row_hi && c0.saturating_add(cd0) > row_lo;
+    let chunk_overlaps = |chunk: &ChunkInfo| {
+        match chunk.offsets.first().copied().unwrap_or(0).to_usize() {
+            Ok(c0) => overlaps(c0),
+            // A leading offset too large for `usize` — a 32-bit target reading a
+            // crafted file. Kept rather than dropped: the walk below converts it
+            // again and reports the failure, and a filter that swallowed it here
+            // would turn that error into silence.
+            Err(_) => true,
+        }
+    };
+
+    // Walk the index once, then reuse it for later windows on this handle —
+    // keeping only this window's chunks, since each `ChunkInfo` taken out of the
+    // index owns a coordinate `Vec` and the rest would be allocated and dropped
+    // unread. Sweeping a dataset window by window makes that a product rather
+    // than a sum (issue #289).
+    let mut chunks = if let Some(chunks) = cache.indexed_chunks_matching(chunk_overlaps) {
         chunks
     } else {
         let chunks = collect_chunks_for_layout_from_source(
@@ -854,41 +895,19 @@ pub(crate) fn read_chunked_rows_from_source<S: Source + ?Sized>(
             length_size,
         )?;
         cache.populate_index(&chunks, rank);
-        chunks
+        chunks.into_iter().filter(chunk_overlaps).collect()
     };
     sort_chunks_by_address(&mut chunks);
 
     let chunk_dims_u64: Vec<u64> = chunk_dims.iter().map(|&d| d as u64).collect();
     let ctx = ChunkContext::from_datatype(&chunk_dims_u64, datatype)?;
 
-    let row_lo = row_start.to_usize()?;
-    let row_hi = row_lo.saturating_add(out_rows); // exclusive; caller clamped to the dataset
-    let cd0 = chunk_dims[0];
-
-    // A chunk contributes to the window when its rows meet `[row_lo, row_hi)`.
-    // The span plan and the walk below have to agree on which chunks those are,
-    // so the test is written once.
-    let overlaps = |c0: usize| c0 < row_hi && c0.saturating_add(cd0) > row_lo;
-
     // Coalesce over the window's own chunks. A plan built over the dataset's
     // whole chunk list would put the rows on either side of the window inside a
     // span and read them for nothing — an eight-row window measured 32 KB where
     // it needed 64 bytes.
-    let mut spans = plan_chunk_spans(&chunks, rank, cache, |chunk| {
-        chunk
-            .offsets
-            .first()
-            .copied()
-            .unwrap_or(0)
-            .to_usize()
-            .is_ok_and(&overlaps)
-    });
+    let mut spans = plan_chunk_spans(&chunks, rank, cache, chunk_overlaps);
 
-    // Plain LRU rather than a fill-once pass, so the chunks this window finishes
-    // on are the ones retained. That is the reuse the doc above promises: the
-    // next window straddles this one's *last* chunk, and a window wide enough to
-    // fill the cache would otherwise drop exactly it. See [`CachePass`].
-    let pass = crate::chunk_cache::CachePass::LRU;
     // One decoder for the whole window; see `FilterScratch`.
     let mut scratch = FilterScratch::new();
 
@@ -1023,18 +1042,20 @@ fn row_major_strides(dims: &[usize]) -> Result<Vec<usize>, FormatError> {
 /// decompressed-chunk caching.
 ///
 /// This is the streaming counterpart of [`read_chunked_data_cached`].
-#[allow(clippy::too_many_arguments)]
 pub fn read_chunked_data_cached_from_source<S: Source + ?Sized>(
     source: &S,
-    layout: &DataLayout,
-    dataspace: &Dataspace,
-    datatype: &Datatype,
-    pipeline: Option<&FilterPipeline>,
-    fill: FillPattern<'_>,
+    spec: RawReadSpec<'_>,
     offset_size: u8,
     length_size: u8,
     cache: &ChunkCache,
 ) -> Result<Vec<u8>, FormatError> {
+    let RawReadSpec {
+        layout,
+        dataspace,
+        datatype,
+        pipeline,
+        fill,
+    } = spec;
     let (
         chunk_dimensions,
         version,
@@ -1065,7 +1086,7 @@ pub fn read_chunked_data_cached_from_source<S: Source + ?Sized>(
         }
     };
 
-    let addr = match chunk_index_address(addr_opt, dataspace, datatype, fill)? {
+    let addr = match chunk_index_address(addr_opt, spec)? {
         Ok(addr) => addr,
         Err(unallocated) => return Ok(unallocated),
     };
@@ -1703,15 +1724,18 @@ fn assemble_chunks(
 /// entirely.  Decompressed chunk data is also cached with LRU eviction.
 pub fn read_chunked_data_cached(
     file_data: &[u8],
-    layout: &DataLayout,
-    dataspace: &Dataspace,
-    datatype: &Datatype,
-    pipeline: Option<&FilterPipeline>,
-    fill: FillPattern<'_>,
+    spec: RawReadSpec<'_>,
     offset_size: u8,
     length_size: u8,
     cache: &ChunkCache,
 ) -> Result<Vec<u8>, FormatError> {
+    let RawReadSpec {
+        layout,
+        dataspace,
+        datatype,
+        pipeline,
+        fill,
+    } = spec;
     let (
         chunk_dimensions,
         version,
@@ -1742,7 +1766,7 @@ pub fn read_chunked_data_cached(
         }
     };
 
-    let addr = match chunk_index_address(addr_opt, dataspace, datatype, fill)? {
+    let addr = match chunk_index_address(addr_opt, spec)? {
         Ok(addr) => addr,
         Err(unallocated) => return Ok(unallocated),
     };
@@ -2133,11 +2157,13 @@ mod tests {
         let fill_bytes = fill.to_le_bytes();
         let out = read_chunked_data_from_source(
             &BytesSource::new(&file_data),
-            &layout,
-            &dataspace,
-            &make_f64_type(),
-            None,
-            FillPattern::new(Some(&fill_bytes), nz(8)),
+            RawReadSpec {
+                layout: &layout,
+                dataspace: &dataspace,
+                datatype: &make_f64_type(),
+                pipeline: None,
+                fill: FillPattern::new(Some(&fill_bytes), nz(8)),
+            },
             8,
             8,
         )
@@ -2202,41 +2228,25 @@ mod tests {
             ),
         ] {
             let ds = simple(dims.clone());
-            let from_source = read_chunked_data_from_source(
-                &BytesSource::new(&file_data),
-                &layout,
-                &ds,
-                &datatype,
-                None,
+            let spec = RawReadSpec {
+                layout: &layout,
+                dataspace: &ds,
+                datatype: &datatype,
+                pipeline: None,
                 fill,
-                8,
-                8,
-            )
-            .unwrap();
+            };
+            let from_source =
+                read_chunked_data_from_source(&BytesSource::new(&file_data), spec, 8, 8).unwrap();
             let cached_from_source = read_chunked_data_cached_from_source(
                 &BytesSource::new(&file_data),
-                &layout,
-                &ds,
-                &datatype,
-                None,
-                fill,
+                spec,
                 8,
                 8,
                 &ChunkCache::new(),
             )
             .unwrap();
-            let cached = read_chunked_data_cached(
-                &file_data,
-                &layout,
-                &ds,
-                &datatype,
-                None,
-                fill,
-                8,
-                8,
-                &ChunkCache::new(),
-            )
-            .unwrap();
+            let cached =
+                read_chunked_data_cached(&file_data, spec, 8, 8, &ChunkCache::new()).unwrap();
             assert_eq!(from_source, expected, "dims {dims:?}");
             assert_eq!(cached_from_source, expected, "dims {dims:?}");
             assert_eq!(cached, expected, "dims {dims:?}");
@@ -2605,11 +2615,7 @@ mod tests {
 
         let raw = read_chunked_data_cached(
             &file_data,
-            &layout,
-            &dataspace,
-            &datatype,
-            None,
-            FillPattern::ZERO,
+            RawReadSpec::plain(&layout, &dataspace, &datatype),
             8,
             8,
             &ChunkCache::new(),
@@ -2633,11 +2639,7 @@ mod tests {
 
         let raw = read_chunked_data_cached(
             &file_data,
-            &layout,
-            &dataspace,
-            &datatype,
-            None,
-            FillPattern::ZERO,
+            RawReadSpec::plain(&layout, &dataspace, &datatype),
             8,
             8,
             &ChunkCache::new(),
@@ -2662,36 +2664,19 @@ mod tests {
         pipeline: Option<&FilterPipeline>,
     ) {
         use crate::source::ReadSeekSource;
-        let buffered = read_chunked_data_cached(
-            file_data,
+        let spec = RawReadSpec {
             layout,
             dataspace,
             datatype,
             pipeline,
-            FillPattern::ZERO,
-            8,
-            8,
-            &ChunkCache::new(),
-        )
-        .unwrap();
-        let from_mem = read_chunked_data_from_source(
-            &BytesSource::new(file_data),
-            layout,
-            dataspace,
-            datatype,
-            pipeline,
-            FillPattern::ZERO,
-            8,
-            8,
-        )
-        .unwrap();
+            fill: FillPattern::ZERO,
+        };
+        let buffered = read_chunked_data_cached(file_data, spec, 8, 8, &ChunkCache::new()).unwrap();
+        let from_mem =
+            read_chunked_data_from_source(&BytesSource::new(file_data), spec, 8, 8).unwrap();
         let from_seek = read_chunked_data_from_source(
             &ReadSeekSource::new(std::io::Cursor::new(file_data.to_vec())).unwrap(),
-            layout,
-            dataspace,
-            datatype,
-            pipeline,
-            FillPattern::ZERO,
+            spec,
             8,
             8,
         )
@@ -2779,11 +2764,13 @@ mod tests {
 
         let raw = read_chunked_data_cached(
             &file_data,
-            &layout,
-            &dataspace,
-            &datatype,
-            Some(&pipeline),
-            FillPattern::ZERO,
+            RawReadSpec {
+                layout: &layout,
+                dataspace: &dataspace,
+                datatype: &datatype,
+                pipeline: Some(&pipeline),
+                fill: FillPattern::ZERO,
+            },
             8,
             8,
             &ChunkCache::new(),
@@ -2866,11 +2853,7 @@ mod tests {
 
         let raw = read_chunked_data_cached(
             &file_data,
-            &layout,
-            &dataspace,
-            &datatype,
-            None,
-            FillPattern::ZERO,
+            RawReadSpec::plain(&layout, &dataspace, &datatype),
             8,
             8,
             &ChunkCache::new(),
@@ -2993,11 +2976,7 @@ mod tests {
 
         let raw = read_chunked_data_cached(
             &file_data,
-            &layout,
-            &dataspace,
-            &datatype,
-            None,
-            FillPattern::ZERO,
+            RawReadSpec::plain(&layout, &dataspace, &datatype),
             8,
             8,
             &ChunkCache::new(),
@@ -3024,11 +3003,7 @@ mod tests {
         assert!(!cache.stats().index_loaded());
         let raw = read_chunked_data_cached(
             &file_data,
-            &layout,
-            &dataspace,
-            &datatype,
-            None,
-            FillPattern::ZERO,
+            RawReadSpec::plain(&layout, &dataspace, &datatype),
             8,
             8,
             &cache,
@@ -3052,11 +3027,7 @@ mod tests {
         // First read — populates index + decompressed cache
         let raw1 = read_chunked_data_cached(
             &file_data,
-            &layout,
-            &dataspace,
-            &datatype,
-            None,
-            FillPattern::ZERO,
+            RawReadSpec::plain(&layout, &dataspace, &datatype),
             8,
             8,
             &cache,
@@ -3068,11 +3039,7 @@ mod tests {
         // Second read — should hit the decompressed cache
         let raw2 = read_chunked_data_cached(
             &file_data,
-            &layout,
-            &dataspace,
-            &datatype,
-            None,
-            FillPattern::ZERO,
+            RawReadSpec::plain(&layout, &dataspace, &datatype),
             8,
             8,
             &cache,
@@ -3090,11 +3057,7 @@ mod tests {
 
         let raw = read_chunked_data_cached(
             &file_data,
-            &layout,
-            &dataspace,
-            &datatype,
-            None,
-            FillPattern::ZERO,
+            RawReadSpec::plain(&layout, &dataspace, &datatype),
             8,
             8,
             &cache,
@@ -3132,14 +3095,11 @@ mod tests {
         let cache = ChunkCache::new();
         let out = read_chunked_rows_from_source(
             &BytesSource::new(b""),
-            &layout,
-            &dataspace,
-            &make_f64_type(),
-            None,
-            FillPattern::ZERO,
+            RawReadSpec::plain(&layout, &dataspace, &make_f64_type()),
             8,
             8,
             &cache,
+            CachePass::LRU,
             0,
             1,
         )
@@ -3175,14 +3135,11 @@ mod tests {
         let cache = ChunkCache::new();
         let err = read_chunked_rows_from_source(
             &BytesSource::new(b""),
-            &layout,
-            &dataspace,
-            &make_f64_type(),
-            None,
-            FillPattern::ZERO,
+            RawReadSpec::plain(&layout, &dataspace, &make_f64_type()),
             8,
             8,
             &cache,
+            CachePass::LRU,
             0,
             1,
         )
@@ -3219,14 +3176,11 @@ mod tests {
         let cache = ChunkCache::new();
         let err = read_chunked_rows_from_source(
             &BytesSource::new(b""),
-            &layout,
-            &dataspace,
-            &make_f64_type(),
-            None,
-            FillPattern::ZERO,
+            RawReadSpec::plain(&layout, &dataspace, &make_f64_type()),
             8,
             8,
             &cache,
+            CachePass::LRU,
             0,
             1,
         )
@@ -3263,32 +3217,28 @@ mod tests {
             max_dimensions: None,
         };
         let seven = 7.0f64.to_le_bytes();
+        let datatype = make_f64_type();
         for fill in [FillPattern::ZERO, FillPattern::new(Some(&seven), nz(8))] {
             let cache = ChunkCache::new();
-            let whole = read_chunked_data_cached_from_source(
-                &BytesSource::new(b""),
-                &layout,
-                &dataspace,
-                &make_f64_type(),
-                None,
+            let spec = RawReadSpec {
+                layout: &layout,
+                dataspace: &dataspace,
+                datatype: &datatype,
+                pipeline: None,
                 fill,
-                8,
-                8,
-                &cache,
-            )
-            .expect("an unallocated dataset reads as fill");
+            };
+            let whole =
+                read_chunked_data_cached_from_source(&BytesSource::new(b""), spec, 8, 8, &cache)
+                    .expect("an unallocated dataset reads as fill");
             assert_eq!(whole.len(), 80);
 
             let window = read_chunked_rows_from_source(
                 &BytesSource::new(b""),
-                &layout,
-                &dataspace,
-                &make_f64_type(),
-                None,
-                fill,
+                spec,
                 8,
                 8,
                 &cache,
+                CachePass::LRU,
                 2,
                 4,
             )
@@ -3298,14 +3248,11 @@ mod tests {
 
             let empty = read_chunked_rows_from_source(
                 &BytesSource::new(b""),
-                &layout,
-                &dataspace,
-                &make_f64_type(),
-                None,
-                fill,
+                spec,
                 8,
                 8,
                 &cache,
+                CachePass::LRU,
                 0,
                 0,
             )

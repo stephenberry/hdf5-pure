@@ -604,3 +604,79 @@ fn repack_materializes_a_never_written_dataset() {
         "the destination is larger than the source it came from"
     );
 }
+
+/// A typed whole-dataset read sweeps row windows (issue #289), and a dataset the
+/// C library allocated lazily is where that sweep meets storage that is not
+/// there: no chunk exists at all, or some chunk grid slots hold data and others
+/// never will.
+///
+/// Only the C library can write this file. Both cases have to answer the fill
+/// value for every element no chunk covers, in *every* window and not just the
+/// first — a sweep that carried the fill pattern into its first window and zeros
+/// into the rest would pass a whole-read test and fail here.
+///
+/// The dataset is deliberately larger than the read's window budget: at 1 MiB of
+/// stored bytes to a window rounded down to whole 1,000-row chunk bands, 400,000
+/// `i32` is two windows — 262,000 rows and then 138,000.
+#[test]
+fn a_swept_typed_read_of_lazily_allocated_storage_reads_holes_as_fill() {
+    const N: usize = 400_000;
+    const CHUNK: usize = 1000;
+    const FILL: i32 = -12_345;
+
+    let dir = tempdir().unwrap();
+    let never = dir.path().join("never.h5");
+    let partly = dir.path().join("partly.h5");
+
+    for (path, write_some) in [(&never, false), (&partly, true)] {
+        let file = hdf5::File::create(path).unwrap();
+        let ds = file
+            .new_dataset::<i32>()
+            .shape((N,))
+            .chunk((CHUNK,))
+            .fill_value(FILL)
+            .create("col")
+            .unwrap();
+        if write_some {
+            // Every fourth chunk, so written and unwritten slots fall in every
+            // window of the sweep.
+            let block: Vec<i32> = (0..CHUNK).map(|i| i as i32).collect();
+            let mut start = 0;
+            while start + CHUNK <= N {
+                ds.write_slice(&block, start..start + CHUNK).unwrap();
+                start += 4 * CHUNK;
+            }
+        }
+        drop(ds);
+        file.close().unwrap();
+    }
+
+    let expected_never = vec![FILL; N];
+    let mut expected_partly = vec![FILL; N];
+    let mut start = 0;
+    while start + CHUNK <= N {
+        for (i, slot) in expected_partly[start..start + CHUNK].iter_mut().enumerate() {
+            *slot = i as i32;
+        }
+        start += 4 * CHUNK;
+    }
+
+    for (path, expected) in [(&never, &expected_never), (&partly, &expected_partly)] {
+        let file = File::open_streaming(path).unwrap();
+        let ds = file.dataset("col").unwrap();
+        assert_eq!(
+            &ds.read_i32().unwrap(),
+            expected,
+            "a swept read of {} did not match what the C library stored",
+            path.display()
+        );
+        // The same values the whole-read path answers: a full-range window
+        // delegates to it, which makes this the before-and-after comparison.
+        assert_eq!(
+            ds.read_i32().unwrap(),
+            ds.read_i32_rows(0, N as u64).unwrap(),
+            "the sweep and the whole read disagree over {}",
+            path.display()
+        );
+    }
+}
