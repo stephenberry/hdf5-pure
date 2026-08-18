@@ -270,7 +270,7 @@ for batch in 0..1000 {
 file.close().unwrap();   // applies staged edits, then one fsync
 ```
 
-`SyncPolicy::OnClose` is close to what the reference C library does: its default `sec2` driver installs no flush callback at all, so `H5Fflush` drains libhdf5's caches with `write` and stops there, leaving power-loss durability to the application. It is not a write-back cache — this crate buffers nothing in user space, so every write reaches the operating system as it is made. A file written under `OnClose` is byte-identical to the same file written under `Always`, is visible to other processes on the machine as it is written, and survives *this process* crashing.
+`SyncPolicy::OnClose` is close to what the reference C library does: its default `sec2` driver installs no flush callback at all, so `H5Fflush` drains libhdf5's caches with `write` and stops there, leaving power-loss durability to the application. It is not a write-back cache: every commit and every append has reached the operating system by the time it returns, under either policy — see [Write gathering](#write-gathering) for what is held back and for how long. A file written under `OnClose` is byte-identical to the same file written under `Always`, is visible to other processes on the machine once the operation that wrote it returns, and survives *this process* crashing.
 
 Three things are given up, and they are worth separating:
 
@@ -291,6 +291,20 @@ A file left flagged by a SWMR writer is the sharpest case. That flag is cleared 
 The whole-file paths are outside all of this: `FileBuilder::write` and [`repack`](repack.md) never `fsync` under either policy, since each writes a file and hands it over rather than holding an editing session.
 
 The default is `SyncPolicy::Always`, which is every guarantee described above this section.
+
+## Write gathering
+
+A commit or an in-place append is not one write. A single append issues the chunk's bytes at end-of-file and then patches an index element, a checksum, the array header's statistics, the dataspace dimension, and the superblock's recorded end-of-file — eight writes on a measured file, seven of them a few bytes each, landing in a handful of pages that the *next* append patches again. Issued one at a time, that is seven syscalls and seven page dirtyings for a few dozen bytes, and on flash a page dirtied seven times is written seven times.
+
+Every read-write session therefore gathers its writes and emits **one write per dirty page**. The bytes it holds are released at every *ordering barrier* — the points the commit and append sequences already define, where writes made before must reach the disk before writes made after — so:
+
+- a commit or an append that has returned has put its bytes in the operating system, whatever the `SyncPolicy` says, because every operation ends with a barrier;
+- nothing about crash safety changes: the barriers keep their ordering meaning under both policies, so a write that fails still leaves the file in the state it had before the operation;
+- nothing about the resulting file changes — the bytes are identical either way.
+
+A session appending one chunk to each of eight datasets, four times over, issued 160 writes where it made 256 — and 448 before the separate reduction in what an append writes at all.
+
+There is no setting for this and nothing to opt into. The one session that does *not* gather is the [SWMR](swmr.md) writer, whose readers follow its ordered phases as they become visible; coalescing those would not make a smaller file, it would let a reader see a state the phases exist to hide.
 
 ## Supported targets and formats
 

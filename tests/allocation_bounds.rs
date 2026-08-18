@@ -741,3 +741,133 @@ fn one_append_costs_its_batch_not_the_dataset() {
     assert_eq!(back.len(), (WARMUP_APPENDS + 2) * CHUNK_ELEMS as usize);
     assert_eq!(back[back.len() - 1], (CHUNK_ELEMS - 1) as f64);
 }
+
+/// Gathering writes does not copy what it has already gathered on every new one.
+///
+/// Chunks are placed one after another, so each new write starts exactly where
+/// the last one ended. Merging that by building a fresh buffer and copying the
+/// old one into it makes the gathering quadratic in the number of writes it
+/// holds: filling the budget that way copies hundreds of megabytes to write one
+/// (issue #288). Extending the pending run in place makes it linear.
+///
+/// Measured through one large append rather than many small ones, because that
+/// is what grows a single run to the whole gather budget: an append of this size
+/// is split into one-megabyte batches, and within a batch the chunk writes are
+/// contiguous and merge into one run that reaches the budget before it drains.
+/// Many separate appends would not show it — each drains at its own barriers
+/// while its run is still a few kilobytes — and a commit shows the same defect
+/// but buries it under the header, link and index work that dominates at any
+/// size worth measuring.
+#[test]
+fn gathering_writes_does_not_recopy_what_it_holds() {
+    const CHUNK: usize = 512;
+    const CHUNKS: usize = 1024;
+    const RAW_BYTES: u64 = (CHUNK * CHUNKS * 8) as u64;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("buffered.h5");
+    let mut builder = FileBuilder::new();
+    builder
+        .with_file_space_strategy(hdf5_pure::FileSpaceStrategy::Page, true, 1)
+        .with_file_space_page_size(4096);
+    builder
+        .create_dataset("growing")
+        .with_f64_data(&[1.0f64; CHUNK])
+        .with_shape(&[CHUNK as u64])
+        .with_maxshape(&[u64::MAX])
+        .with_chunks(&[CHUNK as u64]);
+    builder.write(&path).unwrap();
+
+    // Built outside the region: this is the caller's buffer, not the library's.
+    let batch: Vec<f64> = (0..CHUNK * CHUNKS).map(|i| (i % CHUNK) as f64).collect();
+    // Scoped: a `Dataset` owns a handle on the session, so the session outlives
+    // `file` itself and the append is only certainly on disk once both are gone.
+    let measured = {
+        let file = File::open_rw_with_options(
+            &path,
+            hdf5_pure::FileAccessProperties::new().with_sync_policy(hdf5_pure::SyncPolicy::OnClose),
+        )
+        .unwrap();
+        let mut ds = file.dataset("growing").unwrap();
+        measure("gathered_append", || {
+            ds.append(&batch).unwrap();
+        })
+        .1
+    };
+
+    // The appended data is in this measurement, so a measurement of nothing
+    // cannot pass the ceiling below by default.
+    assert!(
+        measured.bytes >= RAW_BYTES,
+        "the appended data is not in this measurement, so the bound below is \
+         measuring something other than the append: {measured}"
+    );
+
+    // Measured at 5.2x the raw bytes when a pending run is extended in place, and
+    // at 132x when each write rebuilds the run it lands in. The ceiling sits
+    // between them with room on both sides, since the point is the shape of the
+    // curve rather than one host's constant.
+    assert!(
+        measured.bytes < 32 * RAW_BYTES,
+        "gathering must not recopy what it holds: measured {measured} against \
+         {RAW_BYTES} bytes of appended data"
+    );
+
+    let file = File::open(&path).unwrap();
+    let back = file.dataset("growing").unwrap().read_f64().unwrap();
+    assert_eq!(back.len(), CHUNK * (CHUNKS + 1));
+    assert_eq!(&back[CHUNK..CHUNK * 2], &batch[..CHUNK]);
+}
+
+/// A write too large for the gather budget is issued rather than copied into it.
+///
+/// Gathering holds a write so it can be merged with its neighbours, and a write
+/// already larger than the whole budget has no neighbours it could be merged
+/// with — it is flushed on the very next line. Absorbing it first therefore buys
+/// nothing and costs a full copy of it, which for a staged commit is a second
+/// copy of the dataset (issue #288). The bound is on bytes because that is the
+/// only axis this moves: the allocation *count* is identical either way.
+#[test]
+fn a_write_larger_than_the_gather_budget_is_not_copied_into_it() {
+    const ELEMS: usize = 2 * 1024 * 1024;
+    const DATASET_BYTES: u64 = (ELEMS * 8) as u64;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big_commit.h5");
+    let mut builder = FileBuilder::new();
+    builder
+        .create_dataset("seed")
+        .with_f64_data(&[1.0f64; 8])
+        .with_shape(&[8]);
+    builder.write(&path).unwrap();
+
+    let data: Vec<f64> = (0..ELEMS).map(|i| i as f64).collect();
+    let measured = {
+        let file = File::open_rw(&path).unwrap();
+        let root = file.root();
+        let (_, m) = measure("big_staged_commit", || {
+            root.create_dataset("big", |b| {
+                b.with_f64_data(&data).with_shape(&[ELEMS as u64]);
+            })
+            .unwrap();
+            file.commit().unwrap();
+        });
+        m
+    };
+
+    // The staged dataset is in this measurement, so a commit that did nothing
+    // cannot reach this floor.
+    assert!(
+        measured.bytes >= DATASET_BYTES,
+        "the staged dataset is not in this measurement: {measured}"
+    );
+
+    // Measured at 1.00x the dataset with the bypass and 2.00x without it: the
+    // difference is exactly one more copy. Half again is ample headroom for the
+    // headers and the link the commit also writes, and still nowhere near two.
+    assert!(
+        measured.bytes < DATASET_BYTES * 3 / 2,
+        "a staged commit must not copy its data into the gather buffer as well: \
+         measured {measured} against a {DATASET_BYTES}-byte dataset"
+    );
+}

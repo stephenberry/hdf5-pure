@@ -244,8 +244,8 @@ impl FileAccessProperties {
     /// [`Dataset::append`](crate::Dataset::append) forces its writes to durable
     /// storage before returning. [`SyncPolicy::OnClose`] issues no `fsync` at all,
     /// which is what the reference C library does; the writes still reach the
-    /// operating system as they are made, so only power-loss durability moves to
-    /// the caller.
+    /// operating system by the time the operation making them returns, so only
+    /// power-loss durability moves to the caller.
     ///
     /// The read-only opens ignore this: they write nothing.
     pub const fn with_sync_policy(mut self, sync_policy: SyncPolicy) -> Self {
