@@ -42,6 +42,42 @@ use crate::filters::{ChunkContext, FilterScratch, compress_chunk_with, decompres
 use crate::message_type::MessageType;
 use crate::source::Source;
 
+/// Counts the two index-block allocations, so a test can say whether its fixture
+/// reached them.
+///
+/// Both are rare: with the C library's Extensible-Array defaults a data block is
+/// allocated roughly every sixteen appends and a *super* block twice in the first
+/// five hundred. A crash sweep positioned over the wrong window exercises neither
+/// while looking exactly like one that exercises both, which is how the first
+/// draft of [`crate::crash_replay`] came to pass with both barriers below
+/// deleted.
+#[cfg(test)]
+pub(crate) mod alloc_probe {
+    use core::cell::Cell;
+
+    thread_local! {
+        static DATA_BLOCKS: Cell<usize> = const { Cell::new(0) };
+        static SUPER_BLOCKS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn note_data_block() {
+        DATA_BLOCKS.with(|c| c.set(c.get() + 1));
+    }
+
+    pub(crate) fn note_super_block() {
+        SUPER_BLOCKS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Zero both counters and return what they held, so a caller measures one
+    /// window rather than the whole process.
+    pub(crate) fn take() -> (usize, usize) {
+        (
+            DATA_BLOCKS.with(|c| c.replace(0)),
+            SUPER_BLOCKS.with(|c| c.replace(0)),
+        )
+    }
+}
+
 /// The undefined-address sentinel for a given offset size.
 pub(crate) fn undef_addr(offset_size: u8) -> u64 {
     match offset_size {
@@ -668,6 +704,8 @@ impl Located {
             } else {
                 self.alloc_undef_data_block(file, dblk_nelmts, block_offset_rel)?
             };
+            #[cfg(test)]
+            alloc_probe::note_data_block();
             // As in `ensure_super_block`: the fresh block is at end-of-file and
             // its parent pointer is not, so they need a barrier between them or
             // an address-ordered flush names a block that is not there yet.
@@ -770,6 +808,8 @@ impl Located {
             self.client_id,
         );
         let new_addr = file.append_raw(&aesb)?;
+        #[cfg(test)]
+        alloc_probe::note_super_block();
         // The block exists before anything names it. Its bytes are at
         // end-of-file and the slot below is in the index block, near the front,
         // so without this the two are one barrier-free window and a gathering
