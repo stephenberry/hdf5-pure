@@ -197,20 +197,27 @@ pub(crate) trait FileImage: Source + Send + Sync {
     /// job, and whether it happens is the policy's decision.
     fn ordering_barrier(&mut self) -> Result<(), Error>;
 
-    /// How many writes this image has issued against the file since it was
-    /// opened, for the tests that assert what an operation costs. Distinct from
-    /// what the engine *called*: turning many of those into one is the point.
-    #[cfg(test)]
-    fn issued_writes(&self) -> u64;
-
-    /// How many bytes those writes carried.
-    #[cfg(test)]
-    fn issued_write_bytes(&self) -> u64;
-
     /// Every issued write as `(offset, length)`, in the order it went out. What
     /// a count cannot say: that a publish point followed the bytes it names.
     #[cfg(test)]
     fn issued_write_order(&self) -> Vec<(u64, u64)>;
+
+    /// How many writes this image has issued against the file since it was
+    /// opened, for the tests that assert what an operation costs. Distinct from
+    /// what the engine *called*: turning many of those into one is the point.
+    #[cfg(test)]
+    fn issued_writes(&self) -> u64 {
+        self.issued_write_order().len() as u64
+    }
+
+    /// How many bytes those writes carried. Distinct from the count because the
+    /// two answer different questions: joining runs lowers the count, and
+    /// declining to write bytes that are about to be truncated away lowers only
+    /// this.
+    #[cfg(test)]
+    fn issued_write_bytes(&self) -> u64 {
+        self.issued_write_order().iter().map(|&(_, n)| n).sum()
+    }
 
     /// Adopt `mode` for every write from here on, flushing anything already
     /// buffered that the new mode would not have held.
@@ -297,11 +304,6 @@ pub(crate) struct BufferedWrites {
     /// so the integration tests that measure allocation never compile this.
     #[cfg(test)]
     issued_order: Vec<(u64, u64)>,
-    /// Bytes those writes carried. Separate from the count because the two
-    /// answer different questions: joining runs lowers the count, and declining
-    /// to write bytes that are about to be truncated away lowers only this.
-    #[cfg(test)]
-    issued_bytes: u64,
 }
 
 impl BufferedWrites {
@@ -316,27 +318,13 @@ impl BufferedWrites {
             on_disk_len,
             #[cfg(test)]
             issued_order: Vec::new(),
-            #[cfg(test)]
-            issued_bytes: 0,
         }
-    }
-
-    /// How many writes this has issued against the handle since it was opened.
-    #[cfg(test)]
-    pub(crate) fn issued(&self) -> u64 {
-        self.issued_order.len() as u64
     }
 
     /// Every issued write as `(offset, length)`, in the order it went out.
     #[cfg(test)]
     pub(crate) fn issued_order(&self) -> &[(u64, u64)] {
         &self.issued_order
-    }
-
-    /// How many bytes those writes carried.
-    #[cfg(test)]
-    pub(crate) fn issued_bytes(&self) -> u64 {
-        self.issued_bytes
     }
 
     /// The handle, for the positioned reads an image serves from it.
@@ -404,9 +392,13 @@ impl BufferedWrites {
     /// patches land in the header and index runs rather than in the long one at
     /// end-of-file. Its worth was measured on a buffer held *across* operations,
     /// where a patch lands inside a run already grown to the budget: 541 MB
-    /// against 7.7 MB. That configuration is issue #308, so this path is kept for
-    /// its correctness and for the day that returns, not for a bound that can
-    /// reach it today.
+    /// against 7.7 MB. That configuration is issue #308.
+    ///
+    /// It is a pure optimization, not a correctness requirement: disabling it
+    /// passes the whole suite, because the general merge reaches the same bytes
+    /// by unioning the runs and overwriting. It is kept because it is right the
+    /// day #308 returns — but a reader who finds it in the way should know that
+    /// no test today can tell it from the slow path.
     fn absorb(&mut self, offset: u64, bytes: &[u8]) {
         let mut lo = offset;
         let mut hi = offset + bytes.len() as u64;
@@ -425,8 +417,7 @@ impl BufferedWrites {
         }
         // A write that continues the run before it and reaches no run after it is
         // what a sequence of appends at end-of-file is.
-        if self.extends_the_run_before_it(offset, hi) {
-            let (&k, _) = self.runs.range(..offset).next_back().expect("just checked");
+        if let Some(k) = self.run_ending_at(offset, hi) {
             let run = self.runs.get_mut(&k).expect("just enumerated");
             run.extend_from_slice(bytes);
             self.pending_bytes += bytes.len();
@@ -489,14 +480,23 @@ impl BufferedWrites {
         (k + v.len() as u64 >= end).then_some(k)
     }
 
-    /// Whether `[offset, end)` begins exactly where the preceding run ends and
-    /// touches nothing after it, so the write can be appended to that run in
-    /// place rather than merged into a fresh one.
-    fn extends_the_run_before_it(&self, offset: u64, end: u64) -> bool {
-        let Some((&k, v)) = self.runs.range(..offset).next_back() else {
-            return false;
-        };
-        k + v.len() as u64 == offset && self.runs.range(offset..=end).next().is_none()
+    /// The start offset of the pending run that ends exactly at `offset` when
+    /// `[offset, end)` touches nothing after it, so the write can be appended to
+    /// that run in place rather than merged into a fresh one.
+    fn run_ending_at(&self, offset: u64, end: u64) -> Option<u64> {
+        let (&k, v) = self.runs.range(..offset).next_back()?;
+        (k + v.len() as u64 == offset && self.runs.range(offset..=end).next().is_none())
+            .then_some(k)
+    }
+
+    /// Where a walk that must see every run reaching `offset` has to start: the
+    /// run before it can still reach into the window, and a walk from `offset`
+    /// would step over it.
+    fn walk_from(&self, offset: u64) -> u64 {
+        self.runs
+            .range(..=offset)
+            .next_back()
+            .map_or(offset, |(&k, _)| k)
     }
 
     /// Whether the pending runs wholly cover `[offset, end)`.
@@ -510,27 +510,15 @@ impl BufferedWrites {
     /// every profile and only skips *running* it, so gating this would compile in
     /// a debug build and fail every release one.
     fn covers(&self, offset: u64, end: u64) -> bool {
-        if end <= offset {
-            return true;
-        }
         let mut at = offset;
-        for (&k, v) in self
-            .runs
-            .range(..=offset)
-            .next_back()
-            .into_iter()
-            .chain(self.runs.range((
-                std::ops::Bound::Excluded(offset),
-                std::ops::Bound::Unbounded,
-            )))
-        {
+        for (&k, v) in self.runs.range(self.walk_from(offset)..) {
+            if at >= end {
+                return true;
+            }
             if k > at {
                 return false;
             }
             at = at.max(k + v.len() as u64);
-            if at >= end {
-                return true;
-            }
         }
         at >= end
     }
@@ -543,13 +531,7 @@ impl BufferedWrites {
             return;
         }
         let end = offset + buf.len() as u64;
-        // The run starting before `offset` can still reach into the window.
-        let first = self
-            .runs
-            .range(..=offset)
-            .next_back()
-            .map_or(offset, |(&k, _)| k);
-        for (&k, v) in self.runs.range(first..) {
+        for (&k, v) in self.runs.range(self.walk_from(offset)..) {
             if k >= end {
                 break;
             }
@@ -573,8 +555,13 @@ impl BufferedWrites {
         }
     }
 
-    /// Issue what is gathered if this mode releases at ordering points; a no-op
-    /// otherwise, including when nothing is buffered at all.
+    /// Issue what is gathered, so everything written before this reaches the
+    /// operating system before anything written after it.
+    ///
+    /// Stated as a dispatch over the mode rather than a bare `flush`, which
+    /// would be equivalent today: an unbuffered image never holds runs, so its
+    /// flush is already a no-op. The arms say which modes release here, so a mode
+    /// that did not would have to say so instead of inheriting it.
     pub(crate) fn ordering_barrier(&mut self) -> Result<(), Error> {
         match self.mode {
             WriteBuffering::Unbuffered => Ok(()),
@@ -657,10 +644,7 @@ impl BufferedWrites {
             .map_err(Error::Io)?;
         self.handle.write_all(bytes).map_err(Error::Io)?;
         #[cfg(test)]
-        {
-            self.issued_order.push((offset, bytes.len() as u64));
-            self.issued_bytes += bytes.len() as u64;
-        }
+        self.issued_order.push((offset, bytes.len() as u64));
         self.on_disk_len = self.on_disk_len.max(offset + bytes.len() as u64);
         Ok(())
     }
@@ -669,10 +653,23 @@ impl BufferedWrites {
     /// length puts past end-of-file and issuing the rest first, so a run below the
     /// cut still lands.
     pub(crate) fn set_len(&mut self, len: u64) -> Result<(), Error> {
-        self.discard_from(len);
-        self.flush()?;
+        // Two rules meet here, and the order is the only one that keeps both.
+        // Nothing may write bytes the truncate is about to remove, so the doomed
+        // runs must go before the flush. And `discard_from` permanently forgets
+        // them, so it must not run ahead of a step that can fail — discarding
+        // first leaves a failed truncate reporting a length whose bytes nothing
+        // will ever write, against `flush`'s own contract that an error leaves
+        // the writes pending rather than gone. The truncate therefore goes first:
+        // it is the step that dooms them, and until it succeeds they are alive.
+        //
+        // What that leaves is a failed *flush* after a successful truncate, which
+        // keeps every surviving run pending but has already moved the file. That
+        // is an error path in both orders; this one is the half that cannot lose
+        // a write.
         self.handle.set_len(len).map_err(Error::Io)?;
+        self.discard_from(len);
         self.on_disk_len = len;
+        self.flush()?;
         Ok(())
     }
 
@@ -825,16 +822,6 @@ impl FileImage for MirrorImage {
 
     fn ordering_barrier(&mut self) -> Result<(), Error> {
         self.writes.ordering_barrier()
-    }
-
-    #[cfg(test)]
-    fn issued_writes(&self) -> u64 {
-        self.writes.issued()
-    }
-
-    #[cfg(test)]
-    fn issued_write_bytes(&self) -> u64 {
-        self.writes.issued_bytes()
     }
 
     #[cfg(test)]
@@ -993,21 +980,21 @@ impl Source for HandleImage {
             });
         }
         let on_disk = self.writes.on_disk_len();
-        let from_disk = if offset < on_disk {
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "end is offset + buf.len(), so this is at most buf.len()"
-            )]
-            let take = (on_disk.min(end) - offset) as usize;
+        // Where the disk runs out inside this window: everything below comes off
+        // the file, everything above it exists only as a pending write.
+        let disk_end = on_disk.clamp(offset, end);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "disk_end is clamped to [offset, offset + buf.len()), so this is at \
+                      most buf.len()"
+        )]
+        let take = (disk_end - offset) as usize;
+        if take > 0 {
             read_at_handle(self.writes.handle(), on_disk, offset, &mut buf[..take])?;
-            buf[take..].fill(0);
-            offset + take as u64
-        } else {
-            buf.fill(0);
-            offset
-        };
+        }
+        buf[take..].fill(0);
         debug_assert!(
-            from_disk >= end || self.writes.covers(from_disk, end),
+            disk_end >= end || self.writes.covers(disk_end, end),
             "read of [{offset}, {end}) reaches past the file's {on_disk} bytes into a \
              range no pending write covers, so it would return zeros"
         );
@@ -1093,16 +1080,6 @@ impl FileImage for HandleImage {
 
     fn ordering_barrier(&mut self) -> Result<(), Error> {
         self.writes.ordering_barrier()
-    }
-
-    #[cfg(test)]
-    fn issued_writes(&self) -> u64 {
-        self.writes.issued()
-    }
-
-    #[cfg(test)]
-    fn issued_write_bytes(&self) -> u64 {
-        self.writes.issued_bytes()
     }
 
     #[cfg(test)]
@@ -1200,14 +1177,6 @@ impl FileImage for CountingImage {
         self.inner.ordering_barrier()
     }
 
-    fn issued_writes(&self) -> u64 {
-        self.inner.issued_writes()
-    }
-
-    fn issued_write_bytes(&self) -> u64 {
-        self.inner.issued_write_bytes()
-    }
-
     fn issued_write_order(&self) -> Vec<(u64, u64)> {
         self.inner.issued_write_order()
     }
@@ -1275,14 +1244,6 @@ impl FileImage for SourceOnlyImage {
 
     fn ordering_barrier(&mut self) -> Result<(), Error> {
         self.0.ordering_barrier()
-    }
-
-    fn issued_writes(&self) -> u64 {
-        self.0.issued_writes()
-    }
-
-    fn issued_write_bytes(&self) -> u64 {
-        self.0.issued_write_bytes()
     }
 
     fn issued_write_order(&self) -> Vec<(u64, u64)> {
@@ -1841,6 +1802,49 @@ mod tests {
             img.sync_all().unwrap();
             assert_in_sync(&path, img.as_ref(), backing);
         }
+    }
+
+    /// A truncate that **fails** keeps every write it would have discarded.
+    ///
+    /// `discard_from` is irreversible, so the order it sits in is the whole
+    /// subject: the doomed runs have to go before the flush, or bytes about to
+    /// stop existing get written out (the test above), and they must not go
+    /// before the truncate, or a truncate that fails leaves the image reporting
+    /// a length whose bytes nothing will ever write. Putting the truncate first
+    /// satisfies both, since until it succeeds nothing is doomed.
+    ///
+    /// Asserted through a read-only handle, which is the cheapest `set_len`
+    /// failure there is. No engine path reaches this today — the one
+    /// `FileImage::truncate` caller barriers first, so the buffer is always
+    /// empty by the time it arrives — which is exactly why it needs a test: the
+    /// suite cannot otherwise tell this order from the one that loses the write.
+    #[test]
+    fn a_failed_truncate_keeps_the_writes_it_would_have_discarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("read_only");
+        std::fs::write(&path, b"abcdefgh").unwrap();
+
+        let mut writes = BufferedWrites::new(fs::File::open(&path).unwrap(), 8);
+        writes.set_mode(GATHERED).unwrap();
+        writes.write_at(8, &[9u8; 200]).unwrap();
+        assert_eq!(
+            writes.pending_bytes, 200,
+            "the write must be held, not issued"
+        );
+
+        assert!(
+            writes.set_len(8).is_err(),
+            "a read-only handle must refuse set_len, or this proves nothing"
+        );
+        assert_eq!(
+            writes.pending_bytes, 200,
+            "a truncate that failed discarded the writes it never doomed"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"abcdefgh",
+            "a failed truncate must not have written anything either"
+        );
     }
 
     /// A flush that cannot write leaves its writes **pending**, so the next one

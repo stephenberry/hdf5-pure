@@ -1120,6 +1120,25 @@ pub(crate) enum AppendTarget<'a> {
 /// peak append memory never scales with the caller's slice.
 const APPEND_BATCH_BYTES: u64 = 1 << 20;
 
+/// The data-only durability barrier: an ordering point always, and an `fsync`
+/// only when this session's [`SyncPolicy`] keeps the cadence.
+///
+/// One function rather than one per caller because the commit path
+/// ([`WriteEngine::barrier_data`]) and the append engine's phase boundaries
+/// ([`EditStore::sync`]) are the same point reached from two owners of the
+/// image, and a barrier that orders at one and not the other is a
+/// crash-consistency defect no test on the default policy can see (issue #288).
+///
+/// The match is exhaustive on purpose, as at [`WriteEngine::barrier`]:
+/// `SyncPolicy` is sealed to the outside but not to this crate, so a policy
+/// added later fails to compile here until someone decides what it means.
+fn barrier_data(image: &mut dyn FileImage, sync_policy: SyncPolicy) -> Result<(), Error> {
+    match sync_policy {
+        SyncPolicy::Always => image.sync_data(),
+        SyncPolicy::OnClose => image.ordering_barrier(),
+    }
+}
+
 /// Byte budget for the writes one operation may gather before they are issued
 /// (see [`WriteBuffering::Operation`]).
 ///
@@ -2314,10 +2333,7 @@ impl WriteEngine {
     /// does not move end-of-file and so needs no metadata flush. It orders the
     /// gathered writes for the same reason.
     fn barrier_data(&mut self) -> Result<(), Error> {
-        match self.sync_policy {
-            SyncPolicy::Always => self.image.sync_data(),
-            SyncPolicy::OnClose => self.image.ordering_barrier(),
-        }
+        barrier_data(self.image.as_mut(), self.sync_policy)
     }
 
     /// Force this session's writes to durable storage *whatever* the policy
@@ -7375,13 +7391,7 @@ impl Store for EditStore<'_> {
         self.write_at(self.sb_sig_off as u64, &bytes)
     }
     fn sync(&mut self) -> Result<(), Error> {
-        // The append engine's phase boundaries are ordering points exactly as the
-        // commit's are, so they issue the gathered writes under either policy;
-        // see `WriteEngine::barrier` for what leaving them gathered would cost.
-        match self.sync_policy {
-            SyncPolicy::Always => self.image.sync_data(),
-            SyncPolicy::OnClose => self.image.ordering_barrier(),
-        }
+        barrier_data(self.image, self.sync_policy)
     }
 }
 
@@ -11241,31 +11251,8 @@ mod tests {
         );
     }
 
-    /// The `fsync` cadence belongs to whoever the fapl says: every durability
-    /// point in the engine — an immediate append's ordered barriers, a commit's
-    /// barrier and repoint, the barrier a commit issues after truncating, the
-    /// same-length-overwrite fast path, and the barrier `close` issues — answers
-    /// to the session's [`SyncPolicy`], while `force_sync` (the explicit
-    /// `File::sync`) answers to nobody (issue #263).
-    ///
-    /// The counts are compared as a table across the two policies rather than
-    /// pinned to literals: how many `fsync`s a commit costs is an implementation
-    /// detail that may fall, but that `OnClose` costs *none* and `Always` costs
-    /// some at each of those points is the contract. The file is read back
-    /// under both, since a skipped barrier must cost durability and nothing else
-    /// — the bytes have already reached the operating system.
-    ///
-    /// Every stage here is a *distinct* barrier site. A commit tail that syncs
-    /// twice does not stand in for the fast path that syncs once, nor for the
-    /// post-truncate barrier that only a shrinking commit reaches: each is its
-    /// own `self.barrier()` call that a later edit could regress to a bare
-    /// `self.image.sync_all()` on its own — verified by mutating each site
-    /// separately and watching this fail. The persisting tails and the
-    /// consistency-flag write are covered by the test below.
-    ///
     /// Write a small file of `tables` unlimited chunked datasets, paged when
     /// asked, for the write-gathering tests below.
-    #[cfg(test)]
     fn gather_fixture(path: &std::path::Path, tables: usize, paged: bool) {
         use crate::writer::FileBuilder;
         let mut b = FileBuilder::new();
@@ -11287,8 +11274,8 @@ mod tests {
     }
 
     /// Run the same appends and the same commit on `session`, and report what it
-    /// cost in writes and what the file ended up as.
-    #[cfg(test)]
+    /// cost in writes. The file it leaves is the other half of what the callers
+    /// compare, and they read it off the path themselves.
     fn gather_workload(session: &mut WriteEngine) -> u64 {
         let before = session.image.issued_writes();
         for round in 0..4 {
@@ -11423,12 +11410,11 @@ mod tests {
     /// would be satisfied by a session that issued everything at the wrong time.
     ///
     /// It covers two of the three ordering sites: `barrier` (the commit tail) and
-    /// `EditStore::sync` (the append phases). The third, `barrier_data`, has one
-    /// caller — `set_consistency_flags` — whose own callers are the SWMR writer,
-    /// which gathers nothing, and the teardown path, which forces a sync
-    /// regardless. Its `ordering_barrier` is therefore correct by symmetry with
-    /// the other two and distinguishable by no test; it is named here so the gap is a
-    /// known one rather than an assumed-covered one.
+    /// `EditStore::sync` (the append phases). The third is `barrier_data`, which
+    /// `EditStore::sync` now shares rather than duplicates, so it is correct by
+    /// identity rather than by argument. It is covered too, one test over:
+    /// mutating its `OnClose` arm to `Ok(())` fails
+    /// `sync_policy_governs_the_persisting_and_flag_barriers` and nothing else.
     #[test]
     fn a_barrier_orders_the_publish_point_last_under_every_policy() {
         use tempfile::tempdir;
@@ -11691,6 +11677,28 @@ mod tests {
         );
     }
 
+    /// The `fsync` cadence belongs to whoever the fapl says: every durability
+    /// point in the engine — an immediate append's ordered barriers, a commit's
+    /// barrier and repoint, the barrier a commit issues after truncating, the
+    /// same-length-overwrite fast path, and the barrier `close` issues — answers
+    /// to the session's [`SyncPolicy`], while `force_sync` (the explicit
+    /// `File::sync`) answers to nobody (issue #263).
+    ///
+    /// The counts are compared as a table across the two policies rather than
+    /// pinned to literals: how many `fsync`s a commit costs is an implementation
+    /// detail that may fall, but that `OnClose` costs *none* and `Always` costs
+    /// some at each of those points is the contract. The file is read back
+    /// under both, since a skipped barrier must cost durability and nothing else
+    /// — the bytes have already reached the operating system.
+    ///
+    /// Every stage here is a *distinct* barrier site. A commit tail that syncs
+    /// twice does not stand in for the fast path that syncs once, nor for the
+    /// post-truncate barrier that only a shrinking commit reaches: each is its
+    /// own `self.barrier()` call that a later edit could regress to a bare
+    /// `self.image.sync_all()` on its own — verified by mutating each site
+    /// separately and watching this fail. The persisting tails and the
+    /// consistency-flag write are covered by the test below.
+    ///
     /// One site is left uncovered: the version 0/1 repoint branch of the
     /// non-persisting tail. A pre-v2 file cannot be produced by this crate's own
     /// writer — the crosscheck tests get one from the C library — and the

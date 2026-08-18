@@ -8,8 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
-- A read-write session gathers the many small writes one commit or in-place append makes and issues one per dirty page: a session of 32 chunk appends issued 160 writes where it made 256, under either `SyncPolicy`. Every ordering barrier still issues what it holds, so a failed write leaves the same file it did before, and the SWMR writer gathers nothing ([#288](https://github.com/stephenberry/hdf5-pure/issues/288)).
-- An in-place append issues fewer writes before any gathering, which is what a SWMR writer sees: the Extensible Array header's six statistics go out as one write, and an append that allocates no index block no longer rewrites the superblock twice — 17 writes down to 12 ([#288](https://github.com/stephenberry/hdf5-pure/issues/288)).
+- A read-write session issues far fewer writes for the same file: one per dirty page, gathered across the many small writes a commit or in-place append makes. A session of 32 chunk appends issued 160 writes where it once made 448, with no change to the bytes on disk or to what a failed write leaves behind, and the SWMR writer gathers nothing ([#288](https://github.com/stephenberry/hdf5-pure/issues/288)).
 - The typed whole-dataset readers (`Dataset::read_f64` and its eight siblings) decode a row window at a time instead of the whole dataset at once, so peak memory is the values they return plus about a mebibyte rather than twice the dataset: an 8 MiB `f64` dataset peaked at 16.8 MB and now peaks at 10.1 MB ([#289](https://github.com/stephenberry/hdf5-pure/issues/289)).
 - A row window takes only its own chunks out of the cached chunk index rather than the whole index, so reading a dataset window by window costs a constant per chunk instead of one allocation per chunk of the dataset per window ([#289](https://github.com/stephenberry/hdf5-pure/issues/289)).
 
