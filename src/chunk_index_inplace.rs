@@ -16,9 +16,9 @@
 //! without changing it, taking one barrier at teardown instead.
 //!
 //! This module owns the byte-level mechanics that do not depend on *why* the
-//! append is happening: the in-memory-mirror file cursor ([`InPlaceFile`]), the
-//! per-dataset geometry cache ([`Located`]), and the element-slot / block /
-//! super-block writes that maintain the Extensible Array. It is element-width
+//! append is happening: the writable byte seam ([`Store`]), the per-dataset
+//! geometry cache ([`Located`]), and the element-slot / block / super-block
+//! writes that maintain the Extensible Array. It is element-width
 //! agnostic: the same code path stores a bare address for an unfiltered array
 //! (client id 0) or the full `address + compressed_size + filter_mask` record for
 //! a filtered array (client id 1), selected by the array header's client id. The
@@ -89,17 +89,14 @@ impl ElemRecord {
 
 /// Writable byte-level I/O the Extensible-Array growth engine ([`Located`])
 /// depends on, extending the read-only [`Source`] seam with in-place mutation.
-/// Its owners today are [`InPlaceFile`] (the append/SWMR writers' own mirror +
-/// handle) and the read-write engine's borrowed mirror; the bounded backing adds
-/// a store with no mirror at all, which is why every engine
-/// *read* goes through [`Source`] (bounded, random-access) rather than a
-/// whole-file `&[u8]`. Genericizing the engine over this trait lets a long-lived
-/// edit engine drive an O(1) in-place append against its *own* single mirror and
-/// exclusive lock rather than constructing a second `InPlaceFile` (which would
-/// take a second exclusive lock and keep a divergent mirror). Each owner keeps its
-/// own crash-safety discipline for the primitives — `InPlaceFile` mirrors before
-/// disk, the edit mirror writes disk before mirror — while sharing the checksummed
-/// slot/block/super-block mechanics through the derived operations below.
+/// Its one production owner is the read-write engine's `EditStore`, which drives
+/// it against whichever [`FileImage`](crate::image::FileImage) the session
+/// opened — a whole-file mirror or a handle with no mirror at all. That second
+/// case is why every engine *read* goes through [`Source`] (bounded,
+/// random-access) rather than a whole-file `&[u8]`. Genericizing the engine over
+/// this trait is what lets one long-lived session drive an O(1) in-place append
+/// against its own image and exclusive lock, rather than opening a second one
+/// that would take a second lock and keep a divergent view.
 pub(crate) trait Store: Source {
     /// This file's address (offset) field width in bytes.
     fn offset_size(&self) -> u8;
@@ -656,6 +653,10 @@ impl Located {
             } else {
                 self.alloc_undef_data_block(file, dblk_nelmts, block_offset_rel)?
             };
+            // As in `ensure_super_block`: the fresh block is at end-of-file and
+            // its parent pointer is not, so they need a barrier between them or
+            // an address-ordered flush names a block that is not there yet.
+            file.sync()?;
             file.write_addr_at(dblk_ptr_off, new_addr)?;
             match region.parent {
                 Parent::IndexDirect { .. } => self.rechecksum_index_block(file)?,
@@ -754,6 +755,11 @@ impl Located {
             self.client_id,
         );
         let new_addr = file.append_raw(&aesb)?;
+        // The block exists before anything names it. Its bytes are at
+        // end-of-file and the slot below is in the index block, near the front,
+        // so without this the two are one barrier-free window and a gathering
+        // image issues them in *address* order — the pointer first (issue #288).
+        file.sync()?;
 
         let slot_off = self.index_block_addr
             + ib_prefix
@@ -887,14 +893,29 @@ impl Located {
             // construction and this is the predicate the walk always had.
             crate::chunked_write::SlotOccupancy::Dense(num_chunks),
         );
-        let ls = file.length_size() as u64;
+        let ls = file.length_size() as usize;
         let ea_addr = self.ea_addr;
-        file.write_length_at(ea_addr + 12, stats.nsuper_blks)?;
-        file.write_length_at(ea_addr + 12 + ls, stats.super_blk_size)?;
-        file.write_length_at(ea_addr + 12 + 2 * ls, stats.ndata_blks)?;
-        file.write_length_at(ea_addr + 12 + 3 * ls, stats.data_blk_size)?;
-        file.write_length_at(ea_addr + 12 + 4 * ls, stats.max_idx_set)?;
-        file.write_length_at(ea_addr + 12 + 5 * ls, stats.nelmts)?;
+        // The six statistics are adjacent length-sized fields, so they are one
+        // span and go out as one write. Six writes of eight bytes each into the
+        // same forty-eight are six syscalls and, on flash, six chances to dirty
+        // the same page (issue #288).
+        // On the stack: this runs on every append, and the six fields are at most
+        // forty-eight bytes, so a heap allocation per append would be one the
+        // six separate writes never made.
+        let mut stat_block = [0u8; 6 * 8];
+        let mut at = 0;
+        for value in [
+            stats.nsuper_blks,
+            stats.super_blk_size,
+            stats.ndata_blks,
+            stats.data_blk_size,
+            stats.max_idx_set,
+            stats.nelmts,
+        ] {
+            stat_block[at..at + ls].copy_from_slice(&value.to_le_bytes()[..ls]);
+            at += ls;
+        }
+        file.write_at(ea_addr + 12, &stat_block[..at])?;
         let aehd_size =
             ExtensibleArrayHeader::serialized_size(file.offset_size(), file.length_size()) as u64;
         let cks_off = ea_addr + aehd_size - 4;
@@ -1082,6 +1103,11 @@ pub(crate) fn apply_ea_append<F: Store>(
     file.sync()?;
     file.patch_superblock_eof()?;
     file.sync()?;
+    // What the superblock now records. Phase 3 rewrites it only if the element
+    // writes below push past this, which is the *only* thing that phase's patch
+    // is for; an append that allocates no new block would otherwise rewrite the
+    // whole superblock with the bytes it already holds.
+    let recorded_eof = file.len();
     if max_phase < 2 {
         return Ok(());
     }
@@ -1106,7 +1132,9 @@ pub(crate) fn apply_ea_append<F: Store>(
 
     // Phase 3: cover any EA blocks allocated during the element writes, then
     // publish the EA header element count.
-    file.patch_superblock_eof()?;
+    if file.len() != recorded_eof {
+        file.patch_superblock_eof()?;
+    }
     loc.update_ea_header(file, plan.new_num_chunks)?;
     file.sync()?;
     if max_phase < 4 {
@@ -1413,6 +1441,16 @@ mod tests {
         max_read: Cell<usize>,
         total_read: Cell<usize>,
         reads: RefCell<Vec<(u64, usize)>>,
+        /// How many times the append sequence rewrote the superblock to advance
+        /// its recorded end-of-file. Two of the four durability phases can, and
+        /// only one of them always must.
+        superblock_patches: Cell<usize>,
+        /// Barriers the append sequence issued. Every one is a point where the
+        /// writes before it must reach the disk before the writes after it.
+        syncs: Cell<usize>,
+        /// Blobs appended at end-of-file: the chunk, plus one per fresh index
+        /// block. Each fresh block owes a barrier before the pointer naming it.
+        appends: Cell<usize>,
     }
 
     impl WindowProbeStore {
@@ -1426,6 +1464,9 @@ mod tests {
                 max_read: Cell::new(0),
                 total_read: Cell::new(0),
                 reads: RefCell::new(Vec::new()),
+                superblock_patches: Cell::new(0),
+                syncs: Cell::new(0),
+                appends: Cell::new(0),
             }
         }
 
@@ -1433,6 +1474,9 @@ mod tests {
             self.max_read.set(0);
             self.total_read.set(0);
             self.reads.borrow_mut().clear();
+            self.superblock_patches.set(0);
+            self.syncs.set(0);
+            self.appends.set(0);
         }
     }
 
@@ -1456,6 +1500,7 @@ mod tests {
             self.superblock.length_size
         }
         fn append_bytes(&mut self, bytes: &[u8]) -> Result<u64, Error> {
+            self.appends.set(self.appends.get() + 1);
             let addr = self.data.len() as u64;
             self.data.extend_from_slice(bytes);
             Ok(addr)
@@ -1466,6 +1511,8 @@ mod tests {
             Ok(())
         }
         fn patch_superblock_eof(&mut self) -> Result<(), Error> {
+            self.superblock_patches
+                .set(self.superblock_patches.get() + 1);
             self.superblock.eof_address = self.data.len() as u64;
             let bytes = self.superblock.serialize();
             let off = self.sb_sig_off;
@@ -1473,6 +1520,7 @@ mod tests {
             Ok(())
         }
         fn sync(&mut self) -> Result<(), Error> {
+            self.syncs.set(self.syncs.get() + 1);
             Ok(())
         }
     }
@@ -1523,6 +1571,115 @@ mod tests {
         )
         .unwrap();
         apply_ea_append(store, loc, &plan, 4).unwrap();
+    }
+
+    /// A fresh Extensible-Array block is separated from the pointer that names
+    /// it by a barrier, so the block is on the disk before anything reaches it.
+    ///
+    /// The block's bytes go to end-of-file; the slot that points at it lives in
+    /// the index block or a super block, near the front of the file. Left in one
+    /// barrier-free window, an image that gathers its writes issues them in
+    /// *address* order — the pointer first — and a failure in between leaves an
+    /// index block whose checksum validates and whose pointer names bytes past
+    /// the end of the file. The next append then reads that pointer, believes the
+    /// block exists, and writes into nothing (issue #288).
+    ///
+    /// Stated as a count because the barrier is what the property *is*: the
+    /// appends that allocate a block must cost strictly more barriers than the
+    /// ones that do not. Both directions are asserted — a run with no allocating
+    /// append would satisfy "more" vacuously, and one where every append
+    /// allocated would satisfy it without separating anything.
+    ///
+    /// 320 appends at one chunk each, because a shorter run only ever allocates
+    /// *direct* data blocks: the first super block, which has the same hazard
+    /// through a different call path, arrives past 300.
+    #[test]
+    fn allocating_an_index_block_barriers_before_the_pointer_that_names_it() {
+        let mut store = WindowProbeStore::open(build_unlimited(4, 1));
+        let (mut loc, datatype) = locate(&store);
+
+        // (barriers, blobs appended at end-of-file) for each append.
+        let mut rounds: Vec<(usize, usize)> = Vec::new();
+        for i in 0..320i32 {
+            store.reset_counters();
+            append_i32s(&mut store, &mut loc, &datatype, (4 + i)..(5 + i));
+            rounds.push((store.syncs.get(), store.appends.get()));
+        }
+
+        // A plain append writes only its chunk at end-of-file.
+        let base = rounds
+            .iter()
+            .find(|&&(_, appends)| appends == 1)
+            .map(|&(syncs, _)| syncs)
+            .expect("some append allocates no index block");
+        let blocks = |appends: usize| appends - 1;
+        assert!(
+            rounds.iter().any(|&(_, appends)| blocks(appends) == 1),
+            "the run must allocate a data block somewhere: {rounds:?}"
+        );
+        assert!(
+            rounds.iter().any(|&(_, appends)| blocks(appends) >= 2),
+            "the run must reach a super block, which allocates two blocks in one \
+             append, or the second barrier site is never exercised: {rounds:?}"
+        );
+        for (round, &(syncs, appends)) in rounds.iter().enumerate() {
+            assert_eq!(
+                syncs,
+                base + blocks(appends),
+                "append {round} allocated {} index block(s) and took {syncs} \
+                 barriers against the {base} a plain append takes: each fresh \
+                 block owes one, between its bytes and the pointer naming it",
+                blocks(appends)
+            );
+        }
+    }
+
+    /// The append sequence rewrites the superblock **once** when its index
+    /// writes allocate nothing, and twice when they allocate a block past the
+    /// end-of-file phase 1 recorded.
+    ///
+    /// Phase 1's patch is unconditional — the chunk bytes always extend the file.
+    /// Phase 3's exists only to cover blocks the element writes added, and an
+    /// append that adds none used to rewrite the whole superblock with the bytes
+    /// it already held: one wasted write, and one wasted page dirtying, on every
+    /// append (issue #288).
+    ///
+    /// Asserted in both directions on purpose. "Never twice" would be satisfied
+    /// by dropping phase 3's patch altogether, which understates the end-of-file
+    /// on exactly the appends that grow the index — so this also demands that
+    /// some append in the run *does* patch twice, and the sequence below is long
+    /// enough to cross a block boundary and produce one.
+    #[test]
+    fn phase_three_patches_the_superblock_only_when_the_index_grew() {
+        let mut store = WindowProbeStore::open(build_unlimited(4, 1));
+        let (mut loc, datatype) = locate(&store);
+
+        let mut patches = Vec::new();
+        for i in 0..40i32 {
+            store.reset_counters();
+            append_i32s(&mut store, &mut loc, &datatype, (4 + i)..(5 + i));
+            patches.push(store.superblock_patches.get());
+        }
+
+        assert!(
+            patches.iter().all(|&p| p >= 1),
+            "every append extends the file, so every one must record the new \
+             end-of-file at least once: {patches:?}"
+        );
+        assert!(
+            patches.contains(&1),
+            "an append that allocates no index block must not rewrite the \
+             superblock a second time: {patches:?}"
+        );
+        assert!(
+            patches.contains(&2),
+            "an append that does allocate one must, or the file would advertise \
+             an end-of-file short of its own index: {patches:?}"
+        );
+        assert!(
+            patches.iter().all(|&p| p <= 2),
+            "the sequence defines exactly two such points: {patches:?}"
+        );
     }
 
     /// The engine's bounded-read contract: appends against a file far larger
