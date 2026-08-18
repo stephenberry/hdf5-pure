@@ -91,7 +91,10 @@ use crate::writer::FileBuilder;
 enum Verdict {
     /// Read back, and the state is one a crash at this point may leave.
     Clean,
-    /// Refused to read. The benign failure: the caller is told.
+    /// Refused to read. Benign in general — the caller is told rather than
+    /// misled — but see [`Expect::EveryPrefixReads`]: the operations swept here
+    /// promise that the previous value stays readable, so for most of them this
+    /// is a failure too.
     Loud(String),
     /// Read back without complaint, and returned something else.
     Silent(String),
@@ -139,6 +142,10 @@ impl Recording {
         work(path);
         let ops = disk_log::take();
         let (data_blocks, super_blocks) = alloc_probe::take();
+        // The recorded order itself, on request. This is what shows the
+        // address-order inversion directly: with a barrier the block at
+        // end-of-file is issued before the pointer naming it, and without one the
+        // same two writes come out the other way round.
         if std::env::var_os("CRASH_REPLAY_OPS").is_some() {
             for (i, op) in ops.iter().enumerate() {
                 std::eprintln!("OP {i} {}", op.describe());
@@ -490,8 +497,12 @@ fn appending_to_a_paged_file_survives_a_crash_at_every_write() {
 /// what catches a state that decodes but whose index no longer describes where
 /// the next element goes.
 ///
-/// Fewer rounds than the sweeps above: each prefix costs a session here rather
-/// than a read.
+/// This is the only sweep that catches the barrier before a fresh **super**
+/// block. That one publishes a pointer into the index block while the block it
+/// names is still in the buffer, and the dimension covering it has not been
+/// written, so no read follows the pointer and every prefix looks perfect. The
+/// next append follows it, reads an address out of bytes that were never
+/// written, and tries to write eight bytes at 4397202087197605906.
 #[test]
 fn a_crashed_append_can_be_reopened_and_appended_to() {
     let dir = tempfile::tempdir().unwrap();
@@ -512,6 +523,7 @@ fn a_crashed_append_can_be_reopened_and_appended_to() {
         drop(s);
     });
 
+    rec.assert_allocated(2, 1);
     let hi = WARMUP + RECOVER_ROUNDS * ROUND;
     rec.replay_every_prefix(dir.path(), Expect::EveryPrefixReads, |p| {
         // Read it first: a file that will not open is loud, and there is nothing
