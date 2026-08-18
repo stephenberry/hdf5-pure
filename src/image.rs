@@ -44,13 +44,126 @@
 //! land at that address, and only then appends. An implementation that inserted
 //! padding inside `append` would silently relocate every such blob, so padding
 //! belongs in a layer above this one.
+//!
+//! # Buffered writes
+//!
+//! Both images reach the disk through one [`BufferedWrites`], which gathers the
+//! many small writes a commit or an in-place append issues and emits one write
+//! per dirty page. Where the *bytes* live still differs between the two — that is
+//! what the images are — but how those bytes reach the operating system no longer
+//! does (issue #288).
+//!
+//! [`WriteBuffering`] says how long a write may sit in memory, and every image is
+//! built [`Unbuffered`](WriteBuffering::Unbuffered) until an entry point says
+//! otherwise, so a path that forgets to configure it is slow rather than wrong.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 use crate::convert::TryToUsize;
 use crate::error::{Error, FormatError};
 use crate::source::{BytesSource, MetadataCacheConfig, MetadataReadCache, Source};
+
+/// How long a write may sit in memory before it must reach the operating system.
+///
+/// An `fsync` always flushes first, so nothing here weakens durability against
+/// *power* loss. What each mode trades is which intermediate states another
+/// process can observe, and — for [`Session`](Self::Session) alone — the order
+/// they become observable in, which is what decides whether a failed write
+/// leaves the previous file or a broken one. Each variant states its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriteBuffering {
+    /// Every write reaches the operating system as it is made, in the order the
+    /// engine issued it.
+    ///
+    /// This is what a lock-free session takes. A SWMR writer's ordered phases are
+    /// read *concurrently*, so the order in which its writes become visible is
+    /// part of the format's contract with the reader, not an implementation
+    /// detail free to be coalesced away.
+    Unbuffered,
+    /// Dirty bytes live until the next ordering barrier, or until `max_bytes` of
+    /// them accumulate, whichever comes first. Every commit and every in-place
+    /// append ends with a barrier, so this also means: until the operation that
+    /// wrote them finishes.
+    ///
+    /// This is the default for a locked session, and it leaves the ordering the
+    /// engine already had: the barriers still separate content from the publish
+    /// points that reach it, so a failed write leaves what it left before this
+    /// gathering existed. What it stops making visible are the intermediate states
+    /// *between* two barriers of one operation — which no reader outside SWMR has
+    /// a contract to see, and a read-write session is normally alone with the file
+    /// anyway.
+    ///
+    /// "Normally" because the exclusive lock is not guaranteed: `FileLocking::Disabled`,
+    /// `HDF5_USE_FILE_LOCKING=FALSE`, and `BestEffort` on a filesystem that cannot
+    /// lock all reach this mode without one. That costs nothing here — hiding
+    /// *more* intermediate states cannot break a reader that was never promised
+    /// them — but it is why the argument above rests on the contract rather than
+    /// on the lock.
+    ///
+    /// One thing it does not repair, because it never held: a publish point that
+    /// is itself two writes — a value and the checksum covering it — is atomic
+    /// only when both land in one page. Gathering makes that *more* often true
+    /// than straight-through writing did, and true for every object header this
+    /// crate's own writer produces, but not universally.
+    Operation { page_size: u64, max_bytes: usize },
+    /// Dirty bytes live until `max_bytes` of them accumulate, an `fsync` is
+    /// issued, or the session closes — spanning both operations and the ordering
+    /// barriers inside them.
+    ///
+    /// This is the `H5Pset_page_buffer_size` analogue, and it is opt-in because of
+    /// what crossing those barriers costs. Gathered writes are issued in address
+    /// order, and **every** publish point of an operation sits at a lower address
+    /// than the content it reaches — a commit's superblock and root at address 0,
+    /// an append's dataspace dimension and array-header element count in the
+    /// object header near the front, the chunk bytes and index blocks they name at
+    /// end-of-file. Held across their barriers, they are all issued first.
+    ///
+    /// So a write that fails, or a process that dies, mid-flush can leave:
+    ///
+    /// - a root or an end-of-file naming bytes that never arrived — a file that
+    ///   fails to read, which is the *benign* case;
+    /// - a dataset whose length was published but whose rows were not, which reads
+    ///   back **clean**, as fill values;
+    /// - a dataset header published over a region a previous commit freed, which
+    ///   reads back **clean**, as the deleted object's bytes.
+    ///
+    /// The last two are silent: every checksum verifies and the reader has no
+    /// signal. Measured, not reasoned — each was produced by failing one write of
+    /// a two-write drain.
+    ///
+    /// This is what a write-back page buffer is, rather than a defect in this one:
+    /// `H5Pset_page_buffer_size` makes no crash-consistency claim either, and the
+    /// C library's page buffer reorders the same way. What is given up is a
+    /// guarantee this crate adds *on top of* HDF5, not one an HDF5 user brings
+    /// with them. A completed commit's bytes may also still be in this process's
+    /// memory when it returns.
+    ///
+    /// Under [`SyncPolicy::Always`](crate::SyncPolicy::Always) this mode holds
+    /// nothing in practice, since every barrier is an `fsync` and flushes on its
+    /// way out. It is a setting for a session that has already moved the `fsync`
+    /// cadence to the application.
+    Session { page_size: u64, max_bytes: usize },
+}
+
+impl WriteBuffering {
+    /// The page a write is rounded to when deciding what to merge, and the byte
+    /// budget; `None` when nothing is buffered at all.
+    const fn budget(self) -> Option<(u64, usize)> {
+        match self {
+            WriteBuffering::Unbuffered => None,
+            WriteBuffering::Operation {
+                page_size,
+                max_bytes,
+            }
+            | WriteBuffering::Session {
+                page_size,
+                max_bytes,
+            } => Some((page_size, max_bytes)),
+        }
+    }
+}
 
 /// The file bytes a mutating session works on.
 ///
@@ -88,14 +201,14 @@ pub(crate) trait FileImage: Source + Send + Sync {
 
     /// Flush buffered writes and force the file's *data* to durable storage.
     ///
-    /// An implementation must make its writes visible to the operating system as
-    /// it makes them, rather than relying on this to push them out.
     /// [`SyncPolicy::OnClose`](crate::SyncPolicy) skips every in-session call to
-    /// this and to [`sync_all`](Self::sync_all), and it promises the writes still
-    /// reach the operating system — a user-space buffer drained only here would silently
-    /// break that, holding a "committed" edit in this process's memory. Both
-    /// images write straight through, so this costs nothing to honor; it is
-    /// stated because the next one has no other way to learn it.
+    /// this and to [`sync_all`](Self::sync_all), so an implementation that buffers
+    /// must not treat this as its only drain: a buffer emptied nowhere else would
+    /// hold a *committed* edit in this process's memory under that policy.
+    /// [`ordering_barrier`](Self::ordering_barrier) is the other drain, and the
+    /// engine calls it at every point where the order of two writes matters —
+    /// which every operation ends with. Which of the two a given
+    /// [`WriteBuffering`] answers to is that enum's whole subject.
     fn sync_data(&mut self) -> Result<(), Error>;
 
     /// Flush buffered writes and force the file's data **and metadata** to
@@ -109,14 +222,545 @@ pub(crate) trait FileImage: Source + Send + Sync {
     /// choice at each call site has to be preserved by inspection.
     fn sync_all(&mut self) -> Result<(), Error>;
 
+    /// An ordering point has been reached: every write made before it must reach
+    /// the operating system before any write made after it.
+    ///
+    /// Named for the event rather than the effect, because the effect is the
+    /// mode's to choose. [`WriteBuffering::Operation`] issues what it holds, which
+    /// is what makes gathering free — the engine's barriers keep their ordering
+    /// meaning under every [`SyncPolicy`](crate::SyncPolicy), and every operation
+    /// ends with one, so a finished commit or append has reached the operating
+    /// system either way. [`WriteBuffering::Session`] deliberately does nothing
+    /// here; that is exactly the guarantee an explicit page buffer trades.
+    ///
+    /// It forces nothing to durable storage. That is [`sync_all`](Self::sync_all)'s
+    /// job, and whether it happens is the policy's decision.
+    fn ordering_barrier(&mut self) -> Result<(), Error>;
+
+    /// How many writes this image has issued against the file since it was
+    /// opened, for the tests that assert what an operation costs. Distinct from
+    /// what the engine *called*: turning many of those into one is the point.
+    #[cfg(test)]
+    fn issued_writes(&self) -> u64;
+
+    /// How many bytes those writes carried.
+    #[cfg(test)]
+    fn issued_write_bytes(&self) -> u64;
+
+    /// Every issued write as `(offset, length)`, in the order it went out. What
+    /// a count cannot say: that a publish point followed the bytes it names.
+    #[cfg(test)]
+    fn issued_write_order(&self) -> Vec<(u64, u64)>;
+
+    /// Adopt `mode` for every write from here on, flushing anything already
+    /// buffered that the new mode would not have held.
+    ///
+    /// Deliberately not defaulted: an image that silently ignored this would be a
+    /// SWMR writer coalescing the ordered writes its readers depend on, and the
+    /// only sound default — do nothing — is exactly that bug.
+    fn set_write_buffering(&mut self, mode: WriteBuffering) -> Result<(), Error>;
+
     /// The whole image as one slice, for parsers that walk bytes directly.
     ///
     /// `Some` only for a backing that already holds the file in memory. A
     /// caller must always have a [`Source`] path for the `None` case; this is a
     /// fast path, not a capability check.
+    ///
+    /// Buffering does not withdraw it: an image that lends its buffer out keeps
+    /// that buffer current as it writes, and defers only the *disk* write.
     fn as_slice(&self) -> Option<&[u8]> {
         None
     }
+}
+
+/// An open read/write handle plus the writes not yet issued against it: the one
+/// place either image touches the disk.
+///
+/// # What it gathers
+///
+/// A commit or an in-place append issues many small writes into a few pages. One
+/// measured in-place append costs eight: an eight-kilobyte chunk at end-of-file,
+/// and seven index, checksum, dimension and superblock patches averaging eighteen
+/// bytes each, landing in pages the *next* append dirties again. A session
+/// appending one chunk to each of eight such datasets, four times over, makes 256
+/// of those write calls and issues 160 of them gathered (issue #288).
+///
+/// Pending writes are held as disjoint byte runs, merged on insert when they
+/// touch or overlap, and emitted at flush as **one write per dirty page**: runs
+/// sharing a page are joined, and the clean bytes between them are read back so
+/// the join is a single write rather than a lie. That read is the deliberate
+/// trade — it is a page-cache hit against a write this crate is trying not to
+/// issue, and the flash it is issued to charges for writes.
+///
+/// # Why both images share it
+///
+/// The mirror already holds every byte of the file, so for that backing the runs
+/// are a second copy of what it is about to write — bounded by the byte budget,
+/// and it could instead have gathered dirty *page indices* and sliced its own
+/// buffer at flush. That was weighed and declined: the saving is ~78 KB per
+/// sixteen appends with no change in peak, and the cost would be two
+/// implementations of write ordering, of which only one would be exercised by any
+/// given test. Every rule in this module's tests is asserted `for backing in
+/// BACKINGS`, from one body — including the crash-ordering rules — and this crate
+/// has already paid for the alternative once, where two emit paths each needed
+/// their own tests and a test through one was blind to the other.
+///
+/// # What it does not do
+///
+/// It does not evict. Exceeding the byte budget flushes everything rather than
+/// choosing a victim page. Under [`WriteBuffering::Operation`] the budget is only
+/// ever reached by one large operation, whose runs are long and contiguous and
+/// gain nothing from being kept; under [`WriteBuffering::Session`] it is reached
+/// by accumulation, and flushing whole then costs one extra pass over pages that
+/// were about to be written anyway. Choosing a victim would buy the difference
+/// between those two, which no measurement here has asked for.
+pub(crate) struct BufferedWrites {
+    handle: fs::File,
+    mode: WriteBuffering,
+    /// Pending writes keyed by start offset. Disjoint and non-touching: two runs
+    /// that met would have been merged when the second was inserted, which is
+    /// what lets a flush walk them in order and lets [`overlay`](Self::overlay)
+    /// stop at the first run past its range.
+    runs: BTreeMap<u64, Vec<u8>>,
+    pending_bytes: usize,
+    /// The file's real length on disk, moved by every write this issues and by
+    /// [`set_len`](Self::set_len), and by nothing else.
+    ///
+    /// A flush reads the clean bytes between two runs sharing a page, and that
+    /// read must not fall past the end of the actual file — which trails the
+    /// image's logical end-of-file whenever an append is still pending.
+    on_disk_len: u64,
+    /// Every write actually issued against the handle, as `(offset, length)` in
+    /// the order it went out — the figure this whole type exists to lower, and
+    /// the *order*, which is what says a publish point followed the bytes it
+    /// names. Recording cannot change what is gathered, so it is carried only
+    /// where it is read: the unit tests. `cfg(test)` is the lib's own test build,
+    /// so the integration tests that measure allocation never compile this.
+    #[cfg(test)]
+    issued_order: Vec<(u64, u64)>,
+    /// Bytes those writes carried. Separate from the count because the two
+    /// answer different questions: joining runs lowers the count, and declining
+    /// to write bytes that are about to be truncated away lowers only this.
+    #[cfg(test)]
+    issued_bytes: u64,
+}
+
+impl BufferedWrites {
+    /// Wrap `handle`, whose length on disk is `on_disk_len`. Buffers nothing
+    /// until [`set_mode`](Self::set_mode) says otherwise.
+    pub(crate) fn new(handle: fs::File, on_disk_len: u64) -> Self {
+        Self {
+            handle,
+            mode: WriteBuffering::Unbuffered,
+            runs: BTreeMap::new(),
+            pending_bytes: 0,
+            on_disk_len,
+            #[cfg(test)]
+            issued_order: Vec::new(),
+            #[cfg(test)]
+            issued_bytes: 0,
+        }
+    }
+
+    /// How many writes this has issued against the handle since it was opened.
+    #[cfg(test)]
+    pub(crate) fn issued(&self) -> u64 {
+        self.issued_order.len() as u64
+    }
+
+    /// Every issued write as `(offset, length)`, in the order it went out.
+    #[cfg(test)]
+    pub(crate) fn issued_order(&self) -> &[(u64, u64)] {
+        &self.issued_order
+    }
+
+    /// How many bytes those writes carried.
+    #[cfg(test)]
+    pub(crate) fn issued_bytes(&self) -> u64 {
+        self.issued_bytes
+    }
+
+    /// The handle, for the positioned reads an image serves from it.
+    pub(crate) fn handle(&self) -> &fs::File {
+        &self.handle
+    }
+
+    /// The file's current length on disk, which is short of the image's logical
+    /// end-of-file by exactly the appends still pending.
+    pub(crate) fn on_disk_len(&self) -> u64 {
+        self.on_disk_len
+    }
+
+    /// Adopt `mode`, flushing first so nothing gathered under the old rules
+    /// outlives them.
+    pub(crate) fn set_mode(&mut self, mode: WriteBuffering) -> Result<(), Error> {
+        self.flush()?;
+        self.mode = mode;
+        Ok(())
+    }
+
+    /// Record (or issue) a write of `bytes` at `offset`.
+    pub(crate) fn write_at(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Error> {
+        // Above the mode check: an empty write is nothing to do under any of
+        // them, and issuing one costs a `seek` and a `write_all` to change no
+        // byte.
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let Some((_, max_bytes)) = self.mode.budget() else {
+            return self.issue(offset, bytes);
+        };
+        // A write the budget cannot hold gains nothing from being held: it is
+        // already at least a page, so it merges with nothing, and absorbing it
+        // first would copy it into a run only to flush that run on the next line.
+        // Measured on a 16 MiB staged commit, that copy was the whole dataset a
+        // second time. Flush before issuing so this cannot overtake a pending
+        // byte at a lower address.
+        if bytes.len() >= max_bytes {
+            self.flush()?;
+            return self.issue(offset, bytes);
+        }
+        self.absorb(offset, bytes);
+        if self.pending_bytes > max_bytes {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Merge `bytes` at `offset` into the pending runs, joining every run it
+    /// touches or overlaps into one.
+    ///
+    /// The two fast paths below are not tuning. The general merge allocates a
+    /// buffer the size of the whole joined span and copies the old runs into it,
+    /// so without them the gathering is **quadratic in the writes it holds**: both
+    /// cases arrive once per append, against a run grown to the byte budget.
+    /// Measured over 256 appends into a one-megabyte page buffer, disabling the
+    /// containment path alone costs 541 MB of copying to write one megabyte, and
+    /// the extension path alone 142 MB, against 7.7 MB with both. (Disabling both
+    /// costs 413 MB — less than the first alone, because a run that is never
+    /// extended never grows large enough to be expensive to copy. Each is worth
+    /// keeping; neither figure is the other's upper bound.)
+    fn absorb(&mut self, offset: u64, bytes: &[u8]) {
+        let mut lo = offset;
+        let mut hi = offset + bytes.len() as u64;
+        // A write wholly inside a run already held — an index element patched
+        // into a block this same operation appended, a superblock rewritten a
+        // second time — is that run's own bytes changing.
+        if let Some(k) = self.run_containing(offset, hi) {
+            let run = self.runs.get_mut(&k).expect("just enumerated");
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "run_containing proved k <= offset and that the run reaches                           offset + bytes.len(), so this is an index into a buffer already                           resident, and a resident buffer's length is a usize"
+            )]
+            let at = (offset - k) as usize;
+            run[at..at + bytes.len()].copy_from_slice(bytes);
+            return;
+        }
+        // A write that continues the run before it and reaches no run after it is
+        // what a sequence of appends at end-of-file is.
+        if self.extends_the_run_before_it(offset, hi) {
+            let (&k, _) = self.runs.range(..offset).next_back().expect("just checked");
+            let run = self.runs.get_mut(&k).expect("just enumerated");
+            run.extend_from_slice(bytes);
+            self.pending_bytes += bytes.len();
+            return;
+        }
+        // The run that starts before this write and may reach it. Taking its end
+        // into `hi` matters for a write that lands wholly inside a longer run.
+        if let Some((&k, v)) = self.runs.range(..lo).next_back() {
+            let end = k + v.len() as u64;
+            if end >= lo {
+                lo = k;
+                hi = hi.max(end);
+            }
+        }
+        // Runs starting at or after `lo`, in order, while each still touches what
+        // has been gathered. They are disjoint, so one pass settles `hi`.
+        let mut absorbed: Vec<u64> = Vec::new();
+        for (&k, v) in self.runs.range(lo..) {
+            if k > hi {
+                break;
+            }
+            hi = hi.max(k + v.len() as u64);
+            absorbed.push(k);
+        }
+        debug_assert!(
+            lo <= offset && hi >= offset + bytes.len() as u64,
+            "the merged span must contain the write that caused it"
+        );
+        // `[lo, hi)` is the union of the new write and the runs it touches, all of
+        // which are already resident, so its length is the sum of some `usize`
+        // lengths and cannot fail to be one.
+        let span = (hi - lo)
+            .to_usize()
+            .expect("a merged run is the union of buffers already in memory");
+        let mut merged = vec![0u8; span];
+        for k in absorbed {
+            let old = self.runs.remove(&k).expect("just enumerated");
+            self.pending_bytes -= old.len();
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "every absorbed run starts within [lo, hi), which `merged` spans,                           so this indexes `merged`"
+            )]
+            let at = (k - lo) as usize;
+            merged[at..at + old.len()].copy_from_slice(&old);
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "lo <= offset, asserted above, and `merged` spans [lo, hi) which                       contains the write"
+        )]
+        let at = (offset - lo) as usize;
+        merged[at..at + bytes.len()].copy_from_slice(bytes);
+        self.pending_bytes += merged.len();
+        self.runs.insert(lo, merged);
+    }
+
+    /// The start offset of the pending run that wholly contains `[offset, end)`,
+    /// so the write can be patched into it in place.
+    fn run_containing(&self, offset: u64, end: u64) -> Option<u64> {
+        let (&k, v) = self.runs.range(..=offset).next_back()?;
+        (k + v.len() as u64 >= end).then_some(k)
+    }
+
+    /// Whether `[offset, end)` begins exactly where the preceding run ends and
+    /// touches nothing after it, so the write can be appended to that run in
+    /// place rather than merged into a fresh one.
+    fn extends_the_run_before_it(&self, offset: u64, end: u64) -> bool {
+        let Some((&k, v)) = self.runs.range(..offset).next_back() else {
+            return false;
+        };
+        k + v.len() as u64 == offset && self.runs.range(offset..=end).next().is_none()
+    }
+
+    /// Whether the pending runs wholly cover `[offset, end)`.
+    ///
+    /// Only a debug assertion asks this. It is the one way a buffered read can
+    /// go wrong *quietly*: an address past the file's real length reads as zeros
+    /// and is then patched by the overlay, so a range the overlay does not reach
+    /// returns zeros rather than an error, and zeros parse.
+    ///
+    /// Not `cfg(debug_assertions)`: `debug_assert!` type-checks its argument in
+    /// every profile and only skips *running* it, so gating this would compile in
+    /// a debug build and fail every release one.
+    fn covers(&self, offset: u64, end: u64) -> bool {
+        if end <= offset {
+            return true;
+        }
+        let mut at = offset;
+        for (&k, v) in self
+            .runs
+            .range(..=offset)
+            .next_back()
+            .into_iter()
+            .chain(self.runs.range((
+                std::ops::Bound::Excluded(offset),
+                std::ops::Bound::Unbounded,
+            )))
+        {
+            if k > at {
+                return false;
+            }
+            at = at.max(k + v.len() as u64);
+            if at >= end {
+                return true;
+            }
+        }
+        at >= end
+    }
+
+    /// Patch pending bytes over `buf`, which the caller filled from `offset` on
+    /// disk. An image whose reads go to the disk must call this or read stale
+    /// bytes; one that reads from its own current mirror must not need to.
+    pub(crate) fn overlay(&self, offset: u64, buf: &mut [u8]) {
+        if self.runs.is_empty() || buf.is_empty() {
+            return;
+        }
+        let end = offset + buf.len() as u64;
+        // The run starting before `offset` can still reach into the window.
+        let first = self
+            .runs
+            .range(..=offset)
+            .next_back()
+            .map_or(offset, |(&k, _)| k);
+        for (&k, v) in self.runs.range(first..) {
+            if k >= end {
+                break;
+            }
+            let run_end = k + v.len() as u64;
+            if run_end <= offset {
+                continue;
+            }
+            let from = k.max(offset);
+            let to = run_end.min(end);
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "from and to are clamped to both the read window and the run, so                           each delta is at most buf.len() or v.len() — lengths of buffers                           already in memory"
+            )]
+            let (buf_from, buf_to, run_from, run_to) = (
+                (from - offset) as usize,
+                (to - offset) as usize,
+                (from - k) as usize,
+                (to - k) as usize,
+            );
+            buf[buf_from..buf_to].copy_from_slice(&v[run_from..run_to]);
+        }
+    }
+
+    /// Issue what is gathered if this mode releases at ordering points; a no-op
+    /// otherwise, including when nothing is buffered at all.
+    pub(crate) fn ordering_barrier(&mut self) -> Result<(), Error> {
+        match self.mode {
+            WriteBuffering::Unbuffered | WriteBuffering::Session { .. } => Ok(()),
+            WriteBuffering::Operation { .. } => self.flush(),
+        }
+    }
+
+    /// Issue every pending run, joining those that share a page into one write.
+    ///
+    /// A run is removed from the map only once it has been issued, and a run that
+    /// cannot be is put back. Taking the whole map up front and returning on the
+    /// first error would drop everything not yet written *and* leave
+    /// `pending_bytes` at zero, so the next flush — including the one
+    /// [`File::close`](crate::File::close) makes — would find an empty buffer and
+    /// report success over a batch it had silently lost. An error here means the
+    /// writes are still pending and the caller may retry or report; it never
+    /// means they are gone.
+    pub(crate) fn flush(&mut self) -> Result<(), Error> {
+        // A flush is where the page size is spent; an unbuffered image never
+        // reaches here with runs, and a mode change flushes under the old size.
+        let page_size = self.mode.budget().map_or(1, |(p, _)| p).max(1);
+        while let Some((start, mut bytes)) = self.runs.pop_first() {
+            self.pending_bytes -= bytes.len();
+            // Join every following run sharing a page with this one's last byte,
+            // reading back the clean bytes between them so the join is one write
+            // rather than a lie.
+            while let Some((&next, _)) = self.runs.first_key_value() {
+                if next > self.on_disk_len
+                    || !same_page(start + bytes.len() as u64 - 1, next, page_size)
+                {
+                    break;
+                }
+                let gap_at = start + bytes.len() as u64;
+                if gap_at < next {
+                    let filled = bytes.len();
+                    // The one length here not bounded by a buffer already in
+                    // memory: it is the hole between two runs sharing a page, so
+                    // it is bounded by the page size, which is the file's to
+                    // choose. Checked rather than asserted for that reason.
+                    let gap = match (next - gap_at).to_usize() {
+                        Ok(gap) => gap,
+                        Err(e) => {
+                            self.restore(start, bytes);
+                            return Err(Error::Format(e));
+                        }
+                    };
+                    bytes.resize(filled + gap, 0);
+                    if let Err(e) =
+                        read_at_handle(&self.handle, self.on_disk_len, gap_at, &mut bytes[filled..])
+                    {
+                        // Give back the run as it stood before the gap read, so it
+                        // still ends short of `next` and the runs stay disjoint.
+                        bytes.truncate(filled);
+                        self.restore(start, bytes);
+                        return Err(Error::Format(e));
+                    }
+                }
+                let (_, tail) = self.runs.pop_first().expect("just peeked");
+                self.pending_bytes -= tail.len();
+                bytes.extend_from_slice(&tail);
+            }
+            if let Err(e) = self.issue(start, &bytes) {
+                self.restore(start, bytes);
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Put a run that could not be issued back in the map, pending again.
+    fn restore(&mut self, start: u64, bytes: Vec<u8>) {
+        self.pending_bytes += bytes.len();
+        self.runs.insert(start, bytes);
+    }
+
+    /// Write `bytes` at `offset` through to the operating system now.
+    fn issue(&mut self, offset: u64, bytes: &[u8]) -> Result<(), Error> {
+        self.handle
+            .seek(SeekFrom::Start(offset))
+            .map_err(Error::Io)?;
+        self.handle.write_all(bytes).map_err(Error::Io)?;
+        #[cfg(test)]
+        {
+            self.issued_order.push((offset, bytes.len() as u64));
+            self.issued_bytes += bytes.len() as u64;
+        }
+        self.on_disk_len = self.on_disk_len.max(offset + bytes.len() as u64);
+        Ok(())
+    }
+
+    /// Physically resize the file to `len`, dropping the pending writes the new
+    /// length puts past end-of-file and issuing the rest first, so a run below the
+    /// cut still lands.
+    pub(crate) fn set_len(&mut self, len: u64) -> Result<(), Error> {
+        self.discard_from(len);
+        self.flush()?;
+        self.handle.set_len(len).map_err(Error::Io)?;
+        self.on_disk_len = len;
+        Ok(())
+    }
+
+    /// Forget every pending byte at or past `len`, trimming a run that straddles
+    /// it. Those bytes are about to stop existing.
+    fn discard_from(&mut self, len: u64) {
+        let doomed: Vec<u64> = self.runs.range(len..).map(|(&k, _)| k).collect();
+        for k in doomed {
+            let v = self.runs.remove(&k).expect("just enumerated");
+            self.pending_bytes -= v.len();
+        }
+        if let Some((&k, _)) = self.runs.range(..len).next_back() {
+            let v = self.runs.get_mut(&k).expect("just enumerated");
+            // Saturating rather than `as`: a gap wider than this platform's
+            // `usize` cannot be shorter than the run, so saturation keeps the run
+            // whole, which is the answer. Truncating would trim — or at an exact
+            // multiple of the word size empty — a run that must be kept.
+            let keep = (len - k).to_usize().unwrap_or(usize::MAX);
+            if keep < v.len() {
+                self.pending_bytes -= v.len() - keep;
+                v.truncate(keep);
+            }
+        }
+    }
+
+    /// Flush, then force the file's data to durable storage.
+    pub(crate) fn sync_data(&mut self) -> Result<(), Error> {
+        self.flush()?;
+        self.handle.flush().map_err(Error::Io)?;
+        self.handle.sync_data().map_err(Error::Io)?;
+        Ok(())
+    }
+
+    /// Flush, then force the file's data and metadata to durable storage.
+    pub(crate) fn sync_all(&mut self) -> Result<(), Error> {
+        self.flush()?;
+        self.handle.flush().map_err(Error::Io)?;
+        self.handle.sync_all().map_err(Error::Io)?;
+        Ok(())
+    }
+}
+
+impl Drop for BufferedWrites {
+    /// Last resort for a session dropped without a teardown — a bare engine in a
+    /// test, or an unwind. The engine's own `close`/`drop` path syncs, which
+    /// flushes; this is what keeps a path that does neither from silently
+    /// discarding a write it reported as done.
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
+}
+
+/// Whether two file offsets fall in the same `page_size`-aligned page.
+const fn same_page(a: u64, b: u64, page_size: u64) -> bool {
+    a / page_size == b / page_size
 }
 
 /// A whole-file in-memory mirror plus the read/write handle it mirrors, kept
@@ -127,13 +771,20 @@ pub(crate) trait FileImage: Source + Send + Sync {
 /// slice accesses and never touch the disk, at the cost of holding the entire
 /// file resident.
 ///
-/// Every mutation writes to disk *before* updating the mirror, so a failed
+/// Every mutation reaches the disk *before* updating the mirror, so a failed
 /// write can leave the mirror behind the file but never ahead of it. That
 /// direction is the safe one: the session re-reads its own mirror to plan
 /// later edits, and planning against bytes that are not yet on disk would
 /// commit a structure pointing at content that does not exist.
+///
+/// "Reaches the disk" is [`BufferedWrites`]'s business, not this type's, so
+/// under a buffering mode the mirror does run ahead of the *file* between
+/// flushes. The ordering above is preserved where it matters — the mirror is
+/// updated after the write is accepted, so a rejected write never enters it —
+/// and the reads that plan the next edit come from the mirror, which is current
+/// by construction.
 pub(crate) struct MirrorImage {
-    handle: fs::File,
+    writes: BufferedWrites,
     data: Vec<u8>,
 }
 
@@ -141,7 +792,11 @@ impl MirrorImage {
     /// Wrap an open read/write `handle` and the `data` already read from it.
     /// The caller is responsible for the two agreeing.
     pub(crate) fn new(handle: fs::File, data: Vec<u8>) -> Self {
-        Self { handle, data }
+        let on_disk_len = data.len() as u64;
+        Self {
+            writes: BufferedWrites::new(handle, on_disk_len),
+            data,
+        }
     }
 }
 
@@ -158,8 +813,7 @@ impl Source for MirrorImage {
 impl FileImage for MirrorImage {
     fn append(&mut self, bytes: &[u8]) -> Result<u64, Error> {
         let addr = self.data.len() as u64;
-        self.handle.seek(SeekFrom::Start(addr)).map_err(Error::Io)?;
-        self.handle.write_all(bytes).map_err(Error::Io)?;
+        self.writes.write_at(addr, bytes)?;
         self.data.extend_from_slice(bytes);
         Ok(addr)
     }
@@ -174,10 +828,7 @@ impl FileImage for MirrorImage {
         // Convert before touching the file so a failure leaves both sides
         // untouched rather than the mirror behind the disk.
         let offset_usize = offset.to_usize()?;
-        self.handle
-            .seek(SeekFrom::Start(offset))
-            .map_err(Error::Io)?;
-        self.handle.write_all(bytes).map_err(Error::Io)?;
+        self.writes.write_at(offset, bytes)?;
         self.data[offset_usize..offset_usize + bytes.len()].copy_from_slice(bytes);
         Ok(())
     }
@@ -192,24 +843,40 @@ impl FileImage for MirrorImage {
         // conversion after `set_len` would leave the mirror longer than the
         // file. Convert first so neither side moves unless both can.
         let len_usize = len.to_usize()?;
-        self.handle.set_len(len).map_err(Error::Io)?;
+        self.writes.set_len(len)?;
         self.data.truncate(len_usize);
         Ok(())
     }
 
     fn sync_data(&mut self) -> Result<(), Error> {
-        self.handle.flush().map_err(Error::Io)?;
-        self.handle.sync_data().map_err(Error::Io)?;
-        Ok(())
+        self.writes.sync_data()
     }
 
     fn sync_all(&mut self) -> Result<(), Error> {
-        // `Write::flush` is a no-op for `fs::File`, so this matches the bare
-        // `sync_all` it replaced; it is here so the trait's documented "flush
-        // buffered writes" holds for an implementation that does buffer.
-        self.handle.flush().map_err(Error::Io)?;
-        self.handle.sync_all().map_err(Error::Io)?;
-        Ok(())
+        self.writes.sync_all()
+    }
+
+    fn ordering_barrier(&mut self) -> Result<(), Error> {
+        self.writes.ordering_barrier()
+    }
+
+    #[cfg(test)]
+    fn issued_writes(&self) -> u64 {
+        self.writes.issued()
+    }
+
+    #[cfg(test)]
+    fn issued_write_bytes(&self) -> u64 {
+        self.writes.issued_bytes()
+    }
+
+    #[cfg(test)]
+    fn issued_write_order(&self) -> Vec<(u64, u64)> {
+        self.writes.issued_order().to_vec()
+    }
+
+    fn set_write_buffering(&mut self, mode: WriteBuffering) -> Result<(), Error> {
+        self.writes.set_mode(mode)
     }
 
     fn as_slice(&self) -> Option<&[u8]> {
@@ -292,8 +959,13 @@ impl Source for BorrowedHandle<'_> {
 /// Every mutation invalidates the cache entries it overlaps *before* the write
 /// reaches the disk, so a concurrent-looking read can miss a fresh byte but
 /// never return a stale one.
+///
+/// Holding no mirror is also what makes this the image that has to *overlay* its
+/// pending writes onto every read: it has no second copy of the bytes to keep
+/// current, so a buffered write is visible only through [`BufferedWrites`] until
+/// it lands.
 pub(crate) struct HandleImage {
-    handle: fs::File,
+    writes: BufferedWrites,
     /// Logical end-of-file: the real file length at open, moved by `append` and
     /// `truncate` and by nothing else.
     len: u64,
@@ -307,7 +979,7 @@ impl HandleImage {
     /// opt out).
     pub(crate) fn new(handle: fs::File, len: u64, cache: MetadataCacheConfig) -> Self {
         Self {
-            handle,
+            writes: BufferedWrites::new(handle, len),
             len,
             metadata_cache: cache
                 .is_enabled()
@@ -333,8 +1005,47 @@ impl Source for HandleImage {
         self.len
     }
 
+    /// Bytes from the file, with every pending write patched over them.
+    ///
+    /// The disk read is clamped to the file's *real* length rather than the
+    /// image's: a pending append leaves addresses that are readable by this
+    /// image's contract but do not exist yet on disk, and `read_exact` past the
+    /// end of a file is an error, not a short read. Those addresses are covered
+    /// by the pending writes that created them, which the overlay then supplies.
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FormatError> {
-        read_at_handle(&self.handle, self.len, offset, buf)
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .ok_or(FormatError::OffsetOverflow {
+                offset,
+                length: buf.len() as u64,
+            })?;
+        if end > self.len {
+            return Err(FormatError::UnexpectedEof {
+                expected: end.to_usize().unwrap_or(usize::MAX),
+                available: self.len.to_usize().unwrap_or(usize::MAX),
+            });
+        }
+        let on_disk = self.writes.on_disk_len();
+        let from_disk = if offset < on_disk {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "end is offset + buf.len(), so this is at most buf.len()"
+            )]
+            let take = (on_disk.min(end) - offset) as usize;
+            read_at_handle(self.writes.handle(), on_disk, offset, &mut buf[..take])?;
+            buf[take..].fill(0);
+            offset + take as u64
+        } else {
+            buf.fill(0);
+            offset
+        };
+        debug_assert!(
+            from_disk >= end || self.writes.covers(from_disk, end),
+            "read of [{offset}, {end}) reaches past the file's {on_disk} bytes into a \
+             range no pending write covers, so it would return zeros"
+        );
+        self.writes.overlay(offset, buf);
+        Ok(())
     }
 
     fn read_metadata_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, FormatError> {
@@ -370,8 +1081,7 @@ impl FileImage for HandleImage {
         // obligation belongs to the contract, not to this implementation's
         // read-bounds policy.
         self.invalidate(addr, bytes.len() as u64);
-        self.handle.seek(SeekFrom::Start(addr)).map_err(Error::Io)?;
-        self.handle.write_all(bytes).map_err(Error::Io)?;
+        self.writes.write_at(addr, bytes)?;
         self.len += bytes.len() as u64;
         Ok(addr)
     }
@@ -391,11 +1101,7 @@ impl FileImage for HandleImage {
             }))?;
         debug_assert!(end <= self.len);
         self.invalidate(offset, bytes.len() as u64);
-        self.handle
-            .seek(SeekFrom::Start(offset))
-            .map_err(Error::Io)?;
-        self.handle.write_all(bytes).map_err(Error::Io)?;
-        Ok(())
+        self.writes.write_at(offset, bytes)
     }
 
     fn truncate(&mut self, len: u64) -> Result<(), Error> {
@@ -405,21 +1111,40 @@ impl FileImage for HandleImage {
             self.len
         );
         self.invalidate(len, self.len.saturating_sub(len));
-        self.handle.set_len(len).map_err(Error::Io)?;
+        self.writes.set_len(len)?;
         self.len = len;
         Ok(())
     }
 
     fn sync_data(&mut self) -> Result<(), Error> {
-        self.handle.flush().map_err(Error::Io)?;
-        self.handle.sync_data().map_err(Error::Io)?;
-        Ok(())
+        self.writes.sync_data()
     }
 
     fn sync_all(&mut self) -> Result<(), Error> {
-        self.handle.flush().map_err(Error::Io)?;
-        self.handle.sync_all().map_err(Error::Io)?;
-        Ok(())
+        self.writes.sync_all()
+    }
+
+    fn ordering_barrier(&mut self) -> Result<(), Error> {
+        self.writes.ordering_barrier()
+    }
+
+    #[cfg(test)]
+    fn issued_writes(&self) -> u64 {
+        self.writes.issued()
+    }
+
+    #[cfg(test)]
+    fn issued_write_bytes(&self) -> u64 {
+        self.writes.issued_bytes()
+    }
+
+    #[cfg(test)]
+    fn issued_write_order(&self) -> Vec<(u64, u64)> {
+        self.writes.issued_order().to_vec()
+    }
+
+    fn set_write_buffering(&mut self, mode: WriteBuffering) -> Result<(), Error> {
+        self.writes.set_mode(mode)
     }
 
     // No `as_slice`: withholding the whole-file slice is what this image is for.
@@ -504,6 +1229,26 @@ impl FileImage for CountingImage {
         self.inner.sync_all()
     }
 
+    fn ordering_barrier(&mut self) -> Result<(), Error> {
+        self.inner.ordering_barrier()
+    }
+
+    fn issued_writes(&self) -> u64 {
+        self.inner.issued_writes()
+    }
+
+    fn issued_write_bytes(&self) -> u64 {
+        self.inner.issued_write_bytes()
+    }
+
+    fn issued_write_order(&self) -> Vec<(u64, u64)> {
+        self.inner.issued_write_order()
+    }
+
+    fn set_write_buffering(&mut self, mode: WriteBuffering) -> Result<(), Error> {
+        self.inner.set_write_buffering(mode)
+    }
+
     fn as_slice(&self) -> Option<&[u8]> {
         self.inner.as_slice()
     }
@@ -559,6 +1304,26 @@ impl FileImage for SourceOnlyImage {
 
     fn sync_all(&mut self) -> Result<(), Error> {
         self.0.sync_all()
+    }
+
+    fn ordering_barrier(&mut self) -> Result<(), Error> {
+        self.0.ordering_barrier()
+    }
+
+    fn issued_writes(&self) -> u64 {
+        self.0.issued_writes()
+    }
+
+    fn issued_write_bytes(&self) -> u64 {
+        self.0.issued_write_bytes()
+    }
+
+    fn issued_write_order(&self) -> Vec<(u64, u64)> {
+        self.0.issued_write_order()
+    }
+
+    fn set_write_buffering(&mut self, mode: WriteBuffering) -> Result<(), Error> {
+        self.0.set_write_buffering(mode)
     }
 
     // Deliberately inherits the `None` default: that is the whole point.
@@ -777,6 +1542,455 @@ mod tests {
 
             let mut buf = [0u8; 2];
             assert!(img.read_at(3, &mut buf).is_err(), "{backing:?}");
+        }
+    }
+
+    /// A 64-byte page, so a test can put two writes in one page or in two
+    /// without writing kilobytes to say so.
+    const PAGE: u64 = 64;
+
+    /// Gather writes for the duration of one operation, at [`PAGE`].
+    const GATHERED: WriteBuffering = WriteBuffering::Operation {
+        page_size: PAGE,
+        max_bytes: 4096,
+    };
+
+    /// An image over `initial`, gathering its writes under `mode`.
+    fn gathering(
+        dir: &std::path::Path,
+        initial: &[u8],
+        backing: Backing,
+        mode: WriteBuffering,
+    ) -> (std::path::PathBuf, Box<dyn FileImage>) {
+        gathering_named(dir, "g", initial, backing, mode)
+    }
+
+    /// The same, under a caller-chosen name. A test that holds two images at once
+    /// needs it: [`image`] names its file after the backing alone, so two of them
+    /// would share a path — and the first, still alive and still flushing on drop,
+    /// would be writing into a file the second had truncated.
+    fn gathering_named(
+        dir: &std::path::Path,
+        name: &str,
+        initial: &[u8],
+        backing: Backing,
+        mode: WriteBuffering,
+    ) -> (std::path::PathBuf, Box<dyn FileImage>) {
+        let path = dir.join(std::format!("{name}_{backing:?}.bin"));
+        std::fs::write(&path, initial).unwrap();
+        let handle = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut img: Box<dyn FileImage> = match backing {
+            Backing::Mirror => Box::new(MirrorImage::new(handle, initial.to_vec())),
+            Backing::Handle => Box::new(HandleImage::new(
+                handle,
+                initial.len() as u64,
+                MetadataCacheConfig::new(64 * 1024),
+            )),
+        };
+        img.set_write_buffering(mode).unwrap();
+        (path, img)
+    }
+
+    /// The engine plans its next edit against bytes it just wrote, so a gathered
+    /// write has to read back through the image even while the file still holds
+    /// the old ones. That divide is the whole hazard the gathering introduces,
+    /// and it runs on both backings because they answer it differently: the
+    /// mirror is already current, the handle image overlays.
+    #[test]
+    fn a_gathered_write_reads_back_before_it_reaches_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        for backing in BACKINGS {
+            let (path, mut img) = gathering(dir.path(), b"abcdef", backing, GATHERED);
+
+            img.write_at(1, b"ZZ").unwrap();
+            img.append(b"gh").unwrap();
+
+            assert_eq!(bytes(img.as_ref()), b"aZZdefgh", "{backing:?}");
+            assert_eq!(
+                img.read_metadata_at(0, 4).unwrap(),
+                b"aZZd",
+                "{backing:?}: the cached read path must see it too"
+            );
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                b"abcdef",
+                "{backing:?}: nothing was to be issued yet"
+            );
+
+            // A read that *starts inside* a pending run, rather than at or before
+            // it. The overlay has to walk back to the run covering the window's
+            // first byte; starting the walk at the window would miss it, and the
+            // reader would get the stale byte off the disk.
+            let mut inner = [0u8; 1];
+            img.read_at(2, &mut inner).unwrap();
+            assert_eq!(
+                &inner, b"Z",
+                "{backing:?}: a read starting inside a pending run missed it"
+            );
+
+            img.ordering_barrier().unwrap();
+            assert_in_sync(&path, img.as_ref(), backing);
+        }
+    }
+
+    /// Two writes into one page cost one write; the same two, one page apart,
+    /// cost two. The join reads the clean bytes between them back, so it must
+    /// leave them alone — the case where "one write per page" would otherwise be
+    /// implemented by writing zeros over a neighbor.
+    #[test]
+    fn writes_sharing_a_page_are_issued_as_one() {
+        let dir = tempfile::tempdir().unwrap();
+        for backing in BACKINGS {
+            let initial: Vec<u8> = (0..PAGE as u8 * 3).collect();
+
+            let (path, mut img) =
+                gathering_named(dir.path(), "one_page", &initial, backing, GATHERED);
+            let before = img.issued_writes();
+            img.write_at(2, b"XX").unwrap();
+            img.write_at(40, b"YY").unwrap();
+            img.ordering_barrier().unwrap();
+            assert_eq!(
+                img.issued_writes() - before,
+                1,
+                "{backing:?}: two writes in one page are one write"
+            );
+            let mut want = initial.clone();
+            want[2..4].copy_from_slice(b"XX");
+            want[40..42].copy_from_slice(b"YY");
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                want,
+                "{backing:?}: joining two runs must not disturb the bytes between them"
+            );
+
+            let (path2, mut img2) =
+                gathering_named(dir.path(), "two_pages", &initial, backing, GATHERED);
+            let before = img2.issued_writes();
+            img2.write_at(2, b"XX").unwrap();
+            img2.write_at(2 + PAGE, b"YY").unwrap();
+            img2.ordering_barrier().unwrap();
+            assert_eq!(
+                img2.issued_writes() - before,
+                2,
+                "{backing:?}: two writes a page apart stay two"
+            );
+            let mut want2 = initial.clone();
+            want2[2..4].copy_from_slice(b"XX");
+            want2[PAGE as usize + 2..PAGE as usize + 4].copy_from_slice(b"YY");
+            assert_eq!(std::fs::read(&path2).unwrap(), want2, "{backing:?}");
+        }
+    }
+
+    /// A write over a gathered one replaces it rather than racing it to the
+    /// file: the superblock is rewritten twice within one in-place append, and
+    /// the second is the one that must land.
+    #[test]
+    fn a_later_write_wins_over_the_gathered_one_it_covers() {
+        let dir = tempfile::tempdir().unwrap();
+        for backing in BACKINGS {
+            let (path, mut img) = gathering(dir.path(), b"abcdefgh", backing, GATHERED);
+
+            img.write_at(2, b"1111").unwrap();
+            img.write_at(3, b"22").unwrap();
+            img.ordering_barrier().unwrap();
+
+            assert_eq!(std::fs::read(&path).unwrap(), b"ab1221gh", "{backing:?}");
+            assert_in_sync(&path, img.as_ref(), backing);
+        }
+    }
+
+    /// Every durability barrier drains first, so what an `fsync` forces is
+    /// everything written up to it. A barrier that synced around the gathered
+    /// bytes would report a commit durable while it sat in this process.
+    #[test]
+    fn a_barrier_issues_what_was_gathered() {
+        let dir = tempfile::tempdir().unwrap();
+        for backing in BACKINGS {
+            let (path, mut img) = gathering(dir.path(), b"abcdef", backing, GATHERED);
+            img.write_at(0, b"Z").unwrap();
+            img.sync_data().unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"Zbcdef", "{backing:?}");
+
+            img.write_at(1, b"Y").unwrap();
+            img.sync_all().unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"ZYcdef", "{backing:?}");
+        }
+    }
+
+    /// Truncation drops the gathered bytes it puts past end-of-file *without
+    /// issuing them*, and keeps the ones below the cut.
+    ///
+    /// The result alone cannot say this: writing a doomed run and then cutting it
+    /// off leaves the same file, which is why the count is asserted. What it buys
+    /// is real — a commit that appends and then trims can otherwise write out
+    /// every byte it is about to discard, which is the write amplification this
+    /// whole layer exists to remove.
+    #[test]
+    fn truncate_discards_the_gathered_bytes_past_the_cut_rather_than_writing_them() {
+        let dir = tempfile::tempdir().unwrap();
+        for backing in BACKINGS {
+            let (path, mut img) = gathering(dir.path(), b"abcdefgh", backing, GATHERED);
+
+            img.append(&[9u8; 200]).unwrap();
+            let before = img.issued_writes();
+            img.truncate(8).unwrap();
+
+            assert_eq!(
+                img.issued_writes(),
+                before,
+                "{backing:?}: bytes about to stop existing were written out first"
+            );
+            assert_eq!(img.len(), 8, "{backing:?}");
+            assert_eq!(std::fs::read(&path).unwrap(), b"abcdefgh", "{backing:?}");
+
+            // A run straddling the cut keeps its half below it, and carries only
+            // that half. Here the write happens either way, so it is the *bytes*
+            // that say whether the doomed half rode along.
+            let before = img.issued_write_bytes();
+            img.write_at(1, b"ZZZZZZ").unwrap();
+            img.truncate(4).unwrap();
+            assert_eq!(
+                img.issued_write_bytes() - before,
+                3,
+                "{backing:?}: the part of the run past the cut was written anyway"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), b"aZZZ", "{backing:?}");
+            assert_in_sync(&path, img.as_ref(), backing);
+        }
+    }
+
+    /// After a truncate, the image's idea of the file's real length is the
+    /// truncated one — so a later append reads back as what was appended, not as
+    /// the end of a file that is no longer there.
+    ///
+    /// The bounded image serves a read by taking what exists on disk and patching
+    /// the pending writes over it, and the boundary between those two is exactly
+    /// this length. Leave it stale after a truncate and the read tries to take
+    /// bytes off a file that has since shrunk.
+    #[test]
+    fn a_truncate_leaves_the_real_length_where_a_later_append_can_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        for backing in BACKINGS {
+            let (_path, mut img) = gathering(dir.path(), b"abcdefgh", backing, GATHERED);
+
+            img.truncate(4).unwrap();
+            img.append(b"WXYZ").unwrap();
+
+            let mut buf = [0u8; 4];
+            img.read_at(4, &mut buf)
+                .unwrap_or_else(|e| panic!("{backing:?}: reading the appended range failed: {e}"));
+            assert_eq!(&buf, b"WXYZ", "{backing:?}");
+            assert_eq!(bytes(img.as_ref()), b"abcdWXYZ", "{backing:?}");
+        }
+    }
+
+    /// In the general merge — the path taken when a write joins runs on both
+    /// sides of it rather than landing inside one — the new bytes still win over
+    /// the older run they overlap.
+    ///
+    /// `a_later_write_wins_over_the_gathered_one_it_covers` pins the same rule on
+    /// the wholly-contained fast path. This is the other branch, and it needs a
+    /// write that *partly* overlaps a held run and reaches a second one, which no
+    /// engine path happens to produce — so nothing else distinguishes copying the
+    /// absorbed runs before the new bytes from copying them after.
+    #[test]
+    fn the_general_merge_also_lets_the_later_write_win() {
+        let dir = tempfile::tempdir().unwrap();
+        for backing in BACKINGS {
+            let (path, mut img) = gathering(dir.path(), b"abcdefghij", backing, GATHERED);
+
+            // Two runs with a hole between them, then one write that overlaps the
+            // tail of the first, spans the hole, and touches the second.
+            img.write_at(0, b"111").unwrap();
+            img.write_at(6, b"222").unwrap();
+            img.write_at(2, b"XXXXX").unwrap();
+            img.ordering_barrier().unwrap();
+
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                b"11XXXXX22j",
+                "{backing:?}: the general merge must let the later write win"
+            );
+            assert_in_sync(&path, img.as_ref(), backing);
+        }
+    }
+
+    /// Operation retention drains at every ordering barrier; session retention
+    /// does not, which is the whole difference between the default and an
+    /// explicit page buffer.
+    #[test]
+    fn session_retention_survives_an_ordering_barrier_and_operation_retention_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        for backing in BACKINGS {
+            let held = WriteBuffering::Session {
+                page_size: PAGE,
+                max_bytes: 4096,
+            };
+            let (path, mut img) = gathering_named(dir.path(), "held", b"abcdef", backing, held);
+            img.write_at(0, b"Z").unwrap();
+            img.ordering_barrier().unwrap();
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                b"abcdef",
+                "{backing:?}: a page buffer must survive an ordering barrier"
+            );
+            img.sync_all().unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"Zbcdef", "{backing:?}");
+
+            // The other half of the name, which is the default and the one the
+            // engine's barriers depend on.
+            let (released, mut img) =
+                gathering_named(dir.path(), "released", b"abcdef", backing, GATHERED);
+            img.write_at(0, b"Z").unwrap();
+            img.ordering_barrier().unwrap();
+            assert_eq!(
+                std::fs::read(&released).unwrap(),
+                b"Zbcdef",
+                "{backing:?}: operation retention must release at an ordering barrier"
+            );
+        }
+    }
+
+    /// The budget is a ceiling on what is held, not advice: a session-retained
+    /// buffer that never drained until close would spend memory without bound on
+    /// a long-running writer.
+    #[test]
+    fn the_budget_drains_a_buffer_that_would_outgrow_it() {
+        let dir = tempfile::tempdir().unwrap();
+        for backing in BACKINGS {
+            let (path, mut img) = gathering(
+                dir.path(),
+                &vec![0u8; 4096],
+                backing,
+                WriteBuffering::Session {
+                    page_size: PAGE,
+                    max_bytes: 100,
+                },
+            );
+            // Three separate pages, 64 bytes each: the third crosses 100 bytes.
+            for page in 0..3u64 {
+                img.write_at(page * PAGE, &[7u8; 40]).unwrap();
+            }
+            assert_ne!(
+                std::fs::read(&path).unwrap(),
+                vec![0u8; 4096],
+                "{backing:?}: the budget must have forced a drain"
+            );
+            img.sync_all().unwrap();
+            assert_in_sync(&path, img.as_ref(), backing);
+        }
+    }
+
+    /// A flush that cannot write leaves its writes **pending**, so the next one
+    /// retries them instead of reporting success over a batch it lost.
+    ///
+    /// This is the failure mode buffering introduces and straight-through writing
+    /// cannot have: a write is accepted, reported as fine, and only fails later at
+    /// the drain. If that drain then emptied the buffer, the `force_sync` on the
+    /// close path would find nothing to do and return `Ok` over a file missing up
+    /// to a whole budget of writes — turning "the commit errored" into "the commit
+    /// errored and then close said fine".
+    ///
+    /// A read-only handle is the cheapest write failure to arrange.
+    #[test]
+    fn a_failed_flush_keeps_its_writes_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("readonly.bin");
+        std::fs::write(&path, b"abcdefgh").unwrap();
+        let handle = fs::OpenOptions::new().read(true).open(&path).unwrap();
+        let mut img = MirrorImage::new(handle, b"abcdefgh".to_vec());
+        img.set_write_buffering(GATHERED).unwrap();
+
+        img.write_at(0, b"ZZ").unwrap();
+        assert!(
+            img.sync_all().is_err(),
+            "a write to a read-only handle must fail"
+        );
+        assert!(
+            img.sync_all().is_err(),
+            "the retry must report the failure too, not an empty buffer's success"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"abcdefgh",
+            "nothing should have reached the file"
+        );
+
+        // The other failure inside a flush is the read that fills the gap between
+        // two runs sharing a page. A write-only handle reaches exactly it: the
+        // mirror serves ordinary reads from memory, so this is the only read in
+        // play, and the writes must survive it just the same.
+        let write_only = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let mut gapped = MirrorImage::new(write_only, b"abcdefgh".to_vec());
+        gapped.set_write_buffering(GATHERED).unwrap();
+        gapped.write_at(0, b"X").unwrap();
+        gapped.write_at(4, b"Y").unwrap();
+        assert!(
+            gapped.sync_all().is_err(),
+            "the gap read must fail on a handle that cannot read"
+        );
+        assert!(
+            gapped.sync_all().is_err(),
+            "and the retry must still report it rather than an empty buffer"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"abcdefgh",
+            "a failed gap read must not have written a partial join"
+        );
+
+        // A failed gap read must also leave the run at the length it had, not at
+        // the length the aborted read resized it to. Keeping the zero padding
+        // would leave the run *touching* its neighbour, so a retry would find no
+        // gap to read and would write those zeros over the clean bytes between
+        // them. Asserted against the buffer directly: the retry cannot be run
+        // here (the handle still cannot read), and the state is the invariant.
+        let write_only = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let mut w = BufferedWrites::new(write_only, 8);
+        w.set_mode(GATHERED).unwrap();
+        w.write_at(0, b"X").unwrap();
+        w.write_at(4, b"Y").unwrap();
+        assert!(w.flush().is_err(), "the gap read must fail");
+        assert_eq!(
+            w.pending_bytes, 2,
+            "the run kept the padding the failed gap read added"
+        );
+        assert_eq!(
+            w.runs.get(&0).map(Vec::len),
+            Some(1),
+            "the restored run must end where it did, clear of its neighbour"
+        );
+
+        // And once the obstacle is gone, the pending writes are still there to
+        // land — the point of keeping them rather than merely reporting.
+        let writable = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut recovered = MirrorImage::new(writable, b"abcdefgh".to_vec());
+        recovered.set_write_buffering(GATHERED).unwrap();
+        recovered.write_at(0, b"ZZ").unwrap();
+        recovered.sync_all().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"ZZcdefgh");
+    }
+
+    /// A session dropped without a teardown still lands its writes. The engine's
+    /// own close syncs, so this covers the paths that do not — an unwind, and the
+    /// bare engines the tests build.
+    #[test]
+    fn dropping_the_image_issues_what_it_still_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        for backing in BACKINGS {
+            let (path, mut img) = gathering(dir.path(), b"abcdef", backing, GATHERED);
+            img.write_at(0, b"Z").unwrap();
+            drop(img);
+
+            assert_eq!(std::fs::read(&path).unwrap(), b"Zbcdef", "{backing:?}");
         }
     }
 

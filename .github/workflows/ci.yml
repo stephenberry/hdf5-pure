@@ -173,6 +173,14 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --locked --features "serde ndarray" --all-targets -- -D warnings
+      # Every other job in this workflow builds in debug, and some things compile
+      # only there: `debug_assert!` type-checks its argument in every profile, so
+      # a helper gated on `cfg(debug_assertions)` and called from one passes the
+      # whole suite and fails every downstream release build (issue #288). It also
+      # covers `--release`-only lints and the release examples `CLAUDE.md` points
+      # at for heap profiling.
+      - name: Check (release)
+        run: cargo check --locked --release --all-targets --features "serde ndarray"
       - name: Rustdoc (deny warnings)
         env:
           RUSTDOCFLAGS: -D warnings

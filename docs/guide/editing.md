@@ -270,7 +270,7 @@ for batch in 0..1000 {
 file.close().unwrap();   // applies staged edits, then one fsync
 ```
 
-`SyncPolicy::OnClose` is close to what the reference C library does: its default `sec2` driver installs no flush callback at all, so `H5Fflush` drains libhdf5's caches with `write` and stops there, leaving power-loss durability to the application. It is not a write-back cache — this crate buffers nothing in user space, so every write reaches the operating system as it is made. A file written under `OnClose` is byte-identical to the same file written under `Always`, is visible to other processes on the machine as it is written, and survives *this process* crashing.
+`SyncPolicy::OnClose` is close to what the reference C library does: its default `sec2` driver installs no flush callback at all, so `H5Fflush` drains libhdf5's caches with `write` and stops there, leaving power-loss durability to the application. It is not a write-back cache: every commit and every append has reached the operating system by the time it returns, under either policy — see [Write gathering](#write-gathering) for what is held back and for how long. A file written under `OnClose` is byte-identical to the same file written under `Always`, is visible to other processes on the machine once the operation that wrote it returns, and survives *this process* crashing.
 
 Three things are given up, and they are worth separating:
 
@@ -291,6 +291,58 @@ A file left flagged by a SWMR writer is the sharpest case. That flag is cleared 
 The whole-file paths are outside all of this: `FileBuilder::write` and [`repack`](repack.md) never `fsync` under either policy, since each writes a file and hands it over rather than holding an editing session.
 
 The default is `SyncPolicy::Always`, which is every guarantee described above this section.
+
+## Write gathering
+
+A commit or an in-place append is not one write. A single append issues the chunk's bytes at end-of-file and then patches an index element, a checksum, the array header's statistics, the dataspace dimension, and the superblock's recorded end-of-file — eight writes on a measured file, seven of them a few bytes each, landing in a handful of pages that the *next* append patches again. Issued one at a time, that is seven syscalls and seven page dirtyings for a few dozen bytes, and on flash a page dirtied seven times is written seven times.
+
+Every read-write session therefore gathers its writes and emits **one write per dirty page**. The bytes it holds are released at every *ordering barrier* — the points the commit and append sequences already define, where writes made before must reach the disk before writes made after — so:
+
+- a commit or an append that has returned has put its bytes in the operating system, whatever the `SyncPolicy` says, because every operation ends with a barrier;
+- nothing about crash safety changes: the barriers keep their ordering meaning under both policies, so a write that fails still leaves the file in the state it had before the operation;
+- nothing about the resulting file changes — the bytes are identical either way.
+
+A session appending one chunk to each of eight datasets, four times over, issued 160 writes where it made 256 — and 448 before the separate reduction in what an append writes at all.
+
+There is no setting for this and nothing to opt into. The one session that does *not* gather is the [SWMR](swmr.md) writer, whose readers follow its ordered phases as they become visible; coalescing those would not make a smaller file, it would let a reader see a state the phases exist to hide.
+
+### Letting pages live longer
+
+Under the default, a page dirtied on either side of a barrier is written twice. `H5Pset_page_buffer_size`'s analogue lifts that:
+
+```rust
+use hdf5_pure::{File, FileAccessProperties, SyncPolicy};
+
+let file = File::open_rw_with_options(
+    "ring.h5",
+    FileAccessProperties::new()
+        .with_sync_policy(SyncPolicy::OnClose)
+        .with_page_buffer_size(4 << 20),
+).unwrap();
+```
+
+Dirty pages then survive across barriers, commits and appends until the budget is spent, an `fsync` is issued, or the session closes. On that same session, that takes the 160 down to 10.
+
+Four things are required, and the last is the one to weigh:
+
+- **A paged file** created with `FileSpaceStrategy::Page`, and a budget of at least that file's page size.
+- **A budget of at least 1 MiB**, which is what a session already gathers between barriers. A smaller page buffer *replaces* that budget rather than extending it, and issues more writes than leaving the property unset: measured on a 4 KiB-paged file, one 4 MiB append cost 37 writes unset, 60 with a 64 KiB buffer, and 517 with a 4 KiB one.
+- **`SyncPolicy::OnClose`.** Under the default `Always` every barrier is an `fsync` that flushes the buffer, so it would hold nothing while still costing the guarantee below.
+- **Giving up the guarantee that a failed write leaves the previous file.** See below.
+
+All four are refused rather than quietly ignored, at open and again by `File::create_with_options` for a creation/access pair it could not reopen with; the SWMR writer refuses a page buffer outright. The first two are deliberately *stricter* than the C library on the path that matters — `H5Pset_page_buffer_size` refuses them at `H5Fcreate`, but at `H5Fopen` it silently zeroes the budget on an unpaged file and rounds a sub-page budget up.
+
+### What a page buffer gives up
+
+Gathered writes go out in address order, and every publish point sits below the content it reaches: a commit's superblock and root at address 0, an append's dataspace dimension and chunk-index element count in the object header near the front, the chunk bytes and index blocks they name at end-of-file. Held across their barriers, all of them are issued first. A write that fails, or a process that dies, mid-flush can therefore leave:
+
+- a root or an end-of-file naming bytes that never arrived — a file that fails to read, which is the benign case;
+- a dataset whose length was published but whose rows were not, which reads back **clean**, as fill values;
+- a dataset header published over a region an earlier commit freed, which reads back **clean**, as the deleted object's data.
+
+The last two are silent: every checksum verifies and a reader has no signal. These were measured by failing one write of a two-write drain, not reasoned about.
+
+This is what a write-back page buffer *is*, rather than a fault in this one — `H5Pset_page_buffer_size` makes no crash-consistency claim either, and the C library's page buffer reorders the same way. But it does mean the thing being switched off is a guarantee this crate adds on top of HDF5, not one an HDF5 user arrives expecting.
 
 ## Supported targets and formats
 
