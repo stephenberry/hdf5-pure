@@ -288,6 +288,16 @@ pub(crate) struct BufferedWrites {
     /// what lets a flush walk them in order and lets [`overlay`](Self::overlay)
     /// stop at the first run past its range.
     runs: BTreeMap<u64, Vec<u8>>,
+    /// The total length of every pending run, maintained by hand at each site
+    /// that inserts, extends, merges or drops one.
+    ///
+    /// Under-counting already fails loudly: `flush` subtracts a run's length
+    /// from this, so too small a value underflows a `usize` and panics. Over-
+    /// counting is silent, and what it costs is the budget in
+    /// [`set_mode`](Self::set_mode) firing early — this gatherer quietly
+    /// reverting toward one write per patch, which no byte comparison and no
+    /// write-count ratio in the suite is tight enough to see. That asymmetry is
+    /// why [`invariants_hold`](Self::invariants_hold) exists.
     pending_bytes: usize,
     /// The file's real length on disk, moved by every write this issues and by
     /// [`set_len`](Self::set_len), and by nothing else.
@@ -374,6 +384,32 @@ impl BufferedWrites {
         Ok(())
     }
 
+    /// Every run is non-empty, the runs are disjoint *and* non-touching in
+    /// address order, and [`pending_bytes`](Self::pending_bytes) is exactly their
+    /// total length.
+    ///
+    /// Not gated on `cfg(debug_assertions)`, because `debug_assert!` type-checks
+    /// its argument in every profile: a gated helper called from one compiles in
+    /// debug and fails every release build, which is the trap the `Check
+    /// (release)` CI job exists to catch.
+    fn invariants_hold(&self) -> bool {
+        let mut total = 0usize;
+        let mut prev_end: Option<u64> = None;
+        for (&k, v) in &self.runs {
+            if v.is_empty() {
+                return false;
+            }
+            // Touching is a violation, not just overlapping: two runs that meet
+            // exactly should have been merged into one by `absorb`.
+            if prev_end.is_some_and(|end| k <= end) {
+                return false;
+            }
+            total += v.len();
+            prev_end = Some(k + v.len() as u64);
+        }
+        total == self.pending_bytes
+    }
+
     /// Merge `bytes` at `offset` into the pending runs, joining every run it
     /// touches or overlaps into one.
     ///
@@ -421,6 +457,7 @@ impl BufferedWrites {
             let run = self.runs.get_mut(&k).expect("just enumerated");
             run.extend_from_slice(bytes);
             self.pending_bytes += bytes.len();
+            debug_assert!(self.invariants_hold(), "absorb: extension path");
             return;
         }
         // The run that starts before this write and may reach it. Taking its end
@@ -471,6 +508,7 @@ impl BufferedWrites {
         merged[at..at + bytes.len()].copy_from_slice(bytes);
         self.pending_bytes += merged.len();
         self.runs.insert(lo, merged);
+        debug_assert!(self.invariants_hold(), "absorb: general merge");
     }
 
     /// The start offset of the pending run that wholly contains `[offset, end)`,
@@ -558,10 +596,9 @@ impl BufferedWrites {
     /// Issue what is gathered, so everything written before this reaches the
     /// operating system before anything written after it.
     ///
-    /// Stated as a dispatch over the mode rather than a bare `flush`, which
-    /// would be equivalent today: an unbuffered image never holds runs, so its
-    /// flush is already a no-op. The arms say which modes release here, so a mode
-    /// that did not would have to say so instead of inheriting it.
+    /// Dispatched rather than flushed unconditionally — which would be
+    /// equivalent today, since an unbuffered image never holds runs — so that a
+    /// mode which does *not* release here has to say so instead of inheriting it.
     pub(crate) fn ordering_barrier(&mut self) -> Result<(), Error> {
         match self.mode {
             WriteBuffering::Unbuffered => Ok(()),
@@ -693,6 +730,7 @@ impl BufferedWrites {
                 v.truncate(keep);
             }
         }
+        debug_assert!(self.invariants_hold(), "discard_from");
     }
 
     /// Flush, then force the file's data to durable storage.

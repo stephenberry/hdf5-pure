@@ -1626,6 +1626,14 @@ impl WriteEngine {
         // the SWMR writer, whose concurrent readers observe the order its ordered
         // phases become visible in, and so must see every write as it is made
         // (issue #288).
+        //
+        // `lock.is_some()` is a proxy for "not the SWMR writer", used because
+        // `swmr_mode` is not set until after this. It is exact only while
+        // `open_swmr_writer` is the sole lock-free entry point: a future one that
+        // took a lock would silently *gain* gathering, which is the direction
+        // that costs a reader. The other direction — a lock-free non-SWMR open
+        // losing gathering — costs only writes. Whoever adds such an entry point
+        // owns this condition.
         if lock.is_some() {
             let page_size = session.gather_page_size();
             session
@@ -11335,7 +11343,12 @@ mod tests {
             b.force_sync().unwrap();
             drop(b);
 
-            // Measured at 86 against 154. The margin is what it is because every
+            // Measured at 86 against 154. Not the 160-against-256 the module docs
+            // and the changelog quote: those are the same workload over *eight*
+            // datasets, and this fixture builds four. The ratio is the claim
+            // either way, which is why the assertion below is a ratio.
+            //
+            // The margin is what it is because every
             // barrier still issues what it has gathered — see `WriteEngine::barrier`
             // — so the gathering merges within a phase and never across one.
             // Merging across barriers would go further and is issue #308, which

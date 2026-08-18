@@ -103,9 +103,17 @@ pub(crate) trait Store: Source {
     /// This file's length field width in bytes.
     fn length_size(&self) -> u8;
 
-    /// Append `bytes` at end-of-file, returning their start address. The bytes are
-    /// made durable-visible immediately (not buffered until the next `sync`), so a
-    /// later in-place patch of the region lands on bytes that already exist.
+    /// Append `bytes` at end-of-file, returning their start address.
+    ///
+    /// The bytes reach the file's *logical* length at once, so a later in-place
+    /// patch of the region addresses bytes the store already accounts for. They
+    /// do **not** necessarily reach the disk: a session gathers its writes and
+    /// issues them at the next ordering barrier (issue #288). Anything that
+    /// publishes an address into this region to a *lower* address — a pointer, an
+    /// element count, the superblock's end-of-file — must therefore
+    /// [`sync`](Self::sync) between the two, because gathered writes go out in
+    /// address order and would otherwise publish first. `ea_insert` and the two
+    /// data-block allocators do exactly that.
     fn append_bytes(&mut self, bytes: &[u8]) -> Result<u64, Error>;
 
     /// Append `bytes` into a *raw* page. Identical to
@@ -131,11 +139,18 @@ pub(crate) trait Store: Source {
     /// Advance the superblock's recorded end-of-file to the store's current
     /// logical length and rewrite the superblock.
     fn patch_superblock_eof(&mut self) -> Result<(), Error>;
-    /// Flush buffered writes to durable storage (an `fsync` barrier). A store
-    /// whose session defers durability to the application
-    /// ([`SyncPolicy::OnClose`](crate::SyncPolicy)) does nothing here; the ordered
-    /// writes below still happen in the order they are written, which is what a
-    /// concurrent *reader* observes, and only power-loss ordering is given up.
+    /// An ordering barrier: everything written before this reaches the operating
+    /// system before anything written after it, and under
+    /// [`SyncPolicy::Always`](crate::SyncPolicy) it is forced to durable storage
+    /// as well.
+    ///
+    /// Both halves matter, and only the second is the policy's to skip.
+    /// [`SyncPolicy::OnClose`](crate::SyncPolicy) issues no `fsync` here but still
+    /// releases the session's gathered writes, so this is never a no-op: writes
+    /// between two barriers go out in *address* order, and every publish point in
+    /// this format sits at a lower address than the content it names. What
+    /// `OnClose` gives up is power-loss durability, not the order a concurrent
+    /// reader observes (issue #288).
     fn sync(&mut self) -> Result<(), Error>;
 
     /// Write an offset-sized address at `offset`.
