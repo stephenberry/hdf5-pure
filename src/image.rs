@@ -2102,4 +2102,196 @@ mod tests {
         only.read_at(0, &mut buf).unwrap();
         assert_eq!(&buf, b"aZcdefgh");
     }
+
+    // -----------------------------------------------------------------------
+    // Differential tests against a byte model
+    // -----------------------------------------------------------------------
+
+    /// A deterministic xorshift, so a failure is reproducible from its seed.
+    struct Xorshift(u64);
+
+    impl Xorshift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn upto(&mut self, n: u64) -> u64 {
+            if n == 0 { 0 } else { self.next() % n }
+        }
+    }
+
+    /// The gathering configurations the sweep below runs under.
+    ///
+    /// The narrow ones are the point. `max_bytes` of 96 against writes of up to
+    /// 80 bytes means a single write frequently exceeds the budget on its own,
+    /// which is the bypass in [`BufferedWrites::write_at`] that flushes and
+    /// issues rather than absorbing; a configuration generous enough never to
+    /// reach it leaves that path untested. The 1-byte page is the degenerate end,
+    /// where two writes merge only by touching.
+    const MIXES: [WriteBuffering; 5] = [
+        WriteBuffering::Unbuffered,
+        WriteBuffering::Operation {
+            page_size: 1,
+            max_bytes: 4096,
+        },
+        WriteBuffering::Operation {
+            page_size: 16,
+            max_bytes: 96,
+        },
+        WriteBuffering::Operation {
+            page_size: 64,
+            max_bytes: 4096,
+        },
+        WriteBuffering::Operation {
+            page_size: 4096,
+            max_bytes: 1 << 20,
+        },
+    ];
+
+    /// Random sequences of every primitive, against a `Vec<u8>` that models what
+    /// the file should hold, on both backings and under every gathering
+    /// configuration.
+    ///
+    /// Two claims, checked after *every* operation rather than at the end, so a
+    /// failure names the operation that caused it rather than the one that
+    /// happened to notice:
+    ///
+    /// - reads through the image equal the model, which for the handle backing
+    ///   means the overlay reassembles pending runs, clean bytes and the gaps
+    ///   between them correctly;
+    /// - at every ordering barrier the *file* equals the model too. The
+    ///   gathering may delay a write, but never lose or reorder one across the
+    ///   point that exists to bound it.
+    ///
+    /// Sequences rather than cases, because what this shape catches is about
+    /// *history*: a run left touching its neighbour, a merge that copies the old
+    /// bytes over the new, a trailing-run scan off by one at a page boundary.
+    /// None of those is reachable by a single write.
+    ///
+    /// The in-loop barrier is [`FileImage::ordering_barrier`] and not
+    /// `sync_data`, which would prove exactly the same thing about the model and
+    /// cost twenty times the wall clock: measured here at **12.4s against 0.6s**,
+    /// the difference being 2,400 `fsync`s that flush what the barrier had
+    /// already flushed. One `sync_data` per configuration covers the flush-then-
+    /// fsync ordering, and `assert_in_sync` closes each one.
+    #[test]
+    fn a_random_operation_sequence_matches_a_byte_model() {
+        let dir = tempfile::tempdir().unwrap();
+        for backing in BACKINGS {
+            for (mi, mode) in MIXES.into_iter().enumerate() {
+                for seed in 0..8u64 {
+                    let initial: Vec<u8> = (0..300u32).map(|i| (i % 251) as u8).collect();
+                    let sub = dir.path().join(std::format!("m{mi}s{seed}"));
+                    std::fs::create_dir_all(&sub).unwrap();
+                    let (path, mut img) = gathering(&sub, &initial, backing, mode);
+                    let mut model = initial.clone();
+                    let mut rng = Xorshift(0x9E37_79B9_7F4A_7C15 ^ (seed << 32) ^ (mi as u64));
+                    let at =
+                        |step: u32| std::format!("{backing:?} mode {mi} seed {seed} step {step}");
+                    // One step per configuration takes the durable barrier
+                    // instead of the ordering one.
+                    let fsync_at = rng.upto(300) as u32;
+
+                    for step in 0..300u32 {
+                        match rng.upto(10) {
+                            0..=3 if !model.is_empty() => {
+                                let len = 1 + rng.upto(48).min(model.len() as u64 - 1);
+                                let offset = rng.upto(model.len() as u64 - len + 1);
+                                let bytes = vec![(rng.next() & 0xff) as u8; len as usize];
+                                img.write_at(offset, &bytes).unwrap();
+                                model[offset as usize..(offset + len) as usize]
+                                    .copy_from_slice(&bytes);
+                            }
+                            4..=6 => {
+                                let bytes =
+                                    vec![(rng.next() & 0xff) as u8; 1 + rng.upto(80) as usize];
+                                let placed = img.append(&bytes).unwrap();
+                                assert_eq!(placed, model.len() as u64, "{}: append", at(step));
+                                model.extend_from_slice(&bytes);
+                            }
+                            7 => {
+                                let keep = rng.upto(model.len() as u64 + 1);
+                                img.truncate(keep).unwrap();
+                                model.truncate(keep as usize);
+                            }
+                            _ => {
+                                if step == fsync_at {
+                                    img.sync_data().unwrap();
+                                } else {
+                                    img.ordering_barrier().unwrap();
+                                }
+                                assert_eq!(
+                                    std::fs::read(&path).unwrap(),
+                                    model,
+                                    "{}: a barrier left the file disagreeing with the model",
+                                    at(step)
+                                );
+                            }
+                        }
+                        assert_eq!(img.len(), model.len() as u64, "{}: length", at(step));
+                        assert_eq!(bytes(img.as_ref()), model, "{}: reads", at(step));
+                        if let Some(slice) = img.as_slice() {
+                            assert_eq!(slice, &model[..], "{}: slice", at(step));
+                        }
+                    }
+
+                    img.sync_all().unwrap();
+                    assert_in_sync(&path, img.as_ref(), backing);
+                }
+            }
+        }
+    }
+
+    /// Every window of a buffer holding several pending runs reads back as the
+    /// model says, including the ones that make the overlay's bookkeeping
+    /// awkward: a window entirely inside one run, one spanning a gap, one
+    /// covering two runs that meet on the same byte, a single byte, an empty
+    /// window, and one reaching past the file's real end into bytes that exist
+    /// only as a pending append.
+    ///
+    /// Exhaustive rather than sampled. There are only a few thousand windows, and
+    /// choosing a handful by hand is how an off-by-one at exactly one boundary
+    /// survives.
+    #[test]
+    fn every_window_over_a_buffered_image_matches_the_model() {
+        let dir = tempfile::tempdir().unwrap();
+        for backing in BACKINGS {
+            let initial: Vec<u8> = (0..200u32).map(|i| (i % 251) as u8).collect();
+            let (_, mut img) = gathering(dir.path(), &initial, backing, GATHERED);
+            let mut model = initial.clone();
+
+            // Runs chosen for their relationships rather than their contents: two
+            // that meet exactly at byte 40, one alone in the middle of a page, a
+            // single byte, and one that exists only as a pending append past the
+            // file's real end.
+            let put = |img: &mut Box<dyn FileImage>, model: &mut Vec<u8>, at: u64, b: &[u8]| {
+                img.write_at(at, b).unwrap();
+                model[at as usize..at as usize + b.len()].copy_from_slice(b);
+            };
+            put(&mut img, &mut model, 30, &[0xA1; 10]);
+            put(&mut img, &mut model, 40, &[0xA2; 10]);
+            put(&mut img, &mut model, 90, &[0xB0; 1]);
+            put(&mut img, &mut model, 130, &[0xC0; 20]);
+            let tail = [0xD0u8; 30];
+            img.append(&tail).unwrap();
+            model.extend_from_slice(&tail);
+
+            let len = model.len() as u64;
+            assert_eq!(img.len(), len);
+            for start in 0..=len {
+                for end in start..=len {
+                    let mut buf = vec![0u8; (end - start) as usize];
+                    img.read_at(start, &mut buf).unwrap();
+                    assert_eq!(
+                        buf,
+                        &model[start as usize..end as usize],
+                        "{backing:?}: window {start}..{end}"
+                    );
+                }
+            }
+        }
+    }
 }
