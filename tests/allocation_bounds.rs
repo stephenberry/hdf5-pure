@@ -744,23 +744,25 @@ fn one_append_costs_its_batch_not_the_dataset() {
 
 /// Gathering writes does not copy what it has already gathered on every new one.
 ///
-/// Blobs are placed one after another, so each new write starts exactly where
+/// Chunks are placed one after another, so each new write starts exactly where
 /// the last one ended. Merging that by building a fresh buffer and copying the
 /// old one into it makes the gathering quadratic in the number of writes it
-/// holds: filling this page buffer that way copies hundreds of megabytes to
-/// write one (issue #288). Extending the pending run in place makes it linear.
+/// holds: filling the budget that way copies hundreds of megabytes to write one
+/// (issue #288). Extending the pending run in place makes it linear.
 ///
-/// Measured through an explicit page buffer, which is where the effect is
-/// isolated: it holds writes across operations up to its budget, so the run
-/// grows to the budget and the gathering is the only thing in the measurement
-/// that could scale with the square of anything. A commit shows the same defect
+/// Measured through one large append rather than many small ones, because that
+/// is what grows a single run to the whole gather budget: an append of this size
+/// is split into one-megabyte batches, and within a batch the chunk writes are
+/// contiguous and merge into one run that reaches the budget before it drains.
+/// Many separate appends would not show it — each drains at its own barriers
+/// while its run is still a few kilobytes — and a commit shows the same defect
 /// but buries it under the header, link and index work that dominates at any
 /// size worth measuring.
 #[test]
 fn gathering_writes_does_not_recopy_what_it_holds() {
     const CHUNK: usize = 512;
-    const APPENDS: usize = 256;
-    const RAW_BYTES: u64 = (CHUNK * APPENDS * 8) as u64;
+    const CHUNKS: usize = 1024;
+    const RAW_BYTES: u64 = (CHUNK * CHUNKS * 8) as u64;
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("buffered.h5");
@@ -776,23 +778,19 @@ fn gathering_writes_does_not_recopy_what_it_holds() {
         .with_chunks(&[CHUNK as u64]);
     builder.write(&path).unwrap();
 
-    let batch: Vec<f64> = (0..CHUNK).map(|i| i as f64).collect();
+    // Built outside the region: this is the caller's buffer, not the library's.
+    let batch: Vec<f64> = (0..CHUNK * CHUNKS).map(|i| (i % CHUNK) as f64).collect();
     // Scoped: a `Dataset` owns a handle on the session, so the session outlives
-    // `file` itself, and with a page buffer that is the difference between a
-    // file with every append in it and one still holding them.
+    // `file` itself and the append is only certainly on disk once both are gone.
     let measured = {
         let file = File::open_rw_with_options(
             &path,
-            hdf5_pure::FileAccessProperties::new()
-                .with_sync_policy(hdf5_pure::SyncPolicy::OnClose)
-                .with_page_buffer_size(1 << 20),
+            hdf5_pure::FileAccessProperties::new().with_sync_policy(hdf5_pure::SyncPolicy::OnClose),
         )
         .unwrap();
         let mut ds = file.dataset("growing").unwrap();
-        measure("page_buffered_appends", || {
-            for _ in 0..APPENDS {
-                ds.append(&batch).unwrap();
-            }
+        measure("gathered_append", || {
+            ds.append(&batch).unwrap();
         })
         .1
     };
@@ -802,23 +800,23 @@ fn gathering_writes_does_not_recopy_what_it_holds() {
     assert!(
         measured.bytes >= RAW_BYTES,
         "the appended data is not in this measurement, so the bound below is \
-         measuring something other than the appends: {measured}"
+         measuring something other than the append: {measured}"
     );
 
-    // Measured at 7.3x the raw bytes when the runs are patched and extended in
-    // place, and at 516x when each write rebuilds the run it lands in — two
-    // orders of magnitude apart, so this bound need not be tight to separate
-    // them.
+    // Measured at 5.2x the raw bytes when a pending run is extended in place, and
+    // at 132x when each write rebuilds the run it lands in. The ceiling sits
+    // between them with room on both sides, since the point is the shape of the
+    // curve rather than one host's constant.
     assert!(
-        measured.bytes < 64 * RAW_BYTES,
+        measured.bytes < 32 * RAW_BYTES,
         "gathering must not recopy what it holds: measured {measured} against \
          {RAW_BYTES} bytes of appended data"
     );
 
     let file = File::open(&path).unwrap();
     let back = file.dataset("growing").unwrap().read_f64().unwrap();
-    assert_eq!(back.len(), CHUNK * (APPENDS + 1));
-    assert_eq!(&back[CHUNK..CHUNK * 2], &batch[..]);
+    assert_eq!(back.len(), CHUNK * (CHUNKS + 1));
+    assert_eq!(&back[CHUNK..CHUNK * 2], &batch[..CHUNK]);
 }
 
 /// A write too large for the gather budget is issued rather than copied into it.

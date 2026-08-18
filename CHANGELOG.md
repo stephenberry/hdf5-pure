@@ -6,10 +6,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-### Added
-
-- `FileAccessProperties::with_page_buffer_size` gives a read-write session a write-back page buffer, the `H5Pset_page_buffer_size` analogue, keeping dirty pages across the ordering barriers inside a commit or append: a session of 32 chunk appends issued 10 writes where the default issued 160. It requires a paged file, a budget of at least 1 MiB, and `SyncPolicy::OnClose` — each refused rather than ignored — and it gives up the guarantee that a failed write leaves the previous file, which can leave a dataset that reads clean and returns the wrong bytes ([#288](https://github.com/stephenberry/hdf5-pure/issues/288)).
-
 ### Changed
 
 - A read-write session gathers the many small writes one commit or in-place append makes and issues one per dirty page: a session of 32 chunk appends issued 160 writes where it made 256, under either `SyncPolicy`. Every ordering barrier still issues what it holds, so a failed write leaves the same file it did before, and the SWMR writer gathers nothing ([#288](https://github.com/stephenberry/hdf5-pure/issues/288)).
