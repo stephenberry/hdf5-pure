@@ -143,7 +143,6 @@ pub(crate) mod disk_log {
     use std::cell::RefCell;
 
     /// One completed operation against the file, in the order it was issued.
-    #[derive(Clone, Debug, PartialEq, Eq)]
     pub(crate) enum DiskOp {
         /// `bytes` landed at `offset`. Positioned, so replaying it is exact
         /// wherever the file's length happens to be.
@@ -180,11 +179,29 @@ pub(crate) mod disk_log {
         LOG.with(|l| l.borrow_mut().take()).unwrap_or_default()
     }
 
-    /// Note one completed operation, if this thread is recording.
-    pub(crate) fn record(op: DiskOp) {
+    /// Note one completed write, if this thread is recording.
+    ///
+    /// Takes the bytes by reference and copies them *inside* the recording
+    /// check, which is the difference between the claim above and a lie: built
+    /// as a `DiskOp` at the call site, every write in the whole `cfg(test)`
+    /// build would pay a heap allocation and a copy to hand it to a thread that
+    /// is not recording and will drop it.
+    pub(crate) fn record_write(offset: u64, bytes: &[u8]) {
         LOG.with(|l| {
             if let Some(log) = l.borrow_mut().as_mut() {
-                log.push(op);
+                log.push(DiskOp::Write {
+                    offset,
+                    bytes: bytes.to_vec(),
+                });
+            }
+        });
+    }
+
+    /// Note one completed resize, if this thread is recording.
+    pub(crate) fn record_set_len(len: u64) {
+        LOG.with(|l| {
+            if let Some(log) = l.borrow_mut().as_mut() {
+                log.push(DiskOp::SetLen(len));
             }
         });
     }
@@ -749,10 +766,7 @@ impl BufferedWrites {
         #[cfg(test)]
         self.issued_order.push((offset, bytes.len() as u64));
         #[cfg(test)]
-        disk_log::record(disk_log::DiskOp::Write {
-            offset,
-            bytes: bytes.to_vec(),
-        });
+        disk_log::record_write(offset, bytes);
         self.on_disk_len = self.on_disk_len.max(offset + bytes.len() as u64);
         Ok(())
     }
@@ -776,7 +790,7 @@ impl BufferedWrites {
         // a write.
         self.handle.set_len(len).map_err(Error::Io)?;
         #[cfg(test)]
-        disk_log::record(disk_log::DiskOp::SetLen(len));
+        disk_log::record_set_len(len);
         self.discard_from(len);
         self.on_disk_len = len;
         self.flush()?;
@@ -2118,8 +2132,9 @@ mod tests {
             self.0
         }
 
+        /// A value in `0..n`. Every caller passes a positive `n`.
         fn upto(&mut self, n: u64) -> u64 {
-            if n == 0 { 0 } else { self.next() % n }
+            self.next() % n
         }
     }
 

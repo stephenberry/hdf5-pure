@@ -27,58 +27,74 @@
 //! issued. A [`Recording`] pairs that log with the file's bytes as they were
 //! before the session opened, which makes every prefix of the log a file that
 //! could really have existed: the operations are positioned, so applying the
-//! first *k* of them to the starting bytes is exactly the disk state after *k*
-//! of them completed.
-//!
-//! Each prefix is then read back and classified:
-//!
-//! - **clean** — it reads, and returns a state a crash at that point may leave.
-//! - **loud** — it refuses to read.
-//! - **silent** — it reads without complaint and is wrong anyway: wrong data, or
-//!   a file that cannot be appended to. Always a failure.
-//!
-//! **Loud is not automatically benign here.** For a *read-only* interruption it
-//! would be — the caller is told rather than misled. But these operations promise
-//! more than that: an in-place append leaves the previous value in place until
-//! its last write, and a commit publishes at one superblock write, so the dataset
-//! that was readable before is readable throughout. A prefix that refuses to read
-//! is a window in which a crash destroyed a file that was previously fine, and
-//! [`Expect::EveryPrefixReads`] rejects it.
+//! first *k* of them to the starting bytes is exactly the disk state after *k* of
+//! them completed. Each prefix is written out and read back, and judged as
+//! [`Verdict::Clean`], [`Verdict::Loud`] or [`Verdict::Silent`].
 //!
 //! # This one can fail
 //!
 //! A crash harness that cannot fail is decoration, and the first draft of this
 //! one was: it swept five hundred prefixes, called every one of them clean, and
-//! went on doing so with **both** ordering barriers in
-//! [`crate::chunk_index_inplace`] deleted. Three things were wrong, and each is
-//! now something the module states rather than something it happened to get
-//! right:
+//! went on doing so with **both** of the ordering barriers it was written for
+//! deleted. Nothing about that was visible from the outside — the sweep was wide,
+//! the assertions were real, and the numbers looked healthy.
 //!
-//! 1. **The window was in the wrong place.** Extensible-Array blocks are
-//!    allocated by chunk count, a data block roughly every sixteen chunks and a
-//!    super block at chunk 244 and then not until 500. A window over chunks
-//!    270..340 crosses no super-block allocation at all.
-//!    [`alloc_probe`](crate::chunk_index_inplace::alloc_probe) counts what a
-//!    recorded window really allocated, and every sweep demands its share.
-//! 2. **The chunks were too narrow.** With a one-element chunk the whole file is
-//!    a few kilobytes, so the index block and end-of-file fall in one gathered
-//!    write — and one write is atomic, which hides the missing barrier
-//!    completely. [`CHUNK`] is 64 elements to keep them apart.
-//! 3. **The rule was too weak.** See above: a prefix that refuses to read was
-//!    being counted as the benign outcome.
+//! Three separate things were wrong, and the fix for each is a *demand the code
+//! makes* rather than a value that happens to be right:
 //!
-//! With all three fixed, deleting the barrier before a fresh **data** block makes
-//! three of the sweeps report `UnexpectedEof` — an index pointer into bytes past
-//! end-of-file — and deleting the one before a fresh **super** block makes
-//! [`a_crashed_append_can_be_reopened_and_appended_to`] report a file that reads
-//! perfectly and then panics on the next append, at an address read out of bytes
-//! that were never written.
+//! 1. The window did not cross the allocations that reach the barriers — see
+//!    [`WARMUP_ROUNDS`] and [`Recording::assert_positioned`].
+//! 2. The file was small enough that a publish point and the content it names
+//!    merged into a single write, which is atomic — see [`CHUNK`] and the same
+//!    method's second condition.
+//! 3. A prefix that refused to read was counted as benign — see
+//!    [`Expect::EveryPrefixReads`].
+//!
+//! Each of those is now something a future change trips over rather than
+//! silently loses. [`Recording::replay_every_prefix`] adds two more of the same
+//! kind: replaying the *whole* log must reproduce the file the session really
+//! left, so a write escaping [`disk_log`] cannot pass unnoticed, and the last
+//! prefix must satisfy the workload's finished state, so a session that quietly
+//! stopped doing work cannot either.
+//!
+//! # What it covers, and what it does not
+//!
+//! Measured by deleting each barrier in the Extensible-Array append engine in
+//! turn and running the library:
+//!
+//! | barrier | caught |
+//! | --- | --- |
+//! | before a fresh data-block pointer | yes, and by the pre-existing structural test |
+//! | before a fresh super-block pointer | yes, only by [`a_crashed_append_can_be_reopened_and_appended_to`] |
+//! | `apply_ea_append` phase 1, chunk bytes → superblock end-of-file | yes, by [`recorded_eof_covers_the_file`] |
+//! | `apply_ea_append` phase 1, end-of-file → index writes | **no** |
+//! | `apply_ea_append` phase 2 → 3 | **no** |
+//! | `apply_ea_append` phase 3, header count → dimension | yes |
+//!
+//! The two uncovered ones are not gaps in the sweep, and it is worth knowing why
+//! before adding a workload to chase them. Deleting the first changes **nothing
+//! that reaches the disk** under gathering — the recorded write order is
+//! byte-identical, because the order it enforces is the order address-sorting
+//! already produces. Deleting the second does reorder two metadata writes, but
+//! the state between them is a published element count with a stale block, which
+//! is indistinguishable from a normal in-progress append to a reader bounded by
+//! the dataspace dimension. Both remain load-bearing for the two things this
+//! module does not model: `fsync` durability under
+//! [`SyncPolicy::Always`](crate::SyncPolicy), and the visibility order a *SWMR*
+//! reader follows, which is defined in terms of the header counts rather than the
+//! dimension.
+//!
+//! Outside this engine, nothing is covered: dense attribute heaps, the
+//! Fixed-Array and v2 B-tree chunk indexes, filtered and variable-length chunk
+//! writes, and group link-table growth all publish low-address pointers to
+//! high-address content and have no sweep here. That is the remaining half of
+//! issue #309.
 
 use std::path::Path;
 
 use crate::chunk_index_inplace::alloc_probe;
 use crate::edit::{AppendBuilder, AppendTarget, MemoryStrategy, SyncPolicy, WriteEngine};
-use crate::error::Error;
+use crate::error::{Error, FormatError};
 use crate::file_lock::FileLocking;
 use crate::file_space_info::FileSpaceStrategy;
 use crate::image::disk_log::{self, DiskOp};
@@ -87,7 +103,6 @@ use crate::type_builders::DatasetBuilder;
 use crate::writer::FileBuilder;
 
 /// What reading one replayed prefix made of it.
-#[derive(Debug)]
 enum Verdict {
     /// Read back, and the state is one a crash at this point may leave.
     Clean,
@@ -122,6 +137,9 @@ struct Recording {
     /// session exists rather than alongside it, so no platform's file locking
     /// has an opinion about it.
     base: Vec<u8>,
+    /// The file the recorded session actually wrote, kept so the last prefix can
+    /// be compared against it.
+    real: std::path::PathBuf,
     ops: Vec<DiskOp>,
     /// Fresh Extensible-Array blocks the recorded window allocated, by kind.
     /// See [`assert_allocated`](Self::assert_allocated).
@@ -158,20 +176,30 @@ impl Recording {
         Self {
             label: label.to_string(),
             base,
+            real: path.to_path_buf(),
             ops,
             data_blocks,
             super_blocks,
         }
     }
 
-    /// Require that the recorded window allocated at least this many fresh index
-    /// blocks of each kind — which is the only thing that puts the two ordering
-    /// barriers in [`crate::chunk_index_inplace`] under the sweep at all.
+    /// Require that this fixture is positioned where the defect is visible. Two
+    /// separate conditions, because the first draft of this module satisfied
+    /// neither while sweeping five hundred prefixes and reporting every one
+    /// clean:
     ///
-    /// Stated as a demand rather than checked afterwards because a window that
-    /// misses them still sweeps hundreds of prefixes and reports every one of
-    /// them clean, with or without the barriers.
-    fn assert_allocated(&self, data_blocks: usize, super_blocks: usize) {
+    /// 1. The window **allocated** fresh index blocks of each kind, since the two
+    ///    ordering barriers in [`crate::chunk_index_inplace`] are only reached by
+    ///    an allocation. A window over the wrong rounds crosses neither.
+    /// 2. End-of-file is **far enough from the index** that the two sides of a
+    ///    publish cannot share a gathered write. This is the condition that is
+    ///    easy to lose by retuning a constant: [`CHUNK`] used to be one element,
+    ///    which kept the whole file inside two pages, and two writes that merge
+    ///    into one are atomic — the inversion still happens and no prefix can
+    ///    observe it. Deleting a barrier and shrinking `CHUNK` back to 1 makes
+    ///    the sweeps pass again with condition 1 still satisfied, so nothing but
+    ///    this catches it.
+    fn assert_positioned(&self, data_blocks: usize, super_blocks: usize) {
         assert!(
             self.data_blocks >= data_blocks && self.super_blocks >= super_blocks,
             "{}: the recorded window allocated {} data block(s) and {} super block(s), \
@@ -180,6 +208,15 @@ impl Recording {
             self.label,
             self.data_blocks,
             self.super_blocks
+        );
+        let pages = std::fs::metadata(&self.real).unwrap().len() / GATHER_PAGE;
+        assert!(
+            pages >= MIN_PAGES,
+            "{}: the file spans {pages} gather pages of {GATHER_PAGE} bytes, under the \
+             {MIN_PAGES} this needs. Below that, a publish point near the front of the \
+             file and the block it names at end-of-file merge into one gathered write, \
+             which is atomic, and no replayed prefix can fall between them.",
+            self.label
         );
     }
 
@@ -202,11 +239,19 @@ impl Recording {
 
     /// Materialize every prefix in turn and hand each to `check`, then hold it to
     /// `expect`.
+    ///
+    /// `finished` is what the *last* prefix must satisfy — the state the workload
+    /// was supposed to reach. Without it every sweep here is satisfiable by doing
+    /// nothing: prefix 0 is the untouched starting file, every checker accepts it
+    /// (an append that has not happened and a commit that has not landed are both
+    /// legitimate crash states), and so a regression that silently stopped
+    /// publishing would leave all five sweeps reporting 100% clean.
     fn replay_every_prefix(
         &self,
         dir: &Path,
         expect: Expect,
         check: impl Fn(&Path) -> Verdict,
+        finished: impl Fn(&Path) -> Result<(), String>,
     ) -> Tally {
         let path = dir.join(std::format!("{}.replay.h5", self.label));
         let mut image = self.base.clone();
@@ -222,6 +267,28 @@ impl Recording {
                 Self::apply(&mut image, &self.ops[k - 1]);
             }
             std::fs::write(&path, &image).unwrap();
+            if k == self.ops.len() {
+                // Replaying the whole log must reproduce the file the session
+                // actually left. Anything reaching the disk outside
+                // `BufferedWrites` — a raw positioned write on the handle, a
+                // second thread — is invisible to the log, and every prefix
+                // above would then be a state that never existed.
+                assert_eq!(
+                    image,
+                    std::fs::read(&self.real).unwrap(),
+                    "{}: replaying every recorded operation does not reproduce the \
+                     file the session left, so the log is not everything that \
+                     reached the disk",
+                    self.label
+                );
+                if let Err(why) = finished(&path) {
+                    panic!(
+                        "{}: the completed workload did not reach the state this \
+                         sweep is judging interruptions of: {why}",
+                        self.label
+                    );
+                }
+            }
             let after = if k == 0 {
                 "the starting file".to_string()
             } else {
@@ -269,10 +336,13 @@ enum Expect {
     /// went from readable to not, which is a regression a caller experiences even
     /// though nothing is silently wrong.
     ///
-    /// It is what the ordering barriers buy. Removing either of the two in
-    /// [`crate::chunk_index_inplace`] breaks it immediately: the pointer to a
-    /// fresh index block is issued before the block, and the prefix between them
-    /// reads `UnexpectedEof`, naming an address past end-of-file.
+    /// It is what the ordering barriers buy, though not all of them through this
+    /// rule. Removing the barrier before a fresh *data* block breaks it directly:
+    /// the pointer is issued before the block, and the prefix between them reads
+    /// `UnexpectedEof`, naming an address past end-of-file. The *super* block's
+    /// barrier produces no unreadable prefix at all and is caught by the silent
+    /// rule instead, in
+    /// [`a_crashed_append_can_be_reopened_and_appended_to`].
     ///
     /// The rule holds for an object header whose chunk 0 fits inside one gather
     /// page. Above that, a value and the checksum covering it can land in
@@ -280,8 +350,13 @@ enum Expect {
     /// which predates the gathering and is not what these sweeps are about.
     EveryPrefixReads,
     /// Some prefixes may refuse to read; at least this fraction must not. For the
-    /// baseline sweeps, which are deliberately run in a mode that does *not*
-    /// provide the rule above.
+    /// baseline sweeps, run in a mode that deliberately does *not* provide the
+    /// rule above.
+    ///
+    /// The floor is loose on purpose and is not the interesting assertion — the
+    /// unbuffered sweep measures 88% clean against a 0.5 floor. What it bounds
+    /// that nothing else does is the baseline mode itself degenerating to
+    /// all-loud, which the gathered half cannot see.
     SomeMayRefuse { min_clean: f64 },
 }
 
@@ -336,6 +411,11 @@ impl Tally {
 // ---------------------------------------------------------------------------
 // The append workload
 // ---------------------------------------------------------------------------
+
+/// The page a locked session merges its writes within, and the least number of
+/// them a fixture must span. See [`Recording::assert_positioned`].
+const GATHER_PAGE: u64 = crate::file_space_info::DEFAULT_PAGE_SIZE;
+const MIN_PAGES: u64 = 8;
 
 /// Elements per chunk, and per recorded round: one whole chunk per append.
 ///
@@ -418,6 +498,9 @@ fn append(s: &mut WriteEngine, from: i32, count: i32) {
 /// a crash before that append published, which is the whole point of the
 /// barriers.
 fn appended_prefix_is_intact(path: &Path, lo: i32, hi: i32) -> Verdict {
+    if let Err(why) = recorded_eof_covers_the_file(path) {
+        return Verdict::Silent(why);
+    }
     let read = crate::reader::File::open(path).and_then(|f| f.dataset("d")?.read_i32());
     Verdict::of(read, |data| {
         let n = data.len() as i32;
@@ -436,33 +519,57 @@ fn appended_prefix_is_intact(path: &Path, lo: i32, hi: i32) -> Verdict {
     })
 }
 
-/// Stopping an in-place append at *any* write must leave a file that either
-/// refuses to open or reads as an intact prefix of the sequence.
+/// The superblock's recorded end-of-file must not name bytes the file does not
+/// have.
 ///
-/// This is the test the two barriers in [`crate::chunk_index_inplace`] were added
-/// for. Deleting either one makes it fail here rather than in a later session:
-/// the index block or data block pointer is published while the block itself is
-/// still only in the buffer, so the next read follows it past end-of-file.
-#[test]
-fn appending_survives_a_crash_at_every_write() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("append.h5");
-    warmed_base(&path, false);
+/// Reading one dataset cannot see this. The recorded end-of-file is the
+/// allocator's cursor, not something a read follows, so a superblock claiming
+/// more file than exists decodes perfectly and returns every correct value — and
+/// then the next session allocates from a cursor past the real end, placing a
+/// block in a hole.
+///
+/// It is the check the three barriers in the first half of
+/// [`apply_ea_append`](crate::chunk_index_inplace::apply_ea_append) exist for,
+/// and the reason they were invisible to the first version of this module: they
+/// separate content at end-of-file from the *superblock field that covers it*,
+/// which is at address 8-ish and therefore first in address order. Every one of
+/// them is caught here and nowhere else in the crate.
+fn recorded_eof_covers_the_file(path: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|e| std::format!("reading the file back: {e}"))?;
+    // A prefix whose superblock does not parse is a *loud* state, not this
+    // function's business; the read below will classify it.
+    let Ok(sb) = crate::superblock::Superblock::parse(&bytes, 0) else {
+        return Ok(());
+    };
+    if sb.eof_address > bytes.len() as u64 {
+        return Err(std::format!(
+            "the superblock records end-of-file at {} but the file is {} bytes: \
+             every byte between is one a later session would allocate from and \
+             never find",
+            sb.eof_address,
+            bytes.len()
+        ));
+    }
+    Ok(())
+}
 
-    let rec = Recording::of("append", &path, |p| {
-        let mut s = WriteEngine::open_with_locking(p, FileLocking::Enabled).unwrap();
-        s.set_sync_policy(SyncPolicy::OnClose);
-        for r in 0..ROUNDS {
-            append(&mut s, WARMUP + r * ROUND, ROUND);
-        }
-        drop(s);
-    });
-
-    rec.assert_allocated(2, 1);
-    let hi = WARMUP + ROUNDS * ROUND;
-    rec.replay_every_prefix(dir.path(), Expect::EveryPrefixReads, |p| {
-        appended_prefix_is_intact(p, WARMUP, hi)
-    });
+/// The completed workload must have reached the length it was aiming at.
+///
+/// This is what the last replayed prefix is held to. Every *other* prefix
+/// legitimately accepts a shorter dataset — that is what a crash mid-append
+/// leaves — so without this the whole sweep is satisfied by a session that
+/// appended nothing at all.
+fn appended_all_the_way(path: &Path, hi: i32) -> Result<(), String> {
+    let data = crate::reader::File::open(path)
+        .and_then(|f| f.dataset("d")?.read_i32())
+        .map_err(|e| std::format!("the finished file does not read: {e:?}"))?;
+    if data.len() as i32 != hi {
+        return Err(std::format!(
+            "it holds {} elements rather than the {hi} the workload appended",
+            data.len()
+        ));
+    }
+    Ok(())
 }
 
 /// The same sweep on a paged file, where the free-space managers are written and
@@ -485,11 +592,14 @@ fn appending_to_a_paged_file_survives_a_crash_at_every_write() {
         drop(s);
     });
 
-    rec.assert_allocated(2, 1);
+    rec.assert_positioned(2, 1);
     let hi = WARMUP + ROUNDS * ROUND;
-    rec.replay_every_prefix(dir.path(), Expect::EveryPrefixReads, |p| {
-        appended_prefix_is_intact(p, WARMUP, hi)
-    });
+    rec.replay_every_prefix(
+        dir.path(),
+        Expect::EveryPrefixReads,
+        |p| appended_prefix_is_intact(p, WARMUP, hi),
+        |p| appended_all_the_way(p, hi),
+    );
 }
 
 /// A file left by a crash must not merely *read* — it must be usable. Every
@@ -510,10 +620,15 @@ fn a_crashed_append_can_be_reopened_and_appended_to() {
     warmed_base(&path, false);
 
     const RECOVER_ROUNDS: i32 = ROUNDS;
-    // Enough to cross a whole data block (`data_blk_min_elmts` is 16), so the
-    // recovery reaches the region the crashed session was allocating rather than
-    // filling in behind it.
-    const RECOVER_APPEND: i32 = 40;
+    // Chunks, not elements. The recovery has to reach past the region the
+    // crashed session was allocating rather than filling in behind it, and a
+    // data block is `data_blk_min_elmts` = 16 *chunks*, so this crosses two of
+    // them. Written as a count of `ROUND` because it was once a bare 40 back
+    // when a chunk was one element, and widening `CHUNK` silently turned it into
+    // two thirds of a single chunk — an append that advanced the dataset barely
+    // at all while its comment still claimed to cross a block.
+    const RECOVER_CHUNKS: i32 = 40;
+    const RECOVER_APPEND: i32 = RECOVER_CHUNKS * ROUND;
     let rec = Recording::of("recover", &path, |p| {
         let mut s = WriteEngine::open_with_locking(p, FileLocking::Enabled).unwrap();
         s.set_sync_policy(SyncPolicy::OnClose);
@@ -523,9 +638,12 @@ fn a_crashed_append_can_be_reopened_and_appended_to() {
         drop(s);
     });
 
-    rec.assert_allocated(2, 1);
+    rec.assert_positioned(2, 1);
     let hi = WARMUP + RECOVER_ROUNDS * ROUND;
-    rec.replay_every_prefix(dir.path(), Expect::EveryPrefixReads, |p| {
+    rec.replay_every_prefix(
+        dir.path(),
+        Expect::EveryPrefixReads,
+        |p| {
         // Read it first: a file that will not open is loud, and there is nothing
         // to recover.
         match appended_prefix_is_intact(p, WARMUP, hi) {
@@ -578,7 +696,9 @@ fn a_crashed_append_can_be_reopened_and_appended_to() {
             }
         }
         appended_prefix_is_intact(p, before + RECOVER_APPEND, before + RECOVER_APPEND)
-    });
+        },
+        |p| appended_all_the_way(p, hi),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -588,17 +708,22 @@ fn a_crashed_append_can_be_reopened_and_appended_to() {
 /// Churn rounds in one recorded commit session.
 const CHURN: i32 = 6;
 /// Elements `d` starts the commit workload with, and gains per round.
-const COMMIT_BASE: i32 = 64;
-const COMMIT_STEP: i32 = 16;
+///
+/// Sized so the file spans well over [`MIN_PAGES`] gather pages, for the reason
+/// [`Recording::assert_positioned`] gives: at the 64 and 16 this used to be, the
+/// whole file was under 4 KB, every write merged with every other, and the sweep
+/// could not observe an inversion it nonetheless produced.
+const COMMIT_BASE: i32 = 4096;
+const COMMIT_STEP: i32 = 1024;
 
 /// Elements of `added{r}`, and of the `doomed{r}` it replaces. Different lengths
 /// so a round that resurrected the wrong object reads as the wrong length rather
 /// than as plausible data.
 fn added_values(r: i32) -> Vec<i32> {
-    (0..48 + r).map(|i| i * 7 + r).collect()
+    (0..2048 + r).map(|i| i * 7 + r).collect()
 }
 fn doomed_values(r: i32) -> Vec<i32> {
-    (0..32 + r).map(|i| i * 3 + r).collect()
+    (0..1024 + r).map(|i| i * 3 + r).collect()
 }
 
 /// Build the file the commit workload churns: one growable dataset, and one
@@ -623,6 +748,21 @@ fn commit_base(path: &Path, paged: bool) {
     b.write(path).unwrap();
 }
 
+/// Read a dataset that may legitimately not be in the file, distinguishing "no
+/// such path" from "the path is there and will not decode".
+///
+/// The difference matters and is easy to lose: mapping every error to `None`
+/// turns a commit that published a link to a half-written object header — a
+/// genuinely torn commit — into "this round has not committed yet", which every
+/// rule below accepts.
+fn read_optional(f: &crate::reader::File, path: &str) -> Result<Option<Vec<i32>>, Error> {
+    match f.dataset(path) {
+        Ok(ds) => ds.read_i32().map(Some),
+        Err(Error::Format(FormatError::PathNotFound { .. })) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 /// `d`'s elements, then each round's `added{r}` and `doomed{r}` — `None` where
 /// the path is not in the file at all.
 type CommitState = (Vec<i32>, Vec<Option<Vec<i32>>>, Vec<Option<Vec<i32>>>);
@@ -640,19 +780,11 @@ fn commit_state_is_one_or_the_other(path: &Path) -> Verdict {
     let read = (|| -> Result<CommitState, Error> {
         let f = crate::reader::File::open(path)?;
         let d = f.dataset("d")?.read_i32()?;
-        // A path that is absent is a state, not a failure; a path that is present
-        // and unreadable is a failure, and stays an `Err`.
         let mut added = Vec::new();
         let mut doomed = Vec::new();
         for r in 0..CHURN {
-            added.push(match f.dataset(&std::format!("added{r}")) {
-                Ok(ds) => Some(ds.read_i32()?),
-                Err(_) => None,
-            });
-            doomed.push(match f.dataset(&std::format!("doomed{r}")) {
-                Ok(ds) => Some(ds.read_i32()?),
-                Err(_) => None,
-            });
+            added.push(read_optional(&f, &std::format!("added{r}"))?);
+            doomed.push(read_optional(&f, &std::format!("doomed{r}"))?);
         }
         Ok((d, added, doomed))
     })();
@@ -723,6 +855,34 @@ fn commit_state_is_one_or_the_other(path: &Path) -> Verdict {
     })
 }
 
+/// Every round of the commit workload must actually have committed, or the sweep
+/// above is judging interruptions of a session that did nothing. `d` must also
+/// have grown by every round's append.
+fn every_round_committed(path: &Path) -> Result<(), String> {
+    let f = crate::reader::File::open(path)
+        .map_err(|e| std::format!("the finished file does not open: {e:?}"))?;
+    let d = f
+        .dataset("d")
+        .and_then(|d| d.read_i32())
+        .map_err(|e| std::format!("the finished `d` does not read: {e:?}"))?;
+    let want = COMMIT_BASE + CHURN * COMMIT_STEP;
+    if d.len() as i32 != want {
+        return Err(std::format!(
+            "`d` holds {} elements rather than {want}",
+            d.len()
+        ));
+    }
+    for r in 0..CHURN {
+        if f.dataset(&std::format!("added{r}")).is_err() {
+            return Err(std::format!("`added{r}` was never created"));
+        }
+        if f.dataset(&std::format!("doomed{r}")).is_ok() {
+            return Err(std::format!("`doomed{r}` was never deleted"));
+        }
+    }
+    Ok(())
+}
+
 /// One recorded churn round: grow a dataset in place, create another, delete a
 /// third, and commit. The three edits take different routes to the disk — the
 /// append patches the header in place, the create and the delete both go through
@@ -786,10 +946,12 @@ fn committing_survives_a_crash_at_every_write() {
                 drop(s);
             });
 
+            rec.assert_positioned(1, 0);
             rec.replay_every_prefix(
                 dir.path(),
                 Expect::EveryPrefixReads,
                 commit_state_is_one_or_the_other,
+                every_round_committed,
             );
         }
     }
@@ -811,8 +973,9 @@ fn committing_survives_a_crash_at_every_write() {
 /// size is issue #307).
 ///
 /// So the same workload, swept the same way, leaves *fewer* unreadable states
-/// when gathered. Both are run here in one process against one warmed base file,
-/// so the comparison is between the two modes and not between two machines.
+/// when gathered. Both are run here in one process, from base files built by the
+/// same function with the same arguments, so the comparison is between the two
+/// modes and not between two machines.
 #[test]
 fn gathering_leaves_fewer_unreadable_crash_states_than_not_gathering() {
     use crate::image::WriteBuffering;
@@ -835,9 +998,13 @@ fn gathering_leaves_fewer_unreadable_crash_states_than_not_gathering() {
             }
             drop(s);
         });
-        rec.replay_every_prefix(dir.path(), expect, |p| {
-            appended_prefix_is_intact(p, WARMUP, hi)
-        })
+        rec.assert_positioned(1, 0);
+        rec.replay_every_prefix(
+            dir.path(),
+            expect,
+            |p| appended_prefix_is_intact(p, WARMUP, hi),
+            |p| appended_all_the_way(p, hi),
+        )
     };
 
     // `None` keeps the session default, which is the gathering a locked
@@ -851,31 +1018,32 @@ fn gathering_leaves_fewer_unreadable_crash_states_than_not_gathering() {
         Expect::SomeMayRefuse { min_clean: 0.5 },
     );
 
-    // Neither mode may corrupt silently — `assert_sound` has already said so for
-    // both, and that is the guarantee. This is the softer, measured claim on top
-    // of it.
+    // `gathered.loud.len() < straight.loud.len()` would read as the headline
+    // claim and assert almost nothing: `Expect::EveryPrefixReads` has already
+    // required the left side to be empty, so it degenerates to "the right side is
+    // not zero". What is worth pinning is the *right* side — that straight-
+    // through writing really does leave unreadable states here, and why.
+    //
+    // Every one of them is a torn publish point: a value written without the
+    // checksum covering it, which gathering merges into one write whenever the
+    // two share a page. Requiring *all* of them to be torn rather than merely one
+    // is what makes this a description of the mechanism rather than a floor.
     assert!(
-        gathered.loud.len() < straight.loud.len(),
-        "gathering was supposed to leave fewer unreadable crash states, but left \
-         {} of {} against {} of {}. The gathered ones:\n  {}",
-        gathered.loud.len(),
-        gathered.total,
-        straight.loud.len(),
-        straight.total,
-        gathered.loud.join("\n  ")
+        gathered.loud.is_empty(),
+        "the gathered sweep should have left no unreadable state"
     );
-    // And the reason it is fewer: the states straight-through writing leaves are
-    // torn publish points, a value written without the checksum that covers it.
     let torn = straight
         .loud
         .iter()
         .filter(|why| why.contains("ChecksumMismatch"))
         .count();
     assert!(
-        torn > 0,
-        "expected the unbuffered sweep to tear a checksum away from the value it \
-         covers, but none of its {} unreadable states says so:\n  {}",
+        torn == straight.loud.len() && torn > 0,
+        "straight-through writing should leave unreadable crash states, all of them \
+         a checksum torn from the value it covers; got {torn} torn of {} unreadable \
+         in {} prefixes:\n  {}",
         straight.loud.len(),
+        straight.total,
         straight.loud.join("\n  ")
     );
 }
