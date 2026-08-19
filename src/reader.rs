@@ -2882,6 +2882,22 @@ impl Group {
     /// Delete the object named `name` from this group, staged until
     /// [`File::commit`]. See [`create_group`](Self::create_group) for the
     /// file-mode rules.
+    ///
+    /// Creating a new object at the same path in the same commit *replaces* it:
+    /// the removal is applied before the addition and one superblock write
+    /// publishes both, so a rotation costs one commit and the path is never
+    /// momentarily absent.
+    ///
+    /// ```no_run
+    /// # use hdf5_pure::File;
+    /// # fn main() -> Result<(), hdf5_pure::Error> {
+    /// let file = File::open_rw("ring.h5")?;
+    /// file.root().delete("t0")?;
+    /// file.root().create_dataset("t0", |b| { b.with_i32_data(&[1, 2, 3]); })?;
+    /// file.commit()?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn delete(&self, name: &str) -> Result<(), Error> {
         self.with_child_session(name, |session, child| session.delete(child))
     }

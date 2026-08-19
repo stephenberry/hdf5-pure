@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- A `File::open_rw` commit accepts a delete and a create at the same path, so replacing an object is one commit and one linearization point instead of two commits with the object missing in between. A dataset may replace a group or the reverse, replacing a group discards its subtree, and a staged edit to the object being replaced is still refused ([#305](https://github.com/stephenberry/hdf5-pure/issues/305)).
+
 ### Changed
 
 - A read-write session issues far fewer writes for the same file: one per dirty page, gathered across the many small writes a commit or in-place append makes. A session of 32 chunk appends issued 160 writes where it once made 448, with no change to the bytes on disk or to what a failed write leaves behind, and the SWMR writer gathers nothing ([#288](https://github.com/stephenberry/hdf5-pure/issues/288)).

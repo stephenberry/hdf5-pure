@@ -133,6 +133,34 @@ file.commit().unwrap();
 
 Unlike `copy`, the source subtree is read and validated **eagerly** (the `File` borrow need not outlive the call), so `copy_from` returns a `Result`; the destination still changes only on `commit()`. Because the copy is byte-for-byte verbatim, anything whose stored bytes embed a *source-file* absolute address — which would dangle in another file — is refused up front: variable-length and reference datasets and attributes (whether compact or dense), and any shared header message (a committed datatype, or an SOHM-shared dataspace, fill value, or filter pipeline). The same-file `copy` keeps these forms valid instead, by sharing the source file's global heaps and objects. The `source` must be a buffered file (`File::open` or `File::from_bytes`, not `File::open_streaming`) using 8-byte offsets and no userblock.
 
+### Replacing an object
+
+Deleting a path and creating something new at that same path in one commit replaces it. The removal is applied before the addition, and the commit's single superblock write publishes both, so a rotating store — a ring buffer of tables, a rolling window of daily datasets — expresses a rotation as one commit rather than two, and the path is never momentarily absent:
+
+```rust
+let file = File::open_rw("ring.h5").unwrap();
+let root = file.root();
+
+root.delete("t0").unwrap();
+root.create_dataset("t0", |b| { b.with_i32_data(&[1, 2, 3]); }).unwrap();
+file.commit().unwrap();
+```
+
+The replacement need not resemble the original: a dataset may replace a group or the reverse, and replacing a group discards its whole subtree rather than inheriting it.
+
+Everything the commit adds *below* a replaced path lands in the replacement, whatever order the calls were made in — staging `create_dataset("g/x")` and then replacing `g` puts `x` in the new group, not the one being removed. What is refused is a staged edit that could only mean the *original*:
+
+| staged beside `delete("g")` | |
+| --- | --- |
+| `create_dataset("g/x")` with no replacement of `g` | refused — it would add into a group whose own link the commit removes |
+| a group under `g` that the commit does not itself create | refused |
+| an attribute set on `g`, or a value overwrite inside it | refused |
+| `copy("g/inner", "backup")` — a copy reading from the replaced subtree | refused: a copy takes its bytes from the pre-commit file, so this would place the original at `backup` while the replacement lands at `g` |
+
+A source that is deleted but *not* replaced is unambiguous — that is a move — and stays allowed.
+
+The new object's storage is appended rather than laid over the original's: the original stays live until the superblock is repointed, which is what makes a crash mid-rotation land on one side or the other. The space the deletion released is therefore what a *later* commit draws on, by the two mechanisms [Space reuse and truncation](#space-reuse-and-truncation) describes — reuse for an interior region, truncation for one that reaches the end of the file. A rotation loop in one session reaches a steady file size rather than growing.
+
 ## Appending to an unlimited dataset
 
 `Dataset::append_staged` grows an existing **chunked, unlimited** dataset in place along its first (axis-0) dimension, **including filtered** datasets (deflate, shuffle, fletcher32, scale-offset, LZF, and ZFP with the `zfp` feature). It is the general, non-SWMR counterpart to the [SWMR writer](swmr.md), which appends only to *unfiltered*, chunk-aligned datasets. It returns an `AppendBuilder` whose typed and generic methods mirror the writer's; repeated calls concatenate in call order.

@@ -3896,3 +3896,458 @@ fn add_empty_chunked_datasets_of_every_flavor() {
     drop(file);
     std::fs::remove_file(&path).ok();
 }
+
+// ---------------------------------------------------------------------------
+// Replacing an object at its own path in one commit (issue #305)
+// ---------------------------------------------------------------------------
+
+/// A file holding one dataset and one populated group, both at the root, for the
+/// replacement tests below to rotate.
+fn write_rotation_starter(path: &std::path::Path) {
+    let mut b = FileBuilder::new();
+    b.create_dataset("slot").with_f64_data(&[1.0, 2.0, 3.0]);
+    b.create_dataset("bystander").with_i32_data(&[42]);
+    b.write(path).unwrap();
+
+    let session = File::open_rw(path).unwrap();
+    session.root().create_group("g").unwrap();
+    session.root().create_group("g/sub").unwrap();
+    session
+        .root()
+        .create_dataset("g/inner", |b| {
+            b.with_i32_data(&[7, 8]);
+        })
+        .unwrap();
+    session.commit().unwrap();
+}
+
+#[test]
+fn a_dataset_is_replaced_at_its_own_path_in_one_commit() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_replace_dataset.h5");
+    write_rotation_starter(&path);
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session.root().delete("slot").unwrap();
+        session
+            .root()
+            .create_dataset("slot", |b| {
+                b.with_i32_data(&[9, 8, 7, 6]);
+            })
+            .unwrap();
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    // The new object, not the old one, and not both: the datatype changed from
+    // f64 to i32 and the length from 3 to 4, so a surviving original reads as
+    // the wrong shape rather than as plausible data.
+    let slot = file.dataset("slot").unwrap();
+    assert_eq!(slot.shape().unwrap(), vec![4]);
+    assert_eq!(slot.read_i32().unwrap(), vec![9, 8, 7, 6]);
+    // Exactly one link named `slot` — a replacement removes the original's link
+    // rather than adding a second one beside it.
+    assert_eq!(
+        file.root()
+            .iter_datasets()
+            .unwrap()
+            .filter(|(n, _)| n == "slot")
+            .count(),
+        1
+    );
+    assert_eq!(
+        file.dataset("bystander").unwrap().read_i32().unwrap(),
+        vec![42]
+    );
+    assert_eq!(
+        file.dataset("g/inner").unwrap().read_i32().unwrap(),
+        vec![7, 8]
+    );
+    drop(file);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn replacing_a_group_replaces_its_whole_subtree() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_replace_group.h5");
+    write_rotation_starter(&path);
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session.root().delete("g").unwrap();
+        session
+            .root()
+            .create_group_with("g", |g| {
+                g.set_attr("generation", AttrValue::I64(2));
+                g.create_dataset("fresh", |b| {
+                    b.with_i32_data(&[1, 2, 3]);
+                });
+            })
+            .unwrap();
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    // The replacement is a new, empty group configured in the same commit: the
+    // original's child is gone rather than inherited.
+    assert!(
+        file.dataset("g/inner").is_err(),
+        "the replaced group kept the original's child"
+    );
+    assert_eq!(
+        file.dataset("g/fresh").unwrap().read_i32().unwrap(),
+        vec![1, 2, 3]
+    );
+    assert_eq!(
+        file.group("g").unwrap().attrs().unwrap()["generation"],
+        AttrValue::I64(2)
+    );
+    assert_eq!(
+        file.root()
+            .iter_groups()
+            .unwrap()
+            .filter(|(n, _)| n == "g")
+            .count(),
+        1
+    );
+    drop(file);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_dataset_is_replaced_below_the_root_too() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_replace_nested.h5");
+    write_rotation_starter(&path);
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session.root().delete("g/inner").unwrap();
+        session
+            .root()
+            .create_dataset("g/inner", |b| {
+                b.with_i32_data(&[5, 5, 5]);
+            })
+            .unwrap();
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("g/inner").unwrap().read_i32().unwrap(),
+        vec![5, 5, 5]
+    );
+    drop(file);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn rotating_one_path_in_a_session_stops_growing_the_file() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_rotation_bounded.h5");
+    write_rotation_starter(&path);
+
+    let mut sizes = Vec::new();
+    {
+        let session = File::open_rw(&path).unwrap();
+        for round in 0..12u32 {
+            session.root().delete("slot").unwrap();
+            session
+                .root()
+                .create_dataset("slot", |b| {
+                    b.with_i32_data(&vec![round as i32; 256]);
+                })
+                .unwrap();
+            session.commit().unwrap();
+            sizes.push(session.file_size());
+        }
+    }
+
+    // A rotation is what the refusal used to cost two commits, and the point of
+    // paying it once is that the file reaches a steady state instead of growing
+    // by a dataset per round: each commit frees the object the previous one
+    // placed, and the next reuses that space. Judged against the *second* round
+    // rather than the first, because the first has nothing freed to draw on yet.
+    let ceiling = sizes[1];
+    assert!(
+        sizes[2..].iter().all(|&s| s <= ceiling),
+        "the file grew past its second-round size under rotation: {sizes:?}"
+    );
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("slot").unwrap().read_i32().unwrap(),
+        vec![11i32; 256]
+    );
+    drop(file);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn an_addition_below_a_path_needs_that_path_replaced_too() {
+    // Replacing `g` makes an addition below it unambiguous: `g/added` is placed
+    // in the group this commit builds, not in the one it removes.
+    let path = std::env::temp_dir().join("hdf5_pure_edit_replace_descendant_ok.h5");
+    write_rotation_starter(&path);
+    {
+        let session = File::open_rw(&path).unwrap();
+        session.root().delete("g").unwrap();
+        session.root().create_group("g").unwrap();
+        session
+            .root()
+            .create_dataset("g/added", |b| {
+                b.with_i32_data(&[1, 2]);
+            })
+            .unwrap();
+        session.commit().unwrap();
+    }
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("g/added").unwrap().read_i32().unwrap(),
+        vec![1, 2]
+    );
+    assert!(
+        file.dataset("g/inner").is_err(),
+        "the addition landed in the group being removed rather than its replacement"
+    );
+    drop(file);
+    std::fs::remove_file(&path).ok();
+
+    // Without that replacement it is the ambiguity the refusal exists for: the
+    // addition names a group whose own link this commit removes.
+    let path = std::env::temp_dir().join("hdf5_pure_edit_replace_descendant.h5");
+    write_rotation_starter(&path);
+    let before = std::fs::read(&path).unwrap();
+    let session = File::open_rw(&path).unwrap();
+    session.root().delete("g").unwrap();
+    session
+        .root()
+        .create_dataset("g/added", |b| {
+            b.with_i32_data(&[1]);
+        })
+        .unwrap();
+    let err = session.commit().unwrap_err();
+    assert!(
+        matches!(&err, Error::EditUnsupported(m) if m.contains("overlaps an addition")),
+        "unexpected error: {err:?}"
+    );
+    // The refusal is a preflight, so not a byte of the file changed.
+    drop(session);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_group_and_a_dataset_replace_each_other() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_replace_kind_swap.h5");
+    write_rotation_starter(&path);
+
+    // A dataset over a group: the whole subtree goes with the link.
+    {
+        let session = File::open_rw(&path).unwrap();
+        session.root().delete("g").unwrap();
+        session
+            .root()
+            .create_dataset("g", |b| {
+                b.with_i32_data(&[4, 5, 6]);
+            })
+            .unwrap();
+        session.commit().unwrap();
+    }
+    {
+        let file = File::open(&path).unwrap();
+        assert_eq!(
+            file.dataset("g").unwrap().read_i32().unwrap(),
+            vec![4, 5, 6]
+        );
+        // `File::group` hands back a handle for any resolvable path without
+        // checking the object's kind, so the group-ness of `g` is judged by
+        // what the handle can do rather than by whether it exists.
+        assert!(
+            file.group("g").unwrap().iter_datasets().is_err(),
+            "`g` still reads as a group"
+        );
+        assert!(file.dataset("g/inner").is_err());
+        assert!(file.group("g/sub").is_err());
+    }
+
+    // And a group back over that dataset.
+    {
+        let session = File::open_rw(&path).unwrap();
+        session.root().delete("g").unwrap();
+        session
+            .root()
+            .create_group_with("g", |g| {
+                g.create_dataset("back", |b| {
+                    b.with_i32_data(&[7]);
+                });
+            })
+            .unwrap();
+        session.commit().unwrap();
+    }
+    let file = File::open(&path).unwrap();
+    assert!(
+        file.dataset("g").is_err(),
+        "`g` still resolves as a dataset"
+    );
+    assert_eq!(file.dataset("g/back").unwrap().read_i32().unwrap(), vec![7]);
+    drop(file);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_staged_edit_to_a_replaced_object_is_refused() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_replace_edited.h5");
+    write_rotation_starter(&path);
+
+    // `g` is replaced by a *dataset*, so the group-attribute edit at the same
+    // path can only mean the group being removed. A replacement makes every
+    // path under it name the new object, and there is no new group here to
+    // carry the attribute.
+    let session = File::open_rw(&path).unwrap();
+    session.root().delete("g").unwrap();
+    session
+        .root()
+        .create_dataset("g", |b| {
+            b.with_i32_data(&[1]);
+        })
+        .unwrap();
+    session
+        .group("g")
+        .unwrap()
+        .set_attr("generation", AttrValue::I64(1))
+        .unwrap();
+    let err = session.commit().unwrap_err();
+    assert!(
+        matches!(&err, Error::EditUnsupported(m) if m.contains("at or under a replaced path")),
+        "unexpected error: {err:?}"
+    );
+    drop(session);
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("g/inner").unwrap().read_i32().unwrap(),
+        vec![7, 8]
+    );
+    drop(file);
+    std::fs::remove_file(&path).ok();
+
+    // The same rule one level down: `g` is replaced by a group this time, but
+    // `g/sub` names the *original's* subgroup, which the replacement does not
+    // create. Refused for the same reason and by the same guard.
+    let path = std::env::temp_dir().join("hdf5_pure_edit_replace_edited_child.h5");
+    write_rotation_starter(&path);
+    let before = std::fs::read(&path).unwrap();
+    let session = File::open_rw(&path).unwrap();
+    session.root().delete("g").unwrap();
+    session.root().create_group("g").unwrap();
+    session
+        .group("g/sub")
+        .unwrap()
+        .set_attr("generation", AttrValue::I64(1))
+        .unwrap();
+    let err = session.commit().unwrap_err();
+    assert!(
+        matches!(&err, Error::EditUnsupported(m) if m.contains("at or under a replaced path")),
+        "unexpected error: {err:?}"
+    );
+    drop(session);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_copy_replaces_an_object_at_its_own_path() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_replace_by_copy.h5");
+    write_rotation_starter(&path);
+
+    // A copy is linked into its parent by the same apply-loop step as a created
+    // dataset, and after the same removal, so it replaces a path too.
+    {
+        let session = File::open_rw(&path).unwrap();
+        session.root().delete("slot").unwrap();
+        session.copy("g/inner", "slot").unwrap();
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("slot").unwrap().read_i32().unwrap(),
+        vec![7, 8]
+    );
+    // The copy's source is untouched, and the replaced original is gone rather
+    // than shadowed: it held f64, so a surviving link reads as the wrong type.
+    assert_eq!(
+        file.dataset("g/inner").unwrap().read_i32().unwrap(),
+        vec![7, 8]
+    );
+    assert_eq!(file.dataset("slot").unwrap().shape().unwrap(), vec![2]);
+    drop(file);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_copy_reading_from_a_replaced_path_is_refused() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_replace_copy_source.h5");
+    write_rotation_starter(&path);
+    let before = std::fs::read(&path).unwrap();
+
+    // A copy takes its bytes from the pre-commit file. Reading from a path this
+    // same commit replaces would put the *original* at `backup` while the
+    // replacement lands at `slot`, so one commit would produce two different
+    // objects from one path with nothing to say so.
+    {
+        let session = File::open_rw(&path).unwrap();
+        session.root().delete("slot").unwrap();
+        session
+            .root()
+            .create_dataset("slot", |b| {
+                b.with_i32_data(&[9, 9, 9, 9]);
+            })
+            .unwrap();
+        session.copy("slot", "backup").unwrap();
+        let err = session.commit().unwrap_err();
+        assert!(
+            matches!(&err, Error::EditUnsupported(m) if m.contains("reads from a path the same commit replaces")),
+            "unexpected error: {err:?}"
+        );
+        drop(session);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    // Reading from inside a replaced *group* is the same conflict one level down.
+    {
+        let session = File::open_rw(&path).unwrap();
+        session.root().delete("g").unwrap();
+        session
+            .root()
+            .create_group_with("g", |g| {
+                g.create_dataset("inner", |b| {
+                    b.with_i32_data(&[7, 7, 7, 7, 7]);
+                });
+            })
+            .unwrap();
+        session.copy("g/inner", "backup").unwrap();
+        let err = session.commit().unwrap_err();
+        assert!(
+            matches!(&err, Error::EditUnsupported(m) if m.contains("reads from a path the same commit replaces")),
+            "unexpected error: {err:?}"
+        );
+        drop(session);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    // A source that is deleted but *not* replaced is unambiguous — that is a
+    // move — and stays allowed.
+    {
+        let session = File::open_rw(&path).unwrap();
+        session.copy("slot", "moved").unwrap();
+        session.root().delete("slot").unwrap();
+        session.commit().unwrap();
+    }
+    let file = File::open(&path).unwrap();
+    assert_eq!(
+        file.dataset("moved").unwrap().read_f64().unwrap(),
+        vec![1.0, 2.0, 3.0]
+    );
+    assert!(file.dataset("slot").is_err());
+    drop(file);
+    std::fs::remove_file(&path).ok();
+}

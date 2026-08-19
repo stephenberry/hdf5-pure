@@ -21,7 +21,16 @@
 //! Deletion ([`Group::delete`](crate::Group::delete), the HDF5 `H5Ldelete`) is the mirror image:
 //! the parent group's header is rebuilt without the removed link, relocated up
 //! the tree the same way, and the unlinked object (and its subtree) is freed —
-//! its blocks are returned to a session-local free list (see below).
+//! its blocks are returned to a session-local free list (see below). A deletion
+//! and an addition at the *same* path in one commit is a **replacement** (issue
+//! #305): the link is removed from the rebuilt parent before the new object's is
+//! appended, and the one superblock write publishes both, so a rotating store
+//! expresses a rotation as one commit and the path is never momentarily absent.
+//! The new object's storage is still appended rather than laid over the old
+//! one's — the original stays live until the superblock repoint, which is what
+//! makes a crash during the rotation land on one side or the other — so the
+//! space the deletion released is what a *later* commit draws on, by reuse or by
+//! truncation.
 //! Object copy ([`File::copy`](crate::File::copy), the HDF5 `H5Ocopy`) deep-copies
 //! a source subtree — appending fresh copies of every object, repointing internal
 //! links and the contiguous data address — and links the copy in like an
@@ -2870,11 +2879,37 @@ impl WriteEngine {
     /// on close. After reuse, an object reference to a deleted object may resolve
     /// to an unrelated object (deleting a referenced object is undefined in HDF5).
     ///
-    /// The path must exist. A deletion may not overlap another staged change in
-    /// the same commit (e.g. delete `/a` while adding `/a/b`); split such
-    /// edits into separate commits. The link's parent group must itself be
-    /// editable in place (compact links, single-chunk header); the target being
-    /// removed has no such restriction.
+    /// The path must exist. The link's parent group must itself be editable in
+    /// place (compact links, single-chunk header); the target being removed has
+    /// no such restriction.
+    ///
+    /// # Replacing an object
+    ///
+    /// Deleting a path and creating a new object at that same path in one commit
+    /// is a *replacement*, and is accepted (issue #305): the removal is applied
+    /// before the addition, and the commit's single superblock write publishes
+    /// both, so the path is occupied at every instant a crash could interrupt.
+    /// The new object need not resemble the old one — a dataset may replace a
+    /// group, or the reverse — and replacing a group discards its whole subtree
+    /// rather than inheriting it.
+    ///
+    /// Everything this commit adds *below* a replaced path lands in the
+    /// replacement, whatever order the calls were made in: staging
+    /// `create_dataset("g/x")` and then replacing `g` puts `x` in the new group,
+    /// not the one being removed. A staged edit that could only mean the
+    /// *original* is refused instead — a group under the replaced path that this
+    /// commit does not itself create, an attribute set on the object being
+    /// removed, a value overwrite inside it, or a [`copy`](crate::File::copy)
+    /// reading from it.
+    ///
+    /// See [`Group::delete`](crate::Group::delete) for the public form and a
+    /// worked example.
+    ///
+    /// A deletion may not overlap a staged change at a *different* path
+    /// (deleting `/a` while adding `/a/b`, unless `/a` is itself replaced in the
+    /// same commit), nor an edit to the object being removed (an attribute set
+    /// on it, or a value overwrite of something inside it); split those into
+    /// separate commits.
     pub fn delete(&mut self, path: &str) -> Result<(), Error> {
         let comps = split_path(path);
         self.refuse_if_claimed(&comps)?;
@@ -3331,6 +3366,12 @@ impl WriteEngine {
         let mut nodes: BTreeMap<PathKey, Node> = BTreeMap::new();
         nodes.entry(PathKey::new()).or_default(); // root is always dirty
         let mut add_targets: Vec<PathKey> = Vec::new();
+        // Where each in-file `copy` reads from. A copy takes its bytes from the
+        // *pre-commit* file, so a source this same commit replaces would copy the
+        // object being removed while the replacement lands at the same path — see
+        // the delete-staging loop, which refuses that. Cross-file copies are not
+        // tracked: their source is in another file, so no path here can name it.
+        let mut copy_sources: Vec<PathKey> = Vec::new();
         let mut attr_targets: Vec<PathKey> = Vec::new();
 
         // Mark explicitly-created new groups, ensuring their ancestor chain.
@@ -3397,6 +3438,7 @@ impl WriteEngine {
             // userblock file the stored addresses are base-relative, so pass this
             // session's base for the read to absolutize them.
             let tree = Self::read_copy_subtree(&self.image(), src_addr as u64, 0, false, base)?;
+            copy_sources.push(src);
             add_targets.push(dst.clone());
             let leaf = dst.last().unwrap().clone();
             let parent = dst[..dst.len() - 1].to_vec();
@@ -3420,9 +3462,10 @@ impl WriteEngine {
         }
 
         // Stage deletions: each must exist, must not overlap any other staged
-        // change, and is recorded against its parent group (which becomes dirty).
-        // `deleted_addrs` keeps each removed object's header address so its owned
-        // blocks can be reclaimed after the commit lands (issue #21).
+        // change *unless* this commit replaces what it removes, and is recorded
+        // against its parent group (which becomes dirty). `deleted_addrs` keeps
+        // each removed object's header address so its owned blocks can be
+        // reclaimed after the commit lands (issue #21).
         let delete_targets = std::mem::take(&mut self.pending_deletes);
         let mut deleted_addrs: Vec<usize> = Vec::new();
         for (i, d) in delete_targets.iter().enumerate() {
@@ -3439,14 +3482,79 @@ impl WriteEngine {
             if let Ok(a) = usize::try_from(del_addr) {
                 deleted_addrs.push(a);
             }
+            // A deletion may overlap other staged work when this commit
+            // *replaces* what it removes: an addition names exactly `d`, so the
+            // removal and the new object at the same path are one rotation
+            // rather than an edit of something being deleted (issue #305).
+            let recreated = add_targets.iter().any(|t| t == d);
+            // A replacement also requires that every group node at or below `d`
+            // is one this commit builds fresh. A node that is *not* new is
+            // rebuilt from the old object's on-disk header — the object being
+            // replaced — and both ways that lands are wrong, in the two shapes
+            // this guard was measured against:
+            //
+            // * At `d` itself (a group attribute set on a path this commit
+            //   replaces with a *dataset*), the node and the replacement share a
+            //   `path_addr` key. The replacement's address overwrites the group's,
+            //   the parent's link is then patched to the address it already had,
+            //   and the rebuilt group header is left orphaned — a commit that
+            //   returns `Ok` having **silently discarded** the staged attribute.
+            // * Strictly below `d`, the parent is a freshly built region with no
+            //   existing link to patch, so `patch_link_target` reports a missing
+            //   child link partway through the apply. That leaves a valid file
+            //   (the superblock is never repointed) but appends dead bytes and
+            //   reports the wrong thing.
+            //
+            // Refusing here keeps both in the preflight, where the commit is
+            // all-or-nothing and the message can name the actual conflict.
+            if recreated
+                && !nodes
+                    .iter()
+                    .all(|(key, node)| !is_prefix(d, key) || node.is_new)
+            {
+                return Err(Error::EditUnsupported(
+                    "a staged edit names a group at or under a replaced path that this \
+                     commit does not itself create; create it in the same commit, or use \
+                     separate commits",
+                ));
+            }
+            // A copy reading from a path this commit replaces is the same conflict
+            // seen from the other side: `read_copy_subtree` already took its bytes
+            // from the pre-commit file, so the commit would place the *original*
+            // at the copy's destination while placing something else at `d` — two
+            // different objects from one path, in one commit, with no error. A
+            // source that is merely deleted and not replaced is unambiguous (it is
+            // a move) and stays allowed.
+            if recreated {
+                for t in &copy_sources {
+                    if is_prefix(d, t) {
+                        return Err(Error::EditUnsupported(
+                            "a copy in this commit reads from a path the same commit \
+                             replaces; use separate commits",
+                        ));
+                    }
+                }
+            }
+            // Past that return `recreated` means the whole touched subtree is
+            // fresh, so an addition at or below `d` lands in the replacement. The
+            // apply loop already removes a group's deleted links before appending
+            // any new one (`remove_link_from_region` runs first), so a
+            // replacement needs no further sequencing here.
             for t in &add_targets {
+                if recreated && is_prefix(d, t) {
+                    continue;
+                }
                 if is_prefix(d, t) || is_prefix(t, d) {
                     return Err(Error::EditUnsupported(
-                        "a deletion overlaps an addition in the same commit; use separate commits",
+                        "a deletion overlaps an addition in the same commit; \
+                         replace the path instead, or use separate commits",
                     ));
                 }
             }
             for t in &attr_targets {
+                if recreated && is_prefix(d, t) {
+                    continue;
+                }
                 if is_prefix(d, t) {
                     return Err(Error::EditUnsupported(
                         "a deletion overlaps a group-attribute edit in the same commit; use separate commits",
@@ -3455,8 +3563,13 @@ impl WriteEngine {
             }
             for t in &write_targets {
                 if is_prefix(d, t) {
+                    // `write_targets` holds three kinds — a value overwrite, a
+                    // dataset-attribute edit, and a staged append — so the
+                    // message names what they have in common rather than only
+                    // the first of them.
                     return Err(Error::EditUnsupported(
-                        "a deletion overlaps a value overwrite in the same commit; use separate commits",
+                        "a deletion overlaps a staged edit to a dataset in the same \
+                         commit; use separate commits",
                     ));
                 }
             }
@@ -3535,7 +3648,10 @@ impl WriteEngine {
         }
 
         // Validate names: no addition may collide with an existing link or with
-        // another addition under the same parent.
+        // another addition under the same parent. A link this same commit
+        // deletes is not one of the existing ones — the apply loop removes it
+        // from the region before any addition is appended, so replacing an
+        // object at its own path is a rotation, not a collision (issue #305).
         for key in &keys {
             let node = &nodes[key];
             let mut adding: Vec<&str> = Vec::new();
@@ -3551,7 +3667,9 @@ impl WriteEngine {
                 adding.push(leaf);
             }
             for (i, name) in adding.iter().enumerate() {
-                if node.existing_links.iter().any(|n| n == name) || adding[..i].contains(name) {
+                let survives = node.existing_links.iter().any(|n| n == name)
+                    && !node.deletes.iter().any(|n| n == name);
+                if survives || adding[..i].contains(name) {
                     return Err(Error::EditUnsupported(
                         "a link with this name already exists in the target group",
                     ));
@@ -3749,6 +3867,16 @@ impl WriteEngine {
             };
 
             // Remove deleted links first (verbatim-preserving the rest).
+            //
+            // First is a correctness requirement rather than a convention, and
+            // has been since a replacement became one commit (issue #305):
+            // `remove_link_from_region` matches by *name*, so a removal running
+            // after the additions below would take the replacement's link with
+            // the original's and leave the path gone. Every link this loop could
+            // collide with — a copy's, a dataset's, a new child group's — is
+            // appended after it, which is what keeps that unreachable. (A
+            // relocating write and an existing child group *patch* a link rather
+            // than appending one, so neither can be a replacement's.)
             for name in &deletes {
                 region = remove_link_from_region(&region, name)?;
             }

@@ -1664,3 +1664,81 @@ fn write_dataset_relocate_with_multiple_hard_links_is_refused() {
         "file modified on refusal"
     );
 }
+
+/// A delete and a create at the same path in one commit (issue #305), on files
+/// the C library wrote in both formats, read back by the C library.
+///
+/// The replacement changes the dataset's length, so a file where the original
+/// survived — or where its link was left beside the replacement's — reads as the
+/// wrong length rather than as plausible data. The *datatype* does no work here:
+/// the C library converts silently, and `read_raw::<i32>()` on a surviving f64
+/// original returns values rather than an error. `h5py` and `h5dump` go through
+/// this same reader.
+#[test]
+fn a_replaced_object_is_read_by_the_c_library() {
+    for (name, low, high, want_sb) in [
+        ("replace_v2.h5", LibraryVersion::V18, LibraryVersion::V18, 2),
+        (
+            "replace_v3.h5",
+            LibraryVersion::V110,
+            LibraryVersion::latest(),
+            3,
+        ),
+    ] {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(name);
+        write_c_starter(&path, low, high);
+        assert_eq!(File::open(&path).unwrap().superblock().version, want_sb);
+
+        {
+            let session = File::open_rw(&path).unwrap();
+            // A dataset replaced at its own path, and a group replaced with its
+            // whole subtree — the two shapes a rotation takes.
+            session.root().delete("alpha").unwrap();
+            session
+                .root()
+                .create_dataset("alpha", |b| {
+                    b.with_i32_data(&[11, 22]);
+                })
+                .unwrap();
+            session.root().delete("grp").unwrap();
+            session
+                .root()
+                .create_group_with("grp", |g| {
+                    g.set_attr("generation", AttrValue::I64(2));
+                    g.create_dataset("delta", |b| {
+                        b.with_f64_data(&[9.5]);
+                    });
+                })
+                .unwrap();
+            session.commit().unwrap();
+        } // drop the editor (release its exclusive lock) before reading back
+
+        let c = hdf5::File::open(&path).unwrap();
+        assert_eq!(
+            c.dataset("alpha").unwrap().read_raw::<i32>().unwrap(),
+            vec![11, 22],
+            "{name}: the C library sees the original rather than the replacement"
+        );
+        assert_eq!(
+            c.dataset("grp/delta").unwrap().read_raw::<f64>().unwrap(),
+            vec![9.5]
+        );
+        assert_c_absent(&c.dataset("grp/beta").unwrap_err(), "grp/beta");
+        assert_eq!(
+            c.group("grp")
+                .unwrap()
+                .attr("generation")
+                .unwrap()
+                .read_scalar::<i64>()
+                .unwrap(),
+            2
+        );
+        // The untouched neighbour, to show the rotation did not disturb the rest
+        // of the group it rebuilt.
+        assert_eq!(
+            c.dataset("doomed").unwrap().read_raw::<i32>().unwrap(),
+            vec![7, 8]
+        );
+    }
+}
