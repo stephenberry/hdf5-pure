@@ -48,7 +48,7 @@
 //!    merged into a single write, which is atomic — see [`CHUNK`] and the same
 //!    method's second condition.
 //! 3. A prefix that refused to read was counted as benign — see
-//!    [`Expect::EveryPrefixReads`].
+//!    [`Tally::assert_sound`].
 //!
 //! Each of those is now something a future change trips over rather than
 //! silently loses. [`Recording::replay_every_prefix`] adds two more of the same
@@ -70,6 +70,13 @@
 //! | `apply_ea_append` phase 1, end-of-file → index writes | **no** |
 //! | `apply_ea_append` phase 2 → 3 | **no** |
 //! | `apply_ea_append` phase 3, header count → dimension | yes |
+//!
+//! A barrier is not the only way this class of defect arrives. A *publish* is
+//! the other: a value written apart from the checksum covering it is two writes
+//! with a crash point between them, no matter how the barriers fall. That was
+//! issue #307, and it is why the sweeps here are run at more than one header
+//! width — see [`warmed_base_padded`] and
+//! [`a_publish_costs_the_same_whether_or_not_it_spans_a_page`].
 //!
 //! The two uncovered ones are not gaps in the sweep, and it is worth knowing why
 //! before adding a workload to chase them. Deleting the first changes **nothing
@@ -107,9 +114,8 @@ enum Verdict {
     /// Read back, and the state is one a crash at this point may leave.
     Clean,
     /// Refused to read. Benign in general — the caller is told rather than
-    /// misled — but see [`Expect::EveryPrefixReads`]: the operations swept here
-    /// promise that the previous value stays readable, so for most of them this
-    /// is a failure too.
+    /// misled — but see [`Tally::assert_sound`]: the operations swept here
+    /// promise that the previous value stays readable, so this is a failure too.
     Loud(String),
     /// Read back without complaint, and returned something else.
     Silent(String),
@@ -220,6 +226,36 @@ impl Recording {
         );
     }
 
+    /// Demand that a *publish* write in this recording crosses a gather-page
+    /// boundary — that the structure being published really is wider than the
+    /// page whose merging hid issue #307.
+    ///
+    /// A publish is a patch near the front of the file, so this looks for a write
+    /// that begins inside the first gather page and reaches past it. Any write is
+    /// not enough: an append at end-of-file crosses page boundaries all day and
+    /// says nothing about the header's width.
+    ///
+    /// Without this, a padded fixture is one object-header layout change away
+    /// from sitting wholly inside a page, where every publish is atomic for free
+    /// and the sweep passes while proving nothing. The padding was measured, and
+    /// a measured constant is exactly the kind that drifts.
+    fn assert_publishes_across_a_gather_page(&self) {
+        let crossing = self.ops.iter().any(|op| match *op {
+            DiskOp::Write { offset, ref bytes } => {
+                offset < GATHER_PAGE && offset + bytes.len() as u64 > GATHER_PAGE
+            }
+            DiskOp::SetLen(_) => false,
+        });
+        assert!(
+            crossing,
+            "{}: no write starts inside the first {GATHER_PAGE}-byte gather page and \
+             reaches past it, so the header this sweep publishes into fits in one page \
+             and every publish is atomic whatever the engine does. The fixture needs a \
+             wider object header.",
+            self.label
+        );
+    }
+
     /// Apply one operation to an in-memory image of the file, exactly as the
     /// filesystem would: a positioned write past end-of-file extends it, leaving
     /// the gap reading as zeros, and `set_len` both truncates and extends.
@@ -249,7 +285,6 @@ impl Recording {
     fn replay_every_prefix(
         &self,
         dir: &Path,
-        expect: Expect,
         check: impl Fn(&Path) -> Verdict,
         finished: impl Fn(&Path) -> Result<(), String>,
     ) -> Tally {
@@ -319,45 +354,9 @@ impl Recording {
                 tally.silent.len()
             );
         }
-        tally.assert_sound(&self.label, expect);
+        tally.assert_sound(&self.label);
         tally
     }
-}
-
-/// What a sweep demands of the states it finds.
-#[derive(Clone, Copy)]
-enum Expect {
-    /// **No prefix may fail to read.**
-    ///
-    /// This is the real promise of an operation the crate calls crash-atomic, and
-    /// it is stronger than "never silently wrong". The dataset was readable before
-    /// the operation began; a crash part-way through must leave it readable, as
-    /// the old value. A prefix that refuses to read is a window in which the file
-    /// went from readable to not, which is a regression a caller experiences even
-    /// though nothing is silently wrong.
-    ///
-    /// It is what the ordering barriers buy, though not all of them through this
-    /// rule. Removing the barrier before a fresh *data* block breaks it directly:
-    /// the pointer is issued before the block, and the prefix between them reads
-    /// `UnexpectedEof`, naming an address past end-of-file. The *super* block's
-    /// barrier produces no unreadable prefix at all and is caught by the silent
-    /// rule instead, in
-    /// [`a_crashed_append_can_be_reopened_and_appended_to`].
-    ///
-    /// The rule holds for an object header whose chunk 0 fits inside one gather
-    /// page. Above that, a value and the checksum covering it can land in
-    /// different pages and a crash between them tears the header — issue #307,
-    /// which predates the gathering and is not what these sweeps are about.
-    EveryPrefixReads,
-    /// Some prefixes may refuse to read; at least this fraction must not. For the
-    /// baseline sweeps, run in a mode that deliberately does *not* provide the
-    /// rule above.
-    ///
-    /// The floor is loose on purpose and is not the interesting assertion — the
-    /// unbuffered sweep measures 88% clean against a 0.5 floor. What it bounds
-    /// that nothing else does is the baseline mode itself degenerating to
-    /// all-loud, which the gathered half cannot see.
-    SomeMayRefuse { min_clean: f64 },
 }
 
 /// What one sweep found, kept so a caller can compare two of them.
@@ -372,9 +371,26 @@ struct Tally {
 }
 
 impl Tally {
-    /// Fail on any silent corruption, and on a run that did not meet what its
-    /// sweep expects of it.
-    fn assert_sound(&self, label: &str, expect: Expect) {
+    /// The two rules every sweep is held to.
+    ///
+    /// **Nothing silent.** A prefix that reads cleanly and hands back the wrong
+    /// data is the outcome with no signal at all, and no crash point may produce
+    /// one.
+    ///
+    /// **Nothing unreadable.** Stronger, and the real promise of an operation the
+    /// crate calls crash-atomic: the dataset was readable before the operation
+    /// began, so a crash part-way through must leave it readable, as the old
+    /// value. A prefix that refuses to read is a window in which the file went
+    /// from readable to not — a regression a caller experiences even though
+    /// nothing is silently wrong.
+    ///
+    /// The second is what the ordering barriers buy, though not all of them
+    /// through this rule. Removing the barrier before a fresh *data* block breaks
+    /// it directly: the pointer is issued before the block, and the prefix between
+    /// them reads `UnexpectedEof`, naming an address past end-of-file. The *super*
+    /// block's barrier produces no unreadable prefix at all and is caught by the
+    /// first rule instead, in [`a_crashed_append_can_be_reopened_and_appended_to`].
+    fn assert_sound(&self, label: &str) {
         assert!(
             self.silent.is_empty(),
             "{label}: {} of {} replayed prefixes read cleanly and returned the wrong data:\n  {}",
@@ -382,29 +398,15 @@ impl Tally {
             self.total,
             self.silent.join("\n  ")
         );
-        match expect {
-            Expect::EveryPrefixReads => assert!(
-                self.loud.is_empty(),
-                "{label}: {} of {} replayed prefixes refused to read, though every one \
-                 of them is a crash during an operation that leaves the previous value \
-                 in place and readable:\n  {}",
-                self.loud.len(),
-                self.total,
-                self.loud.join("\n  ")
-            ),
-            // Without a floor, a checker that called every state loud, or a
-            // workload that quietly stopped doing work, would report no silent
-            // corruption and pass.
-            Expect::SomeMayRefuse { min_clean } => assert!(
-                self.clean as f64 >= min_clean * self.total as f64,
-                "{label}: only {} of {} prefixes read cleanly, below the {min_clean} floor, \
-                 so this run proved nothing. The {} that refused:\n  {}",
-                self.clean,
-                self.total,
-                self.loud.len(),
-                self.loud.join("\n  ")
-            ),
-        }
+        assert!(
+            self.loud.is_empty(),
+            "{label}: {} of {} replayed prefixes refused to read, though every one \
+             of them is a crash during an operation that leaves the previous value \
+             in place and readable:\n  {}",
+            self.loud.len(),
+            self.total,
+            self.loud.join("\n  ")
+        );
     }
 }
 
@@ -457,16 +459,37 @@ const WARMUP: i32 = WARMUP_ROUNDS * ROUND;
 /// this harness is about, with the blocks allocated in the order an append
 /// allocates them.
 fn warmed_base(path: &Path, paged: bool) {
+    warmed_base_padded(path, paged, 0);
+}
+
+/// [`warmed_base`], with `pad` bytes of attribute in the dataset's object header.
+///
+/// Padding is a positioning tool, not decoration. `patch_dimension` writes the
+/// dataspace dimension near the front of chunk 0 and the chunk checksum at its
+/// end; the two are joined into one write only when they share a gather page. A
+/// header under [`GATHER_PAGE`] therefore publishes atomically for free and no
+/// prefix can fall between them, which is why the unpadded sweeps below cannot
+/// see issue #307. Above it they split, and the crash state between them is a
+/// new value under its old checksum.
+fn warmed_base_padded(path: &Path, paged: bool, pad: usize) {
     let mut b = FileBuilder::new();
     if paged {
         b.with_file_space_strategy(FileSpaceStrategy::Page, true, 1)
             .with_file_space_page_size(4096);
     }
-    b.create_dataset("d")
-        .with_i32_data(&[0i32])
-        .with_shape(&[1])
-        .with_maxshape(&[u64::MAX])
-        .with_chunks(&[CHUNK]);
+    {
+        let d = b.create_dataset("d");
+        d.with_i32_data(&[0i32])
+            .with_shape(&[1])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[CHUNK]);
+        if pad > 0 {
+            d.set_attr(
+                "pad",
+                crate::type_builders::AttrValue::AsciiString("x".repeat(pad)),
+            );
+        }
+    }
     b.write(path).unwrap();
 
     let mut s = WriteEngine::open_with_locking(path, FileLocking::Enabled).unwrap();
@@ -596,7 +619,6 @@ fn appending_to_a_paged_file_survives_a_crash_at_every_write() {
     let hi = WARMUP + ROUNDS * ROUND;
     rec.replay_every_prefix(
         dir.path(),
-        Expect::EveryPrefixReads,
         |p| appended_prefix_is_intact(p, WARMUP, hi),
         |p| appended_all_the_way(p, hi),
     );
@@ -642,7 +664,6 @@ fn a_crashed_append_can_be_reopened_and_appended_to() {
     let hi = WARMUP + RECOVER_ROUNDS * ROUND;
     rec.replay_every_prefix(
         dir.path(),
-        Expect::EveryPrefixReads,
         |p| {
         // Read it first: a file that will not open is loud, and there is nothing
         // to recover.
@@ -949,7 +970,6 @@ fn committing_survives_a_crash_at_every_write() {
             rec.assert_positioned(1, 0);
             rec.replay_every_prefix(
                 dir.path(),
-                Expect::EveryPrefixReads,
                 commit_state_is_one_or_the_other,
                 every_round_committed,
             );
@@ -961,29 +981,27 @@ fn committing_survives_a_crash_at_every_write() {
 // Gathering against not gathering
 // ---------------------------------------------------------------------------
 
-/// Gathering makes each individual write *larger*, which sounds like it should
-/// widen the window a crash can land in. It does the opposite, and this measures
-/// by how much.
+/// The guarantee does not depend on the write gathering.
 ///
-/// The reason is that the format's publish points are frequently a pair of
-/// writes — a value, and the checksum covering it — and a pair is atomic only
-/// when both land together. Straight-through writing never joins them.
-/// Gathering joins them whenever they share a page, which is every object header
-/// this crate's own writer produces below about 3.9 KB (the residue above that
-/// size is issue #307).
+/// It once did. A publish was a value write followed by a checksum write, joined
+/// into one only where the gatherer found the two in the same page, so an
+/// unbuffered session left this sweep 20 unreadable states in 168 — every one a
+/// checksum torn from the value it covered. Since issue #307 the engine publishes
+/// a checksummed structure as one write itself, and both configurations sweep
+/// clean.
 ///
-/// So the same workload, swept the same way, leaves *fewer* unreadable states
-/// when gathered. Both are run here in one process, from base files built by the
-/// same function with the same arguments, so the comparison is between the two
-/// modes and not between two machines.
+/// Running both is what keeps it that way. A publish point that regressed to two
+/// writes would pass the gathered sweep for as long as the two shared a page, and
+/// fail here at once — which is exactly how #307 hid: it was reachable only on a
+/// dataset whose object header outgrew one page.
 #[test]
-fn gathering_leaves_fewer_unreadable_crash_states_than_not_gathering() {
+fn crash_states_read_back_with_and_without_write_gathering() {
     use crate::image::WriteBuffering;
 
     const ROUNDS_EACH: i32 = 20;
     let hi = WARMUP + ROUNDS_EACH * ROUND;
 
-    let sweep = |label: &str, mode: Option<WriteBuffering>, expect: Expect| -> Tally {
+    let sweep = |label: &str, mode: Option<WriteBuffering>| -> Tally {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("compare.h5");
         warmed_base(&path, false);
@@ -1001,49 +1019,225 @@ fn gathering_leaves_fewer_unreadable_crash_states_than_not_gathering() {
         rec.assert_positioned(1, 0);
         rec.replay_every_prefix(
             dir.path(),
-            expect,
             |p| appended_prefix_is_intact(p, WARMUP, hi),
             |p| appended_all_the_way(p, hi),
         )
     };
 
     // `None` keeps the session default, which is the gathering a locked
-    // read-write session takes, and it is held to the full rule.
-    let gathered = sweep("compare-gathered", None, Expect::EveryPrefixReads);
-    // The unbuffered half is *not*, and that is the finding: straight-through
-    // writing does not provide it.
-    let straight = sweep(
-        "compare-unbuffered",
-        Some(WriteBuffering::Unbuffered),
-        Expect::SomeMayRefuse { min_clean: 0.5 },
-    );
+    // read-write session takes.
+    let gathered = sweep("compare-gathered", None);
+    let straight = sweep("compare-unbuffered", Some(WriteBuffering::Unbuffered));
 
-    // `gathered.loud.len() < straight.loud.len()` would read as the headline
-    // claim and assert almost nothing: `Expect::EveryPrefixReads` has already
-    // required the left side to be empty, so it degenerates to "the right side is
-    // not zero". What is worth pinning is the *right* side — that straight-
-    // through writing really does leave unreadable states here, and why.
-    //
-    // Every one of them is a torn publish point: a value written without the
-    // checksum covering it, which gathering merges into one write whenever the
-    // two share a page. Requiring *all* of them to be torn rather than merely one
-    // is what makes this a description of the mechanism rather than a floor.
+    // Both sweeps assert the rule inside `replay_every_prefix`, so what is left
+    // to pin here is that the second one is the *finer* of the two. Unbuffered
+    // writing issues each patch separately, so it stops the machine at instants
+    // the gathered sweep never reaches; if the two ever swept the same number of
+    // prefixes, the mode would be being ignored and this whole comparison would
+    // be one sweep run twice.
     assert!(
-        gathered.loud.is_empty(),
-        "the gathered sweep should have left no unreadable state"
-    );
-    let torn = straight
-        .loud
-        .iter()
-        .filter(|why| why.contains("ChecksumMismatch"))
-        .count();
-    assert!(
-        torn == straight.loud.len() && torn > 0,
-        "straight-through writing should leave unreadable crash states, all of them \
-         a checksum torn from the value it covers; got {torn} torn of {} unreadable \
-         in {} prefixes:\n  {}",
-        straight.loud.len(),
+        straight.total > gathered.total,
+        "the unbuffered sweep should stop at more instants than the gathered one, \
+         but swept {} prefixes against {}",
         straight.total,
-        straight.loud.join("\n  ")
+        gathered.total
+    );
+}
+
+/// Bytes of attribute padding that push the dataspace dimension and its
+/// object-header checksum into different gather pages. Measured threshold on the
+/// default 4096-byte page: 3800 still joins, 3900 splits.
+const HEADER_PAD: usize = 4096;
+
+/// An in-place append publishes its new dimension and the checksum covering it.
+/// A header chunk wider than one gather page splits those into two writes, and a
+/// crash between them leaves the file **unreadable** — the new value under the
+/// old checksum (issue #307).
+#[test]
+fn publishing_a_dimension_in_a_wide_header_survives_a_crash_at_every_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("wide_header.h5");
+    warmed_base_padded(&path, true, HEADER_PAD);
+
+    let rec = Recording::of("wide-header", &path, |p| {
+        let mut s = WriteEngine::open_with_locking(p, FileLocking::Enabled).unwrap();
+        s.set_sync_policy(SyncPolicy::OnClose);
+        for r in 0..ROUNDS {
+            append(&mut s, WARMUP + r * ROUND, ROUND);
+        }
+        s.finalize_persist().unwrap();
+        drop(s);
+    });
+
+    rec.assert_publishes_across_a_gather_page();
+    let hi = WARMUP + ROUNDS * ROUND;
+    rec.replay_every_prefix(
+        dir.path(),
+        |p| appended_prefix_is_intact(p, WARMUP, hi),
+        |p| appended_all_the_way(p, hi),
+    );
+}
+
+/// Publishing costs the same number of writes whether or not the structure being
+/// published spans a gather page — which is the defect of issue #307 stated as a
+/// rule rather than as one of its consequences.
+///
+/// The sweep above catches the consequence, and only for the object header: it
+/// reads the file back, so it sees a torn publish only where a reader follows the
+/// torn field. This sees the split itself, so it covers every publish an append
+/// makes — the array header's statistics, an index block's element and its data-
+/// block pointers, a data block's element — without needing a workload that
+/// reads each one.
+///
+/// Measured before the fix: 5 writes at 3800 bytes of padding against 6 at 3900,
+/// the extra one being the checksum stranded in the next page. Both buffering
+/// modes are checked, because the unbuffered one splits every publish regardless
+/// of where the pages fall.
+#[test]
+fn a_publish_costs_the_same_whether_or_not_it_spans_a_page() {
+    use crate::image::WriteBuffering;
+
+    for mode in [None, Some(WriteBuffering::Unbuffered)] {
+        let mut counts = Vec::new();
+        // A sweep rather than the two sides of the measured threshold: picking
+        // the boundary by hand is how a fixture ends up just short of the case it
+        // was written for, and stepping across it costs milliseconds.
+        for pad in [0usize, 2000, 3800, 3900, 4200, 8300] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("pad.h5");
+            warmed_base_padded(&path, true, pad);
+
+            let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+            s.set_sync_policy(SyncPolicy::OnClose);
+            if let Some(mode) = mode {
+                s.set_write_buffering(mode).unwrap();
+            }
+            let before = s.issued_write_order().len();
+            append(&mut s, WARMUP, ROUND);
+            let made = s.issued_write_order()[before..].to_vec();
+            drop(s);
+            // Whether this padding put the publish across a page: a write that
+            // starts inside the first gather page and reaches past it.
+            let wide = made
+                .iter()
+                .any(|&(off, len)| off < GATHER_PAGE && off + len > GATHER_PAGE);
+            counts.push((pad, made.len(), wide));
+        }
+        // The comparison is only meaningful across the boundary. All-narrow or
+        // all-wide passes with the defect present — measured — so the sweep has to
+        // say it landed on both sides rather than be trusted to.
+        assert!(
+            counts.iter().any(|&(_, _, w)| w) && counts.iter().any(|&(_, _, w)| !w),
+            "{mode:?}: every padding fell on the same side of the {GATHER_PAGE}-byte \
+             page, so this comparison holds nothing: {counts:?}"
+        );
+        let (_, first, _) = counts[0];
+        assert!(
+            counts.iter().all(|&(_, n, _)| n == first),
+            "{mode:?}: one append must cost the same writes at every header width, \
+             but cost {counts:?}"
+        );
+    }
+}
+
+/// A publish being one write leaves the gathering almost nothing to merge inside
+/// an append, so the two buffering modes must cost writes that differ by a
+/// **constant** rather than by a per-append one.
+///
+/// This is the half [`a_publish_costs_the_same_whether_or_not_it_spans_a_page`]
+/// cannot see. That one compares header widths, so a publish that splits at
+/// *every* width — the array header's six statistics and its checksum are fifty
+/// bytes apart and share a page whatever the dataset looks like — changes both
+/// sides of its comparison and passes. Splitting shows up here instead, as a gap
+/// that grows with the number of appends.
+///
+/// Measured: 5 writes against 5 for one append and 40 against 40 for eight,
+/// unpaged; one more on the unbuffered side throughout when the file is paged,
+/// from padding a page at the raw/metadata boundary. Before issue #307 the same
+/// eight appends were 40 against 64, and the excess was three writes per append.
+#[test]
+fn buffering_saves_a_constant_number_of_writes_not_one_per_append() {
+    use crate::image::WriteBuffering;
+
+    /// Room for the handful of writes gathering merges that are *not* per-append:
+    /// a paged file's boundary padding, and the joins around an allocation round.
+    const SLACK: usize = 4;
+
+    for paged in [false, true] {
+        let cost = |rounds: i32, unbuffered: bool| -> usize {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("gap.h5");
+            warmed_base(&path, paged);
+            let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+            s.set_sync_policy(SyncPolicy::OnClose);
+            if unbuffered {
+                s.set_write_buffering(WriteBuffering::Unbuffered).unwrap();
+            }
+            for i in 0..rounds {
+                append(&mut s, WARMUP + i * ROUND, ROUND);
+            }
+            let n = s.issued_write_order().len();
+            drop(s);
+            n
+        };
+
+        // Two append counts an order of magnitude apart: a per-append excess
+        // grows between them and a constant one does not, which is the whole
+        // distinction. Comparing one count against an absolute would pin a number
+        // that every unrelated change to the append path moves.
+        let (few, many) = (2i32, 24i32);
+        let gap = |rounds: i32| cost(rounds, true).saturating_sub(cost(rounds, false));
+        let (gap_few, gap_many) = (gap(few), gap(many));
+        // A floor as well as a ceiling. If `set_write_buffering` silently did
+        // nothing, both sides would be the same session and every gap would be
+        // zero, which satisfies the rule below without measuring anything.
+        assert!(
+            gap_many > 0,
+            "paged={paged}: unbuffered writing must cost more writes than gathered \
+             over {many} appends, but the two were equal — the buffering mode is \
+             not taking effect and nothing below is being measured"
+        );
+        assert!(
+            gap_many <= gap_few + SLACK,
+            "paged={paged}: buffering must save a constant number of writes, but saved \
+             {gap_few} over {few} appends and {gap_many} over {many} — a gap that grows \
+             with the appends is a publish that is still two writes"
+        );
+    }
+}
+
+/// A publish writes back from the byte it changed, not from the front of the
+/// structure that byte sits in.
+///
+/// Two appends into the same Extensible-Array data block touch a slot one
+/// element further along each time, so the second writes strictly fewer bytes
+/// than the first. Rewriting the whole block would make the two equal — which is
+/// what this test exists to fail on, since the write *count* is the same either
+/// way and every other check here counts writes.
+///
+/// Measured on this fixture: 531 bytes then 523, against 992 and 992 when the
+/// publish starts at the structure instead. The block, not the object header, is
+/// where the saving is: 534 bytes of index block against the 116 the first of
+/// these appends actually changes.
+#[test]
+fn a_publish_writes_from_the_byte_it_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("from.h5");
+    warmed_base(&path, false);
+
+    let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+    s.set_sync_policy(SyncPolicy::OnClose);
+    let written = |s: &WriteEngine| -> u64 { s.issued_write_order().iter().map(|&(_, n)| n).sum() };
+    let mut cost = Vec::new();
+    for i in 0..2 {
+        let before = written(&s);
+        append(&mut s, WARMUP + i * ROUND, ROUND);
+        cost.push(written(&s) - before);
+    }
+    drop(s);
+    assert!(
+        cost[1] < cost[0],
+        "an append that touches a later slot of the same block must write fewer \
+         bytes than one that touches an earlier slot, but the two cost {cost:?}"
     );
 }

@@ -2311,6 +2311,15 @@ impl WriteEngine {
         self.image.set_write_buffering(mode)
     }
 
+    /// Every write this session issued, as `(offset, length)` in the order it
+    /// went out. Same reasoning as [`set_write_buffering`](Self::set_write_buffering):
+    /// the image is private, and a test that asks whether a publish left the
+    /// engine as one write has nowhere else to look.
+    #[cfg(test)]
+    pub(crate) fn issued_write_order(&self) -> Vec<(u64, u64)> {
+        self.image.issued_write_order()
+    }
+
     /// The durability barrier a write path calls for, data and metadata both —
     /// issued unless this session's [`SyncPolicy`] leaves the `fsync` cadence to
     /// the application.
@@ -11293,10 +11302,13 @@ mod tests {
         b.write(path).unwrap();
     }
 
-    /// Run the same appends and the same commit on `session`, and report what it
-    /// cost in writes. The file it leaves is the other half of what the callers
-    /// compare, and they read it off the path themselves.
-    fn gather_workload(session: &mut WriteEngine) -> u64 {
+    /// Run the same appends and the same commit on `session`, and report what
+    /// each cost in writes: the in-place appends, then the staged commit that
+    /// follows them. They are counted apart because the gathering earns its keep
+    /// in only one of them — see the caller. The file the workload leaves is the
+    /// other half of what the callers compare, and they read it off the path
+    /// themselves.
+    fn gather_workload(session: &mut WriteEngine) -> (u64, u64) {
         let before = session.image.issued_writes();
         for round in 0..4 {
             for t in 0..4 {
@@ -11312,8 +11324,12 @@ mod tests {
                 .stage_created_dataset(&std::format!("/n{t}"), db)
                 .unwrap();
         }
+        let after_appends = session.image.issued_writes();
         session.commit().unwrap();
-        session.image.issued_writes() - before
+        (
+            after_appends - before,
+            session.image.issued_writes() - after_appends,
+        )
     }
 
     /// Gathering a session's writes lowers what it costs and changes nothing
@@ -11345,30 +11361,42 @@ mod tests {
             a.image
                 .set_write_buffering(WriteBuffering::Unbuffered)
                 .unwrap();
-            let straight_writes = gather_workload(&mut a);
+            let (straight_appends, straight_commit) = gather_workload(&mut a);
             a.force_sync().unwrap();
             drop(a);
 
             let mut b = WriteEngine::open_with_locking(&gathered, FileLocking::Enabled).unwrap();
             b.set_sync_policy(SyncPolicy::OnClose);
-            let gathered_writes = gather_workload(&mut b);
+            let (gathered_appends, gathered_commit) = gather_workload(&mut b);
             b.force_sync().unwrap();
             drop(b);
 
-            // Measured at 86 against 154. Not the 160-against-256 the module docs
-            // and the changelog quote: those are the same workload over *eight*
-            // datasets, and this fixture builds four. The ratio is the claim
-            // either way, which is why the assertion below is a ratio.
-            //
-            // The margin is what it is because every
-            // barrier still issues what it has gathered — see `WriteEngine::barrier`
-            // — so the gathering merges within a phase and never across one.
-            // Merging across barriers would go further and is issue #308, which
-            // is held back on what it would cost a crashed session.
+            // The commit tail is where the gathering earns its keep, and the half
+            // to assert a ratio on. Measured: 2 writes against 10 unpaged, 4
+            // against 16 paged. A commit rebuilds a group, repoints a root and
+            // re-homes the free-space managers, all inside one phase and all into
+            // a handful of pages, which is what merging within a barrier is for.
+            // Merging *across* barriers would go further and is issue #308, held
+            // back on what it would cost a crashed session.
             assert!(
-                gathered_writes * 4 < straight_writes * 3,
-                "paged={paged}: gathering must cost meaningfully fewer writes, \
-                 but cost {gathered_writes} against {straight_writes}"
+                gathered_commit * 3 < straight_commit,
+                "paged={paged}: gathering must cost meaningfully fewer writes for a \
+                 commit, but cost {gathered_commit} against {straight_commit}"
+            );
+            // The appends are the other half, and since issue #307 they are a
+            // near-tie: 88 against 92 unpaged, 92 against 92 paged. Publishing a
+            // checksummed structure is one write from the engine now rather than
+            // two the gatherer had to rejoin, so the buffering has almost nothing
+            // left to merge here — before that fix this half was 92 against 144.
+            // What is still worth pinning is that it never costs *more*. Note the
+            // limit of that: a publish write made wider still merges the same way,
+            // so widening one to the whole structure it sits in changes no count
+            // here or anywhere — `a_publish_writes_from_the_byte_it_changed` is
+            // what holds that, by counting bytes rather than writes.
+            assert!(
+                gathered_appends <= straight_appends,
+                "paged={paged}: gathering must not cost more writes for the appends, \
+                 but cost {gathered_appends} against {straight_appends}"
             );
             assert_eq!(
                 std::fs::read(&straight).unwrap(),
@@ -11649,7 +11677,9 @@ mod tests {
     /// writer is the regime where it still shows: it gathers nothing by design,
     /// so every write the engine makes is a syscall. Stated as a ceiling on the
     /// count rather than as an exact figure, since what an append needs is free to
-    /// fall — six statistics written singly puts it five over.
+    /// fall — and it has: 12 before issue #307 published each checksummed
+    /// structure in one write, 8 after. Six statistics written singly puts it five
+    /// over; a checksum written apart from the value it covers, four.
     #[test]
     fn an_unbuffered_append_costs_a_small_constant_number_of_writes() {
         use tempfile::tempdir;
@@ -11668,9 +11698,10 @@ mod tests {
             "the append issued nothing, so the ceiling below proves nothing"
         );
         assert!(
-            cost <= 14,
+            cost <= 10,
             "an unbuffered append costs {cost} writes; the array header's six \
-             statistics belong in one write, not six (measured at 12)"
+             statistics belong in one write, not six, and each checksum belongs in \
+             the write that changed what it covers (measured at 8)"
         );
     }
 

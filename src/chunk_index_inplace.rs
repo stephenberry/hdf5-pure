@@ -189,30 +189,6 @@ pub(crate) trait Store: Source {
     /// reader observes (issue #288).
     fn sync(&mut self) -> Result<(), Error>;
 
-    /// Write an offset-sized address at `offset`.
-    fn write_addr_at(&mut self, offset: u64, addr: u64) -> Result<(), Error> {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "the 4-byte arm is taken only when this file's offset_size is 4 bytes"
-        )]
-        match self.offset_size() {
-            4 => self.write_at(offset, &(addr as u32).to_le_bytes()),
-            _ => self.write_at(offset, &addr.to_le_bytes()),
-        }
-    }
-
-    /// Write a length-sized value at `offset`.
-    fn write_length_at(&mut self, offset: u64, val: u64) -> Result<(), Error> {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "the 4-byte arm is taken only when this file's length_size is 4 bytes"
-        )]
-        match self.length_size() {
-            4 => self.write_at(offset, &(val as u32).to_le_bytes()),
-            _ => self.write_at(offset, &val.to_le_bytes()),
-        }
-    }
-
     /// Read an offset-sized address at `offset`.
     fn read_addr_at(&self, offset: u64) -> Result<u64, Error> {
         let mut buf = [0u8; 8];
@@ -221,14 +197,64 @@ pub(crate) trait Store: Source {
         Ok(u64::from_le_bytes(buf))
     }
 
-    /// Recompute the Jenkins checksum over `[start, cks_off)` and store it at
-    /// `cks_off`.
-    fn rechecksum_range(&mut self, start: u64, cks_off: u64) -> Result<(), Error> {
-        let bytes = self.read_exact_at(start, (cks_off - start).to_usize()?)?;
-        let cks = jenkins_lookup3(&bytes);
-        self.write_at(cks_off, &cks.to_le_bytes())
+    /// Change a checksummed structure and publish it as **one** write.
+    ///
+    /// Reads `[start, cks_off + 4)`, places `value` at `at` inside the body
+    /// before `cks_off`, recomputes the Jenkins checksum over it, and writes back
+    /// everything from `at` through the checksum field.
+    ///
+    /// The single write is the point, not an optimization. A value written
+    /// separately from the checksum covering it is atomic only where the
+    /// gatherer joins the two, which it does only when both land in the same
+    /// page; a structure wider than one page publishes the new value under the
+    /// *old* checksum, and a failure between the two writes leaves it unreadable
+    /// (issue #307). Every other publish point in this crate — the superblock
+    /// repoint above all — is already a single write, and this is what brings
+    /// these into line rather than a new mechanism.
+    ///
+    /// One write is not crash-atomicity: a `pwrite` wide enough may still tear at
+    /// a device boundary. It is the same window the superblock publish has always
+    /// had, which is this crate's bar.
+    ///
+    /// The write starts at `at` rather than at `start`, so patching an element
+    /// near the end of a large block does not rewrite the block. The *read* still
+    /// covers the whole body, because the checksum does. Measured over six
+    /// appends at the same number of writes: 3,066 bytes against 5,952 unpaged
+    /// and 31,266 against 34,158 on a paged file with a 4 KiB header — the index
+    /// block, not the object header, is where most of that sits.
+    /// `crash_replay::a_publish_writes_from_the_byte_it_changed` is what holds
+    /// it, since the write count is the same either way.
+    fn publish_checksummed(
+        &mut self,
+        start: u64,
+        cks_off: u64,
+        at: u64,
+        value: &[u8],
+    ) -> Result<(), Error> {
+        let span = (cks_off + 4 - start).to_usize()?;
+        // A range outside the structure is refused rather than asserted: every
+        // offset here is derived from geometry parsed out of the file, so a
+        // malformed one is untrusted input, not a broken invariant. Checked
+        // before the read, so a refusal costs nothing.
+        let from = at
+            .checked_sub(start)
+            .and_then(|d| d.to_usize().ok())
+            .filter(|&f| f.checked_add(value.len()).is_some_and(|e| e <= span - 4))
+            .ok_or(Error::AppendUnsupported(
+                "a checksummed structure was patched outside itself",
+            ))?;
+        let mut bytes = self.read_exact_at(start, span)?;
+        bytes[from..from + value.len()].copy_from_slice(value);
+        let (body, cks_field) = bytes.split_at_mut(span - 4);
+        cks_field.copy_from_slice(&jenkins_lookup3(body).to_le_bytes());
+        self.write_at(at, &bytes[from..])
     }
 }
+
+/// Widest Extensible-Array element this engine can be asked to place: an
+/// 8-byte address, a stored size no wider than the `u64` that fills it, and a
+/// 4-byte filter mask. `locate` refuses any file naming more.
+const MAX_EA_ELEM: usize = 8 + 8 + 4;
 
 /// Absolute file offsets of the object-header messages a caller may need to
 /// parse after locating a dataset.
@@ -433,10 +459,13 @@ impl Located {
             ));
         }
         // A filtered element is `address + compressed_size + filter_mask`, so its
-        // stored width must leave room for at least a one-byte size field. Reject
-        // a corrupt header whose element_size is too small before the width
-        // arithmetic (`ea_elem_size - offset_size - 4`) would underflow.
-        if ea_header.client_id == 1 && (ea_header.element_size as usize) < os as usize + 5 {
+        // stored width must leave room for a size field of one to eight bytes.
+        // Reject a corrupt header outside that range before the width arithmetic
+        // (`ea_elem_size - offset_size - 4`) underflows below it, or names above
+        // it a size field wider than the `u64` that fills it. The whole-file read
+        // path refuses both ends in `read_variable_length`.
+        let elem_w = ea_header.element_size as usize;
+        if ea_header.client_id == 1 && !(os as usize + 5..=os as usize + 12).contains(&elem_w) {
             return Err(unsupported(
                 "malformed filtered extensible-array element width",
             ));
@@ -482,31 +511,6 @@ impl Located {
                 fill: fill_msg.map(|m| (m.msg_type, m.data_off, m.size)),
             },
         })
-    }
-
-    /// Write element record `rec` at byte offset `off` (a slot known to exist).
-    /// For an unfiltered array only the address is written; for a filtered array
-    /// the full `address + compressed_size + filter_mask` record is written,
-    /// refusing a stored size that does not fit the array's fixed element width.
-    fn write_element_at<F: Store>(
-        &self,
-        file: &mut F,
-        off: u64,
-        rec: ElemRecord,
-    ) -> Result<(), Error> {
-        if self.client_id == 0 {
-            return file.write_addr_at(off, rec.addr);
-        }
-        let os = file.offset_size() as usize;
-        let csz = self.ea_elem_size - os - 4;
-        if csz < 8 && rec.stored_size >= (1u64 << (8 * csz)) {
-            return Err(Error::AppendUnsupported(
-                "recompressed chunk size exceeds the dataset's extensible-array element width",
-            ));
-        }
-        file.write_addr_at(off, rec.addr)?;
-        file.write_at(off + os as u64, &rec.stored_size.to_le_bytes()[..csz])?;
-        file.write_at(off + (os + csz) as u64, &rec.filter_mask.to_le_bytes())
     }
 
     /// Read the element record stored at byte offset `off`.
@@ -663,9 +667,9 @@ impl Located {
         if e < idx {
             let ib_prefix = (4 + 1 + 1 + os) as u64;
             let slot_off = self.index_block_addr + ib_prefix + e * elem_size;
-            self.write_element_at(file, slot_off, rec)?;
-            self.rechecksum_index_block(file)?;
-            return Ok(());
+            let mut buf = [0u8; MAX_EA_ELEM];
+            let n = self.element_bytes(&mut buf, os, rec)?;
+            return self.publish_index_block(file, slot_off, &buf[..n]);
         }
 
         let region = locate_data_block(&self.geom, idx, e);
@@ -710,16 +714,19 @@ impl Located {
             // its parent pointer is not, so they need a barrier between them or
             // an address-ordered flush names a block that is not there yet.
             file.sync()?;
-            file.write_addr_at(dblk_ptr_off, new_addr)?;
             match region.parent {
-                Parent::IndexDirect { .. } => self.rechecksum_index_block(file)?,
-                Parent::Super { .. } => self.rechecksum_super_block(
+                Parent::IndexDirect { .. } => {
+                    self.publish_index_block(file, dblk_ptr_off, &new_addr.to_le_bytes()[..os])?;
+                }
+                Parent::Super { .. } => self.publish_super_block(
                     file,
                     sblk_addr.unwrap(),
                     ndblks,
                     dblk_nelmts,
                     self.page_nelmts,
                     blk_off,
+                    dblk_ptr_off,
+                    &new_addr.to_le_bytes()[..os],
                 )?,
             }
             new_addr
@@ -730,9 +737,10 @@ impl Located {
         if !is_paged {
             let db_prefix = (4 + 1 + 1 + os + blk_off) as u64;
             let elem_off = dblk_addr + db_prefix + slot * elem_size;
-            self.write_element_at(file, elem_off, rec)?;
+            let mut buf = [0u8; MAX_EA_ELEM];
+            let n = self.element_bytes(&mut buf, os, rec)?;
             let cks_off = dblk_addr + db_prefix + dblk_nelmts * elem_size;
-            file.rechecksum_range(dblk_addr, cks_off)?;
+            file.publish_checksummed(dblk_addr, cks_off, elem_off, &buf[..n])?;
         } else {
             let page_nelmts = self.page_nelmts;
             let header_size = (4 + 1 + 1 + os + blk_off + 4) as u64;
@@ -740,23 +748,27 @@ impl Located {
             let slot_in_page = slot % page_nelmts;
             let page_bytes = page_nelmts * elem_size + 4;
             let page_off = dblk_addr + header_size + page * page_bytes;
-            self.write_element_at(file, page_off + slot_in_page * elem_size, rec)?;
+            let elem_off = page_off + slot_in_page * elem_size;
+            let mut buf = [0u8; MAX_EA_ELEM];
+            let n = self.element_bytes(&mut buf, os, rec)?;
             let page_cks_off = page_off + page_nelmts * elem_size;
-            file.rechecksum_range(page_off, page_cks_off)?;
+            file.publish_checksummed(page_off, page_cks_off, elem_off, &buf[..n])?;
 
             if slot_in_page == 0 {
                 let sblk_addr = sblk_addr.unwrap();
                 let npages = dblk_nelmts / self.page_nelmts;
                 if let Parent::Super { dblk_local, .. } = region.parent {
                     let global_page = dblk_local as u64 * npages + page;
-                    self.set_sb_page_bit(file, sblk_addr, blk_off, global_page)?;
-                    self.rechecksum_super_block(
+                    let (byte, set) = sb_page_bit(file, sblk_addr, blk_off, global_page)?;
+                    self.publish_super_block(
                         file,
                         sblk_addr,
                         ndblks,
                         dblk_nelmts,
                         self.page_nelmts,
                         blk_off,
+                        byte,
+                        &[set],
                     )?;
                 }
             }
@@ -820,8 +832,7 @@ impl Located {
             + ib_prefix
             + self.idx_blk_elmts * self.ea_elem_size as u64
             + ((ndblk_addrs + sblk_j) * os) as u64;
-        file.write_addr_at(slot_off, new_addr)?;
-        self.rechecksum_index_block(file)?;
+        self.publish_index_block(file, slot_off, &new_addr.to_le_bytes()[..os])?;
         Ok(new_addr)
     }
 
@@ -881,26 +892,56 @@ impl Located {
         file.append_raw(&buf)
     }
 
-    /// Set page `global_page`'s bit in a super block's page-init bitmap
-    /// (MSB-first).
-    fn set_sb_page_bit<F: Store>(
-        &self,
-        file: &mut F,
-        sblk_addr: u64,
-        blk_off: usize,
-        global_page: u64,
-    ) -> Result<(), Error> {
-        let os = file.offset_size() as usize;
-        let bitmap_start = sblk_addr + (4 + 1 + 1 + os + blk_off) as u64;
-        let byte = bitmap_start + global_page / 8;
-        let mask = 0x80u8 >> (global_page % 8);
-        let mut v = [0u8; 1];
-        file.read_at(byte, &mut v)?;
-        file.write_at(byte, &[v[0] | mask])
+    /// Width of a filtered element's stored-size field, checked against the record
+    /// about to go in it. Zero for an unfiltered array, whose element is a bare
+    /// address.
+    fn element_size_width(&self, os: usize, rec: ElemRecord) -> Result<usize, Error> {
+        if self.client_id == 0 {
+            return Ok(0);
+        }
+        // `element_size` is one byte out of the array header, so a file can name
+        // a width the three fields do not fit in. `locate` is where that byte is
+        // refused; by here it is in `os + 5 ..= os + 12`.
+        debug_assert!(
+            (os + 5..=os + 12).contains(&self.ea_elem_size),
+            "locate admitted an element width of {} for a {os}-byte address",
+            self.ea_elem_size
+        );
+        let csz = self.ea_elem_size - os - 4;
+        if csz < 8 && rec.stored_size >= (1u64 << (8 * csz)) {
+            return Err(Error::AppendUnsupported(
+                "recompressed chunk size exceeds the dataset's extensible-array element width",
+            ));
+        }
+        Ok(csz)
     }
 
-    /// Recompute the index block checksum from the located dataset metadata.
-    fn rechecksum_index_block<F: Store>(&self, file: &mut F) -> Result<(), Error> {
+    /// Lay one Extensible-Array element into `buf`, returning the bytes used.
+    /// Its fields are contiguous, so this is one span rather than the three
+    /// writes it replaced.
+    fn element_bytes(
+        &self,
+        buf: &mut [u8; MAX_EA_ELEM],
+        os: usize,
+        rec: ElemRecord,
+    ) -> Result<usize, Error> {
+        buf[..os].copy_from_slice(&rec.addr.to_le_bytes()[..os]);
+        if self.client_id == 0 {
+            return Ok(os);
+        }
+        let csz = self.element_size_width(os, rec)?;
+        buf[os..os + csz].copy_from_slice(&rec.stored_size.to_le_bytes()[..csz]);
+        buf[os + csz..os + csz + 4].copy_from_slice(&rec.filter_mask.to_le_bytes());
+        Ok(os + csz + 4)
+    }
+
+    /// Change the index block and republish it, checksum included, as one write.
+    fn publish_index_block<F: Store>(
+        &self,
+        file: &mut F,
+        at: u64,
+        value: &[u8],
+    ) -> Result<(), Error> {
         let os = file.offset_size() as usize;
         let ib_prefix = (4 + 1 + 1 + os) as u64;
         let ndblk_addrs = self.geom.direct_dblk_nelmts.len();
@@ -909,10 +950,11 @@ impl Located {
             + ib_prefix
             + self.idx_blk_elmts * self.ea_elem_size as u64
             + ((ndblk_addrs + nsblk_addrs) * os) as u64;
-        file.rechecksum_range(self.index_block_addr, cks_off)
+        file.publish_checksummed(self.index_block_addr, cks_off, at, value)
     }
 
-    fn rechecksum_super_block<F: Store>(
+    /// Change a super block and republish it, checksum included, as one write.
+    fn publish_super_block<F: Store>(
         &self,
         file: &mut F,
         sblk_addr: u64,
@@ -920,12 +962,14 @@ impl Located {
         dblk_nelmts: u64,
         page_nelmts: u64,
         blk_off: usize,
+        at: u64,
+        value: &[u8],
     ) -> Result<(), Error> {
         let os = file.offset_size() as usize;
         let prefix = (4 + 1 + 1 + os + blk_off) as u64;
         let bitmap = sb_bitmap_size(ndblks, dblk_nelmts, page_nelmts)? as u64;
         let cks_off = sblk_addr + prefix + bitmap + ndblks * os as u64;
-        file.rechecksum_range(sblk_addr, cks_off)
+        file.publish_checksummed(sblk_addr, cks_off, at, value)
     }
 
     /// Patch the six EA header statistics and recompute the header checksum.
@@ -970,11 +1014,10 @@ impl Located {
             stat_block[at..at + ls].copy_from_slice(&value.to_le_bytes()[..ls]);
             at += ls;
         }
-        file.write_at(ea_addr + 12, &stat_block[..at])?;
         let aehd_size =
             ExtensibleArrayHeader::serialized_size(file.offset_size(), file.length_size()) as u64;
         let cks_off = ea_addr + aehd_size - 4;
-        file.rechecksum_range(ea_addr, cks_off)
+        file.publish_checksummed(ea_addr, cks_off, ea_addr + 12, &stat_block[..at])
     }
 
     /// Publish `new_dim` as the dataspace axis-0 dimension (the commit point) and
@@ -984,8 +1027,13 @@ impl Located {
         file: &mut F,
         new_dim: u64,
     ) -> Result<(), Error> {
-        file.write_length_at(self.dim0_off, new_dim)?;
-        file.rechecksum_range(self.ohdr_chunk_start, self.ohdr_chunk_msg_end)
+        let ls = file.length_size() as usize;
+        file.publish_checksummed(
+            self.ohdr_chunk_start,
+            self.ohdr_chunk_msg_end,
+            self.dim0_off,
+            &new_dim.to_le_bytes()[..ls],
+        )
     }
 }
 
@@ -1203,6 +1251,26 @@ pub(crate) fn apply_ea_append<F: Store>(
     loc.current_dim = plan.new_dim;
     loc.num_chunks = plan.new_num_chunks;
     Ok(())
+}
+
+/// The byte of a super block's page-init bitmap that holds page `global_page`'s
+/// bit (MSB-first), and that byte with the bit set.
+///
+/// A read-modify-write, so it reads the byte and hands the *result* back for the
+/// publish to place: one field of one byte is not a value the caller can name on
+/// its own.
+fn sb_page_bit<F: Store>(
+    file: &F,
+    sblk_addr: u64,
+    blk_off: usize,
+    global_page: u64,
+) -> Result<(u64, u8), Error> {
+    let os = file.offset_size() as usize;
+    let bitmap_start = sblk_addr + (4 + 1 + 1 + os + blk_off) as u64;
+    let byte = bitmap_start + global_page / 8;
+    let mut v = [0u8; 1];
+    file.read_at(byte, &mut v)?;
+    Ok((byte, v[0] | (0x80u8 >> (global_page % 8))))
 }
 
 /// Byte size of a super block's page-init bitmap (0 when its data blocks are not
@@ -1829,5 +1897,51 @@ mod tests {
         let got = file.dataset("d").unwrap().read_i32().unwrap();
         let expected: Vec<i32> = (0..n + 7 + 13).collect();
         assert_eq!(got, expected);
+    }
+
+    /// A filtered element's stored-size field is at most the eight bytes of the
+    /// `u64` that fills it, and a file naming a wider one is refused at `locate`
+    /// rather than panicking when the element is laid out.
+    ///
+    /// The refusal is two-sided for a reason: the low side alone was what this
+    /// guard checked, and the high side reached
+    /// `rec.stored_size.to_le_bytes()[..csz]` with `csz` up to 243. Reproduced
+    /// through the safe public API before the upper bound landed — an
+    /// `element_size` of 30 on an 8-byte-address file panicked with "range end
+    /// index 18 out of range for slice of length 8".
+    #[test]
+    fn an_element_width_wider_than_a_u64_is_refused_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wide_elem.h5");
+        let mut b = crate::writer::FileBuilder::new();
+        b.create_dataset("d")
+            .with_i32_data(&(0..4096).collect::<Vec<_>>())
+            .with_shape(&[4096])
+            .with_maxshape(&[u64::MAX])
+            .with_chunks(&[4])
+            .with_deflate(1);
+        b.write(&path).unwrap();
+
+        // Widen the array header's element_size (byte 6 of `EAHD`) past the three
+        // fields it names. A filtered element is address + stored size + filter
+        // mask, so on an 8-byte-address file the format's own ceiling is 20.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let at = bytes
+            .windows(4)
+            .position(|w| w == b"EAHD")
+            .expect("a filtered unlimited dataset is indexed by an extensible array");
+        assert_eq!(bytes[at + 6], 14, "the writer's own element width moved");
+        bytes[at + 6] = 30;
+        std::fs::write(&path, &bytes).unwrap();
+
+        let f = crate::reader::File::open_rw(&path).unwrap();
+        let err = f
+            .dataset("d")
+            .and_then(|mut d| d.append(&[1i32, 2, 3, 4]))
+            .expect_err("an element width wider than a u64 must be refused");
+        assert!(
+            std::format!("{err:?}").contains("element width"),
+            "the refusal should name the element width, but said {err:?}"
+        );
     }
 }
