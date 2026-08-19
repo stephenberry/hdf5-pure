@@ -1019,12 +1019,6 @@ mod tests {
         assert_eq!(chunks[1].address, 0x2000);
     }
 
-    /// `fixed_array_index_spans` must tile exactly the contiguous FAHD + FADB
-    /// blob the writer produces, in both the non-paged and paged regimes and for
-    /// filtered and unfiltered element records. This pins the reclaim sizing to
-    /// `build_fixed_array_at` so the two cannot drift.
-    #[cfg(feature = "std")]
-    #[test]
     /// Every checksummed structure of a Fixed Array is verified on read, by both
     /// backends (issue #312).
     ///
@@ -1143,6 +1137,12 @@ mod tests {
         }
     }
 
+    /// `fixed_array_index_spans` must tile exactly the contiguous FAHD + FADB
+    /// blob the writer produces, in both the non-paged and paged regimes and for
+    /// filtered and unfiltered element records. This pins the reclaim sizing to
+    /// `build_fixed_array_at` so the two cannot drift.
+    #[cfg(feature = "std")]
+    #[test]
     fn index_spans_tile_fixed_array_blob() {
         use crate::chunked_write::{WrittenChunk, build_fixed_array_at};
 

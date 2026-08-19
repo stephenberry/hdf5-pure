@@ -1044,6 +1044,72 @@ fn crash_states_read_back_with_and_without_write_gathering() {
     );
 }
 
+/// A super block is published one data-block pointer at a time, and the *second*
+/// such publish lands in a super block a reader can already see — so a checksum
+/// torn from the pointer it covers is a state a reader reaches, and since #312 a
+/// state it refuses.
+///
+/// The first pointer into a *fresh* super block is not that state. The block
+/// becomes reachable only once the header's element count is published, and by
+/// then its checksum is whole — the ordering hides the window rather than the
+/// reader missing it. So this sweep starts *past* the super block's own
+/// allocation instead of across it, which is what the sweeps positioned at the
+/// warm-up boundary do.
+///
+/// Unbuffered for the reason [`crash_states_read_back_with_and_without_write_gathering`]
+/// gives: a super block is small, so gathering merges the two writes of a split
+/// publish into one and hides exactly what this exists to catch.
+#[test]
+fn publishing_into_a_live_super_block_survives_a_crash_at_every_write() {
+    use crate::image::WriteBuffering;
+
+    /// The round to start recording at. With the C library's defaults a fresh
+    /// data block is allocated at chunk 244 — which is also where the super
+    /// block holding it is created — and the next at 308. Recording 300..=320
+    /// therefore crosses a data-block allocation inside a super block that has
+    /// held live elements since chunk 244.
+    const START_ROUNDS: i32 = 300;
+    const ROUNDS_EACH: i32 = 20;
+    let lo = START_ROUNDS * ROUND;
+    let hi = lo + ROUNDS_EACH * ROUND;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("live_super.h5");
+    warmed_base(&path, false);
+    {
+        let mut s = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+        s.set_sync_policy(SyncPolicy::OnClose);
+        let mut n = WARMUP;
+        while n < lo {
+            append(&mut s, n, ROUND);
+            n += ROUND;
+        }
+        drop(s);
+    }
+
+    let rec = Recording::of("live-super", &path, |p| {
+        let mut s = WriteEngine::open_with_locking(p, FileLocking::Enabled).unwrap();
+        s.set_sync_policy(SyncPolicy::OnClose);
+        s.set_write_buffering(WriteBuffering::Unbuffered).unwrap();
+        for r in 0..ROUNDS_EACH {
+            append(&mut s, lo + r * ROUND, ROUND);
+        }
+        drop(s);
+    });
+    // One data block, and no super block: a window that allocated a super block
+    // would be back at the case the ordering already hides.
+    rec.assert_positioned(1, 0);
+    assert_eq!(
+        rec.super_blocks, 0,
+        "the window must publish *into* a live super block, not allocate one"
+    );
+    rec.replay_every_prefix(
+        dir.path(),
+        |p| appended_prefix_is_intact(p, lo, hi),
+        |p| appended_all_the_way(p, hi),
+    );
+}
+
 /// Bytes of attribute padding that push the dataspace dimension and its
 /// object-header checksum into different gather pages. Measured threshold on the
 /// default 4096-byte page: 3800 still joins, 3900 splits.
