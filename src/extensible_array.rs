@@ -876,6 +876,11 @@ pub(crate) fn extensible_array_index_spans<S: Source + ?Sized>(
             "invalid Extensible Array index block signature".into(),
         ));
     }
+    // The addresses read out of this block become free space, so a block that
+    // fails its checksum is refused here rather than reclaimed from: releasing
+    // a span derived from bytes we cannot trust would hand live storage back to
+    // the allocator.
+    crate::checksum::verify_trailing(&ib)?;
     spans.push((ib_addr, aeib_size as u64));
 
     // Read the index block's direct data-block addresses, then its super-block
@@ -942,16 +947,22 @@ fn easb_data_block_spans<S: Source + ?Sized>(
     elem_size: usize,
     spans: &mut Vec<(u64, u64)>,
 ) -> Result<(), FormatError> {
-    use crate::chunked_write::eadb_size;
+    use crate::chunked_write::{aesb_size, eadb_size};
 
     let os = offset_size as usize;
     let sb_header = 4 + 1 + 1 + os + blk_off_size; // sig + ver + client + hdr_addr + block_offset
-    let sb_sig = source.read_metadata_at(sb_addr, sb_header)?;
-    if &sb_sig[..4] != b"EASB" {
+    // The whole super block in one read: its checksum covers all of it, and the
+    // addresses read out of it become free space, so one that fails is refused
+    // rather than reclaimed from.
+    let sb_len =
+        aesb_size(ndblks, dblk_nelmts, page_nelmts, offset_size, blk_off_size).to_usize()?;
+    let sb = source.read_metadata_at(sb_addr, sb_len)?;
+    if &sb[..4] != b"EASB" {
         return Err(FormatError::ChunkedReadError(
             "invalid Extensible Array super block signature".into(),
         ));
     }
+    crate::checksum::verify_trailing(&sb)?;
 
     // When the super block's data blocks are paged, a page-init bitmap of
     // `ndblks * ceil(npages / 8)` bytes precedes the data-block addresses.
@@ -967,24 +978,9 @@ fn easb_data_block_spans<S: Source + ?Sized>(
     } else {
         0
     };
-    // Read the data-block address table that follows the header and bitmap.
-    let table_addr = sb_addr
-        .checked_add((sb_header + bitmap_size) as u64)
-        .ok_or(FormatError::OffsetOverflow {
-            offset: sb_addr,
-            length: (sb_header + bitmap_size) as u64,
-        })?;
-    let table_len = ndblks
-        .to_usize()?
-        .checked_mul(os)
-        .ok_or(FormatError::OffsetOverflow {
-            offset: ndblks,
-            length: os as u64,
-        })?;
-    let table = source.read_metadata_at(table_addr, table_len)?;
-    let mut pos = 0usize;
+    let mut pos = sb_header + bitmap_size;
     for _ in 0..ndblks {
-        let addr = read_offset(&table, pos, offset_size)?;
+        let addr = read_offset(&sb, pos, offset_size)?;
         pos += os;
         if is_undefined_addr(addr, offset_size) {
             continue;
@@ -2265,11 +2261,19 @@ mod tests {
             let db_prefix = 4 + 1 + 1 + 8 + (header.max_nelmts_bits as usize).div_ceil(8);
             let max_unpaged = db_prefix + page_nelmts * stride + 4;
 
-            let mut poke_sites: Vec<u64> = Vec::new();
+            // Each site is a byte to flip and whether the reclaim walk reads
+            // the structure it belongs to. That walk turns what it reads into
+            // free space, so where it does read one, a corrupt one must stop it
+            // rather than release a span derived from bytes nothing vouched
+            // for. It reads pointers out of the header, index block and super
+            // blocks; it sizes data blocks from the header without reading
+            // them.
+            let mut poke_sites: Vec<(u64, bool)> = Vec::new();
             let mut paged = 0;
             for &(at, len) in &spans {
                 let start = at.to_usize().unwrap();
-                if &file[start..start + 4] == b"EADB" && len as usize > max_unpaged {
+                let kind = &file[start..start + 4];
+                if kind == b"EADB" && len as usize > max_unpaged {
                     paged += 1;
                     // A paged block checksums its prefix on its own and then
                     // each page. Poke the prefix and the *first* page: a
@@ -2277,19 +2281,23 @@ mod tests {
                     // the reader steps over without reading, so its checksum is
                     // not a soundness property and pinning it here would assert
                     // more than the format requires.
-                    poke_sites.push(at + db_prefix as u64 + 4 - 1);
-                    poke_sites.push(at + (max_unpaged + 4) as u64 - 1);
+                    poke_sites.push((at + db_prefix as u64 + 4 - 1, false));
+                    poke_sites.push((at + (max_unpaged + 4) as u64 - 1, false));
                 } else {
                     // The last byte of every other structure is the top byte of
                     // its one trailing checksum.
-                    poke_sites.push(at + len - 1);
+                    poke_sites.push((at + len - 1, kind != b"EADB"));
                 }
             }
             if n == 140000 {
                 assert!(paged > 0, "n={n} must reach a paged data block");
             }
+            assert!(
+                poke_sites.iter().any(|&(_, walked)| walked),
+                "n={n}: the sweep must reach a structure the reclaim walk reads"
+            );
 
-            for site in poke_sites {
+            for (site, walked) in poke_sites {
                 let at = site.to_usize().unwrap();
                 let original = file[at];
                 file[at] ^= 0x01;
@@ -2302,6 +2310,14 @@ mod tests {
                     streamed_err,
                     "n={n}: the streaming backend must refuse what the buffered one does, at {at:#x}"
                 );
+                if walked {
+                    let walk = extensible_array_index_spans(&BytesSource::new(&file), base, 8, 8);
+                    assert!(
+                        matches!(walk, Err(FormatError::ChecksumMismatch { .. })),
+                        "n={n}: the reclaim walk must refuse a corrupt structure at {at:#x} \
+                         rather than release spans read out of it, got {walk:?}"
+                    );
+                }
                 file[at] = original;
             }
         }

@@ -1111,19 +1111,27 @@ mod tests {
                 // checksum -- for a paged data block, of its final page's. The
                 // writer marks every page initialized, so the reader reads them
                 // all and that final checksum is one it verifies.
-                let mut poke_sites: Vec<u64> =
-                    spans.iter().map(|&(at, len)| at + len - 1).collect();
+                // The header is the one structure the reclaim walk reads: it
+                // sizes the data block from the header's own fields without
+                // touching it. A corrupt header must stop that walk rather than
+                // have it release spans computed from bytes nothing vouched for.
+                let mut poke_sites: Vec<(u64, bool)> = spans
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &(at, len))| (at + len - 1, i == 0))
+                    .collect();
                 if n as usize > page_size {
                     let (db_at, _) = spans[1];
                     let bitmap = (n as usize).div_ceil(page_size).div_ceil(8);
                     // The prefix-and-bitmap checksum, then the first page's.
-                    poke_sites.push(db_at + (db_prefix + bitmap + 4) as u64 - 1);
-                    poke_sites.push(
+                    poke_sites.push((db_at + (db_prefix + bitmap + 4) as u64 - 1, false));
+                    poke_sites.push((
                         db_at + (db_prefix + bitmap + 4 + page_size * elem_size + 4) as u64 - 1,
-                    );
+                        false,
+                    ));
                 }
 
-                for site in poke_sites {
+                for (site, walked) in poke_sites {
                     let at = site.to_usize().unwrap();
                     let original = file[at];
                     file[at] ^= 0x01;
@@ -1138,6 +1146,15 @@ mod tests {
                         "filters={has_filters}, n={n}: the streaming backend must refuse what the \
                          buffered one does, at {at:#x}"
                     );
+                    if walked {
+                        let walk = fixed_array_index_spans(&BytesSource::new(&file), base, os, ls);
+                        assert!(
+                            matches!(walk, Err(FormatError::ChecksumMismatch { .. })),
+                            "filters={has_filters}, n={n}: the reclaim walk must refuse a corrupt \
+                             header at {at:#x} rather than release spans read out of it, got \
+                             {walk:?}"
+                        );
+                    }
                     file[at] = original;
                 }
             }
