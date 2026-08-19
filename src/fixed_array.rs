@@ -69,6 +69,8 @@ impl FixedArrayHeader {
         pos += length_size as usize;
         let data_block_address = read_offset(d, pos, offset_size)?;
 
+        crate::checksum::verify_trailing(&d[..min_size])?;
+
         Ok(FixedArrayHeader {
             client_id,
             element_size,
@@ -289,7 +291,24 @@ pub fn read_fixed_array_chunks(
     let mut chunks = Vec::new();
 
     if !is_paged {
-        // Elements stored directly after the data block prefix.
+        // Elements stored directly after the data block prefix, then one
+        // checksum over the prefix and every slot -- including the unallocated
+        // ones, which the writer fills with the undefined address.
+        let db_len = num_elements
+            .checked_mul(elem_size)
+            .and_then(|elems| elems.checked_add(db_header_size + 4))
+            .ok_or(FormatError::OffsetOverflow {
+                offset: num_elements as u64,
+                length: elem_size as u64,
+            })?;
+        if db_len > file_data.len() || db_offset > file_data.len() - db_len {
+            return Err(FormatError::UnexpectedEof {
+                expected: db_offset.saturating_add(db_len),
+                available: file_data.len(),
+            });
+        }
+        crate::checksum::verify_trailing(&file_data[db_offset..db_offset + db_len])?;
+
         let mut pos = db_offset + db_header_size;
         for index in 0..num_elements {
             if let Some(info) = parse_fa_element(
@@ -331,6 +350,8 @@ pub fn read_fixed_array_chunks(
         });
     }
     let bitmap = &file_data[bitmap_pos..bitmap_pos + bitmap_size];
+    // A paged block checksums its prefix and bitmap together, then each page.
+    crate::checksum::verify_trailing(&file_data[db_offset..bitmap_pos + bitmap_size + 4])?;
     let pages_start = bitmap_pos + bitmap_size + 4;
     let page_stride = page_size
         .checked_mul(elem_size)
@@ -355,6 +376,17 @@ pub fn read_fixed_array_chunks(
                 length: page_stride as u64,
             })?;
         let page_start = pages_start + page_offset;
+        // The page checksum follows its elements. Only the last page is
+        // partial: the writer does not pad it, so its checksum covers the
+        // elements it actually holds.
+        let page_end = page_start
+            .checked_add(nelem_in_page * elem_size + 4)
+            .filter(|&end| end <= file_data.len())
+            .ok_or(FormatError::UnexpectedEof {
+                expected: page_start.saturating_add(nelem_in_page * elem_size + 4),
+                available: file_data.len(),
+            })?;
+        crate::checksum::verify_trailing(&file_data[page_start..page_end])?;
         for j in 0..nelem_in_page {
             let index = page * page_size + j;
             let elem_pos = page_start + j * elem_size;
@@ -429,20 +461,21 @@ pub fn read_fixed_array_chunks_from_source<S: Source + ?Sized>(
     let mut chunks = Vec::new();
 
     if !is_paged {
-        // All elements live directly after the prefix; read them in one window.
-        let region = source.read_metadata_at(
-            db_address + db_header_size as u64,
-            num_elements
-                .checked_mul(elem_size)
-                .ok_or(FormatError::OffsetOverflow {
-                    offset: num_elements as u64,
-                    length: elem_size as u64,
-                })?,
-        )?;
+        // The whole block in one window: prefix, every element slot, and the
+        // single checksum over them.
+        let db_len = num_elements
+            .checked_mul(elem_size)
+            .and_then(|elems| elems.checked_add(db_header_size + 4))
+            .ok_or(FormatError::OffsetOverflow {
+                offset: num_elements as u64,
+                length: elem_size as u64,
+            })?;
+        let region = source.read_metadata_at(db_address, db_len)?;
+        crate::checksum::verify_trailing(&region)?;
         for index in 0..num_elements {
             if let Some(info) = parse_fa_element(
                 &region,
-                index * elem_size,
+                db_header_size + index * elem_size,
                 index,
                 header.client_id,
                 chunk_byte_size,
@@ -461,7 +494,11 @@ pub fn read_fixed_array_chunks_from_source<S: Source + ?Sized>(
     let npages = num_elements.div_ceil(page_size);
     let bitmap_size = npages.div_ceil(8);
     let bitmap_addr = db_address + db_header_size as u64;
-    let bitmap = source.read_metadata_at(bitmap_addr, bitmap_size)?;
+    // A paged block checksums its prefix and bitmap together, then each page.
+    let prefix_and_bitmap =
+        source.read_metadata_at(db_address, db_header_size + bitmap_size + 4)?;
+    crate::checksum::verify_trailing(&prefix_and_bitmap)?;
+    let bitmap = prefix_and_bitmap[db_header_size..db_header_size + bitmap_size].to_vec();
     let pages_start_addr = bitmap_addr + bitmap_size as u64 + 4;
     let page_stride = page_size
         .checked_mul(elem_size)
@@ -484,15 +521,20 @@ pub fn read_fixed_array_chunks_from_source<S: Source + ?Sized>(
                 length: page_stride as u64,
             })?;
         let page_addr = pages_start_addr + page_offset as u64;
+        // Elements plus the page's own checksum. Only the last page is partial:
+        // the writer does not pad it, so its checksum covers the elements it
+        // actually holds.
         let region = source.read_metadata_at(
             page_addr,
             nelem_in_page
                 .checked_mul(elem_size)
+                .and_then(|elems| elems.checked_add(4))
                 .ok_or(FormatError::OffsetOverflow {
                     offset: nelem_in_page as u64,
                     length: elem_size as u64,
                 })?,
         )?;
+        crate::checksum::verify_trailing(&region)?;
         for j in 0..nelem_in_page {
             if let Some(info) = parse_fa_element(
                 &region,
@@ -534,6 +576,14 @@ mod tests {
     /// The grid of a dataset with no maximum shape: dense row-major, which is
     /// what these tests read. The numbering rule itself is tested in
     /// [`crate::chunk_grid`]; these tests are about the array structures.
+    use crate::checksum::stamp_trailing as stamp;
+
+    /// FAHD: 8 fixed bytes, the element count, the data-block address, and the
+    /// checksum.
+    const fn fahd_len(os: u8, ls: u8) -> usize {
+        8 + ls as usize + os as usize + 4
+    }
+
     fn dense_grid(dims: &[u64], chunk_dims: &[u32]) -> ChunkGrid {
         let cd: Vec<u64> = chunk_dims.iter().map(|&d| u64::from(d)).collect();
         ChunkGrid::new(&cd, dims, None, crate::chunk_grid::GridOrder::RowMajor).unwrap()
@@ -603,7 +653,7 @@ mod tests {
         buf[8..16].copy_from_slice(&5u64.to_le_bytes());
         // data_block_address (offset_size=8)
         buf[16..24].copy_from_slice(&0x1000u64.to_le_bytes());
-        // checksum (4 bytes, we don't validate in parse)
+        stamp(&mut buf, 0, fahd_len(8, 8));
 
         let header = FixedArrayHeader::parse(&buf, 0, 8, 8).unwrap();
         assert_eq!(header.client_id, 1);
@@ -651,6 +701,11 @@ mod tests {
         file_data[fahd_offset + 8..fahd_offset + 16].copy_from_slice(&num_chunks.to_le_bytes());
         file_data[fahd_offset + 16..fahd_offset + 24]
             .copy_from_slice(&(db_offset as u64).to_le_bytes());
+        stamp(
+            &mut file_data,
+            fahd_offset,
+            fahd_len(offset_size, length_size),
+        );
 
         // Build FADB at db_offset
         file_data[db_offset..db_offset + 4].copy_from_slice(b"FADB");
@@ -668,6 +723,13 @@ mod tests {
             let pos = elem_start + i * os;
             file_data[pos..pos + os].copy_from_slice(&addr.to_le_bytes());
         }
+
+        // Prefix, one address per element slot, checksum.
+        stamp(
+            &mut file_data,
+            db_offset,
+            (6 + os) + num_chunks as usize * os + 4,
+        );
 
         let header =
             FixedArrayHeader::parse(&file_data, fahd_offset, offset_size, length_size).unwrap();
@@ -788,6 +850,11 @@ mod tests {
         file_data[fahd_offset + 8..fahd_offset + 16].copy_from_slice(&num_chunks.to_le_bytes());
         file_data[fahd_offset + 16..fahd_offset + 24]
             .copy_from_slice(&(db_offset as u64).to_le_bytes());
+        stamp(
+            &mut file_data,
+            fahd_offset,
+            fahd_len(offset_size, length_size),
+        );
 
         file_data[db_offset..db_offset + 4].copy_from_slice(b"FADB");
         file_data[db_offset + 4] = 0;
@@ -809,6 +876,13 @@ mod tests {
             file_data[pos + os..pos + os + 4].copy_from_slice(&csize.to_le_bytes());
             file_data[pos + os + 4..pos + os + 8].copy_from_slice(&fmask.to_le_bytes());
         }
+
+        // Prefix, one filtered element record per slot, checksum.
+        stamp(
+            &mut file_data,
+            db_offset,
+            (6 + os) + num_chunks as usize * elem_size + 4,
+        );
 
         let header =
             FixedArrayHeader::parse(&file_data, fahd_offset, offset_size, length_size).unwrap();
@@ -864,6 +938,11 @@ mod tests {
         file_data[fahd_offset + 8..fahd_offset + 16].copy_from_slice(&num_chunks.to_le_bytes());
         file_data[fahd_offset + 16..fahd_offset + 24]
             .copy_from_slice(&(db_offset as u64).to_le_bytes());
+        stamp(
+            &mut file_data,
+            fahd_offset,
+            fahd_len(offset_size, length_size),
+        );
 
         // FADB prefix: sig + version + client_id + header_addr + bitmap + checksum
         file_data[db_offset..db_offset + 4].copy_from_slice(b"FADB");
@@ -872,7 +951,8 @@ mod tests {
         file_data[db_offset + 6..db_offset + 14]
             .copy_from_slice(&(fahd_offset as u64).to_le_bytes());
         file_data[db_offset + 14] = bitmap; // page-init bitmap (1 byte for 2 pages)
-        // checksum at db_offset+15..+19 left zero (reader does not validate)
+        // A paged block checksums its prefix and bitmap together.
+        stamp(&mut file_data, db_offset, 6 + os + 1 + 4);
 
         // Pages: stride = page_size(2)*elem_size(8) + 4 checksum = 20 bytes.
         let pages_start = db_offset + 14 + 1 + 4;
@@ -884,6 +964,11 @@ mod tests {
             let pos = pages_start + page * stride + j * os;
             file_data[pos..pos + os].copy_from_slice(&addr.to_le_bytes());
         }
+        // Each page carries its own checksum after its elements. Page 0 is
+        // full at two slots; page 1 holds the array's odd third and is not
+        // padded, so its checksum sits one slot in.
+        stamp(&mut file_data, pages_start, 2 * os + 4);
+        stamp(&mut file_data, pages_start + stride, os + 4);
 
         let header =
             FixedArrayHeader::parse(&file_data, fahd_offset, offset_size, length_size).unwrap();

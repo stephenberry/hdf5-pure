@@ -1932,6 +1932,10 @@ mod tests {
             .expect("a filtered unlimited dataset is indexed by an extensible array");
         assert_eq!(bytes[at + 6], 14, "the writer's own element width moved");
         bytes[at + 6] = 30;
+        // Restamp the header. Its checksum covers this field, so leaving it
+        // stale would have the reader refuse the file for being corrupt before
+        // it ever reached the width guard under test.
+        crate::checksum::stamp_trailing(&mut bytes, at, 12 + 6 * 8 + 8 + 4);
         std::fs::write(&path, &bytes).unwrap();
 
         let f = crate::reader::File::open_rw(&path).unwrap();
