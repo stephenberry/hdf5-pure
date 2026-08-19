@@ -1025,6 +1025,124 @@ mod tests {
     /// `build_fixed_array_at` so the two cannot drift.
     #[cfg(feature = "std")]
     #[test]
+    /// Every checksummed structure of a Fixed Array is verified on read, by both
+    /// backends (issue #312).
+    ///
+    /// The array has two: the header and its one data block, which when paged
+    /// checksums its prefix and bitmap together and then each page separately.
+    /// Each is corrupted in its stored checksum -- bytes that carry no other
+    /// meaning, so a refusal can only be the checksum. Before this the reader
+    /// returned the same chunk list it did for the sound file.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_corrupted_fixed_array_structure_is_refused() {
+        use crate::chunked_write::{WrittenChunk, build_fixed_array_at};
+        use crate::source::BytesSource;
+
+        let os: u8 = 8;
+        let ls: u8 = 8;
+        let base = 0x800u64;
+        for has_filters in [false, true] {
+            // 1024 = the page size, so 1025 and 3000 are paged: 3000 also
+            // leaves a partial final page, which the writer does not pad.
+            for &n in &[5u64, 1024, 1025, 3000] {
+                let chunks: Vec<WrittenChunk> = (0..n)
+                    .map(|i| WrittenChunk {
+                        address: 0x100000 + i * 8,
+                        compressed_size: if has_filters { 8 + (i % 7) } else { 8 },
+                        filter_mask: 0,
+                    })
+                    .collect();
+                let fa = build_fixed_array_at(
+                    &crate::chunked_write::IndexSlots::dense(&chunks),
+                    8,
+                    os,
+                    ls,
+                    has_filters,
+                    base,
+                );
+                let mut file = vec![0u8; base as usize + fa.len()];
+                file[base as usize..].copy_from_slice(&fa);
+
+                let chunk_dims = vec![1u32];
+                let read_both = |file: &[u8]| -> (Result<Vec<ChunkInfo>, FormatError>, bool) {
+                    let grid = dense_grid(&[n], &chunk_dims);
+                    let buffered =
+                        FixedArrayHeader::parse(file, base as usize, os, ls).and_then(|h| {
+                            read_fixed_array_chunks(file, &h, &grid, &chunk_dims, 8, os, ls)
+                        });
+                    let mem = BytesSource::new(file);
+                    let streamed = FixedArrayHeader::parse_from_source(&mem, base, os, ls)
+                        .and_then(|h| {
+                            read_fixed_array_chunks_from_source(
+                                &mem,
+                                &h,
+                                &grid,
+                                &chunk_dims,
+                                8,
+                                os,
+                                ls,
+                            )
+                        });
+                    (buffered, streamed.is_err())
+                };
+                let sound = read_both(&file).0.expect("the sound file must read");
+                assert_eq!(
+                    sound.len() as u64,
+                    n,
+                    "the fixture must read before it is corrupted (filters={has_filters}, n={n})"
+                );
+
+                let spans =
+                    fixed_array_index_spans(&BytesSource::new(&file), base, os, ls).unwrap();
+                assert_eq!(spans.len(), 2, "FA index = FAHD + FADB");
+
+                let header = FixedArrayHeader::parse(&file, base as usize, os, ls).unwrap();
+                let elem_size = if has_filters {
+                    header.element_size as usize
+                } else {
+                    os as usize
+                };
+                let page_size = 1usize << header.max_nelmts_bits;
+                let db_prefix = 4 + 1 + 1 + os as usize;
+
+                // The last byte of a structure is the top byte of its trailing
+                // checksum -- for a paged data block, of its final page's. The
+                // writer marks every page initialized, so the reader reads them
+                // all and that final checksum is one it verifies.
+                let mut poke_sites: Vec<u64> =
+                    spans.iter().map(|&(at, len)| at + len - 1).collect();
+                if n as usize > page_size {
+                    let (db_at, _) = spans[1];
+                    let bitmap = (n as usize).div_ceil(page_size).div_ceil(8);
+                    // The prefix-and-bitmap checksum, then the first page's.
+                    poke_sites.push(db_at + (db_prefix + bitmap + 4) as u64 - 1);
+                    poke_sites.push(
+                        db_at + (db_prefix + bitmap + 4 + page_size * elem_size + 4) as u64 - 1,
+                    );
+                }
+
+                for site in poke_sites {
+                    let at = site.to_usize().unwrap();
+                    let original = file[at];
+                    file[at] ^= 0x01;
+                    let (buffered, streamed_err) = read_both(&file);
+                    assert!(
+                        matches!(buffered, Err(FormatError::ChecksumMismatch { .. })),
+                        "filters={has_filters}, n={n}: a corrupted checksum at {at:#x} must be \
+                         refused, got {buffered:?}"
+                    );
+                    assert!(
+                        streamed_err,
+                        "filters={has_filters}, n={n}: the streaming backend must refuse what the \
+                         buffered one does, at {at:#x}"
+                    );
+                    file[at] = original;
+                }
+            }
+        }
+    }
+
     fn index_spans_tile_fixed_array_blob() {
         use crate::chunked_write::{WrittenChunk, build_fixed_array_at};
 

@@ -2131,6 +2131,128 @@ mod tests {
         );
     }
 
+    /// Every checksummed structure of an Extensible Array is verified on read,
+    /// by both backends (issue #312).
+    ///
+    /// The array is walked by [`extensible_array_index_spans`], so the sweep
+    /// reaches whatever the writer laid down rather than a list written here:
+    /// the header, the index block, every super block, and every data block,
+    /// paged and not. Each is corrupted in its stored checksum and, for a paged
+    /// data block, in the separate checksum over its prefix -- bytes that carry
+    /// no other meaning, so a refusal can only be the checksum. Before this the
+    /// reader returned the same chunk list it did for the sound file.
+    #[cfg(feature = "std")]
+    #[test]
+    fn a_corrupted_extensible_array_structure_is_refused() {
+        use crate::chunked_write::{WrittenChunk, build_extensible_array_at};
+        use crate::source::BytesSource;
+
+        // The same progression as `streaming_ea_super_blocks_and_paged_match_buffered`:
+        // inline and direct blocks, then super blocks, then paged data blocks.
+        for &n in &[2000u64, 50000, 140000] {
+            let chunks: Vec<WrittenChunk> = (0..n)
+                .map(|i| WrittenChunk {
+                    address: 0x10 + i * 8,
+                    compressed_size: 8,
+                    filter_mask: 0,
+                })
+                .collect();
+            let base = 0x1000u64;
+            let ea = build_extensible_array_at(
+                &crate::chunked_write::IndexSlots::dense(&chunks),
+                8,
+                8,
+                8,
+                false,
+                base,
+            )
+            .unwrap();
+            let mut file = vec![0u8; base as usize + ea.len()];
+            file[base as usize..].copy_from_slice(&ea);
+
+            let ds_dims = vec![n];
+            let chunk_dims = vec![1u32];
+            let read_both = |file: &[u8]| -> (Result<Vec<ChunkInfo>, FormatError>, bool) {
+                let grid = dense_grid(&ds_dims, &chunk_dims);
+                let buffered =
+                    ExtensibleArrayHeader::parse(file, base as usize, 8, 8).and_then(|h| {
+                        read_extensible_array_chunks(file, &h, &grid, &chunk_dims, 8, 8, 8)
+                    });
+                let mem = BytesSource::new(file);
+                let streamed =
+                    ExtensibleArrayHeader::parse_from_source(&mem, base, 8, 8).and_then(|h| {
+                        read_extensible_array_chunks_from_source(
+                            &mem,
+                            &h,
+                            &grid,
+                            &chunk_dims,
+                            8,
+                            8,
+                            8,
+                        )
+                    });
+                (buffered, streamed.is_err())
+            };
+            assert_eq!(
+                read_both(&file).0.expect("the sound file must read").len() as u64,
+                n,
+                "the fixture must read before it is corrupted, at n={n}"
+            );
+
+            let spans = extensible_array_index_spans(&BytesSource::new(&file), base, 8, 8).unwrap();
+            assert!(spans.len() > 1, "the sweep must reach past the header");
+
+            let header = ExtensibleArrayHeader::parse(&file, base as usize, 8, 8).unwrap();
+            let stride = ea_elem_stride(&header, 8);
+            let page_nelmts = 1usize << header.max_dblk_nelmts_bits;
+            // A data block's bytes before any checksum, and the largest an
+            // unpaged one can be -- a paged block is always longer, since it
+            // holds at least two full pages.
+            let db_prefix = 4 + 1 + 1 + 8 + (header.max_nelmts_bits as usize).div_ceil(8);
+            let max_unpaged = db_prefix + page_nelmts * stride + 4;
+
+            let mut poke_sites: Vec<u64> = Vec::new();
+            let mut paged = 0;
+            for &(at, len) in &spans {
+                let start = at.to_usize().unwrap();
+                if &file[start..start + 4] == b"EADB" && len as usize > max_unpaged {
+                    paged += 1;
+                    // A paged block checksums its prefix on its own and then
+                    // each page. Poke the prefix and the *first* page: a
+                    // trailing page the bitmap never marked initialized is one
+                    // the reader steps over without reading, so its checksum is
+                    // not a soundness property and pinning it here would assert
+                    // more than the format requires.
+                    poke_sites.push(at + db_prefix as u64 + 4 - 1);
+                    poke_sites.push(at + (max_unpaged + 4) as u64 - 1);
+                } else {
+                    // The last byte of every other structure is the top byte of
+                    // its one trailing checksum.
+                    poke_sites.push(at + len - 1);
+                }
+            }
+            if n == 140000 {
+                assert!(paged > 0, "n={n} must reach a paged data block");
+            }
+
+            for site in poke_sites {
+                let at = site.to_usize().unwrap();
+                let original = file[at];
+                file[at] ^= 0x01;
+                let (buffered, streamed_err) = read_both(&file);
+                assert!(
+                    matches!(buffered, Err(FormatError::ChecksumMismatch { .. })),
+                    "n={n}: a corrupted checksum at {at:#x} must be refused, got {buffered:?}"
+                );
+                assert!(
+                    streamed_err,
+                    "n={n}: the streaming backend must refuse what the buffered one does, at {at:#x}"
+                );
+                file[at] = original;
+            }
+        }
+    }
+
     /// `extensible_array_index_spans` must account for exactly the index
     /// structure the writer lays down: its total must equal the header, index
     /// block, and the super-/data-block bytes recorded in the EAHD statistics,
