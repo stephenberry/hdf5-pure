@@ -1096,8 +1096,10 @@ fn publishing_into_a_live_super_block_survives_a_crash_at_every_write() {
         }
         drop(s);
     });
-    // One data block, and no super block: a window that allocated a super block
-    // would be back at the case the ordering already hides.
+    // A floor of one data-block allocation. `assert_positioned` states only
+    // floors, so the super-block *ceiling* is its own assertion: a window that
+    // allocated one would be back at the case the ordering already hides, and
+    // would sweep clean however the publish were written.
     rec.assert_positioned(1, 0);
     assert_eq!(
         rec.super_blocks, 0,
