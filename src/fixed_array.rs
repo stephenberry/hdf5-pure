@@ -428,13 +428,18 @@ pub fn read_fixed_array_chunks_from_source<S: Source + ?Sized>(
     let os = offset_size as usize;
     let db_header_size = 4 + 1 + 1 + os;
 
-    // Data block prefix: FADB(4) + version(1) + client_id(1) + header_address.
-    let prefix = source.read_metadata_at(db_address, db_header_size)?;
-    if &prefix[0..4] != b"FADB" {
-        return Err(FormatError::ChunkedReadError(
-            "invalid Fixed Array data block signature".into(),
-        ));
-    }
+    // Both branches below read from the start of the data block, so its prefix
+    // -- FADB(4) + version(1) + client_id(1) + header_address -- arrives with
+    // the bytes they verify the checksum over, and the signature is checked
+    // there rather than in a read of its own.
+    let signature = |block: &[u8]| -> Result<(), FormatError> {
+        if &block[0..4] != b"FADB" {
+            return Err(FormatError::ChunkedReadError(
+                "invalid Fixed Array data block signature".into(),
+            ));
+        }
+        Ok(())
+    };
 
     let chunk_size_bytes = if header.client_id == 0 {
         0
@@ -471,6 +476,7 @@ pub fn read_fixed_array_chunks_from_source<S: Source + ?Sized>(
                 length: elem_size as u64,
             })?;
         let region = source.read_metadata_at(db_address, db_len)?;
+        signature(&region)?;
         crate::checksum::verify_trailing(&region)?;
         for index in 0..num_elements {
             if let Some(info) = parse_fa_element(
@@ -497,6 +503,7 @@ pub fn read_fixed_array_chunks_from_source<S: Source + ?Sized>(
     // A paged block checksums its prefix and bitmap together, then each page.
     let prefix_and_bitmap =
         source.read_metadata_at(db_address, db_header_size + bitmap_size + 4)?;
+    signature(&prefix_and_bitmap)?;
     crate::checksum::verify_trailing(&prefix_and_bitmap)?;
     let bitmap = prefix_and_bitmap[db_header_size..db_header_size + bitmap_size].to_vec();
     let pages_start_addr = bitmap_addr + bitmap_size as u64 + 4;

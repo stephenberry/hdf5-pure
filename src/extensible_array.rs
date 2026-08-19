@@ -381,17 +381,18 @@ fn read_data_block_elements(
     Ok(chunks)
 }
 
-/// Test whether page `page_idx` is initialized in a super-block page-init
-/// bitmap. The bitmap is a contiguous, MSB-first bit stream: page 0 is bit 7 of
-/// byte 0, page 1 is bit 6, page 8 is bit 7 of byte 1, and so on.
 /// On-disk extent of a *non-paged* Extensible Array data block (`EADB`): the
 /// prefix, one record per element slot, and the trailing checksum that covers
 /// them.
 ///
 /// Every slot is written when the block is allocated, so this is fixed by the
 /// block's element count and does not shrink for a read that decodes fewer.
-/// [`crate::chunked_write::eadb_size`] is the writer's side of the same rule;
-/// `eadb_extent_matches_the_writer` pins them together.
+///
+/// [`crate::chunked_write::eadb_size`] states the same rule for the writer, and
+/// deliberately stays a separate function: it sizes a block from an in-memory
+/// write request, which is bounded, while this one sizes it from a header
+/// parsed out of a file, which is not — hence the checked arithmetic.
+/// `eadb_extent_matches_the_writer` holds the two to the same answer.
 fn eadb_extent(
     nelmts: usize,
     header: &ExtensibleArrayHeader,
@@ -408,6 +409,9 @@ fn eadb_extent(
         })
 }
 
+/// Test whether page `page_idx` is initialized in a super-block page-init
+/// bitmap. The bitmap is a contiguous, MSB-first bit stream: page 0 is bit 7 of
+/// byte 0, page 1 is bit 6, page 8 is bit 7 of byte 1, and so on.
 fn page_is_initialized(bitmap: &[u8], page_idx: usize) -> bool {
     let byte = page_idx / 8;
     let mask = 0x80u8 >> (page_idx % 8);
@@ -1889,6 +1893,56 @@ mod tests {
     }
 
     /// Test serialized_size computation.
+    /// [`eadb_extent`] must agree with [`crate::chunked_write::eadb_size`], the
+    /// writer's own sizing, for every non-paged block.
+    ///
+    /// Not the thing that catches a divergence: a reader that sizes a block
+    /// four bytes short of the writer hashes the wrong bytes and refuses every
+    /// sound file, which reddens twenty-eight tests here. What this adds is the
+    /// name of the rule that broke, and the widths a round trip does not write
+    /// — a 4-byte-offset file, a 32-bit block-offset field, and a block of no
+    /// elements at all.
+    #[test]
+    fn eadb_extent_matches_the_writer() {
+        for &(client_id, element_size) in &[(0u8, 8u8), (1, 20)] {
+            for &offset_size in &[4u8, 8] {
+                for &max_nelmts_bits in &[10u8, 16, 32] {
+                    let header = ExtensibleArrayHeader {
+                        client_id,
+                        element_size,
+                        max_nelmts_bits,
+                        idx_blk_elmts: 4,
+                        min_dblk_nelmts: 4,
+                        super_blk_min_nelmts: 2,
+                        max_dblk_nelmts_bits: 10,
+                        num_elements: 0,
+                        index_block_address: 0,
+                    };
+                    let blk_off = (max_nelmts_bits as usize).div_ceil(8);
+                    let stride = ea_elem_stride(&header, offset_size);
+                    let page_nelmts = 1u64 << header.max_dblk_nelmts_bits;
+                    // Every count a non-paged block can have, up to the page
+                    // size that would make it paged instead.
+                    for nelmts in [0u64, 1, 2, 4, 16, 64, 255, 256, 1023, page_nelmts] {
+                        assert_eq!(
+                            eadb_extent(nelmts as usize, &header, offset_size, blk_off).unwrap()
+                                as u64,
+                            crate::chunked_write::eadb_size(
+                                nelmts,
+                                stride,
+                                page_nelmts,
+                                offset_size,
+                                blk_off,
+                            ),
+                            "client={client_id} os={offset_size} bits={max_nelmts_bits} \
+                             nelmts={nelmts}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn header_serialized_size() {
         // 12 fixed + 6*8 stats + 8 addr + 4 checksum = 72
