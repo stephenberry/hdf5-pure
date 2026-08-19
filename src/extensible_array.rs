@@ -2191,7 +2191,10 @@ mod tests {
     /// data block, in the separate checksum over its prefix -- bytes that carry
     /// no other meaning, so a refusal can only be the checksum. Before this the
     /// reader returned the same chunk list it did for the sound file.
-    #[cfg(feature = "std")]
+    /// Refusal is what the `checksum` feature buys, so this asserts it only
+    /// where it is compiled in: with the feature off `verify_trailing` is a
+    /// no-op and a corrupt index reads as it did before.
+    #[cfg(all(feature = "std", feature = "checksum"))]
     #[test]
     fn a_corrupted_extensible_array_structure_is_refused() {
         use crate::chunked_write::{WrittenChunk, build_extensible_array_at};
