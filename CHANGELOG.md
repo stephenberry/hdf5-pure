@@ -10,10 +10,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - A read-write session issues far fewer writes for the same file: one per dirty page, gathered across the many small writes a commit or in-place append makes. A session of 32 chunk appends issued 160 writes where it once made 448, with no change to the bytes on disk or to what a failed write leaves behind, and the SWMR writer gathers nothing ([#288](https://github.com/stephenberry/hdf5-pure/issues/288)).
 - The typed whole-dataset readers (`Dataset::read_f64` and its eight siblings) decode a row window at a time instead of the whole dataset at once, so peak memory is the values they return plus about a mebibyte rather than twice the dataset: an 8 MiB `f64` dataset peaked at 16.8 MB and now peaks at 10.1 MB ([#289](https://github.com/stephenberry/hdf5-pure/issues/289)).
+- An in-place append that is not write-gathered — an unbuffered session and every SWMR append — costs 8 writes where it cost 12, since each checksummed structure is now published in a single write ([#307](https://github.com/stephenberry/hdf5-pure/issues/307)).
 - A row window takes only its own chunks out of the cached chunk index rather than the whole index, so reading a dataset window by window costs a constant per chunk instead of one allocation per chunk of the dataset per window ([#289](https://github.com/stephenberry/hdf5-pure/issues/289)).
 
 ### Fixed
 
+- Appending in place to a dataset whose Extensible Array header names an element wider than the fields it holds is refused rather than panicking. Only a corrupt or crafted file reaches it; the whole-file read path already refused the same header ([#307](https://github.com/stephenberry/hdf5-pure/issues/307)).
+- An interrupted in-place append no longer leaves a dataset unreadable. A value and the checksum covering it are published in one write, where they were two that only became atomic when they shared a file-space page — so a dataset whose object header exceeded one page, such as a compound type with many members or a few string attributes, tore on every append ([#307](https://github.com/stephenberry/hdf5-pure/issues/307)).
 - A paged file (`FileSpaceStrategy::Page`) stops growing under delete-and-recreate churn: the free-space managers a commit rewrites are placed in free space rather than in a fresh page whose remainder nothing recorded, which cost a page per commit. A wholly free page can also be reopened for the other page type, so space a delete released is no longer stranded for the kind of data that released it ([#286](https://github.com/stephenberry/hdf5-pure/issues/286)).
 
 ## [0.39.0] - 2026-08-17

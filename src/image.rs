@@ -102,11 +102,13 @@ pub(crate) enum WriteBuffering {
     /// them — but it is why the argument above rests on the contract rather than
     /// on the lock.
     ///
-    /// One thing it does not repair, because it never held: a publish point that
-    /// is itself two writes — a value and the checksum covering it — is atomic
-    /// only when both land in one page. Gathering makes that *more* often true
-    /// than straight-through writing did, and true for every object header this
-    /// crate's own writer produces, but not universally.
+    /// It is not what makes a publish point atomic, and was never able to be. A
+    /// value and the checksum covering it, written separately, would join here
+    /// only when both landed in one page; a structure wider than that published
+    /// the new value under the old checksum whichever mode was in force. That was
+    /// issue #307, and the fix was to write such a structure once from the engine
+    /// rather than to widen what this merges — so the guarantee now holds under
+    /// [`Unbuffered`](WriteBuffering::Unbuffered) too.
     Operation { page_size: u64, max_bytes: usize },
 }
 
