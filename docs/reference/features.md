@@ -9,7 +9,7 @@ For how to declare these in `Cargo.toml`, see [Installation](../getting-started/
 | Feature | Default | Pulls in | Implies | Description |
 |---|---|---|---|---|
 | `std` | yes | — | — | File I/O and the high-level reader/writer API |
-| `checksum` | yes | — | — | Jenkins hash for v2+ object headers |
+| `checksum` | yes | — | — | Jenkins hash validating checksummed metadata |
 | `deflate` | yes | `flate2` (rust backend) | — | Deflate (zlib) compression, pure-Rust backend |
 | `serde` | no | `serde` | `std` | Serialize/deserialize MATLAB v7.3 `.mat` files via serde |
 | `fast-deflate` | no | `flate2/zlib-ng` | — | zlib-ng backend for deflate |
@@ -32,7 +32,7 @@ Enables the standard library. This brings in the entire high-level reader and wr
 
 ### `checksum`
 
-Enables the Jenkins lookup3 hash used to validate and emit checksums in version 2 and later object headers. It has no extra dependency. Keep this enabled for broad compatibility with files the reference HDF5 C library and h5py produce; it is also the one feature you should keep when targeting WASM (see below).
+Enables the Jenkins lookup3 hash used to validate and emit the checksums HDF5 puts on its metadata: version 2 and later object headers, the superblock, version 2 B-tree nodes, fractal heaps, and the Extensible-Array and Fixed-Array chunk indexes. It has no extra dependency. Keep this enabled for broad compatibility with files the reference HDF5 C library and h5py produce; it is also the one feature you should keep when targeting WASM (see below).
 
 ### `deflate`
 

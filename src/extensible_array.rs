@@ -110,6 +110,8 @@ impl ExtensibleArrayHeader {
         pos += ls; // skip [5] nelmts
         let index_block_address = read_offset(d, pos, offset_size)?;
 
+        crate::checksum::verify_trailing(&d[..min_size])?;
+
         Ok(ExtensibleArrayHeader {
             client_id,
             element_size,
@@ -326,22 +328,27 @@ fn read_data_block_elements(
 ) -> Result<Vec<ChunkInfo>, FormatError> {
     // AEDB: signature(4) + version(1) + client_id(1) + header_address(offset_size)
     let db_header_size = 4 + 1 + 1 + offset_size as usize;
-    if db_header_size > file_data.len() || db_offset > file_data.len() - db_header_size {
+    // Block offset is encoded in ceil(max_nelmts_bits/8) bytes.
+    let blk_off_size = (header.max_nelmts_bits as usize).div_ceil(8);
+    // The block's checksum covers all `nelmts` slots, not just the ones this
+    // read decodes, so the extent is the writer's -- every slot is written when
+    // the block is allocated, whether or not a chunk occupies it.
+    let db_len = eadb_extent(nelmts, header, offset_size, blk_off_size)?;
+    if db_len > file_data.len() || db_offset > file_data.len() - db_len {
         return Err(FormatError::UnexpectedEof {
-            expected: db_offset.saturating_add(db_header_size),
+            expected: db_offset.saturating_add(db_len),
             available: file_data.len(),
         });
     }
 
-    let d = &file_data[db_offset..];
+    let d = &file_data[db_offset..db_offset + db_len];
     if &d[0..4] != b"EADB" {
         return Err(FormatError::ChunkedReadError(
             "invalid Extensible Array data block signature".into(),
         ));
     }
+    crate::checksum::verify_trailing(d)?;
     // Skip version(1) + client_id(1) + header_address(offset_size) + block_offset
-    // Block offset is encoded in ceil(max_nelmts_bits/8) bytes
-    let blk_off_size = (header.max_nelmts_bits as usize).div_ceil(8);
     let mut pos = db_offset + db_header_size + blk_off_size;
 
     // Direct data blocks and non-paged super-block data blocks store their
@@ -372,6 +379,34 @@ fn read_data_block_elements(
     }
 
     Ok(chunks)
+}
+
+/// On-disk extent of a *non-paged* Extensible Array data block (`EADB`): the
+/// prefix, one record per element slot, and the trailing checksum that covers
+/// them.
+///
+/// Every slot is written when the block is allocated, so this is fixed by the
+/// block's element count and does not shrink for a read that decodes fewer.
+///
+/// [`crate::chunked_write::eadb_size`] states the same rule for the writer, and
+/// deliberately stays a separate function: it sizes a block from an in-memory
+/// write request, which is bounded, while this one sizes it from a header
+/// parsed out of a file, which is not — hence the checked arithmetic.
+/// `eadb_extent_matches_the_writer` holds the two to the same answer.
+fn eadb_extent(
+    nelmts: usize,
+    header: &ExtensibleArrayHeader,
+    offset_size: u8,
+    blk_off_size: usize,
+) -> Result<usize, FormatError> {
+    let elem_stride = ea_elem_stride(header, offset_size);
+    nelmts
+        .checked_mul(elem_stride)
+        .and_then(|elems| elems.checked_add(4 + 1 + 1 + offset_size as usize + blk_off_size + 4))
+        .ok_or(FormatError::OffsetOverflow {
+            offset: nelmts as u64,
+            length: elem_stride as u64,
+        })
 }
 
 /// Test whether page `page_idx` is initialized in a super-block page-init
@@ -427,6 +462,8 @@ fn read_paged_data_block(
             "invalid Extensible Array data block signature".into(),
         ));
     }
+    // A paged block checksums its header on its own, then each page separately.
+    crate::checksum::verify_trailing(&file_data[db_offset..db_offset + db_header_size])?;
 
     let mut chunks = Vec::new();
     let mut pos = db_offset + db_header_size;
@@ -449,6 +486,16 @@ fn read_paged_data_block(
             pos += page_stride;
             continue;
         }
+        // The page's checksum covers all `page_nelmts` slots, including any
+        // beyond the published count that this read stops short of decoding.
+        let page_end = pos
+            .checked_add(page_stride)
+            .filter(|&end| end <= file_data.len())
+            .ok_or(FormatError::UnexpectedEof {
+                expected: pos.saturating_add(page_stride),
+                available: file_data.len(),
+            })?;
+        crate::checksum::verify_trailing(&file_data[pos..page_end])?;
         let page_start = start_index + page * page_nelmts;
         // Ignore element slots beyond the published count; see the same bound
         // in `read_data_block_elements`.
@@ -497,22 +544,36 @@ pub fn read_extensible_array_chunks(
     let chunk_byte_size: u64 =
         chunk_dimensions.iter().map(|&d| d as u64).product::<u64>() * element_size as u64;
 
-    // Parse index block (AEIB)
+    // Derive the (shared) extensible-array geometry from the header. This is
+    // the same progression the writer uses, so reader and writer cannot drift.
+    let geom = EaGeometry::from_header(header);
+
+    // Parse index block (AEIB). Its length is fixed by the geometry -- every
+    // inline slot and every block pointer is always written -- so the whole
+    // block, checksum included, can be bounded before anything in it is read.
     let ib_offset = header.index_block_address.to_usize()?;
     let ib_header_size = 4 + 1 + 1 + offset_size as usize; // sig + ver + client + hdr_addr
-    if ib_header_size > file_data.len() || ib_offset > file_data.len() - ib_header_size {
+    let ib_len = crate::chunked_write::aeib_size(
+        offset_size,
+        header.idx_blk_elmts as usize,
+        ea_elem_stride(header, offset_size),
+        geom.direct_dblk_nelmts.len(),
+        geom.nsblk_addrs,
+    );
+    if ib_len > file_data.len() || ib_offset > file_data.len() - ib_len {
         return Err(FormatError::UnexpectedEof {
-            expected: ib_offset.saturating_add(ib_header_size),
+            expected: ib_offset.saturating_add(ib_len),
             available: file_data.len(),
         });
     }
 
-    let ib = &file_data[ib_offset..];
+    let ib = &file_data[ib_offset..ib_offset + ib_len];
     if &ib[0..4] != b"EAIB" {
         return Err(FormatError::ChunkedReadError(
             "invalid Extensible Array index block signature".into(),
         ));
     }
+    crate::checksum::verify_trailing(ib)?;
     // Skip version(1) + client_id(1) + header_address(offset_size)
     let mut pos = ib_offset + ib_header_size;
 
@@ -555,10 +616,6 @@ pub fn read_extensible_array_chunks(
     if global_index >= total_elements {
         return Ok(chunks);
     }
-
-    // Derive the (shared) extensible-array geometry from the header. This is
-    // the same progression the writer uses, so reader and writer cannot drift.
-    let geom = EaGeometry::from_header(header);
 
     // 2. Direct data blocks: their addresses are listed in the index block,
     //    one per entry in `geom.direct_dblk_nelmts`.
@@ -649,20 +706,6 @@ fn read_super_block(
     //       + checksum
     let blk_off_size = (header.max_nelmts_bits as usize).div_ceil(8);
     let sb_header_size = 4 + 1 + 1 + os + blk_off_size;
-    if sb_header_size > file_data.len() || sb_offset > file_data.len() - sb_header_size {
-        return Err(FormatError::UnexpectedEof {
-            expected: sb_offset.saturating_add(sb_header_size),
-            available: file_data.len(),
-        });
-    }
-
-    if &file_data[sb_offset..sb_offset + 4] != b"EASB" {
-        return Err(FormatError::ChunkedReadError(
-            "invalid Extensible Array super block signature".into(),
-        ));
-    }
-
-    let mut pos = sb_offset + sb_header_size;
 
     // A super block's data blocks are paged when their element count exceeds
     // the page size. When paged, a page-init bitmap precedes the data block
@@ -675,14 +718,44 @@ fn read_super_block(
     } else {
         0
     };
+    let bitmap_size = if is_paged {
+        ndblks
+            .checked_mul(npages.div_ceil(8))
+            .ok_or(FormatError::OffsetOverflow {
+                offset: ndblks as u64,
+                length: npages.div_ceil(8) as u64,
+            })?
+    } else {
+        0
+    };
+
+    // The whole super block -- header, bitmap, every data-block pointer, and
+    // the checksum over them -- is fixed by the geometry, so it is bounded
+    // before anything in it is read.
+    let sb_len = ndblks
+        .checked_mul(os)
+        .and_then(|addrs| addrs.checked_add(sb_header_size + bitmap_size + 4))
+        .ok_or(FormatError::OffsetOverflow {
+            offset: ndblks as u64,
+            length: os as u64,
+        })?;
+    if sb_len > file_data.len() || sb_offset > file_data.len() - sb_len {
+        return Err(FormatError::UnexpectedEof {
+            expected: sb_offset.saturating_add(sb_len),
+            available: file_data.len(),
+        });
+    }
+
+    if &file_data[sb_offset..sb_offset + 4] != b"EASB" {
+        return Err(FormatError::ChunkedReadError(
+            "invalid Extensible Array super block signature".into(),
+        ));
+    }
+    crate::checksum::verify_trailing(&file_data[sb_offset..sb_offset + sb_len])?;
+
+    let mut pos = sb_offset + sb_header_size;
+
     let page_bitmap: Vec<u8> = if is_paged {
-        let bitmap_size = ndblks * npages.div_ceil(8);
-        if bitmap_size > file_data.len() || pos > file_data.len() - bitmap_size {
-            return Err(FormatError::UnexpectedEof {
-                expected: pos.saturating_add(bitmap_size),
-                available: file_data.len(),
-            });
-        }
         let bm = file_data[pos..pos + bitmap_size].to_vec();
         pos += bitmap_size;
         bm
@@ -693,12 +766,6 @@ fn read_super_block(
     // Read data block addresses.
     let mut dblk_addrs: Vec<u64> = Vec::with_capacity(ndblks);
     for _ in 0..ndblks {
-        if os > file_data.len() || pos > file_data.len() - os {
-            return Err(FormatError::UnexpectedEof {
-                expected: pos.saturating_add(os),
-                available: file_data.len(),
-            });
-        }
         let addr = read_offset(file_data, pos, offset_size)?;
         dblk_addrs.push(addr);
         pos += os;
@@ -809,6 +876,11 @@ pub(crate) fn extensible_array_index_spans<S: Source + ?Sized>(
             "invalid Extensible Array index block signature".into(),
         ));
     }
+    // The addresses read out of this block become free space, so a block that
+    // fails its checksum is refused here rather than reclaimed from: releasing
+    // a span derived from bytes we cannot trust would hand live storage back to
+    // the allocator.
+    crate::checksum::verify_trailing(&ib)?;
     spans.push((ib_addr, aeib_size as u64));
 
     // Read the index block's direct data-block addresses, then its super-block
@@ -875,16 +947,22 @@ fn easb_data_block_spans<S: Source + ?Sized>(
     elem_size: usize,
     spans: &mut Vec<(u64, u64)>,
 ) -> Result<(), FormatError> {
-    use crate::chunked_write::eadb_size;
+    use crate::chunked_write::{aesb_size, eadb_size};
 
     let os = offset_size as usize;
     let sb_header = 4 + 1 + 1 + os + blk_off_size; // sig + ver + client + hdr_addr + block_offset
-    let sb_sig = source.read_metadata_at(sb_addr, sb_header)?;
-    if &sb_sig[..4] != b"EASB" {
+    // The whole super block in one read: its checksum covers all of it, and the
+    // addresses read out of it become free space, so one that fails is refused
+    // rather than reclaimed from.
+    let sb_len =
+        aesb_size(ndblks, dblk_nelmts, page_nelmts, offset_size, blk_off_size).to_usize()?;
+    let sb = source.read_metadata_at(sb_addr, sb_len)?;
+    if &sb[..4] != b"EASB" {
         return Err(FormatError::ChunkedReadError(
             "invalid Extensible Array super block signature".into(),
         ));
     }
+    crate::checksum::verify_trailing(&sb)?;
 
     // When the super block's data blocks are paged, a page-init bitmap of
     // `ndblks * ceil(npages / 8)` bytes precedes the data-block addresses.
@@ -900,24 +978,9 @@ fn easb_data_block_spans<S: Source + ?Sized>(
     } else {
         0
     };
-    // Read the data-block address table that follows the header and bitmap.
-    let table_addr = sb_addr
-        .checked_add((sb_header + bitmap_size) as u64)
-        .ok_or(FormatError::OffsetOverflow {
-            offset: sb_addr,
-            length: (sb_header + bitmap_size) as u64,
-        })?;
-    let table_len = ndblks
-        .to_usize()?
-        .checked_mul(os)
-        .ok_or(FormatError::OffsetOverflow {
-            offset: ndblks,
-            length: os as u64,
-        })?;
-    let table = source.read_metadata_at(table_addr, table_len)?;
-    let mut pos = 0usize;
+    let mut pos = sb_header + bitmap_size;
     for _ in 0..ndblks {
-        let addr = read_offset(&table, pos, offset_size)?;
+        let addr = read_offset(&sb, pos, offset_size)?;
         pos += os;
         if is_undefined_addr(addr, offset_size) {
             continue;
@@ -969,7 +1032,7 @@ pub fn read_extensible_array_chunks_from_source<S: Source + ?Sized>(
     let elem_stride = ea_elem_stride(header, offset_size);
 
     // Read the whole index block: header + inline element slots + direct
-    // data-block addresses + super-block addresses.
+    // data-block addresses + super-block addresses + its checksum.
     let ib_header_size = 4 + 1 + 1 + os;
     let n_inline = header.idx_blk_elmts as usize;
     let ndirect = geom.direct_dblk_nelmts.len();
@@ -986,13 +1049,14 @@ pub fn read_extensible_array_chunks_from_source<S: Source + ?Sized>(
             offset: (ndirect + nsblk) as u64,
             length: os as u64,
         })?;
-    let ib_len = ib_header_size + inline_bytes + addr_bytes;
+    let ib_len = ib_header_size + inline_bytes + addr_bytes + 4;
     let ib = source.read_metadata_at(header.index_block_address, ib_len)?;
     if &ib[0..4] != b"EAIB" {
         return Err(FormatError::ChunkedReadError(
             "invalid Extensible Array index block signature".into(),
         ));
     }
+    crate::checksum::verify_trailing(&ib)?;
 
     let mut pos = ib_header_size;
     let mut chunks = Vec::new();
@@ -1099,24 +1163,20 @@ fn read_data_block_elements_from_source<S: Source + ?Sized>(
     let os = offset_size as usize;
     let db_header_size = 4 + 1 + 1 + os;
     let blk_off_size = (header.max_nelmts_bits as usize).div_ceil(8);
-    let elem_stride = ea_elem_stride(header, offset_size);
     let limit = total_elements.saturating_sub(start_index).min(nelmts);
 
-    // Prefix + block-offset field + `limit` element slots (we only decode up to
-    // the published count).
-    let elem_bytes = limit
-        .checked_mul(elem_stride)
-        .ok_or(FormatError::OffsetOverflow {
-            offset: limit as u64,
-            length: elem_stride as u64,
-        })?;
-    let region_len = db_header_size + blk_off_size + elem_bytes;
+    // The whole block, because its checksum covers every slot -- including the
+    // ones past `limit` that this read does not decode. That is more than the
+    // window this used to take, but a data block is bounded by the array's page
+    // size, so it is one short read either way.
+    let region_len = eadb_extent(nelmts, header, offset_size, blk_off_size)?;
     let block = source.read_metadata_at(db_address, region_len)?;
     if &block[0..4] != b"EADB" {
         return Err(FormatError::ChunkedReadError(
             "invalid Extensible Array data block signature".into(),
         ));
     }
+    crate::checksum::verify_trailing(&block)?;
 
     let mut pos = db_header_size + blk_off_size;
     let mut chunks = Vec::new();
@@ -1175,26 +1235,25 @@ fn read_paged_data_block_from_source<S: Source + ?Sized>(
             init_pages = page + 1;
         }
     }
-    // Clamp to the bytes actually available (the final partial page may omit its
-    // trailing checksum).
-    let avail = source
-        .len()
-        .saturating_sub(db_address)
-        .to_usize()
-        .unwrap_or(usize::MAX);
     let pages_bytes = init_pages
         .checked_mul(page_stride)
         .ok_or(FormatError::OffsetOverflow {
             offset: init_pages as u64,
             length: page_stride as u64,
         })?;
-    let region_len = (db_header_size + pages_bytes).min(avail);
+    // Through the last initialized page, checksums included. Every page is
+    // written whole when the block is allocated, so this region is present in
+    // any file whose pages the bitmap vouches for -- a short read here means a
+    // truncated block, which is what the error says.
+    let region_len = db_header_size + pages_bytes;
     let block = source.read_metadata_at(db_address, region_len)?;
     if block.len() < 4 || &block[0..4] != b"EADB" {
         return Err(FormatError::ChunkedReadError(
             "invalid Extensible Array data block signature".into(),
         ));
     }
+    // A paged block checksums its header on its own, then each page separately.
+    crate::checksum::verify_trailing(&block[..db_header_size])?;
 
     let mut chunks = Vec::new();
     let mut pos = db_header_size;
@@ -1204,6 +1263,8 @@ fn read_paged_data_block_from_source<S: Source + ?Sized>(
             pos += page_stride;
             continue;
         }
+        // See `read_paged_data_block`: the page checksum covers every slot.
+        crate::checksum::verify_trailing(&block[pos..pos + page_stride])?;
         let page_start = start_index + page * page_nelmts;
         let limit = total_elements.saturating_sub(page_start).min(page_nelmts);
         for i in 0..limit {
@@ -1266,18 +1327,19 @@ fn read_super_block_from_source<S: Source + ?Sized>(
         0
     };
 
-    // Header + (optional) page-init bitmap + data-block addresses.
+    // Header + (optional) page-init bitmap + data-block addresses + checksum.
     let addr_bytes = ndblks.checked_mul(os).ok_or(FormatError::OffsetOverflow {
         offset: ndblks as u64,
         length: os as u64,
     })?;
-    let region_len = sb_header_size + bitmap_size + addr_bytes;
+    let region_len = sb_header_size + bitmap_size + addr_bytes + 4;
     let block = source.read_metadata_at(sb_address, region_len)?;
     if &block[0..4] != b"EASB" {
         return Err(FormatError::ChunkedReadError(
             "invalid Extensible Array super block signature".into(),
         ));
     }
+    crate::checksum::verify_trailing(&block)?;
 
     let mut pos = sb_header_size;
     let page_bitmap: Vec<u8> = if is_paged {
@@ -1345,6 +1407,14 @@ mod tests {
         let cd: Vec<u64> = chunk_dims.iter().map(|&d| u64::from(d)).collect();
         ChunkGrid::new(&cd, dims, None, crate::chunk_grid::GridOrder::RowMajor).unwrap()
     }
+
+    use crate::checksum::stamp_trailing as stamp;
+
+    /// EAHD: 12 fixed bytes, six length-sized statistics, the index-block
+    /// address, and the checksum.
+    const fn eahd_len(os: u8, ls: u8) -> usize {
+        12 + 6 * ls as usize + os as usize + 4
+    }
     #[test]
     fn parse_header_valid() {
         let os: u8 = 8;
@@ -1367,6 +1437,7 @@ mod tests {
         buf[44..52].copy_from_slice(&5u64.to_le_bytes()); // stat[4] = num_elements
         buf[52..60].copy_from_slice(&0u64.to_le_bytes()); // stat[5]
         buf[60..68].copy_from_slice(&0x1000u64.to_le_bytes()); // index_block_address
+        stamp(&mut buf, 0, eahd_len(os, ls));
 
         let hdr = ExtensibleArrayHeader::parse(&buf, 0, os, ls).unwrap();
         assert_eq!(hdr.client_id, 0);
@@ -1505,7 +1576,7 @@ mod tests {
             .copy_from_slice(&(num_chunks as u64).to_le_bytes());
         file_data[aehd_offset + 60..aehd_offset + 68]
             .copy_from_slice(&(aeib_offset as u64).to_le_bytes());
-        // checksum (4 bytes at +68) — not validated
+        stamp(&mut file_data, aehd_offset, eahd_len(os, ls));
 
         // Build AEIB at aeib_offset
         file_data[aeib_offset..aeib_offset + 4].copy_from_slice(b"EAIB");
@@ -1522,6 +1593,17 @@ mod tests {
             let p = elem_start + i * osv;
             file_data[p..p + osv].copy_from_slice(&addr.to_le_bytes());
         }
+
+        // The index block is sized by the header's geometry whatever the array
+        // holds: prefix, two inline slots, then a pointer per direct data block
+        // (min_dblk_nelmts=4 and super_blk_min_nelmts=2 give two) and one per
+        // super block (nine levels less the two taken as direct, so seven).
+        // Every pointer here is left zero -- the read stops at the inline slots.
+        stamp(
+            &mut file_data,
+            aeib_offset,
+            (6 + osv) + 2 * osv + 2 * osv + 7 * osv + 4,
+        );
 
         let header = ExtensibleArrayHeader::parse(&file_data, aehd_offset, os, ls).unwrap();
         let ds_dims = vec![40u64]; // 2 chunks × 20 elements
@@ -1638,6 +1720,7 @@ mod tests {
         // idx_blk_addr at offset 12 + 6*8 = 60
         file_data[aehd_offset + 60..aehd_offset + 68]
             .copy_from_slice(&(aeib_offset as u64).to_le_bytes());
+        stamp(&mut file_data, aehd_offset, eahd_len(os, ls));
 
         // AEIB
         file_data[aeib_offset..aeib_offset + 4].copy_from_slice(b"EAIB");
@@ -1656,22 +1739,15 @@ mod tests {
             pos += osv;
         }
 
-        // Direct data block addresses: first sb_level=0 has 1 dblk, sb_level=1 has 1 dblk
-        // Total direct dblks for sblk_min=2: 2^0 + 2^1 = 1 + 2 = 3 (oops)
-        // Actually: sblk_min levels. level 0: 2^0=1 dblk, level 1: 2^1=2 dblks => 3 dblks
-        // But we only have 2 remaining elements.
-        // dblk sizes: level 0: 1 dblk of min_dblk=2; level 1: 2 dblks of 2 each (nelmts doubles at level > 0)
-        // Wait, re-reading the code: at level 0, nelmts=min_dblk=2, 1 dblk.
-        // At level 1, 1 dblk, nelmts still 2 (doubles only at level > 0... but the code says
-        // `if sb_level > 0 { nelmts *= 2 }` after pushing). Let me re-check.
-        // After push at level 0: nelmts=2. Then if 0>0 false, no double. Push 1 dblk of 2.
-        // Level 1: ndblks=2. Push 2 dblks of 2. Then 1>0 true, nelmts=4.
-        // Total: 3 dblks with sizes [2, 2, 2]. Total = 6.
-        // We only need 2 more elements. So only the first dblk has data.
-        let n_direct_dblks = 3;
+        // Direct data-block pointers. The first `super_blk_min_nelmts` super
+        // blocks of the doubling table are stored directly in the index block
+        // rather than through a super block, and with `min_dblk_nelmts = 2`
+        // those are (1 block of 2) and (1 block of 4) -- two pointers. Only the
+        // first holds data; the array's four elements are two inline and two
+        // here.
+        let n_direct_dblks = 2;
         file_data[pos..pos + osv].copy_from_slice(&(aedb_offset as u64).to_le_bytes());
         pos += osv;
-        // 2 more dblk addresses - undefined
         for _ in 1..n_direct_dblks {
             file_data[pos..pos + osv].copy_from_slice(&u64::MAX.to_le_bytes());
             pos += osv;
@@ -1692,6 +1768,21 @@ mod tests {
             file_data[dbpos..dbpos + osv].copy_from_slice(&addr.to_le_bytes());
             dbpos += osv;
         }
+
+        // Prefix, two inline slots, the two direct pointers written above, and
+        // one pointer per remaining super block (ten levels less the two taken
+        // as direct).
+        stamp(
+            &mut file_data,
+            aeib_offset,
+            (6 + osv) + 2 * osv + n_direct_dblks * osv + 8 * osv + 4,
+        );
+        // Prefix, block offset, `min_dblk_nelmts` element slots, checksum.
+        stamp(
+            &mut file_data,
+            aedb_offset,
+            (6 + osv) + blk_off_size + min_dblk_nelmts as usize * osv + 4,
+        );
 
         let header = ExtensibleArrayHeader::parse(&file_data, aehd_offset, os, ls).unwrap();
         let ds_dims = vec![40u64];
@@ -1798,6 +1889,56 @@ mod tests {
     }
 
     /// Test serialized_size computation.
+    /// [`eadb_extent`] must agree with [`crate::chunked_write::eadb_size`], the
+    /// writer's own sizing, for every non-paged block.
+    ///
+    /// Not the thing that catches a divergence: a reader that sizes a block
+    /// four bytes short of the writer hashes the wrong bytes and refuses every
+    /// sound file, which reddens twenty-eight tests here. What this adds is the
+    /// name of the rule that broke, and the widths a round trip does not write
+    /// — a 4-byte-offset file, a 32-bit block-offset field, and a block of no
+    /// elements at all.
+    #[test]
+    fn eadb_extent_matches_the_writer() {
+        for &(client_id, element_size) in &[(0u8, 8u8), (1, 20)] {
+            for &offset_size in &[4u8, 8] {
+                for &max_nelmts_bits in &[10u8, 16, 32] {
+                    let header = ExtensibleArrayHeader {
+                        client_id,
+                        element_size,
+                        max_nelmts_bits,
+                        idx_blk_elmts: 4,
+                        min_dblk_nelmts: 4,
+                        super_blk_min_nelmts: 2,
+                        max_dblk_nelmts_bits: 10,
+                        num_elements: 0,
+                        index_block_address: 0,
+                    };
+                    let blk_off = (max_nelmts_bits as usize).div_ceil(8);
+                    let stride = ea_elem_stride(&header, offset_size);
+                    let page_nelmts = 1u64 << header.max_dblk_nelmts_bits;
+                    // Every count a non-paged block can have, up to the page
+                    // size that would make it paged instead.
+                    for nelmts in [0u64, 1, 2, 4, 16, 64, 255, 256, 1023, page_nelmts] {
+                        assert_eq!(
+                            eadb_extent(nelmts as usize, &header, offset_size, blk_off).unwrap()
+                                as u64,
+                            crate::chunked_write::eadb_size(
+                                nelmts,
+                                stride,
+                                page_nelmts,
+                                offset_size,
+                                blk_off,
+                            ),
+                            "client={client_id} os={offset_size} bits={max_nelmts_bits} \
+                             nelmts={nelmts}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn header_serialized_size() {
         // 12 fixed + 6*8 stats + 8 addr + 4 checksum = 72
@@ -1950,9 +2091,9 @@ mod tests {
         // first. The format does not require that order, and a file whose
         // index block trails its data blocks is what reaches the address loop
         // with everything before it intact -- so move the index block to the
-        // end and repoint the header at it. Nothing else about the file
-        // changes; both header and index-block checksums go unvalidated on
-        // this path, so the copy needs no fixing up.
+        // end and repoint the header at it. The index block is copied byte for
+        // byte and its checksum covers only its own bytes, so the copy stays
+        // valid; the header is edited, so it is restamped below.
         let old_ib = built.index_block_address.to_usize().unwrap();
         let ib_len = 4 + 1 + 1 + 8                            // sig + ver + client + header addr
             + built.idx_blk_elmts as usize * 8                // inline elements
@@ -1966,6 +2107,7 @@ mod tests {
         // the six length-sized statistics fields.
         let addr_field = base as usize + 12 + 6 * 8;
         file[addr_field..addr_field + 8].copy_from_slice(&(new_ib as u64).to_le_bytes());
+        stamp(&mut file, base as usize, eahd_len(8, 8));
 
         let header = ExtensibleArrayHeader::parse(&file, base as usize, 8, 8).unwrap();
         assert_eq!(header.index_block_address as usize, new_ib);
@@ -1993,7 +2135,9 @@ mod tests {
             + geom.direct_dblk_nelmts.len() * 8;
 
         // Cut the file in the middle of that first address. Every data block
-        // now lies before the cut, so the address loop is what faults.
+        // now lies before the cut, so the index block is what faults -- both
+        // backends bound the whole block before reading any of it, because the
+        // checksum they verify covers all of it.
         file.truncate(sblk_start + 4);
 
         let buffered = read_extensible_array_chunks(
@@ -2012,8 +2156,8 @@ mod tests {
             }) => {
                 assert_eq!(
                     expected,
-                    sblk_start + 8,
-                    "the buffered read must fault on the super-block address itself"
+                    new_ib + ib_len,
+                    "the buffered read must fault on the cut index block, not earlier"
                 );
                 assert_eq!(available, file.len());
             }
@@ -2035,6 +2179,151 @@ mod tests {
             streamed.is_err(),
             "streaming read must refuse the same file, got {streamed:?}"
         );
+    }
+
+    /// Every checksummed structure of an Extensible Array is verified on read,
+    /// by both backends (issue #312).
+    ///
+    /// The array is walked by [`extensible_array_index_spans`], so the sweep
+    /// reaches whatever the writer laid down rather than a list written here:
+    /// the header, the index block, every super block, and every data block,
+    /// paged and not. Each is corrupted in its stored checksum and, for a paged
+    /// data block, in the separate checksum over its prefix -- bytes that carry
+    /// no other meaning, so a refusal can only be the checksum. Before this the
+    /// reader returned the same chunk list it did for the sound file.
+    /// Refusal is what the `checksum` feature buys, so this asserts it only
+    /// where it is compiled in: with the feature off `verify_trailing` is a
+    /// no-op and a corrupt index reads as it did before.
+    #[cfg(all(feature = "std", feature = "checksum"))]
+    #[test]
+    fn a_corrupted_extensible_array_structure_is_refused() {
+        use crate::chunked_write::{WrittenChunk, build_extensible_array_at};
+        use crate::source::BytesSource;
+
+        // The same progression as `streaming_ea_super_blocks_and_paged_match_buffered`:
+        // inline and direct blocks, then super blocks, then paged data blocks.
+        for &n in &[2000u64, 50000, 140000] {
+            let chunks: Vec<WrittenChunk> = (0..n)
+                .map(|i| WrittenChunk {
+                    address: 0x10 + i * 8,
+                    compressed_size: 8,
+                    filter_mask: 0,
+                })
+                .collect();
+            let base = 0x1000u64;
+            let ea = build_extensible_array_at(
+                &crate::chunked_write::IndexSlots::dense(&chunks),
+                8,
+                8,
+                8,
+                false,
+                base,
+            )
+            .unwrap();
+            let mut file = vec![0u8; base as usize + ea.len()];
+            file[base as usize..].copy_from_slice(&ea);
+
+            let ds_dims = vec![n];
+            let chunk_dims = vec![1u32];
+            let read_both = |file: &[u8]| -> (Result<Vec<ChunkInfo>, FormatError>, bool) {
+                let grid = dense_grid(&ds_dims, &chunk_dims);
+                let buffered =
+                    ExtensibleArrayHeader::parse(file, base as usize, 8, 8).and_then(|h| {
+                        read_extensible_array_chunks(file, &h, &grid, &chunk_dims, 8, 8, 8)
+                    });
+                let mem = BytesSource::new(file);
+                let streamed =
+                    ExtensibleArrayHeader::parse_from_source(&mem, base, 8, 8).and_then(|h| {
+                        read_extensible_array_chunks_from_source(
+                            &mem,
+                            &h,
+                            &grid,
+                            &chunk_dims,
+                            8,
+                            8,
+                            8,
+                        )
+                    });
+                (buffered, streamed.is_err())
+            };
+            assert_eq!(
+                read_both(&file).0.expect("the sound file must read").len() as u64,
+                n,
+                "the fixture must read before it is corrupted, at n={n}"
+            );
+
+            let spans = extensible_array_index_spans(&BytesSource::new(&file), base, 8, 8).unwrap();
+            assert!(spans.len() > 1, "the sweep must reach past the header");
+
+            let header = ExtensibleArrayHeader::parse(&file, base as usize, 8, 8).unwrap();
+            let stride = ea_elem_stride(&header, 8);
+            let page_nelmts = 1usize << header.max_dblk_nelmts_bits;
+            // A data block's bytes before any checksum, and the largest an
+            // unpaged one can be -- a paged block is always longer, since it
+            // holds at least two full pages.
+            let db_prefix = 4 + 1 + 1 + 8 + (header.max_nelmts_bits as usize).div_ceil(8);
+            let max_unpaged = db_prefix + page_nelmts * stride + 4;
+
+            // Each site is a byte to flip and whether the reclaim walk reads
+            // the structure it belongs to. That walk turns what it reads into
+            // free space, so where it does read one, a corrupt one must stop it
+            // rather than release a span derived from bytes nothing vouched
+            // for. It reads pointers out of the header, index block and super
+            // blocks; it sizes data blocks from the header without reading
+            // them.
+            let mut poke_sites: Vec<(u64, bool)> = Vec::new();
+            let mut paged = 0;
+            for &(at, len) in &spans {
+                let start = at.to_usize().unwrap();
+                let kind = &file[start..start + 4];
+                if kind == b"EADB" && len as usize > max_unpaged {
+                    paged += 1;
+                    // A paged block checksums its prefix on its own and then
+                    // each page. Poke the prefix and the *first* page: a
+                    // trailing page the bitmap never marked initialized is one
+                    // the reader steps over without reading, so its checksum is
+                    // not a soundness property and pinning it here would assert
+                    // more than the format requires.
+                    poke_sites.push((at + db_prefix as u64 + 4 - 1, false));
+                    poke_sites.push((at + (max_unpaged + 4) as u64 - 1, false));
+                } else {
+                    // The last byte of every other structure is the top byte of
+                    // its one trailing checksum.
+                    poke_sites.push((at + len - 1, kind != b"EADB"));
+                }
+            }
+            if n == 140000 {
+                assert!(paged > 0, "n={n} must reach a paged data block");
+            }
+            assert!(
+                poke_sites.iter().any(|&(_, walked)| walked),
+                "n={n}: the sweep must reach a structure the reclaim walk reads"
+            );
+
+            for (site, walked) in poke_sites {
+                let at = site.to_usize().unwrap();
+                let original = file[at];
+                file[at] ^= 0x01;
+                let (buffered, streamed_err) = read_both(&file);
+                assert!(
+                    matches!(buffered, Err(FormatError::ChecksumMismatch { .. })),
+                    "n={n}: a corrupted checksum at {at:#x} must be refused, got {buffered:?}"
+                );
+                assert!(
+                    streamed_err,
+                    "n={n}: the streaming backend must refuse what the buffered one does, at {at:#x}"
+                );
+                if walked {
+                    let walk = extensible_array_index_spans(&BytesSource::new(&file), base, 8, 8);
+                    assert!(
+                        matches!(walk, Err(FormatError::ChecksumMismatch { .. })),
+                        "n={n}: the reclaim walk must refuse a corrupt structure at {at:#x} \
+                         rather than release spans read out of it, got {walk:?}"
+                    );
+                }
+                file[at] = original;
+            }
+        }
     }
 
     /// `extensible_array_index_spans` must account for exactly the index

@@ -37,7 +37,7 @@ hdf5-pure = { version = "0.14", features = ["ndarray", "serde", "zfp"] }
 | Feature | Default | Enables |
 |---|:---:|---|
 | `std` | ✅ | File I/O and the high-level reader API |
-| `checksum` | ✅ | Jenkins hash for v2+ object headers |
+| `checksum` | ✅ | Jenkins hash validating checksummed metadata |
 | `deflate` | ✅ | Deflate (zlib) compression, pure-Rust backend |
 | `serde` | | Read/write MATLAB v7.3 `.mat` files via serde |
 | `ndarray` | | N-dimensional array I/O via the `ndarray` crate |

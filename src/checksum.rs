@@ -11,6 +11,56 @@ pub fn jenkins_lookup3(data: &[u8]) -> u32 {
     hashlittle(data, 0)
 }
 
+/// Verify the four-byte Jenkins checksum HDF5 stores at the end of a metadata
+/// structure: `block` is the whole structure, checksum included, and the
+/// checksum covers everything before it.
+///
+/// This is a no-op unless the `checksum` feature is enabled, so a caller needs
+/// no `cfg` of its own — it passes the bytes it already holds and the
+/// validation compiles away.
+pub(crate) fn verify_trailing(block: &[u8]) -> Result<(), crate::error::FormatError> {
+    #[cfg(not(feature = "checksum"))]
+    {
+        let _ = block;
+        Ok(())
+    }
+    #[cfg(feature = "checksum")]
+    {
+        // A structure shorter than its own checksum field is truncated, not
+        // merely wrong: report the shortfall rather than indexing past the end.
+        let Some((body, stored)) = block.split_last_chunk::<4>() else {
+            return Err(crate::error::FormatError::UnexpectedEof {
+                expected: 4,
+                available: block.len(),
+            });
+        };
+        let stored = u32::from_le_bytes(*stored);
+        let computed = jenkins_lookup3(body);
+        if computed != stored {
+            return Err(crate::error::FormatError::ChecksumMismatch {
+                expected: stored,
+                computed,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Stamp the trailing checksum of the structure occupying `file[at..at + len]`,
+/// the inverse of [`verify_trailing`].
+///
+/// Test-only: the writers build a structure into a buffer and append its
+/// checksum as the last step, so only a hand-built fixture needs to patch one
+/// in afterwards. A fixture that skips it is not a file any HDF5 library reads,
+/// and `len` states where the structure ends independently of the reader, so a
+/// disagreement about its extent fails the checksum rather than passing
+/// unnoticed.
+#[cfg(test)]
+pub(crate) fn stamp_trailing(file: &mut [u8], at: usize, len: usize) {
+    let cks = jenkins_lookup3(&file[at..at + len - 4]);
+    file[at + len - 4..at + len].copy_from_slice(&cks.to_le_bytes());
+}
+
 fn rot(x: u32, k: u32) -> u32 {
     x.rotate_left(k)
 }

@@ -607,7 +607,7 @@ Reading decodes the MATLAB opaque value classes `datetime`, `duration`, and `cat
 | Feature | Default | Description |
 |---|---|---|
 | `std` | yes | File I/O, high-level reader API |
-| `checksum` | yes | Jenkins hash for v2+ object headers |
+| `checksum` | yes | Jenkins hash validating checksummed metadata |
 | `deflate` | yes | Deflate compression (pure Rust backend) |
 | `serde` | no | Serialize/deserialize MATLAB v7.3 `.mat` files via serde |
 | `fast-deflate` | no | zlib-ng backend for deflate via `flate2/zlib-ng` |
@@ -615,7 +615,7 @@ Reading decodes the MATLAB opaque value classes `datetime`, `duration`, and `cat
 | `provenance` | no | SHA-256 data provenance tracking |
 | `zfp` | no | ZFP fixed-rate compression (HDF5 filter 32013), f32/f64/i32/i64 × 1D–4D |
 
-For bare-metal `no_std`, disable default features (keep `checksum` for object-header validation):
+For bare-metal `no_std`, disable default features (keep `checksum` for metadata validation):
 
 ```toml
 [dependencies]
