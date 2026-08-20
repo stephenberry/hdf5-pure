@@ -93,6 +93,7 @@ Refused today with a `... yet` message, intended to land. Each row links to its 
 | Adding **chunked/extensible variable-length-string** datasets | [#105](https://github.com/stephenberry/hdf5-pure/issues/105) |
 | **Overwriting** (`Dataset::write_staged`) with `with_vlen_strings` or `with_path_references` — both stage placeholder element bytes only the add path resolves. A refusal on those builders, not on the datatypes: either dataset still overwrites through `with_reference_data` / `with_raw_data` | [#321](https://github.com/stephenberry/hdf5-pure/issues/321) |
 | **Cross-file copy** of variable-length / reference / shared data, including an attribute naming a committed datatype | [#106](https://github.com/stephenberry/hdf5-pure/issues/106) |
+| Keeping an **object reference already stored in the file** valid when its target's header is rewritten. A dirty object is rebuilt at a fresh address and only its parent link is repointed, so a reference dataset the commit never touched still holds the old address, and that header is freed. The reference the commit *writes* is unaffected: a path target resolves to the new address | [#324](https://github.com/stephenberry/hdf5-pure/issues/324) |
 
 ### Repack
 

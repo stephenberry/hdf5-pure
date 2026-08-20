@@ -3890,7 +3890,7 @@ impl WriteEngine {
         // resolves to its new address, while every reference already stored in
         // the file still holds the old one. That second half is a defect of its
         // own and a wider one, since it breaks references this commit never
-        // touched, and refusing more here would not fix it.
+        // touched, and refusing more here would not fix it (issue #324).
         let mut deleted_free: Vec<(u64, u64, PageType)> = Vec::new();
         deleted_addrs.sort_unstable();
         deleted_addrs.dedup();
