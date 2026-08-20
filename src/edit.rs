@@ -10214,6 +10214,46 @@ mod tests {
         assert!(screen_resolved_references(&dt, &raw, &nothing).is_ok());
     }
 
+    /// A variable-length *of object references* is refused rather than skipped:
+    /// its addresses live in the global heap the elements point at, not in the
+    /// element bytes this screen reads (issue #317).
+    ///
+    /// The reference C library writes such a datatype (`H5T_VLEN` of
+    /// `H5T_STD_REF_OBJ`) and an in-file copy carries it, so it reaches the
+    /// screen through `copy` even though nothing here builds one. A
+    /// variable-length *string* is unaffected — the heap it points at is never
+    /// reclaimed by a delete, so its elements stay valid.
+    #[test]
+    fn a_variable_length_of_object_references_is_refused() {
+        use crate::datatype::{CharacterSet, ReferenceType};
+        let of_references = Datatype::VariableLength {
+            is_string: false,
+            padding: None,
+            charset: None,
+            base_type: Box::new(Datatype::Reference {
+                size: 8,
+                ref_type: ReferenceType::Object,
+            }),
+        };
+        let of_strings = crate::type_builders::make_vlen_string_type(CharacterSet::Utf8);
+        let raw = vec![0u8; 32];
+        let invalidated = InvalidatedAddresses {
+            removed: vec![(248, 71)],
+            moved: Vec::new(),
+            base: 0,
+        };
+
+        let err = screen_resolved_references(&of_references, &raw, &invalidated).unwrap_err();
+        assert!(
+            err.to_string().contains("could not be located"),
+            "got: {err}"
+        );
+        assert!(
+            screen_resolved_references(&of_strings, &raw, &invalidated).is_ok(),
+            "a variable-length string points at a heap no delete reclaims"
+        );
+    }
+
     /// An object reference wider than the 8 bytes the slot walker maps is
     /// refused, not skipped (issue #317).
     ///
