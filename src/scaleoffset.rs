@@ -1887,8 +1887,10 @@ mod tests {
         let comp = compress(&raw, &f).unwrap();
         let dec = decompress(&comp, &f, None).unwrap();
         let got: Vec<f64> = dec
-            .chunks_exact(8)
-            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| f64::from_le_bytes(*c))
             .collect();
         let tol = 0.5 * 10f64.powi(-decimals);
         for (g, v) in got.iter().zip(vals.iter()) {
@@ -1908,8 +1910,10 @@ mod tests {
         let comp = compress(&raw, &f).unwrap();
         let dec = decompress(&comp, &f, None).unwrap();
         let got: Vec<f32> = dec
-            .chunks_exact(4)
-            .map(|c| f32::from_be_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_be_bytes(*c))
             .collect();
         let tol = 0.5 * 10f32.powi(-decimals);
         for (g, v) in got.iter().zip(vals.iter()) {
@@ -2174,8 +2178,10 @@ mod tests {
             let comp = compress(&raw, &f).unwrap();
             let dec = decompress(&comp, &f, None).unwrap();
             let got: Vec<f64> = dec
-                .chunks_exact(8)
-                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| f64::from_le_bytes(*c))
                 .collect();
             // 0.5 ULP rounding + a few ULP of float arithmetic noise.
             let tol = 0.501 * 10f64.powi(-decimals);
@@ -2231,8 +2237,10 @@ mod tests {
         chunk.push(0);
         let out = decompress(&chunk, &f, None).unwrap();
         let got: Vec<u32> = out
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
             .collect();
         assert_eq!(
             got,
@@ -2276,8 +2284,10 @@ mod tests {
         chunk.extend_from_slice(&pack_offsets(&[0, 1, 7, 2], 3, 4).unwrap());
         let out = decompress(&chunk, &f, None).unwrap();
         let got: Vec<u32> = out
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
             .collect();
         assert_eq!(got, vec![10u32, 11, 999, 12]);
     }

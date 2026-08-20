@@ -1509,8 +1509,8 @@ fn emit_object_reference_dataset(
             .into());
         }
         let mut targets = Vec::with_capacity(n_elements);
-        for chunk in raw[..needed].chunks_exact(8) {
-            let v = u64::from_le_bytes(chunk.try_into().expect("chunks_exact(8) yields 8 bytes"));
+        for chunk in raw[..needed].as_chunks::<8>().0 {
+            let v = u64::from_le_bytes(*chunk);
             targets.push(resolve_reference_address(v, path, drop, addr_map)?);
         }
         targets

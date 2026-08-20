@@ -108,15 +108,19 @@ fn decode_tolerance(fix: &Fixture, raw: &[u8]) -> f64 {
         "f32" | "f64" => 2f64.powi(-(fix.rate as i32 / 2)),
         "i32" => {
             let max_abs = raw
-                .chunks_exact(4)
-                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]).unsigned_abs() as f64)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| i32::from_le_bytes(*c).unsigned_abs() as f64)
                 .fold(0f64, f64::max);
             (max_abs / 2.0).max(1.0)
         }
         "i64" => {
             let max_abs = raw
-                .chunks_exact(8)
-                .map(|c| i64::from_le_bytes(c.try_into().unwrap()).unsigned_abs() as f64)
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| i64::from_le_bytes(*c).unsigned_abs() as f64)
                 .fold(0f64, f64::max);
             (max_abs / 2.0).max(1.0)
         }
@@ -143,12 +147,16 @@ fn decode_and_max_err(
     match dtype {
         "f32" => {
             let expected: Vec<f32> = raw
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect();
             let got: Vec<f32> = decoded
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect();
             if got.len() != expected.len() {
                 return Err(format!(
@@ -161,12 +169,16 @@ fn decode_and_max_err(
         }
         "f64" => {
             let expected: Vec<f64> = raw
-                .chunks_exact(8)
-                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| f64::from_le_bytes(*c))
                 .collect();
             let got: Vec<f64> = decoded
-                .chunks_exact(8)
-                .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| f64::from_le_bytes(*c))
                 .collect();
             if got.len() != expected.len() {
                 return Err(format!(
@@ -179,12 +191,16 @@ fn decode_and_max_err(
         }
         "i32" => {
             let expected: Vec<i32> = raw
-                .chunks_exact(4)
-                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| i32::from_le_bytes(*c))
                 .collect();
             let got: Vec<i32> = decoded
-                .chunks_exact(4)
-                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| i32::from_le_bytes(*c))
                 .collect();
             if got.len() != expected.len() {
                 return Err(format!(
@@ -202,12 +218,16 @@ fn decode_and_max_err(
         }
         "i64" => {
             let expected: Vec<i64> = raw
-                .chunks_exact(8)
-                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| i64::from_le_bytes(*c))
                 .collect();
             let got: Vec<i64> = decoded
-                .chunks_exact(8)
-                .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| i64::from_le_bytes(*c))
                 .collect();
             if got.len() != expected.len() {
                 return Err(format!(

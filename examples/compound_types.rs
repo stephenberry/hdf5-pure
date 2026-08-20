@@ -67,7 +67,9 @@ fn main() {
 /// Decode a `{real: f64, imag: f64}` compound dataset's raw record bytes into
 /// `(real, imag)` pairs (16 little-endian bytes per element).
 fn decode_complex64(raw: &[u8]) -> Vec<(f64, f64)> {
-    raw.chunks_exact(16)
+    raw.as_chunks::<16>()
+        .0
+        .iter()
         .map(|rec| {
             let re = f64::from_le_bytes(rec[0..8].try_into().unwrap());
             let im = f64::from_le_bytes(rec[8..16].try_into().unwrap());

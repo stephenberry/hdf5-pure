@@ -2170,8 +2170,10 @@ mod tests {
         .unwrap();
 
         let decoded: Vec<f64> = out
-            .chunks_exact(8)
-            .map(|b| f64::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| f64::from_le_bytes(*b))
             .collect();
         assert_eq!(
             decoded,
