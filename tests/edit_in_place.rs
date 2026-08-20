@@ -4135,17 +4135,24 @@ fn a_copy_of_a_committed_reference_datatype_is_screened() {
 ///
 /// Refusing every committed datatype would have been the easy way to stay safe
 /// at the shared Datatype message, and would have taken this with it.
+///
+/// The dataset carries a committed datatype *and* an attribute whose own
+/// datatype is committed, which are two different indirections: the first is a
+/// shared Datatype message, the second a shared field inside an ordinary
+/// Attribute message. Both have to be followed for this copy to go through.
 #[test]
 fn a_copy_of_a_committed_ordinary_datatype_still_commits_beside_a_delete() {
     let path = std::env::temp_dir().join("hdf5_pure_edit_ref_copy_committed_ok.h5");
     let mut b = FileBuilder::new();
     b.commit_datatype("mytype", hdf5_pure::make_f64_type());
+    b.commit_datatype("counttype", hdf5_pure::make_i32_type());
     let mut g = b.create_group("g");
     g.create_dataset("inner").with_i32_data(&[1, 2, 3]);
     b.add_group(g.finish());
-    b.create_dataset("src")
-        .with_f64_data(&[1.5, 2.5])
+    let ds = b.create_dataset("src");
+    ds.with_f64_data(&[1.5, 2.5])
         .with_committed_datatype("mytype");
+    ds.set_attr_committed("count", AttrValue::I32(7), "counttype");
     b.write(&path).unwrap();
 
     {
@@ -4157,6 +4164,13 @@ fn a_copy_of_a_committed_ordinary_datatype_still_commits_beside_a_delete() {
 
     let file = File::open(&path).unwrap();
     assert_eq!(file.dataset("dup").unwrap().read_f64().unwrap(), [1.5, 2.5]);
+    // Compared against the source's rather than against a literal: what
+    // matters here is that the copy carried the attribute across, not how the
+    // reader widens an `i32`.
+    assert_eq!(
+        file.dataset("dup").unwrap().attrs().unwrap(),
+        file.dataset("src").unwrap().attrs().unwrap()
+    );
     assert!(file.group("g").is_err(), "g was deleted");
     drop(file);
     std::fs::remove_file(&path).ok();

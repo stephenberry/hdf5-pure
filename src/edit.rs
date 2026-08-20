@@ -10026,6 +10026,62 @@ mod tests {
         region
     }
 
+    /// A reference target supplied as a *raw address* is screened exactly as one
+    /// supplied as a path (issue #317), and the address it would have resolved
+    /// to is returned unchanged when it names space this commit keeps.
+    ///
+    /// Driven directly because no session API stages one: `ObjectRefTarget::Raw`
+    /// is what [`crate::repack`]'s faithful re-emit builds, through
+    /// `with_embedded_object_references`, and a builder reachable from a session
+    /// produces only [`ObjectRefTarget::Path`]. The arm is here so the two ways
+    /// a target can name an object answer to the same rule rather than to
+    /// whichever one a caller happened to use.
+    #[test]
+    fn a_raw_reference_target_is_screened_like_a_path_one() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("raw_target.h5");
+        let mut b = crate::writer::FileBuilder::new();
+        b.create_dataset("d").with_i32_data(&[1, 2, 3]);
+        b.write(&path).unwrap();
+        let engine = WriteEngine::open_with_locking(&path, FileLocking::Enabled).unwrap();
+
+        let nodes: BTreeMap<PathKey, Node> = BTreeMap::new();
+        let path_addr: BTreeMap<PathKey, u64> = BTreeMap::new();
+        let resolve = |address: u64, spans: Vec<(u64, u64)>| {
+            WriteEngine::resolve_reference_target(
+                &ObjectRefTarget::Raw(address),
+                &path_addr,
+                &nodes,
+                &[],
+                &[],
+                &[],
+                &ReclaimedSpace { spans, base: 0 },
+                &engine.image(),
+                engine.superblock(),
+            )
+        };
+
+        assert!(
+            resolve(300, vec![(248, 71)]).is_err(),
+            "an address inside a reclaimed span is refused"
+        );
+        assert_eq!(
+            resolve(300, vec![(400, 71)]).unwrap(),
+            300,
+            "an address outside every reclaimed span is carried through"
+        );
+        assert_eq!(
+            resolve(300, Vec::new()).unwrap(),
+            300,
+            "a commit that reclaims nothing screens nothing"
+        );
+        // The two sentinels name no object, so they are carried through even
+        // when they fall inside a reclaimed span.
+        assert_eq!(resolve(0, vec![(0, 4096)]).unwrap(), 0);
+        assert_eq!(resolve(UNDEF, vec![(0, u64::MAX)]).unwrap(), UNDEF);
+    }
+
     /// A copied object's *attributes* are screened against the space the commit
     /// reclaims, in either storage an object can hold them in — inline in the
     /// header region, or in the fractal heap a dense object uses — and an
