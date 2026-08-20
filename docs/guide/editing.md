@@ -281,7 +281,9 @@ The appended data is `fsync`ed before the root is repointed, so the "repoint las
 
 A refusal costs the session nothing it had staged, so nothing is lost by attempting a commit. A refused `commit()` puts the staged set back whole — `has_staged_edits()` still answers `true`, and committing again gives the same refusal rather than applying the part of the batch the refusal was not about. A staging call that refuses stages nothing, including a `create_group_with` whose closure had already recorded several edits before the refused one.
 
-Which errors arrive where follows from that: a dataset is validated as it is staged, so a bad shape, a missing datatype or an unsupported combination is reported by `create_dataset` itself, while anything that has to read the file — a value overwrite that is not the on-disk shape, a deletion that overlaps another edit, a target that does not exist — is reported by `commit()`.
+Which errors arrive where follows from that: a dataset is validated as it is staged, so a bad shape, a missing datatype or an unsupported combination is reported by `create_dataset` or `write_staged` itself, while anything that has to read the file — a value overwrite that is not the on-disk datatype or shape, a deletion that overlaps another edit, a target that does not exist — is reported by `commit()`.
+
+A value overwrite is decided that way too. It replaces element bytes and nothing else, so a builder asking for chunking, filters, an extensible shape, an attribute or a fill value is refused by the staging call, and so are the two datatypes whose element bytes are placeholders only a newly created dataset can resolve: variable-length strings (`with_vlen_strings`) and path-resolved object references (`with_path_references`). `with_reference_data` supplies its addresses already resolved and overwrites like any other value.
 
 ## Choosing the fsync cadence
 

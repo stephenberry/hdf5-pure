@@ -3419,11 +3419,23 @@ impl Dataset {
 
     /// Overwrite this dataset's values through its full [`DatasetBuilder`],
     /// staged until [`File::commit`] — the builder-level counterpart of
-    /// [`write`](Self::write), for element kinds that are not [`H5Element`]
-    /// (variable-length strings, raw bytes with an explicit datatype).
+    /// [`write`](Self::write), for element kinds [`H5Element`] does not cover
+    /// (raw bytes carried by an explicit datatype).
     ///
     /// The replacement must match the on-disk datatype and shape exactly; a
     /// reshape or retype is refused on [`File::commit`].
+    ///
+    /// This overwrites element bytes and nothing else, so a builder asking for
+    /// more than that is refused by **this call**, before anything is staged:
+    /// chunking, filters or an extensible shape; an attribute; a fill value; and
+    /// the two datatypes whose element bytes are placeholders that only a newly
+    /// created dataset can resolve — variable-length strings
+    /// ([`with_vlen_strings`](DatasetBuilder::with_vlen_strings)) and
+    /// path-resolved object references
+    /// ([`with_path_references`](DatasetBuilder::with_path_references)). Set
+    /// those when the dataset is created.
+    /// [`with_reference_data`](DatasetBuilder::with_reference_data), whose
+    /// addresses are resolved already, overwrites like any other value.
     ///
     /// The file must have been opened with [`File::open_rw`], else
     /// [`Error::ReadOnly`](crate::Error::ReadOnly).
@@ -3431,10 +3443,13 @@ impl Dataset {
     /// ```no_run
     /// # use hdf5_pure::File;
     /// # fn main() -> Result<(), hdf5_pure::Error> {
-    /// let file = File::open_rw("labels.h5")?;
-    /// let mut ds = file.dataset("names")?;
+    /// let file = File::open_rw("counters.h5")?;
+    /// let mut ds = file.dataset("ticks")?;
+    /// // Keep the dataset's own datatype and supply the replacement bytes it
+    /// // describes — three little-endian 16-bit elements here.
+    /// let dt = ds.datatype()?;
     /// ds.write_staged(|b| {
-    ///     b.with_vlen_strings(&["ada", "grace", "katherine"]);
+    ///     b.with_raw_data(dt, vec![1, 0, 2, 0, 3, 0], 3);
     /// })?;
     /// file.commit()?;
     /// # Ok(())
