@@ -87,7 +87,7 @@ pub fn encode_string_saveobj_payload(
     // Pad to a multiple of 4 u16s so we can pack 4 per u64 word.
     units.resize(units.len().next_multiple_of(4), 0);
 
-    for chunk in units.chunks_exact(4) {
+    for chunk in units.as_chunks::<4>().0 {
         let v = (chunk[0] as u64)
             | ((chunk[1] as u64) << 16)
             | ((chunk[2] as u64) << 32)

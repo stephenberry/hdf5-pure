@@ -297,8 +297,10 @@ fn reads_h5py_shuffle_lzf() {
     assert_eq!(ds.filters(), vec![2, 32000]);
     let raw = std::fs::read(fixture("f64_shuffle_lzf.raw.bin")).unwrap();
     let expected: Vec<f64> = raw
-        .chunks_exact(8)
-        .map(|b| f64::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|b| f64::from_le_bytes(*b))
         .collect();
     assert_eq!(ds.read_f64().unwrap(), expected);
 }
@@ -310,8 +312,10 @@ fn reads_h5py_lzf_multichunk() {
     let ds = file.dataset("v").unwrap();
     let raw = std::fs::read(fixture("i64_multichunk.raw.bin")).unwrap();
     let expected: Vec<i64> = raw
-        .chunks_exact(8)
-        .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|b| i64::from_le_bytes(*b))
         .collect();
     assert_eq!(ds.read_i64().unwrap(), expected);
 }

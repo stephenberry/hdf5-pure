@@ -565,8 +565,10 @@ mod streaming_tests {
     fn read_back_f64(bytes: &[u8], path: &str) -> Vec<f64> {
         let file = crate::reader::File::from_bytes(bytes.to_vec()).unwrap();
         let raw = file.dataset(path).unwrap().read_raw().unwrap();
-        raw.chunks_exact(8)
-            .map(|b| f64::from_le_bytes(b.try_into().unwrap()))
+        raw.as_chunks::<8>()
+            .0
+            .iter()
+            .map(|b| f64::from_le_bytes(*b))
             .collect()
     }
 

@@ -665,19 +665,19 @@ fn deflate_compress(
 /// unrolled): gather byte `j` of element `i` from plane `j` and write the `N`
 /// reconstructed bytes of the element as one contiguous store.
 fn unshuffle_n<const N: usize>(data: &[u8], result: &mut [u8], num_elements: usize) {
-    for (i, out) in result.chunks_exact_mut(N).enumerate() {
+    for (i, out) in result.as_chunks_mut::<N>().0.iter_mut().enumerate() {
         let mut elem = [0u8; N];
         for (j, b) in elem.iter_mut().enumerate() {
             *b = data[j * num_elements + i];
         }
-        out.copy_from_slice(&elem);
+        *out = elem;
     }
 }
 
 /// Shuffle one element width `N` (const-generic): read the `N` contiguous bytes
 /// of element `i` and scatter byte `j` into plane `j`.
 fn shuffle_n<const N: usize>(data: &[u8], result: &mut [u8], num_elements: usize) {
-    for (i, elem) in data.chunks_exact(N).enumerate() {
+    for (i, elem) in data.as_chunks::<N>().0.iter().enumerate() {
         for (j, &b) in elem.iter().enumerate() {
             result[j * num_elements + i] = b;
         }

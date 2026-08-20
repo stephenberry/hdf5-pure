@@ -38,8 +38,10 @@ fn chunk_i32_at(path: &std::path::Path, chunk: &Chunk) -> Vec<i32> {
     let start = chunk.address as usize;
     let end = start + chunk.storage_size as usize;
     bytes[start..end]
-        .chunks_exact(4)
-        .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| i32::from_le_bytes(*b))
         .collect()
 }
 
