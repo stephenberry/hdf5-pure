@@ -1803,6 +1803,14 @@ impl DatasetBuilder {
 
     /// Write an object reference dataset. Each address is an 8-byte absolute
     /// address pointing to an object header in the file.
+    ///
+    /// The addresses are written as given — nothing here resolves them, and
+    /// nothing checks that they name anything. Use
+    /// [`with_path_references`](Self::with_path_references) to name targets by
+    /// path and have the writer resolve them. In a
+    /// [`File::open_rw`](crate::File::open_rw) session the addresses are checked
+    /// at `commit` against what the same commit deletes, so a reference into
+    /// storage that commit reclaims is refused rather than written.
     pub fn with_reference_data(&mut self, addresses: &[u64]) -> &mut Self {
         self.datatype = Some(make_object_reference_type());
         let mut b = Vec::with_capacity(addresses.len() * 8);

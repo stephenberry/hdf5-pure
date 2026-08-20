@@ -3441,10 +3441,10 @@ impl Dataset {
     /// dataset of either type can still be overwritten by supplying element bytes
     /// that need no resolving, with
     /// [`with_reference_data`](DatasetBuilder::with_reference_data) or
-    /// [`with_raw_data`](DatasetBuilder::with_raw_data). Those bytes are stored as
-    /// given and are not screened — an address pointing at an object the same
-    /// commit deletes is written as-is, where the same target named as a path is
-    /// refused.
+    /// [`with_raw_data`](DatasetBuilder::with_raw_data). An object reference
+    /// supplied that way is screened at `commit` by *address* against what the
+    /// same commit deletes, exactly as one named as a path is screened by name,
+    /// so neither form can be left pointing at storage the delete reclaims.
     ///
     /// The file must have been opened with [`File::open_rw`], else
     /// [`Error::ReadOnly`](crate::Error::ReadOnly).
