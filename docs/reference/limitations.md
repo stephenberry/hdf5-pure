@@ -91,7 +91,7 @@ Refused today with a `... yet` message, intended to land. Each row links to its 
 | Editing across **soft / external links** | [#103](https://github.com/stephenberry/hdf5-pure/issues/103) |
 | Creation-order tracking, shared/SOHM messages, copying a **version-1** object | [#104](https://github.com/stephenberry/hdf5-pure/issues/104) |
 | Adding **chunked/extensible variable-length-string** datasets | [#105](https://github.com/stephenberry/hdf5-pure/issues/105) |
-| **Overwriting** (`Dataset::write_staged`) with `with_vlen_strings` or `with_path_references` — both stage placeholder element bytes only the add path resolves. A refusal on those builders, not on the datatypes: either dataset still overwrites through `with_reference_data` / `with_raw_data` | [#318](https://github.com/stephenberry/hdf5-pure/issues/318) |
+| **Overwriting** (`Dataset::write_staged`) with `with_vlen_strings` or `with_path_references` — both stage placeholder element bytes only the add path resolves. A refusal on those builders, not on the datatypes: either dataset still overwrites through `with_reference_data` / `with_raw_data` | [#321](https://github.com/stephenberry/hdf5-pure/issues/321) |
 | **Cross-file copy** of variable-length / reference / shared data, including an attribute naming a committed datatype | [#106](https://github.com/stephenberry/hdf5-pure/issues/106) |
 
 ### Repack
