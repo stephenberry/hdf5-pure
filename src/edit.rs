@@ -5138,12 +5138,17 @@ impl WriteEngine {
             ));
         }
 
-        // `with_path_references` and `with_object_references` stage the same
-        // shape of placeholder, and the overwrite path resolves them just as
-        // little: `reference_targets` is read only by the add path, in
+        // Every producer of `reference_targets` stages the same shape of
+        // placeholder — the public `with_path_references` and the two forms
+        // repack re-emits through — and the overwrite path resolves them just as
+        // little: the field is read only by the add path, in
         // `preflight_reference_targets` and the apply loop that follows it. Left
         // unrefused, a staged overwrite writes address-zero placeholders over a
         // working reference dataset and `commit` reports `Ok` (issue #318).
+        //
+        // `with_reference_data` is not one of them: it stores the addresses the
+        // caller supplied, so there is nothing left to resolve and it overwrites
+        // like any other value.
         if fd.reference_targets.is_some() {
             return Err(Error::EditUnsupported(
                 "write_dataset cannot overwrite an object-reference dataset's \
@@ -5167,9 +5172,9 @@ impl WriteEngine {
     /// on-disk dataset's is likewise refused — this is a value overwrite, not a
     /// reshape or retype.
     ///
-    /// Every refusal `fd` decides on its own is already spent by then:
-    /// [`refuse_unsupported_overwrite`](Self::refuse_unsupported_overwrite) makes
-    /// them where the write is staged. Each one left here reads the header.
+    /// Every refusal `fd` can decide on its own has been made by then, by
+    /// [`refuse_unsupported_overwrite`](Self::refuse_unsupported_overwrite),
+    /// where the write is staged. Each one left here reads the header.
     fn prepare_write<S: Source + ?Sized>(
         src: &S,
         addr: u64,
