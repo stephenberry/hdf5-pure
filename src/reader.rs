@@ -3442,9 +3442,10 @@ impl Dataset {
     /// that need no resolving, with
     /// [`with_reference_data`](DatasetBuilder::with_reference_data) or
     /// [`with_raw_data`](DatasetBuilder::with_raw_data). An object reference
-    /// supplied that way is screened at `commit` by *address* against what the
-    /// same commit deletes, exactly as one named as a path is screened by name,
-    /// so neither form can be left pointing at storage the delete reclaims.
+    /// supplied that way is screened at `commit` by *address*, against both what
+    /// the same commit deletes and what it rewrites elsewhere, so it cannot be
+    /// left naming storage the commit is vacating — the answer a target named as
+    /// a path already got by name.
     ///
     /// The file must have been opened with [`File::open_rw`], else
     /// [`Error::ReadOnly`](crate::Error::ReadOnly).

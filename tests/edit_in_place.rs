@@ -4008,6 +4008,247 @@ fn a_copy_of_a_reference_dataset_is_allowed_beside_an_unrelated_delete() {
     std::fs::remove_file(&path).ok();
 }
 
+/// An address naming an object the same commit *rewrites elsewhere* is refused
+/// too: the object still exists, but not there (issue #317).
+///
+/// Adding a child to `g` rebuilds its header at a fresh address and frees the
+/// old one, so a reference supplied as `g`'s pre-commit address is stale the
+/// moment the commit lands — and, once something reuses the span, reads as
+/// whatever went there. The same target named as a **path** resolves to the new
+/// address instead, which is why the refusal can point at `with_path_references`
+/// rather than at separate commits.
+#[test]
+fn a_reference_address_to_a_group_this_commit_rewrites_is_refused() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_addr_moved_group.h5");
+    let mut b = FileBuilder::new();
+    let mut g = b.create_group("g");
+    g.create_dataset("inner").with_i32_data(&[1, 2, 3]);
+    b.add_group(g.finish());
+    b.create_dataset("refs").with_path_references(&["g"]);
+    b.write(&path).unwrap();
+
+    let g_addr = {
+        let file = File::open(&path).unwrap();
+        let raw = file.dataset("refs").unwrap().read_raw().unwrap();
+        u64::from_le_bytes(raw[..8].try_into().unwrap())
+    };
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("added", |b| {
+                b.with_reference_data(&[g_addr]);
+            })
+            .unwrap();
+        session
+            .root()
+            .create_dataset("g/newthing", |b| {
+                b.with_i32_data(&[9]);
+            })
+            .unwrap();
+        let err = session.commit().unwrap_err();
+        assert!(err.to_string().contains("rewrites elsewhere"), "got: {err}");
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+
+    // The same commit, with the target named by path, commits — and the
+    // reference resolves to the rebuilt group, `newthing` included.
+    {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("added", |b| {
+                b.with_path_references(&["g"]);
+            })
+            .unwrap();
+        session
+            .root()
+            .create_dataset("g/newthing", |b| {
+                b.with_i32_data(&[9]);
+            })
+            .unwrap();
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    match &file.dataset("added").unwrap().dereference().unwrap()[0] {
+        Object::Group(g) => {
+            let mut names = g.datasets().unwrap();
+            names.sort();
+            assert_eq!(names, vec!["inner".to_string(), "newthing".to_string()]);
+        }
+        other => panic!("expected a group reference, got {other:?}"),
+    }
+    drop(file);
+    std::fs::remove_file(&path).ok();
+}
+
+/// The same rule for a *dataset* target, relocated by an attribute edit rather
+/// than by gaining a child (issue #317).
+///
+/// An attribute edit rewrites the dataset's object header at a fresh address —
+/// its data stays put — so a reference holding the old header address is left
+/// naming freed bytes.
+#[test]
+fn a_reference_address_to_a_relocated_dataset_is_refused() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_addr_moved_dataset.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("d").with_i32_data(&[11, 22, 33]);
+    b.create_dataset("refs").with_path_references(&["d"]);
+    b.write(&path).unwrap();
+
+    let d_addr = {
+        let file = File::open(&path).unwrap();
+        let raw = file.dataset("refs").unwrap().read_raw().unwrap();
+        u64::from_le_bytes(raw[..8].try_into().unwrap())
+    };
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("added", |b| {
+                b.with_reference_data(&[d_addr]);
+            })
+            .unwrap();
+        session
+            .dataset("d")
+            .unwrap()
+            .set_attr("tag", AttrValue::I32(1))
+            .unwrap();
+        let err = session.commit().unwrap_err();
+        assert!(err.to_string().contains("rewrites elsewhere"), "got: {err}");
+    }
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
+/// An address naming an object the commit leaves alone still commits, even
+/// though the commit rewrites *something* — it rebuilds the root group, as every
+/// commit does (issue #317).
+///
+/// This is what keeps the moved-header half a screen rather than a ban: the
+/// list of rewritten headers is non-empty on essentially every commit, so a
+/// gate on "does this commit rewrite anything" would refuse every supplied
+/// address there is.
+#[test]
+fn a_reference_address_to_an_object_this_commit_leaves_alone_is_accepted() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_addr_untouched.h5");
+    let mut b = FileBuilder::new();
+    b.create_dataset("d").with_i32_data(&[11, 22, 33]);
+    b.create_dataset("refs").with_path_references(&["d"]);
+    b.write(&path).unwrap();
+
+    let d_addr = {
+        let file = File::open(&path).unwrap();
+        let raw = file.dataset("refs").unwrap().read_raw().unwrap();
+        u64::from_le_bytes(raw[..8].try_into().unwrap())
+    };
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("added", |b| {
+                b.with_reference_data(&[d_addr]);
+            })
+            .unwrap();
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    match &file.dataset("added").unwrap().dereference().unwrap()[0] {
+        Object::Dataset(ds) => assert_eq!(ds.read_i32().unwrap(), vec![11, 22, 33]),
+        other => panic!("expected a dataset reference, got {other:?}"),
+    }
+    drop(file);
+    std::fs::remove_file(&path).ok();
+}
+
+/// The screen reads every element, not just the first: here element 0 names a
+/// survivor and element 1 names the deleted object (issue #317).
+#[test]
+fn a_hazardous_reference_past_the_first_element_is_found() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_addr_second_element.h5");
+    let mut b = FileBuilder::new();
+    let mut g = b.create_group("g");
+    g.create_dataset("inner").with_i32_data(&[1, 2, 3]);
+    b.add_group(g.finish());
+    let mut keep = b.create_group("keep");
+    keep.create_dataset("survivor").with_i32_data(&[4, 5, 6]);
+    b.add_group(keep.finish());
+    b.create_dataset("probe")
+        .with_path_references(&["keep/survivor", "g/inner"]);
+    b.write(&path).unwrap();
+
+    let (survivor, inner) = {
+        let file = File::open(&path).unwrap();
+        let raw = file.dataset("probe").unwrap().read_raw().unwrap();
+        (
+            u64::from_le_bytes(raw[..8].try_into().unwrap()),
+            u64::from_le_bytes(raw[8..16].try_into().unwrap()),
+        )
+    };
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("added", |b| {
+                b.with_reference_data(&[survivor, inner]);
+            })
+            .unwrap();
+        session.root().delete("g").unwrap();
+        let err = session.commit().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("holds the address of an object this commit deletes"),
+            "got: {err}"
+        );
+    }
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A copied *group* is screened through its whole subtree, not just at its root:
+/// the reference dataset here is a child of the group being copied (issue #317).
+#[test]
+fn a_copied_groups_subtree_is_screened() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_copy_subtree.h5");
+    let mut b = FileBuilder::new();
+    let mut g = b.create_group("g");
+    g.create_dataset("inner").with_i32_data(&[1, 2, 3]);
+    b.add_group(g.finish());
+    let mut holder = b.create_group("holder");
+    holder
+        .create_dataset("refs")
+        .with_path_references(&["g/inner"]);
+    b.add_group(holder.finish());
+    b.write(&path).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session.copy("holder", "holder_copy").unwrap();
+        session.root().delete("g").unwrap();
+        let err = session.commit().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("holds the address of an object this commit deletes"),
+            "got: {err}"
+        );
+    }
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
 /// Build a file with a *chunked* object-reference dataset `crefs` holding two
 /// references to `keep/survivor`, alongside the `probe` path-reference dataset
 /// the address is read back from and a deletable group `g`. Returns the address

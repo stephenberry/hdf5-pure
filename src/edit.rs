@@ -266,6 +266,16 @@ const UNDEF: u64 = u64::MAX;
 const REFERENCE_INTO_RECLAIMED_SPACE: &str = "a reference this commit writes holds the address of an object this commit deletes, or of \
      one under it; the reference would be left pointing at storage the delete can reclaim";
 
+/// The refusal for the other half of [`InvalidatedAddresses`]: the object is
+/// still there, but not at that address any more.
+///
+/// It names the way out, which the removal refusal cannot: the target still
+/// exists, so naming it by path gets the address it lands on rather than the one
+/// it is leaving.
+const REFERENCE_TO_A_MOVED_OBJECT: &str = "a reference this commit writes holds the pre-commit address of an object this commit \
+     rewrites elsewhere; name the target by path (`with_path_references`), which resolves to \
+     where it lands";
+
 /// Maximum number of compact attributes; beyond this HDF5 switches a dataset to
 /// dense (fractal-heap) attribute storage, which this engine does not emit.
 /// Mirrors `DENSE_ATTR_THRESHOLD` in `file_writer`.
@@ -3299,6 +3309,12 @@ impl WriteEngine {
         let mut inplace_writes: Vec<(usize, Vec<u8>)> = Vec::new();
         let mut moving_writes: Vec<(PathKey, String, MovingWrite)> = Vec::new();
         let mut write_targets: Vec<PathKey> = Vec::new();
+        // Pre-commit object-header addresses this commit rewrites elsewhere, for
+        // `InvalidatedAddresses` below: a reference naming one of these keeps an
+        // address the commit is vacating (issue #317). Recorded here rather than
+        // re-derived, since each site has just resolved the address and knows
+        // from its own plan whether the header actually moves.
+        let mut moved_headers: Vec<u64> = Vec::new();
         // The file-wide hard-link count, computed lazily the first time a write
         // relocates a header: such a write moves the dataset's object header and
         // patches only the one parent link that names it, so a dataset reachable
@@ -3351,6 +3367,7 @@ impl WriteEngine {
                             ));
                         }
                     }
+                    moved_headers.push(addr as u64);
                     let leaf = full.last().unwrap().clone();
                     let parent = full[..full.len() - 1].to_vec();
                     moving_writes.push((parent, leaf, mw));
@@ -3406,6 +3423,7 @@ impl WriteEngine {
                     ));
                 }
             }
+            moved_headers.push(addr as u64);
             let leaf = full.last().unwrap().clone();
             let parent = full[..full.len() - 1].to_vec();
             moving_writes.push((parent, leaf, mw));
@@ -3471,6 +3489,7 @@ impl WriteEngine {
                         ));
                     }
                 }
+                moved_headers.push(addr as u64);
                 let region = Self::gather_oh_messages(&self.image(), addr as u64, base)?;
                 let (region, pending_vl_attrs) = apply_group_attr_ops(&region, &ops)?;
                 let leaf = full.last().unwrap().clone();
@@ -3794,6 +3813,10 @@ impl WriteEngine {
             }
         }
 
+        // A rebuilt group's old header is vacated just as a relocated dataset's is,
+        // so the two join one list for the screen below.
+        moved_headers.extend(superseded_addrs.iter().map(|&a| a as u64));
+
         // Apply and validate group attribute edits before any writes. This keeps
         // unsupported attribute edits under the same all-or-nothing preflight
         // contract as unsupported dataset additions. A variable-length attribute
@@ -3883,14 +3906,9 @@ impl WriteEngine {
         // the link graph cannot be walked in full, no deleted object is
         // reclaimed (a safe leak) — and none is screened either, which is sound
         // in the same direction: nothing is freed, so no reference dangles.
-        // Superseded group headers — always dead once the root is repointed —
-        // are reclaimed regardless, and are gathered below rather than here.
-        // They are deliberately outside this screen: a rewritten group is the
-        // same object at the same path, so a reference *named as a path*
-        // resolves to its new address, while every reference already stored in
-        // the file still holds the old one. That second half is a defect of its
-        // own and a wider one, since it breaks references this commit never
-        // touched, and refusing more here would not fix it (issue #324).
+        // Superseded group headers and relocated dataset headers are vacated too,
+        // and are screened separately: `moved_headers` holds them, gathered as
+        // each write's plan was made, and they are addresses rather than spans.
         let mut deleted_free: Vec<(u64, u64, PageType)> = Vec::new();
         deleted_addrs.sort_unstable();
         deleted_addrs.dedup();
@@ -3902,17 +3920,32 @@ impl WriteEngine {
             }
         }
         // The page types the walk records are for the allocator, not for this.
-        let reclaimed = ReclaimedSpace {
-            spans: deleted_free
+        let supplied = InvalidatedAddresses {
+            removed: deleted_free
                 .iter()
                 .map(|&(off, len, _)| (off, len))
                 .collect(),
+            moved: moved_headers,
             base: self.superblock.base_address,
         };
 
         // An in-file copy re-emits its source's element bytes verbatim, so a
         // copied object reference keeps naming whatever it named in the source —
         // including an object this same commit is removing (issue #317).
+        //
+        // Removals only, and this is the one place the two halves part company. A
+        // *supplied* address is a fresh claim about the file, and a commit that
+        // moves the object falsifies it. A *copied* one repeats a claim the file
+        // already made: if the target moves, the reference it was copied from
+        // breaks whether or not the copy happens, so refusing the copy would
+        // rescue nothing and would take with it every copy in every commit —
+        // a commit rebuilds the root group, so `moved` is rarely empty. That
+        // wider breakage is [#324](https://github.com/stephenberry/hdf5-pure/issues/324).
+        let copied = InvalidatedAddresses {
+            removed: supplied.removed.clone(),
+            moved: Vec::new(),
+            base: supplied.base,
+        };
         {
             // Framed at the base address: a shared-message address is stored
             // relative to it, and `SourceResolver` reads its references as
@@ -3924,7 +3957,7 @@ impl WriteEngine {
             };
             for key in &keys {
                 for (_, tree) in &nodes[key].copies {
-                    screen_copied_references(tree, &reclaimed, &framed)?;
+                    screen_copied_references(tree, &copied, &framed)?;
                 }
             }
         }
@@ -3940,7 +3973,7 @@ impl WriteEngine {
         // `reject_foreign_addresses` refuses a reference datatype outright on
         // that path.
         for (_, fd) in staged.datasets.iter().chain(&staged.writes) {
-            screen_resolved_references(&fd.dt, &fd.raw, &reclaimed)?;
+            screen_resolved_references(&fd.dt, &fd.raw, &supplied)?;
         }
 
         // Prove every object-reference target resolves before any write (see
@@ -3955,7 +3988,7 @@ impl WriteEngine {
             &add_targets,
             &write_targets,
             delete_targets,
-            &reclaimed,
+            &supplied,
             &self.image(),
             &self.superblock,
         )?;
@@ -4185,7 +4218,7 @@ impl WriteEngine {
                             &add_targets,
                             &write_targets,
                             &delete_targets,
-                            &reclaimed,
+                            &supplied,
                             &self.image(),
                             &self.superblock,
                         )?;
@@ -6946,7 +6979,7 @@ impl WriteEngine {
         add_targets: &[PathKey],
         write_targets: &[PathKey],
         delete_targets: &[PathKey],
-        reclaimed: &ReclaimedSpace,
+        invalidated: &InvalidatedAddresses,
         src: &(impl Source + ?Sized),
         superblock: &Superblock,
     ) -> Result<u64, Error> {
@@ -6962,8 +6995,8 @@ impl WriteEngine {
             // otherwise write it past the screen its `Path` twin gets — which
             // is the shape of this bug in the first place (issue #317).
             ObjectRefTarget::Raw(addr) => {
-                if reclaimed.covers(*addr) {
-                    return Err(Error::EditUnsupported(REFERENCE_INTO_RECLAIMED_SPACE));
+                if let Some(refusal) = invalidated.refusal(*addr) {
+                    return Err(Error::EditUnsupported(refusal));
                 }
                 return Ok(*addr);
             }
@@ -7019,7 +7052,7 @@ impl WriteEngine {
         add_targets: &[PathKey],
         write_targets: &[PathKey],
         delete_targets: &[PathKey],
-        reclaimed: &ReclaimedSpace,
+        invalidated: &InvalidatedAddresses,
         src: &(impl Source + ?Sized),
         superblock: &Superblock,
     ) -> Result<(), Error> {
@@ -7044,7 +7077,7 @@ impl WriteEngine {
                                 add_targets,
                                 write_targets,
                                 delete_targets,
-                                reclaimed,
+                                invalidated,
                                 src,
                                 superblock,
                             )?;
@@ -7645,55 +7678,76 @@ enum CopyTree {
     },
 }
 
-/// The file spans this commit's deletions reclaim, and the base address the
-/// references screened against them are stored relative to.
+/// The addresses this commit invalidates, against which a reference it writes is
+/// screened (issue #317).
 ///
-/// A deletion frees its object's header and storage, and for a group its whole
-/// subtree — [`WriteEngine::collect_free_spans`] is the walk that enumerates
-/// it. An object reference *is* an object-header address, so a reference this
-/// commit writes that lands inside one of these spans names something the same
-/// commit removes: it survives the commit only until the next allocation reuses
-/// the span, and then dereferences to whatever landed there (issue #317).
+/// An object reference *is* an object-header address, so a commit can falsify one
+/// two ways. It can **remove** the object: a deletion frees its header and
+/// storage, and a group's whole subtree with it
+/// ([`WriteEngine::collect_free_spans`] is the walk that enumerates it), so the
+/// address survives the commit only until the next allocation reuses the span and
+/// then reads as whatever landed there. Or it can **move** it: a dirty group and
+/// a relocating dataset write are both rebuilt at a fresh address, and the old
+/// header is freed once the superblock is repointed.
 ///
-/// These are the very spans the commit later hands to the free-space manager,
-/// taken from one walk rather than two, so the screen and the reclaimer cannot
-/// come to disagree about what this commit removes.
-struct ReclaimedSpace {
-    /// Absolute `(offset, length)` file spans, as
+/// Both are screened here because both are refused on the *path* side — a deleted
+/// path by name, a dirty group or a write target as "still writing"
+/// ([`WriteEngine::resolve_reference_target`]). An address that skipped either
+/// check would make the answer depend on how the caller named the target, which
+/// is the shape of the defect this exists to close.
+///
+/// The removal spans are the very ones the commit hands to the free-space
+/// manager, taken from one walk rather than two, so the screen and the reclaimer
+/// cannot come to disagree about what this commit removes.
+struct InvalidatedAddresses {
+    /// Absolute `(offset, length)` file spans this commit's deletions reclaim, as
     /// [`collect_free_spans`](WriteEngine::collect_free_spans) reports them.
-    spans: Vec<(u64, u64)>,
+    removed: Vec<(u64, u64)>,
+    /// Absolute pre-commit object-header addresses this commit rewrites
+    /// elsewhere: every existing group it dirties, and every dataset write that
+    /// relocates (a resizing or compact overwrite, a staged append, an attribute
+    /// edit). An in-place overwrite does not relocate and is not here — the path
+    /// side refuses it anyway, for want of a cheap way to tell them apart, but
+    /// here the write plan already has.
+    moved: Vec<u64>,
     /// The superblock base address. A stored object reference is *base-relative*
-    /// and these spans are absolute, so the comparison needs it; it is zero for
-    /// every file without a userblock.
+    /// and both lists above are absolute, so the comparison needs it; it is zero
+    /// for every file without a userblock.
     base: u64,
 }
 
-impl ReclaimedSpace {
-    /// Whether this commit reclaims anything at all. A commit that deletes
-    /// nothing — or whose deletes reclaim nothing, because the objects keep a
-    /// surviving hard link — screens no reference, so every caller can skip its
-    /// own work when this is true.
+impl InvalidatedAddresses {
+    /// Whether this commit invalidates anything at all, so a caller with nothing
+    /// cheap to check can skip its own work.
     fn is_empty(&self) -> bool {
-        self.spans.is_empty()
+        self.removed.is_empty() && self.moved.is_empty()
     }
 
-    /// Whether `stored`, one object-reference element exactly as it is written
-    /// to disk, names an object this commit removes.
+    /// The refusal `stored` earns — one object-reference element exactly as it is
+    /// written to disk — or `None` when it still names what it named.
     ///
-    /// The null (`0`) and undefined ([`UNDEF`]) references name no object at
-    /// all, so neither is screened — the same two values
+    /// The null (`0`) and undefined ([`UNDEF`]) references name no object at all,
+    /// so neither is screened: the same two values
     /// [`crate::repack`](crate::repack) carries through verbatim rather than
-    /// resolving.
-    fn covers(&self, stored: u64) -> bool {
+    /// resolving, and the two [`crate::reader`] refuses to dereference.
+    fn refusal(&self, stored: u64) -> Option<&'static str> {
         if stored == 0 || stored == UNDEF {
-            return false;
+            return None;
         }
-        let Some(abs) = stored.checked_add(self.base) else {
-            return false;
-        };
-        self.spans
+        // An address that cannot even be shifted into the file is not one of
+        // ours; leave it to whatever reads it.
+        let abs = stored.checked_add(self.base)?;
+        if self
+            .removed
             .iter()
             .any(|&(off, len)| abs >= off && abs - off < len)
+        {
+            return Some(REFERENCE_INTO_RECLAIMED_SPACE);
+        }
+        if self.moved.contains(&abs) {
+            return Some(REFERENCE_TO_A_MOVED_OBJECT);
+        }
+        None
     }
 }
 
@@ -9677,11 +9731,17 @@ fn datatype_copies_foreign_address(dt: &crate::datatype::Datatype) -> bool {
 /// directly or through a compound member, array entry, or enumeration base.
 ///
 /// The narrow sibling of [`datatype_copies_foreign_address`], which asks the
-/// wider question the cross-file copy path needs. Variable-length data is
-/// deliberately *not* included here: a deletion frees object headers and dataset
-/// storage ([`WriteEngine::collect_free_spans`]) and never a global heap
-/// collection, so variable-length elements keep pointing at data that is still
-/// there.
+/// wider question the cross-file copy path needs.
+///
+/// A variable-length datatype counts only when what it *holds* is an object
+/// reference. The heap itself is not at risk — a deletion frees object headers
+/// and dataset storage ([`WriteEngine::collect_free_spans`]) and never a global
+/// heap collection, so a variable-length string keeps pointing at data that is
+/// still there — but a `H5T_VLEN` of `H5T_STD_REF_OBJ`, which the reference
+/// library writes and an in-file copy carries, keeps its addresses in the heap
+/// *contents*. Those are object addresses like any other, and the element bytes
+/// hold only a heap id, so [`embedded_reference_slots`] finds no slot for them
+/// and [`screen_resolved_references`] refuses rather than passes.
 fn datatype_holds_object_reference(dt: &Datatype) -> bool {
     use crate::datatype::ReferenceType;
     match dt {
@@ -9692,9 +9752,9 @@ fn datatype_holds_object_reference(dt: &Datatype) -> bool {
         Datatype::Compound { members, .. } => members
             .iter()
             .any(|m| datatype_holds_object_reference(&m.datatype)),
-        Datatype::Array { base_type, .. } | Datatype::Enumeration { base_type, .. } => {
-            datatype_holds_object_reference(base_type)
-        }
+        Datatype::Array { base_type, .. }
+        | Datatype::Enumeration { base_type, .. }
+        | Datatype::VariableLength { base_type, .. } => datatype_holds_object_reference(base_type),
         _ => false,
     }
 }
@@ -9710,7 +9770,7 @@ fn datatype_holds_object_reference(dt: &Datatype) -> bool {
 /// existed it was written straight through to disk.
 ///
 /// Element bytes still carrying placeholders are unaffected: an unresolved slot
-/// holds zero, which [`ReclaimedSpace::covers`] never screens, and the target
+/// holds zero, which [`InvalidatedAddresses::covers`] never screens, and the target
 /// that replaces it is screened by `resolve_reference_target` instead — by name
 /// for a path, by address for a raw one. So this runs over every staged
 /// dataset's `raw` without asking which builder filled it: the rule is about the
@@ -9718,9 +9778,9 @@ fn datatype_holds_object_reference(dt: &Datatype) -> bool {
 fn screen_resolved_references(
     dt: &Datatype,
     raw: &[u8],
-    reclaimed: &ReclaimedSpace,
+    invalidated: &InvalidatedAddresses,
 ) -> Result<(), Error> {
-    if reclaimed.is_empty() || !datatype_holds_object_reference(dt) {
+    if invalidated.is_empty() || !datatype_holds_object_reference(dt) {
         return Ok(());
     }
     // The datatype declares an object reference, so the walker must find one.
@@ -9747,8 +9807,8 @@ fn screen_resolved_references(
                 u64::from_le_bytes(element[at..at + 8].try_into().expect(
                     "embedded_reference_slots keeps every slot 8 bytes inside the element",
                 ));
-            if reclaimed.covers(stored) {
-                return Err(Error::EditUnsupported(REFERENCE_INTO_RECLAIMED_SPACE));
+            if let Some(refusal) = invalidated.refusal(stored) {
+                return Err(Error::EditUnsupported(refusal));
             }
         }
     }
@@ -9782,10 +9842,10 @@ fn screen_resolved_references(
 /// (base-relative) shared-message address indexes directly.
 fn screen_copied_references(
     tree: &CopyTree,
-    reclaimed: &ReclaimedSpace,
+    invalidated: &InvalidatedAddresses,
     src: &(impl Source + ?Sized),
 ) -> Result<(), Error> {
-    if reclaimed.is_empty() {
+    if invalidated.is_empty() {
         return Ok(());
     }
     use crate::shared_message::SharedResolver as _;
@@ -9812,7 +9872,7 @@ fn screen_copied_references(
         } => (region, dense_attrs),
     };
     for attr in dense_attrs {
-        screen_resolved_references(&attr.datatype, &attr.raw_data, reclaimed)?;
+        screen_resolved_references(&attr.datatype, &attr.raw_data, invalidated)?;
     }
 
     // One walk of the header: the object's own element datatype, the compact
@@ -9881,7 +9941,7 @@ fn screen_copied_references(
                 .map_err(|_| {
                     Error::EditUnsupported("a source attribute could not be parsed for copying")
                 })?;
-                screen_resolved_references(&attr.datatype, &attr.raw_data, reclaimed)?;
+                screen_resolved_references(&attr.datatype, &attr.raw_data, invalidated)?;
             }
             _ => {}
         }
@@ -9893,7 +9953,7 @@ fn screen_copied_references(
         // that did not yield them leaves a reference datatype unscreened, so it
         // is refused for the same reason a chunked one is.
         CopyTree::DatasetVerbatim { .. } => match (&element_dt, &compact) {
-            (Some(dt), Some(data)) => screen_resolved_references(dt, data, reclaimed)?,
+            (Some(dt), Some(data)) => screen_resolved_references(dt, data, invalidated)?,
             (Some(dt), None) if datatype_holds_object_reference(dt) => {
                 return Err(Error::EditUnsupported(
                     "a compact object-reference dataset's elements could not be read to screen \
@@ -9909,7 +9969,7 @@ fn screen_copied_references(
         // present and says a reference is in bytes it could not reach.
         CopyTree::DatasetContiguous { data, .. } => {
             if let Some(dt) = &element_dt {
-                screen_resolved_references(dt, data, reclaimed)?;
+                screen_resolved_references(dt, data, invalidated)?;
             }
         }
         // Chunked: `chunk_bytes` are carried exactly as the source stored them,
@@ -9928,7 +9988,7 @@ fn screen_copied_references(
         }
         CopyTree::Group { children, .. } => {
             for (_, child) in children {
-                screen_copied_references(child, reclaimed, src)?;
+                screen_copied_references(child, invalidated, src)?;
             }
         }
     }
@@ -10071,8 +10131,9 @@ mod tests {
     #[test]
     fn a_copied_compact_reference_dataset_is_screened() {
         let empty = BytesSource::new(Vec::new());
-        let reclaimed = ReclaimedSpace {
-            spans: vec![(248, 71)],
+        let invalidated = InvalidatedAddresses {
+            removed: vec![(248, 71)],
+            moved: Vec::new(),
             base: 0,
         };
         for (address, refused) in [(248u64, true), (318, true), (319, false)] {
@@ -10080,7 +10141,7 @@ mod tests {
                 region: compact_reference_region(address),
                 dense_attrs: Vec::new(),
             };
-            let got = screen_copied_references(&tree, &reclaimed, &empty);
+            let got = screen_copied_references(&tree, &invalidated, &empty);
             assert_eq!(got.is_err(), refused, "compact element {address}: {got:?}");
         }
 
@@ -10096,7 +10157,7 @@ mod tests {
             ),
             dense_attrs: Vec::new(),
         };
-        let err = screen_copied_references(&no_layout, &reclaimed, &empty).unwrap_err();
+        let err = screen_copied_references(&no_layout, &invalidated, &empty).unwrap_err();
         assert!(
             err.to_string().contains("could not be read to screen"),
             "got: {err}"
@@ -10132,11 +10193,12 @@ mod tests {
         );
 
         let raw = [0u8; 8];
-        let reclaimed = ReclaimedSpace {
-            spans: vec![(248, 71)],
+        let invalidated = InvalidatedAddresses {
+            removed: vec![(248, 71)],
+            moved: Vec::new(),
             base: 0,
         };
-        let err = screen_resolved_references(&dt, &raw, &reclaimed).unwrap_err();
+        let err = screen_resolved_references(&dt, &raw, &invalidated).unwrap_err();
         assert!(
             err.to_string().contains("could not be located"),
             "got: {err}"
@@ -10144,8 +10206,9 @@ mod tests {
 
         // A commit that reclaims nothing has nothing to screen it against, so
         // the datatype alone is not a refusal.
-        let nothing = ReclaimedSpace {
-            spans: Vec::new(),
+        let nothing = InvalidatedAddresses {
+            removed: Vec::new(),
+            moved: Vec::new(),
             base: 0,
         };
         assert!(screen_resolved_references(&dt, &raw, &nothing).is_ok());
@@ -10175,16 +10238,18 @@ mod tests {
 
         let mut raw = vec![0u8; 16];
         raw[..8].copy_from_slice(&300u64.to_le_bytes());
-        let reclaimed = ReclaimedSpace {
-            spans: vec![(248, 71)],
+        let invalidated = InvalidatedAddresses {
+            removed: vec![(248, 71)],
+            moved: Vec::new(),
             base: 0,
         };
-        let err = screen_resolved_references(&dt, &raw, &reclaimed).unwrap_err();
+        let err = screen_resolved_references(&dt, &raw, &invalidated).unwrap_err();
         assert!(err.to_string().contains("cannot be screened"), "got: {err}");
 
         // Still nothing to screen against when the commit reclaims nothing.
-        let nothing = ReclaimedSpace {
-            spans: Vec::new(),
+        let nothing = InvalidatedAddresses {
+            removed: Vec::new(),
+            moved: Vec::new(),
             base: 0,
         };
         assert!(screen_resolved_references(&dt, &raw, &nothing).is_ok());
@@ -10213,7 +10278,7 @@ mod tests {
 
         let nodes: BTreeMap<PathKey, Node> = BTreeMap::new();
         let path_addr: BTreeMap<PathKey, u64> = BTreeMap::new();
-        let resolve = |address: u64, spans: Vec<(u64, u64)>| {
+        let resolve = |address: u64, removed: Vec<(u64, u64)>, moved: Vec<u64>| {
             WriteEngine::resolve_reference_target(
                 &ObjectRefTarget::Raw(address),
                 &path_addr,
@@ -10221,30 +10286,41 @@ mod tests {
                 &[],
                 &[],
                 &[],
-                &ReclaimedSpace { spans, base: 0 },
+                &InvalidatedAddresses {
+                    removed,
+                    moved,
+                    base: 0,
+                },
                 &engine.image(),
                 engine.superblock(),
             )
         };
 
         assert!(
-            resolve(300, vec![(248, 71)]).is_err(),
+            resolve(300, vec![(248, 71)], Vec::new()).is_err(),
             "an address inside a reclaimed span is refused"
         );
-        assert_eq!(
-            resolve(300, vec![(400, 71)]).unwrap(),
-            300,
-            "an address outside every reclaimed span is carried through"
+        assert!(
+            resolve(300, Vec::new(), vec![300]).is_err(),
+            "an address this commit rewrites elsewhere is refused"
         );
         assert_eq!(
-            resolve(300, Vec::new()).unwrap(),
+            resolve(300, vec![(400, 71)], vec![299, 301]).unwrap(),
+            300,
+            "an address outside every reclaimed span and every moved header is carried through"
+        );
+        assert_eq!(
+            resolve(300, Vec::new(), Vec::new()).unwrap(),
             300,
             "a commit that reclaims nothing screens nothing"
         );
         // The two sentinels name no object, so they are carried through even
         // when they fall inside a reclaimed span.
-        assert_eq!(resolve(0, vec![(0, 4096)]).unwrap(), 0);
-        assert_eq!(resolve(UNDEF, vec![(0, u64::MAX)]).unwrap(), UNDEF);
+        assert_eq!(resolve(0, vec![(0, 4096)], vec![0]).unwrap(), 0);
+        assert_eq!(
+            resolve(UNDEF, vec![(0, u64::MAX)], vec![UNDEF]).unwrap(),
+            UNDEF
+        );
     }
 
     /// A copied object's *attributes* are screened against the space the commit
@@ -10254,8 +10330,9 @@ mod tests {
     #[test]
     fn a_copied_reference_attribute_is_screened_in_both_storages() {
         let empty = BytesSource::new(Vec::new());
-        let reclaimed = ReclaimedSpace {
-            spans: vec![(248, 71)],
+        let invalidated = InvalidatedAddresses {
+            removed: vec![(248, 71)],
+            moved: Vec::new(),
             base: 0,
         };
         // 248 is the first byte of the reclaimed span, 318 its last, 319 the
@@ -10271,7 +10348,7 @@ mod tests {
                 dense_attrs: Vec::new(),
             };
             for (storage, tree) in [("dense", &dense), ("inline", &inline)] {
-                let got = screen_copied_references(tree, &reclaimed, &empty);
+                let got = screen_copied_references(tree, &invalidated, &empty);
                 assert_eq!(
                     got.is_err(),
                     refused,
