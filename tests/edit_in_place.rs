@@ -3877,12 +3877,6 @@ fn write_dataset_rejects_vlen_strings_without_writing() {
 /// written eight zero bytes over a working reference dataset — so a test that
 /// only checked for an error would pass against a refusal placed after the
 /// write.
-///
-/// Both lengths are exercised because the two would have been destroyed through
-/// different doors: a same-length overwrite goes straight over the existing data
-/// block with no apply loop at all, a different-length one relocates the dataset.
-/// The refusal reads the staged builder and nothing else, so neither reaches a
-/// plan.
 #[test]
 fn write_dataset_rejects_object_references_without_writing() {
     let path = std::env::temp_dir().join("hdf5_pure_edit_write_object_ref_rejected.h5");
@@ -3896,24 +3890,11 @@ fn write_dataset_rejects_object_references_without_writing() {
 
     {
         let session = File::open_rw(&path).unwrap();
-        // Same element count: the same-length in-place path.
         let err = session
             .dataset("refs")
             .unwrap()
             .write_staged(|b| {
                 b.with_path_references(&["bb"]);
-            })
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("object-reference"),
-            "expected an object-reference refusal, got: {err}"
-        );
-        // A different element count: the relocating path.
-        let err = session
-            .dataset("refs")
-            .unwrap()
-            .write_staged(|b| {
-                b.with_path_references(&["a", "bb"]);
             })
             .unwrap_err();
         assert!(

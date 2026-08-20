@@ -2023,10 +2023,13 @@ impl WriteEngine {
     /// `commit` reports [`Error::EditUnsupported`]. Contiguous, compact, and
     /// chunked (including filtered) datasets are all supported; the dataset's
     /// existing chunk geometry, filter pipeline, and chunk index are taken from the
-    /// on-disk header (a builder that itself requests chunking/filtering is refused
-    /// as "not a value overwrite"). A chunk index this engine cannot enumerate (a
-    /// version-2 B-tree) is refused. Partial / sub-region writes are out of scope —
-    /// the whole dataset is replaced.
+    /// on-disk header. A chunk index this engine cannot enumerate (a version-2
+    /// B-tree) is refused. Partial / sub-region writes are out of scope — the
+    /// whole dataset is replaced.
+    ///
+    /// What the builder alone can rule out —
+    /// [`refuse_unsupported_overwrite`](Self::refuse_unsupported_overwrite) —
+    /// is refused *here* rather than at `commit`.
     ///
     /// When the new data is the same length as the existing contiguous data block
     /// (the common case), the bytes are written straight into that block: no
@@ -5082,13 +5085,9 @@ impl WriteEngine {
     ///
     /// [`stage_dataset_write`](Self::stage_dataset_write) applies these as the
     /// write is staged, so the call that configured the builder is the one that
-    /// reports the mistake. What is left to
-    /// [`prepare_write`](Self::prepare_write) all needs the target's header: its
-    /// datatype, its shape, and how its storage is laid out.
-    ///
-    /// A refusal that reads only `fd` belongs here rather than beside those.
-    /// Issue #318 was a missing arm in this set — the object-reference case, next
-    /// to the variable-length-string one whose reasoning it shares entirely.
+    /// reports the mistake. A refusal that reads only `fd` belongs here; one that
+    /// needs the target's header belongs in
+    /// [`prepare_write`](Self::prepare_write).
     fn refuse_unsupported_overwrite(fd: &FlatDataset) -> Result<(), Error> {
         // A value overwrite never introduces chunking, filters, or an extensible
         // shape: those would change the storage layout, not just the bytes.
@@ -5138,17 +5137,14 @@ impl WriteEngine {
             ));
         }
 
-        // Every producer of `reference_targets` stages the same shape of
-        // placeholder — the public `with_path_references` and the two forms
-        // repack re-emits through — and the overwrite path resolves them just as
-        // little: the field is read only by the add path, in
-        // `preflight_reference_targets` and the apply loop that follows it. Left
-        // unrefused, a staged overwrite writes address-zero placeholders over a
-        // working reference dataset and `commit` reports `Ok` (issue #318).
-        //
-        // `with_reference_data` is not one of them: it stores the addresses the
-        // caller supplied, so there is nothing left to resolve and it overwrites
-        // like any other value.
+        // `reference_targets` holds elements only the add path resolves, in
+        // `preflight_reference_targets` and the apply loop after it; the
+        // overwrite path never reads the field. Checked on the field rather than
+        // on `with_path_references`, since every producer stages elements that
+        // are equally unresolved. Left unrefused, a staged overwrite writes
+        // address-zero placeholders over a working reference dataset and
+        // `commit` reports `Ok` (issue #318). `with_reference_data` supplies
+        // resolved addresses and overwrites like any other value.
         if fd.reference_targets.is_some() {
             return Err(Error::EditUnsupported(
                 "write_dataset cannot overwrite an object-reference dataset's \
@@ -5172,9 +5168,8 @@ impl WriteEngine {
     /// on-disk dataset's is likewise refused — this is a value overwrite, not a
     /// reshape or retype.
     ///
-    /// Every refusal `fd` can decide on its own has been made by then, by
-    /// [`refuse_unsupported_overwrite`](Self::refuse_unsupported_overwrite),
-    /// where the write is staged. Each one left here reads the header.
+    /// Every refusal `fd` can decide on its own has been made by then, where the
+    /// write is staged.
     fn prepare_write<S: Source + ?Sized>(
         src: &S,
         addr: u64,
