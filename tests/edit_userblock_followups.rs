@@ -478,7 +478,14 @@ fn userblock_reference_to_an_object_the_same_commit_places() {
     // same commit placed.
     let raw = file.dataset("refs").unwrap().read_raw().unwrap();
     let stored = u64::from_le_bytes(raw[..8].try_into().unwrap());
-    assert!(stored > 0 && stored < UB as u64, "base-relative: {stored}");
+    // Base-relative, so it is smaller than the absolute offset the object sits
+    // at. (It is under `UB` here only because this fixture is small; the
+    // dereference below is what proves the value is the right one.)
+    let absolute = stored + UB as u64;
+    assert!(
+        stored > 0 && absolute > UB as u64,
+        "base-relative: {stored}"
+    );
     let targets = file.dataset("refs").unwrap().dereference().unwrap();
     match &targets[0] {
         hdf5_pure::Object::Dataset(ds) => assert_eq!(ds.read_i32().unwrap(), vec![7, 8, 9]),

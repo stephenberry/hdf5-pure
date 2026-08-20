@@ -1124,9 +1124,10 @@ impl Datatype {
     }
 }
 
-/// Whether `dt` reaches an object reference anywhere in its structure, directly
-/// or through a compound member, array entry, enumeration base, or the contents
-/// of a variable-length sequence.
+/// Whether `dt` reaches an **object address** anywhere in its structure — an
+/// object or dataset-region reference, directly or through a compound member,
+/// array entry, enumeration base, or the contents of a variable-length
+/// sequence.
 ///
 /// The paired half of [`embedded_reference_slots`], which locates the ones it
 /// can address. This one recognises an object reference of any width and in any
@@ -1142,18 +1143,20 @@ impl Datatype {
 /// string keeps pointing at data that is still there — but a `H5T_VLEN` of
 /// `H5T_STD_REF_OBJ`, which the reference library writes, keeps its addresses in
 /// the heap *contents*, where the element bytes hold only a heap id.
-pub(crate) fn datatype_holds_object_reference(dt: &Datatype) -> bool {
+pub(crate) fn datatype_holds_object_address(dt: &Datatype) -> bool {
     match dt {
-        Datatype::Reference {
-            ref_type: ReferenceType::Object,
-            ..
-        } => true,
+        // Both reference kinds name an object. An object reference *is* the
+        // header address; a dataset-region reference is a global-heap id whose
+        // heap object holds the address and a selection, so the address is one
+        // indirection further out — out of reach of a screen that reads element
+        // bytes, which is what makes it unmappable rather than absent.
+        Datatype::Reference { .. } => true,
         Datatype::Compound { members, .. } => members
             .iter()
-            .any(|m| datatype_holds_object_reference(&m.datatype)),
+            .any(|m| datatype_holds_object_address(&m.datatype)),
         Datatype::Array { base_type, .. }
         | Datatype::Enumeration { base_type, .. }
-        | Datatype::VariableLength { base_type, .. } => datatype_holds_object_reference(base_type),
+        | Datatype::VariableLength { base_type, .. } => datatype_holds_object_address(base_type),
         _ => false,
     }
 }
@@ -1169,7 +1172,7 @@ pub(crate) fn datatype_holds_object_reference(dt: &Datatype) -> bool {
 /// Returns `None` when the element bytes cannot be walked safely: the offsets
 /// found do not fit the datatype's declared element size, or the type reaches an
 /// object reference this walker cannot address (see
-/// [`datatype_holds_object_reference`]). Both mean the same thing to a caller —
+/// [`datatype_holds_object_address`]). Both mean the same thing to a caller —
 /// the addresses are not readable from here — so neither is reported as an empty
 /// slot list, which would read as "this type holds none".
 pub(crate) fn embedded_reference_slots(datatype: &Datatype) -> Option<Vec<usize>> {
@@ -1253,7 +1256,7 @@ pub(crate) fn embedded_reference_slots(datatype: &Datatype) -> Option<Vec<usize>
             // say so rather than report "no slots here" and let a caller read
             // that as "nothing to check". Asking the predicate rather than
             // restating its arms is what keeps the pair honest as either grows.
-            _ => !datatype_holds_object_reference(datatype),
+            _ => !datatype_holds_object_address(datatype),
         }
     }
 

@@ -215,7 +215,7 @@ use crate::convert::TryToUsize;
 use crate::data_layout::DataLayout;
 use crate::dataspace::{Dataspace, DataspaceType};
 use crate::datatype::{
-    Datatype, DatatypeByteOrder, datatype_holds_object_reference, embedded_reference_slots,
+    Datatype, DatatypeByteOrder, datatype_holds_object_address, embedded_reference_slots,
 };
 use crate::error::{Error, FormatError, OBJECT_HEADER_MESSAGE_MAX};
 use crate::extensible_array::ExtensibleArrayHeader;
@@ -272,10 +272,13 @@ const REFERENCE_INTO_RECLAIMED_SPACE: &str = "a reference this commit writes hol
 /// still there, but not at that address any more.
 ///
 /// It can offer a way out, which the removal refusal cannot: the target still
-/// exists, so a path names it. Whether the path resolves depends on where the
-/// commit has got to — [`WriteEngine::resolve_reference_target`] resolves it once
-/// this commit has placed the target and reports "still writing" until then — so
-/// the message names separate commits as well, rather than promising the first.
+/// exists, so a path names it. Whether the path *works* depends on which half of
+/// [`InvalidatedAddresses::moved`] the target came from, which is why the message
+/// names separate commits as well rather than promising the first.
+/// [`WriteEngine::resolve_reference_target`] resolves a **dirty group** once this
+/// commit has placed it, and reports "still writing" until then; a **relocating
+/// dataset write** it refuses outright, by exact match against `write_targets`,
+/// with no later point at which that changes.
 const REFERENCE_TO_A_MOVED_OBJECT: &str = "a reference this commit writes holds the pre-commit address of an object this commit \
      rewrites elsewhere; name the target by path (`with_path_references`) so it resolves to \
      where the object lands, or use separate commits";
@@ -4056,8 +4059,10 @@ impl WriteEngine {
         // also vacates its old data block: both become dead once the parent's
         // relinked header lands. `superseded_addrs` covers only the rebuilt group
         // headers, not the relocated dataset's own header, so record that here too.
-        // The pre-commit dataset-header address is resolved from the live file; its
-        // chunks and old data extent are freed only after the superblock repoint.
+        // The pre-commit dataset-header address rides on the write plan (`old_oh`),
+        // recorded where the plan was made; its chunks and old data extent are
+        // freed only after the superblock repoint.
+
         // The single-hard-link guard in the write preflight makes freeing the old
         // header safe (no surviving link still points at it).
         for key in &keys {
@@ -9767,7 +9772,7 @@ fn screen_resolved_references(
     raw: &[u8],
     invalidated: &InvalidatedAddresses,
 ) -> Result<(), Error> {
-    if !datatype_holds_object_reference(dt) {
+    if !datatype_holds_object_address(dt) {
         return Ok(());
     }
     // The datatype declares an object reference, so the walker must find one.
@@ -9776,26 +9781,31 @@ fn screen_resolved_references(
     // 8-byte object reference only, and reports any other width as no slots at
     // all. Both mean the addresses cannot be read, and an empty list taken for
     // "nothing to check" would wave through exactly the datatype
-    // `datatype_holds_object_reference` had just recognised. Neither shape is
+    // `datatype_holds_object_address` had just recognised. Neither shape is
     // one this crate builds; refuse rather than write references past a screen
     // that could not see them.
     let Some(slots) = embedded_reference_slots(dt).filter(|slots| !slots.is_empty()) else {
         // Unconditional, unlike the per-address checks below. Those refuse an
         // address that lands somewhere this commit vacates; this one cannot read
-        // the addresses at all, so there is nothing to compare and no commit it
-        // could be safe in — `moved` is never empty, since a commit always
-        // rebuilds the root group. An in-file copy reaches this only beside a
-        // deletion, because it is screened against `for_copied`, whose `moved`
-        // is empty by construction.
+        // the addresses at all, so there is nothing to compare against and no
+        // amount of screening would help. Every commit that reaches here rebuilds
+        // at least the root group, so `for_supplied.moved` is never empty and
+        // gating this would have changed nothing anyway. A commit whose only
+        // staged edit is a same-length in-place overwrite never reaches here at
+        // all — it takes the fast path above, which vacates nothing. An in-file
+        // copy reaches this only beside a deletion, because it is screened
+        // against `for_copied`, whose `moved` is empty by construction.
         //
         // The `filter` is belt-and-braces: `embedded_reference_slots` already
         // reports an unaddressable reference as `None` rather than as an empty
         // list, and reading an empty list as "nothing to check" is exactly the
         // hole this screen was found to have.
         return Err(Error::EditUnsupported(
-            "an object reference this commit writes could not be located in its datatype, so it \
-             cannot be screened against what this commit vacates; supply an 8-byte object \
-             reference (`with_reference_data`)",
+            "a reference this commit writes sits in a datatype whose addresses this screen \
+             cannot read — a width other than eight, a dataset-region reference, a \
+             variable length of them, or a compound holding one beside a reference it can \
+             read — so it cannot be checked against what this commit vacates; supply an \
+             8-byte object reference (`with_reference_data`)",
         ));
     };
     // Non-empty slots mean the datatype has room for at least one 8-byte
@@ -9954,7 +9964,7 @@ fn screen_copied_references(
         // is refused for the same reason a chunked one is.
         CopyTree::DatasetVerbatim { .. } => match (&element_dt, &compact) {
             (Some(dt), Some(data)) => screen_resolved_references(dt, data, invalidated)?,
-            (Some(dt), None) if datatype_holds_object_reference(dt) => {
+            (Some(dt), None) if datatype_holds_object_address(dt) => {
                 return Err(Error::EditUnsupported(
                     "a compact object-reference dataset's elements could not be read to screen \
                      them against this commit's deletions; use separate commits",
@@ -9977,7 +9987,7 @@ fn screen_copied_references(
         CopyTree::DatasetChunked { .. } => {
             if element_dt
                 .as_ref()
-                .is_some_and(datatype_holds_object_reference)
+                .is_some_and(datatype_holds_object_address)
             {
                 return Err(Error::EditUnsupported(
                     "a chunked object-reference dataset cannot be copied in a commit that also \
@@ -10200,7 +10210,7 @@ mod tests {
         };
         let err = screen_resolved_references(&dt, &raw, &invalidated).unwrap_err();
         assert!(
-            err.to_string().contains("could not be located"),
+            err.to_string().contains("this screen cannot read"),
             "got: {err}"
         );
 
@@ -10247,7 +10257,7 @@ mod tests {
 
         let err = screen_resolved_references(&of_references, &raw, &invalidated).unwrap_err();
         assert!(
-            err.to_string().contains("could not be located"),
+            err.to_string().contains("this screen cannot read"),
             "got: {err}"
         );
         assert!(
@@ -10259,7 +10269,7 @@ mod tests {
     /// An object reference wider than the 8 bytes the slot walker maps is
     /// refused, not skipped (issue #317).
     ///
-    /// [`datatype_holds_object_reference`] answers for an object reference of
+    /// [`datatype_holds_object_address`] answers for an object reference of
     /// *any* width, while [`embedded_reference_slots`] locates only the 8-byte
     /// one — so the walker reports a width it cannot address as unwalkable
     /// rather than as "no slots here", which a screen would read as "nothing to
@@ -10285,7 +10295,10 @@ mod tests {
             base: 0,
         };
         let err = screen_resolved_references(&dt, &raw, &invalidated).unwrap_err();
-        assert!(err.to_string().contains("cannot be screened"), "got: {err}");
+        assert!(
+            err.to_string().contains("this screen cannot read"),
+            "got: {err}"
+        );
 
         // Unconditional, for the reason
         // `a_datatype_whose_reference_slots_do_not_fit_is_refused` states.

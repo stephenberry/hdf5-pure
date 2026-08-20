@@ -4158,8 +4158,10 @@ fn a_reference_address_to_a_relocated_dataset_is_refused() {
 /// unaddressable instead, which is what its fall-through arm asks
 /// `datatype_holds_object_reference` in order to know.
 ///
-/// Both members are reachable from a plain C-written file through `copy`, and
-/// from `with_raw_data` here, which takes whatever `Datatype` it is given.
+/// The variable-length half is what the reference C library writes (`H5T_VLEN`
+/// of `H5T_STD_REF_OBJ`), so a plain `copy` reaches it; the 16-byte reference is
+/// this crate's own construction. Both arrive through `with_raw_data`, which
+/// takes whatever `Datatype` it is given.
 #[test]
 fn a_datatype_mixing_locatable_and_unlocatable_references_is_refused() {
     let object_ref = || Datatype::Reference {
@@ -4211,7 +4213,7 @@ fn a_datatype_mixing_locatable_and_unlocatable_references_is_refused() {
             session.root().delete("g").unwrap();
             let err = session.commit().unwrap_err();
             assert!(
-                err.to_string().contains("could not be located"),
+                err.to_string().contains("this screen cannot read"),
                 "{tag}: got {err}"
             );
         }
@@ -4221,9 +4223,56 @@ fn a_datatype_mixing_locatable_and_unlocatable_references_is_refused() {
     }
 }
 
+/// A **dataset-region** reference is refused beside a delete, like every other
+/// reference whose address this screen cannot read (issue #317).
+///
+/// Its element bytes are a global-heap id, and the object address sits in the
+/// heap object that id names — one indirection further out than the element
+/// bytes this screen walks. So it is unreadable rather than absent, which is why
+/// `datatype_holds_object_address` counts it and the walker declines to map it.
+/// Nothing in this crate builds one; `with_raw_data` and an in-file `copy` of a
+/// C-written file are the doors.
+#[test]
+fn a_dataset_region_reference_is_refused_beside_a_delete() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_region.h5");
+    let inner = write_reference_fixture(&path);
+    let before = std::fs::read(&path).unwrap();
+
+    let mut element = vec![0u8; 12];
+    element[..8].copy_from_slice(&inner.to_le_bytes());
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("added", |b| {
+                b.with_raw_data(
+                    Datatype::Reference {
+                        size: 12,
+                        ref_type: ReferenceType::DatasetRegion,
+                    },
+                    element.clone(),
+                    1,
+                );
+            })
+            .unwrap();
+        session.root().delete("g").unwrap();
+        let err = session.commit().unwrap_err();
+        assert!(
+            err.to_string().contains("this screen cannot read"),
+            "got: {err}"
+        );
+    }
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
 /// The relocating-write half of `moved`, through the two doors an attribute
-/// edit does not cover: a **resizing overwrite** and a **staged append**, each
-/// of which rewrites the dataset's header at a fresh address (issue #317).
+/// edit does not cover: a **chunked rebuild** (a filtered chunk whose
+/// replacement no longer fits its slot — the element count is unchanged, so
+/// this is not a reshape) and a **staged append**, each of which rewrites the
+/// dataset's header at a fresh address (issue #317).
 ///
 /// Both reach `moved` from the write plan rather than from the path, so a
 /// reference supplied as the target's pre-commit address is refused where the

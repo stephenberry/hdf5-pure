@@ -247,14 +247,17 @@ fn persisting_session_seeds_reusable_free_on_open() {
     assert_internally_consistent(&acct);
 }
 
-/// A relocating overwrite vacates two adjacent things — the dataset's old object
-/// header and its old chunk storage — and both are reclaimed, so they coalesce
-/// into a single reusable region rather than leaving the header stranded between
-/// the freed chunks (issue #317's refactor carries the old header address on the
-/// write plan; before that it was re-derived by a second path lookup).
+/// A relocating overwrite leaves three adjacent things free — the superseded
+/// root group header, the dataset's old object header, and its old chunk storage
+/// — and all three are reclaimed, so they coalesce into a single reusable region
+/// rather than leaving the dataset's header stranded between the other two
+/// (issue #317's refactor carries that header's address on the write plan; before
+/// it, the reclaim loop re-derived it with a second path lookup).
 ///
-/// The single region is the assertion that bites: leaving the header unreclaimed
-/// still reports free space, just less of it and in two pieces.
+/// The single region is the assertion that bites: leaving the dataset's header
+/// unreclaimed still reports free space, just less of it and in two pieces. It
+/// is one-sided — freeing *too much* would also coalesce — so the read-back
+/// below is what stands against that direction.
 #[test]
 fn a_relocating_overwrite_reclaims_the_old_header_with_its_storage() {
     let dir = tempdir().unwrap();
