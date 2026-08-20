@@ -3,7 +3,7 @@
 
 use hdf5_pure::{
     AttrValue, CharacterSet, DType, Datatype, Error, File, FileBuilder, FormatError, Object,
-    ScaleOffset, StringPadding,
+    ReferenceType, ScaleOffset, StringPadding,
 };
 
 /// Write a starter file with one dataset, returning its path.
@@ -3764,6 +3764,401 @@ fn add_reference_dataset_targeting_write_overwrite_target_is_rejected_without_wr
     }
 
     assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
+/// The fixture the address-side reference tests below share (issue #317): a
+/// dataset inside a group a commit can delete, and a reference dataset naming
+/// it by path. Returns the address `refs` stores — which is what a caller hands
+/// to `with_reference_data` to stage the *same* reference as an address rather
+/// than as a path, the form `resolve_reference_target` never sees.
+///
+/// `inner` is deliberately large enough that the group's reclaimed span is wide
+/// and unmistakable; the assertions below do not depend on its contents.
+fn write_reference_fixture(path: &std::path::Path) -> u64 {
+    let mut b = FileBuilder::new();
+    let mut g = b.create_group("g");
+    g.create_dataset("inner")
+        .with_i32_data(&(0..512).collect::<Vec<i32>>());
+    b.add_group(g.finish());
+    b.create_dataset("refs").with_path_references(&["g/inner"]);
+    b.write(path).unwrap();
+
+    let file = File::open(path).unwrap();
+    let raw = file.dataset("refs").unwrap().read_raw().unwrap();
+    u64::from_le_bytes(raw[..8].try_into().unwrap())
+}
+
+/// A reference *added* as a resolved address, naming an object the same commit
+/// deletes, is refused rather than written (issue #317).
+///
+/// `with_reference_data` stages element bytes that are already addresses, so it
+/// sets no `reference_targets` and never reaches `resolve_reference_target` —
+/// the function carrying the by-name delete refusal that the identical target
+/// gets when it is named as a path (issue #314). Before the screen this commit
+/// returned `Ok`, leaving `added` pointing into the span the same commit had
+/// just reported as reusable.
+#[test]
+fn an_added_reference_address_into_deleted_space_is_refused() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_addr_add.h5");
+    let inner = write_reference_fixture(&path);
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("added", |b| {
+                b.with_reference_data(&[inner]);
+            })
+            .unwrap();
+        session.root().delete("g").unwrap();
+        let err = session.commit().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("holds the address of an object this commit deletes"),
+            "got: {err}"
+        );
+        // A refusal returns the whole batch to the caller (issue #316).
+        assert!(session.has_staged_edits());
+    }
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
+/// The same address through the *overwrite* door, which reaches neither
+/// `resolve_reference_target` nor `preflight_reference_targets`: a staged write
+/// replaces an existing dataset's bytes instead of placing a new object, so it
+/// is screened on its own (issue #317).
+#[test]
+fn an_overwritten_reference_address_into_deleted_space_is_refused() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_addr_write.h5");
+    let inner = write_reference_fixture(&path);
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .dataset("refs")
+            .unwrap()
+            .write_staged(|b| {
+                b.with_reference_data(&[inner]);
+            })
+            .unwrap();
+        session.root().delete("g").unwrap();
+        let err = session.commit().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("holds the address of an object this commit deletes"),
+            "got: {err}"
+        );
+    }
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
+/// An address naming an object the delete does not touch still commits, and
+/// dereferences to it (issue #317).
+///
+/// This is what makes the screen a test of *where the address points* rather
+/// than of whether the commit deletes anything: `doomed` goes away in the same
+/// commit that writes a reference to `keep/survivor`, and only the second fact
+/// decides the verdict.
+#[test]
+fn a_reference_address_to_a_surviving_object_is_accepted_beside_a_delete() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_addr_survivor.h5");
+    let mut b = FileBuilder::new();
+    let mut doomed = b.create_group("doomed");
+    doomed.create_dataset("inner").with_i32_data(&[7]);
+    b.add_group(doomed.finish());
+    let mut keep = b.create_group("keep");
+    keep.create_dataset("survivor").with_i32_data(&[4, 5, 6]);
+    b.add_group(keep.finish());
+    b.create_dataset("refs")
+        .with_path_references(&["keep/survivor"]);
+    b.write(&path).unwrap();
+
+    let survivor = {
+        let file = File::open(&path).unwrap();
+        let raw = file.dataset("refs").unwrap().read_raw().unwrap();
+        u64::from_le_bytes(raw[..8].try_into().unwrap())
+    };
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session
+            .root()
+            .create_dataset("added", |b| {
+                b.with_reference_data(&[survivor]);
+            })
+            .unwrap();
+        session.root().delete("doomed").unwrap();
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let targets = file.dataset("added").unwrap().dereference().unwrap();
+    assert_eq!(targets.len(), 1);
+    match &targets[0] {
+        Object::Dataset(ds) => assert_eq!(ds.read_i32().unwrap(), vec![4, 5, 6]),
+        other => panic!("expected a dataset reference, got {other:?}"),
+    }
+    drop(file);
+    std::fs::remove_file(&path).ok();
+}
+
+/// An in-file copy re-emits its source's element bytes verbatim, which for an
+/// object-reference dataset means re-emitting addresses. The copy of `refs`
+/// would land pointing at `g/inner`, which the same commit deletes, so the
+/// copied elements are screened exactly as a staged dataset's are and the
+/// commit is refused (issue #317).
+#[test]
+fn a_copy_of_a_reference_dataset_beside_a_delete_is_refused() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_copy_delete.h5");
+    write_reference_fixture(&path);
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session.copy("refs", "refs_copy").unwrap();
+        session.root().delete("g").unwrap();
+        let err = session.commit().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("holds the address of an object this commit deletes"),
+            "got: {err}"
+        );
+    }
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
+/// The other half of that rule: with nothing deleted there is no reclaimed
+/// space to point into, so the same copy commits and both datasets dereference
+/// to the same object (issue #317).
+///
+/// The companion to `copy_same_file_still_allows_variable_length_attribute`:
+/// an in-file copy keeps addresses valid by sharing the file, and only a
+/// removal in the same commit takes that away.
+#[test]
+fn a_copy_of_a_reference_dataset_without_a_delete_still_works() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_copy_plain.h5");
+    write_reference_fixture(&path);
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session.copy("refs", "refs_copy").unwrap();
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    for name in ["refs", "refs_copy"] {
+        let targets = file.dataset(name).unwrap().dereference().unwrap();
+        assert_eq!(targets.len(), 1, "{name}");
+        match &targets[0] {
+            Object::Dataset(ds) => {
+                assert_eq!(ds.read_i32().unwrap().len(), 512, "{name}");
+            }
+            other => panic!("{name}: expected a dataset reference, got {other:?}"),
+        }
+    }
+    drop(file);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A copy of a reference dataset commits *beside* a delete when the reference
+/// names something the delete does not take: `refs` points at `g/inner`, and
+/// `scratch` is what goes away (issue #317).
+///
+/// This is what makes the copy screen a test of where the copied addresses
+/// point rather than of whether the commit deletes anything. The distinction is
+/// not academic: every successful delete reclaims at least the deleted object's
+/// own header, so a screen gated on "this commit deletes something" would
+/// refuse every copy of a reference dataset in any commit that removes
+/// anything at all.
+#[test]
+fn a_copy_of_a_reference_dataset_is_allowed_beside_an_unrelated_delete() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_copy_unrelated.h5");
+    let mut b = FileBuilder::new();
+    let mut g = b.create_group("g");
+    g.create_dataset("inner").with_i32_data(&[1, 2, 3]);
+    b.add_group(g.finish());
+    b.create_dataset("refs").with_path_references(&["g/inner"]);
+    b.write(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session.root().create_group("scratch").unwrap();
+        session.commit().unwrap();
+        session.copy("refs", "refs_copy").unwrap();
+        session.root().delete("scratch").unwrap();
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    let targets = file.dataset("refs_copy").unwrap().dereference().unwrap();
+    match &targets[0] {
+        Object::Dataset(ds) => assert_eq!(ds.read_i32().unwrap(), vec![1, 2, 3]),
+        other => panic!("expected a dataset reference, got {other:?}"),
+    }
+    drop(file);
+    std::fs::remove_file(&path).ok();
+}
+
+/// A copy of a *chunked* object-reference dataset is refused beside a delete
+/// even though the address it holds is fine, because this path cannot tell:
+/// the copy carries `chunk_bytes` exactly as the source stored them, filters
+/// and all, and never decodes them (issue #317).
+///
+/// The address below is deliberately one no delete touches, so the refusal can
+/// only be coming from the datatype. It is the one place the screen is
+/// conservative, and it is the same limit that makes `repack` refuse a chunked
+/// object-reference dataset outright.
+#[test]
+fn a_chunked_reference_copy_beside_a_delete_is_refused() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_copy_chunked.h5");
+    let mut b = FileBuilder::new();
+    let mut g = b.create_group("g");
+    g.create_dataset("inner").with_i32_data(&[1, 2, 3]);
+    b.add_group(g.finish());
+    let mut keep = b.create_group("keep");
+    keep.create_dataset("survivor").with_i32_data(&[4, 5, 6]);
+    b.add_group(keep.finish());
+    b.create_dataset("probe")
+        .with_path_references(&["keep/survivor"]);
+    b.write(&path).unwrap();
+
+    let survivor = {
+        let file = File::open(&path).unwrap();
+        let raw = file.dataset("probe").unwrap().read_raw().unwrap();
+        u64::from_le_bytes(raw[..8].try_into().unwrap())
+    };
+
+    // Rebuild with a chunked reference dataset naming the *surviving* object.
+    let mut b = FileBuilder::new();
+    let mut g = b.create_group("g");
+    g.create_dataset("inner").with_i32_data(&[1, 2, 3]);
+    b.add_group(g.finish());
+    let mut keep = b.create_group("keep");
+    keep.create_dataset("survivor").with_i32_data(&[4, 5, 6]);
+    b.add_group(keep.finish());
+    b.create_dataset("crefs")
+        .with_reference_data(&[survivor, survivor])
+        .with_chunks(&[1]);
+    b.write(&path).unwrap();
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session.copy("crefs", "dup").unwrap();
+        session.root().delete("g").unwrap();
+        let err = session.commit().unwrap_err();
+        assert!(
+            err.to_string().contains("chunked object-reference dataset"),
+            "got: {err}"
+        );
+    }
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
+/// Build a file whose `crefs` dataset holds one object reference to `g/inner`
+/// through a **committed** (shared) datatype, and returns that address.
+///
+/// Two passes because the address is only known once the layout is final: the
+/// second writes the same objects in the same order and changes eight data
+/// bytes, so it must not move anything, and the caller asserts that it did not.
+fn write_committed_reference_file(path: &std::path::Path, stored: u64) -> u64 {
+    let mut b = FileBuilder::new();
+    b.commit_datatype(
+        "reftype",
+        Datatype::Reference {
+            size: 8,
+            ref_type: ReferenceType::Object,
+        },
+    );
+    let mut g = b.create_group("g");
+    g.create_dataset("inner").with_i32_data(&[1, 2, 3]);
+    b.add_group(g.finish());
+    b.create_dataset("probe").with_path_references(&["g/inner"]);
+    b.create_dataset("crefs")
+        .with_reference_data(&[stored])
+        .with_committed_datatype("reftype");
+    b.write(path).unwrap();
+
+    let file = File::open(path).unwrap();
+    let raw = file.dataset("probe").unwrap().read_raw().unwrap();
+    u64::from_le_bytes(raw[..8].try_into().unwrap())
+}
+
+/// A committed (shared) datatype is *resolved* before the copy's elements are
+/// screened, so a copy whose named type turns out to be an object reference is
+/// caught by address like any other (issue #317).
+///
+/// Without the resolution step there is nothing to parse at a shared Datatype
+/// message — its body is a pointer into the file's shared-message storage — and
+/// this copy would go through unscreened.
+#[test]
+fn a_copy_of_a_committed_reference_datatype_is_screened() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_copy_committed.h5");
+    let inner = write_committed_reference_file(&path, 0);
+    assert_eq!(
+        write_committed_reference_file(&path, inner),
+        inner,
+        "the second pass must not move g/inner"
+    );
+    let before = std::fs::read(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session.copy("crefs", "dup").unwrap();
+        session.root().delete("g").unwrap();
+        let err = session.commit().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("holds the address of an object this commit deletes"),
+            "got: {err}"
+        );
+    }
+
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    std::fs::remove_file(&path).ok();
+}
+
+/// The other side of that resolution: a committed datatype that is *not* a
+/// reference is screened and passes, so a copy of an object with a named type
+/// still commits beside a delete (issue #317).
+///
+/// Refusing every committed datatype would have been the easy way to stay safe
+/// at the shared Datatype message, and would have taken this with it.
+#[test]
+fn a_copy_of_a_committed_ordinary_datatype_still_commits_beside_a_delete() {
+    let path = std::env::temp_dir().join("hdf5_pure_edit_ref_copy_committed_ok.h5");
+    let mut b = FileBuilder::new();
+    b.commit_datatype("mytype", hdf5_pure::make_f64_type());
+    let mut g = b.create_group("g");
+    g.create_dataset("inner").with_i32_data(&[1, 2, 3]);
+    b.add_group(g.finish());
+    b.create_dataset("src")
+        .with_f64_data(&[1.5, 2.5])
+        .with_committed_datatype("mytype");
+    b.write(&path).unwrap();
+
+    {
+        let session = File::open_rw(&path).unwrap();
+        session.copy("src", "dup").unwrap();
+        session.root().delete("g").unwrap();
+        session.commit().unwrap();
+    }
+
+    let file = File::open(&path).unwrap();
+    assert_eq!(file.dataset("dup").unwrap().read_f64().unwrap(), [1.5, 2.5]);
+    assert!(file.group("g").is_err(), "g was deleted");
+    drop(file);
     std::fs::remove_file(&path).ok();
 }
 
