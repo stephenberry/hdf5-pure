@@ -1124,14 +1124,54 @@ impl Datatype {
     }
 }
 
+/// Whether `dt` reaches an object reference anywhere in its structure, directly
+/// or through a compound member, array entry, enumeration base, or the contents
+/// of a variable-length sequence.
+///
+/// The paired half of [`embedded_reference_slots`], which locates the ones it
+/// can address. This one recognises an object reference of any width and in any
+/// position; that one maps only the 8-byte form reachable through compound
+/// members and array entries. The gap between them is not an oversight but the
+/// point: a datatype this accepts and that cannot map is one whose addresses
+/// cannot be read, which callers must refuse rather than pass over. Their fall-
+/// through arm consults this function so the two cannot drift apart.
+///
+/// A variable-length datatype counts only when what it *holds* is an object
+/// reference. The heap itself is not at risk — a deletion frees object headers
+/// and dataset storage and never a global heap collection, so a variable-length
+/// string keeps pointing at data that is still there — but a `H5T_VLEN` of
+/// `H5T_STD_REF_OBJ`, which the reference library writes, keeps its addresses in
+/// the heap *contents*, where the element bytes hold only a heap id.
+pub(crate) fn datatype_holds_object_reference(dt: &Datatype) -> bool {
+    match dt {
+        Datatype::Reference {
+            ref_type: ReferenceType::Object,
+            ..
+        } => true,
+        Datatype::Compound { members, .. } => members
+            .iter()
+            .any(|m| datatype_holds_object_reference(&m.datatype)),
+        Datatype::Array { base_type, .. }
+        | Datatype::Enumeration { base_type, .. }
+        | Datatype::VariableLength { base_type, .. } => datatype_holds_object_reference(base_type),
+        _ => false,
+    }
+}
+
 /// Every 8-byte object reference `datatype` reaches through a compound member or
 /// array entry, as byte offsets within one element, in declaration order.
 ///
-/// Mirrors [`embedded_vlen_slots`](crate::vl_data::embedded_vlen_slots) for the other kind of address a rewrite
-/// invalidates. A datatype that *is* an object reference yields the single slot
-/// at offset 0, so callers handling that case separately should test for it
-/// first. Returns `None` if the offsets found do not fit the datatype's declared
-/// element size, which means the element bytes cannot be walked safely.
+/// Mirrors [`embedded_vlen_slots`](crate::vl_data::embedded_vlen_slots) for the
+/// other kind of address a rewrite invalidates. A datatype that *is* an object
+/// reference yields the single slot at offset 0, so callers handling that case
+/// separately should test for it first.
+///
+/// Returns `None` when the element bytes cannot be walked safely: the offsets
+/// found do not fit the datatype's declared element size, or the type reaches an
+/// object reference this walker cannot address (see
+/// [`datatype_holds_object_reference`]). Both mean the same thing to a caller —
+/// the addresses are not readable from here — so neither is reported as an empty
+/// slot list, which would read as "this type holds none".
 pub(crate) fn embedded_reference_slots(datatype: &Datatype) -> Option<Vec<usize>> {
     /// Returns `false` when the datatype cannot be walked on this target, for the
     /// reasons [`embedded_vlen_slots`]' walker documents.
@@ -1206,7 +1246,14 @@ pub(crate) fn embedded_reference_slots(datatype: &Datatype) -> Option<Vec<usize>
                 }
                 true
             }
-            _ => true,
+            // Anything this walker does not map. A type that nonetheless
+            // reaches an object reference — a width other than 8, an
+            // enumeration over one, a variable-length sequence *of* them — is
+            // one whose addresses cannot be located in the element bytes, so
+            // say so rather than report "no slots here" and let a caller read
+            // that as "nothing to check". Asking the predicate rather than
+            // restating its arms is what keeps the pair honest as either grows.
+            _ => !datatype_holds_object_reference(datatype),
         }
     }
 

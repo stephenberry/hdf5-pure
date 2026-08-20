@@ -214,7 +214,9 @@ use crate::chunked_write::{
 use crate::convert::TryToUsize;
 use crate::data_layout::DataLayout;
 use crate::dataspace::{Dataspace, DataspaceType};
-use crate::datatype::{Datatype, DatatypeByteOrder, embedded_reference_slots};
+use crate::datatype::{
+    Datatype, DatatypeByteOrder, datatype_holds_object_reference, embedded_reference_slots,
+};
 use crate::error::{Error, FormatError, OBJECT_HEADER_MESSAGE_MAX};
 use crate::extensible_array::ExtensibleArrayHeader;
 use crate::file_create_properties::FileCreateProperties;
@@ -9727,38 +9729,6 @@ fn datatype_copies_foreign_address(dt: &crate::datatype::Datatype) -> bool {
     }
 }
 
-/// Whether `dt` reaches an 8-byte **object reference** anywhere in its structure,
-/// directly or through a compound member, array entry, or enumeration base.
-///
-/// The narrow sibling of [`datatype_copies_foreign_address`], which asks the
-/// wider question the cross-file copy path needs.
-///
-/// A variable-length datatype counts only when what it *holds* is an object
-/// reference. The heap itself is not at risk — a deletion frees object headers
-/// and dataset storage ([`WriteEngine::collect_free_spans`]) and never a global
-/// heap collection, so a variable-length string keeps pointing at data that is
-/// still there — but a `H5T_VLEN` of `H5T_STD_REF_OBJ`, which the reference
-/// library writes and an in-file copy carries, keeps its addresses in the heap
-/// *contents*. Those are object addresses like any other, and the element bytes
-/// hold only a heap id, so [`embedded_reference_slots`] finds no slot for them
-/// and [`screen_resolved_references`] refuses rather than passes.
-fn datatype_holds_object_reference(dt: &Datatype) -> bool {
-    use crate::datatype::ReferenceType;
-    match dt {
-        Datatype::Reference {
-            ref_type: ReferenceType::Object,
-            ..
-        } => true,
-        Datatype::Compound { members, .. } => members
-            .iter()
-            .any(|m| datatype_holds_object_reference(&m.datatype)),
-        Datatype::Array { base_type, .. }
-        | Datatype::Enumeration { base_type, .. }
-        | Datatype::VariableLength { base_type, .. } => datatype_holds_object_reference(base_type),
-        _ => false,
-    }
-}
-
 /// Refuse a staged dataset whose element bytes already hold *resolved* object
 /// references naming space this commit reclaims (issue #317).
 ///
@@ -9780,7 +9750,7 @@ fn screen_resolved_references(
     raw: &[u8],
     invalidated: &InvalidatedAddresses,
 ) -> Result<(), Error> {
-    if invalidated.is_empty() || !datatype_holds_object_reference(dt) {
+    if !datatype_holds_object_reference(dt) {
         return Ok(());
     }
     // The datatype declares an object reference, so the walker must find one.
@@ -9793,11 +9763,30 @@ fn screen_resolved_references(
     // one this crate builds; refuse rather than write references past a screen
     // that could not see them.
     let Some(slots) = embedded_reference_slots(dt).filter(|slots| !slots.is_empty()) else {
-        return Err(Error::EditUnsupported(
-            "an object reference this commit writes could not be located in its datatype, so \
-             it cannot be screened against this commit's deletions",
-        ));
+        // A *blanket* refusal, so it asks a different question from the
+        // per-address checks below and answers to a different set. `moved` is
+        // never empty — a commit always rebuilds the root group — so gating this
+        // on it would refuse the datatype in every commit rather than in the
+        // ones where something is actually going away, which is a ban rather
+        // than a screen. `removed` is empty whenever the commit deletes nothing,
+        // which is what keeps the refusal (and its wording) honest.
+        //
+        // The `filter` is belt-and-braces: `embedded_reference_slots` already
+        // reports an unaddressable reference as `None` rather than as an empty
+        // list, and reading an empty list as "nothing to check" is exactly the
+        // hole that cost this screen a defect.
+        return if invalidated.removed.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::EditUnsupported(
+                "an object reference this commit writes could not be located in its datatype, \
+                 so it cannot be screened against the objects this commit deletes",
+            ))
+        };
     };
+    if invalidated.is_empty() {
+        return Ok(());
+    }
     // Non-empty slots mean the datatype has room for at least one 8-byte
     // address, so the element size is at least 8 and `chunks_exact` is safe.
     let element_size = dt.type_size() as usize;
@@ -10259,11 +10248,10 @@ mod tests {
     ///
     /// [`datatype_holds_object_reference`] answers for an object reference of
     /// *any* width, while [`embedded_reference_slots`] locates only the 8-byte
-    /// one and reports every other as "no slots here". A screen that read an
-    /// empty slot list as "nothing to check" would wave through exactly the
-    /// datatype it had just recognised — and `Dataset::dereference` reads such
-    /// an element, taking the address from its first eight bytes, so the
-    /// reference is live.
+    /// one — so the walker reports a width it cannot address as unwalkable
+    /// rather than as "no slots here", which a screen would read as "nothing to
+    /// check". `Dataset::dereference` reads such an element, taking the address
+    /// from its first eight bytes, so the reference is live.
     #[test]
     fn an_object_reference_wider_than_eight_bytes_is_refused() {
         use crate::datatype::ReferenceType;
@@ -10272,8 +10260,8 @@ mod tests {
             ref_type: ReferenceType::Object,
         };
         assert!(
-            embedded_reference_slots(&dt).is_some_and(|s| s.is_empty()),
-            "the fixture must be one the walker maps no slot for"
+            embedded_reference_slots(&dt).is_none(),
+            "the walker must report a width it cannot map, not an empty slot list"
         );
 
         let mut raw = vec![0u8; 16];

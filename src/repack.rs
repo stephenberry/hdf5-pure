@@ -522,7 +522,9 @@ fn emit_dataset(
     // element bytes unchanged.
     let reference_slots = embedded_reference_slots(&datatype).ok_or_else(|| {
         Error::RepackUnsupported(format!(
-            "dataset {path}: datatype declares object references its own element size cannot hold"
+            "dataset {path}: datatype declares object references this rewrite cannot locate in \
+             its element bytes -- a width other than eight, an enumeration over one, a \
+             variable-length sequence of them, or offsets its own element size cannot hold"
         ))
     })?;
 
