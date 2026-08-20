@@ -3407,8 +3407,8 @@ impl Dataset {
     /// [`Error::ReadOnly`](crate::Error::ReadOnly). Unlike [`append`](Self::append)
     /// (immediate), this is a staged edit applied on [`File::commit`].
     pub fn write<T: H5Element>(&mut self, data: &[T]) -> Result<(), Error> {
-        // Build off the lock — `H5Element` is user-implementable, so
-        // `write_into` is potentially user code (see `write_staged`).
+        // Build off the lock, as `write_staged` does: `write_into` is trait
+        // code reached with no lock held, keeping both paths identical.
         self.check_staged_edit()?;
         let mut builder = DatasetBuilder::new("");
         T::write_into(&mut builder, data);
@@ -3419,8 +3419,11 @@ impl Dataset {
 
     /// Overwrite this dataset's values through its full [`DatasetBuilder`],
     /// staged until [`File::commit`] — the builder-level counterpart of
-    /// [`write`](Self::write), for element kinds [`H5Element`] does not cover
-    /// (raw bytes carried by an explicit datatype).
+    /// [`write`](Self::write), and the only one of the two that can carry a
+    /// **shape**. [`write`](Self::write) sends a flat `&[T]`, so it can overwrite
+    /// a one-dimensional dataset only; a multi-dimensional one needs
+    /// [`with_shape`](DatasetBuilder::with_shape) and so comes through here, as
+    /// do compound, complex, and raw bytes under an explicit datatype.
     ///
     /// The replacement must match the on-disk datatype and shape exactly; a
     /// reshape or retype is refused on [`File::commit`].
@@ -3428,14 +3431,20 @@ impl Dataset {
     /// This overwrites element bytes and nothing else, so a builder asking for
     /// more than that is refused by **this call**, before anything is staged:
     /// chunking, filters or an extensible shape; an attribute; a fill value; and
-    /// the two datatypes whose element bytes are placeholders that only a newly
-    /// created dataset can resolve — variable-length strings
-    /// ([`with_vlen_strings`](DatasetBuilder::with_vlen_strings)) and
-    /// path-resolved object references
-    /// ([`with_path_references`](DatasetBuilder::with_path_references)). Set
-    /// those when the dataset is created.
-    /// [`with_reference_data`](DatasetBuilder::with_reference_data), whose
-    /// addresses are resolved already, overwrites like any other value.
+    /// the two builders whose element bytes are placeholders only a newly created
+    /// dataset can resolve —
+    /// [`with_vlen_strings`](DatasetBuilder::with_vlen_strings) and
+    /// [`with_path_references`](DatasetBuilder::with_path_references). Set those
+    /// when the dataset is created.
+    ///
+    /// The refusal is on those builders, not on the datatypes they produce: a
+    /// dataset of either type can still be overwritten by supplying element bytes
+    /// that need no resolving, with
+    /// [`with_reference_data`](DatasetBuilder::with_reference_data) or
+    /// [`with_raw_data`](DatasetBuilder::with_raw_data). Those bytes are stored as
+    /// given and are not screened — an address pointing at an object the same
+    /// commit deletes is written as-is, where the same target named as a path is
+    /// refused.
     ///
     /// The file must have been opened with [`File::open_rw`], else
     /// [`Error::ReadOnly`](crate::Error::ReadOnly).

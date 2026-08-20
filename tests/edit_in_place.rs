@@ -3872,11 +3872,12 @@ fn write_dataset_rejects_vlen_strings_without_writing() {
 /// test for issue #318: both builders stage placeholder element bytes that only
 /// the add path resolves, so both are refused as the overwrite is staged.
 ///
-/// The assertion that matters is the last one. Before the refusal existed, this
-/// same sequence returned `Ok` from `write_staged` **and** from `commit`, having
-/// written eight zero bytes over a working reference dataset — so a test that
-/// only checked for an error would pass against a refusal placed after the
-/// write.
+/// Before the refusal existed, this same sequence returned `Ok` from
+/// `write_staged` **and** from `commit`, having written eight zero bytes over a
+/// working reference dataset. The file-content and `dereference` assertions are
+/// what make this a test about that rather than about an error message; no
+/// mutation of the code as it stands reaches them, since the refusal precedes
+/// every write, and they are here for a version of this code where it does not.
 #[test]
 fn write_dataset_rejects_object_references_without_writing() {
     let path = std::env::temp_dir().join("hdf5_pure_edit_write_object_ref_rejected.h5");
@@ -3933,6 +3934,11 @@ fn write_dataset_rejects_object_references_without_writing() {
 /// This is the other half of issue #318's fix. Widening the refusal to "any
 /// reference dataset" would take a working capability away, and the whole suite
 /// would still pass.
+///
+/// It pins that the write *applies*, not that the addresses are sound. Nothing
+/// screens them: an address into a subtree the same commit deletes is stored
+/// as-is, where the same target named as a path is refused (issue #317's family,
+/// which this refusal neither creates nor closes).
 #[test]
 fn write_dataset_accepts_resolved_reference_addresses() {
     let path = std::env::temp_dir().join("hdf5_pure_edit_write_resolved_refs.h5");

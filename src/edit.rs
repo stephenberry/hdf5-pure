@@ -5176,6 +5176,16 @@ impl WriteEngine {
         fd: &FlatDataset,
         base: u64,
     ) -> Result<WritePlan, Error> {
+        // Enforced by construction: `staged.writes` has one producer, and it
+        // refuses there. Asserted rather than re-refused because a second caller
+        // that skipped it would not fail here — a chunked builder would fall
+        // through and be written as a plain contiguous overwrite, with
+        // `chunk_options` silently dropped.
+        debug_assert!(
+            Self::refuse_unsupported_overwrite(fd).is_ok(),
+            "a staged write reached prepare_write without refuse_unsupported_overwrite"
+        );
+
         let region = Self::gather_oh_messages(src, addr, base)?;
 
         // Locate the datatype, dataspace, and data-layout messages, and detect a
