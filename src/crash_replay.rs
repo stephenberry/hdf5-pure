@@ -747,6 +747,15 @@ fn doomed_values(r: i32) -> Vec<i32> {
     (0..1024 + r).map(|i| i * 3 + r).collect()
 }
 
+/// Elements of `slot` after `g` rounds have committed. `slot` is deleted and
+/// recreated at its own path in one commit (issue #305), so unlike `added`/
+/// `doomed` it is never absent — the generation is what says which commit a
+/// prefix caught. Lengths differ per generation, so a prefix that resurrected
+/// the previous object reads as the wrong length rather than as plausible data.
+fn slot_values(g: i32) -> Vec<i32> {
+    (0..512 + 37 * g).map(|i| i * 11 + g).collect()
+}
+
 /// Build the file the commit workload churns: one growable dataset, and one
 /// `doomed{r}` per round for the delete half to consume.
 fn commit_base(path: &Path, paged: bool) {
@@ -766,6 +775,10 @@ fn commit_base(path: &Path, paged: bool) {
             .with_i32_data(&v)
             .with_shape(&[v.len() as u64]);
     }
+    let v = slot_values(0);
+    b.create_dataset("slot")
+        .with_i32_data(&v)
+        .with_shape(&[v.len() as u64]);
     b.write(path).unwrap();
 }
 
@@ -785,8 +798,14 @@ fn read_optional(f: &crate::reader::File, path: &str) -> Result<Option<Vec<i32>>
 }
 
 /// `d`'s elements, then each round's `added{r}` and `doomed{r}` — `None` where
-/// the path is not in the file at all.
-type CommitState = (Vec<i32>, Vec<Option<Vec<i32>>>, Vec<Option<Vec<i32>>>);
+/// the path is not in the file at all — and finally `slot`, which every prefix
+/// must have.
+type CommitState = (
+    Vec<i32>,
+    Vec<Option<Vec<i32>>>,
+    Vec<Option<Vec<i32>>>,
+    Vec<i32>,
+);
 
 /// A commit publishes at its superblock write, so every object must read as
 /// either its pre-commit or its post-commit state — never a mixture, and never
@@ -807,10 +826,21 @@ fn commit_state_is_one_or_the_other(path: &Path) -> Verdict {
             added.push(read_optional(&f, &std::format!("added{r}"))?);
             doomed.push(read_optional(&f, &std::format!("doomed{r}"))?);
         }
-        Ok((d, added, doomed))
+        // Not `read_optional`: a replacement leaves the path occupied at every
+        // instant, so "no such path" is a failure here rather than a state, and
+        // it has to reach the judge as one. `dataset` returning `PathNotFound`
+        // is an `Error`, which `Verdict::of` would file as `Loud` — which
+        // `Tally::assert_sound` also fails on, but under a reason about the file
+        // refusing to read rather than about the path being gone.
+        let slot = match f.dataset("slot") {
+            Ok(ds) => ds.read_i32()?,
+            Err(Error::Format(FormatError::PathNotFound { .. })) => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        Ok((d, added, doomed, slot))
     })();
 
-    Verdict::of(read, |(d, added, doomed)| {
+    Verdict::of(read, |(d, added, doomed, slot)| {
         // `d` is judged on its own. An in-place append publishes at its own
         // phase 4, before the staged commit in the same round runs, so its length
         // says nothing about whether that commit landed — the two are separate
@@ -872,6 +902,36 @@ fn commit_state_is_one_or_the_other(path: &Path) -> Verdict {
                 r - 1
             ));
         }
+
+        // `slot` is deleted and recreated at its own path in the same commit, so
+        // it is occupied at every instant: a prefix where the path is gone is a
+        // window in which a replacement was two operations rather than one.
+        if slot.is_empty() {
+            return Err("`slot` is not in the file, though every commit that \
+                        removes it puts its replacement back in the same commit"
+                .to_string());
+        }
+        // And it is occupied by the generation this prefix's *other* evidence
+        // says: rounds commit in order and each round replaces `slot` once, so
+        // after `c` committed rounds `slot` holds generation `c`. This is the
+        // rule that makes a replacement one linearization point rather than
+        // merely an atomic-looking pair — a `slot` a generation ahead of or
+        // behind the round count would mean the delete and the create were
+        // published at different instants.
+        let c = committed.iter().filter(|&&b| b).count() as i32;
+        if slot != slot_values(c) {
+            let found = (0..=CHURN).find(|&g| slot == slot_values(g));
+            return Err(match found {
+                Some(g) => {
+                    std::format!("`slot` holds generation {g} while {c} round(s) have committed")
+                }
+                None => std::format!(
+                    "`slot` holds {} elements, which is no generation this session writes \
+                     ({c} round(s) have committed, so generation {c} was expected)",
+                    slot.len()
+                ),
+            });
+        }
         Ok(())
     })
 }
@@ -901,6 +961,17 @@ fn every_round_committed(path: &Path) -> Result<(), String> {
             return Err(std::format!("`doomed{r}` was never deleted"));
         }
     }
+    let slot = f
+        .dataset("slot")
+        .and_then(|d| d.read_i32())
+        .map_err(|e| std::format!("the finished `slot` does not read: {e:?}"))?;
+    if slot != slot_values(CHURN) {
+        return Err(std::format!(
+            "`slot` holds {} elements rather than generation {CHURN}'s {}",
+            slot.len(),
+            slot_values(CHURN).len()
+        ));
+    }
     Ok(())
 }
 
@@ -921,6 +992,17 @@ fn churn(s: &mut WriteEngine, r: i32) {
     s.stage_created_dataset(&std::format!("/added{r}"), db)
         .unwrap();
     s.delete(&std::format!("doomed{r}")).unwrap();
+
+    // Delete and recreate one path in the *same* commit (issue #305), beside the
+    // unrelated create and delete above. This is the edit that has no two-commit
+    // intermediate state to fall into, so a prefix where `slot` is missing is a
+    // real failure rather than a legitimate half-done rotation.
+    s.delete("slot").unwrap();
+    let v = slot_values(r + 1);
+    let mut sb = DatasetBuilder::new("slot");
+    sb.with_i32_data(&v).with_shape(&[v.len() as u64]);
+    s.stage_created_dataset("/slot", sb).unwrap();
+
     s.commit().unwrap();
 
     // The workload has to have done all three, or the sweep is judging a session
